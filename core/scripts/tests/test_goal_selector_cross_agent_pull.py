@@ -41,6 +41,7 @@ os.environ.setdefault("MIND_AGENT", "bravo")
 
 gs = importlib.import_module("goal-selector")
 collect_cross_agent_candidates = gs.collect_cross_agent_candidates
+score_goal = gs.score_goal  # : emission-side test target
 
 if _SAVED_AGENT is None:
     os.environ.pop("MIND_AGENT", None)
@@ -252,7 +253,7 @@ def case_invalid_inputs_fail_open() -> tuple[bool, str]:
 
 
 def case_callsite_shape_project_root_is_agents_parent() -> tuple[bool, str]:
-    """REGRESSION 4: the WIRED call site (goal-selector.py cmd_select)
+    """REGRESSION : the WIRED call site (goal-selector.py cmd_select)
     passes AGENT_DIR.parent — the agents-parent (PROJECT_ROOT/agents), NOT
     PROJECT_ROOT — as the project_root arg. The helper MUST still surface
     sibling-routed goals from that arg shape.
@@ -291,8 +292,52 @@ def case_callsite_shape_project_root_is_agents_parent() -> tuple[bool, str]:
         return True, "ok"
 
 
+def case_score_goal_stamps_routed_to_me() -> tuple[bool, str]:
+    """: score_goal MUST preserve intended_agent AND stamp
+    routed_to_me on the EMITTED candidate dict, so the target agent's LLM
+    selection path (aspirations-select Phase 2.5 / 2.55) sees a cross-agent
+    candidate is routed TO IT — not "someone else's goal" to abstain on.
+
+    By collect_cross_agent_candidates' strict-match contract
+    (intended_agent == agent_name), EVERY source='cross-agent:<owner>'
+    candidate is BY CONSTRUCTION routed to the selecting agent, so a
+    'cross-agent'/not-my-lane abstention on one is ALWAYS wrong. Dropping the
+    field from the emission made bravo abstain 13x from its own HIGH-routed
+    g-001-339. The other cases here test the RAW candidate off
+    collect_cross_agent_candidates; this pins the DOWNSTREAM score_goal
+    emission that the LLM actually reads."""
+    goal = _make_goal("g-001-339", intended_agent=TARGET_AGENT)
+    goal["priority"] = "HIGH"
+    asp = _make_aspiration("asp-001", [goal])
+    wm, resolved, sess = {}, {}, []
+
+    # cross-agent candidate: routed to the selecting agent by construction
+    xc = score_goal(
+        {"goal": goal, "aspiration": asp, "source": "cross-agent:foo"},
+        wm, resolved, sess,
+    )
+    if xc.get("routed_to_me") is not True:
+        return False, f"cross-agent routed_to_me={xc.get('routed_to_me')!r}, expected True"
+    if xc.get("intended_agent") != TARGET_AGENT:
+        return False, f"intended_agent not preserved: {xc.get('intended_agent')!r}"
+
+    # native world candidate: not routed, no intended_agent (key absent)
+    native = _make_goal("g-native-01", intended_agent=None)
+    nc = score_goal(
+        {"goal": native, "aspiration": _make_aspiration("asp-002", [native]), "source": "world"},
+        wm, resolved, sess,
+    )
+    if nc.get("routed_to_me") is not False:
+        return False, f"native routed_to_me={nc.get('routed_to_me')!r}, expected False"
+    if nc.get("intended_agent") is not None:
+        return False, f"native intended_agent leaked: {nc.get('intended_agent')!r}"
+
+    return True, "ok"
+
+
 CASES = [
     ("sibling-routed-goal-appears",     case_sibling_routed_goal_appears),
+    ("score-goal-stamps-routed-to-me",  case_score_goal_stamps_routed_to_me),
     ("callsite-shape-agents-parent",    case_callsite_shape_project_root_is_agents_parent),
     ("own-queue-not-double-counted",    case_own_queue_not_double_counted),
     ("unreadable-sibling-fails-open",   case_unreadable_sibling_fails_open),

@@ -101,8 +101,28 @@ Bash: retrieve.sh --supplementary-only --category {goal.category} --goal {goal.i
 # Side effect: writes agents/<agent>/session/retrieval-session.json for utilization tracking
 Output: "▸ Supplementary: {N} reasoning, {N} guardrails, {N} patterns, {N} experiences"
 
+# Step 4a: Shared-commons retrieval — Pattern B hook slot `commons-retrieval` (g-335-211)
+# Steps 3-4 read only THIS world's own stores. This slot lets a domain that participates
+# in a SHARED cross-world commons pull from it too, so agents build on what other agents
+# and other worlds already learned instead of re-deriving it. Core names the slot; the
+# world convention (when present) names what to run. core/config/conventions/domain-hooks.md.
+# MUST run AFTER Step 4 — retrieve.sh OVERWRITES retrieval-session.json wholesale, so a
+# commons write placed earlier would be silently clobbered. The convention is responsible
+# for merging under its OWN manifest key, never supplementary_detail (that key drives
+# utilization counters keyed by LOCAL record id; a foreign signature is not a local record).
+Bash: load-conventions.sh commons-retrieval → IF path returned: Read it
+# Procedural convention — gate on file EXISTENCE, not load status.
+Bash: source core/scripts/_paths.sh && test -f "$WORLD_DIR/conventions/commons-retrieval.md" && echo "exists"
+IF exists:
+    Follow each Step in the convention, passing {goal.id}, {goal.category}, {goal.title}.
+    Fail-open by contract: any step that fails is logged and swallowed. Commons
+    consumption ENRICHES execution — it must never gate it.
+ELSE:
+    # No domain commons convention (fresh world, or a world that shares nothing).
+    # Nothing to do — Steps 3-4 already loaded every store this world has.
+
 # Memory Deliberation: assess each supplementary item
-FOR EACH item in reasoning_bank + guardrails + pattern_signatures:
+FOR EACH item in reasoning_bank + guardrails + pattern_signatures + any patterns Step 4a returned:
     Mark: ACTIVE (will inform execution) or SKIPPED (not applicable)
 
 # Step 4b: Strategy application (closes meta-strategy → execution feedback loop)
@@ -128,7 +148,8 @@ IF context insufficient: Read additional nodes, increment retrieval_count
 # retrieve.sh auto-writes agents/<agent>/session/retrieval-session.json with tree_nodes_loaded,
 # supplementary_items, counts, and utilization_pending: true.
 # Optional enrichment: pipe deliberation details to wm-set.sh active_context.retrieval_manifest
-# The utilization-gate.sh hook guarantees feedback runs even if Phase 4.26 is skipped.
+# iteration-close.sh do_state_update repairs utilization_pending before the Phase 4.26
+# gate, so feedback runs even if Phase 4.26 is skipped (g-115-3123).
 #
 # SCOPE LIMITATION (g-001-122 / bravo iter 52): utilization-feedback `--infer` and
 # `times_inferred_helpful` counters are only populated when this Step 4 executes.
@@ -312,7 +333,7 @@ IF productive:
     echo '{"experience_refs": ["{experience_id}"]}' | Bash: wm-set.sh active_context.experience_refs
 ```
 
-## Phase 4.26: Context Utilization Feedback (SKIP under lightweight mode — no retrieval-session.json; utilization-gate.sh backstop applies --all-unknown)
+## Phase 4.26: Context Utilization Feedback (SKIP under lightweight mode — no retrieval-session.json, so the iteration-close repair no-ops too)
 
 ```
 # PRIMARY PATH (script-based — one command replaces the manual loop):
@@ -327,10 +348,14 @@ Bash: utilization-feedback.sh --goal {goal.id} --helpful "node1,node2,rb-001,gua
 #   all_noise) but no times_noise pollution.
 # Reads retrieval-session.json, increments tree + supplementary counters, clears pending flag.
 
-# BACKSTOP: utilization-gate.sh hook auto-applies --all-unknown before state-update
-# if Phase 4.26 is skipped entirely (post-2026-05-07; was --all-noise pre-fix).
-# The system NEVER has zero utilization data; the gate still flags backstop-only
-# goals to force the LLM to attest or pass --no-retrieval-applicable.
+# BACKSTOP (hot path): iteration-close.sh _repair_utilization_pending runs inside
+# do_state_update immediately BEFORE phase-4-26-gate.sh — --infer --confidence
+# balanced, falling back to --all-unknown on schema<2 (g-115-3123).
+# BACKSTOP (direct-skill path only): the utilization-gate.sh PreToolUse[Skill] hook
+# covers Skill(aspirations-state-update) calls that bypass iteration-close. It does
+# NOT cover the Bash hot path — a PreToolUse[Skill] matcher structurally cannot.
+# The gate still flags backstop-only goals to force the LLM to attest or pass
+# --no-retrieval-applicable (though the gate is itself inert today — g-115-3113).
 ```
 
 ## Phase 4.5: Knowledge Reconciliation (IF NOT trivial_mode — no_diff ⇒ nothing to reconcile; escape hatch re-enables on diff)

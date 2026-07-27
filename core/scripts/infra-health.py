@@ -12,6 +12,7 @@ automatically when a check is requested.
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -34,6 +35,7 @@ from _paths import PROJECT_ROOT, WORLD_DIR
 from _fileops import locked_modify_yaml, locked_append_jsonl
 from _world_config import load_world_config as _load_world_config
 HEALTH_FILE = WORLD_DIR / "infra-health.yaml"
+RETIRED_ARCHIVE_FILE = WORLD_DIR / "infra-health-retired.jsonl"
 ASPIRATIONS_CONFIG = PROJECT_ROOT / "core" / "config" / "aspirations.yaml"
 
 
@@ -131,28 +133,56 @@ def _find_probe_script(component):
     return None
 
 
+def _load_probe_aliases():
+    """Return the probe-stem -> canonical-component alias map (WORLD overlay).
+
+    Some probe scripts record their result under a canonical component name that
+    differs from their filename stem, because the script body hardcodes
+    ``infra-health.sh record <canonical>``. Without an alias,
+    _discover_probe_components would derive the STEM as its own component — a
+    stale SHADOW duplicating the canonical one. g-115-2768: probe-bitnet-prod.sh
+    records under ``bitnet`` (per the g-115-151 recurring), but its stem
+    otherwise yielded a ``bitnet-prod`` shadow.
+
+    Lives in world/config/infra-health-probe-aliases.yaml (key: ``probe_aliases``)
+    so the domain-specific component names stay OUT of this framework script — the
+    same world-overlay pattern as _load_component_categories. Empty dict when the
+    overlay is missing/malformed, so discovery is unchanged where no alias is set.
+    """
+    overlay = _load_world_config(
+        "infra-health-probe-aliases",
+        default={"probe_aliases": {}},
+    )
+    aliases = overlay.get("probe_aliases") or {}
+    return aliases if isinstance(aliases, dict) else {}
+
+
 def _discover_probe_components():
     """Glob world/scripts/probe-*.sh and return the set of component names.
 
-    Component name is the script stem after the 'probe-' prefix:
-        world/scripts/probe-bridge.sh -> 'bridge'
-        world/scripts/probe-bitnet-prod.sh -> 'bitnet-prod'
+    Component name is the script stem after the 'probe-' prefix, then normalized
+    through the probe-alias overlay (see _load_probe_aliases):
+        world/scripts/probe-bridge.sh      -> 'bridge'
+        world/scripts/probe-bitnet-prod.sh -> 'bitnet' (aliased; the script
+                                              records under 'bitnet', g-115-2768)
 
     Returns a set of strings; empty set when world/scripts/ is missing.
     rb-506 application: probe-script existence is the SSOT for which
     components exist; YAML-registration becomes a reflection of reality
-    rather than a drift-prone manual list.
+    rather than a drift-prone manual list. The alias keeps discovery agreeing
+    with the name a probe script records under, so no shadow component is derived.
     """
     probe_dir = WORLD_DIR / "scripts"
     if not probe_dir.is_dir():
         return set()
+    aliases = _load_probe_aliases()
     discovered = set()
     for script in probe_dir.glob("probe-*.sh"):
         stem = script.stem
         if stem.startswith("probe-"):
             name = stem[len("probe-"):]
             if name:
-                discovered.add(name)
+                discovered.add(aliases.get(name, name))
     return discovered
 
 
@@ -647,26 +677,54 @@ def _sync_known_blockers(alerts):
                 existing = []
 
             # Drop pre-existing streak-* entries (we re-derive from current alerts).
-            preserved = [
-                b for b in existing
-                if not (isinstance(b, dict) and isinstance(b.get("blocker_id"), str)
+            def _is_streak(b):
+                return (isinstance(b, dict) and isinstance(b.get("blocker_id"), str)
                         and b["blocker_id"].startswith("streak-"))
-            ]
+
+            # Carry first-detection time across re-derivation (g-115-3348).
+            # These entries are rebuilt from scratch on every sync, so stamping
+            # detected_at=now below would reset the age on each run and the
+            # blocker could never grow old enough for the aged-blocker recheck
+            # (blocker-recheck.py) or the proactive user escalation to fire --
+            # permanently young instead of permanently ageless, but equally
+            # unreachable. Preserve the ORIGINAL stamp keyed by blocker_id;
+            # only a genuinely new streak gets `now`.
+            prior_detected = {
+                b["blocker_id"]: b.get("detected_at")
+                for b in existing if _is_streak(b) and b.get("detected_at")
+            }
+
+            preserved = [b for b in existing if not _is_streak(b)]
 
             session_no = _get_session_number()
+            _now_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
             for alert in alerts:
                 component = alert.get("component")
                 if not component:
                     continue
                 preserved.append({
                     "blocker_id": f"streak-{component}",
-                    "description": (
+                    # Field name MUST be `reason` — the field goal-selector's
+                    # block-detail renderers consume (trace_root_bottleneck +
+                    # collect_blocked both read b.get("reason", "unknown")). A
+                    # prior `description` key rendered every streak-gated goal's
+                    # block reason as the literal word "unknown" (g-115-2872,
+                    # verified 2026-07-21 with the roblox-studio streak blocker
+                    # at 20 consecutive failures). Single-source-of-truth: emit
+                    # the narrative under the consumed field at this one
+                    # construction site rather than patching the 4 renderer sites.
+                    "reason": (
                         f"Streak alert: {alert.get('consecutive_failures')} consecutive "
                         f"probe failures. Last failure: {alert.get('last_failure_reason') or 'unknown'}"
                     ),
                     "affected_categories": component_categories.get(component, []),
                     "affected_skills": [],
                     "detected_session": session_no,
+                    # Documented schema pairs detected_session with detected_at
+                    # (handoff-working-memory.md:159). Only detected_session was
+                    # emitted here, so streak blockers carried no parsable age at
+                    # all and _age_hours() returned None for every one of them.
+                    "detected_at": prior_detected.get(f"streak-{component}") or _now_iso,
                     "resolution": None,
                     "source": "infra-health.streak-alert",
                 })
@@ -872,6 +930,120 @@ def cmd_probe_freshness(args):
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
+# retire — archive-first component removal
+# ---------------------------------------------------------------------------
+
+def _archive_has_receipt(component, retired_at):
+    """Read RETIRED_ARCHIVE_FILE back and confirm a receipt for (component, retired_at).
+
+    The whole-record read-back IS the archive verification (archive-before-delete.md
+    step 4 — a sampled spot-check is not verification; for a single receipt the
+    full read is the verification). Returns False (fail-closed) on any read error
+    so a missing/unreadable archive blocks the delete rather than proceeding.
+    """
+    if not RETIRED_ARCHIVE_FILE.exists():
+        return False
+    try:
+        with open(RETIRED_ARCHIVE_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("component") == component and rec.get("retired_at") == retired_at:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def cmd_retire(args):
+    """Retire (remove) a component from world/infra-health.yaml — archive-first.
+
+    There was previously no safe way to remove a component: check / record /
+    status / stale / list / streak-alert / probe-freshness all CREATE-or-UPDATE,
+    never delete — so a stale shadow (bitnet-prod) or orphan (llm-bitnet-prod)
+    could only be cleared by hand-editing the 60+-component, concurrently-written
+    YAML, which loses concurrent probe writes. This is the locked, archive-first
+    removal primitive (g-115-2768).
+
+    Archive-before-delete (.claude/rules/archive-before-delete.md): the
+    component's current entry is appended to world/infra-health-retired.jsonl
+    (OUTSIDE the blast radius — the live system reads infra-health.yaml, never the
+    archive), the archive is VERIFIED by read-back, and ONLY THEN is the component
+    removed under the _fileops lock. The archive line is the receipt (component,
+    entry, retired_at, reason, retired_by) with everything needed to restore.
+
+    Idempotent: retiring an absent component is a no-op success. rb-506: check-all
+    discovery re-adds any component still derived from a live
+    world/scripts/probe-*.sh (after alias normalization), so a retire only STICKS
+    when discovery no longer maps to the name — the command warns when it detects
+    a live re-derivation source.
+    """
+    component = args.component
+
+    # 1. ENUMERATE — snapshot the current entry (lockless read; the authoritative
+    #    removal re-reads under lock in step 4).
+    data = load_health()
+    entry = data.get("components", {}).get(component)
+    if entry is None:
+        print(json.dumps(
+            {"retired": False, "component": component, "reason": "absent"},
+            ensure_ascii=False))
+        return
+
+    # 2. ARCHIVE (outside blast radius) BEFORE delete.
+    now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    receipt = {
+        "retired_at": now,
+        "component": component,
+        "entry": entry,
+        "reason": args.reason,
+        "retired_by": os.environ.get("MIND_AGENT", "unknown"),
+    }
+    locked_append_jsonl(RETIRED_ARCHIVE_FILE, receipt)
+
+    # 3. VERIFY ARCHIVE — read the JSONL back and confirm the receipt landed.
+    if not _archive_has_receipt(component, now):
+        print(json.dumps(
+            {"retired": False, "component": component,
+             "reason": "archive_verify_failed",
+             "detail": f"receipt for {component}@{now} not found in "
+                       f"{RETIRED_ARCHIVE_FILE.name} after append — component NOT removed"},
+            ensure_ascii=False))
+        sys.exit(1)
+
+    # 4. DELETE — locked RMW pops the component (re-reads under lock; if a
+    #    concurrent probe re-created it, the current entry is what we remove).
+    def _modifier(d):
+        if d is None:
+            d = {}
+        d.setdefault("components", {}).pop(component, None)
+        return d
+
+    locked_modify_yaml(HEALTH_FILE, _modifier, initial={"components": {}})
+
+    # 5. RECEIPT + re-derivation warning (rb-506). check-all re-adds via
+    #    _discover_probe_components (the alias-normalized set) — NOT via
+    #    _find_probe_script (which matches the raw filename and would false-warn
+    #    on an aliased-away stem like bitnet-prod).
+    out = {
+        "retired": True,
+        "component": component,
+        "archived_to": str(RETIRED_ARCHIVE_FILE),
+        "retired_at": now,
+    }
+    if component in _discover_probe_components():
+        out["warning"] = (
+            f"world/scripts/probe-*.sh discovery still maps to '{component}' — "
+            f"check-all will re-add it (add a probe alias or remove the probe script)")
+    print(json.dumps(out, ensure_ascii=False))
+
+
+# ---------------------------------------------------------------------------
 
 def build_parser():
     parser = argparse.ArgumentParser(description="Infrastructure health check and tracking")
@@ -903,6 +1075,10 @@ def build_parser():
     p_fresh = sub.add_parser("probe-freshness", help="Report whether the probe store is fresh enough to trust a streak-alert result (stale=true means a 0-alert result may be false-healthy)")
     p_fresh.add_argument("--window-hours", type=float, default=None, help="Override recency window (default: aspirations.yaml infra_health.window_hours, fallback 6)")
 
+    p_retire = sub.add_parser("retire", help="Archive-first remove a component from world/infra-health.yaml (locked; recoverable from world/infra-health-retired.jsonl)")
+    p_retire.add_argument("component", help="Component to retire (removed from infra-health.yaml after its entry is archived)")
+    p_retire.add_argument("--reason", type=str, default=None, help="Why the component is being retired (stored in the archive receipt)")
+
     return parser
 
 
@@ -915,6 +1091,7 @@ DISPATCH = {
     "record": cmd_record,
     "streak-alert": cmd_failing_streak,
     "probe-freshness": cmd_probe_freshness,
+    "retire": cmd_retire,
 }
 
 

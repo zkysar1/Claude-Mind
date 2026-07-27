@@ -324,7 +324,7 @@ def validate_formation_quality(rec):
 
 # Recognized evidence-pointer shapes in free-text resolution fields.
 _EVIDENCE_PATTERNS = (
-    re.compile(r"\bg-\d{3}-\d{2,4}\b"),                          # goal-id
+    re.compile(r"\bg-(?:\d{3}-\d{2,4}|xw-\d{8}T\d{6}-\d{2})\b"),  # goal-id (incl xw, )
     re.compile(r"\b(?:rb|guard|sig|sa|bel)-\d+\b"),             # rb/guardrail/sig/...
     re.compile(r"\bexp-[a-z0-9][\w-]+", re.I),                  # experience-ref
     re.compile(r"\bmsg-\d{8}-"),                                # board message id
@@ -420,7 +420,7 @@ def normalize_record(rec):
             # name is still at its None default and the old carries a real value.
             # DEFAULT_FIELDS pre-seeds surprise=None on every record, so without
             # this copy a {surprise_level: N} update always lost its value to the
-            # both-exist branch — surprise stayed None (7 /
+            # both-exist branch — surprise stayed None ( /
             # idea:normalize-record-rename-valuedrop). Applies to all renames.
             if rec[new_name] is None and rec[old_name] is not None:
                 rec[new_name] = rec[old_name]
@@ -532,7 +532,7 @@ def empty_meta():
 def compute_meta(live_items, archive_items):
     """Recompute meta from all records."""
     meta = empty_meta()
-    # Dedup by id across live+archive (6; mirrors pipeline_write.py
+    # Dedup by id across live+archive (; mirrors pipeline_write.py
     # _compute_meta): a tombstoned id is present in BOTH files by design —
     # count each hypothesis once (archive copy wins) so accuracy denominators
     # never double-count.

@@ -52,7 +52,7 @@ import os
 import re
 import shutil
 from datetime import date, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional, Tuple
 
 from .. import file_locks, history, changelog
@@ -173,7 +173,7 @@ def _atomic_write_jsonl(path: Path, items: List[Dict[str, Any]]) -> None:
 # --- Validate / normalize (verbatim from experience.py) -------------------
 
 # Goal-id embedded in an experience id: exp-{goal-id}-{slug}. Verbatim from
-# experience.py derive_goal_id_from_id (7) — the daemon add path builds
+# experience.py derive_goal_id_from_id () — the daemon add path builds
 # ids as exp-{goal_id}-{skill_slug}, so a caller-formed cmd_add record can leave
 # the goal_id FIELD null while the id still names the goal. Underscore-prefixed
 # per the daemon's private-helper convention (cf. _normalize_record).
@@ -201,7 +201,7 @@ def _normalize_record(rec: dict) -> dict:
                 if sub_key not in rec[f]:
                     rec[f][sub_key] = sub_default
     # Backfill a null goal_id from the id when the id embeds a canonical goal-id
-    # (exp-g-NNN-NN-*). Symmetric with experience.py normalize_record (7)
+    # (exp-g-NNN-NN-*). Symmetric with experience.py normalize_record ()
     # — without this the LIVE daemon write path leaves goal_id null on caller-formed
     # cmd_add records, blinding the daemon --goal read filter (rec.get("goal_id")
     # == goal). NEVER overwrites a present value; slug-only ids stay null.
@@ -231,6 +231,19 @@ def _validate_record(ctx, rec: dict) -> None:
     stats = rec.get("retrieval_stats")
     if stats is not None and not isinstance(stats, dict):
         raise ValueError("retrieval_stats must be a dict")
+    # guard-1373 /  (Layer-B write-time enforcement): reject a
+    # content_path under a temp/ directory segment. temp/ is periodically
+    # drained, so a body registered there is orphan-prone (foxtrot accumulated
+    # 23 such orphaned entries — ). guard-1373 is the LLM-facing rule
+    # (Layer A) and the verify-learning audit is the detective (Layer C); this
+    # closes the programmatic write path that neither prevented. Segment match
+    # (PurePosixPath.parts), not substring, so "template/" etc. are unaffected.
+    cp_parts = PurePosixPath(str(rec["content_path"]).replace("\\", "/")).parts
+    if "temp" in cp_parts:
+        raise ValueError(
+            f"content_path must not be under a temp/ directory (orphan-prone — "
+            f"temp/ is drained): {rec['content_path']}; use a durable location "
+            f"such as agents/<agent>/experience/ (guard-1373)")
     content_path = Path(rec["content_path"])
     if not content_path.is_absolute():
         content_path = ctx.paths.project_root / content_path
@@ -261,7 +274,7 @@ def _check_no_duplicate_id(items, rec_id, archive_items=None) -> None:
 
 
 def _uniquify_id(base_id: str, items, archive_items=None) -> str:
-    """5: auto-suffix on id collision. A recurring re-run of the same
+    """: auto-suffix on id collision. A recurring re-run of the same
     goal+skill is a NEW execution, not an idempotent retry — the pre-fix 409
     refusal silently lost the fresh trace (orphaned .md). Try base, then
     -YYYYMMDD, then -YYYYMMDD-2..-99; same-day exhaustion raises ValueError."""
@@ -418,7 +431,7 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
     rec = _normalize_record(rec)
     rec["created"] = _stamp_now()
 
-    # 7: derive goal_id from the id when the payload omits it — a
+    # : derive goal_id from the id when the payload omits it — a
     # null goal_id makes the record invisible to the exact-match --goal read
     # filter even though the goal id is embedded in the record id
     # (fleet measured 28-34% null on 2026-07-10). Conservative prefix regex:
@@ -591,7 +604,7 @@ def archive_goal(ctx) -> "Response":  # type: ignore[name-defined]
         return Response.error(400, "invalid_id",
                               f"computed experience id fails validation: {base_experience_id}")
 
-    # 5: uniquify BEFORE deriving the canonical .md path so a
+    # : uniquify BEFORE deriving the canonical .md path so a
     # recurring re-run gets a fresh id (dated suffix) instead of a 409 that
     # orphans the trace. Suffix chars ([0-9-]) preserve ID_RE validity.
     items = _read_jsonl(_live_path(ctx))
@@ -613,10 +626,10 @@ def archive_goal(ctx) -> "Response":  # type: ignore[name-defined]
     # COPY trace to canonical (must precede _validate_record's content_path
     # check — the validator requires the file to exist at content_path, so the
     # ordering itself cannot change without splitting the validator).
-    # 5: copy-not-move. The old os.replace consumed the caller's
+    # : copy-not-move. The old os.replace consumed the caller's
     # trace on EVERY post-move failure (validation_failed, in-lock 409s,
     # write_failed), stranding an orphan .md and making retries
-    # non-idempotent (observed 5-attempt sequence, 3 close). The
+    # non-idempotent (observed 5-attempt sequence,  close). The
     # source is deleted only after the record lands; _abort removes the copy
     # on every post-copy failure path.
     copied_from: Optional[Path] = None

@@ -526,7 +526,7 @@ def _read_micro_hypotheses():
     data = _load_yaml(wm, {}) or {}
     # Slots live under the top-level `slots:` map in the live WM layout — the
     # old top-level read returned None for every invocation, so batch-micro
-    # always early-exited with "no micro-hypotheses to process" (9).
+    # always early-exited with "no micro-hypotheses to process" ().
     # Keep the top-level read as fallback for pre-slots layouts.
     slots = data.get("slots")
     if isinstance(slots, dict) and slots.get("micro_hypotheses") is not None:
@@ -646,7 +646,7 @@ def cmd_batch_micro(args):
     if actionable:
         flags.append("actionable_discoveries")
 
-    # 9: counted-once contract. Settled micros are counted into the
+    # : counted-once contract. Settled micros are counted into the
     # all-time counters at THIS pass and must then LEAVE the WM slot — the
     # caller writes micro_hypotheses_writeback (pending-only) back to WM.
     # total_all_time is DERIVED (confirmed_all_time + corrected_all_time +

@@ -261,7 +261,7 @@ case "$CATEGORY" in
 esac
 if [ -n "${WORLD_DIR:-}" ] && [ -n "$CANDIDATE_NODE_KEY" ]; then
   CANDIDATE_NODE_FILE="${WORLD_DIR}/knowledge/tree/${CANDIDATE_NODE_KEY}.md"
-  # 6: the category heuristic can name a node that does NOT exist
+  # : the category heuristic can name a node that does NOT exist
   # (e.g. category "agent-health" -> agent-health.md, never created). A phantom
   # candidate keeps the Phase 0-pre4 consumer stuck -- it cannot Edit a
   # non-existent node, so encoding is skipped and the sentinel never clears

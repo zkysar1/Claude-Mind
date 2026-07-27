@@ -49,7 +49,7 @@ def _write_jsonl(path: Path, records: list[dict]) -> None:
 
 
 # Verbatim shape of a leaked test_asp_id_auto_allocation.py fixture (the
-# 4 incident record).
+#  incident record).
 FIXTURE_ASP = {
     "id": "asp-338", "title": "auto-minted", "motivation": "g-328-29 fixture",
     "status": "active", "goals": [
@@ -121,6 +121,28 @@ def test_archive_is_scanned(tmp_path):
                for s in suspects), suspects
 
 
+def test_retired_and_archived_tombstones_are_skipped(tmp_path):
+    """: a retired/archived aspiration is a GOVERNED tombstone -- a
+    leak already handled via aspirations status (the g-328-29 asp-338..349 batch
+    retired 2026-07-14). Re-flagging it every 24h run is pure re-triage noise.
+    A FRESH leak never carries retired/archived status, so live detection is
+    preserved: an active-status fixture in the SAME store still flags, and its
+    nested goals are skipped along with the tombstone aspiration."""
+    scanner = _load_scanner()
+    retired_asp = {**FIXTURE_ASP, "id": "asp-338", "status": "retired"}
+    archived_asp = {**FIXTURE_ASP, "id": "asp-339", "status": "archived"}
+    live_asp = {**FIXTURE_ASP, "id": "asp-350", "status": "active"}
+    world = _seed_world(tmp_path, archive=[retired_asp, archived_asp, live_asp])
+    ids = {s["record_id"] for s in scanner.scan(world_dir=str(world))}
+    # Governed tombstones (and their nested goals) are NOT flagged.
+    assert not any(i.startswith("asp-338") for i in ids), ids
+    assert not any(i.startswith("asp-339") for i in ids), ids
+    # A fresh (active-status) leak in the same archive store IS still detected,
+    # nested goals included -- live-leak detection is preserved.
+    assert "asp-350" in ids
+    assert "asp-350/g-338-01" in ids
+
+
 def test_exit_on_hits_codes(tmp_path, monkeypatch):
     scanner = _load_scanner()
     world = _seed_world(tmp_path, live=[FIXTURE_ASP])
@@ -148,4 +170,6 @@ if __name__ == "__main__":
     test_clean_store_returns_zero(Path(__import__("tempfile").mkdtemp()))
     test_parallel_filer_regex_is_anchored(Path(__import__("tempfile").mkdtemp()))
     test_archive_is_scanned(Path(__import__("tempfile").mkdtemp()))
+    test_retired_and_archived_tombstones_are_skipped(
+        Path(__import__("tempfile").mkdtemp()))
     print("ok (run under pytest for the monkeypatch exit-code test)")

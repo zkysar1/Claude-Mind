@@ -259,7 +259,7 @@ def test_parent_pending_not_applied():
 
 
 def test_provenance_guard_fires_through_main():
-    """rb-3887 guard-FIRING branch through main() (6).
+    """rb-3887 guard-FIRING branch through main() ().
 
     Fixture: discovered_by-only parent link (origin_signal carries no goal-id,
     title has no "for <g-id>" form) on an Unblock created AFTER its parent's

@@ -90,17 +90,17 @@ def test_own_goals_ownership_filter(tmp_path):
         agent_asps=[{"id": "asp-900", "goals": [
             _goal("g-900-1", "in-progress"),
             _goal("g-900-2", "pending"),
-            _goal("", "completed"),   # excluded (terminal)
+            _goal("g-900-3", "completed"),   # excluded (terminal)
         ]}],
         world_asps=[{"id": "asp-901", "goals": [
-            _goal("", "in-progress", claimed_by="delta"),   # own
-            _goal("", "in-progress", claimed_by="alpha"),   # NOT own
-            _goal("", "pending"),                            # unclaimed -> not own
+            _goal("g-901-1", "in-progress", claimed_by="delta"),   # own
+            _goal("g-901-2", "in-progress", claimed_by="alpha"),   # NOT own
+            _goal("g-901-3", "pending"),                            # unclaimed -> not own
         ]}],
     )
     og = _run(world, agent)["sections"]["own_goals"]
     ip_ids = {g["id"] for g in og["in_progress"]}
-    assert ip_ids == {"", ""}     # alpha's + unclaimed excluded
+    assert ip_ids == {"g-900-1", "g-901-1"}     # alpha's + unclaimed excluded
     assert og["pending_count"] == 1             # only the agent-queue pending
 
 

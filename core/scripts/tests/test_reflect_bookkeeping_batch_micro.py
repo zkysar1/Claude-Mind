@@ -1,4 +1,4 @@
-"""Regression pins for reflect-bookkeeping.py batch-micro (9).
+"""Regression pins for reflect-bookkeeping.py batch-micro ().
 
 Two defects fixed together:
 
@@ -76,7 +76,7 @@ MICROS = [
 # ── reader layout (defect 1) ─────────────────────────────────────────────────
 
 def test_reader_finds_micros_under_slots_map(tmp_path, monkeypatch):
-    # 9 regression pin: live WM nests slots under `slots:` — the old
+    #  regression pin: live WM nests slots under `slots:` — the old
     # top-level read returned [] here and batch-micro always early-exited.
     wm = _write_wm(tmp_path, {"slots": {"micro_hypotheses": MICROS},
                               "slot_meta": {}})

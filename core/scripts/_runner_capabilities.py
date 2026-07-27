@@ -129,6 +129,86 @@ def derive_runner_capabilities(config=None, probe_fn=None):
     return caps
 
 
+# --- Per-box declaration surface (local-paths.conf) --------------------------
+# `core/config/aspirations.yaml` is git-shared and `meta/config-overrides.yaml`
+# is S3-shared -- BOTH apply fleet-wide, so neither can express "THIS box has a
+# live Studio session" without wrongly claiming it for every other runner.
+# `local-paths.conf` is the only genuinely per-box surface: gitignored AND in
+# `owncloud_sync._EXCLUDE_NAMES`, so it never reaches git or S3. These keys are
+# the conf's capability-declaration contract.
+BOX_CONF_PROVIDES = "RUNNER_CAPABILITIES_PROVIDES"   # comma-separated tokens
+BOX_CONF_LACKS = "RUNNER_CAPABILITIES_LACKS"         # comma-separated tokens
+BOX_CONF_PROBE = "RUNNER_CAPABILITIES_PROBE"         # "false"/"0"/"no" => no probes
+
+
+def _split_tokens(raw):
+    """Comma-separated conf value -> clean token list (empty on None/blank)."""
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple, set)):
+        parts = list(raw)
+    else:
+        parts = str(raw).split(",")
+    return [t for t in (str(p).strip() for p in parts) if t]
+
+
+def box_config_from_conf(conf):
+    """Translate a parsed `local-paths.conf` dict into a runner_capabilities
+    config block (same provides/lacks/probe shape as the aspirations.yaml
+    block, so both feed `derive_runner_capabilities` unchanged).
+
+    Returns {} when the conf declares none of the keys -- an absent declaration
+    must be indistinguishable from "no per-box config", so the fleet default
+    and probe behaviour are untouched on every box that never opts in.
+    """
+    if not isinstance(conf, dict):
+        return {}
+    out = {}
+    provides = _split_tokens(conf.get(BOX_CONF_PROVIDES))
+    lacks = _split_tokens(conf.get(BOX_CONF_LACKS))
+    if provides:
+        out["provides"] = provides
+    if lacks:
+        out["lacks"] = lacks
+    if BOX_CONF_PROBE in conf:
+        out["probe"] = str(conf.get(BOX_CONF_PROBE)).strip().lower() not in (
+            "false", "0", "no", "off")
+    return out
+
+
+def merge_capability_config(fleet_cfg, box_cfg):
+    """Merge the git-shared fleet block with the per-box declaration.
+
+    Precedence follows the module's existing "lacks is the authoritative last
+    word" rule, extended across the two layers:
+      * provides -- UNION. The box adds what it alone can assert (studio-session);
+        the fleet block keeps whatever it declared for everyone.
+      * lacks    -- UNION. Removal is authoritative from EITHER layer, and is
+        applied after provides by derive_runner_capabilities, so a token in
+        either `lacks` wins over a `provides` in either layer. A box can never
+        be wrongly forced to claim a capability it says it does not have.
+      * probe    -- the BOX wins when it declares one. Whether probes are
+        meaningful is a property of the physical box, not of the fleet.
+    """
+    fleet_cfg = fleet_cfg if isinstance(fleet_cfg, dict) else {}
+    box_cfg = box_cfg if isinstance(box_cfg, dict) else {}
+    merged = {}
+    for key in ("provides", "lacks"):
+        seen, union = set(), []
+        for layer in (fleet_cfg, box_cfg):
+            for tok in _split_tokens(layer.get(key)):
+                if tok not in seen:
+                    seen.add(tok)
+                    union.append(tok)
+        if union:
+            merged[key] = union
+    if "probe" in box_cfg:
+        merged["probe"] = box_cfg["probe"]
+    elif "probe" in fleet_cfg:
+        merged["probe"] = fleet_cfg["probe"]
+    return merged
+
+
 def goal_required_capabilities(goal):
     """Capabilities a goal REQUIRES. Conservative: EXPLICIT `requires_capability`
     only (a list, or a single string). A goal with none returns the empty set and

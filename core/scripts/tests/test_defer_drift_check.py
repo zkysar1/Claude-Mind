@@ -1,4 +1,4 @@
-"""Tests for defer-drift-check.py (6).
+"""Tests for defer-drift-check.py ().
 
 The guard flags goals whose deferred_until has gone PAST while a structured-
 defer marker persists (deferred_readiness selector pollution — canonical
@@ -176,7 +176,7 @@ def test_precondition_status_uncheckable_when_evaluator_absent(monkeypatch):
     assert mod._precondition_status(g) == "uncheckable"
 
 
-# ── on-schedule-expiry discrimination (1) ─────────────────────────
+# ── on-schedule-expiry discrimination () ─────────────────────────
 
 def test_on_schedule_expiry_classified_and_suppressed():
     """A defer whose prose maturity date == deferred_until expired on schedule —

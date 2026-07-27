@@ -128,7 +128,7 @@ if [[ -n "$SUMMARY" || -n "$RETRIEVAL_INFLUENCE" ]]; then
     # Scan BOTH summary and retrieval-influence lines — citations may appear
     # only in the influence articulation (R12 / G10 closure).
     # [0-9]{3,}: IDs crossed into 4 digits (rb-3742, guard-1151) — the old
-    # {3} exact-width silently dropped every modern cite (1, same
+    # {3} exact-width silently dropped every modern cite (, same
     # defect class as the board.py / board_write.py _CITE_RE fix).
     citations="$(printf '%s\n%s' "$SUMMARY" "$RETRIEVAL_INFLUENCE" | grep -oE '\b(rb|guard)-[0-9]{3,}\b' | sort -u || true)"
     for cite in $citations; do

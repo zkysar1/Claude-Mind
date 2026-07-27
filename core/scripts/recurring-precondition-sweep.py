@@ -112,7 +112,7 @@ def _advance_last_achieved_at(goal_id: str, source: str, now_iso: str, dry_run: 
     # as a direct `py` call (aspirations-precheck Phase 0.5c) with NO _paths.sh
     # preamble, so on env-only own-cloud hosts the inherited env lacks those
     # vars and the update-goal WRITE aborts BEFORE the lock ("cannot map a
-    # governed path to a root"; 2) — advanced=0 skipped_on_error=1,
+    # governed path to a root"; ) — advanced=0 skipped_on_error=1,
     # silently, every iteration a goal actually needs advancing. The READ side
     # above already resolved WORLD_DIR/META_DIR via _paths.py's
     # .mind-data/local-paths.conf fallback, so propagate them under the names

@@ -1,4 +1,4 @@
-"""test_add_goal_id_uniqueness_guard.py — regression for 4.
+"""test_add_goal_id_uniqueness_guard.py — regression for .
 
 The single-goal add_goal endpoint must NEVER let a caller-supplied `id` collide
 with an existing goal in the same aspiration — INCLUDING a completed one. That

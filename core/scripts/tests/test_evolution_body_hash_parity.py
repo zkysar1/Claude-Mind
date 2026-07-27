@@ -1,4 +1,4 @@
-"""3-way parity pin for the evolution body-hash implementations (8).
+"""3-way parity pin for the evolution body-hash implementations ().
 
 g-115-2567 made hash EQUALITY across three hand-maintained copies load-bearing:
 the sweep's live-dedup join skips a backfill entry only when the commit blob's

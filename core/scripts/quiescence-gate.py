@@ -86,16 +86,22 @@ from _paths import AGENT_DIR, CONFIG_DIR, CORE_ROOT  # noqa: E402
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
 
 
-# Bare goal-id-shaped tag (e.g. "6"): a finding carrying a bare goal
+# Bare goal-id-shaped tag (e.g. ""): a finding carrying a bare goal
 # id IS goal-linked, even without the "goal_id:" prefix. The drainable detector
 # (_count_actionable_findings_without_goal) must treat it as has_goal, or it
 # over-counts actionable-without-goal findings and fires approved_but_drainable
 # on a false set every quiescence cycle (rb-3014 / bravo finding msg-2962,
 # empirically confirmed 2026-07-10: 3 of 5 flagged findings were bare-tag
 # goal-linked). Shape per CLAUDE.md ID Formats: g-<aspiration digits>-<goal
-# digits>. Fully anchored so g-prefixed non-goal tags (git-sync, cc-05) do NOT
-# match.
-_GOAL_ID_TAG_RE = re.compile(r"^g-\d+-\d+$")
+# digits>, INCLUDING the optional "-<letter>" decomposition suffix
+# (-d, -b) and the g-xw-<ts>-NN cross-world form — i.e. the
+# canonical goal-id shape of aspirations.py GOAL_ID_RE (SSOT). The earlier
+# "^g-\d+-\d+$" missed the "-<letter>" suffix, so a finding tagged e.g.
+# "-d" (a real completed goal) read as UN-linked and fired a false
+# approved_but_drainable every quiescence cycle (, alpha finding
+# msg-4248 incident 2026-07-25). Still fully anchored so g-prefixed non-goal
+# tags (git-sync, cc-05) do NOT match.
+_GOAL_ID_TAG_RE = re.compile(r"^g-(?:\d+-\d+(?:-[a-z])?|xw-\d{8}T\d{6}-\d{2})$")
 
 
 # --- Config ------------------------------------------------------------------
@@ -275,7 +281,8 @@ def _compute_hash(blocker_refs):
 CYCLE_CACHE_NAME = "quiescence-last-cycle.json"
 
 
-def _write_cycle_cache(current_hash, refs_for_hash, sleep_seconds, goal_count, now):
+def _write_cycle_cache(current_hash, refs_for_hash, sleep_seconds, goal_count, now,
+                       earliest_wake_at=None):
     """Write the approved-cycle cache consumed by quiescence-cycle-cache.py.
 
     Single writer of <agent>/session/quiescence-last-cycle.json. Called ONLY on
@@ -308,6 +315,7 @@ def _write_cycle_cache(current_hash, refs_for_hash, sleep_seconds, goal_count, n
         "goal_count": goal_count,
         "cycle_count": 0,
         "wake_outcome": None,
+        "earliest_wake_at": earliest_wake_at,
         "approved_at": now.isoformat(timespec="seconds"),
     }
     p = AGENT_DIR / "session" / CYCLE_CACHE_NAME
@@ -765,13 +773,44 @@ def _count_unreflected_hypotheses():
         return 0
 
 
+def _finding_ids_linked_by_goal_origin():
+    """Finding-ids linked to a goal (open OR completed, world+agent) via its
+    origin_signal `board_post:{finding-id}` (g-115-3057). A finding whose ONLY
+    goal link is a completed goal's origin_signal carries no goal-id tag, so the
+    tag check in _count_actionable_findings_without_goal misses it and re-flags
+    it drainable on EVERY quiescence cycle — B6.8 then re-investigates a
+    fully-handled finding forever (the completed-twin blind spot; concrete:
+    msg-4277 -> g-250-262 completed, origin_signal=board_post:msg-4277).
+    origin_signal is the strong unique-per-finding dedup key (rb-5058); this
+    mirrors the origin_signal_completed strategy g-115-3048 added to
+    goal_duplication.py. Fail-soft: empty set on any error."""
+    from _paths import WORLD_DIR
+    covered = set()
+    for asp_path in (
+        AGENT_DIR / "aspirations.jsonl" if AGENT_DIR else None,
+        WORLD_DIR / "aspirations.jsonl" if WORLD_DIR else None,
+    ):
+        for asp in _load_aspirations_from(asp_path):
+            for goal in asp.get("goals", []):
+                if not isinstance(goal, dict):
+                    continue
+                origin = (goal.get("origin_signal") or "").strip()
+                if origin.startswith("board_post:"):
+                    fid = origin[len("board_post:"):].strip()
+                    if fid:
+                        covered.add(fid)
+    return covered
+
+
 def _count_actionable_findings_without_goal():
     """Count findings (board, 7d) tagged 'actionable', NOT goal-linked, and
     not authored by this agent — matching B6.8 Target 3's conversion filter so
     the gate's count agrees with what the orchestrator would actually drain.
-    "Goal-linked" = a literal 'goal_id' tag, a 'goal_id:<id>' prefixed tag, OR
-    a bare goal-id-shaped tag (e.g. 'g-115-1766' — rb-3014). board-read emits
-    JSONL (one post per line) or a JSON array; tolerate both. 0 on any error."""
+    "Goal-linked" = a literal 'goal_id' tag, a 'goal_id:<id>' prefixed tag, a
+    bare goal-id-shaped tag (e.g. 'g-115-1766' — rb-3014), OR a goal (open or
+    completed) whose origin_signal is `board_post:{this-finding-id}`
+    (g-115-3057 completed-twin fix). board-read emits JSONL (one post per line)
+    or a JSON array; tolerate both. 0 on any error."""
     try:
         agent = os.environ.get("MIND_AGENT", "") or ""
         raw = _rt.rt_call("GET", "/v1/board/read",
@@ -791,6 +830,11 @@ def _count_actionable_findings_without_goal():
                     posts.append(json.loads(line))
                 except json.JSONDecodeError:
                     continue
+        # Findings covered by a goal's origin_signal (open or completed) carry
+        # no goal-id tag — resolve them once so the completed-twin case (a
+        # fully-handled finding whose only link is a COMPLETED goal) is not
+        # counted drainable ().
+        origin_covered = _finding_ids_linked_by_goal_origin()
         count = 0
         for post in posts:
             if not isinstance(post, dict):
@@ -806,7 +850,9 @@ def _count_actionable_findings_without_goal():
                 or _GOAL_ID_TAG_RE.match(t)
                 for t in tag_strs
             )
-            if has_actionable and not has_goal and post.get("author") != agent:
+            covered_by_origin = str(post.get("id") or "") in origin_covered
+            if (has_actionable and not has_goal and not covered_by_origin
+                    and post.get("author") != agent):
                 count += 1
         return count
     except Exception as e:
@@ -1047,6 +1093,28 @@ def cmd_check(args, cfg):
         elif reset_counter and int(q.get("fragmented_count", 0) or 0) > 0:
             q_new["fragmented_count"] = 0
 
+        # D1: cap sleep_seconds at the earliest timer horizon so the loop
+        # wakes when a deferred/recurring/blocker-expiry/hypothesis-gated
+        # goal becomes executable. scan_queue is shared with dry-idle via
+        # _wake_timers. Fail-open: scan failure leaves _wt_earliest=None
+        # and sleep_seconds stays at the config/fragmentation value.
+        _wt_earliest = None
+        try:
+            from _wake_timers import scan_queue, MIN_FLOOR_S as _TIMER_FLOOR
+            _, _wt_earliest = scan_queue(now)
+        except Exception:
+            pass
+        if _wt_earliest is not None:
+            try:
+                _wt_dt = datetime.fromisoformat(str(_wt_earliest).rstrip("Z"))
+                _wt_secs = int((_wt_dt - now).total_seconds())
+                if _wt_secs < _TIMER_FLOOR:
+                    _wt_secs = _TIMER_FLOOR
+                if _wt_secs < sleep_seconds:
+                    sleep_seconds = _wt_secs
+            except (ValueError, TypeError):
+                pass
+
         q_new["iters"] = int(q_new.get("iters", 0)) + 1
 
         # B6.8 (): gather drainable hygiene evidence (design section
@@ -1067,6 +1135,7 @@ def cmd_check(args, cfg):
         q_new["active_snapshot"] = {
             "entered_at": now.isoformat(timespec="seconds"),
             "sleep_seconds": sleep_seconds,
+            "earliest_wake_at": _wt_earliest,
             "refs": refs_for_hash,
             # Baseline for Magic Wand 2 newly-arrived-work check. Read by
             # cmd_verify_wake → _check_newly_arrived_work. If the field is
@@ -1099,7 +1168,8 @@ def cmd_check(args, cfg):
     # never voids the approval — the fast path just MISSES next iteration).
     if approved:
         _write_cycle_cache(current_hash, refs_for_hash, sleep_seconds,
-                           goal_count_at_entry, now)
+                           goal_count_at_entry, now,
+                           earliest_wake_at=_wt_earliest)
 
     # --- Log and return -------------------------------------------------------
     record = {
@@ -1150,6 +1220,7 @@ def cmd_check(args, cfg):
         "should_notify": prolonged.get("should_notify", False),
         "prolonged_payload": prolonged.get("prolonged_payload"),
         "throttled_hours_remaining": prolonged.get("throttled_hours_remaining"),
+        "earliest_wake_at": _wt_earliest if approved else None,
     }
     print(json.dumps(output, ensure_ascii=False, default=str))
 

@@ -47,12 +47,17 @@ QUERY="channel=$(rt_url_encode "$CHANNEL")"
 [ -n "$TAGS" ]     && QUERY+="&tags=$(rt_url_encode "$TAGS")"
 
 # Translate daemon JSON to CLI-compat stdout: print only the message ID.
+# : any advisory warnings the daemon returns (e.g. a dangling
+# reply_to) go to STDERR, keeping stdout = just the id so id-parsing callers
+# are unaffected.
 _extract_id() {
     # shellcheck disable=SC2086
     printf '%s' "$1" | $(rt_python_launcher) -c "
 import json, sys
 resp = json.load(sys.stdin)
 print(resp['id'])
+for w in (resp.get('warnings') or []):
+    print('[board-post] WARN: ' + str(w), file=sys.stderr)
 "
 }
 

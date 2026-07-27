@@ -9,7 +9,7 @@
 # <agent>/session/uncommitted-edits.jsonl. The partner-uncommitted-log filter
 # in iteration-commit.sh () reads that log to drop partner-authored
 # neutral files from a committer's `git add`. Bash-created files are invisible
-# to it, so a partner's iteration-commit sweeps them — the 6
+# to it, so a partner's iteration-commit sweeps them — the 
 # over-inclusion class (events.py, knowledge-graph-build.py: 545 LOC committed
 # under the wrong agent with no fresh-eyes review, 2026-06-20).
 #

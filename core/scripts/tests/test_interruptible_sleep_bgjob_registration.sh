@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test_interruptible_sleep_bgjob_registration.sh — regression for 7
+# test_interruptible_sleep_bgjob_registration.sh — regression for 
 # (quiescence-sleep pacing via background-jobs registration, 2026-07-10).
 #
 # Verifies that interruptible-sleep.sh under QUIESCENCE_SLEEP=1 registers a
@@ -185,7 +185,7 @@ case5() {
   fi
 }
 
-# ── Case 6: EXTERNAL_WAIT (mid-goal external wait, 8) registers ──
+# ── Case 6: EXTERNAL_WAIT (mid-goal external wait, ) registers ──
 # Mirrors case1 but for the external-wait-sleep job type. Self-contained row
 # checks (the shared helpers grep the quiescence-sleep- prefix) so cases 1-5
 # are untouched.

@@ -71,6 +71,7 @@ PROJECT_ROOT = CORE_ROOT.parent
 
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, g-115-3030)
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
 
 # Canonical path + fileop primitives. _paths.WORLD_DIR is the single source
@@ -697,7 +698,7 @@ def _age_hours(ts):
     if not ts:
         return None
     try:
-        t = dt.datetime.fromisoformat(str(ts).replace("Z", ""))
+        t = parse_naive_iso(ts)
         return (dt.datetime.now() - t).total_seconds() / 3600
     except Exception:
         return None

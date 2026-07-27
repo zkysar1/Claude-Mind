@@ -34,8 +34,8 @@ import pytest
 
 # parents[3]: tests -> scripts -> core -> PROJECT_ROOT. The prior
 # .parent.parent.parent stopped at <root>/core, doubling CONFIG_DIR to
-# core/core/config — the 9 .parents off-by-one class IN a test
-# (this file never ran green before 3).
+# core/core/config — the  .parents off-by-one class IN a test
+# (this file never ran green before ).
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 INIT_META = PROJECT_ROOT / "core" / "scripts" / "init-meta.sh"
 CONFIG_DIR = PROJECT_ROOT / "core" / "config"

@@ -1,4 +1,4 @@
-"""Unit tests for 4 min_session_goals gate in felt-sense-cadence-check.py.
+"""Unit tests for  min_session_goals gate in felt-sense-cadence-check.py.
 
 Three cases mirror the fresh-eyes-cadence-check.py test (same gate shape):
 1. no-gate (min_session_goals=0): behaves as before — fire when diff >= cadence

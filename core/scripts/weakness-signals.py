@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""weakness-signals.py — windowed weakness-signal computation (5).
+"""weakness-signals.py — windowed weakness-signal computation ().
 
 Computes the /reflect Step 5.55 guardrail + pattern-signature weakness signals
 over a WINDOW (delta since the last weakness analysis) instead of lifetime

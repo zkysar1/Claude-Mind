@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # IRREDUCIBLY LOCAL -- per-Bash-call latency budget / precheck cadence gate. Keep local: never add MCP or remote-service indirection here (a localhost daemon hop, where already present, is the maximum).
-# Cadence gate for the curriculum re-evaluation ritual (1).
+# Cadence gate for the curriculum re-evaluation ritual ().
 #
 # Exit 0 → curriculum-evaluate should re-run this iteration (interval elapsed
 #          OR never evaluated).

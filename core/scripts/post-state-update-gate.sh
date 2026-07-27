@@ -46,6 +46,7 @@ emit_json() {
   FIRED="${FIRED:-false}" \
   CORE_FILES="${CORE_FILES:-}" \
   COMMITS_SCANNED="${COMMITS_SCANNED:-0}" \
+  SCOPE_DEGRADED="${SCOPE_DEGRADED:-}" \
   python3 - <<'PYEOF'
 import json, os
 fired = os.environ.get("FIRED") == "true"
@@ -56,11 +57,16 @@ reason = os.environ.get("REASON") or ""
 files_raw = os.environ.get("CORE_FILES") or ""
 files = [l.strip() for l in files_raw.splitlines() if l.strip()][:20]
 out = {"fired": fired, "core_count": cc, "loc_changed": loc, "reason": reason}
-# Multi-commit committed scope (0): how many goal commits were unioned.
+# Multi-commit committed scope (): how many goal commits were unioned.
 # 0 = working-tree scope. Additive field — consumers key on fired/files/reason.
 scanned = int(os.environ.get("COMMITS_SCANNED", "0") or "0")
 if scanned:
     out["commits_scanned"] = scanned
+# : the caller ASKED for committed scope and got none, so the run
+# silently degraded to working-tree scope. Additive + only-when-true, so the
+# absence of the field keeps meaning "nothing to report" for every consumer.
+if os.environ.get("SCOPE_DEGRADED"):
+    out["scope_degraded"] = os.environ["SCOPE_DEGRADED"]
 if fired:
     out["files"] = files
     if ns:
@@ -76,7 +82,7 @@ fi
 
 # ── Gather changed files ─────────────────────────────────────────────────────
 # Two scope modes:
-#   (1) COMMITTED SCOPE (8) — when iteration-close.sh extracts the
+#   (1) COMMITTED SCOPE () — when iteration-close.sh extracts the
 #       commit_sha from iteration-commit.sh's JSON output and exports COMMIT_SHA,
 #       scope detection to exactly the files THAT COMMIT landed
 #       (git diff --name-only ${SHA}~1..${SHA}) and SKIP untracked detection.
@@ -85,7 +91,7 @@ fi
 #       inherits that decision instead of re-deriving it from a working tree that
 #       may carry partner WIP at neutral paths (core/scripts/, core/config/,
 #       mind_api/src/). Closes the stranded-partner false-positive class
-#       (4 investigation, Option B). The gate's OWN attribution filter
+#       ( investigation, Option B). The gate's OWN attribution filter
 #       (below) is ALSO skipped in this mode — it exists to scrub working-tree
 #       noise that committed scope eliminates by construction, and re-running it
 #       on fresh-mtime committed files would reintroduce the Source-1 over-drop
@@ -99,7 +105,7 @@ fi
 # (a script added in the commit shows as status=A in the range diff, not as
 # untracked).
 #
-# DELTA vs CUMULATIVE (2): mode (1) IS per-goal-delta scoped — the
+# DELTA vs CUMULATIVE (): mode (1) IS per-goal-delta scoped — the
 # committed range is exactly this goal's landed work — and it is the PRIMARY
 # path (iteration-close.sh runs iteration-commit BEFORE this gate on every deep
 # close, so a deep goal that committed core edits takes committed scope). Mode
@@ -110,7 +116,7 @@ fi
 # norm; the cross-agent attribution filter (below) drops known-partner residue;
 # and the mode-only exclusion (below) drops zero-content residue, the largest
 # recurring subclass (exec-bit normalization of Windows-authored *.sh on Linux,
-# e.g. 1's 434-file commit). A full iteration-start dirty-set baseline
+# e.g. 's 434-file commit). A full iteration-start dirty-set baseline
 # (snapshot at loop entry, subtract at gate time) was evaluated and DEFERRED:
 # the only clean iteration-start capture point is a critical-path script
 # (heartbeat-tick.sh, IRREDUCIBLY LOCAL) or fragile SKILL.md pseudocode, and any
@@ -125,12 +131,12 @@ GOAL_ID="${GOAL_ID:-}"
 COMMIT_SHA_VALID=no
 COMMITTED_NEW_SCRIPTS=""
 
-# ── Multi-commit committed scope (0) ────────────────────────────────
+# ── Multi-commit committed scope () ────────────────────────────────
 # A deep goal may land MORE than one commit: the sanctioned mid-Phase-4
 # iteration-commit (e.g. committing daemon code early so the post-commit hook
 # restarts the daemon for live verification) plus the close-time commit. The
 # close-time COMMIT_SHA alone missed the mid-goal commit entirely (canonical:
-# 6 — new core script + 3 core files in e7cb064e evaded the gate
+#  — new core script + 3 core files in e7cb064e evaded the gate
 # because close commit 191a772b carried only docs). Fix: when the caller passes
 # GOAL_ID, union in every commit whose message carries "(GOAL_ID)" —
 # iteration-commit.sh stamps the goal id into every subject it composes
@@ -145,7 +151,7 @@ SHA_LIST="$COMMIT_SHA"
 if [ -n "$GOAL_ID" ]; then
   # Colon anchor (fresh-eyes msg-3119): match the stamp format
   # `type(goal-id): title` exactly — a prose CITATION of a goal id in a later
-  # commit's body ("closes the gap (2)") lacks the colon and no
+  # commit's body ("closes the gap ()") lacks the colon and no
   # longer cross-unions into that goal's scope. Zero recall loss: every
   # iteration-commit subject carries "(<goal-id>):".
   GOAL_SHAS=$(git log --fixed-strings --grep "(${GOAL_ID}):" --format=%H -n 50 --since=48.hours 2>/dev/null || true)
@@ -166,9 +172,41 @@ if [ -n "$SHA_LIST" ]; then
   done <<< "$SHA_LIST"
 fi
 COMMITS_SCANNED=0
+SCOPE_DEGRADED=""
 if [ -n "$VALID_SHAS" ]; then
   COMMIT_SHA_VALID=yes
   COMMITS_SCANNED=$(printf '%s\n' "$VALID_SHAS" | grep -c . || echo 0)
+elif [ -n "$COMMIT_SHA" ] || [ -n "$GOAL_ID" ]; then
+  # ── Goal-scope degradation () ────────────────────────────────────
+  # The caller ASKED for committed scope — iteration-close.sh always passes
+  # GOAL_ID — but no commit resolved, so the run falls through to the
+  # working-tree branch below. That fallback is CUMULATIVE: it diffs whatever
+  # is dirty vs HEAD, which in a live loop is a mix of this goal's edits and
+  # every prior goal's uncommitted residue. It still fires the gate (biasing to
+  # over-review is correct), but its verdict is no longer attributable to THIS
+  # goal — and until now that swap happened in total silence, so a verdict read
+  # as goal-scoped when it was not.
+  #
+  # This is the real defect behind . The originally-suspected one —
+  # that agent bookkeeping churn makes the fallback unreachable — is real in the
+  # abstract but sits on a path iteration-close never takes: measured with
+  # GOAL_ID set, the gate resolved the goal's commit (commits_scanned=1) and
+  # correctly reported core_count=0. The verdict quoted in that goal's own
+  # description carried NO commits_scanned field, which is precisely how the
+  # silent degradation was caught: it had come from working-tree scope.
+  # Loud-and-attributable beats silently-plausible.
+  #
+  # Benign causes exist (goal closed with nothing committed yet; a commit older
+  # than the 48h window; a shallow clone) — hence a warning, never a failure.
+  # stderr goes to core/logs/iteration-close-stderr.log; the JSON field is what
+  # a later audit can actually count.
+  if [ -n "$GOAL_ID" ]; then
+    SCOPE_DEGRADED="no commit matched \"(${GOAL_ID}):\" within 48h/50 commits${COMMIT_SHA:+ (COMMIT_SHA=${COMMIT_SHA} also unresolvable)}"
+  else
+    SCOPE_DEGRADED="COMMIT_SHA=${COMMIT_SHA} did not resolve to a commit with a parent"
+  fi
+  echo "[post-state-update-gate] WARNING: committed scope requested but unavailable — ${SCOPE_DEGRADED}." >&2
+  echo "[post-state-update-gate] Falling back to working-tree scope: the verdict below covers ALL uncommitted changes vs HEAD, not just ${GOAL_ID:-this goal}." >&2
 fi
 
 if [ "$COMMIT_SHA_VALID" = "yes" ]; then
@@ -177,7 +215,7 @@ if [ "$COMMIT_SHA_VALID" = "yes" ]; then
   # single BASE_FOR_LOC string.
   CHANGED=""
   RANGES=""
-  UNTRACKED=""  # committed scope — untracked detection skipped (8)
+  UNTRACKED=""  # committed scope — untracked detection skipped ()
   while IFS= read -r _s; do
     [ -z "$_s" ] && continue
     RANGES=$(printf '%s\n%s\n' "$RANGES" "${_s}~1..${_s}" | sed '/^$/d')
@@ -214,13 +252,27 @@ else
   #     empty, fall back to previous-commit-to-HEAD range.
   # Removing either path silently breaks the opposite scenario. The CHANGED-empty
   # check is the discriminator; do not replace with a timestamp heuristic.
+  #
+  # NOTE (, 2026-07-26): the loop's own bookkeeping under agents/<agent>/
+  # (journal.jsonl, changelog.jsonl, health/<date>.jsonl, skill-invocations.jsonl) is
+  # rewritten by iteration-close on EVERY goal, so in a live iteration CHANGED is
+  # essentially never empty and this fallback is unreachable. That is tolerable ONLY
+  # because this whole `else` branch is the degraded path: iteration-close always
+  # passes GOAL_ID, which takes the goal-attributed committed scope above instead.
+  # Do NOT "fix" the discriminator by filtering agents/ out of CHANGED — that was
+  # tried and reverted. Without a GOAL_ID there is nothing tying HEAD~1..HEAD to the
+  # current goal, so making the fallback reachable would attribute the PREVIOUS
+  # goal's committed core/ files to this one on every agent-files-only iteration.
+  # Unreachable-and-correct beats reachable-and-misattributing. The real defect was
+  # that committed scope could degrade to here SILENTLY; that is now loud (see the
+  # goal-scope degradation warning above).
   BASE_FOR_LOC="HEAD"
   if [ -z "$CHANGED" ]; then
     CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | sed '/^$/d' | sort -u || true)
     BASE_FOR_LOC="HEAD~1..HEAD"
   fi
   # Working-tree scope is single-range; RANGES unifies the numstat consumers
-  # below with the multi-range committed scope (0).
+  # below with the multi-range committed scope ().
   RANGES="$BASE_FOR_LOC"
 
   if [ -z "$CHANGED" ]; then
@@ -250,7 +302,7 @@ ATTRIB_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_cross_agent_attrib
 # Skipped under committed scope (COMMIT_SHA_VALID=yes): the committed set is
 # already this-agent-only (iteration-commit filtered it pre-commit), and
 # re-filtering fresh-mtime committed files would reintroduce the Source-1
-# over-drop the 4 investigation flagged (8).
+# over-drop the  investigation flagged ().
 if [ "$COMMIT_SHA_VALID" != "yes" ] && [ -n "${MIND_AGENT:-}" ] && [ -f "$ATTRIB_HELPER" ]; then
   if [ -n "$CORE_FILES" ]; then
     ATTRIB_TMP=$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/xagent-core-$$.txt")
@@ -268,14 +320,14 @@ if [ "$COMMIT_SHA_VALID" != "yes" ] && [ -n "${MIND_AGENT:-}" ] && [ -f "$ATTRIB
   fi
 fi
 
-# ── Mode-only exclusion (2) ─────────────────────────────────────────
+# ── Mode-only exclusion () ─────────────────────────────────────────
 # A file whose ONLY change is a mode bit (exec-bit normalization, symlink/type
 # flip) carries ZERO reviewable content: `git diff --numstat` reports it as
 # "0<tab>0<tab><path>". Counting it toward core_files — or firing a
 # fresh-eyes-code review on it — is a false positive: there is no code delta to
 # review. The LOC path below already treats mode-only as 0; this makes the
 # FILE-COUNT path consistent, so the gate measures CONTENT deltas, not mode
-# flips. Canonical residue class: 1 normalized 434 Windows-authored
+# flips. Canonical residue class:  normalized 434 Windows-authored
 # *.sh exec bits (100644->100755) in one commit — mode-only, zero content —
 # which would otherwise blow past core_files>=3 on the next deep close.
 #
@@ -290,7 +342,7 @@ fi
 MODE_ONLY_DROPPED=0
 if [ -n "$CORE_FILES" ]; then
   PRE_MODE_COUNT=$(printf '%s\n' "$CORE_FILES" | sed '/^$/d' | grep -c . || echo 0)
-  # Concatenate numstat across all ranges (0 multi-commit scope). The
+  # Concatenate numstat across all ranges ( multi-commit scope). The
   # CONTENT_CHANGED filter below admits a file when ANY range shows a nonzero
   # delta — correct union semantics (mode-only in one commit + content in
   # another = content).
@@ -338,7 +390,7 @@ LOC_CHANGED=0
 if [ -n "$CORE_SCRIPTS" ]; then
   while IFS= read -r f; do
     [ -z "$f" ] && continue
-    # Sum the file's delta across all ranges (multi-commit scope, 0).
+    # Sum the file's delta across all ranges (multi-commit scope, ).
     # awk's string→number coercion keeps binary-file "-" columns at 0, matching
     # the prior single-range behavior.
     n=$(while IFS= read -r _r; do
@@ -355,7 +407,7 @@ fi
 # for the reason string (full list is in CORE_FILES already). Source depends on
 # scope: working-tree → UNTRACKED (post-attribution-filter); committed scope →
 # COMMITTED_NEW_SCRIPTS (status=A files in the commit range), so guard-343's
-# new-script trigger survives committed scope (8).
+# new-script trigger survives committed scope ().
 NEW_SCRIPT=""
 if [ "$COMMIT_SHA_VALID" = "yes" ]; then
   NEW_SCRIPT_SOURCE="$COMMITTED_NEW_SCRIPTS"
@@ -623,7 +675,7 @@ PYEOF
   fi
   FIRED=true REASON="${REASONS% }" emit_json
 else
-  # 2 observability: name the mode-only exclusion when it reduced the
+  #  observability: name the mode-only exclusion when it reduced the
   # count, so a debugger seeing core_files=0 after an exec-bit-only commit sees
   # WHY (the fix worked) instead of an unexplained non-fire.
   MODE_SUFFIX=""

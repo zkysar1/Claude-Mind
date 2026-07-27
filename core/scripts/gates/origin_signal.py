@@ -77,7 +77,7 @@ ALLOWED_PREFIXES = (
     "idea:",
     "maintain:",
     "drift_detected:",
-    # cycle-detector lane — automated detection-driven filers (0).
+    # cycle-detector lane — automated detection-driven filers ().
     # These were filed in production (alert sweep, routing audit, insight
     # sweep) but passed the gate only via Layer-D title auto-derive or
     # --override-all, leaving their stored origin_signal unrecognized by
@@ -88,9 +88,20 @@ ALLOWED_PREFIXES = (
     "routing-mismatch:",        # post-decompose routing audit (specific-agent)
     "routing-either-resolve:",  # post-decompose routing audit (either-case)
     "insight_trigger:",         # insight-trigger-sweep Apply/Investigate goals
+    # Same cycle-detector lane, second reconciliation (). Found by
+    # diffing EVERY origin_signal literal prescribed across
+    # .claude/skills/*/SKILL.md + core/config/**/*.md against this tuple:
+    # 2 of 50 prescribed literals named a prefix that was never registered.
+    # Both are automated detection-driven filers, so they belong in this lane
+    # rather than being rewritten to a sanctioned agent-self prefix — a generic
+    # `unblock:`/`maintain:` would erase the discriminator each one's own
+    # reader matches on. Keep locked with the cycle-detector branch in
+    # _goal_source.infer(); check-origin-signal-drift.py re-runs the diff.
+    "skill-discovery-audit:",   # aspirations-evolve Step 9.5.5 forged-skill audit
+    "blocker_pattern:",         # aspirations-all-blocked MW#5 T1 Unblock synthesis
     "idle_fallback",
     "program-change-proposal:",
-    # _goal_source.infer() parity (9). These prefixes were already
+    # _goal_source.infer() parity (). These prefixes were already
     # recognized by _goal_source.py infer() as legitimate goal sources
     # (user / recurring-cycle / cycle-detector / agent-self) but had drifted
     # out of this whitelist. Goals carrying them passed source-inference yet

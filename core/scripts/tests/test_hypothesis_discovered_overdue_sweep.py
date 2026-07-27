@@ -1,4 +1,4 @@
-"""Unit tests for hypothesis-discovered-overdue-sweep.py classify_overdue (9).
+"""Unit tests for hypothesis-discovered-overdue-sweep.py classify_overdue ().
 
 Pure-classifier tests only -- no daemon, no file I/O (classify_overdue takes the
 record list + `now` explicitly). Daemon-safe: hermetic, no wm.py env I/O.
@@ -173,9 +173,9 @@ def test_counts_aggregate():
 
 
 # ---------------------------------------------------------------------------
-# 1: formed_date + horizon fallback when resolves_by is ABSENT.
+# : formed_date + horizon fallback when resolves_by is ABSENT.
 # Before this, resolves_by-absent records (the common draft shape) were skipped
-# entirely and never swept; 6 had to hand-triage 165 such records.
+# entirely and never swept;  had to hand-triage 165 such records.
 # ---------------------------------------------------------------------------
 
 
@@ -209,7 +209,7 @@ def test_no_resolves_by_recent_short_not_overdue():
 def test_no_resolves_by_long_horizon_recent_needs_judgment():
     # id-date 2026-03-19 + long window 90 = 06-17 -> 7d overdue < 90 long thresh ->
     # not expired; bare (no resolves_by => fails formation) -> NEEDS_JUDGMENT.
-    # Mirrors the 6 manual call: keep recent long-horizon predictions.
+    # Mirrors the  manual call: keep recent long-horizon predictions.
     rec = _no_rb(id="2026-03-19_old-long", horizon="long")
     c = SW.classify_overdue([rec], NOW)
     assert rec in c["needs_judgment"]
@@ -258,7 +258,7 @@ def test_non_date_sentinel_not_fallback_even_when_old():
     # NOT an absent value -- so it must NOT trigger the formed_date+horizon
     # fallback, even with a stale id-date. Distinguishes intentional-sentinel-skip
     # from truly-absent-fallback (guards the test_session_end_sentinel_skipped
-    # contract against re-break by 1's fallback).
+    # contract against re-break by 's fallback).
     rec = _bare(id="2026-01-01_very-old", horizon="session", resolves_by="session_end")
     c = SW.classify_overdue([rec], NOW)
     assert c["overdue"] == 0

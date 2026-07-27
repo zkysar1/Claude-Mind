@@ -237,12 +237,12 @@ def test_compact_restore_preserves_live_loop_state(sandbox, agent_dir):
 
 
 # ---------------------------------------------------------------------------
-# Test 4: signals.dry_idle dynamic sub-slot survives compaction (4-a)
+# Test 4: signals.dry_idle dynamic sub-slot survives compaction (-a)
 # ---------------------------------------------------------------------------
 
 @with_sandbox
 def test_compact_restore_preserves_dry_idle_signals(sandbox, agent_dir):
-    """4-a: the dynamic signals.dry_idle counter (streak, last_dry_at,
+    """-a: the dynamic signals.dry_idle counter (streak, last_dry_at,
     sleep_total_s, session_start_at, cap_cycles) must survive compaction. Because
     loop_state is in SKIP_SLOTS, a live loop_state carrying signals.dry_idle is
     preserved verbatim across compact-restore — a stale (pre-feature) checkpoint

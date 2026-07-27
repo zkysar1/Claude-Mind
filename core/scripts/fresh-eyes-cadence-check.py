@@ -181,7 +181,7 @@ def _report_filename_epoch(filename: str) -> float | None:
 
 
 def newest_reconcilable_report(reports_dir: Path, report_glob: str, slot_epoch: float):
-    """8 auto-reconcile detector. Return (Path, iso_ts) for the newest
+    """ auto-reconcile detector. Return (Path, iso_ts) for the newest
     report under `reports_dir` matching `report_glob` whose FILENAME timestamp is
     strictly newer than `slot_epoch` (the last cadence stamp). Return None when no
     such report exists — i.e. the most recent review is already accounted for by
@@ -276,7 +276,7 @@ def main() -> int:
     # Goal-count cadence (the single source of truth)
     current = count_completed_goals()
     last = wm_slot_value(slot_name) or {}
-    # Defensive type-guard (2, mirror of l1-skew-check.py:307): a
+    # Defensive type-guard (, mirror of l1-skew-check.py:307): a
     # legacy/restored WM slot may hold a bare timestamp string (the
     # pre-dict-migration shape) instead of the {goals_count_at_last_fire: N}
     # dict the recorder writes. Without this, last.get() raises AttributeError
@@ -356,7 +356,7 @@ def main() -> int:
             f"fresh-eyes-cadence-check: block={args.config_block} slot={slot_name} "
             f"current={current} last={last_count} diff={diff} cadence={goal_cadence}"
         )
-    # Negative-diff self-heal (6): a DOWNWARD count-basis correction
+    # Negative-diff self-heal (): a DOWNWARD count-basis correction
     # (census double-count repair, store surgery, count-basis change) leaves
     # the stamped slot ABOVE the live count. Without this branch, diff stays
     # negative and the ritual silently starves until the count regrows past
@@ -420,7 +420,7 @@ def main() -> int:
             )
         return 1
     if diff >= goal_cadence:
-        # 8 team-aware gate: shared-resource rituals (tree, program)
+        #  team-aware gate: shared-resource rituals (tree, program)
         # have ONE time series, but the per-agent WM slot above never sees a
         # TEAMMATE's fire — so an agent whose own slot is stale re-runs the
         # ritual days after the team already reviewed (canonical incident:
@@ -435,7 +435,7 @@ def main() -> int:
         # reached when the per-agent cadence already crossed) until the world
         # count elapses past the team stamp. Fail-open: missing file, missing
         # stamp, missing field, or parse error → per-agent behavior.
-        # KNOWN RESIDUAL (9, rb-2876): the world-only diff STILL
+        # KNOWN RESIDUAL (, rb-2876): the world-only diff STILL
         # crosses when a single fleet S3 sync imports > cadence completed
         # goals in one window (a transient fresh-box bring-up artifact --
         # steady-state syncs are incremental < cadence). Harm is
@@ -455,8 +455,8 @@ def main() -> int:
             if team_world is not None:
                 current_world = count_completed_goals(world_only=True)
                 team_diff = current_world - team_world
-                # Team-layer negative-diff self-heal (1, sibling of
-                # the 6 per-agent guard above): a DOWNWARD world-count
+                # Team-layer negative-diff self-heal (, sibling of
+                # the  per-agent guard above): a DOWNWARD world-count
                 # correction (census repair) leaves the shared stamp ABOVE the
                 # live world count, and only a FIRE re-stamps
                 # shared_cadences.<slot> (fresh-eyes-record-tick.sh) — which
@@ -534,7 +534,7 @@ def main() -> int:
                             f"{(team or {}).get('timestamp', '?')} < cadence) [g-115-1388]"
                         )
                     return 1
-        # 4 min_session_goals gate: world-goal completions tick every
+        #  min_session_goals gate: world-goal completions tick every
         # agent's cadence counter, but per-agent rituals (Self briefing, felt-
         # sense lanes 1-6) need session-scoped data to do real work. When the
         # firing-agent has <min_session_goals completed THIS session, return
@@ -553,7 +553,7 @@ def main() -> int:
                         f"session_done={session_done} < min_session_goals={min_session_goals})"
                     )
                 return 1
-        # 8 auto-reconcile: the fresh-eyes rituals write their archive
+        #  auto-reconcile: the fresh-eyes rituals write their archive
         # report (Phase 4) BEFORE stamping the cadence slot (Phase 8). Autocompact
         # between those two steps leaves a report on disk with the slot un-stamped,
         # so on the next iteration the cadence "fires" again even though the review

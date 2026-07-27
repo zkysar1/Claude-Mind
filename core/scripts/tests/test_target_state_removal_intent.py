@@ -49,7 +49,7 @@ is_read_intent = ts_mod.is_read_intent
 # ─── Positive cases: leading post-colon removal verb → True ─────────────
 
 def test_apply_retire_canonical_fp():
-    """The canonical session-104 FP shape (7)."""
+    """The canonical session-104 FP shape ()."""
     assert is_removal_intent("Apply: retire stale-read-gate — full removal scope") is True
 
 

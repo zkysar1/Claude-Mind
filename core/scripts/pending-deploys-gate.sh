@@ -97,9 +97,16 @@ _file_deploy_unblock() {
     local repo="$1" sha="$2" gid="$3" verdict="$4"
     local sha7="${sha:0:7}"
     local osig="unblock:pending-deploy-${sha7}"
-    # Dedup: if a live (pending|in-progress|blocked) Unblock already names this
-    # repo@sha7, do not re-file. resolved/skipped ones do NOT block a re-file
-    # (a re-failed re-push legitimately needs a fresh Unblock).
+    # Dedup: if a live (pending|in-progress|blocked) OR completed Unblock already
+    # names this repo@sha7, do not re-file. A COMPLETED Unblock for this EXACT
+    # origin_signal means the (immutable) sha's failure was already captured and
+    # addressed -- re-filing is pure noise (the g-115-2897 storm: 8 duplicate
+    # bddb90c Unblocks). Suppressing the duplicate FILING does not drop the
+    # failure: the ledger entry persists and keeps the closure not-clean (SG-b) +
+    # holds graceful stop (SG-c), so an unresolved deploy stays surfaced through
+    # those orthogonal mechanisms rather than through spammy re-files. Only
+    # skipped/expired do NOT block a re-file (a re-failed re-push legitimately
+    # needs a fresh Unblock).
     local dup
     dup="$(MIND_AGENT="$AGENT" bash "$SCRIPT_DIR/aspirations-query.sh" --goal-field origin_signal "$osig" 2>/dev/null || echo '')"
     if printf '%s' "$dup" | python3 -c '
@@ -111,8 +118,8 @@ except Exception:
     sys.exit(1)   # unparseable -> treat as no-dup, allow filing
 rows = d if isinstance(d, list) else (d.get("results") or d.get("goals") or [])
 for g in (rows or []):
-    if isinstance(g, dict) and g.get("status") in ("pending", "in-progress", "blocked"):
-        sys.exit(0)   # live dup exists
+    if isinstance(g, dict) and g.get("status") in ("pending", "in-progress", "blocked", "completed"):
+        sys.exit(0)   # live-or-completed dup exists -> suppress re-file
 sys.exit(1)
 ' 2>/dev/null; then
         echo "[pending-deploys-gate] Unblock for ${repo}@${sha7} already queued — not re-filing" >&2

@@ -178,7 +178,18 @@ re-introduces the clobber class g-115-1561 fixed.
               IF source==world: aspirations-claim.sh — its OWN Bash call, output
               VISIBLE (NEVER `>/dev/null 2>&1`, never newline-batched with the
               phase-4 markers below: g-115-2345 — a silenced 409 let echo execute
-              zeta's claimed goal for a full phase; guard-1007). Parse the JSON:
+              zeta's claimed goal for a full phase; guard-1007). On that SAME
+              claim call, forward the Scorer Sovereignty deviation code from
+              select Phase 2.94 as a `--deviation "{deviation_code}"` argument
+              (deviation_code is "" on the happy path — claiming the scorer top —
+              which the gate treats as no-code and allows). IF the claim exits 2
+              WITH a `scorer-sovereignty:` stderr message (the scorer-verdict gate
+              refused an unsanctioned divergence, g-115-2812): journal the abort
+              ("scorer-sovereignty refusal: {goal.id} not scorer top, no valid
+              deviation") + LOOP_CONTINUE — re-select next iteration (the fix is
+              either a valid --deviation code from Phase 2.94 or tuning
+              meta/goal-selection-strategy.yaml, NOT routing around the gate).
+              Parse the JSON:
               any `error` field OR claimed_by != self → journal abort +
               LOOP_CONTINUE (no phase-end — phase-start not yet written).
               # phase-start AFTER the claim (g-115-1371 / rb-1533): the phase-4-execute marker
@@ -194,6 +205,15 @@ re-introduces the clobber class g-115-1561 fixed.
               Bash: execution-diary.sh phase-start phase-4-execute --goal {goal.id}
               Bash: team-state-in-flight.sh --agent <self> --goal-id {goal.id}
               --title "{goal.title}" --phase 4   # live snapshot for partner
+              # SOURCE-ASYMMETRIC (g-115-3199). For source==world this is now
+              # REDUNDANT — aspirations-claim.sh `_post_claim_effects` stamps
+              # in_flight + current_focus automatically on every rc=0 claim, so
+              # the call above just re-writes identical values (idempotent, and
+              # harmless if kept for uniformity). For source==agent it is still
+              # LOAD-BEARING: agent-queue goals never invoke aspirations-claim.sh
+              # at all (see the `IF source==world` guard above), so this LLM call
+              # is their ONLY stamp path. Do not delete it on the strength of the
+              # world-path wiring alone.
               # `started` is NOT set here — the daemon claim chokepoint owns it
               # (aspirations_write.py setdefault at claim time; single-writer rule,
               # g-115-2175/g-115-2187-t). An LLM `started today` write would clobber

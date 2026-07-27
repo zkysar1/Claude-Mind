@@ -233,7 +233,7 @@ def test_move_to_resolved_requires_evidence(pipeline_daemon):
 
 
 def test_move_to_archived_tombstones_record(pipeline_daemon):
-    """6 tombstone-in-live archival: the record STAYS in live as a
+    """ tombstone-in-live archival: the record STAYS in live as a
     stage=archived tombstone (the own-cloud union-by-id merge cannot express
     a cross-file removal), the archive gains exactly one deduped copy, and
     archive_sweep prunes the tombstone after PRUNE_GRACE_DAYS."""
@@ -401,6 +401,10 @@ def test_update_field_reflected_sets_date(pipeline_daemon):
     rec = next(r for r in items if r["id"] == "2026-05-12_test-active")
     assert rec["reflected"] is True
     assert rec.get("reflected_date") is not None
+    # : the monotonic flag also carries WHO set it (provenance), from
+    # the calling agent (X-Mind-Agent header -> _agent_name), so reflected=true
+    # is auditable, not opaque.
+    assert rec.get("reflected_by") == "alpha"
 
 
 def test_update_field_history_and_changelog(pipeline_daemon):
@@ -434,7 +438,7 @@ def test_update_field_recomputes_meta(pipeline_daemon):
 
 
 # ---------------------------------------------------------------------------
-# pipeline/update (whole-record) — 5: archive-reach
+# pipeline/update (whole-record) — : archive-reach
 # ---------------------------------------------------------------------------
 
 def test_update_replaces_live_record(pipeline_daemon):
@@ -464,7 +468,7 @@ def test_update_replaces_live_record(pipeline_daemon):
 
 
 def test_update_reaches_archive(pipeline_daemon):
-    """5: update() probes the archive when the id is absent from
+    """: update() probes the archive when the id is absent from
     live, so a multi-field-corrupt ARCHIVED record — which rejects every
     single-field update-field repair because the whole record re-validates on
     each field write — can be repaired via this atomic whole-record path.

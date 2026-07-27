@@ -97,7 +97,7 @@ def main() -> int:
     # Pin the environment BEFORE the board import: board.py resolves
     # WORLD_DIR from _paths at module import, and _fileops/storage_backend
     # read STORAGE_BACKEND at first use. main()-style file runs OUTSIDE
-    # pytest — no conftest autouse pin (5 / guard-955).
+    # pytest — no conftest autouse pin ( / guard-955).
     tmp = Path(tempfile.mkdtemp(prefix="board-attr-unit-"))
     try:
         os.environ["MIND_WORLD"] = (tmp / "world").as_posix()
@@ -163,7 +163,7 @@ def main() -> int:
         if CALLS:
             failed.append(f"Case 5: expected no calls on general channel, got {CALLS}")
 
-        # ─── Case 6: 4-digit IDs attribute (1 regex regression) ───
+        # ─── Case 6: 4-digit IDs attribute ( regex regression) ───
         # The pre-fix \d{3} regex silently excluded every ID past 999 —
         # rb-3742 / guard-1151 are live current IDs.
         CALLS.clear()

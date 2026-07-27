@@ -1435,7 +1435,7 @@ class FreshnessProbe(Probe):
 
 
 class MirrorWedgeProbe(Probe):
-    """Own-cloud mirror-wedge visibility (9): classifies the sweep's
+    """Own-cloud mirror-wedge visibility (): classifies the sweep's
     conflict-streaks artifact (mirror_health.probe()) every tick. A both-
     diverged conflict silently freezes a file's mirror refresh — this box
     served days-stale world reads for ~21h (30 files, g-115-2548 wedge)
@@ -1476,8 +1476,24 @@ class MirrorWedgeProbe(Probe):
         if v == "wedged":
             self.consecutive_wedged += 1
             if self.consecutive_wedged >= self.WEDGED_TICKS_TO_FILE and not self.fired:
-                self.fired = True
                 goal = self._file_wedge_goal(verdict)
+                # Mark the episode fired ONLY when the goal actually landed
+                # (). Setting fired=True unconditionally (before this
+                # fix) meant a single filing FAILURE — a gate block that the
+                # --override-duplication above now prevents, or a transient
+                # daemon error — permanently lost the wedge goal for the whole
+                # episode while the freeze persisted (observed: working-memory.yaml
+                # frozen ~411 sweeps, filed:false 2026-07-18 + 2026-07-20, never
+                # queued). Leaving fired=False on failure re-attempts the filing
+                # on the next wedged tick; the Event still emits each attempt so a
+                # persistent failure stays loud rather than silent. The dedup
+                # return (an open wedge goal ALREADY covers this box) also counts
+                # as covered — else a wedge that clears then reappears while the
+                # prior goal is still open would re-emit a critical event EVERY
+                # tick ( review). ONLY a genuine no-goal failure keeps
+                # fired=False so it retries.
+                if goal.get("filed") or goal.get("dedup"):
+                    self.fired = True
                 events.append(Event(
                     probe=self.name, event="mirror_wedged", severity="critical",
                     payload={"wedged_count": verdict.get("wedged_count"),
@@ -1512,7 +1528,12 @@ class MirrorWedgeProbe(Probe):
             import importlib
             pf = importlib.import_module("pointer_freshness")
             if pf.open_goal_exists(origin_signal, WORLD_DIR, self.ctx.agent_dir):
-                return {"filed": False, "goal_id": None, "error": "open goal exists (dedup)"}
+                # dedup=True: an open wedge goal ALREADY covers this box, so the
+                # episode is covered even though we filed nothing NOW. check()
+                # treats this like a success (fired=True) — a genuine no-goal
+                # FAILURE has no dedup key and retries. ( review)
+                return {"filed": False, "dedup": True, "goal_id": None,
+                        "error": "open goal exists (dedup)"}
             files = sorted((verdict.get("files") or {}).items())
             listing = "; ".join(f"{p} ({n} sweeps)" for p, n in files[:8])
             body = {
@@ -1538,9 +1559,28 @@ class MirrorWedgeProbe(Probe):
                 "origin_signal": origin_signal,
             }
             from _runtime_bash import BASH as _bash
+            # --override-duplication (): this probe ALREADY owns exact
+            # box-scoped dedup via open_goal_exists(origin_signal) above (at most
+            # one OPEN wedge goal per box). The goal-dup-gate's fuzzy keyword
+            # check additionally false-positives on the wedge goal's generic
+            # owncloud/mirror tokens — and does so MOST during incident-heavy
+            # windows when overlapping owncloud goals sit in-queue, i.e. exactly
+            # when a wedge is most likely. Without the override the auto-file was
+            # silently defeated (filed:false observed 2026-07-18 + 2026-07-20 on
+            # zeta's box while working-memory.yaml stayed frozen ~411 sweeps).
+            # The exact origin_signal dedup above remains the real guard; this
+            # bypasses only the redundant fuzzy layer. Same idiom as
+            # stale-sentinel-canary.py:336 / cargo-cult-detector.py:239.
+            _override_reason = (
+                "MirrorWedgeProbe owns exact box-scoped dedup via "
+                "open_goal_exists(origin_signal); the goal-dup-gate keyword "
+                "check false-positives on generic owncloud/mirror tokens during "
+                "incident-heavy windows, silently defeating the wedge auto-file "
+                "(g-115-2803).")
             proc = subprocess.run(
                 [_bash, "core/scripts/aspirations-add-goal.sh", "asp-115",
-                 "--source", "world"],
+                 "--source", "world",
+                 "--override-duplication", _override_reason],
                 input=json.dumps(body, ensure_ascii=True),
                 capture_output=True, text=True,
                 cwd=str(self.ctx.project_root_path), timeout=60,

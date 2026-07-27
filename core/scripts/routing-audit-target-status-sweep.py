@@ -129,6 +129,7 @@ from _fileops import locked_append_jsonl  # noqa: E402
 
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, )
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
 
 
@@ -145,7 +146,7 @@ TITLE_CLASS_PATTERN = re.compile(
 TITLE_TARGET_PATTERN = re.compile(
     r"routing-(?:mismatch|either-resolve)\s+(g-\d+-\d+)\b")
 
-# 9: the audit's RECOMMENDED agent, parsed from the description clause
+# : the audit's RECOMMENDED agent, parsed from the description clause
 # both spec builders (post-decompose-routing-audit._build_investigate_spec /
 # _build_either_resolve_spec) emit verbatim:
 #   "aspirations-update-goal.sh <target-id> intended_agent <best_agent>"
@@ -255,7 +256,7 @@ def _age_hours(ts):
     if not ts:
         return None
     try:
-        t = dt.datetime.fromisoformat(str(ts).replace("Z", ""))
+        t = parse_naive_iso(ts)
         return (dt.datetime.now() - t).total_seconds() / 3600
     except Exception:
         return None
@@ -299,7 +300,7 @@ def _parse_target_id(g):
 
 
 def _parse_recommended_agent(g):
-    """Extract the audit's RECOMMENDED agent (9). Returns agent or None.
+    """Extract the audit's RECOMMENDED agent (). Returns agent or None.
 
     Both _build_investigate_spec and _build_either_resolve_spec embed the exact
     clause 'aspirations-update-goal.sh <target-id> intended_agent <best_agent>'
@@ -343,7 +344,7 @@ def _build_intended_agent_index(all_aspirations):
 
 
 def _recommended_matches_current(g, target_id, intended_agent_idx):
-    """9: has the target already been re-stamped to the recommendation?
+    """: has the target already been re-stamped to the recommendation?
 
     Returns (matched, recommended, current). `matched` is True when the audit's
     recommended agent (parsed from the description clause) equals the target's
@@ -466,9 +467,9 @@ def main():
             # unblock sweep's parent-absence handling.
             target_status = status_idx.get(target_id, "archived")
             # Two independent close reasons:
-            #   terminal  (3) — target reached a terminal status; the
+            #   terminal  () — target reached a terminal status; the
             #             re-stamp the audit asked for is moot.
-            #   corrected (9) — target still pending/in-progress, but its
+            #   corrected () — target still pending/in-progress, but its
             #             CURRENT intended_agent already equals the audit's
             #             recommendation, so the flagged mismatch is resolved by
             #             definition (the re-stamp already happened).

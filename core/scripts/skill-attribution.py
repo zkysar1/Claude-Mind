@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """Aggregate per-skill invocation telemetry from <agent>/skill-invocations.jsonl.
 
-MVP — Layer 2 of the skill-telemetry signal repair master plan. Read-only
-aggregator. Joins (currently): all agents' invocation ledgers. Future joins
-(when data accumulates): execution-diary, journal outcomes, stop-hook-log turn
-duration.
+Layer 2 of the skill-telemetry signal repair master plan. Read-only aggregator.
+Joins all agents' invocation ledgers; the invocation->outcome join (g-355-06)
+layers execution-diary + journal outcomes on top to score each invocation
+success/failure/unknown by the enclosing-goal time-window (the Continual-Harness
+skill lifecycle: skills are not just invocation-tracked but success/failure-scored,
+so failing skills surface for reconsolidation — see skill-evaluate.py
+`reconsolidation`).
 
 Outputs per skill:
   total_invocations, model_invocations, user_invocations,
   agents_using, session_count, first_seen, last_seen, days_since_last
+  (with --with-outcomes) success/failure/unknown invocations + success_rate
 
 Knowledge tree: world/knowledge/tree/system/system-constraints-loop/skill-telemetry-signal-master-plan.md
 
@@ -19,8 +23,10 @@ Usage:
   python3 core/scripts/skill-attribution.py --since 7d       # last 7 days
   python3 core/scripts/skill-attribution.py --skill /reflect # one skill drill-down
   python3 core/scripts/skill-attribution.py --silent-only    # never-seen skills
+  python3 core/scripts/skill-attribution.py --with-outcomes  # per-skill success/failure join
+  python3 core/scripts/skill-attribution.py --failing-invocations  # list failing invocations
 """
-import os, sys, json, argparse, datetime
+import os, sys, json, argparse, datetime, re
 from collections import defaultdict
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -36,20 +42,33 @@ import _paths  # noqa: E402
 
 
 def find_agent_dirs():
-    """Return list of agent directories (each containing a local-paths.conf)."""
+    """Return agent names (dirs under the agents-parent with a skill-invocations.jsonl).
+
+    Two properties of this discovery:
+      1. Routed through _paths.agents_root() — agent dirs live at
+         PROJECT_ROOT/<AGENTS_PARENT_DIR>/<name> (currently agents/<name>), NOT at
+         PROJECT_ROOT directly. A depth-1 PROJECT_ROOT scan (the pre-g-355-06
+         form) silently found ZERO agents post-Phase-2.5.D relocation — the
+         documented AGENTS_PARENT_DIR drift class (g-115-1405).
+      2. Marker is the telemetry file itself, NOT local-paths.conf. The conf is
+         gitignored + per-box, so on a synced multi-box fleet only the locally-
+         bound agent has one — using it would collapse this CROSS-agent
+         aggregator to a single agent on every box. Matching skill-discovery.py's
+         data-file-glob pattern, discovery keys on the actual invocation ledger.
+    """
     out = []
-    for entry in sorted(os.listdir(PROJECT_ROOT)):
-        agent_path = os.path.join(PROJECT_ROOT, entry)
-        if not os.path.isdir(agent_path):
-            continue
-        if os.path.isfile(os.path.join(agent_path, 'local-paths.conf')):
+    agents_root = str(_paths.agents_root())
+    if not os.path.isdir(agents_root):
+        return out
+    for entry in sorted(os.listdir(agents_root)):
+        if os.path.isfile(os.path.join(agents_root, entry, 'skill-invocations.jsonl')):
             out.append(entry)
     return out
 
 
 def read_invocations(agent_name, since_dt=None):
     """Read <agent>/skill-invocations.jsonl and return list of row dicts."""
-    path = os.path.join(PROJECT_ROOT, agent_name, 'skill-invocations.jsonl')
+    path = os.path.join(str(_paths.agents_root()), agent_name, 'skill-invocations.jsonl')
     if not os.path.exists(path):
         return []
     rows = []
@@ -71,6 +90,183 @@ def read_invocations(agent_name, since_dt=None):
                     continue
             rows.append(row)
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Invocation -> outcome join ()
+#
+# Continual-Harness skill lifecycle: a reusable skill is not just invocation-
+# tracked, it is success/failure-scored per invocation so failing skills can be
+# surfaced for reconsolidation/debug. Each invocation is joined to the goal that
+# was executing when it fired (enclosing time-window per agent), and that goal's
+# outcome is resolved from the journal + execution-diary.
+#
+# Outcome sources (both are success-biased — they record COMPLETED goals):
+#   - journal 'Outcome: deep|routine|durable' line              -> success
+#   - execution-diary reaching 'phase-12-productivity' phase_end -> success (closed)
+#   - a goal with a diary window that NEVER reached close and is
+#     not the in-flight (last, open) goal                        -> failure
+#   - journal 'Outcome: deferred'                                -> failure
+#   - no attributable window / no signal                         -> unknown
+#
+# Join key: agent + time-window. The invocation's sid scopes to the agent's
+# ledger; the execution-diary is that agent's single append-only timeline, so
+# sid-level disambiguation across concurrent same-agent sessions is a future
+# refinement (the diary carries no sid field). Inter-goal invocations (precheck/
+# select, fired between goals) attach to the preceding goal's window.
+# ---------------------------------------------------------------------------
+
+SUCCESS_OUTCOMES = {'deep', 'routine', 'durable'}
+CLOSE_PHASE = 'phase-12-productivity'
+_GOAL_LINE_RE = re.compile(r'Goal:\s*\(?(g-[0-9]+-[0-9]+)\)?')
+_OUTCOME_LINE_RE = re.compile(r'Outcome:\s*(\w+)')
+
+
+def _canon_skill(sk):
+    """Strip leading slash + args -> canonical skill key (mirrors aggregate())."""
+    if not sk:
+        return sk
+    return sk.lstrip('/').split(None, 1)[0]
+
+
+def read_execution_diary(agent_name):
+    """Read <agent>/session/execution-diary.jsonl -> ts-sorted list of row dicts."""
+    path = os.path.join(str(_paths.agents_root()), agent_name,
+                        'session', 'execution-diary.jsonl')
+    rows = []
+    if not os.path.exists(path):
+        return rows
+    with open(path, encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    rows.sort(key=lambda r: r.get('timestamp', ''))
+    return rows
+
+
+def read_journal_outcomes(agent_name):
+    """Parse <agent>/journal/**/*.md -> {goal_id: outcome_word}. Last write wins.
+
+    Journal blocks look like '## HH:MM — Goal: g-XXX (g-XXX)\\nOutcome: deep'.
+    The outcome word is searched within the 200 chars following each goal
+    mention (the journal only logs completed goals, so this is a success signal).
+    """
+    base = os.path.join(str(_paths.agents_root()), agent_name, 'journal')
+    outcomes = {}
+    if not os.path.isdir(base):
+        return outcomes
+    for root, _dirs, files in os.walk(base):
+        for fn in sorted(files):
+            if not fn.endswith('.md'):
+                continue
+            try:
+                with open(os.path.join(root, fn), encoding='utf-8') as f:
+                    text = f.read()
+            except OSError:
+                continue
+            for m in _GOAL_LINE_RE.finditer(text):
+                gid = m.group(1)
+                om = _OUTCOME_LINE_RE.search(text, m.end(), m.end() + 200)
+                if om:
+                    outcomes[gid] = om.group(1).lower()
+    return outcomes
+
+
+def build_goal_windows(diary_rows):
+    """From ts-sorted diary rows, build [(goal_id, start_ts, end_ts)] intervals.
+
+    Contiguous same-goal entries collapse into one run; a window ends where the
+    NEXT distinct goal begins (the last window's end is None = open/in-flight).
+    """
+    seq = [(r['goal_id'], r['timestamp']) for r in diary_rows
+           if r.get('goal_id') and r.get('timestamp')]
+    runs = []  # [goal_id, first_ts, last_ts]
+    for gid, ts in seq:
+        if runs and runs[-1][0] == gid:
+            runs[-1][2] = ts
+        else:
+            runs.append([gid, ts, ts])
+    windows = []
+    for idx, (gid, first_ts, _last_ts) in enumerate(runs):
+        end = runs[idx + 1][1] if idx + 1 < len(runs) else None
+        windows.append((gid, first_ts, end))
+    return windows
+
+
+def _resolve_window_outcome(gid, start, end, is_last, journal_out, close_ts):
+    """success | failure | unknown for one goal window (see module join docstring)."""
+    jo = journal_out.get(gid)
+    if jo in SUCCESS_OUTCOMES:
+        return 'success'
+    if jo == 'deferred':
+        return 'failure'
+    # closed if a phase-12-productivity phase_end timestamp falls in [start, end)
+    for cts in close_ts:
+        if cts >= start and (end is None or cts < end):
+            return 'success'
+    if is_last and end is None:
+        return 'unknown'  # most-recent, open window — in-flight, not yet closed
+    return 'failure'      # window exists, no success signal, not in-flight
+
+
+def _locate_invocation(ts, win_outcomes):
+    """Return (outcome, goal_id) for the goal window containing ts, else ('unknown', None)."""
+    for gid, start, end, outcome in win_outcomes:
+        if ts >= start and (end is None or ts < end):
+            return outcome, gid
+    return 'unknown', None
+
+
+def compute_join(agents, since_dt=None):
+    """Join invocations to enclosing-goal outcomes across `agents`.
+
+    Returns {'per_skill': {skill: {success, failure, unknown, classified,
+    success_rate}}, 'failing': [{skill, goal_id, ts, agent}]}.
+    """
+    per_skill = defaultdict(lambda: {'success': 0, 'failure': 0, 'unknown': 0})
+    failing = []
+    for ag in agents:
+        invs = read_invocations(ag, since_dt=since_dt)
+        if not invs:
+            continue
+        diary = read_execution_diary(ag)
+        windows = build_goal_windows(diary)
+        journal_out = read_journal_outcomes(ag)
+        close_ts = sorted(r['timestamp'] for r in diary
+                          if r.get('entry_type') == 'phase_end'
+                          and r.get('phase') == CLOSE_PHASE and r.get('timestamp'))
+        win_outcomes = []
+        for idx, (gid, start, end) in enumerate(windows):
+            is_last = idx == len(windows) - 1
+            outcome = _resolve_window_outcome(gid, start, end, is_last,
+                                              journal_out, close_ts)
+            win_outcomes.append((gid, start, end, outcome))
+        for r in invs:
+            ts = r.get('ts', '')
+            sk = _canon_skill(r.get('skill', ''))
+            if not sk or not ts:
+                continue
+            cls, gid = _locate_invocation(ts, win_outcomes)
+            per_skill[sk][cls] += 1
+            if cls == 'failure':
+                failing.append({'skill': sk, 'goal_id': gid, 'ts': ts, 'agent': ag})
+    out = {}
+    for sk, c in per_skill.items():
+        classified = c['success'] + c['failure']
+        out[sk] = {
+            'success': c['success'],
+            'failure': c['failure'],
+            'unknown': c['unknown'],
+            'classified': classified,
+            'success_rate': round(c['success'] / classified, 4) if classified else None,
+        }
+    failing.sort(key=lambda f: f['ts'])
+    return {'per_skill': out, 'failing': failing}
 
 
 def known_skills():
@@ -185,6 +381,10 @@ def main():
     ap.add_argument('--skill', help='Drill into one skill (raw "/foo" or canonical "foo")')
     ap.add_argument('--silent-only', action='store_true',
                     help='List known skills with ZERO invocations (in window)')
+    ap.add_argument('--with-outcomes', action='store_true',
+                    help='Join invocations to enclosing-goal outcomes (success/failure/unknown)')
+    ap.add_argument('--failing-invocations', action='store_true',
+                    help='List invocations whose enclosing goal FAILED (for reconsolidation review)')
     ap.add_argument('--json', action='store_true', help='Machine-readable output')
     args = ap.parse_args()
 
@@ -198,6 +398,45 @@ def main():
         all_rows.extend(rs)
 
     stats = aggregate(all_rows)
+
+    # Invocation -> outcome join (opt-in; heavier — reads diaries + journals)
+    join = None
+    if args.with_outcomes or args.failing_invocations:
+        join = compute_join(agents, since_dt=since_dt)
+        # Fold per-skill outcome counts into stats for the report paths
+        for sk, oc in join['per_skill'].items():
+            if sk in stats:
+                stats[sk].update({
+                    'success_invocations': oc['success'],
+                    'failure_invocations': oc['failure'],
+                    'unknown_invocations_outcome': oc['unknown'],
+                    'classified_invocations': oc['classified'],
+                    'success_rate': oc['success_rate'],
+                })
+
+    # Failing-invocations mode (feeds skill-evaluate reconsolidation review)
+    if args.failing_invocations:
+        failing = join['failing']
+        by_skill = defaultdict(int)
+        for f in failing:
+            by_skill[f['skill']] += 1
+        if args.json:
+            print(json.dumps({
+                'failing_count': len(failing),
+                'by_skill': dict(sorted(by_skill.items(), key=lambda kv: -kv[1])),
+                'failing': failing,
+                'window_since': args.since or 'all_time',
+                'agents_scanned': agents,
+            }, indent=2, default=str))
+        else:
+            print(f"=== failing invocations ({len(failing)}) ===")
+            print(f"  window: {args.since or 'all_time'}")
+            for sk, n in sorted(by_skill.items(), key=lambda kv: -kv[1]):
+                print(f"    {sk:30}  failing={n}")
+            print(f"\n  recent failing invocations:")
+            for f in failing[-20:]:
+                print(f"    [{f['ts']}] {f['skill']:24} goal={f['goal_id']} agent={f['agent']}")
+        return 0
 
     # Skill drill-down
     if args.skill:
@@ -259,10 +498,15 @@ def main():
         print(f"\n  Top skills by invocation count:")
         ranked = sorted(stats.items(), key=lambda kv: -kv[1]['total_invocations'])
         for sk, s in ranked[:20]:
-            print(f"    {sk:30}  total={s['total_invocations']:4}  "
-                  f"model={s['model_invocations']:3} user={s['user_invocations']:3}  "
-                  f"agents={','.join(s['agents_using']):15}  "
-                  f"last={s['last_seen'] or '-'} ({s['days_since_last']}d ago)")
+            line = (f"    {sk:30}  total={s['total_invocations']:4}  "
+                    f"model={s['model_invocations']:3} user={s['user_invocations']:3}  "
+                    f"agents={','.join(s['agents_using']):15}  "
+                    f"last={s['last_seen'] or '-'} ({s['days_since_last']}d ago)")
+            if args.with_outcomes and 'success_rate' in s:
+                sr = s['success_rate']
+                line += (f"  | ok={s['success_invocations']} fail={s['failure_invocations']} "
+                         f"rate={sr if sr is not None else '-'}")
+            print(line)
     return 0
 
 

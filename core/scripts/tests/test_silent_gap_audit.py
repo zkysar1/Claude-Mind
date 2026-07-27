@@ -255,7 +255,7 @@ def test_detect_telemetry_stale_no_content_ts_suppressed():
             sga.WORLD_DIR = orig
 
 
-# ---- recent_completed_corpus (6: time-windowed completed-goal dedup) ----
+# ---- recent_completed_corpus (: time-windowed completed-goal dedup) ----
 
 _NOW = dt.datetime(2026, 7, 15, 12, 0, 0)  # fixed reference for deterministic windowing
 
@@ -312,9 +312,9 @@ def test_recent_completed_corpus_completed_date_fallback():
 
 
 def test_completed_corpus_suppresses_refire_via_is_covered():
-    # THE fix (6): a gap whose primary token matches a RECENTLY-completed
+    # THE fix (): a gap whose primary token matches a RECENTLY-completed
     # investigation is COVERED even when NO open goal exists — the exact re-fire the
-    # open-only dedup missed (3/3 deep-investigated twice).
+    # open-only dedup missed (/ deep-investigated twice).
     completed = [_completed(
         "g-2233", 1, title="Investigate: silent-gap zero-input deadline_urgency",
         origin="investigate:silent-gap-zero-input-goal-selector-deadline_urgency")]

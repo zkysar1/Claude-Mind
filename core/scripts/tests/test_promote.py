@@ -198,7 +198,7 @@ def test_shell_invariant_violation_higher_target_exit1(tmp_path):
     assert "INVARIANT VIOLATION" in r.stderr
 
 
-# NOTE (2): the dry-run HAPPY-PATH tests (lower/equal target -> "[dry-run]
+# NOTE (): the dry-run HAPPY-PATH tests (lower/equal target -> "[dry-run]
 # OK") moved to section 7 and now run against an ISOLATED clean+tagged source with
 # a stubbed seed-preflight. run_promote() targets the LIVE repo, and promote Step 3
 # invokes seed-preflight UNCONDITIONALLY (dry-run softens only the Step-1b/1c
@@ -283,8 +283,8 @@ def _setup_promote_source(tmp_path: Path, version: str = "1.0.0", frontier: bool
     (src / "core" / "config").mkdir(parents=True)
     (src / "mind_api" / "src").mkdir(parents=True)
     # check-releases-current.sh is REQUIRED here: promote Step 1a delegates the
-    # RELEASES.json check to it (1, single role-aware checker).
-    # promotion-preflight.{sh,py} are REQUIRED since 9 wired the
+    # RELEASES.json check to it (, single role-aware checker).
+    # promotion-preflight.{sh,py} are REQUIRED since  wired the
     # reconcile-not-mirror drift gate into promote Step 3b (real gate, no stub
     # — the fixture source/target are framework-path subsets so it runs CLEAN,
     # and its weights-contract check self-skips: no goal-selector.py in the copy).
@@ -503,7 +503,7 @@ def test_pr_custom_branch_name(tmp_path):
 
 # ===========================================================================
 # 7. promote-to-upstream.sh — dry-run happy path + publishability gate
-#    (ISOLATED source, 2)
+#    (ISOLATED source, )
 # ===========================================================================
 # These exercise the dry-run "[dry-run] OK" path and the Step-3 seed-preflight
 # gate against an ISOLATED clean+tagged source with stubbed sub-steps -- the same
@@ -545,7 +545,7 @@ def test_shell_dry_run_lower_target_ok(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "[dry-run] OK" in r.stdout
     assert "would: seed-transplant.sh" in r.stdout  # would, not did
-    # 1: pin that the Step 3b reconcile-not-mirror drift gate RAN on the
+    # : pin that the Step 3b reconcile-not-mirror drift gate RAN on the
     # happy path — removing the promotion-preflight invocation must fail here.
     assert "promotion-preflight: CLEAN" in r.stdout
     # The target was NOT mutated by the dry-run.
@@ -586,12 +586,12 @@ def test_shell_dry_run_unpublishable_fails(tmp_path):
 
 
 # ===========================================================================
-# 8. promote-to-upstream.sh — role-conditional release gates (1)
+# 8. promote-to-upstream.sh — role-conditional release gates ()
 #    seed->downstream promote runs WITHOUT --force-release; frontier stays strict
 # ===========================================================================
 @requires_git
 def test_shell_dry_run_seed_role_skips_release_gates(tmp_path):
-    """1 (option 2): a SEED source (self_role=seed, NO RELEASES.json, NO
+    """ (option 2): a SEED source (self_role=seed, NO RELEASES.json, NO
     v-tag — the un-bootstrapped claude-mind condition) promotes downstream in
     --dry-run WITHOUT --force-release. The RELEASES.json (Step 1a) and v-tag
     (Step 1c) gates are FRONTIER-ONLY provenance and skip for a non-frontier role.

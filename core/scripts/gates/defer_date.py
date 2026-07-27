@@ -92,7 +92,7 @@ RELATIVE_NEXT = re.compile(
 RELATIVE_TOMORROW = re.compile(r"\btomorrow\b", re.IGNORECASE)
 
 
-# ---- Due-date disambiguation (3) --------------------------------
+# ---- Due-date disambiguation () --------------------------------
 #
 # A date governed by DUE-BY language ("by 2026-11-02", "submit by X",
 # "X deadline") is a DUE date — work must happen BEFORE it — NOT a
@@ -149,7 +149,7 @@ def extract(text: str, now: Optional[datetime] = None) -> dict:
     matches: list[tuple[datetime, str, str]] = []
 
     for m in ISO_DATE.finditer(text):
-        # 3: skip due-by dates ("by X", "X deadline") — they are
+        # : skip due-by dates ("by X", "X deadline") — they are
         # due dates, not start-after dates, and must not become deferred_until.
         if _is_due_context(text, m.start(), m.end()):
             continue

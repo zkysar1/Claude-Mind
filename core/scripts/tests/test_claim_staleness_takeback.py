@@ -228,7 +228,7 @@ def test_takeback_ledger_context_shape():
             assert ctx.get("effective_timeout_hours") == 4.0
 
 
-# --- `started` attempt-marker at claim (7-t / 5) ---------
+# --- `started` attempt-marker at claim (-t / ) ---------
 # The daemon claim chokepoint stamps `started` via setdefault(), so it is the
 # FIRST-attempt time: set once when a never-attempted goal is claimed, and
 # preserved across every later re-claim or stale take-back. cmd_cycles reads

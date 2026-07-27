@@ -22,7 +22,7 @@ Legacy field names (`hit_rate`, `times_triggered`, `false_positive_rate`, `false
 were replaced by `outcome_stats.*` and are actively tracked for drift in the registry's
 `stale_fields` map. DO NOT use these names in new pseudocode.
 
-ID format: `sig-NNN` (zero-padded 3-digit, regex: `^sig-\d{3}$`)
+ID format: `sig-NNN` (regex: `^sig-\d+$`, open-ended per guard-1161; new IDs zero-padded to 3+ digits, but many legacy sub-3-digit record IDs exist, e.g. sig-8)
 Valid statuses: `active`, `retired`, `contradicted`
 
 ## Script-Based Access (Exclusive Data Layer)

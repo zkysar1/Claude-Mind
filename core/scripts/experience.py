@@ -221,12 +221,26 @@ def validate_record(rec):
 # exp-{goal_id}-{skill_slug}, so the goal-id is present in the id even when a
 # caller-formed cmd_add record leaves the goal_id FIELD null — which blinds the
 # daemon --goal read filter (mind_api/src/endpoints/experience.py: it matches on
-# rec.get("goal_id") == goal, so a null field is invisible). 7.
-GOAL_ID_IN_EXP_ID_RE = re.compile(r"^exp-(g-\d{3}-\d{2,4})-")
+# rec.get("goal_id") == goal, so a null field is invisible). .
+# : add ONLY the cross-world xw-<ts>-NN branch so xw goals' experiences
+# derive (the old `g-\d{3}-\d{2,4}` returned None for every xw exp-id, losing the
+# null-field fallback). NO decompose-child -[a-z] suffix ON PURPOSE (
+# design; confirmed by  fresh-eyes): the exp-id embed is AMBIGUOUS —
+# `exp--a-s93` is goal  with slug `a-s93`, NOT decompose child
+# -a (both share the id shape; the field, when present, disambiguates —
+# derive is only the null-field fallback). A greedy -[a-z] mis-derives real
+# slug-<letter> records to a NONEXISTENT goal-id, which breaks the daemon --goal
+# read filter. Deriving the PARENT is the safe default (the parent always exists);
+# a decompose child attributing to its parent is a benign, pre-existing limitation.
+GOAL_ID_IN_EXP_ID_RE = re.compile(r"^exp-(g-(?:\d{3}-\d{2,4}|xw-\d{8}T\d{6}-\d{2}))-")
 
 
 def derive_goal_id_from_id(rec_id):
-    """Return the g-NNN-NN goal-id embedded in an experience id, or None.
+    """Return the goal-id (g-NNN-NN or g-xw-<ts>-NN) embedded in an experience id, or None.
+
+    A decompose child (g-NNN-NN-a) derives to its PARENT g-NNN-NN — the embed is
+    ambiguous with a slug-<letter> id, so parent-derivation is the safe fallback
+    (see GOAL_ID_IN_EXP_ID_RE comment; g-115-2761).
 
     Matches ONLY the canonical exp-{goal-id}-{slug} shape. Slug-only ids
     (exp-encode-session-*, exp-577-behavioral-*, exp-2026-05-16_ohs-*) return
@@ -264,7 +278,7 @@ def normalize_record(rec):
     # existing records backfill on their next core-side touch. NEVER overwrites a
     # present goal_id; slug-only ids stay null. Persisting the derived value at
     # write time is what makes the daemon --goal read (which matches the stored
-    # field, not a re-derivation) find the record. (7)
+    # field, not a re-derivation) find the record. ()
     if not rec.get("goal_id"):
         derived = derive_goal_id_from_id(rec.get("id"))
         if derived:
@@ -479,7 +493,7 @@ def cmd_archive_goal(args):
     # Use _read_optional_stdin (NOT a bare sys.stdin.read()): isatty() does not
     # guarantee EOF on a non-terminal stdin, so a bare read blocks >90s on an
     # inherited non-EOF pipe when the wrapper is invoked without a stdin pipe
-    # (2 root cause; experience-add.sh avoids this only because it is
+    # ( root cause; experience-add.sh avoids this only because it is
     # always piped).
     extra = {}
     raw = _read_optional_stdin().strip()
@@ -552,7 +566,7 @@ def cmd_archive_goal(args):
     # validate_record, because validate_record enforces that content_path
     # resolves to an existing file (do NOT reorder past validate_record
     # without splitting the validator into schema-only and filesystem-only
-    # phases). 5: copy-not-move — the old os.replace consumed the
+    # phases). : copy-not-move — the old os.replace consumed the
     # caller's trace on a post-move validation failure, stranding an orphan
     # .md and making the retry non-idempotent. The source is deleted only
     # after the record lands; the validation-failure path removes the copy.
@@ -590,7 +604,7 @@ def cmd_archive_goal(args):
     try:
         validate_record(rec)
     except ValueError as e:
-        # 5: remove the copy so the failed attempt leaves no orphan
+        # : remove the copy so the failed attempt leaves no orphan
         # .md and the caller's trace_src survives for an idempotent retry.
         if copied_from is not None:
             try:

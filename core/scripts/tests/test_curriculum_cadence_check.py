@@ -1,4 +1,4 @@
-"""Unit tests for curriculum-cadence-check.py (1).
+"""Unit tests for curriculum-cadence-check.py ().
 
 The cadence gate is time-based: exit 0 (fire) when >= interval_hours have
 elapsed since the last curriculum evaluation (or it was never evaluated),

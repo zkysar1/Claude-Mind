@@ -49,7 +49,7 @@ def _default_machine_id(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _isolate_sync_manifest(monkeypatch, tmp_path):
-    """4: _refresh's no-clobber guard lazily reads owncloud_sync's
+    """: _refresh's no-clobber guard lazily reads owncloud_sync's
     persistent sync-manifest (located via RUNTIME_DIR). Point RUNTIME_DIR at a
     per-test tmp dir so these tests are hermetic — they never read the real
     mind_api/state/owncloud-sync-manifest.json (no dependency on machine state).
@@ -144,7 +144,7 @@ def test_list_dir_env_scoped(cloud):
 
 
 def test_list_objects_flat_recursive_with_etags(cloud):
-    """8: list_objects returns EVERY descendant object as
+    """: list_objects returns EVERY descendant object as
     (rel_posix, etag, size) in one flat paginated pass — the pull sweep's
     cheap enumeration. ETags match content md5 for single-part PUTs; deep
     keys keep their full rel path; other roots never leak in."""
@@ -553,7 +553,7 @@ def test_heartbeat_wrong_token_rejected(cloud):
         a.heartbeat("alpha", "WRONG-TOKEN")                 # not the runner_token
 
 
-# --- clean release: RUNNING->IDLE iff token matches (7) -------------
+# --- clean release: RUNNING->IDLE iff token matches () -------------
 def test_release_runner_clean(cloud):
     a = _backend(cloud, machine_id="A")
     assert a.acquire_runner("alpha", "tokA") is True
@@ -599,7 +599,7 @@ def test_release_runner_missing_item_noop(cloud):
     assert a.release_runner("never-started", "tok") is False
 
 
-# --- list_runner_claims: env-scoped enumeration for ownership (7) ---
+# --- list_runner_claims: env-scoped enumeration for ownership () ---
 def test_list_runner_claims_empty(cloud):
     a = _backend(cloud, machine_id="A")
     assert a.list_runner_claims() == []
@@ -670,14 +670,14 @@ def test_rel_raises_on_unmapped_path(cloud, tmp_path):
         b._s3_key(tmp_path / "nowhere" / "x.jsonl")         # under no root -> raise, not p.name
 
 
-# --- _refresh no-clobber guard (3 root cause / 4 fix) ------
+# --- _refresh no-clobber guard ( root cause /  fix) ------
 # The in-process self._etags cache is empty after a daemon restart, so the
 # first force_fresh refresh must NOT download stale S3 over a local file holding
 # unpushed writes. The guard gates the overwrite on the persistent sync-manifest
 # baseline, symmetric to owncloud_sync._pull_one. These four tests pin all four
 # _overwrite_decision branches: no_clobber, download(peer), identical, download(no-baseline).
 def test_refresh_no_clobber_unpushed_local_after_restart(cloud, tmp_path):
-    """3 regression: a restart empties _etags; the first force_fresh
+    """ regression: a restart empties _etags; the first force_fresh
     refresh of a file whose local copy has unpushed writes (local != baseline)
     must KEEP local, never clobber it with stale S3."""
     b = _backend(cloud)
@@ -779,7 +779,7 @@ def test_refresh_multipart_etag_downloads_not_no_clobber(cloud, tmp_path):
 
 
 def test_refresh_nonmultipart_local_equals_baseline_downloads(cloud, tmp_path):
-    """7 BRD sub-case (a) PINNING: NON-multipart S3 ETag + local ==
+    """ BRD sub-case (a) PINNING: NON-multipart S3 ETag + local ==
     baseline (no unpushed writes) + S3 moved (a peer wrote) -> "download"
     (adopt S3 + refresh the fence). This is the final fall-through in
     _overwrite_decision and already behaved correctly before g-115-1787 —
@@ -946,7 +946,7 @@ def test_from_env_fails_closed_when_machine_id_unset(monkeypatch, tmp_path):
     assert OwnCloudBackend.from_env().machine_id == "machine-1"
 
 
-# --- multi-tenant customer dimension (T-b, 1) ----------------------
+# --- multi-tenant customer dimension (T-b, ) ----------------------
 # Brief mind_api/docs/lodestar-tenant-isolation-rearch.md sections 3/6/8. The
 # back-compat invariant (default customer => byte-identical legacy keys) is the
 # regression that protects the live ayoai-mind/* data; the customer-set cases
@@ -1055,7 +1055,7 @@ def test_no_key_bleed_across_concurrent_contexts(cloud):
     assert results["t2"] == f"vinheim/{ENV_ID}/world/k.jsonl"
 
 
-# --- machine-local exclusion at the per-op backend (4 / rb-2396) ----
+# --- machine-local exclusion at the per-op backend ( / rb-2396) ----
 # The exclusion policy (_EXCLUDE_DIRS dir-prune + _is_machine_local basenames)
 # lived only in owncloud_sync's periodic walk; the per-op backend was blind, so
 # jsonl_hygiene truncating world/presence/<agent>.jsonl via get_backend()._put
@@ -1200,7 +1200,7 @@ def test_both_diverged_unregistered_file_preserves_safe_freeze(cloud, tmp_path):
     assert b._get_remote_raw(key)[0] == base + b"remoteB\n"  # peer intact, not clobbered
 
 
-# --- 0: fence-on-miss (W1 — unfenced first-write-per-key post-restart)
+# --- : fence-on-miss (W1 — unfenced first-write-per-key post-restart)
 # The in-process _etags fence cache is empty after every daemon restart (and
 # stays unpopulated for writes whose base read never touched S3). _put must
 # never issue an UNCONDITIONAL PutObject to a non-machine-local key: existing
@@ -1209,7 +1209,7 @@ def test_both_diverged_unregistered_file_preserves_safe_freeze(cloud, tmp_path):
 # — the W1∘W2 clobber composition, 2026-07-16 aspirations.jsonl incident), and
 # absent keys become conditional creates (IfNoneMatch="*").
 def test_fresh_instance_put_existing_unregistered_key_carries_ifmatch(cloud, tmp_path):
-    """0 (W1): a fresh backend (empty _etags — every daemon restart)
+    """ (W1): a fresh backend (empty _etags — every daemon restart)
     writing to an EXISTING unregistered key must NOT issue an unconditional
     PUT: it head_objects the key and fences on the CURRENT etag."""
     b = _backend(cloud)
@@ -1233,7 +1233,7 @@ def test_fresh_instance_put_existing_unregistered_key_carries_ifmatch(cloud, tmp
 
 
 def test_fresh_instance_stale_body_to_registered_key_merges_not_clobbers(cloud, tmp_path):
-    """0 incident pin (2026-07-16 aspirations.jsonl clobber): a fresh
+    """ incident pin (2026-07-16 aspirations.jsonl clobber): a fresh
     backend whose outgoing body derives from a STALE local read (missing the
     peer's record already on S3) must MERGE with the current remote. PUT-time
     head-fencing alone would pass (the fence IS current) and still erase the
@@ -1257,7 +1257,7 @@ def test_fresh_instance_stale_body_to_registered_key_merges_not_clobbers(cloud, 
 
 
 def test_fresh_instance_put_absent_key_uses_conditional_create(cloud):
-    """0: fence-miss + key absent on S3 = a true create — carries
+    """: fence-miss + key absent on S3 = a true create — carries
     IfNoneMatch='*' (a concurrent peer create 412s into the conflict lane
     instead of last-writer-wins) and never IfMatch."""
     b = _backend(cloud)
@@ -1289,7 +1289,7 @@ def _hyp_line(rec_id, **kw):
 
 
 def test_both_diverged_pipeline_store_merges_not_freezes(cloud, tmp_path):
-    """7 END-TO-END (BRD P0 sub-case (b)): the EXACT cc-04 freeze
+    """ END-TO-END (BRD P0 sub-case (b)): the EXACT cc-04 freeze
     shape — NON-multipart pipeline.jsonl, genuine both-diverged (real unpushed
     local records AND S3 moved) — must union-merge with ZERO data loss
     (local-only AND S3-only hypothesis records BOTH survive), refresh the
@@ -1389,7 +1389,7 @@ def test_merge_failure_on_registered_store_raises_conflict_not_clobbers(cloud, t
 
 
 def test_hot_coordination_store_412_merges_with_empty_diverged_flag(cloud, tmp_path):
-    """1: a HOT coordination store (team-state.yaml, written every
+    """: a HOT coordination store (team-state.yaml, written every
     iteration) whose in-process fence went stale but whose key was NEVER added
     to _diverged_keys -- because _refresh's warm-cache early-return skips the
     no_clobber divergence detection for an always-warm cache -- MERGE-RECONCILES
@@ -1508,7 +1508,7 @@ def test_cas_412_then_success_completes_via_retry(cloud, monkeypatch):
     assert m["writes"] >= 2 and m["conflict_rate"] > 0.0  # rate is measurable
 
 
-# --- list_dir on governed root (cold-bootstrap fix, 2) ---------------
+# --- list_dir on governed root (cold-bootstrap fix, ) ---------------
 
 def _backend_root_map(cloud, root_map, machine_id="m1"):
     """Build an OwnCloudBackend with an explicit root_map (not cache_root).
@@ -1695,7 +1695,7 @@ def test_non_permission_client_error_not_masked(cloud, monkeypatch):
     assert ei.value.response["Error"]["Code"] == "ThrottlingException"
 
 
-# --- 8: _overwrite_decision fails CLOSED on a baseline-read FAILURE ---
+# --- : _overwrite_decision fails CLOSED on a baseline-read FAILURE ---
 # (the own-cloud read-stale-clobber fix; rb-3422 "a data-protection guard whose
 # failure mode is OVERWRITE is not a guard"). The PRE-fix code fell through to
 # "download" -- silently overwriting local -- whenever the baseline-read RAISED:

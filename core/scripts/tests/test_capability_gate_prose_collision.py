@@ -1,4 +1,4 @@
-"""test_capability_gate_prose_collision.py — regression test for 2.
+"""test_capability_gate_prose_collision.py — regression test for .
 
 The capability gate matched extracted defer_reason keywords against the FULL
 PROSE of capability-routing.md rows (via _entry_tokens over the whole row), not
@@ -38,7 +38,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 CORE_SCRIPTS = SCRIPT_DIR.parent
 GATE_PY = CORE_SCRIPTS / "capability-gate.py"
 
-# The 8 fleet-blocked defer_reason (the exact incident shape). After
+# The  fleet-blocked defer_reason (the exact incident shape). After
 # the fix the surviving tokens (fleet / partner / cross_agent_surfacing / ...)
 # match no capability row.
 _FLEET_DEFER = (
@@ -58,13 +58,13 @@ _REAL_DEFER = (
 # evidence-verb disqualifier must NOT strip it (no over-disqualification).
 _PROBE_ACTION = "blocked: need to probe the service health endpoint before retry"
 
-# 3: compound action requests where a genuine provisionable keyword
+# : compound action requests where a genuine provisionable keyword
 # (commit/push — both ARE capability-row tokens) is followed within 0-2 words by
-# an evidence-verb's BARE IMPERATIVE form (Confirm/show). The 2
+# an evidence-verb's BARE IMPERATIVE form (Confirm/show). The 
 # disqualifier's bare-form alternations (shows?, confirm(?:s|ed)?) wrongly
 # matched here and stripped the keyword — turning a real agent action into
 # would_block=False (false-negative in a safety gate, confirmed by the
-# 2 fresh-eyes review a6e3fd81). After tightening _EVIDENCE_VERB_AFTER
+#  fresh-eyes review a6e3fd81). After tightening _EVIDENCE_VERB_AFTER
 # to inflected report forms only, these MUST block again.
 #
 # NB: the SURVIVING keyword must itself be a capability-row token for the
@@ -80,12 +80,12 @@ _COMPOUND_PUSH_SHOW = (
     "Waiting for user to push and show the team the updated dashboard."
 )
 
-# 5: a boolean literal is a config-VALUE fragment, never a capability
+# : a boolean literal is a config-VALUE fragment, never a capability
 # identifier. The tokenizer splits "cross_agent_surfacing.enabled=true" into
 # "cross_agent_surfacing.enabled" + "true"; the bare "true" then false-matched
 # "plugin_connected: true" in the RUN-mode game-session capability row ->
-# would_block=True + spurious Unblock 4. After stopwording true/false
-# this defer passes cleanly. (This is the real 8 fleet defer shape.)
+# would_block=True + spurious Unblock . After stopwording true/false
+# this defer passes cleanly. (This is the real  fleet defer shape.)
 _BOOLEAN_LITERAL_DEFER = (
     "Blocked on active partner fleet: validating cross_agent_surfacing.enabled="
     "true requires 2+ partner agents in concurrent live sessions; none active. "
@@ -123,7 +123,7 @@ def test_prose_collision_tokens_not_extracted():
 
 
 def test_fleet_defer_does_not_falsely_block():
-    """The exact 8 defer must not produce a spurious capability match —
+    """The exact  defer must not produce a spurious capability match —
     this is what refused the defer AND auto-filed spurious g-115-1881."""
     _, d = _run_gate(_FLEET_DEFER)
     assert not d.get("would_block"), (
@@ -156,7 +156,7 @@ def test_probe_as_action_still_extracted():
 
 
 def test_compound_imperative_commit_confirm_still_blocks():
-    """Recall-weakening regression (3): 'commit the hotfix. Confirm the
+    """Recall-weakening regression (): 'commit the hotfix. Confirm the
     regression is fixed' — the bare imperative 'Confirm' must NOT strip 'commit'
     (the sole capability-row token here). Under the g-115-1882 bare-form regex
     'commit' was stripped and the defer wrongly passed (would_block=False); after
@@ -171,7 +171,7 @@ def test_compound_imperative_commit_confirm_still_blocks():
 
 
 def test_compound_imperative_push_show_still_blocks():
-    """Recall-weakening regression (3): 'push and show the team' — bare
+    """Recall-weakening regression (): 'push and show the team' — bare
     'show' must not strip 'push'. Genuine provisionable action still blocks."""
     _, d = _run_gate(_COMPOUND_PUSH_SHOW)
     assert d.get("would_block"), (

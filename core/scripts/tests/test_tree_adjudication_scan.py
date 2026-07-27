@@ -1,4 +1,4 @@
-"""Tests for tree-adjudication-scan.py (1).
+"""Tests for tree-adjudication-scan.py ().
 
 Verifies the earned-low calibration-adjudication marker scan: a node whose .md
 body carries a `## Confidence Rationale` heading is reported (so g-115-400's

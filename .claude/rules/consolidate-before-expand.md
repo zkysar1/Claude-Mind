@@ -10,9 +10,11 @@ An aspiration 90% complete is worth more than three aspirations 10% complete.
 
 1. **Completion has gravity**: Goals in near-complete aspirations score higher
    than goals in new aspirations. The closer to done, the stronger the pull.
-2. **Depth before breadth**: Continuing within the same aspiration is the
-   default. Switching requires justification (current aspiration is blocked,
-   or new work is genuinely more urgent).
+2. **Depth before breadth**: The scorer's completion terms (completion_pressure,
+   tail_bonus, depth_bonus, streak_momentum, context_coherence) encode this rule
+   numerically — trust the ranking. Do NOT re-apply consolidation as a per-pick
+   veto over the scorer's top pick; the numeric momentum already prefers continuing
+   within a near-complete aspiration and switching only when the ranking says so.
 3. **New aspirations require health check**: Before creating a new aspiration,
    assess existing aspiration completion rates. If average completion is below
    25%, explain why new work is warranted.

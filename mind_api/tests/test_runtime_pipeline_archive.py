@@ -144,7 +144,7 @@ def test_archive_sweep_single(archive_daemon):
     resp = json.loads(body)
     assert resp["archived_count"] == 1
 
-    # 6: stays in live as a stage=archived tombstone with a prune
+    # : stays in live as a stage=archived tombstone with a prune
     # clock (the own-cloud union-by-id merge cannot express a cross-file
     # removal, so the stage flip converges fleet-wide before the prune).
     live_items = _read_jsonl(live)
@@ -197,7 +197,7 @@ def test_archive_sweep_mixed(archive_daemon):
     resp = json.loads(body)
     assert resp["archived_count"] == 2
 
-    # 6: swept records stay in live as stage=archived tombstones;
+    # : swept records stay in live as stage=archived tombstones;
     # ineligible records keep their stage.
     live_items = _read_jsonl(live)
     by_id = {r["id"]: r for r in live_items}

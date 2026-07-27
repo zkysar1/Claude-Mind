@@ -344,6 +344,37 @@ rt_spawn() {
     stamp="$(date +%Y-%m-%dT%H:%M:%S)"
     mkdir -p "$RT_DIR"
 
+    # ─── Shared-runtime claim gate () ──────────────────────────────
+    # Sibling of the gate in mind-api-start.sh; same condition, both chokepoints
+    # now fail CLOSED. Placed before rt_daemon_kill for the same reason the
+    # launcher resolution below is: never destroy a live daemon we should not be
+    # replacing. The  scrub further down canonicalizes the environment
+    # of a daemon this path DOES spawn, but scrubbing is fail-OPEN — the shared
+    # port is still claimed and the live daemon still dies; only the
+    # replacement's env is clean. When the parent process is pytest, the spawn
+    # itself is the defect, not just its environment.
+    #
+    # A test isolates by pointing the runtime dir elsewhere — via RT_DIR here
+    # (what _daemon_fixture.py sets, line 183) or RUNTIME_DIR in
+    # mind-api-start.sh. The gate therefore compares the dir ACTUALLY about to
+    # be claimed against the shared one, rather than enumerating env-var names:
+    # an earlier draft checked `-z "$RUNTIME_DIR"` and would have refused every
+    # correctly-isolated fixture test, since those set RT_DIR and never
+    # RUNTIME_DIR. Comparing the resolved dir also catches RUNTIME_DIR being set
+    # explicitly TO the shared path. MIND_ALLOW_SHARED_DAEMON_FROM_TEST=1 is the
+    # deliberate-operator opt-in (test_daemon_orphan_prevention.py).
+    #
+    # Returns 0, not 1, per the rt_spawn contract documented in the launcher
+    # ABORT below: a non-zero return here would trip `set -e` in a bare caller.
+    # Not spawning is sufficient — rt_wait_for_ready is the single source of
+    # truth for readiness and the caller surfaces a loud daemon-down error.
+    if [ -n "${PYTEST_CURRENT_TEST:-}" ] \
+       && [ "$RT_DIR" = "$PROJECT_ROOT/mind_api/state" ] \
+       && [ "${MIND_ALLOW_SHARED_DAEMON_FROM_TEST:-}" != "1" ]; then
+        echo "[$stamp] rt_spawn — REFUSED: pytest parent (${PYTEST_CURRENT_TEST}) would claim the SHARED $RT_DIR and kill the live daemon. Set RT_DIR (or RUNTIME_DIR) to a tmp dir in the test env, or MIND_ALLOW_SHARED_DAEMON_FROM_TEST=1. Daemon NOT started. (g-115-3329)" >> "$RT_SPAWN_LOG"
+        return 0
+    fi
+
     # Resolve the launcher BEFORE the destructive rt_daemon_kill / the
     # "attempting" log — never kill a predecessor we cannot replace.
     local py_cmd
@@ -380,7 +411,7 @@ rt_spawn() {
     echo "[$stamp] rt_spawn — attempting daemon start" >> "$RT_SPAWN_LOG"
 
     (
-        # 8: canonicalize the daemon environment at the wrapper
+        # : canonicalize the daemon environment at the wrapper
         # auto-respawn chokepoint. The daemon otherwise inherits the POKING
         # process's env verbatim — observed 2026-07-16: a background pytest
         # suite's wrapper call respawned the production daemon carrying
@@ -869,7 +900,7 @@ rt_call() {
     # below may retry rt_curl after a recycle, and a streamed first body would
     # CONCATENATE with the retry body on the caller's $() capture (rt_curl
     # emits no trailing newline) — observed 2026-07-18 as a doubled goal-id
-    # ("11") that made claim-liveness-check INDETERMINATE
+    # ("") that made claim-liveness-check INDETERMINATE
     # and fail-opened the guard-1151 restart gate. rt_curl prints nothing to
     # stdout on rc 2/3, so buffering + printf '%s' is byte-identical for every
     # non-retry path.

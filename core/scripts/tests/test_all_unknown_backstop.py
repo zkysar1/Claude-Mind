@@ -114,7 +114,7 @@ def _seed_paths_conf(repo_root: Path, world_dir: Path, meta_dir: Path) -> Path:
     # agents/<name>/ — seeding at PROJECT_ROOT/<name> made _paths fall
     # through to first-available conf, so utilization-feedback wrote its
     # session state under the WRONG agent dir while this test asserted its
-    # own tmp path ( polluter warning observed live; 1).
+    # own tmp path ( polluter warning observed live; ).
     agent_dir = repo_root / "agents" / "test-all-unknown-agent"
     agent_dir.mkdir(parents=True, exist_ok=True)
     conf_text = (
@@ -143,8 +143,8 @@ def main() -> int:
         env["MIND_WORLD"] = world_dir.as_posix()
         env["MIND_META"] = meta_dir.as_posix()
         # main()-style file runs OUTSIDE pytest — no conftest autouse pin
-        # (5): pin the backend so nothing routes to own-cloud S3
-        # keys (guard-955; 1 class-A repair).
+        # (): pin the backend so nothing routes to own-cloud S3
+        # keys (guard-955;  class-A repair).
         env["STORAGE_BACKEND"] = "local"
 
         # Step 1: run --all-unknown

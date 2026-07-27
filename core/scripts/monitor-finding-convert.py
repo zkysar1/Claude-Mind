@@ -51,11 +51,19 @@ def _goal_text(g):
     return " ".join(str(g.get(k) or "") for k in ("title", "description", "origin_signal"))
 
 
-def is_duplicate(origin_signal, probe_id, open_goals):
+def is_duplicate(origin_signal, probe_id, open_goals, completed_goals=None):
     """A finding is already covered when ANY open goal carries this origin_signal,
     OR its text references the probe id (handles a goal filed before the prefix
     convention, or hand-filed). Conservative: a single open match suppresses the
-    re-file (the rb-428 idempotency contract)."""
+    re-file (the rb-428 idempotency contract).
+
+    g-115-3048: ALSO suppress when a COMPLETED goal carries this EXACT
+    origin_signal. Previously is_duplicate scanned open goals only, so a
+    finding already converted+completed under this origin_signal was NOT
+    deduped and re-filed a duplicate of done work (the completed-twin blind
+    spot; sibling incident g-115-3046). The completed scan is EXACT
+    origin_signal ONLY — the fuzzy text/pid checks stay open-goals-only to
+    keep false positives low."""
     osig = (origin_signal or "").strip()
     pid = (probe_id or "").strip()
     for g in open_goals or []:
@@ -68,6 +76,12 @@ def is_duplicate(origin_signal, probe_id, open_goals):
             return True
         if pid and pid in text:
             return True
+    if osig:
+        for g in completed_goals or []:
+            if not isinstance(g, dict):
+                continue
+            if (g.get("origin_signal") or "").strip() == osig:
+                return True
     return False
 
 
@@ -126,6 +140,33 @@ def _read_open_goals(source):
     return goals
 
 
+def _read_completed_goals(source):
+    """Read COMPLETED goals from active aspirations (world/agent) for the
+    g-115-3048 completed-twin dedup. Mirrors _read_open_goals but filters
+    status == 'completed'. Used ONLY for the EXACT origin_signal match in
+    is_duplicate (the fuzzy text/pid checks stay open-goals-only). Fail-open:
+    any read/decode error yields [] so the converter never aborts."""
+    if _rt is None:
+        return []
+    try:
+        out = _rt.aspirations_read(source=source, active=True)
+    except Exception as e:  # _rt.RtError or transport error
+        print("[monitor-finding-convert] WARN: read %s completed goals failed: %s" % (source, e),
+              file=sys.stderr)
+        return []
+    try:
+        data = _rt.tolerant_decode_aggregate("monitor-finding-convert-completed: %s" % source, out)
+    except Exception:
+        return []
+    goals = []
+    for asp in (data or []):
+        if isinstance(asp, dict):
+            for g in asp.get("goals", []) or []:
+                if isinstance(g, dict) and g.get("status") == "completed":
+                    goals.append(g)
+    return goals
+
+
 def _default_filer(target_asp, record, source, origin_signal):
     """Real daemon filer: _rt add-goal with a Duplication override justified by
     THIS converter's own (stricter) origin_signal dedup having already passed."""
@@ -144,14 +185,17 @@ def _default_filer(target_asp, record, source, origin_signal):
     return gid
 
 
-def convert_finding(probe, evidence, *, source="world", goals=None, filer=None,
-                    dry_run=False):
+def convert_finding(probe, evidence, *, source="world", goals=None,
+                    completed_goals=None, filer=None, dry_run=False):
     """Convert a tripped probe into ONE deduped goal. Returns a result dict.
 
     Injection seams (hermetic test): `goals` overrides the open-goal corpus
-    (default: live daemon read of world+agent); `filer(target_asp, record,
-    source, origin_signal) -> goal_id` overrides the daemon add-goal call.
-    Fail-open: any error yields {"filed": false, "error": ...}, never raises.
+    (default: live daemon read of world+agent); `completed_goals` overrides
+    the completed-goal corpus used for the g-115-3048 EXACT origin_signal
+    dedup (default: live read, or [] when `goals` is injected so tests stay
+    hermetic); `filer(target_asp, record, source, origin_signal) -> goal_id`
+    overrides the daemon add-goal call. Fail-open: any error yields
+    {"filed": false, "error": ...}, never raises.
     """
     osig = origin_signal_for(probe)
     pid = (probe.get("id") or "unknown").strip()
@@ -167,11 +211,19 @@ def convert_finding(probe, evidence, *, source="world", goals=None, filer=None,
         return result
 
     # Dedup against open goals (live read unless injected).
+    # : also dedup against COMPLETED goals by EXACT origin_signal —
+    # a finding already converted+completed under this origin_signal must not
+    # re-file. Live mode reads both corpora; injected-corpus test mode
+    # (goals is not None) uses only the injected completed_goals (default [])
+    # so it never hits the live daemon.
     if goals is None:
         open_goals = _read_open_goals("world") + _read_open_goals("agent")
+        completed = (completed_goals if completed_goals is not None
+                     else _read_completed_goals("world") + _read_completed_goals("agent"))
     else:
         open_goals = goals
-    if is_duplicate(osig, pid, open_goals):
+        completed = completed_goals or []
+    if is_duplicate(osig, pid, open_goals, completed):
         result["deduped"] = True
         return result
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""_dry_idle.py -- pure-compute core for the dry-idle backoff (4-b, Layer 2).
+"""_dry_idle.py -- pure-compute core for the dry-idle backoff (-b, Layer 2).
 
 The autonomous loop's DRY state -- zero executable goals AND quiescence
 denied/NA -- previously spun via synchronous Skill re-entry (no interruptible
@@ -31,7 +31,7 @@ typo can never crash the loop.
 from pathlib import Path
 
 # Fallback config -- MUST mirror core/config/aspirations.yaml dry_idle_backoff
-# (landed by Layer 1, 4-a). load_config() merges the live block over
+# (landed by Layer 1, -a). load_config() merges the live block over
 # these; DEFAULTS is the fail-open floor when the config is unreadable.
 DEFAULTS = {
     "enabled": True,

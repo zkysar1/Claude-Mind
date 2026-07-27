@@ -231,7 +231,7 @@ def test_ayoai_world_meta_preset_short_circuits(tmp_path):
 
 def test_fail_loud_when_no_agent_conf(tmp_path):
     # own-cloud selected but no agents/*/local-paths.conf → no agent resolves
-    # the governed roots. FAIL LOUD (9 / rb-1796): the prior silent
+    # the governed roots. FAIL LOUD ( / rb-1796): the prior silent
     # fail-open served own-cloud with unset roots, 500ing every storage op — a
     # startup refusal is far easier to diagnose than a healthy-but-broken daemon.
     with pytest.raises(RuntimeError, match="no .*agent resolved WORLD/META"):
@@ -239,7 +239,7 @@ def test_fail_loud_when_no_agent_conf(tmp_path):
 
 
 def test_owncloud_skips_underscore_test_agent_shadow(tmp_path):
-    # 9 canonical case: a `_`-prefixed test/throwaway agent whose conf
+    #  canonical case: a `_`-prefixed test/throwaway agent whose conf
     # lacks WORLD_PATH sorts BEFORE real agents. The OLD resolve(None) picked it
     # first, raised, and silently fail-opened (roots unset). The fix skips
     # `_`-prefixed dirs and resolves the real agent (alpha) instead.

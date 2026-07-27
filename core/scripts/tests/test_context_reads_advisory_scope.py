@@ -1,4 +1,4 @@
-"""0: context-reads advisory-scope split invariants.
+""": context-reads advisory-scope split invariants.
 
 The read-before-edit ADVISORY + the RECORDER cover core/scripts framework code
 (is_in_scope_advisory), but the BLOCKING re-read dedup gate (cmd_gate / exit 2)

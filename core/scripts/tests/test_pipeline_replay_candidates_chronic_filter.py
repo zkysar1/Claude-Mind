@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test_pipeline_replay_candidates_chronic_filter.py — pins the 1 fix to
+"""test_pipeline_replay_candidates_chronic_filter.py — pins the  fix to
 the `GET /v1/pipeline/read?replay_candidates=1` endpoint (mind_api/src/world/pipeline.py).
 
 THE BUG (g-115-1421): replay_candidates merges pipeline.jsonl + pipeline-archive.jsonl
@@ -78,7 +78,7 @@ def test_encoded_via_chronic_excluded_from_both_stages(tmp_path):
     ]
     archive = [
         _rec("arch-unencoded", "archived", encoded=None),       # IN  (merge preserved)
-        _rec("arch-encoded", "archived", encoded=True),         # OUT (canonical 1 case)
+        _rec("arch-encoded", "archived", encoded=True),         # OUT (canonical  case)
     ]
     ids = _read_candidates(tmp_path, live, archive)
     assert "live-unencoded" in ids
@@ -135,7 +135,7 @@ def test_future_next_review_filter_intact(tmp_path):
 
 
 def test_replay_count_cap_excluded_from_both_stages(tmp_path):
-    # 9: rc>=5 records are source-excluded — the LLM-side archive
+    # : rc>=5 records are source-excluded — the LLM-side archive
     # remedy is a no-op for already-archived records, which cycled forever.
     ids = _read_candidates(
         tmp_path,
@@ -179,7 +179,7 @@ def test_replay_count_unparseable_falls_through(tmp_path):
 
 
 def test_next_review_datetime_form_tolerated(tmp_path):
-    # 9 bundled hardening: a datetime-form next_review_date must not
+    #  bundled hardening: a datetime-form next_review_date must not
     # silently defeat the 7-day exclusion (bare date.fromisoformat raises on
     # "YYYY-MM-DDTHH:MM:SS" and the swallowed ValueError meant INCLUDE).
     ids = _read_candidates(
@@ -192,6 +192,49 @@ def test_next_review_datetime_form_tolerated(tmp_path):
     )
     assert "dt-not-due" not in ids
     assert "dt-due" in ids
+
+
+def test_dual_present_prefers_live_copy_next_review(tmp_path):
+    # : read/write copy-preference inversion. A record present in BOTH
+    # live (full stage=archived tombstone) AND archive (frozen at first-archival)
+    # must be judged by the LIVE copy's fresh replay_metadata — where update_field
+    # (live-first) actually stamps replay progress. Here a replay pushed
+    # next_review far future on the LIVE copy (→ should defer/exclude), while the
+    # frozen ARCHIVE copy still shows a PAST next_review (→ would leak back in if
+    # the archive copy won the dedup, as it did before the fix).
+    rid = "dual-present"
+    live = [_rec(rid, "archived", encoded=None, next_review="2999-01-01", replay_count=3)]
+    archive = [_rec(rid, "archived", encoded=None, next_review="2000-01-01", replay_count=1)]
+    ids = _read_candidates(tmp_path, live, archive)
+    assert rid not in ids, (
+        "live copy's future next_review must win the dedup → excluded (no leak). "
+        "If this fails, the archive-wins inversion has regressed (g-115-2773)."
+    )
+
+
+def test_dual_present_live_rc_cap_wins(tmp_path):
+    # Symmetric proof on the rc>=5 cap: a record replayed to rc=5 on the LIVE
+    # copy (via update_field) must be excluded even though the frozen ARCHIVE
+    # copy still shows rc=1. Before the fix the archive rc=1 won → the exhausted
+    # record leaked back every cycle.
+    rid = "dual-rc"
+    live = [_rec(rid, "archived", replay_count=5)]      # exhausted on live → OUT
+    archive = [_rec(rid, "archived", replay_count=1)]   # frozen → would leak in if it won
+    ids = _read_candidates(tmp_path, live, archive)
+    assert rid not in ids, "live copy's exhausted replay_count must win → excluded (g-115-2773)"
+
+
+def test_dual_present_live_freshness_can_include(tmp_path):
+    # The inversion cuts both ways: prefer-live must also let a record that is
+    # DUE on the live copy surface even if the frozen archive copy had deferred
+    # it. Live next_review is past (due) while archive's was future — live wins,
+    # so it IS a candidate. Guards against a naive "always exclude dual-present"
+    # over-correction.
+    rid = "dual-due"
+    live = [_rec(rid, "archived", next_review="2000-01-01", replay_count=2)]   # due on live → IN
+    archive = [_rec(rid, "archived", next_review="2999-01-01", replay_count=2)]  # deferred (stale)
+    ids = _read_candidates(tmp_path, live, archive)
+    assert rid in ids, "live copy's past next_review must win → included when genuinely due (g-115-2773)"
 
 
 if __name__ == "__main__":

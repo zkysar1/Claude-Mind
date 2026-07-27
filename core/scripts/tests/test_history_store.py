@@ -557,6 +557,45 @@ def atomic_write_uses_unique_tmp_suffix(sandbox, store):
     assert_eq(leftover_unique_tmps, [], "no leftover unique-tmp")
 
 
+@with_sandbox
+def vacuum_skips_yaml_named_source_dir(sandbox, store):
+    """Regression -a: a source file whose NAME ends in .yaml creates a
+    manifest DIRECTORY that also ends in .yaml, so rglob('*.yaml') matches that
+    directory. Reading a directory as a manifest raised 'Is a directory', and
+    vacuum Phase 2a's fail-safe then treated it as a corrupt manifest and ABORTED
+    the ENTIRE vacuum (12 such .yaml-named source dirs on the live store made
+    vacuum reclaim 0 of ~4G). vacuum must SKIP the directory, not abort."""
+    file_path = _make_file(sandbox, "config.yaml", b"")
+    for i in range(3):
+        store.save(file_path, f"k: v{i}\n".encode("utf-8"), sandbox, agent=f"a{i}")
+        time.sleep(0.003)
+    # The manifest dir itself ends in .yaml — the exact bug trigger.
+    manifest_dir = sandbox / ".history" / "snapshots" / "config.yaml"
+    assert_true(manifest_dir.is_dir(), "manifest dir named config.yaml exists")
+    # Plant an orphan blob so a WORKING vacuum has real work to do (reached only
+    # if Phase 2a did NOT abort).
+    orphan_dir = sandbox / ".history" / "blobs" / "zz"
+    orphan_dir.mkdir(parents=True, exist_ok=True)
+    orphan = orphan_dir / "fakehashzzz.gz"
+    orphan.write_bytes(b"orphan payload")
+    result = store.vacuum(sandbox, dry_run=False)
+    # Must NOT abort on the .yaml-named manifest directory.
+    assert_true(result.get("aborted") is None,
+                f"vacuum must not abort on .yaml-named source dir: "
+                f"aborted={result.get('aborted')} corrupt={result.get('corrupt_manifests')}")
+    assert_eq(result["corrupt_manifests"], [], "no false-corrupt from the manifest directory")
+    # Orphan swept; the 3 reachable snapshots survive and still restore.
+    assert_true(result["blobs_deleted"] >= 1, f"orphan blob deleted: {result}")
+    assert_true(not orphan.exists(), "orphan gone")
+    snaps = store.list_snapshots(file_path, sandbox)
+    assert_eq(len(snaps), 3, "all 3 reachable snapshots preserved")
+    for i, snap in enumerate(snaps):
+        target_idx = len(snaps) - 1 - i
+        expected = f"k: v{target_idx}\n".encode("utf-8")
+        actual = store.restore(file_path, snap["snapshot_id"], sandbox)
+        assert_eq(actual, expected, f"snap {snap['snapshot_id']} restores after vacuum")
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -587,6 +626,8 @@ TESTS = [
     vacuum_aborts_on_missing_hash,
     vacuum_aborts_on_missing_base_for_delta,
     atomic_write_uses_unique_tmp_suffix,
+    # -a regression (2026-07-20): .yaml-named source dir must not abort vacuum
+    vacuum_skips_yaml_named_source_dir,
 ]
 
 

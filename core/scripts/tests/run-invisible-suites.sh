@@ -4,13 +4,13 @@
 # which `pytest core/scripts/tests` collects NOTHING from) and report
 # per-file pass/fail plus an aggregate verdict.
 #
-# Why this exists (9, 2026-07-16): 69 of the test files here are
+# Why this exists (, 2026-07-16): 69 of the test files here are
 # main()-style. The daemon-safe full suite (4400+ collected tests) says
 # nothing about any of them, so their redness is silent until someone runs
 # them by hand — observed twice in one week: the asp-257 suites sat red 3
-# days masking a real NameError (3 / rb-3678), and
+# days masking a real NameError ( / rb-3678), and
 # test_layer_d_telemetry.py was red the same way outside any aggregator
-# (8). This runner is the population-level counterpart of
+# (). This runner is the population-level counterpart of
 # run-asp-257-suite.sh: enumeration is DYNAMIC (a new main()-style file is
 # covered automatically; a file converted to pytest shape drops out
 # automatically).
@@ -50,9 +50,9 @@ command -v python3 >/dev/null 2>&1 || { echo "ERROR: no python3 on PATH — _pat
 # Quarantined files are SKIPPED (listed loudly, never run) so the aggregate
 # verdict stays meaningful for the healthy population. Remove a file from
 # this list in the SAME commit that fixes it (its goal ID is the tracker).
-# Baseline: 9 sweep, 2026-07-16 — 9 reds of 69.
+# Baseline:  sweep, 2026-07-16 — 9 reds of 69.
 declare -A QUARANTINE=(
-  # Class A (1) RESOLVED 2026-07-17: all four repaired — and the sweep
+  # Class A () RESOLVED 2026-07-17: all four repaired — and the sweep
   # surfaced two REAL production bugs the reds had been pointing at:
   #   (1) board.py's findings attribution subprocess (`reasoning-bank.py
   #       <family> increment`) had been a silent no-op since H2 Wave 2 removed
@@ -69,14 +69,14 @@ declare -A QUARANTINE=(
   #     .mind-data box the LIVE daemon resolves every agent to the live world
   #     before conf, so seeded confs can never sandbox it).
   #   test_all_unknown_backstop.py — agents/-relocated conf seed + env pins.
-  # Class B (2) RESOLVED 2026-07-16: all three were harness drift.
+  # Class B () RESOLVED 2026-07-16: all three were harness drift.
   #   test_cross_lane_claim.py — rewritten on DaemonFixture+HTTP (cmd_claim was
   #     removed in the daemon-only migration; the endpoint owns the guard). The
   #     rewrite surfaced and fixed a REAL fixture gap: _daemon_fixture.py now
   #     pins MIND_WORLD/MIND_META (g-2297 bootstrap poisoned main()-style runs).
   #   test_distill_candidate_filters.py — sys.path insert before tree.py load.
   #   test_paths_mind_data_resolution.py — PROJECT_ROOT .parent arithmetic fix.
-  # Class C (3) RESOLVED 2026-07-16: both were test drift, gates intact.
+  # Class C () RESOLVED 2026-07-16: both were test drift, gates intact.
   #   test_remove_child_orphan_gate.py — scenario 3 converted to in-process
   #     cmd_batch (daemon-routed tree-update.sh ignored the tmp MIND_WORLD).
   #   test_fileops_corruption_guards.py — 3 allow-branch assertions repointed

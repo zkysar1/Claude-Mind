@@ -1,4 +1,4 @@
-"""test_pending_phase_6_spark_sentinel.py — 4 regression test.
+"""test_pending_phase_6_spark_sentinel.py —  regression test.
 
 Pins the sentinel-WM-slot transport that decouples Phase 6 spark dispatch
 from recurring-close.sh's stdout. When recurring-close.sh's wall-clock
@@ -47,11 +47,12 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 CORE_SCRIPTS = SCRIPT_DIR.parent
 RECURRING_CLOSE_SH = CORE_SCRIPTS / "recurring-close.sh"
+ITERATION_CLOSE_SH = CORE_SCRIPTS / "iteration-close.sh"
 
 BASH_PATH = shutil.which("bash") or "bash"
 
 # Load the kebab-named spark-fire-dedup.py to unit-test its pure functions
-# (3 — fast-stdout-path double-fire dedup). importlib is the
+# ( — fast-stdout-path double-fire dedup). importlib is the
 # established pattern for hyphenated core/scripts modules (cf.
 # test_applies_to_required.py, test_aspirations_compact_completed.py).
 import importlib.util as _ilu  # noqa: E402
@@ -73,7 +74,7 @@ def _build_sentinel_payload(goal_id: str, outcome: str, source: str, summary: st
     """
     now = datetime.now()
     expires_at = (now + timedelta(minutes=60)).isoformat(timespec="seconds")
-    set_at = now.isoformat(timespec="seconds")  # 4: consumption-based dedup key
+    set_at = now.isoformat(timespec="seconds")  # : consumption-based dedup key
     return {
         "goal_id":    goal_id,
         "outcome":    outcome,
@@ -162,6 +163,87 @@ def test_recurring_close_writes_set_at():
         "recurring-close.sh missing set_at in pending_phase_6_spark payload (g-115-1404)"
 
 
+# ── : the NON-recurring sentinel WRITE lives in do_state_update ──
+# The  backstop wrote the pending_phase_6_spark sentinel from
+# do_verify. But do_verify treats --outcome as OPTIONAL (usage line ~33),
+# while do_state_update REQUIRES it (exit 2 when absent). A deep non-recurring
+# verify that omitted --outcome left OUTCOME empty → the deep-guard was false →
+# the sentinel was silently not written → Phase 6 spark skipped (observed
+# ). The fix MOVED the write to do_state_update, where --outcome is
+# guaranteed present. These pins guard the move against a silent revert.
+
+def _slice_iteration_close_function(func_name: str) -> str:
+    """Return the source text of one do_* function body in iteration-close.sh.
+
+    Slices between this function's `do_<name>() {` marker and the next
+    `do_*() {` definition. Robust to bash `${...}`/`$(...)`/JSON-dict braces
+    (which a naive brace-counter would trip on) because it uses the ordered
+    function-definition markers, not brace depth.
+    """
+    src = ITERATION_CLOSE_SH.read_text(encoding="utf-8")
+    import re
+    defs = [(m.start(), m.group(1))
+            for m in re.finditer(r"^(do_[a-z_]+)\(\) \{", src, re.MULTILINE)]
+    assert defs, "no do_*() functions found in iteration-close.sh"
+    for idx, (pos, name) in enumerate(defs):
+        if name == func_name:
+            end = defs[idx + 1][0] if idx + 1 < len(defs) else len(src)
+            return src[pos:end]
+    raise AssertionError(f"function {func_name}() not found in iteration-close.sh")
+
+
+def test_sentinel_write_is_in_do_state_update():
+    """The pending_phase_6_spark WM write must live in do_state_update ().
+
+    do_state_update REQUIRES --outcome, so OUTCOME is guaranteed non-empty and
+    the deep-guard cannot be silently falsified by an omitted flag.
+    """
+    body = _slice_iteration_close_function("do_state_update")
+    assert "wm-set.sh pending_phase_6_spark" in body \
+        or 'wm-set.sh" pending_phase_6_spark' in body, \
+        "do_state_update missing pending_phase_6_spark sentinel write (g-115-2848 regressed)"
+
+
+def test_sentinel_write_not_in_do_verify():
+    """do_verify must NOT write the pending_phase_6_spark sentinel ().
+
+    do_verify keeps ONLY the stdout imperative — the WRITE moved out because
+    --outcome is optional there and an omission defeated the g-115-2416 backstop.
+    """
+    body = _slice_iteration_close_function("do_verify")
+    assert "wm-set.sh pending_phase_6_spark" not in body \
+        and 'wm-set.sh" pending_phase_6_spark' not in body, \
+        "do_verify still writes the sentinel — g-115-2848 move incomplete (--outcome " \
+        "is optional in verify, so the write is unreliable there)"
+
+
+def test_do_verify_keeps_phase6_stdout_imperative():
+    """do_verify must still emit the in-turn Phase-6 stdout imperative ().
+
+    Moving the WRITE must not delete the fast-path prompt that fires the spark
+    in-turn when --outcome IS present on the verify call (the common path).
+    """
+    body = _slice_iteration_close_function("do_verify")
+    assert "Phase 6 spark REQUIRED" in body, \
+        "do_verify lost the Phase-6 stdout imperative (g-115-2416)"
+
+
+def test_state_update_sentinel_guarded_on_recurring():
+    """The do_state_update sentinel write must be guarded so recurring goals do
+    NOT get a double sentinel (g-115-2848).
+
+    recurring-close.sh writes its own POST-FLIP sentinel at end-of-script and
+    subprocess-calls iteration-close.sh --phase state-update. Without the
+    !recurring guard, a recurring deep close would write the sentinel twice.
+    """
+    body = _slice_iteration_close_function("do_state_update")
+    # The write block must reference the recurring probe and the deep-outcome guard.
+    assert "_su_is_recurring" in body, \
+        "do_state_update sentinel write missing recurring guard (double-write risk)"
+    assert '"$OUTCOME" == "deep"' in body, \
+        "do_state_update sentinel write missing deep-outcome guard"
+
+
 def test_aspirations_skill_md_has_consumer_block():
     """aspirations/SKILL.md Phase -0.5c.2 must consume pending_phase_6_spark.
 
@@ -191,7 +273,7 @@ def test_sentinel_payload_is_valid_json():
     assert parsed == p
 
 
-# ── 3: consumer-side dedup for the fast-stdout-path double-fire ──
+# ── : consumer-side dedup for the fast-stdout-path double-fire ──
 #
 # recurring-close.sh writes the sentinel AND emits a stdout imperative; on the
 # FAST path the LLM fires Skill(aspirations-spark) in-turn (fire #1) and the
@@ -277,7 +359,7 @@ def test_record_then_check_round_trip_semantics():
     assert spark_fire_dedup.recently_fired(fired, "g-XYZ-9", _NOW + timedelta(minutes=7), window_minutes=5) is False
 
 
-# -- 4 / rb-1674 +  / rb-2615: consumption-window dedup -------
+# --  / rb-1674 +  / rb-2615: consumption-window dedup -------
 #
 # The 5-min time window false-fired across the bg-timeout wall-clock between
 # record (aspirations-spark Step 0.5) and check (next loop entry): spark
@@ -320,9 +402,20 @@ def test_fired_in_consumption_window_proactive_before_set_at_true():
 def test_fired_in_consumption_window_prior_close_before_window_false():
     """A spark from a genuine PREVIOUS close (well before the lower bound --
     recurring intervals are hours) -> fire, not suppress. 20 min exceeds the
-    10-min lookback, so it is outside the window."""
+    15-min lookback (g-115-2988), so it is outside the window."""
     fired = {"g-XYZ-1": (_NOW - timedelta(minutes=20)).isoformat(timespec="seconds")}
     assert spark_fire_dedup.fired_in_consumption_window(fired, "g-XYZ-1", _NOW) is False
+
+
+def test_fired_in_consumption_window_slow_resume_gap_within_widened_bound_true():
+    """ REGRESSION: a NON-recurring in-turn Phase-6 spark can fire well
+    before the do_state_update sentinel's set_at under a slow post-compaction
+    resume (observed 10m08s: fire 23:03:24 vs set_at 23:13:32, g-115-2984). The
+    old 10-min lower bound false-fired by 8s; the widened 15-min bound
+    (MAX_BG_CLOSE_DURATION_MIN) counts a 10m30s-early fire as THIS close's
+    consumption -> skip. Pins the widen: this fire is False under 10, True under 15."""
+    fired = {"g-XYZ-1": (_NOW - timedelta(minutes=10, seconds=30)).isoformat(timespec="seconds")}
+    assert spark_fire_dedup.fired_in_consumption_window(fired, "g-XYZ-1", _NOW) is True
 
 
 def test_fired_in_consumption_window_far_future_beyond_ttl_false():
@@ -473,7 +566,7 @@ def test_cli_check_fire_on_garbage_stdin():
     assert rc == 0
 
 
-# -- CLI --sentinel-set-at: the consumption-based dedup path (4) -----
+# -- CLI --sentinel-set-at: the consumption-based dedup path () -----
 
 
 def test_cli_check_skip_when_fired_at_or_after_set_at():
@@ -494,7 +587,7 @@ def test_cli_check_fire_when_fired_well_before_set_at():
     """check with --sentinel-set-at fires (exit 0) when the recorded fire
     PREDATES set_at by MORE than MAX_BG_CLOSE_DURATION_MIN — a spark from a
     genuine previous close, not this one (recurring intervals are hours). 20 min
-    is outside the 10-min lookback window, so it still fires (rb-1674 / g-306-80)."""
+    is outside the 15-min lookback window (g-115-2988), so it still fires (rb-1674 / g-306-80)."""
     set_at = datetime.now()
     fired_at = (set_at - timedelta(minutes=20)).isoformat(timespec="seconds")
     stdin = json.dumps({"g-XYZ-9": fired_at})

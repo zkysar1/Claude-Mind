@@ -227,7 +227,7 @@ def _post_board_decision(entry):
     env = os.environ.copy()
     if agent:
         env["MIND_AGENT"] = agent
-    # Governed-root forwarding (0). board.py WRITES a governed store,
+    # Governed-root forwarding (). board.py WRITES a governed store,
     # so on own-cloud it needs WORLD_PATH/META_PATH in its env — without one,
     # OwnCloudBackend.from_env() raises and the child exits 1 on its first write.
     #
@@ -325,7 +325,7 @@ def _email_user(entry, event):
         "Title": subject,
         "InfoMessage": subject,
         "Body": body,
-        # Provenance stamp — email-send.sh refuses payloads without it (6).
+        # Provenance stamp — email-send.sh refuses payloads without it ().
         "XPayloadProvenance": "evolution-complete/v1",
     }
     # email-send.sh lives at world/scripts/email-send.sh in the externally-mounted
@@ -383,7 +383,7 @@ def _propose_program_change(entry, reasoning):
         # gating. Known disabled state, not an error: one clean line, fall back to
         # finalize quietly (mirrors the F3 snapshot-metrics rc=64 pattern above).
         # If a future goal builds the producer, this existence check passes and
-        # the ack flow activates with no further change here. (9)
+        # the ack flow activates with no further change here. ()
         print("INFO: program cross-agent ack flow not initiated — "
               "program-change-propose.py intentionally unimplemented "
               "(see world/conventions/self-program-evolution.md Phase 6). "
@@ -586,7 +586,7 @@ def main():
             # stays `final`; the decisions-board post below gives partners
             # post-hoc visibility (guard-380 model). NOTE not WARN — finalizing
             # without the ack flow is the documented expected behavior while the
-            # producer/sweep stay unimplemented, not a degradation. (9)
+            # producer/sweep stay unimplemented, not a degradation. ()
             print("NOTE: program edit finalized without cross-agent ack flow "
                   "(ack producer/sweep unimplemented — see _propose_program_change "
                   "log above and self-program-evolution convention Phase 6).",

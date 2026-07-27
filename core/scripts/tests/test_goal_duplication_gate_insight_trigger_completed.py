@@ -1,4 +1,4 @@
-"""test_goal_duplication_gate_insight_trigger_completed.py — 5.
+"""test_goal_duplication_gate_insight_trigger_completed.py — .
 
 Regression test for the Completed-Maintain skip in _check_insight_triggers.
 

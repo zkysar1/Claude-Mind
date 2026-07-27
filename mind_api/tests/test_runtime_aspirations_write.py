@@ -87,7 +87,7 @@ def test_add_goal_honors_caller_provided_id(running_daemon):
 
 
 def test_add_goal_history_snapshot_created(running_daemon):
-    # 0: history.snapshot delegates to _fileops.save_history, whose
+    # : history.snapshot delegates to _fileops.save_history, whose
     # Stage-2 authoritative store is the CAS-delta layout — assert a manifest
     # lands under .history/snapshots/<rel>/ instead of the legacy per-file
     # uncompressed tree (which is no longer written by default).

@@ -42,7 +42,7 @@ source "$SCRIPT_DIR/_paths.sh"
 # FAIL output.
 if [[ -z "${MIND_AGENT:-}" ]]; then
     # Resolve PROJECT_ROOT + AGENTS_PARENT_DIR from the canonical helper rather
-    # than hardcoding the agent-parent layout (2). The prior bare
+    # than hardcoding the agent-parent layout (). The prior bare
     # "$PROJECT_ROOT"/*/ walk looked for local-paths.conf as a DIRECT child of
     # PROJECT_ROOT, but under AGENTS_PARENT_DIR=agents the confs live one level
     # deeper at agents/<name>/local-paths.conf — so the walk matched none,
@@ -98,7 +98,7 @@ cases = [
         "need user trust confirmation for credential rotation",
         set(),  # no specific skill required, just policy expectations
         {"add-npc-task"},  # but stopwords shouldn't trigger false matches
-        # Flipped True→False (3 triage, 2026-07-16): the comment
+        # Flipped True→False ( triage, 2026-07-16): the comment
         # "capability-routing.md row on credentials triggers block" was never
         # true — the only credentials row is Genuinely-Human-Only ("Must be
         # created in AWS IAM by user"). The block actually rode a sole

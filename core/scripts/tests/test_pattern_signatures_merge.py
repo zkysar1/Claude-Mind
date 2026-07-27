@@ -1,4 +1,4 @@
-"""Tests for merge_pattern_signatures (3).
+"""Tests for merge_pattern_signatures ().
 
 pattern-signatures.jsonl was the last g-115-2319 store neither registered nor
 adjudicated in coordination_merge._HANDLERS. Its writers mutate records in
@@ -62,7 +62,7 @@ def test_disjoint_union_keeps_both_sides():
     assert sorted(r["id"] for r in out) == ["sig-8", "sig-9"]
 
 
-# --- key-order byte-commutativity (1) --------------------------------
+# --- key-order byte-commutativity () --------------------------------
 
 def test_distinct_new_keys_byte_commutative_live_probe_shape():
     """The exact live-probe repro from finding

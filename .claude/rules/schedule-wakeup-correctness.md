@@ -129,6 +129,38 @@ does NOT re-enter after ScheduleWakeup, the worst case is a SLOW loop
 self-arming — NOT a dead loop. The change cannot make survival worse than
 the status quo.
 
+### Re-arm FIRST on resurrection (single-shot-net gap, rb-4345 / g-115-2771)
+
+The net is a SINGLE replace-slot wakeup — FIRING it consumes it. When the
+`<<autonomous-loop-dynamic>>` wakeup fires and resurrects a dead loop, the
+resurrected turn begins with **no net armed** — it is protected again only once
+its own terminal-pair re-arms at iteration close. If the resurrected turn
+text-dies BEFORE reaching that close, the single net is already spent and
+nothing remains to resurrect the loop: a SECOND silent death with no third net.
+This is not hypothetical and is WORSE than the original single death — the
+condition that killed the loop the first time (an API storm returning
+529/`overloaded_error`/ECONNRESET/timeout) commonly outlasts the 600s
+resurrection latency, so the resurrected turn is statistically likely to die the
+same way with the net already gone. Observed 2026-07-19 (cc-04): the deadman
+fired at 00:00:40 and resurrected the loop, the resurrected turns text-died
+00:00–00:04 during an API storm WITHOUT re-arming, and the loop stayed dead ~7h
+until recovery-gate zombie-recovery at 07:18.
+
+**RULE:** on a `<<autonomous-loop-dynamic>>` wakeup firing, the resurrected
+turn's FIRST tool call MUST be a
+`ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>", delaySeconds=600)` re-arm —
+restoring the net BEFORE any loop-entry work that could fail — THEN proceed to
+Phase -1.5. This is NOT the "arm early" mechanic F2 rejected: F2 forbade arming
+early in a STEADY-STATE iteration (where the turn-terminal arm would truncate a
+multi-turn iteration). The resurrection re-arm is a one-shot net-restoration at
+the very START of a resurrection turn; the iteration then runs normally and its
+terminal-pair re-arm at close simply REPLACES this restoration arm (double-arm
+is harmless under replace-slot semantics). Each resurrection thus re-establishes
+the net protecting the NEXT resurrection, so the loop keeps getting chances for
+as long as the storm persists instead of spending its one-and-only net on the
+first resurrection. The gate passes the sentinel unconditionally, so the re-arm
+is always approved.
+
 Rationale + full incident trace: `core/config/rationale/deadman-switch.md`.
 
 ### D. Using ScheduleWakeup for EXTERNAL polling the harness already tracks

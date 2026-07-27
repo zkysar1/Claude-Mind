@@ -1,4 +1,4 @@
-"""test_team_state_authoritative.py — 8.
+"""test_team_state_authoritative.py — .
 
 Unit tests for `_team_state.load_rows_authoritative`: the surgical per-consumer
 authoritative shard read that fixes partner_in_flight blindness on the own-cloud

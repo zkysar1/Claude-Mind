@@ -1,4 +1,4 @@
-"""test_pending_deploys_gate.py — 8-b (pending-deploys hard gate, ENFORCE).
+"""test_pending_deploys_gate.py — -b (pending-deploys hard gate, ENFORCE).
 
 Verifies core/scripts/pending-deploys-gate.sh (SG-b): the closure gate that
 refuses CLEAN-SUCCESS goal closure while a deploy obligation is unresolved. It
@@ -73,8 +73,14 @@ def _setup_repo(tmp: Path, agent="zeta") -> Path:
     (repo / ".claude").mkdir()
 
     # Real framework artifacts under test + their runtime deps.
+    # _runtime_bash.py is a REQUIRED dep of pending-deploys.py ():
+    # resolve() shells out to deploy-verify.sh via _runtime_bash.BASH rather
+    # than a bare "bash", because on win32 CreateProcess searches System32
+    # before PATH and a bare "bash" reaches the WSL launcher, which blocks
+    # forever on a dead LxssManager. Omit it and the copied script cannot
+    # import, so the hermetic repo silently stops exercising the real path.
     for fname in ("pending-deploys-gate.sh", "pending-deploys.py",
-                  "deploy-verify.sh", "_paths.sh"):
+                  "deploy-verify.sh", "_paths.sh", "_runtime_bash.py"):
         dst = core / fname
         dst.write_bytes((CORE_SCRIPTS / fname).read_bytes())
         dst.chmod(0o755)
@@ -96,6 +102,12 @@ def _setup_repo(tmp: Path, agent="zeta") -> Path:
         '#!/usr/bin/env bash\n'
         'all="$*"\n'
         'case "$all" in\n'
+        # landed-detection (pending-deploys.py _landed_on_default): compare
+        # ahead_by ("0" => ancestor-landed) and commits/<sha>/pulls merged count
+        # (>0 => superseded-by-merge). Defaults (1 / 0) => NOT landed, so tests
+        # that do not set these keep the pre-landed-detection behavior.
+        '  *"/compare/"*) printf "%s" "${FAKE_AHEAD_BY-1}" ;;\n'
+        '  *"/commits/"*"/pulls"*) printf "%s" "${FAKE_MERGED-0}" ;;\n'
         '  *"actions/workflows"*) printf "%s" "${FAKE_GH_ACTIVE-1}" ;;\n'
         '  *"actions/runs"*)\n'
         '    c="${FAKE_GH_CONCLUSION:-success}"\n'
@@ -113,7 +125,8 @@ def _setup_repo(tmp: Path, agent="zeta") -> Path:
     q.write_text(
         '#!/usr/bin/env bash\n'
         'if [ "${FAKE_QUERY_DUP:-0}" = "1" ]; then\n'
-        '  printf \'[{"goal_id":"g-dup","status":"pending","origin_signal":"unblock:pending-deploy-x"}]\'\n'
+        '  st="${FAKE_QUERY_STATUS:-pending}"\n'
+        '  printf \'[{"goal_id":"g-dup","status":"%s","origin_signal":"unblock:pending-deploy-x"}]\' "$st"\n'
         'else\n'
         '  printf "[]"\n'
         'fi\n'
@@ -152,6 +165,13 @@ def _run_gate(repo: Path, *args, agent="zeta", **env_overrides):
     ghbin = repo / "_fakebin"
     env = _hermetic_env(**env_overrides)
     env["PATH"] = f"{_to_bash_path(ghbin)}:" + env.get("PATH", "")
+    # GH_BIN points at the EXTENSIONLESS stub, deliberately. It is the only form
+    # that survives both worlds: bash execs it directly, and it carries the `&`
+    # in the runs query intact. Python cannot exec it (WinError 193) and falls
+    # back to bash via pending-deploys.run_gh() / deploy-verify's BASH_BIN.
+    # A .cmd shim was tried and MEASURED BROKEN -- cmd.exe re-parses the command
+    # line and truncates `...head_sha=X&per_page=50` at the ampersand.
+    env["GH_BIN"] = (ghbin / "gh").as_posix()
     return subprocess.run(
         [BASH, _to_bash_path(repo / "core" / "scripts" / "pending-deploys-gate.sh"),
          "--agent", agent, "--timeout-mins", "1", *args],
@@ -296,3 +316,80 @@ def test_gate_fail_open_no_agent():
         )
         assert r.returncode == 0, r.stderr
         assert '"error":"no-agent"' in r.stdout, r.stdout
+
+
+# ── : landed-detection (defect 1) + completed-dedup (defect 2) ─────
+
+def test_gate_clears_superseded_via_landed_detection():
+    """DEFECT 1: a FAILED deploy whose sha landed via a MERGED PR (superseded)
+    is auto-cleared by resolve's landed-detection -> the gate counts it cleared,
+    files NO Unblock, and the closure stays clean. This is the end-to-end fix
+    for the bddb90c poison class (deploy-verify(dead-sha)=failed forever)."""
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        repo = _setup_repo(Path(td))
+        filed = Path(td) / "filed-goals.jsonl"
+        _seed(repo, [_entry(sha="e" * 40)])
+        # deploy-verify -> failed; landed-detection -> not-ancestor but merged PR.
+        r = _run_gate(repo, "--goal", "g-115-2688-b",
+                      FAKE_GH_CONCLUSION="failure", FAKE_AHEAD_BY="9", FAKE_MERGED="1",
+                      FILED_GOALS=str(filed))
+        assert r.returncode == 0, r.stderr
+        s = _summary(r)
+        assert s["cleared"] == 1 and s["failed"] == 0, s
+        assert s["not_clean"] is False, f"superseded-landed entry must clear cleanly: {s}"
+        assert s["unblocks_filed"] == 0, "no Unblock for a landed sha"
+        assert _load_store(repo) == [], "landed entry not cleared from ledger"
+
+
+def test_gate_clears_ancestor_landed_via_landed_detection():
+    """DEFECT 1: an UNVERIFIED deploy whose sha is an ancestor of the default
+    branch (ahead_by==0 -- CI ran on the branch HEAD, not this intermediate
+    commit) is cleared, not stranded unverified forever (aa9a788/4adcc37)."""
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        repo = _setup_repo(Path(td))
+        _seed(repo, [_entry(sha="f" * 40)])
+        # FAKE_GH_ACTIVE="" -> deploy-verify unverified fast; ahead_by=0 -> ancestor.
+        r = _run_gate(repo, "--goal", "g-115-2688-b",
+                      FAKE_GH_ACTIVE="", FAKE_AHEAD_BY="0")
+        assert r.returncode == 0, r.stderr
+        s = _summary(r)
+        assert s["cleared"] == 1 and s["unverified"] == 0 and s["not_clean"] is False, s
+        assert _load_store(repo) == [], "ancestor-landed entry not cleared"
+
+
+def test_gate_dedup_unblock_when_completed_exists():
+    """DEFECT 2: rc 1, NOT landed, but a COMPLETED Unblock already names this sha
+    -> no re-file. The re-file storm (8 duplicate bddb90c Unblocks) came from the
+    dedup checking only live goals; a completed Unblock must suppress too."""
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        repo = _setup_repo(Path(td))
+        filed = Path(td) / "filed-goals.jsonl"
+        _seed(repo, [_entry(sha="c" * 40)])
+        r = _run_gate(repo, "--goal", "g-115-2688-b",
+                      FAKE_GH_CONCLUSION="failure", FAKE_QUERY_DUP="1",
+                      FAKE_QUERY_STATUS="completed", FILED_GOALS=str(filed))
+        assert r.returncode == 0, r.stderr
+        s = _summary(r)
+        assert s["failed"] == 1 and s["not_clean"] is True, s
+        assert s["unblocks_filed"] == 0, "a completed Unblock must suppress the re-file"
+        assert not filed.exists() or filed.read_text().strip() == "", "no goal should be filed"
+
+
+def test_gate_refiles_when_only_skipped_exists():
+    """DEFECT 2 boundary: a SKIPPED Unblock does NOT suppress -- a re-failed
+    re-push legitimately needs a fresh Unblock, so skipped/expired never dedup."""
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        repo = _setup_repo(Path(td))
+        filed = Path(td) / "filed-goals.jsonl"
+        _seed(repo, [_entry(sha="c" * 40)])
+        r = _run_gate(repo, "--goal", "g-115-2688-b",
+                      FAKE_GH_CONCLUSION="failure", FAKE_QUERY_DUP="1",
+                      FAKE_QUERY_STATUS="skipped", FILED_GOALS=str(filed))
+        assert r.returncode == 0, r.stderr
+        s = _summary(r)
+        assert s["failed"] == 1, s
+        assert s["unblocks_filed"] == 1, "skipped must NOT dedup -- fresh Unblock filed"

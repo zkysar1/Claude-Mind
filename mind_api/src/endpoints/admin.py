@@ -152,8 +152,14 @@ def owncloud_pull(ctx) -> "Response":  # type: ignore[name-defined]
         return Response.json(
             {"backend": backend, "ok": False,
              "error": f"import failed: {e}"}, status=500)
+    # `only` (): comma-separated continuity filenames to narrow the
+    # pull to, skipping the temp/ sweep. Lets a caller that needs ONE file per
+    # agent (/open-questions refreshing every peer's pending-questions.yaml)
+    # avoid a full ~900-file sweep per agent. Absent/empty -> unchanged full pull.
+    only_raw = (ctx.query.get("only") or "").strip()
+    only = {p.strip() for p in only_raw.split(",") if p.strip()} or None
     try:
-        stats = owncloud_sync.pull_continuity(get_backend(), agent)
+        stats = owncloud_sync.pull_continuity(get_backend(), agent, only=only)
     except Exception as e:  # noqa: BLE001
         return Response.json(
             {"backend": backend, "ok": False,

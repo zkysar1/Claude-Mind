@@ -175,7 +175,7 @@ def test_try_new_patterns_dispatcher_attaches_pattern_field():
 
 
 def test_time_gated_dep_recognized_when_all_deps_completed():
-    """8: deferred_until goal whose defer names ALL-completed deps
+    """: deferred_until goal whose defer names ALL-completed deps
     → recognize-only classification (never a clear)."""
     mod = _import_defer_recheck()
     by_id = _make_by_id({

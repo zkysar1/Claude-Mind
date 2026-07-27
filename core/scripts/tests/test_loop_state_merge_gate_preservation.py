@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test_loop_state_merge_gate_preservation.py — 8 regression test.
+"""test_loop_state_merge_gate_preservation.py —  regression test.
 
 Pins the Mechanism C backstop (g-115-1411): loop-state-merge-gate.check() floors
 the three monotonic top-level loop_state counters — goals_completed,

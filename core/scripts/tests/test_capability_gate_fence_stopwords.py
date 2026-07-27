@@ -1,4 +1,4 @@
-"""test_capability_gate_fence_stopwords.py — regression test for 1.
+"""test_capability_gate_fence_stopwords.py — regression test for .
 
 Own-cloud write-fence defer_reasons ("own-cloud pipeline writes fenced; reads
 work, writes fail; write_conflict") leaked the generic infra tokens
@@ -30,10 +30,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 CORE_SCRIPTS = SCRIPT_DIR.parent
 GATE_PY = CORE_SCRIPTS / "capability-gate.py"
 
-# A minimal own-cloud write-fence defer_reason. After 1 + 0
+# A minimal own-cloud write-fence defer_reason. After  + 
 # the only tokens that survive extraction are non-capability-matching (fenced /
 # precondition_unmet / write_conflict / since) — writes/reads/pipeline AND
-# own-cloud are stopworded. (0: own-cloud was added to _STOPWORDS once
+# own-cloud are stopworded. (: own-cloud was added to _STOPWORDS once
 # the forged skill probe-governed-store registered a trigger containing it,
 # turning the previously-inert own-cloud token into a false capability match on
 # a legitimately-fenced defer.)
@@ -106,12 +106,12 @@ def test_detection_preserved_for_real_domain_capability():
     )
 
 
-# 0 recall control (guard-958): stopwording own-cloud must NOT suppress
+#  recall control (guard-958): stopwording own-cloud must NOT suppress
 # an ADJACENT genuine capability token. The single surviving keyword is the SOLE
 # matcher, sitting right beside the newly-stopworded own-cloud — so a
 # multi-keyword happy path cannot mask a recall regression.
 # Re-pointed from backend-cat/probe-governed-store to analyze-npc-behavior
-# (3): probe-governed-store was NEVER forged — 7 was
+# (): probe-governed-store was NEVER forged —  was
 # mis-premised (skill + backend-cat.sh absent on disk and from
 # forged-skills.yaml; re-scoped in place to a design+forge goal, still
 # pending), so the original fixture asserted recall of a PHANTOM registration
@@ -122,7 +122,7 @@ _ADJACENT_RECALL_DEFER = "blocked: own-cloud analyze-npc-behavior step must run 
 
 
 def test_own_cloud_stopworded_no_longer_matches_forged_skill():
-    """0: the pure own-cloud fence defer must not match the
+    """: the pure own-cloud fence defer must not match the
     probe-governed-store forged skill. own-cloud is now stopworded, so it is
     absent from keyword extraction and produces no capability match — the exact
     false-positive that regressed test_fence_defer_does_not_falsely_block when
@@ -140,7 +140,7 @@ def test_own_cloud_stopworded_no_longer_matches_forged_skill():
 
 
 def test_recall_preserved_adjacent_to_stopword():
-    """0 / guard-958 adversarial recall control: stopwording own-cloud
+    """ / guard-958 adversarial recall control: stopwording own-cloud
     must not break detection of an adjacent genuine capability token. A defer
     whose SOLE surviving keyword is analyze-npc-behavior (own-cloud stopworded
     right beside it) must still route to the agent via that skill — proving no

@@ -1,0 +1,167 @@
+# domain-leak-exempt: canonical fleet node manifest — the literal hostnames, tailnet
+# addresses and env-var key NAMES below ARE this file's functional payload. Genericizing
+# them would make it inert: a parity checker with placeholder nodes checks nothing.
+#
+# Canonical configuration manifest for the agent fleet. Consumed by
+# core/scripts/fleet-config-parity.sh, which compares every live node against
+# this file and emits per-node PASS / DRIFT.
+#
+# WHY THIS EXISTS (g-115-3071). The fleet has strong LIVENESS observability and had
+# effectively zero CONFIGURATION observability. The last six fleet incidents were ALL
+# config drift and NONE were liveness failures — every one was found by a human or an
+# agent tripping over it, never by a probe. The watchdog reported all nodes healthy
+# throughout and was correct: they were alive, they were just wrong.
+#
+# ── SECRETS CONTRACT (non-negotiable) ──────────────────────────────────────────
+# `required_env_keys` / `optional_env_keys` are KEY NAMES. The checker reads the
+# NAME SET of each node's .env.local and never its values; no value of any key
+# listed here is read, compared, logged, or emitted on any output path.
+# The ONLY value-bearing reads are `value_visible_env_keys` below — three
+# non-secret configuration identifiers whose values ARE the thing being audited.
+#
+# ── guard-892: CHECK THE NAME BEFORE CHECKING THE STORE ────────────────────────
+# Every name below is transcribed from a real read-site, not guessed. A manifest of
+# guessed names produces false DRIFT forever: the canonical trap in this codebase is
+# the header `AYOAI-API-KEY` whose value comes from env var `AYO_OPERATOR_KEY` — no
+# env var named MIND_API_KEY exists anywhere in the fleet. When adding a key here,
+# grep the consuming code for the name it actually reads.
+
+schema_version: 1
+last_verified: "2026-07-25"
+verified_from: "cc-05 (bravo)"   # guard-1412 — a manifest baseline has a vantage point too
+
+# ── Env-var key NAMES every node must carry ────────────────────────────────────
+# Absence of any of these is DRIFT. This is the "cc-02 lost 5 storage keys on
+# 2026-07-14, found by accident 11 days later" incident class.
+required_env_keys:
+  - STORAGE_BACKEND
+  - STORAGE_S3_BUCKET
+  - STORAGE_DDB_LOCK_TABLE
+  - STORAGE_DDB_SESSIONS_TABLE
+  - ENVIRONMENT_ID
+  - MACHINE_ID
+  - OWNERSHIP_MODE
+  - AWS_ACCESS_KEY_ID
+  - AWS_SECRET_ACCESS_KEY
+  - AWS_DEFAULT_REGION
+  - ANTHROPIC_API_KEY
+  - USER_EMAIL
+
+# Per-vertical / per-role extras. Absence is NOT drift — presence is informational.
+# Listing them keeps an unexpected NEW key visible as `unknown_env_keys` instead of
+# silently blending into the baseline.
+optional_env_keys:
+  - AGENTS_GROUP_EMAIL
+  - ARC_API_KEY
+  - AYO_OPERATOR_KEY
+  - AYO_SES_EMAIL_S3_BUCKET
+  - DEEPINFRA_API_KEY
+  - EFS_SSH_HOST
+  - EFS_SSH_KEY_PATH
+  - EFS_SSH_USER
+  - GROQ_API_KEY
+  - MIND_AWS_ACCESS_KEY_ID
+  - MIND_AWS_SECRET_ACCESS_KEY
+  - OPENAI_API_KEY
+  - REMOTE_DATA_PATH
+
+# ── The ONLY keys whose VALUE is read ──────────────────────────────────────────
+# Non-secret configuration identifiers. Their values are precisely what drifted in
+# incident (6): "Claude-Mind pointing at the shared PRODUCTION bucket with no
+# ENVIRONMENT_ID and no MACHINE_ID". Auditing them requires reading them.
+# Do NOT add a credential-bearing key to this list.
+value_visible_env_keys:
+  - STORAGE_BACKEND
+  - ENVIRONMENT_ID
+  - MACHINE_ID
+
+# Expected resolved values. `per_node` overrides the fleet default where a node
+# legitimately differs; MACHINE_ID is checked against each node's `host`.
+expected_resolved:
+  STORAGE_BACKEND: own-cloud
+  ENVIRONMENT_ID: ayoai-mind
+
+# ── Toolchain floors ───────────────────────────────────────────────────────────
+# node_major 22: the claude-code package declares engines >=22. Incident (3) was the
+# fleet sitting on Node 20 under that floor. claude_min tracks incident (2), the
+# fleet running 13 Claude Code versions behind.
+toolchain:
+  node_major_min: 22
+  claude_min: "2.1.0"
+
+# ── local-paths.conf shape ─────────────────────────────────────────────────────
+# Key names only. AGENT_WRITE_PATH may be multi-root; the checker reports its
+# ROOT COUNT and existence, never its contents.
+required_paths_keys:
+  - WORLD_PATH
+  - META_PATH
+  - AGENT_WRITE_PATH
+
+# ── Deploy-key policy ──────────────────────────────────────────────────────────
+# The read_only flag is read from the GitHub API and matched by PUBLIC KEY BODY,
+# never by key title. Incident (4) — "echo/zeta/bravo stranded on read-only deploy
+# keys" — is invisible to a title heuristic: as of 2026-07-25 zeta has TWO registered
+# keys, `cc-02-zeta-readonly` (read_only=true) and `zeta-cc02-deploy` (read_only=false).
+# Only matching the body of the key the box actually holds says which one is live.
+deploy_key:
+  repo: zkysar1/Ayoai-Mind
+  require_write: true          # read_only=true on the live key is DRIFT
+
+# ── Aggregate-unreachability escalation (g-115-3162) ───────────────────────────
+# UNREACHABLE nodes deliberately do NOT set exit 1 on their own: one node behind a
+# dropped tunnel is a blip, and failing the 12h sweep on a blip is the noise this
+# checker was built to avoid. But that tolerance has no ceiling, so a TOTAL fleet
+# blackout also exits 0 — measured 0 PASS / 0 DRIFT / 5 UNREACHABLE / rc=0. The
+# sweep then measures nothing, files nothing, and reports success: a failed
+# measurement counted as a passing one (guard-1091).
+#
+# The escalation is keyed on NON-SELF nodes because the self node is collected
+# locally, so in a real blackout it still reports PASS/DRIFT while every peer goes
+# UNREACHABLE — "all nodes unreachable" would be false exactly when the fleet is
+# down. min_non_self_nodes keeps a small fleet from tripping on one blip: with a
+# single peer, "100% of peers unreachable" IS the blip case.
+blackout_escalation:
+  enabled: true
+  unreachable_fraction: 1.0    # share of non-self nodes UNREACHABLE to call it systemic
+  min_non_self_nodes: 2        # below this, fraction is meaningless — tolerate
+
+# ── The fleet ──────────────────────────────────────────────────────────────────
+# addr: tailnet address. Verified reachable by plain `ssh root@<addr>` from cc-05 on
+# 2026-07-25 for ALL five nodes — including foxtrot, whose tailnet node IS its WSL2
+# instance, so it needs no `-i` key file and no `wsl` wrapper from a tailnet peer
+# (that incantation in world/conventions/local-compute.md is the off-tailnet path).
+nodes:
+  - agent: alpha
+    host: cc-04
+    addr: 100.87.130.61
+    shape: lxc
+    user: root
+    root: /opt/ayoai-mind
+  - agent: bravo
+    host: cc-05
+    addr: 100.101.128.104
+    shape: lxc
+    user: root
+    root: /opt/ayoai-mind
+  - agent: echo
+    host: cc-03
+    addr: 100.96.167.28
+    shape: lxc
+    user: root
+    root: /opt/ayoai-mind
+  - agent: zeta
+    host: cc-02
+    addr: 100.86.98.9
+    shape: lxc
+    user: root
+    root: /opt/ayoai-mind
+  - agent: foxtrot
+    host: LAPTOP-3IOFCNEO
+    addr: 100.73.115.66
+    shape: wsl2
+    user: root
+    root: /home/zkysa/ayoai-mind
+    # foxtrot is a Windows laptop running WSL2 + tmux, NOT an lxc container, and its
+    # framework root differs from the container nodes. MACHINE_ID is not expected to
+    # equal `host` here (the containers self-name cc-0N; this box does not).
+    machine_id_check: skip

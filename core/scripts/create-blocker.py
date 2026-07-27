@@ -271,10 +271,17 @@ def main():
                 if not ref_ok:
                     print(f"[create-blocker] WARN: blocker_ref not set on goal "
                           f"{args.goal_id}: {ref_err.strip()}", file=sys.stderr)
+        # One spelling of blocker identity everywhere (). Not a live
+        # bug today -- _find_existing matches on affected_skills, and the other
+        # writer's streak entries carry an empty list, so only this script's own
+        # blockers reach here and those always have `id`. Read the canonical key
+        # first anyway: leaving a lone `id`-only reader is how the drift this
+        # goal removed got seeded in the first place.
+        existing_id = existing.get("blocker_id") or existing.get("id")
         print(json.dumps({
-            "summary": f"appended goal {args.goal_id} to existing blocker {existing.get('id')}",
+            "summary": f"appended goal {args.goal_id} to existing blocker {existing_id}",
             "flags": ["existing_blocker_appended"],
-            "blocker_id": existing.get("id"),
+            "blocker_id": existing_id,
             "unblocking_goal_id": existing.get("unblocking_goal"),
             "new_goal_created": False,
         }, ensure_ascii=False, default=str))
@@ -447,6 +454,28 @@ def main():
     }
 
     new_blocker = {
+        # SCHEMA CONFORMANCE (). The documented known_blockers schema
+        # (core/config/conventions/handoff-working-memory.md) names these keys
+        # `blocker_id` and `detected_at`. EVERY other participant already uses
+        # them — the other writer (infra-health.py:682 streak alerts) and all
+        # six readers: blocker-recheck.py:277/288/294/325, goal-selector.py:
+        # 2158/2178, aspirations-precheck SKILL.md Phase 0.5b.1, and
+        # aspirations-all-blocked SKILL.md:804. This site was the SOLE deviant,
+        # writing `id`/`created_at`, so blockers born here were invisible to all
+        # of them at once: the aged-blocker capability recheck could never fire
+        # (age was always None -> `continue`), proactive user escalation could
+        # never fire, and goal-selector rendered the blocker id as the skill name.
+        # Both alarm clocks on a user-routed blocker were disconnected.
+        #
+        # `id`/`created_at` are RETAINED as legacy aliases, not removed: live
+        # blockers in this shape exist across the fleet's working memories, and
+        # create-blocker.py:277 reads its own `id` on the dedup path. Emitting
+        # both is purely additive, so it cannot break an unenumerated consumer;
+        # the duplication is a bounded migration state, tracked for removal once
+        # fleet blockers have cycled. Values are identical by construction --
+        # these are key aliases for one fact, not two sources of truth.
+        "blocker_id": blocker_id,
+        "detected_at": _now.strftime("%Y-%m-%dT%H:%M:%S"),
         "id": blocker_id,
         "type": args.blocker_type,
         "affected_skills": [args.failure_skill],

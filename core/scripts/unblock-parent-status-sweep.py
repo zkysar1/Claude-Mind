@@ -103,6 +103,7 @@ from _fileops import locked_append_jsonl  # noqa: E402
 
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, )
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
 
 
@@ -123,15 +124,15 @@ GOAL_ID_PATTERN = re.compile(r"^g-\d+-\d+$")
 # tests/test_terminal_goal_states_parity.py.
 TERMINAL_STATES = {"completed", "skipped", "expired", "decomposed", "superseded"}
 
-# 1 — close-sequence tolerance for the _provenance_fp_guard.
+#  — close-sequence tolerance for the _provenance_fp_guard.
 #
-# The 4 guard tested `created < parent_completed` and called ANY
+# The  guard tested `created < parent_completed` and called ANY
 # earlier creation a "genuine wait". That boundary is wrong at the margin: an
 # Unblock filed DURING its parent's close sequence (Phase 4 surfaces a finding
 # -> the agent files the follow-up -> verify/state-update/learning-gate then
 # stamp the parent terminal) is created SECONDS-to-MINUTES *before* the parent
 # completes, and is a FOLLOW-UP, not a wait. Measured FPs, all re-swept under
-# the bare test:  (28s lead),  (93s), 3 (97s) — each
+# the bare test:  (28s lead),  (93s),  (97s) — each
 # description literally opens "MEASURED during <parent>", i.e. the parent's
 # completion is their PRECONDITION, not what moots them.
 #
@@ -248,7 +249,7 @@ def _age_hours(ts):
     if not ts:
         return None
     try:
-        t = dt.datetime.fromisoformat(str(ts).replace("Z", ""))
+        t = parse_naive_iso(ts)
         return (dt.datetime.now() - t).total_seconds() / 3600
     except Exception:
         return None
@@ -303,7 +304,7 @@ def _parse_ts(ts):
     if not ts:
         return None
     try:
-        parsed = dt.datetime.fromisoformat(str(ts).replace("Z", ""))
+        parsed = parse_naive_iso(ts)
     except Exception:
         return None
     if parsed.tzinfo is not None:

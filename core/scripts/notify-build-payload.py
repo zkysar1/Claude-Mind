@@ -53,7 +53,7 @@ import argparse
 import json
 import os
 import re
-import subprocess  # finding-disproof gate (4)
+import subprocess  # finding-disproof gate ()
 import sys
 from pathlib import Path
 
@@ -194,7 +194,7 @@ def main():
         default=None,
         help="Override PROJECT_ROOT (test only). Default: derived from script location.",
     )
-    # --- finding-disproof gate (4) -------------------------------
+    # --- finding-disproof gate () -------------------------------
     # Fires for `blocker` and `decision-needed` only — the two categories that
     # carry FINDINGS to the user (info/completion/update are status reports).
     # See finding-disproof-gate.py for the incident: a blocker email told the
@@ -245,7 +245,7 @@ def main():
         )
         sys.exit(2)
 
-    # --- finding-disproof gate (4, 2026-07-14) --------------------
+    # --- finding-disproof gate (, 2026-07-14) --------------------
     # Enforced HERE, not in notify-user/SKILL.md, because the incident email
     # BYPASSED the skill entirely — the agent called this script directly. A
     # gate in a SKILL.md is honor-system; the script is the real chokepoint,
@@ -287,8 +287,19 @@ def main():
     sections = parse_json_array("--sections-json", args.sections_json)
     next_steps = parse_json_array("--next-steps-json", args.next_steps_json)
 
-    identity = extract_self_identity(agent, project_root)
-    body = f"{identity}\n\n{message}"
+    # Validate self.md structure (fails loud rc=3 on missing/malformed) but do
+    # NOT prepend the extracted identity to the body —  plain-language
+    # contract (user directive 2026-07-20 "PLEASE lower the cognitive load
+    # for me here"). Agent→user emails must read like a competent human
+    # assistant wrote them, not open with the second-person system-prompt block
+    # "## Identity You are **<Agent>** — ..." (the exact text flagged in the
+    # 2026-07-20 16:52 jargon-email incident). Identity is carried by the
+    # transport subject prefix + domain sign-off convention instead. The
+    # validation call is retained so a malformed self.md still fails loud (the
+    # rc=3 guard this helper exists for; pinned by test_missing_self_md /
+    # test_malformed_self_md).
+    extract_self_identity(agent, project_root)
+    body = message
 
     if args.category == "blocker":
         payload = {
@@ -305,7 +316,7 @@ def main():
             "NextSteps": next_steps,
         }
 
-    # Provenance stamp — email-send.sh refuses payloads without it (6)
+    # Provenance stamp — email-send.sh refuses payloads without it ()
     # and pops it before the transport sees the payload.
     payload["XPayloadProvenance"] = "notify-build-payload/v1"
 

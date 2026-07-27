@@ -1,4 +1,4 @@
-"""test_iteration_commit_staged_deletion.py — 0 regression test.
+"""test_iteration_commit_staged_deletion.py —  regression test.
 
 Verifies iteration-commit.sh handles already-staged deletions (porcelain "D " —
 index column D, clean worktree) WITHOUT aborting the whole commit.

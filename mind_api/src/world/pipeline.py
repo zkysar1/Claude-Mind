@@ -98,7 +98,7 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
                   "resolved": 0, "archived": len(archive)}
         for r in items:
             stg = r.get("stage", "discovered")
-            # Live stage=archived tombstones (6) are counted by their
+            # Live stage=archived tombstones () are counted by their
             # archive-file copy already — skip them here or the count doubles.
             if stg in counts and stg != "archived":
                 counts[stg] += 1
@@ -125,14 +125,30 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
     if flag(q, "replay_candidates"):
         items = jc.get(_live_path(ctx))
         archive = jc.get(_archive_path(ctx))
-        # Dedup by id, preferring the archive copy (6): a tombstoned
-        # id is present in BOTH files by design — without this, every archived
-        # hypothesis would surface twice as a replay candidate.
+        # Dedup by id (): a tombstoned id is present in BOTH files by
+        # design — without collapsing, every archived hypothesis would surface
+        # twice as a replay candidate.
+        #
+        # WHICH copy wins: the LIVE copy ( — read/write copy-preference
+        # inversion fix). A record moved to archived is kept in live as a FULL
+        # stage=archived tombstone AND appended to archive exactly ONCE
+        # (pipeline_write.move dedup-guards the archive append). update_field
+        # probes LIVE-first, so every post-archival replay stamp (replay_count,
+        # next_review_date) lands on the LIVE copy — the archive copy is frozen
+        # at first-archival. The prior archive-wins order therefore read STALE
+        # metadata: a replay that pushed next_review into the future (written to
+        # live) was invisible here, so the exclusion never took and the record
+        # leaked back as a candidate every cycle (150/165 = 91% of world records
+        # at diagnosis, /rb-4354). Iterating archive FIRST then live
+        # makes the fresher live copy win the last-write dedup, aligning this
+        # read with where update_field actually writes. Archive-only records
+        # (live tombstone already pruned) still resolve to the archive copy —
+        # their only copy, and also update_field's target — so no case regresses.
         _by_id: dict = {}
-        for r in list(items) + list(archive):
+        for r in list(archive) + list(items):
             rid = r.get("id")
             if rid is not None:
-                _by_id[rid] = r  # archive iterates second → archive copy wins
+                _by_id[rid] = r  # live (items) iterates second → live copy wins ()
         all_resolved = [r for r in _by_id.values()
                         if r.get("stage") in ("resolved", "archived")]
         candidates = []
@@ -141,7 +157,7 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
             if not r.get("reflected", False):
                 continue
             replay = r.get("replay_metadata") or {}
-            # 1: a chronic-CORRECTED hypothesis encoded as a calibration
+            # : a chronic-CORRECTED hypothesis encoded as a calibration
             # guardrail by Replay Step 3.6 has zero further replay value. Archived
             # records are merged into the candidate pool above, so without this
             # source-level exclusion an encoded item re-surfaces every cycle
@@ -150,7 +166,7 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
             # also applies LLM-side — script-enforced > LLM-gated.
             if replay.get("encoded_via_chronic") is True:
                 continue
-            # 9: rc>=5 records have exhausted the spaced-repetition
+            # : rc>=5 records have exhausted the spaced-repetition
             # ladder (Replay Step 1's cap). For already-archived records the
             # LLM-side remedy (pipeline-move to archived) is a no-op, so
             # without this source-level exclusion they resurface every cycle.

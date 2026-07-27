@@ -219,7 +219,7 @@ if ar.stderr:
     sys.stderr.write(ar.stderr)
 counts = {k: 0 for k in ARTIFACT_KEYS}
 total_artifacts = 0  # unweighted sum, kept for logging
-# 9: a counter FAILURE is not a measurement of ZERO. Previously, a
+# : a counter FAILURE is not a measurement of ZERO. Previously, a
 # nonzero exit (e.g. ONE tree node with malformed YAML front matter — the whole
 # shared tree is one bad node away from this) left `counts` all-zero and the gate
 # went on to print `encoding_ratio=0.00` as if it had measured something. That is
@@ -274,7 +274,7 @@ if encoding_degraded:
     # Loud + ATTRIBUTED. The prior failure mode printed a bare `encoding_ratio=0.00`
     # next to an unattributed YAML traceback, which reads as "you encoded nothing"
     # rather than "I could not count". Never let a broken counter masquerade as a
-    # measurement (9 / guard-1090).
+    # measurement ( / guard-1090).
     print(f"[productivity-gate] *** ENCODING SIGNAL DEGRADED — encoding_ratio above is "
           f"NOT a measurement *** {encoding_degraded}", file=sys.stderr)
 
@@ -458,7 +458,7 @@ if score >= stop_threshold:
             print(f"[productivity-gate] streak reset 0 (was {current_streak}) — score recovered")
     sys.exit(0)
 
-# 9: below threshold — but is the score TRUSTWORTHY? encoding_ratio carries
+# : below threshold — but is the score TRUSTWORTHY? encoding_ratio carries
 # weight 0.3, so a failed/degraded counter can subtract up to 0.30 from the score and
 # push a genuinely-productive agent under stop_threshold. Stopping an agent because a
 # YAML parse error in ONE shared tree node blinded the counter is a catastrophic

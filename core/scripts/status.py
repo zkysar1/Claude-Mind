@@ -60,7 +60,7 @@ def _hours_since(ts_str: str | None) -> float | None:
     except Exception:
         return None
     delta = (datetime.now() - dt).total_seconds() / 3600.0
-    # Cross-machine clock/TZ skew (0): a partner on a machine whose
+    # Cross-machine clock/TZ skew (): a partner on a machine whose
     # local wall-clock is ahead writes a future-dated liveness stamp, and
     # datetime.now() is machine-local (naive), so delta goes negative. Clamp
     # to 0 — a future-dated stamp means "just active", never "active in the

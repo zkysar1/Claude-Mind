@@ -401,7 +401,7 @@ def audit(goal: dict, *, project_root: Path,
             stamped_score=0, gap=0, scores={}, goal_id=goal_id,
             investigate_spec=None,
         )
-    # 2: the "either" sentinel used to short-circuit here with
+    # : the "either" sentinel used to short-circuit here with
     # "classifier was uncertain — auditing for a mismatch produces noise."
     # That removed Self.md affinity from exactly the case where it's the
     # deciding signal. The fix runs the audit under a higher gap threshold
@@ -430,7 +430,7 @@ def audit(goal: dict, *, project_root: Path,
 
     # Recursion guard: an Investigate goal filed BY this audit carries
     # origin_signal "routing-mismatch:<X>" (specific-agent path) or
-    # "routing-either-resolve:<X>" (either-case path, 2).
+    # "routing-either-resolve:<X>" (either-case path, ).
     # Re-auditing the audit's own output produces an infinite filing chain.
     # Bail early on either prefix.
     origin = goal.get("origin_signal")
@@ -445,7 +445,7 @@ def audit(goal: dict, *, project_root: Path,
             investigate_spec=None,
         )
 
-    # 1 / rb-1488: ALSO skip insight-trigger-derived goals. The
+    #  / rb-1488: ALSO skip insight-trigger-derived goals. The
     # insight-trigger sweep () files Apply/Investigate goals from
     # findings-channel posts and stamps intended_agent from the finding
     # author's requires_action_by tag — that routing is AUTHOR-CURATED, not
@@ -544,7 +544,7 @@ def audit(goal: dict, *, project_root: Path,
                 investigate_spec=None,
             )
 
-    # Absolute min-best-score floor (rb-1488 / 1). The gap check below
+    # Absolute min-best-score floor (rb-1488 / ). The gap check below
     # catches RELATIVE stand-outs, but bag-of-words contamination yields a
     # top-decile GAP between two NEAR-ZERO absolute scores (FP band best
     # ~0.073-0.081, rb-1478). When the best agent's own absolute Jaccard is

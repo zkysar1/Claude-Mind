@@ -145,8 +145,8 @@ def section_handoff(agent_path):
     elif kb not in (None, ""):
         out["known_blockers_active"] = kb
     # pending_deploys: unverified deploy obligations rolled into the handoff at
-    # graceful stop (SG-c, 8-c). Surfacing the count here gives the
-    # cross-session visibility mirror a real consumer (9, fresh-eyes
+    # graceful stop (SG-c, -c). Surfacing the count here gives the
+    # cross-session visibility mirror a real consumer (, fresh-eyes
     # SG-c Finding 1); the persisting pending-deploys.yaml store stays the
     # source of truth re-probed by SG-b's all-sweep.
     pd = data.get("pending_deploys")

@@ -316,6 +316,60 @@ def _session_file_machine_local(basename: str, rel_parts) -> bool:
     return Path(basename).suffix.lower() not in _SESSION_DATA_EXTS
 
 
+def _is_single_writer_session_file(full, be) -> bool:
+    """True iff `full` is a manifest-registered, single-writer per-agent session
+    file eligible for the both-diverged LOCAL-WINS auto-resolve (g-115-2820).
+
+    Eligible = under agents/<name>/session/ (not scratch/) with sync_tier
+    continuity|ephemeral. These are per-agent PRIVATE session state
+    (working-memory.yaml, handoff.yaml, execution-diary.jsonl, ...) authored by
+    exactly ONE box — the one running that agent — so they are deliberately NOT
+    merge-registered (a UNION of two sessions' private scratch is semantically
+    wrong: it would mix loop_state counters etc.; guard-907). Reaching the
+    both-diverged branch of _sync_one for such a file PROVES this box authored
+    the local change: the sweep's H4a owned-prune (sweep(), ~L1027) never walks a
+    PEER agent's session dir under own-cloud, so a caching box hits the
+    stale-cache PULL branch, never both-diverged, for a file it does not author.
+    Local is therefore authoritative and local-wins is safe.
+
+    EXCLUDED (keep the conservative clobber-safe skip): merge-registered
+    peer-authored stores (handled upstream by _try_merge_put), the world/ + meta/
+    shared trees (peer-authored), machine_local session files (never synced, so
+    never reach _sync_one), and UNREGISTERED session files (fail closed until
+    classified in the manifest)."""
+    roots = getattr(be, "_roots", None)
+    if not roots:
+        return False
+    try:
+        fp = Path(full).resolve()
+    except OSError:
+        return False
+    for root_path, prefix in roots:
+        if prefix != "agents":
+            continue
+        try:
+            rel_parts = fp.relative_to(Path(root_path).resolve()).parts
+        except ValueError:
+            continue
+        # rel_parts like ('<agent>', 'session', <basename or subdir...>).
+        if len(rel_parts) < 3 or rel_parts[1] != "session":
+            return False
+        if "scratch" in rel_parts[2:]:      # machine-local ad-hoc workspace
+            return False
+        tiers = _load_session_tiers()
+        if tiers is None:                   # unreadable manifest -> fail closed
+            return False
+        exact, globs = tiers
+        tier = exact.get(fp.name)
+        if tier is None:
+            for pat, t in globs:
+                if fnmatch.fnmatch(fp.name, pat):
+                    tier = t
+                    break
+        return tier in ("continuity", "ephemeral")
+    return False
+
+
 # --- manifest (machine-local mtime cache to skip unchanged files) ----------
 def _runtime_dir() -> Path:
     rd = os.environ.get("RUNTIME_DIR")
@@ -353,7 +407,7 @@ def _save_manifest(m: dict) -> None:
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
     except OSError as e:
-        print(f"[sync] WARN: could not create manifest dir {p.parent}: {e}",
+        _sync_print(f"[sync] WARN: could not create manifest dir {p.parent}: {e}",
               file=sys.stderr)
         return
     tmp_fd = None
@@ -368,7 +422,7 @@ def _save_manifest(m: dict) -> None:
         os.replace(tmp_name, p)
         tmp_path = None  # replaced successfully — nothing to clean up
     except OSError as e:
-        print(f"[sync] WARN: could not persist manifest {p}: {e}",
+        _sync_print(f"[sync] WARN: could not persist manifest {p}: {e}",
               file=sys.stderr)
     finally:
         if tmp_fd is not None:
@@ -453,7 +507,7 @@ def _owned_agents(be=None):
         # clobbering a peer (test_ownership_ddb_failure_owns_none).
         raise
     except Exception as exc:
-        print(f"[sync] live runner-claim read failed "
+        _sync_print(f"[sync] live runner-claim read failed "
               f"({type(exc).__name__}: {exc}); owning NO agent dirs this sweep "
               "(conservative — never own-all, never clobber a peer).",
               file=sys.stderr)
@@ -507,14 +561,14 @@ def _manifest_entry(v):
 def _require_owncloud_backend():
     kind = os.environ.get("STORAGE_BACKEND", "local").strip().lower()
     if kind != "own-cloud":
-        print(f"[sync] backend is {kind!r}, not 'own-cloud' — nothing to mirror "
+        _sync_print(f"[sync] backend is {kind!r}, not 'own-cloud' — nothing to mirror "
               "to S3 (the local files ARE the store under the local backend). "
               "No-op.", file=sys.stderr)
         return None
     from storage_backend import get_backend
     be = get_backend()
     if not hasattr(be, "mirror_put"):
-        print("[sync] ERROR: backend has no mirror_put — wrong backend or stale "
+        _sync_print("[sync] ERROR: backend has no mirror_put — wrong backend or stale "
               "owncloud_backend.py.", file=sys.stderr)
         sys.exit(2)
     return be
@@ -543,6 +597,20 @@ def _etag_is_multipart(etag: str) -> bool:
 _MERGE_NA = object()  # sentinel: store not merge-registered -> caller's default action
 
 
+def _sync_print(msg, *, file=None):
+    """Emit a ``[sync]`` log line prefixed with a naive-UTC ISO timestamp.
+
+    g-115-2815 / g-115-2797: the un-timestamped ``[sync]`` lines made the
+    2026-07-20 cc-02 forensics unable to reconstruct arrival/sweep timing —
+    "when did this conflict-skip actually fire?" was unanswerable. Every
+    ``[sync]`` line now carries a timestamp. TZ is UTC fleet-wide
+    (g-115-2546), so ``time.strftime`` yields a comparable naive-UTC stamp on
+    every box. The stream is resolved at CALL time (not bound at def time) so
+    pytest ``capsys`` capture still sees the output."""
+    stream = file if file is not None else sys.stdout
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}", file=stream)
+
+
 def _try_merge_put(be, full: Path, local_bytes: bytes, stats: dict, *,
                    counter: str):
     """Union-merge push via the store's registered commutative handler
@@ -562,12 +630,28 @@ def _try_merge_put(be, full: Path, local_bytes: bytes, stats: dict, *,
     """
     merge_put = getattr(be, "merge_put", None)
     if merge_put is None:
+        stats["merge_na_no_merge_put"] = stats.get("merge_na_no_merge_put", 0) + 1
+        stats["last_merge_na_reason"] = "backend-lacks-merge_put"
         return _MERGE_NA
     try:
         from owncloud_backend import _coordination_merge_handler
         if _coordination_merge_handler(full) is None:
+            stats["merge_na_unregistered"] = \
+                stats.get("merge_na_unregistered", 0) + 1
+            stats["last_merge_na_reason"] = "not-merge-registered"
             return _MERGE_NA
-    except Exception:  # noqa: BLE001 — registry unavailable -> default action
+    except Exception as e:  # noqa: BLE001 — registry import/unavailable
+        # g-115-2815: this except previously swallowed the registry-import
+        # failure SILENTLY, so a merge-REGISTERED store whose coordination_merge
+        # import failed in the sweep process fell through to the identical
+        # CONFLICT skip below — undiagnosable from the logs (candidate cause (b)
+        # of the 2026-07-20 cc-02 incident). Log + count + record the reason so
+        # the both-diverged CONFLICT line can name WHY the merge lane bailed.
+        stats["merge_na_import_error"] = \
+            stats.get("merge_na_import_error", 0) + 1
+        stats["last_merge_na_reason"] = f"registry-import-error: {e}"
+        _sync_print(f"[sync] WARN: merge registry import failed for {full}: "
+                    f"{e}", file=sys.stderr)
         return _MERGE_NA
     # Preserve-before-drop (g-115-2325): merge_put's write-back REPLACES the
     # local file with the merged bytes. For parseable content the union loses
@@ -581,11 +665,14 @@ def _try_merge_put(be, full: Path, local_bytes: bytes, stats: dict, *,
     try:
         res = merge_put(full, local_bytes)
     except Exception as e:  # noqa: BLE001 — CAS exhausted / transport error
-        print(f"[sync] WARN: union-merge push failed for {full}: {e}",
+        _sync_print(f"[sync] WARN: union-merge push failed for {full}: {e}",
               file=sys.stderr)
         stats["errors"] += 1
         return None
     if res is None:  # backend-side not-registered/machine-local double-check
+        stats["merge_na_backend_declined"] = \
+            stats.get("merge_na_backend_declined", 0) + 1
+        stats["last_merge_na_reason"] = "backend-declined-merge"
         return _MERGE_NA
     stats[counter] = stats.get(counter, 0) + 1
     # Per-file lane attribution (g-115-2468): the aggregate counters alone
@@ -595,9 +682,19 @@ def _try_merge_put(be, full: Path, local_bytes: bytes, stats: dict, *,
     stats.setdefault("merge_events", []).append(
         {"file": str(full), "lane": counter})
     try:
-        return hashlib.md5(full.read_bytes()).hexdigest()
+        md5 = hashlib.md5(full.read_bytes()).hexdigest()
     except OSError:
-        return None
+        md5 = None
+    # g-115-2937: ALSO append the event to a DURABLE per-file merge-events log
+    # so a pushed_merged / diverged_merged / nobaseline_merged firing is
+    # observable post-hoc. The in-memory list above dies with the sweep, and the
+    # core/logs sweep-stats sink is machine-local (core/ is not a sync root) +
+    # boring-filtered; this dedicated log lives in the mind_api/state durable
+    # tier — the SAME tier the FREEZE path's owncloud-conflict-streaks.json uses,
+    # closing the success-path/freeze-path observability asymmetry. Fail-open.
+    _persist_merge_event({"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                          "file": str(full), "lane": counter, "md5": md5})
+    return md5
 
 
 # --- core: one file --------------------------------------------------------
@@ -637,14 +734,14 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
     try:
         local_bytes = full.read_bytes()
     except OSError as e:
-        print(f"[sync] WARN: unreadable {full}: {e}", file=sys.stderr)
+        _sync_print(f"[sync] WARN: unreadable {full}: {e}", file=sys.stderr)
         stats["errors"] += 1
         return None
     local_md5 = hashlib.md5(local_bytes).hexdigest()
     try:
         st = be.stat(full)  # S3 HEAD; None if absent
     except Exception as e:  # noqa: BLE001 — network/credential issues -> count + go on
-        print(f"[sync] WARN: stat failed for {full}: {e}", file=sys.stderr)
+        _sync_print(f"[sync] WARN: stat failed for {full}: {e}", file=sys.stderr)
         stats["errors"] += 1
         return None
 
@@ -673,7 +770,7 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
                 if merged_md5 is not _MERGE_NA:
                     return merged_md5
             stats["multipart_deferred"] = stats.get("multipart_deferred", 0) + 1
-            print(f"[sync] skip (S3 ETag is multipart — cannot classify vs "
+            _sync_print(f"[sync] skip (S3 ETag is multipart — cannot classify vs "
                   f"baseline; deferring, no clobber): {full}", file=sys.stderr)
             return None
         # single-machine: fall through to push below (local authoritative)
@@ -701,7 +798,7 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
                     be.refresh(full)  # GET S3 -> local (materialize peer bytes)
                 except Exception as e:  # noqa: BLE001 — transient fetch error
                     # Fall back to the conservative skip; next sweep retries.
-                    print(f"[sync] WARN: stale-pull refresh failed for "
+                    _sync_print(f"[sync] WARN: stale-pull refresh failed for "
                           f"{full}: {e}", file=sys.stderr)
                     stats["stale_skipped"] = stats.get("stale_skipped", 0) + 1
                     return None
@@ -716,7 +813,7 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
             # Multi-machine but NOT own-cloud: no single authority -> keep the
             # conservative clobber-safe STALE skip.
             stats["stale_skipped"] = stats.get("stale_skipped", 0) + 1
-            print(f"[sync] skip (stale local vs newer S3 — peer wrote): {full}",
+            _sync_print(f"[sync] skip (stale local vs newer S3 — peer wrote): {full}",
                   file=sys.stderr)
             return None
         if baseline_md5 is not None and not local_at_baseline and not s3_at_baseline:
@@ -726,19 +823,79 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
             # guard-907), the merged bytes land on S3 (fenced CAS) AND local,
             # and the returned md5 becomes the new baseline so the next sweep
             # reads in-sync. Unregistered stores keep the clobber-safe skip.
+            diverged_merge_na_reason = None
             if not dry_run:
                 merged_md5 = _try_merge_put(be, full, local_bytes, stats,
                                             counter="diverged_merged")
                 if merged_md5 is not _MERGE_NA:
                     return merged_md5
+                # g-115-2815: merge lane returned _MERGE_NA — capture WHY (set by
+                # _try_merge_put on this same call) so the CONFLICT line below is
+                # distinguishable from a genuinely-unregistered skip.
+                diverged_merge_na_reason = stats.get("last_merge_na_reason")
+            # g-115-2820: a single-writer per-agent session file that is NOT
+            # merge-registered (a union of two sessions' private scratch is
+            # semantically wrong — loop_state counters etc.) would otherwise fall
+            # to the clobber-safe skip below and WEDGE FOREVER (zeta's
+            # working-memory.yaml: 451 consecutive both-diverged skips before a
+            # MANUAL reconcile, g-115-2816). But reaching this branch PROVES this
+            # box authored the local change: the sweep's H4a owned-prune (~L1027)
+            # never walks a PEER agent's session dir under own-cloud, so a caching
+            # box hits the stale-cache PULL branch above — never both-diverged —
+            # for a file it does not author. Local IS authoritative -> LOCAL-WINS:
+            # push local -> S3 (fenced CAS) and adopt local as the new baseline
+            # (deterministic + terminating; the push-local twin of the g-328-22
+            # no-baseline pull-S3 reconcile). The overwritten S3 bytes are
+            # provably a prior version of THIS box's own single-writer file
+            # (single-writer + owned-prune => no peer authored S3), already in
+            # local .history; the pre-adopt snapshot is the archive-before-delete
+            # receipt (see .claude/rules/archive-before-delete.md).
+            if own_cloud_authority and _is_single_writer_session_file(full, be):
+                if dry_run:
+                    stats["local_wins_would_resolve"] = \
+                        stats.get("local_wins_would_resolve", 0) + 1
+                    return None
+                _snapshot_before_pull(
+                    full,
+                    summary="pre-local-wins snapshot: both-diverged single-writer "
+                            "session file pushed local->S3 + adopted local "
+                            "baseline (g-115-2820)")
+                try:
+                    from owncloud_backend import ConflictError
+                except Exception:  # pragma: no cover — registry unavailable
+                    ConflictError = ()  # type: ignore
+                try:
+                    be.mirror_put(full, local_bytes, expected_version=st.version)
+                except ConflictError:
+                    # S3 moved again between our HEAD and the PUT -> the next
+                    # sweep re-evaluates; never force over a just-changed remote.
+                    _sync_print(f"[sync] skip (concurrent write during local-wins): "
+                          f"{full}", file=sys.stderr)
+                    stats["conflicts"] += 1
+                    return None
+                except Exception as e:  # noqa: BLE001 — transport/CAS error
+                    _sync_print(f"[sync] WARN: local-wins PUT failed for {full}: {e}",
+                          file=sys.stderr)
+                    stats["errors"] += 1
+                    return None
+                stats["local_wins_resolved"] = \
+                    stats.get("local_wins_resolved", 0) + 1
+                return local_md5
             # Do NOT auto-clobber either side; surface it for reconciliation.
             # g-115-2268 Gap C: record the path so sweep() can track a
             # per-path consecutive-conflict streak and surface PERSISTENT
             # conflicts loudly instead of skipping silently forever.
             stats["diverged_skipped"] = stats.get("diverged_skipped", 0) + 1
             stats.setdefault("conflict_paths", []).append(str(full))
-            print(f"[sync] skip (CONFLICT — local and S3 both changed since "
-                  f"baseline): {full}", file=sys.stderr)
+            # g-115-2815: distinguish a merge-lane bail (a merge-REGISTERED store
+            # whose union-merge returned _MERGE_NA — a bug to chase) from a
+            # genuinely-unregistered conflict skip. Both reached this identical
+            # line before, which is why the 2026-07-20 cc-02 incident was
+            # undiagnosable from the logs.
+            reason_suffix = (f"; merge-lane NA: {diverged_merge_na_reason}"
+                             if diverged_merge_na_reason else "")
+            _sync_print(f"[sync] skip (CONFLICT — local and S3 both changed since "
+                  f"baseline{reason_suffix}): {full}", file=sys.stderr)
             return None
         if baseline_md5 is None and multi_machine:
             # No baseline to prove this machine authored the local content, and a
@@ -788,7 +945,7 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
                     # Transient S3/refresh error -> fall back to the conservative
                     # skip so a fetch failure never drops the local cache; the next
                     # sweep retries. Bounded (fires only on a real refresh failure).
-                    print(f"[sync] WARN: reconcile refresh failed for {full}: {e}",
+                    _sync_print(f"[sync] WARN: reconcile refresh failed for {full}: {e}",
                           file=sys.stderr)
                     stats["nobaseline_skipped"] = \
                         stats.get("nobaseline_skipped", 0) + 1
@@ -844,11 +1001,11 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
     except ConflictError:
         # Concurrent backend write moved the object between our HEAD and PUT —
         # it synced its own bytes; the next sweep reconciles ours if divergent.
-        print(f"[sync] skip (concurrent write): {full}", file=sys.stderr)
+        _sync_print(f"[sync] skip (concurrent write): {full}", file=sys.stderr)
         stats["conflicts"] += 1
         return None
     except Exception as e:  # noqa: BLE001
-        print(f"[sync] WARN: PUT failed for {full}: {e}", file=sys.stderr)
+        _sync_print(f"[sync] WARN: PUT failed for {full}: {e}", file=sys.stderr)
         stats["errors"] += 1
         return None
 
@@ -896,11 +1053,11 @@ def _update_conflict_streaks(stats: dict) -> None:
                         if v >= _CONFLICT_STREAK_THRESHOLD)
     stats["conflict_persistent"] = persistent
     for k in persistent[:_CONFLICT_PERSISTENT_PRINT_CAP]:
-        print(f"[sync] CONFLICT-PERSISTENT ({new[k]} consecutive sweeps): {k} "
+        _sync_print(f"[sync] CONFLICT-PERSISTENT ({new[k]} consecutive sweeps): {k} "
               f"— local and S3 both diverged from baseline; needs "
               f"merge/reconcile (g-115-2268 Gap C)", file=sys.stderr)
     if len(persistent) > _CONFLICT_PERSISTENT_PRINT_CAP:
-        print(f"[sync] CONFLICT-PERSISTENT: ... and "
+        _sync_print(f"[sync] CONFLICT-PERSISTENT: ... and "
               f"{len(persistent) - _CONFLICT_PERSISTENT_PRINT_CAP} more",
               file=sys.stderr)
     try:
@@ -909,7 +1066,7 @@ def _update_conflict_streaks(stats: dict) -> None:
         tmp.write_text(json.dumps(new, indent=0), encoding="utf-8")
         tmp.replace(p)
     except OSError as e:
-        print(f"[sync] WARN: conflict-streaks persist failed: {e}",
+        _sync_print(f"[sync] WARN: conflict-streaks persist failed: {e}",
               file=sys.stderr)
 
 
@@ -970,7 +1127,38 @@ def _log_sweep_stats(stats: dict, *, source: str,
         with open(_SWEEP_STATS_LOG, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception as e:  # noqa: BLE001 — telemetry is strictly fail-open
-        print(f"[sync] WARN: sweep-stats telemetry write failed: {e}",
+        _sync_print(f"[sync] WARN: sweep-stats telemetry write failed: {e}",
+              file=sys.stderr)
+
+
+# --- durable per-file merge-events log (g-115-2937) -------------------------
+# The success path's counterpart to the FREEZE path's owncloud-conflict-streaks
+# .json: a dedicated, durable, per-file record of every union-merge firing so
+# "did the merge lane fire on store X, and when" is answerable post-hoc. Lives
+# in mind_api/state (the durable tier), NOT core/logs (machine-local, boring-
+# filtered). Reuses the sweep-log size caps for a whole-line self-trim.
+def _merge_events_path() -> Path:
+    return _runtime_dir() / "owncloud-merge-events.jsonl"
+
+
+def _persist_merge_event(event: dict) -> None:
+    """Append one union-merge event ({ts, file, lane, md5}) as a JSON line to
+    the durable merge-events log. Fail-open (mirrors _log_sweep_stats): telemetry
+    must NEVER break the sweep or the PostToolUse push path."""
+    p = _merge_events_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        try:  # size-capped self-trim — keep newest tail, whole lines only
+            if p.exists() and p.stat().st_size > _SWEEP_LOG_MAX_BYTES:
+                data = p.read_bytes()[-_SWEEP_LOG_KEEP_BYTES:]
+                nl = data.find(b"\n")
+                p.write_bytes(data[nl + 1:] if nl >= 0 else data)
+        except OSError:
+            pass  # trim is best-effort; the append below still fail-opens
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, default=str) + "\n")
+    except Exception as e:  # noqa: BLE001 — telemetry is strictly fail-open
+        _sync_print(f"[sync] WARN: merge-events persist failed: {e}",
               file=sys.stderr)
 
 
@@ -1013,7 +1201,7 @@ def sweep(be, *, only_root, dry_run, use_manifest, full, only_agent=None):
              "multipart_deferred": 0, "pruned_agents": 0, "push_paths": []}
     for root_path, prefix in _roots(be, only_root):
         if not root_path.exists():
-            print(f"[sync] root absent (skipped): {root_path}", file=sys.stderr)
+            _sync_print(f"[sync] root absent (skipped): {root_path}", file=sys.stderr)
             continue
         for dirpath, dirnames, filenames in os.walk(root_path):
             dirnames[:] = [d for d in dirnames if d not in _EXCLUDE_DIRS]
@@ -1160,7 +1348,7 @@ def propagate_temp_moves(be, *, dry_run=False, owned=None, only_agent=None):
             children = be.list_dir(temp_dir)
         except Exception as e:  # noqa: BLE001 — enumeration is best-effort
             stats["errors"] += 1
-            print(f"[sync] temp-move-propagation list_dir failed for "
+            _sync_print(f"[sync] temp-move-propagation list_dir failed for "
                   f"{agent}: {e}", file=sys.stderr)
             continue
         for name in children:
@@ -1190,7 +1378,7 @@ def propagate_temp_moves(be, *, dry_run=False, owned=None, only_agent=None):
                         f"agents/{agent}/temp/{name}")
             except Exception as e:  # noqa: BLE001 — per-key isolation
                 stats["errors"] += 1
-                print(f"[sync] temp-move-propagation delete failed for "
+                _sync_print(f"[sync] temp-move-propagation delete failed for "
                       f"agents/{agent}/temp/{name}: {e}", file=sys.stderr)
     return stats
 
@@ -1240,9 +1428,9 @@ def sync_file(be, target: Path, *, dry_run, stats_out=None) -> int:
     # no-baseline conservative skip never suppresses a genuine local write).
     _sync_one(be, target, dry_run=dry_run, stats=stats, multi_machine=False)
     if stats["pushed"]:
-        print(f"[sync] pushed {target}")
+        _sync_print(f"[sync] pushed {target}")
     elif stats["would_push"]:
-        print(f"[sync] would push {target}")
+        _sync_print(f"[sync] would push {target}")
     if stats_out is not None:
         stats_out.update(stats)
     # Telemetry (g-115-2468): plain pushes are the NORMAL PostToolUse path and
@@ -1254,9 +1442,14 @@ def sync_file(be, target: Path, *, dry_run, stats_out=None) -> int:
     return 1 if stats["errors"] else 0
 
 
-def _snapshot_before_pull(full: Path) -> None:
-    """Best-effort .history snapshot of local bytes about to be clobbered by an
-    S3-authoritative pull (g-115-1928).
+def _snapshot_before_pull(full: Path, *, summary: str | None = None) -> None:
+    """Best-effort .history snapshot of local bytes at an authoritative-overwrite
+    seam (g-115-1928).
+
+    Default use: local bytes about to be clobbered by an S3-authoritative PULL.
+    `summary` overrides the .history label so the SAME snapshot primitive can
+    also receipt the g-115-2820 local-wins PUSH (where local is the winner made
+    canonical, not the clobbered side) — see _sync_one's both-diverged branch.
 
     Fires ONLY on the no-baseline + local-differs branches (_pull_one's
     "S3-authoritative at bind" and _sync_one's g-328-22 reconcile) — the one
@@ -1286,8 +1479,8 @@ def _snapshot_before_pull(full: Path) -> None:
             return
         save_history(
             full, base, "owncloud-sync",
-            summary="pre-pull snapshot: S3-authoritative overwrite of "
-                    "no-baseline local (g-115-1928)")
+            summary=summary or ("pre-pull snapshot: S3-authoritative overwrite of "
+                                "no-baseline local (g-115-1928)"))
     except Exception as e:  # noqa: BLE001 — insurance must never block the pull
         print(f"[pull] WARN: pre-pull history snapshot failed for {full}: {e}",
               file=sys.stderr)
@@ -1403,14 +1596,26 @@ def _pull_one(be, full: Path, *, dry_run: bool, stats: dict, baseline_md5=None):
         return None
 
 
-def pull_continuity(be, agent: str, *, dry_run: bool = False) -> dict:
+def pull_continuity(be, agent: str, *, dry_run: bool = False,
+                    only: "set[str] | None" = None) -> dict:
     """Pull every continuity-tier session file for `agent` from S3 to local,
     freshness-aware (never clobbering unpushed local writes). Called by the
     /start IDLE branch (via owncloud-pull.sh -> POST /v1/admin/owncloud-pull)
     so a machine-move resumes from the last machine's flushed handoff /
     working-memory / execution-diary / ... The continuity set is the SSOT
     session-manifest.yaml (sync_tier == continuity); fail-closed to an empty
-    set if the manifest is untrustworthy (pull nothing rather than guess)."""
+    set if the manifest is untrustworthy (pull nothing rather than guess).
+
+    `only` (g-115-3074) narrows the pull to the named continuity files and SKIPS
+    the temp/ sweep. It exists because a caller that needs ONE file per agent —
+    /open-questions refreshing every peer's pending-questions.yaml before it
+    reads them — otherwise pays a full sweep per agent: measured 59s for one
+    peer (904 files) on cc-04, i.e. ~5min fleet-wide, which is not a viable cost
+    for an interactive dashboard. Names are matched against the continuity set,
+    so `only` can never widen the pull beyond it or reach a non-continuity file;
+    an unknown name simply selects nothing (reported via requested_missing).
+    Filtering here rather than in the caller keeps the S3 round-trips themselves
+    scoped — the point is to not fetch the other 900 objects."""
     stats = {"agent": agent, "scanned": 0, "pulled": 0, "in_sync": 0,
              "would_pull": 0, "s3_absent": 0, "local_ahead_skipped": 0,
              "multipart_deferred": 0, "errors": 0, "pulled_files": []}
@@ -1420,6 +1625,15 @@ def pull_continuity(be, agent: str, *, dry_run: bool = False) -> dict:
         return stats
     exact, _globs = tiers
     continuity_names = sorted(n for n, t in exact.items() if t == "continuity")
+    if only:
+        wanted = {str(n).strip() for n in only if str(n).strip()}
+        missing = sorted(wanted - set(continuity_names))
+        continuity_names = [n for n in continuity_names if n in wanted]
+        if missing:
+            # Surfaced, not fatal: a caller naming a non-continuity file gets a
+            # visible signal instead of a silent empty pull.
+            stats["requested_missing"] = missing
+        stats["only"] = sorted(wanted)
 
     agents_roots = _roots(be, "agents")
     if not agents_roots:
@@ -1454,13 +1668,18 @@ def pull_continuity(be, agent: str, *, dry_run: bool = False) -> dict:
     # _save_manifest below: pull_temp updates new_manifest in place, so one save
     # persists BOTH session and temp baselines (an independent save inside
     # pull_temp would clobber the session set written here).
-    temp_stats = pull_temp(be, agent, dry_run=dry_run,
-                           _manifest=manifest, _new_manifest=new_manifest)
-    stats["temp"] = temp_stats
-    for _k in ("scanned", "pulled", "in_sync", "would_pull", "s3_absent",
-               "local_ahead_skipped", "multipart_deferred", "errors"):
-        stats[_k] += temp_stats.get(_k, 0)
-    stats["pulled_files"].extend(temp_stats.get("pulled_files", []))
+    #
+    # SKIPPED under `only`: a targeted caller asked for specific session files;
+    # sweeping temp/ (an S3 prefix LIST plus a fetch per object) is the bulk of
+    # the cost `only` exists to avoid, and it is never what such a caller wants.
+    if not only:
+        temp_stats = pull_temp(be, agent, dry_run=dry_run,
+                               _manifest=manifest, _new_manifest=new_manifest)
+        stats["temp"] = temp_stats
+        for _k in ("scanned", "pulled", "in_sync", "would_pull", "s3_absent",
+                   "local_ahead_skipped", "multipart_deferred", "errors"):
+            stats[_k] += temp_stats.get(_k, 0)
+        stats["pulled_files"].extend(temp_stats.get("pulled_files", []))
     if not dry_run:
         _save_manifest(new_manifest)
     return stats
@@ -1933,7 +2152,7 @@ def main() -> int:
         return 1 if stats["errors"] else 0
 
     if args.no_manifest and _multi_machine():
-        print("[sync] WARNING: --no-manifest disables the content baseline; on a "
+        _sync_print("[sync] WARNING: --no-manifest disables the content baseline; on a "
               "multi-machine setup this can clobber a peer's newer S3 bytes. "
               "Prefer a manifest-backed sweep (drop --no-manifest).",
               file=sys.stderr)
@@ -1950,7 +2169,7 @@ def main() -> int:
                   only_agent=sweep_agent)
     dt = time.time() - t0
     mode = "DRY-RUN" if args.dry_run else "APPLIED"
-    print(f"[sync] {mode} in {dt:.1f}s — scanned {stats['scanned']}, "
+    _sync_print(f"[sync] {mode} in {dt:.1f}s — scanned {stats['scanned']}, "
           f"in-sync {stats['in_sync']}, "
           f"{'would-push' if args.dry_run else 'pushed'} "
           f"{stats['would_push'] if args.dry_run else stats['pushed']}, "

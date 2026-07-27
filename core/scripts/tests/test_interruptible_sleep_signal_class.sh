@@ -55,7 +55,7 @@ run_case() {
   # future mtime is what the cases semantically mean: a live wake event
   # arriving during the sleep.
   # +30s (not +3): the stamp must exceed WORST-CASE script startup (bash
-  # spawn + _paths.sh source + the 7 quiescent-mode bg-job python
+  # spawn + _paths.sh source + the  quiescent-mode bg-job python
   # registration) on a cold/AV-loaded box — at +3s the quiescent cases still
   # flaked when startup crossed the stamp. Cases exit at i=0/1 regardless,
   # so the far-future mtime adds zero runtime.

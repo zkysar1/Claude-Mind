@@ -264,11 +264,21 @@ def _eval_goal_completed_after(p: dict) -> PredicateResult:
                                observed_value={"status": goal.get("status")},
                                reason=f"goal {goal_id} has no completion timestamp")
 
+    ts_str = str(completed_ts_str)
     try:
-        completed_ts = _to_local_naive(datetime.fromisoformat(str(completed_ts_str)))
+        parsed = datetime.fromisoformat(ts_str)
     except (ValueError, TypeError):
         return PredicateResult(False, "goal_completed_after", pid,
                                reason=f"unparseable completion timestamp: {completed_ts_str}")
+    # FIX 1 ( / rb-4371): a DATE-ONLY completed_date ('2026-07-19',
+    # ~95% of the store) parses to midnight, so an intra-day same-day cutoff
+    # spuriously FAILS the >= below even though the goal provably completed by
+    # that day's end. Extend a date-only value to end-of-day (23:59:59) — the
+    # latest instant it could have completed — before comparison. Stays NAIVE
+    # local per guard-982.
+    if len(ts_str) == 10 and "T" not in ts_str and ":" not in ts_str:
+        parsed = parsed.replace(hour=23, minute=59, second=59)
+    completed_ts = _to_local_naive(parsed)
 
     passed = completed_ts.timestamp() >= (cutoff.timestamp() - CLOCK_SKEW_GRACE_SECONDS)
     return PredicateResult(

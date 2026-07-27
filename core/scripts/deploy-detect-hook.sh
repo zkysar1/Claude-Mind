@@ -2,7 +2,7 @@
 # IRREDUCIBLY LOCAL -- per-Bash-call latency budget / hook. Keep local: never add MCP or remote-service indirection here.
 # deploy-detect-hook.sh — PostToolUse[Bash] hook: register a deploy-verification
 # obligation when an agent pushes to a CI repo (part of the pending-deploys hard
-# gate, 8 / SG-a).
+# gate,  / SG-a).
 #
 # On EVERY Bash tool call this hook runs. The HOT PATH is a single raw-string
 # pre-filter: if the stdin payload does not even contain "push", exit 0 before

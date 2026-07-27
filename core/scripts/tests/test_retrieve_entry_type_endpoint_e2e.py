@@ -1,4 +1,4 @@
-"""test_retrieve_entry_type_endpoint_e2e.py -- 9 (follow-up to ).
+"""test_retrieve_entry_type_endpoint_e2e.py --  (follow-up to ).
 
 g-306-11 added a reasoning-bank `entry_type` filter to retrieve across three
 layers: the engine (core/scripts/retrieve.py load_reasoning_bank), the daemon

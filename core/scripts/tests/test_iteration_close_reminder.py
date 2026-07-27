@@ -1,4 +1,4 @@
-"""test_iteration_close_reminder.py — 8 regression test.
+"""test_iteration_close_reminder.py —  regression test.
 
 Pins outcome-aware reminder text selection in iteration-close-reminder.py:
 
@@ -258,7 +258,7 @@ def test_missing_tool_response_fails_open_to_generic(tmp_path):
 
 
 # ── Bonus: malformed tool_response shapes also fail-open ────────────────
-# Not part of the 4-case acceptance matrix from 8, but the
+# Not part of the 4-case acceptance matrix from , but the
 # fail-open contract in _is_deep_recurring_close warrants explicit pins.
 
 
@@ -284,7 +284,7 @@ def test_tool_response_missing_stdout_fails_open_to_generic(tmp_path):
     assert GENERIC_MARKER in ctx and DEEP_MARKER not in ctx
 
 
-# ── Orphaned-stdin regression (2): hook must NOT hang forever ──
+# ── Orphaned-stdin regression (): hook must NOT hang forever ──
 # Before the guard-664 daemon-thread+join(timeout) fix, json.load(sys.stdin)
 # blocked INDEFINITELY when the stdin pipe's write-end was held open by an
 # inherited/orphaned handle — pid-28404 ran 343h (stale-jobs-scan flagged it,

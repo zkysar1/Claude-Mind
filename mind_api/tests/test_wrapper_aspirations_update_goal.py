@@ -53,7 +53,7 @@ def _seed_goal(project_root: Path, port: int, *, title: str = "Seed",
             "origin_signal": origin_signal, "description": description}
     if extras:
         goal.update(extras)
-    # mc-066 (0): the Phase E.5 operator-offload gate 400s any
+    # mc-066 (): the Phase E.5 operator-offload gate 400s any
     # recurring-shaped seed (recurring=True OR interval_hours present) that
     # lacks an offload_decision — inject the fixture decision unless the
     # test supplies its own.

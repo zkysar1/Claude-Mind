@@ -152,3 +152,25 @@ fi
 # Sister to Gate 1. See .claude/rules/... + mind_api/docs/lodestar-dynamic-
 # ownership-design.md (SUPERSEDED note). Bypass is NOT the answer — fix the code.
 _gate check-no-ownership-flag bash "$REPO/core/scripts/check-no-ownership-flag.sh"
+
+# Gate 12: bare-"bash" argv[0] in Python subprocess calls (g-115-3171,
+# 2026-07-26). guard-580 forbids subprocess.run(["bash", ...]) — on win32
+# CreateProcess searches System32 BEFORE PATH, so a bare argv[0] reaches the
+# WSL launcher and BLOCKS FOREVER on a dead LxssManager (0-CPU child, parent
+# hung in communicate(), pytest's faulthandler bound aborting the whole run).
+#
+# Layer A (the guardrail) was measured insufficient: rb-5255 records the author
+# reintroducing the pattern within the HOUR of sweeping it out of 12 sites and
+# rescoping the guardrail — correctly-scoped rule + freshly read + actively
+# fixing that class = still reintroduced. Hence Layer B.
+#
+# STAGED-ADDED-LINES scoped (Gate 1's precedent): 19 pre-existing sites live in
+# core/scripts/tests/*.py, so whole-tree blocking would refuse every unrelated
+# commit. This refuses NEW introductions only; `--audit` reports the backlog
+# (tracked by its own goal). Detection is AST-based, not grep, so `#`-comment
+# and docstring prose mentions are structurally excluded rather than
+# heuristically stripped — see the .py module docstring for why grep cannot.
+# Escape for a genuinely POSIX-only path: `# allow-bare-bash: <reason>`.
+# Companion authoring-time layer: bare-bash-authoring-gate.sh (PreToolUse[Bash])
+# covers the ad-hoc `py -3 -c` surface this gate structurally cannot reach.
+_gate check-no-bare-bash $PY "$REPO/core/scripts/check-no-bare-bash.py"

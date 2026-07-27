@@ -1,4 +1,4 @@
-"""test_pending_deploys.py — 8-a (pending-deploys hard gate, CAPTURE).
+"""test_pending_deploys.py — -a (pending-deploys hard gate, CAPTURE).
 
 Verifies the two SG-a artifacts:
   - core/scripts/pending-deploys.py — session-local tracker (add/dedup/list/
@@ -221,7 +221,7 @@ def test_hook_ignores_dry_run():
         prod = _setup_product_repo(Path(td))
         pd = _to_bash_path(prod)
         # Every dry-run form must register NOTHING — including short `-n` as a
-        # TRAILING token (no following space): the 8-a fresh-eyes
+        # TRAILING token (no following space): the -a fresh-eyes
         # finding was that `*" -n "*` alone missed `git push -n` /
         # `git push origin main -n`, registering a false-positive obligation.
         for cmd in (f"git -C {pd} push --dry-run",
@@ -284,6 +284,302 @@ def test_hook_fail_open_empty_stdin():
         repo = _setup_mind_repo(Path(td))
         assert _run_hook(repo, "").returncode == 0
         assert _run_hook(repo, '{"tool_input":{"command":"ls"}}').returncode == 0
+
+
+# ── Defect 1: resolve landed-detection () ─────────────────────────
+# cmd_resolve tests run IN-PROCESS (import the module, fake subprocess.run) so
+# BOTH the deploy-verify hop AND the gh landed-detection probes are driven
+# deterministically without a network, a real repo, or a fake-gh-on-PATH. The
+# gate test (test_pending_deploys_gate.py) covers the end-to-end subprocess
+# wiring + store-clearing through the SG-b gate.
+
+import contextlib  # noqa: E402
+import io  # noqa: E402
+import importlib.util  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+from unittest.mock import patch  # noqa: E402
+
+
+def _load_pd():
+    spec = importlib.util.spec_from_file_location("pending_deploys_mod", TRACKER)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_PD = _load_pd()
+
+
+class _FakeProc:
+    def __init__(self, returncode, stdout):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = ""
+
+
+def _fake_run(deploy_rc, deploy_status, *, default_branch="main",
+              ahead_by="5", merged="0", sha_present=True, gh_calls=None,
+              flaky_pc=False):
+    """subprocess.run stand-in: routes deploy-verify.sh -> (rc, status JSON) and
+    `gh api ...` -> the landed-detection + rebase-orphan probe values (default
+    branch / ahead_by / merged-PR count / commit-exists). default_branch=None
+    simulates an unusable gh; sha_present=False simulates a REBASE ORPHAN the
+    remote never saw (bare repos/<repo>/commits/<sha> -> 404/422). flaky_pc
+    simulates a TRANSIENT gh error (rate-limit/timeout) on ONLY the re-confirm
+    default-branch read: the 1st bare repos/<repo> read succeeds, the 2nd
+    fails (Finding 1 fail-safe boundary)."""
+    pc = {"n": 0}   # counts bare repos/<repo> default-branch reads: the positive
+                    # control + the post-Finding-1 re-confirm. Drives flaky_pc.
+    def run(cmd, **kw):
+        joined = " ".join(str(c) for c in cmd)
+        if "deploy-verify.sh" in joined:
+            return _FakeProc(deploy_rc, json.dumps({"status": deploy_status}))
+        if cmd and str(cmd[0]) == "gh":
+            if gh_calls is not None:
+                gh_calls.append(joined)
+            api = str(cmd[2]) if len(cmd) > 2 else ""
+            if "/compare/" in api:
+                return _FakeProc(0, ahead_by)
+            if "/pulls" in api:                  # repos/<repo>/commits/<sha>/pulls
+                return _FakeProc(0, merged)
+            if "/commits/" in api:               # bare commit lookup (rebase-orphan probe)
+                return _FakeProc(0, "f" * 40) if sha_present else _FakeProc(1, "")
+            # bare repos/<repo> -q .default_branch: the positive control AND (post
+            # Finding 1) the re-confirm read. flaky_pc fails ONLY the 2nd read.
+            pc["n"] += 1
+            if default_branch is None or (flaky_pc and pc["n"] >= 2):
+                return _FakeProc(1, "")          # gh error -> positive control fails
+            return _FakeProc(0, default_branch)  # repos/<repo> -q .default_branch
+        return _FakeProc(0, "")
+    return run
+
+
+def _resolve_in_process(store, repo, sha, runner):
+    args = SimpleNamespace(repo=repo, sha=sha, dir="", timeout_mins=None,
+                           subprocess_timeout=None, store=str(store), agent=None)
+    buf = io.StringIO()
+    with patch.object(_PD.subprocess, "run", runner), contextlib.redirect_stdout(buf):
+        rc = _PD.cmd_resolve(args)
+    line = [l for l in buf.getvalue().splitlines() if l.strip().startswith("{")][-1]
+    return rc, json.loads(line)
+
+
+def _seed_store(store, repo, sha):
+    _tracker(store, "add", "--repo", repo, "--sha", sha, "--goal-id", "g-1")
+
+
+def _store_shas(store):
+    return {e["sha"] for e in json.loads(_tracker(store, "list", "--json").stdout)}
+
+
+def test_resolve_clears_on_ancestor_landed():
+    """deploy-verify FAILED, but the sha is an ancestor of the default branch
+    (ahead_by==0) -> landed-detection clears the entry (rc 0, landed_via)."""
+    with tempfile.TemporaryDirectory() as td:
+        store = Path(td) / "pd.yaml"
+        sha = "a" * 40
+        _seed_store(store, "o/r", sha)
+        rc, out = _resolve_in_process(store, "o/r", sha,
+                                      _fake_run(1, "failed", ahead_by="0"))
+        assert rc == 0, out
+        assert out["cleared"] is True and out["landed_via"].startswith("ancestor:"), out
+        assert sha not in _store_shas(store), "ancestor-landed entry not cleared"
+
+
+def test_resolve_clears_on_merged_pr():
+    """deploy-verify UNVERIFIED, sha NOT an ancestor, but its PR is merged ->
+    landed-detection clears the entry (rc 0, landed_via=merged-pr)."""
+    with tempfile.TemporaryDirectory() as td:
+        store = Path(td) / "pd.yaml"
+        sha = "b" * 40
+        _seed_store(store, "o/r", sha)
+        rc, out = _resolve_in_process(store, "o/r", sha,
+                                      _fake_run(2, "unverified", ahead_by="7", merged="1"))
+        assert rc == 0, out
+        assert out["cleared"] is True and out["landed_via"] == "merged-pr", out
+        assert sha not in _store_shas(store), "merged-pr entry not cleared"
+
+
+def test_resolve_keeps_when_not_landed():
+    """deploy-verify FAILED and the sha neither is an ancestor nor has a merged
+    PR -> entry KEPT, rc mirrors deploy-verify (1)."""
+    with tempfile.TemporaryDirectory() as td:
+        store = Path(td) / "pd.yaml"
+        sha = "c" * 40
+        _seed_store(store, "o/r", sha)
+        rc, out = _resolve_in_process(store, "o/r", sha,
+                                      _fake_run(1, "failed", ahead_by="4", merged="0"))
+        assert rc == 1, out
+        assert out["cleared"] is False, out
+        assert sha in _store_shas(store), "genuinely-failed entry must be kept"
+
+
+def test_resolve_keeps_when_gh_unusable():
+    """FAIL-SAFE: deploy-verify FAILED and gh cannot read the default branch
+    (positive control fails) -> entry KEPT, never a spurious clear (rb-3434)."""
+    with tempfile.TemporaryDirectory() as td:
+        store = Path(td) / "pd.yaml"
+        sha = "d" * 40
+        _seed_store(store, "o/r", sha)
+        rc, out = _resolve_in_process(store, "o/r", sha,
+                                      _fake_run(1, "failed", default_branch=None))
+        assert rc == 1, out
+        assert out["cleared"] is False, out
+        assert sha in _store_shas(store), "gh-unusable must NOT clear (fail-safe)"
+
+
+def test_resolve_ok_path_skips_landed_check():
+    """Regression: an ok CI verdict clears WITHOUT invoking landed-detection
+    (no gh call) -- landed-detection is only for the failed/unverified path."""
+    with tempfile.TemporaryDirectory() as td:
+        store = Path(td) / "pd.yaml"
+        sha = "e" * 40
+        _seed_store(store, "o/r", sha)
+        gh_calls = []
+        rc, out = _resolve_in_process(store, "o/r", sha,
+                                      _fake_run(0, "ok", gh_calls=gh_calls))
+        assert rc == 0 and out["cleared"] is True, out
+        assert "landed_via" not in out, "ok path must not report landed_via"
+        assert gh_calls == [], "landed-detection must not run on the ok path"
+        assert sha not in _store_shas(store)
+
+
+# ──  / rb-4737: rebase-orphan retirement + non-deploying-branch skip ──
+
+def test_resolve_retires_rebased_away():
+    """deploy-verify UNVERIFIED, sha did NOT land (not ancestor, no merged PR),
+    AND the sha is ABSENT from origin (rebase orphan: superseded by git pull
+    --rebase, never pushed) -> retire the phantom entry (rc 0, retired_via)."""
+    with tempfile.TemporaryDirectory() as td:
+        store = Path(td) / "pd.yaml"
+        sha = "a" * 40
+        _seed_store(store, "o/r", sha)
+        rc, out = _resolve_in_process(store, "o/r", sha,
+                                      _fake_run(2, "unverified", ahead_by="7",
+                                                merged="0", sha_present=False))
+        assert rc == 0, out
+        assert out["cleared"] is True and out.get("retired_via") == "rebased-away", out
+        assert sha not in _store_shas(store), "rebased-away phantom not retired"
+
+
+def test_resolve_keeps_present_sha_not_retired():
+    """Boundary: a sha that IS on origin (present) but deploy FAILED and did not
+    land must be KEPT — never mis-retired as rebased-away (the absent-check must
+    not over-retire a genuinely-failing deploy)."""
+    with tempfile.TemporaryDirectory() as td:
+        store = Path(td) / "pd.yaml"
+        sha = "c" * 40
+        _seed_store(store, "o/r", sha)
+        rc, out = _resolve_in_process(store, "o/r", sha,
+                                      _fake_run(1, "failed", ahead_by="4",
+                                                merged="0", sha_present=True))
+        assert rc == 1, out
+        assert out["cleared"] is False and "retired_via" not in out, out
+        assert sha in _store_shas(store), "present-but-failed sha must be kept"
+
+
+def test_resolve_rebased_away_gated_by_positive_control():
+    """FAIL-SAFE: if gh cannot read the default branch (positive control fails),
+    the absent-check must NOT retire even a would-be rebase-orphan — an unusable
+    gh is not evidence of absence (rb-4740). Entry kept, rc mirrors deploy."""
+    with tempfile.TemporaryDirectory() as td:
+        store = Path(td) / "pd.yaml"
+        sha = "d" * 40
+        _seed_store(store, "o/r", sha)
+        rc, out = _resolve_in_process(store, "o/r", sha,
+                                      _fake_run(2, "unverified", default_branch=None,
+                                                sha_present=False))
+        assert rc == 2, out
+        assert out["cleared"] is False, out
+        assert sha in _store_shas(store), "gh-unusable must never retire (fail-safe)"
+
+
+def test_resolve_keeps_on_flaky_positive_control_reconfirm():
+    """Finding 1 (fresh-eyes ): the commit-lookup and the positive
+    control are SEPARATE gh calls; _gh collapses every non-zero exit to None, so
+    a TRANSIENT error (rate-limit 403 / timeout) on ONLY the commit-lookup would
+    — without the re-confirm — be misread as genuine absence and RETIRE a real
+    obligation. Here the 1st default-branch read (positive control) succeeds, the
+    commit-lookup returns not-found, and the RE-CONFIRM default-branch read fails
+    (transient). The entry MUST be kept (fail-safe), never retired."""
+    with tempfile.TemporaryDirectory() as td:
+        store = Path(td) / "pd.yaml"
+        sha = "e" * 40
+        _seed_store(store, "o/r", sha)
+        rc, out = _resolve_in_process(store, "o/r", sha,
+                                      _fake_run(2, "unverified", ahead_by="7",
+                                                merged="0", sha_present=False,
+                                                flaky_pc=True))
+        assert rc == 2, out
+        assert out["cleared"] is False and "retired_via" not in out, out
+        assert sha in _store_shas(store), \
+            "transient gh error on re-confirm must never retire (Finding 1 fail-safe)"
+
+
+def _setup_branch_repo(td) -> Path:
+    """A real git repo whose current branch is `main` and whose origin/HEAD is
+    set locally (no network) to origin/main, so _push_branch_deploys can resolve
+    current-vs-default without a remote."""
+    repo = Path(td) / "branchrepo"
+    repo.mkdir()
+    env = _hermetic_env(GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                        GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+
+    def g(*a):
+        subprocess.run(["git", "-C", str(repo), *a], env=env,
+                       capture_output=True, text=True, timeout=30)
+
+    g("init", "-q")
+    g("config", "user.email", "t@t")
+    g("config", "user.name", "t")
+    (repo / "f.txt").write_text("x\n")
+    g("add", ".")
+    g("commit", "-q", "-m", "init")
+    g("branch", "-M", "main")  # name the branch `main` regardless of git's default
+    head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                          env=env, capture_output=True, text=True, timeout=30).stdout.strip()
+    # Simulate origin/main + origin/HEAD LOCALLY (no network fetch needed).
+    g("update-ref", "refs/remotes/origin/main", head)
+    g("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    return repo
+
+
+def test_add_registers_on_default_branch():
+    """A commit on the repo's default branch (main) DOES register — the deploy
+    workflow triggers there, so the obligation is real."""
+    with tempfile.TemporaryDirectory() as td:
+        repo = _setup_branch_repo(td)
+        store = Path(td) / "pd.yaml"
+        _tracker(store, "add", "--repo", "o/r", "--sha", "a" * 40,
+                 "--goal-id", "g-1", "--dir", str(repo))
+        assert _tracker(store, "has-pending").returncode == 0, \
+            "default-branch push must register a deploy obligation"
+
+
+def test_add_skips_non_default_branch():
+    """A commit on a docs/side branch (not the default) does NOT trigger the
+    deploy workflow, so it must be SKIPPED at registration (g-115-2925 / rb-4737,
+    the 50fc8d1 docs/operator-hardening phantom class)."""
+    with tempfile.TemporaryDirectory() as td:
+        repo = _setup_branch_repo(td)
+        subprocess.run(["git", "-C", str(repo), "checkout", "-q", "-b", "docs/x"],
+                       env=_hermetic_env(), capture_output=True, text=True, timeout=30)
+        store = Path(td) / "pd.yaml"
+        _tracker(store, "add", "--repo", "o/r", "--sha", "b" * 40,
+                 "--goal-id", "g-2", "--dir", str(repo))
+        assert _tracker(store, "has-pending").returncode == 1, \
+            "non-default-branch push must be skipped (no deploy obligation)"
+
+
+def test_add_fail_open_non_git_dir():
+    """FAIL-OPEN: a --dir that is not a git repo (branch unresolvable) must still
+    register — the branch skip only fires on a CONFIRMED non-default branch."""
+    with tempfile.TemporaryDirectory() as td:
+        store = Path(td) / "pd.yaml"
+        _tracker(store, "add", "--repo", "o/r", "--sha", "a" * 40,
+                 "--goal-id", "g-1", "--dir", str(Path(td) / "not-a-repo"))
+        assert _tracker(store, "has-pending").returncode == 0, \
+            "non-git --dir must fail-open (register), never silently skip"
 
 
 if __name__ == "__main__":

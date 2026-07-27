@@ -1,4 +1,4 @@
-"""Unit tests for core/scripts/_dry_idle.py (4-b, dry-idle Layer 2).
+"""Unit tests for core/scripts/_dry_idle.py (-b, dry-idle Layer 2).
 
 Pure-logic tests -- no daemon, no WM, no I/O beyond the fail-open config read
 (so these run identically with or without a live daemon; STORAGE_BACKEND is

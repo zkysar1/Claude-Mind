@@ -33,7 +33,7 @@ STRUCTURED_DEFER_PREFIXES = (
     "precondition_unmet:",        # aspirations-execute pre-claim re-check
     "blocked_on_dependency",      # dependency-chain tracker
     "Circuit breaker:",           # aspirations/SKILL.md Phase 5.5
-    "human_blocked:",             # 6: genuinely non-agent-provisionable
+    "human_blocked:",             # : genuinely non-agent-provisionable
                                   # human-gated block (user approve-click, legal
                                   # counsel, self-IAM). NEVER auto-clears, so
                                   # goal-selector exempts it from the 120h defer
@@ -43,7 +43,7 @@ STRUCTURED_DEFER_PREFIXES = (
                                   # plateaus, instead of re-surfacing every iter.
                                   # User-surfacing preserved via the precheck
                                   # human_blocked age-escalation. Design: zeta's
-                                  # 4 brief.
+                                  #  brief.
 )
 
 # CRITICAL: case-insensitive match. LLM-authored defers drift casing

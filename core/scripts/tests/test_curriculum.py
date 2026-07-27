@@ -1,4 +1,4 @@
-"""Tests for curriculum.py cross-queue graduation counting (0 / 3).
+"""Tests for curriculum.py cross-queue graduation counting ( / ).
 
 g-115-1560 added cross_queue counting to the curriculum count_check gate in BOTH
 core/scripts/curriculum.py (CLI) and mind_api/src/endpoints/curriculum.py (daemon)

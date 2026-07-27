@@ -8,11 +8,27 @@
 # still flags the goal as needing positive signal but the retrieval-session
 # is no longer pending).
 #
-# This is the backstop that ensures the system NEVER has zero utilization data,
-# even if the LLM skips Step 5b and Phase 4.26 entirely. Replaces the original
-# --all-noise backstop which over many iterations pushed unattested-but-relevant
-# nodes toward retirement (tree.py distill `has_feedback` gate consumes
-# times_noise — see audit 2026-05-07 / 0/655 leaves with times_helpful>0).
+# SCOPE (narrowed 2026-07-25,  — read this before trusting the hook):
+# This covers ONLY direct Skill(aspirations-state-update) invocations — /boot,
+# consolidation, and ad-hoc callers that bypass iteration-close.sh. It does NOT
+# cover the autonomous loop's hot path, and a PreToolUse[Skill] matcher
+# structurally CANNOT: the hot path runs `Bash: iteration-close.sh --phase
+# state-update` and stopped invoking the skill. Measured across 5 agents'
+# skill-invocation ledgers: aspirations-state-update fired 15 times out of
+# 12,325 total invocations (0.12%); bravo 0 of 2,552. The previous header
+# claimed this hook "ensures the system NEVER has zero utilization data" — that
+# guarantee was false for ~all closes, and was masked only by phase-4-26-gate.py
+# being independently inert ().
+#
+# The hot-path equivalent is iteration-close.sh `_repair_utilization_pending`,
+# called from do_state_update immediately BEFORE phase-4-26-gate.sh. Keep the
+# two in behavioral agreement (same tier order, same --confidence) — divergence
+# means the same manifest scores differently depending on which path ran.
+#
+# The --all-unknown fallback replaced the original --all-noise backstop, which
+# over many iterations pushed unattested-but-relevant nodes toward retirement
+# (tree.py distill `has_feedback` gate consumes times_noise — see audit
+# 2026-05-07 / 0/655 leaves with times_helpful>0).
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
 # _platform.sh converts MSYS paths to Windows paths for python3 interop.
@@ -70,13 +86,19 @@ fi
 # distinctive_tokens against the execution diary. Requires schema_version >= 2
 # retrieval-session.json; older sessions exit 4 and fall back to --all-unknown.
 # stderr is preserved — it's the only signal when the heuristic misfires.
+# --confidence balanced (min_distinctive=1) matches the hot-path helper in
+# iteration-close.sh. It was `conservative` (>=2) until 2026-07-25 ():
+# the hot path swapped to balanced under C.2 because conservative starved
+# positive signal (0 helpful across 320 active guardrails, 2026-05-09 audit),
+# but this hook was never updated, so the two backstops scored the same manifest
+# differently. Change both or neither.
 echo "[utilization-gate] Phase 4.26 was skipped for $goal_id — attempting --infer" >&2
 # : record that the --infer fallback path fired. `|| true` keeps the
 # hook exit code at 0 (PreToolUse contract); stderr is preserved so real bugs
 # in trigger-firings surface alongside the [utilization-gate] echos above.
 bash "$CORE_ROOT/scripts/trigger-firings.sh" record utilization-gate.infer --context "{\"goal_id\":\"$goal_id\"}" || true
 set +e
-bash "$CORE_ROOT/scripts/utilization-feedback.sh" --goal "$goal_id" --infer --confidence conservative >/dev/null
+bash "$CORE_ROOT/scripts/utilization-feedback.sh" --goal "$goal_id" --infer --confidence balanced >/dev/null
 rc=$?
 set -e
 if [ "$rc" -eq 4 ]; then

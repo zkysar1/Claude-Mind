@@ -100,6 +100,7 @@ PROJECT_ROOT = CORE_ROOT.parent
 
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, )
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
 
 from _paths import WORLD_DIR  # noqa: E402
@@ -185,7 +186,7 @@ def _age_hours(ts):
     if not ts:
         return None
     try:
-        t = dt.datetime.fromisoformat(str(ts).replace("Z", ""))
+        t = parse_naive_iso(ts)
         return (dt.datetime.now() - t).total_seconds() / 3600
     except Exception:
         return None
@@ -196,7 +197,7 @@ def _parse_ts(ts):
     if not ts:
         return None
     try:
-        return dt.datetime.fromisoformat(str(ts).replace("Z", ""))
+        return parse_naive_iso(ts)
     except Exception:
         return None
 
@@ -395,7 +396,7 @@ def main():
             continue
         # Index siblings once per aspiration (cheap).
         for g in goals:
-            # Two candidate lanes (3):
+            # Two candidate lanes ():
             #   apply      — original title-prefix lane (defer_reason required)
             #   structural — decomposition-backref lane for split-parents
             #                titled otherwise (no defer_reason required; the

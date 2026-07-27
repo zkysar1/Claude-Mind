@@ -86,7 +86,7 @@ def row_path(world_dir, agent: str) -> Path:
     return rows_dir(world_dir) / f"{name}.yaml"
 
 
-# Sibling-row backend overlay (9, 2026-07-11). Each agent's shard is
+# Sibling-row backend overlay (, 2026-07-11). Each agent's shard is
 # written ONLY on its own box; the own-cloud mirror sweep is PUSH-ONLY, so
 # sibling shards never land in this box's local rows dir. A local-only iterdir
 # therefore composes clone-era fossils for every partner (fleet-wide
@@ -233,7 +233,7 @@ def load_rows_authoritative(world_dir) -> dict:
 
 
 def row_agent_names(world_dir) -> tuple:
-    """Row-file stems, local ∪ backend (9: local-only stems miss every
+    """Row-file stems, local ∪ backend (: local-only stems miss every
     sibling on push-only-mirror boxes). Backend piece rides the _backend_rows
     TTL cache, so the parse cost is shared with load_rows."""
     d = rows_dir(world_dir)
@@ -256,7 +256,7 @@ def _entry_ts(entry) -> str:
 
 
 def _is_retired(entry) -> bool:
-    """Retirement tombstone check (9). A retired row (an agent whose
+    """Retirement tombstone check (). A retired row (an agent whose
     container/identity was decommissioned, e.g. the charlie+delta→foxtrot
     merge leftovers) is dropped from the composed roster INSTEAD of deleted —
     shard deletion needs s3:DeleteObject rights fleet boxes don't hold, and a
@@ -377,9 +377,9 @@ def read_agent_row(world_dir, agent: str, core_path=None) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Agent-row retirement (5) — the sanctioned REMOVE path.
+# Agent-row retirement () — the sanctioned REMOVE path.
 #
-# Signal gap 9 root-caused: team-state had NO way to remove an
+# Signal gap  root-caused: team-state had NO way to remove an
 # agent_status ROW. route_field sends agent_status.<name> to a per-agent
 # SHARD (targeting a non-existent shard for un-sharded legacy agents);
 # the generic --operation remove / _remove_nested only drops items from a
@@ -499,7 +499,7 @@ def retire_agent(world_dir, core_path, agent, author, now, *,
         raise ValueError(f"invalid agent name for retire: {agent!r}")
 
     plan = enumerate_retire(world_dir, core_path, name)
-    # 3: beliefs ABOUT the retiree are held by OTHER agents and persist
+    # : beliefs ABOUT the retiree are held by OTHER agents and persist
     # independently of the retiree's own row — enumerate them so retirement (or a
     # re-run after the row is already gone) sweeps the dead beliefs too.
     sweep = enumerate_belief_sweep(world_dir, core_path, name)

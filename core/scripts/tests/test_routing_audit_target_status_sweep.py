@@ -1,4 +1,4 @@
-"""test_routing_audit_target_status_sweep.py — regression test for 3 / rb-1478.
+"""test_routing_audit_target_status_sweep.py — regression test for  / rb-1478.
 
 Asserts that routing-audit-target-status-sweep.py's helper functions correctly
 identify the g-115-1329 canonical incident shape (a routing-audit Investigate
@@ -55,7 +55,7 @@ def _import_sweep():
 # ---- Case 1-5: target_id extraction ---------------------------------------
 
 def test_target_id_from_origin_signal_mismatch():
-    """9 canonical: _build_investigate_spec emits
+    """ canonical: _build_investigate_spec emits
     origin_signal='routing-mismatch:<target-id>' verbatim."""
     mod = _import_sweep()
     g = {
@@ -101,7 +101,7 @@ def test_target_id_origin_signal_wins_over_title():
 
 
 def test_target_id_unparseable_generic_shape():
-    """0 shape: a routing-audit goal with a generic title carrying no
+    """ shape: a routing-audit goal with a generic title carrying no
     target goal-id and no target-shaped origin_signal -> None (correctly not
     a sweep candidate)."""
     mod = _import_sweep()
@@ -206,7 +206,7 @@ def test_build_status_index():
     assert idx == {"g-1": "completed", "g-2": "pending", "g-3": "skipped"}
 
 
-# ---- 9: corrected-while-pending close reason ----------------------
+# ---- : corrected-while-pending close reason ----------------------
 # Description text below mirrors post-decompose-routing-audit._build_*_spec
 # VERBATIM so these double as a regression guard if the clause format drifts.
 

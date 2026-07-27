@@ -158,8 +158,8 @@ def main() -> int:
     print(f"  [{'PASS' if d.get('unblock_suggested') is False and 'unblock_title' not in d else 'FAIL'}] "
           f"no-match-no-fields: unblock_suggested={d.get('unblock_suggested')!r}")
 
-    # Case 5: 2 noun-as-verb guard. A verbless failure_reason that
-    # matches a capability ONLY via a domain-noun token (the 8 shape:
+    # Case 5:  noun-as-verb guard. A verbless failure_reason that
+    # matches a capability ONLY via a domain-noun token (the  shape:
     # 'npc' from a tree-restructuring desc token-matched to an NPC capability)
     # would_blocks but carries NO imperative verb → the Unblock is SUPPRESSED
     # (unblock_suggested=False) rather than filing a meaningless "Unblock: npc"

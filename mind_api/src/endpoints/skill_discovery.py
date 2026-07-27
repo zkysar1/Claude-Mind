@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -65,13 +65,19 @@ def _read_yaml(path: Path) -> Dict[str, Any]:
 def _parse_iso(s):
     if not s or not isinstance(s, str):
         return None
+    # /: robust tzinfo-strip via the shared _dt.parse_naive_iso
+    # (core/scripts is on the daemon sys.path — cf. the `from storage_backend import
+    # get_backend` import above). The bare strip-the-Z-then-fromisoformat idiom
+    # returned an AWARE datetime for offset-bearing input, so a later naive
+    # subtraction (_days_between) raised TypeError. Date-only fallback preserved.
+    from _dt import parse_naive_iso
+    r = parse_naive_iso(s)
+    if r is not None:
+        return r
     try:
-        return datetime.fromisoformat(s.replace("Z", ""))
+        return datetime.strptime(s[:10], "%Y-%m-%d")
     except ValueError:
-        try:
-            return datetime.strptime(s[:10], "%Y-%m-%d")
-        except ValueError:
-            return None
+        return None
 
 
 def _days_between(d1, d2):

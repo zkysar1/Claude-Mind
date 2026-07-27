@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Evolution-stub PENDING check — the missing PROMPT half of the stub lifecycle.
 #
-# THE GAP THIS CLOSES (0, 2026-07-14):
+# THE GAP THIS CLOSES (, 2026-07-14):
 #   evolution-record.py writes an `awaiting_completion` stub on every self.md /
 #   program.md edit. The LLM is then supposed to call evolution-complete.sh,
 #   which records the WHY and — for a MATERIAL agent_self change — fires the
@@ -63,14 +63,14 @@ export EVO_STUB_THRESHOLD_MINUTES="$THRESHOLD_MINUTES"
 # combination: harmless today, a trap for the next reader. Single source of truth
 # — fail visibly rather than fall back to an inconsistent one
 # (communication-clarity.md rule 5). If _paths.sh cannot be sourced we exit 0 at
-# line 47 and never reach here. (fresh-eyes-code, 0)
+# line 47 and never reach here. (fresh-eyes-code, )
 
 # NOTE: stderr is deliberately NOT swallowed (no `2>/dev/null`). The sibling
 # producer experience-staleness-check.sh:63 omits it too, and guard-424's class
 # ("gate/precheck scripts must fail loud with stderr, not silently") applies:
 # a gate built to catch SILENT non-execution must not itself be able to silently
 # non-execute. `|| exit 0` keeps it fail-OPEN (never blocks the loop) while a
-# crash still lands in iteration-close's stderr log. (fresh-eyes-code, 0)
+# crash still lands in iteration-close's stderr log. (fresh-eyes-code, )
 python3 - <<'PY' || exit 0
 import json
 import os

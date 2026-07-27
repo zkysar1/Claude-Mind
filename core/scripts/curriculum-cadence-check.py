@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cadence gate for the curriculum re-evaluation ritual (1).
+"""Cadence gate for the curriculum re-evaluation ritual ().
 
 Exits 0 when `curriculum-evaluate` should re-run this iteration (>=
 `interval_hours` since the last evaluation, or never evaluated). Exits 1 on

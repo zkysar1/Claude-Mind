@@ -1,4 +1,4 @@
-"""2 part 2 — sweep temp/ move-propagation unit tests.
+""" part 2 — sweep temp/ move-propagation unit tests.
 
 propagate_temp_moves deletes the remote ROOT key agents/<a>/temp/<name> only
 when the LOCAL drained/<name> twin exists (the drained copy IS the archive —

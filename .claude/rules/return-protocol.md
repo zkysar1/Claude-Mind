@@ -29,6 +29,24 @@ Anti-pattern C). Opt-out per agent: when
 `Skill(aspirations)` alone, exactly as the table above (the pre-deadman
 behavior). Rationale: `core/config/rationale/deadman-switch.md`.
 
+**Re-arm FIRST on resurrection (single-shot-net gap, rb-4345 / g-115-2771).**
+The deadman is a SINGLE replace-slot wakeup — firing CONSUMES it. When a
+`<<autonomous-loop-dynamic>>` wakeup fires and resurrects a dead loop, that
+resurrected turn starts with NO net. If it then text-dies before re-arming (the
+likely case: under an API storm the first tool calls fail with
+529/ECONNRESET/timeout and the model narrates → text-end), the net is gone and
+the loop dies silently a SECOND time with nothing left to resurrect it — the
+exact 7h death of 2026-07-19 (cc-04: wakeup fired 00:00:40, resurrected turns
+text-died 00:00–00:04 during an API storm WITHOUT re-arming, dead until 07:18
+zombie-recovery). RULE: on a `<<autonomous-loop-dynamic>>` firing, the **FIRST
+tool call of the resurrected turn is a `ScheduleWakeup(prompt=
+"<<autonomous-loop-dynamic>>", delaySeconds=600)` re-arm** — restore the net
+BEFORE any work that might fail. Then proceed with the normal loop entry
+(Phase -1.5 onward); the iteration's later terminal-pair re-arm is harmless
+(replace-slot semantics make a double-arm a no-op). Restoring the net first
+costs one tool call and converts "death during resurrection" from a multi-hour
+silent death into at most one more 600s resurrection cycle.
+
 ## The Trap
 
 The failure mode observed on 2026-04-23 (alpha session 58) was:

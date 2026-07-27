@@ -275,7 +275,7 @@ say "prepended RELEASES.json entry for $NEW"
 
 # --- Step 9: git commit + annotated tag (M2 — sole tagger; NEVER pushes) ---
 # Pathspec-scope the commit to ONLY the release-bump files (mirrors
-# iteration-commit.sh:1105 / 8). A bare `git commit` records the WHOLE
+# iteration-commit.sh:1105 / ). A bare `git commit` records the WHOLE
 # index, so if an autonomous agent has pre-staged WIP in the shared tree when a
 # maintainer cuts a release, that WIP gets swept into the release commit
 # (guard-741). release.sh stages a fixed, known file set, so commit exactly those.

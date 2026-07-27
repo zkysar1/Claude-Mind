@@ -40,10 +40,20 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+# Two INDEPENDENT try blocks on purpose. Combining them (g-335-253 first draft,
+# caught by fresh-eyes) couples unrelated failures: if _paths lacks
+# agent_state_dir, a single combined import loses _WORLD_DIR too — degrading the
+# script to "no metrics-dir -> WARN -> surface nothing", which the pre-change code
+# survived. Each name gets its own fallback so one missing symbol cannot take the
+# other down.
 try:
     from _paths import WORLD_DIR as _WORLD_DIR  # noqa: E402
 except Exception:  # noqa: BLE001 — test env without _paths falls back to --metrics-dir
     _WORLD_DIR = None
+try:
+    from _paths import agent_state_dir as _agent_state_dir  # noqa: E402
+except Exception:  # noqa: BLE001 — falls back to the manual SCRIPT_DIR derivation below
+    _agent_state_dir = None
 
 SWEEP_LOGS = {
     "parent-supersession-sweep-metrics.jsonl": "parent-supersession",
@@ -166,8 +176,9 @@ def _announce_board(mutations, agent):
     # board-post.sh is a SIBLING in core/scripts, so anchor on SCRIPT_DIR and
     # count no parents at all.
     try:
+        from _runtime_bash import BASH  # rb-1472: not bare "bash"
         proc = subprocess.run(
-            ["bash", str(SCRIPT_DIR / "board-post.sh"),
+            [BASH, str(SCRIPT_DIR / "board-post.sh"),
              "--channel", "findings", "--type", "finding",
              "--tags", "sweep-auto-close,visibility,g-115-2676"],
             input=msg, capture_output=True, text=True, timeout=30,
@@ -213,9 +224,25 @@ def main():
 
         wm_path = args.watermark_file
         if not wm_path:
-            repo = Path(__file__).resolve().parent.parent
             agent = args.agent or "unknown"
-            wm_path = str(repo / "agents" / agent / "session" / "sweep-surface-watermark")
+            # g-335-253: was `repo = Path(__file__).resolve().parent.parent` then
+            # `repo / "agents" / ...`. That `.parent.parent` is CORE_ROOT, not
+            # PROJECT_ROOT, so the watermark was written to
+            # <root>/core/agents/<agent>/session/ — a path nothing reads. The dedup
+            # watermark therefore never persisted: _read_watermark fell back to the
+            # window default on EVERY run, so the same mutations re-surfaced forever
+            # (silent, because local stdout still looked right — same tell as the
+            # board-post bug below). This is the SECOND instance of the
+            # `.parent`-as-PROJECT_ROOT class in this very file; the g-115-2681 fix
+            # corrected the board-post site and missed this one.
+            # Route through the _paths helper instead of re-deriving a root at all:
+            # it is the single sync point for AGENTS_PARENT_DIR, and CLAUDE.md
+            # "Agent-dir Resolution" forbids joining PROJECT_ROOT/<agent> by hand.
+            if _agent_state_dir is not None:
+                wm_path = str(_agent_state_dir(agent) / "sweep-surface-watermark")
+            else:  # test env without _paths — SCRIPT_DIR is core/scripts, so ../.. is root
+                wm_path = str(SCRIPT_DIR.parent.parent / "agents" / agent
+                              / "session" / "sweep-surface-watermark")
 
         watermark = _read_watermark(wm_path, now, args.window_hours)
         mutations = _collect_new_mutations(metrics_dir, watermark)

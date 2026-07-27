@@ -43,4 +43,24 @@ for _hook in pre-commit pre-push post-commit; do
     fi
 done
 
+# Record-level merge driver for the RMW agent ledgers (merge=ayoai-ledger in
+# .gitattributes). git driver config lives in .git/config, which — like
+# .git/hooks and unlike core.hooksPath's target — is NOT version-controlled, so
+# this tracked installer is the cross-clone registration mechanism. The driver
+# resolves cross-box iteration-push.sh conflicts on experience / changelog /
+# experience-meta / journal / aspirations ledgers by record-level commutative
+# union instead of aborting (). Idempotent (only writes on drift) +
+# fail-open (a config hiccup must not block session start).
+_LEDGER_DRIVER='bash core/scripts/git-merge-ayoai-ledger.sh %O %A %B %P'
+_CUR_LEDGER_DRIVER="$(git config --local --get merge.ayoai-ledger.driver 2>/dev/null || echo "")"
+if [ "$_CUR_LEDGER_DRIVER" != "$_LEDGER_DRIVER" ]; then
+    git config --local merge.ayoai-ledger.name \
+        "the framework record-level agent-ledger merge (commutative; reuses coordination_merge)" 2>/dev/null || true
+    if git config --local merge.ayoai-ledger.driver "$_LEDGER_DRIVER" 2>/dev/null; then
+        echo "[install-git-hooks] merge.ayoai-ledger driver registered (cross-box ledger conflicts now self-heal)" >&2
+    else
+        echo "[install-git-hooks] WARN: could not register merge.ayoai-ledger driver (non-fatal; ledger conflicts fall back to manual union)" >&2
+    fi
+fi
+
 exit 0

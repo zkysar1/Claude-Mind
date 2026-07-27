@@ -175,6 +175,19 @@ def _scan_aspirations(path: Path, store_label: str) -> list[dict]:
         if not isinstance(asp, dict):
             continue
         asp_id = asp.get("id", "?")
+        # g-115-2723: skip governed tombstones. A retired/archived aspiration is
+        # a leak that was ALREADY handled via aspirations status (the g-328-29
+        # asp-338..349 batch, retired 2026-07-14 per g-115-2056/2063/2145) —
+        # re-flagging its title/motivation/goals every 24h run is pure re-triage
+        # noise a reader must dismiss each cycle. Live-leak detection is
+        # PRESERVED: a FRESH leak never carries retired/archived status (it lands
+        # with whatever status the leaking test wrote — active/completed), so a
+        # real leak in either store stays in scope. Aspiration-level status is
+        # the reliable marker (goals under a retired asp can still read
+        # `pending`, so goal.status is NOT a tombstone signal — skip at the
+        # aspiration level, which also drops its nested goals).
+        if str(asp.get("status", "")).strip().lower() in ("retired", "archived"):
+            continue
         for scope, field in ((_SCOPE_ASP_TITLE, "title"),
                              (_SCOPE_ASP_MOTIVATION, "motivation")):
             for sig in _match(scope, asp.get(field)):

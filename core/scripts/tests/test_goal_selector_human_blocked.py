@@ -1,4 +1,4 @@
-"""test_goal_selector_human_blocked.py — 6 regression.
+"""test_goal_selector_human_blocked.py —  regression.
 
 Pins the `human_blocked:` structured-defer class (design: zeta's g-115-1644 brief).
 
@@ -206,7 +206,7 @@ def test_synth_blocker_ref_for_human_blocked():
     assert str(ref.get("external_id", "")).startswith("structured-defer:")
 
 
-# ── 1: deferred_until (path b) takes precedence over a structured-prefix
+# ── : deferred_until (path b) takes precedence over a structured-prefix
 #    defer_reason (path a) when BOTH are present and deferred_until is future ──
 
 
@@ -219,7 +219,7 @@ def _past_iso(days_ago):
 
 
 def test_synth_deferred_until_future_wins_over_structured_prefix():
-    # THE 1 REGRESSION: a goal carrying BOTH a structured-prefix
+    # THE  REGRESSION: a goal carrying BOTH a structured-prefix
     # defer_reason AND a far-future deferred_until must derive
     # expires_at == deferred_until (path b), NOT set_at+120h (path a). The
     # explicit deferred_until is the authoritative structural expiry. Before the

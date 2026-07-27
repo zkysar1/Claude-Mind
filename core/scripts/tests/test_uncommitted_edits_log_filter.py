@@ -53,7 +53,7 @@ def _to_bash_path(p) -> str:
 
 
 # Framework env namespace stripped before spawning the record-script
-# subprocess (0, rb-1324/rb-1565 non-hermetic-pollution class).
+# subprocess (, rb-1324/rb-1565 non-hermetic-pollution class).
 # The record-script tests below spawn a fresh shell that sources _paths.sh;
 # a fresh subprocess can only be influenced by its parent via env + cwd. cwd
 # is never mutated by the suite (no os.chdir anywhere), so env is the sole
@@ -122,14 +122,14 @@ def _setup_repo(tmpdir: Path, agents=("alpha", "zeta")) -> Path:
     core_scripts = repo / "core" / "scripts"
     core_scripts.mkdir(parents=True)
     (core_scripts / ".gitkeep").write_text("")
-    # 3: the partner-log (), own-log (), AND
+    # : the partner-log (), own-log (), AND
     # post-commit-clear snapshots all import _normalize_rel_path from
     # $REPO/core/scripts/_cross_agent_attribution_filter.py (which pulls
     # _stdio). Copy both into the temp repo so the harness exercises the REAL
     # normalization instead of the import's fail-open identity fallback —
     # otherwise absolute-form log entries silently stay un-normalized in-test,
     # the exact blind spot the sibling concurrent-partner harness closed at
-    # 3. Mirrors test_iteration_commit_concurrent_partner.py::_setup_repo.
+    # . Mirrors test_iteration_commit_concurrent_partner.py::_setup_repo.
     for _mod in ("_cross_agent_attribution_filter.py", "_stdio.py"):
         (core_scripts / _mod).write_bytes((CORE_SCRIPTS / _mod).read_bytes())
     # Match production: __pycache__ is gitignored. Without this, the
@@ -287,7 +287,7 @@ def test_own_log_does_not_self_filter():
 
 
 def test_own_log_exempts_double_recorded_path():
-    """0 regression: when a neutral-path file is recorded in BOTH a
+    """ regression: when a neutral-path file is recorded in BOTH a
     partner's uncommitted-edits.jsonl AND the committer's OWN log (the g-115-695
     between-claim double-recording — one physical edit logged by two agents), the
     committer's first-person authorship MUST override the partner-log drop and
@@ -455,7 +455,7 @@ def _setup_full_record_env(tmp: Path) -> Path:
     # host where `py` is itself an `exec python3` wrapper (e.g. this Linux box's
     # /usr/local/bin/py), a `python3->py -3` shim plus a `py -3->python3` wrapper
     # form an infinite mutual recursion once the shim dir is on PATH — the record
-    # script hangs and the subprocess times out (6). sys.executable is an
+    # script hangs and the subprocess times out (). sys.executable is an
     # absolute path, so there is no PATH re-resolution and no loop.
     shim_dir = core_scripts / ".python-shim"
     shim_dir.mkdir()
@@ -474,7 +474,7 @@ def _hook_payload(absolute_path: Path) -> str:
 
 
 def test_record_filters_agent_prefixed_path_under_agents_parent():
-    """5 regression: under AGENTS_PARENT_DIR=agents, an edit to
+    """ regression: under AGENTS_PARENT_DIR=agents, an edit to
     agents/<name>/foo MUST NOT land in uncommitted-edits.jsonl. Before the
     fix the loop at L72 walked `$PROJECT_ROOT/*/` looking for self.md
     sentinels — but with AGENTS_PARENT_DIR=agents, no top-level sibling has
@@ -505,7 +505,7 @@ def test_record_filters_agent_prefixed_path_under_agents_parent():
 
 
 def test_record_appends_neutral_path_under_agents_parent():
-    """5 regression — positive case: under AGENTS_PARENT_DIR=agents,
+    """ regression — positive case: under AGENTS_PARENT_DIR=agents,
     an edit to core/scripts/foo MUST land in uncommitted-edits.jsonl. Pairs
     with the negative test above so the fix is verified both ways
     (rejects agent paths, accepts neutral paths)."""
@@ -608,7 +608,7 @@ def test_clear_on_success_removes_committed_paths():
 
 
 def test_clear_normalizes_absolute_own_log_entry():
-    """3 regression: the post-commit clear must prune an own-log entry
+    """ regression: the post-commit clear must prune an own-log entry
     stored in LEGACY-ABSOLUTE form (C:/.../repo/core/foo.py), not just relative
     form. The clear compares the entry's `file` against the relative committed
     set; without _normalize_rel_path (the SAME normalizer the two construction

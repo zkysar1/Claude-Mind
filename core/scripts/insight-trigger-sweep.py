@@ -70,7 +70,7 @@ ACTION_TYPE_RE = re.compile(r"^action_type:(.+)$")
 SEVERITY_RE = re.compile(r"^severity:(.+)$")
 AFFECTS_RE = re.compile(r"^affects:(g-\d+-\d+)$")
 
-# 6: terminal statuses that mean "no Apply needed — target already
+# : terminal statuses that mean "no Apply needed — target already
 # resolved". Mirrors unblock-parent-status-sweep.py:112 (rb-908 lineage).
 # Audit-time -> apply-time staleness gap (rb-1150): zeta's 06:37 audit
 # spawned a supersession-Apply at 18:11; the target had already closed at
@@ -185,7 +185,7 @@ def load_triggers():
 
 
 # ---------------------------------------------------------------------------
-# Apply-time goal-status re-probe (6, rb-1150)
+# Apply-time goal-status re-probe (, rb-1150)
 # ---------------------------------------------------------------------------
 
 
@@ -407,13 +407,13 @@ def main():
 
     filed = []
     overflow = []
-    audit_stale = []  # 6: skipped because target already terminal
-    affects_missing = []  # 6: filed-with-warning when target not found
+    audit_stale = []  # : skipped because target already terminal
+    affects_missing = []  # : filed-with-warning when target not found
     for t in pending:
         if len(filed) >= MAX_GOALS_PER_RUN:
             overflow.append(t)
             continue
-        # 6 / rb-1150: re-probe affects:<goal-id> target status
+        #  / rb-1150: re-probe affects:<goal-id> target status
         # before filing the Apply. Authors of insight_triggers tag with
         # `affects:<goal-id>` when the action points at a specific goal;
         # absent that tag we file unchanged (no probe target available).

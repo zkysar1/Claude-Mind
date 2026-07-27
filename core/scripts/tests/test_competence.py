@@ -1,4 +1,4 @@
-"""Tests for _competence.py — the competence-assessment SSOT (6).
+"""Tests for _competence.py — the competence-assessment SSOT ().
 
 Covers the assess() formula, the refresh-before-evaluate glue
 (refresh_competence_for_gates), write-side field preservation, and the
@@ -116,7 +116,7 @@ def test_write_preserves_evolve_owned_fields(tmp_path):
     assert ca["highest_capability"] == "EXPLOIT"  # evolve-owned key preserved
 
 
-# --- assess_stage (4 — script-enforced stage producer) ---------------
+# --- assess_stage ( — script-enforced stage producer) ---------------
 
 def _seed_tree_with_levels(world: Path, nodes: dict):
     """nodes: key -> (parent, depth, capability_level)."""
@@ -272,7 +272,7 @@ def test_refresh_ignores_other_metric_dotpaths(tmp_path):
 # --- wiring parity (guard-742 half-fix class) ---------------------------------
 
 def test_cli_daemon_competence_refresh_parity():
-    """Both curriculum evaluate implementations MUST carry the 6
+    """Both curriculum evaluate implementations MUST carry the 
     refresh wiring in sync — a fix to only one side is half a fix."""
     cli = CLI_FILE.read_text(encoding="utf-8")
     daemon = DAEMON_FILE.read_text(encoding="utf-8")
@@ -290,10 +290,10 @@ def test_wrapper_delegates_to_ssot():
     assert "N_KNOWLEDGE =" not in wrapper
 
 
-# --- daemon round-trip (9) -------------------------------------------
+# --- daemon round-trip () -------------------------------------------
 
 def test_daemon_roundtrip_evaluate_refreshes_metric(tmp_path):
-    """Live integration path (9): POST /v1/curriculum/evaluate with a
+    """Live integration path (): POST /v1/curriculum/evaluate with a
     competence metric gate → the daemon-side refresh fires BEFORE gate
     evaluation → developmental-stage.yaml gains assessed_at/producer, the
     response carries competence_refresh=ok, and the gate reads the RECOMPUTED
@@ -346,7 +346,7 @@ def test_daemon_roundtrip_evaluate_refreshes_metric(tmp_path):
         assert ca["average_competence"] == expected
         assert ca["producer"] == _competence.PRODUCER
         assert ca["assessed_at"]
-        # 4: the refresh now recomputes the stage block too (script is
+        # : the refresh now recomputes the stage block too (script is
         # the single producer). The seeded tree has no mappable depth>=2 leaves
         # → tree_maturity 0.0 → stage recomputed to "exploring" (stale seed
         # "applying" is corrected, not preserved).

@@ -152,3 +152,31 @@ def full_calibration_progress(health_dir):
             if isinstance(ts, str) and len(ts) >= 10:
                 dates.add(ts[:10])
     return len(dates), records
+
+
+def calibration_state(health_dir, min_days, min_records):
+    """THE definition of "is this agent calibrated?" (spec §10). Returns
+    (calibrated, progress) where progress is (days, records) when a full scan
+    ran, or None when the `.calibrated` marker short-circuited it.
+
+    Both halves of the subsystem MUST route their calibration read through this
+    helper — `health-regression-check.py` (detection) and `health-revert.py`
+    (revert, whose `route_candidate` calls `mode == full AND calibrated` the
+    master safety gate). They previously each computed `calibrated` themselves
+    and DRIFTED (g-115-3125): the revert half used `calibration_progress(
+    recent_records(d, 200))`, precisely the bounded-window form the docstring
+    above and spec §10 say MUST NOT gate calibration. Because a busy agent packs
+    200 records into a handful of calendar days, that half read False on every
+    PRODUCTIVE agent — the more health evidence an agent generated, the more
+    permanently its revert authority stayed locked — while the detection half
+    read True. Measured on zeta 2026-07-26: windowed (6 days/200 records) =>
+    False; full-history (43 days/1150 records) => True.
+
+    Read-only by design. The one-time marker WRITE stays with the detection
+    half, which owns the fires-exactly-once `calibration_just_completed` edge;
+    duplicating the write here would make that edge fire twice.
+    """
+    if (Path(health_dir) / ".calibrated").exists():
+        return True, None
+    days, records = full_calibration_progress(health_dir)
+    return (days >= min_days and records >= min_records), (days, records)

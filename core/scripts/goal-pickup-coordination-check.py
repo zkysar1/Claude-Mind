@@ -103,16 +103,16 @@ JSON output:
     "overlapping_commits": [
       {"hash", "short", "subject", "committed_goal_id",
        "matched_paths": [...], "matched_keywords": [...]}
-      # product-repo hits (8) additionally carry
+      # product-repo hits () additionally carry
       # "repo": <name> and "matched_goal_id": bool
     ],
-    "matched_uncommitted": [           # partner in-flight (uncommitted) overlaps (5)
+    "matched_uncommitted": [           # partner in-flight (uncommitted) overlaps ()
       {"file", "matched_paths": [...], "matched_stem": str}
     ],
     "board_partner_activity": [        # partner claim/completion posts ()
       {"id", "author", "timestamp", "kind": "claim"|"complete", "text"}
     ],
-    "product_surfaces": [str, ...],    # product surfaces the goal prose names (8)
+    "product_surfaces": [str, ...],    # product surfaces the goal prose names ()
     "product_repos_scanned": [str, ...],
     "product_branch_hits": [{"repo", "branch"}],
     "product_pr_hits": [{"repo", "number", "title", "state", "updatedAt"}],
@@ -147,6 +147,7 @@ PROJECT_ROOT = CORE_ROOT.parent
 
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, )
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
 
 # Path-like tokens in goal prose: a governed-root-anchored path
@@ -176,12 +177,12 @@ _STOPWORDS = frozenset({
     "use", "uses", "using", "so", "not", "but", "all", "any", "each", "per",
     "idea", "apply", "investigate", "recurring", "maintain", "unblock",
     "implement", "support", "enable", "handle", "wire", "wired",
-    # 5: boilerplate goal-vocabulary that recurs across nearly every
+    # : boilerplate goal-vocabulary that recurs across nearly every
     # goal title / commit subject and carries NO same-surface identity. The
     # canonical FP (): a goal whose title carried "participants:[agent,
     # user]" matched UNRELATED commit 286090d7d (merge-authority) on "agent" +
     # "user" alone (matched_paths empty) -> race_risk=true on pure goal-record
-    # vocab. Sibling to goal-duplication-gate _STOPWORDS (5, same FP
+    # vocab. Sibling to goal-duplication-gate _STOPWORDS (, same FP
     # family). Each is a poor surface discriminator; dropping them keeps
     # race_risk firing on substantive file/topic overlap, not goal-record
     # boilerplate. Expand as new generic-token FP classes surface.
@@ -344,9 +345,9 @@ def classify_uncommitted_overlap(affected_paths, keywords, uncommitted_files):
 
 
 # Goal-id shape (ID Formats: g-NNN-NN through g-NNN-NNNN, plus decomposition
-# suffixes like 4-c). Used to extract WHICH goal a claim post claims.
+# suffixes like -c). Used to extract WHICH goal a claim post claims.
 _GOAL_ID_RE = re.compile(r"g-\d+-\d+(?:-[a-z0-9]+)*", re.IGNORECASE)
-# Claim-announce text prefixes: "claim: <id> — <title>" (the 3 atomic
+# Claim-announce text prefixes: "claim: <id> — <title>" (the  atomic
 # announce shape) and the older "Claiming <id> ..." ceremony form.
 _CLAIM_TEXT_PREFIX_RE = re.compile(
     r"^\s*claim(?:ing)?[:\s]+(?:goal\s+)?(g-\d+-\d+(?:-[a-z0-9]+)*)",
@@ -371,7 +372,8 @@ def _claimed_ids(mtype, text, tags):
     return ids
 
 
-def classify_board_mentions(goal_id, me, messages, goal_recurring=False):
+def classify_board_mentions(goal_id, me, messages, goal_recurring=False,
+                            goal_last_achieved=None):
     """Pure. Partner-authored board posts that STRUCTURALLY claim or complete
     this goal-id — the cross-box signal that survives store partitions
     (g-001-311: on 2026-07-09 alpha's aspirations-claim write never propagated
@@ -401,7 +403,10 @@ def classify_board_mentions(goal_id, me, messages, goal_recurring=False):
 
     Recurring goals skip completion-kind hits (goal_recurring=True): a
     recurring goal completes every cycle, so a partner's past completion post
-    is history, not a race. Claims still count. Own-author posts are excluded
+    is history, not a race. Claims still count EXCEPT stale prior-cycle claims:
+    when goal_last_achieved (lastAchievedAt) is passed, a recurring-goal CLAIM
+    whose timestamp pre-dates lastAchievedAt was a claim for an already-completed
+    cycle and is dropped (g-115-2978). Own-author posts are excluded
     (a prior same-agent session's stranded claim is the stranded-claim sweep's
     job, not a partner race). Returns [{id, author, timestamp, kind, text}].
 
@@ -436,7 +441,7 @@ def classify_board_mentions(goal_id, me, messages, goal_recurring=False):
             # A claim post whose extracted claimed id is a DIFFERENT goal (or
             # unparseable) — this goal_id appears only as a body citation.
             # Not a race signal; dropping prevents the wrong digest yield
-            # (1, FP specimen msg-20260713-171224-alpha-5101).
+            # (, FP specimen msg-20260713-171224-alpha-5101).
             continue
         elif mtype == "complete" or text.lstrip().lower().startswith("completed"):
             kind = "complete"
@@ -444,6 +449,23 @@ def classify_board_mentions(goal_id, me, messages, goal_recurring=False):
             continue  # bare mention — dropped (see docstring)
         if kind == "complete" and goal_recurring:
             continue
+        # Stale prior-cycle claim drop (): for a recurring goal, a
+        # partner CLAIM whose timestamp PRE-DATES this goal's lastAchievedAt was
+        # a claim for a now-completed prior cycle — history, not a live race.
+        # Dropping it prevents an unnecessary yield of a due, collision-safe
+        # recurring goal (incident 2026-07-23: echo claim 15:19:21 pre-dated
+        #  lastAchievedAt 15:27:15, echo in_flight on a different goal).
+        # Fail-safe: if either timestamp is unparseable, KEEP the hit — the
+        # conservative direction leaves race_risk set (a false yield is safer
+        # than a missed race).
+        if kind == "claim" and goal_recurring and goal_last_achieved:
+            try:
+                claim_dt = parse_naive_iso(m.get("timestamp"))
+                la_dt = parse_naive_iso(goal_last_achieved)
+                if claim_dt < la_dt:
+                    continue  # stale-cycle claim — not a live race
+            except Exception:
+                pass  # unparseable → keep (conservative: race_risk stays)
         hits.append({
             "id": m.get("id") or "",
             "author": author,
@@ -454,7 +476,7 @@ def classify_board_mentions(goal_id, me, messages, goal_recurring=False):
     return hits
 
 
-# ── Product-repo surface probe: pure classifiers (8) ────────────────
+# ── Product-repo surface probe: pure classifiers () ────────────────
 
 # Repo-name tokens too generic to identify a product surface on their own
 # (full repo names still match regardless). Deployment-specific prefixes need
@@ -546,7 +568,7 @@ def detect_product_surfaces(surface_text, repo_names, write_path_entries=()):
 
 def classify_product_overlap(affected_paths, keywords, commits, goal_id,
                              min_shared_keywords=2, goal_recurring=False):
-    """Pure. Product-repo variant of classify_overlap (8). Two
+    """Pure. Product-repo variant of classify_overlap (). Two
     deliberate differences from the mind-repo classifier:
       1. NO own-goal exclusion — inverted into a FORCE-INCLUDE: a product
          commit whose subject names THIS goal-id is the strongest
@@ -627,7 +649,7 @@ def _since_arg(since_hours):
 
 
 def _git_fetch_remote(timeout_s=10, cwd=None):
-    """Refresh remote-tracking refs before the log scan (6). Without
+    """Refresh remote-tracking refs before the log scan (). Without
     this, the scan sees only the local clone's history: on 2026-07-15
     (g-335-65) the check ran BEFORE the pre-execution Pull Latest step, so a
     partner's fix pushed 20h earlier (8992abe) was invisible and the REAL
@@ -692,7 +714,7 @@ def _git_log_commits(since_hours):
     return _parse_name_only_log(out)
 
 
-# ── Product-repo probe: impure helpers (8) ──────────────────────────
+# ── Product-repo probe: impure helpers () ──────────────────────────
 
 def _parse_write_path_conf(conf_path):
     """AGENT_WRITE_PATH entries (';'-separated, optionally quoted) from a
@@ -845,7 +867,7 @@ def _gh_pr_hits(repo_dir, goal_id, timeout_s=15):
 def _scan_product_repos(goal_id, surface_text, affected_paths, keywords,
                         since_hours, min_shared_keywords,
                         goal_recurring=False):
-    """Impure orchestrator for the product-repo probe (8). Detects
+    """Impure orchestrator for the product-repo probe (). Detects
     whether the goal prose names a product surface; when it does, scans every
     git repo reachable from AGENT_WRITE_PATH (windowed git log + goal-id
     branch scan), fetching + PR-searching ONLY the matched-name repos
@@ -1052,8 +1074,8 @@ def _read_partners(since_minutes=360):
         mins = None
         if la:
             try:
-                t = dt.datetime.fromisoformat(str(la).replace("Z", ""))
-                # Cross-machine clock/TZ skew (0): a partner whose
+                t = parse_naive_iso(la)
+                # Cross-machine clock/TZ skew (): a partner whose
                 # machine clock is ahead writes a future-dated last_active;
                 # now (machine-local naive) - t goes negative. Clamp to 0 — a
                 # future-dated liveness stamp means "just active". Skew-safe.
@@ -1195,7 +1217,7 @@ def main():
         min_shared_keywords=args.min_shared_keywords)
     partners = _read_partners()
 
-    # Uncommitted (partner in-flight) probe — 5. Gated on a partner
+    # Uncommitted (partner in-flight) probe — . Gated on a partner
     # being in_flight: the working tree is shared (guard-741), so without a
     # partner in_flight any uncommitted files are this agent's own WIP and
     # flagging them would be a self-false-positive. When a partner IS in_flight,
@@ -1215,12 +1237,13 @@ def main():
     me = os.environ.get("MIND_AGENT", "")
     board_hits = classify_board_mentions(
         args.goal_id, me, _board_recent_mentions(args.board_since_hours),
-        goal_recurring=bool((goal or {}).get("recurring")))
+        goal_recurring=bool((goal or {}).get("recurring")),
+        goal_last_achieved=(goal or {}).get("lastAchievedAt"))
     if board_hits:
         race_risk = True
 
-    # Product-repo probe — 8. The mind-repo probes above are blind
-    # to work shipped in AGENT_WRITE_PATH product repos (the 6
+    # Product-repo probe — . The mind-repo probes above are blind
+    # to work shipped in AGENT_WRITE_PATH product repos (the 
     # shape: the deliverable PR existed ~24h before claim; only a sibling
     # mind commit was flagged). Gated on the goal prose naming a product
     # surface, so ordinary framework goals pay ~zero cost.

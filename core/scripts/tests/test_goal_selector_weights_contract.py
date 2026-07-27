@@ -1,4 +1,4 @@
-"""test_goal_selector_weights_contract.py — 5 regression guards.
+"""test_goal_selector_weights_contract.py —  regression guards.
 
 Three-part fix under test:
   (1) opportunity_boost criterion restored (the rb-498-era promotion clobbered
@@ -63,7 +63,7 @@ def test_known_criteria_matches_score_goal_raw_keys():
 
 
 def test_opportunity_boost_in_manifest_and_seed():
-    """The 5 restore itself: criterion in the manifest AND seeded."""
+    """The  restore itself: criterion in the manifest AND seeded."""
     assert "opportunity_boost" in gs.KNOWN_CRITERIA
     seed = yaml.safe_load((REPO_ROOT / "core/config/meta.yaml").read_text(encoding="utf-8"))
     w = seed["initial_state"]["goal_selection_strategy"]["weights"]
@@ -80,7 +80,7 @@ def test_seed_template_weights_subset_of_known():
 
 
 def test_seed_template_weights_complete():
-    """Every computed criterion must be SEEDED (3): the sibling of
+    """Every computed criterion must be SEEDED (): the sibling of
     the subset check above. Together they pin seed == KNOWN_CRITERIA. Without
     this, a criterion added to code could silently lag out of the seed for
     weeks (the seed had 19/26 before g-115-2543), so a fresh world would seed

@@ -1,4 +1,4 @@
-"""test_rb_entry_type_taxonomy_sync.py -- 9 (follow-up to ).
+"""test_rb_entry_type_taxonomy_sync.py --  (follow-up to ).
 
 g-306-11 added the optional reasoning-bank `entry_type` taxonomy across the
 dual-mirror RB validators: the CLI (core/scripts/reasoning-bank.py) and the

@@ -411,7 +411,7 @@ def build_trajectory(asp_id, shared=None):
     velocity_window = config.get("velocity_window", 5)
     current_velocity = compute_learning_velocity(goal_artifacts, velocity_window)
     inflection_points = detect_inflection_points(goal_artifacts)
-    # Record-level exemption (7): maintenance-scope queues (recurring
+    # Record-level exemption (): maintenance-scope queues (recurring
     # upkeep aspirations) legitimately run at ~0 learning velocity — that is
     # their normal operating point, not a stalled learning direction. An
     # aspiration carrying plateau_exempt: true suppresses BOTH flags so evolve

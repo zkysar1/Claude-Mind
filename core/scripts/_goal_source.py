@@ -38,10 +38,14 @@ def infer(origin_signal):
         return "recurring-cycle"
     if sig.startswith(("failing_test:", "resolved_hypothesis:",
                        "low_confidence_node:", "drift_detected:", "monitor:",
-                       # automated detection-driven filers (0) — kept
+                       # automated detection-driven filers () — kept
                        # locked with ALLOWED_PREFIXES in gates/origin_signal.py
                        "alert-email:", "routing-mismatch:",
-                       "routing-either-resolve:", "insight_trigger:")):
+                       "routing-either-resolve:", "insight_trigger:",
+                       # second reconciliation () — same lane, found
+                       # by diffing prescribed SKILL.md literals against
+                       # ALLOWED_PREFIXES; both are automated sweeps
+                       "skill-discovery-audit:", "blocker_pattern:")):
         return "cycle-detector"
     if sig == "idle_fallback" or sig.startswith((
             "decomposition:", "parent_aspiration:", "unblock:",

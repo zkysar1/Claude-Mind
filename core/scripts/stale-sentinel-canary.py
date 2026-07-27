@@ -59,6 +59,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -76,7 +77,7 @@ try:
 except Exception:
     sys.exit(0)
 
-# Registry-derived (3): _sentinel_registry.py is the single source of
+# Registry-derived (): _sentinel_registry.py is the single source of
 # truth shared with precheck-sentinel-battery.py. canary_tracked_slots()
 # yields exactly the four slots previously hardcoded here (force_tree_maintain,
 # fresh_eyes_dispatch_pending, force_metric_encoding_pending + the
@@ -96,26 +97,26 @@ CANARY_SLOT = "stale_sentinel_canary"
 # names a real aspiration.
 ASP_ID = "asp-115"
 DEFAULT_THRESHOLD = 3
-# Re-file suppression window (4). The stuck condition this canary
+# Re-file suppression window (). The stuck condition this canary
 # detects is INTERMITTENT (consumer-skip across a compact/stop boundary), so a
 # genuinely-stuck sentinel re-trips the count every few iterations. Without
 # dedup the canary filed a byte-identical Investigate on EACH fire — three
 # identical `investigate:stale-sentinel-canary:force_tree_maintain` goals
-# (5 06-24, 9 06-25, 4 06-29) polluted the queue,
+# ( 06-24,  06-25,  06-29) polluted the queue,
 # the last ranking #1 in the selector at score 11.13 and displacing real work.
 # `_recent_investigate_exists` suppresses a re-file when an OPEN (pending/
 # in-progress) OR recently-filed (< DEDUP_HOURS) identical-origin_signal
 # Investigate already exists — the rb-428 sweep-family idempotency posture every
 # OTHER filer in this family already has, mirroring the sibling
 # streak-break-reflector._recent_investigate_exists. 168h (7d) because the
-# observed re-file gap was ~96h (9 -> 4); 48h (the
+# observed re-file gap was ~96h ( -> ); 48h (the
 # streak-break value) would not have caught it. The post-fire counter reset is
 # unchanged, so a still-stuck sentinel re-trips and re-checks dedup every
 # `threshold` runs (self-correcting: a persisting problem re-alerts once the
 # cooldown lapses).
 DEDUP_HOURS = 168
 
-# Consumption-aware sentinels (3). Bare presence-count (_is_set)
+# Consumption-aware sentinels (). Bare presence-count (_is_set)
 # false-fires for a sentinel whose WRITER re-arms it every iteration while
 # the CONSUMER keeps up: the count then measures consecutive-writer-arms
 # (e.g. consecutive substantive deep closes), NOT consumer-bypass. The
@@ -134,10 +135,10 @@ DEDUP_HOURS = 168
 # in-iteration iteration-close-digest item-7 path) stamps the dispatch slot
 # on ANY handling — dispatch OR a justified no-dispatch clear (e.g. files
 # were partner-attributed). Maps sentinel -> consumer dispatch slot.
-# Registry-derived (3): {slot: dispatch_slot} for every canary-tracked
+# Registry-derived (): {slot: dispatch_slot} for every canary-tracked
 # slot carrying a dispatch stamp — currently fresh_eyes_dispatch_pending
-# (3), force_tree_maintain (9), force_metric_encoding_pending
-# (6). All three share the identical false-fire shape those goals
+# (), force_tree_maintain (), force_metric_encoding_pending
+# (). All three share the identical false-fire shape those goals
 # fixed: the writer re-arms the sentinel in iteration-close do_state_update
 # (Phase 8) and the canary samples in do_productivity_check (Phase 12, SAME
 # close, AFTER the arm), BEFORE the next iteration's precheck consumer clears
@@ -159,7 +160,7 @@ def _now_iso() -> str:
 
 
 def _is_set(value) -> bool:
-    """Registry-shared set-semantics (3) — see _sentinel_registry.is_set.
+    """Registry-shared set-semantics () — see _sentinel_registry.is_set.
 
     Moved verbatim to the registry so the battery and this canary can never
     diverge on what counts as "set". This alias keeps every internal call
@@ -186,7 +187,7 @@ def _read_threshold(override: int | None) -> int:
 
 
 def _recent_investigate_exists(sentinel: str, since_hours: int = DEDUP_HOURS) -> bool:
-    """Suppress a duplicate canary Investigate (4).
+    """Suppress a duplicate canary Investigate ().
 
     Returns True (suppress the file) when the world+agent queues already hold an
     Investigate with origin_signal ``investigate:stale-sentinel-canary:<sentinel>``
@@ -253,9 +254,10 @@ def _file_investigate(sentinel: str, stuck: int, dry_run: bool) -> dict:
     resolve the script — passing Windows-form ``C:\\...`` paths through
     subprocess gets backslashes interpreted as escapes by bash.
     """
+    filer = os.environ.get("MIND_AGENT") or "<see filed_by_agent>"
     title = (
-        f"Investigate: stale sentinel {sentinel} set for {stuck} iterations "
-        "— consumer SKILL likely bypassed"
+        f"Investigate: stale sentinel {sentinel} (filed by {filer}) set for "
+        f"{stuck} iterations — consumer SKILL likely bypassed"
     )
     description = (
         f"The {sentinel} sentinel has been set in working memory for {stuck} "
@@ -263,12 +265,21 @@ def _file_investigate(sentinel: str, stuck: int, dry_run: bool) -> dict:
         f"consumer SKILL (aspirations-precheck Phase 0-pre/0-pre2/0-pre3/"
         f"0-pre4 or aspirations-state-update Step 8) likely failed to fire "
         f"mid-iteration (graceful-stop interruption, compact recovery, LLM "
-        f"omission). Investigate: (1) read the sentinel via "
-        f"`wm-read.sh {sentinel} --json` to capture the payload; (2) identify "
-        f"the consumer SKILL phase responsible for clearing it (see canary "
-        f"source for the writer/consumer pairs); (3) determine why the "
-        f"consumer hasn't fired in this run; (4) either clear the sentinel "
-        f"manually (`echo 'null' | wm-set.sh {sentinel}`) if the consumer's "
+        f"omission). CROSS-AGENT TRIAGE (rb-5069): this canary fires "
+        f"PER-AGENT but files into the SHARED world queue, so triage the "
+        f"FILING agent's WM (filed_by_agent={filer}), NOT your own — a "
+        f"stale value in a different agent's WM is not this goal's subject. "
+        f"Investigate: (1) read the sentinel in {filer}'s WM via "
+        f"`MIND_AGENT={filer} wm-read.sh {sentinel} --json` to capture the "
+        f"payload; (2) check whether the sentinel's dispatch_slot (from "
+        f"_sentinel_registry.py, for consumption-aware sentinels) advanced "
+        f"since this goal was filed — if it advanced, the consumer DID fire "
+        f"and the episode self-resolved (close benign); only a STILL-set "
+        f"sentinel with a frozen dispatch is a genuine stuck condition; "
+        f"(3) identify the consumer SKILL phase responsible for clearing it "
+        f"(see canary source for the writer/consumer pairs) and why it "
+        f"hasn't fired; (4) either clear the sentinel manually (`echo 'null' "
+        f"| MIND_AGENT={filer} wm-set.sh {sentinel}`) if the consumer's "
         f"action has already been taken, or trigger the consumer phase "
         f"explicitly. Filed by stale-sentinel-canary; threshold "
         f"`stale_sentinel.threshold_iterations` controls sensitivity."
@@ -311,7 +322,7 @@ def _file_investigate(sentinel: str, stuck: int, dry_run: bool) -> dict:
         result = _run_add([])
     except Exception as exc:
         return {"error": "subprocess_failed", "detail": str(exc)}
-    # 4: the goal-duplication gate's prose-overlap heuristic
+    # : the goal-duplication gate's prose-overlap heuristic
     # false-positives on canary Investigates BY CONSTRUCTION — a stale-sentinel
     # Investigate shares vocabulary ("stale sentinel", the sentinel name, the
     # consumer-phase names) with any recently-completed goal about the same
@@ -403,7 +414,7 @@ def run(threshold: int, dry_run: bool) -> dict:
             }
 
             if sentinel in CONSUMPTION_AWARE and is_set:
-                # Consumption-aware (3): count toward stuck only
+                # Consumption-aware (): count toward stuck only
                 # while the consumer's dispatch timestamp stays FROZEN. A
                 # writer re-arm with the consumer keeping up advances the
                 # dispatch slot, which resets the count — distinguishing
@@ -457,7 +468,7 @@ def run(threshold: int, dry_run: bool) -> dict:
     # WM access during validation. Counters are already persisted with the
     # post-fire reset; if filing fails the next iteration starts fresh.
     for sentinel, stuck in fired_records:
-        # Dedup (4): on the LIVE filing path, suppress a re-file when an
+        # Dedup (): on the LIVE filing path, suppress a re-file when an
         # OPEN or recently-filed identical-origin_signal Investigate already
         # exists. The counter was already reset post-fire, so a still-stuck
         # sentinel re-trips and re-checks dedup every `threshold` runs

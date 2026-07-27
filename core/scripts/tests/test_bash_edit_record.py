@@ -93,7 +93,7 @@ def _setup_repo(tmp: Path, agents=("alpha", "zeta")) -> Path:
     # host where `py` is itself an `exec python3` wrapper (e.g. this Linux box's
     # /usr/local/bin/py), a `python3->py -3` shim plus a `py -3->python3` wrapper
     # form an infinite mutual recursion once the shim dir is on PATH — the record
-    # script hangs and the subprocess times out (6). sys.executable is an
+    # script hangs and the subprocess times out (). sys.executable is an
     # absolute path, so there is no PATH re-resolution and no loop; it is also the
     # correct working interpreter on Windows (bypasses the Store stub).
     shim_dir = core_scripts / ".python-shim"

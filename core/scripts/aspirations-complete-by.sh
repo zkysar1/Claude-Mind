@@ -61,6 +61,11 @@ source "$CORE_ROOT/scripts/_runtime.sh"
 QUERY="goal_id=$(rt_url_encode "$GOAL_ID")&source=$(rt_url_encode "$SOURCE_VAL")"
 [ -n "$AGENT_VAL" ] && QUERY="${QUERY}&agent_name=$(rt_url_encode "$AGENT_VAL")"
 [ -n "$KEY_FINDING" ] && QUERY="${QUERY}&key_finding=$(rt_url_encode "$KEY_FINDING")"
+# Session identity ( outcome 5) — see aspirations-release.sh for why
+# this is load-bearing rather than cosmetic. Best-effort; omitted when unset.
+if [ -n "${MIND_SID:-}" ]; then
+    QUERY="${QUERY}&sid=$(rt_url_encode "$MIND_SID")"
+fi
 
 rc=0
 RESPONSE="$(rt_call POST /v1/aspirations/complete-by \

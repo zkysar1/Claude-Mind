@@ -89,7 +89,7 @@ def _setup_repo(tmpdir: Path, agents=("alpha", "zeta")) -> Path:
     core_scripts = repo / "core" / "scripts"
     core_scripts.mkdir(parents=True)
     (core_scripts / ".gitkeep").write_text("")
-    # 3: the own-log () and partner-log () snapshots
+    # : the own-log () and partner-log () snapshots
     # import _normalize_rel_path from $REPO/core/scripts/_cross_agent_attribution
     # _filter.py (which pulls _stdio). Copy both into the temp repo so the harness
     # exercises the REAL normalization instead of the import's fail-open identity
@@ -101,7 +101,7 @@ def _setup_repo(tmpdir: Path, agents=("alpha", "zeta")) -> Path:
     # Match production: __pycache__ is gitignored. Without this, the
     # py-normalization subprocess that compiles the copied helper modules above
     # leaves an untracked core/scripts/__pycache__/ that git-status surfaces as
-    # a staged neutral-path artifact — which the 6 over-inclusion audit
+    # a staged neutral-path artifact — which the  over-inclusion audit
     # then (correctly) flags, polluting the audit-silent assertion.
     (repo / ".gitignore").write_text("__pycache__/\n")
     subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
@@ -572,11 +572,11 @@ def test_g115828_own_log_does_not_exempt_unrelated_path():
 
 
 # ---------------------------------------------------------------------------
-# 3 — own-log path-normalization symmetry (over-exclusion fix)
+#  — own-log path-normalization symmetry (over-exclusion fix)
 #
 # The  own-log exemption snapshot did raw `print(fp)` with NO
 # _normalize_rel_path, while the  partner-log snapshot DID normalize
-# (0). uncommitted-edits.jsonl demonstrably holds BOTH relative AND
+# (). uncommitted-edits.jsonl demonstrably holds BOTH relative AND
 # absolute (legacy C:/...) `file` entries. So an ABSOLUTE own-log entry keyed
 # committer_authored_paths by the absolute string, while the git-status
 # candidate `$path` is repo-relative — the membership check missed, the
@@ -589,7 +589,7 @@ def test_g115828_own_log_does_not_exempt_unrelated_path():
 
 
 def test_g1151413_absolute_own_log_entry_still_exempts():
-    """3: an own-log entry stored in ABSOLUTE (Windows-drive) form —
+    """: an own-log entry stored in ABSOLUTE (Windows-drive) form —
     the legacy shape proven to coexist in real uncommitted-edits.jsonl files
     (g-115-1180) — must STILL grant the g-115-828 first-person-authorship
     exemption. Pre-fix the own-log snapshot did not normalize, so the absolute
@@ -732,7 +732,7 @@ def test_g115697_partner_uncommitted_log_filters_after_in_flight_cleared():
 
 
 def test_g1151620_partner_log_exempts_own_authored_double_recorded_path():
-    """0 REVERSAL of the prior  default (this test replaces
+    """ REVERSAL of the prior  default (this test replaces
     test_g115697_partner_log_does_not_exempt_own_authored_path): when a contested
     neutral path is recorded in BOTH the committer's OWN uncommitted-edits.jsonl
     AND a partner's log (the g-115-695 double-recording overlap), the committer's
@@ -781,7 +781,7 @@ def test_g1151620_partner_log_exempts_own_authored_double_recorded_path():
         os.utime(target, (edit_epoch, edit_epoch))
 
         # Both alpha's own log AND zeta's partner log record the same path.
-        # 0: the own-log presence now exempts the contested path from
+        # : the own-log presence now exempts the contested path from
         # the partner-log drop (first-person authorship overrides).
         _seed_own_uncommitted_log(repo, "alpha", ["core/scripts/contested-1620.py"])
         _seed_partner_uncommitted_log(repo, "zeta", ["core/scripts/contested-1620.py"])
@@ -802,7 +802,7 @@ def test_g1151620_partner_log_exempts_own_authored_double_recorded_path():
 
 
 # ---------------------------------------------------------------------------
-# 6 — over-inclusion AUDIT (detection-only)
+#  — over-inclusion AUDIT (detection-only)
 #
 # The attribution filters above are a DENYLIST: a neutral-path file is staged
 # unless a partner signal fires. An ORPHAN — a partner's uncommitted shared-
@@ -812,23 +812,23 @@ def test_g1151620_partner_log_exempts_own_authored_double_recorded_path():
 # test_concurrent_partner_no_partner_in_flight_file_included pins that an own
 # unlogged neutral file MUST stage, so an orphan cannot be auto-dropped without
 # over-excluding legitimate own work. Staging-time PREVENTION is therefore
-# impossible; the 6 audit makes the residual over-inclusion VISIBLE +
+# impossible; the  audit makes the residual over-inclusion VISIBLE +
 # post-hoc-correctable instead of silently swept under the committing goal_id
 # (the  deep auto-override path). A flagged file is EITHER a recording
 # gap (own edit missing from the own-log) OR a mis-attributed partner orphan —
-# both actionable. Deny-vs-allow-list contract: 2.
+# both actionable. Deny-vs-allow-list contract: .
 #
 # The audit gates on OUTCOME==deep (the only path that bulk-stages neutral
 # files under one goal_id while bypassing the uncommitted-work-gate) and keys
 # the per-file flag on absence from committer_authored_paths — the SAME own-log
 # SSOT the  exemption uses, so attribution is consistent across the
 # retain-side (Filter 2 exemption) and the detect-side (this audit).
-# Marker: `AUDIT (6 over-inclusion)`.
+# Marker: `AUDIT ( over-inclusion)`.
 # ---------------------------------------------------------------------------
 
 
 def test_g1151426_over_inclusion_audit_flags_unattributed_not_attributed():
-    """6 (both branches in one scenario): under a deep outcome with
+    """ (both branches in one scenario): under a deep outcome with
     partner in_flight=null, two neutral-path files reach staging. One is
     recorded in alpha's OWN uncommitted-edits.jsonl (attributed) -> must NOT be
     flagged. The other is in NO own-log (orphan OR recording gap) -> MUST be
@@ -918,7 +918,7 @@ def test_g1151426_audit_silent_when_all_neutral_attributed():
 
 
 def test_g1151498_prestaged_foreign_not_swept_by_pathspec_commit():
-    """8: a file PRE-STAGED in the shared index but EXCLUDED from this
+    """: a file PRE-STAGED in the shared index but EXCLUDED from this
     committer's staged_files[] (here via the namespace filter -- agents/zeta/)
     must NOT be swept into the committer's real commit. The cross-agent filters
     gate what iteration-commit `git add`s, but a bare whole-index `git commit`

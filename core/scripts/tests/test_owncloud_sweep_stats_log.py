@@ -1,4 +1,4 @@
-"""test_owncloud_sweep_stats_log.py — sweep-outcome telemetry sink (8).
+"""test_owncloud_sweep_stats_log.py — sweep-outcome telemetry sink ().
 
 The union-lane counters (pushed_merged / diverged_merged / nobaseline_merged)
 were in-memory per-run and stdout-transient: during the
@@ -28,6 +28,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 CORE_SCRIPTS = SCRIPT_DIR.parent
 sys.path.insert(0, str(CORE_SCRIPTS))
@@ -40,6 +42,17 @@ def _read_lines(p: Path):
         return []
     return [json.loads(ln) for ln in p.read_text(encoding="utf-8").splitlines()
             if ln.strip()]
+
+
+@pytest.fixture(autouse=True)
+def _redirect_merge_events_log(tmp_path, monkeypatch):
+    """: _try_merge_put now appends a durable merge-event line via
+    _persist_merge_event on every successful union merge. Redirect that write
+    into tmp so no test in this module touches the real
+    mind_api/state/owncloud-merge-events.jsonl."""
+    monkeypatch.setattr(
+        owncloud_sync, "_merge_events_path",
+        lambda: tmp_path / "owncloud-merge-events.jsonl")
 
 
 def test_interesting_stats_written(tmp_path, monkeypatch):
@@ -136,6 +149,43 @@ def test_try_merge_put_records_merge_event(tmp_path):
     assert stats["nobaseline_merged"] == 1
     assert stats["merge_events"] == [
         {"file": str(target), "lane": "nobaseline_merged"}]
+
+
+def test_try_merge_put_persists_durable_event(tmp_path):
+    """: a merge SUCCESS also appends a durable {ts,file,lane,md5}
+    JSON line to _merge_events_path() (the mind_api/state tier), so a
+    pushed/diverged/nobaseline merge stays observable post-hoc after the
+    in-memory stats['merge_events'] list dies with the sweep. The autouse
+    fixture points _merge_events_path at tmp."""
+    import hashlib
+    target = tmp_path / "gate-firings.jsonl"      # merge-registered by basename
+    target.write_text('{"a": 1}\n', encoding="utf-8")
+    stats = {"errors": 0}
+    owncloud_sync._try_merge_put(
+        _StubBackend(), target, target.read_bytes(), stats,
+        counter="diverged_merged")
+    durable = _read_lines(owncloud_sync._merge_events_path())
+    assert len(durable) == 1, "one durable line per merge success"
+    rec = durable[0]
+    assert rec["file"] == str(target)
+    assert rec["lane"] == "diverged_merged"
+    assert rec["ts"][:2] == "20"                  # ISO timestamp present
+    assert rec["md5"] == hashlib.md5(target.read_bytes()).hexdigest()
+
+
+def test_persist_merge_event_fail_open(tmp_path, monkeypatch, capsys):
+    """: a durable-log write failure must NEVER break the merge/push
+    path — mirrors _log_sweep_stats fail-open (test_fail_open_on_unwritable_sink).
+    Parent is a FILE, so mkdir raises inside the helper and is swallowed."""
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("file, not dir", encoding="utf-8")
+    monkeypatch.setattr(
+        owncloud_sync, "_merge_events_path",
+        lambda: blocker / "sub" / "owncloud-merge-events.jsonl")
+    owncloud_sync._persist_merge_event(           # must not raise
+        {"ts": "2026-07-23T00:00:00", "file": "x", "lane": "pushed_merged",
+         "md5": None})
+    assert "merge-events persist failed" in capsys.readouterr().err
 
 
 if __name__ == "__main__":

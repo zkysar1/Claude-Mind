@@ -52,7 +52,7 @@ import yaml
 
 from ..agent_paths import assert_not_cruft
 
-from _competence import refresh_competence_for_gates  # noqa: E402  # SSOT, 6
+from _competence import refresh_competence_for_gates  # noqa: E402  # SSOT, 
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +251,7 @@ def _evaluate_gate(gate, agent_dir, project_root, world_dir=None, agent_name=Non
         operator = gate.get("operator", ">=")
         threshold = gate.get("threshold", 0)
         current_value = _count_matching_jsonl(agent_dir, file_rel, field, value)
-        # Cross-queue graduation counting (0): opt-in; daemon mirror of
+        # Cross-queue graduation counting (): opt-in; daemon mirror of
         # core/scripts/curriculum.py. Unchanged unless the gate sets cross_queue.
         if gate.get("cross_queue") and world_dir is not None and agent_name:
             current_value += _count_world_attributed(world_dir, field, value, agent_name)
@@ -398,7 +398,7 @@ def evaluate(ctx) -> "Response":  # type: ignore[name-defined]
         }, indent=None)
 
     # Refresh the competence metric BEFORE evaluating (producer wiring,
-    # 6) — mirrors core/scripts/curriculum.py cmd_evaluate. Fail-open:
+    # ) — mirrors core/scripts/curriculum.py cmd_evaluate. Fail-open:
     # on refresh failure the stored value is used (pre-wiring behavior).
     competence_refresh = refresh_competence_for_gates(
         gates, Path(ctx.paths.world), agent_dir)
@@ -427,7 +427,7 @@ def evaluate(ctx) -> "Response":  # type: ignore[name-defined]
 
     # next_stage = the promotion target (next stage by list order), independent
     # of whether gates pass. Emitted for parity with the `status` endpoint
-    # (which computes it the same way) — the omission here caused 3's
+    # (which computes it the same way) — the omission here caused 's
     # misdiagnosis (curriculum-evaluate showed no next_stage, misread as a
     # broken promotion path, when the path via status()+promote() was intact).
     next_stage = (

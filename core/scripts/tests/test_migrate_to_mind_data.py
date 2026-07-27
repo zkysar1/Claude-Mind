@@ -1,4 +1,4 @@
-"""test_migrate_to_mind_data.py - 6 durable regression guard for
+"""test_migrate_to_mind_data.py -  durable regression guard for
 core/scripts/migrate-to-mind-data.sh (asp-330 M4 / g-330-04).
 
 Replaces the throwaway isolated test (8/8 mechanics + real _paths._resolve_tier)

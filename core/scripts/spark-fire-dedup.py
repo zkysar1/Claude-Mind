@@ -53,7 +53,7 @@ import sys
 from datetime import datetime, timedelta
 
 SLOT = "spark_fired_session"  # documented here for callers; this script is slot-agnostic
-# Consumption-based dedup (4 / rb-1674): the PRIMARY path compares the
+# Consumption-based dedup ( / rb-1674): the PRIMARY path compares the
 # recorded fire time against the sentinel's set_at (passed via --sentinel-set-at).
 # DEFAULT_WINDOW_MIN is now only the FALLBACK for callers that cannot supply a
 # set_at; it is aligned to the sentinel's 60-min TTL (Phase -0.5c.2 expires
@@ -75,10 +75,19 @@ DEFAULT_PRUNE_MIN = 90
 # read a proactive fire as a PRIOR-close fire and false-fired the spark next
 # iteration. MAX_BG_CLOSE_DURATION_MIN widens the consumption window's LOWER
 # bound by this much so a proactive fire still counts as THIS close's
-# consumption. 10 covers the observed 6m11s with margin and stays well under any
-# recurring interval (hours), so it never suppresses a genuine SECOND deep-close
-# of the same goal.
-MAX_BG_CLOSE_DURATION_MIN = 10
+# consumption.
+# : widened 10 -> 15. The NON-recurring producer (iteration-close.sh
+# do_state_update, ) writes set_at at Phase 8, but the in-turn Phase-6
+# spark fires earlier at Phase 6, so the lower bound must cover the whole
+# Phase-6 -> Phase-8 execution gap. A slow post-compaction resume with heavy
+# between-phase reasoning inflated that gap to 10m08s (fire 23:03:24 vs set_at
+# 23:13:32, ), 8s past the old 10-min bound -> false re-fire (caught
+# manually, no double-spark). 15 covers that with ~5min margin. Safe in BOTH
+# directions: a NON-recurring goal closes exactly ONCE, so there is no genuine
+# second close to suppress (the lower bound is purely a recurring-goal concern),
+# and recurring intervals are hours (>> 15min), so widening never suppresses a
+# genuine SECOND deep-close of a recurring goal either.
+MAX_BG_CLOSE_DURATION_MIN = 15
 
 
 def _parse_dt(value):
@@ -112,7 +121,7 @@ def recently_fired(fired_map, goal_id, now, window_minutes=DEFAULT_WINDOW_MIN):
 def fired_in_consumption_window(fired_map, goal_id, set_at,
                                 lookback_minutes=MAX_BG_CLOSE_DURATION_MIN,
                                 lookahead_minutes=DEFAULT_WINDOW_MIN):
-    """Consumption-based dedup (4 / rb-1674; window widened by
+    """Consumption-based dedup ( / rb-1674; window widened by
     g-306-80 / rb-2615). True iff goal_id was recorded within the consumption
     window [set_at - lookback_minutes, set_at + lookahead_minutes] bracketing
     the sentinel's creation time `set_at`.
@@ -195,7 +204,7 @@ def cmd_check(args):
     fired = _read_stdin_map()
     set_at = _parse_dt(getattr(args, "sentinel_set_at", None))
     if set_at is not None:
-        # PRIMARY path (4): consumption-based — is the recorded fire
+        # PRIMARY path (): consumption-based — is the recorded fire
         # inside THIS sentinel's consumption window? The window brackets set_at
         # on both sides (): [set_at - MAX_BG_CLOSE_DURATION_MIN,
         # set_at + TTL], so a proactive fire that lands just BEFORE set_at still

@@ -1,4 +1,4 @@
-"""Verdict-logic tests for _claim_liveness.py (3, guard-1151 Layer B).
+"""Verdict-logic tests for _claim_liveness.py (, guard-1151 Layer B).
 
 The wrapper claim-liveness-check.sh maps: LIVE/INDETERMINATE -> exit 0
 (fail-open), STALE -> exit 1. These tests pin the pure classification —

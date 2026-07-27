@@ -158,7 +158,7 @@ def test_compute_meta_evidence_pct(funcs):
     compute_meta = funcs[2]
     live = [
         {"stage": "resolved", "outcome": "CONFIRMED",
-         "outcome_detail": "confirmed via 4"},          # has evidence
+         "outcome_detail": "confirmed via "},          # has evidence
         {"stage": "resolved", "outcome": "CORRECTED",
          "outcome_detail": "wrong, but no pointer here"},        # no evidence
         {"stage": "resolved", "outcome": "EXPIRED",
@@ -195,7 +195,7 @@ def test_detector_parity(label, rec):
 
 
 # ---------------------------------------------------------------------------
-# normalize_record rename value-drop (7)
+# normalize_record rename value-drop ()
 #
 # DEFAULT_FIELDS pre-seeds surprise=None on every record. When a record reaches
 # normalize carrying BOTH surprise_level (a real value) and surprise=None, the
