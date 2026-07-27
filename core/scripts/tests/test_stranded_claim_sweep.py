@@ -684,15 +684,28 @@ def _phase_4_block_lines() -> List[str]:
 
 def test_digest_writes_phase_start_after_claim():
     """phase-start phase-4-execute MUST appear after aspirations-claim.sh in
-    the digest's Phase 4 block (g-115-1371 / rb-1533 regression guard)."""
+    the digest's Phase 4 block (g-115-1371 / rb-1533 regression guard).
+
+    Counts the CALL line only, never a comment that merely names the script
+    (g-115-3387, 2026-07-27). The precondition was a bare substring match, so
+    prose ABOUT the call counted as another call: g-115-3199 added two
+    annotations to this block ("# REDUNDANT -- aspirations-claim.sh
+    `_post_claim_effects` stamps ...", "# LOAD-BEARING: agent-queue goals never
+    invoke aspirations-claim.sh") and the count went 1 -> 3. The guard's real
+    subject -- one call, ordered before phase-start -- was never violated:
+    measured call at block-line 28, phase-start at 55. Documenting a call must
+    not read as adding one, or the guard punishes the comments that explain it.
+    """
     block = _phase_4_block_lines()
-    claim_idxs = [i for i, ln in enumerate(block) if "aspirations-claim.sh" in ln]
+    claim_idxs = [i for i, ln in enumerate(block)
+                  if "aspirations-claim.sh" in ln
+                  and not ln.lstrip().startswith("#")]
     start_idxs = [i for i, ln in enumerate(block)
                   if "phase-start phase-4-execute" in ln]
 
     assert len(claim_idxs) == 1, (
-        f"expected exactly one aspirations-claim.sh line in the Phase 4 block, "
-        f"got {len(claim_idxs)}")
+        f"expected exactly one aspirations-claim.sh CALL line (comment mentions "
+        f"excluded) in the Phase 4 block, got {len(claim_idxs)}")
     assert len(start_idxs) == 1, (
         f"expected exactly one `phase-start phase-4-execute` line in the Phase 4 "
         f"block, got {len(start_idxs)}")

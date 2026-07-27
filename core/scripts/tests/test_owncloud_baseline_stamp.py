@@ -31,7 +31,7 @@ from pathlib import Path
 import pytest
 
 moto = pytest.importorskip("moto")
-import   # noqa: E402
+import boto3  # noqa: E402
 from moto import mock_aws  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]

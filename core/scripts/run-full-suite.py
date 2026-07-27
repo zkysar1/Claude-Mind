@@ -210,6 +210,27 @@ def classify(text, failed, chunks=None):
             reasons.append(
                 "chunk %02d stopped at %d%% -- it never finished, so the totals "
                 "are missing its tests" % (i, tally[3] if tally else 0))
+        elif _progress_tally(chunk) is None and not re.search(
+                r"\d+\s+(passed|failed)\b", chunk):
+            # SILENT-ZERO CHUNK (, 2026-07-27). _looks_aborted returns
+            # False when there is NO progress output at all -- `if not tally:
+            # return False` -- so a chunk whose log is empty, truncated, or
+            # corrupted contributes 0 tests AND is judged fine, and the run is
+            # certified trustworthy. That is the same laundering the docstring
+            # above forbids, reached through the opposite door: not "stopped
+            # early" but "left no evidence it ran at all".
+            #
+            # MEASURED: chunk 02 of a 4-chunk run reported "0 passed, 0 failed"
+            # and the run still printed "GENUINE -- trustworthy" on a 4290-test
+            # total against a ~5969 baseline. Re-parsing that same log
+            # afterwards returned (432, 0, 0), and its mtime was LATER than the
+            # next chunk's despite chunks running sequentially -- the file was
+            # rewritten after the runner read it (the temp dir is cloud-synced;
+            # the log had 1532 NUL bytes). Whatever the cause, a chunk of 139
+            # files yielding no parseable output is never a clean result.
+            reasons.append(
+                "chunk %02d produced no parseable test output -- its tests are "
+                "missing from the totals (log empty, truncated, or corrupted)" % i)
     for marker in CONTENTION_MARKERS:
         if marker in text:
             reasons.append("resource-exhaustion marker present: %s" % marker)
