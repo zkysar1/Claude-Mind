@@ -13,6 +13,12 @@ import os
 import subprocess
 from pathlib import Path
 
+import sys
+import pathlib
+# guard-580: resolve bash explicitly — a bare 'bash' argv[0] hits System32 WSL on win32.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _bash_helpers import BASH  # noqa: E402
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 BASH_SUITE = REPO_ROOT / "core" / "scripts" / "tests" / "test-infra-streak-dedup.sh"
 
@@ -26,7 +32,7 @@ def test_infra_streak_dedup_bash_suite():
     env["STORAGE_BACKEND"] = "local"
     env.setdefault("MIND_AGENT", "testagent")
     proc = subprocess.run(
-        ["bash", str(BASH_SUITE)],
+        [BASH, str(BASH_SUITE)],
         capture_output=True,
         text=True,
         timeout=240,

@@ -29,17 +29,40 @@ probe `git branch -r --contains <sha>`:
   - SHA exists locally but on NO remote -> committed-but-not-pushed  -> FLAG
   - SHA is not a valid commit anywhere  -> claimed commit missing     -> FLAG
 The two FLAG classes are exactly the completed!=committed failure the goal
-targets. A clean origin-landing is proof the deliverable shipped.
+targets.
 
---apply files ONE dedup'd Investigate per flagged goal
-(origin_signal="investigate:completed-not-committed-<goal-id>"), routed to
-asp-115 (framework hygiene). Without --apply it is report-only (dry run).
+TIER 2 — STRANDED ON AN UNMERGED BRANCH (g-115-3471). `git branch -r --contains`
+is satisfied by ANY remote branch, so tier 1's "landed" verdict was ALSO true of
+work pushed to a feature branch whose pull request was then never merged. That
+made a real false negative in a live gate: on 2026-07-23 a fleet-wide run
+reported "0 flagged — every completed goal's work landed in git/origin" while
+the oldest of eleven open Lodestar pull requests had been unmerged for eight
+days. A gate that is merely absent emits no signal; this one emitted a positive
+all-clear for work no user could see, and nothing downstream re-checks a goal
+the sweep already blessed. So tier 2 re-examines exactly the goals tier 1
+cleared:
+  - landed SHA contained by the repo's DEFAULT branch  -> shipped, clean
+  - off default + an OPEN pull request >= --min-pr-age-hours -> stranded_open_pr
+  - off default + no open pull request                 -> stranded_no_pr (weaker)
+Tier 2 is conservative in the NO-FLAG direction, opposite to apply_superseded:
+an unresolvable default branch or an unreachable forge degrades to clean plus a
+stderr warning, never to a flag. Tier 1's all-clear is the loop's trust anchor,
+so a wrong tier-2 flag would cost more than a missed one.
 
-PURE CORE. `extract_commit_shas`, `is_code_deliverable`, and `classify_goal`
-are pure (no git, no daemon) — the git origin-status of each SHA is INJECTED
-as a dict, so the full eligibility ladder is unit-testable with synthetic
-goals and a synthetic probe map. main() is the only impure part (daemon read
-+ real git probe + Investigate filing).
+--apply files ONE dedup'd Investigate per flagged goal, routed to asp-115
+(framework hygiene). The two lanes dedup on separate origin_signal keys
+("investigate:completed-not-committed-<goal-id>" and
+"investigate:stranded-unmerged-<goal-id>") because they prescribe different
+remedies — push the commit vs merge the pull request. stranded_no_pr is
+report-only (a branch with no PR may still be live work). Without --apply the
+whole sweep is report-only (dry run).
+
+PURE CORE. `extract_commit_shas`, `is_code_deliverable`, `classify_goal`,
+`landed_shas`, and `classify_stranded` are pure (no git, no daemon, no forge) —
+the origin status, default-branch containment and pull-request record for each
+SHA are INJECTED as dicts, so the full eligibility ladder is unit-testable with
+synthetic goals and synthetic probe maps. main() is the only impure part
+(daemon read + real git/gh probes + Investigate filing).
 
 Sibling pattern (rb-428 detective-sweep family): defer-drift-check.py,
 unblock-parent-status-sweep.py, parent-supersession-sweep.py. Guards honored:
@@ -316,6 +339,190 @@ def classify_goal(goal, now, sha_status, min_age_minutes=30.0,
     }
 
 
+def landed_shas(goal, now, sha_status, goalid_status=None,
+                min_age_minutes=30.0, lookback_hours=168.0):
+    """For an ELIGIBLE completed code goal, return its SHAs that ARE on some
+    remote branch (sha_status True). Empty list when the goal is ineligible or
+    nothing landed. PURE. g-115-3471.
+
+    UNION of both attribution paths — the SHAs named in the record AND the ones
+    resolved from the goal-id in commit messages (rb-3999 loop commits embed
+    "(<goal-id>)", not a SHA) — deliberately NOT classify_goal's either/or. The
+    two lanes ask different questions and need different evidence. Tier 1 asks
+    "did anything land?", so the first landing settles it and a partial view is
+    harmless. Tier 2 asks "did everything reach the default branch?", where a
+    partial view produces a FALSE CLEAN: a multi-repo goal whose named commit
+    reached main in an unprotected repo while its other half waits on an open
+    PR scores clean under either/or. That is not hypothetical — it is g-335-190
+    (named 326bf09, on main; its Vinheim half 3b0b14ee sat on the branch of PR
+    #53, open 5 days), and it was invisible until this lane was measured against
+    the live estate rather than trusted. Dedup by set keeps the union honest
+    when a SHA is reachable both ways.
+
+    This lane is the exact complement of classify_goal: that function flags when
+    NOTHING landed, this one only looks at goals where something DID. The two are
+    mutually exclusive by construction and need no cross-dedup.
+    """
+    if goal.get("status") != "completed":
+        return []
+    if not is_code_deliverable(goal):
+        return []
+    completed_at = _parse_iso(goal.get("completed_at"))
+    if completed_at is None:
+        return []
+    age_minutes = (now - completed_at).total_seconds() / 60.0
+    if age_minutes < min_age_minutes or age_minutes > lookback_hours * 60.0:
+        return []
+    landed = [s for s in extract_commit_shas(goal)
+              if sha_status.get(s) is True]
+    seen = set(landed)
+    resolved = (goalid_status or {}).get(goal.get("id")) or {}
+    for s, st in resolved.items():
+        if st is True and s not in seen:
+            seen.add(s)
+            landed.append(s)
+    return landed
+
+
+def classify_stranded(goal, now, sha_status, default_status, pr_status,
+                      min_age_minutes=30.0, lookback_hours=168.0,
+                      min_pr_age_hours=24.0, goalid_status=None):
+    """Pure second-tier test: the goal's commit reached origin, but only on a
+    NON-DEFAULT branch. Returns a stranded entry or None. g-115-3471.
+
+    THE FALSE NEGATIVE THIS CLOSES. Tier 1 (classify_goal + probe_sha_origin)
+    decides "landed" by `git branch -r --contains`, which is satisfied by ANY
+    remote branch. So a deliverable pushed to a feature branch whose pull
+    request is then never merged scores LANDED and CLEAN — the sweep emits a
+    positive all-clear for work no user can see. Dated counter-example: on
+    2026-07-23 a fleet-wide run reported "0 flagged — every completed goal's
+    work landed in git/origin", while the oldest of eleven open Lodestar pull
+    requests had been unmerged for eight days. Every one of those commits was on
+    a remote branch, so tier 1 blessed all of them. A gate that is merely absent
+    emits no signal; this one manufactured confidence.
+
+    `default_status` is the INJECTED map {sha: True|False|None}:
+      True  -> contained by the repo's default branch (genuinely shipped)
+      False -> on a remote branch but NOT on the default branch
+      None  -> default branch could not be resolved (undeterminable)
+    `pr_status` is the INJECTED map {sha: {"state": ..., "number": ..., ...}}
+    where state is OPEN | CLOSED | MERGED | NONE | UNAVAILABLE.
+
+    CONSERVATIVE IN THE NO-FLAG DIRECTION, deliberately opposite to
+    apply_superseded. Tier 1 is the source of the loop's "clean sweep" signal,
+    so a wrong flag here degrades a trusted all-clear into noise. Therefore
+    None-status default resolution does NOT flag, and — per this goal's explicit
+    scope note — an UNAVAILABLE forge does NOT flag either: an unreachable API
+    must never turn a clean sweep into a flagged one. Both degrade to clean and
+    surface as warnings in the run report instead.
+
+    Two classes, matching the goal's guidance that they carry different weight:
+      stranded_open_pr -> commit off-default AND an open PR carries it, open at
+                          least min_pr_age_hours. STRONG: the work is finished,
+                          reviewed-or-not, and simply not merged. Investigate-filed.
+      stranded_no_pr   -> commit off-default with no open PR (none found, closed,
+                          or merged into a non-default base). WEAKER — could be a
+                          live working branch — so it is report-only, never filed.
+    A PR younger than min_pr_age_hours suppresses the entry entirely rather than
+    demoting it to stranded_no_pr: a freshly-opened PR is in flight, not stranded,
+    and the existing age-threshold discipline (no false positives inside the
+    normal settle window) is what keeps this sweep quiet enough to be trusted.
+    """
+    landed = landed_shas(goal, now, sha_status, goalid_status,
+                         min_age_minutes, lookback_hours)
+    if not landed:
+        return None  # tier-1's lane (nothing landed) or ineligible — not ours
+    off_default = [s for s in landed if default_status.get(s) is False]
+    if not off_default:
+        # On the default branch, or undeterminable. Either way the deliverable
+        # is not PROVABLY stranded — stay silent.
+        return None
+
+    # Pick the most informative PR record across the off-default SHAs: an open
+    # one if any, else whatever was found, so the report still names the PR that
+    # closed or merged elsewhere.
+    #
+    # A MISSING key defaults to UNAVAILABLE, never to {} (which would read as
+    # "no PR" and land the goal in stranded_no_pr). "Not probed" and "probe
+    # failed" are the same epistemic state, and only UNAVAILABLE suppresses.
+    # main() currently probes every off-default SHA so the key is always present,
+    # but the obvious future optimization — narrowing the gh probe set to bound
+    # network calls — would otherwise silently convert unprobed SHAs into report
+    # lines asserting a PR does not exist. Absence of a probe is not a negative
+    # result (verify-before-assuming rule 4).
+    records = [pr_status.get(s) or dict(_PR_UNAVAILABLE) for s in off_default]
+    if any(r.get("state") == "UNAVAILABLE" for r in records):
+        return None  # forge unreachable — never convert a clean sweep to a flag
+    open_prs = [r for r in records if r.get("state") == "OPEN"]
+    pr = None
+    if open_prs:
+        pr = open_prs[0]
+        created = _parse_iso(pr.get("created_at"))
+        pr_age_hours = (
+            (now - created).total_seconds() / 3600.0 if created else None)
+        # Unknown age suppresses, exactly like UNAVAILABLE. This is the only
+        # branch that produces a WRITE (--apply files an Investigate), so an
+        # unparseable created_at must not be the one input that walks past the
+        # age gate — "cannot confirm the PR is old enough" is not "the PR is old
+        # enough", and the whole lane is conservative in the no-flag direction.
+        if pr_age_hours is None or pr_age_hours < min_pr_age_hours:
+            return None  # in flight, or age unknown — not provably stranded
+        reason = "stranded_open_pr"
+    else:
+        pr = next((r for r in records if r.get("number")), None)
+        pr_age_hours = None
+        if pr:
+            created = _parse_iso(pr.get("created_at"))
+            if created:
+                pr_age_hours = (now - created).total_seconds() / 3600.0
+        reason = "stranded_no_pr"
+    # A multi-repo goal can be stranded on SEVERAL pull requests at once, and
+    # naming one sends the reader to half the remedy —  is stranded on
+    # BOTH Vinheim #54 and Zak-Code #129, and the first live report named only
+    # #54. Carry the rest disjointly rather than duplicating the primary.
+    other_prs = []
+    seen_numbers = {pr.get("number")} if pr else set()
+    for r in records:
+        n = r.get("number")
+        if n and n not in seen_numbers:
+            seen_numbers.add(n)
+            other_prs.append({"number": n, "state": r.get("state"),
+                              "url": r.get("url")})
+
+    # completed_at is guaranteed parseable here: landed_shas returns [] when it
+    # is None, and an empty landed list short-circuits above. Keep that coupling
+    # in mind before reordering — an unguarded None reaches this subtraction.
+    completed_at = _parse_iso(goal.get("completed_at"))
+    age_minutes = (now - completed_at).total_seconds() / 60.0
+    entry = {
+        "goal_id": goal.get("id"),
+        "source": goal.get("_source"),
+        "aspiration_id": goal.get("_aspiration_id"),
+        "completed_at": goal.get("completed_at"),
+        "age_hours": round(age_minutes / 60.0, 1),
+        "reason": reason,
+        "shas_off_default": off_default,
+        "resolved_via": (
+            "record-sha" if any(s in extract_commit_shas(goal)
+                                for s in off_default) else "goal-id"),
+        "title": (goal.get("title") or "")[:80],
+    }
+    if pr and pr.get("number"):
+        entry["pull_request"] = {
+            "number": pr.get("number"),
+            "state": pr.get("state"),
+            "url": pr.get("url"),
+            "title": (pr.get("title") or "")[:80],
+            "created_at": pr.get("created_at"),
+            "age_hours": (round(pr_age_hours, 1)
+                          if pr_age_hours is not None else None),
+        }
+    else:
+        entry["pull_request"] = None
+    entry["other_pull_requests"] = other_prs
+    return entry
+
+
 def apply_superseded(entry, superseded_status):
     """Mark a flagged committed_not_pushed entry benign_superseded when EVERY
     local-only SHA's changed files are already byte-identical in HEAD. PURE
@@ -468,6 +675,138 @@ def build_sha_status(goals, candidate_repos):
     return status
 
 
+def resolve_default_ref(repo):
+    """Remote-tracking ref of the repo's DEFAULT branch ("origin/main"), or None
+    when it cannot be resolved locally. Impure (git), no network, no mutation.
+
+    origin/HEAD is the authoritative pointer but is absent on some clones (shallow
+    / CI / `--no-tags`), so fall back to probing the two conventional names. A
+    None result deliberately makes classify_stranded stay silent for that repo
+    rather than guess a default branch — guessing wrong would flag every commit
+    in the repo as stranded."""
+    rc, out = _git(repo, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
+    ref = out.strip()
+    if rc == 0 and ref.startswith("refs/remotes/"):
+        return ref[len("refs/remotes/"):]
+    for cand in ("origin/main", "origin/master"):
+        rc2, _ = _git(repo, "rev-parse", "--verify", "--quiet", f"{cand}^{{commit}}")
+        if rc2 == 0:
+            return cand
+    return None
+
+
+def probe_sha_on_default(sha, candidate_repos, default_refs):
+    """True when SHA is contained by its repo's DEFAULT branch, False when it is
+    on a remote branch but not the default, None when undeterminable. Impure.
+    g-115-3471.
+
+    Uses the same `git branch -r --contains` command family as probe_sha_origin,
+    narrowed to the default ref via --list, so error (rc!=0) stays distinguishable
+    from a genuine negative (rc==0, empty stdout). `merge-base --is-ancestor`
+    would be equally exact but reports both "not an ancestor" and internal error
+    as a nonzero rc, which would silently turn a probe failure into a flag."""
+    for repo in candidate_repos:
+        rc, _ = _git(repo, "cat-file", "-e", f"{sha}^{{commit}}")
+        if rc != 0:
+            continue  # not in this repo
+        ref = default_refs.get(str(repo))
+        if not ref:
+            return None  # default branch unknown here — cannot judge
+        rc2, out = _git(repo, "branch", "-r", "--contains", sha, "--list", ref)
+        if rc2 != 0:
+            return None  # probe error — undeterminable, never a flag
+        return bool(out.strip())
+    return None  # not a real commit anywhere we can see
+
+
+def build_default_status(shas, candidate_repos, default_refs):
+    """Probe each SHA once for default-branch containment. {sha: True|False|None}.
+    Impure. g-115-3471."""
+    status = {}
+    for sha in shas:
+        if sha not in status:
+            status[sha] = probe_sha_on_default(sha, candidate_repos, default_refs)
+    return status
+
+
+def _gh(repo, *args, timeout=30):
+    """Run a gh command with cwd=repo; return (rc, stdout). Never raises — a
+    missing `gh` binary, an unauthenticated shell, or a non-GitHub remote all
+    surface as rc!=0, which callers map to UNAVAILABLE (never to a flag)."""
+    try:
+        r = subprocess.run(
+            ["gh", *args], cwd=str(repo),
+            capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout.strip()
+    except Exception:
+        return 1, ""
+
+
+_PR_UNAVAILABLE = {"state": "UNAVAILABLE", "number": None, "url": None,
+                   "title": None, "created_at": None}
+
+
+def probe_sha_pull_request(sha, candidate_repos):
+    """Resolve the pull request carrying SHA. Impure (forge API via `gh`).
+    Returns a record whose "state" is OPEN | CLOSED | MERGED | NONE |
+    UNAVAILABLE. g-115-3471.
+
+    Uses `repos/{owner}/{repo}/commits/<sha>/pulls`, whose gh placeholders
+    resolve from cwd — so no origin-URL parsing and no owner/name bookkeeping.
+    Prefers an OPEN pull request when several carry the commit; that is the one
+    whose non-merge is the stranding.
+
+    DEGRADES, NEVER ERRORS. Every failure mode — gh absent, not authenticated,
+    remote not on a forge, API unreachable, 404 — returns UNAVAILABLE, which
+    classify_stranded treats as "do not flag". This is the goal's explicit
+    requirement: an unreachable forge must not turn a clean sweep into a flagged
+    one."""
+    for repo in candidate_repos:
+        rc, _ = _git(repo, "cat-file", "-e", f"{sha}^{{commit}}")
+        if rc != 0:
+            continue  # not in this repo
+        rc2, out = _gh(repo, "api",
+                       f"repos/{{owner}}/{{repo}}/commits/{sha}/pulls")
+        if rc2 != 0:
+            return dict(_PR_UNAVAILABLE)
+        try:
+            prs = json.loads(out or "[]")
+        except Exception:
+            return dict(_PR_UNAVAILABLE)
+        if not isinstance(prs, list) or not prs:
+            return {"state": "NONE", "number": None, "url": None,
+                    "title": None, "created_at": None}
+
+        def _norm(p):
+            raw = (p.get("state") or "").lower()
+            if raw == "open":
+                state = "OPEN"
+            elif p.get("merged_at"):
+                state = "MERGED"
+            else:
+                state = "CLOSED"
+            return {"state": state, "number": p.get("number"),
+                    "url": p.get("html_url"), "title": p.get("title"),
+                    "created_at": p.get("created_at")}
+
+        norms = [_norm(p) for p in prs if isinstance(p, dict)]
+        if not norms:
+            return {"state": "NONE", "number": None, "url": None,
+                    "title": None, "created_at": None}
+        return next((n for n in norms if n["state"] == "OPEN"), norms[0])
+    return dict(_PR_UNAVAILABLE)  # SHA in no candidate repo — cannot query
+
+
+def build_pr_status(shas, candidate_repos):
+    """Probe each off-default SHA once for its pull request. {sha: record}.
+    Impure. g-115-3471."""
+    status = {}
+    for sha in shas:
+        if sha not in status:
+            status[sha] = probe_sha_pull_request(sha, candidate_repos)
+    return status
+
+
 def sha_superseded(sha, candidate_repos):
     """True when SHA's changed files are byte-identical in HEAD — the deliverable
     is already present under HEAD's lineage (benign convergent-parallel-fix
@@ -537,20 +876,28 @@ def resolve_shas_by_goal_id(goal_id, candidate_repos):
 
 def build_goalid_status(goals, candidate_repos, now,
                         min_age_minutes=30.0, lookback_hours=168.0):
-    """For each completed code-deliverable goal with ZERO extracted SHAs that
-    passes the age gate, resolve commits by goal-id and probe each. Returns
+    """For each completed code-deliverable goal that passes the age gate,
+    resolve commits by goal-id and probe each. Returns
     {goal_id: {sha: origin_status}}. Impure. BOUNDED to the eligible subset so
-    the per-goal `git log --grep` cost falls only on the real zero-SHA phantom
-    candidates, not every goal (this sweep is a 24h detective, not a hot path).
-    g-115-2600."""
+    the per-goal `git log --grep` cost falls only on goals in the actionable
+    window, not every goal (this sweep is a 24h detective, not a hot path).
+    g-115-2600.
+
+    Covers goals that DO name a SHA as well (g-115-3471). Tier 1 still consults
+    this map only when the record names no SHA at all, so its behavior is
+    unchanged; tier 2 needs both views because it asks a different question.
+    Tier 1 asks "did anything land?", where one landing settles it. Tier 2 asks
+    "did everything this goal produced reach the default branch?", and a partial
+    view of a MULTI-REPO goal answers that wrongly: g-335-190 named one commit
+    that reached main in an unprotected repo while its Vinheim half sat on the
+    branch of open PR #53, so an extracted-SHA-only view scored it clean. Cost
+    of the wider net measured at 70 extra goals / ~14s on a 3,632-goal queue."""
     result = {}
     for g in goals:
         if g.get("status") != "completed":
             continue
         if not is_code_deliverable(g):
             continue
-        if extract_commit_shas(g):
-            continue  # the extracted-SHA path already covers this goal
         completed_at = _parse_iso(g.get("completed_at"))
         if completed_at is None:
             continue
@@ -569,14 +916,25 @@ def build_goalid_status(goals, candidate_repos, now,
 
 # ─────────────────────────── Investigate filing ───────────────────────────
 
-def _existing_investigate(goal_id, all_goals):
+STRANDED_SIGNAL_PREFIX = "investigate:stranded-unmerged-"
+
+
+def _existing_investigate(goal_id, all_goals,
+                          key_prefix="investigate:completed-not-committed-"):
     """True when an open Investigate for this goal already exists (dedup on the
     stable origin_signal key). Scans the goals ALREADY read this run — asp-115,
     where these Investigates are filed, is an active aspiration, so a prior
     Investigate is present in `all_goals`. In-memory (no extra daemon round-
     trip) and inherently fail-closed: _read_goals is guard-383 fatal on a read
-    error, so we never reach here with a partial queue."""
-    key = f"investigate:completed-not-committed-{goal_id}"
+    error, so we never reach here with a partial queue.
+
+    `key_prefix` selects the class (g-115-3471): the stranded-on-an-unmerged-
+    branch lane files under STRANDED_SIGNAL_PREFIX so it dedups independently
+    of the committed-not-pushed lane. The two describe the same goal but
+    prescribe DIFFERENT remedies — push the commit vs merge the pull request —
+    so collapsing them onto one key would let whichever fired first suppress
+    the other's actionable Investigate forever."""
+    key = f"{key_prefix}{goal_id}"
     for g in all_goals:
         if (g.get("origin_signal") == key
                 and g.get("status") in ("pending", "in-progress")):
@@ -586,26 +944,57 @@ def _existing_investigate(goal_id, all_goals):
 
 def _file_investigate(entry):
     """File one Investigate goal into  (world). Returns the filed goal
-    id or None. Idempotent via _existing_investigate (checked by caller)."""
+    id or None. Idempotent via _existing_investigate (checked by caller).
+
+    Serves both flag classes. The daemon call, asp-115 routing and error
+    handling are identical, so only the title / origin_signal / description
+    differ by reason (g-115-3471)."""
     gid = entry["goal_id"]
-    body = {
-        "title": f"Investigate: {gid} closed completed but commit absent from origin",
-        "priority": "HIGH",
-        "participants": ["agent"],
-        "category": "framework-architecture",
-        "origin_signal": f"investigate:completed-not-committed-{gid}",
-        "description": (
-            f"completed-not-committed-sweep flagged {gid} "
-            f"('{entry['title']}', source={entry['source']}, "
-            f"completed {entry['age_hours']}h ago). Reason: {entry['reason']}. "
-            f"Commit(s) present locally but on NO remote branch: "
-            f"{entry['shas_absent_local_only']}"
-            f"{' (found by goal-id commit-scope match, not named in the goal record — rb-3999)' if entry.get('resolved_via') == 'goal-id' else ''}. "
-            f"The goal closed status=completed but its code deliverable is not "
-            f"on origin past the push-throttle window. Push the commit (or re-do "
-            f"the work if it was lost) and confirm origin landing. "
-            f"rb-3135 / g-115-2570 completed!=committed class."),
-    }
+    if entry.get("reason") == "stranded_open_pr":
+        pr = entry.get("pull_request") or {}
+        body = {
+            "title": (f"Investigate: {gid} closed completed but its commit is "
+                      f"stranded on an unmerged branch (PR #{pr.get('number')})"),
+            "priority": "HIGH",
+            "participants": ["agent"],
+            "category": "framework-architecture",
+            "origin_signal": f"{STRANDED_SIGNAL_PREFIX}{gid}",
+            "description": (
+                f"completed-not-committed-sweep tier 2 flagged {gid} "
+                f"('{entry['title']}', source={entry['source']}, "
+                f"completed {entry['age_hours']}h ago). "
+                f"Commit(s) on a remote branch but NOT on the repository's "
+                f"default branch: {entry['shas_off_default']}"
+                f"{' (found by goal-id commit-scope match, not named in the goal record — rb-3999)' if entry.get('resolved_via') == 'goal-id' else ''}. "
+                f"Pull request #{pr.get('number')} ({pr.get('url')}) is still "
+                f"OPEN after {pr.get('age_hours')}h."
+                f"{' ALSO stranded on: ' + ', '.join('#%s (%s, %s)' % (o['number'], o['state'], o['url']) for o in entry['other_pull_requests']) + ' — merging only the first leaves the rest of this goal invisible.' if entry.get('other_pull_requests') else ''}"
+                f" The goal closed "
+                f"status=completed and tier 1 scores it landed — any remote "
+                f"branch satisfies that test — but the deliverable has not "
+                f"reached the default branch, so no user can see it. Merge the "
+                f"pull request (or close it and re-open the goal if the work "
+                f"was abandoned). g-115-3471 stranded-on-unmerged-branch class."),
+        }
+    else:
+        body = {
+            "title": f"Investigate: {gid} closed completed but commit absent from origin",
+            "priority": "HIGH",
+            "participants": ["agent"],
+            "category": "framework-architecture",
+            "origin_signal": f"investigate:completed-not-committed-{gid}",
+            "description": (
+                f"completed-not-committed-sweep flagged {gid} "
+                f"('{entry['title']}', source={entry['source']}, "
+                f"completed {entry['age_hours']}h ago). Reason: {entry['reason']}. "
+                f"Commit(s) present locally but on NO remote branch: "
+                f"{entry['shas_absent_local_only']}"
+                f"{' (found by goal-id commit-scope match, not named in the goal record — rb-3999)' if entry.get('resolved_via') == 'goal-id' else ''}. "
+                f"The goal closed status=completed but its code deliverable is not "
+                f"on origin past the push-throttle window. Push the commit (or re-do "
+                f"the work if it was lost) and confirm origin landing. "
+                f"rb-3135 / g-115-2570 completed!=committed class."),
+        }
     try:
         # aspirations_add_goal(asp_id, record, source=...) — record is the dict
         # itself; the daemon returns the parsed created-goal record (a dict).
@@ -634,6 +1023,10 @@ def main():
     ap.add_argument("--lookback-hours", type=float, default=168.0,
                     help="Only consider goals completed within this window "
                          "(default 168 = 7 days).")
+    ap.add_argument("--min-pr-age-hours", type=float, default=24.0,
+                    help="Tier 2 only flags a stranded commit whose open pull "
+                         "request is at least this old, so a freshly-opened PR "
+                         "still in flight is never flagged (default 24).")
     args = ap.parse_args()
 
     now = dt.datetime.now()
@@ -677,10 +1070,58 @@ def main():
     benign_superseded = [e for e in flagged if e.get("benign_superseded")]
     real_flagged = [e for e in flagged if not e.get("benign_superseded")]
 
+    # ── Tier 2: stranded on an unmerged branch () ──────────────────
+    # Tier 1 above scores a commit LANDED when any remote branch contains it, so
+    # a deliverable pushed to a feature branch whose PR is never merged reads as
+    # clean. Tier 2 re-checks the goals tier 1 blessed: resolve each repo's
+    # default branch, keep the landed SHAs that missed it, then ask the forge
+    # which pull request carries them. Probes are staged narrowest-last — the
+    # network call runs only on the off-default subset, never on every SHA.
+    default_refs = {str(r): resolve_default_ref(r) for r in candidate_repos}
+    landed_by_goal = {
+        g.get("id"): landed_shas(g, now, sha_status, goalid_status,
+                                 args.min_age_minutes, args.lookback_hours)
+        for g in all_goals}
+    default_status = build_default_status(
+        sorted({s for shas in landed_by_goal.values() for s in shas}),
+        candidate_repos, default_refs)
+    pr_status = build_pr_status(
+        sorted({s for s, st in default_status.items() if st is False}),
+        candidate_repos)
+
+    stranded_all = []
+    for g in all_goals:
+        entry = classify_stranded(
+            g, now, sha_status, default_status, pr_status,
+            args.min_age_minutes, args.lookback_hours,
+            args.min_pr_age_hours, goalid_status=goalid_status)
+        if entry is not None:
+            stranded_all.append(entry)
+    stranded_all.sort(key=lambda e: e["age_hours"], reverse=True)
+    stranded = [e for e in stranded_all if e["reason"] == "stranded_open_pr"]
+    stranded_no_pr = [e for e in stranded_all if e["reason"] == "stranded_no_pr"]
+    pr_probe_unavailable = sorted(
+        s for s, r in pr_status.items() if r.get("state") == "UNAVAILABLE")
+    if pr_probe_unavailable:
+        print(f"[completed-not-committed-sweep] WARN: pull-request lookup "
+              f"unavailable for {len(pr_probe_unavailable)} off-default commit(s) "
+              f"— those goals are NOT flagged this run (an unreachable forge must "
+              f"never turn a clean sweep into a flagged one, g-115-3471).",
+              file=sys.stderr)
+
     investigate_created = []
     if args.apply:
         for entry in real_flagged:
             if _existing_investigate(entry["goal_id"], all_goals):
+                continue
+            gid = _file_investigate(entry)
+            if gid:
+                investigate_created.append(gid)
+        # stranded_no_pr is deliberately NOT filed — a commit on a branch with no
+        # open PR may simply be a live working branch. It stays in the report.
+        for entry in stranded:
+            if _existing_investigate(entry["goal_id"], all_goals,
+                                     STRANDED_SIGNAL_PREFIX):
                 continue
             gid = _file_investigate(entry)
             if gid:
@@ -690,10 +1131,16 @@ def main():
         "scanned": scanned,
         "candidate_repos": [str(r) for r in candidate_repos],
         "fetch_status": fetch_status,
+        "default_refs": default_refs,
         "flagged_count": len(real_flagged),
         "flagged": real_flagged,
         "benign_superseded_count": len(benign_superseded),
         "benign_superseded": benign_superseded,
+        "stranded_count": len(stranded),
+        "stranded": stranded,
+        "stranded_no_pr_count": len(stranded_no_pr),
+        "stranded_no_pr": stranded_no_pr,
+        "pr_probe_unavailable": pr_probe_unavailable,
         "investigate_created": investigate_created,
         "applied": bool(args.apply),
         "now": now.isoformat(timespec="seconds"),
@@ -701,6 +1148,7 @@ def main():
 
     if args.output == "human":
         print(f"scanned={scanned} flagged={len(real_flagged)} "
+              f"stranded={len(stranded)} stranded_no_pr={len(stranded_no_pr)} "
               f"benign_superseded={len(benign_superseded)} "
               f"repos={len(candidate_repos)} applied={bool(args.apply)}")
         for e in real_flagged:
@@ -708,6 +1156,18 @@ def main():
                   f"completed {e['age_hours']}h ago | "
                   f"local-only={e['shas_absent_local_only']} "
                   f"via={e.get('resolved_via', 'record-sha')} | {e['title']}")
+        for e in stranded:
+            pr = e.get("pull_request") or {}
+            others = e.get("other_pull_requests") or []
+            extra = (" +PRs " + ",".join(f"#{o['number']}" for o in others)) if others else ""
+            print(f"  [stranded_open_pr] {e['goal_id']} ({e['source']}): "
+                  f"completed {e['age_hours']}h ago | PR #{pr.get('number')}{extra} "
+                  f"open {pr.get('age_hours')}h | off-default={e['shas_off_default']} "
+                  f"via={e.get('resolved_via', 'record-sha')} | {e['title']}")
+        for e in stranded_no_pr:
+            print(f"  [stranded_no_pr log-only] {e['goal_id']} ({e['source']}): "
+                  f"on a remote branch but not the default branch, no open PR | "
+                  f"off-default={e['shas_off_default']} | {e['title']}")
         for e in benign_superseded:
             print(f"  [benign_superseded log-only] {e['goal_id']} ({e['source']}): "
                   f"deliverable present in HEAD under a different SHA | "
