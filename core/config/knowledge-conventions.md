@@ -85,7 +85,12 @@ Returns all context as JSON. Fails open — if nothing relevant, proceed without
 - MERGE: `article_count <= merge_threshold (1)`, no children → absorb into sibling
 - PRUNE: empty node, no sibling → archive
 - All levels auto-create; L1 new domains logged prominently in journal and tree_growth_log
-- Always log to `tree_growth_log` in `world/knowledge/tree/_tree.yaml`
+- `tree_growth_log` in `world/knowledge/tree/_tree.yaml` is written by the
+  tree write paths, not by the caller (`core/scripts/_growth_log.py` SSOT,
+  shared by `core/scripts/tree.py` and `mind_api/src/world/tree_write.py`).
+  Logged ops: DECOMPOSE, PRUNE, REPARENT, L1_ADD, L1_RENAME. Ordinary
+  child-add is intentionally excluded. Do not hand-append rows — extend the
+  SSOT instead, so both write paths stay in agreement (g-115-3210)
 
 ### Interior vs Leaf Invariant
 - **Interior nodes**: have children, contain summary/index only, `node_type: interior` in `_tree.yaml`

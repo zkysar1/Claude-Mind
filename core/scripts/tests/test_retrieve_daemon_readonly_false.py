@@ -1,7 +1,7 @@
 """test_retrieve_daemon_readonly_false.py — regression pin for the daemon
 /v1/retrieve counter-bump (read_only=false) lane returning a POPULATED body.
 
-Regression for  /  (Decision #58, mind_api/src/endpoints/
+Regression for g-115-765 / g-115-785 (Decision #58, mind_api/src/endpoints/
 retrieve.py). The 2026-05-14 daemon-only cutover (commit 25d6520) deleted
 retrieve.py's argparse + main() + __main__. The read_only=false
 (counter-bump / goal-execution) lane of the retrieve wrapper fell through to

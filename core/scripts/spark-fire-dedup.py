@@ -89,6 +89,36 @@ DEFAULT_PRUNE_MIN = 90
 # genuine SECOND deep-close of a recurring goal either.
 MAX_BG_CLOSE_DURATION_MIN = 15
 
+#  / : the bound above was outgrown FOUR times (~10m08s ->
+# widened to 15; then 15m09s zeta, 16m31s alpha, 24m00s  -- three
+# agents, three days). It cannot be calibrated, because the two directions it
+# conflates are not the same quantity:
+#   - RECURRING path: lookback models how long a BACKGROUNDED recurring-close.sh
+#     takes to write set_at after the LLM fires off its stdout imperative. That
+#     IS bounded by script runtime -- MAX_BG_CLOSE_DURATION_MIN is right for it.
+#   - NON-RECURRING path: the sentinel is written by iteration-close.sh
+#     do_state_update at Phase 8, while the in-turn spark fires at Phase 6, so
+#     the lookback must span the LLM's ENTIRE Phase-6 work. Phase 6 is UNBOUNDED
+#     BY DESIGN (it files goals, writes stores, notifies, amends self.md), so no
+#     constant can bound it and every widening only postpones the next cliff.
+# The field reports cannot locate the true distribution either: a gap UNDER the
+# bound dedups correctly and is never noticed, so every observation is
+# structurally required to exceed it. The sample is LEFT-CENSORED AT THE BOUND,
+# which is what produced the deceptive +7s/+9s/+20s pile-up (read at the time as
+# a tight central tendency; it is censoring). Calibrating from it is impossible
+# in principle, not merely imprecise.
+# THE STRUCTURAL FACT that removes the need for a number: a NON-recurring goal
+# closes exactly ONCE, so there is no genuine second close to suppress -- the
+# lower bound is purely a recurring-goal concern. On that path ANY recorded fire
+# for the goal_id is necessarily THIS close's fire, so the correct lower bound is
+# not 15 or 20 minutes but ABSENT. Passing lookback_minutes=None expresses that.
+UNBOUNDED_LOOKBACK = None
+# Sentinel payload `producer` value written by iteration-close.sh do_state_update
+# (the non-recurring producer). recurring-close.sh writes NO producer field, and
+# pre- sentinels have none either -- both correctly fall through to the
+# bounded MAX_BG_CLOSE_DURATION_MIN path, so this is backward-compatible.
+NONRECURRING_PRODUCER = "nonrecurring-state-update"
+
 
 def _parse_dt(value):
     """Parse an ISO timestamp; return None on any failure (guard-420 pattern:
@@ -141,6 +171,11 @@ def fired_in_consumption_window(fired_map, goal_id, set_at,
     far-future fire (clock skew / a stale entry beyond the sentinel's life) does
     not count as this close's consumption.
 
+    A lookback_minutes of None (UNBOUNDED_LOOKBACK) drops the lower bound
+    entirely — used for the NON-recurring producer, where a goal closes exactly
+    once so any recorded fire IS this close's (g-115-3351; see the constant's
+    comment for why no finite bound is calibratable there).
+
     Fail-safe: a non-dict map, a None set_at, a missing entry, or an unparseable
     fired timestamp all return False (fire), never True — the dedup must never
     suppress a spark on bad data (a redundant fire is the safe failure
@@ -151,9 +186,59 @@ def fired_in_consumption_window(fired_map, goal_id, set_at,
     ts = _parse_dt(fired_map.get(goal_id))
     if ts is None:
         return False
-    lo = set_at - timedelta(minutes=lookback_minutes)
     hi = set_at + timedelta(minutes=lookahead_minutes)
+    if lookback_minutes is None:
+        return ts <= hi
+    lo = set_at - timedelta(minutes=lookback_minutes)
     return lo <= ts <= hi
+
+
+def already_fired_this_close(fired_map, goal_id):
+    """WRITE-SIDE dedup (): True iff goal_id has a parseable entry in
+    the spark_fired_session map at all — no time comparison of any kind.
+
+    Consulted by iteration-close.sh do_state_update BEFORE it writes the
+    pending_phase_6_spark sentinel on the NON-recurring path. When the in-turn
+    Phase-6 spark already fired for this goal, the sentinel has nothing to
+    trigger, so the correct action is to NOT WRITE IT — which makes the in-turn
+    path timing-free and leaves the sentinel doing only its real job (covering
+    the bg-timeout path where no in-turn fire happened).
+
+    This is the fix that ELIMINATES the window rather than widening it a fourth
+    time. It is sound precisely because a non-recurring goal closes exactly once:
+    there is no earlier close of this goal_id whose fire could be mistaken for
+    this one. That is why no timestamp is compared here, and why adding one back
+    would re-introduce the uncalibratable bound (see UNBOUNDED_LOOKBACK).
+
+    Fail-safe direction is INVERTED relative to the read-side helpers, and the
+    inversion is deliberate: here a False (write the sentinel) is the safe
+    answer, because a redundant sentinel costs at most one extra spark while a
+    wrongly-suppressed sentinel could lose the spark entirely on the bg-timeout
+    path. So a non-dict map, a missing entry, or an unparseable timestamp all
+    return False → write the sentinel.
+    """
+    if not isinstance(fired_map, dict):
+        return False
+    return _parse_dt(fired_map.get(goal_id)) is not None
+
+
+def gap_seconds(fired_map, goal_id, set_at):
+    """Return (set_at - fired_at) in seconds for goal_id, or None when absent /
+    unparseable. This is the UNCENSORED variable the field reports could never
+    observe: every report of the defect necessarily exceeded the bound, so the
+    failures alone can never locate the distribution (g-115-3351's third
+    confirmation). Logging this for EVERY non-recurring deep close — including
+    the ones that dedup correctly — is what removes the censoring.
+
+    May be negative (fire recorded after set_at), which is the normal shape when
+    the LLM sparks after state-update rather than before.
+    """
+    if not isinstance(fired_map, dict) or set_at is None:
+        return None
+    ts = _parse_dt(fired_map.get(goal_id))
+    if ts is None:
+        return None
+    return (set_at - ts).total_seconds()
 
 
 def prune_and_record(fired_map, goal_id, now, prune_minutes=DEFAULT_PRUNE_MIN):
@@ -211,7 +296,18 @@ def cmd_check(args):
         # counts as this-close consumption. Robust against the bg-timeout
         # wall-clock that broke the 5-min window (rb-1674) AND the proactive
         # before-set_at fire that broke the strict >= test (rb-2615).
-        deduped = fired_in_consumption_window(fired, args.goal_id, set_at)
+        # : the NON-recurring producer gets an UNBOUNDED lower bound.
+        # Its gap is the LLM's whole Phase-6 span, which no constant can bound;
+        # and it needs no lower bound at all, because a non-recurring goal
+        # closes exactly once (no prior close to mis-match). Any other producer
+        # — recurring-close.sh, or a pre- sentinel with no producer
+        # field — keeps the bounded MAX_BG_CLOSE_DURATION_MIN behavior, which is
+        # correct for it: there the lookback models a bounded script runtime.
+        producer = (getattr(args, "producer", None) or "").strip()
+        lookback = (UNBOUNDED_LOOKBACK if producer == NONRECURRING_PRODUCER
+                    else MAX_BG_CLOSE_DURATION_MIN)
+        deduped = fired_in_consumption_window(fired, args.goal_id, set_at,
+                                              lookback_minutes=lookback)
     else:
         # FALLBACK (no sentinel set_at supplied): time-window heuristic.
         deduped = recently_fired(fired, args.goal_id, _now(), args.window_min)
@@ -220,6 +316,26 @@ def cmd_check(args):
         return 1
     print("fire")
     return 0
+
+
+def cmd_fired(args):
+    """WRITE-SIDE gate (). stdin = spark_fired_session map.
+
+    Prints `skip-write` when the goal already has a recorded in-turn fire (so
+    iteration-close.sh do_state_update must NOT write the pending_phase_6_spark
+    sentinel), else `write`. Callers compare the STRING, not the exit code, so
+    the decision survives any `set -e` / pipeline-status handling in bash.
+
+    Also prints the measured gap (set_at - fired_at) when --set-at is supplied
+    and an entry exists, as `write|skip-write<TAB>gap_seconds`, so the caller can
+    emit the uncensored telemetry without a second parse of the map.
+    """
+    fired = _read_stdin_map()
+    already = already_fired_this_close(fired, args.goal_id)
+    gap = gap_seconds(fired, args.goal_id, _parse_dt(getattr(args, "set_at", None)))
+    verdict = "skip-write" if already else "write"
+    sys.stdout.write(verdict if gap is None else f"{verdict}\t{gap:.0f}")
+    return 1 if already else 0
 
 
 def main(argv=None):
@@ -234,9 +350,31 @@ def main(argv=None):
                     help="fallback time-window minutes, used only when --sentinel-set-at is absent")
     pc.add_argument("--sentinel-set-at", default=None,
                     help="ISO timestamp of the sentinel's creation (set_at). When supplied, dedup is "
-                         "consumption-based (skip iff fired_at >= set_at) instead of the --window-min "
-                         "heuristic — robust against bg-timeout wall-clock (g-115-1404 / rb-1674).")
+                         "consumption-based instead of the --window-min heuristic: skip iff fired_at "
+                         "falls in the window BRACKETING set_at on both sides — "
+                         "[set_at - MAX_BG_CLOSE_DURATION_MIN, set_at + DEFAULT_WINDOW_MIN]. The lower "
+                         "bound matters: on the non-recurring path the in-turn Phase-6 spark fires "
+                         "BEFORE do_state_update writes set_at, so fired_at < set_at is the NORMAL "
+                         "shape there and still skips. Robust against bg-timeout wall-clock "
+                         "(g-115-1404 / rb-1674) AND the proactive before-set_at fire that the "
+                         "retired strict `fired_at >= set_at` test mis-read as a prior close "
+                         "(g-306-80 / rb-2615; lower bound widened 10 -> 15 by g-115-2988).")
+    pc.add_argument("--producer", default=None,
+                    help="sentinel payload's `producer` field. When it is "
+                         f"'{NONRECURRING_PRODUCER}' the consumption window's LOWER bound is "
+                         "DROPPED (g-115-3351): that path's gap is the LLM's unbounded Phase-6 "
+                         "span, and a non-recurring goal closes exactly once so any recorded "
+                         "fire is necessarily this close's. Absent/other (recurring-close.sh, "
+                         "or a pre-g-115-3351 sentinel) keeps the bounded behavior.")
     pc.set_defaults(func=cmd_check)
+    pf = sub.add_parser("fired", help="stdin=current map JSON; stdout=write|skip-write[\\tgap_seconds] "
+                                      "(write-side sentinel gate, g-115-3351)")
+    pf.add_argument("goal_id")
+    pf.add_argument("--set-at", default=None,
+                    help="ISO timestamp to measure the gap against (normally now). When supplied "
+                         "and an entry exists, the gap in seconds is appended after a TAB so the "
+                         "caller can log the UNCENSORED distribution.")
+    pf.set_defaults(func=cmd_fired)
     args = p.parse_args(argv)
     try:
         return args.func(args)
@@ -249,6 +387,11 @@ def main(argv=None):
         cmd = getattr(args, "cmd", None)
         if cmd == "check":
             print("fire")
+        elif cmd == "fired":
+            # Safe direction is INVERTED here vs `check`: write the sentinel. A
+            # redundant sentinel costs one extra spark; a wrongly-suppressed one
+            # could lose the spark entirely on the bg-timeout path.
+            sys.stdout.write("write")
         elif cmd == "record":
             try:
                 sys.stdout.write(json.dumps({args.goal_id: _now().isoformat(timespec="seconds")}))

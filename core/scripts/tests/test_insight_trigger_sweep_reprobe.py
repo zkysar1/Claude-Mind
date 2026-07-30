@@ -72,7 +72,8 @@ def sandbox(monkeypatch, tmp_path: Path):
 
     Patches:
       - its.WORLD_ASPS: tmp world's aspirations.jsonl
-      - its.FINDINGS: tmp world's findings.jsonl
+      - its.BOARD_DIR: tmp world's board/ (channels are auto-discovered from
+        it since g-115-3925; the module-level FINDINGS path is gone)
       - its._agents_root: lambda returning an agents/ dir with one agent
       - its.file_goal: lambda recording calls (assertable)
       - its._emit_audit_stale_note: lambda recording calls (assertable)
@@ -98,7 +99,7 @@ def sandbox(monkeypatch, tmp_path: Path):
     (test_agent / "aspirations.jsonl").write_text("", encoding="utf-8")
 
     monkeypatch.setattr(its, "WORLD_ASPS", asp_jsonl)
-    monkeypatch.setattr(its, "FINDINGS", findings)
+    monkeypatch.setattr(its, "BOARD_DIR", findings.parent)
     monkeypatch.setattr(its, "_agents_root", lambda: agents_dir)
 
     filed_calls = []

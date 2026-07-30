@@ -440,19 +440,43 @@ rm -rf "$repo"
 # files ONLY, never bravo-scope/ or zeta-scope/.
 echo "Test 15: namespace filter drops cross-agent files"
 repo=$(fresh_repo)
-mkdir "$repo/alpha"; echo "alpha-self" > "$repo/alpha/self.md"
-mkdir "$repo/bravo"; echo "bravo-self" > "$repo/bravo/self.md"
-mkdir "$repo/zeta";  echo "zeta-self"  > "$repo/zeta/self.md"
+# AGENT DIRS LIVE UNDER agents/ (Phase 2.5.D, AGENTS_PARENT_DIR="agents").
+# iteration-commit.sh discovers them by scanning "$REPO"/agents/*/self.md (~L221)
+# and its prefix checks test `agents/*` (~L591/657/706). Seeding them at the repo
+# ROOT — the pre-relocation shape this fixture used until 2026-07-29 — made
+# discovery find ZERO agent dirs, which self-DISABLES the filter. That is why
+# Tests 15 and 18 were red (6 assertions) and, worse, why Tests 16 and 17 were
+# passing VACUOUSLY: both assert the filter does NOT fire, which is trivially
+# true when it never engages at all. Keep this path shape in sync with
+# AGENTS_PARENT_DIR (CLAUDE.md "Agent-dir Resolution" lists iteration-commit.sh
+# as a literal-string hardcoder, so a rename touches both sides).
+# FIXTURE AGENT NAMES ARE DELIBERATELY FICTIONAL — do NOT "fix" them back to
+# alpha/bravo/zeta. Two of the three filters this fixture wakes read the LIVE
+# production team-state: the pre-claim filter (~L782) looks up
+# agent_status.$MIND_AGENT.in_flight.claimed_at, and the concurrent-partner
+# filter (~L835) looks up every OTHER discovered agent's. Both are gated on the
+# same `known_agents` discovery, so all three were dead while this fixture
+# seeded at the repo root and all three woke together when it moved under
+# agents/. With real fleet names, team-state-read.sh returns a real partner's
+# live claimed_at, the concurrent-partner filter drops shared.txt as "partner
+# work", and this test fails — but ONLY while a real partner happens to be
+# mid-iteration. Measured 2026-07-29: red with bravo in_flight, green minutes
+# later. A fictional name resolves to null, so no partner epoch is collected
+# and the two team-state filters stay inactive by construction. That is what
+# makes the shared.txt assertion below deterministic instead of fleet-dependent.
+mkdir -p "$repo/agents/tstalpha"; echo "tstalpha-self" > "$repo/agents/tstalpha/self.md"
+mkdir -p "$repo/agents/tstbravo"; echo "tstbravo-self" > "$repo/agents/tstbravo/self.md"
+mkdir -p "$repo/agents/tstzeta";  echo "tstzeta-self"  > "$repo/agents/tstzeta/self.md"
 # Commit the self.md files so they're tracked (not staged for our test commit)
 git -C "$repo" add -A
 git -C "$repo" commit -q -m "seed agent dirs"
 # Now create uncommitted files in each agent dir
-echo "alpha-work" > "$repo/alpha/file.txt"
-echo "bravo-work" > "$repo/bravo/file.txt"
-echo "zeta-work"  > "$repo/zeta/file.txt"
-echo "shared"     > "$repo/shared.txt"  # not under any agent dir
-# Run as alpha — should commit only alpha/file.txt and shared.txt
-out=$(MIND_AGENT=alpha bash "$ITERATION_COMMIT" \
+echo "tstalpha-work" > "$repo/agents/tstalpha/file.txt"
+echo "tstbravo-work" > "$repo/agents/tstbravo/file.txt"
+echo "tstzeta-work"  > "$repo/agents/tstzeta/file.txt"
+echo "shared"        > "$repo/shared.txt"  # not under any agent dir
+# Run as tstalpha — should commit only agents/tstalpha/file.txt and shared.txt
+out=$(MIND_AGENT=tstalpha bash "$ITERATION_COMMIT" \
   --goal-id g-280-12 --title "Apply: namespace filter test" --outcome deep --repo "$repo" 2>&1)
 if echo "$out" | grep -qE "namespace filter dropped [0-9]+ cross-agent"; then
   pass "namespace filter info line emitted"
@@ -461,15 +485,15 @@ else
 fi
 # Inspect last commit
 committed=$(git -C "$repo" diff-tree --no-commit-id --name-only -r HEAD)
-if echo "$committed" | grep -q "^alpha/file.txt$"; then
-  pass "alpha's file committed"
+if echo "$committed" | grep -q "^agents/tstalpha/file.txt$"; then
+  pass "committer's own file committed"
 else
-  fail "alpha's file NOT committed: $committed"
+  fail "committer's file NOT committed: $committed"
 fi
-if echo "$committed" | grep -qE "^(bravo|zeta)/file.txt$"; then
+if echo "$committed" | grep -qE "^agents/(tstbravo|tstzeta)/file.txt$"; then
   fail "cross-agent file leaked into commit: $committed"
 else
-  pass "no cross-agent files in commit (bravo/ + zeta/ correctly filtered)"
+  pass "no cross-agent files in commit (agents/tstbravo/ + agents/tstzeta/ correctly filtered)"
 fi
 if echo "$committed" | grep -q "^shared.txt$"; then
   pass "shared (non-agent) file committed"
@@ -478,17 +502,17 @@ else
 fi
 # Author signature
 msg=$(git -C "$repo" log -1 --pretty=%B)
-if echo "$msg" | grep -q "Co-Authored-By: alpha"; then
-  pass "Co-Authored-By: alpha on the commit"
+if echo "$msg" | grep -q "Co-Authored-By: tstalpha"; then
+  pass "Co-Authored-By: tstalpha on the commit"
 else
   fail "wrong Co-Authored-By: $(echo "$msg" | tail -3)"
 fi
-# Status should still show bravo/zeta files as untracked (we filtered them, didn't commit them)
+# Status should still show the other agents' files as untracked (filtered, not committed)
 remaining=$(git -C "$repo" status --porcelain)
-if echo "$remaining" | grep -qE "^\?\? (bravo|zeta)/"; then
+if echo "$remaining" | grep -qE "^\?\? agents/(tstbravo|tstzeta)/"; then
   pass "filtered files remain in working tree (not absorbed, not deleted)"
 else
-  fail "expected bravo/ + zeta/ untracked, got: $remaining"
+  fail "expected agents/tstbravo/ + agents/tstzeta/ untracked, got: $remaining"
 fi
 rm -rf "$repo"
 
@@ -497,17 +521,21 @@ rm -rf "$repo"
 # cross-agent edits like coordinated refactors).
 echo "Test 16: --no-namespace-filter override commits cross-agent files"
 repo=$(fresh_repo)
-mkdir "$repo/alpha"; echo "alpha-self" > "$repo/alpha/self.md"
-mkdir "$repo/bravo"; echo "bravo-self" > "$repo/bravo/self.md"
+# agents/ prefix required — see the Test 15 note. Before 2026-07-29 this case
+# passed VACUOUSLY: with the dirs at the repo root the filter never engaged, so
+# "override commits both files" held whether or not --no-namespace-filter did
+# anything. It is a real control only against a filter that would otherwise fire.
+mkdir -p "$repo/agents/alpha"; echo "alpha-self" > "$repo/agents/alpha/self.md"
+mkdir -p "$repo/agents/bravo"; echo "bravo-self" > "$repo/agents/bravo/self.md"
 git -C "$repo" add -A
 git -C "$repo" commit -q -m "seed agent dirs"
-echo "x" > "$repo/alpha/file.txt"
-echo "y" > "$repo/bravo/file.txt"
+echo "x" > "$repo/agents/alpha/file.txt"
+echo "y" > "$repo/agents/bravo/file.txt"
 out=$(MIND_AGENT=alpha bash "$ITERATION_COMMIT" \
   --goal-id g-280-12 --title "Apply: override test" --outcome deep --repo "$repo" \
   --no-namespace-filter 2>&1)
 committed=$(git -C "$repo" diff-tree --no-commit-id --name-only -r HEAD)
-if echo "$committed" | grep -q "^alpha/file.txt$" && echo "$committed" | grep -q "^bravo/file.txt$"; then
+if echo "$committed" | grep -q "^agents/alpha/file.txt$" && echo "$committed" | grep -q "^agents/bravo/file.txt$"; then
   pass "--no-namespace-filter commits both alpha and bravo files"
 else
   fail "override didn't commit cross-agent: $committed"
@@ -524,17 +552,20 @@ rm -rf "$repo"
 # e.g., direct user invocations or external scripts).
 echo "Test 17: namespace filter inactive when MIND_AGENT unset"
 repo=$(fresh_repo)
-mkdir "$repo/alpha"; echo "alpha-self" > "$repo/alpha/self.md"
-mkdir "$repo/bravo"; echo "bravo-self" > "$repo/bravo/self.md"
+# agents/ prefix required — see the Test 15 note. Same vacuity as Test 16 before
+# 2026-07-29: this asserts the filter is inactive without MIND_AGENT, which the
+# root-level fixture guaranteed for the wrong reason (no agent dirs discovered).
+mkdir -p "$repo/agents/alpha"; echo "alpha-self" > "$repo/agents/alpha/self.md"
+mkdir -p "$repo/agents/bravo"; echo "bravo-self" > "$repo/agents/bravo/self.md"
 git -C "$repo" add -A
 git -C "$repo" commit -q -m "seed"
-echo "x" > "$repo/alpha/file.txt"
-echo "y" > "$repo/bravo/file.txt"
+echo "x" > "$repo/agents/alpha/file.txt"
+echo "y" > "$repo/agents/bravo/file.txt"
 # Unset MIND_AGENT explicitly
 out=$(unset MIND_AGENT; bash "$ITERATION_COMMIT" \
   --goal-id g-280-12 --title "Apply: unset agent test" --outcome deep --repo "$repo" 2>&1)
 committed=$(git -C "$repo" diff-tree --no-commit-id --name-only -r HEAD)
-if echo "$committed" | grep -q "^alpha/file.txt$" && echo "$committed" | grep -q "^bravo/file.txt$"; then
+if echo "$committed" | grep -q "^agents/alpha/file.txt$" && echo "$committed" | grep -q "^agents/bravo/file.txt$"; then
   pass "no MIND_AGENT → namespace filter inactive (commits everything)"
 else
   fail "expected both files committed, got: $committed"
@@ -547,15 +578,26 @@ rm -rf "$repo"
 # sensitive-pattern-only and from raw empty-status.
 echo "Test 18: skip when all uncommitted files are cross-agent"
 repo=$(fresh_repo)
-mkdir "$repo/alpha"; echo "alpha-self" > "$repo/alpha/self.md"
-mkdir "$repo/bravo"; echo "bravo-self" > "$repo/bravo/self.md"
+# agents/ prefix required, and fictional agent names — see the Test 15 note for
+# both (the prefix drives discovery; the fictional names keep the team-state
+# filters out of the fixture).
+mkdir -p "$repo/agents/tstalpha"; echo "tstalpha-self" > "$repo/agents/tstalpha/self.md"
+mkdir -p "$repo/agents/tstbravo"; echo "tstbravo-self" > "$repo/agents/tstbravo/self.md"
 git -C "$repo" add -A
 git -C "$repo" commit -q -m "seed"
-echo "y" > "$repo/bravo/file.txt"  # ONLY bravo file uncommitted
-out=$(MIND_AGENT=alpha bash "$ITERATION_COMMIT" \
+echo "y" > "$repo/agents/tstbravo/file.txt"  # ONLY the other agent's file uncommitted
+out=$(MIND_AGENT=tstalpha bash "$ITERATION_COMMIT" \
   --goal-id g-280-12 --title "Apply: all-cross-agent test" --outcome deep --repo "$repo" 2>&1)
-if echo "$out" | grep -q "all uncommitted files belong to other agents"; then
-  pass "skip message names the cross-agent case"
+# Assert the NAMESPACE count specifically, not merely that some skip happened
+# (guard-1082): the script emits one generalized skip line covering five filter
+# classes, so a bare "did it skip?" grep would stay green if a DIFFERENT filter
+# swallowed the file. Pinning "1 namespace" proves which filter fired.
+# The literal this replaced ("all uncommitted files belong to other agents") was
+# the pre- wording; c72c5d5c6 (2026-05-13) generalized the message and
+# left this assertion behind, so it had been failing for 77 days in a test no
+# automated runner executed — the exact defect  exists to close.
+if echo "$out" | grep -qE "skip: all uncommitted files filtered .*[^0-9]1 namespace"; then
+  pass "skip message names the cross-agent case (1 namespace-filtered)"
 else
   fail "expected cross-agent skip message: $out"
 fi
@@ -566,11 +608,11 @@ if [[ "$commit_count" -eq 2 ]]; then  # initial + seed
 else
   fail "unexpected commit count: $commit_count (expected 2)"
 fi
-# Bravo's file should still be untracked
-if git -C "$repo" status --porcelain | grep -q "^?? bravo/file.txt"; then
-  pass "bravo's file preserved (not absorbed, not deleted)"
+# The other agent's file should still be untracked
+if git -C "$repo" status --porcelain | grep -q "^?? agents/tstbravo/file.txt"; then
+  pass "other agent's file preserved (not absorbed, not deleted)"
 else
-  fail "bravo's file missing from working tree"
+  fail "other agent's file missing from working tree"
 fi
 rm -rf "$repo"
 

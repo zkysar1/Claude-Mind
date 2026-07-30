@@ -1,8 +1,23 @@
 #!/usr/bin/env bash
 # run-invisible-suites.sh — run every pytest-INVISIBLE test file in
-# core/scripts/tests (main()-style files with zero `def test_` functions,
-# which `pytest core/scripts/tests` collects NOTHING from) and report
-# per-file pass/fail plus an aggregate verdict.
+# core/scripts/tests and report per-file pass/fail plus an aggregate verdict.
+#
+# TWO populations are invisible to `pytest core/scripts/tests`:
+#   (1) main()-style .py files — zero top-level `def test_` functions, so
+#       pytest collects nothing from them (detected dynamically below).
+#   (2) shell tests — .sh files, which pytest cannot collect AT ALL. Every
+#       shell test here is invisible by construction, so unlike the .py half
+#       there is no shape predicate to apply: the glob IS the population.
+#
+# The shell half was added 2026-07-29 (). Until then 19 shell
+# contract tests executed in NO automated runner, and the cost was measured,
+# not theoretical: test_iteration_commit.sh sat 6-of-55 red, one of its
+# assertions since 2026-05-13 (c72c5d5c6 generalized a skip message and left
+# the test behind) — 77 days silent. Worse than the visible reds, its fixture
+# seeded agent dirs at the repo ROOT instead of under agents/, which made the
+# production namespace-filter discovery find zero agent dirs and SELF-DISABLE;
+# two further tests were therefore passing VACUOUSLY, asserting a filter does
+# not fire when it could never have fired at all.
 #
 # Why this exists (, 2026-07-16): 69 of the test files here are
 # main()-style. The daemon-safe full suite (4400+ collected tests) says
@@ -17,7 +32,7 @@
 #
 # Usage:
 #   bash core/scripts/tests/run-invisible-suites.sh [--list]
-#     --list  print the enumerated invisible files and exit (no runs)
+#     --list  print the enumerated invisible files (both halves) and exit
 #
 # Exit: 0 when every file passes, 1 when any fails, 0 on --list.
 #
@@ -93,16 +108,31 @@ mapfile -t INVISIBLE < <(
     grep -qE '^def test_' "$f" || echo "$f"
   done
 )
+# Shell half: BOTH separators. This directory uses test_*.sh (14) and
+# test-*.sh (5) interchangeably, and globbing only the underscore form would
+# leave those 5 invisible — reproducing the exact defect this runner closes,
+# in the runner meant to close it. The originating goal itself said "14 shell
+# tests"; the directory holds 19. Whenever this glob is edited, re-count with
+#   ls core/scripts/tests/test_*.sh core/scripts/tests/test-*.sh | wc -l
+# and compare against the --list total, rather than trusting either number.
+# No shape predicate here (contrast the .py half): pytest cannot collect a
+# .sh file at all, so every match is invisible by construction.
+mapfile -t INVISIBLE_SH < <(
+  for f in "$TESTS_DIR"/test_*.sh "$TESTS_DIR"/test-*.sh; do
+    echo "$f"
+  done | sort -u
+)
 shopt -u nullglob
 
-if [ ${#INVISIBLE[@]} -eq 0 ]; then
+if [ ${#INVISIBLE[@]} -eq 0 ] && [ ${#INVISIBLE_SH[@]} -eq 0 ]; then
   echo "invisible-suites: 0 pytest-invisible files — population fully pytest-collectable"
   exit 0
 fi
 
 if [ "${1:-}" = "--list" ]; then
-  printf '%s\n' "${INVISIBLE[@]##*/}"
-  echo "── ${#INVISIBLE[@]} pytest-invisible file(s)"
+  [ ${#INVISIBLE[@]} -gt 0 ] && printf '%s\n' "${INVISIBLE[@]##*/}"
+  [ ${#INVISIBLE_SH[@]} -gt 0 ] && printf '%s\n' "${INVISIBLE_SH[@]##*/}"
+  echo "── ${#INVISIBLE[@]} main()-style .py + ${#INVISIBLE_SH[@]} shell = $(( ${#INVISIBLE[@]} + ${#INVISIBLE_SH[@]} )) pytest-invisible file(s)"
   exit 0
 fi
 
@@ -130,8 +160,36 @@ for f in "${INVISIBLE[@]}"; do
   fi
 done
 
+# ---- Shell half () -----------------------------------------------
+# Ported from the reference implementation, $WORLD_PATH/scripts/run-domain-tests.sh
+# ("Shell half"), which has run this shape against the domain suite since
+# . Shares this runner's QUARANTINE map, tally, and FAILED_FILES so a
+# shell red is reported exactly like a python red. `bash "$f"` matches the
+# reference; guard-580's bare-"bash"-argv[0] prohibition is scoped to
+# Windows-native Python subprocess.run(["bash",...]), not a shell script
+# invoking bash, and this line is inside a shell script.
+for f in "${INVISIBLE_SH[@]}"; do
+  base="${f##*/}"
+  if [ -n "${QUARANTINE[$base]:-}" ]; then
+    SKIPPED=$((SKIPPED + 1))
+    echo "QUARANTINED $base — ${QUARANTINE[$base]}"
+    continue
+  fi
+  out=$(timeout "$PER_FILE_TIMEOUT" bash "$f" 2>&1); rc=$?
+  if [ $rc -eq 0 ]; then
+    PASSES=$((PASSES + 1))
+    echo "PASS $base (shell)"
+  else
+    FAILS=$((FAILS + 1))
+    FAILED_FILES+=("$base")
+    echo "FAIL(rc=$rc) $base (shell)"
+    printf '%s\n' "$out" | tail -8 | sed 's/^/    | /'
+  fi
+done
+
 echo "════════════════════════════════════════"
 echo "invisible-suites: $PASSES/$((PASSES + FAILS)) files passed, $SKIPPED quarantined (open goals above)"
+echo "  population: ${#INVISIBLE[@]} main()-style .py + ${#INVISIBLE_SH[@]} shell"
 if [ $FAILS -gt 0 ]; then
   echo "Failed files (NOT quarantined — new reds):"
   for ff in "${FAILED_FILES[@]}"; do echo "  - $ff"; done

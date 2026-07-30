@@ -1173,14 +1173,55 @@ def extract_and_infer_targets(title, description, search_roots=None, agent_name=
     return ex
 
 
+def _resolve_virtual_path(rel_path):
+    """Resolve a `world/`- or `meta/`-prefixed virtual path to its real
+    external location. Returns a Path, or None when the prefix is absent,
+    the external root is unconfigured, or the result escapes that root.
+
+    world/ and meta/ are EXTERNAL, user-configured roots (local-paths.conf);
+    only core/, .claude/ and agents/ live under PROJECT_ROOT. A bare
+    PROJECT_ROOT join therefore resolves this ENTIRE goal class to a path that
+    does not exist — skill-gaps, forged-skills, aspirations, conventions,
+    knowledge-tree nodes, reasoning bank, guardrails. Because every caller
+    here is fail-open, the miss never errored: it surfaced as
+    exists:false / verdict=unknown, which is indistinguishable from "probe
+    ran, found nothing conclusive". guard-132 names _paths.resolve_file_path
+    as the single resolver for this. (g-115-3601)
+    """
+    if not (rel_path.startswith("world/") or rel_path.startswith("meta/")):
+        return None
+    try:
+        import _paths  # late import — same lazy pattern as _resolve_search_roots
+        root = _paths.WORLD_DIR if rel_path.startswith("world/") else _paths.META_DIR
+        if root is None:
+            return None
+        resolved = Path(_paths.resolve_file_path(rel_path)).resolve()
+        # Containment: the virtual prefix authorizes its OWN root and nothing
+        # else, so `world/../../etc/passwd` must still be refused. This
+        # REPLACES (does not waive) the project_root boundary check that the
+        # caller applies to non-virtual paths.
+        resolved.relative_to(Path(root).resolve())
+        return resolved
+    except Exception:
+        # resolve_file_path raises RuntimeError when the matching *_DIR is
+        # unset; relative_to raises ValueError on escape; Path.resolve can
+        # raise OSError. Every caller is an advisory that must never throw —
+        # fail open to "unresolved", exactly as before this fix.
+        return None
+
+
 def _resolve_target_paths(project_root, rel_path, allowed_roots=None):
     """Resolve rel_path to one or more real file paths.
 
-    Three modes:
+    Four modes:
       A) rel_path is absolute (e.g., from extract_and_infer_targets):
          validate it exists AND lives under one of allowed_roots (defaulting
          to [project_root]). Returns single-element list or []. Boundary
          check is preserved — refuses paths outside the allowed set.
+      V) rel_path carries a `world/` or `meta/` virtual prefix: resolve to the
+         EXTERNAL configured root via _resolve_virtual_path (guard-132), which
+         re-asserts containment in place of the project_root boundary check.
+         Checked BEFORE B/C, which structurally cannot reach external roots.
       B) rel_path has slashes/backslashes (descriptive path):
          literal-resolve under project_root only.
       C) rel_path is a bare basename:
@@ -1216,6 +1257,15 @@ def _resolve_target_paths(project_root, rel_path, allowed_roots=None):
                 continue
         return []  # absolute path not under any allowed root — refuse.
 
+    # Virtual external prefix (world/ meta/) — MUST precede the project_root
+    # join below, which structurally cannot see external roots. Resolvable but
+    # absent returns [] rather than falling through: the path WAS resolved, the
+    # file simply is not there, and the Mode C basename search below is
+    # unreachable for a slashed path anyway. ()
+    virtual = _resolve_virtual_path(rel_path)
+    if virtual is not None:
+        return [virtual] if virtual.is_file() else []
+
     # Mode B/C: relative path under project_root.
     literal = (Path(project_root) / rel_path).resolve()
     try:
@@ -1249,6 +1299,15 @@ def _read_target_file(project_root, rel_path):
     caller already owns a specific path. For multi-path resolution, use
     _resolve_target_paths + _read_file_content.
     """
+    # Same external-prefix resolution as _resolve_target_paths ().
+    # Both run over the SAME target_files inside probe_target_state, so fixing
+    # only one would make per_file[].exists and line_hint_verifications
+    # disagree about the identical path — internally contradictory output.
+    virtual = _resolve_virtual_path(rel_path)
+    if virtual is not None:
+        if not virtual.is_file():
+            return (None, False)
+        return _read_file_content(virtual)
     p = (Path(project_root) / rel_path).resolve()
     try:
         project_root_resolved = Path(project_root).resolve()

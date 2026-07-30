@@ -540,7 +540,7 @@ def test_aspirations_concurrent_add_same_id_keeps_both():
     b = _rb([_asp("asp-115", [base, boxB])])
     ab, ba = cm.merge_aspirations(a, b), cm.merge_aspirations(b, a)
     assert ab == ba                                        # commutative / byte-identical
-    assert sorted(_goal_ids(ab)) == ["", "", ""]  # loser re-id'd, none lost
+    assert sorted(_goal_ids(ab)) == ["g-115-01", "g-115-02", "g-115-03"]  # loser re-id'd, none lost
     descs = {g.get("description") for asp in _recs(ab) for g in asp["goals"]}
     assert {"ALPHA-CONTENT", "BRAVO-CONTENT"} <= descs     # zero content loss
     keep = _find_goal(ab, "g-115-02")
@@ -578,7 +578,7 @@ def test_aspirations_variant_id_not_reallocated():
                                     created_at="2026-07-14T10:00:00")])])
     ab, ba = cm.merge_aspirations(a, b), cm.merge_aspirations(b, a)
     assert ab == ba
-    assert _goal_ids(ab) == {"-a", ""}   # variant kept verbatim
+    assert _goal_ids(ab) == {"g-115-1991-a", "g-115-05"}   # variant kept verbatim
 
 
 def test_aspirations_reid_winner_no_duplicate_id():
@@ -614,7 +614,7 @@ def test_aspirations_collision_reid_stamps_tombstone():
                               _rb([_asp("asp-115", [gB])]))
     moved = _find_goal(ab, "g-115-03")
     assert moved is not None and moved["title"] == "bravo work"
-    assert moved.get("displaced_from") == ""         # tombstone stamped
+    assert moved.get("displaced_from") == "g-115-02"         # tombstone stamped
     keep = _find_goal(ab, "g-115-02")
     assert "displaced_from" not in keep                      # winner untouched
 
@@ -660,8 +660,8 @@ def test_aspirations_chained_displacement_stale_replay_no_refight():
     Z = _goal("g-115-67", title="Z", created_at="2026-07-14T09:30:00")
     s2 = cm.merge_aspirations(s1, _rb([_asp("asp-115", [Z])]))
     y2 = next(g for a in _recs(s2) for g in a["goals"] if g["title"] == "Y")
-    assert y2["id"] == ""                       # chained displacement
-    assert y2["displaced_from"] == ""           # first home preserved
+    assert y2["id"] == "g-115-68"                       # chained displacement
+    assert y2["displaced_from"] == "g-115-50"           # first home preserved
     # Stale replica still holding Y at its FIRST displacement slot rejoins.
     stale = _rb([_asp("asp-115", [dict(y1)])])
     s3 = cm.merge_aspirations(s2, stale)
@@ -1787,7 +1787,7 @@ def test_tree_node_loser_only_base_field_preserved():
     assert "origin_goal_id" not in newer
     ab, ba = cm._merge_tree_node(older, newer), cm._merge_tree_node(newer, older)
     assert ab == ba
-    assert ab["origin_goal_id"] == ""             # loser-only authored field kept
+    assert ab["origin_goal_id"] == "g-115-42"             # loser-only authored field kept
     assert ab["last_updated"] == "2026-07-06T00:00:00"    # NEWER class still takes the newer
 
 
@@ -2213,6 +2213,135 @@ def test_fs_multiround_settle_idempotent():
     assert cm.merge_forged_skills(m1, b) == m1   # stale replay settles
 
 
+# --- amendment lane () -------------------------------------------
+# The keyed union above cured row DELETION and left row AMENDMENT broken.
+# Amending an existing row (adding a trigger, fixing a companion_scripts path)
+# bumps no forged_date and adds no FIELD, so pre-fix it fell to the _canon
+# lexicographic tiebreak and could lose DETERMINISTICALLY — measured on cc-05
+# 2026-07-28: a 4-trigger addition lost 10-to-6, byte-identically with the args
+# swapped, so retrying could never win. `amended_at` is tier 0 (guard-1153:
+# LWW on a timestamp written BY THE SAME MUTATION that writes the field).
+
+_BASE = {"parent": "p", "type": "utility", "forged_date": "2026-07-11",
+         "forged_by": "zeta", "gap_ref": "gap-12", "triggers": ["t1", "t2"]}
+
+
+def _amended(**over):
+    r = dict(_BASE)
+    r.update(over)
+    return r
+
+
+def test_fs_amendment_with_stamp_beats_untouched_peer():
+    """The live shape: an amended row vs an untouched peer copy. NOTE this case
+    is NOT tier-0-discriminating — the stamp also adds a FIELD, so tier 2
+    (more fields) already picks the amended side and the assertion holds with
+    tier 0 removed. Kept as a consistency check of the real-world shape; the
+    tier-0-load-bearing cases are the `outranks_forged_date` (tier 1) and
+    `outranks_field_count` (tier 2) tests below. (Mutation-tested 2026-07-28:
+    deleting the tier-0 block fails ONLY those two.)"""
+    amended = _amended(triggers=["t1", "t2", "t3", "t4"],
+                       amended_at="2026-07-28T08:05:00")
+    stale = _amended()
+    assert len(amended) == len(stale) + 1   # the stamp itself differs in arity
+    a, b = _fs({"skill-z": amended}), _fs({"skill-z": stale})
+    ab, ba = cm.merge_forged_skills(a, b), cm.merge_forged_skills(b, a)
+    assert ab == ba                                            # guard-907
+    assert yaml.safe_load(ab.decode())["skills"]["skill-z"]["triggers"] == \
+        ["t1", "t2", "t3", "t4"]
+
+
+def test_fs_newer_amendment_wins_over_older_amendment():
+    older = _amended(triggers=["t1", "t2", "old"], amended_at="2026-07-28T08:00:00")
+    newer = _amended(triggers=["t1", "t2", "new"], amended_at="2026-07-28T09:00:00")
+    a, b = _fs({"skill-z": older}), _fs({"skill-z": newer})
+    ab, ba = cm.merge_forged_skills(a, b), cm.merge_forged_skills(b, a)
+    assert ab == ba
+    assert yaml.safe_load(ab.decode())["skills"]["skill-z"]["triggers"] == \
+        ["t1", "t2", "new"]
+
+
+def test_fs_amendment_stamp_outranks_forged_date():
+    """Tier 0 beats tier 1: an amendment to an OLDER row still wins, because a
+    re-forge would carry its own (newer) amended_at if it meant to supersede."""
+    amended_old = _amended(forged_date="2026-07-01", triggers=["kept"],
+                           amended_at="2026-07-28T08:05:00")
+    plain_new = _amended(forged_date="2026-07-20", triggers=["dropped"])
+    a, b = _fs({"skill-z": amended_old}), _fs({"skill-z": plain_new})
+    ab, ba = cm.merge_forged_skills(a, b), cm.merge_forged_skills(b, a)
+    assert ab == ba
+    assert yaml.safe_load(ab.decode())["skills"]["skill-z"]["triggers"] == ["kept"]
+
+
+def test_fs_amendment_stamp_outranks_field_count():
+    """Tier 0 beats tier 2 — the second load-bearing case, and the one the
+    steady state produces. Once the writer contract is live BOTH sides carry a
+    stamp, so the stamp no longer inflates arity and tier 2 stops rescuing the
+    amendment for free. Here the peer is RICHER (two extra fields) but carries
+    the OLDER stamp: without tier 0 the field-count tier picks the peer and the
+    amendment is lost, which is the original defect wearing a different hat."""
+    amended = _amended(triggers=["t1", "t2", "kept"],
+                       amended_at="2026-07-28T09:00:00")
+    richer_older = _amended(triggers=["dropped"], amended_at="2026-07-20T00:00:00",
+                            note="n", restored="r")
+    assert len(richer_older) > len(amended)          # tier 2 favours the peer
+    a, b = _fs({"skill-z": amended}), _fs({"skill-z": richer_older})
+    ab, ba = cm.merge_forged_skills(a, b), cm.merge_forged_skills(b, a)
+    assert ab == ba                                                  # guard-907
+    assert yaml.safe_load(ab.decode())["skills"]["skill-z"]["triggers"] == \
+        ["t1", "t2", "kept"]
+
+
+def test_fs_unquoted_amendment_beats_older_quoted():
+    """guard-371 on the amended_at tier. Quoting is INVISIBLE in YAML, and
+    amending is a hand-edit, so an unquoted stamp is the likely real-world
+    form — PyYAML parses it as datetime, whose str() separator is a SPACE
+    (0x20 < 'T'). Un-normalized, a newer unquoted stamp sorted BELOW any older
+    quoted one sharing the date, inverting the tier. (The sibling resolver's
+    forged_date leg was always safe — str(date) has no separator at all —
+    which is how the datetime case rode along unnoticed.)"""
+    newer_unquoted = (b"skills:\n  skill-z:\n    triggers: [kept]\n"
+                      b"    amended_at: 2026-07-28T09:00:00\n")
+    older_quoted = (b"skills:\n  skill-z:\n    triggers: [dropped]\n"
+                    b"    amended_at: '2026-07-28T08:00:00'\n")
+    ab = cm.merge_forged_skills(newer_unquoted, older_quoted)
+    ba = cm.merge_forged_skills(older_quoted, newer_unquoted)
+    assert ab == ba                                                  # guard-907
+    assert yaml.safe_load(ab.decode())["skills"]["skill-z"]["triggers"] == ["kept"]
+
+
+def test_fs_removal_survives_amendment_stamp():
+    """guard-1072 was NOT traded away. A field-level UNION of triggers — the
+    obvious alternative fix — has no deletion semantics and would resurrect a
+    deliberately removed trigger from any peer holding the old row. The
+    whole-record stamp keeps removal expressible."""
+    trimmed = _amended(triggers=["t1"], amended_at="2026-07-28T08:06:00")
+    a, b = _fs({"skill-z": trimmed}), _fs({"skill-z": _amended()})
+    ab, ba = cm.merge_forged_skills(a, b), cm.merge_forged_skills(b, a)
+    assert ab == ba
+    got = yaml.safe_load(ab.decode())["skills"]["skill-z"]["triggers"]
+    assert got == ["t1"] and "t2" not in got      # removal NOT resurrected
+
+
+def test_fs_no_stamp_falls_through_to_prior_tiers():
+    """A writer that never sets amended_at is no worse off than pre-fix: the
+    record still resolves on forged_date -> field count -> _canon."""
+    old = _amended(forged_date="2026-07-01", triggers=["old"])
+    new = _amended(forged_date="2026-07-10", triggers=["new"])
+    a, b = _fs({"skill-z": old}), _fs({"skill-z": new})
+    ab, ba = cm.merge_forged_skills(a, b), cm.merge_forged_skills(b, a)
+    assert ab == ba
+    assert yaml.safe_load(ab.decode())["skills"]["skill-z"]["triggers"] == ["new"]
+
+
+def test_fs_amendment_idempotent_and_settles():
+    amended = _amended(triggers=["t1", "t2", "t3"], amended_at="2026-07-28T08:05:00")
+    a, b = _fs({"skill-z": amended}), _fs({"skill-z": _amended()})
+    m1 = cm.merge_forged_skills(a, b)
+    assert cm.merge_forged_skills(m1, m1) == m1      # fixpoint
+    assert cm.merge_forged_skills(m1, b) == m1       # stale peer replay settles
+
+
 def test_fs_degenerate_inputs_commutative():
     good = _fs({"skill-a": {"forged_date": "2026-07-01"}})
     for bad in (b"", b"- just\n- a list\n", b"scalar\n"):
@@ -2374,6 +2503,95 @@ def test_sr_unquoted_datetime_last_updated_newer_wins():
             == cm.merge_skill_relations(same_str, same_dt))
 
 
+# --- skill-relation amendment loss () ------------------------------
+# Sibling of the _fs_ amendment family above (). _merge_skill_relation
+# was MORE exposed than _merge_forged_skill, not less: it has no date leg at
+# all, so before tier 0 an amendment that did not change the field COUNT was
+# decided by an arbitrary _canon compare. The three load-bearing cases below
+# are the ones where tier 0 must OVERRIDE the field-count tier; each was
+# mutation-proven by deleting the tier-0 block in coordination_merge.py.
+
+
+def test_sr_amendment_stamp_outranks_field_count():
+    """Tier 0 beats tier 2 — the steady-state case, once the writer contract is
+    live and BOTH sides carry a stamp. The peer is RICHER (two extra fields)
+    but carries the OLDER stamp: without tier 0 the field-count tier picks the
+    peer and the confidence bump is silently lost, which is the defect."""
+    amended = _rel("s1", "t1", confidence=0.7,
+                   amended_at="2026-07-28T09:00:00")
+    richer_older = _rel("s1", "t1", confidence=0.5, evidence="stale",
+                        note="n", amended_at="2026-07-20T00:00:00")
+    assert len(richer_older) > len(amended)         # tier 2 favours the peer
+    a, b = _sr(rels=[amended]), _sr(rels=[richer_older])
+    ab, ba = cm.merge_skill_relations(a, b), cm.merge_skill_relations(b, a)
+    assert ab == ba                                                  # guard-907
+    assert yaml.safe_load(ab.decode())["forged_relations"][0]["confidence"] == 0.7
+
+
+def test_sr_unstamped_peer_sorts_oldest():
+    """The MIGRATION-WINDOW case, and the one that pins the "" sentinel: a peer
+    copy written before the writer contract existed has no amended_at at all.
+    It must sort OLDEST (not tie, not win), even though it is richer — else the
+    first amendment after rollout loses to every un-upgraded peer."""
+    amended = _rel("s1", "t1", amended_at="2026-07-28T09:00:00")
+    unstamped_richer = _rel("s1", "t1", confidence=0.5, evidence="pre-fix")
+    assert len(unstamped_richer) > len(amended)     # tier 2 favours the peer
+    a, b = _sr(rels=[amended]), _sr(rels=[unstamped_richer])
+    ab, ba = cm.merge_skill_relations(a, b), cm.merge_skill_relations(b, a)
+    assert ab == ba                                                  # guard-907
+    assert "confidence" not in yaml.safe_load(ab.decode())["forged_relations"][0]
+
+
+def test_sr_removal_survives_amendment_stamp():
+    """guard-1072 was NOT traded away. A field-level UNION of confidence/
+    evidence — the obvious alternative fix — has no deletion semantics and
+    would resurrect a retracted evidence string from any peer holding the old
+    row. The whole-record stamp keeps removal expressible."""
+    trimmed_newer = _rel("s1", "t1", confidence=0.7,
+                         amended_at="2026-07-28T09:00:00")
+    full_older = _rel("s1", "t1", confidence=0.7, evidence="retracted probe log",
+                      amended_at="2026-07-20T00:00:00")
+    a, b = _sr(rels=[trimmed_newer]), _sr(rels=[full_older])
+    ab, ba = cm.merge_skill_relations(a, b), cm.merge_skill_relations(b, a)
+    assert ab == ba
+    won = yaml.safe_load(ab.decode())["forged_relations"][0]
+    assert "evidence" not in won                  # removal NOT resurrected
+
+
+def test_sr_unquoted_amendment_beats_older_quoted():
+    """guard-371, and the case this fix most needed: cmd_add REFUSES duplicates,
+    so amending an edge is a HAND-EDIT — and a hand-editor typing YAML omits
+    quotes, which PyYAML parses as datetime whose str() separator is a SPACE
+    (0x20 < 'T'). Un-normalized, the newer hand-amended row lost to ANY older
+    quoted peer sharing the date, silently reinstating the exact defect on the
+    exact workflow the fix documents. Measured, then fixed, via _ts_key."""
+    newer_unquoted = (b"forged_relations:\n- source: s1\n  target: t1\n"
+                      b"  type: compose_with\n  confidence: 0.9\n"
+                      b"  amended_at: 2026-07-28T09:00:00\nlast_updated: null\n")
+    older_quoted = (b"forged_relations:\n- source: s1\n  target: t1\n"
+                    b"  type: compose_with\n  confidence: 0.1\n"
+                    b"  amended_at: '2026-07-28T08:00:00'\nlast_updated: null\n")
+    ab = cm.merge_skill_relations(newer_unquoted, older_quoted)
+    ba = cm.merge_skill_relations(older_quoted, newer_unquoted)
+    assert ab == ba                                                  # guard-907
+    assert yaml.safe_load(ab.decode())["forged_relations"][0]["confidence"] == 0.9
+
+
+def test_sr_newer_amendment_wins_over_older_amendment():
+    """The plain two-amendments shape. NOTE this case is NOT
+    tier-0-discriminating: with equal field counts the _canon tiebreak sorts
+    keys, `amended_at` sorts first among them, so the newer side wins on
+    content anyway. Kept as a consistency check of the steady-state shape —
+    the tier-0-load-bearing cases are the three above."""
+    older = _rel("s1", "t1", confidence=0.5, amended_at="2026-07-28T08:00:00")
+    newer = _rel("s1", "t1", confidence=0.9, amended_at="2026-07-28T09:00:00")
+    assert len(older) == len(newer)
+    a, b = _sr(rels=[older]), _sr(rels=[newer])
+    ab, ba = cm.merge_skill_relations(a, b), cm.merge_skill_relations(b, a)
+    assert ab == ba
+    assert yaml.safe_load(ab.decode())["forged_relations"][0]["confidence"] == 0.9
+
+
 # --- evolution event streams () -----------------------------------
 def _evo(recs):
     return _rb(recs)
@@ -2523,3 +2741,75 @@ def test_hcb_output_matches_writer_dump_style():
     # — byte-matching it means a semantically-null merge converges.
     a = json.dumps({"k": "v"}, indent=2, sort_keys=True).encode()
     assert cm.merge_hypothesis_category_bindings(a, a) == a
+
+
+# --- alloc_nonce goal identity () ---------------------------------
+# ROOT CAUSE (): _goal_identity keyed on (created_at, title). title is
+# MUTABLE, so a title edit racing a stale snapshot gave the two copies different
+# identities -- they never collapsed in step 1, both landed in the same seq
+# bucket, and step 3 displaced one to a fresh id. ONE GOAL BECAME TWO, silently
+# (proven live:  carries displaced_from=''). The fix keys on an
+# immutable, unique allocation nonce minted at the add-goal chokepoint.
+
+def _nonce_goal(gid, title, nonce=None, created="2026-07-01T00:00:00"):
+    g = {"id": gid, "title": title, "created_at": created, "status": "pending"}
+    if nonce:
+        g["alloc_nonce"] = nonce
+    return g
+
+
+def test_alloc_nonce_collapses_title_edit():
+    # THE regression: same logical goal, retitled on one side. Must stay ONE goal.
+    n = "n" * 32
+    a = [_nonce_goal("g-315-515", "Apply: do the thing", nonce=n)]
+    b = [_nonce_goal("g-315-515", "Unblock: do the thing", nonce=n)]
+    out = cm._merge_goals(a, b, "315")
+    assert len(out) == 1, f"title edit split one goal into {len(out)}"
+    assert out[0]["id"] == "g-315-515"
+    assert "displaced_from" not in out[0]
+
+
+def test_alloc_nonce_keeps_distinct_goals_distinct():
+    # The  guarantee: two DISTINCT goals that collided on one id must
+    # NOT be field-merged into a franken-record. Different nonces => 2 goals.
+    a = [_nonce_goal("g-315-90", "Distinct goal A", nonce="a" * 32)]
+    b = [_nonce_goal("g-315-90", "Distinct goal B", nonce="b" * 32)]
+    out = cm._merge_goals(a, b, "315")
+    assert len(out) == 2
+    assert {g["title"] for g in out} == {"Distinct goal A", "Distinct goal B"}
+
+
+def test_alloc_nonce_distinct_goals_same_second_survive():
+    # Discriminates the SHIPPED fix from the tempting cheap one. Keying identity
+    # on (id, created_at) would collapse these two DISTINCT same-second goals and
+    # lose a writer's content; keying on the nonce keeps both. This test FAILS
+    # under that alternative, which is why it is here rather than the assertion
+    # above alone.
+    same = "2026-07-01T00:00:00"
+    a = [_nonce_goal("g-315-91", "Same-second A", nonce="1" * 32, created=same)]
+    b = [_nonce_goal("g-315-91", "Same-second B", nonce="2" * 32, created=same)]
+    assert len(cm._merge_goals(a, b, "315")) == 2
+
+
+def test_no_nonce_preserves_legacy_identity():
+    # Goals predating the field must behave EXACTLY as before -- the change is a
+    # no-op for them. A legacy title edit still splits (that is the pre-fix
+    # behaviour, deliberately unchanged), and a legacy same-title pair still
+    # collapses by (created_at, title).
+    a = [_nonce_goal("g-315-515", "Apply: do the thing")]
+    b = [_nonce_goal("g-315-515", "Unblock: do the thing")]
+    assert len(cm._merge_goals(a, b, "315")) == 2
+
+    same = [_nonce_goal("g-315-515", "Apply: do the thing")]
+    assert len(cm._merge_goals(same, list(same), "315")) == 1
+
+
+def test_alloc_nonce_merge_is_byte_commutative():
+    # guard-907: identity must stay a pure symmetric function of (a, b) so both
+    # machines converge byte-identically under the fenced-PUT loop.
+    n = "c" * 32
+    a = [_nonce_goal("g-315-515", "Apply: t", nonce=n)]
+    b = [_nonce_goal("g-315-515", "Unblock: t", nonce=n)]
+    ab = json.dumps(cm._merge_goals(a, b, "315"), sort_keys=True)
+    ba = json.dumps(cm._merge_goals(b, a, "315"), sort_keys=True)
+    assert ab == ba

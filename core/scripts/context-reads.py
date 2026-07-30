@@ -77,6 +77,28 @@ def tracker_path(session_id=None):
 
 SESSION_HEADER_PREFIX = "#session:"
 
+# Marker for a RANGED read (offset/limit/pages). Such a read is real evidence the
+# file was opened, but only PARTIAL evidence of context — read-before-edit.md
+# Rule 1 counts it "only if it covers the region being edited", which no gate can
+# evaluate (Edit carries old_string, never a line range). So the two consumers
+# deliberately diverge ():
+#
+#   read_tracker()        FULL only  -> cmd_gate, the BLOCKING dedup gate,
+#                                       and cmd_check (a partly-read convention
+#                                       is not a loaded convention)
+#   _read_tracker_split() both sets  -> cmd_check_file, the non-blocking advisory,
+#                                       which must tell the two states apart
+#
+# Keeping partials out of read_tracker is the load-bearing half. Were a ranged
+# peek allowed to satisfy the dedup gate, the follow-up WHOLE-file read would be
+# refused as "Already in context" — losing the very context the peek lacked, and
+# colliding with verify-before-assuming.md's re-verify mandate. Recording ranged
+# reads at all is the other half: without it the advisory claimed "has not been
+# Read" for a file just read, on every large file (a large file is exactly the one
+# read with offset/limit), and read-before-edit.md Rule 4 names that
+# desensitization as the specific harm.
+PARTIAL_PREFIX = "#partial:"
+
 # Scope filter: only these path prefixes are tracked
 TRACKED_PREFIXES = [
     str(CONFIG_DIR),
@@ -174,8 +196,8 @@ def _read_raw_lines(session_id=None):
     return stored_sid, path_lines
 
 
-def read_tracker(session_id=None):
-    """Read the tracker file, return a set of normalized paths.
+def _read_tracker_split(session_id=None):
+    """Read the tracker file, return (full_paths, partial_paths) as two sets.
 
     Side effect: if session_id doesn't match stored session, DELETES the tracker
     file and returns empty. This self-healing behavior is the ONLY mechanism that
@@ -187,16 +209,41 @@ def read_tracker(session_id=None):
         tp = tracker_path(session_id)
         if tp is not None and tp.exists():
             tp.unlink()
-        return set()
+        return set(), set()
 
-    return set(line.strip() for line in path_lines if line.strip())
+    full, partial = set(), set()
+    for line in path_lines:
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith(PARTIAL_PREFIX):
+            partial.add(line[len(PARTIAL_PREFIX):])
+        else:
+            full.add(line)
+    return full, partial
 
 
-def append_tracker(normalized, session_id=None):
-    """Append a single path to the tracker file."""
+def read_tracker(session_id=None):
+    """Set of FULLY-read paths. Ranged reads are deliberately EXCLUDED.
+
+    Every pre-g-115-3747 caller keeps its exact original semantics, which is what
+    stops cmd_gate from ever refusing a whole-file read on the strength of a
+    ranged peek. Advisory consumers want _read_tracker_split() instead, which
+    hands back both sets so they can tell "never opened" from "opened in part".
+    """
+    return _read_tracker_split(session_id)[0]
+
+
+def append_tracker(normalized, session_id=None, partial=False):
+    """Append a single path to the tracker file.
+
+    partial=True writes the entry behind PARTIAL_PREFIX so it is visible to the
+    advisory but invisible to the blocking dedup gate.
+    """
     if SESSION_DIR is None:
         return  # No agent bound
 
+    entry = (PARTIAL_PREFIX + normalized) if partial else normalized
     tp = tracker_path(session_id)
     # The per-Body tracker lives under sessions/<unitKey>/ (created by /start
     # FORK-BODY); the agent-wide tracker under session/. Guard the parent dir so
@@ -207,10 +254,10 @@ def append_tracker(normalized, session_id=None):
     if not tp.exists() or tp.stat().st_size == 0:
         # New tracker — write session header + first path
         header = f"{SESSION_HEADER_PREFIX}{session_id}\n" if session_id else ""
-        tp.write_text(header + normalized + "\n", encoding="utf-8")
+        tp.write_text(header + entry + "\n", encoding="utf-8")
     else:
         with open(tp, "a", encoding="utf-8") as f:
-            f.write(normalized + "\n")
+            f.write(entry + "\n")
 
 
 def remove_from_tracker(normalized, session_id=None):
@@ -222,7 +269,12 @@ def remove_from_tracker(normalized, session_id=None):
     # Preserve session header, filter path lines
     header_lines = [l for l in lines if l.startswith(SESSION_HEADER_PREFIX)]
     path_lines = [l for l in lines if not l.startswith(SESSION_HEADER_PREFIX)]
-    remaining = [line for line in path_lines if line.strip() != normalized]
+    # BOTH forms must go. Clearing only the full entry would leave a partial one
+    # behind, and the advisory would then stay silent for a file that has since
+    # been modified — a false all-clear, which is the strictly worse direction
+    # than the false alarm this whole change exists to remove.
+    stale = (normalized, PARTIAL_PREFIX + normalized)
+    remaining = [line for line in path_lines if line.strip() not in stale]
     if len(remaining) == len(path_lines):
         return  # Not found, nothing to do
     all_lines = header_lines + remaining
@@ -265,18 +317,33 @@ def cmd_gate(args):
 # ---------------------------------------------------------------------------
 
 def cmd_record(args):
-    """PostToolUse recorder: append path to tracker if in scope."""
-    normalized = normalize_path(args.file_path)
+    """PostToolUse recorder: append path to tracker if in scope.
 
-    # read_tracker MUST run before is_in_scope — it clears stale cross-session trackers
-    tracked = read_tracker(session_id=args.session_id)
+    --partial marks a ranged (offset/limit/pages) read. Before g-115-3747 the
+    shell hook dropped those reads entirely rather than passing them here.
+    """
+    normalized = normalize_path(args.file_path)
+    partial = bool(getattr(args, "partial", False))
+
+    # split-read MUST run before is_in_scope — it clears stale cross-session trackers
+    full, partial_set = _read_tracker_split(session_id=args.session_id)
 
     if not is_in_scope_advisory(normalized):
         return  # Not tracked (recorder uses the WIDER advisory scope — )
 
-    if normalized in tracked:
-        return  # Already recorded
+    if normalized in full:
+        return  # Already at full fidelity; a later ranged peek adds nothing
 
+    if partial:
+        if normalized in partial_set:
+            return  # Already recorded as partial — repeated peeks stay one entry
+        append_tracker(normalized, session_id=args.session_id, partial=True)
+        return
+
+    # A FULL read supersedes any prior partial: drop the stale marker entry so the
+    # dedup gate starts applying (a partial entry is invisible to it by design).
+    if normalized in partial_set:
+        remove_from_tracker(normalized, session_id=args.session_id)
     append_tracker(normalized, session_id=args.session_id)
 
 
@@ -346,20 +413,23 @@ def cmd_clear(args):
 
 def cmd_status(args):
     """Print tracker contents for debugging."""
-    stored_sid, path_lines = _read_raw_lines(None)
-    tracked = set(line.strip() for line in path_lines if line.strip())
-    if not tracked:
+    stored_sid, _path_lines = _read_raw_lines(None)
+    full, partial_set = _read_tracker_split(None)
+    if not full and not partial_set:
         print("Context reads tracker: empty (no files tracked)")
         return
     if stored_sid:
         print(f"Session: {stored_sid}")
-    print(f"Context reads tracker: {len(tracked)} file(s)")
-    for path in sorted(tracked):
+    print(f"Context reads tracker: {len(full)} full, {len(partial_set)} partial")
+    # Marker-stripped by the split above — printing raw lines here would hand
+    # os.path.relpath a "#partial:/abs/path" string and render it as garbage.
+    for path, suffix in ([(p, "") for p in sorted(full)]
+                         + [(p, "  (partial)") for p in sorted(partial_set)]):
         try:
             rel = os.path.relpath(path, str(PROJECT_ROOT).replace("\\", "/"))
         except ValueError:
             rel = path
-        print(f"  {rel}")
+        print(f"  {rel}{suffix}")
 
 
 # ---------------------------------------------------------------------------
@@ -367,14 +437,29 @@ def cmd_status(args):
 # ---------------------------------------------------------------------------
 
 def cmd_check_file(args):
-    """Check if file paths are tracked. Print untracked ones (in scope only)."""
-    tracked = read_tracker(session_id=args.session_id)
+    """Check if file paths are tracked. Print untracked ones (in scope only).
+
+    Default output is unchanged from pre-g-115-3747: a bare path per line, where a
+    partially-read file still counts as "not in context". That contract is
+    load-bearing for the FIVE digest-loader callers (load-loop-digest.sh,
+    load-aspirations-compact.sh, load-tree-summary.sh, load-execute-protocol.sh,
+    load-consolidation-housekeeping.sh) — they do a plain emptiness test on stdout
+    and never parse a prefix, and for them a partly-read digest genuinely does need
+    re-emitting. Only pre-edit-context-gate.sh passes --partial-aware, because only
+    it needs to tell "never opened" apart from "opened, but not all of it".
+    """
+    full, partial_set = _read_tracker_split(session_id=args.session_id)
+    partial_aware = bool(getattr(args, "partial_aware", False))
 
     for fp in args.file_paths:
         normalized = normalize_path(fp)
         # WIDER advisory scope (): the read-before-edit advisory covers
         # core/scripts framework-code edits, which the narrow is_in_scope omits.
-        if is_in_scope_advisory(normalized) and normalized not in tracked:
+        if not is_in_scope_advisory(normalized) or normalized in full:
+            continue
+        if partial_aware and normalized in partial_set:
+            print(f"PARTIAL\t{normalized}")
+        else:
             print(normalized)
 
 
@@ -392,6 +477,8 @@ def build_parser():
 
     record_p = sub.add_parser("record", help="Record a file read into the tracker")
     record_p.add_argument("--session-id", default=None, help="Current session ID (from hook JSON)")
+    record_p.add_argument("--partial", action="store_true",
+                          help="Ranged read (offset/limit/pages) — advisory-visible, never dedup-blocking")
     record_p.add_argument("file_path", help="Absolute path to the file that was read")
 
     inv_p = sub.add_parser("invalidate", help="Remove a file from the tracker (modified)")
@@ -403,6 +490,8 @@ def build_parser():
 
     cf_p = sub.add_parser("check-file", help="Check if file paths are tracked (print untracked)")
     cf_p.add_argument("--session-id", default=None, help="Current session ID (from hook JSON)")
+    cf_p.add_argument("--partial-aware", action="store_true",
+                      help="Prefix ranged-read-only paths with 'PARTIAL\\t' (edit advisory only)")
     cf_p.add_argument("file_paths", nargs="+", help="Absolute file paths to check")
 
     sub.add_parser("clear", help="Delete the tracker file")

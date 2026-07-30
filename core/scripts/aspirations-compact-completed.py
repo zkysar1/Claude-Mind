@@ -73,7 +73,6 @@ from _paths import WORLD_DIR, AGENT_DIR  # noqa: E402
 # blocked_by, intended_agent, counters, …) is preserved verbatim.
 STRIP_FIELDS = ("description", "verification", "outcome_note")
 MARKER = "body_compacted"
-TERMINAL_KEEP_COUNT_STATUSES = None  # placeholder; counts validated generically
 
 
 def _completed_dt(goal: dict):

@@ -943,8 +943,35 @@ recurring:
                                   # out-score capped role_affinity (1.5 ceiling × 1.0
                                   # weight). 4.0 default bounds asymmetry while
                                   # preserving relative ordering up to ~3x overdue.
+                                  # KNOWN, DELIBERATELY UNFIXED (, measured
+                                  # 2026-07-30 cc-04): the hard clamp binds at elapsed
+                                  # 3.17x interval while the starvation predicate starts
+                                  # at 2.00x, so 16 of 21 starved rows — spanning 5.1x to
+                                  # 78.7x overdue — all scored the identical +3.20 and the
+                                  # LEAST-starved row ranked HIGHEST. No value of
+                                  # urgency_max fixes that; it only relocates where
+                                  # ordering dies. An asymptotic soft cap was built and
+                                  # REVERTED: it perturbs the [3.5, 4.0) band and breaks
+                                  # the deliberate  contract that a never-fired
+                                  # recurring goal accrues EXACTLY urgency_max (3 tests in
+                                  # test_goal_selector_never_fired_recurring.py). The
+                                  # starvation fix did not need it — the saturation relief
+                                  # below carries the effect — so the ordering question is
+                                  # split out rather than bundled. See rb-5876.
   saturation_window: 4            # Recent completions window for saturation check
-  saturation_max_penalty: 4.0     # Max raw penalty when all recent are recurring
+  saturation_max_penalty: 4.0     # Max raw penalty when all recent are recurring.
+                                  # NOTE (): equal to urgency_max, and both carry
+                                  # weight 0.8 — so at full class saturation the largest
+                                  # urgency a goal can earn (+3.20) is cancelled to the
+                                  # decimal by the largest penalty it can pay (-3.20),
+                                  # netting 0.00 however overdue it is. That made the 7b
+                                  # design note ("truly overdue recurring goals overcome
+                                  # this via high recurring_urgency") arithmetically
+                                  # impossible. The fix was NOT to unbalance these two
+                                  # numbers but to stop charging the CLASS penalty to
+                                  # individually-starved goals — see the relief block in
+                                  # goal-selector.score_goal, which reuses the FW-1
+                                  # exemption predicate below.
   debt_threshold: 0.80            # Candidate ratio triggering debt recovery bonus
   debt_bonus: 3.0                 # Score bonus for non-recurring goals during recovery
   streak_mult: 3.0                # Streak resets when elapsed > this * interval_hours.
@@ -1060,6 +1087,15 @@ recurring:
   substantive_demotion_margin: 0.5          # demoted recurring lands this far below top substantive
   substantive_demotion_floor: 5.0           # only fires when a non-recurring agent-exec goal scores >= this
   substantive_demotion_overdue_exempt_ratio: 5.0  # recurring goals overdue beyond N× interval are exempt
+  # : the ratio test above is PURE — no absolute-time bound — so 5.0 means
+  # elapsed == 6× interval. A 6h monitor stays demoted until 36h stale; its entire
+  # value is timeliness. Scale the bar to the interval instead of relaxing globally.
+  # Measured over 38 live recurring candidates: a flat ">=12h overdue" OR exempts
+  # 24/38 (baseline 6/38), re-opening the domination FW-1 exists to prevent; this
+  # form exempts 8/38 and cannot touch the 55 of 61 recurring goals above 6h.
+  # Set short_interval_hours to 0 to disable (restores pre- behavior).
+  substantive_demotion_short_interval_hours: 6.0        # "monitor class" = interval <= this
+  substantive_demotion_short_interval_exempt_ratio: 1.0 # monitor exempt at 2× its interval stale
 
   # --- AUTO-CONTRACT (LifingPolls plan item 4 — 2026-05-08) ---
   # Inverse of cargo-cult auto-extend. When a recurring goal consistently
@@ -1160,11 +1196,29 @@ user_signal_boost:
 strategic_focus_boost:
   weight: 1.0                         # raw boost per goal under a named aspiration
                                       # (x1.5 criterion weight -> +1.5 effective).
-                                      # Calibrated so product goals clear ROUTINE
-                                      # infra sweeps — matching the directive's own
-                                      # wording — without overriding higher-scoring
-                                      # verified-defect work. Bias, not veto
-                                      # (Scorer Sovereignty, ).
+                                      # Bias, not veto (Scorer Sovereignty, ).
+#
+# DO NOT RAISE THIS TO MAKE PRODUCT WORK WIN (, 2026-07-28).
+# This comment previously claimed the weight was "calibrated so product goals
+# clear ROUTINE infra sweeps". Measured on live rankings, it does not: three
+# agents independently found the lane top still losing — zeta gap 1.29 and 1.38,
+# foxtrot 1.39, bravo 1.69 — all with the +1.5 already applied. The obvious
+# reading is that the number is too small. It is not; the number is the wrong
+# lever, and that is why the same finding kept recurring.
+#
+# The directive is a PAIRWISE claim: "product goals outrank ROUTINE INFRA SWEEPS
+# at selection time." This knob is a PER-GOAL SCALAR — it biases the lane against
+# EVERYTHING by the same amount, because a per-goal term cannot see what it is
+# competing against. So any value large enough to reliably clear a routine sweep
+# ALSO overrides the verified-defect work the directive never meant to outrank.
+# The magnitude debate is therefore unresolvable AT the scalar: both horns are
+# wrong, which is the tell that the shape is wrong.
+#
+# The pairwise half lives where it can see both sides of the comparison:
+# emit_strategic_focus_banner() in goal-selector.py (fires only when the top pick
+# eligible to this agent is `recurring` and a named-lane goal ranks below it),
+# plus heuristic sh-004 in meta/goal-selection-strategy.yaml. Change THOSE.
+# Keep this at 1.0 as bounded bias.
 
 # --- WORK-CLASS BALANCE (Tranche C — rb-390) ---
 # Pulls under-represented work_class values up when the last-N session
@@ -1250,6 +1304,17 @@ self_drift_gate:
 scoring:
   handoff_bonus: 0.30             # added to score when goal.handoff_to == current agent
   handoff_sender_penalty: -2.5    # applied when goal.handoff_to names ANOTHER agent
+
+user_blocker_escalation:
+  # Phase 0.5b.1c (): EMAIL the user when a goal carrying `user` in
+  # participants has waited past this age. The delivery-channel sibling of
+  # handoff_aging / dependency_timeout / inbox_alert_age_hours — those three all
+  # escalate to the coordination board, which is agent-to-agent and so cannot
+  # discharge a block whose condition is a HUMAN action. Measured: 10+ board
+  # posts in one day on a HIGH ship-gate blocker, user never told.
+  # Cooldown is the escalation's own board post (shared + durable, ),
+  # NOT per-agent WM proactive_escalation_log (N-agent duplication + WM resets).
+  escalate_hours: 48
 
 handoff_aging:
   warn_hours: 48                     # aged handoffs get an escalating scoring bonus from here

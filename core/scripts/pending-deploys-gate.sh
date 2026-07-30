@@ -54,11 +54,11 @@ ASPIRATION="asp-115"          # world framework aspiration — home for infra Un
 SOURCE="world"
 while [ $# -gt 0 ]; do
     case "$1" in
-        --agent)        AGENT="${2:-}"; shift 2 ;;
-        --goal)         GOAL="${2:-}"; shift 2 ;;
-        --timeout-mins) TIMEOUT_MINS="${2:-3}"; shift 2 ;;
-        --aspiration)   ASPIRATION="${2:-asp-115}"; shift 2 ;;
-        --source)       SOURCE="${2:-world}"; shift 2 ;;
+        --agent)        AGENT="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --goal)         GOAL="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --timeout-mins) TIMEOUT_MINS="${2:-3}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --aspiration)   ASPIRATION="${2:-asp-115}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --source)       SOURCE="${2:-world}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         *) shift ;;   # tolerate unknown args (fail-open posture)
     esac
 done

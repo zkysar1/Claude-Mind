@@ -610,8 +610,43 @@ while IFS= read -r line; do
       core/scripts/tests/fixtures/*)              : ;;
       .gitignore)                                 : ;;
       *)
-        if grep -qE "$content_secret_regex" "$path" 2>/dev/null; then
+        # Honor the per-line `# secret-scanner: skip` marker that the sibling
+        # pre-commit gate (check-no-hardcoded-secrets.sh) already honors, so the
+        # two scanners agree on ONE bypass contract instead of two divergent ones
+        # (guard-1280: route every sink through a single source of truth).
+        #
+        # Without this, a line the pre-commit gate explicitly sanctions still makes
+        # the WHOLE file permanently unstageable here — silently, since the WARN
+        # below is one stderr line amid a long commit log. Observed :
+        # verify-learning/SKILL.md added a check scanning for unredacted AWS key
+        # IDs, which necessarily names the canonical AWS *documentation example*
+        # key as its own false-positive exclusion. That literal matched the regex
+        # below, so from d280d96f4 onward every edit to the framework's largest
+        # regression surface (~2490 assertions) stayed uncommitted. guard-1668 is
+        # the general class: a check that forbids a pattern, whose scan surface
+        # includes the file defining the check, hits on its own documentation.
+        # Test the OUTPUT for non-emptiness rather than the pipeline's rc — correct
+        # under every grep implementation, so it cannot regress on a box whose grep
+        # differs. The sibling gate uses the same output-capturing form.
+        #
+        # The rc form (`| grep -qv ...`) is a real trap, though NOT for this script.
+        # Measured on cc-05: `grep -qv` on EMPTY stdin returns 0 under ugrep 7.5.0
+        # and 1 under GNU grep 3.11 — and 0 means "skip" here, so the rc form marks
+        # every CLEAN file as a hit. Scripts are safe (a script's `grep` resolves to
+        # /usr/bin/grep = GNU). It bites when an agent HAND-TESTS the predicate in
+        # its interactive shell, where the user profile defines a `grep` FUNCTION
+        # wrapping ugrep that child processes never inherit (BASH_FUNC_grep is not
+        # exported). That asymmetry is the hazard: the hand-run result is genuine
+        # output from the genuine predicate, so it reads as authoritative while
+        # describing an environment the script never runs in. See
+        # probe-with-canonical-code-path.md, "Canonical BINARY Is Not Canonical
+        # INVOCATION" — this is that class, with the shell itself as the wrong arg
+        # shape. The output form is kept because it is right either way.
+        unmarked_hits=$(grep -nE "$content_secret_regex" "$path" 2>/dev/null \
+                          | grep -vE 'secret-scanner:[[:space:]]*skip' || true)
+        if [[ -n "$unmarked_hits" ]]; then
           echo "[$SCRIPT_NAME] WARN: $path contains token-shaped content — skipping (file stays in working tree)" >&2
+          echo "[$SCRIPT_NAME]       If intentional (an example/test token), append '# secret-scanner: skip' to that line." >&2
           content_skipped_files+=("$path")
           skipped_files+=("$path")
           continue
@@ -1089,6 +1124,61 @@ if [[ "$OUTCOME" == "deep" && ${#staged_files[@]} -gt 0 && -n "${MIND_AGENT:-}" 
   fi
 fi
 
+# --- Backend-conditional temp durability () ------------------------
+# .gitignore carries a blanket `agents/*/temp/*`. Its stated rationale is that
+# temp durability comes from the own-cloud S3 sweep, "NOT by git". That holds on
+# own-cloud and is FALSE on STORAGE_BACKEND=local: no sweep runs, git ignores
+# temp/, so working docs staged there have ZERO durability mechanism. Measured
+# 2026-07-28 on a local-backend deployment: 11 undrained .md working docs would
+# have been lost on clone.
+#
+# WHY THE FIX LIVES HERE AND NOT IN .gitignore: gitignore has no conditionals,
+# so "track only when STORAGE_BACKEND=local" is inexpressible in it.
+# .git/info/exclude is machine-local and does NOT travel to fresh boxes — that
+# was precisely the  bug the blanket ignore rule was created to fix.
+# The condition must live in code, and this script is the staging chokepoint.
+#
+# WHY CONDITIONAL AND NOT UNCONDITIONAL: measured 266 root .md/.json under
+# agents/*/temp/ in this repo. This deployment is own-cloud, where S3 already
+# provides the durability, so unconditional tracking would add 266 files of pure
+# churn to the deployment that does not need it.
+#
+# SCOPE IS DELIBERATELY NARROW — three separate restrictions, each load-bearing:
+#   1. OWN AGENT ONLY. Never force-add a partner's temp/. Over-inclusion of a
+#      partner path is the guard-834 failure mode and is un-preventable at
+#      staging time once it happens (), so it is excluded up front.
+#   2. ROOT LEVEL ONLY (-maxdepth 1). Subdirs are goal-scratch and temp/drained/
+#      is an archive of already-encoded material; neither is an undrained
+#      working doc. This is the population the incident was actually about.
+#   3. *.md ONLY. The own-cloud durable contract (owncloud_sync.py:1355-1358)
+#      covers root *.md AND *.json, but that contract is itself over-broad: in
+#      real usage every root .json is a scratch dump (an 847 KB table scan, a
+#      1.5 MB bank dump, 0-byte probes — ~3.5 MB synced as if durable). Rather
+#      than inherit a known-too-wide rule, this takes the defensible half.
+#      Whether .json belongs in the own-cloud contract at all is tracked
+#      separately as that goal's SECOND FINDING.
+#
+# Backend resolution copies the established idiom from check-prerequisites.sh
+# (live env first, else one grepped line from .env.local — never sourcing the
+# file, so no credentials enter this script's environment).
+declare -a temp_force_files=()
+_resolve_storage_backend() {
+  local v="${STORAGE_BACKEND:-}"
+  if [[ -z "$v" && -f "$REPO/.env.local" ]]; then
+    v="$(grep -E '^[[:space:]]*STORAGE_BACKEND[[:space:]]*=' "$REPO/.env.local" 2>/dev/null \
+        | tail -1 | sed -E 's/^[^=]*=[[:space:]]*//; s/[[:space:]]*#.*$//; s/[[:space:]]*$//')"
+  fi
+  printf '%s' "$v" | tr '[:upper:]' '[:lower:]'
+}
+if [[ -n "${MIND_AGENT:-}" && "$(_resolve_storage_backend)" == "local" ]]; then
+  _temp_dir="$REPO/agents/$MIND_AGENT/temp"
+  if [[ -d "$_temp_dir" ]]; then
+    while IFS= read -r _tf; do
+      [[ -n "$_tf" ]] && temp_force_files+=("agents/$MIND_AGENT/temp/$(basename "$_tf")")
+    done < <(find "$_temp_dir" -maxdepth 1 -type f -name '*.md' 2>/dev/null | sort)
+  fi
+fi
+
 # --- Dry-run output ----------------------------------------------------------
 if [[ $DRY_RUN -eq 1 ]]; then
   echo "[$SCRIPT_NAME] DRY-RUN — would commit in $REPO:"
@@ -1097,6 +1187,10 @@ if [[ $DRY_RUN -eq 1 ]]; then
   echo "---"
   echo "files to stage (git add):"
   for f in "${staged_files[@]}"; do echo "  $f"; done
+  if [[ ${#temp_force_files[@]} -gt 0 ]]; then
+    echo "files to stage (git add -f — local-backend temp durability, g-115-3759):"
+    for f in "${temp_force_files[@]}"; do echo "  $f"; done
+  fi
   if [[ ${#rm_only_files[@]} -gt 0 ]]; then
     echo "files to stage (git rm --cached):"
     for f in "${rm_only_files[@]}"; do echo "  $f"; done
@@ -1177,6 +1271,23 @@ if [[ ${#staged_files[@]} -gt 0 ]]; then
       exit 2
     fi
   }
+fi
+
+# Local-backend temp durability (). `git add -A` above respects
+# .gitignore, so these paths are invisible to it — an ignored file never appears
+# in `git status --porcelain` and so never reaches staged_files. -f is the only
+# way in, and it is why this is a SEPARATE add rather than a filter change.
+#
+# WARN-not-fail is deliberate: this is a durability ENHANCEMENT for one backend,
+# never a precondition for the iteration commit itself. A failure here must not
+# cost the agent its actual work commit, so it can never exit non-zero.
+if [[ ${#temp_force_files[@]} -gt 0 ]]; then
+  if git -C "$REPO" add -f -- "${temp_force_files[@]}" 2>/dev/null; then
+    staged_files+=("${temp_force_files[@]}")
+    echo "[$SCRIPT_NAME] INFO: force-added ${#temp_force_files[@]} local-backend temp doc(s) for durability (g-115-3759)" >&2
+  else
+    echo "[$SCRIPT_NAME] WARN: git add -f failed for temp durability paths (continuing — the work commit is unaffected)" >&2
+  fi
 fi
 
 if [[ ${#rm_only_files[@]} -gt 0 ]]; then

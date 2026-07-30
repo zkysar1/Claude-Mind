@@ -125,8 +125,6 @@ try:
 except Exception:
     evaluate_all = None
 
-TERMINAL_STATUSES = ("completed", "archived", "skipped", "expired", "resolved")
-
 
 def _tolerant_decode(source, raw):
     """-tolerant decode for the daemon aspirations_read body.

@@ -81,6 +81,13 @@ GENUINE_PREFIXES = (
     "time-gated:",
 )
 
+# Age past which a structured-prefix defer stops being self-certifying and
+# becomes a re-check candidate. See classify() for the full rationale and
+# `.claude/rules/reclaim-routed-work.md` rule 2 ("well-formed is not valid").
+# Tunable via --stale-days. 14d matches the pending-questions-sweep
+# auto_resolve horizon so the reclaim lanes age items on one clock.
+STALE_STRUCTURED_DAYS = 14.0
+
 GENUINE_PATTERNS = [
     "weeks of post-",
     "weeks of live",
@@ -131,7 +138,24 @@ def _has_prefix(text: str, prefixes: tuple) -> str | None:
     return None
 
 
-def classify(defer_reason: str, participants: list | None) -> dict:
+def _defer_age_days(defer_set_at) -> float | None:
+    """Age of the defer in days, or None when unparseable/absent.
+
+    Fail-open by design (guard-142): an unreadable timestamp yields None, and
+    every caller treats None as "not stale" — an audit heuristic must never
+    manufacture staleness out of a parse failure.
+    """
+    if not defer_set_at:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(defer_set_at)[:19])
+    except Exception:
+        return None
+    return (datetime.now() - parsed).total_seconds() / 86400.0
+
+
+def classify(defer_reason: str, participants: list | None,
+             defer_set_at=None, stale_days: float = STALE_STRUCTURED_DAYS) -> dict:
     """Return {"category": "a"|"b"|"c"|"unknown", "evidence": [...]}."""
     if not defer_reason:
         return {"category": "unknown", "evidence": ["empty defer_reason"]}
@@ -139,10 +163,46 @@ def classify(defer_reason: str, participants: list | None) -> dict:
     text = defer_reason.strip()
     lo = text.lower()
 
-    # Cat-A first: structured prefix defers are the most explicit
+    # Cat-A first: structured prefix defers are the most explicit.
+    #
+    # WELL-FORMED IS NOT VALID (.claude/rules/reclaim-routed-work.md rule 2).
+    # This branch used to be an UNCONDITIONAL early return, which made a
+    # formatting convention into a laundering mechanism: a defer that merely
+    # STARTED with a structured prefix was stamped "genuine" and no other
+    # signal — narrative patterns, ambiguity patterns, age — was ever
+    # consulted. Measured 2026-07-28 on the live queue: 29 of 40 defers
+    # (72.5%) took this return, including two frozen 6 and 8 days past a
+    # standing grant that had explicitly retired their reason. The prefix
+    # attests that the AUTHOR declared a precondition; it says nothing about
+    # whether that precondition is still a legitimate reason to stay stopped.
+    #
+    # The fast path is preserved for FRESH structured defers (the common,
+    # correct case). Past `stale_days` the prefix downgrades to a cat-B
+    # re-check candidate instead of a verdict — age is the TRIGGER to look
+    # again, never itself the finding (rule 3), so this surfaces for review
+    # rather than concluding anything.
     pfx = _has_prefix(text, GENUINE_PREFIXES)
     if pfx:
-        return {"category": "a", "evidence": [f"structured-prefix:{pfx}"]}
+        age = _defer_age_days(defer_set_at)
+        if age is None:
+            return {"category": "a",
+                    "evidence": [f"structured-prefix:{pfx}", "age:unknown"]}
+        if age <= stale_days:
+            return {"category": "a",
+                    "evidence": [f"structured-prefix:{pfx}", f"age:{age:.1f}d"]}
+        return {
+            "category": "b",
+            "evidence": [
+                f"structured-prefix:{pfx}",
+                f"age:{age:.1f}d",
+                # ASCII-only: this string is DATA, not a comment -- it lands in
+                # the JSON payload and can reach shell args downstream, where a
+                # multi-byte sequence fails argv parsing (guard-607, guard-606).
+                f"stale-structured: prefix is well-formed but {age:.1f}d old "
+                f"(> {stale_days}d) - re-derive BOTH axes: is the premise still "
+                f"true, AND is the reason still a valid reason?",
+            ],
+        }
 
     # Cat-A pattern matches
     a_hits = _has_any(lo, GENUINE_PATTERNS)
@@ -190,9 +250,26 @@ def _enumerate_agents() -> list:
     return out
 
 
+# A defer on a goal that has already reached a terminal status is not routed-away
+# work — there is nothing left to reclaim, so re-deriving its routing can never
+# close anything. Reporting them anyway is not merely noisy: it is the failure mode
+# lane B exists to prevent. Measured 2026-07-29 on the live queue, this lane
+# reported 3 stale-structured defers of which 2 were `retired` — 67% permanent,
+# un-actionable residue that reappears identically every sweep. A reader who checks
+# the lane, finds nothing they can act on, and stops checking has been trained to
+# ignore it by the sweep's own output, which is exactly how the one REAL item
+# (foxtrot's g-005-17) went repeatedly surfaced and never routed.
+# `retired` is included deliberately: it is not in the documented goal-status enum
+# (it is an aspiration status) but live goal records carry it, and both phantoms
+# here had it.
+TERMINAL_STATUSES = frozenset({"completed", "skipped", "expired", "retired"})
+
+
 def load_deferred() -> list:
     """Return list of dicts {src, agent, asp_id, goal_id, defer_reason,
-    defer_set_at, participants, title, status}."""
+    defer_set_at, participants, title, status}.
+
+    Terminal-status goals are excluded — see TERMINAL_STATUSES."""
     out = []
     sources = []
     world = WORLD_DIR if WORLD_DIR.is_dir() else None
@@ -215,6 +292,8 @@ def load_deferred() -> list:
             for g in a.get("goals", []):
                 dr = g.get("defer_reason")
                 if not dr:
+                    continue
+                if (g.get("status") or "").strip().lower() in TERMINAL_STATUSES:
                     continue
                 out.append({
                     "src": src,
@@ -272,12 +351,19 @@ def main(argv=None):
     p.add_argument("--output", choices=("json", "human"), default="json",
                    help="json (default) or human (summary table)")
     p.add_argument("--report", help="Write markdown report to this path")
+    p.add_argument("--stale-days", type=float, default=STALE_STRUCTURED_DAYS,
+                   help=f"Age past which a structured-prefix defer stops being "
+                        f"self-certifying and becomes a cat-B re-check candidate "
+                        f"(default {STALE_STRUCTURED_DAYS}). See "
+                        f".claude/rules/reclaim-routed-work.md rule 2.")
     args = p.parse_args(argv)
 
     deferred = load_deferred()
     enriched = []
     for r in deferred:
-        c = classify(r["defer_reason"], r.get("participants"))
+        c = classify(r["defer_reason"], r.get("participants"),
+                     defer_set_at=r.get("defer_set_at"),
+                     stale_days=args.stale_days)
         enriched.append({**r, "category": c["category"], "evidence": c["evidence"]})
 
     if args.report:

@@ -21,9 +21,9 @@ source "$SCRIPT_DIR/_paths.sh" 2>/dev/null || true
 GOAL_ID=""; GOAL_TEXT=""; CATEGORY=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --goal-id)   GOAL_ID="${2:-}";   shift 2 ;;
-    --goal-text) GOAL_TEXT="${2:-}"; shift 2 ;;
-    --category)  CATEGORY="${2:-}";  shift 2 ;;
+    --goal-id)   GOAL_ID="${2:-}";   shift $(( $# >= 2 ? 2 : 1 )) ;;
+    --goal-text) GOAL_TEXT="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+    --category)  CATEGORY="${2:-}";  shift $(( $# >= 2 ? 2 : 1 )) ;;
     *) shift ;;
   esac
 done

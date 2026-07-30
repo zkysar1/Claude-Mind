@@ -76,7 +76,7 @@ def test_parent_id_origin_signal_beats_title():
     mod = _import_sweep()
     g = {
         "id": "g-001",
-        "title": "Unblock: thing for ",  # different from origin_signal
+        "title": "Unblock: thing for g-999-99",  # different from origin_signal
         "origin_signal": "unblock:g-250-69",
     }
     # origin_signal wins
@@ -243,7 +243,7 @@ def test_rb3887_provenance_created_after_parent_completion_guarded():
         "discovered_by": "g-307-62",
         "created_at": "2026-07-17T20:00:00",
     }
-    ts_idx = {"": "2026-07-17T18:00:00"}  # parent completed FIRST
+    ts_idx = {"g-307-62": "2026-07-17T18:00:00"}  # parent completed FIRST
     assert mod._parse_parent_id(g) == "g-307-62"
     reason = mod._provenance_fp_guard(g, "g-307-62", ts_idx)
     assert reason is not None and "rb-3887" in reason
@@ -261,7 +261,7 @@ def test_rb3887_legacy_wait_created_before_parent_completion_sweeps():
         "discovered_by": "g-250-69",
         "created_at": "2026-05-13T09:00:00",
     }
-    ts_idx = {"": "2026-05-13T09:46:25"}  # parent completed AFTER
+    ts_idx = {"g-250-69": "2026-05-13T09:46:25"}  # parent completed AFTER
     assert mod._provenance_fp_guard(g, "g-250-69", ts_idx) is None
 
 
@@ -311,7 +311,7 @@ def test_g115_2674_origin_signal_form_guarded_when_created_after_parent():
         "discovered_by": "g-250-69",
         "created_at": "2026-05-14T00:00:00",
     }
-    ts_idx = {"": "2026-05-13T09:46:25"}  # parent completed BEFORE
+    ts_idx = {"g-250-69": "2026-05-13T09:46:25"}  # parent completed BEFORE
     assert "rb-3887" in mod._provenance_fp_guard(g, "g-250-69", ts_idx)
     # Same for the title 'for <g-id>' form without origin_signal:
     g_title = {
@@ -338,7 +338,7 @@ def test_g115_2674_layer_d_defer_time_unblock_still_sweeps():
         "discovered_by": "g-250-69",
         "created_at": "2026-05-10T08:00:00",   # filed at defer time
     }
-    ts_idx = {"": "2026-05-13T09:46:25"}  # parent completed LATER
+    ts_idx = {"g-250-69": "2026-05-13T09:46:25"}  # parent completed LATER
     assert mod._provenance_fp_guard(layer_d, "g-250-69", ts_idx) is None
 
 

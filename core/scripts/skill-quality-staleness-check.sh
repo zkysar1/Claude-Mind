@@ -137,11 +137,32 @@ if [ "$MODE" = "file-goal" ] && [ "$rc" = "2" ]; then
     title="Investigate: skill-quality.yaml staleness (>${DAYS}d)"
     desc="Auto-filed by skill-quality-staleness-check.sh. meta/skill-quality.yaml has not been updated in more than ${DAYS} days. Likely cause: Step 8.76 sampling gate excluding current workload (routine outcomes or goal.skill=null). Reference: world/knowledge/tree/system/system-constraints-loop/skill-telemetry-signal-master-plan.md"
     if [ -x "$CORE_ROOT/scripts/aspirations-add-goal.sh" ]; then
-        bash "$CORE_ROOT/scripts/aspirations-add-goal.sh" \
-            --aspiration asp-115 \
-            --title "$title" \
-            --description "$desc" \
-            --priority MEDIUM 2>&1 | tail -3 || true
+        # Goal fields go in the JSON BODY on stdin. --title/--description/
+        # --priority are hard-rejected CLI flags (exit 2, aspirations-add-goal.sh
+        # ~L98) -- this branch passed all three, so it could never file anything,
+        # and `2>&1 | tail -3 || true` swallowed the rejection. Dead from the day
+        # it was written; found by the  sweep, never masked by a
+        # successful filing (zero goals carry this title, any status).
+        # Values reach python via ENV, single-quoted source (guard-165).
+        _sq_payload="$(SQ_TITLE="$title" SQ_DESC="$desc" py -3 -c '
+import json, os
+print(json.dumps({
+    "title": os.environ["SQ_TITLE"],
+    "priority": "MEDIUM",
+    "participants": ["agent"],
+    "category": "framework-architecture",
+    "origin_signal": "investigate:skill-quality-staleness",
+    "description": os.environ["SQ_DESC"],
+}))
+')"
+        if [ -z "$_sq_payload" ]; then
+            echo "WARN: skill-quality staleness payload build failed; goal not filed" >&2
+        else
+            _sq_err="$(printf '%s' "$_sq_payload" \
+                | bash "$CORE_ROOT/scripts/aspirations-add-goal.sh" \
+                      --source world --aspiration asp-115 2>&1 >/dev/null)" \
+                || echo "WARN: skill-quality staleness goal-file failed (non-fatal): ${_sq_err}" >&2
+        fi
     else
         echo "WARN: aspirations-add-goal.sh not available; goal not filed" >&2
     fi

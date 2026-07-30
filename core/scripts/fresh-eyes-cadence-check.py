@@ -108,6 +108,13 @@ def count_completed_goals(world_only: bool = False) -> int:
     return total
 
 
+# In-flight claim TTL for team_aware rituals (). Deliberately longer
+# than any observed ritual (minutes) and far shorter than the cadence itself
+# (100-200 world goals = many hours), so a claim orphaned by a crashed ritual
+# delays the next legitimate fire by at most this window instead of losing it.
+CLAIM_TTL_MINUTES = 30.0
+
+
 def team_stamp_value(slot_name: str):
     """Read the shared team-fire stamp for `slot_name` from
     world/team-state.yaml → shared_cadences.<slot_name> (g-115-1388).
@@ -445,6 +452,47 @@ def main() -> int:
         # (implementation-discipline + elegance-is-subtraction). Revisit only
         # on evidenced steady-state harm.
         if fe.get("team_aware"):
+            # ── In-flight claim check (, 2026-07-28) ──────────────
+            # The shared stamp below is written at ritual END but READ here at
+            # ritual START, so agents entering that window together all read
+            # the same pre-fire value and all pass (check-then-act). Measured
+            # before this guard: 4 duplicate rituals across ~34 post-mechanism
+            # fires — 2026-06-15, 06-19, and BOTH slots on 07-19, gaps
+            # 2m48s-9m52s. The team gate was live (, 2026-06-10) for
+            # every one of them and suppressed none, because a stamp that does
+            # not exist yet cannot suppress anything.
+            #
+            # The claim is written by the ACTION-PERFORMER at ritual start
+            # (fresh-eyes-record-tick.sh --claim), never here: guard-718 keeps
+            # the performer sole writer of every shared cadence key and leaves
+            # this gate read-only. It lives in a SEPARATE key rather than in
+            # the stamp — writing the real stamp early would corrupt the
+            # cadence basis if the ritual then died, costing a full cadence
+            # (days). A stale claim costs at most CLAIM_TTL_MINUTES.
+            # Fail-open on every unreadable field: a claim bug must never
+            # starve the ritual.
+            claim = team_stamp_value(f"{slot_name}__inflight_claim")
+            if isinstance(claim, dict):
+                claimed_by = claim.get("claimed_by")
+                claimed_epoch = _parse_iso_epoch(claim.get("claimed_at"))
+                me = os.environ.get("MIND_AGENT", "")
+                # claimed_by == me is IGNORED on purpose: a claim orphaned by
+                # my own crashed ritual must not block me out of re-running it.
+                if claimed_by and claimed_by != me and claimed_epoch is not None:
+                    age_min = (datetime.now().timestamp() - claimed_epoch) / 60.0
+                    # A future-dated claim (clock skew) and an expired one
+                    # (dead ritual) both fall through to the normal path.
+                    if 0 <= age_min < CLAIM_TTL_MINUTES:
+                        print(
+                            f"fresh-eyes-cadence-check: noop "
+                            f"(block={args.config_block}, per-agent "
+                            f"diff={diff}>=cadence={goal_cadence} but "
+                            f"{claimed_by} claimed this shared ritual "
+                            f"{age_min:.1f}m ago and is still mid-flight — "
+                            f"suppressing duplicate; re-fires after "
+                            f"{CLAIM_TTL_MINUTES:.0f}m if that ritual died)"
+                        )
+                        return 1
             team = team_stamp_value(slot_name)
             team_world = (team or {}).get("world_goals_count_at_last_fire")
             if team_world is not None:

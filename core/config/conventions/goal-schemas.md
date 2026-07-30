@@ -470,15 +470,69 @@ from quiescence eligibility).
 
 ```yaml
 blocker_ref:
+  # --- core keys (always present after validation) ---
   type:         <enum — see BLOCKER_REF_TYPES>
   external_id:  <string — observable identifier the next wake-cycle can probe>
   state_hash:   <string or null — optional snapshot for wake-miss detection>
   created_at:   <ISO 8601 timestamp, auto-populated>
   expires_at:   <ISO 8601 timestamp, auto-populated from per-type TTL>
+  # --- promoted optional keys (present only when supplied) ---
+  unblock_goal: <goal-id or board-msg ref — the thing whose completion clears this>
+  why:          <free text — human-readable rationale>
 ```
 
+**Key vocabulary is closed (g-115-3532).** `validate()` accepts exactly the keys
+above. Three input aliases fold onto their canonical spelling — `unblocking_goal`
+and `unblocking_goal_id` → `unblock_goal`, `reason` → `why`, `ref` →
+`external_id` — and an explicit canonical key wins over its alias. **Any other
+key is REFUSED, not silently dropped** (`blocker_type` → use `type`;
+`blocking_goal` → use `unblock_goal`; `blocker_id` → use `external_id`;
+`denied_action` / `principal` / `probe` → put it in `why`). Refusing is
+deliberate: absorbing variants one at a time is how a vocabulary reaches five
+spellings, which is exactly how this schema got into the state described below.
+
+`unblock_goal` and `why` are PROMOTED rather than stripped because a live reader
+consumes them — `blocked-signal-resolution-check._resolve_blocker_ref` resolves
+a ref via `unblock_goal`, so stripping it would convert a resolvable block into
+an opaque one.
+
+> **AUTO-POPULATION CAVEAT — RESOLVED for the write path (g-115-3532,
+> 2026-07-27).** "Auto-populated" was previously a claim about ONE write path
+> and FALSE for the others: population happens inside
+> `gates/blocker_ref.validate()`, which was reached ONLY via the `--blocker-ref`
+> flag (CLI) / `X-Mind-Blocker-Ref` header (daemon). A DIRECT field write —
+> `aspirations-update-goal.sh <id> blocker_ref '<json>'` — landed verbatim with
+> no validation, no normalization and no TTL.
+>
+> Measured consequence (2026-07-27, g-115-3505): of 11 live blocked goals
+> carrying a dict `blocker_ref`, exactly ONE matched `validate()`'s output
+> shape and 6 carried no `expires_at` at all. A ref with no `expires_at` never
+> TTL-expires, so the auto-conversion promised in "Expiry behavior" below could
+> never fire for it.
+>
+> **Both** write paths now normalize: `aspirations.py cmd_update_goal` and
+> `mind_api/src/endpoints/aspirations_write.py` route a direct dict write
+> through the same `validate()` (guard-330 — every write path calls its
+> full-record validator). Regression-pinned by
+> `core/scripts/tests/test_blocker_ref_write_path_normalization.py`.
+>
+> **Two gaps remain — do NOT assume a stored ref is canonical.** (1) A
+> bare-STRING `blocker_ref` is still a live reader-supported shape and is
+> deliberately out of scope here (tracked in g-115-3313). (2) Stored refs are
+> not re-validated on read, and the live corpus predates this fix: 4 `type`
+> values in use are absent from `BLOCKER_REF_TYPES` (`resource-contention`,
+> `coordination`, `upstream_artifact_unpushed`, plus one ref with no `type` at
+> all), so those refs would be REFUSED if rewritten today. Enum reconciliation
+> + backfill of the untimed refs is tracked in **g-115-3543**.
+>
+> `quiescence-gate.py` C3 treats an ABSENT `expires_at` as disqualifying
+> (absent is not "not yet expired" — guard-487: a suppression gate fails
+> CLOSED), so quiescence stays denied until the backfill lands.
+
 **`type` enum** (single source of truth: `BLOCKER_REF_TYPES` in
-`core/scripts/aspirations.py`):
+`core/scripts/gates/blocker_ref.py` — `aspirations.py` imports it, it does not
+define it. That module's header lists the 5 sites a new type must be added to,
+including its `BLOCKER_REF_TTL_HOURS` entry, which is keyed BY type):
 
 | Type | Meaning | `external_id` conventions |
 |------|---------|---------------------------|

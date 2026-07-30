@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Reflect bookkeeping — Tier 1a hot-path extraction.
 # Subcommands: encoding-score|dual-classification|convention-routing|
-#              entity-normalize|context-gap|utilization-delta|batch-micro|run-all
+#              entity-normalize|context-gap|utilization-delta|batch-micro|
+#              surprise|run-all
 # Plan: ~/.claude/plans/i-had-one-agent-luminous-reddy.md (Tier 1a #2).
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"

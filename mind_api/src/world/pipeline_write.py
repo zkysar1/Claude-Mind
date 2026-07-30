@@ -25,6 +25,7 @@ from ..jsonl_cache import cache as _jsonl_cache
 from .. import file_locks, history, changelog
 
 from _fileops import _atomic_write_with_fallback  # noqa: E402
+from _surprise import apply_derived_surprise  # noqa: E402  # : surprise is DERIVED, not caller-supplied
 from storage_backend import get_backend  # noqa: E402  # s5c: own-cloud read freshness
 from ..agent_paths import assert_not_cruft  # noqa: E402
 
@@ -138,6 +139,40 @@ def _normalize_record(rec: Dict[str, Any]) -> Dict[str, Any]:
             if rec[new_name] is None and rec[old_name] is not None:
                 rec[new_name] = rec[old_name]
             del rec[old_name]
+    # SURPRISE IS DERIVED, NEVER ACCEPTED FROM THE CALLER ().
+    # It is a pure function of (outcome, confidence) — both already on the
+    # record — so a caller-supplied value is not an input, it is a second
+    # writer of a derived field, and it drifted: measured across the resolved +
+    # archived union (769 records, 391 scoreable), 158 stored values (40.4%)
+    # disagreed with the canonical helper and 80 (20.5%) disagreed by enough to
+    # change the /review-hypotheses Step 3.5 branch. 47 of those UNDER-stated,
+    # so a mandated broad re-retrieve + reconciliation never ran — silently,
+    # because nothing errors and the record looks complete. Deriving here makes
+    # the drift structurally impossible rather than merely forbidden by prose,
+    # which is why this is a subtraction and not a validating gate: a gate
+    # would keep two writers and need its own enforcement (same shape as
+    # guard-1280 / guard-1604).
+    #
+    # All four write endpoints in this module — move, add, update, update_field
+    # — call _normalize_record, but that is NOT sufficient on its own and this
+    # comment used to claim it was. update_field normalizes and THEN assigns
+    # `rec[field] = value`, so the assignment lands on top of anything derived
+    # here; it re-applies the derivation itself (see apply_derived_surprise's
+    # docstring for the two measured holes). "Every writer calls the normalizer"
+    # and "every writer is covered" are different claims — the second needs the
+    # ordering checked, not just the call.
+    #
+    # Placed AFTER the renames block on purpose, so a caller using the legacy
+    # `surprise_level` name has already been folded into `surprise` and cannot
+    # reintroduce a stale value behind this assignment.
+    #
+    # derive_surprise returns None for anything not genuinely scoreable (no
+    # outcome, a non-CONFIRMED/CORRECTED outcome, or a missing/unparseable
+    # confidence) and we leave the stored value untouched in that case — so an
+    # unresolved record's `surprise: None` keeps meaning "not yet resolved"
+    # rather than being overwritten with a 0 that reads as a real measurement.
+    apply_derived_surprise(rec)
+
     if "slug" not in rec and "id" in rec:
         parts = rec["id"].split("_", 1)
         rec["slug"] = parts[1] if len(parts) > 1 else rec["id"]
@@ -758,6 +793,12 @@ def update_field(ctx) -> "Response":  # type: ignore[name-defined]
             idx, rec = found
             rec = _normalize_record(rec)
             rec[field] = value
+            # Re-derive AFTER the assignment (). _normalize_record
+            # already derived surprise, but that ran one line too early to
+            # matter here: `--field surprise --value 99` overwrites the derived
+            # value, and `--field outcome --value CONFIRMED` changes the very
+            # input the derivation reads without re-running it. Both measured.
+            apply_derived_surprise(rec)
 
             try:
                 _validate_record(rec)
@@ -1296,6 +1337,14 @@ def meta_update(ctx) -> "Response":  # type: ignore[name-defined]
     }
 
     try:
+        # WRITE-CLASS RESOLVED, no locked_rmw cure needed (, measured):
+        # coordination_merge.merge_handler_for("pipeline-meta.json") returns
+        # merge_pipeline_meta, so this is class (a) MERGE-PROTECTED — a
+        # reconciler runs below the write and a conflict is merged rather than
+        # refused, which is what locked_rmw's retry would otherwise be for. The
+        # other half of the cure is already present below: the read is force-
+        # freshed INSIDE the lock, so this site never had the unlocked-read
+        # window that the class-(b) sites in mind_api/src/meta did.
         with file_locks.locked(meta_path):
             # #38 own-cloud: force-fresh the local cache BEFORE the raw read so
             # (a) the read sees a peer's committed meta and (b) the backend

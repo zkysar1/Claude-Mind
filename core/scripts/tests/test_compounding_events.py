@@ -303,7 +303,7 @@ def test_append_event_roundtrip(tmp_path):
 
 def test_append_rejects_invalid_without_writing(tmp_path):
     store = tmp_path / "compounding-events.jsonl"
-    res = ce.append_event(_lb_event(goal="", src=""), path=str(store))  # self-citation
+    res = ce.append_event(_lb_event(goal="g-555-01", src="g-555-01"), path=str(store))  # self-citation
     assert res["ok"] is False
     assert "self-citation" in res["error"].lower()
     # Nothing written.
@@ -401,7 +401,7 @@ def test_emit_self_citation_cited_is_skipped(tmp_path):
         supp=[{"id": "rb-100", "type": "reasoning_bank"}])
     res = ce.emit("g-200-01", artifact_ref="abc123",
                   artifact_write_time="2026-06-27T11:00:00",
-                  cited={"rb-100": ""},   # source == closing goal
+                  cited={"rb-100": "g-200-01"},   # source == closing goal
                   manifest_path=manifest, store=str(store), enabled=True)
     assert res["emitted_load_bearing"] == 0
     assert res["skipped"] == 1

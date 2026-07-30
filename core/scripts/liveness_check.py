@@ -30,9 +30,22 @@ The verdict is intentionally conservative:
   * DORMANT — both are present but both are stale (> threshold).
   * UNKNOWN — neither signal could be read (do NOT report DORMANT when we could
     not even check — UNKNOWN is safer than a false-dormant).
+  * RETIRED — the agent's shard carries a live retirement tombstone. Checked
+    FIRST, because retirement dominates both freshness signals (g-115-3702).
+
+Why RETIRED cannot be derived from freshness (g-115-3702): retirement is a
+TOMBSTONE, not a delete — shard deletion needs s3:DeleteObject rights fleet
+boxes do not hold — so a retired agent's shard survives and keeps being
+written, and the retirement WRITE ITSELF refreshes the fresh signal. Retiring
+an agent therefore made it look MORE alive for a full threshold window. Because
+composing the roster drops retired rows, ``last_active`` also comes back absent,
+removing the one signal that would have aged into DORMANT and leaving shard
+freshness as the sole input. Measured on `meta-tiebreaker`: retired_at
+17:08:19, authoritative-store push 17:08:20, verdict "alive" 2.8h later.
 
 ``decide_liveness`` is a PURE function (no IO) so it is unit-testable without a
-backend; the boto3 / mtime fetch lives in ``main`` behind ``fetch_fresh_signal``.
+backend; the boto3 / mtime fetch lives in ``main`` behind ``fetch_fresh_signal``,
+and the tombstone read behind ``fetch_retirement_tombstone``.
 """
 import argparse
 import json
@@ -86,12 +99,18 @@ def _fmt_age(delta):
     return f"{mins / 60.0:.1f}h"
 
 
-def decide_liveness(last_active_iso, fresh_signal_iso, threshold_hours=DEFAULT_THRESHOLD_HOURS, now=None):
+def decide_liveness(last_active_iso, fresh_signal_iso, threshold_hours=DEFAULT_THRESHOLD_HOURS, now=None,
+                    retired_entry=None):
     """Pure liveness decision.
 
     Returns a dict: {verdict, reason, signal, last_active_age_min, fresh_age_min}
-    where verdict is one of "alive" | "dormant" | "unknown" and ``signal`` names
-    which input carried the alive verdict ("last_active" | "fresh_signal" | None).
+    where verdict is one of "alive" | "dormant" | "unknown" | "retired" and
+    ``signal`` names which input carried the verdict ("last_active" |
+    "fresh_signal" | "retirement_tombstone" | None).
+
+    ``retired_entry`` is the agent's shard dict when it carries a live retirement
+    tombstone (see fetch_retirement_tombstone), else None. Defaulting to None keeps
+    every existing caller's behavior byte-identical.
     """
     if now is None:
         raise ValueError("now must be supplied (kept explicit for testability)")
@@ -103,6 +122,26 @@ def decide_liveness(last_active_iso, fresh_signal_iso, threshold_hours=DEFAULT_T
         return round(d.total_seconds() / 60.0, 1) if d is not None else None
 
     base = {"last_active_age_min": mins(la_age), "fresh_age_min": mins(fs_age)}
+
+    # Retirement DOMINATES every freshness signal, and is checked before the fast
+    # path on purpose: an agent retired moments ago still has a fresh last_active,
+    # so a freshness-first ordering would report it alive. _is_retired has already
+    # applied the revival rule (a heartbeat newer than retired_at un-retires), so
+    # reaching here with a tombstone means the row is genuinely decommissioned.
+    # "retired" is a distinct verdict rather than "dormant" because the two
+    # authorise different things: dormant means quiet and may come back, retired
+    # means gone. Consumers testing `verdict == "dormant"` (goal-selector's
+    # _liveness_confirms_dormant) therefore get False and keep goals routed —
+    # the fail-safe direction (g-115-3702).
+    if retired_entry:
+        ra = str(retired_entry.get("retired_at") or "unknown")
+        by = str(retired_entry.get("retired_by") or "unknown")
+        return {"verdict": "retired", "signal": "retirement_tombstone",
+                "reason": (f"agent carries a retirement tombstone (retired_at {ra}, by {by}) — "
+                           "decommissioned, not merely quiet. Shard freshness is NOT evidence of "
+                           "life here: the shard survives retirement and the retirement write "
+                           "itself refreshes it."),
+                **base}
 
     # Fast path: a fresh last_active is sufficient (common case, no fresh-signal
     # fetch needed by the caller).
@@ -180,6 +219,44 @@ def fetch_fresh_signal(agent, world_dir, backend):
     return fetch_local_shard_mtime(agent, world_dir)
 
 
+def fetch_retirement_tombstone(agent, world_dir):
+    """The agent's shard dict when it carries a live retirement tombstone, else None.
+
+    Retirement is a TOMBSTONE, not a delete: shard deletion needs s3:DeleteObject
+    rights fleet boxes do not hold, so a retired agent's shard SURVIVES and keeps
+    getting written. Both freshness signals above read that shard's write time, so
+    without this check a decommissioned agent reads "alive" forever.
+
+    The inversion that makes it worse (g-115-3702, observed 2026-07-28): the
+    retirement WRITE ITSELF refreshes the signal, so retiring an agent makes it
+    look MORE alive for a full threshold window. Measured on `meta-tiebreaker` —
+    retired_at 17:08:19, authoritative-store push 17:08:20 (one second later),
+    verdict still "alive" 2.8h afterwards. And because composing the roster drops
+    retired rows, ``last_active`` comes back absent, which removes the one signal
+    that would otherwise have aged into "dormant" — leaving shard freshness as the
+    SOLE input and any future write (a sync, a merge, a re-push) re-freshening it.
+
+    Retirement semantics are NOT reimplemented here: ``_team_state._is_retired`` is
+    the single source of truth and carries the self-healing revival rule (a
+    heartbeat newer than retired_at un-retires the row).
+
+    Fail-open (same posture as fetch_fresh_signal): any missing shard, unreadable
+    YAML, or import failure returns None and the caller falls through to the
+    freshness verdict. Note this reads the LOCAL shard — under own-cloud the local
+    tree is a read-through cache, so an un-pulled shard yields None on a box that
+    has never read it (guard-980: absence of a local file is not evidence).
+    """
+    shard = os.path.join(world_dir, "team-state", "agents", f"{agent}.yaml")
+    try:
+        import yaml
+        import _team_state
+        with open(shard, "r", encoding="utf-8") as fh:
+            entry = yaml.safe_load(fh) or {}
+        return entry if _team_state._is_retired(entry) else None
+    except Exception:  # noqa: BLE001 — fail-open, never block a liveness read
+        return None
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Liveness verdict combining last_active + an inherently-fresh signal.")
     ap.add_argument("--agent", required=True)
@@ -201,7 +278,12 @@ def main(argv=None):
     if not (la_age is not None and la_age <= timedelta(hours=args.threshold_hours)):
         fresh_iso = fetch_fresh_signal(args.agent, args.world_dir, args.backend)
 
-    result = decide_liveness(args.last_active, fresh_iso, args.threshold_hours, now=now)
+    # Cheap local read, and it must run even on the last_active-fresh fast path:
+    # an agent retired moments ago still has a fresh last_active.
+    retired_entry = fetch_retirement_tombstone(args.agent, args.world_dir)
+
+    result = decide_liveness(args.last_active, fresh_iso, args.threshold_hours, now=now,
+                             retired_entry=retired_entry)
     result["agent"] = args.agent
     result["fresh_signal_iso"] = fresh_iso
     result["last_active_iso"] = (args.last_active or None)

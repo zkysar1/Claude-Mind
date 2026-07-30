@@ -221,7 +221,7 @@ def test_backfill_skips_goals_with_existing_source(tmp_path):
              "origin_signal": "decomposition:g-000-00",
              "goal_source": "user"},  # explicit, mismatched on purpose
             {"id": "g-001-02", "status": "pending",
-             "origin_signal": "decomposition:"},  # unset
+             "origin_signal": "decomposition:g-000-00"},  # unset
         ],
     }
     (world_path / "aspirations.jsonl").write_text(
@@ -244,8 +244,8 @@ def test_backfill_skips_goals_with_existing_source(tmp_path):
                (world_path / "aspirations.jsonl").read_text(encoding="utf-8").splitlines()
                if ln.strip()]
     by_id = {g["id"]: g for g in written[0]["goals"]}
-    assert by_id[""]["goal_source"] == "user"        # preserved
-    assert by_id[""]["goal_source"] == "agent-self"  # filled
+    assert by_id["g-001-01"]["goal_source"] == "user"        # preserved
+    assert by_id["g-001-02"]["goal_source"] == "agent-self"  # filled
 
     counters_2: dict = {}
     mod._backfill_source("world", world_path / "aspirations.jsonl", True, counters_2)

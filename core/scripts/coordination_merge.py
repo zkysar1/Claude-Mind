@@ -70,6 +70,26 @@ def _canon(v) -> str:
     return json.dumps(v, sort_keys=True, ensure_ascii=True, default=str)
 
 
+def _ts_key(v) -> str:
+    """Normalize a timestamp scalar into a lexicographically-comparable key.
+
+    guard-371: PyYAML parses an UNQUOTED timestamp into a ``datetime``, whose
+    ``str()`` uses a SPACE separator ("2026-07-28 09:00:00") where the quoted
+    form keeps ISO's "T". Space (0x20) sorts BELOW "T" (0x54), so a bare
+    ``str()`` compare ranks a NEWER unquoted stamp under ANY older quoted one
+    sharing the same date — silently inverting the ordering it exists to
+    establish. Quoting is invisible in YAML, so a hand-edit is the likely
+    producer of the unquoted form and the amend path is exactly where it lands.
+
+    Accepts str, datetime, date, or None (missing sorts oldest) — which is why
+    this normalizes rather than calling ``.isoformat()`` directly as guard-371's
+    action_hint suggests: the merge sees BOTH already-ISO strings and parsed
+    datetimes in the same field, and only str has no ``.isoformat()``."""
+    if v is None:
+        return ""
+    return str(v).replace(" ", "T")
+
+
 def _newer(x, y) -> bool:
     """True iff ISO-8601 timestamp ``x`` is STRICTLY newer than ``y``. None
     (missing timestamp) sorts oldest. ISO 8601 local timestamps are fixed-width
@@ -156,9 +176,37 @@ def _merge_rb_record(a: dict, b: dict) -> dict:
       - status:      a retire is a deliberate, monotonic action -> retired-dominates
       - utilization: per-counter MAX (see _merge_counters)
       - valid_to:    a set retirement bound dominates a null; else newer wins
-      - everything else: deterministic content tiebreak (larger canon)
+      - everything else: PER-FIELD ``amended_fields`` recency tier, then the
+        deterministic content tiebreak (larger canon) when both sides are
+        unstamped or stamped identically
       - key order:   canonicalized when the sides' key sequences diverged
-        (_commutative_key_order — byte-commutativity on distinct-key adds)."""
+        (_commutative_key_order — byte-commutativity on distinct-key adds).
+
+    WHY THE AMENDMENT TIER EXISTS HERE, AND WHY THE EXPOSURE IS WORSE THAN THE
+    GUARDRAIL CASE (g-115-3688). The generic tiebreak ``_canon(va) >= _canon(vb)``
+    decides by BYTE ORDER, which has no relation to which text is newer — see
+    _merge_guard_record for the full 0x22-terminator derivation. What differs is
+    WHICH field it reaches. ``_guard_identity`` keys on (created, FULL rule), so a
+    guardrail's primary payload is immune: a divergent ``rule`` SPLITS into two
+    records rather than losing one, and only the secondary free-text fields were
+    exposed. ``_rb_identity`` keys on (created, TITLE), so ``content`` — the
+    reasoning bank's PRIMARY payload — is a mutable NON-identity field that flows
+    straight into the generic tiebreak. Measured before the fix (in-process probe,
+    2026-07-28): merging content='base text' against content='base text and more'
+    yielded 'base text' — the amendment was silently reverted.
+
+    PER-FIELD, not a record-level scalar (the g-115-3690 correction). This
+    function merges FIELD BY FIELD, so a record-level ordering key would mean
+    "the newer WRITE wins EVERY content field" and would deterministically
+    discard a concurrent amendment to a different field of the same record.
+    ``_field_stamp`` reads the per-field map first and falls back to the retired
+    record-level ``amended_at`` scalar as a migration floor; absent both,
+    ``_ts_key(None)`` is ``""`` (sorts oldest), so a stamped record beats an
+    unstamped legacy copy and two unstamped records keep pre-fix behavior exactly.
+
+    Reasoning-bank records carry NO top-level monotonic counter — every counter
+    lives inside ``utilization`` (merged above) — so there is no
+    _GUARD_MONOTONIC_FIELDS analogue to place above this tier."""
     out = dict(a)
     for k, vb in b.items():
         if k not in out:
@@ -179,8 +227,27 @@ def _merge_rb_record(a: dict, b: dict) -> dict:
                 out[k] = va
             else:
                 out[k] = va if _newer(va, vb) or (va == vb) else vb
+        elif k == _AMEND_STAMP_FIELD and isinstance(va, dict) and isinstance(vb, dict):
+            # The stamp map needs its OWN merge rule, or it falls to the generic
+            # tiebreak below and one box's whole map replaces the other's —
+            # losing the ordering evidence this tier reads, one level down.
+            out[k] = _merge_stamp_map(va, vb)
+        elif k == _AMEND_LEGACY_FIELD:
+            # Retired record-level scalar: MAX, not byte order. _canon(None) is
+            # "null" and _canon("2026-…") opens with '"' (0x22 < 0x6E), so the
+            # generic tiebreak would let a NULL beat a real timestamp and erase
+            # the floor the migration path reads.
+            out[k] = va if _ts_key(va) >= _ts_key(vb) else vb
         else:
-            out[k] = va if _canon(va) >= _canon(vb) else vb
+            # Amendment recency, PER FIELD — deliberately BELOW
+            # status/utilization/valid_to, which carry semantics recency must not
+            # override: a retirement on box A must survive a newer unrelated
+            # amendment on box B, and a counter must never regress.
+            sa, sb = _field_stamp(a, k), _field_stamp(b, k)
+            if sa != sb:
+                out[k] = va if sa > sb else vb
+            else:
+                out[k] = va if _canon(va) >= _canon(vb) else vb
     return _commutative_key_order(a, b, out)
 
 
@@ -361,6 +428,46 @@ def _guard_identity(rec: dict):
 # the lexically-larger canonical JSON ("9" > "10"), REGRESSING the count.
 _GUARD_MONOTONIC_FIELDS = ("times_triggered",)
 
+# Per-field amendment stamps, {<field-name>: <iso-timestamp>}, written by the
+# daemon's /v1/store/set-field via StoreSpec.amend_stamp_field ().
+_AMEND_STAMP_FIELD = "amended_fields"
+# The RETIRED record-level scalar it replaced (). Live only on records
+# written between commit d30d21bd and ; read as a per-field floor.
+_AMEND_LEGACY_FIELD = "amended_at"
+
+
+def _merge_stamp_map(a: dict, b: dict) -> dict:
+    """Union two per-field stamp maps, keeping the LATER timestamp per key.
+
+    Union (not pick-one) because each box only stamps the fields IT wrote: box A
+    amending ``trigger_condition`` and box B amending ``action_hint`` produce maps
+    with disjoint keys, and both stamps are true. Per-key MAX resolves the case
+    where both boxes wrote the same field. Commutative and idempotent."""
+    out = dict(a)
+    for k, vb in b.items():
+        va = out.get(k)
+        out[k] = vb if va is None or _ts_key(vb) > _ts_key(va) else va
+    return out
+
+
+def _field_stamp(rec: dict, field: str) -> str:
+    """Comparable amendment stamp for ONE field of ONE record.
+
+    Resolution order, and why: the per-field map is the truth when it carries the
+    field. Otherwise fall back to the retired record-level scalar — the MIGRATION
+    path (g-115-3690 step 5). A record written between d30d21bd and this fix has
+    a real scalar and no map; reading the scalar as a floor for every field keeps
+    those records ordering exactly as they did, instead of silently dropping to
+    unstamped and regressing them to the byte-order tiebreak. Absent both,
+    ``_ts_key(None)`` is ``""`` — sorts oldest, so a stamped record beats an
+    unstamped one and two unstamped records fall through unchanged."""
+    m = rec.get(_AMEND_STAMP_FIELD)
+    if isinstance(m, dict):
+        v = m.get(field)
+        if v is not None:
+            return _ts_key(v)
+    return _ts_key(rec.get(_AMEND_LEGACY_FIELD))
+
 
 def _merge_guard_record(a: dict, b: dict) -> dict:
     """Field-merge two guardrail records sharing identity (created + rule) — the
@@ -368,7 +475,58 @@ def _merge_guard_record(a: dict, b: dict) -> dict:
     _merge_rb_record (status retired-dominates, utilization per-counter MAX,
     valid_to set-dominates-else-newer, everything else content tiebreak) PLUS
     top-level ``times_triggered`` MAX (a monotonic trigger counter reasoning-bank
-    records do not carry)."""
+    records do not carry) PLUS a PER-FIELD ``amended_fields`` recency tier on the
+    generic content fields (guard-1703, redesigned g-115-3690).
+
+    WHY THE AMENDMENT TIER EXISTS (g-115-3662 item 2). The generic tiebreak
+    ``_canon(va) >= _canon(vb)`` decides by BYTE ORDER, which has no relation to
+    which text is newer. Canonical JSON closes a string with ``"`` (0x22); an
+    appended clause continues with whatever character follows the shared prefix.
+    So an amendment that appends after a SPACE (0x20 < 0x22) LOSES to the text it
+    extends, while one appending a comma or hyphen (0x2C / 0x2D > 0x22) wins —
+    the outcome turns on the first character of the addition, which no author
+    controls deliberately. Same defect class as guard-371 (space-vs-"T").
+
+    Scope, measured rather than assumed (probe, 2026-07-28): this tier does NOT
+    protect ``rule``. ``_guard_identity`` keys on (created, FULL rule), so two
+    records whose rule text differs are DIFFERENT identities and never reach this
+    function — a divergent rule SPLITS into two records instead of losing one.
+    The fields actually exposed are the amendable free-text ones:
+    ``trigger_condition``, ``action_hint``, ``source``.
+
+    Deliberately NOT a length/superset rule. Append and truncate produce the same
+    strict-prefix relation in opposite directions, so "prefer longer" would fix
+    the append case and silently BREAK legitimate truncation (measured: the
+    current tiebreak resolves truncation correctly). Only an explicit ordering
+    key can tell the two apart — hence a timestamp.
+
+    WHY THE STAMP IS PER-FIELD, not record-level (g-115-3690 — a REFINEMENT of
+    g-115-3662, which shipped the scalar form). This function merges FIELD BY
+    FIELD. A record-level ordering key applied inside a per-field merge silently
+    changes meaning from "keep the newer TEXT" to "the newer WRITE wins EVERY
+    content field", so a concurrent amendment to a DIFFERENT field of the same
+    guardrail is deterministically discarded. Measured: box A amends
+    ``trigger_condition`` at T1, box B amends only ``action_hint`` at T2 and still
+    carries A's old trigger_condition — under the scalar, B won every field and
+    A's amendment was lost. guard-1153 names the correct shape directly: LWW on a
+    timestamp written BY THE SAME MUTATION that writes the field; a record-level
+    stamp is that guard's "UNCORRELATED timestamp" failure mode.
+
+    The scalar was modeled on the same-file ``_merge_forged_skill``, which is a
+    WHOLE-RECORD-wins merge (``return a if aa > ab else b``) where a record-level
+    stamp is exactly right. That precedent was sound for its own structure and is
+    NOT transplantable field-wise — the transferable lesson is to re-derive a
+    merge tier against the target handler's MERGE GRANULARITY.
+
+    Degrades gracefully in three layers: an absent per-field key falls back to the
+    retired record-level ``amended_at`` scalar (the migration floor, so records
+    written between d30d21bd and this fix keep their ordering); absent both,
+    ``_ts_key(None)`` is ``""``, which sorts oldest, so a stamped record beats an
+    unstamped legacy copy and two unstamped records fall through to the
+    pre-existing byte-order behavior unchanged. WRITER: the daemon's
+    ``/v1/store/set-field`` stamps ONLY the field it wrote, via the spec's
+    ``amend_stamp_field`` — per rb-5493 a merge-tier ordering field without a
+    writer is a reader with no writer."""
     out = dict(a)
     for k, vb in b.items():
         if k not in out:
@@ -393,8 +551,32 @@ def _merge_guard_record(a: dict, b: dict) -> dict:
                 and isinstance(va, (int, float)) and isinstance(vb, (int, float)) \
                 and not isinstance(va, bool) and not isinstance(vb, bool):
             out[k] = max(va, vb)
+        elif k == _AMEND_STAMP_FIELD and isinstance(va, dict) and isinstance(vb, dict):
+            # The stamp map needs its OWN merge rule. Without one it would fall to
+            # the generic byte-order tiebreak below and one box's whole map would
+            # replace the other's — losing the very ordering evidence this tier
+            # reads, one level down (guard-1153: every field in a record merge
+            # gets explicit semantics, never the opaque default).
+            out[k] = _merge_stamp_map(va, vb)
+        elif k == _AMEND_LEGACY_FIELD:
+            # Retired record-level scalar: MAX, not byte order. _canon(None) is
+            # "null" and _canon("2026-…") starts with '"' (0x22 < 0x6E), so the
+            # generic tiebreak would let a NULL beat a real timestamp and erase
+            # the floor the migration path reads.
+            out[k] = va if _ts_key(va) >= _ts_key(vb) else vb
         else:
-            out[k] = va if _canon(va) >= _canon(vb) else vb
+            # Amendment recency, PER FIELD — this branch sits BELOW
+            # status/utilization/valid_to/monotonic on purpose. Those four carry
+            # semantics recency must not override: a retirement on box A must
+            # survive a newer unrelated amendment on box B, and a counter must
+            # never regress to the newer record's lower value.
+            sa, sb = _field_stamp(a, k), _field_stamp(b, k)
+            if sa != sb:
+                out[k] = va if sa > sb else vb
+            else:
+                # Both unstamped (or stamped identically) — fall through to the
+                # pre-existing content tiebreak unchanged.
+                out[k] = va if _canon(va) >= _canon(vb) else vb
     return _commutative_key_order(a, b, out)
 
 
@@ -472,8 +654,24 @@ def _merge_sig_record(a: dict, b: dict) -> dict:
                 and isinstance(va, (int, float)) and isinstance(vb, (int, float)) \
                 and not isinstance(va, bool) and not isinstance(vb, bool):
             out[k] = max(va, vb)
+        elif k == _AMEND_STAMP_FIELD and isinstance(va, dict) and isinstance(vb, dict):
+            out[k] = _merge_stamp_map(va, vb)
+        elif k == _AMEND_LEGACY_FIELD:
+            out[k] = va if _ts_key(va) >= _ts_key(vb) else vb
         else:
-            out[k] = va if _canon(va) >= _canon(vb) else vb
+            # Amendment recency, PER FIELD — BELOW status/utilization/
+            # outcome_stats/last_matched/sample_size on purpose: recency must not
+            # un-retire a record, regress a counter, or desync `accuracy` from the
+            # counters it was recomputed from. Exposure measured (probe,
+            # 2026-07-28): _sig_identity keys on (created, name), so `name` is
+            # immune (a divergent name SPLITS), while `description` and
+            # `expected_outcome` — both live on real records — reached this
+            # byte-order tiebreak and silently reverted amendments.
+            sa, sb = _field_stamp(a, k), _field_stamp(b, k)
+            if sa != sb:
+                out[k] = va if sa > sb else vb
+            else:
+                out[k] = va if _canon(va) >= _canon(vb) else vb
     return _commutative_key_order(a, b, out)
 
 
@@ -873,8 +1071,38 @@ def _goal_identity(g):
     fall back to id-identity — the pre-fix behaviour — so they field-merge by id
     exactly as before and this change is a no-op for them (they are already
     allocated and never NEWLY collide). A non-dict entry falls back to content so
-    it is never collapsed with a distinct entry (zero data loss)."""
+    it is never collapsed with a distinct entry (zero data loss).
+
+    ``alloc_nonce`` (g-115-3907) takes precedence over BOTH. The
+    ``(created_at, title)`` key below is invariant under re-id but NOT under a
+    title edit, and ``title`` is mutable (``aspirations-update-goal.sh <goal>
+    title <new>`` is supported). So a title edit racing a stale snapshot gave the
+    two copies different identities: they never collapsed in step 1, both landed
+    in the same seq bucket, and step 3 displaced one to a fresh id — ONE GOAL
+    SILENTLY BECAME TWO. Proven live, not inferred: g-315-517 carries
+    ``displaced_from='g-315-515'``, written at exactly one site (step 3). Two of
+    the three confirmed instances were ``Apply:`` -> ``Unblock:`` retitles — the
+    shape the defer->Unblock auto-conversion produces — so it is systematic.
+
+    The nonce is minted at the add-goal chokepoint and is immutable AND unique,
+    which no other field is (created_at: immutable but second-precision, so not
+    unique; id: unique in-store but re-assigned by the collision path; title:
+    neither). Keying on it makes identity invariant under re-id AND retitle at
+    once. It also STRENGTHENS the g-115-2147 guarantee rather than trading
+    against it: two DISTINCT goals always carry different nonces, so they can
+    never be field-merged into a franken-record — whereas widening the key to
+    ``(id, created_at)`` (the tempting cheap fix) would merge two distinct goals
+    that collided on an id within the same second, losing a writer's content.
+
+    Goals predating the field lack it and fall through to the unchanged
+    ``(created_at, title)`` branch, so this is a NO-OP for every existing goal.
+    Mixed-mode (one side carries the nonce, the other is a pre-field snapshot of
+    the same goal) degrades to exactly the previous behaviour — no worse than the
+    status quo it replaces."""
     if isinstance(g, dict):
+        nonce = g.get("alloc_nonce")
+        if nonce:
+            return ("nonce", nonce)
         ct, ti = g.get("created_at"), g.get("title")
         if ct and ti:
             return ("ct", ct, ti)
@@ -1708,15 +1936,49 @@ def _merge_forged_skill(a: dict, b: dict) -> dict:
     """Reconcile two records of the SAME skill name. A skill record is
     authored as a unit (one forge event writes all fields), so the winner is
     WHOLE-RECORD — field-blending would stitch two authored versions'
-    triggers/companion_scripts. Winner: newer ``forged_date`` (ISO string,
-    lexicographic; missing sorts oldest) -> more fields (richer side, the
-    _merge_module convention) -> ``_canon`` content tiebreak. Symmetric in
-    (a, b) -> both machines converge; merge(r, r) == r (idempotent)."""
-    # str() coercion: an UNQUOTED YAML date parses as datetime.date (the
-    # merge_tree str-vs-date bug class); str(date) is ISO so it compares
-    # lexicographically with the quoted-string form.
-    da = str(a.get("forged_date")) if a.get("forged_date") is not None else ""
-    db = str(b.get("forged_date")) if b.get("forged_date") is not None else ""
+    triggers/companion_scripts. Winner: newer ``amended_at`` -> newer
+    ``forged_date`` (ISO string, lexicographic; missing sorts oldest) -> more
+    fields (richer side, the _merge_module convention) -> ``_canon`` content
+    tiebreak. Symmetric in (a, b) -> both machines converge; merge(r, r) == r
+    (idempotent).
+
+    ``amended_at`` (g-115-3638) exists because the whole-record rule above is
+    correct for a FORGE event and wrong for an AMENDMENT. Adding a trigger or
+    fixing a companion_scripts path on an EXISTING row bumps no ``forged_date``
+    and adds no FIELD, so pre-fix it fell to the ``_canon`` tiebreak — an
+    arbitrary lexicographic comparison unrelated to intent. Measured on cc-05
+    2026-07-28: a 4-trigger addition lost 10-triggers-to-6, byte-identically
+    with the arguments swapped, so the loss was deterministic and retrying
+    could never win. Three write paths (Edit tool, plain python, backend
+    write_text) each reported success and none landed.
+
+    Why a stamp and NOT a field-level union of triggers/companion_scripts (the
+    obvious fix, rejected): a union-merged field has NO deletion semantics
+    (guard-1072) — removing a misfiring trigger would silently resurrect it
+    from any peer holding the old row, trading a silent-add-loss for a silent
+    remove-loss. guard-1153 requires a decrementable field to get EXPLICIT
+    semantics, and names this exact shape: LWW on a timestamp written BY THE
+    SAME MUTATION that writes the field. Same pattern as ``claimed_at``, and
+    as the ``intended_agent_set_at`` proposed for Lane (h).
+
+    Commutativity (guard-907) holds: the comparison is on CONTENT (an ISO
+    string), never on the local-vs-remote role, and a missing stamp sorts
+    oldest on BOTH sides. A writer that does not set ``amended_at`` is no worse
+    off than before the fix — it simply falls through to the pre-existing
+    tiers. AMENDING WRITERS MUST SET IT (see .claude/skills/forge-skill Step 4);
+    that is what makes an amendment beat an untouched peer copy."""
+    # _ts_key, NOT str(). The two fields differ and only one was ever safe: a
+    # bare str() IS ISO for forged_date (a DATE — "2026-07-28", no separator at
+    # all), but NOT for amended_at (a DATETIME — str() separates with a SPACE,
+    # which sorts BELOW "T"). The original comment reasoned about the date case
+    # and the datetime case rode along on it silently. Normalize both
+    # (guard-371; measured on the sibling resolver, ).
+    aa = _ts_key(a.get("amended_at"))
+    ab = _ts_key(b.get("amended_at"))
+    if aa != ab:
+        return a if aa > ab else b
+    da = _ts_key(a.get("forged_date"))
+    db = _ts_key(b.get("forged_date"))
     if da != db:
         return a if da > db else b
     if len(a) != len(b):
@@ -1782,10 +2044,46 @@ def _co_invocation_log_cap() -> int:
 
 
 def _merge_skill_relation(a: dict, b: dict) -> dict:
-    """Reconcile two records of the SAME (source, target, type) edge. No date
-    field exists on relation records, so: more fields (richer side — e.g.
-    confidence+evidence vs bare edge) -> _canon content tiebreak. Symmetric
-    and idempotent (mirrors _merge_forged_skill minus the date leg)."""
+    """Reconcile two records of the SAME (source, target, type) edge. Winner:
+    newer ``amended_at`` -> more fields (richer side — e.g. confidence+evidence
+    vs bare edge) -> ``_canon`` content tiebreak. Symmetric in (a, b) -> both
+    machines converge; merge(r, r) == r (idempotent).
+
+    ``amended_at`` (g-115-3639) is tier 0 here for the same reason it is on
+    ``_merge_forged_skill`` (g-115-3638), and this resolver was MORE exposed
+    than that one, not less: it has NO date leg at all, so an amendment that
+    does not change the field COUNT — bumping ``confidence`` 0.5 -> 0.7,
+    correcting an ``evidence`` string, fixing a typo in a rationale — tied the
+    field-count tier and was decided by an arbitrary ``_canon`` lexicographic
+    compare. Deterministic, so retrying could never win, and every write path
+    reports success. LATENT rather than observed: skill-relations.yaml is
+    lower-write-frequency than forged-skills.yaml and edges are mostly ADDED (a
+    new edge wins the union outright) rather than amended — but the class is
+    measured on the sibling, so it is not speculative.
+
+    A field-level union of confidence/evidence was rejected for the same reason
+    as on the sibling: a union-merged field has NO deletion semantics
+    (guard-1072), so it would trade a silent-amend-loss for a silent
+    remove-loss. guard-1153 names this exact shape instead — LWW on a timestamp
+    written BY THE SAME MUTATION that writes the field.
+
+    Commutativity (guard-907) holds: the comparison is on CONTENT (an ISO
+    string), never on the local-vs-remote role, and a missing stamp sorts
+    oldest on BOTH sides, so pre-stamp rows resolve exactly as they did before.
+
+    AMENDING WRITERS MUST SET IT — that is what makes an amendment beat an
+    untouched peer copy. ``skill-relations.py`` cmd_add stamps it on every new
+    edge; because cmd_add REFUSES duplicates, amending an existing edge is a
+    hand-edit, and cmd_add's duplicate error states the contract at the moment
+    the amender hits it."""
+    # _ts_key, NOT str(): amending an edge is a HAND-EDIT (cmd_add refuses
+    # duplicates), and a hand-edit is exactly what produces an UNQUOTED stamp,
+    # which PyYAML parses as datetime whose str() separator is a SPACE. See
+    # _ts_key / guard-371 — a bare str() here inverted the tier it implements.
+    aa = _ts_key(a.get("amended_at"))
+    ab = _ts_key(b.get("amended_at"))
+    if aa != ab:
+        return a if aa > ab else b
     if len(a) != len(b):
         return a if len(a) > len(b) else b
     return a if _canon(a) >= _canon(b) else b
@@ -1847,11 +2145,12 @@ def merge_skill_relations(local: bytes, remote: bytes) -> bytes:
 
         def _log_key(e):
             d = e.get("date") if isinstance(e, dict) else None
-            # str(datetime) uses a space where ISO strings use 'T' — without
-            # normalization a datetime-typed entry sorts BEFORE a string-typed
-            # entry of the same second (space < 'T'), skewing cap eviction.
-            return (str(d).replace(" ", "T") if d is not None else "",
-                    _canon(e))
+            # _ts_key (guard-371): str(datetime) uses a space where ISO strings
+            # use 'T', so without normalization a datetime-typed entry sorts
+            # BEFORE a string-typed entry of the same second (space < 'T'),
+            # skewing cap eviction. Delegated rather than inlined — this was one
+            # of three hand-rolled copies of _ts_key in this file.
+            return (_ts_key(d), _canon(e))
 
         merged_log = sorted(seen.values(), key=_log_key)
         cap = _co_invocation_log_cap()
@@ -1868,7 +2167,7 @@ def merge_skill_relations(local: bytes, remote: bytes) -> bytes:
         # order or merge(a,b) != merge(b,a) at the byte level.
         candidates = [v for v in (lu_a, lu_b) if v is not None]
         out["last_updated"] = max(
-            candidates, key=lambda v: (str(v).replace(" ", "T"), _canon(v)))
+            candidates, key=lambda v: (_ts_key(v), _canon(v)))
     return _dump_yaml_default(_commutative_key_order(a, b, out))
 
 
@@ -2766,6 +3065,440 @@ def merge_hypothesis_category_bindings(local: bytes, remote: bytes) -> bytes:
     return json.dumps(out, indent=2, sort_keys=True).encode("utf-8")
 
 
+# --- meta RMW indexes (): keyed union + DERIVED-FIELD recompute ----
+# Residual scope of  after its original premise was superseded. All
+# three are own-cloud-synced (absent from owncloud_sync._EXCLUDE_DIRS/_NAMES/
+# _GLOBS) and routed to merge=ayoai-ledger, but had NO handler -- so a
+# both-diverged write hit the driver fail-safe and FROZE instead of self-healing.
+# Each writer was read BEFORE registering (rb-245); those reads DISQUALIFIED 7 of
+# the 10 files the goal named -- dispositions recorded in the triage block inside
+# _HANDLERS below.
+
+_IMPK_WINDOWS = (5, 10, 20)
+
+
+def _impk_learning_value(entry) -> float:
+    """learning_value coerced to float, never raising. meta-impk's own
+    recompute does NOT coerce (it would crash on a malformed entry); a merge
+    handler must never crash, so it degrades a bad value to 0.0 instead."""
+    if not isinstance(entry, dict):
+        return 0.0
+    try:
+        return float(entry.get("learning_value", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _ts_sort_key(entry, field: str = "date"):
+    """(normalized-timestamp, canon) total order for a record list.
+
+    Normalization is delegated to the module's ``_ts_key`` (guard-371) rather
+    than re-spelled here: str(datetime) uses a space where ISO strings use 'T',
+    and " " (0x20) sorts BELOW "T" (0x54), so a bare str() ranks a NEWER
+    unquoted YAML stamp under any older quoted one sharing the date. This
+    helper originally inlined that ``.replace(" ", "T")``, which was correct but
+    was a SECOND copy of a normalizer alpha had just unified across 12 sites
+    (msg-20260728-100804-alpha-4734, severity:invalidates on this file) — and a
+    duplicate normalizer only has to survive one future edit to _ts_key to start
+    disagreeing with it silently. One spelling, one place.
+
+    _canon is the second key so a normalized TIE cannot resolve by arg order,
+    which is what keeps the sort commutative (guard-907)."""
+    d = entry.get(field) if isinstance(entry, dict) else None
+    return (_ts_key(d), _canon(entry))
+
+
+def merge_improvement_velocity(local: bytes, remote: bytes) -> bytes:
+    """Union merge for meta/improvement-velocity.yaml (imp@k telemetry).
+
+    Writer read (rb-245) -- meta-impk.py cmd_record APPENDS one entry to
+    ``entries`` and then RECOMPUTES ``rolling_averages`` from the tail. There is
+    no prune/cap/rewrite path, so a content line-union cannot resurrect anything.
+    (The ``improvement-velocity.yaml: 50`` in _fileops._PER_FILE_SNAPSHOT_CAP
+    caps .history SNAPSHOTS, not entries -- it is not an eviction path.)
+
+    ``rolling_averages`` is DERIVED from ``entries[-w:]`` and is RECOMPUTED
+    here, never carried from a side: guard-1153 -- a derived field left to the
+    opaque LWW default silently republishes the losing side's window. The
+    ARITHMETIC mirrors cmd_record (mean of the last w learning_values, round 4,
+    0.0 when fewer than w entries exist); the WINDOW does not. cmd_record takes
+    its tail in APPEND order, this takes it in (date, canon) order, so the two
+    agree only while date order and append order agree over the last w.
+    MEASURED on the live file 2026-07-29: 6269 entries, 0 missing ``date``, but
+    **81 date-order inversions** against append order -- real, just not currently
+    inside the last-20. Bounded and self-healing: convergence is unaffected
+    (every box runs this same handler) and the next ``impk record`` recomputes
+    from the writer's own tail. Do NOT "fix" the divergence by dropping the sort
+    -- see the next paragraph for why the sort is load-bearing.
+
+    Entries are emitted sorted by (date, canon). Sorting is load-bearing beyond
+    byte-commutativity: the averages are computed from the TAIL, so an unsorted
+    union would make the DERIVED values arg-order-dependent even when the entry
+    SET is identical -- merge(a,b) != merge(b,a) in VALUE, not just in bytes.
+
+    Emits ONLY ``entries`` + ``rolling_averages``. meta-impk's
+    validate_velocity_structure RAISES on any other top-level key, so passing an
+    unknown key through would yield a file its own writer refuses to read back
+    (checked at both post-read and pre-write)."""
+    try:
+        a = yaml.safe_load(local.decode("utf-8")) or {}
+        b = yaml.safe_load(remote.decode("utf-8")) or {}
+    except Exception:  # noqa: BLE001 -- unparseable side -> content tiebreak
+        return local if local >= remote else remote
+    if not (isinstance(a, dict) and isinstance(b, dict)):
+        return local if local >= remote else remote
+
+    seen: Dict[str, object] = {}
+    for e in (a.get("entries") or []) + (b.get("entries") or []):
+        seen.setdefault(_canon(e), e)
+    entries = sorted(seen.values(), key=_ts_sort_key)
+
+    rolling: Dict[str, float] = {}
+    for w in _IMPK_WINDOWS:
+        if len(entries) >= w:
+            rolling[f"window_{w}"] = round(
+                sum(_impk_learning_value(e) for e in entries[-w:]) / w, 4)
+        else:
+            rolling[f"window_{w}"] = 0.0
+
+    return _dump_yaml_default({"entries": entries, "rolling_averages": rolling})
+
+
+# skill-evaluate.py module constants, mirrored so the handler stays a PURE
+# function of its two inputs. Deliberately NOT read from
+# meta/skill-quality-strategy.yaml at merge time: if two boxes carried
+# different dimension_weights they would compute different `overall` from
+# identical evaluations and the fenced-PUT loop would ping-pong forever
+# (guard-907's exact deadlock). A deployment that customizes the weights gets a
+# merged `overall` recomputed with these defaults, which self-heals to the
+# customized value on the next `skill-evaluate score` write -- the same
+# derived-field/self-correcting tradeoff merge_pipeline_meta already takes.
+# (Verified 2026-07-29: the live strategy file's weights equal these defaults,
+# so the divergence is latent, not active.)
+_SQ_DIMENSIONS = ("safety", "completeness", "executability",
+                  "maintainability", "cost_awareness")
+_SQ_WEIGHTS = {"safety": 0.30, "completeness": 0.25, "executability": 0.20,
+               "maintainability": 0.15, "cost_awareness": 0.10}
+_SQ_ROLLING_WINDOW = 20
+
+
+def _sq_aggregate(evaluations: List[object]) -> Dict[str, float]:
+    """Byte-for-byte mirror of skill-evaluate.compute_aggregate/compute_overall."""
+    if not evaluations:
+        return {d: 0.0 for d in list(_SQ_DIMENSIONS) + ["overall"]}
+    count = len(evaluations)
+    means: Dict[str, float] = {}
+    for dim in _SQ_DIMENSIONS:
+        total = 0.0
+        for e in evaluations:
+            if isinstance(e, dict):
+                try:
+                    total += float(e.get(dim, 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    pass
+        means[dim] = round(total / count, 4)
+    means["overall"] = round(
+        sum(means[d] * _SQ_WEIGHTS.get(d, 0.0) for d in _SQ_DIMENSIONS), 4)
+    return means
+
+
+def merge_skill_quality(local: bytes, remote: bytes) -> bytes:
+    """Skill-keyed union for meta/skill-quality.yaml.
+
+    Writer read (rb-245) -- skill-evaluate.py cmd_score (and its daemon twin
+    mind_api/src/meta/skill_evaluate.py) APPENDS one evaluation under
+    ``skills.<name>.evaluations``, FIFO-caps that list at ROLLING_WINDOW=20,
+    recomputes ``aggregate`` from the surviving list, and increments
+    ``total_evaluations`` by 1.
+
+    Three fields, three DIFFERENT rules -- this is the guard-1153 record, and
+    treating them uniformly is the defect it names:
+
+    * ``evaluations`` -- content-union, sorted by (date, canon), then RE-CAPPED
+      at 20 from the tail. Without the re-cap a merge resurrects FIFO-evicted
+      evaluations and grows the list past the writer's own bound (the same
+      trap merge_skill_relations' co_invocation_log cap exists for).
+    * ``aggregate`` -- fully DERIVED; recomputed from the merged+capped list.
+      Never carried from a side.
+    * ``total_evaluations`` -- NOT len(evaluations). The writer increments it
+      unconditionally, so it counts every evaluation ever recorded INCLUDING
+      those the FIFO cap evicted; deriving it from the list would silently
+      reset a long-lived skill's lifetime count to <=20. It is a genuinely
+      monotonic, never-repaired counter, so guard-1153's sanctioned shape is
+      MAX. MAX is knowingly LOSSY under true concurrent divergence (base 10,
+      +3 on one box and +2 on the other yields 13, not 15) -- accepted per
+      rb-5718: a resolution that is more faithful for ONE merge but
+      non-convergent is strictly worse than a slightly lossy one that
+      converges. It is floored at len(evaluations) so the pair can never be
+      internally contradictory.
+
+    ``last_updated`` takes the strictly-newer value (never rolled back), keyed
+    through ``_ts_key`` (guard-371) rather than a hand-rolled replace — see the
+    _ts_sort_key docstring for why the duplicate spelling is the hazard."""
+    try:
+        a = yaml.safe_load(local.decode("utf-8")) or {}
+        b = yaml.safe_load(remote.decode("utf-8")) or {}
+    except Exception:  # noqa: BLE001
+        return local if local >= remote else remote
+    if not (isinstance(a, dict) and isinstance(b, dict)):
+        return local if local >= remote else remote
+
+    out = dict(a) if _canon(a) >= _canon(b) else dict(b)
+
+    sa = a.get("skills") if isinstance(a.get("skills"), dict) else {}
+    sb = b.get("skills") if isinstance(b.get("skills"), dict) else {}
+    if sa or sb or "skills" in a or "skills" in b:
+        merged: Dict[str, object] = {}
+        for name in sorted(set(sa) | set(sb)):
+            ra, rb = sa.get(name), sb.get(name)
+            if not isinstance(ra, dict) or not isinstance(rb, dict):
+                # One side absent/malformed -> take the dict side, else canon.
+                merged[name] = (ra if isinstance(ra, dict)
+                                else rb if isinstance(rb, dict)
+                                else (ra if _canon(ra) >= _canon(rb) else rb))
+                continue
+            seen: Dict[str, object] = {}
+            for e in (ra.get("evaluations") or []) + (rb.get("evaluations") or []):
+                seen.setdefault(_canon(e), e)
+            evals = sorted(seen.values(), key=_ts_sort_key)
+            if len(evals) > _SQ_ROLLING_WINDOW:
+                evals = evals[-_SQ_ROLLING_WINDOW:]
+
+            def _count(rec):
+                try:
+                    return int(rec.get("total_evaluations", 0) or 0)
+                except (TypeError, ValueError):
+                    return 0
+
+            rec = dict(ra) if _canon(ra) >= _canon(rb) else dict(rb)
+            rec["evaluations"] = evals
+            rec["aggregate"] = _sq_aggregate(evals)
+            rec["total_evaluations"] = max(_count(ra), _count(rb), len(evals))
+            merged[name] = _commutative_key_order(ra, rb, rec)
+        out["skills"] = merged
+
+    lu_a, lu_b = a.get("last_updated"), b.get("last_updated")
+    if lu_a is not None or lu_b is not None:
+        candidates = [v for v in (lu_a, lu_b) if v is not None]
+        # _ts_key (guard-371), not a hand-rolled replace. THREE inline copies
+        # coexisted with _ts_key in this file — two in merge_skill_relations
+        # ('s own fresh-eyes hardening pass) and this one — because
+        # each author rediscovers the need locally at the comparison site.
+        # Fixing only the site that prompted you is how the others survive
+        # (fresh-eyes msg-20260729-162641-foxtrot-5006).
+        out["last_updated"] = max(
+            candidates, key=lambda v: (_ts_key(v), _canon(v)))
+
+    return _dump_yaml_default(_commutative_key_order(a, b, out))
+
+
+def merge_strategy_archive(local: bytes, remote: bytes) -> bytes:
+    """id-keyed union for meta/strategy-archive.yaml (``archive:`` list of
+    sa-NNN records).
+
+    Writer read (rb-245): NO code writer -- the store is LLM-maintained via
+    Edit, which is precisely why it can both-diverge across boxes without any
+    script serializing the writes. Records are append-mostly post-mortems of
+    retired strategies; nothing deletes, so a union cannot resurrect. Same-id
+    divergence resolves by content tiebreak (canon-max), and output is sorted
+    by (id, canon) so the bytes are arg-order-independent (guard-907).
+
+    Non-dict / id-less entries are deduped by content and sorted last rather
+    than dropped -- the union promise holds for malformed rows too."""
+    try:
+        a = yaml.safe_load(local.decode("utf-8")) or {}
+        b = yaml.safe_load(remote.decode("utf-8")) or {}
+    except Exception:  # noqa: BLE001
+        return local if local >= remote else remote
+    if not (isinstance(a, dict) and isinstance(b, dict)):
+        return local if local >= remote else remote
+
+    out = dict(a) if _canon(a) >= _canon(b) else dict(b)
+
+    if "archive" in a or "archive" in b:
+        by_id: Dict[str, object] = {}
+        loose: List[object] = []
+        for r in ((a.get("archive") or []) + (b.get("archive") or [])):
+            if isinstance(r, dict) and r.get("id") is not None:
+                k = str(r["id"])
+                prev = by_id.get(k)
+                by_id[k] = r if prev is None or _canon(r) >= _canon(prev) else prev
+            else:
+                loose.append(r)
+        merged = [by_id[k] for k in sorted(by_id)]
+        merged += sorted({_canon(r): r for r in loose}.values(), key=_canon)
+        out["archive"] = merged
+
+    return _dump_yaml_default(_commutative_key_order(a, b, out))
+
+
+def _sg_merge_generation(a: dict, b: dict) -> dict:
+    """Reconcile two copies of the SAME ``generation`` number.
+
+    Unlike the id-keyed unions above, the divergent unit here is not a record
+    that one side added -- it is the SAME record that BOTH sides mutated in
+    place, because ``meta-generations.py cmd_update`` bumps ``generations[-1]``
+    on every goal close. Field semantics are read off that writer:
+
+      started / ended  MIN / MAX of the non-null sides. The generation began
+                       when the FIRST box opened it and stopped being counted
+                       when the LAST box closed it. ``ended`` stays null only
+                       while BOTH sides are open -- a close is a monotonic act
+                       and must dominate, the ``status``-retire precedent in
+                       _merge_rb_record.
+      goals_completed  MAX, deliberately NOT sum. Each box increments its own
+                       copy from a COMMON ancestor, so summing double-counts
+                       every goal already present on both sides -- and the
+                       double-count is unbounded under repeated merges, which
+                       is precisely how a counter ledger stops converging. MAX
+                       is commutative and never invents work. Its cost is REAL
+                       and is NOT self-healing: increments unique to the losing
+                       side are lost permanently, because nothing recomputes
+                       this field -- each box simply resumes incrementing from
+                       the merged value. Do NOT borrow experience-meta.json's
+                       "lossy-safe rollup self-heals on next write" rationale
+                       here (an earlier draft of this docstring did): that
+                       counter is DERIVED from the experience list, so its next
+                       write repairs it, and goals_completed is derived from
+                       nothing. Accepted anyway, deliberately -- the field is
+                       soft telemetry for the generation ledger (reported by
+                       cmd_close, and a >=3 floor on the peak update), so a
+                       bounded under-count is cheap, while sum corrupts without
+                       bound and a content tiebreak discards a whole side.
+      best/worst_score MAX / MIN -- the writer literally computes them that way.
+      metrics          per-key MAX via _merge_counters, EXCEPT the derived
+                       average below.
+      avg_learning_value  RECOMPUTED from the merged total and count, never
+                       carried (guard-1153). Carrying it is the failure this
+                       file's sibling tests call load-bearing: the union is
+                       visible in a diff, the staleness is not. Arithmetic
+                       mirrors cmd_update exactly (round(total/goals, 4), 0.0
+                       at zero goals), so unlike merge_improvement_velocity's
+                       window there is no writer/handler disagreement to
+                       self-heal -- this recompute is exact.
+      parameter_snapshot  content tiebreak. It is a point-in-time capture of
+                       config, so a union would fabricate a snapshot that was
+                       never live on either box.
+
+    Everything else falls to the deterministic canon tiebreak, and key order is
+    canonicalized so distinct-key adds stay byte-commutative (guard-907)."""
+    out = dict(a) if _canon(a) >= _canon(b) else dict(b)
+
+    for fld, pick in (("started", min), ("ended", max)):
+        vals = [v for v in (a.get(fld), b.get(fld)) if v is not None]
+        if vals:
+            out[fld] = pick(vals, key=_ts_key)
+        elif fld in a or fld in b:
+            out[fld] = None
+
+    for fld, pick in (("goals_completed", max), ("best_score", max),
+                      ("worst_score", min)):
+        vals = [v for v in (a.get(fld), b.get(fld))
+                if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        if vals:
+            out[fld] = pick(vals)
+
+    ma, mb = a.get("metrics"), b.get("metrics")
+    if isinstance(ma, dict) or isinstance(mb, dict):
+        metrics = _merge_counters(ma if isinstance(ma, dict) else {},
+                                  mb if isinstance(mb, dict) else {})
+        if "avg_learning_value" in metrics:
+            total = metrics.get("total_learning_value", 0.0)
+            goals = out.get("goals_completed", 0)
+            # bool is a subclass of int, so both operands need the explicit
+            # exclusion -- guarding only `goals` let a True total_learning_value
+            # through and produced avg=0.2 (measured, fresh-eyes probe P1).
+            metrics["avg_learning_value"] = (
+                round(total / goals, 4)
+                if isinstance(total, (int, float)) and not isinstance(total, bool)
+                and isinstance(goals, int) and not isinstance(goals, bool)
+                and goals > 0
+                else 0.0)
+        out["metrics"] = metrics
+
+    return _commutative_key_order(a, b, out)
+
+
+def merge_strategy_generations(local: bytes, remote: bytes) -> bytes:
+    """Merge for meta/strategy-generations.yaml (the evolution generation ledger).
+
+    Writer read (rb-245) -- meta-generations.py. ``cmd_open`` APPENDS a new
+    generation and ``cmd_update`` / ``cmd_close`` MUTATE ``generations[-1]`` in
+    place. There is no prune or cap, so a union cannot resurrect a pruned row;
+    but because the tail row is rewritten on every goal close, two live boxes
+    diverge on the SAME generation within minutes. That is why this handler is
+    a same-key FIELD merge (_sg_merge_generation) and not the id-union its
+    siblings use -- a canon tiebreak across the whole row would silently
+    discard one box's counter increments.
+
+    Top-level fields:
+      generations         union by ``generation``, field-merged on collision,
+                          emitted in generation order. Rows that are not dicts
+                          or carry no ``generation`` are deduped by content and
+                          sorted last rather than dropped.
+      current_generation  RECOMPUTED as max(generation) -- a pure function of
+                          the merged list, so carrying it could name a
+                          generation the merged file does not contain.
+      peak_score /        MAX-dominant, NOT recomputed. These are a monotone
+      peak_generation     high-water mark, not a pure function of current
+                          state: the writer only ever raises peak_score, and a
+                          recompute over the merged rows would silently LOWER
+                          it whenever the winning generation's running average
+                          has since fallen. The distinction against
+                          ``avg_learning_value`` above is the whole point --
+                          accumulators take MAX, pure-derived fields get
+                          recomputed (guard-1153 governs the second kind only).
+                          peak_generation follows whichever side owns the
+                          higher score; an exact tie takes the lower generation
+                          so the pair stays arg-order-independent.
+
+    NOT registered by g-115-3863, which triaged ten meta indexes: this file was
+    in neither its registered trio nor its disqualified seven, so it is a plain
+    gap rather than a reversed disposition (g-115-3980)."""
+    try:
+        a = yaml.safe_load(local.decode("utf-8")) or {}
+        b = yaml.safe_load(remote.decode("utf-8")) or {}
+    except Exception:  # noqa: BLE001 -- unparseable side -> content tiebreak
+        return local if local >= remote else remote
+    if not (isinstance(a, dict) and isinstance(b, dict)):
+        return local if local >= remote else remote
+
+    out = dict(a) if _canon(a) >= _canon(b) else dict(b)
+
+    if "generations" in a or "generations" in b:
+        by_num: Dict[int, dict] = {}
+        loose: List[object] = []
+        for r in ((a.get("generations") or []) + (b.get("generations") or [])):
+            num = r.get("generation") if isinstance(r, dict) else None
+            if isinstance(num, int) and not isinstance(num, bool):
+                prev = by_num.get(num)
+                by_num[num] = r if prev is None else _sg_merge_generation(prev, r)
+            else:
+                loose.append(r)
+        merged: List[object] = [by_num[k] for k in sorted(by_num)]
+        merged += sorted({_canon(r): r for r in loose}.values(), key=_canon)
+        out["generations"] = merged
+        if by_num:
+            out["current_generation"] = max(by_num)
+
+    # max over the (score, generation) pairs, then min over the tied winners --
+    # both order-independent, so the pair survives an argument swap intact.
+    peaks = [(v, g) for v, g in ((a.get("peak_score"), a.get("peak_generation")),
+                                 (b.get("peak_score"), b.get("peak_generation")))
+             if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    if peaks:
+        best = max(v for v, _ in peaks)
+        winners = [g for v, g in peaks if v == best]
+        gens = [g for g in winners
+                if isinstance(g, int) and not isinstance(g, bool)]
+        out["peak_score"] = best
+        # A non-int generation is malformed rather than impossible; fall back to
+        # the canon tiebreak so even that path stays arg-order-independent.
+        out["peak_generation"] = min(gens) if gens else max(winners, key=_canon)
+
+    return _dump_yaml_default(_commutative_key_order(a, b, out))
+
+
 # --- registration -----------------------------------------------------------
 _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     # id-keyed field-merge (records edited in place -> merge same-id copies)
@@ -2976,6 +3709,100 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     "infra-health.yaml": merge_infra_health,
     "goal-selection-strategy.yaml": merge_goal_selection_strategy,
     "hypothesis-category-bindings.json": merge_hypothesis_category_bindings,
+    #  meta RMW indexes: routed to merge=ayoai-ledger + own-cloud-synced
+    # but unhandled, so both-diverged froze them. Each has DERIVED fields that the
+    # handler recomputes rather than carrying (guard-1153) — see each docstring.
+    "improvement-velocity.yaml": merge_improvement_velocity,
+    "skill-quality.yaml": merge_skill_quality,
+    "strategy-archive.yaml": merge_strategy_archive,
+    # : same class, missed by the  triage (neither registered
+    # nor disqualified). Rewritten on EVERY goal close by meta-generations.py, so
+    # it wedged two live boxes for real before it was noticed. Same-key FIELD
+    # merge rather than an id-union — both sides mutate the tail row in place.
+    "strategy-generations.yaml": merge_strategy_generations,
+    # : two synced append-only logs, each writer-read (rb-245).
+    #   alert-sweep-seen.jsonl -> world/scripts/alert-sweep.sh appends the seen-row
+    #     inside its mkdir-lock ("read-classify-file-append is all under the lock");
+    #     no rewrite/prune writer fleet-wide, and no store-hygiene entry rotates it.
+    #   missing-verification-criteria.jsonl -> missing-criteria-log.py append_record
+    #     opens the path 'a' under its own hermetic lock; records are immutable
+    #     verify-phase observations.
+    "alert-sweep-seen.jsonl": merge_append_only_jsonl,
+    "missing-verification-criteria.jsonl": merge_append_only_jsonl,
+    # NOT REGISTERED — MACHINE-LOCAL, so a both-diverged 412 is IMPOSSIBLE and a
+    # handler would be dead code (). The originating measurement counted
+    # "routed to merge=ayoai-ledger + absent from this registry" as the unhandled
+    # population; that predicate is WRONG in two independent ways, and 9 of the 18
+    # files it named fall out once either is applied:
+    #   (a) `.gitattributes merge=ayoai-ledger` is INERT for these paths — the whole
+    #       /.mind-data/ tree is gitignored (.gitignore:207), so git never merges
+    #       them. `git check-attr` still reports the attribute because it matches
+    #       path STRINGS regardless of tracking, which is what made the measurement
+    #       look authoritative. The live consumer is owncloud_backend
+    #       `_coordination_merge_handler` (the 412 both-diverged reconcile), NOT git.
+    #   (b) a file the sync never mirrors cannot diverge across boxes at all. The
+    #       authoritative predicate is owncloud_backend._machine_local = the
+    #       _EXCLUDE_DIRS directory prune PLUS owncloud_sync._is_machine_local;
+    #       checking _is_machine_local ALONE is not enough (it deliberately does not
+    #       test _EXCLUDE_DIRS — see its caller's NOTE), and that omission reports
+    #       presence/ as syncing.
+    # Measured machine-local, hence out of scope (basename | why):
+    #   presence/<agent>.jsonl        -> `presence` in _EXCLUDE_DIRS (liveness
+    #                                    coordination goes through the coordination
+    #                                    database, not mirrored files). Also NOT
+    #                                    append-only: jsonl_hygiene rewrites the
+    #                                    whole file.
+    #   gate-firings.spool.jsonl      -> _EXCLUDE_NAMES; per-box buffer drained into
+    #                                    the SHARED gate-firings.jsonl (registered).
+    #   history-save-telemetry.jsonl  -> *-telemetry.jsonl per-machine append log
+    #   write-queue-telemetry.jsonl   -> *-telemetry.jsonl per-machine append log
+    #   handoff-yaml-build-log.jsonl      -> world/*-log.jsonl per-machine (log_script_decision)
+    #   pending-questions-sweep-log.jsonl -> world/*-log.jsonl per-machine
+    #   precheck-eval-log.jsonl           -> world/*-log.jsonl per-machine (also already
+    #                                        deferred above as a world-root telemetry log)
+    #   reflect-bookkeeping-log.jsonl     -> world/*-log.jsonl per-machine
+    #   state-update-audit-log.jsonl      -> world/*-log.jsonl per-machine
+    # Corollary worth knowing before adding ANY entry here: registration and
+    # syncability are independent, and the registry already contains at least one
+    # entry for a store the sync excludes — "changelog.jsonl" is in
+    # owncloud_sync._EXCLUDE_NAMES while its entry above states that leaving it
+    # unregistered froze the write-audit trail *out of S3*. Both cannot hold; that
+    # contradiction is filed separately rather than resolved here.
+    # DEFERRED () — synced, but append-only NOT provable:
+    #   gate-eval-recommendations.jsonl -> has NO code writer. It is appended by an
+    #     ad-hoc `echo '<json>' >> $META_DIR/...` step in skill pseudocode, so there
+    #     is no writer to read (rb-245 cannot be satisfied), and a concurrent-append
+    #     race has already been observed in it (two records concatenated across a
+    #     dropped newline, 2026-07-01). Its line count has also FALLEN (a record at
+    #     line 18 on 2026-07-01; 13 lines total on 2026-07-30) — unexplained, and a
+    #     removal path is exactly what makes a line-union resurrect deleted records
+    #     (guard-1816). Register only once the shrink is explained.
+    # DELIBERATELY NOT REGISTERED —  dispositions (7 of the 10 files
+    # that goal named; the writer read is what disqualified them, which is the
+    # rb-245 discipline working rather than being skipped):
+    #   world/knowledge/tree/_summary.json -> DERIVED CACHE, not shared state.
+    #     load-tree-summary.sh: "Generates _summary.json from _tree.yaml if
+    #     stale." Its content is a pure function of _tree.yaml (which HAS a
+    #     handler, merge_tree). A union of two summaries would fabricate a
+    #     summary matching NEITHER side's tree — strictly worse than the
+    #     safe-freeze, because the freeze is repaired by regeneration on the
+    #     next stale check. Correct resolution is regenerate, never merge.
+    #   patterns/_index.yaml, strategies/_index.yaml, meta-knowledge/_index.yaml,
+    #   transfer/_index.yaml -> BASENAME COLLISION, structurally unregisterable.
+    #     merge_handler_for dispatches on os.path.basename, so all four collapse
+    #     to the single key "_index.yaml" — one registry slot for four stores
+    #     that are NOT the same shape ({count, entries[]} keyed by `file` in
+    #     patterns vs by `id` in meta-knowledge; transfer is {bundles: []}).
+    #     Registering any one of them would silently apply that handler to the
+    #     other three. Whichever of these first acquires a real writer + real
+    #     churn needs a PATH-PATTERN branch in merge_handler_for (the
+    #     merge_team_state_shard precedent), not a basename entry.
+    #   world/knowledge/beliefs.yaml, world/knowledge/transitions.yaml ->
+    #     writerless empty stubs (31B/16B), mtime still the 2026-07-14T13:23
+    #     init-world.sh stamp 15 days on. Same disposition as world/journal.jsonl
+    #     above: freeze is a no-op on a file nothing writes. beliefs.yaml is READ
+    #     (retrieve.py + the daemon twin) and has one potential writer
+    #     (bitemporal-backfill.py); revisit if it ever accumulates content.
     # DELIBERATELY NOT REGISTERED (rb-245 disqualified -- the audit's whole point):
     #   dead-ends.jsonl        -> meta-dead-ends.py write_all() does
     #                             locked_write_jsonl(DE_PATH, records) = full-file

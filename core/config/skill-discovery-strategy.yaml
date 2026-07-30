@@ -79,15 +79,36 @@ goals:
 # without duplicating the check itself.
 triage_hint_templates:
   silently_undertriggering: |
-    1. Confirm verify-learning Section FSR-D passes for this skill
-       (bash skill-description-lint.sh — must contain Use whenever / Fires when).
+    0. FIRST: does the skill body exist on THIS box? `ls .claude/skills/<name>/SKILL.md`.
+       Registry presence means it exists SOMEWHERE in the fleet, not here — post-2026-05
+       forged bodies are git-invisible and do not propagate (guard-1142, g-115-2358).
+       A body absent locally explains 0 invocations on its own; stop here if so.
+    1. Confirm the description carries trigger phrasing (verify-learning Section FSR-D):
+       grep the description for "Use whenever" OR "Fires when" OR "Use when" — ALL THREE
+       satisfy FSR-D. There is no standalone lint script; FSR-D runs inside
+       /verify-learning. (Do not treat "Use when" as a failure — that reading has
+       already produced one false diagnosis.)
     2. If FSR-D passed but skill is still silent: the description's WHEN clause
        does not match real caller phrases. Compare description scenarios against
        recent goals in aspirations.jsonl that should have invoked it.
     3. If skill is forged: check world/forged-skills.yaml triggers list against
        caller-phrase patterns in base skills (rb-314 lesson: triggers must match
        what callers actually say, not what the gap claimed they would say).
-    4. If skill is base: check the gap analysis in meta/skill-gaps.yaml — the
+       Grep each trigger phrase across .claude/skills/, core/config/ and core/scripts/:
+       if a phrase appears in ZERO files outside the skill's own SKILL.md, no caller
+       can ever emit it and the skill is reachable only by a human typing it.
+    4. REACH-PATH vs OPPORTUNITY (do this before concluding the description is at
+       fault — it is the hypothesis the evidence usually refutes). Ask two separate
+       questions: (a) did the triggering SITUATION occur at all in the window? If it
+       never arose, 0 invocations is CORRECT and the flag is a false positive
+       (guard-1116 sparse-by-design). (b) If it DID arise, what automated path was
+       supposed to reach the skill, and does that path cover the whole population or
+       only new arrivals? A CREATE-TIME chokepoint governs the flow and never the
+       stock, and its own telemetry looks healthy because a gate can only report on
+       what reaches it (canonical: g-115-3412 — build-operator-job, 0 invocations,
+       correct description, correct triggers; its only reach-path gated new recurring
+       goals while 48 pre-existing ones carrying 2673 fires were grandfathered).
+    5. If skill is base: check the gap analysis in meta/skill-gaps.yaml — the
        capability the skill was authored against may have shifted.
   cold_after_use: |
     1. Skill was used, then went idle. Compare last-invocation-context against

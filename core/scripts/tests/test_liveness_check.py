@@ -127,3 +127,70 @@ def test_age_future_skew_clamped_to_zero():
 def test_age_missing_returns_none():
     assert _age(None, NOW) is None
     assert _age("garbage", NOW) is None
+
+
+# --- Retirement tombstone dominates freshness () -----------------
+# A retired agent's shard SURVIVES (delete-less store) and keeps getting
+# written, so shard freshness alone reports a decommissioned agent as alive.
+# The retirement write itself refreshes that signal, so retiring an agent made
+# it look MORE alive for a full threshold window. Measured on `meta-tiebreaker`
+# 2026-07-28: retired_at 17:08:19, authoritative-store push 17:08:20, verdict
+# "alive" 2.8h later.
+
+RETIRED = {"retired": True, "retired_at": "2026-07-14T09:00:00", "retired_by": "bravo"}
+
+
+def test_retired_beats_fresh_shard_signal():
+    # The exact production shape: last_active absent (composing the roster drops
+    # retired rows), shard push 10 minutes old -> would have been "alive".
+    r = decide_liveness(None, _ago(minutes=10), threshold_hours=6, now=NOW,
+                        retired_entry=RETIRED)
+    assert r["verdict"] == "retired"
+    assert r["signal"] == "retirement_tombstone"
+
+
+def test_retired_beats_the_fresh_last_active_fast_path():
+    # Ordering is load-bearing: an agent retired moments ago STILL has a fresh
+    # last_active, so a freshness-first ordering would report it alive.
+    r = decide_liveness(_ago(minutes=1), _ago(minutes=1), threshold_hours=6, now=NOW,
+                        retired_entry=RETIRED)
+    assert r["verdict"] == "retired"
+
+
+def test_retired_reason_names_who_and_when():
+    r = decide_liveness(None, _ago(minutes=10), threshold_hours=6, now=NOW,
+                        retired_entry=RETIRED)
+    assert "2026-07-14T09:00:00" in r["reason"] and "bravo" in r["reason"]
+
+
+def test_retired_is_not_dormant_so_goals_stay_routed():
+    # goal-selector._liveness_confirms_dormant tests `verdict == "dormant"`.
+    # "retired" must NOT satisfy it — retired and dormant authorise different
+    # things, and False is the fail-safe direction (goals stay routed).
+    r = decide_liveness(None, _ago(days=7), threshold_hours=6, now=NOW,
+                        retired_entry=RETIRED)
+    assert r["verdict"] == "retired"
+    assert r["verdict"] != "dormant"
+
+
+def test_absent_tombstone_preserves_every_existing_verdict():
+    # retired_entry defaults to None, so pre-existing callers are byte-identical.
+    for la, fs, expected in (
+        (_ago(minutes=30), None, "alive"),
+        (_ago(days=7), _ago(minutes=4), "alive"),
+        (_ago(days=7), _ago(days=7), "dormant"),
+        (_ago(days=7), None, "unknown"),
+    ):
+        assert decide_liveness(la, fs, threshold_hours=6, now=NOW)["verdict"] == expected
+        assert decide_liveness(la, fs, threshold_hours=6, now=NOW,
+                               retired_entry=None)["verdict"] == expected
+
+
+def test_revived_agent_is_not_retired_here():
+    # _team_state._is_retired owns the revival rule (a heartbeat newer than
+    # retired_at un-retires) and is applied by fetch_retirement_tombstone, which
+    # then passes None. Assert the pure function honors that contract: given
+    # None it must fall through to the freshness verdict, never a sticky retired.
+    r = decide_liveness(_ago(minutes=5), None, threshold_hours=6, now=NOW,
+                        retired_entry=None)
+    assert r["verdict"] == "alive"

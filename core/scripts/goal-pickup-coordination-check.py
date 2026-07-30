@@ -198,8 +198,6 @@ _STOPWORDS = frozenset({
     "class", "close",
 })
 
-TERMINAL_STATUSES = ("completed", "archived", "skipped", "expired", "resolved")
-
 
 def extract_paths(text):
     """Return the set of path-like tokens found in goal prose. Pure."""
@@ -1524,6 +1522,47 @@ def main():
         "advisory": advisory,
         "now": dt.datetime.now().isoformat(timespec="seconds"),
     }
+
+    # --- Advisory telemetry () ---------------------------------
+    # Emit a firing on EVERY invocation, including the silent no-risk case.
+    # Logging ONLY when race_risk fires would reproduce the exact gap this
+    # closes: a zero count would stay ambiguous between "no races occurred"
+    # and "the probe has not run in a month". One row per invocation makes
+    # fired/invoked a measurable RATE, which is the question the goal asks
+    # (is this LLM-invoked advisory actually being invoked?).
+    #
+    # The decision vocabulary is derived from THIS probe's own verdict, never
+    # borrowed from another gate's semantics — an inherited mapping would
+    # misreport, which is worse than no telemetry because it reads as
+    # authoritative:
+    #   noop  — nothing to compare (no affected paths AND no keywords)
+    #   block — race_risk true (ADVISORY block; this probe never hard-blocks)
+    #   pass  — scanned, and clean
+    #
+    # FAIL-OPEN: any telemetry failure leaves the advisory verdict byte-
+    # identical. The verdict is computed above and is not read back from here.
+    try:
+        import _gate_log
+        if not affected_paths and not keywords:
+            _decision = "noop"
+        elif race_risk:
+            _decision = "block"
+        else:
+            _decision = "pass"
+        _gate_log.log(
+            "goal-pickup-coordination", _decision,
+            caller="goal-pickup-coordination-check.main",
+            payload={"goal_id": args.goal_id, "source": args.source,
+                     "since_hours": args.since_hours},
+            extra={"race_risk": race_risk,
+                   "affected_paths": len(affected_paths),
+                   "keywords": len(keywords),
+                   "overlapping_commits": len(overlapping),
+                   "board_hits": len(board_hits),
+                   "product_repos_scanned": len(product["repos_scanned"]),
+                   "partner_in_flight": bool(partner_in_flight)})
+    except Exception:
+        pass  # best-effort; telemetry must never change the advisory verdict
 
     if args.output == "human":
         print(f"goal={args.goal_id} race_risk={race_risk} "

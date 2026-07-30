@@ -85,7 +85,7 @@ implementation state: ✓=implemented this session, ✗=open, ◐=partial.
 | G6 | ✓ R10 | Inbound board post / email | New external signal should trigger a delta-retrieve for relevant context before the agent acts | `access-email/SKILL.md` — Inbound Signal Retrieval section added; `aspirations-execute/SKILL.md` Phase 3.97 — Inbound Signal Sweep added |
 | G7 | ✓ R9 | `create-aspiration` dedup | R/G that constrain or refine the new aspiration; today only title-matches existing aspirations | `create-aspiration/SKILL.md` Step 5.1.5 — Cross-store contradiction check added inside Step 5 |
 | G8 | ✓ R13 | Framework rules + conventions not retrievable | F store is loaded by skill-frontmatter convention key, not searchable by content; the agent cannot retrieve a rule by topic | `core/scripts/retrieve.py` — `load_framework_rules()` walks `.claude/rules/*.md`, `core/config/conventions/*.md`, `world/conventions/*.md`; parses title + section headers + first 500 chars of body per file; reuses `_entry_matches_text` token-overlap. Opt-in via new `--include-framework` flag; result returned under new `framework_rules` key. Index rebuilt every call (corpus is ~94 files, body samples ~50KB total — O(ms) cost; no parallel YAML). **Wired (g-001-232, 2026-05-12)**: `.claude/skills/respond/SKILL.md` Tier 1 retrieve passes `--include-framework` for all user queries; e2e probe confirmed query "implementation discipline avoid scope creep" surfaces `.claude/rules/implementation-discipline.md`. |
-| G9 | ✓ R3 | Supplementary-store matcher is bimodal with tree nodes | T uses token-overlap; R/G/P used `_entry_matches_category` (substring on category field only); free-text queries returned zero supplementary hits | `core/scripts/retrieve.py` — `_entry_matches_text` token-overlap fallback added; 3 loaders updated to use `_entry_matches` combined predicate. Verified: all 5 paraphrased queries now return rb=8-40, g=14-40. |
+| G9 | ✓ R3 | Supplementary-store matcher is bimodal with tree nodes | T uses token-overlap; R/G/P used `_entry_matches_category` (substring on category field only); free-text queries returned zero supplementary hits | `core/scripts/retrieve.py` — `_entry_matches_text` token-overlap fallback added; 3 loaders updated to use `_entry_matches` combined predicate. Verified: all 5 paraphrased queries now return rb=8-40, g=14-40. **R3 was a PARTIAL application, completed 2026-07-30 by g-115-3855.** It updated the three engine LOADERS and missed a fourth consumer in another layer: the daemon session writer (`mind_api/src/endpoints/retrieve.py`) kept re-deriving `supplementary_items` membership with the narrow `_entry_matches_category`. So free-text-matched entries were returned and counter-bumped but dropped from the attestation manifest — `utilization-feedback --helpful` could never credit them, and `utility_ratio` drove them out of ranking. Membership is now taken from the loaders' return set (computed once). Measured on one query: 48 returned / 14 recorded → 48/48; attestation `helpful` 0 → 4. Note the sweep that missed it grepped the NEW predicate name, which structurally cannot find sites still calling the OLD one — grep `_entry_matches_category` (rb-5824, guard-1455). |
 | G10 | ✓ R12 | "Retrieval influence:" not captured in journal | Phase 4 Step 5c output existed in protocol but never reached journal entries | `core/config/execute-protocol-digest.md` Step 5c — writes `retrieval_influence_last` to working memory; `core/scripts/iteration-close.sh` — reads slot and passes via new `--retrieval-influence` flag; `core/scripts/journal-append.sh` — accepts flag and emits "Retrieval influence:" line |
 | G11 | ✓ R14 | `/respond` Step 5 directive writes | Self update / new aspiration / paused aspiration / remembered fact / recurring task all write to a store without first retrieving to check for contradictions, constraints, or duplicates. Non-autonomous-mode counterpart to G7. | `.claude/skills/respond/SKILL.md` Step 5.0 — Pre-Write Retrieval added between Mode Gate and directive routing. Reuses Step 4 retrieval when subject matches; re-retrieves for divergent subjects. Surfaces contradictions to user; user is authoritative. |
 | G12 | ✓ R15 | `/respond` Step 6 Knowledge Freshness | User correction triggered `_tree.yaml` scan only — missed RB/guards/beliefs/patterns that depend on the falsified knowledge. Sister mechanism to G3 surprise→broad-retrieve. | `.claude/skills/respond/SKILL.md` Step 6.1.a' — Broad re-retrieve added; builds reconciliation_candidates set across all stores; sub-step e' marks contradicting rb/guard/bel/sig for review (retire via existing `*-update.sh` scripts). |
@@ -115,6 +115,27 @@ The matcher in `core/scripts/retrieve.py` works in two layers:
 This bimodal behavior is **G9**. R3 adds a text-fallback layer that activates
 when category matching returns empty — restoring symmetry between tree-node
 and supplementary-store free-text retrieval.
+
+**Two predicates exist, and only one of them is the membership answer.**
+`_entry_matches_category` (narrow, category-substring) is still callable and is
+still correct for code paths that genuinely want exact-category semantics.
+`_entry_matches` (= category OR text-overlap) is what the three loaders use to
+SELECT the return set. Anything downstream that needs to know "which entries did
+this retrieval return?" must take the loaders' return set directly — never
+re-compute it, with either predicate. Re-deriving is what broke the attestation
+manifest for months (see G9 above): the narrow predicate silently dropped every
+text-fallback entry, and because the bump-set follows the RETURN set, those
+entries accrued `retrieval_count` they could never offset with `times_helpful`.
+`load_reasoning_bank`'s docstring states the invariant — the bump set MUST equal
+the return set — and it binds every consumer of that set, not just the bumper.
+
+One consequence worth stating because it reads as a workaround and is a weak
+one: leading a free-text `--category` string with a real category key does NOT
+restore membership generally. The narrow predicate is a bidirectional substring
+test against the whole query, so an anchor rescues only entries whose own
+category literally appears in the string — measured 6 of 20 guardrails and 0 of
+20 reasoning-bank rows on one live query. Post-fix the anchor is unnecessary;
+pre-fix it was never sufficient.
 
 ## Cross-references
 

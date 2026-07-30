@@ -228,6 +228,14 @@ def is_code_deliverable(goal):
       - a commit-SHA-shaped token is present
     A goal with none of these is treated as non-code (docs/tree/journal-only)
     and skipped — we never want to flag a knowledge-only close for "no commit".
+
+    NOT THE WHOLE GATE ANY MORE (g-115-3476). Every signal above is PROSE-shaped
+    — it reads how the closer narrated, when the question is what git contains.
+    Both consumers now also admit on `has_git_evidence`, so a tersely-closed goal
+    whose id appears in a real commit message is no longer skipped. Measured
+    2026-07-28 on the live queue: of the 136 in-window completed goals this
+    predicate rejected, 127 (93%) had commits resolvable by goal-id. It was not
+    filtering non-code goals; it was filtering terse ones.
     """
     wc = (goal.get("work_class") or "").lower()
     if wc in ("framework", "product"):
@@ -243,6 +251,18 @@ def is_code_deliverable(goal):
     if extract_commit_shas(goal):
         return True
     return False
+
+
+def has_git_evidence(goal, goalid_status):
+    """True when this goal's id appears in a real commit message. PURE — the git
+    work already happened in build_goalid_status; this only reads its result.
+
+    Whether a goal produced a code deliverable is a fact about GIT, not about how
+    its closer chose to narrate, so this admits goals that is_code_deliverable's
+    prose signals reject. sig-38: a detector predicate narrower than its
+    motivating incident class ships blind to its own trigger. (g-115-3476)
+    """
+    return bool((goalid_status or {}).get(goal.get("id")))
 
 
 def classify_goal(goal, now, sha_status, min_age_minutes=30.0,
@@ -275,7 +295,9 @@ def classify_goal(goal, now, sha_status, min_age_minutes=30.0,
     """
     if goal.get("status") != "completed":
         return None
-    if not is_code_deliverable(goal):
+    # Prose OR git. is_code_deliverable reads only how the close was narrated;
+    # has_git_evidence reads what actually landed. Either admits. ()
+    if not is_code_deliverable(goal) and not has_git_evidence(goal, goalid_status):
         return None
     completed_at = _parse_iso(goal.get("completed_at"))
     if completed_at is None:
@@ -365,7 +387,11 @@ def landed_shas(goal, now, sha_status, goalid_status=None,
     """
     if goal.get("status") != "completed":
         return []
-    if not is_code_deliverable(goal):
+    # Prose OR git — same widening as classify_goal. This tier is where the
+    # three measured counter-examples live:  /  /  all
+    # sat on the branches of OPEN PRs in product repos and were invisible
+    # because their closers happened to write no commit keyword.
+    if not is_code_deliverable(goal) and not has_git_evidence(goal, goalid_status):
         return []
     completed_at = _parse_iso(goal.get("completed_at"))
     if completed_at is None:
@@ -896,8 +922,14 @@ def build_goalid_status(goals, candidate_repos, now,
     for g in goals:
         if g.get("status") != "completed":
             continue
-        if not is_code_deliverable(g):
-            continue
+        # NO is_code_deliverable gate here (). This map IS the git
+        # evidence both consumers consult, so gating it on the prose predicate
+        # made the predicate self-confirming: a goal it rejected could never
+        # acquire the evidence that would have admitted it. The age window below
+        # is what bounds the cost, and it bounds it tightly — measured on the
+        # live queue 2026-07-28: 136 goals added, 0.243s each, 33.1s total for a
+        # sweep that runs on a 24h cadence. 127 of those 136 (93%) resolved to
+        # real commits.
         completed_at = _parse_iso(g.get("completed_at"))
         if completed_at is None:
             continue
@@ -1027,16 +1059,59 @@ def main():
                     help="Tier 2 only flags a stranded commit whose open pull "
                          "request is at least this old, so a freshly-opened PR "
                          "still in flight is never flagged (default 24).")
+    ap.add_argument("--goal", default=None,
+                    help="Scope the sweep to ONE goal id. Turns the fleet-wide "
+                         "detective sweep into a single-goal probe so a caller "
+                         "at CLOSE time can ask 'did THIS goal's work reach the "
+                         "default branch?' without re-implementing the tier-2 "
+                         "ancestry logic (g-115-3838). Pair with "
+                         "--min-age-minutes 0: a just-closed goal is younger "
+                         "than the 30-min push-throttle guard and would "
+                         "otherwise be filtered out before any check runs.")
+    ap.add_argument("--no-fetch", action="store_true",
+                    help="Skip the pre-probe `git fetch` across candidate repos. "
+                         "For the CLOSE-TIME caller only, where the agent just "
+                         "pushed from this box so local origin/* refs are "
+                         "already current. Do NOT use for the scheduled fleet "
+                         "sweep: the refs a fetch adds are OTHER boxes' pushes, "
+                         "and skipping it reintroduces the g-115-2660 cross-box "
+                         "false positive (a commit landed elsewhere reads as "
+                         "local-only). Measured cost of the fetch on cc-05: "
+                         "~24s across 57 repos, unaffected by --goal.")
     args = ap.parse_args()
 
     now = dt.datetime.now()
     all_goals = _read_goals("world") + _read_goals("agent")
+    # Single-goal scoping (). Applied to the goal POPULATION only —
+    # every downstream stage (sha_status, goalid_status, both tiers) is left
+    # untouched, so a scoped run and a fleet run evaluate the same goal through
+    # exactly the same predicates. Filtering here rather than at report time is
+    # what keeps that true: a report-time filter would still let OTHER goals'
+    # SHAs into build_sha_status and change what this goal is compared against.
+    if args.goal:
+        all_goals = [g for g in all_goals
+                     if str((g or {}).get("id") or "") == args.goal]
     candidate_repos = discover_candidate_repos()
     # : refresh origin/* refs ONCE before probing `branch -r --contains`,
     # else a cross-box commit (landed on the remote from another box, unfetched
     # here) reads local-only and false-positives as committed_not_pushed. Fetch
     # is refs-only (never pushes / never touches the tree) and fail-open.
-    fetch_status = _fetch_origin(candidate_repos)
+    # : the fetch is the sweep's dominant cost and it does NOT scale
+    # with --goal — it refreshes every discovered repo regardless of scope.
+    # Measured on cc-05: a --goal-scoped run still fetched 57 repos and took
+    # 24,131ms. That is fine for a 24h detective sweep and disqualifying for a
+    # per-close advisory, so --no-fetch exists for the close-time caller ONLY.
+    # It is sound exactly there and nowhere else: the closing agent has just
+    # pushed FROM THIS BOX, so local origin/* refs already reflect that push by
+    # construction. The refs a fetch would add are OTHER boxes' pushes, which
+    # are what the cross-box  false-positive guard needs — hence the
+    # scheduled sweep must keep fetching. Using --no-fetch for a fleet run would
+    # reintroduce exactly that false positive.
+    # str(r): candidate_repos holds Path objects and this dict is json.dumps'd
+    # in the report — Path keys raise TypeError at serialization, which _fetch_origin
+    # avoids by stringifying. Mirror that here or --no-fetch crashes at output time.
+    fetch_status = ({str(r): "skipped_no_fetch" for r in candidate_repos}
+                    if args.no_fetch else _fetch_origin(candidate_repos))
     sha_status = build_sha_status(all_goals, candidate_repos)
     goalid_status = build_goalid_status(all_goals, candidate_repos, now,
                                         args.min_age_minutes, args.lookback_hours)

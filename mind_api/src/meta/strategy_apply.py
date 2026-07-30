@@ -51,6 +51,7 @@ from ..agent_paths import assert_not_cruft
 # module happened to load first ().
 import _gate_log  # noqa: E402 — module-level log(); daemon passes meta_dir explicitly
 from _fileops import _atomic_write_with_fallback, _validate_no_surrogates  # noqa: E402
+from coordination_merge import merge_handler_for  # noqa: E402 — write-class classifier (guard-1733)
 
 
 # (filename, heuristics_field, phase_name) — keep in sync with CLI STRATEGY_FILES.
@@ -76,6 +77,21 @@ def _atomic_write_yaml(path: Path, data: Any) -> None:
     _atomic_write_with_fallback(path, _write, fallback_counter_key="daemon_strategy_apply_write")
 
 
+def _persist_unlocked(ctx, path: Path, data: Any) -> None:
+    """_persist's body WITHOUT the lock, for callers already inside a
+    locked_rmw cycle. file_locks.locked is NOT reentrant (a plain
+    threading.Lock), so nesting it inside locked_rmw deadlocks the daemon
+    thread. Mirrors meta_yaml._persist_unlocked."""
+    base_dir = ctx.paths.meta
+    agent = (ctx.headers.get("x-mind-agent") or "").strip() or "system"
+    assert_not_cruft(path.parent, "mkdir (strategy_apply)")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _validate_no_surrogates(data, path)
+    history.snapshot(path, base_dir, agent)
+    _atomic_write_yaml(path, data)
+    changelog.append(base_dir, agent, path, "edit")
+
+
 def _persist(ctx, path: Path, data: Any) -> None:
     """locked_write_yaml equivalent: CSafeDumper + history + changelog 'edit'."""
     base_dir = ctx.paths.meta
@@ -89,16 +105,80 @@ def _persist(ctx, path: Path, data: Any) -> None:
         changelog.append(base_dir, agent, path, "edit")
 
 
-def _load(ctx, file_tuple):
+def _load(ctx, file_tuple, force_fresh: bool = False):
     path = ctx.paths.meta / file_tuple[0]
     from storage_backend import get_backend
-    get_backend().ensure_local(path)  # own-cloud read-path fix 2026-07-02: materialize an S3-only file on a fresh box before the local read; no-op on LocalBackend and for out-of-root/git-shipped paths (keystone in owncloud_backend._refresh)
+    if force_fresh:
+        # Force-pull the latest remote object AND record its ETag as the
+        # If-Match fence, so a locked_rmw retry re-reads the peer's landed write
+        # and re-fences against the etag the remote actually holds. A cache-TTL
+        # read inside a retry loop re-fences against an etag the remote no
+        # longer has and the 412 repeats forever (rb-2639).
+        get_backend().refresh(path)
+    else:
+        get_backend().ensure_local(path)  # own-cloud read-path fix 2026-07-02: materialize an S3-only file on a fresh box before the local read; no-op on LocalBackend and for out-of-root/git-shipped paths (keystone in owncloud_backend._refresh)
     if not path.exists():
         return path, None, []
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
     heuristics = data.get(file_tuple[1], []) or []
     return path, data, heuristics
+
+
+def _apply_to_strategy_file(ctx, file_tuple, mutate):
+    """Read→mutate→write ONE strategy file under the locking discipline that
+    file's write class actually requires, and return whatever `mutate` reports.
+
+    STRATEGY_FILES is MIXED-CLASS (g-115-3834, measured — do not re-derive from
+    shape). Both entries are `*-strategy.yaml` in the same directory, driven by
+    the same loop, through the same helper, and they need OPPOSITE treatment:
+
+        goal-selection-strategy.yaml         (a) MERGE-protected -> the bare
+            lock is correct; merge_goal_selection_strategy reconciles below the
+            write, so a concurrent writer is merged rather than refused.
+        aspiration-generation-strategy.yaml  (b) fence-only -> needs locked_rmw
+            with a fresh in-cycle read; nothing reconciles below the write, an
+            unlocked read + bare-locked write silently drops the peer's
+            increment, and a stale If-Match fence is a PERMANENT per-object
+            wedge rather than a transient miss (rb-2639).
+
+    That is why the class is looked up per BASENAME here at run time via the
+    registry, rather than inferred from the loop, the module, the directory, or
+    a sibling file — the inference guard-1733 exists to forbid. Deriving it from
+    merge_handler_for also means a future registry change re-routes this code
+    automatically instead of silently invalidating a hardcoded assumption.
+
+    `mutate(heuristics) -> (dirty, result)` mutates the list IN PLACE and
+    reports whether a write is needed plus whatever the caller accumulates. It
+    is re-invoked from scratch on every locked_rmw retry against a freshly-read
+    list, so it MUST NOT append into an enclosing collection — return it.
+    """
+    path = ctx.paths.meta / file_tuple[0]
+
+    if merge_handler_for(file_tuple[0]) is not None:
+        # Class (a) — deliberately left on the bare lock. See docstring.
+        _p, data, heuristics = _load(ctx, file_tuple)
+        if not heuristics:
+            return None
+        dirty, result = mutate(heuristics)
+        if dirty:
+            data[file_tuple[1]] = heuristics
+            _persist(ctx, path, data)
+        return result
+
+    # Class (b) — cured: the read moves INSIDE the lock and the whole cycle
+    # re-runs on a conflict, re-applying the mutation over the peer's write.
+    def _cycle():
+        _p, data, heuristics = _load(ctx, file_tuple, force_fresh=True)
+        if not heuristics:
+            return None
+        dirty, result = mutate(heuristics)
+        if dirty:
+            data[file_tuple[1]] = heuristics
+            _persist_unlocked(ctx, path, data)
+        return result
+
+    return file_locks.locked_rmw(path, _cycle)
 
 
 def _tokenize(text):
@@ -117,47 +197,55 @@ def _run_match(ctx, phase_filter, keyword_tokens, increment):
     for file_tuple in STRATEGY_FILES:
         if phase_filter != "any" and phase_filter != file_tuple[2]:
             continue
-        path, data, heuristics = _load(ctx, file_tuple)
-        if not heuristics:
-            continue
-        dirty = False
-        for h in heuristics:
-            if not _keyword_match(h, keyword_tokens):
-                continue
-            if "times_applied" not in h:
-                h["times_applied"] = 0
-                dirty = True
-            if increment:
-                h["times_applied"] = int(h.get("times_applied", 0)) + 1
-                dirty = True
-            matched.append({
-                "id": h.get("id"),
-                "description": (h.get("description") or "")[:180],
-                "file": file_tuple[0],
-                "phase": file_tuple[2],
-                "times_applied": h.get("times_applied", 0),
-            })
-        if dirty:
-            data[file_tuple[1]] = heuristics
-            _persist(ctx, path, data)
+
+        def _mutate(heuristics, _ft=file_tuple):
+            # Built per attempt and RETURNED, never appended into `matched`
+            # directly: on a locked_rmw retry this runs again against a freshly
+            # read list, and an enclosing append would duplicate every match.
+            dirty = False
+            local = []
+            for h in heuristics:
+                if not _keyword_match(h, keyword_tokens):
+                    continue
+                if "times_applied" not in h:
+                    h["times_applied"] = 0
+                    dirty = True
+                if increment:
+                    # Reads from the freshly-read record on a retry, so a peer's
+                    # concurrent increment is added to rather than overwritten.
+                    h["times_applied"] = int(h.get("times_applied", 0)) + 1
+                    dirty = True
+                local.append({
+                    "id": h.get("id"),
+                    "description": (h.get("description") or "")[:180],
+                    "file": _ft[0],
+                    "phase": _ft[2],
+                    "times_applied": h.get("times_applied", 0),
+                })
+            return dirty, local
+
+        result = _apply_to_strategy_file(ctx, file_tuple, _mutate)
+        if result:
+            matched.extend(result)
     return matched
 
 
 def _run_migrate(ctx):
     migrated = 0
     for file_tuple in STRATEGY_FILES:
-        path, data, heuristics = _load(ctx, file_tuple)
-        if not heuristics:
-            continue
-        dirty = False
-        for h in heuristics:
-            if "times_applied" not in h:
-                h["times_applied"] = 0
-                dirty = True
-                migrated += 1
-        if dirty:
-            data[file_tuple[1]] = heuristics
-            _persist(ctx, path, data)
+
+        def _mutate(heuristics):
+            dirty = False
+            count = 0
+            for h in heuristics:
+                if "times_applied" not in h:
+                    h["times_applied"] = 0
+                    dirty = True
+                    count += 1
+            return dirty, count
+
+        result = _apply_to_strategy_file(ctx, file_tuple, _mutate)
+        migrated += result or 0
     return migrated
 
 

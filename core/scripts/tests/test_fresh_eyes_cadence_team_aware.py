@@ -30,6 +30,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -69,7 +70,7 @@ def _stub_config(team_aware=True, goal_cadence=25, min_session_goals=0):
 
 
 def _wire(monkeypatch, mod, *, config, current, current_world, slot_value,
-          team_stamp="UNSET"):
+          team_stamp="UNSET", team_claim=None):
     monkeypatch.setattr(mod, "_load_yaml", lambda _p: config)
     monkeypatch.setattr(
         mod, "count_completed_goals",
@@ -85,7 +86,15 @@ def _wire(monkeypatch, mod, *, config, current, current_world, slot_value,
 
     monkeypatch.setattr(mod, "wm_slot_value", fake_wm)
     if team_stamp != "UNSET":
-        monkeypatch.setattr(mod, "team_stamp_value", lambda _slot: team_stamp)
+        # Slot-aware: the  claim check reads a SEPARATE key
+        # (<slot>__inflight_claim) before the cadence stamp, so the stub must
+        # tell them apart or every claim test would be handed a cadence stamp.
+        def fake_team(slot):
+            if str(slot).endswith("__inflight_claim"):
+                return team_claim
+            return team_stamp
+
+        monkeypatch.setattr(mod, "team_stamp_value", fake_team)
     monkeypatch.setattr(sys, "argv", ["fresh-eyes-cadence-check.py"])
 
 
@@ -212,6 +221,85 @@ def test_main_fails_open_on_malformed_stamp(mod, monkeypatch):
         _stub_subprocess(monkeypatch, mod)
         rc = mod.main()
         assert rc == 0, f"malformed stamp {bad_stamp!r} must fail open to fire"
+
+
+# ── in-flight claim () ─────────────────────────────────────────────
+#
+# The shared stamp is written at ritual END but READ at ritual START, so agents
+# entering that window together all read the same pre-fire value and all passed.
+# Measured before this guard: 4 duplicate rituals across ~34 fires made AFTER
+# the team gate landed (2026-06-15, 06-19, and BOTH slots on 07-19; gaps
+# 2m48s-9m52s). Every test below wires a cadence stamp that ALLOWS the fire
+# (world diff 30 >= cadence 25), so rc=1 can only come from the claim — that is
+# what isolates the new branch from the cadence branch.
+
+def _claim(minutes_ago: float, by: str = "alpha"):
+    ts = datetime.now() - timedelta(minutes=minutes_ago)
+    return {"claimed_by": by, "claimed_at": ts.strftime("%Y-%m-%dT%H:%M:%S")}
+
+
+def _wire_claim(monkeypatch, mod, claim):
+    _wire(
+        monkeypatch, mod,
+        config=_stub_config(team_aware=True),
+        current=100,
+        current_world=95,   # world diff = 95-65 = 30 >= 25 → cadence gate FIRES
+        slot_value={"timestamp": "2026-06-01T00:00:00",
+                    "goals_count_at_last_fire": 70},
+        team_stamp={
+            "timestamp": "2026-05-01T12:00:00",
+            "world_goals_count_at_last_fire": 65,
+            "fired_by": "alpha",
+        },
+        team_claim=claim,
+    )
+    monkeypatch.setenv("MIND_AGENT", "bravo")
+    return _stub_subprocess(monkeypatch, mod)
+
+
+def test_main_noops_when_sibling_claim_is_live(mod, monkeypatch, capsys):
+    """Sibling mid-ritual → suppress the duplicate even though cadence says fire."""
+    calls = _wire_claim(monkeypatch, mod, _claim(5, by="alpha"))
+    rc = mod.main()
+    out = capsys.readouterr().out
+    assert rc == 1, f"live sibling claim must suppress; got rc={rc}; out={out!r}"
+    assert "alpha" in out, "message must name the claimant"
+    assert "mid-flight" in out
+    assert len(calls) == 0, "claim noop must not write any slot"
+
+
+def test_main_fires_when_claim_expired(mod, monkeypatch):
+    """A claim older than the TTL means a dead ritual → fall through and fire."""
+    calls = _wire_claim(
+        monkeypatch, mod, _claim(mod.CLAIM_TTL_MINUTES + 15, by="alpha"))
+    assert mod.main() == 0, "an expired claim must not starve the ritual"
+    assert len(calls) == 0
+
+
+def test_main_ignores_own_claim(mod, monkeypatch):
+    """My own orphaned claim must not block me out of re-running the ritual."""
+    _wire_claim(monkeypatch, mod, _claim(5, by="bravo"))   # MIND_AGENT=bravo
+    assert mod.main() == 0, "self-claim must be ignored, not self-suppressing"
+
+
+def test_main_ignores_future_dated_claim(mod, monkeypatch):
+    """Clock skew across boxes → negative age → fail open."""
+    _wire_claim(monkeypatch, mod, _claim(-120, by="alpha"))
+    assert mod.main() == 0, "future-dated claim must fail open to fire"
+
+
+def test_main_fails_open_on_malformed_claim(mod, monkeypatch):
+    """Any unreadable claim field → fire. A claim bug must never starve a ritual."""
+    for bad in (
+        {},                                                 # empty
+        {"claimed_by": "alpha"},                            # no timestamp
+        {"claimed_at": "2026-07-28T00:00:00"},              # no claimant
+        {"claimed_by": "alpha", "claimed_at": "garbage"},   # unparseable
+        {"claimed_by": "alpha", "claimed_at": None},
+        "not-a-dict",
+    ):
+        _wire_claim(monkeypatch, mod, bad)
+        assert mod.main() == 0, f"malformed claim {bad!r} must fail open to fire"
 
 
 # ── team_stamp_value ──────────────────────────────────────────────────────────

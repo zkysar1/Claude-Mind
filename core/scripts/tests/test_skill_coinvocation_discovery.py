@@ -18,7 +18,7 @@ load_existing_compose() read an empty world (deterministic); synthetic
 "coinvoc-test-*" skill names dodge the real base-config compose dedup.
 
 Cross-references:
-  -  -- Master plan finding #13 (the build goal)
+  - g-304-10 -- Master plan finding #13 (the build goal)
   - skill-relations.py cmd_discover -- the dedup/pair pattern reused
   - guard-588 -- module-level env stash discipline
 """

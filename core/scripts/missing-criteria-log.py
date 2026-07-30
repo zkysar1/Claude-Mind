@@ -17,7 +17,7 @@ here; only the *uncovered* gaps are.
 
 Reads a JSON record from stdin:
   {
-    "goal_id": "",             # required, non-empty string
+    "goal_id": "g-306-03",             # required, non-empty string
     "items":   ["...", "..."],         # required, non-empty list of uncovered-item strings
     "source":  "world" | "agent",      # optional
     "category": "framework-patterns",  # optional

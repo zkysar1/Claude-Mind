@@ -29,13 +29,16 @@ GOAL_ID=""
 AGENT=""
 CROSS_LANE=""
 DEVIATION=""
-declare -a PASSTHROUGH=()
+# (PASSTHROUGH array removed : it was written in three places and read
+# in none — a vestigial leftover of the pre-daemon cutover. Its only live effect
+# was the `-*` branch's shift-the-flag-only behavior, which is the defect fixed
+# below, so it went out with that line rather than surviving as a write-only
+# array that reads like it still forwards something.)
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --cross-lane)
             CROSS_LANE="${2-}"
-            PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
         --source)
             # Accept-and-ignore for convention symmetry (). Many
@@ -59,14 +62,36 @@ while [[ $# -gt 0 ]]; do
             DEVIATION="${2-}"
             shift $(( $# >= 2 ? 2 : 1 ));;
         -*)
-            PASSTHROUGH+=("$1"); shift;;
+            # REFUSE unknown flags (). This branch used to do
+            # `PASSTHROUGH+=("$1"); shift` — shifting the FLAG ONLY. The
+            # orphaned VALUE then fell through to the positional branch below
+            # and became agent_name. So a single typo (`--deviation-code X`
+            # for `--deviation X`) silently minted a phantom fleet agent named
+            # X: a team-state agent_status row in a fleet that has no such
+            # agent, carrying an in_flight that release could never clear
+            # (release looks up the REAL agent's row) and that then blocked
+            # goal filing via goal-duplication-gate's partner_in_flight check.
+            #
+            # The --source branch above exists for exactly this failure (read
+            # its comment: "phantom claimed_by=world row"). Enumerating one
+            # KNOWN flag cannot cover the UNKNOWN flags that actually cause it,
+            # which is why the hole re-opened. Refusing closes it.
+            #
+            # Safe to be strict: the accepted set is fully enumerated and small.
+            # Verified 2026-07-28 across core/scripts, .claude/skills,
+            # core/config, and world/scripts — no caller passes any flag but
+            # --source and --deviation.
+            echo "Error: unrecognized flag '$1'." >&2
+            echo "  Accepted: --deviation <code> | --cross-lane <reason> | --source <world|agent> | --goal[-id] <id>" >&2
+            echo "  Usage: aspirations-claim.sh <goal-id> [<agent-name>] [--deviation <code>]" >&2
+            exit 1;;
         *)
             if [ -z "$GOAL_ID" ]; then
                 GOAL_ID="$1"
             elif [ -z "$AGENT" ]; then
                 AGENT="$1"
             fi
-            PASSTHROUGH+=("$1"); shift;;
+            shift;;
     esac
 done
 
@@ -137,6 +162,80 @@ except Exception:
 " 2>/dev/null)" || true
     claimed_by="${extracted%%$'\t'*}"
     title="${extracted#*$'\t'}"
+    # --- iteration-checkpoint anchor () --------------------------
+    # Third instance of the same fold as the two blocks below: creation was
+    # LLM-discretionary (ONE executable `loop-state-save.sh init` call site in
+    # the whole repo — aspirations-select/SKILL.md Phase 2.95) while DELETION is
+    # bash-enforced (iteration-close.sh `rm -f`). So a loop that selects by
+    # calling goal-selector.sh directly instead of Skill(aspirations-select)
+    # never anchors, and the checkpoint stays absent for the REST of the
+    # session — every downstream reader then degrades silently and fail-open.
+    # Measured on this box: 101 `update_against_missing_checkpoint` rows in
+    # agents/<agent>/session/checkpoint-miss.jsonl.
+    #
+    # WHY source is hardcoded "world" rather than derived: reaching here means
+    # the daemon claim returned rc=0, which happens only after _find_goal
+    # succeeded against the WORLD queue (aspirations_write.py claim()), and the
+    # both-queues case is refused 409 upstream. So the goal is a world-queue
+    # goal by construction. Agent-queue goals never reach this function at all —
+    # claim() refuses them 400 `agent_queue_goal` BY DESIGN ("Agent-queue goals
+    # do not require claims... Proceed directly to execution"), so the claim
+    # chokepoint structurally cannot cover source=agent and Phase 2.95 remains
+    # LOAD-BEARING for that path. Do not "finish the job" by dropping the loop
+    # digest's `IF source==world` claim guard: every agent-source iteration
+    # would then start with a 400 the digest treats as "journal abort +
+    # LOOP_CONTINUE", which would silently stop executing the entire recurring
+    # cadence (.. all live in the agent queue).
+    #
+    # ENSURE, not overwrite: writes only when no checkpoint exists or it
+    # anchors a DIFFERENT goal. When Phase 2.95 already ran it wrote a RICHER
+    # anchor (selector_score, skill, cross_agent_owner) and an unconditional
+    # init here would silently downgrade it.
+    #
+    # Path resolution is delegated to loop-state-save.sh on purpose — this
+    # wrapper does a skinny PROJECT_ROOT resolve and must NOT inline a 6th
+    # AGENTS_PARENT_DIR copy (see the header note on the same constraint for
+    # runner-token). FAIL-OPEN throughout.
+    local cp_goal asp_num
+    cp_goal="$(MIND_AGENT="$agent" bash "$CORE_ROOT/scripts/loop-state-save.sh" read 2>/dev/null \
+        | $(rt_python_launcher) -c "
+import json, sys
+try:
+    print((json.loads(sys.stdin.read() or 'null') or {}).get('goal_id') or '')
+except Exception:
+    print('')
+" 2>/dev/null)" || true
+    # Strip CR before comparing (fresh-eyes finding, this goal). On Windows the
+    # whole round-trip is text-mode: loop-state-save.py `_atomic_write` opens with
+    # os.fdopen(fd,"w") so the file gets \r\n, cmd_read prints it back through a
+    # text-mode stdout, and the python above re-emits goal_id via print() — also
+    # text mode. $( ) strips the trailing \n but NOT the \r, so cp_goal arrives as
+    # "g-NNN-NN\r", never equals "$goal_id", and the ENSURE guarantee below
+    # inverts into overwrite-every-claim — silently downgrading Phase 2.95's
+    # richer anchor on exactly one platform. NOT reproducible off Windows (the
+    # \r is added by the interpreter's stdout translation, not by any file
+    # content a test can seed), so this is defensive by inspection rather than
+    # test-pinned; stating that limit beats shipping a source-text-only test.
+    cp_goal="${cp_goal//$'\r'/}"
+    # asp-NNN from g-NNN-NN[-a]; asp-xw-<ts> from g-xw-<ts>-NN (both forms are
+    # in loop-state-save.py SCHEMA's id patterns).
+    case "$goal_id" in
+        g-xw-*) asp_num="xw-$(printf '%s' "$goal_id" | cut -d- -f3)";;
+        g-*)    asp_num="$(printf '%s' "$goal_id" | cut -d- -f2)";;
+        *)      asp_num="";;
+    esac
+    if [ -n "$asp_num" ] && [ "${cp_goal:-}" != "$goal_id" ]; then
+        printf '{"goal_id":"%s","aspiration_id":"asp-%s","source":"world","phase":"selected","selected_at":"%s"}' \
+            "$goal_id" "$asp_num" "$(date +%Y-%m-%dT%H:%M:%S)" \
+            | MIND_AGENT="$agent" bash "$CORE_ROOT/scripts/loop-state-save.sh" init \
+                >/dev/null \
+            || echo "[aspirations-claim] WARN: iteration-checkpoint init failed for ${goal_id} (claim still succeeded)" >&2
+        # stdout is dropped (the "anchored:" line is noise on a successful claim)
+        # but stderr is deliberately NOT — init's own WARN names WHY it refused
+        # (e.g. an aspiration_id that fails the SCHEMA pattern), and the generic
+        # message above cannot. Swallowing both channels would leave a failure
+        # visible but undiagnosable, which is the half-fix rb-5454 warns about.
+    fi
     # --- in_flight / current_focus stamp () ----------------------
     # Folds the honor-system `team-state-in-flight.sh` step (documented in
     # coordination.md as "Phase 4 claim, before board post") into the claim

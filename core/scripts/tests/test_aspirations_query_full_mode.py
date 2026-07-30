@@ -125,6 +125,35 @@ def test_full_mode_returns_full_record():
     assert rec["id"] == GOAL_ID, rec
 
 
+def test_full_mode_emits_both_id_keys():
+    """: --full must carry BOTH `id` and `goal_id`, with equal values.
+
+    Before this, the two projections had MUTUALLY EXCLUSIVE identifier keys:
+    default carried goal_id and no id; --full carried id and no goal_id at all
+    (measured 520/520 records). That is a silent-None trap rather than a
+    nuisance, because --full is the mode the Multi-Agent Safety Rule mandates —
+    it is the only mode carrying claimed_by — so the very flag that makes the
+    partner-claim guard possible was the flag that nullified a goal_id-keyed
+    implementation of it. A loop filtering by goal_id matched nothing and looked
+    correct in review.
+
+    Asserting EQUALITY (not just presence) is the load-bearing part: an alias
+    that drifts from the raw record's id would reintroduce the same class of bug
+    while passing a presence-only check.
+    """
+    with tempfile.TemporaryDirectory(prefix="q-bothkeys-") as tmpd:
+        world = _seed_world(Path(tmpd))
+        with DaemonFixture(world) as df:
+            rec = _query(df.port, "true")
+    assert "id" in rec, f"--full dropped `id`; keys={sorted(rec.keys())}"
+    assert "goal_id" in rec, (
+        f"--full must ALSO emit `goal_id` so either key works (g-115-3473); "
+        f"keys={sorted(rec.keys())}")
+    assert rec["id"] == rec["goal_id"] == GOAL_ID, (
+        f"id/goal_id disagree or are wrong: id={rec.get('id')!r} "
+        f"goal_id={rec.get('goal_id')!r} expected={GOAL_ID!r}")
+
+
 def test_default_projection_unchanged():
     with tempfile.TemporaryDirectory(prefix="q-default-") as tmpd:
         world = _seed_world(Path(tmpd))
@@ -159,6 +188,8 @@ def test_full_truthy_and_false_spellings():
 
 if __name__ == "__main__":
     test_full_mode_returns_full_record()
+    test_full_mode_emits_both_id_keys()
     test_default_projection_unchanged()
     test_full_truthy_and_false_spellings()
-    print("PASS: g-115-1304 --full goal-by-id full-record read mode")
+    print("PASS: g-115-1304 --full goal-by-id full-record read mode "
+          "+ g-115-3473 dual id/goal_id key")

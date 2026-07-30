@@ -24,6 +24,20 @@
 #   Help:
 #     bash core/scripts/cross-world-post.sh --help
 #
+# ── PREFER core/scripts/peer-board-post.sh FOR BOARD POSTS ─────────────
+# For plain board posts to a peer, use `peer-board-post.sh`: it resolves the
+# target from the `core/config/environments/*.yaml` registry and pins the PEER's
+# storage backend before writing. THIS script routes through the hand-maintained
+# WORLD_MAP below — a literal absolute path that is correct only on the machine
+# it was written for (the single entry is a Windows path; it does not resolve on
+# a Linux box), and it inherits the CALLER's storage backend, which is the
+# guard-955 / rb-2983 hazard when the two deployments differ — as ayoai-mind
+# (own-cloud) and zds-mind (local) do, deliberately and by user directive.
+#
+# What is NOT yet available elsewhere: `--inject-goal`. Until an equivalent
+# exists, this script remains the only aspiration/goal injection path, which is
+# why it is fixed in place rather than retired.
+#
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
 
@@ -32,8 +46,36 @@ source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
 declare -A WORLD_MAP
 WORLD_MAP[ayoai]="C:/ZakNoCloud/AyoaiCache/Ayoai-World"
 
-# ── Constants ──────────────────────────────────────────────────────────
-ORIGIN="omni@zds-mind"
+# ── Origin identity (G5 provenance) ────────────────────────────────────
+# DERIVED from ENVIRONMENT_ID — never hardcoded. This file is promoted
+# ayoai-mind -> claude-mind -> zds-mind, so ANY literal origin is correct in at
+# most one tier and silently forges a peer identity in every other: until
+# 2026-07-30 this read `omni@zds-mind`, so running it from ayoai-mind stamped
+# both the author field (L234) and the message id (L207) as zds-mind's agent.
+# That is not a cosmetic mislabel — the receiving world has no other way to
+# attribute a post, and `cross-deployment-channel.md` documents that 87% of
+# real inbound traffic is already unattributable by author alone.
+#
+# DIE rather than default: a post with a WRONG provenance stamp is worse than
+# no post, and G5 makes provenance mandatory (guard-68).
+ORIGIN_AGENT="${MIND_AGENT:-omni}"
+ORIGIN_ENV="${ENVIRONMENT_ID:-}"
+if [ -z "$ORIGIN_ENV" ] && [ -f "${PROJECT_ROOT:-.}/.env.local" ]; then
+    ORIGIN_ENV=$(grep -m1 '^ENVIRONMENT_ID=' "${PROJECT_ROOT:-.}/.env.local" 2>/dev/null \
+                 | cut -d= -f2- | tr -d '"'"'"' \r')
+fi
+if [ -z "$ORIGIN_ENV" ]; then
+    echo "cross-world-post.sh: cannot resolve ENVIRONMENT_ID — refusing to post" >&2
+    echo "  G5 (guard-68) requires a provenance stamp; an unstamped or guessed" >&2
+    echo "  origin would misattribute this post to another deployment." >&2
+    echo "  Set ENVIRONMENT_ID in .env.local, or use core/scripts/peer-board-post.sh," >&2
+    echo "  which resolves the peer from core/config/environments/*.yaml." >&2
+    exit 2
+fi
+# `<agent>@<env-id>` — '@' not '-': every registry env-id contains a hyphen, so
+# the hyphen form cannot be split back into (agent, env). See
+# core/config/conventions/cross-deployment-channel.md.
+ORIGIN="${ORIGIN_AGENT}@${ORIGIN_ENV}"
 RATE_LIMIT_CAP=20       # G4: max posts per hour per target
 
 # ── Helpers ────────────────────────────────────────────────────────────
@@ -93,11 +135,18 @@ check_rate_limit() {
     # Count records from our origin across all board channels in the last hour.
     # Use a simple grep + python count for robustness.
     local count
-    count=$(py -3 -c "
+    # guard-165: pass ORIGIN through the ENVIRONMENT, never interpolate it into
+    # the Python source text. This block already used the correct pattern for
+    # board_dir (argv) while interpolating origin one line up. Newly relevant as
+    # of 2026-07-30: ORIGIN used to be a hardcoded literal (guaranteed
+    # quote-free); it is now derived from MIND_AGENT + ENVIRONMENT_ID, i.e. from
+    # environment input. No injection path is known — both inputs are controlled
+    # — so this is latent-correctness, not a live break.
+    count=$(CWP_ORIGIN="$ORIGIN" py -3 -c "
 import json, sys, os, glob
 from datetime import datetime, timedelta
 
-origin = '$ORIGIN'
+origin = os.environ['CWP_ORIGIN']
 now = datetime.now()
 one_hour_ago = now - timedelta(hours=1)
 count = 0

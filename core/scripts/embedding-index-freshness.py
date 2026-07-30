@@ -51,7 +51,29 @@ def _blend_enabled():
 
 
 def _source_mtime():
-    """Newest mtime of the corpus source stores (world rb + guardrails)."""
+    """Newest mtime of the corpus source stores.
+
+    The watch-set MUST mirror embedding-index-build.load_corpus, which indexes
+    guardrails + reasoning-bank + KNOWLEDGE TREE NODES. It did not until
+    g-115-3763: the tree was in the corpus but not here, so a tree-only
+    encoding never marked the index stale and the new node stayed invisible to
+    retrieve.sh until an unrelated rb/guardrail write happened to fire the
+    tick. Measured (bravo, cc-05, 2026-07-28): 85 unindexed entries had
+    accumulated, and three queries that should have matched a freshly-added
+    node returned it in 0/15 results each — then at ranks 7/4/4 after a manual
+    --update. The node content was fine; only the index was stale.
+
+    BOTH tree surfaces are watched because the embedded text is
+    humanized-key + _tree.yaml summary + the node .md's first body paragraph
+    (build.tree_doc_text): a new node or a summary edit moves _tree.yaml, while
+    a body edit moves only the .md. Watching either one alone leaves the other
+    class of edit silently unindexed.
+
+    The .md sweep is a stat-only rglob — 11.8ms over 1291 nodes measured on
+    cc-04, against a tick that already runs once per iteration close. An
+    over-trigger costs one incremental --update (seconds); an under-trigger
+    costs invisibility, so the sweep deliberately does not filter out
+    non-node .md files that may sit under the tree root."""
     try:
         from _paths import WORLD_DIR
     except Exception:
@@ -64,6 +86,21 @@ def _source_mtime():
         except OSError:
             continue
         newest = m if newest is None else max(newest, m)
+    tree_root = Path(WORLD_DIR) / "knowledge" / "tree"
+    try:
+        m = (tree_root / "_tree.yaml").stat().st_mtime
+        newest = m if newest is None else max(newest, m)
+    except OSError:
+        pass
+    try:
+        for p in tree_root.rglob("*.md"):
+            try:
+                m = p.stat().st_mtime
+            except OSError:
+                continue
+            newest = m if newest is None else max(newest, m)
+    except OSError:
+        pass
     return newest
 
 
