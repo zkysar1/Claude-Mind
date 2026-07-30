@@ -69,6 +69,87 @@ if [ -n "$ALL_AGENTS" ] && [ -n "$AGENT" ]; then
     echo "[owncloud-pull] ERROR: --all-agents and --agent are mutually exclusive" >&2
     exit 2
 fi
+
+# --- Local-backend continuity pull () ------------------------------
+# This script IS the session-start continuity pull: /start's IDLE branch calls it
+# so a session resumes with current world/meta state. Under own-cloud that means
+# fetching from S3. Under STORAGE_BACKEND=local there is no S3 authority — git is
+# the sync mechanism — and the daemon endpoint below correctly reports a no-op,
+# so the continuity pull did NOTHING on a local-backend deployment.
+#
+# The consequence was not theoretical: the ONLY caller of iteration-push.sh is
+# iteration-close.sh, i.e. the AUTONOMOUS LOOP, so assistant- and reader-mode
+# sessions never fetched at all. Measured 2026-07-29 — a laptop assistant session
+# was 47 commits behind origin while actively reading and writing those files,
+# because the agent had moved to another box and been pushing there for hours.
+# own-cloud deployments never had this gap; it was purely a missing local-backend
+# implementation behind an existing hook.
+#
+# Handled HERE rather than in /start because Edit/Write on .claude/skills/start/*
+# is in the settings.json DENY bucket (guard-103): making the existing call site
+# backend-complete needs no /start change at all, and keeps ONE continuity-pull
+# entry point for both backends.
+#
+# --no-push is load-bearing: starting a session must never publish state as a
+# side effect. Delegating to iteration-push.sh reuses its hardened fetch+integrate
+# (FETCH_HEAD throttle, dirty-tree refusal, merge --abort on true conflict,
+# fail-soft on auth/network) instead of re-deriving that logic here.
+_ocp_storage_backend() {
+    local v="${STORAGE_BACKEND:-}"
+    if [[ -z "$v" && -f "$PROJECT_ROOT/.env.local" ]]; then
+        v="$(grep -E '^[[:space:]]*STORAGE_BACKEND[[:space:]]*=' "$PROJECT_ROOT/.env.local" 2>/dev/null \
+             | tail -1 | sed -E 's/^[^=]*=[[:space:]]*//; s/[[:space:]]*#.*$//; s/[[:space:]]*$//')"
+    fi
+    # Default to "local" when nothing is set anywhere, MATCHING the daemon's own
+    # default: mind_api/src/endpoints/admin.py resolves
+    # os.environ.get("STORAGE_BACKEND", "local").strip().lower(). Without this
+    # the two disagree exactly where it matters — a local-backend deployment
+    # that relies on the default (no env var, no .env.local entry) would have
+    # the daemon report backend=local while this helper returned "", so the
+    # continuity pull would silently skip on the very deployments the fix
+    # targets. Verified at the emitter, not assumed.
+    [ -z "$v" ] && v="local"
+    printf '%s' "$v" | tr '[:upper:]' '[:lower:]'
+}
+#
+# TWO GATES BELOW, both added by the bravo half of this converged change. Each
+# blocks a case where the git work is wrong rather than merely unnecessary.
+if [ "$(_ocp_storage_backend)" = "local" ]; then
+    # GATE 1 — --only means TARGETED REFRESH, not continuity pull.
+    # /open-questions calls `--all-agents --only pending-questions.yaml`, and
+    # --only exists precisely because a full sweep is "far too slow for an
+    # interactive dashboard" (this file's header). Attaching a repo-wide
+    # fetch+merge to that path reintroduces the cost the flag was built to
+    # avoid — and the integrate can COMMIT self-namespace churn to self-heal a
+    # dirty tree (), so a read-oriented user command could produce a
+    # commit. Found by /fresh-eyes-code reviewing this change.
+    if [ -n "$ONLY" ]; then
+        echo "[owncloud-pull] backend=local: --only is a targeted refresh — skipping git integrate (use a bare /start for the continuity pull)"
+        exit 0
+    fi
+    # GATE 2 — reader mode must stay side-effect-free, and --no-push alone is
+    # NOT sufficient to make it so: the integrate path can COMMIT self-namespace
+    # churn BEFORE the --no-push seam is ever reached (). So reader
+    # does not integrate at all; it stays as current as the checkout it opened
+    # on, which is the right trade against writing to disk in a read-only
+    # session. /start sets the mode (SKILL.md:634) before calling this script
+    # (SKILL.md:668), so this reads the TARGET mode, not a stale one — verified,
+    # because a reversed order would make every local /start read the "reader"
+    # disk-default and skip the integrate silently.
+    _ocp_mode="$(bash "$CORE_ROOT/scripts/session-mode-get.sh" 2>/dev/null || true)"
+    _ocp_mode="$(printf '%s' "$_ocp_mode" | tr -d '[:space:]')"
+    if [ "$_ocp_mode" = "reader" ]; then
+        echo "[owncloud-pull] backend=local: reader mode — skipping git integrate (side-effect-free contract)"
+        exit 0
+    fi
+    echo "[owncloud-pull] backend=local — continuity pull via git fetch+integrate (no push)"
+    # Fail-soft by contract: iteration-push.sh always exits 0 without --strict, so
+    # a network/auth/dirty-tree hiccup degrades to "resume from local state"
+    # exactly as the own-cloud path's WARN branch does. Never block session start.
+    bash "$_RUNTIME_SELF/iteration-push.sh" --repo "$PROJECT_ROOT" --no-push \
+        || echo "[owncloud-pull] WARN: git continuity pull returned non-zero — resuming from local state (may be stale)" >&2
+    exit 0
+fi
 if [ -z "$ALL_AGENTS" ]; then
     [ -z "$AGENT" ] && AGENT="${MIND_AGENT:-}"
     if [ -z "$AGENT" ]; then

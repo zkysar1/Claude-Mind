@@ -40,7 +40,7 @@ from _paths import WORLD_DIR, AGENT_DIR  # noqa: E402
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
 
 DEFAULT_SILENCE_HOURS = 6
-DEFAULT_TARGET_ASP = ""   # framework-maintenance home
+DEFAULT_TARGET_ASP = "asp-001"   # framework-maintenance home
 DEFAULT_PRIORITY = "MEDIUM"
 DEFAULT_CATEGORY = "framework-maintenance"
 

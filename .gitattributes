@@ -72,3 +72,58 @@ agents/*/aspirations.jsonl merge=ayoai-ledger
 # diverges on both sides, so nothing is silently coalesced. Driver registered
 # per-clone by install-git-hooks.sh (git driver config is NOT version-controlled).
 agents/*/journal/**/*.md merge=ayoai-journal-md
+
+# Cross-machine merge for the SHARED world/meta stores under .mind-data/ — the
+# local-backend (STORAGE_BACKEND=local) analogue of every rule above.
+#
+# WHY THIS IS NEEDED: with no S3 authority, git IS the sync mechanism — and
+# iteration-push.sh's fetch+integrate is NOT backend-gated (zero STORAGE_BACKEND
+# refs), so it runs every iteration on every box. Every rule above is scoped to
+# agents/*, which WAS the whole git surface while world/ + meta/ were external and
+# gitignored. When .mind-data/ became git-tracked (2026-07-28) the shared stores
+# entered git with NO merge routing, so git fell back to LINE-based merge — which
+# writes '<<<<<<<' markers INSIDE a .jsonl and CORRUPTS it, because a conflict
+# marker is not valid JSON. Measured on a real two-box conflict: the unrouted
+# store took 2 markers (unparseable); the same conflict routed here merged clean.
+#
+# WHY ayoai-ledger IS THE RIGHT DRIVER: it dispatches by BASENAME through
+# coordination_merge.merge_handler_for() — the SAME 72-handler registry the
+# own-cloud S3 reconcile path already uses in production — so each store gets its
+# purpose-built commutative handler (merge_aspirations, merge_reasoning_bank,
+# merge_guardrails, merge_tree, merge_team_state[_shard], merge_spark_questions,
+# merge_append_only_jsonl, ...) with ZERO new merge logic. Verified end-to-end on
+# real records: both boxes' new records kept, both counter bumps kept via MAX, and
+# a genuine id COLLISION (both boxes allocating rb-900 — the guaranteed clash when
+# one agent identity runs on two boxes) auto-resolved to rb-900 + rb-901, no dupes.
+#
+# AN UNREGISTERED BASENAME IS A STRICT IMPROVEMENT, NOT A RISK: merge_bytes raises,
+# the driver exits 1 WITHOUT writing %A, so git keeps the conflict and the file
+# retains valid 'ours' content instead of being corrupted by markers. All three
+# cases measured (handled / unhandled / unrouted baseline). So a broad extension
+# glob is safe: a new store is covered the day its handler is registered, and is
+# no worse than today until then.
+#
+# NOT merge=union: these are RMW stores (status flips, counter rollups, pruning,
+# archival) and fail the zero-deleted-lines evidence gate stated above — union
+# would resurrect pruned/edited records.
+#
+# DELIBERATELY NOT ROUTED: *.md knowledge-tree nodes (prose — a visible conflict
+# marker is readable and hand-resolvable, and there is no record structure to
+# union), and *.sh / *.py under world/scripts/ (real code — git's line merge is
+# the correct behavior there).
+#
+# KNOWN BOUNDED SIDE-EFFECT: merge_reasoning_bank re-stamps ids via id_format
+# 'rb-{N}' (UNPADDED — required by _merge_id_keyed_jsonl's byte-converge contract).
+# A store carrying legacy zero-padded rb ids renumbers them on its first real rb
+# merge (ZDS: exactly 4 — rb-001..rb-004; the store switches to unpadded at rb-5).
+# Record CONTENT is untouched; only textual cross-references go stale. guardrails
+# is UNAFFECTED (id_format is 3-pad 'guard-{N:03d}', which already reproduces both
+# guard-001 and guard-213 byte-for-byte). Tracked for deliberate normalization —
+# not a reason to leave the store unrouted, since the alternative is marker
+# corruption of the whole store on every conflict.
+.mind-data/world/**/*.jsonl merge=ayoai-ledger
+.mind-data/world/**/*.yaml merge=ayoai-ledger
+.mind-data/world/**/*.json merge=ayoai-ledger
+.mind-data/meta/**/*.jsonl merge=ayoai-ledger
+.mind-data/meta/**/*.yaml merge=ayoai-ledger
+.mind-data/meta/**/*.json merge=ayoai-ledger

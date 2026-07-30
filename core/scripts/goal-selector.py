@@ -81,7 +81,8 @@ from cadence_signals import evaluate_cadence_signal  # noqa: E402  ( signal-gate
 # Single source of truth for terminal goal statuses — see aspirations.py.
 # Derived sets below (SKIP_STATUSES, ABANDONED_STATUSES) stay consistent if a new
 # status is added to TERMINAL_GOAL_STATUSES.
-from aspirations import TERMINAL_GOAL_STATUSES, STRUCTURED_DEFER_PREFIXES  # noqa: E402
+from aspirations import (TERMINAL_GOAL_STATUSES, STRUCTURED_DEFER_PREFIXES,  # noqa: E402
+                         routes_away_from)
 from _goal_census import effective_counts  # noqa: E402  (B9-deep census-augmented counts)
 from _iaus_scorer import iaus_score  # noqa: E402  ( flagged utility scorer)
 from _runner_capabilities import (  # noqa: E402  ( per-runner capability filter)
@@ -619,6 +620,14 @@ def load_recurring_config():
         "substantive_demotion_margin": 0.5,
         "substantive_demotion_floor": 5.0,
         "substantive_demotion_overdue_exempt_ratio": 5.0,
+        # : interval-scoped exemption for monitor-class recurring goals.
+        # These MUST be listed here — the loop below iterates `defaults` as an
+        # ALLOWLIST, so a key present in aspirations.yaml but absent from this dict
+        # is silently discarded with no parse error and no warning. Values mirror
+        # the shipped aspirations.yaml so behavior is identical whether or not a
+        # given deployment's YAML carries the keys.
+        "substantive_demotion_short_interval_hours": 6.0,
+        "substantive_demotion_short_interval_exempt_ratio": 1.0,
     }
     try:
         import importlib.util
@@ -1498,7 +1507,7 @@ def _is_owner_scoped_goal(goal):
 
 def _get_idle_agents(reallocation_hours):
     """Set of agent names whose team-state last_active is older than
-    reallocation_hours ( gap #4 — intended_agent idle-reallocation).
+    reallocation_hours (g-115-1766 gap #4 — intended_agent idle-reallocation).
 
     An intended_agent-routed goal is normally hidden from every other agent
     (collect_candidates intended_agent filter). When the routed-to agent has
@@ -1889,10 +1898,15 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
             # uncertainty, so any genuinely cross-lane goal stays visible
             # to both agents — only goals confidently routed to a specific
             # peer get filtered out here.
+            # : routes_away_from() also returns False for a value
+            # OUTSIDE the live vocabulary (a retired agent, or an unrecognized
+            # sentinel like the cycle-detector's "any"), so such a goal falls
+            # through and becomes visible instead of vanishing from BOTH this
+            # output and collect_blocked (which never references
+            # intended_agent). Conservative on an unreadable roster -- see the
+            # helper's docstring.
             intended_agent = goal.get("intended_agent")
-            if (intended_agent
-                    and intended_agent != AGENT_NAME
-                    and intended_agent != "either"):
+            if routes_away_from(intended_agent, AGENT_NAME):
                 # Idle-agent reallocation ( gap #4): when the routed-to
                 # agent has been idle beyond reallocation_hours AND the goal is
                 # unclaimed, fall through so a running capable agent can pick up
@@ -2677,6 +2691,81 @@ def directive_boost_score(goal_id, category):
     return boost
 
 
+def emit_strategic_focus_banner(scored, agent_name):
+    """Emit a LOUD stderr STRATEGIC-FOCUS banner when a routine sweep outranks the
+    standing directive's own lane (g-115-3251).
+
+    The directive is a PAIRWISE claim -- "product goals outrank routine infra
+    sweeps at selection time" -- but strategic_focus_boost above is a PER-GOAL
+    SCALAR. A scalar cannot express a pairwise preference: it biases the lane
+    against EVERYTHING equally. That is why the weight was deliberately NOT
+    raised here. Any value large enough to clear a routine sweep (measured
+    shortfall 1.29, zeta 2026-07-28) also overrides the verified-defect work
+    that aspirations.yaml's own calibration comment excludes -- so the magnitude
+    debate is unresolvable AT the scalar, and the pairwise half belongs here.
+
+    A banner, not a veto: Scorer Sovereignty (g-115-2812) keeps the ranking with
+    the scorer. Mirrors emit_directive_honor_banner's compaction-proof posture --
+    goal-selector.py runs every iteration, so a bash-emitted line cannot be
+    summarized away, whereas the meta-strategy heuristic sh-004 that states the
+    same rule is LLM-honor-system only (zero code readers) AND had been
+    structurally unfireable: it was written 2026-05-22 for STARVED lanes
+    (completion_ratio < 0.40) and asp-335 sits at 0.88.
+
+    "Routine infra sweep" keys on `recurring` alone -- the directive's own noun.
+    Deliberately NOT a category enum: sh-004's hardcoded framework/product lists
+    are precisely what broke it (on live data BOTH its top-pick category test and
+    its challenger category test missed). Returns the emitted warnings for tests.
+    Fail-open throughout: never raises, never blocks selection.
+    """
+    if not agent_name or not scored:
+        return []
+    try:
+        lanes = load_strategic_focus()["aspirations"]
+    except Exception as e:  # pragma: no cover - fail-open guard
+        print(f"[goal-selector] strategic-focus banner skipped "
+              f"({type(e).__name__}: {e})", file=sys.stderr)
+        return []
+    if not lanes:
+        return []  # no standing directive, or its prose names no asp-NNN
+
+    def _eligible(s):
+        # A goal with no intended_agent is open to anyone; "either" likewise.
+        ia = s.get("intended_agent")
+        return bool(s.get("routed_to_me")) or ia in (None, "", "either", agent_name)
+
+    mine = [s for s in scored if _eligible(s)]
+    if not mine:
+        return []
+    top = mine[0]
+    if not top.get("recurring"):
+        return []  # top eligible pick is not a sweep -- directive says nothing
+    if top.get("aspiration_id") in lanes:
+        return []  # the sweep IS lane work -- already honoring the directive
+    lane = next((s for s in mine if s.get("aspiration_id") in lanes), None)
+    if lane is None:
+        return []  # no lane candidate is available to this agent right now
+    try:
+        gap = round(float(top.get("score") or 0.0) - float(lane.get("score") or 0.0), 2)
+    except (TypeError, ValueError):
+        return []  # non-numeric score -- the docstring promises no raise, so honor it
+    if gap <= 0:
+        return []  # lane already outranks the sweep -- nothing to correct
+    warn = (
+        f"[goal-selector] ⚠ STRATEGIC-FOCUS: top pick eligible to {agent_name} is a "
+        f"ROUTINE SWEEP ({top.get('goal_id')} '{str(top.get('title'))[:48]}', "
+        f"recurring, score {top.get('score')}), outranking lane goal "
+        f"{lane.get('goal_id')} '{str(lane.get('title'))[:48]}' "
+        f"({lane.get('aspiration_id')}, score {lane.get('score')}) by {gap}. The "
+        f"standing user directive says product goals OUTRANK routine infra sweeps "
+        f"at selection time. Prefer {lane.get('goal_id')} and claim it with "
+        f"--deviation meta-tiebreaker, OR state why the sweep genuinely cannot "
+        f"wait. This is bias, not veto -- a real blocker still wins (sh-004)."
+    )
+    print(warn, file=sys.stderr)
+    return [warn]
+
+
 def emit_directive_honor_banner(scored, agent_name, board_path=None):
     """Emit a LOUD stderr DIRECTIVE-HONOR banner (guard-1310, ) for each
     active directive DIRECTED AT agent_name that targets a goal PRESENT in the
@@ -2845,6 +2934,10 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
     rec = 0
     overdue_ratio = 0.0  # hoisted (FW-1): exposed in the result dict so the
                          # post-scoring substantive-demotion exemption can read it.
+    interval = 0.0       # hoisted (): same reason, one field further. The
+                         # exemption needs the INTERVAL as well as the ratio, because
+                         # a pure ratio test carries no absolute-time bound — see
+                         # apply_substantive_demotion for why that starves monitors.
     if goal.get("recurring"):
         interval = get_interval_hours(goal)
         #  (cross-machine clock-skew fix): capture the RAW lastAchievedAt
@@ -2896,6 +2989,29 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
         recurring_count = sum(1 for s in recent if s.get("recurring", False))
         ratio = recurring_count / len(recent)
         rec_sat = -(ratio * RECURRING_CONFIG["saturation_max_penalty"])
+        # INDIVIDUAL-STARVATION RELIEF (). The comment on 7b claims
+        # "truly overdue recurring goals overcome this via high recurring_urgency."
+        # That is arithmetically impossible at the shipped defaults, and the
+        # cancellation is exact: urgency_max and saturation_max_penalty are BOTH
+        # 4.0 and carry the SAME 0.8 weight, so at full class saturation the
+        # largest urgency a goal can earn (+3.20) is cancelled to the decimal by
+        # the largest penalty it can pay (-3.20) — a net of 0.00 no matter how
+        # overdue it is. Measured live 2026-07-30 (cc-04): every capped row in the
+        # starved population showed exactly +3.20 - 2.40 = +0.80 at saturation
+        # 0.75. Raising urgency_max cannot fix this; it just relocates the
+        # cancellation point, which is why prior tuning passes did not move the
+        # tally (14 -> 25 over the day,  -> ).
+        #
+        # The category error is that this is a CLASS penalty aimed at recurring
+        # goals CROWDING OUT substantive work. A goal that has not fired in 20
+        # days is not crowding anything — it is what got crowded out. So scale
+        # the penalty down by the goal's OWN staleness, using the exemption bar
+        # FW-1 already applies to the very same population (shared predicate, so
+        # the two mechanisms cannot drift): before this, FW-1 exempted a 20x-
+        # overdue production health probe from demotion while this penalty went
+        # on charging it in full.
+        rec_sat *= (1.0 - overdue_exemption_level(
+            overdue_ratio, interval, RECURRING_CONFIG))
     raw["recurring_saturation"] = rec_sat
 
     # 7c. per_goal_saturation (penalty when the SAME goal_id fires rapidly)
@@ -3298,6 +3414,7 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
         "tags": _ensure_list(goal.get("tags")),
         "recurring": bool(goal.get("recurring")),
         "recurring_overdue_ratio": round(overdue_ratio, 3),
+        "recurring_interval_hours": round(interval, 3),
         "score": round(total, 2),
         "breakdown": {
             **{k: round(raw.get(k, 0.0) * WEIGHTS[k], 2) for k in WEIGHTS},
@@ -3459,6 +3576,54 @@ def apply_cell_return_boost(scored, config, *, cells_dir=None, agent=None, graph
     return scored
 
 
+def overdue_exemption_level(ratio, interval_hours, config):
+    """How exempt a stale recurring goal is from suppression, on [0.0, 1.0].
+
+    ONE predicate, TWO consumers (g-115-4018): apply_substantive_demotion's
+    binary exemption below, and the recurring_saturation relief in score_goal.
+    Both answer the same question — "is this goal stale enough that suppressing
+    it further would let monitoring rot?" — so they must not be able to drift
+    apart. Before they were joined, FW-1 exempted a 20x-overdue PRODUCTION health
+    probe from demotion while recurring_saturation went on charging that same
+    goal the full class penalty. Two mechanisms, same population, opposite
+    verdicts, neither wrong on its own terms.
+
+    Returns 1.0 when fully exempt — either the pure-ratio bar
+    (substantive_demotion_overdue_exempt_ratio) or the interval-scoped
+    monitor-class bar (g-115-3922) is met. Below that, the larger of the two
+    normalized fractions, so relief phases in rather than switching on. Callers
+    wanting the original binary test use `>= 1.0`, which is exactly how
+    apply_substantive_demotion consumes it — behavior there is unchanged.
+
+    WHY THE SECOND ARM IS INTERVAL-SCOPED AND NOT FLAT ABSOLUTE HOURS
+    (carried from the g-115-3922 site this predicate absorbed). The pure ratio
+    test has no absolute-time bound, so exempt_ratio 5.0 means elapsed == 6x the
+    interval: a 6h monitor stays suppressed until 36h stale, a 24h goal until 6
+    days. A monitor's whole value is timeliness, so scale the bar to the interval
+    instead of relaxing it globally. Measured 2026-07-29 over 38 live recurring
+    candidates: a flat ">=12h overdue" OR exempts 24/38 (baseline 6/38) and
+    ">=48h" still exempts 19/38 — a 3-4x relaxation that re-opens the exact
+    recurring domination FW-1 was built to prevent (6 of 7 agents reporting it).
+    The interval-scoped form exempts 8/38 and by construction cannot touch the
+    55 of 61 corpus recurring goals whose interval exceeds the threshold.
+    short_interval_hours 0.0 makes the guard `0 < iv <= 0.0` unsatisfiable, so
+    behavior is identical to pre-g-115-3922.
+    """
+    exempt_ratio = float(config["substantive_demotion_overdue_exempt_ratio"])
+    short_iv_h = float(config.get("substantive_demotion_short_interval_hours") or 0.0)
+    short_ratio = float(config.get("substantive_demotion_short_interval_exempt_ratio") or 0.0)
+    frac = 0.0
+    if exempt_ratio > 0:
+        frac = ratio / exempt_ratio
+    if 0 < interval_hours <= short_iv_h:
+        # short_ratio <= 0 reproduces today's `ratio >= 0` guard, which is
+        # unconditionally true for a monitor-class interval.
+        if short_ratio <= 0:
+            return 1.0
+        frac = max(frac, ratio / short_ratio)
+    return min(max(frac, 0.0), 1.0)
+
+
 def apply_substantive_demotion(scored, config):
     """FW-1 (2026-05-25, 7-agent feedback): bound recurring scores below substantive work.
 
@@ -3488,7 +3653,8 @@ def apply_substantive_demotion(scored, config):
         return scored
     margin = float(config["substantive_demotion_margin"])
     floor = float(config["substantive_demotion_floor"])
-    exempt_ratio = float(config["substantive_demotion_overdue_exempt_ratio"])
+    # The three exemption knobs are read by overdue_exemption_level, not here
+    # () — keeping local copies would be a second place to update.
     # "Substantive" = non-recurring AND executable by THIS agent (agent_executable
     # raw is 2 when eligible, 0 otherwise). Only protect work the agent can pick up.
     substantive = [
@@ -3503,13 +3669,20 @@ def apply_substantive_demotion(scored, config):
         return scored
     cap = round(top_sub - margin, 2)
     for s in scored:
-        if (s.get("recurring")
-                and s["score"] > cap
-                and float(s.get("recurring_overdue_ratio", 0.0)) < exempt_ratio):
-            s.setdefault("breakdown", {})["substantive_demotion"] = round(cap - s["score"], 2)
-            s.setdefault("raw", {})["substantive_demotion_pre_score"] = s["score"]
-            s["raw"]["substantive_demotion_applied"] = True
-            s["score"] = cap
+        if not s.get("recurring") or s["score"] <= cap:
+            continue
+        ratio = float(s.get("recurring_overdue_ratio", 0.0))
+        iv = float(s.get("recurring_interval_hours", 0.0))
+        # Both exemption arms now come from the shared predicate () so
+        # this and the recurring_saturation relief cannot diverge. `>= 1.0` is the
+        # binary form and is behavior-identical to the two inline tests it
+        # replaced; see overdue_exemption_level for why they were joined.
+        if overdue_exemption_level(ratio, iv, config) >= 1.0:
+            continue  # genuinely-stale monitoring must surface
+        s.setdefault("breakdown", {})["substantive_demotion"] = round(cap - s["score"], 2)
+        s.setdefault("raw", {})["substantive_demotion_pre_score"] = s["score"]
+        s["raw"]["substantive_demotion_applied"] = True
+        s["score"] = cap
     return scored
 
 
@@ -3855,6 +4028,16 @@ def cmd_select(args):
         emit_directive_honor_banner(scored, AGENT_NAME)
     except Exception as e:  # pragma: no cover - defensive; banner must never block
         print(f"[goal-selector] directive-honor banner error "
+              f"({type(e).__name__}: {e})", file=sys.stderr)
+
+    # STRATEGIC-FOCUS banner (): the pairwise half of the standing user
+    # directive, which the per-goal strategic_focus_boost scalar structurally
+    # cannot express. Separately wrapped so it can never disturb the pinned
+    # emit_directive_honor_banner call site above ().
+    try:
+        emit_strategic_focus_banner(scored, AGENT_NAME)
+    except Exception as e:  # pragma: no cover - defensive; banner must never block
+        print(f"[goal-selector] strategic-focus banner error "
               f"({type(e).__name__}: {e})", file=sys.stderr)
 
     print(json.dumps(scored, indent=2, ensure_ascii=False))

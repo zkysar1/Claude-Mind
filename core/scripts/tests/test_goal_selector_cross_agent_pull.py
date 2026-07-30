@@ -43,6 +43,10 @@ gs = importlib.import_module("goal-selector")
 collect_cross_agent_candidates = gs.collect_cross_agent_candidates
 score_goal = gs.score_goal  # : emission-side test target
 
+# Live intended_agent vocabulary — used to derive a peer name rather than
+# hardcoding one that a future retirement would silently rot (guard-1699).
+from aspirations import _valid_intended_agents as _vocab  # noqa: E402
+
 if _SAVED_AGENT is None:
     os.environ.pop("MIND_AGENT", None)
 else:
@@ -189,8 +193,18 @@ def case_strict_match_contract() -> tuple[bool, str]:
         # Phase 2.5.D: agent dirs live under PROJECT_ROOT/agents/.
         foo_dir = root / "agents" / "foo"
         target_dir = root / "agents" / TARGET_AGENT
-        # pick a different agent name for the "other" case so it doesn't match
-        other_name = "delta" if TARGET_AGENT != "delta" else "alpha"
+        # pick a different agent name for the "other" case so it doesn't match.
+        # NOT hardcoded (guard-1699): this used `"delta" if TARGET_AGENT !=
+        # "delta" else "alpha"`, and delta was RETIRED 2026-07-07 -- so the
+        # fixture had quietly stopped meaning "another agent" and started
+        # meaning "a nonexistent agent". Harmless HERE, because
+        # collect_cross_agent_candidates enforces a strict-match contract
+        # (intended_agent == agent_name) and never consults the roster -- but
+        # the identical idiom in test_goal_selector_world_source_derivation.py
+        # DID rot into a false regression once  split the two cases.
+        # Derive from the live vocabulary so it cannot rot again.
+        other_name = next((n for n in sorted(_vocab())
+                           if n not in (TARGET_AGENT, "either")), "alpha")
         _write_aspirations(foo_dir, [
             _make_aspiration("asp-test", [
                 _make_goal("g-match",  intended_agent=TARGET_AGENT),  # included

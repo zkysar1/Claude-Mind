@@ -310,7 +310,7 @@ def test_zero_sha_no_goalid_commit_not_flagged():
     g = _zero_sha_goal(id="g-115-9997")
     assert mod.classify_goal(g, NOW, {}, goalid_status={}) is None
     assert mod.classify_goal(
-        g, NOW, {}, goalid_status={"": {"x": False}}) is None  # other goal
+        g, NOW, {}, goalid_status={"g-999-99": {"x": False}}) is None  # other goal
 
 
 def test_zero_sha_goalid_none_status_dropped():
@@ -985,3 +985,75 @@ def test_file_investigate_names_every_stranding_pr():
         mod._rt.aspirations_add_goal = orig
     desc = captured["body"]["description"]
     assert "#54" in desc and "#129" in desc
+
+
+# ── git evidence admits terse closes () ──────────────────────────
+#
+# is_code_deliverable's three signals are all PROSE-shaped: work_class, a commit
+# keyword somewhere in the evidence fields, or a SHA-looking token. Whether a
+# goal produced code is a fact about git, not about how its closer narrated it,
+# so a tersely-closed goal was skipped by BOTH tiers before any git resolution
+# ran — and because the resolver was itself gated on the predicate, a goal it
+# rejected could never acquire the evidence that would have admitted it.
+#
+# Measured on the live queue 2026-07-28: of the 136 in-window completed goals
+# the predicate rejected, 127 (93%) had commits resolvable by goal-id. Three of
+# them sat on branches of OPEN PRs ( -> Vinheim #55,  ->
+# Vinheim #57,  ->  #162) and were invisible.
+
+def _terse_goal(**kw):
+    """The measured counter-example shape: completed, work_class 'unclassified',
+    no outcome_note / completion_summary / verify_summary, and no commit keyword
+    or SHA token anywhere. is_code_deliverable MUST return False for this."""
+    g = _goal()
+    for k in ("outcome_note", "verification"):
+        g.pop(k, None)
+    g.update({
+        "id": "g-999-01",
+        "work_class": "unclassified",
+        "title": "did the thing",
+        "description": "did the thing",
+    })
+    g.update(kw)
+    return g
+
+
+def test_terse_goal_is_rejected_by_the_prose_predicate():
+    """Precondition for the tests below — if this ever starts returning True the
+    fixture has drifted and the widening tests would pass vacuously."""
+    mod = _import()
+    assert mod.is_code_deliverable(_terse_goal()) is False
+
+
+def test_git_evidence_admits_a_goal_the_prose_predicate_rejects():
+    """Tier 1. Same goal, same prose; the ONLY difference is that its id resolved
+    to a real commit."""
+    mod = _import()
+    g = _terse_goal()
+    assert mod.classify_goal(g, NOW, {}, goalid_status={}) is None
+    flagged = mod.classify_goal(
+        g, NOW, {}, goalid_status={"g-999-01": {"a" * 40: False}})
+    assert flagged is not None and flagged["goal_id"] == "g-999-01"
+
+
+def test_no_git_evidence_still_skips_a_knowledge_only_close():
+    """THE control that keeps the widening honest. The predicate exists so a
+    docs/tree/journal-only close is never flagged for 'no commit'. Admitting on
+    git evidence must not weaken that: no commit, still skipped."""
+    mod = _import()
+    g = _terse_goal()
+    assert mod.classify_goal(g, NOW, {}, goalid_status={}) is None
+    assert mod.classify_goal(g, NOW, {}, goalid_status=None) is None
+
+
+def test_has_git_evidence_is_pure_and_reads_only_the_resolved_map():
+    """It must not shell out — the git work belongs to build_goalid_status, and
+    duplicating it here would put a `git log` inside the pure tier predicates."""
+    mod = _import()
+    g = _terse_goal()
+    assert mod.has_git_evidence(g, None) is False
+    assert mod.has_git_evidence(g, {}) is False
+    assert mod.has_git_evidence(g, {"other-id": {"x": True}}) is False
+    assert mod.has_git_evidence(g, {"g-999-01": {"a" * 40: True}}) is True
+    # An empty per-goal map means "resolved nothing" -> not evidence.
+    assert mod.has_git_evidence(g, {"g-999-01": {}}) is False

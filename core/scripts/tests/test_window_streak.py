@@ -15,20 +15,23 @@ Post-cutover (2026-05-14): aspirations.py complete-by CLI was deleted;
 tests now hit the daemon endpoint via _rt.aspirations_complete_by. Each
 test spins up an in-process daemon against a temp project root so the
 fixture data is visible to the daemon (the long-running daemon sees the
-real world dir, not temp dirs — see mind_api/tests/conftest.py for the
-canonical pattern).
+real world dir, not temp dirs).
+
+Use the SHARED core/scripts/tests/_daemon_fixture.py — never a local copy.
+Until 2026-07-30 this file carried a forked _DaemonFixture that pinned only
+RT_DIR and MIND_AGENT. The shared one also pins MIND_WORLD (g-115-2352),
+STORAGE_BACKEND (g-115-2101), and MIND_META (guard-652). Missing the
+MIND_WORLD pin meant that wherever MIND_WORLD happened to be exported, the
+env tier beat the fixture local-paths.conf, the daemon resolved the REAL
+world, and all 5 tests failed 404 goal_not_found on the fixture-seeded goal
+-- green on boxes where the var was unset, red where it was set (g-115-3947).
 """
 from __future__ import annotations
 
 import json
-import os
-import socket
 import sys
 import tempfile
-import threading
-import time
 from datetime import datetime, timedelta
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -39,104 +42,7 @@ if str(CORE_SCRIPTS) not in sys.path:
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 import _rt  # canonical Python -> daemon client (post-cutover)
-
-
-# ---------------------------------------------------------------------------
-# In-process daemon helpers (mirrors mind_api/tests/conftest.py pattern)
-# ---------------------------------------------------------------------------
-
-def _make_project_root(tmp: Path, world: Path, agent: str = "alpha") -> Path:
-    """Build a minimal project root with local-paths.conf pointing at world."""
-    pr = tmp / "repo"
-    pr.mkdir(exist_ok=True)
-    # Phase 2.5.D layout: agent dirs live under agents/ parent.
-    agents_parent = pr / "agents"
-    agents_parent.mkdir(exist_ok=True)
-    agent_dir = agents_parent / agent
-    agent_dir.mkdir(exist_ok=True)
-    (agent_dir / "session").mkdir(exist_ok=True)
-    meta = pr / "meta"
-    meta.mkdir(exist_ok=True)
-    (agent_dir / "local-paths.conf").write_text(
-        f"WORLD_PATH={world.as_posix()}\nMETA_PATH={meta.as_posix()}\n",
-        encoding="utf-8",
-    )
-    return pr
-
-
-def _start_daemon(project_root: Path) -> tuple:
-    """Start an in-process daemon; return (httpd, port)."""
-    from mind_api.src.server import Server, _Handler
-    from mind_api.src import lifecycle
-
-    server = Server(project_root=project_root, port=0)
-    handler_cls = type(
-        "_BoundHandler", (_Handler,), {
-            "routes": server.routes,
-            "resolver": server.resolver,
-            "access_log_path": lifecycle.access_log(project_root),
-            "pid": 0,
-            "port": 0,
-        },
-    )
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
-    port = httpd.server_address[1]
-    handler_cls.port = port
-    handler_cls.pid = os.getpid()
-
-    # Write port file so _rt can find this daemon.
-    rt_dir = project_root / "mind_api" / "state"
-    rt_dir.mkdir(parents=True, exist_ok=True)
-    (rt_dir / "daemon.port").write_text(str(port), encoding="utf-8")
-
-    t = threading.Thread(target=httpd.serve_forever, daemon=True)
-    t.start()
-    deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline:
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.05):
-                break
-        except OSError:
-            time.sleep(0.02)
-    return httpd, port
-
-
-class _DaemonFixture:
-    """Context manager: spins up an in-process daemon for a temp world."""
-
-    def __init__(self, world: Path, agent: str = "alpha"):
-        self.world = world
-        self.agent = agent
-        self._httpd = None
-        self._port = None
-        self._pr = None
-        self._prev_env = {}
-
-    def __enter__(self):
-        tmp = self.world.parent
-        self._pr = _make_project_root(tmp, self.world, self.agent)
-        self._httpd, self._port = _start_daemon(self._pr)
-
-        # Point _rt at this daemon via env overrides.
-        self._prev_env = {
-            "RT_DIR": os.environ.get("RT_DIR"),
-            "RT_PORT_FILE": os.environ.get("RT_PORT_FILE"),
-            "MIND_AGENT": os.environ.get("MIND_AGENT"),
-        }
-        rt_dir = self._pr / "mind_api" / "state"
-        os.environ["RT_DIR"] = str(rt_dir)
-        os.environ["MIND_AGENT"] = self.agent
-        return self
-
-    def __exit__(self, *exc):
-        if self._httpd:
-            self._httpd.shutdown()
-            self._httpd.server_close()
-        for k, v in self._prev_env.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
+from _daemon_fixture import DaemonFixture  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +123,7 @@ def test_first_completion_seeds_window_streak():
     """No prior lastAchievedAt -> windowStreak = 1, longestWindowStreak = 1."""
     with tempfile.TemporaryDirectory() as tmpd:
         world = _make_world(Path(tmpd), last_achieved_at=None)
-        with _DaemonFixture(world):
+        with DaemonFixture(world):
             rc, _, err = _complete_by("g-100-01")
             assert rc == 0, err
         g = _read_goal(world, "g-100-01")
@@ -235,7 +141,7 @@ def test_on_time_completion_advances_both():
         world = _make_world(Path(tmpd), last_achieved_at=last,
                             current_streak=3, window_streak=3,
                             longest_window=3, interval_hours=4)
-        with _DaemonFixture(world):
+        with DaemonFixture(world):
             rc, _, err = _complete_by("g-100-01")
             assert rc == 0, err
         g = _read_goal(world, "g-100-01")
@@ -253,7 +159,7 @@ def test_past_strict_within_window_streak_continues():
         world = _make_world(Path(tmpd), last_achieved_at=last,
                             current_streak=5, window_streak=5,
                             longest_window=5, interval_hours=4)
-        with _DaemonFixture(world):
+        with DaemonFixture(world):
             rc, _, err = _complete_by("g-100-01")
             assert rc == 0, err
         g = _read_goal(world, "g-100-01")
@@ -271,7 +177,7 @@ def test_past_window_resets():
         world = _make_world(Path(tmpd), last_achieved_at=last,
                             current_streak=10, window_streak=10,
                             longest_window=10, interval_hours=4)
-        with _DaemonFixture(world):
+        with DaemonFixture(world):
             rc, _, err = _complete_by("g-100-01")
             assert rc == 0, err
         g = _read_goal(world, "g-100-01")
@@ -293,7 +199,7 @@ def test_streak_break_emits_signal():
         world = _make_world(tmp, last_achieved_at=last,
                             current_streak=5, window_streak=5,
                             longest_window=5, interval_hours=4)
-        with _DaemonFixture(world):
+        with DaemonFixture(world):
             rc, _, err = _complete_by("g-100-01")
             assert rc == 0, err
         # Just verify the streak reset happened (signal emission is

@@ -309,7 +309,7 @@ def test_merge_union_and_append_and_scalar(running_daemon):
     # conftest session 2: goals_completed=[,], key_events=[],
     # tags=[routine].
     patch = {
-        "goals_completed": ["", "g-NEW"],  # union: dedup 
+        "goals_completed": ["g-001-03", "g-NEW"],  # union: dedup 
         "key_events": ["e1", "e2"],                 # append
         "tags": ["routine", "extra"],               # union: dedup routine
         "hypotheses_resolved": 4,                    # scalar overwrite

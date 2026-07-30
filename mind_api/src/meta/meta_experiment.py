@@ -61,9 +61,19 @@ def _config(ctx) -> Dict[str, Any]:
     return _read_yaml(ctx.paths.project_root / "core" / "config" / "meta.yaml")
 
 
-def _read_yaml(path: Path) -> Dict[str, Any]:
+def _read_yaml(path: Path, force_fresh: bool = False) -> Dict[str, Any]:
+    """force_fresh=True force-pulls the latest remote object AND records its
+    ETag as the If-Match fence token, so a locked_rmw retry re-reads the peer's
+    landed write and re-fences against the etag the remote actually holds. A
+    cache-TTL read inside a retry loop re-fences against an etag the remote no
+    longer has, and the 412 then repeats forever against a remote that never
+    changes — the per-object stale-IfMatch DEADLOCK (rb-2639). Mirrors
+    meta_yaml._read_yaml."""
     from storage_backend import get_backend
-    get_backend().ensure_local(path)  # own-cloud read-path fix 2026-07-02: materialize an S3-only file on a fresh box before the local read; no-op on LocalBackend and for out-of-root/git-shipped paths (keystone in owncloud_backend._refresh)
+    if force_fresh:
+        get_backend().refresh(path)  # force-pull latest + set If-Match fence (rb-2639)
+    else:
+        get_backend().ensure_local(path)  # own-cloud read-path fix 2026-07-02: materialize an S3-only file on a fresh box before the local read; no-op on LocalBackend and for out-of-root/git-shipped paths (keystone in owncloud_backend._refresh)
     if not path.exists():
         return {}
     with open(path, "r", encoding="utf-8") as f:
@@ -84,17 +94,35 @@ def _atomic_write_yaml(path: Path, data: Any) -> None:
         path, _write, fallback_counter_key="daemon_meta_experiment_write")
 
 
-def _persist(ctx, path: Path, data: Any) -> None:
-    """Locked CSafeDumper write + history snapshot + changelog 'edit' (no summary)."""
+def _persist_unlocked(ctx, path: Path, data: Any) -> None:
+    """_persist's body WITHOUT the lock, for callers already inside a
+    locked_rmw cycle. file_locks.locked is NOT reentrant (a plain
+    threading.Lock), so nesting it inside locked_rmw deadlocks the daemon
+    thread. Mirrors meta_yaml._persist_unlocked.
+
+    WHY these two files need the locked_rmw treatment (g-115-3834, measured —
+    do not re-derive from shape): coordination_merge.merge_handler_for returns
+    None for BOTH active-experiments.yaml and completed-experiments.yaml, so
+    both are write-class (b) FENCE-ONLY — nothing reconciles below the write,
+    and a stale If-Match fence is a PERMANENT per-object wedge rather than a
+    transient miss. Classify by PATH via that one lookup, never by the sibling
+    module or the enclosing directory (guard-1733)."""
     base_dir = ctx.paths.meta
     agent = _agent_name(ctx)
     assert_not_cruft(path.parent, "mkdir (meta_experiment)")
     path.parent.mkdir(parents=True, exist_ok=True)
-    with file_locks.locked(path):
-        _validate_no_surrogates(data, path)
-        history.snapshot(path, base_dir, agent)
-        _atomic_write_yaml(path, data)
-        changelog.append(base_dir, agent, path, "edit")
+    _validate_no_surrogates(data, path)
+    history.snapshot(path, base_dir, agent)
+    _atomic_write_yaml(path, data)
+    changelog.append(base_dir, agent, path, "edit")
+
+
+# The bare-lock `_persist` that used to live here is DELETED, not retained
+# (). Both paths this module writes — active-experiments.yaml and
+# completed-experiments.yaml — are class (b) fence-only, so a bare-lock persist
+# here is not merely unused, it is ALWAYS the wrong call, and leaving it in
+# place arms the next editor to reach for the shorter name. `_persist_unlocked`
+# + `file_locks.locked_rmw` is the only correct pair in this module.
 
 
 def _next_id(experiments) -> str:
@@ -142,10 +170,16 @@ def create(ctx) -> "Response":  # type: ignore[name-defined]
 
     assert_not_cruft(active_path.parent, "mkdir (meta_experiment)")
     active_path.parent.mkdir(parents=True, exist_ok=True)
-    with file_locks.locked(active_path):
-        active = _read_yaml(active_path)
+
+    def _cycle():
+        # force_fresh matters most HERE: both the max_concurrent check and
+        # _next_id are derived from the list this read returns. A cache-TTL read
+        # lets two boxes mint the same exp-NNN and each overwrite the other's,
+        # silently — the retry re-derives both against the peer's landed write.
+        active = _read_yaml(active_path, force_fresh=True)
         experiments = active.get("experiments", [])
         if len(experiments) >= max_concurrent:
+            # No write — locked_rmw makes exactly one pass and returns this.
             return Response.error(409, "max_concurrent",
                                   "Max {} concurrent experiments".format(max_concurrent))
         exp_id = _next_id(experiments)
@@ -168,10 +202,12 @@ def create(ctx) -> "Response":  # type: ignore[name-defined]
         _atomic_write_yaml(active_path, active)
         changelog.append(base_dir, agent, active_path, "edit")
 
-    return Response.text(
-        json.dumps({"status": "created", "id": exp_id,
-                    "strategy": strategy, "field": field}) + "\n",
-        content_type="application/json")
+        return Response.text(
+            json.dumps({"status": "created", "id": exp_id,
+                        "strategy": strategy, "field": field}) + "\n",
+            content_type="application/json")
+
+    return file_locks.locked_rmw(active_path, _cycle)
 
 
 # ---------------------------------------------------------------------------
@@ -212,53 +248,76 @@ def resolve(ctx) -> "Response":  # type: ignore[name-defined]
     if not exp_id:
         return Response.error(400, "missing_param", "id is required")
 
-    active = _read_yaml(_active_path(ctx))
-    completed = _read_yaml(_completed_path(ctx))
-    experiments = active.get("experiments", [])
-    completed_list = completed.get("experiments", [])
-
-    target = None
-    remaining = []
-    for exp in experiments:
-        if exp.get("id") == exp_id:
-            target = exp
-        else:
-            remaining.append(exp)
-    if not target:
-        return Response.error(404, "not_found", "Experiment {} not found".format(exp_id))
-
-    baseline_metrics = target.get("metrics", {}).get("baseline", [])
-    variant_metrics = target.get("metrics", {}).get("variant", [])
-    if baseline_metrics and variant_metrics:
-        delta = (sum(variant_metrics) / len(variant_metrics)
-                 - sum(baseline_metrics) / len(baseline_metrics))
-    else:
-        delta = 0.0
-
+    active_path = _active_path(ctx)
+    completed_path = _completed_path(ctx)
     threshold = _config(ctx).get("experiments", {}).get("significance_threshold", 0.05)
-    if delta > threshold:
-        outcome = "adopted"
-    elif delta < -threshold:
-        outcome = "reverted"
-    else:
-        outcome = "inconclusive"
+    out: Dict[str, Any] = {}
 
-    target["resolved"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-    target["outcome"] = outcome
-    target["delta"] = round(delta, 6)
-    target["status"] = "resolved"
+    # Both files are write-class (b), and before  BOTH reads happened
+    # entirely outside any lock — the widest RMW window of the five cured sites.
+    # Each file now gets its own locked_rmw with a fresh in-cycle read. The two
+    # writes remain NON-atomic across files (faithful to CLI, unchanged here):
+    # locked_rmw fences one object, so a cross-file transaction is out of its
+    # scope and out of this fix's.
+    def _cycle_active():
+        active = _read_yaml(active_path, force_fresh=True)
+        experiments = active.get("experiments", [])
 
-    completed_list.append(target)
-    completed["experiments"] = completed_list
-    active["experiments"] = remaining
+        target = None
+        remaining = []
+        for exp in experiments:
+            if exp.get("id") == exp_id:
+                target = exp
+            else:
+                remaining.append(exp)
+        if not target:
+            # No write — locked_rmw makes exactly one pass and returns this.
+            return Response.error(404, "not_found",
+                                  "Experiment {} not found".format(exp_id))
 
-    # Two separate locked writes (NOT atomic across files — faithful to CLI).
-    _persist(ctx, _active_path(ctx), active)
-    _persist(ctx, _completed_path(ctx), completed)
+        baseline_metrics = target.get("metrics", {}).get("baseline", [])
+        variant_metrics = target.get("metrics", {}).get("variant", [])
+        if baseline_metrics and variant_metrics:
+            delta = (sum(variant_metrics) / len(variant_metrics)
+                     - sum(baseline_metrics) / len(baseline_metrics))
+        else:
+            delta = 0.0
+
+        if delta > threshold:
+            outcome = "adopted"
+        elif delta < -threshold:
+            outcome = "reverted"
+        else:
+            outcome = "inconclusive"
+
+        target["resolved"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        target["outcome"] = outcome
+        target["delta"] = round(delta, 6)
+        target["status"] = "resolved"
+
+        active["experiments"] = remaining
+        _persist_unlocked(ctx, active_path, active)
+        out["target"] = target
+        out["outcome"] = outcome
+        out["delta"] = delta
+        return None
+
+    not_found = file_locks.locked_rmw(active_path, _cycle_active)
+    if not_found is not None:
+        return not_found
+
+    def _cycle_completed():
+        completed = _read_yaml(completed_path, force_fresh=True)
+        completed_list = completed.get("experiments", [])
+        completed_list.append(out["target"])
+        completed["experiments"] = completed_list
+        _persist_unlocked(ctx, completed_path, completed)
+
+    file_locks.locked_rmw(completed_path, _cycle_completed)
 
     return Response.text(
         json.dumps({"status": "resolved", "id": exp_id,
-                    "outcome": outcome, "delta": round(delta, 6)}) + "\n",
+                    "outcome": out["outcome"], "delta": round(out["delta"], 6)}) + "\n",
         content_type="application/json")
 
 

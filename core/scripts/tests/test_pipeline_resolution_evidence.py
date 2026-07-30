@@ -158,7 +158,7 @@ def test_compute_meta_evidence_pct(funcs):
     compute_meta = funcs[2]
     live = [
         {"stage": "resolved", "outcome": "CONFIRMED",
-         "outcome_detail": "confirmed via "},          # has evidence
+         "outcome_detail": "confirmed via g-115-1604"},          # has evidence
         {"stage": "resolved", "outcome": "CORRECTED",
          "outcome_detail": "wrong, but no pointer here"},        # no evidence
         {"stage": "resolved", "outcome": "EXPIRED",

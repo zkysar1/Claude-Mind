@@ -4,7 +4,11 @@ Required:
     channel=<name>
 
 Optional filters (all combinable):
-    since=<duration>     e.g. 1h, 30m, 2d
+    since=<duration|timestamp>
+                         duration  e.g. 1h, 30m, 2d
+                         timestamp e.g. 2026-07-29T00:45:45
+                         an unparseable value is a 400, never a silent no-op
+                         (g-115-3775)
     author=<name>
     tag=<tag>
     type=<message-type>
@@ -120,6 +124,46 @@ def _parse_duration(s: str):
     return None
 
 
+def _parse_since(s: str, now=None):
+    """Resolve a `since` query value to an absolute cutoff datetime.
+
+    Two accepted shapes:
+      - relative duration  ``<int><m|h|d>``            e.g. ``24h``, ``30m``, ``7d``
+      - absolute timestamp ``YYYY-MM-DDTHH:MM:SS``     the naive form every
+        framework caller mints via ``date +%Y-%m-%dT%H:%M:%S``
+
+    Returns the cutoff datetime, or None when the value matches NEITHER shape.
+
+    Callers MUST treat None as a client error. Do NOT restore the old
+    ``if delta:`` gate, which skipped the whole filter block on an unparseable
+    value and returned the entire channel at HTTP 200 — a zero-signal read
+    presented as a scoped one (verify-before-assuming.md rule 4). Measured on
+    the live daemon 2026-07-29 (alpha, cc-04), same channel seconds apart:
+    ``--since 2026-01-01T00:00:00`` returned 5069 lines, ``--since 1h``
+    returned 13.
+
+    The timestamp shape is added here rather than removed from the caller
+    because ``world/conventions/post-execution.md`` Step 1.75a mints an absolute
+    instant on purpose — "findings posted since I started this goal" is not
+    expressible as a whole-unit duration without rounding and a race.
+
+    Note the ``is not None`` below is load-bearing and NOT a style choice: the
+    old truthiness test ALSO swallowed a legitimately-parsed ``0h``
+    (``timedelta(0)`` is falsy), silently widening the window to unbounded.
+    That second silent drop is not hypothetical — ``infra-streak-notify.sh:393``
+    carries a ceil() specifically because an accidental ``0h`` board query
+    "re-permitted the cross-claimant double email" (g-249-33). Truthiness on a
+    parse result conflates "no value" with "a valid zero". (g-115-3775)
+    """
+    if not s:
+        return None
+    now = now or datetime.now()
+    delta = _parse_duration(s)
+    if delta is not None:
+        return now - delta
+    return _parse_ts(s)
+
+
 def read(ctx) -> "Response":  # type: ignore[name-defined]
     from ..server import Response
 
@@ -142,13 +186,17 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
 
     since = q.get("since")
     if since:
-        delta = _parse_duration(since)
-        if delta:
-            cutoff = datetime.now() - delta
-            messages = [
-                m for m in messages
-                if _parse_ts(m.get("timestamp")) and _parse_ts(m.get("timestamp")) >= cutoff
-            ]
+        cutoff = _parse_since(since)
+        if cutoff is None:
+            return Response.error(
+                400, "invalid_param",
+                "query parameter 'since' must be a duration (<int><m|h|d>, "
+                "e.g. '24h') or a timestamp (YYYY-MM-DDTHH:MM:SS); "
+                f"got {since!r}")
+        messages = [
+            m for m in messages
+            if _parse_ts(m.get("timestamp")) and _parse_ts(m.get("timestamp")) >= cutoff
+        ]
 
     author = q.get("author")
     if author:

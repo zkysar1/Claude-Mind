@@ -236,5 +236,162 @@ def test_score_goal_adds_the_boost_into_directive_boost():
     )
 
 
+# -------------------------------------------- STRATEGIC-FOCUS banner ()
+#
+# The scalar above answers "how much is a lane goal worth?". It structurally
+# CANNOT answer "does this lane goal beat THAT competitor?", because a per-goal
+# term never sees what it competes against. The live directive is exactly that
+# pairwise claim ("product goals outrank ROUTINE INFRA SWEEPS"), so the pairwise
+# half lives in emit_strategic_focus_banner. These tests pin the predicate --
+# especially the SILENT cases, which are what keep it from becoming noise.
+
+
+def _c(gid, score, *, asp="asp-115", recurring=False, ia="either", title="t"):
+    """Minimal scored-candidate row, in ranked (descending-score) order."""
+    return {"goal_id": gid, "aspiration_id": asp, "score": score,
+            "recurring": recurring, "intended_agent": ia, "title": title}
+
+
+def test_banner_fires_when_a_routine_sweep_outranks_the_lane(focus, capsys):
+    """The canonical live case, measured on 2026-07-28: zeta's top eligible pick
+    was g-115-831 (recurring infra sweep) outranking the asp-335 lane by 1.29."""
+    focus({"strategic_focus": {"primary": LIVE_PRIMARY}})
+    scored = [_c("g-115-831", 11.29, recurring=True, title="Recurring: tripwire"),
+              _c("g-335-285", 10.0, asp="asp-335", ia="zeta")]
+    warnings = gs.emit_strategic_focus_banner(scored, "zeta")
+    assert len(warnings) == 1
+    err = capsys.readouterr().err
+    assert "STRATEGIC-FOCUS" in err
+    assert "g-115-831" in err and "g-335-285" in err
+    assert "1.29" in err, "the gap must be stated — it is the actionable number"
+    assert "meta-tiebreaker" in err, "must name the sanctioned deviation code"
+
+
+def test_silent_when_top_eligible_pick_is_not_a_sweep(focus, capsys):
+    """`recurring` IS the predicate — the noun the directive itself uses. A
+    non-recurring top pick (verified-defect work) is exactly what the directive
+    never meant to outrank, so the banner must say nothing."""
+    focus({"strategic_focus": {"primary": LIVE_PRIMARY}})
+    scored = [_c("g-115-999", 11.29, recurring=False),
+              _c("g-335-285", 10.0, asp="asp-335", ia="zeta")]
+    assert gs.emit_strategic_focus_banner(scored, "zeta") == []
+    assert "STRATEGIC-FOCUS" not in capsys.readouterr().err
+
+
+def test_silent_when_the_sweep_itself_is_lane_work(focus):
+    """A recurring goal UNDER a named lane already honors the directive."""
+    focus({"strategic_focus": {"primary": LIVE_PRIMARY}})
+    scored = [_c("g-335-900", 11.0, asp="asp-335", recurring=True, ia="zeta"),
+              _c("g-335-285", 10.0, asp="asp-335", ia="zeta")]
+    assert gs.emit_strategic_focus_banner(scored, "zeta") == []
+
+
+def test_silent_when_lane_already_outranks_the_sweep(focus):
+    """Nothing to correct — the directive is being honored by the ranking."""
+    focus({"strategic_focus": {"primary": LIVE_PRIMARY}})
+    scored = [_c("g-335-285", 11.5, asp="asp-335", ia="zeta"),
+              _c("g-115-831", 11.29, recurring=True)]
+    assert gs.emit_strategic_focus_banner(scored, "zeta") == []
+
+
+def test_silent_when_no_lane_candidate_is_eligible_to_this_agent(focus):
+    """A lane goal routed to ANOTHER agent must not nag this one — otherwise the
+    banner fires forever on work this agent is not allowed to claim."""
+    focus({"strategic_focus": {"primary": LIVE_PRIMARY}})
+    scored = [_c("g-115-831", 11.29, recurring=True),
+              _c("g-335-285", 10.0, asp="asp-335", ia="foxtrot")]
+    assert gs.emit_strategic_focus_banner(scored, "zeta") == []
+
+
+def test_foxtrot_per_agent_correction_no_blanket_product_thumb(focus):
+    """foxtrot's addendum to : a blanket product bias would be WRONG,
+    because foxtrot's own mix is already product-majority. Keying on the agent's
+    OWN eligible top pick delivers that for free — when an agent's top pick is
+    its own non-recurring product work, the banner stays silent."""
+    focus({"strategic_focus": {"primary": LIVE_PRIMARY}})
+    scored = [_c("g-326-68", 12.2, asp="asp-326", ia="foxtrot", recurring=False),
+              _c("g-335-285", 10.0, asp="asp-335", ia="foxtrot")]
+    assert gs.emit_strategic_focus_banner(scored, "foxtrot") == []
+
+
+def test_silent_when_directive_names_no_aspiration(focus, capsys):
+    focus({"strategic_focus": {"primary": "work harder on the product please"}})
+    scored = [_c("g-115-831", 11.29, recurring=True),
+              _c("g-335-285", 10.0, asp="asp-335", ia="zeta")]
+    assert gs.emit_strategic_focus_banner(scored, "zeta") == []
+    assert "STRATEGIC-FOCUS" not in capsys.readouterr().err
+
+
+def test_unrouted_goals_count_as_eligible(focus):
+    """intended_agent unset/None means open to anyone — treating it as ineligible
+    would silently hide most of the queue from the check."""
+    focus({"strategic_focus": {"primary": LIVE_PRIMARY}})
+    scored = [_c("g-115-831", 11.29, recurring=True, ia=None),
+              _c("g-335-285", 10.0, asp="asp-335", ia=None)]
+    assert len(gs.emit_strategic_focus_banner(scored, "zeta")) == 1
+
+
+@pytest.mark.parametrize("scored,agent", [
+    ([], "zeta"),
+    ([_c("g-1", 1.0)], ""),
+    ([{"goal_id": "g-1"}], "zeta"),                       # no score / no fields
+    ([_c("g-115-831", 11.0, recurring=True), {}], "zeta"),  # malformed row
+    # non-numeric score: found by the  fresh-eyes probe. float("high")
+    # raised ValueError straight out of the function while its docstring promised
+    # it never raises — the call site caught it, so the loop was safe and the
+    # false contract was invisible.
+    ([_c("g-115-831", "high", recurring=True),
+      _c("g-335-285", 10.0, asp="asp-335", ia="zeta")], "zeta"),
+])
+def test_banner_never_raises(focus, scored, agent):
+    """Fail-open is the contract: a banner bug must never block goal selection."""
+    focus({"strategic_focus": {"primary": LIVE_PRIMARY}})
+    assert isinstance(gs.emit_strategic_focus_banner(scored, agent), list)
+
+
+def test_banner_never_writes_to_stdout(focus, capsys):
+    """STDOUT IS THE ORCHESTRATOR'S DATA CHANNEL. goal-selector.py prints the
+    ranked-candidate JSON to stdout and aspirations-select parses it; one stray
+    print() here corrupts that parse for every agent, every iteration. The
+    firing test asserts the text IS on stderr — this asserts it is NOT on
+    stdout, which is the half that actually breaks the loop if it regresses."""
+    focus({"strategic_focus": {"primary": LIVE_PRIMARY}})
+    scored = [_c("g-115-831", 11.29, recurring=True),
+              _c("g-335-285", 10.0, asp="asp-335", ia="zeta")]
+    assert len(gs.emit_strategic_focus_banner(scored, "zeta")) == 1
+    captured = capsys.readouterr()
+    assert "STRATEGIC-FOCUS" in captured.err
+    assert captured.out == "", (
+        f"REGRESSION: the strategic-focus banner wrote to STDOUT "
+        f"({captured.out[:120]!r}) — that channel carries the ranked-candidate "
+        f"JSON the orchestrator parses (g-115-3251)."
+    )
+
+
+def test_banner_is_wired_into_the_selection_path():
+    """Behavior tests on the helper still pass if nobody calls it (the exact
+    failure mode of sh-004, which had ZERO code readers for two months)."""
+    src = (CORE_SCRIPTS / "goal-selector.py").read_text(encoding="utf-8")
+    assert "emit_strategic_focus_banner(scored, AGENT_NAME)" in src, (
+        "REGRESSION: the strategic-focus banner is defined but never invoked — "
+        "the pairwise half of the standing directive is unenforced again "
+        "(g-115-3251)."
+    )
+
+
+def test_scalar_was_not_raised_to_force_product_work():
+    """Pins the  decision. Three agents independently proposed raising
+    this knob; the measured gaps (1.29/1.38/1.39/1.69) all exceed the +1.5 it
+    already contributes only because a SCALAR biases the lane against everything
+    equally. Any value large enough to clear a routine sweep also overrides the
+    verified-defect work the directive never meant to outrank. If this assert
+    fails, read the DO NOT RAISE block in core/config/aspirations.yaml first."""
+    import yaml
+    cfg = yaml.safe_load(
+        (CORE_SCRIPTS.parent / "config" / "aspirations.yaml").read_text(
+            encoding="utf-8"))
+    assert cfg["strategic_focus_boost"]["weight"] == 1.0
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

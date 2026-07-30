@@ -11,11 +11,16 @@ Used by:
   - audit-user-to-agent.py, full-suite-recommender.py — agent fallback
 
 Resolution order:
-  1. world/team-state.yaml `agent_status:` keys — the runtime source of truth,
-     populated by team-state.py in-flight/clear-in-flight on every iteration.
+  1. world/team-state.yaml `agent_status:` + per-agent shard rows, merged and
+     retirement-filtered through _team_state.compose_agent_status — the
+     runtime source of truth, populated by team-state.py in-flight/
+     clear-in-flight on every iteration. When team-state holds ANY agent this
+     wins outright: an all-retired roster resolves to EMPTY and deliberately
+     does NOT fall through to (2), because a retired agent keeps its dir and
+     would be resurrected there.
   2. PROJECT_ROOT/*/local-paths.conf discovery — any directory with a
-     local-paths.conf is an agent. Covers fresh installs before team-state
-     has been populated by a first /start.
+     local-paths.conf is an agent. Reached ONLY when team-state is absent or
+     holds no agents at all: fresh installs before a first /start.
   3. MIND_AGENT env var alone — single-agent fallback when nothing else
      exists yet.
   4. Empty tuple — caller decides how to handle.
@@ -81,6 +86,72 @@ def _rows_dir_for(ts_path: Path) -> Path:
     return d
 
 
+def _load_compose():
+    """Roster merge (), SSOT-imported from _team_state.
+
+    LAZY and fail-open by design. This module is import-cycle-proof (see the
+    inlined constants above), so the import happens inside the call rather
+    than at module scope: _team_state does not import _agents today, and a
+    function-local import keeps that safe regardless of future edits. Same
+    shape _team_state itself uses for its own cycle-proof imports.
+
+    compose_agent_status is the SSOT for merging core-file residual rows with
+    per-agent shard rows AND dropping retirement tombstones. It is imported
+    rather than re-derived because the merge carries two non-obvious rules a
+    second copy drifts from silently: WHOLE-ROW newest-wins (row winning
+    ties), and self-healing revival (a heartbeat NEWER than retired_at
+    un-retires the row). A hand-rolled equivalent shipped in the first
+    g-115-3735 cut and diverged from compose in BOTH stale-core directions —
+    measured by fresh-eyes-code 2026-07-28, not theorized.
+
+    Fail-open direction is deliberate: on import failure the fallback merges
+    WITHOUT filtering, i.e. exactly the pre-g-115-3735 behavior. A roster that
+    is too INCLUSIVE only degrades routing, whereas one that is too EXCLUSIVE
+    can strand a live agent's work.
+    """
+    try:
+        from _team_state import compose_agent_status  # lazy — cycle-proof
+        return compose_agent_status
+    except Exception:
+        return lambda core, rows: {**core, **rows}
+
+
+def _rows_token(rows_dir: Path):
+    """Cache token for the shard rows: (dir mtime, newest row-file mtime).
+
+    Dir mtime ALONE was sufficient while the roster was built from row
+    FILENAMES — only create/delete/rename changes that key set, and those do
+    bump the dir mtime. Since g-115-3735 the roster also depends on row
+    CONTENT (the retirement tombstone), and a content write does NOT bump the
+    parent dir's mtime. Measured on this repo 2026-07-28: rows dir mtime
+    14:55 while the meta-tiebreaker retirement write landed 17:09 — the dir
+    mtime could not see the retirement at all.
+
+    Without the file-mtime fold a long-lived daemon would keep serving a
+    roster containing an agent retired minutes ago. The daemon is the main
+    consumer, so omitting this would leave the fix inert exactly where it
+    matters most.
+    """
+    try:
+        dir_m = rows_dir.stat().st_mtime
+    except OSError:
+        return None
+    newest = 0.0
+    try:
+        for p in rows_dir.iterdir():
+            if p.suffix != ".yaml":
+                continue
+            try:
+                m = p.stat().st_mtime
+            except OSError:
+                continue
+            if m > newest:
+                newest = m
+    except OSError:
+        pass
+    return (dir_m, newest)
+
+
 def _resolve_world_team_state(project_root: Path) -> Path | None:
     """Find team-state.yaml — at PROJECT_ROOT/world/ or at the configured
     external WORLD_PATH inside an agent's local-paths.conf."""
@@ -104,30 +175,72 @@ def _resolve_world_team_state(project_root: Path) -> Path | None:
     return None
 
 
-def _from_team_state(project_root: Path) -> Tuple[str, ...]:
-    """Roster = union of core-file agent_status keys and per-agent row-file
-    stems (g-328-27 sharding — post-shard the rows ARE the runtime truth;
-    core keys cover un-migrated deployments)."""
+def _from_team_state(project_root: Path) -> Tuple[str, ...] | None:
+    """Roster = compose_agent_status(core-file agent_status, shard rows) — the
+    union of both sources (g-328-27 sharding: post-shard the rows ARE the
+    runtime truth; core keys cover un-migrated deployments) MINUS any agent
+    whose surviving entry carries a live retirement tombstone (g-115-3735).
+
+    Returns None when team-state is absent or holds NO agents at all, which
+    tells get_active_agents to fall through to directory discovery (a fresh
+    install, before the first /start populates team-state). Returns a tuple —
+    POSSIBLY EMPTY — whenever team-state WAS populated: an all-retired
+    deployment genuinely has zero active agents, and saying so is the honest
+    answer.
+
+    Collapsing those two empties into one was a real defect (found by
+    fresh-eyes-code 2026-07-28, hours after the original fix): `or`-chaining an
+    empty roster into _from_discovery re-admitted the retired agents, because a
+    retired agent keeps its dir AND its local-paths.conf. The tombstone filter
+    was silently undone in precisely the case where it was doing the most work.
+
+    Retirement is a TOMBSTONE, not a delete — the store denies the delete
+    right, so a retired agent's shard SURVIVES and keeps being written. The
+    pre-fix roster was built from row FILENAMES and never opened the files,
+    so the tombstone was unreachable BY CONSTRUCTION rather than by omission,
+    and a decommissioned agent was reported active indefinitely (measured:
+    meta-tiebreaker retired 17:08:19, still returned by get_active_agents 3h
+    later). Both halves needed the fix — the core-file branch read raw
+    agent_status keys rather than the composed view, so it bypassed the
+    tombstone too.
+
+    Blast radius was routing: a decommissioned agent presenting as a valid
+    target can absorb work nothing will execute.
+    """
     ts = _resolve_world_team_state(project_root)
     if ts is None:
-        return ()
-    names: set = set()
+        return None
+    core_status: dict = {}
+    rows: dict = {}
     try:
         import yaml  # noqa: PLC0415
         with open(ts, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
-        agent_status = data.get("agent_status") or {}
-        if isinstance(agent_status, dict):
-            names.update(k for k in agent_status.keys() if isinstance(k, str) and k)
+        cs = data.get("agent_status")
+        if isinstance(cs, dict):
+            core_status = {k: v for k, v in cs.items()
+                           if isinstance(k, str) and k}
     except Exception:
         pass
     try:
-        for p in _rows_dir_for(ts).iterdir():
-            if p.suffix == ".yaml" and p.is_file() and p.stem:
-                names.add(p.stem)
+        import yaml  # noqa: PLC0415
+        for p in sorted(_rows_dir_for(ts).iterdir()):
+            if not (p.suffix == ".yaml" and p.is_file() and p.stem):
+                continue
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    rows[p.stem] = yaml.safe_load(f) or {}
+            except Exception:
+                # Unreadable/corrupt shard reads as NOT retired — an empty
+                # mapping carries no tombstone. Same fail-open direction as
+                # _load_compose. A shard holding valid-but-non-mapping YAML is
+                # equally safe: compose's _is_retired isinstance-guards first.
+                rows[p.stem] = {}
     except OSError:
         pass
-    return tuple(sorted(names))
+    if not core_status and not rows:
+        return None
+    return tuple(sorted(_load_compose()(core_status, rows)))
 
 
 def _from_discovery(project_root: Path) -> Tuple[str, ...]:
@@ -168,23 +281,27 @@ def get_active_agents() -> Tuple[str, ...]:
         except OSError:
             current_mtime = None
         #  sharding: roster changes also arrive as row-file
-        # add/remove, which bumps the rows DIR mtime (content-only row
-        # updates don't change the key set, so dir mtime suffices).
-        # Fold it into the cache token so a /start that creates a new
-        # agent's row invalidates a long-lived daemon's cached roster.
+        # add/remove, which bumps the rows DIR mtime. Since  the
+        # roster ALSO depends on row CONTENT (the retirement tombstone), and
+        # a content write does not bump the dir mtime — so the token folds in
+        # the newest row-file mtime as well. See _rows_token.
         if current_mtime is not None:
-            try:
-                current_mtime = (current_mtime,
-                                 _rows_dir_for(ts).stat().st_mtime)
-            except OSError:
-                current_mtime = (current_mtime, None)
+            current_mtime = (current_mtime, _rows_token(_rows_dir_for(ts)))
 
     if (_CACHE is not None
             and _CACHE.get("mtime") == current_mtime
             and current_mtime is not None):
         return _CACHE["agents"]
 
-    result = _from_team_state(root) or _from_discovery(root) or _from_env() or ()
+    result = _from_team_state(root)
+    if result is None:
+        # team-state absent, or present but holding no agents at all — a fresh
+        # install. This is NOT the same as a populated-but-all-retired roster,
+        # which _from_team_state returns as an empty TUPLE and which must NOT
+        # reach here: discovery enumerates agent DIRS, and a retired agent
+        # keeps its dir, so falling through would resurrect exactly the agents
+        # the tombstone filter just excluded (fresh-eyes-code, 2026-07-28).
+        result = _from_discovery(root) or _from_env() or ()
     _CACHE = {"agents": result, "mtime": current_mtime}
     return result
 

@@ -40,6 +40,7 @@ Return shape (matches the legacy CLI's `result` dict verbatim):
       "event_gated_patterns": [...],
       "cure_action": str|None,
       "cure_overrides_exemption": bool,
+      "cure_disproved_by": str|None,   # cure registered but caller disproved it
       "reason": str,
       # When suggest_unblock=True and would_block=True:
       "unblock_suggested": True,
@@ -167,14 +168,52 @@ def _match_user_only_preconditions(text: str) -> list:
     return [s for s in USER_ONLY_PRECONDITION_SUBSTRINGS if s in lo]
 
 
+# Disproof patterns for the start-session cure family. The cure runs through the
+# Studio plugin bridge, so a caller who has already observed the bridge to be
+# disconnected has disproved it. Regexes (not literals) because the marker is
+# copied out of tool output whose separator varies: "plugin_connected: false"
+# (JSON), "plugin_connected=false" (kv), "plugin not connected" (prose).
+_CURE_DISPROOF_NO_PLUGIN = [
+    re.compile(r"plugin_connected\W{0,3}false", re.IGNORECASE),
+    re.compile(r"\bplugin\b[^.\n]{0,24}\bnot\s+connected\b", re.IGNORECASE),
+    re.compile(r"\bno\s+plugin\b[^.\n]{0,24}\bconnect", re.IGNORECASE),
+]
+
+
 # --- User-only-precondition cure registry (g-248-79, 2026-05-06) -------------
+# A cure value is EITHER a bare action string (UNCONDITIONAL — always resolvable)
+# OR a dict {"action": str, "disproved_by": [regex, ...]} (CONDITIONAL — the cure
+# has its own precondition, and the listed patterns are evidence in the caller's
+# own failure_reason that the precondition is already DISPROVED).
+#
+# WHY THE CONDITIONAL FORM EXISTS (g-115-3813). Every cure was unconditional, so
+# a resolvable cure ALONE forced the refusal (see cure_block below) and the
+# emitted Unblock instructed an action that could not succeed. `active_sessions=0
+# -> start-session` is the canonical case: capability-routing.md scopes that
+# remedy to "anytime roblox-studio.sh status returns plugin_connected: true", and
+# the registry had no field in which to carry that scope. Measured cost: 6
+# impossible Unblock goals across asp-307/318/335/326, 4 of them SKIPPED by four
+# different agents, one BLOCKED 2.5 days. The defect was never "the gate ignores
+# the condition" — it was that the registry COULD NOT EXPRESS one.
+#
+# The predicate is deliberately EVIDENCE-SHAPED rather than probe-shaped: it
+# reads what the caller already measured instead of shelling out to re-measure
+# (a subprocess inside a gate is a latency + safety change this defect does not
+# require). That also repairs an inversion — before this, quoting your diagnostic
+# output made refusal MORE likely, because the quoted marker was what the
+# substring scan matched on. A well-evidenced defer must not be punished for its
+# evidence.
 USER_ONLY_PRECONDITION_CURES = {
-    "insufficient_session_data": (
-        "start RUN-mode session via roblox-studio.sh start-session --mode RUN"
-    ),
-    "active_sessions=0": (
-        "start session via roblox-studio.sh start-session"
-    ),
+    "insufficient_session_data": {
+        "action": (
+            "start RUN-mode session via roblox-studio.sh start-session --mode RUN"
+        ),
+        "disproved_by": _CURE_DISPROOF_NO_PLUGIN,
+    },
+    "active_sessions=0": {
+        "action": "start session via roblox-studio.sh start-session",
+        "disproved_by": _CURE_DISPROOF_NO_PLUGIN,
+    },
     "roblox_studio_session_required": None,
     "studio_session_required":         None,
     "player_character_required":       None,
@@ -183,12 +222,64 @@ USER_ONLY_PRECONDITION_CURES = {
 }
 
 
-def _resolve_cure_action(user_only_matches: list) -> Optional[str]:
+def _cure_disproof_hit(text: str, patterns: list) -> Optional[str]:
+    """Return the first disproof pattern matching `text`, else None.
+
+    Accepts compiled patterns OR plain strings. The string form is not
+    decoration: everything adjacent in this registry is a plain string —
+    USER_ONLY_PRECONDITION_SUBSTRINGS above, and the sibling "action" key —
+    so writing `"disproved_by": ["plugin_connected"]` is the natural mistake,
+    not an exotic one. Compiled-only raised AttributeError INSIDE evaluate(),
+    which the daemon calls on every narrative defer, so the failure surfaced
+    as a 500 on a write rather than a fail-open verdict — strictly worse than
+    the false refusal this registry exists to prevent. A gate must not be the
+    thing that breaks the write. (Found by the fresh-eyes pass on this change.)
+    """
+    if not text or not patterns:
+        return None
+    for pat in patterns:
+        if isinstance(pat, str):
+            if re.search(pat, text, re.IGNORECASE):
+                return pat
+            continue
+        if pat.search(text):
+            return pat.pattern
+    return None
+
+
+def _resolve_cure_action(user_only_matches: list,
+                         text: str = "") -> tuple:
+    """Resolve the first registered cure, honouring its own precondition.
+
+    Returns (cure_action, disproved_by) where a non-None `disproved_by` means a
+    cure WAS registered but the caller's text already shows it cannot work, so
+    `cure_action` is None. Distinguishing "no cure registered" from "cure
+    disproved" is what makes the resulting non-refusal legible after the fact —
+    both collapse to cure_action=None at the block sites.
+
+    A disproved cure does NOT end the scan. The pre-conditional loop returned
+    the first USABLE cure and skipped past unusable (None) entries, and that is
+    the property to preserve: when a text matches two preconditions and only the
+    first one's cure is disproved, the second's viable cure must still be found.
+    Returning early there would silently exempt a defer the gate should refuse —
+    a recall loss (guard-958), and the failure direction that stays invisible.
+    Latent today because both conditional entries share one disproof set; three
+    lines now rather than a puzzle after the next registry entry.
+    """
+    first_disproof = None
     for precon in user_only_matches:
         cure = USER_ONLY_PRECONDITION_CURES.get(precon)
-        if cure:
-            return cure
-    return None
+        if not cure:
+            continue
+        if isinstance(cure, dict):
+            hit = _cure_disproof_hit(text, cure.get("disproved_by") or [])
+            if hit:
+                if first_disproof is None:
+                    first_disproof = hit
+                continue
+            return cure.get("action"), None
+        return cure, None
+    return None, first_disproof
 
 
 # --- Session-requirement narrative patterns (g-248-79) -----------------------
@@ -357,9 +448,42 @@ def _load_capability_routing(world_dir) -> list:
             continue
         if not seen_divider:
             continue
+        # Bound the MATCH SURFACE so row LENGTH stops being an input to match
+        # probability (g-115-3655). Rows are uniformly 2 cells: cell 0 is the
+        # capability identifier, cell 1 is provenance prose that grows
+        # monotonically — every measurement appends to the row it corrects, so
+        # the worst row is now 79 chars of identifier and 3231 of prose. Feeding
+        # the whole line to _entry_tokens made ordinary English a match surface:
+        # the live FPs matched on 'never'/'registry' and 'fenced'/'since'.
+        #
+        # Cell 0 contributes in FULL (its bare words ARE discriminating —
+        # "Deployments", "SSH to EFS"). Cell 1 contributes ONLY identifier-shaped
+        # tokens (containing - _ or . per _TOKEN_RE's compound class). That is
+        # load-bearing, not cosmetic: 11 of 20 rows name their script ONLY in the
+        # prose cell (efs-ssh.sh, operator-api.sh, email-send.sh, goal-selector.py
+        # ...), which is exactly what a real defer cites — dropping cell 1 wholesale
+        # breaks true-positive detection, the dangerous direction. Backtick-scoping
+        # was measured as the alternative and rejected: it loses goal-selector.py.
+        #
+        # Durability: prose growth adds English, which is excluded, so appending
+        # provenance adds no match surface. Adding a new script name does — which
+        # is correct. This supersedes growing _STOPWORDS per incident (g-001-254,
+        # g-115-1885, g-115-2269, guard-958), which only bought time until the
+        # next row grew.
+        #
+        # SAFETY: this surface is a strict SUBSET of the previous one, so it can
+        # never create a NEW match. The only possible regression is lost
+        # detection — which is what the capability_gate_* family measures.
+        cells = [c.strip() for c in stripped.strip("|").split("|")]
+        identifier = cells[0] if cells else stripped
+        prose_identifiers = " ".join(
+            m.group(0) for m in _TOKEN_RE.finditer(" ".join(cells[1:]))
+            if any(ch in m.group(0) for ch in "-_.")
+        )
         rows.append({
             "source": "capability-routing.md",
             "row": stripped,
+            "match_text": f"{identifier} {prose_identifiers}".strip(),
         })
     return rows
 
@@ -581,6 +705,79 @@ def _is_adjectival_use(text: str, match) -> bool:
     if not nxt:
         return False  # nothing after -> treat as verb
     return nxt.group(0).lower() not in _ADJ_VERB_FOLLOW_FUNCWORDS
+
+
+# g-115-3405: a verb the narrative PROHIBITS is not the requested action. The
+# Layer-D auto-conversion derives an action verb from the defer narrative and
+# files an Unblock telling the next agent to perform it -- so on a defer whose
+# whole point is DO-NOT-do-X it filed a goal instructing X. Origin: g-115-2050
+# was deferred because a defective census made a DELETE unsafe ("deleting would
+# destroy live tree nodes"); the gate filed g-115-3404 "Unblock: delete for
+# g-115-2050". Acting on that would have caused exactly the loss the defer
+# exists to prevent. rb-574 already requires the title to name the ACTION
+# rather than the matched keyword; this case shows the action verb itself can
+# be INVERTED when the framing is prohibitive.
+#
+# Kept MINIMAL and evidence-driven, same posture as _ADJECTIVE_VERBS above: a
+# broad "any negation anywhere suppresses" rule would gut recall, since defer
+# narratives are full of incidental negations ("cannot reach the host, so
+# restart the bridge" -- "restart" is still the genuine action).
+#
+# Both patterns are CLAUSE-BOUNDED via [^.!?\n] (the idiom already used by
+# _BEFORE_GERUND_END / _COUNT_BEFORE_END below), so a prohibition never leaks
+# across a sentence boundary into an unrelated imperative. That bound is what
+# preserves recall on the adversarial control guard-958 mandates: in
+# "Do not delete the archive. Push the fix." the sole surviving keyword
+# ("push") still matches even though it sits directly after the disqualifier.
+#
+# ADJACENCY, not proximity: the marker must sit within 2 WORDS of the verb with
+# no clause break between them. A wider char-window silently destroys recall --
+# measured while building this fix, a 40-char window suppressed the genuine
+# action in "cannot reach the host, so restart the bridge" (the negation is
+# about the HOST, not the action). That is precisely the single-keyword recall
+# loss guard-958 says a multi-keyword happy path will mask.
+_PROHIBITIVE_PRE = re.compile(
+    r"\b(?:do\s+not|don['’]?t|must\s+not|mustn['’]?t|"
+    r"should\s+not|shouldn['’]?t|shall\s+not|never|"
+    r"cannot|can['’]?t|avoid|refrain\s+from|"
+    r"rather\s+than|instead\s+of|unsafe\s+to|not\s+safe\s+to)"
+    r"(?:\s+\w+){0,2}\s*$",
+    re.IGNORECASE,
+)
+
+# Consequence framing: "<verb> would destroy the tree". Deliberately uses only
+# INFLECTED modal report forms (would/will/could/might + a destructive verb) --
+# never a bare base form, which would also match the imperative itself and kill
+# recall (rb-2996, guard-958).
+_PROHIBITIVE_POST = re.compile(
+    r"^[^.!?\n]{0,40}?\b(?:would|will|could|might)\s+"
+    r"(?:destroy|break|lose|corrupt|wipe|clobber|overwrite|"
+    r"damage|orphan|truncate|nuke)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_prohibited_use(text: str, match) -> bool:
+    """True if the _IMPERATIVE_VERBS token at `match` is PROHIBITED by its
+    local context rather than requested, so it must not become an Unblock's
+    action verb.
+
+    Two signals, both clause-bounded so a prohibition cannot cross a sentence
+    boundary:
+      PRE  -- a prohibition marker precedes the verb in the same clause
+              ("do not delete", "never purge", "unsafe to restart").
+      POST -- a destructive-consequence modal follows it in the same clause
+              ("delete would destroy the live nodes").
+
+    Fails toward KEEPING the verb (returns False) when neither fires --
+    conservative, matching the gate's fail-open bias (guard-958). When every
+    candidate verb is prohibited, action_verb stays None and the existing
+    g-115-1872 verbless-suppression withholds the Unblock entirely; no new
+    suppression path is introduced. g-115-3405.
+    """
+    if _PROHIBITIVE_PRE.search(text[:match.start()]):
+        return True
+    return bool(_PROHIBITIVE_POST.search(text[match.end():]))
 
 
 # --- Context-aware keyword disqualification ---------------------------------
@@ -834,7 +1031,14 @@ def _entry_tokens(entry: dict) -> set:
         parts.append(str(t))
     for s in entry.get("scripts", []) or []:
         parts.append(str(s))
-    if "row" in entry:
+    # Prefer the bounded match surface built in _load_capability_routing;
+    # "row" is retained on the entry for DIAGNOSTICS only (it is what the gate
+    # echoes back in `matches`), so tokenizing it here would reinstate the
+    # unbounded-prose surface. Fall back to "row" for entries from other
+    # sources that carry no match_text.
+    if entry.get("match_text"):
+        parts.append(str(entry["match_text"]))
+    elif "row" in entry:
         parts.append(str(entry["row"]))
     blob = " ".join(parts).lower()
     toks = set()
@@ -918,6 +1122,60 @@ def _log_evidence_approval(world_dir, agent_name: str, failure_reason: str,
         return None
 
 
+# g-115-3934: skill-NAME parts that are COMMON ENGLISH NOUNS, not identifiers.
+# _identifier_parts' premise -- "the name is what the author chose as its
+# identity, so a prose keyword equal to a name part is a deliberate reference"
+# -- holds for proper-noun/domain identifiers (efs, roblox, vinheim, aws, npc)
+# and FAILS for common nouns that merely happen to sit in a skill name. Measured
+# 2026-07-29 via the canonical gate invocation, two live FPs on defers naming no
+# capability at all:
+#   "the next session has not happened yet and the task which must run before it
+#    is not scheduled"          -> 'task'    -> add-npc-task            would_block=True
+#   "a new runtime endpoint must appear before this can be verified"
+#                               -> 'runtime' -> scan-runtime-margin +
+#                                               ship-vinheim-runtime-endpoint  ""
+# Both are SOLE-token matches that survived only through the name-parts branch:
+# an entry built with triggers=[] and scripts=[] still qualifies 'task', which
+# is the proof the trigger vocabulary is NOT the mechanism here (the ORIGINAL
+# g-115-3934 report blamed multi-word trigger tokenization -- that is a real but
+# DISTINCT mechanism, the >=2-hit path, which bypasses this predicate by design).
+#
+# This is the SAME class the author already closed one step away: _identifier_parts
+# excludes companion SCRIPT names precisely because "roblox-bridge.py would make
+# 'bridge' an identifier part of access-roblox-studio, reintroducing the exact
+# observed FP". A generic noun in the NAME is that class; only the script source
+# was demoted. This demotes the name source for common nouns only.
+#
+# NOT frequency-based, and that alternative was measured and REJECTED: 'efs' is a
+# name-part of BOTH access-efs-data and archive-efs-graveyard, so "a part shared
+# by 2+ skills is not distinctive" would kill the very recall case (g-248-105's
+# "cannot access EFS" -> efs) this predicate exists to protect. The discriminator
+# is common-noun-vs-proper-noun, not rarity.
+#
+# NOT _STOPWORDS, deliberately: these tokens must stay in EXTRACTION so they keep
+# counting inside 2+-token overlaps (zero recall loss for any multi-token match --
+# the same reasoning g-248-105 gives for its own design). Stopwording them would
+# suppress them globally, which is the per-incident treadmill guard-958/g-115-3655
+# document. Words already in _IMPERATIVE_VERBS (run, verify, scan, probe, review,
+# update, stop, archive, ...) are untouched -- they qualify via the earlier branch
+# and dropping them re-opened the g-115-1883 recall regressions.
+#
+# EXTENSION RULE: add a token here only with a measured FP from the canonical gate
+# invocation, and only if the token is a common English noun/adjective that no
+# domain reader would treat as naming a specific thing. SAFETY DIRECTION: every
+# addition DROPS matches, which LOOSENS the gate (the g-115-792 anti-pattern), so
+# each addition needs an adversarial single-surviving-keyword recall control per
+# guard-958.
+_GENERIC_NAME_PARTS = frozenset({
+    # measured FPs (2026-07-29, g-115-3934)
+    "task", "runtime",
+    # same shape, high-frequency in framework defer prose; each is a common noun
+    # whose skill-name occurrence is incidental, and each retains its skill's
+    # true discriminators (npc / margin / vinheim / play-mode / studio compounds)
+    "session", "endpoint", "margin", "state", "health", "data", "report",
+})
+
+
 def _identifier_parts(entry: dict) -> set:
     """Hyphen/underscore parts of the entry's SKILL NAME — and only the name.
     "access-efs-data" -> {access, efs, data}. The name is what the skill's
@@ -956,6 +1214,11 @@ def _single_token_qualifies(tok: str, entry: dict) -> bool:
         return True
     if tok in _IMPERATIVE_VERBS:
         return True
+    # g-115-3934: a name part qualifies only when it is an IDENTIFIER, not a
+    # common English noun that happens to sit in the name. See
+    # _GENERIC_NAME_PARTS for the measured FPs and the extension rule.
+    if tok in _GENERIC_NAME_PARTS:
+        return False
     return tok in _identifier_parts(entry)
 
 
@@ -996,6 +1259,7 @@ def evaluate(failure_reason: str, *,
              suggest_unblock: bool = False,
              for_goal_id: Optional[str] = None,
              agent_name: str = "",
+             caller_context: str = "create-blocker",
              world_dir: Optional[Path] = None,
              skills_dir: Optional[Path] = None) -> dict:
     """Run the capability gate. See module docstring for return shape +
@@ -1014,6 +1278,19 @@ def evaluate(failure_reason: str, *,
         suggest_unblock: when True AND would_block, emit unblock_payload.
         for_goal_id: goal-id to interpolate into unblock_title.
         agent_name: MIND_AGENT value for audit-log "agent" field.
+        caller_context: which enforcement path invoked the gate —
+            "create-blocker" (default, legacy behaviour) or "defer".
+            ONLY affects which bypass flag the human-readable `reason`
+            text recommends. The two paths honour DIFFERENT flags:
+            --override-agent-match is the CREATE_BLOCKER bypass and is
+            explicitly NOT honoured on the defer path (g-115-2814), where
+            --force-defer is required. Before g-115-3405 the reason text
+            hardcoded --override-agent-match for both, so an agent that
+            followed it verbatim on a defer failed QUIETLY —
+            override_applied stayed null while the gate re-blocked on
+            different keywords, reading as a new problem rather than an
+            ignored flag. Defaulting to "create-blocker" keeps every
+            existing caller byte-identical.
         world_dir: WORLD_DIR for source-loaders + audit log. None
             disables all world-backed checks.
         skills_dir: SKILLS_DIR for SKILL.md scan. Defaults to repo's
@@ -1069,15 +1346,27 @@ def evaluate(failure_reason: str, *,
                            + ". Fix the evidence JSON or fall back to "
                              "--override-agent-match \"<justification>\"."),
             }
+            # decision="block", NOT "fail_open" (g-115-3093). This branch raises
+            # nothing and the caller does NOT proceed: it returns would_block=True,
+            # which capability-gate.py:190 turns into exit 1 — a REFUSAL. The old
+            # "fail_open" label contradicted _gate_log's own definition ("Gate
+            # raised an exception. Caller proceeds; investigate offline") and was
+            # the sole trigger for gate-retirement-eval's investigate-on-fail_open
+            # rule, which read 3 malformed-evidence refusals as 3 MISSED
+            # capability-routing blocks and produced a spurious HIGH goal.
+            # `gate_error` is likewise reserved for real caught exceptions
+            # (sibling gates all set it from f"{type(e).__name__}: {e}"), so the
+            # validation message moves to extra.evidence_error. `decision_path`
+            # still separates these from capability-match blocks in the stats.
             _gate_log(
                 "capability-gate",
-                "fail_open",
+                "block",
                 payload=failure_reason or "",
-                gate_error=evidence_error,
                 extra={
                     "would_block": True,
                     "intended_participants": intended_participants,
                     "decision_path": "evidence-error",
+                    "evidence_error": evidence_error,
                 },
             )
             return err
@@ -1090,7 +1379,13 @@ def evaluate(failure_reason: str, *,
         approval_kind = "override-agent-match"
 
     user_only_matches = _match_user_only_preconditions(failure_reason)
-    cure_action = _resolve_cure_action(user_only_matches)
+    # Scanned over failure_reason, NOT text_blob — deliberately the same field
+    # the precondition itself was matched in, so a marker and its disproof are
+    # always evaluated over identical text. On the defer path there is no
+    # diagnostic_text at all (the daemon passes only str(value)), so widening
+    # would buy nothing and would let the two scopes drift apart.
+    cure_action, cure_disproved_by = _resolve_cure_action(
+        user_only_matches, failure_reason)
 
     suggested_routing = "agent" if matches else "unknown"
 
@@ -1150,6 +1445,15 @@ def evaluate(failure_reason: str, *,
                     # the Unblock (rather than filing "Unblock: clean for g-X").
                     if tok in _ADJECTIVE_VERBS and _is_adjectival_use(
                             failure_reason or "", m):
+                        continue
+                    # g-115-3405: a verb the narrative PROHIBITS is not the
+                    # requested action -- skip it and keep scanning. On a
+                    # wholly prohibitive defer no verb survives, action_verb
+                    # stays None, and the g-115-1872 verbless-suppression
+                    # below withholds the Unblock (rather than filing
+                    # "Unblock: delete" for a defer that exists to PREVENT
+                    # the delete -- the g-115-2050 / g-115-3404 inversion).
+                    if _is_prohibited_use(failure_reason or "", m):
                         continue
                     action_verb = tok
                     break
@@ -1306,7 +1610,25 @@ def evaluate(failure_reason: str, *,
         "event_gated_patterns": event_gated_matches,
         "cure_action": cure_action,
         "cure_overrides_exemption": cure_action is not None,
+        # g-115-3813: non-null means a cure WAS registered for the matched
+        # precondition but the caller's own text disproved it, so the blanket
+        # user-only exemption stands. Without this field a disproved cure is
+        # indistinguishable from no cure at all in the payload.
+        "cure_disproved_by": cure_disproved_by,
     }
+
+    # g-115-3405 GAP 2: the bypass flag the reason text recommends is
+    # PATH-DEPENDENT. --override-agent-match is the CREATE_BLOCKER bypass and
+    # is explicitly NOT honoured on the defer path (g-115-2814 — the shell
+    # wrapper plumbs it only so argparse can redirect); --force-defer is the
+    # defer-path bypass. Hardcoding the former for both made the reason text
+    # recommend a flag that path IGNORES, so following it verbatim failed
+    # quietly. Computed once, used at every reason site below.
+    _is_defer_ctx = (caller_context or "").strip().lower() == "defer"
+    bypass_flag_hint = (
+        '--force-defer "<justification>"' if _is_defer_ctx
+        else '--override-agent-match "<justification>"'
+    )
 
     # Reason composition — precedence: cure > keyword > session-req >
     # exemption > user-keystroke > evidence > plain match > no match.
@@ -1326,7 +1648,7 @@ def evaluate(failure_reason: str, *,
             f"agent cure: '{cure_action}'. Cure registry overrides the blanket "
             f"exemption — defer refused, invoke the cure capability instead."
             f"{kw_clause} If this match is a false positive, re-call with "
-            '--override-agent-match "<justification>".'
+            f"{bypass_flag_hint}."
         )
     elif would_block and keyword_block:
         top = matches[0]
@@ -1342,7 +1664,7 @@ def evaluate(failure_reason: str, *,
             f" (keyword: {top['matched_keyword']}). "
             "Invoke that capability instead of routing to user. "
             "If this match is a false positive, re-call with "
-            '--override-agent-match "<justification>" OR '
+            f"{bypass_flag_hint} OR "
             '--evidence \'[{"type":"rb","id":"rb-NNN","claim":"..."}]\' '
             "for structured agent self-approval."
             f"{canonical_hint}"
@@ -1363,7 +1685,7 @@ def evaluate(failure_reason: str, *,
             "plugin_connected=true (capability-routing.md "
             "Agent-Provisionable Services). Invoke that capability "
             "instead of routing to user. If this match is a false positive, "
-            're-call with --override-agent-match "<justification>".'
+            f"re-call with {bypass_flag_hint}."
             f"{canonical_hint}"
         )
     elif matches and event_gated_matches:
@@ -1461,6 +1783,12 @@ def evaluate(failure_reason: str, *,
     if cure_action:
         gate_extra["cure_action_registered"] = cure_action
         gate_extra["cure_overrides_exemption"] = True
+    elif cure_disproved_by:
+        # g-115-3813: a NON-firing that must still be countable. Without this,
+        # telemetry cannot distinguish "this precondition has no cure" from
+        # "the cure was disproved" — and the second is the population whose
+        # size tells us whether the conditional form is carrying its weight.
+        gate_extra["cure_disproved_by"] = cure_disproved_by
 
     _gate_log(
         "capability-gate",

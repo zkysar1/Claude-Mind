@@ -44,6 +44,39 @@ SENTINELS: list[dict] = [
         "dispatch_slot": None,
         "canary_tracked": False,
     },
+    # . Consumer phase 0-pre2.5 shipped with  but was never
+    # registered, so the battery enumerated six slots and its "all N null — no
+    # gates to dispatch" line instructed a SKIP past 0-pre..0-pre6 that included
+    # this gate. Measured twice: zeta/cc-02 2 stubs unseen ~9h; bravo/cc-05
+    # 15 MATERIAL self.md stubs unseen ~19h, found only by a standalone read.
+    #
+    # fired_key False — MEASURED, not copied. The producer
+    # (evolution-stub-pending-check.sh) exits at `if not pending` BEFORE
+    # building the payload, so a zero-count payload is unreachable and the dict
+    # is always non-empty. is_set()'s no-"fired"-key branch (bool(value)) is
+    # therefore exactly right; a count-based actionable test would be dead code.
+    #
+    # canary_tracked True WITH a dispatch_slot — also measured. The producer is
+    # idempotent and RE-ARMS every iteration while any stub is pending, which is
+    # the fresh_eyes_dispatch_pending shape  fixed, NOT the
+    # force_tree_maintain shape guard-868 says is safe to presence-count (that
+    # one's writers are rate-limited so it never re-arms). Presence-counting
+    # here would false-fire on the legitimate never-fabricate path: a stub whose
+    # rationale genuinely cannot be reconstructed is SUPPOSED to sit set until
+    # evolution-stub-expiry's 24h deadline. Dispatch-advancement gives the
+    # staleness detection this gate needs without that false fire.
+    #
+    # Position is load-bearing: the battery prints in REGISTRY order (it does
+    # not sort), so registry order must equal protocol order — 0-pre2.5 belongs
+    # between 0-pre2 and 0-pre3, not appended at the end.
+    {
+        "slot": "force_evolution_finalize",
+        "phase": "0-pre2.5",
+        "skill_section": "aspirations-precheck Phase 0-pre2.5 (Evolution-Stub Finalize Gate; evolution-complete.sh per stub — NEVER fabricate a rationale)",
+        "fired_key": False,
+        "dispatch_slot": "force_evolution_finalize_last_dispatch",
+        "canary_tracked": True,
+    },
     {
         "slot": "fresh_eyes_dispatch_pending",
         "phase": "0-pre3",

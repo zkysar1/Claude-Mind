@@ -47,6 +47,20 @@ Before treating a hand-run script's output as evidence:
    branch is a fingerprint of which branch ran. Its *absence* is signal, not noise.
 3. **Run wrong-shape and right-shape side by side in one turn.** The diff is the
    positive control, and it is seconds of work.
+4. **Check whether your SHELL is the wrong shape.** Your interactive Bash is not the
+   script environment. The user profile can define shell FUNCTIONS and aliases that
+   shadow standard commands, and those are NOT exported — so `bash script.sh` and
+   every child process resolve the real binary instead. `type -t <cmd>` reports
+   `function` in your shell and `file` inside a script; confirm with
+   `bash -c 'type -t <cmd>'` before trusting any hand-run predicate.
+
+   This axis fails in BOTH directions, which is why it is worth a separate check:
+   it can hand-test GREEN on something broken (guard-1742 — the hook-wrapper env-var
+   case) *or* hand-test RED on something healthy. Measured g-115-3794: `grep -qv` on
+   empty stdin returns 0 under a profile-defined `grep` function wrapping ugrep, and
+   1 under the GNU grep that every script actually gets. The false alarm reached a
+   committed rationale comment before re-measurement in script context caught it —
+   the code was fine; only the stated reason was wrong.
 
 Canonical incident (g-115-3260, 2026-07-26): `post-state-update-gate.sh` was
 hand-run with no `GOAL_ID` and returned `{"fired": false, "core_count": 0}`. That

@@ -116,7 +116,7 @@ def test_colliding_caller_id_is_reassigned():
         world, _agent_dir = _make_world(Path(tmpd))
         with DaemonFixture(world) as df:
             body = {
-                "id": "",  # collides with the seeded completed goal
+                "id": "g-100-01",  # collides with the seeded completed goal
                 "title": "Collided promote goal",
                 "description": "Cross-Mind promotion reused an existing id",
                 "priority": "HIGH",
@@ -157,7 +157,7 @@ def test_noncolliding_caller_id_is_preserved():
         world, _agent_dir = _make_world(Path(tmpd))
         with DaemonFixture(world) as df:
             body = {
-                "id": "",  # fresh, no collision
+                "id": "g-100-50",  # fresh, no collision
                 "title": "Fresh-id goal",
                 "description": "Caller-supplied non-colliding id",
                 "priority": "MEDIUM",

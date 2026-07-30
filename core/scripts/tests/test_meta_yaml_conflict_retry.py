@@ -31,6 +31,11 @@ A stub backend supplies the conflict type without S3.
      fence per attempt is what breaks the deadlock; a retry on a stale token
      conflicts identically forever.
   2. the cycle is wrapped in locked_rmw — so a conflict retries at all.
+  3. the READ happens inside the lock — the third half of the fix, and the one
+     that went unpinned until g-115-3295. Hoisting the read back out while
+     keeping (1) and (2) left every other test green, re-opening the
+     unlocked-RMW lost-update window. Asserted at READ time: a hoisted read
+     still WRITES under the lock, so a write-time check passes that revert.
 
 Stub-backend pattern mirrors test_retrieve_bump_conflict_retry.py /
 test_fileops_conflict_retry.py.
@@ -253,6 +258,63 @@ def test_set_field_reraises_when_retries_exhaust(meta_dir, backend, monkeypatch)
         "a failed write must leave the store untouched"
 
 
+def test_read_and_write_both_happen_inside_the_lock(meta_dir, backend, monkeypatch):
+    """Lock SCOPE, not merely lock presence — the third half of the  fix.
+
+    Moving the READ inside the lock (`_persist` -> `_persist_unlocked` called
+    within `locked_rmw`) closed an unlocked-RMW lost-update window. Reverting
+    just that — hoisting the read back out while leaving force_fresh AND
+    locked_rmw intact — left all five other tests GREEN, so nothing pinned it.
+    That matters beyond this file: this suite is the reference pattern the
+    g-115-3295 audit propagates to every other fence-only writer, and an
+    unpinned invariant propagates as an unpinned invariant.
+
+    THE ASSERTION POINT IS READ TIME, NOT WRITE TIME. The goal text proposed
+    asserting `_held` is non-empty at write time; that does not catch the
+    mutation it describes, because a read hoisted out of the cycle still writes
+    under the lock — the write-time assertion passes the very revert it exists
+    to catch. Lock scope only differs at the READ. The write-time assertion is
+    kept as well, but it is the weaker of the two.
+
+    Spying `refresh` (not `ensure_local`) isolates the in-cycle reads exactly:
+    lines 483/548 are the only `force_fresh=True` callers in meta_yaml, and
+    `_load_bounds` reads core/config/meta.yaml through a plain `open()`, so
+    nothing outside the cycle can pollute this signal.
+    """
+    seen = {"read": [], "write": []}
+
+    real_refresh = backend.refresh
+
+    def spy_refresh(p):
+        seen["read"].append(bool(backend._held))
+        return real_refresh(p)
+
+    monkeypatch.setattr(backend, "refresh", spy_refresh)
+
+    real_write = MY._atomic_write_with_fallback
+
+    def spy_write(path, write_fn, **kw):
+        seen["write"].append(bool(backend._held))
+        return real_write(path, write_fn, **kw)
+
+    monkeypatch.setattr(MY, "_atomic_write_with_fallback", spy_write)
+
+    MY.set_field(_ctx(meta_dir, {
+        "file": "skill-gaps.yaml", "dotpath": "gaps.1",
+        "value": {"id": "gap-002", "type": "utility"}}))
+
+    assert seen["read"], "the cycle never force-refreshed — see the fence test"
+    assert all(seen["read"]), (
+        "the force_fresh READ happened with NO lock held ({}) — the read has been "
+        "hoisted out of the locked_rmw cycle, re-opening the unlocked-RMW "
+        "lost-update window a peer write slips through".format(seen["read"]))
+
+    assert seen["write"], "nothing was written"
+    assert all(seen["write"]), (
+        "the WRITE happened with no lock held ({}) — _persist_unlocked must only "
+        "ever be called from inside locked_rmw".format(seen["write"]))
+
+
 # ---------------------------------------------------------------------------
 # append_item — the shape most exposed to the wedge (every agent appends to
 # the same shared encounter_log lists)
@@ -284,6 +346,135 @@ def test_append_item_refreshes_and_retries(meta_dir, backend, monkeypatch):
         "the retry must re-apply the append exactly once, not zero or twice"
 
 
+# ---------------------------------------------------------------------------
+# Route-level wiring (, sq-019). Every other test in this file calls
+# set_field / append_item as FUNCTIONS. That leaves the registration itself
+# unexercised: rename the path, drop the line, or bind the wrong handler and
+# every one of them still passes while the endpoint is dead. The route was
+# verified live by hand once; this is the automated version.
+#
+# Resolving through register() is the whole point — a test that imports the
+# handler directly cannot see a routing regression by construction.
+# ---------------------------------------------------------------------------
+
+def test_set_route_is_registered_and_persists(meta_dir, backend):
+    """POST /v1/meta/yaml/set resolves from the route table AND has the side effect."""
+    routes = {}
+    MY.register(routes)
+
+    handler = routes.get(("POST", "/v1/meta/yaml/set"))
+    assert handler is not None, (
+        "POST /v1/meta/yaml/set is not registered — the endpoint is unreachable "
+        "no matter how correct set_field is. Registered: {}".format(sorted(routes)))
+    assert handler is MY.set_field, "the path is bound to the wrong handler"
+
+    resp = handler(_ctx(meta_dir, {
+        "file": "skill-gaps.yaml", "dotpath": "gaps.1",
+        "value": {"id": "gap-002", "type": "utility"}}))
+
+    assert resp.status == 200, "route returned {}".format(resp.status)
+    # The side effect is the assertion that matters — a handler wired to the
+    # right path that writes nothing is the same outage as no route at all.
+    assert [g["id"] for g in _gaps(meta_dir)] == ["gap-001", "gap-002"], \
+        "route resolved but the write never landed"
+
+
+def test_all_four_meta_yaml_routes_are_registered():
+    """The sibling paths ship together; a partial registration is the regression
+    most likely to slip through, since one working endpoint reads as 'wired'."""
+    routes = {}
+    MY.register(routes)
+    assert sorted(routes) == sorted([
+        ("GET", "/v1/meta/yaml/read"),
+        ("POST", "/v1/meta/yaml/set"),
+        ("POST", "/v1/meta/yaml/append"),
+        ("POST", "/v1/meta/yaml/log"),
+    ]), "meta-yaml route set changed: {}".format(sorted(routes))
+
+
+# ---------------------------------------------------------------------------
+# The two side-effect writers (). Both are class (b) FENCE-ONLY —
+# backpressure.yaml and strategy-generations.yaml have no merge handler, so the
+# fenced write is the whole defense (core/config/conventions/
+# governed-store-write-classes.md). Both previously did an unlocked read + a
+# bare-locked write via _persist, and both are wrapped in `except Exception:
+# pass`, so the wedge was not merely unrecoverable — it was SILENT.
+# ---------------------------------------------------------------------------
+
+def _flaky(monkeypatch, fail_first_n=1):
+    """Make the next `fail_first_n` writes raise a conflict, then succeed."""
+    real_write = MY._atomic_write_with_fallback
+    calls = {"n": 0}
+
+    def flaky_write(path, write_fn, **kw):
+        calls["n"] += 1
+        if calls["n"] <= fail_first_n:
+            raise _Conflict("412 stale If-Match")
+        return real_write(path, write_fn, **kw)
+
+    monkeypatch.setattr(MY, "_atomic_write_with_fallback", flaky_write)
+    return calls
+
+
+def test_backpressure_monitor_retries_a_conflict_and_lands(meta_dir, backend, monkeypatch):
+    """A conflict on backpressure.yaml is absorbed and the monitor still lands.
+
+    Before the fix this raised inside the bare-locked _persist, was swallowed by
+    the enclosing `except Exception: pass`, and the monitor was silently lost —
+    no retry, no error, no record that a strategy change went unmonitored.
+    """
+    (meta_dir / "backpressure.yaml").write_text(
+        yaml.safe_dump({"version": 1, "active_monitors": [], "rollback_history": []}),
+        encoding="utf-8")
+    calls = _flaky(monkeypatch)
+
+    MY._create_backpressure_monitor(
+        _ctx(meta_dir, {}), "mc-1", "reflection-strategy.yaml", "cadence", 3, 5)
+
+    assert calls["n"] == 2, "conflict was not retried (or no write was attempted)"
+    assert backend.refresh_calls >= 2, (
+        "the retry did not RE-fence — retrying against the same stale token "
+        "conflicts identically forever (rb-2639)")
+    mons = yaml.safe_load((meta_dir / "backpressure.yaml").read_text())["active_monitors"]
+    assert [m["meta_change_id"] for m in mons] == ["mc-1"], \
+        "the retry must apply the append exactly once, not zero or twice"
+
+
+def test_generation_transition_retries_a_conflict_and_lands(meta_dir, backend, monkeypatch):
+    """Same cure on strategy-generations.yaml, the sibling fence-only writer."""
+    (meta_dir / "strategy-generations.yaml").write_text(
+        yaml.safe_dump({"version": 1, "current_generation": 1,
+                        "generations": [{"generation": 1, "started": "2026-07-01",
+                                         "ended": None}]}),
+        encoding="utf-8")
+    calls = _flaky(monkeypatch)
+
+    MY._trigger_generation_transition(_ctx(meta_dir, {}))
+
+    assert calls["n"] == 2, "conflict was not retried"
+    assert backend.refresh_calls >= 2, "the retry did not re-fence"
+    gen = yaml.safe_load((meta_dir / "strategy-generations.yaml").read_text())
+    assert gen["current_generation"] == 2, "the transition did not land"
+    assert len(gen["generations"]) == 2, \
+        "the retry must append exactly one generation, not zero or two"
+    assert gen["generations"][0]["ended"] is not None, "prior generation not closed"
+
+
+def test_generation_transition_uninitialised_writes_nothing(meta_dir, backend):
+    """The `version` guard moved INSIDE the cycle with the read it depends on.
+
+    Deciding from a pre-cycle read would race the very peer write the fix
+    guards against. The cycle must be able to return without writing.
+    """
+    (meta_dir / "strategy-generations.yaml").write_text(
+        yaml.safe_dump({"generations": []}), encoding="utf-8")
+
+    MY._trigger_generation_transition(_ctx(meta_dir, {}))
+
+    assert yaml.safe_load((meta_dir / "strategy-generations.yaml").read_text()) == \
+        {"generations": []}, "uninitialised store must be left untouched"
+
+
 def test_append_item_rejects_non_list_as_400(meta_dir, backend):
     """The not_a_list guard moved inside the cycle — it must still map to 400,
     not escape as an unhandled exception."""
@@ -292,3 +483,16 @@ def test_append_item_rejects_non_list_as_400(meta_dir, backend):
         "item": {"note": "x"}}))
     body = resp.body.decode() if isinstance(resp.body, bytes) else resp.body
     assert "not_a_list" in body
+    # Assert the STATUS, not just the code string in the body ( F6).
+    # Without this the test proved only that the words "not_a_list" appear
+    # somewhere — a regression remapping the same payload to 500, or letting the
+    # _MetaYamlError escape the cycle and become an unhandled 500, still carries
+    # that string and still passed. The docstring claimed the 400 all along; only
+    # the assertion was missing.
+    assert resp.status == 400, (
+        "not_a_list must map to 400 (client sent a bad dotpath), not {} — a 5xx "
+        "here tells the caller to retry a request that can never succeed".format(
+            resp.status))
+    assert yaml.safe_load((meta_dir / "skill-gaps.yaml").read_text())[
+        "last_updated"] == "2026-07-26", \
+        "a rejected append must leave the store untouched"

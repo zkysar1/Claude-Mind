@@ -310,8 +310,8 @@ def test_complete_intent_supersedes_open_goal_no_strand_no_reskip():
     backstop would wrongly do — the exact mistake the no-op analysis avoided)."""
     with tempfile.TemporaryDirectory() as tmpd:
         world = _seed_world(Path(tmpd), asp_status="active", goals=[
-            _goal("", "completed"),   # evidence
-            _goal("", "pending"),      # open → must be superseded
+            _goal("g-900-10", "completed"),   # evidence
+            _goal("g-900-11", "pending"),      # open → must be superseded
         ])
         intent = {
             "evidence_goal_ids": ["g-900-10"],

@@ -103,6 +103,7 @@ DESIGN NOTES
 """
 
 import argparse
+import http.client
 import json
 import os
 import subprocess
@@ -111,7 +112,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -1615,6 +1616,203 @@ def mh_threshold() -> int:
         return 3
 
 
+def daemon_health_json(root: Path, timeout: float = 1.0) -> Optional[dict]:
+    """Fetch the daemon's /v1/admin/health BODY (vs daemon_health_probe, which
+    returns only reachability). Returns None when unreachable or unparseable —
+    the caller must fail open, because reachability is DaemonHealthProbe's job
+    and guard-597 forbids concluding death from a single timed-out probe."""
+    try:
+        port = _rt_port_file(root).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not port:
+        return None
+    url = f"http://127.0.0.1:{port}/v1/admin/health"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            status = getattr(resp, "status", None) or resp.getcode()
+            if not (200 <= int(status) < 300):
+                return None
+            return json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError,
+            http.client.HTTPException):
+        # http.client.HTTPException (IncompleteRead, BadStatusLine, ...) derives
+        # from Exception ONLY — not OSError, not ValueError — so a truncated or
+        # malformed response escaped this tuple and broke the docstring promise
+        # above. The tick loop would have caught it, but the probe then dies
+        # silently instead of failing open by contract (fresh-eyes F-003).
+        return None
+
+
+class ClockSkewProbe(Probe):
+    """Fails loud when a naive-stamp-minting process is not on UTC ().
+
+    THE DEFECT. A long-lived process keeps the TZ env it started with, so one
+    started before the TZ=UTC posture landed mints every naive stamp at an
+    offset. The whole fleet compares naive stamps (board `--since`,
+    `last_active` staleness, LWW merges), so a behind-clock writer reads as
+    OLDER than it is and systematically LOSES last-write-wins races: its newer
+    content is discarded as stale, with no error on the losing side. Measured
+    2026-07-30 on a peer deployment: a diary entry stamped 03:46:43 in a file
+    written at 07:46:43 — exactly UTC-4.
+
+    WHY A FRESH-SUBPROCESS ASSERTION CANNOT FIND THIS, and why this probe is
+    shaped the way it is. The watchdog tick runs in a NEW process, which
+    inherits the CURRENT environment and is therefore UTC-correct even while
+    the long-lived daemon beside it is four hours behind. An assertion that
+    only checked its own clock would pass on precisely the box that has the
+    bug — the same hand-tested-green trap that left pre-edit-context-gate
+    inert for 59 days (.claude/rules/read-before-edit.md Rule 4). So the
+    load-bearing reading here is the DAEMON's self-measured `tz_offset_s`,
+    not this process's.
+
+    TWO INDEPENDENT NUMBERS, deliberately not derived from each other:
+      - daemon `tz_offset_s`   — measured inside the daemon (now() - utc).
+      - this process's offset  — measured here, the same way.
+    Diffing the daemon's reported stamp against OUR clock would cancel to zero
+    whenever both are skewed by the same amount, which is the fleet-wide case
+    that matters most.
+
+    A MISSING FIELD IS NOT A PASS. A daemon old enough to predate
+    `tz_offset_s` is, by construction, a long-lived process — the exact
+    population most likely to be skewed. Reporting that as clean would be a
+    vacuous zero, so it emits `clock_posture_unverifiable` instead.
+
+    Fail-open on unreachable: emits nothing and lets DaemonHealthProbe own
+    reachability (guard-597).
+    """
+
+    name = "clock-skew"
+    # 60s sits far above NTP jitter and far below the smallest real TZ offset
+    # (15 min = 900s), so it separates "clock drift" from "wrong zone" cleanly.
+    THRESHOLD_S = 60
+
+    def __init__(self, ctx: WatchdogContext) -> None:
+        super().__init__(ctx)
+        self.prev_state: Optional[str] = None  # "clean" | "skewed" | "unverifiable"
+
+    @staticmethod
+    def _self_offset_s() -> int:
+        now = datetime.now()
+        utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        return round((now - utc).total_seconds())
+
+    def check(self) -> list[Event]:
+        self_off = self._self_offset_s()
+        health = daemon_health_json(self.ctx.project_root_path)
+        if health is None:
+            return []  # unreachable — not our call to make (guard-597)
+
+        daemon_off = health.get("tz_offset_s")
+        if daemon_off is None:
+            state = "unverifiable"
+            payload = {
+                "self_offset_s": self_off,
+                "daemon_offset_s": None,
+                "daemon_pid": health.get("pid"),
+                "daemon_uptime_s": health.get("uptime_s"),
+                "note": "daemon health has no tz_offset_s — it predates the field, "
+                        "so it is a long-lived process whose clock posture cannot be "
+                        "confirmed. Absence is NOT a clean reading; restart to verify.",
+            }
+            summary = (f"{self.name}: clock_posture_unverifiable "
+                       f"(daemon pid={health.get('pid')} predates tz_offset_s)")
+            event_name = "clock_posture_unverifiable"
+            severity = "info"
+        elif abs(int(daemon_off)) >= self.THRESHOLD_S or abs(self_off) >= self.THRESHOLD_S:
+            state = "skewed"
+            # Name the process that is ACTUALLY skewed. A blanket "restart the
+            # daemon" is wrong advice in the daemon-clean/self-skewed case, and
+            # it is wrong while the payload's own daemon_offset_s reads 0 —
+            # exactly the concluding-a-cause-the-fields-contradict shape
+            # guard-1955 names. That case is reachable and is the more urgent
+            # one: it means the BOX TZ regressed after the daemon started
+            # correctly, so every NEW process is now minting skewed stamps
+            # while the daemon looks fine (fresh-eyes F-002).
+            daemon_bad = abs(int(daemon_off)) >= self.THRESHOLD_S
+            self_bad = abs(self_off) >= self.THRESHOLD_S
+            if daemon_bad and self_bad:
+                who = "both the daemon and this process"
+                remedy = ("the BOX TZ posture is wrong, not just one process: fix "
+                          "TZ=UTC at the environment/settings level, then restart "
+                          "the daemon AND the agent session")
+            elif daemon_bad:
+                who = "the daemon"
+                remedy = ("restart the daemon so it inherits TZ=UTC — the code is "
+                          "correct, the process env is stale (same class as "
+                          "guard-559 / rb-2022; no edit will fix it)")
+            else:
+                who = "this watchdog process (the daemon is clean)"
+                remedy = ("the daemon is on UTC but freshly-spawned processes are "
+                          "NOT — the box TZ regressed AFTER the daemon started. Fix "
+                          "TZ=UTC in the environment; restarting the daemon would "
+                          "make things WORSE by moving it onto the wrong zone too")
+            payload = {
+                "self_offset_s": self_off,
+                "daemon_offset_s": int(daemon_off),
+                "threshold_s": self.THRESHOLD_S,
+                "skewed_side": ("both" if (daemon_bad and self_bad)
+                                else "daemon" if daemon_bad else "self"),
+                "daemon_pid": health.get("pid"),
+                "daemon_uptime_s": health.get("uptime_s"),
+                "daemon_naive_now": health.get("naive_now"),
+                "remedy": remedy,
+            }
+            summary = (f"{self.name}: clock_skew_detected in {who} — "
+                       f"daemon={daemon_off}s self={self_off}s "
+                       f"(threshold {self.THRESHOLD_S}s) — naive stamps LOSE LWW races")
+            event_name = "clock_skew_detected"
+            severity = "critical"
+        else:
+            state = "clean"
+            payload = {"self_offset_s": self_off, "daemon_offset_s": int(daemon_off)}
+            # event_name/summary for this branch depend on what we are arriving
+            # FROM, which is not known until the dedup step below resolves `was`.
+            summary = ""
+            event_name = ""
+            severity = "info"
+
+        # State-deduped: emit only on transition, so a standing skew does not
+        # spam every tick but a NEW one is never missed. "clean" emits only as
+        # a recovery from a prior non-clean state.
+        if state == self.prev_state:
+            return []
+        was = self.prev_state
+        self.prev_state = state
+        if state == "clean" and was is None:
+            return []
+
+        if state == "clean":
+            # Distinguish the two ways of arriving at clean. Emitting
+            # `clock_skew_cleared` out of `unverifiable` asserts that a skew was
+            # detected and then fixed, when none was ever measured — a signal
+            # whose NAME carries semantics the observation does not support
+            # (guard-1008). The prev_state payload disambiguated it, but the
+            # event name and summary line are what a log reader sees first, and
+            # the arrival from `unverifiable` is the COMMON case: it is what any
+            # daemon predating tz_offset_s emits on its first post-restart tick
+            # (fresh-eyes F-001).
+            if was == "unverifiable":
+                event_name = "clock_posture_verified"
+                summary = (f"{self.name}: clock_posture_verified — daemon now reports "
+                           f"tz_offset_s (daemon={daemon_off}s self={self_off}s); no "
+                           f"skew was ever measured, the posture was merely unreadable")
+            else:
+                event_name = "clock_skew_cleared"
+                summary = (f"{self.name}: clock_skew_cleared "
+                           f"(daemon={daemon_off}s self={self_off}s)")
+
+        return [Event(probe=self.name, event=event_name, severity=severity,
+                      payload={**payload, "prev_state": was}, summary=summary)]
+
+    def to_dict(self) -> dict:
+        return {"prev_state": self.prev_state}
+
+    def from_dict(self, state: dict) -> None:
+        if state:
+            self.prev_state = state.get("prev_state")
+
+
 def build_probes(ctx: WatchdogContext) -> list[Probe]:
     """Single registration point. Add new probes here."""
     return [
@@ -1624,6 +1822,7 @@ def build_probes(ctx: WatchdogContext) -> list[Probe]:
         BackgroundJobProbe(ctx),
         StopHookBlockProbe(ctx),
         DaemonHealthProbe(ctx),
+        ClockSkewProbe(ctx),
         FreshnessProbe(ctx),
         MirrorWedgeProbe(ctx),
     ]

@@ -159,13 +159,25 @@ def cmd_add(args):
     if not isinstance(forged, list):
         forged = []
 
-    # Check for duplicates (same source + target + type)
+    # Check for duplicates (same source + target + type). Refusing here is what
+    # makes amending an existing edge a HAND-EDIT, so this error is the moment of
+    # use for the amended_at contract () — state it here, where the
+    # amender actually lands, rather than only in a docstring they will not open.
     for existing in forged:
         if (existing.get("source") == source
                 and existing.get("target") == target
                 and existing.get("type") == rel_type):
             print("Error: duplicate relation already exists: {} --{}--> {}".format(
                 source, rel_type, target), file=sys.stderr)
+            print("  To AMEND it (confidence, evidence, ...), edit the record in"
+                  " world/skill-relations.yaml and you MUST also bump its"
+                  " 'amended_at' to the current naive ISO timestamp"
+                  " (date +%Y-%m-%dT%H:%M:%S). That stamp is tier 0 of"
+                  " _merge_skill_relation: without it, an amendment that does not"
+                  " change the field COUNT falls to an arbitrary lexicographic"
+                  " tiebreak and can lose DETERMINISTICALLY to an untouched peer"
+                  " copy — with every write path reporting success"
+                  " (g-115-3639, guard-1153).", file=sys.stderr)
             sys.exit(1)
 
     # Build the relation record
@@ -178,6 +190,13 @@ def cmd_add(args):
         relation["confidence"] = entry["confidence"]
     if "evidence" in entry:
         relation["evidence"] = entry["evidence"]
+    # Tier-0 merge stamp (, guard-1153: LWW on a timestamp written BY
+    # THE SAME MUTATION that writes the field). Stamping at CREATE is the writer
+    # half of the fix: it makes the field exist on every edge this path produces,
+    # so a later hand-edit amendment has a baseline to beat. Safe for back-compat
+    # — a pre-stamp peer copy sorts oldest in _merge_skill_relation, so the
+    # stamped side wins, which is the correct outcome (it was written later).
+    relation["amended_at"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
     forged.append(relation)
     world_data["forged_relations"] = forged

@@ -1,29 +1,58 @@
 #!/usr/bin/env python3
-"""Audit pass — drain accumulated participants:[user]-only goals.
+"""Audit pass -- lane P of the reclaim duty: re-derive every goal carrying 'user'.
 
-For every pending or blocked goal with participants == ["user"] in
-world/aspirations.jsonl and in each agent's <agent>/aspirations.jsonl, run
-capability-gate.py against the goal's title+description. If the gate finds
-an agent-provisionable match the goal should have been tagged [agent, user]
-at creation. In --apply mode, promote participants to ["agent", "user"] via
-aspirations.py update-goal and append a reclassification record to
-world/audit-user-to-agent.jsonl.
+Two lanes over every non-terminal goal whose participants INCLUDE "user", in
+world/aspirations.jsonl and in each agent's <agent>/aspirations.jsonl:
 
-Dry-run by default — prints proposed reclassifications without mutating.
+  PROMOTE  participants == ["user"]      "should the AGENT be involved?"
+           Runs capability-gate.py on title+description. A match means the
+           goal should have been [agent, user] at creation. With --apply,
+           promotes via aspirations.py update-goal and logs to
+           world/audit-user-to-agent.jsonl. Adding the agent is safe, so
+           this lane may mutate.
+
+  DROP     "user" alongside others       "is the USER still needed?"
+           Joins the goal's declared `user_leg_scope` against the scopes
+           granted in world/conventions/capability-routing.md
+           "## Standing User Grants". A covered scope means the user's leg
+           is already standing-approved and "user" can come off. REPORTS
+           ONLY -- removing the human is a one-way door inside the loop, and
+           the field it depends on is populated on a minority of goals.
+
+Why the second lane exists (measured 2026-07-29 on the live world queue):
+the promote lane's exact `participants == ["user"]` predicate had a live
+candidate set of ZERO -- one goal in the fleet matched it, and that goal was
+a deliberate park the audit correctly refuses to touch. The other 28
+user-carrying goals were all ["agent", "user"] and structurally invisible.
+Correct routing caused the blindness: capability-before-user.md tells the
+fleet to file [agent, user] whenever both legs are real, so the creation-time
+gate's success produced exactly the population the audit-time tool could not
+see. The creation-time advisory (gates/user_leg_scope.py) has always tested
+`"user" in participants`; only this half was narrower.
+
+`user_leg_scope` is the join key, and that was always its purpose -- the
+creation-time advisory says so verbatim: "Standing-grant matching will fall
+back to prose recognition." This is that matching, done as an exact join
+between two vocabularies that already existed and had never been connected.
+
+Dry-run by default -- prints the plan without mutating.
 
 Part (1) of g-243-02 (plan: curious-sparking-simon.md). Pairs with the
 --evidence flag in capability-gate.py (same goal, Part 2, already shipped).
+Drop lane serves .claude/rules/reclaim-routed-work.md lane P.
 
 Usage:
-  py -3 core/scripts/audit-user-to-agent.py            # dry-run, prints plan
-  py -3 core/scripts/audit-user-to-agent.py --apply    # apply reclassifications
-  py -3 core/scripts/audit-user-to-agent.py --limit 5  # test on first 5
+  py -3 core/scripts/audit-user-to-agent.py            # dry-run, both lanes
+  py -3 core/scripts/audit-user-to-agent.py --apply    # apply PROMOTE only
+  py -3 core/scripts/audit-user-to-agent.py --output json
+  py -3 core/scripts/audit-user-to-agent.py --limit 5  # first 5 promotables
 """
 
 import argparse
 import datetime as dt
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -37,6 +66,10 @@ ASP_PY = SCRIPT_DIR / "aspirations.py"
 sys.path.insert(0, str(SCRIPT_DIR))
 from _fileops import locked_append_jsonl  # noqa: E402
 from _paths import agent_dir as _agent_dir, enumerate_agent_confs  # noqa: E402
+# SSOT for the scope vocabulary — never copy the set. The same module backs the
+# creation-time advisory in aspirations.py (cmd_add_goal / cmd_add /
+# cmd_update_goal), so audit time and creation time cannot drift apart.
+from gates.user_leg_scope import VALID_USER_LEG_SCOPES  # noqa: E402
 
 
 def _world_dir_for(agent: str) -> Path:
@@ -83,10 +116,31 @@ def _load_jsonl(path: Path) -> list:
     return recs
 
 
-def _find_user_only_goals(source_label: str, asp_path: Path) -> list:
-    """Return candidates: goals where participants == ['user'] exactly.
+def _find_user_participant_goals(source_label: str, asp_path: Path) -> list:
+    """Return every non-terminal goal whose participants INCLUDE 'user'.
 
-    Each candidate: {source, aspiration_id, goal, file_path}.
+    Shape-tagged, nothing silently dropped. Each candidate:
+    {source, aspiration_id, goal, file_path, shape, deliberate}.
+
+    `shape` is "user-only" (participants == ['user']) or "agent-user"
+    ('user' alongside others). The distinction decides which lane runs:
+    user-only asks "should the agent be involved?" (promote); agent-user
+    asks "is the user still needed?" (drop) — a different question with a
+    much higher evidence bar, because dropping the human is a one-way door
+    inside the loop while adding the agent is not.
+
+    WHY "include" and not "== ['user']" (measured 2026-07-29, live world
+    queue): the exact-match predicate this replaces had a live candidate set
+    of ZERO. One goal in the entire fleet matched it -- g-314-01, a
+    deliberate park -- which the `deliberate` guard below then excluded, so
+    the auditor was structurally incapable of returning a candidate. The
+    other 28 user-carrying goals were all ['agent', 'user'] and invisible to
+    it. The creation-time advisory (gates/user_leg_scope.py) has always
+    tested `"user" in participants`; only the audit-time half was narrower.
+    The gate's own success caused the blindness: capability-before-user.md
+    tells the fleet to file [agent, user] whenever both legs are real, so
+    correct routing produces exactly the population the auditor could not
+    see.
     """
     out = []
     for asp in _load_jsonl(asp_path):
@@ -96,27 +150,114 @@ def _find_user_only_goals(source_label: str, asp_path: Path) -> list:
             parts = g.get("participants")
             if not isinstance(parts, list):
                 continue
-            if [str(p).strip().lower() for p in parts] != ["user"]:
+            norm = [str(p).strip().lower() for p in parts]
+            if "user" not in norm:
                 continue
             if g.get("status") not in ("pending", "blocked"):
                 continue
-            # Skip deliberate user routing: the audit targets accidental
-            # agent-side drift ([user] wrongly set AT CREATION), not goals the
-            # user explicitly directed. origin_signal == "user_directive" marks
-            # a deliberate [user] choice (e.g. a participants:[user] park signal
-            # —  : "DO-NOT-TOUCH: park is participants:[user]
-            # ONLY ... Reversal = the user edits participants"). Auto-promoting
-            # it to [agent, user] would let the agent act on the goal, violating
-            # the directive. ( audit run, 2026-06-09: caught the
+            # Deliberate user routing is REPORTED, not skipped. The audit
+            # targets accidental agent-side drift (user wrongly attached AT
+            # CREATION), not goals the user explicitly directed:
+            # origin_signal == "user_directive" marks a deliberate choice
+            # (e.g. the participants:[user] park signal --  :
+            # "DO-NOT-TOUCH: park is participants:[user] ONLY ... Reversal =
+            # the user edits participants"). Acting on it would violate the
+            # directive. ( audit run, 2026-06-09: caught the
             # felt-sense-checkin "lane" keyword false-positive on .)
-            if (g.get("origin_signal") or "").strip().lower() == "user_directive":
-                continue
+            #
+            # It is tagged rather than `continue`d because a silent skip is
+            # indistinguishable from a clean sweep -- the exact failure this
+            # whole audit lane exists to correct. A tagged record shows up in
+            # the count and states why it was left alone.
+            deliberate = (g.get("origin_signal") or "").strip().lower().startswith(
+                ("user_directive", "user-directed"))
             out.append({
                 "source": source_label,
                 "aspiration_id": asp.get("id"),
                 "goal": g,
                 "file_path": str(asp_path),
+                "shape": "user-only" if norm == ["user"] else "agent-user",
+                "deliberate": deliberate,
             })
+    return out
+
+
+_GRANT_ROW = re.compile(r"^\|\s*(grant-[0-9]+)\s*\|(.+)$")
+
+
+def _scope_head(cell: str) -> str:
+    """The DECLARATIVE head of a grant's scope cell.
+
+    Grant scope cells open with the granted scope and then qualify it at
+    length -- conditions, carve-outs, history, and clauses that name actions
+    the grant explicitly does NOT cover. Matching enum tokens against the
+    whole cell therefore inverts meaning on real rows: grant-008's body says
+    "PROVIDED the commit is verified" (a precondition, not a grant of
+    `commit`), and grant-009's says "anything needing NEW credentials ...
+    still routes to user" (an explicit REFUSAL). A whole-cell scan reads
+    both as grants.
+
+    Cutting at the first period keeps only the declarative lead. The cut is
+    deliberately crude and under-matches -- an abbreviation ("incl.") ends
+    the head early. That bias is the safe one: a missed match leaves a goal
+    routed to the user exactly as it is today, while a false match would
+    recommend removing the human. This is the same false-positive class the
+    capability gate's tuning history warns about, met with the one predicate
+    that cannot silently over-fire.
+    """
+    return cell.split(".", 1)[0]
+
+
+def _parse_standing_grants(world_dir: Path) -> dict:
+    """Parse `## Standing User Grants` into {scope_token: [grant_id, ...]}.
+
+    Returns {"by_scope": {...}, "unkeyed": [(grant_id, head)], "error": str|None}.
+
+    `unkeyed` is a first-class result, not a leftover: a grant whose head
+    uses none of the VALID_USER_LEG_SCOPES vocabulary can never be matched
+    by a goal's `user_leg_scope`, so the permission it carries is invisible
+    to this audit no matter how many goals it ought to free. Surfacing it
+    tells the reader which row to reword -- the machine-findable-terms
+    requirement of `.claude/rules/reclaim-routed-work.md` rule 4, applied to
+    the grants table itself.
+    """
+    out = {"by_scope": {}, "unkeyed": [], "error": None}
+    if world_dir is None:
+        out["error"] = "no WORLD_PATH"
+        return out
+    path = world_dir / "conventions" / "capability-routing.md"
+    if not path.is_file():
+        out["error"] = f"not found: {path}"
+        return out
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception as e:
+        out["error"] = f"read failed: {e}"
+        return out
+
+    in_section = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            in_section = stripped.lower().startswith("## standing user grants")
+            continue
+        if not in_section:
+            continue
+        m = _GRANT_ROW.match(stripped)
+        if not m:
+            continue
+        grant_id, rest = m.group(1), m.group(2)
+        cells = [c.strip() for c in rest.split("|")]
+        if not cells:
+            continue
+        head = _scope_head(cells[0])
+        hits = [s for s in sorted(VALID_USER_LEG_SCOPES)
+                if re.search(rf"(?<![\w-]){re.escape(s)}(?![\w-])", head, re.I)]
+        if hits:
+            for s in hits:
+                out["by_scope"].setdefault(s, []).append(grant_id)
+        else:
+            out["unkeyed"].append((grant_id, head[:90]))
     return out
 
 
@@ -184,6 +325,75 @@ def _log_reclassification(world_dir: Path, record: dict) -> None:
               file=sys.stderr)
 
 
+def _assess_user_leg(cand: dict, grants: dict) -> dict:
+    """Lane P drop-check for an ['agent', 'user'] goal.
+
+    The user-only lane asks "should the AGENT be involved?" and answers it
+    with the capability gate. This lane asks the opposite and harder
+    question -- "is the USER still needed?" -- which the gate cannot answer:
+    the gate scores agent capability, and the agent already being capable
+    says nothing about whether the human leg is discharged.
+
+    The answer is decidable exactly when the user's leg was DECLARED. That
+    is what `user_leg_scope` is for, and the creation-time advisory already
+    says so in as many words: "Standing-grant matching will fall back to
+    prose recognition." Matching a declared scope token against the granted
+    scopes is that matching, done for real -- an exact join between two
+    vocabularies that already existed and had never been connected.
+
+    Verdicts:
+      grant-covered -> a standing grant covers this scope; the user's leg is
+                       already approved, so `user` can come off. RECOMMEND.
+      keep          -> scope declared and NOT granted. Correct as routed.
+      undeclared    -> no `user_leg_scope`; the leg was never written down,
+                       so nothing can re-derive it mechanically. The fix is
+                       to backfill the field, not to guess.
+      deliberate    -> the user directed this routing. Never touch.
+
+    Returns a verdict dict; NEVER mutates. Dropping the human is a one-way
+    door inside the loop, and the field it depends on is populated on a
+    small minority of goals -- so this half of the audit reports and the
+    re-derivation stays with the reader.
+    """
+    g = cand["goal"]
+    scope = (g.get("user_leg_scope") or "").strip()
+    base = {
+        "goal_id": g.get("id"),
+        "aspiration_id": cand["aspiration_id"],
+        "source": cand["source"],
+        "title": g.get("title", ""),
+        "status": g.get("status"),
+        "user_leg_scope": scope or None,
+        "participants": g.get("participants"),
+    }
+    if cand.get("deliberate"):
+        return {**base, "verdict": "deliberate",
+                "reason": f"origin_signal={g.get('origin_signal')!r} -- user directed "
+                          "this routing; the reversal is the user editing participants"}
+    if not scope:
+        return {**base, "verdict": "undeclared",
+                "reason": "no user_leg_scope -- the user's leg was never declared, so "
+                          "no standing grant can match it and no sweep can re-derive "
+                          "it. Backfill with: aspirations-update-goal.sh "
+                          f"{g.get('id')} user_leg_scope <scope>",
+                "valid_scopes": sorted(VALID_USER_LEG_SCOPES)}
+    if scope not in VALID_USER_LEG_SCOPES:
+        return {**base, "verdict": "undeclared",
+                "reason": f"user_leg_scope={scope!r} is outside the canonical set, so it "
+                          "cannot join the grants table",
+                "valid_scopes": sorted(VALID_USER_LEG_SCOPES)}
+    covering = grants.get("by_scope", {}).get(scope, [])
+    if covering:
+        return {**base, "verdict": "grant-covered", "grants": covering,
+                "reason": f"user_leg_scope={scope!r} is covered by "
+                          f"{', '.join(covering)} -- the user has standing-approved this "
+                          "scope, so the user leg is already discharged. Drop 'user' from "
+                          "participants; if the agent leg is also done, close the goal."}
+    return {**base, "verdict": "keep",
+            "reason": f"user_leg_scope={scope!r} matches no standing grant -- the user "
+                      "leg is real and this routing is correct"}
+
+
 def _summarize(cands: list) -> str:
     """Short goal summary: title truncated + aspiration + source."""
     lines = []
@@ -196,15 +406,20 @@ def _summarize(cands: list) -> str:
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description="Audit [user]-only goals and reclassify matches to [agent, user].")
+        description="Reclaim lane P: promote [user] goals to [agent, user], and "
+                    "re-derive whether 'user' is still needed on [agent, user] goals.")
     ap.add_argument("--apply", action="store_true",
-                    help="Actually mutate goals. Default is dry-run.")
+                    help="Mutate goals in the PROMOTE lane. The drop lane never "
+                         "mutates. Default is dry-run.")
     ap.add_argument("--limit", type=int, default=0,
-                    help="Process only the first N candidates (for testing).")
+                    help="Process only the first N PROMOTE candidates (for testing). "
+                         "Does not bound the drop lane.")
     ap.add_argument("--agent-for-gate", default=None,
                     help="MIND_AGENT env for gate invocations. "
                          "Defaults to current session's agent or the first "
                          "discovered agent dir.")
+    ap.add_argument("--output", choices=("text", "json"), default="text",
+                    help="text (default) or json for programmatic consumers.")
     args = ap.parse_args(argv)
 
     _discovered = _discover_agents()
@@ -223,21 +438,43 @@ def main(argv=None):
     world_dir = _world_dir_for(agent_for_gate)
 
     # Build the candidate list from world/aspirations.jsonl + every agent's file.
-    candidates = []
+    all_user_goals = []
     if world_dir is not None:
-        candidates += _find_user_only_goals(
+        all_user_goals += _find_user_participant_goals(
             "world", world_dir / "aspirations.jsonl")
     for a in _discover_agents():
-        candidates += _find_user_only_goals(
+        all_user_goals += _find_user_participant_goals(
             a, _agent_dir(a) / "aspirations.jsonl")
+
+    # Lane split. user-only runs the promote path below (unchanged); agent-user
+    # runs the report-only drop check. Deliberate user routings are excluded
+    # from promotion but still assessed and counted, so they appear in the
+    # report as "left alone, and here is why" rather than vanishing.
+    grants = _parse_standing_grants(world_dir)
+    leg_verdicts = [_assess_user_leg(c, grants)
+                    for c in all_user_goals if c["shape"] == "agent-user"]
+    candidates = [c for c in all_user_goals
+                  if c["shape"] == "user-only" and not c["deliberate"]]
+    deliberate_user_only = [c for c in all_user_goals
+                            if c["shape"] == "user-only" and c["deliberate"]]
 
     if args.limit and args.limit > 0:
         candidates = candidates[:args.limit]
 
-    print(f"[audit-user-to-agent] {len(candidates)} candidate goal(s) with "
-          f"participants=['user']")
-    if not candidates:
-        return 0
+    # Header goes to STDERR under --output json so stdout stays a single parseable
+    # document. A human-readable banner ahead of the JSON makes `| json.load`
+    # fail on char 1, which is exactly how a machine-readable mode ends up
+    # documented but unusable.
+    print(f"[audit-user-to-agent] {len(all_user_goals)} non-terminal goal(s) carry "
+          f"'user': {len(candidates)} promotable user-only, "
+          f"{len(deliberate_user_only)} deliberate user-only, "
+          f"{len(leg_verdicts)} [agent, user]",
+          file=(sys.stderr if args.output == "json" else sys.stdout))
+
+    # NO early return on an empty promote lane. That return used to end the run
+    # here, and on the live queue `candidates` is legitimately 0 -- so an early
+    # exit would print a clean line and silently skip the entire drop lane,
+    # reproducing the invisibility this change exists to fix.
 
     reclassified = []
     unchanged = []
@@ -322,7 +559,36 @@ def main(argv=None):
 
         reclassified.append(action)
 
-    # --- Report ---
+    by_verdict = {}
+    for v in leg_verdicts:
+        by_verdict.setdefault(v["verdict"], []).append(v)
+
+    if args.output == "json":
+        json.dump({
+            "promote_lane": {
+                "candidates": len(candidates),
+                "reclassified": reclassified,
+                "unchanged": [c["goal"]["id"] for c in unchanged],
+                "deliberate_skipped": [c["goal"]["id"] for c in deliberate_user_only],
+                "errors": errors,
+            },
+            "drop_lane": {
+                "assessed": len(leg_verdicts),
+                "counts": {k: len(v) for k, v in sorted(by_verdict.items())},
+                "verdicts": leg_verdicts,
+            },
+            "grants": {
+                "by_scope": grants.get("by_scope", {}),
+                "unkeyed": [{"grant": gid, "head": head}
+                            for gid, head in grants.get("unkeyed", [])],
+                "error": grants.get("error"),
+            },
+            "applied": bool(args.apply),
+        }, sys.stdout, indent=1)
+        print("")
+        return 0
+
+    # --- Report: lane 1, promote [user] -> [agent, user] ---
     print("")
     print(f"Would reclassify: {len(reclassified)}")
     for a in reclassified:
@@ -333,13 +599,56 @@ def main(argv=None):
     print(f"\nUnchanged (no match): {len(unchanged)}")
     if unchanged:
         print(_summarize(unchanged))
+    if deliberate_user_only:
+        print(f"\nDeliberate user routing, left alone: {len(deliberate_user_only)}")
+        print(_summarize(deliberate_user_only))
     if errors:
         print(f"\nErrors: {len(errors)}")
         for e in errors:
             print(f"  {e['goal_id']}: {e['reason']}")
 
+    # --- Report: lane 2, is the user still needed on [agent, user]? ---
+    print("")
+    print("=" * 68)
+    print(f"[agent, user] user-leg re-derivation: {len(leg_verdicts)} goal(s)")
+    if grants.get("error"):
+        print(f"  standing grants UNREADABLE ({grants['error']}) -- every scope "
+              "below is reported as ungranted, which is the fail-safe direction "
+              "but is NOT evidence the user leg is real")
+    else:
+        print(f"  granted scopes: "
+              f"{ {k: v for k, v in sorted(grants['by_scope'].items())} or '(none)'}")
+    print("=" * 68)
+
+    for verdict, label in (
+        ("grant-covered", "DROP 'user' -- a standing grant already covers this leg"),
+        ("undeclared", "UNDECLARED user leg -- cannot be re-derived until backfilled"),
+        ("keep", "keep -- user leg is real and ungranted"),
+        ("deliberate", "deliberate -- user directed this routing"),
+    ):
+        rows = by_verdict.get(verdict, [])
+        if not rows:
+            continue
+        print(f"\n{label}: {len(rows)}")
+        for v in rows:
+            print(f"  {v['goal_id']:<16} {v['status']:<9} "
+                  f"scope={v['user_leg_scope'] or '-'}  {v['title'][:58]}")
+            if verdict in ("grant-covered", "undeclared"):
+                print(f"      -> {v['reason']}")
+
+    if grants.get("unkeyed"):
+        print(f"\nGrants no goal can key to: {len(grants['unkeyed'])}")
+        print("  These rows grant real permission, but their scope head uses none of")
+        print("  the user_leg_scope vocabulary, so no goal can ever match them here.")
+        print(f"  Vocabulary: {sorted(VALID_USER_LEG_SCOPES)}")
+        for gid, head in grants["unkeyed"]:
+            print(f"    {gid}: {head}")
+
+    print("\nThe drop lane NEVER mutates: --apply governs the promote lane only.")
+    print("Removing the human is a one-way door inside the loop, and user_leg_scope")
+    print("is populated on a minority of goals -- so this half reports and you decide.")
     if not args.apply:
-        print("\n(dry-run — pass --apply to mutate goals)")
+        print("\n(dry-run -- pass --apply to mutate goals in the promote lane)")
     return 0
 
 

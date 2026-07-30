@@ -478,7 +478,12 @@ def render_proposal_goals(result: dict) -> list[dict]:
             "priority": "MEDIUM",
             "category": "framework-architecture",
             "participants": ["agent", "user"],
-            "origin_signal": f"override-ledger-consume:{gate}:{tag}",
+            # Needs a REGISTERED prefix (gates/origin_signal.py ALLOWED_PREFIXES).
+            # The bare "override-ledger-consume:" form is not registered, so every
+            # goal this analyzer rendered would have been refused at filing time
+            # ( sweep). No dedup consumer keys on the old string -- it
+            # appeared only here -- so the prefix change is safe.
+            "origin_signal": f"investigate:override-ledger-consume:{gate}:{tag}",
             "verification": {
                 "outcomes": [
                     f"User approves a specific config-field change for {gate} "

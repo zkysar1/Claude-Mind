@@ -44,7 +44,7 @@ STALE_MIN=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --plain) PLAIN=1; shift ;;
-        --stale-minutes) STALE_MIN="${2:-0}"; shift 2 ;;
+        --stale-minutes) STALE_MIN="${2:-0}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         *) echo "Unknown arg: $1" >&2; exit 0 ;;
     esac
 done

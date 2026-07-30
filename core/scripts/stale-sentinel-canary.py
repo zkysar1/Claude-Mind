@@ -31,6 +31,15 @@ Tracked sentinels (force_* counter-gate family; set/clear semantics):
                                        consumer: aspirations-precheck Phase 0-pre3
     force_metric_encoding_pending    — writer: post-state-update-metric-gate.sh
                                        consumer: aspirations-precheck Phase 0-pre4
+    force_evolution_finalize         — writer: evolution-stub-pending-check.sh
+                                       consumer: aspirations-precheck Phase 0-pre2.5
+                                       (CONSUMPTION-AWARE from registration,
+                                       g-115-3678 — the producer re-arms every
+                                       iteration while any stub is pending, and
+                                       a stub whose rationale genuinely cannot
+                                       be reconstructed is SUPPOSED to sit set
+                                       until the 24h expiry, so presence-count
+                                       would fire on correct behavior)
 
 Not tracked: consolidation_health (refresh-snapshot, no set/clear) and
 known_blockers (list-shaped, handled by blocker-recheck.sh).

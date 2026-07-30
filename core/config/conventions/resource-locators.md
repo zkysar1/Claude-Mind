@@ -60,7 +60,7 @@ Each locator entry is a markdown section with this structure:
 ## {stable-key-name}
 
 - **Value**: `{the locator value}`
-- **Kind**: {path | endpoint | identifier | connection-string}
+- **Kind**: {path | endpoint | identifier | connection-string | code-location}
 - **Scope**: {production | staging | dev | local}
 - **Discovered**: {YYYY-MM-DD} via `{exact command or steps}`
 - **Last verified**: {YYYY-MM-DD}
@@ -70,6 +70,50 @@ Each locator entry is a markdown section with this structure:
 The stable-key-name is the lookup handle (e.g., `prod-data-root`,
 `widget-service-endpoint`). It is NOT the value itself, and it should be
 descriptive enough to be meaningful without reading `Notes`.
+
+### Kind `code-location` — remote-primary, REQUIRED fields
+
+A locator that names **where source code lives** uses `Kind: code-location`
+and carries two extra fields. Both are REQUIRED; an entry missing either is
+not a locator (see "A path without a machine is a note" below):
+
+```markdown
+## {stable-key-name}
+
+- **Remote**: `{canonical clone URL}`      # PRIMARY — true on every box
+- **Kind**: code-location
+- **Local path**: `{absolute path}` **on** `{machine identifier}`   # per-box convenience
+- **Discovered**: {YYYY-MM-DD} via `{exact command}`
+- **Last verified**: {YYYY-MM-DD}
+- **Notes**: {what this code is, which sub-paths matter}
+```
+
+Worked example (generic):
+
+```markdown
+## widget-service-code
+
+- **Remote**: `https://github.com/acme/widget-service.git`
+- **Kind**: code-location
+- **Local path**: `/opt/src/widget-service` **on** `build-host-01`
+- **Discovered**: 2026-01-15 via `git -C /opt/src/widget-service remote -v`
+- **Last verified**: 2026-01-15
+- **Notes**: service handlers under `src/handlers/`; tests under `tests/`.
+```
+
+**`Remote` is the primary field and `Local path` is secondary.** The remote is
+the only value that is true from every box; a local path is true on exactly one
+machine and silently false everywhere else. Write the remote first so a reader
+scanning the entry reaches the universal value before the box-scoped one.
+
+**A path without a machine is a note, not a locator.** An absolute path recorded
+with no machine identifier is *implicitly box-scoped while reading as though it
+were universal* — which is the whole defect. If you cannot name the box a path
+was verified on, you do not know the path; record the remote and omit the path.
+
+Multiple boxes hold the same checkout at different roots. List them as separate
+`Local path` lines, each with its own machine — never collapse them into one
+"the path" line, and never assume another box uses the same root.
 
 ## Retrieval-Before-Discovery Protocol
 
@@ -119,6 +163,16 @@ silently overwrite — provenance matters.
   canonical entry per locator; cross-reference by key if needed.
 - Do not encode into the knowledge tree. Tree nodes are articles with
   confidence scores; locators are lookup data and do not need scoring.
+- **Do not record a code path without a machine identifier.** It reads as
+  universal and is true on one box. Add the machine, or record only the remote.
+- **Do not report code as unreachable because a local path is missing.** A
+  missing local path means *this box has no checkout yet* — the correct response
+  is `git clone <remote>` (or `git fetch` in an existing checkout), then re-read.
+  Reporting "I cannot see X" from one failed local stat is a capability-absence
+  claim drawn from a single silent signal, which
+  `.claude/rules/verify-before-assuming.md` forbids: the remote is the second
+  signal, and it is in the entry. **A locator lookup that yields a path you do
+  not have has SUCCEEDED, not failed** — it told you what to clone.
 
 ## Enforcement Points
 

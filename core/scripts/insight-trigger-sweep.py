@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""core/scripts/insight-trigger-sweep.py — Convert findings-channel
-insight_triggers into goals.
+"""core/scripts/insight-trigger-sweep.py — Convert board insight_triggers
+into goals.
 
 Background
 ----------
-Agents post insight_triggers to world/board/findings.jsonl with tags like
+Agents post insight_triggers to the board with tags like
 `requires_action_by:alpha`, `action_type:extend-filter`, `severity:constrains`
 when they notice cross-agent action items. The goal-selector reads goal
 QUEUES, not BOARD posts, so these descriptive tags sit on the board with
@@ -12,7 +12,7 @@ no consumer. Canonical case: bravo's msg-20260514-143816-bravo-1073 posted
 at 14:38 routed an action to alpha; 2h later no goal existed in any queue.
 
 This sweeper closes the gap:
-  1. Reads world/board/findings.jsonl for the last 24h.
+  1. Reads EVERY live board channel for the last 24h (see board_channels()).
   2. Filters to posts older than 1h (GRACE_HOURS) so authors who file
      their own goal-via-script first aren't pre-empted.
   3. Drops posts without `requires_action_by:<x>` AND `action_type:<y>` tags.
@@ -23,6 +23,15 @@ This sweeper closes the gap:
   5. Files an Apply goal in the world queue under asp-115 with
      `intended_agent=<x>` and `origin_signal=insight_trigger:<msg_id>`.
   6. Caps filings at MAX_GOALS_PER_RUN to bound any spam blast radius.
+
+Channel scope (g-115-3925, 2026-07-29)
+--------------------------------------
+This sweep read ONLY findings.jsonl from inception until 2026-07-29, so a
+`requires_action_by:` tag posted to any other channel was structurally
+invisible — it could never convert, at any age. Measured cost of that gap:
+msg-20260728-194530-omni-5115 (omni -> alpha, coordination, action_type:revisit)
+sat undelivered. See board_channels() for why the fix is auto-discovery rather
+than a longer constant.
 
 Modes
 -----
@@ -48,8 +57,20 @@ sys.path.insert(0, str(PROJECT_ROOT / "core" / "scripts"))
 import _rt  # noqa: E402  — canonical Python -> daemon client (post-cutover; see _rt.py)
 from _paths import WORLD_DIR, agents_root as _agents_root  # noqa: E402
 
-FINDINGS = WORLD_DIR / "board" / "findings.jsonl"
+BOARD_DIR = WORLD_DIR / "board"
 WORLD_ASPS = WORLD_DIR / "aspirations.jsonl"
+
+# Files under board/ that are NOT message channels. `<channel>-reads.jsonl` is
+# the per-channel read-tracking sidecar (rows are {msg_id, reader_agent, ...},
+# never messages); `<channel>-archive.jsonl` is a rotation of a channel this
+# sweep already scans, and every row in it is older than the rotation — i.e.
+# older than WINDOW_HOURS by construction, so reading 11MB of it per run buys
+# nothing. The `-archive.jsonl` suffix also covers the double-rotated
+# `<channel>-archive-archive.jsonl`. A channel legitimately named
+# `<x>-archive` would be excluded; none exists and the tradeoff is documented
+# here rather than guarded, because the alternative (an allowlist) is the
+# construct this whole change removes.
+CHANNEL_EXCLUDE_SUFFIXES = ("-reads.jsonl", "-archive.jsonl")
 
 # Tunables — edit in place if the cadence/window/spam-cap needs adjustment.
 # Single source of truth; no config-file indirection unless cross-agent
@@ -118,69 +139,111 @@ def _parse_ts(ts_str):
     return datetime.fromisoformat(ts_str.rstrip("Z"))
 
 
+def board_channels():
+    """Every live board channel file, sorted. Auto-discovered, not enumerated.
+
+    Discovery rather than an allowlist is deliberate. The defect this replaces
+    was a single hardcoded `FINDINGS` path: a channel the constant did not name
+    could never be swept, and nothing anywhere reported that it was being
+    skipped. An allowlist has the same failure mode one entry later — it just
+    moves the moment the next channel is forgotten. Globbing removes the class:
+    a new channel file is swept the run after it appears, with no code change.
+
+    Scanning every channel is also semantically right, not merely convenient.
+    `requires_action_by:<agent>` + `action_type:<verb>` is an explicit routing
+    request; a channel is a topic hint, not a permission boundary, so there is
+    no channel where that pair should be deliberately ignored. Untagged posts
+    cost one JSON parse and are dropped by the same filter that already drops
+    the ~97% of findings.jsonl carrying no routing tags.
+
+    Measured 2026-07-29 (alpha, cc-04), all-time counts of posts carrying BOTH
+    required tags: findings 183, coordination 5, and general / decisions /
+    reasoning / feedback 0 each. So the widening's live yield today is small —
+    the value is that the next channel cannot go unswept, not a backlog.
+    Note the goal that motivated this cited "102 of 142 inbound peer posts" on
+    coordination; that counts `requires_action_by:` ALONE. Requiring the pair
+    the sweep actually filters on drops it to 5 on the live channel.
+    """
+    if not BOARD_DIR.is_dir():
+        return []
+    return sorted(
+        p for p in BOARD_DIR.glob("*.jsonl")
+        if not p.name.endswith(CHANNEL_EXCLUDE_SUFFIXES)
+    )
+
+
 def load_triggers():
-    """Read findings.jsonl, yield candidate insight_triggers.
+    """Read every live board channel, yield candidate insight_triggers.
 
     A candidate satisfies all of:
       - message has `requires_action_by:<agent>` tag
       - message has `action_type:<verb>` tag
       - message timestamp is within WINDOW_HOURS and older than GRACE_HOURS
     """
-    _refresh(FINDINGS)  # guard-980: avoid a stale git-sync mirror of findings.jsonl
-    if not FINDINGS.is_file():
-        return []
     now = datetime.now()
     win_cutoff = now - timedelta(hours=WINDOW_HOURS)
     grace_cutoff = now - timedelta(hours=GRACE_HOURS)
     out = []
-    for line in FINDINGS.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
+    for channel_path in board_channels():
+        # guard-980: avoid a stale git-sync mirror of the channel file.
+        _refresh(channel_path)
+        if not channel_path.is_file():
             continue
-        try:
-            msg = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        try:
-            ts = _parse_ts(msg["timestamp"])
-        except (KeyError, ValueError):
-            continue
-        if ts < win_cutoff or ts > grace_cutoff:
-            continue
-        tags = msg.get("tags") or []
-        target = None
-        action = None
-        severity = "informs"
-        affects_goal = None
-        for t in tags:
-            m = REQ_ACTION_RE.match(t)
-            if m:
-                target = m.group(1).strip()
+        channel = channel_path.stem
+        for line in channel_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
                 continue
-            m = ACTION_TYPE_RE.match(t)
-            if m:
-                action = m.group(1).strip()
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
                 continue
-            m = SEVERITY_RE.match(t)
-            if m:
-                severity = m.group(1).strip()
+            try:
+                ts = _parse_ts(msg["timestamp"])
+            except (KeyError, ValueError):
                 continue
-            m = AFFECTS_RE.match(t)
-            if m:
-                affects_goal = m.group(1).strip()
-        if not target or not action:
-            continue
-        out.append({
-            "msg_id": msg.get("id"),
-            "author": msg.get("author"),
-            "target": target,
-            "action": action,
-            "severity": severity,
-            "affects_goal": affects_goal,
-            "text": msg.get("text", ""),
-            "tags": tags,
-            "timestamp": msg.get("timestamp"),
-            "age_h": round((now - ts).total_seconds() / 3600, 1),
-        })
+            if ts < win_cutoff or ts > grace_cutoff:
+                continue
+            tags = msg.get("tags") or []
+            target = None
+            action = None
+            severity = "informs"
+            affects_goal = None
+            for t in tags:
+                m = REQ_ACTION_RE.match(t)
+                if m:
+                    target = m.group(1).strip()
+                    continue
+                m = ACTION_TYPE_RE.match(t)
+                if m:
+                    action = m.group(1).strip()
+                    continue
+                m = SEVERITY_RE.match(t)
+                if m:
+                    severity = m.group(1).strip()
+                    continue
+                m = AFFECTS_RE.match(t)
+                if m:
+                    affects_goal = m.group(1).strip()
+            if not target or not action:
+                continue
+            out.append({
+                "msg_id": msg.get("id"),
+                "author": msg.get("author"),
+                # Where the trigger was READ from, not msg["channel"] — the
+                # board pointer in the filed goal must name the file a reader
+                # can open. A row's self-reported channel can disagree with
+                # the file holding it (rotation, hand-edits), and the pointer
+                # is only useful if it resolves.
+                "channel": channel,
+                "target": target,
+                "action": action,
+                "severity": severity,
+                "affects_goal": affects_goal,
+                "text": msg.get("text", ""),
+                "tags": tags,
+                "timestamp": msg.get("timestamp"),
+                "age_h": round((now - ts).total_seconds() / 3600, 1),
+            })
     return out
 
 
@@ -315,11 +378,11 @@ def _build_goal_payload(trigger):
         trigger["text"],
         "",
         f"Tags: {', '.join(trigger['tags'])}",
-        f"Board pointer: world/board/findings.jsonl ({trigger['msg_id']})",
+        f"Board pointer: world/board/{trigger['channel']}.jsonl ({trigger['msg_id']})",
         "",
         "Filed automatically by core/scripts/insight-trigger-sweep.py — closes",
-        "the routing gap where findings-channel action items did not reach",
-        "the goal queue (canonical incident: msg-20260514-143816-bravo-1073).",
+        "the routing gap where board action items did not reach the goal queue",
+        "(canonical incident: msg-20260514-143816-bravo-1073).",
     ]
     return {
         "title": title,
@@ -454,6 +517,10 @@ def main():
         "mode": "dry-run" if dry_run else "sweep",
         "window_hours": WINDOW_HOURS,
         "grace_hours": GRACE_HOURS,
+        # : report the channels actually read. A silently-narrow
+        # scan is the exact defect this replaces, so the scope must be
+        # visible in the output rather than inferable from the source.
+        "channels_scanned": [p.stem for p in board_channels()],
         "scanned": len(triggers),
         "skipped_already_converted": len(skipped),
         "audit_stale": len(audit_stale),
@@ -483,7 +550,9 @@ def main():
         print(json.dumps(summary, indent=2))
     else:
         # Human-readable
-        print(f"[insight-trigger-sweep] mode={summary['mode']} scanned={summary['scanned']} "
+        print(f"[insight-trigger-sweep] mode={summary['mode']} "
+              f"channels={','.join(summary['channels_scanned']) or 'none'} "
+              f"scanned={summary['scanned']} "
               f"skipped={summary['skipped_already_converted']} filed={summary['filed']} "
               f"audit_stale={summary['audit_stale']} affects_missing={summary['affects_missing']} "
               f"overflow={summary['overflow']}")

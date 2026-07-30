@@ -211,7 +211,7 @@ def main() -> int:
     cases_run += 1
     items_high = _make_synthetic_items()
     items_high[0]["goals"].append({
-        "id": "",  # highest existing seq
+        "id": "g-001-42",  # highest existing seq
         "title": "Some unrelated goal",
         "status": "completed",
         "type": "idea",

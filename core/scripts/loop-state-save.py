@@ -216,13 +216,75 @@ def cmd_init(args) -> int:
     return 0
 
 
+def _warn_checkpoint_missing(path, args) -> None:
+    """Surface a write against an absent checkpoint. NEVER raises, never blocks.
+
+    Two channels, deliberately, per guard-772: a stderr banner is invisible when
+    the caller runs inside a backgrounded subprocess -- which is how much of the
+    loop executes -- so the durable JSONL half is what makes the miss auditable
+    after the fact. Single-line JSON under PIPE_BUF in O_APPEND mode is
+    single-write atomic; this is observability-grade, not durable-state-grade.
+    """
+    # Hoisted out of the try below: the two channels are independent, and a
+    # stderr failure must not blind the durable one via NameError.
+    keys = []
+    try:
+        keys = [p.split("=", 1)[0] for p in (getattr(args, "set", None) or []) if "=" in p]
+    except Exception:
+        pass
+    try:
+        print(
+            "[loop-state-save] WARN: update against a MISSING iteration-checkpoint "
+            "(%s) -- wrote nothing, returning 0 for fail-open. Attempted key(s): %s. "
+            "Cause is almost always a skipped Phase 2.95 (aspirations-select creates "
+            "the checkpoint; only iteration-close deletes it), which leaves it absent "
+            "for the REST of the session and silently degrades every downstream "
+            "reader. Re-anchor with: loop-state-save.sh init (g-115-3454)."
+            % (path, ", ".join(keys) or "<none>"),
+            file=sys.stderr,
+        )
+    except Exception:
+        pass
+    try:
+        from datetime import datetime
+        ledger = Path(path).parent / "checkpoint-miss.jsonl"
+        rec = {
+            "at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            "agent": os.environ.get("MIND_AGENT", "unknown"),
+            "event": "update_against_missing_checkpoint",
+            "checkpoint_path": str(path),
+            "attempted_keys": keys,
+        }
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        with open(ledger, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=True) + "\n")
+    except Exception:
+        pass  # the ledger must never be the outage
+
+
 def cmd_update(args) -> int:
     """Merge-update one or more fields on the existing checkpoint. If the
     checkpoint doesn't exist, exit 0 (treat as no-op — caller may be running
-    outside an iteration). Unknown keys → stderr WARN + non-zero exit."""
+    outside an iteration) but SURFACE the miss on stderr + a durable ledger.
+    Unknown keys → stderr WARN + non-zero exit."""
     path = _checkpoint_path()
     if not path.exists():
-        # Match _checkpoint_refresh fail-open semantics: missing file is fine.
+        # Fail-open on the EXIT CODE is deliberate and must stay: the six
+        # iteration-close.sh call sites treat a nonzero rc as an iteration
+        # failure, and a caller genuinely outside an iteration is a legitimate
+        # no-op. But exit-0 is not a licence to be SILENT.
+        #
+        # : checkpoint CREATION is LLM-discretionary pseudocode
+        # (.claude/skills/aspirations-select/SKILL.md Phase 2.95 -- the only
+        # init call site in the repo) while its DELETION is bash-enforced
+        # (iteration-close.sh do_productivity_check `rm -f`). So a skipped
+        # Phase 2.95 removes the file for the REST of the session, and this
+        # branch then reported success to every writer while persisting
+        # nothing -- degrading ~13 downstream readers invisibly. Reproduced
+        # live 2026-07-28: an iteration that selected via goal-selector.sh
+        # without invoking Skill(aspirations-select) ran with no checkpoint,
+        # and this call returned rc=0.
+        _warn_checkpoint_missing(path, args)
         return 0
 
     if args.set:

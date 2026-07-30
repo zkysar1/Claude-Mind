@@ -963,7 +963,34 @@ def cmd_check(args, cfg):
             continue
         refs_for_hash.append(ref)
         exp = ref.get("expires_at")
-        if exp:
+        if not exp:
+            # ABSENT is not "not yet expired" (). A missing
+            # expires_at is NO liveness evidence at all, so treating it as
+            # unexpired lets a ref gate the queue indefinitely with no TTL
+            # that can ever break it — precisely the narrative-laundering the
+            # blocker_ref requirement exists to prevent, reachable by omitting
+            # a field the schema calls automatic. This gate SUPPRESSES loop
+            # work (it approves sleep), so guard-487 governs: a suppression
+            # gate fails CLOSED when its input cannot establish the fact it
+            # needs. That is already this block's posture for an UNPARSEABLE
+            # value below — absence was the one case that slipped through, not
+            # a deliberate exemption.
+            #
+            # Auto-population lives in gates/blocker_ref.validate(), which is
+            # reached ONLY via the --blocker-ref flag paired with a
+            # defer_reason / status=blocked write. A DIRECT `update-goal <id>
+            # blocker_ref '<json>'` field write lands verbatim at
+            # aspirations.py:1905 with no validation and no TTL. Measured
+            # 2026-07-27: 7 of 11 live blocked goals carried a ref with no
+            # expires_at. Disqualifying here is the READ-side backstop; the
+            # write-side normalization is tracked separately.
+            expired_ref.append({
+                "goal_id": e.get("goal_id"),
+                "external_id": ref.get("external_id"),
+                "expired_at": None,
+                "missing_expires_at": True,
+            })
+        else:
             try:
                 if datetime.fromisoformat(str(exp)) <= now:
                     expired_ref.append({
@@ -985,9 +1012,23 @@ def cmd_check(args, cfg):
             "sample_goal_ids": missing_ref[:5],
         })
     if expired_ref:
+        # Report the two disqualifying shapes separately — "in the past" would
+        # misdescribe a ref that has no expires_at at all, and the reader's next
+        # action differs (a past TTL means re-probe the blocker; an absent one
+        # means the ref was written through the unvalidated field path and needs
+        # normalizing). .
+        n_missing = sum(1 for r in expired_ref if r.get("missing_expires_at"))
+        n_past = len(expired_ref) - n_missing
+        parts = []
+        if n_past:
+            parts.append(f"{n_past} with expires_at in the past")
+        if n_missing:
+            parts.append(f"{n_missing} with NO expires_at (absent != unexpired)")
         reasons.append({
             "condition": "C3_blocker_ref_future_expiry",
-            "detail": f"{len(expired_ref)} blocker_ref(s) have expires_at in the past",
+            "detail": f"{len(expired_ref)} blocker_ref(s) disqualify: " + ", ".join(parts),
+            "missing_expires_at_count": n_missing,
+            "past_expiry_count": n_past,
             "sample": expired_ref[:5],
         })
 
