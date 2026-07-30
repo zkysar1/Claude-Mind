@@ -464,6 +464,7 @@ def main() -> int:
     scanned = len(candidates)
     eligible, applied, results = 0, 0, []
     skipped_deliberate = skipped_cooldown = skipped_young = 0
+    skipped_uncomputable = 0
     batch = []  # eligible goals, delivered as ONE digest (see below)
 
     for cand in candidates:
@@ -479,7 +480,29 @@ def main() -> int:
                             "reason": "deliberate_user_routing",
                             "age_hours": age})
             continue
-        if age is None or age < escalate_hours:
+        if age is None:
+            # AN UNCOMPUTABLE AGE IS NOT A YOUNG ONE. Folding it into
+            # below_threshold is the single most misleading label available: a
+            # reader scanning the output sees "too new to escalate yet" and moves
+            # on, while the goal is structurally incapable of EVER reaching the
+            # threshold — it carries no parseable timestamp in any of the four
+            # fields _goal_age_hours tries, so its age is not small, it is
+            # undefined. Skipping is still correct (guard-420: no datetime
+            # arithmetic on a null; fail-open), but the skip must be NAMED.
+            # Measured 2026-07-30 (): 16 of 796 open world goals carry
+            # no created_at — 3 HIGH, one of them the unblocking goal for a live
+            # outage — and this branch reported every one of them as fine.
+            # guard-1986: a not-checkable case folded into a substantive verdict
+            # is an all-clear whose cleanliness has nothing to do with the data.
+            skipped_uncomputable += 1
+            results.append({"goal_id": gid, "action": "skip",
+                            "reason": "age_uncomputable",
+                            "detail": "no parseable blocked_since / blocked_at / "
+                                      "created_at / created — age is undefined, "
+                                      "so this goal can never age into escalation",
+                            "age_hours": None})
+            continue
+        if age < escalate_hours:
             skipped_young += 1
             results.append({"goal_id": gid, "action": "skip",
                             "reason": "below_threshold", "age_hours": age})
@@ -543,9 +566,20 @@ def main() -> int:
         "applied": applied,
         "skipped": {"deliberate": skipped_deliberate,
                     "cooldown": skipped_cooldown,
-                    "below_threshold": skipped_young},
+                    "below_threshold": skipped_young,
+                    "age_uncomputable": skipped_uncomputable},
         "results": results,
     }, indent=2))
+    # A count buried in a JSON blob is still a silent skip — this lane exists
+    # because a goal that cannot reach the user is invisible until someone
+    # looks. Say it on stderr, where the precheck operator actually reads.
+    if skipped_uncomputable:
+        sys.stderr.write(
+            "user-blocker-escalation: %d goal(s) have an UNCOMPUTABLE age (no "
+            "parseable timestamp) and can never age into escalation — %s\n"
+            % (skipped_uncomputable,
+               ", ".join(r["goal_id"] for r in results
+                         if r.get("reason") == "age_uncomputable")))
     return 0
 
 

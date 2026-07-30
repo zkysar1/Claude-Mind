@@ -1095,7 +1095,24 @@ def cmd_temp_pressure(args, config, compact):
     EPHEMERA_SUFFIXES = (".log", ".txt", ".py", ".sh", ".err")
     count = 0
     ephemera_count = 0
+    # : THIRD class. The two classes above are extension ALLOWLISTS, so
+    # every other suffix in temp/ root was invisible to this metric — not counted,
+    # not reported, no hint it existed. Measured on a downstream deployment
+    # 2026-07-30: temp/ root held 26 files and this function returned 7 (a 3.7x
+    # undercount); the missing 19 were 6 .pdf, 4 .yaml, 4 .docx, 2 .jsonl, 1 .ps1,
+    # 1 extensionless. Reported separately and deliberately NOT folded into
+    # pressure_count: these files are not drain-drainable and not purgeable, so
+    # counting them toward the drain threshold would fire drain goals that cannot
+    # drain them. Visibility is the fix; changing threshold semantics is not.
+    unclassified_count = 0
+    # WHY NOT rglob (): the originating goal's verification proposed
+    # reconciling against "an independent rglob enumeration". That is the WRONG
+    # denominator and would be a regression — rglob picks up drained/ (195 files
+    # at measure time), and a drained file is by definition NOT undrained
+    # pressure. iterdir over temp/ ROOT is correct; the undercount was never a
+    # traversal-depth bug, it was the extension allowlist above.
     temp_dir = (AGENT_DIR / "temp") if AGENT_DIR is not None else None
+    ephemera_files = []
     if temp_dir is not None and temp_dir.is_dir():
         for f in temp_dir.iterdir():
             if not f.is_file():
@@ -1104,6 +1121,48 @@ def cmd_temp_pressure(args, config, compact):
                 count += 1
             elif f.suffix in EPHEMERA_SUFFIXES:
                 ephemera_count += 1
+                ephemera_files.append(f)
+            else:
+                unclassified_count += 1
+
+    #  / guard-273: a purge suggestion must never count a git-TRACKED
+    # file. Extension alone cannot tell a business record from scratch, and the
+    # ephemera classes include .txt/.py/.sh — all plausible tracked deliverables.
+    #
+    # SCOPED HONESTLY: at measure time ZERO ephemera-classified files were
+    # tracked, so this defect was LATENT, not realised. The originating goal
+    # claimed the emitted text "proposes destroying deliverables" and cited two
+    # .pdf files as evidence; .pdf is not in EPHEMERA_SUFFIXES, so those could
+    # never have entered a purge count. That specific claim does not hold. The
+    # general risk does: `.gitignore` now ignores ALL of agents/*/temp/*
+    # (), but it does not UNTRACK what was tracked before that rule,
+    # and legacy-tracked files remained under temp/. So tracked files DO live
+    # here, and one rename away from a .txt is a purge that names a deliverable.
+    # This check makes that structurally impossible.
+    #
+    # FAILS OPEN: any git error leaves the counts untouched. A precheck advisory
+    # must never break the loop over an unavailable git.
+    ephemera_tracked_excluded = 0
+    if ephemera_files:
+        try:
+            import subprocess as _sp
+            _r = _sp.run(["git", "ls-files", "-z", "--", str(temp_dir)],
+                         capture_output=True, text=True, timeout=15,
+                         cwd=str(PROJECT_ROOT))
+            if _r.returncode == 0:
+                _tracked = {p.replace("\\", "/") for p in _r.stdout.split("\0") if p}
+                for f in ephemera_files:
+                    try:
+                        _rel = f.relative_to(PROJECT_ROOT).as_posix()
+                    except ValueError:
+                        continue
+                    if _rel in _tracked:
+                        ephemera_count -= 1
+                        unclassified_count += 1
+                        ephemera_tracked_excluded += 1
+        except Exception:
+            pass  # fail open — see comment above
+
     pressure_count = count + ephemera_count
 
     # Dedup: if a drain-temp ACTION goal is already open, do NOT re-suggest filing —
@@ -1191,10 +1250,21 @@ def cmd_temp_pressure(args, config, compact):
     elif pressure_count >= warn_threshold:
         flags.append("temp_pressure_warn")
 
-    if pressure_count:
+    # : surface unclassified in the SUMMARY, not just the JSON body. The
+    # summary is what the precheck prints every iteration and therefore the only
+    # part a reader reliably sees; a count that exists only in the JSON is the
+    # same invisibility this fix exists to remove. Named "not-drainable" rather
+    # than a bare number so it cannot be misread as additional drain pressure.
+    if pressure_count or unclassified_count:
         _breakdown = f"{count} undrained doc(s)"
         if ephemera_count:
             _breakdown += f" + {ephemera_count} ephemera(.log/.txt/.py/.sh/.err)"
+        if unclassified_count:
+            _breakdown += (f" + {unclassified_count} not-drainable"
+                           "(other suffixes, excluded from thresholds)")
+        if ephemera_tracked_excluded:
+            _breakdown += (f" [{ephemera_tracked_excluded} git-tracked file(s) "
+                           "reclassified out of purge scope]")
         summary = (
             f"temp-pressure: {_breakdown} "
             f"(warn>={warn_threshold}, drain>={drain_threshold}"
@@ -1209,6 +1279,9 @@ def cmd_temp_pressure(args, config, compact):
         "count": count,
         "ephemera_count": ephemera_count,
         "pressure_count": pressure_count,
+        "unclassified_count": unclassified_count,
+        "ephemera_tracked_excluded": ephemera_tracked_excluded,
+        "temp_root_total": count + ephemera_count + unclassified_count,
         "existing_drain_goal": existing,
         "thresholds": {"warn_threshold": warn_threshold,
                        "drain_goal_threshold": drain_threshold},

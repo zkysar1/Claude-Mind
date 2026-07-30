@@ -182,3 +182,52 @@ def test_utility_ratio_fields_parity():
         "utility-ratio field-set drift: CLI _UTILITY_RATIO_FIELDS "
         f"{cli_fields} != daemon {daemon_fields}. " + _RESYNC
     )
+
+
+# --- E. distill detector: DELEGATION, not a mirror ---------------------------
+# Pairs A-D above are FIELD-SET checks, and that is exactly why this one is
+# shaped differently. tree_write._get_distill_candidates was a hand-maintained
+# mirror of the whole DETECTOR ALGORITHM, and it drifted four fixes behind while
+# every field-set test above stayed green: crit3 ( oversized read-cap)
+# absent, interior nodes skipped by an early `continue` (/rb-4648), the
+#  sparse-feedback + stale-signal bars missing, and
+# `maintain_exempt: distill` (/guard-896) unhonoured. None of those is
+# a field, so none was visible to a field-set comparison. Measured cost (foxtrot,
+# 2026-07-30, cc-04/Linux, one 1297-node tree, one process): daemon 809 vs CLI
+# 566 — a ~40% disagreement between the WRITE path (which feeds post_run_debt and
+# gates backlog-mode escalation fleet-wide) and the READ path (`tree-read.sh
+# --distill-candidates`, which tree_read.py lists as NOT daemon-served and so
+# falls through to the CLI).
+#
+#  fixed it by DELEGATION rather than by re-syncing the copy: the two
+# ctx-dependent seams (config dir, node-.md resolver) are injected into the CLI
+# function. So the invariant worth pinning is not "the field-sets match" but
+# "there is no second implementation to drift" — assert the daemon function's
+# body still delegates. A re-fork fails here immediately instead of surfacing
+# months later as a debt figure nobody can reconcile.
+def test_distill_candidates_daemon_delegates_to_cli():
+    fn = _func(_module(DAEMON_TREE_WRITE), "_get_distill_candidates")
+    calls = [n.func.id for n in ast.walk(fn)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+    assert "_cli_get_distill_candidates" in calls, (
+        "tree_write._get_distill_candidates no longer delegates to the CLI "
+        "detector (core/scripts/tree.py::get_distill_candidates). It was "
+        "re-forked into a second implementation, which is the exact drift that "
+        "made the daemon report 809 distill candidates while the CLI reported "
+        "566 on the same tree (g-115-4062). If the daemon needs caller-specific "
+        "behaviour, add a keyword-only seam to the CLI function and inject it "
+        "here — do not re-implement the detector. " + _RESYNC
+    )
+    # The delegation must pass BOTH ctx seams. Dropping either silently
+    # re-points the daemon at the CLI module's own PROJECT_ROOT / WORLD_DIR
+    # globals, which are wrong for a daemon serving a non-bound agent — a
+    # tenant-correctness bug that no count comparison on THIS box would reveal.
+    kwargs = {kw.arg for n in ast.walk(fn) if isinstance(n, ast.Call)
+              for kw in n.keywords if kw.arg}
+    for seam in ("config_dir", "resolve_path"):
+        assert seam in kwargs, (
+            f"delegation drops the {seam!r} seam: the daemon must resolve this "
+            "through its per-request ctx, not the CLI module globals. "
+            "A daemon serving a project root other than the CLI module's would "
+            "read the wrong path with no local symptom. " + _RESYNC
+        )

@@ -782,6 +782,42 @@ files:
     required_when_idle: false
     required_when_running: false
 
+  # ── Orphan registered 2026-07-23 () ───────────────────────
+  # RE-REGISTERED 2026-07-30 () after a downstream deployment found this
+  # entry had been deleted by a mirror-not-reconcile framework sync — the same
+  # sync that reverted a .gitignore temp-durability inversion. Back-ported UP so
+  # the registration lives at the frontier and stops being re-lost on each hop.
+  #
+  # LLM-staged notify body surfaced as a desync orphan (Boot Phase -1.5
+  # advisory 2026-07-20). No scripted writer: the /stop graceful-stop flow
+  # has the LLM compose the session-end summary and pass it to the domain
+  # notification skill via --message-file; the filename is a deployment
+  # convention. Consumed once (sent), regenerated each /stop -> ephemeral + clear.
+  - file: session-end-notify-body.md
+    purpose: LLM-staged notification body for the /stop session-end summary (passed to the domain notification skill via --message-file at graceful-stop, then consumed; regenerated each /stop). A one-shot notification artifact, not session state — safe to drop on recovery.
+    writer: LLM (graceful-stop session-end notification staging; no scripted writer)
+    recovery_action: clear
+    sync_tier: ephemeral
+    required_when_idle: false
+    required_when_running: false
+
+  # ── Orphan registered 2026-07-30 () ────────────────────────
+  # Surfaced by session-desync-check.sh while verifying the manifest edit above:
+  # unregistered AND signal-shaped (no data extension), so the own-cloud sweep was
+  # keeping it machine-local WITHOUT confirmation that machine-local is correct.
+  # It is: sweep-mutation-surface.py stores a per-agent high-water timestamp so
+  # already-surfaced mutations do not re-announce forever. Losing it is harmless —
+  # _read_watermark falls back to the window default and mutations re-surface once —
+  # so it carries no knowledge and must NOT be promoted to sync_tier=continuity.
+  # preserve (not clear) because clearing it buys a duplicate board announce.
+  - file: sweep-surface-watermark
+    purpose: per-agent high-water timestamp for sweep-mutation-surface.py, so already-surfaced mutations are not re-announced on every run. Progress marker, not knowledge; on loss _read_watermark falls back to the --window-hours default and mutations re-surface once.
+    writer: sweep-mutation-surface.py (read by its own _read_watermark)
+    recovery_action: preserve
+    sync_tier: machine_local
+    required_when_idle: false
+    required_when_running: false
+
 # ── Desync invariants ───────────────────────────────────────────────
 # Rules checked by session-desync-check.sh. Violations are logged advisory
 # to <agent>/session/desync-warnings.jsonl but do NOT auto-fix.

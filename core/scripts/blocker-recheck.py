@@ -47,6 +47,64 @@ HUMAN_ONLY_BLOCKER_TYPES = {
     "user_action",
 }
 
+# Blockers whose lifecycle is owned by the PRODUCER that emits them, not by
+# this recheck. These are auto-generated from a live probe signal and are
+# re-derived from scratch on every producer sync, so the producer already
+# clears them the moment the underlying condition recovers
+# (infra-health.py::_sync_known_blockers: "Removes any pre-existing streak-*
+# entries before re-adding — single sync pass = idempotent. Recovery is
+# automatic"). This script clearing them is therefore never NEEDED, and is
+# actively harmful when the condition is still live.
+#
+# The deeper reason is a category error, not a tuning problem. The capability
+# recheck asks "was an agent-provisionable capability OVERLOOKED at blocker
+# creation time?" — a question about a decision CREATE_BLOCKER's Step 2.5 made.
+# A producer-emitted blocker never went through CREATE_BLOCKER at all, so there
+# is no creation-time capability decision to have been wrong. That is why the
+# false Investigate this path filed () asked why Step 2.5 "missed"
+# a capability that was never applicable: the question is unanswerable because
+# it presupposes a step that never ran.
+#
+# These blockers also evade BOTH existing structural filters, which is why a
+# third is needed rather than an entry in one of them: they carry no `type`
+# (so the HUMAN_ONLY_BLOCKER_TYPES test above sees None) and no `participants`
+# (so the is_user_routed test below treats them as user-routed by the legacy
+# allowance). Measured 2026-07-30 on the live streak-roblox-studio blocker:
+# match_count=10, top_match=access-roblox-studio, matched_keyword='connect' —
+# cleared for real at 14:23:26 while the canonical probe reported
+# doctor_verdict=relay-dead with 28 consecutive failures. Owning the
+# access-roblox-studio skill does not repair a black-holed localhost relay.
+#
+# Cost of a wrong clear is asymmetric and is what makes this fail-closed:
+# `resolution` is set on known_blockers, and BOTH the Phase 0.5b re-probe loop
+# AND the proactive-escalation path iterate known_blockers — so a live outage
+# goes invisible to each, plus a false Investigate is filed. Cost of a wrong
+# NON-clear is nil: the producer re-derives and drops the entry on recovery.
+PRODUCER_MANAGED_SOURCE_PREFIXES = ("infra-health.",)
+
+
+def _is_producer_managed(b) -> bool:
+    """True when a blocker's lifecycle is owned by its emitting producer.
+
+    Two independent signals, OR-ed, because they are written at the same
+    construction site and either alone is sufficient identification:
+      - `source` (e.g. "infra-health.streak-alert") names the producer;
+      - `blocker_id` prefix "streak-" is what infra-health's own `_is_streak`
+        predicate keys on when it re-derives the entries.
+
+    Both tests are isinstance-guarded before `.startswith`. A bare-string or
+    non-dict record must return False rather than raise — the same read-side
+    discipline `blocker_ref` handling requires, where a naive `.get` on a
+    string raises AttributeError and a bare try/except reads it as absent.
+    """
+    if not isinstance(b, dict):
+        return False
+    src = b.get("source")
+    if isinstance(src, str) and src.startswith(PRODUCER_MANAGED_SOURCE_PREFIXES):
+        return True
+    bid = b.get("blocker_id")
+    return isinstance(bid, str) and bid.startswith("streak-")
+
 
 def _run(argv, input_text=None) -> tuple:
     """Run a subprocess. Return (returncode, stdout, stderr)."""
@@ -237,8 +295,22 @@ def _add_investigate_goal(aspiration_id: str, blocker: dict, gate_result: dict) 
     # aspirations.py add-goal CLI was deleted in the 2026-05-14 cutover;
     # _rt.aspirations_add_goal is the canonical Python -> daemon replacement.
     # Daemon-only: no CLI fallback.
+    # source RESOLVED from where the aspiration actually lives, not hardcoded
+    # "world" ( sweep). In a deployment whose framework-hygiene home is
+    #  that id lives in the AGENT queue — filing it with source="world"
+    # reproduces aspiration_not_found in a new costume: the id is right, the store
+    # is wrong. This is the exact trap _escalation_target.source_flag exists to
+    # close, and the old help text's claim that the target "must exist in
+    # world/aspirations.jsonl (not an agent-local queue)" is what made hardcoding
+    # it look safe.
     try:
-        result = _rt.aspirations_add_goal(aspiration_id, goal_record, source="world")
+        from _paths import WORLD_DIR as _WD2, AGENT_DIR as _AD2  # type: ignore
+        from _escalation_target import source_flag as _asp_source
+        _src = _asp_source(aspiration_id, _WD2, _AD2)
+    except Exception:
+        _src = "world"          # pre-fix behaviour; never worse than before
+    try:
+        result = _rt.aspirations_add_goal(aspiration_id, goal_record, source=_src)
     except _rt.RtError as e:
         return f"<add-goal-failed:{(e.body or str(e)).strip() or 'no detail'}>"
     goal_id = result.get("goal_id") or result.get("id")
@@ -253,10 +325,35 @@ def main(argv=None):
                     help="Blockers older than this are rechecked. Default 4h.")
     ap.add_argument("--apply", action="store_true",
                     help="Actually clear blockers + create Investigate goals. Default: dry-run.")
-    ap.add_argument("--investigate-aspiration", default="asp-115",
-                    help="World-level aspiration ID to add Investigate goals under. "
-                         "Default: asp-115 (Recurring Infrastructure Monitoring). "
-                         "Must exist in world/aspirations.jsonl (not an agent-local queue).")
+    # Default RESOLVED, not hardcoded ( sweep). This was
+    # default="", the third instance of the same defect fixed in
+    # cadence-stale-canary and stale-sentinel-canary:  is THIS
+    # deployment's framework queue and exists in neither queue downstream, so
+    # every Investigate filed there died aspiration_not_found. Found by sweeping
+    # for siblings of the original bug rather than waiting for this one to
+    # surface on its own.
+    # NOTE the old help text asserted "Must exist in world/aspirations.jsonl (not
+    # an agent-local queue)" — that assumption is what made the hardcode look
+    # safe, and it is wrong in deployments whose framework-hygiene home IS the
+    # agent queue. The resolver returns the matching source.
+    # WORLD_DIR / AGENT_DIR are NOT module globals here (this script only defines
+    # SCRIPT_DIR / CORE_ROOT / PROJECT_ROOT and reaches state via the daemon
+    # client), so import them explicitly. The first version of this fix referenced
+    # them bare, raised NameError, and the except-branch silently returned
+    # "" — a non-fix that passed syntax, ran without error, and reproduced
+    # the exact bug. Caught only by checking what the default RESOLVED to instead
+    # of trusting "no crash". A fail-open around a name error will hide a
+    # non-functioning fix every time.
+    try:
+        from _paths import WORLD_DIR as _WD, AGENT_DIR as _AD  # type: ignore
+        from _escalation_target import resolve as _resolve_asp
+        _default_asp, _asp_via = _resolve_asp(CORE_ROOT, _WD, _AD)
+    except Exception as _exc:
+        _default_asp, _asp_via = "asp-115", f"fallback:{type(_exc).__name__}"
+    ap.add_argument("--investigate-aspiration", default=_default_asp,
+                    help="Aspiration ID to add Investigate goals under. Default is "
+                         f"RESOLVED to one that exists: {_default_asp} ({_asp_via}). "
+                         "Override via stale_cadence.escalation_aspiration or this flag.")
     args = ap.parse_args(argv)
 
     blockers = _wm_read_blockers()
@@ -267,6 +364,10 @@ def main(argv=None):
         "rechecked": 0,
         "matches_found": 0,
         "cleared": 0,
+        # Always present, including when 0 — a counter that appears only when
+        # non-zero gives consumers an unstable shape and makes "the exemption
+        # never fired" indistinguishable from "this build has no exemption".
+        "producer_managed_exempt": 0,
         "investigate_goals_created": [],
         "actions_taken": "dry-run" if not args.apply else "apply",
         "details": [],
@@ -287,6 +388,14 @@ def main(argv=None):
         # correct path for these is to surface them via pending-question
         # re-raise, not to clear them programmatically.
         if b.get("type") in HUMAN_ONLY_BLOCKER_TYPES:
+            updated.append(b)
+            continue
+        # Producer-managed blockers NEVER auto-clear here — see
+        # PRODUCER_MANAGED_SOURCE_PREFIXES. Counted, not silent: a sweep that
+        # skips work without saying so reads as "nothing matched", which is the
+        # same output a genuinely clean run produces.
+        if _is_producer_managed(b):
+            report["producer_managed_exempt"] = report.get("producer_managed_exempt", 0) + 1
             updated.append(b)
             continue
         participants = b.get("participants") or []

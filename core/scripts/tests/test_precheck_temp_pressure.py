@@ -365,5 +365,129 @@ def test_temp_pressure_scratch_scripts_not_conflated_with_docs(tmp_path, monkeyp
     assert r["pressure_count"] == 5
 
 
+# ---------------------------------------------------------------------------
+# : the third file class + the purge-scope git cross-check.
+#
+# WHY THESE EXIST: the two classes above are extension ALLOWLISTS, so every
+# other suffix in temp/ root was counted by nothing and reported by nothing.
+# Measured on a live agent: 26 files in temp/ root, metric returned 7 (3.7x).
+# The fix reports the remainder as `unclassified_count` and pins the total via
+# `temp_root_total`, WITHOUT feeding pressure_count — those files are neither
+# drainable nor purgeable, so counting them toward the drain threshold would
+# fire drain goals that cannot drain anything. test_pressure_count_excludes_
+# unclassified is the guard for that specific decision.
+# ---------------------------------------------------------------------------
+
+
+def test_unclassified_counts_non_allowlisted_suffixes(tmp_path, monkeypatch):
+    temp = tmp_path / "temp"
+    temp.mkdir(parents=True)
+    (temp / "a.md").write_text("doc", encoding="utf-8")       # counted: doc
+    (temp / "b.log").write_text("x", encoding="utf-8")        # counted: ephemera
+    for name in ("vol2.pdf", "brief.docx", "cfg.yaml", "led.jsonl", "s.ps1", "r.tsv", "NOEXT"):
+        (temp / name).write_text("x", encoding="utf-8")       # counted: unclassified
+    monkeypatch.setattr(pe, "AGENT_DIR", tmp_path)
+    r = pe.cmd_temp_pressure(_Args(), CONFIG, _compact())
+    assert r["count"] == 1
+    assert r["ephemera_count"] == 1
+    assert r["unclassified_count"] == 7
+    # temp_root_total must reconcile with an independent enumeration of temp/ ROOT
+    assert r["temp_root_total"] == len([f for f in temp.iterdir() if f.is_file()]) == 9
+
+
+def test_pressure_count_excludes_unclassified(tmp_path, monkeypatch):
+    """Unclassified files must NOT move the drain threshold: they are neither
+    drainable nor purgeable, so a drain goal fired by them could not act."""
+    temp = tmp_path / "temp"
+    temp.mkdir(parents=True)
+    for i in range(40):                        # far past drain_goal_threshold=20
+        (temp / f"deliverable-{i:02d}.pdf").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(pe, "AGENT_DIR", tmp_path)
+    r = pe.cmd_temp_pressure(_Args(), CONFIG, _compact())
+    assert r["unclassified_count"] == 40
+    assert r["pressure_count"] == 0
+    assert r["flags"] == []                    # no warn, no drain_needed
+    assert r["suggested_goal"] is None
+
+
+def test_unclassified_surfaces_in_summary(tmp_path, monkeypatch):
+    """A count that lives only in the JSON body is the same invisibility this
+    fix removes — the summary is what the precheck actually prints."""
+    temp = tmp_path / "temp"
+    temp.mkdir(parents=True)
+    (temp / "vol2.pdf").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(pe, "AGENT_DIR", tmp_path)
+    r = pe.cmd_temp_pressure(_Args(), CONFIG, _compact())
+    assert "not-drainable" in r["summary"]
+    assert r["summary"] != "temp-pressure: clean"
+
+
+def _git(cwd, *args):
+    import subprocess
+    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
+
+
+def _seed_git_repo(tmp_path):
+    """A real repo so the cross-check exercises real `git ls-files` output."""
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.email", "t@t")
+    _git(tmp_path, "config", "user.name", "t")
+
+
+def test_tracked_ephemera_excluded_from_purge_scope(tmp_path, monkeypatch):
+    """POSITIVE CONTROL for the git cross-check: extension alone cannot tell a
+    business record from scratch, so a TRACKED .txt/.py must leave purge scope."""
+    agent = tmp_path / "agents" / "agent-a"
+    temp = agent / "temp"
+    temp.mkdir(parents=True)
+    _seed_git_repo(tmp_path)
+    (temp / "deliverable-notes.txt").write_text("tracked record", encoding="utf-8")
+    (temp / "build-helper.py").write_text("tracked script", encoding="utf-8")
+    (temp / "scratch.log").write_text("real scratch", encoding="utf-8")
+    _git(tmp_path, "add", "-f", "agents/agent-a/temp/deliverable-notes.txt",
+         "agents/agent-a/temp/build-helper.py")
+    _git(tmp_path, "commit", "-qm", "seed")
+    monkeypatch.setattr(pe, "AGENT_DIR", agent)
+    monkeypatch.setattr(pe, "PROJECT_ROOT", tmp_path)
+    r = pe.cmd_temp_pressure(_Args(), CONFIG, _compact())
+    assert r["ephemera_tracked_excluded"] == 2
+    assert r["ephemera_count"] == 1            # only the untracked .log stays purgeable
+    assert r["unclassified_count"] == 2        # reclassified, NOT dropped
+    assert r["temp_root_total"] == 3           # conservation
+
+
+def test_untracked_ephemera_stays_in_purge_scope(tmp_path, monkeypatch):
+    """NEGATIVE CONTROL: same tree, nothing tracked -> the check must stay
+    silent. Without this, a broken cross-check that excluded everything would
+    still pass the positive control above."""
+    agent = tmp_path / "agents" / "agent-a"
+    temp = agent / "temp"
+    temp.mkdir(parents=True)
+    _seed_git_repo(tmp_path)
+    for name in ("deliverable-notes.txt", "build-helper.py", "scratch.log"):
+        (temp / name).write_text("x", encoding="utf-8")
+    monkeypatch.setattr(pe, "AGENT_DIR", agent)
+    monkeypatch.setattr(pe, "PROJECT_ROOT", tmp_path)
+    r = pe.cmd_temp_pressure(_Args(), CONFIG, _compact())
+    assert r["ephemera_tracked_excluded"] == 0
+    assert r["ephemera_count"] == 3
+    assert r["unclassified_count"] == 0
+
+
+def test_git_cross_check_fails_open(tmp_path, monkeypatch):
+    """No repo at PROJECT_ROOT -> `git ls-files` fails. A precheck advisory must
+    never break the loop over unavailable git, so counts stay untouched."""
+    agent = tmp_path / "agents" / "agent-a"
+    temp = agent / "temp"
+    temp.mkdir(parents=True)
+    (temp / "scratch.log").write_text("x", encoding="utf-8")
+    (temp / "notes.txt").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(pe, "AGENT_DIR", agent)
+    monkeypatch.setattr(pe, "PROJECT_ROOT", tmp_path)   # not a git repo
+    r = pe.cmd_temp_pressure(_Args(), CONFIG, _compact())
+    assert r["ephemera_count"] == 2                     # unchanged — failed open
+    assert r["ephemera_tracked_excluded"] == 0
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

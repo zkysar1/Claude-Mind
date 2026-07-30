@@ -1,5 +1,27 @@
 [
   {
+    "version": "2.8.4",
+    "previous_version": "2.8.3",
+    "date": "2026-07-30",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Frontier reconcile for the seed->downstream hop: 8 downstream-ahead framework files back-ported UP (escalation-target resolver, sync-casualty-detect, user-signal-refresh, asp-115 hardcode fix x3, precheck-eval temp-pressure visibility + git-tracked purge guard, 2 session-manifest orphans) plus fleet sync.",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.8.3",
+    "previous_version": "2.8.2",
+    "date": "2026-07-30",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Reconcile 8 downstream-ahead framework files UP to the frontier ahead of the seed->downstream hop: _escalation_target/sync-casualty-detect/user-signal-refresh (new), the asp-115 escalation-hardcode fix in cadence-stale-canary + blocker-recheck, precheck-eval temp-pressure unclassified_count + git-tracked purge-scope exclusion, and 2 re-registered session-manifest orphans.",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.8.2",
     "previous_version": "2.8.1",
     "date": "2026-07-30",

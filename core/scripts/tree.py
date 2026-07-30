@@ -734,9 +734,28 @@ def _analyze_node_body(text):
     return line_count, int(char_count / CHARS_PER_TOKEN), refresh_sections
 
 
-def get_distill_candidates(tree, include_skipped=False):
+def get_distill_candidates(tree, include_skipped=False, *,
+                           config_dir=None, resolve_path=None):
     """Return nodes eligible for DISTILL based on utility + structural thresholds.
     Reads thresholds from core/config/tree.yaml pruning section.
+
+    `config_dir` and `resolve_path` are OPTIONAL dependency injections and both
+    default to the module-level CLI behavior, so every existing caller is
+    unaffected. They exist so the daemon can DELEGATE to this function instead
+    of maintaining a second copy: mind_api/src/world/tree_write.py must resolve
+    both the config path and each node's .md path through its per-request `ctx`
+    (a daemon process may serve a project root that is not this module's), which
+    is the only reason its `_get_distill_candidates` was ever a separate
+    implementation. That copy then drifted four fixes behind (g-115-4062:
+    crit3/read-cap absent, interior nodes skipped by an early `continue`, the
+    permissive has_feedback>=1 bar, and distill_exempt unhonoured), producing a
+    LIVE read/write disagreement — CLI reported distill debt 558 while the
+    daemon reported 807 on the same tree in the same minute, and the daemon's
+    number is what lands in post_run_debt and gates backlog-mode escalation
+    fleet-wide. Injecting the two path seams is what makes one implementation
+    serve both callers; do NOT re-fork this function to add a caller-specific
+    path rule (rb-4884: byte-near-identical siblings are a maintenance debt,
+    not a design).
 
     LEAF nodes are evaluated against all three criteria (crit1 low-utility,
     crit2 large-mediocre, crit3 oversized-append-grown). INTERIOR nodes (with
@@ -757,7 +776,7 @@ def get_distill_candidates(tree, include_skipped=False):
     "interior node, crit3-eligible, crit3 did not trip" — an interior node that
     DOES trip crit3 is returned as a candidate, not skipped.)
     """
-    config_path = str(CONFIG_DIR / "tree.yaml")
+    config_path = str((config_dir if config_dir is not None else CONFIG_DIR) / "tree.yaml")
     pruning = {}
     if os.path.exists(config_path):
         with open(config_path, "r", encoding="utf-8") as f:
@@ -850,7 +869,8 @@ def get_distill_candidates(tree, include_skipped=False):
         crit1 = rc >= min_ret and utility_signal_ok and ur < threshold
         # Criterion 2: large node with mediocre payoff
         file_path = node.get("file", "")
-        abs_path = str(resolve_file_path(file_path)) if file_path else ""
+        _resolver = resolve_path if resolve_path is not None else resolve_file_path
+        abs_path = str(_resolver(file_path)) if file_path else ""
         line_count = 0
         est_tokens = 0
         refresh_sections = 0
