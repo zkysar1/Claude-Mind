@@ -39,9 +39,9 @@ cross_repo_commit_product() {
     local goal_id="" title="" outcome=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --goal-id) goal_id="${2:-}"; shift 2 ;;
-            --title)   title="${2:-}"; shift 2 ;;
-            --outcome) outcome="${2:-}"; shift 2 ;;
+            --goal-id) goal_id="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+            --title)   title="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+            --outcome) outcome="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
             *) shift ;;
         esac
     done

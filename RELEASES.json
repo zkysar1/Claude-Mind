@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.8.0",
+    "previous_version": "2.7.1",
+    "date": "2026-07-30",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Fleet-cycle sync: 308 framework commits since v2.7.1 — coordination_merge handler coverage (improvement-velocity, strategy-generations), .mind-data ledger merge-driver routing, TZ=UTC clock-skew rails, probe-aggregate false-all-clear sweep, recurring-goal staleness detector, cross-deployment peer surface in /prime, argv-hang fixes",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.7.1",
     "previous_version": "2.7.0",
     "date": "2026-07-27",

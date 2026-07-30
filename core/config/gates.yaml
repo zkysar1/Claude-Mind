@@ -51,7 +51,7 @@
 # pending_audit pending the same analysis.
 
 schema_version: 1
-last_updated: "2026-07-13"
+last_updated: "2026-07-28"
 
 gates:
 
@@ -544,6 +544,52 @@ gates:
     fn_description: "A near-duplicate insight passes the advisory check and is encoded; bloat accrues slowly, surfaced later by retrieval_utility_report (G4b) + /reflect --curate-memory."
     rb_evidence: []
     tuning_notes: "Phase-1 earn-the-keep (g-115-1468 / G4a). Advisory-first: logs keep/drop recommendation via _gate_log, does NOT change the curator decision. Conservative defaults (dup_threshold 0.80, min_novelty 0.20 -- favors keep). Tighten / enforce once advisory firings show a stable signal."
+    retirement_eligible: true
+
+  # ─── Advisory-only probes (never block; instrumented ) ───────
+  # Both ALWAYS exit 0 and neither can stop its caller, so neither can ever
+  # emit `override` — the FP signal (override / (block + override)) is
+  # structurally unavailable for them. Read their FP rate from the tuning
+  # corpus (nearest_id/similarity in `extra`), not from the override ratio.
+  # They log on EVERY invocation including the silent case, so fired/invoked
+  # is a RATE; a bare count would be uninterpretable.
+
+  - id: store-dupe-warn
+    script: core/scripts/store_dupe_warn.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: "core/scripts/guardrails-add.sh", phase: "pre-append advisory" }
+      - { file: "core/scripts/reasoning-bank-add.sh", phase: "pre-append advisory" }
+      - { file: "core/scripts/pattern-signatures-add.sh", phase: "pre-append advisory" }
+    dominant_risk: FN
+    asymmetry_magnitude: high
+    keyword_bias: strict
+    override_flag: null
+    fp_cost: low
+    fn_cost: medium
+    fp_description: "Warns on a non-duplicate; the add still lands, author reads the named entry and moves on (seconds). It cannot refuse an entry."
+    fn_description: "A true duplicate is added unwarned; two entries drift apart and both get retrieved. This is the COMMON case, not the rare one -- see tuning_notes."
+    rb_evidence: [rb-5589]
+    tuning_notes: "g-115-3223 built it, g-115-3626 instrumented it. FN-dominant but keyword_bias is deliberately STRICT, and the tension is real: thresholds sit just above each store's measured p99 nearest-neighbour similarity (guardrails 0.45, rb/pattern-sigs 0.55) because an advisory that fires often gets ignored, and alarm fatigue converts straight back into FN. Lexical (jaccard) only -- MEASURED blind to semantic duplicates: guard-1486/guard-1485 are a true duplicate scoring 0.112, ranked 20th, BELOW the store median. So expect a high FN floor no lexical threshold can lower; the semantic half is g-115-3736. Do NOT count-retire on a low fire rate alone -- check the `similarity` distribution in the firing corpus first, since a near-miss cluster just under threshold is a tuning signal, not a uselessness signal."
+    retirement_eligible: true
+
+  - id: goal-pickup-coordination
+    script: core/scripts/goal-pickup-coordination-check.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: ".claude/skills/aspirations-execute/SKILL.md", phase: "pre-claim coordination probe" }
+    dominant_risk: FP
+    asymmetry_magnitude: medium
+    keyword_bias: strict
+    override_flag: null
+    fp_cost: medium
+    fn_cost: high
+    fp_description: "Spurious race_risk advises YIELD on an unclaimed goal; the goal is skipped and sits until another iteration (minutes), and repeated FPs teach the agent to ignore the advisory."
+    fn_description: "A genuine collision is missed; two agents execute the same goal and one body of multi-hour work is discarded at merge. Strictly costlier than store-dupe-warn's FN (a duplicate memory entry), which is why it ranks a step above it."
+    rb_evidence: []
+    tuning_notes: "Instrumented g-115-3626. Its whole tuning history is FP suppression (release-kind hits no longer keep race_risk latched forever; goal-record citations no longer flip it -- g-115-2131, g-115-3459), hence strict. `block` here means ADVISORY-block: race_risk IS a yield recommendation, so `block` is the honest label even though the probe never hard-blocks -- unlike store-dupe-warn above, which recommends nothing and therefore logs a warn as `pass`. Same mechanism, two verdicts: do not unify the mappings."
     retirement_eligible: true
 
 # ─── Gates discovered in core/scripts/ but not in the Session-56 audit.

@@ -163,6 +163,249 @@ runs whenever no live daemon is present. Enforced by `guard-672`.
 > VERDICT, not the per-chunk lines, and reach for `--chunks 8` before concluding
 > anything about the tree. (g-115-3471, alpha/cc-04.)
 >
+> **`--chunks 8` is a starting point, not a ceiling — 8 went INVALID here and 12
+> was CLEAN** (2026-07-28, foxtrot, cc-04/Linux, live fleet running). Same tree,
+> two runs ~40 min apart: 8 chunks **INVALID (contended)** with chunk 06 stopping
+> at 95%, then 12 chunks CLEAN at **6,505 passed / 2 failed / 0 errors**. So if 8
+> comes back INVALID, escalate the chunk count rather than concluding anything —
+> and in particular do not read the contended run's totals as a regression.
+>
+> **The ladder has a second rung: 12 went INVALID and 16 was CLEAN** (2026-07-29,
+> bravo, cc-05/Linux, live fleet — four partners active within 9 min). Same tree,
+> two runs ~35 min apart: 12 chunks **INVALID (contended)**, then 16 chunks CLEAN
+> at **6,688 passed / 0 failed / 0 errors**. So "escalate" is not a single step up
+> from 8 — read it as a ladder (8 → 12 → 16), and expect the rung you need to rise
+> with fleet contention rather than being a fixed property of the tree.
+>
+> **THIRD RUNG: 16 went INVALID and 20 was CLEAN** (2026-07-30, echo,
+> `cc-03` / Linux 6.8.0-136-generic, live fleet — five partners active within
+> 30 min: alpha 3m, bravo 16m, foxtrot 23m, zeta 2m, g-115-4003). Same tree, two
+> runs ~10 min apart: 16 chunks **INVALID (contended)** reporting
+> `TOTAL: 7404 passed, 0 failed, 0 errors`, then 20 chunks **CLEAN** at
+> **7,446 passed / 0 failed / 0 errors**. So the ladder is 8 → 12 → 16 → 20, and
+> it is still open at the top — do not read 16 as a ceiling any more than 8 or 12
+> was.
+>
+> Two things this rung adds. **(1) The INVALID trap fired here in its most
+> deceptive form yet, and the row above predicted it exactly**: all 16 per-chunk
+> lines read `0 failed` AND the TOTAL read `0 failed, 0 errors`, with no stopped
+> percentage and no failing file anywhere in the output. Nothing distinguished it
+> from a pass except the `VERDICT: INVALID (contended) -- this number means
+> NOTHING` line. Third independent confirmation, on a third box: read the VERDICT
+> FIRST and let it decide whether the numbers above it mean anything.
+> **(2) `VERDICT: CLEAN` scopes to the pytest chunks only — it is not a
+> whole-suite all-clear.** The same CLEAN run also carried
+> `FAIL(rc=1) test-wm-prune-cadence-protection.sh (shell)` from the
+> invisible-suites (`main()`-style) half, which the runner reports SEPARATELY and
+> which the CLEAN verdict does not cover. That file fails SOLO (⇒ genuine per the
+> guard-1448 discriminator, not contention) and is owned by **g-115-3799**, whose
+> scope is explicitly "wm-prune.sh (+ its .py) **and its tests**". Do not read
+> CLEAN and stop: grep the log for `^FAIL` too, or a genuine red in the
+> pytest-invisible half rides out under a clean verdict — the exact blind spot
+> `run-invisible-suites.sh` exists to cover.
+>
+> **Independently reproduced the same rung on a DIFFERENT box the same day**
+> (2026-07-29, foxtrot, cc-04/Linux, live fleet, g-115-3863): 12 chunks
+> **INVALID (contended)**, then 16 chunks CLEAN at **6,673 passed / 2 failed /
+> 0 errors** (the 2 are the pre-existing `test_fleet_config_parity` pair tracked
+> by g-115-3803, not a regression). Two boxes, one day, same 12→16 escalation.
+> That is what makes the rung worth writing down as a ladder rather than as one
+> box's quirk — and it also means a rung that worked yesterday is evidence about
+> yesterday's contention, not a setting you can inherit.
+>
+> This run also shows the INVALID trap at its most convincing yet: the 12-chunk run
+> reported **`TOTAL: 6675 passed, 0 failed, 0 errors` with every one of its 12
+> per-chunk lines reading `0 failed`**. There was no visible defect anywhere in the
+> output — no stopped percentage, no failing file, nothing to notice. Only the
+> `VERDICT: INVALID (contended) -- this number means NOTHING` line distinguished it
+> from a pass. Prior entries warn that per-chunk lines can look complete; this one
+> is stronger: a fully clean-looking TOTAL plus twelve clean-looking chunk lines
+> can still be a run that proves nothing. Read the VERDICT first and let it decide
+> whether the numbers above it mean anything at all.
+>
+> This run reproduced the paragraph above in every detail, which is the point of
+> recording it: the INVALID run's chunk-06 line read `791 passed, 0 failed, 0
+> errors` — indistinguishable from a completed chunk — and only the runner's own
+> verdict caught that it never finished. A second confirmation, on a different
+> box and a different chunk count, that the per-chunk lines cannot be trusted and
+> the VERDICT can.
+>
+> Attribution note for that CLEAN run: the 2 failures were `test_fleet_config_parity`
+> (fails solo -> GENUINE, pre-existing, ~~tracked by g-115-3446~~ **CORRECTED
+> 2026-07-29: they were UNTRACKED — now g-115-3803**). The INVALID run had
+> ALSO reported `test_pending_phase_6_spark_sentinel` x2, which passed 70/70 solo and
+> did not recur in the CLEAN run — a textbook guard-1448 contention artifact. Note the
+> discriminator worked in BOTH directions in one sitting, which is the reason to run it
+> rather than guess: same run, same log, one pair real and one pair noise.
+>
+> **2026-07-29 (g-115-3210, bravo, `cc-05` / Linux 6.8.0-136-generic, live fleet
+> running, 12 chunks): 6674 passed / 0 failed / 0 errors, VERDICT CLEAN.** Domain
+> suite alongside it: 242 pytest + 5/5 shell units, 1 pre-existing
+> environment-gated quarantine. **`test_fleet_config_parity` is GREEN here —
+> 28 passed / 0 failed run solo**, so the pair the row above calls GENUINE and
+> tracks as **g-115-3803 does not reproduce on cc-05/Linux**. Do not close
+> g-115-3803 on that: the failing run was cc-04, and a failure that reproduces on
+> one box and not another is a portability/environment finding, not a fixed bug.
+> Recorded here specifically because the row above spent a day unable to
+> reconcile two runs for want of this field.
+>
+> **2026-07-29 (g-115-3876, echo, `cc-03` / Linux 6.8.0-136-generic, live fleet —
+> five partners active within 8 min, 12 chunks): 6747 passed / 0 failed /
+> 0 errors, VERDICT CLEAN.** Domain suite alongside it: 242 pytest + 5/5 shell
+> units, 1 environment-gated quarantine. A THIRD box, and the first `cc-03` row
+> in this table.
+>
+> Two things this row settles that the rows above left open:
+>
+> 1. **The ladder rung is not monotonic in partner count.** cc-05 needed 16
+>    chunks with FOUR partners active; cc-03 was CLEAN at 12 with FIVE. So do not
+>    read the rung as a function of how many agents are up — pick a rung, and if
+>    it returns INVALID, escalate. The ladder is a retry protocol, not a
+>    predictor, and a rung that worked on another box today is not a setting to
+>    inherit.
+> 2. **`test_fleet_config_parity` is GREEN here — 28 passed / 0 failed run solo**,
+>    the same methodology the cc-05 row used, plus green in-suite within the
+>    0-failed total. That makes it cc-04 RED / cc-05 GREEN / cc-03 GREEN.
+>    Two independent boxes now fail to reproduce it, which strengthens rather
+>    than closes **g-115-3803**: a failure isolated to one box of three is a
+>    portability finding about that box, and closing it on green elsewhere would
+>    discard the only signal pointing at the real cause.
+>
+> Also measured: the six `test_target_state_external_path` failures seen earlier
+> the same day on this box did NOT recur at 12 chunks — 0 failed. They were
+> contention artifacts, confirming the guard-1448 discriminator from the
+> escalation side rather than the solo-rerun side: raising the chunk count made
+> them vanish without a single code change.
+>
+> **2026-07-29 (g-115-3590, alpha, `cc-04` / Linux 6.8.0-136-generic, live fleet,
+> 16 chunks): 6820 passed / 0 failed / 0 errors, VERDICT CLEAN.** Domain suite
+> alongside it: 5/5 shell units, 1 environment-gated quarantine (a driver that
+> exists only on the remote-storage host, so it is absent on every other box).
+> Two things this row adds:
+>
+> 1. **16 was CLEAN on the FIRST try — the ladder is a retry protocol, not a
+>    required climb.** Every prior row reached 16 by escalating from a contended
+>    12. Starting at 16 skipped that, which is cheaper than two runs when you
+>    already expect contention. Nothing here says 16 is now the floor; it says you
+>    may enter the ladder at any rung.
+> 2. **`test_fleet_config_parity` is GREEN on cc-04 — 28 passed / 0 failed run
+>    solo, and 0 failed in-suite.** The rows below call this pair GENUINE *on
+>    cc-04* and track it as **g-115-3803**. Same box, same day, now green, with no
+>    fix attributable to this goal's diff. Do **not** read that as resolved: a
+>    red→green flip on the same box with no identified cause is evidence of
+>    intermittency, and closing on it would discard the only signal pointing at
+>    the cause. It does mean the earlier "fails solo ⇒ GENUINE" call did not
+>    reproduce — which is itself a caution about that discriminator: a solo re-run
+>    is one measurement, not a verdict, and a single solo red should be repeated
+>    before it earns the GENUINE label.
+>
+> **2026-07-30 (g-115-3925, alpha, `cc-04` / Linux 6.8.0-136-generic, live fleet,
+> 12 chunks): 6934 passed / 0 failed / 0 errors, VERDICT CLEAN.** Domain suite
+> alongside it: 5/5 shell units, 1 environment-gated quarantine (the same
+> remote-host-only driver). **12 was CLEAN on the FIRST try**, which is the
+> point of the row: the two entries above reached CLEAN only at 16 after 12
+> came back contended, and read together they could easily be taken as "12 is
+> no longer enough." It is not a floor either. The rung tracks the contention
+> in the moment, not the tree and not the box — so pick a rung, and let the
+> VERDICT, never the rung's recent history, decide whether to climb.
+> `test_fleet_config_parity` is green in-suite here (0 failed overall), a
+> second consecutive cc-04 green — still not grounds to close **g-115-3803**,
+> for the intermittency reason the row above gives.
+>
+> **2026-07-30 (g-115-3933, foxtrot, hostname `LAPTOP-3IOFCNEO` / `Linux
+> 6.6.87.2-microsoft-standard-WSL2` / `MACHINE_ID=foxtrot-laptop`, live fleet):
+> 16 chunks INVALID (contended) → 20 chunks VALID at 6822 passed / 2 failed /
+> 0 errors, VERDICT GENUINE.** Domain half clean (242 pytest + 5/5 shell units,
+> 1 environment-gated quarantine). Three things this row adds:
+>
+> 1. **The ladder extends to 20.** 16 came back INVALID here and 20 was valid on
+>    the re-run — same tree, ~35 min apart. Read the ladder as 8 → 12 → 16 → 20
+>    and keep escalating: the rung is a property of contention at that moment,
+>    not of the tree. (Consistent with the alpha row directly above, where 12 was
+>    clean first try on the same calendar day — the rung is not a fleet-wide
+>    setting either of us can inherit from the other.)
+> 2. **rc=1 is AMBIGUOUS — split the halves before naming a cause.**
+>    `run-full-suite.sh` L48-53 collapses two suites into one exit code: the
+>    framework rc WINS when non-zero, and a domain red surfaces as 1 *only* when
+>    the framework half was clean. So rc=1 means EITHER genuine framework
+>    failures OR a clean framework plus a red domain suite. The three greps, in
+>    order, are `EXIT=` → `VERDICT` → `domain test suite` (read its own summary
+>    line). That localized this run to the framework half before any test name
+>    was known. (rb-5816.)
+> 3. **The solo red WAS repeated, answering the caution in the 2026-07-29
+>    (g-115-3590) row above.** That caution asks for a repeat before a solo red
+>    earns GENUINE. Done: red-solo, then red-in-suite in the 20-chunk run, then
+>    red-solo again ~35 min later — three reds. `test_fleet_config_parity`'s two
+>    tests are GENUINE here and stay tracked by **g-115-3803**; do not close
+>    them. Exoneration of the change under test was positive, not inferred from
+>    "the chunk containing my tests reported 0 failed": the two new test files
+>    plus the pre-existing suites for both modified scripts were re-run
+>    explicitly (61 passed / 0 failed).
+>
+> **The box NICKNAME is not trustworthy, and these two same-day rows prove it
+> rather than merely suggesting it.** Read them together: alpha reports
+> `test_fleet_config_parity` GREEN on "cc-04" and calls it a *second consecutive*
+> cc-04 green; I measured the same two tests RED three times, twice solo, on the
+> same calendar day. If both rows describe one box, one test was green and red
+> within hours. They do not describe one box — alpha's kernel is
+> `6.8.0-136-generic`, mine is `6.6.87.2-microsoft-standard-WSL2`, and
+> `agents/foxtrot/self.md` independently states foxtrot runs WSL2 on
+> `LAPTOP-3IOFCNEO`. So "cc-04" names at least two machines, and the
+> cc-04-RED / cc-05-GREEN / cc-03-GREEN matrix cannot be read as three machines.
+> A red→green "flip on the same box with no identified cause" — the puzzle two
+> rows above — is most likely no flip at all. Which record owns the nickname is
+> UNMEASURED; I verified only this box. **Record `hostname` and `uname -r`
+> verbatim, never a nickname** — the nickname is exactly what let this drift in
+> while every row still looked like it satisfied the "record the box and OS"
+> instruction. (Merge-resolved by foxtrot 2026-07-30: both rows kept; the
+> contradiction between them is the finding, so neither was dropped.)
+>
+> **2026-07-30 (g-115-3980, bravo, `hostname` = cc-05, `uname -r` =
+> 6.8.0-136-generic, live fleet — 4 partners active): 16 chunks INVALID
+> (contended) → 20 chunks 6944 passed / 0 failed / 0 errors, VERDICT CLEAN.**
+> Same tree, ~12 min apart. This is a SECOND box reproducing 16→20 on the same
+> calendar day as the foxtrot row above, which is the only reason it is worth a
+> row: the 12→16 rung earned its place the same way, and one box's escalation is
+> a quirk until another box repeats it. Note the two boxes differ — cc-05 is
+> `6.8.0-136-generic`, foxtrot is WSL2 — so this is corroboration across
+> hardware, not one machine twice.
+>
+> Two things it does NOT say. It is not evidence the rung is settling at 20;
+> both rows describe contention at a moment, and the row above is explicit that
+> the rung is not inheritable. And it says nothing about
+> `test_fleet_config_parity`: 0 failed in-suite here, but I did not re-run those
+> two tests solo, and the row above establishes that in-suite green does not
+> settle an intermittent — so **g-115-3803** stays open on my account too.
+>
+> Worth recording because it cost a full extra cycle: the INVALID run reported
+> `TOTAL: 6891 passed, 0 failed, 0 errors` with all 16 per-chunk lines reading
+> `0 failed`. Nothing in it looked wrong. Only `VERDICT: INVALID (contended) --
+> this number means NOTHING` distinguished it from the CLEAN run 12 minutes
+> later, whose total was 53 tests HIGHER. Read the VERDICT first; a fully
+> clean-looking TOTAL over fully clean-looking chunks is not a pass.
+>
+> **2026-07-30 (g-115-4029, zeta, `hostname` = cc-02, `uname -r` =
+> 6.8.0-136-generic, live fleet, 16 chunks): 7095 passed / 0 failed / 0 errors,
+> VERDICT CLEAN on the FIRST try.** Domain half: 7/7 shell units, 1
+> environment-gated quarantine (the remote-storage-host-only driver, g-115-3216);
+> invisible-suites 90/90, 0 quarantined. Recorded only because **cc-02 is a box
+> this table had never covered** — the ladder, VERDICT-first, and
+> TOTAL-is-not-comparable lessons above are already settled and this run neither
+> extends nor contradicts them. Note the TOTAL sits 1 above a 7094 run taken ~2h
+> earlier on this same box while I had added 2 tests in between; per the TOTAL
+> caveat above that arithmetic is not meant to reconcile, and `failed`/`errors`
+> are the fields that carry the signal.
+> **"Pre-existing" is not "tracked" — verify the tracking ID, do not inherit it.**
+> The row above carried a wrong ID for a day. `g-115-3446` is a COVERAGE-gap goal
+> (add a pin for an untested branch); `g-115-3443` tracks two red contract-pins in
+> *different* files and only CITES `test_fleet_config_parity.py` to record it was
+> 28/28 green on 07-27 — which dates the regression rather than owning it. Neither
+> tracked these two tests, so a GENUINE failure sat unowned while every reader of
+> this row was told it was handled. Establishing "not caused by my change" is the
+> easy half and it is where the check usually stops; a failure you have correctly
+> exonerated yourself of still needs an owner. Open the cited goal and confirm it
+> names the failing TESTS — a shared file path is not ownership.
+>
 > **The environmental-timeout class is GONE, and the previous entry's guidance is
 > now REVERSED.** The 2026-07-25 baseline told you to treat failures in 9 named
 > files as "a machine signal, NOT a code regression." That was true then and is
@@ -175,10 +418,33 @@ runs whenever no live daemon is present. Enforced by `guard-672`.
 > and `test_history_vacuum_archive` are now fully **GREEN**.
 >
 > **So: do NOT excuse a failure in those files as environmental any more.** The 6
-> still failing (`test_pending_deploys_gate`, `test_pre_apply_consult_gate_scope`,
+> named below carry no timeout signature — when they DO fail, the failure is real.
+> ~~still failing~~ **RESOLVED — see the Windows row below; all 6 now pass on both
+> platforms.** (`test_pending_deploys_gate`, `test_pre_apply_consult_gate_scope`,
 > `test_pending_deploys_stop_hook`, `test_iteration_push`,
-> `test_infra_streak_dedup_sh`, `test_git_merge_ayoai_ledger`) carry no timeout
-> signature and are GENUINE — triage them, don't dismiss them.
+> `test_infra_streak_dedup_sh`, `test_git_merge_ayoai_ledger`)
+>
+> **2026-07-27 — WINDOWS row, closing the portability question the row above left
+> open** (alpha, `DESKTOP-O91DLK2`, Windows 10 19045 / MSYS2 MINGW64, `sys.platform
+> = win32`, 4 chunks, fleet quiet — omni stopped for the promotion):
+> **6,144 passed / 0 failed / 0 errors.** The cc-04 entry above states
+> *"Unmeasured by me: whether those 12 still fail on a Windows box."* Measured now:
+> the 6 called GENUINE were re-run explicitly on Windows — **59 passed, 0 failed.**
+>
+> So this is **NOT** a portability finding. Both platforms are green, which means
+> the 07-26 Windows entry (32 failed) and the 07-27 Linux entry (0 failed) are
+> reconciled by TIME, not by OS: fixes landed in between. At least one is directly
+> attributable — `test_infra_streak_dedup_sh` was one of 9 bare-`bash` argv[0]
+> sites repaired during the v2.6.0→v2.7.1 promotion earlier the same day
+> (`2b3f3ce84`, `198d29685`), which is the same `CreateProcess`/System32/WSL root
+> cause the 07-25 → 07-26 narrative above describes. The remaining 5 were not
+> individually attributed.
+>
+> Note this row obeys the "record the box and OS" instruction two paragraphs up,
+> and it is the reason the reconciliation was possible at all. Do not drop that
+> field. Also note the TOTAL caveat applies here too: 6,144 (Windows, 4 chunks)
+> vs 6,223 (Linux, 4 chunks) is **not** evidence of missing tests — judge by the
+> FAILING FILE SET, which is empty on both.
 >
 > **Why failures rose 20 → 32 while the box got healthier**: +743 tests that had
 > never executed now run. Judge by FAILING FILE SET, never the count. The newly
@@ -193,6 +459,22 @@ runs whenever no live daemon is present. Enforced by `guard-672`.
 > which pins `STORAGE_BACKEND=local`, excludes `daemon_integration`, chunks into
 > fresh processes, and returns **exit 2 = INVALID/contended** so a resource-starved
 > run can never be mistaken for a pass or a regression.
+>
+> **Never pipe that runner — not even on a finished run.** Trap 2 below forbids
+> piping a LIVE run through `tail` for a buffering reason; this is a second,
+> independent reason that applies to a COMPLETED run as well, and it defeats both
+> safeguards named in the paragraph above at once. A trailing pipe replaces the
+> runner's exit code with the pipe's (`guard-1150`), so the exit-2 INVALID signal
+> is destroyed — a background-task notification will cheerfully report "exit code
+> 0" for a contended run. And a bounded window (`| tail -40`) discards the
+> `VERDICT` line, which every baseline row above insists is the ONLY authority on
+> whether the numbers mean anything. Committed live 2026-07-30 (g-115-3855):
+> `run-full-suite.sh --chunks 16 --confirm-solo 2>&1 | tail -40` produced a
+> notification reading exit 0 with no verdict anywhere in the captured output.
+> The result was recoverable only because all 16 chunk logs happened to reach
+> `[100%]` — had one stopped short, the run would have been indistinguishable
+> from a pass. Redirect to a file and Read it (as trap 2 already prescribes);
+> never pipe.
 
 The daemon-safe full suite takes ~32min (measured: 1916s; 2231 passed / 2 failed
 / 1 skipped over 2234 selected). The runtime concentrates in a handful of
@@ -298,12 +580,13 @@ Or wait for a quiet window with the fleet stopped. Enforced by `guard-1448`.
 |---|---|---|
 | `core/scripts/*.py` (non-test) | `cd PROJECT_ROOT && python -m pytest core/scripts/tests -q` | exit code 0, all collected tests pass |
 | `core/scripts/gates/capability.py`, `capability-gate.py`, or the defer→Unblock path in `aspirations.py` | ALSO run `bash core/scripts/tests/run-asp-257-suite.sh` — 4 of its 6 suites are `main()`-style files pytest collects 0 tests from, so pytest-green says NOTHING about them (they sat red 3 days undetected, masking a real NameError — g-115-2343 / rb-3678) | aggregator prints `6/6 suites passed` |
-| Any change whose test coverage lives in a `main()`-style file (69 of the `test_*.py` files here — enumerate with `bash core/scripts/tests/run-invisible-suites.sh --list`) | `bash core/scripts/tests/run-invisible-suites.sh` — dynamic population runner over every pytest-invisible file; known-reds are quarantined inline with their tracking goal IDs (g-115-2349 baseline sweep found 9 silent reds) | runner exits 0 (`60/60 files passed, N quarantined`) |
+| Any change whose test coverage lives in a pytest-INVISIBLE file — a `main()`-style `.py` (no top-level `def test_`) **or any `.sh`, which pytest cannot collect at all**. Measured 2026-07-29 (cc-05): 71 `.py` + 19 shell = 90 files. Do not trust that count; re-derive with `bash core/scripts/tests/run-invisible-suites.sh --list`, which prints the split. | `bash core/scripts/tests/run-invisible-suites.sh` — dynamic population runner; known-reds are quarantined inline with their tracking goal IDs (g-115-2349 baseline sweep found 9 silent reds of 69). **Since g-115-3957 this runner is invoked automatically by `core/scripts/run-full-suite.sh`**, so a full-suite run already covers it; invoke it directly only when you want the invisible half alone. | runner exits 0 (`N/N files passed, M quarantined`) |
 | `mind_api/src/*.py` | `python -m pytest core/scripts/tests -q` (runtime is exercised by daemon-aware wrappers in core/scripts/tests) | exit 0 |
 | `core/scripts/*.sh` (production wrapper) | Whatever the wrapper's daemon endpoint suite covers — typically `python -m pytest core/scripts/tests -q -k <endpoint>` | exit 0 |
 | `.claude/skills/*/SKILL.md` | Re-read the edited pseudocode + `bash core/scripts/domain-leak-check.sh`; if the change alters skill BEHAVIOR (not just prose), also `/verify-learning` for cross-skill grep checks. (Do NOT use `skill-evaluate.sh` here. A bare `skill-evaluate.sh <skill-name>` errors `unknown subcommand`: it needs a subcommand (read/report/underperforming/score), and `score --skill <s> --goal <g>` rates RUNTIME skill-on-goal performance, not a static SKILL.md edit.) | re-read confirms intent; domain-leak-check clean; verify-learning passes if behavior changed |
 | `.claude/rules/*.md` | No automated check — re-read the rule and confirm wording matches intent | manual review |
 | `core/config/*.yaml` / `core/config/*.md` | Re-parse via affected consumers — `bash core/scripts/<consumer>.sh --dry-run` if available, otherwise `python -c "import yaml; yaml.safe_load(open('<path>'))"` | parse succeeds, no schema break |
+| **External domain + meta paths** — `world/scripts/**`, `world/conventions/**`, `meta/**`. These are neither git-tracked framework nor a sibling product repo, so before g-356-02 they had **no row in either table**. | `STORAGE_BACKEND=local python3 -m pytest "$WORLD_PATH/scripts/tests" -q` (the pin is mandatory — guard-955), plus whatever shell-unit runner the domain provides. **`full-suite-recommender.sh` CANNOT SEE THESE PATHS**: they are external and gitignored, and the recommender detects changes via git, so it reports `no code changes detected` for every domain-script and meta-strategy edit ever made, by any agent, on any box. Its silence there means "I cannot see", rendered identically to "nothing changed" — pick the suite yourself and say in the verify summary that the recommender was *blind*, not quiet (guard-1947). Read-side inverse of rb-1699, where the same tool OVER-attributes partner changes inside the tracked tree. | domain pytest exits 0; shell units pass except pre-existing environment-gated quarantines, which must be named |
 
 ### Product workspace (sibling repos under `AGENT_WRITE_PATH`)
 

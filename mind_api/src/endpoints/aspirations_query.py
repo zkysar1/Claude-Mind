@@ -11,6 +11,12 @@ Query parameters (at least one required — same rule as the CLI):
                                           of the 6-field projection (g-115-1304;
                                           category added g-115-1614)
 
+The identifier key is available as BOTH `id` and `goal_id` in full mode
+(g-115-3473), so a caller keyed on either name is correct. The default
+projection still emits `goal_id` only. Before g-115-3473 the two projections
+had mutually exclusive id keys, which silently returned None for every record
+when a goal_id-keyed reader passed --full.
+
 Response: application/json — `json.dumps(results, indent=2, ensure_ascii=True)`,
 byte-for-byte matching `cmd_query`'s stdout. Always reads BOTH world and agent
 queues (the CLI ignores --source for query — see aspirations.py:879 comment).
@@ -135,7 +141,19 @@ def query(ctx) -> "Response":  # type: ignore[name-defined]
                         # goal-by-id lookup needs one call, not an aspiration-scoped
                         # read + .goals[] traverse. asp_id/source are appended last so
                         # they override any same-named goal keys (metadata authoritative).
-                        results.append({**goal, "asp_id": asp_id, "source": source_name})
+                        #
+                        # goal_id is emitted ALONGSIDE the raw record's own "id" so
+                        # either key works and no caller can be wrong ().
+                        # The two projections previously had MUTUALLY EXCLUSIVE id
+                        # keys: default carried goal_id and no id, full carried id and
+                        # no goal_id. That is a silent-None trap precisely because
+                        # --full is the mode the Multi-Agent Safety Rule mandates (it
+                        # is the only mode carrying claimed_by), so the flag that makes
+                        # the guard possible was the flag that nullified a goal_id-keyed
+                        # implementation of it. Emitted last, like asp_id/source, so a
+                        # stray goal key cannot shadow it.
+                        results.append({**goal, "goal_id": goal.get("id", ""),
+                                        "asp_id": asp_id, "source": source_name})
                     else:
                         results.append({
                             "goal_id": goal.get("id", ""),

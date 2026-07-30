@@ -95,6 +95,15 @@ def main(argv=None) -> int:
     ap.add_argument("--override-agent-match",
                     help="Justification for overriding a matched capability "
                          "(echoed to stderr).")
+    ap.add_argument("--caller-context", default="create-blocker",
+                    choices=["create-blocker", "defer"],
+                    help=("Which enforcement path is invoking the gate. Only "
+                          "affects which bypass flag the human-readable "
+                          "`reason` recommends: --override-agent-match at "
+                          "CREATE_BLOCKER time, --force-defer on the defer "
+                          "path (the two are NOT interchangeable — g-115-2814). "
+                          "Defaults to create-blocker so existing callers are "
+                          "byte-identical (g-115-3405)."))
     ap.add_argument("--evidence",
                     help=("JSON array of evidence entries approving agent-routing "
                           "of a [user]-tagged goal. Each entry: "
@@ -135,6 +144,7 @@ def main(argv=None) -> int:
         suggest_unblock=args.suggest_unblock,
         for_goal_id=args.for_goal_id,
         agent_name=agent_name,
+        caller_context=args.caller_context,
         world_dir=world_dir,
         skills_dir=SKILLS_DIR,
     )

@@ -9,7 +9,11 @@ For each goal with defer_reason != null older than --max-age-hours, re-probe
 the defer condition. Currently handles:
 
   (a) "blocked_on_dependency: g-XXX must ..." — check if g-XXX is completed.
-      If yes, clear defer_reason (dependency resolved).
+      If yes, clear defer_reason (dependency resolved). Resolution spans the
+      LIVE queues AND aspirations-archive.jsonl (g-115-3916): a dep that
+      completed inside a since-archived aspiration is absent from every live
+      read, and resolving live-only reported it identically to an id that
+      never existed — freezing g-005-17 for 37 days. See _read_archived_goals.
   (b) "Gated on g-X + g-Y" multi-goal clause — extract ALL g-ids inside the
       gating clause and require all completed before clearing. Excludes
       parenthetical g-ids outside the clause (rb-667 anti-overcapture).
@@ -694,6 +698,67 @@ def _read_goals(source):
     return goals
 
 
+def _read_archived_goals(source):
+    """Return goals nested inside ARCHIVED aspirations for one source.
+
+    The live read (`_read_goals`) sees only aspirations-*.jsonl. When an
+    aspiration COMPLETES it moves to aspirations-archive.jsonl and every one
+    of its goals vanishes from that view — so a dependency that completed and
+    was then archived resolves to nothing, and the sweep reports it exactly
+    the way it reports an id that never existed. That collapse is the
+    g-115-3916 defect: g-005-17 sat frozen 37 DAYS citing g-316-08, which had
+    completed 2026-06-22 inside the since-archived asp-316, while this sweep
+    ran every iteration and reported nothing wrong.
+
+    The incentive is inverted, which is why it survived so long: archiving a
+    completed aspiration is CORRECT housekeeping, and performing it is what
+    makes every defer citing one of its goals permanently unclearable. The
+    defer's own promise ("auto-clears when X completes") is then what stops a
+    human re-checking it. Same family as guard-1802 — a predicate blind to
+    part of the population it covers, where a clean run and an empty run are
+    indistinguishable.
+
+    FAIL-SOFT, deliberately asymmetric to `_read_goals`. That function exits(1)
+    on RtError per guard-383, because a silent [] there would poison the
+    aggregate and clear defers on a half-view — a WRONG-CLEAR. Here the failure
+    mode is the opposite: losing the archive degrades to exactly the pre-fix
+    behavior (an archived dep stays unresolved, the defer stays put), a
+    MISSED-CLEAR. Wrong-clear is unsafe and must be fatal; missed-clear is the
+    status quo ante and must not take the sweep down with it. The degradation
+    is reported, never silent — see `archive_read_failed` in the JSON output.
+    """
+    try:
+        out = _rt.aspirations_read(source=source, archive=True)
+    except _rt.RtError as e:
+        print(f"[defer-recheck] {source} archive read failed (degrading to "
+              f"live-only for this source): {e.body or e}", file=sys.stderr)
+        return None
+    data = _rt.tolerant_decode_aggregate(f"[defer-recheck] {source} archive", out)
+    if data is None:
+        # EMPTY BODY IS A VALID STATE, NOT A FAILURE — tolerant_decode_aggregate
+        # documents None as "genuinely empty" and every sibling maps it to [].
+        # Returning None here instead would mark a source whose archive is simply
+        # empty (a fresh world, a source with nothing archived yet) as
+        # archive_read_failed, and SILENTLY — the RtError branch above prints a
+        # diagnostic, this path prints nothing. That would flip archive_degraded
+        # to true on every not-found detail, i.e. the sweep would disown its own
+        # correct verdicts. Caught by fresh-eyes review of this file (g-115-3916);
+        # only the RtError branch above is a real read failure.
+        return []
+    # ?archive=1 returns a BARE list of aspirations, not the {"aspirations": [...]}
+    # envelope the active reads use. Handle both so a future endpoint change
+    # cannot silently empty this index.
+    asps = data.get("aspirations") if isinstance(data, dict) else data
+    goals = []
+    for asp in asps or []:
+        for g in asp.get("goals", []) or []:
+            g["_source"] = source
+            g["_aspiration_id"] = asp.get("id")
+            g["_archived"] = True
+            goals.append(g)
+    return goals
+
+
 def _age_hours(ts):
     if not ts:
         return None
@@ -737,6 +802,37 @@ def main():
     # Build goal index for dependency lookup (both sources).
     all_goals = _read_goals("world") + _read_goals("agent")
     by_id = {g.get("id"): g for g in all_goals}
+
+    # ARCHIVE INDEX (g-115-3916). Dependency resolution must span BOTH stores:
+    # a dep completed inside a since-archived aspiration is absent from every
+    # live read above. Folded into the SAME `by_id` so all four existing lookup
+    # sites (_classify_time_gated_dep, _try_precon_elapsed,
+    # _try_precon_studio_source, and the main dep loop) resolve it without
+    # threading a second index through four signatures.
+    #
+    # LIVE WINS on collision, and that direction is load-bearing: an id present
+    # in both stores means the live record is the current one (a re-opened goal,
+    # or a mid-archive race), so the archive copy is a stale snapshot that must
+    # never shadow it. The `not in by_id` guard below is what enforces that —
+    # do not "simplify" it to an unconditional assignment.
+    #
+    # `dep_origin` stays SEPARATE rather than merging the two into one
+    # undifferentiated set, per guard-1555: "found, completed, and its whole
+    # initiative closed" is a STRONGER fact than "found, completed" in the live
+    # queue, and an id in NEITHER store is an anomaly to report — not a silent
+    # skip. Collapsing those three into one message is what hid this for 37 days.
+    dep_origin = {gid: "live" for gid in by_id}
+    archive_read_failed = []
+    for _src in ("world", "agent"):
+        _arch = _read_archived_goals(_src)
+        if _arch is None:
+            archive_read_failed.append(_src)
+            continue
+        for _g in _arch:
+            _gid = _g.get("id")
+            if _gid and _gid not in by_id:
+                by_id[_gid] = _g
+                dep_origin[_gid] = "archive"
 
     scanned = 0
     eligible = 0
@@ -827,9 +923,23 @@ def main():
                 dep_statuses.append({"id": did, "status": dep.get("status")})
 
         if missing:
+            # DISTINCT from "found, completed" — see the dep_origin comment in
+            # main(). Reaching here now means the id was searched in the live
+            # queue AND the archive and exists in NEITHER, which is an anomaly
+            # (a typo'd or hallucinated dep id, or a hard-deleted goal), not the
+            # routine "its aspiration got archived" case that used to land here
+            # and freeze the goal silently. The message says which stores were
+            # searched so a future reader cannot re-derive the old ambiguity.
+            _degraded = (" [archive read DEGRADED for: %s — an archived dep "
+                         "could be misreported as missing]"
+                         % ",".join(archive_read_failed)) if archive_read_failed else ""
             details.append({"goal_id": g["id"], "age_hours": round(age_h, 1),
                             "dep_ids": dep_ids, "action": "skipped",
-                            "reason": f"dep(s) not found: {missing}"})
+                            "anomaly": True,
+                            "searched": ["live", "archive"],
+                            "archive_degraded": bool(archive_read_failed),
+                            "reason": f"dep(s) not found in live queues OR archive: {missing}"
+                                      f"{_degraded}"})
             continue
 
         incomplete = [d for d in dep_statuses if d["status"] != "completed"]
@@ -841,8 +951,13 @@ def main():
             continue
 
         # All cited deps completed — clearable.
+        # dep_origins makes an ARCHIVE-sourced clear visible in the record.
+        # Without it this clear is indistinguishable from a live-queue one, and
+        # the whole point of g-115-3916 is that the archive path was invisible.
         entry = {"goal_id": g["id"], "source": g["_source"], "age_hours": round(age_h, 1),
-                 "dep_ids": dep_ids, "action": "would_clear"}
+                 "dep_ids": dep_ids,
+                 "dep_origins": {d: dep_origin.get(d, "live") for d in dep_ids},
+                 "action": "would_clear"}
         would_clear.append(g["id"])
 
         if args.apply:
@@ -891,6 +1006,12 @@ def main():
         "time_gated_early_candidates": time_gated_early,
         "details": details,
         "apply": args.apply,
+        # Surface the archive index so a degraded run is never mistaken for a
+        # clean one. `archive_indexed` counting 0 with no failure recorded is a
+        # real signal too — it means the archive is genuinely empty, not that
+        # the lookup silently reverted to live-only (g-115-3916).
+        "archive_indexed": sum(1 for v in dep_origin.values() if v == "archive"),
+        "archive_read_failed": archive_read_failed,
         "metrics_log": str(metrics_path) if metrics_path else None,
     }
 

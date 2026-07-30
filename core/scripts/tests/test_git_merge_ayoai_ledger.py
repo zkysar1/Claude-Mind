@@ -178,3 +178,94 @@ def test_live_git_merge_experience_selfheals(tmp_path):
     assert res.returncode == 0, f"merge aborted (driver not invoked?): {res.stderr}"
     ids = sorted(r["id"] for r in _lines(exp.read_bytes()))
     assert ids == ["exp-O", "exp-T", "exp-base"]  # union of both sides, deduped base
+
+
+def _init_ledger_repo(tmp_path, attributes: str):
+    """Temp repo with the ayoai-ledger driver wired exactly as the test above
+    does (see its comment for why the wrapper path must be POSIX-form)."""
+    repo = tmp_path / "repo"; repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
+    wrapper = Path(_SCRIPTS, "git-merge-ayoai-ledger.sh").as_posix()
+    _git(repo, "config", "merge.ayoai-ledger.driver", f'bash {wrapper} %O %A %B %P')
+    (repo / ".gitattributes").write_text(attributes)
+    return repo
+
+
+def _diverge(repo, path, base: bytes, ours: bytes, theirs: bytes):
+    """base -> two branches writing conflicting content -> merge theirs into
+    ours. Returns the CompletedProcess of the merge."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(base)
+    _git(repo, "add", "-A"); _git(repo, "commit", "-qm", "base")
+    trunk = "master" if _git(repo, "rev-parse", "--verify",
+                             "master").returncode == 0 else "main"
+    _git(repo, "checkout", "-qb", "ours")
+    path.write_bytes(ours); _git(repo, "commit", "-qam", "ours")
+    _git(repo, "checkout", "-q", trunk)
+    _git(repo, "checkout", "-qb", "theirs")
+    path.write_bytes(theirs); _git(repo, "commit", "-qam", "theirs")
+    _git(repo, "checkout", "-q", "ours")
+    return _git(repo, "merge", "theirs", "-m", "merge")
+
+
+@pytest.mark.skipif(subprocess.run(["git", "--version"], capture_output=True).returncode != 0,
+                    reason="git not available")
+def test_live_git_merge_strategy_generations_selfheals(tmp_path):
+    """ criterion 3, as a REAL merge rather than a unit test of the
+    handler (guard-1290: a .gitattributes entry plus a passing unit test proves
+    nothing about what git actually does).
+
+    Reproduces the wedge that was measured on two live omni bodies: both boxes
+    advance the SAME open generation, so the tail row conflicts at line level.
+    """
+    yaml = pytest.importorskip("yaml")
+
+    def sg(goals, total):
+        return yaml.dump({
+            "version": 1, "current_generation": 42,
+            "generations": [{"generation": 42, "started": "2026-07-28T05:59:34",
+                             "ended": None, "goals_completed": goals,
+                             "metrics": {"avg_learning_value": round(total / goals, 4),
+                                         "total_learning_value": total}}],
+            "peak_generation": 40, "peak_score": 0.9,
+        }, default_flow_style=False, sort_keys=False).encode("utf-8")
+
+    repo = _init_ledger_repo(tmp_path, ".mind-data/meta/**/*.yaml merge=ayoai-ledger\n")
+    gen = repo / ".mind-data" / "meta" / "strategy-generations.yaml"
+    res = _diverge(repo, gen, sg(100, 50.0), sg(158, 79.0), sg(212, 106.0))
+
+    # Name BOTH causes. "wedge not fixed" alone would misattribute a broken
+    # harness (driver never registered, temp repo not initialised) as a product
+    # bug, which is the exact misreading this suite exists to prevent.
+    assert res.returncode == 0, (
+        f"merge aborted — either the handler is missing or the driver was never "
+        f"registered in this temp repo: {res.stderr}")
+    # The goal's named diagnostic: a wedged path stays in unmerged index state
+    # while its working-tree copy has ZERO conflict markers, so a marker grep
+    # reports the file as fine. Assert on the index, never on the content.
+    unmerged = _git(repo, "diff", "--name-only", "--diff-filter=U").stdout.strip()
+    assert unmerged == "", f"path left in unmerged index state: {unmerged}"
+
+    m = yaml.safe_load(gen.read_text())
+    g = m["generations"][0]
+    assert g["goals_completed"] == 212                              # MAX, not 370
+    assert g["metrics"]["avg_learning_value"] == round(106.0 / 212, 4)  # recomputed
+    assert m["current_generation"] == 42
+
+
+@pytest.mark.skipif(subprocess.run(["git", "--version"], capture_output=True).returncode != 0,
+                    reason="git not available")
+def test_live_git_merge_unregistered_basename_still_fails_safe(tmp_path):
+    """ criterion 4. Registering a new basename must not weaken the
+    no-corruption guarantee for the ones still unregistered: the driver exits 1,
+    git keeps the conflict, and %A is never silently overwritten with one side.
+    """
+    repo = _init_ledger_repo(tmp_path, ".mind-data/meta/**/*.yaml merge=ayoai-ledger\n")
+    unknown = repo / ".mind-data" / "meta" / "no-handler-for-this.yaml"
+    res = _diverge(repo, unknown, b"k: base\n", b"k: ours\n", b"k: theirs\n")
+
+    assert res.returncode != 0, "unregistered basename merged — fail-safe weakened"
+    unmerged = _git(repo, "diff", "--name-only", "--diff-filter=U").stdout.strip()
+    assert unmerged.endswith("no-handler-for-this.yaml")

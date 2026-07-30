@@ -644,11 +644,40 @@ def get_active_content(tree, key):
     return {"key": key, "active_content": content, "sections_found": sections_found}
 
 
+# Chars-per-token for DENSE TECHNICAL MARKDOWN — the content class of every
+# knowledge-tree node (code fences, paths, ids, heavy punctuation). NOT the
+# ~4.0 that holds for English prose: BPE splits far more aggressively here.
+#
+# MEASURED 2026-07-27..30 ( alpha, re-verified  echo) against
+# exact token counts from Read-tool truncation notices:
+#     product-world-model.md             67730 chars / 29270 tok = 2.31
+#     framework-guardrails-and-gates.md  65407 chars / 26882 tok = 2.43
+# Corroborated independently by a word/punctuation-run count on the one file whose
+# bytes were unchanged between measurements: 18254 runs x 1.60 = 29206 vs 29270
+# measured (0.2% off). The other file had GROWN 65407->70457 chars in the interim,
+# so dividing its CURRENT chars by the OLD token count yields a spurious 2.62 —
+# re-measure both halves of a ratio, or not at all.
+#
+# Deliberately the LOW end of the measured range: est_tokens = chars / RATIO, so a
+# SMALLER divisor yields a LARGER estimate and the guard fires EARLIER. Erring high
+# is the fail-safe direction (rb-2077: a node past the Read cap returns a TRUNCATED
+# read, which does not satisfy the read-before-edit gate, and the bounded-Read
+# workaround is only discoverable after burning the round-trip). A slightly early
+# crit3 costs a non-destructive archive+keep-newest rollup; a late one costs an
+# agent a silent failed edit.
+#
+# The prior value (4) underestimated by ~1.7x, ALWAYS in the flattering direction:
+# it scored 5 over-cap nodes as "HEALTHY" and put crit3's 80% proactive trigger at
+# ~135% of real cap, inverting the headroom it exists to provide.
+CHARS_PER_TOKEN = 2.3
+
+
 def _analyze_node_body(text):
     """Return (line_count, est_tokens, refresh_sections) for a node .md body.
 
-    est_tokens uses the ~4-chars/token markdown heuristic that underlies the
-    Read tool's ~25k-token cap. refresh_sections counts the dated append-grown
+    est_tokens divides by CHARS_PER_TOKEN (see the constant above for the
+    measurement + why it is not 4) to approximate the Read tool's ~25k-token
+    cap. refresh_sections counts the dated append-grown
     sweep headings (markdown headings whose text contains "refresh" or
     "verified values", case-insensitive) that are the structural signature of a
     recurring-sweep node — the shape the rb-2085 distill procedure targets.
@@ -666,7 +695,7 @@ def _analyze_node_body(text):
             low = s.lower()
             if "refresh" in low or "verified values" in low:
                 refresh_sections += 1
-    return line_count, char_count // 4, refresh_sections
+    return line_count, int(char_count / CHARS_PER_TOKEN), refresh_sections
 
 
 def get_distill_candidates(tree, include_skipped=False):
@@ -1547,6 +1576,16 @@ from _l1_pick import (  # noqa: E402
     log_l1_pick as _l1_log,
 )
 
+# tree_growth_log SSOT () — same split-brain reason as _l1_pick
+# above: the daemon batch/reparent branches import these very functions, so
+# the structural-op log cannot be written on one path and skipped on the
+# other. See _growth_log.py for the measured finding (there was never a
+# script writer for DECOMPOSE; the log's 8 frozen rows are prose residue).
+from _growth_log import (  # noqa: E402
+    record_batch as _growth_record_batch,
+    record_reparent as _growth_record_reparent,
+)
+
 
 def _append_l1_pick_log(target_node, l1, decision_type, source, reason):
     """Append one L1 pick log entry (CLI form: META_DIR + env identity). Fail-open."""
@@ -2358,6 +2397,13 @@ def cmd_remove_child(args):
         if child_key in nodes:
             del nodes[child_key]
         data["nodes"] = nodes
+        # tree_growth_log PRUNE row (). Standalone --remove-child
+        # gets the SAME row a batch remove-child gets — otherwise the two
+        # removal paths disagree, which is the split this goal exists to close.
+        _growth_record_batch(
+            data,
+            [{"op": "remove-child", "key": parent_key, "child_key": child_key}],
+            date.today().isoformat())
         data["last_updated"] = date.today().isoformat()
         return data
 
@@ -2731,6 +2777,12 @@ def cmd_batch(args):
         captured["propagate_results"] = propagate_results
 
         tree["nodes"] = nodes
+        # tree_growth_log: DECOMPOSE + PRUNE rows for this batch ().
+        # SSOT in _growth_log.py — the daemon's batch branch calls the SAME
+        # function, which is what stops this log going silent on one write path
+        # while working on the other (the  shape). Must run INSIDE
+        # the lock and BEFORE serialization: it mutates `tree`. Fail-open.
+        _growth_record_batch(tree, mutation_ops, date.today().isoformat())
         tree["last_updated"] = date.today().isoformat()
         return tree
 
@@ -3123,6 +3175,10 @@ def cmd_reparent(args):
         captured["new_cap"] = new_cap
 
         tree["nodes"] = nodes
+        # tree_growth_log REPARENT row () — inside the lock, before
+        # serialization. Same SSOT as the batch path; daemon mirrors this.
+        _growth_record_reparent(tree, node_key, new_parent_key,
+                                date.today().isoformat())
         tree["last_updated"] = date.today().isoformat()
         return tree
 

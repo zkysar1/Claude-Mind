@@ -15,6 +15,17 @@
 #   explicitly traded "ask first" for "notify after, revert if wrong"; the
 #   notify-after half was silently not executing, so the autonomy was unearned.
 #
+#   RE-MEASURED 2026-07-28 () — quote THIS, not the 07-14 line above,
+#   which is a pre-gate snapshot: 197 material rows fleet-wide, 166 final / 31
+#   expired = 16% expiry, down from 34%. The corpus tripled and the rate more
+#   than halved, so this gate is working. Caveat that survives both numbers:
+#   `final` proves the RECORD was completed, NOT that an email reached the user
+#   (MIND_EVOLUTION_NOTIFY_DRYRUN=1 finalizes without sending) — so `final`
+#   counts are an upper bound on delivery, never a measure of it. The 07-14
+#   figure was almost re-quoted verbatim into a user email 19h into a live
+#   incident; the finding-disproof gate refused the send and the re-measure is
+#   what came back. Date any figure you put here.
+#
 #   The expiry sweep is the honest FALLBACK. This script is the missing PROMPT:
 #   it fires a WM sentinel while the stub is still finalizable, and
 #   aspirations-precheck Phase 0-pre2.5 forces the LLM to complete it BEFORE
@@ -49,7 +60,7 @@ source "$SCRIPT_DIR/_paths.sh" 2>/dev/null || exit 0
 THRESHOLD_MINUTES=20
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --threshold-minutes) THRESHOLD_MINUTES="${2:-20}"; shift 2 ;;
+        --threshold-minutes) THRESHOLD_MINUTES="${2:-20}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         *) shift ;;
     esac
 done

@@ -46,6 +46,36 @@ def _run(tmp_path, *, vault_body, agent="alpha", extra_args=(), mock_state=None)
     env["PROVISION_GH_VAULT_FILE"] = str(vault_file)
     env["SSH_KEY_DIR"] = str(ssh_dir)
     env["GH_REPO"] = "zkysar1/Ayoai-Mind"
+    # Control the vault-key derivation (). VAULT_KEY above is a
+    # hardcoded literal, but the script does not take it — it DERIVES
+    # ${VAULT_KEY_PREFIX}_FLEET_GH_DEPLOYKEY_ADMIN_TOKEN, where VAULT_KEY_PREFIX
+    # is the uppercased first segment of ENVIRONMENT_ID (default "ayoai-mind").
+    # Since `env` starts as dict(os.environ), both inputs leaked ambiently, so
+    # the fixture and the script agreed only by COINCIDENCE of that default.
+    # Under any other env-id the script looks for a key the fixture never wrote,
+    # finds none, takes the DORMANT-BUT-READY branch — which the first test
+    # asserts is correct — and the seven non-dormant tests fail. Measured on
+    # Linux 2026-07-27: bare run 8 passed; ENVIRONMENT_ID=zds-mind 1 passed /
+    # 7 failed, exactly the non-dormant set.
+    #
+    # This is NOT only hygiene: this repo is the DEV SOURCE of the Ayoai-Mind ->
+    # Claude-Mind -> ZDS-Mind promotion chain, whose downstream env-ids differ BY
+    # CONSTRUCTION — the suite would pass here forever and ship broken to every
+    # consumer.
+    #
+    # PIN the root input (matches the sibling provision-from-vault tests, and
+    # keeps the derivation itself under test — if it breaks, these go dormant
+    # and fail loudly), then CLEAR every override the script honors further down
+    # the chain. The chain has THREE ambient entry points, and pinning only the
+    # first defends against none of the others:
+    #     ENVIRONMENT_ID  -> VAULT_KEY_PREFIX -> GH_DEPLOYKEY_VAULT_KEY
+    # Both later links are `: "${VAR:=default}"` / `if [ -z "${VAR:-}" ]` forms,
+    # so an ambient value wins outright and the pin above never gets consulted.
+    # guard-1484: clear the value when the run must MEASURE resolution rather
+    # than dictate it.
+    env["ENVIRONMENT_ID"] = "ayoai-mind"
+    env.pop("VAULT_KEY_PREFIX", None)
+    env.pop("GH_DEPLOYKEY_VAULT_KEY", None)
     if mock_state is not None:
         env["PROVISION_GH_MOCK_STATE"] = str(mock_state)
     proc = subprocess.run(

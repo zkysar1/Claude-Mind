@@ -4,7 +4,10 @@ Advisory same-surface-race probe at goal-pickup. These tests pin the pure
 classifier contract — path/keyword extraction, commit-goal-id parse, path
 overlap, and the overlap classifier including the canonical 2026-05-13 race
 (partner already shipped) and the own-goal exclusion. The git/daemon/team-state
-reads in main() are impure and exercised only at runtime, not here.
+reads in main() are impure and otherwise exercised only at runtime — the sole
+exception is the telemetry test at the bottom (g-115-3626), which spawns main()
+because asserting the `_gate_log.log(...)` call exists in the source would prove
+wiring and not execution (guard-1451).
 
 Pattern: importlib + sys.path (the script name has hyphens, so it cannot be a
 plain `import`), per test_defer_drift_check.py.
@@ -1006,3 +1009,63 @@ def test_release_alone_does_not_set_race_risk():
     live, _ = M.corroborate_claims("g-115-99", live, {})
     assert live and not any(
         h["kind"] in ("claim", "complete") for h in live)
+
+
+# ── telemetry () ───────────────────────────────────────────────────
+# END-TO-END: spawns the probe and reads the firing back off disk. A source-grep
+# assertion would prove the call is WRITTEN, never that it RUNS (guard-1451).
+#
+# COVERAGE LIMIT, stated rather than glossed: only the `noop` decision is
+# reachable hermetically. `pass` and `block` require a goal that EXISTS in the
+# live queue (the probe reads its title/paths from there — there is no
+# text-injection flag), so producing them here would make the test depend on
+# live queue contents and on a git/board scan.
+#
+# Out-of-band confirmation, so this reads as a test limit and not an unverified
+# branch: ALL THREE decisions were confirmed live on 2026-07-28.
+#   noop  — the hermetic test below (nonexistent goal, nothing to compare).
+#   block — probe run against  itself, race_risk=true → one `block`
+#           record with 18 affected_paths / 12 overlapping_commits.
+#   pass  — a real loop pickup of  at 21:31:41, race_risk=false with
+#           3 affected_paths / 8 keywords / 58 product_repos_scanned.
+# So the mapping is fully exercised in production; what remains untestable HERE
+# is only reproducing pass/block hermetically, which is a fixture limitation and
+# not an unverified code path.
+
+def test_telemetry_firing_lands_on_disk(tmp_path):
+    import json
+    import os
+    import subprocess
+
+    meta = tmp_path / "meta"
+    meta.mkdir()
+    env = dict(os.environ)
+    env.update({"MIND_META": str(meta),
+                "GATE_LOG_ALLOW_PYTEST": "1",   # lift _gate_log's pytest no-op
+                "STORAGE_BACKEND": "local"})    # never S3 (guard-955 / rb-2983)
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--goal-id", "g-999-99",
+         "--source", "world", "--since-hours", "1", "--output", "json"],
+        capture_output=True, text=True, timeout=300, env=env)
+    assert r.returncode == 0, r.stderr
+
+    log = meta / "gate-firings.jsonl"
+    assert log.exists(), "the probe ran but emitted no firing record"
+    rows = [json.loads(l) for l in log.read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert len(rows) == 1, rows
+    assert rows[0]["gate_id"] == "goal-pickup-coordination"
+    # A goal id that matches nothing yields no paths and no keywords: the probe
+    # was invoked but had nothing to compare, which is exactly `noop`.
+    assert rows[0]["decision"] == "noop"
+    assert rows[0]["extra"]["race_risk"] is False
+    assert rows[0]["caller"] == "goal-pickup-coordination-check.main"
+
+
+def test_telemetry_gate_is_registered_in_gates_yaml():
+    import yaml
+    root = Path(__file__).resolve().parent.parent.parent
+    reg = yaml.safe_load((root / "config/gates.yaml").read_text(encoding="utf-8"))
+    row = next((g for g in reg["gates"] if g["id"] == "goal-pickup-coordination"), None)
+    assert row is not None, "goal-pickup-coordination missing from core/config/gates.yaml"
+    assert row["instrumented"] is True
+    assert row["script"] == "core/scripts/goal-pickup-coordination-check.py"

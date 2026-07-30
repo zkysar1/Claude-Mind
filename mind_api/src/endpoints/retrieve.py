@@ -405,12 +405,29 @@ def handle(ctx) -> "Response":  # type: ignore[name-defined]
 
                 supp_items = []
                 supp_detail = []
+                # MEMBERSHIP IS COMPUTED ONCE, BY THE LOADER ().
+                # These four lists ARE the loaders' return sets: already filtered
+                # by `_entry_matches` (strict category, THEN token-overlap
+                # fallback), widened by the embedding blend, and capped. Do NOT
+                # re-derive membership here — that is a second predicate free to
+                # drift from the one that selected the return set, and it did.
+                # The narrower `_entry_matches_category` dropped every entry that
+                # arrived via the text fallback, so a free-text query bumped
+                # retrieval_count on entries `utilization-feedback --helpful`
+                # could never credit: denominator grew, numerator unreachable,
+                # utility_ratio drifted to 0, record sank out of ranking and
+                # never recovered. load_reasoning_bank's docstring states the
+                # violated invariant verbatim ("the bump set MUST equal the
+                # return set") and warns off exactly the
+                # `is_universal_rb or _entry_matches_category` test that stood
+                # here: that decides ELIGIBILITY, and the cap decides RETURN.
+                # Note the `is_universal_rb` disjunct was also INERT — the domain
+                # list is built with `not is_universal_rb(r)`, so it could never
+                # fire, which is why the measured free-text case dropped 100% of
+                # reasoning_bank and not merely the non-universal part.
                 for item in reasoning_bank:
                     iid = item.get("id", "")
                     if not iid:
-                        continue
-                    if not (_r.is_universal_rb(item)
-                            or _r._entry_matches_category(item, categories)):
                         continue
                     supp_items.append({"id": iid, "type": "reasoning_bank"})
                     text = _r._item_text_for_tokens(item, "reasoning_bank")
@@ -437,8 +454,7 @@ def handle(ctx) -> "Response":  # type: ignore[name-defined]
                     iid = item.get("id", "")
                     if not iid:
                         continue
-                    if not _r._entry_matches_category(item, categories):
-                        continue
+                    # No re-derivation — see the membership note above.
                     supp_items.append({"id": iid, "type": "guardrail"})
                     text = _r._item_text_for_tokens(item, "guardrail")
                     supp_detail.append({
@@ -451,8 +467,7 @@ def handle(ctx) -> "Response":  # type: ignore[name-defined]
                     iid = item.get("id", "")
                     if not iid:
                         continue
-                    if not _r._entry_matches_category(item, categories):
-                        continue
+                    # No re-derivation — see the membership note above.
                     supp_items.append({"id": iid,
                                        "type": "pattern_signature"})
                     text = _r._item_text_for_tokens(item,

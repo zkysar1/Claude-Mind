@@ -46,11 +46,63 @@ Applies to:
 4. **The automated safety net is PARTIAL — Rules 1-3 are the real guarantee**:
    `core/scripts/pre-edit-context-gate.sh` is wired as a PreToolUse[Edit|MultiEdit]
    advisory hook. It consults the session's context-reads manifest (via
-   `context-reads.py check-file`) and prints a stderr advisory when the target has
-   not been Read. The warning is advisory (never blocks) — seeing it means stop
-   and Read the file first.
+   `context-reads.py check-file`) and, when the target has not been Read, emits
+   the advisory on two channels: a stderr banner (what a human watching the
+   terminal sees) and a structured `permissionDecision: "allow"` payload, which
+   is the only channel that reaches the model. It never denies and never blocks
+   — seeing the advisory means stop and Read the file first.
 
-   But the gate fires ONLY for the path classes the context-reads manifest
+   **Two distinct advisories, matching Rule 1's conditional** (g-115-3747).
+   "has not been Read this session" means no read of any kind was recorded — Read
+   it. "was Read only in part this session (ranged read)" means the file WAS
+   opened with offset/limit/pages, so Rule 1's "count only if they cover the
+   region being edited" is now yours to evaluate: if your ranged read covered the
+   region you are about to change, proceed; if not, read that region first. Until
+   g-115-3747 ranged reads were discarded by the recorder outright, so they
+   produced the *first* message — a false claim, fired on every large file, which
+   is exactly the file whose advisory most needs to be believed. Note the gate
+   deliberately does NOT go silent on a ranged read: silence would assert full
+   context the manifest cannot vouch for, trading a false alarm for a false
+   all-clear.
+
+   **It did nothing at all from 2026-05-30 to 2026-07-28** (g-115-3731). Two
+   independent defects, either sufficient alone: it bailed on an unset
+   `MIND_AGENT`, which PreToolUse[Edit] never provides, so it exited before its
+   own check on every real invocation; and it wrote only to stderr, which a
+   non-blocking PreToolUse hook cannot deliver to the model (guard-1680). It
+   hand-tested green the whole time, because a hand-run shell HAS `MIND_AGENT`
+   set — the only environment where it failed was the only environment where it
+   ran. If you are reading a version of this rule dated before that fix, it was
+   describing a net that was not there. Both defects are now mutation-proofed by
+   production-shape tests in `core/scripts/tests/test_pre_edit_context_gate.py`.
+
+   **On Windows the 2026-07-28 revival did not take effect until 2026-07-29**
+   (g-115-3820). Three further defects, each Windows-only and each silent, kept
+   the gate 100% inert on this platform after it was declared fixed — so for one
+   more day the paragraph above was still describing a net that was not there,
+   just on fewer boxes. (1) The cheap path pre-filter added the SAME DAY as the
+   revival matched forward-slash globs, but Claude Code sends `file_path` in
+   native form, so every backslashed Windows path fell through to `*) exit 0` —
+   a false REJECT on 100% of Windows edits, violating that pre-filter's own
+   stated invariant, and killing the gate in BOTH the hand-test and production
+   shapes. (2) `source _platform.sh` ran before agent resolution; it exports
+   `MSYS_NO_PATHCONV=1`, under which `session-binding-read.sh` resolves to empty
+   on Git Bash (g-304-19) — the three sibling context-reads hooks already carry
+   the ordering fix and its comment, and this gate was the family member that
+   missed it. (3) `tree-write-fence.sh` redirected to `/dev/stderr`, which does
+   not resolve when stderr is a pipe, so `|| exit 0` ate the entire fence
+   invocation under every captured-output caller.
+
+   The through-line worth carrying: all three hand-tested green for the same
+   reason the original 59-day inertia did — an interactive shell has no
+   `MSYS_NO_PATHCONV`, a terminal has a real `/dev/stderr`, and a hand-typed
+   path uses forward slashes. **The only environment where the gate failed
+   remained the only environment where it actually ran.** A green suite on one
+   OS is not evidence a hook works; this gate has now been declared fixed twice
+   while inert. Treat platform as part of the production shape (guard-920), and
+   record the box and OS with any claim that a hook is live.
+
+   The gate fires ONLY for the path classes the context-reads manifest
    advisory-tracks: `core/config/**`, `.claude/skills/**`,
    `world/knowledge/tree/**`, `world/conventions/**`, `aspirations-compact.json`,
    and — since g-115-2210 — `core/scripts/**` (framework code, the surface where
@@ -62,6 +114,16 @@ Applies to:
    a warning is therefore NOT evidence you have current context. Rules 1-3 are
    honor-system for the out-of-scope majority — the gate backstops only the
    trackable subset.
+
+   Two further exclusions, both silent and both deliberate. A cheap bash
+   path pre-filter short-circuits out-of-scope paths before any subprocess
+   spawn, so the gate adds no measurable cost to an edit it will not act on
+   (measured cc-05: 53ms before the fix, 55ms after, on an out-of-scope path;
+   ~156ms in-scope, paid only where the gate does its job). And the
+   constitutional anchor (`.claude/settings.local.json`,
+   `settings-structural-validator.{py,sh}`) is excluded outright — the payload's
+   `allow` short-circuits the permission system, and the anchor must never
+   receive one.
 
    Scope-split caveat (g-115-2210): `core/scripts/**` is *advisory-only*. Its
    reads are recorded and the edit advisory fires there, but the separate

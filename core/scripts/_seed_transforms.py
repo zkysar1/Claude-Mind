@@ -203,6 +203,20 @@ def _is_comment_line(line: str, suffix: str) -> bool:
     return False
 
 
+def _is_whole_line_comment(line: str, suffix: str) -> bool:
+    """True when the STRICT per-language patterns call this whole line a comment.
+
+    Deliberately narrower than `_is_comment_line`, which ALSO accepts a relaxed
+    inline-hash scan (`re.search(r'\\s#', line)`) that is NOT quote-aware and so
+    fires on `msg = "step # 1"` — a pure code line. Callers that mutate text need
+    to know WHY a line counted as comment context: a real trailing marker (use
+    `_split_comment_span`), a genuine whole-line comment/docstring (this), or
+    merely the relaxed scan being fooled by a hash inside a string (neither —
+    leave the line alone). g-115-3374.
+    """
+    return any(p.match(line) for p in _COMMENT_PATTERNS.get(suffix, []))
+
+
 _EXAMPLE_MARKERS = re.compile(
     r"(?i)\b(?:example|e\.g\.|for\s+example|sample|illustrat\w*|placeholder)\b"
 )
@@ -270,7 +284,35 @@ def apply_inline_edit(content: str, rule: dict) -> str:
     for i, line in enumerate(lines):
         prev = lines[i - 1] if i > 0 else ""
         if _check_context(line, context, suffix, prev):
-            line = re.sub(pattern, replacement, line, flags=flags)
+            # CODE-SPAN GUARD (g-115-3374) — the third of the three handlers
+            # guard-1640's trigger_condition names. No inline_edit rule reaches
+            # this branch TODAY (I18a is the only one with when_in_context, and
+            # it uses example_value), so this is latent rather than active. It
+            # is fixed anyway because the shape, not the rule set, is the
+            # defect: apply_global_regex was equally "inactive" until G13/G14
+            # were authored against it, and it then shipped 47 corrupted sites.
+            # See apply_global_regex for why the else branch is a whole-line sub.
+            if context == "comment":
+                head, sep, tail = _split_comment_span(line, suffix)
+                if sep:
+                    line = head + sep + re.sub(pattern, replacement, tail, flags=flags)
+                elif _is_whole_line_comment(line, suffix):
+                    # No trailing marker, but the STRICT patterns say the whole
+                    # line is comment context: a .py docstring or a .md
+                    # `<!-- -->`. Neither carries a bare '#' to split on, so the
+                    # whole line is the comment. Stripping ids from docstrings
+                    # is G13's main job — skipping here would turn a corruption
+                    # bug into a silent coverage regression.
+                    line = re.sub(pattern, replacement, line, flags=flags)
+                # else: `_is_comment_line` accepted this line ONLY via its
+                # relaxed, non-quote-aware inline-hash scan, while the
+                # quote-aware split found no real marker — i.e. the only '#' is
+                # INSIDE a string literal (`msg = "step # 1"`). That is code,
+                # not comment. Leave it untouched; substituting here deleted
+                # ids out of string literals (found by fresh-eyes review of
+                # this very fix, g-115-3374).
+            else:
+                line = re.sub(pattern, replacement, line, flags=flags)
         out_lines.append(line)
     return "".join(out_lines)
 
@@ -295,7 +337,45 @@ def apply_global_regex(content: str, rule: dict, rel_path: str) -> str:
     for i, line in enumerate(lines):
         prev = lines[i - 1] if i > 0 else ""
         if _check_context(line, context, suffix, prev):
-            line = re.sub(pattern, replacement, line, flags=flags)
+            # CODE-SPAN GUARD (g-115-3374) — the global_regex twin of the guard
+            # in apply_word_list_strip. `_is_comment_line` returns True for a
+            # CODE line carrying a TRAILING comment, and G13/G14 have an EMPTY
+            # replacement, so a whole-line sub DELETES ids out of executable
+            # code. Measured at hop 1 of the promotion chain: 53 goal-ids and
+            # `DEFAULT_TARGET_ASP = "asp-001"` deleted from code, 53/53 of them
+            # on a line containing '#', 0 on a line without one — while 108
+            # goal-ids on '#'-free lines in the same files survived untouched.
+            # Damage lands in assertions and fixtures that still compile, so it
+            # is silent: `== ["g-115-01","g-115-02","g-115-03"]` promoted as
+            # `== ["", "", ""]` while the fixture inputs kept their ids.
+            #
+            # The `else` branch MUST stay a whole-line sub, NOT a no-op (this is
+            # where the word_list_strip form would be wrong here): a .py
+            # docstring line and a .md `<!-- -->` line are genuine comment
+            # context that `_split_comment_span` cannot split, because neither
+            # carries a bare `#`. Skipping them would stop G13 stripping ids
+            # from docstrings — the rule's main job — instead of fixing it.
+            if context == "comment":
+                head, sep, tail = _split_comment_span(line, suffix)
+                if sep:
+                    line = head + sep + re.sub(pattern, replacement, tail, flags=flags)
+                elif _is_whole_line_comment(line, suffix):
+                    # No trailing marker, but the STRICT patterns say the whole
+                    # line is comment context: a .py docstring or a .md
+                    # `<!-- -->`. Neither carries a bare '#' to split on, so the
+                    # whole line is the comment. Stripping ids from docstrings
+                    # is G13's main job — skipping here would turn a corruption
+                    # bug into a silent coverage regression.
+                    line = re.sub(pattern, replacement, line, flags=flags)
+                # else: `_is_comment_line` accepted this line ONLY via its
+                # relaxed, non-quote-aware inline-hash scan, while the
+                # quote-aware split found no real marker — i.e. the only '#' is
+                # INSIDE a string literal (`msg = "step # 1"`). That is code,
+                # not comment. Leave it untouched; substituting here deleted
+                # ids out of string literals (found by fresh-eyes review of
+                # this very fix, g-115-3374).
+            else:
+                line = re.sub(pattern, replacement, line, flags=flags)
         out_lines.append(line)
     return "".join(out_lines)
 

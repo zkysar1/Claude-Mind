@@ -214,6 +214,51 @@ def _coerce_set_value(raw, string_flag):
     return raw  # already-typed JSON value
 
 
+def _assert_type_preserved(prev, value, string_flag, dotpath):
+    """Refuse a silent structured -> scalar-string whole-key replacement.
+
+    THE DEFECT (g-115-3462, live-reproduced g-115-3433). `_parse_value` attempts
+    json.loads ONLY when the stripped value starts with ``[`` or ``{``, and its
+    invalid-JSON branch falls through to the raw string. meta-set.sh always sends
+    ``value`` as a STRING, so a computed JSON payload that got a stray line of
+    stdout prepended begins with ``p``, no parse is attempted, and the whole key
+    is replaced by one scalar at HTTP 200 with nothing logged as wrong. Measured:
+    33 gap dicts in meta/skill-gaps.yaml became a single 50,359-char string;
+    `meta-read.sh` then returned `gaps` as type str and nothing errored anywhere.
+    g-115-1263 closed only the WELL-FORMED-JSON half of this class (arrays now
+    round-trip); the malformed half is what this closes.
+
+    Scope is deliberately narrow: ONLY list/dict -> str, and ONLY without the
+    explicit --string override. `null`/int/float/bool remain allowed, because
+    those are unambiguous deliberate scalars (e.g. disabling a dict-valued knob
+    with `null`) and no garbage-prefixed payload can parse into one — a corrupted
+    payload always lands as `str`, which is precisely the vector.
+
+    REFUSE rather than degrade-and-log, which is the opposite of this codebase's
+    usual posture for operator-supplied config (rb-5242). That entry's reasoning
+    is a boot-guard misfire family (rb-2917/4776/2857) where refusing converts
+    "degraded but serving" into "dead, unrecoverable without a redeploy". Neither
+    property holds here: this is a one-shot CLI/endpoint write, so a refusal costs
+    the caller a retry, and degrade-and-log IS the current behavior — it is what
+    destroys the data. rb-5242's own carve-out ("reserve refuse for values whose
+    absence makes the subsystem actively unsafe") covers whole-key destruction.
+    What IS taken from rb-5242: name the knob in the message.
+    """
+    if string_flag:
+        return
+    if isinstance(prev, (list, dict)) and isinstance(value, str):
+        shape = "{} of {} item(s)".format(type(prev).__name__, len(prev))
+        raise _MetaYamlError(
+            400, "type_destruction",
+            "refusing to replace '{}' ({}) with a {}-char plain string — this "
+            "would destroy the whole key. The value did not parse as JSON "
+            "(a JSON payload must start with '[' or '{{'; got {!r}). Common "
+            "cause: a stray line of stdout prepended to a computed payload. "
+            "Fix the payload, or pass --string if replacing the structure with "
+            "a literal string is genuinely intended. (g-115-3462)".format(
+                dotpath, shape, len(value), value[:40]))
+
+
 def _load_bounds(ctx) -> Dict[str, Any]:
     meta_config = ctx.paths.project_root / "core" / "config" / "meta.yaml"
     if not meta_config.exists():
@@ -286,23 +331,35 @@ def _create_backpressure_monitor(ctx, mc_id, file_rel, dotpath, old_value, new_v
             if entries:
                 recent = entries[-min(10, len(entries)):]
                 baseline = sum(e.get("learning_value", 0) for e in recent) / len(recent)
-        bp = _read_yaml(bp_path)
-        if "version" not in bp:
-            bp = {"version": 1, "active_monitors": [], "rollback_history": []}
         config = _load_bounds(ctx).get("backpressure", {})
         max_monitors = config.get("max_active_monitors", 5)
-        monitors = bp.get("active_monitors", [])
-        if len(monitors) >= max_monitors:
-            monitors.pop(0)
-        monitors.append({
-            "meta_change_id": mc_id, "strategy_file": file_rel, "field": dotpath,
-            "old_value": old_value, "new_value": new_value,
-            "baseline_imp_k": round(baseline, 4), "goals_since_change": 0,
-            "imp_k_samples": [], "consecutive_below_baseline": 0,
-            "consecutive_above_baseline": 0, "status": "monitoring", "created": _now(),
-        })
-        bp["active_monitors"] = monitors
-        _persist(ctx, bp_path, bp)
+
+        # Fence-only writer: backpressure.yaml has NO backend merge handler, so
+        # the fenced write IS the whole defense and a stale fence is a permanent
+        # wedge with no recovery (; the meta-YAML class distinction
+        # -b's aspirations-scoped conclusion does not extend to).
+        # Same locked_rmw + force_fresh cycle as set_field/append_item. The read
+        # MUST stay inside the cycle — hoisting it re-opens the unlocked-RMW
+        # lost-update window (pinned by test_read_and_write_both_happen_inside_the_lock).
+        # The velocity/baseline read above is read-only and correctly stays out.
+        def _cycle():
+            bp = _read_yaml(bp_path, force_fresh=True)
+            if "version" not in bp:
+                bp = {"version": 1, "active_monitors": [], "rollback_history": []}
+            monitors = bp.get("active_monitors", [])
+            if len(monitors) >= max_monitors:
+                monitors.pop(0)
+            monitors.append({
+                "meta_change_id": mc_id, "strategy_file": file_rel, "field": dotpath,
+                "old_value": old_value, "new_value": new_value,
+                "baseline_imp_k": round(baseline, 4), "goals_since_change": 0,
+                "imp_k_samples": [], "consecutive_below_baseline": 0,
+                "consecutive_above_baseline": 0, "status": "monitoring", "created": _now(),
+            })
+            bp["active_monitors"] = monitors
+            _persist_unlocked(ctx, bp_path, bp)
+
+        file_locks.locked_rmw(bp_path, _cycle)
     except Exception:  # noqa: BLE001 — non-fatal, matches CLI broad catch (stderr-only)
         pass
 
@@ -311,13 +368,6 @@ def _trigger_generation_transition(ctx):
     """Lifted from meta-yaml.py (inline lightweight version; non-fatal)."""
     try:
         gen_path = ctx.paths.meta / "strategy-generations.yaml"
-        gen = _read_yaml(gen_path)
-        if "version" not in gen:
-            return  # not initialised
-        generations = gen.get("generations", [])
-        if generations and generations[-1].get("ended") is None:
-            generations[-1]["ended"] = _now()
-        new_num = gen.get("current_generation", 0) + 1
         snapshot = {}
         strategy_files = [
             "goal-selection-strategy.yaml", "reflection-strategy.yaml",
@@ -337,15 +387,31 @@ def _trigger_generation_transition(ctx):
                             for k2, v2 in v.items():
                                 if isinstance(v2, (int, float, str, bool, type(None))):
                                     snapshot["{}.{}.{}".format(prefix, k, k2)] = v2
-        generations.append({
-            "generation": new_num, "started": _now(), "ended": None,
-            "goals_completed": 0, "parameter_snapshot": snapshot,
-            "metrics": {"avg_learning_value": 0.0, "total_learning_value": 0.0},
-            "best_score": 0.0, "worst_score": 1.0,
-        })
-        gen["generations"] = generations
-        gen["current_generation"] = new_num
-        _persist(ctx, gen_path, gen)
+        # Fence-only writer, same class and same cure as _create_backpressure_monitor
+        # above (). The snapshot build hoisted above is READ-ONLY over six
+        # OTHER files and is independent of `gen`, so it correctly stays outside the
+        # cycle — only the strategy-generations.yaml read-modify-write belongs inside.
+        # The "not initialised" check moved in with the read it depends on: deciding
+        # from a pre-cycle read would race the very peer write this fix guards against.
+        def _cycle():
+            gen = _read_yaml(gen_path, force_fresh=True)
+            if "version" not in gen:
+                return  # not initialised — no write, cycle is a no-op
+            generations = gen.get("generations", [])
+            if generations and generations[-1].get("ended") is None:
+                generations[-1]["ended"] = _now()
+            new_num = gen.get("current_generation", 0) + 1
+            generations.append({
+                "generation": new_num, "started": _now(), "ended": None,
+                "goals_completed": 0, "parameter_snapshot": snapshot,
+                "metrics": {"avg_learning_value": 0.0, "total_learning_value": 0.0},
+                "best_score": 0.0, "worst_score": 1.0,
+            })
+            gen["generations"] = generations
+            gen["current_generation"] = new_num
+            _persist_unlocked(ctx, gen_path, gen)
+
+        file_locks.locked_rmw(gen_path, _cycle)
     except Exception:  # noqa: BLE001 — non-fatal, matches CLI broad catch
         pass
 
@@ -441,6 +507,9 @@ def set_field(ctx) -> "Response":  # type: ignore[name-defined]
                 prev = parent[key]
             except (KeyError, IndexError, TypeError):
                 prev = None
+            # Raise BEFORE any mutation: _persist_unlocked is below, so the file
+            # is left untouched and the caller gets a 400 ().
+            _assert_type_preserved(prev, value, string_flag, dotpath)
             if isinstance(parent, list) and isinstance(key, int) and key == len(parent):
                 parent.append(value)
             else:
@@ -537,10 +606,46 @@ def log_record(ctx) -> "Response":  # type: ignore[name-defined]
     log_path = ctx.paths.meta / "meta-log.jsonl"
     assert_not_cruft(log_path.parent, "mkdir (meta_yaml log endpoint)")
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(raw + "\n")
+    # Materialize an S3-only file locally before the append, so the record
+    # extends the authoritative content instead of a stale/absent mirror.
+    # The sibling _append_log path gets this for free via _next_meta_change_id;
+    # this endpoint had no equivalent ().
+    #
+    # FAIL-OPEN, deliberately. _refresh() bare-`raise`s any non-404 ClientError,
+    # so an S3 throttle, outage, or expired credential would turn this endpoint
+    # into a 500 and LOSE the record — strictly worse than the pre-fix behavior,
+    # which always landed the append locally and let the sync sweep carry it up.
+    # An audit log must not become less durable than it was. Degrade to the local
+    # append and SAY SO in the confirmation, so a caller can still tell that the
+    # offset is measured against a possibly-stale mirror.
+    stale_base = None
+    try:
+        from storage_backend import get_backend
+        get_backend().ensure_local(log_path)
+    except Exception as e:  # noqa: BLE001 — durability beats precision here
+        stale_base = "{}: {}".format(type(e).__name__, e)[:200]
+    payload = raw + "\n"
+    nbytes = len(payload.encode("utf-8"))
+    # newline="\n" pins the byte count. In text mode with newline=None, Python
+    # translates "\n" to os.linesep on write, so on a box where os.linesep is
+    # "\r\n" the file grows by one MORE byte than nbytes counts — making both
+    # `bytes` and `offset` wrong by one per record (their SUM still matches the
+    # file size, which is exactly why the error hides). Measured, not assumed.
+    with open(log_path, "a", encoding="utf-8", newline="\n") as f:
+        f.write(payload)
+        f.flush()
+        end = f.tell()
+    # The confirmation the meta-strategies.md contract promises. `path` and
+    # `offset` are what make a dropped or misrouted append self-detecting: a
+    # daemon bound to a different meta root reports a path the caller does not
+    # expect, and a non-advancing offset means the record did not extend the
+    # store ().
+    body = {"status": "logged", "path": str(log_path),
+            "offset": end - nbytes, "bytes": nbytes}
+    if stale_base is not None:
+        body["stale_base"] = stale_base
     return Response.text(
-        json.dumps({"status": "logged"}) + "\n", content_type="application/json")
+        json.dumps(body) + "\n", content_type="application/json")
 
 
 # ---------------------------------------------------------------------------

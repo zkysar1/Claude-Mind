@@ -50,9 +50,46 @@ class TestAnalyzeNodeBody(unittest.TestCase):
         self.assertEqual(lc, 3)
         self.assertGreater(tok, 0)
 
-    def test_token_estimate_is_chars_over_4(self):
+    def test_token_estimate_uses_calibrated_ratio_not_chars_over_4(self):
+        """The estimate divides by CHARS_PER_TOKEN, not the old 4.
+
+        This test previously asserted `tok == 1000` for 4000 chars, pinning
+        chars//4 — i.e. it pinned the DEFECT. chars//4 underestimates dense
+        technical markdown by ~1.7x, always in the flattering direction, which
+        scored 5 over-cap tree nodes as "HEALTHY" and inverted crit3's proactive
+        headroom (its 80% trigger sat at ~135% of true cap). Updated with the
+        fix (g-115-3553) per guard-1696: changing behavior a test pins obliges
+        updating the test, not deleting it.
+        """
         lc, tok, refs = tree_engine._analyze_node_body("x" * 4000)
-        self.assertEqual(tok, 1000)  # 4000 // 4
+        self.assertEqual(tok, int(4000 / tree_engine.CHARS_PER_TOKEN))
+        # Directional guarantee that matters more than the exact arithmetic:
+        # the estimate must be HIGHER than chars//4, because erring high is the
+        # fail-safe direction (rb-2077 — a node past the Read cap returns a
+        # truncated read, which does not satisfy the read-before-edit gate).
+        self.assertGreater(tok, 4000 // 4)
+
+    def test_token_estimate_matches_measured_token_count(self):
+        """Calibration pin: the ratio must reproduce a REAL measured count.
+
+        Ground truth is the exact token count reported by the Read tool's
+        truncation notice for product-world-model.md on 2026-07-27, when the
+        file was 67730 bytes: 29270 tokens. Asserting on a synthetic string can
+        only re-derive the arithmetic; only a measured pair can catch the ratio
+        drifting away from the content class it was calibrated on.
+
+        Tolerance is 5% — tight enough to fail if the ratio moves back toward 4
+        (which lands 42% low) and loose enough to survive tokenizer revisions.
+        """
+        chars, measured = 67730, 29270
+        _, tok, _ = tree_engine._analyze_node_body("x" * chars)
+        err = abs(tok - measured) / measured
+        self.assertLess(
+            err, 0.05,
+            f"estimate {tok} is {100 * err:.1f}% off the measured {measured} for "
+            f"{chars} chars of dense technical markdown; CHARS_PER_TOKEN="
+            f"{tree_engine.CHARS_PER_TOKEN} may have drifted off its calibration",
+        )
 
     def test_dated_refresh_headings_counted(self):
         text = (

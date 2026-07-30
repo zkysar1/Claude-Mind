@@ -676,21 +676,93 @@ do_state_update() {
     # sentinel; Phase 6 spark was skipped). Recurring goals get their sentinel
     # from recurring-close.sh's end-of-script write (POST-FLIP outcome), so guard
     # on !recurring to avoid a double-write. Routine outcomes skip (spark is
-    # deep-only). Dedup: the sentinel is now written AFTER the in-turn spark
-    # (Phase 6 runs between verify and state-update), so fired_at < set_at;
-    # spark-fire-dedup's consumption window brackets set_at by [-15min, +60min]
-    # (g-306-80/rb-2615; lower bound widened 10->15 by g-115-2988 after a slow
-    # post-compaction resume's Phase-6->Phase-8 gap hit 10m08s and false-fired at
-    # 8s past the old 10min bound), covering the proactive-before-set_at fire. A
-    # slow spark (>15min before state-update) would fire once redundantly next
-    # iteration — the dedup's own safe failure direction (a redundant fire, never a lost one).
+    # deep-only).
+    #
+    # DEDUP (g-115-3351 — the window is ELIMINATED here, not widened again).
+    # This sentinel is written AFTER the in-turn spark (Phase 6 runs between
+    # verify and state-update), so fired_at < set_at is the NORMAL shape. The
+    # read side used to absorb that with a lookback window, and that bound was
+    # outgrown FOUR times (~10m08s -> widened to 15; then 15m09s, 16m31s,
+    # 24m00s across three agents on three days) because it was bounding the
+    # LLM's Phase-6 work, which is UNBOUNDED BY DESIGN. Worse, the failures are
+    # left-censored — a gap under the bound dedups correctly and is never
+    # reported — so no field data can ever calibrate it.
+    # The write site already knows the goal_id, so it simply asks whether the
+    # in-turn spark ALREADY fired for this goal and, if so, does not write the
+    # sentinel at all. That makes the in-turn path timing-free and leaves the
+    # sentinel doing only its real job: covering the bg-timeout path where no
+    # in-turn fire happened. Sound because a NON-recurring goal closes exactly
+    # once, so any recorded fire is necessarily THIS close's.
+    # PRECISION (fresh-eyes F-1, same day): "no timing window" is exact WITHIN an
+    # iteration, not unconditionally. spark_fired_session is pruned at
+    # DEFAULT_PRUNE_MIN=90, so an entry older than 90min is dropped — but the ONLY
+    # thing that prunes is another spark's `record`, and sparks serialize within
+    # the loop, so nothing can record between THIS goal's Phase 6 and its Phase 8.
+    # The 90min prune is therefore a CROSS-iteration horizon that cannot fire
+    # mid-iteration. State it that way rather than "absent": the whole point of
+    # this fix is that an over-general claim about a bound is what went wrong.
+    # Fail-open: any error in the probe yields "write" — a redundant sentinel
+    # costs at most one extra spark, while a wrongly-suppressed one could lose
+    # the spark entirely. The read-side guard remains as defense-in-depth for
+    # exactly that degraded path (payload carries `producer`, which drops the
+    # consumer's lower bound for this producer only).
     local _su_is_recurring
     _su_is_recurring="$(_probe_is_recurring)"
     if [[ "$OUTCOME" == "deep" && "$_su_is_recurring" != "true" ]]; then
-        local _sp_expires _sp_setat _sp_payload
+        local _sp_expires _sp_setat _sp_payload _sp_gate _sp_verdict _sp_gap
         _sp_expires="$(python3 -c "from datetime import datetime, timedelta; print((datetime.now() + timedelta(minutes=60)).isoformat(timespec='seconds'))" 2>/dev/null || true)"
         _sp_setat="$(python3 -c "from datetime import datetime; print(datetime.now().isoformat(timespec='seconds'))" 2>/dev/null || true)"
-        if [[ -n "$_sp_expires" ]]; then
+
+        # Write-side gate + UNCENSORED gap measurement in one pass. Prints
+        # "write|skip-write[<TAB>gap_seconds]". bash->bash->python is fine here
+        # (the rb-225/rb-247 hang is python SPAWNING bash, not this direction).
+        _sp_gate="$(bash "$SCRIPT_DIR/wm-read.sh" spark_fired_session --json 2>/dev/null \
+                    | python3 "$SCRIPT_DIR/spark-fire-dedup.py" fired "$GOAL_ID" --set-at "$_sp_setat" 2>/dev/null || true)"
+        [[ -z "$_sp_gate" ]] && _sp_gate="write"   # fail-open
+        _sp_verdict="${_sp_gate%%$'\t'*}"
+        _sp_gap=""
+        [[ "$_sp_gate" == *$'\t'* ]] && _sp_gap="${_sp_gate##*$'\t'}"
+
+        # Telemetry: log the gap for EVERY non-recurring deep close, including
+        # the ones that dedup correctly. Logging only the near-misses would keep
+        # the sample censored at the bound; logging every gap is what removes the
+        # censoring and yields the real distribution (g-115-3351's third
+        # confirmation). gap_seconds is null when no in-turn fire was recorded.
+        SG_GOAL="$GOAL_ID" SG_AGENT="${MIND_AGENT:-unknown}" SG_GAP="$_sp_gap" \
+        SG_VERDICT="$_sp_verdict" SG_SETAT="$_sp_setat" \
+        SG_FILE="$AGENT_DIR/session/spark-gap-telemetry.jsonl" \
+        python3 -c '
+import json, os
+gap = os.environ.get("SG_GAP", "")
+rec = {
+    "goal_id":      os.environ["SG_GOAL"],
+    "agent":        os.environ["SG_AGENT"],
+    "gap_seconds":  (float(gap) if gap else None),
+    "sentinel_written": os.environ["SG_VERDICT"] != "skip-write",
+    "set_at":       os.environ.get("SG_SETAT") or None,
+}
+path = os.environ["SG_FILE"]
+with open(path, "a", encoding="utf-8") as f:
+    f.write(json.dumps(rec) + "\n")
+# ROTATION (guard-583): an append-only telemetry file MUST have a rotation
+# policy in place, not just a .gitignore entry -- the canonical failure
+# (.bash-inject-misses.jsonl) had the ignore rule and still grew unbounded.
+# Keep the newest KEEP lines once the file exceeds CAP. The distribution this
+# feeds is a recent-behavior question, so old rows carry no analytic value.
+CAP, KEEP = 2000, 1000
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    if len(lines) > CAP:
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(lines[-KEEP:])
+except OSError:
+    pass
+' 2>/dev/null || true
+
+        if [[ "$_sp_verdict" == "skip-write" ]]; then
+            echo "[iteration-close] pending_phase_6_spark: NOT written for $GOAL_ID — in-turn Phase-6 spark already recorded${_sp_gap:+ (gap ${_sp_gap}s)}. Write-site dedup — no timing window within the iteration (g-115-3351)."
+        elif [[ -n "$_sp_expires" ]]; then
             # python3 (not py -3) is correct inside this .sh — it sources _paths.sh.
             # Values pass via env (guard-165), never interpolated into the source.
             _sp_payload="$(GID="$GOAL_ID" OUT="$OUTCOME" SRC="$SOURCE" SUM="${SUMMARY:-}" EXP="$_sp_expires" SETAT="$_sp_setat" python3 -c '
@@ -702,6 +774,10 @@ print(json.dumps({
     "summary":    os.environ.get("SUM", ""),
     "expires_at": os.environ["EXP"],
     "set_at":     os.environ.get("SETAT", ""),
+    # g-115-3351: names WHICH producer wrote this sentinel, so the consumer can
+    # drop its lower bound for this path only. recurring-close.sh writes no
+    # producer field and keeps the bounded behavior, which is correct there.
+    "producer":   "nonrecurring-state-update",
 }))
 ' 2>/dev/null || true)"
             if [[ -n "$_sp_payload" ]]; then
@@ -860,9 +936,13 @@ if hit is None:
 else:
     asp_id, rec, wc, cat = hit
     # Field order asp_id,recurring,category,work_class — category BEFORE
-    # work_class so an empty work_class lands TRAILING. Bash IFS=$'\t' read
-    # collapses empty MIDDLE fields on MSYS but preserves trailing. Reorder
+    # work_class so an empty work_class lands TRAILING. A bash read with a tab
+    # IFS collapses empty MIDDLE fields on MSYS but preserves trailing. Reorder
     # avoids the collapse. g-115-175 root cause (2026-04-24).
+    # Do NOT write the ANSI-C tab quote in this comment. It sits inside a
+    # single-quoted python block, so its two quote marks close and REOPEN the
+    # bash string; an EVEN count still passes bash -n, which is why the prior
+    # wording survived undetected (guard-504, g-115-3565).
     print(asp_id + "\t" + ("true" if rec else "false") + "\t" + cat + "\t" + wc)
 ' || { echo "[iteration-close] WARN: aspiration lookup for $GOAL_ID failed — asp_id/recurring/work_class/category unavailable, append will be skipped" >&2; echo $'\t\t\t'; })"
     # Split 4 tab-separated fields (asp_id, recurring, category, work_class).
@@ -1232,6 +1312,76 @@ print(sha)
         fi
     fi
 
+    # Step 8.79a Branch-landed advisory (g-115-3838). ADVISORY, never blocking.
+    #
+    # guard-1548 has documented "a completed status is not evidence the
+    # deliverable reached main" for a while: retrieval_count 31, times_helpful 0
+    # — retrieved often, reaching the CLOSING moment never. Three product goals
+    # closed done on 2026-07-29 with their work sitting in green mergeable
+    # branches nobody had landed (two for five hours, one for six days), and a
+    # terminal goal is invisible to every blocker/defer/blocked-signal sweep by
+    # construction, so no sweep could have found them. The gap was enforcement
+    # at close, not knowledge.
+    #
+    # REUSES the existing tier-2 predicate rather than reimplementing ancestry:
+    # completed-not-committed-sweep.py already decides "did everything reach the
+    # default branch?" via `git branch -r --contains` (the branch-enumeration
+    # form the goal preferred over PR-listing, which is blind to a branch pushed
+    # without one) and already separates stranded_open_pr from the weaker
+    # stranded_no_pr. --goal + --no-fetch (g-115-3838) are what make it callable
+    # for ONE goal at close time.
+    #
+    # --min-age-minutes 0 is REQUIRED: the goal just closed, so it is far younger
+    # than the 30-min push-throttle guard and would otherwise be filtered out
+    # before any check ran — a silent no-op that would look like a clean pass.
+    # --no-fetch is what makes this affordable: measured cc-05, the fetch does
+    # not scale with --goal (57 repos regardless) and costs ~24s vs ~1s without.
+    # It is sound HERE specifically because this box just pushed, so local
+    # origin/* refs already reflect it; the scheduled 24h sweep must keep
+    # fetching to catch OTHER boxes' pushes (g-115-2660).
+    #
+    # ADVISORY by deliberate choice: a hard refusal would wedge the loop whenever
+    # review is legitimately outstanding, and every sibling in this family is
+    # advisory-with-banner. Fail-open on every path — a probe error must never
+    # affect goal closure.
+    if [[ -n "${GOAL_ID:-}" ]]; then
+        local _landed_json _stranded_n
+        _landed_json=$(python3 "$SCRIPT_DIR/completed-not-committed-sweep.py" \
+            --goal "$GOAL_ID" --min-age-minutes 0 --no-fetch --output json \
+            2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || echo '{}')
+        # BOTH lists, not just `stranded` (fresh-eyes, same day as the original
+        # commit). The producer PARTITIONS stranded_all by reason at
+        # completed-not-committed-sweep.py:1176-1177 — `stranded` holds ONLY
+        # reason=="stranded_open_pr", and `stranded_no_pr` is a DISJOINT sibling
+        # key. Reading `stranded` alone was blind to every branch pushed WITHOUT
+        # a pull request, which is both the harder case to notice and the exact
+        # shape of the six-day incident that motivated this goal. The goal's own
+        # description warned about precisely this blindness — it preferred branch
+        # enumeration over PR-listing because "the request-listing form is blind
+        # to a branch pushed without one" — and the first cut avoided it at the
+        # DETECTION layer, then reintroduced it one layer up at consumption.
+        # Fingerprint that gave it away: the printer below carries a
+        # 'no open pull request found' branch that was UNREACHABLE, because
+        # everything in `stranded` has a PR by construction. A handler for a case
+        # the list cannot contain is evidence the author believed it was the
+        # union. guard-1802: diff the consumer's predicate against the producer's
+        # population and measure what it EXCLUDES — a subset predicate and a
+        # genuinely clean queue emit the identical all-clear.
+        _stranded_n=$(echo "$_landed_json" | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d.get('stranded') or []) + len(d.get('stranded_no_pr') or []))" 2>/dev/null || echo 0)
+        if [[ "${_stranded_n:-0}" != "0" ]]; then
+            echo "[iteration-close] ADVISORY: ${GOAL_ID} closed but its commits are NOT on the remote default branch — the work is on a branch nobody has landed." >&2
+            echo "$_landed_json" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+for e in list(d.get('stranded') or []) + list(d.get('stranded_no_pr') or []):
+    pr=e.get('pull_request') or {}
+    loc=('PR #%s %s' % (pr.get('number'), pr.get('url'))) if pr.get('number') else 'no open pull request found'
+    print('[iteration-close]   %s: %s (%s)' % (e.get('goal_id','?'), e.get('reason','?'), loc))
+" 2>/dev/null >&2 || true
+            echo "[iteration-close]   Land it, or record why it is intentionally unlanded. Advisory only — closure is unaffected (guard-1548, g-115-3838)." >&2
+        fi
+    fi
+
     # Step 8.79 Compounding-knowledge metric emission (g-303-35, design Section 6).
     # SHIPS DORMANT: compounding-events.py emit SELF-GATES on
     # compounding_metric.enabled (default OFF in aspirations.yaml) -- when the flag
@@ -1577,16 +1727,40 @@ except Exception as e:
             _canary_payload="$(CANARY_BASENAME="$_canary_basename" CANARY_TARGET="$_canary_target" CANARY_NOW="$NOW_ISO" CANARY_GOAL_ID="$GOAL_ID" \
                 python3 -c '
 import json, os
+# Env reads hoisted to locals so no subscript appears inside an f-string
+# EXPRESSION. Two hazards removed at once (guard-504 remedy a): a backslash is
+# not permitted in an f-string expression, and inside a single-quoted bash
+# string the double quotes need no escaping in the first place. The escaped
+# form made this whole block a SyntaxError, so the corruption alarm filed
+# nothing for as long as it existed (g-115-3565).
+name = os.environ["CANARY_BASENAME"]
+now = os.environ["CANARY_NOW"]
+target = os.environ["CANARY_TARGET"]
+goal = os.environ["CANARY_GOAL_ID"]
 print(json.dumps({
-    "title": f"Investigate: aspirations.jsonl canary fired on {os.environ[\"CANARY_BASENAME\"]} ({os.environ[\"CANARY_NOW\"]})",
+    "title": f"Investigate: aspirations.jsonl canary fired on {name} ({now})",
     "priority": "HIGH",
     "participants": ["agent"],
     "category": "framework-architecture",
-    "origin_signal": f"canary-fired:{os.environ[\"CANARY_BASENAME\"]}:{os.environ[\"CANARY_NOW\"]}",
+    # `investigate:` because canary-fired is NOT in the origin-signal gate
+    # ALLOWED_PREFIXES. TWO independent reasons, found separately and converging
+    # on the same fix (g-115-3565 alpha / g-115-3575 bravo, merged 2026-07-28):
+    #   1. MEASURED: the COLON form is hard-refused. Piping a payload carrying
+    #      "canary-fired:<basename>:<ts>" through the real consumer returns
+    #      {"error": "origin_signal_blocked"} -- so the alarm could not file at
+    #      all, even after its SyntaxError was repaired.
+    #   2. Even where a payload is admitted, an unregistered prefix gets
+    #      Layer-D auto-derived from the TITLE, which truncates the timestamp to
+    #      the month -- two firings on one file in the same month collapse to one
+    #      key and the duplication gate can swallow the second alarm.
+    # A registered prefix fixes both: the payload is admitted AND keeps its
+    # full-precision key, so every firing stays a distinct goal (never deduped --
+    # deliberate; each corruption event needs its own record).
+    "origin_signal": f"investigate:canary-fired-{name}-{now}",
     "description": (
         f"iteration-close.sh state-update canary detected corruption in "
-        f"{os.environ[\"CANARY_TARGET\"]} after state-update for goal "
-        f"{os.environ[\"CANARY_GOAL_ID\"]}. File was restored from latest "
+        f"{target} after state-update for goal "
+        f"{goal}. File was restored from latest "
         f".history snapshot in place; corrupted version preserved as "
         f".canary-corrupt sidecar. Investigate root cause — _fileops.py "
         f"outcomes 1+2 should have caught this earlier; canary firing "
@@ -1595,9 +1769,15 @@ print(json.dumps({
     ),
 }))
 ')"
-            printf '%s' "$_canary_payload" | bash "$SCRIPT_DIR/aspirations-add-goal.sh" --source world --aspiration asp-115 \
-                >/dev/null 2>&1 \
-                || echo "[iteration-close] WARN: canary-Investigate goal-file failed for $_canary_target (non-fatal)" >&2
+            # Surface the consumer's REASON, not just "failed". The prior form
+            # sent stderr to /dev/null, so the origin-signal refusal above was
+            # invisible for the whole life of this branch: the alarm reported a
+            # generic non-fatal WARN and nobody could tell a gate refusal from a
+            # dead daemon. Fail-open is still fail-open -- it just says why now.
+            local _canary_err
+            _canary_err="$(printf '%s' "$_canary_payload" \
+                | bash "$SCRIPT_DIR/aspirations-add-goal.sh" --source world --aspiration asp-115 2>&1 >/dev/null)" \
+                || echo "[iteration-close] WARN: canary-Investigate goal-file failed for $_canary_target (non-fatal): ${_canary_err}" >&2
         fi
     done
 }
@@ -2094,7 +2274,8 @@ do_productivity_check() {
     # the retrieval embedding index. Silent no-op while embedding_blend_enabled
     # is false (one YAML read) or the index is absent (initial build is a
     # deliberate operator action, never hook-spawned). When the blend is live
-    # and a source store (rb/guardrails) is newer than the index, spawns
+    # and a corpus source is newer than the index — rb, guardrails, OR the
+    # knowledge tree (_tree.yaml + node .md bodies, added g-115-3763) — spawns
     # `embedding-index-build.py --update` DETACHED (incremental — re-embeds
     # changed docs only), debounced to one attempt per 6h. Same LOCAL-tick
     # rationale as agent-watchdog above: the index is per-box daemon cache,

@@ -77,12 +77,13 @@ MIN_COMMITS="${ITERATION_PUSH_MIN_COMMITS:-5}"
 MAX_AGE_MIN="${ITERATION_PUSH_MAX_AGE_MIN:-20}"
 FETCH_INTERVAL_MIN="${ITERATION_PUSH_FETCH_INTERVAL_MIN:-10}"
 NO_FETCH=0
+NO_PUSH=0
 
 usage() {
   cat <<'EOF'
 Usage: iteration-push.sh [--repo <path>] [--branch <name>] [--min-commits <n>]
                          [--max-age-min <m>] [--fetch-interval-min <m>]
-                         [--no-fetch] [--dry-run] [--strict] [-h|--help]
+                         [--no-fetch] [--no-push] [--dry-run] [--strict] [-h|--help]
 
 Fail-soft, rate-limited bidirectional sync of the current branch with origin.
 Fetches origin (throttled) and merges origin-ahead commits in (never rebase,
@@ -100,6 +101,11 @@ Options:
                       this many minutes (default 10, env
                       ITERATION_PUSH_FETCH_INTERVAL_MIN). 0 = always fetch.
   --no-fetch          Skip the fetch+integrate step entirely (offline/tests).
+  --no-push           Fetch + integrate, then STOP before the push decision.
+                      The inverse of --no-fetch. This is the session-start
+                      continuity pull for local-backend deployments: a starting
+                      session must become current WITHOUT publishing its state
+                      as a side effect of starting (g-115-3871).
   --dry-run           Compute + log every decision; do NOT fetch-merge or push.
   --strict            Exit 1 on a genuine push/merge failure (tests). Default: always 0.
   -h, --help          Show this help.
@@ -108,12 +114,13 @@ EOF
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --repo)        REPO="${2:-}"; shift 2;;
-    --branch)      BRANCH_OVERRIDE="${2:-}"; shift 2;;
-    --min-commits) MIN_COMMITS="${2:-5}"; shift 2;;
-    --max-age-min) MAX_AGE_MIN="${2:-20}"; shift 2;;
-    --fetch-interval-min) FETCH_INTERVAL_MIN="${2:-10}"; shift 2;;
+    --repo)        REPO="${2:-}"; shift $(( $# >= 2 ? 2 : 1 ));;
+    --branch)      BRANCH_OVERRIDE="${2:-}"; shift $(( $# >= 2 ? 2 : 1 ));;
+    --min-commits) MIN_COMMITS="${2:-5}"; shift $(( $# >= 2 ? 2 : 1 ));;
+    --max-age-min) MAX_AGE_MIN="${2:-20}"; shift $(( $# >= 2 ? 2 : 1 ));;
+    --fetch-interval-min) FETCH_INTERVAL_MIN="${2:-10}"; shift $(( $# >= 2 ? 2 : 1 ));;
     --no-fetch)    NO_FETCH=1; shift;;
+    --no-push)     NO_PUSH=1; shift;;
     --dry-run)     DRY_RUN=1; shift;;
     --strict)      STRICT=1; shift;;
     -h|--help)     usage; exit 0;;
@@ -222,6 +229,38 @@ fi
 #   - empty blocking set, self-commit failure, or the retry still failing
 # FAIL-SOFT throughout (|| true; iteration-push is soft_exit — a bug here can
 # only DEFER, never wedge the loop or discard staged work).
+# Resolved once: under STORAGE_BACKEND=local the storage root .mind-data/ lives
+# INSIDE the repo and is git-tracked, so the agent's own world/meta writes make
+# the tree dirty continuously. Under own-cloud world/ and meta/ are external and
+# gitignored, so they can never block a merge — which is why this only matters
+# for local. Same resolution shape as iteration-commit.sh ().
+# THIRD FALLBACK IS LOAD-BEARING ON A FRESH CLONE (). Both config
+# sources above are MACHINE-LOCAL: STORAGE_BACKEND is usually unset in a plain
+# shell, and .env.local is gitignored by design (per-machine creds/paths), so a
+# freshly-cloned repo on a NEW COMPUTER has neither. Without a third source this
+# resolver returns "" there, every dirty .mind-data/ path takes the defer branch,
+# the merge never runs, the push goes non-fast-forward, and that box strands —
+# i.e. the exact failure this self-heal exists to prevent, re-armed on precisely
+# the machine most likely to hit it. Verified 2026-07-29: .env.local untracked,
+# STORAGE_BACKEND unset in-shell.
+# The structural probe needs no config because tracking .mind-data/ IS what
+# local-backend MEANS: measured 0 tracked files in the own-cloud repo (dir
+# absent entirely) vs 407 in the local one. It also cannot produce a false
+# "local" for own-cloud — an own-cloud repo keeps world/ and meta/ external, so
+# there is nothing under .mind-data/ for git to track. Ordered last so an
+# explicit setting always wins; `head -1` short-circuits the ls-files walk.
+_ip_storage_backend() {
+    local v="${STORAGE_BACKEND:-}"
+    if [[ -z "$v" && -f "$REPO/.env.local" ]]; then
+        v="$(grep -E '^[[:space:]]*STORAGE_BACKEND[[:space:]]*=' "$REPO/.env.local" 2>/dev/null \
+             | tail -1 | sed -E 's/^[^=]*=[[:space:]]*//; s/[[:space:]]*#.*$//; s/[[:space:]]*$//')"
+    fi
+    if [[ -z "$v" ]] && [[ -n "$(git -C "$REPO" ls-files .mind-data 2>/dev/null | head -1)" ]]; then
+        v="local"
+    fi
+    printf '%s' "$v" | tr '[:upper:]' '[:lower:]'
+}
+
 _selfheal_cross_agent_churn_remerge() {
   local self="${MIND_AGENT:-}"
   if [ -z "$self" ]; then
@@ -260,12 +299,27 @@ _selfheal_cross_agent_churn_remerge() {
   # the whole tree untouched (never clear or commit core/world/shared work
   # from the push path).
   local rel name
-  local self_paths=() cross_dirty=() cross_untracked=()
+  local self_paths=() cross_dirty=() cross_untracked=() storage_paths=()
+  local _backend; _backend="$(_ip_storage_backend)"
   for rel in "${dirty[@]}"; do
     case "$rel" in
       agents/*)
         name="${rel#agents/}"; name="${name%%/*}"
         if [ "$name" = "$self" ]; then self_paths+=("$rel"); else cross_dirty+=("$rel"); fi
+        ;;
+      .mind-data/*)
+        # Storage root under local backend = THIS agent's own world/meta writes
+        # (). COMMIT it like self-namespace churn — never `checkout --`
+        # it, which would DISCARD encoded knowledge. Deferring instead is what
+        # stranded a live agent: its tree is dirty with .mind-data writes on
+        # essentially every tick, so once a second box pushed and a merge became
+        # required, the merge deferred every iteration -> no merge -> no push
+        # (non-fast-forward) -> 10 unpushed commits and climbing. Under own-cloud
+        # this arm never fires: world/ and meta/ are external and gitignored.
+        if [ "$_backend" = "local" ]; then storage_paths+=("$rel"); else
+          log "self-heal: blocking file outside agents/* ($rel) — defer (never clear core/world/shared work)"
+          return 1
+        fi
         ;;
       *)
         log "self-heal: blocking file outside agents/* ($rel) — defer (never clear core/world/shared work)"
@@ -278,6 +332,12 @@ _selfheal_cross_agent_churn_remerge() {
       agents/*)
         name="${rel#agents/}"; name="${name%%/*}"
         if [ "$name" = "$self" ]; then self_paths+=("$rel"); else cross_untracked+=("$rel"); fi
+        ;;
+      .mind-data/*)
+        if [ "$_backend" = "local" ]; then storage_paths+=("$rel"); else
+          log "self-heal: blocking file outside agents/* ($rel) — defer (never clear core/world/shared work)"
+          return 1
+        fi
         ;;
       *)
         log "self-heal: blocking file outside agents/* ($rel) — defer (never clear core/world/shared work)"
@@ -293,17 +353,36 @@ _selfheal_cross_agent_churn_remerge() {
   # to agents/<self>/ — a partner's stage racing in between (a) and the commit
   # is excluded from it. Same namespace scope iteration-commit.sh's filter
   # enforces — NOT a bare `git commit` (which would absorb anything staged).
-  if [ "${#self_paths[@]}" -gt 0 ]; then
-    log "self-heal: committing ${#self_paths[@]} SELF-namespace file(s) pre-merge (g-115-2249)"
-    if ! git -C "$REPO" add -- "${self_paths[@]}" 2>/dev/null; then
+  # Stage self-namespace AND (local backend only) storage-root churn together;
+  # the commit stays pathspec-limited to exactly the namespaces we classified,
+  # so a partner's racing stage is still excluded (guard-741/836).
+  local _heal_stage=() _heal_spec=()
+  [ "${#self_paths[@]}" -gt 0 ]    && { _heal_stage+=("${self_paths[@]}");    _heal_spec+=("agents/$self/"); }
+  [ "${#storage_paths[@]}" -gt 0 ] && { _heal_stage+=("${storage_paths[@]}"); _heal_spec+=(".mind-data/"); }
+  if [ "${#_heal_stage[@]}" -gt 0 ]; then
+    # Keep the ORIGINAL wording when there is no storage churn: the 
+    # regression tests assert on it, and with storage_paths empty the extended
+    # phrasing would also be inaccurate. Only widen the line when the local
+    # backend actually contributed storage-root paths.
+    if [ "${#storage_paths[@]}" -gt 0 ]; then
+      log "self-heal: committing ${#self_paths[@]} self-namespace + ${#storage_paths[@]} storage-root file(s) pre-merge (g-115-2249/g-115-3877)"
+    else
+      log "self-heal: committing ${#self_paths[@]} SELF-namespace file(s) pre-merge (g-115-2249)"
+    fi
+    if ! git -C "$REPO" add -- "${_heal_stage[@]}" 2>/dev/null; then
       log "self-heal: git add of self-namespace churn failed — defer"
       return 1
     fi
-    if ! git -C "$REPO" commit -q \
-         -m "chore($self): pre-merge self-namespace churn (iteration-push self-heal, g-115-2249)" \
-         -- "agents/$self/" 2>/dev/null; then
+    # Commit SUBJECT is likewise unchanged when no storage churn was classified
+    # ( asserts on it, and it would be inaccurate otherwise).
+    local _heal_msg="chore($self): pre-merge self-namespace churn (iteration-push self-heal, g-115-2249)"
+    if [ "${#storage_paths[@]}" -gt 0 ]; then
+      _heal_msg="chore($self): pre-merge self+storage churn (iteration-push self-heal, g-115-2249/g-115-3877)"
+    fi
+    if ! git -C "$REPO" commit -q -m "$_heal_msg" \
+         -- "${_heal_spec[@]}" 2>/dev/null; then
       # Unstage what we staged so a failed heal leaves the index as found.
-      git -C "$REPO" reset -q -- "agents/$self/" 2>/dev/null || true
+      git -C "$REPO" reset -q -- "${_heal_spec[@]}" 2>/dev/null || true
       log "self-heal: pathspec-limited commit of self-namespace churn failed — defer"
       return 1
     fi
@@ -367,6 +446,28 @@ if [ "$BEHIND" -gt 0 ]; then
       log "integrated ${BEHIND} origin commit(s) into $BRANCH"
     fi
   fi
+fi
+
+# --no-push: the fetch+integrate above IS the whole job. Exit before the push
+# decision (). This is the session-start continuity pull for
+# local-backend deployments, where git — not S3 — is the sync mechanism, so
+# owncloud-pull.sh routes here instead of no-opping. It must not push: a session
+# that publishes local state merely by STARTING would make /start a write, which
+# breaks reader mode's side-effect-free contract and would surprise an assistant
+# session that opened a terminal to look at something.
+#
+# Placed at the integrate/push seam rather than guarding each push site, so a
+# future push branch cannot be added below and silently escape the flag. Exiting
+# HERE rather than gating the push call also leaves the stranded-depth alarm, the
+# min-commits/max-age thresholds, and the push retry/recovery path completely
+# untouched for the loop's normal caller.
+#
+# Converged from two independent implementations of  (alpha on another
+# box, bravo here) that landed the same guard at the same seam — see the merge
+# commit for why the duplicate happened.
+if [ "$NO_PUSH" = 1 ]; then
+  log "--no-push: fetch+integrate complete, skipping push decision"
+  soft_exit 0
 fi
 
 # Commits ahead of origin (shared local ref; agents are the only pushers).

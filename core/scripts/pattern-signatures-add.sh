@@ -40,6 +40,18 @@ BODY="$(cat)"
 # shellcheck disable=SC1091
 source "$CORE_ROOT/scripts/_runtime.sh"
 
+# --- Advisory near-duplicate warning () --------------------------
+# Prints ONE stderr advisory when this record closely resembles an existing
+# ACTIVE entry. ADVISORY ONLY — it MUST NOT gate the add: a false positive that
+# refuses a legitimate entry is worse than the duplicate it would have prevented.
+# The helper always exits 0 on its own; `|| true` is the second guard so a
+# helper crash cannot trip `set -e` and fail the append. Runs BEFORE the append
+# so the warning can name the EXISTING entry — the new record's id is assigned
+# server-side inside the lock and is not known here.
+# shellcheck disable=SC2086
+printf '%s' "$BODY" | $(rt_python_launcher) "$CORE_ROOT/scripts/store_dupe_warn.py" \
+    --store pattern-signatures || true
+
 _print_record() {
     # shellcheck disable=SC2086
     printf '%s' "$1" | $(rt_python_launcher) -c "

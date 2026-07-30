@@ -161,6 +161,49 @@ def _read_goal_index() -> dict:
                     g["_source"] = source
                     g["_aspiration_id"] = asp.get("id")
                     index[g["id"]] = g
+
+    # ARCHIVE PASS (, sibling audit of ). The reads above are
+    # active=True, so a blocked_by root that COMPLETED inside a since-archived
+    # aspiration is absent from this index. `_root_of` then hits
+    # `root = index.get(rid); if root is None: return rid, None`, the root-walk
+    # stops, and the chain is reported unresolved when it is in fact satisfied —
+    # the blocked_by-edge instance of the same class. Same family as guard-1715:
+    # the all-clear was bounded by the population this index declared.
+    #
+    # LIVE WINS on collision (`not in index`): an id in both stores means the live
+    # record is current (re-opened goal, or a mid-archive race) and the archive
+    # copy is a stale snapshot that must never shadow it. Do NOT simplify this to
+    # an unconditional assignment.
+    #
+    # `_archived` marks origin so "resolved via the archive" stays distinguishable
+    # from "resolved live" and from "in neither store" (which still yields
+    # root None, correctly).
+    #
+    # FAIL-OPEN per source, matching the live loop above: losing the archive
+    # degrades to exactly the pre-fix behavior (fewer resolutions this run), which
+    # is recoverable, whereas aborting the precheck is not.
+    for source in ("world", "agent"):
+        try:
+            out = _rt.aspirations_read(source=source, archive=True)
+        except Exception as e:
+            sys.stderr.write(
+                "dependency-timeout-check: %s archive read failed (%s) — "
+                "fail-open, archived roots stay unresolved this run\n"
+                % (source, e))
+            continue
+        data = _rt.tolerant_decode_aggregate(
+            "[dependency-timeout-check] %s archive" % source, out)
+        if data is None:
+            continue  # empty archive is a valid state, not a failure
+        # ?archive=1 returns a BARE list, not the {"aspirations": [...]} envelope.
+        asps = (data.get("aspirations") if isinstance(data, dict) else data) or []
+        for asp in asps:
+            for g in asp.get("goals", []) or []:
+                if isinstance(g, dict) and g.get("id") and g["id"] not in index:
+                    g["_source"] = source
+                    g["_aspiration_id"] = asp.get("id")
+                    g["_archived"] = True
+                    index[g["id"]] = g
     return index
 
 

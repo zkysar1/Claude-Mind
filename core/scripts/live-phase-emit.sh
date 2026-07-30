@@ -33,10 +33,24 @@ if et == "phase_end":
 elif et == "phase_start":
     print(f"{phase} {gid}".strip())
 elif et in ("finding", "decision", "failure", "approach_change",
-            "observation", "state_update"):
+            "observation", "state_update", "scorer_override"):
     # All remaining VALID_ENTRY_TYPES (execution-diary.py) — a legitimate
     # non-phase tail row must not kill the mirror. Truly unknown values
     # still crash below (the fresh-eyes no-masking invariant).
+    #
+    # SYNC OBLIGATION: this tuple + the two branches above must together
+    # cover the VALID_ENTRY_TYPES set in execution-diary.py exactly. NOTE: no
+    # apostrophes below — this whole block lives inside a bash single-quoted
+    # string, so one possessive breaks the script at parse time (caught in
+    # review here). It is a hand-kept
+    # mirror (this script is IRREDUCIBLY LOCAL — importing the source of truth
+    # would add the very indirection the header forbids), so adding an entry
+    # type there without adding it here silently re-breaks this mirror.
+    # scorer_override drifted exactly that way: added by  (Scorer
+    # Sovereignty Layer B), never added here, so every heartbeat landing on a
+    # deviation-claim tail row exited at the `else` below instead of writing
+    # live_phase. Recognizing a DOCUMENTED type is not the masking the
+    # invariant forbids — the `else` still crashes on genuinely unknown values.
     print(f"{et} {gid}".strip())
 else:
     sys.exit(f"live-phase-emit: unhandled entry_type {et!r}")

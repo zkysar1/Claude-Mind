@@ -356,13 +356,42 @@ def cmd_stats(out):
     added = [i for i in cur_hashes if i not in old_hashes]
     removed = [i for i in old_hashes if i not in cur_hashes]
     changed = [i for i in cur_hashes if i in old_hashes and cur_hashes[i] != old_hashes[i]]
+    #  (b)+(c): report whether THIS box can actually load the model
+    # its own index names. Reporting the model name alone is only half the
+    # question and is what let a dead channel hide for 17 days (2026-07-10 to
+    # 2026-07-27): meta.json said all-MiniLM-L6-v2, the box's cache held only
+    # bge-small, so every query silently degraded to token-overlap while still
+    # returning HTTP 200. Probe the model NAMED IN META.JSON, never the config
+    # default — the query side always loads the index's own model (,
+    # "a box's query encoder always matches its own index"), so that is the
+    # only pairing whose loadability means anything.
+    #
+    # Fail-safe and additive: any failure yields channel="DEAD" plus the reason
+    # rather than raising, and no existing key changes, so current --stats
+    # consumers are unaffected. Paying the model load here is deliberate —
+    # --stats is a diagnostic, and the load IS the thing being measured.
+    load_probe = {"model_loadable": False, "model_backend": None,
+                  "model_load_seconds": None, "channel": "DEAD",
+                  "model_load_error": None}
+    if meta.get("model"):
+        _t = time.time()
+        try:
+            from _embedding_model import load_encoder
+            _enc, _backend = load_encoder(meta["model"])
+            load_probe.update({"model_loadable": True, "model_backend": _backend,
+                               "model_load_seconds": round(time.time() - _t, 2),
+                               "channel": "alive"})
+        except Exception as exc:
+            load_probe.update({"model_load_seconds": round(time.time() - _t, 2),
+                               "model_load_error": "%s: %s" % (type(exc).__name__,
+                                                              str(exc)[:160])})
     print(json.dumps({"op": "stats", "exists": True, "model": meta.get("model"),
                       "dim": meta.get("dim"), "indexed": meta.get("count"),
                       "live_corpus": len(cur), "added": len(added),
                       "removed": len(removed), "changed": len(changed),
                       "stale": bool(added or removed or changed),
                       "bytes": emb_path.stat().st_size if emb_path.exists() else 0,
-                      "out": str(out)}))
+                      "out": str(out), **load_probe}))
 
 
 def main():

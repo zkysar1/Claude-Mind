@@ -169,6 +169,63 @@ def _read_goals(source):
     return goals
 
 
+def _read_archived_goals(source):
+    """Return goals nested inside ARCHIVED aspirations for one source.
+
+    `_read_goals` above reads active=True, so it sees only aspirations-*.jsonl.
+    When an aspiration COMPLETES it moves to aspirations-archive.jsonl and every
+    one of its goals leaves that view — so a blocker_ref naming a goal that
+    completed inside a since-archived aspiration is absent from the live index
+    and falls through `_classify_ref` to the `rid.startswith("g-")` branch,
+    which reports it `dangling`.
+
+    That verdict is not merely missing, it is INVERTED, and this sweep's own
+    docstring calls dangling "a real defect to surface": the STRONGEST possible
+    resolution (the referent completed AND its whole initiative closed, per
+    guard-1555) is reported as a broken reference, so a reader acting on it goes
+    and repairs a reference that is perfectly satisfied. That is strictly worse
+    than the silent skip the sibling defer-recheck.py had (g-115-3916), because
+    a wrong verdict is acted on while a missing one is merely unhelpful.
+
+    Same family as guard-1715: an enumerator's all-clear is bounded by the
+    population IT declares, and this index declared only live goals.
+
+    FAIL-SOFT, deliberately asymmetric to `_read_goals`. That function exits(1)
+    on RtError per guard-383 because a silent [] there poisons the merged
+    aggregate. Here the failure mode is the opposite: losing the archive degrades
+    to exactly the pre-fix behavior (an archived referent reads as dangling
+    again), so it must not take the sweep down. The degradation is REPORTED, never
+    silent — see `archive_read_failed` / `archive_degraded` in the JSON output.
+    """
+    try:
+        out = _rt.aspirations_read(source=source, archive=True)
+    except _rt.RtError as e:
+        print(f"[blocked-signal-resolution-check] {source} archive read failed "
+              f"(degrading to live-only for this source): {e.body or e}",
+              file=sys.stderr)
+        return None
+    data = _tolerant_decode(f"{source} archive", out)
+    if data is None:
+        # EMPTY BODY IS A VALID STATE, NOT A FAILURE. A source whose archive is
+        # simply empty (fresh world, nothing archived yet) must NOT be reported as
+        # archive_read_failed — that would flip archive_degraded true everywhere
+        # and make the sweep disown its own correct verdicts. Only the RtError
+        # branch above is a real read failure.
+        return []
+    # ?archive=1 returns a BARE list of aspirations, not the
+    # {"aspirations": [...]} envelope the active reads use. Handle both so a
+    # future endpoint change cannot silently empty this index.
+    asps = data.get("aspirations") if isinstance(data, dict) else data
+    goals = []
+    for asp in asps or []:
+        for g in asp.get("goals", []) or []:
+            g["_source"] = source
+            g["_aspiration_id"] = asp.get("id")
+            g["_archived"] = True
+            goals.append(g)
+    return goals
+
+
 def _load_pq_index():
     """Fleet-wide pending-question id -> status. Returns (index, missing_agents).
 
@@ -336,9 +393,18 @@ def _classify_ref(ref_id, goal_index, pq_index, pq_complete=True):
     if not rid:
         return (None, "empty reference", "opaque")
     if rid in goal_index:
-        status = (goal_index[rid][1].get("status") or "unknown")
+        _g = goal_index[rid][1]
+        status = (_g.get("status") or "unknown")
+        # "found in the archive" is kept DISTINCT from "found live" and from
+        # "found nowhere" (guard-1555): a referent that completed AND had its
+        # whole initiative archived is a STRONGER fact than one merely completed
+        # in the live queue, and collapsing the three into one message is what
+        # hid the sibling defect for 37 days. The archived case reaches this
+        # branch at all only because main() folds the archive into goal_index.
+        _where = ("an ARCHIVED aspiration" if _g.get("_archived")
+                  else "the live queue")
         return (status in TERMINAL_STATUSES,
-                f"goal {rid} is {status}", "goal")
+                f"goal {rid} is {status} (found in {_where})", "goal")
     if rid in pq_index:
         status = pq_index[rid]
         return (status in TERMINAL_STATUSES,
@@ -366,11 +432,19 @@ def _classify_ref(ref_id, goal_index, pq_index, pq_complete=True):
 
 
 def _resolve_blocker_ref(kind, as_dict, raw, goal_index, pq_index, now,
-                         pq_complete=True):
+                         pq_complete=True, external_resolver=None):
     """Resolve the blocker_ref half. Returns (resolved, why, basis).
 
     basis is 'no_blocker_ref' | 'ttl_expired' | 'referent_terminal' |
-    'unresolved' | 'dangling' | 'opaque'.
+    'referent_terminal_external' | 'external_unresolvable' | 'unresolved' |
+    'dangling' | 'opaque'.
+
+    `external_resolver` is an optional callable taking a cross-world referent
+    id ('<world>:<goal-id>') and returning that referent's status string, or
+    None when it cannot say. It is injected rather than imported because this
+    checker runs in worlds that have no cross-world reader at all — see the
+    external_id block below for why absence gets its own basis instead of
+    being folded into 'opaque'.
 
     TTL SEMANTICS — stated explicitly because it is easy to over-read: a passed
     `expires_at` means the block record FAIL-OPENED by design (the schema's TTL
@@ -396,15 +470,24 @@ def _resolve_blocker_ref(kind, as_dict, raw, goal_index, pq_index, now,
     # dict form
     whys = []
     expired = False
+    # exp_usable: a TTL this reader could actually READ. Distinct from
+    # `bool(exp_raw)` — a truthy-but-unparseable expires_at is PRESENT but
+    # carries no signal, and conflating the two made the fallthrough below
+    # assert a definite verdict from a field the reader had just failed to
+    # parse ( / rb-245: a definite conclusion drawn against an
+    # unverifiable field).
+    exp_usable = False
     exp_raw = as_dict.get("expires_at")
     if exp_raw:
         exp_dt = _parse_iso(exp_raw)
         if exp_dt is not None:
+            exp_usable = True
             expired = exp_dt < now
             whys.append(f"expires_at={exp_raw} "
                         f"{'PASSED' if expired else 'future'}")
         else:
-            whys.append(f"expires_at={exp_raw} unparseable")
+            whys.append(f"expires_at={exp_raw!r} unparseable — contributes NO "
+                        f"signal, not a live TTL")
     # Both spellings observed in the wild.
     ug = as_dict.get("unblock_goal") or as_dict.get("unblocking_goal")
     ug_resolved, ug_referent = None, None
@@ -412,17 +495,131 @@ def _resolve_blocker_ref(kind, as_dict, raw, goal_index, pq_index, now,
         ug_resolved, ug_why, ug_referent = _classify_ref(
             ug, goal_index, pq_index, pq_complete)
         whys.append(f"unblock_goal: {ug_why}")
+
+    # external_id (). A blocker_ref of type partner-response names its
+    # referent HERE and nowhere else, so until this branch existed that entire
+    # blocker class was undetectable by the one checker built to find blocked
+    # goals whose signals have all cleared. Measured cost before the fix (two
+    # live goals, cleared by hand 2026-07-28): one blocked 5 days past its
+    # referent's completion, one 10 days.
+    #
+    # This is the READ-side of guard-367 ("a field with a canonical resolver
+    # that some code path declines to resolve is SILENT BIAS, not missing
+    # data"): _classify_ref was right there, already resolving unblock_goal.
+    ext = as_dict.get("external_id")
+    ext_resolved, ext_referent = None, None
+    if ext:
+        ext_s = str(ext).strip()
+        # Board prefixes legitimately contain ':' ("coordination:", "findings:",
+        # ...), so a bare colon test would misroute them into the cross-world
+        # branch and strip them of the board classification _classify_ref gives
+        # them. Check the prefixes FIRST.
+        if ":" in ext_s and not ext_s.startswith(_BOARD_PREFIXES):
+            # Cross-world referent. The other world emits no completion
+            # callback, which is the whole reason a defer against it decays
+            # silently from accurate to false. Only an injected resolver can
+            # settle it.
+            if external_resolver is not None:
+                # FAIL-OPEN (guard-142 / Invariant 2). The resolver is injected
+                # foreign code reaching another world — the single likeliest
+                # dependency here to be down, slow, or throwing. A detective
+                # sweep that dies on its own optional dependency is worse than
+                # one that reports less: this function is called per-goal, so an
+                # unhandled raise takes out the WHOLE scan, not just this ref.
+                # The error is recorded in `whys` rather than swallowed, so a
+                # broken resolver is diagnosable instead of merely quiet.
+                try:
+                    status = external_resolver(ext_s)
+                except Exception as exc:  # noqa: BLE001 — deliberate catch-all
+                    status = None
+                    whys.append(f"external_id: cross-world {ext_s} — resolver "
+                                f"raised {type(exc).__name__}: {exc}")
+                if status is not None:
+                    ext_resolved = status in TERMINAL_STATUSES
+                    ext_referent = "external"
+                    whys.append(f"external_id: cross-world {ext_s} is {status}")
+            if ext_referent is None:
+                # NOT 'opaque'. Opaque means "a shape this reader does not
+                # understand"; this shape IS understood and merely unreachable
+                # from here. Folding the two together makes a real operational
+                # population — cross-world refs nothing can currently resolve —
+                # uncountable, and a population you cannot count is one nobody
+                # fixes.
+                ext_referent = "external_unresolvable"
+                whys.append(f"external_id: cross-world {ext_s} — no resolver "
+                            f"configured, referent state undeterminable here")
+        else:
+            ext_resolved, ext_why, ext_referent = _classify_ref(
+                ext_s, goal_index, pq_index, pq_complete)
+            whys.append(f"external_id: {ext_why}")
+
     if not whys:
-        whys.append("blocker_ref dict carries neither expires_at nor "
-                    "unblock_goal — no resolvable signal")
+        # : the old message here read "no resolvable signal", which is
+        # mechanically true of THIS READER but substantively wrong about the ref
+        # — every live instance measured 2026-07-27 was content-rich (`ref`,
+        # `why`, `blocker_type`, `blocking_goal`, `denied_action`, `principal`,
+        # `probe`...). A goal filed off that summary alone would claim these
+        # blocks are unresolvable, which is false (rb-245: an undecidable count
+        # against a field-name assumption). Name the keys so a reader can tell
+        # "genuinely opaque" from "schema variant this reader does not parse".
+        #
+        # Deliberately NOT fixed by adding `blocking_goal` as a third accepted
+        # spelling beside unblock_goal / unblocking_goal above: absorbing
+        # variants one at a time is how a vocabulary reaches five spellings.
+        # Canonicalization belongs at the WRITE path (gates/blocker_ref.validate
+        # already returns exactly type/external_id/state_hash/created_at/
+        # expires_at); it is bypassed by direct `update-goal <id> blocker_ref`
+        # field writes, which is the actual defect. Tracked separately.
+        present = sorted(k for k in as_dict if as_dict.get(k) is not None)
+        recognized = {"expires_at", "unblock_goal", "unblocking_goal",
+                      "external_id"}
+        if set(present) - recognized:
+            whys.append(
+                "blocker_ref dict carries no key this reader resolves "
+                f"(needs expires_at or unblock_goal); present keys: {present} "
+                "— SCHEMA VARIANT, not an empty ref: read the payload before "
+                "concluding the block is unresolvable")
+        else:
+            # NOT necessarily empty (). A recognized key can be
+            # PRESENT with a falsy value — expires_at: "" is the observed case —
+            # and contribute nothing. Calling that dict "empty" sends the next
+            # reader hunting for a missing field that is sitting right there,
+            # which is the same overclaim  fixed one branch above.
+            # Name what is actually present instead.
+            falsy = sorted(k for k in as_dict if not as_dict.get(k))
+            if falsy:
+                whys.append("blocker_ref dict carries no resolvable signal — "
+                            f"recognized key(s) present but EMPTY: {falsy}")
+            else:
+                whys.append("blocker_ref dict is empty — no resolvable signal")
 
     if ug_resolved:
         return (True, "; ".join(whys), "referent_terminal")
+    if ext_resolved:
+        # ORDER IS THE FIX for shape (b): a TERMINAL referent must outrank the
+        # clock. Before this line sat above `expired`, a ref carrying both an
+        # external_id and a future expires_at returned 'unresolved' and waited
+        # out its TTL, even though the referent had completed days earlier —
+        # completion was never the trigger, only the clock was. Distinct basis
+        # from `referent_terminal` so a reader can tell WHICH field settled it.
+        return (True, "; ".join(whys), "referent_terminal_external")
     if expired:
         return (True, "; ".join(whys), "ttl_expired")
-    if ug_referent == "dangling":
+    if ug_referent == "dangling" or ext_referent == "dangling":
         return (None, "; ".join(whys), "dangling")
-    if ug_resolved is None and not exp_raw:
+    if ext_referent == "external_unresolvable":
+        return (None, "; ".join(whys), "external_unresolvable")
+    # `ext_resolved is None` is load-bearing, not defensive: a PENDING external
+    # referent yields False here, and False must fall through to 'unresolved'
+    # rather than be swallowed as 'opaque'. Testing truthiness instead would
+    # re-hide exactly the goals this fix exists to surface.
+    # `not exp_usable`, NOT `not exp_raw` (). With exp_raw, a garbage
+    # TTL string counted as a present signal and pushed control past this guard
+    # to the definite `unresolved` below — reporting "this block is confirmed
+    # still live" on the strength of a field the reader could not read. Every
+    # other undecidable shape in this function returns opaque; an unreadable TTL
+    # is one of those, and the precheck 0.5b.12 sweep consumes the difference.
+    if ug_resolved is None and ext_resolved is None and not exp_usable:
         return (None, "; ".join(whys), "opaque")
     return (False, "; ".join(whys), "unresolved")
 
@@ -513,6 +710,38 @@ def main():
     now = dt.datetime.now()
     all_goals = _read_goals("world") + _read_goals("agent")
     goal_index = {g.get("id"): (g.get("_source"), g) for g in all_goals if g.get("id")}
+
+    # ARCHIVE INDEX (, sibling audit of ). Reference
+    # resolution must span BOTH stores: a referent that completed inside a
+    # since-archived aspiration is absent from every live read above, so
+    # `_classify_ref` fell through to the `g-` branch and reported the strongest
+    # possible resolution as `dangling` — an INVERTED verdict a reader acts on.
+    #
+    # Folded into the SAME `goal_index` (keeping its `(source, goal)` tuple
+    # shape) so ALL existing lookup sites — `_classify_ref`, `_resolve_blocker_ref`,
+    # and the `_classify` blocked_by walk — resolve it without threading a second
+    # index through four signatures.
+    #
+    # LIVE WINS on collision, and that direction is load-bearing: an id present in
+    # both stores means the live record is the current one (a re-opened goal, or a
+    # mid-archive race), so the archive copy is a stale snapshot that must never
+    # shadow it. The `not in goal_index` guard is what enforces that — do NOT
+    # "simplify" it to an unconditional assignment.
+    #
+    # `_archived` on the goal dict carries the origin to `_classify_ref`, which
+    # keeps "found in archive" distinct from "found live" and from "found in
+    # neither store" (that last one is still `dangling`, correctly).
+    archive_read_failed = []
+    for _src in ("world", "agent"):
+        _arch = _read_archived_goals(_src)
+        if _arch is None:
+            archive_read_failed.append(_src)
+            continue
+        for _g in _arch:
+            _gid = _g.get("id")
+            if _gid and _gid not in goal_index:
+                goal_index[_gid] = (_g.get("_source"), _g)
+
     pq_index, pq_missing = _load_pq_index()
     pq_complete = not pq_missing
 
@@ -549,6 +778,13 @@ def main():
         "pq_index_size": len(pq_index),
         "pq_corpus_complete": pq_complete,
         "pq_unreadable_agents": pq_missing,
+        # : a lost archive read degrades this sweep to its pre-fix
+        # behavior (archived referents read as `dangling` again). Surfaced so the
+        # degradation is never silent — a silent one reinstates the original
+        # invisibility, which is the defect, not a smaller version of it. Note an
+        # EMPTY archive is NOT a failure and must leave these two untouched.
+        "archive_read_failed": archive_read_failed,
+        "archive_degraded": bool(archive_read_failed),
         "now": now.isoformat(timespec="seconds"),
     }
 

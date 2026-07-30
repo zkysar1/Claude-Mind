@@ -130,8 +130,8 @@ def test_on_promotes_candidate_matching_high_value_cell(tmp_path):
     # The single HIGH-value cell -- its signature rb-100 is the PPR seed.
     _upsert(cd, "hot", "planning", 9.0, sig="reached via rb-100")
     scored = _scored([
-        ("", "wire rb-101 into selection", 12.0),  # rb-101 -> on-graph -> boosted
-        ("", "touches rb-999 only", 12.0),          # rb-999 -> off-graph -> no boost
+        ("g-306-49", "wire rb-101 into selection", 12.0),  # rb-101 -> on-graph -> boosted
+        ("g-306-50", "touches rb-999 only", 12.0),          # rb-999 -> off-graph -> no boost
     ])
     out = gs.apply_cell_return_boost(scored, _cfg(True), cells_dir=cd, graph_path=graph)
     a = next(s for s in out if s["goal_id"] == "g-306-49")

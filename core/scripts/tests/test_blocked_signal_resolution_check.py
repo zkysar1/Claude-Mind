@@ -274,10 +274,40 @@ def test_unparseable_timestamps_never_raise():
 
 
 def test_blocker_ref_dict_with_no_resolvable_signal_is_undecidable():
+    """A ref this reader cannot resolve stays undecidable — but the message
+    must say WHY, and must not claim the ref is empty when it is not.
+
+    g-115-3505 changed the wording. The old text was "carries neither
+    expires_at nor unblock_goal — no resolvable signal", which is mechanically
+    true of this reader yet substantively wrong about the ref: every live
+    instance measured 2026-07-27 was content-rich ({ref, why}, {blocker_type,
+    blocking_goal, denied_action, principal, probe}, ...). A goal filed off
+    that summary alone would claim the block is unresolvable, which is false
+    (rb-245 — an undecidable count against a field-name assumption). The
+    verdict is unchanged; only the diagnosis is now honest.
+    """
     e = _classify(_goal(blocker_ref={"type": "resource-contention",
                                      "note": "waiting on a human"}))
     assert e["verdict"] == "undecidable"
-    assert "neither expires_at nor unblock_goal" in e["blocker_ref_why"]
+    why = e["blocker_ref_why"]
+    assert "SCHEMA VARIANT" in why, why
+    # The unresolvable-by-THIS-READER framing must survive the reword.
+    assert "expires_at" in why and "unblock_goal" in why, why
+    # The present keys must be named — that is what lets a reader tell a
+    # variant apart from an empty ref without opening the goal.
+    assert "'note'" in why and "'type'" in why, why
+
+
+def test_genuinely_empty_blocker_ref_dict_says_empty_not_variant():
+    """The complement branch. An empty dict really IS signal-free, and must
+    NOT be described as a schema variant — otherwise the new message would
+    send a reader hunting for a payload that does not exist, which is the
+    same misdirection in the opposite direction. g-115-3505."""
+    e = _classify(_goal(blocker_ref={"expires_at": None}))
+    assert e["verdict"] == "undecidable"
+    why = e["blocker_ref_why"]
+    assert "empty" in why.lower(), why
+    assert "SCHEMA VARIANT" not in why, why
 
 
 def test_unblocking_goal_spelling_variant_is_honored():
@@ -351,3 +381,244 @@ def test_load_pq_index_returns_pair_and_reads_store_of_record():
     assert len(index) > 10, (
         f"only {len(index)} pq ids — looks like a local-glob regression "
         f"(resident-agent-only); expected the fleet corpus")
+
+
+# ── blocker_ref.external_id: the partner-response blocker class () ──
+#
+# _resolve_blocker_ref's dict branch consulted exactly two fields — expires_at
+# and unblock_goal/unblocking_goal — and never external_id. A blocker_ref of
+# type partner-response names its referent THERE AND NOWHERE ELSE, so that whole
+# class was undetectable by the one checker built to find blocked goals whose
+# signals have all cleared.
+#
+# Two shapes, both measured on the ZDS-Mind production queue 2026-07-28 and
+# cleared by hand:
+#   (a) {type, external_id} alone      -> (None, 'opaque')     -> "undecidable"
+#       No TTL to fail open and no field consulted that could ever clear it, so
+#       the goal sits blocked FOREVER. One such goal was blocked 5 days past its
+#       referent's completion.
+#   (b) {type, external_id, expires_at future} -> (False, 'unresolved')
+#       Waits out the clock even though the referent completed. One such goal
+#       was blocked 10 days past completion.
+#
+# The control below (same ref, unblock_goal instead of external_id) resolves
+# True, which is what isolates external_id as the sole difference rather than
+# something about partner-response refs generally.
+
+FUTURE_TTL = "2026-07-30T00:00:00"   # after NOW (2026-07-26)
+PASSED_TTL = "2026-07-01T00:00:00"   # before NOW
+
+
+def _resolve_ref(ref, index=None, pq=None, resolver=None):
+    mod = _import()
+    return mod._resolve_blocker_ref(
+        "dict", ref, ref, index or {}, pq or {}, NOW,
+        external_resolver=resolver)
+
+
+_DONE = {"id": "g-999-77", "status": "completed"}
+_LIVE = {"id": "g-999-78", "status": "pending"}
+
+
+def test_external_id_terminal_referent_resolves():
+    """Shape (a): the field is read at all. Pre-fix this was (None, 'opaque')."""
+    resolved, why, basis = _resolve_ref(
+        {"type": "partner-response", "external_id": "g-999-77"},
+        _index(_DONE))
+    assert resolved is True, f"external_id referent not read: {why}"
+    assert basis == "referent_terminal_external", basis
+
+
+def test_external_id_control_unblock_goal_isolates_the_field():
+    """The control that makes the test above a claim about external_id and not
+    about partner-response refs in general: identical ref, different field."""
+    resolved, _, basis = _resolve_ref(
+        {"type": "partner-response", "unblock_goal": "g-999-77"}, _index(_DONE))
+    assert (resolved, basis) == (True, "referent_terminal"), basis
+
+
+def test_terminal_referent_beats_a_future_ttl():
+    """Shape (b): pre-fix this returned (False, 'unresolved') — external_id was
+    unread, and the mere PRESENCE of expires_at pushed the fallthrough to a
+    definite 'unresolved', so the goal waited out a TTL its referent had
+    already made moot.
+
+    Scope note (measured, not assumed): this case does NOT pin the ordering of
+    the ext check against `expired`. The TTL here is in the future, so `expired`
+    is False and the two clauses cannot contend. Mutation-testing an ext check
+    ranked BELOW `expired` leaves this test GREEN. The ordering is pinned by the
+    passed-TTL test below; keeping the two apart is what makes each one's claim
+    true."""
+    resolved, why, basis = _resolve_ref(
+        {"type": "partner-response", "external_id": "g-999-77",
+         "expires_at": FUTURE_TTL},
+        _index(_DONE))
+    assert resolved is True, f"clock beat a completed referent: {why}"
+    assert basis == "referent_terminal_external", basis
+
+
+def test_terminal_referent_outranks_a_passed_ttl_in_the_basis():
+    """THE ordering test. Referent completed AND clock lapsed — both say the
+    block can clear, so `resolved` is True either way and the bug hides in the
+    BASIS. The module's doctrine is that a reader weights `referent_terminal`
+    above `ttl_expired` and re-probes the latter before acting; reporting
+    ttl_expired here tells the reader to go re-verify a premise that genuinely
+    cleared.
+
+    Verified by mutation: ranking the ext check below `expired` flips this to
+    'ttl_expired' while every other test in this section stays green."""
+    resolved, _, basis = _resolve_ref(
+        {"type": "partner-response", "external_id": "g-999-77",
+         "expires_at": PASSED_TTL},
+        _index(_DONE))
+    assert resolved is True
+    assert basis == "referent_terminal_external", (
+        f"a completed referent was reported as {basis!r} — the clock outranked "
+        f"the fact, so the reader is told to re-probe a settled premise")
+
+
+def test_pending_external_referent_stays_unresolved():
+    """Over-unblock control. A live referent must NOT clear the block, and must
+    read as 'unresolved' (a definite no) rather than 'opaque' (a shrug) — the
+    opaque fallthrough tests `ext_resolved is None`, and using truthiness there
+    would swallow this False and re-hide the goal."""
+    resolved, _, basis = _resolve_ref(
+        {"type": "partner-response", "external_id": "g-999-78"}, _index(_LIVE))
+    assert (resolved, basis) == (False, "unresolved"), basis
+
+
+def test_cross_world_id_without_resolver_gets_its_own_basis():
+    """'opaque' means a shape this reader does not understand; a cross-world ref
+    IS understood and merely unreachable. Folding them together makes a real
+    operational population uncountable."""
+    resolved, _, basis = _resolve_ref(
+        {"type": "partner-response", "external_id": "zds:g-500-11"})
+    assert resolved is None
+    assert basis == "external_unresolvable", basis
+
+
+def test_cross_world_id_with_injected_resolver_settles():
+    """The resolver is injected, not imported — this checker runs in worlds with
+    no cross-world reader at all. Both verdicts, so neither branch is dead."""
+    done, _, done_basis = _resolve_ref(
+        {"type": "partner-response", "external_id": "zds:g-500-11"},
+        resolver=lambda rid: "completed")
+    live, _, live_basis = _resolve_ref(
+        {"type": "partner-response", "external_id": "zds:g-500-11"},
+        resolver=lambda rid: "pending")
+    assert (done, done_basis) == (True, "referent_terminal_external")
+    assert (live, live_basis) == (False, "unresolved"), live_basis
+
+
+# ── unparseable / falsy expires_at () ──
+#
+# Two fresh-eyes findings from bravo, both in the same dict branch:
+# bravo-fec-unparseable-ttl-asserts-definite-verdict-202607271800 and
+# bravo-fec-empty-dict-message-overclaims. Neither was introduced by ;
+# both were surfaced by probing around it.
+
+def test_unparseable_ttl_is_opaque_not_a_definite_verdict():
+    """rb-245 class: a definite verdict drawn against a field the reader just
+    failed to parse. Pre-fix, {'expires_at': 'garbage'} returned
+    (False, 'unresolved') — 'this block is CONFIRMED still live' — because the
+    opaque guard tested `not exp_raw` and a garbage string is truthy. Every
+    other undecidable shape in this function returns opaque; an unreadable TTL
+    is one of those. The precheck 0.5b.12 sweep consumes the difference, so the
+    overclaim propagates into filed goals."""
+    resolved, why, basis = _resolve_ref({"expires_at": "garbage"})
+    assert (resolved, basis) == (None, "opaque"), (resolved, basis)
+    assert "unparseable" in why, why
+
+
+def test_parseable_ttl_still_yields_a_definite_verdict():
+    """The control that keeps the fix from over-reaching: a TTL that PARSES is a
+    real signal and must keep producing definite verdicts in both directions.
+    Widening opaque to every present expires_at would silently disable the TTL
+    fail-open the schema exists to provide."""
+    future, _, fb = _resolve_ref({"expires_at": FUTURE_TTL})
+    passed, _, pb = _resolve_ref({"expires_at": PASSED_TTL})
+    assert (future, fb) == (False, "unresolved"), fb
+    assert (passed, pb) == (True, "ttl_expired"), pb
+
+
+def test_unparseable_ttl_does_not_suppress_a_real_referent_signal():
+    """An unreadable TTL contributes nothing — it must not also SUBTRACT. A
+    terminal unblock_goal alongside garbage still resolves."""
+    resolved, _, basis = _resolve_ref(
+        {"expires_at": "garbage", "unblock_goal": "g-999-77"}, _index(_DONE))
+    assert (resolved, basis) == (True, "referent_terminal"), basis
+
+
+def test_present_but_falsy_key_is_not_reported_as_an_empty_dict():
+    """{'expires_at': ''} is not an empty dict. Calling it empty sends the next
+    reader hunting for a missing field that is sitting right there — the same
+    overclaim g-115-3505 fixed in the sibling branch one line above."""
+    _, why, basis = _resolve_ref({"expires_at": ""})
+    assert basis == "opaque", basis
+    assert "is empty" not in why, f"still claims emptiness: {why}"
+    assert "expires_at" in why, f"does not name the present-but-empty key: {why}"
+
+
+def test_genuinely_empty_dict_still_says_empty():
+    """Control for the message change: a dict that IS empty must keep saying so,
+    or the reword just moves the inaccuracy to the other case."""
+    _, why, _ = _resolve_ref({})
+    assert "empty" in why, why
+
+
+def test_throwing_resolver_fails_open_and_is_diagnosable():
+    """The resolver is injected foreign code reaching another world — the single
+    likeliest dependency here to be down or throwing. _resolve_blocker_ref runs
+    per-goal, so an unhandled raise takes out the WHOLE scan, not just this ref;
+    a detective sweep that dies on its own optional dependency is worse than one
+    that reports less (guard-142).
+
+    Found by the post-close fresh-eyes probe on this very change, not by design —
+    the first version propagated."""
+    def boom(rid):
+        raise RuntimeError("cross-world reader is down")
+
+    resolved, why, basis = _resolve_ref(
+        {"type": "partner-response", "external_id": "zds:g-500-11"},
+        resolver=boom)
+    assert (resolved, basis) == (None, "external_unresolvable"), basis
+    # Recorded, not swallowed — a broken resolver must be diagnosable from the
+    # report rather than merely quiet.
+    assert "RuntimeError" in why and "resolver raised" in why, why
+
+
+def test_board_prefixed_external_id_is_not_read_as_cross_world():
+    """_BOARD_PREFIXES legitimately contain ':' ('coordination:', 'findings:',
+    ...). A bare colon test would route them into the cross-world branch and
+    strip the board classification _classify_ref gives them."""
+    resolved, _, basis = _resolve_ref(
+        {"type": "partner-response", "external_id": "coordination:msg-1"})
+    assert (resolved, basis) == (None, "opaque"), basis
+
+
+def test_dangling_external_id_surfaces_as_dangling():
+    """A dangling referent can never auto-clear, so it must keep outranking the
+    generic undecidable bases — same treatment unblock_goal already gets."""
+    resolved, _, basis = _resolve_ref(
+        {"type": "partner-response", "external_id": "g-404-99"})
+    assert (resolved, basis) == (None, "dangling"), basis
+
+
+def test_passed_ttl_still_outranks_an_unresolvable_cross_world_ref():
+    """The TTL fail-open is a real design guarantee and must survive the new
+    bases: unreachable referent + lapsed clock is still all_resolved, and still
+    labelled ttl_expired so a reader knows to re-probe before acting."""
+    resolved, _, basis = _resolve_ref(
+        {"type": "partner-response", "external_id": "zds:g-500-11",
+         "expires_at": PASSED_TTL})
+    assert (resolved, basis) == (True, "ttl_expired"), basis
+
+
+def test_external_id_reaches_the_verdict_ladder_end_to_end():
+    """Integration path, not just the resolver in isolation: a resolver fix that
+    never reaches `verdict` would leave the goal exactly as invisible."""
+    goal = _goal(id="g-999-79", blocker_ref={"type": "partner-response",
+                                             "external_id": "g-999-77"})
+    entry = _classify(goal, _index(_DONE))
+    assert entry["verdict"] == "all_resolved", entry
+    assert entry["resolution_basis"] == "referent_terminal_external", entry

@@ -54,7 +54,11 @@ def _agent(fork_sids=()):
     """
     adir = PROJECT_ROOT / "agents" / THROWAWAY
     (adir / "session").mkdir(parents=True, exist_ok=True)
-    (adir / "local-paths.conf").write_text("WORLD_PATH=\nMETA_PATH=\n")
+    # newline="" disables CRLF translation on Windows (guard-1688) — this conf
+    # is sourced by _paths.sh, which would otherwise read a trailing \r.
+    (adir / "local-paths.conf").write_text(
+        "WORLD_PATH=\nMETA_PATH=\n", encoding="utf-8", newline=""
+    )
     for sid in fork_sids:
         bsd = adir / "sessions" / sid
         bsd.mkdir(parents=True, exist_ok=True)

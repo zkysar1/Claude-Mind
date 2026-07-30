@@ -96,6 +96,24 @@ def _atomic_write_yaml(path: Path, data: Any) -> None:
 
 
 def _persist(ctx, path: Path, data: Any) -> None:
+    """NO locked_rmw CURE NEEDED HERE — measured, not inferred ().
+
+    Every one of this module's four callers passes _gen_path(ctx), i.e.
+    strategy-generations.yaml, and coordination_merge.merge_handler_for returns
+    merge_strategy_generations for that basename. It is therefore write-class
+    (a) MERGE-PROTECTED: a reconciler runs BELOW the write, so a concurrent
+    writer is merged rather than refused, and the bare lock is correct.
+
+    This module was reported as needing the cure on the grounds that its
+    _persist is "byte-identical in shape" to the fence-only ones in
+    meta_backpressure / meta_experiment. It is — and that similarity is exactly
+    the inference guard-1733 forbids. Registration is by BASENAME; two
+    identical helpers in adjacent modules land on opposite sides of the split.
+    Before changing anything here, re-run the one lookup:
+        grep -n '"strategy-generations.yaml": merge_' core/scripts/coordination_merge.py
+    If that stops matching, this file becomes class (b) and DOES need the
+    locked_rmw + force_fresh treatment its siblings received.
+    """
     base_dir = ctx.paths.meta
     agent = _agent_name(ctx)
     assert_not_cruft(path.parent, "mkdir (meta_generations)")

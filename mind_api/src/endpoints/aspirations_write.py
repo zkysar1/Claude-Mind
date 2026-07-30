@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -118,6 +119,40 @@ from gates.capability_route import _active_agents as _gate_active_agents  # noqa
 
 def _valid_intended_agents() -> set:
     return set(_gate_active_agents()) | {"either"}
+
+
+def _routes_away_from(intended_agent, agent_name) -> bool:
+    """Daemon-side mirror of `aspirations.routes_away_from` ().
+
+    Duplicated deliberately rather than imported: this module already keeps its
+    own `_valid_intended_agents()` for the same layer-separation reason (the
+    daemon resolves the roster through gates.capability_route, not through
+    core/scripts/_agents). Keep the two in sync.
+
+    Returns False for unset/None, "either", `agent_name` itself, AND any value
+    outside the live vocabulary -- a retired agent or an unrecognized sentinel
+    names nobody who can honor the routing, so refusing the claim stranded the
+    goal permanently (it is invisible to the selector too). Conservative: an
+    unresolvable roster ({"either"} alone) skips the vocabulary check.
+    """
+    # str() before strip(): see the CLI twin's comment -- the replaced
+    # predicate compared with != and tolerated any type; a bare .strip() would
+    # raise on a malformed value. Keep the two bodies byte-identical (a parity
+    # test asserts it).
+    ia = str(intended_agent or "").strip()
+    if not ia or ia == "either" or ia == agent_name:
+        return False
+    # See the CLI twin for the full rationale: a roster-resolution failure must
+    # never escape (the replaced predicate could not raise), and an unresolvable
+    # roster takes the same conservative branch as an empty one. Bodies are kept
+    # byte-identical -- a parity test asserts it.
+    try:
+        valid = _valid_intended_agents()
+    except Exception:
+        return True
+    if len(valid) > 1 and ia not in valid:
+        return False  # off-roster -> nobody can honor it -> treat as "either"
+    return True
 
 # Back-compat shim for any unmigrated reader of the module-level constant.
 # This snapshot is intentionally lazy-recomputed on first access via property
@@ -735,6 +770,11 @@ def _file_unblock_inline(items: List[Dict[str, Any]],
         "blocked_by": [],
         "origin_signal": f"unblock:{original_goal_id}",
         "created_at": datetime.now().isoformat(timespec="seconds"),
+        # alloc_nonce () — see add_goal() for the full rationale.
+        # This lane MUST mint its own: it appends directly and never passes
+        # through add_goal()'s setdefault, and it is the lane that produced 2
+        # of the 3 observed same-goal splits.
+        "alloc_nonce": uuid.uuid4().hex,
         "tags": ["unblock", "defer-gate-routed", "framework-maintenance"],
         "verification": {"outcomes": [], "checks": [], "preconditions": []},
     }
@@ -1328,6 +1368,22 @@ def _run_update_goal_gates(ctx, goal_id: str, field: str, value
             suggest_unblock=True,
             agent_name=ctx.paths.agent_name,
             world_dir=ctx.paths.world,
+            # : THIS IS THE DEFER PATH — say so, or the gate's refusal
+            # text recommends a flag this path ignores. gates.capability computes
+            # `bypass_flag_hint` from caller_context ( GAP 2): "defer"
+            # yields --force-defer (the flag honoured here — note the
+            # X-Mind-Force-Defer header read two lines up), anything else yields
+            # --override-agent-match, which aspirations-update-goal.sh plumbs ONLY
+            # so argparse can redirect and explicitly does NOT honour on this path
+            # (). Omitting this defaulted to "create-blocker", so a
+            # caller following the message verbatim got override_applied=null and
+            # a second refusal with no working escape named anywhere.
+            #  fixed exactly this in aspirations.py
+            # _run_capability_gate_for_defer (--caller-context defer) but not
+            # here — and under daemon-only architecture (35 wrappers, no CLI
+            # fallback) THIS is the only path that runs, so the fix landed
+            # entirely on dead code. Measured 2026-07-29 on .
+            caller_context="defer",
         )
         if cap_result.get("would_block"):
             cap_block_for_layer_d = (
@@ -1477,6 +1533,9 @@ def _file_routing_audit_investigate(ctx, goal: Dict[str, Any]) -> Optional[str]:
                 "discovered_by": invest_spec.get(
                     "discovered_by", "post-decompose-routing-audit"),
                 "created_at": datetime.now().isoformat(timespec="seconds"),
+                # alloc_nonce () — third mint site; appends directly,
+                # so it needs its own stamp. See add_goal() for rationale.
+                "alloc_nonce": uuid.uuid4().hex,
                 "intended_agent": "bravo",
                 "work_class": "framework",
             }
@@ -1539,6 +1598,29 @@ def add_goal(ctx) -> "Response":  # type: ignore[name-defined]
     # concurrent writers can't allocate the same g-NNN-NN sequence.
     goal.setdefault("status", "pending")
     goal.setdefault("created_at", datetime.now().isoformat(timespec="seconds"))
+    # alloc_nonce (): an IMMUTABLE, UNIQUE allocation stamp — the only
+    # thing a goal carries that is both. It exists so coordination_merge can tell
+    # "the same logical goal, edited on two boxes" from "two distinct goals that
+    # collided on an id", without keying on anything a later edit can change.
+    #
+    # WHY NOTHING ELSE WORKS (the trade  had to decide). `created_at`
+    # is immutable but only second-precision, so it is not unique. `id` is unique
+    # within a store but MUTABLE — the collision path re-ids goals, which is the
+    # whole reason identity could not key on it. `title` is neither: keying on it
+    # (the pre-fix behaviour) meant a title edit racing a stale snapshot gave the
+    # two copies different identities, so they never collapsed and one was
+    # displaced to a fresh id — one goal silently became two (proven live:
+    #  carries displaced_from=). Two of the three confirmed
+    # instances were `Apply:` -> `Unblock:` retitles, so it is a systematic shape,
+    # not a freak race. A random nonce is immutable by construction and unique
+    # without needing precision, which is why it is the fix rather than a wider
+    # tuple of existing fields.
+    #
+    # setdefault, matching created_at/filed_by_agent: an explicit caller value is
+    # preserved, and goals written before this field simply lack it — merge falls
+    # back to the previous (created_at, title) identity for them, so this is a
+    # no-op for every existing goal (see coordination_merge._goal_identity).
+    goal.setdefault("alloc_nonce", uuid.uuid4().hex)
     # filed_by_agent (): stamp the filing agent at add time so the
     # per-agent contribution-vs-harm scorecard can attribute churn ("who filed
     # the goal that later expired?") without git-blame / which-queue heuristics.
@@ -2032,6 +2114,31 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
                 )
                 if uls_result["warned"]:
                     warnings.append(uls_result["message"])
+
+            # : mirror of the cmd_update_goal normalization. A DIRECT
+            # `blocker_ref` field write reached this generic assignment with no
+            # validation, no alias normalization and no TTL — _validate_blocker_ref
+            # was reachable only via the X-Mind-Blocker-Ref HEADER path above.
+            # Both writers must normalize or the CLI and daemon disagree on the
+            # stored shape (guard-330). DICTS ONLY: a bare-string ref is a live
+            # reader-supported shape tracked separately ().
+            if field == "blocker_ref" and value not in (None, ""):
+                _candidate_ref = value
+                if isinstance(_candidate_ref, str):
+                    try:
+                        _candidate_ref = json.loads(_candidate_ref)
+                    except (json.JSONDecodeError, TypeError):
+                        _candidate_ref = None      # bare string ref — out of scope
+                if isinstance(_candidate_ref, dict):
+                    _ok_ref, _norm_ref = _validate_blocker_ref(_candidate_ref)
+                    if not _ok_ref:
+                        return Response.error(
+                            400, "blocker_ref_invalid",
+                            f"{_norm_ref} (goal {goal_id}; a direct blocker_ref "
+                            f"field write is normalized by the same validator as "
+                            f"the X-Mind-Blocker-Ref header — g-115-3532)",
+                        )
+                    value = _norm_ref
 
             # Capture old_status BEFORE the mutation — the selection_count
             # cascade compares old vs new to stay idempotent on redundant
@@ -3711,8 +3818,7 @@ def claim(ctx) -> "Response":  # type: ignore[name-defined]
             claimed_asp_id = asp.get("id")  # for the post-write persistence read-back
 
             intended = goal.get("intended_agent")
-            if (intended and intended != agent_name
-                    and intended != "either"):
+            if _routes_away_from(intended, agent_name):
                 if not cross_lane:
                     return Response.error(400, "cross_lane_refused",
                         f"Goal {goal_id} routed to '{intended}' but claimer "

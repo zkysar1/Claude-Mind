@@ -119,6 +119,10 @@ from ..agent_paths import assert_not_cruft
 
 from _fileops import _atomic_write_with_fallback  # noqa: E402
 from _l1_pick import log_l1_pick  # noqa: E402  # S9 SSOT, 
+from _growth_log import (  # noqa: E402  # tree_growth_log SSOT, 
+    record_batch as _growth_record_batch,
+    record_reparent as _growth_record_reparent,
+)
 
 
 VALID_OPS = {"add-child", "set", "increment", "remove-child",
@@ -1413,6 +1417,14 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
                         409, "would_orphan_subtree",
                         f"'{child_key}' has {len(descendants)} descendant(s) "
                         f"({', '.join(descendants)}); remove them first")
+                # tree_growth_log PRUNE row () — same SSOT call the
+                # CLI's cmd_remove_child makes, so standalone and batch removal
+                # agree across BOTH write paths.
+                _growth_record_batch(
+                    tree,
+                    [{"op": "remove-child", "key": parent_key,
+                      "child_key": child_key}],
+                    date.today().isoformat())
                 _write_tree_locked(path, tree, base_dir, agent,
                                    summary=f"tree-remove-child {child_key} from {parent_key}")
                 return Response.json({"ok": True, "op": op,
@@ -1586,6 +1598,10 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
                     nodes, old_parent_key, competence)
 
                 tree["nodes"] = nodes
+                # tree_growth_log REPARENT row () — mirrors
+                # cmd_reparent (tree.py) via the shared _growth_log SSOT.
+                _growth_record_reparent(tree, node_key, new_parent_key,
+                                        date.today().isoformat())
                 tree["last_updated"] = date.today().isoformat()
                 _write_tree_locked(
                     path, tree, base_dir, agent,
@@ -1764,6 +1780,14 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
                         f"(ensure add-child precedes ops that use the new "
                         f"key): {e}")
 
+                # tree_growth_log: DECOMPOSE + PRUNE rows for this batch
+                # (). Mirrors cmd_batch (tree.py) by calling the SAME
+                # _growth_log SSOT — the whole point, since this log's sibling
+                # (l1-pick-log) went silent for ~6 weeks precisely because the
+                # daemon copy of a write path did not carry the CLI's append
+                # (). Must precede serialization: it mutates `tree`.
+                _growth_record_batch(tree, mutation_ops,
+                                     date.today().isoformat())
                 tree["last_updated"] = date.today().isoformat()
                 _write_tree_locked(path, tree, base_dir, agent,
                                    summary=f"tree-batch ({len(operations)} ops)")

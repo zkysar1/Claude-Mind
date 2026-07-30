@@ -74,6 +74,81 @@ BLOCKER_REF_TTL_HOURS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Canonical key vocabulary ().
+#
+# Before this, validate() silently STRIPPED every key outside its 5-key output.
+# That was data loss, not normalization: `unblock_goal` is actively read by
+# blocked-signal-resolution-check.py (_resolve_blocker_ref, the `ug =` line),
+# so a blind strip would have destroyed signal a live reader consumes. The
+# measured corpus (11 live refs, 2026-07-27) carried THREE spellings of
+# "the goal that unblocks this" and TWO of "free-text rationale".
+#
+# Resolution: promote the keys a reader actually consumes, normalize the
+# aliases INTO them, and REJECT everything else at the write path. Absorbing
+# variants one at a time is how a vocabulary reaches five spellings — the
+# reader's own comment says so, and declines to add a third spelling for
+# exactly that reason. This is the write-side half of that decision.
+BLOCKER_REF_CORE_KEYS = (
+    "type", "external_id", "state_hash", "created_at", "expires_at",
+)
+
+# Promoted optional keys — preserved through validate(), documented in
+# goal-schemas.md. Each earns its place by having a live reader.
+BLOCKER_REF_OPTIONAL_KEYS = (
+    "unblock_goal",   # read by blocked-signal-resolution-check._resolve_blocker_ref
+    "why",            # free-text rationale; surfaced in blocker_ref_why output
+)
+
+# Keys ACCEPTED on input but deliberately NOT carried into the output.
+#
+# A separate gate reads these off the RAW payload BEFORE validate() runs:
+# gates/credential_enum.py:113 does ref.get("credential_source_enumeration").
+# That gate is why the key must be accepted — refusing it would reject every
+# credentials-required blocker that carries its enumeration evidence. But it
+# must equally NOT be emitted: credential_enum's whole design (and
+# test_credential_enum_both_doors.test_blocker_ref_validate_drops_the_
+# enumeration_field) depends on validate() returning a REBUILT 5-key dict, so
+# that a guard reading validate's OUTPUT sees the field missing and cannot
+# silently pass on it. Accepted-but-dropped is the only shape satisfying both.
+#
+# Found by widening a regression glob ('s own close ran
+# blocker|defer|quiesc|aspiration and missed `credential` — the refusal
+# shipped in 0c20f24e and was caught one iteration later). Before adding a key
+# here, confirm it has a live RAW-payload reader; before adding one to
+# BLOCKER_REF_OPTIONAL_KEYS instead, confirm its reader wants it in the OUTPUT.
+BLOCKER_REF_PASSTHROUGH_KEYS = (
+    "credential_source_enumeration",
+)
+
+# Input aliases → canonical key. Accepted on the way IN so existing writers
+# keep working, but always stored under the canonical name so readers need
+# exactly one spelling.
+BLOCKER_REF_KEY_ALIASES = {
+    "unblocking_goal":    "unblock_goal",
+    "unblocking_goal_id": "unblock_goal",
+    "reason":             "why",
+    "ref":                "external_id",
+}
+
+# Keys seen in the wild that are deliberately NOT absorbed. Rejected with a
+# pointed message rather than silently dropped, so the writer fixes the payload
+# instead of the vocabulary growing a third spelling of a concept that already
+# has one. `blocker_id` is included: the blocker's own identity belongs in
+# external_id, which is what every reader already keys on.
+BLOCKER_REF_REJECTED_KEYS = {
+    "blocker_type":       "use `type`",
+    "blocking_goal":      "use `unblock_goal`",
+    "blocker_id":         "use `external_id`",
+    "denied_action":      "put it in `why`",
+    "human_only_reason":  "put it in `why`",
+    "principal":          "put it in `why`",
+    "probe":              "put it in `why`",
+    "probed_at":          "put it in `why`",
+    "probed_by":          "put it in `why`",
+}
+
+
 def validate(raw: Any, *, now: Optional[datetime] = None
              ) -> Tuple[bool, Any]:
     """Parse and normalize a blocker_ref payload.
@@ -87,8 +162,11 @@ def validate(raw: Any, *, now: Optional[datetime] = None
 
     Returns:
         (True, normalized_dict) on success — keys: type, external_id,
-            state_hash (optional), created_at, expires_at.
-        (False, error_message_string) on any validation failure.
+            state_hash, created_at, expires_at, plus any of the promoted
+            optional keys (unblock_goal, why) that were supplied.
+        (False, error_message_string) on any validation failure, including
+            an unknown or rejected key (g-115-3532 — unknown keys are
+            REFUSED, never silently stripped).
     """
     if raw is None or raw == "":
         return False, "blocker_ref is required (pass --blocker-ref '<json>')"
@@ -104,6 +182,57 @@ def validate(raw: Any, *, now: Optional[datetime] = None
     if not isinstance(ref, dict):
         return False, (
             f"blocker_ref must be a JSON object, got {type(ref).__name__}"
+        )
+
+    # --- key normalization () -----------------------------------
+    # Fold aliases onto their canonical name BEFORE any other check, so the
+    # rest of this function only ever sees canonical spellings. A canonical
+    # key already present wins over its alias (explicit beats implied).
+    ref = dict(ref)
+    # Which canonical keys were filled BY an alias (vs. supplied explicitly).
+    # The distinction is load-bearing — see the two branches below.
+    alias_filled = {}
+    for alias, canonical in BLOCKER_REF_KEY_ALIASES.items():
+        if alias in ref:
+            value = ref.pop(alias)
+            existing = ref.get(canonical)
+            if existing in (None, ""):
+                ref[canonical] = value
+                alias_filled[canonical] = alias
+            elif canonical in alias_filled and existing != value:
+                # TWO ALIASES collide (e.g. unblocking_goal + unblocking_goal_id,
+                # which both map to unblock_goal). Neither spelling outranks the
+                # other, so the winner would be decided by dict-insertion order
+                # alone and the loser discarded silently — the exact silent-drop
+                # this module refuses for unknown keys. Refuse, naming both.
+                # (fresh-eyes-code F-001, board msg-20260727-185028.)
+                return False, (
+                    f"blocker_ref carries conflicting values for {canonical!r}: "
+                    f"{existing!r} (as {alias_filled[canonical]!r}) vs "
+                    f"{value!r} (as {alias!r}). Neither spelling outranks the "
+                    "other, so picking one would be arbitrary — supply exactly "
+                    "one (g-115-3532)."
+                )
+            # Otherwise the canonical key was supplied EXPLICITLY in the input.
+            # Explicit beats implied: the canonical wins and the alias is
+            # dropped. That precedence is principled, not arbitrary — unlike the
+            # alias-vs-alias case above — so it stays silent.
+
+    # Passthrough keys are ACCEPTED here but never reach `out` below — see
+    # BLOCKER_REF_PASSTHROUGH_KEYS for why both halves are load-bearing.
+    allowed = (set(BLOCKER_REF_CORE_KEYS) | set(BLOCKER_REF_OPTIONAL_KEYS)
+               | set(BLOCKER_REF_PASSTHROUGH_KEYS))
+    unknown = [k for k in ref if k not in allowed]
+    if unknown:
+        hints = []
+        for k in sorted(unknown):
+            hint = BLOCKER_REF_REJECTED_KEYS.get(k)
+            hints.append(f"{k} ({hint})" if hint else k)
+        return False, (
+            "blocker_ref carries unrecognized key(s): " + ", ".join(hints)
+            + f". Allowed: {sorted(allowed)}. Unknown keys are REFUSED rather "
+              "than silently dropped so the vocabulary cannot grow a second "
+              "spelling of a concept that already has one (g-115-3532)."
         )
 
     btype = ref.get("type")
@@ -128,13 +257,21 @@ def validate(raw: Any, *, now: Optional[datetime] = None
         ttl = BLOCKER_REF_TTL_HOURS[btype]
         expires_at = (now_dt + timedelta(hours=ttl)).isoformat(timespec="seconds")
 
-    return True, {
+    out = {
         "type": btype,
         "external_id": ext_id.strip(),
         "state_hash": state_hash,
         "created_at": created_at,
         "expires_at": expires_at,
     }
+    # Carry the promoted optional keys through (). Only when
+    # supplied — an absent `why` stays absent rather than becoming a null,
+    # so the stored shape does not grow noise for refs that have no rationale.
+    for key in BLOCKER_REF_OPTIONAL_KEYS:
+        value = ref.get(key)
+        if value not in (None, ""):
+            out[key] = value
+    return True, out
 
 
 def log_unstructured_override(world_dir: Optional[Path], *,

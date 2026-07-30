@@ -36,8 +36,18 @@ pruning:
   # read-before-edit re-read on every sweep), reusing the rb-2085 procedure.
   # STRUCTURAL — keyed on size + append-grown shape, NOT utility/feedback, so it
   # catches the HIGH-utility sweep nodes crit2's noisy line-count heuristic misses.
-  distill_token_cap: 25000                # Read tool ~25k-token cap (token-size estimate = chars // 4)
-  distill_token_ratio: 0.8                # crit3 fires at this fraction of distill_token_cap (proactive headroom)
+  distill_token_cap: 25000                # Read tool ~25k-token cap. Token estimate = chars / CHARS_PER_TOKEN
+                                          # (tree.py, currently 2.3 — NOT chars//4; see that constant for the
+                                          # measurement). Was documented as chars//4 until 2026-07-30, which
+                                          # underestimated dense technical markdown by ~1.7x and scored 5
+                                          # over-cap nodes "HEALTHY". Expressed in chars this cap is ~57500,
+                                          # not the ~100000 that chars//4 implied. tree.py owns the ratio;
+                                          # this comment must not restate it as a second source of truth.
+  distill_token_ratio: 0.8                # crit3 fires at this fraction of distill_token_cap (proactive headroom).
+                                          # Real headroom only exists now that the estimate is calibrated: under
+                                          # chars//4 this 80% trigger sat at ~135% of true cap, so the proactive
+                                          # guard could not fire until the node was already over the cap it
+                                          # protects — inverted, not merely absent ().
   distill_refresh_min_sections: 3         # append-grown signature: >= N dated "Refresh"/"Verified Values" headings
   max_distill_per_invocation: 10          # max DISTILL ops per /tree maintain run (raised 5→10 at config ceiling 2026-04-18 for backlog drain, g-115-79)
   retire_sessions_unused: 5              # sessions with 0 retrievals before RETIRE eligible

@@ -106,10 +106,10 @@ def test_bump_census_id_append_dedup_and_frozen_legacy():
     asp = {"id": "asp-014", "goals": []}
     _evict._bump_census(asp, "completed", "g-014-02")
     _evict._bump_census(asp, "completed", "g-014-01")
-    _evict._bump_census(asp, "completed", "")   # re-evict: no-op
+    _evict._bump_census(asp, "completed", "g-014-02")   # re-evict: no-op
     _evict._bump_census(asp, "skipped", "g-014-03")
     c = asp["archived_census"]
-    assert c["evicted_ids"]["completed"] == ["", ""]  # sorted, deduped
+    assert c["evicted_ids"]["completed"] == ["g-014-01", "g-014-02"]  # sorted, deduped
     assert c["evicted_ids"]["skipped"] == ["g-014-03"]
     assert "by_status" not in c                      # legacy baseline untouched
     assert census.census_by_status(asp) == {"completed": 2, "skipped": 1}
@@ -227,7 +227,7 @@ def test_evict_merge_reevict_conservation():
     stale = {"id": "asp-011", "title": "t", "last_selected": "2026-06-09T00:00:00",
              "goals": [dict(aged), dict(live)]}
     rec = _one(cm.merge_aspirations(_blob(a_post), _blob(stale)))
-    assert [g["id"] for g in rec["goals"]] == [""]   # no resurrection
+    assert [g["id"] for g in rec["goals"]] == ["g-011-02"]   # no resurrection
 
     # Re-evict on the merged state: set-add no-op, counts stable, audit clean.
     out2 = _evict._make_evictor(CUTOFF)([rec])
@@ -260,7 +260,7 @@ def test_repair_clamps_legacy_only_with_explicit_zeros():
     out = _evict._make_census_repair("2026-06-01T00:00:00")([asp])
     c = out[0]["archived_census"]
     assert c["by_status"] == {"completed": 0, "skipped": 0}   # explicit zeros
-    assert c["evicted_ids"] == {"completed": [""]}    # ground truth kept
+    assert c["evicted_ids"] == {"completed": ["g-013-03"]}    # ground truth kept
     assert _evict._audit_violations(out) == []
     # The MIN-merge now propagates the repair against a stale nonzero peer:
     stale_census = {"by_status": {"completed": 5, "skipped": 1},
@@ -281,7 +281,7 @@ def test_merge_never_crashes_on_garbage_evicted_ids():
         m2 = cm.merge_aspirations(_blob(b), _blob(a))
         assert m1 == m2
         rec = _one(m1)
-        assert [g["id"] for g in rec["goals"]] == [""]  # nothing dropped
+        assert [g["id"] for g in rec["goals"]] == ["g-020-01"]  # nothing dropped
 
 
 # ------------------------------------------------------------------ mint sites

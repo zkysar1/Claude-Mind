@@ -31,7 +31,11 @@ from _fileops import _atomic_write_with_fallback  # noqa: E402
 from storage_backend import get_backend  # noqa: E402  # s5b: own-cloud read freshness
 from ..agent_paths import assert_not_cruft  # noqa: E402
 
-from ..store_registry import STORE_REGISTRY, apply_defaults
+# _stamp_now is imported (rather than re-deriving strftime here) so the
+# amend_stamp_field value is byte-identical in format to `created` — the merge
+# compares these as normalized strings, so a format divergence would order them
+# wrongly. Private-by-underscore but same-package; the shared format IS the point.
+from ..store_registry import STORE_REGISTRY, apply_defaults, _stamp_now
 
 
 # ---------------------------------------------------------------------------
@@ -483,6 +487,36 @@ def set_field(ctx) -> "Response":  # type: ignore[name-defined]
             idx, rec = found
             rec = apply_defaults(rec, spec.default_fields)
             rec[field_name] = value
+            # Amendment recency stamp ( / guard-1703, redesigned
+            # per-field by ). Cross-box merge resolves content fields
+            # with a byte-order tiebreak that has no relation to which text is
+            # newer, so an in-place amendment can be reverted by the older copy it
+            # extends. This stamp is the explicit ordering key
+            # _merge_guard_record needs; without a writer it would be a reader
+            # with no writer (rb-5493).
+            #
+            # PER-FIELD, keyed by the field being written — NOT a record-level
+            # scalar. The merge handler resolves field by field, so a record-level
+            # stamp would order EVERY content field by whichever box wrote last,
+            # deterministically discarding a concurrent amendment to a different
+            # field of the same record. guard-1153 states the correct shape: LWW
+            # on a timestamp written BY THE SAME MUTATION that writes the field.
+            # Writing only `field_name`'s key is what makes that true here.
+            #
+            # Inside locked_rmw, so the stamp is atomic with the field it dates —
+            # a separate write could not be. Skipped when the caller is setting
+            # the stamp field itself (an explicit backfill/correction stays
+            # authoritative rather than being overwritten by now()).
+            if spec.amend_stamp_field and field_name != spec.amend_stamp_field:
+                stamps = rec.get(spec.amend_stamp_field)
+                if not isinstance(stamps, dict):
+                    # Absent, or a legacy record-level scalar left by the
+                    #  shape. Start a fresh map rather than mutating a
+                    # non-dict; the old scalar stays on the record and is read as
+                    # a per-field floor by the merge's migration path.
+                    stamps = {}
+                stamps[field_name] = _stamp_now()
+                rec[spec.amend_stamp_field] = stamps
             if spec.validate is not None:
                 try:
                     spec.validate(ctx, rec)
