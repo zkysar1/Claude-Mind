@@ -85,10 +85,23 @@ except Exception:
     sys.exit(0)
 
 CANARY_SLOT = "cadence_stale_canary"
-# Target aspiration for filed Investigate goals.  is the framework-
-# evolution world aspiration (the g-115-* queue) — the same target the sibling
-# stale-sentinel-canary and the other framework canaries file into.
-ASP_ID = "asp-115"
+# Target aspiration for filed Investigate goals — RESOLVED, not hardcoded ().
+# This was `ASP_ID = ""`, THIS deployment's framework-evolution world aspiration
+# (the g-115-* queue). Downstream deployments do not have it: every escalation filed
+# there died with aspiration_not_found, at every iteration close, and because the
+# failure was recorded in this canary's own report as data rather than raised, nothing
+# escalated the escalation failure — two cadences sat at stuck_count 3 and four cadence
+# rituals went overdue. Not hardcoded to any single id either: this is a FRAMEWORK file
+# that travels the promotion chain, so a deployment-specific constant would break
+# downstream or be clobbered by the next sync (). _escalation_target resolves to
+# an aspiration that ACTUALLY EXISTS, and is therefore correct in every deployment
+# without a per-deployment edit.
+try:
+    from _escalation_target import resolve as _resolve_asp, source_flag as _asp_source
+    ASP_ID, _ASP_VIA = _resolve_asp(CORE_ROOT, WORLD_DIR, AGENT_DIR)
+    ASP_SOURCE = _asp_source(ASP_ID, WORLD_DIR, AGENT_DIR)
+except Exception:
+    ASP_ID, _ASP_VIA, ASP_SOURCE = "asp-115", "fallback:import-failed", "world"
 DEFAULT_THRESHOLD = 3
 # Re-file suppression window (mirrors stale-sentinel-canary DEDUP_HOURS). The
 # stuck condition is INTERMITTENT (a persistently-skipped dispatch re-trips the
@@ -261,7 +274,7 @@ def _file_investigate(cadence: str, stuck: int, cadence_dict: dict, dry_run: boo
 
     def _run_add(extra):
         return subprocess.run(
-            bash_cmd(script_path, "--source", "world", ASP_ID, *extra),
+            bash_cmd(script_path, "--source", ASP_SOURCE, ASP_ID, *extra),
             input=json.dumps(payload),
             capture_output=True, text=True, timeout=30,
         )

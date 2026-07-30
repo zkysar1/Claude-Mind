@@ -310,3 +310,62 @@ def test_provenance_guard_fires_through_main():
             assert not unblock.get("outcome_note"), (
                 f"guard-vetoed Unblock must have no outcome_note; "
                 f"got {unblock.get('outcome_note')!r}")
+
+
+def test_untimestamped_unblock_reports_age_uncomputable_not_below_threshold():
+    """An Unblock with NO parseable timestamp gets its own verdict, not a threshold one.
+
+    g-115-4093 (from g-115-4084). The age gate used to read
+
+        if age_h is None or age_h < args.max_age_hours:
+            ... "reason": f"age {age_h} below threshold {args.max_age_hours}h"
+
+    which rendered the literal string "age None below threshold 0.0h" — not even
+    well-formed, let alone true. A reader scanning `reason` sees a threshold word
+    and moves on, while the goal is structurally incapable of ever aging into
+    eligibility because it has no timestamp at all.
+
+    This is the POSITIVE CONTROL for that fix. The live queue currently yields
+    zero uncomputable rows (created_at was backfilled in g-115-4084), so a live
+    run cannot distinguish "the branch works" from "the branch is unreachable" —
+    exactly the flattering zero the parent goal was about. This test constructs
+    the case so the branch is proven reachable.
+
+    Skipping stays correct (guard-420: no arithmetic on a null). Only the NAME
+    was wrong. guard-2024.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        # created_at=None is falsy, and no defer_reason_set_at / started exist,
+        # so ref_ts resolves to None and _age_hours returns None.
+        world, agent_dir = _make_world_with_pair(
+            tmp, parent_status="skipped", unblock_extra={"created_at": None})
+        with DaemonFixture(world):
+            rc, out, err = _run_sweep(world, agent_dir, apply=True)
+            assert rc == 0, f"sweep failed rc={rc}: {err}"
+            result = json.loads(out)
+
+            row = next((d for d in result.get("details", [])
+                        if d.get("goal_id") == "g-700-73"), None)
+            assert row is not None, (
+                f"the untimestamped Unblock must appear in details; "
+                f"scanned={result.get('scanned')} eligible={result.get('eligible')} "
+                f"applied={result.get('applied')} details={result.get('details')} "
+                f"candidates={result.get('candidates')}")
+
+            assert str(row.get("reason", "")).startswith("age_uncomputable"), (
+                f"an undefined age must get its OWN verdict, not a threshold "
+                f"one; got reason={row.get('reason')!r}")
+            assert "below threshold" not in str(row.get("reason", "")), (
+                f"reason must not claim a threshold comparison it never made; "
+                f"got {row.get('reason')!r}")
+            assert row.get("age_hours") is None, (
+                f"age_hours must stay null, not be coerced; "
+                f"got {row.get('age_hours')!r}")
+            assert row.get("action") == "skipped"
+
+            # Behavior unchanged: still skipped, nothing applied, goal untouched.
+            assert result["applied"] == 0
+            unblock = _read_goal(world, "g-700-73")
+            assert unblock is not None and unblock["status"] == "pending", (
+                "an uncomputable-age Unblock must be left alone, exactly as before")
