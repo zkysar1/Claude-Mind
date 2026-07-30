@@ -112,9 +112,20 @@ def _config_meta(ctx) -> Path:
     return ctx.paths.project_root / "core" / "config" / "meta.yaml"
 
 
-def _read_yaml(path: Path) -> Dict[str, Any]:
+def _read_yaml(path: Path, force_fresh: bool = False) -> Dict[str, Any]:
+    """force_fresh=True force-pulls the latest remote object AND records its
+    ETag as the If-Match fence token, so a locked_rmw retry re-reads the peer's
+    landed write and re-fences each attempt. Without it a stale local mirror
+    fences every PUT against an etag the remote no longer has, and the 412
+    repeats forever against a remote that never changes — the per-object
+    stale-IfMatch DEADLOCK (rb-2639), not transient contention. Mirrors
+    meta_yaml._read_yaml. Default False keeps read-only callers on the
+    cache-TTL ensure_local (no extra S3 GET per read)."""
     from storage_backend import get_backend
-    get_backend().ensure_local(path)  # own-cloud read-path fix 2026-07-02: materialize an S3-only file on a fresh box before the local read; no-op on LocalBackend and for out-of-root/git-shipped paths (keystone in owncloud_backend._refresh)
+    if force_fresh:
+        get_backend().refresh(path)  # force-pull latest + set If-Match fence (rb-2639)
+    else:
+        get_backend().ensure_local(path)  # own-cloud read-path fix 2026-07-02: materialize an S3-only file on a fresh box before the local read; no-op on LocalBackend and for out-of-root/git-shipped paths (keystone in owncloud_backend._refresh)
     if not path.exists():
         return {}
     with open(path, "r", encoding="utf-8") as f:
@@ -134,24 +145,90 @@ def _atomic_write_yaml(path: Path, data: Any) -> None:
         path, _write, fallback_counter_key="daemon_meta_backpressure_write")
 
 
-def _persist(ctx, path: Path, data: Any) -> None:
+def _persist_unlocked(ctx, path: Path, data: Any) -> None:
+    """_persist's body WITHOUT the lock, for callers already inside a
+    locked_rmw cycle. file_locks.locked is NOT reentrant (it takes a plain
+    threading.Lock), so nesting it inside locked_rmw deadlocks the daemon
+    thread. Mirrors meta_yaml._persist_unlocked.
+
+    WHY backpressure.yaml needs the locked_rmw treatment at all (g-115-3834,
+    measured — do not re-derive from shape): coordination_merge.merge_handler_for
+    returns None for it, so it is write-class (b) FENCE-ONLY. Nothing reconciles
+    below the write, which makes a stale If-Match fence a PERMANENT per-object
+    wedge on that box with no self-recovery (rb-2639). Every one of this
+    module's six _persist callers passes _bp_path(ctx), so the class is uniform
+    here — unlike meta_transfer/strategy_apply, whose _persist helpers are
+    called with a MIX of (a) and (b) paths. Classify by PATH, never by the
+    helper or by a sibling module (guard-1733)."""
     base_dir = ctx.paths.meta
     agent = _agent_name(ctx)
     assert_not_cruft(path.parent, "mkdir (meta_backpressure)")
     path.parent.mkdir(parents=True, exist_ok=True)
-    with file_locks.locked(path):
-        _validate_no_surrogates(data, path)
-        history.snapshot(path, base_dir, agent)
-        _atomic_write_yaml(path, data)
-        changelog.append(base_dir, agent, path, "edit")
+    _validate_no_surrogates(data, path)
+    history.snapshot(path, base_dir, agent)
+    _atomic_write_yaml(path, data)
+    changelog.append(base_dir, agent, path, "edit")
+
+
+# The bare-lock `_persist` that used to live here is DELETED, not retained
+# (). Every path this module writes is `backpressure.yaml`, which is
+# class (b) fence-only — so a bare-lock persist here is not merely unused, it is
+# ALWAYS the wrong call, and leaving it in place arms the next editor to reach
+# for the shorter name. `_persist_unlocked` + `file_locks.locked_rmw` is the only
+# correct pair in this module. (Contrast meta_transfer / strategy_apply, which
+# keep their `_persist` because each has a live class-(a) caller.)
 
 
 def _ensure_state(ctx) -> Dict[str, Any]:
+    """Read-path helper for the two READ-ONLY handlers (status, cooldown_check).
+
+    Every MUTATING handler uses _read_state_fresh inside a locked_rmw cycle
+    instead — do NOT call this from inside a cycle: its write takes the lock,
+    and file_locks.locked is not reentrant.
+
+    The default-init write is itself a class-(b) write and so gets the same
+    treatment (g-115-3834). It looks harmless — it stores a constant — but the
+    constant is not the point: on a fence-only store a 412 here has nothing
+    below it to reconcile, so a first-touch race between two boxes would surface
+    as an error out of a read-only endpoint and, worse, keep doing so. Re-reading
+    inside the cycle also means the loser of that race adopts the winner's state
+    rather than overwriting it.
+    """
     path = _bp_path(ctx)
     data = _read_yaml(path)
     if "version" not in data:
+        def _cycle():
+            fresh = _read_yaml(path, force_fresh=True)
+            if "version" in fresh:
+                return fresh              # a peer created it first — take theirs
+            seed = {"version": 1, "active_monitors": [], "rollback_history": []}
+            _persist_unlocked(ctx, path, seed)
+            return seed
+
+        data = file_locks.locked_rmw(path, _cycle)
+    return data
+
+
+def _read_state_fresh(ctx) -> Dict[str, Any]:
+    """_ensure_state's in-cycle twin — for callers already inside a locked_rmw
+    cycle (g-115-3834).
+
+    Two deliberate differences from _ensure_state, both required by
+    file_locks.locked_rmw's contract:
+
+    1. force_fresh=True. The cycle MUST re-read the peer's landed write on every
+       retry attempt, and that read is also what records the If-Match fence
+       token. A cache-TTL read would re-fence each retry against an etag the
+       remote no longer has, and the 412 would repeat forever against a remote
+       that never changes — the per-object stale-IfMatch deadlock (rb-2639).
+    2. It does NOT persist the default-initialised state. _ensure_state's
+       `_persist` call takes file_locks.locked, which is NOT reentrant, so
+       calling it inside a cycle deadlocks the daemon thread. Initialising in
+       memory is sufficient: the cycle's own _persist_unlocked writes it.
+    """
+    data = _read_yaml(_bp_path(ctx), force_fresh=True)
+    if "version" not in data:
         data = {"version": 1, "active_monitors": [], "rollback_history": []}
-        _persist(ctx, path, data)
     return data
 
 
@@ -244,28 +321,33 @@ def monitor(ctx) -> "Response":  # type: ignore[name-defined]
         return Response.error(400, "invalid_param", "baseline must be a float")
 
     config = _load_config(ctx)
-    data = _ensure_state(ctx)
-    monitors = data.get("active_monitors", [])
+    bp_path = _bp_path(ctx)
 
-    if len(monitors) >= config.get("max_active_monitors", 5):
-        monitors.pop(0)  # eviction notice is stderr-only in CLI -> stdout unaffected
+    def _cycle():
+        data = _read_state_fresh(ctx)
+        monitors = data.get("active_monitors", [])
 
-    monitors.append({
-        "meta_change_id": body["change_id"],
-        "strategy_file": body["file"],
-        "field": body["field"],
-        "old_value": _coerce_value(body["old"]),
-        "new_value": _coerce_value(body["new"]),
-        "baseline_imp_k": baseline,
-        "goals_since_change": 0,
-        "imp_k_samples": [],
-        "consecutive_below_baseline": 0,
-        "consecutive_above_baseline": 0,
-        "status": "monitoring",
-        "created": _now(),
-    })
-    data["active_monitors"] = monitors
-    _persist(ctx, _bp_path(ctx), data)
+        if len(monitors) >= config.get("max_active_monitors", 5):
+            monitors.pop(0)  # eviction notice is stderr-only in CLI -> stdout unaffected
+
+        monitors.append({
+            "meta_change_id": body["change_id"],
+            "strategy_file": body["file"],
+            "field": body["field"],
+            "old_value": _coerce_value(body["old"]),
+            "new_value": _coerce_value(body["new"]),
+            "baseline_imp_k": baseline,
+            "goals_since_change": 0,
+            "imp_k_samples": [],
+            "consecutive_below_baseline": 0,
+            "consecutive_above_baseline": 0,
+            "status": "monitoring",
+            "created": _now(),
+        })
+        data["active_monitors"] = monitors
+        _persist_unlocked(ctx, bp_path, data)
+
+    file_locks.locked_rmw(bp_path, _cycle)
     return Response.text(
         json.dumps({"status": "created", "meta_change_id": body["change_id"]}) + "\n",
         content_type="application/json")
@@ -313,76 +395,96 @@ def check(ctx) -> "Response":  # type: ignore[name-defined]
         return Response.error(400, "invalid_param", "learning_value must be a float")
 
     config = _load_config(ctx)
-    data = _ensure_state(ctx)
+    bp_path = _bp_path(ctx)
     regression_window = config.get("regression_window", 5)
     graduation_window = config.get("graduation_window", 15)
     baseline_tolerance = config.get("baseline_tolerance", -0.10)
     audit_only_fields = config.get("audit_only_fields", {}) or {}
 
-    rollback_actions: List[Any] = []
-    graduated: List[Any] = []
-    audit_only_skipped: List[Any] = []
-    monitors = data.get("active_monitors", [])
+    # locked_rmw may run _cycle MORE THAN ONCE (a peer landed a write between
+    # our read and our conditional PUT). Every accumulator must therefore be
+    # rebuilt INSIDE the cycle and published only by the attempt that commits.
+    # Hoisting these three lists to the enclosing scope — their shape before
+    #  — would append one duplicate set per retry, and a duplicated
+    # rollback is indistinguishable from a real one in the response body.
+    out: Dict[str, Any] = {}
 
-    for mon in monitors:
-        if mon["status"] != "monitoring":
-            continue
-        if mon.get("monitor_kind") in EVOLUTION_KINDS:
-            continue
+    def _cycle():
+        data = _read_state_fresh(ctx)
+        rollback_actions: List[Any] = []
+        graduated: List[Any] = []
+        audit_only_skipped: List[Any] = []
+        monitors = data.get("active_monitors", [])
 
-        mon["goals_since_change"] += 1
-        mon["imp_k_samples"].append(learning_value)
-        baseline = mon["baseline_imp_k"]
-        threshold = baseline + baseline_tolerance
-        if learning_value < threshold:
-            mon["consecutive_below_baseline"] += 1
-            mon["consecutive_above_baseline"] = 0
-        else:
-            mon["consecutive_below_baseline"] = 0
-            mon["consecutive_above_baseline"] += 1
+        for mon in monitors:
+            if mon["status"] != "monitoring":
+                continue
+            if mon.get("monitor_kind") in EVOLUTION_KINDS:
+                continue
 
-        if mon["consecutive_below_baseline"] >= regression_window:
-            file_audit = audit_only_fields.get(mon["strategy_file"], []) or []
-            if mon["field"] in file_audit:
-                mon["status"] = "audit_only_skipped"
-                skip = {
-                    "meta_change_id": mon["meta_change_id"],
-                    "strategy_file": mon["strategy_file"], "field": mon["field"],
-                    "would_have_rolled_back_to": mon["old_value"],
-                    "failed_value": mon["new_value"], "skipped_at": _now(),
-                    "reason": ("audit_only_field — backpressure refused to roll back "
-                               "append-only audit log "
-                               "({}::{}); see meta.yaml backpressure.audit_only_fields "
-                               "and rb-504 / g-115-204".format(
-                                   mon["strategy_file"], mon["field"])),
-                    "imp_k_at_check": learning_value,
-                    "goals_measured": mon["goals_since_change"],
-                }
-                audit_only_skipped.append(skip)
-                data.setdefault("audit_only_skips", []).append(skip)
+            mon["goals_since_change"] += 1
+            mon["imp_k_samples"].append(learning_value)
+            baseline = mon["baseline_imp_k"]
+            threshold = baseline + baseline_tolerance
+            if learning_value < threshold:
+                mon["consecutive_below_baseline"] += 1
+                mon["consecutive_above_baseline"] = 0
             else:
-                mon["status"] = "rolled_back"
-                vel = _read_yaml(ctx.paths.meta / "improvement-velocity.yaml")
-                total_goals_now = len(vel.get("entries", []))
-                rollback = {
-                    "meta_change_id": mon["meta_change_id"],
-                    "strategy_file": mon["strategy_file"], "field": mon["field"],
-                    "rollback_to": mon["old_value"], "failed_value": mon["new_value"],
-                    "rolled_back_at": _now(),
-                    "reason": "{} consecutive goals below baseline ({:.4f} + tolerance {})".format(
-                        mon["consecutive_below_baseline"], baseline, baseline_tolerance),
-                    "imp_k_at_rollback": learning_value,
-                    "goals_measured": mon["goals_since_change"],
-                    "total_goals_at_rollback": total_goals_now,
-                }
-                rollback_actions.append(rollback)
-                data.setdefault("rollback_history", []).append(rollback)
-        elif mon["consecutive_above_baseline"] >= graduation_window:
-            mon["status"] = "graduated"
-            graduated.append(mon["meta_change_id"])
+                mon["consecutive_below_baseline"] = 0
+                mon["consecutive_above_baseline"] += 1
 
-    data["active_monitors"] = [m for m in monitors if m["status"] == "monitoring"]
-    _persist(ctx, _bp_path(ctx), data)
+            if mon["consecutive_below_baseline"] >= regression_window:
+                file_audit = audit_only_fields.get(mon["strategy_file"], []) or []
+                if mon["field"] in file_audit:
+                    mon["status"] = "audit_only_skipped"
+                    skip = {
+                        "meta_change_id": mon["meta_change_id"],
+                        "strategy_file": mon["strategy_file"], "field": mon["field"],
+                        "would_have_rolled_back_to": mon["old_value"],
+                        "failed_value": mon["new_value"], "skipped_at": _now(),
+                        "reason": ("audit_only_field — backpressure refused to roll back "
+                                   "append-only audit log "
+                                   "({}::{}); see meta.yaml backpressure.audit_only_fields "
+                                   "and rb-504 / g-115-204".format(
+                                       mon["strategy_file"], mon["field"])),
+                        "imp_k_at_check": learning_value,
+                        "goals_measured": mon["goals_since_change"],
+                    }
+                    audit_only_skipped.append(skip)
+                    data.setdefault("audit_only_skips", []).append(skip)
+                else:
+                    mon["status"] = "rolled_back"
+                    vel = _read_yaml(ctx.paths.meta / "improvement-velocity.yaml")
+                    total_goals_now = len(vel.get("entries", []))
+                    rollback = {
+                        "meta_change_id": mon["meta_change_id"],
+                        "strategy_file": mon["strategy_file"], "field": mon["field"],
+                        "rollback_to": mon["old_value"], "failed_value": mon["new_value"],
+                        "rolled_back_at": _now(),
+                        "reason": "{} consecutive goals below baseline ({:.4f} + tolerance {})".format(
+                            mon["consecutive_below_baseline"], baseline, baseline_tolerance),
+                        "imp_k_at_rollback": learning_value,
+                        "goals_measured": mon["goals_since_change"],
+                        "total_goals_at_rollback": total_goals_now,
+                    }
+                    rollback_actions.append(rollback)
+                    data.setdefault("rollback_history", []).append(rollback)
+            elif mon["consecutive_above_baseline"] >= graduation_window:
+                mon["status"] = "graduated"
+                graduated.append(mon["meta_change_id"])
+
+        data["active_monitors"] = [m for m in monitors if m["status"] == "monitoring"]
+        _persist_unlocked(ctx, bp_path, data)
+        out["data"] = data
+        out["rollback_actions"] = rollback_actions
+        out["graduated"] = graduated
+        out["audit_only_skipped"] = audit_only_skipped
+
+    file_locks.locked_rmw(bp_path, _cycle)
+    data = out["data"]
+    rollback_actions = out["rollback_actions"]
+    graduated = out["graduated"]
+    audit_only_skipped = out["audit_only_skipped"]
 
     newly_rolled_fields = {"{}:{}".format(a["strategy_file"], a["field"])
                            for a in rollback_actions}
@@ -416,32 +518,40 @@ def graduate(ctx) -> "Response":  # type: ignore[name-defined]
     if not change_id:
         return Response.error(400, "missing_param", "change_id is required")
 
-    data = _ensure_state(ctx)
-    monitors = data.get("active_monitors", [])
-    found = False
-    for mon in monitors:
-        # active_monitors mixes weight-monitors (meta_change_id) with evolution
-        # monitors (monitor_kind/revision_id, NO meta_change_id). .get() skips
-        # the latter, mirroring check()'s EVOLUTION_KINDS skip ();
-        # graduate was the sibling that fix missed — an unguarded subscript
-        # KeyError'd the whole endpoint on any co-resident evolution monitor,
-        # breaking graduate fleet-wide ().
-        if mon.get("meta_change_id") == change_id:
-            mon["status"] = "graduated"
-            found = True
-            break
+    bp_path = _bp_path(ctx)
 
-    if not found:
-        # BLOCKING quirk #1: return BEFORE write_yaml — must NOT persist.
+    def _cycle():
+        data = _read_state_fresh(ctx)
+        monitors = data.get("active_monitors", [])
+        found = False
+        for mon in monitors:
+            # active_monitors mixes weight-monitors (meta_change_id) with evolution
+            # monitors (monitor_kind/revision_id, NO meta_change_id). .get() skips
+            # the latter, mirroring check()'s EVOLUTION_KINDS skip ();
+            # graduate was the sibling that fix missed — an unguarded subscript
+            # KeyError'd the whole endpoint on any co-resident evolution monitor,
+            # breaking graduate fleet-wide ().
+            if mon.get("meta_change_id") == change_id:
+                mon["status"] = "graduated"
+                found = True
+                break
+
+        if not found:
+            # BLOCKING quirk #1: return BEFORE write_yaml — must NOT persist.
+            # Returning out of the cycle without writing is safe under
+            # locked_rmw: no PUT means no 412, so the cycle runs exactly once
+            # and this Response is what locked_rmw returns. ()
+            return Response.text(
+                json.dumps({"error": "Monitor {} not found".format(change_id)}) + "\n",
+                content_type="application/json")
+
+        data["active_monitors"] = [m for m in monitors if m["status"] == "monitoring"]
+        _persist_unlocked(ctx, bp_path, data)
         return Response.text(
-            json.dumps({"error": "Monitor {} not found".format(change_id)}) + "\n",
+            json.dumps({"status": "graduated", "meta_change_id": change_id}) + "\n",
             content_type="application/json")
 
-    data["active_monitors"] = [m for m in monitors if m["status"] == "monitoring"]
-    _persist(ctx, _bp_path(ctx), data)
-    return Response.text(
-        json.dumps({"status": "graduated", "meta_change_id": change_id}) + "\n",
-        content_type="application/json")
+    return file_locks.locked_rmw(bp_path, _cycle)
 
 
 # ---------------------------------------------------------------------------
@@ -728,24 +838,29 @@ def evolution_monitor(ctx) -> "Response":  # type: ignore[name-defined]
         agent = (ctx.headers.get("x-mind-agent") or "").strip() or None
 
     ev_cfg = _load_evolution_config(ctx)
-    data = _ensure_state(ctx)
-    monitors = data.get("active_monitors", [])
-    cap = ev_cfg.get("max_active_monitors", 15)
-    if len(monitors) >= cap:
-        for i, m in enumerate(monitors):
-            if m.get("monitor_kind") in EVOLUTION_KINDS:
-                monitors.pop(i)  # eviction notice is stderr-only
-                break
+    bp_path = _bp_path(ctx)
 
-    monitors.append({
-        "monitor_kind": kind, "revision_id": body["revision_id"],
-        "file_path": body["file_path"], "agent": agent,
-        "history_snapshot": body["history_snapshot"], "baseline": baseline,
-        "metric_samples": [], "consecutive_below_baseline": 0,
-        "consecutive_above_baseline": 0, "status": "monitoring", "created": _now(),
-    })
-    data["active_monitors"] = monitors
-    _persist(ctx, _bp_path(ctx), data)
+    def _cycle():
+        data = _read_state_fresh(ctx)
+        monitors = data.get("active_monitors", [])
+        cap = ev_cfg.get("max_active_monitors", 15)
+        if len(monitors) >= cap:
+            for i, m in enumerate(monitors):
+                if m.get("monitor_kind") in EVOLUTION_KINDS:
+                    monitors.pop(i)  # eviction notice is stderr-only
+                    break
+
+        monitors.append({
+            "monitor_kind": kind, "revision_id": body["revision_id"],
+            "file_path": body["file_path"], "agent": agent,
+            "history_snapshot": body["history_snapshot"], "baseline": baseline,
+            "metric_samples": [], "consecutive_below_baseline": 0,
+            "consecutive_above_baseline": 0, "status": "monitoring", "created": _now(),
+        })
+        data["active_monitors"] = monitors
+        _persist_unlocked(ctx, bp_path, data)
+
+    file_locks.locked_rmw(bp_path, _cycle)
     return Response.text(
         json.dumps({"status": "created", "monitor_kind": kind,
                     "revision_id": body["revision_id"], "signal_count": len(baseline)}) + "\n",
@@ -759,52 +874,93 @@ def evolution_monitor(ctx) -> "Response":  # type: ignore[name-defined]
 def evolution_check(ctx) -> "Response":  # type: ignore[name-defined]
     from ..server import Response
     ev_cfg = _load_evolution_config(ctx)
-    data = _ensure_state(ctx)
-    monitors = data.get("active_monitors", [])
+    bp_path = _bp_path(ctx)
     per_kind = ev_cfg.get("per_kind", {})
-    rollback_actions = []
-    graduated = []
 
-    for mon in monitors:
-        kind = mon.get("monitor_kind")
-        if kind not in EVOLUTION_KINDS:
-            continue
-        if mon.get("status") != "monitoring":
-            continue
-        kind_cfg = per_kind.get(kind, {})
-        regression_window = kind_cfg.get("regression_window", 6)
-        graduation_window = kind_cfg.get("graduation_window", 15)
+    # _evolution_rollback is NOT idempotent: it restores a file through
+    # history.py, appends to a world evolution stream, posts to the board, and
+    # EMAILS the user. locked_rmw may run this cycle more than once, so calling
+    # it from an unguarded cycle would re-fire all four on a 412 retry — most
+    # visibly a duplicate rollback email to a human. Caching the executed record
+    # per monitor keeps the side effects at exactly once per request while the
+    # record still lands in the SAME write as the counter updates, so no second
+    # write (and no crash window between two writes) is introduced. The key is a
+    # 3-tuple rather than revision_id alone because a monitor may carry a null
+    # revision_id, and two null-keyed monitors must not share a cache slot.
+    # ()
+    rollback_cache: Dict[Any, Any] = {}
+    out: Dict[str, Any] = {}
 
-        current = _sample_vector(ctx, kind, mon.get("file_path"), mon.get("agent"))
-        if not current:
-            continue  # sampling failed (rc=64) — do NOT count against the monitor
-        mon["metric_samples"].append({"ts": _now(), "vector": current})
-        keep = graduation_window + regression_window + 5
-        mon["metric_samples"] = mon["metric_samples"][-keep:]
+    def _cycle():
+        data = _read_state_fresh(ctx)
+        monitors = data.get("active_monitors", [])
+        rollback_actions = []
+        graduated = []
 
-        vote = _aggregate_vote(mon.get("baseline", {}), current, kind, ev_cfg)
-        if vote["vote"] == "below":
-            mon["consecutive_below_baseline"] += 1
-            mon["consecutive_above_baseline"] = 0
-        else:
-            mon["consecutive_above_baseline"] += 1
-            mon["consecutive_below_baseline"] = 0
+        for mon in monitors:
+            kind = mon.get("monitor_kind")
+            if kind not in EVOLUTION_KINDS:
+                continue
+            if mon.get("status") != "monitoring":
+                continue
+            kind_cfg = per_kind.get(kind, {})
+            regression_window = kind_cfg.get("regression_window", 6)
+            graduation_window = kind_cfg.get("graduation_window", 15)
 
-        if mon["consecutive_below_baseline"] >= regression_window:
-            mon["status"] = "rolled_back"
-            rb = _evolution_rollback(ctx, mon, ev_cfg, current, vote)
-            rollback_actions.append(rb)
-            data.setdefault("rollback_history", []).append(rb)
-        elif mon["consecutive_above_baseline"] >= graduation_window:
-            mon["status"] = "graduated"
-            graduated.append({"revision_id": mon.get("revision_id"), "monitor_kind": kind,
-                              "file_path": mon.get("file_path"),
-                              "samples_collected": len(mon["metric_samples"])})
+            current = _sample_vector(ctx, kind, mon.get("file_path"), mon.get("agent"))
+            if not current:
+                continue  # sampling failed (rc=64) — do NOT count against the monitor
+            mon["metric_samples"].append({"ts": _now(), "vector": current})
+            keep = graduation_window + regression_window + 5
+            mon["metric_samples"] = mon["metric_samples"][-keep:]
 
-    data["active_monitors"] = [m for m in monitors
-                               if m.get("status") == "monitoring"
-                               or m.get("monitor_kind") not in EVOLUTION_KINDS]
-    _persist(ctx, _bp_path(ctx), data)
+            vote = _aggregate_vote(mon.get("baseline", {}), current, kind, ev_cfg)
+            if vote["vote"] == "below":
+                mon["consecutive_below_baseline"] += 1
+                mon["consecutive_above_baseline"] = 0
+            else:
+                mon["consecutive_above_baseline"] += 1
+                mon["consecutive_below_baseline"] = 0
+
+            if mon["consecutive_below_baseline"] >= regression_window:
+                mon["status"] = "rolled_back"
+                # `agent` is load-bearing in this key, not decoration (fresh-eyes
+                # 2026-07-30). evolution_monitor stamps each monitor with the
+                # registering agent, so in an N-agent fleet two agents can hold
+                # monitors with the SAME (kind, revision_id, file_path) — the
+                # normal case for a shared file like program.md or a shared rule.
+                # Without `agent` those two collide, and the collision bites on
+                # the FIRST pass, not only on a retry: the second monitor finds
+                # the first's record already cached, replays it, and its own
+                # rollback never executes while rollback_history gains a
+                # duplicate of the first agent's record.
+                rb_key = (kind, mon.get("revision_id"), mon.get("file_path"),
+                          mon.get("agent"))
+                if rb_key in rollback_cache:
+                    rb = rollback_cache[rb_key]  # retry — replay, do NOT re-fire
+                else:
+                    rb = _evolution_rollback(ctx, mon, ev_cfg, current, vote)
+                    rollback_cache[rb_key] = rb
+                rollback_actions.append(rb)
+                data.setdefault("rollback_history", []).append(rb)
+            elif mon["consecutive_above_baseline"] >= graduation_window:
+                mon["status"] = "graduated"
+                graduated.append({"revision_id": mon.get("revision_id"), "monitor_kind": kind,
+                                  "file_path": mon.get("file_path"),
+                                  "samples_collected": len(mon["metric_samples"])})
+
+        data["active_monitors"] = [m for m in monitors
+                                   if m.get("status") == "monitoring"
+                                   or m.get("monitor_kind") not in EVOLUTION_KINDS]
+        _persist_unlocked(ctx, bp_path, data)
+        out["data"] = data
+        out["rollback_actions"] = rollback_actions
+        out["graduated"] = graduated
+
+    file_locks.locked_rmw(bp_path, _cycle)
+    data = out["data"]
+    rollback_actions = out["rollback_actions"]
+    graduated = out["graduated"]
 
     return Response.text(
         json.dumps({"rollback_actions": rollback_actions, "graduated": graduated,

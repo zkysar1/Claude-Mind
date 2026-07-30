@@ -447,17 +447,28 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
         return Response.error(400, "validation_failed", str(e))
 
     live = _live_path(ctx)
+
+    def _cycle():
+        # Both reads are INSIDE the cycle (invariant 3) — _read_jsonl begins
+        # with get_backend().refresh(path), so every retry re-fences on the
+        # CURRENT remote etag and re-checks the id against the peer's landed
+        # records. Hoisting either read out would re-append against a
+        # pre-conflict snapshot and could admit a duplicate id.
+        items = _read_jsonl(live)
+        archive = _read_jsonl(_archive_path(ctx))
+        try:
+            _check_no_duplicate_id(items, rec["id"], archive)
+        except ValueError as e:
+            return Response.error(409, "duplicate_id", str(e))
+        _append_record(ctx, rec, summary=f"experience-add {rec['id']}")
+        return None
+
     try:
-        with file_locks.locked(live):
-            items = _read_jsonl(live)
-            archive = _read_jsonl(_archive_path(ctx))
-            try:
-                _check_no_duplicate_id(items, rec["id"], archive)
-            except ValueError as e:
-                return Response.error(409, "duplicate_id", str(e))
-            _append_record(ctx, rec, summary=f"experience-add {rec['id']}")
+        refused = file_locks.locked_rmw(live, _cycle)
     except OSError as e:
         return Response.error(500, "write_failed", str(e))
+    if refused is not None:
+        return refused
 
     _update_meta(ctx)
     return Response.json({"ok": True, "record": rec})
@@ -511,39 +522,48 @@ def update_field(ctx) -> "Response":  # type: ignore[name-defined]
 
     base = ctx.paths.agent
     agent = _agent_name(ctx)
-    written: dict = {}
+
+    def _cycle():
+        # The read is INSIDE the cycle (invariant 3). This is the site where
+        # hoisting it would be actively lossy rather than merely unsafe: on a
+        # conflict retry the field must be re-applied on top of the version the
+        # peer just landed, and a pre-conflict snapshot would rewrite the whole
+        # file from stale bytes, silently dropping that peer's write.
+        items = _read_jsonl(target)
+        found = _find_by_id(items, rec_id)
+        if found is None:
+            return Response.error(404, "not_found", f"Record {rec_id} not found"), {}
+        idx, rec = found
+        rec = _normalize_record(rec)
+        rec[field] = value
+        try:
+            _validate_record(ctx, rec)
+        except ValueError as e:
+            return Response.error(400, "validation_failed", str(e)), {}
+        stats = rec.get("retrieval_stats")
+        if (stats and isinstance(stats, dict)
+                and field.startswith("retrieval_stats.")):
+            rc = stats["retrieval_count"]
+            tu = stats["times_useful"]
+            stats["utility_ratio"] = round(tu / max(rc, 1), 4)
+        items[idx] = rec
+        for item in items:
+            _validate_no_surrogates(item, target)
+        history.snapshot(target, base, agent,
+                         summary=f"experience-update-field {rec_id} {field}")
+        _atomic_write_jsonl(target, items)
+        changelog.append(base, agent, target, "edit",
+                         summary=f"experience-update-field {rec_id} {field}",
+                         lines_changed=len(items))
+        _jsonl_cache().invalidate(target)
+        return None, rec
+
     try:
-        with file_locks.locked(target):
-            items = _read_jsonl(target)
-            found = _find_by_id(items, rec_id)
-            if found is None:
-                return Response.error(404, "not_found", f"Record {rec_id} not found")
-            idx, rec = found
-            rec = _normalize_record(rec)
-            rec[field] = value
-            try:
-                _validate_record(ctx, rec)
-            except ValueError as e:
-                return Response.error(400, "validation_failed", str(e))
-            stats = rec.get("retrieval_stats")
-            if (stats and isinstance(stats, dict)
-                    and field.startswith("retrieval_stats.")):
-                rc = stats["retrieval_count"]
-                tu = stats["times_useful"]
-                stats["utility_ratio"] = round(tu / max(rc, 1), 4)
-            items[idx] = rec
-            for item in items:
-                _validate_no_surrogates(item, target)
-            history.snapshot(target, base, agent,
-                             summary=f"experience-update-field {rec_id} {field}")
-            _atomic_write_jsonl(target, items)
-            changelog.append(base, agent, target, "edit",
-                             summary=f"experience-update-field {rec_id} {field}",
-                             lines_changed=len(items))
-            _jsonl_cache().invalidate(target)
-            written = rec
+        refused, written = file_locks.locked_rmw(target, _cycle)
     except OSError as e:
         return Response.error(500, "write_failed", str(e))
+    if refused is not None:
+        return refused
 
     _update_meta(ctx)
     return Response.json({"ok": True, "record": written})
@@ -676,36 +696,48 @@ def archive_goal(ctx) -> "Response":  # type: ignore[name-defined]
     except ValueError as e:
         return _abort(Response.error(400, "validation_failed", str(e)))
 
+    def _cycle():
+        # `canonical` is REBOUND by the race branch below, so it must be
+        # nonlocal: _abort reads it at call time to remove the right copy.
+        nonlocal canonical
+        # Reads INSIDE the cycle (invariant 3) — each retry re-fences on the
+        # current remote etag and re-checks the id against the peer's landed
+        # records, which is exactly what makes the race branch below correct
+        # under retry rather than merely under first-pass contention.
+        cur = _read_jsonl(_live_path(ctx))
+        cur_archive = _read_jsonl(_archive_path(ctx))
+        cur_ids = {r.get("id") for r in cur}
+        cur_ids.update(r.get("id") for r in cur_archive)
+        if rec["id"] in cur_ids:
+            # Race: another writer took the id between the unlocked
+            # uniquify and this lock. Re-uniquify against the fresh sets
+            # and rename the already-moved canonical .md to match.
+            try:
+                new_id = _uniquify_id(base_experience_id, cur, cur_archive)
+            except ValueError as e:
+                return Response.error(409, "duplicate_id", str(e))
+            new_canonical = content_dir / f"{new_id}.md"
+            if new_canonical.exists():
+                return Response.error(
+                    409, "content_path_exists",
+                    f"canonical content_path already exists: {new_canonical}")
+            os.replace(str(canonical), str(new_canonical))
+            canonical = new_canonical
+            try:
+                rec["content_path"] = str(
+                    new_canonical.relative_to(ctx.paths.project_root)).replace("\\", "/")
+            except ValueError:
+                rec["content_path"] = str(new_canonical).replace("\\", "/")
+            rec["id"] = new_id
+        _append_record(ctx, rec, summary=f"experience-archive-goal {rec['id']}")
+        return None
+
     try:
-        with file_locks.locked(_live_path(ctx)):
-            cur = _read_jsonl(_live_path(ctx))
-            cur_archive = _read_jsonl(_archive_path(ctx))
-            cur_ids = {r.get("id") for r in cur}
-            cur_ids.update(r.get("id") for r in cur_archive)
-            if rec["id"] in cur_ids:
-                # Race: another writer took the id between the unlocked
-                # uniquify and this lock. Re-uniquify against the fresh sets
-                # and rename the already-moved canonical .md to match.
-                try:
-                    new_id = _uniquify_id(base_experience_id, cur, cur_archive)
-                except ValueError as e:
-                    return _abort(Response.error(409, "duplicate_id", str(e)))
-                new_canonical = content_dir / f"{new_id}.md"
-                if new_canonical.exists():
-                    return _abort(Response.error(
-                        409, "content_path_exists",
-                        f"canonical content_path already exists: {new_canonical}"))
-                os.replace(str(canonical), str(new_canonical))
-                canonical = new_canonical
-                try:
-                    rec["content_path"] = str(
-                        new_canonical.relative_to(ctx.paths.project_root)).replace("\\", "/")
-                except ValueError:
-                    rec["content_path"] = str(new_canonical).replace("\\", "/")
-                rec["id"] = new_id
-            _append_record(ctx, rec, summary=f"experience-archive-goal {rec['id']}")
+        refused = file_locks.locked_rmw(_live_path(ctx), _cycle)
     except OSError as e:
         return _abort(Response.error(500, "write_failed", str(e)))
+    if refused is not None:
+        return _abort(refused)
 
     # Record landed — consume the source now (completes the move semantics).
     if copied_from is not None:
@@ -756,6 +788,21 @@ def meta_update(ctx) -> "Response":  # type: ignore[name-defined]
     p = _meta_path(ctx)
     get_backend().ensure_local(p)  # own-cloud read-path fix: materialize S3-only file before RMW lock; no-op on LocalBackend and out-of-root paths
     data: dict = {}
+    # DELIBERATELY a bare lock, NOT locked_rmw — and this is the one site in
+    # this module that stays that way (). The other five write
+    # experience.jsonl / experience-archive.jsonl through the backend
+    # (append_jsonl_record / _atomic_write_with_fallback), so they take an
+    # If-Match fence that can go stale and wedge. experience-meta.json is read
+    # with a raw json.load and written with a raw tmp + os.replace below: no
+    # fenced PUT is ever issued for it, so the backend's ConflictError cannot
+    # be raised on this path and locked_rmw would be retrying an exception that
+    # cannot occur. The file reaches S3 via the own-cloud sweep, which carries
+    # its own conflict handling. Same shape, same reasoning, as wm_write._write_wm.
+    #
+    # The census classifier (merge_handler_for -> None) is necessary but NOT
+    # sufficient to place a store in the class-(b) HAZARD: that also requires the
+    # writer to go through the fenced backend path. Check the write path, not
+    # just the basename registration.
     try:
         with file_locks.locked(p):
             if p.exists():
@@ -836,37 +883,45 @@ def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
     agent = _agent_name(ctx)
     archive_p = _archive_path(ctx)
     live_p = _live_path(ctx)
+    # Phase 1: append candidates to ARCHIVE under archive's lock. The read is
+    # INSIDE the cycle (invariant 3) so a retry re-derives `existing` from the
+    # peer's landed archive — the in-lock dedup is what keeps the re-append
+    # idempotent, and it only holds if the set is rebuilt each attempt.
+    def _archive_cycle():
+        arch_items = _read_jsonl(archive_p)
+        existing = {r.get("id") for r in arch_items}
+        for r in to_archive:
+            if r["id"] not in existing:
+                arch_items.append(r)
+        for it in arch_items:
+            _validate_no_surrogates(it, archive_p)
+        history.snapshot(archive_p, base, agent,
+                         summary="experience-archive-sweep")
+        _atomic_write_jsonl(archive_p, arch_items)
+        changelog.append(base, agent, archive_p, "edit",
+                         summary="experience-archive-sweep",
+                         lines_changed=len(arch_items))
+        _jsonl_cache().invalidate(archive_p)
+
+    # Phase 2: rewrite LIVE filtering archived_ids, fresh in-cycle read so a
+    # retry preserves concurrent appends that landed after the conflict.
+    def _live_cycle():
+        live_items = _read_jsonl(live_p)
+        remaining = [r for r in live_items
+                     if r.get("id") not in archived_ids]
+        for it in remaining:
+            _validate_no_surrogates(it, live_p)
+        history.snapshot(live_p, base, agent,
+                         summary="experience-archive-sweep")
+        _atomic_write_jsonl(live_p, remaining)
+        changelog.append(base, agent, live_p, "edit",
+                         summary="experience-archive-sweep",
+                         lines_changed=len(remaining))
+        _jsonl_cache().invalidate(live_p)
+
     try:
-        # Phase 1: append candidates to ARCHIVE under archive's lock.
-        with file_locks.locked(archive_p):
-            arch_items = _read_jsonl(archive_p)
-            existing = {r.get("id") for r in arch_items}
-            for r in to_archive:
-                if r["id"] not in existing:
-                    arch_items.append(r)
-            for it in arch_items:
-                _validate_no_surrogates(it, archive_p)
-            history.snapshot(archive_p, base, agent,
-                             summary="experience-archive-sweep")
-            _atomic_write_jsonl(archive_p, arch_items)
-            changelog.append(base, agent, archive_p, "edit",
-                             summary="experience-archive-sweep",
-                             lines_changed=len(arch_items))
-            _jsonl_cache().invalidate(archive_p)
-        # Phase 2: rewrite LIVE filtering archived_ids, fresh in-lock read.
-        with file_locks.locked(live_p):
-            live_items = _read_jsonl(live_p)
-            remaining = [r for r in live_items
-                         if r.get("id") not in archived_ids]
-            for it in remaining:
-                _validate_no_surrogates(it, live_p)
-            history.snapshot(live_p, base, agent,
-                             summary="experience-archive-sweep")
-            _atomic_write_jsonl(live_p, remaining)
-            changelog.append(base, agent, live_p, "edit",
-                             summary="experience-archive-sweep",
-                             lines_changed=len(remaining))
-            _jsonl_cache().invalidate(live_p)
+        file_locks.locked_rmw(archive_p, _archive_cycle)
+        file_locks.locked_rmw(live_p, _live_cycle)
     except OSError as e:
         return Response.error(500, "write_failed", str(e))
 

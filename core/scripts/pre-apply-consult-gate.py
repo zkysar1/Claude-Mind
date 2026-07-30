@@ -337,10 +337,17 @@ def main(argv=None) -> int:
     #   * any measurement of the consult miss-rate counts every consult as a failure.
     # The gate would have been recommending a command that could not satisfy the audit
     # measuring it. Keep --goal.
+    # --include-framework is equally LOAD-BEARING (, measured 2026-07-29).
+    # This gate fires on FRAMEWORK-file fixes, and without the flag retrieve.sh omits
+    # the `framework_rules` key entirely -- not empty, ABSENT -- so .claude/rules/* and
+    # core/config/conventions/* never reach the consult. That is precisely the corpus
+    # most likely to already prescribe the fix being reviewed. Measured on "fix the
+    # drain-temp purge glob so cited evidence files are not deleted": bare call = no
+    # framework key; with the flag = temp-store.md, the governing convention.
     out.write(f'  bash core/scripts/retrieve.sh --category "{one_line[:80]}" \\\n')
-    out.write(f'       --goal {goal_id} --depth shallow\n')
+    out.write(f'       --goal {goal_id} --depth shallow --include-framework\n')
     out.write("\n")
-    out.write("Then read returned reasoning_bank + guardrails. If any CONTRADICTS the\n")
+    out.write("Then read returned reasoning_bank + guardrails + framework_rules. If any CONTRADICTS the\n")
     out.write("intended fix: STOP -- re-evaluate. Apply the entry's pattern instead,\n")
     out.write("OR retire the entry with justification if genuinely stale. If an entry\n")
     out.write("REINFORCES the fix, proceed and increment utilization on the entry.\n")

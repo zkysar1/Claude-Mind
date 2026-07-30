@@ -26,7 +26,7 @@ STALE_HOURS=24
 REPOS=()
 while [ $# -gt 0 ]; do
     case "$1" in
-        --stale-hours) STALE_HOURS="${2:-24}"; shift 2 ;;
+        --stale-hours) STALE_HOURS="${2:-24}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         --stale-hours=*) STALE_HOURS="${1#*=}"; shift ;;
         --*) shift ;;
         *) REPOS+=("$1"); shift ;;

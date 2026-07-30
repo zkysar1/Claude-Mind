@@ -175,6 +175,16 @@ re-introduces the clobber class g-115-1561 fixed.
                 (do NOT claim). ELSE (surface overlaps but the goal is genuinely still
                 open) proceed to claim — the probe is ADVISORY, never a hard gate
                 (fail-open, exit 0; heuristic affected-paths inference must not freeze work).
+              # KEEP the `IF source==world` guard (g-115-3590). It is not a
+              # stylistic gate: the daemon claim endpoint REFUSES agent-queue
+              # goals with `400 agent_queue_goal` by design, and the parse rule
+              # below treats any `error` field as "journal abort +
+              # LOOP_CONTINUE" — so dropping the guard would abort every
+              # agent-source iteration, silently halting the entire recurring
+              # cadence (g-001-01..g-001-10 all live in the agent queue).
+              # A prior goal recommended dropping it on the premise that
+              # "the script already supports both sources"; the script's
+              # arg parser does, the endpoint does not.
               IF source==world: aspirations-claim.sh — its OWN Bash call, output
               VISIBLE (NEVER `>/dev/null 2>&1`, never newline-batched with the
               phase-4 markers below: g-115-2345 — a silenced 409 let echo execute

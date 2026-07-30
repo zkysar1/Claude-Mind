@@ -57,10 +57,16 @@ def _throwaway_agent(manifest_paths=None, session_id=SID):
     session_dir = agent_dir / "session"
     try:
         session_dir.mkdir(parents=True, exist_ok=True)
-        (agent_dir / "local-paths.conf").write_text("WORLD_PATH=\nMETA_PATH=\n")
+        # newline="" disables CRLF translation on Windows (guard-1688) — both
+        # files are read by the shell scripts under test.
+        (agent_dir / "local-paths.conf").write_text(
+            "WORLD_PATH=\nMETA_PATH=\n", encoding="utf-8", newline=""
+        )
         if manifest_paths is not None:
             lines = [f"#session:{session_id}"] + [_norm(p) for p in manifest_paths]
-            (session_dir / "context-reads.txt").write_text("\n".join(lines) + "\n")
+            (session_dir / "context-reads.txt").write_text(
+                "\n".join(lines) + "\n", encoding="utf-8", newline=""
+            )
         env = dict(os.environ)
         env["MIND_AGENT"] = THROWAWAY_AGENT
         yield env

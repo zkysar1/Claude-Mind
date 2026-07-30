@@ -84,4 +84,30 @@ if [ "$_CUR_JOURNAL_MD_DRIVER" != "$_JOURNAL_MD_DRIVER" ]; then
     fi
 fi
 
+# REGISTERING THE DRIVER IS NOT THE SAME AS THE DRIVER BEING USED ().
+# Everything above writes .git/config. But .git/info/attributes -- per-clone and
+# UNTRACKED, so invisible to git status, ls-files and every review -- OUTRANKS
+# the tracked .gitattributes. One `agents/<agent>/*.jsonl merge=union` line there
+# silently reverts the whole  migration for that agent while every
+# check above still reports success. Union "resurrects pruned/archived/edited
+# records", which on aspirations.jsonl means completed goals returning on a
+# cross-box merge.
+# check-merge-driver-drift.sh detects exactly this and is the reason the class
+# was found twice -- but until now it had NO CALLER, so it was run only when
+# someone already suspected a problem. That is why the identical override
+# survived on the ZDS clone for 11 days AFTER the same defect was found and
+# fixed on Ayoai (, 2026-07-26): the detector was correct, complete,
+# and never invoked. A sweep with no call site is indistinguishable from a sweep
+# that always returns clean.
+# Wired HERE because this script already runs at every session start (via
+# sessionstart-orchestrator.sh) and already owns driver registration -- so the
+# check lands at the one moment the answer can still change before any merge
+# runs. Advisory and fail-open, matching the posture above: it prints and never
+# blocks, because a false positive must not be able to stop a session from
+# starting. Backgrounding it would defeat the point (the output must reach the
+# session that is about to merge), so it is bounded instead.
+if [ -f core/scripts/check-merge-driver-drift.sh ]; then
+    timeout 20 bash core/scripts/check-merge-driver-drift.sh >&2 2>&1 || true
+fi
+
 exit 0

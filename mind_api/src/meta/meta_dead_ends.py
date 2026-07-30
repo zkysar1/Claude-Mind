@@ -130,6 +130,18 @@ def _persist(ctx, items: List[Dict[str, Any]]) -> Optional["Response"]:  # type:
     Replicates _fileops.locked_write_jsonl (the inner of write_all / the tail of
     locked_modify_jsonl) with header-agent attribution and NO summary. Returns a
     Response on OSError, else None.
+
+    KNOWN-UNCURED class-(b) bare lock — tracked by g-115-4017, NOT exempt.
+    Measured 2026-07-30 (g-115-3834) on both axes the write-class convention
+    requires: coordination_merge.merge_handler_for("dead-ends.jsonl") returns
+    None (fence-only, nothing reconciles below the write), AND this module goes
+    through the fenced path — _atomic_write_jsonl delegates to
+    _atomic_write_with_fallback while _read_jsonl uses ensure_local rather than
+    refresh. That is the rb-2639 stale-If-Match shape with both halves present,
+    so it does NOT get the raw-write exemption that working-memory.yaml and
+    experience-meta.json have. This site and add() both need locked_rmw with a
+    force_fresh read inside the cycle; the cured siblings in meta_backpressure /
+    meta_experiment / meta_transfer / strategy_apply are the reference.
     """
     from ..server import Response
 

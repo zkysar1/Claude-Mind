@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import datetime as dt
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -397,3 +398,72 @@ if __name__ == "__main__":
     test_structural_lane_prefix_collision_excluded()
     test_structural_grace_window_age()
     print("All 16 tests passed.")
+
+
+# ── : recurring goals can never be supersession candidates ────────
+# A recurring goal is a STANDING CADENCE; siblings that HARDEN what it invokes
+# improve the cadence rather than retiring it (consolidate-before-expand.md
+# rule 5). Measured before the fix:  (recurring, interval 16.2h,
+# achievedCount=174, currentStreak=4) was reported eligible with
+# action=mark_failed for 235h — ~10 days of write attempts refused only by a
+# downstream guard the sweep never consults.
+#
+# These drive main() end-to-end by monkeypatching _read_aspirations, because
+# the fix lives in main()'s loop, not in a helper — a helper-level test cannot
+# reach it.
+
+def _recurring_shape(recurring: bool):
+    """g-350 structural shape whose parent is (or is not) a recurring goal."""
+    parent, siblings = _g350_shape()
+    parent = dict(parent)
+    if recurring:
+        parent.update({"recurring": True, "interval_hours": 16.2,
+                       "achievedCount": 174, "currentStreak": 4,
+                       "lastAchievedAt": _iso_hours_ago(72)})
+    # siblings[0] IS the parent object in _g350_shape — rebuild with our copy.
+    goals = [parent] + [s for s in siblings if s["id"] != parent["id"]]
+    return [({"id": "asp-350", "status": "active", "goals": goals}, "world")]
+
+
+def _run_main(monkeypatch, capsys, aspirations):
+    import sys as _sys
+    mod = _import_sweep()
+    monkeypatch.setattr(mod, "_read_aspirations",
+                        lambda source: aspirations if source == "world" else [])
+    monkeypatch.setattr(mod, "_append_metric", lambda *a, **k: None)
+    monkeypatch.setattr(_sys, "argv", [
+        "parent-supersession-sweep.py", "--max-age-hours", "24",
+        "--min-siblings", "2", "--metrics-log", "", "--output", "json",
+    ])
+    assert mod.main() == 0
+    return json.loads(capsys.readouterr().out)
+
+
+def test_recurring_goal_never_an_eligible_candidate(monkeypatch, capsys):
+    out = _run_main(monkeypatch, capsys, _recurring_shape(recurring=True))
+    assert out["candidates"] == [], (
+        f"a recurring goal must never be a supersession candidate: {out['candidates']}")
+    assert out["eligible"] == 0, (
+        f"a recurring goal must not even count as eligible, got {out['eligible']}")
+    reasons = [d.get("reason", "") for d in out["details"]
+               if d.get("goal_id") == "g-350-04"]
+    assert any("recurring" in r for r in reasons), (
+        f"expected an explicit recurring skip reason, got {out['details']}")
+    # The skip must be attributed to recurrence, NOT to some other guard that
+    # happens to be holding — that ambiguity is what hid the live instance.
+    assert not any("insufficient sibling" in r for r in reasons), reasons
+
+
+def test_positive_control_same_shape_without_recurring_is_a_candidate(
+        monkeypatch, capsys):
+    """The discriminating half: proves the shape DOES match when not recurring.
+
+    Without this, the assertion above passes vacuously for any shape the sweep
+    never matched in the first place — and a vacuous pass on an exclusion test
+    is indistinguishable from a working exclusion.
+    """
+    out = _run_main(monkeypatch, capsys, _recurring_shape(recurring=False))
+    ids = [c["goal_id"] for c in out["candidates"]]
+    assert ids == ["g-350-04"], (
+        f"non-recurring parent of the same shape MUST be a candidate, got {out}")
+    assert out["eligible"] == 1, out

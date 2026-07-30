@@ -47,9 +47,19 @@ def _agent_name(ctx) -> str:
     return (ctx.headers.get("x-mind-agent") or "").strip() or "system"
 
 
-def _read_yaml(path: Path) -> Dict[str, Any]:
+def _read_yaml(path: Path, force_fresh: bool = False) -> Dict[str, Any]:
+    """force_fresh=True force-pulls the latest remote object AND records its
+    ETag as the If-Match fence token, so a locked_rmw retry re-reads the peer's
+    landed write and re-fences against the etag the remote actually holds. A
+    cache-TTL read inside a retry loop re-fences against an etag the remote no
+    longer has, and the 412 then repeats forever against a remote that never
+    changes — the per-object stale-IfMatch DEADLOCK (rb-2639). Mirrors
+    meta_yaml._read_yaml."""
     from storage_backend import get_backend
-    get_backend().ensure_local(path)  # own-cloud read-path fix 2026-07-02: materialize an S3-only file on a fresh box before the local read; no-op on LocalBackend and for out-of-root/git-shipped paths (keystone in owncloud_backend._refresh)
+    if force_fresh:
+        get_backend().refresh(path)  # force-pull latest + set If-Match fence (rb-2639)
+    else:
+        get_backend().ensure_local(path)  # own-cloud read-path fix 2026-07-02: materialize an S3-only file on a fresh box before the local read; no-op on LocalBackend and for out-of-root/git-shipped paths (keystone in owncloud_backend._refresh)
     if not path.exists():
         return {}
     with open(path, "r", encoding="utf-8") as f:
@@ -66,6 +76,37 @@ def _atomic_write_yaml_csafe(path: Path, data: Any) -> None:
                   default_flow_style=False, allow_unicode=True, sort_keys=False)
 
     _atomic_write_with_fallback(path, _write, fallback_counter_key="daemon_meta_transfer_write")
+
+
+def _persist_unlocked(ctx, path: Path, data: Any) -> None:
+    """_persist's body WITHOUT the lock, for callers already inside a
+    locked_rmw cycle. file_locks.locked is NOT reentrant (a plain
+    threading.Lock), so nesting it inside locked_rmw deadlocks the daemon
+    thread. Mirrors meta_yaml._persist_unlocked.
+
+    THIS MODULE IS MIXED-CLASS — the reason to classify by PATH and never by
+    the helper (guard-1733, measured g-115-3834). _persist here is called with
+    FOUR different paths and they do not share a write class:
+
+        transfer/_index.yaml            (b) fence-only  -> cured, locked_rmw
+        reflection-strategy.yaml        (b) fence-only  -> cured, locked_rmw
+        encoding-strategy.yaml          (b) fence-only  -> cured, locked_rmw
+        goal-selection-strategy.yaml    (a) MERGE-protected -> bare _persist,
+                                        correct as-is; see import_bundle
+
+    Registration is by BASENAME only, so the three siblings sitting in the same
+    directory with near-identical names land on opposite sides of the split.
+    Re-derive with ONE lookup before touching any of them:
+        grep -n '"<basename>": merge_' core/scripts/coordination_merge.py
+    or coordination_merge.merge_handler_for("<basename>")."""
+    base_dir = ctx.paths.meta
+    agent = _agent_name(ctx)
+    assert_not_cruft(path.parent, "mkdir (meta_transfer)")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _validate_no_surrogates(data, path)
+    history.snapshot(path, base_dir, agent)
+    _atomic_write_yaml_csafe(path, data)
+    changelog.append(base_dir, agent, path, "edit")
 
 
 def _persist(ctx, path: Path, data: Any) -> None:
@@ -151,12 +192,20 @@ def export(ctx) -> "Response":  # type: ignore[name-defined]
         yaml.dump(bundle, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
 
     # Register in transfer index (locked CSafeDumper + history + changelog).
+    # _index.yaml is write-class (b) fence-only, so the append must re-read
+    # fresh inside the lock: two boxes exporting concurrently would otherwise
+    # each append to a stale bundle list and one registration would vanish.
     index_path = meta / "transfer" / "_index.yaml"
-    index = _read_yaml(index_path)
-    bundles = index.get("bundles", [])
-    bundles.append({"path": output_raw, "exported": bundle["exported"], "source": self_name})
-    index["bundles"] = bundles
-    _persist(ctx, index_path, index)
+
+    def _cycle_index():
+        index = _read_yaml(index_path, force_fresh=True)
+        bundles = index.get("bundles", [])
+        bundles.append({"path": output_raw, "exported": bundle["exported"],
+                        "source": self_name})
+        index["bundles"] = bundles
+        _persist_unlocked(ctx, index_path, index)
+
+    file_locks.locked_rmw(index_path, _cycle_index)
 
     return Response.text(
         json.dumps({"status": "exported", "path": output_raw,
@@ -205,6 +254,13 @@ def import_bundle(ctx) -> "Response":  # type: ignore[name-defined]
     meta = ctx.paths.meta
     source = bundle.get("source_agent", "unknown")
 
+    # NO CURE NEEDED on this block, deliberately (, measured):
+    # goal-selection-strategy.yaml is write-class (a) MERGE-PROTECTED —
+    # coordination_merge.merge_handler_for returns merge_goal_selection_strategy
+    # — so a reconciler runs BELOW the write and the bare lock is correct. Its
+    # two siblings immediately below are fence-only and ARE cured. Do not
+    # "make this consistent" with them without re-running the one lookup; the
+    # split is by basename, not by directory, module, or file purpose.
     if "goal_selection" in strategies:
         gs = _read_yaml(meta / "goal-selection-strategy.yaml")
         imported = strategies["goal_selection"]
@@ -222,31 +278,48 @@ def import_bundle(ctx) -> "Response":  # type: ignore[name-defined]
             gs["selection_heuristics"] = existing
         _persist(ctx, meta / "goal-selection-strategy.yaml", gs)
 
+    # CURED (): reflection-strategy.yaml is write-class (b) fence-only
+    # despite sitting beside the merge-protected file above. `changes` is built
+    # inside the cycle and returned by the committing attempt — accumulating
+    # into the enclosing list would duplicate one entry per retry.
     if "reflection" in strategies:
-        ref = _read_yaml(meta / "reflection-strategy.yaml")
-        imported = strategies["reflection"]
-        if "depth_allocation" in imported:
-            ref["depth_allocation"] = imported["depth_allocation"]
-            changes.append({"field": "depth_allocation",
-                            "value": ref["depth_allocation"], "source": "transfer"})
-        if "trigger_overrides" in imported:
-            existing = ref.get("trigger_overrides", [])
-            for t in imported["trigger_overrides"]:
-                t["source"] = "transfer from {}".format(source)
-                existing.append(t)
-            ref["trigger_overrides"] = existing
-        _persist(ctx, meta / "reflection-strategy.yaml", ref)
+        ref_path = meta / "reflection-strategy.yaml"
 
+        def _cycle_ref():
+            ref = _read_yaml(ref_path, force_fresh=True)
+            imported = strategies["reflection"]
+            local_changes = []
+            if "depth_allocation" in imported:
+                ref["depth_allocation"] = imported["depth_allocation"]
+                local_changes.append({"field": "depth_allocation",
+                                      "value": ref["depth_allocation"], "source": "transfer"})
+            if "trigger_overrides" in imported:
+                existing = ref.get("trigger_overrides", [])
+                for t in imported["trigger_overrides"]:
+                    t["source"] = "transfer from {}".format(source)
+                    existing.append(t)
+                ref["trigger_overrides"] = existing
+            _persist_unlocked(ctx, ref_path, ref)
+            return local_changes
+
+        changes.extend(file_locks.locked_rmw(ref_path, _cycle_ref))
+
+    # CURED (): encoding-strategy.yaml is write-class (b) fence-only.
     if "encoding" in strategies:
-        enc = _read_yaml(meta / "encoding-strategy.yaml")
-        imported = strategies["encoding"]
-        if "priority_rules" in imported:
-            existing = enc.get("priority_rules", [])
-            for r in imported["priority_rules"]:
-                r["source"] = "transfer from {}".format(source)
-                existing.append(r)
-            enc["priority_rules"] = existing
-        _persist(ctx, meta / "encoding-strategy.yaml", enc)
+        enc_path = meta / "encoding-strategy.yaml"
+
+        def _cycle_enc():
+            enc = _read_yaml(enc_path, force_fresh=True)
+            imported = strategies["encoding"]
+            if "priority_rules" in imported:
+                existing = enc.get("priority_rules", [])
+                for r in imported["priority_rules"]:
+                    r["source"] = "transfer from {}".format(source)
+                    existing.append(r)
+                enc["priority_rules"] = existing
+            _persist_unlocked(ctx, enc_path, enc)
+
+        file_locks.locked_rmw(enc_path, _cycle_enc)
 
     return Response.text(
         json.dumps({"status": "imported", "changes": len(changes), "details": changes}) + "\n",

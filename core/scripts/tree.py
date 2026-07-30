@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import random
+import re
 import sys
 import time
 from datetime import date, datetime, timedelta
@@ -644,15 +645,78 @@ def get_active_content(tree, key):
     return {"key": key, "active_content": content, "sections_found": sections_found}
 
 
+# Chars-per-token for DENSE TECHNICAL MARKDOWN — the content class of every
+# knowledge-tree node (code fences, paths, ids, heavy punctuation). NOT the
+# ~4.0 that holds for English prose: BPE splits far more aggressively here.
+#
+# MEASURED 2026-07-27..30 ( alpha, re-verified  echo) against
+# exact token counts from Read-tool truncation notices:
+#     product-world-model.md             67730 chars / 29270 tok = 2.31
+#     framework-guardrails-and-gates.md  65407 chars / 26882 tok = 2.43
+# Corroborated independently by a word/punctuation-run count on the one file whose
+# bytes were unchanged between measurements: 18254 runs x 1.60 = 29206 vs 29270
+# measured (0.2% off). The other file had GROWN 65407->70457 chars in the interim,
+# so dividing its CURRENT chars by the OLD token count yields a spurious 2.62 —
+# re-measure both halves of a ratio, or not at all.
+#
+# Deliberately the LOW end of the measured range: est_tokens = chars / RATIO, so a
+# SMALLER divisor yields a LARGER estimate and the guard fires EARLIER. Erring high
+# is the fail-safe direction (rb-2077: a node past the Read cap returns a TRUNCATED
+# read, which does not satisfy the read-before-edit gate, and the bounded-Read
+# workaround is only discoverable after burning the round-trip). A slightly early
+# crit3 costs a non-destructive archive+keep-newest rollup; a late one costs an
+# agent a silent failed edit.
+#
+# The prior value (4) underestimated by ~1.7x, ALWAYS in the flattering direction:
+# it scored 5 over-cap nodes as "HEALTHY" and put crit3's 80% proactive trigger at
+# ~135% of real cap, inverting the headroom it exists to provide.
+CHARS_PER_TOKEN = 2.3
+
+# READ-SITE CAVEAT (, rb-5894 / guard-2006). The bias above is what makes
+# this constant correct as a GUARD, and it is what makes its output wrong as a
+# MEASUREMENT. Because 2.3 is the low end of 2.31-2.43, est_tokens runs high by up
+# to ~5.7%, so a node reported at 100-106% of cap may be UNDER it in reality — the
+# verdict flips inside the estimator's own uncertainty band.
+#
+# That is harmless for crit3 (an early distill is a non-destructive rollup, per the
+# note above). It is NOT harmless for any consumer that turns "over cap" into a work
+# list: structural surgery on an already-under-cap node fragments coherent content
+# and buys nothing. Measured 2026-07-30 — of 11 nodes a census flagged as over cap,
+# 3 (at 101%, 103%, 106%) flip to under cap at 2.43.
+#
+# So a consumer acting on cap violations must either re-measure with a real
+# tokenizer, or restrict itself to the bias-INDEPENDENT range where even the most
+# favourable ratio still exceeds the cap:
+#
+#     chars >= 25000 * 2.43  ->  60_750     (~107% of cap at 2.3)
+#
+# Nodes between 25000*2.3 (57_500) and 60_750 chars are UNKNOWN, not over.
+
+# A heading is an append-grown section marker when it carries a goal id
+# (`##  — ...`) or an ISO date (`## Refresh 2026-06-21`). Keyed on the
+# STAMP, not on the word "refresh": measured 2026-07-30, the three most
+# append-grown nodes in this tree (directive-lane-series 19 sections, arc-agi-3
+# 27, env-agnostic-exploration-primitives 23) name their sections by GOAL ID and
+# so scored refresh_sections 0-2 against a >=3 bar — invisible to the very
+# detector built to catch them. Precision holds on the same measurement: the
+# non-append-grown large nodes score 0-1 (framework-guardrails-and-gates 0,
+# product-world-model 1, test-coverage-illusions 0).
+_APPEND_SECTION_STAMP = re.compile(r"g-\d+-\d+|\d{4}-\d{2}-\d{2}")
+
+
 def _analyze_node_body(text):
     """Return (line_count, est_tokens, refresh_sections) for a node .md body.
 
-    est_tokens uses the ~4-chars/token markdown heuristic that underlies the
-    Read tool's ~25k-token cap. refresh_sections counts the dated append-grown
-    sweep headings (markdown headings whose text contains "refresh" or
-    "verified values", case-insensitive) that are the structural signature of a
-    recurring-sweep node — the shape the rb-2085 distill procedure targets.
-    Pure (string in, tuple out) so crit3 in get_distill_candidates is
+    est_tokens divides by CHARS_PER_TOKEN (see that constant for the measurement
+    and why it is not 4). That constant is the SOLE source of the ratio — do not
+    add a config key mirroring it, and do not restore chars/4, which under-reports
+    every oversized node, always in the flattering direction. refresh_sections
+    counts append-grown sweep headings — a markdown heading containing "refresh" /
+    "verified values" (case-insensitive), OR a goal-id / ISO-date stamp — the
+    structural signature of a recurring-sweep node, which is the shape the rb-2085
+    distill procedure targets. The stamp arm matters because THIS tree names
+    append-grown sections by goal id (see _APPEND_SECTION_STAMP). Pure (string in,
+    tuple out) so crit3 in get_distill_candidates is
     unit-testable without filesystem / path-resolution fixtures. (g-115-1570)
     """
     line_count = 0
@@ -664,9 +728,10 @@ def _analyze_node_body(text):
         s = line.lstrip()
         if s.startswith("#"):
             low = s.lower()
-            if "refresh" in low or "verified values" in low:
+            if ("refresh" in low or "verified values" in low
+                    or _APPEND_SECTION_STAMP.search(s)):
                 refresh_sections += 1
-    return line_count, char_count // 4, refresh_sections
+    return line_count, int(char_count / CHARS_PER_TOKEN), refresh_sections
 
 
 def get_distill_candidates(tree, include_skipped=False):
@@ -736,10 +801,30 @@ def get_distill_candidates(tree, include_skipped=False):
         # path below), so an oversized interior node is exactly its target.
         # is_interior suppresses crit1/crit2 symmetrically to is_distill_exempt.
         is_interior = bool(node.get("children"))
-        rc = node.get("retrieval_count", 0)
-        ur = node.get("utility_ratio", 0.0)
-        th = node.get("times_helpful", 0)
-        tn = node.get("times_noise", 0)
+        # `.get(k, default)` returns the default only when the key is ABSENT. A
+        # key PRESENT with value None returns None, and `None < 0.3` raises
+        # TypeError. Measured 2026-07-30: 5 of 1297 nodes carried
+        # `utility_ratio: null` (the directive-lane-series-* family) and that was
+        # enough to make `tree-read.sh --distill-candidates` exit 1 with "'<' not
+        # supported between instances of 'NoneType' and 'float'" — so the DISTILL
+        # half of /tree maintain scanned NOTHING, and every debt figure computed
+        # from the same list (cmd_stats consumers, backlog-mode escalation) died
+        # with it. A whole maintenance operation was inert, and its only symptom
+        # was one error line from a scanner nobody reads on the success path.
+        # Same class as 2026-07-12_getattr-default-masks-more-framedata (cited in
+        # guard-1022): a default that looks defensive and defends nothing.
+        rc = node.get("retrieval_count") or 0
+        ur_raw = node.get("utility_ratio")
+        ur = 0.0 if ur_raw is None else ur_raw
+        # None means NEVER MEASURED, which is not the claim "measured, and zero".
+        # Coercing it to 0.0 for the comparison ALONE would make these nodes read
+        # as low-utility and feed them into exactly the crit1/crit2
+        # false-positive pool this function's  /  history
+        # exists to drain. Carry the distinction into utility_signal_ok below
+        # instead. crit3 is structural and unaffected by design.
+        has_utility_value = ur_raw is not None
+        th = node.get("times_helpful") or 0
+        tn = node.get("times_noise") or 0
         feedback_votes = th + tn
         has_feedback = feedback_votes >= 1
         # : utility is evidence only on >= min_votes feedback events
@@ -754,7 +839,9 @@ def get_distill_candidates(tree, include_skipped=False):
             signal_recent = (date.fromisoformat(last_ret_raw) >= recency_cutoff)
         except ValueError:
             signal_recent = False
-        utility_signal_ok = has_min_votes and signal_recent
+        # has_utility_value: an unmeasured utility_ratio is not utility evidence,
+        # for the same reason a stale last_retrieved is not (see above).
+        utility_signal_ok = has_min_votes and signal_recent and has_utility_value
         # Criterion 1: low utility after sufficient retrievals — but only when
         # we have at least one helpful/noise feedback signal. Before ,
         # crit1 was rc-only; utilization-feedback wasn't firing on tree
@@ -769,7 +856,8 @@ def get_distill_candidates(tree, include_skipped=False):
         refresh_sections = 0
         if abs_path and os.path.exists(abs_path):
             with open(abs_path, "r", encoding="utf-8") as f:
-                line_count, est_tokens, refresh_sections = _analyze_node_body(f.read())
+                line_count, est_tokens, refresh_sections = _analyze_node_body(
+                    f.read())
         # crit2 requires feedback too — same root cause as crit1 (zero-feedback
         # nodes have ur=0.0 by default and mis-fire as "mediocre"). .
         # : same min-votes + recency bar as crit1 (utility_signal_ok).
@@ -781,10 +869,37 @@ def get_distill_candidates(tree, include_skipped=False):
         # utility_ratio/feedback (crit1/crit2): the problem is the node is too
         # large to Read at all, not that its payoff is low (these sweep nodes
         # are typically HIGH-utility, so crit2's ur<0.5 gate never catches them).
-        # Both conditions required (near-cap size AND append-grown shape) so the
-        # false-positive rate stays near zero. Action reuses the rb-2085 distill
-        # procedure (archive verbatim + keep newest-N + dated rollup).
-        crit3 = est_tokens >= token_trigger and refresh_sections >= refresh_min
+        # SPLIT INTO TWO ARMS (, filed by echo). crit3 conflated two
+        # questions, and ANDing them made the read-cap question unanswerable for a
+        # node that is oversized WITHOUT being append-grown:
+        #   (1) READ-CAP PROTECTION — a body past the cap cannot be Read at all.
+        #       Wholly independent of HOW the node grew.
+        #   (2) DISTILL-ACTION SUITABILITY — the rb-2085 procedure (archive
+        #       verbatim + keep newest-N + dated rollup) only makes sense when
+        #       there ARE dated sections to roll up.
+        # The append-grown requirement is correct for (2) and wrong for (1). Do
+        # NOT instead loosen refresh_min: that would recommend `distill` for nodes
+        # where distill is the wrong action, which is the false-positive class the
+        # distill_refresh_min_sections comment deliberately guards.
+        #
+        # Resolution follows this framework's OWN precedent rather than inventing
+        # one:  hit the same shape on the interior-node axis and fixed it
+        # by SEPARATING trigger from action. Same split here on the size axis —
+        # the size test fires on its own, and recommended_action branches on
+        # append-grown-ness into the EXISTING emitted vocabulary (`distill` /
+        # `regroup`; get_redistribute_candidates emits `regroup`, so no new action
+        # string is invented).
+        oversized = est_tokens >= token_trigger
+        append_grown = refresh_sections >= refresh_min
+        crit3 = oversized and append_grown            # read-cap + distill is right
+        crit3_readcap = oversized and not append_grown  # read-cap only; distill is WRONG
+        # A `redistribute` exemption DOES suppress the read-cap-only arm, because
+        # `regroup` is the redistribute family and an intentionally-wide
+        # chronological hub has already opted out of exactly that action. A
+        # `distill` exemption does NOT suppress it — that flag speaks to the wrong
+        # action. (The distill arm's own exemption semantics are unchanged below.)
+        if crit3_readcap and "redistribute" in _node_maintain_exempt(node):
+            crit3_readcap = False
         #  / guard-896: a node durably marked distill-exempt via the
         # coherence gate (rb-94 body-read judgment) is suppressed from the UTILITY
         # triggers — low retrieval signals niche value, not bloat, so distilling it
@@ -800,9 +915,29 @@ def get_distill_candidates(tree, include_skipped=False):
             # an interior hub gets crit3 (structural read-cap) ONLY. Same
             # suppression shape as distill_exempt.
             crit1 = crit2 = False
-        if crit1 or crit2 or crit3:
+        if crit1 or crit2 or crit3 or crit3_readcap:
+            # crit3 before crit3_readcap: they are mutually exclusive by
+            # construction (append_grown vs not), so order only documents intent.
             trigger = ("oversized_append_grown" if crit3
+                       else "oversized_not_append_grown" if crit3_readcap
                        else "low_utility" if crit1 else "large_mediocre")
+            # recommended_action is what makes the split useful to a caller: the
+            # read-cap-only arm must NOT be handed the rb-2085 distill procedure,
+            # because there are no dated sections to roll up. `regroup` is the
+            # action get_redistribute_candidates already emits ().
+            #
+            # SCOPE OF THE CLAIM (see the READ-SITE CAVEAT at CHARS_PER_TOKEN,
+            #  / guard-2006): both oversized_* triggers fire at
+            # token_ratio (0.8) of the cap, so they are PROACTIVE FLAGS and are
+            # NOT assertions that a node exceeds the Read cap. Do not read them
+            # as one. A consumer that needs a genuine over-cap claim — anything
+            # that turns this into structural surgery — must apply that caveat's
+            # bias-independent floor (chars >= 25000*2.43 = 60_750) or re-measure
+            # with a real tokenizer; between 57_500 and 60_750 chars the verdict
+            # is UNKNOWN, not over. `regroup` is deliberately safe under that
+            # uncertainty (it moves children, it does not destroy content), which
+            # is why the early trigger is the right default here.
+            recommended_action = "regroup" if crit3_readcap else "distill"
             candidates.append({
                 "key": key,
                 "utility_ratio": ur,
@@ -814,6 +949,7 @@ def get_distill_candidates(tree, include_skipped=False):
                 "refresh_sections": refresh_sections,
                 "file": file_path,
                 "trigger": trigger,
+                "recommended_action": recommended_action,
             })
         elif include_skipped:
             # Attribute the skip to the most specific gate that failed.
@@ -850,7 +986,12 @@ def get_distill_candidates(tree, include_skipped=False):
     # entirely (rb-2085), so they must win the max_distill_per_invocation budget
     # over low-utility / large-mediocre leaves. Within each tier, lowest utility
     # first (preserves the prior ordering for crit1/crit2 candidates). ()
-    candidates.sort(key=lambda x: (0 if x["trigger"] == "oversized_append_grown" else 1, x["utility_ratio"]))
+    # BOTH read-cap triggers share tier 0 (): an over-cap node is
+    # unreadable regardless of how it grew, so ranking it behind a low-utility
+    # leaf would re-create the invisibility the arm-split just fixed — the arm
+    # would fire and then never surface within a per-invocation cap.
+    _READ_CAP_TRIGGERS = ("oversized_append_grown", "oversized_not_append_grown")
+    candidates.sort(key=lambda x: (0 if x["trigger"] in _READ_CAP_TRIGGERS else 1, x["utility_ratio"]))
     if include_skipped:
         return {"candidates": candidates, "skipped": skipped}
     return candidates
@@ -1545,6 +1686,16 @@ from _l1_pick import (  # noqa: E402
     get_l1_for_node as _get_l1_for_node,
     append_l1_pick_log as _l1_append,
     log_l1_pick as _l1_log,
+)
+
+# tree_growth_log SSOT () — same split-brain reason as _l1_pick
+# above: the daemon batch/reparent branches import these very functions, so
+# the structural-op log cannot be written on one path and skipped on the
+# other. See _growth_log.py for the measured finding (there was never a
+# script writer for DECOMPOSE; the log's 8 frozen rows are prose residue).
+from _growth_log import (  # noqa: E402
+    record_batch as _growth_record_batch,
+    record_reparent as _growth_record_reparent,
 )
 
 
@@ -2358,6 +2509,13 @@ def cmd_remove_child(args):
         if child_key in nodes:
             del nodes[child_key]
         data["nodes"] = nodes
+        # tree_growth_log PRUNE row (). Standalone --remove-child
+        # gets the SAME row a batch remove-child gets — otherwise the two
+        # removal paths disagree, which is the split this goal exists to close.
+        _growth_record_batch(
+            data,
+            [{"op": "remove-child", "key": parent_key, "child_key": child_key}],
+            date.today().isoformat())
         data["last_updated"] = date.today().isoformat()
         return data
 
@@ -2731,6 +2889,12 @@ def cmd_batch(args):
         captured["propagate_results"] = propagate_results
 
         tree["nodes"] = nodes
+        # tree_growth_log: DECOMPOSE + PRUNE rows for this batch ().
+        # SSOT in _growth_log.py — the daemon's batch branch calls the SAME
+        # function, which is what stops this log going silent on one write path
+        # while working on the other (the  shape). Must run INSIDE
+        # the lock and BEFORE serialization: it mutates `tree`. Fail-open.
+        _growth_record_batch(tree, mutation_ops, date.today().isoformat())
         tree["last_updated"] = date.today().isoformat()
         return tree
 
@@ -3123,6 +3287,10 @@ def cmd_reparent(args):
         captured["new_cap"] = new_cap
 
         tree["nodes"] = nodes
+        # tree_growth_log REPARENT row () — inside the lock, before
+        # serialization. Same SSOT as the batch path; daemon mirrors this.
+        _growth_record_reparent(tree, node_key, new_parent_key,
+                                date.today().isoformat())
         tree["last_updated"] = date.today().isoformat()
         return tree
 

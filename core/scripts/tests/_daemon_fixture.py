@@ -13,6 +13,15 @@ The canonical fix pattern was developed in test_window_streak.py
 helpers so the remaining 4-5 tests can adopt the pattern without
 duplicating ~80 lines each.
 
+THIS MODULE IS NOW THE CANONICAL COPY -- do not re-fork it, and do not
+treat the origin file as the reference. The extraction left the original
+behind as a private copy, and it then drifted: this module gained pins for
+MIND_WORLD (g-115-2352), STORAGE_BACKEND (g-115-2101) and MIND_META
+(guard-652) that the origin never got. The origin sat RED wherever
+MIND_WORLD was exported and green everywhere else, which read as a
+platform bug for a day (g-115-3947, 2026-07-30). test_window_streak.py now
+imports from here; 38 test files use this module and zero fork it.
+
 Usage:
     from _daemon_fixture import DaemonFixture, make_project_root
 
@@ -26,7 +35,8 @@ Usage:
                 ...
 
 Cross-references:
-  - test_window_streak.py — canonical pattern (lines 48-136)
+  - test_window_streak.py — where the pattern originated; its local copy was
+    deleted 2026-07-30 (g-115-3947) and it now imports from here
   - mind_api/src/server.py — Server class spawned in-process
   - core/scripts/_rt.py:45-49 — RT_DIR env resolution
   - g-115-874 (zeta investigation) — Cat B + Cat C failure analysis
@@ -97,8 +107,8 @@ def make_project_root(tmp: Path, world: Path, agent: str = "alpha",
 def _start_daemon(project_root: Path) -> tuple:
     """Start an in-process daemon; return (httpd, port).
 
-    Mirrors test_window_streak.py:_start_daemon — kept here to keep the
-    shared fixture self-contained.
+    Originally mirrored test_window_streak.py:_start_daemon; that copy was
+    deleted 2026-07-30 (g-115-3947), so this is now the only implementation.
     """
     from mind_api.src.server import Server, _Handler
     from mind_api.src import lifecycle

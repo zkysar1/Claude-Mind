@@ -1898,24 +1898,55 @@ def _strip_long_form(result):
     tags, utilization counters, confidence, capability_level, match_channel,
     match_score.
 
-    Mutates result in place and returns it for chaining. Reversible only via
-    re-fetch — callers wanting full bodies should pass `--full-content`.
+    Replaces the affected ROWS with stripped COPIES; it never mutates a record
+    in place. Callers wanting full bodies should pass `--full-content`.
+
+    *** THE COPY IS LOAD-BEARING (g-115-3387, 2026-07-27). *** These rows are
+    the SHARED jsonl-cache dicts -- `mind_api/src/jsonl_cache.py:53` warns in
+    capitals that "the returned list and its dicts are the SHARED cache copy
+    ... copy.deepcopy first if you need to modify". The previous in-place form
+    (`r["content"] = None`) did exactly what that forbids, so a single
+    metadata-only retrieval PERMANENTLY NULLED `content` on the daemon's cached
+    reasoning-bank records -- for every later caller, including ones that
+    explicitly passed `--full-content`, until the cache reloaded on mtime/TTL.
+
+    Metadata-only is the DEFAULT, so in practice nearly every retrieval was
+    poisoning the cache for the entries it touched. MEASURED: rb-3698 carries
+    1243 chars in the store; after one default retrieval touched it, a DIFFERENT
+    query with `--full-content` returned content length 0. Consumers that need
+    the lesson text -- the code-review-protocol pre-apply consultation,
+    encode-session dedup, /respond -- silently saw title-only entries and could
+    not tell the difference from an entry that genuinely had no content.
     """
     for bucket in ("reasoning_bank", "meta_lessons"):
-        for r in result.get(bucket, []) or []:
+        rows = result.get(bucket) or []
+        stripped = []
+        for r in rows:
             # Keep title + when_to_use (both short, highly discriminative).
             # Drop content (multi-paragraph lesson text) + description
-            # (redundant long-form when present).
-            if "content" in r:
-                r["content"] = None
-            if "description" in r and r.get("description"):
-                r["description"] = None
-    for p in result.get("pattern_signatures", []) or []:
-        desc = p.get("description")
-        if isinstance(desc, str) and len(desc) > 240:
-            # Signature descriptions occasionally balloon; truncate rather than
-            # null so title-less sigs retain a handle. 240 ≈ one tweet.
-            p["description"] = desc[:240].rstrip() + "…"
+            # (redundant long-form when present). Copy-on-write: only rows
+            # that actually carry a long-form field pay for a dict copy.
+            if ("content" in r) or r.get("description"):
+                r = dict(r)
+                if "content" in r:
+                    r["content"] = None
+                if r.get("description"):
+                    r["description"] = None
+            stripped.append(r)
+        if rows:
+            result[bucket] = stripped
+    sigs = result.get("pattern_signatures") or []
+    if sigs:
+        out = []
+        for p in sigs:
+            desc = p.get("description")
+            if isinstance(desc, str) and len(desc) > 240:
+                # Signature descriptions occasionally balloon; truncate rather
+                # than null so title-less sigs retain a handle. 240 ≈ one tweet.
+                p = dict(p)
+                p["description"] = desc[:240].rstrip() + "…"
+            out.append(p)
+        result["pattern_signatures"] = out
     return result
 
 def _item_text_for_tokens(item, item_type):

@@ -33,9 +33,17 @@ Tested invariants:
   1. world goal, intended_agent == AGENT_NAME -> kept, source == "world"
   2. world goal, intended_agent == "either"   -> kept, source == "world"
   3. world goal, intended_agent == None        -> kept, source == "world"
-  4. world goal, intended_agent == other-agent -> DROPPED (routing filter)
-  5. source is NEVER "agent" nor "cross-agent:*" for any world goal
+  4. world goal, intended_agent == other LIVE agent -> DROPPED (routing filter)
+  5. world goal, intended_agent == an OFF-ROSTER name -> KEPT (g-115-3482:
+     a retired agent or unrecognized sentinel names nobody who can honor the
+     routing, so filtering it made the goal invisible in BOTH the candidate
+     and blocked lists -- 2 goals unreachable for 71 days)
+  6. source is NEVER "agent" nor "cross-agent:*" for any world goal
      (the explicit negative assertion the incident motivates)
+
+Invariants 4 and 5 are complements, and keeping them apart is why OTHER_AGENT
+is now derived from the live vocabulary rather than hardcoded -- see the
+comment at its definition.
 
 Pattern: build synthetic world aspirations, call collect_candidates
 directly with source="world", assert the source tag on each result.
@@ -72,7 +80,27 @@ else:
 # collect_candidates uses module-level AGENT_NAME for the intended_agent
 # filter; tests align "self" to that value.
 SELF_AGENT = gs.AGENT_NAME            # "bravo" per the setdefault above
-OTHER_AGENT = "delta" if SELF_AGENT != "delta" else "alpha"
+
+# OTHER_AGENT must name a LIVE peer. It was hardcoded `"delta"` until
+# 2026-07-28 -- but delta was RETIRED on 2026-07-07, and from that day the
+# fixture silently stopped testing "routed to ANOTHER AGENT" and started
+# testing "routed to a NONEXISTENT agent". Those became two different cases in
+# : an off-roster target names nobody who can honor the routing, so
+# the goal now falls THROUGH (staying visible) instead of vanishing from both
+# the candidate list and the blocked list. The fixture is itself an instance of
+# the bug class it tripped over -- a real name that rotted into a synthetic one.
+# Derive from the live vocabulary so a future retirement cannot repeat it.
+from aspirations import _valid_intended_agents as _vocab  # noqa: E402
+
+_LIVE_PEERS = sorted(n for n in _vocab() if n not in (SELF_AGENT, "either"))
+# Fallback keeps the case meaningful where the roster is unresolvable: the
+# vocabulary check is SKIPPED in that state, so a plain name-mismatch still
+# routes away and the invariant still holds.
+OTHER_AGENT = _LIVE_PEERS[0] if _LIVE_PEERS else "alpha"
+
+# A name that is NOT on the roster -- the  case, pinned explicitly
+# below so both halves of the routing contract live in this file.
+OFFROSTER_AGENT = "delta"
 
 
 def _make_goal(goal_id: str, intended_agent: str | None,
@@ -156,6 +184,35 @@ def case_other_routed_world_goal_dropped() -> tuple[bool, str]:
     return True, "ok"
 
 
+def case_offroster_routed_world_goal_kept() -> tuple[bool, str]:
+    """world goal, intended_agent == an OFF-ROSTER name -> KEPT ().
+
+    The complement of the case above, and the reason that one had to stop
+    hardcoding a name. A value outside the vocabulary (a retired agent, or an
+    unrecognized sentinel like the cycle-detector's "any") names nobody who can
+    ever honor the routing. Filtering it made the goal invisible in BOTH
+    directions -- absent from the candidate list, and never classified by
+    collect_blocked, which does not reference intended_agent at all. Two goals
+    sat unreachable for 71 days that way. Falling through restores them to
+    exactly the visibility "either" would give.
+
+    Skipped when the roster is unresolvable: the vocabulary check is disabled
+    in that state by design (an unreadable team-state must not make every
+    routed goal fleet-visible), so the case would not be meaningful.
+    """
+    if not _LIVE_PEERS:
+        return True, "skipped (roster unresolvable -- vocabulary check disabled by design)"
+    results = _collect_world([_make_goal("g-offroster",
+                                         intended_agent=OFFROSTER_AGENT)])
+    ids = [c["goal"]["id"] for c in results]
+    if ids != ["g-offroster"]:
+        return False, (f"expected ['g-offroster'] (off-roster target falls "
+                       f"through to visible), got {ids}")
+    if results[0].get("source") != "world":
+        return False, f"source mutated: {results[0].get('source')!r}"
+    return True, "ok"
+
+
 def case_source_never_agent_or_cross_agent() -> tuple[bool, str]:
     """The incident's explicit negative: no world goal ever gets source in
     ('agent', 'cross-agent:*'). Mixed-intended_agent batch, assert every
@@ -186,6 +243,7 @@ CASES = [
     ("either-world-goal-keeps-world-source",       case_either_world_goal_keeps_world_source),
     ("unset-world-goal-keeps-world-source",        case_unset_world_goal_keeps_world_source),
     ("other-routed-world-goal-dropped",            case_other_routed_world_goal_dropped),
+    ("offroster-routed-world-goal-kept",           case_offroster_routed_world_goal_kept),
     ("source-never-agent-or-cross-agent",          case_source_never_agent_or_cross_agent),
 ]
 

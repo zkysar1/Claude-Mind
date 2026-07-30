@@ -56,7 +56,31 @@ def _read_entries(path):
 
 def _parse_duration(duration_str):
     """Mirror changelog.py:parse_duration (lines 43-58): only m/h/d suffixes;
-    invalid strings return None and the caller silently skips the filter."""
+    invalid strings return None and the caller silently skips the filter.
+
+    DELIBERATELY still silent, unlike the sibling in endpoints/board.py, which
+    was changed to a 400 by g-115-3775. Do not "fix" this one to match without
+    reading the two reasons they diverge (measured 2026-07-29):
+
+      1. PARITY IS PINNED HERE AND ABSENT THERE. core/scripts/changelog.py is a
+         LIVE CLI (argparse + __main__, `--since` on both read and stats), this
+         endpoint is byte-compat-pinned to it, and
+         mind_api/tests/test_runtime_changelog.py::test_stats_invalid_since_no_filter
+         asserts the silent skip ON PURPOSE. Changing only this side breaks the
+         pin; changing both sides also changes a live CLI's behavior.
+         core/scripts/board.py, by contrast, has no `--since` flag at all — its
+         parse_duration is dead code — so the board endpoint had no parity
+         constraint to honor.
+      2. NO LIVE CALLER PASSES A NON-DURATION HERE. A repo-wide census of
+         changelog `--since` call shapes found only two usage strings
+         ("<duration>]", "<dur>]") and zero real invocations, so the hazard is
+         latent. The board hazard was live: post-execution.md Step 1.75d passes
+         an ISO timestamp, and Step 1.75e is a fail-closed gate reading the
+         result.
+
+    The silent-skip is still the wrong shape and is tracked separately; this
+    docstring exists so the divergence reads as a decision, not an oversight.
+    """
     if not duration_str:
         return None
     unit = duration_str[-1].lower()

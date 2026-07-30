@@ -135,14 +135,26 @@ def aspirations_add_goal(asp_id, record, source="world", overrides=None):
 
 
 def aspirations_read(source="world", active=False, active_compact=False,
-                     asp_id=None, limit=None):
+                     asp_id=None, limit=None, archive=False):
     """GET /v1/aspirations/read. Returns the raw JSON text the deleted
-    `aspirations.py read` CLI used to print (callers json.loads as before)."""
+    `aspirations.py read` CLI used to print (callers json.loads as before).
+
+    `archive=True` returns aspirations-archive.jsonl instead of the live
+    store — a BARE list of aspirations (each with its nested `goals`), not
+    the `{"aspirations": [...]}` envelope the active reads return. Callers
+    resolving a goal-id MUST read both stores: a goal inside a COMPLETED,
+    archived aspiration is absent from every live read, so a live-only
+    lookup reports not-found — indistinguishable from an id that never
+    existed (guard-1555; g-115-3916 measured a 37-day defer freeze from
+    exactly this).
+    """
     query = "source=%s" % _q(source)
     if active:
         query += "&active=1"
     if active_compact:
         query += "&active_compact=1"
+    if archive:
+        query += "&archive=1"
     if asp_id:
         query += "&id=%s" % _q(asp_id)
     if limit is not None:

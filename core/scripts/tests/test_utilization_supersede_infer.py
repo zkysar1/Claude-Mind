@@ -35,6 +35,17 @@ import unittest
 from pathlib import Path
 
 CORE_SCRIPTS = Path(__file__).resolve().parents[1]
+# CORE_SCRIPTS was computed but never put on sys.path, so this file passed under
+# pytest (which already has core/scripts importable) and died standalone with
+# `ModuleNotFoundError: No module named '_paths'` — utilization-feedback.py does
+# `from _paths import ...` at import time, before any test body runs. Standalone
+# is exactly how run-invisible-suites.sh executes it (`python3 <file>`), and this
+# file reaches that runner because its tests are unittest.TestCase methods, so
+# the runner's `^def test_` predicate sees no top-level test and classifies it
+# main()-style. Guarded insert per the _daemon_fixture.py pattern: under pytest
+# the entry is already present, so this is a no-op there. ()
+if str(CORE_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(CORE_SCRIPTS))
 
 
 def _load():

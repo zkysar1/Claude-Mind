@@ -1,5 +1,38 @@
 [
   {
+    "version": "2.8.2",
+    "previous_version": "2.8.1",
+    "date": "2026-07-30",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Fleet sync (50 commits, 12 framework files: tree.py, tree_write.py, verify-learning, fresh-eyes-review, window-streak tests) plus the g-001-221 strategy-apply STRUCTURAL back-port reconciled UP from ZDS.",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.8.1",
+    "previous_version": "2.8.0",
+    "date": "2026-07-30",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Back-port ZDS's strategy-apply STRUCTURAL not-eligible marking (g-001-221) so the Claude->ZDS promotion reconciles UP instead of clobbering it.",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.8.0",
+    "previous_version": "2.7.1",
+    "date": "2026-07-30",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Fleet-cycle sync: 308 framework commits since v2.7.1 — coordination_merge handler coverage (improvement-velocity, strategy-generations), .mind-data ledger merge-driver routing, TZ=UTC clock-skew rails, probe-aggregate false-all-clear sweep, recurring-goal staleness detector, cross-deployment peer surface in /prime, argv-hang fixes",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.7.1",
     "previous_version": "2.7.0",
     "date": "2026-07-27",

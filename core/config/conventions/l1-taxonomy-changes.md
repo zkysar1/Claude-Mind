@@ -104,7 +104,12 @@ pending-question to apply-script-invocation is the audit trail.
 
 Each apply script writes to three audit streams:
 
-- `tree_growth_log` in `_tree.yaml` — `{op: L1_ADD | L1_RENAME, ...}`
+- `tree_growth_log` in `_tree.yaml` — `{op: L1_ADD | L1_RENAME, ...}`. These
+  two apply scripts write their rows directly; the OTHER ops in this log
+  (DECOMPOSE, PRUNE, REPARENT) are written by the tree write paths via
+  `core/scripts/_growth_log.py` (g-115-3210). So this log is not L1-only —
+  reading it that way is the specific error that let it sit frozen for 3.7
+  months.
 - `meta/l1-pick-log.jsonl` — uniform with S9's auto-logging (`decision_type:
   l1-add | l1-rename`)
 - Stdout JSON containing the approval id and the executed plan

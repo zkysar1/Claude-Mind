@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import sys
+import uuid
 from datetime import date, datetime
 from pathlib import Path
 
@@ -139,6 +140,68 @@ from _agents import get_active_agents as _get_active_agents  # noqa: E402
 
 def _valid_intended_agents() -> set:
     return set(_get_active_agents()) | {"either"}
+
+
+def routes_away_from(intended_agent, agent_name) -> bool:
+    """True when `intended_agent` routes a goal AWAY from `agent_name`.
+
+    Returns False for the four non-routing cases: unset/None, the "either"
+    sentinel, `agent_name` itself, and -- the g-115-3482 fix -- any value
+    OUTSIDE the live vocabulary (`_valid_intended_agents()`).
+
+    That last case is the bug this helper exists to kill. An off-roster value
+    names nobody who can ever honor the routing: a RETIRED agent ("delta",
+    removed from team-state agent_status), or an unrecognized sentinel (the
+    cycle-detector writes "any", which obviously MEANS "anyone" and which the
+    vocabulary does not contain). Treating such a value as foreign made the
+    goal doubly dead -- UNSELECTABLE (goal-selector's collect_candidates drops
+    it, while collect_blocked never references intended_agent, so it is absent
+    from BOTH outputs -- invisible in both directions) and UNCLAIMABLE (the
+    takeover guard and the daemon claim path both refuse it). Measured
+    2026-07-28: g-115-913 and g-115-918 sat invisible for 71 days that way.
+
+    Falling through is the SAFE direction, not a loosening: the goal becomes
+    visible to everyone, which is exactly what "either" already does and
+    exactly what whoever wrote "any" intended.
+
+    Conservative (rb-1028, never-on-absent-evidence): when the vocabulary
+    cannot be resolved -- an empty/unreadable roster leaves
+    `_valid_intended_agents()` == {"either"} alone -- the roster check is
+    SKIPPED and the historical name-mismatch behavior stands. An unreadable
+    team-state can therefore never make every routed goal visible fleet-wide,
+    which would be a fail-OPEN across the whole fleet.
+    """
+    # str() before strip(): the predicate this replaced compared with != and so
+    # tolerated ANY type. A bare `.strip()` would raise AttributeError on a
+    # malformed non-string value, and this runs inside goal-selector's
+    # per-goal loop -- an exception there crashes selection, which kills the
+    # autonomous loop. No non-string value exists in the live corpus (4019
+    # checked, 0 bad), so this is purely about not REGRESSING the old code's
+    # type-tolerance. A stringified oddity lands outside the vocabulary and
+    # falls through to visible, which is the safe direction.
+    ia = str(intended_agent or "").strip()
+    if not ia or ia == "either" or ia == agent_name:
+        return False
+    # NEVER let a roster-resolution failure escape: this runs inside
+    # goal-selector's per-goal loop, so an exception here crashes selection and
+    # kills the autonomous loop. The predicate this replaced was a pure string
+    # comparison and could not raise at all, so the guard is about not
+    # REGRESSING that property. The path is real though narrow: _agents
+    # ._resolve_world_team_state calls `_agents_root(root).iterdir()` OUTSIDE
+    # _from_team_state's try block, so an unreadable agents-root (permission,
+    # transient network/own-cloud mount) raises OSError straight through.
+    # goal-selector's own _load_team_state_cached docstring already states the
+    # invariant this honors: team-state is ADVISORY input and "a partial/
+    # unreadable read must NOT crash the whole selector" (rb-2429).
+    # Unresolvable roster => same conservative branch as an empty one: skip the
+    # vocabulary check and keep the historical name-mismatch behavior.
+    try:
+        valid = _valid_intended_agents()
+    except Exception:
+        return True
+    if len(valid) > 1 and ia not in valid:
+        return False  # off-roster -> nobody can honor it -> treat as "either"
+    return True
 
 # Resolved-once snapshot for callers that import as a constant. Refresh
 # semantics match capability_route.ACTIVE_AGENTS — module reload required
@@ -885,6 +948,13 @@ def _run_capability_gate_for_defer(defer_reason_text: str,
            "--failure-reason", defer_reason_text,
            "--intended-participants", "user",
            "--output", "json",
+           # : tell the gate this is the DEFER path so its `reason`
+           # text recommends --force-defer (the flag this path honours) rather
+           # than --override-agent-match (the CREATE_BLOCKER bypass, explicitly
+           # NOT honoured here — ). Following the old text verbatim
+           # failed quietly: override_applied stayed null while the gate
+           # re-blocked on different keywords.
+           "--caller-context", "defer",
            "--suggest-unblock"]
     if goal_id:
         cmd.extend(["--for-goal-id", goal_id])
@@ -1380,6 +1450,13 @@ def _file_unblock_under_existing_lock(items: list, original_goal_id: str,
         "blocked_by": [],
         "origin_signal": expected_origin,
         "created_at": datetime.now().isoformat(timespec="seconds"),
+        # : parity with the add-goal chokepoint
+        # (mind_api/src/endpoints/aspirations_write.py). This site mints goals
+        # directly rather than routing through it, so without this the
+        # defer->Unblock auto-conversion — the exact lane whose `Apply:` ->
+        # `Unblock:` retitles produced 2 of the 3 confirmed splits — would keep
+        # emitting nonce-less goals that fall back to the mutable-title identity.
+        "alloc_nonce": uuid.uuid4().hex,
         "tags": ["unblock", "defer-gate-routed", "framework-maintenance"],
         "verification": {"outcomes": [], "checks": [], "preconditions": []},
     }
@@ -1490,7 +1567,7 @@ def cmd_update_goal(args):
                 or field == "claimed_by"):
             _intended = goal.get("intended_agent")
             _caller = os.environ.get("MIND_AGENT", "").strip() or "unknown"
-            if _intended and _intended != _caller and _intended != "either":
+            if routes_away_from(_intended, _caller):
                 _xl = (getattr(args, "cross_lane", None) or "").strip() or None
                 if not _xl:
                     print(f"BLOCKED: Goal {goal_id} is routed to "
@@ -1893,6 +1970,44 @@ def cmd_update_goal(args):
                 file=sys.stderr,
             )
             sys.exit(1)
+        # : a DIRECT `blocker_ref` field write used to fall straight
+        # through to the generic `goal[field] = value` below with NO validation,
+        # NO alias normalization and NO TTL — validate() was reachable only via
+        # the --blocker-ref FLAG paired with a defer_reason / status=blocked
+        # write. Measured consequence (2026-07-27): of 11 live dict refs, ONE
+        # matched validate()'s shape; 7 carried no expires_at at all, so the
+        # TTL that exists to force a Phase 0.5b re-probe never armed and those
+        # blocks could not age out. Route the direct write through the same
+        # validator (guard-330: every write path calls its full-record validator).
+        #
+        # DICTS ONLY, deliberately. A bare-STRING blocker_ref is a live,
+        # reader-supported shape (blocked-signal-resolution-check's `kind ==
+        # "str"` branch) and normalizing it is a separate tracked concern
+        # (); this goal's contract is that an un-normalized DICT
+        # cannot land. A str that decodes to a dict IS in scope — that is just
+        # a dict arriving over the CLI's JSON-encoded path.
+        if field == "blocker_ref" and value not in (None, ""):
+            _candidate = value
+            if isinstance(_candidate, str):
+                try:
+                    _candidate = json.loads(_candidate)
+                except (json.JSONDecodeError, TypeError):
+                    _candidate = None          # bare string ref — out of scope
+            if isinstance(_candidate, dict):
+                from gates.blocker_ref import validate as _validate_ref
+                _ok, _normalized = _validate_ref(_candidate)
+                if not _ok:
+                    print(
+                        f"BLOCKED: {_normalized}\n"
+                        f"Goal: {goal_id}. A direct `blocker_ref` field write is "
+                        f"normalized by the same validator as --blocker-ref "
+                        f"(g-115-3532) — fix the payload rather than routing "
+                        f"around the gate.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                value = _normalized
+
         # CRITICAL: capture BEFORE the mutation below — the  selection_count
         # bump compares old_status vs the new value to stay idempotent on redundant
         # in-progress writes. Moving this read below `goal[field] = value` would

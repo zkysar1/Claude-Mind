@@ -2,7 +2,12 @@
 # IRREDUCIBLY LOCAL -- per-Bash-call latency budget / hook / session-state critical path. Keep local: never add MCP or remote-service indirection here (a localhost daemon hop, where already present, is the maximum).
 # PostToolUse[Read] hook — record file reads into context-reads tracker.
 # Reads JSON from stdin (tool_input.file_path), records if in scope.
-# Partial reads (offset/limit/pages) are NOT recorded — only full reads are tracked.
+# Ranged reads (offset/limit/pages) ARE recorded, flagged --partial ().
+# They used to be dropped here, which made the read-before-edit advisory assert
+# "has not been Read this session" about a file just read — on every large file,
+# since a large file is exactly the one read with offset/limit. --partial keeps
+# them visible to that advisory while invisible to the BLOCKING dedup gate; see
+# PARTIAL_PREFIX in context-reads.py for why that split is load-bearing.
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
 
@@ -22,13 +27,18 @@ rest="${read_info#*|}"
 session_id="${rest%%|*}"
 file_path="${rest#*|}"
 
-if [ -z "$file_path" ] || [ "$partial" = "1" ]; then
-    exit 0  # No file_path or partial read — skip recording
+if [ -z "$file_path" ]; then
+    exit 0  # Nothing to record
 fi
 
 sid_arg=""
 if [ -n "$session_id" ]; then
     sid_arg="--session-id $session_id"
+fi
+
+partial_arg=""
+if [ "$partial" = "1" ]; then
+    partial_arg="--partial"
 fi
 
 # Resolve agent from session_id — MIND_AGENT is not injected in Read hooks.
@@ -47,4 +57,4 @@ source "$CORE_ROOT/scripts/_platform.sh"
 # swallowed, so the old form silently disabled read-RECORDING on every Read —
 # the tracker never accumulated entries (found 2026-07-07, twin of the same
 # bug in context-reads-gate.sh).
-exec env MIND_AGENT="${AGENT_NAME:-}" python3 "$CORE_ROOT/scripts/context-reads.py" record $sid_arg "$file_path"
+exec env MIND_AGENT="${AGENT_NAME:-}" python3 "$CORE_ROOT/scripts/context-reads.py" record $sid_arg $partial_arg "$file_path"

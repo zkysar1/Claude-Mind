@@ -177,6 +177,39 @@ def parse_value(raw):
     return raw
 
 
+def assert_type_preserved(prev, value, string_flag, dotpath):
+    """Refuse a silent structured -> scalar-string whole-key replacement.
+
+    CLI twin of ``mind_api/src/meta/meta_yaml.py::_assert_type_preserved`` — keep
+    the two in sync (meta-set.sh is daemon-routed, so the daemon copy is the LIVE
+    path; this one covers direct CLI use). Full rationale, incident trace and the
+    rb-5242 refuse-vs-degrade reconciliation live in the daemon docstring.
+
+    Short version (g-115-3462, live-reproduced g-115-3433): ``parse_value``
+    attempts json.loads ONLY for values starting with ``[``/``{`` and otherwise
+    falls through to the raw string, so a computed JSON payload with a stray line
+    of stdout prepended silently replaced 33 gap dicts with one 50,359-char
+    string at exit code 0. Narrow by design: ONLY list/dict -> str, ONLY without
+    --string; null/int/float/bool stay allowed (unambiguous deliberate scalars,
+    and no corrupted payload can parse into one).
+    """
+    if string_flag:
+        return
+    if isinstance(prev, (list, dict)) and isinstance(value, str):
+        shape = f"{type(prev).__name__} of {len(prev)} item(s)"
+        print(
+            f"ERROR: refusing to replace '{dotpath}' ({shape}) with a "
+            f"{len(value)}-char plain string — this would destroy the whole key. "
+            f"The value did not parse as JSON (a JSON payload must start with "
+            f"'[' or '{{'; got {value[:40]!r}). Common cause: a stray line of "
+            f"stdout prepended to a computed payload. Fix the payload, or pass "
+            f"--string if replacing the structure with a literal string is "
+            f"genuinely intended. (g-115-3462)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def load_bounds():
     """Load strategy_schemas from core/config/meta.yaml for bounds validation."""
     meta_config = CONFIG_DIR / "meta.yaml"
@@ -411,6 +444,9 @@ def cmd_set(args):
         old_value = parent[key]
     except (KeyError, IndexError):
         old_value = None
+    # Refuse BEFORE any mutation: write_yaml is below, so the file is left
+    # untouched and the caller gets a non-zero exit ().
+    assert_type_preserved(old_value, value, args.string, args.dotpath)
     # List-index append: when the target is a list and the index equals the
     # current length, append rather than raising IndexError. Lets
     # `meta-set.sh <file> 'gaps[N]' '<json>'` extend a list (the real

@@ -214,7 +214,7 @@ def test_reset_alignment_zeroes() -> bool:
     tmpdir = Path(tempfile.mkdtemp(prefix="loop-state-bump-test-"))
     try:
         wm_path = _seed_wm(tmpdir, goals_completed=5, productive_goals=3)
-        _run_helper(tmpdir, "deep", ["--goal-id", ""])  # alignment -> 1
+        _run_helper(tmpdir, "deep", ["--goal-id", "g-115-1561"])  # alignment -> 1
         rc, stderr = _run_helper(tmpdir, None, ["--reset-alignment"])
         if rc != 0:
             print(f"FAIL: reset — exit {rc}, stderr: {stderr}", file=sys.stderr)
@@ -465,7 +465,7 @@ def test_nonrecurring_idempotent_streaks() -> bool:
                                    routine_count_total=5,
                                    goals_completed_this_session=4)
         _run_helper(tmpdir, "routine", ["--goal-id", "g-999-05", "--recurring", "false"])
-        _run_helper(tmpdir, "routine", ["--goal-id", "", "--recurring", "false"])  # retry
+        _run_helper(tmpdir, "routine", ["--goal-id", "g-999-05", "--recurring", "false"])  # retry
         ls = _read_loop_state(wm_path)
         s = ls["signals"]
         if s["routine_streak_global"] != 3:

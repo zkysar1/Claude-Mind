@@ -265,3 +265,52 @@ agents/*/temp/*
 # forged bodies are git-tracked now; see the note at the .claude/skills marker
 # above. The g-115-2272 parallel-forge collision class stays dead: forges add
 # disjoint NEW dirs and no longer touch any shared ignore file.)
+
+# MACHINE-LOCAL stores under .mind-data/ — mirror of own-cloud's sync-exclusion
+# policy onto the git transport (g-115-3863).
+#
+# WHY: own-cloud already classifies a set of per-machine stores as never-synced
+# (owncloud_sync._EXCLUDE_DIRS + _EXCLUDE_NAMES + the world/*-log.jsonl rule,
+# honored per-operation by OwnCloudBackend._machine_local). For those paths the
+# LOCAL file IS the source of truth — they are disposable per-box telemetry, and
+# jsonl_hygiene caps them with mode=cap precisely because "old entries carry no
+# recoverable value". The git transport had NO equivalent exclusion, so when
+# .mind-data/ became git-tracked (2026-07-28) these per-machine files were swept
+# into git as if they were shared state.
+#
+# MEASURED CONSEQUENCE (2026-07-29, first real cross-box reconcile): three files
+# conflicted, and ALL THREE were machine-local by the policy above —
+# world/presence/omni.jsonl and world/presence/.seq-omni (presence/ is in
+# _EXCLUDE_DIRS) and meta/history-save-telemetry.jsonl (in _EXCLUDE_NAMES). The
+# correlation is total, not coincidental: two boxes each writing their OWN
+# per-machine telemetry to ONE shared git path conflict on every single merge,
+# and since a live agent pushes every few minutes the other box can never
+# converge. Merge handlers are the WRONG fix for this class — there is no
+# meaningful union of two machines' private heartbeat logs. The right fix is the
+# one own-cloud already made: don't share them.
+#
+# DELIBERATE DEVIATION — changelog.jsonl (world + meta) stays TRACKED even though
+# it is in _EXCLUDE_NAMES. It routes to the registered merge_append_only_jsonl
+# handler and auto-merged cleanly in that same reconcile (0 unique records lost),
+# so it never wedges the lane, and it is the write audit trail this repo tracks
+# .mind-data/ in order to back up. Dropping ~86k audit records from the backup to
+# gain nothing operationally would be a loss, not a win.
+#
+# NOTE ON UNTRACKING: `git rm --cached` records a DELETION, so each other box
+# drops its local copy on the next pull. That is safe for this set by definition
+# (disposable, regenerated on the next tick) — presence-tick.py recreates both the
+# log and its .seq-<agent> counter. The counter restarts, which is correct rather
+# than merely tolerable: under this policy every box owns an INDEPENDENT presence
+# sequence, exactly as it already does under own-cloud.
+.mind-data/**/presence/
+.mind-data/**/sessions/
+.mind-data/**/file-contention-telemetry.jsonl
+.mind-data/**/write-queue-telemetry.jsonl
+.mind-data/**/history-save-telemetry.jsonl
+.mind-data/**/.fallback-stats.jsonl
+.mind-data/**/daemon.port
+.mind-data/**/daemon.pid
+.mind-data/**/daemon.lock
+.mind-data/**/local-paths.conf
+.mind-data/world/*-log.jsonl
+.mind-data/world/**/*-log.jsonl

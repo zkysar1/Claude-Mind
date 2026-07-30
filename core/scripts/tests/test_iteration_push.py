@@ -614,3 +614,80 @@ def test_selfheal_mixed_blocking_set_defers_all_or_nothing(tmp_path):
     # ALL-OR-NOTHING: neither file cleared (defer touches nothing)
     assert (a / "agents/bravo/state.jsonl").read_text() == "dirty-bravo\n"
     assert (a / "core/scripts/shared.sh").read_text() == "dirty-core\n"
+
+
+# --------------------------------------------------------------------------- #
+# --no-push: the session-start continuity pull ()
+# --------------------------------------------------------------------------- #
+# owncloud-pull.sh no-ops on local backend by design, so on a local-backend
+# deployment NOTHING fetched outside the autonomous loop and every assistant /
+# reader session started on whatever the checkout was when the loop last ran
+# (observed: 47 commits behind while a session actively read and wrote those
+# files). The fix routes owncloud-pull.sh's local-backend branch here rather
+# than re-deriving the hardened fetch+integrate. --no-push is what makes that
+# safe: becoming current must not publish local state as a side effect of
+# STARTING a session.
+#
+# Each test below is paired with a control that differs ONLY by the flag. A
+# "did not push" assertion is otherwise satisfied by any scenario where nothing
+# WOULD have pushed anyway, which is a test that passes forever while guarding
+# nothing (guard-1832).
+
+def test_no_push_integrates_origin_commits(tmp_path):
+    """The POINT of the flag: a behind session becomes current."""
+    origin, a, b = _clone_pair(tmp_path)
+    _commit_file(b, "from_b.txt", "b\n", "B: change")
+    _must(b, "push", "-q", "origin", "main")
+    before = _tip(a)
+
+    r = _run_push(a, *_default_flags("--no-push", "--strict"))
+    assert r.returncode == 0, r.stderr
+    assert "integrated 1 origin commit" in r.stderr, r.stderr
+    assert _tip(a) != before, "local HEAD did not advance — no integrate happened"
+    assert (a / "from_b.txt").exists(), "origin's file is not in the working tree"
+
+
+def test_no_push_does_not_push_when_ahead(tmp_path):
+    """THE REGRESSION TEST. Local is ahead, so the unflagged run pushes; the
+    flagged run must integrate and stop. Asserts against origin's real ref, not
+    just log text."""
+    origin, a, b = _clone_pair(tmp_path)
+    _commit_file(a, "from_a.txt", "a\n", "A: local work")
+    origin_before = _must(a, "rev-parse", "origin/main")
+
+    r = _run_push(a, *_default_flags("--no-push", "--strict"))
+    assert r.returncode == 0, r.stderr
+    assert "skipping push decision" in r.stderr, r.stderr
+    _must(a, "fetch", "-q", "origin")
+    assert _must(a, "rev-parse", "origin/main") == origin_before, \
+        "--no-push PUBLISHED local commits — a session must not push by starting"
+
+
+def test_control_same_scenario_does_push_without_the_flag(tmp_path):
+    """Positive control for the test above. Identical setup minus --no-push:
+    it MUST push. Without this, the 'did not push' assertion could be passing
+    because the scenario never pushes at all."""
+    origin, a, b = _clone_pair(tmp_path)
+    _commit_file(a, "from_a.txt", "a\n", "A: local work")
+    origin_before = _must(a, "rev-parse", "origin/main")
+
+    r = _run_push(a, *_default_flags("--strict"))
+    assert r.returncode == 0, r.stderr
+    assert "push OK" in r.stderr, r.stderr
+    _must(a, "fetch", "-q", "origin")
+    assert _must(a, "rev-parse", "origin/main") != origin_before, \
+        "control did not push — the paired no-push assertion proves nothing"
+
+
+def test_no_push_stops_before_push_even_when_integrate_is_a_noop(tmp_path):
+    """The seam is placed after integrate, so the flag must still hold when
+    there is nothing to integrate — i.e. it is not accidentally coupled to the
+    merge path having run."""
+    origin, a, b = _clone_pair(tmp_path)
+    _commit_file(a, "from_a.txt", "a\n", "A: local work")
+
+    r = _run_push(a, *_default_flags("--no-push", "--strict"))
+    assert "skipping push decision" in r.stderr, r.stderr
+    # never reached the push-decision logging below the seam
+    assert "pushing " not in r.stderr, r.stderr
+    assert "nothing to push" not in r.stderr, r.stderr

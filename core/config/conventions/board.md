@@ -318,10 +318,21 @@ Two routing mechanisms close the "board post tagged with action items but no
 goal-queue consumer" gap. Both are read-only on the board (the post itself is
 the durable artifact); both write Apply/Investigate goals into the queue.
 
-| Mechanism | Origin signal | Trigger condition |
-|---|---|---|
-| `core/scripts/insight-trigger-gate.py` | `board_post:<msg_id>` | severity:invalidates findings; partial wiring — currently invoked from `/fresh-eyes-code` only |
-| `core/scripts/insight-trigger-sweep.py` (recurring g-115-754, 1h) | `insight_trigger:<msg_id>` | any severity; aged past 1h grace; scans the last 24h |
+| Mechanism | Origin signal | Channels read | Trigger condition |
+|---|---|---|---|
+| `core/scripts/insight-trigger-gate.py` | `board_post:<msg_id>` | `findings` only | severity:invalidates findings; partial wiring — currently invoked from `/fresh-eyes-code` only |
+| `core/scripts/insight-trigger-sweep.py` (recurring g-115-754) | `insight_trigger:<msg_id>` | **every live channel** (auto-discovered) | any severity; aged past 1h grace; scans the last 24h |
+
+The sweep's channel scope is discovered, not enumerated: it globs
+`world/board/*.jsonl` minus `-reads.jsonl` sidecars and `-archive.jsonl`
+rotations, so a newly created channel is swept the run after it appears. It
+was findings-only until 2026-07-29 (g-115-3925), which made a
+`requires_action_by:` tag posted anywhere else structurally unconvertible at
+any age — the tag is an explicit routing request and a channel is a topic
+hint, not a permission boundary. Each run reports `channels_scanned` in its
+`--json` summary; a silently-narrow scan was the defect, so the scope is
+output rather than inferable from source. The gate row above is still
+findings-only and is not currently wired into precheck.
 
 Dedup is asymmetric today: the sweep scans world + per-agent aspirations.jsonl
 for BOTH origin_signal formats before filing, so a post already filed by the
