@@ -37,12 +37,23 @@ review is the third moment: BEFORE applying fixes derived from review.
 4. **Pre-apply consultation** (MANDATORY for framework-file fixes:
    `core/`, `.claude/`, `world/conventions/`, `core/config/`):
    For each fix about to be applied, run
-   `bash core/scripts/retrieve.sh --category "<one-line fix description>" --depth shallow`,
-   read returned reasoning_bank + guardrails, look for entries that
-   describe the SAME fix pattern. If any CONTRADICTS the intended fix,
+   `bash core/scripts/retrieve.sh --category "<one-line fix description>" --depth shallow --include-framework`,
+   read returned reasoning_bank + guardrails + framework_rules, look for
+   entries that describe the SAME fix pattern. If any CONTRADICTS the intended fix,
    STOP — re-read, re-evaluate. Either apply the entry's pattern instead,
    OR retire the entry with justification if genuinely stale. If an
    entry REINFORCES the fix, increment its `utilization.times_helpful`.
+
+   `--include-framework` is load-bearing here, not optional (g-115-3777,
+   measured 2026-07-29). Without it the response has no `framework_rules`
+   key AT ALL — the `.claude/rules/*` and `core/config/conventions/*` files
+   are simply absent from the result, silently. That is the single worst
+   omission for THIS step, because a framework-file fix is exactly the case
+   where a convention or rule is most likely to already prescribe the
+   pattern. Measured on the query "fix the drain-temp purge glob so cited
+   evidence files are not deleted": bare call returned 15 tree nodes / 20 rb
+   / 20 guardrails and no framework key; adding the flag returned
+   `temp-store.md` — the convention that actually governs that fix.
 
    The `--category` parameter accepts free text — the engine runs
    token-overlap matching (Substring/Entity-index/Word-prefix/Concept)

@@ -134,8 +134,27 @@ def load_encoder(model_name):
                 cache = str(Path.home() / ".ayoai-emb")
             return _FastembedEncoder(
                 TextEmbedding(model_name=resolved, cache_dir=cache)), "fastembed"
-    except Exception:
-        pass
+    except Exception as exc:
+        #  (b): NEVER swallow this silently. A `pass` here is how the
+        # semantic retrieval channel stayed dead on a box for 17 days (2026-07-10
+        # to 2026-07-27) while every query still returned HTTP 200 — the fallback
+        # degraded results to token-overlap only, and nothing said so. The failure
+        # is soft by design (callers must keep working), but soft must not mean
+        # SILENT: emit one diagnostic naming the model and the reason so a dead
+        # channel is visible in daemon logs and to health probes.
+        #
+        # This is also where the latency goes. When fastembed cannot load a model
+        # the call falls through to SentenceTransformer() below, which under the
+        # offline posture searches the HF cache layout before failing — measured
+        # ~28s cold on a box where sentence-transformers IS installed. On a box
+        # without it the fallback raises immediately (0.13s measured here), so the
+        # cost is paid only on ST-provisioned boxes.
+        import sys
+        print("[embedding-model] fastembed backend unavailable for "
+              "%r (%s: %s) — falling back to sentence-transformers; "
+              "if that also fails, retrieval degrades to token-overlap only"
+              % (model_name, type(exc).__name__, str(exc)[:160]),
+              file=sys.stderr)
     from sentence_transformers import SentenceTransformer
     return _STEncoder(SentenceTransformer(model_name), model_name), \
         "sentence-transformers"

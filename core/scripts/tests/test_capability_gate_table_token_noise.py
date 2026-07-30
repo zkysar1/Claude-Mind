@@ -27,6 +27,19 @@ the new stopwords). "verified" is a distinct token from the imperative
 asserted below.
 
 Subprocess + fixture shape mirrors test_capability_gate_fence_stopwords.py.
+
+SUPERSEDED AS PRIMARY DEFENSE (g-115-3655, 2026-07-28). This guard was breached a
+SECOND time — 'never'/'registry' against the DynamoDB row, alongside
+'fenced'/'since' in the fence-stopwords sibling — because stopwording is
+per-incident: rows grow monotonically, so the next long row simply supplies the
+next colliding English word. The match surface is now BOUNDED at load time
+(_load_capability_routing emits `match_text` = cell 0 plus only identifier-shaped
+prose tokens), which removes row LENGTH as a matcher input entirely. The
+stopwords below stay as defense in depth; the structural property is pinned
+separately by test_capability_gate_row_prose_bound.py. Note that the tests in
+THIS file cannot detect over-restriction — a cell-0-only matcher passes every
+assertion here while silently breaking true-positive detection (measured), which
+is why the structural file carries its own recall controls.
 """
 from __future__ import annotations
 

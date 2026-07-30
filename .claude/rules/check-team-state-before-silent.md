@@ -28,7 +28,7 @@ slower (e.g., a daily-cadence reviewer agent).
    ```bash
    bash core/scripts/liveness-check.sh --agent <partner> --json
    ```
-   Returns `alive` | `dormant` | `unknown`. It reads `last_active` (daemon-routed)
+   Returns `alive` | `dormant` | `unknown` | `retired`. It reads `last_active` (daemon-routed)
    AND, only when that looks stale, cross-checks an INHERENTLY-FRESH signal — the
    partner's team-state shard's last-write time read from the AUTHORITATIVE store
    rather than the local mirror. This defeats the read-side lie where the daemon
@@ -40,6 +40,20 @@ slower (e.g., a daily-cadence reviewer agent).
    minutes earlier → verdict correctly `alive`). Conclude silence ONLY on
    `dormant`; `unknown` means the fresh signal was unreadable — do NOT conclude
    dormant on `unknown`.
+
+   `retired` (g-115-3702) means the agent is DECOMMISSIONED, not merely quiet —
+   its shard carries a retirement tombstone. Do not route work to it, do not
+   wait on it, and do not file a "partner silent" finding about it; it is not
+   coming back unless someone revives it (a heartbeat newer than `retired_at`
+   un-retires the row automatically). This verdict exists because retirement is
+   a tombstone rather than a delete: the shard SURVIVES and keeps getting
+   written, so the freshness signals alone reported a decommissioned agent as
+   `alive` indefinitely — and the retirement write itself refreshed that signal,
+   making a just-retired agent look MORE alive. Measured on the `meta-tiebreaker`
+   phantom: `retired_at 17:08:19`, authoritative-store push `17:08:20`, verdict
+   `alive` 2.8h later. Note `retired` is deliberately NOT `dormant`: consumers
+   that act on dormancy (goal-selector's `_liveness_confirms_dormant`) see False
+   and keep goals routed, which is the fail-safe direction.
 
    **Underlying raw signal** (what the helper wraps; use directly only when you
    just need the pushed snapshot value, not a liveness verdict):

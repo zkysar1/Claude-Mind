@@ -19,6 +19,30 @@ Create a new baseline entry ONLY when all three hold:
 If the metric is a ratio, latency, or anything continuous — use a different
 mechanism (gates, thresholds, alerts). Not this file.
 
+## Seeding
+
+**Measure the seed with the EXACT predicate that ships — never an exploratory
+one.** While developing a ratchet you will run several throwaway greps to size
+the problem. The number one of those produced is not the seed. Run the shipped
+check, read the number IT reports, and seed that.
+
+A seed measured by a different predicate is an answer to a question nobody will
+ask again. The lucky failure is what happened in g-115-3560: seeded at 12 from
+an exploratory regex, shipped a slightly broader one, and the check landed
+**FAIL at 13/12** on its first run — caught immediately because the discrepancy
+was loud. The unlucky failure is a seed measured by a *narrower* predicate,
+which lands GREEN and silently encodes the wrong population as "no drift".
+
+Seed **after** any repairs the same goal makes, not before, or the baseline
+memorialises drift you already fixed. Then re-run the shipped check once and
+confirm it reports `STABLE:` against the value you just wrote — a seed you have
+not read back is a claim, not a measurement.
+
+Same root as `guard-920` (a regression test must replicate the literal shape its
+production call site passes, not the contract-ideal shape) and `rb-245` (verify
+the population exists before believing a zero) — measure the real thing, not the
+convenient stand-in.
+
 ## Schema
 
 ```yaml
@@ -67,6 +91,8 @@ pattern-signatures, and the knowledge tree. Baseline seeded 2026-04-23 at 0.
 ## Anti-patterns
 
 - Baselining a ratio or continuous metric (wrong tool — use a gate)
+- Seeding from an exploratory measurement instead of the shipped predicate's own
+  output (see § Seeding — a narrower stand-in seeds GREEN and hides the drift)
 - Letting the baseline grow on regression (defeats the ratchet)
 - Keeping unbounded history (current cap: 50 entries, enforced by writer)
 - Using this file as a dashboard replacement (it's a guard, not a feed)

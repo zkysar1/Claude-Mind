@@ -53,6 +53,19 @@ or has to be undone. In particular:
    model prior) lands changes on wrong lines, overwrites concurrent
    modifications, or targets content that no longer exists. See
    `.claude/rules/read-before-edit.md`.
+11. **Filing a discovered-work goal that prescribes a fix** — the
+   sibling of #5, and the one most often skipped, because filing feels
+   like recording rather than deciding. A goal written the moment a
+   problem lands splits into a measured DIAGNOSIS and an unmeasured
+   REMEDY: the diagnosis carries the evidence that motivated the filing,
+   the remedy carries only momentum. Whoever executes it then inherits
+   that remedy as scope and implements it, because the goal reads as
+   evidence-backed throughout. Retrieve against the *remedy* before
+   writing it down — the cheaper fix is often already encoded. See
+   `rb-5669` (a runtime-provisioning goal whose one-line remedy was
+   already in the knowledge tree, and collapsed to one command on
+   execution) and `guard-1719` (the same diagnosis-vs-remedy split seen
+   from the guardrail-reading side).
 
 If you find yourself making one of these decisions without having
 retrieved in the same turn, STOP and retrieve first.
@@ -66,7 +79,7 @@ right shape:
 |----------------|------------|
 | Goal/topic is clearly categorized | `retrieve.sh --category <cat> --depth medium` |
 | Free-text query (no exact category) | `retrieve.sh --category "<free text>" --depth shallow` (engine does token-overlap; supplementary stores fall back to title/content/tags matching when category match returns empty — see retrieval-triggers.md G9 / R3) |
-| Pre-apply consultation for framework-file fix | `retrieve.sh --category "<one-line fix description>" --depth shallow` |
+| Pre-apply consultation for framework-file fix | `retrieve.sh --category "<one-line fix description>" --depth shallow --include-framework` (the flag is REQUIRED here, not optional — without it the response carries no `framework_rules` key at all, so the rules/conventions most likely to already prescribe the fix are silently absent; g-115-3777) |
 | Reader mode / observer session (side-effect-free) | `retrieve.sh --category <q> --read-only` |
 | Need full-body content of supplementary entries | `retrieve.sh --category <cat> --full-content` (opt-in; default is metadata-only) |
 | Goal-execution retrieval (writes retrieval-session.json) | `retrieve.sh --category <cat> --goal <goal-id> --tree-nodes "<comma-keys>"` |
@@ -121,6 +134,10 @@ knowledge.
   retrieval of RB about prior probe attempts and shape
 - Applying a framework-file fix without running the pre-apply
   consultation step in `code-review-protocol.md`
+- Filing a goal whose description prescribes a fix, having retrieved
+  against the problem but never against the proposed remedy — the
+  diagnosis half is what motivated the filing, so it is the half that
+  gets evidence, and the remedy rides along unmeasured
 
 ## Enforcement
 

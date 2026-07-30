@@ -9,7 +9,7 @@ locked_append_jsonl.
 Visibility-only: fail-silent on ALL errors (sys.exit 0 every path).
 Visibility hook MUST NEVER block tool execution.
 
- — Magic-wand framework improvement #1 (cross-agent presence).
+g-115-411 — Magic-wand framework improvement #1 (cross-agent presence).
 Polish layer over per-iteration team-state.last_active heartbeat: per-tool-call
 visibility so bravo can see alpha is mid-execution on a 10-minute goal without
 waiting for the next heartbeat tick. Lock contention: zero cross-agent (each

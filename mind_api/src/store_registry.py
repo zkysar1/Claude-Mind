@@ -76,6 +76,25 @@ class StoreSpec:
     increment_prefix: str = ""
     # Valid increment counters (UTILIZATION_COUNTERS for rb/guard).
     increment_counters: FrozenSet[str] = frozenset()
+    # set-field stamps this field on every successful field write, giving
+    # cross-box merge an explicit recency key for content fields ( /
+    # guard-1703). The stamp is a PER-FIELD MAP — {<written-field>: <iso-ts>} —
+    # not a record-level scalar (): the guardrail merge handler resolves
+    # FIELD BY FIELD, so a record-level key would mean "the newer write wins every
+    # content field" and would discard a concurrent amendment to a different field
+    # of the same record. guard-1153: LWW must key on a timestamp written by the
+    # SAME MUTATION that writes the field. None => no stamp (the default; the
+    # other stores keep their existing behavior unchanged).
+    #
+    # Scoped to set-field ONLY, deliberately. `increment` is excluded because a
+    # utilization bump is not a content amendment and the merge already resolves
+    # counters by per-counter MAX; stamping there would make an unrelated
+    # increment win a content tiebreak. `append` is excluded because a new
+    # record's `created` already orders it.
+    #
+    # MUST be present in the store's KNOWN_FIELDS allowlist — set_field stamps
+    # before it validates, so an unallowlisted stamp self-rejects every write.
+    amend_stamp_field: Optional[str] = None
 
 
 def apply_defaults(rec: dict, defaults: Dict[str, Any]) -> dict:
@@ -255,6 +274,24 @@ RB_DEFAULT_FIELDS = {
     # core/scripts/reasoning-bank.py.
     "valid_from": None,
     "valid_to": None,
+    # amended_fields (): PER-FIELD in-place amendment stamps,
+    # {<field-name>: <iso-timestamp>} — the ordering key
+    # coordination_merge._merge_rb_record needs to keep the NEWER text when two
+    # boxes hold divergent copies of one record. Same mechanism GUARD_DEFAULT_FIELDS
+    # carries (); see that comment for the byte-order derivation and for
+    # why the stamp is per-field rather than a record-level scalar.
+    #
+    # The reasoning bank's EXPOSURE IS WORSE than the guardrail case: _guard_identity
+    # keys on (created, FULL rule) so a guardrail's primary payload is immune (a
+    # divergent rule splits into two records), whereas _rb_identity keys on
+    # (created, TITLE), leaving `content` — the PRIMARY payload — a mutable
+    # non-identity field that reached the byte-order tiebreak directly.
+    #
+    # Declared HERE and not in an explicit RB_KNOWN_FIELDS set on purpose: default
+    # fields flow into the allowlist automatically, and the allowlist entry is
+    # load-bearing because set_field stamps BEFORE it validates — an unallowlisted
+    # stamp field would self-reject every write to this store.
+    "amended_fields": {},
     "when_to_use": {"conditions": [], "category": ""},
     "utilization": {
         "retrieval_count": 0,
@@ -283,6 +320,36 @@ GUARD_DEFAULT_FIELDS = {
     # core/scripts/reasoning-bank.py.
     "valid_from": None,
     "valid_to": None,
+    # amended_fields (): PER-FIELD in-place amendment stamps,
+    # {<field-name>: <iso-timestamp>} — the ordering key
+    # coordination_merge._merge_guard_record needs to keep the NEWER text when two
+    # boxes hold divergent versions of the same guardrail. Its generic tiebreak
+    # decides by byte order, which is unrelated to recency (an appended clause
+    # starting with a space loses to the text it extends; one starting with a
+    # comma wins) — so the merge needs an explicit stamp.
+    #
+    # WHY PER-FIELD, not the record-level scalar this replaces ():
+    # _merge_guard_record merges FIELD BY FIELD, so a record-level key silently
+    # means "the newer WRITE wins every content field" — discarding a concurrent
+    # amendment to a DIFFERENT field of the same guardrail. guard-1153 names the
+    # correct shape directly: LWW on a timestamp written BY THE SAME MUTATION that
+    # writes the field. A record-level stamp is that guard's "UNCORRELATED
+    # timestamp" failure mode.
+    #
+    # Declared HERE rather than in the explicit set below so it flows into
+    # GUARD_KNOWN_FIELDS automatically, exactly as valid_from/valid_to do. That
+    # placement is load-bearing, not stylistic: set_field applies the stamp and
+    # THEN validates, so an unallowlisted stamp would make every guardrail field
+    # write self-reject. Written by the set-field writer via
+    # StoreSpec.amend_stamp_field.
+    "amended_fields": {},
+    # amended_at: the RETIRED record-level scalar (live only on records written
+    # between d30d21bd and ). Kept in the allowlist — NOT as a writer
+    # target — so those records still validate on their next write, and read as a
+    # per-field FLOOR by _merge_guard_record's migration path. Removing it would
+    # make every already-stamped record self-reject (rb-2148: add the sibling
+    # field, never break the locked one).
+    "amended_at": None,
     "when_to_use": {"conditions": [], "category": ""},
     "utilization": {
         "retrieval_count": 0,
@@ -314,6 +381,20 @@ GUARD_KNOWN_FIELDS = (
         "auto_flagged_for_review",
         "retirement_date",
         "retirement_reason",
+        # displaced_from (): SOURCE WRITER is
+        # coordination_merge.py::_merge_id_keyed_jsonl (~L321-323), the
+        # collision-reid path — when two boxes independently mint the same
+        # guard-N for different records, one is re-id'd and stamped with the id
+        # it was displaced from. The field was never added here, so the strict
+        # unknown-field gate below REFUSED every update to any re-id'd record:
+        # 5 live guardrails (guard-1262, guard-1468, guard-1546, guard-1570,
+        # guard-1697) could not be retired, amended, or corrected at all, and
+        # the refusal names `displaced_from` rather than the field the caller
+        # actually passed — so it reads as a caller bug. Measured while
+        # reconciling forked guardrails; the reid stamp is also the merge's own
+        # fingerprint of the fork (guard-1697 displaced_from guard-1475 is
+        # exactly one of the reconciled pairs).
+        "displaced_from",
     }
 )
 
@@ -580,6 +661,18 @@ PATSIG_DEFAULT_FIELDS = {
     "confused_with": [],
     "validation_status": "unvalidated",
     "last_matched": None,
+    # amended_fields (): PER-FIELD in-place amendment stamps,
+    # {<field-name>: <iso-timestamp>}. Same mechanism GUARD_DEFAULT_FIELDS
+    # () and RB_DEFAULT_FIELDS carry; see the GUARD comment for the
+    # byte-order derivation and for why the stamp is per-field, not record-level.
+    #
+    # EXPOSURE MEASURED, not assumed (probe, 2026-07-28): _sig_identity keys on
+    # (created, name), so `name` is immune — a divergent name SPLITS into two
+    # records. `description` and `expected_outcome` are the amendable NON-identity
+    # free-text fields (both live on real records, both PATSIG_REQUIRED_FIELDS),
+    # and merging description='base text' against 'base text and more' returned
+    # 'base text' — the amendment was reverted.
+    "amended_fields": {},
 }
 
 
@@ -774,6 +867,7 @@ STORE_REGISTRY: Dict[str, StoreSpec] = {
         immutable_fields=frozenset({"created"}),
         increment_prefix="utilization.",
         increment_counters=UTILIZATION_COUNTERS,
+        amend_stamp_field="amended_fields",
     ),
     "guardrails": StoreSpec(
         path=lambda ctx: ctx.paths.world / "guardrails.jsonl",
@@ -791,6 +885,7 @@ STORE_REGISTRY: Dict[str, StoreSpec] = {
         immutable_fields=frozenset({"created"}),
         increment_prefix="utilization.",
         increment_counters=UTILIZATION_COUNTERS,
+        amend_stamp_field="amended_fields",
     ),
     "pattern-signatures": StoreSpec(
         path=lambda ctx: ctx.paths.world / "pattern-signatures.jsonl",
@@ -806,6 +901,7 @@ STORE_REGISTRY: Dict[str, StoreSpec] = {
         recompute=_recompute_patsig_accuracy,
         recompute_on_fields=frozenset({"outcome_stats"}),
         immutable_fields=frozenset({"created"}),
+        amend_stamp_field="amended_fields",
     ),
     "spark-questions": StoreSpec(
         path=lambda ctx: ctx.paths.meta / "spark-questions.jsonl",

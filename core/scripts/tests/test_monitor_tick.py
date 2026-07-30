@@ -246,7 +246,7 @@ def test_tripped_files_exactly_one_deduped_goal_end_to_end(tmp_path):
 
     assert len(r1["filed"]) == 1
     assert r2["filed"] == [] and r2["deduped"] == ["p1"]
-    assert filed == [""]       # exactly ONE goal across both trips
+    assert filed == ["g-115-8000"]       # exactly ONE goal across both trips
 
 
 # ---- E1: external-path resolution (world/ meta/ -> external dirs) ----------

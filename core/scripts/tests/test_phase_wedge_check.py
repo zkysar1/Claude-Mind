@@ -1,7 +1,7 @@
 """test_phase_wedge_check.py — unit + regression test for .
 
 phase-wedge-check.py is recovery-gate Path D: the wedged-loop detector for the
-2026-07-04 own-cloud fleet-wedge ( failures #4/#5). A loop wedged behind
+2026-07-04 own-cloud fleet-wedge (g-328-19 failures #4/#5). A loop wedged behind
 a ``_fileops.acquire_lock`` storage failure keeps its DDB heartbeat FRESH while
 diary writes stall, freezing the execution-diary at an unclosed ``phase_start``.
 Recovery-gate Paths A/C both require the heartbeat STALE, so a fresh heartbeat
@@ -125,7 +125,7 @@ def test_clean_old_orphan_followed_by_activity(tmp_path):
     (g-115-22, 394m) false-positive that this fix eliminated.
     """
     diary = _write_diary(tmp_path / "d.jsonl", [
-        _entry("phase_start", "phase-4-execute", 150, ""),   # orphan, never closed
+        _entry("phase_start", "phase-4-execute", 150, "g-115-22"),   # orphan, never closed
         _entry("phase_start", "phase-0-precheck", 10, "g-500-04"),
         _entry("phase_end", "phase-0-precheck", 8, "g-500-04"),
     ])
@@ -153,7 +153,7 @@ def test_wedged_when_last_start_is_old_despite_earlier_pairs(tmp_path):
     diary = _write_diary(tmp_path / "d.jsonl", [
         _entry("phase_start", "phase-2-select", 100, "g-500-06"),
         _entry("phase_end", "phase-2-select", 95, "g-500-06"),
-        _entry("phase_start", "phase-0-precheck", 90, ""),   # wedged here
+        _entry("phase_start", "phase-0-precheck", 90, "g-500-06"),   # wedged here
     ])
     r = WEDGE.check_wedge(diary, BASE_NOW, 45.0)
     assert r["verdict"] == "wedged"

@@ -412,6 +412,40 @@ def main():
             scanned += 1
             if g.get("status") not in ("pending", "in-progress"):
                 continue
+            # A recurring goal is a STANDING CADENCE and can never be
+            # superseded by sibling decomposition (). Siblings that
+            # HARDEN what a recurring goal invokes improve the cadence, they do
+            # not retire it — consolidate-before-expand.md rule 5, "improvement
+            # is not redundancy". Placed here deliberately: after `scanned` (so
+            # the scan count stays honest) and before BOTH lanes' `eligible`
+            # bump (so a recurring goal never reports as an eligible candidate).
+            #
+            # Measured before the fix:  ("Recurring: run
+            # infra-streak-notify.sh...", recurring=True, interval 16.2h,
+            # achievedCount=174, currentStreak=4, status=pending) had been
+            # reported eligible with action=mark_failed for 235h — ~10 days of
+            # write attempts refused only by a downstream guard the sweep never
+            # consults. Both outcomes were bad: keep failing and the sweep
+            # permanently pollutes its own candidate signal; ever succeed and it
+            # terminally closes a 174-completion cadence, which
+            # aspirations-recover-recurring would then flip back — a close/
+            # recover churn loop between two components each believing itself
+            # correct. Excluding at the predicate (not relying on the refusal)
+            # is the fix: a guard you only discover by reading a failed write is
+            # not a guard this sweep is honoring.
+            if g.get("recurring"):
+                details.append({
+                    "goal_id": g.get("id"),
+                    "aspiration_id": asp.get("id"),
+                    "lane": lane,
+                    "action": "skipped",
+                    "reason": ("recurring goal — a standing cadence cannot be "
+                               "superseded by sibling decomposition "
+                               "(achievedCount="
+                               f"{g.get('achievedCount')}, interval_hours="
+                               f"{g.get('interval_hours')})"),
+                })
+                continue
             if g.get("deferred_until"):
                 # Structured time gate is authoritative — same skip rule
                 # as defer-recheck.py.

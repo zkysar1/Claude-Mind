@@ -284,7 +284,7 @@ def test_recommended_matches_current_corrected():
     mod = _import_sweep()
     g = {"id": "g-115-1528", "description": _MISMATCH_DESC_G315_219,
          "origin_signal": "routing-mismatch:g-315-219"}
-    idx = {"": "echo"}  # target re-stamped to the recommendation
+    idx = {"g-315-219": "echo"}  # target re-stamped to the recommendation
     matched, recommended, current = mod._recommended_matches_current(g, "g-315-219", idx)
     assert matched is True
     assert recommended == "echo"
@@ -297,7 +297,7 @@ def test_recommended_matches_current_not_yet_corrected():
     mod = _import_sweep()
     g = {"id": "g-115-1528", "description": _MISMATCH_DESC_G315_219,
          "origin_signal": "routing-mismatch:g-315-219"}
-    idx = {"": "alpha"}  # still the stamped agent
+    idx = {"g-315-219": "alpha"}  # still the stamped agent
     matched, recommended, current = mod._recommended_matches_current(g, "g-315-219", idx)
     assert matched is False
     assert recommended == "echo"

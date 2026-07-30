@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -418,6 +419,29 @@ def test_fired_in_consumption_window_slow_resume_gap_within_widened_bound_true()
     assert spark_fire_dedup.fired_in_consumption_window(fired, "g-XYZ-1", _NOW) is True
 
 
+def test_fired_in_consumption_window_at_lower_bound_exactly_true():
+    """: the lower bound is INCLUSIVE (`lo <= ts`), so a fire at
+    exactly MAX_BG_CLOSE_DURATION_MIN before set_at still counts as this close's
+    consumption -> skip. Sibling tests bracket this at 10m30s (True) and 20m
+    (False) but neither pins the boundary itself, so an accidental `lo < ts`
+    would pass the whole suite. Bound is DERIVED from the module constant
+    (guard-1648): widening MAX_BG_CLOSE_DURATION_MIN moves this case with it
+    rather than silently un-pinning the boundary."""
+    lb = spark_fire_dedup.MAX_BG_CLOSE_DURATION_MIN
+    fired = {"g-XYZ-1": (_NOW - timedelta(minutes=lb)).isoformat(timespec="seconds")}
+    assert spark_fire_dedup.fired_in_consumption_window(fired, "g-XYZ-1", _NOW) is True
+
+
+def test_fired_in_consumption_window_one_second_past_lower_bound_false():
+    """The exclusive side of the same boundary: one second beyond the lookback
+    is a genuine PRIOR close -> fire. Paired with the test above, this pins the
+    bound as a real edge — without it, a window widened to infinity would also
+    satisfy the inclusive case."""
+    lb = spark_fire_dedup.MAX_BG_CLOSE_DURATION_MIN
+    fired = {"g-XYZ-1": (_NOW - timedelta(minutes=lb, seconds=1)).isoformat(timespec="seconds")}
+    assert spark_fire_dedup.fired_in_consumption_window(fired, "g-XYZ-1", _NOW) is False
+
+
 def test_fired_in_consumption_window_far_future_beyond_ttl_false():
     """A fire far beyond set_at + TTL (clock skew / a stale entry past the
     sentinel's ~60-min life) is not this close's consumption -> fire. Pins the
@@ -477,8 +501,16 @@ def test_consumer_phase_minus_0_5c_2_has_dedup_check():
 
 def test_consumer_passes_sentinel_set_at():
     """aspirations/SKILL.md Phase -0.5c.2 must pass --sentinel-set-at to the
-    dedup check so dedup is consumption-based (skip iff fired_at >= set_at)
-    rather than the time-window heuristic that false-fired (g-115-1404)."""
+    dedup check so dedup is consumption-based (skip iff fired_at lands in the
+    window BRACKETING set_at, [set_at - 15min, set_at + 60min]) rather than the
+    time-window heuristic that false-fired (g-115-1404). NOT the strict
+    `fired_at >= set_at` test — that was retired by g-306-80/rb-2615 because on
+    the non-recurring path the in-turn Phase-6 spark fires BEFORE
+    do_state_update writes set_at, making fired_at < set_at the NORMAL shape
+    there. (g-115-3264 asserted the retired rule as current and concluded the
+    dedup was structurally dead on that path; whether it read this phrasing is
+    not recorded — the observation is only that both stated the same retired
+    test.)"""
     skill_md = (
         SCRIPT_DIR.parent.parent.parent
         / ".claude" / "skills" / "aspirations" / "SKILL.md"
@@ -636,6 +668,240 @@ def test_cli_check_malformed_set_at_falls_back_to_window():
     )
     assert out == "skip"
     assert rc == 1
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  /  — write-site elimination of the dedup window.
+#
+# The read-side lookback (MAX_BG_CLOSE_DURATION_MIN) was outgrown FOUR times
+# because on the NON-recurring path it was bounding the LLM's Phase-6 work,
+# which is unbounded by design. The fix stops writing the sentinel at all when
+# an in-turn spark is already recorded, so no timing window is consulted.
+#
+# The four field measurements below are INCIDENT DATA (real gaps, real dates),
+# used as regression fixtures. They are deliberately hardcoded — guard-1220
+# forbids restating the OTHER COMPONENT's expectation, not pinning observed
+# incident values.
+# ══════════════════════════════════════════════════════════════════════════
+
+# (goal_id, fired_at, set_at, gap_label) — every one returned a FALSE `fire`.
+FIELD_MEASUREMENTS = [
+    ("g-115-3338", "2026-07-26T16:27:36", "2026-07-26T16:42:45", "15m09s (zeta)"),
+    ("g-115-3576", "2026-07-28T01:20:58", "2026-07-28T01:36:18", "15m20s (bravo)"),
+    ("g-115-3632", "2026-07-28T08:58:40", "2026-07-28T09:13:47", "15m07s (zeta)"),
+    ("g-335-392",  "2026-07-28T17:21:26", "2026-07-28T17:37:57", "16m31s (alpha)"),
+    ("g-115-3597", "2026-07-28T02:53:45", "2026-07-28T03:17:45", "24m00s (g-115-3609)"),
+]
+
+
+def _writer_producer_literal() -> str:
+    """Read the `producer` literal the WRITER (iteration-close.sh) actually
+    emits into the sentinel payload.
+
+    guard-1220: for a bug spanning a producer and a consumer, the expected value
+    MUST be read from the other component at runtime — never restated by the
+    test. If this test hardcoded "nonrecurring-state-update" it would be
+    self-consistent with the reader alone and could NOT fail on the exact
+    boundary mismatch it exists to catch (the reader's constant drifting away
+    from the writer's literal). Same lesson as rb-5562: when a pre-commit
+    boundary forbids a shared constant, the coupling has to be a test that reads
+    the other side as text.
+    """
+    src = ITERATION_CLOSE_SH.read_text(encoding="utf-8", errors="replace")
+    m = re.search(r'"producer":\s*"([^"]+)"', src)
+    assert m, "iteration-close.sh no longer emits a `producer` field in the sentinel payload"
+    return m.group(1)
+
+
+def test_producer_literal_matches_between_writer_and_reader():
+    """BOUNDARY TEST (guard-1220). The writer's emitted literal and the reader's
+    NONRECURRING_PRODUCER constant are duplicated across a shell/python
+    boundary that admits no shared constant. Derive the expectation from the
+    writer, compare to the reader — so a drift on EITHER side goes red."""
+    assert _writer_producer_literal() == spark_fire_dedup.NONRECURRING_PRODUCER
+
+
+def test_write_site_consults_spark_fired_session_before_writing():
+    """The structural fix: do_state_update asks whether the spark already fired
+    BEFORE writing the sentinel. Without this call the window is back."""
+    src = ITERATION_CLOSE_SH.read_text(encoding="utf-8", errors="replace")
+    assert "spark-fire-dedup.py\" fired" in src or "spark-fire-dedup.py fired" in src, \
+        "do_state_update no longer invokes the `fired` write-side gate"
+    assert "spark_fired_session" in src, \
+        "do_state_update no longer reads the spark_fired_session map"
+    assert "skip-write" in src, "do_state_update no longer honors the skip-write verdict"
+
+
+def test_write_site_gate_precedes_the_wm_set():
+    """Ordering matters: the gate must be consulted BEFORE the wm-set that
+    writes the sentinel, or it cannot suppress anything."""
+    src = ITERATION_CLOSE_SH.read_text(encoding="utf-8", errors="replace")
+    gate_at = src.index("spark-fire-dedup.py")
+    set_at_idx = src.index("wm-set.sh\" pending_phase_6_spark")
+    assert gate_at < set_at_idx, "write-side gate must precede the sentinel wm-set"
+
+
+def test_consumer_passes_producer_flag():
+    """The read-side backstop only engages if the consumer forwards `producer`."""
+    skill_md = (CORE_SCRIPTS.parent.parent / ".claude" / "skills" / "aspirations" / "SKILL.md")
+    text = skill_md.read_text(encoding="utf-8", errors="replace")
+    assert "--producer" in text, "Phase -0.5c.2 no longer forwards --producer to the dedup check"
+
+
+# ---------------------------------------------------------------- already_fired
+
+def test_already_fired_present_true():
+    assert spark_fire_dedup.already_fired_this_close({"g-A": "2026-07-28T18:18:01"}, "g-A") is True
+
+
+def test_already_fired_absent_false():
+    assert spark_fire_dedup.already_fired_this_close({"g-A": "2026-07-28T18:18:01"}, "g-B") is False
+
+
+def test_already_fired_malformed_ts_false():
+    """Fail-open direction is INVERTED vs the read-side helpers: False here means
+    WRITE the sentinel, which is the safe answer on bad data."""
+    assert spark_fire_dedup.already_fired_this_close({"g-A": "garbage"}, "g-A") is False
+
+
+def test_already_fired_non_dict_false():
+    assert spark_fire_dedup.already_fired_this_close(None, "g-A") is False
+    assert spark_fire_dedup.already_fired_this_close("nope", "g-A") is False
+
+
+def test_already_fired_ignores_elapsed_time_entirely():
+    """THE POINT OF THE FIX. A fire 10 hours before set_at still suppresses the
+    write, because a non-recurring goal closes exactly once — there is no prior
+    close to mis-match. Any timestamp comparison reintroduces the uncalibratable
+    bound. If someone adds one back, this test goes red."""
+    ancient = (datetime.now() - timedelta(hours=10)).isoformat(timespec="seconds")
+    assert spark_fire_dedup.already_fired_this_close({"g-A": ancient}, "g-A") is True
+
+
+# ------------------------------------------------------------------ gap_seconds
+
+def test_gap_seconds_measures_uncensored_gap():
+    gap = spark_fire_dedup.gap_seconds(
+        {"g-A": "2026-07-28T18:18:01"}, "g-A",
+        datetime.fromisoformat("2026-07-28T18:25:21"),
+    )
+    assert gap == 440.0  # foxtrot's own correctly-deduped close — the uncensored class
+
+
+def test_gap_seconds_negative_when_fired_after_set_at():
+    gap = spark_fire_dedup.gap_seconds(
+        {"g-A": "2026-07-28T18:30:00"}, "g-A",
+        datetime.fromisoformat("2026-07-28T18:25:00"),
+    )
+    assert gap == -300.0
+
+
+def test_gap_seconds_none_when_absent_or_unparseable():
+    now = datetime.now()
+    assert spark_fire_dedup.gap_seconds({}, "g-A", now) is None
+    assert spark_fire_dedup.gap_seconds({"g-A": "junk"}, "g-A", now) is None
+    assert spark_fire_dedup.gap_seconds({"g-A": now.isoformat()}, "g-A", None) is None
+
+
+# --------------------------------------------- read-side backstop, both orderings
+
+def test_field_measurements_all_deduped_under_nonrecurring_producer():
+    """All FOUR real-world false-fires now SKIP. Each was a genuine in-turn spark
+    that the bounded lookback failed to recognize."""
+    for goal_id, fired_at, set_at, label in FIELD_MEASUREMENTS:
+        assert spark_fire_dedup.fired_in_consumption_window(
+            {goal_id: fired_at}, goal_id, datetime.fromisoformat(set_at),
+            lookback_minutes=spark_fire_dedup.UNBOUNDED_LOOKBACK,
+        ) is True, f"{label} should dedup under the unbounded lower bound"
+
+
+def test_field_measurements_all_false_fired_under_old_bounded_lookback():
+    """Pins the DEFECT itself: with the bounded lookback every one returns False
+    (fire). If this ever goes green, the regression fixture has drifted and the
+    test above proves nothing."""
+    for goal_id, fired_at, set_at, label in FIELD_MEASUREMENTS:
+        assert spark_fire_dedup.fired_in_consumption_window(
+            {goal_id: fired_at}, goal_id, datetime.fromisoformat(set_at),
+            lookback_minutes=spark_fire_dedup.MAX_BG_CLOSE_DURATION_MIN,
+        ) is False, f"{label} should have false-fired under the old bound"
+
+
+def test_unbounded_lookback_still_respects_upper_ttl_bound():
+    """Dropping the LOWER bound must not drop the upper one — a far-future stamp
+    (clock skew / stale entry beyond the sentinel's life) must still fire."""
+    assert spark_fire_dedup.fired_in_consumption_window(
+        {"g-A": "2026-07-28T23:59:00"}, "g-A",
+        datetime.fromisoformat("2026-07-28T18:00:00"),
+        lookback_minutes=spark_fire_dedup.UNBOUNDED_LOOKBACK,
+    ) is False
+
+
+def test_recurring_path_keeps_bounded_lookback_prior_close_still_fires():
+    """The recurring path must be UNTOUCHED: a genuine prior close (hours back,
+    recurring intervals are hours) must still FIRE. This is what the lower bound
+    is legitimately for, and why it is kept for that producer."""
+    assert spark_fire_dedup.fired_in_consumption_window(
+        {"g-R": "2026-07-28T02:00:00"}, "g-R",
+        datetime.fromisoformat("2026-07-28T18:00:00"),
+    ) is False
+
+
+def test_recurring_path_proactive_fire_still_skips():
+    """...while the proactive bg-timeout fire it was built for still SKIPs."""
+    assert spark_fire_dedup.fired_in_consumption_window(
+        {"g-R": "2026-07-28T17:55:00"}, "g-R",
+        datetime.fromisoformat("2026-07-28T18:00:00"),
+    ) is True
+
+
+# ------------------------------------------------------------------------- CLI
+
+def test_cli_fired_skip_write_and_reports_gap():
+    rc, out = _run_dedup_cli(
+        ["fired", "g-A", "--set-at", "2026-07-28T18:25:21"],
+        json.dumps({"g-A": "2026-07-28T18:18:01"}),
+    )
+    assert out.split("\t")[0] == "skip-write"
+    assert out.split("\t")[1] == "440"
+    assert rc == 1
+
+
+def test_cli_fired_write_when_no_entry():
+    rc, out = _run_dedup_cli(["fired", "g-B", "--set-at", "2026-07-28T18:25:21"],
+                             json.dumps({"g-A": "2026-07-28T18:18:01"}))
+    assert out == "write"
+    assert rc == 0
+
+
+def test_cli_fired_write_on_garbage_stdin():
+    """Fail-open: unparseable map → write the sentinel (never lose a spark)."""
+    rc, out = _run_dedup_cli(["fired", "g-A"], "{{{not json")
+    assert out == "write"
+    assert rc == 0
+
+
+def test_cli_check_producer_flag_drops_lower_bound():
+    """End-to-end through the CLI: the same input flips fire→skip purely on the
+    presence of the producer flag."""
+    stdin = json.dumps({"g-115-3338": "2026-07-26T16:27:36"})
+    _, without = _run_dedup_cli(
+        ["check", "g-115-3338", "--sentinel-set-at", "2026-07-26T16:42:45"], stdin)
+    _, with_prod = _run_dedup_cli(
+        ["check", "g-115-3338", "--sentinel-set-at", "2026-07-26T16:42:45",
+         "--producer", spark_fire_dedup.NONRECURRING_PRODUCER], stdin)
+    assert without == "fire"
+    assert with_prod == "skip"
+
+
+def test_cli_check_unknown_producer_keeps_bounded_behavior():
+    """Backward-compat: an empty or unrecognized producer (recurring-close.sh,
+    or any pre-g-115-3351 sentinel) must keep the bounded lookback."""
+    stdin = json.dumps({"g-115-3338": "2026-07-26T16:27:36"})
+    for prod in ("", "recurring-close", "something-else"):
+        _, out = _run_dedup_cli(
+            ["check", "g-115-3338", "--sentinel-set-at", "2026-07-26T16:42:45",
+             "--producer", prod], stdin)
+        assert out == "fire", f"producer={prod!r} must keep the bounded behavior"
 
 
 if __name__ == "__main__":

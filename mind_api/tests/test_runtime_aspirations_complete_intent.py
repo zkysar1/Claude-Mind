@@ -213,7 +213,7 @@ def test_complete_intent_insufficient_evidence(running_daemon):
     _seed_aspiration(world, asp)
 
     block = _valid_intent_block()
-    block["evidence_goal_ids"] = [""]  # Only 1, sprint requires 2
+    block["evidence_goal_ids"] = ["g-001-01"]  # Only 1, sprint requires 2
 
     status, body = _post(
         port, "/v1/aspirations/complete-intent",
@@ -261,7 +261,7 @@ def test_complete_intent_cross_contamination(running_daemon):
     _seed_aspiration(world, asp)
 
     block = _valid_intent_block()
-    block["superseded_goal_ids"] = [""]  #  is also in evidence
+    block["superseded_goal_ids"] = ["g-001-01"]  #  is also in evidence
 
     status, body = _post(
         port, "/v1/aspirations/complete-intent",

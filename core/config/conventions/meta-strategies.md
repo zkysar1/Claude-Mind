@@ -32,7 +32,7 @@ The agent reads these to guide improvement procedures and writes to them during 
 |--------|---------|--------|
 | `meta-read.sh <file> [--field <dotpath>] [--json]` | Read a meta-strategy file or field | YAML or JSON |
 | `meta-set.sh <file> <dotpath> <value>` | Set a field (bounds-validated, auto-logged) | Confirmation |
-| `meta-log-append.sh` | Append JSON from stdin to meta-log.jsonl | Confirmation |
+| `meta-log-append.sh` | Append JSON from stdin to meta-log.jsonl | `{"status":"logged","path":…,"offset":…,"bytes":…}` |
 | `meta-impk.sh compute --window <k> --metric <name>` | Compute improvement velocity | JSON |
 | `meta-impk.sh snapshot --goal-id <id> --learning-value <v>` | Record learning value for a goal | Confirmation |
 | `meta-experiment.sh create --strategy <file> --field <dotpath> --baseline <v> --variant <v>` | Create A/B experiment | JSON |
@@ -65,10 +65,39 @@ The agent reads these to guide improvement procedures and writes to them during 
 
 ### Mandatory logging:
 Every strategy change MUST be logged to `meta/meta-log.jsonl` via `meta-log-append.sh`.
-Each log entry receives a sequential `meta_change_id` (`mc-NNN`) automatically assigned by `meta-set.sh`:
 ```json
 {"date": "<ISO8601>", "meta_change_id": "mc-001", "strategy_file": "<file>", "field": "<dotpath>", "old_value": "<old>", "new_value": "<new>", "reason": "<justification>", "evidence": ["<experience/hypothesis IDs>"], "imp_k_at_change": <snapshot>}
 ```
+
+**`meta_change_id` is assigned by `meta-set.sh`, NOT by `meta-log-append.sh`.**
+`meta-set.sh` builds its own record and stamps the next sequential `mc-NNN`.
+`meta-log-append.sh` appends your JSON **verbatim** (the endpoint validates that
+it parses, nothing more) — so a record submitted through it carries whatever
+`meta_change_id` you put in it, or none at all. Do not expect one to appear.
+
+### Verifying an append landed (g-115-3534):
+Read the wrapper's confirmation — `offset` is the byte position the record was
+written at and `bytes` is its length, so `offset + bytes` must equal the store's
+new size, and `path` must be the meta root you expect (a daemon bound to a
+different root is otherwise invisible). That check is arithmetic and needs no
+second read.
+
+If you verify by reading the file instead, **grep for your record's content —
+do not inspect `tail`.** The store is append-ordered, not date-ordered: of 554
+records measured 2026-07-27, 287 carry a date-only `date` (`YYYY-MM-DD`), 239
+carry a full ISO timestamp, and 28 carry no date field at all. Under own-cloud
+the registered union merge handler for `meta-log.jsonl` can also reorder lines
+when reconciling two boxes. So position in the file is not evidence about
+recency, and absence from `tail` is not evidence a record is missing.
+
+Backfilling the 287 date-only records to full timestamps was **considered and
+rejected** (g-115-3534). It would fabricate a time-of-day that was never
+measured, and it would not make `tail` valid anyway: file order is already
+date order to within a single inversion (caused by a record with no `date` at
+all, not by the two date formats), and neither the 28 date-less records nor
+the merge handler's reordering is addressed by normalizing a format. The
+confirmation above verifies an append without depending on order at all, which
+is the cheaper fix and the one that shipped.
 
 ### Bounds enforcement:
 - Goal selection weights: [0.0, 3.0] per `core/config/meta.yaml` strategy_schemas

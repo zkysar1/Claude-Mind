@@ -20,7 +20,8 @@
 #
 #   always-run:  tree-debt-gate, experience-archival-gate, evolution-finalize-gate,
 #                fresh-eyes-code-gate, dependency-timeout-check,
-#                inbox-alert-age-check, handoff-aging-check
+#                inbox-alert-age-check, handoff-aging-check,
+#                user-blocker-escalation-check
 #                (the last two are the notification-age safety gates — escalate
 #                aged unclaimed work to external parties, so they fire reliably;
 #                . evolution-finalize-gate carries the guard-380
@@ -36,7 +37,12 @@
 #                restores the "last two" referent above, which BOTH fixes had
 #                broken by appending into that pair.)
 #   medium:      aspirations-recover-recurring, monitor-stale-check,
-#                precheck-eval, blocker-recheck, defer-recheck
+#                precheck-eval, blocker-recheck, defer-recheck,
+#                precondition-defer-recheck, recurring-starvation-check
+#                (recurring-starvation-check is deliberately NOT deferrable
+#                despite sitting among the deferrable sweeps: it exists because
+#                a 5-day recurring-lane blind spot went unnoticed, so it must
+#                not be the first thing dropped; )
 #   deferrable:  pending-questions-sweep, recurring-precondition-sweep,
 #                parent-supersession-sweep, unblock-parent-status-sweep,
 #                defer-drift-check, reason-less-blocked-check,
@@ -95,11 +101,11 @@ now_ms() {
 # Section PB check that asserts the SKILL.md tier table matches.
 sweep_tier() {
     case "$1" in
-        tree-debt-gate|experience-archival-gate|evolution-finalize-gate|fresh-eyes-code-gate|dependency-timeout-check|inbox-alert-age-check|handoff-aging-check)
+        tree-debt-gate|experience-archival-gate|evolution-finalize-gate|fresh-eyes-code-gate|dependency-timeout-check|inbox-alert-age-check|handoff-aging-check|user-blocker-escalation-check)
             echo "always-run" ;;
-        aspirations-recover-recurring|monitor-stale-check|precheck-eval|blocker-recheck|defer-recheck|precondition-defer-recheck)
+        aspirations-recover-recurring|monitor-stale-check|precheck-eval|blocker-recheck|defer-recheck|precondition-defer-recheck|recurring-starvation-check)
             echo "medium" ;;
-        pending-questions-sweep|recurring-precondition-sweep|parent-supersession-sweep|unblock-parent-status-sweep|routing-audit-target-status-sweep|credential-defer-recheck|defer-drift-check|reason-less-blocked-check|blocked-signal-resolution-check|fresh-eyes-cadence|fresh-eyes-program-cadence|fresh-eyes-tree-cadence|felt-sense-cadence|l1-skew-cadence|health-regression-cadence|curriculum-cadence|evolution-cadence)
+        pending-questions-sweep|recurring-precondition-sweep|parent-supersession-sweep|unblock-parent-status-sweep|routing-audit-target-status-sweep|credential-defer-recheck|defer-drift-check|reason-less-blocked-check|blocked-signal-resolution-check|reclaim-defer-audit|reclaim-user-participant-audit|fresh-eyes-cadence|fresh-eyes-program-cadence|fresh-eyes-tree-cadence|felt-sense-cadence|l1-skew-cadence|health-regression-cadence|curriculum-cadence|evolution-cadence)
             echo "deferrable" ;;
         *)
             # Unknown sweep name — surface to stderr so a missing registration

@@ -74,6 +74,25 @@ OUTCOME=""
 SOURCE=""
 SUMMARY=""
 OVERRIDE_UNCOMMITTED=""
+# : § STATE-UPDATE quality flags. iteration-close.sh has parsed these
+# since , but this wrapper did not — so `--artifacts-count` et al. exited
+# rc=2 "unknown flag" and a recurring deep close could never carry them.
+# What was and was NOT broken (measured 2026-07-28, don't re-derive):
+#   - `--tree-updated` was ALREADY reachable here, via the  auto-detect
+#     inside iteration-close do_state_update (probes iteration-checkpoint.json
+#     :selected_at against tree .md mtimes). Since state-update-audit.py:94 sets
+#     `measured = bool(tree_updated) or any(...)`, a recurring deep close that
+#     edited the tree before this wrapper ran was already measured.
+#   - The three VALUE flags had no auto-detect and no parser entry, so they were
+#     genuinely unreachable — the close was measured but never enriched.
+# Explicit beats inferred either way: passing --tree-updated makes the claim
+# auditable (and the  validator still IGNORES it, loudly, when no tree
+# edit is detectable since the anchor), so forwarding it is not redundant.
+TREE_UPDATED=""
+TREE_UPDATED_OVERRIDE=""
+ARTIFACTS_COUNT=""
+ENCODING_SCORE=""
+FINDINGS_COUNT=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -81,6 +100,19 @@ while [[ $# -gt 0 ]]; do
         --summary) SUMMARY="$2"; shift 2 ;;
         --outcome) OUTCOME="$2"; shift 2 ;;
         --goal)    GOAL_ID="$2"; shift 2 ;;
+        # § STATE-UPDATE quality flags — forwarded to iteration-close.sh
+        # --phase state-update ONLY (mirrors iteration-close.sh:179-186).
+        # Pass them on THIS call: guard-1235 rules out any post-hoc amend,
+        # because re-running state-update to add them re-fires journal-append
+        # and iteration-commit. (guard-1235 also cites goals_completed
+        # double-counting; that specific arm is stale — loop-state-bump-counters.py
+        # :473 is an idempotent per-goal_id no-op within a session. The
+        # do-not-re-run conclusion still stands on the other two writers.)
+        --tree-updated)          TREE_UPDATED="true"; shift ;;
+        --tree-updated-override) TREE_UPDATED_OVERRIDE="true"; shift ;;
+        --artifacts-count)       ARTIFACTS_COUNT="$2"; shift 2 ;;
+        --encoding-score)        ENCODING_SCORE="$2"; shift 2 ;;
+        --findings-count)        FINDINGS_COUNT="$2"; shift 2 ;;
         # Forward --override-uncommitted to iteration-close.sh do_verify
         # (the only wrapped phase that consumes it).  — was missing
         # the twin patch from b13325b which only updated iteration-close.sh.
@@ -102,6 +134,10 @@ done
 
 if [[ -z "$GOAL_ID" || -z "$OUTCOME" || -z "$SOURCE" ]]; then
     echo "Usage: recurring-close.sh <goal-id> <outcome-class> --source <world|agent> [--summary <text>]" >&2
+    echo "  deep closes may also pass the § STATE-UPDATE quality flags, forwarded to" >&2
+    echo "  --phase state-update: [--tree-updated] [--tree-updated-override]" >&2
+    echo "  [--artifacts-count N] [--encoding-score X] [--findings-count N]" >&2
+    echo "  Pass them on THIS call — there is no post-hoc amend (guard-1235)." >&2
     echo "  outcome-class ∈ {routine, deep}" >&2
     exit 2
 fi
@@ -260,8 +296,21 @@ run_phase() {
 VERIFY_EXTRA=()
 [[ -n "$OVERRIDE_UNCOMMITTED" ]] && VERIFY_EXTRA+=(--override-uncommitted "$OVERRIDE_UNCOMMITTED")
 
+# Build state-update-specific arg array — only this phase consumes the four
+# § STATE-UPDATE quality flags (). Each is appended only when the
+# caller supplied it, so an omitted flag leaves iteration-close.sh at exactly
+# its argparse default and the pre-existing behavior is byte-identical.
+# Deliberately NOT added to COMMON: verify and learning-gate reject unknown
+# flags, so a COMMON-level add would break every recurring close.
+STATE_EXTRA=()
+[[ "$TREE_UPDATED" == "true" ]]          && STATE_EXTRA+=(--tree-updated)
+[[ "$TREE_UPDATED_OVERRIDE" == "true" ]] && STATE_EXTRA+=(--tree-updated-override)
+[[ -n "$ARTIFACTS_COUNT" ]]              && STATE_EXTRA+=(--artifacts-count "$ARTIFACTS_COUNT")
+[[ -n "$ENCODING_SCORE" ]]               && STATE_EXTRA+=(--encoding-score "$ENCODING_SCORE")
+[[ -n "$FINDINGS_COUNT" ]]               && STATE_EXTRA+=(--findings-count "$FINDINGS_COUNT")
+
 run_phase verify           --phase verify           "${COMMON[@]}" --status completed --outcome "$OUTCOME" "${VERIFY_EXTRA[@]}"
-run_phase state-update     --phase state-update     "${COMMON[@]}" --outcome "$OUTCOME"
+run_phase state-update     --phase state-update     "${COMMON[@]}" --outcome "$OUTCOME" "${STATE_EXTRA[@]}"
 
 # ─── force_tree_encoding bypass-consumer (, follow-up rb-911 / ) ───
 # tree-encoding-drift-gate.py fires inside iteration-close state-update and writes

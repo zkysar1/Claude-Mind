@@ -19,6 +19,7 @@ reconfigure_stdio()
 
 from _paths import WORLD_DIR
 from _jsonl_helpers import set_nested_field
+from _surprise import apply_derived_surprise  # : surprise is DERIVED, not caller-supplied
 
 LIVE_PATH = WORLD_DIR / "pipeline.jsonl"
 ARCHIVE_PATH = WORLD_DIR / "pipeline-archive.jsonl"
@@ -425,6 +426,18 @@ def normalize_record(rec):
             if rec[new_name] is None and rec[old_name] is not None:
                 rec[new_name] = rec[old_name]
             del rec[old_name]
+
+    # SURPRISE IS DERIVED, NEVER ACCEPTED FROM THE CALLER ().
+    # Parity mirror of mind_api/src/world/pipeline_write.py::_normalize_record
+    # (guard-547: the daemon copy is the live write path under
+    # no-python-cli-fallback, so a CLI-only fix would miss production and a
+    # daemon-only fix would let this copy drift back). Both import the SAME
+    # helper from core/scripts/_surprise.py — there is one implementation of the
+    # arithmetic, which is the whole point: surprise is a pure function of
+    # (outcome, confidence), so a caller-supplied value is a second writer of a
+    # derived field. It drifted on 40.4% of scoreable records. Rationale, census
+    # and the None-vs-0 reasoning are in the daemon copy and in _surprise.py.
+    apply_derived_surprise(rec)
 
     # Derive slug from id if missing
     if "slug" not in rec and "id" in rec:

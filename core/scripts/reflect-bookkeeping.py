@@ -32,6 +32,12 @@ from pathlib import Path
 # : force utf-8 on stdin/stdout/stderr (covers Windows cp1252 fallback
 # when callers bypass the _platform.sh PYTHONIOENCODING=utf-8 shim).
 from _stdio import reconfigure_stdio  # noqa: E402
+# compute_surprise moved to core/scripts/_surprise.py () so the DAEMON
+# write path can import the same implementation. Re-exported here unchanged so
+# `MOD.compute_surprise` — the surface the rounding/case pins in
+# test_reflect_bookkeeping_batch_micro.py assert against — keeps working, and so
+# `surprise` subcommand callers need no change. Do NOT re-inline the arithmetic.
+from _surprise import compute_surprise  # noqa: E402,F401
 reconfigure_stdio()
 
 from _paths import AGENT_DIR, PROJECT_ROOT, CORE_ROOT, WORLD_DIR  # type: ignore
@@ -177,7 +183,11 @@ def cmd_encoding_score(args):
 def cmd_dual_classification(args):
     """Confidence + outcome → process-outcome dual classification."""
     outcome = args.outcome.upper()
-    conf = args.confidence
+    # The --confidence parser default is now a None SENTINEL (so `surprise` can
+    # tell omitted from explicit-0.5). This subcommand's historical 0.5 default
+    # is preserved HERE, unchanged in behavior — without this coercion the
+    # range check below would TypeError on None ().
+    conf = args.confidence if args.confidence is not None else 0.5
     if outcome not in ("CONFIRMED", "CORRECTED"):
         _emit({"error": f"outcome must be CONFIRMED or CORRECTED, got {outcome}"}, 2)
     if not (0.0 <= conf <= 1.0):
@@ -534,6 +544,55 @@ def _read_micro_hypotheses():
     return data.get("micro_hypotheses") or []
 
 
+# compute_surprise now lives in core/scripts/_surprise.py and is imported at the
+# top of this module (). It moved so the DAEMON write path
+# (mind_api/src/world/pipeline_write.py::_normalize_record) can import the SAME
+# implementation and DERIVE the stored value instead of accepting whatever the
+# caller supplied — 40.4% of scoreable stored values disagreed with this
+# function before that change. The arithmetic is unaltered by the move.
+
+
+def cmd_surprise(args):
+    """Emit the surprise score for one outcome/confidence pair."""
+    # --confidence must be given EXPLICITLY here: silently scoring an omitted
+    # confidence off a shared default would return a plausible-looking wrong
+    # answer. Detection is by None sentinel, NOT by scanning sys.argv for the
+    # bare "--confidence" token -- that sniff falsely refused the equals form
+    # (`--confidence=0.9`), which argparse accepts and which appears in argv as
+    # a single joined token. Caught by fresh-eyes on this same iteration
+    # (); the sentinel has no such blind spot because it reads what
+    # argparse actually parsed rather than re-parsing argv by hand.
+    if args.confidence is None:
+        _emit(
+            {
+                "error": "missing_confidence",
+                "detail": "surprise requires --confidence explicitly; "
+                "defaulting it would silently score a midpoint",
+            },
+            exit_code=2,
+        )
+        return
+    # Range-validate, mirroring cmd_dual_classification (the sibling consumer
+    # of this same flag). Without it a confidence of 5.0 scores surprise=50 and
+    # trips every >=7 promotion gate downstream.
+    if not (0.0 <= args.confidence <= 1.0):
+        _emit(
+            {"error": f"confidence must be 0..1, got {args.confidence}"},
+            exit_code=2,
+        )
+        return
+    surprise = compute_surprise(args.outcome, args.confidence)
+    _emit(
+        {
+            "subcommand": "surprise",
+            "outcome": args.outcome,
+            "confidence": args.confidence,
+            "surprise": surprise,
+            "high_surprise": surprise >= 7,
+        }
+    )
+
+
 def cmd_batch_micro(args):
     """Process the entire micro_hypotheses array as one batch."""
     micros = _read_micro_hypotheses()
@@ -581,12 +640,7 @@ def cmd_batch_micro(args):
     for idx, m in enumerate(micros):
         conf = m.get("confidence") or 0.0
         outcome = m.get("outcome")
-        if outcome == "corrected":
-            surprise = round(conf * 10)
-        elif outcome == "confirmed":
-            surprise = round((1.0 - conf) * 10)
-        else:
-            surprise = 0
+        surprise = compute_surprise(outcome, conf)
         m["surprise"] = surprise
 
         promote_reason = None
@@ -720,6 +774,7 @@ DISPATCH = {
     "context-gap": cmd_context_gap,
     "utilization-delta": cmd_utilization_delta,
     "batch-micro": cmd_batch_micro,
+    "surprise": cmd_surprise,
     "run-all": cmd_run_all,
 }
 
@@ -739,7 +794,12 @@ def main():
 
     # dual-classification inputs
     p.add_argument("--outcome", type=str, default=None)
-    p.add_argument("--confidence", type=float, default=0.5)
+    # default=None is a SENTINEL, not an absent default: `surprise` must
+    # distinguish "caller omitted this" from "caller passed 0.5", and reading
+    # argparse's parsed value is the only reliable way to tell (an argv scan
+    # misses the `--confidence=0.5` equals form). Consumers that want the old
+    # 0.5 default apply it themselves -- see cmd_dual_classification.
+    p.add_argument("--confidence", type=float, default=None)
 
     # convention-routing inputs
     p.add_argument("--lesson", type=str, default=None)

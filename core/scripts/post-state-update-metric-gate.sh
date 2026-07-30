@@ -62,12 +62,19 @@ emit_json() {
   CANDIDATES="${CANDIDATES:-}" \
   CANDIDATE_NODE_KEY="${CANDIDATE_NODE_KEY:-}" \
   CANDIDATE_NODE_FILE="${CANDIDATE_NODE_FILE:-}" \
+  TREE_PROBE="${TREE_PROBE:-}" \
   py -3 - <<'PYEOF'
 import json, os
 fired = os.environ.get("FIRED") == "true"
 dc = int(os.environ.get("DISTINCT_COUNT", "0") or "0")
 reason = os.environ.get("REASON") or ""
 out = {"fired": fired, "distinct_count": dc, "reason": reason}
+# : machine-readable probe state so a consumer can distinguish
+# "probed, no tree edit" from "could not probe" without parsing the prose
+# reason. Omitted on the early no-op paths that never reach the probe.
+tree_probe = os.environ.get("TREE_PROBE") or ""
+if tree_probe:
+    out["tree_probe"] = tree_probe
 if fired:
     cands_raw = os.environ.get("CANDIDATES") or ""
     out["candidates"] = [l.strip() for l in cands_raw.split("\x1f") if l.strip()][:20]
@@ -189,15 +196,43 @@ if [ "$DISTINCT_COUNT" -lt "$DISTINCT_COUNT_THRESHOLD" ]; then
 fi
 
 # Test case 5: tree edited since selected_at -> no-op (LLM already encoded)
+#
+# TREE_PROBE names what actually happened, so the fire-reason at the bottom can
+# distinguish "probed and found no tree edit" from "could not probe at all"
+# (). An explicit flag, not an implicit fall-through, per guard-137:
+# previously ANY of the three guards failing fell through to a hardcoded
+# "no tree edit since selected_at" -- asserting a negative the gate never
+# measured. That is the verify-before-assuming failure mode inside a gate whose
+# whole job is to judge whether encoding happened, and it fired twice against
+# tree nodes that HAD been edited (the  observation).
+TREE_PROBE="ran_no_edit"
 CHECKPOINT_FILE="$AGENT_DIR/session/iteration-checkpoint.json"
 if [ -f "$CHECKPOINT_FILE" ]; then
   SELECTED_AT=$(py -3 -c "import json,sys; d=json.load(open(sys.argv[1],encoding='utf-8')); print(d.get('selected_at',''))" "$CHECKPOINT_FILE" 2>/dev/null || true)
   if [ -n "$SELECTED_AT" ]; then
     if py -3 "$SCRIPT_DIR/tree-edit-since.py" "$SELECTED_AT" >/dev/null 2>&1; then
+      TREE_PROBE="ran_found_edit"
       FIRED=false DISTINCT_COUNT="$DISTINCT_COUNT" REASON="tree already edited since selected_at=$SELECTED_AT (LLM already encoded; no encoding-drift to signal)" emit_json
     fi
+  else
+    TREE_PROBE="unprobed_no_selected_at"
   fi
+else
+  TREE_PROBE="unprobed_no_checkpoint"
 fi
+
+# Honest reason text for each probe state. The gate still FIRES when the probe
+# was unavailable -- suppressing would convert a false assertion into a missed
+# encoding-drift signal, which is the worse error for a gate that exists to
+# catch un-encoded metrics. It just no longer claims a measurement it never took.
+case "$TREE_PROBE" in
+  ran_no_edit)
+    TREE_PROBE_REASON="no tree edit since selected_at" ;;
+  unprobed_no_selected_at)
+    TREE_PROBE_REASON="tree-edit probe UNAVAILABLE (iteration-checkpoint present but carries no selected_at) -- encoding state UNKNOWN, not verified-absent" ;;
+  *)
+    TREE_PROBE_REASON="tree-edit probe UNAVAILABLE (no iteration-checkpoint anchor; Phase 2.95 likely skipped this iteration) -- encoding state UNKNOWN, not verified-absent" ;;
+esac
 
 # Test case 6: sentinel idempotency -- compare candidate fingerprint vs
 # previously stored signal. If unchanged, dedup to no-op so re-running
@@ -283,7 +318,7 @@ fi
 # Fire -- sentinel will be written by caller (iteration-close.sh).
 FIRED=true \
 DISTINCT_COUNT="$DISTINCT_COUNT" \
-REASON="$DISTINCT_COUNT distinct numeric findings in outcome_note, no tree edit since selected_at" \
+REASON="$DISTINCT_COUNT distinct numeric findings in outcome_note, $TREE_PROBE_REASON" \
 CANDIDATES="$CANDIDATES" \
 CANDIDATE_NODE_KEY="$CANDIDATE_NODE_KEY" \
 CANDIDATE_NODE_FILE="$CANDIDATE_NODE_FILE" \

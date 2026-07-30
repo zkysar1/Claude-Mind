@@ -51,37 +51,45 @@ extract_query() {
   printf '%s\n' "$trace" | grep -E '^\+ QUERY=' | tail -1 | sed "s/^+ QUERY=//; s/^'//; s/'$//"
 }
 
+# The wrapper appends `&sid=<MIND_SID>` when a session id is present — ADDITIVE,
+# records-only ( slice 1, commit 19f05706a). Tests 1-4 were exact-equality
+# against the pre-3176 shape and went RED the moment it landed; nobody updated them
+# because this file was a main()-style .sh test referenced by NO aggregator (not
+# run-full-suite.sh, and not run-invisible-suites.sh — that runner globbed test_*.py
+# only), so no runner had ever reported it. Found 2026-07-29 only because a
+# fresh-eyes pass on an unrelated change to the same wrapper ran it by hand: 4 of 6
+# red. That gap is CLOSED (): run-invisible-suites.sh now globs test_*.sh
+# and test-*.sh as well, and run-full-suite.sh invokes that runner, so a future red
+# here is reported without anyone remembering this filename.
+#
+# Assert the base EXACTLY and allow ONLY a sid suffix. Do NOT relax to substring
+# matching (the shape tests 5-6 use): `[[ $q == *agent=zeta* ]]` is satisfied by a
+# query that ALSO carries a phantom `agent=world`, which is the precise defect this
+# file exists to catch. Tolerating the new field must not cost the old assertion.
+assert_query() {
+  local q="$1" base="$2" label="$3"
+  if [[ "$q" == "$base" ]] || [[ "$q" == "$base&sid="?* ]]; then
+    pass "$label → '$q'"
+  else
+    fail "expected '$base' (optionally + '&sid=<id>'), got '$q'"
+  fi
+}
+
 echo "Test 1: --source first then goal-id"
 q=$(extract_query --source world g-fake-test-001)
-if [[ "$q" == "id=g-fake-test-001&agent=zeta" ]]; then
-  pass "--source world g-fake-test-001 → '$q'"
-else
-  fail "expected 'id=g-fake-test-001&agent=zeta', got '$q'"
-fi
+assert_query "$q" "id=g-fake-test-001&agent=zeta" "--source world g-fake-test-001"
 
 echo "Test 2: goal-id first then --source (alpha-incident shape)"
 q=$(extract_query g-fake-test-002 --source world)
-if [[ "$q" == "id=g-fake-test-002&agent=zeta" ]]; then
-  pass "g-fake-test-002 --source world → '$q'"
-else
-  fail "expected 'id=g-fake-test-002&agent=zeta', got '$q'"
-fi
+assert_query "$q" "id=g-fake-test-002&agent=zeta" "g-fake-test-002 --source world"
 
 echo "Test 3: --source agent variant"
 q=$(extract_query --source agent g-fake-test-003)
-if [[ "$q" == "id=g-fake-test-003&agent=zeta" ]]; then
-  pass "--source agent g-fake-test-003 → '$q'"
-else
-  fail "expected 'id=g-fake-test-003&agent=zeta', got '$q'"
-fi
+assert_query "$q" "id=g-fake-test-003&agent=zeta" "--source agent g-fake-test-003"
 
 echo "Test 4: explicit positional agent overrides MIND_AGENT (no --source)"
 q=$(extract_query g-fake-test-004 alpha)
-if [[ "$q" == "id=g-fake-test-004&agent=alpha" ]]; then
-  pass "g-fake-test-004 alpha → '$q'"
-else
-  fail "expected 'id=g-fake-test-004&agent=alpha', got '$q'"
-fi
+assert_query "$q" "id=g-fake-test-004&agent=alpha" "g-fake-test-004 alpha"
 
 echo "Test 5: --cross-lane still works (regression)"
 q=$(extract_query g-fake-test-005 --cross-lane "regression check")
