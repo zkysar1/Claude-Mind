@@ -123,6 +123,18 @@ from _growth_log import (  # noqa: E402  # tree_growth_log SSOT,
     record_batch as _growth_record_batch,
     record_reparent as _growth_record_reparent,
 )
+# : DELEGATE the distill detector to the CLI rather than mirroring it.
+# The module docstring above explains why the OTHER helpers are copied verbatim:
+# importing tree.py runs its module-top `TREE_PATH = str(WORLD_DIR / ...)`, which
+# raises when WORLD_DIR is None. That reason does NOT apply here, measured rather
+# than assumed: tree.py is ALREADY imported in every live daemon process —
+# endpoints/__init__.py:40 loads .world.tree_read, whose module top does
+# `from tree import ...` (tree_read.py:44), and core/scripts/tree.py is a pinned
+# entry on the daemon import surface (mind-api-code-changed.sh:165). So this
+# import adds no new failure mode; it binds a module the process already holds.
+from tree import (  # noqa: E402
+    get_distill_candidates as _cli_get_distill_candidates,
+)
 
 
 VALID_OPS = {"add-child", "set", "increment", "remove-child",
@@ -1058,71 +1070,42 @@ def _node_maintain_exempt(node):
 
 
 def _get_distill_candidates(ctx, tree, include_skipped=False):
-    """ctx-aware mirror of tree.py:561-633. Reads pruning thresholds from the
-    RAW core/config/tree.yaml (no meta overlay — matches the CLI) and node .md
-    line counts via _resolve_candidate_path. Sort + skip-reason enum identical."""
-    config_path = ctx.paths.project_root / "core" / "config" / "tree.yaml"
-    pruning = {}
-    if config_path.exists():
-        with config_path.open("r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
-        pruning = cfg.get("pruning", {})
-    threshold = pruning.get("distill_utility_threshold", 0.3)
-    min_ret = pruning.get("distill_min_retrievals", 5)
-    line_threshold = pruning.get("distill_line_threshold", 50)
-    line_util_threshold = pruning.get("distill_line_utility_threshold", 0.5)
+    """DELEGATES to core/scripts/tree.py::get_distill_candidates ().
 
-    nodes = tree.get("nodes", {})
-    candidates = []
-    skipped = []
-    for key, node in nodes.items():
-        if node.get("children"):
-            if include_skipped:
-                skipped.append({"node_key": key, "skip_reason": "has_children"})
-            continue
-        # `.get(k, default)` yields the default only when the key is ABSENT — a
-        # key PRESENT with value None returns None, and `None < 0.3` raises
-        # TypeError. Measured 2026-07-30 (): 5 of 1297 live nodes carry
-        # `utility_ratio: null`, which made the daemon's --record-maintenance
-        # endpoint 500 with "'<' not supported between instances of 'NoneType'
-        # and 'float'" — so /tree maintain could not record its own cadence stamp
-        # and the post-run debt figure it computes was unobtainable.
-        rc = node.get("retrieval_count") or 0
-        ur = node.get("utility_ratio") or 0.0
-        th = node.get("times_helpful") or 0
-        tn = node.get("times_noise") or 0
-        has_feedback = (th + tn) >= 1
-        crit1 = rc >= min_ret and has_feedback and ur < threshold
-        file_path = node.get("file", "")
-        abs_path = _resolve_candidate_path(ctx, file_path) if file_path else ""
-        line_count = 0
-        if abs_path and os.path.exists(abs_path):
-            with open(abs_path, "r", encoding="utf-8") as f:
-                line_count = sum(1 for _ in f)
-        crit2 = (line_count > line_threshold and ur < line_util_threshold
-                 and rc >= min_ret and has_feedback)
-        if crit1 or crit2:
-            candidates.append({
-                "key": key,
-                "utility_ratio": ur,
-                "retrieval_count": rc,
-                "times_helpful": th,
-                "times_noise": tn,
-                "line_count": line_count,
-                "file": file_path,
-                "trigger": "low_utility" if crit1 else "large_mediocre",
-            })
-        elif include_skipped:
-            if rc < min_ret:
-                skipped.append({"node_key": key, "skip_reason": "insufficient_retrievals"})
-            elif not has_feedback:
-                skipped.append({"node_key": key, "skip_reason": "no_feedback"})
-            else:
-                skipped.append({"node_key": key, "skip_reason": "utility_above_threshold"})
-    candidates.sort(key=lambda x: x["utility_ratio"])
-    if include_skipped:
-        return {"candidates": candidates, "skipped": skipped}
-    return candidates
+    This was a hand-maintained mirror of the CLI detector, and it drifted FOUR
+    fixes behind while both halves stayed live: crit3 (the g-115-1570 oversized
+    read-cap sweep) was absent entirely; interior nodes were skipped by an early
+    `continue` (g-115-2913/rb-4648) so an oversized hub escaped every detector;
+    the g-115-2317 sparse-feedback + stale-signal bars were missing, leaving the
+    permissive `has_feedback >= 1` gate that flagged a standing false-positive
+    pool; and `maintain_exempt: distill` (g-115-1700/guard-896) went unhonoured.
+
+    The consequence was not cosmetic. Measured at the fix (foxtrot, 2026-07-30,
+    cc-04/Linux) on ONE live tree of 1297 nodes, in one process: the pre-edit code
+    at HEAD returned **809** candidates, the CLI returned **566**, and after the
+    delegation both return 566 with identical key lists. g-115-4062 filed the same
+    divergence as 807 vs 558 a few hours earlier — a different tree state, the same
+    ~243-candidate gap. The daemon's number is the one that lands in
+    `post_run_debt` and gates backlog-mode escalation fleet-wide, while
+    `tree-read.sh --distill-candidates` falls through to the CLI (tree_read.py
+    lists it under "NOT served on the daemon path"), so the READ path and the
+    WRITE path had been disagreeing by ~40% on the same tree.
+
+    Only TWO things ever made this function need to be separate, and both are now
+    injected rather than forked: the config path and the node-.md path both have
+    to resolve through the per-request `ctx` (a daemon process may serve a project
+    root that is not the CLI module's). `_resolve_candidate_path` is still the
+    ctx-aware resolver — it is passed in, not replaced. Everything else was
+    duplication (rb-4880/rb-4884: byte-near-identical siblings are maintenance
+    debt, not a design). Do NOT re-fork this to add a caller-specific rule; add a
+    seam to the CLI function instead, so one implementation keeps serving both.
+    """
+    return _cli_get_distill_candidates(
+        tree,
+        include_skipped,
+        config_dir=ctx.paths.project_root / "core" / "config",
+        resolve_path=lambda virtual_path: _resolve_candidate_path(ctx, virtual_path),
+    )
 
 
 def _get_decompose_candidates(ctx, tree, include_skipped=False):

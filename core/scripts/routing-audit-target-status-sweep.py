@@ -451,14 +451,36 @@ def main():
             ref_ts = (g.get("created_at") or g.get("defer_reason_set_at")
                       or g.get("started"))
             age_h = _age_hours(ref_ts)
-            if age_h is None or age_h < args.max_age_hours:
+            if age_h is None:
+                # An UNDEFINED age is not a small one. Fusing it into the
+                # below-threshold branch rendered the literal string
+                # "age None below threshold 24h" — a sentence that is not even
+                # well-formed, let alone true — and a reader scanning `reason`
+                # sees a threshold word and moves on. This goal carries NO
+                # parseable created_at / defer_reason_set_at / started, so it can
+                # never age into eligibility: the skip is permanent, not pending.
+                # Skipping stays correct (guard-420: no arithmetic on a null);
+                # only the name was wrong. See guard-2024, and  which
+                # fixed the identical fusion in user-blocker-escalation-check.py.
                 details.append({
                     "goal_id": g.get("id"),
                     "aspiration_id": asp.get("id"),
                     "target_id": target_id,
-                    "age_hours": (round(age_h, 1) if age_h is not None else None),
+                    "age_hours": None,
                     "action": "skipped",
-                    "reason": f"age {age_h} below threshold {args.max_age_hours}h",
+                    "reason": ("age_uncomputable: no parseable created_at / "
+                               "defer_reason_set_at / started — this goal can "
+                               "never age into eligibility"),
+                })
+                continue
+            if age_h < args.max_age_hours:
+                details.append({
+                    "goal_id": g.get("id"),
+                    "aspiration_id": asp.get("id"),
+                    "target_id": target_id,
+                    "age_hours": round(age_h, 1),
+                    "action": "skipped",
+                    "reason": f"age {age_h:.1f}h below threshold {args.max_age_hours}h",
                 })
                 continue
             eligible += 1

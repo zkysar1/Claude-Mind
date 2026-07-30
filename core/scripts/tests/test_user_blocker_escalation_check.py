@@ -150,7 +150,50 @@ def test_below_threshold_is_not_escalated(tmp_path):
     out = _run(tmp_path, [_goal("g-young", 10)], "--apply", "--escalate-hours", "48")
     assert out["eligible"] == 0
     assert out["skipped"]["below_threshold"] == 1
+    assert out["skipped"]["age_uncomputable"] == 0
     assert out["applied"] == 0
+
+
+def test_untimestamped_goal_is_uncomputable_not_below_threshold(tmp_path):
+    """A goal with NO parseable timestamp must not be labelled `below_threshold`.
+
+    g-115-4084: `if age is None or age < escalate_hours` folded an UNDEFINED age
+    into the young bucket, so the sweep reported a goal that can never age into
+    escalation as if it were merely too new. 16 of 796 open world goals carried
+    no created_at when this was measured — 3 HIGH, one the unblocking goal for a
+    live outage — and every one read as fine. The skip itself is correct
+    (guard-420: no datetime arithmetic on a null); what was wrong was the name.
+
+    Pinned as its own verdict AND its own counter, because guard-1986's tell is
+    exactly a not-checkable case folded into a substantive one: an all-clear
+    whose cleanliness has nothing to do with the data.
+    """
+    g = _goal("g-notime", 500)
+    del g["blocked_since"]          # no blocked_since / blocked_at / created_at
+    out = _run(tmp_path, [g], "--apply", "--escalate-hours", "48")
+
+    assert out["eligible"] == 0
+    assert out["applied"] == 0
+    assert out["skipped"]["age_uncomputable"] == 1
+    assert out["skipped"]["below_threshold"] == 0, \
+        "an undefined age must NOT be counted as young"
+
+    rec = next(r for r in out["results"] if r["goal_id"] == "g-notime")
+    assert rec["reason"] == "age_uncomputable"
+    assert rec["age_hours"] is None
+    assert "never age into escalation" in rec["detail"]
+
+
+def test_uncomputable_and_young_are_counted_separately(tmp_path):
+    """Both buckets populated at once — neither absorbs the other."""
+    g = _goal("g-notime", 500)
+    del g["blocked_since"]
+    out = _run(tmp_path, [g, _goal("g-young", 10), _goal("g-old", 500)],
+               "--apply", "--escalate-hours", "48")
+
+    assert out["skipped"]["age_uncomputable"] == 1
+    assert out["skipped"]["below_threshold"] == 1
+    assert out["eligible"] == 1, "the genuinely-old goal still escalates"
 
 
 def test_deliberate_user_routing_is_reported_not_escalated(tmp_path):
