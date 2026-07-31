@@ -488,6 +488,58 @@ def _load_capability_routing(world_dir) -> list:
     return rows
 
 
+def _load_human_only(world_dir) -> list:
+    """Rows from the `## Human-Only` section — genuinely-needs-a-human actions.
+
+    WHY THIS EXISTS (g-029-95). The gate previously read ONLY the
+    Agent-Provisionable section, so it had no representation of what MUST route
+    to a human. Measured 2026-07-30: a failure_reason naming the outreach
+    per-send Approve&Send sign-off returned would_block=True by matching the
+    `notify-user` forged skill on shared send/email/user vocabulary. would_block
+    means "refuse the participants:[user] routing" — an INVERSION of guard-12 /
+    guard-29, which make that sign-off fail-closed and human-only. The gate was
+    confidently refusing to route to a human the one action that most requires
+    one.
+
+    guard-205 already names this CLASS (a broad keyword matching a
+    general-purpose wrapper that cannot perform the named action) and prescribes
+    keeping participants:[user] plus an override. This makes the convention
+    STRUCTURALLY authoritative instead of relying on the operator to remember
+    the override — a refusal that is wrong on the deployment's tightest rule
+    trains people to override the gate, which is how a safety gate decays into
+    noise.
+
+    PARSES BOTH SHAPES, unlike _load_capability_routing which requires table
+    rows. The Human-Only section is written as bold-lead bullets (14 of them, 0
+    pipe-rows), and requiring a table here would either silently return nothing
+    or force a duplicate table to maintain beside the prose. Accepting `- **X**`
+    and `| X |` means the convention needs no reformatting to gain authority.
+    """
+    if world_dir is None:
+        return []
+    path = world_dir / "conventions" / "capability-routing.md"
+    if not path.is_file():
+        return []
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except Exception:
+        return []
+    rows, in_section = [], False
+    for line in raw.splitlines():
+        s = line.strip()
+        if s.startswith("## "):
+            in_section = s.lower().startswith("## human-only")
+            continue
+        if not in_section or not s:
+            continue
+        # bullets (the actual shape) or table rows (future-proofing)
+        if s.startswith("- ") or s.startswith("* "):
+            rows.append({"source": "capability-routing.md#human-only", "row": s})
+        elif s.startswith("|") and set(s.replace("|", "").replace("-", "").replace(":", "").strip()) > set(" "):
+            rows.append({"source": "capability-routing.md#human-only", "row": s})
+    return rows
+
+
 # --- Keyword extraction + matching ------------------------------------------
 
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9]+(?:[-_.][A-Za-z0-9]+)*")
@@ -1414,9 +1466,19 @@ def evaluate(failure_reason: str, *,
     # the agent must passively observe is non-provisionable — suppress ALL block
     # types uniformly. keyword_block/session_req_block/cure_block stay computed
     # (surfaced in the result for observability) but do not force a route.
+    # Human-only veto (g-029-95; RESTORED g-029-101 after the 2026-07-30 sync
+    # 1df2b2e8 deleted it as ZDS-local drift). Direction of failure matters: a
+    # spurious veto costs one goal wrongly routed to a human (recoverable and
+    # visible). A missing veto costs a fail-closed human approval being REFUSED —
+    # the exact failure guard-12/guard-29 exist to prevent. Bias toward the veto.
+    # Uses the SAME _find_matches predicate as the provisionable path, so a lone
+    # generic word cannot veto.
+    human_only_matches = _find_matches(keywords, _load_human_only(world_dir))
+
     would_block = (
         (keyword_block or session_req_block or cure_block)
         and not event_gated_matches
+        and not human_only_matches
     )
 
     # Log evidence approval ONLY when the gate would have blocked without
