@@ -253,31 +253,47 @@ def _collect_companion_script_dates(ctx, skill_names, forged_skills):
     name_pattern = re.compile(
         r'(?<![\w.-])(' + '|'.join(re.escape(b) for b in script_to_skills) + r')(?![\w.-])'
     )
-    scan_paths = list(ctx.paths.agents_root.glob("*/session/execution-diary.jsonl"))
-    for path in scan_paths:
-        from storage_backend import get_backend
-        get_backend().ensure_local(path)  # own-cloud read-path fix: materialize per-agent execution-diary before local read
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(rec, dict):
-                    continue
-                blob = json.dumps(rec, ensure_ascii=False)
-                matches = set(name_pattern.findall(blob))
-                if not matches:
-                    continue
-                dt = _parse_iso(rec.get("timestamp") or rec.get("date"))
-                if not dt:
-                    continue
-                for basename in matches:
-                    for skill_name in script_to_skills.get(basename, []):
-                        out[skill_name].append(dt)
+    # ROSTER + AUTHORITATIVE READ (), replacing
+    # ctx.paths.agents_root.glob("*/session/execution-diary.jsonl") + per-path
+    # ensure_local(). The ensure_local was a real fix for the READ half, but it
+    # could only ever run on paths the GLOB had already found — and the glob
+    # enumerates by what the local read-through cache holds, so an ABSENT peer's
+    # diary was never enumerated and therefore never materialized. Measured on
+    # cc-02 at filing: 1 of 5 agents present cold. Enumerating from a roster is
+    # the half ensure_local structurally cannot supply.
+    #
+    # No base is passed: in production ctx.paths.agents_root IS _paths
+    # agents_root() (both mirror AGENTS_PARENT_DIR per CLAUDE.md "Agent-dir
+    # Resolution"), and the no-base path additionally unions the team-state shard
+    # roster — which is world state, so it survives a box where no peer AGENT dir
+    # has been pulled yet. Passing the ctx root would silently drop that half.
+    # Function-local import, matching the storage_backend import this replaced —
+    # core/scripts is on the daemon's sys.path at call time, not module load.
+    from _fleet_diary import read_fleet_diaries
+
+    for _agent_name, _diary_text in read_fleet_diaries():
+        # splitlines(), not io.StringIO — identical to the CLI twin, which keeps
+        # the byte-compat this pair is guarded on (CLAUDE.md cross-agent-glob).
+        for line in _diary_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            blob = json.dumps(rec, ensure_ascii=False)
+            matches = set(name_pattern.findall(blob))
+            if not matches:
+                continue
+            dt = _parse_iso(rec.get("timestamp") or rec.get("date"))
+            if not dt:
+                continue
+            for basename in matches:
+                for skill_name in script_to_skills.get(basename, []):
+                    out[skill_name].append(dt)
     return out
 
 

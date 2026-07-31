@@ -66,6 +66,17 @@ from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-IS
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
 from _paths import WORLD_DIR, META_DIR, AGENT_NAME, agent_dir  # noqa: E402
 
+# : never hardcode the escalation aspiration —  is the UPSTREAM
+# deployment's queue and does not exist elsewhere, so a literal files nothing.
+try:
+    from _paths import AGENT_DIR  # noqa: E402
+    from _escalation_target import resolve as _resolve_asp, source_flag as _asp_source
+    ESCALATION_ASP, _ESCALATION_ASP_VIA = _resolve_asp(CORE_ROOT, WORLD_DIR, AGENT_DIR)
+    ESCALATION_SOURCE = _asp_source(ESCALATION_ASP, WORLD_DIR, AGENT_DIR)
+except Exception:
+    ESCALATION_ASP, _ESCALATION_ASP_VIA, ESCALATION_SOURCE = (
+        "asp-115", "fallback:import-failed", "world")
+
 # ----------------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------------
@@ -613,7 +624,7 @@ def run_pipeline(detectors_out, corpus):
     return new_gaps, supp_rb245, supp_dedup
 
 
-def file_investigate(gap, target_asp="asp-115"):
+def file_investigate(gap, target_asp=ESCALATION_ASP):
     """--apply: file ONE new gap as an Investigate via the daemon add-goal
     endpoint (_rt — the canonical Python->daemon path). NOT a bash subprocess: handing a Windows
     absolute path to bash strips its backslashes (rc=127) and a `C:/`-prefixed
@@ -637,7 +648,8 @@ def file_investigate(gap, target_asp="asp-115"):
         f"silent-gap-audit dedup confirmed '{gap['target']}' not covered by any "
         f"open goal (title+description+origin_signal scan)")}
     try:
-        resp = _rt.aspirations_add_goal(target_asp, record, source="world", overrides=override)
+        resp = _rt.aspirations_add_goal(target_asp, record, source=ESCALATION_SOURCE,
+                                        overrides=override)
     except Exception as e:
         print(f"[silent-gap-audit] file failed for {gap['target']}: {e}", file=sys.stderr)
         return None
@@ -659,8 +671,9 @@ def main():
     ap.add_argument("--output", choices=["json", "human"], default="json")
     ap.add_argument("--apply", action="store_true",
                     help="File genuinely-NEW gaps as Investigate goals into --target-asp.")
-    ap.add_argument("--target-asp", default="asp-115",
-                    help="Aspiration to file Investigate goals into (default asp-115).")
+    ap.add_argument("--target-asp", default=ESCALATION_ASP,
+                    help=("Aspiration to file Investigate goals into "
+                          f"(default {ESCALATION_ASP}, resolved per deployment)."))
     ap.add_argument("--detectors", default="all",
                     help="Comma list of detectors to run (written-never-read,telemetry-stale,"
                          "zero-input,never-invoked) or 'all'.")

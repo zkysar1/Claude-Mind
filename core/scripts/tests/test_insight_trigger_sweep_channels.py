@@ -86,6 +86,13 @@ def board(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(its, "BOARD_DIR", board_dir)
     monkeypatch.setattr(its, "WORLD_ASPS", asp_jsonl)
     monkeypatch.setattr(its, "_agents_root", lambda: agents_dir)
+    #  hermeticity: neutralize the addressing-resolution inputs so
+    # these channel pins never read the REAL registry/roster (empty registry
+    # + empty roster => empty collision set => routing behavior these tests
+    # pin is unchanged by the addressing rule).
+    monkeypatch.setattr(its, "ENV_REGISTRY_DIR", tmp_path / "no-environments")
+    monkeypatch.setattr(its, "_self_env", lambda: "test-env")
+    monkeypatch.setattr(its, "_local_roster", lambda: set())
 
     filed = []
 

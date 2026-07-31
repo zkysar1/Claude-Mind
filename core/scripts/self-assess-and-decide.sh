@@ -95,9 +95,15 @@ PY="${PY_CMD:-python3}"
 # Python's stdin and the piped JSON is invisible to the script.
 SIGNALS_JSON="$(cat)"
 
+# : the act_later recommendation below names an aspiration for the LLM
+# to file an Idea into. A literal  is the UPSTREAM deployment's queue and
+# exists in no other deployment, so downstream the recommendation pointed the
+# agent at an aspiration that is not there.
+ESCALATION_ASP="$(bash "$SCRIPT_DIR/escalation-target.sh" --asp)" || ESCALATION_ASP="asp-115"
+
 # Hand off to Python via env vars (rb-774-class lesson: never interpolate
 # bash variables into a python heredoc; pass via env, single-quote source).
-export SIGNALS_JSON REVIEW_TYPE
+export SIGNALS_JSON REVIEW_TYPE ESCALATION_ASP
 
 "$PY" - <<'PYEOF'
 import json
@@ -205,7 +211,9 @@ elif (
         triggers.append(f"partner_align={partner_align:.2f}")
     rationale = "weak-but-present signal: " + ", ".join(triggers)
     recommended = (
-        "file an Idea goal under asp-115 with the recommended edit summary"
+        "file an Idea goal under "
+        + os.environ.get("ESCALATION_ASP", "asp-115")
+        + " with the recommended edit summary"
     )
 else:
     decision = "no_change"

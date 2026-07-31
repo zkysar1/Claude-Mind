@@ -51,8 +51,11 @@ Fleet-wide is the conservative direction for something that files goals.
 
 Report-only by default. `--apply` files at most `--max-file` Unblock goals per
 run (default 1), highest overdue-ratio first, deduplicated on the EXACT
-origin_signal `unblock:recurring-starved-<goal-id>` (never a title substring —
-g-115-2196 is the vacuous-dedup class). The cap exists because the starved set
+origin_signal built by `_origin_signal()` (never a title substring —
+g-115-2196 is the vacuous-dedup class): `unblock:recurring-starved-<goal-id>`
+for WORLD-source goals, whose ids are globally unique, and
+`unblock:recurring-starved-<agent>-<goal-id>` for AGENT-source goals, whose
+ids are per-queue and repeat across the fleet (g-115-4241). The cap exists because the starved set
 is not independent: the first run's 24 hits clustered on one common cause, and
 filing 24 goals would fragment one finding into 24 individually-undiagnosable
 ones while swamping the queue. The summary line always reports the FULL count,
@@ -406,6 +409,50 @@ def scan(multiplier: float, breaks: dict | None = None) -> tuple[list, dict]:
     return starved, stats
 
 
+def _origin_signal(goal_id: str, source: str, agent: str | None = None) -> str:
+    """The dedup key for one starvation Unblock. SINGLE SOURCE for both users.
+
+    There are exactly two consumers — the pre-file dedup check in `main()` and
+    the payload built in `_file_unblock()` — and they MUST agree. They were
+    independently-written f-strings before g-115-4241; qualifying one without
+    the other would make the local dedup miss its own prior filing and re-file
+    every run, which is the failure the fix is meant to prevent. Grep every
+    publisher before changing a key at one call site (rb-3879).
+
+    WHY AGENT-SOURCE KEYS ARE QUALIFIED. Per-agent asp-001 queues REUSE the
+    `g-001-NN` id space: every agent has its own `g-001-02`, so `g-001-02`
+    names five different goals across the fleet. An unqualified key therefore
+    collides. The collision is invisible locally and fatal remotely, because
+    the two dedup scopes differ: `_existing_origin_signals()` reads only THIS
+    agent's queues, while `goal-duplication` scans EVERY agent's. So the local
+    check passes, the filing is attempted, and the gate refuses it — meaning
+    only the FIRST agent in the fleet to detect a starved `g-001-NN` can ever
+    file, and every later agent's starvation is permanently un-filable while
+    the sweep prints REFUSED on every run. Measured twice independently: echo
+    on cc-03 (g-001-02 starved 154.1h, g-001-05 145.3h, both refused against
+    foxtrot's identically-keyed g-001-61), and bravo on cc-05 (g-001-01
+    refused against alpha's g-001-349 and zeta's g-001-70).
+
+    WHY WORLD-SOURCE KEYS ARE LEFT ALONE. World goal ids are already globally
+    unique, so they never collide. Re-keying them would orphan every Unblock
+    already filed under the old form — the dedup would stop matching its own
+    history and re-file each one exactly once. Unchanged is the correct and
+    smaller change.
+
+    A blank/unresolvable agent falls back to the legacy unqualified key rather
+    than minting `...-<blank>-<id>`: that would read as qualified while
+    colliding fleet-wide in a NEW way, which is strictly worse than the bug.
+    """
+    legacy = f"unblock:recurring-starved-{goal_id}"
+    if source != "agent":
+        return legacy
+    owner = (agent if agent is not None
+             else os.environ.get("MIND_AGENT", "")).strip()
+    if not owner:
+        return legacy
+    return f"unblock:recurring-starved-{owner}-{goal_id}"
+
+
 def _existing_origin_signals() -> set:
     """Every origin_signal already present across both queues, any status.
 
@@ -424,8 +471,67 @@ def _existing_origin_signals() -> set:
     return seen
 
 
-def _file_unblock(row: dict) -> str | None:
+def _summarize_refusal(raw) -> str:
+    """Render a gate refusal as a readable one-liner naming the FAILING check
+    and its matches, instead of a head-truncated blob.
+
+    WHY THIS EXISTS (g-115-4205, measured 2026-07-31). The prior form was
+    ``(body or str(e)).strip()[:300]``. A goal-duplication refusal serializes
+    its checks in a fixed order and the PASSING ones come first, so 300 chars
+    lands inside ``recent_completions`` — a check that PASSED. The operator
+    therefore saw ``"passed": true, "reason": "no blocking overlap ..."`` cut
+    mid-word, and nothing at all about the check that actually blocked. That is
+    worse than no detail: it displays a green check as though it were the
+    refusal reason.
+
+    The cost was not hypothetical. It produced a HIGH goal asserting the gate
+    matched "a COMPLETED goal and a phantom id" — both claims false. The real
+    matches were ``g-001-60`` in FOXTROT's queue and ``g-001-69`` in ZETA's,
+    each carrying the exact same ``origin_signal``: three agents had
+    independently detected the same starved goal and the gate was correctly
+    refusing a third duplicate. The gate's own output labels every match with
+    ``source`` (``agent:foxtrot``), so the disambiguating field was present and
+    truncated away. Goal ids of the form ``g-001-NN`` are PER-AGENT-QUEUE, not
+    global — ``g-001-60`` names three different goals across three agents — so
+    a reader who cannot see ``source`` will resolve the id against their OWN
+    queue and reach a confidently wrong conclusion.
+
+    Fail-open: anything that does not parse as the expected gate shape falls
+    back to the raw text (truncated far more generously than before), so a
+    non-gate exception is never swallowed.
+    """
+    text = raw if isinstance(raw, str) else str(raw)
+    try:
+        data = json.loads(text)
+    except Exception:  # noqa: BLE001
+        return text.strip()[:1000]
+    if not isinstance(data, dict):
+        return text.strip()[:1000]
+    checks = ((data.get("gate_output") or {}).get("checks") or [])
+    failing = [c for c in checks if isinstance(c, dict) and not c.get("passed")]
+    if not failing:
+        return text.strip()[:1000]
+    parts = []
+    for c in failing:
+        bits = []
+        for m in (c.get("matches") or [])[:6]:
+            if not isinstance(m, dict):
+                continue
+            # `source` is the load-bearing field — it names WHICH agent's queue
+            # the matched id lives in. Never drop it.
+            bits.append(f"{m.get('goal_id')}[{m.get('source')}"
+                        f"{'/' + m['match_strategy'] if m.get('match_strategy') else ''}]")
+        parts.append(f"{c.get('name')}: {c.get('reason')}"
+                     + (f" -- matches: {', '.join(bits)}" if bits else ""))
+    return f"{data.get('error', 'refused')} | " + " | ".join(parts)
+
+
+def _file_unblock(row: dict, errors: list | None = None) -> str | None:
     """File one Unblock. Returns filed goal id, or None on failure.
+
+    `errors`, when given, collects `{goal_id, reason}` for each refusal so the
+    caller can surface the reason on stdout. Optional and defaulted so every
+    existing call site and test keeps working unchanged.
 
     The description deliberately does NOT name this script or quote schema
     field names. The duplication gate's `target_state` check resolves target
@@ -468,25 +574,50 @@ def _file_unblock(row: dict) -> str | None:
             "checks": [],
             "preconditions": [],
         },
-        "origin_signal": f"unblock:recurring-starved-{goal_id}",
+        "origin_signal": _origin_signal(goal_id, row["source"]),
     }
     try:
         rec = _rt.aspirations_add_goal(row["aspiration_id"], payload,
                                       source=row["source"])
     except Exception as e:  # noqa: BLE001
         body = getattr(e, "body", None)
-        detail = (body or str(e)).strip()[:300]
+        detail = _summarize_refusal(body or str(e))
         print(f"[recurring-starvation] WARN filing failed for {goal_id}: {detail}",
               file=sys.stderr)
+        # Also hand the reason back to the caller so it can reach STDOUT.
+        # stderr alone is not enough: the summary line used to say "see the
+        # WARN line(s) above", which points at a channel many callers drop
+        # (`2>/dev/null`, stdout-only capture, a log tail). Same split-channel
+        # class as guard-1680.
+        if errors is not None:
+            errors.append({"goal_id": goal_id, "reason": detail})
         return None
+    # EVERY return-None path below must record a reason. `failed` is now
+    # len(errors), so a path that returns None silently is a failure the run
+    # reports as zero — and with nothing filed and nothing deduped the summary
+    # block matches no branch and prints NOTHING. That is less visible than the
+    # `failed += 1` counter this replaced, i.e. a regression in exactly the
+    # property this function was changed to provide. Caught by fresh-eyes on
+    # the same iteration that introduced it ().
+    def _fail(reason: str) -> None:
+        print(f"[recurring-starvation] WARN filing failed for {goal_id}: {reason}",
+              file=sys.stderr)
+        if errors is not None:
+            errors.append({"goal_id": goal_id, "reason": reason})
+        return None
+
     if isinstance(rec, str):
         try:
             rec = json.loads(rec)
         except json.JSONDecodeError:
-            return None
+            return _fail(f"unparseable response (str, {len(rec)} chars): "
+                         f"{rec.strip()[:200]}")
     if isinstance(rec, dict):
-        return rec.get("id") or (rec.get("goal") or {}).get("id")
-    return None
+        new_id = rec.get("id") or (rec.get("goal") or {}).get("id")
+        if new_id:
+            return new_id
+        return _fail(f"response carried no goal id; keys={sorted(rec)[:12]}")
+    return _fail(f"unexpected response type {type(rec).__name__}")
 
 
 def main() -> int:
@@ -508,25 +639,59 @@ def main() -> int:
 
     filed = []
     deduped = 0
-    failed = 0
+    failures: list[dict] = []
     if args.apply and starved:
         existing = _existing_origin_signals()
         for row in starved:
             if len(filed) >= max(0, args.max_file):
                 break
-            sig = f"unblock:recurring-starved-{row['goal_id']}"
-            if sig in existing:
+            sig = _origin_signal(row["goal_id"], row["source"])
+            # Also honour the LEGACY unqualified key during the transition, so
+            # the first post-fix run does not re-file every Unblock this agent
+            # already has.
+            #
+            # WHY THAT IS SAFE, stated precisely — the obvious reason is WRONG.
+            # `existing` is NOT "this agent's queues only": _existing_origin_signals
+            # walks _sources(), which ALWAYS yields "world" (the queue every agent
+            # shares) plus this agent's private queue. What actually keeps a
+            # PARTNER's legacy key out of this set is a ROUTING property one call
+            # below — _file_unblock passes `source=row["source"]`, so an
+            # agent-source Unblock is filed into the filing agent's OWN private
+            # queue and never into world. Agent-scoped legacy keys therefore
+            # cannot reach another agent's `existing`. Verified 2026-07-31: of 17
+            # starvation-keyed goals in the shared world queue, 0 carry a
+            # per-agent g-001-NN id.
+            #
+            # SO: if agent-source Unblocks are ever routed to world (or this
+            # dedup starts reading partner queues), this fallback silently
+            # becomes a cross-agent suppressor and reintroduces the exact bug
+            #  fixed — a partner's pre-fix legacy key would block us
+            # again. Revisit this branch with that change, not after it.
+            legacy = f"unblock:recurring-starved-{row['goal_id']}"
+            if sig in existing or legacy in existing:
                 deduped += 1
                 continue
-            new_id = _file_unblock(row)
+            before = len(failures)
+            new_id = _file_unblock(row, errors=failures)
             if new_id:
                 filed.append({"goal_id": row["goal_id"], "filed_as": new_id})
-            else:
-                failed += 1
+            elif len(failures) == before:
+                # Structural net, not a second implementation of the reason.
+                # `failed` is len(failures), so any future return-None path
+                # that forgets to record would be counted as ZERO and vanish
+                # from both the JSON and the human summary. Making the caller
+                # enforce "None implies a recorded failure" keeps the count
+                # honest without every future author having to remember.
+                failures.append({"goal_id": row["goal_id"],
+                                 "reason": "filing returned no goal id and "
+                                           "recorded no reason (unrecorded "
+                                           "failure path in _file_unblock)"})
+    failed = len(failures)
 
     if args.output == "json":
         print(json.dumps({"starved": starved, "stats": stats, "filed": filed,
                           "deduped": deduped, "file_failures": failed,
+                          "file_failure_details": failures,
                           "multiplier": args.multiplier}, indent=2))
         return 0
 
@@ -586,14 +751,42 @@ def main() -> int:
         print(f"    ... and {len(starved) - 10} more")
     for f in filed:
         print(f"    FILED {f['filed_as']} for {f['goal_id']}")
+    # Refusals print whenever there ARE refusals — NOT only when the run filed
+    # nothing. The old `if args.apply and not filed:` gate hid every refusal
+    # that shared a run with a success, and with the default --max-file 1 that
+    # is reachable on the very first two rows: row 1 refused, row 2 filed, loop
+    # breaks. Measured 2026-07-30 before the fix — stdout read
+    # "2 starved ... FILED  for g-999-BB" with NO mention that the
+    # worse-starved row had been refused, which reads as a clean partial run
+    # rather than a swallowed detection. A detector whose refusals are
+    # invisible is indistinguishable from one that found nothing (guard-1802).
+    if failed:
+        # The trailing clause only makes sense when there ARE FILED lines to
+        # mis-read; on an all-refused run it would point at nothing.
+        qualifier = (" — do not read the FILED lines above as the full result"
+                     if filed else "")
+        print(f"    {failed} attempt(s) REFUSED (detected and NOT filed"
+              f"{qualifier}):")
+        for e in failures:
+            # NO display cap here. `reason` already came through
+            # _summarize_refusal, which bounds every return path at 1000 chars,
+            # so a second cut is redundant — and it re-created the exact defect
+            # that function exists to fix. The summarizer puts the FAILING check
+            # first and its `matches` (with the load-bearing per-agent `source`)
+            # LAST, so a 200-char cut landed on the ` -- ` and dropped every
+            # match, in the one block an operator actually reads. The WARN line
+            # at the filing site was fixed and this summary block was not, which
+            # is why the run looked repaired: the two render paths disagreed.
+            # Keep the bound in ONE place (the summarizer), not two.
+            print(f"      REFUSED {e['goal_id']}: {e['reason']}")
     if args.apply and not filed:
         # Name the ACTUAL reason. An earlier version printed the dedup reason
         # unconditionally, which asserted a false cause on a run where every
         # attempt had in fact been refused by a gate (verify-before-assuming:
         # a diagnostic must not claim a cause it did not establish).
         if failed:
-            print(f"    (nothing filed — {failed} attempt(s) REFUSED; see the "
-                  f"WARN line(s) above for the reason)")
+            print(f"    (nothing filed — all {failed} attempt(s) REFUSED, "
+                  f"reasons above)")
         elif deduped:
             print(f"    (nothing filed — {deduped} already have an open "
                   f"origin_signal)")

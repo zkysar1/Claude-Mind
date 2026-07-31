@@ -215,10 +215,10 @@ For each active hypothesis:
 
 4. Compare hypothesis to outcome:
    our_hypothesis: "YES"
-   our_confidence: 0.72
+   confidence: 0.72
    actual_outcome: "NO"
    outcome: CORRECTED
-   surprise_level: 7  # calculated from confidence gap
+   surprise: 7  # calculated from confidence gap
 ```
 
 ### Step 2.5: Source Agreement Check
@@ -309,11 +309,41 @@ ELIF threshold (resolves_no_earlier_than) has passed AND
     # still-future resolves_by fall through to the normal (re-)shelve below, so a
     # hypothesis without a hard deadline keeps re-probing exactly as before.
     # resolves_by may be a date (YYYY-MM-DD) or a datetime — compare the same way
-    # Step 4.0 does ("resolves_by has passed"). Mirrors Step 4.0's active-record
-    # expiry; EXPIRED lands in archived (never resolved).
+    # Step 4.0 does (the SHARED "resolves_by has passed" predicate defined below).
+    # Mirrors Step 4.0's active-record expiry; EXPIRED lands in archived (never
+    # resolved).
+    #
+    # ── "resolves_by has passed" — THE SHARED PREDICATE (Step 2.6a AND Step 4.0) ──
+    # A DATE-ONLY resolves_by (len <= 10, "YYYY-MM-DD") means END of that day:
+    #     date-only  -> passed IFF date.fromisoformat(rb[:10]) <  today
+    #     datetime   -> passed IFF datetime.fromisoformat(rb[:19]) < now
+    # Do NOT feed a date-only value to a naive datetime parse. `2026-07-31` parses
+    # to midnight, so "compare to current_time" makes a deadline that has ~24h left
+    # read as already-passed from 00:00:01 onward — expiring the record up to a full
+    # day EARLY. Expiry is ONE-WAY and destructive: EXPIRED moves to `archived`,
+    # which compute_meta excludes from accuracy stats and Mode 2 (`--unreflected`)
+    # never reflects on, so the record is gone from the learning signal permanently.
+    # Measured 2026-07-31 (bravo, cc-05): 221 of 236 live non-terminal records
+    # (93.6%) carry a date-only resolves_by, and the naive reading would have
+    # expired 6 of them ~22h early in a single pass (2 measurement-pending, 4
+    # active). This is not a rounding nicety — it is the default shape of the store.
+    # THIS IS A DOCS-VS-IMPL DRIFT, NOT A NEW RULE — the shipped code already does
+    # it correctly and only this pseudocode disagreed. `pipeline_write.
+    # _is_stale_unactivated` expires on STRICT `rb < today` at DATE granularity,
+    # pinned by core/scripts/tests/test_archive_sweep_stale_expiry.py, whose
+    # LEAVE_CASES carry `("due_today_not_past", resolves_by=TODAY_STR)` asserting
+    # is False — a deadline of today is explicitly NOT past. Prefer that script as
+    # the authority over any measurement quoted here; it is verifiable by one test
+    # run, and it decides the same way for both the date-only and datetime forms.
+    # The eligibility gate agrees and is generous in the same direction:
+    # cadence_signals._resolvable_hypotheses_present uses
+    # `date.fromisoformat(str(rb)[:10]) <= today`, so a record becomes RESOLVABLE on
+    # its deadline date. Under the naive parse the same record would be
+    # simultaneously "resolvable today" and "expired since midnight" — the two ends
+    # of one cadence disagreeing, in the direction that destroys the record.
     IF record.stage == "measurement-pending"
        AND record.resolves_by is not null
-       AND resolves_by has passed (parse date/datetime; compare to current_time):
+       AND resolves_by has passed (SHARED PREDICATE above — date-only means end-of-day):
         expiry_merge = {
             "outcome": "EXPIRED",
             "outcome_date": "<today ISO>",
@@ -368,16 +398,23 @@ For each resolved hypothesis:
        - Compare our_hypothesis against actual_outcome
        - outcome: "CONFIRMED" if hypothesis matches outcome, "CORRECTED" if not
 
-    2. Calculate surprise level:
-       # Single source of truth — same formula as reflect --batch-micro Step 3.
-       - if CORRECTED: surprise_level = round(our_confidence * 10)
-       - if CONFIRMED: surprise_level = round((1 - our_confidence) * 10)
-       - High surprise = high confidence + wrong, or low confidence + right
+    2. Calculate surprise — INVOKE the helper; do NOT restate the formula:
+       Bash: bash core/scripts/reflect-bookkeeping.sh surprise \
+               --outcome {outcome} --confidence {confidence}
+       Parse stdout JSON → surprise (0-10), high_surprise (bool).
+       # `compute_surprise()` in reflect-bookkeeping.py is the SINGLE
+       # implementation — reflect --batch-micro calls the same function.
+       # Until g-115-3594 this step carried a prose COPY of the arithmetic
+       # that no script could reach, so the two could drift silently and only
+       # whichever copy an LLM happened to read would apply.
+       # --confidence is REQUIRED: omitting it exits 2 rather than silently
+       # scoring 5 off the flag's shared default.
+       # High surprise = high confidence + wrong, or low confidence + right.
 
     3. Update the pipeline record with:
        - outcome: CONFIRMED | CORRECTED
-       - our_confidence: (preserved from hypothesis)
-       - surprise_level: (calculated above)
+       - confidence: (preserved from hypothesis)
+       - surprise: (from the helper above — never recomputed inline)
        - resolution_summary: "CONFIRMED — predicted {X} with {confidence}% confidence"
          or "CORRECTED — predicted {X}, actual was {Y}"
 
@@ -388,7 +425,7 @@ For each resolved hypothesis:
 
 ### Step 3.5: Broad Re-Retrieve on High Surprise (G3 / R5)
 
-When a resolution carries `surprise_level >= 7`, the just-recorded outcome likely
+When a resolution carries `surprise >= 7`, the just-recorded outcome likely
 falsifies one or more downstream beliefs / reasoning-bank entries / pattern
 signatures that the hypothesis was implicitly endorsing. Step 1.5's batch
 retrieval was shallow-to-medium — adequate for predicting outcomes, but
@@ -400,7 +437,7 @@ atomic move so the Tree Update Protocol (Steps 4.5 + Tree Steps 1-5) and any
 downstream `/reflect` calls operate on a complete reconciliation candidate set.
 
 ```
-IF surprise_level >= 7:
+IF surprise >= 7:
     # Broad retrieve at deep depth — supplementary stores AND tree nodes
     Bash: retrieve.sh --category {hypothesis.category} --depth deep
 
@@ -436,12 +473,12 @@ IF surprise_level >= 7:
             new_confidence = max(0.0, round(old_confidence - 0.05, 2))
             IF new_confidence == old_confidence: SKIP (already at floor)
             Bash: echo '{"operations": [{"op": "set", "key": "<node_key>", "field": "confidence", "value": <new_confidence>}, {"op": "set", "key": "<node_key>", "field": "last_update_trigger", "value": "surprise-recalibration"}]}' | bash core/scripts/tree-update.sh --batch
-            Log: "RECALIBRATED {node_key}: confidence {old_confidence} → {new_confidence} (hypothesis {hypothesis.id} surprise={surprise_level})"
+            Log: "RECALIBRATED {node_key}: confidence {old_confidence} → {new_confidence} (hypothesis {hypothesis.id} surprise={surprise})"
 
         # Fail-open: if a tree-update call errors, log and continue. Do NOT
         # block the atomic resolve in Step 4 on a recalibration failure.
 
-ELIF surprise_level >= 5:
+ELIF surprise >= 5:
     # Medium-surprise — re-use Step 1.5 cached batch retrieval, no new probe
     Carry forward the same context_consulted manifest; do not extend it
 
@@ -460,6 +497,11 @@ For each resolved hypothesis, execute this checklist IN ORDER.
 
 ```
 □ 4.0  CHECK EXPIRATION (hypothesis goals only):
+       # "resolves_by has passed" is the SHARED PREDICATE defined in Step 2.6a
+       # above: a DATE-ONLY resolves_by means END of that day (passed IFF
+       # date < today), NOT midnight. 93.6% of live records are date-only, and
+       # the naive datetime parse expires them up to a day early — one-way, into
+       # `archived`, out of accuracy stats and out of Mode 2 reflection forever.
        IF the record has resolves_by AND resolves_by has passed AND outcome is still undetermined:
          - echo '{"outcome":"EXPIRED"}' | bash core/scripts/pipeline-move.sh <id> archived
          - Return "EXPIRED" to calling skill
@@ -467,6 +509,10 @@ For each resolved hypothesis, execute this checklist IN ORDER.
 
 □ 4.1  BUILD merge JSON with:
        - Outcome data (outcome: CONFIRMED/CORRECTED, surprise, outcome_date)
+       # `surprise` is the value Step 3.2's reflect-bookkeeping.sh helper
+       # returned. Carry it forward — do NOT recompute it here, and do not
+       # re-invoke the helper: a second call is a second implementation in
+       # everything but name (g-115-3594).
        - outcome_detail: resolution summary text
        - horizon: (preserve from original — defaults to "short" if missing)
 
@@ -485,16 +531,26 @@ For each resolved hypothesis, execute this checklist IN ORDER.
            most_valuable_source: null
            least_valuable_source: null
            chain_note: null
-       # Compute process_score inline (not deferred to reflect)
-       IF outcome == "CONFIRMED" AND confidence >= 0.60:
-           dual_classification = "earned_confirmed"
-       ELIF outcome == "CONFIRMED" AND confidence < 0.60:
-           dual_classification = "lucky_confirmed"
-       ELIF outcome == "CORRECTED" AND confidence >= 0.60:
-           dual_classification = "unlucky_corrected"
-       ELIF outcome == "CORRECTED" AND confidence < 0.60:
-           dual_classification = "deserved_corrected"
-       process_quality = confidence if CONFIRMED else (1.0 - confidence)
+       # Compute process_score HERE (not deferred to reflect) — but via the
+       # CANONICAL SCRIPT, never by hand. This is the same helper Step 7.6c of
+       # reflect-on-outcome uses, so both writers agree by construction:
+       Bash: bash core/scripts/reflect-bookkeeping.sh dual-classification \
+               --outcome {outcome} --confidence {confidence}
+       Take dual_classification and process_quality VERBATIM from its JSON.
+       # Reference only — the branch table the script implements. Do NOT
+       # hand-evaluate it: g-115-3402's reflection batch (2026-07-27) found TWO
+       # resolved records whose hand-written process_score said unlucky_corrected
+       # (process_quality 0.72 / 0.80) where the script returns deserved_corrected
+       # (0.45 / 0.50) — both had confidence < 0.60. That is not cosmetic drift:
+       # reflect-on-outcome Step 2.5 SKIPS preventive-guardrail extraction on
+       # unlucky_corrected ("process was sound, outcome was variance"), so the
+       # wrong value silently suppressed the guardrail on BOTH records, and the
+       # error ran in the direction that exonerates the process. (guard-1604)
+       #   CONFIRMED & confidence >= 0.60 -> earned_confirmed
+       #   CONFIRMED & confidence <  0.60 -> lucky_confirmed
+       #   CORRECTED & confidence >= 0.60 -> unlucky_corrected
+       #   CORRECTED & confidence <  0.60 -> deserved_corrected
+       #   process_quality = confidence if CONFIRMED else (1.0 - confidence)
 
        # session horizon — reduced metadata:
        # SKIP replay_metadata, context_quality, process_score
@@ -598,7 +654,7 @@ resolve_result:
       confidence: 0.72
       actual: "NO"
       outcome: CORRECTED
-      surprise_level: 7
+      surprise: 7
       reflected: false
 ```
 
@@ -731,10 +787,36 @@ learn_result:
 
 ## Mode 3: Accuracy Report (`--accuracy-report`)
 
-### Step 1: Load All Resolved Hypotheses
+### Step 1: Load the Full Scoreable Population (resolved AND archived)
 
 ```
-Bash: pipeline-read.sh --stage resolved  (all resolved records)
+# BOTH stages are REQUIRED. `--stage resolved` alone is a SURVIVORSHIP FILTER:
+# resolved is the small live holding area, and records migrate to `archived` as
+# they age — so the overwhelming majority of scoreable CONFIRMED/CORRECTED
+# records live in `archived`, not `resolved`. Fetching resolved-only computes
+# the accuracy rate on the small, recent, still-live remnant and calls it the
+# whole population. (g-115-3594. Measured 2026-07-28T20:57 UTC: 42 resolved vs
+# 720 archived; 393 of the 435 scoreable records — 90.3% — sat in archived.
+# Re-measure rather than trusting those figures: the resolved-only denominator
+# is small and churns fast, so any inflation number computed from it decays.
+# The same census 19h earlier read 33/720 and a different inflation. The
+# STRUCTURAL fact — most scoreable records are archived — is what is stable.)
+Bash: pipeline-read.sh --stage resolved
+Bash: pipeline-read.sh --stage archived
+# Score the UNION of the two. Keep EXPIRED / UNRESOLVABLE out of BOTH numerator
+# and denominator (the store-wide convention: only CONFIRMED and CORRECTED are
+# scoreable) — the defect being fixed is that the FETCH dropped archived records
+# that DO carry CONFIRMED/CORRECTED, not that expiries should be scored.
+#
+# CROSS-CHECK, and the cheapest one available: `pipeline-read.sh --meta`
+# already carries a correctly-populated `accuracy` block computed over the same
+# union. If the rate you compute here disagrees with meta.accuracy.accuracy_pct,
+# YOUR population is wrong — do not report until they reconcile. Verified
+# 2026-07-28: this Step was the ONLY consumer in the repo carrying the
+# resolved-only filter. pipeline meta, precheck-eval.py, and
+# tree-accuracy-sync.py all read the union correctly (tree-accuracy-sync's
+# `stage == "resolved"` test is NOT this bug — it filters the LIVE file only,
+# and reads archived from a separate file that needs no stage filter).
 Bash: meta-read.sh meta-knowledge/_index.yaml  # existing meta-data
 
 # Include micro-hypothesis batch stats from pipeline metadata.
@@ -745,16 +827,37 @@ Bash: pipeline-read.sh --meta → micro_hypothesis_stats (if exists)
 
 ### Step 2: Calculate Metrics
 
+EVERY figure below is computed on the resolved+archived UNION from Step 1, and
+every figure MUST be reported with the denominator it was computed over. A bare
+percentage is not reportable here: this Step's defect was invisible for as long
+as it was because `85.7%` reads identically whether its denominator is 7 or 84.
+State `N/M`, and state the population split, so a future reader can see at a
+glance whether the archived side was included.
+
+Per-CATEGORY figures need this most. A category's resolved-only denominator is
+often 1–7, where a single record swings the rate by tens of points and rounds to
+a flattering 100% — so the smaller the denominator, the louder it must be.
+
 ```yaml
 accuracy:
+  population:                    # REQUIRED — emit before any rate
+    scoreable_total: 435         # CONFIRMED + CORRECTED across BOTH stages
+    from_resolved: 42            # the live remnant
+    from_archived: 393           # the aged majority — omitting this IS the bug
+    archived_share_pct: 90.3
+    excluded_non_scoreable: 327  # EXPIRED / UNRESOLVABLE / outcome-null, in neither term
+    measured_at: "2026-07-28T20:57 UTC"   # figures decay; re-measure, do not copy
+    meta_cross_check_pct: 55.6   # pipeline-read.sh --meta accuracy_pct; must reconcile
+
   overall:
-    total: 25
-    confirmed: 18
-    corrected: 7
-    accuracy_pct: 72.0
+    total: 435                   # == population.scoreable_total
+    confirmed: 242
+    corrected: 193
+    accuracy_pct: 55.6
     trend: "improving"  # compare last 10 vs previous 10
 
   by_category:
+    # Always "confirmed/total = pct", never a bare pct.
     politics: {total, confirmed, accuracy, confidence_avg, calibration_error}
     crypto: {total, confirmed, accuracy, confidence_avg, calibration_error}
 

@@ -64,15 +64,62 @@ already loaded — proceed.
 
 ```
 IF invoked with --cadence:
+    # Run this ALONE, in its own Bash call. Do NOT batch it with the 1.1 claim
+    # below (see "Never batch the gate with the claim").
     Bash: core/scripts/fresh-eyes-cadence-check.sh --config-block fresh_eyes_program
-    IF exit 1: Output "Fresh-eyes-program: cadence not crossed — noop." → DONE (return)
+    # Read the OUTPUT TEXT, not just the exit code: the gate prints its verdict
+    # ("noop (…)" vs a fire line) on stdout, and a trailing pipe (| tail, | head)
+    # replaces the gate's rc with the pipe's (guard-1150). A "noop" line means
+    # DONE regardless of what rc you observed.
+    IF noop / exit 1: Output "Fresh-eyes-program: cadence not crossed — noop." → DONE (return)
+                      Do NOT run 1.1. A non-running agent must never hold the claim.
     IF exit 0: proceed
 ELSE (user-invoked, no --cadence flag):
     Proceed directly — user override.
+
+# 1.1 CLAIM the shared ritual (g-115-3218, 2026-07-28) — the FIRST action once
+# committed to running, on BOTH paths above (a user-invoked pass is just as
+# much a duplicate risk to a sibling as a cadence-invoked one).
+# PRECONDITION: the gate above did NOT noop. This line is conditional, not
+# unconditional — reaching it means this agent is about to run the ritual.
+Bash: bash core/scripts/fresh-eyes-record-tick.sh last_fresh_eyes_program_review --claim
 ```
+
+**Never batch the gate with the claim.** They must be separate Bash calls, in
+this order, with the gate's verdict read before the claim runs. Batching inverts
+the mechanism: the claim writes unconditionally, so an agent the gate just
+SUPPRESSED still stamps `__inflight_claim` — overwriting the claim of the sibling
+who is actually mid-flight. Nothing clears that field on the real runner's Phase-8
+stamp, so the stomped claim survives to its 30m TTL carrying the wrong
+`claimed_by` and a later `claimed_at`, silently extending the suppression window
+on every noop. The corruption is invisible: suppression still *works* (a third
+agent sees *a* claim), so the only symptom is a wrong name in shared state.
+
+Observed 2026-07-28T10:18 (zeta): gate printed `noop (… bravo claimed this shared
+ritual 4.6m ago and is still mid-flight …)` and the batched claim overwrote
+bravo's live claim in the same call. Bravo's claim was reconstructed by hand from
+the gate's own "4.6m ago" and restored.
+
+Same shape as `guard-1061` (run `aspirations-claim.sh` ALONE and verify success
+before post-claim setup) and `guard-1007` (read a gate's stdout verdict, do not
+trust rc) — a verdict-bearing call and the action it governs never share a Bash
+invocation.
 
 The cadence script enforces the 100-goal threshold. User invocation
 bypasses it.
+
+**Why the claim, and why it must be FIRST.** This is a SHARED-resource ritual:
+one time series, reviewed on behalf of the whole fleet. The cadence gate reads
+the shared stamp at ritual START, but that stamp is only written at ritual END
+(Phase 8) — so two agents entering this window together both read the same
+pre-fire value, both pass, and both run the entire review. Measured: 4 duplicate
+rituals across ~34 fires made AFTER the team gate landed (2026-06-15, 06-19, and
+BOTH slots on 07-19; gaps 2m48s–9m52s). The claim is visible to a sibling's gate
+immediately, so it noops instead of re-deriving the same briefing. Run it as
+early as possible — the residual race is exactly the span between the gate
+passing and this line. Best-effort: a WARN degrades duplicate suppression but
+never blocks the ritual, the call is a no-op for non-team-aware slots, and the
+claim expires after 30m so a ritual that dies here cannot lock the fleet out.
 
 ## Phase 2: Briefing Assembly (read-only)
 
@@ -80,6 +127,52 @@ Read the inputs. Cache each result so Phase 3 can synthesize without
 re-reading.
 
 ```
+# 2.0 PRIOR SERIES — read this FIRST, before any instrument (g-115-3527, 2026-07-28)
+# program-alignment-health is the accumulated memory of every prior program
+# review: the verdict streak (~79% no_change over 29 known passes — 23 of 29), the
+# Decision Rules, the two attested Program edits, and the extraction caveats
+# that prior reviewers recorded so their successors would not re-derive a
+# finding already investigated and closed.
+Bash: bash core/scripts/tree-read.sh --node program-alignment-health
+  → capture: the last 2-3 assessment-history rows, ALL Decision Rules, and every
+    paragraph containing "Corrected" / "caveat" / "RETRACTED" / "already filed"
+  → carry these into Phase 3. Before writing ANY finding, check it against
+    them: a signal the series has already investigated and closed is NOT a
+    new finding, however fresh the instrument reading looks.
+  → also note who fired last and at what counter. If a sibling agent ran
+    within ~50 goals, THIS pass is a duplicate-cadence CONFIRMING pass —
+    record it as a confirming measurement, not an independent assessment.
+    WHY a duplicate can still reach you (corrected 2026-07-28, g-115-3218):
+    NOT because "per-agent WM slots do not see each other's fires" — that
+    note predates g-115-1388 and is STALE. The gate IS team-aware:
+    fresh-eyes-cadence-check.py `team_stamp_value()` reads
+    world/team-state.yaml `shared_cadences.<slot>` (written by
+    fresh-eyes-record-tick.sh on every fire) and noops while the team's last
+    fire is within cadence, so a sibling fire you can SEE is already
+    suppressed. What survives is narrower and purely temporal: the gate READS
+    that stamp when the ritual STARTS and the stamp is WRITTEN when it ENDS,
+    with no write in between — so agents who enter that multi-minute window
+    together all read the same pre-fire value and all pass. A duplicate here
+    means you overlapped, not that the mechanism is missing.
+  → Decision Rule 1 is the one most often needed: `no_change` is the BASE RATE,
+    not a weak pass. Do not read an empty-handed Phase 3 as a reason to hunt
+    harder for an edit.
+
+# WHY 2.0 EXISTS AND WHY IT IS FIRST. The node used to be reachable only at
+# Phase 5.6, where the encoding novelty-gate forces it — i.e. AFTER the briefing
+# was already synthesized. That ordering guarantees each reviewer re-derives
+# from scratch, and lets a recorded finding catch the re-run only at encode
+# time, once a redundant section is already written. Measured (2026-07-27,
+# alpha, counter 7210): with no node to read, a full Phase-2 evidence pass was
+# spent re-deriving a workspace-path defect ALREADY filed as g-115-3220
+# (foxtrot, 07-26) and cross-referenced inside g-115-3489 — which the same
+# reviewer had filed itself at 11:49 the SAME DAY. The draft goal was discarded
+# at the dedup probe, after the cost was already paid. In the same session the
+# same reviewer ran /fresh-eyes-tree, whose Phase 2.0 early read stopped a
+# re-litigation of a question settled across four prior passes. Same reviewer,
+# same session, both rituals — the discriminating variable was whether the
+# series node was read BEFORE the evidence pass or after it.
+
 # 2.1 The Program — the world's shared purpose
 Bash: world-cat.sh program.md
   → capture full body content
@@ -273,6 +366,7 @@ SIGNALS_JSON='{
   "portfolio_drift_score":          {0..1 — degree cross-agent portfolio has drifted from Program emphasis since last review},
   "completion_health":              {0..1 — average completion ratio across active aspirations (both agents)},
   "self_evolution_signals_count":   {int — Program-related drift indicators across both agents = sq-012/self_evolution pending-questions hits citing purpose (2.6) + len(board_signals) from the findings board (2.6b). A program/self-drift finding on the board counts even when pending-questions is empty (rb-1279 — the count silently 0 on 2026-05-24)},
+  "confirming_signal_fraction":     {0..1 — fraction of the counted self_evolution signals that are CONFIRMING (non-divergent FOR THE PROGRAM), so the act_later gate fires on NET Program-divergent signal not gross volume. This PULLS the (1 - confirming_signal_fraction) discount that self-assess-and-decide.sh already applies (lines 50/159) but that fresh-eyes-program was leaving at the 0.0 default (= every signal treated as divergent). Compute = confirming / self_evolution_signals_count, where a board_signal (2.6b) is CONFIRMING when it is a PER-AGENT-SELF signal (out-of-scope for a Program review — per-agent Self routes via sq-012/guard-380, NOT The Program), OR stale, OR it AFFIRMS a current Program facet (an agent Self that still maps cleanly to a Program facet is stability evidence, not change-pressure); DIVERGENT only when a signal is a genuine PROGRAM-drift/purpose indicator that is FRESH AND suggests The Program ITSELF needs change. pq_signals citing purpose-drift are genuine change-indicators (never confirming). Emit 0.0 only when self_evolution_signals_count == 0. WHY (g-115-2892, zeta 2026-07-22): fresh-eyes-program returned act_later solely on self_evolution_signals_count=5 when ALL 5 board signals were WEAK per-agent-SELF signals explicitly 'recorded for cross-signal review, NOT acted on' — ZERO Program-drift, partner_alignment 0.85, program.md fresh 2026-07-16 — a false-positive treadmill re-filing a follow-up Idea every review. This is the Program-review twin of the g-115-1742 fresh-eyes-review confirming_signal_fraction fix (an affirming/out-of-scope external signal is stability, not drift)},
   "self_last_updated_days":         {int — days since world/program.md last_updated},
   "partner_alignment_score":        {0..1 — cross-agent agreement on Program emphasis; LOW = misalignment},
   "explicit_user_directive":        {true|false — outstanding /respond about The Program or shared purpose},
@@ -331,13 +425,17 @@ For each REMAINING briefing observation, classify per
 doubt, drop — the asymmetry favors dropping:
 
 - **tree** — a compressed durable fact (program-alignment ratio, team-model
-  coverage metric, cross-agent work dynamic). **Novelty gate (mandatory):**
-  before adding, check whether a node already covers this observation
-  (`tree-read.sh --node {candidate-key}`, or a `retrieve.sh` lookup). If one
-  exists and this is only a refreshed measurement, `/tree edit` it (update
-  body + `last_updated` + `last_update_trigger: fresh-eyes-program`) instead
-  of adding a duplicate. Use `/tree add {parent} {key} {summary}` ONLY for a
-  genuinely novel finding.
+  coverage metric, cross-agent work dynamic). **The standing target is
+  `program-alignment-health`** under the `system` L1 — this ritual's series
+  node, sibling in shape to `/fresh-eyes-tree`'s `l1-taxonomy-health`
+  (g-115-3527). Default to `/tree edit` on it: append this pass to its
+  `## Assessment history` table, refresh `## Verified Values`, and update
+  `last_updated` + `last_update_trigger: fresh-eyes-program`. **Novelty gate
+  (mandatory — preserves a time series instead of flooding):** a genuinely
+  novel finding that does NOT belong in the series (a distinct durable fact
+  with its own retrieval identity) may take `/tree add {parent} {key}
+  {summary}`, but check first with `tree-read.sh --node {candidate-key}` or a
+  `retrieve.sh` lookup. A refreshed measurement is an edit, never an add.
 - **reasoning_bank** — a recurring drift / alignment diagnostic.
   `reasoning-bank-add.sh` with summary + ABC chain + `applies_to`
   (`framework` for multi-agent / program-alignment patterns, else `any`).

@@ -255,7 +255,7 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
      # retirement block below.)
      # Only runs during --full-cycle.
 
-     Read agents/<agent>/weakness-report.yaml (create with {last_analyzed: null, analysis_count: 0, weaknesses: [], signal_baseline: {captured_at: null, guardrail_times_active: {}, rollback_count: 0, pattern_totals: {}}} if missing)
+     Read agents/<agent>/weakness-report.yaml (create with {last_analyzed: null, analysis_count: 0, weaknesses: [], signal_baseline: {captured_at: null, guardrail_times_active: {}, signature_outcomes: {}}} if missing)
 
      # WINDOWED SIGNAL SOURCES (g-115-2002 / sig-27 CONFIRMED): several raw signals
      # below are MONOTONIC CUMULATIVE counters that never stop firing once they
@@ -277,7 +277,7 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
      # HISTORY — even windowed, the counter carries no fire information; the
      # source is retired outright in the g-115-2141 block below. The windowing
      # doctrine stands for pattern totals + any future counter-derived source.)
-     baseline = weakness_report.signal_baseline (default {captured_at: null, guardrail_times_active: {}, rollback_count: 0, pattern_totals: {}})
+     baseline = weakness_report.signal_baseline (default {captured_at: null, guardrail_times_active: {}, signature_outcomes: {}})
      first_pass = (baseline.captured_at is null)  # no history yet → cumulative-counter sources emit nothing; baseline is written at end-of-pass
 
      # Gather signals — 3 CONSUMED sources: pattern_signatures (windowed,
@@ -442,13 +442,27 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
      # crosses threshold NEXT window is measured from its value NOW. Runs on EVERY
      # pass — including passes with < 2 signals that skip synthesis — so the window
      # advances every cycle, never stalls at a stale baseline.
-     weakness_report.signal_baseline = {
-         captured_at: now,
-         guardrail_times_active: {g.id: g.utilization.times_active FOR EACH active guard},
-         rollback_count: len(result.rollback_history),
-         pattern_totals: {sig.id: sig.outcome_stats.total FOR EACH active sig}
-     }
-     Edit agents/<agent>/weakness-report.yaml with updated content
+     # THE SCRIPT ALREADY DID THIS — do NOT hand-write the baseline (g-115-4110).
+     # `weakness-signals.py` writes signal_baseline itself on every non-seeding run
+     # (unless --no-baseline-update), which is what "baseline seeding + storage owned
+     # by the script" above means. The schema it writes is THREE keys:
+     #     captured_at          — ISO timestamp of this pass
+     #     guardrail_times_active — {guard_id: utilization.times_active} for active guards
+     #     signature_outcomes   — {sig_id: outcome_stats} for active signatures
+     # There is NO `rollback_count` and NO `pattern_totals`. Those two names appeared
+     # only in this pseudocode and were never written by anything; a reader who queried
+     # them got an empty dict and could reasonably conclude the pattern source was
+     # structurally silent. It is not — measured 2026-07-30: signature_outcomes carried
+     # 55 entries while `pattern_totals` read as absent. Backpressure is windowed by
+     # TIMESTAMP (see the 14d filter above), so it needs no baseline count at all.
+     # rb-245 applies to reading this file as much as to the stores it describes:
+     # enumerate the artifact's REAL keys before concluding a source is inert.
+     Only update the LLM-owned fields (the script does not touch these):
+         weakness_report.last_analyzed  = now
+         weakness_report.analysis_count += 1
+         weakness_report.weaknesses      = <synthesized list, if any>
+     Edit agents/<agent>/weakness-report.yaml with those fields only —
+     leave signal_baseline exactly as the script wrote it.
 
      Output: "▸ Weakness analysis: {len(signals)} signals, {new_weakness_count} new weakness(es), {goal_count} investigation goal(s)"
 5.7. **Meta-Reflection ROI Tracking**:
@@ -479,9 +493,29 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
      Bash: tree-read.sh --stats
      
      # Staleness check: heavily-used nodes that haven't been updated recently
-     FOR EACH node where retrieval_count > 10 AND last_updated older than 5 sessions:
-         echo '{"node_key": "<key>", "reason": "stale-high-retrieval", "retrieval_count": <N>, "sessions_since_update": <M>, "priority": "MEDIUM"}' | wm-append.sh knowledge_debt
-         Log: "▸ Tree lint: {node.key} flagged stale (retrieved {retrieval_count}x, last updated {sessions_ago} sessions ago)"
+     #
+     # READ `_tree.yaml`, NOT `tree-read.sh --summary` (g-115-4110, measured
+     # 2026-07-30 on cc-02 / Linux 6.8.0-136-generic). --summary exposes exactly
+     # eight fields — file, summary, depth, capability_level, confidence,
+     # last_updated, article_count, children — and `retrieval_count` is NOT among
+     # them, so a lint driven off --summary evaluates `retrieval_count > 10`
+     # against a missing key and reports ZERO stale nodes, every time, on a tree
+     # where the true answer is 779. The field is real and fully populated: 1296
+     # of 1299 nodes carry a nonzero count in `_tree.yaml`, max 433. This step
+     # already reads `_tree.yaml` below for cross-references — use the same read.
+     Bash: world-cat.sh knowledge/tree/_tree.yaml   # nodes[] carries retrieval_count
+     #
+     # BOUND THE OUTPUT. At real numbers this predicate matches 984 nodes with
+     # retrieval_count > 10, of which 779 are >14d stale — an unbounded
+     # `FOR EACH -> wm-append.sh knowledge_debt` would write hundreds of debt
+     # items in one pass and bury every other signal in working memory. Flag the
+     # TOP 5 by retrieval_count and report the full count alongside, so the
+     # backlog stays visible without being transcribed.
+     stale = [n for n in nodes if n.retrieval_count > 10 and days_since(n.last_updated) > 14]
+     Log: "▸ Tree lint: {len(stale)} stale high-retrieval nodes (of {len(hi)} with rc>10) — flagging top 5"
+     FOR EACH node in sorted(stale, by retrieval_count desc)[:5]:
+         echo '{"node_key": "<key>", "reason": "stale-high-retrieval", "retrieval_count": <N>, "days_since_update": <M>, "total_stale_at_scan": <len(stale)>, "priority": "MEDIUM"}' | wm-append.sh knowledge_debt
+         Log: "▸ Tree lint: {node.key} flagged stale (retrieved {retrieval_count}x, last updated {days_ago}d ago)"
      
      # Cross-reference discovery: nodes that share entities but aren't linked
      Bash: world-cat.sh knowledge/tree/_tree.yaml  # entity_index
@@ -493,7 +527,10 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
                  Log: "▸ Tree lint: cross-reference added between {node_a.key} and {node_b.key} (shared entity: {entity})"
      
      # Width check: interior nodes exceeding K_max children
-     Read core/config/tree.yaml for K_max
+     # K_max is NESTED at `config.K_max` in core/config/tree.yaml (currently 40),
+     # not top-level — a top-level lookup returns None and the comparison below
+     # throws rather than reporting zero, which is at least the loud failure.
+     Read core/config/tree.yaml → config.K_max
      FOR EACH interior node where child_count > K_max * 2:
          Log: "▸ Tree lint: {node.key} has {child_count} children (K_max={K_max}) — consider reorganization"
          bash core/scripts/tree-update.sh --set <node.key> growth_state ready_to_decompose

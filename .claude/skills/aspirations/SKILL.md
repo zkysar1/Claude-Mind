@@ -77,8 +77,34 @@ If unable to reach user, create a `participants: [agent, user]` goal. Do NOT blo
 
 Before writing ANY entry to `agents/<agent>/session/pending-questions.yaml`:
 1. Search knowledge tree, reasoning bank, guardrails, experience archive
+1a. **Check the standing-grant table FIRST** — `world/conventions/capability-routing.md`
+    (`grant-NNN` rows + the Matching rule under them). A pending question asks the
+    user to do something; a standing grant is the record that they already delegated
+    it. This store is authoritative and cheap to read, and the four stores in step 1
+    do NOT include it. `bash core/scripts/world-cat.sh conventions/capability-routing.md`
+1b. If step 1a finds nothing, check the **decisions board** for a grant made but not
+    yet materialized into the table:
+    `bash core/scripts/board-read.sh --channel decisions --since 720h`
+    (filter for grant / authorization / "go ahead" / "full permission" language).
+    A hit here means the grant is real but the table is stale — materialize it into
+    `capability-routing.md` as part of this same iteration, so the next agent finds
+    it at 1a instead of re-deriving it from a 30-day board scan.
 2. If found: ATTEMPT it. If succeeds: skip pq-XXX
 3. If fails: write pq-XXX with `attempted_solutions` + `autonomous_search_done: true`
+
+Why 1a precedes 1b (g-115-3636, measured 2026-07-28): the originating report assumed
+grants live ONLY on the board. They do not — `capability-routing.md` carries the full
+`grant-001..009` table with provenance, matching, and revocation rules, and the specific
+grant that motivated this fix (grant-007, product-repo PR merge, 2026-07-18) was already
+materialized there. Grant-RECORDING is working; the defect was that ASAP's four-store
+list omits the store the grants are recorded IN. The board scan is the net for the
+recording lag, not the primary lookup.
+
+A grant is not a capability — it is a permission that CHANGED at a point in time, so
+`capability-before-user.md` and `probe-before-defer.md`, which consult a static
+capability catalog, do not catch it. This step is where a standing grant gets seen.
+Sibling gate at report time: `guard-1066` (re-verify a pending item's premise before
+presenting it to the user).
 
 ## `loop` — The Perpetual Heartbeat
 
@@ -181,7 +207,16 @@ Bash: wm-read.sh --json
 if all slots null:
     Read core/config/memory-pipeline.yaml
     Bash: wm-init.sh
-    echo '{"session_id": "session-{session_count}", "session_start": "<today>"}' | Bash: wm-set.sh active_context
+    # session_start is a TOP-LEVEL WM slot — the slot session_artifacts_count.py reads for
+    # the productivity-gate encoding_ratio — NOT active_context (whose canonical schema is
+    # {summary, experience_refs, retrieval_manifest}; writing session metadata there both
+    # targets a slot the gate never reads AND clobbers active_context's real schema). /start
+    # is the canonical seeder (start/SKILL.md) and wm-reset preserves session_start, so seed
+    # here ONLY as a fresh-WM fallback and ONLY when unset, to avoid overwriting the /start
+    # run-start stamp with a mid-run timestamp. (g-115-2828 — the claimed "unset session_start
+    # silently degrades encoding_ratio" did not reproduce: the unset case is loudly handled by
+    # g-115-2179/guard-1090; the real bug was this misplaced write.)
+    Bash: wm-read.sh session_start → IF the value is null: `date +%Y-%m-%dT%H:%M:%S | wm-set.sh session_start`
     Seed recent_violations, pending_resolutions from scripts
     IF handoff.yaml has known_blockers_active: seed known_blockers
 
@@ -294,10 +329,13 @@ Bash: `py -3 core/scripts/stranded-claim-sweep.py --apply`
 # Consumes the `pending_phase_6_spark` WM slot written by TWO producers:
 # (1) recurring-close.sh at end-of-script — AFTER the four iteration-close
 # phases, just before the terminal imperative (NOT during Block C/D, which
-# runs earlier); (2) iteration-close.sh do_verify for NON-recurring deep
-# completions (g-115-2416 — script-enforced parity; previously Phase 6 for
-# non-recurring deep closes rode on LLM memory alone and drifted, observed
-# miss g-115-2404). Both producers emit a stdout imperative AND the sentinel;
+# runs earlier); (2) iteration-close.sh do_state_update for NON-recurring deep
+# completions (g-115-2416 origin — script-enforced parity; the sentinel WRITE
+# was MOVED from do_verify to do_state_update by g-115-2848 because do_verify's
+# --outcome is optional and an omission silently no-op'd the write, g-115-2839
+# — do_verify still emits the in-turn Phase-6 stdout imperative. Previously
+# Phase 6 for non-recurring deep closes rode on LLM memory alone and drifted,
+# observed miss g-115-2404). Both producers emit a stdout imperative AND the sentinel;
 # spark-fire-dedup makes in-turn firing + sentinel consumption idempotent.
 # Corollary:
 # a NULL read here while the bg recurring-close is still mid-phase is EXPECTED,
@@ -344,7 +382,19 @@ IF signal is not null:
         # between the in-turn fire and this check exceeded 5min (g-115-1404 /
         # rb-1674). Older sentinels without set_at pass empty → fall back to the
         # (now 60-min, TTL-aligned) window in spark-fire-dedup.py.
-        Bash: dedup=$(bash core/scripts/wm-read.sh spark_fired_session --json | py -3 core/scripts/spark-fire-dedup.py check {signal.goal_id} --sentinel-set-at "{signal.set_at}")
+        # Pass `producer` too (g-115-3351). On the NON-recurring path the
+        # sentinel is normally NOT WRITTEN AT ALL when an in-turn spark already
+        # fired — iteration-close.sh do_state_update now checks
+        # spark_fired_session before writing — so this consumer usually sees no
+        # sentinel for that path. This flag is the defense-in-depth backstop for
+        # the degraded case where that write-side probe failed open: for
+        # producer="nonrecurring-state-update" the consumption window's LOWER
+        # bound is DROPPED, because that gap is the LLM's unbounded Phase-6 span
+        # and a non-recurring goal closes exactly once (no prior close to
+        # mis-match). A sentinel with no producer field (recurring-close.sh, or
+        # any pre-g-115-3351 sentinel) keeps the bounded behavior, which is
+        # correct for it — there the lookback models a bounded script runtime.
+        Bash: dedup=$(bash core/scripts/wm-read.sh spark_fired_session --json | py -3 core/scripts/spark-fire-dedup.py check {signal.goal_id} --sentinel-set-at "{signal.set_at}" --producer "{signal.producer}")
         IF dedup == "skip":
             Output: "▸ PENDING-PHASE-6-SPARK: dedup-skip for {signal.goal_id} — spark already fired in-turn (fast-stdout path) at/after this sentinel's set_at; clearing sentinel without re-firing (g-115-1203 / g-115-1404)"
             Bash: `echo 'null' | wm-set.sh pending_phase_6_spark`
@@ -503,7 +553,13 @@ the first firing per session actually reads the file into context.)
 
 **Recurring-goal shortcut**: when the just-executed goal has `recurring: true`,
 collapse steps 1, 2, 4, 5 into a single call:
-`Bash: recurring-close.sh <goal-id> <routine|deep> [--source world|agent] [--summary "..."]`
+`Bash: recurring-close.sh <goal-id> <routine|deep> [--source world|agent] [--summary "..."] [--tree-updated] [--tree-updated-override] [--artifacts-count N] [--encoding-score X] [--findings-count N]`
+
+The five § STATE-UPDATE quality flags (g-115-3192) are forwarded to the wrapped
+`--phase state-update` ONLY. Pass them on THIS call for a deep close — guard-1235
+rules out any post-hoc amend, because re-running state-update to add them re-fires
+journal-append and iteration-commit. Omitting them leaves iteration-close.sh at its
+argparse defaults, exactly as before.
 This wraps the 4 phases atomically AND advances `lastAchievedAt` (via
 `aspirations-complete-by.sh` inside `iteration-close.sh do_verify`) AND
 maintains the cross-session `consecutive_routine` counter on the goal AND

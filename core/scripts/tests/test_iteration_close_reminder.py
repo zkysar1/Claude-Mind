@@ -1,12 +1,32 @@
-"""test_iteration_close_reminder.py —  regression test.
+"""test_iteration_close_reminder.py —  +  regression tests.
 
-Pins outcome-aware reminder text selection in iteration-close-reminder.py:
+Pins TWO independent decisions in iteration-close-reminder.py. They are separate
+questions and have opposite defaults; conflating them produced the g-115-4179
+false-fire class.
+
+WHETHER to inject at all (the outcome gate, g-115-4179):
+
+  stdout carries "[<script>-close] ... ITERATION COMPLETE"     -> inject
+  --help probe / usage error / invalid outcome-class or
+    --source / truncated mid-phase output / no tool_response   -> inject NOTHING
+
+WHICH reminder text, once a close is proven (g-115-1138):
 
   recurring-close.sh stdout contains
     "[recurring-close] OUTCOME=deep -- NEXT ACTION REQUIRED"   -> DEEP_RECURRING
   iteration-close.sh productivity-check (no OUTCOME marker)    -> GENERIC
   recurring-close.sh OUTCOME=routine (different marker text)   -> GENERIC
-  tool_response missing / empty / wrong shape                  -> GENERIC (fail-open)
+  unexpected tool_response shape                               -> GENERIC (fail-open)
+
+g-115-4179 origin (discovered during g-001-10, 2026-07-31): the hook decided
+whether to fire from the COMMAND TEXT alone and never checked whether the close
+succeeded. `recurring-close.sh --help` was rejected, closed nothing, printed no
+ITERATION COMPLETE — and the hook injected the full deadman-pair directive
+asserting an iteration had closed. The directive is maximally imperative
+("your terminal response MUST be EXACTLY these TWO batched tool calls"), so an
+agent obeying it mid-goal abandons its in-flight work and re-enters the loop on
+a false premise. guard-1118 / guard-1162 are the Layer-A compensations this gate
+makes unnecessary.
 
 Origin (zeta investigation g-115-1121, 2026-05-22): the hook predated the
 g-115-977 outcome-aware imperative split in recurring-close.sh by 27 days.
@@ -230,14 +250,33 @@ def test_iteration_close_productivity_check_emits_generic_reminder(tmp_path):
     )
 
 
-# ── Case 4: missing tool_response → fail-open (GENERIC, no crash) ───────
+# ── Case 4 + malformed shapes: no close evidence → inject NOTHING ───────
+#
+# CONTRACT CHANGE,  (2026-07-31). These three cases previously
+# asserted GENERIC_MARKER — i.e. "no evidence of a close → fire anyway". That
+# was the  fail-open, and it was written to answer a DIFFERENT
+# question than the one it ended up governing:
+#
+#   _is_deep_recurring_close  answers WHICH reminder (deep vs generic).
+#     Fail-open there is right, and is UNCHANGED — an unknown shape still
+#     degrades to the generic text rather than crashing.
+#   _close_actually_completed answers WHETHER to emit one at all.
+#     Fail-open there is WRONG: it injects a maximally-imperative "an
+#     iteration just closed" directive on no evidence that one did.
+#
+# The three cases below exercise the second question, so their assertion
+# flips. Their original intent — the hook must not crash on a weird payload —
+# is preserved verbatim in the rc == 0 assertions. Direction is deliberate and
+# specified by the goal: a FALSE fire tells the agent to abandon live work; a
+# MISSED fire is caught by the Stop hook, return-protocol discipline, and the
+# pending_phase_6_spark sentinel.
 
 
-def test_missing_tool_response_fails_open_to_generic(tmp_path):
+def test_missing_tool_response_injects_nothing(tmp_path):
     """Older Claude Code versions / non-standard payloads may omit
-    tool_response entirely. The hook must NOT crash — it must fall through
-    to the generic reminder (preserves the original session-58 alpha-stopping
-    safety-net behavior)."""
+    tool_response entirely. The hook must NOT crash (rc=0) AND must inject
+    nothing — with no tool_response there is no evidence any iteration
+    closed."""
     proj = _build_fake_project(tmp_path, AGENT, SID)
     # tool_response key entirely absent from the payload.
     payload = _make_payload(COMMAND_RECURRING, tool_response=None)
@@ -246,42 +285,187 @@ def test_missing_tool_response_fails_open_to_generic(tmp_path):
         f"hook must fail-open (rc=0) when tool_response missing; "
         f"got rc={rc}, stderr={stderr[-300:]}"
     )
-    ctx = _additional_context(stdout)
-    assert GENERIC_MARKER in ctx, (
-        f"missing tool_response should fall through to generic reminder; "
-        f"got: {ctx[:400]}"
-    )
-    assert DEEP_MARKER not in ctx, (
-        f"missing tool_response must NOT emit spark reminder (no evidence "
-        f"the close was deep); got: {ctx[:400]}"
+    assert stdout.strip() == "", (
+        f"missing tool_response is NO evidence of a close — the hook must "
+        f"inject nothing; got stdout: {stdout[:400]}"
     )
 
 
-# ── Bonus: malformed tool_response shapes also fail-open ────────────────
-# Not part of the 4-case acceptance matrix from , but the
-# fail-open contract in _is_deep_recurring_close warrants explicit pins.
-
-
-def test_non_dict_tool_response_fails_open_to_generic(tmp_path):
-    """tool_response is a string instead of a dict — fail-open path."""
+def test_non_dict_tool_response_injects_nothing(tmp_path):
+    """tool_response is a string instead of a dict — no crash, no injection."""
     proj = _build_fake_project(tmp_path, AGENT, SID)
     payload = _make_payload(COMMAND_RECURRING, tool_response="not-a-dict")
     rc, stdout, _ = _invoke_hook(payload, proj)
     assert rc == 0
-    ctx = _additional_context(stdout)
-    assert GENERIC_MARKER in ctx and DEEP_MARKER not in ctx
+    assert stdout.strip() == "", (
+        f"non-dict tool_response carries no close marker — inject nothing; "
+        f"got stdout: {stdout[:400]}"
+    )
 
 
-def test_tool_response_missing_stdout_fails_open_to_generic(tmp_path):
-    """tool_response present but stdout key missing — fail-open path."""
+def test_tool_response_missing_stdout_injects_nothing(tmp_path):
+    """tool_response present but stdout key missing — no crash, no injection."""
     proj = _build_fake_project(tmp_path, AGENT, SID)
     payload = _make_payload(
         COMMAND_RECURRING, tool_response={"stderr": "x", "interrupted": False}
     )
     rc, stdout, _ = _invoke_hook(payload, proj)
     assert rc == 0
-    ctx = _additional_context(stdout)
-    assert GENERIC_MARKER in ctx and DEEP_MARKER not in ctx
+    assert stdout.strip() == "", (
+        f"tool_response without stdout carries no close marker — inject "
+        f"nothing; got stdout: {stdout[:400]}"
+    )
+
+
+# ── : the false-fire class the outcome gate closes ────────────
+#
+# Every case below invokes a close script by command text (so the pre-fix
+# predicate matched and fired) while closing NOTHING. Each is reachable from a
+# normal agent turn: a --help probe, and the three early-exit rejections in
+# recurring-close.sh (usage L135, invalid outcome-class L145, invalid --source
+# L164). Per guard-1943, a suite that only feeds a SUCCESSFUL close cannot
+# distinguish the pre-fix hook from the fixed one — these are the cases that
+# can.
+
+
+def test_help_probe_that_closed_nothing_injects_nothing(tmp_path):
+    """The observed incident (, 2026-07-31): `recurring-close.sh
+    --help` is rejected by the script, prints no ITERATION COMPLETE, and
+    closes nothing — yet the command text matched and the full deadman-pair
+    directive fired. Obeying it mid-goal abandons the in-flight goal."""
+    proj = _build_fake_project(tmp_path, AGENT, SID)
+    payload = _make_payload(
+        "bash core/scripts/recurring-close.sh --help",
+        {
+            "stdout": "",
+            "stderr": "recurring-close: unknown flag --help\n",
+            "interrupted": False,
+        },
+    )
+    rc, stdout, stderr = _invoke_hook(payload, proj)
+    assert rc == 0, f"hook exit non-zero: rc={rc}, stderr={stderr[-300:]}"
+    assert stdout.strip() == "", (
+        f"a rejected --help probe closed no iteration — the hook must inject "
+        f"nothing; got stdout: {stdout[:400]}"
+    )
+
+
+@pytest.mark.parametrize(
+    "label,command,resp_stdout,resp_stderr",
+    [
+        (
+            "usage-error",
+            "bash core/scripts/recurring-close.sh",
+            "",
+            "recurring-close: usage: recurring-close.sh <goal-id> "
+            "<outcome-class> [--source <world|agent>]\n",
+        ),
+        (
+            "invalid-outcome-class",
+            "bash core/scripts/recurring-close.sh g-001-05 banana",
+            "",
+            "recurring-close: invalid outcome class 'banana' "
+            "(expected: routine|deep)\n",
+        ),
+        (
+            "invalid-source",
+            "bash core/scripts/recurring-close.sh g-001-05 routine --source moon",
+            "",
+            "recurring-close: invalid --source 'moon' (expected: world|agent)\n",
+        ),
+        (
+            "iteration-close-phase-rejected",
+            "bash core/scripts/iteration-close.sh --phase productivity-check",
+            "[iteration-close] missing required flag(s): --source\n",
+            "",
+        ),
+    ],
+)
+def test_rejected_close_invocations_inject_nothing(
+    tmp_path, label, command, resp_stdout, resp_stderr
+):
+    """Each early-exit rejection path matched the command-text predicate and
+    fired the reminder pre-fix. None of them printed ITERATION COMPLETE,
+    because none of them closed anything."""
+    proj = _build_fake_project(tmp_path, AGENT, SID)
+    payload = _make_payload(
+        command,
+        {"stdout": resp_stdout, "stderr": resp_stderr, "interrupted": False},
+    )
+    rc, stdout, hook_stderr = _invoke_hook(payload, proj)
+    assert rc == 0, f"[{label}] hook exit non-zero: rc={rc}, {hook_stderr[-300:]}"
+    assert stdout.strip() == "", (
+        f"[{label}] closed no iteration — the hook must inject nothing; "
+        f"got stdout: {stdout[:400]}"
+    )
+
+
+def test_partial_output_without_the_marker_injects_nothing(tmp_path):
+    """A close that ran real work but died before its terminal marker (a
+    mid-phase crash, a truncated stream) is NOT a completed iteration. The
+    gate keys on the marker, not on 'stdout looks close-ish'."""
+    proj = _build_fake_project(tmp_path, AGENT, SID)
+    truncated = (
+        "[iteration-close] retrieval gate (state-update): inferred utilization\n"
+        "[loop-state-bump-counters] outcome=deep goals_completed=162\n"
+        "[iteration-close] iteration-commit: {\"commit_sha\": \"abc123\"}\n"
+    )
+    payload = _make_payload(
+        COMMAND_ITERATION_CLOSE,
+        {"stdout": truncated, "stderr": "", "interrupted": True},
+    )
+    rc, stdout, _ = _invoke_hook(payload, proj)
+    assert rc == 0
+    assert stdout.strip() == "", (
+        f"close output without the terminal marker is not a completed "
+        f"iteration; got stdout: {stdout[:400]}"
+    )
+
+
+def test_marker_survives_rule_character_drift(tmp_path):
+    """The gate anchors on the two STABLE literals — the bracketed producer
+    tag and the phrase — so a cosmetic change to the U+2550 rule characters
+    cannot silently re-open the false-fire (the same tolerance
+    _DEEP_RECURRING_RE has for dash drift). Mirrors the producer-side pin in
+    /verify-learning sq-018."""
+    proj = _build_fake_project(tmp_path, AGENT, SID)
+    for variant in (
+        "[iteration-close] ═══ ITERATION COMPLETE ═══",   # production literal
+        "[iteration-close] === ITERATION COMPLETE ===",   # ascii drift
+        "[iteration-close] --- ITERATION COMPLETE ---",   # hyphen drift
+        "[iteration-close] ITERATION COMPLETE",           # rule removed
+    ):
+        payload = _make_payload(
+            COMMAND_ITERATION_CLOSE,
+            {"stdout": variant + "\n", "stderr": "", "interrupted": False},
+        )
+        rc, stdout, _ = _invoke_hook(payload, proj)
+        assert rc == 0
+        ctx = _additional_context(stdout)
+        assert GENERIC_MARKER in ctx, (
+            f"marker variant {variant!r} should still be recognised as a "
+            f"completed close; got: {ctx[:200]}"
+        )
+
+
+def test_tag_and_phrase_on_separate_lines_do_not_pair(tmp_path):
+    """The gate's inter-literal run excludes newlines, so a producer tag on
+    one line cannot pair with the phrase on another to manufacture a false
+    positive."""
+    proj = _build_fake_project(tmp_path, AGENT, SID)
+    payload = _make_payload(
+        COMMAND_RECURRING,
+        {
+            "stdout": "[recurring-close] starting\nsome ITERATION COMPLETE text\n",
+            "stderr": "",
+            "interrupted": False,
+        },
+    )
+    rc, stdout, _ = _invoke_hook(payload, proj)
+    assert rc == 0
+    assert stdout.strip() == "", (
+        f"tag and phrase on separate lines must not pair; got: {stdout[:400]}"
+    )
 
 
 # ── Orphaned-stdin regression (): hook must NOT hang forever ──

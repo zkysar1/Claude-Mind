@@ -53,8 +53,15 @@ fi
 goal_json="$(py -3 "$SCRIPT_DIR/scorer-override-audit.py" --since-hours "$SINCE" --emit-investigate-goal || true)"
 
 if [ -n "$goal_json" ]; then
-    printf '%s' "$goal_json" | bash "$SCRIPT_DIR/aspirations-add-goal.sh" --source world asp-115
-    echo "[scorer-override-audit] HITS in ${SINCE}h — filed Investigate goal into asp-115"
+    # : resolve the escalation aspiration per deployment. A literal
+    #  is the UPSTREAM queue and exists nowhere else, so downstream this
+    # add-goal failed aspiration_not_found and the audit's finding was dropped.
+    # Resolved inline (not at script top) — this branch only runs on hits, so
+    # the clean-window common path pays nothing for the subprocess.
+    _et="$(bash "$SCRIPT_DIR/escalation-target.sh")" || _et="asp-115 world"
+    printf '%s' "$goal_json" | bash "$SCRIPT_DIR/aspirations-add-goal.sh" \
+        --source "${_et##* }" "${_et%% *}"
+    echo "[scorer-override-audit] HITS in ${SINCE}h — filed Investigate goal into ${_et%% *}"
 else
     # Also print the human report for the log/operator when clean.
     py -3 "$SCRIPT_DIR/scorer-override-audit.py" --since-hours "$SINCE"

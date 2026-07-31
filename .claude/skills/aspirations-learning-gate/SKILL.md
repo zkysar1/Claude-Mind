@@ -130,12 +130,20 @@ IF meta_insight_detected:
 
 Verify retrieval happened and utilization feedback completed.
 
-**NOTE: The `utilization-gate.sh` PreToolUse hook (Layer 3 programmatic enforcement)
-handles the critical path — it auto-applies `--all-unknown` feedback before
-state-update if Phase 4.26 was skipped. (Pre-2026-05-07 this used `--all-noise`,
-which silently poisoned times_noise on unattested-but-relevant nodes.) This gate
-is now a secondary check for escalation quality and retroactive retrieval when
-retrieval itself was skipped entirely.**
+**NOTE: `iteration-close.sh`'s `_repair_utilization_pending` handles the critical
+path. It runs inside `do_state_update` immediately BEFORE `phase-4-26-gate.sh`,
+and applies `--infer --confidence balanced` (falling back to `--all-unknown` on
+schema<2) when Phase 4.26 left `utilization_pending=true`. This gate is a
+secondary check for escalation quality and retroactive retrieval when retrieval
+itself was skipped entirely; it calls the same helper again as a backstop, which
+no-ops when state-update already cleared the flag.**
+
+**The `utilization-gate.sh` PreToolUse[Skill] hook covers ONLY direct
+`Skill(aspirations-state-update)` invocations — /boot, consolidation, and ad-hoc
+callers that bypass `iteration-close.sh`. It does NOT and structurally CANNOT
+cover the Bash hot path (measured 15 fires / 12,325 skill invocations across 5
+agents; bravo 0 / 2,552). Any claim that the hook alone guarantees non-zero
+utilization data on the loop path is false — g-115-3123.**
 
 ```
 # Check session file first (primary source), fall back to WM manifest (legacy)

@@ -108,6 +108,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -294,11 +295,38 @@ def _compute_child_path(parent_file: str, slug: str, world_path: Path) -> str:
 
 def _resolve_node_md(virtual_file: str, world_path: Path) -> Path:
     """Resolve a virtual `world/...` node-file path to a concrete path under
-    THIS request's world. Used only when add-child carries a `body`."""
+    THIS request's world. Used when add-child carries a `body` and by the
+    g-115-4140 body-presence advisory."""
     vf = virtual_file.replace("\\", "/")
     if vf.startswith("world/"):
         return world_path / vf[len("world/"):]
     return world_path / vf
+
+
+def _body_presence_warning(node_key: str, file_field, world_path: Path,
+                           context: str):
+    """ daemon mirror of tree.py warn_if_body_absent: return an
+    advisory string (or None) when a registration/enrichment touches a node
+    whose `file:` has no body on the LOCAL mirror. Advisory only — the handler
+    attaches it to the response as `body_presence_warning` (additive key;
+    consumers preserve unknown keys) and stderr-logs it; the write is NEVER
+    refused (guard-1562: register-then-author is a legitimate flow for 8+
+    callers). Local-mirror-only by design — under own-cloud read-through the
+    store of record may hold a body this box never pulled, so the wording
+    points at tree-body-presence-audit.py for the authoritative verdict.
+    No _tree.yaml byte impact (byte-compat with the CLI is untouched).
+    Fail-open."""
+    try:
+        if not file_field:
+            return None
+        if _resolve_node_md(str(file_field), world_path).exists():
+            return None
+        return ("body-presence g-115-4140 [{}]: node '{}' has file '{}' but "
+                "no body on the LOCAL mirror — author the body now, or verify "
+                "against the store of record via tree-body-presence-audit.py"
+                .format(context, node_key, file_field))
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1333,8 +1361,18 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
                             reason=req.get("encoding_reason"), agent=agent)
                 out = _apply_defaults(child_node)
                 out["key"] = child_key
-                return Response.json({"ok": True, "op": op, "key": child_key,
-                                      "node": out, "md_written": md_written})
+                resp = {"ok": True, "op": op, "key": child_key,
+                        "node": out, "md_written": md_written}
+                # : body-presence advisory (skip when this request
+                # just wrote the body itself via the optional `body` field).
+                if not md_written:
+                    _bw = _body_presence_warning(child_key,
+                                                 child_node.get("file"),
+                                                 world_path, "add-child")
+                    if _bw:
+                        print("WARN tree_write: " + _bw, file=sys.stderr)
+                        resp["body_presence_warning"] = _bw
+                return Response.json(resp)
 
             # ---- set --------------------------------------------------------
             if op == "set":
@@ -1368,7 +1406,14 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
                 if field == "confidence":
                     out["ancestors_updated"] = ancestors_updated
                     out["capability_changes"] = capability_changes
-                return Response.json({"ok": True, "op": op, "key": key, "node": out})
+                resp = {"ok": True, "op": op, "key": key, "node": out}
+                # : enriching a bodiless node is the desync signature.
+                _bw = _body_presence_warning(key, node.get("file"),
+                                             world_path, "set")
+                if _bw:
+                    print("WARN tree_write: " + _bw, file=sys.stderr)
+                    resp["body_presence_warning"] = _bw
+                return Response.json(resp)
 
             # ---- increment --------------------------------------------------
             if op == "increment":
@@ -1694,6 +1739,7 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
 
                 updated_keys = set()
                 batch_added_child_keys: List[str] = []  # S9 pick-log, 
+                batch_set_keys: List[str] = []  #  body-presence advisory
                 propagate_results: List[Dict[str, Any]] = []
                 try:
                     # ---- Phase 1: mutations in order ----
@@ -1704,6 +1750,7 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
                             _apply_set(tree, key, o["field"], o.get("value"),
                                        world_path)
                             updated_keys.add(key)
+                            batch_set_keys.append(key)  # 
                         elif op_type == "increment":
                             _apply_increment(tree, key, o["field"])
                             updated_keys.add(key)
@@ -1796,9 +1843,27 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
                         nd = _apply_defaults(tree["nodes"][k])
                         nd["key"] = k
                         updated_nodes.append(nd)
-                return Response.json({"ok": True, "op": op,
-                                      "updated_nodes": updated_nodes,
-                                      "propagate": propagate_results})
+                resp = {"ok": True, "op": op,
+                        "updated_nodes": updated_nodes,
+                        "propagate": propagate_results}
+                # : body-presence advisory for nodes this batch
+                # REGISTERED (add-child) or ENRICHED (set) — mirrors cmd_batch.
+                # Excludes parents touched only by child-list bookkeeping and
+                # propagate-walked ancestors; a key set-then-removed in the
+                # same batch is absent from tree["nodes"] and skipped.
+                _bwarns: List[str] = []
+                for _wk in set(batch_added_child_keys) | set(batch_set_keys):
+                    if _wk in tree["nodes"]:
+                        _bw = _body_presence_warning(
+                            _wk, tree["nodes"][_wk].get("file"),
+                            world_path, "batch")
+                        if _bw:
+                            _bwarns.append(_bw)
+                if _bwarns:
+                    for _bw in _bwarns:
+                        print("WARN tree_write: " + _bw, file=sys.stderr)
+                    resp["body_presence_warnings"] = _bwarns
+                return Response.json(resp)
 
             # ---- record-maintenance -----------------------------------------
             # Mirrors cmd_record_maintenance (tree.py:1355-1556). Records a

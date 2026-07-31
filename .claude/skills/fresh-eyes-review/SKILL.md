@@ -67,6 +67,29 @@ Read the inputs. Cache each result so Phase 3 can synthesize without
 re-reading.
 
 ```
+# 2.0 PRIOR SERIES — read this FIRST, before any instrument (g-335-420, 2026-07-29)
+# directive-lane-compliance is the accumulated memory of every prior review: each
+# agent's PM-First rule-1a series, the measurement recipe, and the Decision Rules
+# that prior reviewers recorded so their successors would not re-derive them.
+# Rule 1a REQUIRES a series with >=3 points — a single reading cannot distinguish
+# "under the floor and correcting" from "under the floor and stuck", and those
+# call for opposite responses.
+Bash: bash core/scripts/tree-read.sh --node directive-lane-compliance
+  → capture: this agent's prior series points, ALL Decision Rules, and the
+    measurement recipe (which is load-bearing — see 2.2b SOURCE below)
+  → carry these into Phase 3. Append this pass's point to the node's series
+    table at Phase 5.6 rather than leaving it only in the temp/ briefing.
+
+# WHY 2.0 EXISTS AND WHY IT IS FIRST. Both sibling rituals learned this the hard
+# way and wrote it into their own Phase 2.0 (fresh-eyes-program reads
+# program-alignment-health; fresh-eyes-tree reads l1-taxonomy-health) — a series
+# node read only at encode time catches a re-derivation AFTER its full cost is
+# already paid. fresh-eyes-review had NO series node at all until 2026-07-29, so
+# its Self-mandated series lived only in the temp/ briefing that Phase 8 archives
+# to temp/drained/ — re-derived from scratch every pass, or carried in volatile
+# session context. Retrieval must precede synthesis
+# (.claude/rules/retrieve-before-deciding.md).
+
 # 2.1 Self — current identity
 Read agents/<agent>/self.md
   → capture body content (after YAML front matter) and last_updated
@@ -79,11 +102,102 @@ Extract for each active aspiration:
   - id, title, priority
   - goals: (completed / total), top 3 goal titles with status
 
-# 2.3 Self-evolution signals — what sq-012 has flagged recently
+# 2.2b STANDING USER DIRECTIVE — read BEFORE assessing alignment (g-115-3136)
+# The Phase 3 "are we working on the right problems" verdict is an assessment
+# of the work mix against what SHOULD be worked on. The agent's own gate (e.g.
+# self.md's PM-First Gate) is only half that standard: a standing user
+# directive in team-state OUTRANKS it, and an internal gate can pass cleanly
+# while the mix violates the directive — because the gate does not know the
+# directive exists. That is a vacuous pass, not sanction.
+# Canonical incident (bravo, 2026-07-25): the briefing measured 109 asp-115 vs
+# 16 asp-335 closes in 7d against the PM-First Gate alone and concluded
+# "sanctioned, not drift". strategic_focus.primary said verbatim "Product goals
+# outrank routine infra sweeps at selection time until asp-335 drains"
+# (asp-335 was 194/233 — not drained) and its rationale said "spread the work
+# across the fleet — some agents idle while others are overloaded", which is a
+# verbatim description of what a partner belief had ALREADY reported about this
+# agent. The wrong verdict was caught only by an unrelated duplication-gate
+# refusal and had to be corrected mid-review. Enforced by guard-1428.
+Bash: team-state-read.sh --field strategic_focus --json
+  → IF non-null: capture primary, rationale, set_by, set_at, acknowledged_by
+  → call this strategic_focus
+  → for every aspiration id named in primary, note its live completion ratio
+    from the 2.2 snapshot. An aspiration BELOW 1.0 means the directive is
+    still LIVE for that lane; at 1.0 it has drained and self-retired.
+  → Phase 3 MUST weigh the mix against this directive BEFORE any internal
+    gate, and MUST state the comparison explicitly — including when the mix
+    complies. "The internal gate passed" is NOT a verdict on its own.
+  → MEASURING the mix: count one-off closes by `completed_date`, but count
+    RECURRING closes by `lastAchievedAt` (companions: `achievedCount`,
+    `currentStreak`). A recurring goal returns to `status: pending` on close,
+    so it NEVER carries `status: completed` and a completed_date-only scan
+    reports ZERO recurring closes — silently dropping the exact lane a
+    "routine infra sweeps" directive targets, always in the direction that
+    flatters compliance. There is no `last_completed` / `completion_count` /
+    `last_run` field: probing those returns 0/N and reads as a framework
+    defect (alpha 2026-07-26 nearly filed one — rb-245 class, a zero-count
+    audit against a nonexistent field). Verify the field exists in one live
+    record before reporting any zero.
+  → SOURCE: measure against the FULL store —
+    `aspirations-read.sh --source world --active` (and `--source agent`) — NOT
+    the `aspirations-compact.json` that Phase 2.2 above tells you to load. The
+    compact is a 9-field projection (category, discovered_by, filed_by_agent,
+    id, participants, priority, status, title, work_class) carrying NONE of
+    `completed_date` / `completed_by` / `recurring` / `lastAchievedAt`. Every
+    field this measurement needs is absent, so the count is structurally ZERO
+    for any agent, any lane, any window — while the aspiration-level completion
+    ratios Phase 2.2 wants from the same file are perfectly correct, which is
+    what makes the file look like the right source. (bravo 2026-07-29: returned
+    0 closes in a session where the reviewer had personally closed ten goals.)
+  → AND the one-live-record probe above must sample a record the predicate will
+    ACTUALLY COUNT. Goal records are heterogeneous — a `field in record`
+    membership test swept across the whole corpus can pass on a differently
+    shaped record than the one being counted, returning a confident wrong yes
+    and clearing the rb-245 check while the zero stands. Probe a record that
+    matches the predicate's own filter (same source, same status, same
+    recurring-ness), or the probe is a second way to be wrong. (sig-54.)
+  → IF null/absent: no standing directive; the internal gate is the standard.
+    Say so explicitly rather than silently omitting the check.
+
+# 2.3 Self-evolution signals in pending-questions
+# ⚠ THE OLD FILTER HERE WAS STRUCTURALLY DEAD, FLEET-WIDE, ON EVERY PASS. It read
+# "id starts with 'sq-012' OR tags include 'self_evolution'". Measured 2026-07-31
+# (bravo, cc-05) across all five agents' files — 99 records: `tags` is absent from
+# the UNION of keys on every agent, and ZERO ids begin with `sq-`. No skill writes
+# `tags:` into this store (0 matches across every SKILL.md). Neither disjunct could
+# ever match, so pq_signals was 0 for every agent on every review — and that zero
+# read as "no self-evolution signal" rather than "this step queries a retired
+# surface." Same class as the Phase 2.4 defect fixed 2026-07-30 (three fields read
+# from a store that never had them); found forty lines below it and missed then.
+# ROOT CAUSE — not a schema mismatch, a RETIRED PROTOCOL. sq-012 used to gate Self
+# edits through a pending-questions PRE-APPROVAL entry. `.claude/rules/self.md`
+# records that gate as SUPERSEDED on 2026-04-22 ("the user explicitly traded 'ask
+# first' for 'notify after, revert if wrong'"), enforced by guard-380. sq-012 signal
+# moved to the board and to journal/self.md revisions. This step was never updated.
+# WHY IT SURVIVED ~15 MONTHS OF PASSES: rb-1279 (2026-05-24) OBSERVED the symptom
+# ("the count silently 0") and fixed it by ADDING 2.3b's board channel as a second
+# source. That was the right adaptation — the signal genuinely had moved — but it
+# made the total non-zero, which removed all pressure to ask why the FIRST source
+# was still zero. A compensating second source masks a broken first one indefinitely.
+# guard-1922 names the general shape: a condition whose signal is not durably
+# readable retires itself silently, always as a pass. guard-1419 names the reading
+# duty: a zero with two candidate explanations that imply OPPOSITE actions must be
+# disambiguated before it is believed.
 Read agents/<agent>/session/pending-questions.yaml
-  → capture entries where id starts with 'sq-012' OR tags include 'self_evolution'
-    AND created within last 30 days (any status)
+  → SCHEMA (measured, all five agents): every record carries `id, question, status,
+    created`; most carry `type` (43 distinct free-text values, ~35% null) and
+    `default_action`. `category` is null on 94 of 99. There is NO `tags` key and no
+    id convention marking self-evolution. Re-probe before trusting any of this.
+  → This store is the `self.md` Decision Authority mechanism-1 surface: decisions
+    ALREADY EXECUTED, logged as "I decided X because Y — override if you disagree."
+    So a self-evolution signal here is a DECISION ABOUT THIS AGENT'S OWN purpose,
+    role, lane, or scope — a judgment on the text, not a key match.
+  → capture such entries created within the last 30 days (any status)
   → call these pq_signals
+  → EXPECT ZERO and say so explicitly. Since the 2026-04-22 supersession the
+    primary sq-012 surfaces are 2.3b (board) and 2.6b (partner beliefs); an empty
+    pq_signals is now the NORMAL reading, not a missing signal. What would make it
+    non-empty is a logged decision that narrows or redirects this agent's purpose.
 
 # 2.3b Self-evolution signals on the findings board (g-115-1214)
 # pending-questions.yaml is not the only self-evolution surface. A self-drift
@@ -104,16 +218,83 @@ Read agents/<agent>/session/pending-questions.yaml
 # unread finding(s)"); this only aligns the board-read call with that intent.
 Bash: board-read.sh --channel findings --since 30d --unread-only --json
   → filter to findings WHERE ('self_evolution' in tags OR 'self-drift' in tags)
-    AND directed at this agent (tags include MIND_AGENT, OR text/author names
-    this agent, OR the finding carries no agent tag = applies to all)
+    AND directed at this agent. **EVALUATE THE TESTS IN THIS ORDER — an
+    explicit agent ROUTING TAG outranks a loose prose mention** (the same
+    precedence `aspirations-select` Phase 2.07 states for directives). Taking
+    (a)'s prose disjunct before (b)'s exclusion is what inflates the count:
+      (a0) tags carry ANY agent name → that tag DECIDES. MIND_AGENT among them
+           → directed. Another agent's name and not MIND_AGENT → it is THAT
+           agent's own signal → EXCLUDE, and do not consult the text at all.
+           **Match BOTH tag forms — the bare name (`alpha`) AND the qualified
+           `agent:<name>` form.** Neither is documented as canonical in
+           `board.md` / `coordination.md`; board tags are free-form and agents
+           demonstrably write both. Measured 2026-07-31 (echo, 26 self_evolution
+           /self-drift findings in 30d): 25 bare, 1 `agent:alpha`. A bare-name
+           membership test silently drops the qualified form out of (a0) — the
+           post then falls through to (a1)/(b), which is exactly the loose prose
+           branch guard-1877 was written to keep it out of. In the measured case
+           (b)'s author-check happened to exclude it anyway, so the count was
+           unaffected; do not read that as the hole being harmless — it means
+           the failure is invisible when it fires. Normalize the prefix before
+           the membership test.
+      (a1) no agent tag, and the finding's SUBJECT is this agent (a claim ABOUT
+           it — not merely a row in a cross-agent comparison table, and not an
+           @-broadcast mention) → directed.
+      (b) the finding carries no agent tag (applies to all) AND is genuinely
+          agent-agnostic — i.e. about the framework / all agents, NOT the
+          author's own self. EXCLUDE a PARTNER-authored self-signal:
+          author != MIND_AGENT AND the text names the AUTHOR'S OWN
+          goal/purpose (e.g. "<author> - recorded for cross-signal review",
+          or an sq-012 tentative on the author's OWN goal). A partner's own
+          untagged sq-012-about-themselves is about the AUTHOR, not this
+          reviewer — it is not a self-evolution signal for THIS agent.
+          (An untagged self-signal authored by THIS agent — author ==
+          MIND_AGENT, e.g. this agent's own strategic-scan / fresh-eyes
+          followup — still counts, per line 91.)
+  # SECOND REGRESSION, and the reason the ORDER above is now explicit
+  # (guard-1877, alpha 2026-07-29; independently replicated by bravo
+  # 2026-07-30, one day later, on a different agent). This ritual's own board
+  # posts now @-broadcast to every agent and carry cross-agent comparison
+  # tables, so the "text names this agent" disjunct — written as a rare
+  # fallback — matches essentially EVERY peer's routine cadence post. Measured
+  # alpha: loose test kept 10 of 18; honest count ZERO. Measured bravo: loose
+  # test kept 15 of 29; honest count ONE (27 of 29 were tagged to another
+  # agent). Left unordered, this inflates self_evolution_signals_count enough
+  # to force act_later on every review forever, and it GROWS — every new
+  # comparison table adds another false match. guard-1877 already carried the
+  # rule; the pseudocode still invited the error, which is why alpha's
+  # measurement did not prevent bravo's near-miss the next day. A guardrail
+  # cannot outvote the instrument it guards.
+  # FIRST REGRESSION (g-115-2922, zeta review 2026-07-22): before this exclusion,
+  # two echo self-signals (echo-3542, echo-3840) — echo's own untagged sq-012s
+  # — were counted toward zeta's review via the "applies to all" disjunct,
+  # inflating self_evolution_signals_count 5->7 and net-divergent 1.0->3.0,
+  # flipping zeta's self-assess from no_change to a FALSE act_later (caught by
+  # a manual authorship check, corrected by hand). The author!=MIND_AGENT +
+  # names-own-purpose test is the fix; a genuinely agent-agnostic untagged
+  # finding is unaffected. Verify-learning guard: a partner-authored untagged
+  # sq-012 MUST NOT count toward another agent's Phase 2.3b board_signals.
   → call these board_signals
   → surface board_signals to Phase 3 "Recent self-evolution signals" bullets
     so the briefing names the unread finding(s), not just pending-questions
 
 # 2.4 Evolution engine output — dev stage, gap analysis, novelty pressure
+# The dev STAGE does NOT live in evolution-log.jsonl. Probed 2026-07-30 (bravo,
+# cc-05): the live record schema is exactly {date, event, details}, and NO entry
+# in the last 40 carries any *stage* key. This step used to say "capture
+# current_stage, gap_analysis summary, interestingness_state" from that file —
+# three fields the store has never had, so all three returned null for every
+# agent on every pass, and that null reads as "the evolution engine has no
+# signal" rather than "this step read the wrong file." rb-245 class: verify the
+# field exists in one live record before reporting its absence.
+Bash: bash core/scripts/curriculum-evaluate.sh
+  → capture current_stage (+ stage_name / all_passed / terminal_stage / next_stage).
+    Branch on SHAPE per the cadence-battery contract: terminal_stage:true with
+    all_passed:true and gates:[] is the CORRECT end state, not a pending promotion.
 Bash: tail -n 5 <META_DIR>/evolution-log.jsonl
-  → parse the most recent entry
-  → capture current_stage, gap_analysis summary, interestingness_state
+  → parse recent entries for `event` + `details` (the fields that exist).
+    `event` values seen live: strategic_scan. Gap-analysis / interestingness
+    narrative, when present, is prose inside `details` — read it, do not key on it.
 
 # 2.5 Strategic-scan portfolio health — category concentration, uncovered Self priorities
 Bash: wm-read.sh portfolio_health_signal

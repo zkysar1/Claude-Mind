@@ -72,18 +72,132 @@ already loaded — proceed.
 
 ```
 IF invoked with --cadence:
+    # Run this ALONE, in its own Bash call. Do NOT batch it with the 1.1 claim
+    # below (see "Never batch the gate with the claim").
     Bash: core/scripts/fresh-eyes-cadence-check.sh --config-block fresh_eyes_tree
-    IF exit 1: Output "Fresh-eyes-tree: cadence not crossed — noop." → DONE (return)
+    # Read the OUTPUT TEXT, not just the exit code: the gate prints its verdict
+    # ("noop (…)" vs a fire line) on stdout, and a trailing pipe (| tail, | head)
+    # replaces the gate's rc with the pipe's (guard-1150). A "noop" line means
+    # DONE regardless of what rc you observed.
+    IF noop / exit 1: Output "Fresh-eyes-tree: cadence not crossed — noop." → DONE (return)
+                      Do NOT run 1.1. A non-running agent must never hold the claim.
     IF exit 0: proceed
 ELSE (user-invoked, no --cadence flag):
     Proceed directly — user override.
+
+# 1.1 CLAIM the shared ritual (g-115-3218, 2026-07-28) — the FIRST action once
+# committed to running, on BOTH paths above (a user-invoked pass is just as
+# much a duplicate risk to a sibling as a cadence-invoked one).
+# PRECONDITION: the gate above did NOT noop. This line is conditional, not
+# unconditional — reaching it means this agent is about to run the ritual.
+Bash: bash core/scripts/fresh-eyes-record-tick.sh last_fresh_eyes_tree_review --claim
 ```
+
+**Never batch the gate with the claim.** They must be separate Bash calls, in
+this order, with the gate's verdict read before the claim runs. Batching inverts
+the mechanism: the claim writes unconditionally, so an agent the gate just
+SUPPRESSED still stamps `__inflight_claim` — overwriting the claim of the sibling
+who is actually mid-flight. Nothing clears that field on the real runner's Phase-8
+stamp, so the stomped claim survives to its 30m TTL carrying the wrong
+`claimed_by` and a later `claimed_at`, silently extending the suppression window
+on every noop. The corruption is invisible: suppression still *works* (a third
+agent sees *a* claim), so the only symptom is a wrong name in shared state.
+
+Observed 2026-07-28T10:18 on the sibling `/fresh-eyes-program` (zeta): the gate
+printed `noop (… bravo claimed this shared ritual 4.6m ago and is still
+mid-flight …)` and the batched claim overwrote bravo's live claim in the same
+call. Both team-aware rituals carry the identical shape, so both were corrected.
+
+Same shape as `guard-1061` (run `aspirations-claim.sh` ALONE and verify success
+before post-claim setup) and `guard-1007` (read a gate's stdout verdict, do not
+trust rc) — a verdict-bearing call and the action it governs never share a Bash
+invocation.
+
+**Why the claim, and why it must be FIRST.** This is a SHARED-resource ritual:
+one time series, reviewed on behalf of the whole fleet. The cadence gate reads
+the shared stamp at ritual START, but that stamp is only written at ritual END
+(Phase 8) — so two agents entering this window together both read the same
+pre-fire value, both pass, and both run the entire review. Measured: 4 duplicate
+rituals across ~34 fires made AFTER the team gate landed (2026-06-15, 06-19, and
+BOTH slots on 07-19; gaps 2m48s–9m52s). The claim is visible to a sibling's gate
+immediately, so it noops instead of re-deriving the same briefing. Run it as
+early as possible — the residual race is exactly the span between the gate
+passing and this line. Best-effort: a WARN degrades duplicate suppression but
+never blocks the ritual, the call is a no-op for non-team-aware slots, and the
+claim expires after 30m so a ritual that dies here cannot lock the fleet out.
 
 ## Phase 2: Briefing Assembly (read-only)
 
 Read the inputs. Cache each result so Phase 3 can synthesize without re-reading.
 
 ```
+# 2.0 PRIOR SERIES — read this FIRST, before any instrument (g-335-315, 2026-07-27)
+# The l1-taxonomy-health node is the accumulated memory of every prior review:
+# the verdict streak, the Decision Rules, and — critically — the RETRACTIONS
+# that prior reviewers recorded so their successors would not re-derive a
+# finding already investigated and closed.
+Bash: bash core/scripts/tree-read.sh --node l1-taxonomy-health
+  → capture: the last 2-3 assessment entries, ALL Decision Rules, and every
+    paragraph containing "RETRACTED" / "recorded so the next reviewer" /
+    "does not re-run" / "FALSIFIED"
+  → carry these into Phase 3. Before writing ANY finding, check it against
+    them: a signal the series has already investigated and closed is NOT a
+    new finding, however fresh the instrument reading looks.
+  → also note who fired last and at what counter. If a sibling agent ran
+    within ~50 goals, THIS pass is a duplicate-cadence CONFIRMING pass —
+    record it as a confirming measurement, not an independent assessment.
+    WHY a duplicate can still reach you (corrected 2026-07-28, g-115-3218):
+    NOT because "per-agent WM slots do not see each other's fires" — that
+    note predates g-115-1388 and is STALE. The gate IS team-aware:
+    fresh-eyes-cadence-check.py `team_stamp_value()` reads
+    world/team-state.yaml `shared_cadences.<slot>` (written by
+    fresh-eyes-record-tick.sh on every fire) and noops while the team's last
+    fire is within cadence, so a sibling fire you can SEE is already
+    suppressed. What survives is narrower and purely temporal: the gate READS
+    that stamp when the ritual STARTS and the stamp is WRITTEN when it ENDS,
+    with no write in between — so agents who enter that multi-minute window
+    together all read the same pre-fire value and all pass. A duplicate here
+    means you overlapped, not that the mechanism is missing.
+
+# WHY 2.0 EXISTS AND WHY IT IS FIRST. This node used to be read only at Phase
+# 5.5, where the encoding novelty-gate forces it — i.e. AFTER the briefing was
+# already synthesized. That ordering guarantees each reviewer re-derives from
+# scratch and lets a recorded retraction catch the re-run only at encode time,
+# once a false section is already written. Measured: the 2026-07-26 pass
+# investigated the "tree_growth_log is a dead writer" signal, established that
+# the log's contract is L1-ops-only (so zero entries since inception is
+# CORRECT), and wrote "recorded so the next reviewer does not re-run it." The
+# 2026-07-27 pass re-ran it anyway and wrote a full "the input is dead"
+# section, catching it only at the Phase 5.5 novelty gate. The note was neither
+# missing nor unclear — it was merely read too late. Same class as this node's
+# own Decision Rule 8 (a lesson sitting in two stores that did not reach the
+# moment of use). Retrieval must precede synthesis, not follow it —
+# .claude/rules/retrieve-before-deciding.md.
+#
+# ⚠ THE 07-26 RETRACTION WAS ITSELF WRONG, AND IS RETRACTED (g-115-3210,
+# 2026-07-29). Its two load-bearing claims are both false on inspection: the
+# log held EIGHT entries, not zero, and every one is `op: DECOMPOSE` — which
+# is not an L1 op, so "the contract is L1-ops-only" cannot explain the rows
+# that are actually in the file. What was true is narrower: the only SCRIPT
+# writers were l1-domain-add.py / l1-domain-rename.py (L1_ADD / L1_RENAME),
+# while DECOMPOSE was an honor-system instruction repeated at 9 sites in
+# tree/SKILL.md and enforced at none. So the 07-27 reviewer's "the input is
+# dead" was the CLOSER read, and the novelty gate suppressed it in favour of
+# a wrong retraction.
+#
+# Keep the ordering lesson above — it is sound and independent. But note what
+# it cost here: a retraction is read as settled, so it is exactly the kind of
+# note that stops the next reader from checking. This one survived two passes
+# unexamined because it arrived pre-labelled as the answer. When a recorded
+# retraction is the reason you are NOT investigating, spend the one command
+# that would falsify it (here: print the log and look at its `op` values).
+#
+# STATUS NOW: the batch/reparent/remove-child write paths append via
+# core/scripts/_growth_log.py (SSOT, called from BOTH tree.py and the daemon's
+# tree_write.py). Rows written from 2026-07-29 onward carry a `reason` naming
+# the writer. The 2026-04-04 → 2026-07-29 window is deliberately NOT
+# backfilled: it is a real gap and later reviews should see it as one.
+
 # 2.1 L1 distribution stats (S1) — the structural mass + retrieval + utility breakdown
 Bash: bash core/scripts/l1-skew-check.sh --markdown
   → capture markdown table (already nicely formatted)
@@ -115,7 +229,42 @@ print(json.dumps({
 "
   → parse the JSON for the briefing
 
-# 2.3 Tree growth log (RENAME/ADD/REPARENT/PRUNE history).
+# 2.2b MANDATORY git cross-check — S9 CANNOT SEE RESTRUCTURE OPS (Decision Rule 12,
+# 2026-07-31). The pick-log above is add-child-shaped: measured at 183 rows it held
+# add-child 99 / batch-add-child 83 / test 1 and ZERO decompose/reparent/prune-typed
+# rows in its entire history. So its `tree-maintain-decompose` source count can only
+# ever sit still, and reading that stillness as "the restructure lane is idle" is a
+# confident wrong answer the instrument will support forever.
+#
+# This is not hypothetical. That count has been frozen at 32 since 2026-05-28 and
+# the series filed it as an "observability note" on 07-01, 07-11 and 07-26 without
+# checking git. The 2026-07-31 pass went further and wrote a full "the tree has not
+# restructured in 64 days, it accretes but cannot rebalance" finding — and filed a
+# goal on it — while git showed a vinheim-web-stack decompose (07-28), a /tree
+# maintain decompose+distill sweep (07-30), a directive-lane-series distill at 219%
+# of cap (07-30), a nine-over-cap-node census (07-30), and the discovery+repair that
+# /tree maintain DISTILL was FULLY INERT (07-30). It was caught by a git probe run
+# for an unrelated reason, so treat the catch as luck and this step as the method.
+#
+# RUN THIS BEFORE writing ANY sentence about restructure/decompose/distill activity.
+Bash: git log --all --since="14 days ago" --date=short --format="%h %ad %s" \
+        | grep -iE "decompose|distill|reparent|prune|split.*node|tree maintain" | head -15
+  → If this returns rows, the lane is ACTIVE regardless of what S9 shows. Report
+    BOTH, and attribute activity to git, never to the pick-log's silence.
+  → If it returns nothing, you still may not conclude "idle" from S9 alone — widen
+    the window before making the claim (--since="60 days ago").
+
+# 2.3 Tree growth log — L1-OPS-ONLY history (L1_ADD / L1_RENAME).
+# READ THIS BEFORE CONCLUDING THE LOG IS BROKEN. Its only non-test writers are
+# l1-domain-rename.py, l1-domain-add.py, and coordination_merge.py. Nothing
+# emits REPARENT or PRUNE, and DECOMPOSE is NOT in scope — so a log frozen at
+# its 8 founding 2026-04-04 entries is the CORRECT reading, not a dead writer:
+# zero L1 ops have ever occurred, therefore zero entries should exist.
+# Decompose activity is visible in the l1-pick-log (source:
+# tree-maintain-decompose), which is a different instrument, not a replacement.
+# This description previously read "RENAME/ADD/REPARENT/PRUNE history", which
+# is what made the log look broken to fresh readers — it has now been
+# investigated and retracted twice (2026-07-26, 2026-07-27).
 # DO NOT interpolate ${WORLD_DIR} into the python -c body — guard-165 forbids
 # bash-var injection into py source. Resolve WORLD_DIR via _paths import, the
 # same way Phase 2.2 resolves META_DIR.

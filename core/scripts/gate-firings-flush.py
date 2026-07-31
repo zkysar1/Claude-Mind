@@ -57,6 +57,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _paths import META_DIR  # noqa: E402
+from _gate_log import segment_name  # noqa: E402
 from storage_backend import LocalBackend  # noqa: E402
 
 SPOOL_NAME = "gate-firings.spool.jsonl"
@@ -64,6 +65,38 @@ FLUSHING_NAME = "gate-firings.spool.flushing.jsonl"
 STAMP_NAME = "gate-firings.spool.last-flush"
 FLUSH_LOCK_NAME = "gate-firings.spool.flush.lock"
 STORE_NAME = "gate-firings.jsonl"
+
+#  Stage 2: date-segmented flush target, DEFAULT OFF.
+#
+# With the flag off this resolves to STORE_NAME and behaviour is byte-identical
+# to before the flag existed. With it on, each flush re-PUTs only today's
+# segment (~1MB at ~3.2k records/day) instead of the full 40-day retention
+# window (~42MB) -- measured amplification near 42,000:1, producing 26,610 S3
+# versions / 968 GB, 65% of the whole bucket.
+#
+# ORDERING CONSTRAINT -- do not enable this on any box until _gate_log
+# .firings_paths() is deployed FLEET-WIDE. A box still running the pre-seam
+# consumers reads only the legacy filename, so it would see a segment holding a
+# few hours of data and report it as the full 30-day window: a gate then looks
+# unfired and therefore RETIRABLE. That is a false all-clear, which is the worst
+# direction this system can fail in. The flag is per-box precisely so the seam
+# can be rolled out first.
+SEGMENTED_ENV = "GATE_FIRINGS_SEGMENTED"
+
+
+def _segmented_enabled() -> bool:
+    return os.environ.get(SEGMENTED_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
+def _store_path(meta: Path) -> Path:
+    """Flush target: the legacy store, or today's segment when segmentation is on.
+
+    The segment basename comes from _gate_log.segment_name so the writer's
+    filename and the reader's matcher share one definition (see that function).
+    """
+    if _segmented_enabled():
+        return meta / segment_name()
+    return meta / STORE_NAME
 
 
 def _serialize(rec: dict) -> str:
@@ -163,7 +196,7 @@ def main() -> int:
     spool = meta / SPOOL_NAME
     flushing = meta / FLUSHING_NAME
     stamp = meta / STAMP_NAME
-    store = meta / STORE_NAME
+    store = _store_path(meta)
     lock_path = meta / FLUSH_LOCK_NAME
 
     residue = flushing.exists()

@@ -417,6 +417,39 @@ Parse JSON output from stdout:
   # status == "skipped" → silent (gate-skipped; not signal-bearing)
 # ── End Unblock-intake probe ────────────────────────────────────────
 
+# ── Forged-Skill Surface (g-115-3811, sig-48) ───────────────────────
+# UNCONDITIONAL — no trivial_mode skip, no config gate, no enable flag.
+# guard-1516 states the defect verbatim: "Nothing in Phase 4 surfaces the
+# forged registry automatically - retrieve.py does not index it and
+# aspirations-execute never reads it - so this check is entirely manual."
+# .claude/rules/forged-skill-resolution.md rule 2 says "never reason about
+# whether a skill 'should' exist - check the registry", and the registry was
+# never read here, so the rule had nothing to act on. Measured twice ~5 weeks
+# apart by different agents, same double-miss shape (g-335-45 missed gap-019 +
+# gap-017; g-335-448 missed gap-011 + gap-019) - a correct, retrievable rule
+# that nothing READS at the moment of the action. That is sig-48 (7/7
+# CONFIRMED), whose prescription is to build a reader at the action point, and
+# whose strongest recorded evidence (g-335-409) is that the working shape is an
+# UNCONDITIONAL step - because then nothing has to remember.
+#
+# Do NOT add a skip condition here. A condition is one more thing that can be
+# wrong, and re-introduces the "something must decide to check" failure this
+# step exists to remove. Cost is one small YAML read + regex (~150ms).
+#
+# Precision is MEASURED, not asserted (see the script's docstring): over all
+# 4,154 world goals it fires on 11.4%, median 0 matches. Silent on no match.
+# Always exits 0 - it must never block execution.
+Bash: ${ENV_PREFIX} py -3 core/scripts/forged-skill-surface.py --goal <goal.id> --source {source}
+IF output is non-empty:
+    # A forged skill already implements what this goal is about to do.
+    # Per forged-skill-resolution.md rule 1, invoke the listed skill (or its
+    # companion script) INSTEAD of hand-rolling the procedure inline.
+    # This is advisory, not binding: if the match is a false positive, say so
+    # in one line and proceed. Do NOT silently ignore it.
+    Output: "▸ FORGED-SKILL SURFACE: <skills listed> - invoke, or state why not applicable"
+# ELSE: silent - no forged skill matches this goal.
+# ── End Forged-Skill Surface ────────────────────────────────────────
+
 # ── Encode-Stable-Facts Gate (G17) ─────────────────────────────────
 # Before resource-access steps (SSH, AWS CLI, describe-*, list-*, find),
 # enforce the three-probe threshold from .claude/rules/encode-stable-facts.md.
@@ -454,7 +487,8 @@ Bash: load-execute-protocol.sh → IF path returned: Read it
 # section inline; the SKILL.md no longer duplicates it.
 # Key side effects to remember:
 #   - retrieve.sh --goal auto-writes retrieval-session.json (utilization tracking)
-#   - The utilization-gate.sh hook guarantees feedback runs even if Phase 4.26 skips
+#   - iteration-close.sh do_state_update runs the utilization repair before the
+#     Phase 4.26 gate, so feedback lands even if Phase 4.26 skips (g-115-3123)
 #   - Step 4b (strategy-apply.sh) closes the meta-strategy → execution loop
 #   - Step 5b.1 persists deliberation onto the linked hypothesis record when present
 # ── End Intelligent Retrieval ───────────────────────────────────────
@@ -1000,13 +1034,22 @@ ELSE:
     Bash: utilization-feedback.sh --goal {goal.id} --all-noise
 ```
 
-BACKSTOP: `utilization-gate.sh` PreToolUse hook auto-applies `--all-unknown`
-before `aspirations-state-update` if this phase is skipped. (Pre-2026-05-07
-the backstop was `--all-noise`, which silently poisoned times_noise on
-unattested-but-relevant nodes — see audit notes in utilization-gate.sh.)
-The system NEVER has zero utilization data; phase-4-26-gate still blocks
-goal completion when only the backstop ran, forcing the LLM to attest or
-pass `--no-retrieval-applicable`.
+BACKSTOP (hot path): `iteration-close.sh`'s `_repair_utilization_pending` runs
+inside `do_state_update` immediately BEFORE `phase-4-26-gate.sh`, applying
+`--infer --confidence balanced` (falling back to `--all-unknown` on schema<2)
+when this phase left `utilization_pending=true`. `do_learning_gate` calls the
+same helper again as a no-op backstop for crash-resume paths.
+
+BACKSTOP (direct-skill path only): the `utilization-gate.sh` PreToolUse[Skill]
+hook covers `Skill(aspirations-state-update)` invocations that bypass
+iteration-close. It does NOT cover the Bash hot path — a PreToolUse[Skill]
+matcher structurally cannot (g-115-3123). (Pre-2026-05-07 both backstops used
+`--all-noise`, which silently poisoned times_noise on unattested-but-relevant
+nodes — see audit notes in utilization-gate.sh.)
+
+phase-4-26-gate still blocks goal completion when only a backstop ran, forcing
+the LLM to attest or pass `--no-retrieval-applicable` — but note that gate is
+itself currently inert at its line 108 (g-115-3113, arming deferred).
 
 MR-Search reflection-quality tracking: helpful items with `source_reflection_id`
 write positive downstream signal to `meta/reflection-strategy.yaml →

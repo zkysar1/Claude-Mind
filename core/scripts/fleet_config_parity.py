@@ -89,6 +89,17 @@ sys.path.insert(0, str(SCRIPT_DIR))
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
 MANIFEST = PROJECT_ROOT / "core" / "config" / "fleet-manifest.yaml"
 
+# g-115-4166: never hardcode the escalation aspiration — asp-115 is the UPSTREAM
+# deployment's queue and does not exist elsewhere, so a literal files nothing.
+try:
+    from _paths import AGENT_DIR, CORE_ROOT, WORLD_DIR
+    from _escalation_target import resolve as _resolve_asp, source_flag as _asp_source
+    ESCALATION_ASP, _ESCALATION_ASP_VIA = _resolve_asp(CORE_ROOT, WORLD_DIR, AGENT_DIR)
+    ESCALATION_SOURCE = _asp_source(ESCALATION_ASP, WORLD_DIR, AGENT_DIR)
+except Exception:
+    ESCALATION_ASP, _ESCALATION_ASP_VIA, ESCALATION_SOURCE = (
+        "asp-115", "fallback:import-failed", "world")
+
 SSH_OPTS = [
     "-o", "BatchMode=yes",
     "-o", "StrictHostKeyChecking=no",
@@ -869,7 +880,7 @@ def _file_investigate(nodes, payload, kind="drift"):
         from _runtime_bash import BASH  # rb-1472: not bare "bash"
         return subprocess.run(
             [BASH, str(SCRIPT_DIR / "aspirations-add-goal.sh"),
-             "--source", "world", "asp-115"] + extra,
+             "--source", ESCALATION_SOURCE, ESCALATION_ASP] + extra,
             input=json.dumps(goal), capture_output=True, text=True, timeout=240)
 
     try:

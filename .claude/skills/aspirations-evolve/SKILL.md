@@ -141,7 +141,22 @@ Trigger evolution check — the system evaluates its own strategy and generates 
    Read core/config/tree.yaml `structural_modifiable.l1_domains`
    IF block missing OR requires_user_approval != true:
      SKIP — feature disabled or misconfigured
-   Bash: pending-questions-read.sh --prefix l1-taxonomy- --status pending
+   # Anti-stacking guard. FLEET-WIDE and FAIL-CLOSED (g-115-3100).
+   #   --all-agents is load-bearing, not defensive: an L1 taxonomy change is a
+   #   WORLD-GLOBAL structural proposal, but the questions live in per-agent
+   #   files. A bound-agent read lets two agents on different boxes each see
+   #   "nothing open" in their OWN file and both file competing proposals at
+   #   the user. Measured 2026-07-25: the 2 open l1-taxonomy- questions belong
+   #   to echo and zeta, so an alpha-bound read returns 0 and does NOT suppress
+   #   while a fleet read returns 2 and does.
+   #   This call previously passed --prefix to a parser that did not accept it
+   #   (exit 2, EMPTY stdout), and the empty read was taken as "nothing open" —
+   #   so the guard was VACUOUS and never suppressed. --prefix now exists.
+   Bash: pending-questions-read.sh --all-agents --prefix l1-taxonomy- --status pending
+   IF the call exits non-zero OR its output is not parseable JSON:
+     SKIP — treat an unreadable probe as SUPPRESSED, never as "nothing open".
+     Suppression gates fail CLOSED (guard-487); the inverse is what made this
+     guard vacuous. Emit a stderr WARN so the broken probe is visible.
    IF any pending l1-taxonomy- question already open:
      SKIP — do not stack proposals; let the user clear the queue first.
 
@@ -398,7 +413,32 @@ Trigger evolution check — the system evaluates its own strategy and generates 
                Log: "PORTFOLIO RELOCATE: {asp.id} has {len(recurring)} recurring goals preventing archival"
                # Find the agent's maintenance aspiration (asp-001 or equivalent)
                # Create equivalent recurring goals there, then stop+complete originals
+               relocated = 0
+               skipped_referenced = 0
                FOR EACH recurring_goal in recurring:
+                   # --- INBOUND-REFERENCE PRECONDITION (g-115-3096, DEFECT 2) ---
+                   # Relocation creates a COPY under a NEW goal id and completes
+                   # the original — every inbound reference still points at the
+                   # OLD id and is orphaned. A long-lived recurring goal
+                   # accumulates them across the reasoning bank, guardrails,
+                   # pattern signatures, pipeline, override ledgers AND non-store
+                   # surfaces (source comments, tests, rationale docs). Archiving
+                   # one aspiration does not buy enough to break them.
+                   #
+                   # Script-enforced, not eyeballed (guard-399: never add an "LLM
+                   # must check X" step without the executable behind it). The
+                   # scanner splits LIVE referents from append-only narration
+                   # (changelog / evolution-log / journal / board / *-archive /
+                   # telemetry) and blocks only on the former — counting
+                   # narration would refuse EVERY relocation, since any goal that
+                   # has ever run has thousands of log lines.
+                   #   exit 0 = clear, safe to relocate
+                   #   exit 1 = referenced, SKIP this goal
+                   Bash: py -3 core/scripts/goal-reference-scan.py {recurring_goal.id}
+                   IF exit code == 1:
+                       Log: "PORTFOLIO RELOCATE SKIP: {recurring_goal.id} has live inbound references — relocating would orphan them; leaving in place"
+                       skipped_referenced += 1
+                       CONTINUE   # next recurring goal; do NOT relocate this one
                    # Create copy in maintenance aspiration
                    new_goal = copy recurring_goal fields (title, description, category,
                        skill, interval_hours, lastAchievedAt, achievedCount,
@@ -409,8 +449,15 @@ Trigger evolution check — the system evaluates its own strategy and generates 
                    # Stop recurring on original and complete it
                    Bash: aspirations-update-goal.sh --source {asp.source} {goal.id} recurring false
                    Bash: aspirations-update-goal.sh --source {asp.source} {goal.id} status completed
-               # Now archive the aspiration (all goals terminal)
-               Bash: aspirations-complete.sh --source {asp.source} {asp.id}
+                   relocated += 1
+               # Archive ONLY if every recurring goal actually moved. A partial
+               # relocation leaves non-terminal recurring goals behind, so
+               # archiving here would bury live work — the aspiration stays open
+               # by design until the references are migrated deliberately.
+               IF skipped_referenced == 0:
+                   Bash: aspirations-complete.sh --source {asp.source} {asp.id}
+               ELSE:
+                   Log: "PORTFOLIO RELOCATE PARTIAL: {asp.id} keeps {skipped_referenced} referenced recurring goal(s) ({relocated} relocated) — NOT archiving"
 
    # --- 2.75d: Priority Distribution Check ---
    # If too many aspirations share the same priority, the signal is meaningless.
@@ -601,7 +648,29 @@ Trigger evolution check — the system evaluates its own strategy and generates 
      (competence-based); dev-stage >= EXPLOIT can pass while the curriculum contract still blocks,
      so gate on BOTH. (Mirrors the `allow_meta_edits` contract check already used at Step 2's META
      EVAL above.) Log one line: `"FORGE CHECK: curriculum blocks allow_forge_skill at {stage_name} — skipping forge-ready loop"`.
-   - **Forge-ready gap → goal creation**: Read `meta/skill-gaps.yaml`. For EACH gap where `status != "forged"`:
+   - **Forge-ready gap → goal creation**: Read `meta/skill-gaps.yaml`. For EACH gap whose status is
+     NOT terminal — terminal set is `{forged, dismissed, satisfied-by-extension}`:
+     - `forged` — a skill was created (`/forge-skill` Step, sets it + a `forged-skills.yaml` entry).
+     - `dismissed` — explicitly declined (`/forge-skill` sets this; see its "Set gap `status: dismissed`").
+     - `satisfied-by-extension` — the capability shipped by EXTENDING an existing script/skill rather
+       than forging a new one. A legitimate and often preferable outcome (implementation-discipline:
+       no single-use abstractions), and the honest label when nothing was in fact forged.
+
+     Test the whole SET, never `status != "forged"` alone. Every non-excluded terminal status makes
+     its gap re-qualify as forge-ready on EVERY evolve pass, forever: the forge goal gets re-filed,
+     the goal-duplication gate blocks it on the completed original via `origin_signal_completed`, and
+     the pass burns the same dead-end investigation again. Observed 2026-07-27 on gap-026, whose
+     `satisfied-by-extension` status (set the previous day, when the capability shipped as an
+     extension to `tree-body-presence-audit.py` under g-115-3237) was invisible to the old
+     one-value test — that status appears NOWHERE else in `core/` or `.claude/`, so no other layer
+     caught it either. `dismissed` has the identical hole and is only latent because no gap
+     currently carries it.
+
+     When adding a new terminal status anywhere, add it HERE and to the sibling filter in
+     `aspirations-spark/SKILL.md` Phase 6.5 (same forge block, same defect) — the two are the only
+     readers of gap status, and they must agree. (guard-821 is the reinforcing rule: it already
+     treats "set a terminal status with a resolution note" as the way to stop re-qualification; this
+     makes the reader honor every such status, not just one.)
      - **Registry cross-check (g-326-09 incident, 2026-07-16)**: before trusting `gap.status`,
        grep `world/forged-skills.yaml` for `gap_ref: {gap.id}`. If a forged skill already
        references this gap, the gap's `status: registered` is STALE (another agent forged it;

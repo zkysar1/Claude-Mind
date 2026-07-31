@@ -2,8 +2,16 @@
 """PostToolUse[Bash] hook — iteration-close loop-continuity reminder.
 
 Fires AFTER iteration-close.sh --phase productivity-check OR recurring-close.sh
-completes, injecting a system-reminder into the model's context that commands
-Skill(aspirations) args='loop' as the next tool call.
+SUCCESSFULLY completes, injecting a system-reminder into the model's context
+that commands Skill(aspirations) args='loop' as the next tool call.
+
+Two independent conditions must BOTH hold before anything is injected:
+  (1) a command segment invokes one of the two close scripts
+      (_command_invokes_iteration_close — command text), and
+  (2) that call actually closed an iteration
+      (_close_actually_completed — the ITERATION COMPLETE marker in stdout).
+Until 2026-07-31 only (1) was checked, so a rejected flag or a `--help` probe
+injected a directive asserting an iteration had closed when none had (g-115-4179).
 
 Background (session 58 alpha-stopping investigation, 2026-04-24):
 The Stop hook does not fire reliably when Claude Code ends a turn with a text
@@ -128,6 +136,11 @@ def _is_deep_recurring_close(tool_response) -> bool:
 
     Fail-open: any unexpected shape (None, non-dict, missing stdout, non-str
     stdout) yields False. The generic reminder fires instead — never crashes.
+
+    Note this fail-open answers WHICH reminder to emit (deep vs generic). It is
+    a different question from WHETHER to emit one at all, which
+    `_close_actually_completed` below answers with the opposite default. Both
+    are correct; conflating them is what produced the false-fire class.
     """
     if not isinstance(tool_response, dict):
         return False
@@ -135,6 +148,38 @@ def _is_deep_recurring_close(tool_response) -> bool:
     if not isinstance(stdout, str):
         return False
     return _DEEP_RECURRING_RE.search(stdout) is not None
+
+
+# Success marker — the TERMINAL line BOTH closers emit, and the only evidence
+# available in the hook payload that an iteration actually closed:
+#   iteration-close.sh:2462   [iteration-close] ═══ ITERATION COMPLETE ═══
+#   recurring-close.sh:1009   [recurring-close] ═══ ITERATION COMPLETE ═══
+# The box-drawing rule (U+2550) is matched permissively for the same reason
+# _DEEP_RECURRING_RE tolerates dash drift: anchor on the two STABLE literals
+# (the bracketed producer tag and the phrase) and accept any non-word run
+# between them, so a cosmetic change to the rule characters cannot silently
+# re-open the false-fire. `[^\w\n]*` excludes newlines, so the tag on one line
+# cannot pair with the phrase on another.
+_ITERATION_COMPLETE_RE = re.compile(
+    r"\[(?:iteration|recurring)-close\][^\w\n]*ITERATION COMPLETE"
+)
+
+
+def _close_actually_completed(tool_response) -> bool:
+    """True iff tool_response.stdout carries the terminal ITERATION COMPLETE
+    marker that both close scripts emit on success.
+
+    Deliberately NOT fail-open: any unexpected shape (None, non-dict, missing
+    stdout, non-str stdout) yields False, so NO reminder is injected. See the
+    OUTCOME GATE comment in main() for why that asymmetry is the safe direction
+    for this particular question.
+    """
+    if not isinstance(tool_response, dict):
+        return False
+    stdout = tool_response.get("stdout")
+    if not isinstance(stdout, str):
+        return False
+    return _ITERATION_COMPLETE_RE.search(stdout) is not None
 
 
 # Terminal-script match is two-layered:
@@ -255,6 +300,31 @@ def main():
     if not _command_invokes_iteration_close(command):
         sys.exit(0)
 
+    # OUTCOME GATE (). The command text proves an INVOCATION, never a
+    # successful CLOSE. Both closers reject bad input at several early exits —
+    # usage error, invalid outcome-class, invalid --source — and a `--help`
+    # probe closes nothing at all; every one of those matched the regex above
+    # and still injected a maximally-imperative "an iteration just closed"
+    # reminder. An agent that obeys it mid-goal abandons the in-flight work and
+    # re-enters the loop on a false premise, leaving the goal claimed and
+    # in-progress. Observed 2026-07-31 during : `recurring-close.sh
+    # --help` was rejected, printed no ITERATION COMPLETE, closed nothing, and
+    # the full deadman-pair directive fired anyway. guard-1118 and guard-1162
+    # are the Layer-A compensations this gate makes unnecessary.
+    #
+    # THE DIRECTION IS DELIBERATE: no evidence of a close -> DO NOT FIRE. That
+    # inverts this file's usual fail-open, and the asymmetry is the whole point.
+    # A FALSE fire tells the agent to abandon live work; a MISSED fire is caught
+    # by the Stop hook, return-protocol discipline, and the
+    # pending_phase_6_spark sentinel. Failing quiet is the safe direction for
+    # THIS question. Known and accepted consequence: a close whose stdout the
+    # harness does not deliver to the hook (a run backgrounded past the Bash
+    # timeout) no longer fires the reminder — precisely the case
+    # aspirations/SKILL.md Phase -0.5c.2's sentinel already backstops.
+    tool_response = data.get("tool_response")
+    if not _close_actually_completed(tool_response):
+        sys.exit(0)
+
     # Mode gate: the Skill(aspirations) imperative only applies to the runner
     # session of an agent in RUNNING + autonomous. Three cuts, in order:
     #   (a) session_id + PROJECT_ROOT present,
@@ -335,8 +405,9 @@ def main():
     # Pick reminder text by inspecting tool_response.stdout for the deep
     # recurring marker. Generic reminder is the default — applies to
     # iteration-close.sh productivity-check AND to OUTCOME=routine recurring
-    # closes AND to any unexpected tool_response shape (fail-open).
-    tool_response = data.get("tool_response")
+    # closes. `tool_response` was already read and outcome-gated above, so by
+    # here a close is PROVEN to have completed; the only open question is which
+    # reminder text fits it.
     # Deadman-aware (default-ON since Stage 5): emit the terminal-PAIR reminder
     # unless this agent opted out via a deadman-disabled flag — same flag the
     # close scripts gate on. Without this, the Skill-only reminder (which

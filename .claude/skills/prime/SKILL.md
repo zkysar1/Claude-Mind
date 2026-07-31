@@ -1,6 +1,6 @@
 ---
 name: prime
-description: "Primes the agent's active context by loading accumulated knowledge: self.md identity, world/program.md shared purpose, all active guardrails, universal + active reasoning-bank entries, category-specific tree nodes (top in-progress and HIGH-priority pending goal categories), recent coordination-board messages, and cross-agent musings. Use whenever a session starts in any mode, when /boot hands off to the aspirations loop, or when switching agents — without priming, the agent answers domain questions from amnesia. Internal sub-skill."
+description: "Primes the agent's active context by loading accumulated knowledge: self.md identity, world/program.md shared purpose, a bounded 100%-coverage guardrail index (expanded in full on demand), a bounded recency slice of the reasoning bank, category-specific tree nodes (top in-progress and HIGH-priority pending goal categories), recent coordination-board messages, and cross-agent musings. Use whenever a session starts in any mode, when /boot hands off to the aspirations loop, or when switching agents — without priming, the agent answers domain questions from amnesia. Internal sub-skill."
 user-invocable: false
 triggers:
   - "/prime"
@@ -68,8 +68,9 @@ IF state == "NO_AGENT":
   → World-only priming mode. Skip all agent-specific steps.
   → Bash: world-cat.sh program.md  # The Program — shared purpose
   → Bash: world-cat.sh knowledge/tree/_tree.yaml  # collective knowledge overview
-  → Bash: guardrails-read.sh --active (shared safety rules)
-  → Bash: reasoning-bank-read.sh --active (shared lessons)
+  → Bash: guardrails-read.sh --summary (shared safety rules — bounded index,
+    100% coverage; same budget + expansion rules as Phase 2 item 3)
+  → Bash: reasoning-bank-read.sh --recent (shared lessons — bounded; see Phase 2 item 4)
   → Display:
     ═══ WORLD PRIME (no agent) ═══
     PROGRAM: [contents of world/program.md]
@@ -120,7 +121,9 @@ IF state == "NO_AGENT":
 
 ## Phase 2: Load Domain-Agnostic Stores (Always)
 
-These are small, always relevant, and not category-specific. Load unconditionally.
+Self, the Program, and beliefs are small and load unconditionally. The two JSONL
+stores — guardrails and the reasoning bank — are not: each loads to an explicit
+token budget below, as a bounded index plus on-demand expansion, never in full.
 
 ```
 1. Read agents/<agent>/self.md → full content
@@ -135,17 +138,43 @@ These are small, always relevant, and not category-specific. Load unconditionall
      {world/program.md content}
    IF empty or missing: skip silently
 
-3. Bash: guardrails-read.sh --active → ALL active guardrails
-   IF count > 30: note overflow but still load all (guardrails are safety-critical)
+# Rationale (WHY bounded, and why not a ranked slice): core/config/rationale/prime-store-load-budget.md
 
-4. Reasoning bank — load universal meta-lessons first, then all active entries.
-   The universal layer guarantees cross-domain lessons (schema-probe-first,
-   canonical-probe, cadence-observability) surface during priming regardless
-   of the agent's current focus. See `memory-pipeline.yaml` → `reasoning_bank_routing`.
-   - Bash: reasoning-bank-read.sh --universal → framework-* + applies_to in {any, framework} entries,
-     sorted by utilization_score desc. Display count + top 5 titles.
-   - Bash: reasoning-bank-read.sh --active → ALL active reasoning bank entries (superset).
-     IF count > 30: note overflow but still load all
+3. Guardrails — bounded INDEX, then expand on demand. Budget ~40k tokens.
+   `--active` is not an option: measured 2026-07-27 at 1398 records / 2.66 MB
+   (~665k tokens), larger than the whole context window — so the former
+   unconditional-load instruction could never have executed.
+   - Bash: guardrails-read.sh --summary → one line per guardrail (id, category,
+     truncated rule). 160 KB (~40k tokens), covering 100% of active guardrails
+     (1398/1398 verified). Nothing is dropped — every guardrail is present by id.
+   - Treat the rule text in that index as ABSENT, not as read: the imperative
+     sits past the truncation ~85% of the time, so a slice shows you the topic
+     and hides the instruction (guard-1421).
+   - Before acting inside a guardrail's trigger zone, expand it IN FULL:
+     `guardrails-read.sh --id guard-NNN`, or `--category <cat>` for a whole lane.
+   - The always-load core is identified by the explicit `severity` marker —
+     NEVER by a utilization count (guard-841 / rb-1824: times_active is
+     cumulative, so passive always-on rails read healthy-HIGH and a count
+     threshold would drop exactly the wrong entries). That marker is not usable
+     yet: 1114/1398 (80%) carry no severity at all and only 3 are CRITICAL.
+     Until it is populated, the 100%-coverage index above IS the safety floor —
+     do not substitute a ranked slice for it.
+
+4. Reasoning bank — bounded recency index; relevance arrives in Phase 3.
+   Budget ~9k tokens. Neither `--active` nor `--universal` is an option:
+   `--universal` measured 4123 records / 10.8 MB (~2.7M tokens) — 79% of the
+   store, so it was never a budget.
+   - Bash: reasoning-bank-read.sh --recent → 498 entries, 37 KB (~9k tokens).
+   - Category-relevant entries load in Phase 3 via
+     `retrieve.sh --category {cat} --depth {tier_depth}` (DEPTH_LIMITS:
+     shallow 15 / medium 30 / deep 50) — the existing budgeted path.
+   - Expand on demand: `--id`, `--tag`, `--query`, `--category`.
+   - This does NOT preserve the old universal-set guarantee (every framework/any
+     lesson present at prime time); that guarantee was unbuyable at ~2.7M tokens.
+     Cross-domain lessons now arrive via the recency window plus Phase 3
+     category retrieval. See `memory-pipeline.yaml` → `reasoning_bank_routing`.
+   - `--universal --summary` does NOT compose: `--universal` wins silently and
+     returns the full ~2.7M-token load, not an index (verified 2026-07-27).
 
 5. Bash: world-cat.sh knowledge/beliefs.yaml  # filter status in (active, weakened)
    IF file missing: beliefs = [] (skip silently)
@@ -251,12 +280,18 @@ These are small, always relevant, and not category-specific. Load unconditionall
    → Observability surface for the anti-drift counters mutated in aspirations
      loop Phase 4.1. See `core/config/aspirations-loop-digest.md` §Signal Mutation
      Blocks A/C: routine_streaks[goal_id] auto-flips outcome_class=deep at 5;
-     session_signals.routine_streak_global auto-flips at 8.
+     signals.routine_streak_global auto-flips at 5 (`recurring.routine_streak_global_ceiling`,
+     core/config/aspirations.yaml — NOT 8, corrected 2026-07-29 against the config + script default).
    Stash for Phase 4:
-     - global = loop_state.session_signals.routine_streak_global  (int, default 0)
+     # Sub-slot is `signals` on disk, NOT `session_signals` (that is the orchestrator's
+     # restored variable name). Reading `session_signals` returns absent → silent all-zeros.
+     - global = loop_state.signals.routine_streak_global           (int, default 0)
      - per_goal = loop_state.routine_streaks                       (dict, default {})
-     - total_routine = loop_state.session_signals.routine_count_total (int, default 0)
-     - goals_completed = loop_state.goals_completed_this_session   (list, default [])
+     - total_routine = loop_state.signals.routine_count_total      (int, default 0)
+     # NOT goals_completed_this_session — that key EXISTS but is an INT counter, so
+     # len() on it raises TypeError; goals_completed is an int too. The list is
+     # counted_goals_this_session. Measured 2026-07-29.
+     - goals_completed = loop_state.counted_goals_this_session     (list, default [])
    IF wm-read returns "null" (no prior loop_state — IDLE session, fresh start, or
    first iteration): stash all zeros. Phase 4 will omit the Boredom line.
 
@@ -281,6 +316,30 @@ These are small, always relevant, and not category-specific. Load unconditionall
     IF unprocessed_count == 0 OR entries is empty: Phase 4 omits the insights block.
     IF count >= 50: display in Phase 4 gets a curation-debt suffix
       (" — consider /felt-sense-checkin to curate") to surface the backlog pressure.
+
+11. Bash: peer-surface.sh
+    → THIS WORLD IS NOT ALONE. Peer deployments are registered in
+      `core/config/environments/*.yaml`, and one of them (`zds-mind`) has been
+      posting to this world's board continuously since 2026-06-02. Every other
+      store /prime loads describes this world only, so without this read the
+      PRIMED summary is a complete-looking picture of a world the agent has no
+      reason to believe has neighbours — and an agent that primes into a
+      solitary world never thinks to cross (g-115-3927).
+    Emits 2-4 lines: peer count + each peer's storage backend, inbound volume
+      over 7d broken down by deployment and channel, and the pointer to
+      `peer-board-post.sh` + `core/config/conventions/cross-deployment-channel.md`.
+    Cost ~1.5s warm (two bounded board reads). FAIL-OPEN by contract — it exits
+      0 on every error path and never gates loop entry.
+    Use the emitted lines VERBATIM — do NOT re-derive these counts inline. The
+      script exists because all three ways to get this wrong return a plausible
+      number instead of an error: `board-read.sh --json` emits JSONL and not an
+      array (a `json.load` returns zero rows, which reads as "no peers"); the
+      `cross-deployment` tag has ZERO installed base, so filtering by it reports
+      an empty channel over real traffic; and "author not in the local roster"
+      over-counts, because some local posts carry a goal-title fragment in the
+      author field. See `core/scripts/peer_surface.py` for the measurements.
+    Stash for Phase 4: peer_lines = the script's stdout lines.
+    IF the script emits nothing at all: Phase 4 omits the block.
 ```
 
 ## Phase 3: Load Category-Specific Knowledge
@@ -335,6 +394,17 @@ Beliefs: {count} active
      "Boredom: routine_streak_global={global} (auto-deep at 5) | per-goal: {top3 or 'none'} | session: {ratio}"
 }
 Partner ({partner-name}): {if in_flight: "in_flight {goal_id} '{title[:40]}' phase={phase} ({Nm/h} ago)" else: "no in_flight"} | last_active {Nm/h ago}
+{Peers block (step 11) — render peer_lines VERBATIM, one per line, unindented.
+ OMIT the block ONLY when step 11 emitted nothing at all. Do NOT omit it on a
+ quiet window: the script deliberately prints "channel is live but quiet this
+ window" rather than a zero, because a suppressed line and an absent channel
+ are indistinguishable to the reader — and that ambiguity is the whole defect
+ this block exists to close. Sits directly under Partner by design: Partner is
+ the local fleet, Peers is the same question asked across deployments.
+ Typical shape:
+   "Peers: 3 registered (claude-mind:local, local:local, zds-mind:local) | self=ayoai-mind:own-cloud"
+   "Inbound (7d): 34 posts from zds-mind [coordination 17, findings 17]"
+   "Cross via core/scripts/peer-board-post.sh (convention: core/config/conventions/cross-deployment-channel.md)"}
 {Pending encodings (cross-agent) — OMIT entire block when pending_encodings is empty.
  Otherwise render:
    "Pending encodings (cross-agent, 30m):"

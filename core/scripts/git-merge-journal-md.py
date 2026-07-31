@@ -55,6 +55,34 @@ one side deliberately removed, a section present in BASE and absent from one
 side is treated as an intentional deletion and is NOT resurrected. With no base
 (the add/add case) every section is an addition, so nothing can be resurrected.
 This is the section-level analogue of the union evidence gate.
+
+SAME-HEADING UNION: RE-EXAMINED AND REFUSED AGAIN (g-115-3980 outcome 5, closed
+by g-115-4253 2026-07-31). The open question was whether a same-heading
+divergence is safe to auto-union rather than conflict. It is not, and the
+REFUSE above stands, on three grounds:
+
+  1. Headings are minute-keyed (``## HH:MM — <label>``; measured across three
+     live agent-days). Identical heading + different body therefore means two
+     DIFFERENT events collapsed onto one key. Coalescing them concatenates two
+     unrelated narratives under one timestamp, and the result is thereafter
+     indistinguishable from a single entry — the loss is silent and permanent.
+  2. The cost of refusing is already bounded. Per the exit-1 contract above,
+     markers wrap ONLY the diverging section and every other section still
+     auto-unions, so a reader resolves one section, not a file.
+  3. It is NOT the class that wedged cc-06, though g-115-4253 bundled the two.
+     There, an unknown basename left the path UNMERGED and aborted the entire
+     integrate (54 commits, 6.2h). Here the driver always writes a resolvable
+     annotated result. Same symptom word ("keeps conflicting"), different
+     failure shape, different remedy — do not import the fallback from
+     git-merge-ayoai-ledger.py into this driver.
+
+The improvement actually available is UPSTREAM of the merge: if two boxes can
+emit the same ``## HH:MM — <label>`` for different events, the key is not unique
+enough, and widening it at write time (journal-append.sh) removes the class
+instead of teaching the merge to paper over it. Deliberately NOT implemented
+here: the reported collisions were on another deployment's journal, unreadable
+from this box, so the same-minute-different-event cause is UNMEASURED. Filed
+rather than fixed on a guess.
 """
 import re
 import sys

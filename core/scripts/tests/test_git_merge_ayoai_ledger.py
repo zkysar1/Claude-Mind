@@ -93,9 +93,108 @@ def test_aspirations_routes_to_registry():
     assert cm.merge_handler_for("agents/x/aspirations.jsonl") is cm.merge_aspirations
 
 
-def test_unregistered_basename_raises():
+def test_unregistered_basename_with_conflicting_content_raises():
+    """Unknown basename + a GENUINE conflict must still raise (=> exit 1).
+
+    The inputs are deliberately non-degenerate. This assertion used to pass
+    b"{}" for both sides, which under the g-115-4253 text-merge fallback is not
+    a conflict at all — identical sides merge to themselves, so the raise it
+    checked for came from having no fallback rather than from the content being
+    unmergeable. A test whose premise is 'the two sides are the same' cannot
+    speak to what happens when they differ."""
     with pytest.raises(Exception):
-        drv.merge_bytes("agents/x/random-unknown.jsonl", b"{}", b"{}")
+        drv.merge_bytes("agents/x/random-unknown.jsonl",
+                        b'{"k": "ours"}\n', b'{"k": "theirs"}\n',
+                        b'{"k": "base"}\n')
+
+
+# ── : validated text-merge fallback for unregistered basenames ─────
+#
+# 167 of 253 routed files had no handler, and each was a hard stop that aborted
+# the whole integrate (cc-06: 54 commits stranded 6.2h behind one file). These
+# pin the fallback's two halves: it must RECOVER the disjoint case, and it must
+# DECLINE anything it cannot vouch for.
+
+def _merge_file_rc(base: bytes, ours: bytes, theirs: bytes, tmp_path) -> int:
+    """Raw `git merge-file` rc on the same inputs — the positive control.
+
+    Without it, a test asserting "the fallback declined" cannot distinguish
+    'validation rejected a clean merge' (what is being pinned) from 'git found
+    a conflict' (which would make the assertion vacuous, guard-1451)."""
+    p = {}
+    for name, blob in (("ours", ours), ("base", base), ("theirs", theirs)):
+        p[name] = tmp_path / f"mf-{name}"
+        p[name].write_bytes(blob)
+    return subprocess.run(
+        ["git", "merge-file", "-p", str(p["ours"]), str(p["base"]),
+         str(p["theirs"])], capture_output=True).returncode
+
+
+def test_unregistered_basename_disjoint_edits_merge_cleanly():
+    """THE regression. Disjoint edits to an unhandled store used to abort the
+    integrate; both sides' values must now survive in one merged result."""
+    base = b"version: 1\nalpha: 0.1\nfiller: x\nfiller2: y\nomega: 0.9\n"
+    ours = base.replace(b"alpha: 0.1", b"alpha: 0.15")
+    theirs = base.replace(b"omega: 0.9", b"omega: 0.95")
+    out = drv.merge_bytes(".mind-data/meta/no-such-handler.yaml",
+                          ours, theirs, base).decode()
+    assert "alpha: 0.15" in out, "our side's edit was dropped"
+    assert "omega: 0.95" in out, "their side's edit was dropped"
+    assert "<<<<<<<" not in out
+
+
+def test_fallback_is_commutative_on_disjoint_edits():
+    """Both boxes must converge on the same bytes, or they re-conflict forever."""
+    base = b"version: 1\nalpha: 0.1\nfiller: x\nfiller2: y\nomega: 0.9\n"
+    a = base.replace(b"alpha: 0.1", b"alpha: 0.15")
+    b = base.replace(b"omega: 0.9", b"omega: 0.95")
+    p = ".mind-data/meta/no-such-handler.yaml"
+    assert drv.merge_bytes(p, a, b, base) == drv.merge_bytes(p, b, a, base)
+
+
+def test_fallback_declines_when_merge_result_does_not_parse():
+    """A clean text merge that yields invalid JSON must not be written."""
+    base = b'{"a": 1}\n'
+    assert drv._validated_text_merge(
+        "x/thing.json", base, b'{"a": 1\n', b'{"a": 1}\n') is None
+
+
+def test_fallback_declines_duplicate_yaml_keys(tmp_path):
+    """The semantic hazard a clean rc cannot see.
+
+    Both sides insert the SAME key far enough apart to merge without conflict;
+    yaml.safe_load would silently keep the LAST, dropping one box's write with
+    no error. The positive control proves git considered this merge clean, so
+    the decline is the validator's doing and not a conflict in disguise."""
+    base = b"a: 1\np1: x\np2: x\np3: x\np4: x\np5: x\nb: 2\n"
+    ours = b"a: 1\ndup: from-ours\np1: x\np2: x\np3: x\np4: x\np5: x\nb: 2\n"
+    theirs = b"a: 1\np1: x\np2: x\np3: x\np4: x\np5: x\nb: 2\ndup: from-theirs\n"
+    assert _merge_file_rc(base, ours, theirs, tmp_path) == 0, (
+        "control failed: git did NOT merge these cleanly, so this test would "
+        "pass for the wrong reason")
+    assert drv._validated_text_merge(
+        ".mind-data/meta/dupkey.yaml", base, ours, theirs) is None
+
+
+def test_fallback_declines_an_extension_it_cannot_validate(tmp_path):
+    """No validator => refuse. Conservative direction, and free: the routing
+    globs only cover .jsonl/.yaml/.json."""
+    base = b"line1\nfill\nfill2\nfill3\nline5\n"
+    ours = base.replace(b"line1", b"line1-ours")
+    theirs = base.replace(b"line5", b"line5-theirs")
+    assert _merge_file_rc(base, ours, theirs, tmp_path) == 0, (
+        "control failed: git did not merge these cleanly")
+    assert drv._validated_text_merge("x/notes.md", base, ours, theirs) is None
+
+
+def test_registered_handlers_are_unaffected_by_the_fallback():
+    """The fallback fires only when merge_handler_for returns None. A record
+    store must still get its commutative handler, not a line merge."""
+    base = _jsonl({"id": "exp-base"})
+    ours = _jsonl({"id": "exp-base"}, {"id": "exp-O"})
+    theirs = _jsonl({"id": "exp-base"}, {"id": "exp-T"})
+    out = _lines(drv.merge_bytes("agents/x/experience.jsonl", ours, theirs, base))
+    assert sorted(r["id"] for r in out) == ["exp-O", "exp-T", "exp-base"]
 
 
 def test_empty_side_ours_empty():
@@ -269,3 +368,44 @@ def test_live_git_merge_unregistered_basename_still_fails_safe(tmp_path):
     assert res.returncode != 0, "unregistered basename merged — fail-safe weakened"
     unmerged = _git(repo, "diff", "--name-only", "--diff-filter=U").stdout.strip()
     assert unmerged.endswith("no-handler-for-this.yaml")
+    # The fail-safe's whole point: %A keeps clean 'ours', never marker soup.
+    assert b"<<<<<<<" not in unknown.read_bytes()
+
+
+@pytest.mark.skipif(subprocess.run(["git", "--version"], capture_output=True).returncode != 0,
+                    reason="git not available")
+def test_live_git_merge_brand_new_meta_index_does_not_wedge(tmp_path):
+    """ verification outcome 2, as a REAL merge.
+
+    The class this closes is 'the routed population grows but the handler map
+    is hand-enumerated', so the only honest proof is to INTRODUCE a store that
+    no registry entry could possibly know about and show the integrate still
+    converges. Inspecting the registry cannot show this — that is precisely the
+    check that passed while cc-06 sat 6.2h behind backpressure.yaml.
+
+    The divergence shape is the real one: two boxes editing DIFFERENT regions
+    of the same index in the same window.
+    """
+    import coordination_merge as cm
+    repo = _init_ledger_repo(tmp_path, ".mind-data/meta/**/*.yaml merge=ayoai-ledger\n")
+    idx = repo / ".mind-data" / "meta" / "invented-after-the-fix.yaml"
+    assert cm.merge_handler_for(str(idx)) is None, (
+        "fixture is void: this basename acquired a handler, so the test would "
+        "prove the registry works rather than that the fallback does")
+
+    base = (b"version: 1\nmonitors:\n- id: m1\n  score: 0.10\n"
+            b"- id: m2\n  score: 0.20\n- id: m3\n  score: 0.30\n")
+    res = _diverge(repo, idx, base,
+                   base.replace(b"score: 0.10", b"score: 0.11"),   # box A: head
+                   base.replace(b"score: 0.30", b"score: 0.33"))   # box B: tail
+
+    assert res.returncode == 0, (
+        f"a NEW meta index still wedges the integrate: {res.stdout}{res.stderr}")
+    unmerged = _git(repo, "diff", "--name-only", "--diff-filter=U").stdout.strip()
+    assert unmerged == "", f"path left unmerged: {unmerged}"
+
+    yaml = pytest.importorskip("yaml")
+    got = yaml.safe_load(idx.read_text())
+    scores = {m["id"]: m["score"] for m in got["monitors"]}
+    assert scores == {"m1": 0.11, "m2": 0.20, "m3": 0.33}, (
+        f"both boxes' edits must survive the merge, got {scores}")

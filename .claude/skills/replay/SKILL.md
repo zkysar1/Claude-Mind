@@ -120,6 +120,44 @@ For each selected hypothesis (max 10 per session):
 Read the full resolved pipeline record
 Read the original evaluation record (scoring, reasoning)
 
+# ⚠ THE OUTCOME NARRATIVE IS NOT ALWAYS IN `outcome_detail` — READ A FALLBACK CHAIN.
+# Measured 2026-07-31 (bravo, cc-05) over the FULL resolved+archived population,
+# 459 records carrying a CONFIRMED/CORRECTED outcome:
+#   `outcome_detail` EMPTY on 134 (29.2%)
+#     -> 61 of those (45.5%) carry the narrative under ANOTHER key:
+#        resolution_note 20 · resolution 10 · evidence_for 8 · resolution_summary 8
+#        · resolution_evidence 7 · reflection_note 4 · outcome_note 3 · actual_outcome 1
+#     -> 73 (15.9% of all resolved) have NO narrative under any of 11 keys.
+# A reader keyed on `outcome_detail` alone renders BOTH halves as a blank OUTCOME
+# line, so "lesson recorded under a different key" and "lesson never recorded" are
+# indistinguishable — and a blank OUTCOME reads as the second. That is 61 lessons
+# silently dropped per full sweep.
+# NOT a legacy artifact: the genuinely-bare 73 are spread 2026-04 (34), 2026-07 (19),
+# 2026-05 (13), 2026-06 (7) — this month is the second-largest cohort.
+# CONTEXT, so this is not re-derived as a regression: the g-303-15 audit measured
+# ~53% missing (`pipeline.py:322`) and the g-303-27 resolution-evidence gate
+# (guard-870 / guard-1126) has since roughly HALVED it. The gate is working. What it
+# does not do is normalize the key — it is a WRITE-time "is there >=1 evidence
+# pointer" check scanning its own chain (`outcome_detail, outcome_notes, rationale,
+# verification, links`), which passes on `rationale` alone and never touches the six
+# keys above. Read-side normalization is this step's job, not the gate's.
+outcome_text = first non-empty of:
+    outcome_detail, resolution_note, resolution, resolution_summary,
+    resolution_evidence, outcome_note, reflection_note, actual_outcome,
+    evidence_for, rationale
+  # `result` is usually the bare verdict string ("CONFIRMED") — use it for the
+  # verdict, never as the narrative.
+  # `--replay-candidates` returns a PROJECTION: `resolution`, `resolution_summary`,
+  # `resolution_evidence`, `reflection_note` and `actual_outcome` are ABSENT from it
+  # even when populated on the record. Dereference with
+  # `pipeline-read.sh --id <id>` before concluding a narrative is missing (sig-54,
+  # SOURCE half — a projection that drops the field returns a structural blank while
+  # its other columns stay correct).
+IF outcome_text is empty after the full chain AND the full record was read:
+    Write the OUTCOME line as "{outcome}, surprise {n} — no lesson narrative
+    recorded" — state the absence rather than emitting a blank, so a successor can
+    tell an unrecorded lesson from an unread one.
+
 Generate 3-line compressed summary:
   CONDITION: {conditions when hypothesized — category, key signals, data recency, context}
   ACTION:    {what we hypothesized, confidence, strategy used, pattern matched}
@@ -148,6 +186,22 @@ Example (violation):
 ## Step 3: Cross-Hypothesis Pattern Mining
 
 After individual replays, analyze the batch as a whole:
+
+**BATCH IS NOT CORPUS (guard-2129).** Step 1 selects this batch through
+`replay_priority_order`, whose rule 1 is violation-first — "hypotheses where outcome
+contradicted expectation (surprise >= 5)". The batch is therefore deliberately enriched
+for corrections, and every corrected-rate computed below is upward-biased BY
+CONSTRUCTION. Items 1 and 2 are where that bites: "N of M corrected hypotheses shared
+condition X" and "accuracy diverges > 10pp from its historical average" both read a
+violation-first batch rate against a whole-corpus average, so an apparent divergence is
+the SELECTION showing through rather than a signal about the strategy. Measured
+2026-07-31 (foxtrot, g-001-05): a 10-record batch read as a strong calibration signal;
+re-measuring the same signatures across all 252 resolved records showed it was a
+selection artifact, and the lesson was retracted before it was encoded. Before emitting
+any rate or divergence as a finding, re-measure it over the unfiltered resolved corpus,
+or state explicitly that the number is batch-scoped and not comparable to a corpus
+average. A guardrail cannot outvote the instrument it guards — guard-2129 sits in the
+guardrail store, and this paragraph is the instrument.
 
 ```
 1. SHARED CONDITIONS in corrected hypotheses:
@@ -347,10 +401,40 @@ For each strategy referenced during replay:
        Log: "RECONSOLIDATION: {strategy} extended — new conditions discovered"
        Append new conditions to the strategy article
 
-  4. Update pattern signatures:
-     For each affected signature, record outcome via script:
+  4. Update pattern signatures — BUT ONLY FOR SIGNATURES WHOSE OWN `conditions` MATCH:
+     "Update pattern signatures" read as a bare imperative is what makes this the
+     easiest step in the skill to get wrong. `record-outcome` is a one-liner, the
+     instruction sounds like bookkeeping, and there is no write-time complaint.
+     Measured 2026-07-31 (bravo, g-001-05, cc-05): three CORRECTED outcomes were
+     recorded against sig-40 — ACTIVE, validated, 6/6, accuracy 1.0 — for a batch
+     whose instances belonged to a DIFFERENT class, driving it to 6/9 = 0.667 in one
+     turn. Two disqualifying signals were already in hand and neither was consulted:
+     sig-40's conditions are VERIFICATION-time ("the check returned a POSITIVE/passing
+     result") while the instances were FORMATION-time, and the same session had
+     minutes earlier written the sentence "sig-40's conditions do not fire on it"
+     into guard-900. The degradation is SILENT and self-reinforcing — outcome_stats
+     feeds confidence and retrieval weighting, so a wrongly-CORRECTED signature is
+     retrieved LESS and the error is less likely to be met again. A signature at
+     accuracy 1.0 has the most to lose and shows no discrepancy at write time.
+     (This paragraph is here rather than only in guard-486 because guard-486 already
+     existed and did not prevent it: guard-1877's lesson — a guardrail cannot outvote
+     the instrument it guards — so the rail belongs in the instrument too.)
+
+     BEFORE recording, for each candidate signature:
+       a. Read it: bash core/scripts/pattern-signatures-read.sh --active
+       b. Restate its `conditions` and name which replayed instance satisfies EACH.
+          If you cannot, the instance belongs to a different entry — record it there
+          (a guardrail or rb) and record NOTHING here.
+       c. A signature matched RETROSPECTIVELY over already-resolved records is not a
+          tested prediction and takes NO outcome. Replay reads history; the signature
+          was not consulted at the time, so nothing about it was put at risk.
+       d. Skip meta-pattern signatures (guard-575) — those resolve via
+          reflect-on-outcome, and recording here double-counts.
+     THEN record the verdict:
        bash core/scripts/pattern-signatures-record-outcome.sh <sig-id> CONFIRMED|CORRECTED
-     Read current signatures if needed: bash core/scripts/pattern-signatures-read.sh --active
+     If you record in error, restore the prior counts with the whole-object writer —
+     record-outcome only increments:
+       bash core/scripts/pattern-signatures-update-field.sh <sig-id> outcome_stats '{"total":N,"confirmed":M,"accuracy":A}'
 
   5. Source node freshness check:
      For each strategy's source tree node:

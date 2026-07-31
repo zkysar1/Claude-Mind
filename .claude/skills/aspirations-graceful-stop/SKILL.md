@@ -226,7 +226,11 @@ ELSE:
     Bash: team-state-read.sh --field agent_status --json
     partner_claimed = set of agent_status[name].in_flight.goal_id
                       for every name != <agent> where in_flight is non-null
-    Bash: aspirations-query.sh --goal-status in-progress
+    # --full is REQUIRED: the default projection returns only six keys
+    # (asp_id, category, goal_id, source, status, title), so `goal.id` below
+    # resolves to nothing and the revert would pass an empty goal-id to a
+    # status mutation. --full widens the projection to include `id`.
+    Bash: aspirations-query.sh --goal-status in-progress --full
     FOR EACH returned goal:
         IF goal.id in partner_claimed:
             Output: "  Skipped {goal.id} (partner-claimed — not ours to revert)"
@@ -327,6 +331,37 @@ Bash: MIND_AGENT=<agent> SID=$(cat agents/<agent>/session/latest-session-id 2>/d
 # pass through ENV VARS, python source single-quoted — never interpolated.
 # Fire-and-forget (|| true): telemetry must never block the graceful stop.
 Bash: SID=$(cat agents/<agent>/session/latest-session-id 2>/dev/null | tr -d '\r\n'); TMODE=$(cat agents/<agent>/session/stop-target-mode 2>/dev/null | tr -d '\r\n'); [ -n "$SID" ] && TSID="$SID" TAGENT="<agent>" TMODE="$TMODE" py -3 -c 'import os,sys; sys.path.insert(0,"core/scripts"); from _session_telemetry import write_close; write_close(sid=os.environ["TSID"], agent=os.environ["TAGENT"], status="completed", ended_reason="graceful-stop", mode_at_end=(os.environ.get("TMODE") or None))' >/dev/null 2>&1 || true
+# D6.65 (g-115-4134): Unconditional git push flush. iteration-push.sh is
+# deliberately RATE-LIMITED in the per-iteration path (g-115-1734, USER DIRECTIVE
+# user 2026-07-02): it pushes only when ahead >= ITERATION_PUSH_MIN_COMMITS (5)
+# OR oldest-unpushed >= ITERATION_PUSH_MAX_AGE_MIN (20). That batching is correct
+# mid-loop and WRONG at shutdown — a session whose final commits sit under BOTH
+# thresholds leaves them stranded with no later iteration to flush them. Observed
+# on ZDS cc-06: omni's last run made 4 commits over 11 minutes (under 5, under
+# 20m), stopped, and 7 commits sat unpushed ~12h. Forcing all three thresholds to
+# zero converts the batch decision into "push whatever is ahead, now".
+# --fetch-interval-min 0 defeats the 10m fetch throttle so the merge/push decides
+# against a FRESH origin ref rather than a cached one — at shutdown there is no
+# next iteration to correct a stale read.
+#
+# ORDERING IS LOAD-BEARING — this runs BEFORE the D6.7 S3 flush, not after.
+# iteration-push does fetch+MERGE, which mutates git-tracked files under
+# agents/<agent>/ (journal.jsonl, experience.jsonl, changelog.jsonl are all
+# tracked; only session/ and sessions/ are gitignored). Those paths are inside
+# the owned-set D6.7 pushes to S3, so a merge landing AFTER the flush would leave
+# local newer than S3 — precisely the machine-move stranding D6.7 exists to
+# prevent. Merge-then-flush keeps the two durability channels consistent. Safe by
+# construction: on a merge conflict iteration-push runs `git merge --abort` and
+# defers, so it never hands D6.7 a conflicted tree.
+#
+# FAIL-SOFT BY CONSTRUCTION, and the `|| true` is NOT what makes it so. Without
+# --strict, iteration-push's soft_exit() returns 0 on EVERY path including genuine
+# push/merge failure, so an rc-gated `|| handle_failure` here would be DEAD CODE
+# (guard-775). Do NOT add --strict to "improve" error handling: that would let a
+# transient network failure abort the stop sequence. The script logs every
+# decision to stderr, which is the real visibility channel. The `|| true` mirrors
+# iteration-close.sh's production shape as belt-and-suspenders only.
+Bash: MIND_AGENT=<agent> bash core/scripts/iteration-push.sh --min-commits 0 --max-age-min 0 --fetch-interval-min 0 || true
 # D6.7 (session-continuity redesign, 2026-06-02): Flush this machine's governed
 # writes to S3 NOW so a machine-move right after this clean stop cannot strand
 # the session's last continuity writes locally. By this point ALL continuity

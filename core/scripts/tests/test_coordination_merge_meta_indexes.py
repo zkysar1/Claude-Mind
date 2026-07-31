@@ -493,3 +493,115 @@ def test_g3992_machine_local_claim_holds(tmp_path, rel, expect_local):
               or osync._is_machine_local(full.name, prefix,
                                          full_path=full, root_path=root))
     assert actual is expect_local
+
+
+# ── backpressure.yaml () ───────────────────────────────────────────
+#
+# Different from its three siblings above: the trap here is not a DERIVED field,
+# it is that the file's two halves need OPPOSITE merges. rollback_history is a
+# pure append (safe to union); active_monitors is a DRAINING queue with two
+# removal paths the writer owns -- a cap eviction (meta-backpressure.py
+# cmd_monitor:94-96 `monitors.pop(0)`) and a status-filter rebuild (cmd_check:225
+# `[m for m in monitors if m["status"]=="monitoring"]`). Unioning that half
+# resurrects monitors the other box already retired.
+#
+# This is the file that actually stranded a box: routed by the .mind-data
+# wildcard with no handler, it arrived with an unmerged index and ZERO conflict
+# markers, wedging cc-06 for 6.2h / 58 commits on 2026-07-31 and then the
+# Windows clone hours later.
+
+
+def _bp(active=None, history=None, skips=None):
+    doc = {"version": 1, "active_monitors": active or [], "rollback_history": history or []}
+    if skips is not None:
+        doc["audit_only_skips"] = skips
+    return _y(doc)
+
+
+def _mon(mid, status="monitoring", **kw):
+    return dict(meta_change_id=mid, status=status, **kw)
+
+
+def test_backpressure_rollback_history_unions_and_loses_nothing():
+    """The append-only half. Neither side may lose a rollback record."""
+    a = _bp(history=[{"meta_change_id": f"mc-{n}"} for n in (44, 45)])
+    b = _bp(history=[{"meta_change_id": f"mc-{n}"} for n in (45, 46)])
+    got = _load(cm.merge_backpressure(a, b))
+    assert sorted(r["meta_change_id"] for r in got["rollback_history"]) == \
+        ["mc-44", "mc-45", "mc-46"]
+
+
+def test_backpressure_does_not_resurrect_a_rolled_back_monitor():
+    """The REAL cc-06 divergence, replayed.
+
+    Ours rolled mc-44/45 back (so they left active_monitors and appear in
+    rollback_history); theirs has not seen that yet and still lists them active.
+    A blind id-union puts them back into the active queue.
+    """
+    ours = _bp(active=[], history=[{"meta_change_id": "mc-44"}, {"meta_change_id": "mc-45"}])
+    theirs = _bp(active=[_mon("mc-44"), _mon("mc-45")], history=[])
+    got = _load(cm.merge_backpressure(ours, theirs))
+    assert got["active_monitors"] == [], "resurrected a rolled-back monitor"
+    assert len(got["rollback_history"]) == 2
+
+
+def test_backpressure_does_not_resurrect_a_graduated_monitor():
+    """Graduation leaves NO tombstone, so the terminal STATUS is the only signal.
+    A terminal status is a decision one box made that the other has not seen."""
+    ours = _bp(active=[_mon("mc-9", "graduated")])
+    theirs = _bp(active=[_mon("mc-9", "monitoring", goals_since_change=3)])
+    got = _load(cm.merge_backpressure(ours, theirs))
+    assert got["active_monitors"] == [], "resurrected a graduated monitor"
+
+
+def test_backpressure_keeps_genuinely_live_monitors_and_maxes_counters():
+    """The negative control. A handler that simply emptied active_monitors would
+    pass all three tests above; this one fails it."""
+    ours = _bp(active=[_mon("mc-7", goals_since_change=9, imp_k_samples=[.1, .2, .3])])
+    theirs = _bp(active=[_mon("mc-7", goals_since_change=4, imp_k_samples=[.1]),
+                         _mon("mc-8")])
+    got = _load(cm.merge_backpressure(ours, theirs))
+    live = {m["meta_change_id"]: m for m in got["active_monitors"]}
+    assert sorted(live) == ["mc-7", "mc-8"]
+    assert live["mc-7"]["goals_since_change"] == 9          # MAX, not last-writer
+    assert len(live["mc-7"]["imp_k_samples"]) == 3          # longer sample run kept
+
+
+def test_backpressure_audit_only_skips_also_tombstone():
+    """audit_only_skips is the SECOND append-only exit route (cmd_check:198)."""
+    ours = _bp(active=[], skips=[{"meta_change_id": "mc-3"}])
+    theirs = _bp(active=[_mon("mc-3")], skips=[])
+    got = _load(cm.merge_backpressure(ours, theirs))
+    assert got["active_monitors"] == []
+    assert len(got["audit_only_skips"]) == 1
+
+
+@pytest.mark.parametrize("case", ["rollback", "graduate", "live", "mixed"])
+def test_backpressure_is_commutative(case):
+    """guard-907. Byte-identical both ways or the two boxes ping-pong forever."""
+    pairs = {
+        "rollback":  (_bp(active=[], history=[{"meta_change_id": "mc-1"}]),
+                      _bp(active=[_mon("mc-1")], history=[])),
+        "graduate":  (_bp(active=[_mon("mc-2", "graduated")]),
+                      _bp(active=[_mon("mc-2", goals_since_change=5)])),
+        "live":      (_bp(active=[_mon("mc-3", goals_since_change=9)]),
+                      _bp(active=[_mon("mc-3", goals_since_change=2), _mon("mc-4")])),
+        "mixed":     (_bp(active=[_mon("mc-5")], history=[{"meta_change_id": "mc-6"}]),
+                      _bp(active=[_mon("mc-6"), _mon("mc-5", goals_since_change=1)],
+                          history=[{"meta_change_id": "mc-7"}])),
+    }
+    a, b = pairs[case]
+    assert cm.merge_backpressure(a, b) == cm.merge_backpressure(b, a)
+
+
+def test_backpressure_is_registered_for_the_wildcard_path():
+    """The wedge was a ROUTING gap, not a logic gap: .gitattributes routed the
+    path to the driver and nothing was behind it. Pin the resolution."""
+    assert cm.merge_handler_for(".mind-data/meta/backpressure.yaml") is cm.merge_backpressure
+    assert cm.merge_handler_for("meta/backpressure.yaml") is cm.merge_backpressure
+
+
+def test_backpressure_unparseable_side_falls_back_not_raises():
+    """A handler that raises re-creates the wedge it was written to remove."""
+    got = cm.merge_backpressure(b"{{{ not yaml", _bp(history=[{"meta_change_id": "mc-1"}]))
+    assert isinstance(got, bytes) and got

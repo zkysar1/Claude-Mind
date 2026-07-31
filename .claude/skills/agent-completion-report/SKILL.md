@@ -94,7 +94,12 @@ All data comes from framework scripts — no direct JSONL reads.
    → Count lines from each
 
 8. Pending questions + user goals
-   Read: agents/<agent>/session/pending-questions.yaml → filter status == "pending"
+   Bash: bash core/scripts/pending-questions-read.sh --status pending
+   → JSON array of pending entries. This reader is shape-tolerant (flattens the
+     dict-wrapper / list-with-wrapper / bare / mixed on-disk shapes via the same
+     _load_questions logic the sweep sibling uses, rb-1786). Do NOT hand-roll a
+     naive top-level `status == "pending"` scan of the raw YAML — it silently
+     SKIPS entries nested inside a `{questions: [...]}` wrapper (g-115-3039).
    Bash: bash core/scripts/load-aspirations-compact.sh → IF path returned: Read it
    (compact data has IDs, titles, statuses, participants — no descriptions/verification)
    Filter goals with participants containing "user"

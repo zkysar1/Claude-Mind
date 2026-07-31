@@ -142,6 +142,17 @@ def project_root() -> Path:
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _paths import agent_dir as _paths_agent_dir  # noqa: E402
 
+# : never hardcode the escalation aspiration —  is the UPSTREAM
+# deployment's queue and does not exist elsewhere, so a literal files nothing.
+try:
+    from _paths import AGENT_DIR, CORE_ROOT, WORLD_DIR  # noqa: E402
+    from _escalation_target import resolve as _resolve_asp, source_flag as _asp_source
+    ESCALATION_ASP, _ESCALATION_ASP_VIA = _resolve_asp(CORE_ROOT, WORLD_DIR, AGENT_DIR)
+    ESCALATION_SOURCE = _asp_source(ESCALATION_ASP, WORLD_DIR, AGENT_DIR)
+except Exception:
+    ESCALATION_ASP, _ESCALATION_ASP_VIA, ESCALATION_SOURCE = (
+        "asp-115", "fallback:import-failed", "world")
+
 
 def read_text_safe(p: Path) -> Optional[str]:
     """Read a file as text. Returns None if missing or unreadable."""
@@ -1579,8 +1590,8 @@ class MirrorWedgeProbe(Probe):
                 "incident-heavy windows, silently defeating the wedge auto-file "
                 "(g-115-2803).")
             proc = subprocess.run(
-                [_bash, "core/scripts/aspirations-add-goal.sh", "asp-115",
-                 "--source", "world",
+                [_bash, "core/scripts/aspirations-add-goal.sh", ESCALATION_ASP,
+                 "--source", ESCALATION_SOURCE,
                  "--override-duplication", _override_reason],
                 input=json.dumps(body, ensure_ascii=True),
                 capture_output=True, text=True,

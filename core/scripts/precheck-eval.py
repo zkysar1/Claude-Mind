@@ -255,12 +255,22 @@ def _run_script(args, input_text=None, timeout=30):
 def cmd_zombies(args, config, compact):
     """Detect zombie aspirations: blocked-stale tails AND all-terminal never-closed.
 
-    Two kinds (discriminated by entry["kind"]): `blocked_stale` — high completion
-    with only blocked-and-stale goals remaining; `all_terminal` — every
+    Three kinds (discriminated by entry["kind"]): `blocked_stale` — high
+    completion with only blocked-and-stale goals remaining;
+    `blocked_stale_no_motivation` — the same profile on an aspiration whose
+    `motivation` yields no usable tokens (g-115-4164); `all_terminal` — every
     non-recurring goal terminal but the aspiration never closed (g-115-2584).
-    Mirrors aspirations-precheck/SKILL.md Phase 0.5.0a. Does NOT route to
-    complete-review — emits a `zombies[]` list and a `needs_complete_review`
-    flag. The orchestrator invokes /aspirations-complete-review per entry.
+    Mirrors aspirations-precheck/SKILL.md Phase 0.5.0a.
+
+    Routes nothing itself — emits `zombies[]` plus the flag(s) naming the
+    handler each class can actually be discharged by:
+      `needs_complete_review`         -> /aspirations-complete-review Phase 7.4
+      `needs_retire_or_normal_close`  -> retire, or close by the normal path
+    A run raises both when the scan matches a mix. The split exists because
+    Phase 7.4's closure script validates the supplied rationale against the
+    aspiration's `motivation`; without one it cannot discharge the flag at all,
+    so a single flag made that class re-fire forever. The orchestrator invokes
+    the handler named by the flag, per entry.
     """
     intent = config.get("intent_satisfaction") or {}
     zombie_ratio = intent.get("zombie_completion_ratio")
@@ -270,6 +280,17 @@ def cmd_zombies(args, config, compact):
             "aspirations.yaml missing intent_satisfaction.{zombie_completion_ratio,"
             "phase_7_4_min_blocked_hours}"
         )
+
+    # Import the HANDLER's own refusal predicate rather than mirroring it
+    # (). aspirations._validate_intent_satisfaction refuses when
+    # _motivation_tokens(asp["motivation"]) is EMPTY — which a bare
+    # `if not asp.get("motivation")` does NOT reproduce: a motivation of only
+    # short words ("a b cd") is present-but-unusable and would still be routed
+    # to a handler that cannot discharge it. Mirroring the predicate here would
+    # re-introduce exactly the detector/handler divergence this fix exists to
+    # close, so this is a deliberate SSOT import (lazy — ~60ms, paid only by
+    # the zombie scan, not by the other seven subcommands).
+    from aspirations import _motivation_tokens
 
     active = _active_aspirations(compact)
     now = _now()
@@ -292,7 +313,19 @@ def cmd_zombies(args, config, compact):
             # complete-review discriminates the sub-shapes itself: no recurring
             # → fully-complete close; recurring riders → functionally-complete
             # stamp. A present stamp is the sanctioned documented-hold — skip.
-            if has_recurring and asp.get("functionally_complete_at"):
+            #
+            # The `has_recurring and` conjunct was REMOVED (): it gave
+            # the documented-hold escape to the recurring shape ONLY, so a
+            # fully-complete aspiration with no recurring riders had no exit at
+            # all. When its close was independently blocked (the unsatisfiable
+            # evidence arithmetic fixed in aspirations.py in the same goal), the
+            # flag became PERMANENT rather than suppressible — measured on ZDS
+            # , which fired on 3+ consecutive passes with no way to stand
+            # it down. 's identical flag WAS killable precisely because it
+            # had recurring riders. Honoring the stamp for both shapes means any
+            # future unsatisfiable-gate bug degrades to a suppressible flag
+            # instead of one that trains the reader to ignore the signal class.
+            if asp.get("functionally_complete_at"):
                 continue
             nonrec_total, nonrec_completed = effective_counts(asp, include_recurring=False)
             zombies.append({
@@ -329,16 +362,53 @@ def cmd_zombies(args, config, compact):
                 break
         if not all_stale:
             continue
+        # RE-ROUTE, do not skip ( / rb-792). The blocked_stale kind
+        # routes to complete-review Phase 7.4 -> aspirations-complete-intent.sh,
+        # which validates that the rationale quotes a token from the
+        # aspiration's `motivation`. An aspiration with no usable motivation
+        # therefore CANNOT be discharged by that handler, so the flag re-fires
+        # forever and trains the reader to ignore the whole signal class
+        # (measured: 3+ consecutive passes on ZDS ).
+        #
+        # Two fixes were measured and REJECTED before this one — do not
+        # re-propose either. (1) Skipping motivation-less aspirations in the
+        # DETECTOR: half the ZDS portfolio lacks the field (7 of 14 active there;
+        # measured 4 of 31 active here 2026-07-31), so skipping would trade a
+        # visible annoyance for an invisible detection gap.
+        #
+        # That 13%/87% split is also what makes `has_motivation` a real
+        # discriminator rather than a flag that is true for everything and
+        # therefore separates nothing (guard-1654 — tabulate the boolean against
+        # the live population BEFORE branching on it, especially in a path that
+        # files goals on a recurring schedule).
+        # (2) Backfilling the motivation: self-defeating, because that field IS
+        # the reference text the closure gate validates the rationale against —
+        # when a gate checks A against B you cannot supply B on the gate's
+        # behalf. Detection coverage is preserved here; only the ROUTE changes,
+        # to the destination aspirations.py:2387's own comment already names
+        # ("retire or complete normally").
+        has_motivation = bool(_motivation_tokens(asp.get("motivation") or ""))
         zombies.append({
             "aspiration_id": asp.get("id"),
             "title": asp.get("title"),
             "source": asp.get("source", "agent"),
-            "kind": "blocked_stale",
+            "kind": "blocked_stale" if has_motivation else "blocked_stale_no_motivation",
             "completion_ratio": round(completion_ratio, 3),
             "blocked_goal_ids": [g.get("id") for g in unfinished],
         })
 
-    flags = ["needs_complete_review"] if zombies else []
+    # Two DISTINCT flags so each lands on a handler that can actually discharge
+    # it (). Emitting one flag for both classes is what made the
+    # motivation-less case permanent: complete-review is the right destination
+    # for a motivation-bearing zombie and a structural dead end for one without.
+    # A run can raise both when the scan matches a mix.
+    dischargeable = [z for z in zombies if z["kind"] != "blocked_stale_no_motivation"]
+    no_motivation = [z for z in zombies if z["kind"] == "blocked_stale_no_motivation"]
+    flags = []
+    if dischargeable:
+        flags.append("needs_complete_review")
+    if no_motivation:
+        flags.append("needs_retire_or_normal_close")
     summary = (
         f"zombies: {len(zombies)} aspiration(s) matching intent-satisfaction profile"
         if zombies else "zombies: clean"

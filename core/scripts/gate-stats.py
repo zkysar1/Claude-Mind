@@ -50,6 +50,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from _paths import META_DIR, WORLD_DIR
+from _gate_log import firings_paths
 
 FIRINGS_JSONL = META_DIR / "gate-firings.jsonl"
 LEDGER_JSONL = WORLD_DIR / "override-bypass-ledger.jsonl"
@@ -308,7 +309,12 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     since = datetime.now() - timedelta(days=args.days)
-    firings = list(_load_records(FIRINGS_JSONL, since))
+    # : read through the store's composition seam (see _gate_log
+    # .firings_paths) rather than a hardcoded filename, so date segments are
+    # picked up with no change here. Today this resolves to exactly
+    # FIRINGS_JSONL, so output is byte-identical.
+    firings = [r for p in firings_paths(FIRINGS_JSONL.parent)
+               for r in _load_records(p, since)]
     ledger = list(_load_records(LEDGER_JSONL, since))
     stats = _build_stats(firings, ledger, gate_filter=args.gate)
 

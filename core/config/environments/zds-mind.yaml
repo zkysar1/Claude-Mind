@@ -14,3 +14,15 @@
 # ZDS-Mind's running behavior.
 environment_id: zds-mind
 backend: local
+# known_agents (OPTIONAL, ): agent names known to operate in THIS
+# deployment. Feeds the cross-deployment addressing collision set
+# (core/config/conventions/cross-deployment-channel.md "Addressing an agent"):
+# a BARE requires_action_by:<name> where <name> is in BOTH the local roster
+# and a peer's known_agents is ambiguous and FAILS LOUD in
+# core/scripts/insight-trigger-sweep.py resolve_addressing(). Measured
+# 2026-07-30 (, zeta, from zds-mind team-state): roster is
+# omni + zeta. Update when their roster changes; absence of this field
+# contributes no names (collision set shrinks, bare names keep routing local).
+known_agents:
+  - omni
+  - zeta

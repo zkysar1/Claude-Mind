@@ -161,9 +161,20 @@ work done inline during another goal's execution, framework edits done
 reflexively, blockers resolved mid-turn.
 
 ```
-Bash: aspirations-query.sh --goal-status in-progress
-Bash: aspirations-query.sh --goal-status pending --goal-field participants agent
+Bash: aspirations-query.sh --goal-status in-progress --full
+Bash: aspirations-query.sh --goal-status pending --goal-field participants agent --full
 ```
+
+**`--full` is MANDATORY here, not cosmetic.** The default projection returns
+exactly SIX keys — `asp_id, category, goal_id, source, status, title` — and
+`claimed_by` is NOT among them (measured 2026-07-25: 0/190 records carried
+`claimed_by` without `--full`; 8/190 carried it with `--full`, which widens
+the projection to 88 distinct keys). Without the flag, the Multi-Agent Safety
+Rule below reads `goal.claimed_by` as absent on EVERY goal, concludes
+"claimed_by is null → safe to mutate", and mutates partner work — which is
+exactly the g-115-683 race the rule was written to prevent. The guard is
+INERT without `--full`. Same applies to `defer_reason` / `blocked_by` /
+`blocker_ref` in Phase 3.
 
 ### Multi-Agent Safety Rule (MANDATORY)
 
@@ -190,7 +201,7 @@ partner work mid-execution, NOT orphan state. Before any mutation:
 
 ```
 FOR each goal in the in-progress / pending-with-agent-participants query:
-    claimed_by = goal.claimed_by  # already in the query result
+    claimed_by = goal.claimed_by  # present ONLY because the query above passed --full
     IF claimed_by is not null AND claimed_by != "$MIND_AGENT":
         SKIP — partner work; do not mutate.
     IF claimed_by is null OR claimed_by == "$MIND_AGENT":
@@ -230,12 +241,140 @@ apply the `claimed_by` check above before mutating goal state.
 Scan blocked goals whose premise may have resolved during the window:
 
 ```
-Bash: aspirations-query.sh --goal-status blocked
+Bash: aspirations-query.sh --goal-status blocked --full
 ```
+
+`--full` is required for the same reason as Phase 2: the default six-key
+projection omits `defer_reason`, `blocked_by`, and `blocker_ref`, so without
+it every blocked goal reads as having no recorded block reason. That is a
+zero-signal probe, not evidence — and it silently contradicts the
+authoritative `reason-less-blocked-check.sh` sweep (rb-245: verify the field
+is in the schema before believing a zero-count).
 
 For each goal whose blocker is agent-provisionable, re-probe with the
 canonical script (per `.claude/rules/probe-before-defer.md`). If the
-probe succeeds:
+probe succeeds, apply BOTH gates below before mutating anything.
+
+### Step 3.0 — check the RULE axis BEFORE re-probing (guard-1783)
+
+Everything else in this phase is the PREMISE axis: is the blocking condition
+still true? That axis alone can never free a goal whose blocker was retired by
+a *permission change* rather than by the world changing — the probe keeps
+returning "yes, still true" and correctly re-blocks, forever.
+
+So before (or alongside) the canonical re-probe, read the standing-grant table
+and check whether any grant has retired this blocker's stated reason:
+
+```
+Bash: bash core/scripts/world-cat.sh conventions/capability-routing.md
+```
+
+Look for a grant whose scope names the blocker's condition. Grants sometimes say
+so verbatim — grant-009 reads *"'DEV env-server is DOWN' / 'no running
+env-server' is no longer a valid `defer_reason` — the correct response is to
+start one."* A blocker citing that condition is invalid the moment the grant is
+recorded, regardless of what the probe measures.
+
+**Decompose a multi-condition blocker before judging it.** An `external_id` like
+`a+b+c` names three conditions; a grant may retire one and leave two. Do NOT
+unblock on the retired one alone (guard-1540: a check watching a SUB-PART returns
+a false all-clear) and do NOT leave the blocker as written either. Re-state it:
+drop the retired condition, record which grant retired it, and name what actually
+remains — including any condition the last probe left INCONCLUSIVE, since
+unverified is neither clear nor live (rb-245).
+
+Measured 2026-07-29, and the reason this step exists: `g-250-03-c` was re-blocked
+by **this very lane** on 2026-07-28T15:55, citing "DEV env-server is DOWN (0
+running)" measured correctly with the canonical script — three days after
+grant-009 (2026-07-25) retired that exact sentence as a valid reason. The probe
+was right and the conclusion was wrong. Its other two conditions were left
+explicitly "inconclusive, not negative", so after the retired one is dropped the
+block rests on zero measured conditions. This is the canonical failure named in
+`.claude/rules/reclaim-routed-work.md`, occurring inside the lane whose job is to
+catch it — because the lane had a premise step and no rule step. guard-1783's
+`times_active` was 0 until this firing.
+
+### Gate 1 — Phase 2's Multi-Agent Safety Rule applies here too
+
+This phase mutates goal status exactly as Phase 2 does, so it inherits
+Phase 2's guard verbatim: if `claimed_by` is set AND `claimed_by !=
+$MIND_AGENT`, SKIP. Additionally check `participants` — a goal routed to
+a single named partner (e.g. `participants: ['foxtrot']`) is that partner's
+work whether or not it is currently claimed, and unblocking it hands them a
+pending goal they did not re-open. Same g-115-683 race class.
+
+Origin (g-335-315 window, 2026-07-27): the g-115-687 sibling-scan audit swept
+sibling SKILLS (`/reflect-maintain` et al., table above) and missed the sibling
+PHASE inside the very skill that carries the rule — this Phase 3 had no
+claimed_by guard at all while Phase 2, forty lines up, had a full one with an
+incident behind it. A guard on one scan and absent from its twin reads as
+covered, which is why it survived two audits.
+
+### Gate 2 — one resolved signal does not authorize an unblock
+
+A blocked goal can carry THREE independent block signals: `blocked_by` (a
+dependency edge on another goal), `blocker_ref` (a structural blocker with
+its own `type` / `expires_at`), and `defer_reason` (a narrative defer). They
+are ANDed, not ORed. Resolving one leaves the others live, so confirm ALL
+THREE are clear before flipping status — and prefer clearing the single
+stale signal over unblocking the goal.
+
+Measured the same window: `g-250-03-c` had `blocked_by: ['g-250-127']` where
+g-250-127 was `completed` — a genuinely stale dependency edge — while its
+`blocker_ref` (resource-contention, two named unmet conditions, `expires_at`
+2026-07-28) was still live. "Dependency resolved → set pending" would have
+released a correctly-blocked goal into the selection pool. Same shape as
+guard-1540: a check watching a SUB-PART of what the block constrains returns
+a false all-clear.
+
+### Gate 3 — an UNREADABLE block signal is not a CLEAR one
+
+Gate 2 says confirm all three signals are clear. A signal read through a
+canonical accessor can come back `None` for two completely different reasons:
+the block genuinely is not there, or the stored record predates the validator
+and spells its keys differently. Both present as `None`, and Gate 2 as written
+authorizes the unblock in both cases.
+
+So `blocker_ref` is CLEAR only when it is absent or empty. A `blocker_ref` that
+is present and non-empty but yields no recognized `type` is UNREADABLE — treat
+it as a LIVE block and skip the goal. Failing closed here is the same posture
+`quiescence-gate.py` C3 already takes on a missing `expires_at` (guard-487:
+absent is not "not yet expired"), and the read-side twin of guard-961, which
+requires `blocker_ref` to be a dict before any block-classification branch acts
+on it.
+
+Measured this window: `g-335-262` (echo's, `credentials-required`, a live IAM
+`CreateTable` denial with `blocking_goal: g-115-3452`) read as
+`blocked_by=None, blocker_ref→type=None, defer_reason=None` — all three
+signals clear, an unblock candidate by Gate 2. The accessor was right; the
+RECORD is non-canonical. `goal-schemas.md` closed the `blocker_ref` key
+vocabulary in g-115-3532 and REFUSES `blocker_type` / `blocking_goal` /
+`denied_action`, but only on the WRITE path — stored refs are never
+re-validated on read, and this one predates the fix. It is already itemized in
+**g-115-3543** ("g-335-262 has NO `type` key at all, plus 8 unrecognized
+keys"), so a hit here needs no new goal — confirm it is on that list and move
+on.
+
+UNREADABLE HAS TWO SUB-SHAPES AND THEY HAVE DIFFERENT TRACKERS. "Confirm it is
+on that list" is right, but the list above is scoped to `blocker_ref` DICTS. The
+other sub-shape is a bare STRING where a dict belongs, and it is tracked
+separately by **g-115-3843**, whose own text says it sits OUTSIDE g-115-3543's
+dict-scoped enumeration. So a reader who meets a string ref, follows the single
+pointer above, and finds only dict work can go wrong in either direction — file
+a duplicate, or read g-115-3543's eventual close as having covered a record it
+never enumerated.
+
+Measured 2026-07-29 (bravo): of 12 blocked goals, `blocker_ref` types were 9
+dict / 1 str / 2 None. The lone string was `g-335-228` carrying
+`'pq-fox-vinheim-chardef-authoring'` — a pointer to a partner's private
+pending-question. Note the detector shape that makes this visible at all:
+`isinstance(br, dict) and br.get('type')` correctly returns `None` for a string,
+so Gate 3 fires and the goal is skipped as LIVE, which is the safe outcome. But
+a naive `br.get('type')` raises `AttributeError` on a string and a naive
+`br.get('type') if br else None` inside a try/except reads it as absent — both
+of which convert a fail-closed skip into a crash or a false all-clear. Keep the
+`isinstance` form.
+
 ```
 Bash: aspirations-update-goal.sh --source <goal.source> <goal-id> status pending
 Bash: aspirations-update-goal.sh --source <goal.source> <goal-id> defer_reason null
@@ -276,11 +415,30 @@ corresponding check, append a check. Use the existing format:
 ### Phase 5b: Stale Checks (staleness scanner — C2)
 
 Did refactors move targets out from under existing checks? Run the
-staleness scanner against `verify-learning/SKILL.md`:
+staleness scanner across the WHOLE skill surface:
 
 ```
-Bash: py -3 core/scripts/verify-learning-staleness.py --text
+Bash: py -3 core/scripts/verify-learning-staleness.py --all-skills --text
 ```
+
+**`--all-skills`, not the default.** The scanner's default target is
+`verify-learning/SKILL.md` alone, and one of its four lanes — the
+`Parse <var>:` field-name lane added by g-115-3607 — has a population of
+**zero** in that file. Not "zero today": verify-learning has never contained
+a `Parse <var>:` line (`git log -S "Parse eval_json"` on it returns nothing),
+and all five real instances live in OTHER skills (aspirations-precheck,
+reflect, reflect-maintain, curriculum-gates, add-npc-task). So the default
+invocation reported `parse_lines_scanned: 0, stale_count: 0` — and a lane
+that scans nothing reports clean exactly like a lane that scans everything
+and finds nothing. That lane had therefore never once run in this sweep and
+never would. Same vacuous-population class as rb-245 / guard-645: read the
+sub-population counts, not just `stale_count`.
+
+Measured 2026-07-31 (zeta, one call each): default = 1 skill / 2500
+assertions / 0 parse-lines; `--all-skills` = 90 skills / 3648 assertions /
+5 parse-lines. Both found 0 stale, so widening cost one flag and bought
++46% assertion coverage plus the only coverage the parse-line lane will
+ever get.
 
 The scanner reports each stale finding as
 `[L<lane>] line N: <stale_ref>` where the lane is:
@@ -326,6 +484,36 @@ This is the lane that gives the skill its name. Ask yourself explicitly:
 > Where is the pain right now? What is one thing I would change about how
 > I operate? What felt hard this window that shouldn't have? What
 > recurring friction am I tolerating instead of fixing?
+
+### Measure before narrating the feeling (guard-1712 / rb-5522)
+
+This lane asks how things feel RIGHT NOW, and right now is always the TAIL
+of the window. Recency is not a bias this lane occasionally has — it is what
+the lane is made of. So before writing a finding:
+
+- **Asserting a TREND about your own behavior** (drifting, concentrating,
+  slipping, improving, "N consecutive X") → COUNT THE WINDOW first:
+  `Bash: wm-read.sh loop_state --json` and tally
+  `counted_goals_this_session` by aspiration prefix.
+- **Asserting a MECHANISM** ("the selector does not weigh X", "no gate
+  covers Y") → GREP FOR IT first, in `core/scripts/`.
+
+Measured 2026-07-28 (alpha): a Lane 7 finding of "nine consecutive framework
+closes against a standing product directive" was about to be filed as
+MATERIAL. The window was actually 31 asp-115 / 30 asp-335 across 65 closes —
+balanced; the perceived run was the last 8. The accompanying claim that the
+standing directive is not scored was refuted by one grep
+(`goal-selector.py` `load_strategic_focus` + `strategic_focus_boost`,
+g-115-3136). Both errors pointed toward the MORE dramatic, more self-critical
+finding — treat that direction as the tell, not as evidence of rigor. A
+finding that flatters the narrative of vigilance earns the same probe as one
+that flatters performance.
+
+Sibling precedent: `/fresh-eyes-review` Phase 2.2b already carries this
+discipline (guard-1428, plus its completed_date-vs-lastAchievedAt counting
+rule) because it makes the same kind of claim. This lane had no measurement
+step at all — a guard present on one scan and absent from its twin, the same
+shape Phase 3 above documents (g-335-315).
 
 Classify your answer:
 
@@ -377,12 +565,45 @@ path was silently dropping ticks. g-001-189 reproduces and documents.
 ```
 Bash: bash core/scripts/fresh-eyes-record-tick.sh last_felt_sense_checkin
 Bash: mkdir -p agents/<agent>/temp/drained
-Write: agents/<agent>/temp/drained/felt-sense-<YYYY-MM-DD>.md  # full 7-lane summary — written STRAIGHT to the drained/ archive (g-115-1838): the 7 lanes already wrote all durable value to the 6 stores + Self DURING the sweep, so this summary is archival-by-design and must NOT enter the /drain-temp queue as already-encoded slush
-Bash: journal-add.sh stdin JSON {journal_file: agents/<agent>/journal/YYYY/MM/YYYY-MM-DD.md, key_events: [...], tags: [...]}
+Write: agents/<agent>/temp/drained/felt-sense-<YYYY-MM-DDTHH-MM-SS>.md  # full 7-lane summary — written STRAIGHT to the drained/ archive (g-115-1838): the 7 lanes already wrote all durable value to the 6 stores + Self DURING the sweep, so this summary is archival-by-design and must NOT enter the /drain-temp queue as already-encoded slush
+  # TIMESTAMP, not date-only. Use `date +%Y-%m-%dT%H-%M-%S` (hyphens, not colons —
+  # Windows filesystem compatibility). The cadence is goal-COUNT based, not daily,
+  # so a productive day crosses it more than once and the later sweep's Write
+  # silently CLOBBERS the earlier sweep's report. Observed 2026-07-26, which
+  # carried THREE fires: 02:38 (diff=146 catch-up), 13:17 (diff=77), and 14:42
+  # (diff=75). Only the Write tool's read-before-write guard caught it.
+  # /fresh-eyes-review Phase 4 already carries this exact fix ("Timestamp includes
+  # HH-MM-SS so multiple same-day invocations do not collide"), and
+  # felt-sense-2026-07-19T18-36-00.md already used the form — so the convention
+  # existed and Phase 8 simply never adopted it.
+  # Worth keeping the same-day pair: it is exactly when the two reports are most
+  # worth comparing. The 14:42 sweep's Lane 7 finding was a RECURRENCE of the
+  # 13:17 sweep's, and that recurrence was the signal a single report cannot carry.
+  # (g-115-3320. Found and fixed independently by two agents within hours — the
+  # merge conflict between the two fixes is what surfaced the 07-19 precedent.)
+Bash: journal-add.sh stdin JSON {journal_file: "{agent}/journal/YYYY/MM/YYYY-MM-DD.md", key_events: [...], tags: [...]}
   # NOTE: journal-add.sh actual API is stdin-JSON only — no --kind / --summary
   # flags. The .md narrative file is written separately (see journal.md
   # convention). This skill writes both: the 7-lane summary at
   # agents/<agent>/temp/drained/felt-sense-*.md AND the index entry via journal-add.sh.
+  # journal_file is AGENT-RELATIVE: the bound agent's name followed by
+  # `/journal/YYYY/MM/YYYY-MM-DD.md`, carrying NO `agents/` prefix. The `{agent}`
+  # placeholder form matches core/config/conventions/journal.md, which states the
+  # same contract; the angle-bracket form is deliberately avoided here because
+  # check-no-bare-agent-prefix.sh Class 1 has no backtick exemption (Class 2 does)
+  # and reads it as a filesystem path reference — which this field VALUE is not.
+  # That asymmetry is a real gate gap, filed as g-115-3496; this wording is the
+  # local workaround, not the fix.
+  # The daemon validator (mind_api/src/store_registry.py STORE_REGISTRY["journal"]
+  # + _journal_validate) is ground truth, NOT this doc — rb-130 / g-001-53.
+  # This line carried the `agents/` prefix until 2026-07-27 (g-335-311
+  # felt-sense), the same drift already fixed in core/config/conventions/journal.md
+  # and guarded by verify-learning Section JDV.
+  # Measured while writing this sweep's own entry: an input of bare
+  # `journal/YYYY/...` is ACCEPTED and NORMALIZED — it stored as
+  # `zeta/journal/2026/07/2026-07-27.md`. So the bare form is not an error, but
+  # the canonical stored shape carries the agent name; write it explicitly rather
+  # than relying on normalization.
 ```
 
 ## Relationship to Existing Mechanisms

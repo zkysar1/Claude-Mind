@@ -295,6 +295,46 @@ FOR EACH f in filed:
 # lands is self-corrected by next-cadence dedup (idempotent).
 ```
 
+## Phase S4.6: Skill-Reconsolidation Cadence (g-355-07)
+
+Turns the g-355-06 invocation->outcome join into ACTION on the SAME
+strategic-scan cadence as S4.5. `skill-evaluate reconsolidation` ranks skills by
+`failure_rate x (1 - quality_overall)` from the skill-attribution ledger;
+`--apply` routes each candidate at/above the threshold into ONE advisory
+Investigate goal (evidence = recent_failing_goals), deduped by EXACT
+origin_signal (`investigate:skill-reconsolidation-<skill-slug>`) against every
+open goal so re-filing is idempotent across cadences (g-115-2196 exact-key
+dedup, never a title substring). The filed goal asks the agent to REVIEW the
+failing skill's SKILL.md against its failures and refine the pseudocode — it
+NEVER auto-modifies the skill (advisory-refine constraint). Belongs HERE (not a
+high-frequency sweep) for the SAME reason as S4.5: low cadence + exact-signal
+dedup keep signal/noise high. Common case is 0 candidates (a healthy fleet has
+no skill failing >= min_failures) — the value is the TAIL: catching a regressing
+skill early, before its failures compound.
+
+Direct py -3 (NOT a bash wrapper): skill-evaluate reconsolidation is .py-only
+(the daemon-routed .sh + endpoint expose read/report/underperforming/score, not
+reconsolidation), and rb-225/rb-247 warn off the Windows bash-subprocess hang.
+`--apply` files via the SAME daemon add-goal endpoint S4.5 uses, so world writes
+route to the authoritative store (no tmp-collision — this is production, not a
+test; guard-955 N/A).
+
+```
+Bash: py -3 core/scripts/skill-evaluate.py reconsolidation --min-failures 2 --apply
+Parse the JSON result.
+Output: ">> Skill reconsolidation: {candidate_count} candidate(s) | {len(filed)} NEW filed | {len(suppressed_dedup)} dedup-suppressed"
+FOR EACH c in reconsolidation_candidates[:5]:
+    Output: "  [{c.skill}] failure_rate={c.failure_rate} priority={c.reconsolidation_priority} recent={c.recent_failing_goals[:3]}"
+FOR EACH f in filed:
+    Output: "  filed {f.goal_id} (reconsolidate:{f.skill})"
+# Fail-open: reconsolidation reads the skill-attribution ledger + quality yaml
+# and files via the daemon; any error (ledger read failure, empty join, filing
+# timeout) is logged and the scan CONTINUES to S5. Never blocks the strategic
+# scan. A filing that times out but lands is self-corrected by next-cadence
+# exact-origin_signal dedup (idempotent). Advisory-only: filed goals REVIEW the
+# skill, never auto-modify it.
+```
+
 ## Phase S5: Signal Triage and Action
 
 Route signals to the appropriate action based on severity. This is where
@@ -372,7 +412,7 @@ Bash: echo "Return to orchestrator -- continue to next phase"
 ## Chaining
 
 - **Called by**: `/aspirations` orchestrator (Phase 1.5, conditional)
-- **Calls**: `experience-read.sh`, `tree-read.sh`, `reasoning-bank-read.sh`, `aspirations-add-goal.sh --source`, `wm-set.sh`, `silent-gap-audit.py --apply` (Phase S4.5 — 4-detector + rb-245 + dedup orphaned-asset audit), `/create-aspiration` (for MEDIUM signals)
+- **Calls**: `experience-read.sh`, `tree-read.sh`, `reasoning-bank-read.sh`, `aspirations-add-goal.sh --source`, `wm-set.sh`, `silent-gap-audit.py --apply` (Phase S4.5 — 4-detector + rb-245 + dedup orphaned-asset audit), `skill-evaluate.py reconsolidation --apply` (Phase S4.6 — failing-invocation skill reconsolidation, advisory Investigate goals, exact-origin_signal dedup), `/create-aspiration` (for MEDIUM signals)
 - **Reads**: Aspiration compact data, experience entries, tree summary, reasoning bank, Self, config
 - **Writes**: Working memory (`last_strategic_scan`, `strategic_scan_signals`, `portfolio_health_signal` slots), investigation goals (HIGH signals), evolution log
 - **Source routing**: All `aspirations-*.sh` calls receive `--source {source}` from the orchestrator

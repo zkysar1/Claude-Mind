@@ -420,7 +420,12 @@ def do_copy_staged(source_root: Path, dest_root: Path, manifest: dict, *,
     stats = {"staged": 0, "transformed": 0, "binary": 0, "pending_skip": [],
              "failures": [], "preserved_deployment_local": []}
 
-    preserve_pred = (_living_dest_preserve_predicate(dest_root)
+    # Skill dirs present in the SOURCE include set are base skills being
+    # promoted — the preserve predicate must not freeze them at dest
+    # ( overreach; see _living_dest_preserve_predicate docstring).
+    src_skill_names = {p[2] for p in (r.split("/", 3) for r in files_in)
+                       if len(p) == 4 and p[0] == ".claude" and p[1] == "skills"}
+    preserve_pred = (_living_dest_preserve_predicate(dest_root, src_skill_names)
                      if preserve_deployment_local else None)
 
     for rel in files_in:
@@ -727,6 +732,23 @@ _DEPLOYMENT_LOCAL_FILES = {
     "CLAUDE.md",
     ".claude/settings.json",
     ".claude/rules/promotion-cycle.md",
+    # .gitignore is deployment-local because what a deployment must TRACK varies
+    # by its storage backend (). A local-backend deployment un-ignored
+    # its in-repo storage root on an explicit 2026-07-28 user directive — ~950MB
+    # single-copy in a private repo, so tracking IS the backup — and each plant
+    # re-added the blanket ignore. That was the THIRD such revert by a sync (an
+    # earlier one is recorded in that deployment's session-manifest, 2026-07-27),
+    # which is the signature of a file that keeps being restored by hand instead
+    # of being declared deployment-local.
+    #
+    # The tradeoff is the same one CLAUDE.md and settings.json already carry and
+    # is deliberate: a NEW framework .gitignore rule will no longer propagate
+    # downstream on its own and must be applied per deployment. Preferred over
+    # the alternative, because the failure modes are not symmetric — an
+    # un-propagated ignore rule leaves junk tracked and visible in git status,
+    # while an overwritten .gitignore silently stops tracking a deployment's only
+    # copy of its data.
+    ".gitignore",
 }
 
 # Gitignored operational directories that must survive at a living production
@@ -914,9 +936,15 @@ def _is_protected_dest_skill(rel: str, forged_prefixes: set,
       EVERY `.claude/skills/<name>/` path — fail-safe toward preservation.
     - otherwise: preserve only paths under a registered forged skill dir.
 
-    Base skills present in the source manifest are kept by the caller's
-    `rel in expected` check BEFORE this is consulted, so this only governs
-    skill dirs that are NOT in the source include set.
+    This helper only correctly governs skill dirs that are NOT in the source
+    include set — but that precondition is the CALLER's to establish, and the
+    two lanes do it differently. The sweep/deletion lanes (do_clean_cruft,
+    do_remove_orphans) run `rel in expected` BEFORE consulting this, so base
+    skills never reach it. The plant lane (_living_dest_preserve_predicate)
+    has no include-set gate and must instead subtract source_skill_names from
+    the prefix set AND bypass the protect_all fail-safe for source-owned
+    skills — a caller that does neither freezes every base skill at dest
+    (the 2026-07-19..31 partial-plant incident, g-115-2739 overreach).
     """
     if not rel.startswith(".claude/skills/"):
         return False
@@ -928,7 +956,7 @@ def _is_protected_dest_skill(rel: str, forged_prefixes: set,
     return False
 
 
-def _living_dest_preserve_predicate(dest_root: Path):
+def _living_dest_preserve_predicate(dest_root: Path, source_skill_names=None):
     """Return a predicate rel->bool: True if an include-set member *rel* must be
     KEPT at a living-prod destination instead of overwritten by copy-staged/swap.
 
@@ -941,17 +969,49 @@ def _living_dest_preserve_predicate(dest_root: Path):
     dest-owned forged skills (via _is_protected_dest_skill). The predicate is
     existence-agnostic; callers gate on `(dest_root/rel).is_file()` so a file
     ABSENT at dest is still planted fresh while a PRESENT one is preserved.
+
+    *source_skill_names* (skill-dir names present in the SOURCE include set)
+    bounds the skill protection: a skill actively promoted from source is a
+    BASE skill, not a dest-owned one, and must stay plantable — under BOTH
+    protection branches (readable registry AND the protect_all_skills
+    fail-safe). Without this bound the g-115-2739 SKILL.md-presence union
+    marks EVERY dest skill dir protected, freezing all base SKILL.md files
+    at the destination forever: measured 2026-07-31, Claude-Mind's 51 base
+    skills sat frozen at 2026-07-19 content across three consecutive plants
+    (#13, #14, v2.8.7) while core/ files planted normally, and the freeze
+    is self-concealing because each partial plant makes the dest copy look
+    MORE dest-ahead to the next plan verdict. The sweep/deletion lanes
+    (do_clean_cruft, do_remove_orphans) never needed this bound — they gate
+    on the include set BEFORE consulting skill protection. Dest-owned skills
+    (forged/domain — absent from the source include set) remain protected
+    exactly as before (omni orphan guard 2026-06-06; root cause A,
+    g-115-2738).
     """
     store_tops = _in_repo_store_tops(dest_root)
     dest_forged = _dest_forged_skill_names(dest_root)
     protect_all_skills = dest_forged is None
+    src_skills = frozenset(source_skill_names or ())
     # SKILL.md-present skills are protected too (root cause A, ) so the
-    # PLANT/copy-staged step and the PLAN report agree with the sweep lanes.
-    _skill_names = (set() if dest_forged is None else set(dest_forged)) \
-        | _dest_skill_names_with_skillmd(dest_root)
+    # PLANT/copy-staged step and the PLAN report agree with the sweep lanes —
+    # MINUS source-owned base skills (see docstring).
+    _skill_names = ((set() if dest_forged is None else set(dest_forged))
+                    | _dest_skill_names_with_skillmd(dest_root)) - src_skills
     forged_prefixes = {f".claude/skills/{n}" for n in _skill_names}
 
+    def _skill_dir_name(rel: str):
+        # parts len 4 = a member under a skill dir (parts[2] is the name);
+        # len 3 = a top-level index file (_triggers.yaml/_tree.yaml), not a
+        # skill dir — those keep the legacy protection branches below.
+        if not rel.startswith(".claude/skills/"):
+            return None
+        parts = rel.split("/", 3)
+        return parts[2] if len(parts) == 4 else None
+
     def _pred(rel: str) -> bool:
+        if _skill_dir_name(rel) in src_skills:
+            # Source-owned base skill: plantable. Only the general
+            # store-root/deployment-local protection still applies.
+            return _is_preserved_at_dest(rel, store_tops)
         return (_is_preserved_at_dest(rel, store_tops)
                 or _is_protected_dest_skill(rel, forged_prefixes, protect_all_skills))
 
@@ -1816,9 +1876,45 @@ def main():
             print(json.dumps(plan, indent=2))
         else:
             print(_render_plan_report(plan))
-        # Read-only observability — ALWAYS exit 0. The plan is a report, not a
-        # gate; wiring the verdict as a promote GATE is P1.5 (), not P0.
+        # THE EXIT CODE CARRIES THE VERDICT (). Still read-only — the
+        # plan mutates nothing — but a report whose refusal is invisible to its
+        # caller is not a gate, and this one WAS being read as one.
+        #
+        # This comment used to read "ALWAYS exit 0. The plan is a report, not a
+        # gate; wiring the verdict as a promote GATE is P1.5, not P0." That was
+        # a deliberate, correct-at-the-time contract, and it is quoted here to
+        # retract it rather than silently replace it. What made it fail was not
+        # the contract but the DISAGREEMENT it left standing: promote-to-upstream
+        # labelled its own call site "living-prod blast-radius gate" and wrote
+        # `|| fail`, so the one consumer believed P1.5 had landed here while this
+        # function believed it had not. Each file was internally consistent; the
+        # gate existed in neither. Measured cost on Hop 2 (Claude-Mind -> ZDS
+        # v2.8.4, 2026-07-30): VERDICT DO NOT PROMOTE printed over 151 prod-ahead
+        # files, planted anyway, 142 files lost 1183 lines, 2 genuine casualties
+        # restored by hand.
+        #
+        # Codes are 20/21 rather than the 2-8 range seed-transplant.sh already
+        # uses for its own failures, so a verdict can never be confused with a
+        # usage error or a mutation fault (the --plan path's own `exit 2` for a
+        # missing destination sits in that range). SSOT for the vocabulary:
+        #   0  = SAFE
+        #   20 = REVIEW REQUIRED  (advisory — caller decides)
+        #   21 = DO NOT PROMOTE   (refusal — caller MUST NOT plant unforced)
+        # seed-transplant.sh propagates these verbatim; promote-to-upstream.sh
+        # aborts on 21 and warns on 20.
+        verdict = plan.get("verdict")
+        if verdict == "DO NOT PROMOTE":
+            return 21
+        if verdict == "REVIEW REQUIRED":
+            return 20
+        return 0
 
 
 if __name__ == "__main__":
-    main()
+    # sys.exit(main()) — NOT a bare main(). The `plan` branch returns its verdict
+    # as an exit code (0/20/21, ); a bare call discards that return and
+    # the process exits 0 regardless, which would leave the gate structurally
+    # inert while every hand-test still looked green. Every OTHER subcommand
+    # returns None, and sys.exit(None) is exit 0, so this changes nothing for
+    # them. Verified 2026-07-31: no pre-existing dispatch branch returned a value.
+    sys.exit(main())

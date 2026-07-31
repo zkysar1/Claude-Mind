@@ -70,10 +70,39 @@ this envelope and write to the same ledger. When the second gate migrates,
 rename `blocker-gate-overrides.jsonl` → `approvals-ledger.jsonl` (noted in
 the MVP plan `curious-sparking-simon.md` as deferred work).
 
+## NOT the same as CREATE_BLOCKER's multi-signal evidence
+
+Two different arrays both called "evidence" are consumed by two ADJACENT steps
+of the SAME protocol, and conflating them is the single measured failure mode
+of this envelope (g-115-3094):
+
+| | this envelope | multi-signal probe evidence |
+|---|---|---|
+| consumer | `capability-gate.py --evidence` (CREATE_BLOCKER step 2.6) | `gates/blocker_create.py` (CREATE_BLOCKER step 2.55) |
+| shape | `{type, id, claim}` | `{tool, command, output, evidence_type}` |
+| discriminator key | **`type`** | **`evidence_type`** |
+| what it means | WHICH STORE the evidence lives in (`rb`, `tree`, ...) | WHAT KIND OF PROBE produced it (`command_exit`, `http_status`) |
+| what it is for | justifying an agent self-approval override | proving 2+ INDEPENDENT signals (`verify-before-assuming.md`) |
+
+They are not a naming inconsistency to be reconciled — they are distinct
+concepts that happen to share the word "evidence", so `guard-1565`'s
+"change the minority" does NOT apply here. A caller that builds ONE array and
+passes it to both gets a confusing asymmetry: step 2.55 accepts it, step 2.6
+refuses with `evidence[0].type=''` (empty because the payload said
+`evidence_type`).
+
+Measured incident: alpha session `aae8287f`, 2026-07-19 07:57:17-07:58:04 —
+one payload refused 3x in 47s, corrected on the 4th attempt. The retries were
+blind because the gate's diagnostic was STDOUT-only at the time (fixed under
+the same goal; it is now mirrored to stderr).
+
 ## Anti-patterns
 
 - Passing a single string instead of a JSON array (gate rejects)
 - Using an unregistered `type` (gate rejects with the allow-list)
+- Passing CREATE_BLOCKER step-2.55 probe evidence (`{tool, command, output,
+  evidence_type}`) to `--evidence` — see the table above; the gate rejects
+  with `evidence[0].type=''`
 - Passing empty `claim` as a placeholder (gate accepts but the ledger
   record becomes useless for human audit)
 - Fabricating `id` values to get past the gate (backpressure + dead-ends
