@@ -90,10 +90,9 @@ def test_companion_script_in_diary_increments_count(tmp_path: Path = None):
                 ],
             },
         }
-        with unittest.mock.patch.object(mod, "agents_root", lambda: tmpdir / "agents"), \
-             unittest.mock.patch.object(mod, "WORLD_DIR", tmpdir / "world"):
+        with unittest.mock.patch.object(mod, "WORLD_DIR", tmpdir / "world"):
             companion_dates = mod.collect_companion_script_dates(
-                ["access-roblox-studio"], forged
+                ["access-roblox-studio"], forged, agents_base=tmpdir / "agents"
             )
 
         assert "access-roblox-studio" in companion_dates
@@ -128,10 +127,9 @@ def test_genuinely_cold_script_stays_at_zero():
                 "companion_scripts": ["world/scripts/roblox-manage-script.sh"],
             },
         }
-        with unittest.mock.patch.object(mod, "agents_root", lambda: tmpdir / "agents"), \
-             unittest.mock.patch.object(mod, "WORLD_DIR", tmpdir / "world"):
+        with unittest.mock.patch.object(mod, "WORLD_DIR", tmpdir / "world"):
             companion_dates = mod.collect_companion_script_dates(
-                ["manage-roblox-scripts"], forged
+                ["manage-roblox-scripts"], forged, agents_base=tmpdir / "agents"
             )
 
         dates = companion_dates.get("manage-roblox-scripts", [])
@@ -171,10 +169,9 @@ def test_board_mentions_do_not_count():
                 "companion_scripts": ["world/scripts/roblox-manage-script.sh"],
             },
         }
-        with unittest.mock.patch.object(mod, "agents_root", lambda: tmpdir / "agents"), \
-             unittest.mock.patch.object(mod, "WORLD_DIR", tmpdir / "world"):
+        with unittest.mock.patch.object(mod, "WORLD_DIR", tmpdir / "world"):
             companion_dates = mod.collect_companion_script_dates(
-                ["manage-roblox-scripts"], forged
+                ["manage-roblox-scripts"], forged, agents_base=tmpdir / "agents"
             )
 
         dates = companion_dates.get("manage-roblox-scripts", [])
@@ -216,10 +213,9 @@ def test_shared_companion_script_credits_all_skills():
                 ],
             },
         }
-        with unittest.mock.patch.object(mod, "agents_root", lambda: tmpdir / "agents"), \
-             unittest.mock.patch.object(mod, "WORLD_DIR", tmpdir / "world"):
+        with unittest.mock.patch.object(mod, "WORLD_DIR", tmpdir / "world"):
             companion_dates = mod.collect_companion_script_dates(
-                ["access-roblox-studio", "run-game-session"], forged
+                ["access-roblox-studio", "run-game-session"], forged, agents_base=tmpdir / "agents"
             )
 
         assert len(companion_dates["access-roblox-studio"]) == 1, (
@@ -267,10 +263,9 @@ def test_same_second_events_dedup_upstream():
                 "companion_scripts": ["world/scripts/aws-exec.sh"],
             },
         }
-        with unittest.mock.patch.object(mod, "agents_root", lambda: tmpdir / "agents"), \
-             unittest.mock.patch.object(mod, "WORLD_DIR", tmpdir / "world"):
+        with unittest.mock.patch.object(mod, "WORLD_DIR", tmpdir / "world"):
             companion_dates = mod.collect_companion_script_dates(
-                ["access-aws-services"], forged
+                ["access-aws-services"], forged, agents_base=tmpdir / "agents"
             )
             dates, sources = mod.collect_invocation_dates(
                 "access-aws-services",

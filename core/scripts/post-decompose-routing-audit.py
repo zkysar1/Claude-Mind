@@ -49,6 +49,38 @@ from typing import Iterable, Optional
 
 
 # ---------------------------------------------------------------------------
+# Escalation target
+# ---------------------------------------------------------------------------
+
+# : never hardcode the escalation aspiration.  is the UPSTREAM
+# deployment's recurring-infrastructure queue and exists in no other deployment,
+# so a literal here files nothing once these framework files are promoted.
+# Lazy + cached, matching this module's in-function import style (_get_agents).
+_ESCALATION_ASP_CACHE: Optional[str] = None
+
+
+def _escalation_asp() -> str:
+    """Resolved escalation aspiration id (cached per process).
+
+    Falls back to the upstream literal so a resolution failure stays exactly as
+    loud as it was before, rather than silently swallowing the escalation.
+    """
+    global _ESCALATION_ASP_CACHE  # pylint: disable=global-statement
+    if _ESCALATION_ASP_CACHE is None:
+        try:
+            scripts_dir = Path(__file__).resolve().parent
+            if str(scripts_dir) not in sys.path:
+                sys.path.insert(0, str(scripts_dir))
+            from _paths import AGENT_DIR, CORE_ROOT, WORLD_DIR  # type: ignore
+            from _escalation_target import resolve as _resolve_asp  # type: ignore
+            _ESCALATION_ASP_CACHE = str(
+                _resolve_asp(CORE_ROOT, WORLD_DIR, AGENT_DIR)[0])
+        except Exception:  # pylint: disable=broad-except
+            _ESCALATION_ASP_CACHE = "asp-115"
+    return _ESCALATION_ASP_CACHE
+
+
+# ---------------------------------------------------------------------------
 # Tokenization
 # ---------------------------------------------------------------------------
 
@@ -265,7 +297,7 @@ def _build_investigate_spec(goal_id: str, stamped_agent: str,
         "origin_signal": f"routing-mismatch:{goal_id}",
         "category": "framework-decomposition",
         "discovered_by": "post-decompose-routing-audit",
-        "aspiration_id": "asp-115",
+        "aspiration_id": _escalation_asp(),
     }
 
 
@@ -306,7 +338,7 @@ def _build_either_resolve_spec(goal_id: str, best_agent: str, gap: float,
         "origin_signal": f"routing-either-resolve:{goal_id}",
         "category": "framework-decomposition",
         "discovered_by": "post-decompose-routing-audit",
-        "aspiration_id": "asp-115",
+        "aspiration_id": _escalation_asp(),
     }
 
 

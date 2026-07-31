@@ -146,7 +146,7 @@ loop via the sentinel — so the loop runs at 600s/iteration (slow) but stays
 ALIVE and keeps re-arming. The worst case is a slow loop, never a dead one. The
 change cannot make survival worse than the status quo (silent death).
 
-## A second open question (Q6): overdue-wakeup behavior + long iterations
+## Q6 — RESOLVED FAVORABLE (2026-07-31): overdue wakeups DO fire on next idle
 
 The net covering iteration N+1's execution is arm_N — the wakeup armed at
 iteration N's terminal, ~600s in the future. If iteration N+1 runs LONGER than
@@ -163,6 +163,38 @@ does it fire when the session goes idle at the death, or was it dropped?
 - If overdue wakeups are dropped: deaths DURING iterations longer than
   `delaySeconds` are NOT netted by the deadman (the Stop hook remains the only —
   unreliable — net for that narrow case).
+
+**MEASURED 2026-07-31 — the FIRST bullet holds. Overdue wakeups fire on next
+idle, essentially instantly.** Observed on foxtrot (`LAPTOP-3IOFCNEO`, WSL2,
+kernel `6.6.87.2-microsoft-standard-WSL2`, session `86dd43e9`), read from its
+transcript JSONL + `core/logs/stop-hook.log` over SSH:
+
+| | overdue case | on-time control (same day, same agent) |
+|---|---|---|
+| arm | `09:02:34` delay=600 | `07:36:53` delay=600 |
+| due | `09:12:34` | `07:46:53` |
+| session state at due | **BUSY** (iteration ran 1h47m; diary `phase-4-execute` 09:17:51) | idle-bound |
+| text-death | `09:42:06` (assistant text, no tool call; stop-hook `ALLOW gate=background-jobs` 09:42:07) | `07:39:38` |
+| **wakeup fired** | **`09:42:22` — ~16s after idle, ~29.5 min OVERDUE** | `07:47:04` — 11s after due |
+
+So the Q6 residual ("deaths during iterations longer than `delaySeconds` are NOT
+netted") **does not exist**. The arm survives its scheduled time while the
+session is busy and fires when the session next goes idle — which is exactly the
+moment a text-death creates. The narrow uncovered case Q6 reserved for the
+unreliable Stop hook is in fact covered by the deadman.
+
+Two consequences. The "more surface" mitigations Q6 floated — a longer delay, or
+a mid-long-goal re-arm checkpoint — are **not needed**; do not spend the
+complexity. And 600s stays correct for the common case without trading anything
+away on the long-iteration case.
+
+Corroborating the *other* half of the design in the same trace: the resurrected
+turn at 09:42:23 re-armed FIRST (`reason: "Re-arm deadman net first (rb-4345)"`)
+before any other work — the rb-4345 rule below is being followed in production,
+not merely documented. That resurrection cycle then self-recovered on schedule;
+a human happened to intervene 28s before the next net was due (09:51:55 vs
+09:52:23), which is an OBSERVABILITY gap, not a liveness one — see the
+turn-end-visibility lane filed 2026-07-31.
 
 This cannot be eliminated by delay tuning alone: no delay ≤ the 3600s clamp
 covers an arbitrarily long iteration, and raising the delay to cover long

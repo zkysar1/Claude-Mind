@@ -727,6 +727,23 @@ _DEPLOYMENT_LOCAL_FILES = {
     "CLAUDE.md",
     ".claude/settings.json",
     ".claude/rules/promotion-cycle.md",
+    # .gitignore is deployment-local because what a deployment must TRACK varies
+    # by its storage backend (). A local-backend deployment un-ignored
+    # its in-repo storage root on an explicit 2026-07-28 user directive — ~950MB
+    # single-copy in a private repo, so tracking IS the backup — and each plant
+    # re-added the blanket ignore. That was the THIRD such revert by a sync (an
+    # earlier one is recorded in that deployment's session-manifest, 2026-07-27),
+    # which is the signature of a file that keeps being restored by hand instead
+    # of being declared deployment-local.
+    #
+    # The tradeoff is the same one CLAUDE.md and settings.json already carry and
+    # is deliberate: a NEW framework .gitignore rule will no longer propagate
+    # downstream on its own and must be applied per deployment. Preferred over
+    # the alternative, because the failure modes are not symmetric — an
+    # un-propagated ignore rule leaves junk tracked and visible in git status,
+    # while an overwritten .gitignore silently stops tracking a deployment's only
+    # copy of its data.
+    ".gitignore",
 }
 
 # Gitignored operational directories that must survive at a living production
@@ -1816,9 +1833,45 @@ def main():
             print(json.dumps(plan, indent=2))
         else:
             print(_render_plan_report(plan))
-        # Read-only observability — ALWAYS exit 0. The plan is a report, not a
-        # gate; wiring the verdict as a promote GATE is P1.5 (), not P0.
+        # THE EXIT CODE CARRIES THE VERDICT (). Still read-only — the
+        # plan mutates nothing — but a report whose refusal is invisible to its
+        # caller is not a gate, and this one WAS being read as one.
+        #
+        # This comment used to read "ALWAYS exit 0. The plan is a report, not a
+        # gate; wiring the verdict as a promote GATE is P1.5, not P0." That was
+        # a deliberate, correct-at-the-time contract, and it is quoted here to
+        # retract it rather than silently replace it. What made it fail was not
+        # the contract but the DISAGREEMENT it left standing: promote-to-upstream
+        # labelled its own call site "living-prod blast-radius gate" and wrote
+        # `|| fail`, so the one consumer believed P1.5 had landed here while this
+        # function believed it had not. Each file was internally consistent; the
+        # gate existed in neither. Measured cost on Hop 2 (Claude-Mind -> ZDS
+        # v2.8.4, 2026-07-30): VERDICT DO NOT PROMOTE printed over 151 prod-ahead
+        # files, planted anyway, 142 files lost 1183 lines, 2 genuine casualties
+        # restored by hand.
+        #
+        # Codes are 20/21 rather than the 2-8 range seed-transplant.sh already
+        # uses for its own failures, so a verdict can never be confused with a
+        # usage error or a mutation fault (the --plan path's own `exit 2` for a
+        # missing destination sits in that range). SSOT for the vocabulary:
+        #   0  = SAFE
+        #   20 = REVIEW REQUIRED  (advisory — caller decides)
+        #   21 = DO NOT PROMOTE   (refusal — caller MUST NOT plant unforced)
+        # seed-transplant.sh propagates these verbatim; promote-to-upstream.sh
+        # aborts on 21 and warns on 20.
+        verdict = plan.get("verdict")
+        if verdict == "DO NOT PROMOTE":
+            return 21
+        if verdict == "REVIEW REQUIRED":
+            return 20
+        return 0
 
 
 if __name__ == "__main__":
-    main()
+    # sys.exit(main()) — NOT a bare main(). The `plan` branch returns its verdict
+    # as an exit code (0/20/21, ); a bare call discards that return and
+    # the process exits 0 regardless, which would leave the gate structurally
+    # inert while every hand-test still looked green. Every OTHER subcommand
+    # returns None, and sys.exit(None) is exit 0, so this changes nothing for
+    # them. Verified 2026-07-31: no pre-existing dispatch branch returned a value.
+    sys.exit(main())

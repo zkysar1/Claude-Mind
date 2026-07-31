@@ -1541,6 +1541,36 @@ def cmd_update_goal(args):
         if field == "participants":
             _warn_missing_user_leg_scope(goal_id, value, goal.get("user_leg_scope"))
 
+        # Capability-absence advisory (). Deliberately mirrors the
+        # user_leg_scope advisory directly above — same chokepoint, same stderr
+        # channel, same never-refuse contract. It fires on the DURABLE PROSE
+        # fields, because that is where a capability-absence claim actually gets
+        # authored; `capability-gate` already hard-blocks the defer_reason subset
+        # it can prove, and this covers the phrasing that gate's keyword match
+        # misses.
+        #
+        # WHY AN ADVISORY HERE RATHER THAN A THIRD GATE (measured ,
+        # meta/gate-firings.jsonl, 120,219 rows): the framework ALREADY has two
+        # capability-absence gates — exhaustive-search-gate (5 firings ever, all
+        # noop) and verify-before-assuming-gate (0 firings) — and both DO log to
+        # the ledger, so those are real zeros. They never fire because their only
+        # call site is an LLM-discretionary step in aspirations-verify Q2, while
+        # capability-gate, invoked from code chokepoints like this one, fired
+        # 8,530 times over the same corpus. The gap was never detection; it was
+        # the absence of a chokepoint call site.
+        #
+        # stderr is the correct channel HERE specifically because this runs in a
+        # Bash-invoked script, whose stderr reaches the model in tool output — a
+        # non-blocking PreToolUse hook's stderr does not (guard-1680).
+        if field in ("defer_reason", "description", "outcome_note"):
+            try:
+                from _capability_absence_patterns import advise
+                _cap_banner = advise(value, field=field, goal_id=goal_id)
+                if _cap_banner:
+                    print(_cap_banner, file=sys.stderr)
+            except Exception:
+                pass  # advisory must never break a durable write
+
         # Cross-lane TAKEOVER guard () — MIRROR of the daemon guard
         # in mind_api/src/endpoints/aspirations_write.py update_goal() (the
         # `=== PR 7i in-lock status guards ===` block). guard-742: this logic
@@ -2278,7 +2308,8 @@ def _validate_intent_satisfaction(asp, intent_block, config):
     Returns (ok, error_message). Does NOT mutate the aspiration.
 
     Enforces:
-      1. Evidence cardinality: len >= max(scope_min, ceil(0.5 * total_non_recurring_goals))
+      1. Evidence cardinality: len >= max(scope_min, min(ceil(0.5 * total_non_recurring),
+         qualifying)) where qualifying = the goals rule 2 below can actually accept
       2. Evidence quality: all evidence goals exist in this asp, are status=completed,
          non-recurring, and have non-empty verification.outcomes
       3. Superseded goals exist in this asp, are non-recurring, and are not already terminal
@@ -2311,10 +2342,42 @@ def _validate_intent_satisfaction(asp, intent_block, config):
     # Evidence cardinality — scope-aware floor (direct access; missing scope = broken config, fail loud)
     scope = asp.get("scope", "project")
     scope_min = config["min_evidence_by_scope"][scope]
-    required = max(scope_min, math.ceil(0.5 * len(non_recurring)))
+    # The ceiling is capped by the QUALIFYING pool, not the raw non-recurring count
+    # (). The quality loop below accepts ONLY completed, non-recurring goals
+    # carrying verification.outcomes, so demanding ceil(0.5 * ALL non-recurring) made
+    # the gate mathematically unsatisfiable whenever outcome coverage fell below 50%:
+    # no evidence set could satisfy both halves, and the caller bounced between
+    # "requires >=37" and "goal X has no verification.outcomes" indefinitely. Measured
+    # on ZDS  — 73 non-recurring, threshold 37, only 30 goals carrying outcomes,
+    # refused twice for real before the arithmetic was identified as the cause.
+    #
+    # min() is strictly STRONGER than relaxing to half the qualifying pool: it demands
+    # EVERY available piece of honest evidence (30 of 30 on ), and where
+    # coverage is healthy (qualifying >= ceil) it is a no-op. So the anti-thin-evidence
+    # intent is preserved rather than traded away. Sparse outcome coverage is scattered
+    # across an aspiration's whole life, not a legacy era — a date-based grandfather
+    # clause would not have worked.
+    qualifying = [g for g in non_recurring
+                  if g.get("status") == "completed"
+                  and ((g.get("verification") or {}).get("outcomes") or [])]
+    required = max(scope_min, min(math.ceil(0.5 * len(non_recurring)), len(qualifying)))
     if len(ev_ids) < required:
+        if len(qualifying) < scope_min:
+            # Still unsatisfiable — but HONESTLY so, and scope_min stays a hard floor
+            # on purpose: an aspiration with fewer qualifying goals than the floor has
+            # genuinely thin evidence and should not be intent-closed. Say so outright
+            # instead of letting the caller discover it by bouncing off the quality
+            # loop one id at a time, which is the dead end this whole fix is about.
+            return False, (f"aspiration {asp.get('id')} cannot be intent-closed: only "
+                           f"{len(qualifying)} of {len(non_recurring)} non-recurring goals are "
+                           f"completed with verification.outcomes, below the scope={scope} floor of "
+                           f"{scope_min}. Supplying more evidence_goal_ids cannot satisfy this. "
+                           f"Reachable exits: retire it (aspirations-retire.sh), or make every "
+                           f"non-recurring goal terminal and close it normally "
+                           f"(aspirations-complete.sh).")
         return False, (f"evidence_goal_ids has {len(ev_ids)}, scope={scope} requires "
-                       f">={required} (max of {scope_min}-by-scope and ceil(0.5 * {len(non_recurring)} non-recurring))")
+                       f">={required} (max of {scope_min}-by-scope and min(ceil(0.5 * "
+                       f"{len(non_recurring)} non-recurring), {len(qualifying)} qualifying))")
 
     # Evidence quality — each evidence goal must be in-asp, non-recurring, completed, with outcomes
     for gid in ev_ids:

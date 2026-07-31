@@ -448,5 +448,84 @@ class TestCrit3GetDistillCandidates(unittest.TestCase):
         self.assertNotIn("low-util-hub", cands)
 
 
+class TestReadCapArmRouting(unittest.TestCase):
+    """ — step 2.a0 of tree/SKILL.md routes the `regroup` arm.
+
+    The arm holds `oversized_not_append_grown` candidates: too big to Read, too
+    few dated sections for the rb-2085 rollup. It used to route them to REGROUP
+    (SKILL.md §1.5), which fires on `child_count > K_max`. tree.yaml raised K_max
+    4 -> 40 by user directive, retiring count-based regroup pressure — so the arm
+    was structurally unable to fire, and `--redistribute-candidates` returns []
+    tree-wide while the arm stays populated. Re-pointed at split-overcap's PATH
+    FORK, which can actually act on an over-cap node.
+
+    The threshold is DERIVED, not chosen, and that is what these tests pin.
+    """
+
+    # tree.py READ-SITE CAVEAT (, rb-5894 / guard-2006): the 25000-token
+    # cap times 2.43 — the HIGH end of the measured 2.31-2.43 chars/token band. At
+    # or above this many chars a node is over cap at ANY ratio in that band, so it
+    # is the only floor a DESTRUCTIVE-shaped consumer may act on.
+    BIAS_INDEPENDENT_CHARS = 60750
+
+    def _skill_src(self):
+        skill = CORE_SCRIPTS.parent.parent / ".claude" / "skills" / "tree" / "SKILL.md"
+        return skill.read_text(encoding="utf-8")
+
+    def test_split_gate_threshold_stays_derived_from_chars_per_token(self):
+        # CHARS_PER_TOKEN has already moved once (4 -> 2.3, after the old value was
+        # found to underestimate by ~1.7x). If it moves again the SKILL.md literal
+        # goes silently wrong in the DESTRUCTIVE direction — under-cap nodes get
+        # routed into structural surgery. Fail loudly instead.
+        expected = int(self.BIAS_INDEPENDENT_CHARS / tree_engine.CHARS_PER_TOKEN)
+        # assertTrue, not assertIn: assertIn dumps the whole 57KB haystack into the
+        # failure output, burying the one line that says what to fix.
+        self.assertTrue(
+            ("est_tokens >= %d" % expected) in self._skill_src(),
+            "step 2.a0's split gate must read 'est_tokens >= %d' (= %d chars / "
+            "CHARS_PER_TOKEN=%s); CHARS_PER_TOKEN changed without re-deriving the "
+            "SKILL.md literal"
+            % (expected, self.BIAS_INDEPENDENT_CHARS, tree_engine.CHARS_PER_TOKEN),
+        )
+
+    def test_split_gate_is_stricter_than_the_arms_own_trigger(self):
+        # The arm fires at 0.8 * cap (proactive, correct for a non-destructive
+        # rollup). The split gate must sit STRICTLY above it, or the routing
+        # inherits a trigger designed to fire early and applies it to surgery.
+        pruning = tree_engine._merged_config().get("pruning", {})
+        arm_trigger = (pruning.get("distill_token_ratio", 0.8)
+                       * pruning.get("distill_token_cap", 25000))
+        gate = int(self.BIAS_INDEPENDENT_CHARS / tree_engine.CHARS_PER_TOKEN)
+        self.assertGreater(
+            gate, arm_trigger,
+            "split gate (%d) must exceed the arm's proactive trigger (%s)"
+            % (gate, arm_trigger),
+        )
+
+    def test_arm_no_longer_routes_to_the_dormant_regroup_section(self):
+        src = self._skill_src()
+        start = src.find("a0. ACTION ROUTING")
+        self.assertNotEqual(start, -1, "step 2.a0 is missing")
+        block = src[start:src.find("\n   a. ", start)]
+        self.assertIn("SPLIT-OVERCAP PATH FORK", block,
+                      "2.a0 must route the read-cap arm at split-overcap's fork")
+        self.assertIn("DO NOT route these to REGROUP", block,
+                      "2.a0 must say why the REGROUP arm is dormant, or the next "
+                      "reader re-points it back at §1.5")
+        self.assertNotIn("handle the node under REGROUP", block,
+                         "the old dormant routing is still present")
+
+    def test_fork_is_not_collapsed_to_an_unconditional_split(self):
+        # split-overcap step 0: boundaries are INPUT, never inferred. A node with
+        # no natural partition key is a DISTILL. Two of the four live arm members
+        # are leaves, so the fork's second branch is load-bearing, not decorative.
+        src = self._skill_src()
+        start = src.find("a0. ACTION ROUTING")
+        block = src[start:src.find("\n   a. ", start)]
+        self.assertIn("BOUNDARIES ARE INPUT, NEVER INFERRED", block)
+        self.assertIn("that is a DISTILL, not a split", block,
+                      "the fork's no-partition-key branch must survive")
+
+
 if __name__ == "__main__":
     unittest.main()

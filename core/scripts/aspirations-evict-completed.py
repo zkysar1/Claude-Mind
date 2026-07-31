@@ -122,7 +122,12 @@ def _eligible(goal: dict, cutoff: datetime) -> bool:
 
 # Sequence-space goal ids: g-NNN-NN..NNNN with an optional concurrent-mint /
 # decompose suffix letter (see coordination_merge._union_goals re-key grammar).
-_GOAL_SEQ_RE = re.compile(r"^g-(\d{3})-(\d{2,4})(-[a-z])?$")
+# Widths are fully open-ended per guard-1161: a bounded form (\d{3}, \d{2,4})
+# silently drops both legacy low-end ids and any aspiration that outgrows the
+# ceiling. This pattern held `\d{3}-\d{2,4}` until , which left
+#  one mint (0) away from the goal ids in its own queue
+# becoming invisible to the conservation guard.
+_GOAL_SEQ_RE = re.compile(r"^g-(\d+)-(\d+)(-[a-z])?$")
 
 
 def _legacy_census_loose(asp: dict, in_list: int, capacity: int) -> bool:
@@ -294,9 +299,24 @@ def _capacity(asp) -> int:
             continue
         tail = gid[len(prefix):]
         num = tail.rstrip("abcdefghijklmnopqrstuvwxyz")
+        # Both suffix spellings, bare (g-NNN-12a) and HYPHENATED (g-NNN-12-a).
+        # The hyphenated form is the one `_union_goals` actually mints and the
+        # one `_GOAL_SEQ_RE` above matches; this parser accepted only the bare
+        # form, so `262-a` rstripped to `262-`, failed .isdigit(), and the goal
+        # was dropped from BOTH max_seq and suffixed. Two parsers for one id
+        # grammar in one file, disagreeing (rb-301): on  the evict guard
+        # `_conservation_violation` (regex, suffix-aware) computed capacity 622
+        # and passed, while `_audit_violations` (this parser) computed 618 and
+        # reported a 4-goal "CONSERVATION VIOLATION" — opposite verdicts, same
+        # data. That audit line directs the operator to `--repair-census
+        # --apply`, which proportionally SHRINKS a correct census to satisfy the
+        # undercounted ceiling. The tell was `true_evicted_max: -4`, a negative
+        # headroom that no real allocation can produce. ()
+        if num.endswith("-"):
+            num = num[:-1]
         if num.isdigit():
             max_seq = max(max_seq, int(num))
-            if tail != num:            # had an alpha suffix (g-NNN-12a)
+            if tail != num:            # had an alpha suffix
                 suffixed += 1
     return max_seq + suffixed
 

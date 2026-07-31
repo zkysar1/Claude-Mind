@@ -15,8 +15,20 @@
 # Detection model (the non-obvious part): match the env-READ pattern
 # (os.environ / getenv / $VAR), NOT the bare flag name. Prose, docstrings,
 # changelog entries, journals, and the historical design docs legitimately MENTION
-# the removed names; only a live env read reintroduces the behavior. Comment lines
-# are stripped before matching (a '# OWNERSHIP_MODE removed' note is not a read).
+# the removed names; only a live env read reintroduces the behavior.
+#
+# TWO DETECTORS, split by comment model (). This script's grep path
+# strips leading-'#' comment lines, which is a COMPLETE comment model for .sh and
+# SKILL.md and is NOT one for Python: a triple-quoted docstring carries no '#', so
+# a line of prose documenting the removed flag matched READ_RE and BLOCKED the
+# commit (measured 2026-07-26; the only escapes were --no-verify, which the message
+# below forbids, or deleting accurate documentation — the false-positive-blocker
+# class of rb-246/guard-147). So .py is delegated to check-no-ownership-flag-py.py,
+# which parses an AST: an env read is a Call or Subscript node and a docstring is
+# Expr(Constant(str)), so prose cannot reach the detector at all rather than being
+# filtered out of it. Same split, same reason, as check-no-bare-bash.py.
+#   .sh + .claude/skills/*/SKILL.md  -> READ_RE grep below ('#' strip is complete)
+#   *.py                             -> check-no-ownership-flag-py.py (AST)
 #
 # Scope: executable framework code only — core/scripts/*.{sh,py}, mind_api/src +
 # mind_api/scripts *.py, and .claude/skills/*/SKILL.md pseudocode. Deliberately
@@ -25,6 +37,10 @@
 # rename maps MACHINE_OWNED_AGENTS as a string literal for a downstream env
 # migration, not a read). Fail-open over false-positive-blocker (rb-246/guard-147).
 set -euo pipefail
+
+# Resolved BEFORE the cd below — the .py delegate is looked up here, not under
+# $REPO_ROOT, so the lookup survives an absolute-path invocation from another tree.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
     # Not in a git work tree — nothing to gate. Fail open, never block.
@@ -60,12 +76,65 @@ READ_RE='((environ|getenv).*(OWNERSHIP_MODE|MACHINE_OWNED_AGENTS))|(\$\{?(OWNERS
 scan() {
     local f="$1" body="$2" code
     in_scope "$f" || return 1
+    # Python is owned by the AST detector (see the header split). Returning "no
+    # hit" here is not a coverage hole: run_py_detector below scans the SAME .py
+    # surface in the same mode, and its rc is OR-ed into this script's rc.
+    case "$f" in *.py) return 1;; esac
     # strip diff '+' prefix then drop shell/python '#' comment lines + blanks
     code="$(printf '%s\n' "$body" | sed 's/^+//' \
             | grep -vE '^[[:space:]]*#' | grep -vE '^[[:space:]]*$' || true)"
     [ -z "$code" ] && return 1
     printf '%s\n' "$code" | grep -Eq "$READ_RE" && return 0
     return 1
+}
+
+# .py delegate (see the header split). Same two modes, rc OR-ed into ours, so this
+# script stays the SINGLE entry point both the pre-commit hook (Gate at
+# core/githooks/pre-commit) and the Layer-D audit goal call.
+# Interpreter selection is the check-no-bare-bash.sh precedent verbatim: `py -3` on
+# Git Bash / MSYS, where a bare `python3` hits the Microsoft Store stub, and plain
+# `python3` elsewhere. Fail-open when the helper is absent — a gate that cannot run
+# must never block a commit, which is the same rb-246/guard-147 class this split
+# exists to fix. Callers MUST use `|| rc=1`, never a bare call: `set -e` is on.
+PY_VERDICT="unset"   # unset | clean | hit | absent | error — gates the clean banner
+
+run_py_detector() {
+    # Resolved from THIS script's dir, not $REPO_ROOT — the check-no-bare-bash.sh
+    # precedent. The two coincide in-repo, but SCRIPT_DIR also survives being
+    # invoked by absolute path from another tree, where a $REPO_ROOT-relative
+    # lookup would miss the helper.
+    local helper="$SCRIPT_DIR/check-no-ownership-flag-py.py"
+    if [ ! -f "$helper" ]; then
+        # FAIL OPEN on blocking, FAIL LOUD on the verdict. These are different
+        # failure modes and conflating them is what made this a real defect:
+        # scan() early-returns for *.py, so a missing delegate leaves .py covered
+        # by NOTHING, and the caller below would still have printed "audit clean".
+        # Measured in this goal's own fresh-eyes review (F1): with the helper
+        # absent and a live os.environ.get(OWNERSHIP_MODE) committed, the script
+        # printed the clean banner and exited 0. That is the guard-2097 hazard —
+        # delegation removes the old path's coverage, so a failure in the new
+        # path is a hole with nothing behind it.
+        echo "WARNING: delegate missing: $helper" >&2
+        echo "  The .py surface is NOT being checked for OWNERSHIP_MODE /" >&2
+        echo "  MACHINE_OWNED_AGENTS reads. Restore it — the .py half of this" >&2
+        echo "  gate is silently absent." >&2
+        PY_VERDICT="absent"
+        return 0
+    fi
+    local prc=0
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) py -3 "$helper" "$@" || prc=$? ;;
+        *) python3 "$helper" "$@" || prc=$? ;;
+    esac
+    case "$prc" in
+        0) PY_VERDICT="clean"; return 0 ;;
+        1) PY_VERDICT="hit";   return 1 ;;
+        *) # rc=3 (git could not enumerate) or any unexpected code: population
+           # UNKNOWN. Never block on it, never call it clean.
+           PY_VERDICT="error"
+           echo "WARNING: .py detector did not complete (rc=$prc) — .py surface NOT checked." >&2
+           return 0 ;;
+    esac
 }
 
 rc=0
@@ -116,6 +185,7 @@ if [ "$MODE" = "precommit" ]; then
             fi
         done
     fi
+    run_py_detector || rc=1
 else
     while IFS= read -r f; do
         [ -f "$f" ] || continue
@@ -126,7 +196,19 @@ else
     done < <(git ls-files 'core/scripts/*.sh' 'core/scripts/*.py' \
                  'mind_api/src/*.py' 'mind_api/src/**/*.py' \
                  'mind_api/scripts/*.py' '.claude/skills/*/SKILL.md')
-    [ "$rc" = "0" ] && echo "audit clean: no OWNERSHIP_MODE / MACHINE_OWNED_AGENTS reads in framework code"
+    # Must run BEFORE the banner — otherwise a .py hit prints "audit clean".
+    run_py_detector --audit || rc=1
+    if [ "$rc" = "0" ]; then
+        # "clean" is a claim about a surface, so it may only be made when BOTH
+        # halves actually read their surface. PY_VERDICT distinguishes "the .py
+        # detector ran and found nothing" from "the .py detector never ran" —
+        # without it those two print the same reassuring line.
+        if [ "$PY_VERDICT" = "clean" ]; then
+            echo "audit clean: no OWNERSHIP_MODE / MACHINE_OWNED_AGENTS reads in framework code"
+        else
+            echo "audit PARTIAL: .sh + SKILL.md surface clean; .py surface NOT checked (delegate: $PY_VERDICT)" >&2
+        fi
+    fi
 fi
 
 exit "$rc"

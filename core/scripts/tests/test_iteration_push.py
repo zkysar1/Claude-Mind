@@ -121,6 +121,65 @@ def test_throttled_below_thresholds(tmp_path):
     assert _must(a, "rev-parse", "origin/main") != _tip(a)
 
 
+def test_forced_zero_thresholds_push_what_throttling_would_defer(tmp_path):
+    """Graceful-stop D6.65 flush: forced-zero thresholds must push a batch the
+    defaults decline.
+
+    Deliberately the SAME scenario as test_throttled_below_thresholds directly
+    above — one fresh commit, 1 ahead — asserting the OPPOSITE outcome. That
+    pair is the contract aspirations-graceful-stop SKILL.md D6.65 rests on:
+    mid-loop batching is correct because another iteration will always follow,
+    but at shutdown there is no next iteration, so a deferred batch is stranded
+    (observed: 7 commits unpushed ~12h after a stop). g-115-4134.
+    """
+    origin, a, b = _clone_pair(tmp_path)
+    _commit_file(a, "f1.txt", "one\n", "A: f1")
+    r = _run_push(a, "--min-commits", "0", "--max-age-min", "0",
+                  "--fetch-interval-min", "0", "--strict")
+    assert r.returncode == 0, r.stderr
+    assert "throttled" not in r.stderr, \
+        "forced-zero thresholds must not defer — the stop path has no next iteration"
+    assert "push OK" in r.stderr
+    assert _must(a, "rev-parse", "origin/main") == _tip(a)
+
+
+def test_graceful_stop_flush_precedes_the_s3_flush():
+    """The D6.65 git flush must run BEFORE the D6.7 S3 flush, and stay fail-soft.
+
+    Ordering is load-bearing, not cosmetic: iteration-push does fetch+MERGE,
+    which mutates git-tracked files under agents/<agent>/ (journal.jsonl,
+    experience.jsonl and changelog.jsonl are all tracked — only session/ and
+    sessions/ are gitignored). Those paths sit inside the owned-set D6.7 pushes
+    to S3, so a merge landing AFTER that flush leaves local newer than S3 —
+    exactly the machine-move stranding D6.7 exists to prevent.
+
+    Paired with the behavioral test above per guard-1451 (a structural test is
+    never sufficient alone): that one proves the flush flushes, this one proves
+    it is wired in at a position where the flush is safe. g-115-4134.
+    """
+    skill = (PROJECT_ROOT / ".claude" / "skills"
+             / "aspirations-graceful-stop" / "SKILL.md")
+    src = skill.read_text(encoding="utf-8")
+
+    push_idx = src.find("iteration-push.sh --min-commits 0")
+    assert push_idx != -1, "D6.65 forced-zero git flush invocation is missing"
+    s3_idx = src.find("owncloud-flush.sh")
+    assert s3_idx != -1, "D6.7 S3 flush invocation is missing"
+    assert push_idx < s3_idx, (
+        "D6.65 git flush must precede the D6.7 S3 flush — a merge after the "
+        "flush strands local-newer-than-S3 state on a machine move"
+    )
+
+    invocation = src[push_idx:src.find("\n", push_idx)]
+    # guard-775: without --strict, iteration-push's soft_exit() returns 0 on
+    # every path, so the stop can never be aborted by a push failure. Adding
+    # --strict here would let a transient network error break the stop sequence.
+    assert "--strict" not in invocation, \
+        "stop-path flush must stay fail-soft — --strict would let a push failure abort the stop"
+    assert "--fetch-interval-min 0" in invocation, \
+        "stop-path flush must defeat the fetch throttle — no next iteration will correct a stale origin ref"
+
+
 def test_up_to_date_noop(tmp_path):
     origin, a, b = _clone_pair(tmp_path)
     r = _run_push(a, *_default_flags("--strict"))

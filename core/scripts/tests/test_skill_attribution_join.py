@@ -372,5 +372,68 @@ def test_cmd_reconsolidation_no_apply_omits_filing_keys(monkeypatch, capsys):
     assert out["candidate_count"] == 1
 
 
+# --- : read_execution_diary must read the STORE, not the local cache ---
+#
+# execution-diary.jsonl is sync_tier: continuity and NOT machine-local, so under
+# own-cloud the authoritative copy is in S3 and the local tree is a read-through
+# cache populated PER-AGENT (owncloud-pull.sh is --agent-scoped; /start pulls the
+# bound agent only). A peer's diary is therefore simply absent on this box, and
+# the old `os.path.exists(path)` gate returned [] for every agent but self.
+#
+# Measured cc-02 2026-07-31 BEFORE the fix: diaries local for 1 of 5 agents while
+# all 5 were live in S3; 4 of 5 agents contributed zero goal windows; fleet
+# classification rate 0.3043% (45/14788). After: all 5 nonzero, 1.2848% (190/14788),
+# which is 100% of what is structurally classifiable (exactly 190 invocations fall
+# inside any diary span -- the residual is retention asymmetry, not a join defect).
+#
+# These two tests are a matched pair and must stay that way: the first fails under
+# the old implementation, the second passes under BOTH. Together they prove the
+# change discriminates rather than merely passing (guard-1943).
+
+
+class _StoreOnlyBackend:
+    """Backend whose content exists ONLY in the store -- never on local disk."""
+
+    def __init__(self, payload):
+        self._payload = payload
+        self.read_paths = []
+
+    def read_text(self, path, encoding="utf-8", *, force_fresh=False):
+        self.read_paths.append(str(path))
+        if str(path) in self._payload:
+            return self._payload[str(path)]
+        raise FileNotFoundError(str(path))
+
+
+def test_read_execution_diary_reads_store_when_local_absent(agents_root, monkeypatch):
+    """The regression guard: absent locally, present in the store -> rows returned."""
+    import storage_backend
+
+    path = os.path.join(str(agents_root), "peer", "session", "execution-diary.jsonl")
+    assert not os.path.exists(path), "fixture must NOT create the file locally"
+
+    rows = [{"timestamp": "2026-07-30T11:00:00", "goal_id": "g-1", "event": "phase_start"},
+            {"timestamp": "2026-07-30T10:00:00", "goal_id": "g-1", "event": "phase_start"}]
+    backend = _StoreOnlyBackend({path: "\n".join(json.dumps(r) for r in rows)})
+    monkeypatch.setattr(storage_backend, "get_backend", lambda: backend)
+
+    got = sa.read_execution_diary("peer")
+
+    # Under the old os.path.exists() gate this is [] -- the whole defect.
+    assert len(got) == 2, "diary present in the store must be read despite absent local cache"
+    assert [r["timestamp"] for r in got] == ["2026-07-30T10:00:00", "2026-07-30T11:00:00"], \
+        "rows must still be timestamp-sorted"
+    assert backend.read_paths == [path], "must read via the backend, not the filesystem"
+
+
+def test_read_execution_diary_absent_in_store_returns_empty(agents_root, monkeypatch):
+    """Genuine absence stays an empty list -- FileNotFoundError is not an error path."""
+    import storage_backend
+
+    backend = _StoreOnlyBackend({})           # store has nothing
+    monkeypatch.setattr(storage_backend, "get_backend", lambda: backend)
+    assert sa.read_execution_diary("ghost") == []
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

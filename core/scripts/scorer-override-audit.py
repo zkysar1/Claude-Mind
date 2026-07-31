@@ -14,12 +14,17 @@ sibling ``aspirations-rejection-audit.py`` (the script SCANS + returns a
 report + exit code; the wrapper files the goal via ``aspirations-add-goal.sh``
 JSON stdin). This keeps the audit engine side-effect-free and unit-testable.
 
-Cross-agent glob routes through ``agents_root()`` per CLAUDE.md "Agent-dir
-Resolution" (the cross-agent-glob table) — it auto-tracks an
-``AGENTS_PARENT_DIR`` rename and never depth-1-redrifts to
-``PROJECT_ROOT.glob`` (the g-115-1405 class). ``--agents-root`` overrides it
-for hermetic tests only (mirrors ``read_ledger``'s ``root=`` param in
-``skill-coinvocation-discovery.py``).
+Cross-agent diary enumeration routes through ``_fleet_diary.read_fleet_diaries``
+(g-115-4154), which derives a ROSTER and backend-reads each agent's diary. It
+replaced a ``base.glob("*/session/execution-diary.jsonl")`` that enumerated by
+what the local read-through cache happened to hold — cold, 1 of 5 agents on
+cc-02; warm, 5 of 5 enumerated with 4 diverged from S3. Both shrink the
+recurrence denominator silently. The helper still routes through ``_paths``
+``agents_root()`` per CLAUDE.md "Agent-dir Resolution" (the cross-agent-glob
+table), so it auto-tracks an ``AGENTS_PARENT_DIR`` rename and never
+depth-1-redrifts to ``PROJECT_ROOT.glob`` (the g-115-1405 class).
+``--agents-root`` overrides the root for hermetic tests only (mirrors
+``read_ledger``'s ``root=`` param in ``skill-coinvocation-discovery.py``).
 
 Metric of success (design intent): fleet-wide UNSANCTIONED-override rate is 0
 BY CONSTRUCTION (the Layer B gate refuses unsanctioned deviations), so every
@@ -44,7 +49,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _paths import agents_root  # noqa: E402
+from _fleet_diary import read_fleet_diaries  # noqa: E402
 
 # Layer B content shape (scorer-verdict-gate.py):
 #   "scorer-override: claimed <goal> over scorer top <top> (deviation=<code>)"
@@ -109,19 +114,22 @@ def _parse_ts(s):
 def audit(since_hours: int = 24, root: Path | None = None) -> dict:
     """Scan all agents' diaries and return the report dict. Pure read — no
     goal filing, no writes."""
-    base = root if root is not None else agents_root()
     cutoff = datetime.now() - timedelta(hours=since_hours)  # naive UTC
     per_agent: dict[str, dict] = {}
     # : global scorer_top -> recurrence. Stuck-at-top is a property of
     # the GOAL/routing, not the agent — a misrouted top can be deviated-over by
     # multiple agents' cross-agent selectors, so count across ALL agents.
     per_top: dict[str, dict] = {}
-    for diary in sorted(base.glob("*/session/execution-diary.jsonl")):
-        agent = diary.parent.parent.name
-        try:
-            lines = diary.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            continue
+    # ROSTER + AUTHORITATIVE READ (), replacing the former
+    # base.glob("*/session/execution-diary.jsonl") + diary.read_text(). "across
+    # ALL agents" above was only ever true of agents the local read-through cache
+    # happened to hold: cold, this covered 1 of 5 on cc-02; warm, it covered 5 of
+    # 5 while 4 of those diverged from S3. Both failures silently SHRINK the
+    # recurrence denominator, and a recurrence count is exactly the statistic that
+    # cannot survive an unstated population change. `root` stays the test seam —
+    # _fleet_diary reads it purely locally (see its docstring).
+    for agent, text in read_fleet_diaries(root):
+        lines = text.splitlines()
         for ln in lines:
             ln = ln.strip()
             # Cheap pre-filter before json.loads (the diary is mostly

@@ -329,9 +329,17 @@ stale_cadence:
 #                health-regression-cadence (0.5h), curriculum-cadence (0.5i),
 #                evolution-cadence (0.5j), defer-drift-check (0.5b.10),
 #                reason-less-blocked-check (0.5b.11),
-#                blocked-signal-resolution-check (0.5b.12).
+#                blocked-signal-resolution-check (0.5b.12),
+#                human-blocked-defer-join (0.5b.15).
 #                All are themselves cadence-gated, so dropping them in tight
 #                zones is safe.
+#                NON-EXHAUSTIVE — this list is a REFLECTION of sweep_tier() in
+#                core/scripts/aspirations-precheck-budget-meter.sh, which is the
+#                single source of truth and wins on any disagreement. It has
+#                already drifted (several 0.5b.* sweeps are registered there and
+#                absent here), so read it as illustrative, never as the roster.
+#                Only the SKILL.md tier table is parity-tested against the script
+#                (test_budget_meter_sweep_tier_parity.py); this block is not.
 #
 # Always-run sweeps fire 100% of the time regardless of zone or budget. If
 # precheck-drops.jsonl ever shows an always-run drop, that's a bug — raise
@@ -1096,6 +1104,24 @@ recurring:
   # Set short_interval_hours to 0 to disable (restores pre- behavior).
   substantive_demotion_short_interval_hours: 6.0        # "monitor class" = interval <= this
   substantive_demotion_short_interval_exempt_ratio: 1.0 # monitor exempt at 2× its interval stale
+
+  # --- DRAIN LANE (; decision (b), board msg-20260730-203612-foxtrot-287) ---
+  # A selection-time drain lane, NOT a score term. Two clamps downstream of
+  # recurring_urgency (the urgency cap , and apply_substantive_demotion's
+  # score=cap assignment ) each flatten distinct overdue ratios to one
+  # value, so NO score-side change can restore drain ordering. The lane instead
+  # REORDERS the already-sorted list for one slot, keyed on overdue ratio directly.
+  # It never touches score computation — that is what keeps non-lane picks
+  # byte-identical ( acceptance bucket 3).
+  #
+  # Eligibility reuses overdue_exemption_level(), the SAME predicate FW-1
+  # demotion-exemption and the  saturation relief consume, so the three
+  # mechanisms cannot drift apart. NOTE the scale: that predicate compares the
+  # SELECTOR's overdue_ratio = (age - interval)/interval, which is 1.0 LOWER than
+  # the ratio recurring-starvation-check headlines (age/basis). Do not author an
+  # eligibility expectation from the detector's number (guard-2004 third trap).
+  drain_lane_enabled: true                # master gate; false restores pre-g-115-4119 ordering exactly
+  drain_lane_interval_iterations: 5       # K: at most one lane pick per K selector invocations
 
   # --- AUTO-CONTRACT (LifingPolls plan item 4 — 2026-05-08) ---
   # Inverse of cargo-cult auto-extend. When a recurring goal consistently
@@ -2078,7 +2104,7 @@ history_vacuum:
   # (claude-mind-own-cloud-data, zds-own-cloud-data, vinheim-data), not a
   # shared "lodestar-data". The graveyard rides a lifecycle-SAFE prefix in this
   # bucket: the only lifecycle rule that could expire data is
-  # NoncurrentVersionExpiration(90d), which touches ONLY overwritten
+  # NoncurrentVersionExpiration(14d; was 90d until 2026-07-31), which touches ONLY overwritten
   # (noncurrent) versions — graveyard objects are write-once with unique
   # date/run-id keys, so they stay CURRENT forever and no clock touches them
   # (there is no current-version Expiration rule). Verified .

@@ -119,7 +119,8 @@ from _paths import META_DIR, CONFIG_DIR, PROJECT_ROOT
 # Decision enum — single source of truth in _gate_log.py. Importing (not
 # redeclaring) means any future change to the taxonomy lands in one place;
 # mismatches between writer and reader become impossible by construction.
-from _gate_log import _VALID_DECISIONS
+from _gate_log import _VALID_DECISIONS, firings_paths
+from itertools import chain as _chain
 
 GATES_YAML = CONFIG_DIR / "gates.yaml"
 FIRINGS_JSONL = META_DIR / "gate-firings.jsonl"
@@ -187,10 +188,15 @@ def _load_gates():
 
 def _load_firings(since):
     """Yield firing records with ts >= `since`. Skip malformed lines (WARN)."""
-    if not FIRINGS_JSONL.is_file():
+    # : read the store through its composition seam, not a hardcoded
+    # filename, so date segments are picked up with no change here. Today this
+    # resolves to exactly FIRINGS_JSONL.
+    paths = firings_paths(FIRINGS_JSONL.parent)
+    if not paths:
         return
     skipped = 0
-    for line in FIRINGS_JSONL.read_text(encoding="utf-8").splitlines():
+    for line in _chain.from_iterable(
+            p.read_text(encoding="utf-8").splitlines() for p in paths):
         line = line.strip()
         if not line:
             continue

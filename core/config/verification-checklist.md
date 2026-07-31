@@ -3001,7 +3001,21 @@ The aspirations-precheck has three precheck sentinel gates that follow the same 
     - `grep -q "force_tree_maintain" core/scripts/iteration-close.sh` AND `grep -q "force_tree_maintain" .claude/skills/aspirations-precheck/SKILL.md`
     - `grep -q "force_experience_archival" core/scripts/experience-staleness-check.sh` AND `grep -q "force_experience_archival" .claude/skills/aspirations-precheck/SKILL.md`
     - `grep -q "fresh_eyes_dispatch_pending" core/scripts/iteration-close.sh` AND `grep -q "fresh_eyes_dispatch_pending" .claude/skills/aspirations-precheck/SKILL.md`
-35. **Static**: `grep -cE "echo 'null' \| Bash: wm-set.sh (force_tree_maintain|force_experience_archival|fresh_eyes_dispatch_pending)" .claude/skills/aspirations-precheck/SKILL.md` returns at least 3 — each consumer clears its own sentinel after firing (one-shot pattern). Without the clear, the gate re-fires every iteration and the LLM gets stuck in a dispatch loop.
+35. **Static**: the SUM of these two greps over `.claude/skills/aspirations-precheck/SKILL.md` is at least 3 — each consumer clears its own sentinel after firing (one-shot pattern). Without the clear, the gate re-fires every iteration and the LLM gets stuck in a dispatch loop.
+
+    ```sh
+    F=.claude/skills/aspirations-precheck/SKILL.md
+    S="force_tree_maintain|force_experience_archival|fresh_eyes_dispatch_pending"
+    raw=$(grep -cE "echo 'null' \| Bash: wm-set\.sh ($S)" "$F")
+    guarded=$(grep -A3 'sentinel-clear-guarded\.sh' "$F" | grep -cE "^[[:space:]-]*--slot ($S)")
+    echo $(( raw + guarded ))   # must be >= 3
+    ```
+
+    The `guarded` term counts a clear routed through `core/scripts/sentinel-clear-guarded.sh`, which satisfies this check's intent *more* strongly than the raw form: it clears only after proving by read-back that the gated write landed, and issues the clear as its own invocation (guard-1870).
+
+    **Why two greps and not one alternation.** g-115-4177 first widened this to a single pattern accepting a bare `--slot <name>` anywhere in the file. A fresh-eyes review of that fix probed it against a synthetic file containing three bare *prose* mentions and zero real clears: it scored 3 and PASSED. That is fail-OPEN, and fail-open is the dangerous direction here — the check exists to catch a *missing* clear, so a predicate satisfiable by documentation text passes while a consumer has none. Anchoring `--slot` inside a 3-line window after the script name closes it (verified: live file 3, prose-only file 0).
+
+    Both mistakes are the same mistake seen from opposite sides, which is the durable lesson: the original predicate pinned an *implementation* and so reported a hardened consumer as missing; the first fix pinned a *token* and so reported prose as a clear. A predicate must name the OBLIGATION — here, "a clear is issued for this slot by a consumer" — and each term must be anchored to something only a real consumer produces. Keep both terms in sync when a further consumer migrates.
 36. **Static (g-115-1553 — consumption-aware canary)**: the `fresh_eyes_dispatch_pending` consumer MUST stamp `fresh_eyes_last_dispatch` on handling, and the canary MUST read it. Unlike the other tracked sentinels, this one is re-armed by its writer on EVERY substantive deep close, so a bare presence-count canary false-fires even when the consumer keeps up; the canary instead keys on the dispatch timestamp advancing. All three must reference the slot:
     - `grep -q "fresh_eyes_last_dispatch" .claude/skills/aspirations-precheck/SKILL.md` (consumer stamps before clear)
     - `grep -q "fresh_eyes_last_dispatch" core/scripts/stale-sentinel-canary.py` (canary reads the advancement signal)

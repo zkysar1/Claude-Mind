@@ -27,6 +27,17 @@ except ImportError:
 
 from _paths import META_DIR
 
+# : never hardcode the escalation aspiration —  is the UPSTREAM
+# deployment's queue and does not exist elsewhere, so a literal files nothing.
+try:
+    from _paths import AGENT_DIR, CORE_ROOT, WORLD_DIR
+    from _escalation_target import resolve as _resolve_asp, source_flag as _asp_source
+    ESCALATION_ASP, _ESCALATION_ASP_VIA = _resolve_asp(CORE_ROOT, WORLD_DIR, AGENT_DIR)
+    ESCALATION_SOURCE = _asp_source(ESCALATION_ASP, WORLD_DIR, AGENT_DIR)
+except Exception:
+    ESCALATION_ASP, _ESCALATION_ASP_VIA, ESCALATION_SOURCE = (
+        "asp-115", "fallback:import-failed", "world")
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -394,7 +405,7 @@ def _open_origin_signals():
     return sigs
 
 
-def file_reconsolidation_investigate(candidate, target_asp="asp-115"):
+def file_reconsolidation_investigate(candidate, target_asp=ESCALATION_ASP):
     """--apply: file ONE reconsolidation candidate as an ADVISORY Investigate via
     the daemon add-goal endpoint (_rt — canonical Python->daemon path, NOT a bash
     subprocess). ADVISORY only: the goal asks the agent to REVIEW the failing
@@ -429,7 +440,8 @@ def file_reconsolidation_investigate(candidate, target_asp="asp-115"):
         f"reconsolidation exact-origin_signal dedup confirmed '{sig}' not open "
         "(no pending/in-progress goal carries this key)")}
     try:
-        resp = _rt.aspirations_add_goal(target_asp, record, source="world", overrides=override)
+        resp = _rt.aspirations_add_goal(target_asp, record, source=ESCALATION_SOURCE,
+                                        overrides=override)
     except Exception as e:  # noqa: BLE001 — fail-open per docstring
         print(f"[skill-evaluate reconsolidation] file failed for {skill}: {e}", file=sys.stderr)
         return None
@@ -475,7 +487,7 @@ def cmd_reconsolidation(args):
     # reviewable work instead of a report nobody reads. Advisory only: the filed
     # goal REVIEWS the skill against its failures, never auto-modifies it ().
     if getattr(args, "apply", False):
-        target_asp = getattr(args, "target_asp", "asp-115")
+        target_asp = getattr(args, "target_asp", ESCALATION_ASP)
         open_sigs = _open_origin_signals()
         filed, suppressed_dedup = [], []
         for c in candidates:
@@ -532,9 +544,9 @@ def main():
     p_recon.add_argument("--apply", action="store_true",
                          help="File each candidate as an advisory Investigate goal "
                               "(exact-origin_signal dedup; advisory-refine only, g-355-07)")
-    p_recon.add_argument("--target-asp", default="asp-115",
+    p_recon.add_argument("--target-asp", default=ESCALATION_ASP,
                          help="Aspiration to file reconsolidation Investigate goals into "
-                              "(default asp-115)")
+                              f"(default {ESCALATION_ASP}, resolved per deployment)")
 
     args = parser.parse_args()
     cmds = {"score": cmd_score, "read": cmd_read, "report": cmd_report,

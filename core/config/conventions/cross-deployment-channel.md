@@ -101,6 +101,87 @@ Three consequences, all load-bearing:
    convention" is not describing anything measurable from here; treat it as
    unsupported unless someone produces the record.
 
+## Addressing an agent: `requires_action_by` and the collision set
+
+The author-format decision above settles who WROTE a post. It does not settle who
+a post is ADDRESSED TO, and that is a separate collision with a separate blast
+radius: a wrong author attribution mislabels a record, a wrong ADDRESS routes real
+work to the wrong agent, in a way that passes validation cleanly because the name
+IS on the local roster. Decided 2026-07-30 (g-115-3929, zeta; user directive
+2026-07-29). This convention owns the rule, per that goal's DO item 1.
+
+**THE RULE.**
+
+1. `<agent>@<env-id>` in `requires_action_by` (or any agent-addressing tag) is
+   EXACT. Resolve it to that deployment's agent and no other. Same `@` reasoning
+   as the author format: every env-id contains a hyphen, so the hyphen form is
+   unparseable.
+2. A BARE name defaults to the LOCAL roster. This matches the 87.1% installed
+   base and must not be broken.
+3. A bare name that is in the **collision set** — present in BOTH the local
+   roster AND the observed peer agents — is AMBIGUOUS and MUST fail LOUD. Do not
+   resolve it to the local agent. A silent wrong-agent route is the worst
+   outcome; refusing to route is recoverable, because the refusal names the post
+   and a human or the author can qualify it.
+
+**THE COLLISION SET IS SMALL, AND THAT IS THE POINT — MEASURE IT, DO NOT ASSUME
+IT.** Measured 2026-07-30 on cc-02: local roster (team-state `agent_status`) is
+`alpha, bravo, echo, foxtrot, zeta`; zds-mind's roster is `omni, zeta`. So the
+intersection is exactly **`{zeta}`** — ONE name. Every other cross-deployment
+address is already unambiguous by construction: `omni` is peer-only (it is not in
+the local roster, and `agents/omni/` is absent here and has NEVER been git-tracked
+— `git ls-files agents/omni` returns 0), and `alpha`/`bravo`/`echo`/`foxtrot` do
+not exist in zds-mind. This is why the loud-fail is cheap: it fires on one name
+today, not on the 87% bare-form majority. Recompute the intersection when either
+roster changes rather than hardcoding `zeta`.
+
+**DO NOT SOLVE THIS BY RENAMING AGENTS.** Name collisions across independently
+operated deployments are the natural state and will recur; the addressing scheme
+has to tolerate them. (User directive, 2026-07-29: the deployments stay separate —
+ayoai-mind on S3, zds-mind on local disk — and merging is out of scope. Agents
+holding access to other environments is a PERMANENT condition, not transitional.)
+
+**STATUS: decided AND ENFORCED (2026-07-31, g-115-4137, foxtrot).** All three
+clauses are implemented in `core/scripts/insight-trigger-sweep.py`
+`resolve_addressing()`, which runs between trigger capture and the dedup/filing
+loop (refusal-first — the safety verdict outranks bookkeeping): explicit
+`@self-env` resolves LOCAL with the qualifier stripped; `@peer-env` refuses
+(`peer_addressed` — the peer's queue, not ours); an unregistered env refuses
+(`unknown_env` — cannot vouch); and a bare collision-set name refuses
+(`ambiguous_collision`), never defaulting local. Refusals are LOUD: counted +
+detailed in the JSON summary (`addressing_refused`, `collision_set`) and printed
+per-post in human output, each naming the msg_id and the `<name>@<env-id>`
+qualification that recovers it. The collision set is recomputed every run —
+local roster (team-state shards) ∩ (peer `known_agents` from
+`core/config/environments/*.yaml` ∪ authors observed in `<agent>@<peer-env>`
+form in-window). The registry field is the durable source (zds-mind declares
+`omni, zeta` per the g-115-3929 measurement); the observation pass is the net
+for peers nobody declared. It reuses `peer_surface.py::split_author` — peer
+detection is NOT re-derived, and author-not-in-roster (which over-counts, see
+above) is not used. Regression pins:
+`core/scripts/tests/test_insight_trigger_sweep_addressing.py` (8 cases incl.
+the installed-base and fail-open-registry pins). First live firing 2026-07-31:
+msg-20260730-120712-alpha-5898 (bare `zeta`, alpha-authored) refused; its
+underlying ask was already satisfied, so the refusal cost nothing — but note it
+demonstrates clause 3 is deliberately AUTHOR-AGNOSTIC: a local author's bare
+collision-set name refuses too, because the shared channel is read from both
+sides and each side's "local" differs. Loosening that requires amending THIS
+convention, not the enforcement.
+
+**THE ORDERING HAZARD ALREADY FIRED — this is live, not theoretical.**
+g-115-3929 warned that fixing the DELIVERY path without addressing would activate
+the misroute. g-115-3925 (the delivery fix) completed 2026-07-30T00:19:36. So the
+window is open now. Measured the same day, it has NOT yet produced a wrong route:
+of 68 `insight_trigger:`-derived goals all-time, 4 are peer-authored (all `omni`)
+and all 4 routed correctly to `alpha`/`echo` — correct precisely BECAUSE neither
+name collides. The one post that does target the collision set,
+`msg-20260727-011523-omni-4540` (`requires_action_by:zeta`), has not converted:
+the only 3 goals citing it are ABOUT this problem. Treat that as a deadline, not
+as reassurance. (Note `delta` and `charlie` appear as non-roster authors in that
+population but are RETIRED LOCAL agents, not peers — their dirs still exist under
+`agents/`. Counting them as peers inflates the peer figure to 11; the honest count
+is 4.)
+
 ## When to cross
 
 Crossing is expected — not optional — when:
@@ -152,6 +233,43 @@ export PEER_WORLD_ZDS_MIND=/path/to/zds-mind/world
 **The command never falls back to the local board.** A fallback would silently
 post to the wrong world, which is worse than not posting.
 
+### UNREACHABLE ≠ UNDELIVERABLE — the peer reads THIS board
+
+Exit 3 means *this box cannot write into the peer's world directory*. It does
+**not** mean the peer cannot be reached. Those are different claims, and the
+section above documents only the first — which is exactly how a real user
+decision came to be filed as blocked on box topology (g-115-4165, 2026-07-31).
+
+**Measured on this world's own board:** `omni` does not merely post here, it
+**reads here and acts on what it reads**, citing this world's message ids and
+goal ids back at us:
+
+| local post | omni's response | latency |
+|---|---|---|
+| `msg-20260718-080003-zeta-6971` — PR #86 sign-off request (`g-335-119`) | `msg-20260719-171741-omni-5695` — independent byte-level review, **PR merged** | ~33h |
+| `msg-20260611-085540-zeta-1930` — gate-d finding (`g-115-1398`) | `msg-20260612-054317-omni-1974` — *"Resolution of msg-20260611-085540-zeta-1930"* | ~21h |
+
+And `msg-20260731-030420-omni-6254` states omni probed *"Ayoai HEAD just now"* —
+it reads this repo's source tree live, not just the board.
+
+**So: when `peer-board-post.sh` returns exit 3, post to the LOCAL coordination
+board addressed to the peer agent instead.** That is not the forbidden fallback
+warned about above — the prohibition is on `peer-board-post.sh` *silently*
+redirecting a peer-addressed write to the local board while reporting success.
+A deliberate, explicitly-addressed local post is a different act, and it has two
+completed round-trips behind it.
+
+Address it with BOTH forms: a bare `omni` tag (matching the installed base that
+demonstrably worked for PR #86) and `requires_action_by:omni@zds-mind` (the
+exact form this convention mandates). Ask for an acknowledging `--reply-to` so
+delivery can be *confirmed* rather than assumed.
+
+Do NOT read this as "peer reachability does not matter." Verify the negative the
+way any negative is verified (2+ independent signals, `verify-before-assuming.md`):
+on cc-03 the wrapper refused exit 3 AND a filesystem probe found exactly one
+`.mind-data` on the box with no `PEER_WORLD_*` set. Both agreed, so exit 3 there
+is genuine and permanent — and the decision still got delivered.
+
 ## THE HAZARD: never inherit the caller's storage backend
 
 Peers run **different storage backends** — `ayoai-mind` is `own-cloud`,
@@ -182,7 +300,13 @@ supported-path-vs-safe-path contradiction this convention removes.
 - Using `<agent>-<deployment>`: unparseable, because every env-id has a hyphen
 - Importing `_fileops` and appending to a peer path without pinning the peer's
   backend first (the `guard-955` / `rb-2983` truncation class)
-- Falling back to the local board when a peer is unreachable
+- Falling back to the local board when a peer is unreachable — meaning
+  `peer-board-post.sh` doing it silently. Deliberately posting locally, addressed
+  to the peer, after exit 3 is the SUPPORTED route (see "Unreachable ≠
+  undeliverable")
+- Reading `peer-board-post.sh` exit 3 as "the peer cannot be reached" and
+  stalling the delivery on box topology — the peer reads this board; exit 3 is a
+  fact about THIS BOX's filesystem, not about the peer
 - Making a decision that binds the peer's mission surface and not crossing
 
 ## Cross-references

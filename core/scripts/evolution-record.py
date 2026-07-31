@@ -151,6 +151,45 @@ def section_at_line(before_text, line_index):
     return "__frontmatter_or_preamble__"
 
 
+# Identity-file cosmetic floor ( / ZDS ): above this many
+# changed CHARACTERS a small-line-delta edit to an identity file is material.
+# Separates a typo (1-3 chars) from a one-line principle rewrite (100+ chars)
+# at the SAME line delta.
+_IDENTITY_COSMETIC_CHAR_BOUND = 30
+
+# file_kind values whose semantic units ARE lines (numbered principles,
+# directive bullets) — a one-line replacement there can reverse meaning.
+_IDENTITY_FILE_KINDS = ("agent_self", "program")
+
+
+def changed_char_count(before_text, after_text):
+    """Character-level added+removed across the line-level changed regions.
+
+    Bounded work: char-diffs ONLY the lines the line-level opcodes mark as
+    changed (callers gate on line delta <= 3 first), never the whole file.
+    """
+    sm = difflib.SequenceMatcher(a=before_text.splitlines(), b=after_text.splitlines())
+    b_chunk = []
+    a_chunk = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        b_chunk.extend(before_text.splitlines()[i1:i2])
+        a_chunk.extend(after_text.splitlines()[j1:j2])
+    csm = difflib.SequenceMatcher(a="\n".join(b_chunk), b="\n".join(a_chunk))
+    added = 0
+    removed = 0
+    for tag, i1, i2, j1, j2 in csm.get_opcodes():
+        if tag == "delete":
+            removed += i2 - i1
+        elif tag == "insert":
+            added += j2 - j1
+        elif tag == "replace":
+            added += j2 - j1
+            removed += i2 - i1
+    return added + removed
+
+
 def classify_change(before_text, after_text, before_hash, after_hash, file_kind):
     """Return change_class per §5.4 / §14.3 heuristic.
 
@@ -159,6 +198,14 @@ def classify_change(before_text, after_text, before_hash, after_hash, file_kind)
     - cosmetic: small diff, no structural change
     - material-rename: heading rename (Jaccard ≥0.5) — deferred; falls to material
     - material: anything else
+
+    file_kind is LOAD-BEARING for identity files (g-115-4199): self.md/program.md
+    store semantic units as single lines, so 'lines changed' is a poor proxy for
+    'meaning changed' there — a full principle rewrite is line-delta 2, same as a
+    typo. For _IDENTITY_FILE_KINDS the cosmetic floor additionally requires the
+    changed-character count to stay under _IDENTITY_COSMETIC_CHAR_BOUND, so a
+    meaning-capable rewrite classifies material and reaches guard-380's
+    notify-after path. Non-identity kinds keep the pure line-count floor.
     """
     if before_hash is None:
         return "bootstrap"
@@ -176,6 +223,11 @@ def classify_change(before_text, after_text, before_hash, after_hash, file_kind)
         b_h = set(re.findall(r"^##+\s+.+$", before_text, re.MULTILINE))
         a_h = set(re.findall(r"^##+\s+.+$", after_text, re.MULTILINE))
         if b_h == a_h:
+            if (
+                file_kind in _IDENTITY_FILE_KINDS
+                and changed_char_count(before_text, after_text) > _IDENTITY_COSMETIC_CHAR_BOUND
+            ):
+                return "material"
             return "cosmetic"
 
     return "material"

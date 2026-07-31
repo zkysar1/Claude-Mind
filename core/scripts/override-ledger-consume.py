@@ -65,6 +65,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 from _paths import META_DIR, WORLD_DIR
 from _override_helpers import SLOT_TO_GATE_ID
+from _gate_log import firings_paths
 
 LEDGER_JSONL = WORLD_DIR / "override-bypass-ledger.jsonl"
 FIRINGS_JSONL = META_DIR / "gate-firings.jsonl"
@@ -214,7 +215,17 @@ def analyze(days: int, gate_filter: str | None, top_k: int):
     """Main aggregation. Returns the JSON-shaped result dict."""
     since = datetime.now() - timedelta(days=days)
     records = list(_load_ledger(LEDGER_JSONL, since))
-    firings_override_counts = _load_firings_override_counts(FIRINGS_JSONL, since)
+    # : read through the store's composition seam (see _gate_log
+    # .firings_paths) rather than a hardcoded filename, so date segments are
+    # picked up with no change here. Counters sum across segments; today the
+    # seam resolves to exactly FIRINGS_JSONL, so the result is unchanged.
+    # Derive the search dir from FIRINGS_JSONL rather than letting the seam
+    # resolve META_DIR itself: callers (and tests) configure the store by
+    # setting that module constant, so a seam that bypassed it would silently
+    # read the live store instead of the configured one.
+    firings_override_counts = Counter()
+    for _p in firings_paths(FIRINGS_JSONL.parent):
+        firings_override_counts.update(_load_firings_override_counts(_p, since))
 
     # Per-gate aggregation (cross-agent — the primary signal for threshold tuning).
     # See world/conventions/override-ledger.md "Cross-Agent Aggregation Rule" ().

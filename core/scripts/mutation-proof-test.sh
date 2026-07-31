@@ -51,6 +51,29 @@ Proves a regression test is not vacuous by mutating the code under test:
   beside, and here it is exactly as stale. Tracked in g-115-3499, which owns
   the freshness fix; this field inherits the hazard rather than adding it.
 
+HOW BROAD WAS THE SABOTAGE — `sabotage_sites` + `sabotage_sites_basis`.
+  --sabotage-old replaces ALL occurrences. When the token appears more than
+  once, the mutation lands at the site under test AND everywhere else, so a
+  predicate anchored to that site and one that merely greps the whole file BOTH
+  go red — and a PASS cannot tell them apart. Measured: a deliberately vacuous
+  whole-file predicate was certified PASS by exactly this. The verdict stays
+  PASS (the proof is real, just for a smaller proposition) and the reason
+  carries a CAVEAT whenever sites > 1. basis says WHAT was counted:
+  "occurrences" (--sabotage-old) | "changed-lines" (--sabotage-sed, the only
+  mode-independent measure) | "unmeasured" (sabotage never applied; sites null).
+  To prove ANCHORING, narrow to one site: --sabotage-sed '0,/re/s//new/'.
+  Mirror of guard-1629, which covers sabotage landing at the WRONG site.
+
+--target MUST NOT be this script. bash re-reads a running script by byte offset,
+  so self-mutation corrupts the running instance; the damage is length-dependent
+  (small edits look fine, large ones syntax-error), so it is refused outright.
+  Mutating any OTHER script live in the current process tree has the same hazard
+  and cannot be detected from here — drive those from a separate harness.
+
+For an N-mutation matrix over a SET of cases (partition proof, per-mutant
+negative controls, unproven-case reporting), see the companion
+core/scripts/mutation-partition-proof.sh, which delegates each mutant here.
+
 Exit: 0 PASS (test is mutation-proof) | 1 FAIL (vacuous/broken/no-op mutation)
       2 usage/operational error       | 3 RESTORE FAILED (manual recovery needed)
 Emits a single-line JSON verdict on stdout.
@@ -87,6 +110,23 @@ if [[ "$TARGET" != /* && ! -f "$TARGET" && -f "$WORKDIR/$TARGET" ]]; then
   TARGET="$WORKDIR/$TARGET"
 fi
 [[ -f "$TARGET" ]] || { echo "ERROR: target file not found: $TARGET" >&2; exit 2; }
+# REFUSE self-mutation. bash reads a script incrementally BY BYTE OFFSET, so
+# editing this file while it executes makes the running instance resume at a
+# stale offset. The damage is LENGTH-DEPENDENT, which is what makes it worth a
+# hard refusal rather than a caveat: a +-2-byte replacement lands inside the
+# same token and appears to work, while a 24-byte deletion resumes mid-statement
+# and dies with a syntax error pointing at an unrelated line. Measured
+# 2026-07-31 () doing exactly this: 3 of 4 self-mutants returned a
+# clean verdict and the 4th exited 2 with no JSON at all. A silent-then-erratic
+# failure inside an N-mutation matrix is precisely the "matrix that corrupts the
+# tree is worse than no matrix" hazard. This catches the SELF case, which is the
+# knowable one; mutating any OTHER script that is live in the current process
+# tree has the same hazard and cannot be detected from here.
+_abs() { readlink -f "$1" 2>/dev/null || echo "$1"; }
+if [[ "$(_abs "$TARGET")" == "$(_abs "${BASH_SOURCE[0]}")" ]]; then
+  echo "ERROR: --target is this script itself. bash re-reads a running script by byte offset, so self-mutation corrupts the running instance (length-dependent: small edits look fine, large ones syntax-error). Copy the script to a scratch path and mutate the copy, or drive the proof from a separate harness." >&2
+  exit 2
+fi
 if [[ $((have_old + have_sed)) -ne 1 ]]; then
   echo "ERROR: provide EXACTLY ONE sabotage form (--sabotage-old/--sabotage-new OR --sabotage-sed)" >&2; exit 2
 fi
@@ -121,6 +161,7 @@ emit() {
   TARGET="$TARGET" VERDICT="$1" REASON="$2" BG="$BASELINE_GREEN" \
   SA="$SAB_APPLIED" SR="$SAB_RED" RG="$RESTORE_GREEN" TR="$TEST_RAN" RS="$RESTORE_STATUS" \
   RT="${RED_TESTS:-null}" RC="${RED_COUNT:-null}" RPE="${RED_PARSE_ERRORS:-null}" \
+  SS="${SAB_SITES:-null}" SSB="${SAB_SITES_BASIS:-unmeasured}" \
   $PY -c '
 import os, json
 try:
@@ -135,6 +176,10 @@ try:
     parse_errors = json.loads(os.environ.get("RPE") or "null")
 except (ValueError, TypeError):
     parse_errors = None
+try:
+    sites = json.loads(os.environ.get("SS") or "null")
+except (ValueError, TypeError):
+    sites = None
 print(json.dumps({
   "verdict": os.environ["VERDICT"], "reason": os.environ["REASON"],
   "target": os.environ["TARGET"], "baseline_green": os.environ["BG"],
@@ -147,6 +192,15 @@ print(json.dumps({
   #         failing (compile/build artifact), which is exactly what guard-1220
   #         and guard-1631 warn a bare RED cannot distinguish.
   "red_tests": red, "red_count": red_count, "red_parse_errors": parse_errors,
+  # HOW BROAD the sabotage was. A mutation that lands at the site under test
+  # AND at N-1 others makes the RED uninformative: a predicate anchored to the
+  # site and one that merely greps the whole file both go red, so a PASS cannot
+  # tell them apart. guard-1629 covers the mirror case (sabotage lands at the
+  # WRONG site -> false accusation); this covers sabotage landing at the right
+  # site PLUS others -> false certification. basis names WHAT was counted:
+  # "occurrences" (--sabotage-old, exact) | "changed-lines" (--sabotage-sed,
+  # the only mode-independent measure) | "unmeasured" (sabotage never applied).
+  "sabotage_sites": sites, "sabotage_sites_basis": os.environ["SSB"],
 }))'
 }
 
@@ -167,19 +221,46 @@ fi
 
 # --- Step 2: apply sabotage, verify the file actually changed ---
 if [[ $have_old -eq 1 ]]; then
-  if ! TARGET="$TARGET" SAB_OLD="$SAB_OLD" SAB_NEW="$SAB_NEW" $PY -c '
+  # Emit the occurrence count on stdout so the caller can see HOW BROAD the
+  # sabotage was (captured into SAB_SITES — it must never reach the script's
+  # own stdout, which carries the single-line JSON verdict).
+  if ! SAB_SITES="$(TARGET="$TARGET" SAB_OLD="$SAB_OLD" SAB_NEW="$SAB_NEW" $PY -c '
 import os, sys
 t = os.environ["TARGET"]; old = os.environ["SAB_OLD"]; new = os.environ["SAB_NEW"]
 s = open(t, encoding="utf-8").read()
-if s.count(old) == 0:
+n = s.count(old)
+if n == 0:
     sys.exit(7)
 open(t, "w", encoding="utf-8").write(s.replace(old, new))
-'; then
+print(n)
+')"; then
     emit "FAIL" "sabotage-old string not found in target — no mutation applied, nothing proven"
     exit 1
   fi
+  SAB_SITES_BASIS="occurrences"
 else
   sed -i "$SAB_SED" "$TARGET" || { emit "FAIL" "sabotage-sed command failed"; exit 1; }
+  # --sabotage-sed runs an arbitrary sed program, so an occurrence count is not
+  # knowable; changed LINES of the original is the mode-independent breadth
+  # measure. Named separately (never let one measure masquerade as another —
+  # same posture as red_tests' null-vs-[]): occurrences counts two hits on one
+  # line as 2, changed-lines counts them as 1, and understating breadth is the
+  # unsafe direction.
+  SAB_SITES="$(A="$BACKUP" B="$TARGET" $PY -c '
+import os, difflib
+a = open(os.environ["A"], encoding="utf-8").read().splitlines()
+b = open(os.environ["B"], encoding="utf-8").read().splitlines()
+print(sum(1 for l in difflib.unified_diff(a, b, n=0)
+          if l.startswith("-") and not l.startswith("---")))
+' 2>/dev/null || echo null)"
+  # Apply this block's own invariant to its own failure path: if the breadth
+  # probe itself failed, sites is null, and naming a basis for a measurement
+  # that never happened is exactly the masquerade the comment above forbids.
+  if [[ "$SAB_SITES" =~ ^[0-9]+$ ]]; then
+    SAB_SITES_BASIS="changed-lines"
+  else
+    SAB_SITES_BASIS="unmeasured"
+  fi
 fi
 if cmp -s "$BACKUP" "$TARGET"; then
   emit "FAIL" "sabotage produced NO change (no-op mutation) — a passing test would be a false proof"
@@ -310,5 +391,13 @@ if run_test; then RESTORE_GREEN="true"; else
   exit 1
 fi
 
-emit "PASS" "mutation-proof: GREEN on real code -> RED under sabotage -> GREEN after restore; the test catches its regression and restore left no sabotage behind"
+PASS_REASON="mutation-proof: GREEN on real code -> RED under sabotage -> GREEN after restore; the test catches its regression and restore left no sabotage behind"
+# A multi-site sabotage yields a RED that any predicate touching the token
+# anywhere would also produce, so the PASS is weaker than it reads. Say so in
+# the reason rather than downgrading the verdict: the proof IS evidence, just
+# for a smaller proposition than "this test is anchored" (guard-1856).
+if [[ "${SAB_SITES:-}" =~ ^[0-9]+$ ]] && (( SAB_SITES > 1 )); then
+  PASS_REASON="${PASS_REASON}. CAVEAT: the sabotage changed ${SAB_SITES} sites (basis=${SAB_SITES_BASIS}), not one — this RED does NOT prove the test is anchored to the site under test, because a predicate that merely matches the token ANYWHERE in the file goes red too. Narrow the mutation to one site (e.g. --sabotage-sed '0,/re/s//new/') to prove anchoring."
+fi
+emit "PASS" "$PASS_REASON"
 exit 0

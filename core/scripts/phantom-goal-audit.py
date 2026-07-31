@@ -44,7 +44,16 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _paths import WORLD_DIR  # noqa: E402
+from _paths import AGENT_DIR, CORE_ROOT, WORLD_DIR  # noqa: E402
+# : never hardcode the escalation aspiration —  is the UPSTREAM
+# deployment's queue and does not exist elsewhere, so a literal files nothing.
+try:
+    from _escalation_target import resolve as _resolve_asp, source_flag as _asp_source
+    ESCALATION_ASP, _ESCALATION_ASP_VIA = _resolve_asp(CORE_ROOT, WORLD_DIR, AGENT_DIR)
+    ESCALATION_SOURCE = _asp_source(ESCALATION_ASP, WORLD_DIR, AGENT_DIR)
+except Exception:
+    ESCALATION_ASP, _ESCALATION_ASP_VIA, ESCALATION_SOURCE = (
+        "asp-115", "fallback:import-failed", "world")
 
 ORIGIN_PREFIX = "phantom-goal-audit"
 
@@ -163,7 +172,7 @@ def apply_file(result):
         script = str(Path(__file__).resolve().parent / "aspirations-add-goal.sh")
         from _runtime_bash import BASH  # rb-1472: not bare "bash"
         proc = subprocess.run(
-            [BASH, script, "--source", "world", "asp-115"],
+            [BASH, script, "--source", ESCALATION_SOURCE, ESCALATION_ASP],
             input=json.dumps(goal), capture_output=True, text=True, timeout=60,
         )
         result["apply"] = ("filed Investigate" if proc.returncode == 0

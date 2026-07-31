@@ -477,6 +477,21 @@ if [ "$AHEAD" -eq 0 ]; then
   log "origin/$BRANCH up to date (0 ahead) — nothing to push"; soft_exit 0
 fi
 
+# Age (minutes) of the OLDEST unpushed commit. Feeds BOTH the push throttle
+# below and the stranded-depth alarm's duration. Hoisted above the alarm
+# (): it used to be derived AFTER it and consumed only by the
+# throttle, so the alarm could report "54 commits" but never "6.2 hours" — and
+# duration is what separates a busy iteration from a wedge. cc-06 sat at
+# AHEAD=54 (more than double the cap) for 6.2h with this alarm firing every
+# single iteration and nobody acting on it. The accumulation was NOT silent;
+# the count simply did not convey urgency the way an elapsed time does.
+OLDEST_CT="$(git -C "$REPO" log "$UPSTREAM..$BRANCH" --format=%ct 2>/dev/null | tail -n 1 || echo "")"
+AGE_MIN=0
+case "$OLDEST_CT" in
+  ''|*[!0-9]*) AGE_MIN=0;;
+  *) NOW_CT="$(date +%s)"; AGE_MIN=$(( (NOW_CT - OLDEST_CT) / 60 )); [ "$AGE_MIN" -lt 0 ] && AGE_MIN=0;;
+esac
+
 # Stranded-depth alarm ( user correction). A push-blocked window
 # (read-only deploy key rb-3236/guard-1021, disabled push, repeated fail-soft)
 # lets AHEAD grow silently — 121 () then 281 by 2026-07-16, and the
@@ -489,16 +504,8 @@ fi
 BULK_ALARM="${ITERATION_PUSH_BULK_ALARM:-25}"
 case "$BULK_ALARM" in ''|*[!0-9]*) BULK_ALARM=25;; esac
 if [ "$AHEAD" -ge "$BULK_ALARM" ]; then
-  log "⚠ STRANDED-DEPTH ALARM: ${AHEAD} unpushed commit(s) >= ${BULK_ALARM} on ${BRANCH} — bulk-push side-effect risk (stale store bases, g-115-2362 class). ACT NOW: if pushes are failing, fix the credential/remote (rb-3236/guard-1021); if push is deliberately disabled, notify the user of the growing backlog. Do NOT let depth grow to another 281-commit unwedge (g-115-2398)."
+  log "⚠ STRANDED-DEPTH ALARM: ${AHEAD} unpushed commit(s) >= ${BULK_ALARM} on ${BRANCH}, oldest $(( AGE_MIN / 60 ))h$(( AGE_MIN % 60 ))m old — bulk-push side-effect risk (stale store bases, g-115-2362 class). ACT NOW: if pushes are failing, fix the credential/remote (rb-3236/guard-1021); if the INTEGRATE is wedged on a merge conflict that ALSO blocks the push (non-fast-forward), read the integrate log above and resolve it — that is the g-115-4253 shape; if push is deliberately disabled, notify the user of the growing backlog. Do NOT let depth grow to another 281-commit unwedge (g-115-2398)."
 fi
-
-# Age (minutes) of the OLDEST unpushed commit — freshness floor.
-OLDEST_CT="$(git -C "$REPO" log "$UPSTREAM..$BRANCH" --format=%ct 2>/dev/null | tail -n 1 || echo "")"
-AGE_MIN=0
-case "$OLDEST_CT" in
-  ''|*[!0-9]*) AGE_MIN=0;;
-  *) NOW_CT="$(date +%s)"; AGE_MIN=$(( (NOW_CT - OLDEST_CT) / 60 )); [ "$AGE_MIN" -lt 0 ] && AGE_MIN=0;;
-esac
 
 # Rate-limit: push only if enough commits accrued OR the oldest is stale enough.
 if [ "$AHEAD" -lt "$MIN_COMMITS" ] && [ "$AGE_MIN" -lt "$MAX_AGE_MIN" ]; then

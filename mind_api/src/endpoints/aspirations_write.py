@@ -1499,21 +1499,38 @@ def _file_routing_audit_investigate(ctx, goal: Dict[str, Any]) -> Optional[str]:
     if not invest_spec or not isinstance(invest_spec, dict):
         return None
 
-    asp_id = "asp-115"
-    world_live, world_base = _resolve_paths(ctx, "world")
+    # : honour the aspiration the audit module RESOLVED for this
+    # deployment (it routes through _escalation_target), and file into whichever
+    # queue actually holds it. Hardcoding "asp-115" + the world store reproduced
+    # the original bug in a new costume: on any deployment without asp-115 the
+    # id does not resolve, _find_aspiration returns None, and this function
+    # returns None — dropping the escalation SILENTLY, with no error anywhere.
+    asp_id = str(invest_spec.get("aspiration_id") or "asp-115")
+    store_live, store_base = _resolve_paths(ctx, "world")
+    try:
+        if _find_aspiration(_read_jsonl(store_live), asp_id) is None:
+            agent_live, agent_base = _resolve_paths(ctx, "agent")
+            if _find_aspiration(_read_jsonl(agent_live), asp_id) is not None:
+                store_live, store_base = agent_live, agent_base
+    except (OSError, ValueError):
+        pass  # fail-open to world — preserves the prior behaviour exactly
+    # This probe is deliberately outside the lock: it only SELECTS a store. If
+    # the queue changes between probe and lock, the locked _find_aspiration
+    # below still returns None and we fall back to the pre-existing behaviour,
+    # so the race can only reproduce the old outcome, never a wrong write.
     agent = _agent_name(ctx)
     origin_signal_val = invest_spec.get("origin_signal", "")
 
     try:
-        with file_locks.locked(world_live):
-            items = _read_jsonl(world_live)
+        with file_locks.locked(store_live):
+            items = _read_jsonl(store_live)
             found = _find_aspiration(items, asp_id)
             if found is None:
                 return None
             _, asp = found
 
             # Idempotent dedup: skip if a pending/in-progress Investigate
-            # with the same origin_signal already exists in asp-115.
+            # with the same origin_signal already exists in that aspiration.
             for existing in asp.get("goals", []) or []:
                 if (existing.get("origin_signal") == origin_signal_val
                         and existing.get("status") in (
@@ -1546,14 +1563,14 @@ def _file_routing_audit_investigate(ctx, goal: Dict[str, Any]) -> Optional[str]:
 
             asp.setdefault("goals", []).append(invest_goal)
             history.snapshot(
-                world_live, world_base, agent,
+                store_live, store_base, agent,
                 summary=f"add-goal {invest_goal['id']} (routing-audit)")
-            _atomic_write_jsonl(world_live, items)
+            _atomic_write_jsonl(store_live, items)
             changelog.append(
-                world_base, agent, world_live, "edit",
+                store_base, agent, store_live, "edit",
                 summary=f"add-goal {invest_goal['id']} (routing-audit)",
                 lines_changed=len(items))
-            _jsonl_cache().invalidate(world_live)
+            _jsonl_cache().invalidate(store_live)
         return invest_goal["id"]
     except (OSError, ValueError):
         return None
@@ -1969,6 +1986,31 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
     # wrappers can re-emit to stderr (matches add_goal). Pure-logic advisories
     # only here; gates that block live in _run_update_goal_gates above.
     warnings: List[str] = []
+
+    # Capability-absence advisory (). MIRROR of the CLI-side advisory
+    # in core/scripts/aspirations.py cmd_update_goal — guard-742: this logic
+    # lives on BOTH sides, keep them in sync or it is half-applied.
+    #
+    # THIS is the live half. aspirations-update-goal.sh is DAEMON-ONLY (no CLI
+    # fallback since the 2026-05-14 cutover), so every agent write lands here;
+    # the CLI entry serves only the rb-428 sweeps, which invoke aspirations.py
+    # directly as a subprocess. Wiring the CLI alone would have produced an
+    # advisory that never fires on the path that matters — the same defect this
+    # goal exists to fix, since exhaustive-search-gate (5 firings, all noop) and
+    # verify-before-assuming-gate (0 firings) are inert for exactly that reason.
+    #
+    # Appending to `warnings` rather than printing is what makes it REACHABLE:
+    # daemon stderr goes to the daemon log, not to the caller, but the wrapper
+    # re-emits resp["warnings"] to stderr (aspirations-update-goal.sh:185-186),
+    # which does reach the model.
+    if field in ("defer_reason", "description", "outcome_note"):
+        try:
+            from _capability_absence_patterns import advise as _cap_advise
+            _cap_msg = _cap_advise(value, field=field, goal_id=goal_id)
+            if _cap_msg:
+                warnings.append(_cap_msg)
+        except Exception:
+            pass  # advisory must never break a durable write
 
     try:
         with file_locks.locked(live_path):
@@ -2569,12 +2611,35 @@ def _validate_intent_satisfaction(
     # Evidence cardinality
     scope = asp.get("scope", "project")
     scope_min = config["min_evidence_by_scope"].get(scope, 3)
-    required = max(scope_min, math.ceil(0.5 * len(non_recurring)))
+    # Cap the ceiling by the QUALIFYING pool — keep byte-identical in intent with
+    # aspirations.py::_validate_intent_satisfaction, which carries the full rationale
+    # (). Short version: the quality loop below accepts only completed,
+    # non-recurring goals carrying verification.outcomes, so demanding
+    # ceil(0.5 * ALL non-recurring) is unsatisfiable whenever outcome coverage is
+    # under 50%. THIS copy is the one that produced the measured refusals — the
+    # daemon serves aspirations-complete-intent.sh, and the incident's quoted error
+    # matched this function's wording, not the CLI's.
+    qualifying = [
+        g for g in non_recurring
+        if g.get("status") == "completed"
+        and ((g.get("verification") or {}).get("outcomes") or [])
+    ]
+    required = max(scope_min, min(math.ceil(0.5 * len(non_recurring)), len(qualifying)))
     if len(ev_ids) < required:
+        if len(qualifying) < scope_min:
+            return False, (
+                f"aspiration {asp.get('id')} cannot be intent-closed: only "
+                f"{len(qualifying)} of {len(non_recurring)} non-recurring goals are "
+                f"completed with verification.outcomes, below the scope={scope} floor of "
+                f"{scope_min}. Supplying more evidence_goal_ids cannot satisfy this. "
+                f"Reachable exits: retire it (aspirations-retire.sh), or make every "
+                f"non-recurring goal terminal and close it normally "
+                f"(aspirations-complete.sh)."
+            )
         return False, (
             f"evidence_goal_ids has {len(ev_ids)}, scope={scope} requires "
             f">={required} (max of {scope_min}-by-scope and "
-            f"ceil(0.5 * {len(non_recurring)} non-recurring))"
+            f"min(ceil(0.5 * {len(non_recurring)} non-recurring), {len(qualifying)} qualifying))"
         )
 
     # Evidence quality
@@ -3694,6 +3759,45 @@ def _holder_session_is_live_runner(ctx, agent_name: str,
         return False
 
 
+def _cross_agent_holder_is_live(ctx, agent_name: str,
+                                holder_sid: str) -> bool:
+    """Is `holder_sid` the live runner of ANOTHER agent (`agent_name`)?
+
+    Cross-agent sibling of _holder_session_is_live_runner, which is
+    deliberately bound-agent-only (its ctx.paths.agent read would resolve the
+    CALLER's session dir for a foreign holder). This one roots the probe at
+    ctx.paths.agents_root / <holder> so the running-session-id + heartbeat
+    checks read the HOLDER's session dir. Same positive-confirmation posture:
+    every ambiguous or error path returns False, which here means "stay
+    quiet" — a wrong False reproduces today's silence, a wrong True costs one
+    spurious warn-only line. (g-115-4232)
+    """
+    try:
+        if not holder_sid or not agent_name:
+            return False
+        sess = ctx.paths.agents_root / agent_name / "session"
+        rsid_path = sess / "running-session-id"
+        hb_path = sess / "runner-heartbeat"
+        if not rsid_path.exists() or not hb_path.exists():
+            return False
+        running_sid = rsid_path.read_text(encoding="utf-8").strip()
+        if not running_sid or running_sid != holder_sid:
+            return False
+        import yaml
+        cfg_path = (ctx.paths.project_root / "core" / "config"
+                    / "aspirations.yaml")
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        stale_minutes = (cfg.get("runner_heartbeat") or {}).get("stale_minutes")
+        if not stale_minutes:
+            return False
+        import time as _time
+        age_s = _time.time() - hb_path.stat().st_mtime
+        return age_s <= (float(stale_minutes) * 60.0)
+    except Exception:
+        return False
+
+
 def _nonholder_claim_warning(ctx, goal: dict, goal_id: str,
                              op: str) -> Optional[str]:
     """Warn when `op` is invoked by a session that does NOT hold the claim.
@@ -3712,19 +3816,42 @@ def _nonholder_claim_warning(ctx, goal: dict, goal_id: str,
 
     So the non-holder path stays PERMITTED and merely becomes VISIBLE. Returns
     None (no warning) whenever the situation is routine: no SID on either side,
-    same session, a different agent (a separate concern with its own handling),
-    or a DORMANT holder — releasing a dormant session's claim is ordinary
-    cleanup, not a collision. Fail-open on any error.
+    same session, or a DORMANT holder — releasing a dormant session's claim is
+    ordinary cleanup, not a collision. Fail-open on any error.
+
+    CROSS-AGENT branch (g-115-4232): a holder that is a DIFFERENT agent used
+    to early-return None here, deferring to "a separate concern with its own
+    handling" — but no such handling existed anywhere on the complete/release
+    path (the claim side refuses cross-agent claims; the close side had zero
+    coverage). Measured incident: foxtrot's claim was falsely swept mid-
+    execution, bravo claimed legitimately, and foxtrot's unaware session then
+    completed the goal over bravo's LIVE claim with no signal at all. Now:
+    warn when the foreign holder's claim-holding session is that agent's live
+    runner (they are likely still working it); stay quiet for dormant/dead
+    foreign holders — completing an abandoned goal is ordinary supersession,
+    and the recovery sweeps must never be nagged.
     """
     try:
         holder = goal.get("claimed_by")
         holder_sid = goal.get("claimed_by_sid")
         caller_sid = (ctx.query.get("sid") or "").strip() or None
-        if not holder or not holder_sid or not caller_sid:
+        if not holder:
+            return None
+        caller_agent = _agent_name(ctx)
+        if holder != caller_agent:
+            if not _cross_agent_holder_is_live(ctx, holder, holder_sid or ""):
+                return None
+            return (f"{op} of {goal_id} was invoked by {caller_agent} — but "
+                    f"the claim is held by a DIFFERENT AGENT's LIVE session "
+                    f"({holder}, sid={holder_sid}, claimed_at="
+                    f"{goal.get('claimed_at')}). {holder}'s running loop is "
+                    f"likely still working this goal. The {op} was applied "
+                    f"anyway (warn-only) — coordinate on the board before "
+                    f"building on this outcome; legitimate for supersession "
+                    f"or hand-off, wrong for a race (g-115-4232).")
+        if not holder_sid or not caller_sid:
             return None
         if holder_sid == caller_sid:
-            return None
-        if holder != _agent_name(ctx):
             return None
         if not _holder_session_is_live_runner(ctx, holder, holder_sid):
             return None

@@ -156,6 +156,22 @@ def main(argv=None) -> int:
         else:
             print(f"Evidence error: {result['evidence_error']}")
             print(f"Reason: {result['reason']}")
+        # Mirror to stderr (g-115-3094 item c). The diagnostic above is complete
+        # and actionable, but it was STDOUT-only: measured 2026-07-30, this branch
+        # wrote 320 bytes to stdout and 0 to stderr. A caller that surfaces only
+        # stderr -- which is the norm for a wrapper that captures stdout as the
+        # gate's DATA -- saw an empty error channel and a bare exit 1, so it could
+        # not tell a malformed-evidence refusal from any other refusal. That is
+        # how one caller retried the same bad payload 3x in 47s before getting it
+        # right (alpha session aae8287f, 2026-07-19 07:57-07:58).
+        # stderr is diagnostic-only here; stdout keeps carrying the machine-readable
+        # payload unchanged, so no existing stdout parser is affected.
+        print(
+            f"[capability-gate] evidence REFUSED: {result['evidence_error']} "
+            f"-- see core/config/conventions/evidence-envelope.md for the "
+            f"required {{type,id,claim}} shape",
+            file=sys.stderr,
+        )
         return 1
 
     if args.override_agent_match:

@@ -705,8 +705,63 @@ def test_scan_absent_conf_is_silent(monkeypatch):
     _isolate_scan(monkeypatch, [])
     result = M._scan_product_repos(
         "g-115-2428", "work on the operator API", set(), set(), 48.0, 2)
+    # "behind" joined the shape in . It is present on BOTH the empty
+    # verdict and the populated result deliberately: a key that appears only on
+    # the populated branch makes every consumer write a .get() fallback, and a
+    # fallback is where a real signal goes to hide (communication-clarity r5).
     assert result == {"surfaces": [], "repos_scanned": [], "commits": [],
-                      "branch_hits": [], "pr_hits": []}
+                      "branch_hits": [], "pr_hits": [], "behind": []}
+
+
+def _behind_fixture(tmp_path, n_behind):
+    """Build a real upstream + clone, advance upstream by n_behind commits,
+    fetch. Returns the clone path. Real git, not a mock: the whole point of
+    _git_behind_count is which refs git actually resolves."""
+    up = tmp_path / "upstream"
+    up.mkdir()
+    _run_git(["-c", "init.defaultBranch=main", "init", "-q"], up)
+    _run_git(["config", "user.email", "t@t"], up)
+    _run_git(["config", "user.name", "t"], up)
+    (up / "f.txt").write_text("v1\n")
+    _run_git(["add", "."], up)
+    _run_git(["commit", "-qm", "c1"], up)
+
+    clone = tmp_path / "clone"
+    _run_git(["clone", "-q", str(up), str(clone)], tmp_path)
+    for i in range(2, 2 + n_behind):
+        (up / "f.txt").write_text(f"v{i}\n")
+        _run_git(["commit", "-qam", f"c{i}"], up)
+    _run_git(["fetch", "-q"], clone)
+    return clone
+
+
+def test_behind_count_reports_exact_lag(tmp_path):
+    #  check 1: a repo deliberately left behind origin reports the
+    # correct count. The number is the whole deliverable — 78 encodings
+    # already say "fetch first"; none of them shows how far behind you are.
+    assert M._git_behind_count(_behind_fixture(tmp_path, 3)) == 3
+
+
+def test_behind_count_zero_when_current(tmp_path):
+    #  check 2: quiet on the common case. 0 is falsy, which is what
+    # the call site branches on, so a current repo emits no advisory line.
+    assert M._git_behind_count(_behind_fixture(tmp_path, 0)) == 0
+
+
+def test_behind_count_fails_open_without_origin(tmp_path):
+    # No remote at all -> None, not an exception. This probe is advisory and
+    # must never block a claim, so every unresolvable case degrades to silence
+    # rather than raising (same posture as _git_fetch_remote above it).
+    solo = tmp_path / "solo"
+    solo.mkdir()
+    _run_git(["-c", "init.defaultBranch=main", "init", "-q"], solo)
+    _run_git(["config", "user.email", "t@t"], solo)
+    _run_git(["config", "user.name", "t"], solo)
+    (solo / "a").write_text("x")
+    _run_git(["add", "."], solo)
+    _run_git(["commit", "-qm", "x"], solo)
+    assert M._git_behind_count(solo) is None
+    assert M._git_behind_count(tmp_path / "does-not-exist") is None
 
 
 def test_since_arg_integer_minutes():

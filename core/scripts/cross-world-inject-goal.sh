@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# domain-leak-exempt: WORLD_MAP holds literal sibling-world directory names required
+# domain-leak-exempt: WORLD_ALIAS holds literal sibling-world environment-ids required
 # for M2 cross-world goal injection routing — operational values, not pedagogical examples.
+# (Was "WORLD_MAP holds literal ... directory names" until 2026-07-31; the hardcoded
+# directory map is gone — paths now resolve per-machine. Only the env-id aliases remain.)
 #
 # Cross-world M2: inject a sandboxed, human-approval-gated goal into a sibling world.
 #
@@ -21,7 +23,11 @@
 #     --shared [--dry-run]
 #
 # Flags:
-#   --target <name>       Target world name (required). Known: ayoai
+#   --target <name>       Target world (required). Alias or env-id: ayoai|claude|zds,
+#                         or any env-id under core/config/environments/ directly.
+#                         The DIRECTORY is resolved per-machine, never hardcoded:
+#                         $PEER_WORLD_<ENV_ID>, else peer_world_path: in the
+#                         registry entry. Exit 3 = not hosted on this box (normal).
 #   --title <text>        Goal title (required; include intent prefix like "Investigate:")
 #   --description <text>  Goal description / motivation (required)
 #   --priority <P>        HIGH | MEDIUM | LOW (default: MEDIUM)
@@ -40,13 +46,78 @@
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
 
-# ── Name-to-path map for known sibling worlds ────────────────────────────────
-# Add entries here as new sibling worlds become reachable.
-declare -A WORLD_MAP
-WORLD_MAP[ayoai]="C:/ZakNoCloud/AyoaiCache/Ayoai-World"
+# ── Target-world resolution (PER-MACHINE — never a hardcoded literal) ────────
+# A sibling world's directory is a filesystem path that exists on SOME machines
+# and not others (peer_board_post.py records boxes where no peer world is present
+# at all). A literal absolute path here is therefore correct on at most ONE box
+# and dead on every other: until 2026-07-31 this held a single Windows path, so
+# on every Linux box this script died before writing anything — and because the
+# SANCTIONED transport for promotion-cycle rule 2 runs through here, that rule
+# stayed technically obeyed and practically unexecutable fleet-wide. Nothing
+# surfaced it, because from inside the loop a refusal to build framework code
+# locally and a successful routing to the dev world look identical (g-115-4191).
+#
+# Resolution reuses the ESTABLISHED cross-deployment convention rather than
+# inventing a second one — core/config/conventions/cross-deployment-channel.md:
+#   1. $PEER_WORLD_<ENV_ID>  — env-id upper-cased, hyphens → underscores
+#   2. peer_world_path:      — in core/config/environments/<env-id>.yaml
+# There is deliberately NO built-in default and NO fallback. An ABSENT path is
+# diagnosable; a WRONG one writes into the wrong world, which is the
+# guard-955 / rb-2983 hazard. Not hosting a peer is NORMAL and exits 3, the same
+# contract peer-board-post.sh already uses.
+declare -A WORLD_ALIAS
+WORLD_ALIAS[ayoai]="ayoai-mind"
+WORLD_ALIAS[claude]="claude-mind"
+WORLD_ALIAS[zds]="zds-mind"
+RESOLVED_WORLD_DIR=""
+
+# ── Origin identity (G5 provenance) ──────────────────────────────────────────
+# DERIVED from ENVIRONMENT_ID — never hardcoded. This block MIRRORS
+# cross-world-post.sh:49-78, which was fixed 2026-07-30; this file was the
+# generalization remainder (guard-2078) and still read "omni@zds-mind" until
+# 2026-07-31. That literal is correct in at most one promotion tier and silently
+# forges a peer identity in every other — running from ayoai-mind stamped both
+# injected_by (G2) and cross_world_origin (G5) as zds-mind's agent.
+#
+# This mattered MORE once the WORLD_MAP fix above revived the transport: a dead
+# script stamps nothing, so reviving it without this would have converted a
+# silent no-op into silent misattribution — strictly worse.
+#
+# DIE rather than default: a record with a WRONG provenance stamp is worse than
+# no record, and G5 makes provenance mandatory (guard-68).
+ORIGIN_AGENT="${MIND_AGENT:-}"
+ORIGIN_ENV="${ENVIRONMENT_ID:-}"
+# The AGENT half gets the SAME treatment as the env half below. It used to read
+# `${MIND_AGENT:-omni}`, which is the very forgery the block above forbids:
+# a literal agent identity, correct in at most one deployment and wrong in every
+# other — and it sat two lines under a comment saying "DIE rather than default".
+# A default here is worse than the env one it mirrors, because an unset
+# MIND_AGENT is the NORMAL shape for a cron or a hand-run, i.e. exactly the
+# caller least likely to notice the stamp is a lie.
+if [ -z "$ORIGIN_AGENT" ]; then
+    echo "cross-world-inject-goal.sh: cannot resolve MIND_AGENT — refusing to inject" >&2
+    echo "  G5 (guard-68) requires a provenance stamp; defaulting the agent half to a" >&2
+    echo "  literal identity would forge a peer agent on every other deployment." >&2
+    echo "  Run from an agent session, or set MIND_AGENT explicitly." >&2
+    exit 2
+fi
+if [ -z "$ORIGIN_ENV" ] && [ -f "${PROJECT_ROOT:-.}/.env.local" ]; then
+    ORIGIN_ENV=$(grep -m1 '^ENVIRONMENT_ID=' "${PROJECT_ROOT:-.}/.env.local" 2>/dev/null \
+                 | cut -d= -f2- | tr -d '"'"'"' \r')
+fi
+if [ -z "$ORIGIN_ENV" ]; then
+    echo "cross-world-inject-goal.sh: cannot resolve ENVIRONMENT_ID — refusing to inject" >&2
+    echo "  G5 (guard-68) requires a provenance stamp; an unstamped or guessed" >&2
+    echo "  origin would misattribute this injection to another deployment." >&2
+    echo "  Set ENVIRONMENT_ID in .env.local." >&2
+    exit 2
+fi
+# `<agent>@<env-id>` — '@' not '-': every registry env-id contains a hyphen, so
+# the hyphen form cannot be split back into (agent, env). See
+# core/config/conventions/cross-deployment-channel.md.
+ORIGIN="${ORIGIN_AGENT}@${ORIGIN_ENV}"
 
 # ── Constants ────────────────────────────────────────────────────────────────
-ORIGIN="omni@zds-mind"
 M2_RATE_LIMIT=3          # G4: max goal injections per source per 24h per target
 LOCK_TIMEOUT_TRIES=50    # 50 × 100ms = 5s max wait for file lock
 TARGET_ASPIRATION="asp-115"  # Layer 1: default standard aspiration for selector-visible goal
@@ -62,7 +133,11 @@ USAGE:
     --reason "<why>" --shared [--priority MEDIUM] [--category <cat>] [--dry-run]
 
 FLAGS:
-  --target <name>       Target world name (required). Known: ayoai
+  --target <name>       Target world (required). Alias or env-id: ayoai|claude|zds,
+                        or any env-id under core/config/environments/ directly.
+                        The DIRECTORY is resolved per-machine, never hardcoded:
+                        $PEER_WORLD_<ENV_ID>, else peer_world_path: in the
+                        registry entry. Exit 3 = not hosted on this box (normal).
   --title <text>        Goal title (required; e.g. "Investigate: X" or "Idea: Y")
   --description <text>  Goal description / motivation (required)
   --priority <P>        HIGH | MEDIUM | LOW (default: MEDIUM)
@@ -106,11 +181,64 @@ USAGE
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
+# Exit 3 = "peer not reachable FROM THIS BOX". Deliberately distinct from die()'s
+# exit 1: not hosting a peer world is the COMMON, EXPECTED case on a fleet box and
+# must be branchable by callers, exactly as peer-board-post.sh already does.
+# UNREACHABLE is not UNDELIVERABLE — the diagnostic says so, because the previous
+# message ("Target world directory does not exist") read as a hard dead end and a
+# real user decision was once filed as blocked on box topology (g-115-4165).
+_peer_unreachable() {
+    local name="$1" env_id="$2" var="$3" path="$4"
+    {
+        if [ -n "$path" ]; then
+            echo "ERROR: world directory for '$name' (env-id: $env_id) does not exist: $path"
+        else
+            echo "ERROR: no world directory configured for '$name' (env-id: $env_id)."
+        fi
+        echo
+        echo "This is NORMAL and often not a bug: a peer world is a per-machine filesystem"
+        echo "path, and this box may simply not host that world."
+        echo
+        echo "If this box DOES host it, point at it (either form):"
+        echo "  export ${var}=/path/to/${env_id}/world"
+        echo "  or set  peer_world_path:  in core/config/environments/${env_id}.yaml"
+        echo
+        echo "If this box does NOT host it, the work is still deliverable — use a channel:"
+        echo "  board message : bash core/scripts/peer-board-post.sh --peer ${env_id} ..."
+        echo "  and if THAT also exits 3, post to the LOCAL coordination board addressed to"
+        echo "  the peer's agent. The peer READS this board and acts on it (measured), so an"
+        echo "  unreachable filesystem is not an undeliverable message."
+        echo "  See core/config/conventions/cross-deployment-channel.md."
+        echo
+        echo "Do NOT hand-edit a literal path into this script: a path that is right on one"
+        echo "box is wrong on every other, and a WRONG path writes into the WRONG world"
+        echo "(guard-955 / rb-2983). That is how this script came to be dead fleet-wide."
+    } >&2
+    exit 3
+}
+
+# Resolves the target world dir per-machine into RESOLVED_WORLD_DIR, or exits 3.
 resolve_target() {
     local name="$1"
-    local path="${WORLD_MAP[$name]:-}"
-    [ -z "$path" ] && die "Unknown target world '$name'. Known targets: ${!WORLD_MAP[*]}"
-    [ -d "$path" ] || die "Target world directory does not exist: $path"
+    local env_id="${WORLD_ALIAS[$name]:-$name}"
+    local var
+    var="PEER_WORLD_$(printf '%s' "$env_id" | tr '[:lower:]' '[:upper:]' | tr '-' '_')"
+    # 1. env-var override (indirect expansion; ':-' keeps `set -u` happy)
+    local path="${!var:-}"
+    # 2. registry entry. Parse with sed, NOT `cut -d:` — a peer_world_path may be
+    #    a Windows path whose drive colon `cut` would split on, silently yielding
+    #    a truncated path that then fails the -d test for the wrong reason.
+    if [ -z "$path" ]; then
+        local reg="${PROJECT_ROOT:-.}/core/config/environments/${env_id}.yaml"
+        if [ -f "$reg" ]; then
+            path=$(sed -n 's/^[[:space:]]*peer_world_path:[[:space:]]*//p' "$reg" \
+                   | head -1 | tr -d '"' | tr -d "'" | sed 's/[[:space:]]*$//')
+        fi
+    fi
+    if [ -z "$path" ] || [ ! -d "$path" ]; then
+        _peer_unreachable "$name" "$env_id" "$var" "$path"
+    fi
+    RESOLVED_WORLD_DIR="$path"
 }
 
 # G4: count injections from ORIGIN into target's aspirations.jsonl in the last 24h.
@@ -209,10 +337,13 @@ esac
 
 # Resolve target world
 resolve_target "$TARGET"
-TARGET_DIR="${WORLD_MAP[$TARGET]}"
+TARGET_DIR="$RESOLVED_WORLD_DIR"
 ASP_FILE="$TARGET_DIR/aspirations.jsonl"
 
-# G4: rate limit check
+# G4: rate limit check. BEST-EFFORT, not a guarantee: this reads the target file
+# BEFORE the lock is acquired further down, so two concurrent injections can both
+# observe "one slot left" and both write. Recorded so nobody cites G4 as an
+# enforced invariant; tightening it means moving this call inside the lock.
 check_rate_limit "$ASP_FILE"
 
 # ── Build the injected records ────────────────────────────────────────────────
@@ -323,6 +454,21 @@ acquire_lock "$LOCK_FILE"
 trap "release_lock '$LOCK_FILE'" EXIT
 
 # Write [1]: audit record (asp-xw-* with embedded goals[] — for provenance only)
+#
+# Normalize the trailing newline FIRST. `>>` concatenates onto the final line
+# when the peer's store does not end in one, silently merging the last existing
+# record and this audit record into a single unparseable line. Write [2] then
+# hits that line, its `except Exception: continue` swallows it, and the target
+# aspiration is reported NOT FOUND — so a store that was merely missing a final
+# newline loses a record AND fails the injection, with the root cause nowhere in
+# the error. A JSONL file with no trailing newline is ordinary: any writer that
+# emits records without a final separator produces one.
+# Found 2026-07-31 by the false-abort regression test, on the pre-existing
+# `>>` (g-115-4204). It was invisible until the Write [2] diagnostic in this
+# same change became reachable — before that it died bare, with no message.
+if [ -s "$ASP_FILE" ] && [ -n "$(tail -c 1 "$ASP_FILE")" ]; then
+    printf '\n' >> "$ASP_FILE"
+fi
 echo "$RECORD" >> "$ASP_FILE"
 
 # Layer 1: find next goal sequence number -- scans embedded goals in TARGET_ASPIRATION
@@ -364,12 +510,13 @@ print(f'g-{asp_num}-{max_seq + 1}')
 
 # Write [2]: inject goal into TARGET_ASPIRATION's goals[] array (in-place rewrite)
 # (g-115-1 fix: previously appended standalone records invisible to collect_candidates())
+set +e   # see the WRITE2 rc handling below -- do NOT let set -e swallow this
 WRITE2_RC=$(py -3 -c "
-import json, sys
+import json, os, sys, tempfile
 goal_id=sys.argv[1]; title=sys.argv[2]; description=sys.argv[3]
 priority=sys.argv[4]; category=sys.argv[5]; origin=sys.argv[6]
 reason=sys.argv[7]; timestamp=sys.argv[8]; audit_ref=sys.argv[9]
-target_asp=sys.argv[10]; asp_file=sys.argv[11]
+target_asp=sys.argv[10]; asp_file=sys.argv[11]; origin_agent=sys.argv[12]
 goal = {
     'id':                    goal_id,
     'title':                 title,
@@ -389,7 +536,7 @@ goal = {
     'work_class':            'unclassified',
     'goal_source':           'user',
     'intended_agent':        'either',
-    'filed_by_agent':        'omni',
+    'filed_by_agent':        origin_agent,
     'created_at':            timestamp,
 }
 output_lines = []
@@ -414,18 +561,68 @@ with open(asp_file, 'r', encoding='utf-8') as fh:
 if not found:
     print(f'ERROR: target aspiration {target_asp} not found', file=sys.stderr)
     sys.exit(1)
-with open(asp_file, 'w', encoding='utf-8', newline='\n') as fh:
-    fh.writelines(output_lines)
+
+# guard-1706: a bulk read-modify-write of a GOVERNED store belonging to ANOTHER
+# world. Two hardening steps, and the reason each is shaped this way:
+#
+# (1) Concurrency. The peer's agents write this file through the PEER's daemon
+#     and do not honour this script's spinlock, so a line appended while we were
+#     building output_lines would be silently dropped by the rewrite. Re-count
+#     immediately before the swap and ABORT rather than clobber.
+# (2) Atomicity. The previous form opened the peer's file with mode 'w', which
+#     TRUNCATES before writing: a crash in that window leaves the peer's entire
+#     goal store empty. That hazard is realized, not theoretical -- on 2026-07-09
+#     a world aspirations.jsonl went from 1366 goals to a single fixture and
+#     needed .history recovery (guard-955 / rb-2983).
+#
+# Deliberately NOT _fileops.locked_modify_jsonl, which guard-1706 otherwise
+# prescribes: that helper routes through THIS world's storage backend, and under
+# own-cloud OwnCloudBackend._s3_key derives the key from the local
+# customer_prefix+env_id rather than from the path -- so it would write the
+# PEER's content onto THIS world's S3 key. Raw filesystem I/O on the resolved
+# peer path is the correct tool here.
+with open(asp_file, 'r', encoding='utf-8') as fh:
+    lines_now = sum(1 for _ in fh)
+if lines_now != len(output_lines):
+    print(f'ERROR: {asp_file} changed while the rewrite was being built '
+          f'({len(output_lines)} lines read, {lines_now} now) -- refusing to '
+          f'clobber a concurrent write. Re-run the injection.', file=sys.stderr)
+    sys.exit(2)
+
+target_dir = os.path.dirname(os.path.abspath(asp_file)) or '.'
+fd, tmp_path = tempfile.mkstemp(dir=target_dir, prefix='.aspirations-inject-', suffix='.tmp')
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as fh:
+        fh.writelines(output_lines)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp_path, asp_file)
+except BaseException:
+    try:
+        os.unlink(tmp_path)
+    except OSError:
+        pass
+    raise
 print('ok')
 " "$SECONDARY_GOAL_ID" "$TITLE" "$DESCRIPTION" "$PRIORITY" "$CATEGORY" \
   "$ORIGIN" "$REASON" "$TIMESTAMP" "$ASP_ID" "$TARGET_ASPIRATION" "$ASP_FILE" \
-  2>&1)
+  "$ORIGIN_AGENT")
+WRITE2_EXIT=$?
+set -e
 
 release_lock "$LOCK_FILE"
 trap - EXIT
 
-if [ "$WRITE2_RC" != "ok" ]; then
-    echo "ERROR: Write [2] FAILED -- $WRITE2_RC" >&2
+# Under `set -euo pipefail`, VAR=$(cmd) inherits cmd's exit status, so a non-zero
+# python exit killed the shell at the assignment ABOVE -- before this check could
+# ever run. The diagnostic was unreachable on every failure path it was written
+# for. The old `2>&1` compounded it by capturing python's stderr INTO the
+# variable, so a failed peer write produced a bare exit 1 with no message at all.
+# stderr now flows straight to the terminal and the rc is captured explicitly.
+if [ "$WRITE2_EXIT" -ne 0 ] || [ "$WRITE2_RC" != "ok" ]; then
+    echo "ERROR: Write [2] FAILED (rc=$WRITE2_EXIT) -- ${WRITE2_RC:-see python diagnostic above}" >&2
+    echo "  Target aspiration: $TARGET_ASPIRATION in $ASP_FILE" >&2
+    echo "  Audit record $ASP_ID was already written by Write [1] and remains." >&2
     exit 1
 fi
 

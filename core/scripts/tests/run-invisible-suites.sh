@@ -31,10 +31,12 @@
 # automatically).
 #
 # Usage:
-#   bash core/scripts/tests/run-invisible-suites.sh [--list]
-#     --list  print the enumerated invisible files (both halves) and exit
+#   bash core/scripts/tests/run-invisible-suites.sh [--list | --resolve-only]
+#     --list          print the enumerated invisible files (both halves) and exit
+#     --resolve-only  print the bound-agent resolution verdict and exit
 #
-# Exit: 0 when every file passes, 1 when any fails, 0 on --list.
+# Exit: 0 when every file passes (or the run SKIPs unbound), 1 when any
+# fails, 0 on --list / --resolve-only.
 #
 # NOTE: files run SEQUENTIALLY — several main()-style suites are
 # standalone-required (rb-2078) or spawn tmp-world subprocesses that would
@@ -60,6 +62,50 @@ export STORAGE_BACKEND=local
 PER_FILE_TIMEOUT="${PER_FILE_TIMEOUT:-300}"
 
 command -v python3 >/dev/null 2>&1 || { echo "ERROR: no python3 on PATH — _paths.sh shim not active" >&2; exit 2; }
+
+# ---- Bound-agent resolution () -----------------------------------
+# The production scripts these suites invoke resolve their agent via
+# MIND_AGENT, which normally arrives through the PreToolUse bash-agent-inject
+# hook. That hook does NOT reach backgrounded Bash calls, cron, CI, or nested
+# subshells — exactly the contexts a suite runner lives in — so an unbound run
+# used to fail 6 files env-shaped (RuntimeError: wm: MIND_AGENT not set) and
+# print them under the new-reds header, camouflaging genuine reds. _paths.sh
+# cannot help: its conf fallthrough resolves WORLD_PATH only and never exports
+# MIND_AGENT. Chain (first hit wins), mirroring sibling resolvers
+# (_resolve_agent_from_sid.py, recovery-gate.sh): (1) env, (2) the resident
+# runner via a sole running-session-id, (3) the sole local-paths.conf on a
+# single-agent box. Ambiguous/empty → the dispatch half SKIPS loudly below
+# (exit 0) rather than running unbound and manufacturing reds.
+# MIND_AGENTS_ROOT is a TEST-hermeticity override only (precedent:
+# gates/goal_duplication.py) — production callers never set it.
+AGENTS_ROOT_DIR="${MIND_AGENTS_ROOT:-$(agents_root)}"
+AGENT_RESOLUTION=""
+_rsids=()
+_confs=()
+if [ -n "${MIND_AGENT:-}" ]; then
+  AGENT_RESOLUTION="env"
+else
+  shopt -s nullglob
+  _rsids=("$AGENTS_ROOT_DIR"/*/session/running-session-id)
+  _confs=("$AGENTS_ROOT_DIR"/*/local-paths.conf)
+  shopt -u nullglob
+  if [ ${#_rsids[@]} -eq 1 ]; then
+    _d="${_rsids[0]%/session/running-session-id}"
+    export MIND_AGENT="${_d##*/}"
+    AGENT_RESOLUTION="running-session-id"
+  elif [ ${#_confs[@]} -eq 1 ]; then
+    _d="${_confs[0]%/local-paths.conf}"
+    export MIND_AGENT="${_d##*/}"
+    AGENT_RESOLUTION="single-conf"
+  fi
+fi
+
+# Test/debug surface: print the resolution verdict and exit before any
+# enumeration or dispatch. This is what the hermetic regression test drives.
+if [ "${1:-}" = "--resolve-only" ]; then
+  echo "agent=${MIND_AGENT:-} resolution=${AGENT_RESOLUTION:-none}"
+  exit 0
+fi
 
 # QUARANTINE — known-red files, each with a triage verdict and an open goal.
 # Quarantined files are SKIPPED (listed loudly, never run) so the aggregate
@@ -135,6 +181,25 @@ if [ "${1:-}" = "--list" ]; then
   echo "── ${#INVISIBLE[@]} main()-style .py + ${#INVISIBLE_SH[@]} shell = $(( ${#INVISIBLE[@]} + ${#INVISIBLE_SH[@]} )) pytest-invisible file(s)"
   exit 0
 fi
+
+# Unresolvable binding: dispatching would re-manufacture the env-shaped reds
+# this resolver exists to kill, so SKIP the whole half loudly instead. Exit 0
+# is deliberate — a skip is not a failure, and the banner states the reason so
+# a reader can never mistake it for coverage (rb-5650 looks-like-coverage).
+# (--list above still works unbound: enumeration invokes nothing.)
+if [ -z "${MIND_AGENT:-}" ]; then
+  echo "════════════════════════════════════════"
+  echo "invisible-suites: SKIPPED — no resolvable agent binding (g-115-4141)"
+  echo "  MIND_AGENT unset; running-session-id files=${#_rsids[@]}, local-paths.conf files=${#_confs[@]} under $AGENTS_ROOT_DIR"
+  echo "  Running ${#INVISIBLE[@]}+${#INVISIBLE_SH[@]} suites unbound would fail env-shaped, camouflaging genuine reds."
+  echo "  Set MIND_AGENT=<name> to run this half."
+  exit 0
+fi
+
+# Always record HOW this run was bound — an env-injected run and a self-resolved
+# run are different launch contexts, and the log line is the only place that
+# distinction survives.
+echo "invisible-suites: agent=$MIND_AGENT resolution=$AGENT_RESOLUTION"
 
 PASSES=0
 FAILS=0

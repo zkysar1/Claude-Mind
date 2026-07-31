@@ -96,12 +96,25 @@ agents/*/journal/**/*.md merge=ayoai-journal-md
 # a genuine id COLLISION (both boxes allocating rb-900 — the guaranteed clash when
 # one agent identity runs on two boxes) auto-resolved to rb-900 + rb-901, no dupes.
 #
-# AN UNREGISTERED BASENAME IS A STRICT IMPROVEMENT, NOT A RISK: merge_bytes raises,
-# the driver exits 1 WITHOUT writing %A, so git keeps the conflict and the file
-# retains valid 'ours' content instead of being corrupted by markers. All three
-# cases measured (handled / unhandled / unrouted baseline). So a broad extension
-# glob is safe: a new store is covered the day its handler is registered, and is
-# no worse than today until then.
+# AN UNREGISTERED BASENAME NOW DEGRADES SAFELY (g-115-4253, 2026-07-31). merge_bytes
+# falls back to git's own 3-way text merge, accepted ONLY when it exits clean AND the
+# result still parses (plus a duplicate-YAML-key check). Disjoint edits merge and the
+# integrate proceeds; overlapping edits and add/add still exit 1 WITHOUT writing %A, so
+# git keeps the conflict and the file retains valid 'ours' content rather than markers.
+#
+# CORRECTION, kept because the superseded claim is the instructive part. This block
+# used to read "AN UNREGISTERED BASENAME IS A STRICT IMPROVEMENT, NOT A RISK ... All
+# three cases measured (handled / unhandled / unrouted baseline). So a broad extension
+# glob is safe ... no worse than today until then." Every clause was true of the FILE
+# and the conclusion was false of the BOX: an unmerged path aborts the whole integrate,
+# so ONE unhandled file stops every unrelated commit. cc-06 stranded 54 commits for 6.2h
+# behind .mind-data/meta/backpressure.yaml. And "all three cases" was a 2x2 missing its
+# fourth cell — ROUTED+disjoint rc=1 (abort) against UNROUTED+disjoint rc=0 (clean, both
+# sides kept) is a REGRESSION this glob introduced, invisible to an enumeration that felt
+# exhaustive. At fix time 167 of 253 routed files (66%) had no handler, so unregistered
+# was the steady state, not a backlog: routing grows by glob, the handler map by hand.
+# Registering a handler is still right when a store wants purpose-built commutative
+# semantics; it is no longer required merely to stop a wedge. See rb-6054, guard-2108.
 #
 # NOT merge=union: these are RMW stores (status flips, counter rollups, pruning,
 # archival) and fail the zero-deleted-lines evidence gate stated above — union

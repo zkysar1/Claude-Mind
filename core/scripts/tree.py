@@ -558,6 +558,47 @@ def compute_child_path(parent_file, child_slug):
     return normalize_virtual_path(parent_dir + "/" + child_slug + ".md")
 
 
+def warn_if_body_absent(node_key, file_field, context):
+    """: loud-warn (NEVER refuse) when a registration/enrichment
+    touches a node whose `file:` has no body on the LOCAL mirror.
+
+    Advisory-only by deliberate choice (guard-1562 enumeration): the canonical
+    /tree add flow authors the body BEFORE registering, so this stays silent
+    there; register-then-author producers (batch decompose, reflect-tree-update)
+    get one stderr line at the exact moment a bodiless registration happens —
+    the desync class's only at-write signal (3 of 1298 nodes measured bodiless,
+    so a fired warn is rare and high-precision). Fail-closed was rejected: 8+
+    non-SKILL callers legitimately register before authoring, and refusing
+    would break them all.
+
+    LOCAL-mirror check by design: under own-cloud read-through a body can exist
+    in the store of record without ever being pulled here, so the wording names
+    the local mirror and points at tree-body-presence-audit.py (g-115-2658) for
+    the store-of-record verdict. stderr only — stdout JSON is unchanged.
+    Fail-open: observability must never block a tree write."""
+    try:
+        if not file_field:
+            return
+        p = str(file_field).replace("\\", "/")
+        if p.startswith("world/"):
+            abs_p = os.path.join(str(WORLD_DIR), p[len("world/"):])
+        elif p.startswith("meta/"):
+            abs_p = os.path.join(str(META_DIR), p[len("meta/"):])
+        else:
+            abs_p = os.path.join(str(PROJECT_ROOT), p)
+        if not os.path.exists(abs_p):
+            print(
+                "WARNING [body-presence g-115-4140] {}: node '{}' registered/"
+                "enriched with file '{}' but no body exists on the LOCAL "
+                "mirror. Author the body now, or verify against the store of "
+                "record via tree-body-presence-audit.py.".format(
+                    context, node_key, file_field),
+                file=sys.stderr,
+            )
+    except Exception:
+        pass
+
+
 def get_all_leaves(tree):
     """Return all leaf nodes (empty children list)."""
     nodes = tree.get("nodes", {})
@@ -2285,6 +2326,10 @@ def cmd_set(args):
 
     locked_modify_yaml(TREE_PATH, _do_set)
 
+    # : post-lock body-presence advisory — enriching a bodiless node
+    # is the desync signature (registered, enriched, retrieved, no content).
+    warn_if_body_absent(key, (captured["node"] or {}).get("file"), "set")
+
     out = apply_defaults(captured["node"])
     out["key"] = key
     if field == "confidence":
@@ -2448,6 +2493,11 @@ def cmd_add_child(args):
         return tree
 
     locked_modify_yaml(TREE_PATH, _do_add)
+
+    # : post-lock body-presence advisory. Silent on the canonical
+    # body-first /tree add flow; fires when a registration lands with no body.
+    warn_if_body_absent(child_key, (captured["child_node"] or {}).get("file"),
+                        "add-child")
 
     # S9: log the L1 pick for this add-child (fail-open).
     _log_l1_pick_for_key(
@@ -2689,6 +2739,7 @@ def cmd_batch(args):
     captured = {"updated_nodes": [], "propagate_results": []}
     removed_slugs = []  # : collect for post-lock cleanup sweep
     added_child_keys = []  # S9: collect for post-lock L1-pick logging
+    batch_set_keys = []  # : collect for post-lock body-presence advisory
 
     def _do_batch(tree):
         if not isinstance(tree, dict) or "nodes" not in tree:
@@ -2763,6 +2814,7 @@ def cmd_batch(args):
                 # auto-bump caused index-ahead drift on metadata-field sets.
                 nodes[key] = node
                 updated_keys.add(key)
+                batch_set_keys.append(key)  # 
 
             elif op_type == "increment":
                 node = nodes[key]
@@ -2919,6 +2971,18 @@ def cmd_batch(args):
         return tree
 
     locked_modify_yaml(TREE_PATH, _do_batch)
+
+    # : post-lock body-presence advisory for nodes this batch
+    # REGISTERED (add-child) or ENRICHED (set). Deliberately excludes parents
+    # touched only by child-list bookkeeping and propagate-walked ancestors —
+    # the advisory targets the registration/enrichment surface, not reads.
+    # A key set-then-removed in the same batch is absent from updated_nodes
+    # and correctly skipped.
+    _warn_keys = set(added_child_keys) | set(batch_set_keys)
+    if _warn_keys:
+        for _n in captured["updated_nodes"]:
+            if _n.get("key") in _warn_keys:
+                warn_if_body_absent(_n["key"], _n.get("file"), "batch")
 
     # : post-lock sweep for any remove-child ops in this batch.
     _post_remove_sweep_dangling(removed_slugs)
