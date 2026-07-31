@@ -50,15 +50,20 @@ source "$SCRIPT_DIR/_paths.sh" 2>/dev/null || { echo '{"checked":0,"error":"path
 AGENT="${MIND_AGENT:-}"
 GOAL=""
 TIMEOUT_MINS=3
-ASPIRATION="asp-115"          # world framework aspiration — home for infra Unblocks (asp-001 retired)
-SOURCE="world"
+# Empty = resolve per deployment at FILING time (g-115-4166). A literal asp-115
+# is the UPSTREAM deployment's queue and exists in no other deployment, so
+# downstream every Unblock filed here failed aspiration_not_found — silently,
+# because the filing call below routes its errors to /dev/null and degrades to
+# the SG-c backstop. An explicit --aspiration/--source still wins.
+ASPIRATION=""
+SOURCE=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --agent)        AGENT="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         --goal)         GOAL="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         --timeout-mins) TIMEOUT_MINS="${2:-3}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
-        --aspiration)   ASPIRATION="${2:-asp-115}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
-        --source)       SOURCE="${2:-world}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --aspiration)   ASPIRATION="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --source)       SOURCE="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         *) shift ;;   # tolerate unknown args (fail-open posture)
     esac
 done
@@ -125,7 +130,15 @@ sys.exit(1)
         echo "[pending-deploys-gate] Unblock for ${repo}@${sha7} already queued — not re-filing" >&2
         return 2   # deduped (distinct from 0=filed / 1=file-not-confirmed) so the caller does NOT count it
     fi
-    local title desc
+    local title desc _et
+    # g-115-4166: resolve here rather than at script top — this function runs
+    # ONLY on a failed deploy, so the common clean-gate path (which returns at
+    # the no-pending-entries fast exit above) never pays for the subprocess.
+    if [ -z "$ASPIRATION" ] || [ -z "$SOURCE" ]; then
+        _et="$(bash "$SCRIPT_DIR/escalation-target.sh")" || _et="asp-115 world"
+        [ -n "$ASPIRATION" ] || ASPIRATION="${_et%% *}"
+        [ -n "$SOURCE" ] || SOURCE="${_et##* }"
+    fi
     title="Unblock: fix failed deploy ${repo}@${sha7} for ${gid:-unknown-goal}"
     desc="deploy-verify.sh reported a FAILED GitHub Actions run for ${repo} at ${sha} (pushed during ${gid:-a goal}). The pending-deploys ENFORCE gate (SG-b, g-115-2688-b) downgraded that goal's closure to not-clean. Investigate the failing run, fix it, re-push, and re-verify via deploy-verify.sh. Verdict JSON: ${verdict}"
     if TITLE="$title" DESC="$desc" OSIG="$osig" GID="${gid:-pending-deploys-gate}" python3 -c '

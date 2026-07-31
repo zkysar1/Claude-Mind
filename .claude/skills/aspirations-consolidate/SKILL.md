@@ -311,7 +311,7 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
       # All items now use the same target resolution path.
       IF item.target_node_key:
           node = {key: item.target_node_key, file: item.target_node_file}
-          verify = bash core/scripts/tree-find-node.sh --node {item.target_node_key}
+          verify = bash core/scripts/tree-read.sh --node {item.target_node_key}
           IF verify is empty:
               node=$(bash core/scripts/tree-find-node.sh --text "{item.observation}" --leaf-only --top 1)
       ELSE:
@@ -584,8 +584,17 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
            times_encountered: {cluster_size}
            procedure_name: "{common procedure description}"
            estimated_value: "medium"
+           type: <utility|analytical>   # REQUIRED (g-115-3131)
            source: "experience-mining"
            evidence_experiences: [list of experience IDs in cluster]
+         # `type` gates the forge developmental bar, so an absent value hands
+         # that decision to a default rather than to you. Classify against
+         # core/config/skill-gaps.yaml gap_types: utility = mechanizes an
+         # ALREADY-DERIVED procedure (deterministic steps, known in->out) ->
+         # CALIBRATE; analytical = the OUTPUT needs domain-mature judgment
+         # (pattern recognition, evaluation) -> EXPLOIT, the higher bar.
+         # Unsure -> write `utility` (it IS the default, so stating it costs
+         # nothing and keeps the gate's input meaningful rather than absent).
          Log: "EXPERIENCE MINING: registered gap {gap.id} from {cluster_size} similar executions in {category}"
        ELIF existing gap covers this AND gap.source != "experience-mining":
          Increment gap.times_encountered by cluster_size - 1
@@ -718,7 +727,7 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
    ### Scripted Handoff Build
 
    The LLM assembles a payload JSON with the prose fields (next_focus,
-   reasons, key_outcomes, decisions_locked) plus the structured fields
+   reasons, `session_summary.key_outcomes`, decisions_locked) plus the structured fields
    already gathered above (phase_cost_report, goal-selector output,
    blockers, debts, user_goals), then pipes it to `handoff-yaml-build.sh`
    which validates required fields, defaults optionals, and writes the
@@ -735,6 +744,22 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
    path even a < 4-entry session writes a single "session" cluster), fall back
    to the prior single linear key_outcomes list. Clear the slot after reading
    (one-shot; next session's Step 0.65 re-populates it).
+
+   **FIELD PATH — write it NESTED, at `session_summary.key_outcomes` (g-115-3385).**
+   NOT top-level `key_outcomes`. Three sources agree the nested path is canonical:
+   the schema example in `core/config/conventions/handoff-working-memory.md`, the
+   only consumer (`boot/SKILL.md` auto-continuation status line, which renders
+   `{session_summary.key_outcomes}`), and the "prior single linear key_outcomes
+   list" named in the fallback above — that prior list was already the nested one,
+   so the cluster summaries REPLACE its contents rather than creating a new
+   top-level field. `handoff-yaml-build.py::_assemble()` is a fixed 17-key
+   allowlist that carries `session_summary` through WHOLE but has no top-level
+   `key_outcomes` slot, so a top-level emission is silently discarded: it
+   validates cleanly, writes 17 fields, reports `flags: []`, and the per-cluster
+   summaries never reach the next session. That is not hypothetical — it happened
+   on the 2026-07-26 consolidation. The builder now reports any unrecognized
+   top-level key in `dropped_keys` plus a stderr WARN, so a repeat is loud rather
+   than silent, but the correct emission is nested in the first place.
 
    Required payload fields (all others optional — script defaults them):
    `session_number`, `next_focus`, `first_action.goal_id`,

@@ -842,6 +842,54 @@ def _git_fetch_remote(timeout_s=10, cwd=None):
         print(f"[goal-pickup-coord] git fetch skipped: {e}", file=sys.stderr)
 
 
+def _git_behind_count(repo_dir, timeout_s=10):
+    """How many commits repo_dir's working tree is BEHIND its origin default
+    branch, or None if it cannot be determined (g-115-3303).
+
+    Reads ONLY refs — `git symbolic-ref` + `git rev-list --count` are both
+    local, so this adds no network on top of the `_git_fetch_remote(cwd=p)`
+    that already ran for this repo. It never touches the working tree or index,
+    preserving the `_git_fetch_remote` restraint documented above (guard-741).
+
+    WHY this exists: the "pull before premise-checking" lesson is encoded 78
+    times (16 guardrails + 62 rb entries, e.g. guard-1361 / rb-3726) and every
+    one is Layer A — the agent remembering. None of them SHOWS the number. A
+    grep of a behind checkout returns zero hits and reads authoritative, which
+    is how g-335-282's premise read FALSE against a tree 9 commits stale. This
+    does not stop anyone grepping a stale tree; it removes not-knowing as the
+    excuse.
+
+    Fail-open to None at every layer: a detached HEAD, a repo with no origin,
+    an unborn branch, a timeout, or any git error yields None (no advisory)
+    rather than an exception — the probe must never block a claim."""
+    def _run(args):
+        return subprocess.check_output(
+            ["git", *args], cwd=str(repo_dir), stderr=subprocess.DEVNULL,
+            timeout=timeout_s,
+        ).decode("utf-8", "replace").strip()
+
+    try:
+        # origin/HEAD is only present when the clone set it; fall back to the
+        # two conventional names rather than guessing one.
+        upstream = ""
+        try:
+            upstream = _run(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+        except Exception:
+            for cand in ("origin/main", "origin/master"):
+                try:
+                    _run(["rev-parse", "--verify", "--quiet", cand])
+                    upstream = cand
+                    break
+                except Exception:
+                    continue
+        if not upstream:
+            return None
+        out = _run(["rev-list", "--count", f"HEAD..{upstream}"])
+        return int(out) if out.isdigit() else None
+    except Exception:
+        return None
+
+
 def _parse_name_only_log(out):
     """Parse RS/US-separated `git log --name-only` output into
     [{hash, subject, files}]. Pure; shared by the mind-repo and product-repo
@@ -1048,7 +1096,7 @@ def _scan_product_repos(goal_id, surface_text, affected_paths, keywords,
     fewer signals, never an exception (advisory probe must never block the
     claim)."""
     empty = {"surfaces": [], "repos_scanned": [], "commits": [],
-             "branch_hits": [], "pr_hits": []}
+             "branch_hits": [], "pr_hits": [], "behind": []}
     try:
         me = os.environ.get("MIND_AGENT", "")
         wp_entries = []
@@ -1066,7 +1114,8 @@ def _scan_product_repos(goal_id, surface_text, affected_paths, keywords,
         if not labels:
             return empty
         result = {"surfaces": sorted(labels), "repos_scanned": [],
-                  "commits": [], "branch_hits": [], "pr_hits": []}
+                  "commits": [], "branch_hits": [], "pr_hits": [],
+                  "behind": []}
         # Network budget follows MATCH order (full-name matches first), not
         # disk order — the live 2026-07-17 replay showed a token-family leak
         # spending all 3 slots on alphabetically-early repos while the
@@ -1080,6 +1129,19 @@ def _scan_product_repos(goal_id, surface_text, affected_paths, keywords,
         gh_ok = _gh_available() if matched_on_disk else False
         for n, p in matched_on_disk:
             _git_fetch_remote(cwd=p)
+            # Reuses the fetch above — ref-only reads, no extra network, no
+            # working-tree mutation. Quiet on the common case (current repo →
+            # 0 → nothing emitted); None means undeterminable, also quiet.
+            _behind = _git_behind_count(p)
+            if _behind:
+                result["behind"].append({"repo": n, "count": _behind})
+                print(
+                    f"[goal-pickup-coord] ADVISORY: product repo '{n}' is "
+                    f"{_behind} commit(s) behind origin — a grep of this "
+                    f"working tree is reading a stale snapshot "
+                    f"(guard-1361/rb-3726: pull before premise-checking).",
+                    file=sys.stderr,
+                )
             if gh_ok:
                 for pr in _gh_pr_hits(p, goal_id):
                     result["pr_hits"].append({"repo": n, **pr})

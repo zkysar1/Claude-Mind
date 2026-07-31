@@ -39,6 +39,17 @@ try:
 except Exception:  # pragma: no cover - _rt always importable in-tree
     _rt = None
 
+# : never hardcode the escalation aspiration —  is the UPSTREAM
+# deployment's queue and does not exist elsewhere, so a literal files nothing.
+try:
+    from _paths import AGENT_DIR, CORE_ROOT, WORLD_DIR
+    from _escalation_target import resolve as _resolve_asp, source_flag as _asp_source
+    ESCALATION_ASP, _ESCALATION_ASP_VIA = _resolve_asp(CORE_ROOT, WORLD_DIR, AGENT_DIR)
+    ESCALATION_SOURCE = _asp_source(ESCALATION_ASP, WORLD_DIR, AGENT_DIR)
+except Exception:
+    ESCALATION_ASP, _ESCALATION_ASP_VIA, ESCALATION_SOURCE = (
+        "asp-115", "fallback:import-failed", "world")
+
 
 def origin_signal_for(probe):
     """origin_signal = '<prefix>:<probe-id>' (drives dedup + traceability)."""
@@ -200,7 +211,7 @@ def convert_finding(probe, evidence, *, source="world", goals=None,
     osig = origin_signal_for(probe)
     pid = (probe.get("id") or "unknown").strip()
     on_trip = (probe.get("on_trip") or "file_goal").strip()
-    target_asp = (probe.get("target_asp") or "asp-115").strip()
+    target_asp = (probe.get("target_asp") or ESCALATION_ASP).strip()
     result = {"probe_id": pid, "origin_signal": osig, "on_trip": on_trip,
               "filed": False, "deduped": False, "goal_id": None, "error": None}
 
@@ -249,13 +260,13 @@ def main(argv=None):
     ap.add_argument("--probe-id", required=True)
     ap.add_argument("--script", default="")
     ap.add_argument("--on-trip", default="file_goal", choices=["file_goal", "post_finding"])
-    ap.add_argument("--target-asp", default="asp-115")
+    ap.add_argument("--target-asp", default=ESCALATION_ASP)
     ap.add_argument("--origin-prefix", default="monitor-probe")
     ap.add_argument("--title", default="")
     ap.add_argument("--priority", default="MEDIUM")
     ap.add_argument("--category", default="framework-architecture")
     # WORLD_AGENT_ONLY: cross-agent routes via MIND_AGENT env override ()
-    ap.add_argument("--source", default="world", choices=["world", "agent"])
+    ap.add_argument("--source", default=ESCALATION_SOURCE, choices=["world", "agent"])
     ap.add_argument("--evidence", default="")
     ap.add_argument("--evidence-file", default="")
     ap.add_argument("--dry-run", action="store_true")

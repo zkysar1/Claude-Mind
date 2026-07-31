@@ -468,6 +468,62 @@ def test_aspirations_lastachievedat_advance_preserved():
     assert g["achievedCount"] == 10
 
 
+def test_aspirations_one_sided_scalar_survives_tie():
+    # : last_selected is advanced by the SELECTION path ONLY, so an
+    # aspiration-level scalar written by any OTHER path is invisible to the
+    # ordering that decides its survival. On a TIE _order_by_ts falls to a
+    # content tiebreak the side LACKING the field can win, and dict(win) then
+    # drops it wholesale. The IDENTICAL last_selected is load-bearing here: a
+    # differing-timestamp variant passes pre-fix and proves nothing.
+    a = _rb([_asp("asp-1", [], chronic_friction=True,
+                  plateau_exempt_reason="measured")])
+    b = _rb([_asp("asp-1", [])])
+    assert _recs(a)[0]["last_selected"] == _recs(b)[0]["last_selected"]   # the tie
+    for merged in (cm.merge_aspirations(a, b), cm.merge_aspirations(b, a)):
+        rec = _recs(merged)[0]
+        assert rec["chronic_friction"] is True
+        assert rec["plateau_exempt_reason"] == "measured"
+    assert cm.merge_aspirations(a, b) == cm.merge_aspirations(b, a)
+
+
+def test_aspirations_set_once_scalar_never_cleared_by_merge():
+    # A merge is not a mutation, so it must not CLEAR what no writer clears.
+    # functionally_complete_at has one writer (aspirations-complete-review, which
+    # only ever SETS it) and one reader (precheck-eval's one-time-fire guard), so
+    # a merge-induced set -> null silently re-arms that guard. Same tie — and the
+    # None side WINS the _canon tiebreak ('n' 0x6E > '"' 0x22), which is exactly
+    # the measured incident shape.
+    setside = _rb([_asp("asp-1", [], functionally_complete_at="2026-07-30T05:25:02")])
+    nullside = _rb([_asp("asp-1", [], functionally_complete_at=None)])
+    for merged in (cm.merge_aspirations(setside, nullside),
+                   cm.merge_aspirations(nullside, setside)):
+        assert _recs(merged)[0]["functionally_complete_at"] == "2026-07-30T05:25:02"
+
+
+def test_aspirations_both_sided_scalar_keeps_lww_basepick():
+    # Scope fence: the one-sided union must NOT widen into a field-level tiebreak
+    # for keys present on BOTH sides. Lifting _merge_archived_census's _canon
+    # byte-order tiebreak to this granularity is the cross-granularity transplant
+    # guard-1153 forbids. A strictly-newer last_selected still decides.
+    old = _rb([_asp("asp-1", [], last_selected="2026-07-03T09:00:00",
+                    motivation="stale")])
+    new = _rb([_asp("asp-1", [], last_selected="2026-07-03T11:00:00",
+                    motivation="fresh")])
+    assert _recs(cm.merge_aspirations(old, new))[0]["motivation"] == "fresh"
+    assert _recs(cm.merge_aspirations(new, old))[0]["motivation"] == "fresh"
+
+
+def test_aspirations_goal_union_unchanged_by_scalar_union():
+    # Scope fence: goal-layer union semantics are measured sound (zero goal
+    # records lost) and must not move. A one-sided aspiration-level scalar must
+    # not perturb goal merging in either direction.
+    a = _rb([_asp("asp-1", [_goal("g-1-1", status="completed")],
+                  chronic_friction=True)])
+    b = _rb([_asp("asp-1", [_goal("g-1-2", status="pending")])])
+    assert _goal_ids(cm.merge_aspirations(a, b)) == {"g-1-1", "g-1-2"}
+    assert _goal_ids(cm.merge_aspirations(b, a)) == {"g-1-1", "g-1-2"}
+
+
 def test_aspirations_nonrecurring_terminal_dominates():
     # delta 2026-07-03 07:19 bug: a NEWER in-progress must NOT revert a completed.
     comp = _rb([_asp("asp-1", [_goal("g-1-1", status="completed",

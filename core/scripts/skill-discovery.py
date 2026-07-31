@@ -50,6 +50,7 @@ except ImportError:
 
 from _paths import META_DIR, WORLD_DIR, PROJECT_ROOT, agents_root
 from _dt import parse_naive_iso  # shared tzinfo-stripping naive-ISO parse ()
+from _fleet_diary import read_fleet_diaries  # roster+authoritative diary scan ()
 
 
 FORGED_PATH = WORLD_DIR / "forged-skills.yaml"
@@ -291,7 +292,7 @@ def collect_journal_skill_dates(skill_names):
     return out
 
 
-def collect_companion_script_dates(skill_names, forged_skills):
+def collect_companion_script_dates(skill_names, forged_skills, agents_base=None):
     """Scan execution-diary + board/coordination for companion-script invocations.
 
     Closes the rb-314 / g-115-798 instrumentation gap: infra-wrapper forged
@@ -375,34 +376,39 @@ def collect_companion_script_dates(skill_names, forged_skills):
     # See docstring "Diary is the authoritative invocation surface" — board
     # is intentionally excluded to keep the genuine-cold signal (e.g.
     # manage-roblox-scripts) at 0 even with historical mentions.
-    # Glob is forgiving when a fresh agent has not yet created its session/ dir.
-    # AGENTS-ROOT GLOB (): diaries live at agents/<name>/session/
-    # execution-diary.jsonl — use _paths SSOT agents_root(), NEVER
-    # PROJECT_ROOT.glob("*/...") (agents/ glob-drift bug class, CLAUDE.md sync-list).
-    scan_paths = list(agents_root().glob("*/session/execution-diary.jsonl"))
-
-    for path in scan_paths:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(rec, dict):
-                    continue
-                blob = json.dumps(rec, ensure_ascii=False)
-                matches = set(name_pattern.findall(blob))
-                if not matches:
-                    continue
-                dt = parse_iso(rec.get("timestamp") or rec.get("date"))
-                if not dt:
-                    continue
-                for basename in matches:
-                    for skill_name in script_to_skills.get(basename, []):
-                        out[skill_name].append(dt)
+    # ROSTER + AUTHORITATIVE READ (), replacing the former
+    # agents_root().glob("*/session/execution-diary.jsonl"). The glob enumerated
+    # by what the local read-through cache happened to hold, so on a cold box it
+    # silently covered a SUBSET of the fleet (measured cc-02: 1 of 5) — and once
+    # warm it covered everyone while serving STALE bytes (measured same box, same
+    # day: 5 of 5 enumerated, 4 of 5 diverged from S3). Either way this source
+    # under-reports invocations, which inflates silently_undertriggering — the
+    # same consequence CLAUDE.md's cross-agent-glob table records for the
+    #  depth-1 drift in this very file. See _fleet_diary for the
+    # measurements and why swapping the read alone cannot fix a glob.
+    # `agents_base` is the alternate-root seam (hermetic tests; mirrors
+    # scorer-override-audit's documented `root=` param). None = production.
+    for _agent_name, _diary_text in read_fleet_diaries(agents_base):
+        for line in _diary_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            blob = json.dumps(rec, ensure_ascii=False)
+            matches = set(name_pattern.findall(blob))
+            if not matches:
+                continue
+            dt = parse_iso(rec.get("timestamp") or rec.get("date"))
+            if not dt:
+                continue
+            for basename in matches:
+                for skill_name in script_to_skills.get(basename, []):
+                    out[skill_name].append(dt)
     return out
 
 

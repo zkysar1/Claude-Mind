@@ -158,9 +158,12 @@ print(json.dumps({
         if [ -z "$_sq_payload" ]; then
             echo "WARN: skill-quality staleness payload build failed; goal not filed" >&2
         else
+            # : resolve per deployment — a literal  is the
+            # UPSTREAM queue and files nothing downstream (aspiration_not_found).
+            _sq_et="$(bash "$CORE_ROOT/scripts/escalation-target.sh")" || _sq_et="asp-115 world"
             _sq_err="$(printf '%s' "$_sq_payload" \
                 | bash "$CORE_ROOT/scripts/aspirations-add-goal.sh" \
-                      --source world --aspiration asp-115 2>&1 >/dev/null)" \
+                      --source "${_sq_et##* }" --aspiration "${_sq_et%% *}" 2>&1 >/dev/null)" \
                 || echo "WARN: skill-quality staleness goal-file failed (non-fatal): ${_sq_err}" >&2
         fi
     else

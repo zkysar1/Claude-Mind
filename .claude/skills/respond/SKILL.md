@@ -235,8 +235,12 @@ mode's no-write contract is preserved.
 
 ### Priority Review Surfacing (check first — surface before other items)
 
-Read `agents/<agent>/session/pending-questions.yaml`
-IF any entry has `type: priority-review` AND `status: pending`:
+Bash: `bash core/scripts/pending-questions-read.sh --type priority-review --status pending`
+(Shape-tolerant reader — flattens the dict-wrapper / list-with-wrapper / bare /
+ mixed on-disk shapes via _load_questions, rb-1786. Do NOT hand-roll a naive
+ top-level scan of the raw YAML: it silently SKIPS wrapper-nested entries,
+ g-115-3039.)
+IF the returned JSON array is non-empty (a `type: priority-review`, `status: pending` entry exists):
   Surface prominently:
   "I've been creating aspirations autonomously and would value your input on
    priorities — say '/priority-review' or just tell me what matters most."
@@ -244,8 +248,10 @@ IF any entry has `type: priority-review` AND `status: pending`:
 
 ### Fresh-Eyes Review Surfacing (check second — distinct pull from priority-review)
 
-Read `agents/<agent>/session/pending-questions.yaml`
-IF any entry has `type: fresh-eyes-review` AND `status: pending`:
+Bash: `bash core/scripts/pending-questions-read.sh --type fresh-eyes-review --status pending`
+(Shape-tolerant reader, rb-1786 / g-115-3039 — see the note above; never
+ hand-roll a naive top-level scan.)
+IF the returned JSON array is non-empty (a `type: fresh-eyes-review`, `status: pending` entry exists; use its `id` as {pq.id}):
   Surface prominently (once per conversation):
   "I have a periodic fresh-eyes check waiting for you (id {pq.id}):
     1. Is the current Self still right?
@@ -258,8 +264,10 @@ IF any entry has `type: fresh-eyes-review` AND `status: pending`:
 
 ### Pending Questions
 
-- Read `agents/<agent>/session/pending-questions.yaml`
-- For `status: pending` items (excluding `type: priority-review` already surfaced above),
+- Bash: `bash core/scripts/pending-questions-read.sh --status pending`
+  (Shape-tolerant reader, rb-1786 / g-115-3039 — see the note above; never
+   hand-roll a naive top-level scan of the raw YAML.)
+- For the returned entries (excluding `type: priority-review` already surfaced above),
   weave 1-2 into conversation naturally
 - Or append: "By the way, I had a question: {question}"
 - When user answers, update status to `answered` and record the answer.
@@ -427,7 +435,7 @@ IF it IS a self-escalation:
     1. Register the escalation (mints the correlation-id, computes the 48h
        fail-closed timeout, appends an awaiting_reply record --- the store owner
        is the single writer):
-         Bash: bash world/scripts/self-escalation-register.sh \
+         Bash: source core/scripts/_paths.sh && bash "$WORLD_PATH/scripts/self-escalation-register.sh" \
              --action "<human-readable action, e.g. graduate curriculum cur-02 -> cur-03>" \
              --escalation-type <curriculum-graduation|capability-unlock|scope-expansion|other> \
              --session "$MIND_SID"
@@ -494,7 +502,7 @@ For `/create-aspiration from-user`, the skill itself sets the aspiration's
 | Persona change | "Be more casual" | Update persona settings in `agents/<agent>/profile.yaml` |
 | Remember fact/preference | "Remember I prefer Python" | PLACEMENT CHECK: route domain-specific stable values (endpoints, paths, service names, account IDs, brand names) to `world/conventions/*.md` per `.claude/rules/encode-stable-facts.md`. Route universal behavioral preferences to working memory or a guardrail. Only create or edit a `.claude/rules/*.md` file for universal behavioral rules that apply regardless of domain — never for a domain-specific operational fact. Then write to the chosen target (`/tree add`, `wm-set.sh domain_data`, or Edit on the appropriate convention file). NEVER use platform auto-memory. |
 | Recurring task | "Check news every week" | Add as recurring goal to an appropriate aspiration |
-| Skill creation request | "Make a skill for X" / "Create a skill" / "Forge a skill for Y" | Route through forge pipeline. Read `meta/skill-gaps.yaml`. If a gap matches the user's description, create goal: title `"Forge skill: {gap.procedure_name}"`, `skill: "/forge-skill"`, `args: "skill {gap-id}"`, priority MEDIUM, in best-fit aspiration via `aspirations-add-goal.sh`. If no matching gap exists, register a new gap in `meta/skill-gaps.yaml` (id: `gap-{next}`, status: `registered`, times_encountered: 1, procedure_name from user description, estimated_value: `medium`), then create the forge goal targeting it. If user was generic ("make a skill" with no specifics), create goal with `skill: "/forge-skill"`, `args: "list"`. Forge-skill gates (curriculum, threshold, stage) apply at execution time — do NOT pre-check here. Confirm: "I'll queue a skill forge for {description}." In UNINITIALIZED state, acknowledge verbally only. |
+| Skill creation request | "Make a skill for X" / "Create a skill" / "Forge a skill for Y" | Route through forge pipeline. Read `meta/skill-gaps.yaml`. If a gap matches the user's description, create goal: title `"Forge skill: {gap.procedure_name}"`, `skill: "/forge-skill"`, `args: "skill {gap-id}"`, priority MEDIUM, in best-fit aspiration via `aspirations-add-goal.sh`. If no matching gap exists, register a new gap in `meta/skill-gaps.yaml` (id: `gap-{next}`, status: `registered`, times_encountered: 1, procedure_name from user description, estimated_value: `medium`, `type`: `utility` or `analytical` — REQUIRED, g-115-3131: `type` gates the forge developmental bar, so an absent value hands that decision to a default rather than to you; per `core/config/skill-gaps.yaml` gap_types, utility = mechanizes an ALREADY-DERIVED procedure → CALIBRATE, analytical = the OUTPUT needs domain-mature judgment → EXPLOIT, the higher bar; unsure → `utility`, which IS the default, so stating it costs nothing), then create the forge goal targeting it. If user was generic ("make a skill" with no specifics), create goal with `skill: "/forge-skill"`, `args: "list"`. Forge-skill gates (curriculum, threshold, stage) apply at execution time — do NOT pre-check here. Confirm: "I'll queue a skill forge for {description}." In UNINITIALIZED state, acknowledge verbally only. |
 | Idea/suggestion | "What if we...?" / "I had an idea..." | Create idea goal: title `"Idea: {user's suggestion}"`, priority MEDIUM, in best-fit aspiration via `aspirations-add-goal.sh` |
 | Observation / problem report | "The processor is running on CPU" / "Logs show errors" / "This is really slow" / "X isn't working" | User observations are implicit investigation requests. Create goal: `"Investigate: {user's observation (50 chars)}"`, priority **HIGH**, in best-fit aspiration via `aspirations-add-goal.sh`. Dedup against existing goals first. Capture user's exact words in description. No confirmation needed — acknowledge and act. In UNINITIALIZED state (no world/), acknowledge verbally only. |
 | Focus | "Focus on coding" / "explore more" / "save tokens" / "go back to normal" | Update `focus` in `agents/<agent>/profile.yaml` (null clears focus) |

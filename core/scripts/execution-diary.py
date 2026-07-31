@@ -25,6 +25,7 @@ Phase markers (Tier 0, plan: i-had-one-agent-luminous-reddy.md):
 import argparse
 import json
 import os
+import re
 import sys
 from datetime import datetime, timedelta
 
@@ -331,13 +332,42 @@ def _maintain_execute_in_flight(kind, phase):
         pass
 
 
+# Goal-shaped token, e.g.  / g-xw-20260730T020622-01 / pt-003.
+# Used only for malformed-call adoption below — deliberately narrow.
+_GOAL_TOKEN_RE = re.compile(r"^(?:g|pt)-[A-Za-z0-9][A-Za-z0-9-]*$")
+
+
 def _emit_phase_marker(kind, phase, iteration, goal_id, note):
     """Shared implementation for phase-start / phase-end markers."""
     if _is_observer_session():
         sys.exit(0)
+    phase = (phase or "").strip()
     if not phase:
         print("ERROR: --phase (or positional name) is required", file=sys.stderr)
         sys.exit(2)
+    # Malformed-call adoption (): a phase quoted together with extra
+    # tokens ("phase-4-execute ") used to be accepted VERBATIM — the
+    # goal id landed in the phase string, goal_id stayed empty, and every
+    # goal_id-keyed consumer broke at once: stranded-claim-sweep's
+    # _diary_has_entry_after keep-signal found no post-claim entry and released
+    # a live mid-execution claim (the completed-without-claim incident), the
+    # exact-match _maintain_execute_in_flight below never armed the recovery
+    # suppressor, and phase-cost pairing keyed on the padded name. Split the
+    # string: first token is the phase; a goal-shaped token becomes goal_id
+    # (an explicit --goal always wins); anything else folds into the note.
+    tokens = phase.split()
+    if len(tokens) > 1:
+        phase = tokens[0]
+        extras = []
+        for tok in tokens[1:]:
+            if not goal_id and _GOAL_TOKEN_RE.match(tok):
+                goal_id = tok
+                print(f"note: adopted goal_id={tok} from space-embedded phase "
+                      f"argument (pass --goal {tok} instead)", file=sys.stderr)
+            else:
+                extras.append(tok)
+        if extras:
+            note = f"{note} {' '.join(extras)}" if note else " ".join(extras)
     entry = {
         "entry_type": kind,
         "phase": phase,

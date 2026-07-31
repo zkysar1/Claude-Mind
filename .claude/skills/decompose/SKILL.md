@@ -174,6 +174,14 @@ function decompose(goal, depth=0):
             checks: [infer_completion_check(sg)],   # machine-verifiable conditions
             preconditions: [infer_preconditions(sg)] # what must be true before execution
         }
+        # HARDENING (g-115-2786 / rb-4371): if infer_preconditions emits a
+        # structured {type:goal_completed_after, goal_id} precondition, it MUST
+        # also carry after_ref. A missing after_ref silently perma-blocks the
+        # sub-goal (predicate.py returns False forever; goal-selector excludes it
+        # while status stays pending — the g-115-2688-b/-c shape). validate_verification
+        # (aspirations.py) now REFUSES such a precondition at filing, so either emit
+        # after_ref or express the dependency via blocked_by (below), never a bare
+        # goal_completed_after.
 
         # Set dependencies (sequential sub-goals block each other)
         sg.blocked_by = [prev_sg.id] if sequential else []

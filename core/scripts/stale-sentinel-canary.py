@@ -104,7 +104,14 @@ CANARY_SLOT = "stale_sentinel_canary"
 # surface a stuck sentinel. Paired with the SCRIPT_DIR path fix in
 # _file_investigate (the rc-127 fix), the canary now reaches the daemon AND
 # names a real aspiration.
-ASP_ID = "asp-115"
+# : resolved, never literal —  is the UPSTREAM deployment's
+# queue and does not exist elsewhere, so a hardcoded id files nothing there.
+try:
+    from _escalation_target import resolve as _resolve_asp, source_flag as _asp_source
+    ASP_ID, _ASP_VIA = _resolve_asp(CORE_ROOT, WORLD_DIR, AGENT_DIR)
+    ASP_SOURCE = _asp_source(ASP_ID, WORLD_DIR, AGENT_DIR)
+except Exception:
+    ASP_ID, _ASP_VIA, ASP_SOURCE = "asp-115", "fallback:import-failed", "world"
 DEFAULT_THRESHOLD = 3
 # Re-file suppression window (). The stuck condition this canary
 # detects is INTERMITTENT (consumer-skip across a compact/stop boundary), so a
@@ -322,7 +329,7 @@ def _file_investigate(sentinel: str, stuck: int, dry_run: bool) -> dict:
     script_path = (SCRIPT_DIR / "aspirations-add-goal.sh").as_posix()
     def _run_add(extra):
         return subprocess.run(
-            bash_cmd(script_path, "--source", "world", ASP_ID, *extra),
+            bash_cmd(script_path, "--source", ASP_SOURCE, ASP_ID, *extra),
             input=json.dumps(payload),
             capture_output=True, text=True, timeout=30,
         )

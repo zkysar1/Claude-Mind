@@ -122,9 +122,13 @@ def test_living_prod_never_touches_dest_owned_forged_skill(tmp_path):
     # The dest-owned forged skill (absent from include set) is untouched.
     assert (dest / ".claude" / "skills" / "domain-thing" / "SKILL.md").read_text(
         encoding="utf-8") == FORGED_SKILL_BODY
-    # And the shared predicate would protect it even if it entered the include set.
+    # The shared predicate protects it: dest-owned (never in source_skill_names).
     pred = _engine._living_dest_preserve_predicate(dest)
     assert pred(".claude/skills/domain-thing/SKILL.md") is True
+    # And the bound is what keeps that protection from overreaching: were the
+    # same name promoted from source, it would become plantable.
+    pred_bounded = _engine._living_dest_preserve_predicate(dest, {"domain-thing"})
+    assert pred_bounded(".claude/skills/domain-thing/SKILL.md") is False
 
 
 def test_fresh_deployment_local_absent_at_dest_is_planted(tmp_path):
@@ -314,3 +318,70 @@ def test_plan_registered_skill_dir_cruft_pattern_not_flagged(tmp_path):
     assert entry["would_delete"] is False              # registry protects it
     assert entry["protection_class"] == "forged-skill"
     assert cruft["dangerous"] == []                    # correctly protected -> not flagged
+
+
+# ── PLANT: base skills in the source include set must never be frozen ──
+# The 2026-07-19..31 partial-plant incident: the  SKILL.md-presence
+# union marked EVERY dest skill dir protected, so copy-staged under
+# --living-prod silently skipped every base skill present at both ends.
+# Claude-Mind's 51 base SKILL.md files sat at 2026-07-19 content across three
+# consecutive plants (#13, #14, v2.8.7) while core/ files planted normally —
+# and the freeze is self-concealing, because each partial plant makes the dest
+# copy look MORE dest-ahead to the next plan verdict.
+
+BASE_SKILL_SRC = "# prime skill\nupstream v2 content\n"
+BASE_SKILL_DEST_STALE = "# prime skill\nstale july-19 content\n"
+
+
+def _with_base_skill(src: Path, dest: Path) -> dict:
+    """Add .claude/skills/prime/SKILL.md to both trees (src fresh, dest stale)
+    and return a manifest whose include set carries it."""
+    for root, body in ((src, BASE_SKILL_SRC), (dest, BASE_SKILL_DEST_STALE)):
+        d = root / ".claude" / "skills" / "prime"
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(body, encoding="utf-8")
+    return {
+        "include": list(MANIFEST["include"]) + [
+            {"path": ".claude/skills/prime/SKILL.md", "type": "file"}],
+        "transformations": [],
+    }
+
+
+def test_base_skill_in_include_set_is_planted_not_frozen(tmp_path):
+    """Registry-readable branch: a skill in the SOURCE include set is by
+    construction a base skill, not dest-owned — it must plant, while the
+    dest-owned forged skill in the same run stays untouched."""
+    src = _mk_source(tmp_path)
+    dest = _mk_living_dest(tmp_path)
+    manifest = _with_base_skill(src, dest)
+
+    stats = _engine.do_copy_staged(src, dest, manifest, preserve_deployment_local=True)
+    _engine.do_swap(dest)
+
+    assert (dest / ".claude" / "skills" / "prime" / "SKILL.md").read_text(
+        encoding="utf-8") == BASE_SKILL_SRC                    # updated, not frozen
+    assert ".claude/skills/prime/SKILL.md" not in stats["preserved_deployment_local"]
+    assert (dest / ".claude" / "skills" / "domain-thing" / "SKILL.md").read_text(
+        encoding="utf-8") == FORGED_SKILL_BODY                 # dest-owned survives
+    # Deployment-local preservation is unaffected by the skill bound.
+    assert (dest / "CLAUDE.md").read_text(encoding="utf-8") == DEST_CLAUDE
+
+
+def test_base_skill_plants_even_when_dest_registry_unreadable(tmp_path):
+    """protect_all_skills branch (no locatable registry — Claude-Mind's actual
+    state: no world/, no agents/*/local-paths.conf): the fail-safe covers
+    dest-owned dirs only. Source-owned base skills still plant; the dest-only
+    skill dir still survives via SKILL.md presence."""
+    src = _mk_source(tmp_path)
+    dest = _mk_living_dest(tmp_path)
+    (dest / "world" / "forged-skills.yaml").unlink()   # registry now unlocatable
+    manifest = _with_base_skill(src, dest)
+
+    stats = _engine.do_copy_staged(src, dest, manifest, preserve_deployment_local=True)
+    _engine.do_swap(dest)
+
+    assert (dest / ".claude" / "skills" / "prime" / "SKILL.md").read_text(
+        encoding="utf-8") == BASE_SKILL_SRC                    # fail-safe does not freeze base skills
+    assert ".claude/skills/prime/SKILL.md" not in stats["preserved_deployment_local"]
+    assert (dest / ".claude" / "skills" / "domain-thing" / "SKILL.md").read_text(
+        encoding="utf-8") == FORGED_SKILL_BODY                 # dest-only dir still protected

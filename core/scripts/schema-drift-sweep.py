@@ -44,6 +44,17 @@ import _paths  # noqa: E402
 from _long_path import open_long_path  # noqa: E402  —  / rb-450
 from _runtime_bash import bash_cmd  # noqa: E402  # : Windows-safe bash resolution
 
+# : never hardcode the escalation aspiration —  is the UPSTREAM
+# deployment's queue and does not exist elsewhere, so a literal files nothing.
+try:
+    from _escalation_target import resolve as _resolve_asp, source_flag as _asp_source
+    ESCALATION_ASP, _ESCALATION_ASP_VIA = _resolve_asp(
+        _paths.CORE_ROOT, _paths.WORLD_DIR, _paths.AGENT_DIR)
+    ESCALATION_SOURCE = _asp_source(ESCALATION_ASP, _paths.WORLD_DIR, _paths.AGENT_DIR)
+except Exception:
+    ESCALATION_ASP, _ESCALATION_ASP_VIA, ESCALATION_SOURCE = (
+        "asp-115", "fallback:import-failed", "world")
+
 try:
     import yaml
 except ImportError:
@@ -310,7 +321,7 @@ def process_store(store_name: str, store_cfg: dict, allowlist: list) -> dict:
 
 # ────────────────────────────── goal creation ──────────────────────────────
 
-def create_fix_goals(all_results: list, aspiration_id: str = "asp-115") -> int:
+def create_fix_goals(all_results: list, aspiration_id: str = ESCALATION_ASP) -> int:
     """For each store with drift, create one cross-agent handoff goal.
 
     Uses aspirations-add-goal.sh. Groups by store so the target agent gets a
@@ -376,7 +387,7 @@ def create_fix_goals(all_results: list, aspiration_id: str = "asp-115") -> int:
         }
         try:
             proc = subprocess.run(
-                bash_cmd(rel_script, "--source", "world", aspiration_id),
+                bash_cmd(rel_script, "--source", ESCALATION_SOURCE, aspiration_id),
                 input=json.dumps(goal),
                 text=True, capture_output=True, timeout=30,
                 cwd=str(_paths.PROJECT_ROOT),
@@ -469,8 +480,9 @@ def main(argv=None):
     ap.add_argument("--output", choices=["human", "json"], default="human")
     ap.add_argument("--create-goals", action="store_true",
                     help="create cross-agent handoff goals for each drift cluster")
-    ap.add_argument("--aspiration-id", default="asp-115",
-                    help="aspiration to file handoff goals under (default: asp-115)")
+    ap.add_argument("--aspiration-id", default=ESCALATION_ASP,
+                    help=("aspiration to file handoff goals under "
+                          f"(default: {ESCALATION_ASP}, resolved per deployment)"))
     args = ap.parse_args(argv)
 
     if not (args.all or args.store):

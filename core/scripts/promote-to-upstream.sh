@@ -8,7 +8,8 @@
 #
 # Usage:
 #   bash core/scripts/promote-to-upstream.sh --target <path-to-target-clone> \
-#        [--branch "promote/vX.Y.Z"] [--pr] [--dry-run] [--living-prod]
+#        [--branch "promote/vX.Y.Z"] [--pr] [--dry-run] [--living-prod] \
+#        [--force-past-plan "<justification>"]
 #
 #   --living-prod: force living-prod mode — pass --living-prod through to
 #     seed-transplant so the target's deployment-local files (CLAUDE.md,
@@ -19,7 +20,16 @@
 #     See guard-1056: the seed pipeline has known living-prod bugs () —
 #     verify deployment-local + forged-skill survival post-promote.
 #
-# Exit: 0 success/dry-run-ok; 1 pre-flight/invariant/chain failure; 2 usage error.
+#   --force-past-plan "<justification>": proceed even when the pre-plant --plan
+#     returns DO NOT PROMOTE (rc 21 — the destination carries framework lines
+#     this source lacks, so planting DELETES them). Requires a written reason;
+#     the valueless form is a usage error, because a bare boolean would let the
+#     gate be waved through by reflex. Prefer back-porting the prod-ahead files
+#     UP to this source (guard-119) over overriding. rc 20 (REVIEW REQUIRED) is
+#     advisory and does not need this flag. ()
+#
+# Exit: 0 success/dry-run-ok; 1 pre-flight/invariant/chain failure (now including
+#   a DO NOT PROMOTE plan verdict); 2 usage error.
 # Design: rails A.7 + omni delta M2 (never push/merge from here beyond a PR) +
 # guardrails CW2 (hard invariant) / CW4 (chain order).
 set -euo pipefail
@@ -34,7 +44,7 @@ WORLD="${WORLD_DIR:-${WORLD_PATH:-}}"
 OVERLAY="$WORLD/config/compatibility.yaml"
 FW_COMPAT="$CONFIG_DIR/compatibility.yaml"
 
-TARGET=""; BRANCH=""; DO_PR=0; DRY=0; LIVING_PROD=0
+TARGET=""; BRANCH=""; DO_PR=0; DRY=0; LIVING_PROD=0; FORCE_PAST_PLAN=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --target) TARGET="${2:-}"; [[ -z "$TARGET" || "$TARGET" == --* ]] && { echo "ERROR: --target requires a path" >&2; exit 2; }; shift 2;;
@@ -42,6 +52,11 @@ while [[ $# -gt 0 ]]; do
     --pr) DO_PR=1; shift;;
     --dry-run) DRY=1; shift;;
     --living-prod) LIVING_PROD=1; shift;;
+    # Escape hatch for a DO NOT PROMOTE verdict (). Requires a written
+    # justification — a bare boolean would let the gate be waved through by
+    # reflex, and the whole defect being fixed is a refusal nobody had to read.
+    # The justification is echoed to stdout and carried into the plant log.
+    --force-past-plan) FORCE_PAST_PLAN="${2:-}"; [[ -z "$FORCE_PAST_PLAN" || "$FORCE_PAST_PLAN" == --* ]] && { echo "ERROR: --force-past-plan requires a justification string" >&2; exit 2; }; shift 2;;
     -h|--help) sed -n '2,/^set -euo/p' "$0" | sed 's/^# \?//;/^set -euo/d'; exit 0;;
     *) echo "ERROR: unknown argument: $1" >&2; exit 2;;
   esac
@@ -236,8 +251,35 @@ fi
 # alone under-protects; the plan is the load-bearing safety checkpoint).
 if [[ $LIVING_PROD -eq 1 ]]; then
   say "living-prod: seed-transplant --plan (blast-radius report) BEFORE planting (g-306-90/guard-1056) ..."
-  bash "$SCRIPT_DIR/seed-transplant.sh" "$TARGET" --living-prod --plan \
-    || fail "seed-transplant --plan failed — cannot assess blast radius; aborting before mutation"
+  # The plan's rc IS its verdict (): 0 SAFE / 20 REVIEW REQUIRED /
+  # 21 DO NOT PROMOTE. SSOT for the vocabulary is the `plan` dispatch comment in
+  # _seed_engine.py; seed-transplant.sh propagates it verbatim.
+  #
+  # This block previously read `... --plan || fail "seed-transplant --plan
+  # failed"`. That LOOKED like a gate and was the reason a reader believed one
+  # existed, but both layers below hardcoded exit 0, so `|| fail` could only
+  # fire if bash could not launch the command. Every actual verdict — including
+  # DO NOT PROMOTE over 151 prod-ahead files on Hop 2 — passed straight through
+  # it into the plant. Distinguishing "could not assess" from "assessed, and the
+  # answer is no" is the entire fix; collapsing them is what hid it.
+  set +e
+  bash "$SCRIPT_DIR/seed-transplant.sh" "$TARGET" --living-prod --plan
+  PLAN_RC=$?
+  set -e
+  case $PLAN_RC in
+    0)  say "plan verdict: SAFE — proceeding to plant" ;;
+    20) say "plan verdict: REVIEW REQUIRED — diverged deployment-local, cruft-swept protected paths, or real orphan deletions were reported ABOVE. Not blocking (advisory), but read the report before trusting this plant." ;;
+    21)
+        if [[ -n "$FORCE_PAST_PLAN" ]]; then
+          say "plan verdict: DO NOT PROMOTE — OVERRIDDEN by --force-past-plan"
+          say "  justification: $FORCE_PAST_PLAN"
+          say "  proceeding under explicit operator override; the prod-ahead files listed above WILL lose their dest-only lines"
+        else
+          fail "plan verdict: DO NOT PROMOTE — the destination carries framework lines the seed lacks (prod-ahead; see the per-file list above). Back-port those UP to this source first (guard-119), then re-run. To override deliberately: --force-past-plan \"<why this is safe>\". Aborting before any mutation."
+        fi
+        ;;
+    *)  fail "seed-transplant --plan failed to run (exit $PLAN_RC) — cannot assess blast radius; aborting before mutation" ;;
+  esac
 fi
 
 # --- Step 4b: seed-plant into the target (commits onto the CURRENT branch) --

@@ -80,6 +80,17 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
 
+# : never hardcode the escalation aspiration —  is the UPSTREAM
+# deployment's queue and does not exist elsewhere, so a literal files nothing.
+try:
+    from _paths import AGENT_DIR, WORLD_DIR  # noqa: E402
+    from _escalation_target import resolve as _resolve_asp, source_flag as _asp_source
+    ESCALATION_ASP, _ESCALATION_ASP_VIA = _resolve_asp(CORE_ROOT, WORLD_DIR, AGENT_DIR)
+    ESCALATION_SOURCE = _asp_source(ESCALATION_ASP, WORLD_DIR, AGENT_DIR)
+except Exception:
+    ESCALATION_ASP, _ESCALATION_ASP_VIA, ESCALATION_SOURCE = (
+        "asp-115", "fallback:import-failed", "world")
+
 AUDIT_ORIGIN_SIGNAL = "investigate:reason-less-blocked-audit"
 NON_TERMINAL_OPEN = ("pending", "in-progress")
 
@@ -204,7 +215,7 @@ def _file_investigate(aspiration_id, entries):
     (g-115-3067)"""
     record = _build_investigate(entries)
     try:
-        result = _rt.aspirations_add_goal(aspiration_id, record, source="world")
+        result = _rt.aspirations_add_goal(aspiration_id, record, source=ESCALATION_SOURCE)
     except _rt.RtError as e:
         body = (e.body or str(e)).strip()
         if "goal_duplication_blocked" not in body:
@@ -214,7 +225,7 @@ def _file_investigate(aspiration_id, entries):
         # world/goal-duplication-overrides.jsonl).
         try:
             result = _rt.aspirations_add_goal(
-                aspiration_id, record, source="world",
+                aspiration_id, record, source=ESCALATION_SOURCE,
                 overrides={"Duplication": (
                     "reason-less sweep: _find_open_audit confirmed no OPEN "
                     "reconcile audit; dup-gate match is COMPLETED prior "
@@ -236,10 +247,10 @@ def main(argv=None):
                     help=("File a deduplicated reconcile Investigate when "
                           "reason-less-blocked goals are found and no open audit "
                           "already exists. Default: dry-run (report only)."))
-    ap.add_argument("--investigate-aspiration", default="asp-115",
-                    help=("World-level aspiration ID the audit Investigate is "
-                          "filed under. Default asp-115 (framework hygiene). "
-                          "Must exist in the world queue."))
+    ap.add_argument("--investigate-aspiration", default=ESCALATION_ASP,
+                    help=("Aspiration ID the audit Investigate is filed under. "
+                          f"Default {ESCALATION_ASP} (framework hygiene), resolved "
+                          "per deployment. Must exist in the resolved queue."))
     ap.add_argument("--output", choices=["json", "human"], default="json")
     args = ap.parse_args(argv)
 

@@ -101,6 +101,14 @@ def sandbox(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(its, "WORLD_ASPS", asp_jsonl)
     monkeypatch.setattr(its, "BOARD_DIR", findings.parent)
     monkeypatch.setattr(its, "_agents_root", lambda: agents_dir)
+    #  hermeticity: neutralize the addressing-resolution inputs so
+    # these reprobe pins never read the REAL registry/roster (their arbitrary
+    # target name 'zeta' is in the live collision set and would refuse).
+    # Empty registry + empty roster => empty collision set => pre-
+    # behavior, which is exactly what these tests pin.
+    monkeypatch.setattr(its, "ENV_REGISTRY_DIR", tmp_path / "no-environments")
+    monkeypatch.setattr(its, "_self_env", lambda: "test-env")
+    monkeypatch.setattr(its, "_local_roster", lambda: set())
 
     filed_calls = []
 

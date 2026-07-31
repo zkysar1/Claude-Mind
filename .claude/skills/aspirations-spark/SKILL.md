@@ -232,12 +232,95 @@ doubt between framework and domain, pick domain.
             Increment times_encountered, append to encounter_log
         ELSE:
             Register new gap: id: gap-{next}, status: registered,
-              times_encountered: 1, procedure_name, estimated_value
-        Write updated skill-gaps.yaml via meta-set.sh
+              times_encountered: 1, procedure_name, estimated_value,
+              type: <utility|analytical>
+            # `type` is REQUIRED at registration (g-115-3131). Omitting it was the
+            # root cause of 22 of 24 gaps being typeless, which silently handed the
+            # forge gate's type-default authority over the whole corpus. Classify
+            # against core/config/skill-gaps.yaml gap_types:
+            #   utility    = mechanizes an ALREADY-DERIVED procedure — deterministic
+            #                steps, known inputs->outputs (API calls, data formatting,
+            #                retrieval/orchestration workflows). Gates at CALIBRATE.
+            #   analytical = the OUTPUT depends on domain-mature judgment (pattern
+            #                recognition, evaluation, deriving semantics). Gates at
+            #                EXPLOIT — the higher bar, so choose it deliberately.
+            # When genuinely unsure, write `utility` and say why in the description:
+            # that IS the default, so recording it explicitly costs nothing and keeps
+            # the gate's input meaningful rather than absent.
+        # meta-set.sh is a DOTPATH setter — `meta-set.sh <file> <dotpath> <value>`.
+        # It does NOT take a whole-file YAML rewrite (that exits 1 with a bare
+        # usage line). `[N]` and `.N` are equivalent (meta-yaml.py:110) and a JSON
+        # array stores as a real YAML list (parse_value, g-115-1263) — guard-661.
+        #
+        # The two branches above need DIFFERENT call shapes (g-115-3462). Measured:
+        #   EXISTING gap (index i already present) — per-field dotpaths, one call each:
+        #     meta-set.sh skill-gaps.yaml "gaps[<i>].times_encountered" <n+1> --reason "<goal-id>"
+        #     meta-set.sh skill-gaps.yaml "gaps[<i>].encounter_log" '<full JSON array>'
+        #   NEW gap (the ELSE branch) — ONE call writing the WHOLE element at
+        #   index == current length, which set_field appends:
+        #     meta-set.sh skill-gaps.yaml "gaps[<len>]" '{"id":"gap-NNN","status":"registered","times_encountered":1,"type":"utility",...}'
+        #
+        # Do NOT reach for a per-field dotpath on a NEW gap: `gaps[<len>].id`
+        # raises navigate_error ("list index N out of range"), because _navigate
+        # bounds-checks INTERMEDIATE segments but not the final key. That dead end
+        # is what pushes a caller toward a whole-array read-modify-write, which is
+        # the operation that caused the g-115-3433 corruption. The whole-element
+        # append needs no RMW at all. (For CONCURRENT writers prefer
+        # _fileops.locked_modify_yaml — meta-set.sh RMW across two daemon calls is
+        # a TOCTOU race; guard-661.)
+        #
+        # A malformed payload is now REFUSED rather than silently stored: writing a
+        # non-JSON string over a list/dict-valued dotpath exits non-zero with
+        # `type_destruction` instead of replacing the whole key with one scalar
+        # (g-115-3462). If you see that error, the payload did not parse as JSON —
+        # the usual cause is a stray line of stdout captured into it.
+        Bash: meta-set.sh skill-gaps.yaml "gaps[<i>].<field>" <value>   # existing gap
+        Bash: meta-set.sh skill-gaps.yaml "gaps[<len>]" '<full gap JSON object>'  # new gap
+        # WRITE-INTEGRITY READ-BACK (g-115-3177) — check rc AND re-read. This step
+        # used to be one unchecked line, so a failed write was SILENT: the agent
+        # journalled "gap registered" and moved on while nothing landed. That is
+        # not hypothetical — on 2026-07-26 this exact write returned write_conflict
+        # 5/5 for zeta (g-335-275) because the daemon's meta-YAML path fenced
+        # against a stale local mirror with no refresh and no retry. Scope is
+        # per-object AND per-box (rb-2639/rb-3280), NOT fleet-wide — a peer's
+        # cross-box write stales only the OBSERVER's mirror — but where it lands
+        # it is PERMANENT: the 412 repeats forever against a remote that never
+        # changes, so no gap can be registered or incremented on that box,
+        # times_encountered never reaches forge_threshold, and no skill is forged
+        # from a detected capability gap. The daemon path is fixed (locked_rmw + force_fresh), but
+        # the protocol must not depend on that: assert the write, never assume it.
+        # Same rule as the forge-goal read-back below (own-cloud can echo success
+        # on a write that did not land).
+        IF meta-set.sh exit code != 0:
+            Log the FULL stderr — do NOT narrate "gap registered".
+            Re-read skill-gaps.yaml; if the gap is genuinely absent, file
+            "Investigate: skill-gaps.yaml write failed — <error code>" (HIGH,
+            participants [agent]) so this box's forge lane cannot go dark
+            unnoticed again, then continue (never block the close on it).
+        ELSE:
+            Bash: meta-read.sh skill-gaps.yaml → confirm the gap id is present
+            with a non-null `type`. If it is NOT, treat exactly as the rc!=0
+            branch: an rc=0 that did not land is the worse failure, not the
+            better one.
 
         # Check forge criteria immediately
-        # GUARD: skip already-forged gaps (Phase 9.2 also checks this)
-        IF gap.status == "forged": skip forge criteria check
+        # GUARD: skip gaps in a TERMINAL status (Phase 9.2 checks the same set).
+        # Terminal set = {forged, dismissed, satisfied-by-extension}:
+        #   forged                 — a skill was created (+ a forged-skills.yaml entry)
+        #   dismissed              — explicitly declined by /forge-skill
+        #   satisfied-by-extension — capability shipped by EXTENDING an existing
+        #                            script/skill instead of forging a new one (a
+        #                            legitimate outcome, and the honest label when
+        #                            nothing was actually forged)
+        # Test the SET, never `== "forged"` alone: any non-excluded terminal status
+        # makes its gap re-qualify as forge-ready forever, so every pass re-files the
+        # forge goal and the duplication gate blocks it on the completed original via
+        # origin_signal_completed — the same dead-end investigation, every time.
+        # Observed 2026-07-27 on gap-026 (satisfied-by-extension). Keep this set in
+        # sync with aspirations-evolve/SKILL.md Step 9; those two are the only readers
+        # of gap status and must agree. (guard-821 reinforces: a terminal status with a
+        # resolution note IS the mechanism that stops re-qualification.)
+        IF gap.status in ("forged", "dismissed", "satisfied-by-extension"): skip forge criteria check
         # Registry cross-check (g-326-09 incident; mirrors evolve Step 9): before trusting
         # gap.status, grep world/forged-skills.yaml for `gap_ref: {gap.id}`. If a forged skill
         # already references this gap, the local skill-gaps.yaml status is STALE (observed 11
@@ -549,9 +632,13 @@ When sq-009 (or sq-c09 experiential variant) fires, it creates a hypothesis goal
      and clause (e) still applies to any claim that an intervention changed
      something.
 1. Create pipeline record: `echo '<record-json>' | bash core/scripts/pipeline-add.sh` (stage defaults to discovered)
-2. Add goal to aspiration: read current aspiration via `aspirations-read.sh --id <asp-id>`,
-   add new goal with hypothesis fields, then pipe updated aspiration JSON to
-   `echo '<aspiration-json>' | bash core/scripts/aspirations-update.sh --source {source} <asp-id>`
+2. Add goal to aspiration: `echo '<goal-json>' | bash core/scripts/aspirations-add-goal.sh --source {source} <asp-id>`
+   — the canonical GATED single-goal writer. Do NOT use the read-modify-write
+   `aspirations-update.sh` whole-aspiration form here: it bypasses the
+   origin-signal and goal-duplication gates, exactly as the forge block above
+   documents for its own migration off it (g-115-2284). Two write paths in one
+   skill, one gated and one not, means the gates fire or not depending on which
+   branch the author happened to copy. (g-115-3177 spark, 2026-07-26.)
    Goal fields:
    - `participants: [agent]`
    - `skill: "/review-hypotheses --hypothesis {hypothesis_id}"`
@@ -559,6 +646,9 @@ When sq-009 (or sq-c09 experiential variant) fires, it creates a hypothesis goal
    - `horizon` — select using decision tree below
    - `resolves_no_earlier_than`, `resolves_by` from default windows for chosen horizon
    - `priority: MEDIUM` (default, agent can adjust)
+   - `origin_signal: "idea:sq-009-<slug>"` — the origin-signal gate's allowlist
+     has NO `hypothesis:` prefix, so the natural choice is REFUSED at write
+     time. Spark-generated goals use `idea:`. (Observed g-115-3297.)
 
    **Horizon selection** (pick the FIRST that matches):
    - **long** — prediction about a trend, scaling limit, or outcome that needs weeks+ to observe
@@ -595,7 +685,22 @@ When sq-009 (or sq-c09 experiential variant) fires, it creates a hypothesis goal
             goal_id: "{goal.id}"   # CANONICAL join key (experience.md schema). The recurring-close 4.25 canary and experience-read --goal match on THIS field — omitting it made template-written entries invisible to both (g-115-2511: writers drifted to source_goal by analogy with the rb/guardrail stores, false-firing force_experience_archival on deep closes)
             hypothesis_id: "{hypothesis_id}"
             tree_nodes_related: [nodes from context manifest]
-            verbatim_anchors: [key evidence excerpts that informed the prediction]
+            verbatim_anchors: [{key: "{kebab-slug}", content: "{key evidence excerpt that informed the prediction}"}, ...]
+              # OBJECTS, NOT STRINGS. The validator REFUSES a list of bare excerpts:
+              # {"error":"validation_failed","detail":"Each verbatim_anchor must have
+              # 'key' and 'content' fields"} — and experience-add.sh exits 1, so the
+              # mandated record is simply absent. This ONE line was the last site in
+              # the repo still documenting the bare-excerpt shape; every sibling
+              # (aspirations-execute:1016, respond:990, reflect-on-outcome:425,
+              # encode-session:299) and core/config/conventions/experience.md:36
+              # ("list of {key, content} objects, NOT plain strings") were already
+              # correct. It produced the SAME validation_failed twice in two days on
+              # two agents — g-335-09 (alpha, 2026-07-29, the incident behind
+              # guard-1870) and g-115-817 (echo, 2026-07-30) — because the reader
+              # follows the skill in front of them, not the convention file. Pair
+              # with guard-1870: read the record back BEFORE clearing
+              # force_experience_archival, or the failure is silent and the gate
+              # that exists to catch it is already spent.
             content_path: "agents/<agent>/experience/{experience_id}.md"
         Set experience_ref on pipeline record:
             bash core/scripts/pipeline-update-field.sh {hypothesis_id} experience_ref "{experience_id}"
@@ -799,16 +904,78 @@ When sq-015 fires after goal completion:
 
 **Handler for sq-018** — "Did this work suggest a NEW test/check/assertion to add to /verify-learning?"
 
-This catches regressions in framework-relevant code (core/, .claude/skills/,
-.claude/rules/, world/conventions/, .claude/settings.json) by proposing an
-explicit assertion in /verify-learning Step 3 BEFORE the next regression hits.
+This catches regressions in framework-relevant code (core/scripts, core/config,
+mind_api/src, .claude/skills, .claude/rules, .claude/settings.json) by proposing
+an explicit assertion in /verify-learning Step 3 BEFORE the next regression hits.
 
 When sq-018 fires after goal completion:
-1. SCOPE FILTER — was this goal framework-touching?
-   Bash: git diff --name-only HEAD@{1} HEAD 2>/dev/null | grep -E '^(core/(scripts|config)|\.claude/(skills|rules)|world/conventions|\.claude/settings\.json)' | head -20
+1. SCOPE FILTER — was THIS goal framework-touching?
+
+   NEVER scope on a reflog-relative range (guard-2001). `HEAD@{1}..HEAD` and
+   `HEAD~1..HEAD` answer "what moved since the previous reflog position", which
+   is not this goal under EITHER of the two conditions that dominate the loop:
+   after iteration-push.sh's `merge --no-edit` the range spans the merge and
+   reports a PARTNER's framework files (a FALSE POSITIVE — it invites a
+   check-goal for code this goal never touched, and severity scales with how far
+   behind the branch was); before this goal's own commit exists it reports the
+   PREVIOUS goal's files. Four independent reproductions across two agents; the
+   two framings were filed separately as g-115-3265 and g-115-3806 and are one
+   defect (g-115-3539).
+
+   Bash:
+     GID="<goal.id>"
+     # (a) The goal's OWN commits. iteration-commit.sh stamps every subject as
+     # `type(goal-id): title`, so git history IS the per-goal commit ledger —
+     # the same resolution post-state-update-gate.sh uses (L151-159), so no
+     # second resolver is introduced. `diff-tree` on a merge emits nothing by
+     # design, so a merge can never leak a partner's files in.
+     # RECURRING GOALS match MORE THAN ONE commit here — a recurring goal-id is
+     # reused every cycle, so the 48h window spans several of its runs (measured:
+     # g-001-01 matched 3 commits / 17 files). That is deliberate and bounded:
+     # it unions the SAME goal's lineage, so the residual over-fire is
+     # same-subject and small. Same trade post-state-update-gate.sh documents at
+     # L144-149 — a review producer biases to over-fire, never to silently drop.
+     # CORRECTED 2026-07-30 (g-115-1538, alpha): this comment said "never a
+     # partner's", which is FALSE for a SHARED recurring goal. A recurring
+     # goal-id belongs to the queue, not to an agent, so whichever agent closes
+     # a cycle stamps ITS commits with that id — measured on g-115-1538, where
+     # 5 matched commits spanned alpha's run AND echo's earlier same-day run,
+     # putting `agents/echo/*` in scope. The BOUND still holds (every file came
+     # from that one goal's own closes, not from unrelated partner work) and the
+     # framework filter returned empty, so no false check was proposed. But do
+     # not read the union as single-agent: on a shared recurring goal it is
+     # single-GOAL, multi-agent.
+     SHAS=$(git log --fixed-strings --grep "(${GID}):" --format=%H -n 50 --since=48.hours 2>/dev/null)
+     if [ -n "$SHAS" ]; then
+       SCOPE=$(printf '%s\n' "$SHAS" | while IFS= read -r s; do [ -n "$s" ] && git diff-tree --no-commit-id --name-only -r "$s" 2>/dev/null; done)
+     else
+       # (b) No commit yet — LEGITIMATE, not an error: guard-1320 fires this
+       # spark inline after verify, BEFORE state-update runs iteration-commit.
+       # The working tree vs HEAD is then this goal's scope.
+       SCOPE=$( { git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } )
+     fi
+     printf '%s\n' "$SCOPE" | sed '/^$/d' | sort -u \
+       | grep -E '^(core/(scripts|config)|mind_api/src|\.claude/(skills|rules)|\.claude/settings\.json)' | head -20
+
    IF empty: SKIP — do NOT increment sparks_generated. Pure non-framework
    goals (domain-specific code, application logic, product features) have
    no /verify-learning surface.
+
+   KNOWN GAP, stated here because this is where a reader checks coverage:
+   world/ and meta/ are NOT covered, and no git command can cover them — they
+   are external gitignored paths (.gitignore `/world/`), so
+   `git ls-files 'world/conventions/*'` returns 0 on every box, for every agent.
+   This regex used to LIST `world/conventions`, which is WORSE than omitting it:
+   a present-but-unmatchable arm passes the coverage review that a missing arm
+   fails, which is how it survived three reviews of this same filter.
+   Do NOT reach for world/changelog.jsonl as the replacement — MEASURED
+   2026-07-30 (alpha, cc-04) and FALSIFIED: that store holds ZERO rows whose
+   file starts with `conventions/` in its entire 35,840-row history, because
+   changelog rows are appended by _fileops.py on SCRIPT-mediated store writes
+   and convention files are edited with the Edit tool. (The query is sound —
+   positive control `changelog-read.sh --since 48h` returns 14,432 rows — so
+   this is a coverage fact, not a probe artifact.) Note `knowledge/` IS covered
+   there, since tree writes go through tree scripts. Full trace: rb-5942.
 
 2. For each changed framework file, identify a check that catches the same regression:
    - New script invariant   → grep-based assertion ("file X must contain Y")
@@ -816,6 +983,172 @@ When sq-018 fires after goal completion:
    - New behavior           → command_check + expected stdout/stderr
    - New convention rule    → assertion that the documented rule holds in code
    - New hook / integration → run-once verification that wiring is live
+
+2.1. ROUTE BEFORE YOU FILE — two questions that end the spark with NOTHING, which is
+   a first-class outcome and was undocumented until 2026-07-30. Ask both:
+
+   Q1. IS THIS INVARIANT ALREADY PINNED BY A SUITE-COLLECTED TEST? If the same goal
+       (or any prior one) added a pytest/shell test that fails when this regression
+       returns, a grep-based verify-learning check DUPLICATES a test that already
+       runs in the full suite — with strictly less power, since a grep cannot express
+       a negative assertion or a mutation-sensitivity pin.
+   Q2. WHICH SUITE OWNS THE FILE THIS INVARIANT LIVES IN, and is /verify-learning
+       actually that suite? /verify-learning is FRAMEWORK-scoped. An invariant about
+       a DOMAIN script (`world/scripts/**`) belongs in the domain's own suite per
+       `.claude/rules/domain-free-examples.md` — filing it here adds to a sealed lane
+       AND puts the check where it does not belong.
+
+   If Q1 is yes, or Q2 routes elsewhere: SKIP steps 2.5 and 3 entirely, and do NOT
+   run steps 4-5 as written. Log ONE accurate line instead — "sq-018: no spark —
+   <invariant> is pinned by <test>" or "... routed to <suite>, not /verify-learning" —
+   and do NOT increment sparks_generated, mirroring step 1's scope-filter SKIP. Do NOT
+   file, and do NOT append to a drain goal.
+   (Step 4's template asserts "proposed verify-learning check for <file>", which is
+   FALSE on a decline, and step 5 would credit sq-018 with a spark it did not produce,
+   inflating the yield_rate that the retire/promote review reads. Caught on this step's
+   FIRST live firing — g-115-3936's own close, where the route landed on pytest — so
+   following "continue to steps 4-5" verbatim would have written a false evolution-log
+   line and a phantom spark. A decline is a first-class outcome; it must not be
+   book-kept as a spark.)
+
+   WHY THIS EXISTS: four consecutive sq-018 evaluations DECLINED to file — bravo
+   g-115-3934 (07-29), foxtrot g-115-4062 (07-30), bravo g-115-4084 (07-30), alpha
+   g-115-4104 (07-30) — every one of them for a reason on this list, and every one
+   re-derived from scratch because the handler encoded only two outcomes: file a
+   singleton, or file a drain. Declining was correct all four times and cost four
+   agents the same deliberation. This step is upstream of the lane-depth counter,
+   which is the point: 2.5 can only choose HOW to file, so it can never reduce
+   arrivals. Cutting them at the source is the half no drain round can reach.
+
+2.5. LANE-DEPTH GATE (g-115-3468, 2026-07-28) — make this producer self-limiting.
+   sq-018 fires on EVERY goal close and step 3 files a NEW Maintain goal each time, with
+   no awareness of how many already wait. The consumer is a single starved MEDIUM goal that
+   loses every scoring contest, so the lane grows MONOTONICALLY: 11 pending on 2026-07-27,
+   18 later that day, 28 on 2026-07-28. Worse, it is SELF-SEALING — every goal of this shape
+   inherits the same boilerplate, so the goal-duplication gate's structural_overlap blocks
+   each NEW arrival against its siblings. Both alpha and zeta hit that block and correctly
+   declined to override. So the lane could only grow via override and could not drain via
+   singletons. That is the additive-only ratchet `.claude/rules/learning-philosophy.md`
+   rule 5 names, and it is a PRODUCER defect, not 28 independent goal failures.
+
+   FOUR MEASURED DEFECTS IN THIS GATE, all fixed below (g-115-3936, six agents,
+   2026-07-29..30). Read them before changing the probe — each one made the gate
+   report confidently on something it could not see:
+
+   (a) THE COUNTER WAS NEAR-DISJOINT FROM THE POPULATION IT MODELS. It counted
+       `origin_signal ^= maintain:sq-018`; what actually seals the lane is any open
+       goal the duplication gate blocks against — i.e. anything citing
+       verify-learning. Measured 16% visibility (6/38), then 20% (9/45), then
+       (bravo, cc-05, 2026-07-30) narrow=10 vs content-derived=26 with an
+       INTERSECTION OF ONLY 6 and a union of 30. So it was not undercounting a
+       nested subset; it was counting a different set. guard-1802 one layer up: a
+       self-limiting predicate narrower than the gate that REFUSES its output.
+   (b) THE DRAIN PROBE COULD NOT SEE A DRAIN THAT WORKED. It filtered to open
+       statuses, so "drain filed, executed, completed" and "nobody ever touched
+       this lane" both returned empty — and the ELSE branch below reads that as
+       "NOTHING is draining it." Success removed the evidence of success, so the
+       better the drain cadence worked the more confidently the gate re-prescribed
+       it. Seven drain rounds were filed this way (rb-5977).
+   (c) THE origin_signal COLLIDED WITH ITSELF BY CONSTRUCTION. It templated on
+       LANE_DEPTH, which is not monotonic — it drops on each drain and re-climbs.
+       So the gate regenerated an identical signal every time the lane re-reached a
+       depth it had already drained at, and `origin_signal_completed` refused it
+       every time. The gate could never file a drain at any depth it had drained at
+       before. Combined with (a): the counter picked a branch, and that branch could
+       not write.
+   (d) THE THRESHOLD WAS TUNED AGAINST THE NARROW COUNT. 8 was chosen when the
+       counter read 6. On the wide count it is meaningless. Note the direction:
+       widening makes this gate MORE willing to consolidate, not less — which is
+       correct, because the lane is genuinely sealed, but it means the DECLINE
+       branch below (not the threshold) is now the load-bearing control.
+
+   Measure the lane, then route. ONE read supplies all four signals — do not add a
+   second call:
+   Bash: bash core/scripts/aspirations-read.sh --source world --id asp-115 2>/dev/null | py -3 -c "
+   import sys,json,datetime
+   raw=sys.stdin.read(); i=raw.find('{')
+   d=json.loads(raw[i:])
+   goals=d.get('goals') or []
+   open_=[g for g in goals if g.get('status') in ('pending','in-progress')]
+   # (a) WIDE counter: the population the duplication gate actually blocks against.
+   #     Text-based, matching the refusing gate, NOT an origin_signal proxy.
+   def cites(g):
+       return 'verify-learning' in ((g.get('title') or '')+' '+(g.get('description') or '')).lower()
+   lane=[g for g in open_ if cites(g)]
+   narrow=[g for g in open_ if (g.get('origin_signal') or '').startswith('maintain:sq-018')]
+   isdrain=lambda g:(g.get('origin_signal') or '').startswith('maintain:drain-verify-learning-check-lane')
+   drain=[g for g in open_ if isdrain(g)]
+   # (b) A drain that COMPLETED recently means the lane is being serviced. An
+   #     open-only probe cannot distinguish that from 'never drained'.
+   cut=(datetime.datetime.now()-datetime.timedelta(hours=48)).isoformat()
+   recent=[g for g in goals if isdrain(g) and g.get('status')=='completed'
+           and str(g.get('completed_at') or '') >= cut]
+   print('LANE_DEPTH=%d' % len(lane))
+   print('LANE_NARROW=%d' % len(narrow))
+   print('DRAIN_GOAL=%s' % (drain[0]['id'] if drain else ''))
+   print('DRAIN_RECENT=%s' % ','.join(g['id'] for g in recent))
+   "
+
+   Report BOTH counts in the log line. LANE_NARROW is kept only so a reader can see
+   how far the old proxy diverged; it must never drive a branch again.
+
+   IF LANE_DEPTH < 15:
+       Proceed to step 3 — file a normal singleton. A shallow lane drains fine
+       one-at-a-time and singletons keep per-check provenance sharpest.
+       (15, not 8: 8 was calibrated against the narrow counter's ~6. Against the
+       wide population — observed 26, 30, 38, 45 — anything below ~15 is a lane
+       that singletons can still clear.)
+   ELIF DRAIN_GOAL is non-empty:
+       # APPEND to the open drain goal instead of filing a 29th singleton. This is
+       # exactly what alpha and zeta each did by hand when the duplication gate
+       # blocked them; step 2.5 makes it the default rather than a lucky judgment call.
+       Read the drain goal's current description, then append a dated block naming
+       the proposed check, its assertion, and the source goal id:
+       Bash: bash core/scripts/aspirations-update-goal.sh --source world <DRAIN_GOAL> description "<existing description>
+
+       -- ADDENDUM (<agent>, <today>, sq-018 spark on <goal.id>) --
+       CHECK TO ADD: <one-line assertion>
+       WHY: <what regression it catches>"
+       Log: "sq-018: lane depth <LANE_DEPTH> (narrow <LANE_NARROW>) >= 15 — appended to open drain goal <DRAIN_GOAL> instead of filing singleton #<LANE_DEPTH+1>"
+       SKIP step 3 (no new goal), then continue to steps 4-5 normally.
+   ELIF DRAIN_RECENT is non-empty:
+       # (b) No drain is OPEN, but one COMPLETED within 48h — so the lane IS being
+       # serviced and filing an (N+1)th round is the treadmill, not the fix. The old
+       # open-only probe could not reach this branch at all: a drain that ran and
+       # closed looked exactly like a lane nobody had touched, so success erased its
+       # own evidence and the gate re-prescribed the drain it had just been given.
+       # ORDER IS LOAD-BEARING: this sits BELOW the append branch on purpose. When a
+       # drain is open, appending keeps the check; declining would discard it. Only
+       # when there is nowhere to put it does declining become the right answer.
+       Record the check where its subject already has an owning suite (the ROUTING
+       question in step 2.1), else carry it in your own goal's close notes.
+       Log: "sq-018: lane depth <LANE_DEPTH> (narrow <LANE_NARROW>), no open drain, but <DRAIN_RECENT> completed within 48h — declining to file an (N+1)th drain round"
+       SKIP step 3, then continue to steps 4-5 normally.
+   ELSE:
+       # Lane is deep, no drain is open, and none completed in 48h. File the DRAIN
+       # goal (not another singleton), carrying this check as its first item.
+       # (c) origin_signal MUST NOT encode LANE_DEPTH. It did until 2026-07-30, and
+       # because LANE_DEPTH falls on each drain and re-climbs, the gate regenerated
+       # an identical signal at every repeat depth — which origin_signal_completed
+       # then refused against the earlier round, forever. Use a DATE, which is
+       # monotonic, so round N is never mistaken for round N-1:
+       #   maintain:drain-verify-learning-check-lane-<YYYYMMDD>
+       File a drain goal titled
+       "Drain the stuck verify-learning check lane — <LANE_DEPTH> open goals cite it, batch them in one pass"
+       with priority HIGH (a blocked lane outranks any single check it contains),
+       participants ["agent"], category framework-hygiene, and a description that
+       enumerates the pending sibling ids + this check. Then continue to steps 4-5.
+       State in the description that LANE_DEPTH is the WIDE count and name the
+       narrow count beside it — a successor who sees only one number cannot tell
+       which population the round was scoped against, which is how rounds 1-6 each
+       drained a subset and reported the lane clear.
+
+   The threshold is 15 on the WIDE count: below it, independent singletons are
+   individually claimable and carry the sharpest provenance; at or above it, the
+   duplication gate has effectively sealed the lane and consolidation is the ONLY
+   path that shrinks it. But treat the threshold as the weaker control — on the wide
+   population the gate will nearly always be above it, so what actually prevents a
+   treadmill is the DRAIN_RECENT decline branch plus step 2's routing question.
 
 3. FILE the check as a Maintain-style goal under asp-115 (framework hygiene). The goal
    exists for SCOPE-DISCIPLINE -- adding the check inline during THIS goal's spark would

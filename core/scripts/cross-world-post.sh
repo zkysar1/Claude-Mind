@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# domain-leak-exempt: functional cross-world path map; WORLD_MAP below holds literal
-# sibling-world directory names required for board cross-post routing - operational
-# values, not pedagogical examples.
+# domain-leak-exempt: WORLD_ALIAS below holds literal sibling-world environment-ids
+# required for board cross-post routing - operational values, not pedagogical examples.
+# (Was "WORLD_MAP holds literal ... directory names" until 2026-07-31; the hardcoded
+# directory map is gone - paths now resolve per-machine. Only the env-id aliases remain.)
 # Cross-world influence: post a provenance-stamped message to a sibling
 # Mind world's board, or inject a sandboxed aspiration/goal.
 #
@@ -27,12 +28,14 @@
 # ── PREFER core/scripts/peer-board-post.sh FOR BOARD POSTS ─────────────
 # For plain board posts to a peer, use `peer-board-post.sh`: it resolves the
 # target from the `core/config/environments/*.yaml` registry and pins the PEER's
-# storage backend before writing. THIS script routes through the hand-maintained
-# WORLD_MAP below — a literal absolute path that is correct only on the machine
-# it was written for (the single entry is a Windows path; it does not resolve on
-# a Linux box), and it inherits the CALLER's storage backend, which is the
-# guard-955 / rb-2983 hazard when the two deployments differ — as ayoai-mind
-# (own-cloud) and zds-mind (local) do, deliberately and by user directive.
+# storage backend before writing. As of 2026-07-31 THIS script resolves its target
+# from the SAME sources (env var / registry `peer_world_path:`) rather than the
+# hand-maintained literal it used to carry — that literal was a Windows path and
+# resolved on no Linux box (g-115-4191). The REMAINING reason to prefer
+# peer-board-post.sh is unchanged and is the important one: this script still
+# inherits the CALLER's storage backend, which is the guard-955 / rb-2983 hazard
+# when the two deployments differ — as ayoai-mind (own-cloud) and zds-mind
+# (local) do, deliberately and by user directive.
 #
 # What is NOT yet available elsewhere: `--inject-goal`. Until an equivalent
 # exists, this script remains the only aspiration/goal injection path, which is
@@ -41,10 +44,24 @@
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
 
-# ── Name-to-path map for known sibling worlds ──────────────────────────
-# Add entries here as new sibling worlds become reachable.
-declare -A WORLD_MAP
-WORLD_MAP[ayoai]="C:/ZakNoCloud/AyoaiCache/Ayoai-World"
+# ── Target-world resolution (PER-MACHINE — never a hardcoded literal) ──
+# A sibling world's directory exists on SOME machines and not others, so a
+# literal absolute path is correct on at most ONE box and dead on every other.
+# Until 2026-07-31 this held a single Windows path and died before writing on
+# every Linux box. Resolution reuses the ESTABLISHED convention rather than a
+# second one — core/config/conventions/cross-deployment-channel.md:
+#   1. $PEER_WORLD_<ENV_ID>  — env-id upper-cased, hyphens → underscores
+#   2. peer_world_path:      — in core/config/environments/<env-id>.yaml
+# NO default and NO fallback: an absent path is diagnosable, a WRONG one writes
+# into the wrong world (guard-955 / rb-2983). Unreachable exits 3, matching
+# peer-board-post.sh. Kept byte-identical to the block in
+# cross-world-inject-goal.sh on purpose — these two drifted once already
+# (its ORIGIN fix landed here 2026-07-30 and not there, guard-2078).
+declare -A WORLD_ALIAS
+WORLD_ALIAS[ayoai]="ayoai-mind"
+WORLD_ALIAS[claude]="claude-mind"
+WORLD_ALIAS[zds]="zds-mind"
+RESOLVED_WORLD_DIR=""
 
 # ── Origin identity (G5 provenance) ────────────────────────────────────
 # DERIVED from ENVIRONMENT_ID — never hardcoded. This file is promoted
@@ -58,8 +75,22 @@ WORLD_MAP[ayoai]="C:/ZakNoCloud/AyoaiCache/Ayoai-World"
 #
 # DIE rather than default: a post with a WRONG provenance stamp is worse than
 # no post, and G5 makes provenance mandatory (guard-68).
-ORIGIN_AGENT="${MIND_AGENT:-omni}"
+ORIGIN_AGENT="${MIND_AGENT:-}"
 ORIGIN_ENV="${ENVIRONMENT_ID:-}"
+# The AGENT half gets the SAME treatment as the env half below. It used to read
+# `${MIND_AGENT:-omni}`, which is the very forgery the block above forbids:
+# a literal agent identity, correct in at most one deployment and wrong in every
+# other — and it sat two lines under a comment saying "DIE rather than default".
+# A default here is worse than the env one it mirrors, because an unset
+# MIND_AGENT is the NORMAL shape for a cron or a hand-run, i.e. exactly the
+# caller least likely to notice the stamp is a lie.
+if [ -z "$ORIGIN_AGENT" ]; then
+    echo "cross-world-post.sh: cannot resolve MIND_AGENT — refusing to post" >&2
+    echo "  G5 (guard-68) requires a provenance stamp; defaulting the agent half to a" >&2
+    echo "  literal identity would forge a peer agent on every other deployment." >&2
+    echo "  Run from an agent session, or set MIND_AGENT explicitly." >&2
+    exit 2
+fi
 if [ -z "$ORIGIN_ENV" ] && [ -f "${PROJECT_ROOT:-.}/.env.local" ]; then
     ORIGIN_ENV=$(grep -m1 '^ENVIRONMENT_ID=' "${PROJECT_ROOT:-.}/.env.local" 2>/dev/null \
                  | cut -d= -f2- | tr -d '"'"'"' \r')
@@ -93,7 +124,11 @@ MODES:
       --target <name> --inject-goal '<goal-json>' --reason "<why>" --shared [--dry-run]
 
 FLAGS:
-  --target <name>       Target world name (required). Known: ayoai
+  --target <name>       Target world (required). Alias or env-id: ayoai|claude|zds,
+                        or any env-id under core/config/environments/ directly.
+                        The DIRECTORY is resolved per-machine, never hardcoded:
+                        $PEER_WORLD_<ENV_ID>, else peer_world_path: in the
+                        registry entry. Exit 3 = not hosted on this box (normal).
   --channel <name>      Board channel to post to (required for board mode)
   --reason <text>       Why this cross-world influence is happening (required; G5 provenance)
   --shared              Explicitly mark this artifact as Shared (required; G1 default-Vault)
@@ -114,12 +149,64 @@ USAGE
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
+# Exit 3 = "peer not reachable FROM THIS BOX". Deliberately distinct from die()'s
+# exit 1: not hosting a peer world is the COMMON, EXPECTED case on a fleet box and
+# must be branchable by callers, exactly as peer-board-post.sh already does.
+# UNREACHABLE is not UNDELIVERABLE — the diagnostic says so, because the previous
+# message ("Target world directory does not exist") read as a hard dead end and a
+# real user decision was once filed as blocked on box topology (g-115-4165).
+_peer_unreachable() {
+    local name="$1" env_id="$2" var="$3" path="$4"
+    {
+        if [ -n "$path" ]; then
+            echo "ERROR: world directory for '$name' (env-id: $env_id) does not exist: $path"
+        else
+            echo "ERROR: no world directory configured for '$name' (env-id: $env_id)."
+        fi
+        echo
+        echo "This is NORMAL and often not a bug: a peer world is a per-machine filesystem"
+        echo "path, and this box may simply not host that world."
+        echo
+        echo "If this box DOES host it, point at it (either form):"
+        echo "  export ${var}=/path/to/${env_id}/world"
+        echo "  or set  peer_world_path:  in core/config/environments/${env_id}.yaml"
+        echo
+        echo "If this box does NOT host it, the work is still deliverable — use a channel:"
+        echo "  board message : bash core/scripts/peer-board-post.sh --peer ${env_id} ..."
+        echo "  and if THAT also exits 3, post to the LOCAL coordination board addressed to"
+        echo "  the peer's agent. The peer READS this board and acts on it (measured), so an"
+        echo "  unreachable filesystem is not an undeliverable message."
+        echo "  See core/config/conventions/cross-deployment-channel.md."
+        echo
+        echo "Do NOT hand-edit a literal path into this script: a path that is right on one"
+        echo "box is wrong on every other, and a WRONG path writes into the WRONG world"
+        echo "(guard-955 / rb-2983). That is how this script came to be dead fleet-wide."
+    } >&2
+    exit 3
+}
+
+# Resolves the target world dir per-machine into RESOLVED_WORLD_DIR, or exits 3.
 resolve_target() {
     local name="$1"
-    local path="${WORLD_MAP[$name]:-}"
-    [ -z "$path" ] && die "Unknown target world '$name'. Known targets: ${!WORLD_MAP[*]}"
-    [ -d "$path" ] && return 0
-    die "Target world directory does not exist: $path"
+    local env_id="${WORLD_ALIAS[$name]:-$name}"
+    local var
+    var="PEER_WORLD_$(printf '%s' "$env_id" | tr '[:lower:]' '[:upper:]' | tr '-' '_')"
+    # 1. env-var override (indirect expansion; ':-' keeps `set -u` happy)
+    local path="${!var:-}"
+    # 2. registry entry. Parse with sed, NOT `cut -d:` — a peer_world_path may be
+    #    a Windows path whose drive colon `cut` would split on, silently yielding
+    #    a truncated path that then fails the -d test for the wrong reason.
+    if [ -z "$path" ]; then
+        local reg="${PROJECT_ROOT:-.}/core/config/environments/${env_id}.yaml"
+        if [ -f "$reg" ]; then
+            path=$(sed -n 's/^[[:space:]]*peer_world_path:[[:space:]]*//p' "$reg" \
+                   | head -1 | tr -d '"' | tr -d "'" | sed 's/[[:space:]]*$//')
+        fi
+    fi
+    if [ -z "$path" ] || [ ! -d "$path" ]; then
+        _peer_unreachable "$name" "$env_id" "$var" "$path"
+    fi
+    RESOLVED_WORLD_DIR="$path"
 }
 
 # G4: count today's posts from this origin in the target world's board dir.
@@ -227,7 +314,7 @@ fi
 
 # Resolve target
 resolve_target "$TARGET"
-TARGET_DIR="${WORLD_MAP[$TARGET]}"
+TARGET_DIR="$RESOLVED_WORLD_DIR"
 
 # G4: rate-limit check
 check_rate_limit "$TARGET_DIR"

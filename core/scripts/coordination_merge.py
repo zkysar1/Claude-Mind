@@ -1366,9 +1366,25 @@ def _merge_archived_census(a_census, b_census):
     return {k: out[k] for k in sorted(out)}
 
 
+# Aspiration-level keys that get their own both-sides-aware merge inside
+# _merge_aspiration_record; the one-sided-key preservation there must not
+# pre-empt them (each already reads from BOTH a and b).
+_ASP_EXPLICIT_MERGE = ("archived_census", "goals", "selection_count",
+                       "sessions_active")
+# Set-once aspiration scalars: written once and cleared by no writer, so a
+# merge must never transition them set -> null ().
+_ASP_SET_ONCE = ("functionally_complete_at",)
+
+
 def _merge_aspiration_record(a: dict, b: dict) -> dict:
     """Merge two records of the SAME aspiration id. Base = newer-``last_selected``
-    snapshot (LWW for opaque aspiration-level fields), then:
+    snapshot (LWW for opaque aspiration-level fields present on BOTH sides), then:
+      - one-sided keys    : a field present on exactly ONE side is KEPT, not
+        dropped by the base-pick (g-115-4163 — last_selected is bumped by the
+        selection path alone, so off-path scalars are invisible to the ordering
+        deciding their survival). Generalizes the same lose-side fix
+        _merge_archived_census got for its own lane in g-115-2430.
+      - _ASP_SET_ONCE     : never allowed to transition set -> null via a merge
       - archived_census   : explicit per-field semantics — evicted_ids UNION,
         legacy by_status MIN, never LWW (_merge_archived_census, g-115-2430).
         Also fixes the latent lose-side loss lane: a census present only on the
@@ -1381,6 +1397,32 @@ def _merge_aspiration_record(a: dict, b: dict) -> dict:
     Goals sorted by identity for the byte-identical result commutativity needs."""
     win, _lose = _order_by_ts(a, b, "last_selected")
     out = dict(win)
+    # Aspiration-level fields present on only ONE side survive the base-pick
+    # (). ``out = dict(win)`` alone drops them wholesale: last_selected
+    # is advanced by the SELECTION path ONLY, so a scalar written by any other
+    # path (completion review, cross-world injection, plateau/friction marks) is
+    # invisible to the ordering that decides its survival — and on a TIE
+    # _order_by_ts falls to a content tiebreak that the side LACKING the field
+    # can win. Generalizes the one-sided-key preservation _merge_archived_census
+    # already does for its own lane ( — "a census present only on the
+    # LWW-losing side previously vanished entirely").
+    # Deliberately NOT generalized: when a key is on BOTH sides the existing LWW
+    # base-pick stands. Lifting the census helper's _canon byte-order tiebreak up
+    # to this granularity is exactly the cross-granularity transplant guard-1153
+    # forbids. Commutative by construction — a one-sided key has one candidate.
+    for k in sorted(set(a) | set(b)):
+        if k not in out and k not in _ASP_EXPLICIT_MERGE:
+            out[k] = a[k] if k in a else b[k]
+    # A merge is not a mutation, so it must never CLEAR a field no writer clears.
+    # functionally_complete_at has exactly one writer (aspirations-complete-review,
+    # which only ever SETS it) and one reader (precheck-eval's one-time-fire
+    # guard), so a merge-induced set -> null silently re-arms that guard. Reached
+    # only when the WINNER's value is None, so the loser holds the sole candidate.
+    for k in _ASP_SET_ONCE:
+        if out.get(k) is None:
+            keep = a.get(k) if a.get(k) is not None else b.get(k)
+            if keep is not None:
+                out[k] = keep
     census = _merge_archived_census(a.get("archived_census"),
                                     b.get("archived_census"))
     if census is not None:
@@ -3500,6 +3542,111 @@ def merge_strategy_generations(local: bytes, remote: bytes) -> bytes:
 
 
 # --- registration -----------------------------------------------------------
+def merge_backpressure(local: bytes, remote: bytes) -> bytes:
+    """Merge for meta/backpressure.yaml (the meta-change rollback monitor).
+
+    Writer read (rb-245) -- meta-backpressure.py. This file is a STATE MACHINE,
+    not a flat ledger, and its two halves need OPPOSITE treatment:
+
+      rollback_history    PURE APPEND (cmd_check:217
+                          ``setdefault(...).append(rollback)``). No prune, no
+                          cap, no rewrite -> id-union is safe.
+      audit_only_skips    PURE APPEND (cmd_check:198). Same.
+      active_monitors     A DRAINING QUEUE. Union is NOT safe here. It has two
+                          independent removal paths: a CAP EVICTION
+                          (cmd_monitor:94-96 ``if len >= max_active_monitors:
+                          monitors.pop(0)``) and a STATUS-FILTER REBUILD
+                          (cmd_check:225 / cmd_graduate:295
+                          ``[m for m in monitors if m["status"]=="monitoring"]``).
+                          A blind id-union across two boxes therefore
+                          RESURRECTS monitors the other side already graduated,
+                          rolled back, or evicted -- the exact hazard that moved
+                          the registered ledgers off merge=union (g-115-2767).
+
+    So active_monitors is reconstructed the way the WRITER reconstructs it,
+    rather than unioned: merge each monitor by ``meta_change_id`` preferring the
+    ADVANCED status (any terminal status beats "monitoring", because a terminal
+    status is a decision one box already made and the other simply has not seen
+    yet), then apply the writer's own ``status == "monitoring"`` filter, then
+    drop anything the merged tombstone sets already account for.
+
+    Cap eviction is the one exit route that leaves NO tombstone, so a monitor
+    evicted on one side can reappear. That is deliberate and bounded: the entry
+    is re-evicted on the next cmd_monitor past the cap, and an over-long list
+    self-heals on the next cmd_check. Losing a rollback RECORD would not be
+    recoverable; carrying a stale monitor for one iteration is.
+
+    Two live boxes hand-resolved this file on 2026-07-31 (cc-06 and the Windows
+    clone, hours apart) because it was routed to merge=ayoai-ledger by the
+    wildcard with no handler behind it -- arriving with an unmerged index and
+    ZERO conflict markers. The generic fallback in git-merge-ayoai-ledger.py
+    stops that from WEDGING; this handler is what makes it merge CORRECTLY.
+    (g-115-4253.)"""
+    try:
+        a = yaml.safe_load(local.decode("utf-8")) or {}
+        b = yaml.safe_load(remote.decode("utf-8")) or {}
+    except Exception:  # noqa: BLE001 -- unparseable side -> content tiebreak
+        return local if local >= remote else remote
+    if not (isinstance(a, dict) and isinstance(b, dict)):
+        return local if local >= remote else remote
+
+    out = dict(a) if _canon(a) >= _canon(b) else dict(b)
+
+    def _by_id(rows):
+        keyed, loose = {}, []
+        for r in (rows or []):
+            if isinstance(r, dict) and r.get("meta_change_id") is not None:
+                keyed[r["meta_change_id"]] = r
+            else:
+                loose.append(r)
+        return keyed, loose
+
+    # --- append-only halves: id-union, deterministic order --------------------
+    tombstoned = set()
+    for field in ("rollback_history", "audit_only_skips"):
+        if field not in a and field not in b:
+            continue
+        ka, la = _by_id(a.get(field))
+        kb, lb = _by_id(b.get(field))
+        merged = dict(kb); merged.update(ka)   # same-id: content tiebreak below
+        for k in set(ka) & set(kb):
+            merged[k] = ka[k] if _canon(ka[k]) >= _canon(kb[k]) else kb[k]
+        tombstoned |= set(merged)
+        loose = sorted({_canon(x) for x in (la + lb)})
+        out[field] = ([merged[k] for k in sorted(merged, key=str)]
+                      + [x for x in (la + lb) if _canon(x) in loose][:len(loose)])
+
+    # --- draining queue: rebuild, do NOT union --------------------------------
+    if "active_monitors" in a or "active_monitors" in b:
+        ka, la = _by_id(a.get("active_monitors"))
+        kb, lb = _by_id(b.get("active_monitors"))
+        rebuilt = {}
+        for k in set(ka) | set(kb):
+            ra, rb = ka.get(k), kb.get(k)
+            if ra is None or rb is None:
+                rebuilt[k] = ra if ra is not None else rb
+                continue
+            # a terminal status is a decision the other side has not seen yet
+            adv = ra if str(ra.get("status")) != "monitoring" else rb
+            base = rb if adv is ra else ra
+            row = dict(base); row.update(adv)
+            for num in ("goals_since_change",):
+                va, vb = ra.get(num), rb.get(num)
+                if isinstance(va, (int, float)) and isinstance(vb, (int, float)):
+                    row[num] = max(va, vb)
+            sa, sb = ra.get("imp_k_samples"), rb.get("imp_k_samples")
+            if isinstance(sa, list) and isinstance(sb, list):
+                row["imp_k_samples"] = sa if len(sa) >= len(sb) else sb
+            rebuilt[k] = row
+        out["active_monitors"] = [
+            rebuilt[k] for k in sorted(rebuilt, key=str)
+            if str(rebuilt[k].get("status", "monitoring")) == "monitoring"
+            and k not in tombstoned
+        ] + [x for x in (la + lb)]
+
+    return yaml.dump(out, default_flow_style=False, sort_keys=False).encode("utf-8")
+
+
 _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     # id-keyed field-merge (records edited in place -> merge same-id copies)
     "reasoning-bank.jsonl": merge_reasoning_bank,
@@ -3720,6 +3867,12 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     # it wedged two live boxes for real before it was noticed. Same-key FIELD
     # merge rather than an id-union — both sides mutate the tail row in place.
     "strategy-generations.yaml": merge_strategy_generations,
+    # : same class again, and the one that actually stranded a box.
+    # Routed by the .mind-data wildcard with nothing behind it, so it arrived
+    # with an unmerged index and ZERO conflict markers -- wedging cc-06 for 6.2h
+    # (58 commits) and then the Windows clone hours later. Its two halves need
+    # OPPOSITE treatment (append-union vs writer-style rebuild); see docstring.
+    "backpressure.yaml": merge_backpressure,
     # : two synced append-only logs, each writer-read (rb-245).
     #   alert-sweep-seen.jsonl -> world/scripts/alert-sweep.sh appends the seen-row
     #     inside its mkdir-lock ("read-classify-file-append is all under the lock");

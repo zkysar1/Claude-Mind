@@ -329,7 +329,17 @@ IF productive:
     # Include: goal_id "{goal.id}" (CANONICAL join key — the recurring-close 4.25
     #   canary and experience-read --goal match on goal_id, NOT source_goal;
     #   omitting it false-fires force_experience_archival, g-115-2511),
-    #   retrieval_audit, verbatim_anchors, content_path
+    #   type (REQUIRED — the add endpoint rejects the record without it; live
+    #   values: goal_execution | reflection | hypothesis_formation. Measured
+    #   g-115-4096: omitting it cost two validation_failed round-trips),
+    #   category (REQUIRED — same validation; use the goal's category. Measured
+    #   g-115-3515: one more round-trip from omitting it),
+    #   summary (REQUIRED — same validation; one-sentence record summary.
+    #   Measured g-356-18: a third round-trip from omitting it — this list is
+    #   the required set: goal_id, type, category, summary),
+    #   retrieval_audit, verbatim_anchors (each anchor is an OBJECT with
+    #   "key"+"content" fields, not a bare string — also validation-enforced),
+    #   content_path
     echo '{"experience_refs": ["{experience_id}"]}' | Bash: wm-set.sh active_context.experience_refs
 ```
 

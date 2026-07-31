@@ -424,9 +424,119 @@ def test_all_agents_tags_every_entry_with_its_owning_agent():
     assert parsed[0]["agent"] == "zzz"
 
 
+# --- : the residue the  pass left uncovered ---------------
+#
+# READ THE PREMISE CORRECTION FIRST.  was filed saying --all-agents
+# "shipped with zero new tests". That was true when filed and is FALSE now:
+#  (commit 333ef7a4b) added the fleet harness and three tests above.
+# Measured 2026-07-31 before writing a line. Two genuine gaps survive it, and
+# they are narrower and more specific than the goal's framing:
+#
+#   (a) EVERY fleet test drives the EXTRACTED python heredoc with AGENTS_ROOT
+#       injected into the environment (see _run_fleet). That is deliberate and
+#       well-reasoned — bash agents_root() has no env override, so seeding the
+#       live agents root would be the  cruft-leak. But the consequence
+#       is absolute: NOTHING exercises the bash-side derivation at line ~102,
+#       so a regression THERE is invisible to the entire suite. That derivation
+#       is exactly what CLAUDE.md's "cross-agent glob consumers" table calls
+#       this call site's only audit surface, and exactly what the goal ranks
+#       HIGHEST risk. A source-level assertion is the only instrument that can
+#       reach it under the hermeticity constraint.
+#   (b) The tagging test uses ONE agent, so it cannot distinguish "tag each
+#       entry with ITS owner" from "tag every entry with the FIRST owner seen".
+#       The isolation test happens to run three agents but asserts only on ids.
+
+
+def test_bash_derives_agents_root_via_the_paths_helper():
+    """SOURCE guard for the one line no runtime test can reach (gap (a)).
+
+    ANCHORED ON THE ASSIGNMENT, not on a mention of the name — guard-1099. The
+    word `agents_root` appears on six lines of the wrapper and TWO of them are
+    comments (the header's "routed through `agents_root()`" note and the
+    path-decomposition comment beside the glob). A bare
+    `grep -q agents_root` therefore passes with the assignment DELETED, matching
+    the prose that describes the rule instead of the code that implements it.
+    Measured on this file, not assumed.
+    """
+    src = READ_SCRIPT.read_text(encoding="utf-8")
+    code = [ln for ln in src.splitlines() if not ln.lstrip().startswith("#")]
+
+    assert any(re.match(r'\s*AGENTS_ROOT="\$\(agents_root\)"\s*$', ln) for ln in code), (
+        "the fleet root must be derived by calling agents_root() from _paths.sh; "
+        "a literal path or a PROJECT_ROOT-relative glob would match NOTHING after "
+        "an AGENTS_PARENT_DIR rename and is invisible to all three CLAUDE.md audit greps"
+    )
+    # The unavailability guard is half the contract: without it a missing
+    # _paths.sh yields an EMPTY root, and the glob then silently walks "/*/session/…"
+    # rather than failing. Exit 2, not a quiet empty sweep.
+    assert any("declare -F agents_root" in ln for ln in code), (
+        "an unsourced _paths.sh must fail loudly (exit 2), not degrade to an empty root"
+    )
+    for ln in code:
+        assert "AGENTS_ROOT=" not in ln or "$(agents_root)" in ln or 'AGENTS_ROOT=""' in ln, (
+            f"AGENTS_ROOT assigned from something other than agents_root(): {ln!r}"
+        )
+
+
+def test_two_agent_fleet_returns_both_entries_each_tagged_with_its_own_owner():
+    """The goal's explicit ask, and what a single-agent tagging test cannot prove.
+
+    With one agent, "tag with the owner" and "tag everything with the first
+    owner seen" are indistinguishable. Two agents separate them. This also
+    pins that BOTH agents' entries come back — the defect the fleet fix
+    existed to cure was returning only the bound agent (21 of 31 fleet
+    questions invisible).
+    """
+    with tempfile.TemporaryDirectory() as tmpd:
+        root = Path(tmpd)
+        for name in ("aaa", "bbb"):
+            (root / name / "session").mkdir(parents=True)
+            _write(root / name / "session" / "pending-questions.yaml",
+                   [{"id": f"pq-{name}-1", "status": "pending"}])
+        rc, parsed, stderr = _run_fleet(root)
+
+    assert rc == 0, f"clean two-agent fleet must succeed (stderr={stderr!r})"
+    assert _ids(parsed) == ["pq-aaa-1", "pq-bbb-1"], (
+        f"both agents' entries must surface, got {_ids(parsed)}"
+    )
+    by_id = {e["id"]: e.get("agent") for e in parsed}
+    assert by_id == {"pq-aaa-1": "aaa", "pq-bbb-1": "bbb"}, (
+        "each entry must carry ITS OWN owner; tagging every entry with the first "
+        f"agent seen passes a single-agent test and fails here: {by_id}"
+    )
+
+
+def test_unknown_flag_exits_2_so_all_agents_needs_no_extra_exclusion_guard():
+    """PREMISE CORRECTION, pinned so the wrong premise cannot be re-derived.
+
+    g-115-3101 asks for a `--all-agents + --agent` mutual-exclusion guard
+    alongside the `--all-agents + --pq-path` one. There is no such guard and
+    none is needed: `--agent` is not a flag at all, so it falls to the parser's
+    catch-all and exits 2 already. Measured (rc=2 both with and without
+    --all-agents) rather than inferred from reading the case statement.
+
+    Pinned rather than merely noted because the NEXT reader of that goal text
+    will otherwise re-derive the same wrong conclusion and add a redundant
+    guard. What must not regress is the catch-all itself — loosening it to
+    ignore unknown flags would silently accept a typo'd invocation.
+    """
+    for argv in (["--all-agents", "--agent", "foxtrot"], ["--agent", "foxtrot"]):
+        r = subprocess.run(
+            [BASH, str(READ_SCRIPT), *argv],
+            env=_env(MIND_AGENT="foxtrot"), capture_output=True, text=True,
+        )
+        assert r.returncode == 2, f"{argv} must exit 2, got {r.returncode}"
+        assert "unknown arg '--agent'" in r.stderr, (
+            f"the catch-all must NAME the offending flag: {r.stderr!r}"
+        )
+
+
 if __name__ == "__main__":
     test_all_agents_survives_one_unreadable_peer()
     test_all_agents_tags_every_entry_with_its_owning_agent()
+    test_bash_derives_agents_root_via_the_paths_helper()
+    test_two_agent_fleet_returns_both_entries_each_tagged_with_its_own_owner()
+    test_unknown_flag_exits_2_so_all_agents_needs_no_extra_exclusion_guard()
     test_prefix_flag_is_accepted_not_unknown_arg()
     test_prefix_match_signals_suppression()
     test_prefix_no_match_allows_proposal()

@@ -1,9 +1,9 @@
 ---
 name: tree
-description: "Knowledge-tree operations entry point dispatching to sub-commands: read (node content), find (search), add (new node), edit (existing node), set (field update), decompose (split large node), distill (summarize), maintain (rebalance), stats (counts & health), validate (schema check). Use whenever the agent needs to read, modify, reorganize, or audit the world knowledge tree — the user says \"add a node about X\", \"update the Y node\", \"reorganize this category\", or reflection/encoding produces a tree write. Canonical entry point; never edit _tree.yaml or node .md files directly."
+description: "Knowledge-tree operations entry point dispatching to sub-commands: read (node content), find (search), add (new node), edit (existing node), set (field update), decompose (split large node), split-overcap (verbatim split of a node too big to Read — MUST use for crit3/oversized nodes, never hand-split), distill (summarize), maintain (rebalance), stats (counts & health), validate (schema check). Use whenever the agent needs to read, modify, reorganize, or audit the world knowledge tree — the user says \"add a node about X\", \"update the Y node\", \"reorganize this category\", a Read of a tree node truncates, or reflection/encoding produces a tree write. Canonical entry point; never edit _tree.yaml or node .md files directly."
 type: system
 user-invocable: false
-triggers: [knowledge-tree, tree-maintain, tree-decompose, tree-distill, tree-node, tree-read, tree-add, tree-edit, tree-validate]
+triggers: [knowledge-tree, tree-maintain, tree-decompose, tree-distill, tree-split, tree-split-overcap, over-cap-node, tree-node, tree-read, tree-add, tree-edit, tree-validate]
 reads:
   - world/knowledge/tree/_tree.yaml
   - core/config/memory-pipeline.yaml
@@ -36,7 +36,7 @@ with granular read/write operations that any skill can call.
 Supports recursive knowledge tree at arbitrary depth up to D_max=20.
 
 ## Mode Gate for Write Operations
-For sub-commands: add, edit, set, decompose, distill, maintain, reparent
+For sub-commands: add, edit, set, decompose, split-overcap, distill, maintain, reparent
 Bash: `session-mode-get.sh`
 - If mode is `reader`: output "Tree write operations require assistant mode. Run `/start --mode assistant` to enable." STOP.
 - If mode is `assistant` or `autonomous`: PROCEED.
@@ -51,6 +51,7 @@ Read-only sub-commands (read, find, stats, validate) work in all modes.
 /tree edit <key>                    — Read node for editing, update _tree.yaml after
 /tree set <key> <field> <value>     — Update _tree.yaml metadata field
 /tree decompose <key>               — Break a large node into children
+/tree split-overcap <key> --boundaries "..." — Verbatim split of a node too big to Read
 /tree distill <key>                 — Extract actionable kernel, archive narrative
 /tree maintain                      — Full batch maintenance (DECOMPOSE, REDISTRIBUTE, DISTILL, SPLIT, SPROUT, MERGE, PRUNE, RETIRE)
 /tree reparent <node> <new-parent>   — Move node (and subtree) to a new parent
@@ -130,7 +131,15 @@ poignancy: <1-10>   # g-306-26: LLM-rated importance (readability copy; the
 last_update_trigger:
   type: tree_growth
   source: "/tree add"
-  session: {current_session}
+  session: {current_session}   # the FULL $MIND_SID, not a truncated prefix —
+                               # tree-edit-since.py:97 compares this EXACTLY against
+                               # MIND_SID to decide "did I encode this, or did a
+                               # partner?". A shortened value silently attributes your
+                               # own node to another session: --tree-updated is then
+                               # IGNORED at state-update close and the node reads as a
+                               # partner's in every later attribution audit. Measured
+                               # 2026-07-30 (g-335-546) — an 8-char prefix here cost
+                               # the iteration its tree-encoding credit.
 ---
 # {Topic Title}
 
@@ -273,6 +282,17 @@ IF node.depth + 1 > 6: abort "Cannot decompose — at max depth"
 #    c. Create child .md with front matter
 #    d. Move relevant ## sections into child
 # 5-8. Atomically convert parent + register children + propagate (ONE batch call):
+# ⚠ THE node_type SET BELOW LOOKS REDUNDANT AND IS LOAD-BEARING — DO NOT DELETE.
+# batch add-child already auto-flips a leaf parent to interior on its own
+# (tree.py cmd_batch, g-115-1437, pinned by
+# test_batch_add_child_flips_parent_leaf_to_interior), so this op changes no
+# state and reads like dead code a cleanup should remove. It is what
+# core/scripts/_growth_log.py RECOGNIZES as "this batch is a decompose"
+# (g-115-3210) — an explicit set-interior plus add-child on the same key. The
+# auto-flip is invisible to that check because it mutates the tree, not the
+# ops list. Remove this line and DECOMPOSE rows silently stop being written,
+# exactly as they silently were not written for 3.7 months before g-115-3210.
+# Pinned by test_growth_log.py::test_producer_batch_shape_still_carries_the_signature.
 echo '{"operations": [
   {"op": "set", "key": "<key>", "field": "node_type", "value": "interior"},
   {"op": "set", "key": "<key>", "field": "article_count", "value": 0},
@@ -280,8 +300,13 @@ echo '{"operations": [
   {"op": "add-child", "key": "<key>", "child": {"key": "<child-2>", "summary": "<summary-2>"}},
   {"op": "propagate", "key": "<key>"}
 ]}' | bash core/scripts/tree-update.sh --batch
-# 9. Log:
-#    Append to tree_growth_log: {op: DECOMPOSE, node: <key>, children: [...], date, reason}
+# 9. Log: NOTHING TO DO — the batch above writes the tree_growth_log DECOMPOSE
+#    row itself (core/scripts/_growth_log.py, g-115-3210). The batch's own
+#    shape IS the signature: `set <key> node_type interior` + add-child on that
+#    same key. Do NOT hand-append a row; you would duplicate the script's.
+#    This step used to read "Append to tree_growth_log: {op: DECOMPOSE, ...}"
+#    and was honour-system — it produced 8 rows on 2026-04-04 and nothing for
+#    the next 3.7 months, while decomposes kept happening.
 ```
 
 ## Sub-Command: /tree distill <key>
@@ -313,9 +338,52 @@ Read {node.file}
 #      Default to COHERENT when ambiguous — destroying context is worse than
 #      leaving a slightly-long coherent node. EXCEPTION: the oversized-append-grown
 #      structural trigger (trigger=oversized_append_grown / crit3, g-115-1570) is
-#      NOT exempt — a coherent node too big to Read still gets the non-destructive
-#      rollup (archive verbatim + keep newest-N); maintain_exempt:["distill"]
-#      suppresses only the utility triggers, never crit3.
+#      NOT exempt — maintain_exempt:["distill"] suppresses only the utility
+#      triggers, never crit3. But crit3 does NOT go straight to the rollup:
+#      it takes the SHAPE FORK at 1.6 FIRST.
+
+# 1.6. SHAPE FORK (guard-2109 / rb-6055 — MANDATORY before ANY destructive
+#      reduction on a crit3 candidate). The crit3 trigger fires on SIZE and
+#      never tests SHAPE, so it collects two shapes that keep-newest-N damages.
+#      Measured: 3 of 3 crit3 nodes hand-examined in ONE maintain run were three
+#      DIFFERENT shapes — the mixed case is the normal case, not the edge case.
+#      Enumerate heading structure and per-section line spans FIRST — use RANGED
+#      Reads (offset/limit); a full Read truncates exactly the node this fork is
+#      for — then route on shape, never on size:
+#        grep -n '^#\{1,3\} ' {node.file}     # headings + line numbers => spans
+#
+#        (a) APPEND-GROWN SERIES — dated sections, newer supersedes older,
+#            roughly UNIFORM section size.
+#            -> keep-newest-N is correct. Proceed to step 2.
+#
+#        (b) CATALOG — sections are orthogonal and PERMANENT (per-lane,
+#            per-component, per-failure-mode) and early sections are REFERENCED
+#            BY later ones. keep-newest-N DELETES the foundational entries, and
+#            the loss is unrecoverable in place (node .md bodies are written
+#            UNFENCED). Correct operation is a SPLIT on the natural partition
+#            key, keeping index + governance sections in the parent:
+#            -> take the SPLIT-OVERCAP PATH FORK (§ split-overcap step 0 —
+#               boundaries are INPUT, never inferred) and STOP. Do NOT distill.
+#
+#        (c) INVERTED-BLOAT SERIES — genuinely a series, but the NEWEST sections
+#            are far LARGER than the old ones, so the cheap dense history is all
+#            that keep-newest-N removes while nearly all the cost is retained.
+#            -> NO CUT. Report the finding as per-entry size discipline and route
+#               it to the node's active writer (board findings post). STOP.
+#
+#      SOLE-WRITER RULE: a per-agent series shard has ONE owner. Never rewrite
+#      another agent's sole-writer node wholesale — route the finding to its
+#      writer instead. This holds even when the shape is (a) and the rollup
+#      would otherwise be correct.
+#
+#      Default when ambiguous: treat as (b)/(c) and do NOT cut. A missed rollup
+#      costs one cycle; a wrong one destroys referenced content with no fence
+#      under it to recover from.
+#
+#      WHY THIS LIVES IN THE PSEUDOCODE and not only in the guardrail: the same
+#      lesson was already carried behaviorally and a near-repeat still occurred
+#      one day later on a different agent, because the pseudocode kept inviting
+#      the error. A guardrail cannot outvote the instrument it guards.
 
 # 2. Archive full original content
 mkdir -p "$WORLD_DIR/knowledge/archive"    # WORLD_DIR from _paths.sh — NEVER use bare world/
@@ -350,6 +418,74 @@ Append to tree_growth_log: {op: DISTILL, node: <key>, date, original_lines, dist
 
 # 7. Propagate (confidence unchanged, but log the event)
 bash core/scripts/tree-propagate.sh <key>
+```
+
+## Sub-Command: /tree split-overcap <key> --boundaries "{##-heading}|{##-heading}|..."
+
+Verbatim split of a node TOO BIG TO READ (the Read tool truncates it). The
+mechanical sibling of `/tree decompose`: decompose is SEMANTIC clustering of a
+readable node; split-overcap moves sections VERBATIM because you cannot
+re-organize what you cannot fully read. Forged from gap-051 (g-115-3994) after
+three hand-runs (directive-lane-compliance 07-29, directive-lane-series 07-30
+x2); both predicted silent failure modes fired live in g-115-4069 and are
+script- or checklist-blocked below.
+
+```
+# 0. PATH FORK (load-bearing — it decided the third live run; not hedging).
+#    Boundaries are INPUT, never inferred. The mechanics generalize; the
+#    BOUNDARY choice does not. If the node has NO natural partition key
+#    (## sections per agent / per component), or cross-cutting content sits
+#    NESTED inside one partition (an h3 fleet-level section inside one
+#    agent's h2 — splitting on the h2 boundary would bury it in one shard),
+#    this is a DISTILL, not a split — use /tree distill and STOP.
+#    Decompose's coherence gate (rb-94) applies here unchanged.
+
+# 1. MEASURE via a full Read's truncation notice — NEVER a byte/char
+#    heuristic (guard-1478, guard-1422 clause 3). Normal trigger: crit3
+#    oversized_append_grown from /tree maintain.
+
+# 2. BACK UP — your OWN sha1-verified copy. Do NOT assume .history backs a
+#    tree node (measured absent for tree nodes in the g-115-4069 run).
+cp {node.file} agents/{agent}/temp/{key}-presplit-$(date +%Y%m%dT%H%M%S).md
+sha1sum {node.file} {backup}   # must match before any surgery
+
+# 3. SPLIT on the given boundaries, VERBATIM. Use RANGED Reads
+#    (offset/limit) to move content the cap hides; moved sections must sum
+#    to the original line count.
+
+# 4. WRITE children (front matter each; kebab-case keys under the parent's
+#    directory).
+
+# 5. INTEGRITY DIFF (MANDATORY — silent failure mode #1: skipping it loses
+#    rows with no error). MUST use the companion verifier, never an ad-hoc
+#    identifier/header check — an identifier-level diff measured 0 orphans
+#    of 18 while the content-level check found 2 whole sections missing
+#    (g-115-4069):
+py -3 core/scripts/tree-split-verify.py --original {backup} \
+    --outputs {child1} {child2} ... {stub-or-index} [{archive}]
+#    Decoration-tolerant, prints denominators ("lines=N missing=M").
+#    exit 1 = content lost: STOP, restore from backup, re-split.
+#    exit 2 (VACUOUS, denominator 0) is NOT a pass — fix the inputs.
+
+# 6. REGISTER children in _tree.yaml with ABSOLUTE paths — a relative path
+#    raises 'not under any configured root' from the own-cloud lock backend
+#    (guard-1331). Use the decompose batch shape (ONE tree-update.sh --batch
+#    with set node_type interior + add-child per child + propagate) — that
+#    exact shape IS the growth-log DECOMPOSE signature (g-115-3210).
+
+# 7. STUB + PARENT RECONCILE (MANDATORY — silent failure mode #2: skipping
+#    it leaves the parent instructing agents to append to the file just
+#    emptied, which re-grows it within one fire; measured live).
+#    a. Leave a stub/index at the old key so an existing --node read does
+#       not return nothing.
+#    b. Re-evaluate EVERY IMPERATIVE carried into the stub against the
+#       post-split topology: verbatim is the right default for CONTENT and
+#       the WRONG default for INSTRUCTIONS. Strike stale imperatives
+#       ("append HERE") with a dated SUPERSEDED note — never delete
+#       (provenance survives).
+#    c. Update front matter (last_updated + last_update_trigger) on the
+#       stub; the verifier deliberately excludes front matter + the H1
+#       title, so THIS step owns their correctness.
 ```
 
 ## Sub-Command: /tree maintain
@@ -483,12 +619,78 @@ Reported by `tree-read.sh --redistribute-candidates` with `reason: k_overflow`,
 **Trigger**: leaf node where:
 - `utility_ratio < distill_utility_threshold` (0.3) AND `retrieval_count >= distill_min_retrievals` (5)
 - OR: `line_count > distill_line_threshold` (50) AND `utility_ratio < distill_line_utility_threshold` (0.5)
+- OR: READ-CAP arms — `est_tokens >= distill_token_ratio * distill_token_cap`
+  (0.8 × 25000). These split on whether the node is append-grown:
+  `trigger == oversized_append_grown` (>= `distill_refresh_min_sections` dated
+  sections) and `trigger == oversized_not_append_grown` (fewer). BOTH are
+  returned by `--distill-candidates`; only the FIRST is a distill. See step 2.a0.
 
 Thresholds from `core/config/tree.yaml` `pruning` section.
 
 **Steps**:
 1. Scan candidates: `Bash: tree-read.sh --distill-candidates`
 2. For each candidate (largest line_count first, up to `max_distill_per_invocation`):
+   a0. ACTION ROUTING (g-115-4058) — read the candidate's `recommended_action`
+      FIRST, before the coherence gate. This list is NOT all distills: a node
+      with `trigger == oversized_not_append_grown` carries
+      `recommended_action: regroup`, because it is too big to Read but has too
+      few dated sections for the rb-2085 archive + keep-newest-N rollup to have
+      anything to roll up. For those, do NOT invoke `/tree distill` — route them
+      to the SPLIT-OVERCAP PATH FORK (§ split-overcap step 0) and SKIP to the
+      next candidate. Only `recommended_action: distill` proceeds to 2.a below.
+
+      DO NOT route these to REGROUP (§1.5) — that arm is DORMANT BY DESIGN and
+      cannot fire on them (g-115-4147, measured 2026-07-30 alpha cc-04). REGROUP
+      triggers on `child_count > K_max`, and `core/config/tree.yaml:9` raised
+      K_max 4 -> 40 by user directive 2026-07-14, stating verbatim: "count-based
+      DECOMPOSE/REGROUP pressure is effectively retired; regroup on SEMANTIC
+      incoherence only." Measured consequence: `tree-read.sh
+      --redistribute-candidates` returns [] against the whole 1299-node tree,
+      and all four live arm members report `child_count: None` — two are LEAVES,
+      which have no children to regroup at all, so the old routing was
+      categorically wrong for them rather than merely unmet. The cost was not
+      theoretical: the arm holds the two MOST-RETRIEVED nodes in the tree
+      (framework-guardrails-and-gates, 438 retrievals / 30,633 est. tokens;
+      product-world-model, 247 / 29,535), both past the ~25k Read cap — so the
+      read-cap arm was silently exempting exactly the nodes the fleet reads most.
+
+      FIRST CHECK est_tokens >= 26413 — this arm's trigger is PROACTIVE and
+      splitting an under-cap node is a net harm (guard-2006 / rb-5894). The arm
+      fires at `token_trigger` = 0.8 * 25000 = 20000, i.e. deliberately BEFORE the
+      cap, which is free for the distill arm (an early rollup is non-destructive)
+      and NOT free here: structural surgery on an already-readable node fragments
+      coherent content and buys nothing. est_tokens = chars/2.3 is the LOW end of
+      the measured 2.31-2.43 band, so it runs high by up to ~5.7% and a node
+      reported at 100-106% of cap may be UNDER it. 26413 is that band's floor
+      (25000 * 2.43 / 2.3) — at or above it the node is over cap at ANY ratio.
+        - est_tokens >= 26413        -> over cap for certain: take the FORK below.
+        - est_tokens <  25000        -> readable in one Read: the arm's "too big to
+          Read" premise is FALSE for it. Do NOT do structural surgery — fall
+          through to the 2.a coherence gate and let it distill on merit or mark
+          `maintain_exempt`.
+        - 25000 <= est_tokens < 26413 -> UNKNOWN, not over. Re-measure with a real
+          tokenizer, or treat as under (conservative for a destructive-shaped op).
+      Measured 2026-07-30: of the 4 live arm members, checker-input-assumption-
+      defects (21680 est / 50156 chars) is UNDER cap and must NOT be split; the
+      other three (27820 / 29535 / 30633) clear 26413 and take the fork.
+
+      THE FORK IS THE ROUTE — do not shorten this to "call split-overcap". Its
+      step 0 is load-bearing: BOUNDARIES ARE INPUT, NEVER INFERRED. Enumerate the
+      node's `##` headings with RANGED Reads (offset/limit — the cap hides them
+      from a full Read), then branch:
+        - a natural partition key exists (## sections per agent / per component)
+          -> `/tree split-overcap <key> --boundaries "..."`
+        - NO natural partition key, OR cross-cutting content sits NESTED inside
+          one partition -> that is a DISTILL, not a split: `/tree distill`, STOP.
+      A leaf with 0 children normally takes this second branch. Skipping the fork
+      and splitting on an inferred boundary buries cross-cutting content in one
+      shard, which the fork exists to prevent.
+      Why this step is load-bearing: the read-cap size test fires INDEPENDENTLY
+      of append-grown-ness (that decoupling is the whole of g-115-4058), so
+      without this routing the nodes in the regroup arm would each
+      receive the destructive-shaped procedure that is wrong for them — the
+      false-positive class the conjunction originally existed to prevent. A
+      branched action that no caller reads changes no behavior.
    a. COHERENCE GATE (rb-94 / guard-896): body-read the candidate FIRST. If it
       coheres as one tight document flagged purely by low retrieval (niche, not
       bloated), set `maintain_exempt` to include "distill" and SKIP — do NOT
@@ -496,7 +698,12 @@ Thresholds from `core/config/tree.yaml` `pruning` section.
       class). The `/tree distill` sub-command enforces the same gate at step 1.5,
       and get_distill_candidates then skips the node's utility triggers durably.
       EXCEPTION: a candidate with `trigger == oversized_append_grown` (crit3) is
-      NOT exempt — its non-destructive rollup still fires (too big to Read).
+      NOT exempt from the COHERENCE gate — it is still too big to Read. But do
+      NOT read that as "the rollup fires": crit3 takes the SHAPE FORK (§ distill
+      step 1.6) first, and the rollup is non-destructive ONLY for shape (a), an
+      append-grown series. For a CATALOG it deletes foundational sections that
+      later ones reference, unrecoverably (guard-2109 / rb-6055). Route via 2.b
+      and let the fork decide; never pre-commit to the rollup here.
    b. Otherwise invoke `/tree distill <key>`.
 3. Log to tree_growth_log
 
@@ -892,7 +1099,15 @@ ELSE:
 - `K_max` (40, per core/config/tree.yaml): soft limit at all levels (can exceed when justified, log reason)
 - `D_max` (20): hard limit — never create nodes beyond depth 20
 - Never prune L1 domain nodes
-- Always append to `tree_growth_log` for every structural change
+- `tree_growth_log` is written BY THE SCRIPTS, not by hand (g-115-3210). The
+  write paths append DECOMPOSE (batch: interior-flip + add-child), PRUNE
+  (remove-child), REPARENT, L1_ADD and L1_RENAME. Ordinary child-add is
+  deliberately NOT logged — it would bury the structural signal the log exists
+  to carry. Do not hand-append rows; if an op you think belongs is missing,
+  add it to `core/scripts/_growth_log.py` so BOTH the CLI and the daemon get
+  it. (This line previously read "Always append ... for every structural
+  change" — an instruction nothing enforced, which is why the log froze for
+  3.7 months.)
 - Always verify `min_articles_per_child` (2) before creating split children
 - Nodes in `growth_state: growing` are protected from MERGE and PRUNE
 - Path construction always computed from parent `file` field — never hardcoded

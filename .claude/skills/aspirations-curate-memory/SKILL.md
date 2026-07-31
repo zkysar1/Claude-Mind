@@ -219,7 +219,8 @@ Curation sweep <date>: guard(retired N, kept M, revised K, skipped S), rb(retire
 ### Phase 6 — Done
 
 Return to caller (g-115-348 completion path). The recurring goal closes via
-`aspirations-complete-by.sh g-115-348 --recurring`.
+`aspirations-complete-by.sh g-115-348` (it is the recurring closer; it takes only
+--source / --key-finding — there is no --recurring flag).
 
 ## Edge cases
 

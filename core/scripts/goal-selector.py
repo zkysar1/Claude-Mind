@@ -27,7 +27,17 @@ Scoring criteria (21 deterministic + 1 stochastic weighted factors):
   context_coherence: +2.0 if same category as last goal, 0 otherwise.
     Context-pressure agnostic — same-category reuse saves tokens regardless of zone.
 
-  recurring_urgency: base + log2(1 + overdue_ratio) * log_scale (logarithmic, no cap)
+  recurring_urgency: base + log2(1 + overdue_ratio) * log_scale, THEN CLAMPED to
+    urgency_max (g-115-1090). "no cap" stood here until 2026-07-30 and was false
+    from the day the clamp landed; it is the sentence that keeps sending readers
+    looking elsewhere for why heavily-overdue goals do not rise. MEASURED at the
+    shipped defaults (base 1.5, log_scale 1.5, urgency_max 4.0): the clamp binds at
+    overdue_ratio 2.175, i.e. age = 3.17x interval. The starvation detector's own
+    threshold is 2.0x, so the clamp binds 0.175 ABOVE the ratio that DEFINES a goal
+    as starved — past that point this term carries ZERO information about how
+    overdue a goal is. Live on 527 candidates (zeta, cc-02, 2026-07-30): 11 of 12
+    recurring rows with ratio >= 2.0 sat at exactly 4.0, spanning 2.12x .. 97.85x
+    (a 46x spread) for one identical urgency. See g-115-4103 / g-115-4047.
   recurring_saturation: -(ratio * max_penalty) penalty when recurring goals dominate recent selections (CLASS level)
   per_goal_saturation: flat penalty when the SAME goal_id fires repeatedly in the recent window (GOAL level).
     Config: aspirations.yaml → per_goal_saturation. Tranche B (rb-390).
@@ -628,6 +638,12 @@ def load_recurring_config():
         # given deployment's YAML carries the keys.
         "substantive_demotion_short_interval_hours": 6.0,
         "substantive_demotion_short_interval_exempt_ratio": 1.0,
+        #  drain lane. Listed here for the SAME allowlist reason as the
+        # two keys above: the loop below iterates `defaults`, so a key present in
+        # aspirations.yaml but absent from this dict is silently discarded — the
+        # K knob would read as its default forever with no parse error.
+        "drain_lane_enabled": True,
+        "drain_lane_interval_iterations": 5,
     }
     try:
         import importlib.util
@@ -3686,6 +3702,155 @@ def apply_substantive_demotion(scored, config):
     return scored
 
 
+def _drain_lane_state_path(agent_dir):
+    return None if agent_dir is None else agent_dir / "session" / "drain-lane-state.json"
+
+
+def read_drain_lane_state(agent_dir):
+    """Read the persisted lane cadence counter. Fail-open to a fresh counter."""
+    p = _drain_lane_state_path(agent_dir)
+    if p is None:
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as fh:
+            v = json.load(fh)
+        return v if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
+def write_drain_lane_state(agent_dir, state):
+    """Atomically persist the lane cadence counter (tempfile + os.replace, the
+    same durability pattern as write_scorer_verdict). FAIL-OPEN: a write failure
+    is swallowed to stderr. Worst case the counter does not advance, which makes
+    the lane fire LESS often — the safe direction for an anti-flood guard."""
+    p = _drain_lane_state_path(agent_dir)
+    if p is None:
+        return
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=".drain-lane-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(state, fh, ensure_ascii=False, indent=2)
+            os.replace(tmp, p)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+            raise
+    except Exception as e:  # pragma: no cover - defensive
+        print(f"[goal-selector] drain-lane state write failed "
+              f"({type(e).__name__}: {e})", file=sys.stderr)
+
+
+def apply_drain_lane(scored, config, agent_dir):
+    """Bounded drain lane (; decision (b)).
+
+    REORDERS the already-sorted list so ONE genuinely-starved recurring goal
+    takes the top slot, at most once per K invocations. Returns the promoted
+    row, or None.
+
+    WHY REORDER AND NOT RESCORE. Two clamps downstream of recurring_urgency each
+    flatten distinct overdue ratios onto a single value — the urgency cap
+    (g-115-4047: 16/21 starved rows spanning 5.1x-78.7x all land on +3.20) and
+    apply_substantive_demotion's `score = cap` above (g-115-4045). So no
+    score-side change can restore drain ORDERING; the information is already
+    gone by the time the sort runs. Keying on overdue ratio here, after the
+    sort, bypasses both clamps. It also makes acceptance bucket 3 true by
+    construction: this function never writes `score`, so every non-lane pick is
+    byte-identical to pre-lane behavior.
+
+    ELIGIBILITY reuses overdue_exemption_level — the SAME predicate FW-1
+    demotion-exemption and the g-115-4018 saturation relief consume — so the
+    three mechanisms cannot drift apart. Mind the scale: that predicate compares
+    the SELECTOR's overdue_ratio = (age - interval)/interval, which is exactly
+    1.0 LOWER than the ratio recurring-starvation-check headlines (age/basis).
+    Authoring an eligibility expectation from the detector's number is
+    guard-2004's third trap, and it already bit this goal's own acceptance
+    criteria: two of the five rows originally listed as past-exempt measured
+    4.57 and 4.76 on this scale and are NOT eligible.
+
+    CADENCE counts selector INVOCATIONS, not wall-clock iterations. An ad-hoc
+    diagnostic run therefore advances the counter. That is deliberate and
+    stated rather than engineered around: the guarantee is "at most one lane
+    pick per K invocations", which still bounds the flood, and the alternative
+    (an iteration id the selector does not own) would couple this to loop state
+    it cannot see.
+
+    Existing filters are untouched — blocked/deferred/claimed/intended_agent
+    routing all still apply upstream, so the lane can only promote a row that
+    was already a legitimate candidate for THIS agent.
+    """
+    if not scored or not config.get("drain_lane_enabled", True):
+        return None
+    k = int(config.get("drain_lane_interval_iterations") or 0)
+    if k <= 0:
+        return None  # non-positive K disables the lane rather than dividing by it
+
+    state = read_drain_lane_state(agent_dir)
+    try:
+        since = int(state.get("invocations_since_pick") or 0)
+    except Exception:
+        since = 0
+    since += 1
+
+    eligible = [
+        s for s in scored
+        if s.get("recurring")
+        and overdue_exemption_level(
+            float(s.get("recurring_overdue_ratio") or 0.0),
+            float(s.get("recurring_interval_hours") or 0.0),
+            config,
+        ) >= 1.0
+    ]
+
+    picked = None
+    if eligible and since >= k:
+        # MOST overdue first; deterministic tiebreak mirrors the main sort so a
+        # tie can never reorder run-to-run.
+        eligible.sort(key=lambda s: (
+            -float(s.get("recurring_overdue_ratio") or 0.0),
+            str(s.get("aspiration_id") or ""),
+            str(s.get("goal_id") or ""),
+        ))
+        picked = eligible[0]
+        if scored[0] is not picked:
+            scored.remove(picked)
+            scored.insert(0, picked)
+        picked["drain_lane_pick"] = True
+        since = 0
+
+    write_drain_lane_state(agent_dir, {
+        "invocations_since_pick": since,
+        "k": k,
+        "eligible_count": len(eligible),
+        "last_pick_goal_id": (picked or {}).get("goal_id") or state.get("last_pick_goal_id"),
+        "ts": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+    })
+    return picked
+
+
+def emit_drain_lane_banner(picked, eligible_count, since, k):
+    """stderr-only (stdout JSON is what the orchestrator parses). Says WHY the
+    top pick is not the scorer's, so the LLM does not read a lane pick as a
+    scoring anomaly. Silence when the lane did not fire is deliberate: a banner
+    on every quiet iteration would train the reader to skip it."""
+    if picked is None:
+        return
+    print(
+        "[goal-selector] DRAIN-LANE: promoted {gid} to top — recurring goal "
+        "{r:.2f}x overdue on the SELECTOR scale ((age-interval)/interval), past the "
+        "exemption bar, and {n} eligible row(s) were starved. Scores are UNCHANGED; "
+        "only ordering moved, for this one slot, at most once per {k} invocations. "
+        "This IS the sanctioned top pick — claim it without a deviation code.".format(
+            gid=picked.get("goal_id"), r=float(picked.get("recurring_overdue_ratio") or 0.0),
+            n=eligible_count, k=k),
+        file=sys.stderr,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
@@ -3997,6 +4162,30 @@ def cmd_select(args):
 
     # Sort: highest score first, then lower aspiration number, then lower goal number
     scored.sort(key=lambda x: (-x["score"], x["aspiration_id"], x["goal_id"]))
+
+    # Bounded drain lane (, decision (b)). Runs AFTER the sort
+    # because it REORDERS rather than rescores, and BEFORE write_scorer_verdict
+    # below so the sidecar records the lane pick as the sanctioned top — the claim
+    # gate then accepts it without a deviation code, which is the intended
+    # semantics: when the lane fires, its pick IS the top pick. Wrapped defensively
+    # for the same reason as the banners — a lane bug must never suppress the
+    # ranked-candidate output that every agent depends on each iteration.
+    try:
+        _lane_k = int(RECURRING_CONFIG.get("drain_lane_interval_iterations") or 0)
+        _lane_pick = apply_drain_lane(scored, RECURRING_CONFIG, AGENT_DIR)
+        if _lane_pick is not None:
+            _lane_elig = sum(
+                1 for s in scored
+                if s.get("recurring")
+                and overdue_exemption_level(
+                    float(s.get("recurring_overdue_ratio") or 0.0),
+                    float(s.get("recurring_interval_hours") or 0.0),
+                    RECURRING_CONFIG) >= 1.0
+            )
+            emit_drain_lane_banner(_lane_pick, _lane_elig, 0, _lane_k)
+    except Exception as e:  # pragma: no cover - defensive; lane must never block
+        print(f"[goal-selector] drain-lane error "
+              f"({type(e).__name__}: {e})", file=sys.stderr)
 
     # : log meta-strategy application. Proof-of-concept that the
     # goal-selection-strategy.yaml WAS consulted during this iteration —

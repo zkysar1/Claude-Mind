@@ -20,8 +20,9 @@ This sweeper closes the gap:
      aspirations.jsonl: `insight_trigger:<msg_id>` (this sweeper) and
      `board_post:<msg_id>` (existing insight-trigger-gate.py). See
      core/config/conventions/board.md "Forward-Routing" for the asymmetry.
-  5. Files an Apply goal in the world queue under asp-115 with
-     `intended_agent=<x>` and `origin_signal=insight_trigger:<msg_id>`.
+  5. Files an Apply goal under the RESOLVED escalation aspiration (see
+     `_escalation_target`; asp-115 upstream, whatever exists locally elsewhere)
+     with `intended_agent=<x>` and `origin_signal=insight_trigger:<msg_id>`.
   6. Caps filings at MAX_GOALS_PER_RUN to bound any spam blast radius.
 
 Channel scope (g-115-3925, 2026-07-29)
@@ -46,6 +47,7 @@ Callers
 """
 import argparse
 import json
+import os
 import re
 import sys
 from datetime import datetime, timedelta
@@ -55,10 +57,29 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "core" / "scripts"))
 import _rt  # noqa: E402  — canonical Python -> daemon client (post-cutover; see _rt.py)
-from _paths import WORLD_DIR, agents_root as _agents_root  # noqa: E402
+from _paths import AGENT_DIR, CORE_ROOT, WORLD_DIR, agents_root as _agents_root  # noqa: E402
+# : never hardcode the escalation aspiration.  is the UPSTREAM
+# deployment's recurring-infra queue; this is a framework file that travels the
+# promotion chain, so a literal here files into a nonexistent aspiration on every
+# other deployment. _escalation_target resolves to one that ACTUALLY EXISTS.
+try:
+    from _escalation_target import resolve as _resolve_asp, source_flag as _asp_source
+    ESCALATION_ASP, _ESCALATION_ASP_VIA = _resolve_asp(CORE_ROOT, WORLD_DIR, AGENT_DIR)
+    ESCALATION_SOURCE = _asp_source(ESCALATION_ASP, WORLD_DIR, AGENT_DIR)
+except Exception:
+    ESCALATION_ASP, _ESCALATION_ASP_VIA, ESCALATION_SOURCE = (
+        "asp-115", "fallback:import-failed", "world")
+# : reuse the canonical <agent>@<env-id> splitter — do NOT re-derive
+# peer detection (cross-deployment-channel.md "Addressing an agent").
+from peer_surface import split_author  # noqa: E402
 
 BOARD_DIR = WORLD_DIR / "board"
 WORLD_ASPS = WORLD_DIR / "aspirations.jsonl"
+#  addressing-rule inputs. The registry is committed under core/ so it
+# is always locally readable; team-state shards are the roster's durable form.
+ENV_REGISTRY_DIR = PROJECT_ROOT / "core" / "config" / "environments"
+ENV_LOCAL_FILE = PROJECT_ROOT / ".env.local"
+TEAM_SHARDS_DIR = WORLD_DIR / "team-state" / "agents"
 
 # Files under board/ that are NOT message channels. `<channel>-reads.jsonl` is
 # the per-channel read-tracking sidecar (rows are {msg_id, reader_agent, ...},
@@ -248,6 +269,167 @@ def load_triggers():
 
 
 # ---------------------------------------------------------------------------
+# Addressing resolution ( — enforces cross-deployment-channel.md
+# "Addressing an agent: requires_action_by and the collision set")
+# ---------------------------------------------------------------------------
+
+
+def _load_env_registry():
+    """{env_id: entry-dict} from core/config/environments/*.yaml.
+
+    Each entry may carry an OPTIONAL `known_agents` list — agent names known to
+    operate in that deployment (the durable half of the collision set). Absence
+    of the field contributes no names. Fail-open: any read/parse error yields
+    fewer entries, never an abort — a missing registry degrades to "no peers
+    known", which preserves the bare-name-means-local installed base.
+    """
+    registry = {}
+    try:
+        import yaml
+        if ENV_REGISTRY_DIR.is_dir():
+            for p in sorted(ENV_REGISTRY_DIR.glob("*.yaml")):
+                try:
+                    data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+                except Exception:
+                    continue
+                env_id = str(data.get("environment_id") or "").strip()
+                if env_id:
+                    registry[env_id] = data
+    except Exception:
+        pass
+    return registry
+
+
+def _self_env():
+    """This deployment's ENVIRONMENT_ID: env var first, then .env.local.
+
+    Returns None when unresolvable. Callers treat None conservatively: an
+    explicit @env target then REFUSES (recoverable, names the post) rather
+    than guessing local — a wrong guess is the exact defect the rule bans.
+    """
+    v = (os.environ.get("ENVIRONMENT_ID") or "").strip()
+    if v:
+        return v
+    try:
+        for line in ENV_LOCAL_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("ENVIRONMENT_ID="):
+                v = line.split("=", 1)[1].strip().strip('"').strip("'")
+                if v:
+                    return v
+    except OSError:
+        pass
+    return None
+
+
+def _local_roster():
+    """Local agent names — team-state shard basenames (the roster's durable
+    form), falling back to conf-bearing agent dirs. Fail-open to empty set,
+    which yields an empty collision set (bare names keep routing local)."""
+    try:
+        if TEAM_SHARDS_DIR.is_dir():
+            names = {p.stem for p in TEAM_SHARDS_DIR.glob("*.yaml")}
+            if names:
+                return names
+    except OSError:
+        pass
+    try:
+        return {
+            d.name for d in _agents_root().iterdir()
+            if d.is_dir() and (d / "local-paths.conf").is_file()
+        }
+    except OSError:
+        return set()
+
+
+def resolve_addressing(triggers):
+    """Apply the cross-deployment addressing rule to each trigger's target.
+
+    THE RULE (cross-deployment-channel.md, decided g-115-3929):
+      1. `<agent>@<env-id>` is EXACT — @self-env resolves to the local agent
+         (qualifier stripped); @peer-env is the PEER deployment's agent and
+         must not convert into this deployment's queue; @unregistered-env
+         cannot be vouched for.
+      2. A bare name NOT in the collision set means the LOCAL agent (the
+         87% installed base — preserved unchanged).
+      3. A bare name IN the collision set is AMBIGUOUS and FAILS LOUD. Never
+         silently default to local: a wrong route passes validation cleanly;
+         a refusal names the post so the author can qualify it.
+
+    Collision set = local roster ∩ (registry known_agents of peer envs ∪
+    authors observed in explicit <agent>@<peer-env> form this window). The
+    registry field is the durable source; the observation pass is additive
+    evidence for peers nobody declared. Recomputed every run — never
+    hardcoded (the convention forbids solving this by naming names in code).
+
+    Returns (resolved, refused, collision_sorted): `resolved` triggers carry a
+    LOCAL bare target; `refused` entries name msg_id + verdict + reason.
+    """
+    registry = _load_env_registry()
+    self_env = _self_env()
+    if self_env is None:
+        print(
+            "[insight-trigger-sweep] WARN: ENVIRONMENT_ID unresolvable — "
+            "explicit @env targets will be refused, not guessed local",
+            file=sys.stderr,
+        )
+    peer_envs = {e for e in registry if e != self_env}
+    peer_agents = set()
+    for env in peer_envs:
+        for name in (registry.get(env, {}).get("known_agents") or []):
+            name = str(name).strip()
+            if name:
+                peer_agents.add(name)
+    for t in triggers:
+        a_name, a_env = split_author(t.get("author"))
+        if a_env and a_env in peer_envs and a_name:
+            peer_agents.add(a_name)
+    roster = _local_roster()
+    collision = roster & peer_agents
+
+    resolved = []
+    refused = []
+    for t in triggers:
+        name, env = split_author(t.get("target"))
+        if env is not None:
+            if self_env is not None and env == self_env:
+                local_t = dict(t)
+                local_t["target"] = name  # explicit local — strip the qualifier
+                resolved.append(local_t)
+            elif env in peer_envs:
+                refused.append({
+                    "msg_id": t["msg_id"], "author": t["author"],
+                    "target": t["target"], "verdict": "peer_addressed",
+                    "reason": (
+                        f"addressed to {name}@{env} — a peer deployment's "
+                        "agent; not convertible into this deployment's queue"
+                    ),
+                })
+            else:
+                refused.append({
+                    "msg_id": t["msg_id"], "author": t["author"],
+                    "target": t["target"], "verdict": "unknown_env",
+                    "reason": (
+                        f"env-id '{env}' is not in core/config/environments/ "
+                        "— cannot vouch for an unregistered deployment"
+                    ),
+                })
+        elif name in collision:
+            refused.append({
+                "msg_id": t["msg_id"], "author": t["author"],
+                "target": t["target"], "verdict": "ambiguous_collision",
+                "reason": (
+                    f"bare '{name}' exists in BOTH the local roster and a peer "
+                    "deployment — ambiguous; qualify as "
+                    f"{name}@<env-id> (cross-deployment-channel.md clause 3)"
+                ),
+            })
+        else:
+            resolved.append(t)
+    return resolved, refused, sorted(collision)
+
+
+# ---------------------------------------------------------------------------
 # Apply-time goal-status re-probe (, rb-1150)
 # ---------------------------------------------------------------------------
 
@@ -426,7 +608,7 @@ def file_goal(trigger, *, dry_run=False):
     )
     try:
         resp = _rt.aspirations_add_goal(
-            "asp-115", payload, source="world",
+            ESCALATION_ASP, payload, source=ESCALATION_SOURCE,
             overrides={"All": justification},
         )
         return {
@@ -458,7 +640,11 @@ def main():
 
     dry_run = args.dry_run
 
-    triggers = load_triggers()
+    raw_triggers = load_triggers()
+    # : addressing resolution BEFORE dedup/filing — a refused target
+    # must never reach the filing loop, and refusal-first beats dedup (the
+    # safety verdict outranks the bookkeeping one).
+    triggers, addressing_refused, collision_set = resolve_addressing(raw_triggers)
     converted_ids = load_converted_ids()
     pending = []
     skipped = []
@@ -521,7 +707,12 @@ def main():
         # scan is the exact defect this replaces, so the scope must be
         # visible in the output rather than inferable from the source.
         "channels_scanned": [p.stem for p in board_channels()],
-        "scanned": len(triggers),
+        "scanned": len(raw_triggers),
+        # : refusals must be VISIBLE in the output, not inferable
+        # from source — a silent skip is the defect class the rule bans.
+        "collision_set": collision_set,
+        "addressing_refused": len(addressing_refused),
+        "addressing_refused_details": addressing_refused,
         "skipped_already_converted": len(skipped),
         "audit_stale": len(audit_stale),
         "affects_missing": len(affects_missing),
@@ -553,9 +744,14 @@ def main():
         print(f"[insight-trigger-sweep] mode={summary['mode']} "
               f"channels={','.join(summary['channels_scanned']) or 'none'} "
               f"scanned={summary['scanned']} "
+              f"addressing_refused={summary['addressing_refused']} "
               f"skipped={summary['skipped_already_converted']} filed={summary['filed']} "
               f"audit_stale={summary['audit_stale']} affects_missing={summary['affects_missing']} "
               f"overflow={summary['overflow']}")
+        for r in addressing_refused:
+            tag = r["verdict"].upper().replace("_", "-")
+            print(f"  REFUSED-{tag}: {r['msg_id']} from {r['author']} "
+                  f"target={r['target']} -- {r['reason']}")
         for f in filed:
             t = f["trigger"]
             r = f["result"]

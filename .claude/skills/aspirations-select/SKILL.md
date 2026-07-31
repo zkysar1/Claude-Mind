@@ -39,6 +39,7 @@ plus metacognitive assessment (model judgment on familiarity, value, cost, infra
 - `selection_context`: Raw parsed output from goal-selector.sh (includes `by_reason`, `blocked_goals`, `blocked_count` when all_blocked)
 - `selection_reason`: Why no goal was returned (`"all_blocked"`, `"all_blocked_by_gate"`, or absent when goal selected)
 - `source`: Queue origin of the selected goal (`"world"` or `"agent"`) — from goal-selector output. Pass to all downstream `aspirations-*.sh` calls via `--source {source}`.
+- `deviation_code`: Scorer Sovereignty Layer B (g-115-2812) — the sanctioned-deviation enum code when the selected goal is NOT the scorer's top pick (`ranked_goals[0]`), else `""`. Phase 4's world-goal claim forwards it via `aspirations-claim.sh {goal.id} --deviation {deviation_code}`. Computed in Phase 2.94.
 
 ## Phase 2: Select Next Goal
 
@@ -67,7 +68,7 @@ IF parsed_output is a JSON object with "all_blocked": true:
     RETURN (goal = None, selection_reason = "all_blocked", selection_context = parsed_output)
 
 ranked_goals = parsed_output  # JSON array of scored candidates
-# Each entry: {goal_id, aspiration_id, title, skill, category, recurring, score, breakdown, raw, cross_world_origin}
+# Each entry: {goal_id, aspiration_id, title, skill, category, recurring, score, breakdown, raw, cross_world_origin, intended_agent, routed_to_me}
 # Foreign-goal display hint (g-336-12): cross_world_origin is non-null
 # "<identity>@<origin-world>" ONLY on goals injected by a cross-world INFLUENCE
 # grant; null for native goals. Whenever a candidate is rendered to a
@@ -76,6 +77,14 @@ ranked_goals = parsed_output  # JSON array of scored candidates
 # badge when the field is non-null, so the agent KNOWS it is executing another
 # world's intent and applies appropriate scrutiny (guardrails, review gate).
 # A native goal (null) renders unchanged — no badge, no false positive.
+# Routed-to-me display hint (g-115-2940): routed_to_me is true ONLY on a
+# source='cross-agent:<owner>' candidate, which — by collect_cross_agent_candidates'
+# strict-match contract (intended_agent==agent_name) — is BY CONSTRUCTION routed to
+# THIS agent. When routed_to_me is true, render the goal as
+# " [routed to YOU (owner: {source.split(':',1)[1]})]" and treat it as YOUR work,
+# NOT another agent's: a 'cross-agent'/not-my-lane abstention on it is ALWAYS wrong
+# (Phase 2.55 CROSS-AGENT-ROUTED EXEMPTION). Dropping intended_agent made bravo
+# abstain 13x from its own HIGH-routed g-001-339.
 
 # Partner-claim filter: drop any goal the partner is already in_flight on.
 # This is the live claim-conflict HINT — it avoids wasting decomposition and
@@ -106,13 +115,81 @@ Directives influence scoring (handled mechanically by `goal-selector.py` `direct
 criterion). The LLM handles acknowledgment and insight trigger processing.
 
 ```
-# Directive acknowledgment
-Bash: board-read.sh --channel coordination --type directive --since 24h --json
-FOR EACH directive WHERE no acknowledgment reply from this agent exists:
+# Directive acknowledgment + HONOR (g-115-2797 / guard-1310 — directive-target lane-skip gap)
+# TWO reads with DIFFERENT scopes (g-115-2990 / discovered_by g-115-2768 — the old SINGLE
+# read re-acked every directive in the 24h window EVERY iteration, 5×-spam): the ACK path must
+# DEDUP (ack a directive at most once per agent), while the HONOR path needs ALL active
+# directives (acked or not) so a still-targeted goal keeps getting honored.
+#
+# HONOR read — full scan, ALL active directives (NO --unread-only, NO --mark-read; the ACK
+# read below owns marking): feeds the directive_targeted_goals honor set. A directive I acked
+# yesterday whose target is in TODAY's ranked_goals must still be honored, so this read must
+# NOT filter by seen-state.
+Bash: all_directives = board-read.sh --channel coordination --type directive --since 24h --json
+# ACK read — DEDUP scan: --unread-only returns ONLY directives THIS agent has not yet seen
+# (the per-agent read-receipt seen-set is the dedup key); --mark-read records the receipt so
+# the NEXT iteration's --unread-only filters them out. This is the g-115-2990 fix: the old
+# single read used --mark-read WITHOUT --unread-only, so receipts were WRITTEN but never
+# CONSUMED, and the loop condition "no acknowledgment reply from this agent exists" was
+# UNVERIFIABLE from a directive-only read (the type=status ack replies were never loaded) — so
+# the LLM re-acked every directive every iteration. --mark-read ALSO preserves the g-2797
+# delivery-observability receipt (a directive is marked the first iteration it is unseen).
+Bash: new_directives = board-read.sh --channel coordination --type directive --since 24h --unread-only --mark-read --json
+directive_targeted_goals = {}   # goal_id -> directive_id, ONLY for directives directed at THIS agent
+FOR EACH directive in new_directives:   # ONLY unseen directives — dedup by construction
+    # Terminal-target short-circuit (mirror the select-path stale-trigger detection
+    # g-115-2969 / guard-1310): a directive whose target:{goal-id} tags are ALL terminal
+    # (completed/skipped/expired) is MOOT — the work it tasked is already done, so acking it is
+    # noise. Do NOT ack (the --mark-read above already recorded the receipt, so it will not
+    # re-surface next iteration). Read each target's current status: Bash: aspirations-read.sh
+    # --source <world|agent> --id asp-<NNN>, then find the goal by id (the aspiration prefix is
+    # g-<NNN>-*); or aspirations-read.sh --source <world|agent> --id <asp-id> to read
+    # a specific aspiration. NOTE: aspirations-query.sh has NO --goal-id flag (it takes
+    # --goal-status / --title-contains / --goal-field / --full and errors without one).
+    targets = [t.split(":",1)[1] for t in (directive.tags or []) if t.startswith("target:")]
+    IF targets is non-empty AND every target goal's status in (completed, skipped, expired):
+        Output: "▸ DIRECTIVE (moot — targets {targets} already terminal): {directive.id}, no ack (g-115-2990)"
+        continue
     Output: "▸ DIRECTIVE: {directive.text} (from {directive.author}, weight: {parsed weight})"
     echo "Acknowledged directive {directive.id}" | \
       Bash: board-post.sh --channel coordination --type status \
         --reply-to {directive.id} --tags "acknowledged,{AGENT_NAME}"
+# Build the honor set from ALL active directives in all_directives (acked or not): a directive is
+# DIRECTED AT THIS AGENT when its tags include AGENT_NAME (bare) or requires_action_by:{AGENT_NAME}
+# — OR its text names this agent AND the directive carries NO explicit routing tag (g-115-2870).
+# An explicit routing tag (any requires_action_by:* tag, OR a bare tag that is another known
+# agent's name) takes PRECEDENCE over a loose prose mention: a directive routed to agent X but
+# naming agent Y in an exclusionary clause ("X please claim; Y cannot do it") must NOT flag Y,
+# and a self-authored directive (author names self in prose) must not flag the author. The
+# prose-mention fallback fires ONLY when no routing tag is present. Each of a directed
+# directive's target:{goal-id} tags names a goal this agent is tasked to prioritize.
+# (Mirrors goal-selector.py emit_directive_honor_banner exactly so both enforcement points agree.)
+FOR EACH directive in all_directives WHERE it is directed at this agent
+        (tag AGENT_NAME / requires_action_by:{AGENT_NAME}, OR text names agent ONLY WHEN no
+         explicit routing tag is present) AND still active:
+    FOR EACH "target:{goal-id}" tag: directive_targeted_goals[goal-id] = directive.id
+
+# ── DIRECTIVE-HONOR HARD RULE (guard-1310 — the residual LLM-path gap) ──
+# The selector's directive_boost (+3.0, criterion 13b) already ranks a directed goal near
+# the top, but that boost is a SILENT scoring nudge — the LLM selection path (lane
+# discipline / self-abstention / focus judgment in Phase 2.5–2.55) can still pass over it.
+# On 2026-07-20 a USER DIRECTIVE targeting zeta (g-315-390, +2.0) was lane-skipped as
+# "Echo's ARC lane" across 5+ selections over 8h; directive_boost pushed it to #1/#2 every
+# time and the LLM skipped it anyway (0 acks, 0 read-receipts) — then re-committed the
+# identical skip live DURING the g-115-2797 investigation. THEREFORE:
+IF directive_targeted_goals is non-empty AND any of its goal-ids is in ranked_goals:
+    honored = highest-scored ranked_goals entry whose id is in directive_targeted_goals
+    Output: "▸ ⚠ DIRECTIVE-HONOR REQUIRED: {honored.id} is targeted by directive
+      {directive_targeted_goals[honored.id]} directed at YOU (score {honored.score}). A
+      directive-targeted goal MUST NOT be passed over by lane / focus / consolidate /
+      self-abstention judgment — a directive IS the tasking (self.md 'unless tasked' is
+      satisfied). SELECT {honored.id} now, OR post a justified-deferral ack (--reply-to the
+      directive) naming a HARD blocker (infra-blocked / genuine capability gap — NOT
+      lane/focus). A silent lane-skip is FORBIDDEN (guard-1310)."
+    # Overrides the lane-discipline / consolidate-before-expand preference for THIS pick
+    # only. It does NOT override a genuine blocker or real capability gap — those get a
+    # justified-deferral ack, not a silent skip. Unless such an ack is posted, set
+    # selected_goal = honored and skip the remaining lane/focus reasoning for this pick.
 
 # Insight trigger scan (cross-agent findings that affect our goals)
 Bash: board-read.sh --channel findings --type finding --since 24h --json
@@ -123,6 +200,25 @@ FOR EACH finding WITH "insight_trigger" in tags:
 
     IF requires_action_by does not match this agent: SKIP
     IF already processed (check for reply from this agent): SKIP
+
+    # Stale-trigger guard (g-115-2969 / rb-4860): a trigger whose affects:<goal-id>
+    # target has ALREADY gone terminal is moot — acting on it decides about
+    # finished work AND can clobber the completer's outcome_note (incident
+    # g-335-94: a stale zeta trigger for g-335-94, which completed ~1 min after
+    # the post, drove a moot select decision + overwrote bravo's outcome_note).
+    # Mirrors insight-trigger-sweep audit_stale (rb-1150) into the LLM
+    # select-path. For each affected goal-id, read its current status
+    # (Bash: aspirations-read.sh --source <world|agent> --id asp-<NNN>, then find
+    # the goal by id — the aspiration is the g-<NNN>-* prefix). Filter to
+    # NON-terminal affected goals; a goal whose status is completed/skipped/
+    # expired is terminal.
+    affected_live = [gid for gid in affected_goals if status(gid) not in ("completed","skipped","expired")]
+    IF affected_live is empty:
+        Output: "▸ INSIGHT TRIGGER (STALE): all affected goal(s) {affected_goals} already terminal — ack-as-stale, no action (g-115-2969)"
+        Acknowledge: echo "Stale insight trigger — affected goal(s) {affected_goals} already terminal at scan time; no action taken (g-115-2969)" | board-post.sh --reply-to {finding.id}
+        SKIP this finding
+    # else: act only on affected_live below (moot terminal goals are excluded from
+    # the investigate/constrain actions).
 
     IF severity == "invalidates":
         Output: "▸ INSIGHT TRIGGER (INVALIDATES): {finding.text}"
@@ -282,7 +378,30 @@ top-ranked goal's category before metacognitive assessment commits to it.
 
 ```
 top_goal = ranked_goals[0]
-Bash: retrieve.sh --category "{top_goal.category} {top_goal.title[:60]}" --depth shallow
+# --goal is REQUIRED here and is NOT optional decoration (g-115-3466).
+# retrieve.sh records the consult into agents/<agent>/session/retrieval-session.json
+# only when it can name a goal. Absent --goal it falls back to
+# retrieve.py::_infer_in_flight_goal_id(), which reads team-state in_flight — and
+# THIS phase runs during SELECTION, strictly BEFORE the Phase 4 claim that sets
+# in_flight. So the infer can only ever resolve to null (no write at all) or to the
+# PREVIOUS goal (a write credited to the wrong goal). Either way the consult that
+# did happen is invisible for the goal it was performed for, and
+# pre-apply-consult-drift-gate.py — which keys on `retrieval-summary: performed=false`
+# for framework-deep closes — advances its streak on a COMPLIANT close. An
+# enforcement layer that cannot see the compliance it demands punishes the compliant
+# and trains the agent to distrust the sentinel, which is the same drift-to-miss the
+# gate exists to stop.
+# MEASURED 2026-07-27 (mtime discriminator, alpha/cc-04): in_flight populated + no
+# --goal DOES write (so the infer leg itself is sound — the defect is this call
+# site's ordering, not the fallback); in_flight null + no --goal does NOT write;
+# --read-only suppresses the write in all cases. The sibling call site in
+# code-review-protocol.md step 4 needs NO change: it runs inside Phase 4, after the
+# claim, where infer resolves correctly.
+# Caveat: on a sanctioned deviation the executed goal may differ from
+# ranked_goals[0], so this pre-write can name a candidate that is not ultimately
+# claimed. That is strictly better than naming the previous goal or nothing, and the
+# Phase 4 goal-execution retrieval (which passes --goal explicitly) corrects it.
+Bash: retrieve.sh --category "{top_goal.category} {top_goal.title[:60]}" --depth shallow --goal {top_goal.goal_id}
 
 From the returned JSON, surface to Phase 2.5:
   - guardrails[] whose rule constrains work in this category right now
@@ -327,9 +446,15 @@ For selected goal, assess:
 
 5. CONSOLIDATION: Check consolidation_health from working memory.
    IF near_complete aspirations exist (consolidation_health.near_complete > 0):
-       Bias toward goals in those aspirations — completion pull is strongest near the finish.
+       Consolidation is handled by the scorer — the scorer ranking IS the consolidation
+       assessment (completion_pressure + tail_bonus + depth_bonus + streak_momentum +
+       context_coherence already meter completion pull, ~4.3 weight-points). Do NOT apply
+       additional consolidation pressure as a per-pick veto over the ranking; trust
+       ranked_goals[0]. (The guard-1310 DIRECTIVE-HONOR hard rule in Phase 2.07 still
+       governs directive-targeted picks — that is a directive obligation, not consolidation.)
    IF selected goal is from a stalled aspiration (consolidation_health.stalled > 0):
-       Consider effort_level = "full" (invest deeply to unstall, not skim).
+       Consider effort_level = "full" (invest deeply to unstall, not skim) — this governs
+       HOW to execute, not WHICH goal to pick.
 
 Apply focus context to value assessment.
 ```
@@ -347,6 +472,22 @@ IF capability_level < auto_designate_below_capability threshold:
 # Can I add genuine value to this goal given my capabilities?
 # Not about effort — about capability match. (arXiv 2603.28990: 8.6% voluntary
 # abstention in top model improves overall system quality.)
+# DIRECTIVE EXEMPTION (guard-1310, g-115-2797): a goal in directive_targeted_goals
+# (Phase 2.07 — directed at THIS agent) is NOT abstainable on lane/focus grounds. Only a
+# GENUINE capability gap justifies deferral, and it must be a justified-deferral ack
+# (--reply-to the directive naming the hard blocker), NEVER a silent abstain. "Focus
+# mismatch" / "not my lane" is satisfied by the directive itself — do not abstain on it.
+# CROSS-AGENT-ROUTED EXEMPTION (g-115-2940): a candidate with routed_to_me==true
+# (source='cross-agent:<owner>') is BY CONSTRUCTION routed to THIS agent —
+# collect_cross_agent_candidates' strict-match contract only pulls goals where
+# intended_agent==agent_name. So it IS your work, not "someone else's goal": a
+# 'cross-agent'/not-my-lane/'focus mismatch' abstention on it is ALWAYS wrong (the
+# exact bug this goal fixes — bravo abstained 13x from its own HIGH-routed g-001-339,
+# reading source='cross-agent:alpha' as "alpha's goal"). Do NOT set abstained_by or
+# deviation=cross-agent on a routed_to_me candidate. Only a GENUINE capability gap
+# (the goal needs a skill outside your "What I Do") justifies deferral — and then via
+# defer_reason naming the hard gap, never a lane abstention. The intended_agent
+# stamp IS the tasking.
 IF goal requires capabilities outside agents/<agent>/self.md "What I Do" section:
     IF goal.abstained_by is set AND goal.abstained_by != AGENT_NAME:
         # Both agents can't do this goal — defer with timestamp for expiry
@@ -418,6 +559,45 @@ Bash: aspirations-read.sh --source {goal.source} --id {goal.aspiration_id}
 goal = find by goal_id in returned aspiration's goals array
 ```
 
+## Phase 2.94: Scorer-Divergence Deviation Code (Scorer Sovereignty Layer B, g-115-2812)
+
+The claim chokepoint (`scorer-verdict-gate.py`, invoked inside
+`aspirations-claim.sh`) REFUSES a world-goal claim that diverges from the
+scorer's fresh top pick unless a `--deviation <code>` names the sanctioned
+reason. `goal-selector.py` writes the verdict sidecar (`top_goal_id` =
+`ranked_goals[0]`); compute `deviation_code` here so Phase 4 can forward it.
+This is a single-point computation (compare the finalized selection to the
+scorer top) — NOT a variable threaded through the divergence phases above — so
+a sanctioned divergence can never silently reach the claim without a code.
+
+```
+IF goal is None:
+    deviation_code = ""          # no claim will happen
+ELIF ranked_goals is empty OR goal.goal_id == ranked_goals[0].goal_id:
+    deviation_code = ""          # HAPPY PATH: claiming the scorer's top pick — no flag needed
+ELSE:
+    # Selection diverged from the scorer top via a sanctioned phase above. Set
+    # the enum code matching the phase that caused THIS divergence (the gate
+    # ALLOWS any valid code — the code is for Layer C audit granularity, not
+    # correctness, so an approximately-right code still passes; picking NO code
+    # or an invalid one is the only failure):
+    #   first-action     — First-Action Override (first-iteration handoff)
+    #   partner-claim    — partner-claim filter dropped the scorer top
+    #   guardrail-forbids — Phase 2.27 guardrail forbade the top goal now
+    #   self-abstention  — Phase 2.55 abstained past the top goal
+    #   blocker-gate     — Phase 2.5b blocker/infra probe skipped the top goal
+    #   precondition-fail — Precondition Gate removed the top goal
+    #   meta-tiebreaker  — Phase 2.05/2.07 meta re-sort chose a different top
+    #   cross-agent      — deliberately claiming a cross-lane / foreign-world goal
+    #   no-goals-rebound — the scorer top is gone from the live queue; rebounded
+    #   force-override   — explicit last-resort escape hatch (audited)
+    deviation_code = <the enum code matching the sanctioned path that diverged>
+    Output: "▸ SCORER-DIVERGENCE: claiming {goal.goal_id} over scorer top {ranked_goals[0].goal_id} — deviation={deviation_code}"
+```
+
+Emit `deviation_code` as a Phase output (see Outputs). Only world-goal claims
+consult it; agent-queue goals are single-agent and never claim.
+
 ## Phase 2.95: Anchor Selection for Autocompact Resilience
 
 Write an iteration checkpoint with the selected goal id. Survives autocompact
@@ -428,6 +608,24 @@ g-250-13 because the compact summary reconstructed the wrong in-flight goal).
 
 Cleared in `/aspirations-execute` Phase 8 on goal completion and in
 `/start --recover` / `aspirations-graceful-stop` D6.
+
+**This phase is NO LONGER the only anchor for `source == world`, and is STILL
+the only one for `source == agent` (g-115-3590).** `aspirations-claim.sh`
+`_post_claim_effects` now anchors the checkpoint itself on every rc=0 claim, so
+a loop that selects by calling `goal-selector.sh` directly instead of invoking
+this skill still gets a world-goal anchor — that drift was the measured cause of
+101 `update_against_missing_checkpoint` rows on one box. The claim chokepoint
+uses ENSURE semantics (writes only when no checkpoint exists or it names a
+DIFFERENT goal), so when this phase has already run its RICHER anchor
+(`selector_score`, `skill`, `cross_agent_owner`) survives untouched.
+
+Agent-queue and cross-agent goals never reach that chokepoint: the daemon claim
+endpoint refuses them `400 agent_queue_goal` **by design** ("Agent-queue goals do
+not require claims... Proceed directly to execution"), and the loop digest
+correctly guards the claim with `IF source==world`. So do NOT retire this phase
+on the strength of the claim-side wiring — for `source == agent` (which includes
+every recurring cadence goal, `g-001-01`..`g-001-10`) it is the ONLY init site
+there is.
 
 ```
 # Cross-agent source translation (g-115-978 Option 3). collect_cross_agent_candidates

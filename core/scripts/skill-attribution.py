@@ -130,21 +130,49 @@ def _canon_skill(sk):
 
 
 def read_execution_diary(agent_name):
-    """Read <agent>/session/execution-diary.jsonl -> ts-sorted list of row dicts."""
+    """Read <agent>/session/execution-diary.jsonl -> ts-sorted list of row dicts.
+
+    Reads through the STORAGE BACKEND, not the local filesystem (g-115-4143).
+    execution-diary.jsonl is `sync_tier: continuity` in session-manifest.yaml and
+    is NOT machine-local, so under own-cloud the authoritative copy lives in S3
+    and the local tree is a read-through cache. That cache is populated per-AGENT:
+    owncloud-pull.sh is --agent-scoped and /start calls it for the bound agent
+    only (--all-agents exists but is used solely by /open-questions, scoped to
+    pending-questions.yaml). So a peer's diary is simply ABSENT on this box until
+    something reads it, and an os.path.exists() gate silently returned [] for
+    every agent but self — dropping their goal windows and with them the entire
+    left side of the invocation->outcome join.
+
+    The sibling ledger read above escapes this only because
+    skill-invocations.jsonl sits OUTSIDE session/ and is synced by a different
+    path; the two functions had identical code shape, so the asymmetry was in
+    cache state, never in the read (measured cc-02 2026-07-31: invocations local
+    for 5/5 agents, diaries local for 1/5 while all 5 were live in S3).
+
+    The failure is per-box and therefore differently wrong on every box — cc-05
+    read 2 of 5 agents, cc-02 read 1 of 5 — so its symptom (a near-zero
+    classification rate) is not reproducible from another machine's numbers.
+
+    A backend error other than absence is deliberately allowed to propagate: a
+    silent [] on an S3 fault would re-create exactly the vacuous zero this fix
+    removes (communication-clarity rule 5 — fail visibly, never degrade quietly).
+    """
+    from storage_backend import get_backend
     path = os.path.join(str(_paths.agents_root()), agent_name,
                         'session', 'execution-diary.jsonl')
     rows = []
-    if not os.path.exists(path):
-        return rows
-    with open(path, encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+    try:
+        text = get_backend().read_text(path)
+    except FileNotFoundError:
+        return rows  # genuinely absent in the store of record
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
     rows.sort(key=lambda r: r.get('timestamp', ''))
     return rows
 
@@ -230,6 +258,7 @@ def compute_join(agents, since_dt=None):
     """
     per_skill = defaultdict(lambda: {'success': 0, 'failure': 0, 'unknown': 0})
     failing = []
+    coverage = {}
     for ag in agents:
         invs = read_invocations(ag, since_dt=since_dt)
         if not invs:
@@ -246,6 +275,25 @@ def compute_join(agents, since_dt=None):
             outcome = _resolve_window_outcome(gid, start, end, is_last,
                                               journal_out, close_ts)
             win_outcomes.append((gid, start, end, outcome))
+        # Diary coverage ( part 2): the two ledgers have ASYMMETRIC
+        # retention — skill-invocations.jsonl is append-only across months, while
+        # execution-diary.jsonl is session-scoped (~8h). An invocation outside every
+        # window has no goal to attribute to and can only ever be 'unknown', so the
+        # classifiable CEILING is the in-span count, not the invocation total.
+        # Reported so a caller cannot read the resulting low rate as a join defect:
+        # --since/'all_time' describes the INVOCATION side only and overstates the
+        # window side. Measured cc-02 2026-07-31: 190 of 14788 invocations (1.28%)
+        # fell inside any diary span, and the join classified exactly 190 — i.e.
+        # 100% of what was structurally classifiable.
+        ts_all = sorted(r.get('ts', '') for r in invs if r.get('ts'))
+        d_ts = [r['timestamp'] for r in diary if r.get('timestamp')]
+        d_first, d_last = (d_ts[0], d_ts[-1]) if d_ts else (None, None)
+        in_span = sum(1 for t in ts_all if d_first and d_first <= t <= d_last)
+        coverage[ag] = {
+            'diary_first': d_first, 'diary_last': d_last,
+            'diary_windows': len(windows),
+            'invocations': len(ts_all), 'invocations_in_diary_span': in_span,
+        }
         for r in invs:
             ts = r.get('ts', '')
             sk = _canon_skill(r.get('skill', ''))
@@ -266,7 +314,18 @@ def compute_join(agents, since_dt=None):
             'success_rate': round(c['success'] / classified, 4) if classified else None,
         }
     failing.sort(key=lambda f: f['ts'])
-    return {'per_skill': out, 'failing': failing}
+    tot_inv = sum(c['invocations'] for c in coverage.values())
+    tot_span = sum(c['invocations_in_diary_span'] for c in coverage.values())
+    return {
+        'per_skill': out,
+        'failing': failing,
+        'diary_coverage': {
+            'per_agent': coverage,
+            'invocations': tot_inv,
+            'classifiable_ceiling': tot_span,
+            'ceiling_ratio': round(tot_span / tot_inv, 4) if tot_inv else None,
+        },
+    }
 
 
 def known_skills():

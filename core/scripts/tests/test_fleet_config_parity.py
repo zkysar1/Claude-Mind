@@ -530,5 +530,130 @@ def test_blackout_report_excludes_self_from_peer_list(monkeypatch):
     assert "selfagent" not in filed[0][1]
 
 
+# ── the _daemon_val logline-precedence branch () ───────────────────
+#
+#  added _daemon_val (fleet_config_parity.py ~L466-482) and shipped it with
+# ZERO coverage: a grep of this file for `_daemon_val` returned 0 as late as
+# 2026-07-31. The two tests that LOOK like they cover it
+# (test_incident_6_daemon_missing_resolved_config_is_caught,
+# test_file_is_not_the_authority_daemon_wins) pass only because their fixtures carry
+# no logline field at all — they exercise the FALLBACK arm, so precedence itself was
+# untested in both directions.
+#
+# That matters more than ordinary coverage debt because this checker AUTO-FILES: a
+# regression spends a whole agent iteration per false positive, and "fixing" phantom
+# drift can break a healthy box. It cost 31h of false HIGH config-drift goals on
+# foxtrot once already.
+#
+# The first two below are a PAIR and are worthless apart. Invariant 1 alone is
+# satisfied by a blanket suppressor that never reports STORAGE_BACKEND drift at all;
+# invariant 2 is the negative control that rules that out. Assert both or neither.
+
+
+def _logline(**over):
+    """A node whose daemon derives config IN-PROCESS — the  shape.
+
+    `resolved_*` comes from /proc/<pid>/environ, which exposes only the EXEC-TIME
+    block, so a daemon that derives its backend after exec reports "unset" there for
+    its whole life. The startup logline states what is actually in force. `cli_*` is
+    pinned explicitly (not left to _healthy's mirror-of-resolved default) so these
+    fixtures cannot manufacture an unrelated LANE DRIFT line and pass for the wrong
+    reason.
+    """
+    f = {"daemon_logline_readable": "yes", "resolved_STORAGE_BACKEND": "unset",
+         "cli_STORAGE_BACKEND": "own-cloud"}
+    f.update(over)
+    return _healthy(**f)
+
+
+def test_logline_wins_over_unset_environ():
+    """INVARIANT 1 — the literal false-positive shape, which must be PASS.
+
+    environ says "unset", the daemon's own startup line says own-cloud, the manifest
+    expects own-cloud. Reading `resolved_STORAGE_BACKEND` directly yields "unset" and
+    emits "daemon has no STORAGE_BACKEND (expected own-cloud)" against a node that is
+    demonstrably writing to own-cloud. Deleting the logline arm of _daemon_val fails
+    exactly here.
+    """
+    drift = _real(_logline(logline_STORAGE_BACKEND="own-cloud"))
+    assert drift == [], (
+        "a daemon whose startup logline declares the expected backend must produce "
+        "ZERO drift even when /proc environ reports it unset — this is the g-115-3157 "
+        "false positive verbatim: %r" % (drift,))
+
+
+def test_local_only_daemon_is_still_caught_through_the_logline():
+    """INVARIANT 2 — the negative control, and the one that can embarrass the fix.
+
+    A genuinely local-only daemon logs "<unset->local>", which _daemon_val normalises
+    to "local". Against an expected own-cloud that MUST still be drift. Without this,
+    invariant 1 is indistinguishable from a blanket suppressor and the failure the
+    checker exists for (2026-07-26: 28 of 49 daemon starts local-only, ~8 encodings
+    stranded) goes silent while the suite stays green.
+    """
+    drift = _real(_logline(logline_STORAGE_BACKEND="<unset->local>",
+                           cli_STORAGE_BACKEND="local"))
+    assert drift, "a local-only daemon against an own-cloud manifest must be caught"
+    # The EXACT expected-mismatch line, not a substring sweep. Measured 2026-07-31:
+    # a `any("STORAGE_BACKEND" in d and "local" in d)` form passed against a mutant
+    # that normalised <unset->local> to "own-cloud" — it was matching the unrelated
+    # LANE DRIFT line the fixture's cli_/daemon disagreement produces, so the test
+    # was green while the detection it exists for was gone (guard-385).
+    assert any("daemon-resolved STORAGE_BACKEND=local expected own-cloud" in d
+               for d in drift), (
+        "the manifest-mismatch line itself must be present — matching any line that "
+        "merely mentions the key passes on a lane-drift message instead: %r"
+        % (drift,))
+
+
+def test_unset_normalisation_is_storage_backend_only():
+    """The `else "unset"` half of the same two-line normalisation.
+
+    `<unset->local>` collapses to "local" ONLY for STORAGE_BACKEND, because that key
+    genuinely defaults to local; for any other key the same prefix means "absent" and
+    must fall through to the has-no-value branch. Widening the normalisation to all
+    keys would silently invent an ENVIRONMENT_ID of "local" and pass invariants 1-2.
+    """
+    drift = _real(_logline(logline_STORAGE_BACKEND="own-cloud",
+                           logline_ENVIRONMENT_ID="<unset->local>"))
+    # ABSENT branch specifically ("daemon has no X"), not the MISMATCH branch
+    # ("daemon-resolved X=local expected ..."). Both mention the key, so a bare
+    # `"ENVIRONMENT_ID" in d` sweep passed against a mutant that returned "local"
+    # for every key — the exact widening this test exists to forbid (guard-385).
+    assert any("daemon has no ENVIRONMENT_ID" in d for d in drift), (
+        "a <unset...> ENVIRONMENT_ID must read as ABSENT; normalising it to the "
+        "literal 'local' produces a mismatch line instead, which names the key just "
+        "as loudly and is a different, wrong verdict: %r" % (drift,))
+
+
+def test_fallback_path_unchanged_when_logline_unreadable():
+    """INVARIANT 3 — backward compatibility, so a refactor cannot make the logline
+    mandatory.
+
+    With daemon_logline_readable="no" the verdict must derive from `resolved_*`
+    exactly as it did pre-g-115-3157: a good environ passes, an unset one is caught.
+    Both directions are asserted because a refactor that ignored `resolved_*`
+    entirely would satisfy either one alone.
+    """
+    ok = _real(_healthy(daemon_logline_readable="no"))
+    assert ok == [], "logline unreadable + healthy environ must still pass: %r" % (ok,)
+
+    caught = _real(_healthy(daemon_logline_readable="no",
+                            resolved_STORAGE_BACKEND="unset",
+                            cli_STORAGE_BACKEND="own-cloud"))
+    # The ABSENT-branch line specifically. This fixture emits TWO lines naming the
+    # key — the detection under test, and a lane-disagreement line
+    # ("STORAGE_BACKEND disagrees: daemon=unset file=own-cloud"). A bare
+    # `"STORAGE_BACKEND" in d` sweep accepts the second, so it stays green even if
+    # the absent-branch detection is deleted outright. Same defect as invariant 2
+    # and the normalisation test above; found by fresh-eyes review AFTER the
+    # 5-mutant run passed, because M1-M5 all happened to break the surviving line
+    # too (guard-385, guard-1099).
+    assert any("daemon has no STORAGE_BACKEND" in d for d in caught), (
+        "with no logline to consult, an unset environ must still raise the "
+        "absent-branch line; matching any line that mentions the key passes on "
+        "the lane-disagreement message instead: %r" % (caught,))
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

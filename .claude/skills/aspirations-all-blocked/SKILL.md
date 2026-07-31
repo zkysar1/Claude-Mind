@@ -155,9 +155,10 @@ FOR EACH review_msg NOT from this agent:
 
         # R4 Post to Board:
         # Share review hypothesis on findings channel so both agents learn.
-        #   Bash: board-post.sh --channel findings --type finding \
-        #         --tags "code_review,{goal_id}" \
-        #         --message "Review of {goal_id}: {hypothesis_summary}. Assessment: {architectural_notes}"
+        #   Bash: echo "Review of {goal_id}: {hypothesis_summary}. Assessment: {architectural_notes}" \
+        #         | board-post.sh --channel findings --type finding \
+        #           --tags "code_review,{goal_id}"
+        #   (message text goes on STDIN — there is NO --message flag; guard-1394)
 
         # R5 Issue Handling (preserved from original protocol):
         IF issues_found during R2 assessment:
@@ -558,16 +559,41 @@ IF B6.5 returned rc=1 (quiescence denied):
     Iterate parsed.blocked_goals. Group by blocker_ref.external_id (or by
     blocker_ref.type when external_id is null).
 
-    # Build set of patterns already covered by outstanding Unblock goals
-    # so we don't spam duplicates. aspirations-query.sh exposes
-    # --title-contains (case-insensitive substring); pair with
-    # --goal-status pending,in-progress to scope to live goals.
+    # Build the set of blocker patterns already covered by an OUTSTANDING
+    # Unblock aspiration, so we don't spam duplicates.
+    #
+    # READ THE ASPIRATION STORE, NOT THE GOAL STORE (g-115-3139). The write
+    # below stamps `blocker_pattern:<pattern>` on the ASPIRATION handed to
+    # /create-aspiration; no GOAL ever carries that origin_signal, because
+    # create-aspiration stamps its seed goal `parent_aspiration:<asp-id>`
+    # instead. The previous read scanned GOALS, so covered_patterns was ALWAYS
+    # empty and the `NOT IN covered_patterns` suppression below never
+    # suppressed anything — a dedup keyed on a value nothing writes
+    # (vacuous-dedup class, g-115-2196).
+    #
+    # Measured 2026-07-29: 0 of 4132 goal records carry a blocker_pattern
+    # origin_signal; 1 of 381 aspirations does (asp-279,
+    # `blocker_pattern:roblox_studio_session_required`) — confirming the
+    # aspiration store is where the writer actually lands. (The goal's own
+    # stated evidence was a VACUOUS zero — a bare prefix passed to an
+    # exact-match flag. Read guard-1796 before re-verifying this by query.)
+    #
+    # --active (NOT --archive) preserves the original intent: only OPEN work
+    # suppresses re-synthesis. An archived Unblock aspiration whose pattern is
+    # STILL blocking should be re-synthesized — the prior attempt did not
+    # resolve it. asp-279 is archived and therefore correctly does not suppress.
+    #
+    # aspirations-read.sh requires a content selector alongside --source
+    # (guard-1293) and returns FULL records, so origin_signal is present. Do
+    # NOT substitute aspirations-query.sh here: its default projection is six
+    # keys and omits origin_signal entirely (guard-1424 / guard-884), which
+    # would silently re-introduce the same always-empty bug through a
+    # different door.
     covered_patterns = set()
-    Bash: aspirations-query.sh --title-contains "Unblock:" --goal-status pending,in-progress
-    FOR EACH existing unblock goal:
-        Parse pattern from origin_signal (format: "blocker_pattern:<id>")
-        OR from description if origin_signal absent.
-        covered_patterns.add(pattern)
+    FOR EACH src IN (world, agent):
+        Bash: aspirations-read.sh --active --source {src}
+        FOR EACH aspiration WHERE origin_signal starts with "blocker_pattern:":
+            covered_patterns.add(origin_signal with the "blocker_pattern:" prefix stripped)
 
     created_count = 0
     FOR EACH pattern WHERE affected_count >= 2 AND pattern NOT IN covered_patterns:
@@ -801,8 +827,18 @@ IF config.proactive_escalation.b7_notify:
         Bash: wm-read.sh known_blockers --json
         blocker_summary = ""
         FOR EACH blocker WHERE resolution is null:
-            age_hours = hours_since(blocker.detected_at)
-            blocker_summary += "• {blocker.reason} (blocked {age_hours:.0f}h, {len(blocker.affected_goals)} goals)\n"
+            # LEGACY-SHAPE + CROSS-WRITER TOLERANCE (g-115-3348). Two writers
+            # emit different key sets: infra-health.py uses reason/blocker_id,
+            # create-blocker.py used failure_reason/id (it now ALSO emits the
+            # documented detected_at/blocker_id, but blockers created before
+            # that fix are still live in working memory). Reading only the
+            # documented names rendered every canonically-created blocker as
+            # "• None (blocked ...)" with no age -- in the ALL-BLOCKED
+            # last-resort notification, i.e. exactly when the user most needs
+            # to know what is stuck.
+            age_hours = hours_since(blocker.detected_at or blocker.created_at)
+            reason    = blocker.reason or blocker.failure_reason
+            blocker_summary += "• {reason} (blocked {age_hours:.0f}h, {len(blocker.affected_goals)} goals)\n"
             blocker_summary += "  Unblock: {blocker.unblocking_goal}\n"
         IF blocker_summary is empty:
             blocker_summary = "All goals blocked on dependencies (no infrastructure blockers active)."

@@ -29,14 +29,47 @@ Valid from ANY state (RUNNING, IDLE, UNINITIALIZED).
    — If UNINITIALIZED and /prime outputs "Nothing to prime": SKIP (continue to Phase 2)
 ```
 
-## Phase 2: Scan Pending Questions
+## Phase 2: Scan Pending Questions (FLEET-WIDE)
+
+This dashboard answers "what does the USER owe / what is waiting on them" — a
+question about the WHOLE FLEET, not the bound agent. Both steps below are
+required: fixing either alone still leaves the user blind (g-115-3074).
 
 ```
-1. Read agents/<agent>/session/pending-questions.yaml
-   IF file missing: pending_questions = []
-   ELSE: filter questions where status == "pending"
-   Store as pending_questions list
+1. Refresh every agent's mirror (DATA leg — defeats stale/absent peer files):
+   Bash: `bash core/scripts/owncloud-pull.sh --all-agents --only pending-questions.yaml`
+   → ~1s fleet-wide. `--only` is load-bearing: the unfiltered fleet pull is a
+     full continuity sweep at ~59s/agent (~5min), which is not a viable cost for
+     an interactive dashboard. Fleet roster comes from team-state.
+   → Best-effort: on a non-own-cloud backend this is a no-op, and a per-agent
+     failure is isolated (the sweep continues). NEVER block the dashboard on it —
+     a failed refresh degrades to reading whatever mirrors exist, which is
+     strictly better than showing nothing. Proceed to step 2 regardless.
+
+2. Read every agent's questions (SKILL leg — defeats bound-agent-only scope):
+   Bash: `bash core/scripts/pending-questions-read.sh --all-agents --status pending`
+   → JSON array of pending entries, each tagged with an `agent` key. Store as
+     pending_questions list; group by `agent` for output.
+   This reader is shape-tolerant (flattens the dict-wrapper / list-with-wrapper /
+   bare / mixed on-disk shapes via the same _load_questions logic the sweep
+   sibling uses, rb-1786) and applies that SAME flattener per agent file. Do NOT
+   hand-roll a naive top-level `status == "pending"` scan of the raw YAML — it
+   silently SKIPS entries nested inside a `{questions: [...]}` wrapper
+   (g-115-3039) — and do NOT hand-roll a fleet walk either: the flatten body is
+   kept byte-faithful across three lock-step copies, and a fourth copy in skill
+   pseudocode is the least likely to be kept in sync. A missing or malformed
+   per-agent file contributes [] without failing the others.
 ```
+
+**Why fleet-wide** (user-surfaced 2026-07-25): the user ran `/open-questions`
+expecting the fleet backlog and effectively saw nothing. Two independent defects
+produced that. DATA — `owncloud-pull.sh` was `--agent`-scoped, so an alpha-bound
+session never refreshed PEER files; on cc-04 bravo's copy was 18 days stale and
+echo/foxtrot/zeta's were ABSENT entirely. SKILL — this phase read only the bound
+agent's path, so even with perfect mirrors an alpha-bound run structurally could
+not surface the other agents' questions. Measured after the fix: 13 → 30
+questions visible, matching a direct authoritative-store read exactly
+(alpha 10, bravo 2, echo 4, foxtrot 7, zeta 7).
 
 ## Phase 3: Scan User-Participant Goals
 
@@ -66,10 +99,14 @@ Valid from ANY state (RUNNING, IDLE, UNINITIALIZED).
 ═══ OPEN ITEMS ════════════════════════════════
 
 IF pending_questions is non-empty:
-  ## Pending Questions
+  ## Pending Questions ({total} across {N} agents)
+  Group by the `agent` key, agents sorted alphabetically, and emit one
+  sub-section per agent so the user can see who is waiting on what:
+
+  ### {agent} ({count})
   | ID | Date | Question | Default Action |
   |---|---|---|---|
-  {for each: id, date, question (truncated to ~100 chars), default_action}
+  {for each of that agent's entries: id, date, question (truncated to ~100 chars), default_action}
 
 IF user_goals is non-empty:
   ## User Goals
@@ -116,12 +153,18 @@ IF all three empty (pending_questions, user_goals, blocked_goals):
   Nothing requires your attention. All questions answered, no user goals open, no blocked goals.
 
 ───────────────────────────────────────────────
-Summary: {N} pending questions, {M} user goals, {B} blocked goals
+Summary: {N} pending questions across {A} agents, {M} user goals, {B} blocked goals
 ═══════════════════════════════════════════════
 ```
 
 ## Chaining
 
 - **Called by**: User only. NEVER by Claude.
-- **Calls**: `/prime` (read-only context loading)
-- **Modifies**: Nothing. This skill is entirely read-only.
+- **Calls**: `/prime` (read-only context loading),
+  `owncloud-pull.sh --all-agents --only pending-questions.yaml` (Phase 2 mirror
+  refresh), `pending-questions-read.sh --all-agents` (Phase 2 fleet read),
+  `aspirations-query.sh`, `aspirations-read.sh`, `goal-selector.sh blocked`
+- **Modifies**: No agent state. The Phase 2 refresh writes peer
+  `session/pending-questions.yaml` mirrors from the authoritative store — a
+  cache fill, freshness-gated and never clobbering unpushed local writes (the
+  manifest baseline gates every overwrite). The dashboard itself is read-only.

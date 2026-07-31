@@ -53,6 +53,8 @@ SKILL.md (after Phase 1) call `meter end` to write the summary record.
 | 0.5.0 | precheck-eval | medium |
 | 0.5b.0.5 | blocker-recheck | medium |
 | 0.5b.1b | inbox-alert-age-check | always-run |
+| 0.5b.1c | user-blocker-escalation-check | always-run |
+| 0.5b.2 | dependency-timeout-check | always-run |
 | 0.5b.2b | handoff-aging-check | always-run |
 | 0.5b.3 | precondition-defer-recheck | medium |
 | 0.5b.4 | defer-recheck | medium |
@@ -63,7 +65,12 @@ SKILL.md (after Phase 1) call `meter end` to write the summary record.
 | 0.5b.9 | credential-defer-recheck | deferrable |
 | 0.5b.10 | defer-drift-check | deferrable |
 | 0.5b.11 | reason-less-blocked-check | deferrable |
+| 0.5b.12 | blocked-signal-resolution-check | deferrable |
+| 0.5b.13 | reclaim-defer-audit | deferrable |
+| 0.5b.14 | reclaim-user-participant-audit | deferrable |
+| 0.5b.15 | human-blocked-defer-join | deferrable |
 | 0.5c | recurring-precondition-sweep | deferrable |
+| 0.5c.1 | recurring-starvation-check | medium |
 | 0.5e | fresh-eyes-cadence | deferrable |
 | 0.5e.5 | fresh-eyes-program-cadence | deferrable |
 | 0.5e.7 | fresh-eyes-tree-cadence | deferrable |
@@ -84,6 +91,16 @@ starved the cadence rituals. Zone-drop is now the sole drop path; `elapsed_ms` /
 
 Fail-open: any meter error returns `run`. The meter is velocity optimization,
 not safety gating — never block the loop on a meter bug.
+
+**Cadence-battery note (g-115-2984):** the six `*-cadence` sweeps for the
+skill-invocation cadences — `fresh-eyes-cadence`, `fresh-eyes-program-cadence`,
+`fresh-eyes-tree-cadence`, `felt-sense-cadence`, `curriculum-cadence`,
+`evolution-cadence` — are NO LONGER meter-checked per-phase. Their CHECKS run
+unconditionally inside the ONE **Phase 0.5e Cadence Battery** (cheap + read-only,
+so no meter gate on the check); the meter-check for each of these names happens
+at DISPATCH time in the battery loop, gating the expensive ritual invocation.
+Do NOT `meter check` them separately. `l1-skew-cadence` (0.5g) and
+`health-regression-cadence` (0.5h) keep their own per-phase meter checks.
 
 ## Inputs (from orchestrator)
 
@@ -175,10 +192,19 @@ display entirely.
 ```
 Bash: wm-read.sh loop_state
 Parse:
-    global     = loop_state.session_signals.routine_streak_global   (int, default 0)
+    # The on-disk sub-slot is `signals`, NOT `session_signals` — the orchestrator
+    # renames it on restore (aspirations/SKILL.md: `session_signals = loop_state.signals`)
+    # and every Python writer uses `signals`. Reading the restored NAME here returns
+    # absent → every counter defaults to 0 → the `global >= 4` warning below can never
+    # fire, silently, on every iteration. Measured 2026-07-29 (zeta): a literal read
+    # returned productive_streak=0 while the slot held 43.
+    global     = loop_state.signals.routine_streak_global            (int, default 0)
     per_goal   = loop_state.routine_streaks                          (dict, default {})
-    total_rt   = loop_state.session_signals.routine_count_total      (int, default 0)
-    completed  = loop_state.goals_completed_this_session             (list, default [])
+    total_rt   = loop_state.signals.routine_count_total              (int, default 0)
+    # NOT goals_completed_this_session — that key EXISTS but is an INT (a counter),
+    # so len() on it raises TypeError. The actual list is counted_goals_this_session.
+    # (goals_completed is an int too, so it is not the fix either.) Measured 2026-07-29.
+    completed  = loop_state.counted_goals_this_session               (list, default [])
 
 IF loop_state is null OR (global == 0 AND no per_goal value > 0):
     SKIP — clean streak state, no signal to surface
@@ -228,17 +254,32 @@ IF output is non-empty:
 # ELSE: clean — emit nothing (quiet on the common empty case).
 ```
 
-## Phase 0-pre.0d: Sentinel Battery (g-115-2303 — ONE call replaces the six per-phase wm-reads)
+## Phase 0-pre.0d: Sentinel Battery (g-115-2303 — ONE call replaces the per-phase wm-reads)
 
-The six force-gate/pending sentinel gates below (Phases 0-pre..0-pre6) are
+The force-gate/pending sentinel gates below (Phases 0-pre..0-pre6) are
 enumerated by ONE script call. The script owns the slot list
 (`core/scripts/_sentinel_registry.py` — shared with `stale-sentinel-canary.py`,
-single source of truth), so a phase can never silently fall out of the protocol:
-post-autocompact, "run the battery" is the only line that must survive
+single source of truth), so a REGISTERED phase can never silently fall out of the
+protocol: post-autocompact, "run the battery" is the only line that must survive
 summarization; the output re-derives the full battery. (Origin g-115-2302: a
 reconstructed protocol carried 3 of 6 phases and a set sentinel sat unread for
 3 iterations.) Adding a new sentinel gate = one registry entry + its consumer
 phase section below.
+
+REGISTERED is load-bearing, and the word was added the hard way (g-115-3678).
+This paragraph used to promise that a phase "can never" fall out — an unqualified
+guarantee the battery cannot give, because its N is its OWN registry, not the set
+of consumer phases below. Phase 0-pre2.5 shipped a consumer with no registry
+entry, so the battery truthfully reported "all 6 registered sentinels null — no
+gates to dispatch" while a 7th sat set; that all-clear then authorised the SKIP
+below, past the very gate it had not checked. Measured unseen: 2 stubs / ~9h
+(zeta), then 15 MATERIAL self.md stubs / ~19h (bravo) — the latter ~5h from
+expiring unnotified, breaking the guard-380 notify-after promise. A present
+consumer phase and an absent registry entry each look correct in isolation, and
+the count in the all-clear line is the only place the mismatch shows. So: when
+adding a gate, the registry entry is not bookkeeping that follows the real work —
+it IS what makes the gate exist. And when reading the all-clear, read the COUNT,
+not just the word "all".
 
 ```
 Bash: bash core/scripts/precheck-sentinel-battery.sh
@@ -343,9 +384,31 @@ IF signal is not null:
     # last_outcome_origin field ("genuine" vs "forced"), or the close output's
     # outcome_in=routine/outcome_out=deep line.
     <compose experience-add.sh JSON payload>
-    echo '<payload-json>' | Bash: experience-add.sh
-    # Clear signal after successful write (one-shot).
-    echo 'null' | Bash: wm-set.sh force_experience_archival
+    # WRITE + CLEAR AS ONE GUARDED STEP (g-115-4177). Do NOT hand-compose
+    # `experience-add.sh ... ; wm-set.sh <slot>` — that shape is the defect, and
+    # `&&` does not fix it: experience-add.sh can exit **rc=0 while REFUSING the
+    # payload** (see aspirations-spark's verbatim_anchors note — a bare-string
+    # anchor list is refused, and guardrails-add.sh was measured doing the same
+    # over an invalid `applies_to`). Exit status is therefore not proof the
+    # record landed, so the read-back is mandatory and the primitive owns it.
+    # The primitive runs the write, re-reads it, and clears ONLY if BOTH pass;
+    # on any failure it leaves the sentinel SET with a diagnostic naming which
+    # check failed, so the obligation re-surfaces next iteration (fail-CLOSED).
+    # This also satisfies guard-1870 mechanically — the clear is issued as its
+    # own invocation, never sharing a Bash call with the write it gates.
+    # Measured six times before this existed; the last three within ~30h by an
+    # agent that had documented the failure each time, which is why the
+    # corrective is wiring rather than another encoded rule (rb-745, guard-232).
+    Bash: printf '%s' '<payload-json>' > agents/<agent>/temp/exp-payload.json
+    Bash: bash core/scripts/sentinel-clear-guarded.sh \
+            --slot force_experience_archival \
+            --verify "bash core/scripts/experience-read.sh --goal <goal-id>" \
+            --expect "<experience_id>" \
+            -- bash -c 'bash core/scripts/experience-add.sh < agents/<agent>/temp/exp-payload.json'
+    # rc=0 cleared · rc=1 the write failed · rc=2 the write did not land (read-back
+    # empty or id mismatch) · rc=3 usage/clear error. On 1 or 2 do NOT narrate
+    # "experience archived" — read the diagnostic, fix the payload, and let the
+    # sentinel re-fire.
     # Continue to Phase 0.
 ```
 
@@ -382,7 +445,8 @@ One-shot with retry: the producer re-fires the sentinel every iteration until th
 stub is finalized, so a failed completion is never lost.
 
 ```
-Bash: wm-read.sh force_evolution_finalize --json
+signal = Phase 0-pre.0d battery payload for force_evolution_finalize
+         (fallback only if battery errored: Bash: wm-read.sh force_evolution_finalize --json)
 IF signal is not null AND signal.count > 0:
     Output: "▸ EVOLUTION-FINALIZE GATE: {signal.count} awaiting_completion stub(s) ({signal.material_count} MATERIAL) past {signal.threshold_minutes}min — finalizing before goal selection"
     FOR EACH stub in signal.stubs:
@@ -404,6 +468,15 @@ IF signal is not null AND signal.count > 0:
         # For change_class=material + file_kind=agent_self, evolution-complete's
         # Phase 5 AUTO-posts the decisions board AND AUTO-emails the user
         # (guard-380). No manual notification call is needed here.
+    # Stamp consumer-dispatch timestamp BEFORE clearing — this sentinel is
+    # CONSUMPTION-AWARE in the canary (g-115-3678). Its producer re-arms every
+    # iteration while any stub is pending, so a bare presence-count would fire
+    # on the legitimate never-fabricate path above (a stub left for the 24h
+    # expiry). The canary's discriminator is dispatch ADVANCEMENT, so stamp on
+    # ANY handling — finalized, OR a justified skip because the rationale was
+    # genuinely unreconstructable. Stamp FIRST so an interrupt leaves the safe
+    # direction. (Mirrors Phase 0-pre / 0-pre3 / 0-pre4.)
+    printf '"%s"' "$(date +%Y-%m-%dT%H:%M:%S)" | Bash: wm-set.sh force_evolution_finalize_last_dispatch
     # Clear after the pass. If a completion failed, the producer re-sets the
     # sentinel next iteration — do not hand-retry in a loop here.
     Bash: `echo 'null' | wm-set.sh force_evolution_finalize`
@@ -762,8 +835,43 @@ Bash: bash core/scripts/execution-diary.sh phase-end phase-0.5.0-scripted
 # action block to enter; the payload lives with the subcommand's result.
 #
 #   zombies:needs_complete_review      → for each entry in results.zombies.zombies[]:
-#                                        invoke /aspirations-complete-review Phase 7.4
-#                                        with that aspiration and reason="zombie-scan"
+#                                        route by entry.kind (rb-4906 — the asp-352 mis-route):
+#                                        · all_terminal (every non-recurring goal already
+#                                          terminal; unfinished EMPTY) → invoke
+#                                          /aspirations-complete-review (NOT "Phase 7.4"). The
+#                                          skill self-discriminates: no-recurring falls through
+#                                          7.4's empty-unfinished fast-path to the Phase 7
+#                                          fully-complete gate → aspirations-complete.sh
+#                                          (validates all-terminal, NO evidence gate);
+#                                          has_recurring → Phase 7's functionally-complete
+#                                          stamp. Do NOT attempt complete-intent.sh — its
+#                                          evidence/outcomes gate is unsatisfiable with no open
+#                                          goals (asp-352: 3/25 had outcomes; close failed twice
+#                                          before the normal path succeeded).
+#                                        · blocked_stale (high completion, only blocked-and-
+#                                          stale trailing goals, AND a usable `motivation`)
+#                                          → invoke /aspirations-complete-review Phase 7.4
+#                                          (intent-satisfaction), reason="zombie-scan" —
+#                                          trailing blocked goals need intent-supersession.
+#   zombies:needs_retire_or_normal_close → for each entry in results.zombies.zombies[] with
+#                                        kind == blocked_stale_no_motivation (g-115-4164):
+#                                        the blocked_stale profile on an aspiration whose
+#                                        `motivation` yields no usable tokens. Do NOT send it
+#                                        to Phase 7.4 — complete-intent.sh validates the
+#                                        rationale by quoting that motivation, so with none
+#                                        the flag can never be discharged and re-fires every
+#                                        pass (measured: 3+ consecutive passes, ZDS asp-008).
+#                                        Do NOT backfill a motivation to satisfy the gate that
+#                                        validates against it, and do NOT stop detecting these.
+#                                        Two paths actually discharge it — choose by judgment
+#                                        against the aspiration's TITLE and goal history, since
+#                                        there is no motivation text to reason from:
+#                                        · intent abandoned / superseded → aspirations-retire.sh
+#                                        · intent satisfied, only trailing blocked goals remain
+#                                          → close those goals with a reason (skipped), which
+#                                          makes the aspiration all-terminal, then
+#                                          aspirations-complete.sh (no evidence gate). Next
+#                                          pass re-detects it as all_terminal if you stop early.
 #   pipeline-depth:thin_pipeline       → invoke /create-aspiration from-self
 #   hypothesis-health:stalled_pipeline → /review-hypotheses --resolve
 #   accuracy:accuracy_low              → file Investigate goal targeting
@@ -781,9 +889,15 @@ Bash: bash core/scripts/execution-diary.sh phase-end phase-0.5.0-scripted
 #                                        aspirations-update-goal.sh participants '["agent"]'
 #   temp-pressure:temp_drain_needed    → file results.temp-pressure.suggested_goal
 #                                        via aspirations-add-goal.sh (title/priority
-#                                        HIGH/participants ["agent"]/description from
-#                                        the payload) into asp-001, then the loop
-#                                        executes /drain-temp. Dedup is already done
+#                                        HIGH/participants ["agent"]/description AND
+#                                        intended_agent — ALL fields from the payload)
+#                                        into asp-001, then the loop executes /drain-temp.
+#                                        intended_agent MUST be filed verbatim: it names
+#                                        the temp OWNER, and /drain-temp is bound-agent-
+#                                        scoped, so dropping it lets the content classifier
+#                                        re-route to bravo and the drain no-ops on the
+#                                        wrong temp store (g-115-2979, rb-3876). Dedup is
+#                                        already done
 #                                        by the check (it suppresses this flag when an
 #                                        open drain goal exists — emits temp_drain_pending
 #                                        instead). temp_pressure_warn / temp_drain_pending
@@ -841,7 +955,7 @@ IF known_blockers is non-empty:
             # Re-encountering the failure will re-create the blocker with fresh evidence.
             IF blocker.detected_session + 3 <= current_session:
                 resolve with reason "no_probe: cleared after 3-session expiry (fail-open)"
-                Log: "BLOCKER EXPIRED (no_probe): {blocker.blocker_id} — letting goals attempt"
+                Log: "BLOCKER EXPIRED (no_probe): {blocker.blocker_id or blocker.id} — letting goals attempt"
         ELSE: log probe failed
 
     # Phase 0.5b.0.5: Capability Recheck Sweep (see core/scripts/blocker-recheck.sh)
@@ -868,7 +982,23 @@ IF known_blockers is non-empty:
     IF config.proactive_escalation.blocker_age_hours:
         Bash: wm-read.sh proactive_escalation_log --json
         FOR EACH blocker WHERE resolution is null:
-            age_hours = hours_since(blocker.detected_at)
+            # LEGACY-SHAPE TOLERANCE (g-115-3348). The documented schema
+            # (handoff-working-memory.md) names these `blocker_id` and
+            # `detected_at`, and both writers now emit them. But blockers
+            # created BEFORE that fix are live in working memory carrying
+            # create-blocker.py's `id`/`created_at` instead. Normalize ONCE
+            # here so every read below keys on one name -- previously
+            # blocker.detected_at was absent for those, so age_hours was
+            # undefined and this entire escalation could never fire, while
+            # blocker.blocker_id was None so the cooldown lookup could never
+            # match the real id string /notify-user Step 3 writes.
+            # Do NOT "fix" this by flipping the reads to id/created_at:
+            # infra-health.py streak blockers correctly use blocker_id and
+            # would break. Bounded migration shim -- removable once fleet
+            # blockers have cycled.
+            bid      = blocker.blocker_id or blocker.id
+            detected = blocker.detected_at or blocker.created_at
+            age_hours = hours_since(detected)
             IF age_hours >= config.proactive_escalation.blocker_age_hours:
                 # Re-send cooldown uses re_escalation_hours (default 24), NOT blocker_age_hours
                 # (first-fire age only). Before g-115-2400 blocker_age_hours served both roles,
@@ -877,20 +1007,20 @@ IF known_blockers is non-empty:
                 # producing the silent-skip-judgment pattern instead. Coverage entries appended by
                 # /notify-user Step 3 (any outbound notification naming the blocker_id, e.g. a
                 # completion-report digest) count as escalations here — newest sent_at wins.
-                last_escalation = newest entry in proactive_escalation_log where blocker_id == blocker.blocker_id
+                last_escalation = newest entry in proactive_escalation_log where blocker_id == bid
                 IF last_escalation is null OR hours_since(last_escalation.sent_at) >= config.proactive_escalation.re_escalation_hours:
                     Notify the user:
                         category: blocker
                         subject: "Blocker persisting {age_hours:.0f}h: {blocker.reason}"
                         message: |
-                            Blocker {blocker.blocker_id} has been active for {age_hours:.0f} hours.
+                            Blocker {bid} has been active for {age_hours:.0f} hours.
                             Type: {blocker.type}
                             Affected goals: {blocker.affected_goals}
                             Unblocking goal: {blocker.unblocking_goal}
 
                             The one thing that would unblock this:
                             {action_description_based_on_blocker_type}
-                    echo '{"blocker_id":"{blocker.blocker_id}","sent_at":"{now}"}' | Bash: wm-append.sh proactive_escalation_log
+                    echo '{"blocker_id":"{bid}","sent_at":"{now}"}' | Bash: wm-append.sh proactive_escalation_log
 
     echo '<updated_blockers_json>' | Bash: wm-set.sh known_blockers
 Bash: bash core/scripts/execution-diary.sh phase-end phase-0.5b-blockers
@@ -937,69 +1067,104 @@ Bash: bash core/scripts/inbox-alert-age-check.sh --apply
 # counts are stderr-noted only — they do NOT block precheck.
 ```
 
-## Phase 0.5b.2: Dependency Timeout Escalation
+## Phase 0.5b.1c: User-Blocker Digest Escalation (g-115-3926)
 
-Proactive escalation for dependency-blocked goals approaching the `dependency_timeout_hours`
-threshold. This catches goals stuck behind unresolved `blocked_by` chains — the fail-open
-timeout in goal-selector.py will eventually clear them, but this gives early warning and
-takes differentiated action based on the root cause.
+The DELIVERY-CHANNEL sibling of 0.5b.1 / 0.5b.1b / 0.5b.2 / 0.5b.2b. Those four
+are each individually correct and **all of them post to the coordination board**,
+which is agent-to-agent. That is structurally incapable of discharging a goal
+whose blocking condition is a HUMAN action: no agent reading the board can
+perform it.
+
+Measured 2026-07-29 — g-326-70 (HIGH, `participants:[agent,user]`, blocking
+g-326-63 and g-250-227 under a ship-gate milestone) accumulated 10+ board posts
+from two agents in one day while `proactive_escalation_log` stayed EMPTY and the
+user was never told. The sibling sweeps each miss it for a correct reason:
+0.5b.1b matches an `origin_signal` prefix (this goal's is `unblock:g-326-63`);
+0.5b.2 walks `blocked_by` edges (a physical human action has no goal-id to
+depend on); 0.5b.2b matches `handoff_to` (unset). The guard-1802 / guard-1890
+family: a union of predicates strictly narrower than the population, where every
+sweep reports clean forever.
+
+First live run measured **29 user-participant goals, 14 aged past 48h with no
+escalation ever sent, oldest 186h (7.75 days).**
+
+Tier is **always-run**, matching its four notification-age siblings — it
+notifies an EXTERNAL party, so it must fire even in the tight zone.
 
 ```
-Read core/config/aspirations.yaml → multi_agent.dependency_timeout_hours (default 48)
-escalation_threshold = dependency_timeout * 0.75  # Notify at 75% of timeout (36h default)
+Bash: bash core/scripts/user-blocker-escalation-check.sh --apply
+# Population is IMPORTED from audit-user-to-agent.py's
+# `_find_user_participant_goals` (non-terminal + `user` in participants) — never
+# re-derived here. A second copy of that predicate is exactly how guard-1802's
+# narrow-predicate hole appeared (the old `participants == ["user"]` form had a
+# live candidate set of ZERO against 28 real goals).
+#
+# ONE DIGEST, NOT N EMAILS (reclaim-routed-work.md rule 5). 14 eligible goals
+# produce ONE email, oldest first. A per-goal send would train the recipient to
+# filter the sender — a louder version of the silence this phase fixes.
+# Cooldown stays PER-GOAL (one board record each), so today's escalations drop
+# out of tomorrow's digest while newly aged goals still surface.
+#
+# Category is `blocker` — REQUIRED. notify-user Step 1.5's approval-request gate
+# refuses sends asking the user to do agent-capable work, and this population
+# asks the user to act BY CONSTRUCTION; any other category would be refused and
+# would silently recreate the original silence. `blocker` is exempt.
+#
+# Goals whose origin_signal marks deliberate user routing (asp-314's park) are
+# REPORTED with reason=deliberate_user_routing, never emailed — nagging a
+# deliberate choice is the wrong correction, and a silent skip would be
+# indistinguishable from a clean sweep.
+#
+# No cooldown is recorded when delivery FAILS — a cooldown for an email that
+# never sent would suppress the retry and reproduce the silence. Fail-open at
+# every layer; always exits 0. JSON output carries scanned/eligible/applied/
+# skipped{deliberate,cooldown,below_threshold}.
+# Threshold: core/config/aspirations.yaml → user_blocker_escalation.escalate_hours (48).
+```
 
-Bash: goal-selector.sh blocked
-parsed_blocked = parse JSON output
-dependency_blocked = [e for e in parsed_blocked.blocked_goals WHERE block_reason == "dependency"]
+## Phase 0.5b.2: Dependency Timeout Escalation
 
-IF dependency_blocked is empty: SKIP to Phase 0.5c
+Proactive escalation for dependency-blocked goals approaching
+`multi_agent.dependency_timeout_hours`. Bash-enforced by
+`dependency-timeout-check.sh` (g-115-3124).
 
-Bash: load-aspirations-compact.sh → IF path returned: Read it
-Bash: wm-read.sh proactive_escalation_log --json
+This was the LAST escalation phase still LLM-iterated, and the ONLY one absent
+from the phase table above -- no row meant no sweep name, no tier, no meter
+accounting, so it was invisible to the very mechanism that decides what
+survives context pressure. Measured consequence: the escalation log was empty
+fleet-wide while 8+ dependency-blocked goals sat past the 36h threshold (ages
+up to 1693h). This phase is the fleet's only automated path from a stuck
+dependency to the human, and it had never fired.
 
-FOR EACH entry in dependency_blocked:
-    blocked_goal = look up entry.goal_id in aspirations compact
-    blocked_age = hours_since(blocked_goal.blocked_since)
-    IF blocked_age is null: SKIP  # No timestamp — will expire at next goal-selector run (fail-open)
-    IF blocked_age < escalation_threshold: SKIP  # Not yet approaching timeout
+Tier is **always-run**, matching its two always-run siblings (0.5b.1b, 0.5b.2b)
+-- do NOT `meter check` it. An escalation that fires only when budget permits is
+precisely the defect being fixed.
 
-    # Trace root cause from bottleneck data
-    root = find entry in parsed_blocked.bottlenecks where goal_id matches root of chain
-    root_goal = look up root.goal_id in aspirations compact
+```
+Bash: bash core/scripts/dependency-timeout-check.sh --apply
 
-    # Differentiated escalation based on root cause
-    IF root goal has participants containing "user":
-        # User-action dependency approaching timeout — notify user
-        last_dep_esc = find entry in proactive_escalation_log where blocker_id == "dep_{entry.goal_id}"
-        IF last_dep_esc is null OR hours_since(last_dep_esc.sent_at) >= escalation_threshold:
-            Notify the user about the stale dependency.
-            (Check world/forged-skills.yaml for a skill whose triggers match
-            "notify the user" and invoke it with a blocker-category payload:
-              subject: "Dependency stale {blocked_age:.0f}h: {entry.goal_id} waiting on user"
-              message:
-                Goal {entry.goal_id} ({entry.title}) has been blocked for {blocked_age:.0f}h
-                waiting on {root.goal_id}: {root.title}
+The script owns the DURABLE half, deterministically:
+  escalated  -> one coordination-board post per aged dependency. That post IS
+                the shared cooldown record. It deliberately REPLACES the
+                per-agent WM `proactive_escalation_log`, which both siblings
+                abandoned (g-115-1531): a per-agent slot lets all N agents
+                escalate the same world goal independently, and does not
+                survive a WM reset. Here the action is "email the human", so a
+                per-agent cooldown would put N copies in the user's inbox.
+  boosted    -> roots flipped to HIGH (agent-resolvable, still pending).
 
-                That goal requires user action (participants: [user]).
+The LLM owns ONLY the transport half:
+FOR EACH entry in needs_user_notification:
+    Notify the user about the stale dependency.
+    (Check world/forged-skills.yaml for a skill whose triggers match
+    "notify the user" and invoke it with entry.subject and entry.message.
+    If no matching skill is registered, fall back to a participants:
+    [agent, user] goal via aspirations-add-goal.sh. Never block on
+    notification failure.)
 
-                If not resolved within {(dependency_timeout - blocked_age):.0f}h,
-                the dependency will be cleared automatically (fail-open) and the
-                blocked goal will attempt execution.
-
-                The one thing that would help:
-                {root_goal.description or root.title}
-            If no matching skill is registered, fall back to a participants: [agent, user]
-            goal via aspirations-add-goal.sh. Never block on notification failure.)
-            echo '{"blocker_id":"dep_{entry.goal_id}","sent_at":"{now}"}' | Bash: wm-append.sh proactive_escalation_log
-
-    ELIF root goal has participants containing "agent" AND root goal status == "pending":
-        # Agent-resolvable — boost the blocking goal's priority
-        IF root_goal.priority != "HIGH":
-            Bash: aspirations-update-goal.sh --source {root_source} {root.goal_id} priority HIGH
-            Log: "DEPENDENCY ESCALATION: boosted {root.goal_id} to HIGH (blocking {entry.goal_id} for {blocked_age:.0f}h)"
-
-    # All causes: log the aging dependency for visibility
-    Log: "DEPENDENCY AGING: {entry.goal_id} blocked {blocked_age:.0f}h by {root.goal_id} ({root.cause})"
+A send failure cannot cause a duplicate-escalation storm: the board cooldown
+was already written by the script, so the next sweep stands down regardless.
+IF failed is non-empty: surface it. The sweep is fail-open and retries next run.
 ```
 
 ## Phase 0.5b.2b: Handoff Aging Escalation (Item 3; bash-enforced g-115-1524)
@@ -1098,7 +1263,7 @@ Rationale (WHY pending-questions sentinel sweep): `core/config/rationale/prechec
 ```
 # Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
 Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check pending-questions-sweep)
-IF decision == "drop": SKIP this phase; continue to Phase 0.5c
+IF decision == "drop": SKIP this phase; continue to Phase 0.5b.6
 Bash: bash core/scripts/pending-questions-sweep.sh sweep --apply
 # Reads world+agent aspiration queues to build the completed/superseded
 # goal-id set, evaluates the heuristic chain, and (when --apply) atomically
@@ -1114,7 +1279,7 @@ Rationale (WHY parent-supersession sweep): `core/config/rationale/precheck-gates
 ```
 # Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
 Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check parent-supersession-sweep)
-IF decision == "drop": SKIP this phase; continue to Phase 0.5c
+IF decision == "drop": SKIP this phase; continue to Phase 0.5b.7
 Bash: bash core/scripts/parent-supersession-sweep.sh --max-age-hours 24 --min-siblings 2 --apply
 # Iterates world + agent queues. For each Apply:-parent with reference
 # timestamp + ≥2 superseding Design/Apply siblings (sprint-scope only),
@@ -1131,7 +1296,7 @@ Rationale (WHY unblock-parent-status sweep): `core/config/rationale/precheck-gat
 ```
 # Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
 Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check unblock-parent-status-sweep)
-IF decision == "drop": SKIP this phase; continue to Phase 0.5c
+IF decision == "drop": SKIP this phase; continue to Phase 0.5b.8
 Bash: bash core/scripts/unblock-parent-status-sweep.sh --apply
 # (engine: core/scripts/unblock-parent-status-sweep.py behind the wrapper)
 # Iterates world + agent queues. For each pending "Unblock:" with a
@@ -1151,7 +1316,7 @@ Rationale (WHY routing-audit target-status sweep): `core/config/rationale/preche
 ```
 # Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
 Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check routing-audit-target-status-sweep)
-IF decision == "drop": SKIP this phase; continue to Phase 0.5c
+IF decision == "drop": SKIP this phase; continue to Phase 0.5b.8.5
 Bash: bash core/scripts/routing-audit-target-status-sweep.sh --apply
 # Iterates world + agent queues. For each pending/in-progress routing-audit goal
 # (discovered_by=post-decompose-routing-audit OR origin_signal/title routing-*)
@@ -1282,11 +1447,11 @@ bash-enforced, not left to LLM memory.
 ```
 # Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
 Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check reason-less-blocked-check)
-IF decision == "drop": SKIP this phase; continue to Phase 0.5c
+IF decision == "drop": SKIP this phase; continue to Phase 0.5b.12
 Bash: bash core/scripts/reason-less-blocked-check.sh --apply --output json
 Parse reason_less_count + reason_less[] + investigate_filed + open_audit_goal_id.
 IF reason_less_count == 0:
-    continue silently to Phase 0.5c   # the clean, common case
+    continue silently to Phase 0.5b.12   # the clean, common case
 ELSE:
     Output: "▸ ⚠ REASON-LESS-BLOCKED: {reason_less_count} status=blocked goal(s) with an EMPTY Blocker Reference Schema (no blocker_ref / blocked_by / defer_reason) — invisible to selection, blocker-recheck, AND quiescence"
     FOR EACH e in reason_less[:5]:
@@ -1296,7 +1461,232 @@ ELSE:
     ELIF open_audit_goal_id:
         Output: "    → open reconcile Investigate {open_audit_goal_id} already covers these (dedup — no duplicate filed)"
     # No LLM filing here — the --apply flag already filed-or-deduped bash-side
-    # (drift-proof, the whole point of g-115-2595). Continue to Phase 0.5c.
+    # (drift-proof, the whole point of g-115-2595). Continue to Phase 0.5b.12.
+```
+
+## Phase 0.5b.12: Blocked-Signal Resolution Sweep (g-115-3241)
+
+The exact COMPLEMENT of 0.5b.11 above. That sweep finds blocked goals carrying NO
+block signal; this one finds blocked goals whose signals are all PRESENT and all
+SATISFIED — a goal is in exactly one of the two populations, never both. Together
+they close the `blocked_by`/`blocker_ref` half of the block surface, which the
+whole `defer_reason` sweep family (0.5b.3/0.5b.4/0.5b.9/0.5b.10) cannot see.
+Canonical cost: g-335-144 sat blocked 7 days after its dependency completed,
+found by hand via felt-sense; measured again at first run — g-350-36 had sat
+blocked 6.7 days while its only block signal completed ~1.5h after the block was
+set.
+
+DETECTIVE ONLY — no `--apply`, unlike 0.5b.11 (deliberate, not an omission).
+Three reasons: the population is tiny (2 eligible fleet-wide at first run) so
+automation buys little while a wrong auto-unblock is expensive; most hits are
+lane-owned by another agent, and unblocking their goal appropriates their queue;
+and a passed `expires_at` means the block record FAIL-OPENED per the TTL, which
+is NOT proof the premise cleared. Escalate to `--apply` only if the population
+grows. Read `resolution_basis` before acting: `referent_terminal` is strong
+evidence, `ttl_expired` only means the record aged out.
+
+```
+# Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
+Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check blocked-signal-resolution-check)
+IF decision == "drop": SKIP this phase; continue to Phase 0.5b.13
+Bash: bash core/scripts/blocked-signal-resolution-check.sh --output json
+Parse all_resolved[] + disagreement[] + dangling_ref[] + undecidable[].
+IF all four lists are empty:
+    continue silently to Phase 0.5b.13   # the clean, common case
+ELSE:
+    FOR EACH e in all_resolved[:5]:
+        Output: "▸ ⚠ UNBLOCK-ELIGIBLE: {e.goal_id} ({e.source}, intended={e.intended_agent}) blocked {e.days_blocked}d — every block signal resolved [{e.resolution_basis}]: {e.blocker_ref_why}"
+    FOR EACH e in disagreement[:3]:
+        Output: "▸ SIGNAL DISAGREEMENT: {e.goal_id} blocked {e.days_blocked}d — blocked_by resolved={e.blocked_by_resolved} but blocker_ref resolved={e.blocker_ref_resolved}. Do NOT unblock; reconcile the stale half instead."
+    FOR EACH e in dangling_ref[:3]:
+        Output: "▸ DANGLING BLOCK REF: {e.goal_id} blocked {e.days_blocked}d — {e.blocker_ref_why}. Can never auto-clear; repoint or remove the reference."
+    # Route by lane, do NOT appropriate (guard-1007 family): a hit whose
+    # intended_agent is another agent gets a coordination board post naming the
+    # goal id + the evidence; only an `either`/self-routed hit may be unblocked
+    # by this agent, and only after re-probing a `ttl_expired` basis.
+```
+
+## Phase 0.5b.13: Reclaim — Stale-Defer Audit (lane B)
+
+Lane B of the reclaim duty (`.claude/rules/reclaim-routed-work.md`). The sweeps
+above all test the PREMISE axis — is the blocking condition still true? This
+phase tests the population those sweeps keep returning "still true" on, and asks
+the question none of them ask: has this been frozen so long that the ROUTING
+itself deserves re-derivation?
+
+Why it exists: `audit-deferred-defers.py` shipped with no bash wrapper and NO
+call site in any loop phase — built, verified-to-exist by a presence-only
+`/verify-learning` check, and never once invoked. A sweep with no call site is
+indistinguishable from a sweep that always returns clean. Both were fixed
+2026-07-29: the wrapper landed, and its classifier stopped stamping every
+structured-prefix defer "genuine" unconditionally (72.5% of the live queue took
+that early return, hiding defers frozen 83 and 95 days).
+
+DETECTIVE ONLY — no `--apply` (same reasoning as 0.5b.12): most hits are
+lane-owned by another agent, and clearing their defer appropriates their queue.
+Read the `stale-structured` evidence as a TRIGGER to re-derive, never as a
+verdict that the defer is wrong (rule 3 — age selects what to re-check first,
+it never by itself justifies closing anything).
+
+```
+# Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
+Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check reclaim-defer-audit)
+IF decision == "drop": SKIP this phase; continue to Phase 0.5b.14
+Bash: bash core/scripts/audit-deferred-defers.sh --output json
+Parse records[]; select those whose evidence contains "stale-structured", plus
+all category=="c" (narrative-only) records.
+IF both selections are empty:
+    continue silently to Phase 0.5b.14   # the clean, common case
+ELSE:
+    FOR EACH e in stale_structured[:5]:
+        Output: "▸ ⚠ STALE DEFER: {e.goal_id} ({e.src}) [{e.asp_id}] frozen {age} — well-formed prefix, but re-derive BOTH axes (premise still true? reason still valid?): {e.title}"
+    FOR EACH e in narrative_only[:3]:
+        Output: "▸ ⚠ NARRATIVE DEFER: {e.goal_id} ({e.src}) — defer reads as excuse, not structural block: {e.title}"
+    # Route by lane exactly as 0.5b.12: another agent's hit gets a coordination
+    # board post naming the goal id + evidence; only an `either`/self-routed hit
+    # may be re-derived and cleared by this agent, and only on fresh evidence.
+```
+
+## Phase 0.5b.14: Reclaim — User-Participant Audit (lane P)
+
+Lane P of the reclaim duty. The largest SILENT accumulator in the queue: a goal
+carrying `participants: [agent, user]` still looks like agent work and never
+appears in any blocked tally, so no existing sweep or dashboard surfaces it as
+routed-away. Measured 2026-07-28: 29 non-terminal goals carried `user`, the
+oldest 73 days, with zero sweep covering the population.
+
+`audit-user-to-agent.py` is the lane-P tool. It had the same orphan shape as
+lane B — its only live references were a doc and a presence-only verification
+check — AND it was blind to the population it existed to drain: the
+`participants == ["user"]` EXACT-match predicate had a live candidate set of
+**zero** (one goal in the fleet matched, and that goal was a deliberate park
+the audit correctly refuses to touch). Correct routing caused the blindness:
+`capability-before-user.md` tells the fleet to file `[agent, user]` whenever
+both legs are real, so the creation-time gate working as designed produced
+exactly the population the audit-time tool could not see. Widened 2026-07-29
+to `"user" in participants`, matching what the creation-time advisory
+(`gates/user_leg_scope.py`) always tested.
+
+Two lanes now run, and they ask OPPOSITE questions:
+
+- **PROMOTE** (`participants == ["user"]`) — "should the AGENT be involved?"
+  Answered by the capability gate. `--apply` mutates. Safe: it only widens
+  participants, never removes one.
+- **DROP** (`user` alongside others) — "is the USER still needed?" The gate
+  CANNOT answer this: agent capability says nothing about whether the human
+  leg is discharged. Decidable only when the leg was declared, via
+  `user_leg_scope` joined against the `## Standing User Grants` table. **Reports
+  only, never mutates** — removing the human is a one-way door inside the loop,
+  and the field is populated on a minority of goals.
+
+Read `undeclared` as the lane's primary finding, not as noise: 20 of 28
+`[agent, user]` goals never recorded WHAT the user is for, so no grant can
+match them and no sweep can re-derive them. `grants no goal can key to` is the
+mirror finding — a grant row whose scope head avoids the `user_leg_scope`
+vocabulary carries real permission this audit can never apply. Both are
+`.claude/rules/reclaim-routed-work.md` rule 4 (declare invalidations in
+machine-findable terms) pointed at the two tables that must converge.
+
+DETECTIVE ONLY here — `--apply` stays a deliberate operator action because it
+mutates goals across every agent's queue, not a per-iteration automatic one.
+
+```
+# Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
+Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check reclaim-user-participant-audit)
+IF decision == "drop": SKIP this phase; continue to Phase 0.5b.15
+Bash: bash core/scripts/audit-user-to-agent.sh --output json
+# JSON, not the text report, because the branches below address named fields:
+# promote_lane.reclassified / drop_lane.verdicts / drop_lane.counts /
+# grants.unkeyed. Reading fields the output does not name is how pseudocode
+# rots into decoration.
+# Never treat an empty PROMOTE plan as a clean sweep — on the live queue that
+# lane is legitimately empty while the drop lane has 28 goals to report.
+FOR EACH v in drop_lane verdicts where verdict == "grant-covered" (max 5):
+    Output: "▸ ⚠ DROP `user`: {v.goal_id} — {v.grants} already covers scope '{v.user_leg_scope}': {v.title}"
+    Output: "    → drop `user` from participants; close outright if the agent leg is also done"
+FOR EACH e in promote plan[:5]:
+    Output: "▸ ⚠ RECLAIMABLE [user]-only goal: {e.goal_id} ({e.source}) — capability gate matched '{e.matched_capability}': {e.title}"
+IF promote plan non-empty:
+    Output: "    → run `bash core/scripts/audit-user-to-agent.sh --apply` to promote"
+IF undeclared count > 0:
+    Output: "▸ {N} [agent, user] goal(s) never declared a user_leg_scope — they cannot be re-derived until backfilled"
+IF grants.unkeyed non-empty:
+    Output: "▸ {N} standing grant(s) no goal can key to — reword the scope head to use the user_leg_scope vocabulary"
+IF nothing in any of the four buckets:
+    continue silently to Phase 0.5b.15
+```
+
+## Phase 0.5b.15: Human-Blocked Defer Join (lane H) — g-115-3156
+
+The defer-recheck family all share one assumption: that a defer is cleared by
+RE-RUNNING SOMETHING. 0.5b.4 re-probes an agent-provisionable capability with its
+canonical script, 0.5b.9 does the same for the credential class, 0.5b.3 re-evaluates
+a structured precondition. A `human_blocked` defer has no script to run — what
+satisfies it is a HUMAN MESSAGE arriving on a channel — so it falls through every
+one of them and is effectively permanent until a person notices by hand.
+
+Measured cost of that gap (2026-07-25, foxtrot): the user granted the exact
+authorization at 14:23 in a relayed board directive naming the commit by SHA.
+Nothing cleared the defer. ~8h later the approved work was still unshipped and the
+goal was ABSENT from goal-selector's entire candidate list — a deferred goal is not
+a candidate, so no amount of looping surfaces it. It also manufactured a spurious
+Investigate in a second agent's queue, correct about the mechanism and blind to the
+fact that the work was already authorized.
+
+Not redundant with 0.5b.9, and this was MEASURED rather than assumed — the
+credential sweep is the one phase that also matches on the `human_blocked:`
+prefix, so it is the obvious reason to delete this one. Live on 2026-07-31 it
+scanned 6 such defers and put **all 6** in `skipped_no_key`, whose own stated
+reason is "human-only defer, never cleared". It also scopes to
+`("pending","in-progress")` (`credential-defer-recheck.py:241`), so the 2
+`blocked`-status defers are outside it entirely. That is 100% of the population
+handed off by design: 0.5b.9 clears the credential subset, and this phase is the
+only thing that looks at the residue.
+
+DETECTIVE ONLY — no `--apply`, and that is a design decision rather than an
+unfinished half. guard-1249: "match the probe to the DEFER'S PREMISE, not to the
+resource it names ... never batch-clear several defers naming the same external
+resource on a single probe." A keyword join proves a message MENTIONS a goal; it
+cannot prove the message GRANTS that goal's specific blocking condition. The live
+population shows the hazard is not theoretical: of 8 `human_blocked` defers, THREE
+name one Studio host — exactly the cluster a single probe would wrongly clear.
+
+Read `confidence`, never mere presence. The four signals demand DIFFERENT actions,
+and the two deterministic ones demand OPPOSITE ones:
+
+| signal | confidence | what it means | action |
+|---|---|---|---|
+| `pq_answered` | deterministic | the cited pending-question now reads answered/resolved | strongest case to re-derive and clear |
+| `pq_retired` | deterministic | the cited question was WITHDRAWN | the OPPOSITE — the clearing path is dead, so the defer can never be satisfied as written. Re-premise it or re-file the question; do NOT read it as granted |
+| `board_directive` | heuristic | a board post newer than the defer names this goal | evidence a human SPOKE about it. Open the post; never act on this alone |
+| `pq_missing` | none | the cited `pq-` id exists in no agent's file | nothing arrived — the defer's own citation is broken. Confirm the block is really filed (guard-1197) before trusting it |
+
+```
+# Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
+Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check human-blocked-defer-join)
+IF decision == "drop": SKIP this phase; continue to Phase 0.5c
+Bash: bash core/scripts/human-blocked-defer-join.sh --output json
+Parse verdict + records[] + shared_premise_clusters + errors[].
+IF verdict == "unreadable":
+    Output: "▸ ⚠ HUMAN-BLOCKED JOIN UNREADABLE: {errors} — this is NOT a clean sweep (rb-245)"
+ELIF verdict == "clean":
+    continue silently to Phase 0.5c   # the common case
+ELSE:
+    FOR EACH k, v in shared_premise_clusters.items():
+        Output: "▸ SHARED PREMISE: {v} defers name '{k}' — guard-1249: probe each premise separately, never batch-clear the cluster"
+    FOR EACH r in records where best_confidence == "deterministic" (max 5):
+        Output: "▸ ⚠ DEFER SIGNAL ARRIVED: {r.goal_id} ({r.source}, intended={r.intended_agent}) — {signal names}: {r.title}"
+    FOR EACH r in records where best_confidence == "heuristic" (max 3):
+        Output: "▸ defer mentioned on the board: {r.goal_id} — open the post before concluding anything: {r.title}"
+    FOR EACH r in records where best_confidence == "none" (max 3):
+        Output: "▸ BROKEN CITATION: {r.goal_id} — its defer cites a pq that exists in no agent's file; nothing arrived. Confirm the block is really filed (guard-1197)"
+    # Say what each bucket IS. Rendering a `none` record with the heuristic line
+    # would announce a board post that was never found — the sweep asserting
+    # evidence it never saw, which is the failure class it exists to catch.
+    # Route by lane exactly as 0.5b.12/0.5b.13: a hit whose intended_agent is
+    # another agent gets a coordination board post naming the goal id + the
+    # evidence. Only an `either`/self-routed hit may be re-derived by this agent,
+    # and only after reading the cited pq or post — never on the join alone.
 ```
 
 ## Phase 0.5c: Recurring-Goal Precondition-Filter lastAchievedAt Sweep
@@ -1306,7 +1696,7 @@ Rationale (WHY shape-recurring-trap sweep): `core/config/rationale/precheck-gate
 ```
 # Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
 Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check recurring-precondition-sweep)
-IF decision == "drop": SKIP this phase; continue to Phase 0.5e
+IF decision == "drop": SKIP this phase; continue to Phase 0.5c.1
 Bash: py core/scripts/recurring-precondition-sweep.py
 # Iterates world + agent queues. For each recurring goal past its time
 # gate with a failing structured precondition, advances lastAchievedAt
@@ -1319,149 +1709,173 @@ Companion to cargo-cult auto-extend in core/scripts/cargo-cult-detector.py:
 auto-extend fixes the "detector fires too often" symptom; this sweep fixes
 one of the root causes for precondition-gated goals.
 
-## Phase 0.5e: Fresh-Eyes Cadence Check
+## Phase 0.5c.1: Recurring-Goal Starvation Detector (g-115-3921)
 
-Periodic autonomous portfolio review. Every 25 completed goals (configured in
-`core/config/aspirations.yaml` → `fresh_eyes_review.goal_cadence`), produce a
-local portfolio-direction briefing examining:
+Every OTHER recurring-cadence detector is CLOSE-TRIGGERED: the streak-break
+canary is emitted by `cmd_complete_by`, so a recurring goal that closes LATE
+produces a signal while one that simply STOPS closing produces nothing.
+`cadence-stale-canary.py` covers the six skill-invocation cadences and has no
+analogue for a goal record. This phase watches the open-loop case.
 
-1. Is the current Self still right?
-2. Are we working on the right problems?
-
-The briefing is archived to `agents/<agent>/temp/` and the agent self-assesses
-the outcome (act_now / act_later / no_change). No email is sent and no
-pending-question is filed — the user reviews via git log and tracked
-signals at their own pace.
-
-The cadence gate is script-enforced (`fresh-eyes-cadence-check.sh`) and
-fail-open — if it errors, the loop continues without review. Cadence is
-purely goal-count-based (the `skip_if_pending` gate was removed
-2026-05-19 — see fresh-eyes-cadence-check.py header).
+Runs AFTER Phase 0.5c so any legitimately-shelved goal has already had its
+`lastAchievedAt` advanced — but it does not DEPEND on that, because it
+re-evaluates the same gates live (0.5c is `deferrable` and drops in a tight
+zone). Tier is `medium`, not `deferrable`: a detector that exists because a
+5-day blind spot went unnoticed must not be the first thing dropped, and its
+cost is one daemon read plus a median.
 
 ```
-# Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
-Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check fresh-eyes-cadence)
-IF decision == "drop": SKIP this phase; continue to Phase 0.5e.5
-Bash: core/scripts/fresh-eyes-cadence-check.sh
-IF exit 0 (fire):
-    Output: "▸ Fresh-eyes review cadence crossed — assembling briefing"
-    Invoke /fresh-eyes-review --cadence
-IF exit 1 (noop):
-    # Cadence not crossed OR config disabled — continue silently (no output)
-    continue
-Bash: echo "aspirations-precheck phase documented"
+Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check recurring-starvation-check)
+IF decision == "drop": SKIP this phase; continue to Phase 0.5e
+Bash: bash core/scripts/recurring-starvation-check.sh --apply --max-file 1
+# Reports EVERY starved recurring goal (age > 3 x basis) but files at most ONE
+# Unblock per run, worst overdue-ratio first, deduped on the exact
+# origin_signal `unblock:recurring-starved-<goal-id>`.
+#
+# Read the SUMMARY LINE, not just the FILED line. The cap bounds what is
+# filed, never what is found: first run reported 22 starved and filed 1. A
+# count that stays high across iterations is the finding — 8 of those 22 were
+# echo's own asp-001 lane, all stopped within a 4-hour window on 2026-07-25
+# and unfired for 5 days, which is one common cause rather than 8 independent
+# starvations. Filing per-goal for a cluster like that fragments one
+# diagnosable finding into N undiagnosable ones.
+#
+# Two evidence gates, both reported in the summary (guard-138 — a clock-only
+# staleness heuristic must be paired with evidence before it acts):
+#   basis_suppressed=N — declared interval_hours is frequently aspirational,
+#     so the multiple is taken against max(interval, demonstrated p50). Do NOT
+#     quote a declared-interval ratio as urgency without checking the basis
+#     column: g-115-22 declares 6h against a ~30h demonstrated cadence.
+#   shelved=N — a goal whose preconditions/fire_when currently FAIL is parked,
+#     not starved. Same evaluator and same gate-gathering as Phase 0.5c.
+# Fail-open: always exits 0.
 ```
 
-Distinct from sq-012 (post-goal, narrow) and strategic-scan S3b
-(autonomous, category coverage only) — this is the periodic local
-self-audit that produces a portfolio-direction briefing on a deliberate
-low-frequency cadence. See `.claude/skills/fresh-eyes-review/SKILL.md`.
+## Phase 0.5e: Skill-Invocation Cadence Battery (g-115-2984, fix for g-115-2982)
 
-## Phase 0.5e.5: Fresh-Eyes PROGRAM Cadence Check
+ONE call runs the cadence gate checks for the SIX skill-invocation cadences —
+fresh-eyes-review (0.5e, 25 goals), fresh-eyes-program (0.5e.5, 100),
+fresh-eyes-tree (0.5e.7, 200), felt-sense (0.5f, 75), curriculum (0.5i, 24h),
+evolution (0.5j) — and reports which FIRE. This REPLACES the six separate
+per-phase `<cadence>-cadence-check.sh` gate calls (the old Phases
+0.5e/0.5e.5/0.5e.7/0.5f/0.5i/0.5j, now collapsed here). Starvation class it
+kills: felt-sense (0.5f) starved 3 days / 581 goals because the LLM abbreviated
+its phase under context pressure — the gate was never run, so the ritual was
+never invoked (g-115-2982 REFUTED the budget-meter mechanism; the non-fire at
+diff 581≫cadence 75 proved the phase was never invoked). Same pattern as
+precheck-sentinel-battery (g-115-2303) + orchestrator-entry-battery (g-115-2550):
+post-autocompact, "run the cadence battery" is the ONE line that must survive
+summarization; the battery's output re-derives the full cadence set from
+`core/scripts/_cadence_registry.py` (SSOT) so a cadence can never silently fall
+out of the protocol.
 
-Sibling to Phase 0.5e. Every 100 completed goals (configured in
-`core/config/aspirations.yaml` → `fresh_eyes_program.goal_cadence`),
-produce a local briefing targeting `world/program.md` (The Program — the
-world's shared purpose) examining two questions:
+Scope: l1-skew (Phase 0.5g) and health-regression (Phase 0.5h) are NOT in the
+battery — they keep their own phases below. l1-skew self-acts (posts findings to
+the board inside its own script, so it cannot starve via the skill-skip mode);
+health-regression has a multi-step verify/verdict/revert flow that does not fit
+the uniform "gate → exit 0 → invoke one skill" shape. Both sit outside the
+skill-invocation-skip starvation class this fix targets.
 
-1. Is The Program still the right shared purpose for this world?
-2. Do both agents' Selfs still serve The Program, or have they drifted?
+**Do NOT re-derive health-regression's exclusion from its mode.** This paragraph
+read "health-regression is DORMANT (collect-only)" until 2026-07-30; that premise
+expired on 2026-07-14 when `health_regression.mode` advanced to `full` under
+explicit user authorization (verified: `health-regression-check.sh --json` returns
+`"mode": "full", "calibrated": true`). The exclusion never rested on dormancy —
+it rests on the multi-step SHAPE above, which is unchanged and still true. The
+trap is that a reader who notices the subsystem is live may read the stale reason
+as lapsed and add it to the battery, where its three-call flow does not fit.
 
-Same infrastructure as fresh-eyes-review (`fresh-eyes-cadence-check.sh`,
-`fresh-eyes-record-tick.sh`), parametrized via `--config-block
-fresh_eyes_program` so the two rituals use disjoint config blocks and WM
-slots. Closes the "program.md has no systematic evolution path" gap called
-out in `core/config/conventions/domain-hooks.md` → Directional Context.
-
-```
-# Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
-Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check fresh-eyes-program-cadence)
-IF decision == "drop": SKIP this phase; continue to Phase 0.5f
-Bash: core/scripts/fresh-eyes-cadence-check.sh --config-block fresh_eyes_program
-IF exit 0 (fire):
-    Output: "▸ Fresh-eyes PROGRAM cadence crossed — assembling shared-purpose briefing"
-    Invoke /fresh-eyes-program --cadence
-IF exit 1 (noop):
-    # Cadence not crossed OR config disabled — continue silently (no output)
-    continue
-```
-
-Lower-frequency than fresh-eyes-review (100 vs 25) because shared purpose
-changes much less frequently than individual agent identity. See
-`.claude/skills/fresh-eyes-program/SKILL.md`.
-
-## Phase 0.5e.7: Fresh-Eyes TREE Cadence Check (S5)
-
-Sibling to Phase 0.5e and 0.5e.5. Every 200 completed goals (configured in
-`core/config/aspirations.yaml` → `fresh_eyes_tree.goal_cadence`), produce a
-local briefing targeting the knowledge tree's top-level taxonomy (the L1 set)
-examining:
-
-**Are the four L1s still the right top-level cuts for the knowledge tree?**
-
-Same infrastructure as the two sibling rituals (`fresh-eyes-cadence-check.sh`,
-`fresh-eyes-record-tick.sh`), parametrized via `--config-block fresh_eyes_tree`
-so the three rituals use disjoint config blocks and WM slots. If taxonomy
-changes are desired, the user invokes the S8 apply scripts
-(`l1-domain-rename.sh`, `l1-domain-add.sh`) manually.
+The battery is READ-ONLY (the cadence checks only read goal-count vs last-fire)
+and does NOT read the budget meter — the checks are cheap, so the meter's
+tight-zone `deferrable` drop is applied at DISPATCH time here (gating the
+EXPENSIVE skill invocation, not the cheap check).
 
 ```
-# Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
-Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check fresh-eyes-tree-cadence)
-IF decision == "drop": SKIP this phase; continue to Phase 0.5f
-Bash: core/scripts/fresh-eyes-cadence-check.sh --config-block fresh_eyes_tree
-IF exit 0 (fire):
-    Output: "▸ Fresh-eyes TREE cadence crossed — assembling L1 taxonomy briefing"
-    Invoke /fresh-eyes-tree --cadence
-IF exit 1 (noop):
-    # Cadence not crossed OR config disabled — continue silently (no output)
-    continue
-Bash: echo "aspirations-precheck phase documented"
+Bash: bash core/scripts/precheck-cadence-battery.sh
+IF output is "[cadence-battery] all 6 cadence gates noop — nothing to fire":
+    SKIP all cadence dispatch — continue to Phase 0.5g.
+IF output reports wrapper_failed OR carries an error= line:
+    Fall back to running each cadence check individually (the six
+    `*-cadence-check.sh` gates in _cadence_registry). The battery never blocks
+    the loop.
+FOR EACH "▸ CADENCE FIRE: <name> (phase <phase>) meter=<meter_name> → <dispatch>" line:
+    # Meter-gate the EXPENSIVE skill invocation (deferrable tier — drop in tight zone).
+    Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check <meter_name>)
+    IF decision == "drop":
+        Output: "▸ cadence <name> fired but meter-dropped (tight zone) — deferring the ritual"
+        continue   # do NOT invoke the ritual this iteration
+    # Dispatch per <name>:
+    fresh-eyes-review  → Invoke /fresh-eyes-review --cadence
+    fresh-eyes-program → Invoke /fresh-eyes-program --cadence
+    fresh-eyes-tree    → Invoke /fresh-eyes-tree --cadence
+    felt-sense         → Invoke /felt-sense-checkin --cadence
+    evolution          → Invoke /aspirations-evolve
+                         # its MANDATORY final write stamps last_evolution_at_time +
+                         # bumps evolutions_this_session (loop-state-bump-counters
+                         # --evolution-fired), keeping it idempotent with Phase 8.8
+                         # and respecting global.max_evolutions_per_session
+    curriculum         → # guard-33 invariant: NEVER call curriculum-promote.sh directly;
+                         # promotion routes ONLY through /curriculum-gates.
+                         Bash: eval_json=$(bash core/scripts/curriculum-evaluate.sh)
+                         # FOUR response shapes, not one (g-115-3607). Only `gates` is
+                         # present in every non-error shape; the scalars are branch-local:
+                         #   unconfigured  -> configured:false, all_passed, gates
+                         #   stage-missing -> error (NO configured key at all)
+                         #   TERMINAL      -> configured, current_stage, all_passed:true,
+                         #                    terminal_stage:true, gates:[]   <- early
+                         #                    return at curriculum.py:392, omits the four
+                         #                    scalars below
+                         #   full          -> + stage_name, gates_total,
+                         #                    gates_passed_count, next_stage
+                         # So branch on SHAPE before reading any shape-local field.
+                         Parse eval_json: configured, error, all_passed, gates,
+                                          current_stage, terminal_stage, stage_name, next_stage
+                         # Stamp the cadence slot AFTER evaluate (bare quoted-ISO; stamping
+                         # after means a skipped/failed eval re-fires next iteration).
+                         Bash: printf '"%s"' "$(date +%Y-%m-%dT%H:%M:%S)" | bash core/scripts/wm-set.sh last_curriculum_eval
+                         IF eval_json.error is non-null:
+                             Output: "▸ CURRICULUM: evaluate returned an error ({error}) — snapshot NOT refreshed"
+                             continue
+                         IF eval_json.configured == false: continue  # no curriculum for this agent
+                         IF eval_json.terminal_stage == true:
+                             # all_passed:true with zero gates is the CORRECT steady state
+                             # at the end of the curriculum, NOT a pending promotion. Without
+                             # this branch the ELSE below fired and rendered
+                             # "re-evaluated None — None/None gates pass (not yet promotable)",
+                             # asserting the opposite of the truth and sending a reader
+                             # chasing a phantom gate failure.
+                             Output: "▸ CURRICULUM: {current_stage} is the TERMINAL stage (no graduation gates) — all_passed=true is the correct end state, nothing to promote; snapshot refreshed"
+                             continue
+                         # Derive the counts from `gates` rather than the gates_total /
+                         # gates_passed_count scalars: `gates` is the one field every shape
+                         # carries, so the render cannot go None/None if a new shape appears.
+                         gates_total        = len(eval_json.gates)
+                         gates_passed_count = count of eval_json.gates where passed == true
+                         IF eval_json.all_passed == true AND eval_json.next_stage is non-null:
+                             Output: "▸ CURRICULUM: all gates pass at {stage_name} — routing to /curriculum-gates for promotion to {next_stage} (guard-33, register+defer)"
+                             invoke /curriculum-gates   # non-blocking, deduped
+                         ELSE:
+                             Output: "▸ CURRICULUM: re-evaluated {stage_name} — {gates_passed_count}/{gates_total} gates pass (not yet promotable); snapshot refreshed"
 ```
 
-Distinct from `/tree maintain` (per-node structural ops, autonomous +
-manual), `/reflect` Step 7 Tree Health Lint (per-node staleness + width),
-and `l1-skew-check.py` (S1 passive measurement at 50 goals). Those check
-NODE health or accumulate quantitative skew evidence; this ritual asks
-the structural-design question that no automated gate ever surfaces.
-Lower-frequency than program (200 vs 100) because L1 changes are
-high-blast-radius. See `.claude/skills/fresh-eyes-tree/SKILL.md`.
-
-## Phase 0.5f: Felt-Sense Check-In Cadence
-
-Periodic autonomous structured 7-lane self-audit. Every 75 completed
-goals (configured in `core/config/aspirations.yaml` →
-`felt_sense.goal_cadence`), the agent runs the full sweep:
-memory hygiene, out-of-cycle completions, unblocks, forward backlog,
-framework-test gaps, meta tuning, and the felt-sense question ("where
-is the pain, what would I change"). Material Self findings route
-through `guard-380` post-notification; cosmetic findings journal only.
-
-The cadence gate is script-enforced (`felt-sense-cadence-check.sh`) and
-fail-open — if it errors, the loop continues without the sweep.
-
-```
-# Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
-Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check felt-sense-cadence)
-IF decision == "drop": SKIP this phase; continue to Phase 1
-Bash: core/scripts/felt-sense-cadence-check.sh
-IF exit 0 (fire):
-    Output: "▸ Felt-sense check-in cadence crossed — running 7-lane sweep"
-    Invoke /felt-sense-checkin --cadence
-IF exit 1 (noop):
-    # Cadence not crossed OR config disabled — continue silently
-    continue
-Bash: echo "aspirations-precheck phase documented"
-```
-
-Distinct from fresh-eyes-review (Phase 0.5e — joint user+agent meta-Q&A,
-asks user for answers) and sq-012 (post-goal, narrow). This is an
-autonomous structured self-audit that WRITES outputs directly (tree
-nodes, guardrails, goals, verify-learning checks, meta edits) and
-notifies the user only when Self changes materially. Lower frequency
-(75 vs 25) because the seven lanes are expensive and Lane 7 needs
-room to feel earned rather than ritual. See
-`.claude/skills/felt-sense-checkin/SKILL.md`.
+Per-cadence rationale (the ritual is unchanged — only the CHECK moved into the
+battery):
+- **fresh-eyes-review** (25 goals): portfolio-direction briefing (Self still
+  right? right problems?), archived to `agents/<agent>/temp/`. Distinct from
+  sq-012 + strategic-scan S3b. See `.claude/skills/fresh-eyes-review/SKILL.md`.
+- **fresh-eyes-program** (100 goals): The Program shared-purpose briefing
+  (is `world/program.md` still right? have the Selfs drifted?). See
+  `.claude/skills/fresh-eyes-program/SKILL.md`.
+- **fresh-eyes-tree** (200 goals): L1 taxonomy briefing (are the L1s still the
+  right top-level cuts?). See `.claude/skills/fresh-eyes-tree/SKILL.md`.
+- **felt-sense** (75 goals): structured 7-lane self-audit; material Self findings
+  route through guard-380 post-notification, cosmetic findings journal only. See
+  `.claude/skills/felt-sense-checkin/SKILL.md`.
+- **curriculum** (24h, g-115-1801): read-only gate re-eval so the stored snapshot
+  never goes stale; guard-33 — promotion routes ONLY through /curriculum-gates.
+- **evolution** (g-115-2240): precheck-side net so recurring-heavy sessions
+  (which bypass Phase 8.8) don't starve evolution; idempotent with 8.8 via
+  the shared `last_evolution_at_time` stamp.
 
 ## Phase 0.5g: L1 Distribution Skew Check (S1 — Tree Taxonomy Review)
 
@@ -1485,11 +1899,17 @@ prints to stderr and the loop continues. Exit code 1 on noop is silent.
 ```
 # Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
 Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check l1-skew-cadence)
-IF decision == "drop": SKIP this phase; continue to Phase 1
+# Successor is 0.5h, NOT Phase 1 (g-115-3830). Both pointers here used to read
+# "Phase 1", which skips the Health-Regression + Revert sweep entirely. 0.5h
+# carries its OWN budget meter, so handing control to it under a tight budget
+# costs nothing — it gates itself and continues to Phase 1 on its own drop.
+# That is the whole point of the immediate-successor rule: every phase must get
+# its own budget decision rather than inherit a neighbour's.
+IF decision == "drop": SKIP this phase; continue to Phase 0.5h
 Bash: core/scripts/l1-skew-check.sh --cadence --post-board
 IF exit 0 (fire — cadence crossed, check ran):
     # Script printed its JSON verdict to stdout (LLM context). Board post
-    # already fired if any_flagged. Continue silently to Phase 1.
+    # already fired if any_flagged. Continue silently to Phase 0.5h.
     continue
 IF exit 1 (noop — cadence not crossed):
     continue
@@ -1521,8 +1941,12 @@ to recent in-window file changes (ranked + constitutional-ring-classified), file
 an `Investigate:` goal, and — when revert-eligible — routes the top candidate to
 a tiered revert.
 
-**DORMANT** (launch default `collect-only`): returns `tripped:false reason:"mode=collect-only"` — no-op until mode → `detect-and-report` (Phase 2) or `full` (Phase 3).
-Rationale (WHY DORMANT and mode gate): `core/config/rationale/precheck-gates.md`
+**LIVE** — `health_regression.mode: full` (`core/config/aspirations.yaml:1921`) and calibrated, since 2026-07-14 under explicit user authorization. Measured 2026-07-30 (bravo, cc-05): `health-regression-check.sh --json` returns `mode:"full", calibrated:true`, and a non-trip reports `reason:"interval not elapsed (N/10)"` — never `reason:"mode=collect-only"`.
+
+This header asserted **DORMANT (launch default `collect-only`)** in the present tense until 2026-07-30: the launch default, never re-read after the mode advanced. Nothing failed, so nothing surfaced it — the rb-5818 expired-reason class, and the SECOND occurrence of it in this file. The sibling in the cadence-battery note (~L1622) was corrected earlier the same day and deliberately QUOTES the old wording in order to retract it; do NOT "fix" that one, and anchor any check on a LIVE claim rather than a bare `grep -q DORMANT` (guard-1685 referent trap — the token survives its own correction).
+
+The mode gate itself is unchanged and still governs: `collect-only` → `tripped:false reason:"mode=collect-only"`; `detect-and-report` (Phase 2) adds Investigate reports but never reverts; `full` (Phase 3) additionally grants tiered revert.
+Rationale (WHY the mode gate): `core/config/rationale/precheck-gates.md`
 
 ```
 # Budget meter — deferrable cadence sweep (sibling to 0.5e/0.5f/0.5g).
@@ -1632,101 +2056,30 @@ continue to Phase 1
 Bash: echo "aspirations-precheck phase documented"
 ```
 
-## Phase 0.5i: Curriculum Re-Evaluation Cadence (g-115-1801)
+## Phases 0.5i (Curriculum) + 0.5j (Evolution) — folded into the Phase 0.5e Cadence Battery (g-115-2984)
 
-Time-gated re-evaluation of THIS agent's curriculum graduation gates so the
-stored snapshot never goes stale. The only OTHER `/curriculum-gates` triggers
-(session-end consolidation Step 8.6, cadence-gated evolution Step 10) can skip a
-continuously-looping agent for weeks — delta sat at Foundation a full month
-(eval frozen 2026-06-01, goals=3/competence=0.0) while its live values already
-qualified (goals=27/competence=0.589). Config: `core/config/aspirations.yaml` →
-`curriculum_cadence` (interval_hours default 24, wm_slot `last_curriculum_eval`).
+The curriculum-cadence (24h, g-115-1801) and evolution-cadence (g-115-2240)
+CHECKS now run in the **Phase 0.5e Skill-Invocation Cadence Battery** above,
+alongside the four fresh-eyes/felt-sense cadences — ONE un-skippable call for all
+six, checked at the 0.5e position (before 0.5g/0.5h; no ordering dependency —
+both are idempotent via their own stamps). Their FIRE dispatch lives in that
+battery phase's dispatch loop:
+- **curriculum** — guard-33 invariant preserved (NEVER call `curriculum-promote.sh`
+  directly): read-only `curriculum-evaluate.sh` → stamp `last_curriculum_eval` →
+  route to `/curriculum-gates` ONLY when all gates pass (the SOLE guard-33
+  promotion chokepoint; register+defer, non-blocking, deduped). Precheck remains
+  a caller of that chokepoint alongside consolidation + evolution.
+- **evolution** — precheck-side net so recurring-heavy sessions (which bypass
+  Phase 8.8) don't starve evolution; `/aspirations-evolve`'s mandatory final write
+  stamps `last_evolution_at_time` + bumps `evolutions_this_session`
+  (loop-state-bump-counters --evolution-fired), keeping it idempotent with Phase
+  8.8 and respecting `global.max_evolutions_per_session`.
 
-**guard-33 invariant (MUST NOT weaken)**: this cadence NEVER calls
-`curriculum-promote.sh` directly. `curriculum-evaluate.sh` is a read-only gate
-assessment (safe); only PROMOTION is the human-gated self-escalation. When gates
-pass, promotion routes through `/curriculum-gates` — the SOLE guard-33 promotion
-chokepoint (register + DEFER, non-blocking; deduped via the pending-escalations
-state machine). This makes precheck a THIRD caller of that chokepoint alongside
-consolidation + evolution; the contract is identical.
-
-```
-Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check curriculum-cadence)
-IF decision == "drop": SKIP this phase; continue to Phase 1
-
-Bash: bash core/scripts/curriculum-cadence-check.sh; rc=$?
-IF rc != 0:
-    # Interval not elapsed, config disabled/absent, or state-read error — all silent.
-    continue to Phase 1
-
-# FIRE — interval elapsed (or never evaluated). Re-evaluate this agent's gates.
-Bash: eval_json=$(bash core/scripts/curriculum-evaluate.sh)
-Parse eval_json: configured, current_stage, stage_name, all_passed,
-                 gates_passed_count, gates_total, next_stage
-
-# Stamp the cadence slot AFTER the evaluate (bare quoted-ISO string — the check
-# reads a bare string OR a {"timestamp": ...} dict). Stamping after (not before)
-# means a skipped/failed evaluate re-fires next iteration rather than silently
-# advancing the cadence past a missed eval (self-correcting drift direction).
-Bash: printf '"%s"' "$(date +%Y-%m-%dT%H:%M:%S)" | bash core/scripts/wm-set.sh last_curriculum_eval
-
-IF eval_json.configured == false:
-    # No curriculum configured for this agent — silent (stamp already advanced).
-    continue to Phase 1
-
-IF eval_json.all_passed == true AND eval_json.next_stage is a non-null string:
-    Output: "▸ CURRICULUM CADENCE: all {gates_total} gates pass at {stage_name} ({current_stage}) — routing to /curriculum-gates for promotion to {next_stage} (guard-33 email-confirmed, register+defer)"
-    invoke /curriculum-gates
-    # /curriculum-gates is non-blocking + deduped; it registers/defers the
-    # escalation (or applies a previously-confirmed one) and returns control.
-    continue to Phase 1
-ELSE:
-    Output: "▸ CURRICULUM CADENCE: re-evaluated {stage_name} ({current_stage}) — {gates_passed_count}/{gates_total} gates pass (not yet promotable); snapshot refreshed"
-    continue to Phase 1
-```
-
-## Phase 0.5j: Evolution Cadence Safety-Net (g-115-2240)
-
-Precheck-side evolution cadence tick. The Phase 8.8 evolution cadence check
-(aspirations loop digest) fires ONLY on the non-recurring close path —
-recurring-close.sh wraps just the 4 iteration-close phases then emits the
-terminal imperative, so the next iteration re-enters at Phase -1.5 and Phase
-8.7/8.8/9/11 never run. On recurring-heavy sessions (the common bravo/fleet
-pattern) Phase 8.8 never fires and evolution STARVES (observed 2026-07-15: last
-fired ~99h prior vs the 12h cadence). This sweep is the safety net — it fires
-regardless of close path, exactly like the sibling cadence sweeps above
-(fresh-eyes 0.5e, felt-sense 0.5f, health-regression 0.5h, curriculum 0.5i)
-which all run in precheck. Idempotent with Phase 8.8 via the shared
-`last_evolution_at_time` stamp: whichever fires first stamps it (via
-aspirations-evolve's mandatory final write), the other sees a fresh stamp and
-no-ops.
-
-Deferrable tier: the budget meter drops it in the tight zone, honoring
-`maintenance_cadence.evolution.tight_zone_skip=true` — so the check script does
-NOT check the zone itself. Fail-open (exit 1 on any error) and fail-loud
-(guard-424: errors to stderr).
-
-```
-# Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
-Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check evolution-cadence)
-IF decision == "drop": SKIP this phase; continue to Phase 1
-Bash: core/scripts/evolution-cadence-check.sh
-IF exit 0 (fire):
-    Output: "▸ Evolution cadence crossed (recurring-close bypasses Phase 8.8) — firing /aspirations-evolve"
-    Invoke /aspirations-evolve
-    # aspirations-evolve's MANDATORY final write stamps last_evolution_at_time +
-    # bumps evolutions_this_session (loop-state-bump-counters --evolution-fired),
-    # keeping this sweep idempotent with Phase 8.8 and respecting the per-session
-    # cap (global.max_evolutions_per_session).
-IF exit 1 (noop):
-    # Cadence not crossed, session cap reached, or read error — continue silently.
-    continue
-```
-
-Distinct from Phase 8.8 (non-recurring close path). This is the precheck-side
-net that survives recurring-heavy sessions. See g-115-2240 for the 3-signal
-diagnosis (recurring-close.sh lines 5-8 wrap the 4 phases; lines 955-972 emit the
-terminal imperative; `last_evolution_at_time` was ~99h stale).
+This collapse eliminated the six abbreviate-able per-phase gate calls that let
+felt-sense starve 3 days / 581 goals (g-115-2982). The rituals themselves are
+unchanged; only the CHECK moved into the battery. Distinct from Phase 8.8
+(non-recurring close path evolution check) — the battery is the precheck-side net
+that survives recurring-heavy sessions.
 
 ## Phase 1: Recurring Goal Check
 
@@ -1749,7 +2102,7 @@ Bash: bash core/scripts/aspirations-precheck-budget-meter.sh end
 ## Chaining
 
 - **Called by**: `/aspirations` orchestrator (every iteration, first phase)
-- **Calls**: `aspirations-read.sh`, `aspirations-meta-update.sh`, `guardrail-check.sh`, `infra-health.sh`, `wm-read.sh`, `wm-set.sh`, `aspiration-trajectory.sh` (cycle detection), `aspirations-add-goal.sh` (cycle detection, hypothesis pipeline, accuracy gate), `aspirations-query.sh` (user-goal reclassification), `aspirations-update-goal.sh` (user-goal reclassification), `world-cat.sh` (capability-routing convention), `pipeline-read.sh` (hypothesis pipeline + accuracy health), `fresh-eyes-cadence-check.sh` (Phase 0.5e gate), `recurring-precondition-sweep.py` (Phase 0.5c), `health-regression-check.sh` (Phase 0.5h detection sweep), `health-revert.sh` (Phase 0.5h verify + tiered revert), `/create-aspiration` (health + pipeline depth), `/fresh-eyes-review --cadence` (Phase 0.5e fire), CREATE_BLOCKER protocol
+- **Calls**: `aspirations-read.sh`, `aspirations-meta-update.sh`, `guardrail-check.sh`, `infra-health.sh`, `wm-read.sh`, `wm-set.sh`, `aspiration-trajectory.sh` (cycle detection), `aspirations-add-goal.sh` (cycle detection, hypothesis pipeline, accuracy gate), `aspirations-query.sh` (user-goal reclassification), `aspirations-update-goal.sh` (user-goal reclassification), `world-cat.sh` (capability-routing convention), `pipeline-read.sh` (hypothesis pipeline + accuracy health), `fresh-eyes-cadence-check.sh` (Phase 0.5e gate), `recurring-precondition-sweep.py` (Phase 0.5c), `recurring-starvation-check.sh` (Phase 0.5c.1), `health-regression-check.sh` (Phase 0.5h detection sweep), `health-revert.sh` (Phase 0.5h verify + tiered revert), `/create-aspiration` (health + pipeline depth), `/fresh-eyes-review --cadence` (Phase 0.5e fire), CREATE_BLOCKER protocol
 - **Reads**: Aspirations compact, working memory (blockers), guardrails, trajectory data (cycle detection), pipeline meta (hypothesis counts + accuracy), `core/config/aspirations.yaml` (pipeline_low_water_mark, hypothesis_pipeline_low_water_mark, accuracy_critical_threshold, accuracy_min_sample)
 
 ## Return Protocol

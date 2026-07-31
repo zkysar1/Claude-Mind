@@ -90,9 +90,23 @@ if [ $PLAN -eq 1 ]; then
     fi
     PLAN_FLAGS=""
     [ $LIVING_PROD -eq 1 ] && PLAN_FLAGS="--living-prod"
+    # PROPAGATE the engine's rc — do NOT hardcode `exit 0` here ().
+    # The engine encodes its verdict in the exit code (0 SAFE / 20 REVIEW
+    # REQUIRED / 21 DO NOT PROMOTE; SSOT comment at _seed_engine.py `plan`
+    # dispatch). This line previously read `exit 0`, which discarded that rc and
+    # made promote-to-upstream.sh's `|| fail` unreachable for every real verdict:
+    # it could only ever fire if bash failed to launch the command at all. Two
+    # layers hardcoded 0 while the third called itself a gate.
+    #
+    # `set -e` is why this needs the explicit capture rather than a bare call:
+    # a non-zero rc from the engine would otherwise kill the script here with no
+    # diagnostic, turning a legible refusal into an opaque death.
+    set +e
     py -3 "$SCRIPT_DIR/_seed_engine.py" plan \
         --manifest "$MANIFEST" --source "$PROJECT_ROOT" --dest "$DEST" $PLAN_FLAGS
-    exit 0
+    PLAN_RC=$?
+    set -e
+    exit $PLAN_RC
 fi
 
 # Step 3: Pre-flight checks

@@ -168,10 +168,14 @@ IF all_passed == true:
     # is domain-supplied in world/scripts/. If this world has not wired it,
     # guard-33 fail-closes -- the agent CANNOT self-authorize the unlock, so it
     # defers rather than promoting. It NEVER falls back to a direct promote.
-    IF NOT exists "world/scripts/self-escalation-register.sh":
+    # Resolve $WORLD_PATH for BOTH the existence probe and the invocation — a bare
+    # `world/scripts/...` probe resolves against PROJECT_ROOT (no world/ dir there),
+    # so it would ALWAYS report "not exists" and defer promotion forever, making the
+    # guard-33 fail-closed branch unconditional and the call below unreachable.
+    IF NOT exists "$WORLD_PATH/scripts/self-escalation-register.sh"   (source core/scripts/_paths.sh first):
         Bash: echo "Curriculum: gates passed for {to_stage} but self-escalation transport is not wired in this world -- promotion DEFERRED (guard-33 fail-closed). No self-authorization."
         RETURN
-    Bash: bash world/scripts/self-escalation-register.sh \
+    Bash: source core/scripts/_paths.sh && bash "$WORLD_PATH/scripts/self-escalation-register.sh" \
         --action "{action_text}" \
         --escalation-type curriculum-graduation \
         --session "${MIND_SID:-}"

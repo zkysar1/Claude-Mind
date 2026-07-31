@@ -289,7 +289,25 @@ non-trivial diagnosis) that future readers would benefit from re-reading:
     - Decisions made and rationale
     - Verbatim evidence excerpts that drove decisions
   Bash: echo '<experience-json>' | bash core/scripts/experience-add.sh
+    id: "<experience_id>"        # REQUIRED — same slug as the .md above
     type: "chat_session"
+    category: "<topic-category>" # REQUIRED — omitting it fails validation
+    content_path: "agents/<agent>/experience/<experience_id>.md"  # REQUIRED
+    summary: <one-line>
+    tree_nodes_related: <nodes touched in 1.1>
+    tags: ["chat-derived", ...]
+    # verbatim_anchors is OPTIONAL, but IF included EACH element MUST be an
+    # object {"key": "<tag>", "content": "<excerpt>"} — a bare string exits 1
+    # (experience.py; g-115-2847, hit live registering exp-g-115-2839).
+    # ALL FIVE of id/type/category/content_path/summary are required. Omitting
+    # category or content_path returns:
+    #   {"error":"validation_failed",
+    #    "detail":"Missing required fields: {'category', 'content_path'}"}
+    # *** THIS FAILURE IS EASY TO MISS (g-115-2847, 2026-07-21). *** The error
+    # object parses as JSON, so a caller that reads `.id` off the response gets
+    # None and may print "ENCODED experience: None" while NOTHING was written.
+    # ALWAYS confirm the write landed before reporting success:
+    #   Bash: grep -c "<experience_id>" agents/<agent>/experience.jsonl   → 1
     # Schema-valid types: goal_execution, hypothesis_formation, research,
     # reflection, user_correction, user_interaction, execution_reflection,
     # chat_session (added g-115-425, 2026-05-08). Use "chat_session" for
@@ -297,9 +315,7 @@ non-trivial diagnosis) that future readers would benefit from re-reading:
     # (single-goal trace) and user_interaction (Q&A). The .md front matter
     # may use descriptive type values (not validated), but the JSON body to
     # experience-add.sh MUST use a schema type or the call exits 1.
-    summary: <one-line>
-    tree_nodes_related: <nodes touched in 1.1>
-  Print: ENCODED experience:<experience_id>
+  Print: ENCODED experience:<experience_id>  (only after the grep confirms 1)
 ELSE (pure Q&A, trivial chat): SKIP.
 ```
 
@@ -428,13 +444,39 @@ Did our chat-session work falsify any existing blocker's defer_reason?
 
 ```
 Bash: aspirations-read.sh --blocked
-For each blocked goal:
-  Read defer_reason and goal.source (world or agent)
+
+# *** OUTPUT SHAPE (g-115-2847, 2026-07-21): the goal fields are NESTED. ***
+# --blocked returns a flat LIST of WRAPPER objects, NOT goal objects:
+#     [{"aspiration_id": "asp-NNN",
+#       "aspiration_title": "...",
+#       "goal": { id, title, status, defer_reason, blocked_by, ... }}, ...]
+# So `row["id"]` is None for EVERY row — read `row["goal"]["id"]` instead.
+# Observed failure: a naive parse printed 36 rows of "(no-id) | (none)" and
+# would have silently concluded there was nothing to re-probe.
+#     for row in rows:
+#         g = row["goal"]; asp = row["aspiration_id"]
+
+For each row in the returned list:
+  g = row.goal
+  Read g.defer_reason (and g.blocked_by — a goal can be blocked by EITHER an
+    unmet defer_reason OR a blocked_by dependency list; only defer_reason is
+    clearable here, blocked_by clears when its upstream goals complete)
+  Determine goal.source: world if row.aspiration_id is a world aspiration,
+    else agent.
   IF the conversation produced evidence that falsifies the defer reason
     (new file exists, infrastructure works, capability provisioned, etc.):
-      Bash: aspirations-update-goal.sh --source <goal.source> <goal-id> defer_reason ""
-      Print: UNBLOCKED g-NNN-NN — defer cleared (falsified by <evidence>)
+      # The clear sentinel is the literal string `null`, NOT "" (verified
+      # 2026-07-27, cost one failed call). aspirations-update-goal.sh guards
+      # its positionals with `[ -z "$VALUE" ]` and exits 1 on an empty string
+      # ("Error: goal_id, field, and value are all required."); only `null`
+      # reaches the parse_value branch that writes JSON null (script L130).
+      Bash: aspirations-update-goal.sh --source <goal.source> <g.id> defer_reason null
+      Print: UNBLOCKED <g.id> — defer cleared (falsified by <evidence>)
 If nothing matches: print "No blockers falsified by this session."
+# Beware keyword-only matching: filtering blocked goals by topic keywords
+# ("session", "account", "key") over-matches badly — 25 of 36 rows matched an
+# identity-work filter while none were actually falsifiable. Read the actual
+# defer_reason before concluding relevance.
 ```
 
 ## Lane 4: Work Discovery (skipped in --quick mode)
@@ -502,8 +544,24 @@ IF yes:
     Increment times_encountered, append to encounter_log
   ELSE:
     Register new gap: id: gap-{next}, status: registered, times_encountered: 1,
-                      procedure_name, estimated_value
-  Bash: meta-set.sh skill-gaps.yaml <updated-yaml>
+                      procedure_name, estimated_value,
+                      type: <utility|analytical>   # REQUIRED (g-115-3131)
+    # `type` gates the forge developmental bar — absent hands that decision to
+    # a default instead of you. Per core/config/skill-gaps.yaml gap_types:
+    # utility = mechanizes an ALREADY-DERIVED procedure -> CALIBRATE;
+    # analytical = the OUTPUT needs domain-mature judgment -> EXPLOIT (higher
+    # bar). Unsure -> `utility`; it IS the default, so stating it costs nothing.
+  # meta-set.sh is a DOTPATH setter — `meta-set.sh <file> <dotpath> <value>`.
+  # It does NOT accept a whole-file YAML rewrite; passing one exits 1 with the
+  # bare usage line (verified 2026-07-27, cost two failed attempts). Find the
+  # gap's list index first, then set the fields individually. Bracket and dot
+  # index forms are equivalent (meta-yaml.py:110 normalizes `[N]` -> `.N`), and
+  # a JSON array value round-trips as a real YAML list (parse_value, g-115-1263)
+  # — see guard-661 for the verified contract and the one residual caveat
+  # (read-modify-write across two daemon calls is a TOCTOU race; use
+  # _fileops.locked_modify_yaml when a concurrent writer is possible).
+  Bash: meta-set.sh skill-gaps.yaml "gaps[<i>].times_encountered" <n+1> --reason "<goal-id> encounter"
+  Bash: meta-set.sh skill-gaps.yaml "gaps[<i>].encounter_log" '<full JSON array incl. the new entry>'
   Print: FORGE GAP <gap-id> — <procedure_name>
 Do NOT auto-forge — that requires curriculum permission and the /forge-skill flow.
 ```
@@ -516,12 +574,22 @@ Did the chat-session changes touch framework files where regressions need a chec
 5.1. SCOPE FILTER
    Bash: git status --short
    # Single source of truth: working-tree (uncommitted) scope. Same reasoning
-   # as Phase 1 — chat sessions usually have not committed yet, so HEAD@{1}
-   # would be empty. The aspirations-spark sq-018 handler uses HEAD@{1}..HEAD
-   # because it runs post-commit in the loop; encode-session does not.
+   # as Phase 1 — chat sessions usually have not committed yet, so any
+   # commit-relative range would be empty.
+   # (Corrected 2026-07-30, g-115-3539: this comment used to say the
+   # aspirations-spark sq-018 handler uses HEAD@{1}..HEAD "because it runs
+   # post-commit in the loop". BOTH halves were wrong — guard-1320 fires that
+   # spark inline BEFORE state-update commits, and the range was a defect
+   # rather than a design: it spanned iteration-push merges and attributed a
+   # PARTNER's files to the goal. It now resolves the goal's own commits and
+   # falls back to this same working-tree scope. See guard-2001 / rb-5942.)
    Filter to framework-relevant paths:
-     core/scripts/**, core/config/**, .claude/skills/**, .claude/rules/**,
-     world/conventions/**, .claude/settings.json
+     core/scripts/**, core/config/**, mind_api/src/**, .claude/skills/**,
+     .claude/rules/**, .claude/settings.json
+   # world/ and meta/ are deliberately NOT listed: they are external gitignored
+   # paths (.gitignore `/world/`), so `git status --short` can never report
+   # them. Listing them would look like coverage while matching nothing —
+   # the same dead arm removed from sq-018 in g-115-3539 (rb-5942).
    IF no framework files changed:
      Print: "encode-session: no framework files changed — no verify-learning candidates."
      SKIP rest of Lane 5.
@@ -642,9 +710,32 @@ Lane 6 (Meta):           <N> meta proposals
 Lane 7 (Self):           <evolution-classification or "no change">
 
 Proposals (require user OK to write):
-  <list each proposal here, with the exact tool call needed to accept>
+  <for each: MECHANISM=PROBED|INFERRED — the stated reason, then the exact
+   tool call needed to accept>
 ═══════════════════════════════════════════════════
 ```
+
+**Mark every proposal's stated MECHANISM as PROBED or INFERRED.** A proposal
+carries two separable claims: the ACTION ("recategorize guard-X") and the
+MECHANISM that justifies it ("because a domain category under-retrieves it").
+The mechanism is a factual assertion about how the system behaves, and it can
+be FALSE while the action is still right — so it needs evidence in its own
+right, not the action's plausibility standing in for it. If the mechanism was
+not probed during this session, write `INFERRED` and name the one probe that
+would settle it; do not present an unprobed mechanism in the same voice as a
+measured one.
+
+Canonical incident (2026-07-26): a proposal shipped as "guard-NNN is filed
+under a product-specific category … a domain category on a domain-agnostic
+rule **under-retrieves it**". When the user asked to improve it, the probe
+returned that guardrail at rank 12 of 40 on free-text retrieval — the stated
+mechanism was false. The real loss was narrower (the token-overlap fallback
+fires ONLY when the category match returns empty, so an *exact-category* read
+never reaches it), and the recategorization was still correct. One bullet of
+unprobed causal reasoning had been shipped in the same register as measured
+findings. `communication-clarity.md` rule 6 governs verify summaries and
+reports; this extends the same standard to forward-looking proposals, which
+rule 6 does not name.
 
 The terminal Bash call (per Return Protocol below) also resets the
 `assistant_turn_count` working-memory slot — see Return Protocol for the

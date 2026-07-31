@@ -368,6 +368,82 @@ runs whenever no live daemon is present. Enforced by `guard-672`.
 >    plus the pre-existing suites for both modified scripts were re-run
 >    explicitly (61 passed / 0 failed).
 >
+> AMENDED 2026-07-31 (g-115-4140, same box, folded per the g-115-4058 size
+> practice): **the ladder extends to 24** — 20 chunks INVALID (chunk 02 stopped
+> at 96% behind a clean-looking `TOTAL: 7643 passed, 2 failed`) → 24 chunks
+> VERDICT GENUINE at 7511 passed / 2 failed / 0 errors, ~40 min apart, live
+> fleet. So 8 → 12 → 16 → 20 → 24, still open at the top, and a rung that was
+> CLEAN on this box yesterday (20, the row above) contended today — third
+> same-box confirmation that no rung is inheritable, including from your own
+> prior run. The 2 fails were the `test_fleet_config_parity` pair again
+> (**g-115-3803**, chunk-07 log). Also the first row where the DOMAIN half
+> carried a pre-existing owned red (`test_email_read_listing_assertion.sh`,
+> 9/15 sub-assertions, identical across both runs): rc=1 split per item 2
+> localized it, and an aspirations-query by test name found the owning pending
+> Fix goal — grep the failing FILE name against the world queue before filing.
+> RE-AMENDED hours later (g-115-4137, same box): **the ladder extends to 28** —
+> 20 INVALID → 24 harness-killed → 24 INVALID (chunk 04 stopped at 94%) →
+> 28 chunks VERDICT GENUINE at 7537 passed / 2 failed / 0 errors. The rung
+> that was GENUINE on this box ~12h earlier (24, this row) contended twice
+> today; fourth same-box confirmation that no rung is inheritable. The 2
+> fails were the same `test_fleet_config_parity` pair (**g-115-3803**, red
+> solo again — 4th+5th consecutive red measurement on this box).
+>
+> **STOP CLIMBING THE LADDER FIRST — INVALID has TWO causes and escalating the
+> rung only fixes one.** Every row above treats INVALID as contention, so the
+> prescribed response is a higher rung. On an own-cloud box that advice can
+> loop forever, because the runner writes its chunk logs into
+> `agents/<agent>/temp/suite-run` — *inside the synced tree* — and the sync
+> rewrites logs mid-run. The runner then reads a truncated log, sees a chunk
+> that never reached 100%, and returns INVALID for a run that actually
+> COMPLETED. No rung can fix that.
+>
+> Measured 2026-07-31 (foxtrot, `hostname` = LAPTOP-3IOFCNEO, `uname -r` =
+> 6.6.87.2-microsoft-standard-WSL2, `STORAGE_BACKEND=own-cloud`, 5 agents
+> active within 18 min), same tree, same box, same load:
+>
+> | logs | rung | verdict |
+> |---|---|---|
+> | inside synced tree (default) | 28 | INVALID |
+> | inside synced tree (default) | 32 | INVALID |
+> | inside synced tree (default) | 36 | INVALID (`chunk 15 stopped at 82%`) |
+> | **outside synced tree (`--out`)** | **32** | **GENUINE — trustworthy** |
+>
+> That valid run: **7942 passed / 3 failed / 0 errors**, invisible-suites 94/94,
+> 0 quarantined. Both failing files are owned and neither is new — the
+> `test_fleet_config_parity` pair is **g-115-3803** (6th+7th consecutive red on
+> this box), and `test_completed_not_committed_sweep` is **g-115-4269**, filed
+> from this run: it passes SOLO (63/63) and fails only in-suite, so it is
+> test-order pollution — a third category this rule does not otherwise name,
+> and one where guard-1448's "green solo ⇒ environmental" discriminator and the
+> runner's GENUINE verdict disagree while both are right about what they measure.
+>
+> **The discriminator is NUL bytes, and it is one command.** The 36-chunk run
+> carried 8 NUL bytes total, every one of them in the single chunk the runner
+> flagged (`chunk-15.log`, truncated to 320 bytes); the non-synced run carried
+> **zero across all 32**. Corroborate with mtime: chunk-15 was stamped 11:39:20
+> while chunks 16 and 17 were 11:39:19, though chunks run sequentially — the
+> file was rewritten *after* the runner read it. The flagged chunk's surviving
+> text even contains `100%`.
+>
+> ```bash
+> for f in <logdir>/chunk-*.log; do n=$(tr -dc '\0' < "$f" | wc -c); \
+>   [ "$n" -gt 0 ] && echo "$(basename $f): $n NUL"; done
+> ```
+>
+> Any NUL bytes ⇒ suspect log corruption, not contention. Re-run with the logs
+> outside the synced tree instead of climbing:
+> `bash core/scripts/run-full-suite.sh --chunks 32 --confirm-solo --out /tmp/<non-synced-dir>`
+>
+> This is the CAUSE behind the mechanism `run-full-suite.py`'s own g-115-3387
+> comment already documents — the detection landed, the cause is still live.
+> Tracked by **g-115-3253**, which is filed LOW on the belief that the effect is
+> cosmetic ("a reader cannot see how many ran"). It is not cosmetic: it corrupts
+> the runner's completeness check, which is the one field this whole rule tells
+> you to believe. Cost on first encounter: 3 false INVALIDs, ~2.5h. Evidence:
+> board `msg-20260731-121551-foxtrot-5368`. Unmeasured: whether other own-cloud
+> boxes reproduce, and whether the default log dir should simply move.
+>
 > **The box NICKNAME is not trustworthy, and these two same-day rows prove it
 > rather than merely suggesting it.** Read them together: alpha reports
 > `test_fleet_config_parity` GREEN on "cc-04" and calls it a *second consecutive*

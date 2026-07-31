@@ -1410,9 +1410,23 @@ def evaluate(failure_reason: str, *,
             # (sibling gates all set it from f"{type(e).__name__}: {e}"), so the
             # validation message moves to extra.evidence_error. `decision_path`
             # still separates these from capability-match blocks in the stats.
+            # caller= (g-115-3094): _gate_log.log() has always had a `caller`
+            # kwarg and 2890 distinct callsite labels populate it across 75152
+            # records, but BOTH capability-gate call sites omitted it -- so the
+            # fleet's most-fired gate wrote caller=None on every record.
+            # Measured cost: answering this goal's own question ("which caller
+            # emitted payload_hash b04ad6159b5d?") required correlating a
+            # DIFFERENT gate's record 1s earlier that shared the payload_hash,
+            # because the capability-gate records named nobody.
+            # Shape is `module.function ctx=<path>`, matching the established
+            # convention (cf. `gates.prose_verification.evaluate goal=g-100-02`).
+            # caller_context alone would NOT do: it is a 2-valued enum
+            # (create-blocker|defer) describing the enforcement PATH, whereas
+            # `caller` holds a CALLSITE label -- so it rides as a ctx= suffix.
             _gate_log(
                 "capability-gate",
                 "block",
+                caller=f"gates.capability:evaluate ctx={caller_context}",
                 payload=failure_reason or "",
                 extra={
                     "would_block": True,
@@ -1852,9 +1866,15 @@ def evaluate(failure_reason: str, *,
         # size tells us whether the conditional form is carrying its weight.
         gate_extra["cure_disproved_by"] = cure_disproved_by
 
+    # caller= (g-115-3094) -- see the sibling call site in the evidence-error
+    # branch above for the full rationale and the label shape. This is the MAIN
+    # path (noop/block/pass/override), so it accounts for the overwhelming
+    # majority of this gate's records; leaving it unset kept the ledger's
+    # `caller` column empty for the fleet's most-fired gate.
     _gate_log(
         "capability-gate",
         decision,
+        caller=f"gates.capability:evaluate ctx={caller_context}",
         trigger_matched=trigger,
         payload=failure_reason or "",
         override_reason=override_agent_match,

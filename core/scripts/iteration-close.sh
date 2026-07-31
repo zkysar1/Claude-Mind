@@ -119,6 +119,44 @@ OVERRIDE_MISSING_ARTIFACT=""
 # sees the exact retry command — not a generic "exit 1".
 _CURRENT_PHASE=""
 
+# g-115-4096: read the LIVE goal record before asserting its state in a
+# recovery message. The state-update/learning-gate recovery texts previously
+# asserted "verify succeeded / goal is closed" UNCONDITIONALLY — false
+# whenever the phase was rejected at entry validation (missing --goal/--source
+# exits 2 AFTER _CURRENT_PHASE is set) with verify never having run. Measured
+# cost (bravo, 2026-07-30, g-115-4084): a pending goal held a live claim ~40min
+# because the operator trusted "No goal-status revert needed". A recovery
+# message is read by an operator deciding what NOT to redo, so it must report
+# what it READ (verify-before-assuming.md "Positive File-State Claims").
+# Prints the live status string, or nothing when unreadable (no GOAL_ID,
+# unparseable id, read failure). Error-path only (rc!=0), so the daemon read
+# is off the hot path. Never returns non-zero (trap safety).
+_probe_goal_status() {
+    local gid="${GOAL_ID:-}" asp src st
+    [[ -z "$gid" ]] && return 0
+    [[ "$gid" =~ ^g-([0-9]+)- ]] || return 0   # g-xw-* etc: aspiration id not derivable
+    asp="asp-${BASH_REMATCH[1]}"
+    # ${SOURCE:-world agent} unquoted on purpose: try the caller's source when
+    # given, else probe both queues (a missing --source is a common way to land here).
+    for src in ${SOURCE:-world agent}; do
+        st="$(bash "$SCRIPT_DIR/aspirations-read.sh" --source "$src" --id "$asp" 2>/dev/null \
+              | PGS_GID="$gid" python3 -c '
+import json, os, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+asp = data if isinstance(data, dict) else (data[0] if data else {})
+for g in asp.get("goals", []):
+    if g.get("id") == os.environ["PGS_GID"]:
+        print(g.get("status") or "")
+        break
+' 2>/dev/null)" || st=""
+        if [[ -n "$st" ]]; then printf '%s' "$st"; return 0; fi
+    done
+    return 0
+}
+
 _print_recovery_instructions() {
     # rc passed as first arg from the trap (captured BEFORE other commands
     # in the trap body run, since trap chains reset $? on each call).
@@ -140,13 +178,49 @@ _print_recovery_instructions() {
             echo "  Revert (mark pending): bash core/scripts/aspirations-update-goal.sh --source ${SOURCE:-world} ${GOAL_ID:-<id>} status pending" >&2
             ;;
         state-update)
-            echo "  Goal ${GOAL_ID:-?} has status=completed (verify succeeded) but state-update failed mid-phase." >&2
-            echo "  Retry: bash core/scripts/iteration-close.sh --phase state-update --goal ${GOAL_ID:-<id>} --source ${SOURCE:-world} --outcome ${OUTCOME:-deep}" >&2
-            echo "  (No goal-status revert needed — verify already closed the goal record.)" >&2
+            # g-115-4096: branch on the READ status — rc!=0 here is commonly the
+            # entry validation at do_state_update rejecting the call (missing
+            # --goal/--source) before anything ran, in which case verify never
+            # fired and the goal may still be pending with a live claim.
+            local _live; _live="$(_probe_goal_status)"
+            case "$_live" in
+                completed)
+                    echo "  Goal ${GOAL_ID:-?} has status=completed (verify succeeded) but state-update failed mid-phase." >&2
+                    echo "  Retry: bash core/scripts/iteration-close.sh --phase state-update --goal ${GOAL_ID:-<id>} --source ${SOURCE:-world} --outcome ${OUTCOME:-deep}" >&2
+                    echo "  (No goal-status revert needed — verify already closed the goal record.)" >&2
+                    ;;
+                "")
+                    echo "  Could not read goal ${GOAL_ID:-?}'s live record — verify state UNKNOWN; asserting neither direction." >&2
+                    echo "  Probe first: bash core/scripts/aspirations-read.sh --source ${SOURCE:-<world|agent>} --id asp-<NNN>  # check this goal's status" >&2
+                    echo "  If status=completed, retry: bash core/scripts/iteration-close.sh --phase state-update --goal ${GOAL_ID:-<id>} --source ${SOURCE:-world} --outcome ${OUTCOME:-deep}" >&2
+                    echo "  If not, run verify first (--phase verify --status ${GOAL_STATUS:-completed}), then state-update." >&2
+                    ;;
+                *)
+                    echo "  Goal ${GOAL_ID:-?} is still status=$_live — verify has NOT marked it completed (a claim may still be live on it)." >&2
+                    echo "  This rc likely came from entry validation (bad/missing flags): nothing ran, so do NOT trust any prior-phase assumption." >&2
+                    echo "  Run verify first: bash core/scripts/iteration-close.sh --phase verify --goal ${GOAL_ID:-<id>} --status ${GOAL_STATUS:-completed} --source ${SOURCE:-world}${OUTCOME:+ --outcome $OUTCOME}" >&2
+                    echo "  Then retry:      bash core/scripts/iteration-close.sh --phase state-update --goal ${GOAL_ID:-<id>} --source ${SOURCE:-world} --outcome ${OUTCOME:-deep}" >&2
+                    ;;
+            esac
             ;;
         learning-gate)
-            echo "  Goal ${GOAL_ID:-?} is closed (verify + state-update done) but learning-gate sub-step failed." >&2
-            echo "  Retry: bash core/scripts/iteration-close.sh --phase learning-gate --goal ${GOAL_ID:-<id>} --source ${SOURCE:-world} --outcome ${OUTCOME:-deep}" >&2
+            # g-115-4096: same read-before-assert discipline as state-update above.
+            local _lg; _lg="$(_probe_goal_status)"
+            case "$_lg" in
+                completed)
+                    echo "  Goal ${GOAL_ID:-?} is closed (verify + state-update done) but learning-gate sub-step failed." >&2
+                    echo "  Retry: bash core/scripts/iteration-close.sh --phase learning-gate --goal ${GOAL_ID:-<id>} --source ${SOURCE:-world} --outcome ${OUTCOME:-deep}" >&2
+                    ;;
+                "")
+                    echo "  Could not read goal ${GOAL_ID:-?}'s live record — closure state UNKNOWN; asserting neither direction." >&2
+                    echo "  Probe first: bash core/scripts/aspirations-read.sh --source ${SOURCE:-<world|agent>} --id asp-<NNN>  # check this goal's status" >&2
+                    echo "  If status=completed, retry: bash core/scripts/iteration-close.sh --phase learning-gate --goal ${GOAL_ID:-<id>} --source ${SOURCE:-world} --outcome ${OUTCOME:-deep}" >&2
+                    ;;
+                *)
+                    echo "  Goal ${GOAL_ID:-?} is still status=$_lg — it is NOT closed (verify/state-update did not complete)." >&2
+                    echo "  Run the close sequence from verify: bash core/scripts/iteration-close.sh --phase verify --goal ${GOAL_ID:-<id>} --status ${GOAL_STATUS:-completed} --source ${SOURCE:-world}, then state-update, then learning-gate." >&2
+                    ;;
+            esac
             ;;
         productivity-check)
             echo "  productivity-check is observational — failure does NOT affect goal closure." >&2
@@ -749,6 +823,17 @@ with open(path, "a", encoding="utf-8") as f:
 # (.bash-inject-misses.jsonl) had the ignore rule and still grew unbounded.
 # Keep the newest KEEP lines once the file exceeds CAP. The distribution this
 # feeds is a recent-behavior question, so old rows carry no analytic value.
+# SINGLE-WRITER CONTRACT (fresh-eyes F-2, msg-20260728-193700 / g-115-4096):
+# this readlines-then-rewrite is UNLOCKED and therefore correct ONLY while
+# this site remains the sole writer of the file. That holds today: the file
+# is per-agent (session dir), this is the only write site in the repo
+# (grep spark-gap-telemetry, 2026-07-30), and do_state_update runs serially
+# inside the single bound runner loop (runner-identity gate). If you add a
+# SECOND writer (recurring-close, a sweep, another phase), route BOTH through
+# a _fileops locked helper first -- a concurrent append during this rewrite
+# window is silently dropped, which censors the very distribution the
+# telemetry exists to measure. NOTE this comment lives INSIDE a bash
+# single-quoted python3 -c block: no apostrophes here, ever.
 CAP, KEEP = 2000, 1000
 try:
     with open(path, "r", encoding="utf-8") as f:
@@ -1303,11 +1388,38 @@ print(sha)
             # stamp injection errors, write the un-stamped gate_json unchanged.
             local gate_json_stamped
             gate_json_stamped=$(echo "$gate_json" | python3 -c "import json,sys,datetime; d=json.load(sys.stdin); d['set_at']=datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S'); sys.stdout.write(json.dumps(d))" 2>/dev/null || echo "$gate_json")
-            echo "$gate_json_stamped" | bash "$SCRIPT_DIR/wm-set.sh" fresh_eyes_dispatch_pending >/dev/null 2>&1 || true
+            # MERGE, do not overwrite (g-115-4244; found by echo, board
+            # msg-20260730-113233-echo-5163 F-003). This write used to be an
+            # unconditional wm-set on a slot that holds ONE payload, so two deep
+            # closes back-to-back — the normal cadence of a productive session —
+            # silently CANCELLED the first close's review obligation: the sentinel
+            # reads as satisfied once the second file set is reviewed, and nothing
+            # reported the loss. Measured: a close set core_count=10 (commit
+            # 4ef80c13d) and was overwritten by core_count=3 before consumption;
+            # those 10 files were never reviewed. Refusing the overwrite instead
+            # would just lose the NEW set — both obligations are real, so both
+            # file sets have to survive. The helper unions BY IDENTITY and
+            # RECOMPUTES the derived counts (rb-3399: never carry a stale count
+            # past a union); note core_count is NOT len(files), since the gate
+            # caps files at 20 while core_count is the true count.
+            # Fail-open at every step: an unreadable slot, a helper error, or a
+            # non-zero exit all fall back to writing gate_json_stamped unchanged,
+            # which is exactly the previous behavior — this can never make the
+            # sentinel worse than it was.
+            local _fe_existing _fe_merged
+            _fe_existing=$(bash "$SCRIPT_DIR/wm-read.sh" fresh_eyes_dispatch_pending --json 2>/dev/null || echo null)
+            _fe_merged=$(printf '%s' "$gate_json_stamped" | FRESH_EYES_EXISTING="$_fe_existing" python3 "$SCRIPT_DIR/fresh-eyes-sentinel-merge.py" 2>/dev/null) || _fe_merged=""
+            [ -n "$_fe_merged" ] || _fe_merged="$gate_json_stamped"
+            echo "$_fe_merged" | bash "$SCRIPT_DIR/wm-set.sh" fresh_eyes_dispatch_pending >/dev/null 2>&1 || true
             # DISPATCH line — LLM reads this in-turn and invokes /fresh-eyes-code.
+            # Read the MERGED payload, not gate_json: after the merge above the
+            # sentinel can hold more files than THIS close produced, and a banner
+            # sourced from gate_json would under-report the real obligation (say
+            # "3 core files" while 13 await review). The banner must describe what
+            # the consumer will actually find in the slot.
             local core_count reason
-            core_count=$(echo "$gate_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('core_count', '?'))" 2>/dev/null || echo "?")
-            reason=$(echo "$gate_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('reason', ''))" 2>/dev/null || echo "")
+            core_count=$(echo "$_fe_merged" | python3 -c "import json,sys; print(json.load(sys.stdin).get('core_count', '?'))" 2>/dev/null || echo "?")
+            reason=$(echo "$_fe_merged" | python3 -c "import json,sys; print(json.load(sys.stdin).get('reason', ''))" 2>/dev/null || echo "")
             echo "[iteration-close] DISPATCH: /fresh-eyes-code required — ${core_count} core files ($reason). See WM.fresh_eyes_dispatch_pending for full file list." >&2
         fi
     fi
@@ -1774,9 +1886,14 @@ print(json.dumps({
             # invisible for the whole life of this branch: the alarm reported a
             # generic non-fatal WARN and nobody could tell a gate refusal from a
             # dead daemon. Fail-open is still fail-open -- it just says why now.
-            local _canary_err
+            local _canary_err _canary_et
+            # g-115-4166: resolve per deployment. Resolved inside this branch,
+            # which only runs when a canary actually fires, so the (hot) clean
+            # iteration-close path never pays for the subprocess.
+            _canary_et="$(bash "$SCRIPT_DIR/escalation-target.sh")" || _canary_et="asp-115 world"
             _canary_err="$(printf '%s' "$_canary_payload" \
-                | bash "$SCRIPT_DIR/aspirations-add-goal.sh" --source world --aspiration asp-115 2>&1 >/dev/null)" \
+                | bash "$SCRIPT_DIR/aspirations-add-goal.sh" \
+                      --source "${_canary_et##* }" --aspiration "${_canary_et%% *}" 2>&1 >/dev/null)" \
                 || echo "[iteration-close] WARN: canary-Investigate goal-file failed for $_canary_target (non-fatal): ${_canary_err}" >&2
         fi
     done
@@ -2271,13 +2388,13 @@ do_productivity_check() {
     # guaranteed-executed where precheck pseudocode is not. Fail-open, sub-second,
     # single file write. See core/scripts/user-signal-refresh.py docstring.
     #
-    # KEEP-IN-SYNC / RESTORE NOTE (g-029-101, 2026-07-31): this block is ZDS-LOCAL
-    # and is NOT present upstream, so a MIRROR-style framework sync deletes it. The
-    # 2026-07-30 sync (1df2b2e8) did exactly that, and the loss was silent: the
-    # reader kept reading a well-formed snapshot that had simply stopped advancing
-    # (frozen 07-30 07:57, ~20h stale before detection). Until this lands upstream,
-    # any framework sync MUST run promotion-preflight.sh and re-verify this block
-    # survives. See .claude/rules/promotion-cycle.md "Pre-Overwrite Drift Gate".
+    # PROVENANCE (g-029-101 -> back-ported UP 2026-07-31, g-115 v2.8.7): this block
+    # was born ZDS-LOCAL; the 2026-07-30 mirror-style sync (1df2b2e8) deleted it
+    # there and the loss was silent -- the reader kept reading a well-formed
+    # snapshot that had simply stopped advancing (frozen ~20h before detection).
+    # It now lives HERE (dev source of the promotion chain), so framework syncs
+    # carry it instead of deleting it. That incident is why reconcile-not-mirror
+    # (.claude/rules/promotion-cycle.md "Pre-Overwrite Drift Gate") is mandatory.
     python3 "$(_winpath "$SCRIPT_DIR/user-signal-refresh.py")" \
         >>"$CORE_ROOT/logs/iteration-close-stderr.log" 2>&1 || true
 

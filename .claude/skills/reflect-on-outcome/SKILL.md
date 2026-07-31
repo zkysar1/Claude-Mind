@@ -420,6 +420,22 @@ Experience JSON:
     created: "{ISO timestamp}"
     category: "{hypothesis category}"
     summary: "Reflection on {hypothesis_id}: {key insight}"
+    goal_id: "{goal.id}"   # CANONICAL join key (experience.md schema) — the id of the
+      # ENCLOSING loop goal whose iteration invoked this reflection, NOT the hypothesis.
+      # experience-read --goal and the recurring-close Phase 4.25 canary match on THIS
+      # field (recurring-close.sh ~L894), so a record without it is invisible to both:
+      # the canary then false-fires force_experience_archival on the deep close and
+      # precheck Phase 0-pre2 tells the next agent to compose a DUPLICATE of a record
+      # that already exists. Measured live 2026-07-31 (echo, g-001-08): the record was
+      # written, `experience-read.sh --goal g-001-08` returned 5 rows and none was it;
+      # adding goal_id by hand made it the 6th. Two prior fixes cannot cover this site
+      # (g-115-4226): g-115-2511 fixed only aspirations-spark, and g-115-1917's derive
+      # rule reads a `g-NNN-NN` prefix off the record id — Step 2.6b ids are shaped
+      # `exp-reflect-{hypothesis_id}`, so derivation structurally never fires here.
+      # The canary also accepts legacy `source_goal`; this template carried NEITHER.
+      # NO enclosing goal (a bare /reflect outside a goal iteration)? OMIT the field.
+      # Do not fabricate one — the canary only runs at goal close, so an absent
+      # goal_id is correct there, while a wrong one would satisfy a gate falsely.
     hypothesis_id: "{hypothesis_id}"
     tree_nodes_related: [nodes updated during reflection]
     verbatim_anchors: [{key: "{kebab-slug}", content: "{exact quote from ABC chain / strategy text}"}]
@@ -1089,8 +1105,22 @@ Gap detection heuristics:
 If YES:
   Bash: meta-read.sh skill-gaps.yaml
   If gap already exists → increment times_encountered, append to encounter_log
-  If gap is new → create new entry with id: gap-{next}, status: registered
-  Write updated skill-gaps.yaml via meta-set.sh
+  If gap is new → create new entry with id: gap-{next}, status: registered,
+                  type: <utility|analytical>   # REQUIRED (g-115-3131)
+      # `type` gates the forge developmental bar — an absent value hands that
+      # decision to a default rather than to you. Per core/config/skill-gaps.yaml
+      # gap_types: utility = mechanizes an ALREADY-DERIVED procedure -> CALIBRATE;
+      # analytical = the OUTPUT needs domain-mature judgment -> EXPLOIT (the
+      # higher bar). Unsure -> `utility`; it IS the default, so stating it
+      # explicitly costs nothing and keeps the gate's input meaningful.
+  # meta-set.sh is a DOTPATH setter — `meta-set.sh <file> <dotpath> <value>`.
+  # It does NOT take a whole-file YAML rewrite (that exits 1 with a bare usage
+  # line). Resolve the gap's list index, then set fields individually:
+  #   meta-set.sh skill-gaps.yaml "gaps[<i>].times_encountered" <n+1> --reason "<goal-id>"
+  #   meta-set.sh skill-gaps.yaml "gaps[<i>].encounter_log" '<full JSON array>'
+  # `[N]` and `.N` are equivalent (meta-yaml.py:110) and a JSON array stores as a
+  # real YAML list (parse_value, g-115-1263). Contract + caveat: guard-661.
+  Bash: meta-set.sh skill-gaps.yaml "gaps[<i>].<field>" <value>
 
   # --- Forge criteria check: turn ready gaps into goals ---
   # GUARD: skip already-forged gaps (Phase 9.2 also checks this)

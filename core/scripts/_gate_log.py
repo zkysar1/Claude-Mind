@@ -36,6 +36,7 @@ import datetime as _dt
 import hashlib as _hashlib
 import json as _json
 import os as _os
+import re as _re
 from pathlib import Path as _Path
 
 # Single source of truth for META_DIR — same resolver every other script uses.
@@ -59,6 +60,81 @@ _VALID_DECISIONS = ("noop", "pass", "block", "override", "fail_open")
 # Local/other backends keep the direct locked append: it is a cheap raw local
 # append there, and tests (GATE_LOG_ALLOW_PYTEST) assert on the store file.
 _SPOOL_NAME = "gate-firings.spool.jsonl"
+
+# Store-composition seam (). The spool above fixed the WRITE-FREQUENCY
+# axis of own-cloud write amplification; the OBJECT-SIZE axis is untouched.
+# Measured 2026-07-31 (cc-04): the shared store is 44.75MB/127k records and is
+# re-PUT whole on every iteration-close flush -- ~42MB written to add ~1KB, an
+# amplification near 42,000:1, producing 26,610 S3 versions / 968 GB, which is
+# 65% of the entire bucket and 2.2x aspirations.jsonl + reasoning-bank.jsonl
+# COMBINED. Retention cannot absorb it: `retention_days: 40` in
+# store-hygiene.yaml is already the floor (all 4 readers window by time and
+# gate-retirement-eval defaults to --days 30), and a sweep would drop only 5.8%.
+#
+# The fix is to segment the store by date so a flush touches only the live
+# segment. The blocker was that three consumers each hardcoded the filename
+# (gate-stats.py, gate-retirement-eval.py, override-ledger-consume.py), so a
+# segmented writer would silently starve them -- they would read a few hours of
+# data and report it as a 30-day window, i.e. a gate looks unfired and therefore
+# RETIRABLE. A false all-clear is the worst available failure direction, which is
+# why this seam lands BEFORE any writer change.
+#
+# This returns PATHS rather than records deliberately: the three consumers have
+# genuinely different parse/filter needs (since-windowing, override counting,
+# recency cutoffs), so a shared record-reader would mean rewriting three working
+# parse loops. A path list leaves them untouched and makes segmentation a change
+# to this function alone.
+# Segments are matched by a STRICT date-shaped pattern, not a loose
+# `gate-firings-*.jsonl` glob. The loose form admitted `gate-firings-spool.jsonl`
+# while the accompanying name-prefix check keyed on the DOTTED production spool
+# (`gate-firings.spool.jsonl`) -- a form the glob could never produce, so that
+# check was structurally dead and the exclusion it claimed to provide did not
+# exist. Caught by test_spool_excluded_even_when_hyphenated. Matching the exact
+# segment shape means anything that is not a real segment is excluded by
+# construction rather than by an enumerated denylist that must be kept in sync
+# with every future sibling file.
+_SEGMENT_RE = _re.compile(r"^gate-firings-\d{4}-\d{2}-\d{2}\.jsonl$")
+
+
+def segment_name(day=None):
+    """Basename of the date segment covering `day` (default: today).
+
+    Deliberately defined HERE, immediately beside `_SEGMENT_RE`, rather than in
+    the writer: the writer's filename and the reader's matcher are the two
+    halves of one contract, and the failure mode when they drift is silent --
+    the writer keeps producing files the reader does not recognise, so
+    consumers read a short window and report it as the full retention window.
+    One definition, imported by both, makes that drift impossible rather than
+    merely unlikely.
+
+    Dates are UTC wall clock (TZ=UTC fleet-wide), matching the `ts` field the
+    consumers window on.
+    """
+    day = day or _dt.datetime.now().date()
+    return f"gate-firings-{day.isoformat()}.jsonl"
+
+
+def firings_paths(meta_dir=None):
+    """Ordered paths comprising the gate-firings store, oldest-first.
+
+    Today this is the single legacy file, so callers are byte-identical to
+    reading it directly. Once the writer emits `gate-firings-YYYY-MM-DD.jsonl`
+    segments, they are appended in lexical (== chronological, ISO dates) order
+    and consumers pick them up with no change.
+
+    Excludes the machine-local spool files, which share the `gate-firings-`
+    stem but are NOT part of the shared store (they are drained into it by
+    gate-firings-flush.py and are in owncloud_sync._EXCLUDE_NAMES).
+    """
+    base = _Path(meta_dir) if meta_dir is not None else _Path(META_DIR)
+    paths = []
+    legacy = base / "gate-firings.jsonl"
+    if legacy.is_file():
+        paths.append(legacy)
+    for seg in sorted(base.glob("gate-firings-*.jsonl")):
+        if _SEGMENT_RE.match(seg.name) and seg.is_file():
+            paths.append(seg)
+    return paths
 
 
 def _spool_active():

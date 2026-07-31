@@ -40,8 +40,8 @@ managed-database tables**, ~$0.05–0.15/month incremental.
 
 Daily rotation caps S3 noncurrent-version growth under own-cloud: only the
 current day's file is mutated (appended per iteration); prior days' files are
-immutable and their noncurrent versions age out under the bucket's 90-day
-lifecycle. The ledger syncs to S3 via the existing `owncloud_sync.py` mirror
+immutable and their noncurrent versions age out under the bucket's 14-day
+lifecycle (tightened from 90d on 2026-07-31, S3 cost-anomaly work). The ledger syncs to S3 via the existing `owncloud_sync.py` mirror
 sweep (it is NOT machine-local-excluded) so health history survives a
 machine move. It is never `.history`-snapshotted: the per-iteration append is
 a direct local `open(...,'a')`, not a write through `_fileops`, so the

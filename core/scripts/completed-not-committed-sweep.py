@@ -90,6 +90,17 @@ if str(SCRIPT_DIR) not in sys.path:
 from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, )
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
 
+# : never hardcode the escalation aspiration —  is the UPSTREAM
+# deployment's queue and does not exist elsewhere, so a literal files nothing.
+try:
+    from _paths import AGENT_DIR, WORLD_DIR  # noqa: E402
+    from _escalation_target import resolve as _resolve_asp, source_flag as _asp_source
+    ESCALATION_ASP, _ESCALATION_ASP_VIA = _resolve_asp(CORE_ROOT, WORLD_DIR, AGENT_DIR)
+    ESCALATION_SOURCE = _asp_source(ESCALATION_ASP, WORLD_DIR, AGENT_DIR)
+except Exception:
+    ESCALATION_ASP, _ESCALATION_ASP_VIA, ESCALATION_SOURCE = (
+        "asp-115", "fallback:import-failed", "world")
+
 # Commit SHA extraction is KEYWORD-ANCHORED for precision AND to bound the
 # probe count. A hex token counts ONLY when it sits next to a commit keyword
 # ("committed <sha>", "pushed <sha>", "merge <sha>", "origin/main now at <sha>")
@@ -1030,7 +1041,7 @@ def _file_investigate(entry):
     try:
         # aspirations_add_goal(asp_id, record, source=...) — record is the dict
         # itself; the daemon returns the parsed created-goal record (a dict).
-        out = _rt.aspirations_add_goal("asp-115", body, source="world")
+        out = _rt.aspirations_add_goal(ESCALATION_ASP, body, source=ESCALATION_SOURCE)
         if isinstance(out, dict):
             return out.get("id") or (out.get("goal") or {}).get("id")
         return None
