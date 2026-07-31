@@ -128,6 +128,32 @@ runs whenever no live daemon is present. Enforced by `guard-672`.
 > | errors | 0 | 2 | 0 | **0** |
 > | run completes? | yes | **no** — needed `--ignore`, a chunk died at 51% | yes, all 6 chunks 100% | **yes, all 4 chunks, VERDICT: CLEAN** |
 >
+> **cc-06 FIRST BASELINE (2026-07-30, omni, g-029-87). 86 failed / 0 errors, and the
+> runner classified them GENUINE rather than contended — so this is NOT the
+> progressive-exhaustion profile. Do NOT diff cc-06 against the cc-04 column: they
+> are different boxes, which is precisely why the row above demands the box+OS
+> field.** Two facts to carry:
+>
+> 1. **pytest here is 7.4.4 from the distro package (`apt install python3-pytest`),
+>    not pip.** This box has no pytest in the base image and pip refuses under PEP 668
+>    (externally-managed); `--break-system-packages` was deliberately NOT used, since a
+>    live daemon serves the fleet off this same interpreter. 7.4.4 warns
+>    `Unknown config option: faulthandler_exit_on_timeout`, so **the hang-bounding
+>    described below does NOT apply on cc-06** — a genuinely hung test will buffer
+>    rather than abort with a traceback. That warning is config-only and is *not* a
+>    failure cause; do not attribute failures to it without evidence.
+> 2. **30 of the 86 are in files this rule ALREADY names as pre-existing**
+>    (`test_iteration_push` 7, `test_provision_from_vault_agent_scope` 13,
+>    `test_provision_github_from_vault` 7, `test_provision_from_vault_default_out` 2,
+>    `test_monitor_tick` 1). The remaining 56 across 31 files are new-to-this-box and
+>    untriaged. At least some are **domain-coupled, not broken**:
+>    `test_capability_gate_imperative_noun` (5) asserts on fixtures naming an
+>    upstream-domain service that has 0 occurrences in this deployment's world
+>    convention, so it cannot pass against this world at all. Triage by asking "does
+>    this fixture assume the upstream domain?" before calling it a regression.
+>    Chasing that question is what surfaced g-029-93, a real live defect the test
+>    itself was not reporting.
+>
 > **2026-07-27 (g-115-3471, alpha on cc-04/Linux): all 12 files the 07-26 entry
 > named as failing PASS here** — re-run explicitly, 91 passed / 1 skipped / 0
 > failed. That covers both the 6 called GENUINE and the 6 called newly-visible.
