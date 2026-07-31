@@ -510,6 +510,26 @@ def retire_agent(world_dir, core_path, agent, author, now, *,
                 "detail": f"{name} has no core residual, no shard, and no "
                           f"partner-beliefs — nothing to retire"}
 
+    # Already-tombstoned no-op (). Before the tombstone became the
+    # mechanism, a completed retire left NOTHING behind, so a re-run hit
+    # "not_present" above and was free. Now the shard SURVIVES by design, so
+    # without this guard every re-run would archive again and re-stamp
+    # retired_at — turning an idempotent no-op into an accumulating writer.
+    # Deliberately narrow: it fires only when the tombstone is the ONLY thing
+    # left. A core residual or a live partner-belief about the retiree is real
+    # un-swept residue and must still be cleaned, so those fall through.
+    # _is_retired (not a bare `retired` check) keeps revival honest: an agent
+    # whose heartbeat is NEWER than its tombstone is genuinely back, and
+    # re-retiring it is the correct action rather than a no-op.
+    if (plan["core_residual"] is None and not has_beliefs
+            and _is_retired(plan["row_content"])):
+        return {"ok": True, "agent": name, "removed": False,
+                "reason": "already_retired",
+                "tombstoned": True,
+                "detail": f"{name} is already tombstoned "
+                          f"(retired_at={(plan['row_content'] or {}).get('retired_at')}) "
+                          f"and has no core residual or partner-beliefs left to sweep"}
+
     if dry_run:
         return {"ok": True, "agent": name, "removed": False, "dry_run": True,
                 "would_remove": {
@@ -614,18 +634,59 @@ def retire_agent(world_dir, core_path, agent, author, now, *,
 
         locked_modify_yaml(sp, _modify_shard, initial={})
 
-    # Retiree's own shard unlink (unchanged path).
+    # Retiree's own shard: TOMBSTONE is the mechanism; unlink is best-effort.
+    #
+    # . This used to be an unlink and nothing else, which does not
+    # remove on a read-through backend: the local file is deleted, the backing
+    # object survives (fleet boxes do not hold s3:DeleteObject), and the next
+    # read re-materializes the shard UN-tombstoned. Measured end-to-end on
+    # own-cloud 2026-07-31: retire returned ok:true removed:true, and minutes
+    # later the row was back and live. A direct local write of the tombstone was
+    # ALSO clobbered by the same read-through — only locked_modify_yaml (the
+    # governed write path) made it stick.
+    #
+    # _is_retired (above) has read `retired`/`retired_at` since , and
+    # its docstring states the design verbatim: a retired row is "dropped from
+    # the composed roster INSTEAD of deleted ... a tombstone preserves the audit
+    # trail". Nothing ever wrote those fields — a consumer with no producer, so
+    # both tombstones in this world were hand-improvised by agents mid-incident.
+    # This is that missing producer.
+    #
+    # Ordering is load-bearing: tombstone FIRST (through the governed path, so it
+    # reaches the backing store), then unlink. On a backend where delete works the
+    # shard is gone; where it does not, what survives is the TOMBSTONED row, which
+    # compose_agent_status drops. Both paths converge on "absent from the roster",
+    # which the unlink alone could not guarantee.
+    tombstoned = False
+    # Guard on row_CONTENT, not row_path: enumerate_retire returns a row_path for
+    # every valid agent name whether or not a shard exists, so gating on the path
+    # would MATERIALIZE a tombstone shard for a core-only retiree that never had
+    # one. Same condition the unlink used before this change.
     if plan["row_content"] is not None and plan["row_path"]:
+        sp = Path(plan["row_path"])
+
+        def _tombstone(state):
+            state["retired"] = True
+            state["retired_at"] = now
+            state["retired_by"] = author
+            return state
+
+        locked_modify_yaml(sp, _tombstone, initial={})
+        tombstoned = True
+
+        # Best-effort ONLY — never the mechanism, never fatal. A backend that
+        # denies delete is the expected case, not an error.
         try:
-            Path(plan["row_path"]).unlink()
+            sp.unlink()
             removed_shard = True
-        except FileNotFoundError:
+        except (FileNotFoundError, OSError):  # noqa: PERF203 — best-effort by design
             removed_shard = False
 
-    any_removed = (removed_core or removed_shard
+    any_removed = (removed_core or removed_shard or tombstoned
                    or bool(beliefs_swept["core"] or beliefs_swept["shards"]))
     return {"ok": True, "agent": name, "removed": any_removed,
             "removed_core_residual": removed_core,
             "removed_shard": removed_shard,
+            "tombstoned": tombstoned,
             "beliefs_swept": beliefs_swept,
             "archive": str(archive_path), "source": source}

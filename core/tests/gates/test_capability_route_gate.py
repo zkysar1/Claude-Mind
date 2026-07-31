@@ -216,5 +216,20 @@ def test_active_agents_tripwire():
     three agents existed. Refreshed 2026-05-20 after charlie/delta/echo were
     added; new entries need title-prefix routes if they take goal classes
     that today route to 'either'.
+
+    Refreshed 2026-07-31 (g-115-3748) after charlie+delta merged into foxtrot
+    on 2026-07-07. It had been red 24 days, unseen: run-full-suite.sh collected
+    only 1 of the 3 testpaths pytest.ini declares, so nothing ran this file.
+
+    Worth recording what the red actually caught, because it is the argument
+    for keeping a hand-maintained baseline. Two causes were stacked in it:
+    the expected roster drift above, AND a phantom agent 'test-race-5' that
+    test_team_state_race.py had leaked into the LIVE world/team-state
+    (a fixture row that outlived its own cleanup, carrying a stale in_flight
+    claim on a fake goal for ~5.8h while capability_route warned on every
+    import that it could never be routed to). The tripwire was the only thing
+    that noticed. Purge live pollution BEFORE re-baselining -- baking a test
+    artifact into this tuple would have silenced the detector with the very
+    defect it detected.
     """
-    assert ACTIVE_AGENTS == ("alpha", "bravo", "charlie", "delta", "echo", "zeta")
+    assert ACTIVE_AGENTS == ("alpha", "bravo", "echo", "foxtrot", "zeta")

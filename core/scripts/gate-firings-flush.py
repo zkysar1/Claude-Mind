@@ -248,7 +248,7 @@ def main() -> int:
                 pass
             if total:
                 print(f"[gate-firings-flush] flushed {total} record(s) to "
-                      f"{STORE_NAME} in {time.time() - t0:.2f}s (one batched RMW)")
+                      f"{store.name} in {time.time() - t0:.2f}s (one batched RMW)")
     except Exception as e:  # noqa: BLE001 — fail-open maintenance sweep
         print(f"[gate-firings-flush] WARN: flush failed ({type(e).__name__}: "
               f"{e}) — spool retained, next tick retries", file=sys.stderr)

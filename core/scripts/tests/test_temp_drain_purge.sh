@@ -112,6 +112,35 @@ lcheck "gc_drained real purges 1"                 1          "$(gc_drained_archi
 lcheck "gc_drained kept recent.md only"           recent.md  "$(ls "$T2/temp/drained")"
 lcheck "gc_drained preserved drained/ dir"        yes        "$([ -d "$T2/temp/drained" ] && echo yes || echo no)"
 lcheck "gc_drained missing dir -> 0"              0          "$(gc_drained_archive "$T2/temp/nope" 30 0)"
+# (T2 is NOT a git work-tree, so the whole block above is ALSO the not-a-repo
+# pin for the  tracked-file filter: nothing is tracked there, and the
+# age GC must proceed exactly as before — conflating not-a-repo with
+# ls-files-errored would have failed every count above.)
+
+# Lane 2 tracked-file survival (, back-ported from ZDS): a git-TRACKED
+# file under drained/ is durable BY the invariant the deployment's .gitignore
+# reasons from — the age GC must never delete it (206 tracked prod deliverables
+# were scheduled for a same-day mass deletion because provisioning gave them one
+# shared mtime). Untracked siblings still age out, and the count excludes kept
+# tracked files.
+TG="$(mktemp -d)"
+# Windows/MSYS: mktemp yields /tmp/... while `git rev-parse --show-toplevel`
+# returns the C:/... form, so the function's repo-relative prefix strip cannot
+# match — a SANDBOX artifact, not a production shape (callers pass paths in the
+# same form git returns, and on Windows boxes temp/ is fully gitignored anyway,
+# so the tracked-filter is load-bearing only on Linux/local-backend). Normalize
+# the sandbox to git's form so this pins the real semantics on every platform.
+command -v cygpath >/dev/null 2>&1 && TG="$(cygpath -m "$TG")"
+mkdir -p "$TG/temp/drained"
+git -C "$TG" init -q 2>/dev/null
+: > "$TG/temp/drained/tracked-old.md";   touch -d '40 days ago' "$TG/temp/drained/tracked-old.md"
+: > "$TG/temp/drained/untracked-old.md"; touch -d '40 days ago' "$TG/temp/drained/untracked-old.md"
+git -C "$TG" add temp/drained/tracked-old.md 2>/dev/null
+lcheck "gc_drained tracked: dry-run counts untracked only" 1   "$(gc_drained_archive "$TG/temp/drained" 30 1)"
+lcheck "gc_drained tracked: real purges untracked only"    1   "$(gc_drained_archive "$TG/temp/drained" 30 0)"
+lcheck "gc_drained tracked: tracked-old.md SURVIVED"       yes "$([ -f "$TG/temp/drained/tracked-old.md" ] && echo yes || echo no)"
+lcheck "gc_drained tracked: untracked-old.md purged"       no  "$([ -f "$TG/temp/drained/untracked-old.md" ] && echo yes || echo no)"
+rm -rf "$TG"
 
 # Lane 3 — stray-dir cleanup (>120min, NOT drained/)
 lcheck "cleanup_stray dry-run counts 1"           1          "$(cleanup_stray_dirs "$T2/temp" 120 1)"

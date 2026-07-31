@@ -94,9 +94,23 @@ def test_non_string_value_qualifies_if_truthy():
 def test_structured_prefixes_published():
     """The canonical-case tuple is the public contract. If the framework
     changes its prefix names, the version test below catches the change
-    so docs (goal-schemas.md, probe-before-defer.md) can be updated."""
+    so docs (goal-schemas.md, probe-before-defer.md) can be updated.
+
+    Refreshed 2026-07-31 (g-115-3748) for "human_blocked:", added 2026-06-25
+    by g-115-1646. This test went red that day and stayed red 36 days without
+    anyone seeing it, because run-full-suite.sh collected only 1 of the 3
+    testpaths pytest.ini declares.
+
+    The cost was exactly what the docstring above predicts: the docs duty
+    never fired. "human_blocked:" reached precheck-gates.md and the
+    aspirations-precheck SKILL.md, but neither of the two files named above
+    -- the canonical schema doc and the rule that governs defer routing.
+    A tripwire whose only job is to prompt a docs update is worth nothing
+    if nothing runs it; both docs are updated as part of this fix.
+    """
     assert STRUCTURED_DEFER_PREFIXES == (
         "precondition_unmet:",
         "blocked_on_dependency",
         "Circuit breaker:",
+        "human_blocked:",
     )

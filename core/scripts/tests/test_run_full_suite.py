@@ -201,3 +201,111 @@ def test_the_documented_incident_shape_classifies_contended():
     verdict, reasons = RFS.classify(text, 33)
     assert verdict == "contended"
     assert len(reasons) >= 2, "both the marker and the positional profile should fire"
+
+
+# ── collection roots () ───────────────────────────────────────────
+#
+# THE DEFECT THESE PIN: pytest.ini declared THREE testpaths and this runner
+# collected ONE. 109 files / 1,448 tests never ran -- the gate suite and the
+# daemon-endpoint suite -- and nothing detected it, because the runner reports
+# what it RAN and never what it declined to look for (guard-1760). The runner
+# shipped five weeks AFTER the config already declared three paths, so the
+# newer artifact was the divergent one.
+#
+# The durable fix is that collection roots are DERIVED from pytest.ini rather
+# than hardcoded, so a new test tree joins the suite by being declared in the
+# config. test_derives_roots_from_pytest_ini is the regression guard: it fails
+# if anyone re-hardcodes a single dir.
+
+
+def _ini(tmp_path, testpaths, make_dirs=True):
+    """Write a pytest.ini declaring `testpaths` and create the dirs."""
+    (tmp_path / "pytest.ini").write_text(
+        "[pytest]\ntestpaths = %s\n" % " ".join(testpaths), encoding="utf-8")
+    if make_dirs:
+        for frag in testpaths:
+            (tmp_path / frag).mkdir(parents=True, exist_ok=True)
+    return tmp_path
+
+
+def test_derives_roots_from_pytest_ini(tmp_path, monkeypatch):
+    """ALL declared testpaths are collected, not just the first."""
+    root = _ini(tmp_path, ["core/scripts/tests", "core/tests/gates"])
+    monkeypatch.setattr(RFS, "PROJECT_ROOT", root)
+    got = [p.relative_to(root).as_posix() for p in RFS._testpaths()]
+    assert got == ["core/scripts/tests", "core/tests/gates"]
+
+
+def test_deferred_testpaths_are_excluded_from_collection(tmp_path, monkeypatch):
+    """A declared path in DEFERRED_TESTPATHS is NOT collected into the pool.
+
+    It is deferred because it fails en masse at end-of-invocation while
+    passing alone; running it in the pool hands every closure ~250 phantom
+    failures under a verdict labelled trustworthy.
+    """
+    deferred = sorted(RFS.DEFERRED_TESTPATHS)[0]
+    root = _ini(tmp_path, ["core/scripts/tests", deferred])
+    monkeypatch.setattr(RFS, "PROJECT_ROOT", root)
+    got = [p.relative_to(root).as_posix() for p in RFS._testpaths()]
+    assert got == ["core/scripts/tests"]
+    assert deferred not in got
+
+
+def test_declared_but_absent_dirs_are_skipped(tmp_path, monkeypatch):
+    """A testpath naming a dir that does not exist is skipped, not passed to pytest."""
+    root = _ini(tmp_path, ["core/scripts/tests"])
+    (root / "pytest.ini").write_text(
+        "[pytest]\ntestpaths = core/scripts/tests does/not/exist\n", encoding="utf-8")
+    monkeypatch.setattr(RFS, "PROJECT_ROOT", root)
+    got = [p.relative_to(root).as_posix() for p in RFS._testpaths()]
+    assert got == ["core/scripts/tests"]
+
+
+def test_falls_back_to_tests_dir_when_ini_is_unusable(tmp_path, monkeypatch):
+    """A missing/corrupt pytest.ini degrades to the historical single dir.
+
+    Fail-SAFE direction: the runner keeps collecting what it always did rather
+    than collecting nothing. A fallback to [] would turn a config typo into a
+    silent zero-test run reported as a pass -- the rb-5650 shape.
+    """
+    root = tmp_path
+    (root / "pytest.ini").write_text("<<< not ini >>>", encoding="utf-8")
+    tests_dir = root / "core" / "scripts" / "tests"
+    tests_dir.mkdir(parents=True)
+    monkeypatch.setattr(RFS, "PROJECT_ROOT", root)
+    monkeypatch.setattr(RFS, "TESTS_DIR", tests_dir)
+    assert RFS._testpaths() == [tests_dir]
+
+
+def test_live_config_declares_more_than_one_testpath():
+    """Guards the ORIGINAL defect against the live tree, not a fixture.
+
+    The fixture tests above would all still pass if this repo's pytest.ini
+    silently lost a testpath. This one reads the real config: if it declares
+    more than one collectible root, the runner must return more than one.
+    """
+    # THREE parents: tests -> scripts -> core -> PROJECT_ROOT. Two lands on
+    # core/ and the guard SKIPS with "no pytest.ini in this tree" -- which
+    # reads as a pass in a -q summary. Caught on first run only by asking
+    # WHICH test skipped; a check that declines to run reports success by
+    # default (guard-1977).
+    root = SCRIPT_DIR.parent.parent.parent
+    ini = root / "pytest.ini"
+    if not ini.exists():
+        pytest.skip("no pytest.ini in this tree")
+    # configparser, NOT a hand-rolled line parse: this repo's pytest.ini writes
+    # testpaths in the MULTI-LINE continuation form, so reading "the rest of the
+    # testpaths line" yields "" and the guard skips itself into a false pass.
+    # (Measured on the first two runs of this very test.)
+    import configparser
+    cp = configparser.ConfigParser()
+    cp.read(ini, encoding="utf-8")
+    declared = [f for f in cp.get("pytest", "testpaths", fallback="").split()
+                if (root / f).is_dir()]
+    if len(declared) < 2:
+        pytest.skip("tree declares fewer than 2 existing testpaths")
+    collected = {p.name for p in RFS._testpaths()}
+    expected = {Path(f).name for f in declared if f not in RFS.DEFERRED_TESTPATHS}
+    assert collected == expected, (
+        "runner collected %s but config declares %s (minus deferred)"
+        % (sorted(collected), sorted(expected)))

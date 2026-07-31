@@ -41,6 +41,27 @@ and no gate. This rule plus its enforcement in
    d. The defer_reason must then name the specific external signal that
       genuinely cannot be provisioned — not the action the agent routed
       around.
+   e. When that signal is a HUMAN gate specifically — an approval click,
+      outside counsel, a credential only a person can grant — write it with
+      the `human_blocked:` structured prefix (added 2026-06-25, g-115-1646).
+      It is a member of `STRUCTURED_DEFER_PREFIXES`, so it bypasses the
+      capability-gate and the blocker_ref gate, and it is the ONE member
+      that never auto-clears: `goal-selector` exempts it from the 120h
+      fall-through, keeping the goal suppressed-from-selector but
+      counted-in-blocked so quiescence can fire during a human-gated
+      plateau. Visibility comes from the precheck `human_blocked`
+      age-escalation, not from re-selection.
+
+      Using the prefix does NOT establish that the gate is real. It says
+      "I have concluded this is human-only" in machine-readable form; rule 1
+      still has to be satisfied first, and `reclaim-routed-work.md` rule 2
+      applies with full force — a structured prefix attests that the routing
+      was FORMATTED correctly and is not evidence it is still correct.
+      Because this prefix never expires on its own, it is the defer most
+      exposed to the RULE axis: a standing grant can retire the reason while
+      the condition stays perfectly true, and nothing will re-surface the
+      goal on its own. Schema detail: `core/config/conventions/goal-schemas.md`
+      § Structured-prefix bypass.
 
 2. **Narrative defers are suspect.** A defer_reason that reads like an
    excuse ("blocked on user-initiated X", "waiting for user to run Y",
