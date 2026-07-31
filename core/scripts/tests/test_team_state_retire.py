@@ -404,6 +404,195 @@ def test_cli_retire_missing_agent_arg_errors():
         assert r.returncode != 0  # argparse: --agent required
 
 
+# --- : tombstone is the mechanism, unlink is best-effort -----------
+#
+# The defect these pin: retire_agent removed the shard by UNLINK alone. On a
+# read-through backend the local file goes away, the backing object survives
+# (fleet boxes hold no delete right), and the next read re-materializes the row
+# UN-tombstoned — so the sanctioned removal path did not remove. Meanwhile
+# _is_retired had read `retired`/`retired_at` since  and NOTHING wrote
+# them: a consumer with no producer.
+#
+# Mutation-proofed against the pre-fix code (an assertion is not a guard until
+# something is shown to break it — guard-1220 / guard-1793). Reverting the fix
+# to a bare unlink turns test_retired_agent_excluded_when_delete_is_denied RED
+# (the row stays live and un-tombstoned) and
+# test_retire_writes_tombstone_into_shard RED (no producer). The two local-fs
+# tests above (…_unlinks_and_leaves_core, …_both_stores) stay GREEN either way,
+# which is exactly why they never caught this: on a local filesystem the unlink
+# succeeds, so the backend-dependent half is invisible to them.
+
+
+def _compose_roster_in_subprocess(world: Path) -> list:
+    """Compose the roster in a FRESH interpreter.
+
+    The goal's fix shape asks for this explicitly ("in a process that does not
+    share the caller's module cache"). An in-process assertion can pass off a
+    module-level cache populated before the retire ran, which would mask exactly
+    the resurrection this fix prevents. A subprocess cannot.
+
+    Values go through the environment and the source is single-quoted — never
+    interpolated into the program text (guard-165).
+    """
+    src = (
+        "import os, sys, yaml\n"
+        "sys.path.insert(0, os.environ['CORE_SCRIPTS'])\n"
+        "from pathlib import Path\n"
+        "from _team_state import compose_state\n"
+        "w = Path(os.environ['WORLD'])\n"
+        "core = w / 'team-state.yaml'\n"
+        "doc = yaml.safe_load(core.read_text(encoding='utf-8')) or {} "
+        "if core.exists() else {}\n"
+        "print('\\n'.join(sorted((compose_state(doc, w).get('agent_status') "
+        "or {}).keys())))\n"
+    )
+    env = os.environ.copy()
+    env["WORLD"] = str(world)
+    env["CORE_SCRIPTS"] = str(CORE_SCRIPTS)
+    env["STORAGE_BACKEND"] = "local"  # guard-955: never let a tmp write reach a real store
+    r = subprocess.run([sys.executable, "-c", src], capture_output=True,
+                       text=True, env=env, timeout=60)
+    assert r.returncode == 0, f"subprocess compose failed: {r.stderr}"
+    return [ln for ln in r.stdout.splitlines() if ln.strip()]
+
+
+def test_retire_writes_tombstone_into_shard():
+    """The missing producer for _is_retired. Asserted on the file BEFORE the
+    best-effort unlink can remove it, so it holds on every backend."""
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = Path(tmpd)
+        core = _seed_core(world, {"alpha": {"last_active": "2026-07-11T00:00:00"}})
+        _seed_shard(world, "delta", {"last_active": "2026-07-08T00:00:00"})
+
+        captured = {}
+        real_unlink = Path.unlink
+
+        def _capture_then_unlink(self, *a, **kw):
+            if self.name == "delta.yaml":
+                captured["doc"] = yaml.safe_load(self.read_text(encoding="utf-8"))
+            return real_unlink(self, *a, **kw)
+
+        Path.unlink = _capture_then_unlink
+        try:
+            result = retire_agent(world, core, "delta", "alpha", NOW)
+        finally:
+            Path.unlink = real_unlink
+
+        assert result["tombstoned"] is True
+        assert captured.get("doc"), "shard was never written before unlink"
+        assert captured["doc"]["retired"] is True
+        assert captured["doc"]["retired_at"] == NOW
+        assert captured["doc"]["retired_by"] == "alpha"
+
+
+def test_retired_agent_excluded_when_delete_is_denied():
+    """THE regression. Simulates the read-through/no-delete-right backend by
+    making unlink fail, then composes the roster in a fresh interpreter.
+
+    Pre-fix this is RED: the shard survives with no tombstone, so the retired
+    agent is still in the roster — 'ok:true removed:true' while nothing was
+    removed, which is what was measured live on own-cloud."""
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = Path(tmpd)
+        core = _seed_core(world, {"alpha": {"last_active": "2026-07-11T00:00:00"}})
+        _seed_shard(world, "phantom", {"last_active": "2026-07-08T00:00:00"})
+        _seed_shard(world, "bravo", {"last_active": "2026-07-11T00:00:00"})
+
+        real_unlink = Path.unlink
+
+        def _denied(self, *a, **kw):
+            if self.name == "phantom.yaml":
+                raise OSError(13, "AccessDenied: s3:DeleteObject")
+            return real_unlink(self, *a, **kw)
+
+        Path.unlink = _denied
+        try:
+            result = retire_agent(world, core, "phantom", "alpha", NOW)
+        finally:
+            Path.unlink = real_unlink
+
+        # The delete genuinely failed — that is the point, not an incidental.
+        assert result["removed_shard"] is False
+        assert result["tombstoned"] is True
+        assert row_path(world, "phantom").exists(), "fixture invalid: shard was deleted"
+
+        roster = _compose_roster_in_subprocess(world)
+        assert "phantom" not in roster, (
+            f"retired agent survived in the composed roster: {roster}")
+        assert "bravo" in roster, f"live agent wrongly dropped: {roster}"
+
+
+def test_retire_core_only_does_not_materialize_a_shard():
+    """row_path() is non-None for ANY valid name, so gating the tombstone on the
+    PATH would invent a shard for a core-only retiree. Gate on row_content."""
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = Path(tmpd)
+        core = _seed_core(world, {"charlie": {"last_active": "2026-07-03T09:51:06"},
+                                  "alpha": {"last_active": "2026-07-11T00:00:00"}})
+        result = retire_agent(world, core, "charlie", "alpha", NOW)
+        assert result["removed_core_residual"] is True
+        assert result["tombstoned"] is False
+        assert not row_path(world, "charlie").exists(), \
+            "retire invented a shard for a core-only agent"
+        assert "charlie" not in _compose_roster_in_subprocess(world)
+
+
+def test_already_tombstoned_rerun_is_noop_and_does_not_rearchive():
+    """The tombstone SURVIVES by design, so a re-run must not archive again or
+    re-stamp retired_at — otherwise a repeated retire becomes an accumulating
+    writer. Guard is narrow: only when the tombstone is all that is left."""
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = Path(tmpd)
+        core = _seed_core(world, {"alpha": {"last_active": "2026-07-11T00:00:00"}})
+        _seed_shard(world, "ghostly", {"last_active": "2026-07-08T00:00:00"})
+
+        real_unlink = Path.unlink
+        Path.unlink = lambda self, *a, **kw: (_ for _ in ()).throw(
+            OSError(13, "denied")) if self.name == "ghostly.yaml" else real_unlink(self)
+        try:
+            r1 = retire_agent(world, core, "ghostly", "alpha", NOW)
+            archives_after_first = sorted(p.name for p in graveyard_dir(world).iterdir())
+            r2 = retire_agent(world, core, "ghostly", "alpha", "2026-07-11T23:59:59")
+        finally:
+            Path.unlink = real_unlink
+
+        assert r1["tombstoned"] is True
+        assert r2["removed"] is False
+        assert r2["reason"] == "already_retired"
+        assert sorted(p.name for p in graveyard_dir(world).iterdir()) == archives_after_first, \
+            "re-run archived again"
+        doc = _load(row_path(world, "ghostly"))
+        assert doc["retired_at"] == NOW, "re-run re-stamped retired_at"
+
+
+def test_revived_agent_is_re_retired_not_treated_as_noop():
+    """Revival honesty: _is_retired lets a heartbeat NEWER than the tombstone
+    re-enter the roster. Such an agent is genuinely back, so a retire MUST act
+    rather than short-circuit on the stale `retired` flag."""
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = Path(tmpd)
+        core = _seed_core(world, {"alpha": {"last_active": "2026-07-11T00:00:00"}})
+        # Tombstoned, but heartbeat is NEWER than retired_at => revived.
+        _seed_shard(world, "risen", {"retired": True,
+                                     "retired_at": "2026-07-11T12:00:00",
+                                     "last_active": "2026-07-11T18:00:00"})
+        assert "risen" in _compose_roster_in_subprocess(world), \
+            "fixture invalid: revived agent should be live before retire"
+
+        real_unlink = Path.unlink
+        Path.unlink = lambda self, *a, **kw: (_ for _ in ()).throw(
+            OSError(13, "denied")) if self.name == "risen.yaml" else real_unlink(self)
+        try:
+            r = retire_agent(world, core, "risen", "alpha", "2026-07-12T00:00:00")
+        finally:
+            Path.unlink = real_unlink
+
+        assert r["removed"] is True, "revived agent was wrongly treated as already-retired"
+        assert r["tombstoned"] is True
+        assert _load(row_path(world, "risen"))["retired_at"] == "2026-07-12T00:00:00"
+        assert "risen" not in _compose_roster_in_subprocess(world)
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -192,3 +192,92 @@ def test_writer_output_is_discoverable_by_the_reader(tmp_path, monkeypatch):
     assert target in firings_paths(tmp_path), (
         "writer emitted a path the reader does not recognise as part of the store"
     )
+
+
+# ---------------------------------------------------------------------------
+#  -- two defects /fresh-eyes-code found in the seam above, ~2h after it
+# landed. Both are one-liners; both were invisible to the 22 tests already in
+# this file, and the two blind spots have DIFFERENT shapes worth naming.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("flag_on", [False, True])
+def test_flush_report_names_the_resolved_target(tmp_path, monkeypatch, capsys,
+                                                flag_on):
+    """The flush's success line must name the file it ACTUALLY wrote.
+
+    Defect: the report interpolated STORE_NAME -- the hardcoded legacy constant
+    -- while the flush wrote `store`, the resolved target. So with segmentation
+    ON it appended to gate-firings-YYYY-MM-DD.jsonl and announced
+    gate-firings.jsonl: wrong in exactly the configuration the flag exists to
+    enable, and correct everywhere else. An operator rolling the flag out reads
+    the line as confirmation the flag did nothing.
+
+    PARAMETRIZED OVER BOTH FLAG STATES ON PURPOSE (rb-4133). A flag-off-only
+    assertion passes against the buggy code -- indeed it would have passed
+    before the flag existed at all -- so it has no discriminating power. Only
+    the flag-ON case fails against the defect, and it is only meaningful
+    alongside flag-OFF proving the legacy path did not regress.
+    """
+    monkeypatch.setenv("STORAGE_BACKEND", "local")  # guard-955
+    mod = _load_flush_module()
+    if flag_on:
+        monkeypatch.setenv(mod.SEGMENTED_ENV, "1")
+    else:
+        monkeypatch.delenv(mod.SEGMENTED_ENV, raising=False)
+
+    _write(tmp_path / mod.SPOOL_NAME, '{"ts": "2026-08-01T00:00:00"}\n')
+    # main() parses sys.argv rather than taking argv, so drive it the way the
+    # cron wrapper does rather than reaching past the entry point.
+    monkeypatch.setattr(
+        sys, "argv",
+        ["gate-firings-flush.py", "--meta-dir", str(tmp_path), "--force"],
+    )
+    mod.main()
+
+    line = capsys.readouterr().out
+    expected = mod._store_path(tmp_path).name
+    assert "flushed" in line, f"no flush report emitted: {line!r}"
+    assert expected in line, (
+        f"report names the wrong target: expected {expected!r} in {line!r}"
+    )
+    if flag_on:
+        # The discriminating half: under the defect this said the legacy name.
+        assert _SEGMENT_RE.match(expected)
+        assert "gate-firings.jsonl" not in line
+
+
+def test_firings_paths_returns_empty_when_meta_dir_is_unresolved(monkeypatch):
+    """A no-arg call with an unresolved META_DIR must return [], not raise.
+
+    Defect: `_Path(meta_dir) if meta_dir is not None else _Path(META_DIR)`
+    guarded the PARAMETER but not the module constant, so _Path(None) raised
+    TypeError. Unresolved paths are a real runtime state, not an error -- the
+    writer already treats them as "nothing to do"
+    (gate-firings-flush.py:191), and the reader now matches it.
+
+    WHY 22 GREEN TESTS MISSED THIS: every one of them passes an explicit
+    tmp_path, so they only ever exercise the parameter branch. The untested
+    lane is the no-arg call -- which is the shape the docstring invites, and
+    the only shape that can reach the bug. Coverage of a function is not
+    coverage of its default argument.
+    """
+    import _gate_log
+
+    monkeypatch.setattr(_gate_log, "META_DIR", None)
+    assert _gate_log.firings_paths() == []
+
+
+def test_unresolved_constant_does_not_affect_an_explicit_arg(tmp_path,
+                                                             monkeypatch):
+    """The None guard must not swallow a caller who passed a real directory.
+
+    Pins that the fix is a guard on the fallback, not a short-circuit on the
+    whole function -- the failure mode a careless `if META_DIR is None: return
+    []` at the top would introduce, silently blinding all three consumers.
+    """
+    import _gate_log
+
+    legacy = _write(tmp_path / "gate-firings.jsonl")
+    monkeypatch.setattr(_gate_log, "META_DIR", None)
+    assert _gate_log.firings_paths(tmp_path) == [legacy]

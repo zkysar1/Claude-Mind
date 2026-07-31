@@ -16,6 +16,7 @@ Test cases:
 
 Run: py -3 core/scripts/tests/test_class_balance_cross_session.py
 """
+import datetime as dt
 import json
 import os
 import shutil
@@ -26,6 +27,24 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPT_DIR))
+
+
+def _recent(days_ago):
+    """A journal date `days_ago` days back, computed — never a literal.
+
+    These tests originally hardcoded 2026-05-01..03. That was fine until
+    g-115-4293 gave load_recent_class_completions a staleness guard: the
+    literals aged past the 7-day threshold, the guard correctly fired, and four
+    tests began asserting against the fallback's empty list instead of the
+    journal window they meant to exercise. The dates, not the guard, were wrong.
+
+    A literal date in a time-sensitive test is a slow fuse — it passes for weeks,
+    then fails on a day unrelated to any change, and the failure points at the
+    code rather than at the fixture. Relative offsets keep each test asserting
+    the property it actually names (ordering, tail, skip) with no dependency on
+    the wall-clock date the suite happens to run on.
+    """
+    return (dt.datetime.now() - dt.timedelta(days=days_ago)).strftime("%Y-%m-%d")
 
 
 def with_sandbox(test_fn):
@@ -113,9 +132,12 @@ def test_last_n_tail(world_dir, agent_dir):
     ]
     _write_aspirations(world_dir, "asp-test", goals)
 
-    # Journal: 30 entries each with 1 goal completed, in chronological order
+    # Journal: 30 entries each with 1 goal completed, in chronological order.
+    # Offset so the NEWEST entry is today: the staleness guard keys on the newest
+    # contributor, so a 29-day-old tail is fine while a 29-day-old HEAD would trip
+    # it. This keeps the tail semantics under test without disabling the guard.
     entries = [
-        {"date": f"2026-05-{i+1:02d}", "goals_completed": [f"g-test-{i:02d}"]}
+        {"date": _recent(29 - i), "goals_completed": [f"g-test-{i:02d}"]}
         for i in range(30)
     ]
     _write_journal(agent_dir, entries)
@@ -178,7 +200,7 @@ def test_missing_work_class_skip(world_dir, agent_dir):
     ]
     _write_aspirations(world_dir, "asp-test", goals)
     entries = [
-        {"date": "2026-05-01", "goals_completed": ["g-with-class", "g-no-class"]},
+        {"date": _recent(0), "goals_completed": ["g-with-class", "g-no-class"]},
     ]
     _write_journal(agent_dir, entries)
 
@@ -202,7 +224,7 @@ def test_orphaned_id_skip(world_dir, agent_dir):
 
     # Journal includes an unknown goal_id
     entries = [
-        {"date": "2026-05-01", "goals_completed": ["g-known", "g-unknown-orphan"]},
+        {"date": _recent(0), "goals_completed": ["g-known", "g-unknown-orphan"]},
     ]
     _write_journal(agent_dir, entries)
 
@@ -228,9 +250,9 @@ def test_chronological_order(world_dir, agent_dir):
     _write_aspirations(world_dir, "asp-test", goals)
     # Journal in chronological order: oldest first
     entries = [
-        {"date": "2026-05-01", "goals_completed": ["g-old"]},
-        {"date": "2026-05-02", "goals_completed": ["g-mid"]},
-        {"date": "2026-05-03", "goals_completed": ["g-new"]},
+        {"date": _recent(2), "goals_completed": ["g-old"]},
+        {"date": _recent(1), "goals_completed": ["g-mid"]},
+        {"date": _recent(0), "goals_completed": ["g-new"]},
     ]
     _write_journal(agent_dir, entries)
 

@@ -1291,13 +1291,60 @@ def _log_transient_allblocked_recovery(first_world, retry_world, retry_count):
 # Cross-session class completions ( /  drift fix)
 # ---------------------------------------------------------------------------
 
+# Max age of the NEWEST contributing journal entry before the recent-completions
+# window is treated as fossil rather than recent (). 7 days is
+# deliberately loose: the window is a scoring input, not a correctness gate, and
+# a quiet weekend must not trip it. The measured failures were 50 and 82 days —
+# an order of magnitude past this — so the threshold does not need to be tight
+# to catch the real defect, and a loose one keeps false positives near zero.
+# Override for tests / tuning via env.
+RECENT_WINDOW_MAX_AGE_DAYS = float(
+    os.environ.get("RECENT_WINDOW_MAX_AGE_DAYS", "7") or "7"
+)
+
+
+def _window_age_days(entry_date):
+    """Age in days of a journal entry's `date`, or None if unparseable.
+
+    Returns None (never raises, never guesses) on a missing or malformed date so
+    the caller's guard fails OPEN — an unparseable date must not be treated as
+    stale, or a journal-format change would silently disable the real window.
+    """
+    if not entry_date or not isinstance(entry_date, str):
+        return None
+    raw = entry_date.strip()
+    # Journal entries carry a bare `YYYY-MM-DD`; tolerate a full ISO timestamp
+    # so this keeps working if the writer is ever restored with more precision.
+    #
+    # MOST-SPECIFIC FIRST, and slice to each format's OWN width. Ordering the
+    # date-only format first makes the ISO branch unreachable: `raw[:10]` of an
+    # ISO stamp parses cleanly as a date, so the time is silently dropped and
+    # every ISO input reads up to a day older than it is. Caught by
+    # test_full_iso_timestamp_is_accepted, which measured 3.7 days for a
+    # 3-day-old stamp.
+    for fmt, width in (("%Y-%m-%dT%H:%M:%S", 19), ("%Y-%m-%d", 10)):
+        candidate = raw[:width]
+        if len(candidate) < width:
+            continue
+        try:
+            parsed = datetime.strptime(candidate, fmt)
+        except ValueError:
+            continue
+        return (datetime.now() - parsed).total_seconds() / 86400.0
+    return None
+
+
 def load_recent_class_completions(window_size=20):
     """Cross-session sampling window for goal-selector criteria.
 
     Replaces in-session-only `wm.goals_completed_this_session` (which resets
     every /stop and was structurally blind to cross-session drift) with a
-    rolling window drawn from <agent>/journal.jsonl recent completions, cross-
-    referenced against world+agent aspirations.jsonl for `work_class` lookup.
+    rolling window of THIS agent's recent completions, drawn from world+agent
+    aspirations.jsonl (`completed_at` / `completed_date` / `lastAchievedAt`,
+    filtered to `completed_by == AGENT_NAME`). <agent>/journal.jsonl is a
+    fallback for worlds carrying no completion markers — it was the primary
+    source until g-115-4293, when its `goals_completed` field was found to have
+    no writer anywhere in the codebase and the window had silently fossilised.
 
     Returns a list shaped like `goals_completed_this_session` entries:
         [{goal_id, aspiration_id, recurring, work_class}, ...]
@@ -1327,14 +1374,19 @@ def load_recent_class_completions(window_size=20):
         except Exception:
             return []
 
-    if not journal_path.exists():
-        return _in_session_fallback()
+    # NOTE: journal existence is checked at the JOURNAL branch below, not here.
+    # It used to gate this whole function, which was correct while the journal
+    # was the only source — but once the aspirations store became primary that
+    # early return made the store path unreachable for any agent lacking a
+    # journal.jsonl (a fresh agent, or a transplanted one), silently pinning it
+    # to the in-session list. Caught on pre-completion re-read, .
 
     # Build goal_id → {aspiration_id, recurring, work_class} index from
     # world + agent aspirations. Empty work_class is preserved so callers
     # can distinguish "no entry" from "no work_class tag" (the existing
     # class_balance check filters missing work_class out of the denominator).
     index = {}
+    dated = []  # (completion_ts, info, completed_by) for goals carrying a marker
     try:
         for src_path in (WORLD_ASP_PATH, AGENT_ASP_PATH):
             if not src_path:
@@ -1345,14 +1397,87 @@ def load_recent_class_completions(window_size=20):
                     gid = g.get("id")
                     if not gid:
                         continue
-                    index[gid] = {
+                    info = {
                         "goal_id": gid,
                         "aspiration_id": asp_id,
                         "recurring": bool(g.get("recurring", False)),
                         "work_class": g.get("work_class") or "",
                     }
+                    index[gid] = info
+                    # : collect completion markers while we are already
+                    # walking these records, so the primary window below costs no
+                    # additional I/O. `completed_at` first — measured highest
+                    # coverage (77% of 4,628 goals vs 66% for completed_date);
+                    # lastAchievedAt (2%) is the recurring-goal marker, which is
+                    # the ONLY marker a recurring goal ever gets (it returns to
+                    # status=pending on close and never carries completed_date).
+                    ts = (g.get("completed_at") or g.get("completed_date")
+                          or g.get("lastAchievedAt"))
+                    if ts and info["work_class"]:
+                        dated.append((str(ts), info, g.get("completed_by") or ""))
     except Exception:
         return _in_session_fallback()
+
+    def _guarded(window, newest_ts, source_label):
+        """Return `window`, or fall back when it is empty or FOSSIL.
+
+        Applied to BOTH source paths deliberately. An earlier draft of this fix
+        returned the aspirations window directly and left the guard sitting only
+        on the journal path — which `dated` being non-empty made structurally
+        unreachable, so the guard would have been dead on arrival in the same
+        change that introduced it. Whatever builds the window, the freshness
+        assertion is the last thing between it and the scorer.
+        """
+        if not window:
+            return _in_session_fallback()
+        age_days = _window_age_days(newest_ts) if newest_ts else None
+        if age_days is not None and age_days > RECENT_WINDOW_MAX_AGE_DAYS:
+            print(
+                "[goal-selector] WARN: recent-completions window is STALE — "
+                f"newest contributing record in {source_label} is {age_days:.1f} "
+                f"days old (max {RECENT_WINDOW_MAX_AGE_DAYS}). Falling back to "
+                "the in-session list. per_goal_saturation / class_balance_bonus "
+                "/ context_coherence would otherwise score against fossil data "
+                "(g-115-4293).",
+                file=sys.stderr,
+            )
+            return _in_session_fallback()
+        return window
+
+    # ── Primary window: the aspirations store () ────────────────
+    # The journal path below is retained as a FALLBACK, not the primary source.
+    # Rationale: journal.jsonl `goals_completed` was a DUPLICATE of completion
+    # data the aspirations store already holds, and nothing has written it since
+    # the writer was lost — so it drifted precisely because it was a duplicate
+    # (communication-clarity rule 5: one piece of data, one home). The store is
+    # also the evidence-grade source guard-138 names (an explicit completion
+    # marker, not a journal/experience count).
+    #
+    # Measured 2026-07-31 (alpha, cc-04): 3,077 goals carry both a completion
+    # marker and a work_class, newest stamped minutes earlier — against a journal
+    # window whose newest contributor was 15.7 days old and oldest 50.7.
+    # SCOPE: this agent's completions, NOT the fleet's. The window's whole
+    # purpose () was catching THIS agent's 53% framework dominance, and
+    # the journal it originally read was per-agent. Sourcing the shared store
+    # without this filter silently widens it to every agent: measured on the
+    # first draft, 7 of 8 window entries belonged to partners. That is harmless
+    # for per_goal_saturation (arguably better — it suppresses a recurring goal a
+    # partner just finished) but wrong for the other two consumers, which ask
+    # about SELF: class_balance_bonus would score the fleet's class mix instead
+    # of mine, and context_coherence would reward following the fleet's working
+    # context instead of my own.
+    # Fall back to unfiltered when nothing is self-attributed (a fresh agent, or
+    # a deployment that does not populate completed_by) — a slightly-too-wide
+    # window still beats no cross-session window at all, which is the defect
+    # being fixed.
+    if dated:
+        mine = [d for d in dated if d[2] == AGENT_NAME]
+        scoped = mine or dated
+        label = ("the aspirations store" if mine
+                 else "the aspirations store (unattributed — fleet-wide)")
+        scoped.sort(key=lambda t: t[0])               # ascending == chronological
+        recent = scoped[-window_size:]
+        return _guarded([info for _ts, info, _by in recent], recent[-1][0], label)
 
     # Tail-read journal: collect goals_completed entries from latest entries
     # backwards until we have window_size with non-empty work_class.
@@ -1363,6 +1488,7 @@ def load_recent_class_completions(window_size=20):
         return _in_session_fallback()
 
     completions = []
+    newest_contrib_date = None  # date of the NEWEST entry that contributed
     for line in reversed(lines):
         line = line.strip()
         if not line:
@@ -1383,17 +1509,44 @@ def load_recent_class_completions(window_size=20):
                 # Skip goals without a current work_class lookup —
                 # archived/orphaned IDs would dilute the denominator
                 continue
+            if newest_contrib_date is None:
+                # We walk newest-first, so the FIRST contributor is the newest.
+                newest_contrib_date = entry.get("date")
             completions.append(info)
             if len(completions) >= window_size:
                 break
         if len(completions) >= window_size:
             break
 
-    if not completions:
-        return _in_session_fallback()
-
-    # Reverse to chronological (oldest first) so [-N:] slicing semantics match
-    return list(reversed(completions))
+    # ── Journal fallback + staleness guard () ───────────────────
+    # Reached only when the aspirations store yielded no dated completion at all
+    # (a fresh world, or one predating work_class tagging). Every fallback ABOVE
+    # keys on the window being UNREADABLE (no AGENT_DIR, missing journal, index
+    # error, read error) or EMPTY — none keyed on it being OLD, so a window
+    # filled entirely from months ago was indistinguishable from a fresh one and
+    # was returned as "recent".
+    #
+    # That is not hypothetical: `goals_completed` has NO writer anywhere in
+    # core/scripts or mind_api (every match targets a different store — session
+    # telemetry, handoff.yaml, or the loop_state int counter), so the field
+    # stopped being populated and the window silently fossilised. Measured
+    # 2026-07-31: alpha walked back 194 of 384 journal entries to fill 20, whose
+    # newest contributor was 15.7 days old and oldest 50.7; zeta measured 82 days
+    # on a second box. Three scorer criteria consume this window —
+    # per_goal_saturation (a RAPID-REPEAT suppressor charging -5.0 for a
+    # months-old completion), class_balance_bonus, and context_coherence.
+    #
+    # guard-138 governs the SHAPE: a clock-only staleness heuristic must not take
+    # a destructive action. This one is deliberately non-destructive — it falls
+    # back to the in-session list (current, if short) and WARNS on stderr. It
+    # never deletes, reverts, or rewrites stored state, so the guard-138
+    # evidence-gate requirement (which protects destructive reversion) is not
+    # engaged. Being loud is the actual fix: the defect was silence, not the
+    # staleness itself.
+    #
+    # Reverse to chronological (oldest first) so [-N:] slicing semantics match.
+    return _guarded(list(reversed(completions)), newest_contrib_date,
+                    "journal.jsonl")
 
 
 # ---------------------------------------------------------------------------

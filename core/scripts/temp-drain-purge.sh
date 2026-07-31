@@ -116,13 +116,71 @@ _purge_find_predicate() {
 # -type f keeps -delete bounded to files (never the drained/ dir itself) — never
 # a hand-rolled rm. Caller MUST have asserted drained_dir's parent temp_dir safe.
 # Sourceable + unit-tested (test_temp_drain_purge.sh) with a synthetic drained/.
+#
+# GIT-TRACKED FILES ARE NEVER DELETED (, authored at ZDS 2026-07-31,
+# back-ported UP same day). WHY: a deployment's .gitignore can encode the
+# biconditional
+#   git-ignored  <==>  the guarded purge deletes it
+# reasoning about Lane 1 only (depth-1 ephemera, by extension), concluding that
+# `drained/` contents are NOT purged and therefore SHOULD be tracked. Lane 2
+# purges them anyway — by AGE, at any extension — so the biconditional breaks in
+# the one direction that loses data: 206 git-TRACKED files under a prod agent's
+# temp/drained/ were scheduled for deletion, after which iteration-commit would
+# record the removal and drop them from HEAD.
+#
+# Acute because mtimes there are PROVISIONING artifacts, not authoring times:
+# 188 of the 206 shared one mtime (five seconds after `.git` birth), so they
+# would all cross +30d on the SAME DAY rather than trickling. A trickle gets
+# noticed; a synchronized mass deletion happens while nobody is looking.
+#
+# NO-OP where temp/ is fully git-ignored (this deployment: , justified
+# by own-cloud S3 durability) — `git ls-files` returns nothing there and the
+# filter removes nothing. Load-bearing only where temp/ is default-durable,
+# i.e. under STORAGE_BACKEND=local.
+#
+# FAIL-SAFE DIRECTION: if `git ls-files` is unavailable or errors, the lane
+# deletes NOTHING. Retaining junk is recoverable; deleting a tracked artifact is
+# not.
 gc_drained_archive() {
   local drained_dir="${1:-}" age_days="${2:-30}" dry_run="${3:-0}" list count=0
+  local tracked f rel repo_root untracked=""
   [ -d "$drained_dir" ] || { echo 0; return 0; }
   list="$(find "$drained_dir" -maxdepth 1 -type f -mtime "+$age_days" 2>/dev/null || true)"
-  [ -n "$list" ] && count="$(printf '%s\n' "$list" | grep -c . || true)"
+  [ -z "$list" ] && { echo 0; return 0; }
+
+  # Resolve the repo root once; ls-files paths are repo-relative.
+  #
+  # THE TWO GIT OUTCOMES ARE NOT THE SAME, and conflating them is a bug the unit
+  # tests caught immediately (3 failures, first attempt): "this is not a git repo"
+  # means NO file here can be tracked, so nothing is protected and the normal
+  # age-based GC must proceed exactly as before. Only "this IS a repo but ls-files
+  # ERRORED" is the unknowable case where deleting would be a guess — that one
+  # deletes nothing. Treating not-a-repo as unknowable disables the lane entirely
+  # for every caller outside a work-tree.
+  repo_root="$(git -C "$drained_dir" rev-parse --show-toplevel 2>/dev/null || true)"
+  if [ -z "$repo_root" ]; then
+    tracked=""                       # not a work-tree → nothing can be tracked
+  else
+    tracked="$(git -C "$repo_root" ls-files -- "$drained_dir" 2>/dev/null)" || { echo 0; return 0; }
+  fi
+
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    rel="${f#"$repo_root"/}"
+    case "$(printf '%s\n' "$tracked" | grep -Fx -- "$rel" || true)" in
+      "") untracked="${untracked}${f}"$'\n' ;;   # not tracked → disposable
+      *)  : ;;                                    # tracked → keep, by the invariant
+    esac
+  done <<< "$list"
+
+  [ -n "$untracked" ] && count="$(printf '%s' "$untracked" | grep -c . || true)"
   if [ "$count" -gt 0 ] && [ "$dry_run" -eq 0 ]; then
-    find "$drained_dir" -maxdepth 1 -type f -mtime "+$age_days" -delete 2>/dev/null || true
+    # Per-file bounded guarded find — mirrors Lane 3's per-dir idiom; never a
+    # hand-rolled rm.
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      find "$f" -maxdepth 0 -type f -delete 2>/dev/null || true
+    done <<< "$untracked"
   fi
   echo "$count"
 }

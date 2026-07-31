@@ -129,8 +129,7 @@ def test_canonical_g_250_78_firing_case(tmp_path: Path):
     assert "candidates" in result
     assert isinstance(result["candidates"], list)
     assert len(result["candidates"]) >= 2
-    assert result["candidate_node_key"].startswith("intelligence/")
-    assert result["candidate_node_file"].endswith("npc-cognition.md")
+    _assert_node_key_contract(result, "intelligence", "npc-cognition")
 
 
 # ---------------------------------------------------------------------------
@@ -402,12 +401,53 @@ def test_always_exits_zero_on_garbage_input(tmp_path: Path):
 # Category-to-node-key mapping (heuristic correctness)
 # ---------------------------------------------------------------------------
 
+def _assert_node_key_contract(result: dict, l1: str, category: str) -> None:
+    """Pin the POST- candidate_node_key contract.
+
+    Before g-115-1746 the gate emitted the raw category heuristic
+    ("<l1>/<category>") and these tests asserted that literal. g-115-1746
+    then made the suggestion existence-checked, because a phantom key the
+    Phase 0-pre4 consumer cannot Edit leaves the sentinel stuck (observed 3
+    iterations). The gate now emits exactly one of:
+
+      "<l1>/<category>"  the mapped node, when that node file exists
+      "<l1>"             the L1 parent, when the specific node does not
+                         exist but its ancestor does
+      ""                 neither exists -- consumer picks a real node
+
+    So the assertable invariant is no longer a fixed string: it is that the
+    key is one of those three AND, when non-empty, names a file that is
+    actually on disk. Asserting the pre-1746 literal pinned a value the gate
+    is documented to override -- these three tests went red on 2026-07-03
+    and nobody saw it for 28 days (g-115-3748: run-full-suite.sh collected
+    1 of the 3 testpaths pytest.ini declares).
+
+    ISOLATION CAVEAT, measured 2026-07-31 and deliberately accommodated
+    rather than papered over: `_make_env` does NOT isolate this gate. Its tmp
+    `local-paths.conf` is outranked by `.mind-data/` in the `_paths.sh`
+    resolution chain, so the existence check above stats the REAL world tree,
+    and which branch fires depends on that tree's contents on the box running
+    the suite. The check below is written to hold under either resolution --
+    it does not assume the tmp tree won. Fixing the isolation is g-115-4325.
+    """
+    key = result["candidate_node_key"]
+    assert key in (f"{l1}/{category}", l1, ""), (
+        f"candidate_node_key={key!r} outside the g-115-1746 contract"
+    )
+    if key:
+        f = result["candidate_node_file"]
+        assert f.endswith(f"{key}.md"), f"node_file {f!r} does not match key {key!r}"
+        assert Path(f).is_file(), (
+            f"g-115-1746 invariant violated: suggested {f!r} does not exist"
+        )
+
+
 def test_node_key_intelligence_mapping(tmp_path: Path):
     env = _make_env(tmp_path)
     note = "2x latency win, 30% smaller heap, 1.5x throughput."
     result = _run_gate(env, "deep", "g-0", "npc-cognition", "k1", note)
     if result["fired"]:
-        assert result["candidate_node_key"] == "intelligence/npc-cognition"
+        _assert_node_key_contract(result, "intelligence", "npc-cognition")
 
 
 def test_node_key_performance_mapping(tmp_path: Path):
@@ -417,7 +457,7 @@ def test_node_key_performance_mapping(tmp_path: Path):
     result = _run_gate(env, "deep", "g-0", "ayoai-perf-suite", "k2", note)
     # ayoai-perf-suite matches *perf* — should land under performance/
     if result["fired"]:
-        assert result["candidate_node_key"].startswith("performance/")
+        _assert_node_key_contract(result, "performance", "ayoai-perf-suite")
 
 
 # ---------------------------------------------------------------------------

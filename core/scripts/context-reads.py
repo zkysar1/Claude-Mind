@@ -142,7 +142,17 @@ ADVISORY_EXTRA_PREFIXES = [
 
 def normalize_path(file_path):
     """Resolve a file path to an absolute, normalized string."""
-    p = Path(file_path).resolve()
+    # SEPARATOR NORMALIZATION MUST PRECEDE resolve() (). Claude Code
+    # sends file_path in NATIVE form, so on Windows every path arrives
+    # backslashed. Resolving FIRST and replacing after is too late: on a POSIX
+    # Path implementation a backslashed string has no separators at all, so it
+    # parses as ONE relative filename component and resolve() glues CWD onto the
+    # front — yielding <cwd>/<whole-path> which matches no tracked prefix. The
+    # read is then dropped silently at rc=0, and the read-before-edit advisory
+    # it feeds inverts from never-firing to always-firing (a 100% false-positive
+    # banner, which read-before-edit.md Rule 4 calls worse than a silent one).
+    # The trailing replace is still required for WindowsPath's backslash output.
+    p = Path(str(file_path).replace("\\", "/")).resolve()
     # Forward slashes are the canonical form — all tracker lookups depend on this
     return str(p).replace("\\", "/")
 

@@ -37,6 +37,7 @@ import hashlib as _hashlib
 import json as _json
 import os as _os
 import re as _re
+import sys as _sys
 from pathlib import Path as _Path
 
 # Single source of truth for META_DIR — same resolver every other script uses.
@@ -126,7 +127,24 @@ def firings_paths(meta_dir=None):
     stem but are NOT part of the shared store (they are drained into it by
     gate-firings-flush.py and are in owncloud_sync._EXCLUDE_NAMES).
     """
-    base = _Path(meta_dir) if meta_dir is not None else _Path(META_DIR)
+    # Guard the module constant, not just the parameter (). META_DIR is
+    # None whenever paths are unresolved, so the no-arg call -- the shape this
+    # docstring invites -- raised TypeError from _Path(None). Return [] instead,
+    # matching the writer: gate-firings-flush.py:191 treats an unresolved
+    # META_DIR as a real runtime state with nothing to do, not an error.
+    resolved = meta_dir if meta_dir is not None else META_DIR
+    if resolved is None:
+        # Say so on stderr. Returning [] silently would make "paths unresolved"
+        # indistinguishable from "store is genuinely empty", and a consumer
+        # reading zero firings concludes a gate never fired and is therefore
+        # RETIRABLE -- the false all-clear this module's own ORDERING
+        # CONSTRAINT (gate-firings-flush.py:77-83) calls the worst direction
+        # this system can fail in. The writer prints for the identical
+        # condition; "matching the writer" means matching its loudness too.
+        print("[_gate_log] META_DIR unresolved — gate-firings store not "
+              "enumerable; returning no paths", file=_sys.stderr)
+        return []
+    base = _Path(resolved)
     paths = []
     legacy = base / "gate-firings.jsonl"
     if legacy.is_file():

@@ -9616,6 +9616,51 @@ print(f"PASS: {len(files)} aspiration stores scanned, 0 dotted-literal keys")'
    # not in either file). No line anchors (rb-682). Two-file miss-accumulator.
    Bash (deadman-rearm-first-rule-presence): miss=""; grep -qF 'self-resurrection NET' .claude/rules/return-protocol.md || miss="$miss return-protocol-lost-deadman-net"; grep -qF 're-arms it forward first' .claude/rules/schedule-wakeup-correctness.md || miss="$miss schedule-wakeup-lost-rearm-first"; if [ -n "$miss" ]; then echo "FAIL: deadman re-arm-first rule presence drifted —$miss (the loop-survival guidance that the ScheduleWakeup net is armed BEFORE Skill and re-armed forward each iteration was deleted — silent text-death loop-stall recurrence risk; g-115-2779 / g-115-2771)"; else echo "PASS: deadman re-arm-first rule present in both files (return-protocol.md 'self-resurrection NET' + schedule-wakeup-correctness.md 're-arms it forward first')"; fi
 
+   # === Section S59.5: temp/ durability invariant (g-001-249, authored at ZDS) ==
+   # A file directly under agents/*/temp/ that is NEITHER git-tracked NOR covered by
+   # temp-drain-purge.sh's ephemera list has no durability AND no lifecycle where the
+   # storage backend is local (no own-cloud S3 sweep runs there — .gitignore names
+   # that sweep as temp/'s durability mechanism).
+   #
+   # SUPERSEDES the check proposed in g-001-210, whose invariant ("git-ignored IFF
+   # purged") is OBSOLETE: .gitignore now ignores ALL of agents/*/temp/* by design
+   # (g-115-1765) while the purge covers 8 extensions, so the biconditional is false
+   # in BOTH directions and asserting it would fail permanently.
+   #
+   # The extension list is PARSED from temp-drain-purge.sh, never hardcoded — it grew
+   # 5 → 8 without anything noticing, which is exactly how g-001-210's premise went
+   # stale. WARNS and always exits 0: a fresh working doc legitimately sits untracked
+   # for minutes (24h threshold). Says nothing about depth-2 drained/, which has its
+   # own Lane-2 mtime GC — a different lifecycle, not a violation.
+   #
+   # ENVIRONMENT-GATED BY CONSTRUCTION (back-ported UP 2026-07-31): the check resolves
+   # the active storage backend the same way storage_backend.get_backend() does and
+   # SKIPs unless it is local — correct on every deployment, so it lives at the dev
+   # source and promotion carries it instead of deleting it (retires the original
+   # ZDS-local KEEP-IN-SYNC fragility, rb-842 class).
+   #
+   # Concrete harm it guards (2026-07-31, ZDS): a days-old syntax-checked spec under
+   # a prod agent's temp/ that a PENDING goal instructed a future executor not to
+   # rebuild was never tracked (.gitignore excludes agents/*/temp/*.sh) and is
+   # unrecoverable.
+   Check: no agents/*/temp/ depth-1 file >24h is both untracked and outside the purge list (g-001-249)
+   Bash (temp-durability-invariant): py -3 core/scripts/checks/temp_durability_invariant.py
+
+   # === Section S59.6: session-manifest duplicate entries (g-001-283) ===========
+   # Three entries were duplicated with copies that DISAGREED on recovery_action
+   # (clear vs preserve). Not cosmetic: the manifest's two consumers resolve a
+   # duplicate in OPPOSITE directions —
+   #   owncloud_sync._load_session_tiers  builds {basename: tier}, so LAST wins
+   #   session-manifest-clear.sh          iterates the LIST and clears every entry
+   #                                      marked clear, so the CLEAR copy wins
+   #                                      regardless of position
+   # A name carrying both was therefore cleared on recovery AND reported as
+   # machine_local/preserved. Measured: loop-state-bump-failures.jsonl, an
+   # APPEND-ONLY trend log, was being wiped every recovery. Nothing in the file
+   # signalled a second entry existed.
+   Check: no duplicate `file:` names in core/config/session-manifest.yaml (g-001-283)
+   Bash (session-manifest-no-duplicates): py -3 core/scripts/checks/session_manifest_no_duplicates.py
+
    # === Section S60: PreToolUse hook deny-protocol uniformity (g-115-1012) =========
    # Three structural checks that catch the INERT-gate class of regression
    # surfaced during /encode-session 2026-05-20. A PreToolUse deny gate can

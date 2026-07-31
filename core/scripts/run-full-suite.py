@@ -40,6 +40,7 @@ Exit codes:
 """
 
 import argparse
+import configparser
 import os
 import re
 import subprocess
@@ -51,7 +52,78 @@ if hasattr(sys.stdout, "reconfigure"):
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
-TESTS_DIR = SCRIPT_DIR / "tests"
+TESTS_DIR = SCRIPT_DIR / "tests"          # last-resort fallback; see _testpaths()
+
+# Testpaths that are COLLECTED but run as their OWN pytest invocation rather
+# than inside the chunk pool (). This is not a way to skip them --
+# run-full-suite.sh runs each one and folds its exit code in, exactly as it
+# already does for the invisible-suite and domain halves. It is a way to run
+# them in a fresh process that has not just executed ~8,000 other tests.
+#
+# WHY, measured 2026-07-31 (cc-02 / Linux 6.8.0-136-generic, own-cloud, live
+# fleet). mind_api/tests is daemon-heavy: its tests spawn a real daemon and
+# talk to it over HTTP. It sorts LAST, so in the chunk pool it always runs
+# after everything else, and there it fails en masse -- 411 failures at
+# rung 16, 271 at rung 20 -- with HTTP 404s from test-spawned daemons and
+# assertions that see the LIVE aspirations queue (897 unexpected goals)
+# instead of their fixture. Alone it is fine: the whole tree runs 1128/1135,
+# and chunk 15's exact 47-file list re-runs SOLO to 5. So the split is not the
+# problem and neither are the tests -- something accumulates across the
+# sequential run that fresh chunk processes do not reset. WHICH resource is
+# UNMEASURED; do not inherit a mechanism here that nobody has confirmed.
+#
+# Escalating the ladder does NOT fix it, which is why this is a structural
+# exception rather than a rung recommendation: rung 20 merely moved the cliff
+# from chunk 14 to chunk 17. And the cost of leaving it in the pool is not
+# just noise -- run-full-suite's contention classifier cannot see a tail-chunk
+# cluster (), so it certifies these runs "VERDICT: GENUINE --
+# trustworthy, act on them". A runner that reports ~285 phantom failures under
+# a trustworthy verdict on every deep-code closure is worse than one that runs
+# the tree separately: agents either chase ghosts or learn to disbelieve the
+# verdict, and the code's own guard-580 comment records where that ends.
+#
+# Revisit when  (classifier) and  (the 7 real reds) land,
+# or when the accumulated resource is identified -- at which point this list
+# should shrink to empty.
+DEFERRED_TESTPATHS = {"mind_api/tests"}
+
+
+def _testpaths():
+    """Resolve the suite's collection roots from pytest.ini `testpaths`.
+
+    Deliberately NOT a hardcoded list here (g-115-3748). This runner shipped
+    2026-07-26 collecting exactly `core/scripts/tests`, five weeks AFTER
+    pytest.ini already declared three testpaths — so the project's own
+    declaration of what the suite IS and the tool that runs it disagreed, and
+    the tool was the newer of the two. Re-hardcoding the three paths here
+    would fix today's symptom and rebuild the mechanism: a second source of
+    truth, free to drift again the next time a test tree is added.
+
+    What that drift cost, measured 2026-07-31: 109 files / 1448 tests never
+    ran. Not merely uncovered — 12 of them were RED, some for over a month,
+    and every one of the enforcement layers they guard was therefore
+    unverified. The blind spot was invisible precisely because the runner
+    reports what it RAN and never what it declined to look for (guard-1760).
+
+    Fail-safe: any parse failure, or a testpaths list naming nothing that
+    exists, falls back to the historical single dir. A malformed pytest.ini
+    must not take the suite offline — that would trade a silent gap for a
+    loud one, and this runner is the thing agents use to prove they have not
+    broken anything.
+    """
+    ini = PROJECT_ROOT / "pytest.ini"
+    try:
+        cp = configparser.ConfigParser()
+        cp.read(ini, encoding="utf-8")
+        raw = cp.get("pytest", "testpaths", fallback="")
+    except Exception:
+        raw = ""
+    dirs = []
+    for frag in raw.split():
+        p = PROJECT_ROOT / frag
+        if p.is_dir() and p not in dirs and frag not in DEFERRED_TESTPATHS:
+            dirs.append(p)
+    return dirs or ([TESTS_DIR] if TESTS_DIR.is_dir() else [])
 
 # Windows STATUS_DLL_INIT_FAILED. The signature of resource exhaustion: the OS
 # can no longer initialise DLLs for new processes, so ANY spawn dies -- which
@@ -285,8 +357,11 @@ def main(argv=None):
                     help="on a contended verdict, re-run the worst-hit file alone to prove it")
     args = ap.parse_args(argv)
 
-    if not TESTS_DIR.is_dir():
-        print("run-full-suite: no tests dir at %s" % TESTS_DIR, file=sys.stderr)
+    testpaths = _testpaths()
+    if not testpaths:
+        print("run-full-suite: no tests dir resolved (pytest.ini testpaths "
+              "named nothing that exists, and %s is absent)" % TESTS_DIR,
+              file=sys.stderr)
         return 3
 
     agent = os.environ.get("MIND_AGENT", "").strip()
@@ -294,9 +369,14 @@ def main(argv=None):
         PROJECT_ROOT / "agents" / (agent or "shared") / "temp" / "suite-run")
     out.mkdir(parents=True, exist_ok=True)
 
-    files = sorted(str(p) for p in TESTS_DIR.glob("test_*.py"))
+    # Non-recursive glob per root, matching pytest's own default discovery for
+    # these trees (all three are flat -- verified 2026-07-31: 0 nested test
+    # files across 761). A root that grows subdirectories will need rglob.
+    files = sorted(str(p) for d in testpaths for p in d.glob("test_*.py"))
     if not files:
-        print("run-full-suite: no test files found", file=sys.stderr)
+        print("run-full-suite: no test files found under %s"
+              % ", ".join(str(d.relative_to(PROJECT_ROOT)) for d in testpaths),
+              file=sys.stderr)
         return 3
 
     env = dict(os.environ)
@@ -304,8 +384,13 @@ def main(argv=None):
     env["PYTHONUNBUFFERED"] = "1"
 
     groups = _chunk(files, args.chunks)
-    print("run-full-suite: %d files across %d fresh processes -> %s"
-          % (len(files), len(groups), out))
+    # Name the roots, not just the file count. A reader who cannot see WHICH
+    # trees ran cannot tell coverage from a silently-narrowed scope -- which
+    # is the exact failure this line now reports against ().
+    print("run-full-suite: %d files from %s across %d fresh processes -> %s"
+          % (len(files),
+             ", ".join(str(d.relative_to(PROJECT_ROOT)) for d in testpaths),
+             len(groups), out))
     print("  STORAGE_BACKEND=local pinned (guard-955); "
           "daemon_integration %s"
           % ("INCLUDED" if args.include_daemon_integration else "excluded"))

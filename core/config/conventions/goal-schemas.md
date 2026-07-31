@@ -565,9 +565,31 @@ via `aspirations-precheck` Phase 0.5b re-probe, disqualifying quiescence:
 
 **Structured-prefix bypass**: defer_reason values starting with
 `STRUCTURED_DEFER_PREFIXES` (`precondition_unmet:`, `blocked_on_dependency`,
-`Circuit breaker:`) skip both the capability-gate AND the blocker_ref gate.
-Those are machine-written state markers from the framework itself, not
-narrative claims about external signals.
+`Circuit breaker:`, `human_blocked:`) skip both the capability-gate AND the
+blocker_ref gate. Those are machine-written state markers from the framework
+itself, not narrative claims about external signals.
+
+`human_blocked:` (added 2026-06-25 by g-115-1646) is the one member that is
+NOT self-clearing, and it behaves differently enough to be worth stating
+here: it marks a genuinely non-agent-provisionable human gate (an approval
+click, outside counsel, a credential only a person can grant), so it is
+exempt from the 120h defer fall-through in `collect_eligible` /
+`collect_blocked`. It stays suppressed-from-selector AND counted-in-blocked,
+which is what lets quiescence fire during a human-gated plateau instead of
+the goal re-surfacing every iteration. User-surfacing is preserved by the
+precheck `human_blocked` age-escalation, not by re-selection.
+
+Do not read the bypass as a licence to route work to a human — it is the
+opposite. `.claude/rules/capability-before-user.md` and
+`.claude/rules/reclaim-routed-work.md` still govern whether the gate is real,
+and a `human_blocked:` defer is subject to the same RULE-axis re-check as any
+other routing-away decision: a standing grant can retire the reason while the
+condition remains perfectly true.
+
+(This paragraph is late by 36 days. `test_structured_prefixes_published`
+exists specifically to force a docs update when the tuple changes, went red
+the day `human_blocked:` landed, and nobody saw it — nothing ran that file.
+See g-115-3748.)
 
 **Override ledger**: `world/blocker-gate-overrides.jsonl` receives one record
 per `--force-unstructured-defer` (fields: `timestamp`, `agent`, `source`,

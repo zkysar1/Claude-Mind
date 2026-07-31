@@ -283,6 +283,85 @@ def git_last_commit_ts(repo_root: Path, rel_path: str) -> int | None:
     return None
 
 
+def git_source_freshness(repo_root: Path) -> dict:
+    """Is --source current with its own remote?  ()
+
+    WHY THIS EXISTS. --source takes a PATH and this tool measures whatever tree
+    is there, reporting cleanly either way. Aimed at a stale checkout it reports
+    that checkout's staleness as if it were the target's drift, and nothing in
+    the output hints at it. Measured 2026-07-31 (g-029-102): --source pointed at
+    a clone 48 commits behind origin/main yielded "56 orphan-risk + 38
+    target-ahead"; the same target measured against a fresh
+    `worktree --detach origin/main` yielded "0 orphan-risk + 3 target-ahead".
+    A 30x overstatement, well-formed and plausible, which then justified two
+    filed goals, a reasoning-bank entry, a guardrail, and a duplication-gate
+    override before an unrelated "+0 lines merged" surprise exposed it.
+
+    guard-297 documents the correct aiming procedure, but that is honor-system
+    and the failure it guards is the operator's own — the case rb-840 says to
+    WIRE rather than encode. Hence this check.
+
+    Returns {"state": ..., "ahead": int, "behind": int, "detail": str}.
+    state is one of: current | stale | no_upstream | not_git | unknown.
+    FAIL-OPEN by construction: every error path returns a non-blocking state,
+    because preflight must stay usable against a plain directory.
+    """
+    def _git(*a) -> str | None:
+        try:
+            r = subprocess.run(["git", *a], capture_output=True, text=True,
+                               cwd=str(repo_root), timeout=10)
+            return r.stdout.strip() if r.returncode == 0 else None
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+
+    if _git("rev-parse", "--git-dir") is None:
+        return {"state": "not_git", "ahead": 0, "behind": 0,
+                "detail": "source is not a git repo -- freshness unverifiable"}
+
+    # Prefer the configured upstream; fall back to the remote's default branch.
+    upstream = _git("rev-parse", "--abbrev-ref", "@{u}")
+    if not upstream:
+        head_ref = _git("symbolic-ref", "--quiet", "--short", "HEAD")
+        for cand in ([f"origin/{head_ref}"] if head_ref else []) + ["origin/main", "origin/master"]:
+            if _git("rev-parse", "--verify", "--quiet", cand):
+                upstream = cand
+                break
+    if not upstream:
+        return {"state": "no_upstream", "ahead": 0, "behind": 0,
+                "detail": "source has no upstream/origin ref -- freshness unverifiable"}
+
+    counts = _git("rev-list", "--left-right", "--count", f"{upstream}...HEAD")
+    if not counts:
+        return {"state": "unknown", "ahead": 0, "behind": 0,
+                "detail": f"could not compare against {upstream}"}
+    try:
+        behind, ahead = (int(x) for x in counts.split())
+    except ValueError:
+        return {"state": "unknown", "ahead": 0, "behind": 0,
+                "detail": f"unparseable rev-list output vs {upstream}"}
+
+    if behind == 0:
+        return {"state": "current", "ahead": ahead, "behind": 0,
+                "detail": f"source is current with {upstream}"}
+    return {"state": "stale", "ahead": ahead, "behind": behind,
+            "detail": (f"source is {behind} commit(s) BEHIND {upstream}"
+                       + (f" (and {ahead} ahead)" if ahead else ""))}
+
+
+def format_source_freshness_warning(fresh: dict) -> str | None:
+    """Human-facing WARN for a stale/unverifiable source, or None when current."""
+    st = fresh.get("state")
+    if st == "current":
+        return None
+    if st == "stale":
+        return (f"WARN: --source is {fresh['behind']} commit(s) BEHIND its remote. "
+                "Drift figures below may be THAT CHECKOUT being stale rather than "
+                "target-ahead content. Re-aim per guard-297: git fetch origin; "
+                "git worktree add <scratch> --detach origin/main; then measure. "
+                "(g-029-104)")
+    return f"note: {fresh.get('detail', 'source freshness unverifiable')} -- drift figures unverified against a remote"
+
+
 def git_last_transplant_ts(repo_root: Path) -> int | None:
     """Committer-date unix ts of the target's most recent transplant/sync commit.
 
@@ -602,6 +681,11 @@ def main() -> int:
     param_reconcile_up = [k for k in ta_core_blocking
                           if zone_map.get(k) not in (ZONE_KERNEL, ZONE_PHENO_STRUCT)]
 
+    # Source freshness () -- a stale --source reports ITS OWN staleness
+    # as drift. Advisory only: never changes the verdict or the exit code.
+    src_fresh = git_source_freshness(src)
+    src_warn = format_source_freshness_warning(src_fresh)
+
     if args.json:
         print(json.dumps({
             "source": str(src), "target": str(tgt), "strict": args.strict,
@@ -633,6 +717,7 @@ def main() -> int:
             "kernel_up_conflict": kernel_up_conflict,
             "structural_requires_review": structural_requires_review,
             "param_reconcile_up": param_reconcile_up,
+            "source_freshness": src_fresh,
             "verdict": "DRIFT" if drift else "CLEAN", "exit": 2 if drift else 0,
         }, indent=2))
         return 2 if drift else 0
@@ -641,12 +726,16 @@ def main() -> int:
     print(f"source (incoming)    : {src}")
     print(f"target (overwritten) : {tgt}")
     print(f"mode                 : {'STRICT (block on any diff)' if args.strict else 'default (block on orphan risk)'}")
+    print(f"source freshness     : {src_fresh['detail']}")
     if baseline_ts is not None:
         bl = datetime.datetime.fromtimestamp(baseline_ts, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         print(f"transplant baseline  : {bl} UTC -- per-file target timestamps at/before this are shadows, not target-ahead (g-115-2744)")
     else:
         print("transplant baseline  : none (target has no 'chore: sync framework' commit -- raw per-file timestamps used)")
     print()
+    if src_warn:
+        print(f"  {src_warn}")
+        print()
 
     # Phase 2 ENFORCEMENT (): display the EFFECTIVE (post-excusal)
     # blocking buckets so the human verdict stays consistent with `drift`. A
@@ -755,6 +844,12 @@ def main() -> int:
                 print(f"     ... +{len(files) - 25} more")
         print("   (heuristic path-based; Phase 2 g-115-2865 replaces with a tested diff-classifier)")
         print()
+
+    # Restate the staleness WARN immediately above the verdict ():
+    # readers routinely `| tail -3` this output and never see the header block,
+    # which is exactly how the  misread happened.
+    if src_warn:
+        print(f"  {src_warn}")
 
     if drift:
         print(f"VERDICT: DRIFT DETECTED -- {len(to_core)} orphan-risk"

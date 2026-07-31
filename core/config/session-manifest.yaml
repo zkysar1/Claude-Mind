@@ -539,14 +539,6 @@ files:
     required_when_idle: false
     required_when_running: false
 
-  - file: precheck-retrospection-tracker.json
-    purpose: precheck retrospection cadence tracker ({iter, last_retrospection_run_iter}); gates how often aspirations-precheck re-runs its retrospection pass. Per-machine iter space — a fresh machine starts its own trail, so it must NOT be pulled at boot (registered 2026-07-10, g-115-1900, after a desync warning flagged it as an unregistered data orphan)
-    writer: aspirations-precheck-budget-meter.sh
-    recovery_action: clear
-    sync_tier: ephemeral
-    required_when_idle: false
-    required_when_running: false
-
   - file: streak-breaks.jsonl
     purpose: streak-break events appended when a routine/productive streak ends
     writer: aspirations.py _append_streak_break_event
@@ -558,22 +550,6 @@ files:
   - file: quiescence-audit.jsonl
     purpose: wake-miss audit records emitted by quiescence-gate.py
     writer: quiescence-gate.py _append_log
-    recovery_action: clear
-    sync_tier: ephemeral
-    required_when_idle: false
-    required_when_running: false
-
-  - file: quiescence-last-cycle.json
-    purpose: quiescence fast-path cycle cache ({blocker_set_hash, blocker_refs[], sleep_seconds, ...}) re-validated by quiescence-cycle-cache.py check on each loop re-entry (Phase -0.5e.0). Per-machine cycle state — a different machine has a different blocker context, so it must NOT be pulled at boot (registered 2026-07-10, g-115-1900, same sweep as the other 3 orphans)
-    writer: quiescence-gate.py / quiescence-cycle-cache.py
-    recovery_action: clear
-    sync_tier: ephemeral
-    required_when_idle: false
-    required_when_running: false
-
-  - file: loop-state-bump-failures.jsonl
-    purpose: append-only log of loop-state bump no-op/failure events (e.g. bump_noop_detected → refire) written when loop-state-bump-counters.py detects a counter-advance failure; per-iteration audit trail (registered 2026-07-10, g-115-1900, same sweep as the other 3 orphans)
-    writer: iteration-close.sh (loop-state-bump-counters.py)
     recovery_action: clear
     sync_tier: ephemeral
     required_when_idle: false

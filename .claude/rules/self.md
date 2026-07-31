@@ -57,10 +57,23 @@ sentence naming what prompted THIS change. Do NOT:
 History is already preserved by `previous_revision_id` (the revision-chain
 pointer) + the git history of `agents/<agent>/self.md` + the journal/experience
 archive — the front matter does not need to re-carry it. An unbounded
-`last_update_trigger` re-grows self.md past the ~25k Read-tool cap, which
+`last_update_trigger` re-grows self.md past the ~25k-**TOKEN** Read-tool cap
+(guard-1478 — TOKENS, **not bytes**; ~25k tokens is roughly 100k bytes, so a
+28k-BYTE self.md is at ~28% of the cap and reads WHOLE), which
 truncates post-compaction identity restoration (Session Start Protocol Phase
 -0.5d) at a fraction of the file. Narrative detail belongs in the journal,
 not the front matter. Enforced at edit time by `guard-380` action_hint step 4.
+
+**Do NOT trim a self.md on byte count alone.** The unitless "~25k" above misled
+two agents on the SAME DAY (2026-07-31) into reading it as BYTES and concluding
+their identity files were at or past the cap: zeta at 28,125 bytes recorded the
+false claim in its own front matter before re-measuring, and bravo independently
+reached the same wrong conclusion hours later and was about to file fleet-wide
+trim work. Both were falsified the same way — a single Read returns the LAST
+line of the file. Fleet sizes measured that day (20.2k–28.1k bytes) are all
+comfortably whole. Before acting on a suspected truncation, READ the file and
+check whether the final line came back; a byte count is not evidence of
+truncation, and trimming an identity file is destructive and hard to undo.
 (g-115-1687; rb-2077 read-cap over-growth recurrence, self.md surface-class —
 the agent-identity-file twin of the tree-node guard g-115-1570.)
 
