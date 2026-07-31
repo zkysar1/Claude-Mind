@@ -2258,6 +2258,29 @@ do_productivity_check() {
     python3 "$(_winpath "$SCRIPT_DIR/agent-watchdog.py")" --tick \
         2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
 
+    # user-signal-refresh (g-001-269) -- the WRITER for user-signal-snapshot.yaml,
+    # which goal-selector's user_signal_boost criterion reads. Hosted HERE, beside
+    # the watchdog tick, deliberately: the consumer's docstring says the snapshot is
+    # "refreshed per iteration by the signal-refresh hook in aspirations-precheck",
+    # and that LLM-dispatched hook was never built -- so the criterion sat inert
+    # with a reader and no writer. An LLM-dispatched refresh would reintroduce the
+    # same fragility that left the fresh-eyes cadence 92 goals un-dispatched
+    # (g-001-262); a script-side tick cannot be forgotten under context pressure.
+    # Running at CLOSE rather than at precheck is intentional and sufficient: the
+    # snapshot only needs to be fresh by the NEXT selection, and close is
+    # guaranteed-executed where precheck pseudocode is not. Fail-open, sub-second,
+    # single file write. See core/scripts/user-signal-refresh.py docstring.
+    #
+    # KEEP-IN-SYNC / RESTORE NOTE (g-029-101, 2026-07-31): this block is ZDS-LOCAL
+    # and is NOT present upstream, so a MIRROR-style framework sync deletes it. The
+    # 2026-07-30 sync (1df2b2e8) did exactly that, and the loss was silent: the
+    # reader kept reading a well-formed snapshot that had simply stopped advancing
+    # (frozen 07-30 07:57, ~20h stale before detection). Until this lands upstream,
+    # any framework sync MUST run promotion-preflight.sh and re-verify this block
+    # survives. See .claude/rules/promotion-cycle.md "Pre-Overwrite Drift Gate".
+    python3 "$(_winpath "$SCRIPT_DIR/user-signal-refresh.py")" \
+        >>"$CORE_ROOT/logs/iteration-close-stderr.log" 2>&1 || true
+
     # Monitor-tick -- FW-1b demoted pure-monitoring probes (g-317-13). Runs each
     # ENABLED probe (allowlist in core/config/monitor-probes.yaml; ships empty =
     # inert) at its own interval_hours, beside the watchdog tick -- same LOCAL-tick
