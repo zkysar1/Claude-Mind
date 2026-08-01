@@ -21,4 +21,4 @@ _SELF="$(cd "$(dirname "$0")" && pwd)"
 # 12-wrapper normalizer-coverage grep). The sibling parses bare positionals.
 GOAL_NORMALIZE_TARGET=positional source "$_SELF/_goal-arg-normalize.sh"
 
-exec "$_SELF/aspirations-update-goal.sh" --source agent "$@"
+exec bash "$_SELF/aspirations-update-goal.sh" --source agent "$@"
