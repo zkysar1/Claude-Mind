@@ -390,6 +390,73 @@ def _validate_resolution_evidence(rec: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Provenance stamps ()
+#
+# Authorship and resolver identity were only ever DERIVABLE after the fact, by
+# two routes that disagree. Measured on the CONFIRMED corpus ():
+# filed_by_agent 0/260, agent 0/260, author 1/260; experience_ref -> agent dir
+# covers 70/260 and source_goal -> goal.filed_by_agent covers 50/260, and where
+# both resolve they CONFLICT 10 times against 12 agreements. The resolver half
+# is no better: of 474 resolved records, reflected_by 73 (15.4%), resolved_by 10
+# (2.1%), resolver 2 (0.4%). So "who wrote this" and "who resolved this" are both
+# unanswerable, which blocks every authorship-sensitive audit (self-influence,
+# per-agent calibration, self-resolution bias).
+#
+# BOTH halves are stamped in the same change on purpose. Stamping only the author
+# would leave every author-x-resolver question still blocked while LOOKING like
+# provenance was solved -- the next auditor finds an author field, assumes the gap
+# is closed, and rediscovers the resolver gap from scratch.
+#
+# `formed_at` is separate from `formed_date` rather than a widening of it: the
+# date-only field is load-bearing for back-compat (_normalize_record's
+# resolves_by defaulting parses it, and the archive sweep's age math reads it).
+# A full timestamp is what makes intra-day ordering decidable -- the canonical
+# lobbying case was "posted 06:56, filed 06:58", indistinguishable at date
+# granularity, and 4 of 5 flags in the  audit were that artifact.
+#
+# Additive and idempotent by construction: an explicitly-supplied value always
+# wins (a migration or backfill can set the true author), and re-entering a stamp
+# point never overwrites an earlier one. No historical record is rewritten --
+# authorship for ~73% of the corpus is genuinely unrecoverable and would have to
+# be guessed, and a guessed provenance stamp reads as authority to every later
+# reader (guard-1925).
+#
+# Neither stamp affects validation: _validate_record only tests for MISSING
+# required fields, and _has_resolution_evidence reads experience_ref/evidence_for
+# plus free text -- never these fields. So stamp ordering is behaviorally neutral.
+# ---------------------------------------------------------------------------
+
+def _stamp_formation_provenance(rec: Dict[str, Any], agent: str) -> None:
+    """Stamp author + formed_at at hypothesis formation. Never overwrites."""
+    if agent and not rec.get("author"):
+        rec["author"] = agent
+    if not rec.get("formed_at"):
+        # Naive local-wall-clock ISO 8601, matching `date +%Y-%m-%dT%H:%M:%S`
+        # (CLAUDE.md "Naming Rules" -- TZ=UTC is pinned fleet-wide, so this is
+        # UTC wall time on every box and stamps are comparable across agents).
+        rec["formed_at"] = datetime.now().isoformat(timespec="seconds")
+
+
+def _stamp_resolution_provenance(rec: Dict[str, Any], agent: str) -> None:
+    """Stamp resolved_by + resolved_at at resolution. Never overwrites.
+
+    `resolved_by` reuses the existing sparse field name (10 live records) rather
+    than minting a new one, so those records join the new ones without a
+    translation layer. Deliberately NOT `reflected_by` (73 records): reflection
+    is a later, separate event from resolution, and collapsing them would make
+    "who decided this outcome" unanswerable again in a subtler way.
+
+    `resolved_at` does not collide with the `resolved_date` -> `outcome_date`
+    rename in _normalize_record -- that map keys on the exact string
+    `resolved_date`.
+    """
+    if agent and not rec.get("resolved_by"):
+        rec["resolved_by"] = agent
+    if not rec.get("resolved_at"):
+        rec["resolved_at"] = datetime.now().isoformat(timespec="seconds")
+
+
+# ---------------------------------------------------------------------------
 # Record lookup
 # ---------------------------------------------------------------------------
 
@@ -541,6 +608,11 @@ def move(ctx) -> "Response":  # type: ignore[name-defined]
                 # archived_date stamp below; an explicit caller value wins.
                 if not rec.get("outcome_date"):
                     rec["outcome_date"] = date.today().isoformat()
+                # Resolver identity, same chokepoint and same posture ().
+                # outcome_date answers WHEN a hypothesis was resolved; this answers
+                # WHO resolved it, which no field reliably did (resolved_by was
+                # populated on 10 of 474 resolved records).
+                _stamp_resolution_provenance(rec, agent)
 
             if target_stage == "archived":
                 # Tombstone-in-live archival (): keep the record in
@@ -620,6 +692,14 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
 
     live_path, archive_path, base_dir = _resolve_paths(ctx)
     agent = _agent_name(ctx)
+
+    # Provenance stamps (). Formation always; resolution too when the
+    # record is added directly at stage=resolved -- the block above already
+    # treats that as a resolution event (it runs the resolution-evidence gate),
+    # so it needs the resolver identity for the same reason a move does.
+    _stamp_formation_provenance(rec, agent)
+    if rec.get("stage") == "resolved":
+        _stamp_resolution_provenance(rec, agent)
 
     # Archive snapshot taken pre-lock (same pattern as pipeline.py cmd_add).
     archive_items = _read_jsonl(archive_path)

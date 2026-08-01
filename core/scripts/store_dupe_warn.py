@@ -273,6 +273,35 @@ def main(argv: Optional[List[str]] = None) -> int:
         store = args.store
 
         body = sys.stdin.read()
+        if not body.strip():
+            # EMPTY STDIN IS NOT A GATE INVOCATION — emit nothing (g-115-3797).
+            # Identical class to the `--help` SystemExit discriminated below,
+            # and the same phantom-signal shape g-115-3626 fixed there. Every
+            # caller is `printf '%s' "$BODY" | store_dupe_warn.py --store <s>`
+            # where BODY="$(cat)", so running any *-add.sh with no stdin (an
+            # agent checking the interface, a script whose heredoc did not
+            # fire) pipes "" here. json.loads("") then raises JSONDecodeError,
+            # the generic handler below records decision=fail_open, and
+            # gate-retirement-eval routes ANY fail_open to `investigate`.
+            # That is how this goal got filed: 108 recorded fail_opens, all
+            # reason=JSONDecodeError, spread evenly across all five agents
+            # because every agent occasionally runs a bare *-add.sh.
+            #
+            # There is nothing to duplicate-check and nothing entered any
+            # store unchecked: the daemon rejects an empty body downstream
+            # with {"error":"invalid_body"}, so the caller-bug case is already
+            # surfaced loudly by the add itself. A second signal here would be
+            # redundant, and as fail_open it is actively wrong — it reports the
+            # GATE as having failed when the gate was never asked anything.
+            #
+            # Deliberately NOT a new "skip" decision: _VALID_DECISIONS has no
+            # such member, and adding one would change the schema under
+            # gate-retirement-eval, gate-stats, and every other consumer for a
+            # case that is better described as "did not happen".
+            # NON-empty malformed JSON still falls through to fail_open below —
+            # that IS a real gate failure and must stay visible.
+            _suppress = True
+            return 0
         record = json.loads(body)
         if not isinstance(record, dict):
             detail = {"decision": "fail_open", "reason": "stdin is not a JSON object"}

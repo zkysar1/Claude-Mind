@@ -414,16 +414,26 @@ Primitives".
 
 ```
 For each substantive inline completion in this chat:
-  # asp-001 is RETIRED (status: retired, archived: true). NEVER use it as a
-  # target. Default to asp-115 (the framework-hygiene catch-all) when no
-  # current-focus aspiration is set.
-  target_asp = current focus aspiration (from working memory) OR asp-115
+  # DEPLOYMENT-ROUTED DEFAULT (g-001-195). The framework-hygiene catch-all
+  # aspiration DIFFERS PER DEPLOYMENT — one world's catch-all ID may be
+  # retired or entirely absent in another — so a hardcoded ID here silently
+  # mis-files (or errors on a retired/absent target) after every seed plant.
+  # Resolve per-deployment, in order:
+  #   1. current-focus aspiration (working memory) when set;
+  #   2. else THIS world's catch-all per
+  #      world/conventions/deployment-routing.md (the domain overlay owns
+  #      the concrete asp ID + --source value; each world carries its own);
+  #   3. else probe live aspirations (aspirations-read.sh) for the active
+  #      framework-hygiene/maintenance catch-all. Do NOT guess from memory,
+  #      and NEVER target a retired/archived aspiration.
+  target_asp = current focus aspiration (from working memory) OR <this world's catch-all per deployment-routing.md>
   # origin_signal MUST come from the canonical list enforced by
   # core/scripts/origin-signal-gate.py. "user_directive" is the right value
   # when the user invoked /encode-session — that IS the directive.
   # aspirations-add-goal.sh reads JSON from STDIN (BODY="$(cat)" line 103);
   # positional JSON args are silently discarded. --source picks the JSONL:
-  # world (for asp-115, asp-NNN in world) vs agent (for agent-local aspirations).
+  # world (asp-NNN in world/aspirations.jsonl) vs agent (agent-local
+  # aspirations) — deployment-routing.md records which applies here.
   echo '{"title":"Maintain: <one-line summary of inline work>",
      "description":"Completed inline during chat session on <date>: <details>",
      "status":"completed",
@@ -605,14 +615,17 @@ Did the chat-session changes touch framework files where regressions need a chec
      (the AUTHORITATIVE CHECK SOURCE per Step 3's comment).
      Do NOT auto-edit verify-learning/SKILL.md without showing the user the
      diff first — verify-learning is a high-trust file.
-     File the proposal as a Maintain-style goal under asp-115 (framework hygiene)
-     so it's tracked even if the user doesn't accept inline (JSON via STDIN):
+     File the proposal as a Maintain-style goal under this world's
+     framework-hygiene catch-all (resolve via
+     world/conventions/deployment-routing.md — same protocol as Lane 4;
+     g-001-195) so it's tracked even if the user doesn't accept inline
+     (JSON via STDIN):
        echo '{"title":"Maintain: add verify-learning check for <file>",
           "description":"<what changed, why a check is needed, suggested check form>",
           "status":"pending","priority":"MEDIUM","category":"framework-hygiene",
           "participants":["agent"],
           "origin_signal":"maintain:sq-018-verify-learning"}' \
-         | bash core/scripts/aspirations-add-goal.sh --source world asp-115
+         | bash core/scripts/aspirations-add-goal.sh --source <world|agent> <catch-all per deployment-routing.md>
      Print: VERIFY-LEARNING CANDIDATE g-NNN-NN — <description>
             Suggested form: Check: <assertion> | Bash: <command> → <expected>
 ```

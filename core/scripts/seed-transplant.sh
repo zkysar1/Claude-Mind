@@ -11,6 +11,15 @@
 #                       [--no-clean-cruft]
 #
 # Exits non-zero on failure. See .claude/skills/seed/SKILL.md for the spec.
+#
+# EXIT CODES (SSOT — test_seed_commit_refusal_exit_code.py cites this block):
+#   0     success (including a genuine no-op re-plant)
+#   2-8   usage / pre-flight refusal / build-plan / swap faults
+#   9     destination commit REFUSED (e.g. a dest pre-commit hook) — 
+#   10    post-plant verification FAILED — 
+#   20/21 --plan verdicts only (REVIEW REQUIRED / DO NOT PROMOTE) — 
+# 9 and 10 sit above the pre-existing 2-8 range and clear of the plan verdicts so
+# a refusal can never be read as a usage error or as a blast-radius verdict.
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/_paths.sh"
@@ -438,11 +447,94 @@ if [ $DO_COMMIT -eq 1 ] && [ -d "$DEST/.git" ]; then
     # silently degrades that guard to raw per-file timestamps. verify-learning
     # Section TCS asserts this literal stays in sync with the reader — keep both
     # in step.
-    git -C "$DEST" commit -m "chore: sync framework ($TS)" -q || echo "  (nothing to commit)"
+    # CAPTURE the commit rc — do NOT `|| echo "(nothing to commit)"` ().
+    # A non-zero rc here has TWO OPPOSITE causes and the old line collapsed them:
+    #   - empty staging area  -> the plant was a genuine no-op (benign)
+    #   - pre-commit hook REFUSED -> every planted file IS staged and was rejected
+    # Conflating them discards the only signal that the payload did not land, and
+    # because this was the last statement in the `if`, seed-transplant exited 0 —
+    # which is what kept promote-to-upstream.sh's own `|| fail "seed plant failed"`
+    # (its line 287) permanently dead. Same shape as the --plan verdict defect
+    # fixed by ; this is that defect on the --commit path.
+    #
+    # DISCRIMINATOR: `git diff --cached --quiet` exits 0 when NOTHING is staged
+    # and 1 when staged changes remain. Run it AFTER the failed commit — a hook
+    # refusal leaves the index fully intact, an empty index stays empty.
+    set +e
+    COMMIT_OUT="$(git -C "$DEST" commit -m "chore: sync framework ($TS)" -q 2>&1)"
+    COMMIT_RC=$?
+    set -e
+    if [ $COMMIT_RC -eq 0 ]; then
+        # Capturing the output means a SUCCESSFUL commit's hook chatter (warnings,
+        # advisories) no longer reaches the terminal on its own. Re-emit it, or
+        # this fix would trade a swallowed failure for a swallowed warning.
+        # Explicit `if`, not `[ -n ... ] && printf`. The && form is safe here
+        # (measured: set -e tolerates a short-circuited && list), but this whole
+        # fix exists because a terse shell construct swallowed a signal — a
+        # second subtlety in the same block is the wrong thing to leave behind.
+        if [ -n "$COMMIT_OUT" ]; then printf '%s\n' "$COMMIT_OUT"; fi
+    else
+        # CAPTURE the discriminator's rc — do NOT use it as a bare `if` condition.
+        # It answers three ways, not two: 0 = index empty (benign no-op), 1 = staged
+        # changes remain (a real refusal), anything else = git could NOT answer
+        # (measured: 129 outside a repo; the index-lock and unborn-HEAD cases both
+        # correctly return 1). A bare `if` collapses the third case into the second,
+        # which printed "with 0 file(s) STILL STAGED" — a self-contradiction inside
+        # the branch that exists BECAUSE files are staged, since the count comes from
+        # a second command whose stderr is also discarded. The fail direction was
+        # safe (still exit 9, still refuse), but  happened because a
+        # message asserted the opposite of what occurred; reproducing that class in
+        # the fix for it is not acceptable. (fresh-eyes-code, msg-20260731-203713.)
+        set +e
+        git -C "$DEST" diff --cached --quiet 2>/dev/null
+        STAGED_RC=$?
+        set -e
+        if [ $STAGED_RC -eq 0 ]; then
+            echo "  (nothing to commit — staging area empty, plant was a no-op)"
+        else
+            if [ $STAGED_RC -eq 1 ]; then
+                N_STAGED="$(git -C "$DEST" diff --cached --name-only 2>/dev/null | wc -l | tr -d ' ')"
+                STAGED_DESC="$N_STAGED file(s) STILL STAGED"
+            else
+                # Say what is actually known. An unknown count is not zero.
+                STAGED_DESC="staged state UNKNOWN (git diff --cached exited $STAGED_RC)"
+            fi
+            echo "[seed-transplant] ERROR: commit REFUSED (rc=$COMMIT_RC) with $STAGED_DESC." >&2
+            echo "[seed-transplant] This is NOT an empty diff — the payload was rejected, almost certainly by a destination pre-commit hook." >&2
+            echo "[seed-transplant] Destination commit output follows:" >&2
+            printf '%s\n' "$COMMIT_OUT" >&2
+            echo "[seed-transplant] The plant did NOT land. Refusing to report success (g-115-3481)." >&2
+            exit 9
+        fi
+    fi
 fi
 
 # Step 13: Verification
 echo "[seed-transplant] Running verification..."
-bash "$SCRIPT_DIR/seed-verify.sh" "$DEST" || echo "  (verification reported issues — see above)"
+# The verify rc is this plant's verdict and MUST propagate. This line previously
+# read `|| echo "  (verification reported issues — see above)"`, which made
+# seed-transplant exit 0 on a plant its OWN verifier had just failed ().
+# --expect-commit tells seed-verify that a commit was supposed to land here, which
+# turns a post-plant dirty tree from "expected" into a hard FAIL.
+EXPECT_FLAG=""
+if [ $DO_COMMIT -eq 1 ] && [ -d "$DEST/.git" ]; then
+    EXPECT_FLAG="--expect-commit"
+fi
+# Forward the SAME manifest this plant used. Omitting it made seed-verify fall
+# back to the default manifest, so a plant driven by any non-default manifest was
+# graded against a file list it never intended to copy — Check 1 reported the
+# whole default include set "missing" and Check 6 failed on an unplanted
+# prerequisite script. That mis-grading was INVISIBLE while the verify rc was
+# swallowed one line below; propagating the rc (above) turns it fatal, so the
+# forwarding is part of the same fix, not an unrelated tidy-up.
+set +e
+bash "$SCRIPT_DIR/seed-verify.sh" "$DEST" --manifest "$MANIFEST" $EXPECT_FLAG
+VERIFY_RC=$?
+set -e
+if [ $VERIFY_RC -ne 0 ]; then
+    echo "[seed-transplant] ERROR: post-plant verification FAILED (rc=$VERIFY_RC) — see the checks above." >&2
+    echo "[seed-transplant] Refusing to report success on a plant its own verifier rejected (g-115-3481)." >&2
+    exit 10
+fi
 
 echo "[seed-transplant] DONE. Planted $MOVED files to $DEST"

@@ -41,6 +41,7 @@ Exit codes:
 
 import argparse
 import configparser
+import json
 import os
 import re
 import subprocess
@@ -345,10 +346,255 @@ def failing_files(text):
                    for ln in text.splitlines() if ln.startswith("FAILED")})
 
 
+def _stem_forms(path):
+    """Query strings to look this failing file up by. BOTH forms are required.
+
+    MEASURED 2026-07-31 (echo, cc-03), and this is the whole reason the
+    ownership step is worth automating rather than eyeballing:
+    `aspirations-query.sh --title-contains` is a substring match on the TITLE
+    ONLY, and goal titles routinely drop the `test_` prefix. Querying
+    "test_fleet_config_parity" returns 0 hits; querying "fleet_config_parity"
+    returns 3 -- including g-115-3803, the OPEN goal that owns it.
+
+    So an ownership check keyed on the file stem alone reports UNOWNED for a
+    tracked test, and the caller then files a duplicate goal. That is the exact
+    inversion of what this step exists to prevent, and it fails silently.
+
+    `--goal-field description <name>` is NOT a substitute: it is an EXACT
+    field match, not a substring search. It returns 0 on g-115-3803, whose
+    description provably contains the literal string (verified in the same
+    turn; `--goal-field status pending` returns 915, so the flag works -- it
+    just does not mean "contains").
+    """
+    stem = Path(path).stem
+    forms = [stem]
+    if stem.startswith("test_"):
+        forms.append(stem[len("test_"):])
+    return forms
+
+
+OPEN_STATUSES = ("pending", "in-progress")
+
+
+def _owning_goals(path, root):
+    """Open goals in EITHER queue that name this test, in TITLE **or DESCRIPTION**.
+
+    SEARCHING TITLES ALONE IS NOT ENOUGH, and this cost a near-duplicate filing
+    on this feature's first live use (2026-07-31, echo, cc-03). Two genuine reds
+    -- test_merge_handlers_commutativity_property and
+    test_meta_write_class_conflict_retry -- came back "owner: NONE". They were
+    owned: g-115-4310 is pending and its DESCRIPTION names both files. Its title
+    is "Fix: merge_backpressure breaks two pins -- not byte-commutative
+    (guard-907) and it flipped backpressure.yaml to MERGE-PROTECTED", which
+    names the DEFECT, not the test files.
+
+    That is how a good goal title is written, so this is the common case rather
+    than an edge one: the better the title, the less likely it contains a test
+    filename. `_stem_forms` fixed the query STRING; this fixes the searched
+    FIELD, and they are independent -- neither alone finds g-115-4310.
+
+    Implementation note: `aspirations-query.sh` has no description-substring
+    filter (`--goal-field` is EXACT match), so this pulls the open queues by
+    status in one call per status and substring-scans in-process. That still
+    goes through the sanctioned script rather than reading the JSONL directly.
+
+    OPEN statuses only. A COMPLETED goal that named this test is not an owner:
+    it means the test was fixed and has regressed, which is precisely a thing to
+    file rather than suppress.
+    """
+    from _runtime_bash import BASH  # rb-1472: never a bare "bash" argv[0]
+    # Boundary-aware, NOT a bare substring. The stripped form of a short name is
+    # a common English fragment: `test_thing.py` yields "thing", which
+    # substring-matches "nothing", "something", "anything". That direction of
+    # error is the silent one -- spurious owners suppress ALL filing, and a
+    # suppressed filing leaves no trace to notice. Caught by this feature's own
+    # test on the stripped-form case.
+    #
+    # The left class excludes letters/digits but DELIBERATELY allows `_`: the
+    # stripped form is normally preceded by exactly that, in `test_<form>`.
+    # Excluding `_` on the left would break the very match this form exists for.
+    pats = [re.compile(r"(?<![A-Za-z0-9])" + re.escape(f.lower()) + r"(?![A-Za-z0-9_])")
+            for f in _stem_forms(path)]
+    seen, out = set(), []
+    for status in OPEN_STATUSES:
+        try:
+            r = subprocess.run(
+                [BASH, str(SCRIPT_DIR / "aspirations-query.sh"),
+                 "--goal-status", status, "--full"],
+                capture_output=True, text=True, cwd=str(root), timeout=120)
+        except Exception:
+            continue
+        if r.returncode != 0:
+            continue
+        try:
+            rows = json.loads(r.stdout or "[]")
+        except Exception:
+            continue
+        if isinstance(rows, dict):
+            rows = rows.get("goals") or rows.get("results") or []
+        for g in rows or []:
+            gid = g.get("goal_id") or g.get("id")
+            if not gid or gid in seen:
+                continue
+            hay = ((g.get("title") or "") + " " + (g.get("description") or "")).lower()
+            if any(p.search(hay) for p in pats):
+                seen.add(gid)
+                out.append((gid, g.get("status") or "?", (g.get("title") or "")[:64]))
+    return out
+
+
+def _recent_commits(path, root, days=7):
+    try:
+        r = subprocess.run(
+            ["git", "log", "--oneline", "-n", "5", "--since=%d.days" % days,
+             "--", path],
+            capture_output=True, text=True, cwd=str(root), timeout=60)
+    except Exception:
+        return []
+    return [ln for ln in (r.stdout or "").splitlines() if ln.strip()]
+
+
+def _solo(path, root, env):
+    """Re-run ONE file alone. Green solo => environmental; red solo => genuine.
+
+    The discriminator that falsifies contention in a single measurement
+    (guard-1448): with no competing processes there is nothing to contend for,
+    so a failure that survives is the code's.
+    """
+    try:
+        r = subprocess.run([sys.executable, "-m", "pytest", path, "-q"],
+                           capture_output=True, text=True, cwd=str(root),
+                           env=env, timeout=1800)
+    except Exception as exc:
+        return None, None, str(exc)
+    p, f, e = _parse_counts(r.stdout or "")
+    return p, f + e, None
+
+
+def _print_ownership(path, root, indent="      "):
+    """Step 5. Print who owns this failing file, or say plainly that nobody does.
+
+    Deliberately prints on BOTH branches. A silent "no owner" is
+    indistinguishable from "the check did not run", which is how a GENUINE
+    failure sat unowned for a day while run-full-suite-after-deep-code.md told
+    every reader it was tracked.
+    """
+    owners = _owning_goals(path, root)
+    commits = _recent_commits(path, root)
+    if owners:
+        for gid, status, title in owners:
+            print("%sowner: %s [%s] %s" % (indent, gid, status, title))
+    else:
+        print("%sowner: NONE -- no goal in either queue names this test" % indent)
+    if commits:
+        print("%srecent commits (7d): %s" % (indent, commits[0]))
+    else:
+        print("%srecent commits (7d): none" % indent)
+    return owners
+
+
+def triage(out, root, env):
+    """Consume ALREADY-WRITTEN chunk logs and triage them. Does NOT re-run the suite.
+
+    The run half of this tool has always printed a verdict; nothing covered what
+    to do when that verdict is not CLEAN, so the four-step triage was re-derived
+    by hand every time (gap-053: twice in two days, a full iteration each). Every
+    input is already on disk in the chunk logs, so this reads them rather than
+    paying for another ~30min run.
+
+    Order matters and is not arbitrary:
+      1. positional bucket + completeness -- reuses classify(), so the verdict
+         here can never disagree with the verdict the run printed
+      2. solo re-run per candidate    -- falsifies contention in ONE measurement
+      3. ownership, per genuine red   -- the step that keeps getting skipped
+      4. report only what survives all three
+    """
+    logs = sorted(out.glob("chunk-*.log"))
+    if not logs:
+        print("run-full-suite --triage: no chunk-*.log in %s" % out, file=sys.stderr)
+        print("  --triage reads the logs a run wrote; run the suite first, or "
+              "point --out at the directory that has them.", file=sys.stderr)
+        return 3
+
+    combined = [p.read_text(encoding="utf-8", errors="replace") for p in logs]
+    blob = "\n".join(combined)
+    tot_f = sum(_parse_counts(t)[1] for t in combined)
+    verdict, reasons = classify(blob, tot_f, chunks=combined)
+    candidates = failing_files(blob)
+
+    print("=" * 66)
+    print("TRIAGE: %d chunk log(s) in %s" % (len(logs), out))
+    print("verdict on record: %s | %d failing file(s)"
+          % (verdict.upper(), len(candidates)))
+    for r in reasons:
+        print("  - %s" % r)
+
+    if not candidates:
+        # A contended verdict with NOTHING in the FAILED list is the common and
+        # most deceptive shape: every per-chunk line reads "0 failed" and the
+        # TOTAL looks like a pass. The defect is an incomplete chunk, not a
+        # failing test, so there is nothing to solo-run -- say so explicitly
+        # rather than printing an empty table that reads as all-clear.
+        print("\nNo FAILED lines to triage.")
+        if verdict == "contended":
+            print("The problem is COMPLETENESS, not a failing test: a chunk did "
+                  "not finish, so the totals are missing its tests.")
+            print("Re-run with more --chunks; do not read the totals above.")
+            print("=" * 66)
+            return 2
+        print("=" * 66)
+        return 0
+
+    print("\nStep 2-3: solo re-run + ownership, per candidate")
+    genuine_unowned, genuine_owned, environmental, errored = [], [], [], []
+    for path in candidates:
+        n = blob.count("FAILED " + path)
+        print("\n  %s (%d failure line(s) in the run)" % (path, n))
+        p, f, err = _solo(path, root, env)
+        if err is not None:
+            print("      solo: COULD NOT RUN (%s) -- not classified" % err[:80])
+            errored.append(path)
+            continue
+        if f == 0:
+            print("      solo: %d passed, 0 failed -> ENVIRONMENTAL (do not file)" % p)
+            environmental.append(path)
+            continue
+        print("      solo: %d passed, %d failed -> GENUINE" % (p, f))
+        owners = _print_ownership(path, root)
+        (genuine_owned if owners else genuine_unowned).append(path)
+
+    print("\n" + "=" * 66)
+    print("TRIAGE RESULT: %d environmental | %d genuine-owned | %d genuine-UNOWNED"
+          % (len(environmental), len(genuine_owned), len(genuine_unowned)))
+    if errored:
+        print("  %d candidate(s) could not be re-run -- unclassified: %s"
+              % (len(errored), ", ".join(errored)))
+    if genuine_unowned:
+        print("\nFILE THESE -- genuine, reproduce solo, and no goal names them:")
+        for path in genuine_unowned:
+            print("  %s" % path)
+    elif not errored:
+        # These two are NOT the same finding and must not share a sentence.
+        # "every genuine red is owned" says reds exist and are tracked; "none
+        # reproduced" says the run's failures were not real. Collapsing them
+        # would report a fully-environmental run as though it had confirmed
+        # regressions under management.
+        if genuine_owned:
+            print("\nNothing to file: every genuine red already has an owning goal.")
+        else:
+            print("\nNothing to file: no candidate reproduced solo -- all %d were "
+                  "environmental, so the run's failures were not regressions."
+                  % len(environmental))
+    print("=" * 66)
+    return 1 if (genuine_unowned or errored) else 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--chunks", type=int, default=4,
                     help="fresh processes to split across (default 4)")
+    ap.add_argument("--triage", action="store_true",
+                    help="triage the chunk logs already in --out; does NOT re-run the suite")
     ap.add_argument("--out", default=None,
                     help="log directory (default: agents/<agent>/temp/suite-run)")
     ap.add_argument("--include-daemon-integration", action="store_true",
@@ -369,9 +615,39 @@ def main(argv=None):
         PROJECT_ROOT / "agents" / (agent or "shared") / "temp" / "suite-run")
     out.mkdir(parents=True, exist_ok=True)
 
+    if args.triage:
+        # Constraint 1 governs the solo re-runs too -- they are real pytest
+        # invocations against the real tree, so an unpinned backend can collide
+        # on the production S3 key exactly as a full run would (guard-955).
+        env = dict(os.environ)
+        env["STORAGE_BACKEND"] = "local"
+        env["PYTHONUNBUFFERED"] = "1"
+        return triage(out, PROJECT_ROOT, env)
+
+    # ONE run per log dir, always. --triage globs chunk-*.log, so a leftover
+    # chunk from an earlier run at a DIFFERENT --chunks count silently joins the
+    # evidence for this one. MEASURED 2026-07-31 (echo, cc-03) on this feature's
+    # own first live use: a 16-chunk run left chunk-16..19 behind from a 20-chunk
+    # run 7.5h earlier, and --triage read 20 logs for a 16-chunk run. Those four
+    # happened to carry no FAILED lines, so the verdict was right by luck -- a
+    # stale FAILED would have injected a phantom candidate, and a stale
+    # INCOMPLETE chunk would have made classify() call a healthy run contended.
+    # This tool exists to refuse an invalid measurement; it must not assemble one
+    # out of two runs.
+    for old in out.glob("chunk-*.log"):
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
     # Non-recursive glob per root, matching pytest's own default discovery for
     # these trees (all three are flat -- verified 2026-07-31: 0 nested test
     # files across 761). A root that grows subdirectories will need rglob.
+    # Merge note (echo, 2026-07-31): this multi-root form REPLACED a single-root
+    # `TESTS_DIR.glob(...)` that this box's lineage still carried. Keeping the
+    # single-root line would have silently defeated _testpaths() entirely --
+    # TESTS_DIR is now only the last-resort fallback (see its definition), so
+    # the two are not interchangeable and this is not a cosmetic conflict.
     files = sorted(str(p) for d in testpaths for p in d.glob("test_*.py"))
     if not files:
         print("run-full-suite: no test files found under %s"
@@ -443,6 +719,16 @@ def main(argv=None):
         print("VERDICT: GENUINE failures -- trustworthy, act on them")
         for f in files_failing:
             print("  %s (%d)" % (f, blob.count("FAILED " + f)))
+            # Step 5 inline, because it is cheap (two queries + a git log) and
+            # because it is the step that keeps getting skipped when it is
+            # merely documented. "Pre-existing" is not "tracked": a wrong
+            # tracking ID sat in run-full-suite-after-deep-code.md for a day
+            # while a GENUINE failure was unowned and every reader was told it
+            # was handled. Solo discrimination is NOT run here -- that costs a
+            # pytest invocation per file; use --triage for the full chain.
+            _print_ownership(f, PROJECT_ROOT)
+        print("\nRun `run-full-suite.sh --triage` to solo-discriminate these "
+              "before filing (green solo => environmental, not a regression).")
         print("=" * 66)
         return 1
 

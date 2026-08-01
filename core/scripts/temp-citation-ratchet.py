@@ -45,7 +45,8 @@ grandfathered, and only GROWTH is reported.
 
 Exit codes:
   0  always (advisory), unless VERIFY_LEARNING_DRIFT_HARD_GATE=1 and regressed
-  2  script error (unreadable store, unwriteable baseline file)
+  2  script error (unreadable store, unwriteable baseline file), OR --cited-paths
+     could not determine the cited set (see that flag's fail-loud contract)
 """
 from __future__ import annotations
 
@@ -132,11 +133,19 @@ def _scan_tree(tree_dir: Path):
 def _compute():
     breakdown, total, scanned = {}, 0, 0
     missing = []
+    # Distinct cited temp/ paths, collected alongside the (record, path) pair
+    # count. The COUNT is the ratchet's metric; the PATHS are what
+    # temp-drain-purge.sh Lane 1 exempts from its purge-by-default predicate
+    # (temp-store.md § The third class, criterion (a)(1) "Cited"). Same scan,
+    # two consumers — the D2 decision's "no new counter is needed" holds only
+    # because the pairs this function already builds are made reachable here.
+    paths: set[str] = set()
     tree_dir = WORLD_DIR / "knowledge" / "tree"
     tree_pairs, tree_files = _scan_tree(tree_dir)
     breakdown["tree"] = len(tree_pairs)
     total += len(tree_pairs)
     scanned += tree_files
+    paths.update(p for _, p in tree_pairs)
     if not tree_dir.is_dir():
         missing.append("knowledge/tree")
     for fn in JSONL_STORES:
@@ -145,10 +154,12 @@ def _compute():
         breakdown[fn.replace(".jsonl", "")] = len(pairs)
         total += len(pairs)
         scanned += records
+        paths.update(q for _, q in pairs)
         if not p.is_file():
             missing.append(fn)
     return {"total": total, "breakdown": breakdown,
-            "units_scanned": scanned, "stores_missing": missing}
+            "units_scanned": scanned, "stores_missing": missing,
+            "cited_paths": sorted(paths)}
 
 
 def main():
@@ -156,6 +167,10 @@ def main():
     ap.add_argument("--json", action="store_true", help="Emit JSON")
     ap.add_argument("--dry-run", action="store_true",
                     help="Compute and report without touching the baseline file")
+    ap.add_argument("--cited-paths", action="store_true",
+                    help="Print the distinct cited temp/ paths, one per line, and exit "
+                         "(pure read — never touches the baseline). Exit 2 when the "
+                         "cited set is UNKNOWN rather than empty.")
     args = ap.parse_args()
 
     try:
@@ -163,6 +178,23 @@ def main():
     except Exception as e:
         print(f"ERROR: temp-citation audit failed: {e}", file=sys.stderr)
         return 2
+
+    if args.cited_paths:
+        # FAIL LOUD, NEVER EMPTY. The consumer (temp-drain-purge.sh Lane 1)
+        # EXEMPTS these paths from deletion, so "unknown" and "none" must not
+        # render identically: an empty stdout with rc=0 would read as "nothing
+        # is cited, purge freely" on exactly the box where the world is
+        # unmounted and nothing could be read. rc=2 makes the caller degrade to
+        # its conservative allow-list instead. Same vacuous-zero reasoning as
+        # the ratchet's own units_scanned guard below (rb-245), but the stakes
+        # invert: here a false zero DELETES.
+        if current["units_scanned"] == 0:
+            print("ERROR: no tree node or durable-store row was readable — the cited "
+                  "set is UNKNOWN, not empty (check WORLD_DIR resolution)", file=sys.stderr)
+            return 2
+        for p in current["cited_paths"]:
+            print(p)
+        return 0
 
     if current["units_scanned"] == 0:
         # No tree node and no store row was readable. Reporting 0 citations here

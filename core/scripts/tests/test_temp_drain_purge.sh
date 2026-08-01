@@ -60,7 +60,7 @@ else
 fi
 # : main() must emit the new lane fields (else a downstream JSON
 # consumer of drained_gc_*/stray_* silently sees nulls).
-for k in '"drained_gc_would_purge"' '"stray_would_purge"' '"drained_age_days"'; do
+for k in '"drained_gc_would_purge"' '"stray_would_purge"' '"drained_age_days"' '"citation_lookup"'; do
   if printf '%s' "$out" | grep -q "$k"; then
     echo "  [PASS] dry-run JSON carries $k"
   else
@@ -85,7 +85,7 @@ else
 fi
 # All 5 lane fields the fresh-eyes finding flagged as omitted from THIS branch MUST
 # be present so both exit paths share ONE schema ().
-for k in '"drained_gc_purged"' '"drained_gc_would_purge"' '"stray_purged"' '"stray_would_purge"' '"drained_age_days"'; do
+for k in '"drained_gc_purged"' '"drained_gc_would_purge"' '"stray_purged"' '"stray_would_purge"' '"drained_age_days"' '"citation_lookup"'; do
   if printf '%s' "$nt_out" | grep -q "$k"; then
     echo "  [PASS] no-temp-dir JSON carries $k"
   else
@@ -227,6 +227,117 @@ for neg in design-notes.md realdata.json fresh.raw old.md .gitkeep .hidden-marke
   fi
 done
 rm -rf "$SYNTH"
+
+echo "third-class inversion (g-306-111) — purge-by-default with exemptions:"
+# Every assertion below FAILS against the pre-inversion allow-list, which is the
+# point: the block above passes identically before and after  (it only
+# covers behavior the inversion preserves), so it proves nothing about the new
+# predicate. One distinct mutation per constraint (guard-1861).
+SYNTH2="$(mktemp -d)"
+mkdir -p "$SYNTH2/drained"
+# THIRD CLASS — the complement of drain (.md/.json) and the old 8-extension
+# purge list. Unreachable by BOTH lanes before the inversion, which is why it
+# accrued without bound. Suffixes drawn from the cc-02 2026-07-31 census,
+# including a one-off a single goal invented (.premutation) and an
+# extensionless file, to pin that the predicate keys on the COMPLEMENT rather
+# than on any enumerated list.
+for f in census.jsonl config.yaml rows.tsv archive.gz notes.eml sum.sha256 patch.patch weird.premutation extensionless; do
+  printf 'content\n' > "$SYNTH2/$f"
+done
+# EXEMPTION (ii) — non-empty .md/.json still drain, never purge
+printf '# doc\n'   > "$SYNTH2/keep-doc.md"
+printf '{"k":1}\n' > "$SYNTH2/keep-data.json"
+# EXEMPTION (iii) — a THIRD-CLASS file cited by a durable record. Without the
+# cited-set exemption this is indistinguishable from the purgeable files above,
+# so it is the one case that proves the exemption is wired, not just declared.
+printf 'cited\n'   > "$SYNTH2/cited-evidence.jsonl"
+touch -d '200 minutes ago' "$SYNTH2"/*
+# EXEMPTION (i) — dotfile, aged past the guard
+: > "$SYNTH2/.gitkeep"; touch -d '200 minutes ago' "$SYNTH2/.gitkeep"
+# NEGATIVE: under drained/ — maxdepth must still exclude it
+printf 'archived\n' > "$SYNTH2/drained/old.jsonl"; touch -d '200 minutes ago' "$SYNTH2/drained/old.jsonl"
+
+PURGE_FIND_PRED=()
+_purge_find_predicate 120 cited-evidence.jsonl
+got2="$(find "$SYNTH2" "${PURGE_FIND_PRED[@]}" 2>/dev/null | sed 's#.*/##' | sort | tr '\n' ' ')"
+want2="archive.gz census.jsonl config.yaml extensionless notes.eml patch.patch rows.tsv sum.sha256 weird.premutation "
+if [ "$got2" = "$want2" ]; then
+  echo "  [PASS] 9 third-class files purge (9 suffix shapes incl. one-off + extensionless)"
+else
+  echo "  [FAIL] third-class matched set mismatch"; echo "         got:  $got2"; echo "         want: $want2"; fails=$((fails+1))
+fi
+for neg in keep-doc.md keep-data.json cited-evidence.jsonl .gitkeep old.jsonl; do
+  if printf '%s' "$got2" | grep -qF "$neg"; then
+    echo "  [FAIL] $neg must NOT be purged but matched"; fails=$((fails+1))
+  else
+    echo "  [PASS] $neg correctly exempt"
+  fi
+done
+
+# The FAIL-CLOSED fallback. When the cited set is unknown, main() uses the
+# legacy allow-list — which must reach NONE of the third class, or the
+# degradation would still delete files it cannot prove are uncited.
+PURGE_FIND_PRED=()
+_purge_find_predicate_legacy 120
+got3="$(find "$SYNTH2" "${PURGE_FIND_PRED[@]}" 2>/dev/null | sed 's#.*/##' | sort | tr '\n' ' ')"
+if [ -z "$got3" ]; then
+  echo "  [PASS] legacy fallback matches NO third-class file (fail-closed degrade)"
+else
+  echo "  [FAIL] legacy fallback matched: $got3"; fails=$((fails+1))
+fi
+rm -rf "$SYNTH2"
+
+echo "cited-pattern breadth guard (g-306-111):"
+# Wildcards in cited paths are REAL and must be honored (measured: 4 of 64 live
+# cited paths carry one). But a pattern matching ANY name would exempt every
+# file and silently revert the inversion — the failure that looks like success.
+SYNTH3="$(mktemp -d)"
+printf 'x\n' > "$SYNTH3/g-335-531-residue.py"
+printf 'x\n' > "$SYNTH3/unrelated.jsonl"
+touch -d '200 minutes ago' "$SYNTH3"/*
+# A family wildcard exempts its family and NOTHING else.
+PURGE_FIND_PRED=(); _purge_find_predicate 120 'g-335-531-*'
+g4="$(find "$SYNTH3" "${PURGE_FIND_PRED[@]}" 2>/dev/null | sed 's#.*/##' | sort | tr '\n' ' ')"
+if [ "$g4" = "unrelated.jsonl " ]; then
+  echo "  [PASS] family wildcard 'g-335-531-*' exempts its family only"
+else
+  echo "  [FAIL] family wildcard: got '$g4' want 'unrelated.jsonl '"; fails=$((fails+1))
+fi
+# An over-broad pattern must be DROPPED, not honored — else the lane empties.
+PURGE_FIND_PRED=(); _purge_find_predicate 120 '*' 2>/dev/null
+g5="$(find "$SYNTH3" "${PURGE_FIND_PRED[@]}" 2>/dev/null | sed 's#.*/##' | sort | tr '\n' ' ')"
+if [ "$g5" = "g-335-531-residue.py unrelated.jsonl " ]; then
+  echo "  [PASS] over-broad '*' dropped — lane still purges (cannot silently self-disable)"
+else
+  echo "  [FAIL] over-broad '*' was honored, lane emptied: got '$g5'"; fails=$((fails+1))
+fi
+if _purge_find_predicate 120 '*' 2>&1 >/dev/null | grep -q 'over-broad'; then
+  echo "  [PASS] over-broad exemption warns on stderr (never silent)"
+else
+  echo "  [FAIL] over-broad exemption dropped SILENTLY"; fails=$((fails+1))
+fi
+rm -rf "$SYNTH3"
+
+echo "cited-set lookup contract (g-306-111):"
+# UNKNOWN must be distinguishable from EMPTY, or a box with an unreadable world
+# purges everything. The missing-script case is the hermetic proxy for that.
+if _cited_basenames "/nonexistent-dir-for-temp-drain-test-zzz" >/dev/null 2>&1; then
+  echo "  [FAIL] _cited_basenames returned 0 for a missing script — caller would purge-by-default on an unknown cited set"; fails=$((fails+1))
+else
+  echo "  [PASS] _cited_basenames returns non-zero when the cited set is UNKNOWN"
+fi
+# Success path against the live corpus. A world this box cannot read is a
+# legitimate environment (satellite box), so that is a SKIP, not a FAIL —
+# the fail-closed contract above is what protects that case.
+if cb_out="$(_cited_basenames "$SCRIPT_DIR/.." 2>/dev/null)"; then
+  if printf '%s' "$cb_out" | grep -q '/'; then
+    echo "  [FAIL] _cited_basenames emitted a path, not a basename: $(printf '%s' "$cb_out" | grep -m1 '/')"; fails=$((fails+1))
+  else
+    echo "  [PASS] _cited_basenames emits basenames only ($(printf '%s\n' "$cb_out" | grep -c . || true) cited)"
+  fi
+else
+  echo "  [SKIP] cited-set unreadable on this box — fail-closed path covered above"
+fi
 
 if [ "$fails" -gt 0 ]; then echo ""; echo "$fails failure(s)"; exit 1; fi
 echo ""

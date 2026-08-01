@@ -679,7 +679,9 @@ When sq-009 (or sq-c09 experiential variant) fires, it creates a hypothesis goal
         Experience JSON:
             id: "{experience_id}"
             type: "hypothesis_formation"
-            created: "{ISO timestamp}"
+            # `created` is SCRIPT-OWNED (experience.md schema) — stamped at add
+            # time; do NOT supply it on stdin. A supplied value is silently
+            # overridden, so a timestamp written here is never the one stored.
             category: "{hypothesis category}"
             summary: "Hypothesis: {claim} (confidence: {N})"
             goal_id: "{goal.id}"   # CANONICAL join key (experience.md schema). The recurring-close 4.25 canary and experience-read --goal match on THIS field — omitting it made template-written entries invisible to both (g-115-2511: writers drifted to source_goal by analogy with the rb/guardrail stores, false-firing force_experience_archival on deep closes)

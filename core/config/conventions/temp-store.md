@@ -108,21 +108,30 @@ DIRECTLY under `temp/` that is NOT `drained/` and is untouched past the
 `gNNN-session/`) that neither the ephemera purge (`-type f`) nor the `.md`/
 `.json` drain ever reach.
 
-## Pure ephemera (.log/.txt/.py/.sh/.err/.raw/.out/.bak + 0-byte empties) — purged, not drained
+## Everything that is not a content-bearing `.md`/`.json` — purged, not drained
 
-temp/ holds TWO file classes, and only ONE of them drains:
+temp/ holds THREE file classes. One drains; the other two are purged. As of
+g-306-111 Lane 1 is **purge-by-default with exemptions**, not an allow-list of
+extensions — so the third class is bounded BY THE PREDICATE rather than by a
+list that goes stale on the next goal (see § The third class, below):
 
 | Class | Extensions | Carries knowledge? | `/drain-temp` action |
 |---|---|---|---|
-| Drainable working docs | `.md`, `.json` (with content) | Yes — analyses, briefings, designs | Encode to tree/RB/experience, then move to `drained/` |
-| Pure ephemera | `.log`, `.txt`, `.py`, `.sh`, `.err`, `.raw`, `.out`, `.bak` | No — test-suite output, tool dumps, one-off scratch scripts, raw command-output dumps, backup copies | **Purge (delete)** in Phase 1.5, once older than a 120-min age guard |
+| Drainable working docs | `.md`, `.json` (with content) | Yes — analyses, briefings, designs | **Exempt from purge.** Encode to tree/RB/experience, then move to `drained/` |
+| Pure ephemera | `.log`, `.txt`, `.py`, `.sh`, `.err`, `.raw`, `.out`, `.bak` — **common examples, NOT a closed list** (these 8 WERE the whole lane pre-g-306-111; they are now merely the frequent members of the row below) | No — test-suite output, tool dumps, one-off scratch scripts, raw command-output dumps, backup copies | **Purge (delete)** in Phase 1.5, once older than a 120-min age guard |
 | Empty scratch | ANY name **except dotfiles**, 0 bytes (`-empty`) | No — nothing was ever written | **Purge (delete)** in Phase 1.5, once older than the 120-min age guard |
+| **Third class** (the complement) | everything else — `.jsonl`, `.yaml`, `.xml`, `.tsv`, `.gz`, `.eml`, `.sha256`, and any suffix a goal invents | Sometimes | **Purge (delete)** past the same 120-min guard, UNLESS cited by a durable record (§ The third class (a)(1)). Cited-but-unwrapped files survive so they can be promoted into a receipted dir. |
 
-> ⚠ **`.py`, `.sh`, `.raw`, `.out`, `.bak`, and 0-byte files are purged too.**
-> The glob in `core/scripts/temp-drain-purge.sh` is
-> `*.log, *.txt, *.py, *.sh, *.err, *.raw, *.out, *.bak` OR `-empty` (0-byte,
-> any name). A one-off helper script, a raw command-output dump
-> (`selector.raw`, `probe.out`), a `.bak`, or an empty scratch file left in
+> ⚠ **Anything that is not a content-bearing `.md`/`.json` is purged.**
+> Since g-306-111 the predicate in `core/scripts/temp-drain-purge.sh`
+> (`_purge_find_predicate`) is an INVERSION: it matches every depth-1 file
+> EXCEPT (i) dotfiles, (ii) `.md`/`.json` **with content** — 0-byte ones still
+> purge, since nothing was written to drain — and (iii) basenames cited by a
+> durable record. So `.py`, `.sh`, `.raw`, `.out`, `.bak`, 0-byte files, AND
+> every third-class suffix (`.jsonl`, `.yaml`, `.tsv`, `.gz`, one-offs a goal
+> invents) are all purged. A one-off helper script, a raw command-output dump
+> (`selector.raw`, `probe.out`), a `.bak`, a `.jsonl` scratch dump, or an empty
+> scratch file left in
 > `temp/` **will be deleted** once it is >120 min old. That is the intended
 > behaviour (these are ephemera), but do not leave a script or dump you want to
 > keep here — promote a script to `core/scripts/`/`world/scripts/`, and encode a
@@ -201,6 +210,136 @@ construct an `rm` on a variable path MUST guard the variable (set + non-empty +
 expected-shape) first, or route through a helper that does. An unguarded `rm` on
 a possibly-empty variable is an agent-hang hazard, not just a data-loss hazard —
 the dialog it triggers cannot be answered by an autonomous agent.
+
+## The third class: promotion threshold + durable home (D2 decision)
+
+Both lanes above are **allow-lists**. Drain matches `.md`/`.json`; purge matches
+eight named extensions plus 0-byte. Everything else is the COMPLEMENT of two
+enumerated sets, so the third class is unbounded *by construction* — not by
+oversight. An extension list can never close it, because its members are
+invented per-goal: measured on `cc-02` 2026-07-31, 70 third-class files carried
+**21 distinct suffixes**, 8 of them one-offs a single goal made up (`.premutation`,
+`.pre2`, `.mutated`, `.mine`, `.bak-preiam-cutover`, `.12`, `.test`, `.patch`).
+Enumerating those would have been a fresh list, stale on the next goal.
+
+### (a) The load-bearing threshold
+
+An artifact is **load-bearing** iff BOTH hold:
+
+1. **Cited** — at least one durable record (tree node, RB entry, guardrail,
+   experience, convention, goal) references it by path. `core/scripts/temp-citation-ratchet.py`
+   already computes these `(record, path)` pairs; no new counter is needed.
+2. **Un-inlinable** — its content cannot be folded into the citing record.
+
+Threshold is **≥1 citation, not ≥2.** This is forced by measurement, not chosen
+for leniency: `artifact-reference-integrity.md` (D3) measured inbound-reference
+counts for *moving* artifacts at **median 1, max 4**, with 283 of 305 carrying
+exactly one. So a threshold at 2 retains 22 of 305 (7%) and a threshold at 3
+retains 4 (1.3%) — either discards the overwhelming majority of genuinely-cited
+artifacts to buy a distinction the data does not support. Above 1 there is
+almost no distribution left to threshold on, which is why the citation test is
+a **boolean** (cited at all?) rather than a tunable count.
+
+**Age is explicitly rejected as the gate** (guard-2071: an age-gated evictor
+cannot bound a rate-driven store). Measured accrual here is **6.1 files/day**
+(43 of the 70 arrived within 7 days; 0 exceeded 30 days). Any age-only gate with
+window *W* leaves ~`6.1 × W` files resident — **~184 at a 30-day window**. The
+bound must come from the PREDICATE (what is eligible to persist), never from the
+window. The current apparent boundedness — 0 files older than 30d despite no
+matching purge lane — comes from **ad-hoc manual gardening by whichever agent
+notices**, which is not a mechanism and must not be cited as one.
+
+Everything textual folds. Per D3, FOLDING — dissolve the pointer, inline the
+detail — is the sanctioned remedy, and `.jsonl`/`.yaml`/`.xml`/`.tsv` (50 of the
+70 measured) all fold into a citing node. Folding is the DEFAULT; promotion is
+the exception.
+
+### (b) The durable home — and why it is not a new directory
+
+**No new store, and no new top-level entry.** D3 already decided the neighbouring
+question with "no new node type, no new store, no schema change," and the L1
+path-resolution hook refuses a new top-level entry under any governed root
+regardless (`.claude/rules/path-resolution.md`) — so inventing `world/artifacts/`
+is not available even if it were desirable.
+
+The home is a **receipted directory**: `agents/<agent>/temp/<slug>/` containing
+the artifact plus a top-level `RECEIPT.md`. This is not a new mechanism — Lane 3
+(`cleanup_stray_dirs`) **already** preserves exactly this shape, skipping any
+stray dir carrying `RECEIPT.md` or `.archive-marker` (g-115-2962/guard-1377).
+Promotion is therefore "wrap the file in a receipted dir," not "build a home."
+
+The `RECEIPT.md` is what keeps this from repeating the `reports/` freeze. That
+directory was frozen (see § Migration) because it became *a second, disconnected
+retrieval surface* — invisible to `/prime` and `retrieve.sh`, so its contents
+were lost knowledge regardless of which folder held them. The failure was never
+the location; it was that **nothing pointed in**. A receipted dir is sanctioned
+ONLY while criterion (1) holds: a durable record cites it, so it is reachable
+THROUGH the retrieval surface rather than being a parallel one. An uncited
+receipted dir is the reports/ defect wearing a marker, and the receipt must name
+its citing record.
+
+### What this measures out to, and the residual defect
+
+On `cc-02` 2026-07-31, of 70 third-class files exactly **one** was genuinely
+un-inlinable (`g-335-258-archive.tar.gz`; the only other binary was `ruff` inside
+a stray vendored virtualenv, a Lane 3 stray-dir case, not a file case). That one
+file is **cited by nothing** — grep across the agent tree, `core/config`,
+`.claude`, `world/`, and `meta/` returned zero references. So the population
+actually needing a durable home here is **zero**, and the correct action is to
+build nothing.
+
+Do not read that as universal. The class composition is **deployment-dependent**,
+and that is measured, not speculative. A downstream deployment censused its own
+temp/ root on 2026-07-30 (`g-029-87`, recorded in `core/scripts/precheck-eval.py`)
+and found 26 files where the pressure metric reported 7 — a 3.7x undercount whose
+missing 19 were **6 `.pdf`, 4 `.yaml`, 4 `.docx`, 2 `.jsonl`, 1 `.ps1`, and 1
+extensionless**. That deployment's un-inlinable set is genuinely non-empty
+(`.pdf`/`.docx` fold into nothing), where this box's is a single uncited tarball.
+Same class, opposite population — which is exactly why the rule is written on
+FOLDABILITY rather than on any one box's extension census.
+
+That goal reached the same verdict from the metrics side and is worth quoting,
+because it is independent confirmation rather than an echo: unclassified files are
+"not drain-drainable and not purgeable, so counting them toward the drain threshold
+would fire drain goals that cannot drain them. **Visibility is the fix; changing
+threshold semantics is not.**" `unclassified_count` is that visibility. This
+decision supplies the half it deliberately left open — what to DO with the files
+once seen.
+
+Note the asymmetry that makes the one measured artifact interesting: it is an
+archive-before-delete archive — precisely what guard-1377's preservation exists
+to protect — and the preservation could not see it, because `cleanup_stray_dirs`
+matches `-type d` only. A durable artifact is protected if it is a DIRECTORY and
+unmanaged if it is a FILE.
+
+**The residual defect was retention, not addressing.** D3 reached that same
+sentence from the reference-integrity side; this decision reached it independently
+from the lifecycle side. That work — inverting Lane 1's predicate so the
+complement is purgeable-by-default with the load-bearing set exempted — **landed
+in g-306-111** (`_purge_find_predicate`, plus the class table above).
+
+Three things measured during that change are worth carrying forward, because
+none was predicted by the decision above:
+
+1. **Cited paths are not all literal.** 4 of 64 live cited paths are WILDCARDS
+   (`…/temp/g-335-531-*`, `…/temp/mergeback-*.json`) — durable records cite a
+   FAMILY, not a file. The exemption honors them: escaping to a literal would
+   match nothing and delete the very family the citation names. The one form
+   that is refused is a pattern matching ANY filename (`*`), which a single
+   citation could otherwise use to exempt everything and silently revert the
+   inversion. That case warns on stderr and is dropped.
+2. **The lane fails CLOSED, not open.** When the cited set cannot be determined
+   (unmounted world, missing script), `temp-citation-ratchet.py --cited-paths`
+   exits 2 rather than printing an empty list, and Lane 1 degrades to the
+   pre-inversion allow-list — never to purge-everything. "Unknown" and "nothing
+   is cited" must not render identically when the consumer DELETES on the
+   answer. The run reports which happened via `citation_lookup` in its JSON.
+3. **Measured blast radius on the first box (`cc-03`, 2026-07-31):** 252 →
+   264 would-purge, i.e. **13 files newly exposed** (9 `.jsonl`, 1 `.mjs`,
+   1 `.yaml`, 1 `.tsv` — all raw IO dumps), and **1 file newly PROTECTED**
+   (`g-335-531-residue-classify.py`, saved by a cited-family wildcard that the
+   old allow-list would have deleted as a `.py`). The inversion is therefore
+   not purely more-aggressive: it also stops orphaning cited evidence.
 
 ## Searching temp/
 

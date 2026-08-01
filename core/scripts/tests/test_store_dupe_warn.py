@@ -538,3 +538,70 @@ def test_genuine_argument_error_still_records_fail_open(seeded):
     assert len(rows) == 1, rows
     assert rows[0]["decision"] == "fail_open"
     assert "exit 2" in rows[0]["extra"]["reason"]
+
+
+# --------------------------------------------------------------------------- #
+# Empty stdin is NOT a gate invocation ().
+#
+# Every caller is `printf '%s' "$BODY" | store_dupe_warn.py --store <s>` where
+# BODY="$(cat)", so running any *-add.sh with no stdin pipes "" here. Before the
+# fix, json.loads("") raised JSONDecodeError, the generic handler recorded
+# decision=fail_open, and gate-retirement-eval routes ANY fail_open to
+# `investigate` — which is literally how  was filed: 108 recorded
+# fail_opens, every one reason=JSONDecodeError, spread across all five agents
+# because every agent occasionally runs a bare *-add.sh to check its interface.
+#
+# Note the pre-existing test_degenerate_input_never_blocks already passes "" and
+# asserts rc==0. That is why the phantom survived: the case WAS covered, but only
+# for the never-blocks contract, so the emit went unexamined. Asserting behaviour
+# is not the same as asserting the record it writes.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("payload,label", [
+    ("", "empty"),
+    ("   ", "spaces"),
+    ("\n", "newline"),
+    (" \t\n ", "mixed-whitespace"),
+])
+def test_blank_stdin_emits_no_firing(seeded, payload, label):
+    """A blank-stdin invocation must leave NO trace in the firing log.
+
+    Not merely "not fail_open" — no record at all. The helper was never asked a
+    question: the daemon rejects an empty body downstream with
+    {"error":"invalid_body"}, so the caller-bug case is already surfaced loudly
+    by the add itself, and nothing entered any store unchecked.
+    """
+    world, meta = seeded
+    r = _run_logged(None, "guardrails", world, meta, raw_stdin=payload)
+    assert r.returncode == 0, f"{label}: rc={r.returncode} stderr={r.stderr}"
+    assert _firings(meta) == [], f"{label} emitted a firing: {_firings(meta)}"
+
+
+def test_nonempty_malformed_stdin_still_fail_opens(seeded):
+    """The discrimination proof — and the reason this pair exists.
+
+    Same shape as the bad---store test above: without this, the blank-stdin fix
+    could be 'implemented' by widening the skip to swallow every parse failure,
+    trading a phantom signal for a blind spot. A caller that pipes genuinely
+    corrupt JSON HAS asked the gate a question the gate could not answer, and
+    that must stay visible as fail_open.
+    """
+    world, meta = seeded
+    r = _run_logged(None, "guardrails", world, meta, raw_stdin="{not json")
+    assert r.returncode == 0            # still never breaks the add
+    rows = _firings(meta)
+    assert len(rows) == 1, rows
+    assert rows[0]["decision"] == "fail_open"
+    assert rows[0]["extra"]["reason"] == "JSONDecodeError"
+
+
+def test_valid_record_still_lands_a_firing(seeded):
+    """Guards the other direction: the skip must not swallow real invocations."""
+    world, meta = seeded
+    r = _run_logged({"id": "g-new", "rule": "A wholly unrelated rule about nothing."},
+                    "guardrails", world, meta)
+    assert r.returncode == 0
+    rows = _firings(meta)
+    assert len(rows) == 1, rows
+    assert rows[0]["decision"] == "noop"

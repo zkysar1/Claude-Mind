@@ -57,6 +57,17 @@ fi
 python3 "$SCRIPT_DIR_NATIVE/run-full-suite.py" "$@"
 FRAMEWORK_RC=$?
 
+# --triage RUNS NOTHING -- it re-reads chunk logs a prior run already wrote, and
+# solo-re-runs only the files that failed in them. The invisible-suite and domain
+# halves below are full test runs: firing them here would spend minutes on suites
+# triage never examined, and would fold their exit codes into a verdict that is
+# about the framework chunk logs alone. Exiting here also keeps the tail banner
+# below from misreading triage's rc=1 ("genuine unowned reds found" -- the
+# ACTIONABLE result it exists to produce) as "the framework half did not pass".
+for _arg in "$@"; do
+    if [ "$_arg" = "--triage" ]; then exit "$FRAMEWORK_RC"; fi
+done
+
 # Pytest-invisible suites (). run-full-suite.py drives pytest, which
 # by construction collects NEITHER main()-style .py files (no `def test_`) NOR
 # any .sh file — so before this call site the framework half of a "full suite"
