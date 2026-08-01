@@ -2153,7 +2153,7 @@ else:
    # with no shared runtime source (cross-language: a bash writer + a Python
    # reader, so a true runtime SSOT would add file-read coupling to the transplant
    # commit path against a foreign $DEST repo — rejected as more fragile than the
-   # coupling it removes). WRITER: seed-transplant.sh:420 commits the bulk
+   # coupling it removes). WRITER: seed-transplant.sh:464 commits the bulk
    # transplant as `chore: sync framework ($TS)`. READER: promotion-preflight.py
    # greps `--grep=^chore: sync framework` to find that baseline commit (g-115-2744
    # recency-shadow guard, rb-4253). If the WRITER's prefix words drift, the READER

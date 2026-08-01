@@ -371,7 +371,14 @@ IF signal is not null:
         # Skill(aspirations-spark) in-turn from that stdout, and aspirations-
         # spark Step 0.5 recorded the firing via spark-fire-dedup.py. If this
         # goal was sparked AT/AFTER this sentinel's set_at, this sentinel is a
-        # redundant re-fire — SKIP it and just clear. On the bg-timeout path
+        # redundant re-fire — SKIP it and just clear. NOT a strict comparison:
+        # the helper widens the window's LOWER bound by MAX_BG_CLOSE_DURATION_MIN
+        # (currently 15), so a fire up to 15 min BEFORE set_at still counts as
+        # THIS close's consumption. That is deliberate — the in-turn spark fires
+        # at Phase 6 while set_at is written later (bg recurring-close, or Phase 8
+        # for non-recurring), so a proactive fire legitimately predates set_at.
+        # Expect "skip" on a fire that predates set_at by minutes; that is the
+        # designed behavior, not an inversion. On the bg-timeout path
         # (the LLM never saw the stdout, so no in-turn fire happened) the check
         # returns "fire" and Phase 6 dispatches normally. Fail-open: on any
         # error the check prints "fire", so a dedup bug never suppresses spark.

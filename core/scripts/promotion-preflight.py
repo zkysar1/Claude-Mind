@@ -366,7 +366,7 @@ def git_last_transplant_ts(repo_root: Path) -> int | None:
     """Committer-date unix ts of the target's most recent transplant/sync commit.
 
     seed-transplant.sh lands a transplant as ONE bulk commit
-    'chore: sync framework (<TS>)' (seed-transplant.sh:420) that stamps EVERY
+    'chore: sync framework (<TS>)' (seed-transplant.sh:464) that stamps EVERY
     planted file with the promotion date. That timestamp is the baseline below
     which a per-file target last-commit ts is a recency SHADOW, not a genuine
     target-side edit (rb-4253 / g-115-2744: a v2.5.0 run flagged 654/657 files

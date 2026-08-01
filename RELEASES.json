@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.8.10",
+    "previous_version": "2.8.9",
+    "date": "2026-08-01",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Back-port omni's v2.8.9 plan-flagged prod work (g-001-258 stale-node triage split, g-001-268 drift-channel fix, g-001-10 created field, g-029-82 evolve x3, spark-dedup window comment, g-001-195 deployment-routing generalization via world convention)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.8.9",
     "previous_version": "2.8.8",
     "date": "2026-07-31",

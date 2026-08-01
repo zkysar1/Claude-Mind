@@ -208,6 +208,13 @@ Bash: team-state-read.sh --json (reuse cached result from 2.3)
   → group by completed_by agent; summarize key_finding themes
 
 # 2.6 Drift signals — sq-012 history and program-vs-self divergence
+# RETIRED SURFACE — kept as a read but expect 0, and do NOT treat 0 as evidence
+# of no drift (g-001-268). sq-012's pending-question PRE-APPROVAL path was removed
+# by guard-380 on 2026-04-22 in favour of post-notification, and aspirations-spark
+# says so explicitly: "No pending-question pre-approval path ... Pre-approval is no
+# longer written here." So nothing writes an sq-012 pending-question any more and
+# this read is structurally zero. It is retained only because a HUMAN or another
+# skill may still file one by hand; the load-bearing drift surface is 2.6b below.
 Read agents/<agent>/session/pending-questions.yaml
   → capture entries where id starts with 'sq-012' OR tags include 'self_evolution'
     AND created within last 60 days (longer window than fresh-eyes-review since
@@ -229,9 +236,28 @@ ALSO read <partner_agent>/session/pending-questions.yaml if accessible
 # --unread-only filters by the REVIEWING agent's read-state, NOT by who the
 # signal is about — program-wide drift is still read program-wide, it just stops
 # counting once the reviewing agent has actioned (marked-read) it.
+# CHANNEL + TAGS CORRECTED 2026-07-30 (g-001-268). The prior form read
+# `--channel findings` filtering tags {program_drift, program-drift,
+# self_evolution, self-drift} and returned ZERO across 108 unread findings while
+# a portfolio divergence was plainly measurable. Cause was a triple mismatch, not
+# an absence of drift:
+#   (a) the live writer is self-drift-gate.py, which posts `--channel coordination
+#       --tags self-drift-gate` (verified in that script, not inferred) — so the
+#       reader had both the wrong CHANNEL and the wrong TAG;
+#   (b) the findings board's actual drift vocabulary in use is `program-alignment`
+#       (30 posts) — none of the four filtered tags appear at all;
+#   (c) Phase 2.6's pending-questions path (above) was retired by guard-380 on
+#       2026-04-22, so it can only ever return 0.
+# Read BOTH channels and match the tags that are actually written. Adding a tag
+# to this filter without confirming a WRITER emits it recreates the same zero.
+Bash: board-read.sh --channel coordination --since 60d --unread-only --json
 Bash: board-read.sh --channel findings --since 60d --unread-only --json
   → filter to findings WHERE tags intersect
-    {'program_drift', 'program-drift', 'self_evolution', 'self-drift'}
+    {'self-drift-gate',      # self-drift-gate.py, coordination channel — the live writer
+     'program-alignment',    # the tag fresh-eyes-program itself posts under
+     'program_drift', 'program-drift', 'self_evolution', 'self-drift'}
+    The first two are the ones with confirmed writers; the last four are kept for
+    forward-compatibility and currently match nothing.
   → call these board_signals
   → SCOPE (diverges deliberately from guard-493 AND fresh-eyes-review 2.3b):
     do NOT add --author $MIND_AGENT and do NOT restrict to "directed at this

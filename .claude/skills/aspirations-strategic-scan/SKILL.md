@@ -135,12 +135,47 @@ stale_nodes = [node for node in node_list
                if node.last_updated and days_since(node.last_updated) > strategic_scan.knowledge_staleness_days
                and node.capability_level == "EXPLORE"]
 
+# TRIGGER-TYPE SPLIT (g-001-258; rb-806). `last_updated` is bumped by STRUCTURAL
+# tree operations — decompose / merge / distill / re-parent — which RELOCATE prose
+# without re-verifying it. So a structurally-stamped node's age is UNDERSTATED and
+# it is stale by MORE than this list says. Measured 2026-07-30: two SAM.gov API
+# reference nodes read "61d" while their real content age was ~5 months
+# (predecessor_research_date 2026-02-28); both stamps came from one /tree maintain
+# decompose.
+#
+# SCOPE IS BOUNDED — do not treat the whole list as suspect. Of the 18 stale
+# EXPLORE nodes measured that day, 3 (17%) carried a structural trigger and 15
+# (83%) carried substantive ones whose dates ARE meaningful. An earlier draft of
+# rb-806 over-claimed this as systemic and was retracted after measuring.
+#
+# READ FRONT MATTER, NOT THE INDEX: _tree.yaml carries last_update_trigger for
+# only 4/164 nodes and content_verified for 0/164, so the index cannot answer
+# this. Reading front matter for JUST the stale set (~18 files) is cheap; do not
+# read it for all 164.
+STRUCTURAL_TRIGGERS = {"decompose", "merge", "distill", "re-parent", "reparent"}
+FOR EACH node in stale_nodes:
+    Read the node's own .md front matter (node.file)
+    node._trigger = front_matter.last_update_trigger.type   (may be a bare string)
+    node._content_verified = front_matter.content_verified   (optional, hand-written
+        at re-verify time; when present it is the TRUE content date — prefer it over
+        last_updated. Nothing writes it automatically and that is deliberate: it is
+        an opt-in annotation, not a required field, so its absence means "unknown",
+        never "fresh".)
+understated = [n for n in stale_nodes if str(n._trigger or "").lower() in STRUCTURAL_TRIGGERS]
+
+# STRUCTURAL STAMPS CLUSTER BY EVENT — one decompose splitting a parent into N
+# children understates all N at once (2 events accounted for 5 nodes that day). So
+# check for a same-age + same-trigger CLUSTER rather than screening node by node.
+IF understated:
+    Output: ">> S2a: {len(understated)}/{len(stale_nodes)} stale nodes carry a STRUCTURAL last_update_trigger ({[n.key for n in understated[:5]]}) — their age is UNDERSTATED; fall back to content_verified / predecessor_research_date for true age. Look for same-age same-trigger clusters."
+
 IF len(stale_nodes) > 3:
     signals.append({
         type: "stale_knowledge",
-        description: "{len(stale_nodes)} EXPLORE-stage tree nodes not updated in {strategic_scan.knowledge_staleness_days}+ days: {[n.key for n in stale_nodes[:5]]}",
+        description: "{len(stale_nodes)} EXPLORE-stage tree nodes not updated in {strategic_scan.knowledge_staleness_days}+ days ({len(understated)} of them structurally-stamped, so older than they read): {[n.key for n in stale_nodes[:5]]}",
         severity: "MEDIUM",
-        nodes: [n.key for n in stale_nodes[:5]]
+        nodes: [n.key for n in stale_nodes[:5]],
+        understated_nodes: [n.key for n in understated]
     })
 
 # S2b: Thin FRONTIER nodes -- structurally under-developed leaf stubs.

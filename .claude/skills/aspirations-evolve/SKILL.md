@@ -472,7 +472,16 @@ Trigger evolution check — the system evaluates its own strategy and generates 
            stale_hours = portfolio_review.stale_threshold_sessions * 24
            FOR EACH HIGH aspiration:
                IF asp has no in-progress goals:
-                   IF asp.last_worked is null OR hours_since(asp.last_worked) > stale_hours:
+                   # last_worked must be POPULATED to be evidence of staleness.
+                   # The former `is null OR ...` form demoted every HIGH aspiration
+                   # on deployments where the field is never written (measured
+                   # 2026-07-30, g-029-82: null on all 9 HIGH aspirations INCLUDING
+                   # ones at 78/97 and 78/92 goals completed — heavily worked, not
+                   # idle). Null means UNPOPULATED here, not "never worked on", and
+                   # demoting 9 of 9 flattens the priority signal rather than fixing
+                   # its inflation. If last_worked is null, derive recency from the
+                   # goals' own completed_date / last_modified, or skip the aspiration.
+                   IF asp.last_worked is NOT null AND hours_since(asp.last_worked) > stale_hours:
                        Log: "PORTFOLIO DEMOTE: {asp.id} '{asp.title}' — HIGH with no activity for {stale_hours}+ hours"
                        Demote priority — field-merge, single positional call (daemon merges only this field):
                        Bash: aspirations-update.sh {asp.id} priority MEDIUM
@@ -869,14 +878,19 @@ FOR EACH skill in flagged.skills:
 # fix the field paths below instead.
 `source core/scripts/_paths.sh && bash core/scripts/audit-schema-gate.sh \
         --jsonl-path "$WORLD_DIR/pattern-signatures.jsonl" \
-        --field-names "outcome_stats.accuracy,outcome_stats.total,outcome_stats.confirmed,utilization.retrieval_count"`
+        --field-names "outcome_stats.accuracy,outcome_stats.total,outcome_stats.confirmed"`
+(`utilization.retrieval_count` REMOVED 2026-07-30, g-029-82: pattern-signature
+records carry NO `utilization` block, so including it made this gate block on
+every run — measured `would_block:true, fields_missing:[utilization.retrieval_count]`
+across all 19 records, which silently skipped the whole calibration block. The
+three fields above were verified present.)
 
 `bash core/scripts/pattern-signatures-read.sh --active` → get active patterns as JSON. For each pattern:
 1. Check calibration rules from the `calibration_protocol` section (live schema):
    - `outcome_stats.accuracy < 0.80 AND outcome_stats.total >= 3` → flag for condition tightening (was false_positives/times_triggered > 0.20) <!-- DRIFT-EXEMPT: rename-documentation -->
    - `outcome_stats.total == 0 AND sessions_since_creation > 10` → flag as stale, consider loosening
    - `outcome_stats.confirmed >= 5 AND outcome_stats.accuracy >= 0.90` → graduate to `validated`, increase weight
-   - `utilization.retrieval_count >= 10 AND outcome_stats.total < 2` → retrieved but rarely/never matched. **PRUNE ONLY IF outcome-recording is WIRED** for this pattern (it is a meta-pattern recorded via hypothesis resolution per guard-575, OR a `sig-NNN-auto-detect.py` auto-probe exists). If NO recording mechanism exists, `total < 2` reflects MISSING TRACKING, not pattern failure → RETAIN (a high `retrieval_count` is positive reference-value signal — LLMs keep finding it relevant). Audit 2026-06-14 (g-115-1441): 14/19 active patterns are unwired and ZERO auto-probe scripts exist, so this rule false-flags valuable reference patterns unless the wiring check gates it.
+   - ~~`utilization.retrieval_count >= 10 AND outcome_stats.total < 2`~~ → **INERT, DO NOT USE (g-029-82, 2026-07-30).** Pattern-signature records have no `utilization` block at all: the 19 live records carry exactly `category, conditions, confused_with, created, description, expected_outcome, id, last_matched, name, outcome_stats, retrieval_cues, separation_markers, status, tags, validation_status`. The rule appears to have conflated TREE-NODE schema (tree nodes DO carry `retrieval_count` / `utility_ratio`) with pattern-signature schema, so it could never fire. There is no retrieval counter on these records, so the retrieval-VOLUME half is unmeasurable; the never-matched half is already covered by rule 2 above (`outcome_stats.total == 0 AND sessions_since_creation > 10`), and `last_matched` is the nearest real field. MUST NOT be used to justify pruning until a retrieval counter exists. The retained guidance below remains correct in spirit: **PRUNE ONLY IF outcome-recording is WIRED** for this pattern (it is a meta-pattern recorded via hypothesis resolution per guard-575, OR a `sig-NNN-auto-detect.py` auto-probe exists). If NO recording mechanism exists, `total < 2` reflects MISSING TRACKING, not pattern failure → RETAIN (a high `retrieval_count` is positive reference-value signal — LLMs keep finding it relevant). Audit 2026-06-14 (g-115-1441): 14/19 active patterns are unwired and ZERO auto-probe scripts exist, so this rule false-flags valuable reference patterns unless the wiring check gates it.
 2. For flagged patterns: propose specific condition changes
 3. Update `validation_status` based on current stats
 4. Log changes to pattern calibration via `echo '<json>' | bash core/scripts/evolution-log-append.sh`
@@ -904,8 +918,17 @@ For each `recommendation` in {retire, tighten, widen, investigate, inert_candida
 4. For `widen`: file an Idea goal proposing additional trigger patterns.
    Quote the gate's `fn_description` from gates.yaml as a hint about what's
    escaping.
-5. For `investigate`: file a HIGH-priority Investigate goal — fail_open
-   means the gate code itself has a bug.
+5. For `investigate`: READ the record's `reason` field before choosing a
+   priority — the evaluator emits `investigate` for at least TWO situations
+   that need OPPOSITE responses, and collapsing them into the urgent reading
+   is wrong (g-029-82):
+   - `fail_open` count > 0 (gate-retirement-eval.py ~L63) → the gate CODE has
+     a bug. File a HIGH-priority Investigate goal.
+   - an all-noop gate whose `fn_cost` outranks `fp_cost` → its own `reason`
+     says this is "typically a WORKING preventive guard whose rare guarded
+     condition did not occur in-window, NOT a dead gate." File a MEDIUM Idea
+     goal asking whether the gate's SCOPE is right. Do NOT report a healthy
+     guard as a code bug.
 6. For `inert_candidate`: file an Investigate goal to verify the gate is
    truly inert and route it to retirement or telemetry re-enable. The
    evaluator emits this when a prior retire/tighten/widen recommendation

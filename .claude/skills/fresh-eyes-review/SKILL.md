@@ -251,6 +251,24 @@ Bash: board-read.sh --channel findings --since 30d --unread-only --json
           (An untagged self-signal authored by THIS agent — author ==
           MIND_AGENT, e.g. this agent's own strategic-scan / fresh-eyes
           followup — still counts, per line 91.)
+          **AND THE AUTHOR-NAMES-ITSELF TEST IS NOT SUFFICIENT — add a
+          post-SHAPE test.** The rule above asks whether the TEXT names the
+          author's own goal/purpose, but a partner's routine cadence post
+          carries its authorship in the `author` FIELD and never restates it
+          in prose, so it slips (b) while being purely about that partner.
+          Measured 2026-07-31 (echo N=18, 28 self_evolution/self-drift findings
+          in 30d): the filter kept 5 as directed-at-echo — 4 echo-authored
+          (correct, per the paragraph above) and 1 foxtrot post opening
+          "Fresh-eyes 7192→7220 … Series point 4 appended", a self-signal about
+          FOXTROT. Honest partner-authored count: ZERO. So ALSO exclude when
+          `author != MIND_AGENT` AND the text opens with this ritual's own
+          post shape (`Fresh-eyes <n>-><n>`, `sq-012 TENTATIVE`, or a
+          `N=<k>` series-point line) — those are the AUTHOR's cadence record,
+          regardless of whose names appear in their comparison tables. Third
+          near-miss in this one step (guard-1877 family, after the (a0)
+          tag-form hole fixed at N=15): each one inflates
+          self_evolution_signals_count in the direction that forces act_later
+          forever.
   # SECOND REGRESSION, and the reason the ORDER above is now explicit
   # (guard-1877, alpha 2026-07-29; independently replicated by bravo
   # 2026-07-30, one day later, on a different agent). This ritual's own board

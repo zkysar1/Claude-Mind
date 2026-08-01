@@ -207,6 +207,12 @@ Runs 8-check verification on an existing destination. No copy.
   `Bash: git -C <dest> status --porcelain && git -C <dest> branch --show-current && git -C <dest> log --oneline -1 && git -C <dest> remote -v`
   Report: branch, clean/dirty, last commit, remote (if any).
   If `--fresh-git` was used: confirm only 1 commit (the init).
+  Report-only for THIS verb, but not universally: `seed-verify.sh --expect-commit`
+  (passed by the plant + promote paths, never by this standalone verb) makes a
+  dirty tree a hard FAIL instead. Post-plant a dirty destination IS a failed
+  plant, and reporting it leniently there is what let an empty promotion open a
+  PR under a PROMOTED banner (g-115-3481). Keep the two modes distinct — do not
+  "simplify" this step back to lenient-everywhere.
 
 **Step 5**: Sample integrity (SHA-256).
   For 5-10 key files (`CLAUDE.md`, `core/scripts/_paths.sh`, `.claude/settings.json`,

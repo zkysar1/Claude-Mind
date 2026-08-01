@@ -732,6 +732,19 @@ runs whenever no live daemon is present. Enforced by `guard-672`.
 > fresh processes, and returns **exit 2 = INVALID/contended** so a resource-starved
 > run can never be mistaken for a pass or a regression.
 >
+> **When the verdict is NOT clean, run `bash core/scripts/run-full-suite.sh --triage`**
+> (g-115-4321). It re-reads the chunk logs the run already wrote — it does NOT re-run
+> the suite — and chains the triage every row below does by hand: position-bucket (via
+> the same `classify()`, so it cannot disagree with the printed verdict) → solo re-run
+> per candidate (green solo ⇒ ENVIRONMENTAL, red solo ⇒ GENUINE) → **ownership** →
+> reports only genuine-AND-unowned as FILE THESE. Ownership now also runs inline on a
+> GENUINE verdict, because that is the step these rows keep skipping: it queries the
+> failing file's stem **both with and without the `test_` prefix**, since
+> `--title-contains` matches TITLES only and titles routinely drop that prefix —
+> `test_fleet_config_parity` returns 0 hits where `fleet_config_parity` returns 3,
+> including its open owner. Keying on the stem alone reports a tracked test as unowned
+> and files a duplicate.
+>
 > **Never pipe that runner — not even on a finished run.** Trap 2 below forbids
 > piping a LIVE run through `tail` for a buffering reason; this is a second,
 > independent reason that applies to a COMPLETED run as well, and it defeats both

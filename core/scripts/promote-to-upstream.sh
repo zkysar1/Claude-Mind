@@ -227,7 +227,7 @@ if [[ $DRY -eq 1 ]]; then
   [[ $LIVING_PROD -eq 1 ]] && say "[dry-run] would: seed-transplant.sh \"$TARGET\" --living-prod --plan  (read-only blast-radius report FIRST — g-306-90/guard-1056)"
   say "[dry-run] would: seed-transplant.sh \"$TARGET\" ${LP_FLAG:+$LP_FLAG }--force --commit  (domain-strip + transforms + verify${LP_FLAG:+; living-prod: deployment-local + dest forged skills preserved})"
   [[ $DO_PR -eq 1 ]] && say "[dry-run] would: push branch '$BRANCH' + gh pr create (NEVER merges)"
-  say "[dry-run] would: seed-verify.sh \"$TARGET\""
+  say "[dry-run] would: seed-verify.sh \"$TARGET\" --expect-commit"
   say "[dry-run] OK — all pre-flight + invariant + preflight checks passed"
   exit 0
 fi
@@ -287,8 +287,15 @@ say "planting framework into $TARGET ${LP_FLAG:+(living-prod) }..."
 bash "$SCRIPT_DIR/seed-transplant.sh" "$TARGET" $LP_FLAG --force --commit || fail "seed plant failed"
 
 # --- Step 5: post-promotion verify -----------------------------------------
+# --expect-commit is load-bearing, not decorative (). Without it,
+# seed-verify's git-state check reports a dirty destination as "expected after
+# plant" and exits 0 — so this `|| fail` was DEAD, and Step 4b's `|| fail` above
+# was dead too (seed-transplant swallowed its own commit failure). Both gates
+# that stop the PR were defeated by the same collapse, which is how a plant that
+# committed NOTHING reached "═══ PROMOTED ═══" with a PR open. Post-plant, a
+# dirty tree IS the failure; the flag is what lets the verifier say so.
 say "verifying plant at $TARGET ..."
-bash "$SCRIPT_DIR/seed-verify.sh" "$TARGET" || fail "post-promotion verify FAILED at $TARGET"
+bash "$SCRIPT_DIR/seed-verify.sh" "$TARGET" --expect-commit || fail "post-promotion verify FAILED at $TARGET"
 
 # --- Step 6: optional PR push (NEVER merges) -------------------------------
 if [[ $DO_PR -eq 1 ]]; then

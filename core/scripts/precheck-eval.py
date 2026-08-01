@@ -1146,7 +1146,9 @@ def cmd_temp_pressure(args, config, compact):
             "aspirations.yaml missing temp_pressure."
             "{warn_threshold,drain_goal_threshold}")
 
-    # temp/ holds TWO file classes (core/config/conventions/temp-store.md):
+    # temp/ holds THREE file classes (core/config/conventions/temp-store.md).
+    # The first two are counted below; the third is the COMPLEMENT of both
+    # allowlists and is handled by `unclassified_count` (see  note):
     #   - drainable working docs (.md/.json) -> /drain-temp encodes to the tree
     #     then archives to drained/. Counted as `count`.
     #   - pure ephemera (.log/.txt/.py/.sh/.err: test-suite output, tool dumps

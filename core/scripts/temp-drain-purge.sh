@@ -20,12 +20,18 @@
 #   6. basename(temp_dir) == "temp"
 # THREE guarded deletion lanes — ALL bounded by the assert_safe_temp_dir guard
 # above; NONE ever uses a per-file `rm` on an interpolated path:
-#   Lane 1 (ephemera+empties): `find "$TEMP_DIR" -maxdepth 1 -type f (ephemera
-#                        globs + 0-byte empties, EXCLUDING dotfiles) -mmin +AGE
+#   Lane 1 (purge-by-default): `find "$TEMP_DIR" -maxdepth 1 -type f (EVERY
+#                        file except: dotfiles; content-bearing .md/.json;
+#                        basenames cited by a durable record) -mmin +AGE
 #                        -delete`. SSOT glob = _purge_find_predicate (see its
-#                        header for the two sub-lanes + the .gitkeep dotfile
-#                        exclusion, ). -maxdepth 1 leaves drained/
-#                        (a subdir) untouched.
+#                        header for the three exemptions + why the class is
+#                        bounded by the predicate rather than by an extension
+#                        list,  / ). -maxdepth 1 leaves
+#                        drained/ (a subdir) untouched. DEGRADES to the
+#                        pre-inversion allow-list (_purge_find_predicate_legacy)
+#                        when the cited set cannot be determined — see
+#                        _cited_basenames; the JSON reports which via
+#                        "citation_lookup".
 #   Lane 2 (drained GC): `find "$TEMP_DIR/drained" -maxdepth 1 -type f
 #                        -mtime +DRAINED_AGE_DAYS -delete` — prunes stale archived
 #                        files (temp-store.md: drained/ contents >30d carry zero
@@ -44,10 +50,13 @@
 #   --drained-age-days  drained/ GC age guard in days (default 30)
 # Output (stdout, JSON): {"purged":N,"would_purge":N,"files":[...],
 #   "drained_gc_purged":N,"drained_gc_would_purge":N,"stray_purged":N,
-#   "stray_would_purge":N,"dry_run":bool,"age_min":N,"drained_age_days":N,
+#   "stray_would_purge":N,"citation_lookup":"ok"|"failed"|"n/a",
+#   "dry_run":bool,"age_min":N,"drained_age_days":N,
 #   "temp_dir":"..."} — the no-temp-dir no-op path emits the SAME field set
-#   (all-zero lane fields) so both exit paths share one schema (fresh-eyes
-#   finding bravo-fec-noop-json-missing-lane-fields).
+#   (all-zero lane fields, citation_lookup "n/a") so both exit paths share one
+#   schema (fresh-eyes finding bravo-fec-noop-json-missing-lane-fields).
+#   citation_lookup=="failed" means Lane 1 ran DEGRADED (legacy allow-list, third
+#   class untouched) — treat a low would_purge under it as unmeasured, not clean.
 # Exit: 0 on success (incl. no-temp-dir no-op); 1 on a guard refusal; 2 on bad args.
 #
 # assert_safe_temp_dir() + the lane functions (gc_drained_archive,
@@ -84,30 +93,114 @@ assert_safe_temp_dir() {
   return 0
 }
 
-# _purge_find_predicate <age_min> — populate the global PURGE_FIND_PRED array
-# with the find predicate for the Lane-1 purge. SINGLE SOURCE OF TRUTH for the
-# purge glob: main() uses it for BOTH the list pass and the -delete pass, and
-# test_temp_drain_purge.sh sources it to assert lane behavior against a
-# synthetic temp dir (so the test can never diverge from the real glob).
-# Two sub-lanes, both age-guarded by -mmin +age_min:
-#   (1) ephemera EXTENSIONS — .log/.txt/.py/.sh/.err (test-suite output, tool
-#       dumps, one-shot scratch scripts) + .raw/.out/.bak (raw command-output
-#       dumps / stdout redirects / backup copies) — carry no knowledge.
-#   (2) 0-BYTE EMPTIES of ANY name (-empty) — no content to drain; catches an
-#       empty .json/.md left by an interrupted redirect.
-# EXCLUDES DOTFILES (! -name '.*'): temp/'s only git-TRACKED file is a 0-byte
-# `.gitkeep` (preserves the dir on a fresh clone — temp-store.md); the -empty
-# lane would otherwise delete it (and any 0-byte dotfile marker) once past the
-# age guard, and iteration-commit would commit that deletion (
-# fresh-eyes catch). Real ephemera are never dotfiles, so the exclusion loses
-# nothing.
+# _purge_find_predicate <age_min> [cited_basename...] — populate the global
+# PURGE_FIND_PRED array with the find predicate for the Lane-1 purge. SINGLE
+# SOURCE OF TRUTH for the purge glob: main() uses it for BOTH the list pass and
+# the -delete pass, and test_temp_drain_purge.sh sources it to assert lane
+# behavior against a synthetic temp dir (so the test can never diverge from the
+# real glob).
+#
+# PURGE-BY-DEFAULT WITH EXEMPTIONS (). This lane was an ALLOW-LIST of
+# eight extensions until 2026-07-31. Drain matches .md/.json; purge matched
+# those eight plus 0-byte — so temp/'s THIRD class (the complement of two
+# enumerated sets) had no lifecycle at all and was unbounded BY CONSTRUCTION,
+# not by oversight. An extension list can never close it: measured cc-02
+# 2026-07-31, 70 third-class files carried 21 distinct suffixes, 8 of them
+# one-offs invented by a single goal (.premutation, .pre2, .mutated, .mine,
+# .bak-preiam-cutover, .12, .test, .patch). Enumerating those yields a fresh
+# list that is stale on the next goal. Age cannot be the gate either
+# (guard-2071): measured accrual is 6.1 files/day, so any age-only window W
+# leaves ~6.1*W resident (~184 at 30 days). The bound must come from the
+# PREDICATE. See core/config/conventions/temp-store.md § The third class for
+# the D2 decision this implements.
+#
+# THREE EXEMPTIONS, in predicate order:
+#   (i)   DOTFILES (! -name '.*') — temp/'s only git-TRACKED file is a 0-byte
+#         `.gitkeep` (preserves the dir on a fresh clone — temp-store.md); the
+#         -empty lane would otherwise delete it (and any 0-byte dotfile marker)
+#         once past the age guard, and iteration-commit would commit that
+#         deletion ( fresh-eyes catch).
+#   (ii)  DRAINABLE WORKING DOCS — .md/.json WITH CONTENT. The `-o -empty`
+#         disjunct deliberately re-admits 0-BYTE .md/.json: nothing was ever
+#         written, so there is nothing to drain (the pre-inversion -empty
+#         sub-lane, preserved exactly).
+#   (iii) THE LOAD-BEARING SET — basenames passed by the caller, each cited by
+#         at least one durable record (temp-store.md § The third class (a)(1);
+#         source is temp-citation-ratchet.py --cited-paths, which already
+#         computes the (record, path) pairs). D2's promotion path is "wrap the
+#         file in a receipted dir", which Lane 3 then preserves — so this
+#         exemption is what keeps a cited-but-not-yet-wrapped loose file alive
+#         long enough for someone to wrap it.
+#
+# Caller passes basenames from EVERY agent's temp/, not just the bound one.
+# Over-exemption is the fail-safe direction, and it removes a whole failure
+# mode: an agent-resolution bug could otherwise silently un-protect a cited
+# file, which deletes evidence, while the cost of the broader set is at worst
+# retaining a same-named uncited file.
+#
 # -maxdepth 1 -type f leaves drained/ (a subdir) untouched. -empty works on bfs
 # (this box's find) and GNU findutils alike.
-# SYNC: any change to this glob MUST update the ephemera table in
+# SYNC: any change to this glob MUST update the class table in
 # core/config/conventions/temp-store.md (that file mandates the joint update).
+#
+# CITED PATTERNS MAY CARRY WILDCARDS, AND THAT IS HONORED DELIBERATELY.
+# Measured 2026-07-31 on the live corpus: 4 of 64 cited paths are wildcards
+# ("…/temp/-*", "…/temp/mergeback-*.json", "…/temp/animate-Enemy*-original.lua",
+# "…/temp/prune-probe*-.py") — durable records legitimately cite a
+# FAMILY of artifacts, not one file. Escaping them to literals would match
+# nothing, so the cited family would be deleted; honoring them is the safe
+# direction, and it is what the citation actually asserts.
+#
+# The one case that must NOT be honored is a pattern broad enough to match ANY
+# filename ("*", "*.*"): a single such citation would silently exempt every
+# file and revert this whole change with no signal — the change would look
+# installed while doing nothing. It is detected by testing each pattern against
+# a sentinel name no real artifact carries, and dropped LOUDLY on stderr.
+_PURGE_OVERBROAD_SENTINEL='zzz-overbroad-sentinel-9f3a2c'
 _purge_find_predicate() {
+  local age_min="$1"; shift
+  local _b
+  PURGE_FIND_PRED=( -maxdepth 1 -type f ! -name '.*' \( ! \( -name '*.md' -o -name '*.json' \) -o -empty \) )
+  for _b in "$@"; do
+    [ -n "$_b" ] || continue
+    # Default-expanded: this function is documented as sourceable in isolation,
+    # and `set -u` on an unset sentinel would abort inside a DELETE path.
+    case "${_PURGE_OVERBROAD_SENTINEL:-zzz-overbroad-sentinel-9f3a2c}" in
+      $_b) echo "temp-drain-purge: WARN — ignoring over-broad cited exemption '$_b' (matches any filename; honoring it would disable Lane 1 entirely)" >&2
+           continue ;;
+    esac
+    PURGE_FIND_PRED+=( ! -name "$_b" )
+  done
+  PURGE_FIND_PRED+=( -mmin "+$age_min" )
+}
+
+# _purge_find_predicate_legacy <age_min> — the PRE-INVERSION allow-list glob.
+# Used by main() ONLY when the cited set could not be determined (see
+# _cited_basenames). Degrading to this is strictly no-worse-than-before: it
+# deletes exactly what this lane deleted prior to  and never touches
+# the third class, so an unreadable world can never cause a NEW deletion.
+# Also exercised directly by test_temp_drain_purge.sh so the fallback cannot
+# rot unnoticed.
+_purge_find_predicate_legacy() {
   local age_min="$1"
   PURGE_FIND_PRED=( -maxdepth 1 -type f ! -name '.*' \( \( -name '*.log' -o -name '*.txt' -o -name '*.py' -o -name '*.sh' -o -name '*.err' -o -name '*.raw' -o -name '*.out' -o -name '*.bak' \) -o -empty \) -mmin "+$age_min" )
+}
+
+# _cited_basenames <script_dir> — echo one basename per line for every temp/
+# path cited by a durable record. Returns NON-ZERO when the cited set is
+# UNKNOWN (world unreadable, script missing, python unavailable) — the caller
+# MUST treat that as "fall back to the legacy allow-list", never as "nothing is
+# cited". The ratchet's --cited-paths mode exits 2 rather than printing an
+# empty list for exactly this reason: on a box with an unmounted world, an
+# empty-and-successful result would read as a licence to purge everything.
+# Trailing slashes are stripped so a cited DIRECTORY contributes its own name;
+# harmless against a -type f lane, and cheaper than special-casing it.
+_cited_basenames() {
+  local script_dir="${1:-}" out
+  [ -f "$script_dir/temp-citation-ratchet.py" ] || return 1
+  out="$(python3 "$script_dir/temp-citation-ratchet.py" --cited-paths 2>/dev/null)" || return 1
+  printf '%s\n' "$out" | sed 's#/*$##; s#.*/##' | grep -v '^$' || true
+  return 0
 }
 
 # gc_drained_archive <drained_dir> <age_days> <dry_run> — Lane 2. Prune files
@@ -259,17 +352,40 @@ main() {
   # schema with the main path below (fresh-eyes finding: a consumer of the lane
   # fields must not KeyError on the no-temp-dir branch).
   if [ ! -d "$temp_dir" ]; then
-    printf '{"purged":0,"would_purge":0,"files":[],"drained_gc_purged":0,"drained_gc_would_purge":0,"stray_purged":0,"stray_would_purge":0,"dry_run":%s,"age_min":%d,"drained_age_days":%d,"temp_dir":"%s","note":"temp dir does not exist"}\n' \
+    # citation_lookup is "n/a" here (Lane 1 never ran) rather than omitted: the
+    # field must exist on BOTH exit paths or a strict-field consumer KeyErrors
+    # on a fresh agent — the same schema-parity finding the lane fields carry.
+    printf '{"purged":0,"would_purge":0,"files":[],"drained_gc_purged":0,"drained_gc_would_purge":0,"stray_purged":0,"stray_would_purge":0,"citation_lookup":"n/a","dry_run":%s,"age_min":%d,"drained_age_days":%d,"temp_dir":"%s","note":"temp dir does not exist"}\n' \
       "$([ "$DRY_RUN" -eq 1 ] && echo true || echo false)" "$AGE_MIN" "$DRAINED_AGE_DAYS" "$temp_dir"
     return 0
   fi
 
-  # ── Lane 1 (ephemera + empties). List purgeable files (for the caller's
-  # report), then delete (unless --dry-run). The purge glob is the SSOT function
-  # _purge_find_predicate (see its header for the two sub-lanes + the
-  # temp-store.md sync obligation) — used here for BOTH passes so list and delete
-  # can never diverge. -maxdepth 1 -type f leaves drained/ untouched.
-  _purge_find_predicate "$AGE_MIN"
+  # ── Lane 1 (purge-by-default, exemptions per _purge_find_predicate). List
+  # purgeable files (for the caller's report), then delete (unless --dry-run).
+  # The purge glob is the SSOT function _purge_find_predicate (see its header
+  # for the three exemptions + the temp-store.md sync obligation) — used here
+  # for BOTH passes so list and delete can never diverge. -maxdepth 1 -type f
+  # leaves drained/ untouched.
+  #
+  # FAIL CLOSED on an unknown cited set. _cited_basenames returns non-zero when
+  # it could not determine what is cited; degrading to the pre-inversion
+  # allow-list means an unreadable world can only ever purge what this lane
+  # already purged before  — never the third class. The alternative
+  # (treating "unknown" as "nothing is cited") would delete cited evidence on
+  # exactly the box least able to notice.
+  local citation_lookup="ok"
+  local _cited_raw
+  if _cited_raw="$(_cited_basenames "$script_dir")"; then
+    local _cited_arr=() _cb
+    while IFS= read -r _cb; do [ -n "$_cb" ] && _cited_arr+=( "$_cb" ); done <<EOF
+$_cited_raw
+EOF
+    _purge_find_predicate "$AGE_MIN" "${_cited_arr[@]+"${_cited_arr[@]}"}"
+  else
+    citation_lookup="failed"
+    echo "temp-drain-purge: WARN — cited set UNKNOWN (temp-citation-ratchet.py --cited-paths failed); Lane 1 degraded to the pre-inversion allow-list, third class NOT purged this run." >&2
+    _purge_find_predicate_legacy "$AGE_MIN"
+  fi
   local ephemera_list count
   ephemera_list="$(find "$temp_dir" "${PURGE_FIND_PRED[@]}" 2>/dev/null || true)"
   if [ -z "$ephemera_list" ]; then count=0; else count="$(printf '%s\n' "$ephemera_list" | grep -c . || true)"; fi
@@ -308,8 +424,8 @@ EOF
   else
     purged="$count"; gc_purged="$gc_count"; stray_purged="$stray_count"
   fi
-  printf '{"purged":%d,"would_purge":%d,"files":%s,"drained_gc_purged":%d,"drained_gc_would_purge":%d,"stray_purged":%d,"stray_would_purge":%d,"dry_run":%s,"age_min":%d,"drained_age_days":%d,"temp_dir":"%s"}\n' \
-    "$purged" "$count" "$files_json" "$gc_purged" "$gc_count" "$stray_purged" "$stray_count" \
+  printf '{"purged":%d,"would_purge":%d,"files":%s,"drained_gc_purged":%d,"drained_gc_would_purge":%d,"stray_purged":%d,"stray_would_purge":%d,"citation_lookup":"%s","dry_run":%s,"age_min":%d,"drained_age_days":%d,"temp_dir":"%s"}\n' \
+    "$purged" "$count" "$files_json" "$gc_purged" "$gc_count" "$stray_purged" "$stray_count" "$citation_lookup" \
     "$([ "$DRY_RUN" -eq 1 ] && echo true || echo false)" "$AGE_MIN" "$DRAINED_AGE_DAYS" "$temp_dir"
   return 0
 }

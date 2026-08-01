@@ -1,19 +1,29 @@
 #!/usr/bin/env bash
 # /seed verify <destination> — post-plant smoke test (8 checks).
 #
-# Usage: seed-verify.sh <destination> [--manifest <path>]
+# Usage: seed-verify.sh <destination> [--manifest <path>] [--expect-commit]
 #
 # Outputs structured PASS/FAIL/WARN per check. Exits non-zero if any FAIL.
+# --expect-commit: grade this as a POST-PLANT verify, where a dirty destination
+# tree is a FAIL rather than an informational note ().
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/_paths.sh"
 
 DEST=""
 MANIFEST="$CONFIG_DIR/seed-manifest.yaml"
+# --expect-commit is OPT-IN on purpose (). This script has TWO callers
+# with different contracts: a standalone `/seed verify <dest>` inspects whatever
+# state the destination happens to be in (a dirty tree there is informational),
+# while a POST-PLANT verify knows a commit was supposed to land, so a dirty tree
+# is proof the plant failed. Defaulting to strict would break the standalone use;
+# defaulting to lenient for BOTH is what let an empty promotion report success.
+EXPECT_COMMIT=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --manifest) MANIFEST="$2"; shift ;;
+        --expect-commit) EXPECT_COMMIT=1 ;;
         -*) echo "Unknown flag: $1" >&2; exit 2 ;;
         *) DEST="$1" ;;
     esac
@@ -21,7 +31,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ -z "$DEST" ] || [ ! -d "$DEST" ]; then
-    echo "Usage: seed-verify.sh <destination> [--manifest <path>]" >&2
+    echo "Usage: seed-verify.sh <destination> [--manifest <path>] [--expect-commit]" >&2
     exit 2
 fi
 DEST="$(cd "$DEST" && pwd)"
@@ -88,9 +98,23 @@ if [ -d "$DEST/.git" ]; then
     echo "   remote=$REMOTE"
     if [ -z "$STATUS" ]; then
         echo "   clean: PASS"
+    elif [ "$EXPECT_COMMIT" -eq 1 ]; then
+        # POST-PLANT a dirty tree is BY DEFINITION a failed plant: the planted
+        # files were supposed to be committed. Calling it "expected after plant"
+        # (which this branch did unconditionally until ) meant the
+        # verifier PRINTED the evidence of a failed plant and passed anyway —
+        # so promote-to-upstream.sh's `|| fail "post-promotion verify FAILED"`
+        # could never fire and an empty promotion opened a PR and banner-ed
+        # PROMOTED. Same class as the --plan verdict collapse fixed by .
+        N_DIRTY="$(echo "$STATUS" | wc -l)"
+        echo "   FAIL: $N_DIRTY uncommitted change(s) after a plant that was supposed to commit"
+        echo "         The plant did not land. 'last_commit' above is the destination's"
+        echo "         PRE-EXISTING head, not this plant — do not read it as evidence of success."
+        echo "$STATUS" | head -10 | sed 's/^/         /'
+        FAILS=$((FAILS+1))
     else
         N_DIRTY="$(echo "$STATUS" | wc -l)"
-        echo "   $N_DIRTY changed files (expected after plant)"
+        echo "   $N_DIRTY changed files (informational — pass --expect-commit to treat this as a failed plant)"
     fi
 else
     echo "   INFO: no .git/ at destination"
