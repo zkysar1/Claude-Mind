@@ -16,23 +16,19 @@ PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
 # --- Parse args -----------------------------------------------------------
-REC_ID=""
-FIELD=""
-VALUE=""
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -*) shift;;
-        *)
-            if [ -z "$REC_ID" ]; then REC_ID="$1"
-            elif [ -z "$FIELD" ]; then FIELD="$1"
-            elif [ -z "$VALUE" ]; then VALUE="$1"
-            fi
-            shift;;
-    esac
-done
+# STRICT argv (). The previous `-*) shift;;` arm SWALLOWED unknown
+# flags, sliding the next argument into <value> and clobbering the record with
+# rc=0. Refusals exit 2 SPECIFICALLY — see core/scripts/_argv_strict.sh.
+# shellcheck disable=SC1091
+source "$CORE_ROOT/scripts/_argv_strict.sh"
+
+argv_strict_parse "reasoning-bank-update-field.sh" 3 "$@"
+REC_ID="${ARGV_POS[0]:-}"
+FIELD="${ARGV_POS[1]:-}"
+VALUE="$(argv_strict_resolve_value "reasoning-bank-update-field.sh" "${ARGV_POS[2]:-}")"
 
 if [ -z "$REC_ID" ] || [ -z "$FIELD" ] || [ -z "$VALUE" ]; then
-    echo "Usage: reasoning-bank-update-field.sh <id> <field> <value>" >&2
+    argv_strict_usage "reasoning-bank-update-field.sh" 3
     exit 1
 fi
 

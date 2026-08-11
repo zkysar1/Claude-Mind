@@ -20,7 +20,7 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from _paths import WORLD_DIR, META_DIR
+from _paths import WORLD_DIR, META_DIR, resolve_file_path
 from _fileops import (
     resolve_base_dir as _resolve_base_dir,
     _find_history_snapshots,
@@ -36,6 +36,50 @@ def resolve_base_dir(file_path):
         print(f"Error: {Path(file_path).resolve()} is not under WORLD_DIR or META_DIR", file=sys.stderr)
         sys.exit(1)
     return base
+
+
+def resolve_target(file_arg):
+    """Resolve a file argument to an absolute path under a governed root.
+
+    Every command below used to pass its raw argument straight to
+    `_find_history_snapshots`, which returns `[]` both when a file genuinely
+    has no snapshots AND when the path resolves under no governed root. That
+    collapses an ERROR into a DATA state, and `cmd_list` rendered the result
+    as "No history" at exit 0 — a false-absent verdict on the recovery layer
+    (g-115-4181). Two concrete failures it produced:
+
+      1. Virtual prefixes silently returned nothing. `world/` and `meta/` are
+         the framework's canonical virtual prefixes and do NOT live under
+         PROJECT_ROOT — both roots are external (local-paths.conf). Anchoring
+         them to PROJECT_ROOT yielded a path under no governed root, so
+         `history list world/self-evolution.jsonl` reported "No history" for a
+         file with 35 snapshots, while its absolute form listed all 35.
+      2. Unresolvable and out-of-root paths reported "No history" at exit 0,
+         indistinguishable from a healthy empty store — so a typo, or a path
+         outside the governed roots entirely, read as "the recovery layer has
+         nothing", which is the most dangerous direction for this tool to be
+         wrong in (`archive-before-delete.md`: a recovery layer must never be
+         assumed absent on one unverified signal).
+
+    Resolution goes through `_paths.resolve_file_path`, the framework's single
+    source of truth for virtual prefixes (guard-132); absolute paths pass
+    through unchanged. Validation reuses `resolve_base_dir` above, which
+    already exits loudly with a diagnostic — this helper simply routes the
+    callers through it instead of around it.
+
+    Deliberately does NOT require the file to exist: snapshots outlive the
+    file they describe, and listing them after a delete is exactly when they
+    are needed. "Under a governed root", not "present on disk", is the
+    discriminator between an error and an honest empty result.
+    """
+    try:
+        path = Path(resolve_file_path(str(file_arg)))
+    except RuntimeError as e:
+        # world/ or meta/ prefix with the corresponding root unconfigured.
+        print(f"Error: cannot resolve {file_arg}: {e}", file=sys.stderr)
+        sys.exit(1)
+    resolve_base_dir(path)  # exits 1 with a diagnostic when under no root
+    return path
 
 
 def parse_snapshot_name(name):
@@ -162,8 +206,10 @@ def cmd_list(args):
                the manifest itself is ~250 bytes; the user cares about
                the snapshot's logical size, not the manifest's.
     """
-    snapshots = _find_history_snapshots(Path(args.file))
+    snapshots = _find_history_snapshots(resolve_target(args.file))
     if not snapshots:
+        # Reached only when the path IS under a governed root (resolve_target
+        # exits otherwise), so this is now the one honest empty case.
         print(f"No history for {args.file}")
         return
 
@@ -202,9 +248,10 @@ def cmd_list(args):
 
 def cmd_restore(args):
     """Restore a specific version of a file from either store."""
-    version_path = _find_snapshot_by_name(args.file, args.version)
+    target = resolve_target(args.file)
+    version_path = _find_snapshot_by_name(target, args.version)
     if version_path is None:
-        all_snaps = _find_history_snapshots(Path(args.file))
+        all_snaps = _find_history_snapshots(target)
         if not all_snaps:
             print(f"Error: No history for {args.file}", file=sys.stderr)
         else:
@@ -215,7 +262,6 @@ def cmd_restore(args):
                 print(f"  [{tag}] {snap.name}", file=sys.stderr)
         sys.exit(1)
 
-    target = Path(args.file)
     from _fileops import acquire_lock, release_lock, save_history, append_changelog
 
     # Lock the target file during restore to prevent concurrent writes.
@@ -226,13 +272,13 @@ def cmd_restore(args):
         # Save current version to history before restoring (if it exists)
         if target.exists():
             agent = os.environ.get("MIND_AGENT", "restore")
-            base = resolve_base_dir(args.file)
+            base = resolve_base_dir(target)
             save_history(target, base, agent, summary=f"Before restore from {args.version}")
 
         _copy_snapshot_to_target(version_path, target)
 
         # Log the restore in changelog
-        base = resolve_base_dir(args.file)
+        base = resolve_base_dir(target)
         agent = os.environ.get("MIND_AGENT", "restore")
         append_changelog(base, agent, target, "restore",
                          summary=f"Restored from {args.version}")
@@ -246,16 +292,16 @@ def cmd_diff(args):
     """Show diff between current file and a historical version from either store."""
     import difflib
 
-    version_path = _find_snapshot_by_name(args.file, args.version)
+    target = resolve_target(args.file)
+    version_path = _find_snapshot_by_name(target, args.version)
     if version_path is None:
-        all_snaps = _find_history_snapshots(Path(args.file))
+        all_snaps = _find_history_snapshots(target)
         if not all_snaps:
             print(f"Error: No history for {args.file}", file=sys.stderr)
         else:
             print(f"Error: Version '{args.version}' not found", file=sys.stderr)
         sys.exit(1)
 
-    target = Path(args.file)
     if not target.exists():
         print(f"Error: Current file {args.file} does not exist", file=sys.stderr)
         sys.exit(1)

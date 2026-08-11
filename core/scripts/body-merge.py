@@ -107,6 +107,12 @@ _PENDING_STATE = "closed-pending-merge"
 _MERGED_STATE = "merged"
 _STAGED_DIRNAME = "pending-body-merges"  # : orphan-WM staging dir (cleanup-stale-bindings.sh)
 _STAGED_HASH_SUFFIX = "-wm.hash"  # : forked_wm_hash sidecar staged with an orphan WM
+# -c: the fork-time BASELINE staged alongside an orphan WM, so a staged
+# orphan can do the same 3-way delta the sessions-pass does. Deliberately NOT
+# matched by the `*-wm.yaml` drain glob (it ends `-wm-baseline.yaml`), so it can
+# never be mistaken for a staged WM. Mirrored by hand in cleanup-stale-bindings.sh
+# (the producer) — the same bash/python boundary _STAGED_HASH_SUFFIX carries.
+_STAGED_BASELINE_SUFFIX = "-wm-baseline.yaml"
 # The fork-time WM snapshot (the 3-way-delta common ancestor) filename is owned
 # by body-manifest.py (the fork writer); read here as bm._BASELINE_FILENAME.
 
@@ -299,6 +305,104 @@ def _read_text_strip(p: Path) -> str:
         return ""
 
 
+def _get_backend():
+    """Storage backend for authoritative staged-file access, or None.
+
+    Module-level seam so the hermetic tests can stub a backend whose store
+    diverges from the local dir — the exact state own-cloud read-through
+    caching produces (g-306-187). Never raises: no backend means local-only
+    operation, which is complete on a local-backend box and the best
+    available degradation elsewhere.
+    """
+    try:
+        from storage_backend import get_backend
+        return get_backend()
+    except Exception:  # noqa: BLE001 — fail-open to local-only
+        return None
+
+
+def _read_staged_bytes(backend, path: Path):
+    """(bytes|None, transient) — authoritative-first read of one staged WM.
+
+    Reads the STORE copy first (read_authoritative_bytes never touches the
+    possibly-stale local mirror — the staleness half of the g-115-4154
+    class); store-absent falls back to the local file so a never-pushed
+    local-only staging still drains. `transient=True` means a transport
+    error hid the store copy AND no local copy exists — the caller must
+    leave the unit staged rather than consume bytes it never saw.
+    """
+    if backend is not None:
+        try:
+            return backend.read_authoritative_bytes(path.resolve()), False
+        except FileNotFoundError:
+            pass  # not in the store: local-only staging (or a consume race)
+        except Exception:  # noqa: BLE001 — transport hiccup
+            if not path.is_file():
+                return None, True
+    try:
+        return path.read_bytes(), False
+    except OSError:
+        return None, False
+
+
+def _read_staged_text(backend, path: Path) -> str:
+    """Hash-sidecar read, authoritative-first; '' when absent everywhere."""
+    if backend is not None:
+        try:
+            return backend.read_authoritative_bytes(
+                path.resolve()).decode("utf-8", errors="replace").strip()
+        except Exception:  # noqa: BLE001 — absent or hiccup: try local
+            pass
+    return _read_text_strip(path)
+
+
+def _read_staged_yaml(backend, path: Path):
+    """Baseline-sidecar read, authoritative-first; None when absent/invalid.
+
+    None (not {}) so the caller's 3-way merge degrades to the retained 2-way
+    fallback exactly as the local-only path always has (see Guard 3 comment).
+    """
+    if backend is not None:
+        try:
+            data = yaml.safe_load(backend.read_authoritative_bytes(path.resolve()))
+            return data if isinstance(data, dict) and data else None
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        return _read_yaml(path) or None
+    except (OSError, yaml.YAMLError):
+        return None
+
+
+def _delete_staged(backend, *paths: Path) -> None:
+    """Consume staged files exactly once: local unlink + authoritative delete.
+
+    A local-only unlink is the third layer of the g-306-187 defect: on an
+    own-cloud reducer the authoritative copy lives in the store, so deleting
+    only the mirror leaves an object that re-materializes and RE-MERGES on
+    the next consolidation (a 3-way delta applied twice double-counts
+    counters). Best-effort per file but LOUD on failure — a surviving
+    authoritative object is a future double-merge, not cosmetic residue.
+    LocalBackend has no delete_object: there the local unlink IS the
+    authoritative delete (getattr guard, correct by construction). The
+    content being deleted was merged into the reducer WM (or proven
+    baseline-identical / already-merged), so nothing unrecoverable is
+    destroyed; the bucket is additionally versioned (delete marker only).
+    """
+    deleter = getattr(backend, "delete_object", None)
+    for p in paths:
+        _unlink_quiet(p)
+        if deleter is None:
+            continue
+        try:
+            deleter(p.resolve())
+        except Exception as e:  # noqa: BLE001 — never abort the drain
+            print(
+                f"[body-merge] WARN: authoritative delete failed for {p.name}: "
+                f"{e} — this unit may re-merge at the next consolidation",
+                file=sys.stderr)
+
+
 def _consume_staged(state_dir: Path, reducer_wm_path: Path, summary: dict,
                     already: set) -> None:
     """Drain orphan Body WMs staged by cleanup-stale-bindings.sh ().
@@ -323,51 +427,186 @@ def _consume_staged(state_dir: Path, reducer_wm_path: Path, summary: dict,
          baseline: consume without merging (mirrors the sessions-pass hash
          short-circuit, which staged orphans previously lacked, so a
          never-diverged orphan used to be merged as if divergent).
-      3. otherwise merge (2-way: only the hash, not the baseline CONTENT, is
-         staged, so a staged orphan cannot do the 3-way delta the sessions-pass
-         can — it still merges correctly under the union+SUM policy).
+      3. otherwise merge. 3-WAY when the producer staged the fork-time baseline
+         CONTENT as <unitKey>-wm-baseline.yaml (g-306-119-c), matching what the
+         sessions-pass does from sessions/<unitKey>/forked-wm-baseline.yaml;
+         2-way union+SUM otherwise. The 2-way path is a RETAINED FALLBACK, not
+         dead code: stagings written before the baseline producer shipped, and
+         any crash-preserve path that could not capture a baseline, still land
+         here and must still merge correctly.
 
-    Each staged WM (+ its hash sidecar) is deleted after processing so it is
-    consumed exactly once (malformed/empty ones dropped, never retried).
-    Mutates `summary` (staged_merged / staged_dedup / noop / skipped / scanned).
-    In single-runner no Body forks -> the staging dir is absent -> no-op (dormant).
+    WHY THE 3-WAY MATTERS (the defect, not the plumbing): under 2-way union+SUM
+    a counter the worker NEVER TOUCHED is summed into the reducer's value a
+    second time, because both sides carry the shared baseline. `r + (b - B)`
+    counts B once. So the observable symptom is a counter DRIFTING UPWARD on
+    every orphan drain — including for slots the orphan never wrote.
+
+    CROSS-BOX (g-306-187): a REMOTE worker's staged files arrive via
+    body-manifest.py push-staged -> the authoritative store, and NOTHING on
+    the reducer box reads those exact names — so under own-cloud read-through
+    caching the local staging dir stays empty and a local-only glob drains
+    nothing, silently (the g-115-4154 enumerate-by-what-this-box-holds class;
+    live specimen: 3 staged files for one unitKey survived a full reducer
+    stop/start cycle un-consumed, 2026-08-04). All three surfaces now route
+    through the backend: ENUMERATE (list_dir union'd with the local glob),
+    READ (read_authoritative_bytes first, local fallback), DELETE
+    (delete_object beside each unlink). Merged units delete only AFTER the
+    merged reducer WM is durably written: array slots (spark_capture — the
+    learning payload) re-merge idempotently via content-hash dedup, so a
+    crash between write and delete costs at worst a bounded counter re-add,
+    while delete-first would let a crash destroy the divergence outright.
+
+    Each staged WM (+ its hash and baseline sidecars) is deleted after
+    processing so it is consumed exactly once (malformed/empty ones dropped,
+    never retried). Exception: a unit whose authoritative read failed on a
+    TRANSPORT error with no local copy is left staged (`staged_deferred`) —
+    consuming bytes never seen would destroy the worker's divergence on an
+    S3 hiccup.
+    Mutates `summary` (staged_merged / staged_dedup / staged_deferred / noop
+    / skipped / scanned).
+    In single-runner no Body forks -> the staging dir is absent locally and
+    empty in the store -> no-op (dormant).
     """
     staged_dir = state_dir / _STAGED_DIRNAME
-    if not staged_dir.is_dir():
+    backend = _get_backend()
+    staged_names: set = set()
+    if staged_dir.is_dir():
+        staged_names.update(p.name for p in staged_dir.glob("*-wm.yaml"))
+    if backend is not None:
+        # UNION with the authoritative listing, never replace: a local-only
+        # staging (cleanup-stale-bindings on THIS box, never pushed) must
+        # still drain when the store errors or lags. `.resolve()` is
+        # load-bearing — a relative path makes _s3_key raise inside the
+        # backend and the listing silently degrades (the _fleet_diary.py
+        # lesson). The baseline sidecar ends "-wm-baseline.yaml", which does
+        # NOT match endswith("-wm.yaml") — same disjointness the local glob
+        # relies on (see _STAGED_BASELINE_SUFFIX comment above).
+        try:
+            staged_names.update(
+                n for n in backend.list_dir(staged_dir.resolve())
+                if n.endswith("-wm.yaml"))
+        except Exception:  # noqa: BLE001 — store listing is additive, never fatal
+            pass
+    if not staged_names:
         return
     reducer_wm = _read_yaml(reducer_wm_path)
     staged_changed = False
-    for staged_path in sorted(staged_dir.glob("*-wm.yaml")):
-        unit_key = staged_path.name[: -len("-wm.yaml")]
+    merged_files: list = []  # authoritative deletes deferred past the WM write
+    for name in sorted(staged_names):
+        staged_path = staged_dir / name
+        unit_key = name[: -len("-wm.yaml")]
         summary["scanned"] += 1
         hash_path = staged_dir / f"{unit_key}{_STAGED_HASH_SUFFIX}"
+        baseline_path = staged_dir / f"{unit_key}{_STAGED_BASELINE_SUFFIX}"
         # Guard 1: already merged from sessions/ this run -> consume, don't merge.
         if unit_key in already:
             summary["staged_dedup"].append(unit_key)
-            _unlink_quiet(staged_path)
-            _unlink_quiet(hash_path)
+            _delete_staged(backend, staged_path, hash_path, baseline_path)
             continue
-        try:
-            body_bytes = staged_path.read_bytes()
-            body_wm = yaml.safe_load(body_bytes) or {}
-        except (OSError, yaml.YAMLError):
-            body_bytes = b""
-            body_wm = None
+        body_bytes, transient = _read_staged_bytes(backend, staged_path)
+        if transient:
+            summary["staged_deferred"].append(unit_key)
+            continue
+        body_wm = None
+        if body_bytes is not None:
+            try:
+                body_wm = yaml.safe_load(body_bytes) or {}
+            except yaml.YAMLError:
+                body_wm = None
         if isinstance(body_wm, dict) and body_wm:
             # Guard 2: staged WM unchanged from the fork baseline -> no-op.
-            baseline_hash = _read_text_strip(hash_path)
+            baseline_hash = _read_staged_text(backend, hash_path)
             if baseline_hash and hashlib.sha256(body_bytes).hexdigest() == baseline_hash:
                 summary["noop"].append(unit_key)
+                _delete_staged(backend, staged_path, hash_path, baseline_path)
             else:
-                reducer_wm = merge_wm(reducer_wm, body_wm)
+                # Guard 3: 3-way when the baseline CONTENT was staged, else the
+                # retained 2-way fallback. None (not {}) collapses an empty or
+                # unreadable baseline to the 2-way path rather than merging
+                # against {} — against {} every counter's base_val is absent,
+                # which silently degrades to 2-way anyway but would read as a
+                # 3-way merge. This input comes from the CRASH-preserve path,
+                # so a truncated or half-copied baseline is a real shape here
+                # in a way it is not in the sessions-pass. Falling back to
+                # 2-way merges the orphan with a stale-but-correct policy;
+                # raising would abort the whole drain and strand every later
+                # staged unit in the loop.
+                baseline_wm = _read_staged_yaml(backend, baseline_path)
+                reducer_wm = merge_wm(reducer_wm, body_wm, baseline_wm)
                 staged_changed = True
                 summary["staged_merged"].append(unit_key)
+                merged_files.append((staged_path, hash_path, baseline_path))
         else:
             summary["skipped"].append(unit_key)
-        _unlink_quiet(staged_path)  # consume exactly once (incl. malformed/empty)
-        _unlink_quiet(hash_path)
+            _delete_staged(backend, staged_path, hash_path, baseline_path)
     if staged_changed:
         _write_yaml_atomic(reducer_wm_path, reducer_wm)
+    # Consume merged units only now — after their content is durably in the
+    # reducer WM (see the CROSS-BOX docstring paragraph for the crash trade).
+    for files in merged_files:
+        _delete_staged(backend, *files)
+
+
+def _completed_goal_ids(wm: dict) -> list:
+    """goal_id values from a WM's `goals_completed_this_session` slot.
+
+    Tolerates BOTH live row shapes, which is not defensive padding — the two
+    coexist in the fleet today. The top-level WM slot holds dict rows
+    (`{goal_id, aspiration_id, recurring, work_class, _item_ts}`, measured 372
+    rows on cc-02 2026-08-07), while the identically-named key INSIDE
+    `loop_state` is an int counter and never reaches here. A bare-string row is
+    accepted too because `counted_goals_this_session` — the sibling slot an
+    author reaching for "the list of completed goals" is equally likely to hand
+    this function — is a list of bare ids. Any other shape yields nothing rather
+    than a guess.
+    """
+    rows = wm.get("goals_completed_this_session")
+    if not isinstance(rows, list):
+        return []
+    out = []
+    for r in rows:
+        gid = r.get("goal_id") if isinstance(r, dict) else (r if isinstance(r, str) else None)
+        if gid:
+            out.append(gid)
+    return out
+
+
+def _stamp_merged_goal_ids(reducer_wm_path: Path, pre_ids: set, summary: dict) -> None:
+    """Name the completed goals that arrived from a Body during this merge.
+
+    THIS IS THE ONLY PLACE THE FLEET RECORDS WORKER-COMPLETION, and it exists
+    because measurement showed nothing else does (g-306-198, 2026-08-07):
+
+      * The WM rows carry no session id — union of keys over all 372 live rows
+        is {goal_id, aspiration_id, recurring, work_class, _item_ts}.
+      * `claimed_by` and `claimed_by_sid` are ERASED at close: 0 of 4015
+        completed goals carry either, against 24 of 24 in-progress. That
+        erasure is deliberate (g-115-3176 — "the stamp must not survive the
+        claim it describes") and must NOT be reverted to make this easier; a
+        stamp outliving its claim is how the NEXT claimer inherits a stale SID.
+      * `body-manifest.yaml` records {unitKey, mindKey, env_id, role,
+        reducer_sid, body_state, started_at, forked_wm_hash} — no goal list.
+
+    So a reducer asking "which of my completed goals did a Body close?" had no
+    field to read, and any downstream audit of the worker-learning lanes was
+    undecidable by construction (the same shape as g-306-197's A1). The answer
+    is only derivable HERE, where both sides of the merge are in hand: an id
+    present in the reducer's slot AFTER the merge and absent BEFORE it came
+    from a Body. Deriving it anywhere else would mean re-deriving provenance
+    from an effect (e.g. "this goal has no journal entry"), which is a
+    broadened criterion, not a measurement (guard-2950).
+
+    Fail-safe direction is NO ATTRIBUTION: an unreadable reducer WM yields an
+    empty list, so a plumbing fault produces zero retrospective work rather
+    than a false claim that some goal was worker-completed.
+    """
+    seen = set(pre_ids)
+    out = []
+    for gid in _completed_goal_ids(_read_yaml(reducer_wm_path)):
+        if gid not in seen:
+            seen.add(gid)
+            out.append(gid)
+    summary["merged_goal_ids"] = out
 
 
 def generalize_down(agent: str, project_root: Path | None = None,
@@ -376,12 +615,23 @@ def generalize_down(agent: str, project_root: Path | None = None,
 
     Returns a summary dict. No-op (empty merged/noop/skipped) when no
     closed-pending-merge Body exists — the dormant single-runner case.
+
+    `merged_goal_ids` names the completed goals that arrived from a Body this
+    run — see `_stamp_merged_goal_ids` for why this is the only place that can
+    answer that question. It is the input to the consolidate retrospective
+    sub-step (worker_retrospective.py), which runs the reducer-only lanes a
+    worker Body structurally skipped.
     """
     pr = project_root or _project_root()
     adir = bm._agent_dir(pr, agent)  # validates agent name; raises on bad input
     state_dir = adir / bm._STATE_DIRNAME
     sessions_root = adir / bm._SESSIONS_DIRNAME
     reducer_wm_path = state_dir / bm._WM_FILENAME
+    # Snapshot BEFORE any merge — both the sessions-pass and _consume_staged
+    # write this file, so taking the "before" once here (rather than inside
+    # either path) keeps the set-difference correct for both without touching
+    # either one. .
+    pre_goal_ids = set(_completed_goal_ids(_read_yaml(reducer_wm_path)))
 
     summary = {
         "agent": agent,
@@ -391,6 +641,8 @@ def generalize_down(agent: str, project_root: Path | None = None,
         "skipped": [],
         "staged_merged": [],
         "staged_dedup": [],  # : staged orphans skipped (already merged this run)
+        "staged_deferred": [],  # : authoritative read failed transiently — retry next run
+        "merged_goal_ids": [],  # : completed goals that arrived from a Body
         "passes": 0,
     }
     if not sessions_root.is_dir():
@@ -400,6 +652,7 @@ def generalize_down(agent: str, project_root: Path | None = None,
         # when no sessions/ dir exists. . No sessions-pass ran -> the
         # already-merged set is empty.
         _consume_staged(state_dir, reducer_wm_path, summary, set())
+        _stamp_merged_goal_ids(reducer_wm_path, pre_goal_ids, summary)
         return summary  # nothing else to merge
 
     already: set = set()
@@ -447,6 +700,7 @@ def generalize_down(agent: str, project_root: Path | None = None,
     # /: drain staged orphans, skipping any unit_key already
     # merged in the sessions-pass above (the concurrent-double-merge guard).
     _consume_staged(state_dir, reducer_wm_path, summary, already)
+    _stamp_merged_goal_ids(reducer_wm_path, pre_goal_ids, summary)
     return summary
 
 

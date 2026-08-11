@@ -126,6 +126,23 @@ files:
     required_when_idle: false
     required_when_running: true
 
+  # The DDB claim heartbeat is the OTHER leg of the same heartbeat-tick.sh call
+  # that writes runner-heartbeat above, and the two legs fail INDEPENDENTLY.
+  # This marker exists because that asymmetry was invisible: the DDB leg died
+  # ~105 min before the agent did while the local + team-state legs kept
+  # succeeding, so the claim aged out under a healthy reducer and two later
+  # /starts came up as second reducers (, 2026-08-05). Present = this
+  # runner's cross-machine claim is NOT being renewed; absent = healthy.
+  # Contents are KEY=VALUE lines (first_failed_at, count, last_rc, last_error) —
+  # deliberately not JSON, since jq is absent on some fleet boxes.
+  - file: claim-heartbeat-failure
+    purpose: consecutive-failure record for the DDB runner-claim heartbeat leg (absent = healthy)
+    writer: heartbeat-tick.sh (own-cloud backend only; cleared on the first success)
+    recovery_action: clear
+    sync_tier: machine_local
+    required_when_idle: false
+    required_when_running: false
+
   - file: compact-pending
     purpose: marker that PreCompact fired but SessionStart hasn't restored yet
     writer: PreCompact hook
@@ -505,6 +522,122 @@ files:
     writer: evolution-prepare.py
     recovery_action: clear
     sync_tier: machine_local
+    required_when_idle: false
+    required_when_running: false
+
+  # ── Cross-box Body WM transport staging (pending-body-merges/) ───────
+  # Registered twice, independently and simultaneously, by -b and
+  # ; merged 2026-08-02 (alpha, cc-04). Both sides agreed on all
+  # three globs and every field except `writer`, and that field is the one
+  # worth reading carefully — see the writer note below.
+  #
+  # THREE FILES PER UNIT, staged under <agent>/session/pending-body-merges/:
+  # <unitKey>-wm.yaml (the forked WM), <unitKey>-wm-baseline.yaml (the
+  # pre-fork baseline the reducer's 3-way merge needs, ), and
+  # <unitKey>-wm.hash (the forked_wm_hash integrity sidecar). ALL THREE must
+  # reach remote storage or the reducer box cannot consume the handoff.
+  #
+  # Written by body-manifest.py (close_body_on_genuine / _stage_and_push /
+  # push_staged_files — it owns _STAGED_DIRNAME) and by
+  # cleanup-stale-bindings.sh's crash-preserve path (/).
+  # NOT by body-merge.py: that module only CONSUMES (_consume_staged, L302)
+  # on the reducer box. The  side of this merge attributed all three
+  # entries to body-merge.py, which names the consumer rather than either
+  # writer; corrected here after grepping the three files that touch
+  # pending-body-merges/ (verified 2026-08-02).
+  #
+  # sync_tier MUST be continuity: a remote worker's whole purpose is to get
+  # its forked WM to a reducer on ANOTHER box. `sessions/` (plural) is
+  # walk-pruned by _EXCLUDE_DIRS, which is exactly why the Body's WM is
+  # COPIED here (session/, singular) to become syncable at all.
+  #
+  # Registering all three is load-bearing, not bookkeeping. Unregistered
+  # basenames fall through _session_file_machine_local's extension
+  # heuristic (`suffix in _SESSION_DATA_EXTS`), and `.hash` is NOT in that
+  # set — so the hash sidecar classified machine_local and could never
+  # reach S3, while its two .yaml siblings synced — a successful-looking
+  # WriteResult on a file that never left the box. Measured 2026-08-02
+  # (alpha, cc-04): wm.yaml False, wm-baseline.yaml False, wm.hash True.
+  # That silently disabled _consume_staged's Guard-2 no-op short-circuit
+  # for every cross-box orphan (a never-diverged Body would be merged as
+  # if divergent). Latent since  because same-box staging reads
+  # the local file and never needed the push. Pinned by
+  # test_owncloud_sync.py::test_staged_body_merge_globs_sync, which
+  # mutation-fails if any of these three entries is removed.
+  #
+  # recovery_action: preserve — these files ARE un-merged worker WM.
+  # Clearing them on /start --recover would destroy the only copy of that
+  # Body's divergence, which is the exact loss the transport exists to
+  # prevent.
+  - file: '*-wm.yaml'
+    glob: true
+    purpose: staged forked Body WM awaiting reducer-side merge (cross-box transport)
+    writer: body-manifest.py close_body_on_genuine / cleanup-stale-bindings.sh
+    recovery_action: preserve
+    sync_tier: continuity
+    required_when_idle: false
+    required_when_running: false
+
+  - file: '*-wm-baseline.yaml'
+    glob: true
+    purpose: staged fork-time WM baseline — the 3-way-delta common ancestor the reducer merge needs (g-306-119-c consumes it)
+    writer: body-manifest.py close_body_on_genuine
+    recovery_action: preserve
+    sync_tier: continuity
+    required_when_idle: false
+    required_when_running: false
+
+  - file: '*-wm.hash'
+    glob: true
+    purpose: forked_wm_hash integrity sidecar — drives _consume_staged's never-diverged no-op short-circuit
+    writer: body-manifest.py close_body_on_genuine / cleanup-stale-bindings.sh
+    recovery_action: preserve
+    sync_tier: continuity
+    required_when_idle: false
+    required_when_running: false
+
+  # ── Cross-box Body liveness carrier () ──────────────────────
+  # The SYNCABLE twin of sessions/<SID>/body-heartbeat. That file is the
+  # SAME-BOX signal and stays where it is; it can never serve a cross-box
+  # reader because `sessions/` (plural) is walk-pruned by _EXCLUDE_DIRS —
+  # the identical constraint that forced the staged-WM copy above, and the
+  # reason this one lives in session/ (singular) too.
+  #
+  # CONSUMER: stranded-claim-sweep.py's foreign-SID branch. Before letting
+  # the flat 120m grace expire on a claim held by another SID, it reads this
+  # carrier for THAT sid. Fresh + sid matches -> the holder is alive on
+  # another box, keep the claim. Anything else -> fall through to the exact
+  # pre-existing 120m behavior, so the change can only ever be MORE
+  # conservative than what it replaced.
+  #
+  # sync_tier MUST be continuity, and not merely because the reader is on
+  # another box: guard-2418 — a condition evaluated on one box must not
+  # depend on a machine_local read a different box owns, because the absent
+  # file and the legitimately-false value are the SAME observable and no
+  # error is raised. A machine_local carrier would silently read "dead" for
+  # every live cross-box worker.
+  #
+  # The `.json` suffix is deliberate belt-and-braces, not decoration. This
+  # registration is what sets the tier — but an UNREGISTERED basename falls
+  # to _session_file_machine_local's extension heuristic
+  # (owncloud_sync.py:314-316), and an extensionless name is not in
+  # _SESSION_DATA_EXTS. That is exactly the measured `.hash` incident at
+  # L537-543 above: a successful-looking WriteResult on a file that never
+  # left the box. Registered AND synced-extension, so neither has to hold
+  # alone.
+  #
+  # recovery_action: clear — and note this INVERTS its three neighbours
+  # above, deliberately. Staged WM is preserved because it is the only copy
+  # of a Body's divergence. A heartbeat is the opposite: it is regenerated
+  # every tick and costs nothing to lose, while a PRESERVED STALE carrier is
+  # actively harmful — it would vouch for a dead worker and hold a claim
+  # that should have been released. Cheap to lose, dangerous to keep.
+  - file: 'body-heartbeat-*.json'
+    glob: true
+    purpose: cross-box Body liveness carrier — {sid, agent, host, ts}; consulted by stranded-claim-sweep's foreign-SID grace
+    writer: heartbeat-tick.sh (per-SID, above the IDLE state gate)
+    recovery_action: clear
+    sync_tier: continuity
     required_when_idle: false
     required_when_running: false
 

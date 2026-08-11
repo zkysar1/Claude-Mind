@@ -55,6 +55,14 @@ class _Ctx:
         # Sibling probes constructed by build_probes() read this; ClockSkewProbe
         # itself does not.
         self.agent_dir = Path(agent_dir) if agent_dir else Path(root) / "agents" / "testagent"
+        # Mirrors the WatchdogContext dataclass default (). build_probes
+        # reads this to decide the worker-filtered vs full probe set, and it reads
+        # it STRICTLY rather than via getattr-with-default: a silent fallback there
+        # would hand a worker the full set — five probes that cannot fire on a
+        # worker plus one that false-fires — which is the very defect that goal
+        # fixed. So the cost of strictness is landing here, on an incomplete
+        # stand-in, which is the right place for it to land.
+        self.body_role = "reducer"
 
     def get_processes(self):
         return ""

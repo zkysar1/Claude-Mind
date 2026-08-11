@@ -161,6 +161,46 @@ Check for `agents/<agent>/session/handoff.yaml` to detect auto-continuation from
 ```
 IF agents/<agent>/session/handoff.yaml EXISTS (auto-continuation / inline restart from consolidation):
     1. Read handoff.yaml for previous session state
+    1a. CURRENCY GATE (g-115-4671) — the handoff may be a RESURRECTED corpse,
+        not a live one. Sub-step 5 below deletes handoff.yaml with a LOCAL
+        unlink and no backend delete, so under own-cloud the S3 object survives
+        the consume; handoff.yaml is in the continuity pull-set, so Step 2.6's
+        owncloud-pull re-materializes it on the NEXT /start (guard-1493: "a
+        local-only unlink is silently RE-MATERIALIZED by read-through"). On an
+        agent whose sessions end by CRASH rather than /stop, no new handoff is
+        ever written, so S3 pins the last GRACEFUL stop's copy indefinitely
+        while local sessions keep advancing.
+        MEASURED FLEET-WIDE 2026-08-08 (zeta, cc-02, own-cloud) — embedded
+        handoff timestamp vs that agent's journal last_updated, all five
+        journals at 2026-08-07: alpha ~2d, bravo ~13d, echo ~11d, foxtrot ~13d,
+        zeta ~13d, exists=true for ALL FIVE. Not one agent's quirk.
+        Blast radius is goal SELECTION: a resurrected first_action reaches the
+        loop as a pre-scored top pick and bypasses fresh scoring — which is why
+        this gate sits BEFORE sub-step 2 extracts it.
+        TWO INDEPENDENT ARMS (g-115-5313): staleness is measured BOTH as
+        journal-minus-handoff AND as wall-clock-minus-handoff, and either one
+        breaching the threshold refuses (the JSON names which, in `stale_arms`).
+        The journal arm alone cannot fire on a DORMANT agent — its journal is
+        stale too — which is precisely the crash-heavy population above. Probed:
+        a handoff of 2026-01-01 with a journal of 2026-01-02 read `current` on
+        2026-08-08, seven months old. So more handoffs refuse now than before;
+        that is the fail-SAFE direction, since exit 2 routes boot to the FULL
+        path rather than blocking work.
+        Bash: `bash core/scripts/handoff-currency-check.sh --json`
+        IF exit code == 2 (STALE):
+            Output: "HANDOFF STALE — {reason from JSON}. Ignoring the carried
+                     handoff and running a FULL boot instead."
+            Delete handoff.yaml (same consume as sub-step 5) so the stale copy
+            is not re-read next boot, then SKIP the remaining sub-steps of this
+            branch and execute the `NOT EXISTS (user-initiated)` branch below.
+            Do NOT extract first_action, decisions_locked, or session_summary
+            from it — every one of those carries forward stale context.
+        ELSE (0 = current, or the gate skipped/failed open):
+            Continue to sub-step 1b.
+        The gate FAILS OPEN on all of its own dependency errors (guard-142) and
+        announces every decline on stdout rather than exiting silently — a gate
+        whose only observable state is green cannot be distinguished from a
+        broken one (guard-1977). Threshold: HANDOFF_CURRENCY_MAX_DAYS, default 3.
     1b. Read agents/<agent>/self.md (Self must be in working context even during fast auto-resume)
     1b2. Bash: world-cat.sh program.md  # The Program must be in working context even during fast auto-resume
     1c. User Goals Resume:
@@ -176,7 +216,7 @@ IF agents/<agent>/session/handoff.yaml EXISTS (auto-continuation / inline restar
                     (compact data has IDs, titles — no descriptions/verification)
                     Check if user goal already exists for this key
                     IF no existing goal mentions this key:
-                        Add goal to first active aspiration via aspirations-update.sh:
+                        Add goal to first active aspiration via aspirations-add-goal.sh:
                             (follow Phase -0.5 "Goal creation for missing credentials" schema)
             ELSE:
                 Output: "ENV: All credentials configured"
@@ -304,10 +344,26 @@ via `handoff_to: <AGENT_NAME>` that are still pending or in-progress. Surface
 the count + oldest age so the agent picks them up before baseline scoring
 kicks in.
 
+The `${PIPESTATUS[0]}` line is load-bearing, not ceremony (g-318-80). When
+`status.sh` fails it writes to stderr and exits non-zero, leaving stdout EMPTY.
+This block previously read `json.loads(sys.stdin.read() or '{}')`, so a failed
+call became `{}`, `count` was absent, and the block exited 0 having printed
+nothing — indistinguishable from a healthy boot with no inbound handoffs. Every
+routed handoff would be silently invisible at exactly the moment boot exists to
+surface them. Reading the producer's status is the only thing that separates the
+two cases; the stdout bytes are identical. Enforced ad-hoc by
+`core/scripts/silent-zero-gate.sh`, which refuses that idiom at PreToolUse[Bash].
+
 ```
 Bash: bash core/scripts/status.sh --field handoffs_inbound | python3 -c "
 import sys, json
-h = json.loads(sys.stdin.read() or '{}')
+raw = sys.stdin.read()
+if not raw.strip():
+    # Empty stdout means the producer failed (see PIPESTATUS check below) OR
+    # emitted nothing. Either way there is no count to report and no basis for
+    # claiming zero, so say nothing and let the status line speak.
+    sys.exit(0)
+h = json.loads(raw)
 if not h.get('count'): sys.exit(0)
 oldest = h.get('oldest_age_hours') or 0
 ids = ', '.join(h.get('ids') or [])
@@ -316,7 +372,11 @@ print(f'▸ {h[\"count\"]} pending handoff(s) for you: {ids}{more} (oldest: {old
 for p in h.get('top') or []:
     print(f'    {p[\"id\"]}: {p[\"title\"]}')
 "
+[ "${PIPESTATUS[0]}" -eq 0 ] || echo "▸ WARN: status.sh --field handoffs_inbound failed (rc=${PIPESTATUS[0]}) — inbound-handoff count is UNKNOWN this boot, not zero."
 ```
+
+If that WARN fires, do NOT record or narrate "no pending handoffs". The count is
+unmeasured, which is a different claim from zero and must be reported as such.
 
 Single scan of `aspirations.jsonl` lives in `core/scripts/status.py`
 `collect_handoffs_inbound()`. Do NOT re-implement the scan here — if the

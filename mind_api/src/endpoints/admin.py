@@ -111,6 +111,10 @@ def owncloud_flush(ctx) -> "Response":  # type: ignore[name-defined]
         "conflicts": stats_d.get("conflicts", 0),
         "errors": stats_d.get("errors", 0),
         "pruned_agents": stats_d.get("pruned_agents", 0),
+        # WHICH dirs are unpushable from this box, not just how many
+        # (guard-1579). Sorted so the wrapper's summary line is stable across
+        # runs and diffable; the sweep appends in os.walk order.
+        "pruned_agent_names": sorted(stats_d.get("pruned_agent_names", []) or []),
     })
 
 
@@ -158,8 +162,16 @@ def owncloud_pull(ctx) -> "Response":  # type: ignore[name-defined]
     # avoid a full ~900-file sweep per agent. Absent/empty -> unchanged full pull.
     only_raw = (ctx.query.get("only") or "").strip()
     only = {p.strip() for p in only_raw.split(",") if p.strip()} or None
+    # `with_temp` (): opt INTO the temp/ working-doc sweep, which is
+    # OFF by default because temp/ is not continuity-tier. Absent -> continuity
+    # set only (17 objects), which is what makes this endpoint's cost bounded by
+    # the manifest instead of by scratch population. See pull_continuity's
+    # docstring for the measurement and the machine-move trade-off.
+    with_temp = (ctx.query.get("with_temp") or "").strip().lower() in (
+        "1", "true", "yes")
     try:
-        stats = owncloud_sync.pull_continuity(get_backend(), agent, only=only)
+        stats = owncloud_sync.pull_continuity(get_backend(), agent, only=only,
+                                              include_temp=with_temp)
     except Exception as e:  # noqa: BLE001
         return Response.json(
             {"backend": backend, "ok": False,
@@ -348,8 +360,32 @@ def runner_acquire(ctx) -> "Response":  # type: ignore[name-defined]
             return Response.json(
                 {"backend": backend, "ok": False,
                  "error": f"reclaim-retry failed: {e}"}, status=500)
-        return Response.json(
-            {"backend": backend, "ok": True, "acquired": False, "held": True})
+        # Name the holder on the plain-held answer too, reusing the `prev` read
+        # taken above — this path performs NO additional backend call. Measured
+        # (-a Q1, live end-to-end against production own-cloud): the
+        # held body was exactly {backend, ok, acquired, held} — 4 keys, no
+        # machine_id, no heartbeat_at — so a caller could say only that SOMEONE
+        # holds the claim. runner-claim.sh printed "another machine owns a live
+        # claim", and core/config/start-phase-c.md (the UNINITIALIZED first-boot
+        # path) HALTs on that rc=4 with no holder identity anywhere in its text,
+        # so that sentence was the entire diagnosis a first-boot user received.
+        # Deliberately NOT prev_* : that prefix means "the claim I just broke",
+        # and on this path nothing was broken — the holder is CURRENT and live.
+        # CONDITIONAL by design, same as the stale-break fields above: omitted
+        # when the runner_state row is unreadable, so consumers MUST handle
+        # absence rather than assume presence (-a found three response
+        # shapes, not two).
+        held_resp = {"backend": backend, "ok": True, "acquired": False,
+                     "held": True}
+        if prev:
+            try:
+                hb = int(prev.get("heartbeat_at") or 0)
+                held_resp["holder_machine_id"] = prev.get("machine_id")
+                held_resp["holder_heartbeat_age_seconds"] = max(
+                    0, int(time.time()) - hb)
+            except (TypeError, ValueError):
+                pass
+        return Response.json(held_resp)
     except Exception as e:  # noqa: BLE001 — a bad acquire must not 500-with-stack
         return Response.json(
             {"backend": backend, "ok": False, "error": f"acquire failed: {e}"},
@@ -434,7 +470,8 @@ def runner_claims(ctx) -> "Response":  # type: ignore[name-defined]
             {"backend": backend, "ok": False, "error": f"import failed: {e}"},
             status=500)
     try:
-        claims = get_backend().list_runner_claims()
+        be = get_backend()
+        claims = be.list_runner_claims()
     except Exception as e:  # noqa: BLE001 — DDB Scan error must not 500-with-stack
         msg = str(e)
         payload = {"backend": backend, "ok": False,
@@ -458,6 +495,14 @@ def runner_claims(ctx) -> "Response":  # type: ignore[name-defined]
     return Response.json({
         "backend": backend, "ok": True,
         "environment_id": os.environ.get("ENVIRONMENT_ID", "ayoai-mind"),
+        # The freshness threshold a caller must apply to heartbeat_at to decide
+        # "live" vs "stale". Reported here rather than re-derived caller-side so
+        # there is ONE source of truth: this value was recalibrated 900 -> 3900
+        # after the 2026-07-07 bravo dual-runner incident, and a caller carrying
+        # its own copy would have silently kept stale-breaking live runners.
+        # `getattr` default None = "this daemon cannot tell you" — callers must
+        # treat that as UNREADABLE (refuse), never as fresh (guard-487).
+        "runner_stale_seconds": getattr(be, "runner_stale_seconds", None),
         "claims": [
             {"agent": c.agent, "machine_id": c.machine_id,
              "agent_state": c.agent_state, "heartbeat_at": c.heartbeat_at}

@@ -27,6 +27,7 @@ import importlib.util
 import shutil
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import yaml
@@ -304,6 +305,258 @@ def test_preserve_no_hash_sidecar_when_manifest_lacks_forked_wm_hash(tmp_path):
     assert _staged_path(tmp_path, SID).is_file()
     staged_hash = _staged_path(tmp_path, SID).parent / f"{SID}-wm.hash"
     assert not staged_hash.exists(), "no forked_wm_hash in manifest -> no hash sidecar"
+
+
+# ───────────── -c: staged 3-way delta (baseline-aware _consume_staged) ─────────────
+#
+# THE DEFECT UNDER TEST is counter DOUBLE-COUNTING, not "did a merge happen".
+# Both sides forked from baseline B, so 2-way `r + b` counts B twice. Every
+# assertion below is therefore on a COUNTER THE WORKER NEVER TOUCHED — the case
+# where the correct answer is "unchanged" and the buggy answer is "doubled".
+# A test asserting only that a merge occurred passes under both policies.
+
+def _stage_baseline(pr: Path, sid: str, baseline_wm: dict, name: str = "alpha") -> Path:
+    staged = pr / "agents" / name / "session" / "pending-body-merges"
+    staged.mkdir(parents=True, exist_ok=True)
+    p = staged / f"{sid}-wm-baseline.yaml"
+    with open(p, "w", encoding="utf-8") as f:
+        yaml.dump(baseline_wm, f, default_flow_style=False, sort_keys=False)
+    return p
+
+
+def test_staged_3way_does_not_double_count_untouched_counter(tmp_path):
+    # Worker forked at goals=10 and NEVER advanced it. Reducer is still at 10.
+    # 2-way: 10 + 10 == 20 (wrong). 3-way: 10 + (10 - 10) == 10 (right).
+    pr = _mk_agent(tmp_path, reducer_wm={"slots": {"goals": 10}})
+    _stage(pr, SID, {"slots": {"goals": 10}})
+    _stage_baseline(pr, SID, {"slots": {"goals": 10}})
+    summary = merge.generalize_down("alpha", project_root=pr)
+    assert SID in summary["staged_merged"]
+    assert _read_reducer(pr)["slots"]["goals"] == 10, \
+        "untouched counter was double-counted -> staged merge is still 2-way"
+
+
+def test_staged_3way_credits_only_the_worker_delta(tmp_path):
+    # Concurrent advance: baseline 10, worker -> 13 (+3), reducer -> 12 (+2).
+    # 2-way: 12 + 13 == 25 (double-counts the shared 10). 3-way: 12 + 3 == 15.
+    pr = _mk_agent(tmp_path, reducer_wm={"slots": {"goals": 12}})
+    _stage(pr, SID, {"slots": {"goals": 13}})
+    _stage_baseline(pr, SID, {"slots": {"goals": 10}})
+    merge.generalize_down("alpha", project_root=pr)
+    assert _read_reducer(pr)["slots"]["goals"] == 15
+
+
+def test_staged_without_baseline_retains_2way_sum_fallback(tmp_path):
+    # No baseline sidecar (pre--c staging, or a crash-preserve that
+    # could not capture one) -> the RETAINED 2-way union+SUM must still apply.
+    # This is a strict upgrade, never a replacement.
+    pr = _mk_agent(tmp_path, reducer_wm={"slots": {"goals": 10}})
+    _stage(pr, SID, {"slots": {"goals": 10}})
+    summary = merge.generalize_down("alpha", project_root=pr)
+    assert SID in summary["staged_merged"]
+    assert _read_reducer(pr)["slots"]["goals"] == 20, \
+        "2-way fallback regressed -- a baseline-less orphan must still union+SUM"
+
+
+def test_staged_baseline_is_consumed_with_the_wm(tmp_path):
+    pr = _mk_agent(tmp_path, reducer_wm={"slots": {"goals": 1}})
+    staged_wm = _stage(pr, SID, {"slots": {"goals": 2}})
+    staged_base = _stage_baseline(pr, SID, {"slots": {"goals": 1}})
+    merge.generalize_down("alpha", project_root=pr)
+    assert not staged_wm.exists()
+    assert not staged_base.exists(), "baseline sidecar leaked -- not consumed once"
+
+
+def test_staged_malformed_baseline_falls_back_to_2way_without_raising(tmp_path):
+    # Truncated/half-copied baseline is a REAL shape here: staging is the
+    # crash-preserve path. It must degrade to 2-way, not abort the whole drain.
+    pr = _mk_agent(tmp_path, reducer_wm={"slots": {"goals": 10}})
+    _stage(pr, SID, {"slots": {"goals": 10}})
+    bad = pr / "agents" / "alpha" / "session" / "pending-body-merges" / f"{SID}-wm-baseline.yaml"
+    bad.write_text(": : not valid yaml : :\n", encoding="utf-8")
+    summary = merge.generalize_down("alpha", project_root=pr)
+    assert SID in summary["staged_merged"]
+    assert _read_reducer(pr)["slots"]["goals"] == 20  # 2-way fallback
+    assert not bad.exists()
+
+
+def test_staged_never_diverged_noop_outranks_the_3way_branch(tmp_path):
+    # Guard 2 (hash short-circuit) must still win over Guard 3: a never-diverged
+    # orphan is consumed WITHOUT merging even when a baseline is present.
+    pr = _mk_agent(tmp_path, reducer_wm={"slots": {"goals": 10}})
+    staged_wm = _stage(pr, SID, {"slots": {"goals": 10}})
+    _stage_baseline(pr, SID, {"slots": {"goals": 10}})
+    h = hashlib.sha256(staged_wm.read_bytes()).hexdigest()
+    (staged_wm.parent / f"{SID}-wm.hash").write_text(h, encoding="utf-8")
+    summary = merge.generalize_down("alpha", project_root=pr)
+    assert SID in summary["noop"]
+    assert SID not in summary["staged_merged"]
+
+
+def test_orphan_baseline_alone_is_not_drained_as_a_wm(tmp_path):
+    # Naming guard: `-wm-baseline.yaml` must NOT match the `*-wm.yaml` drain
+    # glob, or a baseline would be merged as if it were a worker WM.
+    pr = _mk_agent(tmp_path, reducer_wm={"slots": {"goals": 10}})
+    orphan = _stage_baseline(pr, SID, {"slots": {"goals": 999}})
+    summary = merge.generalize_down("alpha", project_root=pr)
+    assert summary["scanned"] == 0
+    assert summary["staged_merged"] == []
+    assert _read_reducer(pr)["slots"]["goals"] == 10
+    assert orphan.exists(), "a lone baseline is not a WM -- must not be drained"
+
+
+# ─────────── -c PRODUCER: cleanup-stale-bindings stages the baseline ───────────
+
+def test_preserve_stages_baseline_when_the_fork_writer_left_one(tmp_path):
+    # Without this the consumer's 3-way branch has no producer and is dead code.
+    script = _repo_skeleton(tmp_path)
+    bd = _mk_body_dir(tmp_path, SID, "closed-pending-merge")
+    (bd / "forked-wm-baseline.yaml").write_text("slots:\n  goals: 7\n", encoding="utf-8")
+    r = _call_preserve(script, "alpha", bd, SID)
+    assert r.returncode == 0, r.stderr
+    staged_base = _staged_path(tmp_path, SID).parent / f"{SID}-wm-baseline.yaml"
+    assert staged_base.is_file(), f"expected staged baseline; stderr={r.stderr}"
+    assert "goals: 7" in staged_base.read_text(encoding="utf-8")
+
+
+def test_preserve_no_baseline_sidecar_when_fork_left_none(tmp_path):
+    # Absent baseline is NORMAL (legacy fork / crash-preserve) -> silent, and the
+    # WM is still staged so the 2-way fallback can serve it.
+    script = _repo_skeleton(tmp_path)
+    bd = _mk_body_dir(tmp_path, SID, "closed-pending-merge")  # no baseline written
+    r = _call_preserve(script, "alpha", bd, SID)
+    assert r.returncode == 0, r.stderr
+    assert _staged_path(tmp_path, SID).is_file()
+    staged_base = _staged_path(tmp_path, SID).parent / f"{SID}-wm-baseline.yaml"
+    assert not staged_base.exists()
+
+
+def test_preserve_writes_trigger_last_so_sidecars_are_never_missed(tmp_path):
+    # ORDERING PIN (-c fresh-eyes). _consume_staged globs `*-wm.yaml`,
+    # so the WM is the CONSUMER'S TRIGGER and every sidecar must exist before it
+    # appears. If the WM is written first, a concurrent generalize_down sees it
+    # without its sidecars and silently degrades: no baseline -> 2-way SUM (the
+    # double-count), no hash -> guard 2 skipped. Both degraded paths are valid for
+    # a genuinely sidecar-less staging, so the race produces a wrong number with
+    # NO error. Asserting on mtime is unreliable at this resolution; assert on the
+    # SOURCE ORDER instead, which is what actually governs.
+    src = CLEANUP_SH.read_text(encoding="utf-8")
+    body = src[src.index("_preserve_unmerged_body_wm() {"):]
+    body = body[: body.index("\n}\n")]
+    wm_at = body.index('"$_STAGE_DIR/${_SID}-wm.yaml"')
+    hash_at = body.index('"$_STAGE_DIR/${_SID}-wm.hash"')
+    base_at = body.index('"$_STAGE_DIR/${_SID}-wm-baseline.yaml"')
+    assert hash_at < wm_at, "hash sidecar must be staged BEFORE the -wm.yaml trigger"
+    assert base_at < wm_at, "baseline sidecar must be staged BEFORE the -wm.yaml trigger"
+
+
+def test_preserve_stages_all_three_with_baseline_present(tmp_path):
+    # End-to-end companion to the ordering pin: all three land for a worker fork
+    # that has a baseline AND a forked_wm_hash.
+    script = _repo_skeleton(tmp_path)
+    bd = _mk_body_dir(tmp_path, SID, "closed-pending-merge")
+    (bd / "body-manifest.yaml").write_text(
+        f"unitKey: {SID}\nmindKey: alpha\nbody_state: closed-pending-merge\n"
+        f"forked_wm_hash: abc123def456\n", encoding="utf-8")
+    (bd / "forked-wm-baseline.yaml").write_text("slots:\n  goals: 7\n", encoding="utf-8")
+    r = _call_preserve(script, "alpha", bd, SID)
+    assert r.returncode == 0, r.stderr
+    staged = _staged_path(tmp_path, SID)
+    assert staged.is_file()
+    assert (staged.parent / f"{SID}-wm.hash").is_file()
+    assert (staged.parent / f"{SID}-wm-baseline.yaml").is_file()
+
+
+# ───────── : the SAME trigger-last rule on the G2b close-time path ─────────
+#
+# The pin above covers the bash reap path only. body-manifest.py's close-time
+# path had the rule INVERTED at both of its stages until . These two
+# pins assert the OBSERVED sequence rather than a source-text index, because
+# here the order is executable: the write loop and the push loop can both be
+# run against a recorder.
+
+bm = _load("body_manifest", "body-manifest.py")
+
+
+class _RecordingBackend:
+    """Records the ORDER of write_bytes targets.
+
+    guard-2220: answers by ARGUMENT IDENTITY (it records whatever path it is
+    handed and always returns the same thing), never by a positional queue of
+    returns. A `side_effect=[...]` list would silently encode the production
+    call ORDER — the very thing these tests exist to assert — so adding a call
+    upstream would shift every later answer and redden unrelated tests.
+    """
+
+    def __init__(self):
+        self.pushed: list[str] = []
+
+    def write_bytes(self, target, data):  # noqa: D102 — stub
+        self.pushed.append(Path(target).name)
+        return True
+
+
+def _install_stub_backend(monkeypatch, backend):
+    """push_staged_files imports storage_backend INSIDE the function, so the
+    stub has to be in sys.modules at call time rather than patched on bm."""
+    mod = types.ModuleType("storage_backend")
+    mod.get_backend = lambda: backend
+    monkeypatch.setitem(sys.modules, "storage_backend", mod)
+
+
+def _mk_staged(tmp_path: Path, unit_key: str) -> Path:
+    staged = tmp_path / "session" / "pending-body-merges"
+    staged.mkdir(parents=True)
+    (staged / f"{unit_key}-wm.yaml").write_text("slots: {}\n", encoding="utf-8")
+    (staged / f"{unit_key}-wm-baseline.yaml").write_text("slots: {}\n", encoding="utf-8")
+    (staged / f"{unit_key}-wm.hash").write_text("deadbeef\n", encoding="utf-8")
+    return staged
+
+
+def test_push_staged_files_pushes_trigger_last(tmp_path, monkeypatch):
+    # Asserts the PUSH sequence. This half matters more than the write half:
+    # each write_bytes is a separate backend round trip to a store a reducer on
+    # ANOTHER box polls, so a trigger pushed first is remotely visible for two
+    # more round trips before its sidecars land.
+    uk = "sid-push-order"
+    staged = _mk_staged(tmp_path, uk)
+    be = _RecordingBackend()
+    _install_stub_backend(monkeypatch, be)
+
+    assert bm.push_staged_files(staged, uk) is True
+    assert len(be.pushed) == 3, f"expected all three pushed, got {be.pushed}"
+    assert be.pushed[-1] == f"{uk}-wm.yaml", (
+        f"the -wm.yaml TRIGGER must be pushed LAST; observed order {be.pushed}. "
+        "body-merge.py globs '*-wm.yaml' as the only enumerator of the staging "
+        "dir, so a trigger visible before its sidecars is consumed without them "
+        "(2-way SUM double-count, guard 2 skipped) and then unlinks all three — "
+        "orphaning the sidecars that arrive afterwards permanently.")
+
+
+def test_stage_and_push_writes_trigger_last(tmp_path, monkeypatch):
+    # Asserts the local WRITE sequence, the sibling of the push pin above.
+    uk = "sid-write-order"
+    session_dir = tmp_path / "sessions" / uk
+    session_dir.mkdir(parents=True)
+    (session_dir / bm._WM_FILENAME).write_text("slots: {}\n", encoding="utf-8")
+    (session_dir / bm._BASELINE_FILENAME).write_text("slots: {}\n", encoding="utf-8")
+    state_dir = tmp_path / "session"
+    (state_dir / "pending-body-merges").mkdir(parents=True)
+
+    written: list[str] = []
+    real_write = bm._write_atomic_bytes
+    monkeypatch.setattr(
+        bm, "_write_atomic_bytes",
+        lambda target, data: (written.append(Path(target).name),
+                              real_write(target, data))[1])
+    _install_stub_backend(monkeypatch, _RecordingBackend())
+
+    assert bm._stage_and_push(
+        session_dir, state_dir,
+        {"unitKey": uk, "forked_wm_hash": "deadbeef"}) is True
+    assert len(written) == 3, f"expected all three staged, got {written}"
+    assert written[-1] == f"{uk}-wm.yaml", (
+        f"the -wm.yaml TRIGGER must be WRITTEN LAST; observed order {written}")
 
 
 if __name__ == "__main__":

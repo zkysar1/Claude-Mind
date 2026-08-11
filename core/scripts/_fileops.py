@@ -216,6 +216,18 @@ _SNAPSHOT_BLACKLIST = {
     "meta": (
         "gate-firings.jsonl",   # append-only gate-decision audit log (file IS the history)
     ),
+    "agent": (
+        # Both are append-only telemetry ledgers on HOT paths, added when their
+        # writers moved off bare open(...,"a") onto locked_append_jsonl
+        # (-e). Same class as meta/gate-firings.jsonl above: the file IS
+        # the history, and a full-file snapshot per append is O(N^2) — these fire
+        # once per skill invocation and once per loop iteration respectively, so
+        # unblacklisted they would snapshot a multi-thousand-line file thousands
+        # of times. No .history subtree to delete alongside this addition: the
+        # prior writers were bare appends, so neither store ever had one.
+        "skill-invocations.jsonl",  # one append per skill fire (2 hook writers)
+        "health/",                  # per-date self-health ledger, one append per iteration
+    ),
 }
 
 
@@ -664,6 +676,21 @@ def append_changelog(base_dir, agent_name, file_path, action, summary="", lines_
         "summary": summary,
         "lines_changed": lines_changed,
     }
+
+    #  part (3) — session_id/body attribution is DELIBERATELY ABSENT
+    # here, and must NOT be added as `os.environ.get("MIND_SID")`. Measured
+    # 2026-08-03 (cc-02): the live daemon process carries the MIND_SID of
+    # whichever session happened to SPAWN it (observed pid 3155606 holding
+    # zeta's SID), and every agent's writes route through that one long-lived
+    # process. A process-env read here would therefore stamp EVERY daemon-routed
+    # changelog line with one arbitrary session's id, for as long as that daemon
+    # lives — systematically wrong attribution that reads as authoritative,
+    # which is strictly worse than the field being absent.
+    # Correct design: thread the caller's SID down from the daemon's PER-REQUEST
+    # ctx (the standard .claude/rules/path-resolution.md already sets for paths)
+    # and take it as an explicit parameter. Tracked as the daemon half of
+    # fix set B; do not shortcut it with a process-env read or a heuristic
+    # "am I the daemon" probe.
 
     # Multi-agent concurrency: caller-side locks protect the file being edited
     # but NOT the shared changelog.jsonl. Two agents writing different files

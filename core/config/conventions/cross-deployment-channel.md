@@ -168,6 +168,70 @@ collision-set name refuses too, because the shared channel is read from both
 sides and each side's "local" differs. Loosening that requires amending THIS
 convention, not the enforcement.
 
+**AMENDED 2026-08-08 (g-115-4980, zeta, `hostname` cc-02, `uname -r`
+6.8.0-136-generic) — clause 3 is now 3a + 3b, and author-agnosticism is
+RETIRED.** The paragraph above is what reserved this change; this is that
+amendment, and the sentence it retires was right about the hazard and wrong
+about the remedy.
+
+*The measurement.* Over 10,324 de-duplicated board messages across 8 channels
+since 2026-07-22 (17 days): **48** bare `requires_action_by:zeta` triggers in
+the TAGS field — the field `resolve_addressing` reads. (9 further bare-`zeta`
+mentions are prose in message bodies and were never routing tags; count the
+tags, not the record.) Clause 3a refused all 48 and prevented **zero** wrong
+routes. Authors: alpha 15, foxtrot 11, echo 10, bravo 9, zeta 2, omni 1. **Zero
+bare triggers have ever been authored by an @-qualified author**, all 3
+qualified zeta-targets say `zeta@ayoai-mind`, and nobody has ever written
+`zeta@zds-mind`.
+
+*The rule.* **3b — a bare collision-set name resolves LOCAL when the author is
+an unqualified member of the local roster who is not themselves in the collision
+set.** An unqualified name means "in the speaker's namespace"; when the speaker
+is unambiguously ours, so is the referent. Tagged `addressing:
+author_scoped_local` and counted as `addressing_author_scoped` in the JSON
+summary — a path that resolves what the rule otherwise refuses must be
+countable, never silent (guard-2586, guard-1753). 3a is unchanged for everyone
+else.
+
+*Why this preserves the both-sides property the retired sentence protected.*
+The invariant is not "refuse everything ambiguous" — it is **exactly one side
+routes any given post**. Author-scoping satisfies it: alpha/bravo/echo/foxtrot
+are absent from zds-mind's roster, so the same post read from there has a
+non-roster author and refuses there. `a_name not in collision` is the
+load-bearing clause: an author who is ITSELF in the collision set (`zeta`, 2 of
+the 48) would resolve locally on BOTH sides — a double-route, strictly worse
+than 3a's refusal. Refused, deliberately.
+
+*Roster membership, not `@`-presence, is the discriminator — and this is
+measured, not stylistic.* The peer operator posts under BOTH `omni` and
+`omni@zds-mind`; `split_author("omni")` returns `("omni", None)`, so an
+`@`-based test classifies its unqualified posts as local. That also means the
+existing peer-author OBSERVATION pass (which only widens `peer_agents` on
+`a_env in peer_envs`) cannot see them either — an independent finding this
+amendment does not fix. `omni` ∉ the local roster, so 3b refuses it correctly.
+Note its one bare-`zeta` post, `msg-20260727-011523-omni-4540`, carries
+`affects:g-115-3372` — an ayoai-mind goal — so it did mean THIS zeta; refusing
+it is conservative, not correct-by-luck, and the qualification that recovers it
+is one edit by its author.
+
+*Retired local agents stay refused.* `delta` and `charlie` are absent from the
+roster (their `agents/` dirs survive but the team-state shards do not), so their
+bare posts refuse under 3b. That is the fail-closed direction and they author no
+new triggers; it is a known conservatism, not an oversight.
+
+*Blast radius, enumerated before the flip (guard-1562).* The collision set is
+`{zeta}` — verified live, one name in the entire fleet — so 3b changes the
+verdict for bare-`zeta` targets and nothing else: 45 of 48 newly resolve, 3
+still refuse. Live dry-run after the change: `addressing_refused` 0,
+`addressing_author_scoped` 1, `out_of_window_digest_refused` 0.
+
+*The emitter keeps qualifying unconditionally.* 3b makes the local digest
+round-trip survive a bare tag, but `zeta@<env-id>` is still the only form that
+tells the PEER whose zeta a digest means. 3b is a floor under posts from authors
+we cannot re-author — not a licence to stop qualifying our own. Regression pins
+added: 5 in `test_insight_trigger_sweep_addressing.py`, 1 in
+`test_insight_trigger_sweep_out_of_window.py`.
+
 **THE ORDERING HAZARD ALREADY FIRED — this is live, not theoretical.**
 g-115-3929 warned that fixing the DELIVERY path without addressing would activate
 the misroute. g-115-3925 (the delivery fix) completed 2026-07-30T00:19:36. So the
@@ -232,6 +296,49 @@ export PEER_WORLD_ZDS_MIND=/path/to/zds-mind/world
 
 **The command never falls back to the local board.** A fallback would silently
 post to the wrong world, which is worse than not posting.
+
+#### It is BACKEND-dependent too, and that half does not resolve by finding a better box
+
+"BOX-DEPENDENT" is true and incomplete, and the missing half changes what you
+should do about exit 3. Read the `backend:` key of every registry entry
+(measured 2026-08-08, cc-02):
+
+| env-id | backend | who can write its board |
+|---|---|---|
+| `ayoai-mind` | `own-cloud` | **any box holding the bucket credentials** |
+| `zds-mind` | `local` | only a box that HOSTS its filesystem |
+| `claude-mind` | `local` | only a box that HOSTS its filesystem |
+| `local` | `local` | only itself |
+
+That table is the mechanism behind the inbound/outbound asymmetry measured at
+the top of this file. It is not that peers are better at crossing than we are:
+**this world's board is cloud-backed, so a credentialed peer reaches it from
+anywhere, while a `backend: local` peer's board is a filesystem path with no
+shared store to write through at all.** 139 posts came in because inbound is
+cheap; outbound is unmeasurable from here because for these particular peers it
+is *structurally* unavailable, not merely unconfigured.
+
+So the `export PEER_WORLD_ZDS_MIND=...` recipe above is not a setting some
+better-placed fleet box is missing — it presupposes a box that already hosts the
+peer's filesystem, and no `ayoai-mind` box does. Consequence when triaging a
+relay: for a `backend: local` peer, do NOT route the work to "an agent whose box
+can resolve the peer world" (guard-2082 warns against this and this is *why*
+there is no such agent to route to), and do NOT record the relay as pending a
+reachable box. The local-addressed post below is the terminal delivery mechanism
+available to this deployment, not a stopgap. `zds-mind.yaml` documents its own
+cutover — the operator sets `backend: own-cloud` there when cutting over — so
+this resolves on that cutover and on nothing an agent here can do.
+
+Scope, stated precisely rather than universally: what is measured is that
+`zds-mind` is unwritable from any box not hosting its filesystem, and that the
+registry offers no shared-store path that would change that. A box that DOES
+host it is still reachable, exactly as the recipe above says.
+
+The same backend pair is carried by `guard-1851` for a different purpose (never
+inherit the caller's backend when writing to a peer). Per `guard-130`, treat
+these as two copies of one constant: if a peer's `backend:` changes, this table
+and that guardrail must move together, and the registry file is the source of
+truth for both.
 
 ### UNREACHABLE ≠ UNDELIVERABLE — the peer reads THIS board
 

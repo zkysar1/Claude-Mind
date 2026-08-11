@@ -252,3 +252,120 @@ class TestByteCompat:
         assert _norm_yaml_text(dmn_meta) == _norm_yaml_text(cli_meta)
         dmn_data = yaml.safe_load((dmn_meta / "improvement-velocity.yaml").read_text(encoding="utf-8"))
         assert dmn_data["entries"][-1]["active_meta_changes"] == ["mc-001", "mc-002"]
+
+
+# ---------------------------------------------------------------------------
+#  — per-close idempotency key (close_key)
+#
+# THE LIVE PATH. meta-impk.sh is DAEMON-ONLY (no Python CLI fallback), so the
+# dedup only exists if it exists HERE — a fix applied to core/scripts/meta-impk.py
+# alone would be completely inert in production. These pin the daemon handler
+# directly, and one pins it over a real HTTP round-trip so the route + query
+# parsing are covered too.
+# ---------------------------------------------------------------------------
+
+class TestCloseKeyDedup:
+    def test_http_second_snapshot_same_key_suppressed(self, running_daemon):
+        """End-to-end over HTTP: two POSTs, one close key -> one row, both 200."""
+        project_root, port = running_daemon
+        meta = project_root / "meta"
+        _seed_velocity(meta, 2)
+        key = "g-115-4542:2026-08-09T18:26:55"
+
+        status, body = _http(port, "POST", "/v1/meta/impk/snapshot",
+                             {"goal_id": "g-115-4542", "learning_value": "0.8",
+                              "close_key": key})
+        assert status == 200
+        assert json.loads(body)["status"] == "recorded"
+
+        status, body = _http(port, "POST", "/v1/meta/impk/snapshot",
+                             {"goal_id": "g-115-4542", "learning_value": "0.8",
+                              "close_key": key})
+        assert status == 200, "suppression must be 200, not an error status"
+        assert json.loads(body)["status"] == "duplicate_suppressed"
+
+        data = yaml.safe_load((meta / "improvement-velocity.yaml").read_text(encoding="utf-8"))
+        assert len(data["entries"]) == 3, "duplicate must not append a 4th row"
+
+    def test_http_suppression_does_not_move_windows(self, running_daemon):
+        """The defect was a double-WEIGHTING — assert the derived values hold."""
+        project_root, port = running_daemon
+        meta = project_root / "meta"
+        _seed_velocity(meta, 5)
+        key = "g-8-88:2026-08-09T19:00:00"
+        _http(port, "POST", "/v1/meta/impk/snapshot",
+              {"goal_id": "g-8-88", "learning_value": "0.95", "close_key": key})
+        before = yaml.safe_load(
+            (meta / "improvement-velocity.yaml").read_text(encoding="utf-8"))["rolling_averages"]
+        _http(port, "POST", "/v1/meta/impk/snapshot",
+              {"goal_id": "g-8-88", "learning_value": "0.95", "close_key": key})
+        after = yaml.safe_load(
+            (meta / "improvement-velocity.yaml").read_text(encoding="utf-8"))["rolling_averages"]
+        assert after == before
+
+    def test_http_no_history_or_changelog_written_on_suppression(self, running_daemon):
+        """A write that did not happen must leave no audit trail of happening."""
+        project_root, port = running_daemon
+        meta = project_root / "meta"
+        _seed_velocity(meta, 2)
+        key = "g-5-55:2026-08-09T20:00:00"
+        _http(port, "POST", "/v1/meta/impk/snapshot",
+              {"goal_id": "g-5-55", "learning_value": "0.5", "close_key": key})
+        cl_before = len(_norm_changelog(meta))
+        _http(port, "POST", "/v1/meta/impk/snapshot",
+              {"goal_id": "g-5-55", "learning_value": "0.5", "close_key": key})
+        assert len(_norm_changelog(meta)) == cl_before, \
+            "suppressed duplicate must not append a changelog edit"
+
+    def test_recurring_closes_survive(self, tmp_path):
+        """Same goal, different closes -> both rows. The 2,066-row protection."""
+        from mind_api.src.meta import meta_impk
+        meta = tmp_path / "m"
+        _seed_velocity(meta, 0)
+        meta_impk.snapshot(_FakeCtx(meta, {
+            "goal_id": "g-001-01", "learning_value": "0.4",
+            "close_key": "g-001-01:2026-08-09T08:00:00"}))
+        meta_impk.snapshot(_FakeCtx(meta, {
+            "goal_id": "g-001-01", "learning_value": "0.6",
+            "close_key": "g-001-01:2026-08-09T14:00:00"}))
+        data = yaml.safe_load((meta / "improvement-velocity.yaml").read_text(encoding="utf-8"))
+        assert [e["learning_value"] for e in data["entries"]] == [0.4, 0.6]
+
+    def test_cli_daemon_parity_with_close_key(self, tmp_path):
+        """Byte-compat holds on the new path too — CLI and daemon must not drift."""
+        from mind_api.src.meta import meta_impk
+        cli_meta = tmp_path / "cli"
+        dmn_meta = tmp_path / "dmn"
+        _seed_velocity(cli_meta, 2)
+        _seed_velocity(dmn_meta, 2)
+        key = "g-3-33:2026-08-09T21:00:00"
+        cli_out = _run_cli(cli_meta, [
+            "snapshot", "--goal-id", "g-3-33", "--learning-value", "0.4",
+            "--close-key", key]).stdout
+        resp = meta_impk.snapshot(_FakeCtx(dmn_meta, {
+            "goal_id": "g-3-33", "learning_value": "0.4", "close_key": key}))
+        assert resp.body.decode("utf-8") == cli_out
+        assert _norm_yaml_text(dmn_meta) == _norm_yaml_text(cli_meta)
+
+        # ...and the SUPPRESSED response is byte-identical across both too.
+        cli_dup = _run_cli(cli_meta, [
+            "snapshot", "--goal-id", "g-3-33", "--learning-value", "0.4",
+            "--close-key", key]).stdout
+        dmn_dup = meta_impk.snapshot(_FakeCtx(dmn_meta, {
+            "goal_id": "g-3-33", "learning_value": "0.4",
+            "close_key": key})).body.decode("utf-8")
+        assert dmn_dup == cli_dup
+        assert json.loads(dmn_dup)["status"] == "duplicate_suppressed"
+
+    def test_absent_close_key_unchanged(self, tmp_path):
+        """No key -> unconditional append, and no close_key field on the row."""
+        from mind_api.src.meta import meta_impk
+        meta = tmp_path / "m"
+        _seed_velocity(meta, 0)
+        for _ in range(3):
+            resp = meta_impk.snapshot(_FakeCtx(meta, {
+                "goal_id": "g-7-07", "learning_value": "0.3"}))
+            assert json.loads(resp.body.decode("utf-8"))["status"] == "recorded"
+        data = yaml.safe_load((meta / "improvement-velocity.yaml").read_text(encoding="utf-8"))
+        assert len(data["entries"]) == 3
+        assert all("close_key" not in e for e in data["entries"])

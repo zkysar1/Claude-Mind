@@ -68,6 +68,72 @@ def split_author(author):
     return text, None
 
 
+def parse_routing_tag(tag):
+    """One board ROUTING TAG -> (agent, env-id|None).
+
+    Strips an optional `requires_action_by:` prefix, then defers to
+    split_author so the tag rule and the author rule can never disagree about
+    where the boundary is.
+    """
+    text = str(tag or "")
+    if text.startswith("requires_action_by:"):
+        text = text.split(":", 1)[1]
+    return split_author(text)
+
+
+def routing_tag_targets_agent(tag, agent_name, self_env):
+    """Does one board tag route work to `agent_name` on THIS deployment?
+
+    Accepts BOTH addressing forms, which is the whole point (g-115-4188):
+      bare       -- `zeta`, `requires_action_by:zeta`
+      qualified  -- `zeta@ayoai-mind`, `requires_action_by:zeta@ayoai-mind`
+
+    The qualified form is what cross-deployment-channel.md RECOMMENDS for a
+    collision-set agent (a name declared by more than one deployment's roster),
+    and insight-trigger-sweep.py's refusal path actively tells posters to write
+    it. The consumers this replaced tested `f"requires_action_by:{agent}" in
+    tags` (or `parsed != agent`) -- exact string equality, which the qualified
+    form fails. So bare was LOUDLY REFUSED upstream while qualified was
+    SILENTLY DROPPED downstream: a pincer, in which qualifying posts to satisfy
+    the sweep converts a visible failure into an invisible one.
+
+    NOT A PATTERN MATCH (guard-2860). The comparison is component-wise equality
+    on a parsed (agent, env) pair -- never a prefix, glob, or startswith. A
+    `split("@")[0] == agent_name` shortcut would admit `zeta@zds-mind`, i.e. a
+    PEER DEPLOYMENT's same-named agent, as if it were the local one. The
+    cardinality of what this newly admits is therefore a property of the CODE
+    (exactly the self-env-qualified form) and not of whatever is on disk.
+
+    UNRESOLVABLE self_env FAILS OPEN, AND DELIBERATELY DIVERGES FROM THE SWEEP
+    (guard-1562 -- name what each direction newly admits or refuses).
+    insight-trigger-sweep.py REFUSES an explicit @env target when
+    ENVIRONMENT_ID is unresolvable, which is right for the sweep: its action is
+    FILING A GOAL, so a wrong route is a durable cross-deployment mutation, and
+    its refusal is recoverable because it names the post. The consumers here
+    print an advisory / decide whether to surface work to their own agent. A
+    false positive is one dismissible line; a false negative is a silent
+    lane-skip of a directive aimed at this agent -- the guard-1310 incident
+    class. Different action, different fail-safe direction. Do NOT "align" the
+    two by copying the sweep's posture.
+    """
+    agent, env = parse_routing_tag(tag)
+    if agent != agent_name:
+        return False
+    if env is None:
+        return True          # bare -> unchanged behavior (353 of 360 live tags)
+    if not self_env:
+        # FALSY, not `is None` (fresh-eyes on this file's own first cut). Both
+        # live callers pass _paths.ENVIRONMENT_ID, whose trailing `or None`
+        # normalizes falsy to None -- so `is None` was correct for them and the
+        # gap was LATENT, never live. But the contract above is "unresolvable
+        # fails OPEN", and a caller writing the natural
+        # os.environ.get("ENVIRONMENT_ID", "") would hand us "" and get
+        # fail-CLOSED: every qualified tag silently dropped, the exact defect
+        # this function exists to fix, in the opposite direction and invisible.
+        return True
+    return env == self_env   # @self-env is me; @peer-env is not
+
+
 def classify(rows, self_env, registry, roster):
     """Partition board rows into confirmed-peer / attributed / unattributed."""
     peer_envs = {e for e in registry if e != self_env}

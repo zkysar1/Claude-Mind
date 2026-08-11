@@ -297,8 +297,74 @@ def _collect_companion_script_dates(ctx, skill_names, forged_skills):
     return out
 
 
+def _collect_triage_verdicts(ctx, skill_names):
+    """Map skill -> most recent SETTLED triage verdict from completed goals.
+
+    Mirror of core/scripts/skill-discovery.py::collect_triage_verdicts
+    (g-115-3084). Ported here 2026-08-01 by g-115-4326: the CLI shipped this
+    2026-07-27 (239e5cc7e) and it was never ported, so under the daemon-only
+    architecture — where the daemon is the ONLY live path — the suppression has
+    been inert in production for its entire existence. Measured direction: CLI
+    8 occurrences of verdict_suppressed*, daemon 0.
+
+    RAW LOCAL READ, DELIBERATELY — no get_backend().ensure_local() unlike
+    _read_yaml above. This mirrors the CLI, whose docstring establishes the
+    staleness as fail-safe (guard-980/1139): an unsynced verdict is simply not
+    found, suppression does not fire, and behavior degrades to today's
+    re-flagging. The failure direction is toward the status quo, never toward
+    wrongly silencing a live signal. Adding ensure_local on THIS side only would
+    make the daemon read more than the reference implementation and break the
+    very byte-compat parity this port exists to restore — if it is wanted, it is
+    a change to BOTH tiers and its own decision.
+    """
+    verdicts = {}
+    path = ctx.paths.world / "aspirations.jsonl"
+    if not path.exists():
+        return verdicts
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        # CLI warns on stderr here; the daemon has no stderr channel per
+        # request, and the degradation is identical (suppression disabled).
+        return verdicts
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            asp = json.loads(line)
+        except ValueError:
+            continue
+        for goal in asp.get("goals", []) or []:
+            if goal.get("status") != "completed":
+                continue
+            note = goal.get("outcome_note") or goal.get("description") or ""
+            # Require an explicit settled KEEP. A RETIRE verdict must NOT
+            # suppress — it prescribes a different action that still needs doing.
+            if not re.search(r"\bKEEP\b", note):
+                continue
+            key_text = "{} {}".format(goal.get("title") or "",
+                                      goal.get("origin_signal") or "")
+            when = (_parse_iso(goal.get("completed_at"))
+                    or _parse_iso(goal.get("last_modified"))
+                    or _parse_iso(goal.get("created_at")))
+            if when is None:
+                continue
+            for skill_name in skill_names:
+                if skill_name and skill_name in key_text:
+                    prev = verdicts.get(skill_name)
+                    if prev is None or when > prev["verdict_date"]:
+                        verdicts[skill_name] = {
+                            "goal_id": goal.get("id"),
+                            "verdict": "KEEP",
+                            "verdict_date": when,
+                        }
+    return verdicts
+
+
 def _classify(skill_name, forged_info, quality_data, relations_data,
-              journal_dates, companion_dates, ledger_dates, strategy, now):
+              journal_dates, companion_dates, ledger_dates, strategy, now,
+              verdicts=None):
     forged_date = _parse_iso(forged_info.get("forged_date"))
     days_since_forge = _days_between(forged_date, now)
 
@@ -364,6 +430,46 @@ def _classify(skill_name, forged_info, quality_data, relations_data,
     elif status == "declining":
         action_required = True
 
+    # Re-flagging a skill on the same unchanged metric AFTER it was already
+    # triaged to KEEP is measurement noise, not signal ().
+    #
+    # rb-3132 IS THE LOAD-BEARING CONSTRAINT: a same-class recurrence AFTER a
+    # remediated verdict FALSIFIES that verdict. So suppression is not a blanket
+    # mute — any invocation dated after the verdict means the skill was used and
+    # went cold AGAIN, which is new signal and must re-flag. Suppression applies
+    # only while the metric is genuinely unchanged since the verdict.
+    #
+    # Optional section, gated at the call site per _load_strategy()'s contract —
+    # an older strategy file simply keeps today's behavior.
+    suppression = strategy.get("verdict_suppression") or {}
+    verdict_suppressed = None
+    if action_required and suppression.get("enabled") and verdicts:
+        v = verdicts.get(skill_name)
+        if v is not None:
+            verdict_age = _days_between(v["verdict_date"], now)
+            new_signal_since_verdict = (
+                last_invocation is not None and last_invocation > v["verdict_date"]
+            )
+            if (
+                verdict_age is not None
+                and verdict_age <= suppression["window_days"]
+                and not new_signal_since_verdict
+            ):
+                action_required = False
+                verdict_suppressed = {
+                    "verdict": v["verdict"],
+                    "verdict_goal": v["goal_id"],
+                    "verdict_date": v["verdict_date"].isoformat(),
+                    "verdict_age_days": round(verdict_age, 2),
+                    "window_days": suppression["window_days"],
+                    "reason": (
+                        "already triaged to KEEP by {} {:.0f}d ago and no invocation "
+                        "since — same unchanged metric, no new signal (g-115-3084; "
+                        "rb-3132 recurrence check passed)".format(
+                            v["goal_id"], verdict_age)
+                    ),
+                }
+
     triage_hints = strategy["triage_hint_templates"].get(status, "")
 
     if total_invocations == 0:
@@ -392,6 +498,10 @@ def _classify(skill_name, forged_info, quality_data, relations_data,
         "decline_signal": decline_signal,
         "status": status,
         "action_required": action_required,
+        # Position is load-bearing: json.dumps preserves insertion order and the
+        # byte-compat tests compare rendered bytes, so this key must sit between
+        # action_required and triage_hints exactly as the CLI emits it.
+        "verdict_suppressed": verdict_suppressed,
         "triage_hints": triage_hints,
     }
 
@@ -407,6 +517,9 @@ def build_report(ctx, now: datetime) -> Dict[str, Any]:
     journal_dates = _collect_journal_skill_dates(ctx, skill_names)
     companion_dates = _collect_companion_script_dates(ctx, skill_names, forged)
     ledger_dates = _collect_ledger_skill_dates(ctx, skill_names)
+    verdicts = (_collect_triage_verdicts(ctx, skill_names)
+                if (strategy.get("verdict_suppression") or {}).get("enabled")
+                else None)
 
     skills_out = []
     counts = {}
@@ -415,7 +528,8 @@ def build_report(ctx, now: datetime) -> Dict[str, Any]:
         if not isinstance(info, dict):
             continue
         record = _classify(name, info, quality, relations, journal_dates,
-                            companion_dates, ledger_dates, strategy, now)
+                            companion_dates, ledger_dates, strategy, now,
+                            verdicts=verdicts)
         skills_out.append(record)
         counts[record["status"]] = counts.get(record["status"], 0) + 1
 
@@ -436,6 +550,14 @@ def build_report(ctx, now: datetime) -> Dict[str, Any]:
             "status_counts": counts,
             "total_invocations_logged": overall_invocations,
             "median_forge_to_first_latency_days": median_latency,
+            # Report suppressions explicitly. A suppressed flag is a decision
+            # the consumer should be able to see and audit, not a silent drop.
+            "verdict_suppressed_count": sum(
+                1 for s in skills_out if s.get("verdict_suppressed")),
+            "verdict_suppressed_skills": [
+                {"skill": s["skill"], **s["verdict_suppressed"]}
+                for s in skills_out if s.get("verdict_suppressed")
+            ],
         },
         "skills": skills_out,
     }

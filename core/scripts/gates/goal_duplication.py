@@ -761,6 +761,73 @@ def _check_recent_completions(goal, file_paths, keywords, self_agent,
 
 # --- Check 2: partner_in_flight ---------------------------------------------
 
+def _partner_read_caveat(ts_prov, self_agent, composed_peers=None,
+                         core_sourced=None):
+    """Qualifier appended to BOTH of this check's negative conclusions.
+
+    g-306-158. This check clears a proposal two different ways — "no partners
+    in_flight" (empty peer set) and "no blocking overlap" (peers present, none
+    matching) — and BOTH are negatives over the peer set, so both are evidence
+    only if that set came from the store of record. The second is the common
+    exit whenever any partner is working, so qualifying only the first would
+    leave the provenance signal unconsulted almost all the time.
+
+    Returns "" when the read was fully authoritative; otherwise a caveat naming
+    what was degraded. Never changes passed/failed — a transient store error
+    must not block filing (guard-1753 asks the reader to EXPRESS its blindness,
+    not to act on it here).
+
+    g-306-179: `degraded` is keyed over the COMPOSED peer set — the set this
+    check's negative conclusion is actually ABOUT — not over the raw shard
+    rows, which is what ts_prov["by_agent"] enumerates. The two differ in BOTH
+    directions:
+
+      * compose_agent_status DROPS retired rows, so keying over rows lets a
+        degraded read of a RETIRED peer's shard qualify a clear over a peer
+        partner_inflights never examines (false alarm, reachable today).
+      * compose_agent_status ADMITS core-file-sourced peers, which have no
+        shard and therefore no by_agent key at all. An absent key read as
+        clean, so the caveat stayed empty and the reason claimed the store of
+        record over a locally-read row — the guard-1753 false positive
+        g-306-158 removed, surviving in the half that fix did not cover
+        (silent over-claim, latent).
+
+    `composed_peers`/`core_sourced` default to the pre-g-306-179 behavior when
+    a caller does not supply them, so the row-keyed reading is still reachable
+    but is no longer what the live call site does.
+    """
+    if not isinstance(ts_prov, dict):
+        return ""
+    from _team_state import (PROV_AUTHORITATIVE, PROV_LOCAL_MIRROR, PROV_NONE)
+    by_agent = ts_prov.get("by_agent") or {}
+    core_sourced = set(core_sourced or ())
+    peers = set(by_agent if composed_peers is None else composed_peers)
+    peers.discard(self_agent)
+
+    def _prov(agent):
+        # A composed value taken from the monolithic core file was read with a
+        # plain open() and no force_fresh, so it is a local-mirror read no
+        # matter how that agent's shard (if any) was obtained. Pessimistic on
+        # purpose: an absent label must not read as clean, and the own-cloud
+        # overlay can only make this MORE conservative than reality (the
+        # deliberately-out-of-scope note on ).
+        if agent in core_sourced:
+            return PROV_LOCAL_MIRROR
+        return by_agent.get(agent, PROV_NONE)
+
+    degraded = sorted(a for a in peers if _prov(a) != PROV_AUTHORITATIVE)
+    roster_ok = ts_prov.get("roster") == PROV_AUTHORITATIVE
+    if not degraded and roster_ok:
+        return ""
+    parts = []
+    if not roster_ok:
+        parts.append("peer roster came from the local mirror, which drops peer "
+                     "shards entirely — an in-flight peer may be invisible")
+    if degraded:
+        parts.append("non-authoritative rows for " + ", ".join(degraded))
+    return " — NOT a verified clear: " + "; ".join(parts) + " (g-306-158)"
+
+
 def _check_partner_in_flight(goal, file_paths, keywords, self_agent,
                              source_name, world_dir):
     """Detect when a non-self agent is currently in_flight on a goal whose
@@ -804,9 +871,18 @@ def _check_partner_in_flight(goal, file_paths, keywords, self_agent,
         # LOCAL mirror — else partner_in_flight is permanently blind to peers
         # (frozen/absent local shards) and cannot prevent a double-claim.
         # Fail-open to the local read; only this consumer pays the S3 cost.
-        from _team_state import compose_agent_status, load_rows_authoritative
-        agent_status = compose_agent_status(
-            state.get("agent_status") or {}, load_rows_authoritative(world_dir))
+        # : take the provenance-carrying form. This check's clean
+        # result is a NEGATIVE over the peer set, which is evidence only if the
+        # set was read from the store of record — see the empty branch below.
+        # : take the SOURCES-carrying compose. The caveat below must
+        # be keyed over this composed set (and must know which of its values
+        # came from the un-refreshed core file), not over the shard rows.
+        from _team_state import (compose_agent_status_with_sources, SRC_CORE,
+                                 load_rows_authoritative_with_provenance)
+        rows, ts_prov = load_rows_authoritative_with_provenance(world_dir)
+        agent_status, _compose_src = compose_agent_status_with_sources(
+            state.get("agent_status") or {}, rows)
+        core_sourced = {n for n, s in _compose_src.items() if s == SRC_CORE}
     except Exception as e:
         return {
             "name": "partner_in_flight",
@@ -839,11 +915,16 @@ def _check_partner_in_flight(goal, file_paths, keywords, self_agent,
             "claimed_at": inflight.get("claimed_at"),
         })
 
+    prov_caveat = _partner_read_caveat(ts_prov, self_agent,
+                                       composed_peers=set(agent_status),
+                                       core_sourced=core_sourced)
+
     if not partner_inflights:
         return {
             "name": "partner_in_flight",
             "passed": True,
-            "reason": "no partners in_flight",
+            "reason": ("no partners in_flight" + (prov_caveat or
+                       " (peer set read from the store of record)")),
             "matches": [],
         }
 
@@ -892,7 +973,8 @@ def _check_partner_in_flight(goal, file_paths, keywords, self_agent,
         "name": "partner_in_flight",
         "passed": True,
         "reason": ("no blocking overlap (source=" + source_name +
-                   ", " + str(len(advisories)) + " sub-threshold advisories)"),
+                   ", " + str(len(advisories)) + " sub-threshold advisories)" +
+                   prov_caveat),
         "matches": [],
         "advisories": advisories[:5],
     }
@@ -947,6 +1029,53 @@ def _self_completed_ids(world_dir, self_agent):
     return {e.get("goal_id") for e in entries
             if isinstance(e, dict) and e.get("completed_by") == self_agent
             and e.get("goal_id")}
+
+
+def _same_repo_path(fp, line):
+    """True when goal-side pattern `fp` and commit-side path `line` denote the
+    SAME repo file (or `fp` is a directory containing `line`).
+
+    SYMMETRIC SPECIFICITY FLOOR (g-115-4775). g-115-1166 added a floor to the
+    GOAL side only — `"/" in fp` — leaving `line` unconstrained, so a commit
+    touching a file literally named `f` matched any goal path containing the
+    letter f. Measured 7 false blocks across 4 agents and 4 boxes from one
+    0-byte file; the same commit pair kept firing >32h after the file was
+    deleted, because the add AND the remove both sit in the 48h window.
+
+    ANCHORED AT A PATH BOUNDARY, NOT BY LENGTH. A length threshold still
+    matches any short-but-real filename and needs re-tuning forever. Anchoring
+    also keeps this compatible with alpha's live hypothesis
+    2026-08-03_git-log-48h-citations-carry-relevant-prior-art, which scopes its
+    claim to FULL MULTI-COMPONENT PATH matches: every match that clause admits
+    is boundary-aligned, so none is dropped here.
+
+    THE LEADING-DOT ARM IS LOAD-BEARING, and a separator-only anchor is WRONG
+    without it. `_FILE_PATH_RE` starts at a word character, so a goal naming
+    `.claude/rules/x.md` in prose yields `claude/rules/x.md` with the dot
+    stripped. Measured 2026-08-09 over the live corpus (2307 commit touches ×
+    11439 goal-path pairs): a separator-only anchor lost 387 matches and ALL
+    387 were this class — every one a genuine same-file hit on the
+    `.claude/**` tree the fleet edits most. The count alone did not show it;
+    reading the hits did (guard-1790).
+    """
+    if fp == line:
+        return True
+    if "/" not in fp:
+        # Bare basename: exact match only (, unchanged).
+        return False
+    a = fp.rstrip("/")
+    candidates = [line]
+    if line.startswith("."):
+        candidates.append(line[1:])
+    for cand in candidates:
+        # Same file named at different depths, either direction: git reports
+        # repo-relative paths while goals often name absolute or shortened ones.
+        if cand == a or cand.endswith("/" + a) or a.endswith("/" + cand):
+            return True
+        # Goal names a DIRECTORY; the commit touched a file inside it.
+        if cand.startswith(a + "/"):
+            return True
+    return False
 
 
 def _check_git_log(goal, file_paths, project_root, self_agent="", world_dir=None):
@@ -1031,13 +1160,11 @@ def _check_git_log(goal, file_paths, project_root, self_agent="", world_dir=None
         # sorted() — set iteration is per-process; first-match
         # `goal_file_pattern` must be deterministic.
         for fp in sorted(file_paths):
-            # Specificity floor (): a bare basename (no "/") is too
-            # generic to confirm same-file against the large 48h commit corpus
-            # (dominated by frequently-churned state files), so it would
-            # over-fire once the date filter above was un-broken. Require an
-            # exact match for bare names; only qualified paths may
-            # substring-match either direction.
-            if fp == line or ("/" in fp and (fp in line or line in fp)):
+            # Specificity floor, BOTH sides ( goal-side, 
+            # commit-side). Bare basenames match exactly; qualified paths match
+            # only at a path-component boundary. See _same_repo_path — the
+            # predicate is shared so the floor cannot drift back to one-sided.
+            if _same_repo_path(fp, line):
                 raw_matches.append({
                     "commit": current,
                     "file": line,
@@ -2115,6 +2242,152 @@ def _log_override(world_dir: Optional[Path], agent_name: str, goal: dict,
         return None
 
 
+# --- Check 7: saturated_frontier ---------------------------------------------
+#  / guard-2437. A knowledge-tree node can declare its frontier
+# SATURATED — "this has been measured enough; another measurement reproduces an
+# encoded number". Before this check the declaration lived only in the node BODY,
+# so it was reachable only by an agent already reading the node, i.e. one who no
+# longer needed it. Five independent agents re-measured
+# multi-env-cognitive-load-baseline.md through that gap, and every prior remedy
+# added ANOTHER warning to the same unreachable place, which is why N climbed
+# instead of converging. This check moves the consultation to goal FILING, which
+# is on the path of every skill and every agent.
+#
+# The marker is `saturated_topics` on the _tree.yaml node — the same durable
+# per-node judgment surface `maintain_exempt` / `decompose_exempt` already use,
+# settable via `tree-update.sh --set <key> saturated_topics '[...]'`. No new
+# parsed surface, and no semantic matcher (explicit NON-GOAL of ).
+
+_SATURATION_MEASURE_VERB_RE = re.compile(
+    r"(?:^|\W)(?:re-)?(?:measur|quantif|audit|baselin|benchmark)\w*", re.I)
+
+
+def _saturation_topic_tokens(text: str) -> set:
+    """Tokenize for saturated-topic matching.
+
+    DELIBERATELY NOT the `[a-zA-Z][\\w-]{4,}` regex the rest of this module
+    uses. That one requires 5+ characters, which silently drops `load`, `cost`,
+    `add` and `next` — precisely the discriminating words in these topic
+    phrases. Measured: "cost add next environment" reduces to {environment}
+    under the shared regex, which would fire this check on EVERY goal that
+    mentions an environment. Short tokens are load-bearing here, so this
+    tokenizer keeps them and relies on ALL-tokens-present for precision.
+
+    DO NOT "harmonize" this back to the shared tokenizer. That edit reddens
+    tests/test_goal_duplication_gate_saturated_frontier.py
+    ::test_partial_topic_overlap_does_not_fire, which exists to catch exactly
+    it. The comment above is the WHY; that test is the enforcement (rb-6475 —
+    a divergence defended only by prose loses to any mechanical cleanup pass).
+    """
+    return {t for t in re.findall(r"[a-z0-9]+", (text or "").lower())
+            if t not in _STOPWORDS}
+
+
+def _load_saturated_nodes(world_dir):
+    """Yield (node_key, node_file, [topic, ...]) for nodes declaring saturation.
+
+    Fail-open on a malformed tree: this runs as step 7 of evaluate() on EVERY
+    goal filing, so an escaping exception here blocks the filing endpoint for
+    the whole fleet.
+
+    The three caught classes are the documented failure modes and NOT a blanket
+    `except Exception` (guard-373): OSError = tree absent/unreadable, YAMLError
+    = torn or invalid YAML, UnicodeDecodeError = corrupt bytes from a torn sync
+    write. UnicodeDecodeError is a ValueError, so the original two-class tuple
+    did NOT catch it — measured, not theorised.
+
+    The non-mapping case is a STRUCTURAL isinstance guard rather than a caught
+    AttributeError, deliberately: `safe_load(...) or {}` only substitutes on
+    None, so valid-YAML-that-is-a-list/scalar reached `.get` and raised. Per
+    guard-1946, catching that would make a bug in THIS helper indistinguishable
+    from the malformed input it guards against.
+    """
+    if world_dir is None:
+        return []
+    tree_path = Path(world_dir) / "knowledge" / "tree" / "_tree.yaml"
+    try:
+        with open(tree_path, "r", encoding="utf-8") as f:
+            tree = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError, UnicodeDecodeError):
+        return []
+    if not isinstance(tree, dict):
+        return []
+    nodes = tree.get("nodes")
+    if not isinstance(nodes, dict):
+        return []
+    out = []
+    for key, meta in nodes.items():
+        if not isinstance(meta, dict):
+            continue
+        topics = meta.get("saturated_topics")
+        if isinstance(topics, str):
+            topics = [topics]
+        if not isinstance(topics, list):
+            continue
+        clean = [t for t in topics if isinstance(t, str) and t.strip()]
+        if clean:
+            out.append((key, meta.get("file") or "", clean))
+    return out
+
+
+def _check_saturated_frontier(goal, world_dir):
+    """Refuse a MEASUREMENT/AUDIT goal whose topic a tree node declares saturated.
+
+    Two conjuncts, both required — the conjunction is what keeps precision:
+      1. every non-stopword token of some declared topic appears in the goal's
+         title+description, and
+      2. the goal reads as an origination of measurement work (measure /
+         quantify / audit / baseline / benchmark).
+
+    KNOWN AND DELIBERATE LIMITATION (measured against the N=5 population that
+    motivated this): it catches the three DIRECT measurement filings
+    (g-355-83, g-315-527, g-355-56) and NOT the two "steer/rebalance to PRIMARY"
+    Idea filings (g-115-3000, g-115-3012). Those two carry no measurement verb
+    and none of the topic tokens at filing time — the re-measurement was an
+    execution choice made later. Widening conjunct 2 to catch them would fire on
+    every steering Idea that mentions the pattern, including the live-ARC work
+    the node itself names as the real lever. 3-of-5 at the filing chokepoint is
+    the honest reach of a filing-time check; do not "fix" this by loosening the
+    verb gate.
+    """
+    if world_dir is None:
+        return {"name": "saturated_frontier", "passed": True,
+                "reason": "skipped (no world_dir)", "matches": []}
+
+    blob = f"{goal.get('title') or ''}\n{goal.get('description') or ''}"
+    if not _SATURATION_MEASURE_VERB_RE.search(blob):
+        return {"name": "saturated_frontier", "passed": True,
+                "reason": "no measurement/audit verb in goal text", "matches": []}
+
+    goal_tokens = _saturation_topic_tokens(blob)
+    matches = []
+    for key, node_file, topics in _load_saturated_nodes(world_dir):
+        for topic in topics:
+            topic_tokens = _saturation_topic_tokens(topic)
+            if topic_tokens and topic_tokens <= goal_tokens:
+                matches.append({"node": key, "file": node_file, "topic": topic})
+                break
+
+    if not matches:
+        return {"name": "saturated_frontier", "passed": True,
+                "reason": "no saturated-topic match", "matches": []}
+
+    first = matches[0]
+    return {
+        "name": "saturated_frontier",
+        "passed": False,
+        "reason": (
+            f"frontier SATURATED — '{first['topic']}' is declared saturated by "
+            f"tree node '{first['node']}' ({first['file']}). READ THAT NODE "
+            f"before filing: another measurement here reproduces an "
+            f"already-encoded number. If the goal genuinely measures something "
+            f"new, re-file with --override-duplication naming what is new. "
+            f"(g-115-4703 / guard-2437)"
+        ),
+        "matches": matches,
+    }
+
+
 # --- Main entry point --------------------------------------------------------
 
 def evaluate(goal: dict, *, override_duplication: Optional[str] = None,
@@ -2155,6 +2428,7 @@ def evaluate(goal: dict, *, override_duplication: Optional[str] = None,
         _check_target_state(goal, self_agent, project_root),
         _check_pending_queue(goal, file_paths, keywords, source_name,
                              world_dir, project_root),
+        _check_saturated_frontier(goal, world_dir),
     ]
     failing = [c for c in checks if not c.get("passed")]
     would_block = bool(failing) and not override_duplication

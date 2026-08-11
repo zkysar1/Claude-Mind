@@ -554,10 +554,23 @@ def main(argv=None) -> int:
     # it reports the value actually in force. Reads env rather than calling
     # get_backend() on purpose: constructing the backend here would move that
     # side effect earlier in startup.
+    # MACHINE_ID is emitted here for the SAME reason as the other two, and it was
+    # missing until : `_load_env_local` sets it in-process (it is the
+    # first key of `_N3_ALLOWED_EXACT`), so it is present in this process's
+    # os.environ and ABSENT from /proc/<pid>/environ for the daemon's whole life.
+    # fleet-config-parity's `_daemon_val` already prefers `logline_MACHINE_ID`,
+    # but nothing emitted it, so the MACHINE_ID verdict fell through to the
+    # exec-time environ read — the exact false positive the STORAGE_BACKEND /
+    # ENVIRONMENT_ID pair was fixed for in , left live on the third key.
+    # Appended LAST so the existing `.*ENVIRONMENT_ID=\([^ ]*\)` collector sed,
+    # which stops at the following space, is unaffected. A daemon genuinely
+    # missing the value still prints `<unset>`, which `_daemon_val` normalises to
+    # "unset" and still flags as drift — the real-failure path is preserved.
     print(
         "[runtime] resolved STORAGE_BACKEND="
         f"{os.environ.get('STORAGE_BACKEND') or '<unset->local>'}"
-        f" ENVIRONMENT_ID={os.environ.get('ENVIRONMENT_ID') or '<unset>'}",
+        f" ENVIRONMENT_ID={os.environ.get('ENVIRONMENT_ID') or '<unset>'}"
+        f" MACHINE_ID={os.environ.get('MACHINE_ID') or '<unset>'}",
         file=sys.stderr,
     )
 

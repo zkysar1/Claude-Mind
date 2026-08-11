@@ -58,7 +58,8 @@ import sys
 from pathlib import Path
 
 
-VALID_CATEGORIES = ("info", "completion", "update", "blocker", "decision-needed")
+VALID_CATEGORIES = ("info", "completion", "update", "blocker", "decision-needed",
+                    "user-digest")
 
 CATEGORY_TO_INFOTYPE = {
     "info": "Notification",
@@ -66,6 +67,26 @@ CATEGORY_TO_INFOTYPE = {
     "update": "Aspiration Update",
     "blocker": "Infrastructure Alert",
     "decision-needed": "Decision Needed",
+    # . A batched list of goals waiting on a human. It exists because
+    # the set a correct digest needed was EMPTY, and that emptiness is the whole
+    # defect — two independent, locally-correct decisions whose intersection
+    # nobody checked:
+    #   gate-exempt in notify-user Step 1.5 = {blocker, completion}
+    #   SendInfoAlert-shaped (the ONLY shape with a pretty renderer) = all but blocker
+    #   intersection = {completion}, which is semantically wrong for a digest.
+    # So the digest took `blocker`, which is gate-exempt for a real reason (it
+    # quotes arbitrary goal descriptions, any of which could contain "user must"
+    # and refuse the whole send, wedging the lane — the  shape). The
+    # cost was invisible at the call site: `blocker` routes to SendErrorAlert,
+    # which has NO render_structured at all, so a routine to-do list arrived
+    # headed "AyoAi Error Alert" in a red-bordered white-space:pre-wrap box.
+    # That is the D1 "raw text" complaint, and it is very likely also the
+    #  "caused anxiety" complaint, which was read as a content problem
+    # and answered by reordering the body.
+    # This category is SendInfoAlert-shaped (so it renders) AND must be listed in
+    # notify-user Step 1.5's exempt tuple (so it never wedges). Adding one
+    # WITHOUT the other re-breaks it — keep the two in sync.
+    "user-digest": "Goals Waiting On You",
 }
 
 # Minimum message length AFTER stripping. The silent-empty-email failure
@@ -210,6 +231,12 @@ def main():
                              "Justification required; echoed to stderr for audit. Use only "
                              "when the alert is genuinely time-critical and unfalsifiable-"
                              "by-command — never to route around the question.")
+    parser.add_argument("--fenced-quotes", action="store_true",
+                        help="This message QUOTES text this agent did not author, fenced "
+                             "with '> '. Those lines are excluded from the disproof gate's "
+                             "universal/causal scan — a report is not an assertion "
+                             "(g-115-4594). Opt-in: agent-authored prose stays fully scanned, "
+                             "so a markdown blockquote used for emphasis keeps its coverage.")
     args = parser.parse_args()
 
     agent = args.agent or os.environ.get("MIND_AGENT")
@@ -255,7 +282,13 @@ def main():
     # Fail-OPEN on any gate error (rc=2 / missing gate / exception): a bug here
     # must never silence a real alert. Fail-CLOSED only on a matched claim with
     # no disproof — that refusal IS the feature.
-    if args.category in ("blocker", "decision-needed"):
+    # `user-digest` is in this tuple for a reason that is easy to lose: the digest
+    # USED to be `blocker` and was covered here by accident of that choice. Moving
+    # it to its own category to fix rendering () would have silently
+    # dropped it out of this gate — a protection lost as a side effect of an
+    # unrelated fix, with nothing failing to announce it. It carries findings to a
+    # human and quotes goal text, so it belongs here on the merits too.
+    if args.category in ("blocker", "decision-needed", "user-digest"):
         if args.disproof_waived.strip():
             print("[notify] disproof-gate WAIVED: {r}".format(r=args.disproof_waived.strip()),
                   file=sys.stderr)
@@ -263,12 +296,14 @@ def main():
             gate = Path(__file__).resolve().parent / "finding-disproof-gate.py"
             if gate.exists():
                 try:
+                    gate_argv = [sys.executable, str(gate),
+                                 "--claim", subject + "\n" + message,
+                                 "--disproof-probe", args.disproof_probe,
+                                 "--disproof-result", args.disproof_result]
+                    if args.fenced_quotes:
+                        gate_argv.append("--fenced-quotes")
                     proc = subprocess.run(
-                        [sys.executable, str(gate),
-                         "--claim", subject + "\n" + message,
-                         "--disproof-probe", args.disproof_probe,
-                         "--disproof-result", args.disproof_result],
-                        capture_output=True, text=True, timeout=20,
+                        gate_argv, capture_output=True, text=True, timeout=20,
                     )
                     if proc.stderr:
                         print(proc.stderr.rstrip(), file=sys.stderr)

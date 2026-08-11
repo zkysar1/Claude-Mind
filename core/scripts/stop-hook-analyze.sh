@@ -66,7 +66,34 @@ import sys, re, json, os
 from datetime import datetime, timedelta
 
 log_path, thr_s, win_s, proj_root, world_dir = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4], sys.argv[5]
-pat_block = re.compile(r"^(?P<ts>\S+) BLOCK sid=(?P<sid>\S+) agent=(?P<agent>\S+)")
+# Field tolerance here is load-bearing, not defensive padding. stop-hook.sh has
+# TWO BLOCK writers with DIFFERENT shapes: the main path emits
+# `BLOCK sid=... agent=... runner_token=...` and the worker-net gate (added
+# 2026-08-04 by ) emits `BLOCK gate=worker-net sid=... agent=...`
+# (:484 and :388 as of 2026-08-10 — cites drift; grep `BLOCK ` in stop-hook.sh).
+# A pattern requiring `sid=` immediately after `BLOCK` matched zero of the latter
+# — measured on cc-07 2026-08-06: 3 BLOCK rows in the log, 0 matched, while a
+# synthetic old-format row matched fine. That blindness is one-directional and
+# therefore worse than a plain parse miss: pat_allow below tolerates intervening
+# fields, so a worker-net ALLOW could CLEAR a streak that worker-net BLOCKs could
+# never BUILD, and the analyzer kept printing "no loop stalls detected" — byte-
+# identical to its healthy-fleet output. It ran 2 days unnoticed.
+#
+#  widened the one-optional-`gate=`-field special case to arbitrary
+# intervening fields, because the writer side is under active development (the
+# worker-net gate broke this consumer within 2 days of being added) and ANY
+# second, third, or differently-named field restored the same asymmetry.
+# `(?:\S+ )*?` consumes WHOLE space-separated fields. That is deliberately NOT
+# pat_allow's `.*?`: a lazy `.*?` can halt mid-field on an embedded `sid=`
+# substring, so on `BLOCK reason=missing-sid=x sid=S1 agent=alpha` it captures
+# sid='x' — the wrong value, silently. rb-7110 is the general form (anchor on the
+# discriminating MARKER — here the literal `BLOCK` token after the timestamp —
+# never on a field that siblings also emit). Widening verified per guard-2201 on
+# ONE snapshot of the live 484-line log: OLD 294 / NEW 294, REMOVED set empty,
+# captures unchanged. Regression pin: core/scripts/tests/test_stop_hook_analyze_patterns.py
+pat_block = re.compile(
+    r"^(?P<ts>\S+) BLOCK (?:\S+ )*?sid=(?P<sid>\S+)(?: \S+)*? agent=(?P<agent>\S+)"
+)
 # DO NOT simplify pat_allow to drop the `sid=...` capture. Observer sessions
 # produce ALLOW lines with `agent=X` but a different sid than the runner.
 # Clearing the runner's streak on an observer ALLOW would hide real stalls.

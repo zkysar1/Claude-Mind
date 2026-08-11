@@ -215,6 +215,22 @@ GUARD_KNOWN_FIELDS = (
                                      # Forces inclusion in B.1 candidate list.
         "retirement_date",      # ISO date — set when status flips to retired
         "retirement_reason",    # short string — why this entry was retired
+        "encoded_by",           # agent name — g-306-109. SOURCE WRITER is the
+                                # daemon: endpoints/store.py::append via
+                                # StoreSpec.author_field. Mirrored here because
+                                # this allowlist and the daemon's are a
+                                # deliberately-kept-in-sync pair (see the
+                                # GUARD_DEFAULT_FIELDS "Mirror of the CLI
+                                # default" note in store_registry.py). Every
+                                # guardrail the daemon writes now carries this
+                                # field, so leaving it out would make the two
+                                # validators disagree about what a valid
+                                # guardrail IS — the displaced_from failure
+                                # shape, where an unallowlisted stamp refuses
+                                # every later write to the records carrying it.
+                                # No production caller reaches this validator
+                                # today (daemon-only architecture); the mirror
+                                # is what keeps that still true if one returns.
     }
 )
 

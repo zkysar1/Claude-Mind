@@ -86,6 +86,25 @@ The LLM NEVER reads or edits `world/reasoning-bank.jsonl` directly. All operatio
 
 All backed by `core/scripts/reasoning-bank.py` (Python 3, stdlib only).
 
+**Response shape differs BY FLAG — three shapes, one wrapper.** Measured
+2026-08-02 (zeta, cc-02): `--id` returns a **BARE record dict** (25 keys, no
+wrapper); `--category` and `--recent N` return a **bare JSON LIST of record
+dicts** (no `{"reasoning_bank": [...]}` envelope); `--summary` is **not JSON at
+all** (one-liner text — `json.load` raises). The identical split holds for
+`guardrails-read.sh` below (`--id` bare dict; `--category` / `--active` bare
+list; `--summary` non-JSON).
+
+This matters because the two failure directions are asymmetric. A parser
+written as `d.get("<store>") if isinstance(d, dict) else d` appears to work —
+its `else` branch silently carries the list cases — while the `--id` case falls
+into the dict branch, finds no envelope key, and yields `None`, which reads as
+**"record not found"** for a record that exists. That is a false negative about
+your own store, and it looks exactly like a real absence. Observed twice within
+ten minutes during one felt-sense sweep: `guard-2260`, `guard-1719` and
+`guard-1870` were each declared absent and were all present. Print the shape
+before parsing (guard-2298), or accept all three shapes explicitly. The tables
+here list FLAGS, not shapes — do not infer one from the other (guard-2301).
+
 ---
 
 # Guardrails JSONL Format

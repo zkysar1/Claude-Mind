@@ -339,28 +339,47 @@ def create_fix_goals(all_results: list, aspiration_id: str = ESCALATION_ASP) -> 
     # parsing a Windows-style absolute path (which fails on MSYS).
     rel_script = script.relative_to(_paths.PROJECT_ROOT).as_posix()
 
-    # Derive the handoff target from team-state.yaml agent_status keys minus
-    # MIND_AGENT (lexical sort for determinism). Was hardcoded "alpha" — broke
-    # when bravo (or any future N-th agent) ran --create-goals because every
-    # drift fix routed to alpha regardless of who detected it. Falls back to
-    # "alpha" only when team-state is unreadable or this is a solo-agent world.
+    # Derive the handoff target from the ACTIVE-agent roster minus MIND_AGENT
+    # (lexical sort for determinism). Was hardcoded "alpha"; then a hand-rolled
+    # union of core team-state agent_status keys and per-agent row-file stems.
+    # Neither input applies the retirement tombstone, and the row stems are
+    # unfiltered BY DESIGN — _team_state.row_agent_names promises "names that
+    # have rows", not "active agents", and its other caller
+    # (backfill-completed-by.py) walks HISTORICAL journals where a retired
+    # agent's past completions are legitimate attribution data. Do NOT add a
+    # filter there. _agents.get_active_agents() is the documented SSOT for
+    # "who is in this deployment" and applies the tombstone as of ,
+    # so routing through it DELETES a duplicated roster construction rather
+    # than adding a second filter to maintain ().
+    #
+    # MEASURED 2026-08-10 (echo, hostname cc-03, uname -r 6.8.0-136-generic):
+    # the exposure was wider than the retired agent the goal named. The
+    # hand-rolled union returned 13 names, of which 5 are real agents. The
+    # other 8 are leaked TEST FIXTURES that own live row files (alpha-test,
+    # ic-recovery-test-agent, no-such-agent-xyz, test-race-5, test-race-6,
+    # zz-hbtest, zz-inflight-guard-test) plus the retired meta-tiebreaker.
+    # peers[0] resolved to "alpha" only because nothing sorts ahead of it —
+    # one fixture named "aaa-*" would have captured every schema-drift handoff.
+    # get_active_agents() drops all 8 AND still sees foxtrot, which exists
+    # ONLY as a row file and is absent from core agent_status entirely.
     self_agent = os.environ.get("MIND_AGENT", "")
-    handoff_target = ""
+    handoff_target = None
     try:
-        #  sharding: roster = core agent_status keys ∪ row-file stems.
-        names = set()
-        ts_path = _paths.WORLD_DIR / "team-state.yaml"
-        if ts_path.is_file():
-            with open(ts_path, "r", encoding="utf-8") as f:
-                ts = yaml.safe_load(f) or {}
-            names.update((ts.get("agent_status") or {}).keys())
-        from _team_state import row_agent_names
-        names.update(row_agent_names(_paths.WORLD_DIR))
-        peers = sorted(a for a in names if a != self_agent)
-        if peers:
-            handoff_target = peers[0]
+        from _agents import get_active_agents
+        peers = sorted(a for a in get_active_agents() if a != self_agent)
+        # No active peer is NOT the same as "hand it to alpha". A filter that
+        # drops candidates needs a defined inverse, or the drop is silent and
+        # lands on whatever the default happens to be — which is exactly the
+        # possibly-retired name this fix removes. With no live peer, file the
+        # goal UNROUTED (intended_agent "either", no handoff_to) so it sits in
+        # the shared queue visible to everyone, rather than naming a target
+        # that may not exist. Tree node: drop-without-inverse-pattern.
+        handoff_target = peers[0] if peers else None
     except Exception:
-        pass  # fail-open to "alpha" — preserves prior behavior on errors
+        # fail-open to "alpha" — preserves prior behaviour when the roster is
+        # unreadable. Distinct from the empty-peers path above: an exception
+        # means we do not KNOW the roster, not that we know it is empty.
+        handoff_target = ""
 
     for r in all_results:
         if not r["drift_hits"]:
@@ -377,14 +396,23 @@ def create_fix_goals(all_results: list, aspiration_id: str = ESCALATION_ASP) -> 
             ),
             "priority": "MEDIUM",
             "participants": ["agent"],
-            "handoff_to": handoff_target,
+            # guard-2980: a goal whose whole purpose is that someone ELSE
+            # executes it MUST set intended_agent explicitly. Omission does not
+            # mean "unrouted" — the capability-route gate sets it when absent,
+            # by DOMAIN match against each agent's Self, so a detector filing a
+            # framework defect gets it routed straight BACK to itself. Setting
+            # handoff_to alone does not fix that: handoff_to is the routing
+            # PREFERENCE (a selector bonus), intended_agent is the gate.
+            "intended_agent": "either",
             "handoff_from": os.environ.get("MIND_AGENT", "unknown"),
-            "handoff_created_at": _iso_now(),
             "source": "world",
             # origin-signal-gate: schema-drift-sweep IS a signal source.
             # Cite the drifted store so audits can reconstruct the scan.
             "origin_signal": f"investigate:schema-drift-{r['store']}",
         }
+        if handoff_target:
+            goal["handoff_to"] = handoff_target
+            goal["handoff_created_at"] = _iso_now()
         try:
             proc = subprocess.run(
                 bash_cmd(rel_script, "--source", ESCALATION_SOURCE, aspiration_id),

@@ -67,13 +67,53 @@ _BASELINE_FILENAME = "forked-wm-baseline.yaml"
 # from a mere between-turns turn-end. The stop-hook marks closed-pending-merge
 # only when it is present, then consumes it.
 _CLOSE_SENTINEL_FILENAME = "body-closing"
+# -b: cross-box WM transport staging. body-merge.py is the READER of
+# this contract (_STAGED_DIRNAME L108, _STAGED_HASH_SUFFIX L109); it globs
+# "*-wm.yaml" under state_dir/_STAGED_DIRNAME and derives unitKey by stripping
+# that suffix. Keep these four in sync with it. The baseline suffix is
+# deliberately "-wm-baseline.yaml": it does NOT match the reader's "*-wm.yaml"
+# glob, so a baseline can never be mis-consumed as a Body WM.
+_STAGED_DIRNAME = "pending-body-merges"
+_STAGED_WM_SUFFIX = "-wm.yaml"
+_STAGED_BASELINE_SUFFIX = "-wm-baseline.yaml"
+_STAGED_HASH_SUFFIX = "-wm.hash"
 
 VALID_ROLES = ("reducer", "worker", "observer")
 VALID_STATES = ("active", "closed-pending-merge", "merged", "closed-stale")
+# -a: the ONLY accepted --reducer-sid value. Not a SID and never one —
+# a cross-box reducer's SID cannot be read from this machine (running-session-id
+# is machine_local; the DDB claim stores a runner-token, not a SID). Rejecting
+# every other value keeps a caller from inventing a plausible-looking SID that
+# would then silently mis-address the reducer-side merge.
+REMOTE_REDUCER_SENTINEL = "remote"
+
+
+def _resolve_machine_id() -> str:
+    """Which box this Body runs on. Delegates to the session-telemetry resolver
+    so MACHINE_ID/hostname/unknown fallback has ONE definition fleet-wide.
+    Local import mirrors this module's existing yaml-in-read_manifest style and
+    keeps the /start write path free of an unconditional import."""
+    try:
+        from _session_telemetry import _machine_id
+        return _machine_id()
+    except Exception:
+        # Never let attribution metadata break a Body write.
+        return "unknown"
+
+
 # Manifest field order — deterministic render keeps diffs stable.
 _FIELD_ORDER = (
     "unitKey", "mindKey", "env_id", "role", "reducer_sid",
     "body_state", "started_at", "forked_wm_hash",
+    # -a (cross-box worker): only ever non-default when this Body was
+    # activated by /start --body worker after a cross-box rc=4 refusal.
+    # remote_body distinguishes "the reducer is on ANOTHER machine" from the
+    # same-box worker case — the reducer-side merge needs it because a remote
+    # body's staged WM arrives via an explicit push, not the H4a periodic sweep
+    # (that sweep only runs on a box holding a fresh DDB claim, which a worker
+    # box never holds). machine_id records WHICH box diverged, so a merge
+    # conflict is attributable.
+    "remote_body", "machine_id",
 )
 
 
@@ -119,15 +159,46 @@ def _render_manifest(data: dict) -> str:
     """Render the manifest dict to deterministic YAML (fixed field order).
 
     Hand-rendered (not yaml.safe_dump) to control field order and quoting,
-    matching session-binding-write.py's style. Values are simple scalars.
+    matching session-binding-write.py's style.
+
+    _FIELD_ORDER fixes the order of the KNOWN fields; any other key present in
+    `data` is emitted after them, sorted. That tail is load-bearing, not tidiness
+    (g-306-122): set_state round-trips the whole manifest through this renderer,
+    so without it _FIELD_ORDER acts as an ALLOWLIST and silently DROPS whatever a
+    newer writer added — the guard-1900 class, whose diagnostic signature is a
+    clean parse, zero errors, and a field that is simply not there. The same
+    defect makes a field added to _FIELD_ORDER *after* a manifest was written
+    come back as null on that manifest's next set_state.
+
+    String values are single-quoted with '' escaping (YAML's own escape for a
+    literal quote inside a single-quoted scalar). machine_id resolves from an
+    operator-set, unvalidated MACHINE_ID, and an unquoted value carrying a YAML
+    metacharacter breaks read_manifest -> set_state -> close_body_on_genuine
+    permanently for that Body, at CLOSE time, far from the write that caused it
+    (':' -> ScannerError, '*' -> ComposerError, '#' -> silent value loss).
+    Quoting the whole string CLASS rather than that one field is the guard-610
+    remedy — env_id, mindKey and unitKey ride the same branch. It subsumes the
+    former `started_at` special case byte-identically (that value never contains
+    a quote), so that branch is gone rather than duplicated.
+
+    Non-str non-bool scalars (an int or float arriving via an unknown key) stay
+    bare so they survive the round-trip as numbers rather than becoming strings.
     """
     lines = []
-    for k in _FIELD_ORDER:
+    unknown = sorted(k for k in data if k not in _FIELD_ORDER)
+    for k in (*_FIELD_ORDER, *unknown):
         v = data.get(k)
         if v is None:
             lines.append(f"{k}: null")
-        elif k in ("started_at",):
-            lines.append(f"{k}: '{v}'")
+        elif isinstance(v, bool):
+            # Render lowercase. PyYAML (YAML 1.1) would also accept "True", but
+            # YAML 1.2 parsers do not, and this manifest is read by the the framework-ES
+            # side as well as by Python — emit the form every parser agrees on.
+            # Must precede the str branch: bool is not str, but keeping it first
+            # makes the ordering intent explicit.
+            lines.append(f"{k}: {'true' if v else 'false'}")
+        elif isinstance(v, str):
+            lines.append("{}: '{}'".format(k, v.replace("'", "''")))
         else:
             lines.append(f"{k}: {v}")
     return "\n".join(lines) + "\n"
@@ -165,15 +236,35 @@ def is_reducer(sid: str, agent: str, project_root: Path | None = None) -> bool:
 
 def write_manifest(sid: str, agent: str, env_id: str = "local",
                    role: str = "worker",
-                   project_root: Path | None = None) -> Path:
+                   project_root: Path | None = None,
+                   reducer_sid: str | None = None) -> Path:
     """Write the Body manifest; fork the WM only for a non-reducer worker.
 
     Returns the manifest path. Idempotent on body_state (a re-write resets a
-    Body to active — only /start calls this, once per session).
+    Body to active — only /start calls this, once per session). Reset-to-active
+    includes the close signal: any stale `body-closing` sentinel left by a
+    prior life of this SID is consumed (see the comment at the write below).
+
+    `reducer_sid=REMOTE_REDUCER_SENTINEL` ("remote") activates the CROSS-BOX
+    worker case (g-306-119-a). It is a sentinel, not a SID, and deliberately so:
+    the reducer's SID is UNOBTAINABLE from another machine — `running-session-id`
+    is `sync_tier: machine_local` (core/config/session-manifest.yaml) and the DDB
+    claim row stores a runner-token, not a SID. Callers MUST NOT invent one.
     """
     if role not in VALID_ROLES:
         raise ValueError(f"invalid role {role!r}; expected one of {VALID_ROLES}")
     adir, session_dir, state_dir = _agent_paths(agent, sid, project_root)
+
+    remote = (reducer_sid == REMOTE_REDUCER_SENTINEL)
+    if reducer_sid is not None and not remote:
+        raise ValueError(
+            f"invalid reducer_sid {reducer_sid!r}; the only accepted override is "
+            f"{REMOTE_REDUCER_SENTINEL!r} (a cross-box reducer SID cannot be known "
+            f"from this machine — see the docstring)")
+    if remote and role != "worker":
+        raise ValueError(
+            f"reducer_sid={REMOTE_REDUCER_SENTINEL!r} is only valid with "
+            f"role='worker' (got role={role!r})")
 
     # Fork decision: a worker that is NOT the reducer forks its WM. The reducer
     # (rsid empty -> this body will claim it; OR rsid == sid -> resumed reducer)
@@ -182,11 +273,26 @@ def write_manifest(sid: str, agent: str, env_id: str = "local",
     rsid = _read_running_sid(state_dir)
     fork_needed = (role == "worker") and bool(rsid) and (rsid != sid)
 
+    # CROSS-BOX worker: bypass the local rsid read entirely. On a worker box
+    # `running-session-id` NEVER exists — the whole point of the CW branch is
+    # that the box stays IDLE and never writes it — so `bool(rsid)` is False and
+    # the clause above silently yields fork_needed=False. That is the exact
+    # failure this override exists to prevent: no fork means the worker mutates
+    # the agent-wide WM, which is `sync_tier: continuity` (LWW), so the live
+    # reducer's concurrent writes and this box's would silently destroy each
+    # other. The rsid read is not just unhelpful here, it is unanswerable.
+    if remote:
+        fork_needed = True
+
     # reducer_sid: the SID of the active Reducer body ( / ).
     # the framework-ES reads this field to locate the Reducer's ES snapshot for
     # workers/observers. Null for the reducer itself (it IS the Reducer).
-    # For workers/observers: the value of running-session-id at write time.
-    reducer_sid = None if (role == "reducer") else (rsid or None)
+    # For workers/observers: the value of running-session-id at write time,
+    # or the "remote" sentinel when the reducer lives on another machine.
+    if remote:
+        reducer_sid_out = REMOTE_REDUCER_SENTINEL
+    else:
+        reducer_sid_out = None if (role == "reducer") else (rsid or None)
 
     forked_wm_hash = None
     if fork_needed:
@@ -213,24 +319,74 @@ def write_manifest(sid: str, agent: str, env_id: str = "local",
         "mindKey": agent,
         "env_id": env_id,
         "role": role,
-        "reducer_sid": reducer_sid,
+        "reducer_sid": reducer_sid_out,
         "body_state": "active",
         "started_at": _now_iso_local(),
         "forked_wm_hash": forked_wm_hash,
+        # Defaults keep every pre-existing caller byte-identical apart from two
+        # appended lines: remote_body is False and machine_id is recorded for
+        # every Body (attribution is cheap and useful even same-box).
+        "remote_body": remote,
+        "machine_id": _resolve_machine_id(),
     }
     manifest_path = session_dir / _MANIFEST_FILENAME
+    # A (re-)write resets body_state to active, so any body-closing sentinel
+    # left by a PRIOR life of this SID is consumed with it (fresh-eyes review
+    # of b8ac6a4cf, 2026-08-10). A stale sentinel survives only when a
+    # close-turn text-death also skipped the Stop event (the rb-629 gap) —
+    # every Stop the hook DOES see consumes it via close_body_on_genuine.
+    # Left in place, it pairs with the fresh active manifest and the re-forked
+    # Body's FIRST turn-end takes the stop-hook's WM+sentinel close branch:
+    # marked closed-pending-merge after one work unit (premature retirement).
+    # Safe unconditionally: any WM a stuck close meant to stage was already
+    # re-baselined by the fork above, so the stale signal points at nothing
+    # recoverable — and for reducer/observer roles a sentinel is foreign
+    # residue by definition (only workers ever write one). Consumed BEFORE the
+    # manifest write so an active manifest is never paired with a stale
+    # sentinel, even transiently. Deliberately NOT in set_state: that runs
+    # mid-close, before close_body_on_genuine consumes the sentinel itself.
+    _unlink_quiet(session_dir / _CLOSE_SENTINEL_FILENAME)
     _write_atomic(manifest_path, _render_manifest(data))
     return manifest_path
 
 
+class ManifestParseError(ValueError):
+    """A body-manifest exists but does not parse as YAML.
+
+    Subclasses ValueError DELIBERATELY: main()'s existing validation path
+    (`except (ValueError, FileNotFoundError)` -> exit 2) then catches a
+    malformed manifest with the documented "non-zero exit + stderr diagnostic"
+    contract, WITHOUT main() importing yaml. That matters because yaml is a
+    local import in read_manifest on purpose — the write and is-reducer paths
+    must not pay for it (see read_manifest's import comment). Raising a
+    yaml.YAMLError instead would escape both of main()'s except clauses,
+    because YAMLError subclasses neither ValueError nor OSError.
+    """
+
+
 def read_manifest(sid: str, agent: str, project_root: Path | None = None) -> dict:
-    """Load + return the manifest dict. Raises FileNotFoundError if absent."""
+    """Load + return the manifest dict.
+
+    Raises FileNotFoundError if absent, ManifestParseError if malformed.
+    """
     import yaml  # local import: read/set-state need it; write/is-reducer don't.
     _, session_dir, _ = _agent_paths(agent, sid, project_root)
     manifest_path = session_dir / _MANIFEST_FILENAME
     if not manifest_path.is_file():
         raise FileNotFoundError(f"no body-manifest: {manifest_path}")
-    return yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
+    try:
+        data = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        # -b: previously unguarded. A malformed manifest raised
+        # YAMLError, which escaped main()'s two except clauses (unhandled
+        # traceback + exit 1 instead of the documented exit 2) AND escaped
+        # close_body_on_genuine before any branch could consume the
+        # body-closing sentinel — so the stop-hook condition re-fired at every
+        # subsequent turn-end for that Body, permanently, falsifying that
+        # function's "consumed on every genuine-close branch" invariant.
+        raise ManifestParseError(
+            f"malformed body-manifest {manifest_path}: {exc}") from exc
+    return data or {}
 
 
 def set_state(sid: str, agent: str, new_state: str,
@@ -245,6 +401,134 @@ def set_state(sid: str, agent: str, new_state: str,
     manifest_path = session_dir / _MANIFEST_FILENAME
     _write_atomic(manifest_path, _render_manifest(data))
     return manifest_path
+
+
+def _stage_and_push(session_dir: Path, state_dir: Path, data: dict) -> bool:
+    """Stage this Body's forked WM (+ baseline + hash) for the reducer AND
+    explicitly push each staged file to the storage backend.
+
+    Returns True iff every staged file was written AND pushed. Never raises —
+    a transport failure must not break the stop-hook's turn-end; the caller
+    surfaces it via the 'marked-push-failed' return string instead.
+
+    WHY AN EXPLICIT PUSH AND NOT owncloud-flush (measured 2026-08-02, alpha,
+    cc-04). The design doc says "owncloud-flush/backend-put"; the flush half
+    CANNOT work here. owncloud-flush.sh POSTs /v1/admin/owncloud-flush, which
+    forces the SAME owncloud_sync.sweep(); sweep() calls _owned_agents() (~L1174),
+    which under own-cloud returns only the agents this box holds a FRESH DDB
+    RUNNING CLAIM for and is documented to return the EMPTY set otherwise ("own
+    none this sweep -> no agent dir is pushed"). A worker box holds no claim by
+    construction, so the sweep pushes zero agent dirs and the staged WM is
+    stranded forever. Forcing the sweep changes its TIMING, never its SCOPE.
+    A direct backend write bypasses the ownership prune entirely.
+
+    Do NOT "fix" this by widening _owned_agents — that empty-set return is a
+    deliberate fail-safe (a box that cannot prove it holds the claim must not
+    push a peer's cached agent dir over the peer's newer S3 bytes), and it
+    replaced a static allowlist that silently degraded to own-all.
+    """
+    unit_key = str(data.get("unitKey") or "").strip()
+    if not unit_key:
+        print("body-manifest: cannot stage — manifest has no unitKey",
+              file=sys.stderr)
+        return False
+    staged_dir = state_dir / _STAGED_DIRNAME
+    # (basename-suffix, bytes) for each file this Body owes the reducer.
+    #
+    # ORDER IS LOAD-BEARING — THE -wm.yaml TRIGGER MUST BE LAST. body-merge.py
+    # L357 globs "*-wm.yaml" and derives BOTH sidecars from the matched
+    # unit_key, so the WM's presence is what tells the reducer the unit is
+    # ready. Write it before its sidecars and a reducer sweeping that window
+    # consumes a trigger whose sidecars are missing: it merges 2-way union+SUM
+    # (the counter double-count -c exists to remove) with Guard 2's
+    # no-op short-circuit skipped — and then unlinks all three paths
+    # (body-merge.py L401-403), so sidecars arriving afterwards are orphaned
+    # PERMANENTLY: that glob is the staging dir's only enumerator, and nothing
+    # else in the tree sweeps this directory. Same rule commit 15ade5039
+    # established for the bash reap path (_preserve_unmerged_body_wm).
+    #
+    # The WM is READ first (a missing fork is fatal — early-return below) and
+    # APPENDED last. Do not collapse those two steps back together.
+    items: list[tuple[str, bytes]] = []
+    try:
+        wm_bytes = (session_dir / _WM_FILENAME).read_bytes()
+    except OSError as exc:
+        print(f"body-manifest: cannot stage forked WM: {exc}", file=sys.stderr)
+        return False
+    baseline_src = session_dir / _BASELINE_FILENAME
+    if baseline_src.is_file():
+        try:
+            items.append((_STAGED_BASELINE_SUFFIX, baseline_src.read_bytes()))
+        except OSError as exc:
+            # Non-fatal: without it the reducer falls back to its existing
+            # 2-way union+SUM merge (-c's 3-way branch keeps that
+            # fallback), so a missing baseline degrades precision, not safety.
+            print(f"body-manifest: baseline unreadable, staging WM only: {exc}",
+                  file=sys.stderr)
+    forked_hash = data.get("forked_wm_hash")
+    if forked_hash:
+        items.append((_STAGED_HASH_SUFFIX,
+                      f"{forked_hash}\n".encode("utf-8")))
+    items.append((_STAGED_WM_SUFFIX, wm_bytes))  # TRIGGER LAST — see above
+    ok = True
+    for suffix, body in items:
+        target = staged_dir / f"{unit_key}{suffix}"
+        try:
+            _write_atomic_bytes(target, body)
+        except OSError as exc:
+            print(f"body-manifest: staging write failed for {target}: {exc}",
+                  file=sys.stderr)
+            ok = False
+    return push_staged_files(staged_dir, unit_key) and ok
+
+
+def push_staged_files(staged_dir: Path, unit_key: str) -> bool:
+    """Explicitly push every staged file present for `unit_key`. Returns True
+    iff all of them reached the backend (a file that does not exist is skipped,
+    not a failure). Never raises.
+
+    Shared by BOTH stagers so there is exactly one push implementation:
+      - close_body_on_genuine (this module, remote_body genuine close)
+      - cleanup-stale-bindings.sh's crash-preserve path, via the
+        `push-staged` subcommand.
+
+    That bash caller is annotated IRREDUCIBLY LOCAL (no python3) for latency,
+    and this does not violate it: `_preserve_unmerged_body_wm` returns early
+    when the Body forked no WM, so the subprocess is spawned ONLY when there is
+    genuinely an orphaned Body WM to transport — rare, and the alternative is a
+    permanently stranded WM.
+    """
+    try:
+        # Local import mirrors this module's yaml/_resolve_machine_id style so
+        # /start's write path and is-reducer never pay for it.
+        from storage_backend import get_backend
+        be = get_backend()
+    except Exception as exc:  # noqa: BLE001 — transport must never raise here
+        print(f"body-manifest: storage backend unavailable, staged files NOT "
+              f"pushed ({type(exc).__name__}: {exc})", file=sys.stderr)
+        return False
+    ok = True
+    # ORDER IS LOAD-BEARING — THE -wm.yaml TRIGGER IS PUSHED LAST, for the same
+    # reason _stage_and_push WRITES it last (see the rationale there). The
+    # window is wider here, not narrower: every write_bytes is a separate
+    # backend round trip to a store a reducer on ANOTHER box polls, so a
+    # trigger pushed first is remotely visible for the duration of two more
+    # round trips before its sidecars land — and either of those can fail
+    # independently, leaving the trigger published without them.
+    for suffix in (_STAGED_BASELINE_SUFFIX, _STAGED_HASH_SUFFIX,
+                   _STAGED_WM_SUFFIX):
+        target = staged_dir / f"{unit_key}{suffix}"
+        if not target.is_file():
+            continue
+        try:
+            be.write_bytes(target, target.read_bytes())
+        except Exception as exc:  # noqa: BLE001
+            print(f"body-manifest: explicit push FAILED for {target} "
+                  f"({type(exc).__name__}: {exc}) — staged locally; this Body's "
+                  "WM will not reach the reducer until it is pushed",
+                  file=sys.stderr)
+            ok = False
+    return ok
 
 
 def close_body_on_genuine(sid: str, agent: str,
@@ -266,13 +550,23 @@ def close_body_on_genuine(sid: str, agent: str,
       'no-forked-wm' — no per-Body WM file (a reducer/observer never forked) -> noop
       'no-sentinel'  — a mere between-turns turn-end (no sentinel) -> NOT closed
       'no-manifest'  — sentinel present but manifest missing (sentinel consumed) -> noop
+      'bad-manifest' — sentinel present but manifest unparseable (consumed) -> noop
       'not-active'   — genuine close but body_state already != active (consumed) -> noop
       'marked'       — genuine close + active -> body_state set closed-pending-merge
+                       (for remote_body: WM+baseline+hash staged AND pushed)
+      'marked-push-failed' — as 'marked', but a remote Body's staging or explicit
+                       push failed. State IS transitioned and the sentinel IS
+                       consumed (the close really happened); the distinct string
+                       exists so a silent transport failure is visible to the
+                       stop-hook and to tests rather than reading as success.
 
     The sentinel is consumed (deleted) on every genuine-close branch so a re-fire
-    cannot re-mark. Idempotent and fail-safe by design.
+    cannot re-mark. Idempotent and fail-safe by design. 'bad-manifest' exists so
+    that stays TRUE under a malformed manifest (g-306-119-b): before it, the
+    YAMLError escaped this function entirely and the sentinel survived, so the
+    condition re-fired at every later turn-end for that Body, forever.
     """
-    _, session_dir, _ = _agent_paths(agent, sid, project_root)
+    _, session_dir, state_dir = _agent_paths(agent, sid, project_root)
     body_wm = session_dir / _WM_FILENAME
     if not body_wm.is_file():
         return "no-forked-wm"  # reducer/observer: never forked, nothing to close
@@ -285,31 +579,56 @@ def close_body_on_genuine(sid: str, agent: str,
     except FileNotFoundError:
         _unlink_quiet(sentinel)
         return "no-manifest"
+    except ManifestParseError:
+        # Consume the sentinel here too, or the turn-end condition re-fires for
+        # this Body at EVERY subsequent turn-end and never clears (-b).
+        _unlink_quiet(sentinel)
+        return "bad-manifest"
     if data.get("body_state") != "active":
         _unlink_quiet(sentinel)
         return "not-active"  # already closed/merged -> don't re-queue
+    # FIX 1+2 (-b): a REMOTE Body's reducer lives on another box and
+    # can never see this Body's sessions/<sid>/ dir (walk-pruned by
+    # _EXCLUDE_DIRS), so marking alone strands the WM. Stage into session/
+    # (singular, syncable) and push explicitly. Staged BEFORE set_state so a
+    # staging failure cannot leave a manifest claiming closed-pending-merge
+    # with nothing for the reducer to merge.
+    pushed = True
+    if data.get("remote_body"):
+        pushed = _stage_and_push(session_dir, state_dir, data)
     set_state(sid, agent, "closed-pending-merge", project_root)
     _unlink_quiet(sentinel)
-    return "marked"
+    return "marked" if pushed else "marked-push-failed"
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
-    for name in ("write", "read", "set-state", "is-reducer", "close-body-on-genuine"):
+    for name in ("write", "read", "set-state", "is-reducer",
+                 "close-body-on-genuine", "push-staged"):
         sp = sub.add_parser(name)
         sp.add_argument("--sid", required=True)
         sp.add_argument("--agent", required=True)
         if name == "write":
             sp.add_argument("--env-id", default="local")
             sp.add_argument("--role", default="worker", choices=VALID_ROLES)
+            # choices= is the enforcement, not just help text: it makes an
+            # invented SID a parse error at the CLI boundary rather than a
+            # ValueError deeper in, so /start's CW1b cannot mis-address the
+            # reducer-side merge with a plausible-looking value (-a).
+            sp.add_argument("--reducer-sid", default=None,
+                            choices=[REMOTE_REDUCER_SENTINEL],
+                            help="'remote' activates the cross-box worker fork; "
+                                 "a real cross-box reducer SID is unobtainable "
+                                 "from this machine and must never be passed")
         if name == "set-state":
             sp.add_argument("state", choices=VALID_STATES)
     args = parser.parse_args(argv)
 
     try:
         if args.cmd == "write":
-            path = write_manifest(args.sid, args.agent, args.env_id, args.role)
+            path = write_manifest(args.sid, args.agent, args.env_id, args.role,
+                                  reducer_sid=args.reducer_sid)
             print(path)
         elif args.cmd == "read":
             print(json.dumps(read_manifest(args.sid, args.agent)))
@@ -319,6 +638,16 @@ def main(argv=None):
             print("true" if is_reducer(args.sid, args.agent) else "false")
         elif args.cmd == "close-body-on-genuine":
             print(close_body_on_genuine(args.sid, args.agent))
+        elif args.cmd == "push-staged":
+            # --sid IS the unitKey here. Used by cleanup-stale-bindings.sh's
+            # crash-preserve path, which stages in bash and cannot reach the
+            # storage backend itself. Exit 4 = staged locally but not pushed,
+            # distinct from the validation (2) and io (3) codes so a caller can
+            # tell "nothing to do" from "transport is down".
+            _, _, state_dir = _agent_paths(args.agent, args.sid)
+            ok = push_staged_files(state_dir / _STAGED_DIRNAME, args.sid)
+            print("pushed" if ok else "push-failed")
+            return 0 if ok else 4
     except (ValueError, FileNotFoundError) as e:
         print(f"body-manifest: {e}", file=sys.stderr)
         return 2

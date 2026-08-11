@@ -77,8 +77,17 @@ All data comes from framework scripts — no direct JSONL reads.
    Phase 4-post ("DEBT-CLOSURE OVERRIDE") without requiring log scanning.
 
 4. Hypotheses resolved since last report
+   # BOTH stages are REQUIRED — a record can be archived within the report
+   # window, so a resolved-only fetch UNDERCOUNTS any multi-day report while
+   # staying exact for a same-session one. That split is why this site is the
+   # least visible of the four and survived longest. Measured 2026-08-04T03:33
+   # (bravo, hostname cc-05, uname -r 6.8.0-136-generic): of the scoreable
+   # records in each trailing window, `--stage resolved` alone sees 100% at 2d
+   # but only 75.9% at 7d and 29.8% at 30d — i.e. a week-long report silently
+   # drops a quarter of its own subject matter. (g-115-4866.)
    Bash: bash core/scripts/pipeline-read.sh --stage resolved
-   → Filter where outcome_date >= since date
+   Bash: bash core/scripts/pipeline-read.sh --stage archived
+   → Filter the UNION where outcome_date >= since date
    → Count confirmed vs corrected
 
 5. Overall pipeline accuracy

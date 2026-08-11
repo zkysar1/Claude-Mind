@@ -129,7 +129,7 @@ Maps the filesystem structure to memory types (inspired by "Everything is Contex
 | Micro-predictions | `agents/<agent>/session/working-memory.yaml` → `micro_hypotheses` | Inline R/W within session, batch-reflected at end | Inline during goal execution |
 | Episodic | `agents/<agent>/journal/` + `agents/<agent>/journal.jsonl` | Append-only, indexed by session/date/tags via `journal-read.sh` | State Update Protocol Step 7 |
 | Fact | `world/knowledge/tree/` node articles (any depth) | Tree navigation via `_tree.yaml`, write via consolidation | Reflection, research, consolidation |
-| Experiential | `pipeline-read.sh --stage resolved` + `agents/<agent>/experiential-index.yaml` | Pattern matching by category/violation cause | `/reflect` |
+| Experiential | `pipeline-read.sh --stage resolved` AND `--stage archived` (BOTH — `resolved` alone is a survivorship filter holding ~10% of the store; g-115-4866) + `agents/<agent>/experiential-index.yaml` | Pattern matching by category/violation cause | `/reflect` |
 | Procedural | `.claude/skills/` + `agents/<agent>/skill-gaps.yaml` | Read at invocation, forged via `/forge-skill` | Capability gap detection |
 | User | `core/config/profile.yaml`, `CLAUDE.md` | Read at session start (auto-loaded) | Manual or evolution |
 | Historical | `agents/<agent>/journal/` + `meta/evolution-log.jsonl` + `world/pipeline.jsonl` | Immutable audit trail | Append-only |

@@ -119,7 +119,7 @@ def test_green_solo_is_environmental_and_files_nothing(tmp_path, monkeypatch, ca
     """Green solo falsifies contention in one measurement -> do not file."""
     _log_with_failure(tmp_path)
     monkeypatch.setattr(RFS, "_solo", lambda p, r, e: (32, 0, None))
-    monkeypatch.setattr(RFS, "_owning_goals", lambda p, r: [])
+    monkeypatch.setattr(RFS, "_owning_goals", lambda p, r: ([], 915))
     rc = RFS.triage(tmp_path, tmp_path, {})
     out = capsys.readouterr().out
     assert rc == 0
@@ -133,7 +133,7 @@ def test_all_environmental_does_not_claim_reds_are_owned(tmp_path, monkeypatch, 
     and collapsing them reports a non-regression as a managed regression."""
     _log_with_failure(tmp_path)
     monkeypatch.setattr(RFS, "_solo", lambda p, r, e: (32, 0, None))
-    monkeypatch.setattr(RFS, "_owning_goals", lambda p, r: [])
+    monkeypatch.setattr(RFS, "_owning_goals", lambda p, r: ([], 915))
     RFS.triage(tmp_path, tmp_path, {})
     out = capsys.readouterr().out
     assert "no candidate reproduced solo" in out
@@ -144,7 +144,7 @@ def test_red_solo_unowned_is_filed(tmp_path, monkeypatch, capsys):
     """Reproduces solo AND no goal names it -> the one actionable bucket."""
     target = _log_with_failure(tmp_path)
     monkeypatch.setattr(RFS, "_solo", lambda p, r, e: (10, 2, None))
-    monkeypatch.setattr(RFS, "_owning_goals", lambda p, r: [])
+    monkeypatch.setattr(RFS, "_owning_goals", lambda p, r: ([], 915))
     rc = RFS.triage(tmp_path, tmp_path, {})
     out = capsys.readouterr().out
     assert rc == 1
@@ -163,7 +163,8 @@ def test_red_solo_owned_is_not_filed(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(RFS, "_solo", lambda p, r, e: (10, 2, None))
     monkeypatch.setattr(
         RFS, "_owning_goals",
-        lambda p, r: [("g-115-3803", "pending", "Investigate: fleet_config_parity")])
+        lambda p, r: ([("g-115-3803", "pending", "Investigate: fleet_config_parity",
+                        "exact")], 915))
     rc = RFS.triage(tmp_path, tmp_path, {})
     out = capsys.readouterr().out
     assert rc == 0
@@ -236,7 +237,7 @@ def test_ownership_finds_a_goal_that_names_the_test_only_in_its_description():
                             "core/scripts/tests/test_merge_handlers_commutativity_property.py "
                             "and test_meta_write_class_conflict_retry.py"),
         }])
-        owners = RFS._owning_goals(
+        owners, scanned = RFS._owning_goals(
             "core/scripts/tests/test_merge_handlers_commutativity_property.py", ".")
     finally:
         mp.undo()
@@ -252,7 +253,7 @@ def test_ownership_ignores_goals_that_do_not_name_the_test():
             "goal_id": "g-999-99", "status": "pending",
             "title": "Unrelated work", "description": "nothing to do with tests",
         }])
-        owners = RFS._owning_goals("core/scripts/tests/test_thing.py", ".")
+        owners, scanned = RFS._owning_goals("core/scripts/tests/test_thing.py", ".")
     finally:
         mp.undo()
     assert owners == []
@@ -292,3 +293,279 @@ def test_run_clears_stale_chunk_logs_from_a_prior_run(tmp_path, monkeypatch):
 
     assert not stale.exists(), "stale chunk-19.log from a prior run was not cleared"
     assert (out / "chunk-00.log").exists(), "this run's chunk-00.log should exist"
+
+
+# ── F1: a solo run that executed NOTHING is not a green ─────────────────────
+#
+# Found by /fresh-eyes-code on the code  shipped (echo, cc-03), each
+# defect below re-measured independently 2026-08-01 (zeta, hostname cc-02,
+# uname -r 6.8.0-136-generic) before any fix was written.
+
+class _FakeRun:
+    def __init__(self, returncode, stdout=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = ""
+
+
+def _stub_pytest(monkeypatch, returncode, stdout=""):
+    monkeypatch.setattr(RFS.subprocess, "run",
+                        lambda *a, **k: _FakeRun(returncode, stdout))
+
+
+@pytest.mark.parametrize("rc,stdout,label", [
+    (5, "no tests ran in 0.01s\n", "collected nothing (pytest rc=5)"),
+    (4, "ERROR: file or directory not found\n", "usage error (rc=4)"),
+    (2, "", "interrupted (rc=2)"),
+    (127, "bash: pytest: command not found\n", "interpreter never started"),
+    (0, "", "rc=0 but the log accounts for no tests at all"),
+])
+def test_solo_that_executed_no_tests_is_not_a_green(monkeypatch, rc, stdout, label):
+    """`_parse_counts` maps EVERY one of these to (0, 0, 0).
+
+    That is byte-identical to a clean pass, so before this pin `_solo` returned
+    f == 0 and the caller printed "-> ENVIRONMENTAL (do not file)" -- silently
+    discarding a real red. Measured: `_parse_counts("")`,
+    `_parse_counts("bash: pytest: command not found")` and
+    `_parse_counts("no tests ran in 0.01s")` all return (0, 0, 0).
+
+    guard-2166 in the small: the empty population must return the UNSAFE
+    verdict. Remove the completeness branch in `_solo` and every case here
+    reverts to (0, 0, None), which reads as green.
+    """
+    _stub_pytest(monkeypatch, rc, stdout)
+    p, f, err = RFS._solo("core/scripts/tests/test_thing.py", ".", {})
+    assert err is not None, "%s was reported as a measurement" % label
+    assert (p, f) == (None, None)
+
+
+@pytest.mark.parametrize("rc,stdout", [
+    (0, "32 passed in 4.0s\n"),
+    (1, "10 passed, 2 failed in 4.0s\n"),
+])
+def test_solo_still_measures_when_tests_actually_ran(monkeypatch, rc, stdout):
+    """The other half of the fix: a real run must NOT be refused.
+
+    Without this, tightening `_solo` could pass the pin above by rejecting
+    everything -- which would route every candidate to unclassified and make the
+    whole triage useless.
+    """
+    _stub_pytest(monkeypatch, rc, stdout)
+    p, f, err = RFS._solo("core/scripts/tests/test_thing.py", ".", {})
+    assert err is None
+    assert p is not None and f is not None
+
+
+def test_zero_test_solo_routes_to_unclassified_not_environmental(
+        tmp_path, monkeypatch, capsys):
+    """End-to-end: the non-measurement must not exit 0 claiming nothing to file."""
+    _log_with_failure(tmp_path)
+    monkeypatch.setattr(RFS.subprocess, "run",
+                        lambda *a, **k: _FakeRun(5, "no tests ran in 0.01s\n"))
+    rc = RFS.triage(tmp_path, tmp_path, {})
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "ENVIRONMENTAL" not in out
+    assert "COULD NOT RUN" in out
+
+
+# ── F2: an unanswered ownership query is UNKNOWN, never UNOWNED ─────────────
+
+def test_ownership_query_failure_is_not_a_true_negative(monkeypatch, capsys):
+    """Both failure paths in `_owning_goals` fall through to an empty list.
+
+    Measured: with `subprocess.run` stubbed to rc=1 -- the routine
+    daemon-unreachable shape, and no-python-cli-fallback.md means there is NO
+    CLI fallback beneath it -- `_owning_goals` returns []. Rendered as
+    "owner: NONE", that is byte-identical to a true negative and authorises a
+    duplicate filing. rb-245: verify the instrument answered before believing
+    its zero.
+    """
+    monkeypatch.setattr(RFS.subprocess, "run", lambda *a, **k: _FakeRun(1, ""))
+    owners, scanned = RFS._owning_goals("core/scripts/tests/test_thing.py", ".")
+    assert (owners, scanned) == ([], 0)
+
+    result = RFS._print_ownership("core/scripts/tests/test_thing.py", ".")
+    out = capsys.readouterr().out
+    assert result is None, "instrument failure must not present as 'no owner'"
+    assert "UNKNOWN" in out and "instrument failure" in out
+    assert "owner: NONE" not in out
+
+
+def test_unanswered_ownership_keeps_the_exit_code_nonzero(
+        tmp_path, monkeypatch, capsys):
+    """A genuine red whose ownership is UNKNOWN is unclassified, not clean.
+
+    It must not land in genuine_unowned either -- that would file a goal on the
+    strength of a query that never ran.
+    """
+    _log_with_failure(tmp_path)
+    monkeypatch.setattr(RFS, "_solo", lambda p, r, e: (10, 2, None))
+    monkeypatch.setattr(RFS, "_owning_goals", lambda p, r: ([], 0))
+    rc = RFS.triage(tmp_path, tmp_path, {})
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "UNANSWERED ownership query" in out
+    assert "FILE THESE" not in out
+
+
+def test_true_negative_still_reports_unowned_and_files(monkeypatch, capsys):
+    """The instrument ANSWERED and found nothing -- that is real evidence.
+
+    Pins that the F2 fix keys on 'did the query return rows', not on 'is the
+    owner list empty'. Without this, a fix could call every empty result UNKNOWN
+    and nothing would ever be filed again.
+    """
+    monkeypatch.setattr(
+        RFS.subprocess, "run",
+        lambda *a, **k: _FakeRun(0, json.dumps(
+            [{"goal_id": "g-999-99", "status": "pending",
+              "title": "Unrelated", "description": "nothing to do with it"}])))
+    result = RFS._print_ownership("core/scripts/tests/test_thing.py", ".")
+    out = capsys.readouterr().out
+    assert result == []
+    assert "owner: NONE" in out and "open goal(s) scanned" in out
+
+
+# ── F3: a shared subsystem name is not ownership (guard-1801) ───────────────
+
+_PARITY = "core/scripts/tests/test_fleet_config_parity.py"
+
+
+def test_exact_test_file_match_wins_over_subsystem_name_matches(monkeypatch):
+    """Measured live 2026-08-01: `_owning_goals` on this file matched TEN open
+    goals; exactly one (g-115-3803) owns the failing tests. The rest merely
+    discuss `fleet_config_parity` as a subsystem.
+
+    `_stem_forms` widens the QUERY by stripping `test_` and `_owning_goals`
+    widens the FIELD to the whole description; together they turn a filename
+    lookup into a topic search. Over-match is the SILENT direction -- a spurious
+    owner suppresses all filing and exits 0 printing "every genuine red already
+    has an owning goal" (guard-1801: a shared file path is not ownership).
+    """
+    _stub_query(monkeypatch, [
+        {"goal_id": "g-115-3803", "status": "pending",
+         "title": "Investigate: fleet_config_parity CLI-lane collector exits 1",
+         "description": "the failing pins live in test_fleet_config_parity.py"},
+        {"goal_id": "g-115-3221", "status": "pending",
+         "title": "Investigate: which config values resolve through >1 lane",
+         "description": "context: fleet_config_parity covers the env key set"},
+        {"goal_id": "g-115-3344", "status": "pending",
+         "title": "Idea: fleet_config_parity checks KEY SET but not VALUE SHAPE",
+         "description": "no test file named here"},
+    ])
+    owners, scanned = RFS._owning_goals(_PARITY, ".")
+    assert [o[0] for o in owners] == ["g-115-3803"]
+    assert {o[3] for o in owners} == {"exact"}
+    assert scanned > 0
+
+
+def test_stripped_form_is_a_fallback_and_is_labelled_weak(monkeypatch, capsys):
+    """When NOTHING names the test file, the subsystem hits are still shown --
+    losing g-115-4310 (owner only via its description) is the opposite failure
+    and is pinned above. But they are labelled, because they are not ownership.
+    """
+    _stub_query(monkeypatch, [
+        {"goal_id": "g-115-3221", "status": "pending",
+         "title": "Investigate: config lanes",
+         "description": "context: fleet_config_parity covers the env key set"},
+    ])
+    owners, _ = RFS._owning_goals(_PARITY, ".")
+    assert [o[0] for o in owners] == ["g-115-3221"]
+    assert {o[3] for o in owners} == {"weak"}
+
+    RFS._print_ownership(_PARITY, ".")
+    assert "WEAK match" in capsys.readouterr().out
+
+
+# ── F4: never hand bash a str(WindowsPath) — repo-wide (guard-581) ──────────
+
+PRODUCTION_SCRIPTS = sorted(p for p in SCRIPT_DIR.parent.glob("*.py"))
+
+
+def test_no_production_script_passes_a_str_path_to_bash():
+    """Repo-wide source pin. File-scoped copies of this cannot hold the class.
+
+    `str(WindowsPath)` reaches bash with backslashes, which it treats as escape
+    introducers and strips -- so the script path silently becomes nonexistent,
+    the wrapper "fails", and the caller reports a confident wrong answer. It is
+    invisible on Linux, where `str()` and `.as_posix()` are identical by
+    definition, so a green suite on one OS is not evidence (guard-581).
+
+    Measured 2026-08-01: 8 live sites across 7 files -- and the enforcer's own
+    `check-no-bare-bash.py` fix hint prescribed exactly this shape as its
+    `tests:` remedy, so an author fixing guard-580 was shown the guard-581
+    defect by the gate, at the one moment they were looking for something to
+    copy. That hint now prescribes `.as_posix()` on both lines.
+
+    Comment lines are excluded so a file may still NAME the forbidden shape in
+    prose -- this file and that hint both do.
+
+    THE PREDICATE IS THE LITERAL `[BASH, str(`, not "`[BASH,` and `str(` on one
+    line". The looser form is what the file-scoped ancestor of this pin used, and
+    it was correct THERE only because that file's population was one file. Widened
+    repo-wide it produced two false positives on the first run, both measured:
+    `_runtime_bash.py:94` is `bash_cmd` ITSELF (`[BASH, Path(script).as_posix(),
+    *(str(a) for a in args)]` -- the `str()` stringifies ARGUMENTS, which is the
+    correct implementation), and `product-repo-freshness.py:213` is
+    `[BASH, *argv] if str(argv[0]).endswith(".sh")` -- a type-safe suffix check
+    whose single caller passes a forward-slash string literal, verified by reading
+    it. A predicate that is right on a narrow population can be wrong once the
+    population widens (guard-1802's shape, inverted).
+
+    SO BE CLEAR WHAT THIS DOES NOT COVER: only the LITERAL idiom. A variable
+    path -- `[BASH, some_path]`, `[BASH, *argv]` -- is invisible to it, and that
+    shape is a real guard-581 exposure whenever the variable holds a Path. Do
+    not read a green here as full guard-581 coverage. Probed 2026-08-01 (zeta):
+    all 3 remaining bare-BASH production sites are safe by construction -- two
+    are `[BASH, "-s"]` with the script on stdin (no path argument at all) and
+    one is `[BASH, gh_bin()]`, where gh_bin() returns os.environ["GH_BIN"] or
+    the literal "gh", never a Path. Zero live instances today; the gap is about
+    tomorrow. Tightening the predicate to catch them would reintroduce the false
+    positives above, so the honest boundary is a narrow pin plus this note.
+    """
+    offenders = []
+    for path in PRODUCTION_SCRIPTS:
+        for i, ln in enumerate(
+                path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            if "[BASH, str(" in ln and not ln.lstrip().startswith("#"):
+                offenders.append("%s:%d %s" % (path.name, i, ln.strip()[:80]))
+    assert not offenders, (
+        "guard-581: pass wrapper paths through bash_cmd(...) or Path(...).as_posix(), "
+        "never [BASH, str(path)]. Offending line(s): %r" % offenders)
+
+
+def test_the_str_path_pin_is_not_vacuous():
+    """guard-2166: an all()-shaped pin passes on an empty population.
+
+    If the glob stops finding scripts, or every bash callsite is deleted, the
+    pin above goes green having verified nothing. Assert the population exists
+    and that the safe shape is actually in use.
+    """
+    assert len(PRODUCTION_SCRIPTS) > 100, (
+        "production script glob returned %d files -- the pin above is scanning "
+        "almost nothing" % len(PRODUCTION_SCRIPTS))
+    users = [p.name for p in PRODUCTION_SCRIPTS
+             if "bash_cmd(" in p.read_text(encoding="utf-8", errors="replace")]
+    assert len(users) >= 5, (
+        "only %d script(s) call bash_cmd() -- if wrapper invocation moved to a "
+        "new idiom this pin is measuring a dead pattern: %r" % (len(users), users))
+
+
+def test_the_enforcer_hint_does_not_prescribe_the_defect():
+    """The root, not a symptom. `check-no-bare-bash.py` is read at the exact
+    moment an author wants a shape to copy; a remedy there that satisfies
+    guard-580 while violating guard-581 propagates the second defect under the
+    authority of the first gate. That is the mechanism behind the 8 sites.
+    """
+    src = (SCRIPT_DIR.parent / "check-no-bare-bash.py").read_text(encoding="utf-8")
+    hint = src[src.index("def _fix_hint"):]
+    hint = hint[:hint.index("def main")]
+    # Only the lines that SHOW a call shape. The hint also WARNS about str(Path)
+    # in prose, and matching that too would forbid it from naming what to avoid.
+    prescriptions = [ln for ln in hint.splitlines()
+                     if not ln.lstrip().startswith("#")
+                     and "subprocess.run(" in ln and "str(" in ln]
+    assert not prescriptions, (
+        "the fix hint prescribes a str(path) bash invocation: %r" % prescriptions)
+    assert "as_posix" in hint, "the hint must show the safe script-path shape"

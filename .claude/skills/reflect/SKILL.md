@@ -319,7 +319,27 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
      # Script-enforced beats LLM-discretionary (Phase 3.7 doctrine) — do NOT
      # re-inline the windowing math here.
      Bash: py -3 core/scripts/weakness-signals.py --agent $MIND_AGENT
-     Parse JSON: seeded, guardrail_signals[], signature_signals[], window_start
+     Parse JSON: seeded, guardrail_signals[], signature_signals[], window_start, notes
+     # READ `notes` FIRST — it is the ONLY channel that distinguishes a genuine
+     # clean from a degraded run, and both render as `signature_signals: []`
+     # (g-115-4974, measured 2026-08-04 echo/cc-03). The script fails SAFE on an
+     # unreadable weakness-report.yaml: it computes without a baseline, sets
+     # baseline_updated=false so it will not clobber recoverable content, and says
+     # so — in `notes`, which this parse list did not name, so nothing downstream
+     # ever saw it. Live instance: a prose note in weakness-report.yaml had been
+     # written as an unquoted multi-line plain scalar whose continuation line began
+     # `into it: this pass...`; YAML reads that `: ` as a mapping key, so the whole
+     # 48KB report (2 weaknesses, 2202 guardrail + 61 signature baselines) went
+     # unparseable and this lane returned a VACUOUS zero for ~27h while looking
+     # exactly like a healthy pass. guard-465 / guard-1091 class: a wrapper
+     # reporting "no signal" when the probe never ran is not a measurement of zero.
+     IF notes is non-empty:
+         Output: "▸ ⚠ Weakness signals DEGRADED: {notes} — the zero below is NOT a clean; fix the named cause before reading any count"
+         # Repair, then re-run, before treating any signal count as evidence.
+         # A report file that fails to parse is repairable: convert multi-line
+         # plain scalars to block literals (`key: |-`), verify every parsed string
+         # still appears verbatim in the pre-repair text, and keep an off-tree
+         # backup first (archive-before-delete.md).
      IF seeded == true:
          Log: "▸ Weakness signals: baseline seeded — windowed signals available from the next analysis"
      FOR EACH sig in signature_signals:

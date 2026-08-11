@@ -32,6 +32,16 @@ CORE_ROOT="$PROJECT_ROOT/core"
 # verify-learning normalizer-coverage check.
 GOAL_NORMALIZE_TARGET=positional source "$CORE_ROOT/scripts/_goal-arg-normalize.sh"
 
+# Shared unknown-flag refusal (). Sourced BEFORE _runtime.sh so the
+# refusal is cheap and cannot be masked by a daemon failure.
+# shellcheck disable=SC1091
+source "$CORE_ROOT/scripts/_argv_strict.sh"
+# ONE literal, referenced by BOTH the --help arm and the refusal (
+# fresh-eyes F-002). These were two copies until the review: the helper's own
+# comment asserted they came from one, which was simply false, and two strings
+# that must agree are the drift surface the refusal exists to remove.
+_ACCEPTED_FLAGS="--source --force-defer --override-agent-match --override-uncommitted --cross-lane --override-missing-artifact --blocker-ref --force-unstructured-defer --override-blocker-gate"
+
 # --- Parse args -----------------------------------------------------------
 SOURCE_VAL="world"
 FORCE_DEFER=""
@@ -59,10 +69,15 @@ while [[ $# -gt 0 ]]; do
             shift $(( $# >= 2 ? 2 : 1 ));;
         --override-agent-match)
             # : wrong-context flag on the defer path (it is the
-            # CREATE_BLOCKER bypass). Plumb flag+value so argparse RECOGNIZES it
-            # and can redirect the user to --force-defer, instead of the bare -*
-            # fallback dropping the value into POSITIONALS (argparse "unrecognized
-            # arguments" / too-many-positionals). Does NOT honor the defer bypass.
+            # CREATE_BLOCKER bypass). Enumerated here so the flag+value pair is
+            # CONSUMED as a pair and the daemon can redirect the caller to
+            # --force-defer. Does NOT honor the defer bypass.
+            # Comment corrected : the original said this kept argparse
+            # able to recognize the flag "instead of the bare -* fallback dropping
+            # the value into POSITIONALS". There is no argparse — the 2026-05-14
+            # cutover deleted it — and the bare -* arm no longer drops anything;
+            # it refuses (below). The ENUMERATION is still load-bearing, because
+            # without it this flag's VALUE would be the token that gets refused.
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
         --override-uncommitted)
@@ -94,10 +109,23 @@ while [[ $# -gt 0 ]]; do
             OVERRIDE_BLOCKER_GATE="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
+        -h|--help)
+            # BEFORE the -*) arm: --help is a `-*` token, and refusing it with
+            # exit 2 would be a regression the refusal introduced rather than a
+            # defect it fixed (). Help exits 0.
+            argv_strict_help "$(basename "$0")" "<goal-id> <field> <value>" \
+                "$_ACCEPTED_FLAGS";;
         -*)
-            # Unknown flag — passthrough; argparse on the fallback path
-            # surfaces a canonical error message.
-            PASSTHROUGH+=("$1"); shift;;
+            # REFUSE (). This arm used to append the unknown flag to
+            # PASSTHROUGH and shift, on the strength of a comment promising that
+            # "argparse on the fallback path surfaces a canonical error message".
+            # That fallback was deleted by the 2026-05-14 daemon-only cutover this
+            # file announces at line 2, and PASSTHROUGH has no reader in this script
+            # at all — so the flag vanished and the NEXT token landed in POSITIONALS[2],
+            # the VALUE slot. Measured casualty: a --value-file path overwrote a live
+            # 1606-char description with rc=0, and a second agent hit the identical
+            # shape ~24h later on a different box.
+            argv_strict_refuse_unknown "$(basename "$0")" "$1" "$_ACCEPTED_FLAGS";;
         *)
             POSITIONALS+=("$1")
             PASSTHROUGH+=("$1"); shift;;
@@ -148,6 +176,29 @@ sys.stdout.write(json.dumps(r))
 ' "$VALUE")
 
 QUERY="id=${GOAL_ID}&field=${FIELD}&source=${SOURCE_VAL}"
+# Session identity () — mirrors aspirations-complete-by.sh. This is the
+# MOST-TRAVELLED terminal door (status->completed/skipped/expired lands here), so
+# without it `completed_by_sid` would always inherit the CLAIM's sid rather than
+# recording the body that actually closed the goal. The daemon reads it via
+# ctx.query only; `_nonholder_claim_warning` is called from complete_by/release
+# ONLY (measured), so adding the param changes no other endpoint behavior.
+# Best-effort; omitted when unset.
+if [ -n "${MIND_SID:-}" ]; then
+    QUERY="${QUERY}&sid=$(rt_url_encode "$MIND_SID")"
+fi
+# Cross-lane override () — MUST travel as a QUERY param, mirroring
+# aspirations-claim.sh. update_goal() reads `ctx.query.get("cross_lane")`; it is
+# the one override on this wrapper that is NOT read via `_header_override`, so
+# the header below reaches nothing on its own. This wrapper is daemon-only (no
+# CLI fallback since the 2026-05-14 cutover), so until this line existed the
+# flag was inert for EVERY production caller — including anyone following
+# update_goal's own refusal text, which says "Pass cross_lane=<justification>
+# to override". Regression: test_update_goal_takeover_guard.py
+# ::test_wrapper_cross_lane_flag_reaches_the_daemon (drives THIS wrapper; the
+# CLI-driven override test was green throughout the defect).
+if [ -n "$CROSS_LANE" ]; then
+    QUERY="${QUERY}&cross_lane=$(rt_url_encode "$CROSS_LANE")"
+fi
 
 declare -a HEADER_ARGS=()
 [ -n "$FORCE_DEFER" ] && HEADER_ARGS+=(--header "X-Mind-Force-Defer: $FORCE_DEFER")

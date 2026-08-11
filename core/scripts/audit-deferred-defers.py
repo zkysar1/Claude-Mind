@@ -75,10 +75,52 @@ DEFER_NARRATIVE_PATTERNS = [
 # the GENUINE_PATTERNS free-text list below, not a prefix. GENUINE_PATTERNS has no
 # source anchor (content heuristics). A forced parity test would false-fail.
 # => document, no test.
+#
+# `human_blocked:` (g-115-3805) — the comment above enumerates the divergence's
+# ADDITIONS and never mentioned this OMISSION, so of defer_classifier's four
+# canonical prefixes exactly one reached no path here. The divergence otherwise
+# STANDS: do not import the SSOT tuple or force parity (defer_classifier.py:13-14
+# names three call sites that must stay aligned, and this audit is deliberately
+# not one of them).
+#
+# This one belongs because of WHERE the omission bit. The 14-day age downgrade
+# lives INSIDE `if pfx:` — so for an unrecognised prefix `pfx` is None, that
+# branch never runs, and the row can never become a stale-structured re-check
+# candidate AT ANY AGE. That pointed at exactly the wrong prefix:
+# `.claude/rules/probe-before-defer.md` rule 1e makes `human_blocked:` the ONE
+# member that never auto-clears (goal-selector exempts it from the 120h
+# fall-through) and says verbatim that, because it never expires on its own, it
+# is the defer MOST exposed to the RULE axis. The prefix the rule names as most
+# needing periodic re-derivation was the one this lane was structurally blind to
+# — guard-1802's shape: a reclaim predicate diverged from the set that creates
+# its population, so the sweep reports clean by construction.
+#
+# MEASURED 2026-08-10 (bravo, hostname cc-05, uname -r 6.8.0-136-generic) on the
+# live queue: 11 of 36 rows (30.6%) carry this prefix; before the fix they split
+# cat-b 10 / cat-c 1 with ZERO reaching stale-structured, and TWO were already
+# past the 14d threshold (g-240-101 at 18.5d, g-115-2050 at 14.0d) — confirming
+# a prediction filed on 2026-08-04 that the first miss would land ~08-05/06.
+# Adding the prefix needs no new machinery: the population routes into the
+# EXISTING age path (fresh -> cat-A, past --stale-days -> cat-B stale-structured).
+#
+# Second, smaller half, fixed as a side effect and VERIFIED not assumed: falling
+# through to the pattern matchers, a `human_blocked:` defer met
+# DEFER_NARRATIVE_PATTERNS ("user approved", "user must", ...) — the exact
+# vocabulary a legitimate human-gate defer uses to DESCRIBE its gate, so the
+# better it documented what the human must do, the likelier this lane called it
+# an excuse. The prefix branch returns before c_hits is computed, so recognising
+# the prefix stops it reaching the narrative matcher at all.
+#
+# `time-gated:` is retained but is DEAD as of the same measurement: 0 matches and
+# 0 near-misses across the live corpus (this closes one of g-115-3805's own
+# "EXPLICITLY UNMEASURED" items). Left in place deliberately — it is harmless,
+# and removing a defensive allowlist member would silently reclassify any future
+# writer that adopts it.
 GENUINE_PREFIXES = (
     "blocked_on_dependency:",
     "precondition_unmet:",
     "time-gated:",
+    "human_blocked:",
 )
 
 # Age past which a structured-prefix defer stops being self-certifying and
@@ -105,7 +147,11 @@ GENUINE_PATTERNS = [
     "telemetry accumulated",
     "let predicate.py bake",
     "settle before",
-    "t+",  # t+14d, T+14d (haystack lowercased at classify():134, so needle must be lowercase)
+    "t+",  # t+14d, T+14d (classify() lowercases the haystack into `lo` before
+           # calling _has_any, so every needle in this list MUST be lowercase or
+           # it can never match. Named by expression, not line number: the prior
+           # form cited "classify():134" and drifted 125 lines out of date in a
+           # single edit — a stale pointer reads as authoritative.
     "machine restart to clear",  # purely physical, but mark it for review (could be Unblock)
 ]
 
@@ -154,6 +200,59 @@ def _defer_age_days(defer_set_at) -> float | None:
     return (datetime.now() - parsed).total_seconds() / 86400.0
 
 
+# A defer that NAMES its own resolution date is not stale until that date
+# arrives. The staleness test is age-since-defer_set_at ONLY, so a defer
+# carrying an explicit machine-readable future window was flagged identically to
+# one carrying no date at all -- and then demanded a full two-axis re-derivation
+# on EVERY precheck iteration until its window closed. Measured 2026-08-10
+# (bravo, cc-05): of 7 live defers naming a keyed date, THREE will cross 14d
+# while their own window is still open -- g-115-4946 by 1 day, g-335-646 by 23,
+# g-335-648 by 38. That is the treadmill that trains a reader to skim lane B,
+# which is how a REAL stale defer gets missed.
+#
+# THREE constraints, all deliberate:
+#  1. Do NOT raise STALE_STRUCTURED_DAYS instead. That delays genuine stale hits
+#     by the same amount and cannot distinguish the two cases at all.
+#  2. Suppress on the NAMED KEY, never on a bare date match. A "by DATE
+#     deadline" due-date is NOT a defer-until date (sibling lesson: the
+#     _extract_defer_date semantic inversion), so a loose date scan would read
+#     an urgency deadline as a licence to stay stopped -- inverting the meaning.
+#  3. Only a date that PARSES and is in the FUTURE suppresses. Unparseable or
+#     past dates keep current behavior, matching this file's fail-open posture
+#     (guard-142): an audit heuristic must never manufacture staleness from a
+#     parse failure, and must never launder a CLOSED window into genuineness.
+#
+# `\D{0,32}` cannot cross another date (dates contain digits), so widening the
+# gap can never capture a different date than the one this key introduces. Text
+# between key and date that contains a digit yields NO match -- under-matching,
+# which is the safe direction here: a missed suppression costs one re-derivation,
+# a wrong suppression hides a genuinely stale defer.
+_DATE_GATE_RE = re.compile(
+    r"(resolves_by|deferred_until|window closes)\D{0,32}(\d{4}-\d{2}-\d{2})",
+    re.IGNORECASE,
+)
+
+
+def _keyed_future_date(defer_reason: str, now=None):
+    """Return (key, datetime) when the defer NAMES a FUTURE resolution date.
+
+    None when no keyed date is present, when it does not parse, or when the
+    named window has already closed (all three keep existing behavior).
+    """
+    if not defer_reason:
+        return None
+    m = _DATE_GATE_RE.search(defer_reason)
+    if not m:
+        return None
+    try:
+        when = datetime.fromisoformat(m.group(2))
+    except Exception:
+        return None
+    if when <= (now or datetime.now()):
+        return None
+    return (m.group(1).lower(), when)
+
+
 def classify(defer_reason: str, participants: list | None,
              defer_set_at=None, stale_days: float = STALE_STRUCTURED_DAYS) -> dict:
     """Return {"category": "a"|"b"|"c"|"unknown", "evidence": [...]}."""
@@ -190,6 +289,41 @@ def classify(defer_reason: str, participants: list | None,
         if age <= stale_days:
             return {"category": "a",
                     "evidence": [f"structured-prefix:{pfx}", f"age:{age:.1f}d"]}
+        # Past the age threshold, but the defer may NAME its own future
+        # resolution date -- in which case age is the wrong question and
+        # re-derivation is not yet owed. See _keyed_future_date for the three
+        # constraints on this suppression. Stays visible as cat-A with explicit
+        # date-gated evidence rather than becoming a new category: the
+        # by_category schema ("a","b","c","unknown") is consumed downstream, and
+        # the lane-B phase selects on `stale-structured` evidence, so dropping
+        # that marker is exactly and only what "suppress" has to mean here.
+        gate = _keyed_future_date(text)
+        if gate is not None:
+            key, when = gate
+            left = (when - datetime.now()).total_seconds() / 86400.0
+            return {
+                "category": "a",
+                "evidence": [
+                    f"structured-prefix:{pfx}",
+                    f"age:{age:.1f}d",
+                    # ASCII-only: evidence is DATA that reaches shell args
+                    # downstream (guard-607, guard-606).
+                    #
+                    # MUST NOT contain the literal token the consumer selects
+                    # on. Lane B (aspirations-precheck Phase 0.5b.13) picks rows
+                    # by substring-testing evidence for `stale-structured`, so
+                    # an explanatory phrase naming the marker it is suppressing
+                    # re-selects the very row it just exempted -- the
+                    # suppression defeated by its own prose. Caught by
+                    # test_suppressed_rows_never_carry_the_selector_token, which
+                    # exists because the first draft of this string said
+                    # "stale-structured suppressed" and shipped a no-op.
+                    f"date-gated:{key}:{when.date()} - defer names its own "
+                    f"resolution date, {left:.1f}d still remaining; age "
+                    f"downgrade not applied (age is not the trigger when the "
+                    f"window is declared and still open)",
+                ],
+            }
         return {
             "category": "b",
             "evidence": [
@@ -262,7 +396,33 @@ def _enumerate_agents() -> list:
 # `retired` is included deliberately: it is not in the documented goal-status enum
 # (it is an aspiration status) but live goal records carry it, and both phantoms
 # here had it.
-TERMINAL_STATUSES = frozenset({"completed", "skipped", "expired", "retired"})
+#
+# `decomposed` + `superseded` added g-115-3805. This set had diverged from the
+# framework's canonical terminal set -- {completed, skipped, expired, decomposed,
+# superseded}, written identically in FIVE places (aspirations.py:43,
+# insight-trigger-gate.py:87, insight-trigger-sweep.py:143, precheck-eval.py:63,
+# unblock-parent-status-sweep.py:125). It is now that consensus set PLUS
+# `retired`, which those five omit and which this lane provably needs.
+#
+# HONEST SIZING, because the number will mislead whoever measures next
+# (guard-2529 -- a filter must report what it excluded): adding these two
+# excludes ZERO rows today. There are no `decomposed` or `superseded` goals
+# carrying a defer_reason anywhere in the live corpus. That is not a reason to
+# skip them, and the guard-2616 probe is what shows why: of the FOUR incumbents,
+# `completed`, `skipped` and `expired` are ALSO absent from the corpus (only
+# `retired` has live members, n=2). Speculative-but-correct is the normal and
+# intended state of this set -- it is a defensive predicate over statuses that
+# are rare on deferred goals by construction, not a description of today's queue.
+#
+# guard-2616 (extending a declared set is not additive until you measure the
+# MATCHER can read the new members) is satisfied by construction here, and was
+# probed rather than assumed: the matcher is a plain
+# `(status or "").strip().lower() in TERMINAL_STATUSES` exact compare, not a path
+# template or key layout, so a lowercase member cannot be silently unreadable.
+# The same probe re-run against the incumbents found no shape defeat either.
+TERMINAL_STATUSES = frozenset({
+    "completed", "skipped", "expired", "decomposed", "superseded", "retired",
+})
 
 
 def load_deferred() -> list:

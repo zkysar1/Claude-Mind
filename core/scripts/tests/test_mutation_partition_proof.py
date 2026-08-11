@@ -158,6 +158,72 @@ def test_target_is_byte_identical_after_every_mutant(bed):
     assert (bed / "target.txt").read_bytes() == before
 
 
+def _both_tokens_check(bed):
+    """A predicate both mutations below can kill, so neither is a survivor."""
+    (bed / "check_both.sh").write_text(
+        "grep -q '^GUARDED_TOKEN lives here$' target.txt && "
+        "grep -q '^UNRELATED_TOKEN lives here$' target.txt\n", encoding="utf-8")
+
+
+# The two mutations are the same pair test_target_is_byte_identical_after_every_mutant
+# uses. That test drives a test_cmd which does NOT read stdin -- which is precisely
+# why the defect below survived this file.
+_STDIN_PAIR = [
+    dict(name="m1", case="c1", **SINGLE_SITE),
+    dict(name="m2", case="c2", sabotage_old="UNRELATED_TOKEN", sabotage_new="CHANGED"),
+]
+
+
+def test_stdin_reading_test_cmd_does_not_truncate_the_matrix(bed):
+    """THE STDIN-LEAK REGRESSION ().
+
+    run_test in mutation-proof-test.sh redirected stdout and stderr but NOT stdin.
+    This script drives its loop with `while read ... done <<< "$PLAN_TSV"`, so
+    inside the loop body fd 0 IS the remaining plan rows. A test_cmd that reads
+    stdin consumed them, the loop's next `read` found nothing, and the run ended
+    after the FIRST mutation.
+
+    ASSERT THE COUNTS, NOT TERMINATION AND NOT THE VERDICT -- both are vacuous
+    here, and that is the whole point of this test. Measured against the pre-fix
+    script on this exact plan: it did not hang, it exited 0 in under a second and
+    reported verdict PASS / mutations 1 / cases 1 / cases_unproven [] against a
+    plan declaring TWO of each. A termination assertion passes that. A verdict
+    assertion passes that. Only the count discriminates.
+
+    The severity is the inverse of what a hang would be: this tool exists to
+    detect a k/N tally that conceals unproven cases, and the truncation made its
+    own tally read 1/1. A silent false PASS from the vacuity detector is worse
+    than a loud stall.
+    """
+    _both_tokens_check(bed)
+    rc, r = run_plan(bed, base(
+        bed, test_cmd="cat >/dev/null; bash check_both.sh", mutations=_STDIN_PAIR))
+    assert r["mutations"] == 2, (
+        f"matrix truncated: {r['mutations']} of 2 mutations ran -- the test_cmd "
+        f"consumed the caller's plan rows from stdin")
+    assert len(r["rows"]) == 2
+    assert sorted(row["case"] for row in r["rows"]) == ["c1", "c2"]
+    assert r["killed"] == 2 and r["survivors"] == []
+    assert r["cases"] == 2 and r["cases_unproven"] == []
+    assert rc == 0
+
+
+def test_single_mutation_plan_with_stdin_reading_test_cmd_still_passes(bed):
+    """Plan-size control: the fix must not trade one plan size for another.
+
+    A 1-mutation plan was green BEFORE the fix (the single `read` consumes the
+    whole here-string, so stdin is already at EOF). It must stay green after.
+    Paired with the test above this isolates the variable to stdin rather than
+    to plan size -- either test alone is consistent with the wrong explanation.
+    """
+    _both_tokens_check(bed)
+    rc, r = run_plan(bed, base(
+        bed, test_cmd="cat >/dev/null; bash check_both.sh",
+        mutations=[_STDIN_PAIR[0]]))
+    assert r["mutations"] == 1 and r["killed"] == 1
+    assert r["cases_unproven"] == [] and rc == 0
+
+
 def test_ambiguous_sabotage_form_is_refused(bed):
     plan_path = bed / "plan.json"
     plan_path.write_text(json.dumps(base(bed, mutations=[

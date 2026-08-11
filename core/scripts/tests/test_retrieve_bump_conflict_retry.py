@@ -21,7 +21,6 @@ stale reference are invisible to the code under test (observed: the two
 patch-dependent tests below failed in the full suite, passed in isolation).
 Resolve _fileops dynamically at patch time instead.
 """
-import importlib
 import json
 import sys
 from pathlib import Path
@@ -32,12 +31,8 @@ SCRIPTS = Path(__file__).resolve().parents[1]  # core/scripts
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+import _conflict_fixture as CF  # noqa: E402  (shared conflict seam, )
 import retrieve  # noqa: E402
-
-
-def _fileops_mod():
-    """The CURRENT _fileops module object (post any sibling-suite reload)."""
-    return importlib.import_module("_fileops")
 
 
 class _Conflict(Exception):
@@ -81,7 +76,7 @@ class _StubBackend:
 
 @pytest.fixture(autouse=True)
 def _no_backoff(monkeypatch):
-    monkeypatch.setattr(_fileops_mod(), "_conflict_backoff", lambda *_: 0)
+    monkeypatch.setattr(CF.fileops_mod(), "_conflict_backoff", lambda *_: 0)
 
 
 @pytest.fixture()
@@ -99,11 +94,14 @@ def store(tmp_path):
 
 
 def _use_backend(monkeypatch, be):
-    # _locked_bump_jsonl reads get_backend from retrieve's module namespace;
-    # _rmw_with_conflict_retry reads it from _fileops. Patch both — resolving
-    # _fileops fresh so the patch lands on the object retrieve will import.
-    monkeypatch.setattr(retrieve, "get_backend", lambda: be)
-    monkeypatch.setattr(_fileops_mod(), "get_backend", lambda: be)
+    # _locked_bump_jsonl reads get_backend from retrieve's module namespace, so
+    # retrieve is passed as an `extra`. The rest of the namespace enumeration
+    # lives once in _conflict_fixture.patch_conflict_backend ().
+    # NOTE this consumer's `from _fileops import _rmw_with_conflict_retry` is
+    # FUNCTION-level (retrieve.py:230), so it resolves the current sys.modules
+    # entry at call time and does not strictly need the retry-globals patch the
+    # shared helper also applies — see the MODULE-IDENTITY NOTE above.
+    CF.patch_conflict_backend(monkeypatch, be, retrieve)
 
 
 def test_bump_succeeds_first_try(monkeypatch, store):
@@ -123,7 +121,7 @@ def test_bump_retries_then_succeeds(monkeypatch, store):
     be = _StubBackend()
     _use_backend(monkeypatch, be)
     calls = {"n": 0}
-    fo = _fileops_mod()
+    fo = CF.fileops_mod()
     real_write = fo._atomic_write_with_fallback
 
     def flaky_write(path, write_fn, **kw):
@@ -155,7 +153,7 @@ def test_bump_degrades_on_exhaustion(monkeypatch, store, capsys):
     def always_conflict(path, write_fn, **kw):
         raise _Conflict("wedged fence")
 
-    monkeypatch.setattr(_fileops_mod(), "_atomic_write_with_fallback",
+    monkeypatch.setattr(CF.fileops_mod(), "_atomic_write_with_fallback",
                         always_conflict)
     out = retrieve._locked_bump_jsonl(
         store, lambda rec: rec["id"] == "rb-1")

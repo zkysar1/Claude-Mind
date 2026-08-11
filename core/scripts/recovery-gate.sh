@@ -607,6 +607,13 @@ _check_hung_autocompact() {
 #     wedge (heartbeat re-ticked fresh while the diary freezes) reaches the wedge
 #     check. (At 45min < 60 a long precheck/state-update false-recovered a
 #     healthy agent -- the  defect this invariant fixes.)
+#   - the runner-age gate () suppresses when the CURRENT runner is
+#     younger than the wedge threshold: a diary marker predating this runner is
+#     INHERITED (/start neither rolls the diary nor stamps entries with a sid),
+#     so it is not evidence about it. This is the one gate the 65-vs-60
+#     calibration above cannot supply, because a fresh /start writes a NEW
+#     heartbeat while inheriting an OLD phase_start — breaking the ages-together
+#     coupling that whole invariant rests on.
 #   - phase-wedge-check.py fails OPEN to no-recovery (rc!=0) on any error.
 _check_wedged_loop() {
     local agent="$1"
@@ -644,9 +651,55 @@ _check_wedged_loop() {
     # python3 (not py -3): this script sources _paths.sh, so python3 is the
     # sanctioned form (CLAUDE.md python-invocation rule; matches the SOURCE
     # parse call earlier in this script).
-    MIND_AGENT="$agent" python3 "$SCRIPT_DIR/phase-wedge-check.py" >/dev/null 2>&1
-    local wedge_rc=$?
+    # Capture stdout (do NOT discard): the verdict already carries
+    # threshold_minutes, so the runner-age gate below reuses the detector's own
+    # resolved threshold instead of re-parsing aspirations.yaml in bash. One
+    # source of truth for the threshold, and the gate can never drift from the
+    # detector it guards. `local` is declared on its OWN line — `local x="$(...)"`
+    # would make $? the exit status of `local`, not of the command substitution.
+    local wedge_json wedge_rc
+    wedge_json="$(MIND_AGENT="$agent" python3 "$SCRIPT_DIR/phase-wedge-check.py" 2>/dev/null)"
+    wedge_rc=$?
     [[ "$wedge_rc" -eq 0 ]] || return 0
+
+    # Runner-age gate () — a diary marker older than the CURRENT runner
+    # cannot be evidence about that runner. /start does not roll or reset
+    # execution-diary.jsonl and diary entries carry no sid, so check_wedge (a
+    # pure diary detector, by contract) structurally cannot tell a marker left
+    # by a PRIOR runner from one left by this one. Measured incident: a /start
+    # 4m55s old was recovered because the inherited last marker — a phase_start
+    # from the previous run — was already 70.9min against the 65min threshold.
+    # A fresh /start writes a brand-new heartbeat (FRESH) while inheriting that
+    # stale phase_start, so both Path-D gates read TRUE from signals of
+    # DIFFERENT ages, defeating the  calibration (which assumes a
+    # healthy phase's heartbeat ages WITH its phase_start — a coupling that a
+    # stop/start boundary breaks).
+    #
+    # runner-token is the signal, NOT latest-session-id (which the goal
+    # suggested) — measured 2026-08-05: /start writes all three of
+    # running-session-id, latest-session-id and runner-token in one atomic
+    # triple-write (start/SKILL.md:902), but session-save-id.sh's autocompact
+    # path re-writes ONLY the first two (`for _SID_TARGET in latest-session-id
+    # running-session-id`, L332-338). runner-token is in no refresh loop, so
+    # its mtime is the runner's START time and nothing can reset it. Keying on
+    # latest-session-id would let every autocompact reset the runner age and
+    # suppress Path D for another full threshold — silently disabling recovery
+    # for exactly the long-running sessions the 2026-07-04 fleet-wedge hit.
+    #
+    # Mirrors the execute-in-flight idiom above: `find -mmin +N` lists the file
+    # only when it is OLDER than N minutes, so an EMPTY result means the runner
+    # is younger than the threshold -> suppress. Missing token (abnormal —
+    # /start always writes one; session-manifest-clear removes it only AFTER a
+    # recovery) does NOT suppress: an undeterminable runner age must not
+    # silently disable the genuine-wedge path, which is the costlier failure.
+    local wedge_thresh rtok
+    wedge_thresh="$(printf '%s' "$wedge_json" | python3 -c 'import json,sys; d=json.loads(sys.stdin.read() or "{}"); v=d.get("threshold_minutes"); print(int(float(v)) if v is not None else "")' 2>/dev/null)"
+    rtok="$_adir/session/runner-token"
+    if [[ -n "$wedge_thresh" && -f "$rtok" ]]; then
+        if [[ -z "$(find "$rtok" -maxdepth 0 -mmin "+$wedge_thresh" 2>/dev/null)" ]]; then
+            return 0
+        fi
+    fi
 
     # stop-requested gate: graceful /stop owns the wind-down (rb-762 rc=1-only;
     # 0=signal-set and 2+=error both suppress).
@@ -659,7 +712,7 @@ _check_wedged_loop() {
     local bg_rc=$?
     [[ $bg_rc -eq 1 ]] || return 0
 
-    local cause="wedged loop: heartbeat=fresh, state=RUNNING, execution-diary phase_start unclosed past wedge threshold, no stop-requested, no pending bg job (g-328-23)"
+    local cause="wedged loop: heartbeat=fresh, state=RUNNING, execution-diary phase_start unclosed past wedge threshold, runner older than wedge threshold, no stop-requested, no pending bg job (g-328-23, g-328-45)"
     _perform_recovery "$agent" "$cause"
 }
 

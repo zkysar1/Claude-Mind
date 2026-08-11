@@ -91,6 +91,70 @@ _BACKPRESSURE_DEFAULTS = {
     "max_active_monitors": 5,
 }
 
+# MIRRORS core/scripts/meta-backpressure.py (_AUDIT_FIELD_BOUNDARY /
+# _is_audit_only_field). Layer 1 must not import from core/scripts
+# (core/BOUNDARY.md), so this is a deliberate mirror in the same shape as
+# lifecycle.py's pid_alive. KEEP THE TWO IN SYNC — the divergence between them
+# is what  fixed, and it is invisible to every test that exercises
+# only one side.
+_AUDIT_FIELD_BOUNDARY = ("[", ".", "_")
+
+
+def _is_audit_only_field(field, allowlist) -> bool:
+    """True when `field` is an allowlisted append-only key, or a sub-part of one.
+
+    WHY THIS EXISTS HERE (g-115-5305, measured 2026-08-08 on cc-07). g-115-4552
+    replaced the exact-match test `field in file_audit` with this boundary match
+    in the CLI copy ONLY. Under the daemon-only architecture
+    (.claude/rules/no-python-cli-fallback.md) `meta-backpressure.sh` routes every
+    subcommand to this module, so the CLI copy is not the live path and the fix
+    never took effect: this file still ran `mon["field"] in file_audit`.
+
+    The measured consequence was NOT a near-miss. The allowlist names BASE keys
+    (`roi_history`) while monitors register the shape actually written
+    (`roi_history[86]`), so the exact-match test returned False for EVERY real
+    monitor. `audit_only_skips` had ZERO entries for its entire lifetime while 21
+    `roi_history[N]` rollbacks fired — the success channel was silent, which is a
+    stronger signal than the rollback count alone and is why an empty skips list
+    must never be read as "nothing needed skipping".
+
+    Note the earlier fix's own note says the pre-g-115-4552 predicate left
+    `audit_only_skips` at 0 for 99 days. It stayed at 0 afterwards too, for a
+    different reason in a different file — so "the counter is still zero" was
+    true before AND after, and could not distinguish a fixed system from an
+    unfixed one.
+
+    Erring toward matching is deliberate and asymmetric: an over-match declines a
+    rollback and RECORDS the decision in `audit_only_skips` (visible, and both
+    `new_value`/`old_value` are preserved), while an under-match silently
+    destroys observability data recoverable only from `rollback_history`.
+
+    The bias matters beyond a lost log line: the rollback reason is always
+    "N consecutive goals below baseline", so deletions are BIASED toward
+    low-performance windows — exactly the windows an ROI series exists to
+    explain. The surviving series is survivorship-filtered toward good periods.
+    """
+    # Type-guard before any startswith. The predicate this replaced returns False
+    # for a non-str field and never raises; startswith raises AttributeError on a
+    # non-str field and TypeError on a non-str key, and the caller has no
+    # try/except — so ONE malformed monitor would abort the cycle and skip EVERY
+    # other monitor, including legitimate rollbacks. backpressure.yaml is a shared
+    # own-cloud store with a merge handler, so a null field is reachable. Fail
+    # toward False: identical behavior to the old predicate for malformed input.
+    if not isinstance(field, str):
+        return False
+    for key in allowlist:
+        if not isinstance(key, str) or not key:
+            # An empty key would over-match: field.startswith("") is True for
+            # everything, so any field beginning with a boundary char would match.
+            continue
+        if field == key:
+            return True
+        if (field.startswith(key)
+                and field[len(key):len(key) + 1] in _AUDIT_FIELD_BOUNDARY):
+            return True
+    return False
+
 
 # ---------------------------------------------------------------------------
 # Path + IO helpers
@@ -435,7 +499,7 @@ def check(ctx) -> "Response":  # type: ignore[name-defined]
 
             if mon["consecutive_below_baseline"] >= regression_window:
                 file_audit = audit_only_fields.get(mon["strategy_file"], []) or []
-                if mon["field"] in file_audit:
+                if _is_audit_only_field(mon["field"], file_audit):
                     mon["status"] = "audit_only_skipped"
                     skip = {
                         "meta_change_id": mon["meta_change_id"],

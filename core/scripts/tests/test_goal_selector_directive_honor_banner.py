@@ -219,3 +219,73 @@ def test_prose_only_directive_still_directs_via_fallback(tmp_path):
     warns = gs.emit_directive_honor_banner(
         _scored("g-315-390"), "foxtrot", board_path=bp)
     assert [w["goal_id"] for w in warns] == ["g-315-390"]
+
+
+# ── : @env-QUALIFIED addressing ────────────────────────────────────
+# Mirrors test_insight_trigger_sweep_addressing.py pins 3 + 4 for THIS consumer.
+# The sweep REFUSES a bare collision-set name and tells the poster to qualify it;
+# before these pins, the qualified form the sweep recommends compared unequal
+# here and was dropped in SILENCE. Bare loud upstream + qualified silent
+# downstream is a pincer, so qualifying posts to satisfy the sweep would have
+# traded a visible failure for an invisible one.
+#
+# Per guard-2860 the carve-out pin is the LEAST valuable of these four: it
+# cannot fail in the dangerous direction. The load-bearing ones are the
+# exclusions — a peer deployment's same-named agent, and an agent whose name
+# merely shares a prefix.
+
+def _qualified_directive(target_tag):
+    return {
+        "id": "msg-qual-1", "author": "alpha", "type": "directive",
+        "channel": "coordination",
+        "tags": ["directive", "target:g-315-390", "weight:+2.0", target_tag],
+        "text": "USER DIRECTIVE: prioritize g-315-390.",
+    }
+
+
+def test_qualified_self_env_tag_directs(tmp_path, monkeypatch):
+    """`requires_action_by:zeta@<self-env>` IS this agent — the defect."""
+    monkeypatch.setattr(gs, "ENVIRONMENT_ID", "ayoai-mind")
+    bp = _board(tmp_path, [_qualified_directive(
+        "requires_action_by:zeta@ayoai-mind")])
+    warns = gs.emit_directive_honor_banner(
+        _scored("g-315-390"), "zeta", board_path=bp)
+    assert [w["goal_id"] for w in warns] == ["g-315-390"]
+
+
+def test_qualified_peer_env_tag_does_not_direct(tmp_path, monkeypatch):
+    """`zeta@<peer-env>` is a PEER deployment's zeta, not ours. This is the
+    pin that a `split("@")[0]` shortcut would break — it is why the predicate
+    compares (agent, env) component-wise instead of matching a pattern."""
+    monkeypatch.setattr(gs, "ENVIRONMENT_ID", "ayoai-mind")
+    bp = _board(tmp_path, [_qualified_directive(
+        "requires_action_by:zeta@zds-mind")])
+    assert gs.emit_directive_honor_banner(
+        _scored("g-315-390"), "zeta", board_path=bp) == []
+
+
+def test_qualified_prefix_sibling_agent_does_not_direct(tmp_path, monkeypatch):
+    """`zetax@<self-env>` is a different agent that merely shares a prefix."""
+    monkeypatch.setattr(gs, "ENVIRONMENT_ID", "ayoai-mind")
+    bp = _board(tmp_path, [_qualified_directive(
+        "requires_action_by:zetax@ayoai-mind")])
+    assert gs.emit_directive_honor_banner(
+        _scored("g-315-390"), "zeta", board_path=bp) == []
+
+
+def test_bare_qualified_tag_does_not_reopen_prose_fallback(tmp_path, monkeypatch):
+    """A qualified tag with NO `requires_action_by:` prefix (`alpha@ayoai-mind`)
+    must still count as an explicit routing tag, so the prose fallback stays
+    suppressed. Otherwise has_routing_tag goes False and the g-115-2870
+    false-flag reopens: the tag routes to alpha, the prose names zeta."""
+    monkeypatch.setattr(gs, "ENVIRONMENT_ID", "ayoai-mind")
+    directive = {
+        "id": "msg-qual-2", "author": "alpha", "type": "directive",
+        "channel": "coordination",
+        "tags": ["directive", "target:g-315-390", "weight:+2.0",
+                 "alpha@ayoai-mind"],
+        "text": "alpha please claim g-315-390; zeta cannot do it.",
+    }
+    bp = _board(tmp_path, [directive])
+    assert gs.emit_directive_honor_banner(
+        _scored("g-315-390"), "zeta", board_path=bp) == []

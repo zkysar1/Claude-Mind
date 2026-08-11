@@ -92,9 +92,19 @@ def _make_world(tmp: Path, *, claimed_by=None, claimed_at=None,
     return world
 
 
+# Claims MUST carry a sid: the endpoint refuses sid-less world-goal claims
+# (-b), and production always sends one -- aspirations-claim.sh appends
+# &sid=$MIND_SID, which bash-agent-inject.py injects into every Bash call. A
+# sid-less test call was therefore already diverging from the production arg
+# shape (guard-920). The seeded goals here never set claimed_by_sid, so the
+# same-agent/other-session block stays inert and these takeback cases are
+# unaffected by the value.
+CLAIMER_SID = "44444444-aaaa-bbbb-cccc-444444444444"
+
+
 def _claim(port: int, goal_id: str, agent: str) -> tuple[int, str]:
     url = (f"http://127.0.0.1:{port}/v1/aspirations/claim"
-           f"?id={goal_id}&agent={agent}")
+           f"?id={goal_id}&agent={agent}&sid={CLAIMER_SID}")
     req = urllib.request.Request(url, data=b"", method="POST")
     req.add_header("X-Mind-Agent", agent)
     req.add_header("X-Mind-Override-All", "test-fixture")

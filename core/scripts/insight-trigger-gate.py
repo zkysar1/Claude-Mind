@@ -67,6 +67,8 @@ from _fileops import locked_append_jsonl  # noqa: E402
 from _paths import agent_dir as _agent_dir  # noqa: E402
 from _paths import enumerate_agent_confs as _enumerate_agent_confs  # noqa: E402
 from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, /)
+from _paths import ENVIRONMENT_ID  # noqa: E402  ( world identity)
+from peer_surface import routing_tag_targets_agent  # noqa: E402  ()
 
 
 #  / rb-1150: terminal statuses that mean "no Investigate needed
@@ -261,7 +263,25 @@ def _collect_triggers(findings, self_agent):
         # Policy: if requires_action_by is absent, BOTH agents see it and
         # neither is required to act — skip to avoid duplicate work. A finding
         # that targets this agent must say so explicitly via the tag.
-        if requires_by is None or requires_by != self_agent:
+        #
+        # : the second clause was `requires_by != self_agent`, exact
+        # string equality, so a tag in the @env-qualified form the
+        # cross-deployment convention RECOMMENDS (`zeta@ayoai-mind`) compared
+        # unequal and the trigger was dropped here in silence. That is the
+        # worst place in this family to lose one: this gate is what FILES the
+        # Investigate goal on an `invalidates` severity, so a partner saying
+        # "your assumption is dead" would never reach the agent at all.
+        # The absent-tag clause is deliberately UNTOUCHED (guard-1807 — do not
+        # delete a clause of a compound skip-guard; the excluded class here
+        # fails the equality clause, not the None clause).
+        # Behaviour-preserving on the live corpus, measured 2026-08-06 over
+        # 9110 board records: 353 bare tags and 7 qualified, all 7 targeting
+        # `omni@zds-mind` — a PEER deployment, correctly skipped both before
+        # and after. The newly-admitted set on today's data is EMPTY; this only
+        # changes what happens the first time someone writes the qualified form
+        # for a LOCAL agent (guard-1562 — name what the change newly admits).
+        if requires_by is None or not routing_tag_targets_agent(
+                requires_by, self_agent, ENVIRONMENT_ID):
             continue
         severity = _parse_tag_value(tags, "severity:") or "informs"
         if severity not in ("invalidates", "constrains"):

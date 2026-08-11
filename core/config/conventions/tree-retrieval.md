@@ -75,10 +75,62 @@ Each tree node entry includes `match_channel` (how it was matched) and `match_sc
 (relevance score). Response `meta` includes `retrieval_channels` (list of channels used).
 
 **Matching strategies** (applied in order, results merged):
-1. **Exact key**: category string equals a node key
+1. **Exact key**: category string equals a node key — **literal, case-folded
+   equality only (`tree_match.py`, `_match_nodes` strategy 1 — pre-fix the test
+   read `if key_lower == cat_lower:`); separators are NOT normalized.** So
+   `"test coverage illusions"` does not earn the exact-key channel for the node
+   keyed `test-coverage-illusions`; it falls through to word-prefix/concept.
+   Measured 2026-08-04 (cc-04): that node ranks **#1 at 6.80** for the
+   hyphenated form and **#7 at 4.30** for the space-separated one — the same
+   query, ~2.5 points and 6 rank positions apart, on a 25-match corpus at
+   `--top 25` (the no-op path, so MMR does not explain it).
+   **Read this as a known gap, not intended weighting.** That exact_key (4.0)
+   outranks word_prefix (1.5) IS intended; what is unintended is that the
+   natural-language spelling of the *same* identifier cannot reach the channel
+   at all. Evidence: that equality test is unchanged since the original
+   2026-03-16 commit and was never revisited, whereas strategy 4 was
+   deliberately made separator-agnostic on 2026-05-09 (P0 #2) — the codebase
+   settled this question once, in favour of separator-independence, and
+   strategy 1 simply predates that decision. It matters because
+   natural-language is the query shape the framework MANDATES
+   (`.claude/rules/code-review-protocol.md` step 4 requires two free-text
+   queries). **FIXED 2026-08-04 (g-306-182)**: both sides are normalized with
+   `_norm_separators` (`tree_match.py`), which collapses any non-alphanumeric
+   run to a single hyphen using the same `[a-z0-9]+` tokenizer strategy 4
+   adopted in 2026-05-09 — so the two strategies now agree on what a separator
+   is. The change is **order-preserving**: it makes separators irrelevant, NOT
+   token order, so `"illusions coverage test"` still does not match
+   `test-coverage-illusions`. Verified no key collisions: across all 1330 live
+   tree keys, distinct-normalized == distinct-raw == 1330, and normalization is
+   identity for 100% of them — the kebab-case key convention means only the
+   QUERY side changes. Pinned by
+   `core/scripts/tests/test_tree_match_exact_key_separator.py` (9 cases, proven
+   RED at 3 failures before the fix), whose negative controls — token subset,
+   token superset, reordered tokens, sibling key — exist so the pin cannot be
+   satisfied by making the channel fire more loosely.
+   Note `tree-find-node.sh` is daemon-routed (`rt_call GET /v1/tree/find-node`)
+   and the daemon imports this same `_match_nodes` (`mind_api/src/world/tree.py:38`
+   — no reimplementation), so a running daemon serves the OLD ranking until it
+   next restarts. A live-path measurement taken before that reload shows
+   pre-fix numbers and is not evidence the fix failed (guard-742 class).
+   **Coverage boundary, stated so nobody re-derives it:** the pin is a UNIT
+   test against `_match_nodes`; nothing asserts this behaviour THROUGH the
+   daemon endpoint. `mind_api/tests/test_runtime_tree.py` does exercise
+   `/v1/tree/find-node`, but its cases are returns-a-node / leaf-only /
+   missing-text-400 / invalid-top-400 — none asserts a channel or a score.
+   The gap is judged low-risk *because* the daemon imports this same
+   `_match_nodes` rather than reimplementing it, so the two paths cannot
+   diverge in logic — only in staleness, which the note above covers. It stops
+   being low-risk the moment anything reimplements matching daemon-side. Note
+   also that `mind_api/tests` is a deferred testpath `run-full-suite.sh` does
+   not run by default, so a case added there is real but routinely unexecuted.
 2. **Substring**: category appears in key/summary/topic (bidirectional)
 3. **Entity index**: category matches a semantic entity in `_tree.yaml`
-4. **Word-prefix**: hyphen-split words, prefix match (min 4 chars)
+4. **Word-prefix**: prefix match (min 4 chars) on words split at ANY
+   non-alphanumeric separator — hyphen, space, underscore, slash
+   (`re.findall(r'[a-z0-9]+', ...)`). Was pure `split("-")` until 2026-05-09;
+   before that fix, space-separated and natural-language queries became one
+   unsplit token and returned 0 tree nodes.
 5. **Concept**: query tokens matched against `.md` front-matter `entities` fields
 
 After matching, sibling and parent inclusion runs ONLY when `--depth deep`
@@ -132,6 +184,48 @@ would otherwise be its 3rd or 4th sibling. **No-op when no overflow** —
 if `len(scored) <= limit` the function returns the input unchanged,
 so MMR cost only fires when the cap actually binds.
 Implementation: `_mmr_rerank` in `core/scripts/tree_match.py`.
+
+**What this means when you READ a `--top N` list** (measured g-306-183 /
+g-306-182, 2026-08-04, cc-04). The consequences below are the whole reason a
+correct MMR run keeps getting re-filed as a sort bug — read them before
+concluding the ranker is broken:
+
+- **(a) For `N > 1` the returned list is NEITHER the N highest-scoring nodes
+  NOR in descending score order. Both by design.** Measured:
+  `tree-find-node.sh --text "test-coverage-illusions" --top 5` returns scores
+  `[6.80, 4.88, 4.55, 4.20, 4.42]` — non-monotonic — and *omits*
+  `test-coverage-and-velocity` (4.83) and `test-pollution-defense` (4.69)
+  while including 4.20 and 4.42. Truncation is **not** set-preserving.
+  Dropping high-scoring near-duplicates is the PURPOSE, not a defect.
+- **(b) `--top 1` IS exact, by construction.** `_mmr_rerank` seeds
+  `selected = [scored[0]]`, so the first pick is always the max-relevance
+  item regardless of diversity. Verified across 8 unrelated queries: 0 of 8
+  disagreed with the true top-1 read from `--top 50`. This is what makes
+  `tree-find-node.sh --leaf-only --top 1` — the encoding-target selector in
+  `aspirations-state-update` Step 8 — safe structurally rather than by luck.
+- **(c) The no-op boundary lands exactly at `N = len(matched)`.** Positive
+  control on a corpus matching exactly 25 nodes: `--top 23` → 9 inversions,
+  `--top 24` → 9, `--top 25` → 0, `--top 26` → 0. So a list measured at
+  `N >= len(matched)` is a pure relevance ranking and MMR explains nothing
+  about it — do not reach for MMR to explain an ordering you measured there.
+- **(d) LANE SCOPE — MMR applies to the TREE-NODE lane ONLY.** The
+  supplementary stores (`reasoning_bank`, `guardrails`, `pattern_signatures`)
+  are **plain sorted truncation**, never diversified. Two independent signals,
+  2026-08-04: (1) `_mmr_rerank` is called only from the tree path, gated on
+  `if all_nodes and len(scored) > limit` (`retrieve.py:1884,1888`), while the
+  three supplementary loaders apply `SUPPLEMENTARY_CAPS` as a sorted slice
+  (`retrieve.py:1081,1168,1211`) — and `mind_api/src/endpoints/retrieve.py`
+  delegates to those same `_r.load_*` functions, defining no rerank of its own;
+  (2) empirically, one `--read-only` query at `--depth shallow` vs `--depth
+  deep` returned a shallow guardrail set that is an EXACT ORDERED PREFIX of
+  the deep set (20 of 80; reasoning_bank 20 of 45), which plain truncation
+  produces and diversification does not. This matters because the mandated
+  pre-apply consultation in `.claude/rules/code-review-protocol.md` step 4
+  reads the supplementary lane specifically so as not to miss one entry — a
+  diversity-diluted supplementary lane would silently defeat that. It is not.
+  (Both calls used `--read-only` deliberately: a counter-bumping first call
+  reorders the `utilization_score` key the second call sorts by, which would
+  corrupt the comparison.)
 
 Side effect: increments retrieval_count on all returned items.
 

@@ -109,8 +109,9 @@ SKIP this phase entirely when invoked with --file (targeted single-doc drain).
 # Purge stale ephemera via the CANONICAL GUARDED helper — NEVER hand-roll an
 # `rm` (or the find/rm inline) here. `temp-drain-purge.sh` asserts the temp dir
 # is set + non-empty, absolute, strictly under PROJECT_ROOT, and basename=='temp'
-# BEFORE any deletion, then runs THREE guarded lanes (g-115-2948), NONE using a
-# per-file `rm` on an interpolated path:
+# BEFORE any deletion, then runs THREE guarded DELETION lanes (g-115-2948), NONE
+# using a per-file `rm` on an interpolated path — plus a report-only Lane 0 that
+# deletes nothing (listed last below because it was added last, g-115-3397):
 #   Lane 1 — purge ephemera FILES: `find … -maxdepth 1 -type f (ephemera globs)
 #     -mmin +120 -delete` (leaves drained/ untouched; the 120-min age guard skips
 #     an actively-written suite.log from an in-flight run).
@@ -118,10 +119,25 @@ SKIP this phase entirely when invoked with --file (targeted single-doc drain).
 #     preserved; --drained-age-days overrides the 30-day default).
 #   Lane 3 — remove abandoned stray subdirs: any dir under temp/ that is NOT
 #     drained/ and is untouched past --age-min, via a bounded `find "$stray" -delete`.
-#     EXCEPTION (g-115-2962): a stray dir carrying a top-level RECEIPT.md or a
+#     EXCEPTION (g-115-2962): a stray dir carrying a top-level RECEIPT.* or a
 #     .archive-marker sentinel is an archive-before-delete recovery layer and is
 #     PRESERVED (reported on stderr, excluded from .stray_purged) — never
-#     destroyed as a drain side-effect (archive-before-delete.md).
+#     destroyed as a drain side-effect (archive-before-delete.md). The receipt
+#     match is extension- and case-INSENSITIVE as of g-115-3397: it required
+#     `RECEIPT.md` exactly until 2026-08-08, a name zero producers write
+#     (_seed_engine.py writes RECEIPT.json, history_vacuum_archive.py writes
+#     lowercase receipt.json), so the guard was unreachable by every archive the
+#     framework creates. SSOT predicate: `_has_archive_receipt`.
+#   Lane 0 — REPORT-ONLY, deletes nothing (g-115-3397). Hidden dotfiles directly
+#     under temp/ are matched by NO lane: Phase 1 below enumerates temp/*.md and
+#     temp/*.json (globs that cannot match a leading dot) and Lane 1 exempts
+#     `! -name '.*'`, so a dotfile is never drained, never purged, and never
+#     counted by the temp-pressure metric — permanent invisible residue, and the
+#     originating case was a 221-byte .launch-payload.json holding an api_key and
+#     three other secrets. This lane makes it VISIBLE without adding a way to
+#     destroy live state: purging is the wrong correction because the exemption
+#     protects the git-tracked .gitkeep, and the live population is working
+#     cadence state. Allowlist: .gitkeep, .archive-marker.
 #
 # WHY the helper and NOT an inline rm: hand-rolling an unguarded
 # `rm -f "$TEMP_DIR/$f"` here — when $TEMP_DIR resolves empty — becomes an `rm`
@@ -133,7 +149,11 @@ SKIP this phase entirely when invoked with --file (targeted single-doc drain).
 Bash: bash core/scripts/temp-drain-purge.sh          # add --dry-run when the drain is --dry-run
   → parse the JSON: purged_count = .purged; ephemera names = .files; drained GC
     count = .drained_gc_purged; stray-dir count = .stray_purged (surface all
-    three in the Phase 4 report).
+    three in the Phase 4 report). ALSO surface .unmanaged_dotfiles (Lane 0) and
+    .unmanaged_dotfile_names when the count is non-zero — those files were NOT
+    touched and will still be there next drain, so an unreported non-zero count
+    is the invisible-residue defect returning. It is identical under --dry-run
+    (Lane 0 never deletes), so do NOT read a zero there as "nothing to see".
 IF --dry-run: invoke with --dry-run (all *_purged=0; .would_purge /
     .drained_gc_would_purge / .stray_would_purge list what WOULD go); DELETE NOTHING.
 IF every count is 0 (.purged, .would_purge, .drained_gc_purged, .drained_gc_would_purge,
@@ -171,6 +191,33 @@ For each undrained file (oldest first):
 
    DISCARD is a first-class outcome — do not force-encode junk into the tree.
    Record WHY (already-encoded / superseded / ephemeral) for the Phase 4 report.
+
+3b. BEFORE committing to a DISCARD verdict, run the scripted encode probe.
+   DISCARD is the one branch whose wrong call is silent and effectively
+   irreversible — the doc lands in temp/drained/ and nothing re-examines it —
+   and it was the only branch resting entirely on LLM judgement (g-115-3089).
+
+   Bash: py -3 core/scripts/drain-encode-probe.py <file> --json
+
+   The probe infers the artifact's TYPE from its field shape, then probes the
+   store for the EFFECT the payload would have had — not merely for something
+   with a matching name. Act on the verdict:
+
+   | verdict | meaning | required action |
+   |---|---|---|
+   | `absent`  | the payload's effect is NOT in the store — unapplied work | **DISCARD IS BLOCKED.** Encode it, or leave it undrained. Never archive. |
+   | `encoded` | the effect is present in the store | DISCARD is safe to proceed |
+   | `unknown` | shape unrecognised / store unreadable / effect not observable | fall back to LLM judgement, exactly as before |
+
+   `unknown` is the common case for query-output captures and command scratch,
+   which is correct — the probe narrows the judgement call, it does not replace
+   it. Only `absent` constrains you, and only in the safe direction.
+
+   FAIL-OPEN: the probe never emits `absent` from an internal error (every
+   failure path returns `unknown`) and always exits 0. A probe bug therefore
+   restores today's behaviour rather than wedging the drain lane — arming an
+   inert checker would invert the harm rather than fix it. Do NOT gate a drain
+   on the probe's exit code; read the verdict.
 
 4. Knowledge reconciliation: after a tree encoding, update the node's
    last_updated + last_update_trigger (knowledge-freshness.md).

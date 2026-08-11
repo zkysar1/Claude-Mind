@@ -99,6 +99,34 @@ SIGS_PATH = WORLD_DIR / "pattern-signatures.jsonl"
 BELIEFS_PATH = WORLD_DIR / "knowledge" / "beliefs.yaml"
 
 # Per-agent stores (agent directory)
+#
+# EXP_PATH is LIVE-ONLY, and that is an UNINTENDED reachability gap — NOT
+# deliberate active forgetting (g-115-4617, measured 2026-08-04, echo, hostname
+# cc-03, uname -r 6.8.0-136-generic). 1,722 records sit in experience-archive.jsonl
+# that retrieve cannot surface. Recorded here so the next reader does not
+# re-derive it; the evidence, in the order it settles the question:
+#   - The sweep that fills the archive (experience.py cmd_archive_sweep) applies
+#     (1) age>=30d AND retrieval_count==0, and (2) age>=90d AND utility_ratio<0.2,
+#     with a "never archive high-value" guard requiring rc>=5 AND ur>=0.5.
+#   - utility_ratio is 0.0 on 4,174 of 4,175 fleet records (and on 604 of 604 of
+#     echo's own, which are ground truth rather than a mirror read) because its
+#     recompute is UNREACHABLE DEAD CODE: experience.py cmd_update_field rejects
+#     any dotted field name at L665, and the recompute at L687 fires only on a
+#     dotted field name. So rule (2) degenerates to a PURE 90-DAY AGE CAP and the
+#     protection guard is structurally unreachable — 0 of 4,175 records qualify,
+#     and 174 archived records had rc>=5 (max 34). Tracked by g-115-4969; the
+#     class is guard-893's under-recorded-utilization trap.
+#   - Its stated purpose is performance, not curation: g-001-06, the recurring goal
+#     that drives it, reads "Keeps live JSONL files small and fast."
+#   - No consumer compensates — experiential-index.yaml holds 8 entries fleet-wide.
+#   - The archive is a ONE-WAY DOOR: retrieval_count is bumped only on live
+#     records, so rule (1)'s own criterion is self-fulfilling once a record lands
+#     there (guard-731: never retire on retrieval_count==0 alone).
+# DO NOT widen scope here alone. DO NOT INLINE — the twin at
+# mind_api/src/endpoints/retrieve.py re-binds _r.EXP_PATH to the same live file
+# per request, so a one-sided change fixes nothing (guard-130). Widening is also
+# not free (corpus +70%, and a bump would write into the archive); that cost is
+# UNMEASURED and is g-115-4970's job, not this comment's.
 EXP_PATH = AGENT_DIR / "experience.jsonl" if AGENT_DIR else None
 EI_PATH = AGENT_DIR / "experiential-index.yaml" if AGENT_DIR else None
 
@@ -158,8 +186,17 @@ def _infer_in_flight_goal_id():
     from _team_state import read_agent_row, row_path as _ts_row_path
     try:
         get_backend().ensure_local(_ts_row_path(WORLD_DIR, agent))
-    except Exception:
-        pass  # best-effort — a missing row falls back to the core residual
+    except Exception as e:
+        # best-effort — a missing row falls back to the core residual
+        try:  # report, never raise — see note_swallowed_backend_error (g-306-218)
+            from storage_backend import note_swallowed_backend_error
+            # Recomputed rather than hoisted: _ts_row_path() is currently INSIDE
+            # the guarded block, so lifting it out would let it raise. The nested
+            # try covers the recompute.
+            note_swallowed_backend_error(
+                "ensure_local", _ts_row_path(WORLD_DIR, agent), e)
+        except Exception:
+            pass
     status = read_agent_row(WORLD_DIR, agent, core_path=ts_path) or {}
     inflight = status.get("in_flight")
     if not inflight or not isinstance(inflight, dict):
@@ -800,7 +837,24 @@ def _embedding_blend(matched, active, categories, exclude=None):
     widened.sort(key=lambda r: -scores.get(r.get("id"), min_cos))
     return widened
 
-def _universal_relevance_split(universal_sorted, categories):
+# g-115-4039 — per-request carrier for the universal pull-slot outcome.
+#
+# The producer (_universal_relevance_split, inside load_reasoning_bank) and the
+# consumer (_log_retrieval_trace) sit in different call frames with no shared
+# argument path, and the daemon endpoint calls them separately. A module global
+# is the same channel WORLD_DIR already uses here, and it is safe for the same
+# documented reason: mind_api/src/endpoints/retrieve.py runs BOTH the retrieval
+# and the trace write inside `_swap_lock`, so requests are serialized. Under the
+# CLI there is one request per process.
+#
+# Consumed with POP semantics, never plain read: a request that does not reach
+# the split (supplementary-only, as_of, an early return) must not inherit the
+# PREVIOUS request's numbers. Clearing on read makes a stale carry-over
+# impossible rather than merely unlikely.
+_UNIVERSAL_SPLIT_STATS: "dict" = {}
+
+
+def _universal_relevance_split(universal_sorted, categories, stats=None):
     """g-306-86 — split the universal-RB cap between the utilization push
     floor and query-relevance pulls, flag-gated by `embedding_blend_enabled`.
 
@@ -831,8 +885,36 @@ def _universal_relevance_split(universal_sorted, categories):
         `reasoning-bank-read.sh --universal` (a separate reader); only
         retrieve's meta_lessons output changes here.
     """
+    def _rec(status, picked=0, backfilled=0, slots_n=0):
+        """Record the pull-slot outcome into the caller's `stats` dict.
+
+        g-115-4039: the trace previously carried only COUNTS of returned items,
+        so a lane where both pull slots were filled by cosine and one where
+        cosine picked NOTHING and utilization backfilled every slot both emitted
+        n_reasoning_bank=5 — the cosine feature silently not running was
+        invisible to every metric (same shape as guard-1977: a check that
+        declines to run is indistinguishable from one that ran and passed).
+
+        `status` is FOUR-valued on purpose. A bare picked=0 count would collapse
+        three genuinely different conditions into one number and rebuild the
+        very defect this instruments: `off` (feature flag disabled), `no_slots`
+        (configured to 0 pull slots), `no_scores` (enabled, but the embedding
+        index returned nothing — a broken/missing index, NOT an abstention), and
+        `ran` (cosine actually scored candidates). Only under `ran` does
+        backfilled measure true abstention; treating the other three as
+        abstention would inflate the fleet-wide rate with configuration and
+        infrastructure states.
+        """
+        if stats is None:
+            return
+        stats["universal_cosine_status"] = status
+        stats["n_universal_cosine_picked"] = picked
+        stats["n_universal_backfilled"] = backfilled
+        stats["n_universal_pull_slots"] = slots_n
+
     cfg = _load_retrieval_config()
     if not cfg.get("embedding_blend_enabled", False):
+        _rec("off")
         return universal_sorted[:UNIVERSAL_RB_CAP]
     try:
         slots = int(cfg.get("universal_relevance_slots", 2))
@@ -840,6 +922,7 @@ def _universal_relevance_split(universal_sorted, categories):
         slots = 2
     slots = max(0, min(slots, UNIVERSAL_RB_CAP))
     if slots == 0:
+        _rec("no_slots")
         return universal_sorted[:UNIVERSAL_RB_CAP]
     try:
         from _embedding_retrieval import cosine_scores
@@ -849,6 +932,7 @@ def _universal_relevance_split(universal_sorted, categories):
     except Exception:
         scores = {}
     if not scores:
+        _rec("no_scores", slots_n=slots)
         return universal_sorted[:UNIVERSAL_RB_CAP]
     try:
         min_cos = float(cfg.get("embedding_min_cosine", 0.35))
@@ -860,6 +944,12 @@ def _universal_relevance_split(universal_sorted, categories):
     pulls = [r for r in rest if scores.get(r.get("id"), 0.0) >= min_cos]
     pulls.sort(key=lambda r: -scores.get(r.get("id"), 0.0))
     out.extend(pulls[:slots])
+    cosine_picked = len(pulls[:slots])
+    # Count what the backfill loop ACTUALLY appends rather than inferring it from
+    # (slots - cosine_picked): when `rest` is shorter than the remaining slots the
+    # loop cannot fill them, so the inferred figure would over-report backfill for
+    # a small corpus. Measure the append, do not derive it.
+    before_backfill = len(out)
     if len(out) < UNIVERSAL_RB_CAP:
         picked = {id(r) for r in out}
         for r in rest:
@@ -868,6 +958,8 @@ def _universal_relevance_split(universal_sorted, categories):
                 picked.add(id(r))
             if len(out) >= UNIVERSAL_RB_CAP:
                 break
+    _rec("ran", picked=cosine_picked,
+         backfilled=len(out) - before_backfill, slots_n=slots)
     return out
 
 def _tree_doc_id_for(node):
@@ -1053,8 +1145,29 @@ def load_reasoning_bank(categories, depth="medium", read_only=False, entry_type=
     # g-306-86: flag-gated relevance split of the universal cap. as_of reads
     # keep the pure utilization slice — same historical-view reasoning as the
     # domain-lane blend above.
+    # Clear UNCONDITIONALLY, before the as_of branch. This must not sit inside
+    # the `is None` arm: the consumer pops on the way out, so the carrier is
+    # normally empty by the time the next request arrives — but a request that
+    # populates it and then RAISES before _log_retrieval_trace (anything between
+    # endpoints/retrieve.py:339 and :534) leaves it dirty, and the next request
+    # that reaches the trace write WITHOUT running the split then inherits the
+    # previous request's numbers. Measured leak: an as_of read emitted
+    # status="ran" with a prior request's picked/backfilled counts, and because
+    # the rate contract selects exactly status=="ran" rows, the contaminated row
+    # is COUNTED — corrupting the metric this instrument exists to produce.
+    # Every request that can reach the trace write passes through here
+    # (endpoints/retrieve.py:339 is unconditional), so clearing here closes the
+    # window entirely. Pop-on-read protects the request AFTER the consumer;
+    # this protects the request after a FAILED one. (g-115-4039 fresh-eyes;
+    # guard-1663 — never let a process-global carry across owners.)
+    _UNIVERSAL_SPLIT_STATS.clear()
+    # g-306-86 (cont.): as_of reads never run the blend, so there is no pull-slot
+    # outcome to report. Leaving the carrier empty (rather than writing zeros)
+    # keeps "the lane did not run" distinct from "the lane ran and picked none" —
+    # the same conflation the four-valued status exists to prevent.
     if as_of_dt is None:
-        universal = _universal_relevance_split(universal, categories)
+        universal = _universal_relevance_split(
+            universal, categories, stats=_UNIVERSAL_SPLIT_STATS)
     else:
         universal = universal[:UNIVERSAL_RB_CAP]
 
@@ -2000,6 +2113,24 @@ def _log_retrieval_trace(category, depth, read_only, items_returned,
       supplementary_only — bool
       include_framework — bool
 
+    Universal pull-slot fields (g-115-4039) — PRESENT ONLY when the universal
+    relevance split ran on this request (absent on supplementary-only and as_of
+    reads). Before these, every count in this record was a count of RETURNED
+    items, so a lane where cosine filled both pull slots and one where cosine
+    picked nothing and utilization backfilled every slot were byte-identical:
+    both emitted n_reasoning_bank=5. The cosine path silently not running was
+    unmeasurable fleet-wide.
+      universal_cosine_status    — off | no_slots | no_scores | ran
+      n_universal_pull_slots     — configured pull slots for this request
+      n_universal_cosine_picked  — slots filled by cosine (>= min_cosine)
+      n_universal_backfilled     — slots filled by utilization-order backfill
+
+    ABSTENTION RATE = n_universal_backfilled / n_universal_pull_slots, computed
+    ONLY over rows with universal_cosine_status == "ran". The other three
+    statuses are configuration or infrastructure states, not abstentions —
+    folding them in would report a disabled flag or a missing embedding index as
+    a cosine miss.
+
     Signal #10 of the Self/Program evolution metric vector (§7.1) reads this
     file to compute "retrieval tier success rate" — higher Tier-1-satisfied
     fraction = more knowledge is encoded into the tree (good).
@@ -2042,6 +2173,40 @@ def _log_retrieval_trace(category, depth, read_only, items_returned,
             "supplementary_only": bool(supplementary_only),
             "include_framework": bool(include_framework),
         }
+        # Dropped-key detection (g-115-3416). The n_* keys above are a FIXED
+        # allowlist over items_returned, so a store lane added to items_returned
+        # without a matching n_<store> here vanishes from the trace with no
+        # error — and this trace is what the retrieval audits count. The source
+        # is internal, so this is producer/consumer version skew rather than a
+        # caller-contract break; it is still silent, which is the defect.
+        # Report, do not reject (rb-538 / guard-527). Cheap: a set difference.
+        _carried = {k[2:] for k in record if k.startswith("n_")}
+        # str(k), not k. This block sits INSIDE the enclosing
+        # `try/except Exception: return`, so a raise here silently discards the
+        # WHOLE trace row — the observability addition suppressing the
+        # observability it is attached to. Measured: one non-string key in
+        # items_returned made `sorted()` raise and the row vanish, on an input
+        # that wrote fine before this block existed.
+        _dropped = sorted(str(k) for k in items_returned if k not in _carried)
+        if _dropped:
+            print(
+                "WARN: retrieve trace dropped %d unrecognized items_returned "
+                "key(s): %s. _log_retrieval_trace carries a fixed n_<store> "
+                "allowlist; these counts were NOT written to "
+                "retrieval-trace.jsonl. Add n_<store> to the record if the lane "
+                "should be audited." % (len(_dropped), ", ".join(_dropped)),
+                file=sys.stderr,
+            )
+        # g-115-4039 — universal pull-slot outcome, POPPED (not read) so a
+        # request that never reached the split cannot inherit the previous
+        # request's numbers. Absent keys mean "the blend lane did not run on
+        # this request", which is deliberately DIFFERENT from status="ran" with
+        # zero picks; a consumer computing the fleet-wide abstention rate must
+        # filter to status == "ran" or it will count configuration and
+        # missing-index states as abstentions.
+        if _UNIVERSAL_SPLIT_STATS:
+            record.update(_UNIVERSAL_SPLIT_STATS)
+            _UNIVERSAL_SPLIT_STATS.clear()
         # Same best-effort append pattern as _record_fallback_hit. Single-line
         # JSON under PIPE_BUF (4 KB) is single-write atomic on most filesystems
         # — torn-line risk is observability-grade, not durable-state-grade.

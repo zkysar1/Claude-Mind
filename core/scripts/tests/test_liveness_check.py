@@ -194,3 +194,91 @@ def test_revived_agent_is_not_retired_here():
     r = decide_liveness(_ago(minutes=5), None, threshold_hours=6, now=NOW,
                         retired_entry=None)
     assert r["verdict"] == "alive"
+
+
+# --- Mind vs Body: the shard OBJECT time is not mind liveness (-e) ---
+#
+# The shard object's write time says "something on that box wrote this shard".
+# Under the Mind/Body split that something can be a worker Body while the
+# reducer is dead, so object freshness alone must never promote to "alive".
+
+
+def test_fresh_object_with_stale_authoritative_value_is_not_alive():
+    """THE REGRESSION. A worker Body writing the shard refreshes the object while
+    the mind's own heartbeat has aged out. Before the fix this returned alive."""
+    r = decide_liveness(_ago(days=7), _ago(minutes=4), threshold_hours=6, now=NOW,
+                        authoritative_last_active_iso=_ago(days=7))
+    assert r["verdict"] != "alive"
+    assert r["verdict"] == "unknown"
+
+
+def test_body_write_does_not_make_a_dead_reducer_dormant_either():
+    """guard-1042 + the goal-selector contract. `dormant` is the ONLY verdict
+    _liveness_confirms_dormant acts on, so answering dormant here would leak an
+    active agent's routed goals cross-agent. Not alive, and not dormant."""
+    r = decide_liveness(_ago(days=7), _ago(minutes=4), threshold_hours=6, now=NOW,
+                        authoritative_last_active_iso=_ago(days=7))
+    assert r["verdict"] != "dormant"
+
+
+def test_fresh_authoritative_value_is_alive_and_names_its_signal():
+    r = decide_liveness(_ago(days=7), _ago(days=7), threshold_hours=6, now=NOW,
+                        authoritative_last_active_iso=_ago(minutes=10))
+    assert r["verdict"] == "alive"
+    assert r["signal"] == "authoritative_last_active"
+
+
+def test_fresh_authoritative_value_beats_a_stale_object():
+    # Mind heartbeating but the object read came back old: still alive. The VALUE
+    # is the mind signal; object time is only corroboration.
+    r = decide_liveness(None, _ago(days=3), threshold_hours=6, now=NOW,
+                        authoritative_last_active_iso=_ago(minutes=1))
+    assert r["verdict"] == "alive"
+
+
+def test_both_authoritative_and_object_stale_is_still_dormant():
+    # Two independent authoritative signals agree the agent is quiet.
+    r = decide_liveness(_ago(days=7), _ago(days=7), threshold_hours=6, now=NOW,
+                        authoritative_last_active_iso=_ago(days=7))
+    assert r["verdict"] == "dormant"
+
+
+def test_stale_authoritative_with_unreadable_object_is_unknown_not_dormant():
+    # The object read failed, so there is no corroboration for a death claim.
+    r = decide_liveness(_ago(days=7), None, threshold_hours=6, now=NOW,
+                        authoritative_last_active_iso=_ago(days=7))
+    assert r["verdict"] == "unknown"
+
+
+def test_retirement_still_dominates_a_fresh_authoritative_value():
+    # A just-retired agent's last heartbeat is still fresh; retirement wins.
+    r = decide_liveness(_ago(minutes=1), _ago(minutes=1), threshold_hours=6, now=NOW,
+                        retired_entry={"retired": True, "retired_at": "2026-07-14T09:00:00"},
+                        authoritative_last_active_iso=_ago(minutes=1))
+    assert r["verdict"] == "retired"
+
+
+def test_absent_authoritative_value_preserves_every_existing_verdict():
+    """Backward-compat twin of test_absent_tombstone_preserves_every_existing_verdict.
+    Omitting the new argument must leave every pre-existing caller byte-identical —
+    including the legacy object-freshness-implies-alive row, which is still correct
+    when no mind signal could be read at all."""
+    for la, fs, expected in (
+        (_ago(minutes=30), None, "alive"),
+        (_ago(days=7), _ago(minutes=4), "alive"),
+        (_ago(days=7), _ago(days=7), "dormant"),
+        (_ago(days=7), None, "unknown"),
+    ):
+        assert decide_liveness(la, fs, threshold_hours=6, now=NOW)["verdict"] == expected
+        assert decide_liveness(la, fs, threshold_hours=6, now=NOW,
+                               authoritative_last_active_iso=None)["verdict"] == expected
+
+
+def test_authoritative_age_is_reported_in_every_result():
+    # The new field must be present on all verdicts so callers can log why.
+    r = decide_liveness(_ago(days=7), _ago(minutes=4), threshold_hours=6, now=NOW,
+                        authoritative_last_active_iso=_ago(days=7))
+    assert "authoritative_last_active_age_min" in r
+    assert r["authoritative_last_active_age_min"] > 6 * 60
+    r2 = decide_liveness(_ago(minutes=5), None, threshold_hours=6, now=NOW)
+    assert r2["authoritative_last_active_age_min"] is None

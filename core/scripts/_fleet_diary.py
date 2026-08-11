@@ -87,6 +87,70 @@ def fleet_agent_names(base: Optional[Path] = None) -> list[str]:
     return sorted(names)
 
 
+def _get_backend():
+    """The storage backend, or None when it cannot be constructed."""
+    try:
+        from storage_backend import get_backend
+
+        return get_backend()
+    except Exception:  # noqa: BLE001 — degrade to local reads, never abort
+        return None
+
+
+def read_agent_diary(
+    agent: str,
+    base: Optional[Path] = None,
+    backend: object = "unset",
+) -> tuple[Optional[str], str]:
+    """Read ONE agent's diary, returning `(text, provenance)`.
+
+    PROVENANCE IS THE POINT, and it is why this returns a tuple rather than the
+    bare text `read_fleet_diaries` needed. A caller that merely ANALYSES diary
+    content is fine either way — stale bytes make a slightly wrong report. A
+    caller about to take a DESTRUCTIVE action on the strength of an ABSENCE is
+    not: "the store of record says no work is happening" and "I could not reach
+    the store of record, and the local cache is cold" are the same empty string,
+    and they license opposite decisions (guard-980, rb-6650 — an unreadable
+    store cannot authorise a destructive act). Without provenance the caller
+    cannot tell them apart, so it silently treats the second as the first. The
+    liveness helper carries the identical field for the identical reason
+    (`authoritative_last_active_provenance`, guard-1753).
+
+    Provenance values:
+        authoritative  read through the backend from the store of record
+        absent         the store of record positively reports no such object
+        local-mirror   backend absent/erroring; bytes came from the local cache
+        error          neither path produced bytes
+
+    Fail-open: never raises. `absent` deliberately does NOT fall back to the
+    local mirror — the store of record answering "no" is an answer, and reading
+    around it would re-introduce the cache as an authority.
+    """
+    root = Path(base) if base is not None else agents_root()
+    path = (root / agent / DIARY_RELPATH).resolve()
+    if backend == "unset":
+        backend = _get_backend()
+    if backend is not None:
+        # ABSOLUTE (resolved) path — see the module docstring: a relative
+        # path silently degrades this to a local-mirror read.
+        assert path.is_absolute(), f"non-absolute diary path: {path}"
+        try:
+            return (
+                backend.read_authoritative_bytes(path).decode(
+                    "utf-8", errors="replace"
+                ),
+                "authoritative",
+            )
+        except FileNotFoundError:
+            return None, "absent"
+        except Exception:  # noqa: BLE001 — S3/permission hiccup: fall back
+            pass
+    try:
+        return path.read_text(encoding="utf-8", errors="replace"), "local-mirror"
+    except OSError:
+        return None, "error"
+
+
 def read_fleet_diaries(
     base: Optional[Path] = None,
 ) -> Iterator[tuple[str, str]]:
@@ -104,34 +168,13 @@ def read_fleet_diaries(
     of the absolute tmp path, so tests stay hermetic without a second branch. A
     `local_only` flag would only add a way for the production path to be
     silently disabled.
+
+    Provenance is discarded here on purpose: this iterator's callers analyse
+    content and have no destructive branch. `read_agent_diary` is the entry
+    point for anyone who does.
     """
-    root = Path(base) if base is not None else agents_root()
-    try:
-        from storage_backend import get_backend
-
-        backend = get_backend()
-    except Exception:  # noqa: BLE001 — degrade to local reads, never abort
-        backend = None
-
+    backend = _get_backend()
     for name in fleet_agent_names(base):
-        path = (root / name / DIARY_RELPATH).resolve()
-        text = None
-        if backend is not None:
-            # ABSOLUTE (resolved) path — see the module docstring: a relative
-            # path silently degrades this to a local-mirror read.
-            assert path.is_absolute(), f"non-absolute diary path: {path}"
-            try:
-                text = backend.read_authoritative_bytes(path).decode(
-                    "utf-8", errors="replace"
-                )
-            except FileNotFoundError:
-                continue
-            except Exception:  # noqa: BLE001 — S3/permission hiccup: fall back
-                text = None
-        if text is None:
-            try:
-                text = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
+        text, _provenance = read_agent_diary(name, base, backend=backend)
         if text:
             yield name, text

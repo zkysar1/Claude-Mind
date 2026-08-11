@@ -137,12 +137,17 @@ def _age_hours(goal: dict) -> float:
 def _apply_completion(goal: dict, current_run_dir: str) -> tuple:
     """Mark the goal completed via aspirations.py update-goal."""
     reason = f"superseded-by-newer-run ({current_run_dir})"
+    # --source is a TOP-LEVEL argparse argument on aspirations.py (registered on
+    # `parser`, not on the `update-goal` subparser), so it MUST precede the
+    # subcommand. The reversed order exits rc=2 "unrecognized arguments" before
+    # any goal lookup happens, which made this whole function a permanent no-op
+    # (). All five sibling direct callers already use this order.
     rc, out, err = _py(
         [
             str(SCRIPT_DIR / "aspirations.py"),
-            "update-goal",
             "--source",
             goal["_source"],
+            "update-goal",
             goal["id"],
             "status",
             "completed",
@@ -154,9 +159,9 @@ def _apply_completion(goal: dict, current_run_dir: str) -> tuple:
     _py(
         [
             str(SCRIPT_DIR / "aspirations.py"),
-            "update-goal",
             "--source",
             goal["_source"],
+            "update-goal",
             goal["id"],
             "outcome_note",
             reason,

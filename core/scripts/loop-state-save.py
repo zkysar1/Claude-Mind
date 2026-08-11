@@ -25,6 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _stdio import reconfigure_stdio  # noqa: E402
 from _paths import agent_dir as _paths_agent_dir  # noqa: E402
+from _paths import body_state_path as _body_state_path  # noqa: E402
 reconfigure_stdio()
 
 # Schema — the typed-keys list. Adding a key here is the ONLY way to make it
@@ -105,7 +106,18 @@ def _agent_dir() -> Path:
 
 
 def _checkpoint_path() -> Path:
-    return _agent_dir() / "session" / "iteration-checkpoint.json"
+    """Body-keyed in-flight breadcrumb, agent-wide when unbodied ().
+
+    aspirations-claim.sh pipes an anchor into `init` on EVERY successful
+    world-goal claim, and CLAIM is a WORKER_PHASE — so without body-keying a
+    compliant worker body rewrites the reducer's breadcrumb on every claim,
+    and postcompact-restore then points the reducer at the worker's goal.
+
+    `.name` of agents/<name> IS the agent name (see _paths.agent_dir); taking
+    it from _agent_dir keeps that function the single env-read + fail-loud
+    point rather than adding a second parallel accessor.
+    """
+    return _body_state_path(_agent_dir().name, "iteration-checkpoint.json")
 
 
 def _validate_keys(payload: dict, mode: str) -> list[str]:
@@ -239,8 +251,12 @@ def _warn_checkpoint_missing(path, args) -> None:
             "Cause is almost always a skipped Phase 2.95 (aspirations-select creates "
             "the checkpoint; only iteration-close deletes it), which leaves it absent "
             "for the REST of the session and silently degrades every downstream "
-            "reader. Re-anchor with: loop-state-save.sh init (g-115-3454)."
-            % (path, ", ".join(keys) or "<none>"),
+            "reader. Re-anchor by piping a JSON object carrying ALL required keys "
+            "(%s) into `loop-state-save.sh init` -- a bare `init` with no stdin "
+            "exits 1, and a partial object warns once per missing key and writes "
+            "nothing, so the naive reading of this line fails twice before it "
+            "works (g-115-3454)."
+            % (path, ", ".join(keys) or "<none>", ", ".join(REQUIRED_INIT_KEYS)),
             file=sys.stderr,
         )
     except Exception:

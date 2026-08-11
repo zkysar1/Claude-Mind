@@ -46,7 +46,172 @@ from _paths import PROJECT_ROOT, WORLD_DIR, resolve_file_path, agent_dir as _age
 CLOCK_SKEW_GRACE_SECONDS = 60
 DEFAULT_COMMAND_TIMEOUT = 30
 MAX_COMMAND_TIMEOUT = 120
-ALLOWED_COMMAND_PREFIXES = ("bash core/scripts/", "bash world/scripts/")
+ALLOWED_COMMAND_PREFIXES = (
+    "bash core/scripts/",
+    "bash world/scripts/",
+    # --- : the two invocations the framework MANDATES elsewhere ---
+    # Both were previously unexpressible, so the fleet routed around the
+    # evaluator by inventing type names that fail silently. Measured on the
+    # live corpus: 29 checks failed the allowlist, and these two shapes are
+    # why. Each entry below is required by a rule, not a convenience:
+    #
+    #  * pytest — guard-955 MANDATES a `STORAGE_BACKEND=local` prefix on any
+    #    test runner (it prevents the S3-key collision that truncated
+    #    world/aspirations.jsonl on 2026-07-09). A command cannot both start
+    #    with an env assignment and start with "bash core/scripts/", so the
+    #    canonical run-the-tests check — which 76% of invented type names are
+    #    trying to express — could not be written at all. The env prefix is
+    #    stripped by _strip_env_prefix before matching, so the assignment is
+    #    tolerated rather than the allowlist being loosened to "anything".
+    #
+    #  * source _paths.sh && bash "$WORLD_PATH/... — .claude/rules/path-resolution.md
+    #    REQUIRES this shape for world scripts, because the PreToolUse[Bash]
+    #    hooks do NOT rewrite the `world/` virtual prefix; a bare
+    #    `bash world/scripts/x.sh` dies rc=127. So the pre-existing
+    #    "bash world/scripts/" entry is itself unreachable by the only
+    #    invocation the rules permit — a SECOND dead allowlist entry,
+    #    sibling to the guard-955 one and not previously recorded.
+    "python3 -m pytest",
+    "python -m pytest",
+    "py -3 -m pytest",
+    "source core/scripts/_paths.sh && bash ",
+)
+
+# --- Vocabulary normalization () ----------------------------------
+# READ-TIME aliasing only. Stored goal records are NEVER rewritten: a migration
+# that rewrote 60 records to match a new vocabulary would be a destructive
+# whole-value write over `verification` (guard-2444).
+#
+# WHY THE READER IS THE SIDE THAT CHANGES (guard-1565 participant census):
+# guard-1565 says change the MINORITY spelling. Measured over the live corpus,
+# the invented names are the MAJORITY — command_check alone is 44 against 2 for
+# the canonical command_succeeds — so the evaluator is the deviant party here,
+# not the authors. This is not a tolerance shim for sloppy writing; it is the
+# reader adopting the spelling its own corpus actually uses.
+
+TYPE_ALIASES: Dict[str, str] = {
+    "command_check": "command_succeeds",
+    "command":       "command_succeeds",
+    "test":          "command_succeeds",
+    "test_check":    "command_succeeds",
+    "test_run":      "command_succeeds",
+    "grep":          "command_succeeds",
+    "grep_check":    "command_succeeds",
+    "artifact_check": "file_check",
+}
+
+# TYPE-SCOPED, never global. `target` means PATH inside file_check and COMMAND
+# inside the command-ish types — a single global target->path table would
+# silently mis-map every command-ish check that holds its command in `target`.
+# This is the single easiest way to get this fix wrong, and
+# test_check_vocabulary.py carries a case that FAILS under a global mapping.
+FIELD_ALIASES: Dict[str, Dict[str, str]] = {
+    "file_check":        {"target": "path", "file": "path", "pattern": "path"},
+    "file_exists_after": {"target": "path", "file": "path"},
+    "command_succeeds":  {"target": "command", "cmd": "command", "script": "command"},
+    "metric_threshold":  {"target": "command", "cmd": "command"},
+}
+
+# Types whose author is HONESTLY declaring "this cannot be machine-checked".
+# Before this existed the only way to express that was to fake a checkable type,
+# which then failed closed and made the goal permanently uncloseable. Giving the
+# intent a real name is the fix; see _eval_not_machine_checkable.
+NOT_MACHINE_CHECKABLE_ALIASES: Dict[str, str] = {
+    "manual":          "not_machine_checkable",
+    "manual_check":    "not_machine_checkable",
+    "manual_review":   "not_machine_checkable",
+    "narrative":       "not_machine_checkable",
+    "llm_verify":      "not_machine_checkable",
+}
+
+import re as _re
+# ONE leading `KEY=VALUE ` assignment, e.g. `STORAGE_BACKEND=local python3 -m pytest`.
+_ENV_ASSIGNMENT_ONE = _re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)=(\S*)\s+')
+
+# Env names safe to strip before allowlist matching. ALLOWLIST, not a denylist:
+# the legitimate need is narrow (guard-955's STORAGE_BACKEND, the RUNTIME_DIR
+# test-isolation seam, unbuffering), while the set of variables that redirect
+# execution is open-ended and platform-specific (PATH, LD_PRELOAD, LD_AUDIT,
+# DYLD_INSERT_LIBRARIES, BASH_ENV, ENV, SHELLOPTS, IFS, PYTHONPATH, PYTHONHOME,
+# PYTHONSTARTUP, NODE_OPTIONS, PERL5LIB, GIT_SSH_COMMAND, ...). A denylist of
+# that set is a list you are always one entry behind on. Adding a name here is a
+# one-line agent-capable framework edit; guessing wrong in the other direction
+# silently voids the allowlist.
+_SAFE_ENV_NAMES = frozenset({
+    "STORAGE_BACKEND", "RUNTIME_DIR", "PYTHONUNBUFFERED", "RUN_DEFERRED",
+    "EXTERNAL_WAIT", "TZ", "WAKE_DEBOUNCE_SECONDS",
+})
+_SAFE_ENV_PREFIXES = ("MIND_",)
+
+
+def _is_safe_env_name(name: str) -> bool:
+    return name in _SAFE_ENV_NAMES or name.startswith(_SAFE_ENV_PREFIXES)
+
+
+def _strip_env_prefix(command: str) -> str:
+    """Drop leading env-var assignments before allowlist matching — but ONLY
+    assignments to names on the safe list.
+
+    guard-955 mandates prefixing test runners with STORAGE_BACKEND=local, which
+    is exactly what made the mandated invocation unmatchable by a startswith
+    allowlist. Stripping that assignment restores the allowlist's job.
+
+    THE NAME CHECK IS THE SECURITY BOUNDARY, and stripping unconditionally
+    silently voids the allowlist (measured g-115-5186, caught by the goal's own
+    fresh-eyes pass on the committed code). The allowlist constrains WHICH
+    PROGRAM runs; an execution-controlling variable changes what that program
+    then executes, so `PATH=/tmp/evil bash core/scripts/run-full-suite.sh`
+    passes a program-name check while running attacker-chosen code. Asserting
+    that `FOO=bar rm -rf /` is still refused does NOT cover this: that tests
+    naming a DIFFERENT program, not REDIRECTING the named one.
+
+    An unsafe name is deliberately NOT stripped rather than separately refused —
+    the assignment stays at the front, so the remainder fails the startswith on
+    its own and there is only one refusal path to reason about."""
+    out = command or ""
+    while True:
+        m = _ENV_ASSIGNMENT_ONE.match(out)
+        if not m or not _is_safe_env_name(m.group(1)):
+            return out
+        out = out[m.end():]
+
+
+def _command_allowed(command: str) -> bool:
+    """Single source of truth for the allowlist decision (was duplicated at two
+    call sites, which is how they could drift)."""
+    return any(_strip_env_prefix(command).startswith(p)
+               for p in ALLOWED_COMMAND_PREFIXES)
+
+
+def normalize_check(check: dict) -> dict:
+    """Return a COPY of `check` with aliased type + type-scoped field names.
+
+    Pure and non-mutating: the caller's dict — and therefore the stored goal
+    record it came from — is never touched. Aliases only ever ADD a canonical
+    key; an existing canonical key always wins, so a check that already speaks
+    the canonical vocabulary passes through byte-identical.
+
+    Order is load-bearing: the TYPE is resolved FIRST, because the field table
+    is keyed by the canonical type. Resolving fields first would look up
+    `command_check` in FIELD_ALIASES, miss, and recover nothing."""
+    if not isinstance(check, dict):
+        return check
+    out = dict(check)
+    raw_type = out.get("type", "")
+    canon = NOT_MACHINE_CHECKABLE_ALIASES.get(raw_type) or TYPE_ALIASES.get(raw_type)
+    if canon:
+        out["type"] = canon
+        out.setdefault("_aliased_from", raw_type)
+    for src, dst in FIELD_ALIASES.get(out.get("type", ""), {}).items():
+        if dst not in out and src in out:
+            out[dst] = out[src]
+            out.setdefault("_field_aliased", {})[src] = dst
+    return out
+
+
+# _eval_not_machine_checkable is defined further down, beside the other
+# evaluators — it returns a PredicateResult, which is not declared until after
+# this block.
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +362,7 @@ def _eval_command_succeeds(p: dict) -> PredicateResult:
     if not command:
         return PredicateResult(False, "command_succeeds", pid, reason="missing command")
 
-    if not any(command.startswith(prefix) for prefix in ALLOWED_COMMAND_PREFIXES):
+    if not _command_allowed(command):
         return PredicateResult(False, "command_succeeds", pid,
                                reason=f"command not in allowlist (must start with one of: {ALLOWED_COMMAND_PREFIXES})")
 
@@ -338,7 +503,7 @@ def _eval_metric_threshold(p: dict) -> PredicateResult:
                                reason="must specify at least one of min, max")
     if not command:
         return PredicateResult(False, "metric_threshold", pid, reason="missing command")
-    if not any(command.startswith(prefix) for prefix in ALLOWED_COMMAND_PREFIXES):
+    if not _command_allowed(command):
         return PredicateResult(False, "metric_threshold", pid,
                                reason=f"command not in allowlist (must start with one of: {ALLOWED_COMMAND_PREFIXES})")
     if extract not in ("stdout_int", "json_length", "exit_code"):
@@ -650,6 +815,29 @@ def _eval_pr_merged(p: dict) -> PredicateResult:
     return _verdict(state, "probe")
 
 
+def _eval_not_machine_checkable(p: dict) -> PredicateResult:
+    """An author's explicit 'this needs a human/LLM to judge' ().
+
+    Returns passed=True so a single honest declaration cannot make a goal
+    permanently uncloseable — that failure mode (unknown type -> passed=False,
+    all_passed=all(...)) is precisely what drove authors to fake a checkable
+    type in the first place. The truth is carried in observed_value, not hidden:
+    `machine_checkable: False` says plainly that NOTHING was verified here and
+    the LLM verify phase still owes the real work. Consumers MUST surface it
+    rather than count it as evidence — a caller reading only `passed` is no
+    worse off than today, and one reading observed_value learns it must
+    escalate."""
+    return PredicateResult(
+        passed=True,
+        type="not_machine_checkable",
+        predicate_id=p.get("id"),
+        observed_value={"machine_checkable": False,
+                        "requires_llm_verification": True,
+                        "declared_as": p.get("_aliased_from", p.get("type"))},
+        reason="declared not machine-checkable — LLM verify phase owes this one",
+    )
+
+
 PREDICATE_TYPES: Dict[str, Callable[[dict], PredicateResult]] = {
     "file_exists_after":    _eval_file_exists_after,
     "command_succeeds":     _eval_command_succeeds,
@@ -659,6 +847,7 @@ PREDICATE_TYPES: Dict[str, Callable[[dict], PredicateResult]] = {
     "after_time":           _eval_after_time,
     "vcs_commits_since":    _eval_vcs_commits_since,
     "pr_merged":            _eval_pr_merged,
+    "not_machine_checkable": _eval_not_machine_checkable,
 }
 
 
@@ -671,6 +860,11 @@ def evaluate(predicate: dict) -> PredicateResult:
     if not isinstance(predicate, dict):
         return PredicateResult(False, "invalid", None,
                                reason=f"not a dict: {type(predicate).__name__}")
+    # Vocabulary normalization happens HERE, at the single dispatch chokepoint,
+    # so every caller (selector filter, pre-claim recheck, verify-check-eval)
+    # gets it without needing to know it exists. Non-mutating — the stored
+    # record is never rewritten ().
+    predicate = normalize_check(predicate)
     ptype = predicate.get("type", "")
     handler = PREDICATE_TYPES.get(ptype)
     if handler is None:

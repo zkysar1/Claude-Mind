@@ -36,8 +36,40 @@ AGENT=$(python3 "$CORE_ROOT/scripts/_resolve_agent_from_sid.py" "$SID" 2>/dev/nu
 # nothing to resume.
 RUNNING_SID=$(cat "$(agent_dir "$AGENT")/session/running-session-id" 2>/dev/null | tr -d '\r\n')
 if [ -z "$RUNNING_SID" ] || [ "$SID" != "$RUNNING_SID" ]; then
-    exit 0
+    # ...EXCEPT a worker Body, which is not an observer ().
+    # precompact-checkpoint.sh has NO runner guard, so it fires for a worker
+    # body and writes a BODY-KEYED checkpoint. This guard then refused the very
+    # session that checkpoint belongs to: written, never consumed. Fired live
+    # 2026-08-04 — worker body 301a45f2 autocompacted at 18:38 during the
+    #  soak, restore refused, and the resumed session took a close path,
+    # silently ending the soak's worker leg.
+    #
+    # Discriminator is the SAME rail body_state_path() keys on (_paths.py:99-111,
+    # and bash-agent-inject.py's BODY_ROLE=worker derivation): a session is a
+    # non-reducer Body iff it forked a per-session working-memory.yaml. Only a
+    # worker forks one, so this admits bodies WITHOUT admitting the observers
+    # the guard exists to exclude — a reader/assistant session never forks a
+    # body WM and still exits here, preserving the 2026-05-10 bravo fix.
+    # Deliberately NOT gated on RUNNING_SID: a body whose reducer has since
+    # stopped still owns a real checkpoint, and the .py reads only that body's
+    # own file. If the invariant above ever changes, this rail must change with
+    # it — that coupling is why _paths.py names its dependents explicitly.
+    # agent_session_dir (_paths.sh:139), NOT a literal "sessions" segment:
+    # SESSIONS_DIRNAME is one of the three sync constants in CLAUDE.md's
+    # Agent-dir Resolution table, and a hardcoded segment is invisible to the
+    # constant-name audit grep — the separate literal-string-hardcoder class
+    # that same table has to enumerate by hand.
+    if [ ! -f "$(agent_session_dir "$AGENT" "$SID")/working-memory.yaml" ]; then
+        exit 0
+    fi
 fi
 
 export MIND_AGENT="$AGENT"
+# Symmetry with precompact-checkpoint.sh (). LIVE since  — the
+# guard above now admits worker bodies, so this export is what lets
+# body_state_path() in the .py resolve the body-keyed checkpoint instead of the
+# agent-wide fallback. It is load-bearing, not decorative: drop it and a body
+# restores the reducer's checkpoint. (This comment read "Inert today" while the
+# guard still refused every body.)
+export MIND_SID="$SID"
 exec python3 "$CORE_ROOT/scripts/postcompact-restore.py"

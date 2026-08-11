@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""Reducer self-fencing: step down when the lease says someone else holds it.
+
+The DDB runner claim is a LEASE. `OWNERSHIP_STALE_SECONDS` (T_takeover, 3900s)
+lets a peer break a claim whose heartbeat has aged out — that half is correct
+and is what a lease is for. The missing half is that the HOLDER never checked
+whether it still holds. T_stepdown was effectively INFINITY while T_takeover was
+finite, which is the inversion of the safe ordering: any renewal gap longer than
+T_takeover produces a ZOMBIE LEADER instead of a clean handover.
+
+Measured 2026-08-05 (g-306-225, alpha, cc-04/DESKTOP/cc-07): cc-04 lost its claim
+at 14:38 and kept executing goals as reducer for 2.5+ hours, unaware, while two
+other bodies acquired the claim. No split-brain occurred only because one session
+died on its own and one operator paused theirs — luck and judgment, not mechanism.
+
+This module is the decision half. `decide()` is pure so every branch is testable;
+`check()` performs the poll and returns the same dict.
+
+THE SIGNAL ASYMMETRY IS THE WHOLE DESIGN — do NOT collapse the two cases:
+
+  * "my renewal FAILED"                  AMBIGUOUS. A broken writer and a dead
+                                         agent are indistinguishable from here.
+  * "the claim is held by a DIFFERENT    UNAMBIGUOUS. Positive evidence that this
+    machine"                             runner has been superseded.
+
+Self-fencing on the second is safe and correct. Self-fencing on the first ALONE
+would convert every transient DDB hiccup into a stopped loop, which is worse than
+the disease (guard-1562). So a bare failure never stands this reducer down; only a
+failure that has been CONTINUOUS for `t_stepdown` does, and `t_stepdown` is held
+strictly below T_takeover so the yield always precedes the seize.
+
+FAIL-SAFE DIRECTION — the MIRROR of worker_reducer_liveness.py, and the reason
+this is a separate module rather than a flag on that one. A worker resolves every
+ambiguity toward WIND-DOWN (it must never promote itself). A reducer resolves
+every ambiguity toward HOLD (it must never stop a healthy loop on a plumbing
+fault). Same poll, same rc contract, opposite defaults; fusing them would put the
+two fail-safe directions behind one branch and guarantee that a future edit to one
+silently inverts the other.
+
+rc contract of `runner-claim.sh status` (measured; see worker_reducer_liveness.py
+for the same table, established 2026-08-03):
+
+    rc 0  LIVE       claim row is RUNNING with a fresh heartbeat
+    rc 4  NOT LIVE   ABSENT | NOT-RUNNING | STALE | REFUSE (unverifiable)
+    rc 2  FAILED     daemon returned an error
+    rc 1  daemon error (bash layer maps the daemon's rc=2 to 1)
+    rc 3  no daemon
+
+Note rc=0 is NOT "I hold the claim" — it is "SOMEONE holds a live claim for this
+agent". The status summary names the machine but the verdict never compares it to
+self, which is exactly why a superseded reducer reads all-clear today. Extracting
+that machine and comparing it here is the fix.
+
+rc=4 conflates "definitely not live" with "cannot establish", and for THIS
+consumer that conflation is harmless in the safe direction: both readings mean no
+peer has been observed holding the claim, so the reducer holds. (The same rc=4 is
+decisive for a worker. Copying either treatment across is the bug.)
+
+MEASURED LIMIT, stated rather than papered over (guard-1760): the claims payload
+carries {agent, machine_id, agent_state, heartbeat_at} and NO runner_token, so a
+SAME-BOX reducer restart — new token, same machine_id — is invisible to the
+different-holder read and reports HOLD. Closing that needs the endpoint to expose
+the token.
+"""
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+VERDICT_HOLD = "hold"
+VERDICT_STAND_DOWN = "stand-down"
+
+# Renewal-failure rcs. These are plumbing faults, not evidence about ownership,
+# so they only ever matter via the SUSTAINED-duration branch below.
+FAILURE_RCS = (1, 2, 3)
+
+# Fallback only. The caller passes the configured value; this exists so a
+# decide() call in a test or an inspection seam has a sane number.
+DEFAULT_STEPDOWN_SECONDS = 1950
+
+
+def decide(rc, observed_machine, self_machine, failure_elapsed_s,
+           t_stepdown=DEFAULT_STEPDOWN_SECONDS):
+    """Pure decision — no I/O. Returns {verdict, reason, trigger}.
+
+    `failure_elapsed_s` is seconds of CONTINUOUS renewal failure (0 when the
+    last renewal succeeded). heartbeat-tick.sh already maintains exactly this
+    via the claim-heartbeat-failure marker's first_failed_at, and clears the
+    marker on any success — so "continuous" is a property of the input, and a
+    blip followed by a success can never accumulate (rb-4842).
+
+    `trigger` is the machine-readable branch name, so a caller can act on WHICH
+    condition fired without re-parsing the prose reason.
+    """
+    if rc == 0:
+        if observed_machine and self_machine and observed_machine != self_machine:
+            return {
+                "verdict": VERDICT_STAND_DOWN,
+                "trigger": "different-holder",
+                "reason": (f"superseded: the live claim for this agent is held by "
+                           f"{observed_machine!r}, but this reducer is running on "
+                           f"{self_machine!r} — positive evidence of takeover"),
+            }
+        if observed_machine and self_machine:
+            return {
+                "verdict": VERDICT_HOLD,
+                "trigger": "holding",
+                "reason": f"this box ({self_machine!r}) still holds the live claim",
+            }
+        # One or both machine ids unknown. The comparison is NON-DISCRIMINATING,
+        # not negative — treating an unreadable id as a takeover would stand a
+        # healthy reducer down on a parse miss.
+        return {
+            "verdict": VERDICT_HOLD,
+            "trigger": "holder-unreadable",
+            "reason": (f"claim is LIVE but the holder comparison is unreadable "
+                       f"(observed={observed_machine!r}, self={self_machine!r}) — "
+                       f"non-discriminating, so hold"),
+        }
+
+    if rc in FAILURE_RCS or rc == 4:
+        # Everything below rc=0 is AMBIGUOUS about ownership. Duration is the
+        # only thing that makes it decisive.
+        if failure_elapsed_s >= t_stepdown:
+            return {
+                "verdict": VERDICT_STAND_DOWN,
+                "trigger": "sustained-renewal-gap",
+                "reason": (f"renewal has failed continuously for {failure_elapsed_s}s, "
+                           f"at or past T_stepdown={t_stepdown}s (rc={rc}). Stepping "
+                           f"down BEFORE a peer may legally take the claim keeps the "
+                           f"yield and the seize from overlapping"),
+            }
+        return {
+            "verdict": VERDICT_HOLD,
+            "trigger": "ambiguous-not-yet-decisive",
+            "reason": (f"rc={rc} says nothing about who holds the claim "
+                       f"({failure_elapsed_s}s of failure, T_stepdown={t_stepdown}s) — "
+                       f"a transient fault must not stop a healthy loop"),
+        }
+
+    # An rc this module has not seen. A reducer must not stop on a signal it
+    # cannot interpret — that is the fail-open direction for THIS consumer.
+    return {
+        "verdict": VERDICT_HOLD,
+        "trigger": "unrecognised-rc",
+        "reason": (f"unrecognised poll rc={rc} — holding, because an "
+                   f"uninterpretable signal is not evidence of supersession"),
+    }
+
+
+def parse_machine(stdout):
+    """Pull the holder machine id out of runner-claim.sh's LIVE summary line.
+
+    Format: ... — 'zeta' is RUNNING on 'cc-02', heartbeat 272s old ...
+    Returns None when absent; decide() treats an unknown machine as
+    non-discriminating rather than as a takeover.
+    """
+    marker = "is RUNNING on "
+    i = stdout.find(marker)
+    if i < 0:
+        return None
+    rest = stdout[i + len(marker):]
+    if not rest.startswith("'"):
+        return None
+    j = rest.find("'", 1)
+    return rest[1:j] if j > 0 else None
+
+
+def read_failure_elapsed(marker_path, now_s):
+    """Seconds of continuous renewal failure, from heartbeat-tick.sh's marker.
+
+    Absent marker means the last renewal SUCCEEDED (heartbeat-tick removes it on
+    any success), so 0. A corrupt marker also yields 0 — an unreadable duration
+    must not be treated as a long one.
+    """
+    try:
+        text = Path(marker_path).read_text(encoding="utf-8")
+    except Exception:
+        return 0
+    for line in text.splitlines():
+        if line.startswith("first_failed_at="):
+            raw = line.split("=", 1)[1].strip()
+            if raw.isdigit():
+                return max(0, int(now_s) - int(raw))
+            return 0
+    return 0
+
+
+def _machine_id_from_env_file(env_path):
+    """MACHINE_ID from .env.local, for boxes that do not export it.
+
+    Deliberately a grep-shaped single-key read, mirroring how heartbeat-tick.sh
+    resolves STORAGE_BACKEND: NO secret sourcing, no dotenv parse of the whole
+    file. Last assignment wins (same as that shell one-liner's `tail -1`), and an
+    inline `# comment` is stripped. Returns None on anything unreadable — an
+    unknown self id must leave the comparison non-discriminating, never guess.
+    """
+    try:
+        text = Path(env_path).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    found = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("MACHINE_ID"):
+            continue
+        key, sep, val = stripped.partition("=")
+        if not sep or key.strip() != "MACHINE_ID":
+            continue
+        val = val.split("#", 1)[0].strip().strip('"').strip("'")
+        if val:
+            found = val
+    return found
+
+
+def load_stepdown_seconds(config_path):
+    """runner_heartbeat.stepdown_seconds from aspirations.yaml.
+
+    No hardcoded default on the read path — a missing/invalid block returns None
+    so the caller can fail visibly rather than silently fencing on a magic
+    number (the rb-313 rule the surrounding config block already follows).
+    """
+    try:
+        import yaml
+        with open(config_path, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+    except Exception:
+        return None
+    val = (data.get("runner_heartbeat") or {}).get("stepdown_seconds")
+    return val if isinstance(val, int) and val > 0 else None
+
+
+def check(agent, scripts_dir, self_machine, marker_path, now_s, t_stepdown):
+    """Run the real poll and return decide()'s dict plus the raw evidence."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _runtime_bash import bash_cmd  # guard-580/581: never a bare "bash" argv[0]
+
+    proc = subprocess.run(
+        bash_cmd(str(Path(scripts_dir) / "runner-claim.sh"), "status", "--agent", agent),
+        capture_output=True, text=True,
+    )
+    combined = (proc.stdout or "") + (proc.stderr or "")
+    observed = parse_machine(combined)
+    elapsed = read_failure_elapsed(marker_path, now_s)
+
+    result = decide(proc.returncode, observed, self_machine, elapsed, t_stepdown)
+    result["rc"] = proc.returncode
+    result["observed_machine"] = observed
+    result["self_machine"] = self_machine
+    result["failure_elapsed_s"] = elapsed
+    result["t_stepdown"] = t_stepdown
+    result["poll_output"] = combined.strip()[:400]
+    return result
+
+
+def main(argv):
+    if len(argv) > 1 and argv[1] == "decide-only":
+        # Test/inspection seam: decide() over argv, no daemon, no marker file.
+        # rc observed self elapsed [t_stepdown]
+        rc = int(argv[2])
+        observed = argv[3] or None
+        self_machine = argv[4] or None
+        elapsed = int(argv[5])
+        t_stepdown = int(argv[6]) if len(argv) > 6 else DEFAULT_STEPDOWN_SECONDS
+        out = decide(rc, observed, self_machine, elapsed, t_stepdown)
+        print(json.dumps(out))
+        return 0 if out["verdict"] == VERDICT_HOLD else 1
+
+    scripts_dir = Path(__file__).resolve().parent
+    agent = os.environ.get("MIND_AGENT", "").strip()
+    if not agent:
+        print(json.dumps({
+            "verdict": VERDICT_HOLD,
+            "trigger": "no-agent",
+            "reason": "no MIND_AGENT — not a bound runner context",
+        }))
+        return 0
+
+    # MACHINE_ID is the same SSOT owncloud_backend.from_env reads. Measured
+    # present in the agent shell on cc-02 (2026-08-05) — but heartbeat-tick.sh,
+    # this module's ONLY caller, grep-resolves STORAGE_BACKEND from .env.local
+    # precisely because that variable is NOT exported into the agent shell, and
+    # nothing guarantees MACHINE_ID is exported on every box either. Falling back
+    # to the file closes a coverage gap that would otherwise be SILENT: with no
+    # self id the holder comparison is non-discriminating, so decide() HOLDS and
+    # the fence is inert on that box — the safe direction, but inert is not
+    # covered (guard-1760), and a fence that does nothing on some boxes does not
+    # fix a fleet-wide split-brain.
+    self_machine = os.environ.get("MACHINE_ID", "").strip() or None
+    if not self_machine:
+        self_machine = _machine_id_from_env_file(
+            Path(__file__).resolve().parents[2] / ".env.local")
+
+    t_stepdown = load_stepdown_seconds(scripts_dir.parent / "config" / "aspirations.yaml")
+    if t_stepdown is None:
+        print(json.dumps({
+            "verdict": VERDICT_HOLD,
+            "trigger": "config-unreadable",
+            "reason": ("runner_heartbeat.stepdown_seconds missing or invalid in "
+                       "aspirations.yaml — holding rather than fencing on a "
+                       "magic number"),
+        }))
+        return 0
+
+    sys.path.insert(0, str(scripts_dir))
+    import _paths
+    agent_dir = Path(_paths.agent_dir(agent))
+
+    # ── THE FENCE GOVERNS THE REDUCER ONLY. ─────────────────────────────────
+    # Without this guard the different-holder branch MISFIRES ON EVERY
+    # CROSS-BOX WORKER, which is the exact population the lease is supposed to
+    # let coexist: a worker on box B runs precisely BECAUSE the reducer holds
+    # the claim on box A, so `status` reports LIVE on A, MACHINE_ID is B, and
+    # decide() would stand the worker down on its first heartbeat tick. The
+    # unit suite cannot catch that — decide() is correct in isolation; the
+    # defect would be applying it to a Body it does not govern.
+    #
+    # Predicate: a Body with NO forked per-session working-memory.yaml is the
+    # REDUCER. Same predicate bash-agent-inject uses and the same one
+    # worker_reducer_liveness.main derives (guard-2445, derived locally rather
+    # than imported so neither module can quietly change the other's meaning).
+    # The two fences are complements: this one stands a superseded REDUCER
+    # down, that one winds a stranded WORKER down. They must never both fire.
+    sid = os.environ.get("MIND_SID", "").strip()
+    if not sid:
+        # Cannot establish which Body this is. The safe direction for a REDUCER
+        # fence is to hold: standing down a Body whose role is unknown risks
+        # killing a healthy worker, while holding only delays a stand-down that
+        # the next tick (with a SID present) will make. Coverage caveat, stated
+        # rather than implied (guard-1760): the fence is INERT on any invocation
+        # without MIND_SID. bash-agent-inject exports it on every Bash call, so
+        # in the loop it is present.
+        print(json.dumps({
+            "verdict": VERDICT_HOLD,
+            "trigger": "body-role-unreadable",
+            "reason": ("no MIND_SID — cannot tell reducer from worker, and a "
+                       "fence that governs only the reducer must not act on an "
+                       "unknown role"),
+        }))
+        return 0
+    if (agent_dir / "sessions" / sid / "working-memory.yaml").exists():
+        print(json.dumps({
+            "verdict": VERDICT_HOLD,
+            "trigger": "not-the-reducer",
+            "reason": ("this Body has a forked per-session working memory, so it "
+                       "is a WORKER — a live claim held by another machine is the "
+                       "NORMAL condition for a worker, not supersession. Winding "
+                       "down is worker_reducer_liveness.py's job, not this one's"),
+        }))
+        return 0
+
+    marker = agent_dir / "session" / "claim-heartbeat-failure"
+
+    import time
+    out = check(agent, scripts_dir, self_machine, marker, int(time.time()), t_stepdown)
+    print(json.dumps(out))
+    return 0 if out["verdict"] == VERDICT_HOLD else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

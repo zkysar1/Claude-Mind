@@ -77,20 +77,87 @@ ABSENT, not as read."
 The goal asked which guardrails must always load regardless of budget, and
 correctly anticipated that this should be an explicit tier marker rather than a
 count threshold. Agreed, and the consult above independently forces the same
-answer. The honest complication is that **no usable marker exists today**:
+answer. The honest complication was that **no usable marker existed**:
 
-- `severity`: present on 284/1398 (20%). 1114 carry none. Only **3** are
-  CRITICAL. Case is inconsistent — `HIGH`/`high`, `MEDIUM`/`medium`,
-  `LOW`/`low`, `CRITICAL`/`critical`, plus a stray `info`.
+- `severity`: present on 284/1398 (20%) as measured 2026-07-27. 1114 carried
+  none. Only **3** were CRITICAL. Case was inconsistent — `HIGH`/`high`,
+  `MEDIUM`/`medium`, `LOW`/`low`, `CRITICAL`/`critical`, plus a stray `info`.
 - `applies_to`: present on 3/1398 (0.2%) — effectively an rb-only field.
 
-Selecting on `severity == CRITICAL` today would load 3 guardrails and silently
-treat 1395 as droppable. So Phase 2 names `severity` as *the* marker — fixing
-the mechanism — while stating that it is unusable until populated, and keeps the
-100%-coverage index as the floor in the meantime. The floor is not a stopgap
-that degrades safety: it drops no entry at all. Populating and case-normalizing
-`severity` is separate work, and it is genuinely separate — it is a judgement
-pass over 1398 records, not a side effect of this policy change.
+Selecting on `severity == CRITICAL` then would have loaded 3 guardrails and
+silently treated 1395 as droppable. So Phase 2 names `severity` as *the* marker
+— fixing the mechanism — while keeping the 100%-coverage index as the floor
+until the field is usable. The floor is not a stopgap that degrades safety: it
+drops no entry at all.
+
+### Case is now canonical (g-115-3573, 2026-08-02)
+
+Re-measured at execution on a corpus that had grown 49% in six days — 2123
+records, 2084 active, `severity` populated on 529 and **missing on 1594 (75%)**.
+408 records carried a non-canonical spelling. All 408 were normalized via
+per-record fenced `guardrails-update-field.sh` writes.
+
+Per-record rather than one `locked_modify_jsonl` rewrite, deliberately:
+guard-832 prefers fenced per-record updates over a large bulk write whenever a
+stable daemon window cannot be guaranteed, and five agents were active within
+the preceding fifteen minutes. The `bulk-retire-dead-entries.py` precedent uses
+the bulk primitive, which makes it the tempting pattern and the wrong one here.
+
+Verified per guard-1706 (pre/post line counts equal at 2123, delta 0, so no
+concurrent append was clobbered; zero per-line parse failures) and per guard-832
+(durability confirmed by the owncloud sync-manifest baseline md5 matching the
+live file, not merely by a post-write re-read).
+
+Canonical set is **`CRITICAL` / `HIGH` / `MEDIUM` / `LOW`**, uppercase, matching
+the `Priority Values` vocabulary CLAUDE.md already declares for this identical
+ordinal space. No code reader constrains the choice — `store_registry.py` lists
+`severity` as an allowed field with no server-side logic, and the only consumer
+is Phase 2's prose — so the tie is broken by not inventing a second case
+convention for a value space that already has one. The stray `info` (guard-1021,
+a push-failure diagnostic rather than an ordinal rail) mapped to `LOW`. Post
+state: HIGH 219 / MEDIUM 295 / LOW 12 / CRITICAL 3, zero non-canonical.
+
+### The CRITICAL admission rule
+
+Case normalization makes the field *parseable*; it does not make the tier
+*usable*, because 75% of the corpus is still unmarked. What follows is the
+admission rule the population pass must apply — written here so Phase 2 can
+point at it rather than leaving each rater to invent a bar.
+
+A guardrail is **CRITICAL** when BOTH hold:
+
+1. **The harm outlives the loop.** Violating it produces damage the agent
+   cannot detect and repair on a later iteration — irreversible data loss,
+   corruption of a live/production environment, or a constitutional breach.
+   This is the discriminator against HIGH: violating a HIGH rail typically
+   costs a cycle, and the loop recovers. Nothing recovers a deleted store.
+2. **The trigger zone is not self-announcing.** The danger arrives during work
+   that looks ordinary, so the agent will not think to expand the relevant
+   category first. A rail you would inevitably pull via `--category` before
+   acting (because the work itself names the subject) is already covered by the
+   index plus on-demand expansion, and does not need always-load status.
+
+Explicitly NOT admission criteria: how important the rule feels, how often it
+fires, or any utilization counter. `times_active` and `utilization_score` v1 are
+cumulative, and guard-841 / rb-1824 disqualify them as selection signals for
+exactly this decision — a passive always-on rail accumulates fires *because* it
+is always on.
+
+The three pre-existing CRITICALs are the calibration set, and all three satisfy
+both clauses: guard-813 (promotion cycle is mandatory — a skipped stage ships
+unvalidated framework to production), guard-939 (archive before any destructive
+data operation — the deletion is not undoable), guard-1243 (never write
+git-tracked source into a designated write-prohibited upstream environment). In
+each, the moment of danger looks like routine work — clause 2 doing its job.
+
+Clause 2 is what keeps the tier small by construction, and that is the point: a
+CRITICAL tier that grows to a few hundred entries has become a second budget
+problem rather than a solution to the first one. If a population pass produces
+a large CRITICAL set, the rule was applied too loosely, not the corpus
+discovered to be unusually dangerous.
+
+Populating `severity` across the remaining 1594 records against this rule is a
+judgement pass, not a mechanical migration, and remains separate work.
 
 ## Reasoning bank: what was given up, said out loud
 

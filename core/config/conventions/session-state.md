@@ -116,6 +116,60 @@ not-merged, array+counter merge, active_context reducer-wins, timestamp
 latest-wins, loop_state recurse, body-only slot carry, hash short-circuit via
 the real fork path, multi-body).
 
+### Phase B — worker-goal retrospective (g-306-198, landed)
+
+A worker Body executes goals but never runs the reducer-only close phases, so a
+goal it completed reaches the shared store with `outcome_note` written and the
+reducer lanes — team-state, journal, findings gate, imp@k — simply **absent**,
+with nothing downstream to fill them. `aspirations-consolidate` **Step -0.9**
+(immediately after Step -1) closes that gap by calling
+`core/scripts/worker_retrospective.py` over the goals the merge just carried in.
+
+**`merged_goal_ids` — the provenance the fleet does not otherwise have.**
+generalize-down's JSON summary carries this key: the set-difference of
+`goals_completed_this_session` goal ids in the reducer's WM *after* the merge
+minus *before* it. It is derivable **only at merge time**, and this is the only
+place worker-completion is recorded anywhere:
+
+| candidate discriminator | why it cannot answer "did a worker complete this?" |
+|---|---|
+| `claimed_by` / `claimed_by_sid` on the goal record | both erased at close by design (g-115-3176, `aspirations_write.update_goal`) — 0 of 4015 completed goals carry either |
+| the WM rows themselves | carry `goal_id`/`aspiration_id`/`work_class`, no session id |
+| `body-manifest.yaml` | records the Body, not the goals it closed |
+| absence of a lane (e.g. "no journal entry") | circular — that is the *effect* being repaired, so using it as the test makes the criterion unfalsifiable (guard-2950) |
+
+Consequences worth knowing before changing either half: re-running
+generalize-down does **not** recover the ids (the Bodies are already `merged`,
+so the second run returns an empty list), and a Body whose WM is unreadable
+yields **no** attribution rather than a false one.
+
+**Lane split.** The retrospective is a CALLER of the existing per-lane writers,
+never a re-implementation. That contract partitions the seven lanes: four are
+mechanizable because their writer accepts a goal id (`team_state`, `journal`,
+`findings`, `impk`), and three are reported as `pending_judgment_lanes` for the
+LLM (`verification`, `execution_feedback`, `user_notable`) because their writers
+consume LLM ratings a script cannot honestly supply — the same reason
+`state-update-audit` skips the imp@k snapshot on an unmeasured close rather than
+recording a false 0.0 (g-115-2441).
+
+**Idempotence.** Each goal is stamped `retrospective_encoded` on its own record
+once its lanes land, and a stamped goal is never re-run. The marker is
+deliberately **withheld** when every lane failed, so a transient store fault
+retries on the next pass instead of being recorded as done; lanes therefore run
+BEFORE the marker, matching the crash-ordering trade `_consume_staged` documents.
+
+Dormant under the same condition as the rest of Phase 1C — with one Body (the
+reducer) nothing forks, `merged_goal_ids` is always empty, and Step -0.9 skips.
+Measured on this deployment 2026-08-07: 8 of 9 agent dirs hold zero session
+dirs and the only `body-manifest.yaml` present is the reducer's own, so the
+worker-completed population is 0 by construction, not by circumstance. See
+`core/scripts/worker_retrospective.py` and
+`core/scripts/tests/test_worker_retrospective.py` (18 tests: WM row-shape
+tolerance, set-difference + dedup + unreadable-WM fail-safe, `merged_goal_ids`
+present on the dormant path, plan/skip classification, marker-withheld-on-total-
+failure, and a plan -> apply -> re-plan round trip proving a goal cannot be
+retrospected twice).
+
 
 
 **Single source of truth:** new session files go into the YAML. Recovery
@@ -762,8 +816,8 @@ a watcher subshell is `disown`-ed, or a session closes mid-job. The
 
 **Scanner**: `world/scripts/stale-jobs-scan.sh` (subcommands `report`,
 `reconcile`, `scan --auto-kill`). Identifies Tier A (registered jobs past
-their type-specific lifetime threshold in `core/config/aspirations.yaml →
-stale_scanner.thresholds`) and Tier B (unregistered OS-level orphans
+their type-specific lifetime threshold, resolved from the WORLD overlay
+`world/config/stale-scanner.yaml → thresholds`) and Tier B (unregistered OS-level orphans
 matching known command-line signatures: Processor, llama-server,
 roblox-bridge, ssh-efs).
 

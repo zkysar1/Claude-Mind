@@ -14,6 +14,8 @@ Subcommands:
   init              — Create team-state.yaml + rows dir if missing
   in-flight         — Mark agent as in-flight on a goal (row file)
   clear-in-flight   — Remove the in_flight block from an agent's status (row file)
+  clear-body-row    — Remove one in_flight_bodies.<sid> entry + null siblings
+  retire-agent      — Remove an agent's presence (archive-before-delete gated)
   migrate-shard     — One-shot cleanup: move core agent_status residuals to rows
 """
 
@@ -34,8 +36,11 @@ import yaml
 from _paths import WORLD_DIR
 from _fileops import locked_modify_yaml, locked_write_yaml
 from _team_state import (
+    body_row_shard_present,
     compose_state,
     core_residual,
+    make_clear_body_row_modifier,
+    make_clear_in_flight_modifier,
     retire_agent,
     route_field,
     row_path,
@@ -247,31 +252,49 @@ def cmd_clear_in_flight(args):
     # Track whether any mutation happened so we can print the right message
     # AFTER the locked_modify_yaml call. Using a closure variable avoids
     # doing a second read just to check.
-    status = {"cleared": False}
+    status = {"cleared": False, "skipped_goal_id": None, "row_survived": False}
 
     #  sharding: clear operates on the agent's OWN row file. The
     # core_residual seed matters here: an un-migrated deployment whose
     # in_flight still lives in the core file gets its row seeded from that
     # residual first, so the pop below actually clears it in the composed
     # view (newest-wins prefers the freshly-stamped row).
-    def _row_modifier(row):
-        if not isinstance(row, dict):
-            row = {}
-        if "in_flight" in row:
-            now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-            row.pop("in_flight")
-            row["last_active"] = now
-            status["cleared"] = True
-            return stamp_row_metadata(row, agent_author, now)
-        # No in_flight to clear — return unchanged; locked_modify_yaml
-        # still re-writes the row (harmless yaml round-trip), but we skip
-        # the metadata stamp so timestamps don't move on a no-op call.
-        return row
+    #
+    # The modifier is SHARED with the daemon twin (guard-2323 / guard-547) and
+    # carries the --if-goal compare-and-swap (guard-2474 clause 2, );
+    # it runs inside locked_modify_yaml's lock, so the comparison is atomic
+    # against a concurrent in-flight set on the same row file.
+    #
+    # The raw value is passed deliberately (): normalization lives in
+    # the modifier so this twin and the daemon cannot disagree about what a
+    # blank --if-goal means. This side never stripped, which is why it was the
+    # accidentally-SAFE one — `--if-goal '  '` declined the CAS and preserved the
+    # row, while the daemon's `or None` wiped it. Do not re-add normalization
+    # here; a blank-but-supplied value must reach the modifier so it can raise.
+    # sys.exit, NOT `return` — main() does `dispatch[args.command](args)` and
+    # DISCARDS the return value, so a returned exit code would be swallowed and
+    # the script would exit 0 on a caller bug. That is the same silent-success
+    # shape this goal exists to remove. Matches the file's existing convention
+    # (cmd_update / cmd_clear_body_row both sys.exit on bad input).
+    try:
+        _row_modifier = make_clear_in_flight_modifier(
+            agent_author, if_goal=getattr(args, "if_goal", None), status=status)
+    except ValueError as e:
+        sys.exit(f"team-state clear-in-flight: {e}")
 
     locked_modify_yaml(row_path(WORLD_DIR, target_agent), _row_modifier,
                        initial=core_residual(TEAM_STATE_PATH, target_agent))
     if status["cleared"]:
         print(f"in_flight cleared for {target_agent}")
+    elif status["skipped_goal_id"]:
+        print(f"in_flight left alone for {target_agent}: row holds "
+              f"{status['skipped_goal_id']}, not {args.if_goal}")
+    elif status.get("row_survived") is True:
+        # A row IS still standing — it just carried no goal_id to compare, so
+        # the CAS declined it unverified. Falling through to "already absent"
+        # here asserted the row was gone while it was not ().
+        print(f"in_flight left alone for {target_agent}: row present but "
+              f"carries no comparable goal_id (not cleared)")
     else:
         print(f"in_flight already absent for {target_agent}")
 
@@ -325,6 +348,51 @@ def cmd_migrate_shard(args):
     print(f"migrate-shard: moved {len(moved)} row(s) to {rows_dir(WORLD_DIR)}: "
           f"{', '.join(moved)}")
     print("migrate-shard: core agent_status emptied (composed reads now serve rows)")
+
+
+def cmd_clear_body_row(args):
+    """Remove agent_status.<agent>.in_flight_bodies.<sid>, sweeping null siblings.
+
+    The dict-key REMOVE path g-306-186 found missing: the generic
+    `--operation remove` is list-only, so clearing a body row could only be
+    faked by setting it null, leaving one permanent null key per SID an agent
+    had ever run. Delegates to the shared
+    _team_state.make_clear_body_row_modifier (guard-742 parity by construction —
+    the daemon endpoint builds the same modifier).
+
+    Reachable by an operator as well as by the turn-end worker path, and that
+    second caller is why this subcommand is not speculative: residue accumulated
+    BEFORE the fix belongs to sessions that are gone, so it can only be drained
+    by naming the agent and sid from outside. Passing a sid that is already
+    absent is a supported no-op — the null-sweep still runs, so
+    `--sid <anything>` drains a stale map.
+    """
+    _validate_agent_name(args.agent, "clear-body-row")
+    if not args.sid:
+        sys.exit("team-state clear-body-row: empty --sid")
+    agent_author = args.author or _agent_name()
+    status = {"removed": False, "nulls_swept": 0, "remaining": 0}
+
+    # Nothing to clear from a shard that does not exist — and writing anyway
+    # would CREATE it (guard-2611). Shared predicate, and it materializes the
+    # shard before asking, so a partner's shard this box has never pulled does
+    # not read as absent (; "shared" describes where the code lives,
+    # not what it reads — it IS an .exists(), just not a bare one).
+    if not body_row_shard_present(WORLD_DIR, args.agent):
+        print(json.dumps({"ok": True, "agent": args.agent, "sid": args.sid,
+                          "removed": False, "nulls_swept": 0, "remaining": 0,
+                          "no_shard": True}, ensure_ascii=False))
+        return
+
+    _row_modifier = make_clear_body_row_modifier(agent_author, args.sid,
+                                                 status=status)
+    # No core_residual seed — see the daemon twin: in_flight_bodies is a
+    # post-sharding field that never lived in the core file.
+    locked_modify_yaml(row_path(WORLD_DIR, args.agent), _row_modifier)
+    print(json.dumps({"ok": True, "agent": args.agent, "sid": args.sid,
+                      "removed": status["removed"],
+                      "nulls_swept": status["nulls_swept"],
+                      "remaining": status["remaining"]}, ensure_ascii=False))
 
 
 def cmd_retire_agent(args):
@@ -448,7 +516,22 @@ def build_parser():
                              help="Remove the in_flight block from an agent's status")
     clear_p.add_argument("--agent", required=True,
                          help="Agent name to clear (alpha, bravo, ...)")
+    clear_p.add_argument("--if-goal", dest="if_goal", default=None,
+                         help="Compare-and-swap: clear ONLY if the live "
+                              "in_flight row names this goal_id. Omit for an "
+                              "unconditional clear (recovery/retire/release).")
     clear_p.add_argument("--author", help="Author name (defaults to MIND_AGENT)")
+
+    # clear-body-row () — the dict-key REMOVE path
+    body_p = sub.add_parser("clear-body-row",
+                            help="Remove one in_flight_bodies.<sid> entry "
+                                 "(and any null siblings) from an agent's row")
+    body_p.add_argument("--agent", required=True,
+                        help="Agent name whose body row is being cleared")
+    body_p.add_argument("--sid", required=True,
+                        help="Session id keying the body row. Already-absent "
+                             "is a supported no-op; the null-sweep still runs.")
+    body_p.add_argument("--author", help="Author name (defaults to MIND_AGENT)")
 
     # migrate-shard ()
     migrate_p = sub.add_parser("migrate-shard",
@@ -480,6 +563,7 @@ def main():
         "init": cmd_init,
         "in-flight": cmd_in_flight,
         "clear-in-flight": cmd_clear_in_flight,
+        "clear-body-row": cmd_clear_body_row,
         "migrate-shard": cmd_migrate_shard,
         "retire-agent": cmd_retire_agent,
     }

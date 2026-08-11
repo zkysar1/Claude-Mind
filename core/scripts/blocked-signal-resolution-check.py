@@ -127,6 +127,7 @@ PROJECT_ROOT = CORE_ROOT.parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse)
+from _dependency_graph import norm_blocked_by  # noqa: E402  SSOT (guard-547)
 import _rt  # noqa: E402  canonical Python -> daemon client
 
 TERMINAL_STATUSES = ("completed", "archived", "skipped", "expired", "resolved")
@@ -337,24 +338,13 @@ def _parse_iso(ts):
         return None
 
 
-def _norm_blocked_by(v):
-    """Normalize the polymorphic `blocked_by` field to list[str].
-
-    THE defect this checker exists to survive: the field is a bare STRING on
-    some goals (g-115-3053, g-335-144 on 2026-07-26) and a LIST on others. A
-    checker that iterates it directly turns 'g-335-260' into 7 single-character
-    phantom ids, none of which resolve — so the goal reads "not resolved"
-    forever and is silently excluded from every verdict. Non-str list members
-    are dropped rather than coerced (an unexpected shape must not become a
-    confident wrong id).
-    """
-    if v is None:
-        return []
-    if isinstance(v, str):
-        return [v] if v.strip() else []
-    if isinstance(v, list):
-        return [x for x in v if isinstance(x, str) and x.strip()]
-    return []
+# MOVED to `_dependency_graph.norm_blocked_by` () — SSOT for the
+# polymorphic-`blocked_by` normalization, now shared with
+# dependency-cycle-check.py. The body is unchanged; only its home moved, so
+# guard-547's measured harm (a hand-mirrored copy drifting fixes behind the
+# original) cannot apply to it. This module-level alias preserves the private
+# name for the file's existing call sites and for tests that import it.
+_norm_blocked_by = norm_blocked_by
 
 
 def _norm_blocker_ref(v):

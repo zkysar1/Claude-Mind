@@ -42,4 +42,9 @@ if [[ -z "$AGENT" ]]; then
 fi
 
 export MIND_AGENT="$AGENT"
+# Hook processes inherit NO env vars, so the SID resolved above is the ONLY
+# way the python side can body-key its checkpoint (). Without this
+# export, body_state_path() always takes the agent-wide fallback and a worker
+# body's PreCompact clobbers the reducer's checkpoint — the defect this fixes.
+export MIND_SID="$SID"
 exec python3 "$CORE_ROOT/scripts/precompact-checkpoint.py" "$@"

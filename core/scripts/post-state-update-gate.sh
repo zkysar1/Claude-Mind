@@ -45,6 +45,7 @@ emit_json() {
   REASON="${REASON:-}" \
   FIRED="${FIRED:-false}" \
   CORE_FILES="${CORE_FILES:-}" \
+  REVIEW_EXTRA_FILES="${REVIEW_EXTRA_FILES:-}" \
   COMMITS_SCANNED="${COMMITS_SCANNED:-0}" \
   SCOPE_DEGRADED="${SCOPE_DEGRADED:-}" \
   python3 - <<'PYEOF'
@@ -55,7 +56,18 @@ loc = int(os.environ.get("LOC_CHANGED", "0") or "0")
 ns = (os.environ.get("NEW_SCRIPT") or "").strip()
 reason = os.environ.get("REASON") or ""
 files_raw = os.environ.get("CORE_FILES") or ""
-files = [l.strip() for l in files_raw.splitlines() if l.strip()][:20]
+files = [l.strip() for l in files_raw.splitlines() if l.strip()]
+# : daemon source rides along in the DISPATCH list but never in the
+# COUNT. `files` is what /fresh-eyes-code actually reviews; core_count/loc are
+# the trigger arithmetic. Keeping the two separate is the whole point — see the
+# REVIEW_EXTRA_FILES block below for why the trigger deliberately did NOT widen.
+# Appended AFTER core files and before the [:20] cap so a wide core change can
+# still crowd them out, which is the same precedence the cap already implies.
+extra_raw = os.environ.get("REVIEW_EXTRA_FILES") or ""
+for _p in (l.strip() for l in extra_raw.splitlines()):
+    if _p and _p not in files:
+        files.append(_p)
+files = files[:20]
 out = {"fired": fired, "core_count": cc, "loc_changed": loc, "reason": reason}
 # Multi-commit committed scope (): how many goal commits were unioned.
 # 0 = working-tree scope. Additive field — consumers key on fired/files/reason.
@@ -288,6 +300,36 @@ fi
 # touched only one source file under core/.
 CORE_FILES=$(printf '%s\n' "$CHANGED" | grep '^core/' | grep -v '^core/logs/' || true)
 
+# ── Daemon source rides along in the DISPATCH set only () ───────────
+# `grep '^core/'` above means a mind_api/src/ path could NEVER appear in the
+# emitted files[], by construction — so an adversarial review of a daemon goal
+# saw only its tests. Canonical:  fired core_count=2 loc=298 naming
+# two test files while the entire production change was in
+# mind_api/src/endpoints/aspirations_write.py, and the one real finding that
+# review produced was in that unreviewed file. A review of tests without the
+# code under test reads as coverage the code never got, which is worse than no
+# review at all.
+#
+# SET ONLY — the TRIGGER thresholds deliberately do NOT widen. Measured over
+# the trailing 600 commits (foxtrot, 2026-08-04, hostname LAPTOP-3IOFCNEO):
+# 66 touch mind_api/src; 64 of them (97%) ALREADY fire and merely cannot name
+# the daemon file; only 2 fire nothing at all, and those 2 are one change plus
+# its merge commit. Counting mind_api/src toward CORE_FILE_THRESHOLD/
+# LOC_THRESHOLD would therefore newly fire ~1 distinct change per 600 commits
+# (0.3%) while contradicting guard-343's published spec, whose thresholds are
+# defined in terms of "core/ files" and "LOC delta in core/scripts" (:23-25).
+# Buying 3% of the defect at the price of a fleet-wide spec change is the wrong
+# trade; the other 97% is pure set widening and costs no frequency change.
+#
+# NOT deduped against the cooldown union below, deliberately: the partial-
+# coverage path reduces CORE_FILES but leaves these intact, so a repeat fire
+# may re-dispatch a daemon file. That biases toward MORE review, which is the
+# same fail-open direction this script already states for the attribution
+# filter ("any error retains the original list (biases over-firing)"). The
+# whole-set suppression above still short-circuits before emit, so a fully
+# covered core set emits nothing at all — extras included.
+REVIEW_EXTRA_FILES=$(printf '%s\n' "$CHANGED" | grep '^mind_api/src/' || true)
+
 # ── Cross-agent attribution filter (, rb-911-sibling) ──────────────
 # Mirror iteration-commit.sh's 3-source filter stack ( +  +
 # ). Without this, partner WIP at neutral paths (core/scripts/,
@@ -317,6 +359,18 @@ if [ "$COMMIT_SHA_VALID" != "yes" ] && [ -n "${MIND_AGENT:-}" ] && [ -f "$ATTRIB
       UNTRACKED=$(sed '/^$/d' "$ATTRIB_TMP2" || true)
     fi
     rm -f "$ATTRIB_TMP2"
+  fi
+  # : the dispatch-only daemon set gets the SAME filter. mind_api/src/
+  # is named at :92-93 as a neutral path — i.e. one where partner WIP is
+  # expected — so skipping this would hand a partner's uncommitted daemon edits
+  # to THIS agent's reviewer, which is the exact false-positive class the
+  # filter exists to prevent (bravo session 69, 4 zeta files).
+  if [ -n "$REVIEW_EXTRA_FILES" ]; then
+    ATTRIB_TMP3=$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/xagent-extra-$$.txt")
+    if printf '%s\n' "$REVIEW_EXTRA_FILES" | py -3 "$ATTRIB_HELPER" > "$ATTRIB_TMP3" 2>/dev/null; then
+      REVIEW_EXTRA_FILES=$(sed '/^$/d' "$ATTRIB_TMP3" || true)
+    fi
+    rm -f "$ATTRIB_TMP3"
   fi
 fi
 

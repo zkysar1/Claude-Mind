@@ -55,6 +55,64 @@ switch. Pass `--reader` for the read-only safe floor when walking away.
 
    c. **Positional argument present and agent directory exists** → rebind this session to the named agent: overwrite `.active-agent-<SID>` with `<agent-name>` so the PreToolUse[Bash] hook auto-injects `MIND_AGENT=<agent-name>` on subsequent calls. If you need a deliberate cross-agent probe inside a single command (e.g., reading a third agent's state), write `MIND_AGENT=<other> <cmd>` explicitly — the hook preserves explicit overrides.
 
+**Step 0.6: Worker-Body short-circuit (g-306-125) — MUST run before Step 1.**
+
+On a cross-box run this agent has TWO kinds of live Body: the REDUCER, which owns
+the agent-wide state, and one or more WORKERS. Everything below Step 1 is an
+AGENT-WIDE write — `stop-target-mode`, the `stop-requested` signal, `agent-state`,
+`agent-mode`, the goal claim. A `/stop` typed on a WORKER box must perform none of
+them. `stop-requested` is the sharp one: it is read by the REDUCER's Phase -1.4, so
+setting it from a worker stops the wrong Body on a different machine while the user
+believes they stopped only the box in front of them. A worker's own wind-down is
+driven by the reducer-liveness poll, never by this file.
+
+This check sits ABOVE Step 1 rather than inside the RUNNING branch on purpose. The
+IDLE branch writes agent-wide state too (`session-mode-set.sh`, Step 2 there), and a
+worker whose reducer has already stopped reads state=IDLE — so a RUNNING-only guard
+would leak the mode write.
+
+Detection uses the body-WM predicate: `sessions/<SID>/working-memory.yaml` exists
+ONLY for a non-reducer Body. That is the invariant `core/scripts/bash-agent-inject.py`
+documents and itself routes on, so deriving it here locally keeps the two predicates
+identical and unable to drift. `$MIND_SID` is this session's own SID and IS available
+here, because every step in this skill is a Bash TOOL call and the PreToolUse hook
+injects it — the same basis Step 5's runner detection already relies on. Do NOT
+rewrite this as a `BODY_ROLE` env check: that variable happens to be present in THIS
+context for the same reason, but it is absent in every non-Bash-tool hook, and keying
+a rail on it is the inert-rail class `guard-2445` exists to prevent. COUPLING, stated
+so it fails loudly: if a REDUCER ever gains a `sessions/<sid>/working-memory.yaml`,
+this predicate misclassifies it as a worker and `/stop` becomes a no-op on the box
+that owns the state.
+
+Bash: `if [ -n "$MIND_SID" ] && [ -f "agents/<agent-name>/sessions/$MIND_SID/working-memory.yaml" ]; then echo "worker"; else echo "reducer-or-single"; fi`
+
+IF output is "worker":
+
+1. Stage + push this worker's own per-session state so a machine-move right after the
+   stop cannot strand it. This is the same call graceful-stop D6.7 makes for the same
+   reason — it pushes owned-agent `session/` continuity files (working-memory.yaml,
+   execution-diary.jsonl, ...) to the backend now instead of at the sweep thread's next
+   tick. Fire-and-forget: a flush failure must not block the stop.
+   Bash: `bash core/scripts/owncloud-flush.sh || true`
+
+2. Close this session's telemetry record. The worker got a WP1 `active` record at
+   `/start` and never reaches the IDLE branch's WP2, so without this it orphans as
+   permanently-`active` and pollutes the live-sessions query. Keyed on the WORKER's own
+   `$MIND_SID`. guard-165: SID/agent via ENV, python source single-quoted.
+   Bash: `TSID="$MIND_SID" TAGENT="$MIND_AGENT" py -3 -c 'import os,sys; sys.path.insert(0,"core/scripts"); from _session_telemetry import write_close; write_close(sid=os.environ["TSID"], agent=os.environ["TAGENT"], status="completed", ended_reason="user-stop")' >/dev/null 2>&1 || true`
+
+3. Clean this session's SID binding so PROJECT_ROOT does not accumulate one file per
+   stopped worker. Idempotent.
+   Bash: `rm -f ".active-agent-$MIND_SID"`
+
+4. Output: `"Worker Body stopped on this box. The reducer was NOT signalled — its claim, canonical working memory, and session state are untouched. This worker's session state has been staged and pushed. To stop the whole agent, run /stop <agent-name> on the reducer box."`
+
+DONE. Do NOT continue to Step 1. Do NOT write `stop-target-mode`. Do NOT set
+`stop-requested`. Do NOT chain into the aspirations loop.
+
+IF output is "reducer-or-single": continue to Step 1 unchanged. This is the ordinary
+single-box case and behaves exactly as it did before this step existed.
+
 **Step 1: Check State** -- Bash: `session-state-get.sh`
 (Step 0.5 has already rebound this session to `<agent-name>`, so the PreToolUse hook auto-injects `MIND_AGENT=<agent-name>` and this read targets the correct agent.)
 
@@ -228,6 +286,10 @@ Output: "Agent has not been started yet. Type `/start <name>` to begin."
 
 ## Chaining
 - Sets: `stop-target-mode` file, `stop-requested` signal
+- Sets NEITHER of the above on the **worker-Body path** (Step 0.6): a `/stop` typed on
+  a worker box stages+pushes its own per-session state, closes its telemetry, cleans
+  its binding, and exits without touching any agent-wide file. The reducer is not
+  signalled and keeps running (g-306-125).
 - Calls (RUNNING branch, runner session only): `Skill: aspirations` with args `loop` as
   the final action, so Phase -1.4 runs in the same user turn and the graceful stop
   (D1–D7) completes before the turn ends. Observer sessions skip the chain and leave

@@ -131,6 +131,22 @@ DEFAULT_SLOT_TYPES = [
 ARRAY_SLOTS = {
     "knowledge_debt", "known_blockers", "micro_hypotheses",
     "recent_violations", "sensory_buffer", "conclusions",
+    # spark_capture (): the worker->reducer spark bridge. Membership
+    # here is load-bearing for SURVIVAL, not just for clear-to-[] semantics —
+    # cmd_maintain's scalar-eviction predicate is `slot_name not in ARRAY_SLOTS
+    # and ... slot_val is not None`, and a non-empty list is not None, so an
+    # unregistered spark_capture would be nulled at evict_threshold_minutes
+    # (120) while its Body waited for the next consolidation.
+    "spark_capture",
+    # exp_capture (): the worker->reducer EXPERIENCE bridge, sibling of
+    # spark_capture and registered for the identical survival reason above. The
+    # two are deliberately separate slots rather than one: a spark is a reusable
+    # lesson the reducer ENCODES (rb/guardrail/tree), an exp_capture entry is the
+    # execution narrative it encodes an experience .md FROM, and merging them
+    # would force one consumer to re-classify what the writer already knew.
+    # Membership here also buys body-merge's _dedup_append content-hash dedup for
+    # free — that helper keys off ARRAY_SLOTS, so no body-merge edit is needed.
+    "exp_capture",
 }
 
 # Slots that are maps with specific structure (not scalars)
@@ -175,7 +191,24 @@ CADENCE_TRACKER_PATTERNS = (
 # MIRRORED in mind_api/src/endpoints/wm_write.py (the LIVE runtime path —
 # wm-reset.sh routes to POST /v1/wm/reset, not to cmd_reset). Keep both in
 # sync; parity asserted by test_wm_reset_cadence.py. ()
-RESET_SURVIVING_SLOTS = {"journal_cluster_summaries"}
+#
+# spark_capture () is the second member, for the same reason and a
+# tighter window: body-merge generalize-down delivers a worker's captured spark
+# observations into the reducer WM at aspirations-consolidate Step -1, and
+# wm-reset runs at Step 5 of the SAME consolidation. Without this exemption the
+# transport would land the payload and wipe it ~5 steps later, before any
+# aspirations-spark Phase 6.5 could consume it — the merge would report success
+# and the learning would still be lost. Cleared by its consumer (Phase 6.5), not
+# by reset.
+#
+# exp_capture () is the third member and inherits that reasoning
+# unchanged: it rides the SAME body-merge transport into the reducer WM at
+# Step -1, and its consumer (the retrospective, which calls the existing
+# experience writers over the entries) also runs after the Step-5 reset. Same
+# transport + same boundary = same exemption. Omitting it would make the merge
+# report success while the narratives were wiped ~5 steps later, which is the
+#  failure verbatim, and silent for the same reason.
+RESET_SURVIVING_SLOTS = {"journal_cluster_summaries", "spark_capture", "exp_capture"}
 
 def _is_cadence_tracker(slot_name):
     """True if slot name matches a cadence-tracker pattern — do not evict."""
@@ -571,7 +604,59 @@ def cmd_append(args):
             print(f"ERROR: '{args.slot}' is {type(arr).__name__}, not a list", file=sys.stderr)
             sys.exit(1)
 
-        arr.append(item)
+        # knowledge_debt UPSERT-BY-node_key (, 2026-08-06). The reflect
+        # tree-lint (reflect/SKILL.md, "stale-high-retrieval") re-flags the TOP 5
+        # nodes by retrieval_count on every maintain pass, and that set is stable
+        # by construction — a high-retrieval node stays high-retrieval. Appending
+        # blind made the slot re-record the same nodes each scan: measured 10
+        # entries for 5 distinct node_keys across 3 scans, against a limit of 15.
+        # At saturation the FIFO eviction below drops the OLDEST entries, which
+        # under that duplication are re-recordings of nodes still present — so
+        # the slot can never hold more than ~5 distinct nodes, and genuine debt
+        # from the OTHER writers is evicted within ~3 scans. That silent loss is
+        # exactly what  ("prevents data loss") exists to stop.
+        #
+        # Enforced HERE, not as a "skip if already present" line in the skill
+        # pseudocode: rb-121 — LLM template instructions are insufficient for
+        # structural constraints, they need code-level enforcement. This sits
+        # beside the existing _validate_knowledge_debt_entry gate ( /
+        # rb-248), the precedent for slot-specific enforcement on this store.
+        #
+        # Upsert, not skip: the newest scan carries fresher retrieval_count /
+        # days_since_update, so replacing in place keeps the better measurement.
+        # Position is preserved so the entry keeps its original _item_ts ordering
+        # for eviction — a node that keeps re-flagging must not indefinitely
+        # renew its own priority over older, never-serviced debt.
+        # SELF-HEALING (fresh-eyes-code, same day): collapse ALL matches, not
+        # just the first. The first version replaced the first match and broke,
+        # which prevents NEW duplicates but never converges a slot that ALREADY
+        # holds them — it refreshes one twin and leaves the other pinning an
+        # eviction slot forever. My own slot only converged because I cleaned it
+        # by hand; any slot still duplicated when this ships would stay that way
+        # permanently. Collapsing on write makes the first append after the fix
+        # heal the slot, with no migration step.
+        _upserted = False
+        if root_slot_for_validation == "knowledge_debt" and isinstance(item, dict):
+            _nk = item.get("node_key")
+            if _nk:
+                _matches = [_i for _i, _e in enumerate(arr)
+                            if isinstance(_e, dict) and _e.get("node_key") == _nk]
+                if _matches:
+                    # Keep the OLDEST match's _item_ts: a node that keeps
+                    # re-flagging must not renew its own eviction priority over
+                    # older, never-serviced debt.
+                    _oldest = min(
+                        (arr[_i].get("_item_ts") for _i in _matches
+                         if arr[_i].get("_item_ts")),
+                        default=item.get("_item_ts"),
+                    )
+                    item["_item_ts"] = _oldest
+                    arr[_matches[0]] = item
+                    for _i in reversed(_matches[1:]):
+                        arr.pop(_i)
+                    _upserted = True
+        if not _upserted:
+            arr.append(item)
 
         # Enforce array limits
         config = read_config()

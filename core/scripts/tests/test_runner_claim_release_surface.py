@@ -59,6 +59,10 @@ CASES = [
     ("release", '{"ok":false,"error":"boom","backend":"own-cloud"}', 2, "FAILED"),
     # acquire held (peer owns a live claim) stays exit 4 — unchanged.
     ("acquire", '{"ok":true,"acquired":false,"held":true,"backend":"own-cloud"}', 4, "HELD"),
+    # -c: held WITH holder fields still exits 4, and NAMES the box.
+    ("acquire",
+     '{"ok":true,"acquired":false,"held":true,"backend":"own-cloud",'
+     '"holder_machine_id":"cc-03","holder_heartbeat_age_seconds":520}', 4, "cc-03"),
     # acquire success unchanged.
     ("acquire", '{"ok":true,"acquired":true,"held":false,"backend":"own-cloud"}', 0, "acquire: ok"),
     # heartbeat unchanged.
@@ -71,6 +75,35 @@ def test_runner_claim_summary_surface(op, response, exp_rc, exp_txt):
     rc, out = _run(op, response)
     assert rc == exp_rc, f"op={op} response={response} -> rc={rc} (want {exp_rc}); out={out!r}"
     assert exp_txt in out, f"op={op} -> missing {exp_txt!r} in {out!r}"
+
+
+def test_acquire_held_names_holder_and_falls_back_when_absent():
+    """-c: the HELD refusal names the holder when the daemon supplied
+    it, and falls back to the original anonymous wording when it did not.
+
+    The fallback half is the load-bearing one. g-306-118-a measured THREE
+    acquire response shapes, not two — the daemon OMITS the holder keys when the
+    runner_state row is unreadable — so the wrapper must not borrow the
+    stale-break branch's `or "unknown-machine"` placeholder here. Printing
+    "'unknown-machine' owns a live claim" would assert that a holder had been
+    identified when none was, which is worse than the anonymous sentence it
+    replaced: it looks like data.
+    """
+    held = ('{"ok":true,"acquired":false,"held":true,"backend":"own-cloud",'
+            '"holder_machine_id":"cc-03","holder_heartbeat_age_seconds":520}')
+    rc, out = _run("acquire", held)
+    assert rc == 4, f"holder-present held must still exit 4, got {rc}: {out!r}"
+    assert "cc-03" in out, f"holder machine_id not surfaced: {out!r}"
+    assert "520s" in out, f"heartbeat age not surfaced: {out!r}"
+    # The anonymous wording must be GONE when a holder is known.
+    assert "another machine" not in out, f"anonymous wording survived: {out!r}"
+
+    bare = '{"ok":true,"acquired":false,"held":true,"backend":"own-cloud"}'
+    rc, out = _run("acquire", bare)
+    assert rc == 4, f"holder-absent held must still exit 4, got {rc}: {out!r}"
+    assert "another machine" in out, f"fallback wording lost: {out!r}"
+    assert "unknown-machine" not in out, (
+        f"placeholder printed as though a holder were identified: {out!r}")
 
 
 def test_released_missing_key_does_not_surface():

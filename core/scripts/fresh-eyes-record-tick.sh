@@ -41,7 +41,34 @@ SLOT_NAME="${1:-last_fresh_eyes_review}"
 # as a slot.
 CLAIM_MODE=0
 for _arg in "$@"; do
-    [[ "$_arg" == "--claim" ]] && CLAIM_MODE=1
+    if [[ "$_arg" == "--claim" ]]; then
+        CLAIM_MODE=1
+        continue
+    fi
+    # REFUSE any other --flag, BEFORE any write (). The coercion on the
+    # line below exists to stop a flag being bound to the slot positional, and that
+    # purpose is kept — but on its own it silently turned EVERY unrecognised flag
+    # into a REAL stamp against the default slot. Measured twice, same agent, same
+    # script, same slot: `--help` (2026-08-02) and `--print-current --world-only`
+    # (2026-08-04) each clobbered a live cadence stamp, and the prior value was
+    # unrecoverable because this WM file has no history. A recorder with no required
+    # argument has no safe failure mode for an exploratory invocation — every wrong
+    # call was a successful write.
+    #
+    # A `--help` handler alone would NOT have been enough: write #2 used flags that
+    # are not `--help` at all. They are real flags of the DELEGATE this script calls
+    # (fresh-eyes-cadence-check.sh, L102/L160), not of this wrapper, which parses
+    # only `--claim` — so a reader who saw them in a union-of-the-chain flag listing
+    # would reasonably pass them here. Refusing the whole unrecognised-flag class is
+    # what closes that, not an enumeration of the two flags already observed.
+    #
+    # exit 2 with `unknown arg:` mirrors iteration-close.sh:372 — the sibling in
+    # this directory that already fails this way.
+    if [[ "$_arg" == --* ]]; then
+        echo "unknown arg: $_arg" >&2
+        echo "usage: fresh-eyes-record-tick.sh [<wm-slot-name>] [--claim]" >&2
+        exit 2
+    fi
 done
 [[ "$SLOT_NAME" == --* ]] && SLOT_NAME="last_fresh_eyes_review"
 

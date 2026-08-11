@@ -10,6 +10,20 @@ Query parameters (mutually exclusive — exactly one):
     replay_candidates=1
     archive=1
     meta=1
+    narrative=1   — composes with `id=` (one record) or `stage=` (filtered);
+                   alone it covers the live+archive union. See NARRATIVE_CHAIN.
+
+`stage=archived` does NOT mean the same thing to `narrative=1` as it does to the
+bare `stage` branch, and the difference is load-bearing. The bare branch reads the
+ARCHIVE FILE ONLY and skips the stage filter entirely; `narrative` unions live+archive
+with live-wins dedup (replay_candidates' ordering) and then filters on the record's own
+`stage`. For an id present in BOTH files with DIFFERENT stages, the live copy wins and
+is then excluded. Measured 2026-08-04 (echo, cc-03): 829 vs 827 — the two ids are
+`2026-05-12_g-115-644-prune-steady-state` (live stage discovered) and
+`2026-07-08_cc05-gated-goals-churn-until-preconditioned` (live stage measurement-pending).
+`narrative` reports the FRESHER stage; the bare branch reports a stale archived label.
+Pinned by test_archived_stage_asymmetry_is_pinned — do not "fix" it by mimicking the
+archive-only read, which would report a stage the live record contradicts.
 
 Equivalence target: stdout of `python3 core/scripts/pipeline.py read --<flag>`.
 
@@ -30,6 +44,50 @@ from ..endpoints._jsonl_common import (
 
 VALID_STAGES = {"discovered", "active", "measurement-pending", "resolved", "archived"}
 
+# The outcome narrative is NOT always in `outcome_detail`. Ordered fallback chain,
+# canonical source for every reader (gap-062). Measured 2026-08-04 over the 351-record
+# replay-candidate population: outcome_detail wins on 260 (74.1%); 79 (22.5%) win on a
+# fallback key; 12 (3.4%) have no narrative under ANY of the ten. A reader keyed on
+# outcome_detail alone renders the last two groups identically, so "recorded under a
+# different key" and "never recorded" become indistinguishable — which is the whole
+# reason this lives in one place instead of being re-derived per caller.
+# `result` is deliberately absent: it is the bare verdict ("CONFIRMED"), never prose.
+NARRATIVE_CHAIN = (
+    "outcome_detail", "resolution_note", "resolution", "resolution_summary",
+    "resolution_evidence", "outcome_note", "reflection_note", "actual_outcome",
+    "evidence_for", "rationale",
+)
+
+
+def _narrative_text(value):
+    """Coerce a narrative field of ANY shape to a single string; "" means absent.
+
+    Not every narrative key holds a str. Measured 2026-08-04 across the same 351
+    records: 6 winning values were LISTS (evidence_for) and 1 was a DICT (resolution).
+    A normalizer that assumes str raises AttributeError on exactly those 7, so the
+    coercion is load-bearing rather than defensive. Never truncates — a hand-rolled
+    variant that truncated before scanning produced a false 0-of-10 indicator scan
+    (zeta, 2026-07-31), which is the measurement error this helper exists to retire.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        return "; ".join(p for p in (_narrative_text(v) for v in value) if p)
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True) if value else ""
+    return str(value).strip()
+
+
+def narrative_of(rec):
+    """(key, text) for the first non-empty link in NARRATIVE_CHAIN; (None, "") if bare."""
+    for key in NARRATIVE_CHAIN:
+        text = _narrative_text(rec.get(key))
+        if text:
+            return key, text
+    return None, ""
+
 
 def _live_path(ctx):
     return ctx.paths.world / "pipeline.jsonl"
@@ -48,6 +106,44 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
 
     q = ctx.query
     jc = cache()
+
+    # Checked BEFORE stage/id: those two branches return early, so `narrative=1&id=X`
+    # would otherwise be swallowed and answered with the raw record. Nothing existing
+    # sets `narrative`, so precedence here cannot change any current caller's result.
+    if flag(q, "narrative"):
+        n_stage = q.get("stage")
+        if n_stage and n_stage not in VALID_STAGES:
+            return Response.error(400, "invalid_stage", f"Invalid stage: {n_stage}")
+        by_id: dict = {}
+        # live iterates second → the live copy wins the dedup, matching where
+        # update_field actually writes (same ordering rationale as replay_candidates).
+        for r in list(jc.get(_archive_path(ctx))) + list(jc.get(_live_path(ctx))):
+            rid = r.get("id")
+            if rid is not None:
+                by_id[rid] = r
+        n_id = q.get("id")
+        if n_id:
+            rec = by_id.get(n_id)
+            if rec is None:
+                return Response.error(404, "not_found", f"Record {n_id} not found")
+            selected = [rec]
+        else:
+            selected = [r for r in by_id.values()
+                        if not n_stage or r.get("stage") == n_stage]
+        out = []
+        for r in selected:
+            key, text = narrative_of(r)
+            out.append({
+                "id": r.get("id"),
+                "stage": r.get("stage"),
+                "outcome": r.get("outcome", ""),
+                # null (not "") when the record is genuinely bare, so a caller can
+                # tell an unrecorded lesson from an unread one without re-deriving it.
+                "narrative_key": key,
+                "narrative": text,
+                "chars": len(text),
+            })
+        return json_response_pretty(out)
 
     stage = q.get("stage")
     if stage:
@@ -208,7 +304,7 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
 
     return missing_flag_error([
         "stage", "id", "summary", "counts", "accuracy",
-        "unreflected", "replay_candidates", "archive", "meta",
+        "unreflected", "replay_candidates", "archive", "meta", "narrative",
     ])
 
 

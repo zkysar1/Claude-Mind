@@ -121,6 +121,28 @@ text the grant had invalidated.
    run and a genuinely clean queue produce the same output (guard-1802,
    rb-5650).
 
+   **Second instance, and the variant a predicate diff will NOT catch:**
+   `blocker-recheck.py` enumerated only the `known_blockers` working-memory
+   slot. `create-blocker.py` writes the blocker to TWO places — that slot AND
+   `blocker_ref` on the goal record — and its own comment calls the WM entry
+   "the authoritative record" and the goal copy "a redundancy". That is
+   inverted with respect to durability: the WM slot is per-agent, per-box and
+   ephemeral, while the goal record is shared, fleet-wide and durable.
+   Measured 2026-08-01: all five agents read `known_blockers=null` while six
+   non-terminal goals carried a live `blocker_ref`, so the sweep reported
+   `total_blockers: 0` — the same permanent all-clear as the first instance,
+   from a different cause. Here the predicate was not narrower than the
+   creating gate's; it was pointed at the wrong one of the two stores that
+   gate writes. So diffing predicates cannot find this variant. The question
+   that does: **which store does the creating gate write DURABLY, and is that
+   the store I am reading?** Widen the READ; do not assume the WRITE widens
+   with it — this sweep's clear path is a keyword match with no probe behind
+   it (guard-1978), and extending it over goal records would mutate other
+   agents' goals, so the goal-sourced half is deliberately report-only.
+   (guard-1242 — the `--goal-status blocked` projection omits `blocker_ref`
+   entirely, so the obvious probe for this population returns a false zero
+   too.)
+
 ## Anti-patterns
 
 - Re-probing the premise, finding it still true, and re-deferring — without
@@ -156,6 +178,20 @@ text the grant had invalidated.
   grant's declarative head
 - `core/scripts/gates/user_leg_scope.py` — SSOT for the scope vocabulary and
   the creation-time advisory whose predicate lane P must mirror
+- `core/scripts/gates/defer_scope.py` — the SHARED scope set the four lanes
+  draw from, so a lane extension does not fork a fifth vocabulary. Lane
+  `user-leg` is `VALID_USER_LEG_SCOPES` BY IMPORT from the SSOT above, never
+  re-typed. Read it before adding a scope to ANY lane; two of the shapes it
+  declares were already in lane P's enum, which is why one set rather than
+  four. Its consumer `core/scripts/defer-scope-coverage.py` turns each
+  sweep's printed exclusion count into keyable/unkeyable per lane WITH the
+  observed text — report-only, it never writes a scope onto a goal
+- `rb-7289` — the measured warning about those exclusion counts: a sweep's
+  "cannot key N items" is a claim about the SWEEP's key-space, not the
+  population. `credential-defer-recheck` called 16 of 17 defers human-only
+  when 7 of 7 in its lane were keyable, 6 by an IAM action string its
+  env-var-shaped predicate could not see. Read five skipped items verbatim
+  before believing any such aggregate
 - `guard-349` — read the standing-grants section before routing to the user.
   This rule generalizes it: guard-349 is scoped to commit/push approval and
   is honor-system only, because no code reads that section.

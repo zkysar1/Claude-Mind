@@ -42,8 +42,25 @@ Therefore this tool reports THREE states, never two:
 
   live         — the referent resolves here, and this box can vouch for it
   dangling     — the referent does NOT resolve AND this box owns it
-  unmeasurable — the referent belongs to another agent's box; absence here is
-                 not evidence of anything
+  unmeasurable — this box cannot vouch either way; absence here is not evidence
+                 of anything
+
+TWO families reach `unmeasurable`, for the same reason from different
+directions. The first is `agents/<other>/`, above. The second is the gitignored
+EXTERNAL roots — `world/conventions/` and `meta/` — where on an own-cloud
+deployment the local tree is a read-through cache, so a file nobody has read on
+this box may never materialize locally though it is alive in the store of record
+(guard-980). Those refs are resolved against the STORE (`classify` →
+`_store_exists`): present → `live`, absent → `dangling`, store unreachable →
+`unmeasurable`. Added by g-306-115; before it, local absence alone sent them
+straight to `dangling`.
+
+Measured on the fix (2026-08-01, bravo/cc-05, own-cloud): all 20 locally-absent
+external-root refs are absent from the store too — genuinely dangling, zero
+cache misses — and the store/local diff for both roots is 0 files, so this box
+had no cache-miss population to find. The class is real but was empty HERE; the
+verdict change matters for a box that has NOT materialized everything (a fresh
+clone, a new fleet member), which is exactly the box least able to notice.
 
 `unmeasurable` is deliberately NOT folded into either other bucket. Folding it
 into `dangling` reproduces the flaw above; folding it into `live` hides real
@@ -141,6 +158,22 @@ _NOISE = ("*", "<", "{", "$", "?", "+", "|", "\\", "'", '"', "`")
 # `X.yaml`), so they are excluded as a class rather than enumerated.
 _PLACEHOLDER_SEG = re.compile(r"^(?:[A-Z][A-Z0-9_]*|name|agent|id|foo|bar|baz)$")
 
+# ...with an exception list, because the ALL-CAPS class above has a large,
+# systematic false positive: `SKILL.md` is the single most common real filename
+# under `.claude/skills/`, and the class swallowed every concrete citation of
+# one. Measured 2026-08-01 on the live corpus (): of the 72 refs the
+# class dropped, 61 were concrete `.claude/skills/<name>/SKILL.md` paths and 6
+# were genuine ALL-CAPS placeholders (`X.yaml`, `PYFILE.py`, `X.py`, `X.sh`,
+# `Y.sh`, `X.md`) — so where it fired on ALL-CAPS it was ~91% wrong, and the
+# `.claude/skills/` family read as near-clean because of it.
+#
+# The class rule is kept rather than replaced: it is right about the general
+# case and needs no list of metavariable names. Membership here is MEASURED,
+# not guessed — these are the ONLY ALL-CAPS-stem filenames that exist anywhere
+# under the prefix families `_ARTIFACT_RE` matches (92 `SKILL.md`, 1
+# `README.md`), so the exception cannot silently readmit a placeholder.
+_LITERAL_FILENAMES = {"SKILL.md", "README.md"}
+
 # A census of ARTIFACTS requires an artifact extension. Without this, a
 # `module.function` reference parses as stem+extension and is reported as a
 # dangling file: `core/scripts/_dt.parse_naive_iso` was classified dangling on
@@ -164,6 +197,8 @@ def _is_noise(ref):
     stem, ext = last.split(".", 1)
     if ext.lower() not in _ARTIFACT_EXT:
         return True
+    if last in _LITERAL_FILENAMES:
+        return False
     return bool(_PLACEHOLDER_SEG.match(stem))
 
 
@@ -271,6 +306,40 @@ def collect(store_names, extra_roots=()):
     return hits
 
 
+# The two gitignored EXTERNAL roots. `core/` and `.claude/` are git-tracked and
+# present on every box, so local absence IS absence for them; these two are a
+# read-through cache on own-cloud and need the store consulted ().
+_EXTERNAL_ROOT_PREFIXES = ("world/conventions/", "meta/")
+
+
+def _is_external_root(ref):
+    return str(ref).replace("\\", "/").startswith(_EXTERNAL_ROOT_PREFIXES)
+
+
+def _store_exists(ref):
+    """True (in store) | False (store says absent) | None (could not consult).
+
+    None is load-bearing and is why this returns a tri-state rather than a bool:
+    `OwnCloudBackend.exists` RE-RAISES every ClientError that is not a
+    not-found code, so a permissions or network failure is an exception, not a
+    `False`. Collapsing that to False would report real infrastructure trouble
+    as a pile of dangling references — the loudest possible false alarm, which
+    is the same failure the resolver guard in `classify` exists to prevent. It
+    is also exactly how the g-306-115 predecessor probe went wrong: it read a
+    raise as absence and so returned no signal while looking like a negative.
+
+    Import is deferred: a census with no locally-absent external-root ref never
+    touches the storage layer, so the common path pays nothing. On LocalBackend
+    `exists()` is a plain filesystem check on the path `resolve_file_path`
+    already tested, so local deployments keep their existing verdicts exactly.
+    """
+    try:
+        from storage_backend import get_backend
+        return bool(get_backend().exists(resolve_file_path(ref)))
+    except Exception:
+        return None
+
+
 def classify(ref, resident, assume_local_authoritative=False):
     """live | dangling | unmeasurable — see the module docstring.
 
@@ -293,22 +362,24 @@ def classify(ref, resident, assume_local_authoritative=False):
         # Non-agent artifact. For `core/` and `.claude/` this is sound: they are
         # git-tracked and present on every box, so absence here IS absence.
         #
-        # It is WEAKER for the two EXTERNAL roots, `world/conventions/` and (as
-        # of ) `meta/`. Those are gitignored and, on an own-cloud
-        # deployment, the local tree is a read-through cache — a file nobody has
-        # read on this box may not be materialized locally even though it is
-        # alive in the store of record (guard-980). So a `dangling` verdict on
-        # those two families can be a cache miss wearing a breakage costume.
+        # It is NOT sound for the two EXTERNAL roots, `world/conventions/` and
+        # `meta/`. Those are gitignored and, on an own-cloud deployment, the
+        # local tree is a read-through cache — a file nobody has read on this box
+        # may not be materialized locally even though it is alive in the store of
+        # record (guard-980). So a local-absence `dangling` verdict on those two
+        # families can be a cache miss wearing a breakage costume.
         #
-        # Not corrected here, deliberately: routing them through a backend HEAD
-        # would be a design change, and  was scoped to the pattern.
-        # Scale, measured 2026-07-31: 9 of 1287 refs are `meta/` dangling, and
-        # 2 of those 9 (`meta/decision-rules.yaml`,
-        # `meta/strategic-pulse-runs.jsonl`) are absent locally and UNVERIFIED
-        # against the store — a backend probe was attempted and failed its own
-        # positive control, so it returned no signal rather than a negative one.
-        # Tracked by . Treat a small `dangling` count on an external
-        # family as an upper bound, not a finding.
+        # Fixed by : those refs are routed through the store of record.
+        # This is the SAME three-state reasoning already applied to
+        # `agents/<other>/` below — absence off-box is not evidence — extended to
+        # the family that had been left out. Deliberately NOT a fourth state.
+        if _is_external_root(ref):
+            verdict = _store_exists(ref)
+            if verdict is True:
+                return "live"          # cache miss, not breakage
+            if verdict is False:
+                return "dangling"      # store agrees it is gone
+            return "unmeasurable"      # store could not be consulted
         return "dangling"
     if assume_local_authoritative or owner in resident:
         return "dangling"
@@ -376,8 +447,24 @@ def main():
               % (counts["live"], counts["dangling"], counts["unmeasurable"],
                  ", ".join(resident) or "none"))
         if counts["unmeasurable"]:
-            print("  NOTE: %d ref(s) belong to non-resident agents' boxes — absence "
-                  "here is NOT evidence they dangle." % counts["unmeasurable"])
+            # Split by PRODUCER. `unmeasurable` has had two of them since
+            # , and a single hardcoded explanation is wrong for one of
+            # them at all times. Attributing a store-consult failure to "another
+            # agent's box" would be a confident mis-diagnosis printed exactly
+            # when infrastructure is broken — the moment the reader can least
+            # afford it. (Caught by the  fresh-eyes pass: the module
+            # docstring already said TWO families and this line still said one.)
+            off_box = sum(1 for r in records
+                          if r["status"] == "unmeasurable" and r["owner"] is not None)
+            no_store = counts["unmeasurable"] - off_box
+            if off_box:
+                print("  NOTE: %d ref(s) belong to non-resident agents' boxes — "
+                      "absence here is NOT evidence they dangle." % off_box)
+            if no_store:
+                print("  NOTE: %d external-root ref(s) could not be checked against "
+                      "the store of record — this is an INFRASTRUCTURE signal, not a "
+                      "verdict about the refs. Re-run once the store is reachable."
+                      % no_store)
         for r in sorted(shown, key=lambda x: (-x["inbound_count"], x["ref"])):
             print("  %-12s n=%-3d %-28s %s"
                   % (r["status"], r["inbound_count"], ",".join(r["surfaces"]), r["ref"]))

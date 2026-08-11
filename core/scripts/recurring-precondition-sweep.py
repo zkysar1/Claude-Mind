@@ -47,6 +47,24 @@ sys.path.insert(0, str(HERE))
 import _paths  # noqa: E402
 from predicate import evaluate_all  # noqa: E402
 
+# Sentinel `id` stamped onto the fire_when predicate so the failing gate can be
+# resolved by IDENTITY rather than by predicate TYPE ().
+#
+# The prior test — `failed[0].type == fire_when.get("type")` — mislabels a
+# failing PRECONDITION as `fire_when` whenever the two happen to share a
+# predicate type (two `file_check`s, say). That was cosmetic while it only fed
+# one stdout line, but  promoted it into the DURABLE
+# `last_shelve_reason` field that guard-2197 sends readers to.
+#
+# Index-by-position is NOT a safe alternative here: `evaluate_all(...,
+# include_skippable=False)` `continue`s past any predicate carrying
+# `selector_skip`, so `results[i]` does not correspond to `pcs[i]`. Identity is
+# the only resolution that survives that. All 8 predicate handlers populate
+# `PredicateResult.predicate_id` from `p.get("id")` (verified), including the
+# unknown-type and evaluator-error paths in `predicate.evaluate`, so the
+# sentinel propagates on every branch.
+FIRE_WHEN_PID = "__fire_when__"
+
 
 def _hours_since(iso_ts: str | None) -> float | None:
     if not iso_ts:
@@ -98,13 +116,20 @@ def _iter_recurring_past_gate(src_path: Path):
                 yield g
 
 
-def _advance_last_achieved_at(goal_id: str, source: str, now_iso: str, dry_run: bool) -> bool:
+def _update_goal_field(goal_id: str, source: str, field: str, value: str, dry_run: bool) -> bool:
+    """Write one field on a goal record via aspirations.py update-goal.
+
+    Generalized from `_advance_last_achieved_at` (g-005-28, 2026-07-31) because
+    a shelve now writes THREE fields, not one — see the shelve-trace comment at
+    the call site for why. The env plumbing below (guard-879) is the reason this
+    is parameterized rather than duplicated per field.
+    """
     if dry_run:
         return True
     cmd = [
         sys.executable, str(HERE / "aspirations.py"),
         "--source", source, "update-goal",
-        goal_id, "lastAchievedAt", now_iso,
+        goal_id, field, value,
     ]
     # guard-879: aspirations.py's own-cloud write-lock resolves its governed
     # root map from MIND_WORLD/MIND_META (or the *_PATH fallbacks) in the
@@ -166,7 +191,12 @@ def main() -> int:
                    if isinstance(p, dict) and "type" in p]
             fire_when = g.get("fire_when")
             if isinstance(fire_when, dict) and "type" in fire_when:
-                pcs.append(fire_when)
+                # Shallow COPY + sentinel id. The copy matters: `pcs` holds
+                # references into the live goal record, and stamping an `id`
+                # onto the original would mutate the goal's own fire_when.
+                fw = dict(fire_when)
+                fw["id"] = FIRE_WHEN_PID
+                pcs.append(fw)
             if not pcs:
                 continue  # no gates; nothing to short-circuit on
             results = evaluate_all(pcs, mode="fail_fast", include_skippable=False)
@@ -174,21 +204,68 @@ def main() -> int:
             if not failed:
                 continue  # all gates pass; let the goal fire normally
             goal_id = g.get("id", "<unknown>")
-            if _advance_last_achieved_at(goal_id, source, now_iso, args.dry_run):
+            # Distinguish gate type in the log AND in the durable shelve trace
+            # below. Resolved by IDENTITY — the FIRE_WHEN_PID sentinel stamped
+            # onto the fire_when copy above — NOT by predicate type. The prior
+            # `failed[0].type == fire_when.get("type")` test mislabels a failing
+            # PRECONDITION as `fire_when` whenever the two merely SHARE a type
+            # (two `file_check`s, say), and  promoted that label from a
+            # transient stdout line into the durable `last_shelve_reason` field.
+            # PredicateResult exposes `.predicate_id` and `.type` — not `.ptype`;
+            # see core/scripts/predicate.py. (`.ptype` bug caught by
+            # test_recurring_precondition_sweep_fire_when.py.)
+            gate_kind = "fire_when" if failed[0].predicate_id == FIRE_WHEN_PID else "precondition"
+
+            # ── SHELVE TRACE (, 2026-07-31) ────────────────────────────
+            # Advancing lastAchievedAt is NOT an achievement — this sweep never
+            # touches achievedCount. But the goal record afterwards is
+            # INDISTINGUISHABLE from one that genuinely closed: lastAchievedAt is
+            # fresh and `last_outcome_origin` still reads whatever the last REAL
+            # close wrote (recurring-close.sh is its only writer), so a stale
+            # "genuine" sits beside a fresh timestamp and reads as a recent genuine
+            # close. Discriminating without these fields needs TWO readings of
+            # achievedCount across time; a single read cannot do it. Measured on
+            # : lastAchievedAt advanced ~40h (>=5 intervals) while
+            # achievedCount sat at 91, and a goal addendum written off that record
+            # inferred "roughly 11 genuine deep closes with zero evidence" from what
+            # was actually zero closes. Same class as rb-245 / the frozen-numerator
+            # trap — a field that MOVES read as proof of an event a different field
+            # says did not happen.
+            # Single-read discriminator this enables:
+            #     lastAchievedAt == last_shelved_at  =>  shelved, not achieved
+            #
+            # WRITE ORDER IS LOAD-BEARING (). The trace is written FIRST
+            # and lastAchievedAt LAST. These are three separate subprocess writes
+            # with no transaction around them, so a crash — or a daemon failure on
+            # write 2 of 3 — can land any PREFIX of them:
+            #   trace-LAST (the original order): lastAchievedAt lands fresh while
+            #     last_shelved_at still holds a PRIOR value, so the discriminator
+            #     reads NOT-EQUAL => "genuine close". That is the exact false
+            #     reading this trace exists to prevent, manufactured by the trace's
+            #     own write order. Fail-DANGEROUS.
+            #   trace-FIRST (this order): last_shelved_at lands fresh while
+            #     lastAchievedAt still holds its OLD value, so the discriminator
+            #     reads NOT-EQUAL => "not shelved this cycle" — which is TRUE, the
+            #     advance never landed. Fail-SAFE.
+            # Trace-write failure stays SOFT (logged, never counted as skipped):
+            # resetting overdue_ratio is this sweep's actual contract, and a goal
+            # left un-advanced because its trace could not be written would
+            # re-inflate urgency every cycle — the very trap this script exists for.
+            for _f, _v in (
+                ("last_shelved_at", now_iso),
+                ("last_shelve_reason", f"{gate_kind}:{failed[0].type}"),
+            ):
+                if not _update_goal_field(goal_id, source, _f, _v, args.dry_run):
+                    sys.stderr.write(
+                        f"recurring-precondition-sweep: shelve-trace {_f} "
+                        f"failed for {goal_id} (advance still attempted)\n"
+                    )
+            if _update_goal_field(goal_id, source, "lastAchievedAt", now_iso, args.dry_run):
                 advanced += 1
-                # Distinguish gate type in the log so the user can tell
-                # whether the failure was a precondition or a fire_when.
-                # PredicateResult exposes its predicate type as `.type`,
-                # not `.ptype` — see core/scripts/predicate.py PredicateResult
-                # dataclass. Bug caught by test_recurring_precondition_sweep_fire_when.py.
-                gate_kind = (
-                    "fire_when" if isinstance(fire_when, dict) and failed[0].type == fire_when.get("type")
-                    else "precondition"
-                )
                 print(
                     f"[precondition-sweep] {('DRY-RUN ' if args.dry_run else '')}"
                     f"advanced {goal_id} ({source}): lastAchievedAt -> {now_iso} "
-                    f"(failing {gate_kind}: {failed[0].type})"
+                    f"(failing {gate_kind}: {failed[0].type}) [shelved, not achieved]"
                 )
             else:
                 skipped += 1

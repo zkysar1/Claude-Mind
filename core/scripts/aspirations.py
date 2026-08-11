@@ -433,6 +433,12 @@ def validate_aspiration(asp):
 
     for goal in asp["goals"]:
         validate_goal(goal)
+        # Structured-check schema (). Deliberately HERE and not in
+        # validate_goal: validate_goal also validates the update_goal candidate,
+        # so running it there would make every status change on the 19 live
+        # goals that already carry schema-invalid checks start failing. This is
+        # the ADD-shaped seam, matching where the daemon calls its own copy.
+        _assert_no_invalid_checks(goal)
 
 def validate_verification(verification, goal_id):
     """Validate the unified verification field on a goal."""
@@ -629,12 +635,28 @@ from gates.prose_verification import (  # noqa: E402
     PROSE_VERIFICATION_MARKERS,  # noqa: F401
     evaluate as _prose_verification_evaluate,
 )
+from gates.check_schema import evaluate as _check_schema_evaluate  # noqa: E402
 
 
 def _check_prose_verification_drift(goal):
     # Delegates to the shared gate, raising ValueError on prose-only drift so
     # validate_goal's existing contract (raise → caller surfaces) is preserved.
     result = _prose_verification_evaluate(goal)
+    if result["would_block"]:
+        raise ValueError(result["message"])
+
+
+def _assert_no_invalid_checks(goal):
+    """Refuse schema-invalid verification.checks ().
+
+    Same single-module / both-sides shape as the prose gate above, for the same
+    guard-547 reason: goal filing is daemon-routed, so a validator that existed
+    only here would be inert on every real filing while its tests stayed green.
+    gates.check_schema is the shared implementation; this is the CLI half.
+    """
+    result = _check_schema_evaluate(goal)
+    if result["warning"]:
+        print(result["warning"], file=sys.stderr)
     if result["would_block"]:
         raise ValueError(result["message"])
 
@@ -1571,19 +1593,35 @@ def cmd_update_goal(args):
             except Exception:
                 pass  # advisory must never break a durable write
 
-        # Cross-lane TAKEOVER guard () — MIRROR of the daemon guard
-        # in mind_api/src/endpoints/aspirations_write.py update_goal() (the
-        # `=== PR 7i in-lock status guards ===` block). guard-742: this logic
-        # lives on BOTH sides. The daemon is the LIVE path for
+        # Cross-lane / cross-BODY TAKEOVER guard (, ) —
+        # MIRROR of the daemon guard in
+        # mind_api/src/endpoints/aspirations_write.py update_goal() (first guard
+        # in the `=== PR 7i in-lock status guards ===` block). guard-742: this
+        # logic lives on BOTH sides. The daemon is the LIVE path for
         # aspirations-update-goal.sh (daemon-only wrapper), but this CLI entry
         # is NOT dead code — the rb-428 sweeps (precondition-defer-recheck,
         # credential-defer-recheck) invoke `aspirations.py update-goal`
         # DIRECTLY as a Python subprocess, bypassing the wrapper. Keep both in
         # sync or the guard is half-applied.
         #
+        # THE MIRROR ABOVE ONLY BECAME TRUE ON 2026-08-06 (). From
+        #  until then this comment asserted a daemon mirror that did
+        # not exist: `_routes_away_from` had exactly one call site in that file,
+        # inside claim(). So the ONLY takeover guard in the system sat on the
+        # path production never takes, and the wrapper's writes were entirely
+        # unguarded. Do not read a "MIRROR of" comment as evidence the mirror is
+        # there — grep the other side. That is the whole mechanism of the
+        # 2026-08-05 incident: claim() refused a goal and the next update-goal
+        # write landed, because only one of the two enforcers existed.
+        #
         # claim()/release() enforce intended_agent ownership; update_goal did
         # not — so claiming a foreign goal was refused while
         # `update-goal <foreign> status in-progress` silently took it over.
+        #
+        # THREE conditions, any one refuses. The SID condition is PRIMARY: a
+        # worker Body and its reducer are BOTH `alpha`, so an agent-name
+        # comparison is FALSE for the two-body collision and only the session id
+        # separates them (foxtrot, 2026-08-06 09:11).
         #
         # SCOPE IS DELIBERATELY NARROW — takeover only (status->in-progress,
         # claimed_by). Do NOT widen to all status writes: the rb-428 sweeps
@@ -1597,11 +1635,69 @@ def cmd_update_goal(args):
                 or field == "claimed_by"):
             _intended = goal.get("intended_agent")
             _caller = os.environ.get("MIND_AGENT", "").strip() or "unknown"
-            if routes_away_from(_intended, _caller):
+            _req_sid = os.environ.get("MIND_SID", "").strip() or None
+            _held_by = goal.get("claimed_by")
+            _held_sid = goal.get("claimed_by_sid")
+
+            # MISSING-SID SEMANTICS — the two missing-sid cases are NOT
+            # symmetric, and collapsing them is how this guard would end up
+            # bypassable. Stated explicitly because the fail direction is a real
+            # trade, not an oversight to be rediscovered later.
+            #
+            #   STORED sid absent (`claimed_by_sid` unset) -> ABSTAIN.
+            #     Pre- records legitimately carry no claim sid.
+            #     Refusing them would wedge real work to close a hole, so the
+            #     sid axis simply does not vote.
+            #
+            #   REQUEST sid absent while a STORED one exists -> REFUSE.
+            #     This is the bypass vector, not an abstention: if the guard
+            #     goes quiet whenever the caller omits the sid, then unsetting
+            #     MIND_SID defeats it entirely. claim() reached the same
+            #     conclusion the hard way — its case 5b (-b) had
+            #     previously ALLOWED a no-sid claim, "which left the guard
+            #     bypassable by omitting a param".
+            #
+            # Residual cost, named rather than hidden: when NEITHER side has a
+            # sid, a same-agent two-body collision is undetectable here and
+            # PASSES. Cross-AGENT collisions need no sid and are still caught by
+            # _agent_conflict. The refusal is loud and carries --cross-lane, so
+            # a hook-timeout that drops MIND_SID surfaces as a clear message
+            # with an escape hatch rather than as silent corruption.
+            _sid_conflict = bool(_held_sid and _req_sid
+                                 and _held_sid != _req_sid)
+            _sid_unprovable = bool(_held_sid and not _req_sid)
+            _agent_conflict = bool(_held_by and _held_by != _caller)
+            _lane_conflict = routes_away_from(_intended, _caller)
+
+            if (_sid_conflict or _sid_unprovable
+                    or _agent_conflict or _lane_conflict):
                 _xl = (getattr(args, "cross_lane", None) or "").strip() or None
                 if not _xl:
-                    print(f"BLOCKED: Goal {goal_id} is routed to "
-                          f"'{_intended}' but the caller is '{_caller}'. "
+                    # REASON ORDER != CHECK ORDER, deliberately. All three
+                    # conditions refuse; this picks which one to NAME. The agent
+                    # fact is named first because the sid wording ("two Bodies
+                    # of X") is only TRUE when the holder and the caller are the
+                    # same agent — on a cross-agent takeover both axes differ,
+                    # and naming the sid there would assert a two-body collision
+                    # that is not happening, sending the next reader after the
+                    # wrong mechanism entirely.
+                    if _agent_conflict:
+                        _why = (f"claimed by '{_held_by}' but the caller is "
+                                f"'{_caller}'")
+                    elif _sid_conflict:
+                        _why = (f"held by session '{_held_sid}' but this "
+                                f"request is session '{_req_sid}' — two "
+                                f"Bodies of '{_caller}'")
+                    elif _sid_unprovable:
+                        _why = (f"held by session '{_held_sid}' but this "
+                                f"request carries NO session id, so it cannot "
+                                f"be shown to be the same Body of '{_caller}'")
+                    else:
+                        _why = (f"routed to '{_intended}' but the caller is "
+                                f"'{_caller}'")
+                    _at = goal.get("claimed_at") or "an unrecorded time"
+                    print(f"BLOCKED: Goal {goal_id} is {_why} (claimed at "
+                          f"{_at}). "
                           f"Refusing the TAKEOVER write (field={field}). Pass "
                           f"--cross-lane <justification> to override (logged "
                           f"to override-bypass-ledger.jsonl). Non-takeover "
@@ -1612,7 +1708,11 @@ def cmd_update_goal(args):
                 try:
                     from _override_helpers import audit_cross_lane_claim
                     audit_cross_lane_claim(
-                        goal_id, _caller, _intended, _xl,
+                        goal_id, _caller,
+                        (f"{_held_by or _intended or 'unknown'}@{_held_sid}"
+                         if (_sid_conflict or _sid_unprovable)
+                         else (_held_by or _intended or "unknown")),
+                        _xl,
                         category=goal.get("category"),
                         title=goal.get("title"))
                 except Exception as _ae:  # ledger failure must not lose the write
@@ -1738,8 +1838,22 @@ def cmd_update_goal(args):
         # never by direct update-goal. This keeps the evidence requirement enforceable.
         if field == "status" and value == "superseded":
             print(f"BLOCKED: Cannot set status=superseded directly on {goal_id}. "
-                  f"Use `aspirations-complete-intent.sh <asp-id>` with intent_satisfaction JSON "
-                  f"listing this goal in superseded_goal_ids.",
+                  f"Pick the route that matches what is true: "
+                  f"(1) THE WHOLE ASPIRATION's intent is satisfied -- "
+                  f"`aspirations-complete-intent.sh <asp-id>` with intent_satisfaction JSON "
+                  f"listing this goal in superseded_goal_ids; note its evidence gate requires "
+                  f"every non-recurring goal in the aspiration to be terminal after the "
+                  f"supersession, so this route is unavailable for ONE goal in a live "
+                  f"aspiration. "
+                  f"(2) THIS GOAL ALONE is moot because a sibling shipped its scope -- write "
+                  f"the supersession evidence (the sibling's goal id + what it delivered) to "
+                  f"outcome_note FIRST, then set status=skipped; that is the order and the "
+                  f"status unblock-parent-status-sweep.py::_mark_skipped already uses for the "
+                  f"structurally identical case. "
+                  f"(3) The work is still WANTED and merely waiting on another goal -- use "
+                  f"status=blocked, NOT skipped: skipped is invisible to the blocked-signal "
+                  f"sweeps (precheck 0.5b.11/0.5b.12 scan status=blocked), so nothing will "
+                  f"resurface it when the dependency lands (guard-1690).",
                   file=sys.stderr)
             sys.exit(1)
 
@@ -2105,6 +2219,26 @@ def cmd_update_goal(args):
         ):
             goal["completed_at"] = datetime.now().isoformat(timespec="seconds")
 
+        # : stamp completed_date on the completion transition. The
+        # daemon twin (aspirations_write.py cascade 6a) carries the identical
+        # logic — port both or the fix is inert under daemon-only (guard-2323).
+        # This cascade stamped completed_at above but NOT completed_date, so
+        # the field recorded WHICH CLOSE PATH RAN rather than whether the goal
+        # completed. 616/4346 completed goals lacked it on 2026-08-10, of which
+        # 383 carry completed_by and are the real closes this stamp fixes; most
+        # of the remainder are `Maintain:` goals, filed status:completed at
+        # creation, which never transition and correctly have no completion
+        # date. Every window-filtered lane/compliance metric filters on this
+        # field. Scoped to "completed" (a skipped/expired goal has no
+        # completion date), idempotent, and DATE-shaped to match the canonical
+        # iteration-close stamp and the 95% date-only live majority.
+        if (
+            field == "status"
+            and value == "completed"
+            and goal.get("completed_date") is None
+        ):
+            goal["completed_date"] = datetime.now().strftime("%Y-%m-%d")
+
         # : stamp completed_by on the completion transition — the
         # completion chokepoint every non-recurring status->completed flows
         # through (recurring is blocked above). Pre-fix only ~11% (174/1609) of
@@ -2200,6 +2334,40 @@ def cmd_update_goal(args):
             _clear_stale_blockers(items, {goal_id})
             goal.pop("claimed_by", None)
             goal.pop("claimed_at", None)
+            # The claim is a TRIPLE — the sid clears with the pair ().
+            # claimed_by_sid postdates this code () and was never
+            # propagated here: before this line the file contained ZERO
+            # occurrences of the field, so a terminal transition through THIS
+            # door left an orphaned sid on an unclaimed goal. The daemon
+            # endpoint is the other door and already paired it at four of its
+            # five sites; a fix wired into only one door is inert on the other
+            # (the shape test_credential_enum_both_doors.py exists to police).
+            #
+            #  fix set B part 2: preserve WHICH BODY closed it before
+            # the sid is popped, so the completing body stays forensically
+            # recoverable. Prefer this process's own MIND_SID — here env IS
+            # correct, because the CLI process IS the session (the daemon
+            # sibling must NOT read env: it is long-lived and carries its
+            # SPAWNER's sid, see _completed_by_sid there). Same env-vs-ctx
+            # asymmetry as `completed_by` (). Fall back to the
+            # claim's sid for an un-hooked launch with no MIND_SID.
+            # Order is load-bearing: compute BEFORE the pop.
+            #
+            # : scope AND idempotency mirror the `completed_by` stamp
+            # above exactly — value=="completed", assign only when unset. The
+            # stamp shipped keyed off the whole terminal set and assigning
+            # unconditionally, so a reopened-and-re-completed goal carried one
+            # completion's agent beside another's session, and a SKIPPED goal
+            # carried a field named completed_by_sid with no completed_by beside
+            # it. completed_at / completed_by / completed_by_sid are now one
+            # coherent first-wins triple. The pop stays unconditional: the claim
+            # triple clears at EVERY terminal transition (guard-151).
+            if value == "completed" and not goal.get("completed_by_sid"):
+                _cbs = (os.environ.get("MIND_SID", "").strip()
+                        or goal.get("claimed_by_sid"))
+                if _cbs:
+                    goal["completed_by_sid"] = _cbs
+            goal.pop("claimed_by_sid", None)
         recompute_progress(asp)
         items[asp_idx] = asp
         _write_live_under_lock(items, f"update-goal {goal_id} {field}")

@@ -149,6 +149,20 @@ working_memory_pruning:
     knowledge_debt: 15
     known_blockers: 10
     recent_violations: 5
+    spark_capture: 50               # g-306-176: bounded because this slot is
+                                    # reset-surviving — if a reducer's Phase 6.5
+                                    # never consumes it (routine-only window),
+                                    # entries would otherwise accumulate forever.
+    exp_capture: 20                 # g-306-199: same reset-surviving reason as
+                                    # spark_capture, lower cap on purpose — an
+                                    # exp_capture entry carries an execution
+                                    # narrative plus verbatim_anchors, so it is
+                                    # several times the size of a spark, and one
+                                    # is written per EXECUTED goal rather than
+                                    # per spark-worthy insight (which is often
+                                    # zero). 20 covers a long worker run between
+                                    # consolidations without letting an
+                                    # unconsumed slot grow the WM without bound.
   item_stale_minutes:               # Item-level age thresholds
     micro_hypotheses: 180           # 3 hours — unresolved micros
     sensory_buffer: 60              # 1 hour

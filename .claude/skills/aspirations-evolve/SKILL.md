@@ -551,20 +551,126 @@ Trigger evolution check — the system evaluates its own strategy and generates 
            Log: "CONVENTION HEALTH: {convention}/{step} skipped {skipped}/{times_relevant} times — needs clarification"
 
    # 3.5c: Missing convention gap detection
-   # Find guardrails that fire frequently AND are universal/procedural → convention candidates
+   # Find the guardrails that fire MOST and are universal/procedural → convention candidates.
+   #
+   # RANK-BASED, NOT VALUE-BASED (g-115-3098, fixed 2026-08-10). This filter used to
+   # be an absolute `utilization.times_active >= 5`. times_active is a CUMULATIVE,
+   # never-windowed, fleet-wide counter, so on a mature store an absolute threshold
+   # stops discriminating. Measured on world/guardrails.jsonl: 822/1143 active (71.9%)
+   # on 2026-07-25, 862/1315 (65.6%) on 2026-07-27, and 2067/2935 (70.4%) on
+   # 2026-08-10 — where the median times_active was 10, i.e. the threshold of 5 sat at
+   # HALF the median and selected the majority BY CONSTRUCTION. Emitting 2067
+   # "candidates" is operationally identical to emitting none: nothing triages that
+   # list, so the sub-phase produces no signal and its silence reads as "no convention
+   # gaps exist". Pattern signature sig-27 (cumulative-counter-saturation-needs-windowing).
+   #
+   # WHY TOP-N RATHER THAN WINDOWING — and the answer is NOT "windowing is better but
+   # unavailable". WINDOWING THIS COUNTER CANNOT WORK, for a reason that outlives any
+   # telemetry you might add. times_active is incremented by guardrail-check.py on
+   # KEYWORD-SCAN MATCHES, not on genuine fires: the precheck mass-matches tens of rules
+   # every iteration, which is why the top entries sit in the thousands. The framework
+   # already reached this conclusion once and acted on it — core/scripts/weakness-signals.py
+   # computes a windowed baseline-delta over exactly this field, and its guardrail_signals
+   # output was RETIRED from /reflect Step 5.55 consumption (g-115-2141, re-applied by
+   # g-115-2470) with the note that "even a windowed delta carries no genuine-fire
+   # information". Its stated re-add condition is a real-fires field distinct from
+   # keyword-scan matches. That field does not exist, so a windowed 3.5c would be a more
+   # expensive way to rank the same noise.
+   #
+   # So do NOT "upgrade" this sub-phase to windowing on the strength of the saturation
+   # story alone — the saturation is real and the windowing cure is not. What top-N buys
+   # is honest and bounded: it cannot saturate by construction (the candidate count is N
+   # whatever the values grow to), it needs no new telemetry, and it puts a triageable
+   # slate in front of the universal/procedural judgment that actually decides. The
+   # ranking signal remains scan-volume, which is a proxy — that limitation is inherited
+   # from the counter and is not repaired here.
+   #
+   # ORDER IS LOAD-BEARING — rank the whole active store FIRST, take the top N, and
+   # only THEN drop the already-proposed. The reverse (drop-then-rank) refills the
+   # slate from further down the list every pass and eventually proposes the entire
+   # store — the same saturation on a slower clock. Rank-first CONVERGES: once the
+   # genuine head is proposed the sub-phase goes quiet and re-fires only when a new
+   # guardrail climbs into the top N. That quiet is a real measurement; the current
+   # silence is structural.
+   #
    # rb-245 pre-read gate: verify schema before aggregating. If the gate fails,
    # SKIP this sub-phase (3.5d continues). Do NOT --override: fix field paths instead.
+   # The probe covers EVERY field the emission template reads, not just the ranking
+   # key — guard-1665 step 2 (confirm the projection actually returns each field a
+   # filter/template reads). This is what the pre-fix template violated: it read
+   # guard.title (17.3% present), guard.description (0/2935 — the field does not
+   # exist in this schema at all) and guard.when_to_use.conditions (4.7%), so it
+   # would have emitted a null title, the literal string "IF None:" and a null action
+   # for ~92-100% of records had it ever fired.
    Bash: source core/scripts/_paths.sh && bash core/scripts/audit-schema-gate.sh \
            --jsonl-path "$WORLD_DIR/guardrails.jsonl" \
-           --field-names "utilization.times_active"
+           --field-names "utilization.times_active,rule,when_to_use,action_hint"
    Bash: guardrails-read.sh --active
-   FOR EACH guardrail where utilization.times_active >= 5:
-       IF guardrail rule is universal (applies to most goals) AND procedural (a step to perform):
-           Log: "CONVENTION GAP: guardrail {guard.id} fires frequently ({times_active}x) and is procedural — convention candidate"
+   Read core/config/aspirations.yaml → modifiable.convention_learning.promotion_top_n (default 10)
+   #   Read the bound at run time. Never re-hardcode it here (guard-2805).
+   ranked = active guardrails sorted by utilization.times_active DESC
+   candidates = first {promotion_top_n} entries of ranked        # RANK FIRST — see above
+   Log: "CONVENTION GAP SCAN: top {promotion_top_n} of {len(ranked)} active by times_active (range {candidates[0].utilization.times_active}x..{candidates[-1].utilization.times_active}x)"
+   FOR EACH guard in candidates:
+       IF guard rule is universal (applies to most goals) AND procedural (a step to perform):
+           Log: "CONVENTION GAP: guardrail {guard.id} fires frequently ({guard.utilization.times_active}x) and is procedural — convention candidate"
            # Check if already tracked in convention-changes.jsonl
            IF NOT already_proposed(guard.id):
                target = "pre-execution" if rule maps to pre-execution else "post-execution"
-               echo '{"date":"<today>","type":"promote_guardrail","target":"{target}","proposed_step":{"title":"{guard.title}","condition":"IF {guard.when_to_use.conditions}:","action":"{guard.description}"},"source":"evolve-health-audit","source_hypothesis":null,"source_guardrails":["{guard.id}"],"reinforcement_count":1,"confidence":0.7,"status":"pending"}' >> $WORLD_DIR/conventions/convention-changes.jsonl
+               # Emission template reads ONLY fields this schema actually carries
+               # (measured 2026-08-10 over 2935 active records): rule 100%,
+               # when_to_use 100%, action_hint 34.3%. action_hint falls back to rule.
+               step_title     = first 80 chars of guard.rule (append "…" if truncated)
+               step_action    = guard.action_hint if non-empty else guard.rule
+               # Condition must come from a field that carries MEANING. when_to_use is
+               # present on 100% of records but has TWO SHAPES and is usually worthless.
+               # Measured 2026-08-10 over 2937 active records:
+               #     dict, empty shell {"conditions": [], "category": ""}   2720  92.6%
+               #     dict with non-empty conditions                          139   4.7%
+               #     plain STRING of trigger prose                            75   2.6%
+               #     dict, category only                                       3   0.1%
+               # Handle the string shape explicitly — it is real, usable trigger text
+               # (e.g. guard-359, guard-317). A dict-only branch silently refuses it, and
+               # that miss is concentrated exactly where it hurts: 2 of the live top 10.
+               IF guard.when_to_use is a string AND non-empty:
+                   step_condition = "IF " + guard.when_to_use + ":"
+               ELIF guard.when_to_use.conditions is non-empty:
+                   step_condition = "IF " + join(guard.when_to_use.conditions, ", ") + ":"
+               ELIF guard.when_to_use.category is non-empty:
+                   step_condition = "IF category=" + guard.when_to_use.category + ":"
+               ELSE:
+                   step_condition = null        # empty shell — refused below, deliberately
+               # Fail loud rather than appending a degenerate proposal. A bad proposal is
+               # worse than no proposal: 3.5d will happily mature and auto-apply it into a
+               # convention file.
+               #
+               # NON-NULL IS NOT ENOUGH, and this is the trap the fix itself fell into
+               # (measured 2026-08-10 on the live top 10): rendering the whole when_to_use
+               # object as a fallback produced the literal condition
+               # `IF {'conditions': [], 'category': ''}:` for 6 of 10 candidates. Every one
+               # passed a null check and every one was garbage. NEVER let a raw object repr
+               # satisfy this gate — that is the same class as the pre-fix "IF None:",
+               # wearing a non-null disguise. This is exactly what outcome (g) of
+               # g-115-3098 warns about: a candidate COUNT in single digits proves nothing
+               # about proposal CONTENT.
+               IF any of step_title / step_condition / step_action is null or empty:
+                   Log: "CONVENTION GAP: REFUSED to emit proposal for {guard.id} — unusable field (title={step_title!r} condition={step_condition!r} action={step_action!r}). A refusal here is a finding about the GUARDRAIL, not a bug: it means that entry carries no when_to_use trigger metadata and cannot become a convention step until it does."
+                   CONTINUE to the next candidate — do NOT append.
+               echo '{"date":"<today>","type":"promote_guardrail","target":"{target}","proposed_step":{"title":"{step_title}","condition":"{step_condition}","action":"{step_action}"},"source":"evolve-health-audit","source_hypothesis":null,"source_guardrails":["{guard.id}"],"reinforcement_count":1,"confidence":0.7,"status":"pending"}' >> $WORLD_DIR/conventions/convention-changes.jsonl
+   # ACCEPTANCE (g-115-3098 outcome g): judge this sub-phase by the CONTENT of what it
+   # emits, never by the candidate COUNT. A count in single digits proves nothing if
+   # every proposal is null-filled — that was the pre-fix failure mode exactly. The
+   # direct catch metric is the chain OUTPUT artifact: entries in
+   # $WORLD_DIR/conventions/convention-changes.jsonl carrying source="evolve-health-audit"
+   # (guard-1665 step 1b). That count was 0 across the store's entire history at fix time.
+   #
+   # CAPACITY (measured 2026-08-10): pre-execution.md 7 steps, post-execution.md 9 —
+   # against convention_learning.max_steps_per_convention default 8, post-execution is
+   # already OVER and pre-execution has one slot. Deliberate decision, do not "fix" by
+   # raising the cap or displacing a step: 3.5d's existing pending_capacity flag is the
+   # correct behavior. A saturated convention is a real signal that a human should
+   # decide what to REMOVE; auto-raising the cap converts that signal into unbounded
+   # growth (learning-philosophy.md rule 5 — the complexity ratchet).
 
    # 3.5d: Pending proposal review — auto-apply mature proposals
    IF file_exists($WORLD_DIR/conventions/convention-changes.jsonl):
@@ -657,15 +763,20 @@ Trigger evolution check — the system evaluates its own strategy and generates 
      (competence-based); dev-stage >= EXPLOIT can pass while the curriculum contract still blocks,
      so gate on BOTH. (Mirrors the `allow_meta_edits` contract check already used at Step 2's META
      EVAL above.) Log one line: `"FORGE CHECK: curriculum blocks allow_forge_skill at {stage_name} — skipping forge-ready loop"`.
-   - **Forge-ready gap → goal creation**: Read `meta/skill-gaps.yaml`. For EACH gap whose status is
-     NOT terminal — terminal set is `{forged, dismissed, satisfied-by-extension}`:
+   - **Forge-ready gap → goal creation**: Read `meta/skill-gaps.yaml`. For EACH gap whose status
+     does NOT suppress forging — suppressing set is the three TERMINAL statuses
+     `{forged, dismissed, satisfied-by-extension}` plus the NON-terminal `deferred-to-goal`:
      - `forged` — a skill was created (`/forge-skill` Step, sets it + a `forged-skills.yaml` entry).
      - `dismissed` — explicitly declined (`/forge-skill` sets this; see its "Set gap `status: dismissed`").
      - `satisfied-by-extension` — the capability shipped by EXTENDING an existing script/skill rather
        than forging a new one. A legitimate and often preferable outcome (implementation-discipline:
        no single-use abstractions), and the honest label when nothing was in fact forged.
+     - `deferred-to-goal` — **not terminal.** A resolution path is DECIDED and tracked by an open
+       goal named in the gap's `resolution_tracked_by` field. Forging is wrong (the capability is
+       not missing in the shape a new skill would fill), but nothing has shipped either, so no
+       terminal status is honest yet. This status carries a re-check obligation — see below.
 
-     Test the whole SET, never `status != "forged"` alone. Every non-excluded terminal status makes
+     Test the whole SET, never `status != "forged"` alone. Every non-excluded suppressing status makes
      its gap re-qualify as forge-ready on EVERY evolve pass, forever: the forge goal gets re-filed,
      the goal-duplication gate blocks it on the completed original via `origin_signal_completed`, and
      the pass burns the same dead-end investigation again. Observed 2026-07-27 on gap-026, whose
@@ -675,11 +786,62 @@ Trigger evolution check — the system evaluates its own strategy and generates 
      caught it either. `dismissed` has the identical hole and is only latent because no gap
      currently carries it.
 
-     When adding a new terminal status anywhere, add it HERE and to the sibling filter in
-     `aspirations-spark/SKILL.md` Phase 6.5 (same forge block, same defect) — the two are the only
-     readers of gap status, and they must agree. (guard-821 is the reinforcing rule: it already
-     treats "set a terminal status with a resolution note" as the way to stop re-qualification; this
-     makes the reader honor every such status, not just one.)
+     **`deferred-to-goal` re-check (MANDATORY — a deferral must not suppress forever).** On seeing
+     this status, probe its tracker before honoring it:
+     `Bash: aspirations-query.sh --goal-field id "{gap.resolution_tracked_by}" --full`
+     — `--goal-field id`, NOT `goal_id`. The output projection RENAMES the record key `id` to
+     `goal_id`, but only `id` is queryable, so querying the name you see in the output returns a
+     silent, plausible-looking 0 hits (measured 2026-08-01: `goal_id` → 0 rows, `id` → 1 row).
+     Then: `resolution_tracked_by` ABSENT or empty → the deferral names nothing to re-check and so
+     could never self-clear; treat it as MALFORMED, set the gap back to `registered`, note why, and
+     evaluate forge criteria normally. This is the ONE case that fails OPEN, deliberately — a
+     suppression with no expiry path is strictly worse than one re-filed goal. Tracker NAMED but the
+     probe ERRORS or returns 0 rows → WARN + SKIP, failing CLOSED (guard-487; an unreadable tracker
+     is not a dead one, and a spurious re-file does not self-heal). Tracker `skipped`/`expired` →
+     the deferral is VOID: set the gap back to `registered`, note why, and evaluate forge criteria
+     normally. Tracker `completed` → set `satisfied-by-extension` and skip. Tracker still open →
+     skip; the deferral is live.
+
+     **WHY this status exists (g-115-4457, measured 2026-08-01).** gap-028's description had carried
+     an explicit DO-NOT-FILE directive naming its tracker (g-115-3767) since 2026-07-28, and a forge
+     goal was filed anyway. Every suppression gate in this step reads STATUS or GOAL RECORDS; none
+     reads the gap's own description — which is where that decision had to go, because no status
+     value fit "resolution decided, tracker still open". The dedup probes were not wrong: they
+     correctly found no duplicate, BECAUSE the prior decision was to file nothing. Absence of a forge
+     goal was the EVIDENCE OF THE DECISION, and the sweep read it as evidence of starvation. A prose
+     disposition that no reader reads is not a disposition — give the decision a field, or it does
+     not exist.
+
+     **The status vocabulary is DECLARED in `core/config/skill-gaps.yaml` → `gap_statuses`
+     (g-115-3517, 2026-08-02).** That block is the authoritative source; the set named above is
+     an inline copy kept for its explanations, which guard-426 permits only with a pointer to
+     the source and a check that diffs the copy against it. Both now exist: declare a new status
+     THERE first (with a writer, per guard-334, then sweep `meta/skill-gaps.yaml` for records
+     that should already carry it and report the count), and `skill-gaps-validate.py` will
+     refuse any gap whose status is undeclared. Until 2026-08-02 there was no declaration at all,
+     which is why `satisfied-by-extension` could be coined ad hoc and go unnoticed here.
+
+     When adding a new suppressing status anywhere, add it to ALL THREE readers, which must
+     agree: HERE, the sibling filter in `aspirations-spark/SKILL.md` Phase 6.5 (same forge
+     block, same defect), AND `core/scripts/coordination_merge.py`
+     (`_SKILL_GAP_TERMINAL` / `_gap_status_rank`) — the cross-box merge handler. Agreement is
+     no longer honor-system: `test_skill_gaps_hardening.py` pins all three against the
+     declaration (`test_terminal_set_matches_declared_vocabulary`,
+     `test_forge_filters_name_every_declared_suppressing_status`), so a copy left un-updated
+     fails the suite instead of silently mis-classifying gaps.
+
+     THREE, not two. Until 2026-08-01 this sentence read "the two are the only readers of gap
+     status", and the spark sibling said the same thing — two copies of one unverified claim,
+     which is not corroboration even though it reads like it. The merge handler was found only
+     by grepping the VALUE across `core/` and `mind_api/` (g-115-4457). The consequence of
+     missing it is not cosmetic: a status absent from the merge handler loses to a peer box
+     still holding the old value, silently reverting the decision and re-arming the exact loop
+     the new status was added to prevent. VERIFY BY GREP, not by this list — a fourth reader
+     added later will be just as invisible to this sentence as the third was.
+     (guard-2283: a document's claim about its own completeness is an unverified claim.
+     guard-821 is the reinforcing rule: it already treats "set a status with a resolution
+     note" as the way to stop re-qualification; this makes the reader honor every such
+     status, not just one.)
      - **Registry cross-check (g-326-09 incident, 2026-07-16)**: before trusting `gap.status`,
        grep `world/forged-skills.yaml` for `gap_ref: {gap.id}`. If a forged skill already
        references this gap, the gap's `status: registered` is STALE (another agent forged it;
@@ -756,8 +918,29 @@ avg_quality = parse summary.avg_overall
 IF avg_quality > 0.80 AND summary.total_skills_evaluated >= 5:
     Bash: meta-read.sh skill-quality-strategy.yaml
     IF review_threshold < 0.60:
-        Bash: meta-set.sh skill-quality-strategy.yaml review_threshold 0.60 \
-            --reason "Average quality {avg_quality} supports higher bar"
+        # DEAD-END GUARD (g-115-4938, 2026-08-04). This write is a meta-strategy
+        # threshold change like any other, so it needs the SAME guard Step 0.7
+        # already applies to its own writes — it did not have one, and the value
+        # it hardcodes is a REGISTERED dead end. Measured this pass: de-004
+        # (skill-quality-strategy.yaml / review_threshold / 0.6) carries
+        # failure_pattern "Rolled back 2 times" and times_matched 5, while the
+        # live file sits at review_threshold 0.5 and avg_quality reads 0.9706 —
+        # so the unguarded branch fires EVERY evolve pass and had already made
+        # five attempts at a twice-reverted value. The guard is the fix; do NOT
+        # "fix" this by raising the literal, which only renames the dead end.
+        # Reuse Step 0.7's active_dead_ends if that step ran; re-read otherwise
+        # (it is SKIPPED whole when curriculum-contract-check.sh denies
+        # allow_meta_edits, so the variable cannot be assumed present).
+        Bash: meta-dead-ends.sh read --active
+        active_dead_ends = parse result as JSON array
+        dead_end_match = check_dead_ends(active_dead_ends,
+                             "skill-quality-strategy.yaml", "review_threshold", 0.60)
+        IF dead_end_match is not null:
+            Bash: meta-dead-ends.sh increment {dead_end_match.id} times_matched
+            Log: "SKILL CURATION BLOCKED: review_threshold = 0.60 hits dead end {dead_end_match.id}: {dead_end_match.failure_pattern} — bar left at {review_threshold}"
+        ELSE:
+            Bash: meta-set.sh skill-quality-strategy.yaml review_threshold 0.60 \
+                --reason "Average quality {avg_quality} supports higher bar"
 ```
 
 ### Skill Discovery Audit (Step 9.5.5 — after Skill Curation)
@@ -887,9 +1070,66 @@ three fields above were verified present.)
 
 `bash core/scripts/pattern-signatures-read.sh --active` → get active patterns as JSON. For each pattern:
 1. Check calibration rules from the `calibration_protocol` section (live schema):
-   - `outcome_stats.accuracy < 0.80 AND outcome_stats.total >= 3` → flag for condition tightening (was false_positives/times_triggered > 0.20) <!-- DRIFT-EXEMPT: rename-documentation -->
-   - `outcome_stats.total == 0 AND sessions_since_creation > 10` → flag as stale, consider loosening
+   - **`last_matched is not None` AND** `outcome_stats.accuracy < 0.80 AND outcome_stats.total >= 3` → flag for condition tightening (was false_positives/times_triggered > 0.20) <!-- DRIFT-EXEMPT: rename-documentation -->
+   - **`last_matched is not None` AND** `outcome_stats.total == 0 AND sessions_since_creation > 10` → flag as stale, consider loosening
    - `outcome_stats.confirmed >= 5 AND outcome_stats.accuracy >= 0.90` → graduate to `validated`, increase weight
+
+   <!-- The `last_matched is not None` gate on rules 1 and 2 (g-115-3516 SITE 2,
+   applied 2026-08-10 by echo, hostname cc-03, uname -r 6.8.0-136-generic).
+   Rule 4 below already carries the g-115-1441 caveat that a count-like field
+   reading low means MISSING TRACKING, not pattern failure; rules 1 and 2 read
+   the SAME counters with no equivalent gate. That asymmetry is not theoretical
+   — a calibration pass flagged sig-49 for TIGHTENING when it had never been
+   measured at all. `last_matched` is the recorder's own unconditional stamp, so
+   it is a proof-of-execution discriminator already present in the record (no new
+   plumbing). Measured this run: non-null on 50 of 94 records. guard-1641 is the
+   general class. -->
+
+   <!-- GRADUATE (rule 3) IS EXPOSED, AND THE PROPOSED FIX IS REFUTED — MEASURED,
+   DO NOT BUILD IT. A seeder setting BOTH total=5 and confirmed=5 auto-satisfies
+   rule 3 and reaches validation_status=validated with ZERO independent tests.
+   g-115-3516's appendix proposed gating GRADUATE on `outcome_stats.total >
+   sample_size` (a seeded record has total == sample_size by construction) and
+   explicitly asked that the sample_size population be surveyed BEFORE wiring it,
+   because "a graduate-gate that silently passes when sample_size is absent would
+   be worse than none." That survey is now done and it comes back negative on
+   BOTH halves the caveat named:
+     * PRESENT on only 17 of 94 records (18%) — absent on 82% of the corpus.
+     * NOT consistently meant as formation-instance-count — sig-12 carries
+       sample_size=81 against outcome_stats.total=3.
+   So `total > sample_size` cannot be the graduate discriminator. Fail-closed on
+   an absent field (guard-487) would refuse to graduate 82% of the store; fail-open
+   restores the exact hole. The durable fix is SITE 1 (stop `add` from seeding
+   counters at all), after which total>0 is itself proof of recording — see the
+   guard-2475 constraint recorded on g-115-3516 before attempting it. -->
+
+   <!-- ⚠ RULE 4's STATED REASON IS FALSIFIED — ITS CONCLUSION STILL STANDS.
+   Re-measured 2026-08-10 (echo, cc-03, `--all`): the strikethrough below says
+   "Pattern-signature records have no `utilization` block at all" and enumerates a
+   field list without it. That is no longer true. 86 of 94 records carry a
+   `utilization` block and ALL 86 carry `retrieval_count` (keys: retrieval_count,
+   times_matched, last_retrieved; values to 386); 68 of 73 ACTIVE records have it.
+   The record count in that note is also stale — 19 then, 94 now (73 active).
+   The rule-4 predicate as written would fire on 22 active records TODAY.
+   DO NOT read that as licence to un-retire the rule. Its CONCLUSION — never prune
+   on `total < 2` unless outcome-recording is WIRED for that pattern — is unchanged
+   and still load-bearing, because a low total still reflects missing tracking
+   rather than pattern failure. What changed is only the reason: the rule is no
+   longer *unmeasurable*, it is *unsafe*. That distinction is why this note exists
+   — the next reader who checks the schema will find `utilization` present,
+   conclude the strikethrough is stale, and un-retire a rule that would prune 22
+   patterns on missing tracking. A right conclusion resting on a falsified premise
+   fails in exactly that direction (guard-1922, guard-1641). -->
+
+   <!-- Not applied here, deliberately: SITE 1 (refuse seeded counters in `add`).
+   The live path is the daemon `/v1/store/append`, NOT the cited
+   `core/scripts/pattern-signatures.py:155-161` (guard-2323), and `set_field`
+   calls the SAME `spec.validate(ctx, rec)` over the WHOLE record — so adding the
+   refusal to the shared spec freezes every record that already has total>0:
+   measured 55 of 94 (58.5%), which would break the validation_status transitions
+   this very block performs. That is guard-2475 exactly. It needs a create-only
+   validation hook, which does not exist today. -->
+
    - ~~`utilization.retrieval_count >= 10 AND outcome_stats.total < 2`~~ → **INERT, DO NOT USE (g-029-82, 2026-07-30).** Pattern-signature records have no `utilization` block at all: the 19 live records carry exactly `category, conditions, confused_with, created, description, expected_outcome, id, last_matched, name, outcome_stats, retrieval_cues, separation_markers, status, tags, validation_status`. The rule appears to have conflated TREE-NODE schema (tree nodes DO carry `retrieval_count` / `utility_ratio`) with pattern-signature schema, so it could never fire. There is no retrieval counter on these records, so the retrieval-VOLUME half is unmeasurable; the never-matched half is already covered by rule 2 above (`outcome_stats.total == 0 AND sessions_since_creation > 10`), and `last_matched` is the nearest real field. MUST NOT be used to justify pruning until a retrieval counter exists. The retained guidance below remains correct in spirit: **PRUNE ONLY IF outcome-recording is WIRED** for this pattern (it is a meta-pattern recorded via hypothesis resolution per guard-575, OR a `sig-NNN-auto-detect.py` auto-probe exists). If NO recording mechanism exists, `total < 2` reflects MISSING TRACKING, not pattern failure → RETAIN (a high `retrieval_count` is positive reference-value signal — LLMs keep finding it relevant). Audit 2026-06-14 (g-115-1441): 14/19 active patterns are unwired and ZERO auto-probe scripts exist, so this rule false-flags valuable reference patterns unless the wiring check gates it.
 2. For flagged patterns: propose specific condition changes
 3. Update `validation_status` based on current stats

@@ -46,9 +46,12 @@
 #   deferrable:  pending-questions-sweep, recurring-precondition-sweep,
 #                parent-supersession-sweep, unblock-parent-status-sweep,
 #                defer-drift-check, reason-less-blocked-check,
-#                blocked-signal-resolution-check,
+#                blocked-signal-resolution-check, dependency-cycle-check,
+#                hypothesis-terminal-goal-check,
 #                fresh-eyes-cadence, fresh-eyes-program-cadence,
-#                felt-sense-cadence, health-regression-cadence,
+#                strategic-scan-cadence,
+#                felt-sense-cadence, l1-skew-cadence, scar-tissue-cadence,
+#                health-regression-cadence,
 #                curriculum-cadence, evolution-cadence
 #
 # Unknown sweep names default to medium tier (conservative — less likely to
@@ -105,7 +108,7 @@ sweep_tier() {
             echo "always-run" ;;
         aspirations-recover-recurring|monitor-stale-check|precheck-eval|blocker-recheck|defer-recheck|precondition-defer-recheck|recurring-starvation-check)
             echo "medium" ;;
-        pending-questions-sweep|recurring-precondition-sweep|parent-supersession-sweep|unblock-parent-status-sweep|routing-audit-target-status-sweep|credential-defer-recheck|defer-drift-check|reason-less-blocked-check|blocked-signal-resolution-check|reclaim-defer-audit|reclaim-user-participant-audit|human-blocked-defer-join|fresh-eyes-cadence|fresh-eyes-program-cadence|fresh-eyes-tree-cadence|felt-sense-cadence|l1-skew-cadence|health-regression-cadence|curriculum-cadence|evolution-cadence)
+        pending-questions-sweep|recurring-precondition-sweep|parent-supersession-sweep|unblock-parent-status-sweep|routing-audit-target-status-sweep|credential-defer-recheck|defer-drift-check|reason-less-blocked-check|blocked-signal-resolution-check|dependency-cycle-check|hypothesis-terminal-goal-check|reclaim-defer-audit|reclaim-user-participant-audit|human-blocked-defer-join|fresh-eyes-cadence|fresh-eyes-program-cadence|fresh-eyes-tree-cadence|strategic-scan-cadence|felt-sense-cadence|l1-skew-cadence|scar-tissue-cadence|health-regression-cadence|curriculum-cadence|evolution-cadence)
             echo "deferrable" ;;
         *)
             # Unknown sweep name — surface to stderr so a missing registration

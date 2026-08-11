@@ -278,6 +278,41 @@ def classify(text, failed, chunks=None):
     reasons = []
 
     for i, chunk in enumerate(chunks or []):
+        # NUL-BYTE CORRUPTION CHECK (). Deliberately NOT an elif — a
+        # chunk can be BOTH corrupted and aborted, and the two carry OPPOSITE
+        # remedies, so both reasons must surface.
+        #
+        # WHY THIS IS ITS OWN CHECK. The measured incident is written up in the
+        # silent-zero comment directly below ("the log had 1532 NUL bytes"), but
+        # nothing ever TESTED for them: the evidence was recorded in prose and
+        # left unmeasured. Both existing branches can miss it. `_looks_aborted`
+        # returns False without progress output, and the silent-zero branch is
+        # skipped the moment the log still contains a parseable "N passed" —
+        # which a partially-overwritten log usually does. Verified on this box:
+        # a log of b"...\x00\x00\x00\x00 [100%]\n5 passed\n" satisfies the
+        # has-counts regex, so it passes BOTH branches and certifies GENUINE.
+        # A false GENUINE is strictly worse than a false INVALID: INVALID at
+        # least refuses to be trusted.
+        #
+        # THE REMEDIES DIVERGE, and that is the actionable half. The documented
+        # response to a bad verdict is to climb the chunk ladder (8-12-16-20-24-28)
+        # and re-run. Against corruption that is useless AND destructive: the
+        # re-run writes into the same default log dir and OVERWRITES the only
+        # artifact that could diagnose it. So this reason names the other
+        # remedy explicitly — move the logs off the synced tree with --out.
+        #
+        # NULs survive `read_text(encoding="utf-8", errors="replace")` because
+        # 0x00 is VALID UTF-8; `errors="replace"` only rewrites invalid
+        # sequences. Measured on this box before relying on it, so this check
+        # needs no signature change and no second read of the file.
+        nul = chunk.count("\x00")
+        if nul:
+            reasons.append(
+                "chunk %02d log contains %d NUL byte(s) -- the log was REWRITTEN "
+                "while the runner was reading it, so its counts describe a file "
+                "that no longer exists. This is CORRUPTION, not contention: do "
+                "NOT climb the chunk ladder (a re-run overwrites this evidence). "
+                "Re-run with --out pointed OUTSIDE the synced tree." % (i, nul))
         if _looks_aborted(chunk):
             tally = _progress_tally(chunk)
             reasons.append(
@@ -401,8 +436,34 @@ def _owning_goals(path, root):
     OPEN statuses only. A COMPLETED goal that named this test is not an owner:
     it means the test was fixed and has regressed, which is precisely a thing to
     file rather than suppress.
+
+    Returns ``(owners, rows_scanned)``. **rows_scanned is not a statistic, it is
+    the instrument-failure discriminator.** Both `except Exception: continue`
+    and `if r.returncode != 0: continue` below fall through to an empty list,
+    which the caller used to render as "owner: NONE -- no goal in either queue
+    names this test" -- byte-identical to a true negative, so a daemon-unreachable
+    query silently authorises a duplicate filing. Measured 2026-08-01 (zeta,
+    cc-02): with `subprocess.run` stubbed to rc=1 (the routine
+    daemon-unreachable shape -- and no-python-cli-fallback.md means there is NO
+    CLI fallback beneath it) this returns []; the same call against the live
+    instrument returns 10 goals. An open queue of ~915 goals returning zero rows
+    is never a true negative, so the caller reports UNKNOWN rather than UNOWNED.
+    rb-245 exactly: verify the instrument answered before believing its zero.
+
+    Owner rows are 4-tuples ``(goal_id, status, title, strength)``. **strength
+    exists because a shared name is not ownership (guard-1801).** `_stem_forms`
+    widens the QUERY by stripping `test_` and this function widens the FIELD to
+    the whole description, and together they turn a filename lookup into a topic
+    search: measured the same turn, `test_fleet_config_parity.py` matched TEN
+    open goals, of which exactly one (g-115-3803) owns the failing tests -- the
+    rest merely discuss the subsystem. Over-match is the silent direction, since
+    a spurious owner suppresses ALL filing and exits 0 printing "every genuine
+    red already has an owning goal". So the full `test_<stem>` form wins
+    outright when it matches anything, and the stripped form is consulted ONLY
+    when the full form finds nothing -- those hits are labelled `weak` and the
+    caller prints them as needing verification rather than as settled ownership.
     """
-    from _runtime_bash import BASH  # rb-1472: never a bare "bash" argv[0]
+    from _runtime_bash import bash_cmd  # guard-580 (never bare "bash") + guard-581 (.as_posix())
     # Boundary-aware, NOT a bare substring. The stripped form of a short name is
     # a common English fragment: `test_thing.py` yields "thing", which
     # substring-matches "nothing", "something", "anything". That direction of
@@ -413,14 +474,20 @@ def _owning_goals(path, root):
     # The left class excludes letters/digits but DELIBERATELY allows `_`: the
     # stripped form is normally preceded by exactly that, in `test_<form>`.
     # Excluding `_` on the left would break the very match this form exists for.
-    pats = [re.compile(r"(?<![A-Za-z0-9])" + re.escape(f.lower()) + r"(?![A-Za-z0-9_])")
-            for f in _stem_forms(path)]
-    seen, out = set(), []
+    def _pat(form):
+        return re.compile(r"(?<![A-Za-z0-9])" + re.escape(form.lower())
+                          + r"(?![A-Za-z0-9_])")
+
+    forms = _stem_forms(path)
+    full_pat = _pat(forms[0])                       # test_<stem> -- exact
+    weak_pats = [_pat(f) for f in forms[1:]]        # <stem> -- subsystem-wide
+    seen, strong, weak = set(), [], []
+    rows_scanned = 0
     for status in OPEN_STATUSES:
         try:
             r = subprocess.run(
-                [BASH, str(SCRIPT_DIR / "aspirations-query.sh"),
-                 "--goal-status", status, "--full"],
+                bash_cmd(SCRIPT_DIR / "aspirations-query.sh",
+                         "--goal-status", status, "--full"),
                 capture_output=True, text=True, cwd=str(root), timeout=120)
         except Exception:
             continue
@@ -432,15 +499,24 @@ def _owning_goals(path, root):
             continue
         if isinstance(rows, dict):
             rows = rows.get("goals") or rows.get("results") or []
-        for g in rows or []:
+        rows = rows or []
+        rows_scanned += len(rows)
+        for g in rows:
             gid = g.get("goal_id") or g.get("id")
             if not gid or gid in seen:
                 continue
             hay = ((g.get("title") or "") + " " + (g.get("description") or "")).lower()
-            if any(p.search(hay) for p in pats):
+            row = (gid, g.get("status") or "?", (g.get("title") or "")[:64])
+            if full_pat.search(hay):
                 seen.add(gid)
-                out.append((gid, g.get("status") or "?", (g.get("title") or "")[:64]))
-    return out
+                strong.append(row)
+            elif any(p.search(hay) for p in weak_pats):
+                seen.add(gid)
+                weak.append(row)
+    # The full form wins outright when it matches ANYTHING; the stripped form is
+    # a fallback, never a supplement (guard-1801 -- a shared name is not ownership).
+    hits, strength = (strong, "exact") if strong else (weak, "weak")
+    return [(gid, st, ti, strength) for gid, st, ti in hits], rows_scanned
 
 
 def _recent_commits(path, root, days=7):
@@ -460,6 +536,27 @@ def _solo(path, root, env):
     The discriminator that falsifies contention in a single measurement
     (guard-1448): with no competing processes there is nothing to contend for,
     so a failure that survives is the code's.
+
+    A RUN THAT EXECUTED NO TESTS IS NOT A GREEN. It reaches `_parse_counts` as
+    (0, 0, 0) -- byte-identical to a clean pass -- and the caller's `f == 0`
+    branch then prints "-> ENVIRONMENTAL (do not file)" and drops a real red on
+    the floor. Measured 2026-08-01 (zeta, hostname cc-02, uname -r
+    6.8.0-136-generic): `_parse_counts("")`, `_parse_counts("bash: pytest:
+    command not found")` and `_parse_counts("no tests ran in 0.01s")` all return
+    (0, 0, 0), and a live `_solo` on a file pytest collects nothing from returns
+    (0, 0, None) beside a raw pytest rc=5. Every one of those non-measurements
+    lands in the single bucket that suppresses filing.
+
+    So a measurement needs BOTH halves: pytest exited with a code meaning "I ran
+    your tests" (0 = all passed, 1 = some failed; 2/3/4/5 are interrupted,
+    internal error, usage error and collected-nothing), AND the log accounts for
+    at least one test. Anything else returns the error shape, which the caller
+    already routes to the COULD-NOT-RUN bucket and counts toward rc=1.
+
+    This is guard-2166 in the small -- an empty population must return the
+    UNSAFE verdict, never the safe one -- and classify() already refuses the
+    identical laundering one step upstream, calling an unparseable log CONTENDED
+    rather than clean.
     """
     try:
         r = subprocess.run([sys.executable, "-m", "pytest", path, "-q"],
@@ -468,6 +565,10 @@ def _solo(path, root, env):
     except Exception as exc:
         return None, None, str(exc)
     p, f, e = _parse_counts(r.stdout or "")
+    if r.returncode not in (0, 1) or (p + f + e) == 0:
+        return None, None, (
+            "pytest rc=%d accounted for %d test(s) -- executed nothing, so this "
+            "is not a measurement" % (r.returncode, p + f + e))
     return p, f + e, None
 
 
@@ -478,14 +579,29 @@ def _print_ownership(path, root, indent="      "):
     indistinguishable from "the check did not run", which is how a GENUINE
     failure sat unowned for a day while run-full-suite-after-deep-code.md told
     every reader it was tracked.
+
+    Returns the owner rows, or **None when the ownership query itself did not
+    answer** -- which is a third outcome, not a flavour of "no owner". The
+    caller must not fold None into the unowned bucket: unowned means file it,
+    unknown means the instrument is broken and nothing has been established.
     """
-    owners = _owning_goals(path, root)
+    owners, rows_scanned = _owning_goals(path, root)
     commits = _recent_commits(path, root)
-    if owners:
-        for gid, status, title in owners:
-            print("%sowner: %s [%s] %s" % (indent, gid, status, title))
+    if rows_scanned == 0:
+        # Not "nobody owns this" -- "nobody was asked". Both failure paths in
+        # _owning_goals return an empty list, so without this branch a
+        # daemon-unreachable query reads as a clean true negative.
+        print("%sowner: UNKNOWN -- ownership query returned no goals at all "
+              "(instrument failure, not evidence)" % indent)
+        owners = None
+    elif owners:
+        for gid, status, title, strength in owners:
+            note = "" if strength == "exact" else \
+                "  <- WEAK match on the subsystem name, not the test file; verify"
+            print("%sowner: %s [%s] %s%s" % (indent, gid, status, title, note))
     else:
-        print("%sowner: NONE -- no goal in either queue names this test" % indent)
+        print("%sowner: NONE -- no goal in either queue names this test "
+              "(%d open goal(s) scanned)" % (indent, rows_scanned))
     if commits:
         print("%srecent commits (7d): %s" % (indent, commits[0]))
     else:
@@ -547,12 +663,13 @@ def triage(out, root, env):
 
     print("\nStep 2-3: solo re-run + ownership, per candidate")
     genuine_unowned, genuine_owned, environmental, errored = [], [], [], []
+    ownership_unknown = []
     for path in candidates:
         n = blob.count("FAILED " + path)
         print("\n  %s (%d failure line(s) in the run)" % (path, n))
         p, f, err = _solo(path, root, env)
         if err is not None:
-            print("      solo: COULD NOT RUN (%s) -- not classified" % err[:80])
+            print("      solo: COULD NOT RUN (%s) -- not classified" % err[:120])
             errored.append(path)
             continue
         if f == 0:
@@ -561,7 +678,12 @@ def triage(out, root, env):
             continue
         print("      solo: %d passed, %d failed -> GENUINE" % (p, f))
         owners = _print_ownership(path, root)
-        (genuine_owned if owners else genuine_unowned).append(path)
+        if owners is None:
+            # Instrument failure. NOT unowned -- nothing was established, so this
+            # candidate is unclassified and must keep the exit code non-zero.
+            ownership_unknown.append(path)
+        else:
+            (genuine_owned if owners else genuine_unowned).append(path)
 
     print("\n" + "=" * 66)
     print("TRIAGE RESULT: %d environmental | %d genuine-owned | %d genuine-UNOWNED"
@@ -569,11 +691,15 @@ def triage(out, root, env):
     if errored:
         print("  %d candidate(s) could not be re-run -- unclassified: %s"
               % (len(errored), ", ".join(errored)))
+    if ownership_unknown:
+        print("  %d genuine red(s) with an UNANSWERED ownership query -- "
+              "unclassified, do NOT read as unowned: %s"
+              % (len(ownership_unknown), ", ".join(ownership_unknown)))
     if genuine_unowned:
         print("\nFILE THESE -- genuine, reproduce solo, and no goal names them:")
         for path in genuine_unowned:
             print("  %s" % path)
-    elif not errored:
+    elif not errored and not ownership_unknown:
         # These two are NOT the same finding and must not share a sentence.
         # "every genuine red is owned" says reds exist and are tracked; "none
         # reproduced" says the run's failures were not real. Collapsing them
@@ -586,7 +712,7 @@ def triage(out, root, env):
                   "environmental, so the run's failures were not regressions."
                   % len(environmental))
     print("=" * 66)
-    return 1 if (genuine_unowned or errored) else 0
+    return 1 if (genuine_unowned or errored or ownership_unknown) else 0
 
 
 def main(argv=None):

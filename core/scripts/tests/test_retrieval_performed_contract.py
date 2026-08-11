@@ -107,7 +107,7 @@ def test_real_session_is_not_dismissed_as_no_signal():
     short-circuited by the retrieval_performed branch. Reverting the predicate
     to `not session.get(...)` makes this fail.
     """
-    verdict, reason, _method, _n = gate._evaluate(_real_session(), "g-test-001")
+    verdict, reason, _method, _n, _p = gate._evaluate(_real_session(), "g-test-001")
     assert "no signal" not in reason and "no-retrieval stub" not in reason, (
         f"REGRESSION: a REAL retrieval was dismissed by the retrieval_performed "
         f"branch (reason={reason!r}). Absent means performed — only explicit "
@@ -116,22 +116,22 @@ def test_real_session_is_not_dismissed_as_no_signal():
 
 
 def test_stub_session_is_recognised_as_nothing_to_gate():
-    verdict, reason, _m, _n = gate._evaluate(_stub_session(), "g-test-001")
+    verdict, reason, _m, _n, _p = gate._evaluate(_stub_session(), "g-test-001")
     assert verdict == "pass"
     assert "stub" in reason or "false" in reason.lower()
 
 
 def test_explicit_true_is_treated_as_performed():
     """Legacy sessions carrying an explicit True must not regress to 'stub'."""
-    _v, reason, _m, _n = gate._evaluate(
+    _v, reason, _m, _n, _p = gate._evaluate(
         _real_session(retrieval_performed=True), "g-test-001")
     assert "no-retrieval stub" not in reason
 
 
 def test_stale_session_for_another_goal_still_fails_open():
     """Orthogonal guard — the goal_id mismatch branch must keep precedence."""
-    verdict, reason, _m, _n = gate._evaluate(_real_session("g-other-999"),
-                                             "g-test-001")
+    verdict, reason, _m, _n, _p = gate._evaluate(_real_session("g-other-999"),
+                                                 "g-test-001")
     assert verdict == "pass"
     assert "stale session" in reason
 

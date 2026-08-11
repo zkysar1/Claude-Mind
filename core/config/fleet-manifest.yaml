@@ -81,6 +81,43 @@ expected_resolved:
   STORAGE_BACKEND: own-cloud
   ENVIRONMENT_ID: ayoai-mind
 
+# ── Credential VALUE SHAPE (g-115-3344) ────────────────────────────────────────
+# check (a) reads env-var key NAMES ONLY, so a key that is PRESENT but holds a
+# GARBAGE VALUE passes every dimension above. Live incident 2026-07-26: a ~/.bashrc
+# bug exported the 158-character ERROR TEXT of a failed wslvar call as
+# OPENAI_API_KEY. Key present, toolchain fine, STORAGE_BACKEND resolved correctly —
+# the value was nonsense and nothing looked at it.
+#
+# THE SECRETS CONTRACT ABOVE IS UNCHANGED. The predicate is evaluated ON THE REMOTE
+# NODE; only a VERDICT (ok|too_short|charset|absent) and a LENGTH cross the wire. No
+# value, and deliberately not even a leading prefix — guard-724/1563 mask by default,
+# and nothing here needs one, so none is emitted. Proven by --self-test.
+#
+# SHAPES ARE MEASURED, NOT GUESSED — the guard-892 discipline ("check the name before
+# checking the store") applied to values instead of names. Surveyed on cc-05
+# 2026-08-09 with a derived-only probe: every credential was whitespace-free and each
+# fell in exactly one of the two charset classes below. A guessed shape produces false
+# DRIFT forever, which is the failure this whole file is written to avoid.
+#   token       = ^[A-Za-z0-9_-]+$
+#   token_punct = ^[A-Za-z0-9_./+=:-]+$   (base64-ish secrets carry / + =)
+#
+# min_len sits WELL BELOW each measured length so a vendor lengthening its key never
+# trips it. No max_len and no required prefix, both deliberately omitted: each pins a
+# vendor format that can change without warning, while the charset class alone already
+# catches the incident class — error text contains spaces, and no class admits one.
+# The comment after each entry is the length MEASURED on cc-05, not a requirement.
+value_shape_expectations:
+  ANTHROPIC_API_KEY:          {min_len: 32, charset: token}        # measured 108
+  AWS_ACCESS_KEY_ID:          {min_len: 16, charset: token}        # measured 20
+  AWS_SECRET_ACCESS_KEY:      {min_len: 32, charset: token_punct}  # measured 40
+  MIND_AWS_ACCESS_KEY_ID:     {min_len: 16, charset: token}        # measured 20
+  MIND_AWS_SECRET_ACCESS_KEY: {min_len: 32, charset: token_punct}  # measured 40
+  OPENAI_API_KEY:             {min_len: 32, charset: token}        # measured 51
+  GROQ_API_KEY:               {min_len: 32, charset: token}        # measured 56
+  DEEPINFRA_API_KEY:          {min_len: 24, charset: token}        # measured 32
+  ARC_API_KEY:                {min_len: 24, charset: token}        # measured 36
+  AYO_OPERATOR_KEY:           {min_len: 24, charset: token}        # measured 35
+
 # ── Toolchain floors ───────────────────────────────────────────────────────────
 # node_major 22: the claude-code package declares engines >=22. Incident (3) was the
 # fleet sitting on Node 20 under that floor. claude_min tracks incident (2), the

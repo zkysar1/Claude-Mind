@@ -15,7 +15,25 @@
 #
 # Usage:
 #   bash core/scripts/team-belief-write.sh --about <partner> --belief "<text>" \
-#        [--confidence <0..1>] [--now <iso>]
+#        [--confidence <0..1>] [--domain <focus-domain>] [--now <iso>]
+#
+# --domain () is the OPTIONAL structured focus-domain the belief asserts
+# the partner is working in — pass the partner's observed `current_focus`
+# VERBATIM. It is what makes the belief contradiction-checkable by
+# aspirations-precheck Phase 0-pre.0a (`_belief_contradiction.process_all`
+# evaluates ONLY beliefs carrying a checkable `domain`).
+#
+# THIS FLAG WAS MISSING FROM THIS CASE BLOCK UNTIL 2026-08-03 (alpha, 
+# window). `_team_belief.py` has implemented it since , and
+# fresh-eyes-review Phase 2.6c documents callers passing it — but the catch-all
+# `*) shift;;` below silently discarded it, so every belief written through the
+# ONLY documented path stored `domain: null` and the contradiction detector's
+# candidate set was structurally EMPTY. Its "clean" verdict was vacuous, not
+# negative. Measured: three writes with --domain (foxtrot, bravo, echo) all
+# landed null; wrapper had zero occurrences of `domain`, module had six.
+# (rb-538: multi-layer arg parsers silently drop unknown flags. guard-2172: a
+# wrapper's accepted flags live in its case block ONLY — the SKILL.md pseudocode
+# is not the whitelist.)
 #
 # Values are passed to _team_belief.py via argv and the current list via stdin —
 # never interpolated into a `python -c` source string (guard-165 safe; the
@@ -32,12 +50,13 @@ PROJECT_ROOT="$(cd "$_SELF_DIR/../.." && pwd)"
 source "$PROJECT_ROOT/core/scripts/_paths.sh"
 
 # Value-arg pattern: "${2-}" + safe shift; see team-state-update.sh / _runtime.sh.
-ABOUT=""; BELIEF=""; CONFIDENCE="0.5"; NOW=""
+ABOUT=""; BELIEF=""; CONFIDENCE="0.5"; NOW=""; DOMAIN=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --about)      ABOUT="${2-}";      shift $(( $# >= 2 ? 2 : 1 ));;
         --belief)     BELIEF="${2-}";     shift $(( $# >= 2 ? 2 : 1 ));;
         --confidence) CONFIDENCE="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
+        --domain)     DOMAIN="${2-}";     shift $(( $# >= 2 ? 2 : 1 ));;
         --now)        NOW="${2-}";        shift $(( $# >= 2 ? 2 : 1 ));;
         *) shift;;
     esac
@@ -63,6 +82,7 @@ CURRENT="$(bash "$PROJECT_ROOT/core/scripts/team-state-read.sh" --field "$FIELD"
 # 2. COMPUTE the superseded+capped list (pure module; values via argv, list via stdin).
 PY_ARGS=(--about "$ABOUT" --belief "$BELIEF" --confidence "$CONFIDENCE")
 [ -n "$NOW" ] && PY_ARGS+=(--now "$NOW")
+[ -n "$DOMAIN" ] && PY_ARGS+=(--domain "$DOMAIN")
 NEW_LIST="$(printf '%s' "$CURRENT" | python3 "$PROJECT_ROOT/core/scripts/_team_belief.py" "${PY_ARGS[@]}")"
 
 # 3. WRITE the whole list back with operation=set (daemon). `set` replaces only

@@ -53,6 +53,20 @@ else
     fi
 fi
 
+# Operator-visible warning on failure (). The audit
+# entry below records exit + stderr_head, but a FILE is not the same visibility
+# as a line in the loop's captured output. iteration-close.sh previously called
+# the collector directly and warned on failure; routing it through this wrapper
+# would have SILENTLY dropped that warning, because this wrapper exits 0 by
+# contract. Emitting it here preserves the warning for that caller and adds it
+# for every other one, without touching the exit-0 contract state-update depends
+# on. Trading a visible warning for a structured log entry would have been a
+# quiet downgrade of exactly the signal this wrapper exists to provide.
+if [ "$EXIT" -ne 0 ]; then
+    echo "[outcome-observation-run] WARN: collector failed rc=$EXIT (non-fatal;" \
+         "outcome-metrics.yaml not advanced). stderr: ${STDERR_HEAD:-<none>}" >&2
+fi
+
 # Values passed via env (guard-165: never interpolate bash vars into Python source).
 # Single python3 invocation per python-invocation.md rule 3: inside a .sh wrapper
 # that has sourced _paths.sh, the shim is on PATH and python3 is canonical.

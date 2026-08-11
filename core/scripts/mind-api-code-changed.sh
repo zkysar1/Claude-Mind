@@ -21,6 +21,39 @@
 #                                            core/scripts/experience.py   (see NOTE)
 #                                            core/scripts/tree.py
 #                                            core/scripts/tree_match.py
+#                                            core/scripts/predicate.py
+#                                            core/scripts/aspirations.py
+#
+#      predicate.py + aspirations.py added 2026-08-08 (, reducer pass on
+#      hostname cc-04, uname -r 6.8.0-136-generic). Both entered the daemon surface
+#      via 's own commit 0a0b81427, which created
+#      core/scripts/gates/check_schema.py — the only `import predicate` that REACHES
+#      THE DAEMON, via mind_api/src/endpoints/aspirations_write.py:100
+#      (`from gates.check_schema import evaluate`). This line read "the ONLY non-test
+#      `import predicate` in core/scripts + mind_api" until 2026-08-09; measured
+#      (alpha, hostname cc-04, uname -r 6.8.0-136-generic) that is FALSE —
+#      recurring-precondition-sweep.py, verify-check-eval.py,
+#      precondition-defer-recheck.py and recurring-starvation-check.py all import it.
+#      None of the four is reachable from mind_api/src, so the DAEMON-scoped claim
+#      holds and the worker-inference correction at the end of this block still
+#      stands. Stated imprecisely, though, a reader who greps finds FIVE importers
+#      and mistrusts the block that depends on there being one. The gate reads
+#      predicate.PREDICATE_TYPES and parses its `reason=` literals, so a commit
+#      touching ONLY predicate.py diffed CLEAN, post-commit skipped the restart, and
+#      the daemon would keep validating filings against a STALE type list —
+#      refusing checks that had just become valid.
+#
+#      That is not hypothetical: sibling goal  ships exactly such a
+#      commit (TYPE_ALIASES + the new not_machine_checkable type, both in
+#      predicate.py alone). The two goals shipped a day apart into the same daemon.
+#
+#      The worker pass judged this red "NOT mine" after removing check_schema.py and
+#      seeing the same ['aspirations','predicate'] list. That inference does not
+#      hold — with the only importer deleted, `predicate` cannot be in the surface,
+#      so the removal probe was measuring something other than it claimed. Recorded
+#      because "I removed my change and the failure persisted" is otherwise a
+#      strong-looking exoneration (guard-1448 solo-rerun discipline says re-run the
+#      FILE; it does not license inferring the CAUSE from an unchanged failure list).
 #
 #      This list is NOT hand-maintained guesswork — it is COMPUTED and pinned.
 #      core/scripts/tests/test_daemon_import_surface.py recomputes the daemon's
@@ -164,6 +197,8 @@ for _attempt in 1 2 3; do
         core/scripts/experience.py \
         core/scripts/tree.py \
         core/scripts/tree_match.py \
+        core/scripts/predicate.py \
+        core/scripts/aspirations.py \
         2>&1)"
     _diff_rc=$?
     if [ "$_diff_rc" -eq 0 ]; then

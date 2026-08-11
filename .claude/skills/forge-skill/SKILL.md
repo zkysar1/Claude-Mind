@@ -333,6 +333,17 @@ then come back here for the integration requirements.
      replace it: fixtures prove the interpreter discriminates, the live run proves
      the excluded upstream layers work. The thin API-wrapper exemption in SCOPE
      below applies to this bullet exactly as it does to the fixtures.
+     BUDGET THE LIVE RUN AS A SUCCESS-PATH AUDIT, not a smoke test that the thing
+     runs. For every write the tool performs, read the record back from the store
+     and DIFF the stored fields against what was supplied; for every non-zero exit,
+     read the script's own contract before calling it a failure. A fixture supplies
+     its own expectation, so a call that SUCCEEDS while quietly storing something
+     other than what you passed matches that expectation exactly — which is why
+     this class is structurally unreachable by fixtures and shows up only here.
+     Measured g-115-4466 (2026-08-01): one 3-item live run found three defects,
+     ALL on the success path (a silently-rewritten origin_signal, a read-back keyed
+     on the value that was never stored, and an rc=3 that means success), and none
+     was reachable by any fixture. rb-6343 / guard-2329.
 
    Why the live run is not redundant with a green fixture suite (g-250-269, the
    incident behind guard-1462): a forge followed Step 3.6 exactly — 7/7 fixtures

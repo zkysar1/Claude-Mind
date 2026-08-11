@@ -15,11 +15,25 @@ violation too -- 9/9 green doesn't falsify a guard miss.
 This gate is the post-hoc -> pre-hoc move: shift the consult-before-edit
 discipline from after-the-fact audit to before-the-fact directive.
 
-Trigger conditions (g-115-2201 — WIDENED; see below for what changed and why):
-  1. goal title or description references a framework-file path:
-     core/scripts/, core/config/, mind_api/src/, core/githooks/,
-     core/logs/, .claude/skills/, .claude/rules/, .claude/settings,
-     world/conventions/, SKILL.md, CLAUDE.md
+THIS DOCSTRING IS THE PREDICATE SSOT. Five other files describe this gate
+(aspirations-execute/SKILL.md, execute-protocol-digest.md, aspirations-precheck/
+SKILL.md, pre-apply-consult-gate.sh, pre-apply-consult-drift-gate.py). All five
+carried the PRE-g-115-2201 predicate for 17 days after the code changed, and a
+reader believed them over the code: g-115-4358 was filed HIGH to widen an
+already-widened gate, and its "proof" was a hand-run with MIND_AGENT unset (the
+fail-open path at main(), 0 bytes of stdout) read as "the gate is silent on
+self-filed goals". When this predicate changes, re-sync all five. (g-115-4358)
+
+Trigger conditions (g-115-2201 WIDENED authorship; g-115-4358 added 1c):
+  1. the goal references framework code, by ANY of:
+     a. a framework-file PATH in title/description: core/scripts/, core/config/,
+        mind_api/src/, core/githooks/, core/logs/, .claude/skills/,
+        .claude/rules/, .claude/settings, world/conventions/, SKILL.md, CLAUDE.md
+     b. a framework `category` (framework-maintenance, framework-architecture)
+     c. a BARE filename in title/description that resolves to a real file under
+        core/scripts/, core/scripts/gates/, core/config/, or mind_api/src/
+        ("deploy-verify.sh"). Measured: 1a+1b alone missed 19.9% of goals that
+        actually edited framework files -- see BARE_FILENAME_RE for the numbers.
   2. no retrieval has ALREADY been recorded for this goal
      (retrieval-session.json -- the same artifact the learning gate audits)
   3. agent + goal record can be resolved
@@ -67,6 +81,7 @@ Exit: always 0.
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -106,6 +121,74 @@ FRAMEWORK_CATEGORIES = frozenset({
     "framework-maintenance",
     "framework-architecture",
 })
+
+# Third trigger (). The category field above was added to catch goals that
+# name files bare rather than by path -- and MEASURED, it only partly does: over 1624
+# completed goals scored against git ground truth (did the goal's commits actually
+# touch a framework file?), the needle+category predicate still MISSED 103 of 518
+# framework-editing goals, a 19.9% miss rate. Every miss looked the same: the goal
+# names its file bare ("deploy-verify.sh", "fixture-leak-scan.py") and sits in a
+# non-framework category, so neither existing trigger sees it.
+#
+# The fix resolves the bare name against the FILESYSTEM instead of guessing from
+# prose shape -- a name only counts when a real framework file answers to it. Scored
+# on the same ground truth before being applied (this gate's own goal was filed on an
+# unmeasured premise, so measuring the remedy is the point, not ceremony):
+#
+#   current (needles + category)          FP 39.5%  recall 80.1%
+#   + bare name that EXISTS on disk       FP 42.3%  recall 88.6%   <- applied
+#   + ANY bare .sh/.py/.yaml mention      FP 54.9%  recall 92.7%   <- rejected
+#
+# The applied form closes 44 misses for 66 new banners (~1.5 banners per miss). That
+# trade is favorable because the two sides are not symmetric: a new banner costs a
+# 5-second retrieve.sh, while a miss ships a framework edit with no consult at all --
+# the rb-987 / guard-383 shape. The rejected form buys 21 further misses for 313 more
+# banners, which is the banner-fatigue that makes a gate ignorable (guard-1090).
+# Most of the 66 are goals like "Investigate: owncloud_sync.py symmetry audit" that
+# never edited a file but where consulting first was genuinely useful -- they are
+# false only against the deliberately-conservative "did it EDIT one" ground truth.
+BARE_FILENAME_RE = re.compile(r"\b([a-z0-9][a-z0-9._-]*\.(?:sh|py|yaml))\b")
+
+# Names so generic that a match is evidence of nothing.
+BARE_FILENAME_DENY = frozenset({
+    "__init__.py", "conftest.py", "readme.md", "utils.py",
+})
+
+
+def _bare_search_dirs():
+    """Directories a bare filename may resolve against to count as framework."""
+    return (
+        CORE_ROOT / "scripts",
+        CORE_ROOT / "scripts" / "gates",
+        CORE_ROOT / "config",
+        PROJECT_ROOT / "mind_api" / "src",
+    )
+
+
+def _detect_bare_framework_files(title: str, description: str):
+    """Bare filenames in the prose that resolve to a REAL framework file.
+
+    Resolution against disk is what keeps this from degrading into candidate C:
+    "deploy-verify.sh" fires because core/scripts/deploy-verify.sh exists;
+    "package.json" or a product-repo script named in passing does not.
+    """
+    text = (title + "\n" + description).lower()
+    dirs = _bare_search_dirs()
+    hits = []
+    # dict.fromkeys de-dupes while preserving first-seen order.
+    for name in dict.fromkeys(BARE_FILENAME_RE.findall(text)):
+        if name in BARE_FILENAME_DENY:
+            continue
+        for d in dirs:
+            try:
+                if (d / name).is_file():
+                    hits.append(name)
+                    break
+            except OSError:
+                # Unreadable dir -> just skip it. Fail-open matches the gate's
+                # posture: a missed needle costs a banner, never a wedge.
+                continue
+    return hits
 
 
 def _read_local_paths_conf(agent_name: str) -> dict:
@@ -284,6 +367,15 @@ def main(argv=None) -> int:
     category = (goal.get("category") or "").strip().lower()
     if category in FRAMEWORK_CATEGORIES and "category" not in hits:
         hits = hits + [f"category:{category}"]
+
+    #  — third trigger. The category field above was supposed to cover the
+    # bare-filename shape; measured over 1624 goals it left a 19.9% miss rate, every
+    # miss a goal naming its file bare in a non-framework category. Resolve bare names
+    # against disk. See the BARE_FILENAME_RE block for the scored trade-off.
+    for name in _detect_bare_framework_files(title, description):
+        tag = f"file:{name}"
+        if tag not in hits:
+            hits = hits + [tag]
 
     if not hits:
         # No framework-file reference and not a framework category -- the consult is

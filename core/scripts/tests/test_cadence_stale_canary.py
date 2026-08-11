@@ -2,8 +2,8 @@
 defense-in-depth sibling of stale-sentinel-canary.
 
 Two layers:
-  1. Registry integration — the canary tracks exactly the six _cadence_registry
-     cadences and every check_cmd script exists on disk.
+  1. Registry integration — the canary tracks exactly the _cadence_registry
+     roster (whatever its size) and every check_cmd script exists on disk.
   2. run() counter logic, driven by an INJECTED check_runner + a monkeypatched
      tmp working-memory.yaml so every case is hermetic (no real WM, no
      aspirations.jsonl mutation, no subprocess, no S3):
@@ -88,8 +88,17 @@ def _counters(wm):
 
 # --------------------------------------------------------- registry -----------
 
-def test_registry_tracks_six_cadences():
-    assert len(reg.cadences()) == 6
+def test_registry_roster_is_non_empty_and_matches_names():
+    # Derived from the SSOT, not a literal. This asserted `== 6` and broke on
+    # the first legitimate registry growth ( added a 7th). The count
+    # was also in the test NAME, which a phrase-grep for stale counts does not
+    # find -- so the bump would have been made silently and the name left lying.
+    # The roster MEMBERSHIP is pinned once, in
+    # test_precheck_cadence_battery.py::test_registry_pins_the_skill_invocation_cadence_roster;
+    # this file only needs the canary to track whatever that roster is.
+    cads = reg.cadences()
+    assert cads, "registry must not be empty -- the canary would track nothing"
+    assert len(cads) == len(reg.cadence_names())
 
 
 def test_every_check_cmd_script_exists():

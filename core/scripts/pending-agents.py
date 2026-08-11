@@ -114,6 +114,11 @@ def cmd_register(args):
         "dispatched_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
         "purpose": args.purpose,
         "timeout_minutes": args.timeout,
+        # Owning BODY () — see background-jobs.py cmd_register for the
+        # full rationale. This store is agent-wide and carried no body key, so a
+        # WORKER body's dispatched agent made the REDUCER's stop-hook Gate 2.5
+        # ALLOW a turn-end it would otherwise BLOCK.
+        "owner_sid": (getattr(args, "body_sid", "") or os.environ.get("MIND_SID", "") or ""),
     }
     data["agents"].append(entry)
     write_data(data)
@@ -191,7 +196,20 @@ def cmd_list(args):
 
 
 def cmd_has_pending(args):
-    """Check for non-stale pending agents. Exit 0 if any, exit 1 if none."""
+    """Check for non-stale pending agents. Exit 0 if any, exit 1 if none.
+
+    BODY FILTER (--body-sid, g-306-135). OPT-IN: with no --body-sid the
+    behaviour is byte-identical to before. When passed (stop-hook Gate 2.5),
+    an agent counts only if its owner_sid matches EXACTLY; a missing/empty
+    owner_sid (registered before this change) does NOT gate, because an
+    unknown owner must never become an ALLOW — rb-605, and the Gate 2.6
+    comment's "never the wrong direction for liveness".
+
+    The filter is applied AFTER the staleness prune-and-write below, never
+    before: pruning writes the surviving list back to the shared file, so
+    filtering first would silently DELETE the sibling body's registrations
+    as a side effect of merely asking whether this body has work pending.
+    """
     data = read_data()
     agents = data.get("agents", [])
     if not agents:
@@ -204,7 +222,15 @@ def cmd_has_pending(args):
         else:
             delete_file()
         log(f"pruned {pruned} stale agent(s), {len(kept)} remaining")
-    if kept:
+    # Three-way — see background-jobs.py cmd_has_pending for the full rationale.
+    # None = agent-wide (no filter asked for); "" = caller could not resolve its
+    # own identity, so nothing is "mine"; <sid> = exact match.
+    body_sid = getattr(args, "body_sid", None)
+    if body_sid is not None and not body_sid:
+        sys.exit(1)
+    mine = (kept if body_sid is None
+            else [a for a in kept if (a.get("owner_sid") or "") == body_sid])
+    if mine:
         sys.exit(0)
     else:
         sys.exit(1)
@@ -254,6 +280,8 @@ def build_parser():
     reg.add_argument("--purpose", default="", help="Short description of agent's task")
     reg.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_MINUTES,
                      help=f"Staleness timeout in minutes (default: {DEFAULT_TIMEOUT_MINUTES})")
+    reg.add_argument("--body-sid", default="",
+                     help="Owning body's session id. Defaults to $MIND_SID.")
 
     # deregister
     dereg = sub.add_parser("deregister", help="Remove an agent by ID")
@@ -268,7 +296,12 @@ def build_parser():
     lst.add_argument("--json", action="store_true", help="Output as JSON")
 
     # has-pending
-    sub.add_parser("has-pending", help="Exit 0 if non-stale agents exist, exit 1 otherwise")
+    hp = sub.add_parser("has-pending", help="Exit 0 if non-stale agents exist, exit 1 otherwise")
+    hp.add_argument("--body-sid", default=None,
+                    help="Count only agents owned by this body's session id. "
+                         "Omit entirely for agent-wide (legacy) behaviour; an "
+                         "EMPTY value means the caller has no identity and "
+                         "nothing counts as pending.")
 
     # prune-stale
     sub.add_parser("prune-stale", help="Remove agents past their timeout")

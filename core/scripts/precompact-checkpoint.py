@@ -20,14 +20,21 @@ reconfigure_stdio()
 
 import yaml
 
-from _paths import AGENT_DIR, assert_agent_dir
+from _paths import AGENT_DIR, assert_agent_dir, body_state_path
 from wm import read_wm, WM_PATH  # noqa: E402
 
 # : fail loud at import time if MIND_AGENT unset; replaces the
 # opaque `None / "session"` TypeError class the next line would otherwise raise.
 assert_agent_dir("precompact-checkpoint")
 
-CHECKPOINT_PATH = AGENT_DIR / "session" / "compact-checkpoint.yaml"
+# Body-keyed, agent-wide when unbodied (). Unlike postcompact-restore.sh,
+# THIS hook's launcher has no runner-identity guard — it fires for any session with
+# a bound agent, including a worker body. The write below is an os.replace, so
+# without body-keying a worker body autocompacting clobbers the reducer's
+# checkpoint outright. Bound to a constant (not resolved per-call) because this is
+# a one-shot hook process: import time IS call time, and the existing tests that
+# monkeypatch this constant keep working.
+CHECKPOINT_PATH = body_state_path(AGENT_DIR.name, "compact-checkpoint.yaml")
 
 
 def log(msg):

@@ -184,6 +184,43 @@ def test_update_field_roundtrip(running_daemon):
     assert updated["summary"] == "revised summary text"
 
 
+def test_update_field_whole_object_recomputes_utility_ratio(running_daemon):
+    """ -- the LIVE path, end to end over HTTP.
+
+    experience-update-field.sh is daemon-only, so THIS handler is what runs.
+    The recompute used to be guarded on `field.startswith("retrieval_stats.")`
+    while the dotted rejection at the top of the handler returned 400 before the
+    cycle was entered -- so it never fired, and utility_ratio read 0.0 on 4,174
+    of 4,175 fleet records. The whole-object write is the only shape that
+    reaches it, and the shape every caller uses.
+    """
+    project_root, port = running_daemon
+    agent_dir = project_root / "agents" / "alpha"
+    cp = _make_trace(project_root, "agents/alpha/experience/ur.md")
+    rec = {"id": "exp-ur-daemon", "type": "research", "category": "c",
+           "summary": "summary text long enough here", "content_path": cp}
+    _post_json(port, "/v1/experience/add", {}, rec)
+
+    blob = json.dumps({"retrieval_count": 4, "times_useful": 2, "times_noise": 0,
+                       "utility_ratio": 0.0, "last_retrieved": None})
+    status, body = _post_json(port, "/v1/experience/update-field",
+                              {"id": "exp-ur-daemon", "field": "retrieval_stats",
+                               "value": blob}, None)
+    assert status == 200, body
+    assert json.loads(body)["record"]["retrieval_stats"]["utility_ratio"] == 0.5, body
+    updated = next(r for r in _live_records(agent_dir) if r["id"] == "exp-ur-daemon")
+    assert updated["retrieval_stats"]["utility_ratio"] == 0.5, updated
+
+    # A payload omitting a strict-lookup sub-key must backfill, not 500: the
+    # whole-object write replaces the dict _normalize_record already filled.
+    status, body = _post_json(port, "/v1/experience/update-field",
+                              {"id": "exp-ur-daemon", "field": "retrieval_stats",
+                               "value": json.dumps({"retrieval_count": 3})}, None)
+    assert status == 200, body
+    stats = json.loads(body)["record"]["retrieval_stats"]
+    assert stats["times_useful"] == 0 and stats["utility_ratio"] == 0.0, stats
+
+
 def test_update_field_rejects_created(running_daemon):
     project_root, port = running_daemon
     cp = _make_trace(project_root, "agents/alpha/experience/crt.md")

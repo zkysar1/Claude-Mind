@@ -32,6 +32,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -191,6 +192,150 @@ def _parse_config(path: Path, text: str):
     return _UNPARSEABLE
 
 
+# --- Code lane: comment-vs-logic for .sh/.py () ----------------------
+#
+# The config lane above answers "did a VALUE change?" by PARSING both sides, so
+# comments and formatting vanish for free. Code has no such parse step, which is
+# why a comment-only diff in a shell script was previously indistinguishable
+# from a logic change and blocked every promotion. This lane reconstructs the
+# same discriminator for code by stripping comments and normalizing whitespace,
+# then comparing the functional remainder.
+#
+# Deliberately NARROW — only shell and Python, the two comment syntaxes this
+# scanner models. Any other suffix returns None and falls through to the
+# pre-existing behavior, so widening the language set is an explicit act.
+_CODE_SUFFIXES = (".sh", ".bash", ".py")
+
+# A shell heredoc introducer: `<<WORD`, `<<-WORD`, `<<'WORD'`, `<<"WORD"`.
+# `<<<WORD` (herestring) deliberately does NOT match: it has no body, and the
+# `[A-Za-z_]` class cannot match the third `<`.
+_HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def _scan_code_line(line: str, is_py: bool) -> tuple[str, str | None, str | None]:
+    """Split ONE line into (functional_part, opened_triple_quote, open_quote).
+
+    `open_quote` is the quote character still unclosed when the line ends — a
+    shell string spanning lines, e.g. the `py -3 -c '` ... `'` form guard-165
+    MANDATES throughout this repo. Measured: 143 of 482 core/scripts/*.sh (30%)
+    contain such a line. The caller uses it to keep that body VERBATIM instead
+    of comment-stripping it; without that, a `#` line inside the string was
+    treated as a shell comment and dropped, so two files differing only inside
+    the string compared EQUAL and were wrongly excused from blocking — the one
+    error direction this gate must never take (rb-6259).
+
+    Walks the line character by character tracking string state, so a `#` inside
+    a quoted string is never mistaken for a comment. That case is not academic:
+    `PATTERN="^#!"` and `echo "# header"` are ordinary code, and stripping from
+    the `#` would delete real logic while making the file look comment-only —
+    a FALSE "comment" verdict is the one error direction this gate must not make.
+
+    Two language differences are load-bearing:
+      - Python: `#` outside a string ALWAYS begins a comment (`a#b` -> `a`).
+      - POSIX shell: `#` begins a comment only at the start of a WORD, i.e. at
+        line start or after whitespace. `echo a#b` prints `a#b` verbatim, so
+        treating that `#` as a comment would silently delete code.
+    """
+    i, n = 0, len(line)
+    quote = None                      # active single-line quote char, else None
+    while i < n:
+        c = line[i]
+        if quote:
+            # Shell single-quotes are literal — backslash is NOT an escape there.
+            if c == "\\" and not (not is_py and quote == "'"):
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if is_py and line[i:i + 3] in ('"""', "'''"):
+            delim = line[i:i + 3]
+            end = line.find(delim, i + 3)
+            if end == -1:
+                return line, delim, None   # opens here and stays open
+            i = end + 3
+            continue
+        if c in ("'", '"'):
+            quote = c
+            i += 1
+            continue
+        if c == "\\":
+            i += 2
+            continue
+        if c == "#":
+            if is_py or i == 0 or line[i - 1].isspace():
+                return line[:i], None, None
+            i += 1                    # shell: mid-word `#` is literal
+            continue
+        i += 1
+    return line, None, quote
+
+
+def _functional_code(text: str, suffix: str) -> str | None:
+    """Return the comment-stripped, whitespace-normalized form of shell/Python
+    source — or None when the suffix is not one this scanner models.
+
+    Normalizations applied, each chosen because it cannot change behavior:
+      - trailing whitespace and CR (CRLF vs LF) dropped,
+      - comment-only and blank lines dropped,
+      - leading indentation PRESERVED (significant in Python).
+
+    Three constructs are preserved VERBATIM as functional rather than stripped,
+    because each can carry behavior:
+      - the line-1 shebang, which selects the interpreter (`#!/bin/bash` ->
+        `#!/usr/bin/env python3` is a real change that must keep blocking),
+      - shell heredoc bodies, which are DATA — a `#` line inside one is content,
+      - Python triple-quoted literals, which are runtime values (`__doc__`,
+        embedded SQL). Preserving them means a docstring-only diff classifies as
+        `value` and still blocks. That is over-conservative on purpose: the cost
+        is one unnecessary review, versus silently excusing a changed literal.
+    """
+    suf = (suffix or "").lower()
+    if suf not in _CODE_SUFFIXES:
+        return None
+    is_py = suf == ".py"
+    out: list[str] = []
+    triple: str | None = None         # .py: open triple-quote delimiter
+    heredoc: str | None = None        # .sh: open heredoc terminator
+    in_quote: str | None = None       # quote char of a string spanning lines
+    for idx, raw in enumerate(text.splitlines()):
+        line = raw.rstrip()           # trailing whitespace + CR
+        if heredoc is not None:
+            out.append(line)
+            if line.strip() == heredoc:
+                heredoc = None
+            continue
+        if triple is not None:
+            out.append(line)
+            if triple in line:
+                triple = None
+            continue
+        if in_quote is not None:
+            # Body of a multi-line quoted string — DATA, kept verbatim. Keeping
+            # MORE text can only surface MORE differences, i.e. push toward
+            # blocking, which is the safe direction. A missed closing quote
+            # therefore degrades safely (more verbatim text, never less).
+            out.append(line)
+            if in_quote in line:
+                in_quote = None
+            continue
+        if idx == 0 and line.startswith("#!"):
+            out.append(line)
+            continue
+        kept, triple, in_quote = _scan_code_line(line, is_py)
+        kept = kept.rstrip()
+        # Do not hunt for a heredoc introducer on a line that ended INSIDE a
+        # string — a `<<EOF` in there is string content, not a redirection.
+        if not is_py and kept and in_quote is None:
+            m = _HEREDOC_RE.search(kept)
+            if m:
+                heredoc = m.group(2)
+        if kept:
+            out.append(kept)
+    return "\n".join(out)
+
+
 def classify_divergence(src_abs: Path, tgt_abs: Path, zone: str) -> dict:
     """Classify the CONTENT divergence between two versions of a framework file.
 
@@ -213,7 +358,17 @@ def classify_divergence(src_abs: Path, tgt_abs: Path, zone: str) -> dict:
     Returns {kind, reconcile_eligible, detail}:
       kind: "identical" | "comment" | "value" | "structural" | "unparseable"
     """
-    if zone != ZONE_PHENO_PARAM:
+    # Code lane (): PHENOTYPE-structural .sh/.py get a comment-vs-logic
+    # split of their own. Scoped to PHENOTYPE-structural DELIBERATELY — KERNEL
+    # holds code too (the anchor enforcer, the transplant/preflight mechanism),
+    # and kernel divergence is governed by zone policy that always demands human
+    # review, so it must never be excused by a comment-only finding. NICHE
+    # (world/meta/agents) is deployment-local and out of scope for the same reason.
+    src_suffix = (src_abs.suffix or "").lower()
+    code_lane = (zone == ZONE_PHENO_STRUCT
+                 and src_suffix in _CODE_SUFFIXES
+                 and (tgt_abs.suffix or "").lower() == src_suffix)
+    if zone != ZONE_PHENO_PARAM and not code_lane:
         # Structural / kernel / niche: no value-vs-comment split. Structural
         # changes reconcile with review; kernel/niche are governed by zone policy.
         return {"kind": "structural", "reconcile_eligible": True,
@@ -227,6 +382,22 @@ def classify_divergence(src_abs: Path, tgt_abs: Path, zone: str) -> dict:
     if src_text == tgt_text:
         return {"kind": "identical", "reconcile_eligible": False,
                 "detail": "byte-identical"}
+    if code_lane:
+        func_s = _functional_code(src_text, src_suffix)
+        func_t = _functional_code(tgt_text, src_suffix)
+        if func_s is None or func_t is None:
+            # Unreachable while code_lane is true (both suffixes were checked),
+            # but never silently excuse on an unexpected None.
+            return {"kind": "structural", "reconcile_eligible": True,
+                    "detail": f"{zone}: code lane unavailable; review required"}
+        if func_s == func_t:
+            return {"kind": "comment", "reconcile_eligible": False,
+                    "detail": "functional code identical after comment-strip and "
+                              "whitespace normalization — divergence is comment/"
+                              "formatting only (provenance drift, not a logic change)"}
+        return {"kind": "value", "reconcile_eligible": True,
+                "detail": "functional code differs after comment-strip — a real "
+                          "logic change"}
     parsed_s = _parse_config(src_abs, src_text)
     parsed_t = _parse_config(tgt_abs, tgt_text)
     if parsed_s is _UNPARSEABLE or parsed_t is _UNPARSEABLE:
@@ -616,14 +787,33 @@ def main() -> int:
     # the dev repo by stripping provenance. REPORT-ONLY for now (mirrors the
     # Phase 0 zone column); feeds a future reconcile-eligibility enforcement.
     content_divergence: dict[str, dict] = {}
+    divergence_zone: dict[str, str] = {}
     for k in differing:
         z = zone_map.get(k) or classify_zone(k)
-        if z == ZONE_PHENO_PARAM:
+        # : PHENOTYPE-structural CODE now joins the parametric configs.
+        # Without this the classifier was never even CALLED on a .sh/.py, which is
+        # why comment_only_excused_from_blocking came back empty on a healthy
+        # mirror and every promotion ended in a conscious-bypass env var.
+        if z == ZONE_PHENO_PARAM or (
+                z == ZONE_PHENO_STRUCT
+                and Path(k).suffix.lower() in _CODE_SUFFIXES):
             content_divergence[k] = classify_divergence(S[k], T[k], z)
+            divergence_zone[k] = z
+    # param_* stay PARAMETRIC-ONLY. They are published report fields whose names
+    # promise config files, so the code lane gets its own keys instead of
+    # silently redefining what a consumer of param_comment_diffs is reading.
     param_value_diffs = sorted(k for k, v in content_divergence.items()
-                               if v.get("kind") == "value")
+                               if v.get("kind") == "value"
+                               and divergence_zone.get(k) == ZONE_PHENO_PARAM)
     param_comment_diffs = sorted(k for k, v in content_divergence.items()
-                                 if v.get("kind") == "comment")
+                                 if v.get("kind") == "comment"
+                                 and divergence_zone.get(k) == ZONE_PHENO_PARAM)
+    code_value_diffs = sorted(k for k, v in content_divergence.items()
+                              if v.get("kind") == "value"
+                              and divergence_zone.get(k) == ZONE_PHENO_STRUCT)
+    code_comment_diffs = sorted(k for k, v in content_divergence.items()
+                                if v.get("kind") == "comment"
+                                and divergence_zone.get(k) == ZONE_PHENO_STRUCT)
 
     def bucket(keys):
         core = [k for k in keys if not is_skill(k) and k not in DEPLOYMENT_LOCAL]
@@ -710,6 +900,9 @@ def main() -> int:
             "content_divergence": content_divergence,
             "param_value_diffs": param_value_diffs,
             "param_comment_diffs": param_comment_diffs,
+            #  code lane — same value/comment split, .sh/.py sources.
+            "code_value_diffs": code_value_diffs,
+            "code_comment_diffs": code_comment_diffs,
             "comment_only_excused_from_blocking": comment_only_excused,
             # Phase 3b (): zone partition of the target-ahead blocking
             # set — the explicit structural-with-review gate. Labeling only; every

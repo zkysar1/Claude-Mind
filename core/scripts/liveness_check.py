@@ -14,22 +14,39 @@ busy partner is dormant (observed 2026-07-14: bravo local shard 07-07, bravo S3
 shard 07-14; foxtrot local 07-08). check-team-state-before-silent.md rule-5
 documents the diagnosis; this module is the reusable resolution.
 
-The inherently-fresh signal is the partner's team-state SHARD's last WRITE time,
-read from the authoritative store rather than the local mirror:
-  * own-cloud backend -> S3 ``LastModified`` of ``team-state/agents/<agent>.yaml``
-    (boto3 HEAD; ground-truth per guard-1052 — the object's LastModified is when
-    the peer's box actually pushed, immune to local-mirror staleness).
-  * local backend -> the shard file's local mtime (no sync layer; mtime is truth).
+TWO authoritative signals are read, and telling them apart is the whole point
+under the Mind/Body split (g-306-132-e):
+
+  * MIND liveness — the ``last_active`` VALUE from inside the shard, read fresh
+    from the authoritative store (``fetch_authoritative_last_active`` ->
+    ``_team_state.read_shard_authoritative``). Only the mind's own heartbeat
+    writes this value, so a Body cannot forge it.
+  * BODY activity — the shard OBJECT's last WRITE time (``fetch_fresh_signal``):
+    own-cloud -> S3 ``LastModified`` of ``team-state/agents/<agent>.yaml`` (boto3
+    HEAD; guard-1052); local -> the shard file's mtime (no sync layer).
+
+Originally (g-115-2149) only the object time existed and it stood in for
+liveness, which was correct when one runner per agent was the only writer. It
+stopped being correct when a forked worker Body could write the shard while the
+reducer was dead: the object refreshes, the mind is gone, and the verdict read
+"alive". Object freshness is now corroborating evidence only — it can no longer
+promote to ALIVE on its own.
 
 presence.jsonl is deliberately NOT used: it does not sync to S3 (observed
 2026-07-14: both alpha's and bravo's S3 presence frozen at 06-26 while local is
 fresh), so it is worthless as a cross-box liveness signal.
 
 The verdict is intentionally conservative:
-  * ALIVE   — last_active OR the fresh signal is within the threshold.
-  * DORMANT — both are present but both are stale (> threshold).
-  * UNKNOWN — neither signal could be read (do NOT report DORMANT when we could
-    not even check — UNKNOWN is safer than a false-dormant).
+  * ALIVE   — the local last_active, or the AUTHORITATIVE last_active value, is
+    within the threshold. (Object freshness alone no longer qualifies.)
+  * DORMANT — the mind signals are stale AND the shard object is stale too.
+  * UNKNOWN — the signals could not be read, OR the shard object is fresh while
+    the authoritative last_active value is stale. That second case is body
+    activity without mind liveness: not alive, but not a supported death either
+    (guard-1042 forbids concluding dormant from a stale last_active on a
+    write-frozen box). DORMANT is the only verdict goal-selector acts on, so a
+    false dormant leaks an active agent's routed goals — UNKNOWN degrades toward
+    goals-stay-routed, which is the safe direction.
   * RETIRED — the agent's shard carries a live retirement tombstone. Checked
     FIRST, because retirement dominates both freshness signals (g-115-3702).
 
@@ -100,28 +117,61 @@ def _fmt_age(delta):
 
 
 def decide_liveness(last_active_iso, fresh_signal_iso, threshold_hours=DEFAULT_THRESHOLD_HOURS, now=None,
-                    retired_entry=None):
+                    retired_entry=None, authoritative_last_active_iso=None,
+                    authoritative_provenance=None):
     """Pure liveness decision.
 
-    Returns a dict: {verdict, reason, signal, last_active_age_min, fresh_age_min}
-    where verdict is one of "alive" | "dormant" | "unknown" | "retired" and
-    ``signal`` names which input carried the verdict ("last_active" |
-    "fresh_signal" | "retirement_tombstone" | None).
+    Returns a dict: {verdict, reason, signal, last_active_age_min, fresh_age_min,
+    authoritative_last_active_age_min} where verdict is one of "alive" | "dormant"
+    | "unknown" | "retired" and ``signal`` names which input carried the verdict
+    ("last_active" | "authoritative_last_active" | "fresh_signal" |
+    "retirement_tombstone" | None).
 
     ``retired_entry`` is the agent's shard dict when it carries a live retirement
     tombstone (see fetch_retirement_tombstone), else None. Defaulting to None keeps
     every existing caller's behavior byte-identical.
+
+    ``authoritative_last_active_iso`` is the ``last_active`` VALUE read from inside
+    the authoritative-store shard (g-306-132-e). It is the MIND-liveness signal, as
+    distinct from ``fresh_signal_iso``, which is the shard OBJECT's write time and
+    therefore only BODY activity. Under the Mind/Body split those came apart: a
+    worker Body writing the shard refreshes the object while the reducer is dead,
+    so an object-freshness-only rule reported a dead mind as "alive". Defaulting to
+    None keeps every existing caller byte-identical — the new branch engages only
+    when a caller supplies the value.
+
+    ``authoritative_provenance`` (g-306-138) says WHERE that value came from —
+    ``_team_state.PROV_AUTHORITATIVE`` | ``PROV_LOCAL_MIRROR`` | ``PROV_NONE``, or
+    None when the caller did not resolve it. ``read_shard_authoritative`` fails
+    open to the local mirror, so without this the branch below promoted a MIRROR
+    value to verdict=alive while its reason string asserted "the local mirror
+    lagged" — a claim of authoritative provenance for a value read from the
+    mirror. Only ``PROV_LOCAL_MIRROR`` changes behavior (degrade to unknown);
+    None and PROV_AUTHORITATIVE are treated identically, so every pre-g-306-138
+    caller stays byte-identical.
     """
     if now is None:
         raise ValueError("now must be supplied (kept explicit for testability)")
     thr = timedelta(hours=float(threshold_hours))
     la_age = _age(last_active_iso, now)
     fs_age = _age(fresh_signal_iso, now)
+    ala_age = _age(authoritative_last_active_iso, now)
 
     def mins(d):
         return round(d.total_seconds() / 60.0, 1) if d is not None else None
 
-    base = {"last_active_age_min": mins(la_age), "fresh_age_min": mins(fs_age)}
+    # The provenance travels WITH the age it qualifies, in every verdict. Found by
+    # /fresh-eyes-code on this goal's own diff: without it, a consumer reading
+    # authoritative_last_active_age_min faces exactly the ambiguity g-306-138 set
+    # out to remove — a number with no way to tell whether the value behind it came
+    # from the store of record or from a failed-open mirror. main() used to bolt the
+    # field on afterwards, which left the PURE function (the one goal-selector calls
+    # directly) still unable to answer the question. Not a live defect at the time —
+    # goal-selector reads only ["verdict"] — but it is this defect class re-entering
+    # one layer up, in the fix for it.
+    base = {"last_active_age_min": mins(la_age), "fresh_age_min": mins(fs_age),
+            "authoritative_last_active_age_min": mins(ala_age),
+            "authoritative_last_active_provenance": authoritative_provenance}
 
     # Retirement DOMINATES every freshness signal, and is checked before the fast
     # path on purpose: an agent retired moments ago still has a fresh last_active,
@@ -149,8 +199,55 @@ def decide_liveness(last_active_iso, fresh_signal_iso, threshold_hours=DEFAULT_T
         return {"verdict": "alive", "signal": "last_active",
                 "reason": f"last_active fresh ({_fmt_age(la_age)} ago, <= {threshold_hours:g}h)", **base}
 
+    # The local last_active is stale or absent. Prefer the AUTHORITATIVE VALUE of
+    # last_active over the shard object's write time: the value is mind-liveness,
+    # the object time is only body activity (g-306-132-e). A fresh authoritative
+    # value settles it — this is the local-mirror-lag case g-115-2149 fixed, now
+    # answered with a signal that a worker Body cannot forge.
+    if ala_age is not None and ala_age <= thr:
+        # ...but ONLY when the value actually came from the authoritative store.
+        # read_shard_authoritative fails open to the LOCAL MIRROR on a backend or
+        # read error and returns a bare row that cannot say so (guard-1753), so a
+        # fresh-looking value here may be the same mirror the fast path just found
+        # stale. Promoting it would assert "the local mirror lagged" using a value
+        # read FROM that mirror — a false ALIVE for an agent whose mirror was
+        # pulled recently but has since died, which is the class g-306-132-e
+        # closed, re-entering through the error path. UNKNOWN is the fail-safe
+        # answer that goal-selector._liveness_confirms_dormant does not act on, so
+        # the goals stay routed (g-306-138).
+        if authoritative_provenance == "local-mirror":
+            return {"verdict": "unknown", "signal": None,
+                    "reason": (f"a fresh last_active VALUE ({_fmt_age(ala_age)} ago) was found, but it "
+                               "came from the LOCAL MIRROR — the authoritative-store read failed open. "
+                               "A mirror value cannot establish that the mirror lagged; cannot verify, "
+                               "do NOT conclude dormant"),
+                    **base}
+        la_desc = "stale" if la_age is not None else "absent"
+        return {"verdict": "alive", "signal": "authoritative_last_active",
+                "reason": (f"local last_active {la_desc} but the authoritative-store shard's "
+                           f"last_active VALUE is fresh ({_fmt_age(ala_age)} ago) — the mind is "
+                           "running and the local mirror lagged"),
+                **base}
+
     # last_active stale or absent — the inherently-fresh signal decides.
     if fs_age is not None and fs_age <= thr:
+        # A fresh shard OBJECT with a STALE authoritative last_active VALUE is the
+        # Mind/Body split: something on that box is writing the shard (a worker
+        # Body, a sync, a merge) while the mind's own heartbeat has aged out. That
+        # is NOT evidence of life, so it must not return "alive" — the g-306-132-e
+        # defect. It is not evidence of death either, so it must not return
+        # "dormant": guard-1042 forbids concluding dormant from a stale last_active
+        # on a write-frozen box, and "dormant" is the one verdict
+        # goal-selector._liveness_confirms_dormant acts on, so a false dormant
+        # would leak an active agent's routed goals cross-agent. UNKNOWN is the
+        # only honest answer, and it degrades toward goals-stay-routed.
+        if ala_age is not None:
+            return {"verdict": "unknown", "signal": None,
+                    "reason": (f"shard object is fresh ({_fmt_age(fs_age)} ago) but the "
+                               f"authoritative last_active VALUE is stale ({_fmt_age(ala_age)} ago) "
+                               "— a write to the shard is BODY activity and does not establish that "
+                               "the MIND is running; cannot verify, do NOT conclude dormant"),
+                    **base}
         la_desc = "stale" if la_age is not None else "absent"
         return {"verdict": "alive", "signal": "fresh_signal",
                 "reason": (f"last_active {la_desc} but fresh signal (authoritative-store push) "
@@ -219,6 +316,52 @@ def fetch_fresh_signal(agent, world_dir, backend):
     return fetch_local_shard_mtime(agent, world_dir)
 
 
+def fetch_authoritative_last_active_with_provenance(agent, world_dir):
+    """``(last_active_iso, provenance)`` from inside the agent's authoritative shard.
+
+    The MIND-liveness signal (g-306-132-e), as against fetch_fresh_signal's shard
+    OBJECT write time, which is only BODY activity. Delegates to the shared
+    single-shard primitive ``_team_state.read_shard_authoritative_with_provenance``
+    rather than re-implementing the backend dispatch — that helper is the one place
+    the own-cloud force_fresh read and its fail-open ladder live, so both this
+    module and its sibling consumers agree by construction.
+
+    NO ``backend`` PARAMETER, deliberately (g-306-138 outcome 4). The primitive
+    dispatches on STORAGE_BACKEND itself; accepting one here would create a second
+    source of truth for that decision. The parameter used to be accepted "for call-
+    shape symmetry with fetch_fresh_signal" and then ignored, which meant
+    ``--backend own-cloud`` under an unset STORAGE_BACKEND would send one probe to
+    S3 and the other to the local file. It is removed rather than honoured because
+    honouring it is the second-source-of-truth bug; a signature that cannot express
+    the wrong call is better than one that documents it away.
+
+    Fail-quiet: any error returns ``(None, PROV_NONE)``, and the caller degrades to
+    the object-time signal exactly as before this function existed.
+    """
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        import _team_state
+        row, prov = _team_state.read_shard_authoritative_with_provenance(world_dir, agent)
+        if isinstance(row, dict):
+            return (row.get("last_active"), prov)
+    except Exception as e:  # noqa: BLE001 — fail-quiet by design
+        sys.stderr.write(
+            f"[liveness-check] authoritative last_active unavailable: {type(e).__name__}\n")
+    return (None, "none")
+
+
+def fetch_authoritative_last_active(agent, world_dir):
+    """The ``last_active`` VALUE only — provenance-blind wrapper over the pair above.
+
+    Kept because dropping a value's provenance is legitimate when the caller does
+    not branch on it. Callers that promote this value to a liveness VERDICT must
+    use the ``_with_provenance`` form: see g-306-138 and guard-1753.
+    """
+    return fetch_authoritative_last_active_with_provenance(agent, world_dir)[0]
+
+
 def fetch_retirement_tombstone(agent, world_dir):
     """The agent's shard dict when it carries a live retirement tombstone, else None.
 
@@ -275,7 +418,19 @@ def main(argv=None):
     # already fresh — the common case short-circuits with zero S3 / mtime IO.
     la_age = _age(args.last_active, now)
     fresh_iso = None
+    auth_la_iso = None
+    auth_la_prov = None
     if not (la_age is not None and la_age <= timedelta(hours=args.threshold_hours)):
+        # Both authoritative reads happen only off the fast path. The VALUE is
+        # fetched first because it can settle the verdict on its own; the object
+        # time is still needed to tell "stale mind, active box" (unknown) apart
+        # from "stale mind, quiet box" (dormant).
+        #
+        # --backend is passed to fetch_fresh_signal ONLY. The last_active read
+        # dispatches on STORAGE_BACKEND inside the shared primitive and takes no
+        # backend argument (g-306-138) — see the note in its docstring.
+        auth_la_iso, auth_la_prov = fetch_authoritative_last_active_with_provenance(
+            args.agent, args.world_dir)
         fresh_iso = fetch_fresh_signal(args.agent, args.world_dir, args.backend)
 
     # Cheap local read, and it must run even on the last_active-fresh fast path:
@@ -283,9 +438,15 @@ def main(argv=None):
     retired_entry = fetch_retirement_tombstone(args.agent, args.world_dir)
 
     result = decide_liveness(args.last_active, fresh_iso, args.threshold_hours, now=now,
-                             retired_entry=retired_entry)
+                             retired_entry=retired_entry,
+                             authoritative_last_active_iso=auth_la_iso,
+                             authoritative_provenance=auth_la_prov)
     result["agent"] = args.agent
     result["fresh_signal_iso"] = fresh_iso
+    result["authoritative_last_active_iso"] = auth_la_iso
+    # authoritative_last_active_provenance is NOT set here: decide_liveness now
+    # carries it in `base` for every verdict, so re-writing it would be a second
+    # source of truth for the same field.
     result["last_active_iso"] = (args.last_active or None)
 
     if args.json:

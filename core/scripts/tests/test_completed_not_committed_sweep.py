@@ -792,7 +792,14 @@ def test_file_investigate_body_names_the_pull_request():
         assert mod._file_investigate(entry) == "g-115-9001"
     finally:
         mod._rt.aspirations_add_goal = orig
-    assert captured["asp_id"] == "asp-115"
+    # The escalation aspiration is RESOLVED, not hardcoded ( built
+    # _escalation_target;  swept the call sites). This assertion pinned
+    # the pre-resolver literal and failed on every deployment where asp-115 does
+    # not exist — i.e. downstream, where it resolves to asp-001. Assert the CONTRACT
+    # (a non-empty id that the module actually resolved) rather than a constant
+    # that is correct in exactly one deployment.
+    assert captured["asp_id"] == mod.ESCALATION_ASP
+    assert captured["asp_id"]
     body = captured["body"]
     assert "#53" in body["title"]
     assert body["origin_signal"] == f"{mod.STRANDED_SIGNAL_PREFIX}g-335-190"

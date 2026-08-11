@@ -114,10 +114,50 @@ if not r.get("flushed"):
     print(f"[owncloud-flush] no-op (backend={backend}; {r.get('reason','')})")
     sys.exit(0)
 errs = r.get("errors", 0)
-print(f"[owncloud-flush] backend={backend} scope={r.get('scope','all-owned')} "
+# pruned_agents / skipped_unchanged are BOTH computed by sweep() and BOTH
+# returned by the daemon endpoint, and both used to be dropped here. The
+# pruned one is the load-bearing omission (guard-1579): on a box holding no
+# live RUNNING claim every agent dir is pruned, so the flush pushes nothing
+# agent-scoped and printed `pushed=0 ... errors=0` — byte-identical to a
+# healthy no-op. An assistant-mode session then believes its agent-private
+# encodings propagated when they never left the disk.
+pruned = r.get("pruned_agents", 0)
+scope = r.get("scope", "all-owned")
+print(f"[owncloud-flush] backend={backend} scope={scope} "
       f"pushed={r.get('pushed',0)} in_sync={r.get('in_sync',0)} "
       f"scanned={r.get('scanned',0)} conflicts={r.get('conflicts',0)} "
+      f"skipped_unchanged={r.get('skipped_unchanged',0)} "
+      f"pruned_agents={pruned} "
       f"errors={errs}")
+if pruned:
+    # stderr, so a caller parsing the single summary line above is unaffected.
+    # `pruned_agent_names` may be ABSENT against a daemon that has not been
+    # restarted since it started returning names — degrade to the count rather
+    # than printing an empty list, which would read as "no dirs named".
+    names = r.get("pruned_agent_names") or []
+    which = ", ".join(names) if names else "(names unavailable — daemon predates this field)"
+    # pruned_agents has TWO causes and the count CONFLATES them (owncloud_sync
+    # sweep: the owned-prune, then the only_agent narrowing, both feeding one
+    # counter). Attributing every prune to missing ownership is FALSE under
+    # --agent: that scope drops every OTHER agent dir even ones this box fully
+    # owns — test_sweep_only_agent_scopes_to_one_owned_dir asserts
+    # pruned_agents==1 with own-all, i.e. a prune with zero ownership involved.
+    # That matters because `--agent <name>` is the confirm-recipe guard-1579
+    # itself recommends, so the wrong attribution would land exactly where an
+    # operator is looking for a trustworthy answer. `scope` is the discriminator
+    # and the endpoint already returns it.
+    if scope.startswith("agent:"):
+        why = (f"scope is {scope}, so sibling dirs are pruned BY THE NARROWING "
+               f"regardless of ownership — this says nothing about whether this "
+               f"box holds their claims. Re-run without --agent to test ownership")
+    else:
+        why = ("this machine holds no live RUNNING claim for them; encode to "
+               "world/ or meta/ stores if the artifact must reach the fleet")
+    print(f"[owncloud-flush] WARN: {pruned} agent dir(s) pruned — NOT pushed, "
+          f"and writes under them are local-only from this box: {which}. "
+          f"{why} (guard-1579).", file=sys.stderr)
+# Exit semantics deliberately UNCHANGED: pruning is normal and expected on any
+# box that does not own a dir, so it must not fail /stop's D6.7 flush.
 sys.exit(2 if errs else 0)
 PYEOF
 )" || pyrc=$?

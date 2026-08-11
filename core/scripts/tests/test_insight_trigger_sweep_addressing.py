@@ -276,3 +276,86 @@ def test_missing_registry_degrades_to_local_default(env, monkeypatch):
     assert collision == []
     assert [t["msg_id"] for t in resolved] == ["msg-noreg-1"]
     assert refused == []
+
+
+# ---------------------------------------------------------------------------
+# clause 3b () — author-scoped local resolution
+#
+# Measured 2026-08-08 (zeta, hostname cc-02, uname -r 6.8.0-136-generic) over
+# 10,324 de-duplicated board messages / 17 days: clause 3a refused 48 bare
+# `zeta` triggers and prevented ZERO wrong routes. 45 came from non-colliding
+# local authors, 2 from `zeta` itself, 1 from `omni`. These four pins hold the
+# split, and pin 2 is the one that keeps 3b safe rather than merely permissive.
+# ---------------------------------------------------------------------------
+
+
+def test_collision_target_from_noncolliding_local_author_resolves(env):
+    """The 45-of-48 case. 'alpha' is local and does NOT collide, so its bare
+    'zeta' means the local zeta. Resolution is TAGGED — a path that resolves a
+    name the rule otherwise refuses must be distinguishable from a plain
+    clause-2 resolve (guard-2586 / guard-1753)."""
+    _write(env, "findings", _msg("msg-3b-1", author="alpha", target="zeta"))
+    resolved, refused, collision = its.resolve_addressing(its.load_triggers())
+
+    assert collision == ["zeta"]
+    assert [t["msg_id"] for t in resolved] == ["msg-3b-1"]
+    assert resolved[0]["addressing"] == "author_scoped_local"
+    assert refused == []
+
+
+def test_collision_target_from_colliding_author_still_refuses(env):
+    """THE LOAD-BEARING EXCLUSION. 'zeta' authoring a bare 'zeta' resolves
+    locally on BOTH deployments under author-scoping — a double-route, which
+    is strictly worse than the refusal 3a gave. The author must be local AND
+    non-colliding, not merely local."""
+    _write(env, "findings", _msg("msg-3b-2", author="zeta", target="zeta"))
+    resolved, refused, _ = its.resolve_addressing(its.load_triggers())
+
+    assert resolved == []
+    assert len(refused) == 1
+    assert refused[0]["msg_id"] == "msg-3b-2"
+    assert refused[0]["verdict"] == "ambiguous_collision"
+
+
+def test_collision_target_from_unqualified_peer_author_refuses(env):
+    """The measured `omni` case. The peer operator posts UNQUALIFIED, so
+    split_author('omni') is ('omni', None) and the peer-env test above never
+    sees it. Roster membership — not '@'-presence — is what excludes it."""
+    _write(env, "findings", _msg("msg-3b-3", author="omni", target="zeta"))
+    resolved, refused, _ = its.resolve_addressing(its.load_triggers())
+
+    assert resolved == []
+    assert len(refused) == 1
+    assert refused[0]["verdict"] == "ambiguous_collision"
+
+
+def test_collision_target_from_self_qualified_author_refuses(env):
+    """DELIBERATE conservatism, pinned so it reads as a decision rather than
+    an oversight. 3b requires an UNQUALIFIED local author. A self-qualified
+    one (`alpha@self-env`) is genuinely local and would be safe to resolve,
+    but the measured population of such authors is ZERO — so widening the rule
+    would change behavior for nobody (guard-1562). Fails closed until a real
+    case appears."""
+    _write(env, "findings",
+           _msg("msg-3b-4", author=f"alpha@{SELF_ENV}", target="zeta"))
+    resolved, refused, _ = its.resolve_addressing(its.load_triggers())
+
+    assert resolved == []
+    assert refused[0]["verdict"] == "ambiguous_collision"
+
+
+def test_summary_counts_author_scoped_resolutions(env, monkeypatch, capsys):
+    """3b is the one path that resolves a name the rule otherwise refuses, so
+    it must be COUNTABLE in the machine-readable output — inferring it from
+    source is the same defect class as a silent skip (guard-1760)."""
+    _write(env, "findings",
+           _msg("msg-3b-5", author="foxtrot", target="zeta"),
+           _msg("msg-3b-6", author="omni", target="zeta"),
+           _msg("msg-3b-7", target="alpha"))
+    summary = _run_json(monkeypatch, capsys)
+
+    assert summary["scanned"] == 3
+    assert summary["addressing_author_scoped"] == 1
+    assert summary["addressing_refused"] == 1
+    assert summary["collision_set"] == ["zeta"]
+    assert summary["filed"] == 2

@@ -181,3 +181,106 @@ def test_backend_is_preferred_over_stale_local_bytes(tmp_path):
 
     assert "authoritative" in got["alpha"]
     assert "stale" not in got["alpha"]
+
+
+# --------------------------------------------------------------------------
+# read_agent_diary provenance ()
+#
+# `read_fleet_diaries` discards provenance because its callers only ANALYSE
+# content. A caller about to take a DESTRUCTIVE action on the strength of an
+# ABSENCE cannot: "the store of record says no work is happening" and "I could
+# not reach the store of record and the cache is cold" are the same empty
+# string and license opposite decisions. The stranded-claim sweep patches this
+# function in its own tests, so these are the only tests that pin what it
+# actually returns.
+# --------------------------------------------------------------------------
+
+def _with_backend(backend):
+    return unittest.mock.patch.dict(
+        sys.modules,
+        {"storage_backend": unittest.mock.Mock(get_backend=lambda: backend)},
+    )
+
+
+def test_read_agent_diary_reports_authoritative(tmp_path):
+    _mk_agent(tmp_path, "alpha", ['{"stale": true}'])
+
+    class _Fresh:
+        def read_authoritative_bytes(self, path):
+            return b'{"authoritative": true}\n'
+
+    with _with_backend(_Fresh()):
+        text, prov = _fleet_diary.read_agent_diary("alpha", tmp_path)
+
+    assert prov == "authoritative"
+    assert "authoritative" in text and "stale" not in text
+
+
+def test_read_agent_diary_absent_does_not_fall_back_to_the_mirror(tmp_path):
+    """A positive 'not there' from the store must NOT be second-guessed locally.
+
+    This is the semantic the whole provenance split exists for. Falling back
+    here would let cache bytes answer a question the store already answered,
+    re-installing the mirror as an authority — and a caller that keys a
+    destructive decision on `absent` would be reading the cache while believing
+    it read the store of record.
+    """
+    _mk_agent(tmp_path, "alpha", ['{"local": "leftover"}'])
+
+    class _Gone:
+        def read_authoritative_bytes(self, path):
+            raise FileNotFoundError(path)
+
+    with _with_backend(_Gone()):
+        text, prov = _fleet_diary.read_agent_diary("alpha", tmp_path)
+
+    assert prov == "absent"
+    assert text is None, "local mirror bytes leaked into an 'absent' verdict"
+
+
+def test_read_agent_diary_backend_error_is_labelled_local_mirror(tmp_path):
+    """Degrading to the cache is allowed; SILENTLY degrading is not."""
+    _mk_agent(tmp_path, "alpha", ['{"a": 1}'])
+
+    class _Broken:
+        def read_authoritative_bytes(self, path):
+            raise RuntimeError("S3 unavailable")
+
+    with _with_backend(_Broken()):
+        text, prov = _fleet_diary.read_agent_diary("alpha", tmp_path)
+
+    assert prov == "local-mirror"
+    assert '{"a": 1}' in text
+
+
+def test_read_agent_diary_no_backend_is_local_mirror(tmp_path):
+    _mk_agent(tmp_path, "alpha", ['{"a": 1}'])
+    text, prov = _fleet_diary.read_agent_diary("alpha", tmp_path, backend=None)
+    assert prov == "local-mirror"
+    assert '{"a": 1}' in text
+
+
+def test_read_agent_diary_error_when_neither_path_yields_bytes(tmp_path):
+    (tmp_path / "alpha").mkdir()  # no session/, no diary
+    text, prov = _fleet_diary.read_agent_diary("alpha", tmp_path, backend=None)
+    assert (text, prov) == (None, "error")
+
+
+def test_read_agent_diary_hands_the_backend_an_absolute_path(tmp_path, monkeypatch):
+    """Same relative-path trap as the fleet reader — pinned on this entry point too,
+    because a relative path here would silently return cache bytes LABELLED
+    `authoritative`, which is strictly worse than the unlabelled version."""
+    _mk_agent(tmp_path, "alpha", ['{"a": 1}'])
+    seen: list[Path] = []
+
+    class _Spy:
+        def read_authoritative_bytes(self, path):
+            seen.append(Path(path))
+            return Path(path).read_bytes()
+
+    monkeypatch.chdir(tmp_path)
+    with _with_backend(_Spy()):
+        _, prov = _fleet_diary.read_agent_diary("alpha", tmp_path)
+
+    assert prov == "authoritative"
+    assert seen and seen[0].is_absolute(), f"non-absolute path reached backend: {seen}"

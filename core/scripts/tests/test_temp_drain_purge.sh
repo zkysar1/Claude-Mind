@@ -60,13 +60,47 @@ else
 fi
 # : main() must emit the new lane fields (else a downstream JSON
 # consumer of drained_gc_*/stray_* silently sees nulls).
-for k in '"drained_gc_would_purge"' '"stray_would_purge"' '"drained_age_days"' '"citation_lookup"'; do
+for k in '"drained_gc_would_purge"' '"stray_would_purge"' '"drained_age_days"' '"citation_lookup"' '"drained_gc_files"'; do
   if printf '%s' "$out" | grep -q "$k"; then
     echo "  [PASS] dry-run JSON carries $k"
   else
     echo "  [FAIL] dry-run JSON missing $k — out=$out"; fails=$((fails+1))
   fi
 done
+
+#  main()-level wiring. The function-level cases above prove the
+# EXEMPTION and the LIST; they cannot prove main() actually READS them, and the
+# two ways that wiring silently breaks both yield a well-formed, empty
+# "drained_gc_files":[] — indistinguishable from an honestly-empty drained/ dir.
+# So assert on a fixture that GUARANTEES a non-empty list rather than on the live
+# temp dir, whose drained/ may legitimately have nothing aged past 30d
+# (measured on cc-04 at authoring time: 0 — a real zero that would have made a
+# live-dir assertion pass vacuously forever).
+#   (1) `gc_count="$(gc_drained_archive ...)"` forks a subshell, so the
+#       GC_DRAINED_FILES global set inside is discarded (this was a real bug in
+#       the first draft of the fix, caught before commit).
+#   (2) the JSON builder could emit [] regardless of the global.
+# Driven via MIND_AGENT_DIR, the documented test-only agent-dir override
+# (_paths.sh:163) — plain PROJECT_ROOT/AGENT_DIR env vars do NOT work here
+# because main() sources _paths.sh, which recomputes both from the real repo
+# (measured: the fixture resolved to the LIVE agents/wiretest path and the test
+# read the no-temp-dir branch instead). The fixture must sit UNDER the real
+# PROJECT_ROOT to clear assert_safe_temp_dir guard 5, and its basename must be
+# "temp" for guard 6 — hence a nested temp/ inside this agent's own temp store,
+# which also keeps it self-cleaning and out of live agents/.
+echo "main() lane-2 file-list wiring (g-306-102):"
+TW="$(cd "$SCRIPT_DIR/../.." && pwd)/agents/${MIND_AGENT:-alpha}/temp/.wiretest-$$"
+mkdir -p "$TW/temp/drained"
+: > "$TW/temp/drained/wire-old.md"
+touch -d '40 days ago' "$TW/temp/drained/wire-old.md"
+w_out="$(MIND_AGENT_DIR="$TW" bash "$HELPER" --dry-run 2>/dev/null)"
+if printf '%s' "$w_out" | grep -q '"drained_gc_files":\["wire-old.md"\]'; then
+  echo "  [PASS] main() propagates the lane-2 basename into drained_gc_files"
+else
+  echo "  [FAIL] main() lane-2 list empty/wrong (subshell or builder regression) — out=$w_out"
+  fails=$((fails+1))
+fi
+rm -rf "$TW"
 
 echo "no-temp-dir exit path (g-115-2955) — schema parity with main path:"
 # The dry-run smoke above runs against the LIVE agent temp/ (which exists), so it
@@ -142,6 +176,84 @@ lcheck "gc_drained tracked: tracked-old.md SURVIVED"       yes "$([ -f "$TG/temp
 lcheck "gc_drained tracked: untracked-old.md purged"       no  "$([ -f "$TG/temp/drained/untracked-old.md" ] && echo yes || echo no)"
 rm -rf "$TG"
 
+# ── Lane 2 CITED exemption + file list () ────────────────────────────
+# Before this, a citation protected an artifact in temp/ (Lane 1, ) but
+# NOT once /drain-temp archived it into temp/drained/ — protection was a property
+# of WHICH DIRECTORY the file sat in, not of the artifact. Lane 2 also returned a
+# bare COUNT, so durability-property-check.py had nothing to intersect and was
+# Lane-1-only BY CONSTRUCTION; an exemption nobody can verify is the
+# conditionally-active-mechanism pattern asp-306 exists to kill.
+TC="$(mktemp -d)"
+mkdir -p "$TC/temp/drained"
+: > "$TC/temp/drained/cited-evidence.md";   touch -d '40 days ago' "$TC/temp/drained/cited-evidence.md"
+: > "$TC/temp/drained/uncited-old.md";      touch -d '40 days ago' "$TC/temp/drained/uncited-old.md"
+
+# POSITIVE CONTROL, and it must come FIRST: with NO cited args the lane must
+# still see BOTH files and publish BOTH basenames. Without this, a
+# GC_DRAINED_FILES that is empty for a MECHANICAL reason (e.g. the global lost to
+# a `$(...)` subshell) would make every exemption assertion below pass vacuously
+# — the list would be empty either way and "cited file absent from the list"
+# would prove nothing. Asserting the list is NON-empty here is what gives the
+# assertions their meaning.
+lcheck "gc_drained cited: no-cited-args dry-run counts BOTH" 2 "$(gc_drained_archive "$TC/temp/drained" 30 1)"
+gc_drained_archive "$TC/temp/drained" 30 1 >/dev/null
+lcheck "gc_drained cited: CONTROL list is non-empty (2)"     2 "$(printf '%s' "$GC_DRAINED_FILES" | grep -c . || true)"
+lcheck "gc_drained cited: CONTROL list names the cited file" yes \
+  "$(printf '%s\n' "$GC_DRAINED_FILES" | grep -qFx 'cited-evidence.md' && echo yes || echo no)"
+lcheck "gc_drained cited: GC_DRAINED_COUNT global matches"    2 "$GC_DRAINED_COUNT"
+
+# THE FIX: pass the basename as cited — it must be exempt, absent from the list,
+# and survive a REAL (non-dry) run.
+lcheck "gc_drained cited: dry-run counts uncited only"       1 \
+  "$(gc_drained_archive "$TC/temp/drained" 30 1 cited-evidence.md)"
+gc_drained_archive "$TC/temp/drained" 30 1 cited-evidence.md >/dev/null
+lcheck "gc_drained cited: cited file EXCLUDED from list"     no \
+  "$(printf '%s\n' "$GC_DRAINED_FILES" | grep -qFx 'cited-evidence.md' && echo yes || echo no)"
+lcheck "gc_drained cited: uncited file still IN list"        yes \
+  "$(printf '%s\n' "$GC_DRAINED_FILES" | grep -qFx 'uncited-old.md' && echo yes || echo no)"
+lcheck "gc_drained cited: real run purges uncited only"      1 \
+  "$(gc_drained_archive "$TC/temp/drained" 30 0 cited-evidence.md)"
+lcheck "gc_drained cited: cited-evidence.md SURVIVED"        yes \
+  "$([ -f "$TC/temp/drained/cited-evidence.md" ] && echo yes || echo no)"
+lcheck "gc_drained cited: uncited-old.md purged"             no \
+  "$([ -f "$TC/temp/drained/uncited-old.md" ] && echo yes || echo no)"
+
+rm -rf "$TC"
+
+# ARITY PIN: a SHORT call must read an EMPTY cited set, never its own positionals.
+# Two things make this pin work, and the first draft got both wrong:
+#
+#   ARITY — it must be a SHORT call (2 args), not a 3-arg one. With exactly 3
+#   args `shift 3` SUCCEEDS, so the guarded and unguarded forms are identical and
+#   a 3-arg pin passes against sabotaged code (measured: mutation-proof-test.sh
+#   returned VACUOUS on the 3-arg version). Short calls are a real shape because
+#   the function documents ${2:-30} / ${3:-0} defaults.
+#
+#   FILENAME — the fixture must be named "30" so it COLLIDES with the age_days
+#   argument. Under `shift 3 || true` on a short call the original positionals
+#   survive in "$@", so "30" lands in cited_arr and that file is wrongly EXEMPT.
+#   A normally-named fixture collides with no argument, so the count is identical
+#   either way and the pin passes vacuously for a second, independent reason.
+#
+# Worth pinning because the failure only ever exempts MORE: the lane silently
+# under-deletes while every count still looks plausible.
+# NOTE: a 2-arg call takes dry_run's default of 0, so this REALLY deletes — which
+# is why it runs last, in its own fixture dir.
+TA="$(mktemp -d)"; mkdir -p "$TA/temp/drained"
+: > "$TA/temp/drained/30";            touch -d '40 days ago' "$TA/temp/drained/30"
+: > "$TA/temp/drained/normal-old.md"; touch -d '40 days ago' "$TA/temp/drained/normal-old.md"
+lcheck "gc_drained arity: 2-arg short call sees an EMPTY cited set" 2 \
+  "$(gc_drained_archive "$TA/temp/drained" 30)"
+lcheck "gc_drained arity: arg-named file '30' was NOT exempted"     no \
+  "$([ -f "$TA/temp/drained/30" ] && echo yes || echo no)"
+# Positive counterpart: the same name IS exempt when genuinely passed as cited.
+: > "$TA/temp/drained/30"; touch -d '40 days ago' "$TA/temp/drained/30"
+lcheck "gc_drained arity: 4-arg call DOES exempt the same name"     0 \
+  "$(gc_drained_archive "$TA/temp/drained" 30 0 30)"
+lcheck "gc_drained arity: cited '30' SURVIVED the real run"         yes \
+  "$([ -f "$TA/temp/drained/30" ] && echo yes || echo no)"
+rm -rf "$TA"
+
 # Lane 3 — stray-dir cleanup (>120min, NOT drained/)
 lcheck "cleanup_stray dry-run counts 1"           1          "$(cleanup_stray_dirs "$T2/temp" 120 1)"
 lcheck "cleanup_stray dry-run kept stale-dir"     yes        "$([ -d "$T2/temp/stale-dir" ] && echo yes || echo no)"
@@ -175,6 +287,87 @@ lcheck "cleanup_stray preserved RECEIPT bodies/ + object"   yes "$([ -f "$T2/tem
 lcheck "cleanup_stray preserved .archive-marker dir"        yes "$([ -d "$T2/temp/arc-marker" ] && echo yes || echo no)"
 lcheck "cleanup_stray removed the plain-stale dir"          no  "$([ -d "$T2/temp/plain-stale" ] && echo yes || echo no)"
 rm -rf "$T2"
+
+echo "receipt-sentinel extension/case agnosticism (g-115-3397, via _has_archive_receipt SSOT):"
+# The reader required RECEIPT.md exactly while ZERO producers write that name —
+# _seed_engine.py writes RECEIPT.json, history_vacuum_archive.py writes
+# lowercase receipt.json. Every case below is aged past the 120-min guard, so
+# WITHOUT the widened predicate the three real-producer shapes are DELETED.
+# The two NEGATIVE cases are the anti-vacuity control: a predicate widened to a
+# bare *receipt* substring, or one that dropped -maxdepth 1, would pass all the
+# positives and be unfalsifiable. They must stay RED-able independently.
+T3="$(mktemp -d)"
+mkdir -p "$T3/temp/arc-json/bodies" "$T3/temp/arc-lower" "$T3/temp/arc-bare" \
+         "$T3/temp/decoy-substring" "$T3/temp/decoy-nested/bodies"
+: > "$T3/temp/arc-json/RECEIPT.json"              # _seed_engine.py shape
+: > "$T3/temp/arc-json/bodies/obj-1.json"
+: > "$T3/temp/arc-lower/receipt.json"             # history_vacuum_archive.py shape
+: > "$T3/temp/arc-bare/RECEIPT"                   # extensionless receipt
+: > "$T3/temp/decoy-substring/old-receipt-notes.txt"   # NEGATIVE: scratch, not an archive
+: > "$T3/temp/decoy-nested/bodies/RECEIPT.json"        # NEGATIVE: not top-level
+find "$T3/temp" -mindepth 1 -exec touch -d '3 hours ago' {} + 2>/dev/null || true
+touch -d '3 hours ago' "$T3/temp"
+
+# Predicate-level assertions (the SSOT function, independent of Lane 3's loop)
+lcheck "_has_archive_receipt: RECEIPT.json (seed-engine shape)"  0 "$(_has_archive_receipt "$T3/temp/arc-json"; echo $?)"
+lcheck "_has_archive_receipt: lowercase receipt.json"            0 "$(_has_archive_receipt "$T3/temp/arc-lower"; echo $?)"
+lcheck "_has_archive_receipt: extensionless RECEIPT"             0 "$(_has_archive_receipt "$T3/temp/arc-bare"; echo $?)"
+lcheck "_has_archive_receipt: NEG substring old-receipt-notes"   1 "$(_has_archive_receipt "$T3/temp/decoy-substring"; echo $?)"
+lcheck "_has_archive_receipt: NEG nested receipt is not top-level" 1 "$(_has_archive_receipt "$T3/temp/decoy-nested"; echo $?)"
+lcheck "_has_archive_receipt: NEG empty arg"                     1 "$(_has_archive_receipt ""; echo $?)"
+
+# Lane-3 integration: only the 2 decoys purge; the 3 real receipts survive.
+lcheck "cleanup_stray dry-run counts 2 (3 receipts excluded)" 2 "$(cleanup_stray_dirs "$T3/temp" 120 1 2>/dev/null)"
+lcheck "cleanup_stray real purges 2 (3 receipts preserved)"   2 "$(cleanup_stray_dirs "$T3/temp" 120 0 2>/dev/null)"
+lcheck "preserved RECEIPT.json dir"          yes "$([ -d "$T3/temp/arc-json" ] && echo yes || echo no)"
+lcheck "preserved RECEIPT.json payload"      yes "$([ -f "$T3/temp/arc-json/bodies/obj-1.json" ] && echo yes || echo no)"
+lcheck "preserved lowercase receipt.json dir" yes "$([ -d "$T3/temp/arc-lower" ] && echo yes || echo no)"
+lcheck "preserved extensionless RECEIPT dir"  yes "$([ -d "$T3/temp/arc-bare" ] && echo yes || echo no)"
+lcheck "purged the substring decoy"           no  "$([ -d "$T3/temp/decoy-substring" ] && echo yes || echo no)"
+lcheck "purged the nested-receipt decoy"      no  "$([ -d "$T3/temp/decoy-nested" ] && echo yes || echo no)"
+rm -rf "$T3"
+
+echo "unmanaged-dotfile REPORT lane (g-115-3397, Lane 0 — reports, never deletes):"
+# A dotfile under temp/ is matched by NO lane: the drain enumerates temp/*.md +
+# temp/*.json (a glob that cannot match a leading dot) and Lane 1 exempts
+# `! -name '.*'`. The originating case was a 221-byte secret-bearing dotfile.
+# This lane makes the residue VISIBLE without adding a way to destroy live state
+# — the survival assertion below is the load-bearing one, not the count.
+T4="$(mktemp -d)"
+mkdir -p "$T4/temp" "$T4/temp/.hidden-dir"
+: > "$T4/temp/.launch-payload.json"     # the originating shape
+: > "$T4/temp/.fresh-eyes-last-ts"      # live cadence marker — must be reported, NOT deleted
+: > "$T4/temp/.gitkeep"                 # allowlisted lifecycle marker
+: > "$T4/temp/.archive-marker"          # allowlisted lifecycle marker
+: > "$T4/temp/plain.txt"                # NEGATIVE: not a dotfile, must not be reported
+lcheck "report_unmanaged_dotfiles counts only non-allowlisted" 2 \
+  "$(report_unmanaged_dotfiles "$T4/temp" 2>/dev/null)"
+report_unmanaged_dotfiles "$T4/temp" >/dev/null 2>&1
+lcheck "reported .launch-payload.json"   yes "$(printf '%s' "$UNMANAGED_DOTFILES" | grep -Fqx '.launch-payload.json' && echo yes || echo no)"
+lcheck "reported .fresh-eyes-last-ts"    yes "$(printf '%s' "$UNMANAGED_DOTFILES" | grep -Fqx '.fresh-eyes-last-ts' && echo yes || echo no)"
+lcheck "did NOT report .gitkeep"         no  "$(printf '%s' "$UNMANAGED_DOTFILES" | grep -Fqx '.gitkeep' && echo yes || echo no)"
+lcheck "did NOT report .archive-marker"  no  "$(printf '%s' "$UNMANAGED_DOTFILES" | grep -Fqx '.archive-marker' && echo yes || echo no)"
+lcheck "did NOT report plain.txt (non-dotfile)" no "$(printf '%s' "$UNMANAGED_DOTFILES" | grep -Fqx 'plain.txt' && echo yes || echo no)"
+lcheck "did NOT report .hidden-dir (-type f only)" no "$(printf '%s' "$UNMANAGED_DOTFILES" | grep -Fqx '.hidden-dir' && echo yes || echo no)"
+# REPORT, NOT PURGE — every reported file MUST still be on disk afterwards.
+lcheck "report did NOT delete .launch-payload.json" yes "$([ -f "$T4/temp/.launch-payload.json" ] && echo yes || echo no)"
+lcheck "report did NOT delete .fresh-eyes-last-ts"  yes "$([ -f "$T4/temp/.fresh-eyes-last-ts" ] && echo yes || echo no)"
+lcheck "report did NOT delete .gitkeep"             yes "$([ -f "$T4/temp/.gitkeep" ] && echo yes || echo no)"
+# CAPTURE FIRST, then match. Do NOT pipe the producer straight into `grep -q`
+# here: under `set -uo pipefail` GNU grep exits at the FIRST match, the
+# producer's remaining stderr writes take EPIPE, and the pipeline status becomes
+# that failure — so the assertion reads "no" while the stderr it is testing for
+# was emitted correctly. It reproduces ONLY with 2+ reported dotfiles (one write
+# never meets a closed pipe) and ONLY under real GNU grep — a hand-probe in an
+# interactive shell whose profile defines a `grep` function reads GREEN, which
+# is the guard-1742 / probe-with-canonical-code-path.md rule-4 shell-shape trap.
+_dot_stderr="$(report_unmanaged_dotfiles "$T4/temp" 2>&1 >/dev/null)"
+lcheck "report emits a name on stderr"   yes \
+  "$(printf '%s' "$_dot_stderr" | grep -Fq 'UNMANAGED DOTFILE' && echo yes || echo no)"
+lcheck "report on a missing temp_dir -> 0" 0 "$(report_unmanaged_dotfiles "$T4/nonexistent" 2>/dev/null)"
+lcheck "DOTFILE_ALLOWLIST override honored"  1 \
+  "$(DOTFILE_ALLOWLIST='.gitkeep .archive-marker .fresh-eyes-last-ts' report_unmanaged_dotfiles "$T4/temp" 2>/dev/null)"
+rm -rf "$T4"
 
 echo "purge-lane behavior (via _purge_find_predicate SSOT function, g-115-2947):"
 # Run the SSOT predicate against a synthetic temp dir. We assert the MATCHED set

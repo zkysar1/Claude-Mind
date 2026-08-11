@@ -36,6 +36,71 @@ gap_types:
   # capability_level (tree.yaml) and falls back to the agent's developmental stage
   # (developmental-stage.yaml) only when no node confidence is available.
 
+gap_statuses:
+  # SSOT for the skill-gap status vocabulary (, declared 2026-08-02).
+  #
+  # WHY THIS BLOCK EXISTS. Until now this file declared NO status vocabulary at
+  # all. With nothing to read, each new status was coined ad hoc at resolution
+  # time and every consumer kept its OWN copy of the suppressing set — which is
+  # the copy-drift class guard-426 forbids, with no authoritative source to
+  # reference. It bit twice: `satisfied-by-extension` (coined 2026-07-26) was
+  # invisible to the evolve forge filter's `status != "forged"` test for a day,
+  # and `deferred-to-goal` (added 2026-08-01) shipped without the corpus sweep
+  # guard-334 requires, so gap-045 kept re-qualifying as forge-ready.
+  #
+  # ONE flat map, three derivations — do not add parallel subset lists:
+  #   valid vocabulary  = set(gap_statuses)
+  #   terminal set      = {k for k,v in ... if v["terminal"]}
+  #   suppressing set   = {k for k,v in ... if v["suppresses_forge"]}
+  # `terminal` and `suppresses_forge` are DISTINCT axes and must not be
+  # collapsed: deferred-to-goal suppresses forging without being terminal.
+  #
+  # READERS MUST REFERENCE THIS BLOCK, NEVER RE-COPY IT (guard-426). Where an
+  # inline copy is unavoidable on a hot path, guard-426 requires a comment
+  # naming this block AND a drift check that diffs the copy against it — see
+  # test_skill_gaps_hardening.py::test_terminal_set_matches_declared_vocabulary.
+  # Current copies, all drift-checked: coordination_merge.py
+  # (_SKILL_GAP_TERMINAL / _SKILL_GAP_DEFERRED), aspirations-evolve/SKILL.md
+  # Step 9, aspirations-spark/SKILL.md Phase 6.5.
+  #
+  # Enforcement of the vocabulary itself is skill-gaps-validate.py, which reads
+  # this map and refuses any gap carrying a status not declared here. Adding a
+  # value is therefore a two-part act (guard-334): declare it HERE with a real
+  # WRITER, then SWEEP meta/skill-gaps.yaml for records that should already
+  # carry it and report the count — a measured zero and an unrun sweep are
+  # indistinguishable afterwards.
+  registered:
+    terminal: false
+    suppresses_forge: false
+    description: "Gap is open and forge-eligible once times_encountered >= forge_threshold."
+  deferred-to-goal:
+    terminal: false
+    suppresses_forge: true
+    description: >-
+      Resolution path DECIDED and tracked by the open goal named in the gap's
+      `resolution_tracked_by` field. Nothing has shipped, so no terminal status
+      is honest yet — but forging is the wrong shape, so it suppresses. Carries
+      a re-check obligation (aspirations-evolve Step 9): a deferral whose
+      tracker is missing, void, or terminal must not suppress forever.
+  forged:
+    terminal: true
+    suppresses_forge: true
+    description: "A skill was created; /forge-skill also writes a forged-skills.yaml entry with gap_ref."
+  dismissed:
+    terminal: true
+    suppresses_forge: true
+    description: "Explicitly declined via /forge-skill dismiss (writes dismissed_reason + dismissed_date)."
+  satisfied-by-extension:
+    terminal: true
+    suppresses_forge: true
+    description: >-
+      Capability shipped by EXTENDING an existing script or skill instead of
+      forging a new one. A legitimate and often preferable outcome
+      (implementation-discipline: no single-use abstractions), and the honest
+      label when nothing was in fact forged. Has no forged skill and therefore
+      no gap_ref, so the forged-skills.yaml registry cross-check cannot see it —
+      status is the only signal.
+
 experience_mining:
   min_cluster_size: 3           # Min similar executions to register a gap
   scan_window_days: 30          # Only scan recent experiences

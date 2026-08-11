@@ -101,6 +101,18 @@ The bracket is not cosmetic: `pgrep -f "run-full-suite"` matches the shell
 running the pgrep, so the naive form reports phantom orphans and aborts your
 probe. Measured the same day.
 
+**Run the probe as its OWN command — the bracket does not save you otherwise.**
+It only stops `pgrep` matching its own argv. Put the check and the launch in one
+command (`if pgrep -af "[r]un-full-suite"; then abort; else run-full-suite.sh …`)
+and the ENCLOSING wrapper shell's argv contains the literal script name — a
+different process, which the bracket cannot defend against. It matches, and the
+guard aborts the launch it was written to protect. Measured 2026-08-01 (alpha,
+`hostname` cc-04, `uname -r` 6.8.0-136-generic): a clean process table reported
+one phantom "live run" whose only cited PID was the guard's own wrapper. Two
+separate calls, always. (guard-1238 is the general form — "never use a pattern
+that appears in the probing command itself"; the bracket is a partial mitigation
+of it, not an exemption from it.)
+
 What IS settled: the tree is healthy alone. Run by itself with a verified-clear
 process table, `mind_api/tests` fails **7 tests across 3 files**, all
 `TestByteCompat` — the known byte-compat reds, matching its earlier baseline.
@@ -228,6 +240,46 @@ runs whenever no live daemon is present. Enforced by `guard-672`.
 
 > **RE-BASELINED 2026-07-26 (g-115-3085 Layer 2 landed, alpha). The 2026-06-17
 > AND 2026-07-25 figures are both HISTORICAL — do not compare against either.**
+>
+> **NAMED-RED ROSTER — re-measured 2026-08-09 (alpha, `hostname` cc-04, `uname -r`
+> 6.8.0-136-generic, own-cloud, live fleet). Read this BEFORE triaging any failure
+> named in the rows below.** Those rows accumulate red claims in prose scattered
+> across ten baseline entries, and nothing ever re-checked them — so a reader
+> inherits a twelve-day-old red as current. Targeted solo re-runs of every file the
+> rows still name as red, `STORAGE_BACKEND=local`: all four **GREEN on this box**.
+>
+> | file | tracker | what the rows below say | measured 2026-08-09 cc-04 |
+> |---|---|---|---|
+> | `test_fleet_config_parity` | g-115-3803 | RED 7x on a box called "cc-04" | **57 passed / 0 failed** |
+> | `test_completed_not_committed_sweep` | g-115-4269 | green solo, red in-suite | 63 passed solo — consistent; solo cannot falsify an in-suite claim |
+> | `test-wm-prune-cadence-protection.sh` | g-115-3799 | "fails SOLO ⇒ genuine" | cc-04 **rc=0, 5/5** — but **RED on cc-03**, see below |
+> | `test_email_read_listing_assertion.sh` (domain) | g-335-586 lane | 9/15 sub-assertions red | **rc=0, 19 passed / 0 failed** |
+>
+> **`test-wm-prune-cadence-protection.sh` is BOX-SPLIT, and this row is the correction
+> to my own cc-04 green** (echo, `hostname` cc-03, `uname -r` 6.8.0-136-generic,
+> 2026-08-10, solo re-run with `STORAGE_BACKEND=local` on a quiet box):
+> `rc=1`, `CASE last_goal_category FAIL: expected evicted, got val='infrastructure'`
+> — red SOLO, so GENUINE by the guard-1448 discriminator, not contention. Read
+> together with the cc-04 green one day earlier, that is cc-03 RED / cc-04 GREEN, not
+> "resolved". A roster row carrying only the green would have handed the next reader a
+> fleet-wide all-clear that is false on this box — the same shape as the row above it,
+> which is why the roster asks to be kept current rather than appended to.
+> **NOT yet applied here: the env-diff discriminator** (guard-2015 / rb-5907) — before
+> anyone records this as PORTABILITY, re-run on the GREEN box with the suspect env var
+> SET, because env-dependence reproduces cross-platform and genuine
+> platform-dependence does not. That is `g-115-3799`'s call, not a reason to hold the
+> measurement back.
+>
+> A green here does **not** close any of those goals: the nickname-collision row
+> below establishes that "cc-04" names at least two machines, and one box's green
+> is not evidence about another's red (guard-2015). What it does mean is that you
+> must not begin a triage from the prose alone — re-run the file solo first. It
+> costs seconds, and two of these four contradict what the rows assert about them.
+>
+> **Keep this roster current instead of adding an eleventh baseline row.** The rows
+> below already establish that a fresh TOTAL is not comparable across runs and that
+> the chunk rung is not inheritable, so another whole-suite number buys nothing
+> while the file sits under read-cap pressure (the g-115-4058 folding practice).
 >
 > | | 2026-06-17 | 2026-07-25 | 2026-07-26 | **2026-07-27 (cc-04, Linux)** |
 > |---|---|---|---|---|
@@ -689,12 +741,12 @@ runs whenever no live daemon is present. Enforced by `guard-672`.
 > accounted for all 20 prior failures. `test_monitor_tick`, `test_init_backfill`
 > and `test_history_vacuum_archive` are now fully **GREEN**.
 >
-> **So: do NOT excuse a failure in those files as environmental any more.** The 6
-> named below carry no timeout signature — when they DO fail, the failure is real.
-> ~~still failing~~ **RESOLVED — see the Windows row below; all 6 now pass on both
-> platforms.** (`test_pending_deploys_gate`, `test_pre_apply_consult_gate_scope`,
-> `test_pending_deploys_stop_hook`, `test_iteration_push`,
-> `test_infra_streak_dedup_sh`, `test_git_merge_ayoai_ledger`)
+> **So: do NOT excuse a failure in those files as environmental any more** — they
+> carry no timeout signature, so when they DO fail the failure is real. The six
+> that were red here (`test_pending_deploys_gate`, `test_pre_apply_consult_gate_scope`,
+> `test_pending_deploys_stop_hook`, `test_iteration_push`, `test_infra_streak_dedup_sh`,
+> `test_git_merge_ayoai_ledger`) are **RESOLVED** — all pass on both platforms, see
+> the Windows row below. The instruction is about the CLASS, not a live hunt list.
 >
 > **2026-07-27 — WINDOWS row, closing the portability question the row above left
 > open** (alpha, `DESKTOP-O91DLK2`, Windows 10 19045 / MSYS2 MINGW64, `sys.platform

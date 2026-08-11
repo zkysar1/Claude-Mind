@@ -296,6 +296,14 @@ def handle(ctx) -> "Response":  # type: ignore[name-defined]
             _r.GUARD_PATH = world / "guardrails.jsonl"
             _r.SIGS_PATH = world / "pattern-signatures.jsonl"
             _r.BELIEFS_PATH = world / "knowledge" / "beliefs.yaml"
+            # LIVE-ONLY here too. DO NOT INLINE-CHANGE without its twin at
+            # core/scripts/retrieve.py's EXP_PATH assignment, which carries the
+            # full evidence (guard-130). Short version: the live-only scope is an
+            # UNINTENDED reachability gap over 1,722 archived records, not active
+            # forgetting — the archive sweep's utility_ratio criterion degenerates
+            # to an age cap and its high-value protection is unreachable
+            # (, measured 2026-08-04). Widening one side alone fixes
+            # nothing: this re-bind points at the same live file per request.
             _r.EXP_PATH = (agent_dir / "experience.jsonl") if agent_dir else None
             _r.EI_PATH = (agent_dir / "experiential-index.yaml") if agent_dir else None
             _r.FRAMEWORK_WORLD_CONVENTIONS_DIR = world / "conventions"

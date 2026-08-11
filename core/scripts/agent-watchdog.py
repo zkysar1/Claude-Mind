@@ -257,6 +257,11 @@ class WatchdogContext:
     agent_dir: Path
     project_root_path: Path
     cycle: int = 0
+    # "reducer" (the Body holding running-session-id) or "worker". Decides which
+    # probes build_probes() registers — a worker's state shape makes five of them
+    # structurally unable to fire (). Defaults to reducer so every
+    # existing caller and test keeps its current behaviour unchanged.
+    body_role: str = "reducer"
     _process_cache: Optional[str] = field(default=None, repr=False)
 
     def new_cycle(self) -> None:
@@ -583,6 +588,223 @@ class HeartbeatProbe(Probe):
     def from_dict(self, state: dict) -> None:
         if state and "last_state" in state:
             self.last_state = str(state["last_state"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ClaimHeartbeatProbe — the reader for claim-heartbeat-failure ()
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _claim_stale_window_seconds() -> float:
+    """The claim's ownership-stale window, in seconds.
+
+    Deliberately the SAME source heartbeat-tick.sh uses for its own banner
+    (`OWNERSHIP_STALE_SECONDS`, default 3900), so writer and reader agree about
+    when an outage has entered the window in which a peer may legally seize the
+    claim.
+
+    NOT an identity, and an earlier draft of this docstring wrongly claimed the
+    two "can never disagree". They agree for unset and for any positive integer,
+    which is every real case. They diverge on values bash accepts and this guard
+    rejects — `0`, negatives, and floats: `${OWNERSHIP_STALE_SECONDS:-3900}` keeps
+    a literal `0` while `isdigit() and >0` falls back to 3900 here (and bash `$((
+    ))` would itself fail on a float). Rejecting those is the right call for a
+    reader, since a 0-second window would make every marker instantly critical —
+    but say so rather than asserting an identity that does not hold.
+    """
+    raw = (os.environ.get("OWNERSHIP_STALE_SECONDS") or "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return float(raw)
+    return 3900.0
+
+
+def parse_claim_heartbeat_marker(text: Optional[str]) -> Optional[dict]:
+    """Parse heartbeat-tick.sh's `key=value` marker. None when absent or unusable.
+
+    Mirrors reducer_self_fence.read_failure_elapsed's tolerance deliberately: a
+    corrupt or half-written marker must never be read as a LONG outage, so a
+    non-numeric first_failed_at yields None rather than a guess.
+    """
+    if not text:
+        return None
+    fields: dict = {}
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        fields[k.strip()] = v.strip()
+    first = fields.get("first_failed_at", "")
+    if not first.isdigit():
+        return None
+    count = fields.get("count", "")
+    return {
+        "first_failed_at": int(first),
+        "count": int(count) if count.isdigit() else 0,
+        "last_rc": fields.get("last_rc", ""),
+        "last_error": fields.get("last_error", ""),
+    }
+
+
+class ClaimHeartbeatProbe(Probe):
+    """Surfaces <agent>/session/claim-heartbeat-failure, which had NO reader.
+
+    heartbeat-tick.sh (g-306-221) writes this marker when the DDB runner-claim
+    heartbeat leg fails, and escalates to a loud stderr banner past half the
+    ownership-stale window. But guard-772: stderr is invisible when the tick runs
+    inside a backgrounded Bash call, which is the normal case — so on the box
+    where it matters most (an unattended reducer) the durable marker was the only
+    surviving evidence, and nothing looked at it.
+
+    THIS PROBE MUST NEVER DELETE THE MARKER, and that is the load-bearing
+    constraint rather than a style note. reducer_self_fence.read_failure_elapsed
+    treats an ABSENT marker as "the last renewal SUCCEEDED" and returns 0, so a
+    CONSUMING reader would reset first_failed_at at every read, elapsed could
+    never accumulate, and the sustained-renewal-gap stepdown could NEVER fire —
+    the gate that stops a box acting as reducer after it has lost the claim (the
+    2026-08-05 dual-reducer incident this marker family exists to catch). This is
+    also why /prime is the wrong host: its recovery-notice precedent is `cat + rm`.
+    guard-2760 states the general form — the marker already has a consumer whose
+    remedy is DESTRUCTIVE (step the reducer down); this one is deliberately
+    REVERSIBLE, it reports and does not act.
+
+    Three transitions per episode:
+      - claim_heartbeat_failing (info): marker present, outage under way.
+      - claim_heartbeat_stepdown_window (critical): elapsed reached half the
+        ownership-stale window, so a peer may soon legally take the claim while
+        this box keeps running. Same threshold expression as the writer's banner.
+      - claim_heartbeat_recovered (info): marker gone after a prior failure.
+
+    The MIDDLE transition is the point: a lone appear-time event on a 30-minute
+    outage leaves the reader with a notice from half an hour ago and silence since.
+
+    Worker-inert BY CONSTRUCTION: "claim-heartbeat" is absent from
+    WORKER_SAFE_PROBES, so build_probes filters it out on a worker Body — where
+    heartbeat-tick refuses on IDLE before ever reaching the DDB leg and the marker
+    is sync_tier machine_local. Four probes are already worker-inert and a fifth
+    should not arrive unannounced.
+    """
+
+    name = "claim-heartbeat"
+
+    def __init__(self, ctx: WatchdogContext) -> None:
+        super().__init__(ctx)
+        self.marker_path = ctx.agent_dir / "session" / "claim-heartbeat-failure"
+        self.stale_window_seconds = _claim_stale_window_seconds()
+        # absent | failing | stepdown_window. Persisted via to_dict/from_dict:
+        # --tick is a FRESH PROCESS each iteration, so "emit once per transition"
+        # lives entirely in serialization. An in-process-only dedup would test
+        # green and still spam every iteration in production.
+        self.last_state: str = "absent"
+        # Dedup for the unreadable-marker warning, kept SEPARATE from last_state
+        # on purpose: an unreadable read must not overwrite our memory of whether
+        # an outage was under way, or unreadable->absent would emit a recovery we
+        # never observed (and absent->unreadable->absent would invent one).
+        self.last_unreadable: bool = False
+
+    def check(self) -> list[Event]:
+        events: list[Event] = []
+        # read_text_safe never unlinks. Do not "simplify" this to a consuming
+        # read — see the class docstring.
+        parsed = parse_claim_heartbeat_marker(read_text_safe(self.marker_path))
+
+        if parsed is None and self.marker_path.exists():
+            # PRESENT but unreadable or unparseable. read_text_safe collapses
+            # "missing" and "unreadable" into the same None, and reducer_self_fence
+            # deliberately reads both as "renewal succeeded" — correct THERE, because
+            # its remedy is destructive (stepdown) and must not fire on ambiguity.
+            # This probe only REPORTS, so the fail-safe direction INVERTS: silence on
+            # ambiguity is the exact failure mode the probe exists to end. Surface it.
+            # exists() is sound here specifically because this marker is sync_tier
+            # machine_local (session-manifest.yaml) — guard-980's "never stat the
+            # own-cloud mirror" does not apply, so do not "fix" this to a backend read.
+            if not self.last_unreadable:
+                events.append(Event(
+                    probe=self.name,
+                    event="claim_heartbeat_unreadable",
+                    # "info", not "warn"/"warning": the declared vocabulary is
+                    # exactly {"critical", "info"} (Event, ~L287) and the renderer
+                    # treats every non-"critical" value identically. Informational
+                    # is also the honest level — this says "I cannot tell", not
+                    # "an outage is confirmed".
+                    severity="info",
+                    payload={"path": str(self.marker_path)},
+                    summary=(
+                        f"{self.name}: claim-heartbeat marker is PRESENT but "
+                        f"unreadable/unparseable — a renewal outage may be in "
+                        f"progress and invisible; check permissions and the file"
+                    ),
+                ))
+            self.last_unreadable = True
+            return events            # last_state deliberately UNCHANGED
+        self.last_unreadable = False
+
+        if parsed is None:
+            if self.last_state != "absent":
+                events.append(Event(
+                    probe=self.name,
+                    event="claim_heartbeat_recovered",
+                    severity="info",
+                    payload={"path": str(self.marker_path)},
+                    summary=f"{self.name}: claim heartbeat recovered — marker cleared",
+                ))
+            self.last_state = "absent"
+            return events
+
+        elapsed = max(0, int(time.time()) - parsed["first_failed_at"])
+        phase = ("stepdown_window" if elapsed >= self.stale_window_seconds / 2.0
+                 else "failing")
+
+        if phase != self.last_state:
+            payload = {
+                "elapsed_seconds": elapsed,
+                "count": parsed["count"],
+                "last_rc": parsed["last_rc"],
+                "last_error": parsed["last_error"],
+                "stale_window_seconds": int(self.stale_window_seconds),
+                "path": str(self.marker_path),
+            }
+            if phase == "stepdown_window":
+                events.append(Event(
+                    probe=self.name,
+                    event="claim_heartbeat_stepdown_window",
+                    severity="critical",
+                    payload=payload,
+                    include_processes=True,
+                    summary=(
+                        f"{self.name}: CLAIM HEARTBEAT FAILING {elapsed}s "
+                        f"({parsed['count']} consecutive) — at "
+                        f"{int(self.stale_window_seconds)}s a peer /start will see a "
+                        f"STALE claim and come up as a SECOND REDUCER while this one "
+                        f"keeps running"
+                    ),
+                ))
+            else:
+                events.append(Event(
+                    probe=self.name,
+                    event="claim_heartbeat_failing",
+                    severity="info",
+                    payload=payload,
+                    summary=(
+                        f"{self.name}: DDB claim heartbeat failing {elapsed}s "
+                        f"({parsed['count']} consecutive, rc={parsed['last_rc']}) — "
+                        f"claim ages out at {int(self.stale_window_seconds)}s"
+                    ),
+                ))
+        self.last_state = phase
+        return events
+
+    def to_dict(self) -> dict:
+        # BOTH fields must persist. --tick is a fresh PROCESS per iteration, so
+        # every "emit once" this probe promises lives entirely here; a field kept
+        # only in memory dedups perfectly in-process and spams every iteration in
+        # production, which is precisely the mutation MU4 caught for last_state.
+        return {"last_state": self.last_state,
+                "last_unreadable": self.last_unreadable}
+
+    def from_dict(self, state: dict) -> None:
+        if state and "last_state" in state:
+            self.last_state = str(state["last_state"])
+        if state and "last_unreadable" in state:
+            self.last_unreadable = bool(state["last_unreadable"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1824,11 +2046,363 @@ class ClockSkewProbe(Probe):
             self.prev_state = state.get("prev_state")
 
 
+def _mem_headroom_threshold() -> float:
+    """Fraction of MemTotal at which a single agent process is reported.
+    Override with AGENT_WATCHDOG_MEM_PCT (integer percent, 1-100)."""
+    raw = os.environ.get("AGENT_WATCHDOG_MEM_PCT", "").strip()
+    if raw:
+        try:
+            v = float(raw)
+            if 0 < v <= 100:
+                return v / 100.0
+        except ValueError:
+            pass
+    return 0.60
+
+
+def _mem_total_kb() -> Optional[int]:
+    """MemTotal in kB, or None where /proc/meminfo is absent/unreadable."""
+    txt = read_text_safe(Path("/proc/meminfo"))
+    if not txt:
+        return None
+    for line in txt.splitlines():
+        if line.startswith("MemTotal:"):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                return int(parts[1])
+    return None
+
+
+def _claude_rss_kb() -> list[tuple[int, str, int]]:
+    """(pid, comm, VmRSS_kB) for each live Claude Code process.
+
+    Linux-only by construction: returns [] wherever /proc is absent, so a
+    Windows or macOS box fails OPEN rather than emitting a false reading.
+    Matches both comm spellings seen in the g-115-4699 OOM record on WSL2
+    ('claude.exe' for the victim, 'claude' for a sibling).
+    """
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return []
+    out: list[tuple[int, str, int]] = []
+    try:
+        entries = list(proc.iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        comm = (read_text_safe(entry / "comm") or "").strip()
+        if comm not in ("claude", "claude.exe"):
+            continue
+        for line in (read_text_safe(entry / "status") or "").splitlines():
+            if line.startswith("VmRSS:"):
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    out.append((int(entry.name), comm, int(parts[1])))
+                break
+    return out
+
+
+class MemoryHeadroomProbe(Probe):
+    """Fires BEFORE the OOM killer rather than after it ().
+
+    THE INCIDENT. 2026-08-02T14:41:13, hostname LAPTOP-3IOFCNEO, uname -r
+    6.6.87.2-microsoft-standard-WSL2. A Claude Code process that had run 6.5
+    days held 6.06 GiB anon-rss on a 7.7 GiB box — 88.6% of all resident
+    process memory in the kernel's own victim table. A global OOM fired
+    (CONSTRAINT_NONE) and the kernel selected that process precisely BECAUSE
+    it was the largest. systemd then marked foxtrot-tmux.service failed
+    (OOMPolicy=stop, Restart=no) and restarted nothing, so the agent stayed
+    dead ~76 minutes until a human reopened it.
+
+    WHY THIS SIGNAL, AND WHY IT HAS TO BE THIS ONE. Every liveness defense the
+    loop already carries — the ScheduleWakeup deadman pair, the SessionStart
+    recovery-gate, the stop-hook BLOCK — executes INSIDE the Claude Code
+    process. Once that process is gone, all of them are gone with it, so by
+    construction none can recover it. The only defense that can act is one
+    that fires while the process is still alive. RSS-as-a-fraction-of-MemTotal
+    is that signal: it rises monotonically enough over a long session to give
+    days of warning, and it is readable in two file reads with no daemon.
+
+    WHY NOT oom_score_adj, which is the obvious first idea. Measured from the
+    same victim table: every process OTHER than Claude summed to 0.78 GiB. So
+    de-prioritising Claude as an OOM victim only makes the kernel kill all of
+    that instead and then OOM again moments later, having freed under a
+    gigabyte. Protecting the victim does not create headroom. Ending the
+    session does — which is why this probe reports rather than re-nices.
+
+    Advisory by contract: it emits an event and never mutates state. The
+    remedy (a deliberate /stop + /start rotation) belongs to a human or to a
+    later goal, not to a probe running inside the process it is measuring.
+    """
+
+    name = "memory-headroom"
+
+    def __init__(self, ctx: WatchdogContext) -> None:
+        super().__init__(ctx)
+        self.over = False
+
+    def check(self) -> list[Event]:
+        total_kb = _mem_total_kb()
+        if not total_kb:
+            return []  # not Linux, or /proc unreadable — fail open
+        procs = _claude_rss_kb()
+        if not procs:
+            return []
+        pid, comm, rss_kb = max(procs, key=lambda r: r[2])
+        frac = rss_kb / float(total_kb)
+        threshold = _mem_headroom_threshold()
+        payload = {
+            "pid": pid,
+            "comm": comm,
+            "rss_kb": rss_kb,
+            "rss_gib": round(rss_kb / 1048576.0, 2),
+            "mem_total_kb": total_kb,
+            "mem_total_gib": round(total_kb / 1048576.0, 2),
+            "pct_of_memtotal": round(frac * 100.0, 1),
+            "threshold_pct": round(threshold * 100.0, 1),
+            "claude_process_count": len(procs),
+        }
+
+        if frac >= threshold and not self.over:
+            self.over = True
+            return [Event(
+                probe=self.name, event="memory_pressure", severity="critical",
+                payload=payload, include_processes=True,
+                summary=(f"{self.name}: memory_pressure — {comm} pid {pid} at "
+                         f"{payload['rss_gib']} GiB = {payload['pct_of_memtotal']}% "
+                         f"of {payload['mem_total_gib']} GiB "
+                         f"(threshold {payload['threshold_pct']}%). An OOM kill "
+                         f"selects the largest process and NOTHING restarts it "
+                         f"(g-115-4699) — rotate the session."),
+            )]
+
+        # Hysteresis: only clear once well back under, so a reading parked at
+        # the boundary cannot flap a critical event every tick.
+        if self.over and frac < threshold * 0.9:
+            self.over = False
+            return [Event(
+                probe=self.name, event="memory_pressure_cleared", severity="info",
+                payload=payload,
+                summary=(f"{self.name}: memory_pressure_cleared — "
+                         f"{payload['pct_of_memtotal']}% of MemTotal"),
+            )]
+
+        return []
+
+    def to_dict(self) -> dict:
+        return {"over": self.over}
+
+    def from_dict(self, state: dict) -> None:
+        if state:
+            self.over = bool(state.get("over", False))
+
+
+# Probes that read ONLY box-level state — daemon port, mirror, clock, memory,
+# store freshness. None of them reads agent-state, running-session-id or
+# runner-heartbeat, so they are correct on a worker Body exactly as written.
+# Audited by name against the class bodies (): the other five each key
+# on reducer-shaped state that a worker deliberately does not have.
+# NOTE THE HYPHENS. Probe.name uses hyphens ("daemon-health"), not underscores.
+# The first draft of this set wrote underscores and matched exactly ONE probe
+# (freshness — the only name with no separator), so a worker silently registered
+# 1 probe instead of 5 while the wiring looked correct. Caught only by printing
+# the registered set and diffing it against the reducer's, which is why
+# test_worker_safe_probe_names_all_exist asserts every name resolves to a real
+# probe: a typo'd filter is indistinguishable from a working one at the call site.
+WORKER_SAFE_PROBES = frozenset({
+    "daemon-health", "clock-skew", "freshness", "mirror-wedge", "memory-headroom",
+})
+
+
+class WorkerStallProbe(Probe):
+    """Peer-side worker-Body stall detection ().
+
+    THE ONLY PROBE HERE THAT WATCHES A BOX OTHER THAN ITS OWN, and that is the
+    whole design. Four of this file's probes are structurally INERT in worker
+    shape -- a worker box is `agent-state: IDLE` BY DESIGN, so `classify_stalled`
+    returns None for ANY diary age, and RunningSidProbe / StopHookBlockProbe read
+    a `running-session-id` a worker is forbidden to set. So even after the tick is
+    wired into the worker loop, the stall detectors do not fire there. Worse, an
+    in-loop tick dies WITH the loop, and the incident that motivated this probe
+    (cc-08, ~2h stalled on a lost login) was process death: there was no loop left
+    to tick. Detection of that class has to be out-of-process, which means a peer.
+
+    This probe therefore runs on the REDUCER, inside the tick that already fires
+    every iteration from iteration-close.sh -- no new wiring, no new cron.
+
+    Heavy logic lives in worker_stall.py, lazy-imported inside check() so a
+    syntax error there can never crash the tick (FreshnessProbe's pattern).
+
+    Transition semantics: a body's verdict is remembered across ticks, so a
+    persistent stall logs ONCE per episode rather than every tick, and emits a
+    `worker_stall_cleared` info event when it recovers. Without that, a genuinely
+    wedged worker would produce an event every iteration until someone noticed --
+    which trains the reader to filter the log (guard-2418 class).
+
+    Advisory only: it reports and never mutates. That is deliberate and is the
+    point of the goal -- `stranded-claim-sweep` ALREADY computes this exact
+    signal, but only after a 120-minute grace and only to silently release the
+    claim, so the condition was observable-in-principle and reported nowhere.
+    """
+    name = "worker-stall"
+
+    def __init__(self, ctx: WatchdogContext) -> None:
+        super().__init__(ctx)
+        self.prev: dict = {}  # {sid: verdict}
+
+    def initialize(self) -> None:
+        # Start from an empty baseline rather than capturing current-as-prev:
+        # a stall that is ALREADY in progress at the first tick is exactly the
+        # case worth reporting, and capture-as-prev would swallow it.
+        self.prev = {}
+
+    def check(self) -> list[Event]:
+        try:
+            from worker_stall import scan, is_alerting  # type: ignore
+            from _paths import WORLD_DIR, agents_root  # type: ignore
+        except Exception as e:
+            sys.stderr.write(f"agent-watchdog: worker-stall import failed: {e}\n")
+            return []
+        try:
+            report = scan(Path(agents_root()), Path(WORLD_DIR) / "aspirations.jsonl")
+        except Exception as e:
+            sys.stderr.write(f"agent-watchdog: worker-stall scan failed: {e}\n")
+            return []
+
+        events: list[Event] = []
+        seen: dict = {}
+
+        # INSTRUMENT-FAULT SIGNAL (guard-1893 caller half; guard-1977).
+        # scan() now reports whether it could actually SEE the fleet. Without
+        # this branch a blind scan emits zero events -- byte-identical to "all
+        # bodies healthy" -- which is the exact silent-all-clear this probe
+        # exists to end, reintroduced one layer up. Uses the same prev/seen
+        # transition semantics as the verdicts below, so a persistent fault
+        # logs ONCE per episode rather than every tick.
+        enum_meta = report.get("enumeration") or {}
+        # `all_carriers_unreadable` is load-bearing and was the gap ():
+        # when every carrier fetch fails, the ROSTER listing still succeeds, so
+        # `complete` is True, nothing raises out of the scan so `rows_dropped`
+        # is 0, and the rows survive into `bodies` so `enumeration_lost_
+        # everything` is False. Every term below read clean and no body alerted,
+        # so this probe emitted ZERO events on a fleet it could not see at all.
+        blind = (
+            not enum_meta.get("complete", False)
+            or report.get("enumeration_lost_everything")
+            or (report.get("rows_dropped") or 0) > 0
+            or report.get("all_carriers_unreadable")
+        )
+        # The third fallback is not padding. On the all-unreadable path `reason`
+        # is None (the roster listing SUCCEEDED) and `first_drop_error` is None
+        # (nothing raised), so the original two-term chain rendered this
+        # diagnostic's cause as the literal string "None" -- a probe that
+        # reports it cannot see, and cannot say why, is the next silent layer
+        # one level up (guard-1977).
+        blind_cause = (
+            enum_meta.get("reason")
+            or report.get("first_drop_error")
+            or report.get("first_carrier_read_error")
+            or "every carrier parsed to an unreadable verdict"
+        )
+        health = "blind" if blind else "ok"
+        seen["__enumeration__"] = health
+        if blind and self.prev.get("__enumeration__") != "blind":
+            events.append(Event(
+                probe=self.name,
+                event="worker_stall_probe_blind",
+                severity="warning",
+                payload={
+                    "enumeration": enum_meta,
+                    "carriers_found": report.get("carriers_found"),
+                    "rows_dropped": report.get("rows_dropped"),
+                    "first_drop_error": report.get("first_drop_error"),
+                    "claims_read_via": report.get("claims_read_via"),
+                    "carrier_read_errors": report.get("carrier_read_errors"),
+                    "first_carrier_read_error": report.get("first_carrier_read_error"),
+                    "all_carriers_unreadable": report.get("all_carriers_unreadable"),
+                },
+                summary=(
+                    f"worker-stall probe cannot bound the fleet: "
+                    f"read_via={enum_meta.get('read_via')} "
+                    f"complete={enum_meta.get('complete')} "
+                    f"agents={enum_meta.get('agents_enumerated')} "
+                    f"dropped={report.get('rows_dropped')} "
+                    f"unreadable_carriers={report.get('all_carriers_unreadable')} "
+                    f"carrier_read_errors={report.get('carrier_read_errors')} "
+                    f"-- a zero-alert result here means UNKNOWN, not healthy "
+                    f"({blind_cause})"
+                ),
+            ))
+        elif not blind and self.prev.get("__enumeration__") == "blind":
+            events.append(Event(
+                probe=self.name,
+                event="worker_stall_probe_blind_cleared",
+                severity="info",
+                payload={"enumeration": enum_meta},
+                summary="worker-stall probe can bound the fleet again",
+            ))
+
+        for body in report.get("bodies") or []:
+            sid = body.get("sid")
+            verdict = body.get("verdict")
+            seen[sid] = verdict
+            was = self.prev.get(sid)
+            if is_alerting(verdict) and not is_alerting(was or ""):
+                events.append(Event(
+                    probe=self.name,
+                    event="worker_stall",
+                    severity="critical",
+                    payload={**body, "stale_minutes": report.get("stale_minutes"),
+                             "degraded_read": report.get("degraded_read")},
+                    summary=(
+                        f"WORKER STALL: {body.get('agent')} body {sid} on "
+                        f"{body.get('host')} last ticked "
+                        f"{body.get('carrier_age_minutes')}m ago while holding "
+                        f"{body.get('held_goal')}"
+                    ),
+                ))
+            elif is_alerting(was or "") and not is_alerting(verdict):
+                events.append(Event(
+                    probe=self.name,
+                    event="worker_stall_cleared",
+                    severity="info",
+                    payload={**body},
+                    summary=(f"worker stall cleared: {body.get('agent')} body {sid} "
+                             f"-> {verdict}"),
+                ))
+        self.prev = seen
+        return events
+
+    def to_dict(self) -> dict:
+        return {"prev": self.prev}
+
+    def from_dict(self, state: dict) -> None:
+        self.prev = dict(state.get("prev") or {})
+
+
 def build_probes(ctx: WatchdogContext) -> list[Probe]:
-    """Single registration point. Add new probes here."""
-    return [
+    """Single registration point. Add new probes here.
+
+    On a worker Body the set is FILTERED, not merely reordered — see
+    `WORKER_SAFE_PROBES` and the audit in `is_worker_body`. Enabling the whole
+    set on a worker would install five probes that are structurally incapable
+    of firing there, which reads as coverage and is not (g-306-240).
+
+    WorkerStallProbe is deliberately NOT in WORKER_SAFE_PROBES, and that is the
+    seam where the two halves of g-306-240 meet. It is the PEER-side half: it
+    watches OTHER boxes and must run on the reducer, because the class it exists
+    to catch (process death, lost auth) kills the in-loop tick along with the
+    loop. Registering it on a worker would have each worker watching itself with
+    a probe whose entire premise is out-of-process observation — coverage in
+    appearance only, which is the same defect the filter below prevents.
+    """
+    probes = [
+        WorkerStallProbe(ctx),
         RunningSidProbe(ctx),
         HeartbeatProbe(ctx),
+        ClaimHeartbeatProbe(ctx),
         StalledProbe(ctx),
         BackgroundJobProbe(ctx),
         StopHookBlockProbe(ctx),
@@ -1836,7 +2410,52 @@ def build_probes(ctx: WatchdogContext) -> list[Probe]:
         ClockSkewProbe(ctx),
         FreshnessProbe(ctx),
         MirrorWedgeProbe(ctx),
+        MemoryHeadroomProbe(ctx),
     ]
+    if ctx.body_role == "worker":
+        return [p for p in probes if p.name in WORKER_SAFE_PROBES]
+    return probes
+
+
+def is_worker_body(env: Optional[dict] = None) -> bool:
+    """True when this process is a worker Body rather than the reducer.
+
+    Reads BODY_ROLE, which the PreToolUse bash hook injects on every Bash call
+    (bash-agent-inject.py:500) and which six other scripts already consume — an
+    established signal, not a new one invented here.
+
+    WHY THE ROLE SPLIT EXISTS AT ALL. Until g-306-240, `agent-watchdog.py --tick`
+    had exactly ONE caller in the tree — iteration-close.sh:2554 — and the worker
+    loop deliberately skips iteration-close. So NO probe had ever executed on a
+    worker box: not StalledProbe, not HeartbeatProbe, none. Same structural fact
+    behind g-306-233 (workers never pulled) and g-306-235.
+
+    WHY FIVE PROBES ARE EXCLUDED RATHER THAN FIXED — measured on a live worker
+    (cc-08, 2026-08-06), not inferred:
+      - A worker is `agent-state=IDLE` + `agent-mode=autonomous` BY DESIGN, and
+        it writes NO `runner-heartbeat` and NO `running-session-id`; its liveness
+        files are `sessions/<SID>/body-heartbeat` and the syncable
+        `session/body-heartbeat-<SID>.json`.
+      - So `classify_stalled` returns None on a worker at its FIRST guard
+        (`agent_state != "RUNNING"`), and would return None at the second anyway
+        (`runner-heartbeat` absent → hb_age is None). StalledProbe is doubly
+        dead here; enabling it would add a permanent no-op.
+      - RunningSidProbe, HeartbeatProbe, BackgroundJobProbe and StopHookBlockProbe
+        read the same reducer-shaped files and either no-op or false-fire.
+
+    WHY StalledProbe IS NOT SIMPLY TAUGHT THE WORKER SHAPE — the measurement that
+    decided it. On a worker the execution-diary records ONE entry per GOAL, at
+    claim time; there is no mid-unit progress write. So diary-staleness and
+    unit-duration are the SAME quantity. Measured consecutive gaps on cc-08:
+    34min, 56min, 92min, 28min, 15min — and the 92min one was a real stall while
+    the others were healthy work. No threshold separates them, so a diary-based
+    stall detector on a worker is a false-positive generator, and the goal's
+    load-bearing negative (a healthy worker must not false-fire) is exactly what
+    it would violate. Detecting a stalled worker needs a signal that advances
+    DURING a unit; the diary is not one.
+    """
+    e = os.environ if env is None else env
+    return (e.get("BODY_ROLE") or "").strip().lower() == "worker"
 
 
 def run_once(ctx: WatchdogContext, log_path: Path) -> int:
@@ -2027,7 +2646,19 @@ def main() -> int:
         agent_name=agent_name,
         agent_dir=agent_dir,
         project_root_path=root,
+        body_role="worker" if is_worker_body() else "reducer",
     )
+    if ctx.body_role == "worker":
+        # Say so on stderr. A filtered run must never be mistaken for a full one:
+        # this tick is the FIRST watchdog coverage a worker box has ever had, and
+        # silence about the filtering is how partial coverage gets read as total.
+        sys.stderr.write(
+            "agent-watchdog: BODY_ROLE=worker — running box-level probes only "
+            "(%s). The five reducer-shaped probes are SKIPPED because a worker is "
+            "IDLE+autonomous by design and writes no runner-heartbeat, so they "
+            "cannot fire here; see is_worker_body(). Stall/auth-death of a worker "
+            "is NOT covered by this tick.\n" % ", ".join(sorted(WORKER_SAFE_PROBES))
+        )
 
     if args.once:
         n = run_once(ctx, log_path)

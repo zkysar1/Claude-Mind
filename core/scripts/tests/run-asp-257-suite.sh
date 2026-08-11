@@ -36,38 +36,61 @@ PASSES=0
 FAILS=0
 declare -a FAILED_SUITES
 
+# : truncation is applied HERE, by outcome — never inside the command
+# string. Every suite used to be piped through `| tail -N` at its call site, which
+# on a PASS is a fine terse summary and on a FAIL is actively misleading: the
+# named "FAIL: <case>" lines sit in the MIDDLE of the output, so the trailing
+# window shows only the last few PASS lines plus the count. The operator learned
+# that a suite failed and not which case — measured on suite 1/6, where
+# "FAIL: c_user_trust_confirmation" was invisible behind `tail -3` while the
+# aggregate line read "PASS: 13   FAIL: 1".
+#
+# Capturing instead of piping also removes the reliance on `set -o pipefail` for
+# correct exit-code propagation (guard-696): the suite's own rc is read directly
+# rather than a pipeline's last-non-zero.
 run_suite() {
     local label="$1"
     local cmd="$2"
+    local tail_n="${3:-6}"
+    local out
+    out="$(mktemp)"
     echo "── $label ──"
-    if eval "$cmd"; then
+    if eval "$cmd" > "$out" 2>&1; then
         PASSES=$((PASSES + 1))
+        tail -n "$tail_n" "$out" | sed 's/^/  /'
         echo "  → SUITE PASS"
     else
         FAILS=$((FAILS + 1))
         FAILED_SUITES+=("$label")
+        echo "  ── failing cases ──"
+        if ! grep -aE '^[[:space:]]*(FAIL|FAILED|ERROR|Traceback|AssertionError|E   )' "$out" | sed 's/^/  /'; then
+            echo "  (no FAIL-prefixed lines — see tail below)"
+        fi
+        echo "  ── tail ──"
+        tail -n "$tail_n" "$out" | sed 's/^/  /'
         echo "  → SUITE FAIL"
     fi
+    rm -f "$out"
     echo
 }
 
 run_suite "1/6 capability-gate regression (14 cases)" \
-    "bash $CORE_ROOT/scripts/test-capability-gate.sh 2>&1 | tail -3"
+    "bash $CORE_ROOT/scripts/test-capability-gate.sh" 3
 
 run_suite "2/6 capability-gate narrative-pattern (3 cases)" \
-    "python3 $CORE_ROOT/scripts/tests/test_capability_gate_narrative.py 2>&1 | tail -5"
+    "python3 $CORE_ROOT/scripts/tests/test_capability_gate_narrative.py" 5
 
 run_suite "3/6 capability-gate suggest-unblock (4 cases)" \
-    "python3 $CORE_ROOT/scripts/tests/test_capability_gate_suggest_unblock.py 2>&1 | tail -6"
+    "python3 $CORE_ROOT/scripts/tests/test_capability_gate_suggest_unblock.py" 6
 
 run_suite "4/6 defer-gate Unblock filing (5 cases)" \
-    "python3 $CORE_ROOT/scripts/tests/test_defer_gate_unblock_filing.py 2>&1 | tail -7"
+    "python3 $CORE_ROOT/scripts/tests/test_defer_gate_unblock_filing.py" 7
 
 run_suite "5/6 defer-gate Unblock dedup (7 cases)" \
-    "python3 $CORE_ROOT/scripts/tests/test_defer_gate_unblock_dedup.py 2>&1 | tail -9"
+    "python3 $CORE_ROOT/scripts/tests/test_defer_gate_unblock_dedup.py" 9
 
 run_suite "6/6 defer-to-unblock integration (6 cases)" \
-    "python3 $CORE_ROOT/scripts/tests/test_defer_to_unblock_integration.py 2>&1 | tail -8"
+    "python3 $CORE_ROOT/scripts/tests/test_defer_to_unblock_integration.py" 8
 
 echo "════════════════════════════════════════"
 TOTAL=$((PASSES + FAILS))

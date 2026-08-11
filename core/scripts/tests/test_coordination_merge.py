@@ -548,6 +548,110 @@ def test_aspirations_recurring_cycle_pending_flip_wins():
     assert g["lastAchievedAt"] == "2026-07-03T13:00:00"   # achievement kept
 
 
+def test_goal_one_sided_scalar_survives_lww_basepick():
+    # : _merge_goal built out = dict(win) and overrode only the
+    # enumerated families, so ANY field present on the LOSING side alone was
+    # dropped wholesale. completed_date / completed_by are written by the CLOSE
+    # path, NOT by whatever bumps last_modified, so they are invisible to the
+    # ordering that decides their survival — the identical argument its own
+    # parent _merge_aspiration_record already carries ().
+    # Production shape (merge commit 842fe196): two genuinely-closed goals came
+    # out of a hand-resolved merge with both fields stripped.
+    closed = _rb([_asp("asp-1", [_goal("g-1-1", status="completed",
+                                       last_modified="2026-08-03T10:00:00",
+                                       completed_date="2026-08-03",
+                                       completed_by="alpha")])])
+    touched = _rb([_asp("asp-1", [_goal("g-1-1", status="completed",
+                                        last_modified="2026-08-03T11:00:00")])])
+    for merged in (cm.merge_aspirations(closed, touched),
+                   cm.merge_aspirations(touched, closed)):
+        g = _find_goal(merged, "g-1-1")
+        assert g["completed_date"] == "2026-08-03"
+        assert g["completed_by"] == "alpha"
+    assert (cm.merge_aspirations(closed, touched)
+            == cm.merge_aspirations(touched, closed))     # guard-907
+
+
+def test_goal_one_sided_defer_reason_survives():
+    # Same defect, the other measured production loss: a human_blocked
+    # defer_reason destroyed outright. That prefix never auto-clears
+    # (probe-before-defer.md), so a merge-induced drop silently re-arms work the
+    # fleet had deliberately suppressed — and nothing re-surfaces it.
+    deferred = _rb([_asp("asp-1", [_goal("g-1-1",
+                                         last_modified="2026-08-03T10:00:00",
+                                         defer_reason="human_blocked: awaiting demo recording",
+                                         defer_reason_set_at="2026-08-03T10:00:00")])])
+    touched = _rb([_asp("asp-1", [_goal("g-1-1",
+                                        last_modified="2026-08-03T11:00:00")])])
+    for merged in (cm.merge_aspirations(deferred, touched),
+                   cm.merge_aspirations(touched, deferred)):
+        g = _find_goal(merged, "g-1-1")
+        assert g["defer_reason"] == "human_blocked: awaiting demo recording"
+        assert g["defer_reason_set_at"] == "2026-08-03T10:00:00"
+
+
+def test_goal_one_sided_scalar_survives_tie():
+    # The tie corner, mirroring the parent's  test: on an IDENTICAL
+    # last_modified _order_by_ts falls to a content tiebreak that the side
+    # LACKING the field can win, so the loss does not even need a newer partner.
+    have = _rb([_asp("asp-1", [_goal("g-1-1", outcome_note="verified live")])])
+    lack = _rb([_asp("asp-1", [_goal("g-1-1")])])
+    assert (_find_goal(have, "g-1-1")["last_modified"]
+            == _find_goal(lack, "g-1-1")["last_modified"])          # the tie
+    for merged in (cm.merge_aspirations(have, lack),
+                   cm.merge_aspirations(lack, have)):
+        assert _find_goal(merged, "g-1-1")["outcome_note"] == "verified live"
+
+
+def test_goal_both_sided_scalar_keeps_lww_basepick():
+    # Scope fence: the one-sided union must NOT widen into a field-level
+    # tiebreak for keys present on BOTH sides. Lifting a content tiebreak to
+    # this granularity is the cross-granularity transplant guard-1153 forbids
+    # (and guard-1703 shows why a _canon tiebreak on text is worse than
+    # useless). A strictly-newer last_modified still decides.
+    old = _rb([_asp("asp-1", [_goal("g-1-1", last_modified="2026-08-03T09:00:00",
+                                    outcome_note="stale")])])
+    new = _rb([_asp("asp-1", [_goal("g-1-1", last_modified="2026-08-03T11:00:00",
+                                    outcome_note="fresh")])])
+    assert _find_goal(cm.merge_aspirations(old, new), "g-1-1")["outcome_note"] == "fresh"
+    assert _find_goal(cm.merge_aspirations(new, old), "g-1-1")["outcome_note"] == "fresh"
+
+
+def test_goal_one_sided_union_does_not_resurrect_orphan_claim_sid():
+    # Fence on _GOAL_EXPLICIT_MERGE: the claim triple moves as a UNIT, so the
+    # one-sided loop must never inject a member of it. The reachable hole is a
+    # leftover claimed_by_sid with claimed_by already null on BOTH sides — every
+    # branch of the claim block is False there (no conflict, no exactly-one-side
+    # claim), so an unexcluded loop would resurrect a body id attached to no
+    # claim at all. That is the mixed-pair defect the sid unit-move exists to
+    # prevent, arriving from the opposite direction.
+    orphan = _rb([_asp("asp-1", [_goal("g-1-1", last_modified="2026-08-03T10:00:00",
+                                       claimed_by=None,
+                                       claimed_by_sid="dead-session-uuid")])])
+    clean = _rb([_asp("asp-1", [_goal("g-1-1", last_modified="2026-08-03T11:00:00",
+                                      claimed_by=None)])])
+    for merged in (cm.merge_aspirations(orphan, clean),
+                   cm.merge_aspirations(clean, orphan)):
+        g = _find_goal(merged, "g-1-1")
+        assert g.get("claimed_by") is None
+        assert "claimed_by_sid" not in g or g["claimed_by_sid"] is None
+
+
+def test_goal_one_sided_union_multiround_convergence():
+    # The one-sided union must be idempotent, or the fenced-PUT retry loop
+    # ping-pongs forever instead of converging (guard-907's real failure mode).
+    a = _rb([_asp("asp-1", [_goal("g-1-1", last_modified="2026-08-03T10:00:00",
+                                  completed_date="2026-08-03")])])
+    b = _rb([_asp("asp-1", [_goal("g-1-1", last_modified="2026-08-03T11:00:00",
+                                  outcome_note="from the other box")])])
+    m1 = cm.merge_aspirations(a, b)
+    assert cm.merge_aspirations(m1, b) == m1
+    assert cm.merge_aspirations(a, m1) == m1
+    g = _find_goal(m1, "g-1-1")
+    assert g["completed_date"] == "2026-08-03"            # both one-sided keys
+    assert g["outcome_note"] == "from the other box"      # survive together
+
+
 def test_aspirations_multiround_convergence():
     # merge(merge(a,b), b) == merge(a,b): the fenced-PUT retry loop terminates.
     a = _rb([_asp("asp-1", [_goal("g-1-1", status="completed",
@@ -1008,6 +1112,38 @@ def test_handler_registration_excludes_pruned_stores_g115_2006():
             f"{path} is rewritten in place — line-union would resurrect stubs"
 
 
+def test_journal_full_path_stays_unregistered_g306_118d():
+    # -d REFUSAL PIN. The assertion above tests the BARE BASENAME, which
+    # is not sufficient on its own: merge_handler_for runs THREE path-pattern
+    # branches BEFORE the _HANDLERS lookup (its own docstring: a store can be
+    # merge-protected "with no basename entry"). So a future path-pattern branch
+    # could register agents/<name>/journal.jsonl while the basename assertion
+    # above still passes, green. This pins the shape that would actually ship.
+    #
+    # Evidence for the refusal (recorded in full at the coordination_merge.py
+    # DELIBERATELY NOT REGISTERED block): jsonl_hygiene.py names
+    # agents/<a>/journal.jsonl verbatim and DROPS from the live file in both
+    # modes, and the record is mutated in place (goals_completed grows by one
+    # entry per goal close). Line-union resurrects the dropped; keyed-union
+    # cannot tell a rotate from a gap without a base.
+    for agent in ("zeta", "alpha", "bravo", "echo", "foxtrot"):
+        p = f"agents/{agent}/journal.jsonl"
+        assert cm.merge_handler_for(p) is None, \
+            f"{p} has a live drop path (jsonl_hygiene cap/rotate) — a merge " \
+            f"handler here resurrects dropped records (guard-1072/guard-1816)"
+
+    # POSITIVE CONTROL (guard-1475): a bare `is None` cannot distinguish "correctly
+    # unregistered" from "merge_handler_for is broken and returns None for
+    # everything". This control is deliberately the per-agent DAILY HEALTH LEDGER —
+    # it is registered by a PATH-PATTERN branch and lives under the same
+    # agents/<name>/ prefix, so it proves the exact dispatch mechanism that could
+    # silently capture journal.jsonl is live and reaching into agent dirs.
+    control = "agents/zeta/health/2026-08-02.jsonl"
+    assert cm.merge_handler_for(control) is cm.merge_append_only_jsonl, \
+        "positive control failed — path-pattern dispatch into agents/<name>/ is " \
+        "not resolving, so the journal.jsonl assertions above prove nothing"
+
+
 def test_handler_registration_changelog_g115_2173():
     #  (ports cc-02 7b6801e1): changelog.jsonl is ROTATED into
     # changelog-archive.jsonl by store-hygiene.yaml — a MOVE, not a record-dropping
@@ -1101,6 +1237,42 @@ def test_handler_registration_g115_2009_excludes_rewritten_stores():
     for path in ["meta-log.jsonl", "l1-pick-log.jsonl"]:
         assert cm.merge_handler_for(path) is cm.merge_append_only_jsonl, \
             f"{path} writer-verified append-only (g-115-2551) and must stay registered"
+
+
+def test_complexity_ledger_registered_and_union_is_lossless_g115_3860():
+    """Third meta/*.jsonl append-only sibling — omitted, not excluded ().
+
+    Reproduces the MEASURED wedge shape rather than a synthetic one: 14 rows per
+    side, 7 shared (the synced baseline) and 7 unique to EACH box. Neither side
+    is a superset, so every direction-pick drops 7 real rows — which is exactly
+    why the sync froze instead of choosing, and why the union is the only
+    lossless reconcile. Writer-verified per the sibling protocol:
+    complexity_budget.append_and_delta is the sole writer and opens 'a'.
+    """
+    assert cm.merge_handler_for("complexity-ledger.jsonl") is cm.merge_append_only_jsonl
+
+    def row(day, n):
+        return {"timestamp": f"2026-08-{day:02d}T0{n}:00:00", "metrics": {"rules": n}}
+
+    shared = [row(1, i) for i in range(7)]
+    local_only = [row(2, i) for i in range(7)]
+    remote_only = [row(3, i) for i in range(7)]
+
+    def dump(recs):
+        return "".join(json.dumps(r, ensure_ascii=True) + "\n" for r in recs).encode()
+
+    merged = cm.merge_append_only_jsonl(dump(shared + local_only),
+                                        dump(shared + remote_only))
+    out = [json.loads(ln) for ln in merged.decode().splitlines() if ln.strip()]
+
+    assert len(out) == 21, "shared baseline must collapse to one copy, uniques all kept"
+    for r in shared + local_only + remote_only:
+        assert r in out, f"union dropped {r} — a direction-pick would lose 7 rows"
+    # Chronological, so jsonl_hygiene's keep-newest trim stays valid.
+    assert [r["timestamp"] for r in out] == sorted(r["timestamp"] for r in out)
+    # Commutative (guard-907): box role must not change the result.
+    assert cm.merge_append_only_jsonl(dump(shared + remote_only),
+                                      dump(shared + local_only)) == merged
 
 
 def test_override_ledger_two_box_concurrent_append_converges_g115_2009():

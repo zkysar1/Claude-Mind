@@ -169,9 +169,19 @@ def test_add_goal_accepts_markers_with_checks():
                 "priority": "MEDIUM",
                 "status": "pending",
                 "blocked_by": [],
+                # A REAL predicate type, not a placeholder. This fixture used
+                # {"type": "test"} until  added gates.check_schema to
+                # the same ADD path, which refuses a type predicate.py cannot
+                # dispatch — so the placeholder started failing an assertion
+                # that has nothing to do with it. The assertion below is
+                # unchanged; only the fixture moved to a shape a real filing
+                # could actually have (guard-920). goal_completed_after is used
+                # because it needs no filesystem, so it behaves identically in
+                # this test's temporary world.
                 "verification": {"outcomes": ["works"],
-                                 "checks": [{"type": "test",
-                                             "description": "suite passes"}],
+                                 "checks": [{"type": "goal_completed_after",
+                                             "goal_id": "g-100-01",
+                                             "after_ref": "iso:2030-01-01T00:00:00"}],
                                  "preconditions": []},
                 "origin_signal": "user_directive",
                 "participants": ["agent"],

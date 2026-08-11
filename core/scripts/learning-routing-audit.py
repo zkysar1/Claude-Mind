@@ -31,7 +31,10 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from _paths import PROJECT_ROOT, WORLD_DIR, CORE_ROOT, CONFIG_DIR  # type: ignore
+from _paths import (  # type: ignore
+    PROJECT_ROOT, WORLD_DIR, CORE_ROOT, CONFIG_DIR, agents_root,
+    enumerate_agent_confs,
+)
 
 try:
     import yaml  # type: ignore
@@ -50,6 +53,60 @@ RB_JSONL = WORLD_DIR / "reasoning-bank.jsonl"
 GUARDRAILS_JSONL = WORLD_DIR / "guardrails.jsonl"
 PIPELINE_JSONL = WORLD_DIR / "pipeline.jsonl"
 SIGNATURES_JSONL = WORLD_DIR / "pattern-signatures.jsonl"
+
+# Set by load_all_experiences(); None until it runs.
+_AGENT_CORPUS_OWNED = None
+
+
+def _canonical_world_dirs():
+    """Worlds that the agents_root() experience corpus belongs to."""
+    cands = set()
+    for p in (PROJECT_ROOT / ".mind-data" / "world", PROJECT_ROOT / "world"):
+        try:
+            cands.add(p.resolve())
+        except OSError:
+            pass
+    for conf in enumerate_agent_confs():
+        try:
+            text = conf.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("WORLD_PATH="):
+                value = line.split("=", 1)[1].strip()
+                if value:
+                    try:
+                        cands.add(Path(value).resolve())
+                    except OSError:
+                        pass
+    return cands
+
+
+def world_owns_agent_corpus():
+    """Whether the world under audit owns the per-agent experience corpus.
+
+    The experience records under agents_root() belong to THIS project's own
+    world. When WORLD_DIR has been redirected — `MIND_WORLD` pointing at a
+    tmp fixture world, which is what every hermetic test does — those records
+    are FOREIGN to the world being audited: nothing in the fixture can resolve
+    their hypothesis_id or tree_nodes_related, so every ref reads dangling.
+
+    That is not a reporting nicety. `learning-routing-repair.py --apply` NULLS
+    whatever the audit calls dangling, writing to the files it resolves — which
+    are the REAL agent files, because agents_root() is PROJECT_ROOT-based and
+    no world override moves it. Measured 2026-08-10 (cc-05): an EMPTY tmp world
+    produced 2,739 dangling refs across 12 real agent files, every one of them
+    valid. tree.py::_post_remove_sweep_dangling runs that repair with --apply on
+    every tree-node removal, so three ordinary tree tests were one fast machine
+    away from mass-nulling six agents' experience stores. What actually stopped
+    it was the 30s subprocess timeout expiring during the READ phase, before any
+    write — accidental protection that any performance work would have removed.
+    """
+    try:
+        return WORLD_DIR.resolve() in _canonical_world_dirs()
+    except OSError:
+        return False
 
 
 def _read_jsonl(path, active_only=False):
@@ -91,15 +148,46 @@ def load_pattern_signatures():
 
 
 def load_all_experiences():
-    """Read every agent's experience.jsonl directly.
+    """Read every agent's experience.jsonl AND experience-archive.jsonl.
 
     Cross-refs in shared-world stores can point at experiences from any agent.
     Single-agent loading would produce false-positive 'dangling' verdicts on
     valid cross-agent links.
+
+    TWO defects fixed 2026-08-10 (g-115-5646), both of which manufactured
+    exactly the false positives this function exists to prevent:
+
+    1. DEPTH-1 GLOB. This read ``PROJECT_ROOT.glob("*/experience.jsonl")``,
+       which matches NOTHING post-relocation (agent dirs live at
+       ``PROJECT_ROOT/agents/<name>``), so it returned ZERO records and every
+       experience_ref in the corpus read as dangling. Route through
+       ``agents_root()`` — the reference pattern named in CLAUDE.md
+       "cross-agent glob consumers" and required by guard-1318. This file was
+       invisible to all three audit greps there (no constant, no literal
+       ``agents/*``, no ``.parent``), which is why it survived.
+    2. ARCHIVE-BLIND. Live-only reads missed the 36.2% of the corpus that has
+       aged into experience-archive.jsonl.
+
+    Measured impact before the fix: the audit reported 319 dangling
+    cross-references, of which 305 (95.6%) existed in the true corpus. That
+    number is not cosmetic — ``learning-routing-repair.py --apply`` NULLS every
+    field the audit calls dangling, and tree.py::_post_remove_sweep_dangling
+    invokes it automatically on every tree-node removal. 17,466 experience_ref
+    fields were nulled over 13 days; 16,541 of them (94.7%) pointed at records
+    that existed. Old values survive in
+    world/.history/learning-routing-repair-YYYY-MM-DD.jsonl.
     """
+    global _AGENT_CORPUS_OWNED
+    _AGENT_CORPUS_OWNED = world_owns_agent_corpus()
+    if not _AGENT_CORPUS_OWNED:
+        # Foreign world (a tmp fixture): these records are not its records.
+        # Returning them would make every ref dangle. See world_owns_agent_corpus.
+        return []
     records = []
-    for exp_path in sorted(PROJECT_ROOT.glob("*/experience.jsonl")):
-        records.extend(_read_jsonl(exp_path))
+    root = agents_root()
+    for name in ("experience.jsonl", "experience-archive.jsonl"):
+        for exp_path in sorted(root.glob("*/" + name)):
+            records.extend(_read_jsonl(exp_path))
     return records
 
 
@@ -157,10 +245,27 @@ def _classify_ref(value, expected_kind):
     return [("prose", value)]
 
 
-def audit_cross_refs(stores, ids, tree_keys):
-    """Walk each documented linking field; classify IDs vs prose; flag dangling IDs."""
+def audit_cross_refs(stores, ids, tree_keys, experience_evaluable=None):
+    """Walk each documented linking field; classify IDs vs prose; flag dangling IDs.
+
+    AN ABSENT STORE IS UNMEASURABLE, NEVER EMPTY. When the experience corpus is
+    not loadable — a foreign world (world_owns_agent_corpus() False) or a corpus
+    that read as zero records — refs INTO it are not falsifiable and refs FROM it
+    do not exist. Both directions are SKIPPED rather than flagged.
+
+    This is the deeper half of g-115-5646, and it would have prevented that
+    incident on its own. The proximate cause there was a depth-1 glob returning
+    zero experience records; the reason zero records became 17,466 nulled fields
+    over 13 days is that an empty id-set silently licensed mass invalidation.
+    Fixing only the glob leaves that license in place for the next way the corpus
+    can come back empty — an unmounted external path, a sync miss, a renamed
+    file. Treat "I could not read it" as unknown, and say so out loud
+    (guard-1760: report what you declined to look at, not only what you scanned).
+    """
     dangling = []
     guardrail_candidates_unfiled = []
+    if experience_evaluable is None:
+        experience_evaluable = bool(stores.get("experience"))
 
     def _check(src_store, rec, field, raw, expected_kind, tgt_store, valid_set):
         for kind, val in _classify_ref(raw, expected_kind):
@@ -182,7 +287,7 @@ def audit_cross_refs(stores, ids, tree_keys):
         if r.get("preventive_guardrail"):
             _check("reasoning_bank", r, "preventive_guardrail", r["preventive_guardrail"],
                    "guard", "guardrails", ids["guard"])
-        if r.get("experience_ref"):
+        if r.get("experience_ref") and experience_evaluable:
             _check("reasoning_bank", r, "experience_ref", r["experience_ref"],
                    "exp", "experience", ids["exp"])
         if r.get("source_hypothesis"):
@@ -191,7 +296,7 @@ def audit_cross_refs(stores, ids, tree_keys):
 
     # Guardrails → experience, pattern_signatures
     for r in stores["guardrails"]:
-        if r.get("experience_ref"):
+        if r.get("experience_ref") and experience_evaluable:
             _check("guardrails", r, "experience_ref", r["experience_ref"],
                    "exp", "experience", ids["exp"])
         for p in r.get("related_patterns") or []:
@@ -200,7 +305,7 @@ def audit_cross_refs(stores, ids, tree_keys):
 
     # Pipeline → experience
     for r in stores["pipeline"]:
-        if r.get("experience_ref"):
+        if r.get("experience_ref") and experience_evaluable:
             _check("pipeline", r, "experience_ref", r["experience_ref"],
                    "exp", "experience", ids["exp"])
 
@@ -213,7 +318,22 @@ def audit_cross_refs(stores, ids, tree_keys):
             if not isinstance(tk, str) or not tk.strip():
                 continue
             tk = tk.strip()
-            if tk not in tree_keys:
+            # PATH-SHAPED REFS RESOLVE BY LEAF SLUG (, 2026-08-10).
+            # tree_keys are flat kebab-case slugs, but writers routinely record
+            # this field as a PATH ("system/daemon-only-architecture") because
+            # that is how tree nodes are named everywhere else. A strict `tk not
+            # in tree_keys` therefore flags a valid ref whose leaf exists.
+            # Measured on the live corpus the moment the depth-1 glob fix made
+            # this branch reachable at all: 573 flagged rows, of which 456 (198
+            # unique refs) had their leaf slug present in _tree.yaml. That is
+            # not a reporting nit — learning-routing-repair.py --apply NULLS
+            # every flagged ref and tree.py::_post_remove_sweep_dangling invokes
+            # it automatically on each tree-node removal, so those 456 valid
+            # references would have been stripped out of experience records.
+            # Deliberately conservative: exact match first, then leaf-slug. A
+            # trailing ".md" is NOT stripped — a ref carrying a file extension
+            # is genuinely malformed and should keep surfacing.
+            if tk not in tree_keys and tk.rstrip("/").split("/")[-1] not in tree_keys:
                 dangling.append({
                     "store": "experience", "record_id": r.get("id"),
                     "field": "tree_nodes_related", "ref": tk,
@@ -299,6 +419,19 @@ def format_report(dangling, prose, doc_findings, catalog_findings, stats):
         f"pipeline:{stats['pipeline']} sig:{stats['sig']} exp:{stats['exp']} "
         f"tree:{stats['tree']}"
     )
+    # Never let a skipped axis read as a clean one (guard-1760). exp:0 has two
+    # causes and they demand opposite responses: a foreign world means the
+    # corpus is NOT THIS WORLD'S and every experience axis was deliberately not
+    # evaluated; an owned-but-empty corpus means the read itself came back
+    # empty, which is a defect to chase, not a clean bill.
+    if stats.get("exp", 0) == 0:
+        out.append(
+            "  experience axis SKIPPED — %s. Refs into/out of the experience "
+            "store were NOT evaluated; a 0 here is 'unmeasured', not 'clean'."
+            % ("foreign world: the agents corpus does not belong to %s" % WORLD_DIR
+               if not world_owns_agent_corpus()
+               else "corpus owned by this world but read back 0 records")
+        )
     drift_total = len(dangling) + len(doc_findings) + len(catalog_findings)
     if drift_total == 0 and not prose:
         out.append("")

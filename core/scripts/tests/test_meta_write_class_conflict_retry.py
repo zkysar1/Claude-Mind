@@ -51,7 +51,6 @@ convention).
 """
 from __future__ import annotations
 
-import importlib
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -65,15 +64,11 @@ for _p in (str(_SCRIPTS), str(_ROOT)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import _conflict_fixture as CF  # noqa: E402  (shared conflict seam, )
 from mind_api.src.meta import meta_backpressure as BP   # noqa: E402
 from mind_api.src.meta import meta_experiment as EX     # noqa: E402
 from mind_api.src.meta import meta_transfer as TR       # noqa: E402
 from mind_api.src.meta import strategy_apply as SA      # noqa: E402
-
-
-def _fileops_mod():
-    """The CURRENT _fileops module object (sibling suites reload it)."""
-    return importlib.import_module("_fileops")
 
 
 class _Conflict(Exception):
@@ -120,27 +115,14 @@ class _StubBackend:
         return _Result()
 
 
-def _retry_globals():
-    """The namespace `_rmw_with_conflict_retry` actually reads at call time.
-
-    mind_api/src/file_locks.py binds the FUNCTION OBJECT once via `from
-    _fileops import _rmw_with_conflict_retry`. That function resolves
-    `get_backend` and `_conflict_backoff` from its own __globals__ — the
-    _fileops module dict it was DEFINED in — which is not reliably the dict
-    importlib hands back after a sibling suite reloads _fileops. Patching the
-    wrong one lets `conflict_cls` fall back to the real backend's empty-tuple
-    type, `except conflict_cls` matches nothing, and the injected _Conflict
-    escapes: the conflict tests then pass in isolation and fail in the full
-    suite. Going through __globals__ is exact and reload-proof (same note in
-    test_meta_yaml_conflict_retry.py / test_experience_conflict_retry.py).
-    """
-    return BP.file_locks._rmw_with_conflict_retry.__globals__
-
-
 @pytest.fixture(autouse=True)
 def _no_backoff(monkeypatch):
-    """Retry sleeps would make these tests slow for no signal."""
-    monkeypatch.setitem(_retry_globals(), "_conflict_backoff", lambda *_: 0)
+    """Retry sleeps would make these tests slow for no signal.
+
+    Autouse, so it must stay separate from the `backend` fixture below (which
+    also zeroes backoff): tests that never request `backend` still need it.
+    """
+    monkeypatch.setitem(CF.retry_globals(), "_conflict_backoff", lambda *_: 0)
 
 
 @pytest.fixture()
@@ -153,17 +135,10 @@ def meta_dir(tmp_path):
 
 @pytest.fixture()
 def backend(monkeypatch):
-    be = _StubBackend()
-    # Three namespaces resolve get_backend on these paths and are NOT
-    # guaranteed to be the same dict (see _retry_globals):
-    #   1. storage_backend — every _read_yaml here imports it at CALL time
-    #   2. the retry primitive's own __globals__ — where conflict_cls comes from
-    #   3. the current _fileops module object — the lock path + atomic write
-    import storage_backend
-    monkeypatch.setattr(storage_backend, "get_backend", lambda: be)
-    monkeypatch.setitem(_retry_globals(), "get_backend", lambda: be)
-    monkeypatch.setattr(_fileops_mod(), "get_backend", lambda: be, raising=False)
-    return be
+    # The namespace enumeration this used to hand-roll now lives once in
+    # _conflict_fixture.patch_conflict_backend (). Every _read_yaml on
+    # these paths imports storage_backend at CALL time, so no `extra` is needed.
+    return CF.patch_conflict_backend(monkeypatch, _StubBackend())
 
 
 @pytest.fixture(autouse=True)
@@ -657,12 +632,19 @@ def test_scope_write_classes_are_what_the_cure_assumed():
     """
     from coordination_merge import merge_handler_for
 
-    fence_only = ["backpressure.yaml", "active-experiments.yaml",
+    fence_only = ["active-experiments.yaml",
                   "completed-experiments.yaml", "_index.yaml",
                   "reflection-strategy.yaml", "encoding-strategy.yaml",
                   "aspiration-generation-strategy.yaml"]
+    # backpressure.yaml MOVED (b) -> (a) on 2026-07-31, when 's
+    # f6d6bd7eb registered merge_backpressure. This test fired exactly as its
+    # docstring intends and the re-derivation was done (): the handler
+    # STAYS — unregistering it re-opens a measured 6.2h / 54-commit cross-box
+    # wedge on cc-06 — so the class change is accepted here. Its locked_rmw cure
+    # is deliberately RETAINED as redundant belt-and-braces, not removed.
+    # Decision + rationale: core/config/conventions/governed-store-write-classes.md.
     merge_protected = ["goal-selection-strategy.yaml", "strategy-generations.yaml",
-                       "pipeline-meta.json"]
+                       "pipeline-meta.json", "backpressure.yaml"]
 
     for name in fence_only:
         assert merge_handler_for(name) is None, (

@@ -87,6 +87,22 @@ session — never reconstructed from prior-session memory (per
    # changes. Do NOT add a HEAD@{1}..HEAD probe here — chat sessions usually
    # have not committed yet, so the reflog scope would be empty and the
    # working-tree scope is the only one that captures session work.
+   #
+   # THESE THREE PROBES CANNOT SEE world/ OR meta/, AND THEIR SILENCE ABOUT
+   # THOSE PATHS IS NOT EVIDENCE NOTHING CHANGED (g-115-3392). Both are
+   # EXTERNAL gitignored paths (`.gitignore` `/.mind-data/`), so an edit to a
+   # convention, a knowledge-tree node, or a meta strategy file produces NO
+   # line here, on any box, for any agent, ever. Step 4's in-context
+   # conversation memory is the ONLY source of scope for them — that is not a
+   # fallback, it is the primary and only path, so do not let an empty
+   # `git status` short-circuit step 4.
+   #
+   # Do NOT "fix" this with `git -C "$WORLD_PATH" status` — MEASURED and it
+   # fails SILENTLY (2026-08-02, cc-03). `.mind-data/` lives INSIDE the repo,
+   # so `git -C` there resolves to the PARENT repo (`--show-toplevel` =
+   # PROJECT_ROOT, no `.git` of its own) and reports 0 lines at rc=0 on an
+   # ignored subtree. It reads exactly like a clean tree. guard-1947: an
+   # instrument that cannot see is not one that saw nothing.
 2. Read agents/<agent>/session/working-memory.yaml
 3. Bash: aspirations-read.sh --summary
 4. Identify scope from in-context conversation memory:
@@ -355,6 +371,39 @@ For each debt entry (process in order: HIGH-priority first, then oldest first):
       Log: "AUTO-RESOLVED debt for {debt.node_key} — node updated {node_date} (debt filed {debt_date})"
       continue
 
+  # NULL-KEY LANE (g-115-5150). The check above CANNOT fire when node_key is
+  # null, and null is the MAJORITY shape, not an anomaly: /respond Step 6 files
+  # debt precisely when a correction has BROADER implications than any single
+  # node the _tree.yaml scan found, so "no one node" is the DESIGNED common
+  # case for this slot. `tree-read.sh --node null` returns nothing ->
+  # node_last_updated stays empty -> the entry falls through to the
+  # carry-forward increment on EVERY sweep, forever, until the max-defer
+  # ceiling silently DISCARDS it. Measured 2026-08-06 (alpha): all five live
+  # entries carried node_key null, all priority HIGH, all already at
+  # sessions_deferred 6 of 10 — i.e. four sweeps from being dropped, with the
+  # sweep itself supplying the increments. The resolver was built for a shape
+  # its producer does not usually emit.
+  IF debt.node_key is null or empty:
+      Extract the first goal id matching g-\d+-\d+ from debt.reason (also check
+        debt.routed_goal / debt.source_goal if present).
+      IF such a goal id was found:
+          # Derive the aspiration from the goal id — asp-<NNN> from g-<NNN>-<NN>.
+          # aspirations-read.sh --id takes an ASPIRATION id; passing a GOAL id
+          # returns {"error":"not_found"}, which reads exactly like "the goal is
+          # gone" and would wrongly resolve nothing.
+          Bash: bash core/scripts/aspirations-read.sh --id asp-<NNN>
+          Find the goal in the returned goals[] and read its status.
+          IF status == "completed":
+              Mark entry.resolved = true,
+                   entry.resolution_method = "auto_resolved_by_routed_goal"
+              Log: "AUTO-RESOLVED null-key debt — routed goal {gid} completed: {debt.reason first 60 chars}"
+              continue
+      # Fall through deliberately when there is no goal id, or the goal is not
+      # yet completed. Do NOT resolve a null-key debt on AGE — a debt whose
+      # condition is still TRUE must stay open, and "it got old" is not evidence
+      # the underlying gap was filled. That load-bearing negative is the whole
+      # difference between resolving a debt and discarding it.
+
   # INLINE RESOLUTION for HIGH-priority OR aged debts
   IF entry.priority == "HIGH" OR (entry.sessions_deferred ?? 0) >= 2:
     Read the target node .md file
@@ -378,8 +427,20 @@ For each debt entry (process in order: HIGH-priority first, then oldest first):
 
   # MAX-DEFER CEILING: drop stale debts that never resolve (mirrors Step 2.25)
   IF entry.sessions_deferred >= 10:
+    # DURABLE DROP FIRST (g-115-5150). `resolution_method: max_defer_dropped` is
+    # a DISCARD wearing the word "resolved" — the gap it recorded is still open,
+    # nobody was told, and the only trace was a Log line that dies with the
+    # session. Worse for the null-key majority: the message rendered literally as
+    # "DROPPED debt for null", naming nothing recoverable. So write the reason
+    # somewhere that outlives the entry BEFORE removing it, and never drop a HIGH
+    # debt into a log line alone.
+    Bash: echo '{"entry_type":"observation","content":"KNOWLEDGE DEBT DROPPED (ceiling {sessions_deferred}): node_key={debt.node_key or \"null\"} priority={entry.priority} source_goal={debt.source_goal} — {debt.reason}"}' | bash core/scripts/execution-diary.sh append
+    IF entry.priority == "HIGH":
+      # A HIGH debt reaching the ceiling means 10 sweeps failed to resolve it.
+      # That is a finding about the resolver, not just about this entry.
+      Bash: echo '{"title":"Investigate: HIGH knowledge debt hit the max-defer ceiling","description":"Dropped at sessions_deferred={N}. node_key={debt.node_key or null}. source_goal={debt.source_goal}. Verbatim reason, preserved because the entry is being discarded: {debt.reason}","priority":"MEDIUM","participants":["agent"],"category":"framework-maintenance","tags":["knowledge-debt","max-defer-drop"],"origin_signal":"investigate:knowledge-debt-ceiling"}' | bash core/scripts/aspirations-add-goal.sh --source world asp-115
     Mark entry.resolved = true, entry.resolution_method = "max_defer_dropped"
-    Log: "DROPPED debt for {debt.node_key} — deferred {sessions_deferred} sessions, ceiling reached"
+    Log: "DROPPED debt for {debt.node_key} — deferred {sessions_deferred} sessions, ceiling reached (reason preserved to execution-diary)"
 
 # Build the filtered array — DROP every entry where resolved == true.
 # DO NOT rely on wm-prune.sh to clean these later: knowledge_debt is NOT
@@ -597,9 +658,33 @@ Did the chat-session changes touch framework files where regressions need a chec
      core/scripts/**, core/config/**, mind_api/src/**, .claude/skills/**,
      .claude/rules/**, .claude/settings.json
    # world/ and meta/ are deliberately NOT listed: they are external gitignored
-   # paths (.gitignore `/world/`), so `git status --short` can never report
-   # them. Listing them would look like coverage while matching nothing —
-   # the same dead arm removed from sq-018 in g-115-3539 (rb-5942).
+   # paths (.gitignore `/world/`, `/meta/`, `/.mind-data/`), so `git status
+   # --short` can never report them. Listing them would look like coverage
+   # while matching nothing — the same dead arm removed from sq-018 in
+   # g-115-3539 (rb-5942).
+   #
+   # WHAT COVERS THEM INSTEAD (g-115-3392): nothing here does, and nothing
+   # here can. A convention or knowledge-tree edit made this session reaches
+   # Lane 5 ONLY through your own in-context memory of having made it —
+   # Phase 1 step 4's conversation-scope pass is the sole path. So the SKIP
+   # below means "no TRACKED framework file changed", NOT "no framework-
+   # relevant work happened": if you edited a convention or a tree node this
+   # session and Lane 5 would have proposed a check for it, propose that
+   # check anyway. An empty `git status` is not permission to skip.
+   #
+   # Do NOT try to close this with `git -C "$WORLD_PATH" status` — MEASURED
+   # and it fails SILENTLY (2026-08-02, cc-03): `--show-toplevel` from
+   # inside the world dir resolves to the PARENT repo, which has that path
+   # ignored, so it returns 0 lines at rc=0 and reads exactly like a clean
+   # tree. An mtime sweep is unsound for a different reason — under
+   # own-cloud the local tree is a read-through cache, so a PARTNER's synced
+   # edit moves local mtimes and cannot be told from your own. The mtime
+   # sweep is only sound where an authorship filter exists: 1269/1335 (95%)
+   # of tree nodes carry `last_update_trigger.session`, but only 6 of 66
+   # conventions carry ANY front matter, so no such filter exists for the
+   # conventions half. That asymmetry is why the sound probe is tree-only
+   # and is NOT built here — a probe covering half the surface would read
+   # as coverage of all of it, which is this lane's original defect.
    IF no framework files changed:
      Print: "encode-session: no framework files changed — no verify-learning candidates."
      SKIP rest of Lane 5.

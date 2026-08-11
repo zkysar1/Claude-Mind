@@ -55,6 +55,8 @@ DEFAULT_SLOT_TYPES = [
 ARRAY_SLOTS = {
     "knowledge_debt", "known_blockers", "micro_hypotheses",
     "recent_violations", "sensory_buffer", "conclusions",
+    "spark_capture",  #  — see wm.py for why membership guards survival
+    "exp_capture",    #  — experience sibling of spark_capture, same reason
 }
 MAP_SLOTS = {
     "active_context": {"summary": None, "experience_refs": [], "retrieval_manifest": None},
@@ -76,7 +78,12 @@ CADENCE_TRACKER_PATTERNS = (
 # opposite sides of the aspirations-consolidate Step-5 wm-reset boundary
 # (Step 0.65 writes journal_cluster_summaries; Step 9 consumes it one-shot for
 # handoff key_outcomes). ()
-RESET_SURVIVING_SLOTS = {"journal_cluster_summaries"}
+# spark_capture: body-merge generalize-down writes it at consolidate Step -1;
+# aspirations-spark Phase 6.5 consumes it. wm-reset at Step 5 sits between them.
+# ()
+# exp_capture: same transport, same Step-5 boundary; consumed by the
+# retrospective, which calls the existing experience writers. ()
+RESET_SURVIVING_SLOTS = {"journal_cluster_summaries", "spark_capture", "exp_capture"}
 
 
 def _is_cadence_tracker(slot_name: str) -> bool:
@@ -483,7 +490,42 @@ def append_slot(ctx) -> "Response":  # type: ignore[name-defined]
             if not isinstance(arr, list):
                 return Response.error(400, "not_a_list",
                                       f"'{slot}' is {type(arr).__name__}, not a list")
-            arr.append(item)
+            # knowledge_debt UPSERT-BY-node_key (, 2026-08-06).
+            # TWIN of core/scripts/wm.py cmd_append — keep both in sync; this
+            # daemon copy is the LIVE path (wm-append.sh is daemon-routed, so
+            # the CLI edit alone changes nothing: guard-742). Measured before
+            # the fix: 10 entries for 5 distinct node_keys across 3 scans,
+            # limit 15. The reflect tree-lint re-flags the TOP 5 by
+            # retrieval_count every maintain pass and that set is stable by
+            # construction, so blind appends saturate the slot with re-records
+            # and the FIFO eviction below then drops genuine debt from the
+            # other writers within ~3 scans. Upsert (not skip) because the
+            # newer scan carries fresher counts; _item_ts is preserved so a
+            # node that keeps re-flagging cannot indefinitely renew its own
+            # eviction priority over older, never-serviced debt.
+            # SELF-HEALING: collapse ALL matches, not just the first — a
+            # replace-first-and-break prevents NEW duplicates but never
+            # converges a slot that ALREADY holds them. TWIN of core/scripts/
+            # wm.py cmd_append; keep in sync.
+            _upserted = False
+            if root_slot_for_validation == "knowledge_debt" and isinstance(item, dict):
+                _nk = item.get("node_key")
+                if _nk:
+                    _matches = [_i for _i, _e in enumerate(arr)
+                                if isinstance(_e, dict) and _e.get("node_key") == _nk]
+                    if _matches:
+                        _oldest = min(
+                            (arr[_i].get("_item_ts") for _i in _matches
+                             if arr[_i].get("_item_ts")),
+                            default=item.get("_item_ts"),
+                        )
+                        item["_item_ts"] = _oldest
+                        arr[_matches[0]] = item
+                        for _i in reversed(_matches[1:]):
+                            arr.pop(_i)
+                        _upserted = True
+            if not _upserted:
+                arr.append(item)
             # Enforce array limits.
             config = _read_config(ctx)
             pruning = _get_pruning_config(config)

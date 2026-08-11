@@ -122,6 +122,18 @@ reference documents.
   purgeable directories across tree / reasoning-bank / guardrails. What it does
   NOT do is gate the DELETE side: `/drain-temp` Phase 1.5 purge has no reference
   check wired into it. Scope D4 to that gap alone, not to a fresh detector.
+  **SHIPPED 2026-08-01 (alpha, cc-04).** The delete-side gap was narrower than
+  "no reference check" implies: Lane 1 (root `temp/`) had already gained the
+  cited exemption in g-306-111, and Lane 2 (`drained/` GC by age) had none. So
+  citation-protection was a property of WHICH DIRECTORY a file sat in, not of
+  the artifact — draining a cited doc into `drained/` stripped its protection.
+  `gc_drained_archive` now applies the same basename exemption, publishes
+  `drained_gc_files` so the exemption is checkable from outside, and is SKIPPED
+  outright (not degraded) when the cited set is unknown. No new detector was
+  built: `durability-property-check.py cited-temp-not-purged` gained the lane-2
+  join and its PASS line moved from `[Lane 1 only]` to `[Lanes 1+2]`.
+  Lane 3 stays uncovered by nature — it deletes DIRS, and the cited set is keyed
+  on file basenames, so there is nothing to intersect.
 - **The residual defect is retention, not addressing.** Most live dangles
   exist because a referenced artifact was purged while live references still
   pointed at it. That is the parent pattern verbatim, and it belongs to D5

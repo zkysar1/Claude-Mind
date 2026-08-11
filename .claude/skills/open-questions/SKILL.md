@@ -74,13 +74,37 @@ questions visible, matching a direct authoritative-store read exactly
 ## Phase 3: Scan User-Participant Goals
 
 ```
-1. Bash: `aspirations-query.sh --goal-field participants user`
+1. Bash: `aspirations-query.sh --goal-field participants user --full`
+   → `--full` is LOAD-BEARING: the default projection omits `user_leg_scope`
+     entirely (verified 2026-08-04: 0 of 160 rows carry the key without it,
+     45 with it), and the bucket split below is driven by that field.
    → Filter returned goals where status NOT in ("completed", "skipped", "expired")
-   Store as user_goals list
 
 2. Bash: aspirations-read.sh --archive
    → Same filter (catch goals in archived aspirations that are still open)
-   Append to user_goals list
+   Append to the surviving list
+
+3. Classify every surviving goal into exactly one bucket. The classifier is
+   `is_decision_like()` in `core/scripts/gates/user_leg_scope.py` — the SSOT
+   for the scope vocabulary and its decision/action split. Apply its logic:
+
+   BUCKET A — "Decisions Needed" (NEVER compressible):
+     is_decision_like(user_leg_scope, title) is True — i.e. scope in
+     DECISION_LIKE_SCOPES (architecture-decision, deployment-approval,
+     credential-grant), OR a free-text scope containing decision/approval/
+     grant, OR a title starting with a DECISION_TITLE_PREFIXES marker
+     ("Decide:", "USER DIRECTIVE:", "USER:", "PARKED tracker:").
+
+   BUCKET B — "Actions Needed":
+     Not bucket A, AND (user_leg_scope is set (action-like: commit, push,
+     data-provision, new-resource, or other non-decision free text)
+     OR participants == ["user"] (user-only with no agent leg)).
+
+   BUCKET C — "Reviewer / Improvement Work":
+     Everything else: unscoped, participants include agent, no decision
+     marker. Collapsed BY SPEC in Phase 4 — the LLM never invents its own
+     compression criterion (2026-08-04 incident: ad-hoc LLM triage of a flat
+     42-row table hid an architecture-decision goal from the user).
 ```
 
 ## Phase 3.5: Scan Blocked Goals
@@ -108,11 +132,37 @@ IF pending_questions is non-empty:
   |---|---|---|---|
   {for each of that agent's entries: id, date, question (truncated to ~100 chars), default_action}
 
-IF user_goals is non-empty:
-  ## User Goals
-  | Goal | Aspiration | Title | Priority | Status |
-  |---|---|---|---|---|
-  {for each: goal_id, aspiration_id, title, priority, status}
+IF any user-goal bucket is non-empty:
+  ## User Goals ({total across all three buckets})
+
+  IF bucket_A is non-empty:
+    ### Decisions Needed ({count})
+    DO NOT COMPRESS, SUMMARIZE, OR OMIT ANY ROW IN THIS SECTION — every goal
+    here wants the user's judgment; hiding one is a critical error (the
+    2026-08-04 g-115-4225 incident). Per guard-1066, re-verify each row's
+    premise against current state before presenting — but a stale premise
+    means SURFACE IT WITH THE STALE-PREMISE FINDING (so the user can close
+    it), never silently drop the row. Over-surfacing is the safe direction.
+    | Goal | Aspiration | Title | Scope | Priority | Status |
+    |---|---|---|---|---|---|
+    {each: goal_id, aspiration_id, title (full, NO truncation),
+     user_leg_scope or "unscoped (title-match)", priority, status}
+
+  IF bucket_B is non-empty:
+    ### Actions Needed ({count})
+    | Goal | Aspiration | Title | Scope | Priority | Status |
+    |---|---|---|---|---|---|
+    {each: goal_id, aspiration_id, title, user_leg_scope or "unscoped", priority, status}
+    IF count > 15: render the 15 highest-priority rows, then
+      "... plus {N} more action goals (IDs: {comma list})"
+
+  IF bucket_C is non-empty:
+    ### Reviewer / Improvement Work ({count} goals — collapsed by spec)
+    {count} agent-led improvement goals carry you as reviewer only.
+    IDs: {comma-separated goal_ids, grouped by aspiration}
+    IF any have user_leg_scope unset:
+      ({N} of these declare no user_leg_scope — candidates for scope
+      backfill or participant drop via the reclaim-routed-work lane P.)
 
 IF blocked_goals is non-empty:
   ## Blocked Goals ({summary.total_blocked} of {summary.total_active_goals} active goals)
@@ -149,11 +199,11 @@ IF blocked_goals is non-empty:
     |---|---|---|---|
     {for each: goal_id, aspiration_id, title (truncated ~50 chars), block_detail}
 
-IF all three empty (pending_questions, user_goals, blocked_goals):
+IF all three empty (pending_questions, all user-goal buckets, blocked_goals):
   Nothing requires your attention. All questions answered, no user goals open, no blocked goals.
 
 ───────────────────────────────────────────────
-Summary: {N} pending questions across {A} agents, {M} user goals, {B} blocked goals
+Summary: {N} pending questions across {A} agents, {M} user goals ({count(bucket_A)} decisions needed), {B} blocked goals
 ═══════════════════════════════════════════════
 ```
 

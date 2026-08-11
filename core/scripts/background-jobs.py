@@ -286,6 +286,15 @@ def cmd_register(args):
         "launched_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
         "monitor_goal_id": args.monitor_goal,
         "completion_check": args.completion_check,
+        # Owning BODY (). This store is agent-wide (session/ singular,
+        # one file per mind on the box) and carried no body key, so a WORKER
+        # body's job made the REDUCER's stop-hook Gate 2.6 ALLOW a turn-end it
+        # would otherwise BLOCK. MIND_SID is always injected into Bash tool
+        # calls (bash-agent-inject.py) and every register call site is an
+        # EXECUTE-phase skill, so the env read resolves in production; the
+        # explicit flag exists for tests and for callers that know better.
+        # Empty when unresolvable — see cmd_has_pending for why that is safe.
+        "owner_sid": (getattr(args, "body_sid", "") or os.environ.get("MIND_SID", "") or ""),
     }
     if args.metadata:
         entry["metadata"] = json.loads(args.metadata)
@@ -297,6 +306,21 @@ def cmd_register(args):
     data["jobs"].append(entry)
     write_data(data)
     log(f"registered: {args.id} (type={args.type}, goal={args.goal}, pid={args.pid})")
+    # Un-gateable registration warning (). cmd_has_pending counts a job
+    # as pending only when the PID is alive AND at least one completion mechanism
+    # exists. That strictness is deliberate (the anti-zombie rule — see its
+    # docstring), so this is NOT an error: standalone infrastructure legitimately
+    # registers without one. But without the warning the caller gets a plain
+    # success message for a registration that is structurally incapable of the one
+    # thing it was registered for, believes turn-end is permitted, and busy-spins
+    # against a Gate 2.6 BLOCK for the length of the external wait
+    # (~20 turns over 32min — run-full-suite-after-deep-code.md). Say so at the
+    # only moment the caller is still in a position to fix it.
+    if not (entry["monitor_goal_id"] or "") and not (entry["completion_check"] or ""):
+        log(f"WARN: {args.id} has neither --monitor-goal nor --completion-check — "
+            "this job will NOT satisfy `has-pending` / stop-hook Gate 2.6, so it "
+            "cannot gate turn-end. Pass --completion-check or --monitor-goal if "
+            "you registered it to hold the turn open.")
 
 
 def cmd_deregister(args):
@@ -375,9 +399,41 @@ def cmd_has_pending(args):
     that killed alpha's loop after each iteration.)
 
     Exit 0 = at least one pending job, Exit 1 = none.
+
+    BODY FILTER (--body-sid, g-306-135). OPT-IN by design: with no --body-sid
+    the behaviour is byte-identical to before, because the other consumer of
+    this gate — recovery-gate.sh Cond 4 — probes CROSS-AGENT
+    (`MIND_AGENT="$agent" background-jobs.sh has-pending`) and asks an
+    agent-wide question: "is this whole mind legitimately busy?" Making the
+    filter a default would answer a different question there and, since Cond 4
+    passes when has-pending exits 1, would make zombie-recovery MORE likely to
+    fire on an agent that is genuinely working.
+
+    When --body-sid IS passed (stop-hook Gates 2.5/2.6), a job counts only if
+    its owner_sid matches EXACTLY. A job with a missing/empty owner_sid — one
+    registered before this change — therefore does NOT gate. That direction is
+    deliberate: rb-605 (anticipation gates fail OPEN) and this gate's own
+    comment both say an error must resolve to "no pending jobs" so the BLOCK
+    proceeds and the loop stays alive. Filtering must never turn an unknown
+    owner into an ALLOW, because an ALLOW is what removes the text-death net.
     """
     data = read_data()
+    # THREE-WAY, not two: the flag's ABSENCE and an EMPTY value mean opposite
+    # things, so the default is None rather than "".
+    #   None  -> caller did not ask to filter (recovery-gate) -> agent-wide.
+    #   ""    -> caller asked to filter but could not resolve its own identity.
+    #            That is the error case: nothing is "mine", so exit 1 and let the
+    #            BLOCK proceed. Collapsing it into the None branch would let an
+    #            identity-less caller ALLOW, and matching it against a legacy
+    #            record's empty owner_sid would do the same by string equality.
+    #   <sid> -> exact-match filter; a record with an empty owner_sid can never
+    #            match a non-empty sid, so legacy records correctly do not gate.
+    body_sid = getattr(args, "body_sid", None)
+    if body_sid is not None and not body_sid:
+        sys.exit(1)
     for job in data.get("jobs", []):
+        if body_sid is not None and (job.get("owner_sid") or "") != body_sid:
+            continue
         if not pid_alive(job.get("pid")):
             continue
         if (job.get("monitor_goal_id") or "") or (job.get("completion_check") or ""):
@@ -423,6 +479,8 @@ def build_parser():
                           "format is optional (json|jsonl); omit for size-only. "
                           "Any missing/too-small/unparseable artifact flips status "
                           "from 'completed' to 'failed' with output_check_failures.")
+    reg.add_argument("--body-sid", default="",
+                     help="Owning body's session id. Defaults to $MIND_SID.")
 
     # deregister
     dereg = sub.add_parser("deregister", help="Remove a job by ID")
@@ -437,7 +495,12 @@ def build_parser():
     lst.add_argument("--json", action="store_true", help="Output as JSON")
 
     # has-pending
-    sub.add_parser("has-pending", help="Exit 0 if any jobs exist, exit 1 otherwise")
+    hp = sub.add_parser("has-pending", help="Exit 0 if any jobs exist, exit 1 otherwise")
+    hp.add_argument("--body-sid", default=None,
+                    help="Count only jobs owned by this body's session id. "
+                         "Omit entirely for agent-wide (legacy) behaviour; an "
+                         "EMPTY value means the caller has no identity and "
+                         "nothing counts as pending.")
 
     # clear
     sub.add_parser("clear", help="Delete tracking file entirely")

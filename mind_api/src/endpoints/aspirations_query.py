@@ -19,7 +19,17 @@ when a goal_id-keyed reader passed --full.
 
 Response: application/json — `json.dumps(results, indent=2, ensure_ascii=True)`,
 byte-for-byte matching `cmd_query`'s stdout. Always reads BOTH world and agent
-queues (the CLI ignores --source for query — see aspirations.py:879 comment).
+queues: `--source` is ACCEPTED BUT DOES NOT FILTER, so `--source agent` returns
+world goals too. That is by design, not a bug — every row carries its own
+`source` key, so a caller filters client-side on that. Measured cc-07: the two
+invocations are byte-identical, 3982 rows, {'world': 3933, 'agent': 49}.
+(The previous citation here pointed at `aspirations.py:879`, which is now
+unrelated `streak-breaks.jsonl` code — the line number drifted, so a reader
+following it could not verify the claim. Behaviour re-verified by measurement
+rather than re-cited to another line that will drift again.)
+
+If NEITHER store path exists the endpoint returns 404 `no_aspiration_store`
+naming the paths probed — it does NOT return an empty array (g-115-4842).
 
 What this endpoint does NOT do (Phase B scope-cut, same as aspirations/read):
   - Call `_log_goal_read` for each returned goal. The CLI logged reads to power
@@ -120,13 +130,37 @@ def query(ctx) -> "Response":  # type: ignore[name-defined]
 
     jc = cache()
     sources: List[Tuple[str, List[Dict[str, Any]]]] = []
+    probed: List[str] = []
     world_path = ctx.paths.world / "aspirations.jsonl"
+    probed.append(str(world_path))
     if world_path.exists():
         sources.append(("world", jc.get(world_path)))
     if ctx.paths.agent is not None:
         agent_path = ctx.paths.agent / "aspirations.jsonl"
+        probed.append(str(agent_path))
         if agent_path.exists():
             sources.append(("agent", jc.get(agent_path)))
+
+    # ZERO READABLE STORES IS NOT AN EMPTY RESULT — it is an unanswerable query
+    # (). Without this, both `.exists()` checks failing left `sources`
+    # empty, the loop below ran zero times, and the endpoint returned `[]` with
+    # HTTP 200 and no stderr — byte-identical to a genuinely-clean queue. That is
+    # the reported signature exactly: on one box EVERY query returned [] rc=0
+    # while `aspirations-read.sh` (a different resolver) reported 5149 world
+    # goals in the same minute. A zero whose two explanations imply OPPOSITE
+    # actions is not a measurement (rb-245), and here the two are "nothing
+    # matched your filter" and "I could not find the store at all".
+    #
+    # Deliberately an ERROR, not an empty list with a warning: this endpoint's
+    # whole output is the JSON array, so a caller parsing it has nowhere to see
+    # a warning, and every existing consumer already treats [] as authoritative.
+    # A fresh world with no aspirations.jsonl yet also has no goals to query, so
+    # naming the paths probed is strictly more useful there too.
+    if not sources:
+        return Response.error(
+            404, "no_aspiration_store",
+            "no aspiration store found — probed: " + ", ".join(probed),
+        )
 
     results: List[Dict[str, Any]] = []
     for source_name, aspirations in sources:

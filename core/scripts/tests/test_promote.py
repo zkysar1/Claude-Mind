@@ -623,3 +623,200 @@ def test_shell_dry_run_frontier_missing_releases_still_fails(tmp_path):
     assert r.returncode == 1, r.stdout + r.stderr
     assert "RELEASES.json" in (r.stdout + r.stderr)
     assert "[dry-run] OK" not in r.stdout
+
+
+# ---------------------------------------------------------------------------
+# --auto-merge (). Opt-in merge of the PR the run just opened.
+#
+# The shim below is richer than _mk_gh_shim: it DISPATCHES on the gh subcommand
+# so the script's real decision path executes. Scenarios are driven by env vars
+# rather than by separate shims, so every test exercises one identical binary.
+#
+# Two branches here exist because a guardrail demanded them, and neither can be
+# reproduced on demand against live GitHub:
+#   guard-1897 — `gh pr merge` prints `fatal: Not possible to fast-forward` and
+#                exits NON-ZERO when the REMOTE MERGE ALREADY SUCCEEDED (the
+#                fatal comes from gh updating the local checkout afterwards).
+#                The verdict must come from the remote read, never the exit code.
+#   guard-2640 — an EMPTY statusCheckRollup is not CI-green; it is an empty
+#                population reporting clean, and it renders identically to a
+#                real green. Measured 2026-08-10: no chain repo has any
+#                .github/workflows, so [] is the PERMANENT state here.
+# ---------------------------------------------------------------------------
+
+_GH_DISPATCH_SHIM = r'''#!/usr/bin/env bash
+echo "$@" >> "$GH_CAPTURE_FILE"
+if [[ "$1 $2" == "pr create" ]]; then
+  [[ -n "${SHIM_CREATE_PREAMBLE:-}" ]] && echo "$SHIM_CREATE_PREAMBLE"
+  echo "https://github.com/acme/widget/pull/42"
+elif [[ "$1 $2" == "pr view" ]]; then
+  if [[ "$*" == *mergedAt* ]]; then printf '%b\n' "${SHIM_MERGED_AT-2026-08-10T07:00:00Z}"
+  else
+    _n=0
+    [[ -f "$GH_CAPTURE_FILE.n" ]] && _n=$(cat "$GH_CAPTURE_FILE.n")
+    _n=$((_n+1)); echo "$_n" > "$GH_CAPTURE_FILE.n"
+    if [[ "$_n" == "1" && -n "${SHIM_PR_FACTS_FIRST:-}" ]]; then printf '%b\n' "$SHIM_PR_FACTS_FIRST"
+    else printf '%b\n' "${SHIM_PR_FACTS-MERGEABLE\t0\t0}"; fi
+  fi
+elif [[ "$1 $2" == "pr merge" ]]; then
+  if [[ -n "${SHIM_MERGE_FATAL:-}" ]]; then
+    echo "fatal: Not possible to fast-forward, aborting." >&2
+    exit 1
+  fi
+fi
+exit 0
+'''
+
+
+def _mk_gh_dispatch_shim(tmp_path: Path):
+    shim = tmp_path / "shim"
+    shim.mkdir(exist_ok=True)
+    cap = tmp_path / "gh-capture.txt"
+    gh = shim / "gh"
+    gh.write_text(_GH_DISPATCH_SHIM, encoding="utf-8")
+    os.chmod(gh, 0o755)
+    return shim, cap
+
+
+def _auto_merge_run(tmp_path, *extra_args, **shim_env):
+    """One full promotion with the dispatch shim. Returns (result, capture-text)."""
+    src = _setup_promote_source(tmp_path, "1.0.0")
+    world = _mk_world(tmp_path, "frontier")
+    tgt, _bare = _mk_target_with_remote(tmp_path, "0.0.1")
+    shim, cap = _mk_gh_dispatch_shim(tmp_path)
+    r = _run_promote_pr(src, tgt, world, *extra_args,
+                        shim_dir=shim, gh_capture=cap, extra_env=shim_env)
+    return r, (cap.read_text(encoding="utf-8") if cap.exists() else "")
+
+
+@requires_git
+def test_auto_merge_off_by_default(tmp_path):
+    """Backward compatibility: without the flag the script still NEVER merges."""
+    r, cap = _auto_merge_run(tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "pr create" in cap
+    assert "pr merge" not in cap
+
+
+@requires_git
+def test_auto_merge_merges_when_mergeable_with_zero_checks(tmp_path):
+    """guard-2640: zero checks is NOT laundered into 'CI passed' — the script
+    says so explicitly and names the local gate it is actually relying on."""
+    r, cap = _auto_merge_run(tmp_path, "--auto-merge", SHIM_PR_FACTS="MERGEABLE\\t0\\t0")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "pr merge" in cap
+    assert "NOT read as CI-green" in r.stdout
+    assert "seed-verify.sh --expect-commit passed" in r.stdout
+    assert "--auto-merge OK" in r.stdout
+
+
+@requires_git
+def test_auto_merge_refuses_when_not_mergeable(tmp_path):
+    """A conflicted PR is never merged, and the PR is left open."""
+    r, cap = _auto_merge_run(tmp_path, "--auto-merge", SHIM_PR_FACTS="CONFLICTING\\t0\\t0")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "pr merge" not in cap
+    assert "REFUSED" in r.stdout and "CONFLICTING" in r.stdout
+    assert "left OPEN" in r.stdout
+
+
+@requires_git
+def test_auto_merge_refuses_when_checks_failing(tmp_path):
+    """Checks that EXIST and are red block the merge (guard-1199/1264)."""
+    r, cap = _auto_merge_run(tmp_path, "--auto-merge", SHIM_PR_FACTS="MERGEABLE\\t3\\t1")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "pr merge" not in cap
+    assert "REFUSED" in r.stdout
+    assert "1 of 3 status check(s) not SUCCESS" in r.stdout
+
+
+@requires_git
+def test_auto_merge_proceeds_when_checks_all_green(tmp_path):
+    """The positive control for the branch above: same shape, 0 bad -> merges."""
+    r, cap = _auto_merge_run(tmp_path, "--auto-merge", SHIM_PR_FACTS="MERGEABLE\\t3\\t0")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "pr merge" in cap
+    assert "3 status check(s) all SUCCESS" in r.stdout
+    assert "NOT read as CI-green" not in r.stdout
+
+
+@requires_git
+def test_auto_merge_trusts_remote_over_gh_exit_status(tmp_path):
+    """guard-1897: gh pr merge exits NON-ZERO with the fast-forward fatal while
+    the remote merge SUCCEEDED. Reading the exit code would report a false
+    failure; the remote mergedAt read is the only verdict."""
+    r, cap = _auto_merge_run(tmp_path, "--auto-merge",
+                             SHIM_PR_FACTS="MERGEABLE\\t0\\t0",
+                             SHIM_MERGE_FATAL="1",
+                             SHIM_MERGED_AT="2026-08-10T07:11:00Z")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "pr merge" in cap
+    assert "--auto-merge OK" in r.stdout
+    assert "2026-08-10T07:11:00Z" in r.stdout
+    assert "did NOT land" not in r.stdout
+
+
+@requires_git
+def test_auto_merge_reports_when_remote_says_not_merged(tmp_path):
+    """The other half of guard-1897: a clean gh exit is not success either.
+    Empty mergedAt at the remote must surface as a WARNING, not as OK."""
+    r, cap = _auto_merge_run(tmp_path, "--auto-merge",
+                             SHIM_PR_FACTS="MERGEABLE\\t0\\t0",
+                             SHIM_MERGED_AT="")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "pr merge" in cap
+    assert "did NOT land" in r.stdout
+    assert "--auto-merge OK" not in r.stdout
+
+
+def test_auto_merge_requires_pr_flag(tmp_path):
+    """An accepted-but-inert flag is worse than a rejected one (guard-386)."""
+    r = subprocess.run(
+        [BASH, str(PROMOTE_SH), "--target", str(tmp_path), "--auto-merge"],
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "--auto-merge requires --pr" in (r.stdout + r.stderr)
+
+
+@requires_git
+def test_auto_merge_polls_through_unknown_mergeable(tmp_path):
+    """GitHub computes `mergeable` asynchronously: a just-created PR commonly
+    reads UNKNOWN and resolves on a later read (measured 2026-08-10 against a
+    live PR — poll 1 UNKNOWN, poll 2 MERGEABLE). A single-shot read would refuse
+    almost every real promotion while passing every mocked test, so the poll is
+    load-bearing and this pins it."""
+    r, cap = _auto_merge_run(tmp_path, "--auto-merge",
+                             SHIM_PR_FACTS_FIRST="UNKNOWN\\t0\\t0",
+                             SHIM_PR_FACTS="MERGEABLE\\t0\\t0")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "mergeable=UNKNOWN" in r.stdout and "re-reading" in r.stdout
+    assert "pr merge" in cap
+    assert "--auto-merge OK" in r.stdout
+
+
+@requires_git
+def test_auto_merge_refuses_when_mergeable_never_resolves(tmp_path):
+    """The other side of the poll: UNKNOWN that never resolves is a REFUSAL, not
+    consent. Retrying must not decay into merging on an unresolved signal."""
+    r, cap = _auto_merge_run(tmp_path, "--auto-merge", SHIM_PR_FACTS="UNKNOWN\\t0\\t0")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "pr merge" not in cap
+    assert "REFUSED" in r.stdout and "UNKNOWN" in r.stdout
+
+
+@requires_git
+def test_auto_merge_survives_extra_stdout_from_pr_create(tmp_path):
+    """F-001 (fresh-eyes on this goal's own diff): gh may print an advisory line
+    on stdout BEFORE the PR URL. Capturing the whole of stdout makes PR_URL
+    multi-line, which `gh pr view` then rejects — turning a healthy PR into a
+    false UNREADABLE -> REFUSED. Only the last non-empty line is the URL."""
+    r, cap = _auto_merge_run(tmp_path, "--auto-merge",
+                             SHIM_CREATE_PREAMBLE="Warning: 3 uncommitted changes",
+                             SHIM_PR_FACTS="MERGEABLE\\t0\\t0")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "PR opened: https://github.com/acme/widget/pull/42" in r.stdout
+    assert "Warning: 3 uncommitted changes" not in r.stdout.split("PR opened:")[1][:80]
+    assert "pr merge" in cap
+    assert "--auto-merge OK" in r.stdout
+    assert "REFUSED" not in r.stdout

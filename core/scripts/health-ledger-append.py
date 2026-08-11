@@ -32,6 +32,8 @@ if hasattr(sys.stderr, "reconfigure"):
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import _fileops  # noqa: E402 — after the sys.path insert above (-e)
+
 # --- Inline defaults (used only if config is missing/unreadable; fail-open) ---
 _DEFAULTS = {
     "weights": {"composite_productivity": 0.40, "encoding_ratio": 0.25,
@@ -230,6 +232,28 @@ def main():
     if not world_dir:
         return 0
 
+    #  (G3 worker rail): a WORKER Body must not append to the
+    # agent-wide health ledger. Two boxes appending per-iteration records to one
+    # agents/<agent>/health/<date>.jsonl interleaves two different machines'
+    # composites into one series, which then feeds health-regression-check and
+    # (at mode=full) revert authority — so the corruption is not cosmetic.
+    #
+    # Use MIND_SID directly, NOT _session_id(). That helper deliberately prefers
+    # session/running-session-id — the REDUCER's SID — because it is counting
+    # warmup for the runner. On a worker box that is a DIFFERENT Body (or absent),
+    # so feeding it to the body-WM predicate would test the reducer's session dir
+    # and never fire. The predicate has to be about THIS process's own session.
+    #
+    # Deriving locally rather than reading BODY_ROLE is per guard-2445. Here the
+    # env var would in fact arrive (this runs from iteration-close.sh, inside a
+    # Bash-tool chain that bash-agent-inject rewrote), but the local predicate is
+    # the same one bash-agent-inject itself uses, so the two cannot drift — and
+    # this file is importable from contexts that are not that chain.
+    _own_sid = os.environ.get("MIND_SID", "").strip()
+    if _own_sid and (Path(agent_dir) / "sessions" / _own_sid
+                     / "working-memory.yaml").exists():
+        return 0
+
     cfg = _load_config(config_dir)
     snap = _latest_productivity_snapshot(world_dir, agent)
     if snap is None:
@@ -293,12 +317,25 @@ def main():
 
     # Daily-rotated append (T03b). The filename IS the rotation. mkdir via the
     # runtime (bypasses the L1 Write/Edit hook, which gates only those tools).
+    #
+    # -e: this was a bare open(...,"a"). That is byte-identical to what
+    # LocalBackend does, but it takes NO lock and never reaches the backend, so
+    # under own-cloud the record landed only in the local mirror and a peer's
+    # full-file PUT could overwrite it wholesale. locked_append_jsonl takes the
+    # lock, routes through the active backend (force-fresh read + append + PUT
+    # with 412 retry), and is now reconciled below the write by the handler
+    # registered in coordination_merge for health/*.jsonl. Snapshot-blacklisted
+    # in _fileops so the per-iteration append does not snapshot the day-file each
+    # time (O(N^2) — same treatment as meta/gate-firings.jsonl).
     try:
         health_dir.mkdir(parents=True, exist_ok=True)
         day_file = health_dir / (datetime.now().strftime("%Y-%m-%d") + ".jsonl")
-        with open(day_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=True) + "\n")
-    except OSError as e:
+        _fileops.locked_append_jsonl(day_file, record)
+    except Exception as e:
+        # Widened from OSError: the locked path can also raise on lock
+        # acquisition or a backend error. Telemetry must never break the caller
+        # (this runs inside iteration-close), so the failure stays a no-op —
+        # same contract as before, one rung wider.
         _eprint(f"append failed ({e}) — no-op")
         return 0
 

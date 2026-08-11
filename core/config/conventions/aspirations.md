@@ -28,6 +28,7 @@ time, and they **share the ID `asp-001`** by convention:
 | Source | ID | Title | Seeded by |
 |---|---|---|---|
 | `world/aspirations.jsonl` | `asp-001` | Explore and Learn | `init-world.sh` (copies `core/config/world-aspirations-initial.jsonl`) |
+| `world/aspirations.jsonl` | `asp-002` | Operating Rhythm | `init-world.sh` (same seed file — never-terminal recurring container carrying the `/sprint-planning` cadence goal `g-002-01`; world-scope, so ONE agent claims each firing rather than every agent running its own sprint) |
 | `agents/<agent>/aspirations.jsonl` | `asp-001` | Maintain Agent Health | `init-agent.sh` (copies `core/config/agent-aspirations-initial.jsonl`) |
 | `agents/<agent>/aspirations.jsonl` | `asp-003` | Orient and Specialize | `init-agent.sh` (appends `core/config/agent-aspirations-onboard.jsonl` for subsequent agents) |
 
@@ -141,26 +142,35 @@ Two script families — world (default) and agent — operate on separate queues
 | `aspirations-meta-update.sh <field> <value>` | Update world aspirations metadata | — |
 | `evolution-log-append.sh` | Append evolution event | JSON |
 
-### World-Only Operations (no agent equivalent)
+### Claim-Lifecycle Operations (both queues, `--source`-selected)
 
 | Script | Purpose |
 |--------|---------|
-| `aspirations-claim.sh <goal-id> [agent-name]` | Atomically claim a world goal for an agent |
-| `aspirations-release.sh <goal-id>` | Release a claimed world goal |
+| `aspirations-claim.sh <goal-id> [agent-name]` | Atomically claim a goal for an agent |
+| `aspirations-release.sh <goal-id> [--source world\|agent]` | Release a claimed goal |
 | `aspirations-complete-by.sh [--source world\|agent] <goal-id> [agent-name]` | Mark goal completed with agent attribution |
 
-Agent name defaults to `$MIND_AGENT` for claim and complete-by. Complete-by supports
-`--source agent` for recurring agent-health goals; claim and release are world-only.
+Agent name defaults to `$MIND_AGENT` for claim and complete-by.
+
+**This section was titled "World-Only Operations (no agent equivalent)" and said
+"claim and release are world-only" until g-306-258.** That was true when written and
+is now false: `g-306-238` taught the claim endpoint `&source=agent`, and `g-306-249`
+gave the release wrapper `--source`. The wrapper's default is still `world`, so an
+agent-queue release that omits the flag silently resolves the wrong queue and
+strands the claim — which is precisely why the flag is written out in the table
+above rather than left implicit.
 
 #### Claim Protocol (Goal Lifecycle)
 
 World goals MUST be claimed before execution to prevent duplicate work across agents.
-Agent queue goals do not need claims (single-agent access).
+Agent-queue goals are single-agent, so a claim is not required for mutual exclusion —
+but they DO carry claims when one is taken (g-306-238), and a claim that is taken must
+be released with `--source agent` or it outlives the session.
 
 | Step | Script | When |
 |------|--------|------|
 | **Claim** | `aspirations-claim.sh <goal-id>` | Before Phase 4 execution (world goals) |
-| **Release** | `aspirations-release.sh <goal-id>` | On execution failure, infrastructure failure, or goal revert |
+| **Release** | `aspirations-release.sh <goal-id> --source {source}` | On execution failure, infrastructure failure, goal revert, or session end |
 | **Complete-by** | `aspirations-complete-by.sh <goal-id>` | On verified completion (Phase 5.3) |
 
 **Rules:**

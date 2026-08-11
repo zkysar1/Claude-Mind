@@ -13,11 +13,22 @@ population. The result is a starved positive-signal stream:
 times_helpful counted on only 20 of 411 active reasoning-bank entries
 nearly triggered Plan A retire-the-dead-entries (rb-472).
 
-This gate fires inside iteration-close.sh do_state_update BEFORE the
-goal record is updated to status=completed. It reads the persisted
-retrieval-session.json (the writer's own audit trail) and refuses to
-proceed when the signal is structurally weak. The agent has one of
-three escape paths:
+WHERE IT FIRES, measured rather than assumed (g-115-3148, 2026-08-01).
+This gate runs inside iteration-close.sh `do_state_update`, which is a
+LATER phase invocation than `do_verify` — and `do_verify` is what writes
+`status=completed` (iteration-close.sh:552-562, via aspirations-update-goal.sh
+or aspirations-complete-by.sh for recurring). So the gate does NOT prevent
+the completion write, and the docstring said it did until this was checked
+against the call site. What it actually does is halt do_state_update (exit 1
+at iteration-close.sh:912-916), stopping every downstream obligation of the
+close — meta bookkeeping, the WM session-completion append, tree-encoding
+bookkeeping, the Phase-6 spark sentinel, iteration-commit. That is real
+pressure and the iteration cannot proceed past it, but it is post-completion
+pressure. Read the title above as "refuse to CLOSE OUT", not "refuse to mark".
+
+It reads the persisted retrieval-session.json (the writer's own audit
+trail) and refuses to proceed when the signal is structurally weak. The
+agent has one of three escape paths:
 
   1. Run Phase 4.26 manually with explicit --helpful items, OR
   2. Run --infer and have it classify at least one item helpful, OR
@@ -75,8 +86,34 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from _paths import WORLD_DIR, AGENT_DIR  # noqa: E402
+from _gate_log import log as _gate_log  # noqa: E402
+
+GATE_ID = "phase-4-26-gate"  # MUST match the id in core/config/gates.yaml
 
 OVERRIDE_LEDGER = WORLD_DIR / "phase-4-26-overrides.jsonl"
+
+# Which _gate_log decision each branch reports. Split by whether the gate had
+# anything to grade: a session with no retrieval population is `noop` (invoked,
+# nothing triggered), not `pass` — the retirement evaluator scores
+# count(decision != "noop"), so counting vacuous passes as firings would make
+# an inert gate look busy. That is the exact failure this gate has already had
+# twice ( inert predicate,  saturated predicate), so the
+# telemetry must not be able to hide a third.
+_DECISION_FOR_PATH = {
+    "no-session":            "noop",
+    "stale-session":         "noop",
+    "retrieval-performed-false": "noop",
+    "empty-population":      "noop",
+    "no-method-legacy":      "pass",
+    "infer-helpful":         "pass",
+    "explicit-classification": "pass",
+    "unknown-method":        "pass",
+    "pending-true":          "block",
+    "all-noise":             "block",
+    "all-unknown":           "block",
+    "infer-zero-helpful":    "block",
+    "read-error":            "fail_open",
+}
 
 
 def _load_session(goal_id):
@@ -98,13 +135,19 @@ def _load_session(goal_id):
 
 
 def _evaluate(session, goal_id):
-    """Return (verdict, reason, method, helpful_count).
-    verdict in {"pass", "block"}.
+    """Return (verdict, reason, method, helpful_count, decision_path).
+
+    verdict in {"pass", "block"}. `decision_path` names WHICH branch produced
+    the verdict — one unique label per return, per guard-502, so a firing in
+    meta/gate-firings.jsonl distinguishes "this branch ran" from "the gate was
+    never invoked". The label is also what makes a silent-path regression
+    visible: an inert predicate shows up as 100% one label rather than as an
+    absence nobody can see.
     """
     sess_goal = session.get("goal_id") or ""
     if sess_goal and sess_goal != goal_id:
         return ("pass", "stale session (different goal_id) — fail-open",
-                None, 0)
+                None, 0, "stale-session")
     # `retrieval_performed` is written ONLY by iteration-close.sh's no-retrieval
     # STUB, always as an explicit False; the real retrieve.sh path records
     # goal_id + counts and leaves the key ABSENT. So `not session.get(...)` —
@@ -116,41 +159,42 @@ def _evaluate(session, goal_id):
     # implementation of the same predicate.
     if session.get("retrieval_performed") is False:
         return ("pass", "retrieval_performed=false (no-retrieval stub — nothing to gate)",
-                None, 0)
+                None, 0, "retrieval-performed-false")
     pop = len(session.get("tree_nodes_loaded") or []) + \
           len(session.get("supplementary_items") or [])
     if pop == 0:
-        return ("pass", "empty retrieval population", None, 0)
+        return ("pass", "empty retrieval population", None, 0,
+                "empty-population")
     method = session.get("utilization_method")
     if method is None:
         if session.get("utilization_pending"):
             return ("block",
                     "utilization_pending=true — Phase 4.26 did not run",
-                    None, 0)
+                    None, 0, "pending-true")
         return ("pass",
                 "no utilization_method but pending=false (legacy session)",
-                None, 0)
+                None, 0, "no-method-legacy")
     if method == "all_noise":
         return ("block",
                 "method=all_noise — backstop fired alone, no positive signal",
-                method, 0)
+                method, 0, "all-noise")
     if method == "all_unknown":
         return ("block",
                 "method=all_unknown — backstop fired alone, no positive signal",
-                method, 0)
+                method, 0, "all-unknown")
     if method == "infer":
         helpful = ((session.get("inference_stats") or {}).get("helpful", 0))
         if helpful == 0:
             return ("block",
                     "method=infer with helpful=0 — no positive signal",
-                    method, 0)
+                    method, 0, "infer-zero-helpful")
         return ("pass", "method=infer with helpful=" + str(helpful),
-                method, helpful)
+                method, helpful, "infer-helpful")
     if method in ("manual", "all_helpful"):
         return ("pass", "method=" + method + " (explicit LLM classification)",
-                method, -1)
+                method, -1, "explicit-classification")
     return ("pass", "unknown method=" + str(method) + " — fail-open",
-            method, 0)
+            method, 0, "unknown-method")
 
 
 def _log_override(goal_id, method, reason):
@@ -173,6 +217,40 @@ def _log_override(goal_id, method, reason):
               file=sys.stderr)
 
 
+def _emit_firing(path, goal_id, method, helpful, reason, override):
+    """One firing record per invocation, labelled with the branch that decided.
+
+    Deliberately ONE call site rather than a `_gate_log` beside each `return`:
+    guard-502's requirement is that every branch be DISTINGUISHABLE in the
+    ledger, and carrying `decision_path` out of `_evaluate` achieves that while
+    keeping `_evaluate` a pure function the tests can exercise without touching
+    telemetry. `log()` never raises (see _gate_log docstring), so this cannot
+    break the gate.
+
+    An override is reported as decision=`override`, NOT as the underlying
+    block — that is what makes the FP ratio count(override)/(block+override)
+    computable. Until now the ONLY trace of this gate's behaviour was
+    world/phase-4-26-overrides.jsonl, which records overridden blocks and
+    nothing else: blocks that STOOD and every pass were invisible, so the
+    gate's own pass/block split was unmeasurable (g-115-3148).
+    """
+    decision = _DECISION_FOR_PATH.get(path, "fail_open")
+    _gate_log(
+        GATE_ID,
+        "override" if override is not None else decision,
+        caller="iteration-close.sh:do_state_update",
+        trigger_matched=method,
+        payload=goal_id,
+        override_reason=override,
+        extra={
+            "decision_path": path,
+            "would_block": decision == "block",
+            "helpful_count": helpful,
+            "reason": reason,
+        },
+    )
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--goal", required=True,
@@ -188,13 +266,15 @@ def main(argv=None):
 
     session, load_err = _load_session(goal_id)
     if load_err == "no-session":
-        verdict, reason, method, helpful = (
-            "pass", "no retrieval-session.json — fail-open", None, 0)
+        verdict, reason, method, helpful, path = (
+            "pass", "no retrieval-session.json — fail-open", None, 0,
+            "no-session")
     elif load_err and load_err.startswith("read-error"):
         print("phase-4-26-gate: " + load_err, file=sys.stderr)
+        _emit_firing("read-error", goal_id, None, 0, load_err, override=None)
         return 2
     else:
-        verdict, reason, method, helpful = _evaluate(session, goal_id)
+        verdict, reason, method, helpful, path = _evaluate(session, goal_id)
 
     payload = {
         "goal_id": goal_id,
@@ -211,9 +291,12 @@ def main(argv=None):
         payload["override"] = True
         payload["override_reason"] = override_reason
         payload["original_block_reason"] = reason
+        _emit_firing(path, goal_id, method, helpful, reason,
+                     override=override_reason)
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
 
+    _emit_firing(path, goal_id, method, helpful, reason, override=None)
     print(json.dumps(payload, indent=2, ensure_ascii=False))
     return 1 if payload["verdict"] == "block" else 0
 

@@ -96,9 +96,12 @@ FOR EACH node_key in primary_nodes:
 Output: "▸ Tree nodes: {keys} ({N} loaded, {A} active-only)"
 
 # Step 4: Supplementary stores (auto-writes retrieval-session.json when --goal set)
-Bash: retrieve.sh --supplementary-only --category {goal.category} --goal {goal.id} --tree-nodes "{comma-separated primary_node keys from Step 3}"
+Bash: retrieve.sh --supplementary-only --category {goal.category} --goal {goal.id} --goal-title "{goal.title}" --tree-nodes "{comma-separated primary_node keys from Step 3}"
 # Returns: reasoning_bank, guardrails, pattern_signatures, experiences, beliefs
 # Side effect: writes agents/<agent>/session/retrieval-session.json for utilization tracking
+# Side effect: fires the Step 4a commons-retrieval hook (see below). --goal-title is
+# consumed ONLY by that hook — the producer matches on tokens(category)|tokens(title),
+# so omitting it silently narrows every commons match.
 Output: "▸ Supplementary: {N} reasoning, {N} guardrails, {N} patterns, {N} experiences"
 
 # Step 4a: Shared-commons retrieval — Pattern B hook slot `commons-retrieval` (g-335-211)
@@ -111,14 +114,25 @@ Output: "▸ Supplementary: {N} reasoning, {N} guardrails, {N} patterns, {N} exp
 # for merging under its OWN manifest key, never supplementary_detail (that key drives
 # utilization counters keyed by LOCAL record id; a foreign signature is not a local record).
 Bash: load-conventions.sh commons-retrieval → IF path returned: Read it
-# Procedural convention — gate on file EXISTENCE, not load status.
-Bash: source core/scripts/_paths.sh && test -f "$WORLD_DIR/conventions/commons-retrieval.md" && echo "exists"
-IF exists:
-    Follow each Step in the convention, passing {goal.id}, {goal.category}, {goal.title}.
-    Fail-open by contract: any step that fails is logged and swallowed. Commons
-    consumption ENRICHES execution — it must never gate it.
+# THERE IS NO INVOCATION LINE HERE ANY MORE, AND ITS ABSENCE IS THE POINT (g-335-667).
+# The call now lives INSIDE core/scripts/retrieve.sh, fired by the Step 4 command above.
+# History: the slot shipped 2026-07-26 with this step reading only "Follow each Step in
+# the convention" — prose, real command one indirection away. g-335-666 replaced that
+# with a literal Bash: line here, and the fire rate stayed PARTIAL: cc-02 logged 2
+# invocations while another box logged 0 across three Phase-4 executions. Prose and a
+# Bash: line in a digest are the SAME enforcement class — changing the FORM of an
+# instruction does not change WHO executes it. Do NOT "helpfully" restore a Bash: line
+# here; that is the exact regression, and it would double-fire the producer.
+# The convention remains SSOT for the ARGUMENTS and verdict semantics.
+# The ordering constraint above is now structural rather than documented: the merge
+# happens inside the same script invocation that rewrites retrieval-session.json, so it
+# can no longer be clobbered by it.
+# Verdict arrives on the STDERR of the Step 4 call (stdout stays pure JSON for parsers).
+IF a verdict was printed:
+    Report it per the convention's Step 2, then feed any DRAWN patterns into Memory
+    Deliberation below alongside the local items (mark each ACTIVE or SKIPPED).
 ELSE:
-    # No domain commons convention (fresh world, or a world that shares nothing).
+    # No domain commons hook (fresh world, or a world that shares nothing).
     # Nothing to do — Steps 3-4 already loaded every store this world has.
 
 # Memory Deliberation: assess each supplementary item
@@ -237,12 +251,16 @@ IF gate_d_status == "on":
 # ── End Step 5e ─────────────────────────────────────────────────────────────
 ```
 
-# Pre-apply consult gate (g-115-826 / g-115-2203) — pre-hoc consult-before-edit
-# forcing banner for INHERITED cross-agent framework Applies. Fires ONLY when
-# handoff_from is set AND != current agent AND a framework path is referenced;
-# own-authored goals skip silently (verified: pre-apply-consult-gate.py:182) —
-# their coverage is the post-close drift gate pre-apply-consult-drift-gate.py
-# (g-115-2201). Exits 0 unconditionally (advisory, fail-open). MUST be wired
+# Pre-apply consult gate (g-115-826 / g-115-2203; WIDENED g-115-2201) — pre-hoc
+# consult-before-edit forcing banner for framework Applies. Fires on ANY goal
+# referencing a framework path or bare framework filename, OWN-AUTHORED INCLUDED;
+# handoff_from is NOT a trigger, only an ESCALATOR that makes the banner louder on
+# an inherited spec. Silent once retrieval is recorded for the goal. The post-close
+# drift gate pre-apply-consult-drift-gate.py keys on work_class instead, so it also
+# catches framework goals that never name a file. Exits 0 unconditionally (advisory,
+# fail-open). Predicate SSOT is the pre-apply-consult-gate.py docstring — do not
+# re-state it here with a line-number citation; the previous version of this comment
+# kept the pre-widening predicate for 17 days and manufactured g-115-4358. MUST be wired
 # HERE, not only at aspirations-execute/SKILL.md:562 — this digest IS the
 # documented hot path (post-compaction re-reads load it, NOT the full SKILL.md),
 # so a gate present only in the SKILL.md never fires on the hot path

@@ -36,9 +36,21 @@ fi
 # These skills MUST always be allowed to re-invoke. This is an INTENTIONAL
 # scope decision — NOT a parse-error fail-open (cf. guard-487, which governs
 # the error-path semantics of suppression gates, not deliberate exemptions).
+#
+# `worker-loop` is the BODY-side loop orchestrator (Mind/Body split, ).
+# It is structurally identical to `aspirations` — Phase 5 re-enters via
+# `Skill(worker-loop)` every work unit — but it was created AFTER the list
+# above and was never added, so it was blocked on every re-entry. It does not
+# die the way 's loop did (the model keeps following the copy already
+# in context), which is exactly what made this invisible: the loop looks
+# healthy while the SKILL.md on disk is never re-read. Consequence measured
+# 2026-08-06 on cc-07 — a Phase -0.3 pull step committed at 03:09 had not
+# fired once by 04:14 across FOUR observed re-entries, leaving that worker 22
+# commits behind with no path to self-heal short of a restart. Any edit to
+# worker-loop/SKILL.md was unreachable by every running worker.
 orchestrator_exempt=0
 case "$skill_name" in
-    aspirations|aspirations-*) orchestrator_exempt=1 ;;
+    aspirations|aspirations-*|worker-loop) orchestrator_exempt=1 ;;
 esac
 
 # Resolve the bound agent from session_id for per-agent telemetry ().
@@ -106,8 +118,9 @@ MIND_AGENT="${AGENT_NAME:-}" python3 "$CORE_ROOT/scripts/context-reads.py" recor
 # Knowledge tree: world/knowledge/tree/system/system-constraints-loop/skill-telemetry-signal-master-plan.md
 if [ -n "${AGENT_DIR:-}" ] && [ -n "$skill_name" ]; then
     AGENT_DIR="$AGENT_DIR" AGENT_NAME="${AGENT_NAME:-}" SKILL_NAME="$skill_name" SESSION_ID="$session_id" \
+        SCRIPTS_DIR="$CORE_ROOT/scripts" \
         python3 - <<'PY' 2>/dev/null || true
-import json, datetime, os
+import sys, json, datetime, os
 agent_dir = os.environ.get('AGENT_DIR', '')
 agent_name = os.environ.get('AGENT_NAME', '')
 skill = os.environ.get('SKILL_NAME', '')
@@ -120,9 +133,49 @@ if agent_dir and skill:
         'sid': sid,
         'invocation_source': 'model',
     }
+    #  (G3 worker rail): skip this append when the bound Body is a
+    # WORKER. This is ORTHOGONAL to *how* the append is done (bare vs locked —
+    # see the note below, and do not conflate the two): the rail governs
+    # WHETHER this box should write the agent-wide ledger at all. A worker Body
+    # shares an agent dir with a reducer running on a different machine, so its
+    # appends land in a store it does not own.
+    #
+    # DO NOT rewrite this as `os.environ.get('BODY_ROLE') != 'worker'`. It would
+    # be 100% INERT and would hand-test GREEN. BODY_ROLE is exported by
+    # bash-agent-inject.py, which rewrites the command string of BASH TOOL calls
+    # ONLY — and this is a PreToolUse[Skill] hook invoked directly by Claude Code.
+    # The comment at the top of this file already states the general fact for
+    # MIND_AGENT ("which does NOT inject MIND_AGENT ... only Bash *tool* calls
+    # get it"); BODY_ROLE travels by the identical mechanism and is absent here
+    # for the identical reason. A hand-run shell HAS the var, so the only
+    # environment where such a rail fails is the only environment where it runs
+    # (guard-1680; the 59-day pre-edit-context-gate inertia, read-before-edit.md
+    # Rule 4). The design brief for G3 credits the verifier with catching this one
+    # level up at bash-agent-inject; this is the next instance of the same class.
+    #
+    # So derive the role LOCALLY from the already-resolved agent + session_id,
+    # using the SAME predicate bash-agent-inject uses: a per-session body-WM file
+    # exists ONLY for a non-reducer Body. `sessions` is inlined per this file's
+    # IRREDUCIBLY LOCAL header (sourcing _paths/_session_binding here would blow
+    # the hook latency budget) — it mirrors SESSIONS_DIRNAME and must be updated
+    # with it (CLAUDE.md Agent-dir Resolution, inlined-copies table).
+    _SDN='sessions'
+    if sid and os.path.exists(
+            os.path.join(agent_dir, _SDN, sid, 'working-memory.yaml')):
+        raise SystemExit(0)
+    # Bare O_APPEND write — see the sibling writer user-prompt-skill-record.sh
+    # for the full rationale and the measurement. Short version: -e
+    # routed this through _fileops.locked_append_jsonl, which under own-cloud is
+    # a force-fresh GET + full-file PUT on every hook fire. That is forbidden by
+    # the IRREDUCIBLY LOCAL banner at line 2, and it is not what fixed the data
+    # loss — the merge REGISTRATION did.
+    #
+    # Fail-open is the contract here (guard-141): the enclosing
+    # `2>/dev/null || true` keeps exit 0 regardless of what happens below.
     try:
-        with open(os.path.join(agent_dir, 'skill-invocations.jsonl'), 'a', encoding='utf-8') as f:
-            f.write(json.dumps(row) + chr(10))
+        with open(os.path.join(agent_dir, 'skill-invocations.jsonl'),
+                  'a', encoding='utf-8') as fh:
+            fh.write(json.dumps(row) + '\n')
     except Exception:
         pass
 PY

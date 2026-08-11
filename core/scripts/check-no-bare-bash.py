@@ -260,13 +260,24 @@ def _report(rel: str, hits: list[tuple[int, str, str]], label: str) -> None:
 
 
 def _fix_hint() -> None:
+    # NEVER print a `[BASH, str(path)]` remedy here. This hint is read at the one
+    # moment an author is looking for a shape to copy, so a remedy that satisfies
+    # guard-580 while violating guard-581 propagates the second defect under the
+    # authority of the first gate. It did: the tests: line used to read
+    # `subprocess.run([BASH, str(SCRIPT)], ...)`, and a 2026-08-01 sweep found 8
+    # live `[BASH, str(` sites across 7 files. str(WindowsPath) reaches bash with
+    # backslashes, which it treats as escape introducers and strips -- invisible
+    # on Linux, where str() and .as_posix() are identical by definition. Both
+    # lines below now pass the path through a helper that enforces .as_posix().
     print(
         "  A bare 'bash' argv[0] resolves to System32 WSL on win32 and can hang\n"
         "  forever (guard-580). Resolve it explicitly instead:\n"
-        "    production:  from _runtime_bash import BASH, bash_cmd\n"
+        "    production:  from _runtime_bash import bash_cmd\n"
         "                 subprocess.run(bash_cmd('core/scripts/x.sh', arg), ...)\n"
         "    tests:       from _bash_helpers import BASH\n"
-        "                 subprocess.run([BASH, str(SCRIPT)], ...)\n"
+        "                 subprocess.run([BASH, Path(SCRIPT).as_posix()], ...)\n"
+        "  Pass script paths via bash_cmd() or .as_posix(), never str(Path):\n"
+        "  bash silently strips the backslashes of a str(WindowsPath) (guard-581).\n"
         "  Genuinely POSIX-only? Add '# allow-bare-bash: <reason>' on the line\n"
         "  (or '# allow-bare-bash-file: <reason>' for the whole file).\n"
         "  Do not --no-verify; fix the code.",

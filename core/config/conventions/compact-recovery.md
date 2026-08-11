@@ -331,4 +331,14 @@ postcompact restore surfaces it directly into the next session's context.
 These files in `agents/<agent>/session/` MUST survive boot Phase -1.5 cleanup:
 - `execution-diary.jsonl`
 - `reasoning-snapshot.yaml`
-- `execution-diary-session-*.jsonl` (archived diaries from prior sessions)
+
+A third entry, `execution-diary-session-*.jsonl` ("archived diaries from prior
+sessions"), was removed 2026-08-06 (zeta, hostname cc-02, uname -r
+6.8.0-136-generic; g-328-46): **no code anywhere produces that filename**, so the
+whitelist was protecting a file class that cannot exist. Measured — 0 such files on
+this box against a positive control of 7 live `execution-diary.jsonl`; the diary is
+never renamed or session-scoped, and its retention is age-based trimming
+(`execution-diary.sh trim --hours 8` from `iteration-close.sh`). The authoritative
+registry for `session/` files is `core/config/session-manifest.yaml`, which lists
+`execution-diary.jsonl` and never listed the archived pattern. See the NOT
+IMPLEMENTED note in `handoff-working-memory.md` for the full measurement.

@@ -70,7 +70,26 @@ UNVALIDATABLE = {
     "efs-ssh.sh",
 }
 
-# Flags accepted by essentially every wrapper via common plumbing.
+# Flags suppressed on EVERY call site.
+#
+# THE ORIGINAL JUSTIFICATION — "accepted by essentially every wrapper via common
+# plumbing" — IS MEASURABLY FALSE. Measured 2026-08-10 (bravo, hostname cc-05,
+# uname -r 6.8.0-136-generic) over the 467 parseable wrappers actually referenced
+# by a SKILL.md `Bash:` call site, which is the only population this suppression
+# affects:
+#     --source   50/467  10.7%      --agent    62/467  13.3%
+#     --output   71/467  15.2%      --json    114/467  24.4%
+# Not one is near-universal; the best is under a quarter. So this set is not
+# describing common plumbing, it is blanket-suppressing the four most frequently
+# typed flags in the codebase, and any real mismatch on them is invisible.
+#
+# LEFT IN PLACE DELIBERATELY, pending . Removing entries here RAISES
+# the finding count, and 's sequencing rule is explicit: land the set,
+# then seed the floor ONCE, or the seed encodes a transient. The six FIXes in
+# this file landed together and the floor is seeded against them; changing the
+# suppression set is a separate surface change whose false-positive rate is
+# UNMEASURED (a wrapper that forwards "$@" to a daemon accepting --json would
+# flag as a mismatch while being perfectly correct). Measure that FP rate first.
 UNIVERSAL_FLAGS = {"--help", "-h", "--json", "--output", "--source", "--agent"}
 
 _CASE_ARM = re.compile(r"^\s*\(?\s*((?:-{1,2}[A-Za-z0-9][A-Za-z0-9_-]*\s*\|\s*)*-{1,2}[A-Za-z0-9][A-Za-z0-9_-]*)(?:=\*)?\s*\)")
@@ -80,9 +99,58 @@ _WRAPPER_REF = re.compile(r"(?:core/scripts/)?([a-z0-9][a-z0-9_-]*\.(?:sh|py))")
 # wrapper declares it accepts a flag. heartbeat-tick.sh uses only this form.
 _SH_COMPARE = re.compile(r"[=!]=?\s*[\"']?(--[A-Za-z][A-Za-z0-9-]*)")
 
+# A `case` arm that names a flag in order to REJECT it. Syntactically identical
+# to an accepting arm, so without this the parser reports a guard as a feature —
+# see sh_flag_surface's docstring for the measured inversion. `exit 0` is
+# deliberately NOT a refusal: `--help)` arms legitimately print usage and exit 0.
+_ARM_REFUSES = re.compile(r"\bexit\s+[1-9]")
+# Any sign the arm CONSUMES the flag rather than dying on it: consuming argv,
+# appending to a passthrough array, or assigning a variable.
+_ARM_ACCEPTS = re.compile(r"\bshift\b|\+=|[A-Za-z_][A-Za-z0-9_]*=")
+# Help flags are never "refused": a `--help)` arm that prints usage and exits
+# non-zero is the flag WORKING, not the flag being rejected. `platform-check.sh:70`
+# (`-h|--help) usage; exit 2 ;;`) is the shape — exit status is a style choice
+# there, not a verdict on the flag.
+_HELP_FLAGS = {"--help", "-h"}
 
-def sh_flags(path: Path) -> set[str] | None:
-    """Flags a bash wrapper accepts. None if unparseable.
+
+def _arm_body(lines: list[str], i: int, limit: int = 40) -> str | None:
+    """Text of the case arm starting at lines[i], through its `;;` terminator.
+
+    Returns None on EITHER unresolvable-extent condition — the arm's extent is
+    then UNKNOWN, and an unknown body must never be classified as a refusal:
+      1. no `;;` anywhere inside the window, and
+      2. a NEW arm header appears before this arm's own `;;`.
+    (2) is the one a wider window cannot fix, and it is why widening is not a
+    remedy on its own — see the inline comment on the check.
+
+    That guard is the whole reason this returns Optional. With a 15-line window
+    and a silent truncation, a long arm (comment block + heredoc usage text) ran
+    past its own `;;` and swept in the NEXT arm's `exit 2`, so the classifier
+    read a neighbour's exit as this arm's. Measured on `aspirations-query.sh:65`,
+    whose help arm carries a comment block explicitly stating "Help exits 0" and
+    was still reported refused. Bounded windows fail toward the neighbour, so the
+    failure has to be detected rather than absorbed.
+    """
+    body = []
+    for j in range(i, min(i + limit, len(lines))):
+        # A NEW arm header before this arm's own `;;` means THIS arm is
+        # unterminated — stop, do not absorb the neighbour. Widening the window
+        # alone does NOT fix the overrun, it only makes it rarer: the scan then
+        # finds the NEXT arm's `;;` and attributes that arm's `exit` to this
+        # flag. Measured after the 15->40 widening had already cut refusals from
+        # 27-across-10 to 9-in-1 — an unterminated `--first` followed 12 lines
+        # later by `--second) exit 1 ;;` still reported `--first` REFUSED.
+        if j > i and _CASE_ARM.match(lines[j]):
+            return None
+        body.append(lines[j])
+        if ";;" in lines[j]:
+            return "\n".join(body)
+    return None
+
+
+def sh_flag_surface(path: Path) -> tuple[set[str], set[str]] | None:
+    """(accepted, refused) flags for a bash wrapper. None if unparseable.
 
     TWO declaration forms, both real in this codebase — parsing only the first
     produces false positives:
@@ -92,28 +160,76 @@ def sh_flags(path: Path) -> set[str] | None:
     case-arm-only parser reported both of its legitimate call sites as unknown-flag
     mismatches. Comment lines are excluded so a `# ... --flag ...` note does not
     register a flag the parser never accepts.
+
+    THIRD FORM, and it points the OPPOSITE way from the two above (FIX 4,
+    g-115-3122): an arm can name a flag in order to REFUSE it, and that is
+    syntactically indistinguishable from acceptance. Measured on
+    `aspirations-add-goal.sh:113` — ONE arm listing NINE field-shaped flags
+    (`--title|--description|--priority|--status|--participants|--category|
+    --skill|--asp-id|--asp_id`) whose entire body echoes an error to stderr and
+    `exit 2`. Its L117 comment records exactly why it exists: an LLM typed
+    `--title`, it reached the daemon, and the failure was opaque. So the parser
+    read a guard built to stop LLMs typing `--title` and told the next LLM that
+    `--title` was accepted — it INVERTED the guard.
+
+    This is worse in kind than the under-reporting elsewhere in this file: an
+    under-report makes you look further, an over-report makes you confident.
+    Refused flags are RETURNED, not dropped, because "this flag is actively
+    rejected" is strictly more useful to a caller than "unknown" — and dropping
+    them silently would recreate the (none)-means-unknown collapse that
+    wrapper-surface.py's KNOWN LIMITS already warns about.
+
+    Classification is deliberately NARROW, per this file's conservative-by-
+    construction design: an arm counts as refusing only when it contains a
+    literal non-zero `exit` AND shows no sign of consuming the flag (no `shift`,
+    no `+=`, no assignment). An arm that delegates to a `usage`/`die` helper
+    without a literal exit stays classified as accepting — that is the status
+    quo, whereas a false refusal would be a NEW defect.
     """
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    found: set[str] = set()
-    for line in text.splitlines():
+    accepted: set[str] = set()
+    refused: set[str] = set()
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
         if line.strip().startswith("#"):
             continue
         m = _CASE_ARM.match(line)
         if m:
+            body = _arm_body(lines, i)
+            # body is None => arm extent unknown => treat as accepting (status quo).
+            is_refusal = bool(body) and bool(_ARM_REFUSES.search(body)) \
+                and not _ARM_ACCEPTS.search(body)
             for alt in m.group(1).split("|"):
                 alt = alt.strip()
-                if alt.startswith("-"):
-                    found.add(alt)
+                if not alt.startswith("-"):
+                    continue
+                # A help flag is never refused, however the arm exits.
+                (refused if (is_refusal and alt not in _HELP_FLAGS)
+                 else accepted).add(alt)
             continue
         # form 2 — only inside a test/conditional, so a flag being PASSED to an
         # inner command on an ordinary line is not mistaken for one being ACCEPTED.
         if re.search(r"\b(if|elif|while)\b|\[\[|\[ ", line):
             for m2 in _SH_COMPARE.finditer(line):
-                found.add(m2.group(1))
-    return found
+                accepted.add(m2.group(1))
+    # A flag both accepted somewhere and refused elsewhere is ACCEPTED — the
+    # accepting arm is reachable, so calling it a mismatch would be a false
+    # positive.
+    return accepted, (refused - accepted)
+
+
+def sh_flags(path: Path) -> set[str] | None:
+    """Flags a bash wrapper ACCEPTS (refusal arms excluded). None if unparseable.
+
+    Thin wrapper over sh_flag_surface so existing callers — including
+    wrapper-surface.py, which imports this engine by file path — keep their
+    signature. Use sh_flag_surface directly when you need the refused set.
+    """
+    surface = sh_flag_surface(path)
+    return None if surface is None else surface[0]
 
 
 def py_flags(path: Path) -> set[str] | None:
@@ -136,8 +252,36 @@ def py_flags(path: Path) -> set[str] | None:
     return found
 
 
+# FIX 1 (): the `^` alternative used to sit at the head of this
+# alternation, and it made the invocation-keyword requirement a NO-OP — `^`
+# matches every non-comment line, and the lazy `[^#\n]*?` then reaches any
+# basename anywhere on it. So a bare mention registered as a delegation, and the
+# delegate's whole flag surface was unioned into the caller's, HIDING real
+# mismatches. Worst case measured: `cross-agent-write.sh` absorbed the surfaces
+# of aspirations-claim.sh, board-post.sh, heartbeat-tick.sh,
+# team-state-in-flight.sh and team-state-clear-in-flight.sh — five wrappers it
+# names in a REFUSAL whitelist, i.e. the exact opposite of delegating to them.
+#
+# WHY THE KEYWORD SET IS WIDER THAN THE OBVIOUS FIX. Removing `^` alone is
+# wrong: measured over core/scripts/*.sh it drops 68 edges that resolve to REAL
+# files, and the dominant class is a LEGITIMATE delegation written as an
+# assignment — `SCRIPT_PATH="$PROJECT_ROOT/core/scripts/foo-gate.py"`,
+# `GATE="$SCRIPT_DIR/capability-gate.py"`, `ENGINE=".../guardrail_retire.py"` —
+# the standard shape of every hook wrapper here. (The other 419 "lost" edges are
+# `source "..._platform.sh"` lines whose captured basename has no leading
+# underscore and so names a file that does not exist; those were already no-ops
+# at the `.exists()` guard in wrapper_surface.)
+#
+# The asymmetry decides the trade. A surviving phantom edge makes a surface too
+# WIDE and hides a mismatch — an under-report, which makes a reader look
+# further. A dropped legitimate edge makes a surface too NARROW and flags a
+# correct call site — an over-report, which makes a reader confident and wrong
+# (the same argument sh_flag_surface makes about refusal arms). So this admits
+# the assignment / source / comma-in-argv-list forms rather than dropping them,
+# and accepts that some prose survives.
 _INVOKES = re.compile(
-    r"(?:^|[;&|(]|\bexec\s|\bbash\s|\bsh\s|\bpython3?\s|\bpy\s+-3\s)"
+    r"(?:[;&|(,]|\bexec\s|\bbash\s|\bsh\s|\bpython3?\s|\bpy\s+-3\s"
+    r"|\bsource\s|=\s*[\"']?)"
     r"[^#\n]*?([a-z0-9][a-z0-9_-]*\.(?:py|sh))")
 
 
@@ -198,15 +342,42 @@ def wrapper_surface(name: str, cache: dict, _seen: frozenset = frozenset()) -> s
     agent-aspirations-read.sh -> aspirations-read.sh). Union every hop, else each
     forwarded flag false-positives. `_seen` breaks cycles.
     """
+    surface, _provisional = _wrapper_surface(name, cache, _seen)
+    return surface
+
+
+def _wrapper_surface(name: str, cache: dict,
+                     _seen: frozenset) -> tuple[set[str] | None, bool]:
+    """(surface, provisional). provisional=True => truncated by a cycle; DO NOT cache.
+
+    FIX 3 (g-115-3122). The cycle guard itself is correct — a frame already on
+    the stack contributes nothing, which terminates. The defect was that the
+    CALLER then memoized its own truncated union as if complete. For a.sh <-> b.sh
+    with a SHARED cache: resolving a.sh recurses into b.sh, b.sh's recursion back
+    into a.sh correctly returns empty, so b.sh caches as sh_flags(b.sh) ALONE —
+    and a later top-level lookup of b.sh reads that truncated entry and reports
+    every flag a.sh would have contributed as unknown. False positives, which is
+    the direction this detector exists to avoid.
+
+    Was filed LATENT because `core/scripts/*.sh` has no delegation cycle today, so
+    nothing reaches it. It is nonetheless reachable the moment one appears, and
+    `main()` uses exactly one shared cache across every call site — the condition
+    the bug needs.
+
+    Note the existing `test_mutual_delegation_terminates` cannot see this: it
+    passes a FRESH cache dict per call, so it proves termination only. The
+    shared-cache pin lives in test_shared_cache_does_not_memoize_cycle_truncation.
+    """
     if name in cache:
-        return cache[name]
+        return cache[name], False
     if name in _seen:                      # cycle — contribute nothing, don't fail
-        return set()
+        return set(), True
     path = SCRIPTS_DIR / name
     if not path.exists():
         cache[name] = None
-        return None
+        return None, False
 
+    provisional = False
     if name.endswith(".py"):
         surface = py_flags(path)
     else:
@@ -215,18 +386,46 @@ def wrapper_surface(name: str, cache: dict, _seen: frozenset = frozenset()) -> s
             for tgt in delegate_targets(path):
                 if not (SCRIPTS_DIR / tgt).exists():
                     continue
-                sub = wrapper_surface(tgt, cache, _seen | {name})
+                sub, sub_provisional = _wrapper_surface(tgt, cache, _seen | {name})
+                provisional |= sub_provisional
                 if sub is None:
                     # Unparseable delegate => unknown surface, not a wrong one.
+                    # Not cycle-dependent, so this IS safe to cache.
                     cache[name] = None
-                    return None
+                    return None, False
                 surface |= sub
-    cache[name] = surface
-    return surface
+    # Cache only a COMPLETE result. A provisional one is correct for this call
+    # (the caller above it supplies the missing hop) but wrong to hand to a later
+    # top-level lookup, so it is returned and discarded.
+    if not provisional:
+        cache[name] = surface
+    return surface, provisional
 
 
-def audit_line(line: str, cache: dict):
+_SKILL_NAME_CACHE: dict[str, frozenset[str]] = {}
+
+
+def known_skill_names(skills_dir: Path | None = None) -> frozenset[str]:
+    """Directory names under the skills dir — i.e. the real `/slash-command` set.
+
+    Used to anchor the slash-command truncation in audit_line. Cached per
+    directory so the glob runs once, not once per scanned line.
+    """
+    d = skills_dir or SKILLS_DIR
+    key = str(d)
+    if key not in _SKILL_NAME_CACHE:
+        try:
+            _SKILL_NAME_CACHE[key] = frozenset(
+                p.parent.name for p in d.glob("*/SKILL.md"))
+        except OSError:
+            _SKILL_NAME_CACHE[key] = frozenset()
+    return _SKILL_NAME_CACHE[key]
+
+
+def audit_line(line: str, cache: dict, skill_names: frozenset[str] | None = None):
     """Return (finding|None, skip_reason|None) for one SKILL.md line."""
+    if skill_names is None:
+        skill_names = known_skill_names()
     refs = [m.group(1) for m in _WRAPPER_REF.finditer(line)]
     refs = [r for r in refs if (SCRIPTS_DIR / r).exists()]
     if not refs:
@@ -253,9 +452,24 @@ def audit_line(line: str, cache: dict):
     # about THIS wrapper, and two of them were true findings.
     #   1. a slash-command later on the line owns its own flags
     #      ("calls `pipeline-read.sh --unreflected` then invokes `/review-hypotheses --learn`")
-    m_skill = re.search(r"(?<![\w/])/[a-z][a-z0-9-]+", tail)
-    if m_skill:
-        tail = tail[: m_skill.start()]
+    #
+    # ANCHORED ON THE REAL SKILL SET (FIX 2, ). The prior pattern was a
+    # bare `(?<![\w/])/[a-z][a-z0-9-]+`, which matches the first segment of ANY
+    # absolute UNIX path: in `--json /opt/ayoai-mind/x --bad-flag` it matched
+    # `/opt` and truncated the tail at offset 8, so `--bad-flag` was never
+    # scanned. Every flag appearing after any absolute path on a call line went
+    # unexamined, silently and with no skip recorded.
+    #
+    # Requiring the token to name an actual skill directory is the "boundary a
+    # path cannot satisfy" the fix calls for: `/opt` is not a skill, so it no
+    # longer truncates, while a genuine `/review-hypotheses --learn` still does.
+    # An empty skill set (a --skills-dir override with no SKILL.md) truncates
+    # nothing, which is the honest reading — with no known skills, no token on
+    # the line can be shown to be a slash-command.
+    for m_skill in re.finditer(r"(?<![\w/])/([a-z][a-z0-9-]+)", tail):
+        if m_skill.group(1) in skill_names:
+            tail = tail[: m_skill.start()]
+            break
     #   2. a spaced-off parenthetical is an annotation, not argv
     #      ("wm-read.sh encoding_queue --json  (if --selective mode)")
     m_note = re.search(r"\s{2,}\(", tail)
@@ -339,8 +553,13 @@ def _ratchet(result: dict, output: str) -> int:
             "note": ("Count of SKILL.md `Bash:` call sites passing a flag the "
                      "invoked core/scripts wrapper's own parser does not accept. "
                      "Producer: skillmd-flag-audit.py --ratchet (g-115-3112). "
-                     "Seeded at 11 real + 1 known prose FP; drive to 0 via "
-                     "per-site verified fixes, then the baseline ratchets down."),
+                     "RE-SEEDED at 5 on 2026-08-10 (g-115-3122) after all six "
+                     "accuracy fixes landed together; the prior key was ABSENT "
+                     "from this file, so every run reported SEEDED and never "
+                     "REGRESSED. Do NOT drive this to 0: all 5 are a FLOOR of "
+                     "prose false positives (a flag belonging to a different "
+                     "command on the same line), enumerated in "
+                     "verify-learning/SKILL.md. Investigate any INCREASE."),
             "history": history[-50:],
         }
         captured.update(verdict=verdict, new_baseline=new_baseline,
@@ -381,6 +600,7 @@ def main() -> int:
     args = ap.parse_args()
 
     skills = Path(args.skills_dir) if args.skills_dir else SKILLS_DIR
+    skill_names = known_skill_names(skills)
     cache: dict = {}
     findings, skips = [], {}
     scanned = 0
@@ -394,9 +614,33 @@ def main() -> int:
             if "core/scripts/" not in line and ".sh" not in line and ".py" not in line:
                 continue
             scanned += 1
-            finding, skip = audit_line(line, cache)
+            finding, skip = audit_line(line, cache, skill_names)
             if skip:
                 skips[skip] = skips.get(skip, 0) + 1
+            # FIX 6 () — this scanner reads ONE line per call site, and
+            # does not follow backslash continuations. A call site whose first
+            # line ends in `\` has every subsequent flag invisible, yet was
+            # counted as fully resolved with no skip: `--show-skips` exists for
+            # "honest coverage accounting" and was reporting FULL coverage on
+            # call sites it had read a fraction of.
+            #
+            # Recorded as a skip rather than fixed by joining, deliberately. A
+            # joined line reintroduces the multi-command false positive that the
+            # slash-command and `&&`/`;` truncations above exist to fight —
+            # continuation blocks are exactly where `git merge`/`git diff`
+            # sub-commands sit beside a wrapper call, and three of the five live
+            # findings are already that class. Converting a silent blind spot
+            # into a COUNTED one is the strictly-honest move; joining is a
+            # separate change that must be measured against the FP count.
+            #
+            # This is additive to any skip above: the visible first line is still
+            # audited normally, so a real finding on it is still reported. The
+            # counter says "coverage here was partial", not "nothing was checked".
+            if line.rstrip().endswith("\\") and any(
+                    (SCRIPTS_DIR / m.group(1)).exists()
+                    for m in _WRAPPER_REF.finditer(line)):
+                skips["line-continuation-partial"] = \
+                    skips.get("line-continuation-partial", 0) + 1
             if finding:
                 finding.update({
                     "skill": md.parent.name,

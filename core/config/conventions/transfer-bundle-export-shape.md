@@ -4,8 +4,17 @@ The export/import contract for `meta/transfer/` bundles — the unit by which an
 agent ships WHAT it has learned (portable knowledge) to another agent, org, or
 environment, decoupled from the HOW (the source environment's code and infra).
 This file defines the SHAPE a bundle must take; it is NOT a producer or consumer
-spec. No producer or consumer exists yet — this is forward-compatibility
-insurance so the first one targets a stable shape and the format does not drift.
+spec.
+
+**Two producers now exist** (corrected 2026-08-02, g-115-3266 — this section read
+"No producer or consumer exists yet" for as long as both had been shipping):
+`core/scripts/knowledge-export.py` `write_okf_bundle`, and the sibling wiki
+daemon's `_okf_doc`, which consumes the same pre-projected
+`.knowledge-bundle.json` this repo's export writes. The forward-compatibility bet
+paid off — the first divergence between them was a disagreement on the `type`
+discriminator's spelling, caught by hand. `core/scripts/okf-bundle-conformance.py`
+is the shared, producer-agnostic checker that now covers the invariants below;
+point it at any bundle directory.
 
 ## Why a documented shape now
 
@@ -64,6 +73,50 @@ field names; a consumer must not break when it sees names it does not recognize.
 7. **Optional progressive-disclosure index.** A bundle MAY include a
    per-directory index listing what is available before a reader opens each
    document. Its absence is not an error.
+
+## Producer-side field selection (decided 2026-08-02, g-115-3266)
+
+**A producer MAY restrict which fields it emits. Invariant 4 does not oblige it
+to pass everything through.** Invariant 4 binds CONSUMERS — it says a consumer
+must not DROP a key it does not recognise. It says nothing about what a producer
+must PUT there, and reading it as a producer obligation inverts the contract:
+"the internal store's stronger guarantees are NOT relaxed to match the lean
+bundle shape" (Caveats) applies in this direction too. The bundle is a
+PROJECTION, and choosing what to project is the producer's job.
+
+The question was raised because the two producers appeared to disagree — one
+enumerates a fixed field set, the other passes unmodelled record fields through
+to frontmatter. Measured, the disagreement is smaller and differently shaped than
+it looks: both consume the SAME pre-projected records, so there are almost no
+unmodelled fields left for either to pass through. For guardrails the two
+producers emit byte-identical frontmatter.
+
+Two findings from that measurement are worth carrying, because both cut against
+the intuitive reading:
+
+- **Where fields are actually lost, widening the producer is the wrong fix.**
+  In this repo the loss happens in `knowledge_projection.project()`, one layer
+  before the writer, which rebuilds every record as a fresh dict with an explicit
+  allowlist. That allowlist is a REDACTION AND SUPPRESSION BOUNDARY for a
+  user-facing artifact — it is what keeps framework-internal front-matter fields,
+  internal counters, and goal ids out of a bundle that ships outside the system.
+  A "fidelity" change made there trades a security control for metadata richness.
+  Widen the WRITER if a field it is already given goes unrendered; do not widen
+  the PROJECTION to make more fields available to it.
+
+- **Passthrough is not automatically the safer default.** An emitter that routes
+  every unrecognised field into frontmatter will, on a field name it does not
+  know, put the concept's entire prose into a YAML scalar and emit an empty
+  document body — measured on a real lesson record, where the projection emits
+  `lesson` and the consumer's body-field map expected `content`/`text`/`summary`.
+  The document still conforms to every invariant here; it is simply unreadable as
+  a document. `okf-bundle-conformance.py` grew its `prose_in_fm` check for exactly
+  this shape.
+
+What a shared conformance check may therefore assert is the SHAPE contract
+(invariants 1-7) and nothing more. Field-set parity between producers must NOT be
+asserted — see "Not a field-by-field schema" below; a checker that demanded it
+would enforce the opposite of this convention.
 
 ## What a bundle is NOT
 

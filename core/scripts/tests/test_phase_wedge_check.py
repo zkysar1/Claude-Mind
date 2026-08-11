@@ -30,7 +30,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -168,6 +168,232 @@ def test_threshold_boundary_strict_greater(tmp_path):
     assert WEDGE.check_wedge(at, BASE_NOW, 45.0)["verdict"] == "clean"
     over = _write_diary(tmp_path / "over.jsonl", [_entry("phase_start", "p", 46, "g-1")])
     assert WEDGE.check_wedge(over, BASE_NOW, 45.0)["verdict"] == "wedged"
+
+
+# ---  liveness veto: a churning diary is not a frozen one ----------
+#
+# Measured 2026-08-07 on zeta/cc-02: recovery-gate Path D flipped a HEALTHY loop
+# to IDLE 70 minutes into a deep goal. The phase-open marker was real and 70m
+# old, but the loop was writing ordinary progress entries the whole time --
+# invisible here because _load_markers filters to phase_start/phase_end. The
+# detector's own scope note says it targets the FROZEN-diary wedge; an ordinary
+# write inside the window falsifies "frozen" directly.
+#
+# The pair below is the differential (guard-1268): identical marker, one with a
+# later ordinary write and one without. If a future edit breaks the veto the
+# first fails; if an edit over-broadens it into "never wedge", the second fails.
+# Neither test alone can catch both directions.
+
+def test_liveness_veto_recent_ordinary_write(tmp_path):
+    """THE 2026-08-07 shape: 70m open marker + a 20m ordinary write -> NOT wedged."""
+    diary = _write_diary(tmp_path / "live.jsonl", [
+        _entry("phase_start", "phase-4-execute", 70, "g-115-5227"),
+        _entry("finding", "", 20, "g-115-5227"),
+    ])
+    r = WEDGE.check_wedge(diary, BASE_NOW, 65.0)
+    assert r["verdict"] == "clean", r
+    assert r["liveness_veto"] == "recent_diary_write"
+    assert r["minutes_since_last_write"] == pytest.approx(20.0, abs=0.1)
+    # The age that WOULD have fired is still reported, so an operator reading the
+    # verdict can see how close it came instead of a bare "clean".
+    assert r["age_minutes"] == pytest.approx(70.0, abs=0.1)
+    assert r["stuck_phase"] == "phase-4-execute"
+
+
+def test_frozen_diary_still_wedged_without_veto(tmp_path):
+    """Differential twin: same 70m marker, NO later write -> still wedged.
+
+    This is the 2026-07-04 incident shape the detector exists for (writes blocked
+    behind a wedged lock, so the phase_start IS the newest line). The veto must
+    not reach it -- if this ever goes clean, the liveness fix has disabled the
+    original detection rather than narrowed it.
+    """
+    diary = _write_diary(tmp_path / "frozen.jsonl", [
+        _entry("phase_start", "phase-0-precheck", 70, "g-115-5227"),
+    ])
+    r = WEDGE.check_wedge(diary, BASE_NOW, 65.0)
+    assert r["verdict"] == "wedged", r
+    assert "liveness_veto" not in r
+
+
+def test_liveness_veto_boundary_inclusive(tmp_path):
+    """Write exactly AT the threshold vetoes; one minute past does not.
+
+    Deliberately inclusive (<=) where the age check is strict (>). Both mean the
+    same thing at the boundary -- exactly-at-threshold does not recover -- so the
+    two comparisons stay consistent rather than opening a one-minute seam.
+    """
+    at = _write_diary(tmp_path / "at.jsonl", [
+        _entry("phase_start", "phase-4-execute", 100, "g-1"),
+        _entry("observation", "", 65, "g-1"),
+    ])
+    assert WEDGE.check_wedge(at, BASE_NOW, 65.0)["verdict"] == "clean"
+    over = _write_diary(tmp_path / "over.jsonl", [
+        _entry("phase_start", "phase-4-execute", 100, "g-1"),
+        _entry("observation", "", 66, "g-1"),
+    ])
+    assert WEDGE.check_wedge(over, BASE_NOW, 65.0)["verdict"] == "wedged"
+
+
+def test_liveness_veto_unreadable_suppresses(tmp_path, monkeypatch):
+    """An activity read that raises suppresses recovery, never enables it.
+
+    guard-487 (suppression inputs fail CLOSED) and this script's documented
+    fail-open-to-no-recovery contract point the same way here, so an unreadable
+    liveness signal must land on clean -- not on wedged-by-default.
+    """
+    diary = _write_diary(tmp_path / "boom.jsonl", [
+        _entry("phase_start", "phase-4-execute", 70, "g-1"),
+    ])
+
+    def _boom(_path, _now):
+        raise OSError("simulated unreadable diary")
+
+    monkeypatch.setattr(WEDGE, "last_diary_activity", _boom)
+    r = WEDGE.check_wedge(diary, BASE_NOW, 65.0)
+    assert r["verdict"] == "clean", r
+    assert r["liveness_veto"] == "unreadable"
+
+
+def test_last_diary_activity_spans_all_entry_types(tmp_path):
+    """The activity read must NOT reuse _load_markers' phase-only filter.
+
+    That filter is the entire reason ordinary writes were invisible to this
+    detector, so the newest ORDINARY entry has to win over an older phase marker.
+    """
+    diary = _write_diary(tmp_path / "mix.jsonl", [
+        _entry("phase_start", "phase-4-execute", 70, "g-1"),
+        _entry("decision", "", 30, "g-1"),
+        _entry("finding", "", 12, "g-1"),
+    ])
+    newest = WEDGE.last_diary_activity(diary, BASE_NOW)
+    assert newest == BASE_NOW - timedelta(minutes=12)
+
+
+def test_last_diary_activity_none_when_absent_or_untimestamped(tmp_path):
+    """Missing file -> None. Timestamp-less / malformed rows are skipped, not fatal."""
+    assert WEDGE.last_diary_activity(tmp_path / "nope.jsonl", BASE_NOW) is None
+    path = tmp_path / "junk.jsonl"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write('{"entry_type": "note", "content": "no timestamp"}\n')
+        f.write("not even json\n")
+    assert WEDGE.last_diary_activity(path, BASE_NOW) is None
+
+
+def test_future_dated_row_does_not_veto(tmp_path):
+    """A future-dated row is NOT liveness evidence and must not suppress the wedge.
+
+    Found by fresh-eyes review of this same change. The veto originally tested
+    only the upper bound, so a row dated a day ahead gave since_min = -1440,
+    which trivially satisfies `<= threshold` -- one skewed row silently disabled
+    Path D forever. The diary is sync_tier: continuity (cross-box), so a peer with
+    a bad clock can write one into a diary whose clock it does not own.
+
+    The control below is the load-bearing half: the same diary WITHOUT the stray
+    row must still be wedged, or this test would pass on a detector that had
+    simply stopped working.
+    """
+    rows = [_entry("phase_start", "phase-0-precheck", 200, "g-1")]
+    control = _write_diary(tmp_path / "control.jsonl", rows)
+    assert WEDGE.check_wedge(control, BASE_NOW, 65.0)["verdict"] == "wedged"
+
+    skewed = _write_diary(tmp_path / "skewed.jsonl", [
+        _entry("observation", "", -1440, "g-1"),   # 1 day in the FUTURE
+        rows[0],
+    ])
+    r = WEDGE.check_wedge(skewed, BASE_NOW, 65.0)
+    assert r["verdict"] == "wedged", r
+    assert "liveness_veto" not in r
+    # And the future row must not become the activity timestamp either.
+    assert WEDGE.last_diary_activity(skewed, BASE_NOW) == BASE_NOW - timedelta(minutes=200)
+
+
+def test_future_row_alongside_genuine_recent_write_still_vetoes(tmp_path):
+    """The filter drops only the future row -- a real recent write still vetoes.
+
+    Guards the over-correction: dropping future entries must not drop the
+    credible ones next to them.
+    """
+    diary = _write_diary(tmp_path / "mixed.jsonl", [
+        _entry("phase_start", "phase-4-execute", 200, "g-1"),
+        _entry("observation", "", -600, "g-1"),   # future, ignored
+        _entry("finding", "", 10, "g-1"),         # genuine, recent
+    ])
+    r = WEDGE.check_wedge(diary, BASE_NOW, 65.0)
+    assert r["verdict"] == "clean", r
+    assert r["liveness_veto"] == "recent_diary_write"
+    assert r["minutes_since_last_write"] == pytest.approx(10.0, abs=0.1)
+
+
+def test_tz_aware_row_does_not_suppress_the_wedge(tmp_path):
+    """A tz-AWARE ordinary row must not raise, and must not veto a real wedge.
+
+    Second-pass fresh-eyes finding on the same fix as the future-dated row: that
+    one guarded the VALUE, this one the TYPE. `_pcr._parse_ts` returns whatever
+    `fromisoformat` gives, so an offset-bearing stamp came back AWARE and
+    `ts > now` raised TypeError -- which check_wedge catches as
+    `liveness_veto: unreadable` -> clean. One such row therefore disabled Path D
+    permanently. Before this veto existed an aware ordinary row was never read at
+    all, so the veto INTRODUCED the regression. Fixed by parsing through
+    `_dt.parse_naive_iso` (guard-1398 SSOT), which strips tzinfo and never raises.
+
+    The control is load-bearing: without it this passes on a detector that has
+    simply stopped vetoing anything.
+    """
+    old_marker = _entry("phase_start", "phase-0-precheck", 200, "g-1")
+    control = _write_diary(tmp_path / "ctl.jsonl", [old_marker])
+    assert WEDGE.check_wedge(control, BASE_NOW, 65.0)["verdict"] == "wedged"
+
+    aware_old = {
+        "entry_type": "finding",
+        "timestamp": (BASE_NOW - timedelta(minutes=300)).replace(
+            tzinfo=timezone.utc).isoformat(),
+        "content": "aware, and older than the threshold",
+    }
+    diary = _write_diary(tmp_path / "aware.jsonl", [aware_old, old_marker])
+    r = WEDGE.check_wedge(diary, BASE_NOW, 65.0)
+    assert r["verdict"] == "wedged", r
+    assert "liveness_veto" not in r
+    # The aware row is READ (not dropped) -- it is simply too old to veto.
+    assert WEDGE.last_diary_activity(diary, BASE_NOW) == BASE_NOW - timedelta(minutes=200)
+
+
+def test_tz_aware_recent_row_vetoes_like_a_naive_one(tmp_path):
+    """The tzinfo strip must PRESERVE the instant, not merely stop the raise.
+
+    Guards the over-correction twin: dropping aware rows entirely would also
+    'fix' the TypeError while silently discarding genuine liveness evidence.
+    """
+    diary = _write_diary(tmp_path / "aware_recent.jsonl", [
+        _entry("phase_start", "phase-4-execute", 200, "g-1"),
+        {
+            "entry_type": "observation",
+            "timestamp": (BASE_NOW - timedelta(minutes=15)).replace(
+                tzinfo=timezone.utc).isoformat(),
+            "content": "aware and recent",
+        },
+    ])
+    r = WEDGE.check_wedge(diary, BASE_NOW, 65.0)
+    assert r["verdict"] == "clean", r
+    assert r["liveness_veto"] == "recent_diary_write"
+    assert r["minutes_since_last_write"] == pytest.approx(15.0, abs=0.1)
+
+
+def test_last_diary_activity_skips_non_dict_rows(tmp_path):
+    """A bare JSON scalar/array row must be skipped, not raise AttributeError.
+
+    Unit-scoped ON PURPOSE. check_wedge still raises on such a row via
+    `_load_markers`' bare `e.get("entry_type")`, which runs BEFORE this function
+    (guard-3001 -- a guard cannot protect what executes ahead of it). That defect
+    is pre-existing and lives in a SHARED loader, so it is filed separately; this
+    pins only that THIS function no longer contributes to it.
+    """
+    path = tmp_path / "nondict.jsonl"
+    with open(path, "w", encoding="utf-8") as f:
+        for bad in ("[1,2,3]", '"hello"', "null", "42"):
+            f.write(bad + "\n")
+        f.write(json.dumps(_entry("finding", "", 30, "g-1")) + "\n")
+    assert WEDGE.last_diary_activity(path, BASE_NOW) == BASE_NOW - timedelta(minutes=30)
 
 
 # --- Empty / missing / malformed --------------------------------------------

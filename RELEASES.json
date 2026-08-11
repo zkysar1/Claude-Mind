@@ -1,5 +1,27 @@
 [
   {
+    "version": "2.9.1",
+    "previous_version": "2.9.0",
+    "date": "2026-08-11",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Heal forged-skill registry/file drift blocking seed-preflight: restore alpha's orphan-chain forge set (classify-alert-burst, compare-batch-vs-corpus-rate + batch_corpus_rate engine/tests), reconstructed stubs for 2 unpushed alpha skills, tag measure-predicate-fp, remove core/agents cruft",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.9.0",
+    "previous_version": "2.8.10",
+    "date": "2026-08-10",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Fleet-cycle sync since v2.8.10 (~3400 commits, 10 days): /sprint-planning base hybrid skill + Operating Rhythm world seed (asp-002/g-002-01), reconcile-UP of omni's prod-ahead set (g-001-273 escalation de-hardcode, g-001-339 gate_error forwarding, g-001-368 test portability), anti-starvation selector boost (g-115-5426), worker-body zombie-churn fix (g-306-275), pull-promotion architecture filed (asp-360)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.8.10",
     "previous_version": "2.8.9",
     "date": "2026-08-01",

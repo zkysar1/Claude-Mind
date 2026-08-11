@@ -71,7 +71,20 @@ _SESSION_RE = re.compile(r"^\s*session:\s*(\S+)\s*$", re.MULTILINE)
 
 
 def _front_matter(path):
-    """Return the YAML front-matter block text, or '' when absent."""
+    """Return the YAML front-matter block text, '' when the node is READABLE
+    but carries no front matter, or None when the node could not be READ.
+
+    The '' / None split is load-bearing (g-115-3250). Both used to return '',
+    which collapsed two opposite conditions onto one permissive branch in
+    attributable_to_session: a node that genuinely has no session stamp (the
+    deliberate legacy fail-open) and a node we never managed to open at all.
+    The second must never count as an encoding — the gate would be reporting
+    an encoding for an entry it never read.
+
+    The realistic trigger is NOT the contrived unreadable path but the sync
+    race: a node removed between the stat that enumerated it and the open
+    here, which is exactly the churn window this scan runs in.
+    """
     try:
         with path.open(encoding="utf-8", errors="replace") as fh:
             if fh.readline().strip() != "---":
@@ -84,14 +97,27 @@ def _front_matter(path):
                 if len(lines) >= _FRONT_MATTER_MAX_LINES:
                     break
             return "".join(lines)
-    except OSError:
-        return ""
+    except OSError as e:
+        # Diagnose rather than swallow: silence here is what let an unread
+        # node be reported as a detected encoding.
+        print(f"tree-edit-since: unreadable node {path}: {e}", file=sys.stderr)
+        return None
 
 
 def attributable_to_session(path, sid):
     """True when this node is THIS session's encoding, or carries no
-    attribution at all (fail-open for legacy nodes with no session stamp)."""
-    match = _SESSION_RE.search(_front_matter(path))
+    attribution at all (fail-open for legacy nodes with no session stamp).
+
+    False when the node could not be read — an unread node is not evidence
+    of anything, and must not be credited as this session's encoding.
+    """
+    fm = _front_matter(path)
+    if fm is None:
+        # Unreadable. NOT the legacy no-stamp fail-open below: we have no
+        # evidence either way, so do not credit it. (Also guards the regex —
+        # _SESSION_RE.search(None) raises TypeError.)
+        return False
+    match = _SESSION_RE.search(fm)
     if not match:
         return True
     return match.group(1).strip().strip("\"'") == sid
@@ -130,7 +156,12 @@ def main():
         try:
             if md.stat().st_mtime <= cutoff:
                 continue
-        except OSError:
+        except OSError as e:
+            # Skipping is already the safe direction here (an un-stat-able node
+            # is never credited), but diagnose it anyway — : silence
+            # in BOTH OSError handlers is what made the sync-race window
+            # invisible. Same churn window as _front_matter's.
+            print(f"tree-edit-since: unstattable node {md}: {e}", file=sys.stderr)
             continue
         if sid and not attributable_to_session(md, sid):
             skipped += 1

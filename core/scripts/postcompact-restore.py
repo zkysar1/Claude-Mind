@@ -18,13 +18,19 @@ if hasattr(sys.stderr, "reconfigure"):
 
 import yaml
 
-from _paths import AGENT_DIR, assert_agent_dir
+from _paths import AGENT_DIR, WORLD_DIR, assert_agent_dir, body_state_path
 
 # : fail loud at import time if MIND_AGENT unset; replaces the
 # opaque `None / "session"` TypeError class the next line would otherwise raise.
 assert_agent_dir("postcompact-restore")
 
-CHECKPOINT_PATH = AGENT_DIR / "session" / "compact-checkpoint.yaml"
+# Body-keyed for symmetry with the writers (). This is a NO-OP today:
+# postcompact-restore.sh carries a runner-identity guard (SID must equal
+# running-session-id), so this process only ever runs as the reducer, which is
+# never bodied and always takes the agent-wide fallback. Routed through the same
+# resolver anyway so the reader cannot silently diverge from the writers if that
+# guard is ever relaxed.
+CHECKPOINT_PATH = body_state_path(AGENT_DIR.name, "compact-checkpoint.yaml")
 DIARY_PATH = AGENT_DIR / "session" / "execution-diary.jsonl"
 SNAPSHOT_PATH = AGENT_DIR / "session" / "reasoning-snapshot.yaml"
 # iteration-checkpoint.json is the skill-level breadcrumb written by
@@ -33,7 +39,7 @@ SNAPSHOT_PATH = AGENT_DIR / "session" / "reasoning-snapshot.yaml"
 # Surfaced prominently so the model resumes the correct goal instead of
 # reconstructing a different one from the compact summary (bug traced
 # 2026-04-22 alpha session-56).
-ITERATION_CKPT_PATH = AGENT_DIR / "session" / "iteration-checkpoint.json"
+ITERATION_CKPT_PATH = body_state_path(AGENT_DIR.name, "iteration-checkpoint.json")
 
 # Slots to skip in the "additional slots" section (already shown in dedicated sections)
 #  / zeta allowlist audit 8d: DEDICATED_SECTION_SLOTS + SCALAR_SLOTS_FULL
@@ -127,6 +133,92 @@ def _read_iteration_checkpoint():
         return None
 
 
+# Statuses that make an anchored goal impossible to "resume". SSOT is
+# coordination_merge._TERMINAL_STATUSES; mirrored here rather than imported
+# because this module runs inside a SessionStart hook, where an import failure
+# would take out the ENTIRE context restore, not just this check. Pinned equal
+# by test_postcompact_restore_terminal_anchor.py.
+_TERMINAL_STATUSES = ("completed", "skipped", "expired")
+
+
+def _goal_live_status(goal_id, source):
+    """Resolve an anchored goal's LIVE status. Returns a dict; NEVER raises.
+
+    Keys: `status` (str|None), `checked` (bool), `ambiguous` (bool), `note`.
+
+    `checked` is the load-bearing field, and it is why this returns a dict
+    rather than a bare status string. "I read the queue and the goal is live"
+    and "I could not read the queue at all" are both a falsy status, and they
+    license opposite wordings — the first says resume, the second must admit
+    it does not know. Reporting an unreadable queue as a passed check is the
+    guard-1760 class (a completeness tool must never report what it declined
+    to look at as coverage), so the caller degrades to the original imperative
+    ONLY on checked=False and says so.
+
+    `ambiguous` exists because a goal id is NOT unique across queues, which is
+    exactly the condition behind this function (g-115-5029). Measured
+    2026-08-05: `g-001-01` names "Identify learning domain" in the WORLD queue
+    (skipped 2026-07-22, under the RETIRED asp-001 "Explore and Learn") AND
+    "Reflect and journal" in EVERY agent queue (pending, under the active
+    asp-001 "Maintain Agent Health"). The claim-side anchor in
+    aspirations-claim.sh hardcodes source="world" (correctly — claims only ever
+    resolve against the world queue), so a checkpoint's `source` cannot be used
+    to prove which goal was meant when the id lives in both. When it does, say
+    so instead of silently picking one: a reader told "terminal" about the
+    wrong copy is worse off than one told the id is ambiguous.
+
+    Reads the JSONL directly rather than via a wrapper: hooks run outside
+    bash-agent-inject's PATH shim and outside the daemon's env (guard-1097),
+    so shelling out is the fragile path here, not the robust one.
+    """
+    result = {"status": None, "checked": False, "ambiguous": False, "note": ""}
+    if not goal_id or goal_id == "?":
+        result["note"] = "no goal_id on the checkpoint"
+        return result
+
+    def _status_in(path):
+        """(found, status) for goal_id in one aspirations.jsonl. None on error."""
+        try:
+            if path is None or not path.exists():
+                return None
+            for line in path.read_text(encoding="utf-8",
+                                       errors="replace").splitlines():
+                line = line.strip()
+                if not line.startswith("{"):
+                    continue
+                try:
+                    asp = json.loads(line)
+                except Exception:
+                    continue
+                for goal in (asp.get("goals") or []):
+                    if goal.get("id") == goal_id:
+                        return (goal.get("status") or "").strip().lower()
+            return ""          # queue read cleanly, id absent
+        except Exception:
+            return None        # unreadable — distinct from absent
+
+    world_path = (WORLD_DIR / "aspirations.jsonl") if WORLD_DIR else None
+    agent_path = AGENT_DIR / "aspirations.jsonl"
+    world_status = _status_in(world_path)
+    agent_status = _status_in(agent_path)
+
+    source = (source or "world").strip().lower()
+    primary = world_status if source == "world" else agent_status
+    if primary is None:
+        result["note"] = f"{source} queue unreadable — status not checked"
+        return result
+
+    result["checked"] = True
+    result["status"] = primary or None
+    if world_status and agent_status:
+        result["ambiguous"] = True
+        result["note"] = (f"id exists in BOTH queues "
+                          f"(world={world_status}, agent={agent_status})")
+    elif not primary:
+        result["note"] = f"id not found in the {source} queue"
+    return result
+
+
 def _format_iteration_ckpt_block(iter_ckpt):
     """Format the in-flight goal block for the restore output."""
     goal_id = iter_ckpt.get("goal_id", "?")
@@ -148,14 +240,61 @@ def _format_iteration_ckpt_block(iter_ckpt):
         out.append(f"skill:         {skill}")
     if cross_owner:
         out.append(f"cross_agent_owner: {cross_owner}")
-    out.extend([
-        "",
-        f"CRITICAL: Your in-flight goal is {goal_id} at phase '{phase}'.",
-        "Resume execution on THIS goal. Do NOT re-run goal-selector.sh to",
-        "pick a different one. Do NOT substitute a different goal based on",
-        "narrative context from the compact summary. If this checkpoint",
-        "looks wrong, /aspirations precheck + select will surface the mismatch.",
-    ])
+    # Cross-check the anchor against the goal's LIVE status before emitting an
+    # imperative about it (). The block is still printed in FULL on
+    # every branch — this SURFACES a stale anchor, it never swallows one. A
+    # read-side check that quietly dropped the block would leave the writer
+    # free to keep producing stale anchors with nothing left to notice them.
+    live = _goal_live_status(goal_id, iter_ckpt.get("source"))
+    is_terminal = live["checked"] and live["status"] in _TERMINAL_STATUSES
+
+    if is_terminal:
+        # The one branch that must NOT tell the model to resume. An in-flight
+        # assertion about a closed goal is self-falsifying, and the previous
+        # wording forbade the two actions that would have caught it (re-running
+        # the selector, and reasoning from context) — so obeying it was the
+        # only path left open. guard-2666 is the behavioral rule; this is it
+        # enforced at the layer that already has the goal id in hand.
+        out.extend([
+            "",
+            f"STALE ANCHOR — DO NOT RESUME. This checkpoint names {goal_id}, "
+            f"whose live status is '{live['status']}'.",
+            "A terminal goal cannot be in flight, so this anchor is left over: "
+            "no defer, skip, or release path clears iteration-checkpoint.json "
+            "(guard-2666), and loop-state-save performs no status validation at "
+            "write time.",
+            "ACTION: ignore the goal named above, and re-run "
+            "/aspirations precheck + select to pick fresh work. Do NOT execute "
+            f"{goal_id} and do NOT write an outcome_note onto that record.",
+        ])
+    else:
+        out.extend([
+            "",
+            f"CRITICAL: Your in-flight goal is {goal_id} at phase '{phase}'.",
+            "Resume execution on THIS goal. Do NOT re-run goal-selector.sh to",
+            "pick a different one. Do NOT substitute a different goal based on",
+            "narrative context from the compact summary. If this checkpoint",
+            "looks wrong, /aspirations precheck + select will surface the mismatch.",
+        ])
+        if not live["checked"]:
+            # Say that the check did not run rather than letting the imperative
+            # above imply it passed (guard-1760 — never report what you declined
+            # to look at as coverage).
+            out.append(
+                f"NOTE: the live-status cross-check did NOT run ({live['note']}), "
+                f"so the anchor above is UNVERIFIED — apply guard-2666 by hand "
+                f"and read {goal_id}'s record before resuming."
+            )
+
+    if live["ambiguous"]:
+        # Emitted on BOTH branches: an ambiguous id makes the terminal verdict
+        # and the resume imperative equally unsafe to act on unexamined.
+        out.append(
+            f"AMBIGUOUS ID: {live['note']}. A goal id is not unique across "
+            f"queues, and the claim-side anchor hardcodes source=world, so the "
+            f"checkpoint cannot say which copy was meant. Read BOTH records "
+            f"before acting."
+        )
     if cross_owner:
         out.append(
             f"CROSS-AGENT: Goal pulled from sibling '{cross_owner}'. Phase 4 must "

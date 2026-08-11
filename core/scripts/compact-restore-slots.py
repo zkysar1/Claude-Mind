@@ -24,7 +24,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 import yaml
 
-from _paths import AGENT_DIR, assert_agent_dir
+from _paths import AGENT_DIR, assert_agent_dir, body_state_path
 # F8 (): import the wm_path() RESOLVER (aliased) rather than binding
 # the WM_PATH module attribute once at import. wm.py exposes WM_PATH via PEP 562
 # __getattr__ (body-WM-aware), but `from wm import WM_PATH` freezes the resolved
@@ -37,7 +37,12 @@ from wm import wm_path as _resolve_wm_path, read_wm, write_wm
 # opaque `None / "session"` TypeError class the next line would otherwise raise.
 assert_agent_dir("compact-restore-slots")
 
-CHECKPOINT_PATH = AGENT_DIR / "session" / "compact-checkpoint.yaml"
+# Body-keyed, agent-wide when unbodied () — the read+delete counterpart
+# to precompact-checkpoint.py's write. Bound to a constant rather than resolved
+# per-call for the same reason F8 above calls behavior-preserving: short-lived
+# CLI, env fixed at launch. Keeping it a constant also preserves the three tests
+# that redirect this module attribute directly (guard-1415).
+CHECKPOINT_PATH = body_state_path(AGENT_DIR.name, "compact-checkpoint.yaml")
 
 
 def _is_checkpoint_stale(checkpoint_path, wm_path):

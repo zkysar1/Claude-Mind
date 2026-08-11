@@ -13,7 +13,14 @@ DO NOT add module-level side effects here — that would defeat the
 or PROJECT_ROOT discovery, add them at the call site, not here.
 """
 from __future__ import annotations
+import os
+import re
 from pathlib import Path, PureWindowsPath
+
+# MSYS/Git-Bash drive form: a SINGLE-letter first segment (`/c`, `/c/rest`).
+# A multi-character first segment (`/home/...`, `/cygdrive/c/...`) is not this
+# shape and is deliberately left alone.
+_MSYS_DRIVE_RE = re.compile(r"^/([A-Za-z])(?:/(.*))?$")
 
 
 def absolutize(value: str, project_root: Path) -> Path:
@@ -54,6 +61,50 @@ def absolutize(value: str, project_root: Path) -> Path:
     if not p.is_absolute():
         p = (project_root / value).resolve()
     return p
+
+
+def normalize_msys_path(value: str, *, is_windows=None, exists=None) -> str:
+    """On a Windows host, translate an MSYS/Git-Bash `/c/...` path to `C:/...`.
+
+    The exact mirror of the bug `absolutize` defends against. There, the host
+    is POSIX and the VALUE is Windows-flavored. Here the host is Windows and
+    the VALUE is MSYS-flavored — and it fails SILENTLY, because Windows Python
+    reads a leading `/` as absolute-on-the-current-drive: `Path("/c/W/x.jsonl")`
+    resolves to `C:\\c\\W\\x.jsonl`, so `.is_file()` returns False for a file
+    that plainly exists and every existence-gated caller takes its not-found
+    branch. `_platform.sh` already cygpath-converts the path ENV VARS, which is
+    why this looks fixed — but a caller interpolates `$WORLD_DIR` into ARGV
+    *before* the callee runs, and `MSYS_NO_PATHCONV=1` (exported by that same
+    file) specifically stops MSYS from rewriting argv. So no amount of env
+    conversion can reach an argv-delivered path: a callee that accepts a path
+    ARGUMENT must normalize it itself. (g-115-4175, measured on ZDS-Mind prod.)
+
+    The conversion is applied ONLY when the converted form actually exists, so
+    a legitimate Windows `/c/...` path (which genuinely means `C:\\c\\...`) is
+    never clobbered. On non-Windows hosts the value is returned untouched —
+    `/c/foo` is an ordinary absolute path on POSIX and rewriting it there would
+    turn this defense into a new bug.
+
+    `is_windows` / `exists` are injection seams for TESTS ONLY, and they are
+    load-bearing rather than decorative: the branch that matters executes only
+    on Windows, while dev and staging are POSIX. Without them this function
+    would be verifiable only on the one platform where nobody would notice it
+    breaking — which is precisely the asymmetry that produced the bug
+    (`.claude/rules/run-full-suite-after-deep-code.md`: treat platform as part
+    of the production shape).
+    """
+    if is_windows is None:
+        is_windows = os.name == "nt"
+    if not is_windows:
+        return value
+    m = _MSYS_DRIVE_RE.match(value)
+    if not m:
+        return value
+    converted = "{}:/{}".format(m.group(1).upper(), m.group(2) or "")
+    if exists is None:
+        def exists(p):
+            return Path(p).exists()
+    return converted if exists(converted) else value
 
 
 def looks_like_cruft(p: Path) -> bool:

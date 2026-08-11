@@ -681,6 +681,73 @@ def _bootstrap_env_defaults(root: Optional[Path] = None) -> None:
         pass
 
 
+_SWALLOWED_BACKEND_ERRORS: set = set()
+
+
+def note_swallowed_backend_error(op: str, path, exc: BaseException) -> None:
+    """Announce a backend failure that a fail-open call site is about to swallow.
+
+    THE SWALLOW IS CORRECT AND STAYS. Ten sites across ``core/scripts`` and
+    ``mind_api/src`` wrap ``ensure_local``/``refresh`` in a bare
+    ``except Exception: pass`` because the call is a best-effort materialize
+    ahead of an ``exists()`` / ``is_file()`` / read gate — and every one of those
+    gates guards a WRITE. Crashing there is worse than answering conservatively,
+    so none of them may be converted to a raise.
+
+    What was wrong is that the failure was RECORDED NOWHERE. Each of those
+    idioms exists to fix one specific own-cloud bug: an S3-only ``world/config``
+    overlay read as absent (the g-115-1279 config-404 class), a synced
+    team-state re-created and clobbered on a fresh box, a tree-node body read as
+    empty so the concept index builds degraded. When the backend is broken the
+    ``except`` fires, the site degrades to exactly the local-only answer the
+    idiom was written to prevent, and the restored bug is byte-indistinguishable
+    from healthy operation. The fix that silenced the symptom is then the thing
+    hiding its return.
+
+    CALL-SITE SHAPE — the reporting call is itself wrapped::
+
+        except Exception as e:
+            try:  # report, never raise
+                from storage_backend import note_swallowed_backend_error
+                note_swallowed_backend_error("ensure_local", p, e)
+            except Exception:
+                pass
+
+    The inner ``try`` is load-bearing, not ceremony. Every one of those sites
+    imports ``get_backend`` INSIDE the guarded block, so on the benign "bare
+    subprocess without daemon env" path the IMPORT is what failed and this
+    helper is unbound too — an unguarded call would raise ``NameError`` and turn
+    a fail-open site fail-closed, a strictly worse defect than the silence.
+    It also keeps that benign path silent, which is correct: there is no backend
+    to have failed.
+
+    Deduplicated on ``(op, exception class)`` for the life of the process.
+    ``tree_match.parse_front_matter`` is the per-node reader behind the concept
+    index, so an unconditional line would emit one per tree node (~1246 on this
+    deployment) and bury its own signal. The first occurrence names a concrete
+    path; identical repeats are suppressed, and the suppression is announced so
+    a reader never mistakes one line for one failure.
+
+    NEVER RAISES — not on a malformed ``path``, not on an ``exc`` whose
+    ``__str__`` throws. (g-306-218)
+    """
+    try:
+        key = (op, type(exc).__name__)
+        if key in _SWALLOWED_BACKEND_ERRORS:
+            return
+        _SWALLOWED_BACKEND_ERRORS.add(key)
+        print(
+            f"[storage-backend] WARNING: {op}({path}) failed and was SWALLOWED: "
+            f"{type(exc).__name__}: {exc}. The caller now falls back to whatever "
+            "the local filesystem already held, so a stale or absent local copy "
+            "is being treated as the truth. Further identical "
+            f"{op}/{type(exc).__name__} failures are suppressed this process.",
+            file=sys.stderr,
+        )
+    except Exception:
+        pass
+
+
 def get_backend() -> StorageBackend:
     """Return the process-wide active storage backend.
 
@@ -714,3 +781,7 @@ def reset_backend_for_tests() -> None:
     """Clear the cached backend (test isolation only)."""
     global _ACTIVE_BACKEND
     _ACTIVE_BACKEND = None
+    # The swallow-diagnostic dedup is per-process, so without this a second test
+    # case in the same process would see its warning suppressed by the first and
+    # read as "no diagnostic emitted" ().
+    _SWALLOWED_BACKEND_ERRORS.clear()

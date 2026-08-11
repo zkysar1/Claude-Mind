@@ -59,9 +59,23 @@ Bash: pipeline-read.sh --replay-candidates → resolved hypotheses eligible for 
 Bash: wm-read.sh encoding_queue --json  (if --selective mode)
 Read core/config/memory-pipeline.yaml → replay_priority_order, max_replay_items
 
-Priority selection (most learning signal first):
-1. Violations: hypotheses where outcome contradicted expectation (surprise >= 5)
-2. High-impact outcomes: hypotheses with surprise level >= 7 or significant consequences
+Priority selection (most learning signal first). THE FIELD IS `surprise` — read
+it by that exact name, NOT `surprise_level` (g-001-05, measured 2026-08-10):
+`surprise_level` is a WRITE-SIDE ALIAS that `core/scripts/pipeline.py:442`
+normalizes to `surprise` at write time, so it survives on almost no record. Live
+counts over the 464 replay candidates on cc-05: `surprise` present on 425,
+`surprise_level` on 1. The canonical field is seeded `"surprise": None` in
+DEFAULT_FIELDS (pipeline.py:79) and documented in
+`core/config/conventions/pipeline.md`.
+Keying on the alias is SILENT and self-concealing: rules 1 and 2 below both go
+to zero, so selection falls through to rule 5 and returns a batch of routine
+CONFIRMED fillers that looks like a perfectly normal replay. There is no error
+and no empty result — the only symptom is a batch with no violations in it,
+which is also what a genuinely calm week looks like. Sanity check before
+trusting a zero: `surprise>=5` matched 104 of 464 and violations 56 of 464 on
+the run that found this.
+1. Violations: hypotheses where outcome contradicted expectation (`surprise` >= 5)
+2. High-impact outcomes: hypotheses with `surprise` >= 7 or significant consequences
 3. Pattern signature mismatches: hypotheses where a pattern was matched but outcome differed
 4. EXPLORE/CALIBRATE categories: hypotheses in categories where we're still learning
 5. Random sample: 2-3 routine hypotheses (prevents overfitting to extremes)
@@ -141,18 +155,36 @@ Read the original evaluation record (scoring, reasoning)
 # pointer" check scanning its own chain (`outcome_detail, outcome_notes, rationale,
 # verification, links`), which passes on `rationale` alone and never touches the six
 # keys above. Read-side normalization is this step's job, not the gate's.
-outcome_text = first non-empty of:
-    outcome_detail, resolution_note, resolution, resolution_summary,
-    resolution_evidence, outcome_note, reflection_note, actual_outcome,
-    evidence_for, rationale
+# DO NOT hand-roll the chain — call it (gap-062, forged-by-extension 2026-08-04):
+#   bash core/scripts/pipeline-read.sh --narrative --id <hypothesis-id>
+# emits {id, stage, outcome, narrative_key, narrative, chars}. `narrative_key` is
+# the key the text came from, or NULL when the record is genuinely bare — which is
+# exactly the distinction this step needs and a blank string cannot carry. The
+# ten-key order lives ONCE in mind_api/src/world/pipeline.py NARRATIVE_CHAIN.
+# `--narrative` alone covers the live+archive union; add `--stage resolved` to filter.
+outcome_text = the `narrative` field of that call
   # `result` is usually the bare verdict string ("CONFIRMED") — use it for the
-  # verdict, never as the narrative.
-  # `--replay-candidates` returns a PROJECTION: `resolution`, `resolution_summary`,
-  # `resolution_evidence`, `reflection_note` and `actual_outcome` are ABSENT from it
-  # even when populated on the record. Dereference with
-  # `pipeline-read.sh --id <id>` before concluding a narrative is missing (sig-54,
-  # SOURCE half — a projection that drops the field returns a structural blank while
-  # its other columns stay correct).
+  # verdict, never as the narrative. It is deliberately NOT in the chain.
+  # Two traps the helper now absorbs, both of which bit hand-rolled variants:
+  #   - Do NOT truncate before scanning. A 500-char truncation inside one variant's
+  #     own normalizer produced a false 0-of-10 indicator scan (zeta, 2026-07-31).
+  #   - Not every narrative value is a str. Measured 2026-08-04 (echo, cc-03) over
+  #     351 replay candidates: 6 winning values were LISTS (evidence_for) and 1 was
+  #     a DICT (resolution). `.strip()` raises AttributeError on exactly those.
+  # CORRECTION 2026-08-04 (g-115-4656, echo, cc-03 / 6.8.0-136-generic): this block
+  # previously stated that `--replay-candidates` returns a PROJECTION omitting
+  # `resolution`, `resolution_summary`, `resolution_evidence`, `reflection_note` and
+  # `actual_outcome`, and instructed a per-record `--id` dereference before concluding
+  # a narrative was missing. MEASURED FALSE on this deployment: the endpoint appends
+  # the FULL record (mind_api/src/world/pipeline.py, `candidates.append(r)`) and all
+  # five keys are present in its output — 351 records carried resolution 19,
+  # resolution_summary 37, resolution_evidence 13, reflection_note 7,
+  # actual_outcome 42. There is no CLI mirror to differ (core/scripts/pipeline.py has
+  # zero `replay` references; the wrapper is daemon-only), so the projection had no
+  # second implementation to hide in. The nearby flag that IS a projection is
+  # `--summary`, which emits one text line of id/title/stage/outcome only — the
+  # likely source of the claim. Cost of the error: 351 needless daemon round-trips
+  # per full sweep, to recover fields that were never absent.
 IF outcome_text is empty after the full chain AND the full record was read:
     Write the OUTCOME line as "{outcome}, surprise {n} — no lesson narrative
     recorded" — state the absence rather than emitting a blank, so a successor can
@@ -507,11 +539,55 @@ FOR EACH candidate replayed in Step 2 (skip archived / encoded_via_chronic):
     rm["next_review_date"] = next_review
     Bash: pipeline-update-field.sh {candidate.id} replay_metadata '<rm JSON>'
     Log: "REPLAY STAMP: {candidate.id} rc={rm.replay_count} next_review={next_review}"
+
+# READ-BACK (MANDATORY). guard-409 already requires it — a SKILL.md step writing
+# persistent state that downstream code reads must delegate to a wrapper WITH
+# readback verification — and this step was out of compliance with it until
+# 2026-08-05. An rc=0 from the writer is not that verification (guard-1404 /
+# guard-1870), and a non-null re-read is not either: compare the VALUE (rb-1502).
+FOR EACH candidate stamped above:
+    Bash: pipeline-read.sh --id {candidate.id}   → live_rm = record.replay_metadata
+    verified = (live_rm.last_replayed    == today
+            AND live_rm.next_review_date == next_review
+            AND int(live_rm.replay_count) == rm["replay_count"])
+    IF NOT verified:
+        Log: "REPLAY STAMP FAILED: {candidate.id} live={live_rm}"
+        Retry the write ONCE, then re-verify.
+        IF still unverified: name the id in the Step 6 report under Spaced
+        Repetition Stats. Do NOT continue silently — an unstamped candidate
+        re-enters the next batch and consumes a slot.
+Report BOTH numbers: "stamped N, verified M". Only M is a measurement.
 ```
 
 Both filters now exclude the candidate for 7 days: Step 1's `last_replayed`
 LLM-side skip AND the endpoint's `next_review_date` source-level skip
 (defense-in-depth, mirroring the dual Step-1 / Step-3.6 chronic-skip pattern).
+
+**Why the read-back is mandatory: a dropped stamp is self-concealing.** Measured
+2026-08-05 (alpha, g-001-05, cc-04): of the 10 candidates replayed on 2026-08-02,
+**8 carried `last_replayed=2026-08-02` and 2 still read `2026-07-16`** — two stamps
+silently did not land. Both unstamped records were back in the very next batch,
+consuming 2 of that cycle's 10 slots (20% of the replay budget) re-reviewing
+hypotheses that should have been locked until 2026-08-09. Nothing surfaced the
+failure at the time, because a stamp write that does not land produces **no error
+and no missing artifact** — its only symptom is the record reappearing in a later
+batch, which is exactly what correct spaced-repetition rotation also looks like.
+That is what distinguishes this from an ordinary unchecked write: the failure mode
+and normal operation have the same signature, so the read-back is the only thing
+that can tell them apart.
+
+Note the diagnosis nearly went the other way, and the check that saved it is worth
+copying. The first pass found **0 of 10** stamped and read as "Step 4.5 is broken" —
+but 8 of the 10 were simply ABSENT from `--replay-candidates`, and absence has two
+opposite meanings: chronic-encoded/archived, **or** stamped successfully so that
+`next_review_date` sits in the future and the endpoint correctly excludes them.
+Dereferencing those 8 by id showed all 8 stamped. A zero whose two explanations
+imply opposite actions must be disambiguated before it is believed (guard-1419).
+
+This is Layer-A only (rb-189 — skill docs are not workflow enforcement). It makes
+the obligation explicit and checkable at the point of use; it does not enforce it.
+A future hardening would move the loop into a wrapper script that exits non-zero on
+any unverified stamp, which is what guard-409 actually prescribes.
 
 ## Step 5: Domain Transfer Check (--domain-transfer mode)
 

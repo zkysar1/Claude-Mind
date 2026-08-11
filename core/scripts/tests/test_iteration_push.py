@@ -16,6 +16,7 @@ self-resolve instead of wedging the integrate step.
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -750,3 +751,231 @@ def test_no_push_stops_before_push_even_when_integrate_is_a_noop(tmp_path):
     # never reached the push-decision logging below the seam
     assert "pushing " not in r.stderr, r.stderr
     assert "nothing to push" not in r.stderr, r.stderr
+
+
+# --------------------------------------------------------------------------- #
+# blocking-set narrowing ()
+# --------------------------------------------------------------------------- #
+# The self-heal classifier used to scan the ENTIRE dirty tree, and one path
+# outside agents/* vetoed the whole heal. Because nothing clears that path, the
+# veto repeated every iteration: measured on ZDS cc-06 as ~2.5h / 20+ cycles of
+# merge refusal with 14 dirty files, only some of which the merge touched.
+#
+# The narrowing consults the set git NAMES in its refusal message, and ONLY at
+# the veto and clear sites — never to shrink what gets committed (t8 is the
+# regression pin for that, and t_mixed above is the shape that caught it during
+# development). Each test below is paired against the property it would silently
+# lose, not merely against a log line.
+#
+# The ESCALATION half of  was implemented concurrently by two agents;
+# the surviving mechanism is _ip_defer_streak_tick, covered by
+# test_defer_streak_escalates_then_resets / _survives_dry_run below. The
+# duplicate _ip_refusal_bump and its two tests were retired with it.
+
+
+def test_selfheal_nonblocking_outofscope_file_does_not_veto(tmp_path):
+    """t6 (, the fix): a dirty core/ file that the incoming merge does
+    NOT touch must not veto a heal that would otherwise succeed — and must not
+    be touched either. Pre-fix this deferred forever."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {"agents/bravo/state.jsonl": "v1\n",
+                          "core/scripts/shared.sh": "c1\n"})
+    # origin advances ONLY the cross-agent file -> only IT blocks the merge
+    _commit_file(b, "agents/bravo/state.jsonl", "v2-from-b\n", "B: bravo v2")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "agents/alpha/note.md", "note\n", "A: own work")
+    (a / "agents/bravo/state.jsonl").write_text("dirty-bravo\n",
+                                                encoding="utf-8", newline="\n")
+    # ...and an UNRELATED dirty core/ file the merge never touches
+    (a / "core/scripts/shared.sh").write_text("dirty-core\n",
+                                              encoding="utf-8", newline="\n")
+
+    r = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    assert r.returncode == 0, f"non-blocking core/ churn must not veto: {r.stderr}"
+    assert "as blocking this merge" in r.stderr, r.stderr
+    assert "after churn self-heal" in r.stderr, r.stderr
+    # the blocking cross-agent file converged to origin...
+    assert (a / "agents/bravo/state.jsonl").read_text() == "v2-from-b\n"
+    # ...and the unrelated file was left EXACTLY as found (not cleared, not
+    # committed). Narrowing must remove the veto without widening the blast
+    # radius of the heal.
+    assert (a / "core/scripts/shared.sh").read_text() == "dirty-core\n"
+
+
+def test_selfheal_nonblocking_crossagent_churn_is_not_cleared(tmp_path):
+    """t7: clearing discards a sibling's local churn, so it is now restricted to
+    what git actually named. A cross-agent file the merge does not touch must
+    survive the heal untouched."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {"agents/bravo/blocking.jsonl": "v1\n",
+                          "agents/bravo/idle.jsonl": "v1\n"})
+    _commit_file(b, "agents/bravo/blocking.jsonl", "v2-from-b\n", "B: blocking v2")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "agents/alpha/note.md", "note\n", "A: own work")
+    (a / "agents/bravo/blocking.jsonl").write_text("dirty-blocking\n",
+                                                   encoding="utf-8", newline="\n")
+    (a / "agents/bravo/idle.jsonl").write_text("dirty-idle\n",
+                                               encoding="utf-8", newline="\n")
+
+    r = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    assert r.returncode == 0, f"should heal: {r.stderr}"
+    assert "self-heal: clearing 1 tracked" in r.stderr, r.stderr
+    assert (a / "agents/bravo/blocking.jsonl").read_text() == "v2-from-b\n"
+    # NOT cleared — git never named it, so the heal has no business touching it
+    assert (a / "agents/bravo/idle.jsonl").read_text() == "dirty-idle\n"
+
+
+def test_selfheal_commits_self_churn_git_did_not_name(tmp_path):
+    """t8: the narrowing must NOT reach the commit sites. /
+    exist because own ledger churn re-dirties every tick and must be PRESERVED,
+    not merely unblocked — so self-namespace churn is committed whether or not
+    git named it as blocking. (This exact shape caught a wrong first cut of the
+    g-115-4484 fix, which narrowed the classified set wholesale.)"""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {"agents/alpha/state.jsonl": "v1\n",
+                          "agents/bravo/state.jsonl": "v1\n"})
+    # origin advances ONLY bravo's file -> git names ONLY that as blocking
+    _commit_file(b, "agents/bravo/state.jsonl", "v2-from-b\n", "B: bravo v2")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "core/scripts/quux.sh", "echo\n", "A: framework work")
+    (a / "agents/alpha/state.jsonl").write_text("dirty-self\n",
+                                                encoding="utf-8", newline="\n")
+    (a / "agents/bravo/state.jsonl").write_text("dirty-bravo\n",
+                                                encoding="utf-8", newline="\n")
+
+    r = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    assert r.returncode == 0, f"should heal both halves: {r.stderr}"
+    assert "committing 1 SELF-namespace file(s) pre-merge" in r.stderr, r.stderr
+    # the self churn is IN HISTORY, not merely un-blocking
+    log = _must(a, "log", "--format=%s")
+    assert "pre-merge self-namespace churn" in log, log
+    assert (a / "agents/alpha/state.jsonl").read_text() == "dirty-self\n"
+
+
+# --------------------------------------------------------------------------- #
+# integrate-defer streak escalation + persisted log ()
+# --------------------------------------------------------------------------- #
+def test_defer_streak_escalates_then_resets(tmp_path):
+    """Three consecutive dirty-defer integrates escalate LOUDLY (banner +
+    health JSONL); every defer line is persisted to .git/iteration-push.log;
+    a successful integrate clears the streak state. State lives inside .git/
+    so it can never appear in porcelain (an untracked non-agents/* file would
+    itself trigger the self-heal defer — the bug this feature observes)."""
+    origin, a, b = _clone_pair(tmp_path)
+    # B pushes a rewrite of a file A ALSO holds dirty (uncommitted): A's merge
+    # is refused before starting (would overwrite), and the blocker is outside
+    # agents/* and .mind-data/*, so the self-heal defers the whole tree.
+    _commit_file(b, "base.txt", "B v2\n", "B: rewrite base")
+    _must(b, "push", "-q", "origin", "main")
+    (a / "base.txt").write_text("A dirty uncommitted\n", encoding="utf-8")
+
+    streak = a / ".git" / "iteration-push-defer-streak"
+    iplog = a / ".git" / "iteration-push.log"
+    env = {**os.environ, "MIND_AGENT": "testagent"}
+    (a / "agents" / "testagent").mkdir(parents=True)
+
+    outs = []
+    for _ in range(3):
+        r = subprocess.run(
+            [BASH, str(PUSH_SH), "--repo", str(a), *_default_flags()],
+            capture_output=True, text=True, timeout=120, env=env,
+        )
+        assert r.returncode == 0, r.stderr          # fail-soft, never blocks
+        outs.append(r.stderr)
+    assert "merge DEFERRED" in outs[0], outs[0]
+    assert "INTEGRATE-DEFER STREAK" not in outs[0]
+    assert "INTEGRATE-DEFER STREAK" not in outs[1]
+    assert "INTEGRATE-DEFER STREAK" in outs[2], outs[2]
+    assert streak.is_file() and streak.read_text().split()[0] == "3"
+    # escalation record landed in the resolved agent's health JSONL
+    health = list((a / "agents" / "testagent" / "health").glob("*.jsonl"))
+    assert health, "no health JSONL written at escalation"
+    assert "integrate_defer_streak" in health[0].read_text(encoding="utf-8")
+    # persisted log carries the defer lines (log() tee half of )
+    assert iplog.is_file() and "merge DEFERRED" in iplog.read_text(encoding="utf-8")
+    # streak state is invisible to porcelain (the .git/ placement invariant)
+    assert "iteration-push-defer-streak" not in _must(a, "status", "--porcelain")
+
+    # clear the dirt -> integrate succeeds -> streak state is gone
+    _must(a, "checkout", "--", "base.txt")
+    r = subprocess.run(
+        [BASH, str(PUSH_SH), "--repo", str(a), *_default_flags()],
+        capture_output=True, text=True, timeout=120, env=env,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "integrated" in r.stderr, r.stderr
+    assert not streak.exists(), "streak file must reset on successful integrate"
+
+
+def test_selfheal_retry_conflict_reports_conflict_shape_not_dirty_defer(tmp_path):
+    """When the churn self-heal SUCCEEDS and the retry then hits a true content
+    conflict, the streak shape must be conflict-abort — not dirty-defer.
+
+    The two merge failures are distinct shapes (guard-1985) with non-
+    interchangeable remedies, and this path used to collapse them: the retry
+    aborted a real conflict, then the caller's else-branch logged 'merge
+    DEFERRED' and ticked 'dirty-defer'. The resulting alarm pointed the reader
+    at staged entries / index.lock / dirty shared files, while its companion
+    line ruled OUT the shape that had actually occurred ('NOT ... cross-agent
+    churn (auto-cleared)') — the churn HAD been cleared, successfully, which is
+    precisely why the conflict became reachable. A conflict is also the one
+    shape retrying can never clear, so the wrong label costs unbounded cycles.
+    """
+    origin, a, b = _clone_pair(tmp_path)
+    # B rewrites a tracked file A has ALSO committed differently (-> conflict on
+    # retry) and adds an agents/<other>/ file A holds dirty+untracked (-> the
+    # first merge is refused before starting, so the self-heal engages).
+    _commit_file(b, "base.txt", "B v2\n", "B: rewrite base")
+    _commit_file(b, "agents/otheragent/note.txt", "B note\n", "B: add note")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "base.txt", "A v2\n", "A: rewrite base differently")
+    (a / "agents" / "otheragent").mkdir(parents=True)
+    (a / "agents" / "otheragent" / "note.txt").write_text("A churn\n", encoding="utf-8")
+
+    env = {**os.environ, "MIND_AGENT": "testagent",
+           "ITERATION_PUSH_DEFER_STREAK_ALARM": "1"}
+    (a / "agents" / "testagent").mkdir(parents=True)
+
+    r = subprocess.run(
+        [BASH, str(PUSH_SH), "--repo", str(a), *_default_flags()],
+        capture_output=True, text=True, timeout=120, env=env,
+    )
+    assert r.returncode == 0, r.stderr              # fail-soft, never blocks
+    err = r.stderr
+    # the self-heal did engage and did clear the cross-agent churn
+    assert "clearing 0 tracked + 1 untracked cross-agent file(s)" in err, err
+    # ...and the residual failure is reported as a CONFLICT, not a dirty defer
+    assert "conflict-abort" in err, err
+    assert "dirty-defer" not in err, err
+    assert "TRUE cross-machine content conflict" in err, err
+    assert "merge DEFERRED" not in err, err
+    # the alarm's remedy is the conflict remedy, not the dirty-tree one
+    assert "resolve it by hand" in err, err
+    assert "index.lock contention" not in err, err
+    # the tree is never left mid-merge for the loop to trip over
+    assert not (a / ".git" / "MERGE_HEAD").exists()
+    # the streak still counts this failure
+    streak = a / ".git" / "iteration-push-defer-streak"
+    assert streak.is_file() and streak.read_text().split()[0] == "1"
+    health = list((a / "agents" / "testagent" / "health").glob("*.jsonl"))
+    assert health, "no health JSONL written at escalation"
+    assert '"shape":"conflict-abort"' in health[0].read_text(encoding="utf-8")
+
+
+def test_defer_streak_survives_dry_run(tmp_path):
+    """--dry-run proves nothing about the merge, so it must not reset a real
+    streak (the reset is guarded by DRY_RUN)."""
+    origin, a, b = _clone_pair(tmp_path)
+    _commit_file(b, "base.txt", "B v2\n", "B: rewrite base")
+    _must(b, "push", "-q", "origin", "main")
+    (a / "base.txt").write_text("A dirty uncommitted\n", encoding="utf-8")
+
+    streak = a / ".git" / "iteration-push-defer-streak"
+    r = _run_push(a, *_default_flags())
+    assert r.returncode == 0
+    assert streak.is_file() and streak.read_text().split()[0] == "1"
+
+    r = _run_push(a, *_default_flags("--dry-run"))
+    assert r.returncode == 0
+    assert streak.is_file() and streak.read_text().split()[0] == "1", \
+        "dry-run must neither tick nor reset the streak"

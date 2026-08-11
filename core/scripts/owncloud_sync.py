@@ -163,6 +163,57 @@ _EXCLUDE_NAMES = {
 _EXCLUDE_GLOBS = ("*.lock", "*.pyc", "*.tmp", "*.swp", "*~", "*.sock",
                   "*.pid", "*.port", ".env*")
 
+# --- eager-pull exclusion policy (g-115-5239) -------------------------------
+# Basenames matched here are dropped from the EAGER pull paths ONLY:
+# `_materialize_tree` (cold-start bootstrap) and `pull_sweep` (periodic). They
+# are deliberately NOT added to _EXCLUDE_NAMES/_EXCLUDE_GLOBS, because those
+# mean MACHINE-LOCAL — never mirrored to S3 in EITHER direction. An archive is
+# shared, authoritative-in-S3 content, so machine-local is the wrong class and
+# actively harmful here: OwnCloudBackend._put short-circuits on
+# `self._machine_local(path)` and writes local-only, so archive appends made on
+# one box would never reach S3 and every other box's copy would diverge
+# permanently. `refresh_would_clobber` would likewise start returning True and
+# block the pre-read refresh.
+#
+# What this policy does NOT touch, and why that is the whole point: reads go
+# through OwnCloudBackend.ensure_local -> _refresh, which never consults this
+# module's exclusion policy. So an excluded archive still materializes on
+# demand the first time something actually opens it — it just stops riding
+# along on every cold start and every sweep tick, which is where the egress
+# was being spent (changelog-archive.jsonl measured at 231,212,152 bytes,
+# the single largest object in the store, read by nothing on a normal
+# iteration).
+#
+# Keep this list narrow. A file belongs here only when it is (a) large,
+# (b) genuinely cold on the normal loop path, and (c) still required to be
+# readable and pushable. When in doubt, leave it out — the failure mode of a
+# wrong entry here is a slow first read, but the failure mode of a wrong entry
+# in _EXCLUDE_NAMES is silent cross-box divergence.
+_EAGER_PULL_EXCLUDE_GLOBS = ("*-archive.jsonl",)
+# Roots this policy applies to. SHARED roots only — deliberately NOT "agents".
+# Ten *-archive.jsonl files live under agents/<name>/ (experience-archive.jsonl,
+# aspirations-archive.jsonl), and those are per-agent CONTINUITY that a cold box
+# genuinely needs and that experience-read.sh actually opens — none is a whale
+# (largest measured 656 KB vs changelog-archive.jsonl's 231 MB), so there is no
+# egress case for dropping them and a real continuity case for keeping them.
+# Today no caller can reach this policy with prefix="agents" (pull_sweep hard-
+# restricts to world/meta; nothing passes pull_bootstrap only_root="agents").
+# But pull_bootstrap's own guard ADMITS "agents", so one future caller would
+# silently un-sync every agent's experience archive. The guard below makes that
+# impossible rather than merely unlikely.
+_EAGER_PULL_ROOTS = ("world", "meta")
+
+
+def _is_eager_pull_excluded(basename: str, prefix: str) -> bool:
+    """True iff this object must not be pulled EAGERLY (cold-start bootstrap or
+    periodic sweep). NOT machine-local: the object still pushes normally and
+    still materializes on demand via OwnCloudBackend.ensure_local/_refresh.
+    See the _EAGER_PULL_EXCLUDE_GLOBS block above for why the two classes must
+    stay separate, and _EAGER_PULL_ROOTS for why agents/ is out of scope."""
+    if prefix not in _EAGER_PULL_ROOTS:
+        return False
+    return any(fnmatch.fnmatch(basename, g) for g in _EAGER_PULL_EXCLUDE_GLOBS)
+
 
 def _is_machine_local(basename: str, prefix: str, *, full_path=None, root_path=None) -> bool:
     """True iff this file is per-machine and must NOT be mirrored to S3.
@@ -1081,7 +1132,8 @@ _SWEEP_STATS_LOG = (Path(__file__).resolve().parents[1] / "logs"
 # is scanned==in_sync(+skipped_unchanged) and logging it would bury the
 # forensic signal under heartbeat noise.
 _BORING_STATS = frozenset({"scanned", "in_sync", "skipped_unchanged",
-                           "pruned_agents", "push_paths"})
+                           "pruned_agents", "pruned_agent_names",
+                           "push_paths"})
 
 # Self-trim bounds (g-115-2468 fresh-eyes F2): the live 2-min sweep cadence
 # logs a line for every active-session push heartbeat (~720/day observed
@@ -1162,6 +1214,52 @@ def _persist_merge_event(event: dict) -> None:
               file=sys.stderr)
 
 
+def _own_sid_carrier_path(be):
+    """THIS session's own body-heartbeat carrier, or None. (g-306-235)
+
+    Returns `(path, prefix, root_path)` when the carrier exists on disk, else
+    None.
+
+    The one file the H4a ownership gate gets structurally wrong. The gate's
+    premise — "a non-owner's local copy of a peer file is a stale cache, so
+    pushing it clobbers the owner" — is correct for whole-file, one-logical-
+    writer-per-agent state (handoff.yaml, working-memory.yaml). It is FALSE for
+    a SID-keyed carrier: the writing session id is IN the key, so exactly one
+    box can ever write it, it caches nothing, and no peer holds a copy to
+    clobber. A worker Body runs, by definition, on a box that does NOT hold the
+    agent's runner claim — so the gate suppresses the only file whose entire
+    purpose is to let that Body vouch for itself cross-box, in exactly and only
+    the case it was built for.
+
+    guard-1562 (loosening a fail-CLOSED gate is the dangerous direction). The
+    path is COMPUTED from MIND_AGENT + MIND_SID — never matched from disk —
+    so the set of files any caller can reach through this helper has exactly
+    ONE member per process, and no glob, prefix, or pattern can widen it. That
+    matters concretely: under own-cloud the local tree is a read-through cache,
+    so a PEER's carrier can legitimately exist locally as pulled bytes; it
+    carries a foreign sid and therefore can never match here. A predicate
+    written as `body-heartbeat-*.json` would have admitted it and re-opened the
+    exact peer-clobber hole the gate exists to close.
+
+    Writer: heartbeat-tick.sh:175. Reader: stranded-claim-sweep.py:404.
+    Manifest: session-manifest.yaml `body-heartbeat-*.json`, sync_tier
+    continuity.
+    """
+    agent = (os.environ.get("MIND_AGENT") or "").strip()
+    sid = (os.environ.get("MIND_SID") or "").strip()
+    if not agent or not sid:
+        return None
+    # Defensive: a sid carrying a path separator would escape the agent dir.
+    if "/" in sid or "\\" in sid or sid in (".", ".."):
+        return None
+    roots = _roots(be, "agents")
+    if not roots:
+        return None
+    root_path, prefix = roots[0]
+    p = Path(root_path) / agent / "session" / f"body-heartbeat-{sid}.json"
+    return (p, prefix, Path(root_path)) if p.is_file() else None
+
+
 def sweep(be, *, only_root, dry_run, use_manifest, full, only_agent=None):
     # Load the manifest whenever it is enabled — even on --full. --full disables
     # only the MTIME-skip optimization (the `not full` guard below); it must keep
@@ -1198,7 +1296,14 @@ def sweep(be, *, only_root, dry_run, use_manifest, full, only_agent=None):
              "conflicts": 0, "errors": 0, "skipped_unchanged": 0,
              "stale_skipped": 0, "diverged_skipped": 0, "nobaseline_skipped": 0,
              "nobaseline_reconciled": 0,
-             "multipart_deferred": 0, "pruned_agents": 0, "push_paths": []}
+             "multipart_deferred": 0, "pruned_agents": 0, "push_paths": [],
+             # Names behind the pruned_agents count. The count alone tells a
+             # caller that SOME agent dir is unpushable from this box; only the
+             # names tell it WHICH — which is what an operator needs to know
+             # whether the dir they just wrote to is the stranded one
+             # (guard-1579). Kept in _BORING_STATS so a healthy pruning sweep
+             # does not become "interesting" and log every 2 minutes.
+             "pruned_agent_names": []}
     for root_path, prefix in _roots(be, only_root):
         if not root_path.exists():
             _sync_print(f"[sync] root absent (skipped): {root_path}", file=sys.stderr)
@@ -1223,6 +1328,13 @@ def sweep(be, *, only_root, dry_run, use_manifest, full, only_agent=None):
                 if only_agent is not None:
                     keep = [d for d in keep if d == only_agent]
                 stats["pruned_agents"] += len(dirnames) - len(keep)
+                # Order-stable, dedup-free: dirnames is one os.walk level, so a
+                # name cannot repeat within it. Derived from the SAME keep list
+                # the count uses, so the name list can never disagree with the
+                # count it is supposed to explain.
+                _kept = set(keep)
+                stats["pruned_agent_names"].extend(
+                    d for d in dirnames if d not in _kept)
                 dirnames[:] = keep
             # Session redesign: prune <agent>/session/scratch/ — the machine-local
             # ad-hoc workspace — so the walk never descends into it. session/
@@ -1266,6 +1378,53 @@ def sweep(be, *, only_root, dry_run, use_manifest, full, only_agent=None):
                         except OSError:
                             pass
                     new_manifest[rel_key] = {"mtime": mtime_ns, "md5": new_md5}
+    # g-306-235: publish THIS session's OWN body-heartbeat carrier even when the
+    # H4a owned-prune above dropped its agent dir.
+    #
+    # NOTE THE SHAPE: the gate's predicate is NOT relaxed and the walk admits
+    # nothing new. This pushes ONE path computed from MIND_AGENT + MIND_SID
+    # (see _own_sid_carrier_path for the guard-1562 reasoning). Deciding
+    # per-encountered-file whether something is exempt is the operation that can
+    # go wrong; naming a single path outright cannot.
+    #
+    # Skipped entirely when the agent IS owned — the walk already pushed it, and
+    # a second _sync_one would only re-HEAD the same key.
+    #
+    # g-306-237: SCOPED BY BOTH of sweep()'s scoping params. DO NOT INLINE a
+    # second predicate — the root test below must match the propagate_temp_moves
+    # gate (`if only_root in (None, "agents")`, ~35 lines down, the other
+    # post-walk pass) exactly; they are twins and must not drift (guard-130).
+    # Both shapes are production-reachable from main(): `--root world|meta` sets
+    # only_root to a non-"agents" value, and `--agent NAME` sets only_agent
+    # non-None. only_agent is tested INSIDE rather than in this outer condition
+    # because _cagent does not exist until _own_sid_carrier_path(be) has run;
+    # keeping the cheap root check first also lets a world-scoped sweep skip the
+    # carrier-path computation entirely.
+    if owned is not None and only_root in (None, "agents"):
+        _carrier = _own_sid_carrier_path(be)
+        if _carrier is not None:
+            _cpath, _cprefix, _croot = _carrier
+            _cagent = _cpath.relative_to(_croot).parts[0]
+            if (_cagent not in owned
+                    and (only_agent is None or only_agent == _cagent)):
+                _crel = f"{_cprefix}/{_cpath.relative_to(_croot).as_posix()}"
+                _cbase_mtime, _cbase_md5 = _manifest_entry(manifest.get(_crel))
+                # multi_machine=False: this box IS the authoritative writer for
+                # this key (our sid is in it), the same reasoning sync_file uses
+                # when it fires right after a local write.
+                _cmd5 = _sync_one(be, _cpath, dry_run=dry_run, stats=stats,
+                                  baseline_md5=_cbase_md5, multi_machine=False,
+                                  own_cloud_authority=own_cloud)
+                if _cmd5 is not None:
+                    stats["own_carrier_pushed"] = (
+                        stats.get("own_carrier_pushed", 0) + 1)
+                    if not dry_run:
+                        try:
+                            new_manifest[_crel] = {
+                                "mtime": _cpath.stat().st_mtime_ns,
+                                "md5": _cmd5}
+                        except OSError:
+                            pass
     # g-115-2268 Gap C: surface persistent conflicts (>= N consecutive sweeps)
     # and persist the streak map. Real sweeps only — a dry-run must not mutate
     # the machine-local streak state.
@@ -1278,6 +1437,10 @@ def sweep(be, *, only_root, dry_run, use_manifest, full, only_agent=None):
     # never reads-merges-rewrites a local file, so it adds zero length to the
     # unlocked read->merge->PUT->local-rewrite window zeta flagged in
     # msg-20260711-205747-zeta-3102.
+    #
+    # TWIN (guard-130): this root gate is mirrored by the g-306-237 own-carrier
+    # push above (~35 lines up), the other post-walk pass. Both post-walk passes
+    # honor only_root + only_agent identically — change one, change the other.
     if only_root in (None, "agents"):
         stats["temp_move_propagation"] = propagate_temp_moves(
             be, dry_run=dry_run, owned=owned, only_agent=only_agent)
@@ -1416,7 +1579,16 @@ def sync_file(be, target: Path, *, dry_run, stats_out=None) -> int:
     if prefix == "agents" and owned is not None and matched_root is not None:
         parts = target.relative_to(matched_root).parts
         if parts and parts[0] not in owned:
-            return _skip("peer_agent")
+            # g-306-235: ONE exemption — THIS session's own body-heartbeat
+            # carrier. Exact-path equality against a path computed from
+            # MIND_AGENT + MIND_SID, never a glob: a peer's carrier sitting
+            # here as a pulled read-through cache carries a foreign sid and so
+            # can never match. Both publication paths need this or the fix is
+            # half-applied (the sweep's is above, after the walk).
+            _own_carrier = _own_sid_carrier_path(be)
+            if not (_own_carrier is not None
+                    and target.resolve() == _own_carrier[0].resolve()):
+                return _skip("peer_agent")
     if not target.exists() or target.is_dir():
         return _skip("missing_or_dir")
     stats = {"scanned": 1, "in_sync": 0, "pushed": 0, "would_push": 0,
@@ -1597,7 +1769,8 @@ def _pull_one(be, full: Path, *, dry_run: bool, stats: dict, baseline_md5=None):
 
 
 def pull_continuity(be, agent: str, *, dry_run: bool = False,
-                    only: "set[str] | None" = None) -> dict:
+                    only: "set[str] | None" = None,
+                    include_temp: bool = False) -> dict:
     """Pull every continuity-tier session file for `agent` from S3 to local,
     freshness-aware (never clobbering unpushed local writes). Called by the
     /start IDLE branch (via owncloud-pull.sh -> POST /v1/admin/owncloud-pull)
@@ -1615,7 +1788,32 @@ def pull_continuity(be, agent: str, *, dry_run: bool = False,
     so `only` can never widen the pull beyond it or reach a non-continuity file;
     an unknown name simply selects nothing (reported via requested_missing).
     Filtering here rather than in the caller keeps the S3 round-trips themselves
-    scoped — the point is to not fetch the other 900 objects."""
+    scoped — the point is to not fetch the other 900 objects.
+
+    `include_temp` (g-115-4574) opts INTO the temp/ working-doc sweep. It is OFF
+    by default because temp/ is not continuity-tier: session-manifest.yaml — the
+    SSOT this function derives `continuity_names` from — does not contain temp/
+    at all, and pull_temp was bolted on beside the manifest walk rather than
+    derived from it. The default swept it anyway, so the /start pull's cost was
+    driven by scratch population instead of by the continuity set, and it broke
+    precisely in the machine-move case it exists for: measured cc-04 2026-08-02,
+    164.6s against a 90s RT_CURL_TIMEOUT ceiling, scanned=1590 (17 continuity +
+    ~1573 temp), pulled=125 of which exactly 2 were continuity (handoff.yaml,
+    goal-reads.jsonl) and 123 were probe leftovers from closed goals. Earlier
+    readings: 1054/95.4s (cc-03), 904/59s (cc-04) — the ceiling re-erodes as
+    temp/ grows, which is why raising the timeout was rejected as the fix.
+
+    WHAT A MACHINE-MOVED AGENT LOSES, stated rather than left implicit: its
+    temp/ working docs and drained/ archive do not auto-materialize, so a Read
+    of a cited agents/<agent>/temp/<x>.md fails until someone pulls it. There is
+    no read-through for that path — ensure_local() is called by specific readers
+    (retrieve.py, tree_match.py, _world_config.py), not by the Read tool. That
+    is acceptable because durable records are already forbidden from pointing
+    there (guard-1373: experience content_path MUST be under the durable
+    agents/<agent>/experience/, NEVER under temp/), and artifact-reference-
+    integrity.md already ratified box-dependent temp-citation dangling as
+    tolerated rather than worth a rewrite engine. Nothing is destroyed: the
+    objects stay in S3 and `--with-temp` fetches them on demand."""
     stats = {"agent": agent, "scanned": 0, "pulled": 0, "in_sync": 0,
              "would_pull": 0, "s3_absent": 0, "local_ahead_skipped": 0,
              "multipart_deferred": 0, "errors": 0, "pulled_files": []}
@@ -1669,10 +1867,13 @@ def pull_continuity(be, agent: str, *, dry_run: bool = False,
     # persists BOTH session and temp baselines (an independent save inside
     # pull_temp would clobber the session set written here).
     #
-    # SKIPPED under `only`: a targeted caller asked for specific session files;
-    # sweeping temp/ (an S3 prefix LIST plus a fetch per object) is the bulk of
-    # the cost `only` exists to avoid, and it is never what such a caller wants.
-    if not only:
+    # OPT-IN under `include_temp` (g-115-4574), and still SKIPPED under `only`.
+    # `only` is a targeted caller asking for specific session files; sweeping
+    # temp/ (an S3 prefix LIST plus a fetch per object) is the bulk of the cost
+    # `only` exists to avoid, and is never what such a caller wants. The default
+    # is now OFF for every caller for the same reason at fleet scale — see the
+    # docstring for the measurement and for what a machine-moved agent gives up.
+    if include_temp and not only:
         temp_stats = pull_temp(be, agent, dry_run=dry_run,
                                _manifest=manifest, _new_manifest=new_manifest)
         stats["temp"] = temp_stats
@@ -1853,6 +2054,12 @@ def _materialize_tree(be, root_path: Path, cur: Path, prefix: str, *,
         # Leaf object.
         if _is_machine_local(name, prefix, full_path=child, root_path=root_path):
             continue
+        # Eager-pull exclusion (g-115-5239). Counted, never silent: a sweep that
+        # drops objects without saying so reads identically to one that found
+        # nothing to drop.
+        if _is_eager_pull_excluded(name, prefix):
+            stats["skipped_eager_excluded"] = stats.get("skipped_eager_excluded", 0) + 1
+            continue
         rel_key = f"{prefix}/{child.relative_to(root_path).as_posix()}"
         _base_mtime, base_md5 = _manifest_entry(manifest.get(rel_key))
         before = stats["pulled"]
@@ -1972,7 +2179,7 @@ def pull_bootstrap(be, *, only_root=None, dry_run=False):
              "pulled_roots": [], "scanned": 0, "pulled": 0, "in_sync": 0,
              "would_pull": 0, "s3_absent": 0, "local_ahead_skipped": 0,
              "multipart_deferred": 0, "errors": 0, "pulled_files": [],
-             "skipped": None}
+             "skipped_eager_excluded": 0, "skipped": None}
     if stats["backend"] != "own-cloud":
         stats["skipped"] = "local backend (no-op)"
         return stats
@@ -2028,7 +2235,8 @@ def pull_sweep(be, *, only_root=None, dry_run=False):
              "pulled_roots": [], "scanned": 0, "pulled": 0, "in_sync": 0,
              "would_pull": 0, "s3_absent": 0, "local_ahead_skipped": 0,
              "multipart_deferred": 0, "errors": 0, "pulled_files": [],
-             "skipped_machine_local": 0, "skipped": None}
+             "skipped_machine_local": 0, "skipped_eager_excluded": 0,
+             "skipped": None}
     if stats["backend"] != "own-cloud":
         stats["skipped"] = "local backend (no-op)"
         return stats
@@ -2056,6 +2264,14 @@ def pull_sweep(be, *, only_root=None, dry_run=False):
                 if _is_machine_local(parts[-1], prefix, full_path=full,
                                      root_path=root_path):
                     stats["skipped_machine_local"] += 1
+                    continue
+                # Eager-pull exclusion (g-115-5239) — separate counter from
+                # skipped_machine_local on purpose: these objects DO sync (they
+                # push, and they materialize on demand), they are merely not
+                # dragged along by the sweep. Folding them into the machine-local
+                # tally would misreport a shared archive as per-machine.
+                if _is_eager_pull_excluded(parts[-1], prefix):
+                    stats["skipped_eager_excluded"] += 1
                     continue
                 stats["scanned"] += 1
                 rel_key = f"{prefix}/{rel}"

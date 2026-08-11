@@ -28,6 +28,75 @@ create-aspiration, notification fallbacks, or any other code path:
   (agent portion proceeds; human portion surfaced via pending-questions)
 - ONLY if genuinely human-only (no API, no script, no bridge): `participants: [user]`
 
+## The Fourth Surface: handing the user a command in chat
+
+Three surfaces route work to the user through a WRITTEN RECORD, and each has
+a gate: `participants:[user]` (capability-gate at CREATE_BLOCKER),
+`defer_reason` (capability-gate at `cmd_update_goal`), and outbound email
+(`/notify-user` Step 1.5). **Writing "here, run these commands" in a chat
+reply routes identical work to the identical human and passes through NONE of
+them**, because nothing is ever written and no tool is called. Chat is the
+highest-bandwidth agent-to-principal channel, so the one lane with no
+chokepoint carries the most traffic. It is honor-system by construction — see
+`probe-before-defer.md` § Enforcement for why no gate is possible and what
+post-hoc detection remains.
+
+### State a principled decline AS A CHOICE
+
+This rule is otherwise written against laziness and unexamined capability
+gaps. The hard case is neither: a *reasoned* decline, with a real argument,
+where the agent genuinely can act and elects not to. A principled refusal
+feels more defensible than "I cannot", so it draws less scrutiny and survives
+longer — and if the agent never says *"I can do this, I am choosing not to"*,
+the refusal is **indistinguishable from incapability** and the user never
+thinks to overrule it.
+
+So: when declining to do something you are capable of, say plainly that you
+are capable and that this is a choice, and name what would change it. One
+sentence. It costs nothing and it hands the reversal back to the user, who can
+take it in one word.
+
+### Where a governing doc names an authorized path and the user is present, that path is OPEN
+
+Absolutes that the governing document does not actually state are the second
+half of the same failure. `CLAUDE.md` does not forbid all constitutional-anchor
+changes — it requires "a user-authorized maintenance path, never an autonomous
+edit". When the principal is present and offering exactly that path, the path
+is open, and treating the restriction as absolute converts a two-minute action
+into a multi-day block. Before declining on a governing-doc restriction, re-read
+what it actually says and check whether its named exception is available right
+now.
+
+### Hand-command hygiene (when you do hand over a command block)
+
+For any command aimed at a machine you cannot see, the block MUST:
+
+1. **Assert the expected host and path, and abort otherwise.** Never resolve a
+   deictic reference ("I'm at that computer now") against your own last topic —
+   the user's "that computer" is a claim about THEIR location, and you have no
+   way to check it. Make the command check.
+2. **Assert the expected user, and refuse root** where the service runs as
+   another user. A `sudo -i` reached for because a path was wrong is how a
+   wrong-host command becomes root-owned files in the right place.
+3. **Refuse to clobber an existing file.** Write only if absent, or write beside
+   and diff.
+4. **Verify by an independent read-back, not by the write echo.** A successful
+   write echo says the command ran, not that the intended content is there.
+
+Canonical incident (2026-08-03, production): a HIGH finding said a container
+lacked its constitutional anchor. The agent could have written it — it had
+ssh-ed into that container three times in the same conversation — and declined
+on the reasoning that the anchor's value depends on the agent not having
+written it. Sound in isolation, applied as an absolute the governing doc does
+not state, while the principal was present offering the authorized path. The
+agent then resolved "I am at that computer now" against its own last topic and
+handed over container-specific paths; the principal was at a different machine,
+different deployment, non-root. Permission denied → `sudo -i` → root shell →
+"did I just break production". He had not. Cost: about an hour of his evening,
+a real scare, and a two-day delay on a two-minute fix. All four guards above
+would have broken that chain, and the one-sentence voiced decline would have
+prevented it entirely.
+
 ## What "Human-Only" Means (Framework-Level)
 
 - Granting credentials or API keys the agent does not possess

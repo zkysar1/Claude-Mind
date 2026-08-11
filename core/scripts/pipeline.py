@@ -158,8 +158,19 @@ def parse_value(value_str):
 # Helpers: validation
 # ---------------------------------------------------------------------------
 
-def validate_record(rec):
-    """Validate a pipeline record dict. Raises ValueError on invalid."""
+def validate_record(rec, changed_fields=None):
+    """Validate a pipeline record dict. Raises ValueError on invalid.
+
+    `changed_fields` names the fields THIS write touches; it scopes the
+    position VALUE checks only (g-115-4821). None = validate everything,
+    which is correct for create and whole-record-replace callers and is the
+    pre-g-115-4821 behaviour. Every structural check still runs on every
+    path (guard-330). Kept signature-identical to the daemon's
+    mind_api/src/world/pipeline_write.py::_validate_record — the two are
+    parametrized over the same cases in
+    core/scripts/tests/test_pipeline_position_type_gate.py, which is what
+    catches a fix applied to only one of them.
+    """
     missing = REQUIRED_FIELDS - set(rec.keys())
     if missing:
         raise ValueError(f"Missing required fields: {missing}")
@@ -203,27 +214,47 @@ def validate_record(rec):
     # fields containing "for", stage names, or category names. Accepts: (a) YES/NO
     # prefixes (any case), (b) length >=20 (genuine multi-word claim), or
     # (c) multi-word short answers — rejects everything else.
+    # Type gate (). Every content check below is isinstance(str)-guarded,
+    # so a NON-string position bypassed all of them — including the stage-name and
+    # type-name rejects this block exists for. Measured 2026-08-02: 77 live records
+    # carried bare numbers as position (84 and 10000 against boolean claims; 1/0
+    # standing in for YES/NO), and the rate was accelerating — 7 in May, 16 in Jun,
+    # 52 in Jul. Same shape, and same remedy, as the `surprise` type gate above.
+    # Scoped to writes that touch position (). The dot-prefix arm is
+    # guard-354: bare `f == "position"` would let a nested `position.sub` write
+    # skip the check. Fails CLOSED — None validates rather than skips.
     position = rec.get("position")
-    if isinstance(position, str):
-        pos_stripped = position.strip()
-        if pos_stripped.lower() in VALID_STAGES:
+    checks_position = changed_fields is None or any(
+        f == "position" or f.startswith("position.") for f in changed_fields)
+    if checks_position:
+        if position is not None and not isinstance(position, str):
             raise ValueError(
-                f"Invalid position: '{position}' (matches a pipeline stage name — "
-                f"the stage field was likely written to position by mistake)"
+                f"Invalid position: {position!r} (must be a string; got "
+                f"{type(position).__name__}). A bare number is not a prediction in "
+                f"either claim-space or prediction-space — write YES/NO, or a "
+                f"narrative stance that guard-1800 can restate as 'position was X, "
+                f"reality was Y'."
             )
-        if pos_stripped.lower() in VALID_TYPES:
-            raise ValueError(
-                f"Invalid position: '{position}' (matches a hypothesis type — "
-                f"the type field was likely written to position by mistake)"
-            )
-        starts_with_verdict = pos_stripped.upper().startswith(("YES", "NO"))
-        is_long_claim = len(pos_stripped) >= 20
-        is_multi_word = len(pos_stripped.split()) >= 2
-        if not (starts_with_verdict or is_long_claim or is_multi_word):
-            raise ValueError(
-                f"Invalid position: '{position}' (must be YES/NO, >=20 chars, or "
-                f"a multi-word claim — likely a prompt-template artifact)"
-            )
+        if isinstance(position, str):
+            pos_stripped = position.strip()
+            if pos_stripped.lower() in VALID_STAGES:
+                raise ValueError(
+                    f"Invalid position: '{position}' (matches a pipeline stage name — "
+                    f"the stage field was likely written to position by mistake)"
+                )
+            if pos_stripped.lower() in VALID_TYPES:
+                raise ValueError(
+                    f"Invalid position: '{position}' (matches a hypothesis type — "
+                    f"the type field was likely written to position by mistake)"
+                )
+            starts_with_verdict = pos_stripped.upper().startswith(("YES", "NO"))
+            is_long_claim = len(pos_stripped) >= 20
+            is_multi_word = len(pos_stripped.split()) >= 2
+            if not (starts_with_verdict or is_long_claim or is_multi_word):
+                raise ValueError(
+                    f"Invalid position: '{position}' (must be YES/NO, >=20 chars, or "
+                    f"a multi-word claim — likely a prompt-template artifact)"
+                )
 
 def validate_formation_quality(rec):
     """Formation-quality gate (). Rejects hypotheses with formation

@@ -113,6 +113,14 @@ re-introduces the clobber class g-115-1561 fixed.
                    Bash: execution-diary.sh phase-end phase-1-strategic-scan.
               Skill owns its own last_strategic_scan cadence stamp
               (single-writer per guard-155).
+              # SAFETY NET (g-115-4691): the TIME trigger is now ALSO gated in bash by
+              # strategic-scan-cadence-check.sh, registered in _cadence_registry and run
+              # by the precheck Phase 0.5e cadence battery. Idempotent with this phase via
+              # the shared stamp (same pairing as evolution Phase 8.8 <-> precheck 0.5j).
+              # This phase still owns goal_cadence + recurring_settling, which fire SOONER.
+              # The two diary markers above are NOT evidence this phase ran: they sit
+              # INSIDE the LLM-skippable THEN block, so they inherit its skippability —
+              # measured 0 markers in 178 diary lines on a box whose stamp was 3.9h fresh.
   Phase 2-2.9 Bash: execution-diary.sh phase-start phase-2-select
               Skill(aspirations-select) → goal | selection_reason | source
               IF selection_reason starts with "all_blocked":
@@ -164,6 +172,15 @@ re-introduces the clobber class g-115-1561 fixed.
               # — the board is the one surface that survives cross-box store
               # partitions; g-001-311, guard-997, rb-3296):
               Bash: bash core/scripts/goal-pickup-coordination-check.sh --goal-id {goal.id} --source {source} --output json
+              # CROSS-AGENT GOALS MUST DECLARE THEIR OWNER (g-115-5570). When the
+              # selector's source is 'cross-agent:<owner>' (routed_to_me true),
+              # append `--cross-agent-owner <owner>` to the call above. Agent-queue
+              # ids are per-agent, so the probe now treats a bare `--source agent`
+              # id as a PRIVATE record and skips the board lane entirely — correct
+              # for your own g-001-0N cadence goals, WRONG for a cross-agent goal,
+              # which names one shared record a partner genuinely can contend.
+              # Omitting the flag on a cross-agent goal silently disables the only
+              # real race this lane still catches.
               IF race_risk == true:
                 IF board_partner_activity has a "claim" entry → a partner's claim is
                 live on another box even though the shared store shows unclaimed
@@ -175,20 +192,45 @@ re-introduces the clobber class g-115-1561 fixed.
                 (do NOT claim). ELSE (surface overlaps but the goal is genuinely still
                 open) proceed to claim — the probe is ADVISORY, never a hard gate
                 (fail-open, exit 0; heuristic affected-paths inference must not freeze work).
-              # KEEP the `IF source==world` guard (g-115-3590). It is not a
-              # stylistic gate: the daemon claim endpoint REFUSES agent-queue
-              # goals with `400 agent_queue_goal` by design, and the parse rule
-              # below treats any `error` field as "journal abort +
-              # LOOP_CONTINUE" — so dropping the guard would abort every
-              # agent-source iteration, silently halting the entire recurring
-              # cadence (g-001-01..g-001-10 all live in the agent queue).
-              # A prior goal recommended dropping it on the premise that
-              # "the script already supports both sources"; the script's
-              # arg parser does, the endpoint does not.
-              IF source==world: aspirations-claim.sh — its OWN Bash call, output
+              # THE `IF source==world` GUARD IS GONE (g-306-249). Claim on BOTH
+              # sources. The guard existed because the daemon claim endpoint
+              # REFUSED agent-queue goals with `400 agent_queue_goal`, and the
+              # parse rule below reads any `error` field as "journal abort +
+              # LOOP_CONTINUE" — so dropping it prematurely would have aborted
+              # every agent-source iteration, silently halting the entire
+              # recurring cadence (g-001-01..g-001-10 all live in the agent
+              # queue). That premise is now false on both halves, and both were
+              # MEASURED before this line changed, not inferred:
+              #   - endpoint: g-306-238 landed `&source=agent`. LIVE-probed from
+              #     cc-02 2026-08-07 with two zero-mutation calls —
+              #     `id=<absent>&source=agent` answers "not found in AGENT
+              #     queue" (a world-resolving daemon says "world queue"), and
+              #     `source=bogus` answers 400 `invalid_source`, a branch that
+              #     exists only in the post-g-306-238 module. Probing the LIVE
+              #     endpoint rather than the file on disk is the whole point:
+              #     pytest imports fresh, the daemon does not (guard-984/742).
+              #   - wrapper: `aspirations-release.sh` hardcoded `source=world`
+              #     and swallowed `--source` into an unread PASSTHROUGH array.
+              #     Fixed FIRST, backward-compatible by default, so Phase 5.3
+              #     below can pair a release with this claim. A claim protocol
+              #     with no matching release strands a claim on every recurring
+              #     cadence goal.
+              # A prior goal recommended dropping this guard on the premise that
+              # "the script already supports both sources" — true of the arg
+              # parser, false of the endpoint. Read that as the standing
+              # caution: BOTH layers have to be measured, and neither vouches
+              # for the other (guard-2374 in both directions).
+              aspirations-claim.sh --source {source} — its OWN Bash call, output
               VISIBLE (NEVER `>/dev/null 2>&1`, never newline-batched with the
               phase-4 markers below: g-115-2345 — a silenced 409 let echo execute
-              zeta's claimed goal for a full phase; guard-1007). On that SAME
+              zeta's claimed goal for a full phase; guard-1007).
+              # `--source` IS NOT OPTIONAL NOW. The wrapper OMITS the query param
+              # when the flag is absent, so the endpoint's "world" default
+              # applies — an agent-queue goal claimed without it resolves the
+              # WORLD queue, is not found there, and 404s. Dropping the guard
+              # above without adding the flag here would have converted a
+              # deliberate skip into a hard failure on every cadence goal.
+              On that SAME
               claim call, forward the Scorer Sovereignty deviation code from
               select Phase 2.94 as a `--deviation "{deviation_code}"` argument
               (deviation_code is "" on the happy path — claiming the scorer top —
@@ -202,6 +244,40 @@ re-introduces the clobber class g-115-1561 fixed.
               Parse the JSON:
               any `error` field OR claimed_by != self → journal abort +
               LOOP_CONTINUE (no phase-end — phase-start not yet written).
+              # FALLBACK ONLY, and the trigger is narrow (g-115-4323, rescoped
+              # by g-306-249): the claim above now runs on BOTH sources and its
+              # response carries the FULL record — `verification` and
+              # `description` included — so on the happy path there is nothing
+              # left to fetch. Fire the read below ONLY if the claim response
+              # lacks them. Do not fire it "for safety": it costs ~127KB.
+              # The paragraph that follows is the ORIGINAL justification, kept
+              # because it names what goes wrong when the record is absent and
+              # that hazard is unchanged — only the delivery path moved.
+              # The claim used to be the ONLY full-record delivery in the loop
+              # while the guard above gated it off for agent-queue goals, so
+              # they reached Phase 4 with NO `verification` and NO
+              # `description` anywhere in context. Both
+              # upstream surfaces omit them BY DESIGN: the compact is a 27-key
+              # projection, and the selector candidate carries 17 keys whose `raw`
+              # sub-object is the SCORE BREAKDOWN, not the goal record (an easy
+              # thing to assume otherwise). Measured 2026-08-01: 42 of 92
+              # non-terminal agent-queue goals fleet-wide are NON-recurring and 29
+              # of those carry verification — live on all 5 agents, and mostly
+              # Unblock/Idea/Resolve goals with no `skill` field to drive
+              # execution either. Recurring cadence goals are unaffected in
+              # practice (their verification restates the title and `skill` IS
+              # delivered), which is why this stayed invisible.
+              IF the claim response lacks `verification`/`description`:
+              Bash: aspirations-read.sh --source agent --active
+              → locate {goal.id} and carry its `verification` + `description` into
+              execution. Returns FULL goal records (~127KB for a 65-goal queue).
+              There is NO goal-level read — `--id` takes an ASPIRATION id — and an
+              unknown flag returns an error JSON with rc=0, so parse the body,
+              never just the exit code.
+              # Do NOT "fix" this by adding verification to the compact instead:
+              # measured +762997 bytes = +47% (1.55MB → 2.27MB), median 351 B/goal.
+              # The omission there is a deliberate size trade; the consumer was
+              # the defect.
               # phase-start AFTER the claim (g-115-1371 / rb-1533): the phase-4-execute marker
               # MUST post-date claimed_at so the Phase -0.5c.1 stranded-claim sweep's "diary
               # entry after claimed_at" in-flight signal survives a long post-claim pause
@@ -215,15 +291,15 @@ re-introduces the clobber class g-115-1561 fixed.
               Bash: execution-diary.sh phase-start phase-4-execute --goal {goal.id}
               Bash: team-state-in-flight.sh --agent <self> --goal-id {goal.id}
               --title "{goal.title}" --phase 4   # live snapshot for partner
-              # SOURCE-ASYMMETRIC (g-115-3199). For source==world this is now
-              # REDUNDANT — aspirations-claim.sh `_post_claim_effects` stamps
-              # in_flight + current_focus automatically on every rc=0 claim, so
-              # the call above just re-writes identical values (idempotent, and
-              # harmless if kept for uniformity). For source==agent it is still
-              # LOAD-BEARING: agent-queue goals never invoke aspirations-claim.sh
-              # at all (see the `IF source==world` guard above), so this LLM call
-              # is their ONLY stamp path. Do not delete it on the strength of the
-              # world-path wiring alone.
+              # NO LONGER SOURCE-ASYMMETRIC (g-115-3199, corrected by g-306-249).
+              # `_post_claim_effects` stamps in_flight + current_focus on every
+              # rc=0 claim, and the claim now runs on BOTH sources — so this call
+              # is redundant on both, not just on world. It is KEPT anyway, and
+              # deliberately: the stamp is idempotent, and it is the only stamp
+              # path left on any branch where the claim did not return rc=0 but
+              # execution continues. Do not delete it on the strength of the
+              # claim-side wiring alone — that reasoning was already wrong once
+              # here in the opposite direction.
               # `started` is NOT set here — the daemon claim chokepoint owns it
               # (aspirations_write.py setdefault at claim time; single-writer rule,
               # g-115-2175/g-115-2187-t). An LLM `started today` write would clobber
@@ -231,7 +307,7 @@ re-introduces the clobber class g-115-1561 fixed.
               Bash: aspirations-update-goal.sh status in-progress.
               board-post.sh claim.
               Bash: load-execute-protocol.sh → Read; follow inline.
-              IF infrastructure_failure: aspirations-release.sh;
+              IF infrastructure_failure: aspirations-release.sh --source {source};
               team-state-clear-in-flight.sh --agent <self>;
               Bash: execution-diary.sh phase-end phase-4-execute --goal {goal.id}; LOOP_CONTINUE.
               Write iteration-checkpoint.json (phase_completed=execute, last_updated=now).
@@ -297,8 +373,26 @@ re-introduces the clobber class g-115-1561 fixed.
               # it; LLM-driven non-recurring verify calls MUST too — without
               # it, outcome_class never lands and portfolio analysis stays blind.
               Checkpoint: phase_completed=verify, started_at preserved.
-  Phase 5.3.  Attribution — IF world+completed: aspirations-complete-by.sh
-              ELIF world+non-terminal: aspirations-release.sh
+  Phase 5.3.  Attribution — IF completed: aspirations-complete-by.sh --source {source}
+              ELIF non-terminal: aspirations-release.sh --source {source}
+              # SOURCE-AGNOSTIC since g-306-249 — this is the RELEASE half that
+              # HAS to move with the Phase 4 claim guard above. A claim protocol
+              # with no matching release strands a claim on every recurring
+              # cadence goal, and nothing else clears it: neither
+              # recurring-close.sh nor iteration-close.sh touches `claimed_by`
+              # (positive-controlled: 82/296 "goal" matches in those files, 0
+              # for claimed_by). Both wrappers accept `--source` and both daemon
+              # handlers resolve paths from it (`complete_by` L3375/L3392,
+              # `release` L3644/L3650) and pop `claimed_by`.
+              # ALREADY COVERED, do not duplicate: the RECURRING path closes via
+              # iteration-close.sh's own `aspirations-complete-by.sh --source
+              # "$SOURCE"` branch (do_verify, IS_RECURRING), which was source-
+              # aware before this change. This line is the NON-recurring path.
+              # NET, not owner: stranded-claim-sweep.py releases anything missed
+              # and is already source-aware (it forwards `source` through
+              # rt_call and never went through the wrapper). Do not read its
+              # existence as license to skip the release here — a swept release
+              # is minutes-to-hours late and posts no board pairing.
               # Rationale (WHY this increment pairs with Block B reset):
               #   core/config/rationale/circuit-breaker.md
               IF verify_outcome != completed:

@@ -199,8 +199,12 @@ def parse_front_matter(md_path):
     try:
         from storage_backend import get_backend
         get_backend().ensure_local(p)
-    except Exception:
-        pass
+    except Exception as e:
+        try:  # report, never raise — see note_swallowed_backend_error (g-306-218)
+            from storage_backend import note_swallowed_backend_error
+            note_swallowed_backend_error("ensure_local", p, e)
+        except Exception:
+            pass
     if not p.exists():
         return {}
     try:
@@ -222,6 +226,22 @@ def parse_front_matter(md_path):
 # ---------------------------------------------------------------------------
 # Concept index from .md front matter entities
 # ---------------------------------------------------------------------------
+
+def _norm_separators(s):
+    """Collapse any run of non-alphanumeric characters to a single hyphen.
+
+    Node keys are lowercase kebab-case by framework convention, so this is
+    near-identity for keys and does the real work on the QUERY side: it lets
+    "test coverage illusions", "test_coverage_illusions" and
+    "Test Coverage Illusions" all resolve to the key test-coverage-illusions.
+
+    Uses the same `[a-z0-9]+` tokenizer Strategy 3 adopted on 2026-05-09, so
+    the two strategies agree on what counts as a separator. Order-preserving
+    by construction — this makes separators irrelevant, never token order.
+    Callers must pass an already-lowercased string.
+    """
+    return "-".join(re.findall(r'[a-z0-9]+', s))
+
 
 def build_concept_index(nodes):
     """Build entity-term -> [node_keys] index from .md front matter entities.
@@ -266,13 +286,28 @@ def _match_nodes(category, nodes, entity_index, concept_index):
     matched_keys = set()
     channels = {}
 
+    # g-306-182 (2026-08-04): the exact_key test was LITERAL equality, so the
+    # natural-language spelling of a node key could not earn the channel —
+    # "test coverage illusions" missed the node keyed test-coverage-illusions
+    # and fell through to word_prefix, costing 4.0 -> 1.5 (measured: rank #1 at
+    # 6.80 vs rank #7 at 4.30 on the live tree). Natural language is the query
+    # shape the framework MANDATES (code-review-protocol.md step 4 requires two
+    # free-text queries), so the miss lands on the dominant caller.
+    #
+    # Normalizing to a common separator form resolves it the same way Strategy 3
+    # was resolved on 2026-05-09 (P0 #2) — same `[a-z0-9]+` tokenizer, so the two
+    # strategies now agree on what a separator is. This is deliberately ORDER-
+    # PRESERVING: it makes separators irrelevant, NOT token order, so
+    # "illusions coverage test" still does not match test-coverage-illusions.
+    cat_norm = _norm_separators(cat_lower)
+
     # Strategy 1: Substring — category in key/summary/topic (bidirectional)
     for key, node in nodes.items():
         key_lower = key.lower()
         summary = str(node.get("summary", "")).lower()
         topic = str(node.get("topic", key)).lower()
 
-        if key_lower == cat_lower:
+        if key_lower == cat_lower or _norm_separators(key_lower) == cat_norm:
             # Exact key match (strongest)
             matched.append((key, node))
             matched_keys.add(key)

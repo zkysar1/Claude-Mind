@@ -39,15 +39,28 @@
 # unreadable. Per-agent failures are isolated: one bad agent does not abort the
 # rest, and the exit code still reports that something failed.
 #
-# --only <a.yaml[,b.jsonl]> narrows the pull to those continuity files and skips
-# the temp/ sweep. Names are matched against the continuity set, so --only can
-# never widen the pull. Use it for a targeted refresh: a full sweep is ~59s/agent
-# (904 files, measured on cc-04), i.e. ~5min fleet-wide — fine for /start, far
-# too slow for an interactive dashboard that needs one file per agent.
+# --only <a.yaml[,b.jsonl]> narrows the pull to those continuity files. Names are
+# matched against the continuity set, so --only can never widen the pull. Use it
+# for a targeted refresh when you want ONE file rather than the ~17-object
+# continuity set.
+#
+# --with-temp () opts INTO the temp/ working-doc sweep, which is OFF by
+# default. It is off because temp/ is NOT continuity-tier — session-manifest.yaml
+# does not list it — yet sweeping it made this command's cost scale with scratch
+# population instead of with the continuity set, and pushed it past its own
+# RT_CURL_TIMEOUT ceiling exactly when it had work to do. Measured cc-04
+# (uname -r 6.8.0-136-generic, own-cloud, live fleet, 2026-08-02): default-on
+# 164.6s / scanned=1590 / pulled=125, of which just 2 were continuity files and
+# 123 were temp probe leftovers from closed goals. Prior readings 1054/95.4s
+# (cc-03) and 904/59s (cc-04) show the ceiling re-eroding as temp/ grows, which
+# is why raising RT_CURL_TIMEOUT was rejected as the fix. Cost of the default:
+# a machine-moved agent does not auto-resume its temp/ docs; pass --with-temp to
+# fetch them (nothing is deleted — the objects stay in S3).
 #
 # Usage: bash core/scripts/owncloud-pull.sh [--agent <name>]
 #        bash core/scripts/owncloud-pull.sh --all-agents
 #        bash core/scripts/owncloud-pull.sh --all-agents --only pending-questions.yaml
+#        bash core/scripts/owncloud-pull.sh --agent <name> --with-temp
 set -euo pipefail
 
 _RUNTIME_SELF="$(cd "$(dirname "$0")" && pwd)"
@@ -57,11 +70,13 @@ CORE_ROOT="$PROJECT_ROOT/core"
 AGENT=""
 ALL_AGENTS=""
 ONLY=""
+WITH_TEMP=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --agent) AGENT="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
         --all-agents) ALL_AGENTS=1; shift;;
         --only) ONLY="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
+        --with-temp) WITH_TEMP=1; shift;;
         *) echo "[owncloud-pull] unknown arg: $1" >&2; exit 2;;
     esac
 done
@@ -199,6 +214,7 @@ print("\n".join(sorted((d.get("agent_status") or {}).keys())))' 2>/dev/null || t
 _do_call() {
     local _q="agent=$(rt_url_encode "$1")"
     [ -n "$ONLY" ] && _q="$_q&only=$(rt_url_encode "$ONLY")"
+    [ -n "$WITH_TEMP" ] && _q="$_q&with_temp=1"
     rt_call POST /v1/admin/owncloud-pull --query "$_q"
 }
 
@@ -218,6 +234,41 @@ _pull_one_agent() {
     local _a="$1" _rc=0
     RESPONSE="$(_do_call "$_a")" || _rc=$?
     if [ "$_rc" = "3" ]; then
+        # rc=3 CONFLATES "no daemon" with "request exceeded RT_CURL_TIMEOUT":
+        # _runtime.sh:855 returns 3 for connection-refused, DNS failure AND
+        # timeout alike, and curl's own stderr is discarded by 2>/dev/null
+        # (guard-114), so the caller cannot tell which happened. Retrying a
+        # TIMEOUT is never right — the request was not lost, it was slow, so the
+        # retry re-issues the same slow sweep for another full ceiling AND
+        # autospawns against a HEALTHY daemon, which is the orphan hazard
+        # _runtime.sh:52-55 names.
+        #
+        # Measured (, cc-03, 2026-08-02): RT_CURL_TIMEOUT=5 took
+        # 20.2s wall — 4x the ceiling — decomposing as 5s + ~10s autospawn + 5s.
+        # At the 90s default that is ~190s of TOTAL SILENCE before the caller's
+        # rt_no_daemon_error can print its (accurate) message, so an observer
+        # who kills at 120s sees ZERO BYTES and reads a timeout as a silent
+        # hang. That is the whole of the reported symptom, on three boxes.
+        #
+        # Probe first (guard-597: never declare "unreachable" without a fast
+        # health check). A reachable daemon means this was a timeout, so return
+        # immediately and let the caller's rt_no_daemon_error print the correct
+        # diagnostic at ~1x the ceiling instead of ~2x. Only a genuinely-absent
+        # daemon is worth respawning, which is the case autospawn is FOR.
+        # Return 4, NOT 3 — the probe has just answered the question rc=3
+        # conflates, and throwing that answer away is what let ONE slow agent
+        # abort a whole fleet sweep (). The two cases need OPPOSITE
+        # dispositions in fleet mode: a healthy-but-slow daemon is this agent's
+        # problem (isolate, count, continue), while a genuinely absent one is
+        # every agent's problem (nothing later in the roster can succeed, so
+        # abort). Both single-agent call sites route 4 to rt_no_daemon_error
+        # exactly as they routed 3, and rt_no_daemon_error re-probes rt_is_up
+        # itself and prints the accurate "REACHABLE but exceeded
+        # RT_CURL_TIMEOUT" diagnostic — so single-agent behaviour is byte-for-
+        # byte unchanged and only the fleet loop gains a branch.
+        if rt_is_up; then
+            return 4
+        fi
         if rt_try_autospawn; then
             _rc=0
             RESPONSE="$(_do_call "$_a")" || _rc=$?
@@ -239,7 +290,20 @@ if [ -n "$ALL_AGENTS" ]; then
         _pull_one_agent "$_fa" || _arc=$?
         case $_arc in
             0) ;;
-            3) rt_no_daemon_error "owncloud-pull.sh";;  # no daemon: fatal for all, not just one
+            # 3 = genuinely ABSENT daemon (rt_is_up said no AND autospawn could
+            # not recover it). Fatal for all: nothing later in the roster can
+            # succeed either, so continuing would print N identical failures and
+            # bury the one message that matters.
+            3) rt_no_daemon_error "owncloud-pull.sh";;
+            # 4 = this agent TIMED OUT against a daemon rt_is_up confirmed
+            # healthy. Isolated, like every other per-agent failure. Slow is the
+            # EXPECTED case, not the exotic one —  measured 84.7-95.4s
+            # per agent against a 90s ceiling — so before  this was the
+            # ordinary way a sweep died partway down a sorted roster, always
+            # leaving the same tail unrefreshed, which is precisely the fleet
+            # blindness  exists to prevent.
+            4) echo "[owncloud-pull] agent=$_fa TIMED OUT (daemon reachable; request exceeded RT_CURL_TIMEOUT=${RT_CURL_TIMEOUT:-?}s) — isolated, continuing roster" >&2
+               agents_failed=$((agents_failed + 1)); fleet_rc=1; continue;;
             *) echo "[owncloud-pull] agent=$_fa FAILED (rc=$_arc; detail on stderr above)" >&2
                agents_failed=$((agents_failed + 1)); fleet_rc=1; continue;;
         esac
@@ -295,7 +359,11 @@ _pull_one_agent "$AGENT" || rc=$?
 case $rc in
     0) ;;  # fall through to summary
     2) echo "[owncloud-pull] daemon returned an error (detail on stderr above)" >&2; exit 1;;
-    3) rt_no_daemon_error "owncloud-pull.sh";;
+    # 3 (absent) and 4 (timeout, daemon healthy) BOTH route here, deliberately.
+    # rt_no_daemon_error re-probes rt_is_up and prints the branch-correct
+    # diagnostic itself, so single-agent output and exit code are unchanged by
+    # the  split — only the fleet loop distinguishes them.
+    3|4) rt_no_daemon_error "owncloud-pull.sh";;
     *) echo "[owncloud-pull] unexpected rc=$rc" >&2; exit "$rc";;
 esac
 

@@ -222,6 +222,32 @@ def test_guard_default_and_known_fields_carry_bitemporal_both_mirrors():
                 "it would 400 as an unknown field")
 
 
+def test_guard_known_fields_carry_encoded_by_both_mirrors():
+    """ — the writing-agent stamp, on the same in-sync contract.
+
+    Unlike the bitemporal pair above, `encoded_by` is allowlisted in the
+    EXPLICIT set rather than reached through GUARD_DEFAULT_FIELDS: a default
+    would backfill a null onto every historical guardrail the next time any
+    path rewrote the store, and that goal's contract is that prior rows are
+    untouched. So it needs its own mirror assertion — the derived-from-defaults
+    one above cannot cover it.
+
+    The daemon writes this field on every guardrail append. A CLI mirror that
+    omits it means the two validators disagree about what a valid guardrail is,
+    which is the `displaced_from` failure shape: an unallowlisted field does not
+    merely go unrecognized, it 400s every subsequent write to the records that
+    carry it. No production caller reaches the CLI validator today; this test is
+    what keeps the mirror honest if one returns.
+    """
+    for name, mod in (("daemon", SR), ("cli", _rb)):
+        assert "encoded_by" in mod.GUARD_KNOWN_FIELDS, (
+            f"{name} GUARD_KNOWN_FIELDS missing encoded_by -- guard writes "
+            "carrying the append-time agent stamp would 400 as an unknown field")
+        assert "encoded_by" not in mod.GUARD_DEFAULT_FIELDS, (
+            f"{name} GUARD_DEFAULT_FIELDS gained encoded_by -- defaults are "
+            "applied on rewrite, which would backfill historical records")
+
+
 def test_validate_bitemporal_helper_present_both_mirrors():
     assert hasattr(SR, "_validate_bitemporal")
     assert hasattr(_rb, "_validate_bitemporal")

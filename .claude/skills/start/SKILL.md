@@ -20,7 +20,23 @@ USER-ONLY COMMAND. Claude must NEVER invoke this skill.
 /start <agent-name> --mode reader      # Read-only knowledge access
 /start <agent-name> --mode assistant   # User-directed learning
 /start <agent-name> --mode autonomous  # Full perpetual loop (same as no flag)
+/start <agent-name> --reducer-only     # Refuse the automatic second-body join on rc=4
 ```
+
+The body role is DERIVED, not declared (user directive 2026-08-03 — the v1
+explicit `--body worker` flag was judged needless cognitive load). A bare
+`/start <agent-name>` asks the DDB runner-claim acquire: rc=4 (a live reducer
+holds the claim from another machine) routes this box into the CW cross-box
+worker sequence AUTOMATICALLY, with a loud announcement naming the holder —
+the same rule the same-box RUNNING branch has always used to derive the
+worker role. With no live peer, this box simply becomes the reducer. One rule
+everywhere: `/start <agent>` runs the agent; the framework picks the body
+role. There is deliberately NO explicit body flag — derivation is the ONLY
+path (user directive 2026-08-03: exactly one way of doing things; the interim
+`--body worker` flag was removed the same day derivation superseded it).
+`--reducer-only` refuses the auto-join and shows the holder-naming refusal
+instead — for the rare case where you intend to MOVE the reducer here and a
+temporary worker would be unwanted noise.
 
 On resume (agent already exists):
 ```
@@ -35,6 +51,8 @@ On resume (agent already exists):
 - `--mode <value>`: mode flag. Valid values: `reader`, `assistant`, `autonomous`. If omitted, default to `autonomous`. This default applies uniformly — including the Phase A-0 transplant-resume path, where a bare `/start <agent>` on a freshly-cloned agent resumes it autonomously, exactly like a bare `/start` on any IDLE agent. Pass `--mode reader` (or `assistant`) explicitly for the cautious first-boot-on-a-new-machine case.
 - `--recover`: recovery flag. Set `recover = true` if any argument is the literal string `--recover`. This flag triggers the crashed-runner cleanup in Step 0.7 below. Only meaningful when agent state is RUNNING; fails loud otherwise.
 - `--force`: force flag. Set `force = true` if any argument is the literal string `--force`. Bypasses the heartbeat-staleness precondition on `--recover` (emergency override for the "heartbeat fresh but runner is stuck" case). No effect outside recovery.
+- `--body <anything>`: REMOVED (2026-08-03 — same-day supersede of g-306-119-a's explicit flag; user directive: exactly one way, derivation). Any argument that is the literal `--body` (with or without a value) is a HARD ERROR with this exact explanation: "`--body` was removed — the body role is always DERIVED: a bare `/start <agent>` auto-joins as a worker whenever a live reducer holds the claim elsewhere (rc=4). Use `--reducer-only` to refuse the auto-join." Do NOT silently ignore it — old docs and muscle memory deserve the explanation, not a mystery no-op.
+- `--reducer-only`: set `reducer_only = true` when any argument is the literal string `--reducer-only`. Consumed at exactly ONE place: the ACQUIRE_RC=4 branch of the autonomous IDLE flow below, where it REFUSES the automatic worker-join and displays the holder-naming refusal instead. Use it when the intent is to MOVE the reducer to this box (/stop on the holder, then /start here) and a temporary worker would be unwanted noise.
 - `--override-output-style <justification>`: override flag for the Step 0.6 + C7.7 autonomous+Explanatory gate. When present with a non-empty justification string, Step 0.6 lets the autonomous mode proceed, and C7.7 passes the same value to `output-style-gate.sh --override` for audit logging. The justification is echoed to `world/output-style-overrides.jsonl`.
 
 The flag parser must run flag extraction BEFORE positional extraction so `/start --recover` (no agent name) binds to the current session's agent rather than being misinterpreted as `/start <agent-name=--recover>`.
@@ -312,6 +330,42 @@ or `/start <agent-name> --mode assistant`
 
 **Worker Body Activation Sequence:**
 
+W-pre. **Ex-Worker Same-Terminal Guard** (g-306-210 — the RUNNING-branch half of
+    Step 0-pre2 below; that guard's prose already claims to be mode-wide, but it
+    is placed in the IDLE branch and so never reached this path).
+
+    A SID that previously ran as a Worker Body still has its fork file, because
+    the fork survives wind-down BY DESIGN (0-pre2 explains why). Re-activating
+    the SAME terminal as a worker destroys the earlier Body's unmerged
+    divergence TWICE over, and both writes are silent:
+      - W0.4 `body-manifest.sh write` is **idempotent on `body_state` — a
+        re-write RESETS the Body to `active`** (`body-manifest.py`
+        `write_manifest` docstring) and replaces `forked_wm_hash` with the new
+        fork's. The crashed Body's state record is gone.
+      - W1's `cp` is unconditional and overwrites the fork file itself.
+    After both, `cleanup-stale-bindings.sh::_preserve_unmerged_body_wm` can no
+    longer reclaim anything: it keys its skip on `body_state == merged`, so it
+    happily stages a WM that is now the NEW fork, against a hash that no longer
+    describes the divergence it was meant to protect.
+
+    **This step must run BEFORE W0** — not at W1 as first proposed. A refusal is
+    only side-effect-free when it fires before the destructive write (guard-1813);
+    placed at W1 it would fire *after* W0.4 had already reset the manifest.
+
+    Bash: `test -f "agents/<agent-name>/sessions/$MIND_SID/working-memory.yaml" && echo "EX_WORKER_FORK_PRESENT" || echo "no-fork"`
+
+    IF output is `EX_WORKER_FORK_PRESENT`: STOP. Do NOT proceed to W0. Display
+    the same fresh-terminal message as 0-pre2.
+
+    Refuse rather than stage-then-re-fork, for 0-pre2's stated reason: staging
+    another Body's WM from inside a mislabeled session is a reducer-only
+    operation performed by a non-reducer, with unmerged divergence as the stake.
+    A fresh terminal has a fresh SID, no fork file, and reaches the same worker
+    activation with nothing at risk — and the existing Body is reclaimed on its
+    own schedule by the cleanup sweep's preserve path.
+
+    IF output is `no-fork`: continue to W0.
+
 W0. **Bind this session** (worker variant — MUST NOT touch `running-session-id` or
     `latest-session-id`; those are reducer-owned):
 
@@ -460,6 +514,34 @@ DONE.
 The observer session coexists with the autonomous loop. It does NOT write to
 agent-state, agent-mode, persona-active, or running-session-id.
 
+0-pre. **Ex-Worker Same-Terminal Guard** (g-306-210 — the observer half of Step
+   0-pre2 below; 0-pre2's own text says "Reader/assistant binds inherit the same
+   mislabel, so the refusal is mode-wide", but it sits in the IDLE branch and a
+   reader/assistant bind taken while the agent is RUNNING never reached it.
+   guard-530 is this exact shape: verify a per-session predicate against EVERY
+   session mode it can encounter.)
+
+   "Observers never fork a WM" is true of what an observer WRITES and says
+   nothing about what it INHERITS. `bash-agent-inject.py` keys `BODY_ROLE=worker`
+   + `BODY_WM_PATH` on the fork file's EXISTENCE, not on this session's role, so
+   an observer binding on an ex-worker SID is mislabeled a worker for its whole
+   lifetime and every `wm-*.sh` write it makes lands in the dead Body's fork.
+   Step 0.4 then writes `--role observer`, which RESETS that manifest to
+   `role: observer` / `body_state: active` / `forked_wm_hash: null` — so the
+   cleanup sweep's preserve path later stages a fork with no hash sidecar, and
+   `body-merge` takes its documented degraded branch (no hash → the
+   never-diverged short-circuit is skipped, so an orphan merges as if divergent)
+   with observer scribble mixed in. Read-only in intent, corrupting in effect.
+
+   Bash: `test -f "agents/<agent-name>/sessions/$MIND_SID/working-memory.yaml" && echo "EX_WORKER_FORK_PRESENT" || echo "no-fork"`
+
+   IF output is `EX_WORKER_FORK_PRESENT`: STOP. Do NOT proceed to Step 0. Display
+   the same fresh-terminal message as 0-pre2. Placement before Step 0 is
+   load-bearing for the same reason as W-pre (guard-1813): the manifest reset at
+   Step 0.4 is the destructive write, so a refusal after it protects nothing.
+
+   IF output is `no-fork`: continue to Step 0.
+
 0. **Bind session** (observer variant — MUST NOT touch `agents/<agent-name>/session/latest-session-id`):
 
    Bash: `if [ -z "$MIND_SID" ]; then echo "ERROR:EMPTY_MIND_SID"; exit 1; fi; bash core/scripts/sid-collision-check.sh "<agent-name>" "$MIND_SID" || { echo "ERROR:SID_COLLISION"; exit 2; }; bash core/scripts/session-binding-write.sh --sid "$MIND_SID" --agent "<agent-name>" --mode "<target-mode>" --retire-legacy >/dev/null && echo "BOUND:$MIND_SID" && printf '\n╔════════════════════════════════════════════════════════════╗\n║                                                            ║\n║    ✓  RACE_WINDOW_CLOSED                                   ║\n║       Safe to /start another agent in another terminal     ║\n║                                                            ║\n╚════════════════════════════════════════════════════════════╝\n\n'`
@@ -572,6 +654,61 @@ agent-state, agent-mode, persona-active, or running-session-id.
      breaker has tripped per `stop_checkpoint.py` MAX_RESUME_ATTEMPTS): continue
      to Step 0 normally.
 
+0-pre2. **Ex-Worker Same-Terminal Guard (msg-20260804-220643-alpha-5346)**
+
+   A session whose SID previously ran as a WORKER Body cannot cleanly bind
+   here in ANY mode — and must NEVER become the reducer. The per-SID fork
+   file `agents/<agent-name>/sessions/$MIND_SID/working-memory.yaml`
+   survives wind-down BY DESIGN (generalize-down gates re-merge on manifest
+   `body_state`, not file absence; the only unlink in body-merge is the
+   staged-copy set, a different file family), and `bash-agent-inject.py`
+   exports `BODY_ROLE=worker` + `BODY_WM_PATH` on that file's EXISTENCE for
+   EVERY Bash call in this session — the hook itself documents the hazard at
+   its export site. Proceeding to the IDLE→RUNNING flip would produce a
+   MISLABELED REDUCER that reports success: state flips RUNNING, the DDB
+   claim is acquired, "Agent resumed" prints — but reducer-only writes stay
+   suppressed and reducer WM writes land in the fork (measured live
+   2026-08-04, alpha on DESKTOP-O91DLK2, SID 301a45f2: `BODY_ROLE=worker`
+   verified in the live environment of the wound-down session). Reader/
+   assistant binds inherit the same mislabel, so the refusal is mode-wide.
+   **Mode-wide is a claim about SCOPE, not about this step's reach** — THIS
+   step guards only the IDLE branch. The two other binding paths carry their
+   own copy of the probe, placed ahead of their own first destructive write:
+   RUNNING-worker at `W-pre` and RUNNING-observer at `0-pre` (both g-306-210).
+   The UNINITIALIZED branch is deliberately UNGUARDED, and that covers BOTH of
+   its fork-capable paths — Phase A-0 transplant-resume and the cross-box worker
+   (which forks unconditionally: `write_manifest` sets `fork_needed = True`
+   whenever `reducer_sid == "remote"`). Neither can meet a pre-existing fork on
+   a FIRST bind, because reaching one requires a clone carrying a
+   `sessions/<SID>/working-memory.yaml` whose SID collides with a fresh
+   session's on the destination box, and SIDs are per-machine per-session. Every
+   SUBSEQUENT bind on a cross-box worker box lands in the IDLE branch — the box
+   stays IDLE by design and never writes `running-session-id` — so THIS step is
+   what guards the re-activation case there. Stated rather than built; if a
+   transplant is ever observed carrying live session dirs, this is the
+   assumption to revisit first.
+   The refusal is deliberate — there is NO safe in-place cleanup: deleting
+   the fork from inside the mislabeled session is a reducer-only operation
+   performed by a non-reducer, with unmerged divergence as the stake.
+
+   Bash: `test -f "agents/<agent-name>/sessions/$MIND_SID/working-memory.yaml" && echo "EX_WORKER_FORK_PRESENT" || echo "no-fork"`
+
+   IF output is `EX_WORKER_FORK_PRESENT`: STOP. Do NOT proceed to Step 0.
+   Display:
+   > ⚠ This terminal's session (SID `$MIND_SID`) previously ran as a WORKER
+   > Body for `<agent-name>`. Its fork file still exists, and the Bash hook
+   > keys `BODY_ROLE=worker` on that file for the lifetime of this session —
+   > so this session cannot become the reducer (or bind cleanly in any mode).
+   >
+   > Open a NEW terminal and run `/start <agent-name>` there — a fresh SID
+   > has no fork file. Any unmerged divergence from the worker run is safe:
+   > its `body-manifest.yaml` records the state, and a
+   > `closed-pending-merge` body is merged automatically at the next
+   > reducer consolidation.
+   DONE.
+
+   IF output is `no-fork`: continue to Step 0.
+
 0. **Rebind Agent to Session**
 
    Bash: `if [ -z "$MIND_SID" ]; then echo "ERROR:EMPTY_MIND_SID"; exit 1; fi; bash core/scripts/sid-collision-check.sh "<agent-name>" "$MIND_SID" || { echo "ERROR:SID_COLLISION"; exit 2; }; bash core/scripts/session-binding-write.sh --sid "$MIND_SID" --agent "<agent-name>" --mode "<target-mode>" --retire-legacy >/dev/null && echo "BOUND:$MIND_SID" && printf '\n╔════════════════════════════════════════════════════════════╗\n║                                                            ║\n║    ✓  RACE_WINDOW_CLOSED                                   ║\n║       Safe to /start another agent in another terminal     ║\n║                                                            ║\n╚════════════════════════════════════════════════════════════╝\n\n'`
@@ -679,6 +816,18 @@ agent-state, agent-mode, persona-active, or running-session-id.
    (the same-machine crash-restart case) — the manifest baseline gates every
    overwrite. Under the local backend it is a clean no-op.
 
+   Scope: the CONTINUITY SET ONLY (~17 objects, enumerated from
+   session-manifest.yaml). It does NOT sweep `agents/<agent>/temp/`, which is not
+   continuity-tier — the manifest does not list it. It used to, and that made this
+   step's cost scale with scratch population instead of the manifest, pushing it
+   past its own RT_CURL_TIMEOUT ceiling exactly in the machine-move case it exists
+   for: measured cc-04 2026-08-02, 164.6s / scanned=1590 / pulled=125 of which
+   only 2 were continuity; after, 1.7s / scanned=17 (g-115-4574). A machine-moved
+   agent therefore does not auto-resume its temp/ working docs — pass
+   `--with-temp` to fetch them (they are untouched in S3). Acceptable because
+   durable records may never point into temp/ (guard-1373) and box-dependent
+   temp-citation dangling is already ratified in artifact-reference-integrity.md.
+
    Placement rationale: runs for ALL modes after the binding (Step 0) and
    mode-set (Step 2) but while state is still IDLE — so it is OUTSIDE the
    autonomous "nothing stoppable between RUNNING and /boot" critical section
@@ -750,6 +899,187 @@ agent-state, agent-mode, persona-active, or running-session-id.
      `heartbeat_at` and defeats the acquire's §5 stale-lock-break — pinning this
      /start at rc=4 on its own stale claim. See the heartbeat-tick step just
      before `session-state-set.sh RUNNING` below.)
+   - Bash: `if [ -z "$MIND_SID" ]; then echo "ERROR:EMPTY_MIND_SID"; exit 1; fi; RUNNER_TOKEN=$(py -3 -c "import uuid;print(uuid.uuid4())" 2>/dev/null || python3 -c "import uuid;print(uuid.uuid4())" 2>/dev/null); [ -n "$RUNNER_TOKEN" ] || { echo "ERROR:RUNNER_TOKEN_GEN_FAILED"; exit 3; }; AGENT_STATE_DIR="agents/<agent-name>/session"; mkdir -p "$AGENT_STATE_DIR" && echo "$MIND_SID" > "$AGENT_STATE_DIR/running-session-id.tmp" && mv "$AGENT_STATE_DIR/running-session-id.tmp" "$AGENT_STATE_DIR/running-session-id" && echo "$MIND_SID" > "$AGENT_STATE_DIR/latest-session-id.tmp" && mv "$AGENT_STATE_DIR/latest-session-id.tmp" "$AGENT_STATE_DIR/latest-session-id" && echo "$RUNNER_TOKEN" > "$AGENT_STATE_DIR/runner-token.tmp" && mv "$AGENT_STATE_DIR/runner-token.tmp" "$AGENT_STATE_DIR/runner-token" && echo "RUNNER_TOKEN=$RUNNER_TOKEN"`
+     (Canonical runner-claim: writes THREE files atomically — `running-session-id`, `latest-session-id`, and `runner-token` — into `agents/<agent-name>/session/`. The Phase 2.5.D `agents/` parent prefix MUST be in the heredoc path; without it, the writes land at `agents/<agent-name>/session/` at PROJECT_ROOT (the 2026-05-19 bravo/ cruft incident — the L1 hook only gates Write/Edit, not Bash heredoc writes, so a missing `agents/` prefix silently creates a directory at the wrong root). The first two files hold the Claude Code SID (routing identity used by stop-hook). The third is a FRAMEWORK-OWNED UUID4 (uniqueness identity) — protects against Claude Code reusing a session_id across windows via `claude --continue` / `--resume`. With the token, every BLOCK and watchdog event records the runner-instance identity, so a SID-collision shows up as "same SID, different runner-token" in `core/logs/stop-hook.log` and watchdog events instead of silent corruption. The 2026-05-12 cross-binding incident was invisible to forensics without this signal. DO NOT split these writes into separate Bash commands — the triple-write is the atomic unit. DO NOT remove the `RUNNER_TOKEN_GEN_FAILED` halt; without a token, the loop runs with no uniqueness anchor. Per rb-323/guard-403, observer-paired signals MUST be seeded BEFORE the state-set RUNNING below — same race rb-323 identified for heartbeat-tick. If RUNNER_TOKEN_GEN_FAILED here, state stays IDLE (clean retry); if state-set ran first, state would be RUNNING with no SID files and Path B would have to recover.)
+
+     **HALT ON RUNNER_TOKEN_GEN_FAILED** — if output contains `ERROR:RUNNER_TOKEN_GEN_FAILED`, STOP. Both `py -3` and `python3` failed to generate a UUID. Display to the user:
+     > Cannot start agent `<agent-name>`: the framework-owned runner-token could not be generated (Python unavailable). Check that `py -3` or `python3` works; the runner-token is required for SID-collision detection.
+
+   - **DDB runner-claim acquire (single-runner lifecycle, design §4).** Fires HERE —
+     immediately after the triple-write above, and BEFORE every shared or synced
+     mutation below — because the acquire's ONLY dependency is the runner-token the
+     triple-write just produced, and a refusal must leave no trace a peer can observe.
+     Until g-115-4653 it sat four steps lower (below body-manifest, the stale-file
+     `rm -f`, the loop-active clear, and the `wm-set.sh session_start` seed), and both
+     `team-state-update.sh` writes ran ABOVE the triple-write — so an rc=4 refusal on
+     box B had ALREADY blanked the LIVE box-A runner's `current_focus`, reset its
+     `session_ended`, and overwritten the continuity WM `session_start`. A start that
+     correctly refused to displace a running peer still corrupted it on the way out.
+     Fixing this needed BOTH moves: hoisting the acquire alone would not have helped,
+     because the two team-state writes preceded even the triple-write the acquire
+     depends on. Every step now above this point writes only `sync_tier: machine_local`
+     session files (`core/config/session-manifest.yaml`) — nothing above describes this
+     runner to a peer.
+     Bash: `MIND_AGENT=<agent-name> bash core/scripts/runner-claim.sh acquire --agent <agent-name>; echo "ACQUIRE_RC=$?"`
+     (Cross-machine half of single-runner enforcement: a conditional DDB IDLE->RUNNING
+     claim using the runner-token from the triple-write above. Under
+     STORAGE_BACKEND=own-cloud the daemon does the real DDB CAS; on any other backend
+     runner-claim.sh no-ops (exit 0). **ACQUIRE_RC=4** means a peer machine holds a
+     live DDB claim for `<agent-name>`. It BRANCHES on `reducer_only` (Step 0.5):
+     either way, do NOT proceed to any step below in THIS branch — `agent-state`
+     stays IDLE and nothing shared or synced has been touched yet.
+
+     **ACQUIRE_RC=4 + `reducer_only` → HALT and display the refusal.**
+     **ACQUIRE_RC=4 otherwise →
+     the CW sequence below (cross-box worker). The body role is DERIVED, not
+     declared (user directive 2026-08-03): rc=4 IS the detection that a live
+     reducer exists elsewhere — the acquire auto-breaks stale claims, so rc=4 ⇒
+     the holder heartbeated within OWNERSHIP_STALE_SECONDS. Same one rule as the
+     same-box RUNNING branch, which has always derived the worker role without a
+     flag. CW0's status read doubles as the LOUD derivation announcement —
+     render it as:**
+
+     > Reducer for `<agent-name>` is alive on `<machine_id>` (heartbeat <age>s) —
+     > joining as a SECOND BODY from this box. This worker executes goals; the
+     > reducer keeps encode/reflect/consolidate. To move the reducer here
+     > instead: /stop <agent-name> on <machine_id>, then /start here. To refuse
+     > the auto-join next time: /start <agent-name> --reducer-only.
+
+     The `--reducer-only` refusal must NAME THE HOLDER, not just assert one exists — "another machine"
+     with no machine_id leaves the user unable to act on any of the options it then
+     offers. Read the holder identity first (rc is already known; this is purely for
+     the message, so it is fail-open — on any error print the message without the
+     holder line rather than suppressing the refusal):
+     Bash: `MIND_AGENT=<agent-name> bash core/scripts/runner-claim.sh status --agent <agent-name>`
+     (Prints e.g. `status: LIVE (backend=own-cloud) — 'echo' is RUNNING on 'cc-03',
+     heartbeat 520s old (threshold 3900s)`. Landed g-306-118-b; it is token-free by
+     contract precisely so a box that holds no runner-token for this agent — which is
+     every box in this situation — can still read the holder.)
+
+     > Cannot start `<agent-name>` in autonomous mode — another machine holds a live
+     > runner claim (DDB session-lock).
+     > Holder: <machine_id>, heartbeat <age>s old (threshold <stale_after>s).
+     > `--recover --force` will NOT help from this box: Step 0.7 precondition 1
+     > requires the LOCAL `agent-state` to read RUNNING, and `agent-state` is
+     > `sync_tier: machine_local`, so on THIS box it reads IDLE and recovery exits
+     > "Nothing to recover". The RUNNING-observer branch is unreachable cross-box for
+     > the same reason — it reads local state that the owning box's RUNNING never
+     > reaches.
+     > The three real options:
+     >   /start <agent-name>                 — bare re-issue auto-joins as a SECOND
+     >                                          body from this box (executes goals;
+     >                                          the reducer keeps
+     >                                          encode/reflect/consolidate)
+     >   /stop <agent-name> on <machine_id>  — then re-issue /start here to move the
+     >                                          reducer to this box
+     >   wait out OWNERSHIP_STALE_SECONDS (~65 min) and re-issue /start, which then
+     >   reclaims the stale claim via the acquire's §5 stale-lock-break.
+
+     (CORRECTION, g-306-119-a: this message previously said the "RUNNING-observer /
+     Worker-Body branch is unreachable cross-box". That was true when written and is
+     now HALF false — the Worker-Body IS reachable cross-box, and a bare `/start`
+     (role derivation, 2026-08-03; previously the explicit `--body worker`) is
+     exactly how. The observer half remains true and is kept. Left uncorrected it
+     would be the worst kind of stale text: an authoritative-sounding sentence
+     telling the user the feature they were just offered does not exist.)
+
+     Any OTHER non-zero rc (1 = daemon/DDB error) is FAIL-OPEN: log and PROCEED — a
+     transient DDB hiccup must not block a legitimate start.)
+
+   - **CW: Cross-box worker activation** (ACQUIRE_RC=4 unless `reducer_only`; design
+     `world/docs/cross-box-two-bodies-design.md` §2). Skip this whole block on every
+     other path. The daemon was already ensured earlier in the IDLE flow, so a cold
+     box is fine here.
+
+     **CW-pre — delete ALL THREE reducer-shaped files FIRST, before anything else.**
+     (The design doc §1 says "delete the just-written runner-token"; deleting all
+     three is strictly stronger and is what the design's own stated property
+     actually requires — the Gate-0 mismatch it relies on keys on
+     `running-session-id`, not on the token.) The
+     triple-write above already created `running-session-id`, `latest-session-id`
+     and `runner-token` on this box. A worker box must carry NONE of them: with no
+     `running-session-id`, stop-hook Gate 0 always mismatches (turn-ends route to
+     the body-close path), `is_reducer()` is false, and recovery-gate is indifferent
+     because `agent-state` stays IDLE. This is the first action in the branch
+     specifically so an interrupt anywhere later leaves the box NON-reducer-shaped —
+     the safe direction. Removing all three is what makes "the worker is invisible to
+     box-B recovery machinery" true rather than aspirational.
+     Bash: `AGENT_STATE_DIR="agents/<agent-name>/session"; rm -f "$AGENT_STATE_DIR/running-session-id" "$AGENT_STATE_DIR/latest-session-id" "$AGENT_STATE_DIR/runner-token"; echo "CW_PRE_CLEARED"`
+     (The `agents/` prefix is load-bearing here for the same reason as the
+     triple-write above — dropping it leaves the agent name as the FIRST path
+     segment, which resolves at PROJECT_ROOT and silently deletes nothing.
+     `rm -f` so a partially-written triple-write cannot wedge the branch.)
+
+     **CW0 — display holder identity** (informational; rc=4 already proved liveness):
+     Bash: `MIND_AGENT=<agent-name> bash core/scripts/runner-claim.sh status --agent <agent-name>`
+     Show the user which box holds the reducer they are joining.
+
+     **CW0.5 — bind the session.** Same as the reducer path's W0:
+     Bash: `bash core/scripts/session-binding-write.sh --sid "$MIND_SID" --agent <agent-name> --mode autonomous --retire-legacy`
+     Then the collision gate — note it takes POSITIONAL args, `<agent> <sid>`, and
+     has NO flag form:
+     Bash: `bash core/scripts/sid-collision-check.sh <agent-name> "$MIND_SID"; echo "SIDCOL_RC=$?"`
+     **HALT on an empty `$MIND_SID`, on `SIDCOL_RC=2` (collision — either
+     `ERROR:SID_COLLISION` cross-agent or `ERROR:SID_COLLISION_SAME_AGENT`), and on
+     `SIDCOL_RC=1` (script/usage error).** Only rc=0 continues. Treating rc=1 as
+     passable would convert a usage mistake into a silent bypass of the one gate that
+     stops two bodies sharing a unitKey — and rc=1 is exactly what a wrong arg shape
+     returns. Do not continue into a WM fork with an ambiguous unitKey: the SID IS the
+     unitKey, so a collision would make two bodies write one manifest and one forked
+     WM. The gate has no override flag by deliberate design — do not add one.
+     SCOPE NOTE — know what this gate can still see here. CW-pre just deleted
+     `running-session-id`, and the gate's SAME-AGENT branch short-circuits to rc=0
+     when that file is missing. So on a worker box the same-agent half is VACUOUS by
+     construction — which is correct (there is no local runner to stomp), but it means
+     rc=0 here attests only the CROSS-AGENT property: no OTHER agent's live runner is
+     bound to this SID. Do not read a pass as "no collision of any kind." The
+     same-agent risk this branch actually carries is two workers for the same agent on
+     the same box sharing a SID, which the gate cannot see and which the per-session
+     dir naming makes self-evident instead.
+
+     **CW1a — force-fresh the canonical WM from the shared store.** The fork must
+     start from the reducer's LATEST push, not this box's read-through cache:
+     Bash: `bash core/scripts/backend-cat.sh cat agents/<agent-name>/session/working-memory.yaml > agents/<agent-name>/session/working-memory.yaml.fresh && mv agents/<agent-name>/session/working-memory.yaml.fresh agents/<agent-name>/session/working-memory.yaml && echo "CW1A_FRESH_OK"`
+     (The `cat` SUBCOMMAND is required — `backend-cat.sh <path>` with no subcommand
+     exits 2 (usage). Verified live on this box: the subcommand form returns rc=0 and
+     74020 bytes; the bare form returns rc=2 and zero. Under own-cloud `cat` routes to
+     `read_authoritative_bytes`, a PURE to-memory read of the shared store that never
+     mutates the local mirror — which is exactly why the redirect+`mv` in the command
+     above is what actually refreshes the mirror; `cat` alone would print fresh bytes
+     and leave the stale file in place.
+     Under own-cloud the local tree is a read-through CACHE — a file this box has
+     never read does not materialize locally, and one it read hours ago is stale
+     (guard-980). Forking a stale mirror would hand the reducer a merge baseline that
+     never existed on either box, silently mis-attributing every counter delta.
+     Write-to-temp-then-`mv` so a failed fetch cannot truncate the local WM. If this
+     step fails, HALT — proceeding would fork from the stale cache, which is the one
+     outcome this step exists to prevent.)
+
+     **CW1b — write the worker body manifest** (forces the fork):
+     Bash: `bash core/scripts/body-manifest.sh write --sid "$MIND_SID" --agent <agent-name> --role worker --reducer-sid remote`
+     (`--reducer-sid remote` is a SENTINEL, not a SID — the reducer's SID is
+     UNOBTAINABLE from this machine (`running-session-id` is `sync_tier:
+     machine_local`, and the DDB row stores a runner-token, not a SID), and the CLI
+     rejects any other value rather than let a caller invent a plausible one. It
+     forces `fork_needed=true`, bypassing the local `running-session-id` read that
+     would otherwise decide FALSE here — CW-pre just deleted that file, and a worker
+     box never has one — and records `reducer_sid: remote`, `remote_body: true`,
+     `machine_id`, `forked_wm_hash`. The fork copies the fresh WM to
+     `sessions/$SID/working-memory.yaml` plus `forked-wm-baseline.yaml`; the
+     `BODY_WM_PATH` hook then routes every `wm-*.sh` write to the fork by the existing
+     unchanged mechanism.)
+
+     **CW2 — session telemetry** (fire-and-forget; identical idiom to W0.5 above,
+     including guard-165 — SID/agent/mode travel by ENV, never interpolated into the
+     Python source text):
+     Bash: `TSID="$MIND_SID" TAGENT="<agent-name>" TMODE="worker" py -3 -c 'import os,sys; sys.path.insert(0,"core/scripts"); from _session_telemetry import write_open; write_open(sid=os.environ["TSID"], agent=os.environ["TAGENT"], mode=os.environ["TMODE"], started_by="claude-code")' >/dev/null 2>&1 || true`
+     (`|| true` — telemetry must never abort an activation.)
+
+     **CW3** — `Skill(worker-loop)`. Do NOT set `agent-state` RUNNING, do NOT write
+     `running-session-id`/`runner-token`, do NOT touch the DDB claim, and do NOT run
+     `/boot`. State after CW3: `agent-state` IDLE, no reducer-shaped files on this
+     box, DDB untouched.
+
    - Bash: `MIND_AGENT=<agent-name> bash core/scripts/team-state-update.sh --field "agent_status.<agent-name>.current_focus" --value "\"\"" || true`
      (Clear stale current_focus from the previous session's shutdown — without this,
      a partner reading team-state.yaml sees the prior session's "session ended" or
@@ -759,7 +1089,11 @@ agent-state, agent-mode, persona-active, or running-session-id.
      first aspirations-state-update or aspirations-consolidate write populates
      current_focus with the first real completion. Fail-open with `|| true` so a
      team-state write failure never blocks the RUNNING transition — stderr is NOT
-     suppressed, so write errors surface.)
+     suppressed, so write errors surface. ORDERING (g-115-4653): this is the FIRST
+     shared/synced write in the sequence and MUST stay below the DDB acquire above.
+     It was previously the first write of the whole autonomous branch, so an rc=4
+     refusal blanked the LIVE owning box's focus before ever discovering it had lost
+     the claim.)
    - Bash: `MIND_AGENT=<agent-name> bash core/scripts/team-state-update.sh --field "agent_status.<agent-name>.session_ended" --value "false" || true`
      (Clear stale session_ended from the previous /stop — g-240-72. Without this,
      a partner reading team-state.yaml sees session_ended=true for a live agent
@@ -767,12 +1101,8 @@ agent-state, agent-mode, persona-active, or running-session-id.
      graceful exit; the field then persists until the next /start. We clear here
      instead of removing the field so the absence-vs-false distinction stays
      unambiguous to partner readers. Same fail-open semantics as current_focus
-     above — write failure must not block the RUNNING transition.)
-   - Bash: `if [ -z "$MIND_SID" ]; then echo "ERROR:EMPTY_MIND_SID"; exit 1; fi; RUNNER_TOKEN=$(py -3 -c "import uuid;print(uuid.uuid4())" 2>/dev/null || python3 -c "import uuid;print(uuid.uuid4())" 2>/dev/null); [ -n "$RUNNER_TOKEN" ] || { echo "ERROR:RUNNER_TOKEN_GEN_FAILED"; exit 3; }; AGENT_STATE_DIR="agents/<agent-name>/session"; mkdir -p "$AGENT_STATE_DIR" && echo "$MIND_SID" > "$AGENT_STATE_DIR/running-session-id.tmp" && mv "$AGENT_STATE_DIR/running-session-id.tmp" "$AGENT_STATE_DIR/running-session-id" && echo "$MIND_SID" > "$AGENT_STATE_DIR/latest-session-id.tmp" && mv "$AGENT_STATE_DIR/latest-session-id.tmp" "$AGENT_STATE_DIR/latest-session-id" && echo "$RUNNER_TOKEN" > "$AGENT_STATE_DIR/runner-token.tmp" && mv "$AGENT_STATE_DIR/runner-token.tmp" "$AGENT_STATE_DIR/runner-token" && echo "RUNNER_TOKEN=$RUNNER_TOKEN"`
-     (Canonical runner-claim: writes THREE files atomically — `running-session-id`, `latest-session-id`, and `runner-token` — into `agents/<agent-name>/session/`. The Phase 2.5.D `agents/` parent prefix MUST be in the heredoc path; without it, the writes land at `agents/<agent-name>/session/` at PROJECT_ROOT (the 2026-05-19 bravo/ cruft incident — the L1 hook only gates Write/Edit, not Bash heredoc writes, so a missing `agents/` prefix silently creates a directory at the wrong root). The first two files hold the Claude Code SID (routing identity used by stop-hook). The third is a FRAMEWORK-OWNED UUID4 (uniqueness identity) — protects against Claude Code reusing a session_id across windows via `claude --continue` / `--resume`. With the token, every BLOCK and watchdog event records the runner-instance identity, so a SID-collision shows up as "same SID, different runner-token" in `core/logs/stop-hook.log` and watchdog events instead of silent corruption. The 2026-05-12 cross-binding incident was invisible to forensics without this signal. DO NOT split these writes into separate Bash commands — the triple-write is the atomic unit. DO NOT remove the `RUNNER_TOKEN_GEN_FAILED` halt; without a token, the loop runs with no uniqueness anchor. Per rb-323/guard-403, observer-paired signals MUST be seeded BEFORE the state-set RUNNING below — same race rb-323 identified for heartbeat-tick. If RUNNER_TOKEN_GEN_FAILED here, state stays IDLE (clean retry); if state-set ran first, state would be RUNNING with no SID files and Path B would have to recover.)
-
-     **HALT ON RUNNER_TOKEN_GEN_FAILED** — if output contains `ERROR:RUNNER_TOKEN_GEN_FAILED`, STOP. Both `py -3` and `python3` failed to generate a UUID. Display to the user:
-     > Cannot start agent `<agent-name>`: the framework-owned runner-token could not be generated (Python unavailable). Check that `py -3` or `python3` works; the runner-token is required for SID-collision detection.
+     above — write failure must not block the RUNNING transition. Same g-115-4653
+     ordering constraint: shared/synced, so it MUST stay below the acquire.)
 
    - **Write Body manifest** (FORK-BODY reducer, Phase 1B — g-306-62 / g-330-03): record this
      autonomous session as the Reducer Body, AFTER the running-session-id claim above
@@ -812,19 +1142,6 @@ agent-state, agent-mode, persona-active, or running-session-id.
      autocompact boundary without a re-seed. /stop clears it explicitly
      via `wm-clear-identity.sh` in graceful-stop D4.5 — the ONE authorized
      clear site.)
-   - **DDB runner-claim acquire (single-runner lifecycle, design §4).**
-     Bash: `MIND_AGENT=<agent-name> bash core/scripts/runner-claim.sh acquire --agent <agent-name>; echo "ACQUIRE_RC=$?"`
-     (Cross-machine half of single-runner enforcement: a conditional DDB IDLE->RUNNING
-     claim taken just BEFORE the local state-set below, using the runner-token from the
-     triple-write above. Under STORAGE_BACKEND=own-cloud the daemon does the real DDB
-     CAS; on any other backend runner-claim.sh no-ops (exit 0). **HALT ON ACQUIRE_RC=4**:
-     a peer machine holds a live DDB claim for
-     `<agent-name>` — do NOT proceed to session-state-set RUNNING; state stays IDLE
-     (the observer-paired signals seeded above are harmless at IDLE). Display: "Cannot
-     start `<agent-name>` in autonomous mode — another machine holds a live runner
-     claim (DDB session-lock); stop the other runner or wait ~OWNERSHIP_STALE_SECONDS."
-     Any OTHER non-zero rc (1 = daemon/DDB error) is FAIL-OPEN: log and PROCEED — a
-     transient DDB hiccup must not block a legitimate start.)
    - Bash: `MIND_AGENT=<agent-name> bash core/scripts/heartbeat-tick.sh --bypass-state`
      (FIRST heartbeat — seeds `runner-heartbeat` mtime AND stamps team-state
      `last_active` NOW, and under own-cloud ALSO fires the DDB

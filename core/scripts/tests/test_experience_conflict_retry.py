@@ -42,7 +42,6 @@ suite named by the convention).
 """
 from __future__ import annotations
 
-import importlib
 import json
 import sys
 from pathlib import Path
@@ -56,12 +55,8 @@ for _p in (str(_SCRIPTS), str(_ROOT)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import _conflict_fixture as CF  # noqa: E402  (shared conflict seam, )
 from mind_api.src.endpoints import experience_write as EW  # noqa: E402
-
-
-def _fileops_mod():
-    """The CURRENT _fileops module object (sibling suites reload it)."""
-    return importlib.import_module("_fileops")
 
 
 class _Conflict(Exception):
@@ -123,27 +118,14 @@ class _StubBackend:
             f.write(json.dumps(record, ensure_ascii=True) + "\n")
 
 
-def _retry_globals():
-    """The namespace `_rmw_with_conflict_retry` actually reads at call time.
-
-    mind_api/src/file_locks.py binds the FUNCTION OBJECT once via `from _fileops
-    import _rmw_with_conflict_retry`. That function resolves `get_backend` and
-    `_conflict_backoff` from its own __globals__ — the _fileops module dict it
-    was DEFINED in — which is not reliably the dict importlib hands back after a
-    sibling suite reloads _fileops. Patching the wrong one lets `conflict_cls`
-    fall back to the real backend's empty-tuple type, `except conflict_cls`
-    matches nothing, and the injected _Conflict escapes: the conflict tests then
-    pass in isolation and fail in the full suite. Going through __globals__ is
-    exact and reload-proof (see the same note in
-    test_meta_yaml_conflict_retry.py / test_retrieve_bump_conflict_retry.py).
-    """
-    return EW.file_locks._rmw_with_conflict_retry.__globals__
-
-
 @pytest.fixture(autouse=True)
 def _no_backoff(monkeypatch):
-    """Retry sleeps would make these tests slow for no signal."""
-    monkeypatch.setitem(_retry_globals(), "_conflict_backoff", lambda *_: 0)
+    """Retry sleeps would make these tests slow for no signal.
+
+    Autouse, so it must stay separate from the `backend` fixture below (which
+    also zeroes backoff): tests that never request `backend` still need it.
+    """
+    monkeypatch.setitem(CF.retry_globals(), "_conflict_backoff", lambda *_: 0)
 
 
 @pytest.fixture()
@@ -169,19 +151,12 @@ def agent_dir(tmp_path):
 
 @pytest.fixture()
 def backend(monkeypatch):
-    be = _StubBackend()
-    # Three namespaces resolve get_backend on this path and are NOT guaranteed
-    # to be the same dict (see _retry_globals):
-    #   1. experience_write's own global — bound at import via `from
-    #      storage_backend import get_backend`, so patching storage_backend
-    #      alone is invisible to _read_jsonl / _append_record.
-    #   2. the retry primitive's __globals__ — where conflict_cls comes from.
-    #   3. the current _fileops module object — the lock path + atomic write.
-    monkeypatch.setattr(EW, "get_backend", lambda: be)
-    monkeypatch.setitem(_retry_globals(), "get_backend", lambda: be)
-    monkeypatch.setattr(_fileops_mod(), "get_backend", lambda: be, raising=False)
-    import storage_backend
-    monkeypatch.setattr(storage_backend, "get_backend", lambda: be)
+    # The namespace enumeration this used to hand-roll now lives once in
+    # _conflict_fixture.patch_conflict_backend (). EW is passed as an
+    # `extra` because experience_write binds get_backend in its OWN global at
+    # import (`from storage_backend import get_backend`), so patching
+    # storage_backend alone is invisible to _read_jsonl / _append_record.
+    be = CF.patch_conflict_backend(monkeypatch, _StubBackend(), EW)
     return be
 
 
@@ -574,3 +549,52 @@ def test_scope_wm_write_issues_no_backend_write(tmp_path):
     assert "refresh" not in read_code, (
         "_read_yaml now force-refreshes — WM has joined the fenced backend path "
         "and its write class must be re-derived (g-115-3719)")
+
+
+# ---------------------------------------------------------------------------
+#  — exhausting the retry cap must CLEAN UP, not just raise.
+#
+# test_add_reraises_when_retries_exhaust (above) proves the re-raise fires and
+# stops there. Proving an error path fires is not proving it cleans up. For
+# archive_goal the difference is a permanent wedge: it copy2's the trace to
+# `canonical` BEFORE the write, and the backend's ConflictError is not an
+# OSError, so before the fix it flew past `except OSError`, `_abort` never ran,
+# and the orphan .md stayed on disk. The pre-lock guard then returns 409
+# content_path_exists for that experience_id FOREVER (rb-2639 shape).
+# ---------------------------------------------------------------------------
+
+def test_archive_goal_conflict_exhaustion_leaves_no_orphan_md(agent_dir, backend):
+    """Exhaust the cap, then assert the canonical .md is ABSENT.
+
+    The two file assertions are the point; the status assertion alone would
+    pass against a bare `raise` that stranded the copy.
+    """
+    backend.fail_appends = CF.retry_globals()["_CONFLICT_RETRY_CAP"]  # every attempt conflicts
+    root = agent_dir.parent.parent
+    canonical = agent_dir / "experience" / "exp-g-115-1-aspirations-execute.md"
+    trace_src = root / "traces" / "new.md"
+    assert trace_src.exists(), "fixture precondition: the trace source must exist"
+
+    resp = EW.archive_goal(_ctx(agent_dir, _archive_goal_body(root)))
+
+    # 1. The conflict is a clean response, not an escaped exception.
+    assert resp.status == 409, \
+        "conflict escaped as an unhandled exception: {}".format(resp.body)
+    body_txt = resp.body.decode("utf-8") if isinstance(resp.body, bytes) else str(resp.body)
+    assert "write_conflict" in body_txt, \
+        "wrong error contract for an exhausted conflict: {}".format(body_txt)
+
+    # 2. THE CLEANUP PROOF — _abort ran and removed the copy.
+    assert not canonical.exists(), (
+        "orphan .md survived conflict exhaustion at {} — every later "
+        "archive_goal for this experience_id now 409s content_path_exists "
+        "forever (g-115-3837)".format(canonical))
+
+    # 3. The other half of _abort's stated contract: the caller's trace is intact,
+    #    so the operation is idempotent and the caller can retry ().
+    assert trace_src.exists(), \
+        "failed attempt consumed the caller's trace source — retry is now impossible"
+
+    # 4. No record landed, so the id is genuinely free for a retry.
+    assert [r["id"] for r in _live(agent_dir)] == ["exp-seed"], \
+        "a record landed despite every write attempt conflicting"

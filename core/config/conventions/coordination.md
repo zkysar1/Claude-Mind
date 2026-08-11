@@ -30,6 +30,29 @@ Scripts: `aspirations-claim.sh`, `aspirations-release.sh`, `aspirations-complete
 
 **Key rules:**
 - On claim conflict (exit non-zero): re-enter the selection loop, do not retry
+- **A claim is `claimed_by` + `claimed_at` + `claimed_by_sid`, and they travel as
+  ONE unit.** The sid distinguishes two live instances of the SAME agent — a
+  shape the fleet produces by design (one agent name on multiple boxes; observer
+  sessions coexisting with a live runner). Since g-306-132-c the cross-box merge
+  registers a conflict on same `claimed_by` + DIFFERENT `claimed_by_sid`, not
+  only on differing agent names, and resolves to the older `claimed_at`
+  (claimed_at tie → lexicographic agent, then sid; byte-commutative in both
+  operand orders). Before that fix `claimed_by_sid` was not merged at all, so a
+  record could carry one session's `claimed_by`/`claimed_at` beside another's sid.
+- **`aspirations-claim.sh` still keys exclusion on the AGENT NAME**, so a second
+  session of the same agent CLAIMS SUCCESSFULLY — nothing refuses it. The merge
+  fix is detective, not preventive: the loser learns it was displaced on its next
+  `stranded-claim-sweep.py` run (verdict `possible-displacement`), not at claim
+  time — and that verdict is AMBIGUOUS by construction: the execution diary it
+  reads is `sync_tier: continuity` (per-agent, S3-authoritative) with no session
+  id on entries, so it cannot separate "I was displaced" from "a peer instance
+  legitimately holds it". Treat it as a prompt to check, never a conclusion
+  (g-306-143). The pre-emptive signal is still `guard-1460`'s board read.
+- **If you are the LOSER of a claim conflict, ABORT — do NOT release.** After the
+  merge the claim belongs to the winner, who is alive and mid-execution;
+  releasing clears a live holder's claim and re-opens the goal to a third
+  instance. Abort is local, release is a write to state that is now someone
+  else's. (`rb-6503`.)
 - On infrastructure failure: release claim so other agent can attempt
 - Recurring goals: `complete-by` auto-clears claim for next cycle
 - Session end: release all held claims in handoff
@@ -106,6 +129,36 @@ After completing a world goal that involves code changes:
 Review is **asynchronous and non-blocking**. Goals are NOT held pending review.
 The reviewing agent picks up reviews during idle time, catching bugs faster than
 purely retroactive review without creating bottlenecks.
+
+### Independence Is At The MIND Level, Not The Session Level
+
+**The reviewing identity MUST differ from the executing identity by MIND KEY —
+the agent name — not merely by session id.** Under the Mind/Body split a single
+mind can run several Bodies concurrently (separate sessions, possibly separate
+boxes). Those Bodies share one `self.md`, one identity, one accumulated set of
+priors, and therefore one set of blind spots. Body B of agent A reviewing Body
+A's work is the same reviewer reading its own output through a different
+terminal: it satisfies "a different session looked at it" while delivering none
+of what the gate exists to buy.
+
+Concretely:
+
+- A review request is satisfiable ONLY by an agent whose name differs from the
+  executing goal's `claimed_by` / completing agent. A differing
+  `claimed_by_sid` alone does NOT satisfy it.
+- When no other mind is available, LEAVE the request open. A review gate that
+  auto-satisfies under scarcity reports coverage it does not have — the same
+  failure shape as a completeness tool counting what it declined to look at
+  (`guard-1760`). An unclaimed review request is honest; a same-mind review is
+  not.
+- This is a property of the GATE, so it binds every entry point: the async
+  review-request flow above, the Deep Review Protocol below, and any future
+  automated reviewer. A reviewer that cannot establish the executor's mind key
+  must treat independence as UNPROVEN and decline, not assume.
+
+The session id remains the right discriminator for *contention* questions (who
+holds a claim, which Body wrote a record). It is the wrong discriminator for
+*independence* questions. Do not reuse one for the other.
 
 ### Deep Review Protocol (Hypothesis-Driven Review)
 
@@ -335,7 +388,9 @@ journal.jsonl, experience.jsonl). Those use their own scripts.
 ## Session Boundary Protocol
 
 **At session end (consolidation/handoff):**
-1. Release all held world goal claims via `aspirations-release.sh`
+1. Release all held claims in BOTH queues via `aspirations-release.sh <goal-id> --source {source}`
+   (world-only was correct until g-306-238 gave agent-queue goals claims; see
+   `aspirations-consolidate/SKILL.md` Step 8.9 and g-306-258)
 2. Post session summary to coordination: `--type status`
 3. Include `held_claims: []` in `handoff.yaml`
 
@@ -826,8 +881,15 @@ bash core/scripts/team-state-init.sh
 # Mark agent in-flight on a goal (auto-stamps claimed_at)
 bash core/scripts/team-state-in-flight.sh --agent alpha --goal-id g-001-99 --title "short title" --phase 4
 
-# Clear the in_flight block when goal completes or releases
-bash core/scripts/team-state-clear-in-flight.sh --agent alpha
+# Clear the in_flight block when goal completes or releases.
+# --if-goal is an optional compare-and-swap: the row is cleared ONLY if its live
+# goal_id matches, re-checked inside the row lock. Prefer it whenever you are
+# clearing a row YOU set — in_flight is keyed by agent name with no sid, so the
+# unscoped form blanks whatever is present and can destroy a concurrent
+# sibling's live claim (guard-2474). Omit it only when you genuinely mean
+# "normalize whatever row is there" (retire, release, graceful stop).
+bash core/scripts/team-state-clear-in-flight.sh --agent alpha --if-goal g-001-99
+bash core/scripts/team-state-clear-in-flight.sh --agent alpha              # unconditional
 ```
 
 ### in_flight Field — Live Claim Snapshot
@@ -849,8 +911,9 @@ one to derive the other.
 |------|--------|--------|
 | Phase 4 claim, before board post | `aspirations-claim.sh` — **AUTOMATIC** (`_post_claim_effects`, g-115-3199) | `team-state-in-flight.sh --agent <self> --goal-id ... --title ... --phase 4`. Fires on every rc=0 claim, fail-open, deliberately ungated on `claimed_by`. This row named `aspirations-execute` (LLM pseudocode) until 2026-07-26. Verified that day: the setter had ZERO callers in the codebase, so every write depended on an LLM remembering the step, and execution was UNEVEN rather than uniformly absent — zeta stamped correctly while foxtrot never did (its `current_focus` sat frozen 2h+ on an already-yielded goal across six claims). Uneven is worse than absent for the three readers: a null `in_flight` is indistinguishable from "partner genuinely idle", so the select partner-claim filter, the `goal-pickup-coordination-check` uncommitted-collision probe, and `_cross_agent_attribution_filter`'s Source 1 silently mis-answer instead of failing loud. Covers `source==world` ONLY — agent-queue goals never invoke `aspirations-claim.sh`, so the loop digest's Phase-4 LLM-side `team-state-in-flight.sh` call remains their only stamp path and must NOT be deleted. On the world path that LLM call is now redundant-but-idempotent (same values re-written), not harmful. |
 | Phase 4 → 5 transition (optional) | `aspirations-execute` / `aspirations-verify` | re-run in-flight with `--phase 5` to surface progress |
-| Goal completion | `iteration-close.sh` | `team-state-clear-in-flight.sh --agent <self>` |
-| Goal release (failure / re-select) | `aspirations-execute` release path | `team-state-clear-in-flight.sh --agent <self>` |
+| Goal completion | `iteration-close.sh` do_verify Step 3 | `team-state-clear-in-flight.sh --agent <self> --if-goal "$GOAL_ID"` — SCOPED since g-306-161. `$GOAL_ID` cannot be empty here (do_verify refuses without `--goal`). The scoping does NOT weaken the idempotence blocked/skipped closes rely on: an already-released claim leaves no `in_flight` key, and the modifier returns on key-absence *before* the comparison. Scoped and unscoped differ only when the row holds a DIFFERENT goal — the case being fixed. |
+| Crash forward-recovery | `iteration-close.sh` do_recover Case B | `team-state-clear-in-flight.sh --agent <self> --if-goal "$_gid"` — scoped to the CHECKPOINT's goal, **not** `$GOAL_ID`. `do_recover` never reads `$GOAL_ID` and `--phase recover` is invoked without `--goal`, so scoping it to `$GOAL_ID` would compare against an empty string, which the endpoint coerces back to `None` — an unconditional clear wearing a CAS flag. |
+| Goal release (failure / re-select) | `aspirations-execute` release path | `team-state-clear-in-flight.sh --agent <self>` — deliberately UNSCOPED: release normalizes whatever row is present, including a malformed one. |
 | Claim-conflict abort (partner already in_flight on same goal) | `aspirations-execute` Phase 4 pre-claim | abort + return to select; do NOT write in_flight |
 
 ### `last_fresh_eyes_run` Field — Cross-Agent Coverage Window

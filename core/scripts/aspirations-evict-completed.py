@@ -581,8 +581,12 @@ def main():
         locked_modify_jsonl(path, _make_census_repair(stamp))
         try:
             get_backend().refresh(path)
-        except Exception:
-            pass
+        except Exception as e:
+            try:  # report, never raise — see note_swallowed_backend_error ()
+                from storage_backend import note_swallowed_backend_error
+                note_swallowed_backend_error("refresh", path, e)
+            except Exception:
+                pass
         after_items = [json.loads(ln) for ln in
                        path.read_text(encoding="utf-8").splitlines() if ln.strip()]
         after_v = _audit_violations(after_items)
@@ -630,8 +634,12 @@ def main():
     # Post-write validation: re-read fresh, confirm shrink + goal-count drop.
     try:
         get_backend().refresh(path)
-    except Exception:
-        pass
+    except Exception as e:
+        try:  # report, never raise — see note_swallowed_backend_error ()
+            from storage_backend import note_swallowed_backend_error
+            note_swallowed_backend_error("refresh", path, e)
+        except Exception:
+            pass
     after_items = [json.loads(ln) for ln in
                    path.read_text(encoding="utf-8").splitlines() if ln.strip()]
     after_bytes = path.stat().st_size

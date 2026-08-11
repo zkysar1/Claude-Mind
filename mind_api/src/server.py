@@ -304,11 +304,36 @@ class _Handler(BaseHTTPRequestHandler):
                     429, "write_queue_backpressure",
                     type(e).__name__ + ": " + str(e)[:300])
             elif _is_conflict:
+                # . Report only what the exception LICENSES. The
+                # previous text asserted "remote changed ... safe to retry" —
+                # both derived from the exception TYPE, neither observed. This
+                # handler never reads remote state, so "remote changed" is a
+                # claim about something it did not look at, and "safe to retry"
+                # is advice built on that claim.
+                #
+                # Measured counter-case (, 2026-07-29): the remote was
+                # STATIC — double-HEAD returned the same version 15s apart —
+                # while the local mirror sat 11,057 bytes behind. 8 attempts over
+                # ~2.5min of escalating backoff all conflicted identically,
+                # because retrying cannot fix a stale local read. Worse, the
+                # message asserted the OPPOSITE of persistence, so guard-908's
+                # retry-playbook trigger could not fire. A self-declared-retryable
+                # error that is not retryable is worse than no advice: it is
+                # confident, specific, and wrong, so nothing prompts a re-look.
+                #
+                # What IS known here: the write was rejected on a version
+                # precondition and did not land. The CAUSE is not measured, and
+                # the two candidates need OPPOSITE responses — so name both and
+                # hand over the discriminator instead of picking one.
                 resp = Response.error(
                     409, "write_conflict",
-                    "optimistic-concurrency conflict: remote changed between "
-                    "the in-lock read and the write; the write did NOT land — "
-                    "safe to retry")
+                    "optimistic-concurrency conflict: the write was rejected on "
+                    "a version precondition and did NOT land. WHY it failed is "
+                    "NOT measured here — a live remote change and a STALE LOCAL "
+                    "MIRROR raise this same error and need opposite responses "
+                    "(retry vs. refresh first). Discriminate before retrying: "
+                    "HEAD the remote twice; an UNCHANGED version means local is "
+                    "behind and every retry will conflict identically (g-115-3782)")
             else:
                 # : no repr(e) — repr of a UnicodeError embeds the
                 # whole failed payload and re-triggers the surrogate cascade

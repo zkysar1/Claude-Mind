@@ -225,9 +225,36 @@ at least one finding so Phase 5's board-post has something to publish.
 ```
 FOR EACH finding in findings:
     IF finding.severity in ["invalidates", "constrains"]:
-        # Route via insight-trigger infrastructure (consumes via insight-trigger-gate.py)
+        # Route via insight-trigger infrastructure (consumes via insight-trigger-gate.py).
+        #
+        # `requires_action_by:` is LOAD-BEARING, not decoration. insight-trigger-gate.py
+        # `_collect_triggers` SKIPS any trigger whose requires_action_by is absent, by
+        # documented policy ("if requires_action_by is absent, BOTH agents see it and
+        # neither is required to act — skip to avoid duplicate work"). This skill omitted
+        # the tag, so its own findings were unroutable by the consumer its own Phase 5
+        # names. Measured 2026-08-07 (alpha, hostname cc-04, uname -r 6.8.0-136-generic)
+        # over the live findings channel, 5282 records: 1139 fresh-eyes-code posts, 496
+        # carrying invalidates|constrains, and only 15 carrying requires_action_by: —
+        # so 481 actionable findings were dropped in silence. Counterfactual on a real
+        # post (msg-20260807-195917-alpha-5270): identical tags + requires_action_by:
+        # → routes.
+        #
+        # `affects:<file-path>` is NOT the blocker, contrary to what g-115-5265 was filed
+        # claiming: the gate parses affects: with a generic prefix parser and extracted
+        # the file path fine. (The sibling insight-trigger-sweep.py DOES require
+        # affects:g-NNN-NN, but it drops these posts one clause earlier anyway — it needs
+        # requires_action_by: AND action_type:, and neither is emitted here. See the
+        # "Two consumers, two contracts" note below.)
+        IF a reviewed agent is known (β path — `--author <agent>` was passed):
+            route_tag = "requires_action_by:{reviewed_agent},"
+        ELSE:
+            # α (own post-state-update files) and γ (user-directed): the author IS the
+            # actor and is already present. The gate skips self-triggers by design
+            # (`author == self_agent` → continue), so an address here would route to
+            # nobody. Deliberately unaddressed — this is the "separated, recorded" half.
+            route_tag = ""
         echo "<body>" | bash core/scripts/board-post.sh --channel findings --type finding \
-            --tags "insight_trigger,severity:{finding.severity},affects:{finding.file},fresh-eyes-code,{source_tag}"
+            --tags "insight_trigger,{route_tag}severity:{finding.severity},affects:{finding.file},fresh-eyes-code,{source_tag}"
     ELIF finding.severity == "enables":
         echo "<body>" | bash core/scripts/board-post.sh --channel findings --type finding \
             --tags "enables,fresh-eyes-code,{source_tag}"
@@ -238,6 +265,44 @@ FOR EACH finding in findings:
 
 `source_tag` = `guard-343` (shape α), `g-248-07` or `g-248-08` (shape β),
 `user-invocation` (shape γ). Lets downstream auditors filter by trigger source.
+
+### Two consumers, two contracts — know which one you are writing for (g-115-5265)
+
+`insight_trigger` posts are read by two scripts with **deliberately different**
+predicates. A finding that satisfies one is not thereby routed by the other, and
+neither reports what it declined to admit — so a post that reaches nobody looks
+exactly like a post with nothing to route.
+
+| | `insight-trigger-gate.py` | `insight-trigger-sweep.py` |
+|---|---|---|
+| role | immediate, narrow severity | periodic, broader severity, idempotent |
+| requires | `insight_trigger` + `requires_action_by:` + severity ∈ {invalidates, constrains} | `requires_action_by:` **and** `action_type:` |
+| skips self-triggers | yes (`author == self_agent`) | no |
+| parses `affects:` as | any string (generic prefix parser) | `^affects:(g-\d+-\d+)$` only |
+
+**This skill writes for the GATE.** It emits no `action_type:`, so the sweep will
+never admit its posts — that is intended, not a second bug to fix: the sweep is for
+explicitly-addressed agent-to-agent routing, and a code-review finding is not that.
+
+Consequences worth carrying:
+
+- The gate is the reason `requires_action_by:` is mandatory above. It is also why
+  addressing a finding to yourself accomplishes nothing.
+- An `affects:<file-path>` value survives the gate but has no goal to probe, so
+  `_act_on_trigger` files the Investigate goal with an
+  `affects target not found in any queue` warning. That is a **degraded**, not
+  broken, path. Emitting `affects:<goal-id>` instead — when the finding is
+  attributable to a specific goal — upgrades it to a real target-status re-probe
+  and suppresses the warning. Prefer the goal-id form when a goal is known.
+- Do not "fix" the gap by widening the sweep's `AFFECTS_RE` to accept file paths.
+  That widens a matcher over a live corpus (guard-2201) whose fresh-eyes-code
+  population is ~1,100 posts, and it would not route a single additional finding,
+  because those posts fail the `action_type:` clause first. Measured, not assumed.
+
+Pinned by `core/scripts/tests/test_fresh_eyes_code_trigger_contract.py`, which
+feeds this section's documented tag shape through the gate's own
+`_collect_triggers` and carries a positive control proving the pre-fix shape was
+dropped.
 
 ## Phase 5b: Cross-Agent Coverage Tracking (g-115-291 / rb-593)
 

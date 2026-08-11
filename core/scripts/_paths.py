@@ -90,6 +90,49 @@ def agent_state_dir(name: str) -> Path:
     return agent_dir(name) / SESSION_DIRNAME
 
 
+def body_state_path(name: str, filename: str, sid: "str | None" = None) -> Path:
+    """Body-scoped session-state file, with agent-wide fallback ().
+
+    Returns agents/<name>/sessions/<sid>/<filename> when THIS session is a
+    non-reducer Body, else agents/<name>/session/<filename>.
+
+    The activation signal is the EXISTENCE of the forked working-memory.yaml
+    under the per-session dir — the same signal worker_execute.worker_wm_path
+    and context_reads.tracker_path already use. Only a non-reducer body ever
+    forks one, so a reducer (or any single-runner session) always takes the
+    fallback and its behaviour is byte-identical to the pre-body layout.
+
+    THIS FUNCTION IS A RAIL KEYED ON THAT INVARIANT. bash-agent-inject.py
+    (~L468, the BODY_ROLE=worker derivation) states the coupling explicitly:
+    if a REDUCER ever gains a sessions/<sid>/working-memory.yaml, every rail
+    keyed on this predicate misreads the reducer as a worker, and "any change
+    to who gets a body-WM-file MUST revisit this line and the rails keyed on
+    it." Named here so this rail is findable from that side — a rail that
+    depends on the invariant without saying so cannot be revisited.
+
+    Resolve per-call inside a long-lived process — a session becomes a Body
+    when its worker forks the WM, which can happen after import (the g-306-68
+    PEP-562 lesson). One-shot processes (the compact hooks, the CLI wrappers)
+    may bind the result to a module constant, which also keeps their existing
+    monkeypatch-the-constant tests working.
+
+    `sid` defaults to $MIND_SID, injected into every Bash tool call by
+    bash-agent-inject.py. Hook processes inherit NO env vars, so a hook's
+    launcher must export it explicitly or this always takes the fallback.
+
+    Absoluteness is inherited from agent_dir (guard-552): the only value read
+    from the environment here is the SID, which is a directory NAME, not a
+    path fragment — no new env/conf resolution chain is introduced.
+    """
+    if sid is None:
+        sid = (os.environ.get("MIND_SID") or "").strip()
+    if sid:
+        body_dir = agent_session_dir(name, sid)
+        if (body_dir / "working-memory.yaml").exists():
+            return body_dir / filename
+    return agent_state_dir(name) / filename
+
+
 # --- External path configuration ---
 # world/ and meta/ live at user-supplied external paths (shared drive, NAS, etc.).
 # Each agent stores its own config in <agent>/local-paths.conf.

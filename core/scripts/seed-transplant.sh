@@ -233,6 +233,18 @@ echo "  $N_FILES files to copy"
 echo "  $N_TRANSFORMED files with transformations"
 if [ "$N_PENDING" -gt 0 ]; then
     echo "  WARN: $N_PENDING files have pending_template — will use inline+global transforms only"
+    # NAME them (). A count alone reads as "N files did not promote",
+    # which is the opposite of what pending_template does: the file_replace is
+    # dropped and the file falls through to the chain. Naming the files lets a
+    # reader check the residual instead of inferring a freeze that never happened.
+    echo "$PLAN" | py -3 -c "
+import sys, json
+d = json.load(sys.stdin)
+pend = [f['rel_path'] for f in d['files'] if f['pending_template_skip']]
+for p in pend[:10]:
+    print(f'    ~ {p}')
+if len(pend) > 10:
+    print(f'    ... and {len(pend)-10} more')"
 fi
 
 # Step 5: Dry-run exit
@@ -401,12 +413,28 @@ ORPHAN_JSON="$(py -3 "$SCRIPT_DIR/_seed_engine.py" remove-orphans --manifest "$M
 echo "$ORPHAN_JSON" | py -3 -c "
 import sys, json
 d = json.load(sys.stdin)
+a = d.get('archive') or {}
 if d['removed']:
     print(f\"  removed: {len(d['removed'])} orphan(s)\")
     for r in d['removed'][:10]:
         print(f\"    - {r}\")
     if len(d['removed']) > 10:
         print(f\"    ... and {len(d['removed'])-10} more\")
+    # An archive nobody can find is not an archive — always print the path
+    # and the receipt location (archive-before-delete.md step 6, ).
+    if a.get('archived'):
+        print(f\"  archived {a.get('count')} file(s), {a.get('bytes')} byte(s) BEFORE deletion\")
+        print(f\"    graveyard: {a.get('path')}\")
+        print(f\"    receipt:   {a.get('path')}/RECEIPT.json\")
+elif a.get('archived') and not a.get('verified'):
+    # Fail-CLOSED fired: orphans were found but the archive did not verify,
+    # so nothing was deleted. This is the safe outcome, but it is NOT a
+    # no-op and must never read like one.
+    print('  WARNING: orphans found but the pre-delete archive FAILED to verify')
+    print('           -> NOTHING was deleted (fail-closed). Orphans remain at destination.')
+    for f in (a.get('failures') or [])[:10]:
+        print(f\"    ! {f.get('stage')}: {f.get('path')} — {f.get('error')}\")
+    print(f\"    partial archive: {a.get('path')}\")
 else:
     print('  no orphans found')"
 

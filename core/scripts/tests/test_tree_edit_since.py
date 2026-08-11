@@ -200,3 +200,56 @@ def test_missing_tree_dir_fails_open(tmp_path):
     res = _run(tmp_path)
     assert res.returncode == 1
     assert "no tree dir" in res.stderr
+
+
+# --- unreadable node must not count as an encoding () -------------
+# Contract 3, the complement of contract 2 above. _front_matter used to return
+# '' on OSError, which is the SAME value it returns for a readable node with no
+# front matter — so an unread node took the deliberate legacy fail-open branch
+# and was credited as this session's encoding. The realistic trigger is not the
+# contrived directory below but the sync race: a node removed between the stat
+# that enumerated it and the open, which is exactly this scan's churn window.
+
+
+def test_unreadable_node_is_not_credited_as_encoding(tmp_path):
+    """A node that cannot be READ is not evidence of anything. Before the fix
+    this exited 0 and printed `detected system/trap.md` — reporting an encoding
+    for an entry it never opened."""
+    tree = _make_tree(tmp_path)
+    # A DIRECTORY named *.md: rglob("*.md") yields it, stat() succeeds, and
+    # open() raises IsADirectoryError (an OSError subclass).
+    (tree / "system" / "trap.md").mkdir()
+    res = _run(tmp_path)
+    assert res.returncode == 1, f"stdout={res.stdout!r} stderr={res.stderr!r}"
+    assert "detected" not in res.stdout, res.stdout
+
+
+def test_unreadable_node_is_diagnosed_not_swallowed(tmp_path):
+    """Silence in the OSError handlers is what made this invisible."""
+    tree = _make_tree(tmp_path)
+    (tree / "system" / "trap.md").mkdir()
+    res = _run(tmp_path)
+    assert "unreadable node" in res.stderr, res.stderr
+    assert "trap.md" in res.stderr, res.stderr
+
+
+def test_unstamped_node_still_fails_open(tmp_path):
+    """The legacy fail-open MUST survive the fix. This is the case the '' vs
+    None split exists to keep distinct — regressing it would silently disable
+    attribution for the ~4% of nodes with no session stamp."""
+    tree = _make_tree(tmp_path)
+    _write(tree / "system" / "plain.md", UNSTAMPED_NODE, AFTER)
+    res = _run(tmp_path)
+    assert res.returncode == 0, f"stdout={res.stdout!r} stderr={res.stderr!r}"
+    assert "detected" in res.stdout
+
+
+def test_unreadable_node_does_not_mask_a_real_self_encoding(tmp_path):
+    """An unreadable sibling must not suppress a genuine hit — the fix must
+    skip the unread node, not abort the scan."""
+    tree = _make_tree(tmp_path)
+    (tree / "system" / "trap.md").mkdir()
+    _write(tree / "system" / "mine.md", SELF_NODE, AFTER)
+    res = _run(tmp_path)
+    assert res.returncode == 0, f"stdout={res.stdout!r} stderr={res.stderr!r}"
+    assert "mine.md" in res.stdout

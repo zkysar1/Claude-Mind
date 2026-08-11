@@ -27,16 +27,22 @@ spec.loader.exec_module(battery)
 
 # ---------------------------------------------------------------- registry ----
 
-def test_registry_has_six_skill_invocation_cadences():
+def test_registry_pins_the_skill_invocation_cadence_roster():
+    # The roster is pinned EXPLICITLY on purpose — this is the SSOT, so an
+    # accidental add/remove/reorder must redden here. The engine tests below
+    # deliberately do the opposite and derive their counts from the registry;
+    # only this test asserts membership. (Renamed from ...has_six... in
+    # : a count in the test NAME goes stale the same way a count in
+    # an assertion does, and a stale name is worse — it survives the fix.)
     cads = reg.cadences()
-    assert len(cads) == 6
     assert reg.cadence_names() == [
         "fresh-eyes-review", "fresh-eyes-program", "fresh-eyes-tree",
-        "felt-sense", "curriculum", "evolution",
+        "strategic-scan", "felt-sense", "curriculum", "evolution",
     ]
     assert [c["phase"] for c in cads] == [
-        "0.5e", "0.5e.5", "0.5e.7", "0.5f", "0.5i", "0.5j",
+        "0.5e", "0.5e.5", "0.5e.7", "0.5e.9", "0.5f", "0.5i", "0.5j",
     ]
+    assert len(cads) == len(reg.cadence_names())
 
 
 def test_registry_excludes_self_acting_and_dormant_cadences():
@@ -90,7 +96,11 @@ def _run_json(capsys, runner):
 
 def test_all_noop(capsys):
     rep = _run_json(capsys, _runner_from())
-    assert rep["registered"] == 6
+    # Derived from the registry, never a literal: these assert the ENGINE
+    # reports what it enumerated, which stays true at any roster size. A
+    # hardcoded count here reddens on every legitimate registry growth and
+    # teaches the reader to bump the number rather than check the behaviour.
+    assert rep["registered"] == len(reg.cadences())
     assert rep["fired"] == []
     assert "error" not in rep
 
@@ -99,7 +109,7 @@ def test_all_noop_default_summary(capsys):
     rc = battery.run(False, check_runner=_runner_from())
     out = capsys.readouterr().out
     assert rc == 0
-    assert "all 6 cadence gates noop" in out
+    assert f"all {len(reg.cadences())} cadence gates noop" in out
 
 
 def test_single_fire_carries_dispatch_and_meter(capsys):
@@ -117,7 +127,7 @@ def test_single_fire_human_output(capsys):
     out = capsys.readouterr().out
     assert "CADENCE FIRE: evolution (phase 0.5j)" in out
     assert "aspirations-evolve" in out
-    assert "1 fire / 6 checked" in out
+    assert f"1 fire / {len(reg.cadences())} checked" in out
 
 
 def test_multiple_fire(capsys):

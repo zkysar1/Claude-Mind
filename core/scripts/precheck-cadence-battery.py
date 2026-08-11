@@ -1,7 +1,7 @@
 """precheck-cadence-battery — one call running every deferrable skill-invocation
 cadence gate check and reporting which FIRE (g-115-2984, fix for g-115-2982).
 
-Kills the cadence-starvation-by-abbreviation class: the six skill-invocation
+Kills the cadence-starvation-by-abbreviation class: the seven skill-invocation
 cadence rituals (fresh-eyes-review/program/tree, felt-sense, curriculum,
 evolution) were SIX separate LLM-orchestrated precheck phases (0.5e / 0.5e.5 /
 0.5e.7 / 0.5f / 0.5i / 0.5j), each abbreviate-able under context pressure. When
@@ -16,7 +16,7 @@ that must survive summarization; the output re-derives the full cadence set
 (which FIRE + the skill to invoke) from _cadence_registry, so a phase can never
 silently fall out of the protocol.
 
-READ-ONLY: the six cadence-check scripts "only read state" (goal-count vs
+READ-ONLY: the seven cadence-check scripts "only read state" (goal-count vs
 last-fire), so the battery is side-effect-free — it runs the checks and prints;
 the SKILL.md dispatch loop keeps ownership of the actual SKILL INVOCATION on
 FIRE. The battery deliberately does NOT read the budget meter: the checks are
@@ -25,7 +25,7 @@ the meter's tight-zone `deferrable` drop gates the EXPENSIVE skill invocation an
 is applied at DISPATCH time in the SKILL.md (each FIRE line carries its
 meter_name for that gate).
 
-Scope (principled — see _cadence_registry docstring): the six skill-invocation
+Scope (principled — see _cadence_registry docstring): the seven skill-invocation
 cadences. l1-skew (0.5g, self-acting board post) and health-regression (0.5h,
 DORMANT + multi-step verify/revert) keep their own phases — both sit outside the
 skill-invocation-skip starvation class.
@@ -74,8 +74,8 @@ def _run_bash(argv, timeout):
     can fall back to the per-phase check. Exit 0 == FIRE, any non-zero == noop.
     """
     script = argv[0]
-    from _runtime_bash import BASH  # rb-1472: not bare "bash"
-    full = [BASH, str(SCRIPT_DIR / script)] + list(argv[1:])
+    from _runtime_bash import bash_cmd  # guard-580 + guard-581
+    full = bash_cmd(SCRIPT_DIR / script, *argv[1:])
     try:
         r = subprocess.run(
             full, cwd=str(PROJECT_ROOT),

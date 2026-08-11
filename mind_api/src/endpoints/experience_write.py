@@ -463,6 +463,18 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
         _append_record(ctx, rec, summary=f"experience-add {rec['id']}")
         return None
 
+    #  DECISION — this site and update_field() below are LEFT AS-IS,
+    # deliberately, unlike archive_goal(). A backend ConflictError is not an
+    # OSError, so it escapes here too and surfaces as an unhandled 500 rather
+    # than a clean 409. That is a poor error contract and nothing more: nothing
+    # is written to disk before the cycle, so a failed attempt leaves no state
+    # to clean up and the caller can simply retry. Normalising it would be
+    # cosmetic. archive_goal() differs because it copy2's the trace BEFORE the
+    # write, so an escaping conflict strands an orphan .md that 409s that
+    # experience_id forever. Do NOT infer from this comment that every sibling
+    # is benign — archive_sweep() is a TWO-PHASE move whose phase-1 write lands
+    # before phase 2 can conflict, with no compensating action; that one is a
+    # genuine data-divergence and is tracked by .
     try:
         refused = file_locks.locked_rmw(live, _cycle)
     except OSError as e:
@@ -536,13 +548,39 @@ def update_field(ctx) -> "Response":  # type: ignore[name-defined]
         idx, rec = found
         rec = _normalize_record(rec)
         rec[field] = value
+        # A whole-object write REPLACES the dict _normalize_record already
+        # deep-backfilled above, so re-normalize to restore the sub-key
+        # guarantee the strict lookups below depend on ().
+        if field == "retrieval_stats":
+            rec = _normalize_record(rec)
+        # Validate BEFORE the recompute below so the recompute cannot mask a
+        # record the validator would have rejected. Note what this does NOT do
+        # (measured 2026-08-04): _validate_record only type-checks that
+        # retrieval_stats is a dict, so a whole-object payload carrying its own
+        # utility_ratio is silently overwritten by the derived value rather than
+        # rejected. Recompute-wins is the defensible precedence for a derived
+        # field; asserting on a caller-supplied one is a live-write behaviour
+        # change and needs its own goal. See msg-20260804-201727-echo-5334 and
+        # the twin comment in core/scripts/experience.py (guard-130).
         try:
             _validate_record(ctx, rec)
         except ValueError as e:
             return Response.error(400, "validation_failed", str(e)), {}
+        # DO NOT narrow to the startswith() arm alone (). The dotted
+        # rejection at the top of this handler returns 400 before the cycle is
+        # ever entered, so that arm can NEVER fire — this branch was dead and
+        # utility_ratio read 0.0 on 4,174 of 4,175 fleet records while the
+        # archive sweep's "never archive high-value" guard (rc>=5 AND ur>=0.5)
+        # qualified none of them. `retrieval_stats` as a whole object is the ONLY
+        # shape that reaches here, and it is the shape every caller uses
+        # precisely BECAUSE the dotted form fails. This is the LIVE path
+        # (experience-update-field.sh is daemon-only); the CLI twin in
+        # core/scripts/experience.py must stay in sync — guard-130, pinned by
+        # test_experience_utility_ratio_recompute.py.
         stats = rec.get("retrieval_stats")
         if (stats and isinstance(stats, dict)
-                and field.startswith("retrieval_stats.")):
+                and (field == "retrieval_stats"
+                     or field.startswith("retrieval_stats."))):
             rc = stats["retrieval_count"]
             tu = stats["times_useful"]
             stats["utility_ratio"] = round(tu / max(rc, 1), 4)
@@ -734,6 +772,16 @@ def archive_goal(ctx) -> "Response":  # type: ignore[name-defined]
 
     try:
         refused = file_locks.locked_rmw(_live_path(ctx), _cycle)
+    except get_backend().conflict_error as e:
+        # The backend's ConflictError is NOT an OSError, so without this clause
+        # it flies past the handler below, _abort never runs, and the copy2'd
+        # canonical .md survives. The pre-lock guard above then 409s
+        # content_path_exists for that experience_id FOREVER — a permanent wedge,
+        # not a leak. `conflict_error` is the empty tuple on LocalBackend, so
+        # `except ()` matches nothing and this is a no-op there (same shape
+        # _fileops._rmw_with_conflict_retry relies on). Caught SPECIFICALLY, not
+        # as `except Exception` — guard-373. ()
+        return _abort(Response.error(409, "write_conflict", str(e)))
     except OSError as e:
         return _abort(Response.error(500, "write_failed", str(e)))
     if refused is not None:
@@ -919,6 +967,16 @@ def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
                          lines_changed=len(remaining))
         _jsonl_cache().invalidate(live_p)
 
+    #  — NOT the same class as add()/update_field(), and NOT fixable
+    # by the  shape. These are TWO SEQUENTIAL fenced writes: phase 1
+    # appends to the archive, phase 2 removes from live. A backend ConflictError
+    # is not an OSError, so three consecutive conflicts on PHASE 2 escape this
+    # handler AFTER PHASE 1 HAS LANDED, leaving every swept record in BOTH
+    # files. archive_goal() could route its conflict into an existing _abort();
+    # here there is no compensating action to route to — phase 1 must be made
+    # undoable or idempotent. test_archive_sweep_retries_and_applies_each_move_once
+    # passes and does NOT cover this: it proves the RETRY works, not that
+    # exhaustion cleans up. Unreproduced as of 2026-08-09 (read, not run).
     try:
         file_locks.locked_rmw(archive_p, _archive_cycle)
         file_locks.locked_rmw(live_p, _live_cycle)

@@ -68,6 +68,13 @@ except Exception:  # pragma: no cover -- best-effort; _platform.sh also sets it
 EVENTS_SUBPATH = ("board", "events.jsonl")
 VALID_STATUSES = ("proposed", "claimed", "in-progress", "completed", "abandoned")
 TERMINAL_STATUSES = ("completed", "abandoned")
+# The only keys update_status() honours in its `overrides` argument. Anything
+# else is discarded, and is reported rather than rejected (). Kept
+# beside the record fields it is NOT: `status`, `created_at`, `event_id` and
+# `recorded_by` are also record keys but come from parameters, so passing them
+# via `overrides` is silently ineffective and must warn.
+RECOGNIZED_OVERRIDES = ("owner", "participants", "decomposition",
+                        "completion_signals")
 
 
 def events_path(path=None) -> Path:
@@ -200,6 +207,44 @@ def update_status(event_id: str, new_status: str, *, recorded_by=None,
         "created_at": _now_iso(),
         "recorded_by": recorded_by or _agent(),
     }
+    # Dropped-key detection (, same class as ). The dict
+    # above is a FIXED allowlist over `overrides`, which is caller-supplied — so
+    # an override key outside {owner, participants, decomposition,
+    # completion_signals} is discarded with no error: validate_record passes,
+    # the append succeeds, and the caller's field is simply gone. Worse here than
+    # in handoff.yaml, because this store is append-only event-sourced and the
+    # write is never revisited. Report, do NOT reject: a caller may legitimately
+    # pass provenance the event schema does not persist (rb-538 / guard-527).
+    # stderr-only is deliberate and is the WEAK half (guard-772 — a stderr WARN
+    # is invisible to a backgrounded caller). The structured half is unavailable
+    # without changing the persisted event schema, which this goal's scope
+    # explicitly forbids: the return value IS the appended record, so attaching
+    # dropped_keys would either alter what is written or return something that
+    # differs from it.
+    #
+    # The predicate is membership in RECOGNIZED_OVERRIDES, NOT `k not in
+    # new_rec`. The reference fix uses the not-in-output form and is right to,
+    # because there EVERY output key is payload-sourced so the two predicates
+    # coincide. Here they do not: 4 of the 8 record keys (event_id, status,
+    # created_at, recorded_by) come from parameters, never from `overrides`. So
+    # `overrides={"status": "completed"}` IS silently ignored and the not-in-
+    # output form would not report it — the check would have carried a hole in
+    # exactly the class it exists to close. Copy the reference SHAPE, not its
+    # predicate, whenever the output is not wholly caller-sourced.
+    # str(k), not k: a non-string key makes `sorted()` raise on mixed types and
+    # `", ".join()` raise on ints — turning a key that was previously IGNORED
+    # into a TypeError that aborts the event append. A reporting path must never
+    # be able to fail the write it reports on. (Inherited from the reference,
+    # which had the same latent shape; fixed there in the same sweep, guard-3088.)
+    dropped_keys = sorted(str(k) for k in overrides if k not in RECOGNIZED_OVERRIDES)
+    if dropped_keys:
+        print(
+            "WARN: events.update_status ignored %d unrecognized override key(s): "
+            "%s. Recognized keys are owner, participants, decomposition, "
+            "completion_signals; these were NOT written to the event record for "
+            "%s." % (len(dropped_keys), ", ".join(dropped_keys), event_id),
+            file=sys.stderr,
+        )
     errs = validate_record(new_rec)
     if errs:
         raise ValueError("; ".join(errs))

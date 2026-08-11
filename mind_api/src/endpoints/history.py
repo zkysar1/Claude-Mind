@@ -100,12 +100,28 @@ def _resolve_base_dir(ctx, path):
 
 
 def _resolve_file_arg(ctx, file_str):
-    """Resolve the ?file= param. Relative paths anchor to project_root (the CLI's
-    cwd when invoked via wrappers); absolute paths pass through. The contract for
-    the eventual wrapper cut is an ABSOLUTE path (world/meta are external)."""
+    """Resolve the ?file= param. Absolute paths pass through; `world/` and
+    `meta/` resolve to the configured external roots; anything else anchors to
+    project_root (the CLI's cwd when invoked via wrappers).
+
+    The virtual-prefix branch mirrors `_paths.resolve_file_path`, the CLI-side
+    single source of truth (guard-132), re-expressed against ctx.paths because
+    the daemon cannot use _paths' module globals (see this module's header).
+    Without it, `world/x` anchored to project_root — and since world/meta are
+    EXTERNAL roots, PROJECT_ROOT/world does not exist, so the path landed under
+    no governed base, `_find_history_snapshots` returned [], and `list` printed
+    "No history" at HTTP 200 for a file with a full snapshot set (g-115-4181).
+    Measured before the fix: `world/self-evolution.jsonl` -> "No history";
+    the same file by absolute path -> 35 versions."""
     p = Path(file_str)
     if not p.is_absolute():
-        p = Path(ctx.paths.project_root) / p
+        s = p.as_posix()
+        if s.startswith("world/"):
+            p = Path(ctx.paths.world) / s[6:]
+        elif s.startswith("meta/"):
+            p = Path(ctx.paths.meta) / s[5:]
+        else:
+            p = Path(ctx.paths.project_root) / p
     return p.resolve()
 
 
@@ -232,8 +248,24 @@ def list_versions(ctx) -> "Response":  # type: ignore[name-defined]
         return Response.error(400, "missing_param", "file query param required")
     file_path = _resolve_file_arg(ctx, file_raw)
 
+    # An unresolvable path is an ERROR, not an empty store. Without this,
+    # `_find_history_snapshots` returns [] for both cases and the "No history"
+    # text below rendered a false-absent verdict on the recovery layer at HTTP
+    # 200 (). Mirrors the `restore` handler's long-standing
+    # unresolved_base 400 — list was the outlier, and it is the read the
+    # recovery path actually depends on.
+    base_dir, _kind = _resolve_base_dir(ctx, file_path)
+    if base_dir is None:
+        return Response.error(400, "unresolved_base",
+                              f"{file_raw} is not under any configured base dir "
+                              f"(agent-dir files require X-Mind-Agent)")
+
     snapshots = _find_history_snapshots(ctx, file_path)
     if not snapshots:
+        # Reached only when the path IS under a governed root, so this is now
+        # the one honest empty case. Note a MISSING file is legitimately here:
+        # snapshots outlive the file they describe, and listing them after a
+        # delete is exactly when they are needed.
         return Response.text(f"No history for {file_raw}\n", content_type="text/plain")
 
     out = []
@@ -282,6 +314,15 @@ def diff(ctx) -> "Response":  # type: ignore[name-defined]
     if not file_raw or not version:
         return Response.error(400, "missing_param", "file and version query params required")
     file_path = _resolve_file_arg(ctx, file_raw)
+
+    # Same false-absent class as `list`: an out-of-root path made every
+    # snapshot invisible, so this reported "Version not found" — blaming the
+    # version when the PATH was the problem. Check the root first ().
+    base_dir, _kind = _resolve_base_dir(ctx, file_path)
+    if base_dir is None:
+        return Response.error(400, "unresolved_base",
+                              f"{file_raw} is not under any configured base dir "
+                              f"(agent-dir files require X-Mind-Agent)")
 
     version_path = _find_snapshot_by_name(ctx, file_path, version)
     if version_path is None:

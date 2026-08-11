@@ -233,10 +233,20 @@ IF stop_mode != true:
 
 ## Step 8.9: Release Held Claims
 
+Enumerates BOTH queues and threads `--source` through to the release. Agent-queue
+goals began carrying claims at g-306-238, so a world-only predicate — correct by
+construction before that — now strands exactly the recurring cadence
+(`g-001-01`..`g-001-10`) at session end. Full rationale in the authoritative copy;
+see `aspirations-consolidate/SKILL.md` Step 8.9 (g-306-258).
+
 ```
-Bash: MIND_AGENT={agent} aspirations-read.sh --active-compact 2>/dev/null
-FOR EACH world goal WHERE claimed_by == this agent:
-    Bash: aspirations-release.sh <goal-id>
+# aspirations-query.sh, NOT aspirations-read.sh --active-compact: the query
+# endpoint reads BOTH queues and tags each row with `source`, which is what makes
+# the release below addressable. (verification-checklist.md item 30 already
+# declares the query shape canonical for this step — this copy had drifted.)
+Bash: MIND_AGENT={agent} aspirations-query.sh --goal-field claimed_by {agent_name} --goal-status pending,in-progress,blocked
+FOR EACH returned goal:                      # NOT `FOR EACH world goal`
+    Bash: aspirations-release.sh <goal-id> --source {goal.source}
 echo "Session ending: released all held claims" | Bash: board-post.sh --channel coordination --type status
 ```
 

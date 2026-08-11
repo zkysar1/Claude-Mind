@@ -31,7 +31,9 @@ Matrix:
   3. same agent, different LIVE    -> REFUSE 409 same_agent_other_session
   4. same agent, different DORMANT -> allowed takeover
   4b. holder is runner, heartbeat STALE -> fail open, allowed
-  5. legacy claim (no stored sid) / caller sends no sid -> allowed, no-op
+  5. legacy claim (no STORED sid), caller sends one -> allowed, no-op
+  5b. caller sends NO sid -> REFUSE 400 missing_claim_sid (g-306-132-b; this
+      previously allowed, which left the guard bypassable by omitting a param)
 
 NOTE: claim() does NOT set `status` (verified while reading the endpoint), so
 none of these assert on status transitions.
@@ -339,14 +341,29 @@ def test_terminal_status_clears_claimed_by_sid():
                 f"path: {g.get('claimed_by_sid')}")
 
 
-def test_caller_without_sid_is_noop():
+def test_caller_without_sid_now_refused():
+    """SUPERSEDED PREMISE (-b), deliberately inverted rather than deleted.
+
+    This case previously asserted that a sid-less caller "must behave as before"
+    -- i.e. fall through to the idempotent no-op. That tolerance WAS the residual
+    bypass: the refusal below requires BOTH holder_sid and claim_sid, so omitting
+    one query param skipped the guard this whole file exists to prove. The
+    endpoint now refuses sid-less world-goal claims outright.
+
+    The second assertion is unchanged and still load-bearing: the holder's
+    recorded identity must survive, which it now does trivially because the
+    refusal returns before any write. Full refusal matrix + the escape hatch:
+    core/scripts/tests/test_claim_no_sid_refusal.py.
+    """
     with tempfile.TemporaryDirectory() as tmpd:
         world = _make_world(Path(tmpd), claimed_by="alpha",
                             claimed_by_sid=LIVE_SID)
         with DaemonFixture(world, agent="alpha") as df:
             _seed_session(df.project_root, "alpha", running_sid=LIVE_SID)
             code, body = _claim(df.port, "alpha", None)  # no sid transmitted
-            assert code == 200, (
-                f"a caller sending no sid must behave as before: {code} {body}")
+            assert code == 400, (
+                "a sid-less claim must be REFUSED -- tolerating it leaves the "
+                f"same-agent guard bypassable by omitting a param: {code} {body}")
+            assert "missing_claim_sid" in body, body
             assert _goal(world).get("claimed_by_sid") == LIVE_SID, (
                 "a sid-less caller must NOT erase the holder's recorded identity")

@@ -45,7 +45,10 @@ IF horizon == "micro":
 IF horizon == "session":
     Run LIGHTWEIGHT reflection path:
       - Generate ABC chain (Step 2) — abbreviated: skip skill_chain and research_depth
-      - Skip Step 2.5 differentiated extraction UNLESS surprise >= 7
+      - Skip Step 2.5 differentiated extraction UNLESS surprise >= 7 — EXCEPT when
+        outcome == CORRECTED, where Step 2.5 runs regardless of surprise (its CORRECTED
+        branch only; the CONFIRMED branch stays skipped). See "Why CORRECTED is exempt"
+        below — do NOT read this as a general fall-through (guard-137).
       - Skip Step 2.6 contrastive extraction
       - Generate encoding score (Step 2.7) — normal
       - Generate textual reflection (Step 3) — abbreviated (3-5 sentences max)
@@ -72,6 +75,38 @@ IF horizon == "short" OR horizon == "long" OR horizon is missing:
     Continue to full reflection below.
 ```
 
+### Why CORRECTED is exempt from the surprise gate (g-001-01, 2026-08-08)
+
+`surprise` cannot observe whether the METHOD was well-formed. That is the same
+defect guard-2724 names one level in — it says `unlucky_corrected` is derived from
+`confidence` ALONE and is "a CONFIDENCE PROXY [that] cannot observe whether the
+METHOD was well-formed." The surprise gate above was making the identical proxy
+error one level OUT, and the thing it gated away was guard-2724's override itself:
+that override lives at Step 2.5's CORRECTED branch, so `surprise < 7` on this path
+made the one check designed to catch what a proxy cannot see **structurally
+unreachable**. A rail that only fires when someone reaches past their own path is
+not a rail.
+
+Measured, two independent instances, both session-horizon CORRECTED under the gate:
+2026-08-04 (surprise 4) produced an amendment to rb-5422, recorded at the time as
+coming from "discretionary judgment, not the path"; 2026-08-06
+`sidecar-internal-docs-are-a-seed-property` (surprise 6) produced guard-2876 +
+rb-6931 only because the agent applied guard-2724's override **from inside a Step
+the path had already skipped** (alpha journal 2026-08-06 L217-234). Both would have
+terminated at a violations entry plus a journal note had the agent not reached
+outside. The second instance is what met the "repeatedly" bar the originating
+micro-hypothesis set for its own consumer.
+
+Cheap by construction, so the lightweight path stays lightweight: the exemption is
+scoped to CORRECTED (the branch that can extract a preventive guardrail), and
+guard-2724's four discriminators read three fields already on the record —
+`outcome_detail`, `resolution_method`, `measurement_channel`. Note Step 7.6c is
+still skipped here, so `dual_classification` arrives UNSET; that is the safe
+direction and needs no second edit — Step 2.5's CORRECTED branch routes `unclassified`
+to "Otherwise", which runs the Preventive Guardrail step outright rather than
+consulting an override it has no input for. Trace: rb entry cited in the Maintain
+goal for this change.
+
 ## Step 1: Load Hypothesis
 
 ```
@@ -80,7 +115,45 @@ Read the original evaluation (scoring, reasoning, confidence)
 Read any related knowledge articles that informed the hypothesis
 
 IF hypothesis record has `experience_ref` field:
-    Bash: experience-read.sh --id {experience_ref}
+    # THE REF IS SHARED; THE STORE IT POINTS INTO IS PER-AGENT (g-306-263, measured
+    # 2026-08-08 echo/cc-03). The pipeline is world state, so `--unreflected` hands ANY
+    # agent ANY author's record — but experience-read.sh resolves against the BOUND
+    # agent's store. Reflecting on a partner's record therefore returns
+    # `{"error": "not_found"}` (rc=1) for a record that exists and is readable. Measured:
+    # of 75 resolved-stage records, 46 carry experience_ref and only 3 were the reflecting
+    # agent's — 43 of 46 (93.5%) unresolvable from that binding. So resolve the OWNER
+    # first; the bare call is correct only for your own records.
+    # `resolved_by` IS NOT THE OWNER — it is the LAST fallback and it is usually the
+    # WRONG agent (measured 2026-08-08, echo/cc-03, reflecting
+    # 2026-07-31_recurring-monitors-lack-cross-run-state). An `experience_ref` on a
+    # hypothesis record points at a `type: hypothesis_formation` experience, written
+    # by whoever FORMED the hypothesis. `resolved_by` names whoever RESOLVED it —
+    # a different agent whenever the fleet works a shared pipeline, which is the
+    # normal case. That record was formed by bravo and resolved by alpha, and it
+    # carried NEITHER `agent` NOR `author`, so this chain fell through to
+    # `resolved_by` = alpha and read alpha's store: `not_found`, for a record that
+    # exists, is readable, and lives under bravo. The failure is INDISTINGUISHABLE
+    # from "no experience record exists" — same rc, same JSON — so it silently
+    # downgrades every cross-agent reflection to the weak-antecedent fallback below
+    # while looking like the fallback was correctly earned.
+    owner = record.agent OR record.author           # the FORMER, when recorded
+    candidates = [owner, record.resolved_by, $MIND_AGENT] minus nulls/dupes
+    FOR EACH c in candidates:
+        Bash: MIND_AGENT={c} bash core/scripts/experience-read.sh --id {experience_ref}
+        IF found: use it and STOP.
+    # Still not found after the candidates? SWEEP THE ROSTER before falling back —
+    # it is one cheap loop over `team-state-read.sh` agent_status keys and it is
+    # what actually located the record above. Do NOT skip to the fallback just
+    # because the named candidates missed; a miss here means the record's
+    # provenance fields are absent, NOT that the experience is gone.
+    FOR EACH agent in the team-state roster (skip ones already tried):
+        Bash: MIND_AGENT={agent} bash core/scripts/experience-read.sh --id {experience_ref}
+        IF found: use it, and NOTE in the reflection which agent owned it — the
+        record's provenance fields need backfilling.
+    # Genuinely not found anywhere? Do NOT silently proceed as though the step ran.
+    # Say so in the reflection, and fall back to the record's own claim /
+    # rationale / outcome_detail as the antecedent source — that is a WEAKER antecedent
+    # than the anchors, and the ABC chain should be built knowing it.
     Read the content .md file at the returned record's content_path
     Use this full-fidelity context to reconstruct exact information state at hypothesis formation time
     This replaces reliance on context_manifest paths alone — we now have what the content actually said
@@ -185,7 +258,8 @@ Read hypothesis process_score (if populated by /review-hypotheses Step 4.1):
      ```
 
 **For CORRECTED (corrected hypotheses):**
-- If `dual_classification == unlucky_corrected`: SKIP guardrail extraction — the process was sound, outcome was variance. Log: "Unlucky corrected — process was sound, no guardrail needed." Still create reasoning bank entry (type: failure) for the record but mark `guardrail_skipped: true`.
+- If `dual_classification == unlucky_corrected`: evaluate the PROCESS-DEFECT OVERRIDE (next bullet) FIRST. If the override does NOT fire: SKIP guardrail extraction — the process was sound, outcome was variance. Log: "Unlucky corrected — process was sound, no guardrail needed." Still create reasoning bank entry (type: failure) for the record but mark `guardrail_skipped: true`.
+  - **PROCESS-DEFECT OVERRIDE (guard-2724)** — `unlucky_corrected` is derived in Step 7.6c from the outcome and `confidence >= 0.60` ALONE. It is a CONFIDENCE PROXY and cannot observe whether the METHOD was well-formed, so "the process was sound" above is an inference from that proxy, never a finding. Read the record's `outcome_detail`, `resolution_method`, and `measurement_channel`, and answer four questions: (a) does the named `measurement_channel` actually carry the pre-registered quantity? (b) do the `resolution_method` branches cover the observed outcome space? (c) does the claim assert a scope it never checked? (d) do the claim and the method name the SAME settling data? If ANY answer reveals a defect, the override FIRES — the process was NOT sound: run the Preventive Guardrail step below and record which discriminator fired. The skip applies ONLY when all four come back clean. (Measured 2026-08-05, hypothesis `2026-07-18_c2-idle-variety-nondiscriminating-at-current-coverage`: confidence 0.60 → `unlucky_corrected`, and its own resolution documented all four defects — the literal skip would have suppressed a real guardrail. Contrast guard-1604, which covers a HAND-WRITTEN value being wrong, remedy "the script wins"; here the script's value is CORRECT and only its gloss is false, so re-running the script cannot surface it.)
 - Otherwise (deserved_corrected or unclassified): Preventive Guardrail step:
   1. Identify what went wrong — which evaluation step failed?
   2. Extract a preventive guardrail: "Next time, check [X] before hypothesizing [Y]"
@@ -363,9 +437,17 @@ ELSE:
 After differentiated extraction, check if a contrastive pair exists — a CONFIRMED and CORRECTED in the same category that can be compared to extract what distinguished success from failure.
 
 ```
+# BOTH stages are REQUIRED. `--stage resolved` alone is a SURVIVORSHIP FILTER —
+# resolved is the small live holding area (~10% of the store) and records migrate
+# to archived as they age, so most scoreable records sit in archived. For THIS
+# step the cost is a false negative: a category whose only CONFIRMED/CORRECTED
+# pair has aged into archived reads as "no pair exists" and the contrastive
+# extraction silently never fires. (g-115-4866 fixed the calibration sites;
+# g-115-4715 enumerated this one.)
 Bash: pipeline-read.sh --stage resolved
-Find the most recent CONFIRMED in the same category as this hypothesis
-Find the most recent CORRECTED in the same category as this hypothesis
+Bash: pipeline-read.sh --stage archived
+Find the most recent CONFIRMED in the same category as this hypothesis, over the UNION of both stages
+Find the most recent CORRECTED in the same category as this hypothesis, over the UNION of both stages
 
 If both a CONFIRMED and CORRECTED exist in this category AND they haven't been paired before:
   Compare their ABC chains side by side:

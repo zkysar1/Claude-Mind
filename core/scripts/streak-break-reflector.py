@@ -75,11 +75,29 @@ HERE = Path(__file__).resolve().parent
 PROJECT_ROOT = HERE.parent.parent
 sys.path.insert(0, str(HERE))
 from _paths import WORLD_DIR, AGENT_DIR  # noqa: E402
+from _owner_qualified_signal import qualified_signal  # noqa: E402  (guard-2107, )
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
 
 DEFAULT_PRIORITY = "MEDIUM"
 DEFAULT_CATEGORY = "framework-maintenance"
 DEDUP_HOURS = 48
+
+# The canary origin_signal, and the regex that parses it BACK in
+# _auto_resolve_recovered_canaries. These two are a matched pair: the writer
+# emits CANARY_PREFIX + (owner-qualified) goal id, and CANARY_RE must accept
+# what the writer emits. Module-level so a regression test can bind to the
+# REAL object rather than a re-declared copy — a test over a copied regex
+# passes while the shipped one rejects every new key (guard-1943).
+#
+# Accepts BOTH forms (): legacy `...:` and owner-qualified
+# `...:zeta-`. The owner group is restricted to an agent-name shape so
+# a LEGACY key cannot be mis-split: for `` the optional group would
+# have to consume `g` and leave `001-08`, which cannot match `g-\d+-\d+`, so it
+# backtracks to owner=None.
+CANARY_PREFIX = "investigate:streak-break:"
+CANARY_RE = re.compile(
+    r"^investigate:streak-break:(?:(?P<owner>[a-z][a-z0-9_]*)-)?"
+    r"(?P<gid>g-\d+-\d+)$")
 
 
 def _load_session_gap_threshold() -> float:
@@ -475,7 +493,16 @@ def _file_investigate(entry: dict, asp_id: str, source: str,
             "checks": [],
             "preconditions": [],
         },
-        "origin_signal": f"investigate:streak-break:{goal_id}",
+        # guard-2107 / : an agent-queue `g-001-NN` is unique only
+        # within its owner's queue, so qualify the key with the owner. `source`
+        # is this canary's own queue, and the sweep reads world + the BOUND
+        # agent only, so $MIND_AGENT is the correct owner here.
+        # NOTE: CANARY_RE parses this key back apart in
+        # _auto_resolve_recovered_canaries — it accepts BOTH the qualified and
+        # legacy forms. Changing this format without changing that regex
+        # silently kills auto-resolve (the write side would still test green),
+        # which is why both sides share CANARY_PREFIX.
+        "origin_signal": qualified_signal(CANARY_PREFIX, goal_id, source),
     }
 
     if dry_run:
@@ -514,7 +541,11 @@ def _auto_resolve_recovered_canaries(dry_run: bool) -> tuple[int, list[str]]:
     """
     streak_mult = _load_streak_mult()
     session_gap_threshold_h = _load_session_gap_threshold()
-    canary_re = re.compile(r"^investigate:streak-break:(g-\d+-\d+)$")
+    # Module-level CANARY_RE (see its definition for why it accepts both the
+    # legacy and owner-qualified key forms). Only group "gid" is read — the
+    # owner is deliberately not used for lookup, since `source_state` is keyed
+    # on the bare goal id within this agent's own scan.
+    canary_re = CANARY_RE
     candidates: list[tuple[Path, str]] = []
     if WORLD_DIR is not None:
         candidates.append((WORLD_DIR / "aspirations.jsonl", "world"))
@@ -585,7 +616,7 @@ def _auto_resolve_recovered_canaries(dry_run: bool) -> tuple[int, list[str]]:
                 m = canary_re.match(origin)
                 if not m:
                     continue
-                source_goal_id = m.group(1)
+                source_goal_id = m.group("gid")
                 if source_goal_id not in source_state:
                     continue
                 last_achieved_str, interval_h = source_state[source_goal_id]
