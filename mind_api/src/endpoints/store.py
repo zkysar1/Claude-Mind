@@ -224,6 +224,16 @@ def append(ctx) -> "Response":  # type: ignore[name-defined]
     # 1. Script-owned timestamp (overwrite unconditionally, ignore stdin).
     if spec.created_field:
         rec[spec.created_field] = spec.created_stamp()
+    # 1b. Writing-agent provenance (). NEVER-OVERWRITE — a PRESENCE
+    # test, not a truthiness test, so an explicit caller value survives even
+    # when it is null (the caller-wins contract _rb_inject_source_goal states).
+    # Runs BEFORE prepare so a store's prepare hook stays the escape hatch that
+    # can override it, and before apply_defaults, which is only-if-absent and so
+    # cannot clobber what this sets. _agent_name falls back to "system" on an
+    # empty header, but _require_agent_header already rejected that above, so on
+    # this path the value is always a real agent name.
+    if spec.author_field and spec.author_field not in rec:
+        rec[spec.author_field] = _agent_name(ctx)
     # 2. Prepare hook (e.g. rb source_goal injection from team-state).
     if spec.prepare:
         spec.prepare(ctx, rec)
@@ -346,6 +356,19 @@ def replace(ctx) -> "Response":  # type: ignore[name-defined]
             # post-add; a full replace must not let the caller reset it.
             if spec.created_field:
                 rec[spec.created_field] = found[1].get(spec.created_field)
+            # Same immutability for the append-time author stamp ():
+            # a full replace substitutes the record wholesale, so a caller body
+            # that simply omits the field would silently erase — or reassign —
+            # who wrote the record. Authorship is a fact about creation, exactly
+            # like `created`. Not theoretical: pattern-signatures-update.sh
+            # drives this endpoint against one of the three stamped stores.
+            # Membership test, not `.get()`: historical rows have no author, and
+            # copying an absent key back as null would backfill the very rows
+            # this change promises to leave alone. Where the existing record has
+            # no author, a caller-supplied value is therefore still allowed to
+            # land — deliberate, so a backfill tool remains possible.
+            if spec.author_field and spec.author_field in found[1]:
+                rec[spec.author_field] = found[1][spec.author_field]
             items[found[0]] = rec
             _commit(ctx, spec, path, items,
                     f"store-replace {ctx.query.get('store')} {key}")

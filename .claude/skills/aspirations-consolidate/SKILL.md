@@ -61,6 +61,51 @@ The mode is still `autonomous` at invocation time (D4). If Phase -1.4 step order
    #   Log "▸ GENERALIZE-DOWN: merged {len(merged)} Body(ies), {len(noop)} no-op,
    #        {len(skipped)} skipped (scanned {scanned})".
    # On a non-zero exit: Log the stderr line and CONTINUE to triage (fail-open).
+   # KEEP `merged_goal_ids` from this summary — Step -0.9 consumes it, and this
+   # is the ONLY moment it can be read. See that step for why.
+
+-0.9. WORKER-GOAL RETROSPECTIVE (Phase B, g-306-198):
+   # A WORKER Body executes goals but never runs the reducer-only close phases,
+   # so a goal it completed reaches the shared store with `outcome_note` written
+   # and the reducer lanes — team-state, journal, findings gate, imp@k — simply
+   # ABSENT, with nothing downstream to fill them. This step fills them.
+   #
+   # RUN IT NOW OR NOT AT ALL. `merged_goal_ids` names the completed goals that
+   # arrived from a Body, and it is derivable ONLY here: the WM rows carry no
+   # session id, `claimed_by`/`claimed_by_sid` are erased at close (0 of 4015
+   # completed goals carry either — deliberate, g-115-3176), and
+   # body-manifest.yaml records no goal list. Re-running generalize-down does
+   # NOT recover them: the Bodies are already marked merged, so the second run
+   # returns an empty list. If this step is skipped, those goals keep their
+   # missing lanes permanently.
+   IF the Step -1 summary's `merged_goal_ids` is empty:
+       SKIP — no Body contributed a completed goal this merge (the dormant
+       single-runner case, and the common one). Continue to triage.
+   ELSE:
+       Bash: py -3 core/scripts/worker_retrospective.py --agent "$MIND_AGENT" \
+               --goal-ids "{comma-joined merged_goal_ids}" --apply --output json
+       # (`--from-merge-summary <path|->` accepts the generalize-down JSON
+       #  directly when a scripted caller has it on disk or on stdin.)
+       # Idempotent: each goal is marked `retrospective_encoded` on its own
+       # record once its lanes land, and a marked goal is never re-run. The
+       # marker is deliberately WITHHELD when every lane failed, so a transient
+       # store fault retries next pass instead of being recorded as done.
+       # Parse the JSON. Log "▸ WORKER-RETROSPECTIVE: {planned} planned,
+       #   {len(applied)} applied, {len(skipped)} skipped".
+       # On a non-zero exit: log and CONTINUE to triage (fail-open — a
+       # retrospective failure must never block consolidation).
+   #
+   # THE THREE LANES IT DOES NOT RUN ARE YOURS. The script calls the four lane
+   # writers that accept a goal id (team-state, journal, findings gate, imp@k
+   # via state-update-audit velocity). It reports `pending_judgment_lanes`
+   # — verification, execution_feedback, user_notable — and does NOT fill them:
+   # their writers exist but consume LLM RATINGS, and a script supplying its own
+   # scores would fabricate the measurement the lane records (the same reason
+   # state-update-audit SKIPS the imp@k snapshot on an unmeasured close rather
+   # than writing a false 0.0, g-115-2441). For each applied goal, read its
+   # `outcome_note` and decide those three yourself — post-hoc verification,
+   # a spec-quality rating via `state-update-audit.sh execution-feedback`, and
+   # whether the user would want to know.
 
 0.1. CONSOLIDATION TRIAGE GATE:
    # This logic is duplicated in core/scripts/consolidation-precheck.py.
@@ -380,6 +425,33 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
            Read target node .md file
            IF node was updated AFTER debt was created → mark resolved, skip
 
+           # NULL-KEY LANE (g-115-5150) — mirrors encode-session Lane 1.6.
+           # The node-update check above CANNOT fire without a node_key, and
+           # null is the MAJORITY shape rather than an anomaly: /respond Step 6
+           # files debt precisely when a correction has BROADER implications
+           # than any single node the _tree.yaml scan found, so "no one node" is
+           # the DESIGNED common case here. Such entries fall through to the
+           # carry-forward increment on every sweep until the ceiling below
+           # DISCARDS them. Measured 2026-08-06 (alpha): all five live entries
+           # had node_key null, all HIGH, all at sessions_deferred 6 of 10.
+           IF debt.node_key is null or empty:
+               Extract the first goal id matching g-\d+-\d+ from debt.reason
+                 (also debt.routed_goal / debt.source_goal if present).
+               IF found:
+                   # asp-<NNN> is derived from g-<NNN>-<NN>. aspirations-read.sh
+                   # --id takes an ASPIRATION id; handing it a GOAL id returns
+                   # {"error":"not_found"}, which reads like "goal is gone".
+                   Bash: bash core/scripts/aspirations-read.sh --id asp-<NNN>
+                   Locate the goal in goals[] and read status.
+                   IF status == "completed":
+                       Mark resolved, resolution_method = "auto_resolved_by_routed_goal"
+                       Log: "KNOWLEDGE DEBT RESOLVED (null-key): routed goal {gid} completed — {reason}"
+                       skip
+               # Fall through when no goal id, or the goal is not yet completed.
+               # NEVER resolve a null-key debt on AGE alone: a debt whose
+               # condition is still TRUE must stay open. Age is not evidence the
+               # gap was filled.
+
            # ATTEMPT RESOLUTION — don't just check, actually try
            IF priority is HIGH or sessions_deferred >= 2:
                Reconcile now: read node, attempt the data acquisition that created this debt.
@@ -397,7 +469,17 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
 
            # MAX-DEFER CEILING: drop stale debts that never resolve
            IF sessions_deferred >= 10:
-               Log: "KNOWLEDGE DEBT DROPPED: {node_key} — {reason} (deferred {sessions_deferred} sessions, ceiling reached)"
+               # DURABLE DROP FIRST (g-115-5150) — mirrors encode-session.
+               # This is a DISCARD, not a resolution: the gap is still open and
+               # nobody was told. The Log line dies with the session, and for
+               # the null-key majority it rendered as "DROPPED: null", naming
+               # nothing recoverable. Preserve the reason BEFORE removing.
+               Bash: echo '{"entry_type":"observation","content":"KNOWLEDGE DEBT DROPPED (ceiling {sessions_deferred}): node_key={node_key or \"null\"} priority={priority} source_goal={source_goal} — {reason}"}' | bash core/scripts/execution-diary.sh append
+               IF priority == "HIGH":
+                   # 10 sweeps failed to resolve a HIGH debt — a finding about
+                   # the resolver, not only about this entry.
+                   Bash: echo '{"title":"Investigate: HIGH knowledge debt hit the max-defer ceiling","description":"Dropped at sessions_deferred={N}. node_key={node_key or null}. source_goal={source_goal}. Verbatim reason, preserved because the entry is being discarded: {reason}","priority":"MEDIUM","participants":["agent"],"category":"framework-maintenance","tags":["knowledge-debt","max-defer-drop"],"origin_signal":"investigate:knowledge-debt-ceiling"}' | bash core/scripts/aspirations-add-goal.sh --source world asp-115
+               Log: "KNOWLEDGE DEBT DROPPED: {node_key} — {reason} (deferred {sessions_deferred} sessions, ceiling reached; reason preserved to execution-diary)"
                Remove from debt list (do not carry forward)
 
        Report: "Knowledge debts: {resolved} resolved, {carried} carried forward, {dropped} dropped"
@@ -538,7 +620,32 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
    (~672KB/day write rate is what motivates the truncation). Dormant when
    the PostToolUse * hook is not wired — the loop is idempotent on empty.
 
-   Bash: for _PRES in "$WORLD_DIR"/presence/*.jsonl; do [ -f "$_PRES" ] || continue; py -3 -c "import sys,os,pathlib; sys.path.insert(0, os.environ['CORE_ROOT']+'/scripts'); from _fileops import locked_modify_jsonl; locked_modify_jsonl(pathlib.Path('$_PRES'), lambda recs: recs[-1000:])" 2>/dev/null || true; done; unset _PRES
+   THIS STEP NEVER TRUNCATED ANYTHING, ON ANY BOX, FROM g-115-411 UNTIL
+   2026-08-07 (g-115-5023, filed from ZDS g-001-347). Three compounding
+   defects, each individually silent, which is why it survived:
+     1. It read `os.environ['CORE_ROOT']`, but `_paths.sh:18` ASSIGNS
+        CORE_ROOT without exporting it — line 19 directly below exports
+        PROJECT_ROOT and even comments why. So the child `py` raised
+        KeyError even in a shell where $CORE_ROOT was set and correct.
+     2. `2>/dev/null` swallowed the traceback.
+     3. `|| true` forced rc=0, and there was no &&-gated success line, so
+        the command COULD NOT FAIL. An observer narrating success was
+        narrating rc=0, never truncation.
+   Measured verbatim on three boxes/two platforms before the fix — cc-06
+   Linux 4,916,690 B / 30,411 lines; zak-win MSYS2 2,919,977 B / 18,067;
+   cc-07 Linux 1,172,356 B / 7,183 lines, unchanged by a run that returned
+   rc=0. The 1000-line bound had never held anywhere.
+
+   Values now pass through the ENVIRONMENT and the Python source is
+   SINGLE-quoted, so bash expands nothing inside it (guard-165) — the old
+   line interpolated `pathlib.Path('$_PRES')` straight into the source,
+   which was a parse-injection surface as well as unreadable. stderr is no
+   longer suppressed, and a failure now emits a WARN naming the file. Do
+   NOT reintroduce `2>/dev/null` or `|| true` here: the whole defect above
+   is that the error path rendered identically to success, so no amount of
+   reading the output could ever have found it.
+
+   Bash: for _PRES in "$WORLD_DIR"/presence/*.jsonl; do [ -f "$_PRES" ] || continue; CORE_ROOT="$CORE_ROOT" PRES="$_PRES" py -3 -c 'import sys,os,pathlib; sys.path.insert(0, os.environ["CORE_ROOT"]+"/scripts"); from _fileops import locked_modify_jsonl; locked_modify_jsonl(pathlib.Path(os.environ["PRES"]), lambda recs: recs[-1000:])' || echo "[consolidate] WARN: presence truncation FAILED for $_PRES — file left unbounded"; done; unset _PRES
 
 6. Tree Rebalancing — runs always, including stop_mode. Symmetric with the
    FAST consolidation path in `core/config/consolidation-housekeeping.md`
@@ -693,25 +800,147 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
    Bash: goal-selector.sh blocked
    Parse JSON → blocked_data
 
-   Bash: team-state-update.sh --field agent_status.<AGENT_NAME> \
-     --value '{"last_active":"<now>","current_focus":"session ended","session_goals_completed":<goals_this_session>}'
-   Output: "▸ Team state: updated agent status (session ended, {goals_this_session} goals)"
+   # WHOLE-ROW HAZARD — set NESTED LEAVES, never the bare row path (guard-2769,
+   # g-115-5079). `--field agent_status.<AGENT_NAME>` IS the row path, and the
+   # row path REPLACES: mind_api/src/world/team_state_write.py:200-201 does
+   # `row = dict(parsed)` when the subpath is empty, so a 3-key value leaves a
+   # 3-key row and every key you did not name is gone. A nested-leaf subpath
+   # takes the other branch (`_set_nested`, :202-203) and is additive. Both
+   # print "Updated agent_status.<agent>", so the destructive write's success
+   # message is IDENTICAL to the correct one — nothing surfaces the loss.
+   # Measured 2026-08-05 (alpha, hostname cc-04) running the prior partial-dict
+   # form: `beliefs` (4 entries — the Theory-of-Mind store the Phase 0-pre.0a
+   # contradiction detector reads, carrying prior_confidence / revised_at
+   # bi-temporal history) and `last_fresh_eyes_run` were destroyed in one call.
+   # Re-measured 2026-08-06 (zeta, cc-02) against a live 11-key row: the same
+   # form would have dropped SIX keys, not two — the other four (in_flight,
+   # live_phase, current_focus_updated_at, session_ended) happen to be re-set by
+   # other writers, which is why only two showed up as durable loss.
+   # Do NOT collapse these back into one call, and do NOT &&-chain a sidecar
+   # (board-post, log) onto them — guard-409.
+   FOR EACH (leaf, value) in [("last_active",            "<now>"),
+                              ("current_focus",          "session ended"),
+                              ("session_goals_completed", <goals_this_session>)]:
+       Bash: team-state-update.sh --field agent_status.<AGENT_NAME>.<leaf> --value '<value>'
+
+   # MANDATORY re-read. Recovery is only possible if you NOTICE, and the write
+   # itself will never tell you (guard-2769 step 3, guard-2305).
+   Bash: team-state-read.sh --field agent_status.<AGENT_NAME> --json
+   ASSERT the returned row still carries BOTH `beliefs` AND `last_fresh_eyes_run`.
+   IF either key is absent:
+       # The pre-write copy-on-write snapshot in world/.history is the recovery
+       # layer. Use DIFF, not restore — restore is in-place and would clobber the
+       # session_summary this step just wrote.
+       Bash: bash core/scripts/history-list.sh "world/team-state/agents/<AGENT_NAME>.yaml"
+       Bash: bash core/scripts/history-diff.sh "world/team-state/agents/<AGENT_NAME>.yaml" "<version-name>"
+       Re-set ONLY the lost leaves using the nested-leaf form above, then re-read again.
+   Output: "▸ Team state: updated agent status (session ended, {goals_this_session} goals; beliefs + last_fresh_eyes_run verified intact)"
 
    IF blocked_data.bottlenecks is non-empty:
        critical_blockers_payload = top 3 bottlenecks as JSON array with fields: goal_id, title, cause, downstream_count, updated_by, updated_at
        Bash: team-state-update.sh --field critical_blockers --value '<critical_blockers_json>'
        Output: "▸ Team state: updated critical blockers ({N} entries)"
 
-8.9. Release Held Claims (world goals only):
+8.9. Release Held Claims (BOTH queues):
    # Prevent stale claims when session ends normally. See coordination convention.
    # Status filter excludes terminal-status goals — claim-clearing on completion
    # is enforced in cmd_complete_by/cmd_update_goal; this filter is defense in
    # depth so any future writer regression can't flood the release loop.
+   #
+   # BOTH QUEUES, AND THE SOURCE IS THREADED (g-306-258, from fresh-eyes-code F2
+   # msg-20260807-060726-zeta-5173). This step was world-only in two independent
+   # ways, either sufficient alone to strand a claim: it discarded the agent rows
+   # at the FOR EACH, and it passed no --source so the wrapper's `world` default
+   # applied. Both were CORRECT BY CONSTRUCTION until g-306-238 taught claim() to
+   # accept &source=agent — agent-queue goals carried no claims before that, so a
+   # world-only predicate was complete. The gate's correct operation is what made
+   # the gap invisible (guard-1802 shape, arriving through a SCHEMA change, which
+   # is why no predicate diff would have surfaced it).
+   #
+   # WHY THIS IS THE WORST SITE TO HAVE MISSED: it is the SESSION-END sweep, and
+   # its whole job is to stop claims outliving the session. The goals it could not
+   # see are g-001-01..g-001-10, the recurring cadence — exactly the population
+   # g-306-249's rationale names as the reason a release capability must exist. An
+   # agent that stops while holding one left it stranded across sessions while
+   # this step logged success. Note the mid-session net does NOT cover this:
+   # stranded-claim-sweep.py runs at orchestrator Phase -0.5c.1 on loop RE-ENTRY,
+   # and a session that is ending has no next re-entry. (That sweep is already
+   # source-correct — /v1/aspirations/query reads BOTH queues and tags each row
+   # with `source`, which is the same property the enumeration below relies on.)
+   #
+   # THIS WIDENING ENLARGED g-306-194's BLAST RADIUS — that goal is now CLOSED
+   # and its guard is the block immediately below, so the "do not fix it inline
+   # here" instruction this comment used to carry is RETIRED rather than merely
+   # stale. Kept as history because the reasoning still binds the next editor:
+   # the widening made this step reach agent-queue claims too, and under the
+   # Mind/Body split a worker Body runs as the same agent name against the same
+   # synced agent queue, so a second live holder is a real configuration and not
+   # a hypothetical. The over-release is aggravated by g-306-260 (release()
+   # never resets status, so a wrongly-released in-progress goal is unclaimed
+   # AND unselectable until someone flips it) — which is why the guard below
+   # errs toward SKIPPING rather than toward releasing.
+   # ── FOREIGN-SID GUARD (g-306-194) ─────────────────────────────────────────
+   # Release ONLY claims held by THIS session. The query keys on the AGENT NAME
+   # alone, and under the Mind/Body split a worker Body runs as the same agent
+   # name against the same synced queues — so "another live instance of me" is a
+   # standing configuration, not an edge case. Measured 2026-08-07: this query
+   # returned 53 rows for alpha while a worker Body on another box held ~40 of
+   # them. Releasing those is a silent cross-box theft, aggravated by g-306-260
+   # (release() never resets status, so the victim is left unclaimed AND
+   # unselectable — the over-release does not self-heal).
+   #
+   # THE GUARD IS `== MY SID`, NEVER `!= running-session-id`, and that is
+   # load-bearing: running-session-id is BOX-LOCAL, so the `!=` form is ALSO true
+   # of a genuine live peer and causes the very defect it targets. Skipping every
+   # not-mine claim needs no liveness inference at all and cannot fail in the
+   # dangerous direction — a stale claim left behind is collected by
+   # stranded-claim-sweep.py at the next session's Phase -0.5c.1, which OWNS the
+   # foreign-SID decision and its 120m grace, whereas a wrongly-released peer
+   # claim is destroyed with nothing to restore it. Do NOT "improve" this into a
+   # liveness test here; that would be a second, competing foreign-SID policy.
+   #
+   # A SECOND READ IS REQUIRED — the query cannot answer this (measured
+   # 2026-08-07). aspirations-query.sh projects exactly
+   # {goal_id, asp_id, source, status, title, category} and omits BOTH
+   # claimed_by and claimed_by_sid. That omission is deliberate ("the query
+   # endpoint omits both — query is identity info only",
+   # stranded-claim-sweep._read_goal_claim_fields), so the guard is not a filter
+   # over the rows below; it needs the active aggregate, which carries every
+   # field. One read per SOURCE, not one per GOAL: the sweep pays N aggregate
+   # walks because it inspects a handful of goals, while this step runs over
+   # every claim the agent holds.
    Bash: MIND_AGENT={agent} aspirations-query.sh --goal-field claimed_by {agent_name} --goal-status pending,in-progress,blocked
-   FOR EACH returned goal WHERE source == "world":
-       Bash: aspirations-release.sh <goal-id>
-       Log: "Released claim on {goal.id}"
-   echo "Session ending: released all held claims" | Bash: board-post.sh --channel coordination --type status
+   FOR EACH distinct source among the returned rows:
+       Bash: aspirations-read.sh --source <source> --active --json
+       → sid_map[goal.id] = goal.claimed_by_sid   # for goals with claimed_by == {agent_name}
+   FOR EACH returned goal:                      # NOT `WHERE source == "world"`
+       held_sid = sid_map.get(goal.goal_id)
+       IF held_sid AND held_sid != $MIND_SID:
+           Log: "Skipped {goal.goal_id} — held by session {held_sid[:8]}, not this one ({MIND_SID[:8]})"
+           continue
+       # A NULL held_sid falls through to release DELIBERATELY: claims predating
+       # g-115-3176 carry no sid, and preserving their pre-existing behaviour is
+       # the same legacy rule _read_goal_claim_fields applies.
+       Bash: aspirations-release.sh <goal-id> --source {goal.source}
+       Log: "Released claim on {goal.id} ({goal.source} queue)"
+       # ── PAIRABLE RELEASE POST (g-306-194, guard-1610) ─────────────────────
+       # WORLD ONLY, mirroring _announce_release's own scope decision: an
+       # agent-source queue is private, so a post about one is pure noise on the
+       # shared channel. The RELEASE above still covers BOTH queues (g-306-258) —
+       # announce scope and release scope deliberately differ, do not unify them.
+       IF goal.source == "world":
+           echo "RELEASING {goal.goal_id} -- returned to the world queue as pending because the session holding it ({MIND_SID[:8]}) is ending. Any agent may claim it now." \
+             | Bash: board-post.sh --channel coordination --type release --tags "{goal.goal_id},{agent_name}"
+   # WHY PER-GOAL AND WHY THIS EXACT SHAPE. The old single post — "Session
+   # ending: released all held claims", --type status, no tags — matched NONE of
+   # goal-pickup-coordination-check._released_ids' three legs: not
+   # type=="release"+goal-id tags, not the ^RELEASING <id> text prefix, not a
+   # release-marker tag paired with id tags. Every claim it released therefore
+   # stayed an unpaired lien, and because a post EXISTED, a reader checking "did
+   # we announce?" saw yes — worse than silence. The type, the tags and the
+   # "RELEASING <id>" prefix are each independently load-bearing and are bound to
+   # the REAL consumer by core/scripts/tests/test_release_announce_pairing.py.
+   # Change any one of them and that test goes red.
 
 9. Write Continuation Handoff:
    # Tier 0 phase-cost telemetry (plan: ~/.claude/plans/i-had-one-agent-luminous-reddy.md).

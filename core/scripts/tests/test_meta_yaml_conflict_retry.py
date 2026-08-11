@@ -42,7 +42,6 @@ test_fileops_conflict_retry.py.
 """
 from __future__ import annotations
 
-import importlib
 import json
 import sys
 from pathlib import Path
@@ -57,12 +56,8 @@ for _p in (str(_SCRIPTS), str(_ROOT)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import _conflict_fixture as CF  # noqa: E402  (shared conflict seam, )
 from mind_api.src.meta import meta_yaml as MY  # noqa: E402
-
-
-def _fileops_mod():
-    """The CURRENT _fileops module object (sibling suites reload it)."""
-    return importlib.import_module("_fileops")
 
 
 class _Conflict(Exception):
@@ -109,33 +104,14 @@ class _StubBackend:
         return _Result()
 
 
-def _retry_globals():
-    """The namespace `_rmw_with_conflict_retry` actually reads at call time.
-
-    mind_api/src/file_locks.py does `from _fileops import _rmw_with_conflict_retry`
-    at module level, binding the FUNCTION OBJECT once. That function resolves
-    `get_backend` and `_conflict_backoff` from its own __globals__ — the
-    _fileops module dict it was DEFINED in. Patching the module object returned
-    by importlib.import_module("_fileops") is therefore not reliably the same
-    namespace: sibling suites in this directory sandbox-reload _fileops, after
-    which the imported function still reads the ORIGINAL dict while
-    import_module hands back the NEW module. The patch lands somewhere the code
-    under test never looks, `conflict_cls` falls back to the REAL backend's
-    empty-tuple conflict type, `except conflict_cls` matches nothing, and the
-    injected _Conflict escapes.
-
-    That is not hypothetical: the two conflict-injecting tests below passed in
-    isolation and FAILED in the full suite until this helper existed — the same
-    signature test_retrieve_bump_conflict_retry.py documents in its
-    MODULE-IDENTITY NOTE. Going through __globals__ is exact and reload-proof.
-    """
-    return MY.file_locks._rmw_with_conflict_retry.__globals__
-
-
 @pytest.fixture(autouse=True)
 def _no_backoff(monkeypatch):
-    """Retry sleeps would make these tests slow for no signal."""
-    monkeypatch.setitem(_retry_globals(), "_conflict_backoff", lambda *_: 0)
+    """Retry sleeps would make these tests slow for no signal.
+
+    Autouse, so it must stay separate from the `backend` fixture below (which
+    also zeroes backoff): tests that never request `backend` still need it.
+    """
+    monkeypatch.setitem(CF.retry_globals(), "_conflict_backoff", lambda *_: 0)
 
 
 @pytest.fixture()
@@ -153,18 +129,10 @@ def meta_dir(tmp_path):
 
 @pytest.fixture()
 def backend(monkeypatch):
-    be = _StubBackend()
-    # Three namespaces resolve get_backend on this path, and they are NOT
-    # guaranteed to be the same dict (see _retry_globals):
-    #   1. storage_backend — _read_yaml imports it at CALL time
-    #   2. the retry primitive's own __globals__ — where conflict_cls comes from
-    #   3. the current _fileops module object — belt-and-braces for any other
-    #      helper (_atomic_write_with_fallback's lock path) resolving there
-    import storage_backend
-    monkeypatch.setattr(storage_backend, "get_backend", lambda: be)
-    monkeypatch.setitem(_retry_globals(), "get_backend", lambda: be)
-    monkeypatch.setattr(_fileops_mod(), "get_backend", lambda: be, raising=False)
-    return be
+    # The namespace enumeration this used to hand-roll now lives once in
+    # _conflict_fixture.patch_conflict_backend (). _read_yaml imports
+    # storage_backend at CALL time, so no `extra` module is needed here.
+    return CF.patch_conflict_backend(monkeypatch, _StubBackend())
 
 
 @pytest.fixture(autouse=True)

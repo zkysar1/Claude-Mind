@@ -68,13 +68,44 @@ CLEAN_ASP = {
 }
 
 
-def _seed_world(tmp_path: Path, *, live=None, archive=None, pipeline=None) -> Path:
+def _seed_world(tmp_path: Path, *, live=None, archive=None, pipeline=None,
+                rb=None, guards=None, patsig=None) -> Path:
     world = tmp_path / "world"
     world.mkdir(parents=True, exist_ok=True)
     _write_jsonl(world / "aspirations.jsonl", live or [])
     _write_jsonl(world / "aspirations-archive.jsonl", archive or [])
     _write_jsonl(world / "pipeline.jsonl", pipeline or [])
+    _write_jsonl(world / "reasoning-bank.jsonl", rb or [])
+    _write_jsonl(world / "guardrails.jsonl", guards or [])
+    _write_jsonl(world / "pattern-signatures.jsonl", patsig or [])
     return world
+
+
+# ---------------------------------------------------------------------------
+# : the SECOND leak family. Verbatim record builders from
+# mind_api/tests/test_runtime_store_rbguard.py (_rb_rec / _guard_rec) and
+# test_runtime_store_patsig_spark.py (_patsig_rec). These leak into flat stores
+# the scanner did not cover, and -- because a builder called without an explicit
+# id gets auto-allocated <prefix>-{max+1} against the PRODUCTION max -- they take
+# real next-in-sequence ids, so only CONTENT identifies them.
+# ---------------------------------------------------------------------------
+FIXTURE_RB = {"id": "rb-6120", "title": "Test RB entry", "type": "success",
+              "category": "test-cat", "content": "A test reasoning-bank entry.",
+              "applies_to": "framework", "status": "active"}
+CLEAN_RB = {"id": "rb-6121", "title": "Probe the store of record, not the mirror",
+            "type": "failure", "category": "framework-architecture",
+            "content": "Under own-cloud the local tree is a read-through cache.",
+            "applies_to": "framework", "status": "active"}
+FIXTURE_GUARD = {"id": "guard-200", "rule": "always test before deploy",
+                 "category": "test-guard", "trigger_condition": "before any deploy",
+                 "source": "wave-2-test", "status": "active"}
+CLEAN_GUARD = {"id": "guard-201", "rule": "Pin STORAGE_BACKEND=local for any test runner",
+               "category": "framework-testing",
+               "trigger_condition": "before invoking pytest on an own-cloud box",
+               "source": "g-115-4371", "status": "active"}
+FIXTURE_PATSIG = {"id": "sig-102", "name": "test pattern",
+                  "description": "a test pattern signature",
+                  "expected_outcome": "outcome-x", "status": "contradicted"}
 
 
 def test_detects_seeded_fixture(tmp_path):
@@ -159,6 +190,108 @@ def test_exit_on_hits_codes(tmp_path, monkeypatch):
         sys, "argv",
         ["fixture-leak-scan.py", "--world-dir", str(clean), "--exit-on-hits"])
     assert scanner.main() == 0
+
+
+# ---------------------------------------------------------------------------
+#  -- flat-store coverage + the store-agnostic record-field signatures.
+# Mutation proof for each: the fixture record IS flagged, and a real record with
+# the same SHAPE in the same store is NOT.
+# ---------------------------------------------------------------------------
+
+def test_flat_stores_are_scanned_and_fixtures_detected(tmp_path):
+    """reasoning-bank / guardrails / pattern-signatures were entirely unscanned.
+    Live census 2026-08-01 found 24 + 14 + 1 fixture records the scanner passed."""
+    scanner = _load_scanner()
+    world = _seed_world(tmp_path, live=[CLEAN_ASP],
+                        rb=[CLEAN_RB, FIXTURE_RB],
+                        guards=[CLEAN_GUARD, FIXTURE_GUARD],
+                        patsig=[FIXTURE_PATSIG])
+    suspects = scanner.scan(world_dir=str(world))
+    ids = {s["record_id"] for s in suspects}
+    assert "rb-6120" in ids, suspects
+    assert "guard-200" in ids, suspects
+    assert "sig-102" in ids, suspects
+    # Stores are labelled so a triager knows where to look.
+    stores = {s["store"] for s in suspects}
+    assert "world/reasoning-bank.jsonl" in stores
+    assert "world/guardrails.jsonl" in stores
+    assert "world/pattern-signatures.jsonl" in stores
+    # No false positive on genuine records that live in the SAME stores.
+    assert "rb-6121" not in ids, [s for s in suspects if s["record_id"] == "rb-6121"]
+    assert "guard-201" not in ids, [s for s in suspects if s["record_id"] == "guard-201"]
+
+
+def test_flat_store_without_fixtures_is_clean(tmp_path):
+    """The other half of the mutation proof: remove the fixtures and the same
+    seed goes green. Without this, a scanner that flagged everything would pass
+    the detection half above."""
+    scanner = _load_scanner()
+    world = _seed_world(tmp_path, live=[CLEAN_ASP], rb=[CLEAN_RB],
+                        guards=[CLEAN_GUARD])
+    assert scanner.scan(world_dir=str(world)) == []
+
+
+def test_flat_store_retired_fixture_is_skipped_but_active_one_flags(tmp_path):
+    """A retired flat-store record is a GOVERNED tombstone -- already remediated,
+    so re-flagging it every 24h run is re-triage noise (same rule the aspiration
+    scan applies, g-115-2723). An active fixture in the same store still flags."""
+    scanner = _load_scanner()
+    world = _seed_world(tmp_path, rb=[
+        {**FIXTURE_RB, "id": "rb-100", "status": "retired"},
+        {**FIXTURE_RB, "id": "rb-6120", "status": "active"},
+    ])
+    ids = {s["record_id"] for s in scanner.scan(world_dir=str(world))}
+    assert "rb-100" not in ids, ids
+    assert "rb-6120" in ids, ids
+
+
+def test_pipeline_record_field_fixture_is_detected(tmp_path):
+    """The store-set gap was the LESS important half. pipeline.jsonl was covered
+    from day one and still held 7 undetected fixtures (2026-05-14_test-hyp,
+    2026-07-29_census-a..d, ...) carrying category="test-cat" -- invisible to the
+    title/description pass, which only knows the asp-338..343 family. Being
+    SCANNED is not being COVERED when the signature set is a generation behind."""
+    scanner = _load_scanner()
+    world = _seed_world(tmp_path, pipeline=[
+        {"id": "2026-07-29_census-a", "category": "test-cat",
+         "hypothesis": "a hypothesis"},
+        {"id": "2026-07-31_real-work", "category": "framework-architecture",
+         "hypothesis": "The deadman re-arm restores the net before any work."},
+    ])
+    ids = {s["record_id"] for s in scanner.scan(world_dir=str(world))}
+    assert "2026-07-29_census-a" in ids, ids
+    assert "2026-07-31_real-work" not in ids, ids
+
+
+def test_pipeline_archived_status_is_still_scanned(tmp_path):
+    """Deliberate asymmetry: for the pipeline "archived" is a NORMAL lifecycle
+    status (discovered/active/resolved/archived), NOT the remediation marker it
+    is for an aspiration or an rb/guard row. Skipping it would suppress every
+    fixture that reached archived naturally and make pipeline-archive vacuous."""
+    scanner = _load_scanner()
+    world = _seed_world(tmp_path, pipeline=[
+        {"id": "2026-07-29_census-b", "category": "test-cat",
+         "status": "archived", "hypothesis": "a hypothesis"},
+    ])
+    ids = {s["record_id"] for s in scanner.scan(world_dir=str(world))}
+    assert "2026-07-29_census-b" in ids, ids
+
+
+def test_reported_coverage_equals_actual_coverage(tmp_path, monkeypatch, capsys):
+    """--json reports what it SCANNED. Keeping that list separate from the list
+    scan() iterates is how a scanner comes to under-report its own coverage
+    (guard-1760) -- the failure a completeness tool must never have. One
+    constant, so the two cannot drift."""
+    scanner = _load_scanner()
+    world = _seed_world(tmp_path, live=[CLEAN_ASP])
+    monkeypatch.setattr(
+        sys, "argv", ["fixture-leak-scan.py", "--world-dir", str(world), "--json"])
+    assert scanner.main() == 0
+    reported = json.loads(capsys.readouterr().out)["scanned"]
+    assert reported == [f"world/{n}" for n, _ in scanner.SCANNED_STORES]
+    # And every scanned store is actually dispatched to a real scanner.
+    for _, kind in scanner.SCANNED_STORES:
+        assert kind in scanner._SCANNERS, kind
 
 
 if __name__ == "__main__":

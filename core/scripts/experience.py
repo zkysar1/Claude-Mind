@@ -673,18 +673,49 @@ def cmd_update_field(args):
             )
             sys.exit(1)
         rec[field] = value
+        # A whole-object write REPLACES the dict normalize_record already
+        # deep-backfilled above, so re-normalize to restore the sub-key
+        # guarantee the strict lookups below depend on ().
+        if field == "retrieval_stats":
+            rec = normalize_record(rec)
         # DO NOT REMOVE: full-record validation after any field update — see
         # guard-330 / rb-364. Update-field must not be a back-door around
-        # add-time validation. ORDER MATTERS: validate BEFORE recompute, so
-        # direct writes to derived fields (e.g., utility_ratio) are caught
-        # instead of silently clobbered by the recompute step.
+        # add-time validation. ORDER MATTERS: validate BEFORE recompute, so the
+        # recompute cannot mask a record the validator would have rejected.
+        #
+        # This comment used to add "so direct writes to derived fields (e.g.
+        # utility_ratio) are caught instead of silently clobbered by the
+        # recompute step." That is FALSE and was measured false on 2026-08-04:
+        # validate_record only type-checks that retrieval_stats is a dict (it
+        # has no derived-field assertion), so a whole-object payload carrying
+        # utility_ratio=0.9 with rc=10/tu=1 stores 0.1, rc=0, no warning.
+        # Recompute-wins is the DEFENSIBLE precedence for a derived field — the
+        # defect was the claim, not the behaviour. It went unnoticed because the
+        # recompute below was unreachable until  widened it, so
+        # nothing was ever clobbered and the claim was untestable rather than
+        # wrong. Asserting on a caller-supplied derived value is a live-write
+        # behaviour change and needs its own goal; see
+        # msg-20260804-201727-echo-5334.
         validate_record(rec)
         # Recalculate utility_ratio when retrieval stats change (after validate
         # — recompute output is deterministic). Strict lookups: normalize_record
         # deep-backfills missing sub-keys, so retrieval_count/times_useful are
         # guaranteed present here. Fail loud if not ().
+        #
+        # DO NOT narrow to the startswith() arm alone (). The dotted
+        # guard ~20 lines above exits before this point, so that arm can NEVER
+        # fire — this branch was dead from 2026-05-10 () until
+        # 2026-08-04, and utility_ratio read 0.0 on 4,174 of 4,175 fleet records
+        # while the archive sweep's "never archive high-value" guard
+        # (rc>=5 AND ur>=0.5) qualified none of them. `retrieval_stats` as a
+        # whole object is the ONLY shape that reaches here, and it is the shape
+        # every caller uses precisely BECAUSE the dotted form fails. The
+        # startswith() arm is kept so the recompute stays correct if that guard
+        # is ever relaxed. Pinned by test_experience_utility_ratio_recompute.py.
         stats = rec.get("retrieval_stats")
-        if stats and isinstance(stats, dict) and field.startswith("retrieval_stats."):
+        if stats and isinstance(stats, dict) and (
+                field == "retrieval_stats"
+                or field.startswith("retrieval_stats.")):
             rc = stats["retrieval_count"]
             tu = stats["times_useful"]
             stats["utility_ratio"] = round(tu / max(rc, 1), 4)
@@ -1000,7 +1031,16 @@ def main():
     # update-field
     p_uf = subparsers.add_parser("update-field", help="Update a single record field")
     p_uf.add_argument("rec_id", type=str, help="Record ID")
-    p_uf.add_argument("field", type=str, help="Field to update (supports dot notation)")
+    # NOT dot notation: the daemon rejects any field containing "." with
+    # 400 dotted_field_rejected ("Option A -- matches reasoning-bank.py",
+    # mind_api/src/endpoints/store.py:496, plus 4 sibling sites). These
+    # wrappers are daemon-only (.claude/rules/no-python-cli-fallback.md), so
+    # a dotted field can never succeed. To change one key of a nested object,
+    # read the object, modify it, and write the whole object back under its
+    # flat top-level key.
+    p_uf.add_argument("field", type=str,
+                      help="Field to update (flat top-level key only -- dotted "
+                           "names are rejected by the daemon)")
     p_uf.add_argument("value", type=str, help="New value")
 
     # archive-sweep

@@ -309,3 +309,105 @@ def test_live_config_declares_more_than_one_testpath():
     assert collected == expected, (
         "runner collected %s but config declares %s (minus deferred)"
         % (sorted(collected), sorted(expected)))
+
+
+# ===========================================================================
+#  — NUL-byte log-corruption detection
+#
+# The corruption incident was MEASURED on 2026-07-31 and written into
+# run-full-suite.py's own comments ("the log had 1532 NUL bytes"), but nothing
+# ever tested for them. So the evidence lived in prose while every run stayed
+# blind, and the hypothesis asking "is INVALID actually corruption?" could not
+# be answered: the documented remedy for a bad verdict (climb the chunk ladder
+# and re-run) OVERWRITES the chunk logs before anyone inspects them.
+# ===========================================================================
+
+
+_CLEAN_CHUNK = _progress([("." * 72, 50), ("." * 72, 100)]) + "\n144 passed in 90s"
+
+
+def _corrupt(chunk, n=4):
+    """Splice NUL bytes into an otherwise-healthy chunk log.
+
+    Mirrors the measured incident: the file is PARTIALLY overwritten while the
+    runner reads it, so the surviving text still looks like a finished run.
+    """
+    return chunk[:20] + ("\x00" * n) + chunk[20:]
+
+
+def test_nul_corrupted_chunk_that_still_parses_is_caught():
+    """THE FALSE-GENUINE CASE — invisible to both pre-existing branches.
+
+    `_looks_aborted` is False (the log reaches 100%) and the silent-zero branch
+    is skipped (the has-counts regex matches "144 passed"), so before this
+    check a rewritten log was certified trustworthy. A false GENUINE is
+    strictly worse than a false INVALID: INVALID at least refuses to be
+    trusted.
+    """
+    chunks = [_CLEAN_CHUNK, _corrupt(_CLEAN_CHUNK), _CLEAN_CHUNK]
+    # The pre-existing branches genuinely do not see it: neither fires here.
+    assert RFS._looks_aborted(chunks[1]) is False
+    verdict, reasons = RFS.classify("\n".join(chunks), 0, chunks=chunks)
+    assert verdict == "contended", reasons
+    nul = [r for r in reasons if "NUL byte" in r]
+    assert len(nul) == 1, reasons
+    assert "chunk 01" in nul[0] and "4 NUL byte" in nul[0]
+
+
+def test_the_same_chunk_without_nuls_is_clean():
+    """NEGATIVE CONTROL — the discriminator must be the NULs, nothing else.
+
+    Byte-identical to the case above except the NULs are absent. Without this
+    pairing, a check that flagged every chunk would satisfy the test above.
+    """
+    chunks = [_CLEAN_CHUNK, _CLEAN_CHUNK, _CLEAN_CHUNK]
+    verdict, reasons = RFS.classify("\n".join(chunks), 0, chunks=chunks)
+    assert verdict == "clean", reasons
+    assert not [r for r in reasons if "NUL" in r]
+
+
+def test_nul_and_aborted_are_reported_together_not_exclusively():
+    """Both reasons must surface — their REMEDIES are opposite.
+
+    Aborted says "the box was starved, re-run with more chunks"; corrupted
+    says "do NOT re-run, that overwrites your evidence". An elif would hide
+    one of them and send the reader to the wrong remedy.
+    """
+    stalled = _progress([("." * 72, 25), ("." * 36, 51)])   # no count line
+    both = _corrupt(stalled, 2)
+    chunks = [_CLEAN_CHUNK, both]
+    verdict, reasons = RFS.classify("\n".join(chunks), 0, chunks=chunks)
+    assert verdict == "contended", reasons
+    assert any("NUL byte" in r for r in reasons), reasons
+    assert any("stopped at" in r for r in reasons), reasons
+
+
+def test_nul_reason_names_the_right_remedy_and_warns_off_the_ladder():
+    """The actionable half: climbing the ladder DESTROYS this evidence.
+
+    A re-run writes into the same default log dir, so the standard response to
+    a bad verdict overwrites the only artifact that can diagnose corruption.
+    The reason string has to say so, or the reader does the destructive thing.
+    """
+    chunks = [_corrupt(_CLEAN_CHUNK)]
+    _, reasons = RFS.classify(chunks[0], 0, chunks=chunks)
+    r = next(x for x in reasons if "NUL byte" in x)
+    assert "--out" in r
+    assert "CORRUPTION, not contention" in r
+    assert "ladder" in r
+
+
+def test_every_corrupted_chunk_is_named_individually():
+    """Per-chunk indices, so the reader knows WHICH log to inspect."""
+    chunks = [_corrupt(_CLEAN_CHUNK, 1), _CLEAN_CHUNK, _corrupt(_CLEAN_CHUNK, 3)]
+    _, reasons = RFS.classify("\n".join(chunks), 0, chunks=chunks)
+    nul = [r for r in reasons if "NUL byte" in r]
+    assert len(nul) == 2, reasons
+    assert "chunk 00" in nul[0] and "chunk 02" in nul[1]
+
+
+def test_unchunked_run_is_unaffected():
+    """classify() is also called with chunks=None; that path must not change."""
+    verdict, reasons = RFS.classify(_CLEAN_CHUNK, 0)
+    assert verdict == "clean"
+    assert not [r for r in reasons if "NUL" in r]

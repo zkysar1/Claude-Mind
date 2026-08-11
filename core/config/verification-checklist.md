@@ -2232,7 +2232,7 @@ Verifies the aspirations compact cache reduces repeated context loading from `as
 22. `core/scripts/aspirations.py` has `cmd_query` function and `query` subparser with `--goal-status`, `--goal-field`, `--title-contains` flags
 23. `core/scripts/aspirations-query.sh` exists as thin shell wrapper (same pattern as `aspirations-read.sh`)
 24. `aspirations-query.sh --goal-status in-progress` returns flat JSON array with `goal_id`, `asp_id`, `source`, `title`, `status` fields
-25. `aspirations-query.sh` searches BOTH world and agent queues (ignores `--source` flag)
+25. `aspirations-query.sh` searches BOTH world and agent queues and REFUSES `--source` with exit 2 (g-115-5214 — it used to accept-and-discard it, so `--source world` and `--source agent` returned byte-identical unions and a caller summing both double-counted; scope client-side on the per-row `source` key instead)
 26. `aspirations-query.sh` with no filter flags exits with error (at least one filter required)
 27. `_COMPACT_GOAL_KEEP` (daemon SSOT, `mind_api/src/endpoints/aspirations.py`) does NOT include `claimed_by` — comment documents this is intentional (use `aspirations-query.sh` for claim lookups)
 28. `core/config/conventions/aspirations.md` script table includes all three `aspirations-query.sh` modes
@@ -3100,3 +3100,66 @@ field is in the schema before believing it is null.
 47. **Static**: `grep -q 'Bash: aspirations-query.sh --goal-status in-progress --full' .claude/skills/aspirations-graceful-stop/SKILL.md` — the orphan-revert loop keeps `--full`, so `goal.id` resolves instead of mutating with an empty id. Verified by g-115-3127.
 48. **Static**: `awk '/= "--triage" \]; then exit/{t=NR} /run-invisible-suites\.sh/{i=NR} END{exit !(t && i && t<i)}' core/scripts/run-full-suite.sh` — `run-full-suite.sh`'s `--triage` short-circuit must stay ABOVE the invisible-suite and domain halves. `--triage` RUNS NOTHING: it re-reads chunk logs a prior run already wrote. If a future suite-half is appended and the short-circuit is left below it (or moved), `--triage` silently starts executing full suites it never examined, and folds their exit codes into a verdict that is about the framework chunk logs alone — including misreading triage's rc=1 ("genuine unowned reds found", its actionable result) as "the framework half did not pass". Order-aware by construction, so a check that greps only for the line's presence cannot catch the reordering. Discriminator confirmed 2026-07-31: passes on the current tree, and the same awk with the two patterns swapped exits 1. Verified by g-115-4321.
 49. **Static**: `grep -qE '^_DEFERRED_RESOLVE_RC=\$\?' core/scripts/run-full-suite.sh && ! grep -qE '^DEFERRED_PATHS=.*2>/dev/null' core/scripts/run-full-suite.sh` — the deferred-testpath resolver in `run-full-suite.sh` must capture its exit code and must NOT silently discard the resolver's stderr. Both halves matter and they fail differently: without the rc capture a crashed resolver yields an empty `DEFERRED_PATHS`, so the runner prints NOTHING about deferred paths and a reader cannot distinguish "no deferred paths configured" from "the resolver died" — silence reads as coverage. Without the stderr, the failure is unattributable even once noticed. This is the `verify-before-assuming.md` rule-4 class (a `2>/dev/null` command is ZERO signals, not one) applied to the very tool whose job is to report what did NOT run: `run-full-suite.sh` already reports only what it ran and never what it declined to look for (guard-1760), so a silent resolver failure regenerates exactly the 1,448-test blind spot g-115-3748 closed. Anchored at line-start on the executable assignment, not on prose or comments (guard-1099) — the file now contains comments quoting the old silent form, and an unanchored grep would match those and pass forever. Mutation-proven 2026-07-31: commenting out the rc-capture line turns the check red. Verified by g-115-3748.
+
+## BR15. A Wrapper Flag Implemented in Python and Missing from the Shell Case Block Is Unreachable — and Its Own Named Test Can Still Pass (g-115-4777 window)
+
+`core/scripts/_team_belief.py` implemented `--domain` (g-306-29) end-to-end: argparse
+registration, threading into `supersede_beliefs`, storage on the record. Its test file
+carried `test_domain_field_recorded_when_provided`, which passed. `core/scripts/team-belief-write.sh`
+— the ONLY invocation path documented anywhere, and the one fresh-eyes-review Phase 2.6c
+instructs callers to use — had **zero occurrences of the string `domain`**. Its arg loop's
+catch-all `*) shift;;` silently discarded the flag and its value, so `PY_ARGS` never carried it.
+
+Every partner belief written through the documented path therefore stored `domain: null`, and
+`aspirations-precheck` Phase 0-pre.0a's contradiction detector — which by design evaluates ONLY
+beliefs carrying a checkable `domain` — ran against a structurally EMPTY candidate set. Its
+`clean (no domain-belief contradictions)` verdict was vacuous, not negative: it reported on zero
+beliefs, not on zero contradictions. Measured fleet-wide at 100%, which is the tell — a
+writer-discipline problem does not come out at 100%.
+
+Three things conspired, and each is worth carrying separately:
+
+- **The test tested the layer that was never broken.** `test_domain_field_recorded_when_provided`
+  calls `supersede_beliefs(domain=...)` — the Python function — while the production shape is
+  `bash team-belief-write.sh --domain ...`. guard-920's class exactly: a regression test must
+  replicate the literal production arg shape, not the contract-ideal one. A reader checking
+  "is `--domain` covered?" finds a green test with the right name.
+- **The detector-of-detectors was blind to the line the flag was written on.**
+  `skillmd-flag-audit.py` exists to catch a SKILL.md call site using a flag its wrapper does not
+  accept. It reads only the FIRST line of a `Bash:` call site and does not follow backslash
+  continuations; Phase 2.6c's call is four lines with `--domain` on the last. Controlled probe:
+  three fixtures, `scanned_lines=3`, plain and bracketed continuations both invisible AND both
+  counted as resolved with zero skips. Blast radius 70 of 2,469 call sites. Recorded as FIX 6 on
+  g-115-3122.
+- **Two existing entries already said not to do this.** guard-2172 (a wrapper's accepted flags
+  live in its argument-parsing case block ONLY) and rb-538 (multi-layer arg parsers silently drop
+  unknown flags). The flag was passed on the SKILL.md's authority without consulting either.
+
+The check below is deliberately BOTH halves, because they fail differently: a case arm without the
+`PY_ARGS` forward parses the flag and then discards it (indistinguishable from today's bug at the
+storage layer), and a forward without the case arm can never fire. Anchored on the executable
+lines, not on the surrounding comment — this file's own comment quotes the broken state, and an
+unanchored grep would match the comment and pass forever (guard-1099).
+
+50. **Static**: `grep -qE '^\s+--domain\)\s+DOMAIN=' core/scripts/team-belief-write.sh && grep -qE '^\[ -n "\$DOMAIN" \] && PY_ARGS\+=\(--domain ' core/scripts/team-belief-write.sh` — `team-belief-write.sh` must both PARSE `--domain` into `DOMAIN` and FORWARD it into `PY_ARGS`. Either half alone silently restores the vacuous-detector state described above. Mutation-proven 2026-08-03: deleting the case arm turns the check red; deleting the forward turns it red independently. Verified by g-115-4777 window (alpha, cc-04).
+51. **Runtime**: `bash core/scripts/team-belief-write.sh --about <partner> --belief "<text>" --domain "<focus>"` then read `agent_status.<self>.beliefs` — the newest entry's `domain` must be the passed string, NOT null. This is the live-behavior twin of check 50 and catches the whole class rather than one wrapper's syntax: a drop introduced at the wrapper, in `_team_belief.py`, or at the daemon write all present identically as a null field. Pair it with the negative control (same call WITHOUT `--domain` must still exit 0 and store null) — without the pair, a wrapper that hard-codes a non-null domain would pass. Verified by g-115-4777 window.
+
+The check below guards a gate that was UNREACHABLE BY CONSTRUCTION rather than merely wrong — the
+worst shape to leave uncovered, because an unreachable gate and a gate that finds nothing produce
+identical output forever. `aspirations-all-blocked` B6.7 Target 1 grouped blocked goals by the FULL
+`blocker_ref.external_id`, which is near-unique per goal, then gated aspiration synthesis on
+`affected_count >= 2`. The PRIMARY synthesis target — added first, explicitly to honor a user
+directive about creating more aspirations — could therefore never fire. Filed by omni from
+ZDS-Mind (76 ids / 76 distinct / max-sharing 1); reproduced here on a live 169-goal blocked queue
+(159 distinct of 169, max-sharing 3 — so a rare group CAN reach 2, making the defect intermittent
+rather than total, which is exactly why it survived). Fixed to group by the external_id CLASS
+PREFIX (text before the first colon), which yields 6 patterns at >= 2.
+
+BOTH halves are required and they fail differently. Without the positive half a revert to any other
+key passes silently; without the negative half the old line could be restored alongside the new one
+and the positive grep would still match. The negative half filters comment lines FIRST because the
+SKILL.md deliberately documents the defect in prose ("DO NOT group by the FULL external_id") — an
+unfiltered grep would match that documentation and report the bug present forever (guard-1099, the
+same anchoring trap check 50 describes).
+
+52. **Static**: `grep -qE '^[[:space:]]+Iterate parsed\.blocked_goals\. Group by the external_id CLASS PREFIX' .claude/skills/aspirations-all-blocked/SKILL.md && ! grep -vE '^[[:space:]]*#' .claude/skills/aspirations-all-blocked/SKILL.md | grep -qE 'Group by blocker_ref\.external_id'` — B6.7 Target 1 must group by the external_id CLASS PREFIX and must NOT carry the full-external_id form on any non-comment line. Both halves run and verified green 2026-08-04 (bravo, hostname cc-05, uname -r 6.8.0-136-generic); the positive pattern occurs exactly once in the file, on the executable line. MUTATION-PROVEN the same day against a temp copy, three cases: rewriting the key to `blocker_ref.type` turns it red; appending the old full-external_id form on an executable line turns it red independently; appending that same form inside a `#` comment leaves it GREEN — the third case is the one worth running, because it proves the comment filter works rather than asserting it, and this file's own prose documents the defect it must not match. Verified by g-115-4923.

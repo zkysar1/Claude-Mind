@@ -48,11 +48,31 @@ checked=0
 # Check EVERY agent dir on this box, not just the bound one: the override that
 # motivated this was scoped to a single agent (`agents/alpha/*.jsonl`), so a
 # bound-agent-only probe would have missed it from any other agent's session.
-for conf in "$(agents_root)"/*/local-paths.conf; do
-    [ -f "$conf" ] || continue
-    agent="$(basename "$(dirname "$conf")")"
+#
+# ENUMERATE AGENT DIRS, NOT `*/local-paths.conf` (, fixed 2026-08-06).
+# The conf glob is the enumerator this file's own intent forbids: on any given
+# box only the RESIDENT agent has a local-paths.conf, so it silently degraded
+# this probe to exactly the bound-agent-only scan the comment above rules out.
+# Measured on cc-07 — 5 agent dirs, 1 conf, and every one of the other four
+# carried 5 TRACKED ledger files resolving to ayoai-ledger: 5 of 25 paths
+# checked, 20 invisible, reported as `OK`. The originating cc-04 override was
+# scoped to `agents/alpha/*.jsonl` where alpha IS resident, which is the only
+# reason it was ever caught; the identical override aimed at a non-resident
+# agent would have been undetectable. CLAUDE.md already documents this exact
+# enumerator as wrong for cross-agent sweeps (the owncloud-pull.sh row), and
+# rb-5514 is the general form: enumerate the thing that actually varies, not a
+# box-local artifact that happens to sit beside it.
+for adir in "$(agents_root)"/*/; do
+    [ -d "$adir" ] || continue
+    agent="$(basename "$adir")"
     for led in $LEDGERS; do
         rel="agents/$agent/$led"
+        # `git check-attr` is pattern-only and answers for paths that do not
+        # exist, so without this guard a stray non-agent directory under
+        # agents/ would inflate `checked` with paths git will never merge —
+        # turning the count the goal relies on as an anti-vacuity signal into
+        # a number that grows when coverage does NOT.
+        [ -e "$PROJECT_ROOT/$rel" ] || continue
         got="$(git check-attr merge -- "$rel" 2>/dev/null | sed 's/.*: merge: //')"
         [ -z "$got" ] && continue
         checked=$((checked + 1))

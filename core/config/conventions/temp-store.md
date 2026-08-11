@@ -51,10 +51,53 @@ to live there permanently.
 | Content | Working documents with reuse value that DRAIN to the tree: analyses, briefings, audits, design docs, snapshots | IO buffers with no reuse value: probe dumps, JSON staging, one-shot work files |
 | Drain target | Knowledge tree / reasoning bank / experience | Nowhere — ephemeral by definition |
 | Git | Gitignored — all of `temp/` except `.gitkeep` (g-115-1765); durability via S3 sync | Gitignored (`**/session/`) |
+| Cross-machine | Synced to S3 — survives an agent moving boxes | `sync_tier: machine_local` — **never leaves this box**; an agent that moves machines loses it outright |
 
 **Decision rule**: if the content might be worth encoding into the
 knowledge tree later, write to `temp/`. If it is a throwaway IO buffer
 consumed within the current step, write to `session/scratch/`.
+
+**Two traps in the `Lifetime` and `Cross-machine` rows above** (g-335-941):
+
+1. `session/` (SINGULAR) is not `sessions/` (PLURAL). The 24h mtime TTL people
+   remember belongs to `cleanup-stale-bindings.sh`, which sweeps
+   `agents/<name>/sessions/<SID>/` — the per-session dirs. `session/scratch/`
+   is swept by a different mechanism entirely. Misreading the two costs you the
+   wrong mental model of when your file dies.
+2. Scratch's clear is an **EVENT, not a timer** — every `/start --recover` and
+   every recovery-gate auto-recovery. There is no deadline you can plan around,
+   which is sharper than a TTL, not softer.
+
+### Do not cite a `session/scratch/` path from a durable record
+
+A goal description, tree node, reasoning-bank entry, or convention that names a
+`session/scratch/` path is a durable pointer into a target that will be cleared
+without warning. It WORKS at write time — the file is right there — and the
+failure is silent and delayed. Write the content to `temp/` and cite that, or
+inline the content into the record.
+
+**This is a narrow rule, and the narrowness is measured** (echo, hostname
+`cc-03`, `uname -r` 6.8.0-136-generic, 2026-08-06, own-cloud, 1,435 durable
+surfaces — world tree + world conventions + world aspirations/reasoning-bank/
+pipeline/guardrails/pattern-signatures + all 5 agent aspiration queues):
+
+| predicate | distinct refs |
+|---|---|
+| `agents/*/session/` anywhere | 65 |
+| …naming an at-risk `session-manifest.yaml` entry (`recovery_action: clear` ∪ `sync_tier: machine_local`) | 26 |
+| …under `session/scratch/` — **the actual defect class** | **1** |
+| `agents/*/temp/` (the sanctioned store), for contrast | 358 |
+
+**Do NOT widen this into a gate on "durable record cites an ephemeral path."**
+25 of those 26 at-risk citations are *evidence citations* — a record naming a
+session file as the PROVENANCE of a measurement it already transcribes
+(`Source: agents/<agent>/session/precheck-drops.jsonl, 92 precheck-end
+records`). That is the exact discipline `guard-1476` mandates, so the obvious
+gate would fire ~25 false positives on compliance with another guardrail and
+train agents to drop their provenance stamps. The single scratch-shaped hit was
+`g-335-941`'s own narrative quoting an already-remediated incident from another
+deployment. The distinction that matters is **evidence citation vs content
+pointer**, not durable-vs-ephemeral.
 
 ## File naming
 
@@ -100,7 +143,28 @@ g-115-2948 this GC is **automated** — `temp-drain-purge.sh` **Lane 2**
 (`gc_drained_archive`) prunes `drained/` files older than `--drained-age-days`
 (default 30) on every run, via the same guarded `find -maxdepth 1 -type f
 -mtime +N -delete` pattern (the `drained/` dir itself is always preserved).
-No separate maintenance goal is needed. The "no other subdirectories" rule
+No separate maintenance goal is needed.
+
+**A citation protects an artifact in `drained/` too (g-306-102).** Lane 2
+exempts any file whose basename is cited by a durable record, the same
+exemption Lane 1 gained in g-306-111 and keyed the same way. Before this,
+citation-protection was a property of WHICH DIRECTORY a file sat in rather
+than of the artifact: draining a cited doc into `drained/` stripped its
+protection and made it age-deletable with no reference check at all. Two
+consequences worth knowing:
+
+- When the cited set cannot be determined, Lane 2 is **skipped entirely**
+  (deletes nothing, warns on stderr) rather than falling back. Lane 1 can
+  degrade to the pre-inversion allow-list because that is strictly
+  no-worse-than-before; Lane 2 has no allow-list to fall back to, so its only
+  no-worse option is to delete nothing. A zero `drained_gc_would_purge` under
+  `citation_lookup=="failed"` is a **not-run, not a clean run**.
+- Lane 2 emits per-file basenames as `drained_gc_files`, so the exemption is
+  verifiable from outside — `durability-property-check.py cited-temp-not-purged`
+  now covers Lanes 1+2 rather than Lane 1 only. Lane 3 stays count-only by
+  nature: it deletes DIRS, and the cited set is keyed on file basenames.
+
+The "no other subdirectories" rule
 above is likewise enforced by **Lane 3** (`cleanup_stray_dirs`): any dir
 DIRECTLY under `temp/` that is NOT `drained/` and is untouched past the
 `--age-min` guard (default 120 min) is removed via a per-dir-bounded guarded
@@ -263,12 +327,23 @@ regardless (`.claude/rules/path-resolution.md`) — so inventing `world/artifact
 is not available even if it were desirable.
 
 The home is a **receipted directory**: `agents/<agent>/temp/<slug>/` containing
-the artifact plus a top-level `RECEIPT.md`. This is not a new mechanism — Lane 3
+the artifact plus a top-level `RECEIPT.*`. This is not a new mechanism — Lane 3
 (`cleanup_stray_dirs`) **already** preserves exactly this shape, skipping any
-stray dir carrying `RECEIPT.md` or `.archive-marker` (g-115-2962/guard-1377).
+stray dir carrying a top-level `RECEIPT.*` or `.archive-marker`
+(g-115-2962/guard-1377).
 Promotion is therefore "wrap the file in a receipted dir," not "build a home."
 
-The `RECEIPT.md` is what keeps this from repeating the `reports/` freeze. That
+The receipt's EXTENSION and CASE do not matter, and that was not always true:
+until g-115-3397 (2026-08-08) both this paragraph and the Lane-3 reader named
+`RECEIPT.md` exactly — a filename **no** producer in the tree writes
+(`_seed_engine.py` → `RECEIPT.json`; `history_vacuum_archive.py` → lowercase
+`receipt.json`), so the preservation this section promises was unreachable by
+every archive the framework creates. `_has_archive_receipt` is now the SSOT
+predicate and matches `RECEIPT` / `RECEIPT.*` case-insensitively at top level
+only. Write whichever extension suits the payload; do NOT rely on a nested
+receipt or a `*receipt*`-ish filename — neither is preserved, deliberately.
+
+The `RECEIPT.*` is what keeps this from repeating the `reports/` freeze. That
 directory was frozen (see § Migration) because it became *a second, disconnected
 retrieval surface* — invisible to `/prime` and `retrieve.sh`, so its contents
 were lost knowledge regardless of which folder held them. The failure was never

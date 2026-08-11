@@ -87,8 +87,23 @@ def _run_with_default_out(tmp_path):
     env["BOOTSTRAP_KEY_PATH"] = str(bootstrap)
     env["VAULT_SSH_HOST"] = "stub.invalid"
     env["VAULT_REMOTE_PATH"] = "/stub/vault"
+    # PIN the root input (keeps the derivation itself under test), then CLEAR
+    # every override the script honors further DOWN the chain:
+    #     ENVIRONMENT_ID -> VAULT_KEY_PREFIX -> prefix filter (:189)
+    # Both later links are `: "${VAR:=default}"` / `if [ -z "${VAR:-}" ]` forms,
+    # so an ambient value wins outright and the pin above is never consulted —
+    # pinning only the first link defends against none of the others.
+    # guard-1484: clear the value when the run must MEASURE resolution rather
+    # than dictate it. Measured before this fix (): baseline 2 passed,
+    # VAULT_KEY_PREFIX=BOGUS 2 FAILED.
     env["ENVIRONMENT_ID"] = "ayoai-mind"
+    env.pop("VAULT_KEY_PREFIX", None)
     env.pop("OUT", None)  # the default is the whole point
+    # VAULT_SSH_USER (:106, used at :145/:148) is the one remaining override this
+    # test does not pin. It is inert HERE only because the VAULT_SSH_BIN stub above
+    # ignores its argv — not because the script ignores it. Cleared so hermeticity
+    # rests on the script's contract rather than on the stub's current shape.
+    env.pop("VAULT_SSH_USER", None)
 
     proc = subprocess.run(
         [BASH, str(script)],  # NO --out

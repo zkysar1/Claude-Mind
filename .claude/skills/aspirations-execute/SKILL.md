@@ -80,7 +80,16 @@ and the cross-pulled goal never lands back in the sibling's `aspirations.jsonl`.
 # Read cross_agent_owner from the iteration checkpoint. Empty/absent means
 # this is a normal (non-cross-agent) execution; ENV_PREFIX stays empty and
 # every downstream call behaves exactly as before.
-Bash: cross_agent_owner=$(py -3 -c "import json; d=json.load(open(r'agents/$MIND_AGENT/session/iteration-checkpoint.json',encoding='utf-8')); print(d.get('cross_agent_owner','') or '')" 2>/dev/null || echo "")
+#
+# Goes through `loop-state-save.sh read`, NOT a hardcoded agents/<a>/session/
+# path (g-306-136). The checkpoint is body-keyed: CLAIM and EXECUTE are both
+# WORKER_PHASES, so in a worker body the claim wrote it under
+# sessions/<unitKey>/ and a literal agent-wide read here would silently miss
+# it — the `2>/dev/null || echo ""` fallback would render that as "not a
+# cross-agent execution" and quietly write the goal back to the WRONG queue.
+# The wrapper resolves through _checkpoint_path(), so reader and writer cannot
+# diverge.
+Bash: cross_agent_owner=$(bash core/scripts/loop-state-save.sh read 2>/dev/null | py -3 -c "import json,sys; d=json.load(sys.stdin); print((d or {}).get('cross_agent_owner','') or '')" 2>/dev/null || echo "")
 
 IF cross_agent_owner is non-empty:
     # ENV_PREFIX applies ONLY to subprocess calls whose AGENT_DIR resolves
@@ -96,7 +105,14 @@ IF cross_agent_owner is non-empty:
     #     claimed BRAVO's goal, not BRAVO claimed it)
     #   - board-post.sh (board entries are authored by the calling agent)
     #   - heartbeat-tick.sh (ticks THIS runner's heartbeat)
-    #   - aspirations-claim.sh (--source world is world-scoped — no swap)
+    # MOVED SIDES (g-306-249) — aspirations-claim.sh was listed here as NOT
+    # affected, on the reasoning "--source world is world-scoped, no swap". That
+    # held only while the claim was world-only. It now honors `&source=agent`
+    # and resolves `ctx.paths.agent` from the X-Mind-Agent header, so a
+    # CROSS-AGENT goal (effective_source='agent') claimed without the prefix
+    # resolves THIS agent's queue, not the owner's — the goal is not there, and
+    # the claim 404s. Prefix it like the others when --source agent:
+    #   - aspirations-claim.sh <goal-id> --source agent   (world claims: no swap)
     # Pattern: prefix the affected subprocess invocations with
     #   MIND_AGENT={cross_agent_owner} <command>
     # rather than the global env-prefix the PreToolUse[Bash] hook applies.
@@ -218,7 +234,12 @@ IF exit_code == 1:
         defer_reason "precondition_unmet:{','.join(failed_ids)}"
     Bash: ${ENV_PREFIX} aspirations-update-goal.sh --source {source} {goal.id} \
         defer_reason_set_at "$(date +%Y-%m-%dT%H:%M:%S)"
-    Bash: ${ENV_PREFIX} aspirations-release.sh {goal.id}     # release the claim
+    # --source is load-bearing here, not cosmetic symmetry with the two calls above:
+    # aspirations-release.sh defaults SOURCE_VAL="world" (aspirations-release.sh:54), so a
+    # sourceless release of an AGENT-queue goal releases against the WORLD queue and leaves the
+    # agent-side claim held. The goal then reads as owned and every selector skips it until a
+    # stranded-claim sweep frees it. Pinned by /verify-learning MAC14.
+    Bash: ${ENV_PREFIX} aspirations-release.sh {goal.id} --source {source}   # release the claim
     Journal: "pre-claim precondition unmet for {goal.id}: {failed_ids}"
     GOTO Phase 7 (select next goal)
 # Exit 0 = all passed (vacuous empty-list included). Exit 2 = id not found, warn and proceed.
@@ -389,6 +410,29 @@ IF inbound_signals is non-empty:
 Bash: ${ENV_PREFIX} aspirations-update-goal.sh --source {source} <goal-id> status in-progress
 Bash: ${ENV_PREFIX} aspirations-update-goal.sh --source {source} <goal-id> started <today>
 
+# ── Origin integrate at execute start (g-115-3262) ──────────────────
+# Origin used to be integrated ONLY at iteration close, so a long iteration
+# read and edited git-tracked code against a tree frozen since the previous
+# close — staleness scaled with goal duration, which is backwards. Measured on
+# cc-03 across 338 integrates (.git/iteration-push.log, 2026-08-01→08-10):
+# 88.0% of inter-integrate gaps exceeded the 10-min fetch interval (median
+# 31.1m, p90 56.0m), and the integrate then found the tree a median of 7
+# commits behind (p90 15, max 145; 29.0% were >=10 behind). That staleness is
+# exactly what guard-1759 / guard-1385 / rb-4641 / rb-4716 warn about
+# downstream: a local read that misses origin yields a false "absent".
+# --no-push is fetch+integrate ONLY, stopping before the push decision, so this
+# ADDS an integrate point and leaves the merge-never-rebase posture untouched.
+# A merge that meets a dirty tree or true conflict aborts cleanly and logs —
+# it never overwrites, so this is safe ahead of execution.
+# Cheap by construction: the stateless FETCH_HEAD-mtime throttle
+# (FETCH_INTERVAL_MIN, default 10m) skips the fetch on most iterations, and a
+# real fetch measured ~650ms on this repo. Same call shape the worker loop
+# already uses at its Phase -0.3.
+# EXPECT SILENCE. On a throttled or already-current iteration this prints
+# nothing and changes nothing — that is the step working, not a dead step to
+# drop (guard-1084). No Output: narration line by design (guard-874).
+Bash: bash core/scripts/iteration-push.sh --no-push
+
 # ── Unblock-intake probe (g-115-1017, rb-1111) ──────────────────────
 # Fast intake-time probe: if this is an Unblock goal whose cited bug was
 # fixed by an independent commit between filing and pickup, surface that
@@ -434,20 +478,26 @@ Parse JSON output from stdout:
 #
 # Do NOT add a skip condition here. A condition is one more thing that can be
 # wrong, and re-introduces the "something must decide to check" failure this
-# step exists to remove. Cost is one small YAML read + regex (~150ms).
+# step exists to remove. Cost is one small YAML read + 42 front-matter reads
+# (~57ms) and ~2,800 characters of output.
 #
-# Precision is MEASURED, not asserted (see the script's docstring): over all
-# 4,154 world goals it fires on 11.4%, median 0 matches. Silent on no match.
-# Always exits 0 - it must never block execution.
-Bash: ${ENV_PREFIX} py -3 core/scripts/forged-skill-surface.py --goal <goal.id> --source {source}
-IF output is non-empty:
-    # A forged skill already implements what this goal is about to do.
-    # Per forged-skill-resolution.md rule 1, invoke the listed skill (or its
-    # companion script) INSTEAD of hand-rolling the procedure inline.
-    # This is advisory, not binding: if the match is a false positive, say so
-    # in one line and proceed. Do NOT silently ignore it.
-    Output: "▸ FORGED-SKILL SURFACE: <skills listed> - invoke, or state why not applicable"
-# ELSE: silent - no forged skill matches this goal.
+# It prints the WHOLE registry, every time - there is no per-goal matcher and
+# no goal argument. g-115-4446 scored five candidate matchers on a 30-goal
+# hand-labelled sample (24 ground-truth pairs) on BOTH precision and recall;
+# the shipped one had recall 0.00 (all 4 of its fires were false positives) and
+# precision never exceeded 0.12 on ANY candidate, so a threshold could only
+# move along a bad frontier. Reproduced independently on a second box
+# (g-115-4475). An unconditional index has recall 1.00 by construction and
+# nothing left to drift. Always exits 0 - it must never block execution.
+Bash: ${ENV_PREFIX} py -3 core/scripts/forged-skill-surface.py
+# Output is the full menu - 42 rows of "/skill-name — one line".
+# SCAN IT for a skill that already does what this goal is about to do. Per
+# forged-skill-resolution.md rule 1, invoke that skill (or its companion
+# script) INSTEAD of hand-rolling the procedure inline. Most goals have no
+# entry that applies, and that is the expected case - the index claims only
+# EXISTENCE, never relevance, so passing over all 42 needs no justification.
+IF a listed skill covers this goal's procedure:
+    Output: "▸ FORGED-SKILL SURFACE: /<skill> already does this - invoking instead of hand-rolling"
 # ── End Forged-Skill Surface ────────────────────────────────────────
 
 # ── Encode-Stable-Facts Gate (G17) ─────────────────────────────────
@@ -587,17 +637,24 @@ IF goal.skill is null AND goal.title matches (forge|create.*skill|make.*skill|sk
 # Capture start time so Phase 4.05 can detect mid-execution drift
 phase_4_started_at = "$(date +%s)"
 
-# Pre-apply consult gate (g-115-826, rb-987 / g-115-796 incident):
-# When this goal is an inherited cross-agent Apply touching framework files
+# Pre-apply consult gate (g-115-826, rb-987 / g-115-796 incident;
+# WIDENED by g-115-2201 on 2026-07-14):
+# When this goal's title or description references a framework-file path
 # (core/, .claude/, world/conventions/, core/config/, SKILL.md, CLAUDE.md),
 # emit an advisory-loud directive BEFORE the first Edit to surface
-# guardrails/reasoning-bank entries that may contradict the inherited spec.
-# Triggers only when goal.handoff_from is set AND handoff_from != $MIND_AGENT
-# AND title/description references a framework-file path. Own-authored goals
-# and non-framework Applies skip silently. Fail-open on env/path errors.
-# The gate exits 0 unconditionally — it shifts the consult-before-edit
-# discipline from after-the-fact learning-gate audit to before-the-fact
-# directive but does not block the loop.
+# guardrails/reasoning-bank entries that may contradict the spec.
+# Triggers on ANY such goal — OWN-AUTHORED included. handoff_from is NOT a
+# trigger; it is an ESCALATOR that makes the banner louder on an inherited
+# spec (extra rb-987 hazard: a test suite pinning the spec pins its violation
+# too). Silent when retrieval is ALREADY recorded for the goal — a gate that
+# fires when satisfied is one the agent learns to ignore. Fail-open on
+# env/path errors. The gate exits 0 unconditionally — it shifts the
+# consult-before-edit discipline from after-the-fact learning-gate audit to
+# before-the-fact directive but does not block the loop.
+# SSOT for the predicate is the docstring in core/scripts/pre-apply-consult-gate.py.
+# This comment kept the PRE-widening predicate for 17 days after the code moved,
+# and a reader believed it over the gate: g-115-4358 was filed HIGH to widen an
+# already-widened gate. Re-sync here whenever that docstring changes.
 Bash: bash core/scripts/pre-apply-consult-gate.sh <goal.id>
 
 # Execute primary goal inline (host does ALL writing)

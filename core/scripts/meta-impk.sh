@@ -10,7 +10,7 @@
 #
 # Usage:
 #   meta-impk.sh compute --window <k> --metric <name>
-#   meta-impk.sh snapshot --goal-id <id> --learning-value <v> [--category <c>] [--active-changes <csv>]
+#   meta-impk.sh snapshot --goal-id <id> --learning-value <v> [--category <c>] [--active-changes <csv>] [--close-key <token>]
 set -euo pipefail
 
 _RUNTIME_SELF="$(cd "$(dirname "$0")" && pwd)"
@@ -68,13 +68,18 @@ case "$SUBCMD" in
         esac
         ;;
     snapshot)
-        GOAL_ID=""; LEARNING_VALUE=""; CATEGORY=""; ACTIVE_CHANGES=""
+        GOAL_ID=""; LEARNING_VALUE=""; CATEGORY=""; ACTIVE_CHANGES=""; CLOSE_KEY=""
         while [[ $# -gt 0 ]]; do
             case "$1" in
                 --goal-id) GOAL_ID="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;  # --goal aliased by normalizer above
                 --learning-value) LEARNING_VALUE="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
                 --category)       CATEGORY="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
                 --active-changes) ACTIVE_CHANGES="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
+                #  per-close idempotency token. MUST be parsed here:
+                # the catch-all below silently DISCARDS unrecognised flags, so an
+                # unparsed --close-key would never reach the daemon and the dedup
+                # would not exist while looking wired up end-to-end.
+                --close-key)      CLOSE_KEY="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
                 *) shift;;
             esac
         done
@@ -88,6 +93,7 @@ case "$SUBCMD" in
         [ -n "$LEARNING_VALUE" ] && _append_q "learning_value=$(rt_url_encode "$LEARNING_VALUE")"
         [ -n "$CATEGORY" ]       && _append_q "category=$(rt_url_encode "$CATEGORY")"
         [ -n "$ACTIVE_CHANGES" ] && _append_q "active_changes=$(rt_url_encode "$ACTIVE_CHANGES")"
+        [ -n "$CLOSE_KEY" ]      && _append_q "close_key=$(rt_url_encode "$CLOSE_KEY")"
 
         rc=0
         rt_call POST /v1/meta/impk/snapshot --query "$QUERY" || rc=$?

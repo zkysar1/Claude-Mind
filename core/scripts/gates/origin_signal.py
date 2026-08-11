@@ -44,8 +44,28 @@ Daemon safety:
       non-canonical "auto_derive", which _gate_log coerced to "fail_open"
       with _invalid_decision_received="auto_derive"; that inflated the
       gate's fail_open count (gate-retirement-eval flagged origin-signal
-      "investigate" on ~1023 phantom fail-opens). Fixed 2026-05-28; see the
-      reasoning-bank entry on auto-derive mislabel.
+      "investigate" on ~1023 phantom fail-opens). See rb-921 on auto-derive
+      mislabel -- this pointer read "see the reasoning-bank entry on
+      auto-derive mislabel" with no id from 2026-05-28 until 2026-08-02, and
+      no such entry existed; rb-921 was written to fill it.
+      DATE CORRECTED 2026-08-02 (g-001-339): this said "Fixed 2026-05-28",
+      which the store falsifies -- 35 of the 51 surviving phantoms POSTDATE
+      that date, running through 2026-06-25. Measured over all 30,008
+      firings, keying on the marker `extra._invalid_decision_received ==
+      "auto_derive"` (NOT a substring match on "auto_derive", which also
+      hits the healthy post-fix `extra.decision_path`):
+        phantom  51 records, ALL decision=fail_open, 2026-05-20..2026-06-25
+        healthy  72 records, ALL decision=pass,      2026-07-07..2026-08-01
+      So the fix IS effective now (0 phantoms in the 38d since) but landed
+      LATER than stated; which change closed it is NOT established here, so
+      no mechanism is claimed. The 51 phantoms are immortal -- gate-firings
+      is append-only, so a mislabeled enum value is not a transient blip but
+      a permanent rewrite of this gate's history. Anyone reading raw
+      fail_open counts sees 51 failures that never happened; this gate has
+      NEVER had a real fail_open. gate-retirement-eval is not fooled (it
+      windows, and reports fail_open=0 / keep as of 2026-08-02), but a
+      whole-store query is, and did: it produced a follow-up goal that was
+      drafted and then declined on this measurement.
 """
 from __future__ import annotations
 

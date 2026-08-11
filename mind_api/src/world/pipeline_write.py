@@ -19,7 +19,7 @@ import json
 import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ..jsonl_cache import cache as _jsonl_cache
 from .. import file_locks, history, changelog
@@ -216,7 +216,26 @@ def _normalize_record(rec: Dict[str, Any]) -> Dict[str, Any]:
     return rec
 
 
-def _validate_record(rec: Dict[str, Any]) -> None:
+def _validate_record(rec: Dict[str, Any],
+                     changed_fields: Optional[Iterable[str]] = None) -> None:
+    """Validate a pipeline record. Raises ValueError on invalid.
+
+    `changed_fields` names the fields THIS write touches. It scopes the
+    position VALUE checks only (g-115-4821) — every structural check below
+    still runs on every write path, because guard-330 requires the
+    full-record validator on every path and calls add-path-only validation
+    insufficient. Passing None keeps the pre-g-115-4821 behaviour (validate
+    everything) and is correct for create and whole-record-replace callers.
+
+    Why position needs scoping: the checks are whole-record, so a record
+    whose position was written before the g-115-3802 create-time type gate
+    was refused by EVERY later mutation — including archive_sweep, which is
+    the mechanism that would have retired it. 70 records (25 live / 45
+    archive, measured 2026-08-04) were immutable for fields the write never
+    touched. Position is the only field with such a legacy population: a
+    full-corpus run of this validator returned position failures and nothing
+    else on all 1,543 records.
+    """
     missing = REQUIRED_FIELDS - set(rec.keys())
     if missing:
         raise ValueError(f"Missing required fields: {missing}")
@@ -238,22 +257,36 @@ def _validate_record(rec: Dict[str, Any]) -> None:
     confidence = rec["confidence"]
     if not isinstance(confidence, (int, float)) or confidence < 0 or confidence > 1:
         raise ValueError(f"Invalid confidence: {confidence} (must be 0.0-1.0)")
+    # Position VALUE checks are scoped to writes that actually touch position
+    # (). The dot-prefix arm is guard-354: bare `f == "position"`
+    # would let a nested `position.sub` write skip the check. Fails CLOSED —
+    # an unrecognised/None changed_fields validates rather than skips.
     position = rec.get("position")
-    if isinstance(position, str):
-        pos_stripped = position.strip()
-        if pos_stripped.lower() in VALID_STAGES:
+    checks_position = changed_fields is None or any(
+        f == "position" or f.startswith("position.") for f in changed_fields)
+    if checks_position:
+        # Type gate () — the checks below are isinstance(str)-guarded, so a
+        # non-string position bypassed every one of them. Mirrors core/scripts/pipeline.py.
+        if position is not None and not isinstance(position, str):
             raise ValueError(
-                f"Invalid position: '{position}' (matches a pipeline stage name)")
-        if pos_stripped.lower() in VALID_TYPES:
-            raise ValueError(
-                f"Invalid position: '{position}' (matches a hypothesis type)")
-        starts_with_verdict = pos_stripped.upper().startswith(("YES", "NO"))
-        is_long_claim = len(pos_stripped) >= 20
-        is_multi_word = len(pos_stripped.split()) >= 2
-        if not (starts_with_verdict or is_long_claim or is_multi_word):
-            raise ValueError(
-                f"Invalid position: '{position}' (must be YES/NO, >=20 chars, "
-                f"or a multi-word claim)")
+                f"Invalid position: {position!r} (must be a string; got "
+                f"{type(position).__name__}). A bare number is not a prediction — "
+                f"write YES/NO or a narrative stance (guard-1800).")
+        if isinstance(position, str):
+            pos_stripped = position.strip()
+            if pos_stripped.lower() in VALID_STAGES:
+                raise ValueError(
+                    f"Invalid position: '{position}' (matches a pipeline stage name)")
+            if pos_stripped.lower() in VALID_TYPES:
+                raise ValueError(
+                    f"Invalid position: '{position}' (matches a hypothesis type)")
+            starts_with_verdict = pos_stripped.upper().startswith(("YES", "NO"))
+            is_long_claim = len(pos_stripped) >= 20
+            is_multi_word = len(pos_stripped.split()) >= 2
+            if not (starts_with_verdict or is_long_claim or is_multi_word):
+                raise ValueError(
+                    f"Invalid position: '{position}' (must be YES/NO, >=20 chars, "
+                    f"or a multi-word claim)")
 
 
 def _validate_formation_quality(rec: Dict[str, Any]) -> None:
@@ -578,7 +611,11 @@ def move(ctx) -> "Response":  # type: ignore[name-defined]
             rec = _normalize_record(rec)
 
             try:
-                _validate_record(rec)
+                # A move validates position only when the merge supplies it
+                # (). This is what made the pre-fix merge-repair
+                # escape hatch work: supplying a valid position in the same
+                # merge satisfied the whole-record check.
+                _validate_record(rec, changed_fields=set(merge_data) | {"stage"})
             except ValueError as e:
                 return Response.error(400, "validation_failed",
                                       f"Validation error on move: {e}")
@@ -881,7 +918,10 @@ def update_field(ctx) -> "Response":  # type: ignore[name-defined]
             apply_derived_surprise(rec)
 
             try:
-                _validate_record(rec)
+                # Single-field update: only this field is being written, so a
+                # pre-existing position it does not touch must not refuse it
+                # ( — this is the path that bricked 70 records).
+                _validate_record(rec, changed_fields={field})
             except ValueError as e:
                 return Response.error(400, "validation_failed", str(e))
 
@@ -1174,6 +1214,15 @@ def _is_stale_unactivated(rec: Dict[str, Any], today: date) -> bool:
         rb = date.fromisoformat(str(resolves_by)[:10])
     except (ValueError, TypeError):
         return False
+    # DATE granularity + strict '<' is the FLEET-WIDE deadline semantics, not a
+    # local choice (guard-2073): a date-only resolves_by denotes the END of its
+    # day, so due-today has not passed. This predicate is the pinned authority --
+    # core/scripts/hypothesis-discovered-overdue-sweep.py::classify_overdue was
+    # reconciled TO it () after parsing date-only values as midnight and
+    # disagreeing with this function on the boundary day. If you change the
+    # comparison here, change it there too; its
+    # test_agrees_with_pinned_sibling_predicate_across_the_boundary replicates
+    # this exact expression and will fail.
     return rb < today
 
 
@@ -1258,7 +1307,13 @@ def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
                                 candidate["stage"] = "archived"
                                 candidate["archived_date"] = today.isoformat()
                                 try:
-                                    _validate_record(candidate)
+                                    # : the sweep changes only these
+                                    # two fields. Validating position here is
+                                    # what made the retirement path refuse the
+                                    # very records it exists to retire.
+                                    _validate_record(
+                                        candidate,
+                                        changed_fields={"stage", "archived_date"})
                                 except ValueError as e:
                                     skipped_invalid.append({
                                         "id": rec.get("id", "?"),
@@ -1296,7 +1351,11 @@ def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
                     candidate["stage"] = "archived"
                     candidate["archived_date"] = today.isoformat()
                     try:
-                        _validate_record(candidate)
+                        #  — same as the resolved-archive branch above.
+                        _validate_record(
+                            candidate,
+                            changed_fields={"outcome", "outcome_date",
+                                            "stage", "archived_date"})
                     except ValueError as e:
                         skipped_invalid.append({
                             "id": rec.get("id", "?"),

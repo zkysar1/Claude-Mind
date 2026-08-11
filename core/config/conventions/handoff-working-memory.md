@@ -66,12 +66,49 @@ See `aspirations-consolidate/SKILL.md` Step 0.1.
 
 ---
 
-# Reasoning Trajectory (Cross-Session Context)
+# Reasoning Trajectory (Cross-Session Context) — NOT IMPLEMENTED
 
-The handoff captures the reasoning *journey*, not just the end-state. Built from the
-execution diary (`agents/<agent>/session/execution-diary.jsonl`) during consolidation Step 9.
+**Status: documented design, never built. No producer, no consumer.** The schema
+below is retained as a design record so the intent is not lost and so a future
+reader does not mistake its absence for a regression. If this behaviour is wanted
+it must be BUILT; there is nothing here to repair.
+
+MEASURED 2026-08-06 (zeta, hostname cc-02, uname -r 6.8.0-136-generic; g-328-46),
+extending alpha's 2026-08-05 cc-04 measurement, which covered the three
+diary-archival claims only:
+
+- At measurement time `reasoning_trajectory` occurred exactly TWICE in the whole
+  repo, both in THIS file: the schema key below, and one prose line. (This note
+  adds further occurrences here, so re-measure that total rather than quoting it.)
+  The load-bearing half is unchanged and re-checkable: ZERO hits in source, config,
+  or skills across `core/`, `mind_api/`, `.claude/`, and the rest of `core/config/`
+  — no producer, no consumer. (Repo-wide the one other occurrence is a
+  `mind_api/state/access.log` line for `GET /v1/wm/read?slot=reasoning_trajectory`,
+  emitted by this measurement's own probe. Runtime logs will accrue more from any
+  future check; grep source, not logs.)
+- The only reference to `execution-diary.sh read` anywhere was the "Construction"
+  paragraph this block replaces. It named no real caller.
+- `aspirations-consolidate/SKILL.md` contains ZERO occurrences of `diary`
+  (case-insensitive) — consolidation neither reads, renames, nor archives it.
+- `execution-diary.py` declares exactly `append, read, summary, trim` (plus
+  `phase_start`/`phase_end`); `archive|rotate` match ZERO times across all 21,813
+  bytes. `execution-diary.sh` is `exec python3 execution-diary.py` — direct, NOT
+  daemon-routed — so the `.py` is the live implementation (guard-742 does not apply).
+- No `execution-diary-session-*.jsonl` exists on this box, against a positive
+  control of 7 live `execution-diary.jsonl` files. No code anywhere produces that
+  filename; the only two references were prose here and in `compact-recovery.md`
+  (corrected in the same change).
+- Live `handoff.yaml` carries `session_summary` and no `reasoning_trajectory`.
+
+**Git cannot date any of this, so do not infer a chronology.** `48ffffb4e`
+(2026-06-18) is the ROOT commit of this repository — 3,638 files, 545,074
+insertions — and both this passage and `def cmd_trim` entered in it. "trim
+superseded archival" and "archival was never built" are therefore
+indistinguishable from this repo's history, and a pickaxe result of "archive never
+appeared" is bounded by that history floor rather than being a claim about all time.
 
 ```yaml
+# DESIGN RECORD ONLY — nothing produces or consumes this block.
 reasoning_trajectory:
   diary_entry_count: 42              # Total entries this session
   key_decisions:
@@ -89,19 +126,33 @@ reasoning_trajectory:
     - "Data seeding deployed but not yet verified via integration test"
 ```
 
-Boot Step 0.5 reads `reasoning_trajectory` and includes key decisions and open threads
-in the boot status output, giving the agent continuity of reasoning across sessions.
+**What the diary lifecycle actually is.** `execution-diary.jsonl` is a single
+per-agent append-only file at `agents/<agent>/session/execution-diary.jsonl`. It is
+never renamed, never session-scoped, and its entries carry no `session_id` — live
+entry keys are exactly `content`, `entry_type`, `phase`, `timestamp`. Retention is
+age-based trimming, not archival: `iteration-close.sh` calls
+`execution-diary.sh trim --hours 8`. Boot does not read a prior-session diary,
+because no prior-session diary is ever produced.
 
-**Construction**: Consolidation Step 9 reads `execution-diary.sh read --json`, filters
-entries by type, and synthesizes:
-- `key_decisions` from `decision` entries
-- `failed_approaches` from `failure` + `approach_change` entries
-- `emerging_patterns` from `finding` entries with cross-goal relevance
-- `open_threads` from the last 5 `observation` entries that reference incomplete work
+**Why the absence of session-scoping has teeth.** Scoped neither by filename nor by
+field, a `phase_start` left unclosed by a stopped session remains the LAST marker
+indefinitely. `phase-wedge-check.py` reads exactly that marker — which is how
+recovery-gate Path D read a 70.9-minute-old marker from a session the user had
+stopped and auto-recovered a 5-minute-old replacement session (g-328-45). Had the
+archival this section once described actually existed, the new session would have
+opened on an empty diary and the wedge check would have returned its clean verdict.
 
-**Diary archival**: Consolidation renames `execution-diary.jsonl` to
-`execution-diary-session-{N}.jsonl`. Boot reads last 20 entries from the prior session
-diary. After 3 sessions, old diary files are deleted (keep current + previous).
+**The agent-wide scope is DELIBERATE, and that question is SETTLED — do not re-open
+it.** g-306-129 decided it on 2026-08-03 (alpha): per-session diary routing was
+considered and REJECTED, because the cross-box loss it would prevent measures ZERO
+for a structural reason — the diary has exactly one writer, so a worker Body never
+writes it. That goal also CORRECTED its own filed premise: routing would misfire ONE
+probe (`agent-watchdog.py::StalledProbe`), not three, because `_advance_heartbeat`
+touches the agent-wide heartbeat on every append and both `recovery-gate.sh` and
+`runner-dead-check.sh` AND-gate diary staleness with heartbeat staleness, so they
+fail SAFE. So the Path D consequence above is real, but session-scoping is NOT its
+remedy; the live remedy lane is the runner-age gate (g-328-47). Read g-306-129's
+outcome_note before proposing any change to diary scoping.
 
 ---
 

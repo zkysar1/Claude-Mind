@@ -92,14 +92,43 @@ def _collect(monkeypatch, goals, reallocation_hours=8):
         _asps(goals), source="world", reallocation_hours=reallocation_hours)}
 
 
+_UNSET = object()
+
+
 def _collect_real_liveness(monkeypatch, goals, fresh_iso_or_exc,
-                           reallocation_hours=8):
-    """Collect with the REAL _liveness_confirms_dormant, the fresh-signal
-    fetch pinned to a value (or an exception), and the memo cache cleared."""
+                           reallocation_hours=8, auth_iso=_UNSET,
+                           auth_prov="authoritative"):
+    """Collect with the REAL _liveness_confirms_dormant, BOTH authoritative
+    fetches pinned, and the memo cache cleared.
+
+    Two probes must be pinned, not one (g-306-132-e). ``fetch_fresh_signal`` is
+    the shard OBJECT's write time (body activity); ``fetch_authoritative_last_active``
+    is the ``last_active`` VALUE inside the shard (mind liveness). Pinning only
+    the first leaves the second reaching the LIVE store, which makes the test
+    non-hermetic and — because the running agent's own last_active is fresh —
+    silently flips a dormant scenario to alive. Caught exactly that way when the
+    second probe was added.
+
+    BOTH SPELLINGS of the second probe are pinned (g-306-138): production now
+    calls ``fetch_authoritative_last_active_with_provenance`` (which returns a
+    ``(iso, provenance)`` pair), while the bare-value ``fetch_authoritative_last_active``
+    remains for provenance-blind callers. Pinning only the name production
+    happens to call today re-opens the exact non-hermeticity above the moment
+    that choice changes, so this helper pins both and the test stays hermetic
+    under either wiring.
+
+    ``auth_iso`` defaults to mirroring ``fresh_iso_or_exc`` so every pre-existing
+    call site keeps its original meaning (both signals agree). Pass it explicitly
+    to exercise the split case: object fresh, mind stale. ``auth_prov`` defaults
+    to "authoritative" so pre-existing call sites keep asserting the trusted-value
+    behavior; pass "local-mirror" to exercise the fail-open-ladder degradation.
+    """
     import liveness_check as lc
     _pin_runner_identity(monkeypatch)
     monkeypatch.setattr(gs, "_get_runner_capabilities", lambda: set())
     monkeypatch.setattr(gs, "_LIVENESS_DORMANT_CACHE", {})
+    if auth_iso is _UNSET:
+        auth_iso = fresh_iso_or_exc
     if isinstance(fresh_iso_or_exc, Exception):
         def _boom(*a, **k):
             raise fresh_iso_or_exc
@@ -107,6 +136,17 @@ def _collect_real_liveness(monkeypatch, goals, fresh_iso_or_exc,
     else:
         monkeypatch.setattr(lc, "fetch_fresh_signal",
                             lambda *a, **k: fresh_iso_or_exc)
+    if isinstance(auth_iso, Exception):
+        def _boom_auth(*a, **k):
+            raise auth_iso
+        monkeypatch.setattr(lc, "fetch_authoritative_last_active", _boom_auth)
+        monkeypatch.setattr(lc, "fetch_authoritative_last_active_with_provenance",
+                            _boom_auth)
+    else:
+        monkeypatch.setattr(lc, "fetch_authoritative_last_active",
+                            lambda *a, **k: auth_iso)
+        monkeypatch.setattr(lc, "fetch_authoritative_last_active_with_provenance",
+                            lambda *a, **k: (auth_iso, auth_prov))
     return {c["goal"]["id"] for c in gs.collect_candidates(
         _asps(goals), source="world", reallocation_hours=reallocation_hours)}
 
@@ -198,6 +238,23 @@ def test_both_signals_stale_is_idle(monkeypatch):
         monkeypatch, [_goal("g-stranded", intended="zeta")], stale)
     assert "g-stranded" in ids, \
         "both-signals-stale (dormant) must still reallocate stranded goals"
+
+
+def test_worker_body_shard_write_does_not_make_a_dead_reducer_look_alive(monkeypatch):
+    """-e, consumer side. A worker Body writing the shard keeps the
+    OBJECT fresh while the reducer's own last_active has aged out. Before the fix
+    that read 'alive' and the mind's stranded goals stayed routed to a dead agent
+    forever. Now the verdict is 'unknown' -> _liveness_confirms_dormant is False
+    -> still NOT idle. Asserting the safe direction, not reallocation: 'unknown'
+    must never authorise a take-back (guard-1042)."""
+    _pin_team_state(monkeypatch, {"zeta": 200})
+    body_write = (datetime.now() - timedelta(minutes=2)).isoformat(timespec="seconds")
+    mind_stale = (datetime.now() - timedelta(hours=200)).isoformat(timespec="seconds")
+    ids = _collect_real_liveness(
+        monkeypatch, [_goal("g-routed", intended="zeta")], body_write,
+        auth_iso=mind_stale)
+    assert "g-routed" not in ids, \
+        "a fresh shard object with a stale mind heartbeat is UNKNOWN, not dormant"
 
 
 def test_fresh_signal_unavailable_not_idle(monkeypatch):

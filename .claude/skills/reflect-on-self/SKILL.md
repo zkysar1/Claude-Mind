@@ -27,16 +27,32 @@ Each mode section below is self-contained with its own step numbering.
 
 ## Mode: Extract Patterns (--extract-patterns)
 
-This sub-skill implements Mode 2 of `/reflect`. It is invoked by the parent `/reflect` router when `--extract-patterns` is specified, or during `--full-cycle` after individual hypothesis reflections complete. It mines all resolved hypotheses for reusable strategies, synthesizes Level 1 patterns and Level 2 strategic self-models, and updates the knowledge base.
+This sub-skill implements Mode 2 of `/reflect`. It is invoked by the parent `/reflect` router when `--extract-patterns` is specified, or during `--full-cycle` after individual hypothesis reflections complete. It mines the full resolved population — `--stage resolved` AND `--stage archived`, per Step 1 — for reusable strategies, synthesizes Level 1 patterns and Level 2 strategic self-models, and updates the knowledge base.
 
 ## Step 0: Load Conventions
 
 **Step 0: Load Conventions** — `Bash: load-conventions.sh` with each name from the `conventions:` front matter. Read only the paths returned (files not yet in context). If output is empty, all conventions already loaded — proceed to next step.
 
-## Step 1: Load All Resolved Hypotheses
+## Step 1: Load the Full Resolved Population (resolved AND archived)
 
 ```
-Bash: pipeline-read.sh --stage resolved  (all resolved records)
+# BOTH stages are REQUIRED. `--stage resolved` alone is a SURVIVORSHIP FILTER:
+# `resolved` is the small live holding area and records migrate to `archived`
+# as they age, so most scoreable records sit in `archived`. Measured
+# 2026-08-04T03:33 (bravo, hostname cc-05, uname -r 6.8.0-136-generic):
+# resolved 86 vs archived 829 — resolved is 9.4% of the 915-record store.
+# Pattern MINING is the worst possible consumer of that filter: a "recurring
+# pattern" needs 3+ instances (Step 2), and mining 9.4% of the corpus both
+# suppresses real patterns below threshold and lets a small recent cluster
+# read as one. The `frequency: N` field emitted below, and the "Category
+# accuracy clusters" in the pattern list, are computed straight off this
+# fetch. (g-115-4866; template at review-hypotheses Mode 3 Step 1, g-115-3594.)
+Bash: pipeline-read.sh --stage resolved
+Bash: pipeline-read.sh --stage archived
+# Mine the UNION of the two. Keep EXPIRED / UNRESOLVABLE out of any rate the
+# patterns below assert (store-wide convention: only CONFIRMED and CORRECTED
+# are scoreable) — but they remain legitimate inputs to non-rate pattern
+# mining, so do not drop the records themselves.
 Read all Level 0 reflections from journal entries
 Read existing pattern files from $WORLD_DIR/knowledge/patterns/
 ```

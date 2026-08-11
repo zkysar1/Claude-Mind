@@ -98,7 +98,13 @@ def test_owncloud_flush_agent_scope_narrows_to_per_agent_full(running_daemon, mo
                       "only_agent": only_agent})
         return {"pushed": 1, "scanned": 1, "in_sync": 0,
                 "skipped_unchanged": 0, "conflicts": 0, "errors": 0,
-                "pruned_agents": 1}
+                "pruned_agents": 1,
+                # Deliberately UNSORTED and longer than pruned_agents, so the
+                # assertion below proves the endpoint sorts rather than merely
+                # forwarding whatever os.walk order the sweep produced. The two
+                # sibling fakes in this file omit the key entirely, which keeps
+                # coverage of the absent-key default for an older sweep.
+                "pruned_agent_names": ["zeta", "bravo"]}
 
     fake_sync.sweep = fake_sweep  # type: ignore[attr-defined]
     fake_backend_mod = types.ModuleType("storage_backend")
@@ -114,6 +120,7 @@ def test_owncloud_flush_agent_scope_narrows_to_per_agent_full(running_daemon, mo
     assert body["flushed"] is True
     assert body["scope"] == "agent:alpha"
     assert body["pruned_agents"] == 1
+    assert body["pruned_agent_names"] == ["bravo", "zeta"]
     # §6: per-agent flush is agents-root scoped, single agent, FULL re-HEAD —
     # NOT the periodic-sweep (only_root=None, full=False) shape.
     assert calls == [{"only_root": "agents", "dry_run": False,
@@ -206,8 +213,18 @@ def test_owncloud_pull_own_cloud_invokes_pull_continuity(running_daemon, monkeyp
 
     fake_sync = types.ModuleType("owncloud_sync")
 
-    def fake_pull(be, agent, *, dry_run=False):
-        calls.append((agent, dry_run))
+    # `only` is part of pull_continuity's real signature () and the
+    # endpoint ALWAYS passes it. A fake without it raises TypeError at call
+    # time, which the handler's `except Exception` converts into the very 500
+    # this test forbids -- so the parameter is recorded here, not merely
+    # accepted, and the assertion below pins it ().
+    # `include_temp` () is the same shape and is recorded for the same
+    # reason: merely ACCEPTING it cannot distinguish "the endpoint defaulted it
+    # off" from "the endpoint never passed it", and off-by-default is the whole
+    # behavior being pinned -- the temp/ sweep is what pushed the /start pull
+    # past its own RT_CURL_TIMEOUT (cc-04: scanned 1590, 164.6s vs a 90s ceiling).
+    def fake_pull(be, agent, *, dry_run=False, only=None, include_temp=False):
+        calls.append((agent, dry_run, only, include_temp))
         return {"agent": agent, "scanned": 16, "pulled": 2, "in_sync": 11,
                 "would_pull": 0, "s3_absent": 3, "local_ahead_skipped": 0,
                 "multipart_deferred": 0, "errors": 0,
@@ -228,7 +245,40 @@ def test_owncloud_pull_own_cloud_invokes_pull_continuity(running_daemon, monkeyp
     assert body["agent"] == "alpha"
     assert body["pulled"] == 2
     assert body["pulled_files"] == ["handoff.yaml", "working-memory.yaml"]
-    assert calls == [("alpha", False)]
+    assert calls == [("alpha", False, None, False)]  # include_temp OFF by default
+
+
+def test_owncloud_pull_with_temp_query_param_opts_in(running_daemon, monkeypatch):
+    """: ?with_temp=1 propagates include_temp=True to pull_continuity.
+
+    Twin of the default-off pin above. Both are needed and neither implies the
+    other: a handler that hardcoded include_temp=False would pass the default
+    test, and one that hardcoded True would pass this one. Only the pair proves
+    the query param is actually READ."""
+    _, port = running_daemon
+    calls = []
+
+    fake_sync = types.ModuleType("owncloud_sync")
+
+    def fake_pull(be, agent, *, dry_run=False, only=None, include_temp=False):
+        calls.append((agent, only, include_temp))
+        return {"agent": agent, "scanned": 1590, "pulled": 0, "in_sync": 1590,
+                "would_pull": 0, "s3_absent": 0, "local_ahead_skipped": 0,
+                "multipart_deferred": 0, "errors": 0, "pulled_files": []}
+
+    fake_sync.pull_continuity = fake_pull  # type: ignore[attr-defined]
+    fake_backend_mod = types.ModuleType("storage_backend")
+    fake_backend_mod.get_backend = lambda: object()  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "owncloud_sync", fake_sync)
+    monkeypatch.setitem(sys.modules, "storage_backend", fake_backend_mod)
+    monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
+
+    status, body = _post(
+        port, "/v1/admin/owncloud-pull?agent=alpha&with_temp=1", agent="alpha")
+    assert status == 200
+    assert body["ok"] is True
+    assert calls == [("alpha", None, True)]
 
 
 def test_owncloud_pull_error_returns_500(running_daemon, monkeypatch):
@@ -236,7 +286,12 @@ def test_owncloud_pull_error_returns_500(running_daemon, monkeypatch):
 
     fake_sync = types.ModuleType("owncloud_sync")
 
-    def boom(be, agent, *, dry_run=False):
+    # `only=None` is load-bearing even though this fake only raises: without it
+    # the TypeError fires at CALL time, so the handler returns the expected 500
+    # and this test passes having never reached the RuntimeError it exists to
+    # exercise -- green for the wrong reason (). The assertion below
+    # names "S3 down" for exactly that reason.
+    def boom(be, agent, *, dry_run=False, only=None, include_temp=False):
         raise RuntimeError("S3 down")
 
     fake_sync.pull_continuity = boom  # type: ignore[attr-defined]
@@ -252,7 +307,11 @@ def test_owncloud_pull_error_returns_500(running_daemon, monkeypatch):
     except urllib.error.HTTPError as e:
         assert e.code == 500
         body = json.loads(e.read().decode("utf-8"))
-        assert body["ok"] is False and "pull failed" in body["error"]
+        # "S3 down" is the load-bearing half (guard-2066): "pull failed" alone
+        # matches ANY exception the handler wraps, including the signature
+        # TypeError that made this test vacuous. Naming the raised message is
+        # what proves boom() was actually entered.
+        assert body["ok"] is False and "pull failed: S3 down" in body["error"]
     else:
         raise AssertionError("expected HTTP 500 on pull failure")
 
@@ -266,7 +325,7 @@ def test_owncloud_pull_fail_closed_manifest_returns_200_ok_false(running_daemon,
 
     fake_sync = types.ModuleType("owncloud_sync")
 
-    def fake_pull(be, agent, *, dry_run=False):
+    def fake_pull(be, agent, *, dry_run=False, only=None, include_temp=False):
         return {"agent": agent, "scanned": 0, "pulled": 0,
                 "error": "session-manifest untrustworthy — pulled nothing (fail-closed)"}
 

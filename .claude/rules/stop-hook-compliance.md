@@ -29,8 +29,44 @@ a signal to stop.
    ("assistant") BEFORE setting the signal, preserving the /stop invariant that
    Phase -1.4 reads the target mode without a fallback.
    Parameters: `core/config/aspirations.yaml` → `productivity_gate`
-   (`min_iterations`, `stop_threshold`). This is the ONLY authorized
-   caller of `session-signal-set.sh stop-requested` outside `/stop`.
+   (`min_iterations`, `stop_threshold`). This was the ONLY authorized caller of
+   `session-signal-set.sh stop-requested` outside `/stop` until 2026-08-05;
+   `reducer-self-fence.sh` (below) is now the second. Whoever adds a fourth must
+   correct this sentence in the same change — an authoritative-sounding count
+   that has silently gone stale is worse than no count at all.
+
+   <!-- exception added 2026-08-05 for reducer-self-fence (g-306-225) -->
+   **Exception**: `core/scripts/reducer-self-fence.sh` (invoked only by
+   `heartbeat-tick.sh`, inside its existing `STORAGE_BACKEND=own-cloud` branch)
+   is authorized to set `stop-requested` when the cross-machine runner lease says
+   this box is no longer the reducer. The runner claim is a LEASE, and a lease
+   needs `T_stepdown < T_takeover`: the holder must stop acting as leader before a
+   peer may legally seize the claim, or both act as reducer at once. `T_stepdown`
+   was effectively INFINITY until this gate existed — measured 2026-08-05, cc-04
+   lost its claim at 14:38 and kept executing goals as reducer for 2.5+ hours
+   while two other bodies acquired it.
+   Like productivity-stop-gate, the script MUST write
+   `agents/<agent>/session/stop-target-mode` ("assistant") BEFORE setting the
+   signal, preserving the /stop invariant that Phase -1.4 reads the target mode
+   without a fallback. The LLM MUST NOT invoke it directly — only
+   `heartbeat-tick.sh` may.
+   The decision is script-gated in `core/scripts/reducer_self_fence.py::decide`
+   (pure, fully branch-tested) and fires on exactly TWO triggers, both of which
+   must be read against the signal asymmetry that governs this whole gate: a
+   FAILED RENEWAL is ambiguous (a broken writer and a dead agent look identical
+   from here), while a claim held by a DIFFERENT MACHINE is unambiguous.
+   - `different-holder` — the live claim names another machine. Decisive alone.
+   - `sustained-renewal-gap` — renewal has failed CONTINUOUSLY for
+     `runner_heartbeat.stepdown_seconds` (1950s = half of T_takeover, deliberately
+     equal to the escalation threshold heartbeat-tick.sh already warns at).
+   Every other signal HOLDS, and that is the load-bearing half: a transient
+   daemon blip, an unreadable holder id, an unrecognised rc, and `rc=4`
+   (ABSENT | NOT-RUNNING | STALE | REFUSE) all keep the loop running. Stopping a
+   healthy loop on a plumbing fault is worse than the disease (guard-1562). Note
+   `rc=4` is DECISIVE in the sibling `worker_reducer_liveness.py` and INERT here —
+   the two modules are deliberate mirrors with opposite fail-safe directions, and
+   `test_reducer_self_fence.py` pins that divergence against the real worker
+   module so a future fusion of the two fails loudly.
 
    <!-- exception added 2026-04-19 for recovery-gate (cross-agent visibility plan) -->
    **Exception**: `core/scripts/recovery-gate.sh` (invoked only by the

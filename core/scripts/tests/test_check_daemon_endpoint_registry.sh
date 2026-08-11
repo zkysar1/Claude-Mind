@@ -204,6 +204,10 @@ fi
 init_repo
 (
     cd "$SANDBOX"
+    # embedded-python-audit: skip -- the `def load_all(:` below is a DELIBERATE
+    # syntax error, the fixture Case 8 exists to feed the registry checker. It
+    # must stay uncompilable, so embedded-python-audit.py () is opted
+    # out here rather than the fixture being "fixed".
     cat > mind_api/src/endpoints/__init__.py <<'PYEOF'
 """Endpoint registry — baseline test fixture."""
 from __future__ import annotations

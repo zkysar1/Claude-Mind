@@ -210,6 +210,12 @@ def list_categories(agent=None, cells_dir=None):
 
 # --- write API ---------------------------------------------------------------
 
+# Every key the verdict closure can carry, and their per-invocation defaults.
+# SINGLE SOURCE OF TRUTH: seeded from here and reset from here, so a key added
+# later cannot be reset in one place and forgotten in the other ().
+_OUTCOME_DEFAULTS = {"verdict": None, "evicted": None}
+
+
 def upsert_cell(cell_id, category, *, state_signature, trajectory, score,
                 agent=None, cells_dir=None, now=None):
     """Insert or update a cell, honoring replace-on-strictly-better + K^D cap.
@@ -229,9 +235,22 @@ def upsert_cell(cell_id, category, *, state_signature, trajectory, score,
     path = _category_path(category, agent, cells_dir)
     # The modifier runs INSIDE locked_modify_yaml's lock; it captures its verdict
     # in this closure dict (locked_modify_yaml returns the written data, not the verdict).
-    outcome = {"verdict": None, "evicted": None}
+    outcome = dict(_OUTCOME_DEFAULTS)
 
     def _modifier(data):
+        # locked_modify_yaml routes through _rmw_with_conflict_retry, which
+        # RE-INVOKES this same modifier object on an own-cloud If-Match conflict
+        # (each attempt re-reads fresh, so the DATA is always current). The
+        # closure is not: a key assigned on only SOME branches keeps a losing
+        # attempt's value into the winning attempt's report. `verdict` is set on
+        # all five branches and so was self-healing; `evicted` was set on exactly
+        # one (evicted-and-added), so an attempt that evicted and then lost the
+        # fence reported an eviction that never happened ().
+        # Reset the WHOLE dict rather than the one key known to leak today —
+        # keying the reset to `evicted` would re-open this the moment another
+        # branch-conditional key is added. guard-1965.
+        outcome.clear()
+        outcome.update(_OUTCOME_DEFAULTS)
         if not isinstance(data, dict):
             data = {}
         existing = data.get(cell_id)

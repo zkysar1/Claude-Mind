@@ -126,8 +126,13 @@ def audit(since_hours: int = 24, root: Path | None = None) -> dict:
     # happened to hold: cold, this covered 1 of 5 on cc-02; warm, it covered 5 of
     # 5 while 4 of those diverged from S3. Both failures silently SHRINK the
     # recurrence denominator, and a recurrence count is exactly the statistic that
-    # cannot survive an unstated population change. `root` stays the test seam —
-    # _fleet_diary reads it purely locally (see its docstring).
+    # cannot survive an unstated population change. `root` stays the test seam,
+    # and it selects the ROOT ONLY — never the read mechanism: `_fleet_diary`
+    # reads through the backend either way. Hermeticity here comes from the
+    # guard-955 `STORAGE_BACKEND=local` pin, NOT from passing a tmp root. (This
+    # comment previously claimed the read was "purely local (see its docstring)"
+    # while that docstring says the opposite — the same cache-is-authoritative
+    # misbelief  fixed in stranded-claim-sweep.py.)
     for agent, text in read_fleet_diaries(root):
         lines = text.splitlines()
         for ln in lines:

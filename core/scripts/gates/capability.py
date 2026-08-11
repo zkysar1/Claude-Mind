@@ -76,6 +76,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -486,6 +487,67 @@ def _load_capability_routing(world_dir) -> list:
             "match_text": f"{identifier} {prose_identifiers}".strip(),
         })
     return rows
+
+
+# --- Human-only veto activation (g-115-4408) --------------------------------
+#
+# ACTIVATION IS EXPLICIT, NOT DERIVED FROM A PROSE SECTION HEADER.
+#
+# b51c84dd9 shipped the human-only veto DELIBERATELY INERT on this deployment
+# and said so in its own commit message: the section header did not match
+# `_load_human_only`'s prefix, so the loader returned [] and the veto could not
+# fire. That message ALSO recorded that arming it first requires predicate
+# tuning, because naive arming was measured to over-veto (it swallows the AWS
+# permission-register subsection, and a regression suite went 13/14 -> 10/14).
+#
+# That tuning was never done. The veto armed anyway: the live header was edited
+# to "## Human-Only (Genuinely Human-Only in This Domain)", which DOES match the
+# prefix. 10 rows loaded and the gate began failing OPEN — with no code change,
+# no test signal, and no gate. Seven assertions across four test files went red
+# (measured cc-02 by zeta under g-115-4393; independently reproduced on cc-04).
+#
+# The failure direction is what makes prose-derived activation unacceptable
+# HERE specifically. `would_block` means "refuse the participants:[user]
+# routing", so a spurious human-only match does not make the gate stricter —
+# it makes the gate STOP REFUSING, silently. Agent-doable work then routes to a
+# human unchallenged (the g-115-792 anti-pattern this module's docstring names).
+# A safety gate whose OFF switch is a prose header is one careless rename away
+# from off, and nothing announces it.
+#
+# Default INERT restores the author's shipped intent. Arming is a deliberate,
+# reviewable act: flip the constant (or set the env var for a scoped
+# experiment) — and do the deferred predicate tuning first, because the
+# unconditional-veto defects below are still live when armed.
+#
+# STILL TRUE WHEN ARMED — do not read this switch as a fix for them:
+#   * the veto is GLOBAL: `would_block` ANDs `not human_only_matches` against
+#     all three block types at once, with no notion of WHICH capability matched;
+#   * it is single-token reachable. Measured on cc-04, 34 distinct single
+#     tokens can veto, including `capability-gate.py` — a documentation
+#     cross-reference sitting INSIDE a human-only row. The claim that sharing
+#     `_find_matches` with the provisionable path makes a lone generic word
+#     harmless is refuted: the two uses have OPPOSITE failure directions, so a
+#     false positive is fail-safe on one path and fail-OPEN on this one.
+HUMAN_ONLY_VETO_DEFAULT_ARMED = False
+
+_VETO_ARMED_VALUES = {"1", "true", "armed", "on", "yes"}
+_VETO_INERT_VALUES = {"0", "false", "inert", "off", "no"}
+
+
+def _human_only_veto_armed() -> bool:
+    """Whether the human-only veto may suppress a block. Default: INERT.
+
+    Env override `MIND_HUMAN_ONLY_VETO` exists for scoped experiments and for
+    the predicate-tuning work (option (d) of g-115-4408) — an unrecognised or
+    absent value falls through to the constant, so a typo fails INERT rather
+    than silently arming a fail-open veto.
+    """
+    raw = os.environ.get("MIND_HUMAN_ONLY_VETO", "").strip().lower()
+    if raw in _VETO_ARMED_VALUES:
+        return True
+    if raw in _VETO_INERT_VALUES:
+        return False
+    return HUMAN_ONLY_VETO_DEFAULT_ARMED
 
 
 def _load_human_only(world_dir) -> list:
@@ -1245,7 +1307,69 @@ def _identifier_parts(entry: dict) -> set:
     return parts
 
 
-def _single_token_qualifies(tok: str, entry: dict) -> bool:
+# g-115-3656: a human TRUST ATTESTATION in the prose disqualifies the NAME-part
+# branch of _single_token_qualifies -- and ONLY that branch.
+#
+# MEASURED FP (test-capability-gate.sh case c_user_trust_confirmation, red since
+# 2026-07-28 when 767d1c4d7 forged least-privilege-credential-cutover; the CASE
+# itself dates to 2026-04-18, so the skill's name is what turned it red): "need
+# user trust confirmation for credential rotation" shares exactly ONE token with
+# that skill -- `credential` -- which qualifies solely because it sits in the
+# skill's NAME. would_block means "refuse the participants:[user] routing", so
+# the gate was refusing to route to a human the one shape that most requires one
+# -- the same inversion _load_human_only documents for guard-12/guard-29.
+#
+# WHY NOT _GENERIC_NAME_PARTS, the adjacent and obvious fix: measured, and it
+# CANNOT separate these. The FP and the genuine single-token positives ("this
+# credential is over-provisioned", "the credential is too broad" -- the skill's
+# actual purpose) all produce the byte-identical sole overlap ['credential'], so
+# demoting the token drops all four together. That is precisely the recall loss
+# guard-958 demands an adversarial SINGLE-surviving-keyword control for, and the
+# multi-token invocations ("cut over to a scoped credential" -> 4 hits) MASK it
+# exactly as guard-958 warns. The discriminator is not the token; it is the prose.
+#
+# NARROW BY CONSTRUCTION -- keyed on `trust`, never on approval language broadly.
+# "awaiting user approval to commit and push" is the canonical defer this gate
+# MUST keep blocking (probe-before-defer.md anti-patterns), and it is protected
+# TWICE: it carries no `trust`, and commit/push qualify on the earlier
+# _IMPERATIVE_VERBS branch this check is never reached from. Widening to bare
+# approval/sign-off vocabulary would reopen g-115-792 in the fail-OPEN direction.
+#
+# EXTENSION RULE: as _GENERIC_NAME_PARTS -- a measured FP from the canonical gate
+# invocation PLUS an adversarial single-surviving-keyword recall control, because
+# every addition DROPS matches and dropping a match LOOSENS a safety gate.
+_HUMAN_TRUST_ATTESTATION = re.compile(
+    r"\btrust\b[^.!?\n]{0,16}\b(?:confirm\w*|attest\w*|sign-?off|assurance)\b"
+    r"|\b(?:confirm\w*|attest\w*|sign-?off|assurance)\b[^.!?\n]{0,16}\btrust\b"
+)
+
+# SCOPED TO THE WINDOW GOVERNING THE TOKEN, per the convention the disqualifier
+# family above states for itself ("scoped to the immediate window around the
+# keyword ... fail-open across occurrences"). An unscoped whole-text search was
+# written first and MEASURED WIDER than the defect: it flipped
+# "cannot access EFS, awaiting user trust confirmation" from block to no-block,
+# because a trust phrase anywhere in a long mixed defer disqualified a token it
+# had nothing to do with. That is the fail-OPEN direction on a safety gate, so
+# the attestation must GOVERN the token, not merely co-occur with it.
+_TRUST_PRE_WINDOW = 60
+
+
+def _trust_attestation_governs(tok: str, text: str) -> bool:
+    """Does a human-trust attestation immediately PRECEDE this token?
+
+    Pre-window only, mirroring _IMPERATIVE_NOUN_GOVERNOR_PRE: English puts the
+    gating clause before its object ("user trust confirmation FOR credential
+    rotation"). Any occurrence governed is enough to disqualify the sole-token
+    match; a token appearing elsewhere ungoverned leaves the match intact.
+    """
+    low = text.lower()
+    for m in re.finditer(r"\b" + re.escape(tok.lower()) + r"\b", low):
+        if _HUMAN_TRUST_ATTESTATION.search(low[max(0, m.start() - _TRUST_PRE_WINDOW):m.start()]):
+            return True
+    return False
+
+
+def _single_token_qualifies(tok: str, entry: dict, text: str = "") -> bool:
     """g-248-105: is a SOLE shared token discriminative enough to match?
 
     True when the token is structurally compound (hyphen/underscore/digit —
@@ -1271,10 +1395,18 @@ def _single_token_qualifies(tok: str, entry: dict) -> bool:
     # _GENERIC_NAME_PARTS for the measured FPs and the extension rule.
     if tok in _GENERIC_NAME_PARTS:
         return False
-    return tok in _identifier_parts(entry)
+    if tok not in _identifier_parts(entry):
+        return False
+    # g-115-3656: the name branch is the weakest of the three — it rests on a
+    # token being SOMEONE'S CHOSEN NAME rather than on the token being
+    # intrinsically distinctive — so it is the one branch a human-trust
+    # attestation in the prose overrides. `text` defaults to "" so every caller
+    # that does not thread it through (the human-only veto path, and the
+    # existing positional tests) keeps byte-identical behaviour.
+    return not (text and _trust_attestation_governs(tok, text))
 
 
-def _find_matches(keywords: set, entries: list) -> list:
+def _find_matches(keywords: set, entries: list, text: str = "") -> list:
     """INVARIANT: whole-token set intersection, NOT substring matching.
     Substring matching would let "port" match "report" and "exe" match
     "execute". Synthetic test suite locks this in.
@@ -1292,7 +1424,7 @@ def _find_matches(keywords: set, entries: list) -> list:
         hits = sorted(keywords & entry_toks)
         if not hits:
             continue
-        if len(hits) == 1 and not _single_token_qualifies(hits[0], entry):
+        if len(hits) == 1 and not _single_token_qualifies(hits[0], entry, text):
             continue  # sole generic-prose token — vocabulary, not a reference
         m = dict(entry)
         m["matched_keyword"] = hits[0]
@@ -1368,7 +1500,11 @@ def evaluate(failure_reason: str, *,
     all_entries.extend(_load_skill_md_triggers(skills_dir))
     all_entries.extend(_load_capability_routing(world_dir))
 
-    matches = _find_matches(keywords, all_entries)
+    # text_blob threaded ONLY here (g-115-3656). The human-only veto's
+    # _find_matches call below deliberately keeps the default "": its failure
+    # direction is the opposite one, so leaving it byte-identical is the
+    # conservative choice while that path stays inert (HUMAN_ONLY_VETO_DEFAULT_ARMED).
+    matches = _find_matches(keywords, all_entries, text_blob)
 
     narrative_matches = _match_narrative_patterns(failure_reason)
     event_gated_matches = _match_event_gated_patterns(failure_reason)
@@ -1485,9 +1621,23 @@ def evaluate(failure_reason: str, *,
     # spurious veto costs one goal wrongly routed to a human (recoverable and
     # visible). A missing veto costs a fail-closed human approval being REFUSED —
     # the exact failure guard-12/guard-29 exist to prevent. Bias toward the veto.
-    # Uses the SAME _find_matches predicate as the provisionable path, so a lone
-    # generic word cannot veto.
-    human_only_matches = _find_matches(keywords, _load_human_only(world_dir))
+    # ACTIVATION (g-115-4408): the veto fires ONLY when explicitly armed — see
+    # _human_only_veto_armed above for why prose-header-derived activation was
+    # removed. While inert the rows are not loaded at all, so the veto cannot
+    # fire and human_only_matches stays empty: the state b51c84dd9 shipped.
+    #
+    # The comment that stood here claimed the veto "uses the SAME _find_matches
+    # predicate as the provisionable path, so a lone generic word cannot veto."
+    # That is REFUTED and is retained only to retract it: measured on cc-04, 34
+    # distinct single tokens veto, `capability-gate.py` among them. Sharing the
+    # predicate confers no safety, because the two uses fail in OPPOSITE
+    # directions — a false positive blocks (fail-safe) on the provisionable
+    # path and un-blocks (fail-OPEN) here.
+    human_only_matches = (
+        _find_matches(keywords, _load_human_only(world_dir))
+        if _human_only_veto_armed()
+        else []
+    )
 
     would_block = (
         (keyword_block or session_req_block or cure_block)

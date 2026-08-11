@@ -185,6 +185,18 @@ def test_empty_goals_list_returns_false(monkeypatch):
 # clean raw read where the claim is definitively absent.
 
 CLAIM_AGENT = "alpha"
+# Production ALWAYS sends a sid: aspirations-claim.sh appends &sid=$MIND_SID,
+# and bash-agent-inject.py injects MIND_SID into every Bash call. A sid-less
+# claim() call was therefore already diverging from the production arg shape
+# (guard-920) before -b made that divergence a hard 400
+# missing_claim_sid. Sending one here restores the production shape rather than
+# reaching for the MIND_CLAIM_ALLOW_NO_SID escape hatch, which exists for a
+# genuinely un-hooked caller and would mask this shape drift instead of fixing
+# it. Same fix applied to the three sibling claim suites in -b; this
+# file was missed because it calls aw.claim(ctx) DIRECTLY with a fake ctx and so
+# never appeared in that goal's grep of HTTP claim callers (rb-6511 — the
+# enumeration UNIT must match the changed thing's unit).
+CLAIM_SID = "77777777-aaaa-bbbb-cccc-777777777777"
 
 
 def test_claim_verifier_claimed_by_matches_true(monkeypatch):
@@ -260,11 +272,18 @@ def _fake_ctx(tmp_path, goal_id: str, agent: str):
     }]}
     (world / "aspirations.jsonl").write_text(
         json.dumps(asp) + "\n", encoding="utf-8")
+    # Mirror the real PathSet slots (agent_name, world, meta, agent,
+    # project_root). This fake carried only three of the five, so it passed
+    # only while claim() happened not to read the other two — the sibling
+    # builder below already carries all five. A fake missing a production slot
+    # is a latent red for whichever endpoint change reads it next (guard-920).
+    meta = tmp_path / "meta"
+    meta.mkdir(parents=True, exist_ok=True)
     return SimpleNamespace(
-        query={"id": goal_id, "agent": agent},
+        query={"id": goal_id, "agent": agent, "sid": CLAIM_SID},
         headers={"x-mind-agent": agent},
-        paths=SimpleNamespace(world=world, agent=agent_dir,
-                              project_root=tmp_path),
+        paths=SimpleNamespace(world=world, agent=agent_dir, meta=meta,
+                              project_root=tmp_path, agent_name=agent),
     )
 
 
@@ -316,6 +335,59 @@ def test_claim_endpoint_local_backend_unaffected(tmp_path, monkeypatch):
     resp = aw.claim(ctx)
     assert resp.status == 200, resp.body
     assert json.loads(resp.body)["ok"] is True
+
+
+# ═══ : the lane-pin gate must never wedge a claim ═══
+#
+# The gate's own body is fail-open, but its ARGUMENTS are built before it is
+# entered, so a raise while building them escapes that protection entirely and
+# 500s the claim. That is not hypothetical: adding the gate turned the three
+# tests above red, because this file's fake ctx.paths carried no `meta`.
+# Both halves are pinned — a missing path slot, and the gate raising outright.
+
+def test_claim_survives_a_ctx_paths_missing_a_slot(tmp_path, monkeypatch, capsys):
+    """A ctx.paths without `meta` must not refuse or crash the claim — AND the
+    gate must still RUN, with only its telemetry degraded.
+
+    The status assertion alone would not distinguish the two ways to survive a
+    missing slot, and they are not equally good: reading the slot defensively
+    keeps the gate CLASSIFYING with telemetry off, while letting it raise and
+    catching that below disables the gate ENTIRELY for the call. Both return
+    200, so the absence of the WARN is what pins the better one.
+    """
+    gid = "g-115-7704"
+    ctx = _fake_ctx(tmp_path, gid, CLAIM_AGENT)
+    del ctx.paths.meta          # the exact shape that produced the regression
+    _quiet_side_writers(monkeypatch)
+    _patch_backend(monkeypatch, _FakeLocalBackend())
+    resp = aw.claim(ctx)
+    assert resp.status == 200, resp.body
+    assert json.loads(resp.body)["ok"] is True
+    assert "lane-pin gate raised" not in capsys.readouterr().err
+
+
+def test_claim_survives_a_raising_lane_pin_gate(tmp_path, monkeypatch, capsys):
+    """A gate that raises for ANY reason allows the claim, and says so.
+
+    Loud rather than silent (guard-1977): a gate that quietly declines to run
+    reports success by default, so a permanently-broken gate would be
+    indistinguishable from a permanently-passing one.
+    """
+    gid = "g-115-7705"
+    ctx = _fake_ctx(tmp_path, gid, CLAIM_AGENT)
+    _quiet_side_writers(monkeypatch)
+    _patch_backend(monkeypatch, _FakeLocalBackend())
+
+    def _boom(*a, **k):
+        raise RuntimeError("registry parser exploded")
+    monkeypatch.setattr(aw, "_lane_pin_eval", _boom)
+
+    resp = aw.claim(ctx)
+    assert resp.status == 200, resp.body
+    assert json.loads(resp.body)["ok"] is True
+    err = capsys.readouterr().err
+    assert "lane-pin gate raised" in err
+    assert "registry parser exploded" in err
 
 
 # ═══ : _verify_transition_persisted (critical goal transitions) ═══

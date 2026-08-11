@@ -126,9 +126,9 @@ def _extract_env_key(defer_reason: str) -> str | None:
 def _probe_env_key(key: str) -> bool:
     """Return True iff env-read.sh reports the key as present (exit 0)."""
     env_read = SCRIPT_DIR / "env-read.sh"
-    from _runtime_bash import BASH  # rb-1472: not bare "bash"
+    from _runtime_bash import bash_cmd  # guard-580 + guard-581
     result = subprocess.run(
-        [BASH, str(env_read), "has", key],
+        bash_cmd(env_read, "has", key),
         capture_output=True,
         timeout=10,
     )

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tempfile
 import types
 from pathlib import Path
 
@@ -176,6 +177,115 @@ def test_validator_catches_missing_id_and_nonmap_entry():
 def test_validator_catches_missing_gaps_key():
     issues = _VAL.validate({"last_updated": "2026-05-27"})
     assert any("missing top-level 'gaps'" in i for i in issues)
+
+
+# ---------------------------------------------------------------------------
+# gap_statuses vocabulary — SSOT + the drift checks guard-426 prescribes
+# (). The suppressing set was copied into three readers with no
+# authoritative source; these pin the copies to the declaration so a fourth
+# status cannot be coined ad hoc and silently mis-classified again.
+# ---------------------------------------------------------------------------
+
+PROJECT_ROOT = TESTS_DIR.parents[2]
+
+
+def _vocab():
+    v = _VAL.load_status_vocabulary()
+    assert v, ("gap_statuses is unreadable in core/config/skill-gaps.yaml — the "
+               "status check degrades to a silent skip without it")
+    return v
+
+
+def test_status_vocabulary_loads_from_config_ssot():
+    """The reader is wired to a real declaration, not to nothing (rb-335)."""
+    v = _vocab()
+    for name, spec in v.items():
+        assert isinstance(spec, dict), f"{name} is {type(spec).__name__}, expected a mapping"
+        # Both axes are required and DISTINCT: deferred-to-goal suppresses
+        # forging without being terminal, so neither may be inferred from the other.
+        for axis in ("terminal", "suppresses_forge"):
+            assert isinstance(spec.get(axis), bool), f"{name}.{axis} must be a bool"
+    assert any(s["terminal"] for s in v.values()), "no terminal status declared"
+    assert any(s["suppresses_forge"] and not s["terminal"] for s in v.values()), (
+        "no non-terminal suppressing status declared — the two axes have "
+        "collapsed, which is the distinction gap_statuses exists to hold")
+
+
+def test_validator_accepts_every_declared_status_and_absence():
+    v = _vocab()
+    data = {"gaps": [{"id": f"gap-{i:03d}", "status": s}
+                     for i, s in enumerate(sorted(v))]}
+    assert _VAL.validate(data, status_vocabulary=v) == []
+    # A gap with no status at all stays valid — declaring the vocabulary does
+    # not make the field mandatory (guard-334: no schema weight past the writer).
+    assert _VAL.validate({"gaps": [{"id": "gap-001"}]}, status_vocabulary=v) == []
+
+
+def test_validator_flags_undeclared_status():
+    issues = _VAL.validate({"gaps": [{"id": "gap-001", "status": "coined-ad-hoc"}]},
+                           status_vocabulary=_vocab())
+    assert any("undeclared status" in i and "coined-ad-hoc" in i for i in issues)
+
+
+def test_validator_skips_status_check_without_vocabulary():
+    """No vocabulary => skip, never fail. An unreadable config is not corruption
+    of the file under test; main() prints the NOTE that keeps it non-silent."""
+    assert _VAL.validate({"gaps": [{"id": "gap-001", "status": "anything"}]}) == []
+
+
+def test_main_actually_passes_the_vocabulary():
+    """Pins the PRODUCTION path. validate() defaults the check OFF, so a reader
+    that main() forgot to wire would leave every test above green while the CLI
+    checked nothing — the writer-without-reader trap one level up (rb-335)."""
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "skill-gaps.yaml"
+        p.write_text("gaps:\n- id: gap-001\n  status: coined-ad-hoc\n", encoding="utf-8")
+        assert _VAL.main(["skill-gaps-validate", str(p)]) == 1
+        p.write_text("gaps:\n- id: gap-001\n  status: registered\n", encoding="utf-8")
+        assert _VAL.main(["skill-gaps-validate", str(p)]) == 0
+
+
+def test_terminal_set_matches_declared_vocabulary():
+    """coordination_merge keeps an inline copy on the cross-box merge hot path.
+    guard-426 permits that ONLY with a drift check diffing it against the source."""
+    cm = _load("coordination_merge_mod", "coordination_merge.py")
+    v = _vocab()
+    declared_terminal = {k for k, s in v.items() if s["terminal"]}
+    assert set(cm._SKILL_GAP_TERMINAL) == declared_terminal, (
+        f"_SKILL_GAP_TERMINAL {set(cm._SKILL_GAP_TERMINAL)} has drifted from "
+        f"gap_statuses terminal subset {declared_terminal}")
+    assert cm._SKILL_GAP_DEFERRED in v, "_SKILL_GAP_DEFERRED is not a declared status"
+    assert v[cm._SKILL_GAP_DEFERRED]["suppresses_forge"] is True
+    assert v[cm._SKILL_GAP_DEFERRED]["terminal"] is False
+
+
+def test_forge_filters_name_every_declared_suppressing_status():
+    """The two SKILL.md forge filters are prose copies of the same set. A status
+    absent from one re-qualifies its gap as forge-ready on every evolve pass.
+
+    Matches the DELIMITED token (`x` / "x" / 'x'), not a bare substring. A bare
+    substring search false-passes on incidental prose, and measurably so on the
+    exact word that matters: g-115-3517's own text predicts `rejected` and
+    `superseded` as the likely next additions, and declaring `rejected` made the
+    bare-substring form report BOTH files compliant when neither filter named it
+    — it was matching "Bare \"sq-018\" is rejected" and a convention-changes
+    `status = "rejected"`. All four real statuses appear delimited in both files;
+    both hypotheticals now fail correctly.
+
+    RESIDUAL, stated rather than papered over: evolve alone still carries one
+    delimited `"rejected"` (an unrelated convention-changes status), so a
+    per-file assertion would false-pass there. The test is sound only because it
+    requires BOTH files — do not weaken it to one.
+    """
+    import re
+    v = _vocab()
+    suppressing = {k for k, s in v.items() if s["suppresses_forge"]}
+    for rel in (".claude/skills/aspirations-evolve/SKILL.md",
+                ".claude/skills/aspirations-spark/SKILL.md"):
+        body = (PROJECT_ROOT / rel).read_text(encoding="utf-8")
+        missing = sorted(s for s in suppressing
+                         if not re.search(r"[`\"']" + re.escape(s) + r"[`\"']", body))
+        assert not missing, f"{rel} does not name suppressing status {missing} as a delimited token"
 
 
 # ---------------------------------------------------------------------------

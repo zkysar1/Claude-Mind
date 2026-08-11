@@ -166,9 +166,17 @@ _FAMILY_REFS = {
     "meta-subdir":        "meta/transfer/bundle.md",                     # new
     "core-config":        "core/config/aspirations.yaml",
     "core-scripts":       "core/scripts/tree.py",
-    # NOT `.claude/skills/<x>/SKILL.md` — see
-    # test_skill_md_refs_are_currently_swallowed_by_the_placeholder_filter.
     "claude-skills":      ".claude/skills/forge-skill/reference.md",
+    # `SKILL.md` USED to be swallowed here by the ALL-CAPS placeholder class,
+    # and a test named ..._currently_swallowed_by_the_placeholder_filter pinned
+    # that hole deliberately so a fix would flip it.  narrowed the
+    # class with `_LITERAL_FILENAMES`, so the hole is closed and that test is
+    # gone; this row is what replaced it. Measured 2026-08-01: 61 refs newly
+    # visible, 60 of them live, and NOTHING dropped (guard-2201 delta on one
+    # corpus snapshot). Do not fold this into the row above — they exercise
+    # different halves of `_is_noise` (that one never reaches the placeholder
+    # class; this one is only kept BY the exception).
+    "claude-skills-md":   ".claude/skills/aspirations/SKILL.md",
     "claude-rules":       ".claude/rules/self.md",
 }
 
@@ -227,30 +235,6 @@ def test_meta_boundary_guard_rejects_mind_api_paths():
             "%s leaked a meta-root ref: %s" % (path, found)
 
 
-def test_skill_md_refs_are_currently_swallowed_by_the_placeholder_filter():
-    """KNOWN HOLE, pinned deliberately so a fix flips this test ().
-
-    `_PLACEHOLDER_SEG` treats an ALL-CAPS stem as a documentation metavariable
-    (`X.yaml`, `PYFILE.py`). `SKILL.md` is ALL-CAPS and is also the single most
-    common real filename under `.claude/skills/`, so every concrete
-    `.claude/skills/<name>/SKILL.md` citation is dropped as noise. Measured
-    2026-07-31 on the live corpus: 65 `*/SKILL.md` refs filtered, against 2
-    `.claude/skills/` refs surviving — the family is ~97% invisible and its
-    census line reads as near-clean because of it.
-
-    This is NOT the prefix regex (which matches the path fine — the assert
-    below shows the raw pattern finding it) and so was out of scope for the
-    g-306-107 widening, which deliberately changed `_ARTIFACT_RE` only. It is
-    pinned here rather than left implicit because the alternative is a silent
-    coverage hole in a family this file otherwise claims to cover: when the
-    filter is narrowed, this test fails loudly and gets deleted on purpose."""
-    ref = ".claude/skills/aspirations/SKILL.md"
-    assert ref in census._ARTIFACT_RE.findall(ref), "prefix regex should match"
-    assert census._is_noise(ref) is True, \
-        "SKILL.md no longer filtered — the hole is fixed; delete this test " \
-        "and add SKILL.md to _FAMILY_REFS"
-
-
 def test_unlisted_prefixes_are_not_matched():
     """LEVEL 3 (second control): the census is a whitelist, not a path finder.
 
@@ -261,3 +245,146 @@ def test_unlisted_prefixes_are_not_matched():
     text = ("agents/echo/insights.jsonl core/BOUNDARY.md "
             "mind_api/src/agent_paths.py world/aspirations.jsonl")
     assert _refs_in(text) == set()
+
+
+# ------------------------------------------- external-root store consult ()
+#
+# `world/conventions/` and `meta/` are gitignored EXTERNAL roots. On own-cloud
+# the local tree is a read-through cache, so local absence is not evidence and
+# these refs are resolved against the STORE. None of the three branches below is
+# reachable by any test above: the two existing external-root tests resolve
+# LOCALLY and short-circuit at `exists`, and the non-agent dangling test uses a
+# `core/` path. The branch shipped uncovered without these.
+#
+# All three monkeypatch `storage_backend.get_backend` rather than stubbing
+# `_store_exists`, so the real tri-state logic — including its except path — is
+# what runs. Nothing here touches S3 (guard-955).
+
+class _FakeBackend:
+    def __init__(self, present): self._present = present
+    def exists(self, path): return self._present
+
+
+@pytest.fixture
+def _patch_backend(monkeypatch):
+    import storage_backend
+
+    def _install(behaviour):
+        if behaviour == "raise":
+            def boom(*a, **k):
+                raise RuntimeError("simulated store outage")
+            monkeypatch.setattr(storage_backend, "get_backend", boom)
+        else:
+            monkeypatch.setattr(storage_backend, "get_backend",
+                                lambda *a, **k: _FakeBackend(behaviour))
+    return _install
+
+
+@pytest.mark.parametrize("ref", ["meta/never-here-xyzzy.yaml",
+                                 "world/conventions/never-here-xyzzy.md"])
+def test_external_root_present_in_store_is_live_not_dangling(_patch_backend, ref):
+    """THE point of the fix: a file absent locally but alive in the store is a
+    CACHE MISS, not breakage. Before g-306-115 this returned `dangling`, which
+    is the loudest possible false alarm on a box that has not materialized
+    everything — a fresh clone or new fleet member, i.e. exactly the box least
+    able to notice it is wrong."""
+    _patch_backend(True)
+    assert census.classify(ref, resident=set()) == "live"
+
+
+@pytest.mark.parametrize("ref", ["meta/never-here-xyzzy.yaml",
+                                 "world/conventions/never-here-xyzzy.md"])
+def test_external_root_absent_from_store_is_dangling(_patch_backend, ref):
+    """Negative control. Without it, a classify() that returned `live` for every
+    external-root ref would pass the test above — and would hide real breakage,
+    which is the failure direction that costs more than a false alarm."""
+    _patch_backend(False)
+    assert census.classify(ref, resident=set()) == "dangling"
+
+
+@pytest.mark.parametrize("ref", ["meta/never-here-xyzzy.yaml",
+                                 "world/conventions/never-here-xyzzy.md"])
+def test_external_root_unreachable_store_is_unmeasurable_not_dangling(
+        _patch_backend, ref):
+    """`OwnCloudBackend.exists` RE-RAISES anything that is not a not-found code,
+    so a permissions or network failure arrives as an exception rather than a
+    False. Collapsing it to `dangling` would report an S3 outage as a pile of
+    broken references. It is also how the g-306-115 predecessor probe went
+    wrong — it read a raise as absence, so it returned no signal while looking
+    like a negative result."""
+    _patch_backend("raise")
+    assert census.classify(ref, resident=set()) == "unmeasurable"
+
+
+def test_store_consult_is_scoped_to_external_roots(_patch_backend):
+    """Scope guard. `core/` and `.claude/` are git-tracked and present on every
+    box, so absence IS absence and they must NOT reach the store — a store
+    outage cannot turn them unmeasurable. `world/knowledge/tree/` is likewise
+    excluded (the tree has its own tooling)."""
+    _patch_backend("raise")
+    for ref in ("core/scripts/definitely-not-real-xyzzy.py",
+                ".claude/rules/definitely-not-real-xyzzy.md",
+                "world/knowledge/tree/definitely-not-real-xyzzy.md"):
+        assert census.classify(ref, resident=set()) == "dangling", ref
+
+
+@pytest.mark.parametrize("ref,expected", [
+    ("meta/x.yaml", True),
+    ("world/conventions/x.md", True),
+    ("core/scripts/x.py", False),
+    (".claude/rules/x.md", False),
+    ("world/knowledge/tree/x.md", False),
+    ("agents/echo/temp/x.json", False),
+])
+def test_is_external_root_gating(ref, expected):
+    assert census._is_external_root(ref) is expected
+
+
+# ── Reporting layer ──────────────────────────────────────────────────────────
+# Every test above targets classify(). The reporter had NONE, and that is where
+# the  fresh-eyes pass found a defect: `unmeasurable` gained a second
+# producer and the human-readable NOTE still attributed the whole bucket to
+# "non-resident agents' boxes" — a confident mis-diagnosis printed exactly when
+# the store is down. A classifier-only suite cannot see it, because classify()
+# was right the whole time.
+
+def test_unmeasurable_note_distinguishes_its_two_producers(monkeypatch, capsys):
+    """`unmeasurable` means 'this box cannot vouch', which has two causes that
+    call for OPPOSITE responses: an off-box agent artifact (nothing is wrong)
+    and a store that could not be consulted (infrastructure is wrong). One
+    hardcoded explanation is necessarily false for one of them at all times."""
+    records = [
+        {"ref": "agents/alpha/temp/x.md", "inbound_count": 1, "surfaces": ["s"],
+         "owner": "alpha", "status": "unmeasurable"},
+        {"ref": "world/conventions/a.md", "inbound_count": 1, "surfaces": ["s"],
+         "owner": None, "status": "unmeasurable"},
+        {"ref": "meta/b.yaml", "inbound_count": 1, "surfaces": ["s"],
+         "owner": None, "status": "unmeasurable"},
+    ]
+    monkeypatch.setattr(census, "census", lambda *a, **k: (records, ["bravo"]))
+    monkeypatch.setattr(sys, "argv", ["inbound-reference-census.py"])
+    census.main()
+    out = capsys.readouterr().out
+
+    assert "1 ref(s) belong to non-resident agents' boxes" in out
+    assert "2 external-root ref(s) could not be checked" in out
+    # The regression: the off-box wording must not absorb the store-failure count.
+    assert "3 ref(s) belong to non-resident agents' boxes" not in out
+
+
+def test_unmeasurable_note_omits_the_store_line_when_no_store_failure(
+        monkeypatch, capsys):
+    """Negative control for the test above — without it, a reporter that printed
+    the infrastructure NOTE unconditionally would pass, and every ordinary
+    off-box census would cry outage."""
+    records = [
+        {"ref": "agents/alpha/temp/x.md", "inbound_count": 1, "surfaces": ["s"],
+         "owner": "alpha", "status": "unmeasurable"},
+    ]
+    monkeypatch.setattr(census, "census", lambda *a, **k: (records, ["bravo"]))
+    monkeypatch.setattr(sys, "argv", ["inbound-reference-census.py"])
+    census.main()
+    out = capsys.readouterr().out
+
+    assert "belong to non-resident agents' boxes" in out
+    assert "could not be checked against the store" not in out

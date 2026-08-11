@@ -284,6 +284,36 @@ def test_observer_has_correct_reducer_sid(tmp_path):
         "observer must not create a per-Body WM file"
 
 
+# ─────────────── 2026-08-10: (re-)write consumes a stale close sentinel ───────────────
+
+def test_write_consumes_stale_close_sentinel(tmp_path):
+    # The stale-sentinel edge (fresh-eyes review of b8ac6a4cf): a worker touched
+    # body-closing at genuine close, the turn ended in TEXT, and Claude Code
+    # skipped the Stop event (rb-629 gap) — so nothing consumed the sentinel.
+    # If /start later re-forks the SAME SID (--continue), the fresh active
+    # manifest would pair with the stale sentinel and the re-forked Body's
+    # FIRST turn-end would take the stop-hook's WM+sentinel close branch:
+    # closed-pending-merge after one work unit. write_manifest resets to
+    # active, so it must consume the stale close signal with the same stroke.
+    pr = _mk_agent(tmp_path, running_sid=SID_A, wm_text="slot: x\n")
+    # First life: forked worker whose close began (sentinel written) but whose
+    # Stop event never fired (manifest still active, sentinel still present).
+    bm.write_manifest(SID_B, "alpha", role="worker", project_root=pr)
+    session_dir = pr / "agents" / "alpha" / "sessions" / SID_B
+    (session_dir / bm._CLOSE_SENTINEL_FILENAME).write_text("", encoding="utf-8")
+    # Second life: /start re-forks the same SID.
+    bm.write_manifest(SID_B, "alpha", role="worker", project_root=pr)
+    assert not (session_dir / bm._CLOSE_SENTINEL_FILENAME).exists(), \
+        "reset-to-active must consume a stale body-closing sentinel"
+    assert _read(pr, "alpha", SID_B)["body_state"] == "active"
+    # The behavioral point: the re-forked Body's first turn-end is a clean
+    # between-turns 'no-sentinel', NOT a premature genuine close. On the
+    # pre-fix write_manifest this scenario returns 'marked' (discrimination
+    # probed against b8ac6a4cf's version when this test was authored).
+    assert bm.close_body_on_genuine(SID_B, "alpha", project_root=pr) == "no-sentinel"
+    assert _read(pr, "alpha", SID_B)["body_state"] == "active"
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-q"]))

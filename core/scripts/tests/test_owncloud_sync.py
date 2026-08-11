@@ -160,10 +160,76 @@ def test_session_machine_local_excluded(name):
     "handoff.yaml", "working-memory.yaml", "pending-questions.yaml",
     "execution-diary.jsonl", "email-last-seen.txt", "reasoning-snapshot.yaml",
     "goal-reads.jsonl", "consolidation-lean-streak",
+    # : cross-box Body handoff staging. These pin the session-manifest
+    # GLOB entries, not just the classifier function — delete any of the three
+    # and the corresponding case here goes RED (guard-1943: a green suite
+    # certifies the FUNCTION, never the WIRING).
+    "unit-abc123-wm.yaml",
+    "unit-abc123-wm-baseline.yaml",
+    "unit-abc123-wm.hash",
 ])
 def test_session_continuity_syncs(name):
     # Accumulated cross-machine knowledge must reach S3 (pulled on machine-B).
     assert _sml(name) is False
+
+
+def test_staged_body_merge_globs_sync():
+    """: the three pending-body-merges staged files must all sync.
+
+    Asserted at their REAL path (session/pending-body-merges/<name>) rather than
+    bare session/, and paired with a machine-local control IN THE SAME TEST so a
+    uniformly-passing result cannot be mistaken for a working assertion.
+
+    `.hash` is the load-bearing case: it is absent from _SESSION_DATA_EXTS, so
+    without the manifest glob it classifies machine-local and _put returns a
+    successful-looking WriteResult while silently skipping the upload.
+    """
+    staged = ("unit-abc123-wm.yaml", "unit-abc123-wm-baseline.yaml",
+              "unit-abc123-wm.hash")
+    for name in staged:
+        assert _sml(name, "pending-body-merges") is False, (
+            "%s must sync — the cross-box Body handoff needs all three staged "
+            "files to reach remote storage" % name)
+
+    # CONTROL: an unregistered signal-shaped name in the same directory MUST
+    # still classify machine-local. If this flips, the assertions above are
+    # passing because everything passes, not because the globs are registered.
+    assert _sml("brand-new-signal", "pending-body-merges") is True
+
+
+def test_staged_body_merge_globs_registered():
+    """: pin the manifest WIRING, because only one of three CAN be
+    pinned behaviourally.
+
+    Measured with core/scripts/mutation-proof-test.sh: deleting the
+    `*-wm.hash` entry turns the classifier assertions RED (verdict PASS), but
+    deleting `*-wm-baseline.yaml` does NOT (verdict "VACUOUS TEST"). The reason
+    is that `.yaml` is already in _SESSION_DATA_EXTS, so the two .yaml globs
+    would sync anyway via the unregistered-data-extension default — their
+    classifier assertions are therefore correct but decorative, and cannot
+    detect the registration being removed.
+
+    This test asserts the registration STRUCTURALLY, so all three entries are
+    genuinely pinned. guard-1943: a green suite certifies the FUNCTION, never
+    the WIRING — this is the wiring half.
+    """
+    import yaml
+    # NOTE parents[3], not [2]: this file sits one level deeper than
+    # owncloud_sync.py (core/scripts/tests/ vs core/scripts/), so the [2] the
+    # production loader uses would resolve to core/core/config here.
+    mpath = (Path(__file__).resolve().parents[3]
+             / "core" / "config" / "session-manifest.yaml")
+    entries = yaml.safe_load(mpath.read_text(encoding="utf-8"))["files"]
+    by_name = {e.get("file"): e for e in entries}
+
+    for pat in ("*-wm.yaml", "*-wm-baseline.yaml", "*-wm.hash"):
+        assert pat in by_name, (
+            "session-manifest.yaml lost the %s glob — the cross-box Body "
+            "handoff needs all three staged files registered (g-306-124)" % pat)
+        e = by_name[pat]
+        assert e.get("glob") is True, "%s must be marked glob: true" % pat
+        assert e.get("sync_tier") == "continuity", (
+            "%s must be sync_tier continuity, got %r" % (pat, e.get("sync_tier")))
 
 
 @pytest.mark.parametrize("name", [
@@ -1103,6 +1169,14 @@ def test_sweep_prunes_unowned_agent_dirs(tmp_path, monkeypatch):
     assert str(tmp_path / "agents" / "alpha" / "self.md") in be.puts
     assert str(bravo) not in be.puts              # pruned (peer cache)
     assert stats["pruned_agents"] == 1
+    # WHICH dir was pruned, not just how many (guard-1579 — owncloud-flush.sh
+    # prints the names so an operator can tell whether the dir they just wrote
+    # to is the unpushable one).
+    assert stats["pruned_agent_names"] == ["bravo"]
+    # The name list must never disagree with the count it explains: both are
+    # derived from the same keep list, and this pins that invariant so a future
+    # edit cannot advance one without the other.
+    assert len(stats["pruned_agent_names"]) == stats["pruned_agents"]
 
 
 def test_sweep_owns_all_agents_when_unset(tmp_path, monkeypatch):
@@ -1117,6 +1191,10 @@ def test_sweep_owns_all_agents_when_unset(tmp_path, monkeypatch):
     assert str(tmp_path / "agents" / "alpha" / "self.md") in be.puts
     assert str(bravo) in be.puts                  # own all agents (local backend)
     assert stats["pruned_agents"] == 0
+    # Non-vacuity control for the two assertions above: the name list is EMPTY
+    # when nothing is pruned, so a name-collector that blindly recorded every
+    # dir it walked would fail here rather than passing both directions.
+    assert stats["pruned_agent_names"] == []
 
 
 # --- sweep per-agent flush scope (§6 /stop flush — ) --------------
@@ -1135,6 +1213,9 @@ def test_sweep_only_agent_scopes_to_one_owned_dir(tmp_path, monkeypatch):
     assert str(tmp_path / "agents" / "alpha" / "self.md") in be.puts
     assert str(bravo) not in be.puts              # sibling pruned by only_agent
     assert stats["pruned_agents"] == 1            # bravo pruned, alpha kept
+    # Names are collected on the only_agent narrowing too, not just the
+    # owned-prune — the two filters share one keep list.
+    assert stats["pruned_agent_names"] == ["bravo"]
 
 
 def test_sweep_only_agent_never_pushes_unowned_target(tmp_path, monkeypatch):
@@ -1443,10 +1524,9 @@ def test_pull_temp_updates_shared_manifest_in_place(tmp_path):
     assert new_manifest["agents/alpha/temp/x.md"]["md5"] == _md5(b"pulled body")
 
 
-def test_pull_continuity_also_pulls_temp(tmp_path, monkeypatch):
-    """Integration: the /start pull (pull_continuity) now also resumes temp/.
-    A continuity session file AND a temp working doc both cross the machine-move
-    in one call, both appear in pulled_files, and the temp sub-stats are exposed."""
+def _seed_continuity_plus_temp(tmp_path, monkeypatch):
+    """Shared fixture body for the include_temp pair below: one continuity file
+    and one temp working doc, both present ONLY on S3 (the machine-move shape)."""
     monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
     monkeypatch.setattr(_mod, "_SESSION_TIERS_LOADED", False)  # real manifest fresh
     monkeypatch.setattr(_mod, "_SESSION_TIERS", None)
@@ -1456,13 +1536,49 @@ def test_pull_continuity_also_pulls_temp(tmp_path, monkeypatch):
     sess.mkdir(parents=True)
     be.s3[str(sess / "handoff.yaml")] = b"handoff-from-m1"          # continuity
     be.s3[str(agents_root / "alpha" / "temp" / "brief.md")] = b"brief body"  # temp
-    stats = _mod.pull_continuity(be, "alpha")
+    return be, agents_root, sess
+
+
+def test_pull_continuity_also_pulls_temp_when_opted_in(tmp_path, monkeypatch):
+    """Integration: with include_temp=True a continuity session file AND a temp
+    working doc both cross the machine-move in one call, both appear in
+    pulled_files, and the temp sub-stats are exposed."""
+    be, agents_root, sess = _seed_continuity_plus_temp(tmp_path, monkeypatch)
+    stats = _mod.pull_continuity(be, "alpha", include_temp=True)
     assert "error" not in stats
     assert "handoff.yaml" in stats["pulled_files"]
     assert "temp/brief.md" in stats["pulled_files"]
     assert stats["temp"]["pulled"] == 1
     assert (agents_root / "alpha" / "temp" / "brief.md").read_bytes() == b"brief body"
     assert (sess / "handoff.yaml").read_bytes() == b"handoff-from-m1"
+
+
+def test_pull_continuity_skips_temp_by_default(tmp_path, monkeypatch):
+    """ regression pin — THE DEFAULT. Identical seed to the opt-in test
+    above; the ONLY difference is the absent include_temp. temp/ is not
+    continuity-tier (session-manifest.yaml does not list it), and sweeping it by
+    default made the /start pull's cost scale with scratch population rather than
+    with the continuity set: measured cc-04 2026-08-02, scanned=1590 / 164.6s
+    against a 90s ceiling, with 123 of 125 pulled files being temp scratch.
+
+    Asserting on `scanned` (not just pulled_files) is the load-bearing half: the
+    cost being fixed is the S3 prefix LIST plus a fetch per object, so a version
+    that swept temp/ and merely declined to WRITE the files would still be slow
+    and would still pass a pulled_files-only assertion."""
+    be, agents_root, sess = _seed_continuity_plus_temp(tmp_path, monkeypatch)
+    stats = _mod.pull_continuity(be, "alpha")
+    assert "error" not in stats
+    assert "handoff.yaml" in stats["pulled_files"], "continuity still resumes"
+    assert (sess / "handoff.yaml").read_bytes() == b"handoff-from-m1"
+    # the temp doc is present on S3 and STILL not pulled -> it is the default,
+    # not absence-from-S3, doing the work (mirrors the ephemeral-tier test above)
+    assert "temp/brief.md" not in stats["pulled_files"]
+    assert not (agents_root / "alpha" / "temp" / "brief.md").exists()
+    assert "temp" not in stats, "no temp sub-stats when the sweep never ran"
+    exact, _globs = _mod._load_session_tiers()
+    n_continuity = sum(1 for t in exact.values() if t == "continuity")
+    assert stats["scanned"] == n_continuity, (
+        "scanned must be bounded by the manifest continuity set, not by temp/")
 
 
 def test_pull_temp_list_dir_failure_counts_error_no_crash(tmp_path):

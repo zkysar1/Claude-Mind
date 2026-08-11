@@ -81,7 +81,7 @@ Canonical skill wrappers frequently include ceremony that raw commands lack:
 
 | Example | Wrapper behavior | Synthetic probe misses |
 |---------|------------------|------------------------|
-| `efs-ssh.sh` | `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null` | Plain `ssh host` respects `~/.ssh/known_hosts` and can fail on host-key rotation that the wrapper ignores |
+| `efs-ssh.sh` | Owns the operator transport — and does not tell its callers what that transport is. Currently AWS SSM via `ssm-run.sh`, plus the user/HOME/cwd/exit-code/stdin shims SSM does not give for free | Plain `ssh host` cannot reach the operator **at all**: the world-open port-22 ingress on `ayoai-operator-sg` was removed 2026-08-06 (g-335-852). A raw probe now fails with a connection error that reads exactly like an outage — the strongest form of this rule's thesis |
 | `aws-exec.sh` | Loads `.env.local` credentials via `_env.sh` | Plain `aws` may use wrong profile or missing credentials |
 | `operator-api.sh` | Adds `AYOAI-API-KEY` header | Plain `curl` returns 401 unauthenticated |
 

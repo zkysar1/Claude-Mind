@@ -111,11 +111,66 @@ def test_no_fetch_still_resolves_default_refs_so_the_probe_is_not_vacuous():
 # --goal scoping
 # ---------------------------------------------------------------------------
 
+def _a_local_completed_goal_id():
+    """Resolve a completed goal id from THIS deployment's own queue.
+
+    g-001-368: this test used to pin `g-115-1655`, an UPSTREAM goal id. On a
+    deployment whose queues hold no g-115-*, the scoping filter correctly
+    narrows to zero and the assertion pins a population that cannot exist —
+    measured `scanned == 0` here. Same family as the asp-115 hardcoding swept
+    out of six scripts under g-001-273.
+
+    Why this matters more than one red test: its sibling
+    test_unknown_goal_id_scans_zero_rather_than_falling_back_to_the_fleet
+    asserts a BOGUS id scans zero. With the pinned id also scanning zero, the
+    pair collapsed into two tests measuring the same thing, and the suite lost
+    the POSITIVE arm — it could still prove "unknown scans zero" but no longer
+    that "known scans exactly one", which is the assertion distinguishing real
+    scoping from a filter that always returns nothing. Both controls, or
+    neither proves scoping.
+
+    Resolving at runtime (option b of the goal) rather than building a tmp
+    world (option a) is deliberate and narrower: `_run` shells out to the real
+    sweep against the real repo set, so full hermeticity is a larger change
+    touching every test in this file. That broader environment coupling is
+    real and remains — this fixes only the deployment-specific ID pin.
+    """
+    import subprocess as _sp
+    # BASH, not a bare "bash" argv[0]: on Windows the bare name resolves via
+    # CreateProcess, which searches System32 BEFORE PATH and reaches the WSL
+    # launcher — which sees the repo under /mnt/c, strips the env _paths.sh
+    # needs, and can hang past the timeout. The pre-commit gate caught this
+    # exact line on first write; the helper is the canonical fix ().
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _bash_helpers import BASH
+    for source, asp in (("agent", "asp-001"), ("world", "asp-009")):
+        try:
+            out = _sp.run(
+                [BASH, str(PROJECT_ROOT / "core/scripts/aspirations-read.sh"),
+                 "--source", source, "--id", asp],
+                capture_output=True, text=True, timeout=60).stdout
+            data = json.loads(out)
+            record = data if isinstance(data, dict) else data[0]
+            for g in (record.get("goals") or []):
+                if g.get("status") == "completed" and g.get("id"):
+                    return g["id"]
+        except Exception:
+            continue
+    return None
+
+
 def test_goal_scoping_narrows_the_population_to_one():
-    proc = _run("--goal", "g-115-1655", "--min-age-minutes", "0",
+    import pytest
+    gid = _a_local_completed_goal_id()
+    if not gid:
+        pytest.skip("no completed goal in this deployment's queues to scope to")
+    proc = _run("--goal", gid, "--min-age-minutes", "0",
                 "--no-fetch", "--output", "json")
     assert proc.returncode == 0, proc.stderr[-600:]
-    assert json.loads(proc.stdout).get("scanned") == 1
+    assert json.loads(proc.stdout).get("scanned") == 1, (
+        f"--goal {gid} should narrow the population to exactly that goal; "
+        "if this is 0 the scoping filter is matching nothing, which the "
+        "unknown-id sibling test cannot distinguish from correct behaviour")
 
 
 def test_unknown_goal_id_scans_zero_rather_than_falling_back_to_the_fleet():

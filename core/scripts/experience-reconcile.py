@@ -6,7 +6,8 @@ Created for g-001-256 (rb-443 trade-off confirmation in g-248-32).
 Mismatch types and how each is handled:
 
   orphan_md  — .md exists at <agent>/experience/<id>.md but no jsonl
-               record with that id is in <agent>/experience.jsonl.
+               record with that id is in EITHER index — experience.jsonl
+               or experience-archive.jsonl (see INDEX_FILES).
                Action: parse YAML front matter from the .md, extract
                type/category/summary (with fallbacks: filename gives id;
                first H1 or first non-front-matter paragraph gives summary
@@ -25,9 +26,44 @@ record that is genuinely unrecoverable (front matter missing, summary
 empty, etc.) — no synthetic content is generated for the unrecoverable
 cases. Skip-and-log keeps the audit honest.
 
-Idempotent: skips orphan_md whose id is already in jsonl (cross-agent or
-re-run) and skips missing_md whose .md has been re-created. Safe to
-re-run.
+Idempotent: skips orphan_md whose id is already in EITHER index — live
+or archive (cross-agent or re-run) — and skips missing_md whose .md has
+been re-created. Safe to re-run.
+
+ARCHIVE-BLINDNESS (g-115-4570, fixed 2026-08-02). Until this fix the
+orphan difference was taken against the LIVE index alone, so every record
+that had aged out of experience.jsonl into experience-archive.jsonl was
+reported as an orphan and would have been backfilled into the live index
+by --apply. The two stores are near-disjoint by construction (measured
+fleet-wide: |live ∩ archive| is 0-2 per agent), because archival MOVES a
+row rather than copying it — so "absent from live" means "archived", not
+"unindexed". Measured effect of scanning both, 2026-08-02 on cc-04:
+
+    agent    orphan (live-only)   orphan (both)   wrongly reported
+    alpha            517               136              381
+    bravo            548                43              505
+    echo             183                42              141
+    foxtrot          294                82              212
+    zeta             299                72              227
+
+That is 1,841 reported vs 375 real fleet-wide — a 4.9x inflation, and
+1,466 index rows --apply would have appended for traces that were already
+indexed. Two independent surfaces already treated the archive as part of
+the id namespace and were not consulted when this script was written:
+experience-orphan-ratchet.py's INDEX_FILES ("the archive is an index, not
+a graveyard"), and the daemon write path, whose _check_no_duplicate_id
+spans BOTH stores and returns 409 duplicate_id for exactly the appends
+this script would have made. Note --apply calls locked_append_jsonl
+directly, so that 409 never fires here — the guard exists but this code
+path routes around it.
+
+The archived-but-not-live population is NOT silently dropped: it is
+reported as `archived_indexed` in the per-agent result, so a run cannot
+claim a clean orphan count while declining to say what it excluded.
+Symmetrically, `archive_unparsed` counts archive rows the guard could not
+read — each is an id missing from the guard set, i.e. the pre-fix hazard
+returning one record at a time — and an archive that exists but cannot be
+opened raises rather than degrading to an empty guard (see archived_ids).
 
 Usage:
   py -3 core/scripts/experience-reconcile.py                  # dry-run
@@ -49,10 +85,19 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 from _paths import PROJECT_ROOT, agent_dir as _agent_dir, enumerate_agent_confs  # noqa: E402
 from _fileops import locked_append_jsonl  # noqa: E402
 
-VALID_TYPES = {
-    "goal_execution", "hypothesis_formation", "research", "reflection",
-    "user_correction", "user_interaction", "execution_reflection",
-}
+# SSOT: the experience TYPE enum is OWNED by the write side (experience.py:35).
+# This audit used to carry its own copy of the set, and the two drifted the day
+# after this file was written: `chat_session` entered experience.py 2026-05-08
+# (50ba8a0b1), one day after this file landed (86a6e5950, 2026-05-07), and was
+# never mirrored here. The write side therefore accepted /encode-session records
+# that this audit reported as unrecoverable orphans — measured :
+# 15 chat_session records live in the store, and 9 orphan .md files deferred as
+# "type unrecoverable". Importing the owner's set makes that class of divergence
+# structurally impossible rather than depending on someone remembering a second
+# edit. Safe in every context this script runs in: experience.py's module-level
+# work is a stdio reconfigure plus Path constants, and it imports cleanly with
+# no agent bound (AGENT_DIR=None is guarded there).
+from experience import VALID_TYPES  # noqa: E402
 
 # Front-matter parser is intentionally flat-only: handles `key: value` lines
 # but not lists or nested mappings. All currently-consumed fields (type,
@@ -61,6 +106,24 @@ VALID_TYPES = {
 # fields (e.g., `tags: [a, b]`), upgrade to a real YAML parser.
 FRONT_MATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*(\n|$)", re.DOTALL)
 GOAL_ID_FROM_STEM_RE = re.compile(r"^exp-(g-\d+-\d+)")
+
+# Both index files, in the same order and with the same name as
+# experience-orphan-ratchet.py's constant — deliberately, so a reader who
+# finds one finds the other. See the ARCHIVE-BLINDNESS note in the module
+# docstring for why the archive must be scanned ().
+#
+# The live index stays the sole SOURCE for the missing_md / stem_mismatch
+# direction (see reconcile_agent) — those regenerate .md stubs, and doing
+# that for archived rows would be a different and unrequested behavior.
+#
+# ARCHIVE_INDEX is named rather than reached as INDEX_FILES[1]: a positional
+# read would make a future reorder of this tuple silently point archived_ids
+# at the LIVE file, whereupon it returns live ids, the orphan difference
+# subtracts live twice, and the fix reverts with every test but the tuple
+# assertion still green.
+LIVE_INDEX = "experience.jsonl"
+ARCHIVE_INDEX = "experience-archive.jsonl"
+INDEX_FILES = (LIVE_INDEX, ARCHIVE_INDEX)
 
 
 def discover_agents() -> list:
@@ -245,6 +308,52 @@ def stamp_now() -> str:
     return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
 
+def archived_ids(agent_dir: Path) -> tuple:
+    """Return (ids indexed in the archive, count of unparseable archive lines).
+
+    Read separately from the live index rather than merged into `jsonl_ids`
+    because the two are used for different directions: this set only ever
+    SUBTRACTS from the orphan candidates, while `jsonl_ids` remains the
+    record SOURCE for missing_md / stem_mismatch stub regeneration.
+
+    DELIBERATELY NOT FAIL-OPEN ON AN UNREADABLE ARCHIVE, and this is the one
+    non-obvious choice in the function. Everywhere else this script prefers
+    defer-rather-than-crash, but that posture is about individual RECORDS it
+    cannot recover; here the archive is a SAFETY INPUT. Every id it fails to
+    return is an id that becomes an orphan candidate and, under --apply, a
+    duplicate append into the live index — the exact hazard this function
+    exists to prevent. So an empty set must mean "the archive genuinely has
+    no ids", never "the archive could not be read": absence (a fresh agent
+    with no archive yet) returns empty and is legitimate; an OSError on a
+    file that EXISTS propagates rather than silently disarming the guard.
+
+    A malformed LINE is the residual case and stays a `continue`, matching
+    how the live-index reader treats the same shape. It is not silent
+    though: the count rides back to the caller and is reported, because a
+    dropped id there has the same consequence as an unreadable file, just
+    narrower (guard-1760 — never report what ran without reporting what was
+    skipped).
+    """
+    out, unparsed = set(), 0
+    p = agent_dir / ARCHIVE_INDEX
+    if not p.is_file():
+        return out, unparsed
+    with p.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                unparsed += 1
+                continue
+            rid = rec.get("id", "")
+            if rid:
+                out.add(rid)
+    return out, unparsed
+
+
 def reconcile_agent(agent: str, apply: bool) -> dict:
     agent_dir = _agent_dir(agent)
     jsonl_path = agent_dir / "experience.jsonl"
@@ -274,7 +383,20 @@ def reconcile_agent(agent: str, apply: bool) -> dict:
 
     goal_index = load_goal_index()
     md_stems = set(md_files.keys())
-    orphan_md = sorted(md_stems - set(jsonl_ids.keys()))
+    # Orphan means "referenced by NEITHER index", not "absent from live".
+    # Archival MOVES a row out of experience.jsonl, so subtracting the live
+    # index alone reports every aged record as an orphan and --apply would
+    # append it back into live — resurrecting archived rows and creating the
+    # duplicate id the daemon write path already refuses with 409
+    # (; see the ARCHIVE-BLINDNESS note in the module docstring).
+    arch_ids, arch_unparsed = archived_ids(agent_dir)
+    orphan_md = sorted(md_stems - set(jsonl_ids.keys()) - arch_ids)
+    # Reported, not discarded: the population this fix REMOVES from the
+    # orphan count is exactly the population a reader of the old output was
+    # being misled about, so it must stay visible. A run that excluded
+    # thousands of records must not print the same shape as a genuinely
+    # clean one.
+    archived_indexed = sorted((md_stems - set(jsonl_ids.keys())) & arch_ids)
     # Two missing-md classes:
     #  - missing_md_path: content_path field is set but file does not exist.
     #  - stem_mismatch:   record id does not match any .md stem under
@@ -342,6 +464,16 @@ def reconcile_agent(agent: str, apply: bool) -> dict:
             looked_up = goal_index.get(goal_id)
             if looked_up:
                 category = looked_up[1] or category
+        if not category and rec_type == "chat_session":
+            # A chat_session documents a chat session, not a goal — it carries no
+            # goal_id by construction, so the goal_index lookup above can never
+            # supply its category. Without this fallback the record defers as
+            # "category unrecoverable", i.e. the same permanent-orphan outcome the
+            # VALID_TYPES fix just removed, one gate later (measured :
+            # 8 of the 9 chat_session orphans carry no category in front matter,
+            # so the type fix alone would have rescued exactly 1). The record
+            # CLASS is the category here; no domain semantics are invented.
+            category = "chat-session"
         if not category:
             deferred.append({"id": stem, "kind": "orphan_md",
                              "reason": f"category unrecoverable (fm-empty, goal_id={goal_id or 'none'} not in any queue or category-empty)",
@@ -466,6 +598,14 @@ def reconcile_agent(agent: str, apply: bool) -> dict:
     return {
         "agent": agent,
         "before": {"orphan_md": len(orphan_md),
+                   # Not an orphan and not an error: a trace whose index row
+                   # has aged into experience-archive.jsonl. Surfaced so the
+                   # exclusion is auditable rather than silent ().
+                   "archived_indexed": len(archived_indexed),
+                   # Rows the archive guard could not parse. Non-zero means
+                   # that many ids are missing from the guard set, each one
+                   # a potential duplicate append under --apply.
+                   "archive_unparsed": arch_unparsed,
                    "missing_md": len(missing_md),
                    "stem_mismatch": len(stem_mismatch),
                    "missing_no_path": len(missing_no_path)},

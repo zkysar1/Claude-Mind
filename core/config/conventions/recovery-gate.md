@@ -132,6 +132,40 @@ long precheck/state-update could false-recover a HEALTHY agent (the g-328-25
 defect, found by fresh-eyes-code self-review of g-328-23). Raising the threshold
 is monotonically safe — it can only reduce Path D firings.
 
+**The invariant's SAFETY ARGUMENT is falsified for any phase that writes to the
+diary** (measured 2026-08-08, g-115-5227, zeta, hostname cc-02, `uname -r`
+6.8.0-136-generic). The paragraph above concludes "Only a genuine wedge
+(heartbeat re-ticked FRESH while the diary freezes) presents `phase_start` >
+`wedge_stale` WITH a fresh heartbeat." A HEALTHY loop presented exactly that
+combination on 2026-08-07 and was recovered 70 minutes into a deep goal it then
+completed; the gate's own notice records `heartbeat=fresh, state=RUNNING`.
+
+The mechanism is a coupling the argument does not account for.
+`execution-diary.py::_advance_heartbeat()` ticks `session/runner-heartbeat` by
+direct file touch on **every successful diary write** (called from `cmd_append`
+and `_emit_phase_marker`), and `heartbeat-stale.sh` reads that same file by pure
+mtime. So the parenthetical above — "ticked only by `heartbeat-tick.sh` and
+`interruptible-sleep.sh`" — is incomplete: the diary is a third writer, and
+`heartbeat-stale.sh`'s own header comment ("heartbeat-tick.sh is the single
+[writer]") is stale for the same reason. A long phase that keeps writing
+findings/observations therefore keeps its heartbeat FRESH indefinitely, and the
+"heartbeat goes stale first" suppression never fires for it.
+
+Note the ordering: `_advance_heartbeat` was added 2026-05-13 to FIX a
+false-positive recovery (a 75-minute goal whose heartbeat staled while diary
+appends continued), deliberately making the two "independent multi-signal
+liveness probes" move together. The g-328-25 invariant was written later, on the
+premise that they were still independent. Coupling them fixed the STALE-side
+false positive and created the FRESH-side one.
+
+This is closed at the detector rather than by re-tuning the threshold:
+`check_wedge` now vetoes a wedged verdict when any diary write landed inside the
+window (`liveness_veto: recent_diary_write`) — the same "diary activity means
+alive" insight `_advance_heartbeat` encodes, applied where the verdict is formed.
+Raising `wedge_stale_minutes` would NOT have helped: the heartbeat stays fresh
+for the whole phase regardless of threshold, so any finite threshold is crossed
+eventually by a long healthy phase.
+
 ## Cross-References
 
 - `.claude/rules/stop-hook-compliance.md` — Behavioral rule (no LLM

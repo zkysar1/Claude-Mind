@@ -97,8 +97,18 @@ already uses correct set difference for the orphan_md / missing_md pair.
 
 - `core/scripts/audit_helpers/_paired_diff.py` — canonical helper.
 - `core/scripts/experience-reconcile.py` — pre-existing paired-data audit
-  that already follows the rule (uses `md_stems - set(jsonl_ids.keys())`
-  for orphan_md and the inverse for missing_md).
+  that already follows the rule (set difference for orphan_md and the
+  inverse for missing_md). Note the two directions deliberately read
+  DIFFERENT id sets, and conflating them is a defect this convention does
+  not catch: orphan_md subtracts BOTH indexes (`experience.jsonl` and
+  `experience-archive.jsonl`, per its `INDEX_FILES`), while missing_md /
+  stem_mismatch source records from the LIVE index only, because those
+  regenerate `.md` stubs. Bidirectionality is about which SETS are
+  differenced, not about which STORES compose each set — and until
+  g-115-4570 this script was archive-blind in the orphan direction while
+  fully satisfying this convention, over-reporting orphans 4.9x fleet-wide.
+  When an audit's store is itself split into live and archived halves, ask
+  which halves each direction should span.
 - `world/reasoning-bank.jsonl` rb-707 (the original incident — net delta
   hid 27× more breakage).
 - verify-real-cluster-catalog Candidate 2 (catalog entry for this

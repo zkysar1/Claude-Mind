@@ -93,6 +93,70 @@ def _is_documentation_only_path(fp):
     return any(p.search(fp) for p in _DOCUMENTATION_ONLY_PATTERNS)
 
 
+# CITATION-POSITION exclusion (). The pattern list above keys on the
+# PATH; this keys on the path's POSITION in the prose, which is the only thing
+# that separates "the doc I am editing" from "the doc I am citing as evidence".
+#
+# Measured 2026-08-02 (echo, cc-03 / Linux 6.8.0-136-generic), variables
+# isolated one at a time against the production call shape:
+#   V0  "...`sym`... See <conv>.md"   -> target=[<conv>.md] ids=[sym] ratio 1.0 BLOCK
+#   V1  drop the symbol only          -> PASS
+#   V2  reword the citation only      -> PASS
+# So EITHER edit alone clears the block; it requires BOTH a path and a symbol.
+# The originating incident () changed both at once and could not say
+# which mattered — measured here: neither is individually necessary.
+#
+# WHY THIS IS NOT guard-1058(e). That case has cited files AND a real target
+# file, where the aggregate outvotes the file that must change, and its
+# prescribed discriminator is per_file_hits (the target scores 0 while the
+# cited files carry the hits). Here the cited doc is the ONLY extracted
+# target — per_file has a single entry — so there is no target entry to
+# compare against and that discriminator has nothing to read. The probe ends
+# up asking "does the doc I cited mention this symbol?", which is trivially
+# yes BECAUSE that is why it was cited. A verdict on a question that can only
+# have one answer is not evidence.
+#
+# DELIBERATELY NARROW, per the goal's own warning that an over-broad doc
+# exclusion would blind the probe to doc-targeted goals (common in this fleet):
+#   - `.md` only — no .py/.sh/.ts path is ever affected, so code-target
+#     detection is untouched.
+#   - Cue must IMMEDIATELY precede the path (modulo a leading article), so
+#     scope phrasing ("add a section to core/config/conventions/x.md") keeps
+#     the path as a target.
+#   - Dropped only when EVERY occurrence is citation-positioned. A doc that is
+#     both cited once and named as scope elsewhere stays a target.
+_CITATION_CUE_RE = re.compile(
+    r"(?:\bsee\b|\bper\b|\bcf\b\.?|\brefer to\b|\bdocumented in\b"
+    r"|\bdescribed in\b|\brecorded in\b|\bnoted in\b|\bcaptured in\b"
+    r"|\bdetail\b:|\bdetails\b:)"
+    r"\s+(?:the\s+|a\s+)?$",
+    re.IGNORECASE,
+)
+
+# How far back to look for the cue. One short clause — long enough for
+# "documented in the " and no longer, so a cue in a PRIOR sentence cannot
+# reach forward and demote an unrelated path.
+_CITATION_LOOKBACK = 48
+
+
+def _citation_only_doc_paths(text):
+    """Return .md paths in `text` whose EVERY occurrence is citation-positioned.
+
+    A path cited once and named as scope elsewhere is NOT returned — the
+    scope mention is what makes it a genuine target.
+    """
+    all_cited = {}
+    for m in _FILE_PATH_RE.finditer(text):
+        fp = m.group(1)
+        if not fp.endswith(".md"):
+            continue
+        start = m.start(1)
+        lookback = text[max(0, start - _CITATION_LOOKBACK):start]
+        cited = bool(_CITATION_CUE_RE.search(lookback))
+        all_cited[fp] = all_cited.get(fp, True) and cited
+    return {fp for fp, every in all_cited.items() if every}
+
+
 # READ-intent goal title detector (rb-398 follow-through).
 #
 # Some goal types READ their target files rather than write to them:
@@ -881,6 +945,10 @@ def extract_targets(title, description):
     # File paths.
     target_files_seen = []
     seen_files = set()
+    # : paths that appear ONLY in citation position ("see <doc>.md").
+    # Computed over the whole text before the loop, because the rule is about
+    # every occurrence of a path, not the first one encountered.
+    citation_only = _citation_only_doc_paths(text)
     for fp in _FILE_PATH_RE.findall(text):
         if fp in seen_files:
             continue
@@ -890,6 +958,12 @@ def extract_targets(title, description):
         # the audit report cites identifiers that the impl file does not
         # yet contain.
         if _is_documentation_only_path(fp):
+            continue
+        # : same failure, keyed on POSITION rather than path — a doc
+        # cited as evidence is not a target. Dropping it here (rather than
+        # post-probe) keeps line_hints below consistent with target_files.
+        if fp in citation_only:
+            line_hints.pop(fp, None)
             continue
         seen_files.add(fp)
         target_files_seen.append(fp)

@@ -250,6 +250,42 @@ Update a single `_tree.yaml` metadata field.
 bash core/scripts/tree-update.sh --set <key> <field> <value>
 ```
 
+### Durable per-node judgment markers
+
+Three fields record a decision so it stops being re-derived every sweep. All are
+plain `--set` writes; JSON arrays store as real YAML lists.
+
+| Field | Suppresses | Set it when |
+|---|---|---|
+| `maintain_exempt` (list) | `distill` and/or `redistribute` candidacy | the node is coherent / intentionally wide — see the coherence gates in DISTILL and REGROUP |
+| `decompose_exempt` (bool) | decompose candidacy | the node coheres as ONE document (rb-94) |
+| `saturated_topics` (list of phrases) | **goal FILING on those topics** | the node's frontier is measured out — another measurement would reproduce an already-encoded number |
+
+`saturated_topics` is the odd one out and the reason it is worth naming here:
+the other two suppress TREE MAINTENANCE, this one suppresses WORK ORIGINATION.
+It is read by `core/scripts/gates/goal_duplication.py`'s
+`saturated_frontier` check, which runs as step 7 of every goal filing, so the
+declaration reaches an agent BEFORE they file rather than only after they open
+the node.
+
+```
+bash core/scripts/tree-update.sh --set <key> saturated_topics \
+  '["cognitive load","primitives amortization"]'
+```
+
+Write each phrase as the distinctive words a matching goal would contain; ALL of
+a phrase's non-stopword tokens must appear in the goal's title+description, AND
+the goal must carry a measurement verb (measure / quantify / audit / baseline /
+benchmark), before the gate refuses. Prefer several narrow phrases over one
+broad one — a phrase whose only distinctive token is generic (`environment`)
+will fire on unrelated work.
+
+Do NOT pair this with another prose warning in the node body. Five agents
+re-measured `multi-env-cognitive-load-baseline.md` past four escalating body
+warnings, because a warning in the destination is reachable only by someone who
+already opened the destination. That is the failure this field replaces
+(g-115-4703, guard-2437).
+
 ## Sub-Command: /tree decompose <key>
 
 Break a single large node into children. Same as DECOMPOSE operation but targeted.

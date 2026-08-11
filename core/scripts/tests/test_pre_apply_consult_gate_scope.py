@@ -85,6 +85,17 @@ QUEUE = [
     # deep PRODUCT work -> must stay SILENT
     {"id": "g-5", "title": "Ship the game server login flow",
      "description": "no framework files at all", "category": "product"},
+    # : own-authored, NON-framework category, names a real framework file
+    # BARE with no path prefix anywhere -> MUST fire via on-disk resolution. Neither
+    # the needle scan (no path) nor the category trigger (category is "infra") sees
+    # this shape; measured, it was 19.9% of goals that actually edited framework code.
+    {"id": "g-6", "title": "Idea: teach pre-apply-consult-gate.py to resolve bare names",
+     "description": "no path prefix appears anywhere in this goal", "category": "infra"},
+    # names a plausible-looking script that does NOT exist -> must stay SILENT. This is
+    # the discriminator between the APPLIED fix (resolve against disk, FP 42.3%) and the
+    # REJECTED any-bare-mention form (FP 54.9%, +313 banners for 21 more misses closed).
+    {"id": "g-7", "title": "Idea: rewrite definitely-not-a-real-script-zzz.sh",
+     "description": "product tooling, not framework", "category": "product"},
 ]
 
 
@@ -160,9 +171,92 @@ def test_inherited_spec_still_fires(queue_file):
     assert _fires(queue_file, "g-4")
 
 
+def test_bare_framework_filename_fires(queue_file):
+    """. A goal naming a real framework file BARE — no path prefix, no
+    framework category — must fire.
+
+    MEASURED, not assumed: scored over 1624 completed goals against git ground truth
+    (did the goal's commits actually touch a framework file?), the needle+category
+    predicate MISSED 103 of 518 framework-editing goals — 19.9%. Every miss had this
+    exact shape: "Idea: deploy-verify.sh should classify...", "Investigate:
+    fixture-leak-scan.py should exclude...". The category trigger was ADDED to cover
+    bare names (g-115-2201) and measurably did not, because these goals do not sit in
+    a framework-* category.
+
+    The fixture names THIS GATE'S OWN FILE deliberately: it is the one framework
+    filename guaranteed to exist on disk whenever this test runs, so the positive case
+    cannot rot into a silent skip.
+
+    MUTATION CHECK: delete the `_detect_bare_framework_files` loop from main() and this
+    fails while every other test in the file still passes.
+    """
+    assert _fires(queue_file, "g-6"), (
+        "a goal naming a real framework file bare must fire the consult gate — this is "
+        "the 19.9%-miss shape (g-115-4358)"
+    )
+
+
+def test_unresolvable_bare_filename_stays_silent(queue_file):
+    """THE DISCRIMINATOR between the applied fix and the rejected one.
+
+    Firing on ANY bare .sh/.py/.yaml mention was measured and REJECTED: it closes 21
+    more misses but adds 313 banners (FP 39.5% -> 54.9%), which is the banner-fatigue
+    that makes a gate ignorable (guard-1090). Resolving the name against disk is what
+    keeps the widening honest — a name only counts when a real framework file answers
+    to it.
+    """
+    assert not _fires(queue_file, "g-7"), (
+        "a bare filename that resolves to NO framework file must not fire — that is "
+        "candidate C, measured at 54.9% false positives and rejected"
+    )
+
+
+def test_bare_name_resolution_is_on_disk_not_prose_shape():
+    """Unit-level statement of the same discriminator, independent of the queue fixture."""
+    mod = _load()
+    assert mod._detect_bare_framework_files(
+        "fix pre-apply-consult-gate.py", "") == ["pre-apply-consult-gate.py"]
+    assert mod._detect_bare_framework_files(
+        "fix definitely-not-a-real-script-zzz.sh", "") == []
+
+
+def test_denylisted_generic_name_is_not_evidence():
+    """A deny-listed name that WOULD otherwise resolve must not count as evidence.
+
+    A deny entry is only testable when it is BOTH regex-reachable AND present on
+    disk. The first version of this test checked NEITHER: it keyed on `__init__.py`,
+    which BARE_FILENAME_RE can never emit (the pattern opens `[a-z0-9]`, so a
+    leading underscore fails to match), and it skip-guarded on that file merely
+    EXISTING — which it does, in two search dirs. So the test RAN and PASSED while
+    proving nothing about the deny mechanism, because the name never reached it.
+    Found by fresh-eyes on this goal's own diff; same shape as the g-115-4471
+    receipt blind spot — covering the noun in the test's name while missing the
+    path it claims to exercise.
+
+    Measured 2026-08-01: NO entry satisfies both preconditions (`__init__.py` and
+    `readme.md` are regex-unreachable; `conftest.py` and `utils.py` are absent from
+    every search dir), so BARE_FILENAME_DENY is currently INERT and this skips
+    loudly. It becomes a real assertion the moment any deny entry is both reachable
+    and present — which is the point of deriving the fixture from the constants
+    instead of hardcoding a name.
+    """
+    mod = _load()
+    testable = [n for n in mod.BARE_FILENAME_DENY
+                if mod.BARE_FILENAME_RE.fullmatch(n)
+                and any((d / n).is_file() for d in mod._bare_search_dirs())]
+    if not testable:
+        pytest.skip("no deny entry is both regex-reachable and present on disk — "
+                    "the deny list is inert here, so asserting on it would be a "
+                    "tautology (see docstring)")
+    for name in testable:
+        assert mod._detect_bare_framework_files(f"touch {name}", "") == [], (
+            f"{name} is deny-listed and must not count as a framework reference")
+
+
 @pytest.mark.parametrize("goal_id,why", [
     ("g-2", "market-research goal with no framework reference"),
     ("g-5", "deep PRODUCT work with no framework files"),
+    ("g-7", "product goal naming a script that does not exist on disk"),
 ])
 def test_non_framework_goal_stays_silent(queue_file, goal_id, why):
     """THE OVER-FIX GUARD. Widening the trigger must not tax every close (guard-1080)."""

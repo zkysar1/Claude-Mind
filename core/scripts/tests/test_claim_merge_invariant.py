@@ -188,7 +188,15 @@ def test_one_side_null_older_snapshot_keeps_claim():
 
 
 def test_same_claimer_both_sides_untouched():
-    """Same agent on both sides is not a race — base LWW rides."""
+    """Same agent on both sides, NEITHER carrying a body id, is not a race —
+    base LWW rides.
+
+    Narrowed by g-306-132-c: same-agent is no longer unconditionally
+    non-racing. Two BODIES of one agent (same claimed_by, different
+    claimed_by_sid) DO conflict — see the same-agent-different-body section
+    below. This case stays untouched because with no sids on either side the
+    merge cannot tell two bodies from one body's own re-write, and inventing
+    a conflict from incomplete data is the unsafe direction."""
     a = _goal(claimed_by="zeta", claimed_at="2026-07-11T08:00:00",
               last_modified="2026-07-11T08:00:00")
     b = _goal(claimed_by="zeta", claimed_at="2026-07-11T08:00:05",
@@ -196,6 +204,219 @@ def test_same_claimer_both_sides_untouched():
     m = _merged_pair(a, b)
     assert m["claimed_by"] == "zeta"
     assert m["claimed_at"] == "2026-07-11T08:00:05"  # base (newer LWW) rides
+
+
+# --- same agent, DIFFERENT body (-c, trace T5) ----------------------
+#
+# Two boxes running the SAME agent used to merge silently: `ca_by != cb_by` was
+# False and the one-side-null elif was False too (both truthy), so the pair rode
+# the LWW base and BOTH bodies kept their own view and executed the goal.
+# guard-1460 is the read-side statement of the same defect.
+#
+# Every case below goes through _merged_pair, which merges in BOTH operand
+# orders and asserts byte-commutativity — the "deterministic winner in BOTH
+# operand orders" this fix is verified against.
+
+SID_A = "11111111-1111-1111-1111-111111111111"
+SID_B = "22222222-2222-2222-2222-222222222222"
+
+
+def test_same_agent_different_body_older_claim_wins():
+    """The headline: one mind, two bodies. Older claimed_at takes the goal."""
+    a = _goal(claimed_by="omni", claimed_at="2026-08-03T08:00:00",
+              claimed_by_sid=SID_A, status="in-progress",
+              last_modified="2026-08-03T08:00:00")
+    # Body B claims later but carries the NEWER last_modified — the shape that
+    # let the LWW base hand it the goal.
+    b = _goal(claimed_by="omni", claimed_at="2026-08-03T08:00:40",
+              claimed_by_sid=SID_B, status="in-progress",
+              last_modified="2026-08-03T08:00:40")
+    m = _merged_pair(a, b)
+    assert m["claimed_at"] == "2026-08-03T08:00:00"
+    assert m["claimed_by_sid"] == SID_A, "the older body must hold the goal"
+
+
+def test_same_agent_different_body_claimed_at_tie_is_deterministic():
+    """Same instant: claimed_by carries no ordering information (it is
+    identical), so the tie must break on the body id or the merge is not a
+    function of its inputs."""
+    a = _goal(claimed_by="omni", claimed_at="2026-08-03T08:00:00",
+              claimed_by_sid=SID_B)
+    b = _goal(claimed_by="omni", claimed_at="2026-08-03T08:00:00",
+              claimed_by_sid=SID_A)
+    m = _merged_pair(a, b)
+    assert m["claimed_by_sid"] == SID_A  # lexicographic-smaller sid wins
+
+
+def test_same_agent_one_sided_sid_is_not_a_conflict():
+    """Only one side carries a body id — most likely one body merged against
+    its own pre-sid snapshot (claimed_by_sid postdates the claim schema).
+    Manufacturing a conflict here would hand the goal to whichever copy
+    happens to carry the field."""
+    a = _goal(claimed_by="omni", claimed_at="2026-08-03T08:00:00",
+              claimed_by_sid=SID_A, last_modified="2026-08-03T08:00:00")
+    b = _goal(claimed_by="omni", claimed_at="2026-08-03T08:00:05",
+              last_modified="2026-08-03T08:10:00")
+    m = _merged_pair(a, b)
+    assert m["claimed_by"] == "omni"
+    assert m["claimed_at"] == "2026-08-03T08:00:05"  # base LWW rides, as before
+
+
+def test_same_agent_same_body_is_not_a_conflict():
+    """One body re-writing its own claim must stay on the LWW base."""
+    a = _goal(claimed_by="omni", claimed_at="2026-08-03T08:00:00",
+              claimed_by_sid=SID_A, last_modified="2026-08-03T08:00:00")
+    b = _goal(claimed_by="omni", claimed_at="2026-08-03T08:00:05",
+              claimed_by_sid=SID_A, last_modified="2026-08-03T08:10:00")
+    m = _merged_pair(a, b)
+    assert m["claimed_at"] == "2026-08-03T08:00:05"
+    assert m["claimed_by_sid"] == SID_A
+
+
+# --- claimed_by_sid is part of the claim UNIT --------------------------------
+#
+# Before -c the field was not merged at all: it rode `out = dict(win)`
+# from the LWW base. Whenever the conflict winner was not the LWW winner, the
+# merged record paired the WINNER's claimed_by/claimed_at with the LOSER's body
+# id — a claim attributed to a session that never made it. Reachable in the
+# pre-existing different-AGENT branch too, not only the new same-agent one.
+
+def test_sid_travels_with_the_pair_across_agents():
+    a = _goal(claimed_by="alpha", claimed_at="2026-08-03T08:00:00",
+              claimed_by_sid=SID_A, last_modified="2026-08-03T08:00:00")
+    b = _goal(claimed_by="zeta", claimed_at="2026-08-03T08:00:40",
+              claimed_by_sid=SID_B, last_modified="2026-08-03T08:00:40")
+    m = _merged_pair(a, b)
+    assert (m["claimed_by"], m["claimed_by_sid"]) == ("alpha", SID_A), \
+        "winner's claimed_by must not pair with the loser's body id"
+
+
+def test_terminal_status_clears_sid_with_the_pair():
+    done = _goal(status="completed", last_modified="2026-08-03T08:00:00")
+    live = _goal(status="in-progress", claimed_by="omni",
+                 claimed_at="2026-08-03T08:05:00", claimed_by_sid=SID_A,
+                 last_modified="2026-08-03T08:05:00")
+    m = _merged_pair(done, live)
+    assert m["status"] == "completed"
+    assert "claimed_by" not in m and "claimed_by_sid" not in m, \
+        "a completed goal must not carry a body id"
+
+
+def test_release_clears_sid_with_the_pair():
+    """Null side provably newer than the claim -> genuine release."""
+    claim = _goal(claimed_by="omni", claimed_at="2026-08-03T08:00:00",
+                  claimed_by_sid=SID_A, last_modified="2026-08-03T07:00:00")
+    released = _goal(last_modified="2026-08-03T09:00:00")
+    m = _merged_pair(claim, released)
+    assert "claimed_by" not in m and "claimed_by_sid" not in m
+
+
+# --- the claimed_by_sid sub-branches, mutation-pinned () ------------
+#
+# Fresh-eyes mutation-tested all six claimed_by_sid sub-branches of _merge_goal
+# against this suite (foxtrot, msg-20260803-062524-foxtrot-5036). Only the
+# conflict SET and the terminal-clear POP were killed; FOUR survived — the
+# conflict POP, the release-clear POP, and BOTH halves of the release-keep
+# if/else. The code was correct throughout; the suite simply could not tell.
+#
+# Why they survived, and the rule for reading the cases below: `out` starts as
+# dict(win), the LWW winner. Every pre-existing fixture happened to put the sid
+# on the side `out` was already copied from, so setting it changed nothing and
+# popping it removed nothing — the mutant and the original were observationally
+# equivalent under the fixture though they differ in production (guard-2219).
+# So each test here puts the sid on the side `out` does NOT start from. That is
+# the whole design constraint; a case that ignores it re-creates the no-op.
+#
+# Correction to the filing: fixture (1) was specified as killing L1091 AND
+# L1093. It cannot — those are the two arms of one if/else, so any single
+# fixture takes exactly one of them. Four cases, one per surviving line.
+
+SID_C = "33333333-3333-3333-3333-333333333333"
+
+
+def test_conflict_winner_without_sid_does_not_inherit_losers_sid():
+    """Conflict POP. alpha claims FIRST but carries no body id (a legacy
+    pre-sid claim); zeta claims later, carries SID_B, and holds the newer
+    last_modified — so `out` starts from zeta's record. First-writer-wins
+    hands the claim to alpha, and without the pop the merged goal reads
+    claimed_by=alpha beside zeta's body id: a claim attributed to a session
+    that never made it, which is the mixed pair the unit rule exists to
+    prevent. Sibling of test_sid_travels_with_the_pair_across_agents, which
+    covers the arm where the winner HAS a sid."""
+    a = _goal(claimed_by="alpha", claimed_at="2026-08-03T08:00:00",
+              status="in-progress", last_modified="2026-08-03T08:00:00")
+    b = _goal(claimed_by="zeta", claimed_at="2026-08-03T08:00:40",
+              claimed_by_sid=SID_B, status="in-progress",
+              last_modified="2026-08-03T08:00:40")
+    m = _merged_pair(a, b)
+    assert m["claimed_by"] == "alpha"
+    assert "claimed_by_sid" not in m, \
+        "a sid-less winner must not inherit the loser's body id"
+
+
+def test_release_clear_drops_a_sid_the_lww_winner_actually_holds():
+    """Release-clear POP. test_release_clears_sid_with_the_pair puts the sid
+    on the LWW LOSER, so `out` never held it and the pop there is a no-op.
+    Here the claim side is BOTH the sid holder and the LWW winner (a later
+    edit advanced its last_modified past the release), while the null side is
+    still provably newer than claimed_at — so the release fires and has to
+    strip a sid `out` genuinely carries. Without the pop the goal keeps the
+    releasing body's id with no claim beside it."""
+    claim = _goal(claimed_by="omni", claimed_at="2026-08-03T08:00:00",
+                  claimed_by_sid=SID_A, status="in-progress",
+                  last_modified="2026-08-03T10:00:00")
+    released = _goal(status="pending", last_modified="2026-08-03T09:00:00")
+    m = _merged_pair(claim, released)
+    assert "claimed_by" not in m and "claimed_at" not in m
+    assert "claimed_by_sid" not in m, \
+        "a released goal must not keep the releasing body's id"
+
+
+def test_kept_claim_carries_its_body_id_when_the_snapshot_wins_lww():
+    """Release-keep SET — the consequential one. This is the 
+    double-claim guard with a body id attached.
+    test_one_side_null_older_snapshot_keeps_claim is exactly this shape with
+    no sid anywhere in the fixture, so it exercises only the no-op half.
+
+    Here the stale pre-claim snapshot holds the NEWER last_modified, so `out`
+    starts from the record with no sid at all. Without the SET the kept claim
+    reads claimed_by=omni / claimed_at=08:00 and NO body id — and a sid-less
+    claim then fails _diff_body's bool(ca_sid)/bool(cb_sid) guard on the NEXT
+    merge, so a second body's LATER claim wins. That is g-306-132-c
+    reintroduced through the merge itself."""
+    claim = _goal(claimed_by="omni", claimed_at="2026-08-03T08:00:00",
+                  claimed_by_sid=SID_A, status="in-progress",
+                  last_modified="2026-08-03T07:00:00")
+    snapshot = _goal(status="pending", last_modified="2026-08-03T07:30:00")
+    m = _merged_pair(claim, snapshot)
+    assert m["claimed_by"] == "omni"
+    assert m["claimed_at"] == "2026-08-03T08:00:00"
+    assert m["claimed_by_sid"] == SID_A, \
+        "the kept claim must keep its body id, or the next merge cannot see it"
+
+
+def test_kept_claim_without_sid_strips_a_residue_sid_from_the_snapshot():
+    """Release-keep POP. The claim is legacy/pre-sid; the stale snapshot
+    carries a leftover body id and wins LWW, so `out` holds a sid the kept
+    claim never had. Without the pop the merge MANUFACTURES the mixed pair —
+    claimed_by=omni beside a body id that claimed nothing.
+
+    A claim-less sid is residue rather than anything a writer emits today
+    (claim/release/stale-take-back all move the three fields together). It is
+    reachable precisely because this pop is what prevents it: _merge_goal is
+    applied repeatedly against its own output (see the convergence tests), so
+    a merge that preserves the residue keeps re-preserving it, and one box
+    that produced it propagates it. A total merge must be closed over the
+    shapes it can itself emit."""
+    claim = _goal(claimed_by="omni", claimed_at="2026-08-03T08:00:00",
+                  status="in-progress", last_modified="2026-08-03T07:00:00")
+    snapshot = _goal(status="pending", claimed_by_sid=SID_C,
+                     last_modified="2026-08-03T07:30:00")
+    m = _merged_pair(claim, snapshot)
+    assert m["claimed_by"] == "omni"
+    assert m["claimed_at"] == "2026-08-03T08:00:00"
+    assert "claimed_by_sid" not in m, \
+        "a sid-less claim must not pick up a residue body id"
 
 
 # --- terminal status clears the claim pair (write-path Rule 3 mirror) --------

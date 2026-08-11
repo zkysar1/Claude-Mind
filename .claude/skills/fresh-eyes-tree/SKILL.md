@@ -159,6 +159,39 @@ Bash: bash core/scripts/tree-read.sh --node l1-taxonomy-health
     together all read the same pre-fire value and all pass. A duplicate here
     means you overlapped, not that the mechanism is missing.
 
+# 2.0b LOST-WINDOW JOIN (Decision Rule 18, g-115-4196 lineage; added 2026-08-07).
+# MANDATORY, and it is a JOIN — neither store answers it alone. The cadence
+# STAMP gates the next fire; the assessment ENTRY carries the value. They are
+# written in separate steps (Phase 6 Step 1 vs Phase 5.5), so a pass can advance
+# the clock without producing the artifact, and BOTH readings stay
+# self-consistent: read -assessments alone and you compute your diff from the
+# last ENTRY; read the stamp alone and you compute from the last FIRE. The gap
+# exists only in the comparison.
+#
+# Measured 2026-08-07 (echo, world-count 8488): the stamp read
+# {2026-08-06T07:39:02, world_goals_count_at_last_fire: 8285, fired_by: foxtrot}
+# while the newest entry anywhere in the series was 2026-08-04 / 8082 — a
+# 203-world-goal window with NO series record. Confirmed real, not an instrument
+# failure, by a tree-wide search for a misfiled entry (none) plus a positive
+# control that returned the known 08-04 entry.
+#
+# The command is named here rather than left as a requirement: Phase 2.0's own
+# tree-read cannot answer this, and a step the mandated tool cannot satisfy is
+# silently disobeyed by every compliant reader (guard-2466).
+Bash: bash core/scripts/team-state-read.sh --field shared_cadences.last_fresh_eyes_tree_review --json
+  → stamp_count = world_goals_count_at_last_fire ; stamp_by = fired_by
+  → entry_count = the world-count in the NEWEST `### ` heading of
+    l1-taxonomy-health-assessments (headings carry it since 2026-08-01;
+    pre-08-01 headings say "counter NNNN" and are agent-relative — Rule 13 —
+    so treat those as unusable for this join rather than comparing them)
+  → IF (stamp_count - entry_count) >= cadence (200): a prior pass FIRED and left
+    no entry. Say so in THIS pass's entry, naming stamp_by, both numbers, and the
+    window size. Do NOT infer WHY, and do NOT read a partner's empty temp/ as
+    evidence — it is a per-agent read-through cache that is not materialized on
+    your box (guard-980, check-team-state-before-silent.md). Report the artifact
+    gap; never a partner's conduct.
+  → ELSE: the series is continuous; note the diff and continue.
+
 # WHY 2.0 EXISTS AND WHY IT IS FIRST. This node used to be read only at Phase
 # 5.5, where the encoding novelty-gate forces it — i.e. AFTER the briefing was
 # already synthesized. That ordering guarantees each reviewer re-derives from
@@ -301,8 +334,40 @@ JSON shape (consume programmatically when synthesizing the briefing):
       data_sparse         — <10 picks logged; signal not yet meaningful
       balanced            — all L1s within imbalance threshold
       imbalanced          — findings list is non-empty
-    findings: LIST of {l1, signal: hot|stagnating, pick_share,
-    mass_share, imbalance, interpretation}.
+    findings: LIST of {l1, signal: hot|stagnating|stable-reference,
+    pick_share, mass_share, imbalance, interpretation}. Low-write findings
+    (stagnating / stable-reference) additionally carry read_side
+    (measured|unavailable), retrieval_per_node, median_retrieval_per_node;
+    `hot` findings carry none of those — they are judged on write share
+    alone, so do not read a missing retrieval_per_node as zero.
+
+    `status: imbalanced` describes the NUMERIC condition, NOT a problem —
+    read `signal` for the health judgment (g-115-3214):
+      hot              — growing faster than mass; review the boundary
+      stagnating       — few picks AND consulted below the median rate;
+                         a genuine retirement/merge candidate
+      stable-reference — few picks but consulted at/above the median rate.
+                         HEALTHY. Done growing is not dying — do NOT
+                         propose retirement or merge on the imbalance
+                         number alone (guard-731).
+    `read_side: "unavailable"` is a PER-L1 claim, NOT a global one: THIS
+    L1 has no retrieval data. Read the interpretation string for the
+    scope — it names either "no L1 has retrieval data, so the whole
+    read-side instrument is blind" or "this L1 has no retrieval data,
+    though peers do". The remedies differ: the first means nothing is
+    measurable (fix retrieval logging before judging ANY L1); the second
+    is a measured peer-relative fact and points TOWARD retirement, not
+    away from it. Either way the `stagnating` verdict is write-side-only
+    and is not on its own a retirement recommendation (guard-1974 —
+    absence of evidence never renders as the healthy verdict). The
+    healthy branch is gated on this L1's OWN density, never on the
+    median comparison alone: the median collapses to 0.0 as soon as
+    >=50% of L1s are unconsulted, and `0.0 >= 0.0` would otherwise hand
+    every zero-retrieval L1 `stable-reference` off a zero basis
+    (guard-2393 — a cross-item statistic is not evidence about the
+    item). Before g-115-3214 the low-write branch was guarded by
+    `imbalance > 0`, so a zero-pick L1 was dropped from findings
+    entirely and NO zero-pick L1 could ever surface, dead or alive.
 
 S4/S6 return [] when no candidates met the bar; S7 carries an explicit
 status to distinguish "wait for more data" from "all clear" — they look
@@ -439,6 +504,20 @@ in doubt, drop:
   fresh-eyes-tree`) rather than adding a duplicate. Use `/tree add {parent}
   {key} {summary}` ONLY for a genuinely novel finding (e.g. a new emergence
   candidate).
+
+  **Post-split routing (2026-08-01, g-115-4461) — write to the right one of
+  three.** `l1-taxonomy-health` was split when it reached 155% of the Read
+  cap; it is now an INTERIOR node and appending a pass entry to it re-creates
+  the exact condition the split resolved. Route by content:
+
+  | what you are writing | node |
+  |---|---|
+  | this pass's assessment entry (`### YYYY-MM-DD — ...`) | `l1-taxonomy-health-assessments` |
+  | a measured value backing it | `l1-taxonomy-health-verified-values` |
+  | a NEW operating rule derived across passes | `l1-taxonomy-health` (parent, `## Decision Rules`) |
+
+  The parent is what Phase 2.0 reads FIRST, so it must stay small enough to
+  Read whole — that is the entire point of keeping only the rules there.
 - **reasoning_bank** — a recurring cross-review pattern (e.g. "skew is
   self-reinforcing across 3+ reviews"). `reasoning-bank-add.sh` with summary
   + ABC chain + `applies_to: framework`.
@@ -446,6 +525,54 @@ in doubt, drop:
   single L1 exceeds N% structural mass for 2+ reviews, surface a decompose
   candidate"). `guardrails-add.sh` with rule + trigger_condition.
 - **drop** — already captured, too thin, or a one-cycle anomaly.
+
+### Cap enforcement (STANDING — runs EVERY pass, after the encode above)
+
+This series is append-only by construction: one entry per review, entries are
+getting longer, and nothing removes anything. So it re-crosses any cap it is
+split under. A one-off split buys ~3 passes and then the same goal is filed a
+fourth time — measured twice (`vinheim-web-stack` re-grew 26.9KB→80KB after
+its split, g-115-3861; `l1-taxonomy-health` reached 155% and grew a further
+12% *while the remedy goal sat queued*, g-115-4461). **This step is what makes
+the split durable. Do not skip it because the node "looks fine" — it looked
+fine one pass before it was 155%.**
+
+```
+# 1. MEASURE the assessments child with the CANONICAL estimator. Never chars/4,
+#    never a byte count: bytes are not tokens, and this node's own history has
+#    two agents mis-reading a byte figure as a token figure on the same day
+#    (guard-1478 / rb-2077). CHARS_PER_TOKEN lives in core/scripts/tree.py — read
+#    it, do not hardcode 2.3 here, so this step tracks the constant if it moves.
+Bash: py -3 -c "
+import sys, pathlib; sys.path.insert(0, 'core/scripts')
+from tree import CHARS_PER_TOKEN
+p = pathlib.Path(<assessments-child-file>)
+c = len(p.read_text(encoding='utf-8')); t = c / CHARS_PER_TOKEN
+print('chars=%d tokens=%d pct_of_cap=%.0f%%' % (c, t, 100*t/25000))
+"
+
+# 2. IF the child is over 70% of the ~25k cap: archive its OLDEST entries
+#    (whole `### ` blocks, oldest first) until it is back under 50%. 70/50 is a
+#    hysteresis band, not one threshold — a single trigger point would re-fire
+#    every pass and thrash. Headroom is sized for two large entries: the largest
+#    observed single entry is ~129 lines / ~9k chars.
+#    Archive target: a dated sibling under the same parent, e.g.
+#    `l1-taxonomy-health-assessments-archive-{YYYY-H1|H2}`.
+#    Use `/tree split-overcap` if the child is ALREADY too big to Read whole
+#    (never hand-split an over-cap node); a plain `/tree edit` move is fine
+#    while it still reads whole. Either way the parent's `## Decision Rules`
+#    and the newest 2-3 entries stay put.
+
+# 3. VERIFY by a full Read that returns the file's FINAL line — the truncation
+#    test, not a size estimate (the estimate chooses WHEN to act; the Read is
+#    what proves it worked).
+```
+
+Report the measurement in the Phase 6 board post either way — including when
+no archive was needed. A pass that silently skips this step is
+indistinguishable from a pass where the node was healthy, which is how the
+last over-cap went unnoticed for 15 passes (`guard-1760`: report what you
+declined to act on, not only what you acted on).
 
 Taxonomy CHANGES remain user-driven via the S8 apply scripts (Phase 5) — this
 step encodes OBSERVATIONS only, never mutates `core/config/tree.yaml

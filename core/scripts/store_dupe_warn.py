@@ -69,6 +69,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import traceback
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -252,8 +253,18 @@ def _emit(detail: dict, store: Optional[str]) -> None:
         import _gate_log
         d = dict(detail)
         decision = d.pop("decision", "fail_open")
+        # Forward `gate_error` as its OWN top-level field rather than leaving it
+        # in `extra` (g-001-339). gate-retirement-eval's remediation text for a
+        # fail_open reads verbatim "Inspect the gate_error field on those
+        # firings and fix" — so a diagnostic parked in `extra` is invisible to
+        # the exact instruction that sends a reader looking for it. Measured
+        # 2026-08-02: 0 of 30,008 firings carried gate_error and the key was
+        # absent from the store's entire key union, across 54 fail_opens
+        # fleet-wide — the prescribed diagnostic path was empty for every gate,
+        # not just this one.
+        gate_error = d.pop("gate_error", None)
         _gate_log.log(GATE_ID, decision, caller="store_dupe_warn.main",
-                      payload={"store": store}, extra=d)
+                      payload={"store": store}, gate_error=gate_error, extra=d)
     except Exception:
         pass
 
@@ -335,7 +346,33 @@ def main(argv: Optional[List[str]] = None) -> int:
             detail = {"decision": "fail_open", "reason": f"bad arguments (exit {se.code})"}
         return 0
     except Exception as exc:
-        detail = {"decision": "fail_open", "reason": type(exc).__name__}
+        # gate_error carries the INFORMATIVE TAIL — never a raw format_exc()
+        # (g-001-339). `_gate_log._truncate` keeps the HEAD (`s[:200] + "..."`),
+        # and a traceback's head is its banner plus the OUTER frames, so 200
+        # chars of one is spent before reaching the exception type and message,
+        # which sit at the very END. Passing format_exc() here would therefore
+        # populate the field while still hiding the cause — the failure mode is
+        # a diagnostic that LOOKS present and says nothing. Compose type +
+        # message + innermost frame explicitly: it fits the budget and is the
+        # part a diagnostician actually needs. `reason` stays the bare exception
+        # name so existing consumers that group by it are unaffected.
+        # Report THIS FILE's frame first, then the innermost. The innermost
+        # frame alone is usually inside a stdlib module and is the SAME for
+        # every occurrence of that exception type anywhere — measured here as
+        # `decoder.py:356` for JSONDecodeError, which has zero discriminating
+        # power about which call site actually failed. The own-code frame is
+        # what a fix needs; the innermost is kept after it for depth.
+        tb = traceback.extract_tb(exc.__traceback__)
+        _here = Path(__file__).name
+        own = [f for f in tb if Path(f.filename).name == _here]
+        parts = []
+        if own:
+            parts.append(f"{_here}:{own[-1].lineno}")
+        if tb and (not own or tb[-1] is not own[-1]):
+            parts.append(f"{Path(tb[-1].filename).name}:{tb[-1].lineno}")
+        where = " -> ".join(parts) or "?"
+        detail = {"decision": "fail_open", "reason": type(exc).__name__,
+                  "gate_error": f"{type(exc).__name__}: {exc} @ {where}"}
         return 0
     finally:
         # In the `finally` so every return path above is covered — including the

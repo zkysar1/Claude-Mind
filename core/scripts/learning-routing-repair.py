@@ -28,7 +28,7 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from _paths import PROJECT_ROOT, WORLD_DIR  # type: ignore
+from _paths import WORLD_DIR, agents_root  # type: ignore
 
 # Reuse the audit's classifier and store loaders
 import importlib.util
@@ -54,11 +54,21 @@ STORE_PATHS = {
 
 
 def _resolve_store_path(store, record_id):
-    """experience records live in per-agent files; all others in world/."""
+    """experience records live in per-agent files; all others in world/.
+
+    Routed through agents_root() (guard-1318, CLAUDE.md "cross-agent glob
+    consumers"). This read was PROJECT_ROOT.glob("*/experience.jsonl") until
+    2026-08-10 (g-115-5646) — depth-1, matching nothing post-relocation, so
+    every experience-store repair silently resolved to None. Its twin in
+    learning-routing-audit.load_all_experiences() was the destructive half:
+    this module imports that function, so a zero-record corpus there made the
+    audit call EVERY experience_ref dangling and this script nulled them.
+    """
     if store != "experience":
         return STORE_PATHS[store]
-    # find which agent's experience.jsonl contains this record ID
-    for exp_path in sorted(PROJECT_ROOT.glob("*/experience.jsonl")):
+    # find which agent's experience file contains this record ID
+    for exp_path in sorted(agents_root().glob("*/experience.jsonl")) + \
+            sorted(agents_root().glob("*/experience-archive.jsonl")):
         for line in exp_path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line:

@@ -38,6 +38,43 @@ On a hit, the remediation is NOT to bulk-delete: follow archive-before-delete
 (retire via aspirations status, re-close resurrected archives), AND investigate
 the leaking test run (which box, was the STORAGE_BACKEND=local pin present).
 
+STORE BOUNDARY (decided g-115-4371, 2026-08-01, zeta, cc-02 / Linux
+6.8.0-136-generic -- measured, not inherited). The scanner covered 3 stores and
+carried signatures from ONE leaking test (test_asp_id_auto_allocation.py). A
+census of every candidate world JSONL store found 53 fixture-shaped records, 38
+of them status=active, and the scanner reported PASS on all of them. Both
+dimensions were stale, and the store dimension was the LESS important one:
+pipeline.jsonl was ALREADY covered and still carried 7 undetected fixtures,
+because the signature set had never been extended when new world-writing tests
+landed. So the fix is signature-first (RECORD_FIELD_SIGNATURES below, applied to
+every store including the pre-existing three) and store-second.
+
+IN scope -- the retrieval-bearing governed stores an agent reasons FROM, where a
+leaked row can silently become input to a decision:
+  aspirations(+archive) . pipeline . reasoning-bank(+archive) . guardrails(+archive)
+  . pattern-signatures(+archive)
+
+OUT of scope, deliberately:
+  * board channels -- measured clean at 14,069 rows across all 5. Board ids and
+    bodies are timestamp+agent derived (msg-YYYYMMDD-HHMMSS-<agent>-NNNN), so a
+    fixture cannot collide into one the way an auto-allocated rb-{max+1} can.
+    An informative zero, not a vacuous one (rb-245).
+  * the ~50 telemetry / metrics / ledger / override JSONL stores (*-metrics,
+    *-log, *-overrides, changelog, retrieval-trace, ...). Append-only
+    instrumentation with no retrieval surface: a leaked row there is never read
+    back INTO the agent's reasoning, so it cannot mislead. Scanning them would
+    trade the whole point of a curated high-confidence signal for noise.
+  * meta/spark-questions.jsonl -- DOES have a retrieval surface (candidate
+    promotion), so it fails the out-of-scope test above on the merits. It is out
+    only on cost/benefit: measured 29 rows, 1 fixture row (sq-310, text "What
+    happens when X?" from _spark_question_rec), and it is ALREADY status=retired
+    -- 0 active. Covering it needs a structural change, because scan() is
+    world_dir-scoped and META_DIR is an independently-configured external path
+    (.claude/rules/path-resolution.md: never derive one from the other). Build
+    that seam when a spark-question fixture is found ACTIVE, not before.
+Re-decide this boundary if a store ever gains a retrieval surface -- the test
+is "can a row here reach an agent's reasoning?", not "is it a JSONL file?".
+
 Usage:
   py -3 core/scripts/fixture-leak-scan.py               # scan prod stores, report, exit 0
   py -3 core/scripts/fixture-leak-scan.py --json        # machine-readable
@@ -111,10 +148,97 @@ FIXTURE_SIGNATURES = [
      "source": "test_asp_id_auto_allocation.py", "confidence": "medium"},
 ]
 
+# ---------------------------------------------------------------------------
+# Store-AGNOSTIC record-field signatures (g-115-4371). Unlike FIXTURE_SIGNATURES
+# above -- which is scoped to the aspiration/goal SHAPE -- each entry here is an
+# exact match on one named field of ANY record in ANY scanned store. That is the
+# right shape for the second leak family, whose record builders live in
+# mind_api/tests and hardcode self-declaring literals:
+#   test_runtime_store_rbguard.py     _rb_rec()     -> reasoning-bank.jsonl
+#                                     _guard_rec()  -> guardrails.jsonl
+#   test_runtime_store_patsig_spark.py / test_wrapper_patsig_spark.py
+#                                     _patsig_rec() -> pattern-signatures.jsonl
+#
+# Why field-exact and not id-shape: a builder called WITHOUT an explicit id gets
+# auto-allocated <prefix>-{max+1} against the PRODUCTION max, so the fixture
+# takes a real next-in-sequence id. Measured g-115-4371: an id-collision probe
+# saw 10 of 25 leaked reasoning-bank rows and 8 of 15 guardrails rows, and its
+# hits were dominated by FALSE positives (tests legitimately name real ids like
+# asp-115). Content is the only reliable signal -- the same conclusion this
+# module's header already drew for asp-338..343, now confirmed on a second family.
+_FIELD_SIGNATURES_SRC_RBGUARD = "mind_api/tests/test_runtime_store_rbguard.py"
+_FIELD_SIGNATURES_SRC_PATSIG = "mind_api/tests/test_runtime_store_patsig_spark.py"
+# `test-cat` / `test-guard` are SHARED house literals, not one file's: measured
+# 2026-08-01 in 10 and 3 mind_api/tests files respectively (the pipeline family
+# -- test_runtime_pipeline_writers, test_wrapper_pipeline, test_runtime_pipeline_
+# archive, test_pipeline_surprise_derived -- all use test-cat too). `source` is
+# what a triager opens to fix the leaking test, so naming a single file here
+# would send them to the wrong one for most hits.
+_FIELD_SIGNATURES_SRC_HOUSE = "mind_api/tests (shared house fixture literal)"
+
+RECORD_FIELD_SIGNATURES = [
+    # _rb_rec()
+    {"field": "category", "value": "test-cat",
+     "source": _FIELD_SIGNATURES_SRC_HOUSE, "confidence": "high"},
+    {"field": "title", "value": "Test RB entry",
+     "source": _FIELD_SIGNATURES_SRC_RBGUARD, "confidence": "high"},
+    {"field": "content", "value": "A test reasoning-bank entry.",
+     "source": _FIELD_SIGNATURES_SRC_RBGUARD, "confidence": "high"},
+    # _guard_rec()
+    {"field": "category", "value": "test-guard",
+     "source": _FIELD_SIGNATURES_SRC_HOUSE, "confidence": "high"},
+    {"field": "rule", "value": "always test before deploy",
+     "source": _FIELD_SIGNATURES_SRC_RBGUARD, "confidence": "high"},
+    {"field": "source", "value": "wave-2-test",
+     "source": _FIELD_SIGNATURES_SRC_RBGUARD, "confidence": "high"},
+    {"field": "trigger_condition", "value": "before any deploy",
+     "source": _FIELD_SIGNATURES_SRC_RBGUARD, "confidence": "medium"},
+    # _patsig_rec()
+    {"field": "name", "value": "test pattern",
+     "source": _FIELD_SIGNATURES_SRC_PATSIG, "confidence": "high"},
+    {"field": "description", "value": "a test pattern signature",
+     "source": _FIELD_SIGNATURES_SRC_PATSIG, "confidence": "high"},
+    {"field": "expected_outcome", "value": "outcome-x",
+     "source": _FIELD_SIGNATURES_SRC_PATSIG, "confidence": "medium"},
+]
+
+# Governed tombstone statuses. A record already retired/archived is a leak that
+# was HANDLED; re-flagging it every 24h run is pure re-triage noise a reader must
+# dismiss each cycle. Live detection is preserved because a FRESH leak lands with
+# whatever status the leaking test wrote (active, or none at all). Same rule the
+# aspiration scan applies at the aspiration level (g-115-2723).
+TOMBSTONE_STATUSES = ("retired", "archived")
+
 # Pre-compile regex signatures once.
 for _sig in FIXTURE_SIGNATURES:
     if _sig["kind"] == "regex":
         _sig["_re"] = re.compile(_sig["value"])
+
+
+def _is_tombstone(rec: dict) -> bool:
+    return str(rec.get("status", "")).strip().lower() in TOMBSTONE_STATUSES
+
+
+def _match_record_fields(rec: dict) -> list[dict]:
+    """Return the RECORD_FIELD_SIGNATURES matched by this record's fields."""
+    hits = []
+    for sig in RECORD_FIELD_SIGNATURES:
+        val = rec.get(sig["field"])
+        if val is None:
+            continue
+        if str(val).strip() == sig["value"]:
+            hits.append(sig)
+    return hits
+
+
+def _field_suspects(rec: dict, store_label: str, record_id: str) -> list[dict]:
+    """Emit suspect rows for every RECORD_FIELD_SIGNATURES match on `rec`."""
+    return [{
+        "store": store_label, "record_id": record_id,
+        "field": sig["field"], "value": str(rec.get(sig["field"]))[:80],
+        "matched": sig["value"], "confidence": sig["confidence"],
+        "source": sig["source"],
+    } for sig in _match_record_fields(rec)]
 
 
 def _match(scope: str, value: str) -> list[dict]:
@@ -186,8 +310,9 @@ def _scan_aspirations(path: Path, store_label: str) -> list[dict]:
         # the reliable marker (goals under a retired asp can still read
         # `pending`, so goal.status is NOT a tombstone signal — skip at the
         # aspiration level, which also drops its nested goals).
-        if str(asp.get("status", "")).strip().lower() in ("retired", "archived"):
+        if _is_tombstone(asp):
             continue
+        suspects += _field_suspects(asp, store_label, asp_id)
         for scope, field in ((_SCOPE_ASP_TITLE, "title"),
                              (_SCOPE_ASP_MOTIVATION, "motivation")):
             for sig in _match(scope, asp.get(field)):
@@ -201,6 +326,7 @@ def _scan_aspirations(path: Path, store_label: str) -> list[dict]:
             if not isinstance(g, dict):
                 continue
             gid = g.get("id", "?")
+            suspects += _field_suspects(g, store_label, f"{asp_id}/{gid}")
             for scope, field in ((_SCOPE_GOAL_TITLE, "title"),
                                  (_SCOPE_GOAL_DESC, "description")):
                 for sig in _match(scope, g.get(field)):
@@ -222,6 +348,18 @@ def _scan_pipeline(path: Path, store_label: str) -> list[dict]:
         if not isinstance(rec, dict):
             continue
         rid = rec.get("id", "?")
+        # NO _is_tombstone() skip here, deliberately: for the pipeline "archived"
+        # is a NORMAL lifecycle status (discovered/active/resolved/archived), not
+        # the governed remediation marker it is for an aspiration or an rb/guard
+        # row. Skipping it would suppress detection of every fixture that reached
+        # archived naturally -- and would make pipeline-archive.jsonl vacuous.
+        # g-115-4371: the record-field pass is what actually catches this store's
+        # live leak. pipeline.jsonl was in the covered set from day one and still
+        # held 7 undetected fixtures (2026-05-14_test-hyp, 2026-07-29_census-a..d,
+        # ...) carrying category="test-cat" -- invisible to the title/desc pass
+        # below, which only knows the asp-338..343 family. Being SCANNED is not
+        # being COVERED when the signature set is a generation behind.
+        suspects += _field_suspects(rec, store_label, rid)
         # Pipeline records have no goals/motivation; check their text fields
         # against the title/desc-scoped signatures (a leaked fixture title would
         # match regardless of which store it landed in).
@@ -240,18 +378,52 @@ def _scan_pipeline(path: Path, store_label: str) -> list[dict]:
     return suspects
 
 
+def _scan_flat(path: Path, store_label: str) -> list[dict]:
+    """Scan a FLAT JSONL store (one self-contained record per line, no nesting):
+    reasoning-bank, guardrails, pattern-signatures and their archives. These
+    carry no aspiration/goal shape, so only the store-agnostic
+    RECORD_FIELD_SIGNATURES apply."""
+    suspects: list[dict] = []
+    for rec in _snapshot(path):
+        if not isinstance(rec, dict) or _is_tombstone(rec):
+            continue
+        suspects += _field_suspects(rec, store_label, rec.get("id", "?"))
+    return suspects
+
+
+# Single source of truth for coverage: scan() iterates this, and --json reports
+# it. Keeping the reported list separate from the scanned list is how a scanner
+# comes to under-report its own coverage (guard-1760) -- one constant, no drift.
+SCANNED_STORES: list[tuple[str, str]] = [
+    ("aspirations.jsonl", "aspirations"),
+    # The archive can also carry a leaked fixture (a resurrected/archived one).
+    ("aspirations-archive.jsonl", "aspirations"),
+    ("pipeline.jsonl", "pipeline"),
+    ("pipeline-archive.jsonl", "pipeline"),
+    ("reasoning-bank.jsonl", "flat"),
+    ("reasoning-bank-archive.jsonl", "flat"),
+    ("guardrails.jsonl", "flat"),
+    ("guardrails-archive.jsonl", "flat"),
+    ("pattern-signatures.jsonl", "flat"),
+    ("pattern-signatures-archive.jsonl", "flat"),
+]
+
+_SCANNERS = {
+    "aspirations": _scan_aspirations,
+    "pipeline": _scan_pipeline,
+    "flat": _scan_flat,
+}
+
+
 def scan(world_dir: str | None = None) -> list[dict]:
-    """Scan the production aspiration + pipeline stores for leaked test fixtures.
+    """Scan the production governed stores for leaked test fixtures.
     Returns a list of suspect dicts. `world_dir` overrides WORLD_DIR (tests)."""
     base = Path(world_dir) if world_dir else (Path(WORLD_DIR) if WORLD_DIR else None)
     if base is None:
         return []
     suspects: list[dict] = []
-    suspects += _scan_aspirations(base / "aspirations.jsonl", "world/aspirations.jsonl")
-    # The archive can also carry a leaked fixture (a resurrected/archived one).
-    suspects += _scan_aspirations(base / "aspirations-archive.jsonl",
-                                  "world/aspirations-archive.jsonl")
-    suspects += _scan_pipeline(base / "pipeline.jsonl", "world/pipeline.jsonl")
+    for name, kind in SCANNED_STORES:
+        suspects += _SCANNERS[kind](base / name, f"world/{name}")
     return suspects
 
 
@@ -271,8 +443,7 @@ def main() -> int:
 
     if args.json:
         print(json.dumps({
-            "scanned": ["world/aspirations.jsonl", "world/aspirations-archive.jsonl",
-                        "world/pipeline.jsonl"],
+            "scanned": [f"world/{n}" for n, _ in SCANNED_STORES],
             "suspect_count": len(suspects),
             "suspects": suspects,
         }, indent=2))

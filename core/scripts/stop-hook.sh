@@ -222,16 +222,50 @@ bash "$CORE_ROOT/scripts/cleanup-stale-bindings.sh" 2>/dev/null || true
 rm -f "$PROJECT_ROOT/.stop-hook-stdin.json"
 _T_AFTER_HOUSEKEEPING=$(date +%s%3N)
 
-# --- Gate 0: Session identity — only block the runner session ---
 # running-session-id is set by /start (autonomous mode) and kept in sync by
-# session-save-id.sh (on compact). If missing, no loop is running — allow stop.
+# session-save-id.sh (on compact). Read it up front; Gate 0 itself now runs
+# AFTER the per-Body branch below.
 RUNNER_FILE="$HOOK_AGENT_DIR/session/running-session-id"
-if [ ! -f "$RUNNER_FILE" ]; then
-    echo "$(date +%Y-%m-%dT%H:%M:%S) ALLOW gate=no-runner sid=$HOOK_SID agent=$HOOK_AGENT" >> "$LOG" 2>/dev/null || true
-    exit 0
-fi
-RUNNER_SID=$(cat "$RUNNER_FILE" 2>/dev/null | tr -d '\r\n' || echo "")
-if [ -n "$RUNNER_SID" ] && [ "$HOOK_SID" != "$RUNNER_SID" ]; then
+RUNNER_SID=""
+# Conditional read so a box with NO runner file still spawns no subprocess here
+# (the dormant-case guarantee the per-Body block documents). `set -e` is NOT in
+# effect (`set -uo pipefail`, L25) so the failing test is not fatal, and
+# RUNNER_SID is pre-initialised because `set -u` IS.
+[ -f "$RUNNER_FILE" ] && RUNNER_SID=$(cat "$RUNNER_FILE" 2>/dev/null | tr -d '\r\n' || echo "")
+
+# --- Per-Body branch — HOISTED ABOVE Gate 0's early exit () ---
+# WHY IT MOVED. The Phase 2B close producer and the worker resurrection net
+# below were BOTH nested inside the sid-MISMATCH branch, reachable only when
+# running-session-id EXISTS. A cross-box worker on a remote-reducer box
+# deliberately has NO local running-session-id, so every worker turn-end hit
+# Gate 0's `exit 0` first and got NEITHER. Measured (soak #2, 2026-08-05, SID
+# 5c55002c): three consecutive worker turn-ends logged ALLOW gate=no-runner —
+# two were mid-loop text-deaths this net exists to BLOCK (the worker survived
+# only on ~600s deadman wakeups), and the third was a GENUINE close whose
+# learning payload was stranded (manifest left body_state=active, zero staging).
+# Soak #1 passed only because that box still carried ex-reducer residue — a
+# stale local running-session-id — which made the mismatch branch reachable BY
+# ACCIDENT; cleaning the residue (correct) removed the accident.
+#
+# This is rb-662(1) in bash: a SINGLE-SIGNAL trigger (the per-Body WM fork
+# signature) was wired INSIDE an AGGREGATE gate (runner-file-exists AND
+# sid-differs), which silently drops the single-signal-only path. The remedy it
+# prescribes is exactly this — hoist above the aggregate gate and keep a
+# signal-level guard (`[ -f "$_BODY_WM" ]`, unchanged below).
+#
+# The guard is the UNION of the two non-reducer cases and NOTHING more:
+#   no runner file            -> cross-box worker      (the newly-covered case)
+#   runner file, SID differs  -> today's sid-mismatch  (unchanged)
+#   runner file, SID matches  -> the REDUCER: NOT taken. Its own perpetuity
+#                                layers own that turn-end, and a worker-net
+#                                BLOCK here would hand it the wrong re-entry
+#                                skill (Skill(worker-loop) vs Skill(aspirations)).
+#   runner file present but EMPTY -> NOT taken, exactly as before. The `-n`
+#                                test is preserved DELIBERATELY: this fix adds
+#                                the no-file case without changing the
+#                                empty-file case it was not scoped to touch.
+# Cost on a box that never forked a Body: one extra bash file test, zero py-3.
+if [ ! -f "$RUNNER_FILE" ] || { [ -n "$RUNNER_SID" ] && [ "$HOOK_SID" != "$RUNNER_SID" ]; }; then
     # --- Phase 2B producer (, refines ): close a worker Body on a
     # GENUINE close ---
     # This session is NOT the runner (sid-mismatch). If it is a forked non-reducer
@@ -257,9 +291,120 @@ if [ -n "$RUNNER_SID" ] && [ "$HOOK_SID" != "$RUNNER_SID" ]; then
     if [ -f "$_BODY_WM" ] && [ -f "$_CLOSE_SENTINEL" ]; then
         _CLOSE_RESULT=$($PY "$CORE_ROOT/scripts/body-manifest.py" close-body-on-genuine --sid "$HOOK_SID" --agent "$HOOK_AGENT" 2>/dev/null || echo "")
         echo "$(date +%Y-%m-%dT%H:%M:%S) BODY-CLOSE sid=$HOOK_SID agent=$HOOK_AGENT genuine-close result=$_CLOSE_RESULT" >> "$LOG" 2>/dev/null || true
+        # -d: a worker claims through the SAME contract the reducer uses
+        # (aspirations-claim.sh, worker-loop Phase 2), and that claim WRITES
+        # team-state in_flight — but the worker loop STOPS at Phase 4 and never
+        # runs iteration-close do_verify Step 3 (L629), the only place the normal
+        # path clears it. recovery-gate.sh's clear (via session-manifest-clear.sh,
+        # rb-671) fires only behind its 6-condition zombie AND-gate, which a
+        # CLEANLY-closed worker never trips; stranded-claim-sweep enumerates
+        # status=in-progress only, so a worker that COMPLETED its goal is invisible
+        # to it. Gated on a GENUINE close (marked*) so a between-turns turn-end
+        # never clears — and the helper itself refuses unless the goal's
+        # claimed_by_sid matches THIS Body, because in_flight is agent-keyed with
+        # no sid and an unconditional clear would blank a live REDUCER's row.
+        # Runs only inside the existing worker-only guard, so the dormant
+        # single-runner case still pays ZERO extra py-3 calls. FAIL-OPEN.
+        case "$_CLOSE_RESULT" in
+            marked|marked-push-failed)
+                # stderr -> the log, NOT /dev/null ( defect B). The
+                # helper catches broadly and prints {"verdict":"error"} on
+                # stdout, so ordinary runtime failures are already visible; what
+                # was being eaten is everything UPSTREAM of that handler — a bad
+                # $PY resolution, an ImportError on _rt, a syntax error — which
+                # writes only to stderr and left `result=` empty. On a hook path
+                # nobody watches, a permanently-broken invocation then looks
+                # exactly like a clean nothing-to-clear run
+                # (verify-before-assuming Rule 4: a silenced command is ZERO
+                # signals, not one).
+                _IF_RESULT=$($PY "$CORE_ROOT/scripts/worker_close_in_flight_clear.py" --agent "$HOOK_AGENT" --sid "$HOOK_SID" 2>>"$LOG" || echo "")
+                echo "$(date +%Y-%m-%dT%H:%M:%S) BODY-CLOSE-INFLIGHT sid=$HOOK_SID agent=$HOOK_AGENT result=$_IF_RESULT" >> "$LOG" 2>/dev/null || true
+                unset _IF_RESULT
+                ;;
+        esac
         unset _CLOSE_RESULT
+    elif [ -f "$_BODY_WM" ]; then
+        # --- Worker-body resurrection net () ---
+        # Chosen over the ScheduleWakeup analog; the rejected option and the
+        # measurement behind the choice are recorded in the goal + rb.
+        #
+        # The reducer has THREE perpetuity layers (terminal Skill re-entry +
+        # this hook's unconditional BLOCK + the deadman ScheduleWakeup). A
+        # worker had exactly ONE: the Phase 5 Skill(worker-loop) re-entry added
+        # 2026-08-03 (aa4b8de8a). A text-death between work units — the
+        # rb-629/guard-454 class the reducer survives precisely BECAUSE of the
+        # BLOCK below — silently ended an unattended worker, because Gate 0
+        # ALLOWs every sid-mismatched turn-end. This branch is that missing net.
+        #
+        # WHY HERE AND NOT A NEW GATE: every discriminator is already computed
+        # two lines up. `_BODY_WM` is the fork signature — only non-reducer
+        # workers fork a per-Body working-memory.yaml; the reducer and observers
+        # never do (see the Phase 2B comment above, which already relies on
+        # exactly this). So the observer-trap risk the goal names is excluded
+        # STRUCTURALLY, not heuristically. Verified on this box: the reducer
+        # session has body-manifest.yaml and NO per-session working-memory.yaml.
+        #
+        # THE ELIF IS LOAD-BEARING: a GENUINE close (body-closing sentinel
+        # present) takes the branch above and still reaches the ALLOW, so the
+        # close path can never be trapped. `body-closing` is therefore also the
+        # per-worker escape hatch — no new sentinel was invented for it.
+        #
+        # SAFETY VALVES (guard-1813 — a refusal is not side-effect-free):
+        #   1. body-closing present  -> branch above, ALLOW (genuine close)
+        #   2. stop-requested set    -> ALLOW (user asked the agent to stop)
+        #   3. no per-Body WM        -> not a worker; reducer/observer untouched
+        #   4. manifest body_state already closed -> ALLOW (the Body closed in
+        #      a PRIOR turn; see the worker-net-body-closed branch below)
+        # Cost when no worker has ever forked (measured: 0 on this box across
+        # 572 hook decisions) is ONE bash file test — no py-3 call, matching the
+        # dormant-case guarantee the Phase 2B block above already documents.
+        # Direct file test, NOT session-signal-exists.sh: MIND_AGENT is not
+        # exported until AFTER Gate 0 (see the export comment below), so the
+        # wrapper would resolve the agent from an env this hook has not set yet
+        # — the guard-1742 class, where a hand-run shell has the var and the
+        # real caller does not. $HOOK_AGENT_DIR is already resolved here and
+        # names the same file the wrapper reads, so the test is both cheaper
+        # and correct. Same style as _BODY_WM / _CLOSE_SENTINEL above.
+        if [ -f "$HOOK_AGENT_DIR/session/stop-requested" ]; then
+            echo "$(date +%Y-%m-%dT%H:%M:%S) ALLOW gate=worker-net-stop-requested sid=$HOOK_SID agent=$HOOK_AGENT" >> "$LOG" 2>/dev/null || true
+        elif grep -Eq "^body_state: '?(closed-pending-merge|merged|closed-stale)'?[[:space:]]*$" \
+                "$HOOK_AGENT_DIR/sessions/$HOOK_SID/body-manifest.yaml" 2>/dev/null; then
+            # 4th safety valve (2026-08-09, cc-08 04:39->04:49): a GENUINELY-
+            # CLOSED Body's later turn-ends must stand the net down. After a
+            # genuine close the branch above CONSUMED the body-closing sentinel
+            # and the fork WM SURVIVES the close by design, so this elif's own
+            # discriminators read exactly like a between-units text-death —
+            # while the DURABLE closure record, body-manifest.yaml body_state,
+            # says closed. The deadman wakeup armed by the last work unit still
+            # fires ~600s post-close, so this shape occurs after EVERY genuine
+            # worker close; without this valve that firing was BLOCKed into a
+            # pointless second sentinel ceremony (close-body-on-genuine returns
+            # 'not-active'). Matched quoted or unquoted; a missing or
+            # unreadable manifest falls through to the BLOCK, so the net fails
+            # toward protection and only a positively-read closed state stands
+            # it down.
+            echo "$(date +%Y-%m-%dT%H:%M:%S) ALLOW gate=worker-net-body-closed sid=$HOOK_SID agent=$HOOK_AGENT" >> "$LOG" 2>/dev/null || true
+        else
+            echo "$(date +%Y-%m-%dT%H:%M:%S) BLOCK gate=worker-net sid=$HOOK_SID agent=$HOOK_AGENT" >> "$LOG" 2>/dev/null || true
+            unset _BODY_WM _CLOSE_SENTINEL
+            printf '%s\n' '{"decision": "block", "reason": "Worker Body turn ended without a Skill(worker-loop) re-entry (a text summary or autocompact terminated the turn). Your FIRST action MUST be: Skill('"'"'worker-loop'"'"') — NOT Skill('"'"'aspirations'"'"'), which is the REDUCER-only re-entry (guard-517/guard-463). Do NOT emit a text summary first. If this Body genuinely has no more work, write the body-closing sentinel in your per-session dir and end the turn — that is the sanctioned close path and this net will stand down."}'
+            exit 0
+        fi
     fi
     unset _BODY_WM _CLOSE_SENTINEL
+fi
+
+# --- Gate 0: Session identity — only block the runner session ---
+# Behaviour UNCHANGED; it simply now runs AFTER the per-Body branch above, so a
+# worker on a no-runner box reaches its net / close producer first instead of
+# exiting here. A GENUINE close still falls through to an ALLOW (the close path
+# can never be trapped), and a box that never forked a Body arrives here having
+# paid one extra bash file test and zero py-3 calls.
+if [ ! -f "$RUNNER_FILE" ]; then
+    echo "$(date +%Y-%m-%dT%H:%M:%S) ALLOW gate=no-runner sid=$HOOK_SID agent=$HOOK_AGENT" >> "$LOG" 2>/dev/null || true
+    exit 0
+fi
+if [ -n "$RUNNER_SID" ] && [ "$HOOK_SID" != "$RUNNER_SID" ]; then
     echo "$(date +%Y-%m-%dT%H:%M:%S) ALLOW gate=sid-mismatch sid=$HOOK_SID runner=$RUNNER_SID agent=$HOOK_AGENT runner_token=$RUNNER_TOKEN_LOG" >> "$LOG" 2>/dev/null || true
     exit 0  # Different session — not the autonomous loop runner, allow stop
 fi
@@ -299,7 +444,13 @@ if bash "$CORE_ROOT/scripts/session-signal-exists.sh" stop-loop 2>/dev/null; the
 fi
 
 # --- Gate 2.5: Pending background agents → allow stop ---
-if bash "$CORE_ROOT/scripts/pending-agents.sh" has-pending 2>/dev/null; then
+# --body-sid scopes the check to THIS body (). The store is agent-wide
+# (session/ singular), so without it a sibling WORKER body's dispatched agent
+# ALLOWs the REDUCER's turn-end and removes its text-death net. HOOK_SID (parsed
+# from the hook payload above) is the authoritative body id here — MIND_SID is
+# NOT set in the hook environment (it is injected only into Bash tool calls), so
+# the flag must be passed explicitly rather than read from env.
+if bash "$CORE_ROOT/scripts/pending-agents.sh" has-pending --body-sid "$HOOK_SID" 2>/dev/null; then
     echo "$(date +%Y-%m-%dT%H:%M:%S) ALLOW gate=pending-agents sid=$HOOK_SID agent=$HOOK_AGENT runner_token=$RUNNER_TOKEN_LOG" >> "$LOG" 2>/dev/null || true
     exit 0
 fi
@@ -313,7 +464,11 @@ fi
 # correct one. Mirror recovery-gate so both surfaces agree.
 # Fail-open via 2>/dev/null + exit-1-fallthrough: any script error treated as
 # "no pending jobs" (BLOCK proceeds) — never the wrong direction for liveness.
-if bash "$CORE_ROOT/scripts/background-jobs.sh" has-pending 2>/dev/null; then
+# --body-sid: same reasoning as Gate 2.5 above (). An older
+# background-jobs.py that does not know the flag exits 2 on the unknown
+# argument, which this fail-open shape reads as "no pending jobs" — so a
+# partial deploy in either order lands on BLOCK-proceeds, never on a wrong ALLOW.
+if bash "$CORE_ROOT/scripts/background-jobs.sh" has-pending --body-sid "$HOOK_SID" 2>/dev/null; then
     echo "$(date +%Y-%m-%dT%H:%M:%S) ALLOW gate=background-jobs sid=$HOOK_SID agent=$HOOK_AGENT runner_token=$RUNNER_TOKEN_LOG" >> "$LOG" 2>/dev/null || true
     exit 0
 fi

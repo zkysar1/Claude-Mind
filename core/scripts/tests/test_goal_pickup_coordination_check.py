@@ -401,6 +401,97 @@ def test_board_recurring_keeps_fresh_claim_after_last_achieved():
     assert [h["id"] for h in hits] == ["fresh"]
 
 
+# ── agent-queue namespace () ──────────────────────────────────────
+# Agent-queue goal ids are per-agent records, so the same id names N different
+# goals across the fleet. The pre-existing stale-prior-cycle drop compares the
+# partner's claim against the PROBER's lastAchievedAt, which is the wrong record
+# by construction once N > 1.
+
+def test_is_private_agent_queue_predicate():
+    # World: one id, one record — never private, semantics unchanged.
+    assert M.is_private_agent_queue("world") is False
+    assert M.is_private_agent_queue("world", "bravo") is False
+    # Own agent-queue goal: per-agent record, no partner can contend it.
+    assert M.is_private_agent_queue("agent") is True
+    assert M.is_private_agent_queue("agent", None) is True
+    assert M.is_private_agent_queue("agent", "") is True
+    # Cross-agent: ONE shared record that genuinely can be contended. This case
+    # is why the predicate is not `source == "agent"` — blanket-exempting
+    # source=agent would drop the only real race this lane must still catch.
+    assert M.is_private_agent_queue("agent", "bravo") is False
+
+
+def test_board_agent_queue_private_drops_partner_claim_live_specimen():
+    # Live specimen, measured 2026-08-09T21:38 (bravo, cc-05): bravo probed its
+    # OWN  (lastAchievedAt 2026-08-02T02:34:25, interval 31.0h) and got
+    # race_risk=true with EVERY other evidence lane empty. The sole contributor
+    # was echo's claim on ECHO's own  (interval 5.33h, its own
+    # lastAchievedAt 2026-08-09T20:35:29 — 11 min AFTER its own claim, i.e. echo
+    # had already finished its copy 63 min before bravo probed).
+    msgs = [_msg("msg-20260809-202426-echo-7195", "echo", "claim",
+                 "Claiming g-001-01: Reflect and journal",
+                 tags=["g-001-01", "echo"], ts="2026-08-09T20:24:26")]
+
+    # POSITIVE CONTROL — the specimen must reproduce the false positive on the
+    # pre-fix path, or this test would pass for the wrong reason. echo's claim
+    # (20:24:26) is NEWER than the prober's lastAchievedAt (2026-08-02), so the
+    #  stale-cycle drop keeps it and the digest hard-yields.
+    hits = M.classify_board_mentions(
+        "g-001-01", "bravo", msgs, goal_recurring=True,
+        goal_last_achieved="2026-08-02T02:34:25")
+    assert [h["id"] for h in hits] == ["msg-20260809-202426-echo-7195"]
+    assert hits[0]["kind"] == "claim"  # claim-kind is the hard-yield path
+
+    # FIXED: the id names bravo's own per-agent record, so echo's post is about
+    # a different goal entirely and no board hit survives.
+    hits = M.classify_board_mentions(
+        "g-001-01", "bravo", msgs, goal_recurring=True,
+        goal_last_achieved="2026-08-02T02:34:25", agent_queue_private=True)
+    assert hits == []
+
+
+def test_board_agent_queue_private_drop_is_independent_of_last_achieved():
+    # The namespace drop must NOT depend on lastAchievedAt at all — that field is
+    # exactly the one that names the wrong record here. A partner mid-cycle on
+    # its OWN copy (claim NEWER than its own lastAchievedAt) still cannot race
+    # this record, so the stale-cycle comparison could never have caught it.
+    msgs = [_msg("live", "echo", "claim", "Claiming g-001-01: Reflect and journal",
+                 tags=["g-001-01", "echo"], ts="2026-08-09T20:24:26")]
+    for la in (None, "2026-08-02T02:34:25", "2026-08-09T23:59:59"):
+        assert M.classify_board_mentions(
+            "g-001-01", "bravo", msgs, goal_recurring=True,
+            goal_last_achieved=la, agent_queue_private=True) == []
+
+
+def test_board_cross_agent_goal_keeps_partner_claim():
+    # Outcome 2: a cross-agent goal names ONE shared record. Partner claims stay
+    # in scope, and the existing stale-cycle semantics still apply to it.
+    msgs = [_msg("live", "echo", "claim", "claiming g-001-01",
+                 tags=["g-001-01", "echo"], ts="2026-08-09T20:24:26")]
+    private = M.is_private_agent_queue("agent", "bravo")  # cross-agent owner set
+    assert private is False
+    hits = M.classify_board_mentions(
+        "g-001-01", "alpha", msgs, goal_recurring=True,
+        goal_last_achieved="2026-08-09T10:00:00", agent_queue_private=private)
+    assert [h["id"] for h in hits] == ["live"]
+
+
+def test_board_world_source_semantics_unchanged():
+    # Outcome 3: world goals are never private, so the  stale-cycle
+    # drop keeps governing them exactly as before.
+    msgs = [_msg("stale", "echo", "claim", "claiming g-115-105",
+                 tags=["g-115-105", "echo"], ts="2026-07-23T15:19:21")]
+    private = M.is_private_agent_queue("world")
+    assert private is False
+    assert M.classify_board_mentions(
+        "g-115-105", "foxtrot", msgs, goal_recurring=True,
+        goal_last_achieved="2026-07-23T15:27:15",
+        agent_queue_private=private) == []          # stale-cycle drop still fires
+    assert [h["id"] for h in M.classify_board_mentions(
+        "g-115-105", "foxtrot", msgs, goal_recurring=True,
+        agent_queue_private=private)] == ["stale"]  # and without it, still kept
+
+
 def test_board_stale_drop_failsafe_unparseable_ts_keeps_claim():
     # Fail-safe: an unparseable timestamp must KEEP the claim (conservative —
     # a false yield is safer than a missed race). Also: the drop is
@@ -580,6 +671,222 @@ def test_detect_write_path_literal_adds_label_only():
 def test_detect_empty_inputs():
     assert M.detect_product_surfaces("", _REPO_NAMES) == (set(), [])
     assert M.detect_product_surfaces("operator work", []) == (set(), [])
+
+
+# ── : served-domain tier ───────────────────────────────────────────
+# THE  SHAPE, reproduced structurally. Goal prose names two DOMAINS
+# and neither deliverable repo NAME; a brand token leaks a 13-repo family; the
+# caller spends its <=3 budget on matched[:3]. Measured on the live estate the
+# deliverable repo sat at index 7 of `matched` and was truncated away, so the
+# PR probe searched three alphabetical neighbours and reported 0pr.
+
+# 13 brand-prefixed repos against a 110-name denominator -> thresh 14, so
+# 'brandx' leaks by ONE. This is the live off-by-one re-opened by unioning the
+# convention catalog into the denominator (56 -> 110 names lifts thresh 7 ->
+# 14). test_detect_brand_prefix_suppressed_at_fleet_scale above pins the
+# 56-name case where the same token is correctly suppressed; this fixture pins
+# what happens at the inflated denominator, and the two must both hold.
+# 'brandx-www-site' sorts LAST inside its own leaked family (after every
+# brandx-svc-NN), which is what puts it outside the [:3] budget — the live
+# shape, where the deliverable repo sat at index 7. 'orbital-checkout-app'
+# shares NO token with the domain that serves it, so the token pass cannot
+# reach it by accident; that is the live zacharykysar.com ->
+# Zak-Data-Solutions-Web-App relationship, and it is why a domain map is
+# needed rather than a smarter tokenizer.
+_LEAKY_FLEET = (
+    [f"brandx-svc-{i:02d}" for i in range(11)]
+    + ["brandx-portal-app", "brandx-www-site", "orbital-checkout-app"]
+    + [f"unrelated-tool-{i:02d}" for i in range(96)]
+)
+_LEAKY_DOMAINS = {
+    "brandx-demo.com": {"brandx-www-site"},
+    "widgetco-demo.com": {"orbital-checkout-app"},
+}
+
+
+def test_leaky_fleet_fixture_reproduces_the_off_by_one():
+    # Guards the fixture itself: if a future edit changes the counts, the
+    # regression below would pass for the wrong reason (the leak gone rather
+    # than the domain tier working). 13 owners < thresh 14 -> still leaks.
+    names = [n for n in _LEAKY_FLEET if len(n) >= 5]
+    assert len(names) == 110
+    assert max(3, (len(names) + 7) // 8) == 14
+    assert sum(1 for n in names if n.startswith("brandx")) == 13
+
+
+def test_detect_domain_promotes_deliverable_repo_past_leaked_token():
+    prose = ("Fix: brand mark renders in two cases on brandx-demo.com "
+             "(footer + og:image:alt) and widgetco-demo.com")
+    # BEFORE (no domain map) — the pre-fix behaviour, asserted so this case
+    # cannot silently start passing for an unrelated reason. The two repos
+    # fail in DIFFERENT ways, which is why both are pinned: one is found and
+    # truncated, the other is never found at all.
+    _, before = M.detect_product_surfaces(prose, _LEAKY_FLEET)
+    assert "brandx-www-site" in before, "fixture must leak, not miss"
+    assert before.index("brandx-www-site") > 2, (
+        "pre-fix, the deliverable repo must fall outside the <=3 budget")
+    assert "orbital-checkout-app" not in before, (
+        "pre-fix, a repo named only by its domain is never matched at all")
+    # AFTER — both deliverable repos inside the budget window.
+    labels, matched = M.detect_product_surfaces(
+        prose, _LEAKY_FLEET, domain_repos=_LEAKY_DOMAINS)
+    assert {"brandx-demo.com", "widgetco-demo.com"} <= labels
+    assert set(matched[:3]) >= {"brandx-www-site", "orbital-checkout-app"}
+
+
+def test_detect_domain_matches_www_prefixed_prose():
+    # One www-stripped key must match both spellings — prose in the wild says
+    # 'https://www.brandx-demo.com/' as often as the bare registrable form.
+    labels, matched = M.detect_product_surfaces(
+        "the footer at https://www.brandx-demo.com/ renders it capitalised",
+        _LEAKY_FLEET, domain_repos=_LEAKY_DOMAINS)
+    assert "brandx-demo.com" in labels
+    assert matched[0] == "brandx-www-site"
+
+
+def test_detect_full_name_still_outranks_domain():
+    # A repo the prose NAMES is a stronger statement than one it implies via a
+    # domain, so the explicit name keeps slot 0.
+    _, matched = M.detect_product_surfaces(
+        "port the orbital-checkout-app footer fix to brandx-demo.com",
+        _LEAKY_FLEET, domain_repos=_LEAKY_DOMAINS)
+    assert matched[0] == "orbital-checkout-app"
+    assert "brandx-www-site" in matched[:3]
+
+
+def test_detect_domain_boundary_rejects_neighbouring_registrable_domains():
+    # Found by fresh-eyes review of THIS goal's own first draft. `_bounded`'s
+    # class is [a-z0-9], which excludes letters but not '-' or '.', so
+    # 'brandx-demo.com' matched inside 'evil-brandx-demo.com' and
+    # 'brandx-demo.com.attacker.net'. Both are different registrable domains
+    # and each would have taken one of the three network slots — the exact
+    # wrong-repo-in-the-budget failure this goal exists to fix.
+    accept = [
+        "we changed brandx-demo.com today",              # bare
+        "see https://www.brandx-demo.com/ now",          # www (design intent)
+        "the api at api.brandx-demo.com responds",       # subdomain
+        "the outage was at brandx-demo.com.",            # sentence period
+    ]
+    reject = [
+        "the unrelated host evil-brandx-demo.com",       # hyphen-prefixed
+        "phishing at brandx-demo.com.attacker.net",      # further label
+        "notbrandx-demo.com is a different site",        # letter-prefixed
+    ]
+    # Assert on the domain LABEL, not on `matched` membership. Membership is
+    # CONFOUNDED here: the same prose carries the 'brandx' token, which leaks
+    # (13 owners < thresh 14) and adds every brandx repo including this one via
+    # the token pass — so a membership assertion passes for the reject cases no
+    # matter what the domain pass does. The label is the domain pass's own
+    # signature and is the only uncontaminated signal. (My first draft of this
+    # test asserted membership and failed for exactly that reason.)
+    for prose in accept:
+        labels, matched = M.detect_product_surfaces(
+            prose, _LEAKY_FLEET, domain_repos=_LEAKY_DOMAINS)
+        assert "brandx-demo.com" in labels, f"should match: {prose!r}"
+        assert matched[0] == "brandx-www-site", (
+            f"domain hit must take slot 0: {prose!r}")
+    for prose in reject:
+        labels, matched = M.detect_product_surfaces(
+            prose, _LEAKY_FLEET, domain_repos=_LEAKY_DOMAINS)
+        assert "brandx-demo.com" not in labels, f"must NOT match: {prose!r}"
+        assert matched[:1] != ["brandx-www-site"], (
+            f"must not be promoted into the budget window: {prose!r}")
+
+
+def test_detect_domain_absent_from_prose_adds_nothing():
+    labels, matched = M.detect_product_surfaces(
+        "General loop maintenance", _LEAKY_FLEET,
+        domain_repos=_LEAKY_DOMAINS)
+    assert labels == set() and matched == []
+
+
+def test_detect_domain_map_default_is_backward_compatible():
+    # Every pre-existing caller passes no map; behaviour must be identical.
+    assert (M.detect_product_surfaces("acme-widget-service work", _REPO_NAMES)
+            == M.detect_product_surfaces("acme-widget-service work",
+                                         _REPO_NAMES, domain_repos=None))
+
+
+# extract_domain_repos (pure) -------------------------------------------------
+
+_CATALOG = """
+| repo | remote | notes |
+|---|---|---|
+| `brandx-www-site` | `org/brandx-www-site` | Marketing site (https://www.brandx-demo.com/) |
+| `org/orbital-checkout-app` | **`user/orbital-checkout-app`** | Console — serves **`widgetco-demo.com`** |
+| `brandx-svc-00` | `org/brandx-svc-00` | Batch worker, no public surface |
+Config lives in `env.json` and `tasks.json`; CI is `ci.yml` for `brandx-svc-00`.
+Prose near ambiguous-demo.com naming `brandx-www-site`, `orbital-checkout-app` and `brandx-portal-app` at once asserts no ownership.
+"""
+# NOTE: that last line must stay ONE physical line. Line-scoping is the
+# predicate, so a wrapped fixture puts the domain and the repos on different
+# lines and the row is skipped before the cap is ever consulted — the test
+# then passes with the cap REMOVED. Caught by mutation (cap -> 99 survived).
+
+
+def test_extract_domain_repos_pairs_line_scoped():
+    got = M.extract_domain_repos(_CATALOG, set(_LEAKY_FLEET))
+    assert got.get("brandx-demo.com") == {"brandx-www-site"}
+    assert got.get("widgetco-demo.com") == {"orbital-checkout-app"}
+
+
+def test_extract_domain_repos_strips_www_to_one_key():
+    got = M.extract_domain_repos(_CATALOG, set(_LEAKY_FLEET))
+    assert "www.brandx-demo.com" not in got
+
+
+def test_extract_domain_repos_reads_qualified_org_repo_form():
+    # The orbital row writes ONLY `org/repo` and `user/repo`, never the bare
+    # name — the bare-name regex alone would return nothing for that row.
+    got = M.extract_domain_repos(_CATALOG, set(_LEAKY_FLEET))
+    assert "widgetco-demo.com" in got
+
+
+def test_extract_domain_repos_ignores_filenames_as_domains():
+    # env.json / tasks.json / ci.yml are dotted tokens that are not domains.
+    # A catalog is full of filenames, so an open TLD pattern would pair junk
+    # keys against real repos on almost every line.
+    got = M.extract_domain_repos(_CATALOG, set(_LEAKY_FLEET))
+    assert not any(k.endswith((".json", ".yml", ".py")) for k in got)
+
+
+def test_extract_domain_repos_skips_ambiguous_multi_repo_line():
+    # The prose line names 3 known repos beside a domain — over the cap, so it
+    # asserts no ownership and must contribute nothing.
+    got = M.extract_domain_repos(_CATALOG, set(_LEAKY_FLEET))
+    assert "ambiguous-demo.com" not in got
+
+
+def test_extract_domain_repos_only_maps_known_repos():
+    # A name the caller does not recognise must never enter the map — so the
+    # orbital row, whose only repo is now unknown, pairs nothing at all.
+    got = M.extract_domain_repos(_CATALOG, {"brandx-www-site"})
+    assert got["brandx-demo.com"] == {"brandx-www-site"}
+    assert "widgetco-demo.com" not in got
+
+
+def test_extract_domain_repos_rejects_non_repo_shaped_names():
+    # THE LIVE FALSE POSITIVE (measured 2026-08-09): the loose catalog regex
+    # backticks ordinary words, and the estate catalog paired
+    # 'github.com -> main' and 'schema.org -> Organization'. Neither is on
+    # disk, so neither could waste a network slot — but each would add a
+    # LABEL, and a label alone triggers the whole product scan. 'github.com'
+    # is in ordinary goal prose constantly.
+    catalog = ("| `main` | deployed from https://github.com/org/x |\n"
+               "| `Organization` | the schema.org block names it |\n")
+    assert M.extract_domain_repos(catalog, {"main", "Organization"}) == {}
+    assert M._is_repo_shaped("Ayo-Public-Web-App")
+    assert M._is_repo_shaped("SendErrorAlert")      # 3 CamelCase humps
+    assert M._is_repo_shaped("zds_inference")       # underscore
+    assert not M._is_repo_shaped("main")
+    assert not M._is_repo_shaped("Organization")    # 1 hump
+    assert not M._is_repo_shaped("")
+
+
+def test_extract_domain_repos_empty_inputs():
+    assert M.extract_domain_repos("", {"brandx-public-site"}) == {}
+    assert M.extract_domain_repos(_CATALOG, set()) == {}
+    assert M.extract_domain_repos(None, None) == {}
 
 
 # classify_product_overlap (pure) ---------------------------------------------
@@ -1114,6 +1421,16 @@ def test_telemetry_firing_lands_on_disk(tmp_path):
     assert rows[0]["decision"] == "noop"
     assert rows[0]["extra"]["race_risk"] is False
     assert rows[0]["caller"] == "goal-pickup-coordination-check.main"
+    # The guarded goal's id must be in `extra`, which _gate_log persists
+    # verbatim — NOT only in `payload`, which it reduces to `payload_hash`
+    # and discards (). Without this the firing cannot be joined to
+    # the pickup it guarded, and pickup-coverage collapses to a ratio of two
+    # independently-counted populations, biased up by the duplicate-firing
+    # rate (measured 65.7% raw vs 48.2% de-duplicated).
+    assert rows[0]["extra"]["goal_id"] == "g-999-99"
+    # payload_hash is still emitted; it is a fingerprint, not a join key —
+    # two different pickups whose probe inputs coincide share one hash.
+    assert "payload_hash" in rows[0]
 
 
 def test_telemetry_gate_is_registered_in_gates_yaml():

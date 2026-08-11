@@ -1,4 +1,4 @@
-"""POST /v1/team-state/{update,in-flight,clear-in-flight,init} — team-state writes.
+"""POST /v1/team-state/{update,in-flight,clear-in-flight,clear-body-row,init,retire-agent} — team-state writes.
 
 Daemonises core/scripts/team-state.py cmd_update / cmd_in_flight /
 cmd_clear_in_flight / cmd_init. The read path (GET /v1/team-state/read) lives
@@ -37,7 +37,10 @@ from _fileops import locked_modify_yaml, locked_write_yaml  # noqa: E402
 # sys.path). CLI and daemon route through the SAME functions — guard-742
 # parity by construction.
 from _team_state import (  # noqa: E402
+    body_row_shard_present,
     core_residual,
+    make_clear_body_row_modifier,
+    make_clear_in_flight_modifier,
     retire_agent as _retire_agent,
     route_field,
     row_path,
@@ -303,10 +306,18 @@ def in_flight(ctx) -> "Response":  # type: ignore[name-defined]
 # ---------------------------------------------------------------------------
 
 def clear_in_flight(ctx) -> "Response":  # type: ignore[name-defined]
-    """POST /v1/team-state/clear-in-flight?agent=
+    """POST /v1/team-state/clear-in-flight?agent=[&if_goal=]
 
     Removes the in_flight block from an agent; bumps last_active. No-op (no
     metadata bump) when there's nothing to clear (mirrors the CLI).
+
+    `if_goal` is an optional COMPARE-AND-SWAP (guard-2474 clause 2, g-306-137):
+    when supplied, the row is cleared ONLY if its live goal_id matches. A caller
+    that verified ownership out-of-band is otherwise performing a check-then-act
+    — its verdict is computed from a snapshot while this endpoint blanks
+    whatever row is present at call time, so a concurrent sibling claim inside
+    that window is destroyed regardless of the check. Omitting `if_goal` keeps
+    the original unconditional behavior for recovery/retire/release callers.
     """
     from ..server import Response
 
@@ -318,23 +329,38 @@ def clear_in_flight(ctx) -> "Response":  # type: ignore[name-defined]
     if not target_agent:
         return Response.error(400, "missing_param", "query parameter 'agent' required")
 
+    # RAW, deliberately (). The normalization that used to live here —
+    # `(ctx.query.get("if_goal") or "").strip() or None` — collapsed
+    # blank-but-supplied into absent, and absent means "clear unconditionally",
+    # so `?if_goal=` or `?if_goal=%20%20` DESTROYED a live row and reported
+    # ok/cleared=True. The CLI twin did not strip, so the same input PRESERVED
+    # the row there: one input, two opposite outcomes. Normalization now happens
+    # once inside make_clear_in_flight_modifier, below the point where the twins
+    # could disagree; a blank-but-supplied value raises there and is surfaced as
+    # a 400 rather than silently downgrading to an unconditional wipe.
+    if_goal = ctx.query.get("if_goal")
     agent_author = _agent_name(ctx)
-    status = {"cleared": False}
+    status = {"cleared": False, "skipped_goal_id": None, "row_survived": False}
 
     #  sharding: clear operates on the agent's OWN row file. The
     # core_residual seed lets an un-migrated deployment's in_flight (still
     # in the core file) be seeded into the row and actually cleared —
     # newest-wins compose then prefers the freshly-stamped row.
-    def _row_modifier(row):
-        if not isinstance(row, dict):
-            row = {}
-        if "in_flight" in row:
-            now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-            row.pop("in_flight")
-            row["last_active"] = now
-            status["cleared"] = True
-            return stamp_row_metadata(row, agent_author, now)
-        return row
+    #
+    # The modifier is SHARED with the CLI twin (guard-2323 / guard-547) rather
+    # than hand-mirrored: both modules already import from _team_state, so the
+    # copies cannot drift apart. It runs inside locked_modify_yaml's lock, which
+    # is what makes the if_goal comparison atomic against a concurrent
+    # POST /v1/team-state/in-flight on the same row file.
+    # Factory raises on a blank-but-supplied if_goal (). It raises
+    # BEFORE locked_modify_yaml takes the lock, so a caller bug costs no lock and
+    # no backend round-trip — and 400 is correct rather than the 500 the
+    # write_failed handler below would give, because nothing was ever written.
+    try:
+        _row_modifier = make_clear_in_flight_modifier(
+            agent_author, if_goal=if_goal, status=status)
+    except ValueError as e:
+        return Response.error(400, "invalid_param", str(e))
 
     try:
         locked_modify_yaml(row_path(ctx.paths.world, target_agent), _row_modifier,
@@ -342,8 +368,75 @@ def clear_in_flight(ctx) -> "Response":  # type: ignore[name-defined]
     except (OSError, ValueError) as e:
         return Response.error(500, "write_failed", str(e))
 
+    # row_survived MUST be forwarded: the two shell/worker reporters read only
+    # this response, so without it they can never distinguish "a row is still
+    # standing but carried no comparable goal_id" from "nothing was there"
+    # (). Both were reporting the former as "already absent".
     return Response.json({"ok": True, "agent": target_agent,
-                          "cleared": status["cleared"]})
+                          "cleared": status["cleared"],
+                          "skipped_goal_id": status["skipped_goal_id"],
+                          "row_survived": status["row_survived"]})
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/team-state/clear-body-row  ( — the dict-key REMOVE path)
+# ---------------------------------------------------------------------------
+
+def clear_body_row(ctx) -> "Response":  # type: ignore[name-defined]
+    """POST /v1/team-state/clear-body-row?agent=&sid=
+
+    Removes `agent_status.<agent>.in_flight_bodies.<sid>` outright, and sweeps
+    any null-valued siblings while it holds the row lock.
+
+    This is the path `worker_close_in_flight_clear` had to fake by SETTING NULL
+    through /v1/team-state/update: that dispatch's `remove` operation is
+    list-only, so on a dict key it returns early and reports ok:true having done
+    nothing (g-306-186). Delegates to the shared
+    `_team_state.make_clear_body_row_modifier` — the SAME factory the CLI
+    cmd_clear_body_row uses, so guard-742 parity holds by construction rather
+    than by hand-mirroring, which is precisely why widening `_remove_nested`
+    (a duplicated pair) was rejected in favour of this op.
+    """
+    from ..server import Response
+
+    err = _require_agent_header(ctx)
+    if err:
+        return err
+
+    target_agent = (ctx.query.get("agent") or "").strip()
+    if not target_agent:
+        return Response.error(400, "missing_param", "query parameter 'agent' required")
+    sid = (ctx.query.get("sid") or "").strip()
+    if not sid:
+        return Response.error(400, "missing_param", "query parameter 'sid' required")
+
+    agent_author = _agent_name(ctx)
+    status = {"removed": False, "nulls_swept": 0, "remaining": 0}
+
+    # Nothing to clear from a shard that does not exist — and writing anyway
+    # would CREATE it (guard-2611). Shared predicate, and it materializes the
+    # shard before asking, so a partner's shard this box has never pulled does
+    # not read as absent (; "shared" describes where the code lives,
+    # not what it reads — it IS an .exists(), just not a bare one).
+    if not body_row_shard_present(ctx.paths.world, target_agent):
+        return Response.json({"ok": True, "agent": target_agent, "sid": sid,
+                              "removed": False, "nulls_swept": 0,
+                              "remaining": 0, "no_shard": True})
+
+    _row_modifier = make_clear_body_row_modifier(agent_author, sid, status=status)
+
+    # No core_residual seed, unlike clear-in-flight: in_flight_bodies is a
+    # post-sharding field that has never lived in the core file, so seeding from
+    # a residual could only ever re-materialize an unrelated legacy in_flight.
+    try:
+        locked_modify_yaml(row_path(ctx.paths.world, target_agent), _row_modifier)
+    except (OSError, ValueError) as e:
+        return Response.error(500, "write_failed", str(e))
+
+    return Response.json({"ok": True, "agent": target_agent, "sid": sid,
+                          "removed": status["removed"],
+                          "nulls_swept": status["nulls_swept"],
+                          "remaining": status["remaining"]})
 
 
 # ---------------------------------------------------------------------------
@@ -368,8 +461,12 @@ def init(ctx) -> "Response":  # type: ignore[name-defined]
     try:
         from storage_backend import get_backend
         get_backend().ensure_local(ts_path)
-    except Exception:
-        pass
+    except Exception as e:
+        try:  # report, never raise — see note_swallowed_backend_error ()
+            from storage_backend import note_swallowed_backend_error
+            note_swallowed_backend_error("ensure_local", ts_path, e)
+        except Exception:
+            pass
     #  sharding: always ensure the per-agent rows dir exists
     # (idempotent) so aged deployments gain the layout on their next init.
     from ..agent_paths import assert_not_cruft
@@ -444,5 +541,6 @@ def register(routes) -> None:
     routes[("POST", "/v1/team-state/update")] = update
     routes[("POST", "/v1/team-state/in-flight")] = in_flight
     routes[("POST", "/v1/team-state/clear-in-flight")] = clear_in_flight
+    routes[("POST", "/v1/team-state/clear-body-row")] = clear_body_row
     routes[("POST", "/v1/team-state/init")] = init
     routes[("POST", "/v1/team-state/retire-agent")] = retire_agent

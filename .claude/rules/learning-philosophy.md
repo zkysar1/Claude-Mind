@@ -35,6 +35,22 @@ They are valuable, but they are means — not the mission.
    (`communication-clarity.md` rule 4); this rule makes the loop *count* it.
    (External advisory research pass, 2026-06-13 — the "complexity ratchet" finding.)
 
+   That cadence is `core/scripts/scar-tissue-check.py`, run from
+   aspirations-precheck **Phase 0.5g.5** every `scar_tissue_check.goal_cadence`
+   completed goals. From 2026-06-13 until 2026-08-01 this rule named it as though
+   it existed: `complexity_budget.py` had **zero callers**, so the sentence above
+   promised a measurement nobody was taking. Both halves now report — the FILE
+   surface (trended in `meta/complexity-ledger.jsonl`) and the STORE corpus
+   (guardrail/reasoning-bank active:retired ratio, never-marked-helpful
+   population, and a bounded retirement slate).
+
+   The slate is a **proposal**, never an action: the cadence has no `--apply` path
+   and imports no mutation helper, so retiring stays a deliberate
+   `bulk-retire-dead-entries.py --apply` run by an agent that has read it.
+   Automating retirement would replace one unopposed ratchet with another pointing
+   the other way — and *which* defense has stopped earning its keep is exactly the
+   judgment this rule asks the loop to make, not to delegate. (g-115-3222.)
+
 ## Recognition (the positive half)
 
 Valuing this work is not only an obligation placed on you — the framework reflects

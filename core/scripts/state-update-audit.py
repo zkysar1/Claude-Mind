@@ -66,6 +66,48 @@ def _run(argv, input_text=None, timeout=30):
 
 # ─────────────────────────── Step 8.8 velocity ───────────────────────────
 
+def _close_key(goal_id):
+    """Idempotency token naming THIS goal's close, or "" when underivable.
+
+    `{goal_id}:{selected_at}` read from the iteration checkpoint. Chosen against
+    the live store rather than assumed (g-115-4542):
+
+      - goal_id ALONE is wrong. Measured on 7,814 entries: 2,066 repeat rows
+        across 332 goals, dominated by asp-001 recurring cadence closes
+        (g-001-01 n=205). Every one is a real close and real learning.
+      - A TIME WINDOW is wrong. The store is fleet-shared, so consecutive
+        snapshots for DIFFERENT goals land as little as 1s apart (375 pairs
+        under 60s), while legitimate same-goal recurring re-closes reach down
+        to 31s. The populations overlap; no threshold separates them.
+      - completed_at is wrong. Recurring goals carry completed_at=None and
+        advance lastAchievedAt instead, so it would collapse every recurring
+        close to one key and destroy the 2,066 rows above.
+
+    selected_at names the SELECTION, and one selection yields one close — so it
+    identifies the close event without a daemon round-trip. The checkpoint is a
+    local file cleared by iteration-close's do_productivity_check(), which runs
+    AFTER do_state_update(), so it is live for both the normal close and the
+    post-hoc recovery window that follows it.
+
+    FAIL-OPEN on every uncertainty (missing/corrupt checkpoint, no selected_at,
+    or a checkpoint naming a DIFFERENT goal): returns "", the flag is omitted,
+    and the append is unconditional exactly as before. A wrong key would
+    suppress a legitimate row, which is strictly worse than the double-count
+    this guards against.
+    """
+    if not goal_id:
+        return ""
+    try:
+        cp_path = Path(AGENT_DIR) / "session" / "iteration-checkpoint.json"
+        cp = json.loads(cp_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — absent/corrupt/unreadable all fail open
+        return ""
+    if not isinstance(cp, dict) or cp.get("goal_id") != goal_id:
+        return ""
+    selected_at = str(cp.get("selected_at") or "").strip()
+    return f"{goal_id}:{selected_at}" if selected_at else ""
+
+
 def compute_learning_value(tree_updated, artifacts_count, encoding_score, findings_count):
     """4-component weighted learning_value per SKILL.md line 561.
 
@@ -148,16 +190,46 @@ def cmd_velocity(args):
         "--category", args.category or "uncategorized",
         "--active-changes", active_change_ids,
     ]
+    # : name THIS close so a second snapshot for it is suppressed
+    # rather than double-weighted. Derived here (not passed by the caller) so
+    # the hand-typed post-hoc recovery command printed by iteration-close.sh
+    # gets the protection without needing a new flag — that command is the
+    # documented double-write path, and it is typed at exactly the moment it is
+    # easiest to run twice. Empty -> flag omitted -> unchanged legacy behaviour.
+    close_key = _close_key(args.goal)
+    if close_key:
+        impk_argv += ["--close-key", close_key]
     if args.exploration:
         impk_argv.append("--exploration-mode")
     impk_out, impk_err, impk_rc = _run(impk_argv)
+
+    # OBSERVABILITY ( fresh-eyes). The daemon reports
+    # `duplicate_suppressed` at rc=0 — deliberately, since flagging a correctly
+    # suppressed duplicate as an error would manufacture a false alarm on the
+    # very recovery path this fix protects — but rc was the ONLY signal read
+    # here and impk_out was captured and DISCARDED. So a dedup that fires and a
+    # `_close_key` that has silently degraded to "" produced byte-identical
+    # telemetry: nothing distinguished "the guard held" from "the guard was
+    # never reached" (guard-1760's report-what-you-RAN gap; guard-2352's
+    # recorder-only-on-the-fire-path gap, here with a recorder on NEITHER
+    # path). This flag is informational — HARD_FAIL_FLAGS above is a denylist,
+    # so it never drives a non-zero exit. Gated on close_key so the legacy
+    # no-key path keeps its exact prior behaviour, and fail-open so an
+    # unreadable payload adds no flag rather than breaking the audit record.
+    impk_flags = [] if impk_rc == 0 else ["impk_snapshot_failed"]
+    if impk_rc == 0 and close_key:
+        try:
+            if json.loads(impk_out or "{}").get("status") == "duplicate_suppressed":
+                impk_flags.append("impk_duplicate_suppressed")
+        except (json.JSONDecodeError, ValueError, TypeError, AttributeError):
+            pass
 
     return {
         "subcommand": "velocity",
         "summary": f"velocity: learning_value={lv} (tree={int(args.tree_updated)},"
                    f" artifacts={args.artifacts_count}, encoding={args.encoding_score},"
                    f" findings={args.findings_count})",
-        "flags": [] if impk_rc == 0 else ["impk_snapshot_failed"],
+        "flags": impk_flags,
         "learning_value": lv,
         "active_change_ids": active_change_ids,
         "impk_rc": impk_rc,

@@ -466,6 +466,52 @@ def test_status_superseded_blocked_pre_lock(running_daemon):
     assert "intent_satisfaction" in err["detail"]
 
 
+def test_status_superseded_refusal_names_a_reachable_route(running_daemon):
+    """The refusal must name a route the caller can actually take ().
+
+    The original message named exactly ONE route -- aspirations-complete-intent.sh
+    -- whose evidence gate (_validate_intent_satisfaction condition 6) requires
+    every non-recurring goal in the aspiration to be terminal AFTER the
+    supersession. For a single goal in a live aspiration that route is
+    structurally unavailable, so the message pointed at a locked door and the
+    caller had nowhere to go.
+
+    Three things are pinned here, and each is load-bearing:
+
+    1. The complete-intent route still names its own precondition, so a reader
+       can tell WHY it is unavailable rather than just finding that it fails.
+    2. `skipped` is named for the single-goal-moot case, together with the
+       outcome_note-FIRST ordering that unblock-parent-status-sweep.py's
+       _mark_skipped already uses for the structurally identical case. That
+       convention existed in code and was simply unreachable from here.
+    3. `blocked` is named as the route for work that is still WANTED, WITH the
+       guard-1690 reason. This assertion is the one most worth keeping: a
+       message that recommended `skipped` unconditionally would push
+       dependency-gated goals into the dead zone guard-1690 describes -- skipped
+       is invisible to the blocked-signal sweeps, so nothing would ever resurface
+       them. Naming a second route is only an improvement if it also says when
+       NOT to take it.
+    """
+    _, port = running_daemon
+    g = _seed_goal(port)
+    code, body = _update(port, g["id"], "status", "superseded")
+    assert code == 400
+    detail = json.loads(body)["detail"]
+
+    # (1) whole-aspiration route, with the precondition that makes it unavailable
+    assert "aspirations-complete-intent.sh" in detail
+    assert "terminal" in detail
+
+    # (2) single-goal-moot route + the evidence-before-status ordering
+    assert "skipped" in detail
+    assert "outcome_note" in detail
+    assert "_mark_skipped" in detail
+
+    # (3) still-wanted route + why skipped is wrong for it (the dead zone)
+    assert "blocked" in detail
+    assert "guard-1690" in detail
+
+
 def test_status_completed_on_recurring_blocked(running_daemon):
     """Recurring goals must never reach status=completed. In-lock guard."""
     _, port = running_daemon

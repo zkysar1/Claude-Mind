@@ -1033,7 +1033,19 @@ def do_remove_orphans(dest_root: Path, manifest: dict, source_root: Path,
     though they are absent from the source include set — see
     _is_protected_dest_skill (omni orphan-removal guard, 2026-06-06).
 
-    Returns {"removed": [...], "kept_preserved_count": <int>, "dry_run": bool}
+    Orphans are ARCHIVED BEFORE DELETION (archive-before-delete.md, g-115-4471).
+    An orphan is untracked at the destination by construction — git holds no
+    copy — so a bare unlink is unrecoverable. Each removal cycle enumerates the
+    orphan set (path + bytes + sha256), copies it to
+    `<dest>/.seed-backup-orphans-<timestamp>/`, verifies every copy byte-for-byte,
+    writes a RECEIPT.json with restore instructions, and only then deletes.
+    The sequence fails CLOSED: if any file fails to archive or verify, or the
+    receipt cannot be written, NOTHING is deleted and `removed` comes back empty.
+    Note `do_backup()` does not cover this case — it archives the manifest
+    include-set, i.e. the files that get OVERWRITTEN, never the ones deleted here.
+
+    Returns {"removed": [...], "kept_preserved_count": <int>, "dry_run": bool,
+    "archive": {"archived", "path", "verified", "count", "bytes", "failures"}}
     — note the preserved paths are returned as a COUNT, not a list (callers
     needing the preserved sublist must recompute it; see do_plan §5).
     """
@@ -1063,8 +1075,11 @@ def do_remove_orphans(dest_root: Path, manifest: dict, source_root: Path,
 
     removed = []
     preserved = []
+    candidates = []          # rel paths that WOULD be removed (enumerate first)
 
-    # Walk destination, collecting all files outside the preserve set
+    # Walk destination, collecting all files outside the preserve set.
+    # NOTE: this pass no longer deletes. Deletion happens only after the
+    # orphan set has been archived and the archive VERIFIED — see below.
     for path in dest_root.rglob("*"):
         if not path.is_file():
             continue
@@ -1080,15 +1095,136 @@ def do_remove_orphans(dest_root: Path, manifest: dict, source_root: Path,
         if _is_protected_dest_skill(rel, forged_prefixes, protect_all_skills):
             preserved.append(rel)
             continue
-        # Orphan — would be removed
-        if dry_run:
-            removed.append(rel)
-        else:
+        candidates.append(rel)
+
+    # ── ENUMERATE -> ARCHIVE -> VERIFY -> DELETE -> RECEIPT ──────────────
+    # .claude/rules/archive-before-delete.md. An orphan is a file the
+    # destination holds and the source does not, so it is UNTRACKED there by
+    # construction: git has no copy and deletion is unrecoverable. do_backup()
+    # does NOT cover these — it archives the manifest include-set, i.e. exactly
+    # the files that get OVERWRITTEN, never the ones that get DELETED.
+    #
+    # Graveyard name starts with ".seed-backup-" deliberately: that prefix is
+    # already preserved by _is_preserved_at_dest (and by the empty-dir pass
+    # below), so the archive cannot be swept by a later plant. No new preserve
+    # rule is introduced.
+    archive: dict = {"archived": False, "path": None, "verified": False,
+                     "count": 0, "bytes": 0, "failures": []}
+
+    if dry_run:
+        removed = candidates
+    elif not candidates:
+        removed = []
+    else:
+        # MICROSECONDS are load-bearing, not cosmetic. At second resolution two
+        # sweeps in the same wall-clock second share one graveyard dir, and the
+        # second run's RECEIPT.json OVERWRITES the first's — the archived FILES
+        # survive but the receipt rows documenting them do not, which is exactly
+        # archive-before-delete.md's "an archive nobody can find or restore from
+        # is not an archive". Measured on the second-resolution version
+        # ( fresh-eyes probe): two back-to-back sweeps produced ONE
+        # graveyard and sweep 1's row for core/first.py was gone from the
+        # receipt while the file itself sat beside it, unlisted. Sequential
+        # re-entry is the real case (retry, plan-then-apply, tests), and
+        # microsecond precision closes it.
+        timestamp = datetime.now().strftime("%Y%m%dT%H%M%S-%f")
+        graveyard = dest_root / f".seed-backup-orphans-{timestamp}"
+        entries = []
+        failures = []
+
+        # ENUMERATE + ARCHIVE (copy2, never move — a move IS a delete of the
+        # original, which would leave nothing to verify against).
+        for rel in candidates:
+            src = dest_root / rel
             try:
-                path.unlink()
-                removed.append(rel)
-            except (OSError, FileNotFoundError):
-                pass
+                raw = src.read_bytes()
+            except (OSError, FileNotFoundError) as exc:
+                failures.append({"path": rel, "stage": "read", "error": str(exc)})
+                continue
+            digest, size = _sha256(raw), len(raw)
+            target = graveyard / rel
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, target)
+            except (OSError, shutil.Error) as exc:
+                failures.append({"path": rel, "stage": "copy", "error": str(exc)})
+                continue
+            entries.append({"path": rel, "bytes": size, "sha256": digest})
+
+        # VERIFY the archive against the enumeration — full re-read, per file,
+        # never a sample. Only files that verify become eligible for deletion.
+        verified_rels = []
+        for e in entries:
+            copy_at = graveyard / e["path"]
+            try:
+                got = copy_at.read_bytes()
+            except (OSError, FileNotFoundError) as exc:
+                failures.append({"path": e["path"], "stage": "verify-read",
+                                 "error": str(exc)})
+                continue
+            if len(got) != e["bytes"] or _sha256(got) != e["sha256"]:
+                failures.append({"path": e["path"], "stage": "verify-mismatch",
+                                 "error": "bytes/sha256 differ from source"})
+                continue
+            verified_rels.append(e["path"])
+
+        archive.update({
+            "archived": True,
+            "path": str(graveyard),
+            "verified": not failures,
+            "count": len(verified_rels),
+            "bytes": sum(e["bytes"] for e in entries
+                         if e["path"] in set(verified_rels)),
+            "failures": failures,
+        })
+
+        # RECEIPT alongside the archive, written BEFORE any deletion so an
+        # interrupt leaves the recoverable state, not the destroyed one.
+        receipt = {
+            "event": "seed-transplant orphan removal",
+            "created": datetime.now().isoformat(timespec="seconds"),
+            "dest_root": str(dest_root),
+            "source_root": str(source_root),
+            "rationale": "Files present at destination but absent from the "
+                         "manifest-resolved include set (mirror semantics: "
+                         "destination = manifest AND source).",
+            "enumerated": len(candidates),
+            "archived_verified": len(verified_rels),
+            "failures": failures,
+            "entries": entries,
+            "restore": {
+                "how": "Copy a file back from this directory to the same "
+                       "relative path under dest_root.",
+                "do_not": "Do NOT restore into the source repo, and do NOT "
+                          "restore a path that the manifest still excludes — "
+                          "the next plant would re-detect it as an orphan and "
+                          "archive-then-delete it again.",
+                "example": "cp <this-dir>/<rel-path> <dest_root>/<rel-path>",
+            },
+        }
+        try:
+            graveyard.mkdir(parents=True, exist_ok=True)
+            (graveyard / "RECEIPT.json").write_text(
+                json.dumps(receipt, indent=2), encoding="utf-8")
+        except OSError as exc:
+            failures.append({"path": "RECEIPT.json", "stage": "receipt",
+                             "error": str(exc)})
+            archive["failures"] = failures
+            archive["verified"] = False
+
+        # DELETE — fail CLOSED. If ANY file failed to archive or verify, or the
+        # receipt could not be written, delete NOTHING. A partial sweep with an
+        # incomplete archive is the exact failure this block exists to prevent;
+        # leaving orphans in place is recoverable, deleting them is not.
+        if archive["verified"]:
+            for rel in verified_rels:
+                try:
+                    (dest_root / rel).unlink()
+                    removed.append(rel)
+                except (OSError, FileNotFoundError):
+                    pass
+        else:
+            removed = []
 
     # Second pass: remove empty directories left behind (skip preserved tops)
     if not dry_run:
@@ -1110,7 +1246,7 @@ def do_remove_orphans(dest_root: Path, manifest: dict, source_root: Path,
                 pass
 
     return {"removed": sorted(removed), "kept_preserved_count": len(preserved),
-            "dry_run": dry_run}
+            "dry_run": dry_run, "archive": archive}
 
 
 # ============================================================================

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # IRREDUCIBLY LOCAL -- per-Bash-call latency budget; called once per Phase-4
-# execution. Pre-apply consult gate for inherited cross-agent framework Applies.
+# execution. Pre-apply consult gate for framework Applies (own-authored included).
 # See pre-apply-consult-gate.py for full docs. Wired into aspirations-execute
 # Phase 4 just before "Execute primary goal inline (host does ALL writing)".
 #

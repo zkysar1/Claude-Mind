@@ -31,6 +31,9 @@ import json
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _path_helpers import normalize_msys_path  # noqa: E402
+
 
 def _get_dotted(record, dotted):
     """Traverse `record` by dotted path. Return (found: bool, value).
@@ -110,7 +113,14 @@ def main(argv=None):
     }
 
     try:
-        path = Path(args.file)
+        # normalize_msys_path FIRST () — same defect as its gate
+        # sibling audit-schema-gate.py: a caller interpolates "$WORLD_DIR/..."
+        # into argv, which is MSYS-flavored on Git Bash, and Windows Python
+        # mangles the leading "/" to the current drive. This probe is the
+        # EVIDENCE half of rb-245, so an unfixed probe leaves the gate unable
+        # to be fed even once the gate itself resolves paths correctly.
+        # No-op on POSIX and on already-Windows paths.
+        path = Path(normalize_msys_path(args.file))
         if not path.is_file():
             result["probe_error"] = f"file not found: {args.file}"
             return _emit(result, args.output)

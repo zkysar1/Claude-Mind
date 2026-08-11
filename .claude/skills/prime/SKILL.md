@@ -155,10 +155,18 @@ token budget below, as a bounded index plus on-demand expansion, never in full.
    - The always-load core is identified by the explicit `severity` marker —
      NEVER by a utilization count (guard-841 / rb-1824: times_active is
      cumulative, so passive always-on rails read healthy-HIGH and a count
-     threshold would drop exactly the wrong entries). That marker is not usable
-     yet: 1114/1398 (80%) carry no severity at all and only 3 are CRITICAL.
-     Until it is populated, the 100%-coverage index above IS the safety floor —
-     do not substitute a ranked slice for it.
+     threshold would drop exactly the wrong entries). The marker's CASE is now
+     canonical — `CRITICAL`/`HIGH`/`MEDIUM`/`LOW`, uppercase, matching CLAUDE.md
+     Priority Values (g-115-3573, 2026-08-02: 408 records normalized, zero
+     non-canonical remain) — so it can be compared without case-folding. It is
+     still not usable as a SELECTOR: 1594/2123 (75%) carry no severity at all
+     and only 3 are CRITICAL. Until it is populated, the 100%-coverage index
+     above IS the safety floor — do not substitute a ranked slice for it.
+   - The admission rule for the CRITICAL always-load tier (both clauses: the
+     harm outlives the loop, AND the trigger zone is not self-announcing) is
+     `core/config/rationale/prime-store-load-budget.md` → "The CRITICAL
+     admission rule". Read it before rating any guardrail's severity; do not
+     re-derive a bar per rater.
 
 4. Reasoning bank — bounded recency index; relevance arrives in Phase 3.
    Budget ~9k tokens. Neither `--active` nor `--universal` is an option:

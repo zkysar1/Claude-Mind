@@ -331,3 +331,224 @@ def _default_subprocess_timeout_guard():
         yield
     finally:
         _sp.run, _sp.call = _orig_run, _orig_call
+
+
+# ---------------------------------------------------------------------------
+# : phantom team-state shards created by tests that reach a LIVE daemon
+# ---------------------------------------------------------------------------
+# Several tests bind a FAKE MIND_AGENT ("alpha-test", "ic-recovery-test-agent")
+# and shell out to iteration-close.sh / heartbeat-tick.sh. On a box serving a live
+# daemon those scripts' EXIT-trap heartbeat writes GO THROUGH —  refuses
+# daemon SPAWNS, not calls to an already-running daemon — and the daemon
+# materializes world/team-state/agents/<fake>.yaml. _agents.py::_from_team_state
+# globs that directory to build ACTIVE_AGENTS, so the shard alone keeps a phantom
+# in the fleet roster and turns test_capability_route_gate::test_active_agents_tripwire
+# red. Measured 2026-08-07 on cc-07: running one such module advanced the LIVE shard's
+# last_active by an hour.
+#
+# WHY THIS IS NOT SOLVED BY THE OBVIOUS THINGS, each measured rather than assumed:
+#   - STORAGE_BACKEND=local (guard-955) is already pinned by these tests and does NOT
+#     help. It forces LocalBackend, which stops the S3-KEY collision — that is
+#     guard-955's actual scope — but a LocalBackend write still lands in the LIVE
+#     world tree. "The guard-955 pin is present" is not evidence a test is
+#     world-hermetic, and a reviewer who checks for the pin and stops concludes wrongly.
+#   - MIND_WORLD pointed at a tmp dir does NOT redirect it either. Measured: the live
+#     shard still advanced and the tmp world stayed empty, because the write is
+#     performed by the DAEMON, which resolves its own world path. No env var set in
+#     the test process can move it.
+#   - A retirement TOMBSTONE applied ONCE does not hold. These shards had been retired
+#     by hand on 2026-08-06 and came back, because a heartbeat newer than retired_at
+#     auto-un-retires the row. Purging without closing this path is a treadmill.
+#     Note what this does and does NOT license: a tombstone written AFTER the run's
+#     last write does hold, which is why this teardown writes one (see below).
+#
+# AND A LOCAL unlink() DOES NOT REMOVE ANYTHING ON THIS BACKEND — measured
+# 2026-08-08 (, alpha, cc-04). This fixture originally called
+# p.unlink(missing_ok=True), which is precisely the operation  had
+# already measured as non-durable a week earlier in _team_state.retire_agent:
+# fleet boxes do not hold s3:DeleteObject, so the local mirror goes and the
+# backing object survives, and the next read re-materializes the shard
+# UN-tombstoned. Proof from live data rather than from re-reading the code:
+# test-race-5's S3 object was last written 2026-07-31T17:58:26 and its LOCAL
+# mirror carries mtime 2026-08-08T20:15:43 — recreated eight days after the
+# remote object's final write, which only read-through can do. Its own
+# retirement_reason records that team-state-retire.sh had unlinked it that day.
+# So the unlink teardown ran faithfully and cleaned nothing, on every box, for
+# as long as it shipped; the tripwire was red again ~23h after the fix landed.
+#
+# THE MECHANISM THIS STORE ACTUALLY SUPPORTS IS THE TOMBSTONE, written through
+# the GOVERNED path (locked_modify_yaml), exactly as _team_state.retire_agent
+# does at its tail. compose_agent_status drops a tombstoned row from the roster,
+# so "absent from ACTIVE_AGENTS" is reached by marking in place rather than by
+# deleting (guard-1072). The unlink is kept AFTER it, best-effort and never
+# fatal, matching that function: where delete works the shard is gone, where it
+# does not the tombstoned row is what survives, and both converge on absent.
+# Ordering is load-bearing — tombstone FIRST, or the unlink drops the local file
+# and the governed write re-materializes it without the tombstone.
+# Do NOT "simplify" this back to a bare unlink (guard-1493).
+#
+# NOT A NAME LIST: a curated list of known fake-agent names is an enumeration fix —
+# it goes stale the moment someone adds a new fake agent, and it does so silently,
+# with no commit for review to catch. The conditions below track the MECHANISM.
+#
+# THE ORIGINAL "CREATE-SET DIFF" CONDITION IS GONE, AND ITS REMOVAL IS THE OTHER HALF
+# OF THIS FIX (, measured 2026-08-08 on cc-04). It required that the shard
+# be ABSENT at session start, on the reasoning that this scopes cleanup to the run's
+# own residue. On a read-through backend that condition is satisfied almost never,
+# because the phantom's S3 object is PERMANENT — fleet boxes hold no s3:DeleteObject,
+# so the local mirror re-materializes on any read, and from the next session onward
+# the shard is "pre-existing" forever. Measured directly: with the tombstone fix in
+# place but this condition retained, one writer module still resurrected alpha-test
+# and the teardown skipped it, leaving retired_by from the PRIOR purge rather than
+# this teardown. The condition did not make the fixture careful; it made it a no-op.
+#
+# TWO CONDITIONS REMAIN, and they are the ones that were always doing the protecting.
+# The original comment said so itself — a real partner agent survives on 2 and 3 —
+# so dropping 1 does not widen the blast radius on real agents:
+#   1. no agents/<name>/ directory exists (bravo measured the discriminator: real
+#      agents have one, phantoms do not);
+#   2. the name is not one of the real fleet agents (belt-and-braces against 1).
+# Plus a skip that ALIGNS THIS FIXTURE WITH ITS CONSUMER rather than second-guessing
+# it: a row whose tombstone currently holds is already dropped from the composed
+# roster, so there is nothing to do and re-stamping it would just churn the store.
+# That check imports _team_state._is_retired instead of re-deriving the
+# heartbeat-newer-than-retired_at rule, so the two can never drift apart.
+#
+# RESIDUAL RISK, stated rather than left implicit: a genuinely NEW fleet agent that
+# has no agent dir on this box and is not yet in the `real` set would be tombstoned
+# here. That is bounded and self-healing — _is_retired treats a heartbeat newer than
+# retired_at as revival, so the agent's very next heartbeat re-enters it in the
+# roster — whereas the phantom pollution this replaces was permanent and had recurred
+# at least four times (2026-08-06, 08-07, 08-08 05:49, 08-08 22:30).
+def _retire_phantom_shard(path):
+    """Retire a phantom team-state row through the SANCTIONED daemon path.
+
+    THE CLEANUP MUST NOT BE AN IN-PROCESS WRITE, AND THIS IS THE WHOLE FINDING
+    OF g-115-5220 (measured 2026-08-08, alpha, cc-04). The pollution and the
+    cleanup sit on OPPOSITE SIDES OF THE guard-955 PIN:
+
+      * the phantom row is written by the DAEMON, which runs own-cloud, so it
+        lands in the AUTHORITATIVE store (S3);
+      * this pytest process is pinned STORAGE_BACKEND=local — mandatory under
+        guard-955 and correct for its own purpose — so ANY in-process write,
+        even through the governed locked_modify_yaml path, lands on the LOCAL
+        MIRROR ONLY;
+      * the local mirror is a read-through cache, so the next backend read
+        re-materializes the row FROM S3 and discards the local tombstone.
+
+    Measured directly: running the in-process helper under the pin left the S3
+    object byte-identical (same LastModified, retired_by unchanged), while the
+    same retirement issued through team-state-retire.sh moved it and flipped
+    _is_retired to True. So the pin that protects production from the test also
+    prevents the test from undoing what the DAEMON did to production — which is
+    why four successive purges (2026-08-06, 08-07, 08-08 05:49, 08-08 22:30) all
+    came back, and why the unlink-based version of this fixture cleaned nothing.
+
+    Routing through team-state-retire.sh puts the write back on the daemon's own
+    lane and gets archive-before-delete plus a .graveyard receipt for free —
+    hand-rolling the tombstone here would skip both.
+
+    Fail-open by contract, and the failure mode is ALIGNED rather than merely
+    tolerated: g-115-3329 refuses daemon SPAWNS under pytest, so with no live
+    daemon this call simply fails and we skip — and with no live daemon no
+    phantom was created either, because the EXIT-trap write had nothing to
+    reach. Cleanup is available exactly when pollution is possible.
+    """
+    from pathlib import Path as _Path
+    import sys as _sys  # ABOVE the try: the except handler below writes to it too
+    try:
+        import subprocess as _subp
+        from _runtime_bash import BASH as _bash_exe
+        _script = _Path(__file__).resolve().parents[1] / "team-state-retire.sh"
+        # .as_posix(), never str(): guard-581 — a str(WindowsPath) carries
+        # backslashes, which bash reads as escape introducers and strips.
+        # Matches the sibling call in test_iteration_close_recovery_probe.py.
+        _r = _subp.run(
+            [_bash_exe, _script.as_posix(), "--agent", path.stem, "--source",
+             "pytest session teardown (g-115-5220): phantom test-agent shard"],
+            capture_output=True, timeout=120, check=False,
+        )
+        # Fail-open, but LOUDLY. A daemon-up-but-retire-FAILED path (write
+        # fence, permission error) leaves the phantom AND, if we swallow this,
+        # emits zero signal — the same unobservability that let the original
+        # defect survive four purge cycles. pytest surfaces teardown stderr.
+        if _r.returncode != 0:
+            _sys.stderr.write(
+                "[conftest] phantom-shard retire FAILED rc=%s for %s: %s\n"
+                % (_r.returncode, path.name,
+                   (_r.stderr or b"").decode("utf-8", "replace").strip()[:300])
+            )
+    except Exception as exc:
+        _sys.stderr.write(
+            "[conftest] phantom-shard retire ERRORED for %s: %r\n" % (path.name, exc)
+        )
+        return
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _purge_phantom_team_state_shards():
+    from pathlib import Path as _P
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(_P(__file__).resolve().parents[1]))
+        from _paths import WORLD_DIR as _WD, PROJECT_ROOT as _PR
+        from _agents import AGENTS_PARENT_DIR as _APD
+    except Exception:
+        yield
+        return
+    shards = _P(_WD) / "team-state" / "agents"
+    yield
+    try:
+        import yaml as _yaml
+        import storage_backend as _sb
+        from _team_state import _is_retired
+    except Exception:
+        return
+
+    # ENUMERATE FROM THE AUTHORITATIVE STORE, UNION THE LOCAL MIRROR — never the
+    # local glob alone (guard-980). Measured 2026-08-08 (, cc-04): a
+    # writer module ran, the daemon advanced the phantom's row in the BACKING
+    # STORE, and NO local mirror existed on this box at teardown. A local-glob
+    # teardown therefore saw nothing to clean and reported success, while the row
+    # sat latent in S3 and re-materialized on the next read — the roster showed
+    # the phantom again seconds later. The local mirror is a read-through cache,
+    # so its contents describe what this box happened to have READ, not what
+    # exists; enumerating from it is the same class of error as deciding
+    # liveness from a raw local read. Verified both lanes disagree in practice:
+    # list_dir returned 12 shards while the local dir held 11.
+    backend = None
+    names = set()
+    try:
+        backend = _sb.get_backend()
+        names |= {n for n in backend.list_dir(shards) if n.endswith(".yaml")}
+    except Exception:
+        backend = None
+    if shards.is_dir():
+        names |= {p.name for p in shards.glob("*.yaml")}
+
+    agents_root = _P(_PR) / _APD if _APD else _P(_PR)
+    real = {"alpha", "bravo", "echo", "foxtrot", "zeta"}
+    for fname in sorted(names):
+        name = fname[:-5]
+        # Cheap local discriminators first, so a healthy fleet costs no
+        # backend reads for the five real agents.
+        if name in real:
+            continue
+        if (agents_root / name).is_dir():
+            continue
+        p = shards / fname
+        row = None
+        if backend is not None:
+            try:
+                row = _yaml.safe_load(backend.read_text(p)) or {}
+            except Exception:
+                row = None
+        if row is None:
+            try:
+                with open(p, "r", encoding="utf-8") as fh:
+                    row = _yaml.safe_load(fh) or {}
+            except (OSError, _yaml.YAMLError):
+                continue
+        if _is_retired(row):
+            continue  # tombstone holds — the roster already drops it
+        _retire_phantom_shard(p)

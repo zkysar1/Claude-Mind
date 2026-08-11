@@ -206,6 +206,22 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
                 relation["confidence"] = entry["confidence"]
             if "evidence" in entry:
                 relation["evidence"] = entry["evidence"]
+            # Tier-0 merge stamp (, guard-1153: LWW on a timestamp
+            # written BY THE SAME MUTATION that writes the field). Stamping at
+            # CREATE is the writer half of the fix: it makes the field exist on
+            # every edge this path produces, so a later hand-edit amendment has a
+            # baseline to beat. Safe for back-compat — a pre-stamp peer copy sorts
+            # oldest in _merge_skill_relation, so the stamped side wins, which is
+            # the correct outcome (it was written later).
+            #
+            # Ported from core/scripts/skill-relations.py:199 on 2026-08-01 by
+            # . The CLI shipped this and the daemon never received it;
+            # under daemon-only architecture this IS the live write path, so the
+            # writer half of  has been inert since it landed. Measured
+            # on the live store at port time: 7 of 7 forged_relations carried no
+            # amended_at, i.e. every existing edge is exposed to the deterministic
+            # merge-loss this stamp exists to prevent.
+            relation["amended_at"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
             forged.append(relation)
             world_data["forged_relations"] = forged

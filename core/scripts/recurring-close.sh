@@ -2,7 +2,7 @@
 # recurring-close.sh — atomic close for a recurring goal.
 #
 # Replaces the manual 5-step workflow:
-#   bash iteration-close.sh --phase verify        --goal <id> --status completed --source <s>
+#   bash iteration-close.sh --phase verify        --goal <id> --status completed --source <s> --outcome <o>
 #   bash iteration-close.sh --phase state-update  --goal <id> --source <s> --outcome <o>
 #   bash iteration-close.sh --phase learning-gate --goal <id> --source <s> --outcome <o>
 #   bash iteration-close.sh --phase productivity-check
@@ -870,62 +870,46 @@ agent_dir = _paths.AGENT_DIR
 if not agent_dir:
     sys.exit(0)
 
-exp_path = agent_dir / "experience.jsonl"
-threshold_seconds = 30 * 60  # 30-minute window
-now = datetime.now()
-has_recent = False
-if exp_path.exists():
+# The per-goal check itself now lives in core/scripts/per-goal-experience-check.py
+# (), so the NON-recurring close path can run the identical logic —
+# iteration-close.sh do_state_update calls the same helper. Everything above this
+# line is recurring-ONLY (the Block A/C forced-flip suppressions need
+# ORIGINAL_OUTCOME, which only this path has) and deliberately stays here.
+#
+# guard-2015: this file keeps NO copy of the extracted logic. A left-behind fork
+# stops receiving the shared helper's later hardening, and readers who follow the
+# helper's "extracted from recurring-close.sh" header would land on the stale one.
+#
+# 'trigger' says postflip-deep to make explicit that this fires on the
+# POST-Block-A/C-flip outcome, not the caller's original CLI outcome;
+# 'original_outcome' carries the caller's CLI arg so consumers can distinguish
+# 'caller asked for deep' from 'system flipped routine->deep' ( /
+# ). Both travel to the helper as flags — the payload shape Phase
+# 0-pre2 consumes is unchanged.
+#
+# Degradation is VISIBLE, not swallowed. The helper always exits 0 and reports
+# its own skips on stderr; this wrapper covers the case the helper cannot report
+# on — never being reached at all (missing file, interpreter failure, timeout).
+_helper = Path(sd) / "per-goal-experience-check.py"
+if not _helper.exists():
+    print(f"[recurring-close] WARN: per-goal experience check missing at {_helper} — Phase 4.25 enforcement SKIPPED for {gid}", file=sys.stderr)
+else:
     try:
-        # Read tail-N for performance — recent entries are at end
-        lines = exp_path.read_text(encoding="utf-8").splitlines()
-        for line in reversed(lines[-100:]):  # last 100 entries
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                e = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            # Match canonical goal_id OR legacy source_goal (): 90 of
-            # 476 store entries carry only source_goal (writer templates drifted
-            # by analogy with the rb/guardrail stores where source_goal IS
-            # canonical). Without the fallback the canary false-fires
-            # force_experience_archival on deep closes whose entry exists.
-            if gid not in (e.get("goal_id"), e.get("source_goal")):
-                continue
-            cdate_s = e.get("created") or ""
-            try:
-                cdate = datetime.fromisoformat(cdate_s)
-                if (now - cdate).total_seconds() < threshold_seconds:
-                    has_recent = True
-                    break
-            except (ValueError, TypeError):
-                continue
-    except Exception:
-        sys.exit(0)
-
-if not has_recent:
-    # 'trigger' uses 'postflip-deep' to make explicit that this fires on the
-    # POST-Block-A/C-flip outcome, not the caller's original CLI outcome.
-    # 'original_outcome' carries the caller's CLI arg so consumers can
-    # distinguish 'caller asked for deep' from 'system flipped routine->deep'.
-    # See  falsification finding and  Idea goal.
-    payload = json.dumps({
-        "triggered_at": now.isoformat(timespec="seconds"),
-        "trigger": "recurring-close-postflip-deep-no-recent-entry",
-        "goal_id": gid,
-        "original_outcome": original_outcome,
-    })
-    wm_py = Path(pr) / "core" / "scripts" / "wm.py" if pr else None
-    if wm_py and wm_py.exists():
-        try:
-            subprocess.run(
-                [sys.executable, str(wm_py), "set", "force_experience_archival"],
-                input=payload, text=True, capture_output=True, timeout=5,
-            )
-            print(f"[recurring-close] Phase 4.25 enforcement: deep close on {gid} with no recent experience entry — set force_experience_archival sentinel", file=sys.stderr)
-        except Exception:
-            pass  # Fail-open
+        _r = subprocess.run(
+            [
+                sys.executable, str(_helper),
+                "--goal-id", gid,
+                "--trigger", "recurring-close-postflip-deep-no-recent-entry",
+                "--original-outcome", original_outcome,
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        if _r.stderr:
+            sys.stderr.write(_r.stderr)
+        if _r.returncode != 0:
+            print(f"[recurring-close] WARN: per-goal experience check exited rc={_r.returncode} for {gid}", file=sys.stderr)
+    except Exception as _e:
+        print(f"[recurring-close] WARN: per-goal experience check failed ({_e}) — Phase 4.25 enforcement SKIPPED for {gid}", file=sys.stderr)
 PYEOF
 
 # Streak-break reflector: convert any signals emitted by complete_by into

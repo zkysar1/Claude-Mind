@@ -3,7 +3,12 @@
 #
 # Usage:
 #   bash core/scripts/body-manifest.sh write --sid <unitKey> --agent <mindKey> \
-#       [--env-id local] [--role reducer|worker|observer]
+#       [--env-id local] [--role reducer|worker|observer] [--reducer-sid remote]
+#     --reducer-sid remote  (-a) marks a CROSS-BOX worker: the reducer
+#       holds the DDB claim from another machine. Forces the WM fork, which the
+#       default path cannot do on a worker box because it decides by reading the
+#       local running-session-id, and a worker box never writes one. "remote" is
+#       the only accepted value — a cross-box reducer SID is unobtainable here.
 #   bash core/scripts/body-manifest.sh read      --sid <unitKey> --agent <mindKey>
 #   bash core/scripts/body-manifest.sh set-state  --sid <unitKey> --agent <mindKey> <state>
 #   bash core/scripts/body-manifest.sh is-reducer --sid <unitKey> --agent <mindKey>

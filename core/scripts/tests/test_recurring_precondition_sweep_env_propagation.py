@@ -12,7 +12,8 @@ actually needed advancing. Latent on ALL env-only own-cloud hosts (the read
 side works via _paths.py's .mind-data/local-paths.conf fallback, masking the
 bug until a goal needs the write).
 
-Fix: _advance_last_achieved_at augments the subprocess env with
+Fix: _update_goal_field (named _advance_last_achieved_at until g-005-28
+generalized it to write the shelve-trace fields too) augments the subprocess env with
 MIND_WORLD/WORLD_PATH/MIND_META/META_PATH resolved from
 _paths.WORLD_DIR/META_DIR (the read side already resolved them), letting an
 already-set MIND_* win (guard-879 / guard-652) and skipping a None-able root
@@ -74,7 +75,7 @@ def test_governed_root_map_propagated_to_write_subprocess(monkeypatch):
     monkeypatch.setattr(mod._paths, "WORLD_DIR", Path("/fake/world"))
     monkeypatch.setattr(mod._paths, "META_DIR", Path("/fake/meta"))
 
-    ok = mod._advance_last_achieved_at("g-x", "world", "2026-07-08T00:00:00", dry_run=False)
+    ok = mod._update_goal_field("g-x", "world", "lastAchievedAt", "2026-07-08T00:00:00", dry_run=False)
 
     assert ok is True
     env = captured["env"]
@@ -96,7 +97,7 @@ def test_already_set_ayoai_world_wins(monkeypatch):
     monkeypatch.setattr(mod._paths, "WORLD_DIR", Path("/fake/world"))
     monkeypatch.setattr(mod._paths, "META_DIR", None)  # None-able (guard-551)
 
-    mod._advance_last_achieved_at("g-x", "world", "2026-07-08T00:00:00", dry_run=False)
+    mod._update_goal_field("g-x", "world", "lastAchievedAt", "2026-07-08T00:00:00", dry_run=False)
 
     env = captured["env"]
     assert env["MIND_WORLD"] == "/preset/world"  # preset wins
@@ -118,7 +119,7 @@ def test_empty_string_env_treated_as_unset(monkeypatch):
     monkeypatch.setattr(mod._paths, "WORLD_DIR", Path("/fake/world"))
     monkeypatch.setattr(mod._paths, "META_DIR", Path("/fake/meta"))
 
-    mod._advance_last_achieved_at("g-x", "world", "2026-07-08T00:00:00", dry_run=False)
+    mod._update_goal_field("g-x", "world", "lastAchievedAt", "2026-07-08T00:00:00", dry_run=False)
 
     env = captured["env"]
     assert env["MIND_WORLD"] == "/fake/world"  # empty filled, not left ""
@@ -137,7 +138,7 @@ def test_none_world_dir_skips_gracefully(monkeypatch):
     monkeypatch.setattr(mod._paths, "WORLD_DIR", None)
     monkeypatch.setattr(mod._paths, "META_DIR", None)
 
-    ok = mod._advance_last_achieved_at("g-x", "world", "2026-07-08T00:00:00", dry_run=False)
+    ok = mod._update_goal_field("g-x", "world", "lastAchievedAt", "2026-07-08T00:00:00", dry_run=False)
 
     assert ok is True  # no crash
     env = captured["env"]
@@ -155,7 +156,7 @@ def test_dry_run_skips_subprocess(monkeypatch):
         return _FakeCompleted()
 
     monkeypatch.setattr(mod.subprocess, "run", fake_run)
-    ok = mod._advance_last_achieved_at("g-x", "world", "2026-07-08T00:00:00", dry_run=True)
+    ok = mod._update_goal_field("g-x", "world", "lastAchievedAt", "2026-07-08T00:00:00", dry_run=True)
 
     assert ok is True
     assert calls["n"] == 0

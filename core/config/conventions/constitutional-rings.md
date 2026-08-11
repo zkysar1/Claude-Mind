@@ -13,7 +13,7 @@ structurally (not honor-system) by a self-referential permission deny.
 
 | File | Why anchored |
 |------|--------------|
-| `.claude/settings.local.json` | Holds the deny rules that make every other tier's permission model real. A self-referential `deny: Edit/Write/MultiEdit(**/.claude/settings.local.json)` *inside this file* makes it immutable to every session — deny beats allow across all tiers, hot-reloaded (linchpin-verified 2026-05-16). Mirrored in `~/.claude/settings.json` as an out-of-repo backstop. |
+| `.claude/settings.local.json` | Holds the deny rules that make every other tier's permission model real. A self-referential `deny: Edit/Write/MultiEdit(**/.claude/settings.local.json)` *inside this file* makes it immutable to every session — deny beats allow across all tiers, hot-reloaded (linchpin-verified 2026-05-16). This in-repo deny is the entire mechanism. An out-of-repo mirror in `~/.claude/settings.json` would be optional extra hardening, but nothing in the repo provisions it and it is measured absent on every box — the persistent tripwire advisory A1 is that expected state, not drift. Do NOT create one (g-115-3676): that file is client-managed and rewritten wholesale, so a hand-added deny is silently erased, and it falls outside the deny patterns above, so an agent-written mirror is agent-erasable — it would read as a second independent copy while providing none of the protection. |
 | `core/scripts/settings-structural-validator.{py,sh}` | The fail-closed PreToolUse hook that protects `settings.json`'s deny[]/hooks. rb-931: a meta-safeguard whose substrate is in scope for self-edit is no safeguard. Anchored so the agent cannot neuter it. |
 
 **Modification authority**: NONE autonomously. Changes require a deliberate

@@ -176,11 +176,11 @@ def _announce_board(mutations, agent):
     # board-post.sh is a SIBLING in core/scripts, so anchor on SCRIPT_DIR and
     # count no parents at all.
     try:
-        from _runtime_bash import BASH  # rb-1472: not bare "bash"
+        from _runtime_bash import bash_cmd  # guard-580 + guard-581
         proc = subprocess.run(
-            [BASH, str(SCRIPT_DIR / "board-post.sh"),
-             "--channel", "findings", "--type", "finding",
-             "--tags", "sweep-auto-close,visibility,g-115-2676"],
+            bash_cmd(SCRIPT_DIR / "board-post.sh",
+                     "--channel", "findings", "--type", "finding",
+                     "--tags", "sweep-auto-close,visibility,g-115-2676"),
             input=msg, capture_output=True, text=True, timeout=30,
         )
         if proc.returncode == 0:

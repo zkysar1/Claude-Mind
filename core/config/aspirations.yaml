@@ -325,12 +325,15 @@ stale_cadence:
 #                defer-recheck (Phase 0.5b.4).
 #   deferrable:  pending-questions-sweep (0.5b.5), recurring-precondition-sweep
 #                (0.5c), fresh-eyes-cadence (0.5e), fresh-eyes-program-cadence
-#                (0.5e.5), felt-sense-cadence (0.5f), l1-skew-cadence (0.5g),
+#                (0.5e.5), strategic-scan-cadence (0.5e.9),
+#                felt-sense-cadence (0.5f), l1-skew-cadence (0.5g),
 #                health-regression-cadence (0.5h), curriculum-cadence (0.5i),
 #                evolution-cadence (0.5j), defer-drift-check (0.5b.10),
 #                reason-less-blocked-check (0.5b.11),
 #                blocked-signal-resolution-check (0.5b.12),
-#                human-blocked-defer-join (0.5b.15).
+#                human-blocked-defer-join (0.5b.15),
+#                dependency-cycle-check (0.5b.16),
+#                hypothesis-terminal-goal-check (0.5b.17).
 #                All are themselves cadence-gated, so dropping them in tight
 #                zones is safe.
 #                NON-EXHAUSTIVE — this list is a REFLECTION of sweep_tier() in
@@ -829,6 +832,38 @@ l1_skew_check:
                                 # fresh-eyes (+5) or felt-sense (+15) on a fresh
                                 # seed event — 20 goals out lands distinctly.
 
+# --- SCAR-TISSUE CHECK / SUBTRACTIVE GRADIENT CADENCE () ---
+# The periodic caller complexity_budget.py was written for and never got. Its
+# docstring says it exists to give "the scar-tissue review cadence an objective
+# number to move"; measured 2026-08-01 it had ZERO callers, so the additive
+# ratchet ran unopposed AND unquantified for as long as it has existed.
+# Reports two DIFFERENT corpora side by side (they are not interchangeable):
+#   half A — framework FILE surface (gates/rules/skills/scripts/conventions)
+#   half B — guardrail + reasoning-bank active:retired ratio, never-marked-helpful
+#            population, and a BOUNDED retirement slate
+# The slate is a PROPOSAL for agent judgment. The script has NO --apply path and
+# imports no mutation helper, so "never auto-retire" is structural rather than a
+# flag someone can pass. Acting on a slate stays a deliberate
+# bulk-retire-dead-entries.py --apply run by an agent that has read it.
+# SELF-ACTING (posts to the board itself), so per _cadence_registry.py's documented
+# scope it keeps its OWN precheck phase and is NOT a cadence-battery entry — same
+# exclusion l1-skew carries, and there is no /scar-tissue-review skill to invoke.
+# Implementation: core/scripts/scar-tissue-check.py --cadence --post-board
+scar_tissue_check:
+  goal_cadence: 100             # Every N completed goals — structural drift is
+                                # slow-moving; measured 2026-07-26 -> 2026-08-01
+                                # the stores grew +819 guardrails / +1142 rb in
+                                # six days, so 100 still samples the trend well
+                                # inside its period without posting noise.
+  wm_slot: last_scar_tissue_check
+  # Dead-entry criterion — passed through to the SHARED _curation_predicate seam
+  # that bulk-retire-dead-entries.py and memevo_bench.py already use, so the
+  # proposal can never drift from what the production retirement tool selects.
+  min_retrievals: 100           # Only propose entries with real retrieval volume
+  min_age_days: 30              # Protect new entries still accumulating signal
+  slate_cap: 25                 # Bounded proposal — a slate nobody can read is
+                                # not a proposal. Truncation is always flagged.
+
 # --- CURRICULUM RE-EVALUATION CADENCE () ---
 # Time-based cadence that re-runs curriculum-evaluate for the CURRENT agent so
 # its graduation-gate snapshot never goes stale. The only OTHER /curriculum-gates
@@ -1309,9 +1344,57 @@ self_drift_gate:
                                     # because no currently-active aspiration is a clean
                                     # semantic fit for cross-class drift Unblocks (work_class
                                     # families span product/research/framework/hygiene; pinning
-                                    # to a single aspiration mis-routes the others). Re-enable
-                                    # by setting an aspiration id when a portfolio-steering
-                                    # aspiration is reactivated or a new one is created.
+                                    # to a single aspiration mis-routes the others).
+                                    #
+                                    # DECISION 2026-08-01 (, echo): RETIRED, not
+                                    # merely disabled.  asked for activate-or-retire
+                                    # so the half-built state stops being re-filed; this is the
+                                    # retire. Do NOT re-arm by setting an aspiration id without
+                                    # first re-running the measurement below.
+                                    #
+                                    # (1) A SECOND CONSUMER OF A SIGNAL ALREADY UNDER
+                                    # INVESTIGATION. class_balance_bonus (scorer criterion 7e)
+                                    # reads the SAME class_balance.targets, per-agent, over a
+                                    # cross-session window, softly (±2.0 × 0.8) at EVERY pick —
+                                    # so the correction function is already occupied. But do
+                                    # NOT read this as "superseded by a mechanism that works":
+                                    # the scorer's OBSERVED-FRACTION side is itself open work.
+                                    #  measured cbb penalizing product −1.60 (which
+                                    # implies ~80% product in its window) while the observable
+                                    # mix was framework-heavy, a ±2.24 swing that silently
+                                    # outvotes the strategic_focus directive whose own maximum
+                                    # authority is +1.50;  independently flags the
+                                    # observed-fraction computation as suspect. Arming a HARD
+                                    # escalator that FILES GOALS on top of a soft term already
+                                    # suspected of misreading its window would multiply an
+                                    # unresolved measurement defect into queue noise. That is a
+                                    # reason to retire, not a reason to arm — but it is a
+                                    # weaker claim than supersession, and reasons (2) and (3)
+                                    # below are the load-bearing ones because neither depends
+                                    # on cbb being correct.
+                                    # (2) THE TARGETS DO NOT SURVIVE PER-AGENT APPLICATION.
+                                    # Measured over the last 200 world completions (fleet) and
+                                    # last 30 per agent, denominator = classified only:
+                                    # arming today fires for 8 of 9 agents. research is below
+                                    # critical for 7 of 9 (target 0.20 vs fleet actual 3.0%),
+                                    # which is one miscalibrated target, not seven drifts.
+                                    # Specialists fire hardest and most wrongly — charlie runs
+                                    # 90% product and would be escalated on framework, hygiene
+                                    # AND research, all correct for its lane. rb-3819: an agent
+                                    # whose lane work is cross-lane-routed to a partner has
+                                    # STRUCTURALLY zero executable work in that class, so the
+                                    # deficit is a division-of-labor artifact and an Unblock
+                                    # filed against it is unactionable by construction. This is
+                                    # exactly the "escalator firing against a wrong target is
+                                    # worse than none" case  proposal (b) warned of.
+                                    # (3) ITS UNIQUE FUNCTION IS NOT NEEDED. The gate can create
+                                    # work where the scorer can only re-rank existing candidates
+                                    # — but that only matters under a starved queue, and the
+                                    # queue holds 938 executable goals (precheck, same day).
+                                    #
+                                    # Re-arming requires PER-AGENT targets (none exist today) or
+                                    # a recalibrated fleet map, plus a named active aspiration.
+                                    # Reversible: set target_aspiration_id to re-activate.
 
 # --- CROSS-AGENT HANDOFF SCORING (Item 3) ---
 # Goals tagged `handoff_to: <agent-name>` get scoring bonus on the named agent's
@@ -1332,15 +1415,27 @@ scoring:
   handoff_sender_penalty: -2.5    # applied when goal.handoff_to names ANOTHER agent
 
 user_blocker_escalation:
-  # Phase 0.5b.1c (): EMAIL the user when a goal carrying `user` in
-  # participants has waited past this age. The delivery-channel sibling of
-  # handoff_aging / dependency_timeout / inbox_alert_age_hours — those three all
-  # escalate to the coordination board, which is agent-to-agent and so cannot
-  # discharge a block whose condition is a HUMAN action. Measured: 10+ board
-  # posts in one day on a HIGH ship-gate blocker, user never told.
-  # Cooldown is the escalation's own board post (shared + durable, ),
-  # NOT per-agent WM proactive_escalation_log (N-agent duplication + WM resets).
-  escalate_hours: 48
+  # Phase 0.5b.1c (): EMAIL the user ONE digest of every goal carrying
+  # `user` in participants. The delivery-channel sibling of handoff_aging /
+  # dependency_timeout / inbox_alert_age_hours — those three all escalate to the
+  # coordination board, which is agent-to-agent and so cannot discharge a block
+  # whose condition is a HUMAN action. Measured: 10+ board posts in one day on a
+  # HIGH ship-gate blocker, user never told.
+  # The schedule marker is the digest's own board post (shared + durable,
+  # ), NOT per-agent WM proactive_escalation_log (N-agent duplication
+  # + WM resets).
+  #
+  # THIS IS A SCHEDULE INTERVAL, NOT AN AGE THRESHOLD (D2, ). The
+  # digest goes out every `cadence_hours` regardless of how old anything is, and
+  # goes out EVEN WHEN THE LIST IS EMPTY (D3 all-clear). User directive, verbatim
+  # on both the interval and the reason: "MAybe every 3 days?" / "Predictable is
+  # usually less stressful than rare."
+  #
+  # Replaced `escalate_hours: 48`, which was an age threshold. The key was
+  # RENAMED rather than reused because the number now means something different;
+  # the reader does not accept the old key, so a stale config lands on the coded
+  # default (72) instead of silently running the schedule on a threshold value.
+  cadence_hours: 72
 
 handoff_aging:
   warn_hours: 48                     # aged handoffs get an escalating scoring bonus from here
@@ -1397,6 +1492,30 @@ cell_return:
   bonus_scale: 3.0       # multiplier mapping a candidate's summed PPR mass into the additive bonus range
   bonus_max: 1.5         # additive bonus cap (mirrors retrieve.py ppr_weight_max upper bound)
   enrich_signature: false # g-306-51: when true, inject cat:<category> + tag: pseudo-node entities into each candidate signature so same-category high-value cells boost same-category candidates (a bare goal-id footprint is often graph-distant). Default OFF until an A/B (cell-return-ab-harness --enrich-signature) proves the enriched signal helps.
+
+# --- STARVATION BOOST (anti-starvation for aged one-shot goals) ---
+# Post-scoring pass (apply_starvation_boost in goal-selector.py) that rescues aged,
+# unclaimed, HIGH-priority NON-recurring goals from indefinite selection starvation.
+# Recurring goals already have recurring_urgency (overdue_ratio); one-shot goals had
+# NO age-based term, so a one-shot goal's score is essentially fixed at filing time.
+# A lone HIGH goal in a sprawling, low-completion, heterogeneous aspiration (canonical:
+# an alert-sweep Unblock in asp-115) therefore never rises and can sit unclaimed for
+# days while consolidate-before-expand momentum (completion_pressure + tail_bonus +
+# context_coherence) keeps winning. Motivating incident: , an env-server
+# LLM-service alert unclaimed 29h against an active 5-agent fleet.
+# NO-REGRESSION BY CONSTRUCTION: a goal younger than min_age_hours gets ZERO boost, so
+# normal selection is byte-identical for all but the genuine starvation population.
+# The boost ramps linearly from 0 at min_age_hours to max_boost at full_boost_age_hours,
+# is scaled by priority_multipliers (HIGH-only by default), and is clamped at max_boost.
+starvation_boost:
+  enabled: true             # bug fix; the no-regression property comes from the age threshold, NOT from this flag
+  min_age_hours: 12.0       # a goal must sit unclaimed this long before ANY boost (mirrors proactive_escalation.inbox_alert_age_hours.medium)
+  full_boost_age_hours: 36.0 # age at which the linear ramp reaches max_boost
+  max_boost: 4.0            # additive cap; deliberately BELOW directive_boost's 4.5 raw max so a fresh user directive still outranks a starved goal
+  priority_multipliers:     # per-priority scale; HIGH-only by default (MEDIUM/LOW deprioritisation is prioritisation working as intended, not starvation pathology)
+    HIGH: 1.0
+    MEDIUM: 0.0
+    LOW: 0.0
 
 # --- PRODUCTIVITY SELF-STOP GATE (Item 2) ---
 # Composite productivity score computed at end of each iteration (via
@@ -1745,6 +1864,11 @@ modifiable:
   convention_learning.max_steps_per_convention: {min: 4, max: 12, default: 8}
   convention_learning.auto_apply_confidence: {min: 0.6, max: 1.0, default: 0.8}
   convention_learning.cooldown_goals: {min: 5, max: 20, default: 10}
+  # 3.5c convention-gap detector: how many top-firing guardrails to consider per
+  # pass. RANK-based, replacing an absolute `times_active >= 5` that saturated to
+  # 70.4% of the store (). Read this at run time — never hardcode the
+  # number back into the detector (guard-2805).
+  convention_learning.promotion_top_n: {min: 3, max: 30, default: 10}
   # Strategic scan bounds
   strategic_scan.goal_cadence: {min: 3, max: 20, default: 8}
   strategic_scan.hours_cadence: {min: 1, max: 12, default: 4}
@@ -1856,6 +1980,31 @@ runner_heartbeat:
   # STALLED_DIARY_STALE_MINUTES. Guarded by
   # test_agent_watchdog_stalled.py::test_config_invariant_diary_stale_exceeds_heartbeat_stale.
   stalled_diary_stale_minutes: 180
+  # Reducer self-fencing stand-down threshold (). T_stepdown: after
+  # THIS many seconds of CONTINUOUS DDB claim-renewal failure, a reducer stops
+  # acting as reducer voluntarily, so the lease has a defined step-down window
+  # instead of an infinite one.
+  # INVARIANT (the whole point of the goal): stepdown_seconds MUST be <
+  # owncloud_backend.DEFAULT_RUNNER_STALE_SECONDS (T_takeover, 3900s; env
+  # override OWNERSHIP_STALE_SECONDS). Classic lease correctness — the holder
+  # must step down BEFORE a peer may legally take over, or the two windows
+  # overlap and both boxes act as reducer (split-brain). This is the OPPOSITE
+  # direction from every other invariant in this block (which require the
+  # cross-machine value to EXCEED the local one), because this threshold governs
+  # when the OWNER yields, not when a PEER may seize. Before 2026-08-05
+  # T_stepdown was effectively INFINITY: cc-04 lost its claim at 14:38 and kept
+  # executing as reducer for 2.5+ hours while two other bodies acquired it, and
+  # split-brain was avoided by luck, not by the mechanism.
+  # 1950 = 3900/2, deliberately EQUAL to the escalation threshold heartbeat-tick.sh
+  # already uses (`_HB_STALE / 2`, ) so the loud stderr warning and the
+  # stand-down fire at the same moment rather than at two thresholds a reader has
+  # to reconcile. Guarded by
+  # test_reducer_self_fence.py::test_config_invariant_stepdown_precedes_takeover.
+  # NOTE the gap this does NOT close: a SAME-BOX reducer restart keeps the same
+  # machine_id, so the different-holder read cannot see it (same measured limit
+  # worker_reducer_liveness.py states for its takeover proxy). Closing that needs
+  # the claims endpoint to expose runner_token.
+  stepdown_seconds: 1950
 
 # --- Recovery gate (script-gated crashed-runner auto-recovery) ---
 # core/scripts/recovery-gate.sh fires from the SessionStart hook when ALL FOUR

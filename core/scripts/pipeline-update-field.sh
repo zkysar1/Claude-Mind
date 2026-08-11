@@ -17,6 +17,16 @@ _RUNTIME_SELF="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
+# Shared unknown-flag refusal (). Sourced BEFORE _runtime.sh so the
+# refusal is cheap and cannot be masked by a daemon failure.
+# shellcheck disable=SC1091
+source "$CORE_ROOT/scripts/_argv_strict.sh"
+# ONE literal, referenced by BOTH the --help arm and the refusal (
+# fresh-eyes F-002). These were two copies until the review: the helper's own
+# comment asserted they came from one, which was simply false, and two strings
+# that must agree are the drift surface the refusal exists to remove.
+_ACCEPTED_FLAGS="(none — this wrapper takes three positionals only)"
+
 # --- Parse args -----------------------------------------------------------
 REC_ID=""
 FIELD=""
@@ -25,8 +35,18 @@ declare -a PASSTHROUGH=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        -h|--help)
+            # BEFORE the -*) arm: --help is a `-*` token, and refusing it with
+            # exit 2 would be a regression the refusal introduced rather than a
+            # defect it fixed (). Help exits 0.
+            argv_strict_help "$(basename "$0")" "<rec-id> <field> <value>" \
+                "$_ACCEPTED_FLAGS";;
         -*)
-            PASSTHROUGH+=("$1"); shift;;
+            # REFUSE (). This wrapper is named identically to the four
+            # *-update-field siblings that DID adopt the strict parser, so it read
+            # as converted at a glance while still swallowing unknown flags into a
+            # PASSTHROUGH array nothing reads — sliding the next token into VALUE.
+            argv_strict_refuse_unknown "$(basename "$0")" "$1" "$_ACCEPTED_FLAGS";;
         *)
             if [ -z "$REC_ID" ]; then
                 REC_ID="$1"

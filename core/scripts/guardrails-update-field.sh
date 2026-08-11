@@ -16,23 +16,28 @@ PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
 # --- Parse args -----------------------------------------------------------
-REC_ID=""
-FIELD=""
-VALUE=""
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -*) shift;;
-        *)
-            if [ -z "$REC_ID" ]; then REC_ID="$1"
-            elif [ -z "$FIELD" ]; then FIELD="$1"
-            elif [ -z "$VALUE" ]; then VALUE="$1"
-            fi
-            shift;;
-    esac
-done
+# STRICT. The previous `-*) shift;;` arm SWALLOWED any unknown flag, so
+# `<id> <field> --value-file <path>` slid the PATH into VALUE and clobbered the
+# record with rc=0 and no error. That destroyed guard-1615 (times_active 677,
+# 1400+ chars -> an 87-char path string) on 2026-08-01; only a mandated
+# read-back caught it. See .
+#
+# Two rules, both enforced BEFORE _runtime.sh is sourced so the refusal is cheap
+# and cannot be masked by a downstream daemon failure:
+#   1. an unknown leading-dash argument is an ERROR, never discarded
+#   2. a 4th positional is an ERROR, never discarded
+# Both exit 2 SPECIFICALLY (not merely non-zero) so a test can tell this refusal
+# apart from a daemon/transport failure, which also exits non-zero.
+# shellcheck disable=SC1091
+source "$CORE_ROOT/scripts/_argv_strict.sh"
+
+argv_strict_parse "guardrails-update-field.sh" 3 "$@"
+REC_ID="${ARGV_POS[0]:-}"
+FIELD="${ARGV_POS[1]:-}"
+VALUE="$(argv_strict_resolve_value "guardrails-update-field.sh" "${ARGV_POS[2]:-}")"
 
 if [ -z "$REC_ID" ] || [ -z "$FIELD" ] || [ -z "$VALUE" ]; then
-    echo "Usage: guardrails-update-field.sh <id> <field> <value>" >&2
+    argv_strict_usage "guardrails-update-field.sh" 3
     exit 1
 fi
 

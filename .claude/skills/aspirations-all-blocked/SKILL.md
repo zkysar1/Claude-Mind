@@ -129,9 +129,23 @@ FOR EACH review_msg NOT from this agent:
         # Form a testable prediction about the change's downstream impact.
         # Example: "Change to X will cause Y in the next N executions"
         # Apply calibration gate (same ceiling as spark Step 0.5):
-        #   a. Read recent accuracy: Bash: pipeline-read.sh --stage resolved
-        #      Count CONFIRMED vs CORRECTED for code_review category (or overall if <3)
+        #   a. Read recent accuracy — BOTH stages are REQUIRED:
+        #        Bash: pipeline-read.sh --stage resolved
+        #        Bash: pipeline-read.sh --stage archived
+        #      `--stage resolved` ALONE is a SURVIVORSHIP FILTER — it was 9.4% of
+        #      the store when measured 2026-08-04, and scoring only it moves the
+        #      cap a FULL BAND (62.4% -> cap 0.80 vs the union's 55.5% -> cap
+        #      0.65). Do NOT re-duplicate the rationale here: aspirations-spark
+        #      Step 0.5(a) is the single source of truth for this gate, and this
+        #      site drifted from it precisely because the two were maintained as
+        #      independent copies. Read it there; keep this block a pointer.
+        #      (g-115-4866.)
+        #      Count CONFIRMED vs CORRECTED over the UNION of both stages, for
+        #      code_review category (or overall if <3)
         #      Compute recent_accuracy = confirmed / total
+        #      Log BOTH arms (resolved n / archived n), never just the total —
+        #      a silent regression to resolved-only logs identically otherwise
+        #      (guard-2529 / guard-2273 / guard-2191).
         #   b. Apply confidence ceiling:
         #      - If recent_accuracy < 0.40: cap at 0.55
         #      - If recent_accuracy >= 0.40 and < 0.60: cap at 0.65
@@ -556,8 +570,63 @@ IF B6.5 returned rc=1 (quiescence denied):
     # signal — convert it into Unblock aspirations rather than sleep.
     Bash: goal-selector.sh blocked
     Parse JSON. Returns {"blocked_goals": [...], "blocked_count": N, "by_reason": {...}}.
-    Iterate parsed.blocked_goals. Group by blocker_ref.external_id (or by
-    blocker_ref.type when external_id is null).
+    Iterate parsed.blocked_goals. Group by the external_id CLASS PREFIX —
+    the text before the FIRST colon in blocker_ref.external_id. When there is
+    no colon, the whole string is its own group (correctly a singleton).
+
+    # DO NOT group by the FULL external_id (g-115-4923, filed by omni from
+    # ZDS-Mind, reproduced here). external_id is near-unique per goal, so
+    # affected_count is ~1 for every group and the `>= 2` gate below is
+    # unreachable BY CONSTRUCTION — the PRIMARY synthesis target could never
+    # fire. omni measured 76 ids / 76 distinct / max-sharing 1. Measured here
+    # 2026-08-04 (bravo, hostname cc-05, uname -r 6.8.0-136-generic) on a live
+    # 169-goal blocked queue: 159 distinct of 169, max-sharing 3 — so a rare
+    # group CAN reach 2, which makes the defect intermittent rather than total
+    # and is exactly why it survived. Same vacuous-gate class as the
+    # covered_patterns bug documented below: a guard on a loop body that
+    # never runs.
+    #
+    # The prefix IS the blocker class — all 169 external_ids here carry a
+    # colon, and the prefixes are `hypothesis-gate` 99, `dependency` 25,
+    # `structured-defer` 19, `precondition` 9, `time-gate` 8, `not-my-lane` 5,
+    # `narrative-defer` 1, `explicit-status` 1, plus 2 colon-less
+    # create-blocker ids. That is 10 groups, SIX at >= 2 — the signal this
+    # step wants is present and abundant; only the key was wrong.
+    #
+    # blocker_ref.type is NOT the fallback to reach for, despite reading like
+    # the schema-backed choice. Measured on the same queue it is DEGENERATE:
+    # 167 of 169 are `resource`, giving 3 groups. It would collapse every
+    # distinct blocker class into one bucket and synthesize one meaningless
+    # aspiration. (This was a hypothesis of mine, falsified by measuring.)
+    #
+    # by_reason — already returned by the same call, above — is a valid but
+    # STRICTLY COARSER key: 6 groups, because it collapses `structured-defer`,
+    # `time-gate` and `narrative-defer` into one `deferred` bucket. Those want
+    # different Unblock aspirations, so prefer the prefix. Cross-tab confirms
+    # the prefix refines by_reason rather than cutting across it.
+    #
+    # CAUTION — THIS STEP NOW FIRES, SO JUDGE THE PATTERN BEFORE SYNTHESIZING.
+    # It has been inert, so its output has never been reviewed in practice. On
+    # the queue measured above the top three candidates are `hypothesis-gate`
+    # (99), `dependency` (25) and `structured-defer` (19), and the per-iteration
+    # cap of 3 means those are exactly what the first live firing would create.
+    # At least one is not an actionable blocker: a hypothesis gate is a TIME
+    # LOCK that resolves on its own schedule, so "Unblock: hypothesis-gate (99
+    # goals waiting)" is noise, not work. `time-gate` and `not-my-lane` are
+    # likewise self-resolving or routing artifacts. Prefer patterns naming a
+    # condition an agent can act on; skip the self-resolving classes. Whether
+    # to encode that as a hard exclusion list is g-115-4966 — until it lands,
+    # this is the operator's judgment call at synthesis time.
+    #
+    # MEASURE BOTH KEYS AGAINST `goal-selector.sh blocked`, NOT against
+    # `aspirations-query.sh --goal-status blocked` — the two populations
+    # differ by 30x here (169 vs 5), because `status: blocked` is a narrow
+    # field while this step's notion of blocked includes deferred,
+    # hypothesis-gated and dependency-blocked goals. Measuring the narrow one
+    # first produced a confident, wrong reading of this very defect
+    # (2 ids, no colons, "the prefix fix is inert here") before re-measuring
+    # on the population the code actually reads. guard-1802 class: a probe
+    # predicate narrower than the production path's.
 
     # Build the set of blocker patterns already covered by an OUTSTANDING
     # Unblock aspiration, so we don't spam duplicates.

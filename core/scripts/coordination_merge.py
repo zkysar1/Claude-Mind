@@ -442,12 +442,30 @@ def _merge_stamp_map(a: dict, b: dict) -> dict:
     Union (not pick-one) because each box only stamps the fields IT wrote: box A
     amending ``trigger_condition`` and box B amending ``action_hint`` produce maps
     with disjoint keys, and both stamps are true. Per-key MAX resolves the case
-    where both boxes wrote the same field. Commutative and idempotent."""
+    where both boxes wrote the same field. Commutative and idempotent.
+
+    KEYS ARE SORTED ON THE WAY OUT, and that is load-bearing (g-115-5287). The
+    union is ``dict(a)`` then b's new keys appended, so the disjoint-key case
+    above — the case this docstring already describes as the REASON to union —
+    yields insertion order ``[trigger_condition, action_hint]`` from one arg
+    order and ``[action_hint, trigger_condition]`` from the other. The CONTENT
+    is identical either way, which is why this read as commutative for so long;
+    but this map is a nested VALUE inside a record and ``_dump_jsonl`` calls
+    ``json.dumps`` WITHOUT ``sort_keys``, so the insertion order reaches the
+    output BYTES. Measured on the live handlers: ``merge_guardrails(a, b) !=
+    merge_guardrails(b, a)`` for one guardrail whose two copies each carried a
+    different amended field — guard-907's exact ETag-fenced-PUT ping-pong
+    precondition, on three of the busiest cross-box stores (this helper is
+    called by _merge_rb_record, _merge_guard_record and _merge_sig_record).
+    The registry-wide commutativity property test missed it because its
+    divergence case puts distinct keys at the TOP level of a record, never
+    inside a nested map. Pinned by
+    tests/test_merge_record_side_only_key_preservation.py."""
     out = dict(a)
     for k, vb in b.items():
         va = out.get(k)
         out[k] = vb if va is None or _ts_key(vb) > _ts_key(va) else va
-    return out
+    return {k: out[k] for k in sorted(out)}
 
 
 def _field_stamp(rec: dict, field: str) -> str:
@@ -903,6 +921,24 @@ _GOAL_MAX_FIELDS = (
 # so a stale-base LWW write can never roll back a real achievement).
 _GOAL_NEWER_FIELDS = ("lastAchievedAt", "last_substantive_at")
 _TERMINAL_STATUSES = ("completed", "skipped", "expired")
+# Goal-level keys that get their own both-sides-aware merge inside _merge_goal;
+# the one-sided-key preservation there must not pre-empt them. Goal-level twin of
+# _ASP_EXPLICIT_MERGE (). DERIVED from the two field tuples rather than
+# re-listing them, so adding a monotonic field in one place cannot leave a second
+# source of truth behind.
+#
+# `status` is deliberately ABSENT: its block only overrides for NON-recurring
+# goals (recurring statuses CYCLE and ride the LWW base), so a one-sided status
+# on a recurring goal has no both-sides handler and would still be dropped.
+# The claim TRIPLE is present because it moves as a UNIT — and the reachable
+# hole is narrower than the claim block looks: with claimed_by null on BOTH
+# sides every branch there is False, so an unexcluded loop would resurrect a
+# leftover claimed_by_sid attached to no claim at all.
+_GOAL_EXPLICIT_MERGE = (
+    _GOAL_NEWER_FIELDS + _GOAL_MAX_FIELDS
+    + ("created_at", "displaced_from", "claimed_by", "claimed_at",
+       "claimed_by_sid")
+)
 
 
 def _merge_goal(a: dict, b: dict) -> dict:
@@ -911,6 +947,13 @@ def _merge_goal(a: dict, b: dict) -> dict:
     resettable/opaque fields: currentStreak, consecutive_*, outcome_class,
     defer_*, verification, ...), then the MONOTONIC fields are overridden so a
     stale-base write can never roll back real progress:
+      - one-sided keys : a field present on exactly ONE side is KEPT, not
+        dropped by the base-pick (g-115-5017 — completed_date/completed_by are
+        written by the CLOSE path and defer_reason by the DEFER path, none of
+        which bumps last_modified, so they are invisible to the ordering that
+        decides their survival). Excludes _GOAL_EXPLICIT_MERGE, whose members
+        already read from BOTH sides. Mirrors the loop _merge_aspiration_record
+        has carried since g-115-4163, one level down.
       - lastAchievedAt / last_substantive_at : strictly-newer wins (only advance)
       - achievedCount / longest* / substantive_* : numeric MAX (only grow)
       - created_at                            : OLDER wins (stable allocation ts)
@@ -944,6 +987,29 @@ def _merge_goal(a: dict, b: dict) -> dict:
     Every rule is a symmetric function of (a, b) -> both machines converge."""
     win, _lose = _order_by_ts(a, b, "last_modified")
     out = dict(win)
+    # Goal-level fields present on only ONE side survive the base-pick
+    # (). ``out = dict(win)`` alone drops them wholesale, and the
+    # enumerated overrides below reach only the families they name. The parent
+    # _merge_aspiration_record has carried exactly this loop since 
+    # with the argument that last_selected is advanced by the selection path
+    # alone; the identical argument applies one level down — completed_date /
+    # completed_by are written by the CLOSE path and defer_reason by the DEFER
+    # path, none of which is what bumps last_modified, so they are invisible to
+    # the ordering that decides their survival. On a TIE _order_by_ts falls to a
+    # content tiebreak the side LACKING the field can win, so the loss does not
+    # even require a newer partner. Measured in production (merge commit
+    # 842fe196): two closed goals stripped of completed_date/completed_by, two
+    # human_blocked defer_reasons destroyed.
+    # Deliberately NOT generalized: when a key is on BOTH sides the LWW
+    # base-pick stands — widening this into a field-level content tiebreak is
+    # the cross-granularity transplant guard-1153 forbids, and guard-1703
+    # measured why a _canon tiebreak on text is worse than useless.
+    # Commutative by construction (guard-907): the key set is sorted, and a
+    # one-sided key has exactly one candidate, so neither the iteration order
+    # nor the chosen value can depend on the local-vs-remote argument role.
+    for k in sorted(set(a) | set(b)):
+        if k not in out and k not in _GOAL_EXPLICIT_MERGE:
+            out[k] = a[k] if k in a else b[k]
     # Monotonic timestamps: strictly-newer across BOTH (None sorts oldest).
     for f in _GOAL_NEWER_FIELDS:
         va, vb = a.get(f), b.get(f)
@@ -989,26 +1055,62 @@ def _merge_goal(a: dict, b: dict) -> dict:
         elif ta and tb and sa != sb:
             out["status"] = sa if _canon(sa) >= _canon(sb) else sb
         # else: both terminal-equal OR both non-terminal -> base LWW status stands
-    # Claim pair: first-claim-wins for LIVE claims by DIFFERENT agents
+    # Claim pair: first-claim-wins for LIVE claims that CONFLICT
     # ( / rb-3043 second-claimer steal). Symmetric in (a, b):
     # comparisons are on field VALUES, never argument order.
+    #
+    # TWO claims conflict when they name different AGENTS, *or* -- same mind,
+    # different BODY -- the same agent from two different SESSIONS (-c).
+    # The same-agent case used to fall through every branch here: `ca_by != cb_by`
+    # was False and the `elif bool(ca_by) != bool(cb_by)` below was False too
+    # (both truthy), so the pair silently rode the LWW base and BOTH bodies kept
+    # their own view and executed the goal. Observed in the ZDS fleet (omni x2),
+    # trace T5. guard-1460 is the read-side statement of the same defect; this is
+    # the durable replacement for its manual board-claim interim protocol.
+    #
+    # A conflict needs BOTH sids present and different. One-sided sid is NOT a
+    # conflict: it is most likely the same body merged against its own pre-sid
+    # snapshot (claimed_by_sid postdates the claim schema, ), and
+    # manufacturing a conflict from incomplete data is the unsafe direction --
+    # it would hand the goal to whichever copy happens to carry the field.
     ca_by, cb_by = a.get("claimed_by"), b.get("claimed_by")
-    if ca_by and cb_by and ca_by != cb_by:
+    ca_sid, cb_sid = a.get("claimed_by_sid"), b.get("claimed_by_sid")
+    _diff_agent = bool(ca_by) and bool(cb_by) and ca_by != cb_by
+    _diff_body = (bool(ca_by) and ca_by == cb_by
+                  and bool(ca_sid) and bool(cb_sid) and ca_sid != cb_sid)
+    if _diff_agent or _diff_body:
         ca_at, cb_at = a.get("claimed_at"), b.get("claimed_at")
         if ca_at and cb_at:
             if ca_at != cb_at:
                 first = a if ca_at < cb_at else b   # older claim stands
-            else:
+            elif ca_by != cb_by:
                 first = a if ca_by < cb_by else b   # full tie -> lexicographic
+            else:
+                # Same agent, same instant: break on the BODY id. claimed_by is
+                # identical here, so it carries no ordering information.
+                first = a if (ca_sid or "") < (cb_sid or "") else b
         elif ca_at or cb_at:
             first = a if ca_at else b               # stamped beats timestamp-less
-        else:
+        elif ca_by != cb_by:
             first = a if ca_by < cb_by else b       # both unstamped -> lexicographic
+        else:
+            first = a if (ca_sid or "") < (cb_sid or "") else b
         out["claimed_by"] = first.get("claimed_by")
         if first.get("claimed_at") is not None:
             out["claimed_at"] = first["claimed_at"]
         else:
             out.pop("claimed_at", None)             # pair moves as a unit
+        # claimed_by_sid is part of the SAME unit. Without this it rode the LWW
+        # base from `out = dict(win)`, so whenever the conflict winner was not
+        # the LWW winner the merged record paired the WINNER's claimed_by /
+        # claimed_at with the LOSER's body id -- a claim attributable to a
+        # session that never made it. That mixed pair was reachable in the
+        # pre-existing different-AGENT branch too, not only in the new
+        # same-agent one; it went unnoticed because nothing merged the field.
+        if first.get("claimed_by_sid") is not None:
+            out["claimed_by_sid"] = first["claimed_by_sid"]
+        else:
+            out.pop("claimed_by_sid", None)
     elif bool(ca_by) != bool(cb_by):
         # Exactly ONE side carries a live claim; the other is null. Keep the
         # claim UNLESS the null side is PROVABLY NEWER than the claim -- i.e. its
@@ -1043,6 +1145,7 @@ def _merge_goal(a: dict, b: dict) -> dict:
             # Null side provably newer -> genuine release/supersession -> clear.
             out.pop("claimed_by", None)
             out.pop("claimed_at", None)
+            out.pop("claimed_by_sid", None)         # sid is part of the unit
         else:
             # Stale pre-claim snapshot -> keep the claim (double-claim guard).
             out["claimed_by"] = claim_side.get("claimed_by")
@@ -1050,6 +1153,10 @@ def _merge_goal(a: dict, b: dict) -> dict:
                 out["claimed_at"] = claimed_at
             else:
                 out.pop("claimed_at", None)         # pair moves as a unit
+            if claim_side.get("claimed_by_sid") is not None:
+                out["claimed_by_sid"] = claim_side["claimed_by_sid"]
+            else:
+                out.pop("claimed_by_sid", None)
     # Merged NON-recurring terminal status clears the claim pair (merge-layer
     # mirror of the write-path claim-clearing invariant). Recurring goals
     # cycle completed -> pending, so their claims are left to the LWW base.
@@ -1057,6 +1164,7 @@ def _merge_goal(a: dict, b: dict) -> dict:
             and out.get("status") in _TERMINAL_STATUSES):
         out.pop("claimed_by", None)
         out.pop("claimed_at", None)
+        out.pop("claimed_by_sid", None)             # sid is part of the unit
     return _commutative_key_order(a, b, out)
 
 
@@ -3612,9 +3720,18 @@ def merge_backpressure(local: bytes, remote: bytes) -> bytes:
         for k in set(ka) & set(kb):
             merged[k] = ka[k] if _canon(ka[k]) >= _canon(kb[k]) else kb[k]
         tombstoned |= set(merged)
-        loose = sorted({_canon(x) for x in (la + lb)})
+        # Loose rows carry no meta_change_id, so CONTENT is their only key. Emit
+        # one row per distinct content in canon order — a pure function of
+        # content, independent of which side arrived as `local` (guard-907).
+        # The prior `la + lb` form was argument-order dependent (measured:
+        # [aaa, bbb] vs [bbb, aaa]), and its `[:len(loose)]` truncation DROPPED
+        # a distinct row whenever a duplicate sorted ahead of it — measured on
+        # this append-only store, merging [X, X] with [Y] returned [X, X] and
+        # lost Y outright. The map keeps the dedup the `loose` set was reaching
+        # for while making the count exact instead of truncated.
+        loose = {_canon(x): x for x in (la + lb)}
         out[field] = ([merged[k] for k in sorted(merged, key=str)]
-                      + [x for x in (la + lb) if _canon(x) in loose][:len(loose)])
+                      + [loose[c] for c in sorted(loose)])
 
     # --- draining queue: rebuild, do NOT union --------------------------------
     if "active_monitors" in a or "active_monitors" in b:
@@ -3638,13 +3755,382 @@ def merge_backpressure(local: bytes, remote: bytes) -> bytes:
             if isinstance(sa, list) and isinstance(sb, list):
                 row["imp_k_samples"] = sa if len(sa) >= len(sb) else sb
             rebuilt[k] = row
+        loose_m = {_canon(x): x for x in (la + lb)}  # content-keyed: order-free
         out["active_monitors"] = [
             rebuilt[k] for k in sorted(rebuilt, key=str)
             if str(rebuilt[k].get("status", "monitoring")) == "monitoring"
             and k not in tombstoned
-        ] + [x for x in (la + lb)]
+        ] + [loose_m[c] for c in sorted(loose_m)]
 
-    return yaml.dump(out, default_flow_style=False, sort_keys=False).encode("utf-8")
+    # Terminal canonicalization — the house cure for the sort_keys=False
+    # key-order gap (; merge_tree applies it identically at both its
+    # returns, lines 2859 / 2898). On a content TIE the `>=` tiebreak above is
+    # true in BOTH call directions, so each direction keeps its own local's key
+    # INSERTION order and emits different bytes for identical content. One pass
+    # at the return makes the whole output a pure function of content
+    # (guard-907) without disturbing the tiebreak or the house dump style.
+    return yaml.dump(_canonicalize_for_merge(out),
+                     default_flow_style=False, sort_keys=False).encode("utf-8")
+
+
+# --- meta RMW indexes (, group B of ) -------------------
+
+# DECLARED SOURCE: core/config/skill-gaps.yaml -> `gap_statuses` (). This
+# frozenset is an inline copy, kept inline because the merge handler is a hot cross-box
+# path that must not read YAML config per call. guard-426 permits that only with a
+# pointer to the source AND a drift check: test_skill_gaps_hardening.py
+# ::test_terminal_set_matches_declared_vocabulary diffs both names below against the
+# declaration, so a status added there and forgotten here fails the suite.
+_SKILL_GAP_TERMINAL = frozenset({"forged", "dismissed", "satisfied-by-extension"})
+
+# NOT terminal -- the resolution has not shipped -- but still a DECISION one box
+# already made, so it must outrank `registered` for exactly the reason a terminal
+# status does. See _gap_status_rank. ()
+_SKILL_GAP_DEFERRED = "deferred-to-goal"
+
+
+def _gap_status_rank(status) -> int:
+    """Merge precedence for a skill-gap status: terminal(2) > deferred(1) > other(0).
+
+    Three tiers, not two, because `deferred-to-goal` sits between them: it is a
+    recorded decision (so `registered` must not overwrite it and re-fire the forge
+    goal) but it is not a resolution (so a terminal status, meaning the fix actually
+    landed, must win over it).
+
+    Rank comparison is commutative, and equal ranks fall through to the existing
+    content tiebreak, so the handler stays a pure function of content (guard-907).
+    """
+    if status in _SKILL_GAP_TERMINAL:
+        return 2
+    return 1 if status == _SKILL_GAP_DEFERRED else 0
+
+
+def _yaml_pair(local: bytes, remote: bytes):
+    """Parse both sides as dicts, or return None when either side is unusable.
+
+    Callers fall back to a CONTENT tiebreak on None, never to a positional
+    (local/remote) choice — a positional fallback is not commutative (guard-907).
+    """
+    try:
+        a = yaml.safe_load(local.decode("utf-8")) or {}
+        b = yaml.safe_load(remote.decode("utf-8")) or {}
+    except Exception:  # noqa: BLE001 -- unparseable side -> content tiebreak
+        return None
+    if not (isinstance(a, dict) and isinstance(b, dict)):
+        return None
+    return a, b
+
+
+def merge_skill_gaps(local: bytes, remote: bytes) -> bytes:
+    """Merge for meta/skill-gaps.yaml (the capability-gap registry).
+
+    Writer read (rb-245) -- meta-yaml.py set_field (dotpath RMW), plus
+    skill-analytics.py / skill-gaps-validate.py / scripts-referenced-gate.py.
+    This is a READ-MODIFY-WRITE index, not an append log, so
+    merge_append_only_jsonl is wrong for it. Shape:
+    ``{last_updated: str, gaps: [ {id, status, times_encountered,
+    encounter_log, first_seen, type, ...} ]}``.
+
+    NOT hypothetical: aspirations-spark/SKILL.md records this file returning
+    write_conflict 5/5 for zeta on 2026-07-26. With no handler a both-diverged
+    412 safe-freezes it PERMANENTLY on the affected box, which takes that box's
+    forge lane dark -- no gap can be registered or incremented, so
+    times_encountered never reaches forge_threshold and no skill is ever forged
+    from a detected gap.
+
+    Per-field rules, each derived from the writer or from the live corpus:
+
+      gaps              union by ``id`` (gap-NNN is the stable natural key).
+      times_encountered MAX -- an INDEPENDENT ACCUMULATOR, deliberately NOT
+                        recomputed from len(encounter_log). Measured over all
+                        64 live gaps: 57 agree, 7 diverge, and in EVERY
+                        divergent case the counter EXCEEDS the log (gap-006
+                        2>1, gap-011 6>4, gap-013 2>1, gap-019 3>2, gap-028
+                        7>6, +2); zero run the other way. That one-directional
+                        skew is the fingerprint of a counter that increments
+                        reliably while the log append intermittently fails --
+                        so the counter is the more complete record. Recomputing
+                        (the guard-1153 reflex, tempting at 89% agreement)
+                        would silently DECREMENT those 7 and push each further
+                        from forge_threshold.
+      encounter_log     content-union (append-mostly evidence list).
+      first_seen        EARLIEST wins. This is a first-observation, so the
+                        accumulator rule INVERTS here; taking MAX would
+                        silently rewrite history forward.
+      status            THREE-tier precedence (_gap_status_rank), not two:
+                        terminal > ``deferred-to-goal`` > everything else.
+                        A terminal status (forged / dismissed /
+                        satisfied-by-extension) is a decision one box already
+                        made and the other has not seen yet; letting
+                        ``registered`` win would re-open a closed gap and
+                        re-fire the forge goal forever, which is the documented
+                        duplication-gate dead end. ``deferred-to-goal``
+                        (g-115-4457) is NOT terminal -- the resolution is
+                        decided and tracked by an open goal but has not shipped
+                        -- yet it is still a decision, so it takes the same
+                        protection from ``registered`` while LOSING to a
+                        terminal status. Note this handler is a THIRD reader of
+                        gap status: both aspirations-evolve Step 9 and
+                        aspirations-spark Phase 6.5 assert they are "the only
+                        readers of gap status", and they are wrong. Any new
+                        status must be added HERE as well, or a cross-box merge
+                        silently reverts it.
+      other fields      canonical-content tiebreak (pure function of content).
+    """
+    parsed = _yaml_pair(local, remote)
+    if parsed is None:
+        return local if local >= remote else remote
+    a, b = parsed
+
+    out = dict(a) if _canon(a) >= _canon(b) else dict(b)
+
+    def _merge_gap(x: dict, y: dict) -> dict:
+        g = dict(y) if _canon(x) >= _canon(y) else dict(x)
+        g.update({k: v for k, v in (x if _canon(x) >= _canon(y) else y).items()})
+        # accumulator: MAX (see docstring -- NOT recomputed from the log)
+        tx, ty = x.get("times_encountered"), y.get("times_encountered")
+        if isinstance(tx, int) or isinstance(ty, int):
+            g["times_encountered"] = max(
+                tx if isinstance(tx, int) else 0,
+                ty if isinstance(ty, int) else 0,
+            )
+        # evidence list: content-union
+        if "encounter_log" in x or "encounter_log" in y:
+            g["encounter_log"] = _union_dict_list(
+                x.get("encounter_log") or [], y.get("encounter_log") or [])
+        # first observation: EARLIEST wins (inverts the accumulator rule)
+        fx, fy = x.get("first_seen"), y.get("first_seen")
+        if fx and fy:
+            g["first_seen"] = min(str(fx), str(fy))
+        elif fx or fy:
+            g["first_seen"] = fx or fy
+        # decision: TERMINAL > deferred-to-goal > everything else (_gap_status_rank).
+        # Equal ranks fall through to the whole-record content tiebreak, exactly as
+        # before -- this preserves every prior outcome and only ADDS the middle tier.
+        sx, sy = x.get("status"), y.get("status")
+        rx, ry = _gap_status_rank(sx), _gap_status_rank(sy)
+        if rx != ry:
+            g["status"] = sx if rx > ry else sy
+        elif rx >= 2 and sx != sy:
+            g["status"] = sx if _canon(sx) >= _canon(sy) else sy
+        return g
+
+    if "gaps" in a or "gaps" in b:
+        keyed: Dict[object, dict] = {}
+        loose: list = []
+        for row in list(a.get("gaps") or []) + list(b.get("gaps") or []):
+            if isinstance(row, dict) and row.get("id") is not None:
+                k = _canon(row["id"])
+                keyed[k] = _merge_gap(keyed[k], row) if k in keyed else row
+            else:
+                loose.append(row)
+        merged = [keyed[k] for k in sorted(keyed)]
+        merged += _union_dict_list(loose, [])
+        out["gaps"] = merged
+
+    lu = [str(x) for x in (a.get("last_updated"), b.get("last_updated")) if x]
+    if lu:
+        out["last_updated"] = max(lu)
+
+    return yaml.dump(_canonicalize_for_merge(out),
+                     default_flow_style=False, sort_keys=False).encode("utf-8")
+
+
+def merge_step_attribution(local: bytes, remote: bytes) -> bytes:
+    """Merge for meta/step-attribution.yaml (reflection step attribution).
+
+    Writer read (rb-245) -- init-meta.sh seeds it; the live writer is
+    .claude/skills/reflect-on-outcome/SKILL.md via meta-set. Confirmed
+    cross-agent (the live execution_feedback list carries a foxtrot-authored
+    entry), so it can genuinely both-diverge. Shape: ``{last_updated,
+    total_reflections: int, steps: {}, execution_feedback: [ {goal_id, date,
+    agent, clarity, scope_accuracy, verification_quality, note} ]}``.
+
+    Per-field rules:
+
+      execution_feedback  CONTENT-union, deliberately NOT keyed on ``goal_id``.
+                          The record identity is (goal_id, agent) -- two agents
+                          legitimately file feedback on the SAME goal -- and
+                          the shared list-union helper dedups on the FIRST
+                          present key field rather than a composite, so a
+                          ``goal_id`` key would silently drop one agent's
+                          record. Content-keying keeps both and still dedups
+                          byte-identical rows. Known trade-off: a record EDITED
+                          on one side survives as two rows rather than one.
+                          That is the safe direction for an append-mostly
+                          evidence log -- a visible duplicate beats a silent
+                          loss -- and it is why this is not keyed.
+      total_reflections   RECOMPUTED from the merged list, never carried and
+                          never summed (guard-1153). Both sides forked from a
+                          shared baseline, so summing double-counts it -- the
+                          same no-common-ancestor trap as g-115-3978, where the
+                          two-way (local, remote) signature means a handler
+                          cannot see what each side inherited. Contrast
+                          skill-gaps' times_encountered, which is MAX because
+                          it was MEASURED to be an independent accumulator
+                          rather than derived; the rule is not "always
+                          recompute" but "recompute what is derived".
+      steps               per-key merge, canonical-content tiebreak.
+      last_updated        latest wins.
+    """
+    parsed = _yaml_pair(local, remote)
+    if parsed is None:
+        return local if local >= remote else remote
+    a, b = parsed
+
+    out = dict(a) if _canon(a) >= _canon(b) else dict(b)
+
+    if "execution_feedback" in a or "execution_feedback" in b:
+        merged_fb = _union_dict_list(a.get("execution_feedback") or [],
+                                     b.get("execution_feedback") or [])
+        out["execution_feedback"] = merged_fb
+        # derived -> recompute from the merged evidence, never carry/sum
+        if "total_reflections" in a or "total_reflections" in b:
+            out["total_reflections"] = len(merged_fb)
+
+    if "steps" in a or "steps" in b:
+        sa = a.get("steps") if isinstance(a.get("steps"), dict) else {}
+        sb = b.get("steps") if isinstance(b.get("steps"), dict) else {}
+        steps = dict(sb)
+        for k, v in sa.items():
+            if k in steps and _canon(steps[k]) > _canon(v):
+                continue
+            steps[k] = v
+        out["steps"] = {k: steps[k] for k in sorted(steps, key=_canon)}
+
+    lu = [str(x) for x in (a.get("last_updated"), b.get("last_updated")) if x]
+    if lu:
+        out["last_updated"] = max(lu)
+
+    return yaml.dump(_canonicalize_for_merge(out),
+                     default_flow_style=False, sort_keys=False).encode("utf-8")
+
+
+def merge_audit_baselines(local: bytes, remote: bytes) -> bytes:
+    """Merge for meta/audit-baselines.yaml (the advisory drift ratchets).
+
+    Writer read (rb-245) -- six ratchet writers append here
+    (learning-routing-ratchet.py, experience-orphan-ratchet.py,
+    eviction-conservation-ratchet.py, durability-property-check.py,
+    skillmd-flag-audit.py, health-ledger-append.py). Shape: the TOP-LEVEL keys
+    ARE the baseline names (there is no ``baselines:`` wrapper), each mapping to
+    ``{baseline: int, last_recorded, last_verdict, history: [...], unit?,
+    matcher?}``.
+
+    DIRECTION IS NOT PER-BASELINE, and that is worth stating because the
+    obvious defensive reading (six independent writers -> six possibly-different
+    directions -> read all six) is wrong and expensive. The direction is fixed
+    by the ratchet CONTRACT, which is the single source of truth:
+    ``core/config/conventions/audit-baselines.md`` defines the ``ratcheted``
+    verdict as "current < baseline. Baseline shrinks to current (ONE-WAY)" and
+    names "letting the baseline grow on regression" as the anti-pattern that
+    defeats the ratchet. Every baseline here counts a defect class
+    (orphans, drift, unchecked writes, dangling citations), so every one
+    ratchets DOWN.
+
+      baseline       MIN. This is the whole invariant: a merge that took MAX
+                     would let the worse of two boxes' baselines win and
+                     silently un-ratchet the metric permanently -- the exact
+                     anti-pattern the convention names. MIN is also the
+                     conservative direction: it can only ever tighten.
+      history        content-union (append-only evidence).
+      last_recorded  latest wins.
+      last_verdict   taken from whichever side recorded LAST, so the verdict
+                     stays consistent with the reading that produced it rather
+                     than being re-derived here from a baseline this handler
+                     just changed.
+      unit/matcher   static metadata -> canonical-content tiebreak.
+    """
+    parsed = _yaml_pair(local, remote)
+    if parsed is None:
+        return local if local >= remote else remote
+    a, b = parsed
+
+    out: Dict[str, object] = {}
+    for name in sorted(set(a) | set(b), key=_canon):
+        x, y = a.get(name), b.get(name)
+        if not isinstance(x, dict) or not isinstance(y, dict):
+            # present on one side only, or not a baseline record -> content pick
+            out[name] = x if y is None else (y if x is None else
+                                             (x if _canon(x) >= _canon(y) else y))
+            continue
+        hi = x if _canon(x) >= _canon(y) else y
+        lo = y if hi is x else x
+        rec = dict(lo)
+        rec.update(hi)
+
+        bx, by = x.get("baseline"), y.get("baseline")
+        if isinstance(bx, int) and isinstance(by, int):
+            rec["baseline"] = min(bx, by)          # one-way shrink (never grow)
+        elif isinstance(bx, int) or isinstance(by, int):
+            rec["baseline"] = bx if isinstance(bx, int) else by
+
+        if "history" in x or "history" in y:
+            rec["history"] = _union_dict_list(x.get("history") or [],
+                                              y.get("history") or [])
+
+        rx, ry = str(x.get("last_recorded") or ""), str(y.get("last_recorded") or "")
+        if rx or ry:
+            rec["last_recorded"] = max(rx, ry)
+            later = x if rx >= ry else y
+            if "last_verdict" in later:
+                rec["last_verdict"] = later["last_verdict"]
+        out[name] = rec
+
+    return yaml.dump(_canonicalize_for_merge(out),
+                     default_flow_style=False, sort_keys=False).encode("utf-8")
+
+
+def merge_meta_index(local: bytes, remote: bytes) -> bytes:
+    """Merge for the meta/ imp@k index (``meta.yaml``).
+
+    Writer read (rb-245) -- meta-yaml.py set/append_log. Shape:
+    ``{evaluation_count, sessions_evaluated, total_meta_changes,
+    last_evaluation, overall_imp_k, last_session_imp_k, last_session_review}``.
+
+    NOT dispatched by basename -- see ``merge_handler_for``. ``meta.yaml`` is a
+    generic name and a SECOND one exists in this repo
+    (``core/config/meta.yaml``, the framework config), so a plain _HANDLERS
+    entry would capture the framework config too and apply an imp@k merge to
+    it. The goal that added this handler flagged the hazard in advance; it is
+    real, and confirmed by measurement rather than assumed.
+
+      evaluation_count / sessions_evaluated / total_meta_changes
+                        MAX. Monotonic counters incremented by the writer; each
+                        box may have advanced further than the other, and MAX
+                        keeps the more complete count. NOT summed -- both sides
+                        forked from a shared baseline and summing double-counts
+                        it (the no-common-ancestor trap, g-115-3978).
+      overall_imp_k /   DERIVED metrics, taken WHOLE from whichever side
+      last_session_imp_k / evaluated LAST rather than averaged. Averaging two
+      last_session_review  ratios computed over different denominators produces
+                        a number that describes neither run; carrying the
+                        later-evaluated side keeps the metric consistent with
+                        the evaluation that produced it.
+      last_evaluation   latest wins (and is the key that selects the above).
+    """
+    parsed = _yaml_pair(local, remote)
+    if parsed is None:
+        return local if local >= remote else remote
+    a, b = parsed
+
+    out = dict(a) if _canon(a) >= _canon(b) else dict(b)
+    for f in ("evaluation_count", "sessions_evaluated", "total_meta_changes"):
+        xa, xb = a.get(f), b.get(f)
+        if isinstance(xa, int) or isinstance(xb, int):
+            out[f] = max(xa if isinstance(xa, int) else 0,
+                         xb if isinstance(xb, int) else 0)
+
+    ea, eb = str(a.get("last_evaluation") or ""), str(b.get("last_evaluation") or "")
+    if ea or eb:
+        later = a if ea >= eb else b
+        out["last_evaluation"] = max(ea, eb)
+        for f in ("overall_imp_k", "last_session_imp_k", "last_session_review"):
+            if f in later:
+                out[f] = later[f]
+
+    return yaml.dump(_canonicalize_for_merge(out),
+                     default_flow_style=False, sort_keys=False).encode("utf-8")
 
 
 _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
@@ -3736,6 +4222,27 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     "productivity-snapshots.jsonl": merge_append_only_jsonl,
     "gate-firings.jsonl": merge_append_only_jsonl,
     "trigger-firings.jsonl": merge_append_only_jsonl,
+    # per-agent skill-invocation telemetry ledger (-e). Its SIBLING
+    # store, the per-date health ledger, cannot appear in this basename-keyed
+    # table at all -- see the third path-pattern branch in merge_handler_for.
+    #
+    # Append-only VERIFIED, not assumed (guard-1816: a union handler resurrects
+    # deleted records, so it is a valid cure ONLY where nothing removes them).
+    # Two probes, 2026-08-02: (1) no removal path exists in code -- a grep of
+    # every writer/reader for prune|trim|rotate|truncate|rewrite|filter|evict|
+    # unlink returns nothing; (2) git history over 3900 commits shows removals in
+    # just 6, and each is accounted for: one is the user-directed charlie+delta ->
+    # foxtrot agent merge (a file RENAME, 1204 del / 1204 add), and the rest are
+    # the very last-writer-wins corruption this registration cures -- alpha lost
+    # 595 records (1303 -> 708 lines) inside a commit about sweeping findings
+    # triggers, and a sampled lost record is still absent from origin/main today.
+    # So the deletions are the disease, not a removal path.
+    #
+    # NOTE this correction: guard-912 records "0 historical deletions" for this
+    # store, which was true when measured and is now stale in the literal. Its
+    # CONCLUSION survives -- these are the append-only ones -- but re-probe rather
+    # than inherit the number (guard-2364).
+    "skill-invocations.jsonl": merge_append_only_jsonl,
     # board channels (board.py: "append-only -- never edited or deleted"; the
     # canonical 4 documented in CLAUDE.md -- all share the one append-only writer):
     "coordination.jsonl": merge_append_only_jsonl,
@@ -3847,6 +4354,20 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     # bounded duplicate-ID tolerance (next_meta_change_id takes max, so
     # allocation self-heals), same class as the archive-sink duplicates above.
     "meta-log.jsonl": merge_append_only_jsonl,
+    # meta/complexity-ledger.jsonl (): third member of the meta/*.jsonl
+    # append-only class above, never enrolled — no DEFERRED note and no exclusion
+    # rationale existed for it, so this was an omission rather than a decision.
+    # Writer-verified per the protocol the two siblings used: complexity_budget.py
+    # append_and_delta is the ONLY writer (open(p,"a") — pure append, no rewrite
+    # path), its only caller is scar-tissue-check.py, and no deleter exists
+    # fleet-wide. Every row is an immutable {timestamp, metrics} snapshot, so the
+    # exclusion rationale that keeps other stores off this handler (a base-less
+    # union RESURRECTS deleted records) cannot apply — nothing ever deletes.
+    # Found via a 270-sweep both-diverged freeze on one box: 14 rows per side, 7
+    # shared and 7 unique to EACH, so neither side was a superset and no
+    # direction-pick could avoid dropping 7 real rows. The freeze was correct
+    # behaviour protecting them; the union (21 rows) is the lossless reconcile.
+    "complexity-ledger.jsonl": merge_append_only_jsonl,
     # world/auto-fix-evidence-sweep-metrics.jsonl (): writer RETIRED
     # (zero code references fleet-wide; last record 2026-06-23) — immutable
     # historical run_summary log, so line-union reconciles the residual
@@ -3873,6 +4394,13 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     # (58 commits) and then the Windows clone hours later. Its two halves need
     # OPPOSITE treatment (append-union vs writer-style rebuild); see docstring.
     "backpressure.yaml": merge_backpressure,
+    # meta RMW indexes (). RMW, not append logs -> each needs a
+    # field-level merge; merge_append_only_jsonl would be wrong for both.
+    # skill-gaps.yaml is the measured wedge (write_conflict 5/5 for zeta,
+    # 2026-07-26, which takes that box's forge lane dark).
+    "skill-gaps.yaml": merge_skill_gaps,
+    "step-attribution.yaml": merge_step_attribution,
+    "audit-baselines.yaml": merge_audit_baselines,
     # : two synced append-only logs, each writer-read (rb-245).
     #   alert-sweep-seen.jsonl -> world/scripts/alert-sweep.sh appends the seen-row
     #     inside its mkdir-lock ("read-classify-file-append is all under the lock");
@@ -3964,6 +4492,41 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     #   knowledge-graph.jsonl  -> knowledge-graph-build.py REBUILDS the triple
     #                             store via locked_write_jsonl. A rebuild is a
     #                             rewrite; line-union would resurrect stale edges.
+    #   agents/<name>/journal.jsonl -> REFUSED with evidence (-d, zeta,
+    #     2026-08-02, cc-02 / Linux 6.8.0-136-generic). BOTH handler shapes fail,
+    #     for DIFFERENT reasons -- so "use a keyed union instead" does not rescue
+    #     it. Do not re-litigate without re-measuring these four legs.
+    #     (1) A REMOVAL PATH EXISTS (the guard-1816 grep, positive). jsonl_hygiene.py
+    #         names `agents/<a>/journal.jsonl` VERBATIM in its own usage docstring,
+    #         and both modes drop from the LIVE file: `cap` drops oldest-beyond-bound,
+    #         `rotate` is archive-first then locked_modify_jsonl(path, _drop_compacted).
+    #         Line-union over a store with a live drop path resurrects dropped
+    #         records -- the shape guard-1072 forbids.
+    #     (2) RECORDS ARE MUTATED IN PLACE, measured, not inferred. Every one of the
+    #         last 8 commits to agents/zeta/journal.jsonl is a `@@ -1 +1 @@` single-line
+    #         REPLACE, and the delta is `goals_completed` growing by exactly one entry
+    #         (added=1 removed=0) per goal close. So a LINE-union cannot reconcile two
+    #         boxes' versions of one record -- it keeps BOTH, yielding two records for
+    #         one key, each missing the other's goals. That is corruption, and it is a
+    #         DIFFERENT failure from (1)'s resurrection.
+    #     (3) A KEYED union (the merge_forged_skills shape) fixes (2) and NOT (1):
+    #         handlers are TWO-WAY with no base, so it cannot tell "A rotated old
+    #         records out" from "B has records A lacks". Same reason as the
+    #         knowledge-tree-node entry's clause (2) below.
+    #     (4) SAFE-FREEZE IS WORKING, so there is no live loss to fix. The real key is
+    #         COMPOSITE -- (journal_file, session), NOT journal_file alone; keying on
+    #         the filename alone reports 93-98% of lines as duplicates, which is a
+    #         guard-2363 artifact (sessions 1/2/3 of one day are legitimately distinct
+    #         records). On the composite key duplicates are RARE -- zeta 2 keys/250,
+    #         alpha 1/387, bravo 1/408, echo 2/242, foxtrot 1/364 -- and every dup
+    #         group is a strict SUBSET CHAIN (2 nested, 0 conflicting), so no goal id
+    #         has been lost. Registering a union would ADD the corruption that
+    #         freezing has so far avoided.
+    #     NOTED, NOT FIXED HERE (separate concern, routed to the store-hygiene lane):
+    #     one index record carries a `goals_completed` array of 1331 entries / 18537
+    #     bytes -- 6.3% of the 295KB file in a single line -- and grows unbounded, one
+    #     entry per close forever. A LINE-bounding sweep cannot see an array growing
+    #     INSIDE a record.
     # DEFERRED (writer not yet confirmed strictly append-only -- left unregistered
     # = safe-freeze, the conservative default; needs per-writer read before adding):
     #   scoring-criterion-audit.jsonl, and the
@@ -3977,6 +4540,32 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     #   hand-edited markdown with NO code writer; prose has no commutative
     #   merge unit, so it stays safe-freeze + hand-union on conflict (the
     #   2026-07-18 repair pushed LOCAL, which carried the  correction).
+    #   knowledge-tree node BODIES (world/knowledge/tree/**/*.md) -> same shape.
+    #   RE-CONFIRMED  (2026-08-01, bravo); the decision itself already
+    #   existed at .gitattributes:123 ("DELIBERATELY NOT ROUTED: *.md
+    #   knowledge-tree nodes -- prose: a visible conflict marker is readable and
+    #   hand-resolvable, and there is no record structure to union"). Do NOT
+    #   register one. Measured reasons:
+    #     (1) this registry is BASENAME-keyed. Tree nodes have ~1140 arbitrary
+    #         basenames, so covering them needs a path-pattern branch like the
+    #         team-state-shard case below -- not an _HANDLERS entry.
+    #     (2) handlers are TWO-WAY -- merge_tree(local, remote), NO base. Without
+    #         a common ancestor a union cannot tell "A appended" from "B deleted",
+    #         so it resurrects deleted prose. Same reason dead-ends.jsonl and
+    #         knowledge-graph.jsonl sit in this block.
+    #     (3) it would change ONLY the own-cloud sync path, and strictly for the
+    #         worse (safe-freeze -> base-less union). It cannot help the git path:
+    #         *.md is not routed to the ayoai-ledger driver at all, so git's
+    #         DEFAULT 3-way merge handles bodies -- disjoint hunks merge, adjacent
+    #         edits leave readable conflict markers. (Measured: even if it WERE
+    #         routed, _wellformed() has no .md validator and returns False, so
+    #         _validated_text_merge would refuse every body merge including a
+    #         clean rc=0 one.)
+    #   The "silent loss" this was filed against does not occur on either path:
+    #   unregistered files take the fenced PUT and freeze on conflict
+    #   (owncloud_backend.py ~L1083), and a persistent both-diverged file is
+    #   surfaced loudly by the Gap-C sweeper as CONFLICT-PERSISTENT
+    #   (owncloud_sync.py ~L1056).
     # field-level YAML/JSON reconcile (records MUTATED IN PLACE -> per-field
     # reconcile; verified per-store by reading each writer, rb-245 / ):
     "module-health.yaml": merge_module_health,
@@ -4001,9 +4590,21 @@ def merge_handler_for(path) -> Optional[Callable[[bytes, bytes], bytes]]:
     store is not merge-registered (the backend then keeps its safe-freeze
     behavior for that path).
 
-    Dispatch is by basename EXCEPT for per-agent team-state shards
-    (``.../team-state/agents/<name>.yaml``), whose basenames are dynamic
-    (alpha.yaml/bravo.yaml/...) and so cannot be enumerated in _HANDLERS. Those
+    Dispatch is by basename EXCEPT for THREE path-pattern branches that run
+    BEFORE the _HANDLERS lookup, so a basename grep alone is NOT a complete
+    classifier (see each branch's own comment below for why it exists):
+      1. per-agent team-state shards  ``.../team-state/agents/<name>.yaml``
+      2. per-agent daily health ledger ``.../health/<YYYY-MM-DD>.jsonl``
+      3. ``core/config/**`` EXCLUSION -- a registered basename that also names
+         an immutable framework config is deliberately NOT merged.
+    Branches 1 and 2 register stores whose basenames are DYNAMIC and therefore
+    unenumerable; branch 3 un-registers a path whose basename is AMBIGUOUS. So
+    the answer to "is this store merge-protected?" can be YES with no basename
+    entry (1, 2) and NO despite one (3) -- always resolve through this function,
+    never through a grep of the dict.
+
+    Shard detail: basenames are dynamic (alpha.yaml/bravo.yaml/...) and so cannot
+    be enumerated in _HANDLERS. Those
     match by PATH PATTERN (parent dir ``agents`` under ``team-state``) so new
     agents are covered automatically without touching this registry. Without
     the branch, shard basenames returned None and the backend froze peer shards
@@ -4014,4 +4615,54 @@ def merge_handler_for(path) -> Optional[Callable[[bytes, bytes], bytes]]:
     if (len(parts) >= 3 and parts[-3] == "team-state"
             and parts[-2] == "agents" and parts[-1].endswith(".yaml")):
         return merge_team_state_shard
+    # THIRD path-pattern case (-e), for the SAME reason as the shard
+    # branch above: the per-agent health ledger is DAILY-ROTATED
+    # (agents/<name>/health/<YYYY-MM-DD>.jsonl), so its basenames are dates and a
+    # basename-keyed _HANDLERS entry could only ever cover the days someone
+    # thought to enumerate. Matching by parent dir covers every past and future
+    # day automatically, exactly as the shard branch covers every future agent.
+    #
+    # Its sibling store skill-invocations.jsonl has a STATIC basename and so is a
+    # normal _HANDLERS entry -- the two halves of this goal land in two different
+    # places for that reason alone, not by oversight.
+    #
+    # Same append-only handler and same evidence as that entry: no removal path
+    # in code, and 0 byte-identical duplicate lines across all 8045 live records
+    # on this box, so the line-union cannot collapse a distinct event.
+    if (len(parts) >= 2 and parts[-2] == "health"
+            and parts[-1].endswith(".jsonl")):
+        return merge_append_only_jsonl
+    # Second PATH-PATTERN case (), for the opposite reason to the
+    # shard branch above: that one exists because the basenames are DYNAMIC,
+    # this one because a basename can be AMBIGUOUS. A name registered in
+    # _HANDLERS may ALSO name an immutable framework config under core/config/,
+    # and the two files share NO schema -- core/config/skill-gaps.yaml is the
+    # forge_threshold/gap_types DEFINITION, while the synced meta one is
+    # {last_updated, gaps[]}. Applying a state-file handler to a config is a
+    # schema mismatch, not a merge.
+    #
+    # Measured 2026-08-01 by walking every registered basename against disk:
+    # 3 of 83 collide -- meta.yaml, skill-gaps.yaml, skill-relations.yaml.
+    # The guard is CENTRAL (above the _HANDLERS lookup) rather than per-basename
+    # because the original form covered meta.yaml ALONE, which left the other
+    # two exposed; a per-basename guard must be remembered once per future
+    # collision, and a guard you have to remember is the failure mode that
+    # hides. Registering by basename is what makes this possible at all, so the
+    # exclusion belongs where every basename passes through.
+    #
+    # NEGATIVE (exclude the config) rather than positive (require parent ==
+    # "meta"), because META_PATH is user-configurable and may be named anything
+    # (CLAUDE.md external paths); a positive test would silently return None for
+    # every custom-named meta root.
+    #
+    # Scoped to core/config, NOT to any dir named "config": WORLD_PATH carries
+    # its own config/ overlay dir (8 files, none currently a registered
+    # basename), and a bare parts[-2] == "config" test would silently start
+    # returning None for any overlay that later takes a registered name. The
+    # len(parts) < 3 arm keeps a bare relative "config/<name>.yaml" excluded,
+    # preserving the prior meta.yaml behavior for that shape.
+    if parts[-2:-1] == ["config"] and (len(parts) < 3 or parts[-3] == "core"):
+        return None
+    if parts[-1] == "meta.yaml":
+        return merge_meta_index
     return _HANDLERS.get(os.path.basename(str(path)))

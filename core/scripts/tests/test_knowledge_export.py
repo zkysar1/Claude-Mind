@@ -32,6 +32,17 @@ def _load_mod():
 
 M = _load_mod()
 
+CONFORMANCE_PY = SCRIPT_DIR.parent / "okf-bundle-conformance.py"
+
+
+def _load_conformance_mod():
+    """The shared OKF shape checker — same hyphenated-filename dance as _load_mod."""
+    spec = importlib.util.spec_from_file_location("okf_conformance_under_test", CONFORMANCE_PY)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
 
 # ── fixture builder ──────────────────────────────────────────────────────────
 
@@ -412,6 +423,82 @@ def test_okf_index_carries_generated_at(tmp_path: Path) -> None:
     datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%S")
     # Also human-visible in the body, not only in machine frontmatter.
     assert f"- Generated: {stamp} UTC" in index
+
+
+# ── Writer field-fidelity () ───────────────────────────────────────
+
+
+def test_okf_node_frontmatter_carries_summary(tmp_path: Path) -> None:
+    """`summary` must reach frontmatter even when the node HAS a body.
+
+    This was the one projected field write_okf_bundle actually lost: `body` and
+    `summary` were both consumed by a single `body or summary` fallback, so a node
+    with a body rendered the body and dropped the summary entirely — leaving a
+    consumer no short description to preview by without parsing the article.
+    """
+    world = _build_world(tmp_path, write_bodies=True)
+    bundle = M.build_bundle(world, tmp_path, env={})
+    out = tmp_path / "okf"
+    M.write_okf_bundle(bundle, out)
+    text = next((out / "nodes").glob("*.md")).read_text(encoding="utf-8")
+    fm = _fm(text)
+    assert fm["summary"], "summary must survive into frontmatter, not only as a body fallback"
+    # It stays REDACTED — frontmatter is not a bypass around the projection.
+    assert "alpha" not in str(fm["summary"]).lower()
+    assert "/home/ec2" not in str(fm["summary"])
+    # And the body is still the full article, not the summary (prior behaviour intact).
+    assert "host a quarter of marine" in text
+
+
+def test_okf_writer_loses_no_projected_field(tmp_path: Path) -> None:
+    """Every field project() emits must land in frontmatter or in the body.
+
+    The guard against re-introducing a silent drop at the export boundary. It
+    asserts the WRITER is lossless with respect to what it is GIVEN — which is a
+    different claim from "the bundle carries every store field". project() is an
+    allowlist by design (it is the redaction/suppression boundary for a
+    user-facing wiki); this test must never be read as licence to widen it.
+    """
+    world = _build_world(tmp_path, write_bodies=True)
+    bundle = M.build_bundle(world, tmp_path, env={})
+    out = tmp_path / "okf"
+    M.write_okf_bundle(bundle, out)
+
+    for records, folder in (
+        (bundle.tree, "nodes"), (bundle.hypotheses, "hypotheses"),
+        (bundle.guardrails, "guardrails"), (bundle.lessons, "lessons"),
+    ):
+        if not records:
+            continue
+        text = next((out / folder).glob("*.md")).read_text(encoding="utf-8")
+        fm = _fm(text)
+        for key, value in records[0].items():
+            rendered = " ".join(map(str, value)) if isinstance(value, list) else str(value)
+            if not rendered:
+                continue  # an empty optional field has nothing to lose
+            assert key in fm or rendered in text, (
+                f"{folder}: projected field `{key}` reaches neither frontmatter nor body"
+            )
+
+
+def test_okf_bundle_conforms_to_shape_contract(tmp_path: Path) -> None:
+    """This producer's own output must pass the shared conformance checker.
+
+    Half of the two-producer drift guard (g-115-3266): the checker is
+    producer-agnostic so the sibling wiki daemon's bundles run through the same
+    invariants. Deliberately checks the SHAPE contract only — the convention is
+    explicit that field names are the producer's choice, so field-set parity
+    between producers is NOT asserted here or anywhere.
+    """
+    obc = _load_conformance_mod()
+    world = _build_world(tmp_path, write_bodies=True)
+    bundle = M.build_bundle(world, tmp_path, env={})
+    out = tmp_path / "okf"
+    M.write_okf_bundle(bundle, out)
+
+    report = obc.check_bundle(out)
+    assert report["documents"] > 0, "empty bundle proves nothing (rb-245)"
+    assert report["conforms"], f"own bundle violates the shape contract: {report['violations']}"
 
 
 if __name__ == "__main__":  # pragma: no cover

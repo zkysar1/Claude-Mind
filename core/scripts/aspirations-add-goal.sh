@@ -24,6 +24,16 @@ PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
 # --- Help (must precede main parse so it works even with no args) ---------
+# Scans ALL of "$@", not just $1 ( fresh-eyes F-001). The $1-only form
+# was harmless while an unrecognised flag was silently swallowed: `--source world
+# --help` simply fell through and printed nothing. Once the `-*)` arm began
+# REFUSING, that same call started exiting 2 — the refusal turned a latent
+# asymmetry into a live regression, in the one wrapper of the four whose help
+# lives here rather than in an `-h|--help)` case arm. The new test only exercised
+# --help at position 1, so the suite was green over it.
+for _a in "$@"; do
+    case "$_a" in -h|--help) set -- "--help"; break;; esac
+done
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     cat <<'USAGE'
 Usage: aspirations-add-goal.sh [options] <asp_id>
@@ -68,6 +78,11 @@ For full goal schema see core/config/conventions/aspirations.md.
 USAGE
     exit 0
 fi
+
+# Shared unknown-flag refusal (). Sourced BEFORE _runtime.sh so the
+# refusal is cheap and cannot be masked by a daemon failure.
+# shellcheck disable=SC1091
+source "$CORE_ROOT/scripts/_argv_strict.sh"
 
 # --- Parse args -----------------------------------------------------------
 SOURCE_VAL="world"
@@ -128,11 +143,15 @@ while [[ $# -gt 0 ]]; do
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
         -*)
-            # Unknown flag — passthrough to daemon. The 2026-05-14 cutover
-            # removed the Python CLI fallback, so unknown flags now just hit
-            # the daemon (which rejects unknown query/header params silently).
-            # If you suspect a typo, run --help.
-            PASSTHROUGH+=("$1"); shift;;
+            # REFUSE (). The prior comment here was ACCURATE about the
+            # mechanism — the 2026-05-14 cutover removed the Python CLI fallback, so
+            # an unknown flag "just hit the daemon (which rejects unknown query/header
+            # params silently)" — and that is precisely the defect. A silent reject is
+            # indistinguishable from acceptance at the call site, and PASSTHROUGH has no
+            # reader in this script, so the flag never reached the daemon either. Correct
+            # diagnosis, wrong conclusion: describing a silent drop is a reason to refuse,
+            # not a reason to keep passing it through.
+            argv_strict_refuse_unknown "$(basename "$0")" "$1" "--help --aspiration --source --override-signal --override-duplication --override-no-investigate --override-offload --override-all";;
         *)
             # Positional asp_id (first non-flag wins)
             [ -z "$ASP_ID" ] && ASP_ID="$1"

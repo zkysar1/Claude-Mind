@@ -957,9 +957,22 @@ rt_call() {
 # See .claude/rules/no-python-cli-fallback.md.
 #
 # Verify-before-report (2026-05-20): rt_curl returns rc=3 on EITHER a true
-# connection failure OR a request that exceeded RT_CURL_TIMEOUT. The wrapper's
-# rt_try_autospawn then fails because the daemon's port is still bound (so a
-# new spawn cannot bind). Without verification, BOTH paths surface the same
+# connection failure OR a request that exceeded RT_CURL_TIMEOUT.
+#
+# CORRECTED 2026-08-02 (, measured on cc-03). This comment used to
+# claim "the wrapper's rt_try_autospawn then fails because the daemon's port is
+# still bound (so a new spawn cannot bind)". That is FALSE and was load-bearing
+# misinformation: mind-api-start.sh has an explicit idempotent fast-path (its
+# header line 10, and the L396 "daemon already running (fast-path...)" exit 0)
+# that returns success WITHOUT attempting a bind. So against a healthy-but-slow
+# daemon rt_try_autospawn SUCCEEDS, and any wrapper that retries on rc=3 issues
+# the same slow request a SECOND time. Measured: RT_CURL_TIMEOUT=5 cost 20.2s
+# wall (4x the ceiling), not 5s. A reader trusting the old comment would budget
+# 1x the ceiling for a timeout when the real cost is ~2x — which is exactly how
+# owncloud-pull.sh's ~190s silent window survived review on three boxes.
+# Wrappers must probe rt_is_up before treating rc=3 as "absent" (guard-597).
+#
+# Without verification, BOTH paths surface the same
 # "daemon is unreachable" message — even though in the timeout case the
 # daemon is healthy and the original request was just slow (OneDrive
 # write-lock contention is the canonical cause). This probe fixes the

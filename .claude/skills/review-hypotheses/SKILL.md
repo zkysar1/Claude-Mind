@@ -727,6 +727,24 @@ Processes resolved hypotheses that have NOT yet been reflected on. This is the l
 Bash: pipeline-read.sh --unreflected
 Sort by surprise descending (learn from surprises first)
 If no unreflected records: return { hypotheses_learned: 0 } and exit
+
+# MICRO-HORIZON RECORDS DO NOT GO TO Step 2 (g-335-664, 2026-08-01).
+# Mode 1 Step 1 filters horizon == "micro" defensively; this Mode did not, and
+# the asymmetry is a PERMANENT flag loop: `--unreflected` is (stage == resolved
+# AND NOT reflected) with no horizon term, so a micro record that reached the
+# pipeline is returned here every time, while Step 2's designated path
+# (/reflect --on-hypothesis -> reflect-on-outcome Step 0.5) opens with
+# `IF horizon == "micro": ERROR ... Abort.` The learning gate then reports
+# "N unreflected hypotheses" every iteration forever, and an agent following
+# this Mode literally hits an abort with nowhere to go.
+# Rare but real: measured 3 of 858 pipeline records (1 resolved, 2 archived),
+# 1 of which reached the trap. Do NOT build machinery for it.
+FOR EACH record WHERE horizon == "micro":
+    Reflect it via Step 2.5's direct path (write `lesson`, then
+    `pipeline-update-field.sh <id> reflected true` + `reflected_by <agent>`),
+    NOT via /reflect --on-hypothesis. Batch micro reflection (--batch-micro)
+    reads working memory, so it cannot reach a record already in the pipeline.
+    Exclude it from the Step 2 loop.
 ```
 
 ### Step 2: Reflect on Each Hypothesis

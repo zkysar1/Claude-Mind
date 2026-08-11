@@ -189,7 +189,12 @@ def main():
     # Report rather than reject: unknown keys are not necessarily wrong (a
     # caller may pass provenance the schema does not persist), but they must
     # never be SILENT. rb-538 / guard-527.
-    dropped_keys = sorted(k for k in payload if k not in handoff)
+    # str(k), not k: a non-string top-level payload key makes `sorted()` raise
+    # on mixed types and `", ".join()` raise on ints, so the reporting path
+    # would abort the very write it exists to annotate. Found by fresh-eyes on
+    # a COPY of this line () and fixed here in the same sweep rather
+    # than leaving the reference broken behind its corrected copies (guard-3088).
+    dropped_keys = sorted(str(k) for k in payload if k not in handoff)
     if dropped_keys:
         print(
             "WARN: handoff-yaml-build dropped %d unrecognized top-level "

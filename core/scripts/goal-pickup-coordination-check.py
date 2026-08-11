@@ -118,6 +118,11 @@ JSON output:
     "board_stale_claims": [            # claims live partner state contradicts;
       {..., "stale_reason": str}       # carries WHY ()
     ],
+    "board_namespace_private": bool,   # true => board lane NOT consulted: this is a
+                                       # per-agent record no partner can contend, so
+                                       # an empty board_partner_activity above means
+                                       # "not applicable", not "checked, clean"
+                                       # ()
     "product_surfaces": [str, ...],    # product surfaces the goal prose names ()
     "product_repos_scanned": [str, ...],
     "product_branch_hits": [{"repo", "branch"}],
@@ -422,8 +427,23 @@ def _released_ids(mtype, text, tags):
     return ids
 
 
+def is_private_agent_queue(source, cross_agent_owner=None):
+    """Pure. True when this goal-id names a PER-AGENT record that no partner can
+    contend, so a partner's board post naming the same id is about a DIFFERENT
+    record (g-115-5570).
+
+    Deliberately NOT `source == "agent"` alone. A cross-agent goal (selector
+    source='cross-agent:<owner>') also resolves against an agent queue, but names
+    ONE shared record that genuinely CAN be contended — blanket-exempting
+    source=agent would silently drop the only real race this lane must still
+    catch. World goals are never private: one id, one record, existing semantics
+    unchanged.
+    """
+    return source == "agent" and not cross_agent_owner
+
+
 def classify_board_mentions(goal_id, me, messages, goal_recurring=False,
-                            goal_last_achieved=None):
+                            goal_last_achieved=None, agent_queue_private=False):
     """Pure. Partner-authored board posts that STRUCTURALLY claim or complete
     this goal-id — the cross-box signal that survives store partitions
     (g-001-311: on 2026-07-09 alpha's aspirations-claim write never propagated
@@ -465,6 +485,27 @@ def classify_board_mentions(goal_id, me, messages, goal_recurring=False,
     (a prior same-agent session's stranded claim is the stranded-claim sweep's
     job, not a partner race). Returns [{id, author, timestamp, kind, text}].
 
+    agent_queue_private=True SHORT-CIRCUITS to [] (g-115-5570). Agent-queue goal
+    ids are NOT globally unique: `agents/<name>/aspirations.jsonl` is per-agent,
+    so every agent carries its own g-001-01 with its own interval and its own
+    lastAchievedAt. A partner's claim on that id names THAT PARTNER'S record and
+    is structurally incapable of contending this one, so no partner post about it
+    is evidence about this record — the honest hit count is zero, not "zero after
+    filtering by kind". The caller decides privateness (see is_private_agent_queue);
+    a CROSS-AGENT goal names one shared record that CAN be contended and is NOT
+    private, which is why this is a caller-declared flag rather than
+    `source == "agent"`.
+
+    Why the pre-existing stale-prior-cycle drop below could not catch this: it
+    compares the partner's claim against the lastAchievedAt of whichever record
+    THE PROBER holds. For a world goal there is one record and that is sound; for
+    an agent-queue id there are N records with N different lastAchievedAt values,
+    so the comparison is against the wrong record by construction. Measured
+    2026-08-09 (bravo, cc-05): echo's claim at 20:24:26 was older than echo's own
+    lastAchievedAt (20:35:29) and would have been dropped, but was NEWER than the
+    prober's (2026-08-02) and so was kept — a false hard-yield with every other
+    evidence lane empty.
+
     me is REQUIRED to be non-empty: with me falsy the self/partner distinction
     is impossible (every author passes `author != me`), so the agent's OWN
     claim post would flag as a partner claim on an autocompact re-claim probe
@@ -474,6 +515,8 @@ def classify_board_mentions(goal_id, me, messages, goal_recurring=False,
     """
     if not me:
         return []
+    if agent_queue_private:
+        return []  # per-agent record — no partner post can name it ()
     hits = []
     for m in messages or []:
         if not isinstance(m, dict):
@@ -669,11 +712,16 @@ _GENERIC_SURFACE_TOKENS = frozenset({
 })
 
 
-def detect_product_surfaces(surface_text, repo_names, write_path_entries=()):
+def detect_product_surfaces(surface_text, repo_names, write_path_entries=(),
+                            domain_repos=None):
     """Pure. Which product surfaces (if any) does the goal prose name?
-    Three match forms, all case-insensitive at token boundaries:
+    Four match forms, all case-insensitive at token boundaries:
       - a FULL repo name (compound names are specific enough to match
         anywhere in prose);
+      - a SERVED DOMAIN of a repo (domain_repos: {domain -> {repo names}},
+        from extract_domain_repos). Goal prose about a web surface routinely
+        names the DOMAIN and never the repo — measured g-335-921, whose prose
+        says two domains and neither web-app repo name;
       - a DISTINCTIVE single token of a repo name (camelCase + separator
         split; len>=5, not a stopword/generic term, and appearing in fewer
         than max(3, 12.5%) of the repo names — so goal prose that says just
@@ -686,11 +734,25 @@ def detect_product_surfaces(surface_text, repo_names, write_path_entries=()):
       - a literal AGENT_WRITE_PATH entry path appearing in the prose.
     Returns (labels, matched_repos): labels are human-readable surface names
     for the JSON verdict; matched_repos is an ORDERED, deduped list —
-    full-name matches FIRST, then token-family matches — because the caller
-    spends its bounded network budget (fetch + PR search) on the first <=3,
-    and a full-name match is the strongest statement of WHICH repo the goal
-    means. An entry-path match adds a label only — it triggers the scan
-    without singling out one repo for network work."""
+    full-name matches FIRST, then domain matches, then token-family matches —
+    because the caller spends its bounded network budget (fetch + PR search)
+    on the first <=3, and a full-name match is the strongest statement of
+    WHICH repo the goal means. A domain ranks second because it names one
+    deployed surface, so it is nearly as specific; the token family ranks
+    last because it selects a whole family. An entry-path match adds a label
+    only — it triggers the scan without singling out one repo for network
+    work.
+
+    ORDER IS THE WHOLE FIX for the g-335-921 miss, and the reason this is NOT
+    a threshold retune: the brand token had ALREADY leaked (13 owners against
+    a 14 threshold — the identical off-by-one the 12.5% retune above was
+    written to close, re-opened because the caller unions ~104 convention
+    names into the denominator and lifts it back to 14). The deliverable repo
+    WAS in matched, at index 7, and [:3] truncated it away. Suppressing the
+    leak alone would have made that case WORSE — it would have dropped the
+    deliverable repo out of `matched` entirely instead of merely demoting it.
+    A domain hit promotes the right repos past the leak without touching the
+    threshold, so a leaked family costs ranking rather than correctness."""
     if not surface_text:
         return set(), []
     low = surface_text.lower()
@@ -704,6 +766,24 @@ def detect_product_surfaces(surface_text, repo_names, write_path_entries=()):
         if name not in matched:
             matched.append(name)
 
+    def _domain_bounded(dom):
+        """`_bounded` is WRONG for a domain and the difference is not cosmetic.
+        Its boundary class is [a-z0-9], which excludes letters but NOT '-' or
+        '.', so 'brandx.com' matches inside BOTH 'evil-brandx.com' and
+        'brandx.com.attacker.net' — different registrable domains that would
+        each take one of the three network slots, which is the very failure
+        this whole pass exists to fix. Measured on my own first draft.
+        LEFT  (?<![a-z0-9-]) rejects a hyphen or letter before, and still
+              ADMITS a leading '.', which is what lets one www-stripped key
+              match 'example.com', 'www.example.com' and 'api.example.com'.
+        RIGHT (?![a-z0-9-]) rejects more label characters; (?!\\.[a-z0-9])
+              rejects a further dotted LABEL while still allowing a sentence
+              period ('...at example.com.' matches, 'example.com.evil.net'
+              does not)."""
+        return re.search(
+            r"(?<![a-z0-9-])" + re.escape(dom) + r"(?![a-z0-9-])(?!\.[a-z0-9])",
+            low)
+
     # len>=5 floor on FULL names too: convention-file extraction is regex-
     # loose, and a short generic backticked token (e.g. a table header word)
     # must never become a scan trigger. Real repo names clear 5 easily.
@@ -711,6 +791,19 @@ def detect_product_surfaces(surface_text, repo_names, write_path_entries=()):
     for name in names:
         if _bounded(name.lower()):
             labels.add(name)
+            _add_matched(name)
+    # Served-domain pass. Runs AFTER full names and BEFORE the token family,
+    # so a domain hit takes a network slot ahead of a leaked brand token.
+    # Keys are already www-stripped by extract_domain_repos, and _bounded's
+    # boundary classes are [a-z0-9] (a '.' is neither), so the registrable
+    # form matches BOTH 'example.com' and 'www.example.com' in prose — one
+    # key, both spellings, no second pattern to keep in sync.
+    for dom in sorted(domain_repos or {}):
+        d = str(dom).strip().lower()
+        if not d or not _domain_bounded(d):
+            continue
+        labels.add(d)
+        for name in sorted(domain_repos[dom]):
             _add_matched(name)
     # Distinctive-token pass: token -> owning repo names.
     tok_names = {}
@@ -986,6 +1079,102 @@ def _agent_write_repos(entries):
 
 
 _CONV_NAME_RE = re.compile(r"`([A-Za-z][A-Za-z0-9_-]{3,})`")
+# Backticked org/repo form (`<org>/<repo>`), so a catalog row that writes the
+# fully-qualified name still yields the bare repo name.
+_CONV_QUALIFIED_RE = re.compile(r"`[A-Za-z0-9_.-]+/([A-Za-z][A-Za-z0-9_-]{3,})`")
+_CONV_DOMAIN_RE = re.compile(
+    r"(?<![\w.-])((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,})(?![\w-])")
+# Closed TLD set, deliberately. An open `\.[a-z]{2,}$` reads env.json, ci.yml,
+# main.py and smoke.mjs as domains — a catalog file is full of filenames, and
+# every one of them would pair a junk key against a real repo.
+_CONV_TLDS = frozenset(("com", "org", "net", "io", "ai", "dev", "wiki"))
+# Max distinct known repos a single line may name and still be read as an
+# ownership statement. Measured over this deployment's catalog: every hit
+# named exactly 1, so 2 is headroom, not a widening. A prose paragraph or a
+# contents row that sweeps a domain past several repos asserts no ownership,
+# and admitting it would point network work at the wrong repo with the same
+# confident tone as a real hit (guard-2860 — never relax an ownership
+# predicate into a pattern).
+_CONV_DOMAIN_MAX_REPOS = 2
+_CAMEL_HUMP_RE = re.compile(r"[A-Z][a-z0-9]*")
+
+
+def _is_repo_shaped(name):
+    """Pure. Does `name` look like a repo name rather than an incidental
+    backticked word? A separator, or >=2 CamelCase humps.
+
+    `_CONV_NAME_RE` is deliberately loose — it feeds a NAME set where a stray
+    word is inert, because a word that is not a repo simply never matches on
+    disk. That tolerance does not survive here: a domain map turns one stray
+    word into a LABEL, and a label is what decides whether the product scan
+    runs at all. Measured on this deployment's catalog, the loose regex paired
+    `github.com -> main` and `schema.org -> Organization` — and `github.com`
+    appears in ordinary goal prose constantly, so that one label would have
+    triggered a full product scan on unrelated framework goals. Same input,
+    two consumers, different tolerance for junk (rb-245 shape: verify the
+    field means what the new reader needs, not what the old reader tolerated).
+    """
+    n = str(name or "")
+    if "-" in n or "_" in n:
+        return True
+    return len(_CAMEL_HUMP_RE.findall(n)) >= 2
+
+
+def extract_domain_repos(text, known_repos):
+    """Pure. {served-domain -> {repo names}} from a product-repo catalog.
+
+    A catalog row states ownership by putting the domain and the repo on the
+    SAME LINE ('| `Some-Web-App` | ... | Serves **`www.example.com`** ... |').
+    Line scoping IS the predicate: whole-file co-occurrence would pair every
+    domain with every repo the file mentions.
+
+    Keys are www-stripped so one key matches both spellings in prose.
+    Fail-open by construction: unparseable input yields {}, and the caller
+    then behaves exactly as it did before this pass existed."""
+    out = {}
+    known = {r for r in (known_repos or ()) if r and _is_repo_shaped(r)}
+    if not text or not known:
+        return out
+    for line in str(text).splitlines():
+        doms = {d for d in _CONV_DOMAIN_RE.findall(line.lower())
+                if d.rsplit(".", 1)[-1] in _CONV_TLDS}
+        if not doms:
+            continue
+        repos = {n for n in _CONV_NAME_RE.findall(line) if n in known}
+        repos |= {n for n in _CONV_QUALIFIED_RE.findall(line) if n in known}
+        if not repos or len(repos) > _CONV_DOMAIN_MAX_REPOS:
+            continue
+        for d in doms:
+            key = d[4:] if d.startswith("www.") else d
+            if len(key) < 5:
+                continue
+            out.setdefault(key, set()).update(repos)
+    return out
+
+
+def _convention_domain_repos(known_repos):
+    """Served-domain -> repo map from the same catalog `_convention_repo_names`
+    reads. Empty on any error or when the domain has no such convention —
+    fail-open, and domain-free (the glob names a generic convention shape,
+    never a specific deployment)."""
+    try:
+        from _paths import WORLD_DIR
+    except Exception:
+        return {}
+    if WORLD_DIR is None:
+        return {}
+    out = {}
+    try:
+        for f in sorted(Path(WORLD_DIR).glob("conventions/*product-repos*.md")):
+            try:
+                text = f.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            for d, rs in extract_domain_repos(text, known_repos).items():
+                out.setdefault(d, set()).update(rs)
+    except Exception:
+        return out
+    return out
 
 
 def _convention_repo_names():
@@ -1109,18 +1298,41 @@ def _scan_product_repos(goal_id, surface_text, affected_paths, keywords,
                 wp_entries = []
         repos = _agent_write_repos(wp_entries)
         names = sorted({n for n, _ in repos} | _convention_repo_names())
+        # Served-domain map, same catalog as the names above. Keyed on `names`
+        # (union, not on-disk) so a domain owned by a repo this box has not
+        # cloned still produces a LABEL and triggers the scan; matched_on_disk
+        # drops it from the network budget a few lines below, which is the
+        # correct place for that filter to live.
+        domain_repos = _convention_domain_repos(names)
         labels, matched = detect_product_surfaces(
-            surface_text, names, wp_entries)
+            surface_text, names, wp_entries, domain_repos=domain_repos)
         if not labels:
             return empty
         result = {"surfaces": sorted(labels), "repos_scanned": [],
                   "commits": [], "branch_hits": [], "pr_hits": [],
                   "behind": []}
-        # Network budget follows MATCH order (full-name matches first), not
-        # disk order — the live 2026-07-17 replay showed a token-family leak
-        # spending all 3 slots on alphabetically-early repos while the
-        # full-name-matched repo (the one holding the deliverable PR) got no
-        # fetch/PR search.
+        # Network budget follows MATCH order (full-name first, then served
+        # domain, then token family), not disk order — the live 2026-07-17
+        # replay showed a token-family leak spending all 3 slots on
+        # alphabetically-early repos while the full-name-matched repo (the one
+        # holding the deliverable PR) got no fetch/PR search. The same leak
+        # recurred on  (2026-08-07), which is why the domain tier
+        # exists; see detect_product_surfaces for why ordering, not the
+        # frequency threshold, is the fix.
+        #
+        # This gate is shared by THREE consumers, so the domain tier changes
+        # all three together and the budget stays <=3 for each:
+        #   _gh_pr_hits       — the measured miss. Now searches the repo the
+        #                       goal is about instead of an alphabetical
+        #                       neighbour.
+        #   _git_fetch_remote — same slot count, better aimed. A fetch of the
+        #                       deliverable repo is what makes the two reads
+        #                       below mean anything.
+        #   _git_behind_count — reads the fetch above, so its ADVISORY now
+        #                       describes a repo the goal will actually be
+        #                       graded on. Its own falsy-conflation defect
+        #                       (None and 0 render alike) is untouched here
+        #                       and stays with .
         by_name = {}
         for n, p in repos:
             by_name.setdefault(n, p)
@@ -1263,6 +1475,33 @@ def _partner_in_flight():
                 "title": inf.get("title") or "",
                 "claimed_at": inf.get("claimed_at") or "",
             })
+        # Body-keyed rows (). A partner running as a WORKER Body never
+        # writes `in_flight` -- team-state-in-flight.sh skips the reducer stamp
+        # for any non-reducer body -- so before this loop existed, a worker
+        # partner was invisible here and this probe's whole in_flight GATE
+        # (guard-741) silently opened: with no partner in_flight, uncommitted
+        # files in the SHARED working tree read as unowned and get swept into
+        # this agent's commit. That is the exact hazard the gate exists for, so
+        # the miss is not cosmetic.
+        #
+        # Each body is a separate candidate rather than being merged: they are
+        # genuinely concurrent claims on different goals, and the newest-wins
+        # sort below already picks the most recent across both shapes. Non-dict
+        # entries are skipped. As of  a cleared body row is DELETED
+        # (POST /v1/team-state/clear-body-row), so the common case never reaches
+        # this guard -- but keep it: pre-fix null residue survives on any box that
+        # has not yet run a close, and a hand-edit can still leave one.
+        bodies = (info or {}).get("in_flight_bodies")
+        if isinstance(bodies, dict):
+            for _sid, body in bodies.items():
+                if not isinstance(body, dict) or not body.get("goal_id"):
+                    continue
+                candidates.append({
+                    "name": name,
+                    "goal_id": body.get("goal_id"),
+                    "title": body.get("title") or "",
+                    "claimed_at": body.get("claimed_at") or "",
+                })
     if not candidates:
         return None
     candidates.sort(key=lambda d: d.get("claimed_at") or "", reverse=True)
@@ -1477,6 +1716,13 @@ def main():
     ap.add_argument("--goal-id", required=True)
     # WORLD_AGENT_ONLY: cross-agent routes via MIND_AGENT env override ()
     ap.add_argument("--source", choices=["world", "agent"], default="world")
+    ap.add_argument("--cross-agent-owner", default=None,
+                    help="Owner agent when this is a CROSS-AGENT goal (selector "
+                         "source='cross-agent:<owner>'). Declares that the "
+                         "agent-queue id names ONE shared, contendable record, "
+                         "so partner board claims stay in scope. Omit for your "
+                         "own agent-queue goals, whose ids are per-agent and "
+                         "cannot be contended (g-115-5570).")
     ap.add_argument("--since-hours", type=float, default=2.0,
                     help="git-log lookback window in hours (default 2).")
     ap.add_argument("--min-shared-keywords", type=int, default=2,
@@ -1530,10 +1776,13 @@ def main():
     # unconditionally (NOT gated on partner_in_flight — the whole point is that
     # team-state can be frozen while a partner is mid-claim on another box).
     me = os.environ.get("MIND_AGENT", "")
+    agent_queue_private = is_private_agent_queue(
+        args.source, args.cross_agent_owner)
     board_hits = classify_board_mentions(
         args.goal_id, me, _board_recent_mentions(args.board_since_hours),
         goal_recurring=bool((goal or {}).get("recurring")),
-        goal_last_achieved=(goal or {}).get("lastAchievedAt"))
+        goal_last_achieved=(goal or {}).get("lastAchievedAt"),
+        agent_queue_private=agent_queue_private)
     # Claim/release pairing + live-state corroboration (). Without
     # these, the probe only ACCUMULATED yield signal and never cleared it, so a
     # single abandoned claim became a permanent lien on the goal for every agent.
@@ -1575,6 +1824,10 @@ def main():
         "board_partner_activity": board_hits,
         "board_superseded_claims": superseded_claims,
         "board_stale_claims": stale_claims,
+        # Say that the board lane was NOT consulted, rather than reporting an
+        # empty lane that reads identically to "consulted, found nothing"
+        # (guard-1760). True only for a private agent-queue id ().
+        "board_namespace_private": agent_queue_private,
         "product_surfaces": product["surfaces"],
         "product_repos_scanned": product["repos_scanned"],
         "product_branch_hits": product["branch_hits"],
@@ -1616,7 +1869,21 @@ def main():
             caller="goal-pickup-coordination-check.main",
             payload={"goal_id": args.goal_id, "source": args.source,
                      "since_hours": args.since_hours},
-            extra={"race_risk": race_risk,
+            extra={# The guarded goal's id, so a firing can be JOINED to the
+                   # pickup it guarded (). It was already passed
+                   # above in `payload`, but _gate_log stores only
+                   # `payload_hash` and discards the payload, so the id never
+                   # reached the store. `extra` is persisted verbatim.
+                   # Without it the pickup-coverage question is answerable
+                   # only as a ratio of two independently-counted populations,
+                   # which is biased UP by the duplicate-firing rate: measured
+                   # 65.7% raw vs 48.2% de-duplicated, a 17.5-point
+                   # overstatement in the flattering direction. Key is named
+                   # `goal_id` deliberately — aspirations-read calls this field
+                   # `id` and aspirations-query calls it `goal_id`, so the
+                   # reader must not have to guess which surface produced it.
+                   "goal_id": args.goal_id,
+                   "race_risk": race_risk,
                    "affected_paths": len(affected_paths),
                    "keywords": len(keywords),
                    "overlapping_commits": len(overlapping),

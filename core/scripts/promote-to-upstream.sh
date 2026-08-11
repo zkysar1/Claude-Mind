@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # promote-to-upstream.sh — Promote this repo's framework release ONE step down
 # the chain (frontier->seed, or seed->downstream) into a local clone of the
-# target repo, via the seed-plant machinery. The SCRIPT opens a PR (with --pr)
-# and never auto-merges; the AGENT may merge that PR as a separate verified step
-# once it is mergeable + checks pass (user-granted 2026-06-06; guard-680 /
-# capability-routing grant-002).
+# target repo, via the seed-plant machinery. The SCRIPT opens a PR (with --pr).
+# It does NOT merge by DEFAULT; the AGENT may merge that PR as a separate
+# verified step once it is mergeable + checks pass (user-granted 2026-06-06;
+# guard-680 / capability-routing grant-002). --auto-merge OPTS IN to merging in
+# the same run, under the preconditions documented at that flag below.
 #
 # Usage:
 #   bash core/scripts/promote-to-upstream.sh --target <path-to-target-clone> \
-#        [--branch "promote/vX.Y.Z"] [--pr] [--dry-run] [--living-prod] \
-#        [--force-past-plan "<justification>"]
+#        [--branch "promote/vX.Y.Z"] [--pr] [--auto-merge] [--dry-run] \
+#        [--living-prod] [--force-past-plan "<justification>"]
 #
 #   --living-prod: force living-prod mode — pass --living-prod through to
 #     seed-transplant so the target's deployment-local files (CLAUDE.md,
@@ -44,12 +45,15 @@ WORLD="${WORLD_DIR:-${WORLD_PATH:-}}"
 OVERLAY="$WORLD/config/compatibility.yaml"
 FW_COMPAT="$CONFIG_DIR/compatibility.yaml"
 
-TARGET=""; BRANCH=""; DO_PR=0; DRY=0; LIVING_PROD=0; FORCE_PAST_PLAN=""
+TARGET=""; BRANCH=""; DO_PR=0; DRY=0; LIVING_PROD=0; FORCE_PAST_PLAN=""; AUTO_MERGE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --target) TARGET="${2:-}"; [[ -z "$TARGET" || "$TARGET" == --* ]] && { echo "ERROR: --target requires a path" >&2; exit 2; }; shift 2;;
     --branch) BRANCH="${2:-}"; [[ -z "$BRANCH" || "$BRANCH" == --* ]] && { echo "ERROR: --branch requires a value" >&2; exit 2; }; shift 2;;
     --pr) DO_PR=1; shift;;
+    # Opt-in merge of the PR this run just opened. OFF by default: the default
+    # contract stays "open a PR, let a human or a later verified step merge it".
+    --auto-merge) AUTO_MERGE=1; shift;;
     --dry-run) DRY=1; shift;;
     --living-prod) LIVING_PROD=1; shift;;
     # Escape hatch for a DO NOT PROMOTE verdict (). Requires a written
@@ -62,6 +66,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ -n "$TARGET" ]] || { echo "ERROR: --target <path-to-target-clone> is required" >&2; exit 2; }
+# --auto-merge without --pr has nothing to merge. Reject at parse time rather
+# than no-op'ing silently at Step 6 — an accepted-but-inert flag is worse than a
+# rejected one, because the caller believes it took effect (guard-386, rb-538).
+# `||` form (not `&&`) mirrors the --target guard above and is set -e safe.
+[[ $AUTO_MERGE -eq 0 || $DO_PR -eq 1 ]] || { echo "ERROR: --auto-merge requires --pr (there is no PR to merge without it)" >&2; exit 2; }
 
 say() { echo "[promote] $*"; }
 fail() { echo "[promote] ERROR: $*" >&2; exit 1; }
@@ -127,25 +136,75 @@ say "$CRC_OUT"
 # (b) working tree clean — enforced for ALL roles (promoting an uncommitted
 #     tree is wrong regardless of role). (c) HEAD tagged v$LOCAL is frontier-only
 #     (guarded below).
-DIRTY="$(git -C "$PROJECT_ROOT" status --porcelain 2>/dev/null || true)"
-if [[ -n "$DIRTY" ]]; then
-  if [[ $DRY -eq 1 ]]; then say "[dry-run] note: working tree dirty (would FAIL a real promote)";
-  else fail "working tree is dirty — commit before promoting"; fi
-fi
-# (c) HEAD tagged v$LOCAL — FRONTIER-ONLY provenance. release.sh is the sole
-# v-tagger and only runs at the frontier; a non-frontier role (seed/downstream)
-# re-transplants adopted framework and has no v-tag by design, so the tag gate
-# is skipped for it (, option 2 role-conditional gating).
-if [[ "$SELF_ROLE" == "frontier" ]]; then
-  if ! git -C "$PROJECT_ROOT" rev-parse -q --verify "refs/tags/v$LOCAL" >/dev/null 2>&1; then
-    if [[ $DRY -eq 1 ]]; then say "[dry-run] note: HEAD has no tag v$LOCAL (would FAIL — cut a release with release.sh first)";
-    else fail "no tag v$LOCAL — promote only TAGGED releases (run release.sh first)"; fi
-  else
-    HEAD_SHA="$(git -C "$PROJECT_ROOT" rev-parse HEAD)"
-    TAG_SHA="$(git -C "$PROJECT_ROOT" rev-list -n1 "v$LOCAL")"
-    [[ "$HEAD_SHA" == "$TAG_SHA" ]] || { [[ $DRY -eq 1 ]] && say "[dry-run] note: HEAD is not the v$LOCAL commit (would FAIL)" || fail "HEAD is not the tagged v$LOCAL commit"; }
+#
+# SOURCE-PROVENANCE PREDICATE (). Both conditions are evaluated by ONE
+# function because they are re-checked a SECOND time immediately before the plant
+# (Step 4a.9), and two hand-maintained copies of this predicate would drift —
+# which is the same class of defect this re-check exists to catch.
+#
+# WHY BOTH CONDITIONS, TOGETHER, ARE THE WHOLE GUARANTEE: a clean working tree
+# AND HEAD == the v$LOCAL commit together imply the working tree's content IS the
+# tag's content. seed-transplant copies from the WORKING TREE (`--source
+# "$PROJECT_ROOT"`, _seed_engine copy-staged), so asserting both at plant time is
+# logically equivalent to planting from the tagged commit — without changing
+# seed-transplant's source resolution, which is deliberately tag-agnostic
+# (it is also invoked standalone, where no tag exists at all).
+# Re-checking HEAD==tag ALONE would be strictly weaker: a tree dirtied after the
+# assertion still injects untagged content while HEAD stays put.
+#
+# Sets SRC_DRIFT_KIND (dirty|no-tag|head-not-tag|"") + SRC_DRIFT_DETAIL.
+# Returns 0 when the source faithfully represents v$LOCAL, 1 otherwise.
+# Evaluates the two conditions INDEPENDENTLY and accumulates every kind found
+# into SRC_DRIFT_KIND (space-separated). Deliberately not first-match-wins: the
+# dry-run below exists to report everything wrong BEFORE an operator commits to a
+# 15-minute run, so short-circuiting after the first would make them fix one
+# problem, re-run, and discover the next. `dirty` is independent of the tag
+# checks; `no-tag` and `head-not-tag` are mutually exclusive (you cannot compare
+# against a tag that does not exist).
+source_provenance_drift() {
+  SRC_DRIFT_KIND=""; SRC_DRIFT_DETAIL=""
+  local _dirty _head_sha _tag_sha
+  _add() { SRC_DRIFT_KIND="${SRC_DRIFT_KIND:+$SRC_DRIFT_KIND }$1"
+           SRC_DRIFT_DETAIL="${SRC_DRIFT_DETAIL:+$SRC_DRIFT_DETAIL; }$2"; }
+
+  _dirty="$(git -C "$PROJECT_ROOT" status --porcelain 2>/dev/null || true)"
+  if [[ -n "$_dirty" ]]; then
+    _add dirty "$(printf '%s' "$_dirty" | head -5 | tr '\n' ';')"
   fi
-else
+  # Tag provenance is FRONTIER-ONLY. release.sh is the sole v-tagger and only
+  # runs at the frontier; a non-frontier role (seed/downstream) re-transplants
+  # adopted framework and has no v-tag by design (, option 2
+  # role-conditional gating).
+  if [[ "$SELF_ROLE" == "frontier" ]]; then
+    if ! git -C "$PROJECT_ROOT" rev-parse -q --verify "refs/tags/v$LOCAL" >/dev/null 2>&1; then
+      _add no-tag "v$LOCAL"
+    else
+      _head_sha="$(git -C "$PROJECT_ROOT" rev-parse HEAD)"
+      _tag_sha="$(git -C "$PROJECT_ROOT" rev-list -n1 "v$LOCAL")"
+      [[ "$_head_sha" == "$_tag_sha" ]] || _add head-not-tag "HEAD=$_head_sha v$LOCAL=$_tag_sha"
+    fi
+  fi
+  [[ -z "$SRC_DRIFT_KIND" ]]
+}
+
+if ! source_provenance_drift; then
+  # Report EVERY kind found. A real promote fails on the first (fail exits); a
+  # dry-run emits all notes, matching the pre- diagnostic behavior.
+  for _kind in $SRC_DRIFT_KIND; do
+    case "$_kind" in
+      dirty)
+        if [[ $DRY -eq 1 ]]; then say "[dry-run] note: working tree dirty (would FAIL a real promote)";
+        else fail "working tree is dirty — commit before promoting"; fi ;;
+      no-tag)
+        if [[ $DRY -eq 1 ]]; then say "[dry-run] note: HEAD has no tag v$LOCAL (would FAIL — cut a release with release.sh first)";
+        else fail "no tag v$LOCAL — promote only TAGGED releases (run release.sh first)"; fi ;;
+      head-not-tag)
+        if [[ $DRY -eq 1 ]]; then say "[dry-run] note: HEAD is not the v$LOCAL commit (would FAIL)";
+        else fail "HEAD is not the tagged v$LOCAL commit"; fi ;;
+    esac
+  done
+fi
+if [[ "$SELF_ROLE" != "frontier" ]]; then
   say "skip tag-check: role '$SELF_ROLE' is non-frontier — v-tags are frontier-only (release.sh); a seed re-transplants adopted framework (g-115-1811)"
 fi
 
@@ -226,7 +285,8 @@ if [[ $DRY -eq 1 ]]; then
   [[ $DO_PR -eq 1 ]] && say "[dry-run] would: create PR branch '$BRANCH' in target FIRST (plant commits there, not on target's main)"
   [[ $LIVING_PROD -eq 1 ]] && say "[dry-run] would: seed-transplant.sh \"$TARGET\" --living-prod --plan  (read-only blast-radius report FIRST — g-306-90/guard-1056)"
   say "[dry-run] would: seed-transplant.sh \"$TARGET\" ${LP_FLAG:+$LP_FLAG }--force --commit  (domain-strip + transforms + verify${LP_FLAG:+; living-prod: deployment-local + dest forged skills preserved})"
-  [[ $DO_PR -eq 1 ]] && say "[dry-run] would: push branch '$BRANCH' + gh pr create (NEVER merges)"
+  [[ $DO_PR -eq 1 && $AUTO_MERGE -eq 0 ]] && say "[dry-run] would: push branch '$BRANCH' + gh pr create (does NOT merge — pass --auto-merge to merge in-run)"
+  [[ $DO_PR -eq 1 && $AUTO_MERGE -eq 1 ]] && say "[dry-run] would: push branch '$BRANCH' + gh pr create + gh pr merge --merge (--auto-merge ON; merges only when MERGEABLE, then settles the verdict at origin — guard-1897)"
   say "[dry-run] would: seed-verify.sh \"$TARGET\" --expect-commit"
   say "[dry-run] OK — all pre-flight + invariant + preflight checks passed"
   exit 0
@@ -282,6 +342,34 @@ if [[ $LIVING_PROD -eq 1 ]]; then
   esac
 fi
 
+# --- Step 4a.9: re-assert source provenance IMMEDIATELY before the plant ----
+# TOCTOU CLOSE (). Step 1 asserted clean-tree + HEAD==v$LOCAL at the
+# START of the run. Everything between here and there takes real wall-clock —
+# seed-preflight alone runs minutes, plus promotion-preflight, the PR-branch
+# creation, and the --plan blast-radius pass; a full chain promote takes 15+.
+# The plant below copies from the WORKING TREE, so any commit, checkout, pull, or
+# stray write landing in that window is planted downstream WEARING THE v$LOCAL
+# LABEL. Measured 2026-07-27: two fixes committed inside the window shipped as
+# v2.7.1, so the ZDS payload for that tag contains code the tag does not.
+#
+# The consequence is worse than one mislabeled ship: it silently weakens
+# guard-678 frontier-monotonicity (comparing tags stops comparing what is
+# deployed) and makes what-changed-between-versions reasoning unsound at the
+# exact moment it matters most — a downstream regression hunt.
+#
+# This is a re-check, not a second opinion: the SAME predicate as Step 1, so the
+# two can never disagree. It is a hard fail with no override — an operator who
+# genuinely wants the newer code should cut a new tag, which costs one release.sh
+# run and keeps the label honest. Note the runbook's worktree-at-tag method
+# (core/config/conventions/promotion-runbook.md Phase 3) makes this a guaranteed
+# no-op, because a detached worktree at the tag cannot drift while the fleet
+# commits to main — but that method is documented, not enforced, and the
+# measured incident is what running WITHOUT it costs.
+if ! source_provenance_drift; then
+  fail "SOURCE DRIFTED MID-PROMOTION ($SRC_DRIFT_KIND: $SRC_DRIFT_DETAIL) — the tree changed between the Step 1 assertion and this plant, so planting now would ship content that is NOT in tag v$LOCAL under the v$LOCAL label. Aborting before any mutation of $TARGET. Fix: re-run from a worktree pinned at the tag (promotion-runbook.md Phase 3), or cut a new release with release.sh so the label matches what you are shipping."
+fi
+say "source provenance re-verified at plant time: tree clean and HEAD is the v$LOCAL commit"
+
 # --- Step 4b: seed-plant into the target (commits onto the CURRENT branch) --
 say "planting framework into $TARGET ${LP_FLAG:+(living-prod) }..."
 bash "$SCRIPT_DIR/seed-transplant.sh" "$TARGET" $LP_FLAG --force --commit || fail "seed plant failed"
@@ -297,7 +385,7 @@ bash "$SCRIPT_DIR/seed-transplant.sh" "$TARGET" $LP_FLAG --force --commit || fai
 say "verifying plant at $TARGET ..."
 bash "$SCRIPT_DIR/seed-verify.sh" "$TARGET" --expect-commit || fail "post-promotion verify FAILED at $TARGET"
 
-# --- Step 6: optional PR push (NEVER merges) -------------------------------
+# --- Step 6: optional PR push (merges ONLY under --auto-merge) -------------
 if [[ $DO_PR -eq 1 ]]; then
   # Resolve gh robustly. `command -v gh` ALONE is wrong on Windows git-bash:
   # the GitHub CLI installs to "C:\Program Files\GitHub CLI", which is on the
@@ -327,12 +415,100 @@ if [[ $DO_PR -eq 1 ]]; then
     say "WARNING: --pr requested but 'gh' is not installed/locatable. The plant is committed on branch '$BRANCH' at $TARGET."
     say "Open a PR manually:  (cd \"$TARGET\" && git push -u origin \"$BRANCH\" && gh pr create ...)"
   else
-    ( cd "$TARGET" && git push -u origin "$BRANCH" && \
+    # `git push` output is routed to stderr (>&2), NOT suppressed: stdout must
+    # carry ONLY the PR URL that `gh pr create` prints, so --auto-merge has
+    # something to act on. Silencing it would violate guard-139/guard-1972.
+    if PR_RAW="$( cd "$TARGET" && git push -u origin "$BRANCH" >&2 && \
       "$GH_BIN" pr create --title "Promote framework v$LOCAL from $SELF_ROLE" \
-        --body "Automated framework promotion v$LOCAL ($SELF_ROLE -> $TARGET_ROLE). The agent merges once mergeable + checks pass (user-granted 2026-06-06)." ) \
-      || say "WARNING: PR push/create failed — the plant is committed on '$BRANCH' at $TARGET; open the PR manually."
+        --body "Automated framework promotion v$LOCAL ($SELF_ROLE -> $TARGET_ROLE). The agent merges once mergeable + checks pass (user-granted 2026-06-06)." )"; then
+      # Take the LAST non-empty stdout line, not the whole capture: gh may print
+      # an advisory line before the URL, and a multi-line PR_URL would be passed
+      # verbatim to `gh pr view` and fail — turning a healthy PR into a false
+      # "UNREADABLE -> REFUSED". Trimming happens OUTSIDE the `if` condition on
+      # purpose: a pipe inside it would replace gh's exit status with tail's and
+      # silently defeat the push/create failure branch below (guard-1150).
+      PR_URL="$(printf '%s\n' "$PR_RAW" | sed '/^[[:space:]]*$/d' | tail -n1)"
+      say "PR opened: ${PR_URL:-<no url returned>}"
+    else
+      PR_URL=""
+      say "WARNING: PR push/create failed — the plant is committed on '$BRANCH' at $TARGET; open the PR manually."
+    fi
+
+    if [[ $AUTO_MERGE -eq 1 && -n "$PR_URL" ]]; then
+      # Preconditions, measured rather than assumed (guard-1199/1264/2640).
+      #   mergeable        — the genuinely checkable one (MERGEABLE = no conflict)
+      #   statusCheckRollup— NOT read as green when EMPTY. An empty rollup is an
+      #     empty population reporting clean, and GitHub renders it identically
+      #     to a genuine green; where a chain repo defines no pull_request-
+      #     triggered workflow, [] is its PERMANENT state. Laundering [] into
+      #     "CI passed" is exactly guard-2640. We instead SAY which case we are
+      #     in and rest on the LOCAL gate that already ran: seed-verify.sh
+      #     --expect-commit above, which fails the promotion outright. When
+      #     checks DO exist, any non-SUCCESS blocks the merge. Per-deployment
+      #     measurements live in the domain promotion convention, not here.
+      # GitHub computes `mergeable` ASYNCHRONOUSLY. A read of a just-created PR
+      # commonly returns UNKNOWN and merely TRIGGERS the computation, resolving
+      # on a later read — measured 2026-08-10 against a live PR: poll 1 UNKNOWN,
+      # poll 2 MERGEABLE. --auto-merge reads seconds after `gh pr create`, i.e.
+      # exactly when UNKNOWN is most likely, so a SINGLE-SHOT read would refuse
+      # perfectly mergeable PRs on most real runs while passing every mocked
+      # test. Poll until it resolves; UNKNOWN at the end is treated as a refusal,
+      # never as consent.
+      PR_MERGEABLE="UNKNOWN"; PR_CHECKS=0; PR_BAD=0
+      for _mtry in 1 2 3 4 5; do
+        if PR_FACTS="$( cd "$TARGET" && "$GH_BIN" pr view "$PR_URL" --json mergeable,statusCheckRollup \
+             --jq '[.mergeable, (.statusCheckRollup|length), ([.statusCheckRollup[]|select((.conclusion // .state // "") != "SUCCESS")]|length)] | @tsv' )"; then
+          IFS=$'\t' read -r PR_MERGEABLE PR_CHECKS PR_BAD <<<"$PR_FACTS"
+        else
+          PR_MERGEABLE="UNREADABLE"; PR_CHECKS=0; PR_BAD=0
+          break
+        fi
+        if [[ "$PR_MERGEABLE" != "UNKNOWN" ]]; then break; fi
+        # Announce the read we are ABOUT to make, and only when there is one:
+        # saying "re-reading (5/5)" on the last pass then falling out of the loop
+        # describes a read that never happens, and sleeps for nothing.
+        if [[ "$_mtry" -lt 5 ]]; then
+          say "--auto-merge: mergeable=UNKNOWN (GitHub still computing) — re-reading ($((_mtry + 1))/5)"
+          sleep 2
+        fi
+      done
+
+      if [[ "$PR_MERGEABLE" != "MERGEABLE" ]]; then
+        say "--auto-merge REFUSED: mergeable=$PR_MERGEABLE (expected MERGEABLE). PR left OPEN at $PR_URL"
+      elif [[ "${PR_CHECKS:-0}" -gt 0 && "${PR_BAD:-0}" -gt 0 ]]; then
+        say "--auto-merge REFUSED: ${PR_BAD} of ${PR_CHECKS} status check(s) not SUCCESS. PR left OPEN at $PR_URL"
+      else
+        if [[ "${PR_CHECKS:-0}" -eq 0 ]]; then
+          say "--auto-merge: 0 status checks on this PR — NOT read as CI-green (guard-2640). Basis for merging is the local gate: seed-verify.sh --expect-commit passed above."
+        else
+          say "--auto-merge: ${PR_CHECKS} status check(s) all SUCCESS"
+        fi
+        # guard-1897: `gh pr merge` can print `fatal: Not possible to
+        # fast-forward` WHEN THE REMOTE MERGE ALREADY SUCCEEDED — that fatal
+        # comes from gh updating the LOCAL checkout afterwards. Its exit status
+        # is therefore NOT the verdict, and this `|| true` is a deliberate
+        # discard of a known-unreliable signal, not a guard-139 error-silencing:
+        # the authoritative check is the remote read on the next line.
+        ( cd "$TARGET" && "$GH_BIN" pr merge "$PR_URL" --merge ) || true
+        MERGED_AT="$( cd "$TARGET" && "$GH_BIN" pr view "$PR_URL" --json mergedAt --jq '.mergedAt // ""' 2>/dev/null )" || MERGED_AT=""
+        if [[ -n "$MERGED_AT" ]]; then
+          say "--auto-merge OK: merged at $MERGED_AT — $PR_URL"
+        else
+          say "WARNING: --auto-merge did NOT land — PR still open at $PR_URL; merge it manually."
+        fi
+      fi
+    fi
   fi
 fi
 
 say "═══ PROMOTED v$LOCAL ($SELF_ROLE -> $TARGET_ROLE) ═══"
-say "Target: $TARGET  (PR opened; the agent merges it once mergeable + checks pass — guard-680)"
+# Closing line must not outlive what actually happened: with --auto-merge on,
+# "the agent merges it later" is false, and with --pr off there is no PR at all.
+# All three branches are gated on the same flags as the actions above (guard-527).
+if [[ $DO_PR -eq 1 && $AUTO_MERGE -eq 1 ]]; then
+  say "Target: $TARGET  (--auto-merge ran — see the --auto-merge line above for whether it landed; guard-680)"
+elif [[ $DO_PR -eq 1 ]]; then
+  say "Target: $TARGET  (PR opened; the agent merges it once mergeable + checks pass — guard-680)"
+else
+  say "Target: $TARGET  (planted on branch '$BRANCH'; no PR requested)"
+fi

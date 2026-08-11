@@ -39,6 +39,9 @@ import json
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _path_helpers import normalize_msys_path  # noqa: E402
+
 
 # --- Dotted-path field lookup --------------------------------------------------
 
@@ -134,8 +137,14 @@ def main():
         print(json.dumps(result))
         sys.exit(0)
 
-    # File presence (fail-open if missing)
-    jsonl_path = Path(args.jsonl_path)
+    # File presence (fail-open if missing).
+    # normalize_msys_path FIRST (): callers interpolate "$WORLD_DIR/..."
+    # into argv, and on Git Bash that is MSYS-flavored (/c/...). Windows Python
+    # reads the leading "/" as absolute-on-current-drive, so is_file() returned
+    # False for a file that plainly existed and this gate fail-opened at EVERY
+    # $WORLD_DIR call site — verifying nothing, silently, for the two rb-245
+    # audits it exists to protect. No-op on POSIX and on already-Windows paths.
+    jsonl_path = Path(normalize_msys_path(args.jsonl_path))
     if not jsonl_path.is_file():
         result["reason"] = "file not found — fail-open (gate does not block on missing file)"
         print(f"[audit-schema-gate] fail-open: {jsonl_path} not found", file=sys.stderr)

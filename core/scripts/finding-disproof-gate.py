@@ -89,6 +89,54 @@ def is_retraction(text):
     return any(re.search(p, t) for p in RETRACTION)
 
 
+# QUOTED material is REPORTED, not ASSERTED — the same structural argument as
+# RETRACTION one step out. A retraction necessarily quotes the claim it
+# withdraws; a REPORT necessarily quotes the finding it is reporting. Neither
+# is the sender making the claim, and gating either one punishes the message
+# for faithfully carrying someone else's words.
+#
+# Found the hard way (, 2026-08-02, echo, cc-03/6.8.0-136-generic):
+# user-blocker-escalation-check.py builds a digest that clips each aged goal's
+# description verbatim into the body — deliberately, because paraphrasing
+# degraded the concrete human ask (its docstring, L271-273). One goal's own
+# measured text contained a UNIVERSAL marker, so this gate refused the whole
+# payload. `_send_digest_email` sends ONE digest per batch and records NO
+# cooldowns on failure, so a single marker-carrying description wedged the
+# ONLY automated agent-to-human escalation path for EVERY eligible goal, and
+# retried identically every sweep. The gate was working exactly as written;
+# its input did not mean what it assumed.
+#
+# Convention is plain-text email quoting (`> `), chosen over an invented
+# sentinel because it already renders correctly to the human reading the mail
+# and needs no explanation at either end.
+#
+# OPT-IN, and that is load-bearing — measured on this change's own fresh-eyes
+# review. A bare `>` also opens markdown BLOCKQUOTES, which agents legitimately
+# use for EMPHASIS in their own prose. Probed: the identical claim passed the
+# gate when blockquoted and was refused when not, so an ambient exemption would
+# have silently stripped coverage from every caller on the general notification
+# path — an ACCIDENTAL coverage loss, likelier than the adversarial one below
+# and worse, because nobody chose it. So callers must DECLARE that their payload
+# carries quotations (`--fenced-quotes`); default behaviour is unchanged and no
+# existing caller loses anything.
+#
+# HONEST LIMIT, stated rather than papered over: a caller that passes the flag
+# could still park its own universal claim behind `> `. RETRACTION has the
+# identical hole (write "correction" and walk through). This is a
+# forcing-function for an honest agent, not an adversarial control — and a gate
+# that cannot be satisfied by a truthful message gets routed around, which costs
+# more than the hole does. The flag narrows that hole to callers that opted in.
+def strip_quoted(text):
+    """Drop email-convention quoted lines (`> ...`) before scanning.
+
+    Line-oriented on purpose: no open/close delimiters to leave unbalanced,
+    and a truncated quote degrades to "scanned anyway" (fail-closed) rather
+    than "everything after this point is exempt".
+    """
+    return "\n".join(ln for ln in text.splitlines()
+                     if not ln.lstrip().startswith(">"))
+
+
 def scan(text):
     t = text.lower()
     hits = []
@@ -109,6 +157,11 @@ def main():
     ap.add_argument("--claim-file")
     ap.add_argument("--disproof-probe", default="")
     ap.add_argument("--disproof-result", default="")
+    ap.add_argument("--fenced-quotes", action="store_true",
+                    help="This payload QUOTES text the caller did not author, "
+                         "fenced with the plain-text email convention ('> '). "
+                         "Those lines are excluded from the universal/causal "
+                         "scan. Opt-in: without it, every line is scanned.")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args()
 
@@ -131,7 +184,11 @@ def main():
                   "disconfirmation; never gate it).", file=sys.stderr)
             return 0
 
-        hits = scan(claim)
+        # Scan only what the SENDER asserts — but ONLY when the caller declared
+        # that this payload carries quotations. Un-flagged callers are scanned
+        # whole, so a markdown blockquote in authored prose keeps its coverage
+        # (see strip_quoted above).
+        hits = scan(strip_quoted(claim) if a.fenced_quotes else claim)
         if not hits:
             if a.json:
                 print(json.dumps({"gated": False, "reason": "no universal/causal markers"}))

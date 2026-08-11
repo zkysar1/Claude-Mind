@@ -2,13 +2,18 @@
 """Pre-apply-consult DRIFT gate — decision helper ().
 
 Second, complementary layer to the per-goal advisory `pre-apply-consult-gate.py`
-(g-115-826). That advisory fires at Phase 4 ONLY on cross-agent framework
-Applies (handoff_from != agent) and is loud-but-non-blocking. This layer closes
-two gaps it left open:
-  1. Coverage: the advisory never fires on OWN-authored framework deep goals —
-     which is exactly what the three consecutive misses on 2026-07-14
-     (g-115-2194 / g-115-2195 / g-115-2179) were. This layer keys on
-     work_class == framework (any authorship), not on handoff.
+(g-115-826). That advisory fires at Phase 4, BEFORE the first edit, and is
+loud-but-non-blocking. This layer closes two gaps it left open:
+  1. Coverage: the advisory USED TO fire only on cross-agent framework Applies
+     (handoff_from != agent), so it never fired on OWN-authored framework deep
+     goals — exactly what the three consecutive misses on 2026-07-14
+     (g-115-2194 / g-115-2195 / g-115-2179) were. The SAME g-115-2201 change
+     that added this file also widened that advisory, so it now fires on
+     own-authored goals too and `handoff_from` is merely an escalator there.
+     What stays distinct is the KEY: this layer keys on the close-time
+     work_class == framework classification (any authorship), while the
+     advisory keys on a framework-file PATH appearing in title/description —
+     so a framework goal that never names a path is caught only here.
   2. Posture: `code-review-protocol.md` step 4 is honor-system and drifted to a
      100% miss rate on framework deep goals. "An advisory will not fix a 3/3
      miss rate — advisory is what it already is." This layer ENFORCES: on N

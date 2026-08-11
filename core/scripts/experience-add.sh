@@ -35,6 +35,35 @@ fi
 # Read stdin (the JSON experience record) BEFORE invoking the daemon.
 BODY="$(cat)"
 
+#  (G3 worker rail) — DEFENSIVE, sibling of the guard in
+# journal-append.sh. A worker Body should never reach this writer: experience
+# archival is a reducer-only phase per the work-partition contract. The guard
+# converts a future phase-drift bug from silent shared-store corruption into a
+# LOGGED skip; if it ever fires, that is a bug report about the partition.
+#
+# Placed AFTER stdin is consumed on purpose: exiting before `cat` would leave
+# the caller writing into a closed pipe. Consume, then no-op.
+#
+# This script does a SKINNY PROJECT_ROOT resolve with no _paths.sh (see header),
+# so agent_dir() is unavailable and the two path segments are inlined. They
+# mirror AGENTS_PARENT_DIR and SESSIONS_DIRNAME and MUST be updated with them
+# — CLAUDE.md "Agent-dir Resolution", inlined-copies table. Sourcing _paths.sh
+# here would defeat the skinny-resolve contract this file is built on.
+#
+# MIND_SID is THIS process's own session, NOT running-session-id (the
+# REDUCER's SID — the trap found at the health-ledger writer in this goal).
+# Derived locally rather than from BODY_ROLE per guard-2445.
+#
+# Fail-open in every direction: unset vars or a missing file fall through to
+# the normal write.
+_APD="agents"
+_SDN="sessions"
+if [ -n "${MIND_SID:-}" ] && [ -n "${MIND_AGENT:-}" ] && \
+   [ -f "$PROJECT_ROOT/$_APD/$MIND_AGENT/$_SDN/$MIND_SID/working-memory.yaml" ]; then
+    echo "[experience-add] BODY=worker — SKIPPED agent-wide experience write. A worker should not reach this reducer-only writer; investigate the phase partition (g-306-125)." >&2
+    exit 0
+fi
+
 # --- Daemon path ----------------------------------------------------------
 # shellcheck disable=SC1091
 source "$CORE_ROOT/scripts/_runtime.sh"

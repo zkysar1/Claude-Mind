@@ -44,6 +44,7 @@ PROJECT_ROOT = HERE.parent.parent
 sys.path.insert(0, str(HERE))
 import _paths  # noqa: E402
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
+from _owner_qualified_signal import qualified_signal  # noqa: E402  (guard-2107, )
 
 from _gate_log import log as _gate_log
 
@@ -197,7 +198,8 @@ def already_filed(asp: dict, dedup_title: str) -> str | None:
     return None
 
 
-def build_idea(goal_id: str, title: str, interval_hours: int, consecutive: int, now: datetime) -> dict:
+def build_idea(goal_id: str, title: str, interval_hours: int, consecutive: int,
+               now: datetime, source: str = "world") -> dict:
     description = (
         f"Auto-filed by cargo-cult-detector after recurring goal {goal_id} "
         f"({title}) returned routine outcome {consecutive} times in a row.\n\n"
@@ -227,7 +229,16 @@ def build_idea(goal_id: str, title: str, interval_hours: int, consecutive: int, 
         "blocked_by": [],
         # origin-signal-gate: cargo-cult detection cites the source goal
         # (the one that returned too many routine outcomes in a row).
-        "origin_signal": f"idea:{goal_id}",
+        # guard-2107 / : `idea:` is the BROADEST of this family — no
+        # discriminating middle segment at all — so a bare agent-queue
+        # `g-001-NN` here is ambiguous to any cross-queue reader
+        # (`aspirations-query.sh --goal-field origin_signal` spans world + the
+        # bound agent). This detector's OWN dedup is title-based, so qualifying
+        # changes no dedup behaviour here; it removes the ambiguity for external
+        # readers. The calibrator invokes this path as
+        # `MIND_AGENT=<owning_agent> --source agent`, so the env owner is the
+        # goal's real owner, not merely whoever is running.
+        "origin_signal": qualified_signal("idea:", goal_id, source),
         "tags": ["cargo-cult", "auto-filed", f"source-goal:{goal_id}"],
         "created_at": now.replace(microsecond=0).isoformat(),
     }
@@ -469,7 +480,11 @@ def _file_rebase_up_idea(asp: dict, asp_id: str, source: str, goal_id: str,
             "checks": [], "preconditions": [],
         },
         "blocked_by": [],
-        "origin_signal": f"investigate:contract-suppressed:{goal_id}",
+        # guard-2107 /  — same reasoning as build_idea's `idea:` key.
+        # `source` is already a parameter of this function, so the owner comes
+        # from the caller's routing rather than from ambient state.
+        "origin_signal": qualified_signal(
+            "investigate:contract-suppressed:", goal_id, source),
         "tags": ["cargo-cult", "auto-filed", "regime-c",
                  f"source-goal:{goal_id}"],
         "created_at": datetime.now().replace(microsecond=0).isoformat(),
@@ -1176,17 +1191,44 @@ def cmd_contract_per_goal(args, cfg: dict, contract_cfg: dict) -> int:
             reset_consecutive_deep(args.goal_id, args.source)
         return 0
 
+    # The goal's OWN substantive rate, when the sensor tracks it. consecutive_deep
+    # is a STREAK, not a rate — reporting only the streak invited readers to infer
+    # "issues found on every fire", which is false whenever the streak is shorter
+    # than the run history (: streak 3 against 22/32 = 68.8% substantive).
+    # guard-3060 / guard-2406 both turn on this distinction, so the Idea has to
+    # carry the rate or its reader cannot apply them.
+    _hits = goal.get("substantive_hits")
+    _runs = goal.get("substantive_runs")
+    if isinstance(_hits, int) and isinstance(_runs, int) and _runs > 0:
+        rate_line = (
+            f"Its own substantive rate across tracked runs is {_hits}/{_runs} "
+            f"({100.0 * _hits / _runs:.1f}%) — NOT every fire. Judge the deep "
+            f"label on this goal's own reading, never on the iteration's total "
+            f"learning (guard-3060, guard-2406).\n\n"
+        )
+    else:
+        rate_line = (
+            "This goal does not track substantive_hits/substantive_runs, so its "
+            "own hit RATE is unknown here — a streak is not a rate. Establish the "
+            "rate before treating the deep signal as continuous (guard-3060).\n\n"
+        )
+
     idea = {
         "title": dedup_title,
         "description": (
-            f"Recurring goal {args.goal_id} ({title}) has produced "
-            f"{consecutive_deep} consecutive deep outcomes — issues found on "
-            f"every fire — yet auto-contract has reached the floor "
-            f"({floor:.2f}h, {floor_ratio:g}x original {original}h).\n\n"
+            f"Recurring goal {args.goal_id} ({title}) closed deep "
+            f"{consecutive_deep} times consecutively, which reached the "
+            f"contract threshold. Auto-contract then DECLINED to act: its "
+            f"interval is {interval_hours}h and the next contraction would be "
+            f"{proposed}h, which is below the floor of {floor:.2f}h "
+            f"({floor_ratio:g}x original {original}h). The interval has NOT "
+            f"reached the floor — the floor is what stopped it, and it is "
+            f"doing its job unless the evidence below says otherwise.\n\n"
+            f"{rate_line}"
             f"Either:\n"
             f"  1. Rebase original_interval_hours to a smaller value if the "
             f"natural cadence is genuinely tighter than the original\n"
-            f"  2. Investigate WHY every fire produces deep outcomes "
+            f"  2. Investigate WHY the deep streak keeps rebuilding "
             f"(real signal vs. false positive in the routine/deep classifier)\n"
             f"  3. Retire this goal if the persistent deep signal indicates "
             f"the work it represents is no longer useful"
@@ -1424,7 +1466,8 @@ def main() -> int:
         )
         return 0
 
-    idea = build_idea(args.goal_id, title, interval_hours, consecutive, datetime.now())
+    idea = build_idea(args.goal_id, title, interval_hours, consecutive,
+                      datetime.now(), source=args.source)
 
     if args.dry_run:
         print(f"[cargo-cult] DRY-RUN — would file on {asp_id}:")

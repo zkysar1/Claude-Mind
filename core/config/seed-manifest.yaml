@@ -226,10 +226,24 @@ exclude_always:
 # Pattern values are Python regex strings (single-quoted to avoid YAML escape issues).
 #
 # TEMPLATE STATUS:
-#   - F1 (env.example), F2 (README.md): templates land in this same PR
-#   - I6/I11/I12/I13/I16 (file_replace on SKILL.md / convention files): templates TODO
-#     until skill body is implemented and dry-run reveals the exact clean version needed.
-#     Marked with `pending_template: true` — skill skips with WARN until template lands.
+#   - F1 (.env.example), F2 (README.md): templates exist under core/config/seed-templates/.
+#   - No `pending_template: true` rules remain. Five (F3-F7, on aspirations-spark
+#     SKILL.md / learning-routing.md / domain-overlay-pattern.md /
+#     run-full-suite-after-deep-code.md / verify-learning SKILL.md) were REMOVED
+#     2026-08-01 (g-115-3474) after measuring that they were no-ops: `pending_template`
+#     DROPS the file_replace and lets the file fall through to the ordinary
+#     inline_edit + global_regex + word_list_strip chain (_seed_transforms.py:470),
+#     so deleting the rule leaves transform output byte-identical. Their template
+#     sources had never been authored, and the pointers falsely read as "these files
+#     do not promote." Measured chain residual (domain refs before -> after):
+#     aspirations-spark 1->0, domain-overlay-pattern 2->0, learning-routing 2->1,
+#     run-full-suite 3->1, verify-learning 165->13. The verify-learning residual is
+#     tracked by g-115-4535 — ~4 of those 13 are FUNCTIONAL checks asserting
+#     deployment-specific artifacts, which no template or regex fixes (a rename
+#     just makes the check assert a DIFFERENT nonexistent artifact).
+#   - `pending_template: true` remains a supported escape hatch (drop the replace,
+#     use the chain). If you add one, give it an owning goal — an unowned pending
+#     flag is indistinguishable from a dangling pointer.
 
 transformations:
   # ---------------------------------------------------------------------------
@@ -247,40 +261,9 @@ transformations:
     source: "core/config/seed-templates/README.md"
     reason: "Source README is mostly generic but has agents/<agent>/ path layout drift and a few AyoAI specifics; seed gets a clean re-statement."
 
-  - id: F3
-    type: file_replace
-    target: ".claude/skills/aspirations-spark/SKILL.md"
-    source: "core/config/seed-templates/skills/aspirations-spark-SKILL.md"
-    reason: "Source has npc-domain BIAS as active code path in program-alignment handler (lines 232,243,262-263,272). Full replacement easier than multiline inline_edit. Q26."
-    pending_template: true
-
-  - id: F4
-    type: file_replace
-    target: "core/config/conventions/learning-routing.md"
-    source: "core/config/seed-templates/conventions/learning-routing.md"
-    reason: "Multiple AyoAI references throughout the file + port leaks (28080-28083); cleanest is full file_replace"
-    pending_template: true
-
-  - id: F5
-    type: file_replace
-    target: "core/config/conventions/domain-overlay-pattern.md"
-    source: "core/config/seed-templates/conventions/domain-overlay-pattern.md"
-    reason: "Multiple AyoAI references"
-    pending_template: true
-
-  - id: F6
-    type: file_replace
-    target: ".claude/rules/run-full-suite-after-deep-code.md"
-    source: "core/config/seed-templates/rules/run-full-suite-after-deep-code.md"
-    reason: "Concrete repo refs (C:/ZakNoCloud/GitHub/Ayoai/*, Ayoai-Environment-Server, etc.) at lines 30,56,57"
-    pending_template: true
-
-  - id: F7
-    type: file_replace
-    target: ".claude/skills/verify-learning/SKILL.md"
-    source: "core/config/seed-templates/skills/verify-learning-SKILL.md"
-    reason: "~30+ domain refs across the file; too many for inline_edit; cleanest full replacement"
-    pending_template: true
+  # F3-F7 REMOVED 2026-08-01 (g-115-3474) — see TEMPLATE STATUS above. They were
+  # dangling `pending_template` pointers to template sources that were never
+  # authored; removing them leaves transform output byte-identical.
 
   # ---------------------------------------------------------------------------
   # Inline edits (priority 2) — per-file targeted patterns

@@ -27,6 +27,90 @@ done
 # shellcheck disable=SC1091
 source "$CORE_ROOT/scripts/_runtime.sh"
 
+# ── Reducer-only stamp (2026-08-03,  two-bodies; board msg-20260803-122452-alpha-5159) ──
+# in_flight is keyed by AGENT NAME — one row per MIND — while bodies are per-SID.
+# -d guarded the CLEAR side by claimed_by_sid ownership; this is the
+# WRITE-side twin: an unconditional stamp lets a worker Body's claim clobber the
+# reducer's live row (and the reducer's later verify-clear would blank the
+# worker's — mutual clobber with NO self-heal: heartbeat-tick never refreshes
+# in_flight, so it lasts the whole goal). Only the reducer may stamp: this box's
+# running-session-id exists AND equals this session's MIND_SID. Every other
+# body (cross-box worker: file absent; same-box worker: mismatch) skips loudly,
+# exit 0 — a skip is not a failure, the claim must never break on it. Worker
+# fleet-visibility is NOT lost: the claim's board announce still fires, and that
+# is the reliable cross-box signal (guard-997); a body-keyed row is follow-up.
+if [ -n "$AGENT" ]; then
+    _AGENT_DIR="$(agent_dir "$AGENT")"
+    _RSID_FILE="$_AGENT_DIR/session/running-session-id"
+    _RSID=""
+    [ -f "$_RSID_FILE" ] && _RSID="$(tr -d '[:space:]' < "$_RSID_FILE" 2>/dev/null || true)"
+    if [ -z "${MIND_SID:-}" ] || [ -z "$_RSID" ] || [ "$_RSID" != "$MIND_SID" ]; then
+        # ── Body-keyed visibility row () ──────────────────────────
+        # The reducer row stays untouched (above) — that guarantee is the whole
+        # point of -d and is NOT relaxed here. But a bare `exit 0` left
+        # worker-Body goals with NO team-state row at all, which silently
+        # degraded two readers that gate on in_flight: the guard-741
+        # uncommitted-collision probe (goal-pickup-coordination-check) and
+        # _cross_agent_attribution_filter's Source-1 work windows. Both now also
+        # consume `in_flight_bodies`.
+        #
+        # Keyed by SID because that is the only per-INSTANCE identity available
+        # (worker_close_in_flight_clear's header enumerates why: in_flight has no
+        # sid, iteration-checkpoint.json is agent-wide, the Body WM records
+        # nothing). One row per body, siblings never collide.
+        #
+        # NO SID => NO ROW. An unkeyed body row could not be cleared by its owner
+        # and would strand as a permanent phantom claim — strictly worse than the
+        # missing row this closes. Skip loudly, exactly as before.
+        #
+        # NO LOCAL AGENT DIR => NO ROW either. A real Body always runs on a box
+        # where its own agent dir exists (that is where the session/ it reads
+        # lives), so an absent dir means the --agent is not a resident agent —
+        # a probe, a typo, or a test fixture. Writing there manufactures a
+        # team-state row for an agent that does not exist, and nothing ever
+        # clears it. Measured: without this gate the in_flight-guard regression
+        # test (a deliberately nonexistent --agent) created a real shard in the
+        # SHARED store on every suite run. Fail-safe direction — declining to
+        # write is always recoverable; a phantom row is not (guard-2166).
+        _NO_ROW_REASON=""
+        if [ -z "${MIND_SID:-}" ]; then
+            _NO_ROW_REASON="no MIND_SID to key it"
+        elif [ ! -d "$_AGENT_DIR" ]; then
+            _NO_ROW_REASON="no local agent dir ($_AGENT_DIR) — not a resident agent"
+        fi
+        if [ -n "$_NO_ROW_REASON" ]; then
+            # Keep the sid=/rsid= diagnostic SHAPE of the fall-through skip
+            # below — it is the operator-facing "why did this skip" contract and
+            # test_team_state_in_flight_guard.py pins `sid=unset` / `rsid=absent`
+            # on it. The first cut of this branch invented a new wording, which
+            # read fine in isolation and broke that test (guard-695: fix the
+            # message, do not re-pin a new literal in the test).
+            echo "[team-state-in-flight] SKIP stamp: non-reducer body (sid=${MIND_SID:-unset}, rsid=${_RSID:-absent}) — no body row: $_NO_ROW_REASON" >&2
+            exit 0
+        fi
+        _BODY_VALUE="$(GOAL_ID="$GOAL_ID" TITLE="$TITLE" PHASE="$PHASE" \
+            $(rt_python_launcher) -c '
+import json, os, datetime
+print(json.dumps({
+    "goal_id": os.environ.get("GOAL_ID") or None,
+    "title": os.environ.get("TITLE") or "",
+    "claimed_at": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+    "phase": os.environ.get("PHASE") or None,
+}, sort_keys=True))' 2>/dev/null)" || _BODY_VALUE=""
+        if [ -n "$_BODY_VALUE" ]; then
+            # FAIL-OPEN, like the reducer stamp the claim wraps: a visibility
+            # row must never fail a claim that already committed in the daemon.
+            MIND_AGENT="$AGENT" bash "$CORE_ROOT/scripts/team-state-update.sh" \
+                --field "agent_status.${AGENT}.in_flight_bodies.${MIND_SID}" \
+                --value "$_BODY_VALUE" >/dev/null 2>&1 \
+                && echo "[team-state-in-flight] body row written: ${AGENT}.in_flight_bodies.${MIND_SID} -> ${GOAL_ID}" >&2 \
+                || echo "[team-state-in-flight] WARN: body row write failed for ${AGENT}/${MIND_SID} (claim unaffected)" >&2
+        fi
+        echo "[team-state-in-flight] SKIP stamp: non-reducer body (sid=${MIND_SID:-unset}, rsid=${_RSID:-absent}) — in_flight is reducer-owned" >&2
+        exit 0
+    fi
+fi
+
 QUERY=""
 _append_q() { [ -n "$QUERY" ] && QUERY+="&"; QUERY+="$1"; }
 [ -n "$AGENT" ]   && _append_q "agent=$(rt_url_encode "$AGENT")"

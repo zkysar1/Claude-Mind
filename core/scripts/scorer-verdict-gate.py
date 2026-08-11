@@ -148,9 +148,9 @@ def _log_override(event, agent):
         env = dict(os.environ)
         if agent:
             env["MIND_AGENT"] = agent
-        from _runtime_bash import BASH  # rb-1472: not bare "bash"
+        from _runtime_bash import bash_cmd  # guard-580 + guard-581
         subprocess.run(
-            [BASH, str(diary_sh), "append"],
+            bash_cmd(diary_sh, "append"),
             input=payload, text=True, capture_output=True, timeout=15, env=env,
         )
     except Exception:

@@ -26,9 +26,35 @@
 #   2. Per-file: add the path to ALLOWED_PATHS in allowed_path() below.
 #   3. Per-commit: ALLOW_SECRETS_IN_COMMIT="<one-line justification>" git commit ...
 #      (Audited to core/logs/secret-scanner-overrides.log.)
+#      STAGED MODE ONLY — see --scan-head below.
+#
+# Modes:
+#   (default)     Scan STAGED content. This is Gate 8 of the pre-commit chain.
+#   --scan-head   Scan COMMITTED content at HEAD. Audit mode, not a gate.
+#
+# WHY --scan-head EXISTS (g-306-105, 2026-08-01). The default mode is
+# DIFF-SCOPED: it reads the staged index and never inspects what is already
+# committed. So any credential committed BEFORE this script landed (2026-05-21)
+# is invisible to it permanently — the control cannot see the residue that
+# predates it. Measured on a sibling deployment: an account root key sat in
+# plaintext in two tracked files in current HEAD, first committed one month
+# before the scanner existed, and was found by accident while pre-flighting an
+# unrelated commit. This is the conditionally-active-mechanism class: the gate
+# works exactly as designed and still guarantees nothing about the tree it
+# guards. --scan-head closes the retroactive half; a recurring audit invokes it
+# so the residue surfaces on a schedule instead of by luck.
+#
+# ALLOW_SECRETS_IN_COMMIT deliberately does NOT apply to --scan-head. That
+# variable is a per-COMMIT bypass; honoring it in audit mode would let a stale
+# exported value silence the whole audit, which is the failure this mode exists
+# to prevent. The per-line and per-file bypasses DO apply in both modes.
+#
+# NOTE ON REMEDIATION: finding a secret in HEAD means it is also in history, and
+# history keeps the value regardless of any scrub. ROTATION is the remediation;
+# removing the file is hygiene, not containment.
 #
 # Cross-references:
-#   - core/githooks/pre-commit Gate 8 — wire-up site
+#   - core/githooks/pre-commit Gate 8 — wire-up site (staged mode)
 #   - .claude/rules/no-auto-memory.md — secret-handling rules
 #   - core/config/conventions/secrets.md — credentials convention
 # domain-leak-exempt: this script literally contains token regex patterns
@@ -40,8 +66,23 @@ set -eu
 REPO="$(git rev-parse --show-toplevel)"
 cd "$REPO"
 
+# ─── Mode ─────────────────────────────────────────────────────────────────
+# Parsed BEFORE the override block on purpose: the override is commit-scoped
+# and must not be able to short-circuit the audit mode (see header).
+MODE="staged"
+case "${1:-}" in
+    --scan-head) MODE="head" ;;
+    -h|--help)
+        sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'
+        exit 0 ;;
+    "") : ;;
+    *)
+        echo "[secret-scanner] unknown argument: $1 (expected --scan-head or no argument)" >&2
+        exit 2 ;;
+esac
+
 # ─── Override path (audited) ──────────────────────────────────────────────
-if [[ -n "${ALLOW_SECRETS_IN_COMMIT:-}" ]]; then
+if [[ -n "${ALLOW_SECRETS_IN_COMMIT:-}" && "$MODE" == "staged" ]]; then
     mkdir -p "$REPO/core/logs"
     {
         echo "$(date +%Y-%m-%dT%H:%M:%S)" \
@@ -70,13 +111,42 @@ allowed_path() {
     return 1
 }
 
-# ─── Scan staged content ──────────────────────────────────────────────────
+# ─── Scan ─────────────────────────────────────────────────────────────────
+# Two modes, one report. Each branch below produces `raw` in the SAME
+# `path:lineno:content` shape; everything after the branch is shared, which is
+# what keeps the two modes from drifting into two different report formats.
+hits=0
+hit_report=""
+raw=""
+
+if [[ "$MODE" == "head" ]]; then
+    # ─── Scan committed content at HEAD ───────────────────────────────────
+    # `git grep <rev>` emits `HEAD:path:lineno:content` — one extra leading
+    # field vs `--cached`. Strip it so both modes hand the SAME
+    # `path:lineno:content` shape to the shared regroup loop below; that
+    # shared shape is what keeps the two modes from drifting into two
+    # different report formats.
+    raw=$(git grep -nE "$patterns" HEAD 2>/dev/null || true)
+    raw=$(printf '%s\n' "$raw" | sed 's/^HEAD://')
+    # The allowlist is applied to RESULTS here, not to inputs as in staged
+    # mode. Staged mode can pre-filter because numstat hands it a short,
+    # already-enumerated file list; a HEAD scan has no such list short of
+    # enumerating every tracked file, so filtering after the grep is both
+    # cheaper and exactly equivalent.
+    filtered=""
+    while IFS= read -r gl; do
+        [[ -z "$gl" ]] && continue
+        allowed_path "${gl%%:*}" && continue
+        filtered+="$gl"$'\n'
+    done <<< "$raw"
+    raw="$filtered"
+else
+
+# ─── Scan staged content (Gate 8) ─────────────────────────────────────────
 # git diff --cached --numstat outputs `adds\tdels\tpath` per file. Binary
 # files show `-\t-\tpath` — we skip them (regex on binary is noise). Deleted
 # files don't appear with --diff-filter=ACM.
-hits=0
-hit_report=""
-
+#
 # Collect in-scope staged files (non-binary, not allowlisted) via numstat —
 # the SAME filter as the prior per-file loop (identical file set): binary files
 # (adds=="-") and allowed_path() files are excluded so the scan never touches
@@ -98,33 +168,60 @@ if [[ ${#staged_files[@]} -gt 0 ]]; then
     # $patterns, same all-line coverage, verified git-grep-vs-grep ERE parity).
     # Output shape: `path:lineno:content` (git grep -n); no matches => exit 1.
     raw=$(git grep --cached -nE "$patterns" -- "${staged_files[@]}" 2>/dev/null || true)
-    # Drop lines carrying the per-line skip marker (same override as before).
-    raw=$(printf '%s\n' "$raw" | grep -vE 'secret-scanner:[[:space:]]*skip' || true)
+fi
 
-    if [[ -n "$raw" ]]; then
-        # Regroup git grep's flat `path:lineno:content` stream into the prior
-        # report shape: one `path:` header per file, then `    lineno:content`
-        # (truncated 200). hits = distinct files (git grep emits a file's matches
-        # contiguously, so a path change marks a new file block).
-        prev=""
-        while IFS= read -r gl; do
-            [[ -z "$gl" ]] && continue
-            path="${gl%%:*}"           # path (before first colon)
-            linecontent="${gl#*:}"     # lineno:content — same shape as old grep -n
-            if [[ "$path" != "$prev" ]]; then
-                [[ -n "$prev" ]] && hit_report+=$'\n'   # blank line ends prior block
-                hit_report+="${path}:"$'\n'
-                hits=$((hits + 1))
-                prev="$path"
-            fi
-            hit_report+="    ${linecontent:0:200}"$'\n'
-        done <<< "$raw"
-        [[ -n "$prev" ]] && hit_report+=$'\n'           # trailing blank after last block
-    fi
+fi   # end mode branch
+
+# ─── Shared: per-line skip marker + regroup ───────────────────────────────
+# Both modes reach here with the SAME `path:lineno:content` stream, so the
+# per-line bypass and the report format are defined exactly once.
+raw=$(printf '%s\n' "$raw" | grep -vE 'secret-scanner:[[:space:]]*skip' || true)
+
+if [[ -n "$raw" ]]; then
+    # Regroup git grep's flat `path:lineno:content` stream into the prior
+    # report shape: one `path:` header per file, then `    lineno:content`
+    # (truncated 200). hits = distinct files (git grep emits a file's matches
+    # contiguously, so a path change marks a new file block).
+    prev=""
+    while IFS= read -r gl; do
+        [[ -z "$gl" ]] && continue
+        path="${gl%%:*}"           # path (before first colon)
+        linecontent="${gl#*:}"     # lineno:content — same shape as old grep -n
+        if [[ "$path" != "$prev" ]]; then
+            [[ -n "$prev" ]] && hit_report+=$'\n'   # blank line ends prior block
+            hit_report+="${path}:"$'\n'
+            hits=$((hits + 1))
+            prev="$path"
+        fi
+        hit_report+="    ${linecontent:0:200}"$'\n'
+    done <<< "$raw"
+    [[ -n "$prev" ]] && hit_report+=$'\n'           # trailing blank after last block
 fi
 
 # ─── Verdict ──────────────────────────────────────────────────────────────
-if [[ $hits -gt 0 ]]; then
+if [[ $hits -gt 0 && "$MODE" == "head" ]]; then
+    cat >&2 <<EOF
+
+[secret-scanner] HEAD AUDIT — $hits committed file(s) contain token-shaped strings:
+
+$hit_report
+These are ALREADY COMMITTED. The pre-commit gate cannot have caught them: it is
+diff-scoped, so anything committed before it landed is outside what it can see.
+
+ROTATE FIRST. The value is in git history and stays there whether or not the
+file is scrubbed, so removing the file is hygiene, not containment. Treat every
+hit as live until the credential has been rotated at its issuer.
+
+Then, if a hit is a FALSE POSITIVE (a fixture, a doc example, a regex):
+  1. Per-line:   add  '# secret-scanner: skip'  to the matching line
+  2. Per-file:   add the path to allowed_path() in
+                 core/scripts/check-no-hardcoded-secrets.sh
+
+ALLOW_SECRETS_IN_COMMIT does NOT apply here — it is a per-commit bypass and is
+deliberately ignored in audit mode.
+
+EOF
+elif [[ $hits -gt 0 ]]; then
     cat >&2 <<EOF
 
 [secret-scanner] BLOCKED — $hits file(s) contain token-shaped strings:
@@ -143,6 +240,14 @@ If these are REAL credentials:
   - Do NOT use bypass option 3 as a shortcut.
 
 EOF
+fi
+
+# Non-zero on ANY hit, in BOTH modes. Kept outside the branch on purpose: with
+# the exit inside the staged arm only, audit mode printed a full findings report
+# and still exited 0, so the recurring audit that consumes this exit code could
+# never fire on the residue it exists to find (caught by the positive control
+# during g-306-105 — a report nobody acts on is the same silence as no report).
+if [[ $hits -gt 0 ]]; then
     exit 1
 fi
 

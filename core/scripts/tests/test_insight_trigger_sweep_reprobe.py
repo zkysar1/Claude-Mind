@@ -179,7 +179,7 @@ def test_case1_affects_pending_files_as_is(sandbox, capsys):
     assert rc == 0
     assert summary["scanned"] == 1
     assert summary["audit_stale"] == 0, "pending target must NOT trigger audit-stale"
-    assert summary["affects_missing"] == 0, "pending target is found — no missing"
+    assert summary["affects_missing_annotation"] == 0, "pending target is found — no missing"
     assert summary["filed"] == 1, "trigger must be filed as-is"
     assert len(sandbox["filed_calls"]) == 1
     assert len(sandbox["note_calls"]) == 0
@@ -213,7 +213,7 @@ def test_case2_affects_completed_skips_apply_emits_note(sandbox, capsys):
     assert rc == 0
     assert summary["scanned"] == 1
     assert summary["audit_stale"] == 1, "completed target MUST trigger audit-stale"
-    assert summary["affects_missing"] == 0
+    assert summary["affects_missing_annotation"] == 0
     assert summary["filed"] == 0, "Apply must NOT spawn for terminal-status target"
     assert len(sandbox["filed_calls"]) == 0, "file_goal must NOT be called"
     assert len(sandbox["note_calls"]) == 1, "audit-stale note MUST be emitted"
@@ -248,7 +248,7 @@ def test_case3_affects_missing_files_with_warning(sandbox, capsys):
     assert rc == 0
     assert summary["scanned"] == 1
     assert summary["audit_stale"] == 0, "missing target is NOT audit-stale"
-    assert summary["affects_missing"] == 1, "missing target must increment affects_missing"
+    assert summary["affects_missing_annotation"] == 1, "missing target must increment affects_missing"
     assert summary["filed"] == 1, "missing target should still file as-is with warning"
     assert len(sandbox["filed_calls"]) == 1
     assert len(sandbox["note_calls"]) == 0
@@ -281,7 +281,7 @@ def test_case4_no_affects_tag_files_unchanged(sandbox, capsys):
     assert rc == 0
     assert summary["scanned"] == 1
     assert summary["audit_stale"] == 0
-    assert summary["affects_missing"] == 0
+    assert summary["affects_missing_annotation"] == 0
     assert summary["filed"] == 1
     assert len(sandbox["filed_calls"]) == 1
     # Pending payload should still record affects_goal field (None)

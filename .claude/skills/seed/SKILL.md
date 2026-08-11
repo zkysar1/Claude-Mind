@@ -142,7 +142,12 @@ destination, applying transformations at copy time.
   - "N files to copy"
   - "K transformations to apply (broken down by type)"
   - "M files to backup at destination"
-  - List of pending_template transformations that will be SKIPPED with WARN
+  - List of pending_template files, BY NAME. These are NOT skipped: a
+    `pending_template: true` file_replace is DROPPED and the file falls through
+    to the ordinary inline_edit + global_regex + word_list_strip chain
+    (`_seed_transforms.py:470`). The WARN says which files took that fallback so
+    a dangling template pointer cannot read as "this file does not promote"
+    (g-115-3474 — that misreading is exactly what a count-only WARN produced).
   If `--dry-run`: STOP here. Print exit message "Dry run complete. Re-run
   without --dry-run to apply."
 

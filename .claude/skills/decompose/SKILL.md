@@ -127,7 +127,7 @@ Before decomposing, load the minimum context needed. Map goal keywords to files:
 | discover, explore, find | `pipeline-read.sh --counts`, `world/knowledge/tree/_tree.yaml` |
 | evaluate, score, predict | `core/config/profile.yaml` (evaluation framework), `pipeline-read.sh --stage discovered` |
 | research, learn, document | `world/knowledge/tree/_tree.yaml` |
-| review, accuracy, resolve | `pipeline-read.sh --stage active`, `pipeline-read.sh --stage resolved` |
+| review, accuracy, resolve | `pipeline-read.sh --stage active`, `pipeline-read.sh --stage resolved` AND `pipeline-read.sh --stage archived` (BOTH — `resolved` alone is a survivorship filter, ~10% of the store; g-115-4866) |
 | reflect, pattern, learn | `world/knowledge/patterns/`, `agents/<agent>/journal/` (most recent) |
 | evolve, strategy, adjust | `aspirations-read.sh --active`, `meta/meta-knowledge/_index.yaml` |
 

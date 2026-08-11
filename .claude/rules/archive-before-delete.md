@@ -70,6 +70,27 @@ its owner, tmp files this session created, or append-only writes.
    instructions — including where NOT to restore to (restoring into live
    paths can re-arm read-through resurrection). Record the receipt location
    in a durable retrievable store (knowledge tree node + reasoning bank).
+
+   **Name it `RECEIPT.*` at the archive's TOP LEVEL, and if you write a READER
+   for it, match extension- and case-insensitively.** This step deliberately
+   mandated a receipt while naming no filename — which left writers and readers
+   free to disagree, and every one of them did. Measured 2026-08-08 (g-115-3397):
+   `_seed_engine.py` writes `RECEIPT.json`, `history_vacuum_archive.py` writes
+   lowercase `receipt.json`, and the one reader in the tree
+   (`temp-drain-purge.sh` Lane 3, which preserves archives from a drain purge)
+   required `RECEIPT.md` **exactly** — a name **zero** producers write. The
+   protection was therefore unreachable by every archive the framework itself
+   creates; it fired only on a receipt a human had hand-named. A live
+   archive-before-delete archive carrying `RECEIPT.json` was listed for deletion
+   and survived only because someone hand-marked it mid-drain.
+
+   The asymmetry is what makes this a rule rather than a preference: a missed
+   sentinel DESTROYS a recovery layer, while an over-match merely retains a
+   directory until someone looks. So readers widen on the PRESERVE side — but
+   anchor the match (`RECEIPT` / `RECEIPT.*`, top level only). A bare
+   `*receipt*` substring, or a match at any depth, preserves scratch dirs full
+   of receipt-ish notes and makes the guard unfalsifiable (guard-2860 — never
+   relax an ownership predicate into a pattern).
 7. **Blast-radius check before the delete fires**: enumerate what READS this
    data. Read-through/restore-on-miss sync layers, session-binding caches,
    and registry rows can re-materialize or depend on "deleted" data (the
@@ -89,6 +110,18 @@ its owner, tmp files this session created, or append-only writes.
 - Archiving by moving (a move is a delete of the original)
 - Verifying by sample instead of full count+bytes+checksum
 - No receipt: an archive nobody can find or restore from is not an archive
+- Treating an ADJACENT backup routine as coverage without intersecting its
+  SET with the deletion's set. Measured (g-115-4471): `seed-transplant`'s
+  orphan sweep deleted destination files with a bare `unlink()` while a
+  working `do_backup()` sat in the same script — but that backup archives the
+  manifest INCLUDE-set (files about to be OVERWRITTEN), and the orphan set is
+  the files about to be DELETED. The two are disjoint BY DEFINITION, so the
+  recoverable operation had a backup and the unrecoverable one had none. The
+  backup is what made the gap invisible: a reader asking "is this script
+  careful about data?" finds a real archive routine and stops. Ask instead
+  "does the backup's set intersect the set this step destroys?" — where the
+  intersection is empty, coverage is zero no matter how good the backup is.
+  (rb-6344; twin defect from the classification side: rb-4267.)
 
 ## Cross-references
 

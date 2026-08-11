@@ -50,6 +50,7 @@ FULL_CONTENT=""
 INCLUDE_FRAMEWORK=""
 READ_ONLY=""
 GOAL=""
+GOAL_TITLE=""
 TREE_NODES=""
 ENTRY_TYPE=""
 AS_OF=""
@@ -83,6 +84,13 @@ while [[ $# -gt 0 ]]; do
             shift;;
         --goal)
             GOAL="${2-}"
+            shift $(( $# >= 2 ? 2 : 1 ));;
+        --goal-title)
+            # NOT forwarded to the daemon — consumed locally by the
+            # commons-retrieval hook below, whose query token set is
+            # tokens(category) | tokens(title). Dropping it would silently
+            # narrow every commons match.
+            GOAL_TITLE="${2-}"
             shift $(( $# >= 2 ? 2 : 1 ));;
         --tree-nodes)
             TREE_NODES="${2-}"
@@ -125,11 +133,55 @@ QUERY="category=$(rt_url_encode "$CATEGORY")"
 [ -n "$ENTRY_TYPE" ]        && QUERY+="&entry_type=$(rt_url_encode "$ENTRY_TYPE")"
 [ -n "$AS_OF" ]             && QUERY+="&as_of=$(rt_url_encode "$AS_OF")"
 
+# --- Commons-retrieval hook (Pattern B slot `commons-retrieval`) ----------
+# Fires the domain's shared-commons producer for goal-scoped retrievals.
+#
+# WHY HERE AND NOT IN THE DIGEST (). Prose and a `Bash:` line inside
+# a loaded digest are the SAME enforcement class: both need the model to elect
+# to run them.  converted Step 4a from prose to a Bash: line and the
+# fire rate stayed partial — this box logged 2 invocations while another box
+# logged 0 across three Phase-4 executions. Folding the call in here means it
+# rides the ONE retrieval election that already has enforcement behind it
+# (iteration-close.sh writes a no-retrieval stub when retrieval-session.json
+# is absent; phase-4-26-gate.py and the learning gate read it). That does not
+# make the slot unconditional — no unconditional mid-Phase-4 script chokepoint
+# exists, every step there is an LLM-elected Bash: line — but it removes the
+# one election that had NO enforcement at all.
+#
+# ORDERING IS NOW STRUCTURAL, NOT DOCUMENTED. The daemon call above has
+# already rewritten retrieval-session.json wholesale, so the producer's
+# `commons_patterns` merge can no longer be clobbered by it. The digest
+# previously had to warn about that ordering in prose.
+#
+# CONTRACT: stdout stays pure JSON for callers that parse it, so the
+# producer's verdict is redirected to stderr (still visible to the caller,
+# which is what Step 4a's "report the verdict" obligation needs).
+# Fail-open — a commons miss enriches execution, it never gates it.
+# `test -f` not `-x`: own-cloud materialization drops the exec bit (guard-1124).
+_commons_draw() {
+    [ -n "$GOAL" ] || return 0          # goal-scoped retrievals only
+    [ -z "$READ_ONLY" ] || return 0     # observer safety: never write in reader/assistant
+    local hook="${WORLD_DIR:-}/scripts/commons-retrieve.sh"
+    if [ -n "${WORLD_DIR:-}" ] && [ -f "$hook" ]; then
+        bash "$hook" --goal-id "$GOAL" --category "$CATEGORY" \
+             --title "$GOAL_TITLE" --draw-top 2 >&2 || true
+    else
+        # Do NOT go silent. "No producer on this box" and "ran and drew
+        # nothing" are different facts, and the digest's `|| true` rendered
+        # them identically — which is how a never-wired slot looked healthy
+        # for seven days. Under own-cloud a `test -f` miss can also just mean
+        # the file was never materialized into this box's read-through cache
+        # (guard-980), so the distinction is load-bearing (guard-2352).
+        echo "[retrieve] commons-retrieval: no producer at \$WORLD_DIR/scripts/commons-retrieve.sh — slot fired, nothing drawn" >&2
+    fi
+    return 0
+}
+
 rc=0
 rt_call GET /v1/retrieve --query "$QUERY" || rc=$?
 
 case $rc in
-    0) exit 0;;
+    0) _commons_draw; exit 0;;
     2)
         # Daemon answered with HTTP 4xx/5xx; body already on stderr.
         exit 1;;
@@ -138,7 +190,7 @@ case $rc in
         if rt_try_autospawn; then
             rc=0
             rt_call GET /v1/retrieve --query "$QUERY" || rc=$?
-            if [ "$rc" = "0" ]; then exit 0; fi
+            if [ "$rc" = "0" ]; then _commons_draw; exit 0; fi
         fi
         rt_no_daemon_error "retrieve.sh";;
     *)

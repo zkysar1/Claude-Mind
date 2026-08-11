@@ -15,7 +15,19 @@
 # BASH_SOURCE[0] resolves to THIS file's location (not the caller's $0).
 # This is critical — it anchors all paths to core/scripts/ regardless of cwd.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CORE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"       # core/
+# CORE_ROOT is DELIBERATELY shell-only — assigned, never exported. The asymmetry
+# with the exported PROJECT_ROOT on the next line is intentional and is documented
+# here because it is otherwise a trap: it cost  (aspirations-consolidate
+# Step 5.5 read os.environ['CORE_ROOT'] in a child `py -3 -c`, raised KeyError in
+# every shell where $CORE_ROOT was set and correct, and — behind `2>/dev/null ||
+# true` — reported rc=0 while truncating nothing, on every box, for months).
+# DECISION (, 2026-08-07): keep it unexported. Measured blast radius of
+# the gap was exactly ONE consumer repo-wide, now fixed at its own call site, so
+# exporting would widen the environment of every child process for zero current
+# beneficiary. If you need CORE_ROOT in a child, pass it explicitly at the call
+# site — `CORE_ROOT="$CORE_ROOT" py -3 -c '...os.environ["CORE_ROOT"]...'` — which
+# is what guard-165 already requires for every other runtime value anyway.
+CORE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"       # core/  (shell-only — see above)
 export PROJECT_ROOT="$(cd "$CORE_ROOT/.." && pwd)"  # repo root (exported so world/scripts inherit it)
 CONFIG_DIR="$CORE_ROOT/config"
 REPO_ROOT="$PROJECT_ROOT"                        # legacy alias
@@ -60,7 +72,28 @@ elif ! python3 -c "pass" &>/dev/null; then
     fi
     if [ -n "$_PY_TARGET" ]; then
         mkdir -p "$_PY_SHIM_DIR"
-        printf '#!/usr/bin/env bash\nexec %s "$@"\n' "$_PY_TARGET" > "$_PY_SHIM_DIR/python3"
+        # Multi-launcher shim with self-recursion guard (2026-08-06): the shim
+        # runs later in subprocess chains whose PATH differs from generation
+        # time (C:\Windows often stripped, so `py` unresolvable) — it must
+        # re-resolve per call and must never exec a candidate that resolves
+        # back into its own dir. That exec loop spawned alternating env+bash
+        # pairs at ~700MB each until the caller timed out, on every hook and
+        # polling tick.
+        cat > "$_PY_SHIM_DIR/python3" <<'PYSHIM'
+#!/usr/bin/env bash
+shim_dir=$(cd "$(dirname "$0")" && pwd)
+for candidate in py python python3 /c/Windows/py; do
+  resolved=$(command -v "$candidate" 2>/dev/null)
+  if [ -z "$resolved" ] && [ -x "$candidate" ]; then resolved="$candidate"; fi
+  [ -n "$resolved" ] || continue
+  case "$resolved" in
+    "$shim_dir"/*) continue ;;
+  esac
+  exec "$resolved" "$@"
+done
+echo "python3 shim: no Python launcher found (tried: py, python, python3, /c/Windows/py)" >&2
+exit 127
+PYSHIM
         chmod +x "$_PY_SHIM_DIR/python3"
         cp "$_PY_SHIM_DIR/python3" "$_PY_SHIM_DIR/python"
         chmod +x "$_PY_SHIM_DIR/python"

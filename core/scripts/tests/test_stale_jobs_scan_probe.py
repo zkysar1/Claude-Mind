@@ -446,5 +446,161 @@ class ForeignRootOrphanScopingTest(unittest.TestCase):
                          "only our 2 orphans count; the 4 sibling orphans are scoped out")
 
 
+def _unallocatable_pid():
+    """A PID the kernel can never assign, so /proc/<pid> is guaranteed absent.
+
+    guard-1699: do NOT hardcode a plausible PID as a stand-in for the category
+    "a process that does not exist". Measured on cc-03: pid_max is 4194304 and
+    live PIDs already exceed 3.1M, so a hardcoded 999999 sits squarely inside
+    the allocatable range -- absent by luck, not by construction. The day the
+    counter wraps onto it, CreationDate stops being None and the test below
+    inverts, reading as a regression in the scanner rather than as fixture rot.
+    """
+    try:
+        with open("/proc/sys/kernel/pid_max") as fh:
+            return int(fh.read().strip()) + 1
+    except Exception:
+        # No /proc at all (non-Linux): every /proc read the scanner attempts
+        # fails anyway, which is exactly the state these cases are pinning.
+        return 2 ** 31 - 1
+
+
+class UnixProcessAgeCorruptionTest(unittest.TestCase):
+    """. `ps -o etimes` is not trustworthy for young processes.
+
+    Measured 2026-08-06 (hostname cc-03, Linux 6.8.0-136-generic): for a process
+    younger than the box's btime/uptime skew (~16s there) etimes returns
+    4123168576 -- an exact 32-bit unsigned wrap of a negative elapsed
+    (4294967296 - 4123168576 = 171798720). `ps -o lstart` and /proc were both
+    correct for the same PID at the same instant.
+
+    The consequence INVERTS this scanner: the YOUNGEST processes report as the
+    OLDEST (~130 years => 1145324h), past every threshold at once. The
+    MIN_PROCESS_AGE_SECONDS newborn cooldown cannot catch it, because that guard
+    is computed FROM the corrupted age -- the one check written to protect young
+    processes is the one the defect disables. Demonstrated live before the fix: a
+    1-SECOND-old healthy `python3 ... core/scripts ...` was reported as a
+    hook-python B-orphan at elapsed=1145324.6h against a 0.5h threshold, i.e. a
+    SIGTERM/SIGKILL candidate under `scan --auto-kill`, in its first second.
+
+    These tests drive a SYNTHETIC ps table so they pin the defect on every box,
+    including ones whose clocks show no skew and where the bug cannot reproduce.
+    """
+
+    _PS_HEADER = "    PID    PPID  ELAPSED COMMAND COMMAND"
+    _WRAPPED = 4123168576
+    _NO_SUCH_PID = _unallocatable_pid()
+
+    def _run_with_ps(self, ps_stdout):
+        fake = mock.MagicMock(returncode=0, stdout=ps_stdout, stderr="")
+        with mock.patch.object(sjs, "IS_WINDOWS", False), \
+                mock.patch.object(sjs.subprocess, "run", return_value=fake):
+            return sjs.get_all_processes()
+
+    def test_wrapped_etimes_never_yields_a_geologic_age(self):
+        """The core regression. A live PID (this test process) carrying a wrapped
+        etimes must not come back ~130 years old -- /proc is authoritative and is
+        consulted first, so the wrapped value never reaches CreationDate."""
+        pid = os.getpid()
+        procs = self._run_with_ps(
+            f"{self._PS_HEADER}\n{pid} 1 {self._WRAPPED} python3 python3 -c pass\n"
+        )
+        self.assertEqual(len(procs), 1)
+        age_h = sjs.process_age_hours(procs[0])
+        self.assertIsNotNone(age_h, "a live PID must remain ageable via /proc")
+        self.assertLess(
+            age_h, 24,
+            f"wrapped etimes leaked into CreationDate: age={age_h}h. This is the "
+            "defect that made a 1s-old process a SIGKILL candidate.",
+        )
+
+    def test_unageable_process_is_never_a_candidate(self):
+        """Fail-safe half. A PID with no /proc entry AND a corrupt etimes must
+        yield CreationDate=None, and None must keep it OUT of the candidate set
+        rather than defaulting it to something reapable."""
+        pid = self._NO_SUCH_PID
+        self.assertFalse(
+            os.path.exists(f"/proc/{pid}"),
+            f"precondition: /proc/{pid} must not exist, else this case silently "
+            "stops testing the un-ageable path (guard-1699)",
+        )
+        procs = self._run_with_ps(
+            f"{self._PS_HEADER}\n"
+            f"{pid} 1 {self._WRAPPED} python3 python3 /x/core/scripts/hook.py\n"
+        )
+        self.assertEqual(len(procs), 1)
+        self.assertIsNone(procs[0]["CreationDate"])
+        self.assertIsNone(sjs.process_age_hours(procs[0]))
+        cands = sjs.identify_candidates(procs, None, [], set(),
+                                        sjs.DEFAULT_THRESHOLDS)
+        self.assertEqual(
+            [c for c in cands if c["pid"] == pid], [],
+            "an un-ageable process must never be reaped -- unknown age is not old age",
+        )
+
+    def test_unageable_process_still_enumerated_for_ancestry(self):
+        """None must mean 'age unknown', NOT 'drop the row'. Dropping it would
+        punch a hole in by_pid, making a live parent look dead and turning its
+        children reapable -- a fix that creates the failure it prevents."""
+        pid = self._NO_SUCH_PID
+        procs = self._run_with_ps(
+            f"{self._PS_HEADER}\n"
+            f"{pid} 1 {self._WRAPPED} bash bash /x/wrapper.sh\n"
+        )
+        self.assertEqual([p["ProcessId"] for p in procs], [pid])
+
+
+class SsmRemoteSignatureTest(unittest.TestCase):
+    """. The ssh-shaped detector went blind when operator access moved
+    to SSM: nothing in the live chain is an `ssh` process any more.
+
+    The negative half is the load-bearing one. Measured against a real long call,
+    the chain is TWO durable bash wrappers (efs-ssh.sh, ssm-run.sh) that persist
+    for the whole operation, plus `aws-exec.sh ssm get-command-invocation` and its
+    `aws` child, which are ~2s subprocesses RESPAWNED EVERY POLL by the wait loop.
+    So the obvious remedy -- 'add an aws ssm pattern' -- fires on perfectly
+    HEALTHY in-flight calls, and every one of those poll processes is young enough
+    to also hit the etimes corruption above. These tests pin the durable-wrapper
+    choice so a future well-meaning edit cannot quietly re-introduce it."""
+
+    def test_durable_wrappers_are_classified(self):
+        for cmd in (
+            "bash /w/scripts/efs-ssh.sh sleep 120; echo done",
+            "bash /w/scripts/ssm-run.sh i-04063a4d5a9ded043 'uptime'",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(sjs.classify_orphan(cmd, "bash"), "ssm-remote")
+
+    def test_transient_poll_subprocesses_are_NOT_classified(self):
+        """These respawn every ~2s during a HEALTHY call. Matching them would
+        reap working operator connections."""
+        for cmd, name in (
+            ("bash /w/scripts/aws-exec.sh ssm get-command-invocation --command-id x",
+             "bash"),
+            ("/snap/aws-cli/2312/bin/aws ssm get-command-invocation --command-id x",
+             "aws"),
+            ("/snap/aws-cli/2312/bin/aws ssm send-command --instance-ids i-abc",
+             "aws"),
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertNotEqual(
+                    sjs.classify_orphan(cmd, name), "ssm-remote",
+                    "transient per-poll subprocess must not be reapable",
+                )
+
+    def test_ssh_signature_retained(self):
+        """Kept deliberately: other hosts may still be reached by ssh, so
+        replacing rather than adding would trade one blind spot for another."""
+        self.assertEqual(
+            sjs.classify_orphan("ssh -o Foo=bar ec2-user@10.0.0.1 uptime", "ssh"),
+            "ssh-efs",
+        )
+
+    def test_ssm_remote_has_a_threshold(self):
+        """A label with no threshold silently inherits `default` (12h), which
+        would make a wedged 1h connection invisible for half a day."""
+        self.assertEqual(sjs.DEFAULT_THRESHOLDS["ssm-remote"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

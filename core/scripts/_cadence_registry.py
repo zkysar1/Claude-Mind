@@ -22,10 +22,27 @@ in the battery script.
 SCOPE (principled, NOT a silent cap — the failure mode this fix targets is
 "LLM skips the phase -> the cadence-check gate is never run -> the skill is
 never invoked -> the ritual starves"):
-  IN  — the six cadences whose fire-action is a single LLM SKILL INVOCATION:
+  IN  — the seven cadences whose fire-action is a single LLM SKILL INVOCATION,
+        in phase order (the order CADENCES below is kept in):
         fresh-eyes-review (0.5e), fresh-eyes-program (0.5e.5),
-        fresh-eyes-tree (0.5e.7), felt-sense (0.5f), curriculum (0.5i),
-        evolution (0.5j).
+        fresh-eyes-tree (0.5e.7), strategic-scan (0.5e.9), felt-sense (0.5f),
+        curriculum (0.5i), evolution (0.5j).
+  IN, ADDED 2026-08-02 (g-115-4691) — strategic-scan. It was not excluded on
+        shape grounds; it was NEVER CONSIDERED, and this docstring's silence is
+        the only place that showed it. Its fire-action is one skill invocation,
+        so it met the IN criterion from day one — it was simply invisible here
+        because its consumer phase lives at ORCHESTRATOR Phase 1.5 rather than
+        in precheck, and this list was assembled from precheck phases. It then
+        starved exactly as predicted: 19.5h against a 4h cadence (alpha, cc-04,
+        2026-08-02), with nothing in bash reading last_strategic_scan at all.
+        A Phase-1.5-local gate was considered and rejected as structurally
+        impossible — a bash call inside an LLM-skippable block inherits the
+        skippability (measured: the phase-start/phase-end diary markers already
+        sitting inside that block produced 0 markers in 178 diary lines on a box
+        where the stamp was 3.9h fresh). Idempotent with Phase 1.5 via the shared
+        last_strategic_scan stamp, the same pairing evolution uses with Phase 8.8.
+        When adding a cadence, check the ORCHESTRATOR phases too — not only
+        precheck's.
   OUT — l1-skew (0.5g): SELF-ACTING — it posts findings to the board INSIDE the
         script via --post-board, so its value does not depend on a follow-up LLM
         skill invocation; it cannot starve via the skill-skip mode. Keeps its
@@ -45,7 +62,7 @@ Entry fields:
                  crossed), exit 1 (or any non-zero) = noop. The check scripts
                  "only read state" (goal-count vs last-fire), so running them in
                  the battery is side-effect-free.
-  meter_name     the aspirations-precheck-budget-meter.sh sweep name. All six are
+  meter_name     the aspirations-precheck-budget-meter.sh sweep name. All are
                  `deferrable` tier — the meter drops them ONLY in the tight zone.
                  The battery does NOT read the meter (the checks are cheap +
                  read-only); the SKILL.md dispatch loop meter-gates the expensive
@@ -77,6 +94,17 @@ CADENCES: list[dict] = [
         "check_cmd": ["fresh-eyes-cadence-check.sh", "--config-block", "fresh_eyes_tree"],
         "meter_name": "fresh-eyes-tree-cadence",
         "fire_dispatch": "invoke /fresh-eyes-tree --cadence",
+    },
+    {
+        # . Phase id 0.5e.9 places it after the fresh-eyes trio and
+        # before felt-sense (0.5f); it has no precheck phase of its own — the
+        # battery IS its dispatch point, with orchestrator Phase 1.5 retained as
+        # the sooner-firing goal_cadence / recurring_settling path.
+        "name": "strategic-scan",
+        "phase": "0.5e.9",
+        "check_cmd": ["strategic-scan-cadence-check.sh"],
+        "meter_name": "strategic-scan-cadence",
+        "fire_dispatch": "invoke /aspirations-strategic-scan (scan_trigger=time_cadence)",
     },
     {
         "name": "felt-sense",

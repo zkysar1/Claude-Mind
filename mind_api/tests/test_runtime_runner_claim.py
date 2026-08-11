@@ -254,6 +254,58 @@ def test_acquire_live_peer_not_reclaimed_stays_held(running_daemon, monkeypatch)
                         ("reclaim", "alpha")]
 
 
+def test_acquire_live_peer_names_the_holder(running_daemon, monkeypatch):
+    """-c: the plain-HELD answer names the CURRENT holder, reusing the
+    get_runner_state read this path already performs (see the call assertion in
+    the test above — the row was fetched and the result discarded).
+
+    Measured before the fix (g-306-118-a Q1, live end-to-end against production
+    own-cloud): the held body was exactly {backend, ok, acquired, held} — 4 keys,
+    no machine_id, no heartbeat_at — so runner-claim.sh could say only "another
+    machine owns a live claim", and core/config/start-phase-c.md HALTs a first
+    boot on precisely that sentence with no holder identity anywhere else in its
+    text. The pair asserted here (which box, how stale) is what lets a user
+    choose between waiting out the stale threshold and taking the claim over."""
+    _, port = running_daemon
+    hb_age = 520
+    be = _Backend(acquire_exc=_RunnerHeld("echo RUNNING (live peer)"),
+                  reclaim_ret=False,
+                  runner_state={"machine_id": "cc-03",
+                                "heartbeat_at": str(int(time.time()) - hb_age)})
+    _inject(monkeypatch, be)
+    status, body = _post(port, "/v1/admin/runner-acquire?agent=echo&token=tokB",
+                         agent="echo")
+    assert status == 200
+    assert body["held"] is True
+    assert body["acquired"] is False
+    assert body["holder_machine_id"] == "cc-03"
+    assert hb_age - 10 <= body["holder_heartbeat_age_seconds"] <= hb_age + 60
+    # NOT prev_*: that prefix means "the claim I just broke". Nothing was broken
+    # on this path — reclaim_if_stale returned False and the holder is LIVE. A
+    # consumer keying on prev_* here would report a stale-break that never
+    # happened, which is the exact misreading the 2026-07-07 incident produced.
+    assert "prev_machine_id" not in body
+    assert "reclaimed_stale" not in body
+
+
+def test_acquire_held_omits_holder_when_row_unreadable(running_daemon, monkeypatch):
+    """The holder keys are CONDITIONAL, not guaranteed. -a found THREE
+    response shapes, not two: get_runner_state can return an unreadable/absent
+    row, and the endpoint must then OMIT the keys rather than emit nulls or a
+    placeholder. runner-claim.sh depends on this to fall back to its original
+    wording instead of printing a holder it never identified."""
+    _, port = running_daemon
+    be = _Backend(acquire_exc=_RunnerHeld("alpha RUNNING (live peer)"),
+                  reclaim_ret=False, runner_state=None)
+    _inject(monkeypatch, be)
+    status, body = _post(port, "/v1/admin/runner-acquire?agent=alpha&token=tokB",
+                         agent="alpha")
+    assert status == 200
+    assert body["held"] is True
+    assert "holder_machine_id" not in body
+    assert "holder_heartbeat_age_seconds" not in body
+
+
 def test_acquire_reclaim_then_retry_races_back_to_held(running_daemon, monkeypatch):
     """Race: reclaim succeeds but another machine acquires between our reclaim and
     our retry, so the retry RAISES RunnerHeld again — the endpoint answers

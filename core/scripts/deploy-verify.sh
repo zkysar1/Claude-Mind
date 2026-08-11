@@ -74,6 +74,204 @@ GH="${GH_BIN-gh}"
 { [ -f "$GH" ] || command -v "$GH" >/dev/null 2>&1; } \
     || { echo '{"status":"unverified","detail":"gh CLI not found"}'; exit 2; }
 
+# ── Domain platform-build hook (Pattern B world-script slot) ────────────────
+# guard-119 names THIS script as the canonical post-push probe, and it read
+# GitHub Actions only. Measured 2026-08-06 (): on one commit the
+# Actions run concluded SUCCESS while the hosting platform's build of the SAME
+# commit FAILED and main was blocked — and this script returned
+# {"status":"ok"} exit 0. Following the guardrail exactly closed the goal clean
+# on a blocked pipeline. Two independent environments run the same suite; a
+# green in one is not evidence about the other.
+#
+# Core stays domain-free (.claude/rules/domain-free-examples.md): no vendor or
+# product name appears in this file. The DOMAIN supplies the probe, exactly as
+# iteration-close.sh:1838 does for its pipeline gate. No hook => byte-identical
+# behavior to before this seam existed, which is what makes it safe for the
+# many repos and worlds it does not apply to (pinned by
+# test_no_hook_verdict_is_unchanged).
+#
+# Hook contract — argv: --repo <owner/name> --sha <40-char>. stdout: one JSON
+# line {"state":"absent|ok|failed|pending|unknown","detail":...}.
+#   absent  = looked, and this repo has no platform app  -> CI verdict stands
+#   ok      = platform built this commit successfully    -> CI verdict stands
+#   failed  = platform build failed                      -> failed (exit 1)
+#   pending = still building                             -> unverified (exit 2)
+#   unknown = could not determine (no CLI, no creds, API error) -> unverified
+# `absent` and `unknown` are deliberately DIFFERENT: "no app here" is a genuine
+# no-op, "I could not see" is not. Collapsing them would rebuild the false
+# clean this seam exists to remove.
+#
+# rb-611 fail-safe: anything not recognized — a crashed hook, an unparseable
+# line, a state this version does not know — is treated as `unknown`, never as
+# a pass. The defect class here is a false ok, so an unreadable probe must
+# never be able to produce one.
+# WORLD_DIR must be RESOLVED here, not inherited. This script is invoked
+# directly (guard-119's canonical probe, a bare `deploy-verify.sh --dir <repo>`)
+# and never had a reason to source _paths.sh before, so WORLD_DIR is simply
+# absent from the environment at every real call site. Reading `${WORLD_DIR:-}`
+# alone made the hook path resolve to "/scripts/..." — never a file, always
+# `absent`, so the seam was inert in production while its unit tests (which set
+# WORLD_DIR explicitly) all passed. Measured 2026-08-06 end-to-end against the
+# real red commit: it returned {"status":"ok"} exit 0 with the hook in place.
+# guard-1943 — a green suite certifies the FUNCTION, never the WIRING; the only
+# environment where it failed was the only environment where it actually runs.
+# Pinned by test_hook_found_without_world_dir_in_env, which deliberately unsets
+# WORLD_DIR to replicate the production shape (guard-920).
+if [ -z "${WORLD_DIR:-}" ] && [ -z "${DEPLOY_VERIFY_PLATFORM_HOOK:-}" ]; then
+    _dv_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    # shellcheck source=/dev/null
+    [ -f "$_dv_dir/_paths.sh" ] && . "$_dv_dir/_paths.sh" 2>/dev/null || true
+    # _paths.sh exports WORLD_PATH; WORLD_DIR is its alias in older callers.
+    WORLD_DIR="${WORLD_DIR:-${WORLD_PATH:-}}"
+fi
+PLATFORM_HOOK="${DEPLOY_VERIFY_PLATFORM_HOOK-${WORLD_DIR:-}/scripts/deploy-verify-platform.sh}"
+platform_state=""
+platform_detail=""
+
+probe_platform() {
+    platform_state="absent"
+    platform_detail=""
+    [ -n "$PLATFORM_HOOK" ] && [ -f "$PLATFORM_HOOK" ] || return 0
+
+    # Called DIRECTLY, never as $(probe_platform): this publishes through
+    # globals, and command substitution forks a subshell that discards them
+    # (guard-2226).
+    local raw parsed rc errfile
+    errfile="$(mktemp 2>/dev/null)" || errfile=""
+
+    # BOUND THE HOOK. It reaches an external control plane, and deploy-verify.sh
+    # is guard-119's canonical post-push probe invoked from post-execution — so an
+    # unbounded hang here hangs the loop. --timeout-mins covers only the polling
+    # loop further down; it never covered this call.
+    # Generous and env-overridable rather than a short fixed cap (guard-918): a
+    # slow-but-working probe must not be downgraded to `unknown`. Expiry maps to
+    # `unknown`, which is already the fail-safe state. `timeout` is coreutils and
+    # may be absent, so degrade to the unbounded call rather than failing.
+    rc=0
+    if command -v timeout >/dev/null 2>&1; then
+        raw=$(timeout "${DEPLOY_VERIFY_HOOK_TIMEOUT:-120}" bash "$PLATFORM_HOOK" \
+                  --repo "$REPO" --sha "$SHA" 2>"${errfile:-/dev/null}") || rc=$?
+    else
+        raw=$(bash "$PLATFORM_HOOK" --repo "$REPO" --sha "$SHA" \
+                  2>"${errfile:-/dev/null}") || rc=$?
+    fi
+    # Parse stdout REGARDLESS of rc. The previous `|| raw=""` discarded a valid
+    # verdict whenever the hook exited non-zero — and a hook author has every
+    # reason to do that, since this very seam maps failed->exit 1. Measured: a
+    # hook emitting {"state":"failed"} + exit 1 was reported as "no parseable
+    # verdict" (exit 2), which both lost the verdict and named the wrong cause.
+    # rc is consulted only when stdout carried nothing.
+    #
+    # THE NO-STDOUT CASE IS HANDLED HERE, BEFORE py. It cannot be handled after:
+    # the parser below has a try/except that ALWAYS emits "unknown<TAB>...", so
+    # `parsed` is never empty and an rc/stderr branch placed after it is dead
+    # code. That is not hypothetical — it was the first cut of this very fix,
+    # and test_hanging_hook_times_out_and_is_unverified caught it.
+    if [ -z "$raw" ]; then
+        platform_state="unknown"
+        if [ "$rc" = "124" ]; then
+            platform_detail="platform hook timed out after ${DEPLOY_VERIFY_HOOK_TIMEOUT:-120}s"
+        else
+            platform_detail="platform hook produced no output (exit $rc)"
+        fi
+        # Fold the hook's own stderr into the verdict. Discarding it made every
+        # hook failure look identical and forced a by-hand re-run to learn
+        # anything (verify-before-assuming rule 4: a silenced command is zero
+        # signals). Captured to a temp file, never /dev/stderr — that path does
+        # not resolve when stderr is a pipe (guard-1883).
+        if [ -n "$errfile" ] && [ -s "$errfile" ]; then
+            platform_detail="$platform_detail: $(tr '\n\t' '  ' < "$errfile" | tail -c 300)"
+        fi
+        [ -n "$errfile" ] && rm -f "$errfile"
+        return 0
+    fi
+    # One py call returns "state<TAB>detail"; guard-165 — the value goes
+    # through the environment and the source is single-quoted, never
+    # interpolated.
+    parsed=$(RAW="$raw" py -3 -c '
+import json, os, sys
+raw = os.environ.get("RAW", "")
+line = ""
+for cand in raw.splitlines():
+    if cand.strip().startswith("{"):
+        line = cand.strip()
+try:
+    d = json.loads(line)
+    st = str(d.get("state") or "").strip().lower()
+    if st not in ("absent", "ok", "failed", "pending", "unknown"):
+        st = "unknown"
+    detail = str(d.get("detail") or "")
+except Exception:
+    st, detail = "unknown", "platform hook emitted no parseable verdict"
+sys.stdout.write(st + "\t" + detail.replace("\t", " ").replace("\n", " "))
+' 2>/dev/null) || parsed=""
+
+    if [ -z "$parsed" ]; then
+        platform_state="unknown"
+        if [ "$rc" = "124" ]; then
+            platform_detail="platform hook timed out after ${DEPLOY_VERIFY_HOOK_TIMEOUT:-120}s"
+        else
+            platform_detail="platform hook emitted no parseable verdict (exit $rc)"
+            # Fold the hook's own stderr into the verdict. Discarding it made
+            # every hook failure look identical and forced a by-hand re-run to
+            # learn anything (verify-before-assuming rule 4: a silenced command
+            # is zero signals). Captured to a temp file, never /dev/stderr —
+            # that path does not resolve when stderr is a pipe (guard-1883).
+            if [ -n "$errfile" ] && [ -s "$errfile" ]; then
+                platform_detail="$platform_detail: $(tr '\n\t' '  ' < "$errfile" | tail -c 300)"
+            fi
+        fi
+        [ -n "$errfile" ] && rm -f "$errfile"
+        return 0
+    fi
+    [ -n "$errfile" ] && rm -f "$errfile"
+    platform_state="${parsed%%$'\t'*}"
+    platform_detail="${parsed#*$'\t'}"
+}
+
+# Applies the platform verdict on top of a NON-failing CI verdict, then exits.
+# Wired at three sites: the CI-green path and both no_ci paths (a repo with no
+# push CI is where reading Actions alone is most misleading, not least).
+# $1 = the complete CI JSON payload that would have been emitted alone.
+emit_with_platform() {
+    local ci_json="$1"
+    probe_platform
+    case "$platform_state" in
+        absent|ok)
+            printf '%s\n' "$ci_json"
+            exit 0 ;;
+        failed)
+            # The CI half is described from the payload's own status, not
+            # hardcoded: this emitter is wired to the no_ci paths too, where
+            # asserting "CI passed" would be false. A verdict that misstates
+            # its own evidence is the defect class this seam exists to remove.
+            CI_JSON="$ci_json" PDETAIL="$platform_detail" py -3 -c '
+import json, os
+d = json.loads(os.environ["CI_JSON"])
+ci = "CI passed" if d.get("status") == "ok" else "this repo has no push CI"
+d["status"] = "failed"
+d["platform_state"] = "failed"
+d["detail"] = ("platform build FAILED for this sha (" + ci + "): "
+               + os.environ.get("PDETAIL", "")
+               + " -- the deploy pipeline is blocked; fix before closing the goal")
+print(json.dumps(d))'
+            exit 1 ;;
+        *)
+            CI_JSON="$ci_json" PSTATE="$platform_state" PDETAIL="$platform_detail" py -3 -c '
+import json, os
+d = json.loads(os.environ["CI_JSON"])
+st = os.environ.get("PSTATE", "unknown")
+ci = "CI passed" if d.get("status") == "ok" else "this repo has no push CI"
+d["status"] = "unverified"
+d["platform_state"] = st
+d["detail"] = (ci + " but the platform build is " + st + ": "
+               + os.environ.get("PDETAIL", "")
+               + " -- verify the platform job before claiming success")
+print(json.dumps(d))'
+            exit 2 ;;
+    esac
+}
+
 if [ -z "$REPO" ]; then
     url=$(git -C "$DIR" remote get-url origin 2>/dev/null) || url=""
     REPO=$(printf '%s' "$url" | sed -E 's#^(git@|https://)([^/:]+)[:/]##; s#\.git$##')
@@ -82,6 +280,84 @@ fi
 if [ -z "$SHA" ]; then
     SHA=$(git -C "$DIR" rev-parse HEAD 2>/dev/null) || SHA=""
     [ -z "$SHA" ] && { echo '{"status":"unverified","detail":"cannot infer sha from --dir"}'; exit 2; }
+
+    # ── STALE-SUBJECT GATE ( third manifestation) ──────────────────
+    # Inferring the sha from the LOCAL checkout answers a question nobody asked
+    # when the checkout is behind. Measured on Ayoai-Environment-Server right
+    # after a PR merge: HEAD d87b915 vs origin/main 377fa15 (14 commits behind),
+    # and the bare form emitted {"status":"ok"} for d87b915. Every field in that
+    # JSON — repo, sha, status — was factually correct; only the SUBJECT was
+    # never the commit anyone asked about, so the usual false-green tell (an
+    # implausible value) is absent by construction. A merge performed through
+    # the GitHub API is exactly the case that leaves the checkout stale, which
+    # is the fleet's highest-volume caller.
+    #
+    # WHY FAIL-CLOSED. This script's own rb-611 rule (see the `absent`/`unknown`
+    # comment above) is that an unreadable probe must never produce a pass,
+    # because the defect class here is a false ok. A stale subject is precisely
+    # an unreadable probe wearing a green.
+    #
+    # MEASURED BEFORE CHOOSING (2026-08-08, cc-07, 56 repos under /opt/GitHub):
+    #   42 of 56 (75%) would have been verified at the WRONG sha
+    #    7 genuinely current — the only calls this gate newly rejects is zero of them
+    #    7 on unpushed feature branches (no remote ref; see below)
+    #    0 detached HEAD, 0 without an origin remote
+    # The goal asked what fail-closed would NEWLY reject; two of the four
+    # concerns it named are empty here, and the rejected population is the
+    # defective one.
+    #
+    # ls-remote, NOT `@{u}`. The cheaper option is "resolve the tracked remote
+    # head" — but the tracking ref is itself a local cache that goes stale
+    # without a fetch, and 2 of the 16 repos that looked current by that measure
+    # were NOT. Using it would reproduce the same staleness bug one level down.
+    # ls-remote queries the remote directly and mutates nothing, so it is both
+    # more accurate than `@{u}` and cheaper than the fetch option.
+    #
+    # Passing --sha explicitly bypasses this entirely: the caller has named its
+    # own subject and the local checkout is irrelevant. That is the invocation
+    # guard-119 now prescribes.
+    # REFUSE ONLY ON PROVEN DIVERGENCE. The three ls-remote outcomes are NOT
+    # equivalent and collapsing them was measured to be a real regression:
+    #   rc!=0            the remote could not be read      -> UNKNOWN, warn, proceed
+    #   rc=0, empty      the branch has no remote head     -> UNKNOWN, warn, proceed
+    #   rc=0, differs    POSITIVE evidence of staleness    -> refuse
+    # An unreadable remote is a statement about the network, not about this
+    # checkout, so refusing there would make every offline call fail and — the
+    # thing that actually caught it — would preempt the PLATFORM HOOK, which is
+    # consulted later and is the whole verification path for deploys that are
+    # not GitHub Actions. A first draft of this gate refused on all three and
+    # broke 8 of the 12 platform-hook tests while 3 of the remaining 4 went
+    # VACUOUSLY green: they assert `unverified`, which the over-eager gate also
+    # returned, so the suite stayed 4/12 green while exercising none of the hook.
+    #
+    # The measured defect is the PROVEN case (42 of 56 repos), and refusing
+    # exactly that costs nothing this measurement can find: of the 7 genuinely
+    # current repos, zero are newly rejected.
+    #
+    # rc is captured on its own line, never through `| cut` — a pipe reports the
+    # LAST command's status, so `ls-remote ... | cut` returns cut's 0 even when
+    # the remote is unreachable, silently turning "unknown" into "empty" and
+    # re-collapsing the distinction this block exists to draw (guard-1150).
+    _dv_branch=$(git -C "$DIR" rev-parse --abbrev-ref HEAD 2>/dev/null) || _dv_branch=""
+    if [ -n "$_dv_branch" ] && [ "$_dv_branch" != "HEAD" ]; then
+        _dv_ls=$(git -C "$DIR" ls-remote origin "refs/heads/$_dv_branch" 2>/dev/null)
+        _dv_rc=$?
+        if [ "$_dv_rc" -ne 0 ]; then
+            echo "deploy-verify: WARNING — could not read origin to confirm the subject commit; verifying local HEAD $SHA, which may not be what was pushed (g-115-3273). Pass --sha to be certain." >&2
+        elif [ -z "$_dv_ls" ]; then
+            echo "deploy-verify: WARNING — branch '$_dv_branch' has no remote head (never pushed?); verifying local HEAD $SHA, for which no CI run can exist (g-115-3273). Pass --sha to be certain." >&2
+        else
+            _dv_remote_sha=${_dv_ls%%[!0-9a-f]*}
+            if [ -n "$_dv_remote_sha" ] && [ "$_dv_remote_sha" != "$SHA" ]; then
+                echo "{\"status\":\"unverified\",\"repo\":\"$REPO\",\"sha\":\"$SHA\",\"detail\":\"STALE SUBJECT: local $_dv_branch is at $SHA but origin/$_dv_branch is at $_dv_remote_sha — verifying the local sha would report on a commit nobody asked about (g-115-3273). Re-run as: deploy-verify.sh --dir $DIR --sha $_dv_remote_sha\",\"local_sha\":\"$SHA\",\"remote_sha\":\"$_dv_remote_sha\"}"
+                exit 2
+            fi
+        fi
+    fi
+    # Detached HEAD is deliberately NOT gated: it is the CI-runner shape, where
+    # the checkout IS the pushed sha by construction, and there is no branch to
+    # compare against. Measured 0 detached checkouts across 56 repos here, so
+    # gating it would add a rejection path with no observed population.
 fi
 
 # The runs API head_sha filter matches FULL 40-char shas only — a short sha
@@ -103,8 +379,10 @@ if [ -z "$active_count" ]; then
     exit 2
 fi
 if [ "$active_count" = "0" ]; then
-    echo "{\"status\":\"no_ci\",\"repo\":\"$REPO\",\"sha\":\"$SHA\",\"detail\":\"no active workflows\"}"
-    exit 0
+    # A repo with no Actions can still be built by a hosting platform — that is
+    # the case where reading Actions alone is MOST misleading, so the hook runs
+    # here too rather than only on the CI-green path.
+    emit_with_platform "{\"status\":\"no_ci\",\"repo\":\"$REPO\",\"sha\":\"$SHA\",\"detail\":\"no active workflows\"}"
 fi
 
 # Active workflows exist, but a git push only produces a deploy run when at
@@ -171,8 +449,7 @@ print('no')  # every active workflow is DEFINITIVELY non-push (schedule-only or 
 " 2>/dev/null) || push_capable="yes"  # helper crash -> fail-safe push-capable
 
 if [ "$push_capable" = "no" ]; then
-    echo "{\"status\":\"no_ci\",\"repo\":\"$REPO\",\"sha\":\"$SHA\",\"detail\":\"active workflows exist but none are push-triggered (schedule/dispatch-only or ghost registrations with deleted files); a git push cannot produce a deploy run\"}"
-    exit 0
+    emit_with_platform "{\"status\":\"no_ci\",\"repo\":\"$REPO\",\"sha\":\"$SHA\",\"detail\":\"active workflows exist but none are push-triggered (schedule/dispatch-only or ghost registrations with deleted files); a git push cannot produce a deploy run\"}"
 fi
 
 deadline=$(( $(date +%s) + TIMEOUT_MINS * 60 ))
@@ -217,11 +494,18 @@ print(json.dumps({'state': 'failed' if bad else 'ok', 'runs': out, 'bad': bad}))
 
     case "$state" in
         ok)
-            printf '%s' "$verdict" | py -3 -c "
-import json, sys
+            # Captured into a var rather than printed directly, so the platform
+            # hook can override a CI-green verdict. Values reach python through
+            # the environment (guard-165) — the previous form interpolated
+            # $REPO/$SHA into the source text, and this site had to be rewritten
+            # to route through the emitter regardless.
+            ci_ok_json=$(printf '%s' "$verdict" | REPO="$REPO" SHA="$SHA" py -3 -c '
+import json, os, sys
 v = json.load(sys.stdin)
-print(json.dumps({'status': 'ok', 'repo': '$REPO', 'sha': '$SHA', 'runs': v['runs']}))"
-            exit 0 ;;
+print(json.dumps({"status": "ok", "repo": os.environ["REPO"],
+                  "sha": os.environ["SHA"], "runs": v["runs"]}))')
+            emit_with_platform "$ci_ok_json"
+            ;;
         failed)
             printf '%s' "$verdict" | py -3 -c "
 import json, sys

@@ -15,6 +15,10 @@ This module is the DETERMINISTIC, TESTABLE contract the worker-loop skill
   - WORKER_PHASES / REDUCER_ONLY_PHASES -- the phase split.
   - worker_should_run_phase(phase)      -- the phase gate (a worker runs
     select/claim/execute, skips the reducer-only phases).
+  - LIFECYCLE_DISPOSITIONS              -- the SESSION-LIFECYCLE split (g-306-212):
+    every session stage mapped to exactly one declared worker disposition, so a
+    lifecycle asymmetry fails loudly at edit time instead of surfacing by
+    surprise. See "lifecycle contract" below.
   - worker_wm_path(agent, unit_key)     -- the worker writes ONLY its own forked
     Body WM, reusing the Phase-1A reducer-aware activation signal (the forked
     body-WM-file's existence). Mirrors mind_api/src/agent_paths.py::wm_path so
@@ -34,6 +38,8 @@ universal-environment-abstraction/mind-engine-identity-bridge.md (Phase 2).
 from __future__ import annotations
 
 import argparse
+import collections
+import re
 import sys
 from pathlib import Path
 
@@ -67,6 +73,13 @@ WORKER_PHASES = ("select", "claim", "execute")
 # uses.
 REDUCER_ONLY_PHASES = frozenset({
     "verify",             # Phase 5   -- outcome verification
+    # A worker does NOT run the spark PHASE -- it creates no rb/guardrail/tree
+    # artifact (that would make it an Nth reducer). It DOES record raw spark
+    # observations into the `spark_capture` WM slot during execute
+    # (worker-loop Phase 3.5, ); the reducer replays them through the
+    # real handlers at aspirations-spark Phase 6.5 after generalize-down.
+    # Capturing an observation is part of executing; running the handlers is
+    # the phase. Do not read Phase 3.5 as a violation of this entry.
     "spark",              # Phase 6   -- immediate learning / encoding
     "complete-review",    # Phase 7   -- aspiration completion review
     "state-update",       # Phase 8   -- tree encoding / journal / state
@@ -85,6 +98,605 @@ def worker_should_run_phase(phase: str) -> bool:
     (conservative: a worker never runs a phase not explicitly granted to it).
     """
     return phase in WORKER_PHASES
+
+
+# --------------------------- lifecycle contract () ---------------------------
+#
+# WHY THIS TABLE EXISTS
+# The phase split above has an SSOT. The session LIFECYCLE did not, and every
+# lifecycle asymmetry found so far was discovered BY SURPRISE, each by a
+# different route: prime never runs for workers (, user question
+# 2026-08-04); the per-body heartbeat cannot write on an IDLE worker box
+# (, suite red + live claim-pop trace); compact restore rejected
+# body-keyed checkpoints (, live autocompact close). One defect class:
+# a reducer lifecycle stage with NO DECLARED worker disposition.
+#
+# THE NO-TRANSCRIPTION RULE (the contract this table enforces)
+# A worker capability is a scoped CALL into the shared component -- a mode or
+# flag INSIDE that component -- NEVER a transcription of its steps into
+# worker-loop text. A transcription is a second copy that drifts silently when
+# the component evolves, and nothing fails when it does. So `scoped-call` names
+# the EXISTING component plus the mode; it never names a reimplementation.
+# The loop COUNT stays two by measured necessity (wf_ea3e054b, 50:1 unification
+# cost). This contract is what keeps the CODE count at one per capability.
+#
+# WHAT THIS TABLE CANNOT DO -- read this before trusting a green check.
+# The completeness check asserts the TABLE covers CANONICAL_LIFECYCLE_STAGES.
+# Both live in THIS file, so it cannot detect a stage that exists in the reducer
+# loop but was never added to the canonical list. That residual gap is real and
+# is named here rather than papered over (guard-2582: a static checker's silence
+# about your file is not coverage until you confirm the file is in its
+# population). What DOES have teeth is PHASE_LIFECYCLE_STAGE below: it couples
+# the table to WORKER_PHASES / REDUCER_ONLY_PHASES, which are themselves
+# consumed by the live gate -- so adding a PHASE without declaring its lifecycle
+# stage fails at import, not at 3am.
+
+SHARED_COMPONENT = "shared-component"
+SCOPED_CALL = "scoped-call"
+WORKER_ONLY = "worker-only"
+REDUCER_ONLY_BY_DESIGN = "reducer-only-by-design"
+
+DISPOSITION_KINDS = frozenset({
+    SHARED_COMPONENT, SCOPED_CALL, WORKER_ONLY, REDUCER_ONLY_BY_DESIGN,
+})
+
+# Goal-id shape per CLAUDE.md § ID Formats: g-NNN-NN with 2-4 trailing digits.
+# \Z, NOT $ (guard-1283): in Python `$` also matches immediately BEFORE a
+# trailing newline, so "\n" satisfied a `$`-anchored .match() and was
+# accepted as a valid goal id. \Z anchors at true end-of-string. Probed on both
+# tables that share this regex, so a stray newline from a captured command
+# substitution can no longer enter either as a well-formed id.
+_GOAL_ID_RE = re.compile(r"^g-\d{1,4}-\d{2,4}[a-z]?(-[a-z])?\Z")
+
+
+# DELIBERATELY namedtuple, NOT @dataclass. This module is loaded by
+# `importlib.util.spec_from_file_location` + `exec_module` in the test tree
+# (test_worker_execute.py's `_load`), which does NOT register the module in
+# sys.modules. Under `from __future__ import annotations` every annotation is a
+# string, and dataclasses resolves those via `sys.modules[cls.__module__]` to
+# detect ClassVar/InitVar -- which is None under that loader, so `@dataclass`
+# raises AttributeError at IMPORT and takes the whole file's collection with it.
+# Measured while building this table: it broke test_worker_execute.py, a suite
+# this change never touched. namedtuple needs no annotation machinery, and gives
+# frozen + __eq__ + __repr__ for free.
+_LifecycleFields = collections.namedtuple(
+    "_LifecycleFields", "kind target why mode pending_goal")
+
+
+class LifecycleDisposition(_LifecycleFields):
+    """One declared worker disposition for one session-lifecycle stage.
+
+    Fields:
+      kind          one of DISPOSITION_KINDS
+      target        component name (shared-component/scoped-call) or the anchor
+      why           why THIS disposition and not another
+      mode          REQUIRED iff kind == scoped-call; forbidden otherwise
+      pending_goal  set when the disposition is DECLARED but NOT YET BUILT
+
+    A GAP is UNREPRESENTABLE: every field is validated at construction, so a row
+    with an unknown kind, an empty target, an empty rationale, or a scoped-call
+    missing its mode raises ValueError when the module is imported. There is no
+    sentinel for "undeclared" -- the only way to have no disposition is to have
+    no row, which the completeness check refuses separately.
+
+    `pending_goal` exists so the table can state the contract without asserting,
+    in the indicative, that the code already honours it. An aspirational row
+    written as a fact is worse than no row: it reads as evidence to everyone
+    downstream and nothing ever re-checks it.
+    """
+
+    __slots__ = ()
+
+    def __new__(cls, kind, target, why, mode=None, pending_goal=None):
+        if kind not in DISPOSITION_KINDS:
+            raise ValueError(
+                f"unknown disposition kind {kind!r}; "
+                f"must be one of {sorted(DISPOSITION_KINDS)}")
+        if not (target or "").strip():
+            raise ValueError(f"{kind}: target must be non-empty")
+        if not (why or "").strip():
+            raise ValueError(f"{kind}({target}): why must be non-empty")
+        if kind == SCOPED_CALL and not (mode or "").strip():
+            raise ValueError(
+                f"scoped-call({target}): mode is REQUIRED -- a scoped call must "
+                f"name the mode/flag INSIDE the shared component, else it is "
+                f"indistinguishable from a transcription")
+        if kind != SCOPED_CALL and mode is not None:
+            raise ValueError(
+                f"{kind}({target}): mode is meaningful only for scoped-call")
+        # pending_goal was the ONE unvalidated field until fresh-eyes on this
+        # goal's own diff (F-001) — it accepted 12345 and a list while the
+        # docstring above claimed every field was validated. It is the field
+        # whose entire purpose is honesty about what has NOT shipped, so an
+        # unvalidated one is the worst of the five: junk here reads downstream
+        # as a real tracker. Shape-check only; whether the goal EXISTS is not
+        # checkable here (no store access at import).
+        if pending_goal is not None:
+            if not isinstance(pending_goal, str) or not _GOAL_ID_RE.match(pending_goal):
+                raise ValueError(
+                    f"{kind}({target}): pending_goal must be None or a goal id "
+                    f"like 'g-306-211', got {pending_goal!r}")
+        return super().__new__(cls, kind, target, why, mode, pending_goal)
+
+
+# The canonical session-lifecycle stage list. Hand-maintained -- see "WHAT THIS
+# TABLE CANNOT DO" above. `reducer-iteration` is the one stage not spelled out
+# in the  filing: it is where the per-iteration reducer phases
+# (verify / complete-review / state-update / evolution / learning-gate) live, and
+# it is present so PHASE_LIFECYCLE_STAGE below can map EVERY phase to a stage
+# rather than leaving five phases uncovered.
+CANONICAL_LIFECYCLE_STAGES = (
+    "prime",
+    "boot-continuity",
+    "select",
+    "claim",
+    "execute",
+    "spark-capture",
+    "heartbeat-liveness",
+    "compact-checkpoint",
+    "compact-restore",
+    "stop-hook-gates",
+    "close-staging",
+    "consolidate-merge",
+    "replay",
+    "reducer-iteration",
+    "productivity-stop",
+)
+
+LIFECYCLE_DISPOSITIONS = {
+    "prime": LifecycleDisposition(
+        kind=SCOPED_CALL, target="prime", mode="light (Self + guardrail index + rb recency)",
+        why="A worker reasons with the same identity and rails as its reducer, so it needs "
+            "prime's INPUT side; it must not run prime's reducer-side state writes. "
+            "Today the worker-loop runs no prime at all -- the asymmetry that motivated "
+            "this whole table.",
+        pending_goal="g-306-211"),
+    "boot-continuity": LifecycleDisposition(
+        kind=WORKER_ONLY, target="worker-loop Phase -0 body-identity re-verify",
+        why="/boot is the reducer's session entry and touches running-session-id and "
+            "persona state, which a worker must never claim. The worker's continuity is "
+            "its own re-entry check: Phase -0 re-verifies the forked body-WM signal on "
+            "every pass (guard-517/guard-463 role-gated re-entry)."),
+    "select": LifecycleDisposition(
+        kind=SHARED_COMPONENT, target="goal-selector.sh",
+        why="A worker selects exactly like the reducer -- same scorer, same candidate set. "
+            "There is no worker-specific selection logic and there must not be one."),
+    "claim": LifecycleDisposition(
+        kind=SHARED_COMPONENT, target="aspirations-claim.sh",
+        why="claimed_by stays the mindKey/agent-name, so the claim contract is identical. "
+            "claimed_by_sid (stamped by aspirations-claim.sh, g-115-3176) is what "
+            "distinguishes the Bodies, and it is written by the shared script, not by a "
+            "worker-side variant."),
+    "execute": LifecycleDisposition(
+        kind=SCOPED_CALL, target="aspirations-execute", mode="Phases 3.9-4.5 only",
+        why="The worker DOES the work through the existing execute protocol, entered via "
+            "load-execute-protocol.sh. The phase window is the scope; the protocol text is "
+            "not copied into the worker loop."),
+    "spark-capture": LifecycleDisposition(
+        kind=WORKER_ONLY, target="spark_capture WM slot (worker-loop Phase 3.5)",
+        why="Only the executing Body holds the in-context experience the spark handlers "
+            "need, so the observation cannot be reconstructed later -- but a worker that "
+            "CREATES an rb/guardrail/tree artifact is an Nth reducer. Capture is therefore "
+            "worker-only and the handlers stay reducer-only; the reducer replays the slot "
+            "through aspirations-spark Phase 6.5 after generalize-down (g-306-176)."),
+    "heartbeat-liveness": LifecycleDisposition(
+        kind=WORKER_ONLY, target="worker_reducer_liveness.py (worker-loop Phase 0.5)",
+        why="Inverted from the reducer's: heartbeat-tick.sh writes the agent-wide "
+            "runner-heartbeat + team-state last_active, which a worker must not touch. The "
+            "worker instead POLLS its reducer and winds down when it is gone. NEVER-PROMOTE "
+            "-- no poll result yields 'become the reducer' (g-306-125/g-306-208)."),
+    "compact-checkpoint": LifecycleDisposition(
+        kind=SHARED_COMPONENT, target="precompact-checkpoint.py",
+        why="Same writer for both roles; the per-Body split lives INSIDE the component, at "
+            "_paths.body_state_path, which routes to sessions/<sid>/ when the forked "
+            "body-WM exists and falls back to session/ otherwise (g-306-136). A worker-side "
+            "copy of the checkpoint logic is exactly what the no-transcription rule forbids."),
+    "compact-restore": LifecycleDisposition(
+        kind=SHARED_COMPONENT, target="compact-restore-slots.py",
+        why="Reader twin of the writer above, through the same body_state_path rail. The "
+            "g-306-174 surprise was a reader that rejected body-keyed checkpoints its "
+            "writer produced -- a writer/reader asymmetry inside ONE stage, which is why "
+            "checkpoint and restore are declared as separate rows rather than one."),
+    "stop-hook-gates": LifecycleDisposition(
+        kind=SHARED_COMPONENT, target="stop-hook.sh (Gate 0 + the per-Body branch above it)",
+        why="One hook serves both roles and self-routes, so the per-Body split lives INSIDE "
+            "the component exactly as compact-checkpoint's does. What makes this stage a trap "
+            "is that Gate 0 is runner-KEYED: it answers 'is this the reducer?', and a worker "
+            "is a no-runner box BY DEFINITION -- so anything nested inside Gate 0's branches "
+            "is unreachable for the very role it was written for. That is why the per-Body "
+            "branch must sit ABOVE Gate 0's early exits, not inside one. It sat inside the "
+            "sid-mismatch branch until g-306-214, so a cross-box worker with no local "
+            "running-session-id got NEITHER the resurrection net nor the close producer; the "
+            "measured soak-#2 trace is in stop-hook.sh's branch comment, kept there rather "
+            "than restated here. A worker-side stop hook is what no-transcription forbids."),
+    "close-staging": LifecycleDisposition(
+        kind=WORKER_ONLY, target="body-closing sentinel + stop-hook Phase 2B staging",
+        why="The reducer closes through /stop and aspirations-graceful-stop. A worker has no "
+            "stop obligations to discharge -- it stages its divergent WM for the reducer and "
+            "stops. The sentinel is written ONLY on a genuine close (SELECT found no work, or "
+            "reducer-liveness wind-down), never at end of a work unit (g-306-70)."),
+    "consolidate-merge": LifecycleDisposition(
+        kind=REDUCER_ONLY_BY_DESIGN, target="aspirations-consolidate Step -1 (body-merge.py)",
+        why="Generalize-down is the definition of the reducer role: one Body merges ALL "
+            "Bodies' divergent state. A worker running it would be a second reducer, which is "
+            "the invariant the whole convergence forbids."),
+    "replay": LifecycleDisposition(
+        kind=REDUCER_ONLY_BY_DESIGN, target="Worker Spark Replay block (aspirations-spark Phase 6.5)",
+        why="Replay is the CONSUMING half of spark-capture and runs after body-merge, so it "
+            "requires merged state that only the reducer holds. It reuses the existing Phase "
+            "6.5 handlers rather than a worker-side encoder -- the capture/replay split is "
+            "the no-transcription rule applied to learning."),
+    "reducer-iteration": LifecycleDisposition(
+        kind=REDUCER_ONLY_BY_DESIGN,
+        target="verify / complete-review / state-update / evolution / learning-gate",
+        why="The per-iteration encode+reflect block. Applied ONCE to the MERGED state of all "
+            "Bodies at generalize-down, not per-Body. This stage is the lifecycle twin of "
+            "REDUCER_ONLY_PHASES minus spark and productivity-check, which have their own "
+            "rows because their worker dispositions differ."),
+    "productivity-stop": LifecycleDisposition(
+        kind=REDUCER_ONLY_BY_DESIGN, target="productivity-stop-gate.sh",
+        why="A worker's close condition is work-exhaustion or reducer-death, never a "
+            "productivity score -- and productivity-stop-gate is one of the few authorized "
+            "writers of stop-requested, an agent-wide singleton a worker must not touch."),
+}
+
+# Couples the lifecycle table to the PHASE table above. Every phase the live gate
+# knows about MUST name the lifecycle stage it belongs to, so adding a phase
+# without declaring its lifecycle disposition fails at import. This is the half of
+# the contract with real teeth -- see "WHAT THIS TABLE CANNOT DO".
+PHASE_LIFECYCLE_STAGE = {
+    "select": "select",
+    "claim": "claim",
+    "execute": "execute",
+    "spark": "spark-capture",
+    "verify": "reducer-iteration",
+    "complete-review": "reducer-iteration",
+    "state-update": "reducer-iteration",
+    "evolution": "reducer-iteration",
+    "learning-gate": "reducer-iteration",
+    "productivity-check": "productivity-stop",
+}
+
+
+# --------------------------- carrier contract () ---------------------------
+#
+# WHY A THIRD TABLE
+# The two tables above answer "which PHASES does a worker run" and "what is each
+# LIFECYCLE STAGE's worker disposition". Neither answers the question that
+# actually strands work: **when a worker produces output, what carries it to the
+# reducer?** That question has no SSOT, and the gap is invisible from both
+# existing tables because it is indexed by neither phase nor stage.
+#
+# MEASURED (, filed by alpha REDUCER on cc-04, 2026-08-08). 
+# carries a WORKER outcome_note (alpha, cc-07, 2026-08-07T18:35) reporting its
+# fix COMPLETE: 3 SKILL.md edits, a new verify-learning check, a 4-case mutation
+# proof. ZERO of those artifacts exist on cc-04 -- absent, not merely unmerged.
+# The worker's WM reached the reducer (body-merge.py), its spark observations
+# reached the reducer (spark_capture), and its FILE EDITS reached nothing.
+#
+# NOTE THE CONTRACT ALREADY SAID SO, in the indicative, and nobody could see it:
+# LIFECYCLE_DISPOSITIONS["close-staging"] reads "it stages its divergent WM for
+# the reducer and stops". WM. A framework file edit is divergent state that is
+# not WM, so it was outside the declared carrier all along -- correctly
+# described and structurally unenforced. That is precisely the shape
+# LIFECYCLE_DISPOSITIONS was built to make impossible for stages, applied to
+# output classes instead.
+#
+# WHAT THIS TABLE CANNOT DO -- the same residual gap the lifecycle table names,
+# for the same reason: CANONICAL_OUTPUT_CLASSES lives in THIS file, so the
+# completeness check cannot detect an output class a worker produces that was
+# never added to the canonical list. Adding a class is a judgment call made
+# here; the check only enforces that every DECLARED class has a carrier
+# (guard-2582 -- a static checker's silence about your file is not coverage
+# until you confirm the file is in its population).
+
+STAGED_ARTIFACT = "staged-artifact"      # bytes the reducer drains (body-merge)
+WM_SLOT = "wm-slot"                      # merged by per-slot policy
+SHARED_STORE = "shared-store"            # own-cloud-synced world/ or meta/
+NO_CARRIER = "no-carrier"                # DECLARED as unreachable -- see below
+
+GIT_REF = "git-ref"                      # per-Body namespaced ref, pushed + consumed
+UPSTREAM_REMOTE = "upstream-remote"      # a repo's OWN origin, pushed per post-execution Step 2
+CARRIER_KINDS = frozenset({
+    STAGED_ARTIFACT, WM_SLOT, SHARED_STORE, GIT_REF, UPSTREAM_REMOTE, NO_CARRIER,
+})
+
+_CarrierFields = collections.namedtuple(
+    "_CarrierFields", "kind target why pending_goal")
+
+
+class CarrierDisposition(_CarrierFields):
+    """How ONE class of worker output reaches the reducer -- or that it cannot.
+
+    Fields:
+      kind          one of CARRIER_KINDS
+      target        the concrete mechanism (script, slot, path), never a plan
+      why           why THIS carrier and not another
+      pending_goal  REQUIRED iff kind == no-carrier; forbidden otherwise
+
+    NO_CARRIER is the load-bearing kind and the reason this table is worth
+    having. It does not mean "unknown" -- it is an ASSERTION that this output
+    class currently reaches nothing, and it must name the goal tracking the
+    carrier. That inverts the failure: a worker output class with no carrier is
+    now a DECLARED fact a reader can act on, instead of an absence nobody can
+    see. Silence is what stranded g-115-5147.
+
+    Mirrors LifecycleDisposition deliberately -- same namedtuple-not-dataclass
+    constraint (see that class for the importlib/`from __future__` reason), same
+    construction-time validation, so a GAP IS UNREPRESENTABLE: there is no
+    sentinel for "undeclared", and the only way to have no disposition is to
+    have no row, which carrier_gaps() refuses separately.
+    """
+
+    __slots__ = ()
+
+    def __new__(cls, kind, target, why, pending_goal=None):
+        # isinstance BEFORE the membership test, same reason as pending_goal
+        # below (guard-3075): `kind not in CARRIER_KINDS` is a hash lookup, so
+        # an unhashable kind (list, dict) raises TypeError -- not the ValueError
+        # this class documents for every field. Found by fresh-eyes probing THIS
+        # constructor one field over from the ordering bug it had just fixed:
+        # the same defect class, in the same method, twice.
+        if not isinstance(kind, str) or kind not in CARRIER_KINDS:
+            raise ValueError(
+                f"unknown carrier kind {kind!r}; "
+                f"must be one of {sorted(CARRIER_KINDS)}")
+        if not (target or "").strip():
+            raise ValueError(f"{kind}: target must be non-empty")
+        if not (why or "").strip():
+            raise ValueError(f"{kind}({target}): why must be non-empty")
+        # SHAPE FIRST, then requiredness. Ordering is load-bearing, not style:
+        # the requiredness checks below use `(pending_goal or "").strip()`, which
+        # raises AttributeError -- NOT ValueError -- on a non-string. The class
+        # docstring promises every field raises ValueError, so a caller catching
+        # the documented contract would miss an int and let junk into the table.
+        # Caught by probing this constructor branch-by-branch rather than
+        # asserting it worked; it is the same defect LifecycleDisposition's
+        # pending_goal carried until fresh-eyes (see that class), reproduced one
+        # table over, which is why the order is spelled out here.
+        if pending_goal is not None and (
+                not isinstance(pending_goal, str)
+                or not _GOAL_ID_RE.match(pending_goal)):
+            raise ValueError(
+                f"{kind}({target}): pending_goal must be a goal id like "
+                f"'g-306-263', got {pending_goal!r}")
+        if kind == NO_CARRIER and not (pending_goal or "").strip():
+            raise ValueError(
+                f"no-carrier({target}): pending_goal is REQUIRED -- declaring an "
+                f"output class unreachable without naming the goal that fixes it "
+                f"is how the g-306-263 defect stayed invisible")
+        if kind != NO_CARRIER and pending_goal is not None:
+            raise ValueError(
+                f"{kind}({target}): pending_goal is meaningful only for no-carrier; "
+                f"a carrier that exists is not pending")
+        return super().__new__(cls, kind, target, why, pending_goal)
+
+
+# The output classes a worker Body can produce. Hand-maintained -- see "WHAT
+# THIS TABLE CANNOT DO" above.
+CANONICAL_OUTPUT_CLASSES = (
+    "working-memory",
+    "spark-observation",
+    "goal-record",
+    "shared-store-file",
+    "framework-file-edit",
+    "local-git-commit",
+    "product-repo-commit",
+)
+
+# POINTER DISCIPLINE for pending_goal: it names the goal that BUILDS the
+# carrier, never the goal that FOUND the gap. Those are different goals and the
+# finder closes first --  declared this table and closed the same day,
+# so pointing a row at it would have left a dangling reference in the one field
+# whose entire job is telling a reader who to chase. A no-carrier row is a
+# promise that someone owns the fix; a pointer to a completed goal quietly
+# converts that promise into a dead end that still reads as tracked.
+OUTPUT_CLASS_CARRIERS = {
+    "working-memory": CarrierDisposition(
+        kind=STAGED_ARTIFACT, target="body-merge.py generalize_down (staged body WM + baseline)",
+        why="The Body's forked WM is staged at close and drained by the reducer's "
+            "aspirations-consolidate Step -1 under per-slot merge policies. This is the "
+            "one carrier that has always worked, and it is why WM-shaped output was never "
+            "the thing that stranded."),
+    "spark-observation": CarrierDisposition(
+        kind=WM_SLOT, target="spark_capture WM slot (worker-loop Phase 3.5)",
+        why="Rides the working-memory carrier above, then the reducer replays it through "
+            "the real handlers at aspirations-spark Phase 6.5. Declared separately because "
+            "it is the case that proves the pattern: an output class a worker cannot "
+            "process itself still reaches the reducer, because someone built it a carrier."),
+    "goal-record": CarrierDisposition(
+        kind=SHARED_STORE, target="world/aspirations.jsonl via the daemon claim/update endpoints",
+        why="Goal state is written through the daemon to the own-cloud-synced world store, "
+            "so a worker's claim, status change and outcome_note are visible fleet-wide "
+            "without any Body-to-Body transfer."),
+    "shared-store-file": CarrierDisposition(
+        kind=SHARED_STORE, target="world/ and meta/ (own-cloud synced)",
+        why="Both roots are backed by the storage backend rather than git, so a worker's "
+            "writes there are authoritative for every Body immediately. This is exactly "
+            "the property core/ and .claude/ do NOT have."),
+    "framework-file-edit": CarrierDisposition(
+        kind=GIT_REF, target="refs/workers/<agent>/<sid> — pushed by iteration-push.sh "
+                             "--push-worker-ref, consumed by worker-ref-consume.sh",
+        why="WAS measured unreachable (g-306-263) and is now carried (g-306-264). world/ and "
+            "meta/ are backend-synced; core/ and .claude/ are the git repo, which the backend "
+            "does not carry — so the carrier had to be git itself. The worker pushes HEAD to a "
+            "ref namespaced by its own sid; the reducer fetches refs/workers/ and merges "
+            "explicitly. --no-push stays the default and the shared branch stays the reducer's "
+            "alone: that rule's rationale is contention on shared store files, and a ref whose "
+            "path contains the sid has exactly ONE writer by construction, so the rationale "
+            "does not reach it. All three of the design's blocking unknowns were measured on a "
+            "real worker box rather than inferred (cc-07, 2026-08-08): the box authenticates to "
+            "the Mind remote over SSH; a real push to refs/workers/* is accepted and branch "
+            "protection does not reach it; and no consumer existed, which is why one shipped in "
+            "the same change. Consumption is REPORT-ONLY by default — this goal rejected the "
+            "patch-slot carrier because a framework change applying to drifted context is worse "
+            "than one that is lost, and an auto-merge would re-open that door."),
+    "local-git-commit": CarrierDisposition(
+        kind=GIT_REF, target="refs/workers/<agent>/<sid> — same ref as framework-file-edit "
+                             "(pushing HEAD carries the commits and their contents together)",
+        why="Kept as its own ROW even though it now shares one carrier with "
+            "framework-file-edit, because the two still FAIL differently and the table's job "
+            "is to say what reaches the reducer per output class, not to enumerate mechanisms: "
+            "an uncommitted edit dies with the box, while a local commit survives locally and "
+            "is recoverable by anyone who looks. Merging the rows would hide that an edit left "
+            "UNCOMMITTED is still stranded — the ref carries HEAD, so anything not committed "
+            "before the push is not carried. That is the one residual failure mode of this "
+            "carrier and it is easier to see with the row intact."),
+    "product-repo-commit": CarrierDisposition(
+        kind=UPSTREAM_REMOTE,
+        target="the SIBLING repo's OWN origin — pushed per world/conventions/"
+               "post-execution.md Step 2 (pull-before / push-after, every mode)",
+        why="A worker's product-repo work lands in a DIFFERENT git repo, which no "
+            "refs/workers/<agent>/<sid> ref can carry: --push-worker-ref pushes THIS "
+            "repo's HEAD and knows nothing about a sibling checkout. So the carrier is "
+            "the sibling's own origin, and the failure mode is the commit that was made "
+            "and never pushed — it survives locally, reads as done in the goal record, "
+            "and is invisible to everyone including the reducer. Measured 2026-08-09 on "
+            "cc-08 (g-115-4651): the fix was committed, the goal was CLOSED, and the "
+            "repo sat ahead=1 behind=1; it was caught only by checking the push state by "
+            "hand, because check-outputs did not know this class and exited 2 — the "
+            "'unlisted class is not thereby carried' case this table exists to prevent, "
+            "reproduced one repo over. Its own ROW rather than folded into "
+            "local-git-commit because the two fail in DIFFERENT repositories: pushing "
+            "the Mind worker ref carries neither the sibling commit nor any signal that "
+            "one is pending, so a green framework-file-edit check says nothing here."),
+}
+
+
+def carrier_gaps() -> "list[str]":
+    """Every way the carrier contract is currently incomplete, as messages.
+
+    Empty list == every declared output class names a carrier or an explicit
+    no-carrier row. NOTE what this does NOT assert: a no-carrier row is a
+    complete DECLARATION, not a working carrier. `unreachable_output_classes()`
+    is the query for "what is still stranded" -- keeping them separate is
+    deliberate, so that declaring the truth never looks like fixing it.
+    """
+    gaps = []
+    declared = set(OUTPUT_CLASS_CARRIERS)
+    canonical = set(CANONICAL_OUTPUT_CLASSES)
+
+    for cls_name in CANONICAL_OUTPUT_CLASSES:
+        if cls_name not in declared:
+            gaps.append(f"output class {cls_name!r} has NO carrier row")
+    for cls_name in sorted(declared - canonical):
+        gaps.append(
+            f"carrier row {cls_name!r} is not in CANONICAL_OUTPUT_CLASSES")
+    return gaps
+
+
+def unreachable_output_classes() -> "list[str]":
+    """Output classes a worker can produce that currently reach the reducer via
+    NOTHING, each with the goal tracking its carrier.
+
+    The consumer-facing half of the table: a worker-loop (or a reviewer reading
+    a worker's outcome_note) can ask this instead of inferring reachability from
+    an absence. Sorted for stable output.
+    """
+    return [
+        f"{name} -> no carrier (tracked by {row.pending_goal})"
+        for name, row in sorted(OUTPUT_CLASS_CARRIERS.items())
+        if row.kind == NO_CARRIER
+    ]
+
+
+def stranded_outputs(produced) -> "list[str]":
+    """Of the output classes THIS work unit produced, the ones that reach the
+    reducer via nothing. Empty list == every named output has a carrier.
+
+    This is the ENFORCEMENT half of the table, and the reason the table is not
+    just documentation. `unreachable_output_classes()` answers "what is broken
+    in general", which a worker can read and still report complete; this answers
+    "is what I just did going to survive", which it cannot. A declaration with
+    no consumer is indistinguishable from a sweep that always returns clean
+    (reclaim-routed-work.md) -- the measured precedent is complexity_budget.py,
+    which sat with zero callers for seven weeks while a rule cited it as live.
+
+    Raises KeyError on an unknown class rather than ignoring it: a caller naming
+    an output class this table has never heard of is exactly the case where
+    silence is most expensive, because an unlisted class is how the original
+    defect hid. Fail loud at the call site instead of returning a reassuring [].
+    """
+    unknown = [c for c in produced if c not in OUTPUT_CLASS_CARRIERS]
+    if unknown:
+        raise KeyError(
+            f"unknown output class(es) {sorted(unknown)}; known: "
+            f"{sorted(OUTPUT_CLASS_CARRIERS)}. An output class that is not in "
+            f"the table is not thereby carried -- add a row (g-306-263).")
+    return [
+        f"{c} -> no carrier (tracked by {OUTPUT_CLASS_CARRIERS[c].pending_goal})"
+        for c in sorted(set(produced))
+        if OUTPUT_CLASS_CARRIERS[c].kind == NO_CARRIER
+    ]
+
+
+def _assert_carrier_contract() -> None:
+    """Refuse to import with an incomplete carrier contract.
+
+    Import-time for the same reason as _assert_lifecycle_contract: both tables
+    live in THIS file, so the only way to trip it is to be editing it, and the
+    failure lands in the editing session rather than on a worker box at 3am.
+    """
+    gaps = carrier_gaps()
+    if gaps:
+        raise ValueError(
+            "worker_execute carrier contract incomplete (g-306-263):\n  "
+            + "\n  ".join(gaps))
+
+
+def lifecycle_gaps() -> "list[str]":
+    """Every way the lifecycle contract is currently incomplete, as messages.
+
+    Empty list == the contract holds. Three failure modes, all of which have
+    actually happened to the phase/stage tables in some form:
+      - a canonical stage with no disposition row (the g-306-212 defect class);
+      - a disposition row for a stage that is not canonical (a rename that
+        updated one side only);
+      - a live phase whose lifecycle stage is undeclared or points at a stage
+        that does not exist.
+    """
+    gaps = []
+    declared = set(LIFECYCLE_DISPOSITIONS)
+    canonical = set(CANONICAL_LIFECYCLE_STAGES)
+
+    for stage in CANONICAL_LIFECYCLE_STAGES:
+        if stage not in declared:
+            gaps.append(f"stage {stage!r} has NO disposition row")
+    for stage in sorted(declared - canonical):
+        gaps.append(f"disposition row {stage!r} is not in CANONICAL_LIFECYCLE_STAGES")
+
+    for phase in sorted(set(WORKER_PHASES) | set(REDUCER_ONLY_PHASES)):
+        stage = PHASE_LIFECYCLE_STAGE.get(phase)
+        if stage is None:
+            gaps.append(
+                f"phase {phase!r} declares no lifecycle stage "
+                f"(add it to PHASE_LIFECYCLE_STAGE)")
+        elif stage not in canonical:
+            gaps.append(
+                f"phase {phase!r} maps to stage {stage!r}, which is not canonical")
+    return gaps
+
+
+def _assert_lifecycle_contract() -> None:
+    """Refuse to import with an incomplete lifecycle contract.
+
+    Import-time rather than test-time on purpose: CANONICAL_LIFECYCLE_STAGES,
+    LIFECYCLE_DISPOSITIONS and PHASE_LIFECYCLE_STAGE all live in THIS file, so
+    the only way to trip this is to be editing it -- the failure lands in the
+    editing session, before the commit, and cannot surprise a third party. The
+    test suite and the /verify-learning check assert the same predicate from
+    outside, because an in-file assertion alone would pass vacuously if someone
+    deleted it (guard-2582).
+    """
+    gaps = lifecycle_gaps()
+    if gaps:
+        raise ValueError(
+            "worker_execute lifecycle contract incomplete (g-306-212):\n  "
+            + "\n  ".join(gaps))
+
+
+_assert_lifecycle_contract()
+_assert_carrier_contract()
 
 
 # --------------------------- WM routing ---------------------------
@@ -129,6 +741,26 @@ def _main(argv=None) -> int:
     wp = sub.add_parser("wm-path", help="print the worker's WM target path")
     wp.add_argument("--agent", default=AGENT_NAME or "")
     wp.add_argument("--unit-key", default=None)
+    sub.add_parser("lifecycle",
+                   help="print the session-lifecycle disposition table (one row per stage)")
+    sub.add_parser("lifecycle-gaps",
+                   help="exit 0 (+'complete') if every lifecycle stage is declared, "
+                        "else exit 1 (+one line per gap)")
+    sub.add_parser("carriers",
+                   help="print the output-class carrier table (one row per class)")
+    sub.add_parser("carrier-gaps",
+                   help="exit 0 (+'complete') if every output class declares a carrier, "
+                        "else exit 1 (+one line per gap)")
+    sub.add_parser("unreachable",
+                   help="print output classes that reach the reducer via NOTHING; "
+                        "exit 1 when any exist, 0 (+'none') when all are carried")
+    p_chk = sub.add_parser("check-outputs",
+                           help="given the output classes THIS work unit produced, "
+                                "exit 1 if any cannot reach the reducer (the "
+                                "worker-loop Phase 3.7 gate), 0 if all are carried, "
+                                "2 on an unknown class")
+    p_chk.add_argument("classes", nargs="+",
+                       help=f"one or more of: {', '.join(CANONICAL_OUTPUT_CLASSES)}")
     args = ap.parse_args(argv)
 
     if args.cmd == "phases":
@@ -147,6 +779,62 @@ def _main(argv=None) -> int:
             return 2
         print(str(worker_wm_path(args.agent, args.unit_key)))
         return 0
+    if args.cmd == "lifecycle":
+        for stage in CANONICAL_LIFECYCLE_STAGES:
+            d = LIFECYCLE_DISPOSITIONS[stage]
+            kind = f"{d.kind}({d.target}"
+            kind += f", mode={d.mode})" if d.mode else ")"
+            pend = f"  [PENDING {d.pending_goal}]" if d.pending_goal else ""
+            print(f"{stage:<20} {kind}{pend}")
+        return 0
+    if args.cmd == "lifecycle-gaps":
+        gaps = lifecycle_gaps()
+        if not gaps:
+            print(f"complete ({len(CANONICAL_LIFECYCLE_STAGES)} stages declared)")
+            return 0
+        for g in gaps:
+            print(g)
+        return 1
+    if args.cmd == "carriers":
+        for cls_name in CANONICAL_OUTPUT_CLASSES:
+            c = OUTPUT_CLASS_CARRIERS[cls_name]
+            pend = f"  [NO CARRIER -- tracked by {c.pending_goal}]" if c.pending_goal else ""
+            print(f"{cls_name:<22} {c.kind}({c.target}){pend}")
+        return 0
+    if args.cmd == "carrier-gaps":
+        gaps = carrier_gaps()
+        if not gaps:
+            print(f"complete ({len(CANONICAL_OUTPUT_CLASSES)} output classes declared)")
+            return 0
+        for g in gaps:
+            print(g)
+        return 1
+    if args.cmd == "unreachable":
+        rows = unreachable_output_classes()
+        if not rows:
+            print("none")
+            return 0
+        for r in rows:
+            print(r)
+        return 1
+    if args.cmd == "check-outputs":
+        try:
+            stranded = stranded_outputs(args.classes)
+        except KeyError as exc:
+            print(f"error: {exc.args[0]}", file=sys.stderr)
+            return 2
+        if not stranded:
+            print(f"carried ({len(set(args.classes))} output class(es))")
+            return 0
+        # Deliberately loud and prescriptive: the caller is a worker about to
+        # report COMPLETE, and the whole defect was that this moment passed in
+        # silence. Name the remedy, not just the fault.
+        for s in stranded:
+            print(s)
+        print("DO NOT report this work unit complete -- the artifact cannot reach "
+              "the reducer. Record the stranding in the goal's outcome_note and "
+              "leave the goal in-progress.", file=sys.stderr)
+        return 1
     return 2
 
 

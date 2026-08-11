@@ -29,17 +29,43 @@ slower (e.g., a daily-cadence reviewer agent).
    bash core/scripts/liveness-check.sh --agent <partner> --json
    ```
    Returns `alive` | `dormant` | `unknown` | `retired`. It reads `last_active` (daemon-routed)
-   AND, only when that looks stale, cross-checks an INHERENTLY-FRESH signal — the
-   partner's team-state shard's last-write time read from the AUTHORITATIVE store
-   rather than the local mirror. This defeats the read-side lie where the daemon
-   composes team-state from a STALE LOCAL shard mirror (`_team_state.load_rows`
-   reads shard files locally with no re-fetch from the authoritative store), so a
-   busy partner whose fresh shard already reached the authoritative store reads as
-   days-stale on every OTHER box (observed 2026-07-14: a partner's live
-   `last_active` age was 6.5 days on this box while its shard had been pushed 2
-   minutes earlier → verdict correctly `alive`). Conclude silence ONLY on
-   `dormant`; `unknown` means the fresh signal was unreadable — do NOT conclude
-   dormant on `unknown`.
+   AND, when that looks stale, re-reads the partner's team-state shard FRESH from the
+   AUTHORITATIVE store rather than the local mirror, and compares the `last_active`
+   VALUE inside it. This defeats the read-side lie where the daemon composes team-state
+   from a STALE LOCAL shard mirror (`_team_state.load_rows` reads shard files locally
+   with no re-fetch from the authoritative store), so a busy partner whose fresh
+   heartbeat already reached the authoritative store reads as days-stale on every OTHER
+   box (observed 2026-07-14: a partner's live `last_active` age was 6.5 days on this box
+   while its shard had been pushed 2 minutes earlier → verdict correctly `alive`, and
+   still `alive` under the value-based read, since a working partner's authoritative
+   `last_active` is fresh too).
+
+   **"Read from the authoritative store" is now VERIFIED, not assumed** (g-306-138,
+   2026-08-03). The underlying `_team_state.read_shard_authoritative` fails open to the
+   LOCAL MIRROR — on a non-own-cloud backend, a backend-init error, a read error, or an
+   empty document — and used to return a bare row that could not say which layer produced
+   it (guard-1753). So a transient store error against a partner whose mirror was pulled
+   recently but has since DIED produced verdict `alive` with a reason asserting "the local
+   mirror lagged", about a value read FROM that mirror: a false ALIVE reached through the
+   error path. The read now carries provenance, and a mirror-sourced value degrades to
+   `unknown` instead of promoting to `alive`. The CLI surfaces it as
+   `authoritative_last_active_provenance` (`authoritative` | `local-mirror` | `none`; null
+   on the fast path, which short-circuits before any store read) — so when a verdict hangs
+   on that signal you can now SEE where the value came from rather than trusting the reason
+   string. On a `local` backend the local file IS the store of record, so it correctly reads
+   `authoritative`, not `local-mirror`.
+
+   **The shard OBJECT's write time is NOT a mind-liveness signal, and the helper no
+   longer treats it as one** (g-306-132-e, 2026-08-03). Under the Mind/Body split any
+   BODY on that box can write the shard while the MIND is dead, so a fresh object proves
+   only that *something on that machine wrote* — not that the agent is running. When the
+   object is fresh but the authoritative `last_active` VALUE is stale, the verdict is
+   `unknown`, never `alive`: the two signals disagree and neither settles it. Note the
+   fail-safe direction is preserved in BOTH directions — a body write must not make a
+   dead reducer read `alive`, and it must not make a live agent read `dormant` either,
+   which is why the disagreement resolves to `unknown` rather than to the other verdict.
+   Conclude silence ONLY on `dormant`; `unknown` means the fresh signal was unreadable
+   or contradicted — do NOT conclude dormant on `unknown`.
 
    `retired` (g-115-3702) means the agent is DECOMMISSIONED, not merely quiet —
    its shard carries a retirement tombstone. Do not route work to it, do not
@@ -115,11 +141,15 @@ slower (e.g., a daily-cadence reviewer agent).
    and sent the diagnosis to Branch 2.
 
    `liveness-check.sh --agent <partner> --json` (Rule 1) automates the
-   team-state half of this corroboration per-peer (g-115-2149) — it compares
-   the shard's authoritative-store push time, never the local mirror. Prefer
-   its verdict over hand-reading `last_active` whenever a silence conclusion
-   is at stake; the hand-rolled `head_object` shape above remains the way to
-   read signals the helper does not wrap (execution-diary, working-memory).
+   team-state half of this corroboration per-peer (g-115-2149) — it reads the
+   `last_active` VALUE from the shard fetched fresh from the authoritative
+   store, never from the local mirror, and never from the shard object's write
+   time (g-306-132-e). Prefer its verdict over hand-reading `last_active`
+   whenever a silence conclusion is at stake; the hand-rolled `head_object`
+   shape above remains the way to read signals the helper does not wrap
+   (execution-diary, working-memory) — but apply the same discipline there:
+   a `head_object` returns an OBJECT time, so it corroborates that the box is
+   active, not that the agent's mind is.
 
 ## Anti-patterns
 

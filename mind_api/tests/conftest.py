@@ -65,6 +65,94 @@ os.environ["STORAGE_BACKEND"] = "local"
 os.environ["RT_STALENESS_WARNED"] = "1"
 
 
+# Hermetic WORLD/META resolution (). MUST stay ABOVE the
+# _BOOTSTRAP_ENV snapshot below — the snapshot captures whatever is live at
+# import time, so clearing after it would be a no-op.
+#
+# MEASURED 2026-08-01 (zeta, cc-02 / Linux 6.8.0-136-generic). This is the
+# mechanism the  scope note below records as OPEN, and it is now
+# closed. mind_api/src/agent_paths.py::_resolve_src resolves in the order
+# 1. MIND_WORLD env -> 2/3. .mind-data/ (when the dir exists) -> 4.
+# local-paths.conf. MIND_WORLD is PRECEDENCE 1, so it beats the tmp
+# project_root outright. Probed directly against the resolver with a
+# conftest-shaped tmp root, varying ONLY this variable:
+#     MIND_WORLD unset       -> world=/tmp/.../world          (hermetic)
+#     MIND_WORLD=<production> -> world=<repo>/.mind-data/world (LEAK)
+# And core/scripts/_paths.sh:262 does
+#     export WORLD_DIR WORLD_PATH="$WORLD_DIR" MIND_WORLD="$WORLD_DIR"
+# so ANY pytest launched from a shell that sourced _paths.sh inherits a
+# production MIND_WORLD. That single fact explains both leaking files at
+# once: the in-process running_daemon fixture leaks DESPITE being handed the
+# tmp project_root (precedence 1 fires before project_root is consulted), and
+# test_wrapper_rbguard.py::_run_wrapper propagates the same var to its
+# subprocess via os.environ.copy(). One mechanism, not two.
+#
+# It also explains why the earlier H-WORLD probe was correctly falsified — it
+# ran in a shell with MIND_WORLD unset, so it fell through to the tmp conf and
+# the resolver looked innocent. The resolver IS correct; it was being handed a
+# production override.
+#
+# Why POP rather than pin: the per-test tmp world is created by the
+# `project_root` fixture and is not knowable at import time. With these unset,
+# _resolve_src falls to .mind-data/ (absent under a tmp root) and then to the
+# fixture's own local-paths.conf — the hermetic path, as measured above.
+for _leaky in ("MIND_WORLD", "MIND_META"):
+    os.environ.pop(_leaky, None)
+
+
+# --- Per-test env restore () ------------------------------------
+# The two pins above are MODULE-LEVEL, i.e. applied exactly once at collection
+# time. Until this fixture existed, `mind_api/tests` had no autouse fixture at
+# ALL (a full-file grep for "autouse" returned nothing), so any test in this
+# directory that mutated STORAGE_BACKEND / MIND_WORLD / MIND_META / MIND_AGENT
+# without restoring left it mutated for EVERY test collected after it — pytest
+# imports all modules into one process, so the leak also reaches tests that sort
+# alphabetically earlier. `core/scripts/tests/conftest.py` has carried the
+# equivalent fixture since ; this directory was the asymmetric half.
+#
+# Scope note, stated so nobody reads more into this than was measured: this pins
+# the ENV. It does NOT by itself establish the cause of the 2026-07-31 leak of 52
+# fixture records into 5 governed world stores. That investigation measured the
+# WRITE PATH conclusively (this directory's test_runtime_store_rbguard.py +
+# test_wrapper_rbguard.py, three pytest runs, proven by the literal `source`
+# values wave-2-test / wave-2-wrapper-test plus production-sequence id allocation
+# in world/changelog.jsonl) but did NOT establish the mechanism by which those
+# runs' daemon reached the production world — the most natural candidate, "the
+# tmp project_root resolves to the production world", was PROBED AND FALSIFIED
+# (AgentPathResolver on a conftest-shaped tmp root returns the tmp world). The
+# remaining mechanism is open and tracked separately. Do not treat this fixture
+# as that fix.
+#
+# Deliberately NOT pinned here: MIND_ALLOW_TMP_OWNCLOUD_PUT. Its sibling
+# conftest sets it to "1" to DISARM the own-cloud tempdir tripwire for hermetic
+# pytest sessions; this directory leaves it unset, so the tripwire stays ARMED.
+# Adding it would reduce safety in the exact tree where a production leak was
+# observed, which is the wrong direction and outside this goal.
+_UNSET = object()
+_BOOTSTRAP_ENV = {
+    key: os.environ.get(key, _UNSET)
+    for key in ("STORAGE_BACKEND", "MIND_WORLD", "MIND_META",
+                "MIND_AGENT", "RT_STALENESS_WARNED")
+}
+
+
+@pytest.fixture(autouse=True)
+def _restore_env_per_test():
+    """Re-pin the session env before every test in this directory.
+
+    Runs BEFORE the test body, so a test that legitimately needs a different
+    env still overrides it inside the body (and monkeypatch still unwinds its
+    own changes afterwards) — this fixture only undoes collection-time and
+    prior-test pollution.
+    """
+    for key, value in _BOOTSTRAP_ENV.items():
+        if value is _UNSET:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+    yield
+
+
 @pytest.fixture
 def project_root(tmp_path: Path) -> Path:
     """A throwaway PROJECT_ROOT with a minimal layout the daemon needs."""

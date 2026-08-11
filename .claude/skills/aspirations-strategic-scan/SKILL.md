@@ -152,16 +152,112 @@ stale_nodes = [node for node in node_list
 # only 4/164 nodes and content_verified for 0/164, so the index cannot answer
 # this. Reading front matter for JUST the stale set (~18 files) is cheap; do not
 # read it for all 164.
-STRUCTURAL_TRIGGERS = {"decompose", "merge", "distill", "re-parent", "reparent"}
+# RESOLVE `node.file` BEFORE OPENING IT — IT IS A VIRTUAL PATH, AND THE FAILURE IS
+# SILENT (guard-1102). `tree-read.sh --summary` emits `file` as
+# `world/knowledge/tree/...`, but `world/` is an EXTERNAL path: only the
+# PreToolUse[Write|Edit] hook rewrites that prefix, and it does NOT reach Bash args or
+# a Python `open()`. So opening node.file directly finds nothing, every `_trigger`
+# reads None, `understated` comes back EMPTY, and this whole detector reports a
+# confident "0/N structural" — which is exactly the all-clear a reader wants to see.
+# Measured 2026-08-05 (alpha, cc-04): first pass printed `STRUCTURAL: 0/9` having
+# opened ZERO of 9 files; the corrected pass opened 9/9 and found 1 (`solver-v0-audits`,
+# `type: distill`). The detector rb-806 built to catch understated staleness had itself
+# been silently understating to zero.
+#   Bash: source core/scripts/_paths.sh   -> exports $WORLD_PATH
+#   resolve(f) = os.path.join($WORLD_PATH, f[len("world/"):]) if f.startswith("world/") else f
+# CARRY THE CONTROL, NOT JUST THE FIX: count files actually OPENED and assert it equals
+# len(stale_nodes). Without that count the broken and the healthy run are textually
+# identical — both print a small number and no error (self.md: run a positive control
+# before believing a zero; guard-1419: a zero with two explanations must be
+# disambiguated). If opened < len(stale_nodes), the path resolution is wrong again —
+# report that, and do NOT report the structural count as a measurement.
+# `backfill` added 2026-08-06 (zeta, hostname cc-02, uname -r 6.8.0-136-generic).
+# The set named only tree-RESHAPING operations, but the class it exists to catch is
+# "a MECHANICAL stamp bumped last_updated without re-verifying content" — and the
+# single largest such event in this tree's history was not a reshape. Measured over
+# all 1355 tree .md files: `backfill` is the CURRENT trigger on **334** of them
+# (24.7%), 334 of those from one event (`source: tree-fm-backfill`,
+# `session: backfill-2026-05-10`) — nearly 7x `decompose` (50) + `distill` (17)
+# combined. Those nodes have not been touched since that backfill, so their
+# `last_updated` is the date the stamp was written, not the date the prose was last
+# verified. Blast radius of the ADDITION is small and correct (guard-1562: enumerate
+# what will NEWLY fire): S2a screens only stale EXPLORE nodes, of which exactly 1 of
+# 7 carried this trigger at the time of the change (`adoption-strategy-patterns`).
+STRUCTURAL_TRIGGERS = {"decompose", "merge", "distill", "re-parent", "reparent", "backfill"}
+opened = 0
 FOR EACH node in stale_nodes:
-    Read the node's own .md front matter (node.file)
-    node._trigger = front_matter.last_update_trigger.type   (may be a bare string)
+    Read the node's own .md front matter at resolve(node.file); opened += 1 on success
+    node._trigger = front_matter.last_update_trigger.type
+        # TWO SHAPES, AND THE NESTED ONE DOMINATES — measured 2026-08-06 (alpha,
+        # cc-04) over the live stale set: 8 of 9 nested, 1 flat. So a reader who
+        # takes "may be a bare string" as the common case writes a flat-first
+        # parser and zeroes the detector.
+        #   nested (8/9):  last_update_trigger:\n  type: distill      <- value is .type
+        #   flat   (1/9):  last_update_trigger: "g-335-594 (measured..." <- free text
+        # THE REGEX TRAP, EXACTLY: `last_update_trigger:\s*(?:\n\s+type:\s*)?([A-Za-z_-]+)`
+        # looks correct and is not. `\s*` is greedy, eats the newline+indent, the
+        # optional nested group then cannot match, and the capture returns the
+        # literal token "type" — which is not in STRUCTURAL_TRIGGERS, so every
+        # nested node reads non-structural and the count is a confident 0.
+        # Use `[ \t]*` for that first gap (it must not cross the newline):
+        #   last_update_trigger:[ \t]*(?:\n\s+type:[ \t]*)?["']?([A-Za-z_][A-Za-z0-9_-]*)
     node._content_verified = front_matter.content_verified   (optional, hand-written
         at re-verify time; when present it is the TRUE content date — prefer it over
         last_updated. Nothing writes it automatically and that is deliberate: it is
         an opt-in annotation, not a required field, so its absence means "unknown",
         never "fresh".)
 understated = [n for n in stale_nodes if str(n._trigger or "").lower() in STRUCTURAL_TRIGGERS]
+
+# CONTROL GATE — read this BEFORE reading `understated`.
+IF opened < len(stale_nodes):
+    Output: ">> WARN S2a: opened {opened}/{len(stale_nodes)} stale-node files — path resolution is broken (guard-1102). The structural count below is NOT a measurement; fix resolve() before believing it."
+    # Do NOT emit the 'STRUCTURAL' line below off a partial read — a 0 produced by
+    # unopened files is indistinguishable from a genuine clean result.
+
+# THE CONTROL ABOVE GUARDS THE READ, NOT THE PARSE — and the two failures print
+# the SAME NUMBER. Measured 2026-08-06 (alpha, cc-04): a run that opened 9/9 and
+# passed this gate cleanly still reported `STRUCTURAL: 0/9`, because the trigger
+# regex captured the literal "type" (see the trap on the extraction line above).
+# The true value was 1/9 — `solver-v0-audits`, `type: distill` — the SAME node
+# and SAME count the 2026-08-05 corrected pass found. So this detector has now
+# produced the identical wrong answer twice, one day apart, by two INDEPENDENT
+# mechanisms: first the files were never opened, then they were opened and
+# misread. `opened == len(stale_nodes)` certifies only that bytes arrived.
+# THE POSITIVE CONTROL FOR THE PARSE (guard-2421): the cheapest check is the
+# contradicting prior you already hold — this very block records that the last
+# corrected pass found 2 of 8 (2026-08-08, alpha, cc-04): `solver-v0-audits`
+# (distill) — the same node every corrected pass has found — plus
+# `adoption-strategy-patterns` (backfill), which became detectable only when
+# `backfill` joined STRUCTURAL_TRIGGERS on 2026-08-06. A fresh 0 CONTRADICTS a
+# written prior measurement, so believe the prior and re-read before reporting.
+# CONFIRMED TWICE MORE — same 2 of 8, same two nodes, same 30d threshold:
+# 2026-08-09 (zeta, cc-02) and 2026-08-10 (echo, hostname cc-03, uname -r
+# 6.8.0-136-generic, opened 8/8). Three boxes across three days, count AND
+# membership unchanged. So the prior is stable, not a one-box artifact.
+#
+# AND HERE IS HOW THE PRIOR GETS DEFEATED — I did this on the run that confirmed
+# it. Screening at a hardcoded 60d instead of the configured
+# `knowledge_staleness_days: 30` returns **1 of 6**, and 1-of-6 reads as
+# perfectly consistent with 2-of-8 ("the set shrank; solver-v0-audits must have
+# been updated"). It had not been. The two nodes a 60d screen drops are the two
+# YOUNGEST — and one of them, `solver-v0-audits` at 42d, is STRUCTURAL, which is
+# not luck: a structural stamp resets `last_updated` without re-verifying
+# content, so understated nodes read younger and cluster at the young end of the
+# band (guard-2805). The wrong threshold therefore deletes the highest-signal
+# members while the opened/total control still passes cleanly. So a plausible
+# story for why the prior disagrees is NOT a reason to accept the disagreement:
+# re-read your own constant against the config FIRST (guard-2421 — the
+# contradicting prior is the control, and explaining it away disarms it).
+#
+# KEEP THIS PRIOR CURRENT WHEN YOU MEASURE — it is the control, not a changelog:
+# a count that drifts stale makes the NEXT correct pass read as a contradiction
+# and sends it re-reading a parser that was right. Note the expected value moves
+# when STRUCTURAL_TRIGGERS changes, so a rise can be a widened net rather than
+# new drift; say which. Quote the THRESHOLD you screened at alongside the count —
+# a bare "N of M" is not comparable across passes. If you hold no such prior,
+# print the raw `last_update_trigger` block for 2-3 stale nodes and eyeball the
+# shape before trusting any count. Do not report 0/N from a parser you wrote
+# this turn without one of those two checks. (guard-2421, guard-1419, guard-1984.)
 
 # STRUCTURAL STAMPS CLUSTER BY EVENT — one decompose splitting a parent into N
 # children understates all N at once (2 events accounted for 5 nodes that day). So
@@ -213,10 +309,47 @@ FOR EACH asp in active_asps:
         cat = g.get("category", "uncategorized")
         categories[cat] = categories.get(cat, 0) + 1
 
-# S3a: Category concentration
+# S3a: Concentration — THREE axes, because the single-category one is
+# structurally unable to see this portfolio (g-115-5133).
+#
+# MEASURED 2026-08-09 (zeta, hostname cc-02, uname -r 6.8.0-136-generic; 1655
+# pending/in-progress across 29 active aspirations, world+agent). Reproduces
+# alpha's 2026-08-06 cc-04 measurement 3 days later on a different box:
+#   axis 1  max single category (framework-architecture)  660/1655 = 39.9%  PASSES
+#   axis 1b prefix-grouped (framework-*)                 1118/1655 = 67.6%  PASSES
+#   axis 2  max single aspiration (asp-115)              1376/1655 = 83.1%  FIRES
+# THIRD BOX, 2026-08-10 (echo, hostname cc-03, uname -r 6.8.0-136-generic; 1731
+# pending/in-progress across the SAME 29 active aspirations): 40.4% / 67.1% /
+# 82.8%, 22 `framework-*` labels. Every verdict identical and every ratio within
+# 0.5pp on a population 76 goals larger. So the axis-2 fire is a STANDING
+# property of this portfolio, not a moment: treat a fresh fire as CONFIRMATION,
+# and do not route it to S5 as a new finding — see the dedup warning in S5.
+#
+# THE POPULATION DRIFTS UNDER YOU — a small delta on re-run is NOT a
+# contradiction. Re-measured 6 minutes later in the same iteration: 1656 total,
+# 662/1656 = 40.0%, 1120/1656 = 67.6%, 1377/1656 = 83.2%. Two of the extra goals
+# were ones I filed myself between the two runs. Every verdict held, and the
+# label shape held exactly (21 `framework-*` labels, 6 of them at <=2 goals). So
+# compare VERDICTS and the ratio to two significant figures, not raw counts;
+# only a swing that flips a verdict is evidence of anything.
+#
+# READ AXIS 1b's NUMBER BEFORE BELIEVING IT FIXED ANYTHING. Prefix-grouping is
+# the cheapest remedy and it changes ZERO verdicts on the live population — it
+# moves the reported figure from 39.9% to 67.6%, still 2.4pp under the 0.70
+# threshold. It is included because the detector should measure the LANE rather
+# than a fragment of it, not because it closes the gap. Adopting it alone would
+# be guard-2499 exactly: converting a VISIBLY blind detector into an APPARENTLY
+# fixed one with the blindness intact, retiring the symptom that would have
+# prompted the next investigation. Axis 2 is the one that fires.
+#
+# DO NOT LOWER concentration_threshold TO MAKE AXIS 1b FIRE. 67.6% against 0.70
+# is 2.4pp short, and moving the bar to reach it is guard-2950 (do not broaden a
+# criterion to reach a threshold your count lands just under). Read the threshold
+# from config at run time, never from this comment (guard-2805).
 IF categories:
     total = sum(categories.values())
     IF total > 0:
+        # --- axis 1: single category (unchanged; kept as the finest-grained view)
         max_cat = max(categories, key=categories.get)
         max_cat_pct = categories[max_cat] / total
         IF max_cat_pct > strategic_scan.concentration_threshold:
@@ -226,6 +359,59 @@ IF categories:
                 severity: "LOW",
                 category: max_cat
             })
+
+        # --- axis 1b: prefix-grouped category (framework-*, infrastructure-*, ...)
+        # Categories fragment across sibling labels that name ONE lane. Measured:
+        # 21 distinct framework-* labels, 6 of them holding <= 2 goals. Group on
+        # the first hyphen segment so the lane is compared as a lane.
+        prefix_counts = {}
+        FOR EACH cat, n in categories.items():
+            p = cat.split("-")[0]
+            prefix_counts[p] = prefix_counts.get(p, 0) + n
+        max_prefix = max(prefix_counts, key=prefix_counts.get)
+        max_prefix_pct = prefix_counts[max_prefix] / total
+        IF max_prefix_pct > strategic_scan.concentration_threshold:
+            signals.append({
+                type: "concentration_lane",
+                description: "Lane concentrated: {max_prefix_pct:.0%} of pending goals under '{max_prefix}-*' across {count of labels with that prefix} distinct labels -- the single-category axis cannot see this",
+                severity: "LOW",
+                category: max_prefix
+            })
+
+        # --- axis 2: aspiration concentration (NEW — this axis had no check at all)
+        # A portfolio can be perfectly spread across categories and still be one
+        # aspiration wearing many hats. This is the axis that fires today.
+        # Same population S3 built `categories` from, so `total` is a valid
+        # denominator for this axis too — do not re-derive a second total here,
+        # or the two axes stop being comparable.
+        asp_counts = {}
+        FOR EACH g in pending/in-progress goals across active_asps:
+            asp_counts[g.aspiration_id] = asp_counts.get(g.aspiration_id, 0) + 1
+        IF asp_counts:
+            max_asp = max(asp_counts, key=asp_counts.get)
+            max_asp_pct = asp_counts[max_asp] / total
+            # THE THRESHOLD BELOW IS INHERITED, NOT CALIBRATED FOR THIS AXIS
+            # (rb-7249). concentration_threshold was chosen for the single-CATEGORY
+            # axis, whose distribution is fragmented across 21 labels. Aspirations
+            # are few and coarse, so a HEALTHY portfolio's max-aspiration share sits
+            # structurally much higher than its max-category share — the same bar
+            # may be far too permissive here, or too strict. It was not load-bearing
+            # at first measurement (83.2% cleared 0.7 comfortably), which is exactly
+            # why the reuse could not show itself as wrong. If this axis starts
+            # firing on portfolios a reader judges healthy, the fix is a PER-AXIS
+            # threshold, not a nudge to the shared one.
+            IF max_asp_pct > strategic_scan.concentration_threshold:
+                signals.append({
+                    type: "concentration_aspiration",
+                    description: "Portfolio concentrated: {max_asp_pct:.0%} of pending goals in a SINGLE aspiration '{max_asp}' -- category spread says nothing about this axis",
+                    severity: "MEDIUM",
+                    aspiration: max_asp
+                })
+
+        # rb-4502: removing a false negative EXPOSES the next-layer gap. When
+        # axis 2 fires and axis 1 stays silent, the finding is not "asp-115 is
+        # too big" on its own — it is that the two axes disagree, and the
+        # category axis is the one giving false comfort. Report both.
 
 # S3b: Self priority coverage
 # Check if Self's stated priorities have corresponding active work.

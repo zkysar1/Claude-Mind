@@ -141,11 +141,33 @@ def cmd_snapshot(args):
     if "entries" not in vel:
         vel["entries"] = []
 
+    # Per-close idempotency () — mirrors mind_api/src/meta/meta_impk.py
+    # snapshot(). The key names the close EVENT, not the goal: a repeat snapshot
+    # for the same goal is overwhelmingly LEGITIMATE (measured 2026-08-09 on
+    # 7,814 live entries — 2,066 repeat rows, dominated by  recurring
+    # closes,  alone n=205), so deduping on goal_id would destroy real
+    # learning. Exact-match only; absent key -> unconditional append exactly as
+    # before, so no existing caller changes behaviour.
+    close_key = (getattr(args, "close_key", "") or "").strip()
+    if close_key and any(
+            isinstance(e, dict) and e.get("close_key") == close_key
+            for e in vel["entries"]):
+        # rc=0 on purpose: iteration-close.sh treats any non-zero rc from the
+        # audit as "snapshot not recorded" and WARNs. Suppression is the system
+        # working, so it must not read as a failure.
+        print(json.dumps({"status": "duplicate_suppressed",
+                          "goal_id": args.goal_id,
+                          "learning_value": float(args.learning_value),
+                          "close_key": close_key}))
+        return
+
     entry = {
         "goal_id": args.goal_id,
         "date": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
         "learning_value": float(args.learning_value),
     }
+    if close_key:
+        entry["close_key"] = close_key
     if args.category:
         entry["category"] = args.category
     if args.active_changes:
@@ -191,6 +213,12 @@ def build_parser():
     p_snap.add_argument("--learning-value", required=True, help="Learning value (0-1)")
     p_snap.add_argument("--category", default="", help="Goal category")
     p_snap.add_argument("--active-changes", default="", help="Comma-separated mc-NNN IDs of active backpressure monitors")
+    p_snap.add_argument("--close-key", default="",
+                        help="Per-close idempotency token (g-115-4542). A second "
+                             "snapshot carrying a close-key already present is "
+                             "SUPPRESSED (rc=0) instead of double-weighting the "
+                             "goal in the 5/10/20 rolling windows. Omit for the "
+                             "legacy unconditional append.")
 
     return parser
 

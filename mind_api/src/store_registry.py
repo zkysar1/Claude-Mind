@@ -95,6 +95,31 @@ class StoreSpec:
     # MUST be present in the store's KNOWN_FIELDS allowlist — set_field stamps
     # before it validates, so an unallowlisted stamp self-rejects every write.
     amend_stamp_field: Optional[str] = None
+    # Writing-agent provenance field, stamped by append ONLY ().
+    # NEVER-OVERWRITE: applied with a PRESENCE test, so an explicit caller value
+    # — including an explicit null — wins, matching the caller-wins contract
+    # _rb_inject_source_goal already documents. Contrast created_field directly
+    # above, which overwrites unconditionally: `created` is a clock reading the
+    # caller has no standing to assert, whereas authorship is something a caller
+    # (a backfill tool, a cross-agent relay) can legitimately know better than
+    # the request header does.
+    #
+    # Declarative rather than a `prepare` hook on purpose. rb ALREADY owns its
+    # prepare slot (_rb_inject_source_goal), so a hook-based stamp would have to
+    # be chained into that one store and re-implemented for the other two — the
+    # per-store duplication rb-4074 warns against. One emitter in store.py
+    # append() + one declaration per store keeps the mutation surface separable:
+    # deleting any single declaration reddens exactly that store's test.
+    #
+    # Scoped to APPEND only. `set_field`/`increment` mutate an EXISTING record,
+    # where the writer is an amender, not the author — stamping there would
+    # silently rewrite history to name whoever last bumped a counter.
+    #
+    # MUST be present in the store's KNOWN_FIELDS allowlist where one exists
+    # (guardrails does; rb and pattern-signatures have no unknown-field gate) —
+    # append stamps BEFORE it validates, so an unallowlisted stamp would
+    # self-reject every write to that store.
+    author_field: Optional[str] = None
 
 
 def apply_defaults(rec: dict, defaults: Dict[str, Any]) -> dict:
@@ -395,6 +420,15 @@ GUARD_KNOWN_FIELDS = (
         # fingerprint of the fork (guard-1697 displaced_from guard-1475 is
         # exactly one of the reconciled pairs).
         "displaced_from",
+        # encoded_by (): SOURCE WRITER is endpoints/store.py::append,
+        # via StoreSpec.author_field — the writing agent stamped at the append
+        # chokepoint, never-overwrite. Allowlisted here rather than added to
+        # GUARD_DEFAULT_FIELDS (which would flow in automatically, as
+        # valid_from/valid_to do) precisely BECAUSE defaults would backfill a
+        # null onto every historical record rewritten by any later path; this
+        # goal's contract is that pre-existing rows stay byte-identical, so the
+        # field must be ALLOWED without being DEFAULTED.
+        "encoded_by",
     }
 )
 
@@ -617,8 +651,15 @@ def _rb_inject_source_goal(ctx, rec):
         from storage_backend import get_backend
         get_backend().ensure_local(path)
         get_backend().ensure_local(_ts_row_path(ctx.paths.world, agent_name))
-    except Exception:
-        pass
+    except Exception as e:
+        try:  # report, never raise — see note_swallowed_backend_error ()
+            from storage_backend import note_swallowed_backend_error
+            # Two calls share this guard, so which one failed is not recoverable
+            # here — name what was attempted rather than pin the wrong path.
+            note_swallowed_backend_error(
+                "ensure_local", f"{path} (or its team-state row)", e)
+        except Exception:
+            pass
     try:
         status = read_agent_row(ctx.paths.world, agent_name, core_path=path) or {}
         goal_id = (status.get("in_flight") or {}).get("goal_id")
@@ -868,6 +909,25 @@ STORE_REGISTRY: Dict[str, StoreSpec] = {
         increment_prefix="utilization.",
         increment_counters=UTILIZATION_COUNTERS,
         amend_stamp_field="amended_fields",
+        # . NAME CHOSEN BY KEY CENSUS ON SEMANTICS, not on which
+        # existing name is best populated (rb-6166). Measured 2026-08-01 across
+        # all three sibling stores: the most-populated author-ish key by far is
+        # `source` (guardrails 1939/1939 = 100%, rb 70, patsig 15) — and it is
+        # NOT authorship. Its live values are provenance narrative and derivation
+        # method ("session-1: Built ... User caught the gap.", "user correction
+        # session ...", "execution-reflection", "encoding-build-encoding-cycle"),
+        # so stamping an agent name there would both mean the wrong thing and
+        # clobber a load-bearing field on a store where it is REQUIRED. Likewise
+        # `source_goal` (rb 5363 = 89.9%) names the goal, not the writer.
+        # `encoded_by` carried exactly ONE row in 5966 — value "bravo", an agent
+        # name — so it is the only key in the corpus already meaning what this
+        # stamps, and adopting it makes that orphan row consistent instead of
+        # minting a second name for one concept. It also matches the framework's
+        # own verb for writing a distilled lesson into a durable store (encode);
+        # `author`, the sibling pipeline_write.py name, fits an authored
+        # hypothesis better than an encoded lesson. Zero readers repo-wide at
+        # adoption, so no consumer assumes its rarity.
+        author_field="encoded_by",
     ),
     "guardrails": StoreSpec(
         path=lambda ctx: ctx.paths.world / "guardrails.jsonl",
@@ -886,6 +946,11 @@ STORE_REGISTRY: Dict[str, StoreSpec] = {
         increment_prefix="utilization.",
         increment_counters=UTILIZATION_COUNTERS,
         amend_stamp_field="amended_fields",
+        #  — see the census rationale on the reasoning-bank spec above.
+        # This is the one store with a strict unknown-field gate, so the name is
+        # ALSO allowlisted in GUARD_KNOWN_FIELDS; dropping either half breaks
+        # every guardrail write, not just the stamp.
+        author_field="encoded_by",
     ),
     "pattern-signatures": StoreSpec(
         path=lambda ctx: ctx.paths.world / "pattern-signatures.jsonl",
@@ -902,6 +967,9 @@ STORE_REGISTRY: Dict[str, StoreSpec] = {
         recompute_on_fields=frozenset({"outcome_stats"}),
         immutable_fields=frozenset({"created"}),
         amend_stamp_field="amended_fields",
+        #  — see the census rationale on the reasoning-bank spec above.
+        # This store had NO authorship key on any of its 79 rows.
+        author_field="encoded_by",
     ),
     "spark-questions": StoreSpec(
         path=lambda ctx: ctx.paths.meta / "spark-questions.jsonl",

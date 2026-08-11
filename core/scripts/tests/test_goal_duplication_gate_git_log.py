@@ -41,8 +41,26 @@ Cases:
      Symmetry guard: the carve-out is Maintain-title-scoped, not a blanket
      completed-goal exemption.
 
+  P  one-char commit-side filename vs unrelated goal path -> PASS
+  Q  3-char extensionless fragment inside an ISO date      -> PASS
+  R  absolute goal path vs repo-relative committed path    -> BLOCK
+  S  dotfile: extractor-stripped leading '.'               -> BLOCK
+  T  non-boundary suffix ('parity.sh' in '...-parity.sh')  -> PASS
+     P-T pin the COMMIT-side floor (g-115-4775). B/C above pin the GOAL side
+     (g-115-1166); the commit side had NO floor, so `line in fp` degenerated
+     to "does the goal path contain this string" and a stray 0-byte file named
+     `f` produced 7 false blocks across 4 agents and 4 boxes over 2 days.
+     BOTH directions are pinned on purpose: R/S are the matches the fix must
+     NOT lose, and S in particular guards the leading-dot arm — measured over
+     the live corpus (2307 commit touches x 11439 goal-path pairs), a
+     separator-only anchor lost 387 matches and every one was the `.claude/**`
+     dotfile class. P/Q/T each carry an ANTI-VACUITY assertion that the
+     PRE-FIX predicate matched the fixture, so a PASS cannot come from a
+     fixture that never reached the changed branch (guard-3167).
+
 Filed by g-115-1166 (corpus-size co-signal calibration audit, zeta).
 Cases D/E added by g-115-1813 (git_log completed-Maintain carve-out, alpha).
+Cases P-T added by g-115-4775 (commit-side specificity floor, zeta).
 """
 
 from __future__ import annotations
@@ -371,12 +389,123 @@ def main() -> int:
                 "the tag is both (most-specific-first); "
                 f"advisories={ro.get('advisories')}")
 
+        # ── P-T: COMMIT-SIDE specificity floor () ────────────────
+        # Cases B/C above pin the GOAL-side floor (). These pin the
+        # COMMIT side, which had none: `line in fp` applied no constraint to
+        # `line`, so a commit touching a file named `f` matched any goal path
+        # containing the letter f. Both directions are pinned deliberately —
+        # a fix that only stops over-firing would trade a false block for a
+        # false pass, and the goal's own acceptance names both.
+        def _old_match(fp, line):
+            """The PRE-FIX predicate, verbatim. Used only for anti-vacuity:
+            a must-PASS case proves nothing unless the fixture actually
+            reached the branch that changed (guard-3167 — never infer
+            branch-reach from the absence of an error)."""
+            return fp == line or ("/" in fp and (fp in line or line in fp))
+
+        repo6 = base / "repo6"
+        repo6.mkdir()
+        _git(repo6, "init", "-q")
+        _git(repo6, "config", "user.email", "test@example.com")
+        _git(repo6, "config", "user.name", "git-log-test")
+        # A one-character file and a 3-char extensionless fragment — both
+        # measured live: `f` was a stray empty file () that produced
+        # 7 false blocks across 4 agents and 4 boxes; `26-` came from a
+        # zero-byte cruft removal and matched inside an ISO DATE.
+        (repo6 / "f").write_text("", encoding="utf-8")
+        (repo6 / "26-").write_text("", encoding="utf-8")
+        _git(repo6, "add", "-A")
+        _git(repo6, "commit", "-q", "-m", "chore: stray empty files")
+
+        # P: one-char commit-side name vs an unrelated goal path containing 'f'
+        p_fp = "core/scripts/fleet-config-parity.sh"
+        if not _old_match(p_fp, "f"):
+            failures.append(
+                "P: ANTI-VACUITY FAIL — the pre-fix predicate does not match "
+                f"{p_fp!r} against 'f', so this fixture never reached the "
+                "changed branch and a PASS below would prove nothing")
+        rp = _check(repo6, {p_fp})
+        if rp.get("passed") is not True:
+            failures.append(
+                "P: expected PASS — a commit touching a file named 'f' must "
+                "not match an unrelated goal path merely containing the "
+                f"letter f; got passed={rp.get('passed')} "
+                f"matches={rp.get('matches')}")
+
+        # Q: 3-char extensionless fragment matching inside an ISO date
+        q_fp = "agents/echo/experience/exp-2026-08-03_batch.md"
+        if not _old_match(q_fp, "26-"):
+            failures.append(
+                "Q: ANTI-VACUITY FAIL — pre-fix predicate does not match "
+                f"{q_fp!r} against '26-'; fixture never reached the branch")
+        rq = _check(repo6, {q_fp})
+        if rq.get("passed") is not True:
+            failures.append(
+                "Q: expected PASS — '26-' matching inside an ISO date is not "
+                f"same-file evidence; got passed={rq.get('passed')} "
+                f"matches={rq.get('matches')}")
+
+        # R-T: the OTHER direction — genuine matches that MUST still block.
+        repo7 = base / "repo7"
+        repo7.mkdir()
+        _git(repo7, "init", "-q")
+        _git(repo7, "config", "user.email", "test@example.com")
+        _git(repo7, "config", "user.name", "git-log-test")
+        t7 = repo7 / "core" / "scripts" / "gates" / "zzz_fixture.py"
+        t7.parent.mkdir(parents=True)
+        t7.write_text("# fixture\n", encoding="utf-8")
+        d7 = repo7 / ".claude" / "rules" / "zzz-fixture.md"
+        d7.parent.mkdir(parents=True)
+        d7.write_text("# rule\n", encoding="utf-8")
+        (repo7 / "parity.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+        _git(repo7, "add", "-A")
+        _git(repo7, "commit", "-q", "-m", "add fixtures")
+
+        # R: goal names the ABSOLUTE path, git reports repo-relative → BLOCK.
+        # This is the legitimate match `line in fp` was carrying; a boundary
+        # anchor must preserve it.
+        rr = _check(repo7, {"/opt/ayoai-mind/core/scripts/gates/zzz_fixture.py"})
+        if rr.get("passed") is not False:
+            failures.append(
+                "R: expected BLOCK — an absolute goal path must still match "
+                "the repo-relative path git reports (the relative-vs-absolute "
+                f"case); got passed={rr.get('passed')} "
+                f"reason={rr.get('reason')!r}")
+
+        # S: DOTFILE. `_FILE_PATH_RE` starts at a word character, so a goal
+        # naming '.claude/rules/x.md' in prose yields it WITHOUT the leading
+        # dot. Measured 2026-08-09 over the live corpus: a separator-only
+        # anchor lost 387 matches and every one was this class. If this case
+        # regresses, the whole `.claude/**` tree stops matching.
+        rs = _check(repo7, {"claude/rules/zzz-fixture.md"})
+        if rs.get("passed") is not False:
+            failures.append(
+                "S: expected BLOCK — the goal-side extractor strips a leading "
+                "dot, so 'claude/rules/zzz-fixture.md' must still match the "
+                f"committed '.claude/rules/zzz-fixture.md'; got "
+                f"passed={rs.get('passed')} reason={rs.get('reason')!r}")
+
+        # T: non-boundary SUFFIX — 'parity.sh' sits inside
+        # 'fleet-config-parity.sh' preceded by '-', not '/'. Different files.
+        t_fp = "core/scripts/fleet-config-parity.sh"
+        if not _old_match(t_fp, "parity.sh"):
+            failures.append(
+                "T: ANTI-VACUITY FAIL — pre-fix predicate does not match "
+                f"{t_fp!r} against 'parity.sh'; fixture never reached branch")
+        rt = _check(repo7, {t_fp})
+        if rt.get("passed") is not True:
+            failures.append(
+                "T: expected PASS — 'parity.sh' is a substring of "
+                "'fleet-config-parity.sh' but not at a path boundary, so they "
+                f"are different files; got passed={rt.get('passed')} "
+                f"matches={rt.get('matches')}")
+
     if failures:
         print(f"FAIL ({len(failures)} cases)")
         for f in failures:
             print(f"  - {f}")
         return 1
-    print("PASS (15/15 cases)")
+    print("PASS (20/20 cases)")
     return 0
 
 

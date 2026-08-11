@@ -19,7 +19,11 @@
 #   5. temp_dir is strictly UNDER "$project_root/" (never /, /temp, or a sibling)
 #   6. basename(temp_dir) == "temp"
 # THREE guarded deletion lanes — ALL bounded by the assert_safe_temp_dir guard
-# above; NONE ever uses a per-file `rm` on an interpolated path:
+# above; NONE ever uses a per-file `rm` on an interpolated path. Plus Lane 0
+# (report_unmanaged_dotfiles, ), which DELETES NOTHING in any mode and
+# exists only to make the one file class no lane can see — hidden dotfiles —
+# visible; it emits `unmanaged_dotfiles` / `unmanaged_dotfile_names` on the JSON
+# and one stderr line per file, identically under --dry-run:
 #   Lane 1 (purge-by-default): `find "$TEMP_DIR" -maxdepth 1 -type f (EVERY
 #                        file except: dotfiles; content-bearing .md/.json;
 #                        basenames cited by a durable record) -mmin +AGE
@@ -36,6 +40,15 @@
 #                        -mtime +DRAINED_AGE_DAYS -delete` — prunes stale archived
 #                        files (temp-store.md: drained/ contents >30d carry zero
 #                        retrieval value). drained/ itself is preserved ().
+#                        EXEMPTS git-tracked files () AND basenames cited
+#                        by a durable record () — before  the
+#                        citation exemption existed in Lane 1 only, so archiving a
+#                        cited doc into drained/ STRIPPED its protection and made
+#                        it age-deletable. SKIPPED ENTIRELY (deletes nothing, warns
+#                        on stderr) when the cited set cannot be determined: unlike
+#                        Lane 1 there is no allow-list to degrade to. Emits per-file
+#                        basenames via "drained_gc_files" so the exemption is
+#                        checkable from outside.
 #   Lane 3 (stray dirs): `find "$TEMP_DIR" -mindepth 1 -maxdepth 1 -type d
 #                        ! -name drained -mmin +AGE_MIN` → each match guarded-
 #                        deleted via `find "$stray" -delete` (re-asserted strictly
@@ -49,14 +62,17 @@
 #                       actively-written logs and still-active scratch dirs)
 #   --drained-age-days  drained/ GC age guard in days (default 30)
 # Output (stdout, JSON): {"purged":N,"would_purge":N,"files":[...],
-#   "drained_gc_purged":N,"drained_gc_would_purge":N,"stray_purged":N,
-#   "stray_would_purge":N,"citation_lookup":"ok"|"failed"|"n/a",
+#   "drained_gc_purged":N,"drained_gc_would_purge":N,"drained_gc_files":[...],
+#   "stray_purged":N,"stray_would_purge":N,"citation_lookup":"ok"|"failed"|"n/a",
 #   "dry_run":bool,"age_min":N,"drained_age_days":N,
 #   "temp_dir":"..."} — the no-temp-dir no-op path emits the SAME field set
 #   (all-zero lane fields, citation_lookup "n/a") so both exit paths share one
 #   schema (fresh-eyes finding bravo-fec-noop-json-missing-lane-fields).
+#   "files" is LANE 1; "drained_gc_files" is LANE 2 (). Lane 3 remains
+#   count-only — it deletes DIRS, so there is no file basename to intersect.
 #   citation_lookup=="failed" means Lane 1 ran DEGRADED (legacy allow-list, third
-#   class untouched) — treat a low would_purge under it as unmeasured, not clean.
+#   class untouched) AND Lane 2 was skipped outright — treat a low would_purge or
+#   a zero drained_gc_would_purge under it as unmeasured, not clean.
 # Exit: 0 on success (incl. no-temp-dir no-op); 1 on a guard refusal; 2 on bad args.
 #
 # assert_safe_temp_dir() + the lane functions (gc_drained_archive,
@@ -203,12 +219,34 @@ _cited_basenames() {
   return 0
 }
 
-# gc_drained_archive <drained_dir> <age_days> <dry_run> — Lane 2. Prune files
-# DIRECTLY under drained/ older than <age_days>. Echoes the match count (the
-# would-purge count when dry_run=1, else the purged count). find -maxdepth 1
-# -type f keeps -delete bounded to files (never the drained/ dir itself) — never
-# a hand-rolled rm. Caller MUST have asserted drained_dir's parent temp_dir safe.
+# gc_drained_archive <drained_dir> <age_days> <dry_run> [cited_basename...] —
+# Lane 2. Prune files DIRECTLY under drained/ older than <age_days>. Echoes the
+# match count (the would-purge count when dry_run=1, else the purged count) and
+# populates the global GC_DRAINED_FILES with one BASENAME per line for every
+# file it would delete / did delete. find -maxdepth 1 -type f keeps -delete
+# bounded to files (never the drained/ dir itself) — never a hand-rolled rm.
+# Caller MUST have asserted drained_dir's parent temp_dir safe.
 # Sourceable + unit-tested (test_temp_drain_purge.sh) with a synthetic drained/.
+#
+# CITED FILES ARE NEVER DELETED (). Lane 1 gained this exemption in
+# ; Lane 2 did not, which made citation-protection a property of WHICH
+# DIRECTORY a file happens to sit in rather than a property of the artifact. The
+# moment /drain-temp archived a cited doc into drained/, its protection vanished
+# and it became age-deletable with no reference check at all. Same variadic
+# cited-basename shape as _purge_find_predicate, deliberately — one idiom.
+#
+# WHY THE FILE LIST IS PART OF THE FIX, not decoration: this lane returned a
+# bare COUNT, so `durability-property-check.py cited-temp-not-purged` had
+# nothing to intersect and was Lane-1-only BY CONSTRUCTION. An exemption nobody
+# can verify is the conditionally-active-mechanism pattern this whole 
+# body of work exists to kill (guard-1943: a green suite certifies the FUNCTION,
+# never the WIRING). Emitting the list is what makes the exemption checkable
+# from outside.
+#
+# The caller owns the UNKNOWN-cited-set policy, exactly as it does for Lane 1:
+# passing zero basenames here means "nothing is cited", which is only true when
+# the lookup SUCCEEDED and returned empty. main() skips this lane outright when
+# citation_lookup=="failed" — see its call site.
 #
 # GIT-TRACKED FILES ARE NEVER DELETED (, authored at ZDS 2026-07-31,
 # back-ported UP same day). WHY: a deployment's .gitignore can encode the
@@ -237,6 +275,17 @@ _cited_basenames() {
 gc_drained_archive() {
   local drained_dir="${1:-}" age_days="${2:-30}" dry_run="${3:-0}" list count=0
   local tracked f rel repo_root untracked=""
+  # Explicit arity check, NOT `shift 3 || true`: under a short call that shift
+  # fails and leaves the ORIGINAL positionals in "$@", which would then be read
+  # as cited basenames. Guarding on $# keeps a 3-arg call (every existing unit
+  # test) at an empty cited set, byte-identical to the pre- behaviour.
+  local cited_arr=()
+  if [ "$#" -gt 3 ]; then shift 3; cited_arr=( "$@" ); fi
+  # Two globals so a caller can read BOTH results without a subshell (`$(...)`
+  # would discard them). The stdout `echo "$count"` contract below is unchanged,
+  # so existing 3-arg callers/tests that capture it keep working verbatim.
+  GC_DRAINED_FILES=""               # basenames this lane would delete / deleted
+  GC_DRAINED_COUNT=0
   [ -d "$drained_dir" ] || { echo 0; return 0; }
   list="$(find "$drained_dir" -maxdepth 1 -type f -mtime "+$age_days" 2>/dev/null || true)"
   [ -z "$list" ] && { echo 0; return 0; }
@@ -257,8 +306,19 @@ gc_drained_archive() {
     tracked="$(git -C "$repo_root" ls-files -- "$drained_dir" 2>/dev/null)" || { echo 0; return 0; }
   fi
 
+  local _bn _c _is_cited
   while IFS= read -r f; do
     [ -n "$f" ] || continue
+    # CITED exemption first — it is the cheaper test and the stronger claim.
+    # Matched on BASENAME, same key _purge_find_predicate uses for Lane 1, so a
+    # citation protects an artifact identically whether it sits in temp/ or has
+    # already been archived into temp/drained/.
+    _is_cited=0
+    _bn="$(basename "$f")"
+    for _c in ${cited_arr[@]+"${cited_arr[@]}"}; do
+      [ "$_c" = "$_bn" ] && { _is_cited=1; break; }
+    done
+    [ "$_is_cited" -eq 1 ] && continue            # cited → keep, by the invariant
     rel="${f#"$repo_root"/}"
     case "$(printf '%s\n' "$tracked" | grep -Fx -- "$rel" || true)" in
       "") untracked="${untracked}${f}"$'\n' ;;   # not tracked → disposable
@@ -267,6 +327,15 @@ gc_drained_archive() {
   done <<< "$list"
 
   [ -n "$untracked" ] && count="$(printf '%s' "$untracked" | grep -c . || true)"
+  # Publish the basenames so an external checker can intersect them against the
+  # cited set. Emitted for BOTH dry-run and real runs — a dry-run-only list would
+  # leave the real deletion path unverifiable, which is the gap being closed.
+  if [ -n "$untracked" ]; then
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      GC_DRAINED_FILES="${GC_DRAINED_FILES}$(basename "$f")"$'\n'
+    done <<< "$untracked"
+  fi
   if [ "$count" -gt 0 ] && [ "$dry_run" -eq 0 ]; then
     # Per-file bounded guarded find — mirrors Lane 3's per-dir idiom; never a
     # hand-rolled rm.
@@ -275,6 +344,87 @@ gc_drained_archive() {
       find "$f" -maxdepth 0 -type f -delete 2>/dev/null || true
     done <<< "$untracked"
   fi
+  GC_DRAINED_COUNT="$count"
+  echo "$count"
+}
+
+# _has_archive_receipt <dir> — exit 0 when <dir> carries an archive-before-delete
+# receipt sentinel at its top level. SINGLE SOURCE OF TRUTH for the Lane-3
+# preservation test; sourceable + unit-tested so the test can never diverge from
+# the real predicate.
+#
+# EXTENSION- AND CASE-AGNOSTIC BY MEASUREMENT, NOT BY TASTE ().
+# archive-before-delete.md step 6 mandates a receipt and deliberately names no
+# filename, so the writer and the reader were free to disagree — and every
+# producer in this tree landed on the far side of that disagreement. Measured
+# 2026-08-08 (bravo, hostname cc-05, uname -r 6.8.0-136-generic):
+#   _seed_engine.py:1207          writes  RECEIPT.json   (graveyard archives)
+#   history_vacuum_archive.py:167 writes  receipt.json   (local, LOWERCASE)
+#   history_vacuum_archive.py:228 writes  receipt.json   (S3, LOWERCASE)
+# This predicate previously required RECEIPT.md exactly. ZERO producers write
+# that name, so the preservation guard was structurally unreachable by every
+# archive the framework actually creates — it could only ever fire on a receipt
+# a human had hand-named. The originating case was live: a genuine
+# archive-before-delete archive carrying RECEIPT.json was listed for deletion
+# and survived only because it was hand-marked mid-drain.
+#
+# The widening is on the PRESERVE side only and can never delete something the
+# old predicate kept, which is the correct asymmetry: a missed sentinel destroys
+# a recovery layer (the exact anti-pattern archive-before-delete.md exists to
+# forbid), while an over-match merely retains a stray dir until someone looks.
+#
+# ANCHORED `RECEIPT` / `RECEIPT.*`, never a bare `*receipt*` substring. A dir
+# holding `old-receipt-notes.txt` is scratch, not an archive; matching it would
+# make the guard unfalsifiable (guard-2860 — never relax an ownership predicate
+# into a pattern). -iname is honored by GNU findutils and bfs alike, the same
+# portability bar the Lane-1 -empty disjunct is held to.
+_has_archive_receipt() {
+  local d="${1:-}"
+  [ -n "$d" ] || return 1
+  if [ -e "$d/.archive-marker" ]; then return 0; fi
+  [ -n "$(find "$d" -maxdepth 1 -type f \( -iname 'RECEIPT' -o -iname 'RECEIPT.*' \) 2>/dev/null | head -n 1)" ]
+}
+
+# report_unmanaged_dotfiles <temp_dir> — Lane 0. REPORT (never delete) hidden
+# dotfiles sitting directly under temp/ that are not lifecycle markers. Echoes
+# the count; names go to stderr. Sourceable + unit-tested.
+#
+# WHY REPORT AND NOT PURGE (). Lane 1 exempts dotfiles via
+# `! -name '.*'` and the drain lane enumerates temp/*.md + temp/*.json, neither
+# of which matches a leading dot — so a dotfile is never drained, never purged,
+# and never counted by the temp-pressure metric. That is permanent invisible
+# residue, and the originating case was a 221-byte .launch-payload.json holding
+# an api_key, an account_id and two service keys, removed only because a human
+# happened to look during a hand drain.
+#
+# Purging them is the WRONG correction, and this is measured rather than
+# cautious. The Lane-1 dotfile exemption exists for a stated reason (it protects
+# the git-tracked 0-byte .gitkeep from the -empty sub-lane — ), and
+# the live population is working state, not litter: on this box temp/ carried
+# .fresh-eyes-last-ts, .fe-ts and .-backup-path, all cadence markers
+# a blanket purge would silently delete. The goal's own verification asks for
+# "reported OR purged"; reporting is the branch that adds visibility without
+# adding a new way to destroy live state.
+#
+# The allowlist is the two LIFECYCLE markers this framework writes on purpose.
+# DOTFILE_ALLOWLIST overrides it (space-separated basenames) for tests.
+_DOTFILE_ALLOWLIST_DEFAULT='.gitkeep .archive-marker'
+UNMANAGED_DOTFILES=""              # newline-separated basenames, for the caller
+report_unmanaged_dotfiles() {
+  local temp_dir="${1:-}" count=0 f b
+  UNMANAGED_DOTFILES=""
+  [ -d "$temp_dir" ] || { echo 0; return 0; }
+  local allow=" ${DOTFILE_ALLOWLIST:-$_DOTFILE_ALLOWLIST_DEFAULT} "
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    b="$(basename "$f")"
+    case "$allow" in *" $b "*) continue ;; esac
+    echo "temp-drain-purge: UNMANAGED DOTFILE (never drained, never purged, uncounted): $f" >&2
+    UNMANAGED_DOTFILES="${UNMANAGED_DOTFILES}${b}"$'\n'
+    count=$((count + 1))
+  done <<EOF
+$(find "$temp_dir" -maxdepth 1 -type f -name '.*' 2>/dev/null || true)
+EOF
   echo "$count"
 }
 
@@ -295,13 +445,14 @@ cleanup_stray_dirs() {
   while IFS= read -r d; do
     [ -z "$d" ] && continue
     # archive-before-delete guard (): NEVER purge a stray dir that is an
-    # archive-before-delete archive. A top-level RECEIPT.md or .archive-marker
+    # archive-before-delete archive. A top-level RECEIPT.* (any extension, any
+    # case — see _has_archive_receipt, ) or .archive-marker
     # sentinel marks a retention-immune recovery layer; destroying it as a drain
     # side-effect is the exact anti-pattern archive-before-delete.md forbids
     # (nearly lost -zeta-orphan-archive-20260713, a completed-S3-deletion
     # recovery layer). Preserve + report on stderr; do NOT count as purged.
-    if [ -e "$d/RECEIPT.md" ] || [ -e "$d/.archive-marker" ]; then
-      echo "temp-drain-purge: PRESERVING archive dir (RECEIPT.md/.archive-marker present): $d" >&2
+    if _has_archive_receipt "$d"; then
+      echo "temp-drain-purge: PRESERVING archive dir (RECEIPT.*/.archive-marker present): $d" >&2
       continue
     fi
     count=$((count + 1))
@@ -355,7 +506,7 @@ main() {
     # citation_lookup is "n/a" here (Lane 1 never ran) rather than omitted: the
     # field must exist on BOTH exit paths or a strict-field consumer KeyErrors
     # on a fresh agent — the same schema-parity finding the lane fields carry.
-    printf '{"purged":0,"would_purge":0,"files":[],"drained_gc_purged":0,"drained_gc_would_purge":0,"stray_purged":0,"stray_would_purge":0,"citation_lookup":"n/a","dry_run":%s,"age_min":%d,"drained_age_days":%d,"temp_dir":"%s","note":"temp dir does not exist"}\n' \
+    printf '{"purged":0,"would_purge":0,"files":[],"drained_gc_purged":0,"drained_gc_would_purge":0,"drained_gc_files":[],"stray_purged":0,"stray_would_purge":0,"citation_lookup":"n/a","dry_run":%s,"age_min":%d,"drained_age_days":%d,"temp_dir":"%s","note":"temp dir does not exist"}\n' \
       "$([ "$DRY_RUN" -eq 1 ] && echo true || echo false)" "$AGE_MIN" "$DRAINED_AGE_DAYS" "$temp_dir"
     return 0
   fi
@@ -375,8 +526,8 @@ main() {
   # exactly the box least able to notice.
   local citation_lookup="ok"
   local _cited_raw
+  local _cited_arr=() _cb
   if _cited_raw="$(_cited_basenames "$script_dir")"; then
-    local _cited_arr=() _cb
     while IFS= read -r _cb; do [ -n "$_cb" ] && _cited_arr+=( "$_cb" ); done <<EOF
 $_cited_raw
 EOF
@@ -414,9 +565,68 @@ EOF
   # sourceable + unit-tested). Bounded by the assert_safe_temp_dir guard already
   # passed above for temp_dir; each echoes its match count (would-purge when
   # --dry-run, else purged).
-  local gc_count stray_count
-  gc_count="$(gc_drained_archive "$temp_dir/drained" "$DRAINED_AGE_DAYS" "$DRY_RUN")"
+  #
+  # Lane 2 FAIL-CLOSED on an unknown cited set (), mirroring the policy
+  # split Lane 1 already uses: the FUNCTION applies the exemption, the CALLER
+  # decides what an unknown cited set means. Lane 1 can degrade to an allow-list
+  # that is strictly no-worse-than-before; Lane 2 has no allow-list to fall back
+  # to, so its only no-worse option is to delete nothing — which is also the
+  # direction this lane's git-tracked guard already chose ("if git ls-files is
+  # unavailable or errors, the lane deletes NOTHING"). Retaining junk for one
+  # run is recoverable; deleting the evidence a durable record cites is not.
+  local gc_count stray_count gc_files_json='[]'
+  if [ "$citation_lookup" = "ok" ]; then
+    # Called WITHOUT command substitution, deliberately: `$(...)` forks a
+    # subshell, so the GC_DRAINED_FILES global set inside would be discarded and
+    # this lane's file list would be silently empty forever — the exact
+    # unverifiable-exemption shape being fixed. The count comes from the
+    # GC_DRAINED_COUNT global for the same reason; the stdout `echo "$count"`
+    # contract is preserved unchanged for the unit tests that capture it.
+    gc_drained_archive "$temp_dir/drained" "$DRAINED_AGE_DAYS" "$DRY_RUN" \
+      "${_cited_arr[@]+"${_cited_arr[@]}"}" >/dev/null
+    gc_count="$GC_DRAINED_COUNT"
+    # Build the lane-2 array in pure bash, mirroring the Lane 1 idiom above
+    # rather than extracting a shared helper — one call site each today, and
+    # rewriting Lane 1's working builder is outside this goal.
+    local _gf_first=1 _gf
+    gc_files_json='['
+    if [ -n "$GC_DRAINED_FILES" ]; then
+      while IFS= read -r _gf; do
+        [ -z "$_gf" ] && continue
+        [ "$_gf_first" -eq 0 ] && gc_files_json="$gc_files_json,"
+        gc_files_json="$gc_files_json\"$_gf\""
+        _gf_first=0
+      done <<EOF
+$GC_DRAINED_FILES
+EOF
+    fi
+    gc_files_json="$gc_files_json]"
+  else
+    gc_count=0
+    echo "temp-drain-purge: WARN — cited set UNKNOWN; Lane 2 (drained/ GC) SKIPPED this run rather than deleting by age alone (g-306-102)." >&2
+  fi
   stray_count="$(cleanup_stray_dirs "$temp_dir" "$AGE_MIN" "$DRY_RUN")"
+
+  # ── Lane 0 (REPORT-ONLY, ). Deletes nothing in either mode, so it is
+  # unaffected by --dry-run and its count is emitted identically on both paths.
+  # Called WITHOUT command substitution for the same reason Lane 2 is: `$(...)`
+  # forks a subshell, so the UNMANAGED_DOTFILES global set inside would be
+  # discarded and the names array would be silently empty forever.
+  local dot_count dot_files_json='[' _df_first=1 _df
+  report_unmanaged_dotfiles "$temp_dir" >/dev/null
+  dot_count=0
+  if [ -n "$UNMANAGED_DOTFILES" ]; then
+    while IFS= read -r _df; do
+      [ -z "$_df" ] && continue
+      [ "$_df_first" -eq 0 ] && dot_files_json="$dot_files_json,"
+      dot_files_json="$dot_files_json\"$_df\""
+      _df_first=0
+      dot_count=$((dot_count + 1))
+    done <<EOF
+$UNMANAGED_DOTFILES
+EOF
+  fi
+  dot_files_json="$dot_files_json]"
 
   local purged gc_purged stray_purged
   if [ "$DRY_RUN" -eq 1 ]; then
@@ -424,8 +634,9 @@ EOF
   else
     purged="$count"; gc_purged="$gc_count"; stray_purged="$stray_count"
   fi
-  printf '{"purged":%d,"would_purge":%d,"files":%s,"drained_gc_purged":%d,"drained_gc_would_purge":%d,"stray_purged":%d,"stray_would_purge":%d,"citation_lookup":"%s","dry_run":%s,"age_min":%d,"drained_age_days":%d,"temp_dir":"%s"}\n' \
-    "$purged" "$count" "$files_json" "$gc_purged" "$gc_count" "$stray_purged" "$stray_count" "$citation_lookup" \
+  printf '{"purged":%d,"would_purge":%d,"files":%s,"drained_gc_purged":%d,"drained_gc_would_purge":%d,"drained_gc_files":%s,"stray_purged":%d,"stray_would_purge":%d,"unmanaged_dotfiles":%d,"unmanaged_dotfile_names":%s,"citation_lookup":"%s","dry_run":%s,"age_min":%d,"drained_age_days":%d,"temp_dir":"%s"}\n' \
+    "$purged" "$count" "$files_json" "$gc_purged" "$gc_count" "$gc_files_json" "$stray_purged" "$stray_count" \
+    "$dot_count" "$dot_files_json" "$citation_lookup" \
     "$([ "$DRY_RUN" -eq 1 ] && echo true || echo false)" "$AGE_MIN" "$DRAINED_AGE_DAYS" "$temp_dir"
   return 0
 }

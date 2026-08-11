@@ -111,13 +111,26 @@ After EVERY goal execution (Steps 1-8, plus Steps 8.5 and 8.75 for deep outcomes
 # Routine-only sessions would otherwise skip the hook indefinitely and leave
 # outcome-metrics.yaml silently stale (20-day window observed 2026-04-24 to
 # 2026-05-14, see world/conventions/outcome-observation.md "Cadence Guarantee").
-# This guard fires the same wrapper opportunistically when the metrics file
-# is missing or > 24h stale. Wrapper exits 0 unconditionally — fail-open.
+# This guard fires the same wrapper opportunistically when the hook has not
+# run on THIS BOX for > 24h. Wrapper exits 0 unconditionally — fail-open.
+#
+# KEYED ON THE BOX-LOCAL INVOCATION LOG, NOT THE SHARED METRICS FILE (g-115-4879).
+# This gate used to stat $WORLD_DIR/outcome-metrics.yaml — a WORLD-SHARED
+# artifact — to decide whether to run a BOX-LOCAL action. On a multi-box fleet
+# that is structurally dead: partners on other boxes keep the shared file fresh
+# (measured updated_at two minutes before a probe on a box where the hook had
+# NEVER run), so the staleness predicate is permanently FALSE on every box that
+# is not the one collecting, and the guard never fires there. A guard that reads
+# a SHARED artifact to decide a BOX-LOCAL action cannot work on a fleet.
+#
+# core/logs/outcome-observation-runs.jsonl is the right signal because it is
+# box-local by construction (.gitignore'd, written by the wrapper on EVERY
+# invocation), so its absence or age is genuine evidence about THIS box. Absent
+# ⇒ fire: the hook has never run here, which was true on both cc-05 and cc-07.
 IF outcome_class == "routine":
-    Bash: source core/scripts/_paths.sh && \
-          METRICS_FILE="$WORLD_DIR/outcome-metrics.yaml"; \
-          if [ ! -f "$METRICS_FILE" ] || \
-             [ $(( ( $(date +%s) - $(stat -c %Y "$METRICS_FILE") ) / 3600 )) -ge 24 ]; then \
+    Bash: OBS_LOG="core/logs/outcome-observation-runs.jsonl"; \
+          if [ ! -f "$OBS_LOG" ] || \
+             [ $(( ( $(date +%s) - $(stat -c %Y "$OBS_LOG") ) / 3600 )) -ge 24 ]; then \
               bash core/scripts/outcome-observation-run.sh "{goal.id}" routine; \
           fi
 
@@ -397,13 +410,30 @@ IF outcome_class == "routine":
             # running when the node has enough existing content to BE redundant with.
             IF the target node already has >= 3 existing insights (Verified Values /
                Key Insights bullets):
-                Write agents/<agent>/session/mdl-existing-corpus.jsonl
+                Write agents/<agent>/temp/mdl-existing-corpus.jsonl
                   # transient scratch: one JSONL line {id, text} per existing node
-                  # insight (id = short tag). session/ always exists (L1-clean),
-                  # overwritten each close.
+                  # insight (id = short tag). Overwritten each close.
+                  # MUST be agents/<agent>/temp/, NOT session/ (g-115-3347 second
+                  # site, VERIFIED BLOCKED 2026-08-04 by alpha on cc-04 during
+                  # g-306-183). This line used to say session/, reasoning that
+                  # "session/ always exists (L1-clean)" — true about L1 path
+                  # resolution, and irrelevant, because session-manifest-write-gate
+                  # is a SEPARATE enforcement layer that BLOCKS any unregistered
+                  # file under agents/<agent>/session/ in autonomous mode. The
+                  # observed refusal: "session-manifest-write-gate (block,
+                  # mode=autonomous): unregistered file 'mdl-existing-corpus.jsonl'
+                  # under alpha/session/". So this advisory was structurally
+                  # unreachable in autonomous mode for every agent — the step could
+                  # only ever run by an agent improvising a different path.
+                  # IDENTICAL defect to Step 8.5's, fixed there 2026-08-02 by
+                  # g-115-4607 and left behind here: when you fix a blocked-path
+                  # bug, grep the WHOLE file for the same path shape, because one
+                  # skill can prescribe the same dead location at several steps.
+                  # agents/<agent>/temp/ is the canonical agent temp store
+                  # (core/config/conventions/temp-store.md) and carries no such gate.
                 Bash: py -3 core/scripts/mdl_gate.py gate \
                       --candidate "<the compressed insight from step c>" \
-                      --existing agents/<agent>/session/mdl-existing-corpus.jsonl \
+                      --existing agents/<agent>/temp/mdl-existing-corpus.jsonl \
                       --node <node.key> --goal {goal.id} --caller aspirations-state-update
                   # args, not python source -> guard-165 N/A. exit 0 keep / 1 near-dup.
                 Parse stdout JSON (keep, nearest_id, max_similarity, novelty, reason):
@@ -560,7 +590,15 @@ IF step_8_wrote_insight:   # True when Step 8 entered "compress into Key Insight
     parent_asp = goal's parent aspiration
 
     # Write the insight to a temporary file for --insight-file.
-    Write agents/<agent>/session/findings-gate-insight.tmp.md with insight_text
+    # MUST be agents/<agent>/temp/, NOT session/ (g-115-4607, 2026-08-02).
+    # session-manifest-write-gate BLOCKS any unregistered file under
+    # agents/<agent>/session/ in autonomous mode, and this scratch buffer was
+    # never registered — so the path this step prescribed for its own dispatch
+    # was refused on every deep close, on every agent. agents/<agent>/temp/ is
+    # the canonical agent temp store (core/config/conventions/temp-store.md) and
+    # carries no such gate. The wrapper takes any path via --insight-file, so
+    # the buffer's location was never load-bearing; only session/ was wrong.
+    Write agents/<agent>/temp/findings-gate-insight.tmp.md with insight_text
 
     # LLM residue: investigation-override binary. Only answer if
     # is_investigation AND the insight contains NO keyword signals
@@ -569,7 +607,7 @@ IF step_8_wrote_insight:   # True when Step 8 entered "compress into Key Insight
     investigation_needs_action = (is_investigation AND finding_requires_action(insight_text))
 
     # Single dispatch — wrapper handles scan + dedup + goal creation.
-    flags = "--goal {goal.id} --aspiration {parent_asp} --category {goal.category} --source {source} --insight-file agents/<agent>/session/findings-gate-insight.tmp.md"
+    flags = "--goal {goal.id} --aspiration {parent_asp} --category {goal.category} --source {source} --insight-file agents/<agent>/temp/findings-gate-insight.tmp.md"
     IF is_investigation: flags += " --is-investigation"
     IF investigation_needs_action: flags += " --investigation-needs-action"
 
@@ -581,7 +619,7 @@ IF step_8_wrote_insight:   # True when Step 8 entered "compress into Key Insight
     #   findings_count=<N> created=<M>
     # If M > 0, append to journal: "Findings gate: N signal(s) → M new goal(s)"
 
-    Delete agents/<agent>/session/findings-gate-insight.tmp.md
+    Delete agents/<agent>/temp/findings-gate-insight.tmp.md
 # If Step 8 did not write insight: silent pass (no output)
 ```
 
@@ -1028,8 +1066,31 @@ IF outcome_class != "routine":
     # Procedural convention — gate on file EXISTENCE, not load status.
     Bash: source core/scripts/_paths.sh && test -f "$WORLD_DIR/conventions/outcome-observation.md" && echo "exists"
     IF exists:
-        Follow each Step in the convention.
-        Any step that fails SHOULD be logged and swallowed — never abort state-update.
+        # MECHANIZED, not prose (g-115-4879). This line used to read only
+        # "Follow each Step in the convention." — and a hook whose invocation
+        # is prose does not fire. Measured: core/logs/outcome-observation-runs.jsonl
+        # was ABSENT on cc-05 and independently on cc-07, on both boxes while
+        # core/logs/ was live and writable, so this slot had never produced a
+        # single audit entry on either.
+        #
+        # THE DEDUP GUARD IS LOAD-BEARING, NOT DEFENSIVE. iteration-close.sh
+        # do_state_update also fires this hook (its own comment records that it
+        # exists precisely because iteration-close BYPASSES this step), so the
+        # two paths are normally mutually exclusive — but an LLM that invokes
+        # this sub-skill DIRECTLY and then runs iteration-close would fire both,
+        # running the collector twice per close. That duplicate-work regression
+        # is exactly why the original remedy for this goal was retracted by its
+        # own filer. Keying the skip on the box-local log's LAST entry makes the
+        # two paths safe to coexist without either needing to know about the other.
+        Bash: OBS_LOG="core/logs/outcome-observation-runs.jsonl"; \
+              if [ -f "$OBS_LOG" ] && tail -1 "$OBS_LOG" | grep -q '"goal_id": *"{goal.id}"'; then \
+                  echo "[8.12] already audited for {goal.id} this close (iteration-close hot path) — skipping"; \
+              else \
+                  bash core/scripts/outcome-observation-run.sh "{goal.id}" "{outcome_class}"; \
+              fi
+        Then follow any REMAINING Steps in the convention that the wrapper does
+        not perform. Any step that fails SHOULD be logged and swallowed — never
+        abort state-update.
     ELSE:
         # No domain outcome-observation convention exists (fresh agent).
         # Nothing to do — downstream Outcome Delta section will show

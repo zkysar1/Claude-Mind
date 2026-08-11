@@ -491,20 +491,47 @@ A goal that "feels done" is not done — the evidence must be traceable.
 
 ## Step 3: Execute Decisions
 
-### Multi-Agent Safety Pre-Check (claimed_by guard)
+### Multi-Agent Safety Pre-Check (claimed_by + claimed_by_sid guard)
 
 Before executing ANY status mutation (COMPLETE / SKIP / SCOPE-DOWN / UNBLOCK),
-read `claimed_by` from the candidate goal and short-circuit if a partner agent
-holds the claim:
+read `claimed_by` **and `claimed_by_sid`** from the candidate goal and
+short-circuit unless BOTH identify this session:
 
 1. **Read `claimed_by` first** (it's already in the goal record from Step 1's
    load). If `claimed_by` is set AND `claimed_by != $MIND_AGENT`, the goal is
    partner work — SKIP this candidate entirely. Do NOT execute COMPLETE, SKIP,
    SCOPE-DOWN, or UNBLOCK. Log the skip reason ("partner-claimed") in the
    grooming_result.details so the audit trail shows what was deferred.
-2. **Only mutate** when `claimed_by` is null OR `claimed_by == $MIND_AGENT`.
-3. The check is per-goal — a single grooming pass can mutate goals I own
+2. **Only mutate** when `claimed_by` is null OR
+   (`claimed_by == $MIND_AGENT` **AND** `claimed_by_sid == $MIND_SID`).
+   The agent NAME is not ownership: under the Mind/Body split one agent runs
+   several sessions, so `claimed_by == $MIND_AGENT` is true for a LIVE peer
+   instance of yourself and the name test authorizes mutating its running
+   execution. Measured on the same 32 records from two sessions minutes apart:
+   the reducer saw foreign=13/13, the holding worker Body saw foreign=0/17 —
+   identical records, opposite verdict, decided only by which session asked
+   (g-115-5147, 2026-08-07).
+3. **Absent `claimed_by_sid` fails CLOSED (skip), and an empty `$MIND_SID`
+   fails CLOSED too** — never fall back to the name test on an unresolvable
+   identity. A `claimed_by` with no `claimed_by_sid` is a legacy claim and is
+   indistinguishable from a live peer-Body claim from outside that session;
+   the errors are asymmetric (skipping costs a deferred groom, mutating races
+   a running execution — guard-487). Measured at fix time: 15 of 32
+   in-progress goals (47%) carried no `claimed_by_sid`, so this clause
+   withholds a large share of the population — which is why rule 5 is
+   mandatory rather than nice-to-have.
+4. The check is per-goal — a single grooming pass can mutate goals I own
    while skipping partner-held ones.
+5. **Report a per-reason skip tally on every pass**, even when every counter
+   is zero: `N candidates — M mutated, F skipped (foreign sid), A skipped
+   (absent sid), P skipped (partner)`. A phase that mutates nothing and says
+   nothing is indistinguishable from a phase with nothing to do (guard-1760 /
+   rb-245), and a safety fix that silently disables the phase it protects is
+   not a safety fix.
+
+Step 1's goal load MUST pass `--full`. The six-key default projection omits
+both `claimed_by` and `claimed_by_sid`, which makes every clause above read
+"null → safe to mutate" on every row, silently (guard-1424 / guard-2467).
 
 Same multi-agent safety class as `felt-sense-checkin` Phase 2 (g-115-687,
 2026-05-13). Sister skill audited a parallel race surface: even though
@@ -520,7 +547,17 @@ pattern that complements per-goal claimed_by.
 For each COMPLETE decision:
   IF goal.claimed_by is not null AND goal.claimed_by != "$MIND_AGENT":
     SKIP — partner-claimed; record skip in grooming_result.details
-    CONTINUE
+    skipped_partner += 1; CONTINUE
+  IF "$MIND_SID" is empty:
+    SKIP — unresolvable identity fails CLOSED, never the name test
+    skipped_absent_sid += 1; CONTINUE
+  IF goal.claimed_by == "$MIND_AGENT" AND goal.claimed_by_sid is null:
+    SKIP — legacy claim, indistinguishable from a live peer Body of myself
+    skipped_absent_sid += 1; CONTINUE
+  IF goal.claimed_by == "$MIND_AGENT" AND goal.claimed_by_sid != "$MIND_SID":
+    SKIP — MY AGENT NAME, ANOTHER LIVE SESSION (the peer-Body branch the
+           name test cannot see); record skip in grooming_result.details
+    skipped_foreign_sid += 1; CONTINUE
   Bash: aspirations-update-goal.sh --source {asp.source} {goal_id} status completed
   Bash: evolution-log-append.sh with:
     {"date": "{today}", "event": "aspiration_grooming",
@@ -529,7 +566,17 @@ For each COMPLETE decision:
 For each SKIP decision:
   IF goal.claimed_by is not null AND goal.claimed_by != "$MIND_AGENT":
     SKIP — partner-claimed; record skip in grooming_result.details
-    CONTINUE
+    skipped_partner += 1; CONTINUE
+  IF "$MIND_SID" is empty:
+    SKIP — unresolvable identity fails CLOSED, never the name test
+    skipped_absent_sid += 1; CONTINUE
+  IF goal.claimed_by == "$MIND_AGENT" AND goal.claimed_by_sid is null:
+    SKIP — legacy claim, indistinguishable from a live peer Body of myself
+    skipped_absent_sid += 1; CONTINUE
+  IF goal.claimed_by == "$MIND_AGENT" AND goal.claimed_by_sid != "$MIND_SID":
+    SKIP — MY AGENT NAME, ANOTHER LIVE SESSION (the peer-Body branch the
+           name test cannot see); record skip in grooming_result.details
+    skipped_foreign_sid += 1; CONTINUE
   Bash: aspirations-update-goal.sh --source {asp.source} {goal_id} status skipped
   Bash: evolution-log-append.sh with:
     {"date": "{today}", "event": "aspiration_grooming",
@@ -538,7 +585,17 @@ For each SKIP decision:
 For each SCOPE-DOWN decision:
   IF goal.claimed_by is not null AND goal.claimed_by != "$MIND_AGENT":
     SKIP — partner-claimed; record skip in grooming_result.details
-    CONTINUE
+    skipped_partner += 1; CONTINUE
+  IF "$MIND_SID" is empty:
+    SKIP — unresolvable identity fails CLOSED, never the name test
+    skipped_absent_sid += 1; CONTINUE
+  IF goal.claimed_by == "$MIND_AGENT" AND goal.claimed_by_sid is null:
+    SKIP — legacy claim, indistinguishable from a live peer Body of myself
+    skipped_absent_sid += 1; CONTINUE
+  IF goal.claimed_by == "$MIND_AGENT" AND goal.claimed_by_sid != "$MIND_SID":
+    SKIP — MY AGENT NAME, ANOTHER LIVE SESSION (the peer-Body branch the
+           name test cannot see); record skip in grooming_result.details
+    skipped_foreign_sid += 1; CONTINUE
   Bash: aspirations-update-goal.sh --source {asp.source} {goal_id} description "{revised description}"
   Bash: evolution-log-append.sh with:
     {"date": "{today}", "event": "aspiration_grooming",
@@ -547,11 +604,27 @@ For each SCOPE-DOWN decision:
 For each UNBLOCK decision:
   IF goal.claimed_by is not null AND goal.claimed_by != "$MIND_AGENT":
     SKIP — partner-claimed; record skip in grooming_result.details
-    CONTINUE
+    skipped_partner += 1; CONTINUE
+  IF "$MIND_SID" is empty:
+    SKIP — unresolvable identity fails CLOSED, never the name test
+    skipped_absent_sid += 1; CONTINUE
+  IF goal.claimed_by == "$MIND_AGENT" AND goal.claimed_by_sid is null:
+    SKIP — legacy claim, indistinguishable from a live peer Body of myself
+    skipped_absent_sid += 1; CONTINUE
+  IF goal.claimed_by == "$MIND_AGENT" AND goal.claimed_by_sid != "$MIND_SID":
+    SKIP — MY AGENT NAME, ANOTHER LIVE SESSION (the peer-Body branch the
+           name test cannot see); record skip in grooming_result.details
+    skipped_foreign_sid += 1; CONTINUE
   Bash: aspirations-update-goal.sh --source {asp.source} {goal_id} blocked_by "[]"
   Bash: evolution-log-append.sh with:
     {"date": "{today}", "event": "aspiration_grooming",
      "details": "unblocked {id}: {reason}"}
+
+# MANDATORY per-reason skip tally (pre-check rule 5) — emit even when every
+# counter is zero. Without it a fail-closed pass and an empty-population pass
+# are indistinguishable (guard-1760 / rb-245), and rule 3 withholds a large
+# share of the population by design.
+Output: "{n_candidates} candidates — {mutated} mutated, {skipped_foreign_sid} skipped (foreign sid), {skipped_absent_sid} skipped (absent sid), {skipped_partner} skipped (partner)"
 
 # Post-decision sweep
 After all decisions executed:

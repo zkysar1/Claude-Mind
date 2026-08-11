@@ -2,9 +2,57 @@
 """User-Blocker Escalation — the delivery-channel sibling of the aged-blocker family ().
 
 Scan the world + agent goal queues for non-terminal goals that carry `user` in
-`participants` and have aged past `user_blocker_escalation.escalate_hours`
-(default 48) with no recent escalation, and DELIVER ONE EMAIL TO THE USER per
-aged goal — plus a coordination-board record that doubles as the shared cooldown.
+`participants` and DELIVER ONE DIGEST EMAIL TO THE USER ON A FIXED CADENCE
+(`user_blocker_escalation.cadence_hours`, default 72) — plus one
+coordination-board record per digest that doubles as the shared schedule marker.
+
+THE CADENCE IS A SCHEDULE, NOT A THRESHOLD (D2, g-115-4963 / g-115-4903)
+-----------------------------------------------------------------------
+Until 2026-08-08 this script fired whenever a goal CROSSED an age threshold
+(`escalate_hours`, 48). The user replaced that by directive, verbatim: "I really
+like the idea of once a week, but it may be too long. MAybe every 3 days?" — and
+the stated reason is the whole design constraint: "Predictable is usually less
+stressful than rare."
+
+So the trigger is now THE CLOCK SINCE THE LAST DIGEST, and nothing else. Goal age
+no longer gates membership at all; it is rendered per item because the reader
+wants it, and it orders the list. Re-introducing ANY age predicate on membership
+rebuilds the unpredictable ping in slower clothing, which is the specific failure
+the directive names.
+
+Two consequences that are easy to get wrong, both load-bearing:
+
+  - THE PER-GOAL COOLDOWN IS GONE, deliberately. Under a schedule it would be
+    actively harmful: a goal escalated in digest N would be suppressed from
+    digest N+1 while STILL waiting on the user, so the list would drain toward
+    empty and the all-clear below would fire while real work sat blocked. That
+    converts a comfort signal into a false one. The SCHEDULE is the rate limit;
+    one rate limiter, not two (communication-clarity rule 5). The user expects a
+    set each time: "if we switch to every 3 days, then I presume there will be a
+    set of these goals."
+  - AN UNCOMPUTABLE AGE NO LONGER DISQUALIFIES. With no threshold there is
+    nothing for a null age to fail, so those goals are now IN the digest with the
+    age line saying so. This retires the g-115-4084 hole for this lane at the
+    root rather than by naming it: 16 of 796 open world goals carry no
+    created_at, 3 of them HIGH.
+
+AN EMPTY LIST IS A SEND, NOT A SKIP (D3, same directive)
+--------------------------------------------------------
+VERBATIM: "And yes, I do like this, it would give me comfort". When the list is
+empty the script sends the SHORT all-clear. This is a deliberate reversal of the
+no-news-is-good-news default — the user has said silence is worse for them, so
+the quiet case is the one that must still arrive.
+
+This is the branch that silently regresses: every instinct in a sweep script says
+"nothing to report, return early", and the regression is invisible because a
+skipped send and a healthy quiet week produce the same empty inbox. `main` has no
+`if batch:` guard around delivery for exactly that reason, and
+`test_empty_list_sends_an_all_clear_not_a_noop` exists to keep one from
+reappearing.
+
+NOT BUILT, BY DIRECTIVE (D4): reply-to-close, or any per-item reply affordance.
+VERBATIM: "No, I do not want this, because I want more than one goal per email".
+The batch is designed around MANY goals per email; do not narrow it toward one.
 
 WHY THIS EXISTS (the hole g-115-3926 measured, and why no sibling closes it)
 ---------------------------------------------------------------------------
@@ -75,7 +123,7 @@ Two things the delivery path must get right, both load-bearing:
 Called by aspirations-precheck. Dry-run by default; --apply to actually send.
 
 Usage:
-    py -3 user-blocker-escalation-check.py [--apply] [--escalate-hours N]
+    py -3 user-blocker-escalation-check.py [--apply] [--cadence-hours N]
                                            [--agent <name>]                # default $MIND_AGENT
                                            [--board-escalation-log <path>] # tests only
                                            [--no-board] [--no-email]       # tests only
@@ -101,8 +149,12 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from _runtime_bash import bash_cmd  # guard-580: never hand-author a bare "bash" argv[0]
 
-DEFAULT_ESCALATE_HOURS = 48.0
-BOARD_TAG = "user-blocker-escalated"
+DEFAULT_CADENCE_HOURS = 72.0  # D2: every 3 days, fixed schedule
+BOARD_TAG = "user-blocker-escalated"   # kept so existing peer greps still match
+DIGEST_TAG = "user-digest-sent"        # the schedule marker — see _read_last_digest_age
+# Bound on how many goal ids ride along as board tags. The ids are also in the
+# post BODY (unbounded), so this caps tag sprawl without dropping information.
+MAX_TAGGED_GOAL_IDS = 25
 
 
 def _load_population_predicate():
@@ -135,8 +187,16 @@ def _load_population_predicate():
         return None
 
 
-def _read_escalate_hours(cli_value) -> float:
-    """CLI wins; else config; else DEFAULT_ESCALATE_HOURS. Never raises."""
+def _read_cadence_hours(cli_value) -> float:
+    """CLI wins; else config; else DEFAULT_CADENCE_HOURS. Never raises.
+
+    Reads `cadence_hours`. The predecessor key `escalate_hours` is deliberately
+    NOT accepted as a fallback: it named an age threshold, and this number is a
+    schedule interval, so honouring the old key would silently run the new
+    mechanism on a value chosen for the old one (48h instead of 72h) with
+    nothing to show that it happened. A stale config should land on the stated
+    default, not on a number that means something else.
+    """
     if cli_value is not None:
         return float(cli_value)
     try:
@@ -145,12 +205,12 @@ def _read_escalate_hours(cli_value) -> float:
         with open(cfg_path, "r", encoding="utf-8") as fh:
             cfg = yaml.safe_load(fh) or {}
         block = cfg.get("user_blocker_escalation") or {}
-        val = block.get("escalate_hours")
+        val = block.get("cadence_hours")
         if val is not None:
             return float(val)
     except Exception:
         pass
-    return DEFAULT_ESCALATE_HOURS
+    return DEFAULT_CADENCE_HOURS
 
 
 def _age_hours(ts, now: dt.datetime):
@@ -191,25 +251,69 @@ def _goal_age_hours(goal: dict, now: dt.datetime):
     return None, None
 
 
-def _escalate_window_str(escalate_hours: float) -> str:
-    """board-read --since window, rounded UP so it covers the full cooldown."""
-    return "%dh" % (int(math.ceil(escalate_hours)) + 1)
+def _cadence_window_str(cadence_hours: float) -> str:
+    """board-read --since window, rounded UP so it covers the full cadence.
+
+    cadence+1h is deliberate: a digest OLDER than the window falls out of the
+    scan and reads as "never sent", which returns DUE — and at that age it is
+    genuinely due, so the rounding error cannot manufacture an early send.
+    """
+    return "%dh" % (int(math.ceil(cadence_hours)) + 1)
 
 
-def _read_recent_escalations(escalate_hours: float, now: dt.datetime,
-                             board_log_path: Path = None) -> set:
-    """Goal_ids already escalated within the window, from ANY agent.
+def _schedule_verdict(read_ok: bool, hours_since_last, cadence_hours: float):
+    """Pure. -> (due: bool, reason: str). The whole trigger lives here.
 
-    The board post made by `_post_board` IS the cooldown record — shared (all
-    agents read one board) and durable (survives WM resets). See the module
-    docstring for the two per-agent-WM bugs this shape fixes.
+    Kept pure and separate so every branch is directly testable without a board,
+    an email, or a queue — same shape as `reducer_self_fence.decide`.
 
-    FAIL-OPEN: any read failure yields an empty set, so everything is eligible.
-    Additive over-delivery beats silent suppression for THIS sweep specifically,
-    because silent suppression is the defect being fixed.
+    THE FAIL DIRECTION IS INVERTED HERE, AND ONLY HERE. Every other layer of
+    this script fails OPEN (a broken layer means fewer emails, never an aborted
+    precheck) because delivery is additive. A SCHEDULE gate cannot inherit that:
+    "I could not read when I last sent" fails open to "so send now", and this
+    script runs from aspirations-precheck on EVERY loop iteration — so a
+    persistent board-read failure would mail the user on every iteration, all
+    day. That is unbounded, outward-facing and irreversible.
+
+    Failing closed costs one sweep, recovered on the next (minutes, not days),
+    and the miss is announced on stderr rather than swallowed. The asymmetry is
+    decisive, so the schedule refuses to send on an unreadable clock.
+    """
+    if not read_ok:
+        return False, "schedule_unreadable"
+    if hours_since_last is None:
+        return True, "no_prior_digest"
+    if hours_since_last < cadence_hours:
+        return False, "within_cadence"
+    return True, "cadence_elapsed"
+
+
+def _read_last_digest_age(cadence_hours: float, now: dt.datetime,
+                          board_log_path: Path = None):
+    """Age in hours of the most recent digest send. -> (read_ok, age_or_None).
+
+    The board post made by `_post_digest_board_record` IS the schedule marker —
+    shared (all agents read one board) and durable (survives WM resets, and
+    survives the reducer moving between boxes, which a machine-local marker file
+    would not). See the module docstring for the two per-agent-WM bugs this
+    shape fixes.
+
+    `read_ok=False` means the board could not be read at all, which is NOT the
+    same as "no digest has been sent" — see `_schedule_verdict` for why that
+    distinction is the one thing standing between a board outage and a mailbox
+    full of duplicate digests.
+
+    Keys on DIGEST_TAG, not BOARD_TAG. The predecessor design posted one
+    BOARD_TAG record per escalated GOAL, and those posts are still in board
+    history — reusing that tag would read a pre-cutover per-goal post as "a
+    digest was already sent" and suppress the first digest under the new cadence
+    for up to a full window, silently.
     """
     posts = []
+    read_ok = True
     if board_log_path is not None:
+        # Test seam: a missing/empty file means "no prior digest", not a failed
+        # read. Tests that need the failed-read branch call _schedule_verdict.
         try:
             with open(board_log_path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
@@ -222,7 +326,7 @@ def _read_recent_escalations(escalate_hours: float, now: dt.datetime,
                 bash_cmd(SCRIPT_DIR / "board-read.sh",
                          "--channel", "coordination",
                          "--type", "status",
-                         "--since", _escalate_window_str(escalate_hours),
+                         "--since", _cadence_window_str(cadence_hours),
                          "--json"),
                 capture_output=True, text=True, encoding="utf-8",
                 errors="replace", timeout=30,
@@ -237,36 +341,89 @@ def _read_recent_escalations(escalate_hours: float, now: dt.datetime,
                     except Exception:
                         continue
             else:
+                read_ok = False
                 sys.stderr.write(
                     "user-blocker-escalation: board-read.sh exit=%d stderr=%s — "
-                    "fail-open (no cooldown this sweep)\n"
+                    "SCHEDULE UNREADABLE, no digest this sweep (retries next)\n"
                     % (proc.returncode, (proc.stderr or "").strip()[:200]))
         except Exception as exc:
+            read_ok = False
             sys.stderr.write(
-                "user-blocker-escalation: board-read.sh exception (%s) — fail-open\n" % exc)
+                "user-blocker-escalation: board-read.sh exception (%s) — "
+                "SCHEDULE UNREADABLE, no digest this sweep (retries next)\n" % exc)
 
-    recent = set()
+    newest = None
     for p in posts:
         if not isinstance(p, dict):
             continue
-        tags = p.get("tags") or []
-        if BOARD_TAG not in tags:
+        if DIGEST_TAG not in (p.get("tags") or []):
             continue
         age = _age_hours(p.get("timestamp") or p.get("ts"), now)
-        if age is None or age >= escalate_hours:
-            continue  # outside the window (or unparseable) — does not suppress
-        for t in tags:
-            if isinstance(t, str) and t.startswith("g-"):
-                recent.add(t)
-    return recent
+        if age is None:
+            # An unparseable timestamp on a digest record cannot date the last
+            # send. Treating it as "no send" would return DUE and could mail on
+            # every sweep, so it degrades the READ instead — fail-closed, same
+            # reasoning as _schedule_verdict.
+            read_ok = False
+            sys.stderr.write(
+                "user-blocker-escalation: digest board record has an unparseable "
+                "timestamp (%r) — SCHEDULE UNREADABLE, no digest this sweep\n"
+                % (p.get("timestamp") or p.get("ts")))
+            continue
+        if newest is None or age < newest:
+            newest = age
+    return read_ok, newest
 
 
-def _compose_digest_body(batch: list, escalate_hours: float) -> str:
-    """ONE body covering every aged goal, oldest first.
+def _compose_all_clear_body(cadence_hours: float) -> str:
+    """The SHORT all-clear (D3). Sent when the list is empty — never skipped.
 
-    Per-goal detail is deliberately SHORT (title + what it blocks + a clipped
-    description). A digest that reproduces 14 full goal descriptions is not a
-    digest; the goal_id is the handle for anyone who wants the full record.
+    Deliberately short, because its whole job is to be reassuring at a glance:
+    "And yes, I do like this, it would give me comfort". A long empty-state email
+    makes the reader hunt for the ask that is not there, which is the opposite of
+    the effect asked for.
+
+    It says WHEN the next one arrives, because the value the user named is
+    predictability — an all-clear that does not date the next check-in leaves
+    them wondering whether the schedule is still running.
+
+    WORDING CONSTRAINT: this body must not read as a request. /notify-user Step
+    1.5 refuses sends whose text asks the user to do something the agent could do
+    itself ("waiting for you to", "user must", "please approve", ...). That gate
+    is skill pseudocode and does not execute on this script's direct
+    notify-build-payload path, so it is not what stops us today — but the phrasing
+    stays clear of those shapes anyway, because a category or transport change
+    later must not turn the comfort email into a refused one.
+    """
+    return "\n".join([
+        "Nothing needs you right now.",
+        "",
+        "No open goal is waiting on a decision, an approval, or an unblock from",
+        "you. This is the every-%.0f-hour check-in, and it goes out on that"
+        % cadence_hours,
+        "schedule whether the list has items or is empty — so a short note like",
+        "this one means the queue is genuinely clear, not that the check was",
+        "skipped.",
+        "",
+        "Next check-in in about %.0f hours." % cadence_hours,
+    ])
+
+
+def _compose_digest_body(batch: list, cadence_hours: float) -> str:
+    """ONE body covering every goal waiting on the user, oldest first.
+
+    ORDER IS THE POINT: the asks come first and the framework background last.
+    That is not styling — the user's 2026-08-03 reply (g-115-4815) said this
+    email "caused anxiety" and that they could not tell "what you need the user
+    to do", and the body opened with six lines of our own archaeology before a
+    single actionable word.
+
+    Per-goal shape, in this order: title, NEEDS FROM YOU, age + creation date,
+    what it blocks, quoted description. Detail stays bounded — a digest that
+    reproduces 14 full descriptions is not a digest, and the goal_id is the
+    handle for the full record — but bounded now means a 1200-char clip that
+    reports how much it dropped, not a 400-char clip that silently landed in the
+    middle of the background.
 
     Descriptions are clipped but never paraphrased — a paraphrase is where a
     concrete "connect the plugin on DEV" ask degrades into something the reader
@@ -274,17 +431,8 @@ def _compose_digest_body(batch: list, escalate_hours: float) -> str:
     """
     ordered = sorted(batch, key=lambda t: -(t[2] or 0.0))
     lines = [
-        "%d goal(s) have been waiting on you past %.0fh with no prior escalation."
-        % (len(ordered), escalate_hours),
-        "",
-        "WHY YOU ARE HEARING ABOUT IT NOW:",
-        "These goals carry `user` in participants, so part of each needs a human.",
-        "Until g-115-3926 no escalation path covered this population at all — the",
-        "three existing aged-work sweeps all post to the coordination board, which",
-        "is agent-to-agent, so a block whose condition is a HUMAN action could",
-        "accumulate board traffic for days without ever reaching you. It did.",
-        "",
-        "Oldest first:",
+        "%d goal(s) need something from you. Oldest first."
+        % len(ordered),
     ]
     for idx, (cand, goal, age, age_field) in enumerate(ordered, 1):
         gid = goal.get("id", "") or "(unknown)"
@@ -292,45 +440,162 @@ def _compose_digest_body(batch: list, escalate_hours: float) -> str:
         blocks = goal.get("blocks") or goal.get("blocking") or []
         lines += [
             "",
-            "%d. [%s] %.0fh — %s" % (idx, gid, age or 0.0,
-                                     (goal.get("title") or "").strip()),
-            "   aspiration=%s priority=%s aged-from=%s" % (
+            "%d. [%s] %s" % (idx, gid, (goal.get("title") or "").strip()),
+        ]
+        # NEEDS-FROM-YOU line, FIRST per item and never omitted ( A4:
+        # "I am unable to tell what you need the user to do"). `user_leg_scope`
+        # is the field that answers it and it was rendered NOWHERE — measured
+        # 2026-08-03: populated on 16 of 45 live user-carrying goals, with
+        # exactly the right vocabulary (credential-grant, architecture-decision,
+        # deployment-approval, restart-timing-approval-for-live-agent). When it
+        # is ABSENT the line still prints and says so, rather than silently
+        # dropping out: a missing answer the reader can see is actionable
+        # ("nobody recorded why I am on this"), a missing LINE is not.
+        scope = (goal.get("user_leg_scope") or "").strip()
+        if scope:
+            lines += ["   NEEDS FROM YOU: %s" % scope]
+        else:
+            lines += ["   NEEDS FROM YOU: not recorded on this goal — if the "
+                      "description below does not make it obvious, that is our "
+                      "bug, not yours; say so and we will fix the goal."]
+        # AGE-vs-NOVELTY (A5: "are these newly assigned to me, or just old
+        # ones"). Under the fixed cadence a goal that still needs the user
+        # REAPPEARS in every digest until it is discharged, so an item may be
+        # months old and also have been listed last time — the reader cannot tell
+        # that from an age figure alone. Render the creation date beside the
+        # aged-from clock. Deliberately NOT claiming "first time you have seen
+        # this": that would need a full board-history scan this function does not
+        # run, and an unmeasured claim here is exactly what the reader would rely
+        # on (verify-before-assuming.md).
+        created = str(goal.get("created_at") or goal.get("created") or "")[:10]
+        # A NULL AGE IS RENDERED AS UNKNOWN, NEVER AS ZERO. `age or 0.0` would
+        # print "waiting 0h" for a goal carrying no parseable timestamp, which
+        # reads as brand-new and sorts the reader's attention away from it —
+        # the same null-fused-into-a-substantive-verdict shape as ,
+        # moved from the skip counter into the rendering.
+        if age is None:
+            clock = "   waiting (age unknown — no parseable timestamp on this goal)"
+        else:
+            clock = "   waiting %.0fh (aged-from=%s)" % (age, age_field or "?")
+        lines += [
+            "%s%s | aspiration=%s priority=%s" % (
+                clock,
+                (" | goal first created %s" % created) if created else "",
                 cand.get("aspiration_id") or "?",
-                goal.get("priority") or "unset", age_field or "?"),
+                goal.get("priority") or "unset"),
         ]
         if blocks:
             lines += ["   blocks: %s" % ", ".join(str(b) for b in blocks)]
         if desc:
-            clipped = " ".join(desc.split())[:400]
-            lines += ["   %s%s" % (clipped, "..." if len(desc) > 400 else "")]
+            # `> ` marks this as QUOTED goal text, not agent assertion. Two
+            # jobs, one character: the human reader sees whose words these are,
+            # and finding-disproof-gate's strip_quoted() excludes it from the
+            # universal/causal scan. Without it, a marker inside ANY member's
+            # description refuses the whole digest and — because the caller
+            # records no cooldowns on failure — wedges this entire lane on
+            # every retry ().
+            #
+            # CLIP BUDGET RAISED 400 -> 1200 (A4: "these goals seem to be cut
+            # off and not have all the information"). Descriptions in this fleet
+            # routinely OPEN with diagnosis and context and reach the ask later,
+            # so a 400-char head-clip was landing on the background and cutting
+            # before the request. Still clipped — the docstring's point that a
+            # digest reproducing full descriptions is not a digest still holds —
+            # but the truncation now SAYS how much it dropped instead of a bare
+            # ellipsis, so the reader knows whether to open the goal.
+            budget = 1200
+            flat = " ".join(desc.split())
+            clipped = flat[:budget]
+            if len(flat) > budget:
+                lines += ["   > %s" % clipped,
+                          "   > [...%d more characters — read the full goal by id "
+                          "above]" % (len(flat) - budget)]
+            else:
+                lines += ["   > %s" % clipped]
     lines += [
         "",
-        "Each goal above is now on a %.0fh per-goal cooldown, so this digest will"
-        % escalate_hours,
-        "not repeat them. Newly aged goals will appear in a future digest.",
+        "This goes out every %.0f hours on a fixed schedule, whether the list has"
+        % cadence_hours,
+        "items or is empty. Anything still waiting on you will be on the next one",
+        "too, so nothing here quietly falls off the list by being ignored.",
         "",
         "If any of these no longer needs you, say so and the `user` participant",
         "gets dropped — that is a one-way door inside the loop, so it is not done",
         "automatically (reclaim-routed-work.md lane P).",
+        "",
+        "--",
+        "WHY YOU ARE HEARING ABOUT IT NOW (background, moved below the asks",
+        "2026-08-03 — you told us this email led with our archaeology instead of",
+        "your action):",
+        "These goals carry `user` in participants, so part of each needs a human.",
+        "Until g-115-3926 no escalation path covered this population at all — the",
+        "three existing aged-work sweeps all post to the coordination board, which",
+        "is agent-to-agent, so a block whose condition is a HUMAN action could",
+        "accumulate board traffic for days without ever reaching you. It did.",
     ]
     return "\n".join(lines)
 
 
-def _send_digest_email(agent: str, batch: list, escalate_hours: float,
+def _send_digest_email(agent: str, batch: list, cadence_hours: float,
                        no_email: bool) -> tuple:
-    """Deliver ONE digest covering the whole batch. Returns (ok, detail).
+    """Deliver ONE digest — or the all-clear when the batch is empty.
 
-    Category is `blocker` — REQUIRED, not stylistic. See docstring note 1: any
-    other category is refused by notify-user Step 1.5's approval-request gate
-    for this population, which would silently recreate the original silence.
-    `blocker` also selects SendErrorAlert, hence `--error` on the sender.
+    Returns (ok, detail). THERE IS NO EARLY RETURN ON AN EMPTY BATCH: D3 makes
+    the quiet case a send. The caller must not guard this with `if batch`.
+
+    Category is `user-digest` for a populated digest and `info` for the
+    all-clear. Both are SendInfoAlert-shaped, so `--error` never fires below.
+
+    It was `blocker` for both until 2026-08-08, on the reasoning that `blocker`
+    is exempt from notify-user Step 1.5's approval-request gate and this digest
+    quotes arbitrary goal descriptions — one containing "user must" would refuse
+    the whole send, and this caller records no cooldowns on failure, so the lane
+    would wedge on every retry (the g-115-4594 shape). TWO SEPARATE THINGS WERE
+    WRONG WITH THAT. They were found independently, on different boxes, and both
+    are measured:
+
+      1. That gate does not run on this path AT ALL (g-115-4963). Step 1.5 is
+         pseudocode in notify-user/SKILL.md; this script invokes
+         notify-build-payload.py and email-send.sh directly and never enters the
+         skill, so the exemption was never the binding constraint it was taken
+         for. The all-clear body is still written clear of approval-request
+         phrasing, so a future transport change that DOES route through the
+         skill cannot turn it into a refused send.
+      2. `blocker` carries a second effect nobody weighed at this call site
+         (g-115-4962): it is the ONE category emitting the SendErrorAlert shape,
+         and SendErrorAlert has no render_structured at all. So the user's
+         routine to-do list arrived under "AyoAi Error Alert" / "An error has
+         been detected from <agent>", entire body in a red-bordered pink
+         `white-space: pre-wrap` box. That IS user directive D1's "they come
+         across as raw text", and very likely also the g-115-4815 "caused
+         anxiety" report — which was read as a content-ordering problem and
+         answered by reordering the body while the framing went unexamined.
+
+    Finding 1 alone would leave `blocker` looking merely unnecessary; finding 2
+    is what makes it actively wrong for this population. `user-digest` is
+    SendInfoAlert-shaped like everything but `blocker`, AND is listed in Step
+    1.5's exempt tuple — so it stays correct under either transport. The
+    category and the `--error` flag must move together; see the comment on
+    CATEGORY_TO_INFOTYPE.
+
+    NOT DONE HERE, deliberately: the body is still prose in one Body field, so
+    render_structured renders it as escaped text inside its card frame. Emitting
+    per-goal `Sections` would produce real cards, but that changes WHAT the
+    digest says and overlaps directive D5 ("shrink the input"), which is a
+    separate goal. This change is the transport/routing defect only.
     """
-    oldest = max((t[2] or 0.0) for t in batch)
-    subject = "%d goal(s) waiting on you (oldest %.0fh)" % (len(batch), oldest)
+    if batch:
+        oldest = max((t[2] or 0.0) for t in batch)
+        subject = "%d goal(s) waiting on you (oldest %.0fh)" % (len(batch), oldest)
+        category, fenced = "user-digest", True
+    else:
+        subject = "Nothing waiting on you"
+        category, fenced = "info", False
     if no_email:
         return True, "no_email"
 
-    body = _compose_digest_body(batch, escalate_hours)
+    body = (_compose_digest_body(batch, cadence_hours) if batch
+            else _compose_all_clear_body(cadence_hours))
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False,
@@ -338,10 +603,16 @@ def _send_digest_email(agent: str, batch: list, escalate_hours: float,
             fh.write(body)
             tmp_path = fh.name
 
+        # A populated digest QUOTES each goal's description verbatim (see
+        # _compose_digest_body). Declare it so the disproof gate scans only what
+        # THIS script authored — . The all-clear quotes nothing, so it
+        # does not claim to.
+        argv = ([sys.executable, str(SCRIPT_DIR / "notify-build-payload.py"),
+                 "--agent", agent, "--category", category]
+                + (["--fenced-quotes"] if fenced else [])
+                + ["--subject", subject, "--message-file", tmp_path])
         built = subprocess.run(
-            [sys.executable, str(SCRIPT_DIR / "notify-build-payload.py"),
-             "--agent", agent, "--category", "blocker",
-             "--subject", subject, "--message-file", tmp_path],
+            argv,
             capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=60,
         )
@@ -367,8 +638,16 @@ def _send_digest_email(agent: str, batch: list, escalate_hours: float,
         if sender is None or not sender.exists():
             return False, "email-send.sh not resolvable (WORLD_PATH=%r)" % world
 
+        # `--error` selects the SendErrorAlert transport and MUST track the
+        # category the payload was built with — the builder emits the
+        # SendErrorAlert shape only for `blocker`. NEITHER branch above uses
+        # `blocker` any more (), so this never fires today. It is kept
+        # as the invariant rather than deleted, because the mismatch it guards
+        # fails SILENTLY: an info-shaped payload posted to the error endpoint
+        # still reports a successful send.
+        sender_argv = [sender] + (["--error"] if category == "blocker" else [])
         sent = subprocess.run(
-            bash_cmd(sender, "--error"),
+            bash_cmd(*sender_argv),
             input=built.stdout, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=120,
         )
@@ -386,25 +665,42 @@ def _send_digest_email(agent: str, batch: list, escalate_hours: float,
                 pass
 
 
-def _post_board(goal: dict, age_hours: float, no_board: bool) -> tuple:
-    """Post the coordination-board record that doubles as the shared cooldown.
+def _post_digest_board_record(batch: list, cadence_hours: float,
+                              no_board: bool) -> tuple:
+    """ONE coordination-board record per digest. It IS the schedule marker.
 
-    Posted even though delivery is by email: peers must be able to see the human
-    was already told (otherwise every agent re-escalates), and this post IS the
-    cooldown record read by `_read_recent_escalations`.
+    Posted even though delivery is by email, for two jobs in one artifact:
+    peers must be able to see the human was already told (otherwise every agent
+    re-escalates), and `_read_last_digest_age` reads this post's timestamp to
+    decide when the next digest is due.
+
+    ONE post, not one per goal — the predecessor posted per escalated goal, which
+    made N board records per sweep AND made the schedule a per-goal question. The
+    schedule is a property of the digest, so it gets exactly one record.
+
+    Posted on the ALL-CLEAR too (empty batch). Skipping it there would leave the
+    schedule marker unwritten on every quiet sweep, so the next sweep would read
+    "no prior digest", find DUE, and send again — the all-clear would fire on
+    every precheck iteration instead of every cadence window.
     """
-    gid = goal.get("id", "") or ""
-    msg = ("User-blocker escalated %.0fh: %s [%s] — emailed the user; "
-           "no re-send this cooldown window." % (
-               age_hours, (goal.get("title") or "")[:90], gid))
+    gids = [(g.get("id") or "") for _c, g, _a, _f in batch if g.get("id")]
+    if gids:
+        oldest = max((t[2] or 0.0) for t in batch)
+        msg = ("User-participant digest SENT (%d goal(s), oldest %.0fh) — emailed "
+               "the user; next digest due in %.0fh. Goals: %s"
+               % (len(gids), oldest, cadence_hours, ", ".join(gids)))
+    else:
+        msg = ("User-participant digest SENT (all-clear, 0 goals waiting) — "
+               "emailed the user; next digest due in %.0fh." % cadence_hours)
     if no_board:
         return True, "no_board"
+    tags = [DIGEST_TAG, BOARD_TAG] + gids[:MAX_TAGGED_GOAL_IDS]
     try:
         proc = subprocess.run(
             bash_cmd(SCRIPT_DIR / "board-post.sh",
                      "--channel", "coordination",
                      "--type", "status",
-                     "--tags", "%s,%s" % (BOARD_TAG, gid)),
+                     "--tags", ",".join(tags)),
             input=msg, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=60,
         )
@@ -420,7 +716,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--apply", action="store_true",
                     help="actually send + post (default is dry-run)")
-    ap.add_argument("--escalate-hours", type=float, default=None)
+    # Renamed from --escalate-hours, which named an age threshold. The number
+    # means something genuinely different now (a schedule interval), so the old
+    # spelling is gone rather than aliased — an alias would let a caller keep
+    # passing a threshold value and silently get a cadence.
+    ap.add_argument("--cadence-hours", type=float, default=None)
     ap.add_argument("--agent", default=os.environ.get("MIND_AGENT", ""))
     ap.add_argument("--board-escalation-log", default=None, help="tests only")
     ap.add_argument("--no-board", action="store_true", help="tests only")
@@ -430,7 +730,7 @@ def main() -> int:
     args = ap.parse_args()
 
     now = dt.datetime.now()
-    escalate_hours = _read_escalate_hours(args.escalate_hours)
+    cadence_hours = _read_cadence_hours(args.cadence_hours)
     agent = args.agent or "unknown"
 
     find_pop = _load_population_predicate()
@@ -457,15 +757,19 @@ def main() -> int:
                     "user-blocker-escalation: population scan failed for %s (%s) — "
                     "continuing with other sources\n" % (label, exc))
 
-    recent = _read_recent_escalations(
-        escalate_hours, now,
+    # THE SCHEDULE GATE — the only trigger. Read BEFORE the population loop so
+    # the JSON reports it even on a not-due sweep, which is the common case.
+    read_ok, hours_since_last = _read_last_digest_age(
+        cadence_hours, now,
         Path(args.board_escalation_log) if args.board_escalation_log else None)
+    due, schedule_reason = _schedule_verdict(read_ok, hours_since_last,
+                                             cadence_hours)
 
     scanned = len(candidates)
     eligible, applied, results = 0, 0, []
-    skipped_deliberate = skipped_cooldown = skipped_young = 0
-    skipped_uncomputable = 0
-    batch = []  # eligible goals, delivered as ONE digest (see below)
+    skipped_deliberate = 0
+    unknown_age = 0
+    batch = []  # every goal waiting on the user — delivered as ONE digest
 
     for cand in candidates:
         goal = cand.get("goal") or {}
@@ -474,52 +778,34 @@ def main() -> int:
 
         if cand.get("deliberate"):
             # Reported, never emailed — nagging a deliberate choice is the wrong
-            # correction. Counted so the skip is visible, not silent.
+            # correction. Counted so the skip is visible, not silent. This is the
+            # ONLY membership filter left: under a fixed cadence, age decides
+            # nothing (D2), so there is no threshold and no per-goal cooldown for
+            # a goal to fall through.
             skipped_deliberate += 1
             results.append({"goal_id": gid, "action": "skip",
                             "reason": "deliberate_user_routing",
                             "age_hours": age})
             continue
+
         if age is None:
-            # AN UNCOMPUTABLE AGE IS NOT A YOUNG ONE. Folding it into
-            # below_threshold is the single most misleading label available: a
-            # reader scanning the output sees "too new to escalate yet" and moves
-            # on, while the goal is structurally incapable of EVER reaching the
-            # threshold — it carries no parseable timestamp in any of the four
-            # fields _goal_age_hours tries, so its age is not small, it is
-            # undefined. Skipping is still correct (guard-420: no datetime
-            # arithmetic on a null; fail-open), but the skip must be NAMED.
-            # Measured 2026-07-30 (): 16 of 796 open world goals carry
-            # no created_at — 3 HIGH, one of them the unblocking goal for a live
-            # outage — and this branch reported every one of them as fine.
-            # guard-1986: a not-checkable case folded into a substantive verdict
-            # is an all-clear whose cleanliness has nothing to do with the data.
-            skipped_uncomputable += 1
-            results.append({"goal_id": gid, "action": "skip",
-                            "reason": "age_uncomputable",
-                            "detail": "no parseable blocked_since / blocked_at / "
-                                      "created_at / created — age is undefined, "
-                                      "so this goal can never age into escalation",
-                            "age_hours": None})
-            continue
-        if age < escalate_hours:
-            skipped_young += 1
-            results.append({"goal_id": gid, "action": "skip",
-                            "reason": "below_threshold", "age_hours": age})
-            continue
-        if gid in recent:
-            skipped_cooldown += 1
-            results.append({"goal_id": gid, "action": "skip",
-                            "reason": "cooldown_active", "age_hours": age})
-            continue
+            # INCLUDED, not skipped. The predecessor dropped these because they
+            # could never reach the age threshold; with no threshold there is
+            # nothing left for a null age to fail, so the goal belongs in the
+            # digest and the age line says the age is unknown. Retires the
+            #  hole for this lane at the root (16 of 796 open world
+            # goals carry no created_at, 3 of them HIGH) rather than by naming
+            # it in a skip counter nobody reads.
+            unknown_age += 1
 
         eligible += 1
-        rec = {"goal_id": gid, "age_hours": round(age, 1),
-               "age_field": age_field,
-               "aspiration_id": cand.get("aspiration_id"),
-               "shape": cand.get("shape"), "action": "would_escalate"}
+        results.append({"goal_id": gid,
+                        "age_hours": None if age is None else round(age, 1),
+                        "age_field": age_field,
+                        "aspiration_id": cand.get("aspiration_id"),
+                        "shape": cand.get("shape"),
+                        "action": "would_escalate" if due else "would_wait"})
         batch.append((cand, goal, age, age_field))
-        results.append(rec)
 
     # ONE DIGEST, NOT N EMAILS (reclaim-routed-work.md rule 5: "Batch them into
     # a digest for the next user check-in"). The first live dry-run returned 14
@@ -527,59 +813,100 @@ def main() -> int:
     # separate emails in one sweep. For a sweep whose entire purpose is to make
     # the user aware of a backlog, that volume is self-defeating: it trains the
     # recipient to filter the sender, which is a louder version of the silence
-    # this script exists to fix. Cooldown stays PER-GOAL (one board record each)
-    # so a goal escalated today is excluded from tomorrow's digest while newly
-    # aged goals still surface.
-    if args.apply and batch:
-        ok_mail, mail_detail = _send_digest_email(agent, batch, escalate_hours,
+    # this script exists to fix. D4 reinforces it from the user's side: "I want
+    # more than one goal per email".
+    #
+    # THE CONDITION IS `due`, AND DELIBERATELY NOT `due and batch` (D3). An empty
+    # batch sends the all-clear. Adding `and batch` here is the one-token change
+    # that silently reverts this goal, because the regression is invisible from
+    # the outside: a skipped send and a genuinely quiet window produce the same
+    # empty inbox. `test_empty_list_sends_an_all_clear_not_a_noop` is the pin.
+    ok_mail = None
+    mail_detail = board_detail = None
+    ok_board = None
+    if args.apply and due:
+        ok_mail, mail_detail = _send_digest_email(agent, batch, cadence_hours,
                                                   args.no_email)
-        for cand, goal, age, age_field in batch:
-            gid = goal.get("id") or ""
-            target = next((r for r in results if r.get("goal_id") == gid), None)
-            # Record the per-goal cooldown ONLY on successful delivery: a cooldown
-            # for an email that never sent would suppress the retry and reproduce
-            # exactly the silence being fixed.
-            if ok_mail:
-                ok_board, board_detail = _post_board(goal, age, args.no_board)
-                if target is not None:
-                    target.update({"action": "escalated", "email": mail_detail,
-                                   "board": board_detail, "board_ok": ok_board})
-                applied += 1
-            else:
-                if target is not None:
-                    target.update({"action": "failed", "email": mail_detail,
-                                   "board": "not_posted_no_cooldown_recorded"})
-        if not ok_mail:
+        if ok_mail:
+            # The board record is the schedule marker, so it is written ONLY on
+            # successful delivery: marking the schedule for an email that never
+            # sent would start the next window from a send that did not happen
+            # and suppress the retry for a full cadence — the exact silence this
+            # lane exists to fix.
+            ok_board, board_detail = _post_digest_board_record(
+                batch, cadence_hours, args.no_board)
+            applied = len(batch)
+            for r in results:
+                if r.get("action") == "would_escalate":
+                    r.update({"action": "escalated", "email": mail_detail,
+                              "board": board_detail, "board_ok": ok_board})
+        else:
+            board_detail = "not_posted_no_schedule_marker_recorded"
+            for r in results:
+                if r.get("action") == "would_escalate":
+                    r.update({"action": "failed", "email": mail_detail,
+                              "board": board_detail})
             sys.stderr.write(
-                "user-blocker-escalation: digest delivery FAILED (%s) — no cooldowns "
-                "recorded for %d goal(s), will retry next sweep\n"
+                "user-blocker-escalation: digest delivery FAILED (%s) — schedule "
+                "marker NOT recorded for %d goal(s), will retry next sweep\n"
                 % (mail_detail, len(batch)))
 
     print(json.dumps({
         "agent": agent,
         "now": now.strftime("%Y-%m-%dT%H:%M:%S"),
-        "escalate_hours": escalate_hours,
+        "cadence_hours": cadence_hours,
+        "schedule": {
+            "due": due,
+            "reason": schedule_reason,
+            "read_ok": read_ok,
+            "hours_since_last_digest": (None if hours_since_last is None
+                                        else round(hours_since_last, 1)),
+            "hours_until_next": (
+                None if (not read_ok or hours_since_last is None or due)
+                else round(cadence_hours - hours_since_last, 1)),
+        },
         "dry_run": not args.apply,
         "predicate_loaded": find_pop is not None,
         "scanned": scanned,
         "eligible": eligible,
         "applied": applied,
-        "skipped": {"deliberate": skipped_deliberate,
-                    "cooldown": skipped_cooldown,
-                    "below_threshold": skipped_young,
-                    "age_uncomputable": skipped_uncomputable},
+        "all_clear": due and not batch,
+        # DELIVERY IS REPORTED SEPARATELY FROM `applied`, which counts GOALS.
+        # On a sent all-clear `applied` is 0 — correct (zero goals escalated) and
+        # indistinguishable from "nothing was sent" if it were the only signal.
+        # For a lane whose entire defect was a send that nobody could tell had
+        # not happened, that ambiguity is not acceptable in its own output.
+        "delivery": {
+            "attempted": args.apply and due,
+            "shape": None if not (args.apply and due) else (
+                "digest" if batch else "all_clear"),
+            "ok": ok_mail,
+            "detail": mail_detail,
+            "board": board_detail,
+            "board_ok": ok_board,
+        },
+        "skipped": {"deliberate": skipped_deliberate},
+        "unknown_age": unknown_age,
         "results": results,
     }, indent=2))
-    # A count buried in a JSON blob is still a silent skip — this lane exists
-    # because a goal that cannot reach the user is invisible until someone
-    # looks. Say it on stderr, where the precheck operator actually reads.
-    if skipped_uncomputable:
+    # A verdict buried in a JSON blob is still invisible — this lane exists
+    # because a goal that cannot reach the user goes unnoticed until someone
+    # looks. Say the two non-obvious outcomes on stderr, where the precheck
+    # operator actually reads.
+    if not read_ok:
         sys.stderr.write(
-            "user-blocker-escalation: %d goal(s) have an UNCOMPUTABLE age (no "
-            "parseable timestamp) and can never age into escalation — %s\n"
-            % (skipped_uncomputable,
+            "user-blocker-escalation: SCHEDULE UNREADABLE — no digest sent this "
+            "sweep. This fails CLOSED on purpose (see _schedule_verdict); it "
+            "retries next sweep, but a PERSISTENT read failure means the user "
+            "stops hearing from this lane entirely.\n")
+    if unknown_age:
+        sys.stderr.write(
+            "user-blocker-escalation: %d goal(s) carry no parseable timestamp — "
+            "included in the digest with age reported as unknown: %s\n"
+            % (unknown_age,
                ", ".join(r["goal_id"] for r in results
-                         if r.get("reason") == "age_uncomputable")))
+                         if r.get("action") != "skip"
+                         and r.get("age_hours") is None)))
     return 0
 
 

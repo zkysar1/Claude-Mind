@@ -267,6 +267,14 @@ def write_okf_bundle(bundle: ProjectedBundle, out_dir: Path) -> dict[str, int]:
             "type": "node",
             "key": n.get("key") or stem,
             "title": title,
+            # `summary` rides in frontmatter, not only as the body fallback below
+            # (g-115-3266). It is the ONE projected field this writer used to lose:
+            # a node WITH a body rendered `body` and dropped `summary` entirely, so a
+            # consumer had no short description to preview a node by without parsing
+            # (and truncating) the article. In frontmatter it is machine-addressable.
+            # Empty for nodes that have no summary — invariant 5 (consumers tolerate
+            # missing optional fields), same as `parent` already is.
+            "summary": str(n.get("summary") or ""),
             "parent": n.get("parent") or "",
             "children": list(n.get("children") or []),
         }

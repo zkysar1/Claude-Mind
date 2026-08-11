@@ -264,3 +264,98 @@ def test_non_date_sentinel_not_fallback_even_when_old():
     assert c["overdue"] == 0
     d, basis = SW.effective_deadline(rec)
     assert d is None and basis is None
+
+
+# ---------------------------------------------------------------------------
+# : DATE-GRANULARITY boundary (guard-2073).
+#
+# Every fixture above uses _iso(), which returns a full ISO *datetime*. So until
+# this section the date-only shape -- 93.6% of live non-terminal pipeline
+# records, measured 2026-07-31 -- was not exercised by a single test, and the
+# N=0 (due-today) boundary was unpinned in either shape. That is why
+# classify_overdue could parse a date-only deadline to MIDNIGHT and call a
+# record with ~24h remaining overdue, while the pinned sibling
+# pipeline_write._is_stale_unactivated said the opposite, for as long as it did.
+# ---------------------------------------------------------------------------
+
+
+def _date_only(offset_days):
+    """A DATE-ONLY 'YYYY-MM-DD' deadline, the dominant live shape."""
+    return (NOW + timedelta(days=offset_days)).date().isoformat()
+
+
+def test_date_only_due_today_not_overdue():
+    # THE regression this section exists for. Date-only today = END of today, so
+    # it has NOT passed at NOW (12:00). Under the old midnight parse this was
+    # overdue and indistinguishable from due-yesterday.
+    rec = _well_formed(resolves_by=_date_only(0))
+    c = SW.classify_overdue([rec], NOW)
+    assert c["overdue"] == 0
+    assert rec not in c["expire"] and rec not in c["promote"] and rec not in c["needs_judgment"]
+
+
+def test_date_only_due_yesterday_is_overdue():
+    # The other side of the same boundary: one day earlier IS past.
+    rec = _well_formed(resolves_by=_date_only(-1))
+    c = SW.classify_overdue([rec], NOW)
+    assert c["overdue"] == 1
+    assert rec in c["promote"]  # well-formed + recent -> review path
+
+
+def test_date_only_due_tomorrow_not_overdue():
+    rec = _well_formed(resolves_by=_date_only(+1))
+    c = SW.classify_overdue([rec], NOW)
+    assert c["overdue"] == 0
+
+
+def test_datetime_due_today_earlier_instant_not_overdue():
+    # DELIBERATE, and the pin that stops granularity-branching being reintroduced:
+    # a datetime deadline is truncated to its DATE too, so an instant earlier
+    # today (09:00 vs NOW 12:00) is NOT overdue. One predicate shared with the
+    # sibling beats sub-day precision the day-scale buckets cannot use, and a
+    # later boundary is fail-safe for a sweep whose expire[] bucket is one-way.
+    rec = _well_formed(resolves_by=NOW.replace(hour=9).isoformat())
+    c = SW.classify_overdue([rec], NOW)
+    assert c["overdue"] == 0
+
+
+def test_overdue_days_counts_calendar_days():
+    # overdue_days must be date-granular too, or the expire threshold drifts
+    # against the comparison that selected the record. Date-only 31 days back
+    # crosses the 30-day short threshold; 30 days back does not.
+    rec_expire = _well_formed(id="e", resolves_by=_date_only(-31))
+    rec_keep = _well_formed(id="k", resolves_by=_date_only(-30))
+    c = SW.classify_overdue([rec_expire, rec_keep], NOW)
+    assert rec_expire in c["expire"]
+    assert rec_keep not in c["expire"]
+
+
+def test_formed_horizon_fallback_due_today_not_overdue():
+    # The fallback basis inherits the same boundary: id-date 06-10 + short
+    # window 14 = 06-24 = today -> not yet overdue. 06-09 + 14 = 06-23 -> overdue.
+    today_rec = _no_rb(id="2026-06-10_lands-today")
+    past_rec = _no_rb(id="2026-06-09_landed-yesterday")
+    assert SW.classify_overdue([today_rec], NOW)["overdue"] == 0
+    assert SW.classify_overdue([past_rec], NOW)["overdue"] == 1
+
+
+def test_agrees_with_pinned_sibling_predicate_across_the_boundary():
+    """Anti-drift pin: classify_overdue must agree with the authority it was
+    reconciled to. Replicates pipeline_write._is_stale_unactivated's deadline
+    test (`date.fromisoformat(str(rb)[:10]) < today`) rather than importing it,
+    so this stays a hermetic pure-classifier test with no daemon coupling. If
+    someone restores datetime-granularity here, the -0 and the intra-day cases
+    diverge and this fails."""
+    from datetime import date as _date
+
+    def sibling_says_past(rb):
+        return _date.fromisoformat(str(rb)[:10]) < NOW.date()
+
+    cases = [_date_only(n) for n in (-31, -2, -1, 0, +1, +5)]
+    cases.append(NOW.replace(hour=9).isoformat())   # intra-day datetime, today
+    cases.append(NOW.replace(hour=23).isoformat())  # later-today datetime
+    cases.append(_iso(-3))                          # datetime, clearly past
+    for rb in cases:
+        rec = _well_formed(resolves_by=rb)
+        mine = SW.classify_overdue([rec], NOW)["overdue"] == 1
+        assert mine == sibling_says_past(rb), f"disagreement on resolves_by={rb!r}"

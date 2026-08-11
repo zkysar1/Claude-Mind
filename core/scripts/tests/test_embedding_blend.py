@@ -364,3 +364,210 @@ def test_as_of_read_skips_blend(monkeypatch, stores):
     # Sanity: the same call WITHOUT as_of does engage the blend.
     domain2, _ = _retrieve.load_reasoning_bank(QUERY, "medium", read_only=True)
     assert called and [r["id"] for r in domain2] == ["rb-sem", "rb-1"]
+
+
+# ── 5c. Pull-slot abstention telemetry () ──────────────────────────
+#
+# Before these fields the trace carried only counts of RETURNED items, so a lane
+# where cosine filled both pull slots and one where cosine picked NOTHING and
+# utilization backfilled every slot emitted identical rows (n_reasoning_bank=5).
+# The cosine path silently not running was unmeasurable. These pin the four-way
+# status split, because a bare picked=0 count would collapse three genuinely
+# different conditions and rebuild the defect being instrumented.
+
+def _split_stats(uni, monkeypatch=None):
+    """Run the split with a stats sink and return the populated dict."""
+    stats = {}
+    _retrieve._universal_relevance_split(uni, QUERY, stats=stats)
+    return stats
+
+
+def _uni8():
+    return [_uni(f"rb-u{i}", util=1.0 - i * 0.1) for i in range(8)]
+
+
+def test_stats_arg_is_optional_and_omitting_it_never_raises(monkeypatch):
+    """Backward compat: every pre-existing caller passes 2 positional args."""
+    cfg = _cfg(True)
+    cfg["universal_relevance_slots"] = 2
+    _retrieve._RETRIEVAL_CFG_CACHE = cfg
+    monkeypatch.setattr(er, "cosine_scores", lambda q, **k: {"rb-u7": 0.80})
+    out = _retrieve._universal_relevance_split(_uni8(), QUERY)
+    assert len(out) == _retrieve.UNIVERSAL_RB_CAP
+
+
+def test_status_off_when_flag_disabled(monkeypatch):
+    _retrieve._RETRIEVAL_CFG_CACHE = _cfg(False)
+    monkeypatch.setattr(er, "cosine_scores",
+                        lambda q, **k: (_ for _ in ()).throw(
+                            AssertionError("must not be called")))
+    s = _split_stats(_uni8())
+    assert s["universal_cosine_status"] == "off"
+    assert s["n_universal_cosine_picked"] == 0
+    assert s["n_universal_backfilled"] == 0
+
+
+def test_status_no_slots_when_configured_to_zero(monkeypatch):
+    cfg = _cfg(True)
+    cfg["universal_relevance_slots"] = 0
+    _retrieve._RETRIEVAL_CFG_CACHE = cfg
+    monkeypatch.setattr(er, "cosine_scores", lambda q, **k: {"rb-u7": 0.99})
+    s = _split_stats(_uni8())
+    assert s["universal_cosine_status"] == "no_slots"
+
+
+def test_status_no_scores_is_not_an_abstention(monkeypatch):
+    """An empty score map means the embedding index gave nothing back — a
+    broken/missing index, NOT cosine declining to pick. Counting it as
+    abstention would report infrastructure failure as a feature miss."""
+    cfg = _cfg(True)
+    cfg["universal_relevance_slots"] = 2
+    _retrieve._RETRIEVAL_CFG_CACHE = cfg
+    monkeypatch.setattr(er, "cosine_scores", lambda q, **k: {})
+    s = _split_stats(_uni8())
+    assert s["universal_cosine_status"] == "no_scores"
+    assert s["n_universal_backfilled"] == 0   # must NOT read as 2 abstentions
+
+
+def test_status_ran_with_full_cosine_picks(monkeypatch):
+    cfg = _cfg(True)
+    cfg["universal_relevance_slots"] = 2
+    _retrieve._RETRIEVAL_CFG_CACHE = cfg
+    monkeypatch.setattr(er, "cosine_scores",
+                        lambda q, **k: {"rb-u6": 0.90, "rb-u4": 0.50})
+    s = _split_stats(_uni8())
+    assert s["universal_cosine_status"] == "ran"
+    assert s["n_universal_cosine_picked"] == 2
+    assert s["n_universal_backfilled"] == 0
+    assert s["n_universal_pull_slots"] == 2
+
+
+def test_status_ran_with_zero_picks_is_full_abstention(monkeypatch):
+    """THE case the goal exists to make visible: cosine ran, nothing cleared the
+    threshold, utilization backfilled every pull slot. Previously indistinguishable
+    from a fully cosine-filled lane."""
+    cfg = _cfg(True)
+    cfg["universal_relevance_slots"] = 2
+    _retrieve._RETRIEVAL_CFG_CACHE = cfg
+    monkeypatch.setattr(er, "cosine_scores", lambda q, **k: {"rb-u5": 0.10})
+    s = _split_stats(_uni8())
+    assert s["universal_cosine_status"] == "ran"
+    assert s["n_universal_cosine_picked"] == 0
+    assert s["n_universal_backfilled"] == 2
+
+
+def test_status_ran_with_partial_picks(monkeypatch):
+    cfg = _cfg(True)
+    cfg["universal_relevance_slots"] = 2
+    _retrieve._RETRIEVAL_CFG_CACHE = cfg
+    monkeypatch.setattr(er, "cosine_scores", lambda q, **k: {"rb-u7": 0.80})
+    s = _split_stats(_uni8())
+    assert s["n_universal_cosine_picked"] == 1
+    assert s["n_universal_backfilled"] == 1
+
+
+def test_backfilled_is_measured_not_inferred_on_a_short_corpus(monkeypatch):
+    """(slots - picked) OVER-reports when `rest` is too short to fill the slots.
+    Counting the actual appends is what keeps the rate honest on a small store."""
+    cfg = _cfg(True)
+    cfg["universal_relevance_slots"] = 2
+    _retrieve._RETRIEVAL_CFG_CACHE = cfg
+    monkeypatch.setattr(er, "cosine_scores", lambda q, **k: {"rb-u0": 0.10})
+    # 4 entries with CAP=5: floor takes 3, rest is 1 entry, nothing qualifies.
+    uni = [_uni(f"rb-u{i}", util=1.0 - i * 0.1) for i in range(4)]
+    s = _split_stats(uni)
+    assert s["n_universal_cosine_picked"] == 0
+    # Only ONE entry existed to backfill with — the inferred figure would say 2.
+    assert s["n_universal_backfilled"] == 1
+
+
+def test_abstention_rate_excludes_non_ran_statuses(monkeypatch):
+    """The consumer contract: rate = backfilled / pull_slots over status=='ran'
+    ONLY. This pins the discriminator rather than leaving it to prose."""
+    cfg = _cfg(True)
+    cfg["universal_relevance_slots"] = 2
+    _retrieve._RETRIEVAL_CFG_CACHE = cfg
+    rows = []
+    monkeypatch.setattr(er, "cosine_scores", lambda q, **k: {})
+    rows.append(_split_stats(_uni8()))                    # no_scores
+    monkeypatch.setattr(er, "cosine_scores", lambda q, **k: {"rb-u5": 0.10})
+    rows.append(_split_stats(_uni8()))                    # ran, full abstention
+    ran = [r for r in rows if r["universal_cosine_status"] == "ran"]
+    assert len(ran) == 1
+    rate = sum(r["n_universal_backfilled"] for r in ran) / sum(
+        r["n_universal_pull_slots"] for r in ran)
+    assert rate == 1.0        # 2/2 — and the no_scores row did not dilute it
+
+
+def test_trace_record_carries_the_fields_and_pops_them(monkeypatch, tmp_path):
+    """End-to-end: the fields reach the trace row, and a SECOND request that
+    never reaches the split does not inherit the first one's numbers."""
+    monkeypatch.setattr(_retrieve, "WORLD_DIR", tmp_path)
+    _retrieve._UNIVERSAL_SPLIT_STATS.clear()
+    _retrieve._UNIVERSAL_SPLIT_STATS.update(
+        {"universal_cosine_status": "ran", "n_universal_pull_slots": 2,
+         "n_universal_cosine_picked": 0, "n_universal_backfilled": 2})
+    _retrieve._log_retrieval_trace(
+        category="q", depth="medium", read_only=True,
+        items_returned={"tree_nodes": 1}, effective_goal=None,
+        supplementary_only=False, include_framework=False)
+    # Second call with the carrier now empty (popped by the first).
+    _retrieve._log_retrieval_trace(
+        category="q2", depth="medium", read_only=True,
+        items_returned={"tree_nodes": 1}, effective_goal=None,
+        supplementary_only=False, include_framework=False)
+    rows = [json.loads(ln) for ln in
+            (tmp_path / "retrieval-trace.jsonl").read_text().splitlines() if ln.strip()]
+    assert rows[0]["universal_cosine_status"] == "ran"
+    assert rows[0]["n_universal_backfilled"] == 2
+    # Absent, NOT zero — "the lane did not run" must stay distinct from
+    # "ran and picked none", or the rate silently gains a denominator.
+    assert "universal_cosine_status" not in rows[1]
+    assert "n_universal_backfilled" not in rows[1]
+
+
+def test_dirty_carrier_from_a_failed_request_does_not_leak_into_an_as_of_row(
+        monkeypatch, stores, tmp_path):
+    """A request that populates the carrier and then RAISES before the trace
+    write must not contaminate the next request's row.
+
+    Pop-on-read protects the request AFTER the consumer. It cannot protect the
+    request after a FAILED one: nothing pops when the handler raises between
+    endpoints/retrieve.py:339 and :534. The clear therefore has to be
+    unconditional at load_reasoning_bank entry, not inside the `as_of is None`
+    arm -- an as_of read skips that arm entirely.
+
+    This matters more than a stray field: the leaked row carries
+    status == "ran", and the documented rate contract selects exactly those
+    rows, so the contaminated row is COUNTED and the abstention rate is wrong.
+    Regression for the g-115-4039 fresh-eyes finding (guard-1663 class;
+    rb-659 -- state-mutating production code needs a fresh fixture per call).
+    """
+    rb_p, _ = stores
+    monkeypatch.setattr(_retrieve, "WORLD_DIR", tmp_path)
+    _retrieve._RETRIEVAL_CFG_CACHE = _cfg(True)
+    monkeypatch.setattr(er, "cosine_scores", lambda q, **k: {"rb-sem": 0.9})
+    _write_jsonl(rb_p, [
+        _rb("rb-1", "shutdown-sequencing", "graceful shutdown sequencing steps",
+            valid_from="2026-06-01T00:00:00"),
+    ])
+    # Request A got as far as the split, then died before the trace write.
+    _retrieve._UNIVERSAL_SPLIT_STATS.clear()
+    _retrieve._UNIVERSAL_SPLIT_STATS.update(
+        {"universal_cosine_status": "ran", "n_universal_pull_slots": 2,
+         "n_universal_cosine_picked": 2, "n_universal_backfilled": 0})
+
+    # Request B is an as_of read -- it never runs the split.
+    _retrieve.load_reasoning_bank(QUERY, "medium", read_only=True,
+                                  as_of="2026-07-01T00:00:00")
+    assert _retrieve._UNIVERSAL_SPLIT_STATS == {}, \
+        "as_of entry must clear the carrier; a dirty one leaks into B's row"
+
+    _retrieve._log_retrieval_trace(
+        category="request-B-as-of", depth="medium", read_only=True,
+        items_returned={"tree_nodes": 3}, effective_goal=None,
+        supplementary_only=False, include_framework=False)
+    row = json.loads(
+        (tmp_path / "retrieval-trace.jsonl").read_text().splitlines()[0])
+    leaked = {k: v for k, v in row.items() if "universal" in k}
+    assert leaked == {}, f"B inherited A's pull-slot numbers: {leaked}"

@@ -162,6 +162,11 @@ def classify_overdue(records, now, expire_days_short=DEFAULT_EXPIRE_DAYS_SHORT,
     overdue -- resolves_by when present, else formed_date + horizon window
     (g-115-1981); records with neither a resolves_by nor a parseable formation
     date are ignored.
+
+    PAST means strictly EARLIER CALENDAR DAY than `now`, not earlier instant: a
+    deadline falling on today has not passed yet, because a date-only deadline
+    denotes the END of its day (guard-2073). `now` is still a datetime -- only
+    the comparison is date-granular.
     """
     expire, promote, needs = [], [], []
     overdue = 0
@@ -171,10 +176,23 @@ def classify_overdue(records, now, expire_days_short=DEFAULT_EXPIRE_DAYS_SHORT,
         if rec.get("stage") != "discovered":
             continue
         deadline, _basis = effective_deadline(rec)
-        if deadline is None or deadline >= now:
+        # DATE granularity, strict '<' (guard-2073). A date-only resolves_by --
+        # 93.6% of live non-terminal records, measured 2026-07-31 -- parses to
+        # MIDNIGHT at the START of its day, so the naive `deadline < now` marked a
+        # deadline with up to ~24h still remaining as already past. This matches
+        # the pinned authority pipeline_write._is_stale_unactivated
+        # (`date.fromisoformat(str(rb)[:10]) < today`), so the two sweeps reading
+        # this same field cannot disagree on the boundary day again;
+        # cadence_signals._resolvable_hypotheses_present agrees generously
+        # (<= today). Truncating a datetime resolves_by to its date too (rather
+        # than branching on granularity) is deliberate: it keeps ONE predicate
+        # shared with the sibling, and every bucket below thresholds in whole
+        # days, so sub-day precision buys nothing and a later boundary is the
+        # fail-safe direction for a sweep whose expire[] bucket is one-way.
+        if deadline is None or deadline.date() >= now.date():
             continue  # no derivable deadline, or not yet overdue
         overdue += 1
-        overdue_days = (now - deadline).days
+        overdue_days = (now.date() - deadline.date()).days
         horizon = (rec.get("horizon") or "short").strip().lower()
         # Long-horizon windows are months; everything else (short/session/unset)
         # uses the short threshold.
@@ -258,7 +276,10 @@ def main() -> int:
     for rec in c["expire"]:
         rid = rec.get("id")
         deadline, basis = effective_deadline(rec)
-        days = (now - deadline).days if deadline else "?"
+        # Date-granular, matching classify_overdue's predicate above — the note
+        # below is the human-readable account of the same decision, so the two
+        # must not report different day counts.
+        days = (now.date() - deadline.date()).days if deadline else "?"
         if basis == "formed+horizon":
             window_desc = (
                 f"derived deadline (formed_date + {(rec.get('horizon') or 'short')}"

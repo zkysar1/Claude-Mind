@@ -38,7 +38,7 @@ gate was never run. g-115-2984 made the CHECK un-skippable; this canary makes a
 skipped DISPATCH un-silent — an Investigate fires after `threshold` consecutive
 un-dispatched fires.
 
-Scope: the six skill-invocation cadences in _cadence_registry (the same SSOT the
+Scope: the seven skill-invocation cadences in _cadence_registry (the same SSOT the
 battery reads). l1-skew (0.5g) and health-regression (0.5h) are NOT
 cadence-battery members (they self-act / are dormant) and are outside this canary
 too, exactly as they are outside the battery.

@@ -230,25 +230,73 @@ def filter_paths(paths, self_agent, project_root, world_dir):
         else {}
     )
 
-    self_in_flight = (agent_status.get(self_agent) or {}).get("in_flight") or {}
-    self_claimed_at = (
-        _iso_to_epoch(self_in_flight.get("claimed_at"))
-        if isinstance(self_in_flight, dict)
-        else 0
-    )
+    # ── Body-keyed claim windows () ────────────────────────────────
+    # A WORKER Body never writes `in_flight` (team-state-in-flight.sh stamps only
+    # for the reducer), so before this both halves of Source 1 degraded silently
+    # whenever any Body was involved -- and in OPPOSITE directions, which is why
+    # each half takes a different extremum rather than one shared helper:
+    #
+    #   SELF, newest (max): `self_claimed_at` answers "when did I start the work
+    #   I am about to commit". A worker's answer lives in its OWN body row. Newest
+    #   wins because a later start means fewer files pass `skip_concurrent` and
+    #   more fall to the Source-3 pre-claim drop -- i.e. this agent claims LESS
+    #   authorship. Zero here (the pre-fix worker case) disabled skip_concurrent
+    #   AND Source 3 outright, so a worker's own in-claim edits could be handed to
+    #   a partner while genuine partner WIP was kept.
+    #
+    #   PARTNER, oldest (min): `partner_epochs[p]` answers "how far back does this
+    #   partner's concurrent work reach". Oldest wins because a smaller epoch
+    #   matches MORE files as partner-owned, and dropping a file we might own is
+    #   recoverable while committing a file a partner owns is the guard-741
+    #   hazard. Absent here meant a worker partner was simply not concurrent.
+    #
+    # Both directions are deliberately conservative about this agent's claims.
+    # Non-dict body rows are skipped. As of  a cleared row is DELETED
+    # (POST /v1/team-state/clear-body-row), so the common case never reaches this
+    # guard -- but keep it: pre-fix null residue survives on any box that has not
+    # yet run a close, and a hand-edit can still leave one.
+    def _body_epochs(entry):
+        """(epoch, iso) pairs from an agent's in_flight_bodies map."""
+        bodies = (entry or {}).get("in_flight_bodies")
+        if not isinstance(bodies, dict):
+            return []
+        out = []
+        for _sid, body in bodies.items():
+            if not isinstance(body, dict):
+                continue
+            iso = body.get("claimed_at")
+            ep = _iso_to_epoch(iso)
+            if ep > 0:
+                out.append((ep, iso))
+        return out
 
-    # Source 1: partner in_flight claim timestamps (concurrent work).
+    self_entry = agent_status.get(self_agent) or {}
+    self_in_flight = self_entry.get("in_flight") or {}
+    _self_pairs = []
+    if isinstance(self_in_flight, dict):
+        _ep = _iso_to_epoch(self_in_flight.get("claimed_at"))
+        if _ep > 0:
+            _self_pairs.append((_ep, self_in_flight.get("claimed_at")))
+    _self_pairs.extend(_body_epochs(self_entry))
+    self_claimed_at = max((ep for ep, _ in _self_pairs), default=0)
+
+    # Source 1: partner claim timestamps (concurrent work), reducer + bodies.
     partner_epochs = {}
     partner_isos = {}
     for p in partners:
-        in_flight = (agent_status.get(p) or {}).get("in_flight") or {}
-        if not isinstance(in_flight, dict):
+        entry = agent_status.get(p) or {}
+        in_flight = entry.get("in_flight") or {}
+        pairs = []
+        if isinstance(in_flight, dict):
+            ep = _iso_to_epoch(in_flight.get("claimed_at"))
+            if ep > 0:
+                pairs.append((ep, in_flight.get("claimed_at")))
+        pairs.extend(_body_epochs(entry))
+        if not pairs:
             continue
-        iso = in_flight.get("claimed_at")
-        ep = _iso_to_epoch(iso)
-        if ep > 0:
-            partner_epochs[p] = ep
-            partner_isos[p] = iso
+        ep, iso = min(pairs, key=lambda t: t[0])
+        partner_epochs[p] = ep
+        partner_isos[p] = iso
 
     # Source 2: partner uncommitted-edits logs (explicit authorship record).
     # Phase 2.5.D: agent dirs live under PROJECT_ROOT/agents/<name>/.

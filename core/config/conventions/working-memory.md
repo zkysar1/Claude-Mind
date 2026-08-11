@@ -39,6 +39,7 @@ slots:
   sensory_buffer: []                  # Pre-encoding observations
   session_goal: null                  # High-level session objective
   conclusions: []                     # Judgment calls with evidence, for audit (see negative-conclusions.md)
+  spark_capture: []                   # Worker->reducer spark bridge (g-306-176); lazily created on first append
 
 # Parallel metadata (auto-managed by wm.py — never edit directly)
 slot_meta:
@@ -117,7 +118,7 @@ drift where one site resets the stamp while another skips the update.
 
 | Slot | Owner | Content | Used by |
 |------|-------|---------|---------|
-| `last_strategic_scan` | `aspirations-strategic-scan` | ISO timestamp of last scan | Orchestrator Phase 1.5 `hours_cadence` check |
+| `last_strategic_scan` | `aspirations-strategic-scan` | ISO timestamp of last scan | Orchestrator Phase 1.5 `hours_cadence` check, AND `strategic-scan-cadence-check.sh` -> precheck Phase 0.5e cadence battery (g-115-4691; READ-ONLY there per guard-155). Bare ISO string, NOT the `{timestamp, goals_count_at_last_fire}` dict its siblings use -- so no goal-count cadence can be computed from it. |
 | `last_fresh_eyes_review` | `fresh-eyes-review` | `{timestamp, goals_count_at_last_fire}` | `fresh-eyes-cadence-check.sh` → precheck Phase 0.5e |
 | `portfolio_health_signal` | `aspirations-strategic-scan` (S3 phase) | Category concentration + uncovered-priority findings | Consumed by `/fresh-eyes-review` Phase 2.5 + evolution gap analysis |
 | `cooldown_active` | `productivity-stop-gate.sh` `_write_blocked_sleep_until` | Boolean — true while a productivity-cooldown sleep is pending; cleared on every `blocked_sleep_until=null` cleanup path in `core/config/blocked-sleep-recovery-digest.md` | `blocked-sleep-recovery-digest.md` Phase -0.5e light-precheck — suppresses the `proactive_escalation` "still blocked" notification when the wake came from productivity-paced rest rather than B7-backoff (g-251-08). |
@@ -235,6 +236,42 @@ See `core/config/conventions/handoff-working-memory.md` for full schema.
   category: "category-slug"
   _item_ts: "YYYY-MM-DDTHH:MM:SS"
 ```
+
+### spark_capture items (g-306-176)
+
+The worker→reducer spark bridge. A WORKER Body skips every reducer-only phase
+(`worker_execute.REDUCER_ONLY_PHASES`), so six learning lanes that need the
+executing session's in-context experience — rb-creation, guardrail-extraction,
+gotcha-detection, forge-skill, pattern-outcome, experience-file-loading — are
+structurally unreachable on the worker path. This slot is how the observation
+survives the hand-off: the worker APPENDS during Phase 4, `body-merge.merge_wm`
+carries it to the reducer at generalize-down, and `aspirations-spark` Phase 6.5
+replays it there.
+
+```yaml
+- goal_id: "g-NNN-NN"       # REQUIRED — also the anti-collision key (below)
+  category: "category-slug" # the goal's category, for the Phase 6.5 handlers
+  observation: "What was learned, in enough detail to encode from"
+  sq_trigger: "sq-NNN"      # optional — the spark question this answers, or null
+  _item_ts: "YYYY-MM-DDTHH:MM:SS"   # auto-added by the append endpoint
+```
+
+Three properties are load-bearing and each is pinned by a test in
+`core/scripts/tests/test_spark_capture_bridge.py`:
+
+- **`goal_id` defeats cross-goal dedup collisions.** `body-merge._dedup_append`
+  unions by content hash, so two workers that phrase the same observation
+  identically would collapse to one entry and the second goal would silently
+  lose its learning. A distinct `goal_id` inside each entry makes the hashes
+  differ. Do not drop the field to save space.
+- **The slot is in `RESET_SURVIVING_SLOTS`.** Delivery (consolidate Step -1)
+  and `wm-reset` (Step 5) are in the same consolidation run, in that order.
+- **The slot is in `ARRAY_SLOTS`.** `wm-prune`'s scalar eviction would otherwise
+  null a populated slot at `evict_threshold_minutes`.
+
+Bounded at 50 items (`array_limits`), oldest-first — a safety net for a window
+where the reducer never runs Phase 6.5, not the normal path. Phase 6.5 clears
+the slot after consuming it.
 
 ### encoding_queue items
 ```yaml

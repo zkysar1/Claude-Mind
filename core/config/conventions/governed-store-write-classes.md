@@ -24,17 +24,32 @@ DEADLOCK, not transient contention). Class (a) degrades; class (b) wedges.
 ## How to classify a store (one lookup, no judgment)
 
 `merge_handler_for` in `core/scripts/coordination_merge.py` dispatches on
-**basename**, against the `_HANDLERS` dict (79 entries as of 2026-07-30), plus
-one path-pattern branch for per-agent team-state shards
-(`.../team-state/agents/<name>.yaml`, whose basenames are dynamic).
+**basename**, against the `_HANDLERS` dict (85 entries measured 2026-08-02 by
+`grep -c '^\s*"[^"]*":\s*merge_' core/scripts/coordination_merge.py` — re-derive
+rather than trusting this number), plus **THREE path-pattern branches that run
+BEFORE the dict lookup**:
+
+| # | Pattern | Effect |
+|---|---|---|
+| 1 | `.../team-state/agents/<name>.yaml` | registers — basenames are per-agent |
+| 2 | `.../health/<YYYY-MM-DD>.jsonl` | registers — basenames are dates (g-306-118-e) |
+| 3 | `core/config/**` | **un**-registers — a registered basename that also names an immutable framework config is deliberately NOT merged (g-115-3997) |
 
 ```bash
 # authoritative, and cheaper than reasoning about it
-grep -n '"<basename>": merge_' core/scripts/coordination_merge.py
+py -3 -c "import sys; sys.path.insert(0,'core/scripts'); import coordination_merge as m; print(m.merge_handler_for('<repo-relative path>'))"
 ```
 
-A hit means class (a). No hit means class (b). Registration is by basename
-only — a store's directory, purpose, and sibling files are all irrelevant.
+A non-`None` return means class (a). `None` means class (b).
+
+**Do NOT substitute a grep of the dict for that call — it is wrong in BOTH
+directions.** Branches 1 and 2 make a store class (a) with *no* basename entry,
+so a grep reports a false (b) on every agent shard and every health ledger;
+branch 3 makes a path class (b) *despite* a basename entry, so a grep reports a
+false (a) on the three colliding `core/config` names. The grep form was
+documented here as authoritative until 2026-08-02, and its first failure mode
+(shards) already existed when it was written. Resolve per PATH, through the
+function; a basename is an input to the answer, not the answer.
 
 ## The prior question: does this store sync at all? (class (c), g-115-3992)
 
@@ -140,13 +155,41 @@ table's own instruction. Corrected 2026-07-28 by the fresh-eyes pass on this fil
 | `endpoints/experience_write.py` | `experience.jsonl`, `experience-archive.jsonl` | **(b) — FIXED** (5 of 6 sites; the 6th writes `experience-meta.json`, unfenced — see below) |
 | `endpoints/wm_write.py` | `working-memory.yaml` | (b) by basename, **NOT a hazard — unfenced write path** (see below) |
 | `meta/meta_yaml.py` | generic dotpath writer + 2 side effects | **(b) — FIXED** |
-| `meta/meta_backpressure.py` | `backpressure.yaml` (all 6 `_persist` callers) | **(b) — FIXED** (5 mutating handlers; `status`/`cooldown_check` are read-only) |
+| `meta/meta_backpressure.py` | `backpressure.yaml` (all 6 `_persist` callers) | **RECLASSIFIED (b) -> (a) on 2026-07-31** (`merge_backpressure`). Was **(b) — FIXED** (5 mutating handlers; `status`/`cooldown_check` are read-only); that cure is RETAINED as redundant belt-and-braces — see the reclassification note below |
 | `meta/meta_generations.py` | `strategy-generations.yaml` (all 4 callers) | **(a) — NO CURE NEEDED** (`merge_strategy_generations`); was listed (b) here, see correction below |
 | `meta/meta_transfer.py` | `transfer/_index.yaml` (b), `reflection-` (b), `encoding-strategy.yaml` (b), **`goal-selection-strategy.yaml` (a)** | **MIXED — 3 FIXED, 1 correctly left bare** |
 | `meta/meta_experiment.py` | `active-experiments.yaml`, `completed-experiments.yaml` | **(b) — FIXED** (both, 2 handlers) |
 | `meta/strategy_apply.py` | `aspiration-generation-strategy.yaml` (b), **`goal-selection-strategy.yaml` (a)** | **MIXED — FIXED, routed per-basename at run time** |
 | `meta/meta_dead_ends.py` | `dead-ends.jsonl` | (b) — **UN-CURED, 2 sites, tracked by g-115-4017** (confirmed on BOTH axes: no handler, AND it writes via `_atomic_write_with_fallback` while reading via `ensure_local` — the wedged shape, no raw-write exemption) |
 | `meta/meta_impk.py` | `improvement-velocity.yaml` | **(a)** — `merge_improvement_velocity`; already carries the cure regardless. Its one apparent "bare lock" is a COMMENT describing the idiom it replaced, not a call — grep the executable line. |
+
+#### Reclassification: `backpressure.yaml` (b) -> (a), 2026-07-31 (g-115-4310, alpha, cc-04/Linux)
+
+`f6d6bd7eb` (closing g-115-4253) registered `merge_backpressure`, moving this
+basename across the split. `test_scope_write_classes_are_what_the_cure_assumed`
+fired exactly as its docstring intends — "the signal to re-derive the cure, not
+a silent behaviour change in production." Re-derived here so the next reader
+inherits the decision rather than repeating it (guard-1816 step 4):
+
+- **The handler STAYS; the pin updates.** Unregistering it restores class (b)
+  and re-opens the measured incident that motivated it — cc-06 could not
+  integrate for 6.2 hours with 54 commits stranded behind
+  `no ayoai-ledger handler for basename backpressure.yaml`.
+- **The `locked_rmw` cure is RETAINED, not removed**, though class (a) no longer
+  requires it. A reconciler now exists below the write, so a stale fence is no
+  longer a permanent wedge and the cure is belt-and-braces rather than
+  load-bearing. Stripping five handler conversions out of a store that has
+  already stranded a box once is an unrequested behaviour change carrying real
+  risk against no demanded benefit; the cost of keeping it is one extra refresh
+  per write cycle.
+- **The class change was a SIDE EFFECT, not a considered decision — and that is
+  precisely why the pin exists.** g-115-4253 never mentions write classes,
+  `locked_rmw`, or this convention; it asked for a *class-closing* remedy and
+  explicitly warned "do not just add a third handler and close." The handler is
+  sound on its own terms (its docstring carries the full guard-1816
+  append-only-vs-draining-queue analysis), but its write-class consequence was
+  invisible to the goal that produced it. A registry move nobody reasoned about
+  still reaches this table, and only an executable assertion catches it.
 
 #### Two corrections this table forced, both measured (g-115-3834, 2026-07-30, cc-04/Linux)
 

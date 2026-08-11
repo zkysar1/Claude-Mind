@@ -275,3 +275,92 @@ def test_idempotency(running_daemon):
 
     resp2 = _post(port)
     assert resp2["cleared_count"] == 0
+
+
+# ---- claimed_by_sid is part of the claim TRIPLE () ----
+#
+#  added claimed_by_sid and paired it at four of the five pop sites
+# in aspirations_write.py; this sweeper was the unpaired one. Two independent
+# halves are pinned below, and they fail for DIFFERENT reasons — the body half
+# leaves residue behind, the predicate half never sees the residue at all.
+
+
+def test_sid_cleared_with_the_pair(running_daemon):
+    """Terminal goal with the full triple → all three removed, not just two.
+
+    Fails without the `goal.pop("claimed_by_sid", None)` line: claimed_by and
+    claimed_at go, and the sid is left behind on a now-unclaimed goal.
+    """
+    project_root, port = running_daemon
+    world = project_root / "world"
+    _write_jsonl(world / "aspirations.jsonl", [
+        _make_asp("asp-001", "active", goals=[
+            _make_goal("g-001-01", "completed",
+                       claimed_by="alpha", claimed_at="2026-05-01T00:00:00",
+                       claimed_by_sid="SID-ALPHA"),
+        ]),
+    ])
+
+    resp = _post(port)
+    assert resp["cleared_count"] == 1
+
+    goal = _read_jsonl(world / "aspirations.jsonl")[0]["goals"][0]
+    assert "claimed_by" not in goal
+    assert "claimed_at" not in goal
+    assert "claimed_by_sid" not in goal, (
+        "the sid must clear WITH the pair — a claim is a triple, and a "
+        "leftover sid on an unclaimed goal is read by no consumer-side guard, "
+        "so it accumulates unnoticed")
+
+
+def test_orphaned_sid_only_is_visible_to_the_sweeper(running_daemon):
+    """A terminal goal carrying ONLY an orphaned sid must be found and cleared.
+
+    This is the PREDICATE half and it is the retroactive one. Without the
+    `or "claimed_by_sid" in goal` disjunct the goal never matches, so the
+    sweeper that exists to clean this residue up can never select it — the
+    orphan is permanently invisible and `cleared_count` reads 0, which is
+    indistinguishable from a clean store.
+    """
+    project_root, port = running_daemon
+    world = project_root / "world"
+    _write_jsonl(world / "aspirations.jsonl", [
+        _make_asp("asp-001", "active", goals=[
+            _make_goal("g-001-01", "completed", claimed_by_sid="SID-ORPHAN"),
+        ]),
+    ])
+
+    resp = _post(port)
+    assert resp["cleared_count"] == 1, (
+        "a terminal goal whose only claim residue is an orphaned sid must be "
+        "selectable by the sweeper; 0 here means the predicate cannot see it")
+    assert resp["cleared_ids"] == ["g-001-01"]
+
+    goal = _read_jsonl(world / "aspirations.jsonl")[0]["goals"][0]
+    assert "claimed_by_sid" not in goal
+
+
+def test_fresh_claim_triple_preserved(running_daemon):
+    """Non-terminal goal with the full triple → nothing cleared.
+
+    Guards the widened predicate against over-clearing: adding the sid
+    disjunct must not make a LIVE claim sweepable. The status test is still
+    the gate; the disjunct only widens what counts as residue on a goal that
+    is already terminal.
+    """
+    project_root, port = running_daemon
+    world = project_root / "world"
+    _write_jsonl(world / "aspirations.jsonl", [
+        _make_asp("asp-001", "active", goals=[
+            _make_goal("g-001-01", "in-progress",
+                       claimed_by="alpha", claimed_at="2026-05-01T00:00:00",
+                       claimed_by_sid="SID-ALPHA"),
+        ]),
+    ])
+
+    resp = _post(port)
+    assert resp["cleared_count"] == 0
+
+    goal = _read_jsonl(world / "aspirations.jsonl")[0]["goals"][0]
+    assert goal["claimed_by"] == "alpha"
+    assert goal["claimed_by_sid"] == "SID-ALPHA"

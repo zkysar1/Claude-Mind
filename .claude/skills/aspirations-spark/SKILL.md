@@ -98,6 +98,73 @@ This is for lessons learned during EXECUTION, not hypothesis resolution
 SKIP: goal outcome was routine/expected with no new insight.
 Exception: the Operational Gotcha Auto-Detection block always runs (it uses
 structural keyword signals, not agent judgment about novelty).
+Exception: the Worker Spark Replay block below always runs. Its input is
+OTHER sessions' observations, so THIS goal's outcome says nothing about
+whether there is learning to capture — a reducer closing a routine goal is
+exactly when a worker's backlog would be silently dropped.
+
+### Worker Spark Replay (g-306-176) — runs FIRST, and runs unconditionally
+
+A WORKER Body skips every reducer-only phase, so this phase never executes on
+the worker path and six learning lanes are structurally unreachable there
+(rb-creation, guardrail-extraction, gotcha-detection, forge-skill,
+pattern-outcome, experience-file-loading). Workers therefore APPEND their
+observations to the `spark_capture` WM slot during their Phase 3.5, and
+`body-merge.merge_wm` carries the slot into the reducer's WM at
+generalize-down. This block is where that captured learning finally reaches the
+handlers below.
+
+```
+Bash: bash core/scripts/wm-read.sh spark_capture --json
+IF the slot is null or an empty list:
+    No worker capture this window (the common case on a single-Body agent —
+    this bridge is dormant until a 2nd Body forks).
+    # PROVENANCE RECORD, empty branch (g-306-251). This write is the LOAD-BEARING
+    # half and must NOT be skipped as "nothing happened" — it is what makes a
+    # later absence readable. A recorder placed only on the fire path is absent
+    # exactly on the population you most need to account for (guard-2352), so
+    # without this line a zero-hit grep cannot distinguish "the consumer ran and
+    # had nothing to replay" from "the consumer never ran at all". Measured
+    # 2026-08-07 (zeta, cc-02): that exact ambiguity made the question
+    # undecidable — 0 hits fleet-wide across every journal, experience file and
+    # execution diary, with no way to tell which zero it was.
+    # Its own command, never &&-chained to a sidecar (guard-409).
+    Bash: printf '{"entry_type":"observation","goal_id":"<closing-goal-id>","content":"worker-spark-replay: checked, 0 observations"}' | bash core/scripts/execution-diary.sh append
+    Continue to the normal Phase 6.5 body below.
+ELSE:
+    Output: "▸ Worker spark replay: {N} captured observation(s) from {distinct goal_ids}"
+    FOR EACH entry in the slot:
+        Run the SAME handlers below (reasoning bank, guardrails, operational
+        gotcha, forge awareness, pattern outcome) over entry.observation,
+        using entry.goal_id / entry.category in place of the current goal's —
+        the artifact must be attributed to the goal that PRODUCED the
+        observation, not to whatever the reducer happens to be closing. Cite
+        entry.sq_trigger when present. The PLACEMENT CHECK below applies to
+        these artifacts too — a worker's observation about domain
+        infrastructure still belongs in a domain-scoped entry, and this block
+        sits ABOVE that paragraph only because it must run before the SKIP.
+    # PROVENANCE RECORD, fire branch (g-306-251). Written BEFORE the clear, on
+    # the same crash-safety reasoning the next comment gives: a crash here leaves
+    # the slot intact to re-replay (safe) plus a record already written (a
+    # harmless over-count), whereas recording after the clear could lose the
+    # batch AND leave no trace it ever existed. Name the source goal_ids — that
+    # is what makes an artifact attributable to the replay path rather than to an
+    # ordinary reducer close, since source_goal and encoded_by are exactly the
+    # two fields an ordinary close already writes and neither marks a replay.
+    # Its own command, never &&-chained to a sidecar (guard-409).
+    Bash: printf '{"entry_type":"observation","goal_id":"<closing-goal-id>","content":"worker-spark-replay: FIRED, %s observation(s) from %s"}' "<N>" "<distinct goal_ids>" | bash core/scripts/execution-diary.sh append
+    # One-shot consume. Clear only AFTER the handlers have run: a crash between
+    # read and clear re-replays on the next close (duplicate-checked by the
+    # existing semantic-overlap gates below, which strengthen rather than
+    # duplicate), whereas clearing first would lose the batch outright.
+    Bash: bash core/scripts/wm-clear.sh spark_capture
+```
+
+Do NOT skip the clear. The slot is in `RESET_SURVIVING_SLOTS` — it deliberately
+outlives the consolidate Step-5 `wm-reset` that would otherwise wipe it between
+its Step -1 delivery and this consumer — so this block is the ONLY thing that
+drains it. Skipping the clear replays the same observations every close until
+the 50-item `array_limits` cap starts dropping the oldest.
 
 PLACEMENT CHECK (before creating ANY guardrail or rb entry below): if the
 prescriptive rule's `applies_to` is `domain` — i.e., it names a brand, a
@@ -304,23 +371,84 @@ doubt between framework and domain, pick domain.
             better one.
 
         # Check forge criteria immediately
-        # GUARD: skip gaps in a TERMINAL status (Phase 9.2 checks the same set).
-        # Terminal set = {forged, dismissed, satisfied-by-extension}:
+        # GUARD: skip gaps whose status SUPPRESSES forging (Phase 9.2 checks the same set).
+        # DECLARED SOURCE: core/config/skill-gaps.yaml -> `gap_statuses` (g-115-3517,
+        # 2026-08-02) is authoritative; the set below is an inline copy kept for its
+        # explanations. guard-426 permits a copy only with a pointer to the source AND a
+        # drift check — the check is test_skill_gaps_hardening.py
+        # ::test_forge_filters_name_every_declared_suppressing_status, which reddens if a
+        # declared suppressing status is missing here. Declare new statuses THERE first;
+        # skill-gaps-validate.py then refuses any gap carrying an undeclared status.
+        # Suppressing set = three TERMINAL statuses + one NON-terminal deferral:
         #   forged                 — a skill was created (+ a forged-skills.yaml entry)
         #   dismissed              — explicitly declined by /forge-skill
         #   satisfied-by-extension — capability shipped by EXTENDING an existing
         #                            script/skill instead of forging a new one (a
         #                            legitimate outcome, and the honest label when
         #                            nothing was actually forged)
-        # Test the SET, never `== "forged"` alone: any non-excluded terminal status
+        #   deferred-to-goal       — NOT terminal. A resolution path is DECIDED and
+        #                            tracked by an open goal named in the gap's
+        #                            `resolution_tracked_by` field. Forging is wrong
+        #                            (the capability is not missing in the shape a new
+        #                            skill would fill) but nothing has shipped either,
+        #                            so no terminal status is honest yet.
+        # Test the SET, never `== "forged"` alone: any non-excluded suppressing status
         # makes its gap re-qualify as forge-ready forever, so every pass re-files the
         # forge goal and the duplication gate blocks it on the completed original via
         # origin_signal_completed — the same dead-end investigation, every time.
         # Observed 2026-07-27 on gap-026 (satisfied-by-extension). Keep this set in
-        # sync with aspirations-evolve/SKILL.md Step 9; those two are the only readers
-        # of gap status and must agree. (guard-821 reinforces: a terminal status with a
-        # resolution note IS the mechanism that stops re-qualification.)
+        # sync with BOTH other readers — aspirations-evolve/SKILL.md Step 9 AND
+        # core/scripts/coordination_merge.py `_SKILL_GAP_TERMINAL` / `_gap_status_rank`,
+        # the cross-box merge handler. THREE readers, not two. This comment claimed
+        # "those two are the only readers" until 2026-08-01, and the sibling in evolve
+        # said the same — two copies of one unverified claim, which read as
+        # corroboration. The merge handler was found only by grepping the VALUE across
+        # the tree (g-115-4457); a new status missing from it is silently reverted on
+        # merge when a peer still holds the old value, re-arming the loop the status was
+        # added to prevent. (guard-2283: a doc's claim about its own completeness is an
+        # unverified claim. guard-821 reinforces: a status with a resolution note IS the
+        # mechanism that stops re-qualification.)
+        #
+        # WHY `deferred-to-goal` EXISTS (g-115-4457, measured 2026-08-01). gap-028's
+        # description had carried an explicit DO-NOT-FILE directive naming its tracker
+        # (g-115-3767) since 2026-07-28, and a forge goal was filed anyway. Every
+        # suppression gate in this block reads STATUS or GOAL RECORDS; none reads the
+        # gap's own description — which is where that decision had to go, because no
+        # status value fit "resolution decided, tracker still open". The dedup probes
+        # were not wrong: they correctly found no duplicate, BECAUSE the prior decision
+        # was to file nothing. Absence of a forge goal was the EVIDENCE OF THE DECISION,
+        # and the sweep read it as evidence of starvation. A prose disposition that no
+        # reader reads is not a disposition — give the decision a field, or it does not
+        # exist.
         IF gap.status in ("forged", "dismissed", "satisfied-by-extension"): skip forge criteria check
+        IF gap.status == "deferred-to-goal":
+            # RE-CHECK the tracker; do NOT blindly suppress. A deferral whose tracker
+            # died must not silence the gap forever — that is the never-expiring
+            # suppression class (.claude/rules/reclaim-routed-work.md rule 3: age
+            # triggers a re-check, evidence closes it).
+            tracker = gap.resolution_tracked_by
+            IF tracker is absent or empty:
+                # The ONLY case that fails OPEN, deliberately. A deferral naming no
+                # tracker has no path to ever self-clear, so honoring it would suppress
+                # this gap forever — strictly worse than one re-filed goal. Malformed,
+                # not live: set gap.status back to "registered", note why in the
+                # description, and CONTINUE to the forge criteria check below.
+            # Tracker NAMED but unreadable is the opposite case — see fail-CLOSED below.
+            Bash: aspirations-query.sh --goal-field id "{tracker}" --full
+            # `--goal-field id`, NOT `goal_id`. The output projection RENAMES the record
+            # key `id` to `goal_id`, but only `id` is queryable — so querying the name
+            # you see in the output returns a silent, plausible-looking 0 hits. Measured
+            # 2026-08-01: `--goal-field goal_id g-115-3767` -> 0, `--goal-field id
+            # g-115-3767` -> 1. A false-empty here would void a LIVE deferral and re-file.
+            IF the probe ERRORS or returns 0 rows: WARN + SKIP (fail CLOSED, guard-487 —
+                an unreadable tracker is not a dead one, and a spurious re-file does not
+                self-heal). Do NOT treat 0 rows as "tracker is gone".
+            ELIF tracker status in (skipped, expired): the deferral is VOID — set
+                gap.status back to "registered", note why in the description, and
+                CONTINUE to the forge criteria check below.
+            ELIF tracker status == completed: the resolution shipped — set gap.status
+                "satisfied-by-extension" and skip.
+            ELSE (pending / in-progress / blocked): skip — the deferral is live.
         # Registry cross-check (g-326-09 incident; mirrors evolve Step 9): before trusting
         # gap.status, grep world/forged-skills.yaml for `gap_ref: {gap.id}`. If a forged skill
         # already references this gap, the local skill-gaps.yaml status is STALE (observed 11
@@ -384,7 +512,25 @@ doubt between framework and domain, pick domain.
     # SKIP entirely IF trivial_mode OR outcome_class == routine (no deliberation
     # worth judging). Otherwise:
     Bash: cat agents/<agent>/session/retrieval-session.json   # may be absent
-    IF file absent OR retrieval_performed == false: SKIP this block
+    IF file absent: SKIP this block
+    # `retrieval_performed` IS a live key — but ONLY on the no-retrieval STUB that
+    # iteration-close.sh writes (`"retrieval_performed": False`, L2506). The real
+    # daemon-written manifest OMITS it, and ABSENT MEANS PERFORMED. That asymmetry
+    # is a tested contract (g-115-3126), which is why all four consumers spell it
+    # `d.get("retrieval_performed") is not False` and never `bool(...)` — the
+    # obvious boolean read inverts the discriminator on every real manifest
+    # (pre-apply-consult-gate.py:275-286, phase-4-26-gate.py:151-161,
+    # iteration-close.sh:589, compounding-events.py:306).
+    # CORRECTED 2026-08-09 (alpha, hostname cc-04, uname -r 6.8.0-136-generic).
+    # This comment previously stated the key does not exist in this schema and that
+    # the old guard "can never fire". It fires on every stub — g-335-913's own
+    # session file is one (schema_version 2, all populations empty). The prior pass
+    # sampled a REAL manifest and generalised that one shape to "the schema"; no
+    # stub was sampled. Dropping the guard was still correct, but for a different
+    # reason than was written: a stub has empty supplementary_detail BY
+    # CONSTRUCTION, so `retrieved_sigs is empty` below already subsumes it — the
+    # field check is redundant, not inert. Sample BOTH shapes before re-asserting
+    # anything about this file (rb-245, guard-1902).
     retrieved_sigs = [e["id"] for e in (session.supplementary_detail or [])
                       if e.get("type") == "pattern_signature"]
     IF retrieved_sigs is empty: SKIP this block   # common case: no Step-4 patterns
@@ -583,8 +729,69 @@ When sq-009 (or sq-c09 experiential variant) fires, it creates a hypothesis goal
          over already-saturated categories like: code, infrastructure, pipeline
          Reformulate: what USER-FACING or EXPERIENTIAL consequence follows from this work?
 0.5. Calibration gate (BEFORE assigning confidence):
-     a. Read recent accuracy: `Bash: pipeline-read.sh --stage resolved`
-        - Count CONFIRMED vs CORRECTED in this category (or overall if <3 in category)
+     a. Read recent accuracy — BOTH stages are REQUIRED:
+        `Bash: pipeline-read.sh --stage resolved`
+        `Bash: pipeline-read.sh --stage archived`
+        - `--stage resolved` ALONE is a SURVIVORSHIP FILTER. `resolved` is the
+          small live holding area; records migrate to `archived` as they age, so
+          most scoreable records sit in `archived`. Measured 2026-08-04T03:33
+          (bravo, hostname cc-05, uname -r 6.8.0-136-generic): resolved 86 vs
+          archived 829 — resolved is 9.4% of the 915-record store. Coverage of
+          scoreable records decays with the window: 100% at 2d, 75.9% at 7d,
+          29.8% at 30d, 21.5% at 90d. That is why the narrowing is invisible to
+          a same-session check and material by ~5 days.
+        - THE CEILING MOVES A FULL BAND, which is the actual harm here. Same
+          instant, same store: resolved-only scores 53/85 = 62.4% → cap 0.80;
+          the union scores 304/548 = 55.5% → cap 0.65. Identical magnitude to
+          the `resolution`-vs-`outcome` field bug recorded just below, from an
+          entirely different cause — a wrong POPULATION and a wrong FIELD break
+          this gate the same way.
+        - DO NOT READ "cap 0.65" AS THE CORRECT ANSWER. Fixing the population
+          fixes ONE of two independent live defects: this gate now reads the
+          corpus it is documented to read. It does NOT fix the second, which is
+          that an AGGREGATE accuracy over any corpus cannot denominate a
+          PER-BAND ceiling — a ceiling asserts a realized frequency AT a
+          confidence level, the input averages across all levels, and they
+          coincide only if accuracy is flat across bands (it is not). Treating
+          the union figure as the right input is a known error shape; both
+          defects are tracked at g-115-4715, and the measured detail lives in
+          the tree at performance/agent-performance/hypothesis-calibration.md
+          ("The Cap's Input and Its Output Are in Different Units" + "Resolved
+          Is Overloaded, and the Two Senses Set Different Caps").
+        - The two populations are TEMPORALLY DISJOINT, not subset-and-superset:
+          measured 2026-08-04, archived scoreable spans 2026-03-27..07-30 and
+          stage-resolved 07-31..08-04, with ZERO overlap. So `--stage resolved`
+          is not a sample of the corpus — it is an undeclared recency window
+          whose WIDTH is set by archival cadence rather than any time constant.
+          Whenever archival runs, this gate's lookback silently changes.
+        - CHEAPEST CROSS-CHECK: `pipeline-read.sh --meta` carries an `accuracy`
+          block already computed over the union (read total_resolved 548 /
+          confirmed 304 / accuracy_pct 55.5 — matching the hand count exactly).
+          Use it to confirm the OVERALL arm. It has no by-category breakdown, so
+          the per-category arm still needs the records.
+          (g-115-4866; template at review-hypotheses Mode 3 Step 1, g-115-3594.)
+        - Count CONFIRMED vs CORRECTED over the UNION of both stages, in this
+          category (or overall if <3 in category)
+        - COUNT THE `outcome` FIELD. There is no `resolution` key on a resolved
+          record (schema: pipeline.md; verified keys include `outcome`,
+          `outcome_date`, `outcome_detail`, `resolution_method` — NOT
+          `resolution`). A `resolution`-keyed count does NOT return zero, which
+          is what makes it dangerous: a handful of records carry that key from
+          an older shape, so the count comes back small-but-nonzero and reads as
+          a real track record. Measured 2026-08-01 (g-115-4005): `resolution`
+          gave total=2 / accuracy=0.0 over a store of 44, which sets the cap to
+          0.55; `outcome` gave 23 CONFIRMED / 20 CORRECTED = 0.535, cap 0.65.
+          READ THAT "store of 44" AS A HISTORICAL ARTEFACT, NOT AS THE
+          DENOMINATOR: 44 was the then-current `--stage resolved` count, i.e.
+          the narrow population this step no longer uses. Re-derived over the
+          union the same day, it would have been several hundred. Left in place
+          because the field comparison it illustrates is still valid — but do
+          not carry 44 forward as the store size, or the narrow denominator gets
+          re-derived from this very example. (g-115-4866.)
+          The wrong field silently tightens the ceiling by a full band. Exclude
+          `UNRESOLVABLE` (a third value) from the denominator — it is neither a
+          hit nor a miss. This is the rb-245 class landing inside the gate whose
+          own job is calibration.
         - If total == 0: SKIP gate (no track record yet), proceed to Step 0.7
         - Compute recent_accuracy = confirmed / total
      b. Apply confidence ceiling:
@@ -592,7 +799,14 @@ When sq-009 (or sq-c09 experiential variant) fires, it creates a hypothesis goal
         - If recent_accuracy >= 0.40 and < 0.60: cap at 0.65
         - If recent_accuracy >= 0.60 and < 0.80: cap at 0.80
         - If recent_accuracy >= 0.80: no cap
-        - Log: "Calibration gate: {N} resolved, {accuracy}% accurate → cap {cap}"
+        - Log: "Calibration gate: {N} scoreable over resolved+archived
+          (resolved {N_res} / archived {N_arch}), {accuracy}% accurate → cap {cap}"
+          Report BOTH arms, never just the total. A single number cannot show
+          whether the union was actually read, so a silent regression to the
+          resolved-only fetch would log identically to a correct run — and the
+          n is the only place that difference is visible. (guard-2529 /
+          guard-2273: a count taken behind a filter must state what the filter
+          excluded; guard-2191: state the n for both arms.)
      c. The agent MAY assign confidence below the cap freely.
         The cap only prevents overconfidence, not underconfidence.
 0.7. Adversarial pre-mortem (required when proposed confidence > 0.65):
@@ -947,6 +1161,21 @@ When sq-018 fires after goal completion:
      # framework filter returned empty, so no false check was proposed. But do
      # not read the union as single-agent: on a shared recurring goal it is
      # single-GOAL, multi-agent.
+     # OBSERVED 2026-08-02 (g-001-07, echo, cc-03): the case the line above
+     # says had not happened. The framework filter did NOT return empty — the
+     # 48h union over g-001-07 spanned 5 closes by THREE agents (echo, zeta,
+     # bravo) and surfaced `.claude/rules/self.md` from BRAVO's 07-31 19:24
+     # close. This iteration edited no framework file at all. So on a SHARED
+     # recurring goal the filter can hand you a partner's framework file and
+     # invite a check for a change you never made and have not read.
+     # THE BOUND IS INTACT AND STILL NOT ENOUGH: "came from this goal's own
+     # closes" is a guarantee about the GOAL's lineage, and step 2's question
+     # is about THIS ITERATION's work — on a shared recurring id those are
+     # different sets. Do not read a non-empty filter as proof you touched it.
+     # CHEAP DISCRIMINATOR, one command, before proposing anything:
+     #   git log -1 --format='%an %ad' <sha>   per matched sha
+     # If the framework file's commit is not this iteration's, DECLINE via the
+     # step 2.1 route (log one accurate line, do NOT increment sparks_generated).
      SHAS=$(git log --fixed-strings --grep "(${GID}):" --format=%H -n 50 --since=48.hours 2>/dev/null)
      if [ -n "$SHAS" ]; then
        SCOPE=$(printf '%s\n' "$SHAS" | while IFS= read -r s; do [ -n "$s" ] && git diff-tree --no-commit-id --name-only -r "$s" 2>/dev/null; done)

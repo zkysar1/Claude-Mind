@@ -13,6 +13,49 @@ Reads working memory via _rt.wm_read (daemon client); writes via wm.py set
 client). Dry-run by default; pass --apply to actually clear blockers and
 create Investigate goals.
 
+TWO POPULATIONS, ONLY ONE OF WHICH IS MUTABLE HERE (g-115-4328)
+---------------------------------------------------------------
+Blockers live in two places, and until 2026-08-01 this sweep read only the
+first:
+
+  (1) the `known_blockers` WORKING-MEMORY slot — per-agent, per-box, EPHEMERAL;
+  (2) the `blocker_ref` field on the GOAL RECORD — shared, fleet-wide, DURABLE.
+
+`create-blocker.py` writes BOTH: the WM entry first, then `_set_goal_blocker_ref`
+mirrors it onto the goal, calling the WM entry "the authoritative record" and the
+goal copy "a redundancy for the gate's structural check". That relationship is
+inverted with respect to DURABILITY, and the measurement shows which one survives:
+on 2026-08-01 all five fleet agents read `known_blockers=null` while SIX
+non-terminal goals carried a live `blocker_ref`. The ephemeral "authoritative"
+store had lost everything; the durable "redundancy" was the only surviving record.
+
+A slot-only read therefore reported `total_blockers: 0` — a number indistinguishable
+from a genuinely clean queue (guard-1802 / rb-5650: a zero-result run and a clean
+queue produce identical output). That is the `enumerator-all-clear-boundary` class:
+the count was honest about the population it enumerated and silent about the one
+the reader cared about.
+
+WHY THE GOAL-SOURCED HALF IS REPORT-ONLY, NOT AUTO-CLEARED. Widening the COUNT
+fixes the vacuous all-clear. Widening the CLEAR PATH would be a different and
+much riskier change, refused here for three measured reasons:
+  * guard-1978: this script consults NO probe — it decides purely on a
+    capability-gate keyword match against blocker narrative prose. Extending
+    that keyword-match clear path over a new population extends a known
+    false-positive surface (the streak-roblox-studio clear of a verified-live
+    outage is the canonical instance).
+  * Clearing a goal-sourced blocker means mutating the GOAL, not a WM slot.
+    `blocked-signal-resolution-check.py` (precheck Phase 0.5b.12) already owns
+    that population for the "is this block resolved?" question and is
+    deliberately DETECTIVE-ONLY, because most such goals are lane-owned by
+    another agent and unblocking one appropriates its owner's queue.
+  * The two sweeps ask different questions and both are needed: 0.5b.12 asks
+    "have this goal's block signals resolved?"; this asks "was an
+    agent-provisionable capability OVERLOOKED at creation time?".
+
+So goal-sourced entries are counted, aged, structurally filtered, and gate-checked
+for VISIBILITY, and their `action` is always report-only. They are also excluded
+from the `known_blockers` write-back — see the partition in main().
+
 Exit codes: always 0 (reporting tool). Use the JSON output's `actions_taken`
 field to determine what changed.
 """
@@ -199,6 +242,94 @@ def _wm_read_blockers() -> list:
     return data if isinstance(data, list) else []
 
 
+def _read_goal_blocker_refs() -> list:
+    """Blockers that live on GOAL RECORDS, normalized to the known_blockers shape.
+
+    The durable half of the two populations described in the module docstring.
+    Returns entries carrying `_origin: "goal"` so main() can (a) keep them out of
+    the `known_blockers` write-back and (b) refuse to auto-clear them.
+
+    READ THE FULL RECORD, NEVER THE QUERY PROJECTION (guard-1242).
+    `aspirations-query.sh --goal-status blocked` returns only
+    [asp_id, category, goal_id, source, status, title] — `blocker_ref` is ABSENT
+    from that projection, so building this population from it would yield a
+    guaranteed empty result that looks exactly like a clean queue. That is the
+    same vacuous-zero the widening exists to remove, so the query path would
+    re-create the defect one layer up. `_rt.aspirations_read` returns full goal
+    records; use it.
+
+    Live stores only, deliberately. A goal inside a COMPLETED+archived aspiration
+    is absent from these reads (guard-1555), and that is correct here: a blocker
+    on finished work is moot. This is a live-blocker sweep, not an audit.
+
+    guard-961: `blocker_ref` must be a DICT before any field access. A bare
+    string or list is a malformed record, not a blocker — skip it rather than
+    raise, matching the read-side discipline `_is_producer_managed` already uses.
+
+    guard-383 symmetry with `_wm_read_blockers`: a source read failure is FATAL,
+    never a silent `return []`. A silent empty list here would write the very
+    "zero blockers" lie this function exists to eliminate. The single fail-open
+    boundary stays the shell wrapper (rb-347).
+    """
+    try:
+        from _goal_census import TERMINAL_STATUSES  # leaf module, drift-tested
+    except Exception:                                # pragma: no cover - import guard
+        TERMINAL_STATUSES = frozenset(
+            {"completed", "decomposed", "expired", "skipped", "superseded"})
+    # NOTE: "retired" is not in the canonical set, so a retired goal's blocker_ref
+    # IS counted. Deliberate: a local superset would silently diverge from the
+    # drift-tested constant. The over-count is visible instead — every detail
+    # record carries `goal_status`, so a reader can see it.
+    out = []
+    for gsource in ("world", "agent"):
+        try:
+            raw = _rt.aspirations_read(source=gsource, active=True)
+        except _rt.RtError as e:
+            print(f"[blocker-recheck] aspirations_read({gsource}) failed: "
+                  f"{e.body or e}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else raw
+        except json.JSONDecodeError as e:
+            print(f"[blocker-recheck] aspirations_read({gsource}) returned "
+                  f"undecodable JSON: {e}", file=sys.stderr)
+            sys.exit(1)
+        # Both envelope shapes are live: the documented {"aspirations": [...]}
+        # and a BARE list (measured 2026-08-01 on source=world, active=1).
+        # Handle both — keying on only one silently yields zero aspirations.
+        asps = data.get("aspirations") if isinstance(data, dict) else data
+        for a in (asps or []):
+            if not isinstance(a, dict):
+                continue
+            for g in (a.get("goals") or []):
+                if not isinstance(g, dict):
+                    continue
+                if g.get("status") in TERMINAL_STATUSES:
+                    continue
+                ref = g.get("blocker_ref")
+                if not isinstance(ref, dict):    # guard-961
+                    continue
+                gid = g.get("id")
+                out.append({
+                    # Normalized to the known_blockers shape so every downstream
+                    # filter (_blocker_id, _age_hours, HUMAN_ONLY_BLOCKER_TYPES,
+                    # _is_producer_managed, is_user_routed) applies unchanged.
+                    "blocker_id": ref.get("external_id") or f"goalref:{gid}",
+                    "type": ref.get("type"),
+                    "reason": ref.get("why") or ref.get("reason"),
+                    "detected_at": ref.get("created_at"),
+                    "participants": g.get("participants"),
+                    "source": "goal-blocker-ref",
+                    "blocker_ref": ref,
+                    "_origin": "goal",
+                    "_goal_id": gid,
+                    "_goal_source": gsource,
+                    "_goal_status": g.get("status"),
+                    "_intended_agent": g.get("intended_agent"),
+                })
+    return out
+
+
 def _wm_set_blockers(blockers: list) -> bool:
     rc, _, _ = _py(
         [str(SCRIPT_DIR / "wm.py"), "set", "known_blockers"],
@@ -356,11 +487,23 @@ def main(argv=None):
                          "Override via stale_cadence.escalation_aspiration or this flag.")
     args = ap.parse_args(argv)
 
-    blockers = _wm_read_blockers()
+    wm_blockers = _wm_read_blockers()
+    goal_blockers = _read_goal_blocker_refs()
+    # WM first so its entries keep their original write-back order (the
+    # partition below relies on identity, not position, but a stable order
+    # keeps the emitted slot byte-comparable across runs).
+    blockers = wm_blockers + goal_blockers
     report = {
         "agent": os.environ.get("MIND_AGENT", ""),
         "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
         "total_blockers": len(blockers),
+        # DECLARE THE POPULATION, do not just count it. `total_blockers: 0` was
+        # honest and unreadable because it never said WHICH population it had
+        # enumerated (enumerator-all-clear-boundary). These two always appear,
+        # including when 0, so "the goal half found nothing" stays distinguishable
+        # from "this build has no goal half".
+        "wm_blockers": len(wm_blockers),
+        "goal_blockers": len(goal_blockers),
         "rechecked": 0,
         "matches_found": 0,
         "cleared": 0,
@@ -368,18 +511,42 @@ def main(argv=None):
         # non-zero gives consumers an unstable shape and makes "the exemption
         # never fired" indistinguishable from "this build has no exemption".
         "producer_managed_exempt": 0,
+        # Same stable-shape rule as producer_managed_exempt above: always present,
+        # so "no goal-sourced blocker matched" never reads as "this build has no
+        # goal-sourced path".
+        "goal_sourced_report_only": 0,
+        # WHY THE ZERO. `rechecked: 0` against a non-zero total_blockers is the
+        # same unreadable all-clear this goal was filed about, just one field to
+        # the right: a reader cannot tell "every blocker was correctly filtered"
+        # from "the filters are silently broken". Every `continue` below tallies
+        # its reason here, so the skips always sum to (total_blockers - rechecked)
+        # and the zero explains itself. Keys are fixed so the shape is stable.
+        "skipped": {
+            "malformed": 0,        # not a dict
+            "already_resolved": 0,  # carries a resolution
+            "human_only_type": 0,   # HUMAN_ONLY_BLOCKER_TYPES — never auto-clears
+            "producer_managed": 0,  # mirrors producer_managed_exempt
+            "not_user_routed": 0,   # pure [agent] — no creation-time lapse to catch
+            "unaged": 0,            # no parsable detected_at/created_at
+            "below_age_threshold": 0,
+        },
         "investigate_goals_created": [],
         "actions_taken": "dry-run" if not args.apply else "apply",
         "details": [],
     }
 
+    def _skip(reason):
+        report["skipped"][reason] += 1
+
     updated = []
     for b in blockers:
         # Only re-examine blockers that went to user (or hybrid) and are unresolved
         if not isinstance(b, dict):
+            _skip("malformed")
             updated.append(b)
             continue
         if b.get("resolution"):
+            _skip("already_resolved")
             updated.append(b)
             continue
         # Structural type filter — human-only blocker categories NEVER auto-clear.
@@ -388,6 +555,7 @@ def main(argv=None):
         # correct path for these is to surface them via pending-question
         # re-raise, not to clear them programmatically.
         if b.get("type") in HUMAN_ONLY_BLOCKER_TYPES:
+            _skip("human_only_type")
             updated.append(b)
             continue
         # Producer-managed blockers NEVER auto-clear here — see
@@ -396,6 +564,7 @@ def main(argv=None):
         # same output a genuinely clean run produces.
         if _is_producer_managed(b):
             report["producer_managed_exempt"] = report.get("producer_managed_exempt", 0) + 1
+            _skip("producer_managed")
             updated.append(b)
             continue
         participants = b.get("participants") or []
@@ -406,6 +575,7 @@ def main(argv=None):
                           or set(participants) == {"agent", "user"}
                           or not participants)
         if not is_user_routed:
+            _skip("not_user_routed")
             updated.append(b)
             continue
 
@@ -423,6 +593,17 @@ def main(argv=None):
         # age is None if BOTH keys are missing or unparsable — skip rather
         # than guess. age_hours below threshold — not yet aged, also skip.
         if age is None or age < args.max_age_hours:
+            # Split the two, because they mean opposite things. "below threshold"
+            # is a WAIT — this blocker will become eligible on its own. "unaged" is
+            # a PERMANENT exclusion: with no parsable stamp the age test can never
+            # pass, at any threshold, ever. A goal-sourced blocker_ref makes this
+            # reachable — `created_at` is OPTIONAL in the blocker_ref schema, and a
+            # live one lacking it was measured 2026-08-01 (). Do NOT
+            # synthesize an age from expires_at to "fix" it: _age_hours' contract is
+            # to refuse uncertain state, and a guessed age feeds the keyword-match
+            # clear path. Counting it is the fix — a permanent exclusion that is
+            # visible is a finding; one that is silent is this goal all over again.
+            _skip("unaged" if age is None else "below_age_threshold")
             updated.append(b)
             continue
 
@@ -453,11 +634,32 @@ def main(argv=None):
             "would_block": gate.get("would_block", False),
             "top_match": top_match,
             "matched_keyword": first_match.get("matched_keyword"),
+            # Provenance is part of the finding, not decoration: a reader must be
+            # able to tell which population a row came from without re-deriving it.
+            "origin": b.get("_origin") or "wm",
         }
+        if b.get("_origin") == "goal":
+            detail["goal_id"] = b.get("_goal_id")
+            detail["goal_source"] = b.get("_goal_source")
+            detail["goal_status"] = b.get("_goal_status")
+            detail["intended_agent"] = b.get("_intended_agent")
 
         if gate.get("would_block"):
             report["matches_found"] += 1
-            if args.apply:
+            if b.get("_origin") == "goal":
+                # REPORT-ONLY by design — see the module docstring. Clearing this
+                # would mutate a GOAL (often another agent's), on a keyword match
+                # with no probe behind it (guard-1978). Surface it and let a reader
+                # decide; `blocked-signal-resolution-check` owns this population's
+                # resolution question and is likewise detective-only.
+                report["goal_sourced_report_only"] = (
+                    report.get("goal_sourced_report_only", 0) + 1)
+                detail["action"] = (
+                    "report-only (goal-sourced): capability gate matched an "
+                    "agent-provisionable skill — re-derive by hand; this sweep "
+                    "never mutates goal records"
+                )
+            elif args.apply:
                 # INVARIANT: create the Investigate goal FIRST, THEN clear the
                 # blocker. If reversed, a failed add-goal silently loses both
                 # the blocker (so the user never sees the issue again) AND
@@ -492,7 +694,18 @@ def main(argv=None):
         updated.append(b)
 
     if args.apply and report["cleared"] > 0:
-        _wm_set_blockers(updated)
+        # PARTITION — the one line that makes the widening safe. `updated`
+        # accumulates BOTH populations, but only the WM half may ever be written
+        # back to the WM slot. Without this filter the sweep would inject
+        # goal-derived synthetic entries into `known_blockers`, inventing blockers
+        # nobody created and corrupting every downstream consumer that iterates
+        # that slot (Phase 0.5b re-probe, proactive escalation, quiescence-gate).
+        # Filtering HERE rather than at each append site keeps the guarantee at a
+        # single provable chokepoint instead of spread across six branches.
+        _wm_set_blockers([
+            x for x in updated
+            if not (isinstance(x, dict) and x.get("_origin") == "goal")
+        ])
         # Wake-on-signal (): tells interruptible-sleep.sh to exit 2 and
         # break backoff early when at least one blocker clears. Non-blocking —
         # the signal is purely advisory; if the script is missing or fails the

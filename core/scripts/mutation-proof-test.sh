@@ -152,7 +152,16 @@ restore() {
 }
 trap restore EXIT INT TERM
 
-run_test() { ( cd "$WORKDIR" && bash -c "$TEST_CMD" ) >/dev/null 2>&1; }
+# stdin is redirected from /dev/null so the test command can never consume the
+# CALLER's stdin (). mutation-partition-proof.sh drives its loop with
+# `while read ... done <<< "$PLAN_TSV"`, so inside the loop body fd 0 IS the
+# remaining plan rows; a test_cmd that reads stdin ate them, the loop's next
+# `read` found nothing, and the run ended early reporting verdict PASS over a
+# TRUNCATED matrix (measured: a 2-mutation plan reported mutations:1 cases:1
+# cases_unproven:[] and exit 0). That is the k/N-tally-conceals-unproven-cases
+# failure this tool exists to detect, occurring inside the tool itself.
+# Strictly additive: it cannot change any invocation that does not read stdin.
+run_test() { ( cd "$WORKDIR" && bash -c "$TEST_CMD" ) </dev/null >/dev/null 2>&1; }
 
 emit() {
   # $1 verdict, $2 reason. Single-line JSON on stdout.

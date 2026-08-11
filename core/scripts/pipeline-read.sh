@@ -32,6 +32,12 @@ while [[ $# -gt 0 ]]; do
         --accuracy)           FLAG_KEYS+=(accuracy);           PASSTHROUGH+=("$1"); shift;;
         --unreflected)        FLAG_KEYS+=(unreflected);        PASSTHROUGH+=("$1"); shift;;
         --replay-candidates)  FLAG_KEYS+=(replay_candidates);  PASSTHROUGH+=("$1"); shift;;
+        # --narrative: normalized outcome narrative (gap-062). Emits
+        # {id, stage, outcome, narrative_key, narrative, chars} per record; the
+        # 10-key fallback chain lives ONCE in mind_api/src/world/pipeline.py
+        # (NARRATIVE_CHAIN) instead of being re-derived by each caller.
+        # Composes with --id (one record) and --stage (filtered).
+        --narrative)          FLAG_KEYS+=(narrative);          PASSTHROUGH+=("$1"); shift;;
         --archive)            FLAG_KEYS+=(archive);            PASSTHROUGH+=("$1"); shift;;
         --meta)               FLAG_KEYS+=(meta);               PASSTHROUGH+=("$1"); shift;;
         *)

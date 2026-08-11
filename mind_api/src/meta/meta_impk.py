@@ -3,7 +3,7 @@
 Daemonises the two imp@k subcommands (Batch 6):
 
   GET  /v1/meta/impk/compute   (cmd_compute)   ?window=<int>&metric=<str>
-  POST /v1/meta/impk/snapshot  (cmd_snapshot)  ?goal_id=&learning_value=&category=&active_changes=
+  POST /v1/meta/impk/snapshot  (cmd_snapshot)  ?goal_id=&learning_value=&category=&active_changes=&close_key=
 
 SCOPE: META. Both operate on META_DIR/improvement-velocity.yaml
 (meta-impk.py:92/130). base_dir = ctx.paths.meta; resolve_base_dir returns
@@ -202,10 +202,15 @@ def compute(ctx) -> "Response":  # type: ignore[name-defined]
 # ---------------------------------------------------------------------------
 
 def snapshot(ctx) -> "Response":  # type: ignore[name-defined]
-    """POST /v1/meta/impk/snapshot?goal_id=&learning_value=&category=&active_changes=
+    """POST /v1/meta/impk/snapshot?goal_id=&learning_value=&category=&active_changes=&close_key=
 
     Mirrors meta-impk.py cmd_snapshot (line 128): append a learning_value entry,
     recompute rolling averages, locked CSafeDumper write with history+changelog.
+
+    close_key (optional, g-115-4542) makes the append idempotent per CLOSE: a
+    second snapshot carrying a key already present is suppressed with status
+    duplicate_suppressed at HTTP 200, instead of double-weighting the goal in
+    all three rolling windows. Omitted -> unconditional append, unchanged.
     """
     from ..server import Response
 
@@ -221,6 +226,10 @@ def snapshot(ctx) -> "Response":  # type: ignore[name-defined]
         return Response.error(400, "invalid_param", "learning_value must be a float")
     category = ctx.query.get("category", "")
     active_changes = ctx.query.get("active_changes", "")
+    # : optional per-close idempotency token. Absent -> unconditional
+    # append, byte-identical to the pre-fix path (so no existing caller changes
+    # behaviour and no legitimate row can be lost to a fail-open).
+    close_key = (ctx.query.get("close_key") or "").strip()
 
     live_path = _path(ctx)
     base_dir = ctx.paths.meta
@@ -242,11 +251,31 @@ def snapshot(ctx) -> "Response":  # type: ignore[name-defined]
         if "entries" not in vel:
             vel["entries"] = []
 
+        # Per-close idempotency (). The key names the close EVENT, not
+        # the goal: a repeat snapshot for the same goal is overwhelmingly
+        # LEGITIMATE (measured 2026-08-09 on 7,814 live entries — 2,066 repeat
+        # rows, dominated by asp-001 recurring closes,  alone n=205), so
+        # deduping on goal_id would destroy real learning. Suppression must
+        # therefore be exact-match on the caller's token and nothing looser.
+        #
+        # Placed AFTER the force_fresh read inside _cycle, deliberately: on
+        # own-cloud a retry re-reads the peer's landed write, so a row that
+        # arrived from another box between attempts is seen here rather than
+        # duplicated. Returning early skips history.snapshot + changelog.append
+        # too — a suppressed write leaves no audit trace of a write that did
+        # not happen.
+        if close_key and any(
+                isinstance(e, dict) and e.get("close_key") == close_key
+                for e in vel["entries"]):
+            return "duplicate_suppressed"
+
         entry: Dict[str, Any] = {
             "goal_id": goal_id,
             "date": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
             "learning_value": learning_value,
         }
+        if close_key:
+            entry["close_key"] = close_key
         if category:
             entry["category"] = category
         if active_changes:
@@ -270,7 +299,9 @@ def snapshot(ctx) -> "Response":  # type: ignore[name-defined]
         history.snapshot(live_path, base_dir, agent)
         _atomic_write_yaml(live_path, vel)
         changelog.append(base_dir, agent, live_path, "edit")
+        return "recorded"
 
+    status = "recorded"
     try:
         assert_not_cruft(live_path.parent, "mkdir (meta_impk)")
         live_path.parent.mkdir(parents=True, exist_ok=True)
@@ -282,13 +313,22 @@ def snapshot(ctx) -> "Response":  # type: ignore[name-defined]
         # "write_conflict" floor — the caller still gets the safe-to-retry 409,
         # never a false 500. (: closes the recurring non-fatal
         # state-update-audit velocity-snapshot failure diagnosed in .)
-        file_locks.locked_rmw(live_path, _cycle)
+        status = file_locks.locked_rmw(live_path, _cycle)
     except OSError as e:
         return Response.error(500, "write_failed", str(e))
 
+    # BYTE-COMPAT: the recorded payload keeps its exact pre-fix key order and
+    # key set. Suppression is a NEW status, and it exits 200/rc=0 on purpose —
+    # iteration-close.sh prints "WARN: state-update-audit.sh failed rc=N
+    # (velocity/backpressure snapshot not recorded)" on any non-zero rc, so
+    # signalling a correctly-suppressed duplicate as an error would manufacture
+    # a false alarm on the very recovery path this fix protects.
+    payload: Dict[str, Any] = {"status": status, "goal_id": goal_id,
+                               "learning_value": learning_value}
+    if status == "duplicate_suppressed":
+        payload["close_key"] = close_key
     return Response.text(
-        json.dumps({"status": "recorded", "goal_id": goal_id,
-                    "learning_value": learning_value}) + "\n",
+        json.dumps(payload) + "\n",
         content_type="application/json")
 
 

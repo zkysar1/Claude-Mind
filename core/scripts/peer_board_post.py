@@ -177,7 +177,22 @@ def main(argv=None) -> int:
              f"  value containing '..' or a separator would write OUTSIDE the peer's\n"
              f"  board -- refusing rather than sanitizing.")
 
+    # env first, then .env.local (same precedence as iteration-push's
+    # _ip_storage_backend). .env.local is not auto-sourced into tool shells,
+    # and an EMPTY self-env is not merely cosmetic (author renders as
+    # agent@unknown-env, breaking the parseable <agent>@<env-id> contract) —
+    # it also DISARMS the peer==self refusal just below. Measured 2026-08-01:
+    # two live posts landed as alpha@unknown-env with ENVIRONMENT_ID present
+    # in .env.local the whole time.
     self_env = os.environ.get("ENVIRONMENT_ID", "").strip()
+    if not self_env:
+        try:
+            for ln in (PROJECT_ROOT / ".env.local").read_text(encoding="utf-8").splitlines():
+                ln = ln.strip()
+                if ln.startswith("ENVIRONMENT_ID") and "=" in ln and not ln.startswith("#"):
+                    self_env = ln.split("=", 1)[1].split("#", 1)[0].strip().strip("'\"")
+        except OSError:
+            pass
     if args.peer == self_env:
         _die(EXIT_REFUSED,
              f"--peer {args.peer!r} is THIS world -- use board-post.sh for local posts.")

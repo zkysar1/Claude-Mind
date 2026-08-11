@@ -202,7 +202,7 @@ def main():
             print("WARN: %d temp file(s) >24h are cited by a durable record, so the "
                   "purge lane exempts them, but they are neither git-tracked nor "
                   "drainable — no durability, no lifecycle. Promote each into a "
-                  "receipted dir (agents/<agent>/temp/<slug>/ + RECEIPT.md), or fold "
+                  "receipted dir (agents/<agent>/temp/<slug>/ + RECEIPT.*), or fold "
                   "the content into the citing record: %s"
                   % (len(orphans), ", ".join(orphans[:5])))
         else:

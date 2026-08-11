@@ -100,6 +100,23 @@ GRACE_HOURS = 1.0
 WINDOW_HOURS = 24.0
 MAX_GOALS_PER_RUN = 10
 
+#  outcome 2: the CONVERSION window above is 24h while this sweep's
+# cadence is 5.33h, so a run that slips a day drops triggers with no trace —
+# `scanned` counts only what the sweep chose to look at, so an out-of-window
+# trigger is absent from the DENOMINATOR rather than skipped within it, and the
+# run still reports clean conservation. AUDIT_WINDOW_HOURS is a strictly wider
+# read-only lookback used to COUNT and NAME those, never to convert them.
+# Deliberately not equal to WINDOW_HOURS: keeping the two separate is what lets
+# conservation (outcome 1) stay exact while the audit half reports beyond it.
+AUDIT_WINDOW_HOURS = 168.0
+
+# Tag prefix for the out-of-window routing note. It doubles as the dedup key
+# (guard-2177 / guard-1826): the out-of-window condition is MONOTONE — a post
+# only gets older — so a stateless re-post would fire every 5.33h forever. The
+# board note IS the cooldown record, matching handoff-aging-check and
+# dependency-timeout-check, whose durable half is likewise a board post.
+OOW_TAG_PREFIX = "insight-trigger-out-of-window:"
+
 SEVERITY_PRIORITY = {
     "invalidates": "HIGH",
     "constrains": "MEDIUM",
@@ -145,8 +162,12 @@ def _refresh(path):
     try:
         from storage_backend import get_backend
         get_backend().refresh(path)
-    except Exception:
-        pass
+    except Exception as e:
+        try:  # report, never raise — see note_swallowed_backend_error ()
+            from storage_backend import note_swallowed_backend_error
+            note_swallowed_backend_error("refresh", path, e)
+        except Exception:
+            pass
 
 
 def _parse_ts(ts_str):
@@ -224,48 +245,123 @@ def load_triggers():
                 continue
             if ts < win_cutoff or ts > grace_cutoff:
                 continue
-            tags = msg.get("tags") or []
-            target = None
-            action = None
-            severity = "informs"
-            affects_goal = None
-            for t in tags:
-                m = REQ_ACTION_RE.match(t)
-                if m:
-                    target = m.group(1).strip()
-                    continue
-                m = ACTION_TYPE_RE.match(t)
-                if m:
-                    action = m.group(1).strip()
-                    continue
-                m = SEVERITY_RE.match(t)
-                if m:
-                    severity = m.group(1).strip()
-                    continue
-                m = AFFECTS_RE.match(t)
-                if m:
-                    affects_goal = m.group(1).strip()
-            if not target or not action:
+            rec = _parse_trigger_msg(msg, channel, now, ts)
+            if rec is None:
                 continue
-            out.append({
-                "msg_id": msg.get("id"),
-                "author": msg.get("author"),
-                # Where the trigger was READ from, not msg["channel"] — the
-                # board pointer in the filed goal must name the file a reader
-                # can open. A row's self-reported channel can disagree with
-                # the file holding it (rotation, hand-edits), and the pointer
-                # is only useful if it resolves.
-                "channel": channel,
-                "target": target,
-                "action": action,
-                "severity": severity,
-                "affects_goal": affects_goal,
-                "text": msg.get("text", ""),
-                "tags": tags,
-                "timestamp": msg.get("timestamp"),
-                "age_h": round((now - ts).total_seconds() / 3600, 1),
-            })
+            out.append(rec)
     return out
+
+
+def _parse_trigger_msg(msg, channel, now, ts):
+    """Both-tagged? -> trigger dict. Else None.
+
+    Extracted (g-115-754) so the CONVERSION scan (`load_triggers`) and the
+    AUDIT scan (`load_out_of_window_triggers`) apply one identical definition
+    of "is this an insight_trigger". Two live call sites today — the audit
+    half is only trustworthy if it recognises exactly what the conversion half
+    would have recognised, so a second copy of this parse would be the defect.
+    """
+    tags = msg.get("tags") or []
+    target = None
+    action = None
+    severity = "informs"
+    affects_goal = None
+    for t in tags:
+        m = REQ_ACTION_RE.match(t)
+        if m:
+            target = m.group(1).strip()
+            continue
+        m = ACTION_TYPE_RE.match(t)
+        if m:
+            action = m.group(1).strip()
+            continue
+        m = SEVERITY_RE.match(t)
+        if m:
+            severity = m.group(1).strip()
+            continue
+        m = AFFECTS_RE.match(t)
+        if m:
+            affects_goal = m.group(1).strip()
+    if not target or not action:
+        return None
+    return {
+        "msg_id": msg.get("id"),
+        "author": msg.get("author"),
+        # Where the trigger was READ from, not msg["channel"] — the board
+        # pointer in the filed goal must name the file a reader can open. A
+        # row's self-reported channel can disagree with the file holding it
+        # (rotation, hand-edits), and the pointer is only useful if it resolves.
+        "channel": channel,
+        "target": target,
+        "action": action,
+        "severity": severity,
+        "affects_goal": affects_goal,
+        "text": msg.get("text", ""),
+        "tags": tags,
+        "timestamp": msg.get("timestamp"),
+        "age_h": round((now - ts).total_seconds() / 3600, 1),
+    }
+
+
+def load_out_of_window_triggers():
+    """The AUDIT half ( outcome 2). Returns (out_of_window, routed_ids, truncated).
+
+    `load_triggers` above drops a both-tagged post the moment it is older than
+    WINDOW_HOURS, and reports nothing — so a run that slips past the window
+    silently loses work while still reporting exact conservation, because
+    `scanned` is defined as what the sweep chose to LOOK AT. This scan covers
+    [AUDIT_WINDOW_HOURS, WINDOW_HOURS) — strictly the band the conversion scan
+    refuses — and only counts and names; it never converts.
+
+    Returns:
+      out_of_window — trigger dicts in that band, newest first.
+      routed_ids    — msg_ids already carrying an OOW_TAG_PREFIX board note.
+                      Harvested in this SAME pass (the board files are already
+                      open) so routing is idempotent without a second scan.
+      truncated     — count of both-tagged posts OLDER than the audit window.
+                      Reported rather than swallowed: a bounded scan that does
+                      not say what it declined to look at reads as coverage it
+                      never had (guard-1760).
+    """
+    now = datetime.now()
+    win_cutoff = now - timedelta(hours=WINDOW_HOURS)
+    audit_cutoff = now - timedelta(hours=AUDIT_WINDOW_HOURS)
+    out = []
+    routed_ids = set()
+    truncated = 0
+    for channel_path in board_channels():
+        _refresh(channel_path)  # guard-980
+        if not channel_path.is_file():
+            continue
+        channel = channel_path.stem
+        for line in channel_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            # Harvest prior routing notes from ANY age — a note posted 8 days
+            # ago must still suppress a re-post today, so this lookup is
+            # deliberately not bounded by the audit window.
+            for tag in (msg.get("tags") or []):
+                if tag.startswith(OOW_TAG_PREFIX):
+                    routed_ids.add(tag[len(OOW_TAG_PREFIX):])
+            try:
+                ts = _parse_ts(msg["timestamp"])
+            except (KeyError, ValueError):
+                continue
+            if ts >= win_cutoff:
+                continue  # in-window (or in grace) — the conversion half owns it
+            rec = _parse_trigger_msg(msg, channel, now, ts)
+            if rec is None:
+                continue
+            if ts < audit_cutoff:
+                truncated += 1
+                continue
+            out.append(rec)
+    out.sort(key=lambda r: r["age_h"])
+    return out, routed_ids, truncated
 
 
 # ---------------------------------------------------------------------------
@@ -352,9 +448,29 @@ def resolve_addressing(triggers):
          cannot be vouched for.
       2. A bare name NOT in the collision set means the LOCAL agent (the
          87% installed base — preserved unchanged).
-      3. A bare name IN the collision set is AMBIGUOUS and FAILS LOUD. Never
+      3a. A bare name IN the collision set is AMBIGUOUS and FAILS LOUD. Never
          silently default to local: a wrong route passes validation cleanly;
          a refusal names the post so the author can qualify it.
+      3b. EXCEPT when the AUTHOR is a non-colliding local (amended g-115-4980,
+         2026-08-08, zeta/cc-02). An unqualified name means "in the speaker's
+         namespace", so a bare target from an author who is unambiguously ours
+         is ours. Tagged `addressing: author_scoped_local` and counted in the
+         summary — distinguishable from a clause-2 resolve, never silent.
+
+    WHY 3b IS SAFE, AND WHY THE AUTHOR-EXCLUSION IS LOAD-BEARING. The channel
+    is read from BOTH deployments and each side's "local" differs, so the
+    invariant that matters is that exactly ONE side routes any given post.
+    Author-scoping satisfies it: alpha/bravo/echo/foxtrot are absent from the
+    peer roster, so the same post the peer reads has a non-roster author there
+    and refuses. But an author who is ITSELF in the collision set resolves
+    locally on BOTH sides — a double-route, strictly worse than the refusal.
+    Hence `a_name not in collision`. Measured 2026-08-08 over 10,324 board
+    messages / 17 days: of 48 bare-`zeta` triggers, 45 carry non-colliding
+    local authors (resolve), 2 are zeta-authored (refuse — double-route risk),
+    1 is `omni`-authored (refuse — peer author, and `split_author('omni')` is
+    `('omni', None)` because the peer operator posts unqualified, so it is NOT
+    caught by the peer-env test above). Clause 3a had refused all 48 and
+    prevented 0 wrong routes.
 
     Collision set = local roster ∩ (registry known_agents of peer envs ∪
     authors observed in explicit <agent>@<peer-env> form this window). The
@@ -415,15 +531,34 @@ def resolve_addressing(triggers):
                     ),
                 })
         elif name in collision:
-            refused.append({
-                "msg_id": t["msg_id"], "author": t["author"],
-                "target": t["target"], "verdict": "ambiguous_collision",
-                "reason": (
-                    f"bare '{name}' exists in BOTH the local roster and a peer "
-                    "deployment — ambiguous; qualify as "
-                    f"{name}@<env-id> (cross-deployment-channel.md clause 3)"
-                ),
-            })
+            # clause 3b () — AUTHOR-SCOPED LOCAL. A bare name is
+            # unqualified, and an unqualified name means "in the speaker's
+            # namespace". When the AUTHOR is demonstrably one of ours, the
+            # bare target is theirs-and-therefore-ours; refusing it protects
+            # against nothing. See the symmetry proof below for why this is
+            # not the silent local-default clause 3a bans.
+            a_name, a_env = split_author(t.get("author"))
+            if a_env is None and a_name and a_name in roster \
+                    and a_name not in collision:
+                local_t = dict(t)
+                # Distinguishable from an ordinary clause-2 local resolve
+                # (guard-2586 / guard-1753): a path that degrades to a
+                # default must never emit the same signal as one that
+                # resolved outright. Counted in the summary, not silent.
+                local_t["addressing"] = "author_scoped_local"
+                resolved.append(local_t)
+            else:
+                refused.append({
+                    "msg_id": t["msg_id"], "author": t["author"],
+                    "target": t["target"], "verdict": "ambiguous_collision",
+                    "reason": (
+                        f"bare '{name}' exists in BOTH the local roster and a "
+                        f"peer deployment, and author '{t.get('author')}' is "
+                        "not a non-colliding local — ambiguous; qualify as "
+                        f"{name}@<env-id> (cross-deployment-channel.md "
+                        "clause 3)"
+                    ),
+                })
         else:
             resolved.append(t)
     return resolved, refused, sorted(collision)
@@ -508,6 +643,123 @@ def _emit_audit_stale_note(trigger, target_status):
     except Exception as e:
         print(f"[insight-trigger-sweep] WARN: audit-stale board-post failed: {e}", file=sys.stderr)
         return {"posted": False, "msg_id": None, "error": str(e)}
+
+
+def _emit_out_of_window_digest(target, triggers):
+    """Route a target agent's aged-out triggers as ONE digest ( outcome 3).
+
+    Outcome 3 asks that an aged-out unconverted trigger reach its target agent
+    by name rather than being dropped. One post PER TRIGGER satisfies that
+    literally and defeats it in practice: the first live run had 23 of them, and
+    23 posts in one cadence trains every reader to scroll past the tag — a
+    louder version of the silence being fixed. Same call made for the
+    user-blocker digest (aspirations-precheck 0.5b.1c). Grouping by target keeps
+    the addressing exact while bounding volume by the ROSTER (~6) instead of by
+    the backlog, so no per-run cap is needed.
+
+    Every msg_id is carried as its own OOW_TAG_PREFIX tag, so dedup stays
+    per-trigger: a target whose digest went out yesterday gets a new one only
+    for triggers that aged out since.
+
+    The digest does NOT re-file the aged triggers themselves — they are days
+    old, so filing them past the conversion window would re-introduce exactly
+    the rb-1150 audit-time/apply-time staleness the affects-probe exists to
+    prevent. Instead the digest carries `requires_action_by:<target>` +
+    `action_type:triage-aged-triggers`, which makes it an ordinary in-window
+    trigger, so the NEXT run converts it into ONE triage goal. N possibly-spent
+    Applies become one live decision, and the aged work reaches the SELECTOR
+    rather than only the board — which is the gap this whole sweeper exists to
+    close. Bounded: the digest converts once (msg_id dedup).
+
+    THIS DOCSTRING USED TO SAY the digest's own conversion runs the
+    cross-deployment addressing check, "so ambiguous targets are refused there
+    rather than duplicated here." That was wrong, and the correction is the
+    reason this function is now called only with a pre-resolved target
+    (g-115-4684). Deferring the check to conversion is sufficient for a
+    TRANSIENT refusal — overflow self-heals, since several conversion attempts
+    fit inside WINDOW_HOURS at this cadence. It is exactly WRONG for a
+    DETERMINISTIC one: an ambiguous bare name is a property of the STRING, so
+    the refusal repeats on every run, the digest never converts, it ages out,
+    and it is re-digested for the same target forever — one new post per audit
+    cycle, each about the previous one, with the routed work never arriving.
+
+    The caller (main) therefore runs resolve_addressing over the aged batch and
+    passes only resolvable targets here. `target` is already qualifier-stripped
+    and known-local; do NOT re-derive it from a trigger's raw `target` field.
+
+    Fail-open like its sibling — a post failure leaves no tag, so the next run
+    retries rather than losing the finding.
+    """
+    import subprocess
+    # The tag written below is READ BACK by resolve_addressing on the NEXT run --
+    # that read IS the conversion mechanism, so this function is a producer for a
+    # validator living in the same file. `target` arrives bare and
+    # qualifier-stripped (see above), and rule 3 REFUSES a bare name in the
+    # collision set. So a digest for such a target could never convert, and
+    # guard-2177 correctly forbids re-posting it, making the loss PERMANENT
+    # rather than late. Both halves were individually right; the defect existed
+    # only in their disagreement, which is why neither
+    # test_insight_trigger_sweep_out_of_window.py nor
+    # test_insight_trigger_sweep_addressing.py could see it. Emit rule 1's EXACT
+    # form instead.
+    #
+    # Qualify UNCONDITIONALLY, not only on a collision: the collision set is
+    # recomputed every run from the registry, so a name that is unambiguous today
+    # joins it the moment a peer declares it -- and this post can never be
+    # reissued to catch up. @self-env resolves to the local agent with the
+    # qualifier stripped, so the non-colliding majority path is unchanged.
+    # With ENVIRONMENT_ID unresolvable there is no qualified form to write: fall
+    # back to bare rather than emitting `<target>@None`, which rule 1 would
+    # refuse as unknown_env -- strictly worse than the status quo.
+    _env = _self_env()
+    req_target = f"{target}@{_env}" if _env else target
+    lines = [
+        f"{len(triggers)} insight_trigger(s) addressed to {target} aged out of the "
+        f"{WINDOW_HOURS}h conversion window with no converting goal in any queue. "
+        f"This sweep did NOT file them: at this age the premise may be spent, and "
+        f"filing would re-introduce the rb-1150 audit-time/apply-time gap. "
+        f"{target} decides — file the work, or reply that it is moot.",
+        "",
+    ]
+    for t in sorted(triggers, key=lambda r: r["age_h"]):
+        lines.append(
+            f"  {t['msg_id']}  from {t['author']} on #{t['channel']}  "
+            f"action={t['action']}  severity={t['severity']}  age={t['age_h']}h"
+        )
+    lines += [
+        "",
+        f"This post is itself tagged requires_action_by:{req_target} + "
+        "action_type:triage-aged-triggers, so the NEXT run of this sweep converts "
+        "it into one triage goal in your queue — the aged triggers reach the "
+        "selector as a single decision, not as N re-filed stale Applies. It "
+        "converts exactly once (msg_id dedup), and cross-deployment addressing is "
+        "checked there, not here.",
+        "",
+        "No reminder follows: this note IS the dedup record. The sweep keeps "
+        "reporting these under `audit:` every run, but a re-post would fire every "
+        "cadence forever, because a post only gets older (guard-2177).",
+    ]
+    text = "\n".join(lines)
+    tags = ",".join(
+        ["insight-trigger-out-of-window", f"requires_action_by:{req_target}",
+         "action_type:triage-aged-triggers"]
+        + [f"{OOW_TAG_PREFIX}{t['msg_id']}" for t in triggers]
+    )
+    try:
+        # sys.executable + board.py, never `bash` — rb-225/rb-247/guard-580.
+        proc = subprocess.run(
+            [sys.executable, str(PROJECT_ROOT / "core" / "scripts" / "board.py"),
+             "post", "--channel", "coordination", "--type", "status", "--tags", tags],
+            input=text, capture_output=True, text=True, timeout=15,
+        )
+        return {"posted": proc.returncode == 0,
+                "msg_id": proc.stdout.strip() if proc.returncode == 0 else None,
+                "count": len(triggers)}
+    except Exception as e:
+        print(f"[insight-trigger-sweep] WARN: out-of-window digest for {target} failed: {e}",
+              file=sys.stderr)
+        return {"posted": False, "msg_id": None, "count": len(triggers), "error": str(e)}
+
 
 
 # ---------------------------------------------------------------------------
@@ -696,8 +948,136 @@ def main():
 
     if dry_run:
         filed_count = len(filed)
+        filing_failed_count = 0
     else:
         filed_count = sum(1 for f in filed if f["result"].get("rc") == 0)
+        #  fresh-eyes F-2. Counted independently rather than derived as
+        # `len(filed) - filed_count`, but be clear about what that does and does
+        # NOT buy — the first draft of this comment claimed the stronger thing and
+        # a positive control refuted it.
+        #
+        # MEASURED (both forms, same tests): IDENTICAL behavior, 5/5 green either
+        # way. `rc == 0` and `rc != 0` are exact complements over one list, so the
+        # two counts always sum to len(filed) however they are written. The change
+        # is honesty-of-naming (this line counts what it says it counts, and a
+        # third rc state would surface rather than hide), NOT a new guarantee.
+        #
+        # THE LIMITATION SURVIVES THE FIX, so do not read `conservation.holds` as
+        # covering this: `filed + filing_failed` reconstructs `attempted` BY
+        # CONSTRUCTION, so the identity below is structurally blind to a bug in
+        # this split and no phrasing of these two lines can change that. The real
+        # guarantee is a VALUE assertion in the tests — test_case_C's `filed == 1`
+        # and test_split_is_exhaustive_and_valued's per-term checks, both of which
+        # go red on a genuine miscount (measured). This is guard-3092 again: the
+        # identity is necessary, never sufficient.
+        filing_failed_count = sum(1 for f in filed if f["result"].get("rc") != 0)
+
+    #  outcomes 2+3: the AUDIT half. Kept strictly out of the
+    # conservation identity above — `scanned` is what the sweep chose to look
+    # at, and folding aged-out triggers into it would silently redefine the one
+    # number outcome 1 pins. Reported alongside, never inside.
+    oow, oow_routed_ids, oow_truncated = load_out_of_window_triggers()
+    oow_converted = [t for t in oow if t["msg_id"] in converted_ids]
+    oow_unconverted = [t for t in oow if t["msg_id"] not in converted_ids]
+    # Route as ONE digest per TARGET, not per trigger — see
+    # _emit_out_of_window_digest for why (23 posts in one cadence on the first
+    # live run). Already-routed triggers are excluded from the digest entirely,
+    # so a target only ever hears about what aged out since its last digest.
+    oow_unrouted = [t for t in oow_unconverted if t["msg_id"] not in oow_routed_ids]
+    # Resolve the DIGEST'S OWN addressing before emitting it ().
+    #
+    # The digest is itself an in-window trigger by this sweep's own definition
+    # (_parse_trigger_msg accepts anything with requires_action_by + action_type,
+    # and there is no exclusion for action_type:triage-aged-triggers). That is
+    # deliberate — it is what makes aged work reach the SELECTOR. But it means a
+    # digest carrying an UNRESOLVABLE target can never convert: it ages out, its
+    # own msg_id is not in oow_routed_ids (that set holds the ids it CARRIES),
+    # so it is re-digested into a new digest for the same target, refused for
+    # the same reason, forever — one new digest per audit cycle, each about the
+    # previous one, with the routed work never arriving.
+    #
+    # Deferring the check to the digest's own conversion is sufficient only for
+    # a TRANSIENT refusal (overflow self-heals: ~4 conversion attempts fit inside
+    # WINDOW_HOURS at this cadence). It is exactly wrong for a DETERMINISTIC one
+    # — an ambiguous bare name is a property of the STRING, so it repeats every
+    # run and the refusal lands where nothing can act on it.
+    #
+    # resolve_addressing is the SSOT for the rule, so it is REUSED rather than
+    # reimplemented. It is passed the FULL unconverted set (routed and unrouted)
+    # plus raw_triggers, for two reasons:
+    #
+    #   (1) COLLISION SET. Its observation half keys on authors seen this window,
+    #       and a narrower set means FEWER refusals — the unsafe direction. So it
+    #       is computed over every trigger this run observed, in BOTH windows.
+    #   (2) THE CLEANUP HALF DEPENDS ON IT. See below.
+    #
+    # The extra in-window entries are filtered back out by msg_id (the two
+    # windows are disjoint by construction), so the conservation identity above
+    # is untouched. Fail-open is inherited: an unreadable env registry yields an
+    # empty peer set, hence an empty collision set, hence digests still emit
+    # (guard-142 — a gate must not block work on its own dependency errors).
+    #
+    # CLEANUP for the debris this defect already produced, and the reason the
+    # resolve runs over oow_unconverted rather than oow_unrouted. A digest
+    # emitted BEFORE this fix carries OOW tags for the triggers it named, so
+    # those ids sit in oow_routed_ids and are excluded from oow_unrouted —
+    # "routed" into a post that can never convert. A target in that state has
+    # NOTHING unrouted, therefore produces NO refusal. Keying the stranding
+    # report off the refusal set would make it inert in precisely the case it
+    # was written for: it would report clean forever while the debris sat there.
+    # (Measured on the first dry-run of this fix — all 21 unconverted triggers
+    # were already_routed, so a refusal-keyed report saw zero. That is the same
+    # vacuous-bucket class as the omitted out-of-window count this whole goal
+    # exists to close, reproduced inside its own remedy.)
+    #
+    # Resolving the WHOLE unconverted set instead splits the refusals by which
+    # bucket the msg_id came from: unrouted -> blocked now; already-routed -> its
+    # prior digest was unconvertible, so it is stranded (guard-1532 — a refusal
+    # whose consequence is unnamed pushes the reader onto whatever exit remains).
+    oow_ids = {t["msg_id"] for t in oow_unrouted}
+    _oow_res, _oow_ref, oow_collision = resolve_addressing(oow_unconverted + raw_triggers)
+    oow_resolved = [t for t in _oow_res if t["msg_id"] in oow_ids]
+    oow_digest_refused = [r for r in _oow_ref if r["msg_id"] in oow_ids]
+    oow_stranded_by_prior_digest = {}
+    for r in _oow_ref:
+        if r["msg_id"] in oow_ids or r["msg_id"] not in oow_routed_ids:
+            continue
+        oow_stranded_by_prior_digest.setdefault(r["target"], []).append(r["msg_id"])
+    for v in oow_stranded_by_prior_digest.values():
+        v.sort()
+    by_target = {}
+    for t in oow_resolved:
+        by_target.setdefault(t["target"], []).append(t)
+    oow_digests = []
+    for target in sorted(by_target):
+        batch = by_target[target]
+        if dry_run:
+            res = {"posted": False, "msg_id": None, "count": len(batch), "reason": "dry_run"}
+        else:
+            res = _emit_out_of_window_digest(target, batch)
+        oow_digests.append({
+            "target": target,
+            "count": len(batch),
+            "msg_ids": [t["msg_id"] for t in batch],
+            "result": res,
+        })
+    oow_details = [
+        {"msg_id": t["msg_id"], "author": t["author"], "channel": t["channel"],
+         "target": t["target"], "action": t["action"], "severity": t["severity"],
+         "age_h": t["age_h"], "already_routed": t["msg_id"] in oow_routed_ids}
+        for t in oow_unconverted
+    ]
+    oow_newly_routed = sum(d["count"] for d in oow_digests if d["result"].get("posted"))
+
+    #  fresh-eyes F-1: computed ONCE. The sum was written twice below
+    # (for "sum" and again inside "holds"); an editor changing one and not the
+    # other yields a `holds` that disagrees with the `sum` printed beside it,
+    # and nothing would catch it. Asserted by test_terms_match_source, which
+    # now also pins `holds == (sum == scanned)`.
+    _conservation_sum = (
+        filed_count + filing_failed_count + len(addressing_refused)
+        + len(skipped) + len(audit_stale) + len(overflow)
+    )
 
     summary = {
         "mode": "dry-run" if dry_run else "sweep",
@@ -713,12 +1093,76 @@ def main():
         "collision_set": collision_set,
         "addressing_refused": len(addressing_refused),
         "addressing_refused_details": addressing_refused,
+        # clause 3b (): a collision-set name that resolved because
+        # its author is a non-colliding local. Surfaced for the same reason
+        # refusals are — this is the ONE path that resolves a name the rule
+        # otherwise refuses, so it must be countable, not inferable.
+        "addressing_author_scoped": sum(
+            1 for t in triggers if t.get("addressing") == "author_scoped_local"
+        ),
         "skipped_already_converted": len(skipped),
         "audit_stale": len(audit_stale),
-        "affects_missing": len(affects_missing),
+        # : affects_missing is an ANNOTATION on the filed set, NOT a
+        # disposition. :936-945 appends here and then FALLS THROUGH to file_goal,
+        # so its members are ALSO counted in attempted/filed. Including it as an
+        # identity term double-counts (measured case A: scanned=1, sum=2). It is
+        # reported here for visibility and deliberately excluded from
+        # `conservation` below — see the key name, which now says so.
+        "affects_missing_annotation": len(affects_missing),
         "filed": filed_count,
         "attempted": len(filed),
+        # : an attempted filing that returned rc != 0 is in `filed` but
+        # excluded from `filed_count` (:952), so before this key it landed in NO
+        # bucket at all (measured case B: scanned=1, sum=0). The two errors
+        # CANCEL when one of each occurs in the same run (measured case C:
+        # scanned=2, sum=2, identity holds, goals actually created=1) — which is
+        # why a bare `scanned` assertion could never catch either.
+        "filing_failed": filing_failed_count,
         "overflow": len(overflow),
+        # : the conservation identity, COMPUTED rather than asserted in
+        # prose. Four prose defenses claimed this "stays exact" (:105-110, the
+        # companion test docstring, 's acceptance criterion) and no test
+        # ever summed the terms — so both defects below survived every green run.
+        # Emitting `holds` makes the invariant checkable by the recurring goal
+        # that depends on it, instead of hand-verified in close notes.
+        # guard-3092: conservation is NECESSARY BUT NOT SUFFICIENT — a run where
+        # the terms sum correctly can still have created zero goals (case C), so
+        # read `filed` alongside `holds`, never `holds` alone.
+        "conservation": {
+            "terms": [
+                "filed", "filing_failed", "addressing_refused",
+                "skipped_already_converted", "audit_stale", "overflow",
+            ],
+            "sum": _conservation_sum,
+            "scanned": len(raw_triggers),
+            "holds": _conservation_sum == len(raw_triggers),
+        },
+        # --- audit half (). NOT terms of the conservation identity. ---
+        "audit_window_hours": AUDIT_WINDOW_HOURS,
+        "out_of_window": len(oow),
+        "out_of_window_converted": len(oow_converted),
+        "out_of_window_unconverted": len(oow_unconverted),
+        "out_of_window_newly_routed": oow_newly_routed,
+        "out_of_window_already_routed": sum(1 for d in oow_details if d["already_routed"]),
+        "out_of_window_digests": oow_digests,
+        # : digests REFUSED because their own target is unresolvable.
+        # Reported as a first-class count including the healthy zero — the whole
+        # lineage of this goal is that an omitted bucket reads identically to an
+        # empty one, and this bucket names work that is now reaching NOBODY.
+        "out_of_window_digest_refused": len(oow_digest_refused),
+        "out_of_window_digest_refused_details": oow_digest_refused,
+        # Collision set for the AUDIT pass. Deliberately separate from
+        # `collision_set` above: this one is computed over both windows' authors,
+        # so the two can legitimately differ and a reader must be able to see
+        # which one produced a given refusal.
+        "out_of_window_collision_set": oow_collision,
+        # Triggers a PRE-FIX digest already claimed to have routed, whose digest
+        # was unconvertible. Suppressed from re-routing by their own OOW tags.
+        "out_of_window_stranded_by_prior_digest": oow_stranded_by_prior_digest,
+        # Both-tagged posts older than AUDIT_WINDOW_HOURS. Named so a reader can
+        # tell "none aged out" from "I stopped looking" (guard-1760).
+        "audit_truncated_older_than_window": oow_truncated,
+        "out_of_window_details": oow_details,
         "pending": [
             {
                 "msg_id": t["msg_id"],
@@ -745,9 +1189,17 @@ def main():
               f"channels={','.join(summary['channels_scanned']) or 'none'} "
               f"scanned={summary['scanned']} "
               f"addressing_refused={summary['addressing_refused']} "
+              f"addressing_author_scoped={summary['addressing_author_scoped']} "
               f"skipped={summary['skipped_already_converted']} filed={summary['filed']} "
-              f"audit_stale={summary['audit_stale']} affects_missing={summary['affects_missing']} "
-              f"overflow={summary['overflow']}")
+              f"audit_stale={summary['audit_stale']} "
+              f"filing_failed={summary['filing_failed']} "
+              f"overflow={summary['overflow']} "
+              # : rendered AFTER overflow and named as an annotation,
+              # so the human line groups the six identity terms together and
+              # cannot be misread as a seventh disposition (which is how the
+              # double-count went unnoticed inline at the old position).
+              f"| affects_missing_annotation={summary['affects_missing_annotation']} "
+              f"conservation={'OK' if summary['conservation']['holds'] else 'BROKEN'}")
         for r in addressing_refused:
             tag = r["verdict"].upper().replace("_", "-")
             print(f"  REFUSED-{tag}: {r['msg_id']} from {r['author']} "
@@ -765,6 +1217,38 @@ def main():
             print(f"  WARN: {am['msg_id']} affects_goal={am['affects_goal']} not found in any queue; filed as-is")
         if overflow:
             print(f"  WARN: {len(overflow)} additional triggers exceeded MAX_GOALS_PER_RUN={MAX_GOALS_PER_RUN}")
+        # Audit half — printed on its own line so it can never be misread as a
+        # conservation term. Always printed, including the zero case: "0 aged
+        # out over a 168h audit" is the reassurance the sweep previously could
+        # not give, and a line that appears only on trouble teaches readers that
+        # its absence means nothing was checked.
+        print(f"  audit: window={AUDIT_WINDOW_HOURS}h out_of_window={summary['out_of_window']} "
+              f"(converted={summary['out_of_window_converted']} "
+              f"unconverted={summary['out_of_window_unconverted']}) "
+              f"routed_now={summary['out_of_window_newly_routed']} "
+              f"already_routed={summary['out_of_window_already_routed']} "
+              f"digest_refused={summary['out_of_window_digest_refused']} "
+              f"older_than_audit_window={summary['audit_truncated_older_than_window']}")
+        for r in oow_digest_refused:
+            tag = r["verdict"].upper().replace("_", "-")
+            print(f"  OUT-OF-WINDOW DIGEST REFUSED-{tag}: {r['msg_id']} from {r['author']} "
+                  f"target={r['target']} -- {r['reason']}")
+            print(f"      NOT ROUTED. This trigger now reaches nobody until its target is "
+                  f"resolvable; emitting the digest anyway would recurse once per audit cycle.")
+        for tgt, stranded in sorted(oow_stranded_by_prior_digest.items()):
+            print(f"  OUT-OF-WINDOW STRANDED (pre-fix debris) target={tgt}: "
+                  f"{len(stranded)} trigger(s) carry OOW tags from a digest that cannot "
+                  f"convert, so re-routing is suppressed: {', '.join(stranded)}")
+        for dg in oow_digests:
+            state = ("DRY-RUN-WOULD-ROUTE" if dry_run
+                     else "ROUTED" if dg["result"].get("posted")
+                     else "ROUTE-FAILED")
+            print(f"  OUT-OF-WINDOW DIGEST {state} -> {dg['target']}: {dg['count']} trigger(s) "
+                  f"{dg['result'].get('msg_id') or ''}".rstrip())
+            for mid in dg["msg_ids"]:
+                d = next(x for x in oow_details if x["msg_id"] == mid)
+                print(f"      {mid} from {d['author']} action={d['action']} "
+                      f"severity={d['severity']} age={d['age_h']}h (#{d['channel']})")
 
     return 0
 

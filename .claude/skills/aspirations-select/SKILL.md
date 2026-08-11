@@ -164,8 +164,30 @@ FOR EACH directive in new_directives:   # ONLY unseen directives — dedup by co
 # prose-mention fallback fires ONLY when no routing tag is present. Each of a directed
 # directive's target:{goal-id} tags names a goal this agent is tasked to prioritize.
 # (Mirrors goal-selector.py emit_directive_honor_banner exactly so both enforcement points agree.)
+#
+# BOTH ADDRESSING FORMS COUNT (g-115-4188). A routing tag may be bare
+# (`<AGENT>`, `requires_action_by:<AGENT>`) or @env-QUALIFIED
+# (`<AGENT>@<ENV-ID>`, `requires_action_by:<AGENT>@<ENV-ID>`). Split on the
+# FIRST `@` — every registry env-id contains a hyphen, so a hyphen-joined form
+# cannot be split back unambiguously. Then:
+#   agent-part != AGENT_NAME                      -> not for me
+#   no @ qualifier (bare)                         -> for me (unchanged behavior)
+#   @qualifier == this deployment's ENVIRONMENT_ID -> for me
+#   @qualifier == some OTHER deployment's env-id   -> NOT for me, it is a peer
+# Do NOT shortcut this by comparing only the text before the `@`: that admits a
+# PEER deployment's same-named agent as if it were the local one (guard-2860 —
+# never relax an ownership predicate to a pattern). If ENVIRONMENT_ID is
+# unresolvable, treat a qualified tag as FOR ME: this path only prints a
+# MUST-SELECT advisory, so a false positive is one dismissible line while a
+# false negative is the silent lane-skip guard-1310 exists to prevent.
+# The qualified form is what cross-deployment-channel.md RECOMMENDS for an agent
+# name more than one deployment declares, and insight-trigger-sweep.py actively
+# tells posters to write it — so an exact-string test makes the very form the
+# convention recommends invisible here. Canonical implementation (import it, do
+# not re-derive it): peer_surface.routing_tag_targets_agent.
 FOR EACH directive in all_directives WHERE it is directed at this agent
-        (tag AGENT_NAME / requires_action_by:{AGENT_NAME}, OR text names agent ONLY WHEN no
+        (tag AGENT_NAME / requires_action_by:{AGENT_NAME}, in either the bare or
+         the @ENVIRONMENT_ID-qualified form, OR text names agent ONLY WHEN no
          explicit routing tag is present) AND still active:
     FOR EACH "target:{goal-id}" tag: directive_targeted_goals[goal-id] = directive.id
 
@@ -609,8 +631,10 @@ g-250-13 because the compact summary reconstructed the wrong in-flight goal).
 Cleared in `/aspirations-execute` Phase 8 on goal completion and in
 `/start --recover` / `aspirations-graceful-stop` D6.
 
-**This phase is NO LONGER the only anchor for `source == world`, and is STILL
-the only one for `source == agent` (g-115-3590).** `aspirations-claim.sh`
+**This phase is NO LONGER the only anchor for EITHER source (g-115-3590; the
+`source == agent` half was still true when that was written and stopped being
+true at g-306-249 — see the DECIDED block below, which is the current answer).**
+`aspirations-claim.sh`
 `_post_claim_effects` now anchors the checkpoint itself on every rc=0 claim, so
 a loop that selects by calling `goal-selector.sh` directly instead of invoking
 this skill still gets a world-goal anchor — that drift was the measured cause of
@@ -619,13 +643,30 @@ uses ENSURE semantics (writes only when no checkpoint exists or it names a
 DIFFERENT goal), so when this phase has already run its RICHER anchor
 (`selector_score`, `skill`, `cross_agent_owner`) survives untouched.
 
-Agent-queue and cross-agent goals never reach that chokepoint: the daemon claim
-endpoint refuses them `400 agent_queue_goal` **by design** ("Agent-queue goals do
-not require claims... Proceed directly to execution"), and the loop digest
-correctly guards the claim with `IF source==world`. So do NOT retire this phase
-on the strength of the claim-side wiring — for `source == agent` (which includes
-every recurring cadence goal, `g-001-01`..`g-001-10`) it is the ONLY init site
-there is.
+**DECIDED, do not re-derive (g-306-249): this phase STAYS, and the claim
+chokepoint is the NET — they do not half-own the invariant.** The reason above
+has changed and the conclusion has not, which is exactly the case worth writing
+down. Agent-queue goals used to be unable to reach the chokepoint at all: the
+daemon refused them `400 agent_queue_goal` "by design" and the loop digest
+guarded the claim with `IF source==world`. Both are now false — g-306-238 landed
+`&source=agent` (LIVE-probed from cc-02 2026-08-07: `id=<absent>&source=agent`
+answers "not found in AGENT queue", `source=bogus` answers 400 `invalid_source`)
+and g-306-249 dropped the digest guard. So the chokepoint DOES anchor agent-queue
+goals now, and this phase is no longer the only init site for `source == agent`.
+
+It stays because it is the SOLE WRITER of two fields the chokepoint cannot know:
+`cross_agent_owner` and `selector_score`/`skill`. `cross_agent_owner` is derived
+HERE, from `goal.source.startswith('cross-agent:')`, and the source is translated
+to plain `'agent'` before any claim runs — so by the time `_post_claim_effects`
+sees it, the owner is unrecoverable. Phase 4's claim block READS that field back
+to env-prefix the owner's writes. A cross-agent goal whose anchor lost
+`cross_agent_owner` writes its state into the WRONG agent's tree, silently.
+
+The split is therefore: **this phase owns the anchor's CONTENT; the chokepoint
+owns its EXISTENCE** (ENSURE semantics — writes only when absent or naming a
+different goal, so this phase's richer anchor survives). Retiring this phase
+requires moving `cross_agent_owner` into the claim first, not merely observing
+that the claim now anchors.
 
 ```
 # Cross-agent source translation (g-115-978 Option 3). collect_cross_agent_candidates

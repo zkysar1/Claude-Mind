@@ -84,6 +84,37 @@ if [[ -z "$GOAL_ID" || -z "$OUTCOME" ]]; then
     exit 2
 fi
 
+#  (G3 worker rail) — DEFENSIVE, and deliberately so. A worker Body
+# should never reach this writer at all: journal append is a reducer-only phase
+# and the work-partition contract says workers do not run reducer phases. This
+# guard exists to convert a FUTURE phase-drift bug from a silent shared-store
+# corruption into a LOGGED skip. If it ever actually fires, that is a bug
+# report about the phase partition, not routine operation — the stderr line is
+# the point.
+#
+# Derived locally rather than from BODY_ROLE per guard-2445. Here the env var
+# WOULD arrive (this runs from iteration-close.sh inside a Bash-tool chain that
+# bash-agent-inject rewrote), but the body-WM predicate is the same one
+# bash-agent-inject itself uses, so the two cannot drift, and this wrapper is
+# reachable from call sites that are not that chain (the header names manual
+# reflections and ad-hoc encoding as intended future callers).
+#
+# MIND_SID is THIS process's own session — NOT session/running-session-id,
+# which is the REDUCER's SID and would test the wrong session dir on a worker
+# box (the trap found at the health-ledger writer, same goal).
+#
+# Fail-open in every direction: unset vars, an agent_dir failure, or a missing
+# file all fall through to the normal append. This writer fires on every
+# iteration close fleet-wide, so the guard must never be able to block it.
+if [ -n "${MIND_SID:-}" ] && [ -n "${MIND_AGENT:-}" ]; then
+    _jr_agent_dir="$(agent_dir "$MIND_AGENT" 2>/dev/null || echo "")"
+    if [ -n "$_jr_agent_dir" ] && \
+       [ -f "$_jr_agent_dir/sessions/$MIND_SID/working-memory.yaml" ]; then
+        echo "[journal-append] BODY=worker — SKIPPED agent-wide journal append for $GOAL_ID. A worker should not reach this reducer-only writer; investigate the phase partition (g-306-125)." >&2
+        exit 0
+    fi
+fi
+
 # Resolve target file path
 year="$(date +%Y)"
 month="$(date +%m)"

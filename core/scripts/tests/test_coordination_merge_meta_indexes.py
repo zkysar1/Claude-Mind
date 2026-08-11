@@ -594,6 +594,66 @@ def test_backpressure_is_commutative(case):
     assert cm.merge_backpressure(a, b) == cm.merge_backpressure(b, a)
 
 
+# ── the three corners the four cases above cannot reach () ─────────
+#
+# Every fixture above goes through _bp(), which emits the SAME top-level key
+# sequence on both sides and gives every row a meta_change_id. So none of them
+# can generate top-level order divergence, none exercises the loose-row path,
+# and none diverges below the top level. They were all green while
+# test_merge_handlers_commutativity_property::test_serialization_order_commutative
+# was red on this very handler — sound tests whose fixtures never built the
+# shape that breaks. Pin the three shapes directly.
+
+
+def test_backpressure_loose_rows_are_content_keyed_not_side_ordered():
+    """Rows with no meta_change_id can only be keyed by CONTENT.
+
+    The pre-fix `la + lb` concatenation emitted them in arrival order, so the
+    two directions produced identical values in a different order — guard-907
+    ping-pong in the one corner every fixture above misses.
+    """
+    a = _bp(history=[{"note": "aaa"}], active=[{"note": "ma"}])
+    b = _bp(history=[{"note": "bbb"}], active=[{"note": "mb"}])
+    assert cm.merge_backpressure(a, b) == cm.merge_backpressure(b, a)
+    got = _load(cm.merge_backpressure(a, b))
+    assert got["rollback_history"] == [{"note": "aaa"}, {"note": "bbb"}]
+    assert got["active_monitors"] == [{"note": "ma"}, {"note": "mb"}]
+
+
+def test_backpressure_a_duplicate_loose_row_never_evicts_a_distinct_one():
+    """Append-only means append-only: a repeat must not push a record out.
+
+    The pre-fix form deduped into a `loose` SET and then took
+    `(la + lb)[:len(loose)]` — positional truncation, not dedup. Merging
+    [X, X] with [Y] returned [X, X] and dropped Y from an audit trail
+    outright. test_backpressure_rollback_history_unions_and_loses_nothing
+    cannot catch it: all of its rows are id-keyed, so it never reaches this
+    branch.
+    """
+    a = _bp(history=[{"n": "X"}, {"n": "X"}])
+    b = _bp(history=[{"n": "Y"}])
+    got = _load(cm.merge_backpressure(a, b))
+    assert {"n": "Y"} in got["rollback_history"], "a duplicate evicted a distinct record"
+    assert got["rollback_history"] == [{"n": "X"}, {"n": "Y"}]
+
+
+def test_backpressure_nested_key_order_needs_deep_canonicalization():
+    """Why the cure is _canonicalize_for_merge and NOT _commutative_key_order.
+
+    _commutative_key_order is the chassis cure for this class, and it is
+    SHALLOW: it returns `out` untouched when list(a) == list(b). Here both
+    sides carry an identical top-level sequence and diverge one level down,
+    inside the record — so the shallow helper provably no-ops and the bytes
+    still differ. Simplifying the handler to it silently reopens this.
+    """
+    a = _y({"version": 1, "rollback_history": [{"meta_change_id": "r1", "x": 1, "y": 2}]})
+    b = _y({"version": 1, "rollback_history": [{"meta_change_id": "r1", "y": 2, "x": 1}]})
+    # positive control: the shallow cure cannot fire on this input
+    assert list(_load(a).keys()) == list(_load(b).keys())
+    assert cm._commutative_key_order(_load(a), _load(b), _load(a)) == _load(a)
+    assert cm.merge_backpressure(a, b) == cm.merge_backpressure(b, a)
+
+
 def test_backpressure_is_registered_for_the_wildcard_path():
     """The wedge was a ROUTING gap, not a logic gap: .gitattributes routed the
     path to the driver and nothing was behind it. Pin the resolution."""
@@ -605,3 +665,293 @@ def test_backpressure_unparseable_side_falls_back_not_raises():
     """A handler that raises re-creates the wedge it was written to remove."""
     got = cm.merge_backpressure(b"{{{ not yaml", _bp(history=[{"meta_change_id": "mc-1"}]))
     assert isinstance(got, bytes) and got
+
+
+# ---------------------------------------------------------------------------
+#  — skill-gaps.yaml + step-attribution.yaml
+#
+# Group (B) of . Both are RMW indexes, so merge_append_only_jsonl is
+# wrong for both. The load-bearing test here is
+# `test_skill_gaps_times_encountered_is_max_not_len`: it is the SAME trap this
+# file's module docstring already flags for sq total_evaluations, and the two
+# stores resolve it in OPPOSITE directions, so neither answer can be inferred
+# from the other — each has to be measured against its own corpus.
+# ---------------------------------------------------------------------------
+
+def _gap(gid, **kw):
+    g = {"id": gid, "status": "registered", "times_encountered": 1}
+    g.update(kw)
+    return g
+
+
+def test_skill_gaps_is_registered():
+    assert cm.merge_handler_for("meta/skill-gaps.yaml") is cm.merge_skill_gaps
+    assert cm.merge_handler_for(".mind-data/meta/skill-gaps.yaml") is cm.merge_skill_gaps
+
+
+def test_step_attribution_is_registered():
+    assert cm.merge_handler_for("meta/step-attribution.yaml") is cm.merge_step_attribution
+
+
+def test_skill_gaps_neither_sides_gaps_are_lost():
+    """The wedge this handler exists to remove: a both-diverged 412 froze the
+    file permanently, taking the box's forge lane dark (zeta, 2026-07-26)."""
+    a = _y({"gaps": [_gap("gap-001"), _gap("gap-A-only")]})
+    b = _y({"gaps": [_gap("gap-001"), _gap("gap-B-only")]})
+    ids = {g["id"] for g in _load(cm.merge_skill_gaps(a, b))["gaps"]}
+    assert ids == {"gap-001", "gap-A-only", "gap-B-only"}
+
+
+def test_skill_gaps_times_encountered_is_max_not_len():
+    """MAX, not a recompute from len(encounter_log).
+
+    Measured over all 64 live gaps: 57 agree with the log length, 7 diverge,
+    and in EVERY divergent case the COUNTER EXCEEDS the log; zero run the other
+    way. That one-directional skew means the counter is an independent
+    accumulator whose companion log append intermittently fails — so the
+    counter is the more complete record. Recomputing (the guard-1153 reflex,
+    tempting at 89% agreement) would DECREMENT those gaps and push each further
+    from forge_threshold, darkening the very lane this handler unwedges.
+    """
+    a = _y({"gaps": [_gap("gap-001", times_encountered=5,
+                          encounter_log=[{"g": "g-1"}])]})
+    b = _y({"gaps": [_gap("gap-001", times_encountered=3,
+                          encounter_log=[{"g": "g-2"}, {"g": "g-3"}])]})
+    g = _load(cm.merge_skill_gaps(a, b))["gaps"][0]
+    assert g["times_encountered"] == 5, "must be MAX"
+    assert g["times_encountered"] != len(g["encounter_log"]), "must NOT be len()"
+    assert g["times_encountered"] != 8, "must NOT be a sum"
+
+
+def test_skill_gaps_first_seen_takes_earliest_not_latest():
+    """first_seen is a first-observation, so the accumulator rule INVERTS.
+    Taking MAX here silently rewrites history forward."""
+    a = _y({"gaps": [_gap("gap-001", first_seen="2026-05-01")]})
+    b = _y({"gaps": [_gap("gap-001", first_seen="2026-04-01")]})
+    assert _load(cm.merge_skill_gaps(a, b))["gaps"][0]["first_seen"] == "2026-04-01"
+
+
+def test_skill_gaps_terminal_status_beats_registered():
+    """A terminal status is a decision one box already made. Letting
+    `registered` win re-opens a closed gap, and the duplication gate then
+    blocks the re-filed forge goal on the completed original — forever."""
+    for term in ("forged", "dismissed", "satisfied-by-extension"):
+        a = _y({"gaps": [_gap("gap-001", status=term)]})
+        b = _y({"gaps": [_gap("gap-001", status="registered")]})
+        assert _load(cm.merge_skill_gaps(a, b))["gaps"][0]["status"] == term
+        assert _load(cm.merge_skill_gaps(b, a))["gaps"][0]["status"] == term
+
+
+def test_skill_gaps_deferred_to_goal_beats_registered_but_loses_to_terminal():
+    """`deferred-to-goal` is the MIDDLE tier and needs both halves proven.
+
+    It is not terminal (the resolution is decided and tracked by an open goal but
+    has not shipped), so it must LOSE to a terminal status. It IS a decision, so
+    `registered` must not overwrite it — that reverts the suppression and re-fires
+    the forge goal, which is the same dead end the terminal rule prevents.
+
+    Regression origin (g-115-4457): the status shipped in aspirations-evolve Step 9
+    and aspirations-spark Phase 6.5, both of which claim to be "the only readers of
+    gap status". This handler is a third, and without the middle tier a cross-box
+    merge against a box still holding `registered` fell through to the whole-record
+    content tiebreak — silently arbitrary with respect to the decision.
+    """
+    a = _y({"gaps": [_gap("gap-001", status="deferred-to-goal")]})
+    b = _y({"gaps": [_gap("gap-001", status="registered")]})
+    assert _load(cm.merge_skill_gaps(a, b))["gaps"][0]["status"] == "deferred-to-goal"
+    assert _load(cm.merge_skill_gaps(b, a))["gaps"][0]["status"] == "deferred-to-goal"
+
+    for term in ("forged", "dismissed", "satisfied-by-extension"):
+        t = _y({"gaps": [_gap("gap-001", status=term)]})
+        d = _y({"gaps": [_gap("gap-001", status="deferred-to-goal")]})
+        assert _load(cm.merge_skill_gaps(t, d))["gaps"][0]["status"] == term
+        assert _load(cm.merge_skill_gaps(d, t))["gaps"][0]["status"] == term
+
+
+def test_step_attribution_same_goal_different_agents_both_survive():
+    """Identity is (goal_id, agent). A goal_id-keyed union would silently drop
+    one agent's feedback, because the shared helper dedups on the FIRST present
+    key field rather than a composite."""
+    a = _y({"execution_feedback": [{"goal_id": "g-1", "agent": "bravo"}]})
+    b = _y({"execution_feedback": [{"goal_id": "g-1", "agent": "foxtrot"}]})
+    rows = _load(cm.merge_step_attribution(a, b))["execution_feedback"]
+    assert len(rows) == 2
+    assert {r["agent"] for r in rows} == {"bravo", "foxtrot"}
+
+
+def test_step_attribution_total_reflections_is_recomputed_not_summed():
+    """Opposite ruling to skill-gaps' counter, on purpose: this one IS derived.
+    Summing double-counts the shared fork baseline — the two-way merge has no
+    common ancestor to subtract (g-115-3978)."""
+    a = _y({"total_reflections": 2, "execution_feedback": [
+        {"goal_id": "g-1", "agent": "bravo"}, {"goal_id": "g-2", "agent": "bravo"}]})
+    b = _y({"total_reflections": 2, "execution_feedback": [
+        {"goal_id": "g-1", "agent": "bravo"}, {"goal_id": "g-3", "agent": "bravo"}]})
+    out = _load(cm.merge_step_attribution(a, b))
+    assert out["total_reflections"] == 3
+    assert out["total_reflections"] != 4, "must NOT be a sum"
+
+
+def test_g_115_3997_handlers_are_commutative():
+    """guard-907: byte-identical both directions, or two boxes never converge."""
+    a = _y({"last_updated": "2026-07-21", "gaps": [
+        _gap("gap-001", times_encountered=5, status="forged",
+             first_seen="2026-05-01", encounter_log=[{"g": "g-1"}]),
+        _gap("gap-A")]})
+    b = _y({"last_updated": "2026-07-25", "gaps": [
+        _gap("gap-001", times_encountered=3, first_seen="2026-04-01",
+             encounter_log=[{"g": "g-2"}]),
+        _gap("gap-B")]})
+    assert cm.merge_skill_gaps(a, b) == cm.merge_skill_gaps(b, a)
+
+    sa = _y({"last_updated": "2026-07-30", "total_reflections": 1,
+             "steps": {"s1": {"v": 1}},
+             "execution_feedback": [{"goal_id": "g-1", "agent": "bravo"}]})
+    sb = _y({"last_updated": "2026-07-31", "total_reflections": 1,
+             "steps": {"s2": {"v": 2}},
+             "execution_feedback": [{"goal_id": "g-1", "agent": "foxtrot"}]})
+    assert cm.merge_step_attribution(sa, sb) == cm.merge_step_attribution(sb, sa)
+
+
+def test_g_115_3997_unparseable_side_falls_back_not_raises():
+    """A handler that raises re-creates the wedge it was written to remove."""
+    for fn in (cm.merge_skill_gaps, cm.merge_step_attribution):
+        got = fn(b"{{{ not yaml", _y({"gaps": [_gap("gap-001")]}))
+        assert isinstance(got, bytes) and got
+
+
+def _bl(baseline, recorded, verdict="stable", history=None, **kw):
+    d = {"baseline": baseline, "last_recorded": recorded, "last_verdict": verdict,
+         "history": history or [{"recorded_at": recorded, "drift_total": baseline}]}
+    d.update(kw)
+    return d
+
+
+def test_audit_baselines_is_registered():
+    assert cm.merge_handler_for("meta/audit-baselines.yaml") is cm.merge_audit_baselines
+
+
+def test_audit_baselines_baseline_takes_min_never_grows():
+    """THE ratchet invariant. `core/config/conventions/audit-baselines.md`
+    defines `ratcheted` as "current < baseline. Baseline shrinks to current
+    (one-way)" and names "letting the baseline grow on regression" as the
+    anti-pattern that defeats the ratchet. A MAX here would let the worse of
+    two boxes win and un-ratchet the metric permanently."""
+    a = _y({"learning_routing_drift": _bl(186, "2026-07-30T23:23:08")})
+    b = _y({"learning_routing_drift": _bl(200, "2026-07-31T10:00:00")})
+    for out in (cm.merge_audit_baselines(a, b), cm.merge_audit_baselines(b, a)):
+        got = _load(out)["learning_routing_drift"]
+        assert got["baseline"] == 186, "must shrink, never grow"
+        # the LATER reading still wins the timestamp/verdict pair
+        assert got["last_recorded"] == "2026-07-31T10:00:00"
+
+
+def test_audit_baselines_keeps_baselines_present_on_only_one_side():
+    a = _y({"only_in_a": _bl(5, "2026-07-30T00:00:00")})
+    b = _y({"only_in_b": _bl(7, "2026-07-31T00:00:00")})
+    out = _load(cm.merge_audit_baselines(a, b))
+    assert set(out) == {"only_in_a", "only_in_b"}
+
+
+def test_audit_baselines_history_is_unioned():
+    a = _y({"m": _bl(3, "2026-07-30T00:00:00",
+                     history=[{"recorded_at": "2026-07-30T00:00:00", "drift_total": 3}])})
+    b = _y({"m": _bl(3, "2026-07-31T00:00:00",
+                     history=[{"recorded_at": "2026-07-31T00:00:00", "drift_total": 3}])})
+    assert len(_load(cm.merge_audit_baselines(a, b))["m"]["history"]) == 2
+
+
+def test_audit_baselines_is_commutative():
+    a = _y({"m1": _bl(186, "2026-07-30T23:23:08", unit="x"),
+            "m2": _bl(0, "2026-07-30T23:23:01")})
+    b = _y({"m1": _bl(200, "2026-07-31T10:00:00", unit="x"),
+            "m3": _bl(464, "2026-07-31T04:53:12", matcher="strict_unverified")})
+    assert cm.merge_audit_baselines(a, b) == cm.merge_audit_baselines(b, a)
+
+
+def test_audit_baselines_unparseable_side_falls_back_not_raises():
+    got = cm.merge_audit_baselines(b"{{{ not yaml", _y({"m": _bl(1, "2026-07-30T00:00:00")}))
+    assert isinstance(got, bytes) and got
+
+
+def test_meta_index_dispatches_by_path_not_basename():
+    """The basename is AMBIGUOUS: core/config/meta.yaml is the framework config
+    and must never receive the imp@k merge. Guard is negative (exclude the
+    config) so a custom-named META_PATH still resolves — a positive
+    parent=="meta" test would silently return None for every custom meta root,
+    which is the failure mode that hides."""
+    assert cm.merge_handler_for(".mind-data/meta/meta.yaml") is cm.merge_meta_index
+    assert cm.merge_handler_for("meta/meta.yaml") is cm.merge_meta_index
+    # a user-renamed external meta root still resolves
+    assert cm.merge_handler_for("/srv/Custom-Meta/meta.yaml") is cm.merge_meta_index
+    # the framework config never does
+    assert cm.merge_handler_for("core/config/meta.yaml") is None
+    assert cm.merge_handler_for("core\\config\\meta.yaml") is None
+
+
+def test_meta_index_counters_are_max_not_summed():
+    a = _y({"evaluation_count": 7, "sessions_evaluated": 5, "total_meta_changes": 20,
+            "last_evaluation": "2026-07-29", "overall_imp_k": 0.4})
+    b = _y({"evaluation_count": 4, "sessions_evaluated": 6, "total_meta_changes": 18,
+            "last_evaluation": "2026-07-31", "overall_imp_k": 0.9})
+    out = _load(cm.merge_meta_index(a, b))
+    assert out["evaluation_count"] == 7 and out["evaluation_count"] != 11
+    assert out["sessions_evaluated"] == 6
+    assert out["total_meta_changes"] == 20
+    # derived metric follows the LATER evaluation, not an average
+    assert out["last_evaluation"] == "2026-07-31"
+    assert out["overall_imp_k"] == 0.9
+
+
+def test_meta_index_is_commutative_and_fails_open():
+    a = _y({"evaluation_count": 7, "last_evaluation": "2026-07-29", "overall_imp_k": 0.4})
+    b = _y({"evaluation_count": 4, "last_evaluation": "2026-07-31", "overall_imp_k": 0.9})
+    assert cm.merge_meta_index(a, b) == cm.merge_meta_index(b, a)
+    got = cm.merge_meta_index(b"{{{ not yaml", a)
+    assert isinstance(got, bytes) and got
+
+
+# --- core/config basename-collision guard ( follow-up audit) --------
+# Registering by BASENAME means a registered name can also match an immutable
+# framework config under core/config/ whose schema is unrelated. Measured by
+# walking all 83 registered basenames against disk: 3 collide.
+
+
+def test_core_config_twins_never_get_the_state_file_handler():
+    """core/config/<name> is a framework DEFINITION, not the synced state file
+    it shares a basename with -- applying the state handler is a schema
+    mismatch. All three measured collisions must return None."""
+    for p in ("core/config/meta.yaml",
+              "core/config/skill-gaps.yaml",
+              "core/config/skill-relations.yaml",
+              "/opt/ayoai-mind/core/config/skill-gaps.yaml"):
+        assert cm.merge_handler_for(p) is None, p
+
+
+def test_synced_twins_still_dispatch_normally():
+    """The guard must not shadow the real synced stores it protects."""
+    assert cm.merge_handler_for(".mind-data/meta/skill-gaps.yaml") is cm.merge_skill_gaps
+    assert cm.merge_handler_for(".mind-data/meta/meta.yaml") is cm.merge_meta_index
+    assert cm.merge_handler_for(
+        ".mind-data/world/skill-relations.yaml") is cm.merge_skill_relations
+
+
+def test_guard_is_scoped_to_core_config_not_any_config_dir():
+    """WORLD_PATH carries its own config/ overlay dir. A bare parent=='config'
+    test would silently return None for an overlay that later takes a
+    registered basename -- so the guard must require core/ above it."""
+    assert cm.merge_handler_for(
+        ".mind-data/world/config/skill-gaps.yaml") is cm.merge_skill_gaps
+
+
+def test_guard_is_negative_so_custom_named_meta_roots_still_work():
+    """META_PATH is user-configurable (CLAUDE.md external paths). A POSITIVE
+    test (parent == 'meta') would return None for every custom-named root --
+    the failure mode that hides."""
+    assert cm.merge_handler_for("/srv/Custom-Meta/skill-gaps.yaml") is cm.merge_skill_gaps
+    assert cm.merge_handler_for("/srv/Custom-Meta/meta.yaml") is cm.merge_meta_index
+
+
+def test_shard_branch_still_precedes_the_config_guard():
+    assert cm.merge_handler_for(
+        ".mind-data/world/team-state/agents/bravo.yaml") is cm.merge_team_state_shard

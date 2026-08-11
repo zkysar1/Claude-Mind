@@ -185,9 +185,11 @@ def _landed_on_default(repo, sha, timeout=30):
     """Probe whether the sha's work reached the default branch by a path OTHER
     than an ok CI run for the exact sha. Returns (landed: bool, via: str).
 
-    deploy-verify.sh classifies the EXACT sha's GitHub Actions runs only -- it
-    has no "did this land on the default branch?" awareness. Two poison
-    sub-classes therefore strand ledger entries forever (g-115-2876, rb-4616):
+    deploy-verify.sh classifies the EXACT sha -- its GitHub Actions runs, and
+    (since g-335-848) the hosting-platform build for that same sha where the
+    world supplies a platform hook. What it still has no awareness of is "did
+    this land on the default branch?". Two poison sub-classes therefore strand
+    ledger entries forever (g-115-2876, rb-4616):
       (a) ANCESTOR-LANDED -- the sha is an ancestor of the default branch
           (compare <default>...<sha> ahead_by == 0). CI may have run only on the
           branch HEAD, so deploy-verify returns `unverified` forever, yet the
@@ -391,8 +393,8 @@ def cmd_resolve(args):
     """
     repo, sha, d = (args.repo or ""), (args.sha or ""), (args.dir or "")
     dv = SCRIPT_DIR / "deploy-verify.sh"
-    from _runtime_bash import BASH  # rb-1472: bin-first, clean-PATH-safe (not bare "bash")
-    cmd = [BASH, str(dv)]
+    from _runtime_bash import bash_cmd  # guard-580 (bin-first, clean-PATH-safe) + guard-581
+    cmd = bash_cmd(dv)
     if d:
         cmd += ["--dir", d]
     if repo:
@@ -473,13 +475,74 @@ def cmd_roll_handoff(args):
     surfaces the carry-over in the boot summary so the agent is aware unverified
     deploys crossed the stop boundary. Merge is dedup-by-(repo,sha) and preserves
     every other handoff key. Fail-open: always prints a summary and returns 0,
-    and NEVER overwrites an unparseable/non-dict handoff (that would lose content).
+    and NEVER overwrites a handoff it cannot first read whole — unparseable,
+    non-dict, or (g-115-5199) unmaterializable from the read-through cache.
+    That third case is the one this preserves-every-key claim used to be FALSE
+    for: a cold own-cloud box read the remote file as absent and wrote a
+    document containing only pending_deploys.
     """
     entries = _load(_store_path(args))
     hp = _handoff_path(args)
     if not entries or hp is None:
         print(json.dumps({"rolled": 0, "handoff": str(hp) if hp else None}))
         return 0
+    # --- COLD-CACHE MATERIALIZE BEFORE THE PRESENCE TEST () --------
+    # Under own-cloud the local tree is a READ-THROUGH CACHE (guard-980), so a
+    # handoff.yaml that exists REMOTELY reads as absent on a cold box. A bare
+    # Path(hp).is_file() then falls through with doc={}, and the locked write
+    # below persists a document containing ONLY pending_deploys — destroying
+    # every other key the remote file carried. handoff.yaml is cross-session
+    # state read at the next boot, so those keys are not recoverable from the
+    # store that produced them.
+    #
+    # Note what the surrounding code already defends, because the asymmetry is
+    # the whole bug: the non-dict branch and the unparseable branch BOTH return
+    # without writing. Those are the RARE loss paths. The cold-cache path is the
+    # COMMON one and was the only one that fell through to the write.
+    #
+    # refresh(), NOT ensure_local() — the pre-apply consult (guard-980) is what
+    # caught this, and the two are NOT interchangeable here. ensure_local is
+    # _refresh(force_fresh=False), and that TTL early-return is gated on
+    # `not force_fresh` (owncloud_backend L618-621), so it can return a
+    # PRESENT-BUT-STALE local file without ever contacting S3 — which drops a
+    # PEER's key by the same whole-file rewrite, just from a warm cache instead
+    # of a cold one. refresh() is force_fresh=True, and its abstract docstring
+    # names this exact caller: "call this before a raw in-lock read, so a
+    # read-modify-write starts from the latest remote state. For a remote-only
+    # file it materializes the local cache." handoff.yaml has NO merge handler
+    # (coordination_merge.merge_handler_for -> None), i.e. it is a fence-only
+    # store with no reconciler below the write, so the current-state read is the
+    # only thing standing between a rewrite and a lost update.
+    #
+    # The 404 contract is what makes this a clean fix rather than a guess
+    # (owncloud_backend._refresh L624-628, and it holds for BOTH force_fresh
+    # values): a 404/NoSuchKey RETURNS normally, leaving local absent — so a
+    # genuinely-absent handoff still takes the empty-doc path and a fresh
+    # agent's first stop is unaffected. Any OTHER ClientError RAISES. So a
+    # normal return makes the local answer authoritative; a raise means we
+    # cannot distinguish absent-remotely from cannot-reach, and the only safe
+    # move is to skip.
+    #
+    # RESIDUAL, named rather than silently closed: the read below and the write
+    # at the end are not held under ONE lock, so a peer writing between them is
+    # still a lost update. That window pre-dates this fix and closing it means
+    # moving the whole body to locked_rmw — filed separately rather than
+    # inlined here.
+    #
+    # SKIPPING IS CHEAP AND LOSS IS NOT — that asymmetry picks the direction.
+    # This store is a VISIBILITY MIRROR (see the docstring): pending-deploys.yaml
+    # is NOT cleared here and remains the single source of truth, so a skipped
+    # roll costs one boot summary and self-heals on the next stop. A dropped key
+    # is gone. Identity on LocalBackend, so this is a no-op off own-cloud.
+    # Lazy import mirrors the _fileops import below — keeps the backend off the
+    # hot add/has-pending paths.
+    try:
+        from storage_backend import get_backend  # type: ignore
+        get_backend().refresh(hp)
+    except Exception:
+        print(json.dumps({"rolled": 0, "error": "handoff-unmaterializable"}))
+        return 0
+
     # Read existing handoff, preserving all keys. On any parse ambiguity, SKIP
     # the write rather than clobber a file we cannot safely round-trip.
     doc = {}

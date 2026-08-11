@@ -456,7 +456,48 @@ def main():
             _body_wm = (_agent_dir(SCRIPT_DIR.parent.parent, _agent_m.group(1))
                         / _SESSIONS_DIRNAME / sid / "working-memory.yaml")
             if _body_wm.exists():
-                body_clause = f'export BODY_WM_PATH="{_body_wm.as_posix()}"; '
+                # G3 (): BODY_ROLE=worker rides the SAME predicate, on
+                # purpose. The design brief says to read the body MANIFEST for the
+                # role; measured here, this function never reads the manifest — it
+                # routes on the body-WM-FILE's existence, and per the invariant
+                # documented above that file is created ONLY for a non-reducer Body.
+                # So `_body_wm.exists()` already IS the worker predicate, and
+                # deriving BODY_ROLE from it costs zero extra I/O on a hook that
+                # runs before EVERY Bash call. Reading the manifest instead would
+                # add a stat+parse per call to re-derive a fact this branch has.
+                #
+                # DECISION RE-DERIVED AND UPHELD (, 2026-08-05, zeta on
+                # cc-02 / Linux 6.8.0-136-generic), with the reason CHANGED. The
+                # latency claim above is true and NOT decisive; measured, N=20000,
+                # against a 196-byte manifest:
+                #     Path.exists()            1.49 us/call   (this branch, today)
+                #     open+read+line-scan      8.24 us/call   =   5.5x
+                #     open+read+yaml.safe_load 210.69 us/call = 141.6x
+                # Against this hook's own interpreter spawn (13.84 ms, measured the
+                # same turn) even the worst form adds ~1.5%. So do NOT defend
+                # existence-routing on cost — the honest denominator makes that
+                # argument too small to decide anything.
+                #
+                # What DOES decide it is that the two predicates differ in WHEN they
+                # change. The file's existence is fixed for the session's lifetime;
+                # `body_state` is written by another process. Routing on state means
+                # that the moment the reducer merges a LIVE worker's fork
+                # (body_state -> merged), BODY_WM_PATH vanishes mid-session and this
+                # worker's subsequent wm-*.sh writes silently redirect to the
+                # agent-wide WM — precisely the contamination the fork exists to
+                # prevent, arriving without an error at the least predictable moment.
+                # The failure mode that motivates the question (an EX-worker SID
+                # mislabeled on re-bind) is handled where it belongs, at bind time:
+                # /start refuses such a bind in all three branches (IDLE 0-pre2,
+                # RUNNING-worker W-pre, RUNNING-observer 0-pre). A refusal at the
+                # boundary beats a predicate that mutates under a running session.
+                # COUPLING, stated so it fails loudly rather than silently: if a
+                # REDUCER ever gains a `sessions/<sid>/working-memory.yaml`, this
+                # export mislabels the reducer as a worker and the store rails
+                # would suppress reducer-only writes. Any change to who gets a
+                # body-WM-file MUST revisit this line and the rails keyed on it.
+                body_clause = (f'export BODY_WM_PATH="{_body_wm.as_posix()}"; '
+                               'export BODY_ROLE=worker; ')
         except OSError:
             body_clause = ""
 

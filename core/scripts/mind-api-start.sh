@@ -528,8 +528,24 @@ if [ -n "$existing_pid" ] && [ -n "$existing_port" ]; then
             # 2026-07-18 "" rt_call retry double-emit —
             # fixed at the source in _runtime.sh rt_call, defended here too).
             # null / absent field yields empty, caught by the -n test below.
+            #
+            # The trailing (-[a-z])? is LOAD-BEARING, not defensive padding: it
+            # mirrors the decomposition suffix in aspirations.py GOAL_ID_RE (the
+            # SSOT for goal-id shape). Without it this grep truncated every
+            # decomposition child to its PARENT — '-b' -> '' —
+            # and then liveness-checked the parent. A decomposed parent is by
+            # definition status='decomposed', which the check reports STALE, so
+            # this gate REFUSED a recycle 100% of the time for any agent working
+            # any decomposition child, permanently and silently. Worse than a
+            # fail-open bug: the probe SUCCEEDS against the wrong goal, so it
+            # returns an authoritative-looking STALE that no fail-open path
+            # catches. Measured 2026-08-02 (-b, cc-04): 35 child-shaped
+            # ids in the world queue, 6 non-terminal. Same defect class already
+            # fixed in quiescence-gate.py (see its _GOAL_ID_TAG_RE comment) and
+            # already correct in goal-pickup-coordination-check.py — this was the
+            # remaining site. guard-1161: keep the digit groups open-ended.
             _clc_gid=$(bash "$SCRIPT_DIR/team-state-read.sh" --field "agent_status.${MIND_AGENT}.in_flight.goal_id" --json 2>/dev/null \
-                | grep -oE 'g-[0-9]+-[0-9]+' | head -n1) || _clc_gid=""
+                | grep -oE 'g-[0-9]+-[0-9]+(-[a-z])?' | head -n1) || _clc_gid=""
             if [ -n "$_clc_gid" ]; then
                 if ! bash "$SCRIPT_DIR/claim-liveness-check.sh" "$_clc_gid"; then
                     _log "REFUSED --restart: claim on in-flight goal $_clc_gid is STALE (superseded/released while executing — guard-1151). The daemon is HEALTHY; a recycle now is the redundant-restart shape. Re-read your goal + the coordination board. Override: MIND_RESTART_FORCE_STALE_CLAIM=1 bash core/scripts/mind-api-start.sh --restart"
@@ -537,6 +553,51 @@ if [ -n "$existing_pid" ] && [ -n "$existing_port" ]; then
                 fi
             fi
         fi
+        # Min-interval RATE gate (, Layer C). guard-1151 above is
+        # CONDITION-gated — it refuses only when the caller's in-flight claim is
+        # stale, so a caller with a fresh claim, or one passing no MIND_AGENT at
+        # all, was completely unbounded. Nothing else on this path bounded how
+        # OFTEN a recycle could fire: grep for cooldown|rate.limit|throttle|
+        # backoff|min_interval across this file returned zero before this block.
+        # A caller in a retry loop recycled the daemon ~25x in 12 minutes
+        # (~20s apart) and every single call was honoured.
+        #
+        # SCOPE IS THE LOAD-BEARING PART: this gates ONLY the healthy+--restart
+        # branch, exactly like guard-1151 above. The unhealthy / stale / orphan
+        # recovery paths below MUST stay unrated — those restart a daemon that is
+        # already broken, and rate-limiting them would convert a transient crash
+        # into an outage that heals no sooner than the interval. Recycling a
+        # HEALTHY daemon is an optimisation; restarting a dead one is recovery.
+        #
+        # FAILS OPEN on every error (unreadable stamp, garbage contents, clock
+        # skew, future timestamp) — a bug in a rate-limiter must never be able to
+        # block a legitimate recycle. Same posture as the claim probe above.
+        # 60s is CALIBRATED, not guessed. Measured against this box's own 131
+        # historical recycles (spawn.log, 2026-07-02..08-02): median gap 6727s
+        # (~1.9h), p10 1475s, min 30s. A 60s floor would have refused exactly
+        # 1 of 130 gaps (0.8%) — and that one has an override — while a storm
+        # firing every ~20s collapses to a single recycle. Re-run the gap
+        # histogram before changing this; a floor that refuses a meaningful
+        # share of real deploys will get routed around instead of tuned.
+        _rr_stamp="$RT_DIR/last-restart"
+        _rr_min="${MIND_RESTART_MIN_INTERVAL_S:-60}"
+        if [ "${MIND_RESTART_FORCE_RATE:-0}" != "1" ] && [ "$_rr_min" -gt 0 ] 2>/dev/null; then
+            _rr_last=$(cat "$_rr_stamp" 2>/dev/null) || _rr_last=""
+            _rr_now=$(date +%s)
+            if [ -n "$_rr_last" ] && [ "$_rr_last" -gt 0 ] 2>/dev/null; then
+                _rr_age=$(( _rr_now - _rr_last ))
+                # Negative age = clock skew or a future stamp: fail open.
+                if [ "$_rr_age" -ge 0 ] && [ "$_rr_age" -lt "$_rr_min" ]; then
+                    _log "REFUSED --restart: last recycle was ${_rr_age}s ago, under the ${_rr_min}s minimum interval (g-115-3426). The daemon is HEALTHY — a recycle this soon is the restart-storm shape, not a deploy. If you are retrying because a previous restart appeared to fail, check the daemon's health FIRST (it is up) instead of recycling again. Override: MIND_RESTART_FORCE_RATE=1 bash core/scripts/mind-api-start.sh --restart ; tune with MIND_RESTART_MIN_INTERVAL_S."
+                    exit 3
+                fi
+            fi
+        fi
+        # Stamp only on an ACTUAL recycle, never on a refusal — otherwise a
+        # caller in a tight retry loop would keep pushing its own window forward
+        # and could never get through, turning a rate limit into a permanent
+        # lockout.
+        date +%s > "$_rr_stamp" 2>/dev/null || true
         _log "daemon healthy (PID=$existing_pid parent=${existing_parent_pid:-?}) but --restart requested; recycling for fresh code"
         need_recycle=1
     elif _is_pid_alive "$existing_pid"; then

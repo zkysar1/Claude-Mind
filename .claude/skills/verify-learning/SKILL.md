@@ -105,6 +105,74 @@ Focus on what actually happened during the test — did the agent USE the new fe
    # readable, which is a WORLD_DIR resolution problem wearing a clean zero (rb-245).
    Bash (temp-citation-ratchet): O=$(bash core/scripts/temp-citation-ratchet.sh 2>&1); case "$O" in *"] STABLE:"*|*"] RATCHETED:"*|*"] SEEDED:"*) echo "PASS: temp-citation-ratchet — $O";; *"] SKIPPED:"*) echo "FAIL: temp-citation-ratchet could not measure the durable stores (no tree node or store row was readable) — this is NOT a clean zero. Check WORLD_DIR resolution before reading it as no-drift. $O";; *) echo "FAIL: temp-citation-ratchet REGRESSED — a durable store now cites a purgeable agents/*/temp/ path that will be orphaned by the next drain. Fold the cited evidence INLINE into the record, or re-point it at a durable path. Do NOT delete the citing text (guard-952/731/712/667). $O";; esac
    Check: `meta/audit-baselines.yaml` has a `temp_citations_durable_stores` entry with `baseline` + `history` + `unit: record_path_pairs_cited_not_dangling` (seeded 2026-07-31 at 73; ratchets DOWN as citations get folded inline, never up)
+
+   # ── Durability PROPERTY checks (g-306-103, D5) ────────────────────────────
+   # The ratchet above guards the WRITE side (a durable record must not cite a
+   # purgeable path). These three guard the PROPERTY itself, and exist because
+   # of a specific failure shape: a durability guarantee is provided by a
+   # mechanism that is only CONDITIONALLY ACTIVE, and nothing verifies the
+   # mechanism is active. A check that greps for the mechanism passes whenever
+   # it is PRESENT — including present and switched off — and is blind entirely
+   # when a DIFFERENT mechanism was the one assumed. Asserting the property is
+   # invariant to both.
+   # Each sub-check treats "could not measure" as FAIL, never PASS (rb-245,
+   # guard-1802): a property check that degrades to an empty result set reports
+   # the reassuring answer forever, which is worse than no check at all.
+   Bash (durability-cited-temp-not-purged): py -3 core/scripts/durability-property-check.py cited-temp-not-purged
+   Bash (durability-temp-durable-copy): py -3 core/scripts/durability-property-check.py temp-durable-copy
+   Bash (durability-tree-node-recoverable): py -3 core/scripts/durability-property-check.py tree-node-recoverable
+   Check: `meta/audit-baselines.yaml` has a `tree_nodes_without_prior_version` entry with `baseline` + `history` + `unit: tree_node_md_files_without_any_recoverable_prior_version` (seeded 2026-08-01 at 1311 of 1321; ratchets DOWN as node writes gain history coverage, never up)
+   # WHY the third one is a ratchet rather than a flat assertion: 1311 of 1321
+   # nodes (99.2%) already have no recoverable prior version, measured 2026-08-01
+   # on cc-02. That is NOT this check's to fix — the cause is upstream and is
+   # tracked separately: 0 of 85,206 changelog rows end in `.md` although 2,152
+   # `knowledge/` rows exist (positive control), so tree-node BODIES reach
+   # neither the changelog nor `.history` on write. The 10 covered nodes got
+   # their snapshots from owncloud `_snapshot_before_pull`, not from any write
+   # path. A flat assertion would fail 1311 times every run and be tuned out;
+   # the ratchet fails only on REGRESSION, which is the actionable signal.
+   # NOTE the layout trap this check was born from: bulk stores snapshot to
+   # `.history/<rel>/` but tree bodies land under `.history/snapshots/<rel>/`.
+   # Probing only the first reports 0 of 1321 — a false 100% caught by a
+   # positive control. Both layouts count; see test_durability_property_check.py.
+
+   # ── Conditionally-active PROPERTY checks (g-306-116, D7 follow-on) ────────
+   # Same family, three more catalogued entries that had NOTHING asserting the
+   # property. Catalogue: tree node `conditionally-active-safety-mechanisms`.
+   # Each names the layers it consulted, because every one of these three is a
+   # property that holds by ABSENCE — and an absence produced by a probe that
+   # looked nowhere is indistinguishable from the real thing unless the examined
+   # set is printed. Read the SCOPE clause in each PASS, not just the word PASS.
+   Bash (durability-held-key-still-listed): py -3 core/scripts/durability-property-check.py held-key-still-listed
+   # ENTRY 6. guard-2077 declines to archive an unconsumed key from a SHARED
+   # inbound lane on the premise that declining keeps it listed. The peer
+   # falsified that premise (msg-20260731-080319-omni-6335): a deliberately-held
+   # manifest was 404 in the lane and already under processed/ by its poll,
+   # archived by ANOTHER world's drain — the processed/ marker is global in the
+   # RETENTION direction too. Measured both ways in one 24h window: one hold
+   # survived ~17h, one did not survive at all. Pass `--held-key K` AT CLAIM TIME
+   # to assert a specific key; with no keys the check asserts only that the lane
+   # is listable, and says so — holds are not durably recorded anywhere
+   # (guard-2077 second half), so no past hold can be audited after the fact.
+   Bash (durability-deadman-armed): py -3 core/scripts/durability-property-check.py deadman-armed
+   # ENTRY 9. The resurrection net is disarmed by the MERE PRESENCE of
+   # session/deadman-disabled, so the property holds today purely by absence.
+   # The check measures only agents RESIDENT on this box and names the rest,
+   # because the sentinel is machine-local and unsynced: a glob over agents/*
+   # answers "armed" for every non-resident agent by pure cache geometry, which
+   # is guard-2193's spatial axis. Measured 2026-08-01 on cc-05: 1 of 5 live
+   # agents examinable here — so a green line is NOT a fleet-wide all-clear, and
+   # closing the residual needs each box to report its own.
+   Bash (durability-agent-binding-effective): py -3 core/scripts/durability-property-check.py agent-binding-effective
+   # ENTRY 7. bash-agent-inject fails OPEN on any error (hook timeouts 15-30s),
+   # and an unbound agent is the wrong-agent-write precondition. Registration of
+   # the hook proves nothing about any single call, so this observes MIND_AGENT
+   # from INSIDE the process and cross-checks it against the on-disk session
+   # binding — an independent source, which is what keeps the assertion
+   # non-vacuous when the fail-open default is absence (guard-1718). A
+   # DISAGREEMENT is reported separately from an absence: it is the worse state,
+   # because everything downstream then succeeds into the wrong agent's store.
+
    Check: `core/scripts/_paths.py` exports WORLD_DIR, AGENT_DIR, META_DIR
    Check: `core/scripts/_platform.sh` has `WORLD_DIR="$(cygpath -m "$WORLD_DIR")"` (Windows path fix)
    Bash (platform-mind-world-reexport): grep -qF 'MIND_WORLD' core/scripts/_platform.sh && echo "PASS: _platform.sh re-exports MIND_WORLD (+MIND_META) from the cygpath-converted WORLD_PATH/META_PATH inside the MSYSTEM/cygpath block — MSYS FORCE_FALLBACK tree.py scans resolve the world/meta roots (ZDS 3f946c9 back-port)" || echo "FAIL: _platform.sh no longer re-exports MIND_WORLD from the cygpath-converted WORLD_PATH — MSYS FORCE_FALLBACK tree.py scans re-break on the C:/...->/c/... path mangle (ZDS 3f946c9 back-port reverted; g-115-2745)"
@@ -179,6 +247,29 @@ Focus on what actually happened during the test — did the agent USE the new fe
    # breadcrumbs with live episode keys to the append-only coordination channel —
    # observed live 2026-07-18 (2 messages, marked read). Guard against silent removal.
    Bash (infra-streak-board-stub-hermeticity): grep -qE '^[[:space:]]*export INFRA_STREAK_BOARD_STUB=' core/scripts/tests/test-infra-streak-dedup.sh && echo "PASS: test-infra-streak-dedup.sh retains its suite-wide 'export INFRA_STREAK_BOARD_STUB=' default — every case inherits the local-JSONL stub, so the suite never reads or posts the REAL coordination board" || echo "FAIL: test-infra-streak-dedup.sh lost the suite-wide 'export INFRA_STREAK_BOARD_STUB=' default — infra-streak-notify.sh's --notify path falls to the live board-read.sh / board-post.sh branch, leaking real coordination breadcrumbs with live episode keys (observed 2026-07-18, 2 msgs; g-115-2641 / g-249-30)"
+
+   # provision-from-vault test-family ambient-override hermeticity (g-115-3552;
+   # source g-115-3386). provision-from-vault.sh resolves its vault key through a
+   # chain whose every link is an ambient override:
+   #     ENVIRONMENT_ID (:107) -> VAULT_KEY_PREFIX (:109) -> prefix filter (:189)
+   # Both later links use `: "${VAR:=default}"` / `if [ -z "${VAR:-}" ]` forms, so
+   # an ambient value wins OUTRIGHT and the pin further up is never consulted. A
+   # test that pins only ENVIRONMENT_ID is therefore NOT hermetic — measured on
+   # cc-05 (Linux 6.8.0-136-generic) before the fix: agent_scope 16 passed at
+   # baseline / 13 FAILED with VAULT_KEY_PREFIX=BOGUS, default_out 2 passed / 2
+   # FAILED. This repo is the DEV SOURCE of the Ayoai-Mind -> Claude-Mind ->
+   # ZDS-Mind chain and downstream env-ids differ BY CONSTRUCTION, so the suite
+   # would pass here forever and ship broken to every consumer.
+   # FAMILY-WIDE ON PURPOSE (this is the whole point): the gap lived in the two
+   # files nobody edited, so a per-file check on the one that WAS fixed would have
+   # reported clean while both siblings stayed open. The glob makes a NEW sibling
+   # join the assertion by existing. The `^[^#]*` anchor is load-bearing per
+   # guard-1099 — these files' own comments name VAULT_KEY_PREFIX, so an
+   # unanchored grep would match the prose and PASS on a commented-out pop.
+   # Positive-controlled 5 ways before landing (guard-1311): pop removed from each
+   # of the 3 members individually -> FAIL naming that member; pop commented out ->
+   # FAIL; empty glob -> FAIL as vacuous rather than a silent clean pass (rb-245).
+   Bash (provision-vault-family-hermeticity): miss=""; n=0; for f in core/scripts/tests/test_provision*.py; do [ -e "$f" ] || continue; n=$((n+1)); grep -qE '^[^#]*env\["ENVIRONMENT_ID"\][[:space:]]*=' "$f" || miss="$miss $(basename "$f"):no-ENVIRONMENT_ID-pin"; grep -qE '^[^#]*env\.pop\("VAULT_KEY_PREFIX"' "$f" || miss="$miss $(basename "$f"):no-VAULT_KEY_PREFIX-pop"; done; if [ "${n:-0}" -lt 3 ]; then echo "FAIL: provision-vault test family glob matched only $n file(s) (expected >=3) — the check went vacuous, which reads identically to a clean pass (rb-245)"; elif [ -n "$miss" ]; then echo "FAIL: provision-vault test family lost its ambient-override clearing:$miss — the chain ENVIRONMENT_ID -> VAULT_KEY_PREFIX -> prefix filter is honored as \`: \${VAR:=default}\` forms, so an ambient VAULT_KEY_PREFIX (any CI runner or downstream env-id) wins outright and the suite fails for an environmental reason (measured g-115-3552: 13 of 16 + 2 of 2 FAILED with VAULT_KEY_PREFIX=BOGUS)"; else echo "PASS: all $n core/scripts/tests/test_provision*.py pin ENVIRONMENT_ID and pop VAULT_KEY_PREFIX (family-wide — a NEW sibling that omits either is caught, which a per-file check would not do)"; fi
 
    # drain-temp Phase 1.5 TEMP_DIR dangerous-rm guard (g-115-1876, g-115-1877;
    # helper-form update 2026-07-13 merge). The Phase 1.5 ephemera purge MUST route
@@ -1169,6 +1260,40 @@ else:
    # removal unwires outcome 3 of the ToM loop undetected. This grep guards it.
    Bash (precheck-wires-belief-contradiction-check): grep -qF 'belief-contradiction-check.sh' .claude/skills/aspirations-precheck/SKILL.md && test -f core/scripts/_belief_contradiction.py && echo "PASS: aspirations-precheck Phase 0-pre.0a wires the ToM contradiction->forced-reflection trigger (belief-contradiction-check.sh + _belief_contradiction.py, g-306-29)" || echo "FAIL: aspirations-precheck lost the Phase 0-pre.0a belief-contradiction-check.sh hook or _belief_contradiction.py is missing -- outcome 3 of the Theory-of-Mind partner-belief loop is unwired (g-306-29); restore Phase 0-pre.0a + the pure module"
 
+   # Two-loop LIFECYCLE parity contract (g-306-212). The PHASE split has had an
+   # SSOT since g-306-69; the session LIFECYCLE did not, and every asymmetry so
+   # far was found BY SURPRISE by a different route -- prime never runs for
+   # workers (g-306-211), the per-body heartbeat cannot write on an IDLE worker
+   # box (g-306-208), compact restore rejected body-keyed checkpoints
+   # (g-306-174). One class: a reducer lifecycle stage with no DECLARED worker
+   # disposition. worker_execute.py now owns LIFECYCLE_DISPOSITIONS and refuses
+   # to import when a stage is undeclared.
+   #
+   # This check RUNS the module rather than grepping it, so it exercises the
+   # live table (guard-2582: a static checker's silence is not coverage).
+   #
+   # The stage-count floor is defense-in-depth, and its FIRST stated rationale
+   # was FALSE. It read "`lifecycle-gaps` reports complete for an EMPTY table,
+   # so completeness alone cannot distinguish fully-declared from
+   # nothing-left-to-declare" — written without measuring. Measured on the live
+   # module (fresh-eyes F-002, 2026-08-05): clearing CANONICAL_LIFECYCLE_STAGES,
+   # LIFECYCLE_DISPOSITIONS and PHASE_LIFECYCLE_STAGE together yields 10 gaps,
+   # not 0, because every live phase then declares no stage. The contract is NOT
+   # vacuously satisfiable, so the floor is a second signal rather than the only
+   # one standing between this check and a gutted table. Kept because it fails
+   # LOUD and cheaply if the phase coupling is ever removed — but do not cite it
+   # as the sole guard against the vacuous-pass shape (mw5-covered-patterns,
+   # guard-1802); here that shape is already closed upstream.
+   Bash (worker-lifecycle-contract-complete): out=$(py -3 core/scripts/worker_execute.py lifecycle-gaps 2>&1); rc=$?; n=$(py -3 core/scripts/worker_execute.py lifecycle 2>/dev/null | grep -cE '^[a-z]'); n=${n:-0}; if [ "$rc" -ne 0 ]; then echo "FAIL: worker_execute lifecycle contract has undeclared stage(s) — a session stage with no worker disposition is the g-306-212 defect class (prime/heartbeat/compact-restore were each found by surprise); declare it in LIFECYCLE_DISPOSITIONS:"; echo "$out"; elif [ "$n" -lt 10 ]; then echo "FAIL: lifecycle table reports complete but only $n stage(s) declared (need >=10) — a gutted table, not a clean one. Emptying CANONICAL_LIFECYCLE_STAGES alone does NOT reach here (measured: 24 gaps, caught by the orphan check); this floor covers the residual case where the table shrinks while staying self-consistent (g-306-212)"; else echo "PASS: worker_execute lifecycle contract complete — $n stages declared, every live phase maps to one ($out)"; fi
+
+   # Same contract, WIRING half: the no-transcription rule is the reason the
+   # table exists (a worker capability is a scoped CALL into the shared
+   # component, never a transcription of its steps into worker-loop text), and
+   # it lives in prose that no unit test reads. A transcription that drifts
+   # produces no error -- that is the whole failure mode -- so the rule's
+   # presence in both the skill and the design SSOT is grepped here.
+   Bash (worker-no-transcription-rule-present): miss=""; grep -qF 'no-transcription' .claude/skills/worker-loop/SKILL.md || miss="$miss worker-loop-SKILL"; grep -qF 'LIFECYCLE_DISPOSITIONS' .claude/skills/worker-loop/SKILL.md || miss="$miss worker-loop-lost-table-pointer"; grep -qF 'no-transcription' core/scripts/worker_execute.py || miss="$miss worker_execute-lost-rule"; test -f core/scripts/tests/test_worker_lifecycle_contract.py || miss="$miss regression-test-missing"; if [ -n "$miss" ]; then echo "FAIL: two-loop no-transcription contract drifted —$miss (g-306-212; the rule that keeps the CODE count at one capability while the LOOP count stays two — restore the rule text + the worker-loop pointer at LIFECYCLE_DISPOSITIONS + the regression test)"; else echo "PASS: no-transcription contract present in worker-loop SKILL.md + worker_execute.py, with the lifecycle regression test in place (g-306-212)"; fi
+
    # Handoff-aging escalation wiring (g-115-1524): aspirations-precheck Phase
    # 0.5b.2b runs handoff-aging-check.sh --apply once per iteration to post a
    # coordination-board escalation for cross-agent handoff goals aged past
@@ -1218,7 +1343,7 @@ else:
    # Cadence-battery <-> registry wiring (g-115-2987; third battery in the
    # family — sibling of the sentinel-battery and orchestrator-entry-battery
    # checks above, same omission class, CADENCE side). g-115-2984 added the
-   # skill-invocation cadence battery: _cadence_registry.py (SSOT of the 6
+   # skill-invocation cadence battery: _cadence_registry.py (SSOT of the
    # deferrable cadences), precheck-cadence-battery.py/.sh (READ-ONLY engine),
    # and rewired aspirations-precheck/SKILL.md Phase 0.5e to run ONE battery
    # call in place of six abbreviate-able per-phase cadence-check phases (the
@@ -1236,7 +1361,7 @@ else:
    # THIS check pins the SKILL.md-side wiring pytest cannot see. Mutation-
    # tested at authoring: deleted battery invocation -> FAIL, registry script
    # rename -> FAIL, 0.5g/0.5h added to registry -> FAIL, live tree -> PASS.
-   Bash (precheck-cadence-battery-wiring): MISS=$(py -3 -c "import sys; sys.path.insert(0,'core/scripts'); from _cadence_registry import cadences; from pathlib import Path; m=[c['check_cmd'][0] for c in cadences() if not (Path('core/scripts')/c['check_cmd'][0]).exists()]; print(','.join(m))"); SCOPE=$(py -3 -c "import sys; sys.path.insert(0,'core/scripts'); from _cadence_registry import cadences; p={c['phase'] for c in cadences()}; print('ok' if '0.5g' not in p and '0.5h' not in p else 'leaked')"); test -f core/scripts/_cadence_registry.py && test -f core/scripts/precheck-cadence-battery.py && test -f core/scripts/precheck-cadence-battery.sh && grep -qF 'bash core/scripts/precheck-cadence-battery.sh' .claude/skills/aspirations-precheck/SKILL.md && [ -z "$MISS" ] && [ "$SCOPE" = "ok" ] && echo "PASS: cadence battery wired — 3 files present, Phase 0.5e invokes precheck-cadence-battery.sh, all 6 registry check_cmd scripts exist, 0.5g/0.5h excluded (g-115-2987)" || echo "FAIL: cadence-battery wiring broken — missing battery file/invocation, registry scripts absent [$MISS], or scope guard leaked [$SCOPE]; the un-skippable-cadence fix regressed (g-115-2984, felt-sense starvation g-115-2982). Restore core/scripts/_cadence_registry.py + precheck-cadence-battery.{py,sh} + aspirations-precheck/SKILL.md Phase 0.5e battery invocation; keep 0.5g/0.5h out of the registry"
+   Bash (precheck-cadence-battery-wiring): MISS=$(py -3 -c "import sys; sys.path.insert(0,'core/scripts'); from _cadence_registry import cadences; from pathlib import Path; m=[c['check_cmd'][0] for c in cadences() if not (Path('core/scripts')/c['check_cmd'][0]).exists()]; print(','.join(m))"); SCOPE=$(py -3 -c "import sys; sys.path.insert(0,'core/scripts'); from _cadence_registry import cadences; p={c['phase'] for c in cadences()}; print('ok' if '0.5g' not in p and '0.5h' not in p else 'leaked')"); test -f core/scripts/_cadence_registry.py && test -f core/scripts/precheck-cadence-battery.py && test -f core/scripts/precheck-cadence-battery.sh && grep -qF 'bash core/scripts/precheck-cadence-battery.sh' .claude/skills/aspirations-precheck/SKILL.md && [ -z "$MISS" ] && [ "$SCOPE" = "ok" ] && echo "PASS: cadence battery wired — 3 files present, Phase 0.5e invokes precheck-cadence-battery.sh, all registry check_cmd scripts exist, 0.5g/0.5h excluded (g-115-2987)" || echo "FAIL: cadence-battery wiring broken — missing battery file/invocation, registry scripts absent [$MISS], or scope guard leaked [$SCOPE]; the un-skippable-cadence fix regressed (g-115-2984, felt-sense starvation g-115-2982). Restore core/scripts/_cadence_registry.py + precheck-cadence-battery.{py,sh} + aspirations-precheck/SKILL.md Phase 0.5e battery invocation; keep 0.5g/0.5h out of the registry"
 
    # Felt-sense Phase 3 RULE-axis step (guard-1783 / reclaim-routed-work.md)
    # The blocked-goal re-probe lane is pure PREMISE axis by construction: it asks
@@ -1255,6 +1380,55 @@ else:
    # Mutation-tested at authoring: deleted the world-cat line -> FAIL; deleted the
    # Step 3.0 header -> FAIL; live tree -> PASS.
    Bash (felt-sense-phase3-rule-axis): F=.claude/skills/felt-sense-checkin/SKILL.md; grep -qF 'Step 3.0' "$F" && grep -qiE 'RULE axis' "$F" && grep -qF 'conventions/capability-routing.md' "$F" && grep -qF 'guard-1783' "$F" && echo "PASS: felt-sense Phase 3 carries the RULE-axis step — standing-grant table is read before a blocked goal is re-blocked on a still-true premise (guard-1783)" || echo "FAIL: felt-sense Phase 3 lost its RULE-axis step — the lane is premise-only again, so a blocker retired by a standing grant (not by the world) will be re-probed correctly and re-blocked forever. This is the canonical reclaim-routed-work.md failure and it has already occurred INSIDE this lane (g-250-03-c re-blocked 3 days after grant-009 retired its stated reason). Restore Step 3.0 in .claude/skills/felt-sense-checkin/SKILL.md: read conventions/capability-routing.md, decompose multi-condition external_ids, re-state rather than unblock"
+
+   # felt-sense --full projection pin (guard-1424 / guard-2467)
+   # Sibling of the rule-axis check above, guarding the OTHER half of the same
+   # two phases. Phase 2's Multi-Agent Safety Rule and Phase 3's Gate 1 both
+   # branch on claimed_by / defer_reason / blocked_by / blocker_ref — none of
+   # which is in aspirations-query.sh's six-key default projection. Drop --full
+   # and the queries still succeed, still return every row, and every one of
+   # those fields reads null: "claimed_by is null -> safe to mutate" becomes
+   # true for PARTNER-claimed goals. The guard does not weaken, it INVERTS,
+   # and nothing in the output says so.
+   # Measured live 2026-08-06 (bravo, cc-05) on the same 5 blocked rows:
+   # default -> 6 distinct keys, 0 rows with claimed_by; --full -> 47 keys,
+   # 3 rows with claimed_by (all foxtrot's). Those 3 are exactly the goals the
+   # rule exists to protect, and the flagless read authorizes mutating them.
+   # Pins the CALL SHAPE, not the prose, and requires n>=3 so deleting the
+   # queries cannot vacuously pass (guard-1715: an empty population reports
+   # clean identically to a full one).
+   # Mutation-tested at authoring: live tree -> PASS(n=3); `sed 's/ --full//'`
+   # -> FAIL naming all 3 lines; queries deleted -> FAIL(n=0).
+   Bash (felt-sense-full-projection-pin): F=.claude/skills/felt-sense-checkin/SKILL.md; N=$(grep -cE 'aspirations-query\.sh --goal-status' "$F"); BAD=$(grep -nE 'aspirations-query\.sh --goal-status' "$F" | grep -v -- '--full'); [ "$N" -ge 3 ] && [ -z "$BAD" ] && grep -qF 'MANDATORY here, not cosmetic' "$F" && echo "PASS: all $N felt-sense goal-status queries pass --full — the Multi-Agent Safety Rule can actually read claimed_by/defer_reason/blocked_by/blocker_ref (guard-1424, guard-2467)" || echo "FAIL: a felt-sense aspirations-query lost --full (or the queries/rationale were removed; n=$N). The six-key default projection omits claimed_by, so Phase 2's safety rule and Phase 3's Gate 1 read null on EVERY goal and invert to 'safe to mutate' on partner-claimed work — the g-115-683 race, silently. Offending: $BAD"
+
+   # sid-ownership-pin (g-115-5147) — THIRD sibling of the two checks above.
+   # The --full pin proves the rule can READ claimed_by; this proves it COMPARES
+   # the right thing once it has. Under the Mind/Body split one agent runs
+   # several sessions, so `claimed_by == $MIND_AGENT` is TRUE for a live peer
+   # instance of yourself: the name test authorizes mutating a running
+   # execution. Measured on the same 32 in-progress records from two sessions
+   # minutes apart — the reducer saw foreign 13/13, the holding worker Body saw
+   # foreign 0/17. Identical records, opposite verdict, decided only by which
+   # session asked. That is why the name test FEELS safe: from inside the
+   # holding session it is correct on every row.
+   # POSITIVE FORM, deliberately (guard-1099): asserts the CONJUNCTION is
+   # PRESENT, never that the old name-only test is absent — the new prose
+   # QUOTES the unsafe test in order to retract it, so an absence-check would
+   # report the defect forever.
+   # Requires all FOUR reflect-maintain mutation sites (COMPLETE / SKIP /
+   # SCOPE-DOWN / UNBLOCK) so deleting three cannot vacuously pass (guard-1715),
+   # and scopes the felt-sense halves by awk RANGE rather than whole-file grep
+   # so Phase 2 and Gate 1 are independently killable.
+   # Uses grep -cF, not -c: a profile-defined `grep` FUNCTION (ugrep wrapper) is
+   # live in interactive shells on this fleet and returns 0 for the BRE form
+   # that GNU grep matches 4 times — `type -t grep` reports `function`
+   # interactively and `file` inside a script, so the BRE form hand-tests RED
+   # while production passes. Fixed-string agrees under both (guard-1742 class).
+   # Mutation-tested at authoring, each mutation verified applied before judging:
+   #   baseline PASS (P2=3 G1=1 RM=4) | drop Phase-2 conjunction -> FAIL(P2=0)
+   #   | revert Gate 1 clause -> FAIL(G1=0) | remove 1 of 4 rm sites -> FAIL(RM=3)
+   #   | restored -> PASS. Three independent halves, three independent kills.
+   Bash (sid-ownership-pin): F=.claude/skills/felt-sense-checkin/SKILL.md; R=.claude/skills/reflect-maintain/SKILL.md; P2=$(awk '/^### Multi-Agent Safety Rule/,/^### Sibling Scans Note/' "$F" | grep -cF 'claimed_by_sid =='); G1=$(awk '/^### Gate 1/,/^### Gate 2/' "$F" | grep -cF 'claimed_by_sid =='); RM=$(grep -cF 'claimed_by_sid != "$MIND_SID"' "$R"); [ "${P2:-0}" -ge 1 ] && [ "${G1:-0}" -ge 1 ] && [ "${RM:-0}" -eq 4 ] && echo "PASS: ownership is the (agent,sid) CONJUNCTION at all three mutation surfaces — felt-sense Phase 2 (n=$P2), Phase 3 Gate 1 (n=$G1), reflect-maintain 4/4 sites (n=$RM). A live peer Body of this same agent can no longer be mutated as if it were self (g-115-5147)" || echo "FAIL: a session-ownership conjunction was lost (Phase2=$P2 need>=1, Gate1=$G1 need>=1, reflect-maintain=$RM need exactly 4). Ownership has fallen back to the agent NAME, which is TRUE for every live peer instance of this same agent under the Mind/Body split — felt-sense/reflect-maintain will close, skip, scope-down or unblock a goal another SESSION of yours is executing right now. Restore the (claimed_by == \$MIND_AGENT AND claimed_by_sid == \$MIND_SID) conjunction, the fail-closed absent-sid/empty-SID clauses, and the per-reason skip tally"
 
    # UTC Timestamp Posture (g-115-2546 — fleet naive-UTC convention)
    # The fleet compares naive timestamps across boxes (board --since,
@@ -1441,8 +1615,12 @@ else:
    # THIRD HALF (g-115-4149 round 11, drained from the bravo/g-335-616 addendum):
    # (c) every registry row whose skill dir exists locally must have a SKILL.md whose
    # front-matter `name` EQUALS the registry key. (a) and (b) pin GIT-STRANDING and
-   # test_forged_skill_surface.py pins TRIGGER MATCHING, so both halves of transport are
-   # covered and NEITHER catches a name mismatch: a skill whose registry key and front-matter
+   # test_forged_skill_surface.py pins INDEX COMPLETENESS (it pinned TRIGGER MATCHING
+   # until g-115-4475 retired the matcher for an unconditional index — and that
+   # retirement makes (c) load-bearing in a new way: the index sources each row's
+   # one-line description from `.claude/skills/<registry-key>/SKILL.md`, so a name
+   # mismatch now costs the description too, not just dispatch), so both halves of
+   # transport are covered and NEITHER catches a name mismatch: a skill whose registry key and front-matter
    # name diverge is registered-and-UNDISPATCHABLE, and (a)+(b) PASS it cleanly because the
    # dir exists and its files are tracked. That is the guard-1142 failure mode. bravo
    # hand-checked this three-way agreement during g-335-616 Q2 precisely because no automated
@@ -4027,9 +4205,25 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
 
    # Weakness analysis
    Check: `reflect/SKILL.md` has Step 5.55 "Weakness Analysis" in --full-cycle section
-   Check: Step 5.55 scans 4 signal sources: pattern_signatures, guardrails, experience, backpressure
+   Check: Step 5.55 names 3 CONSUMED signal sources: pattern_signatures, experience, backpressure
+          (the guardrail source is RETIRED — g-115-2141, re-applied by g-115-2470 after a sync
+          merge silently dropped it. `weakness-signals.py` still COMPUTES `guardrail_signals[]`
+          for baseline bookkeeping, so asserting on the script's output keys would read 4 and
+          pass while the SKILL.md consumes 3. Assert on what the skill CONSUMES, not on what
+          the script emits.)
    Check: Step 5.55 creates investigation goals for HIGH-severity active weaknesses
    Check: `aspirations-evolve/SKILL.md` Step 0.7 reads `agents/<agent>/weakness-report.yaml`
+   Check: `reflect/SKILL.md` Step 5.55's weakness-signals parse list names `notes`
+          Bash: bash -c "grep -c -F 'window_start, notes' .claude/skills/reflect/SKILL.md"  → must be >= 1
+          WHY: `weakness-signals.py` sets `notes` unconditionally (the `out = {...}` at ~L188 and
+          every `notes.append(...)` above it), and it is that script's ONLY channel for reporting a
+          DEGRADED run. Until 2026-08-04 the parse list stopped at `window_start`, so an unparseable
+          `weakness-report.yaml` produced `signature_signals: []` — byte-identical to a healthy pass —
+          and the lane sat dead ~27h on cc-03 undetected (g-115-4974). Dropping `notes` from that line
+          silently restores a permanent false-negative whose broken form is indistinguishable from its
+          healthy one. Use `bash -c` + `-F`: an interactive `grep` may be a profile FUNCTION while
+          scripts get GNU grep, and a false negative here invites re-applying an edit that already
+          landed (guard-2509, measured `function` vs `file` on cc-03 2026-08-04).
 
    # Cross-subsystem integration
    Check: `core/config/conventions/meta-strategies.md` has sections: Backpressure Gate, Dead End Registry, Credit Assignment, Strategy Generations, Weakness Report, Curator Quality Gate
@@ -4281,7 +4475,17 @@ sys.exit(1)
    Check: Step 2.5b appends to `$WORLD_DIR/conventions/convention-changes.jsonl` (lifecycle log)
    Check: `aspirations-evolve/SKILL.md` has "Step 3.5: Convention Health Audit" between Step 3 and Step 4
    Check: Step 3.5 loads both convention files and scans for utilization/skipping patterns
-   Check: Step 3.5c detects guardrails with `times_active >= 5` as convention promotion candidates
+   # Step 3.5c convention-gap detector — RANK-based since g-115-3098 (2026-08-10).
+   # The old assertion pinned the literal `times_active >= 5`, which was the DEFECT:
+   # an absolute threshold on a cumulative counter selected 2067 of 2935 active
+   # guardrails (70.4%), i.e. emitting a candidate list nothing could triage. These
+   # checks encode the replacement contract, not just the replacement string.
+   Check: Step 3.5c reads `convention_learning.promotion_top_n` from `core/config/aspirations.yaml` at run time (config-driven, not a hardcoded threshold — guard-2805)
+   Check: Step 3.5c does NOT contain the executable filter line `FOR EACH guardrail where utilization.times_active >= 5` (anti-regression: that absolute filter saturates monotonically as the store grows). Match the EXECUTABLE line, not the bare literal — the sub-phase's comments legitimately quote `times_active >= 5` to explain what was fixed, and a bare-substring check would re-flag its own documentation forever (guard-2096)
+   Check: Step 3.5c ranks the whole active store by `times_active` DESC and takes the top N BEFORE dropping already-proposed candidates (drop-then-rank refills from further down the list every pass and re-saturates)
+   Check: Step 3.5c emission template interpolates neither `{guard.description}` (0/2935 records carry it) nor `{guard.title}` (17.3%), and its action resolves from `guard.action_hint` with a `guard.rule` fallback. Match the BRACED interpolation forms — the comments name the bare field names to record what was wrong (same guard-2096 reason as the check above)
+   Check: Step 3.5c refuses to append a proposal when any of title/condition/action is null, rather than writing a null-filled proposal 3.5d could auto-apply
+   Check: Step 3.5c's `audit-schema-gate.sh --field-names` probes every field the emission template reads, not only the ranking key (guard-1665 step 2)
    Check: Step 3.5d reviews pending proposals from `convention-changes.jsonl` for auto-apply maturity
    Check: Step 3.5d checks confidence >= threshold OR reinforcement_count >= 2 before auto-applying
    Check: Step 3.5f logs health snapshot to `evolution-log.jsonl`
@@ -4500,11 +4704,11 @@ sys.exit(1)
    Bash: bash core/scripts/aspiration-trajectory.sh asp-282 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); v=d.get('current_velocity',0); assert v>0, f'velocity={v}'; print(f'PASS: asp-282 velocity={v:.2f}')" || { echo "FAIL: asp-282 velocity=0 — script_convention_attribution wiring broken"; exit 1; }
 
    # Pre-formation calibration gate evidence checks (Section CG)
-   Check: `aspirations-spark/SKILL.md` sq-009 handler has Step 0.5 with `pipeline-read.sh --stage resolved`
+   Check: `aspirations-spark/SKILL.md` sq-009 handler has Step 0.5 fetching BOTH `pipeline-read.sh --stage resolved` AND `pipeline-read.sh --stage archived` (asserting only the resolved half — as this line did until g-115-4866 — pins the SURVIVORSHIP FILTER as the contract, and would have kept passing green while the gate scored 9.4% of the store; the executable form is the `sibling-calibration-population` Bash check further down)
    Check: `aspirations-spark/SKILL.md` Step 0.5 has "If total == 0: SKIP gate" (zero-data guard)
    Check: `aspirations-spark/SKILL.md` Step 0.5 confidence ceiling uses explicit boundary operators (>= and <), not ambiguous ranges
    Check: `aspirations-spark/SKILL.md` sq-009 handler has Step 0.7 "Adversarial pre-mortem" with confidence > 0.65 threshold
-   Check: `aspirations-spark/SKILL.md` Step 0.5 does NOT read `confidence_calibration_bias` (single source of truth: resolved pipeline records)
+   Check: `aspirations-spark/SKILL.md` Step 0.5 does NOT read `confidence_calibration_bias` (single source of truth: the resolved+archived pipeline record UNION — the store, not the `resolved` stage; g-115-4866 tightened this parenthetical because "resolved pipeline records" reads as the stage name and is exactly how the narrow denominator gets re-derived)
    Check: `hypothesis-conventions.md` has "Pre-Formation Calibration Gate" section
 
    # Session 32 retrospective guardrail evidence checks (Section RG)
@@ -4710,14 +4914,67 @@ sys.exit(1)
    # alone is a SURVIVORSHIP FILTER: resolved is the small live holding area and
    # records migrate to `archived` as they age, so most scoreable
    # CONFIRMED/CORRECTED records sit in archived. Measured 2026-07-28: 393 of the
-   # 435 scoreable records (90.3%) were archived, and Mode 3 was the ONLY consumer
-   # in the repo carrying the resolved-only filter (pipeline meta, precheck-eval.py
-   # and tree-accuracy-sync.py all read the union correctly).
+   # 435 scoreable records (90.3%) were archived.
+   # CORRECTION (g-115-4866, 2026-08-04): this comment used to end "and Mode 3 was
+   # the ONLY consumer in the repo carrying the resolved-only filter". That was
+   # FALSE, and believing it is what let the class spread — g-115-3595 examined 20
+   # rate-computing SKILL.md steps across a 97-file corpus and found FOUR more
+   # (aspirations-spark 0.5a, aspirations-all-blocked R3, reflect-on-self Step 1,
+   # agent-completion-report Step 4), all fixed under g-115-4866 and pinned by the
+   # sibling check below. Two further NON-rate consumers of the same wrong proxy
+   # were tracked separately: g-115-4558 (--unreflected scans stage==resolved, so
+   # 156 UNRESOLVABLE records that route straight to archived can never be
+   # reflected on) is STILL OPEN; reflect-on-outcome Step 2.6 was FIXED under
+   # g-115-4715 on 2026-08-06, together with two more sites that same enumeration
+   # surfaced (decompose/SKILL.md:130, core/config/architecture-reference.md:132).
+   # Those three are NOT yet pinned by a check — g-115-5168 carries them. Leaving
+   # this comment naming Step 2.6 as unfixed is what would send the next reader to
+   # re-fix it (rb-6976, guard-2923: a stale premise reads as a live one). The union
+   # IS read correctly by pipeline meta, precheck-eval.py and tree-accuracy-sync.py.
+   # Do not re-assert containment here without re-running that corpus sweep.
    # Scoped to the Mode 3 section deliberately: an unscoped grep for
    # "stage archived" passes off any unrelated mention elsewhere in the file, and
    # would keep passing while Step 1 itself regressed. Asserts BOTH fetches --
    # archived-only is equally wrong (it drops the live resolved remnant).
    Bash (review-hypotheses-accuracy-population): sec=$(awk '/^## Mode 3: Accuracy Report/,/^## Mode 4/' .claude/skills/review-hypotheses/SKILL.md); r=$(printf '%s' "$sec" | grep -c 'pipeline-read.sh --stage resolved'); a=$(printf '%s' "$sec" | grep -c 'pipeline-read.sh --stage archived'); test "$r" -ge 1 -a "$a" -ge 1 && echo "PASS: review-hypotheses Mode 3 accuracy population fetches BOTH resolved and archived (resolved=$r archived=$a)" || echo "FAIL: review-hypotheses Mode 3 Step 1 fetches resolved=$r archived=$a — a resolved-only fetch computes the accuracy rate on the small recent remnant and reports it as the whole population (g-115-3594). Restore the paired pipeline-read.sh --stage archived fetch."
+
+   # Sibling survivorship guard — the SAME defect at the 4 sites g-115-3595 found
+   # (g-115-4866). Each is section-scoped for the reason the check above gives: an
+   # unscoped grep passes off any unrelated mention elsewhere in the file and would
+   # keep passing while the step itself regressed. Mutation-tested at authoring in
+   # BOTH forms: deleted in-section archived fetch -> all 4 FAIL; same deletion PLUS
+   # a decoy `--stage archived` appended outside every section -> whole-file grep
+   # counts 1 (a vacuous unscoped check would PASS) while all 4 still FAIL.
+   # The second form is the load-bearing one and the first cannot substitute for it:
+   # each file holds exactly ONE occurrence of the token, so under form 1 an anchored
+   # check and a vacuous one go red identically and the proof would certify both
+   # (guard-2137). Form 2 is what establishes the scoping. (guard-329 / guard-574 /
+   # guard-1636 both-directions.)
+   # READING A FAILURE: `resolved=1 archived=0` is a REAL regression — the step
+   # dropped its archived fetch. `resolved=0 archived=0` means the awk section ANCHOR
+   # stopped matching (a renamed header), NOT a population bug; the FAIL text's
+   # "fetch resolved-only" wording does not apply — repair the anchor instead.
+   # WHY IT MATTERS, measured 2026-08-04T03:33 (bravo, cc-05, 6.8.0-136-generic):
+   # resolved 86 vs archived 829 = 9.4% of a 915-record store; resolved-only scores
+   # 62.4% (cap 0.80) where the union scores 55.5% (cap 0.65) — the spark and
+   # all-blocked sites feed that ceiling, so the defect moves it a FULL BAND.
+   # EXTENDED to 7 sites (g-115-5168, 2026-08-08). The 3 added sites pair the two
+   # stages in PROSE/TABLE form rather than as executed commands, which is why they
+   # were missed: they teach the paired fetch to a reader, so a survivorship
+   # regression there propagates to every future author rather than to one run.
+   # THE 4TH ARG EXISTS FOR A MEASURED REASON — do not drop it when adding a site.
+   # architecture-reference.md:132 writes the pair as `pipeline-read.sh --stage
+   # resolved` AND a BARE `--stage archived` (no wrapper name on the second token),
+   # so the strict archived pattern the other 6 sites use scores archived=0 there.
+   # Measured before wiring: decompose 1/1, reflect-on-outcome 1/1, arch-ref 1/0.
+   # A copy of the block WITHOUT this arg would have shipped a check that can never
+   # pass — permanently red, and red for a formatting difference rather than a real
+   # survivorship bug, which is exactly how a check earns the override reflex.
+   # The relaxation is per-site and deliberate: the other 6 keep the strict form, so
+   # dropping `pipeline-read.sh` at those sites still REGRESSES. Blanket-relaxing all
+   # 7 to the bare token was rejected — it would silently accept a prose mention of
+   # `--stage archived` that no longer names the reader.
+   Bash (sibling-calibration-population): f=""; c() { s=$(awk "$2" "$1"); ap="${4:-pipeline-read.sh --stage archived}"; r=$(printf '%s' "$s" | grep -c 'pipeline-read.sh --stage resolved'); a=$(printf '%s' "$s" | grep -c -e "$ap"); if [ "$r" -ge 1 ] && [ "$a" -ge 1 ]; then echo "  ok $3 (resolved=$r archived=$a)"; else echo "  REGRESSED $3 (resolved=$r archived=$a)"; f="$f $3"; fi; }; c .claude/skills/aspirations-spark/SKILL.md '/^0\.5\. Calibration gate/,/^0\.7\./' spark-0.5a; c .claude/skills/aspirations-all-blocked/SKILL.md '/# R3 Hypothesis Formation:/,/# Add to pipeline/' all-blocked-R3; c .claude/skills/reflect-on-self/SKILL.md '/^## Step 1: Load the Full Resolved Population/,/^## Step 2/' reflect-on-self-step1; c .claude/skills/agent-completion-report/SKILL.md '/^4\. Hypotheses resolved since last report/,/^5\. Overall pipeline/' completion-report-step4; c .claude/skills/decompose/SKILL.md '/^## Step 4: Context Selection/,/^## Step 5/' decompose-step4; c .claude/skills/reflect-on-outcome/SKILL.md '/^## Step 2\.6: Contrastive Extraction/,/^## Step 2\.7/' reflect-on-outcome-step2.6; c core/config/architecture-reference.md '/^## Memory Taxonomy/,/^## Session End Protocol/' arch-ref-memory-taxonomy '--stage archived'; [ -z "$f" ] && echo "PASS: all 7 sibling calibration/mining sites fetch BOTH resolved and archived (g-115-4866, extended g-115-5168)" || echo "FAIL:$f fetch resolved-only — the rate/population is computed on the small recent remnant (g-115-4866). Restore the paired pipeline-read.sh --stage archived fetch."
 
    # Pipeline stage enum drift-watchdog (rb-363)
    # VALID_STAGES in pipeline.py, empty_meta() stage_counts keys (same file), and the
@@ -5638,6 +5895,22 @@ else:
 
    # MAC14: Session-end claim release
    Check: `aspirations-consolidate/SKILL.md` has Step 8.9 with `aspirations-release.sh` for held claims
+   Check: `aspirations-consolidate/SKILL.md` Step 8.9 threads the queue through the release —
+          grep for the literal `aspirations-release.sh <goal-id> --source {goal.source}` (g-306-258).
+          POSITIVE form on purpose. The regression this pins is the world-only shape
+          (`FOR EACH returned goal WHERE source == "world"` + a sourceless release), and the
+          obvious check — assert that string is ABSENT — is guard-1099: Step 8.9's own comment
+          NAMES the old form in order to retract it, so an absence-check reports the defect as
+          live forever. Assert what the fix must CONTAIN, never what it must lack.
+   Check: `core/config/consolidation-housekeeping.md` Step 8.9 carries the same `--source {goal.source}`
+          form (the digest copy drifted from this one; both must move together)
+   Check: `aspirations-execute/SKILL.md` pre-claim precondition-unmet branch threads the queue through
+          its release — grep for the literal `aspirations-release.sh {goal.id} --source {source}`
+          (g-306-261). Same POSITIVE form and same guard-1099 reason as the two checks above: that
+          branch's own comment names the bare shape in order to retract it, so an absence-check would
+          report the defect as live forever. This is the THIRD executable release site — MAC14 pinned
+          only the two consolidate-side ones, and its general title ("Session-end claim release") let
+          this branch inherit the group's reassurance without its coverage.
 
    # MAC15: Shared team state
    Check: `core/scripts/team-state.py` exists with read, update, init subcommands
@@ -6000,6 +6273,17 @@ else:
    # session-snapshot.sh's JSON output. Keep it that way — duplication drifts silently.
    Check: `.claude/skills/start/SKILL.md` Step 0.7 does NOT contain the literal string `startswith("- file:")` (which would indicate an inline YAML parser re-appeared). Bash: `grep -c 'startswith("- file:")' .claude/skills/start/SKILL.md` must be 0.
    Check: `.claude/skills/start/SKILL.md` Step 0.7 references `session-snapshot.sh --output json` (the canonical bash wrapper around session_snapshot.py — keeps a single manifest-parser path). Bash: `grep -c "session-snapshot.sh.*--output.*json" .claude/skills/start/SKILL.md` must be >= 1.
+
+   # CW1b cross-box worker: the manifest write must carry the remote-reducer SENTINEL.
+   # The body-manifest SIDE of this is pinned by 13 tests in test_body_manifest_remote_worker.py
+   # (mutation-proven negative control). What no test can reach is the CALL SITE — start/SKILL.md
+   # is LLM-executed pseudocode, never collected. Drop the flag there and every test stays green
+   # while the cross-box worker silently stops forking its working memory, so a worker box mutates
+   # the agent-wide working-memory.yaml (sync_tier continuity, LWW) against a live reducer and both
+   # sides' writes destroy each other with no error. The fix is tested; its invocation is not.
+   # Anchored on the LITERAL, not a line number: the filer recorded lines 916/917 and it now sits at
+   # 940/941 — a line-anchored check would already have rotted (g-115-4681, g-306-119-a).
+   Check: `.claude/skills/start/SKILL.md` CW1b carries the literal `--reducer-sid remote`. Bash: `bash -c "grep -c -F -- '--reducer-sid remote' .claude/skills/start/SKILL.md"` must be >= 1.
 
    # SFM3: Desync check is advisory-only (never blocks)
    Bash: `bash core/scripts/session-desync-check.sh; echo "exit=$?"` — exit MUST be 0 regardless of warnings
@@ -6715,7 +6999,7 @@ else:
    Check: capability-gate.py _decision ladder has NO duplicate 'pass' branch. Bash: `grep -cE 'approval_kind == "evidence":\s*$' core/scripts/capability-gate.py` → verify ≤1 (one reference in comments is fine; a second branch in the _decision ladder would indicate the dead-branch regression)
    Check: learning-routing drift stable or ratcheted down. Bash: `bash core/scripts/learning-routing-ratchet.sh` → expect exit 0 and a status line starting with `[learning-routing-ratchet] STABLE:` or `RATCHETED:`. A `REGRESSED:` line means new dangling cross-refs were introduced since the last baseline recorded in `meta/audit-baselines.yaml` — run `bash core/scripts/learning-routing-audit.sh` to inspect, then `bash core/scripts/learning-routing-repair.sh --apply` if the new drift is historical. Hard-gate with `VERIFY_LEARNING_DRIFT_HARD_GATE=1` env var if ever wanted.
    Check: eviction-conservation phantom excess stable or ratcheted down (g-115-2505; resurrection-double-count tripwire from g-115-2503). Bash: `bash core/scripts/eviction-conservation-ratchet.sh` → expect exit 0 and a status line starting with `[eviction-conservation-ratchet] STABLE:` or `RATCHETED:`. A `REGRESSED:` line means a NEW resurrection double-count landed since the baseline in `meta/audit-baselines.yaml` (seeded 2026-07-17 at 42 across 4 historical violations) — inspect with `py -3 core/scripts/aspirations-evict-completed.py --source world --audit`; repair via `--repair-census --apply` only after understanding the source. Baselines instead of exit-0 because historical drift pre-dates the check (audit-baselines.md). Same `VERIFY_LEARNING_DRIFT_HARD_GATE=1` opt-in.
-   Check: SKILL.md→wrapper flag mismatches stable or ratcheted down (g-115-3112). Bash: `py -3 core/scripts/skillmd-flag-audit.py --ratchet` → expect exit 0 and `[skillmd-flag-ratchet] STABLE:` or `RATCHETED:`. A `REGRESSED:` line means a SKILL.md now instructs a `Bash:` call that passes a flag the invoked `core/scripts` wrapper's own parser does not accept — the failure is SILENT at the worst call sites (the wrapper errors, stdout is empty, and a suppression gate reads empty as "nothing found" and proceeds — guard-487). Inspect with `py -3 core/scripts/skillmd-flag-audit.py` (add `--show-skips` for coverage accounting). Baseline seeded 2026-07-25 at 12, ratcheted to **2** the same day by g-115-3117 (7 verified-real call sites fixed; 1 more — `pending-questions-read.sh --prefix` — fixed concurrently by a partner and picked up on pull; 2 reclassified as prose FPs on close reading). The remaining 2 are the FLOOR, not debt: both name a flag belonging to a DIFFERENT command on the same line — `:2940` (`--learn` is `/review-hypotheses`') and `:5138` (`--backlog` is `/tree maintain`'s; the tree.py flag it names, `--backlog-mode`, is real). Do not "fix" them. Expect 2; investigate any increase. Baselines instead of exit-0 because the drift pre-dates the check (audit-baselines.md). Same `VERIFY_LEARNING_DRIFT_HARD_GATE=1` opt-in.
+   Check: SKILL.md→wrapper flag mismatches stable or ratcheted down (g-115-3112). Bash: `py -3 core/scripts/skillmd-flag-audit.py --ratchet` → expect exit 0 and `[skillmd-flag-ratchet] STABLE:` or `RATCHETED:`. A `REGRESSED:` line means a SKILL.md now instructs a `Bash:` call that passes a flag the invoked `core/scripts` wrapper's own parser does not accept — the failure is SILENT at the worst call sites (the wrapper errors, stdout is empty, and a suppression gate reads empty as "nothing found" and proceeds — guard-487). Inspect with `py -3 core/scripts/skillmd-flag-audit.py` (add `--show-skips` for coverage accounting). **RE-SEEDED at 5 on 2026-08-10** (bravo, cc-05, uname -r 6.8.0-136-generic, g-115-3122) — expect **5**, investigate any increase. This replaces a prior "seeded at 12, ratcheted to **2**; expect 2" that had gone doubly wrong: the key `skillmd_flag_mismatches` was ABSENT from `meta/audit-baselines.yaml` entirely (echo 2026-08-02, re-confirmed 2026-08-10), so `_ratchet` took its `prior is None` branch and reported SEEDED on every run — never REGRESSED, exit 0 even under the hard gate, i.e. passing while comparing against nothing (guard-487 / rb-245 vacuous zero); and the live count had been 5, not 2, since at least 2026-08-02 with every quoted line number drifted. All 5 are the FLOOR, not debt — each names a flag belonging to a DIFFERENT command on the same line, so do NOT "fix" them: `aspirations-spark:1133` (`--no-edit` is `git merge`'s), `fresh-eyes-program:244` (`--channel` is `board-post.sh`'s, on a COMMENT line), `verify-learning:3314` (`--learn` is `/review-hypotheses`'), `verify-learning:5830` (`--backlog` is `/tree maintain`'s; the tree.py flag it names, `--backlog-mode`, is real), `verify-learning:7651` (`--cached`/`--numstat` are `git diff`'s). Seeded only AFTER all six g-115-3122 fixes landed together, per that goal's sequencing rule (FIX 1/2/4 narrow the surface, FIX 5/6 widen it — a floor set from a partial landing encodes a transient); do NOT re-seed on a partial change. `UNIVERSAL_FLAGS` still suppresses `--source`/`--agent`/`--json`/`--output` on every call site on an assumption measured FALSE (10.7–24.4% acceptance, not "essentially every wrapper") — g-115-5697 owns that and WILL move this floor. Baselines instead of exit-0 because the drift pre-dates the check (audit-baselines.md). Same `VERIFY_LEARNING_DRIFT_HARD_GATE=1` opt-in.
 
    # Feedback-signal pipeline health (Section FP — rb-472 + guard-415, 2026-04-23)
    # Three independent probes for the three failure layers diagnosed during Plan B/A/C.
@@ -7377,16 +7661,23 @@ else:
    Bash (no-unredacted-aws-key-ids): HITS=$(git grep -nE 'AKIA[0-9A-Z]{16}' HEAD -- . 2>/dev/null | grep -v 'AKIAIOSFODNN7EXAMPLE' | head -5); test -z "$HITS" && echo "PASS: no unredacted AWS access-key IDs in tracked content at HEAD" || echo "FAIL: unredacted AWS access-key ID(s) in COMMITTED content: $HITS — the pre-commit secrets gate reads git diff --cached and is structurally blind to already-committed keys, so nothing else catches these (g-115-3674, rb-5512)"  # secret-scanner: skip — the excluded literal is the AWS PUBLISHED example key, not a credential; same per-line marker core/scripts/tests/test_knowledge_projection.py already uses for it. Least-broad of the three documented bypasses. Trailing `#` is an ordinary bash comment and does not affect the check when extracted and run.
 
    # SQ18-B2 (g-115-3521) — every file_replace rule names a seed-template source that EXISTS.
-   # A file_replace rule in core/config/seed-manifest.yaml whose source is missing causes its
-   # target to NOT PROMOTE AT ALL, silently: the plant emits only a WARN carrying a COUNT (not
-   # the filenames) inside a multi-thousand-line log, while the overall verdict still reads
-   # success. THIS CHECK IS EXPECTED RED TODAY, naming 5 — that is correct, not a defect in
-   # the check. g-115-3474 is the corrective goal that turns it green; after it lands this
-   # becomes a tripwire against re-introduction rather than a report of known debt.
-   # NOTE THE RECURSION: verify-learning/SKILL.md is ITSELF one of the five frozen targets, so
-   # this check reaches the seed frontier only until g-115-3474 resolves. A detector that
-   # cannot promote itself is precisely the self-concealing property that let the defect live.
-   Bash (seed-file-replace-sources-exist): MISSING=$(py -3 -c "import yaml,os;m=yaml.safe_load(open('core/config/seed-manifest.yaml',encoding='utf-8'));print(' '.join(t.get('source','') for t in (m.get('transformations') or []) if t.get('type')=='file_replace' and t.get('source') and not os.path.exists(t['source'])))" 2>/dev/null); test -z "$MISSING" && echo "PASS: every file_replace rule in seed-manifest.yaml names an existing seed-templates source" || echo "FAIL: file_replace rule(s) with a MISSING source — each target silently does not promote at all, and the plant reports only a count, not these names: $MISSING (tracked remedy: g-115-3474; guard g-115-3521)"
+   # GREEN since 2026-08-01 (g-115-3474): the 5 rules this check named were REMOVED, and only
+   # F1/F2 remain, both with real sources. It is now a re-introduction tripwire, not known debt.
+   #
+   # THE PREMISE THIS BLOCK USED TO CARRY WAS FALSE, and the correction is the reusable part.
+   # It said a missing source makes the target "NOT PROMOTE AT ALL, silently" — frozen
+   # downstream. Measured false. A missing source has TWO behaviors, neither of them that:
+   #   - WITHOUT `pending_template` — apply_file_replace RAISES FileNotFoundError, so the
+   #     plant fails LOUD. This check's value is catching it before that crash, not after.
+   #   - WITH `pending_template: true` — select_rules_for_file DROPS the file_replace
+   #     (_seed_transforms.py:470) and the file falls through to the ordinary
+   #     inline_edit + global_regex + word_list_strip chain. It DOES promote, transformed.
+   # Proof: deleting the 5 rules left transform output BYTE-IDENTICAL (sha256, all five).
+   # The false premise came from a stale manifest comment ("skill skips with WARN until
+   # template lands") describing pre-2026-05-19 behavior, and it propagated into this check's
+   # FAIL text and into a HIGH goal. A count-only WARN is what made the wrong reading
+   # plausible — seed-transplant.sh now NAMES the files instead.
+   Bash (seed-file-replace-sources-exist): MISSING=$(py -3 -c "import yaml,os;m=yaml.safe_load(open('core/config/seed-manifest.yaml',encoding='utf-8'));print(' '.join(t.get('source','') for t in (m.get('transformations') or []) if t.get('type')=='file_replace' and t.get('source') and not os.path.exists(t['source'])))" 2>/dev/null); test -z "$MISSING" && echo "PASS: every file_replace rule in seed-manifest.yaml names an existing seed-templates source" || echo "FAIL: file_replace rule(s) with a MISSING source: $MISSING — if the rule carries pending_template the target still promotes via the inline+global chain (check its residual); if it does NOT, the plant will CRASH with FileNotFoundError at apply_file_replace. Author the source or drop the rule (g-115-3521; precedent g-115-3474)"
 
    # SQ18-B3 (g-115-3479) — the gradle-tests gate stays WIRED and still DENIES.
    # The gate catches a --tests pattern that matches ZERO tests while Gradle reports no error,
@@ -7817,6 +8108,27 @@ else: print(f'FAIL: insight-trigger sweep scanned {len(cs)} channel(s) {cs} -- a
 import json,sys
 d=json.load(sys.stdin); miss=[k for k in ('archive_read_failed','archive_degraded') if k not in d]
 print('PASS: blocked-signal-resolution-check emits both archive fold-in fingerprint keys' if not miss else 'FAIL: missing archive fingerprint key(s) '+', '.join(miss)+' -- these are emitted ONLY by the archive fold-in path, so their absence means the archive read was dropped and blocked goals whose block signal lives in an archived aspiration are invisible again. A grep for archive=True cannot catch this: a discarded result greps identical to a folded one (g-115-3933, guard-1082)')"
+
+   # Dependency cycles in the blocked_by GRAPH (g-115-3875). A ring — X blocked_by Y,
+   # Y blocked_by X — passes every single-EDGE check simultaneously, because each edge
+   # is individually well formed and nothing else inspects the shape they make together.
+   # It then vanishes from the selector's candidate list AND from its blocked-work
+   # reporting, so it is invisible from every angle at once; the only escape is the 48h
+   # fail-open, which releases BOTH goals and looks like an ordinary unblock.
+   # ASSERTS THE POPULATION, NOT ONLY THE VERDICT — and that is the load-bearing half.
+   # `cycles_found == 0` is exactly what a sweep that read nothing also reports, so a
+   # zero alone would make this check pass forever the moment the daemon read breaks
+   # (rb-245; guard-1922: a condition whose signal is not durably readable retires
+   # itself silently, always as a pass). Gating on goals_scanned > 0 is what makes the
+   # zero falsifiable. NOT piped through `2>/dev/null`: stderr never enters a pipe
+   # anyway, and redirecting it into a parser is the guard-1675 shape.
+   Bash (dependency-cycle-free): bash core/scripts/dependency-cycle-check.sh --output json | py -3 -c "
+import json,sys
+d=json.load(sys.stdin)
+n=d.get('goals_scanned',0); c=d.get('cycles_found',-1)
+if n<=0: print('FAIL: dependency-cycle-check scanned 0 goals -- this is a READ FAILURE, not a clean queue; a cycles_found of 0 here proves nothing (g-115-3875)')
+elif c!=0: print('FAIL: '+str(c)+' dependency cycle(s) across the world+agent queues -- every goal in a ring is frozen AND invisible to the selector and its blocked-work reporting: '+'; '.join(' -> '.join(g['goal_id'] for g in cy['goals']) for cy in d.get('cycles',[])[:3])+'. Resolve by READING the goals (a goal calling itself a PREREQUISITE cannot depend on its dependent), never by breaking the cheapest edge')
+else: print('PASS: no dependency cycles ('+str(n)+' goals scanned, '+str(d.get('goals_with_edges',0))+' carry edges, '+str(d.get('dangling_count',0))+' dangling'+(', ARCHIVE DEGRADED so dangling is unreliable' if d.get('archive_degraded') else '')+')')"
 
    # SQ18-D20 (g-001-68, zeta) — the precheck battery-scope note must not justify the
    # health-regression exclusion by DORMANCY while the subsystem is LIVE. That note
@@ -8365,6 +8677,165 @@ if has_caveat and has_named:
 else:
     print("FAIL: the replay Step 3 batch-is-not-corpus caveat has drifted -- caveat marker present=" + str(has_caveat) + ", names replay_priority_order=" + str(has_named) + ". Without it Step 3 reads as though batch rates are corpus rates, and its \">10pp from historical average\" flag reports the violation-first SELECTION as a strategy signal. A whole-file grep would not catch this: replay_priority_order also appears in Step 1 where the batch is selected (guard-2129, g-115-4149 round 11)")'
 
+   # Worker spark-replay provenance — BOTH branches must record (g-306-251, zeta)
+   # The Worker Spark Replay block writes an execution-diary record on the FIRE branch
+   # AND on the EMPTY branch. The EMPTY one is the fragile half: it looks like a no-op
+   # logging a non-event, so it is the likeliest to be tidied away by a future editor —
+   # and deleting it silently reverts the whole fix. Per guard-2352 a recorder present
+   # only on the fire path is absent exactly on the population you need it for, so a
+   # zero-hit grep can no longer distinguish "the consumer ran and had nothing to
+   # replay" from "the consumer never ran at all". Measured 2026-08-07 (zeta, cc-02):
+   # before the fix that question was undecidable — 0 hits fleet-wide across every
+   # journal, experience file and execution diary, with no way to tell which zero it was.
+   # NOT PINNABLE BY A TEST: the block is LLM-executed pseudocode, so no pytest can
+   # assert compliance; a grep on the SKILL.md text is the only available pin.
+   # SECTION-SCOPED for the reason the siblings give: a decoy occurrence anywhere else
+   # in the file must not satisfy it. Pre-wiring measurement 2026-08-08 (alpha, cc-04,
+   # 6.8.0-136-generic): checked-0=1, FIRED=1, whole-file total=2 — green at authoring,
+   # so this ships pinning a true state rather than born red.
+   Bash (spark-worker-replay-provenance): sec=$(awk '/^### Worker Spark Replay/,/^## Spark Check/' .claude/skills/aspirations-spark/SKILL.md); e=$(printf '%s' "$sec" | grep -c 'worker-spark-replay: checked, 0 observations'); f=$(printf '%s' "$sec" | grep -c 'worker-spark-replay: FIRED'); test "$e" -ge 1 -a "$f" -ge 1 && echo "PASS: Worker Spark Replay records provenance on BOTH branches (empty=$e fired=$f)" || echo "FAIL: Worker Spark Replay provenance record missing — empty-branch=$e fired-branch=$f (both must be >=1). Dropping the EMPTY-branch record (\"worker-spark-replay: checked, 0 observations\") makes a later zero-hit grep undecidable between 'ran, nothing to replay' and 'never ran' (g-306-251, guard-2352). Restore the execution-diary append on that branch."
+
+   # CORRECTED exemption must stay REACHABLE, not merely present (g-001-01, alpha)
+   # guard-2724's PROCESS-DEFECT OVERRIDE lives INSIDE Step 2.5's CORRECTED branch. The
+   # session-horizon lightweight path skipped Step 2.5 unless surprise >= 7 and then
+   # RETURNed, so on that path the override was STRUCTURALLY UNREACHABLE — the outer
+   # `surprise` proxy gated away the very check written to see past the inner
+   # `confidence` proxy. Fixed 2026-08-08 (commit 12c20155). The regression is silent
+   # and self-concealing: an editor tidying the skip line back to its one-line form
+   # re-severs the rail while the path still runs and nothing fails — it just stops
+   # reaching the override. Two measured pre-fix instances, both session/CORRECTED under
+   # the gate, produced artifacts ONLY because the agent reached past its own path.
+   # WHY TWO CONDITIONS AND NOT ONE: a bare grep for "EXCEPT when" would fail OPEN if
+   # the override were later moved OUT of Step 2.5 — a legitimate refactor that makes
+   # the exemption unnecessary. Keying the assertion on the override's OWN presence
+   # keeps the check honest under that refactor instead of demanding a line no longer
+   # needed. So this is conditional, not unconditional.
+   # SCOPE IS TIGHT AND THAT IS LOAD-BEARING: the search runs from `IF horizon ==
+   # "session":` to `IF horizon == "short"`, NOT the whole Horizon Gate section. The
+   # prose subsection "Why CORRECTED is exempt from the surprise gate" sits OUTSIDE that
+   # range and is full of the token CORRECTED — scoping to the section would let that
+   # prose satisfy the assertion while the executable skip line regressed.
+   # NOT PINNABLE BY A TEST (probed, not assumed): 0 hits for "PROCESS-DEFECT" or
+   # "guard-2724" across core/scripts/tests, core/tests/gates and mind_api/tests
+   # (2026-08-08, alpha, cc-04). The 4 test files matching "reflect-on-outcome"
+   # reference the skill name incidentally and assert nothing about Step 2.5.
+   # SCOPE LIMIT, so a successor does not over-claim: this pins ONE instance. The CLASS
+   # — rb-7122, "a rail placed INSIDE a step is only as reachable as the coarser proxy
+   # that gates that step" — is not greppable, and no check here should claim to cover it.
+   Bash (reflect-corrected-exemption-reachable): py -3 -c 'import sys
+from pathlib import Path
+F=Path(".claude/skills/reflect-on-outcome/SKILL.md")
+if not F.exists():
+    print("FAIL: .claude/skills/reflect-on-outcome/SKILL.md is missing — the CORRECTED-exemption reachability rail cannot be evaluated (g-001-01)")
+    sys.exit(0)
+lines=F.read_text(encoding="utf-8").splitlines()
+if not any("PROCESS-DEFECT OVERRIDE" in l for l in lines):
+    print("PASS (vacuous): reflect-on-outcome carries no PROCESS-DEFECT OVERRIDE, so no session-horizon exemption is required — the override was removed or relocated, which is a legitimate refactor (g-001-01)")
+    sys.exit(0)
+start=[i for i,l in enumerate(lines) if l.strip().startswith("IF horizon == \"session\"")]
+end=[i for i,l in enumerate(lines) if l.strip().startswith("IF horizon == \"short\"")]
+if not start or not end or end[0] <= start[0]:
+    print("FAIL: cannot locate the session-horizon block (`IF horizon == \"session\":` through `IF horizon == \"short\"`) in reflect-on-outcome/SKILL.md — the lightweight path was renamed or restructured, so the CORRECTED exemption has no home and its reachability cannot be verified (g-001-01)")
+    sys.exit(0)
+sec="\n".join(lines[start[0]:end[0]])
+has_except="EXCEPT when" in sec
+has_corrected="CORRECTED" in sec
+if has_except and has_corrected:
+    print("PASS: the session-horizon skip line carries the CORRECTED exemption, so guard-2724 PROCESS-DEFECT OVERRIDE stays reachable on that path")
+else:
+    print("FAIL: PROCESS-DEFECT OVERRIDE is present but the session-horizon skip line lost its exemption — EXCEPT-when=" + str(has_except) + " CORRECTED=" + str(has_corrected) + ". Step 2.5 is then skipped for surprise<7 and RETURNs, making guard-2724 STRUCTURALLY UNREACHABLE on the session path while nothing fails loudly (g-001-01, commit 12c20155, rb-7122). Restore the \"EXCEPT when outcome == CORRECTED\" clause, or move the override out of Step 2.5.")'
+
+   # Boot handoff-currency gate WIRING (g-115-4671, zeta)
+   # The gate's FUNCTION is pinned by core/scripts/tests/test_handoff_currency.py (10
+   # tests); its WIRING is pinned by nothing. The call lives in a markdown skill file no
+   # pytest collects, so deleting the sub-step leaves the whole suite green while
+   # crash-recovered boots silently resume on 11-13d stale handoffs again. This is the
+   # guard-1943 / guard-2323 class — a green suite certifies the FUNCTION, never the
+   # WIRING — with a measured live blast radius: 4 of 5 fleet agents were carrying stale
+   # S3 handoff objects at filing (foxtrot 11.2d, verified in-turn against the real
+   # backend object, not the local mirror).
+   # SECTION-SCOPED to Step 0.5 so an unrelated mention elsewhere in boot/SKILL.md
+   # cannot satisfy it. Pre-wiring measurement 2026-08-08 (alpha, cc-04): 1 in-section
+   # hit at L180, whole-file total 1 — green at authoring.
+   Bash (boot-handoff-currency-wiring): sec=$(awk '/^## Step 0\.5: Continuation Detection/,/^## Step 1\.5/' .claude/skills/boot/SKILL.md); n=$(printf '%s' "$sec" | grep -c 'handoff-currency-check.sh'); test "$n" -ge 1 && echo "PASS: boot Step 0.5 invokes handoff-currency-check.sh (in-section hits=$n)" || echo "FAIL: boot Step 0.5 no longer invokes handoff-currency-check.sh (in-section hits=$n) — the currency gate is unwired, so a crash-recovered boot resumes on a stale handoff with the full test suite still green (g-115-4671, guard-1943/guard-2323 wiring-vs-function class). Restore the sub-step 1a call."
+
+   # No bare exec-of-sibling in framework shell wrappers (g-115-4472, back-port of omni g-001-309)
+   # 9 agent-aspirations-*.sh wrappers used a BARE exec of a sibling script path. That
+   # requires the +x bit, which git ships as 100644 — a Linux-only rc=126 silent death
+   # that left 79 queued goals invisible at ZDS. Fix pattern is `exec bash <sibling>`
+   # (167c6cdd6); guard-2271 is the authoring-time rail, rb-6291/rb-3034 carry the
+   # mechanism. This closes the DETECTIVE layer: a NEW wrapper authored with bare exec
+   # re-introduces the class SILENTLY, because the Windows authoring box emulates the
+   # execute bit and never fails there.
+   # THE PREDICATE IS CONTENT-ONLY, AND THAT IS THE WHOLE DIFFICULTY. The obvious
+   # `grep -nE '^\s*exec' core/scripts/*.sh | grep '\.sh'` is WRONG: grep -n prefixes
+   # every line with the FILENAME, which itself ends in .sh, so the second grep matches
+   # the filename rather than the exec target. Measured at authoring (alpha, cc-04,
+   # 2026-08-08): that form reported 4 violations, ALL FOUR false positives —
+   # `exec "$resolved"` in _paths.sh, two `exec $PY <file>.py` lines, and
+   # `exec 2>/dev/null` in presence-tick.sh. Same defect class this file already
+   # documents six instances of: an unanchored predicate satisfied by something other
+   # than the thing under test. Hence a line-content scan, an explicit redirect
+   # exclusion, and an interpreter allow-list that accepts `$PY`-style variables.
+   # POSITIVE-CONTROLLED so the zero means something (rb-245, guard-1419): at authoring,
+   # a synthetic `exec "$(cd ... && pwd)/sibling.sh"` and a synthetic `exec "$VAR/x.sh"`
+   # were BOTH caught, while the correct `exec bash "$(cd ...)/sibling.sh"` was ignored.
+   # Live corpus at authoring: 0 violations against 11 correct forms — a true zero.
+   Bash (no-bare-exec-of-sibling): py -3 -c "import re, glob
+INTERP = re.compile(r'^exec\s+(bash|sh|dash|zsh|python3?|py|env|\"?\\\$\{?[A-Za-z_][A-Za-z0-9_]*\}?\"?)\s')
+REDIR  = re.compile(r'^exec\s*[0-9]*[<>&]')
+viol = []
+for f in sorted(glob.glob('core/scripts/*.sh')):
+    try: lines = open(f, encoding='utf-8', errors='replace').read().splitlines()
+    except OSError: continue
+    for i, line in enumerate(lines, 1):
+        s = line.strip()
+        if not s.startswith('exec'): continue
+        if REDIR.match(s) or INTERP.match(s): continue
+        if '.sh' in s: viol.append('%s:%d' % (f, i))
+if viol:
+    print('FAIL: %d framework wrapper(s) exec a sibling .sh with no explicit interpreter: %s — this needs the +x bit that git ships as 100644, so it dies rc=126 on Linux while the Windows authoring box emulates the bit and never fails (g-115-4472, guard-2271, rb-6291/rb-3034). Use: exec bash <sibling>' % (len(viol), ', '.join(viol[:6])))
+else:
+    print('PASS: no framework wrapper execs a sibling .sh without an explicit interpreter (g-115-4472)')"
+
+   # /open-questions three-bucket contract (g-115-4934)
+   # g-115-4927 (commit 2e9515ba6) made Phase 3/4 classify user-participant goals into
+   # three buckets via gates/user_leg_scope.py::is_decision_like(), with the Decisions
+   # Needed bucket carrying an explicit do-not-compress instruction. The incident class
+   # is SILENT: if a future edit flattens the spec back to one table, drops the
+   # instruction, or deletes the classifier reference, nothing fails until a user
+   # decision goes invisible again (the 2026-08-04 g-115-4225 incident).
+   # TOKENS READ FROM THE FILE, NOT FROM THE PROPOSAL. The filing goal suggested
+   # grepping for "DO-NOT-COMPRESS"; that literal has ZERO hits. The real text is
+   # "NEVER compressible" (Phase 3, bucket A definition) and "DO NOT COMPRESS,
+   # SUMMARIZE, OR OMIT ANY ROW" (Phase 4, output template). Authoring against the
+   # proposed token would have shipped a check that can never pass — permanently red
+   # for a wording difference rather than a real regression, which is exactly how a
+   # check earns the override reflex. A cited form is a pointer to a REGION, not the
+   # executable token.
+   # SPANS TWO PHASES DELIBERATELY: the classifier reference lives in Phase 3 and the
+   # do-not-compress instruction in Phase 4. Asserting only one leaves the other free to
+   # regress. Each half is scoped to its own phase so a mention elsewhere cannot satisfy it.
+   Bash (open-questions-three-bucket-contract): O=.claude/skills/open-questions/SKILL.md; p3=$(awk '/^## Phase 3: Scan User-Participant Goals/,/^## Phase 3.5/' "$O"); p4=$(awk '/^## Phase 4: Output Summary/,/^## Chaining/' "$O"); c=$(printf '%s' "$p3" | grep -c 'is_decision_like'); n=$(printf '%s' "$p3" | grep -c 'NEVER compressible'); d=$(printf '%s' "$p4" | grep -c 'DO NOT COMPRESS, SUMMARIZE, OR OMIT ANY ROW'); test "$c" -ge 1 -a "$n" -ge 1 -a "$d" -ge 1 && echo "PASS: /open-questions three-bucket contract intact (Phase3 classifier=$c never-compressible=$n, Phase4 do-not-compress=$d)" || echo "FAIL: /open-questions three-bucket contract has drifted — Phase3 is_decision_like=$c, Phase3 'NEVER compressible'=$n, Phase4 do-not-compress instruction=$d (each must be >=1). Flattening the three buckets back to one table or dropping the do-not-compress instruction makes a user decision silently invisible again (g-115-4934, g-115-4225 incident, classifier SSOT is core/scripts/gates/user_leg_scope.py::is_decision_like)."
+
+   # worker-loop stays in the skill-dedup exemption (g-115-5151)
+   # context-reads-skill-gate.sh exempts loop orchestrators from the Skill re-invocation
+   # dedup. worker-loop was added 2026-08-06 (commit 5d7d4ab42, g-306-243). Before that
+   # every Skill(worker-loop) re-entry was blocked with exit 2, so a RUNNING worker never
+   # re-read worker-loop/SKILL.md and NO framework edit to the worker loop could reach a
+   # live worker. Measured cc-07: a pull step committed 03:09 had not fired once by 04:14
+   # across four re-entries.
+   # WHY A CHECK: the regression is 100% SILENT. Unlike g-304-20, where the same block
+   # killed the aspirations loop LOUDLY, a blocked worker-loop re-entry leaves the worker
+   # running normally on its in-context copy — nothing errors, no log line appears, and
+   # the only symptom is that framework edits stop taking effect on workers.
+   # ANCHORED ON THE CASE LINE, not the file: the exemption is a case pattern, and the
+   # token `worker-loop` also appears in this gate's own explanatory comments (measured
+   # at authoring: 4 comment mentions vs 1 executable). A whole-file grep would keep
+   # passing on the comments after the case arm was edited — certifying the exact state
+   # this check exists to detect.
+   Bash (worker-loop-skill-dedup-exemption): n=$(awk '/orchestrator_exempt=1/' core/scripts/context-reads-skill-gate.sh | grep -c 'worker-loop'); test "$n" -ge 1 && echo "PASS: worker-loop is in the loop-orchestrator skill-dedup exemption (executable case-line hits=$n)" || echo "FAIL: worker-loop is no longer in the orchestrator_exempt case line of core/scripts/context-reads-skill-gate.sh (hits=$n) — every Skill(worker-loop) re-entry is then blocked with exit 2, so running workers never re-read worker-loop/SKILL.md and NO framework edit can reach them. The failure is 100% silent: the worker keeps running on its in-context copy (g-115-5151, g-306-243, commit 5d7d4ab42)."
+
 ## Step 4: Summary Report
 
    # Priority review skill integrity checks (Section PR)
@@ -8897,6 +9368,23 @@ print('FAIL: precheck missing skip for ' + str(missing) if missing else 'PASS: a
    # are excluded — only actual invocations in pseudocode flag.
    Bash (no-redundant-last-updated): test -z "$(grep -rhnE 'bash core/scripts/tree-update\.sh\s+--set\s+\S+\s+last_updated' .claude/skills/ core/config/ 2>/dev/null)" && echo "PASS: no redundant explicit tree-update.sh --set last_updated invocations in .claude/skills/ or core/config/ pseudocode (T21 hook covers it)" || { echo "FAIL: redundant tree-update.sh --set last_updated invocation(s) found — T21 PostToolUse hook already covers this, the explicit calls are dead pseudocode"; grep -rnE 'bash core/scripts/tree-update\.sh\s+--set\s+\S+\s+last_updated' .claude/skills/ core/config/; }
    Bash (no-redundant-last-update-trigger): test -z "$(grep -rhnE 'bash core/scripts/tree-update\.sh\s+--set\s+\S+\s+last_update_trigger' .claude/skills/ core/config/ 2>/dev/null)" && echo "PASS: no redundant tree-update.sh --set last_update_trigger invocations (field lives only in .md front matter; _tree.yaml writes are dead per guard-531)" || { echo "FAIL: tree-update.sh --set last_update_trigger invocation(s) found — last_update_trigger lives in the .md front matter; _tree.yaml has no such field (guard-531)"; grep -rnE 'bash core/scripts/tree-update\.sh\s+--set\s+\S+\s+last_update_trigger' .claude/skills/ core/config/; }
+
+   # S48.13: A NEW guardrail must not silently contradict an always-run protocol line (g-115-4005)
+   # THE CLASS: guardrails and SKILL.md protocol text have asymmetric reach. An always-run
+   # protocol line executes every iteration on every agent; a guardrail is read only when
+   # retrieval happens to surface it. When they disagree the protocol wins SILENTLY and the
+   # guardrail goes decorative while still reading `active` — the store shows a healthy rule
+   # whose behaviour is its opposite. Originating instance (ZDS guard-272 vs an unconditional
+   # sweep call) went undetected ~6h and surfaced only because an agent reasoned about it.
+   # WHY --known RATHER THAN A BARE ZERO GATE: three real conflicts exist today, all owned by
+   # guard-2119 (it forbids treating `skill-relations.sh read --similar` output as evidence
+   # that no skill covers a procedure, while decompose/forge-skill/verify-learning pseudocode
+   # does exactly that). Reconciling those is separate work — tracked by the goal filed from
+   # g-115-4005. Baselining them keeps this check meaning "a NEW contradiction appeared",
+   # which is the detectable event; a gate that is red forever teaches readers to skip it.
+   # Baselined rows are still REPORTED (never dropped) — suppression is the failure mode the
+   # check exists to catch. When guard-2119's conflicts are reconciled, drop it from --known.
+   Bash (guardrail-protocol-conflict): py -3 core/scripts/guardrail-protocol-conflict-check.py --exit-on-hits --known guard-2119 >/dev/null 2>&1 && echo "PASS: no NEW guardrail-vs-always-run-protocol contradiction (baselined: guard-2119)" || { echo "FAIL: a guardrail forbids a command that SKILL.md pseudocode invokes unconditionally — reconcile the guardrail or the protocol line, then update the --known baseline"; py -3 core/scripts/guardrail-protocol-conflict-check.py --known guard-2119; }
 
    # S48.12: Tree-sync inline-form trigger must NOT abort the last_updated bump (2026-06-04 _tree.yaml drift fix)
    # tree-front-matter-sync.py (T21) used to sys.exit(0) ("REFUSED: trigger has inline

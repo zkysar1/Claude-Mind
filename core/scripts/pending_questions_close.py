@@ -157,8 +157,12 @@ def close_question(agent, qid, answered_by, rationale, dry_run, pq_path=None):
                     return res, 6
                 try:
                     be.refresh(path)  # drop stale cached ETag before re-read
-                except Exception:
-                    pass
+                except Exception as e:
+                    try:  # report, never raise — note_swallowed_backend_error ()
+                        from storage_backend import note_swallowed_backend_error
+                        note_swallowed_backend_error("refresh", path, e)
+                    except Exception:
+                        pass
     finally:
         try:
             be.release_lock(lock_path)

@@ -68,6 +68,19 @@ Per-gate overrides continue to land in their gate-specific ledger files
 as `decision=override`. The bulk-override ledger is additive — it correlates
 the per-gate firings under one token, not replaces them.
 
+**Not every ledger record comes from a CLI flag.** Daemon-side gates have no
+argv to carry a flag, so they are bypassed by an ENV VAR and write to the same
+`override-bypass-ledger.jsonl` under their own `gate` value, with `slots_filled`
+absent (nothing was slot-filled — there is exactly one gate). Reading a record
+with no `slots_filled` as malformed is the mistake to avoid; check `gate` first.
+Current members: `claim-sid-gate` (`MIND_CLAIM_ALLOW_NO_SID`, refuses sid-less
+world-goal claims — g-306-132-b) and `capability-route-gate` (cross-lane claim
+justification, passed as the `cross_lane` query param rather than an env var).
+A daemon gate SHOULD fail open on its own dependency errors and log a
+distinguishable sentinel justification when it does, so a rash of
+gate-dependency failures is visible in this ledger rather than silent
+(guard-142).
+
 ## Anti-patterns
 
 - **Vague bulk justification**: `--override-all "I know what I'm doing"`

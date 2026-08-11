@@ -137,6 +137,93 @@ def test_list_missing_param(running_daemon):
         raise AssertionError("expected 400 without file")
 
 
+# ---------------------------------------------------------------------------
+#  — an unresolvable path is an ERROR, never an empty store.
+#
+# `_find_history_snapshots` returns [] both for "no snapshots" and for "under
+# no governed root", so `list` rendered the second as "No history" at HTTP 200
+# — a false-absent verdict on the recovery layer. `restore` had guarded this
+# with unresolved_base since it shipped; list and diff were the outliers, and
+# list is the read the recovery path actually depends on.
+#
+# test_list_no_history above is the deliberate COMPLEMENT of these: its path IS
+# under the world root (the fixture sets WORLD_PATH=project_root/"world") and
+# simply has no snapshots, so it must stay 200. The discriminator is "under a
+# governed root", never "exists on disk" — snapshots outlive their file.
+# ---------------------------------------------------------------------------
+
+def test_list_out_of_root_returns_400(running_daemon):
+    """A path under no configured base must not read as an empty store."""
+    _, port = running_daemon
+    try:
+        _http("GET", port, "/v1/history/list", {"file": "/etc/hostname"})
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+        assert json.loads(e.read())["error"] == "unresolved_base"
+    else:
+        raise AssertionError("expected 400 for a path under no governed root")
+
+
+def test_diff_out_of_root_returns_400(running_daemon):
+    """diff blamed the VERSION when the PATH was the problem."""
+    _, port = running_daemon
+    try:
+        _http("GET", port, "/v1/history/diff",
+              {"file": "/etc/hostname", "version": "whatever"})
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+        assert json.loads(e.read())["error"] == "unresolved_base"
+    else:
+        raise AssertionError("expected 400 for a path under no governed root")
+
+
+def test_list_world_prefix_resolves_to_world_root(tmp_path):
+    """`world/x` must resolve to the CONFIGURED world root, not project_root.
+
+    The false-NEGATIVE half of g-115-4181.
+
+    DELIBERATELY a direct-handler test, not an HTTP round-trip. The
+    `running_daemon` fixture puts world at project_root/"world", so the buggy
+    branch (project_root / "world/x") and the correct branch (world_root / "x")
+    resolve to the SAME path — an HTTP version of this test passes whether or
+    not the fix is present, and mutation testing caught it doing exactly that
+    (21/21 green with the prefix branch deleted). Production has world
+    EXTERNAL, per local-paths.conf, which is why the bug was live in production
+    and structurally invisible under that fixture.
+
+    `_dirs`-style tmp roots reproduce the production shape: world is outside
+    project_root, so the two branches diverge and the assertion has teeth.
+    """
+    world = tmp_path / "external-world"
+    meta = tmp_path / "external-meta"
+    agent = tmp_path / "external-agent"
+    rel = "knowledge/prefixed.md"
+    (world / rel).parent.mkdir(parents=True, exist_ok=True)
+    (world / rel).write_text("current\n", encoding="utf-8")
+    _make_legacy_snap(world, rel, "2026-07-01T10-00-00", "alpha", "older\n")
+
+    ctx = _FakeCtx(world, meta, agent, REPO_ROOT, {"file": f"world/{rel}"})
+    body = history_ep.list_versions(ctx).body.decode("utf-8")
+    assert "No history" not in body, body
+    assert "1 versions" in body, body
+
+
+def test_list_meta_prefix_resolves_to_meta_root(tmp_path):
+    """Same for `meta/` — broken identically, by the same cause."""
+    world = tmp_path / "external-world"
+    meta = tmp_path / "external-meta"
+    agent = tmp_path / "external-agent"
+    rel = "strategy.yaml"
+    (meta / rel).parent.mkdir(parents=True, exist_ok=True)
+    (meta / rel).write_text("current\n", encoding="utf-8")
+    _make_legacy_snap(meta, rel, "2026-07-01T10-00-00", "alpha", "older\n")
+
+    ctx = _FakeCtx(world, meta, agent, REPO_ROOT, {"file": f"meta/{rel}"})
+    body = history_ep.list_versions(ctx).body.decode("utf-8")
+    assert "No history" not in body, body
+    assert "1 versions" in body, body
+
+
 def test_diff_missing_param(running_daemon):
     _, port = running_daemon
     try:

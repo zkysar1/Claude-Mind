@@ -28,6 +28,7 @@ import os
 import re
 import sys
 from datetime import datetime, timedelta
+from pathlib import Path
 
 # : force utf-8 on stdin/stdout/stderr (covers Windows cp1252 fallback
 # when callers bypass the _platform.sh PYTHONIOENCODING=utf-8 shim).
@@ -35,6 +36,7 @@ from _stdio import reconfigure_stdio  # noqa: E402
 reconfigure_stdio()
 
 from _paths import AGENT_DIR, assert_agent_dir
+from _runtime_bash import bash_cmd  # guard-580: never a bare "bash" argv[0]
 
 # : fail loud at import time if MIND_AGENT unset; replaces the
 # opaque `None / "session"` TypeError class the next line would otherwise raise.
@@ -76,15 +78,119 @@ def _advance_heartbeat():
     # cognitive-load dead code: the second writer never observes the dir
     # absent.
     try:
+        state = ""
         state_file = AGENT_DIR / "session" / "agent-state"
         if state_file.exists():
             state = state_file.read_text(encoding="utf-8").strip()
-            if state == "IDLE":
-                return  # mirrors heartbeat-tick.sh:67-70 state gate
-        hb = AGENT_DIR / "session" / "runner-heartbeat"
-        hb.touch()
+        if state != "IDLE":
+            # The agent-WIDE heartbeat stays gated — a fresh runner-heartbeat
+            # against agent-state=IDLE is the 2026-05-13 desync class (guard-543).
+            (AGENT_DIR / "session" / "runner-heartbeat").touch()
+        # The shared tick fires on BOTH roles, deliberately OUTSIDE the gate
+        # above. It carries its own gate and splits the two signals correctly:
+        # the per-Body heartbeat is written ABOVE it, the claim renewal BELOW.
+        # A WORKER is IDLE by design, so gating this call on RUNNING is exactly
+        # what left a long worker unit with no liveness refresh at all.
+        _tick_shared_heartbeat_if_due()
     except Exception:
         pass
+
+
+# How long either liveness signal may go unrefreshed before this writer fires a
+# tick. Must stay FAR below BOTH windows it protects, so a tick can fail several
+# times over and still be retried inside the shorter one:
+#   reducer — OWNERSHIP_STALE_SECONDS      3900s (peer may break the claim)
+#   worker  — foreign-SID grace           7200s (sweep pops the claim)
+SHARED_HEARTBEAT_INTERVAL_S = 600
+
+
+def _tick_shared_heartbeat_if_due():
+    """Keep BOTH liveness signals on the same cadence as the local heartbeat.
+
+    Serves the two roles at once, because the tick it calls already separates
+    them and neither role may do the other's job:
+
+      * REDUCER (RUNNING) — renews the cross-machine DDB lease, and runs the
+        self-fence. Both live BELOW heartbeat-tick's state gate.
+      * WORKER (IDLE by design) — the tick writes the per-Body heartbeat, which
+        sits ABOVE that gate (g-306-208), then exits 2 before reaching the claim.
+        So a worker refreshes its own liveness and provably cannot renew or
+        touch the reducer's claim. rc=2 here is EXPECTED and must never be
+        branched on.
+
+    The worker half matters on the same measurement the reducer half does:
+    per-Body liveness ticked only once per worker-loop CYCLE, so a single long
+    unit left it frozen. Measured 2026-08-06 on cc-07, 11 minutes into an active
+    unit: body-heartbeat 7.6 minutes stale and not advancing, against
+    stranded-claim-sweep's 120-minute foreign-SID grace. A unit longer than that
+    grace gets its claim popped mid-execution while the Body is healthy and
+    working — and the previous cc-07 unit ran ~140 minutes.
+
+    `_advance_heartbeat` above exists because the two LOCAL staleness signals
+    drifted apart. The same drift then reopened one level up, between the local
+    signal and the distributed one, and this time the fast half is the half that
+    makes everything LOOK healthy:
+
+      * runner-heartbeat  — touched here, on every diary write (continuous)
+      * DDB claim renewal — inside heartbeat-tick.sh, Phase -0.5 only (per-iteration)
+      * reducer self-fence — also inside heartbeat-tick.sh (per-iteration)
+
+    So a single goal running longer than OWNERSHIP_STALE_SECONDS lets the lease
+    expire while the reducer is perfectly healthy and every local probe reports
+    fresh. A peer then sees a free claim and comes up as a SECOND REDUCER, and
+    the self-fence that would catch it is behind the same slow cadence.
+
+    Measured 2026-08-06 on cc-04 (live reducer, healthily executing goals):
+    runner-heartbeat 6s old while the DDB claim heartbeat was 2794s old and
+    aging 1:1 with wall clock. An invoked-by-hand renewal reset it to 0s, so the
+    renewal path was never broken — only unreached. Note the failure marker from
+    g-306-221 stays ABSENT throughout, because a leg that never RUNS never
+    fails: that visibility fix cannot see this mode, and reports healthy.
+
+    The docstring above already cites a 75-minute goal as a real event, so the
+    exposure is not hypothetical — it is the same goal length, measured against
+    a 65-minute window.
+
+    Calls the shared tick rather than `runner-claim.sh heartbeat` directly: the
+    tick owns the failure-marker accounting AND the self-fence, and both belong
+    on this cadence too. A direct renewal here would be a transcription of one
+    of its legs and would silently drift from the other (guard-2676).
+
+    Rate-limited by a stamp file, touched BEFORE the call so a slow or failing
+    tick cannot re-fire on every subsequent diary write. Fail-open on every
+    path — a diary write must never fail because lease renewal had an opinion.
+    """
+    import subprocess
+    import time
+
+    stamp = AGENT_DIR / "session" / "claim-renewal-last"
+    try:
+        if time.time() - stamp.stat().st_mtime < SHARED_HEARTBEAT_INTERVAL_S:
+            return
+    except FileNotFoundError:
+        pass  # never renewed from here — fire now
+    stamp.touch()
+
+    script_dir = Path(__file__).resolve().parent
+    agent = os.environ.get("MIND_AGENT") or AGENT_DIR.name
+    # Explicit env: the 2026-05-14 note above is right that a bash child does not
+    # inherit the hook-injected MIND_AGENT, which is why the local touch is done
+    # inline. Passing it explicitly is what makes the subprocess viable here, and
+    # bash_cmd keeps argv[0] off the bare-"bash" path that reaches the WSL
+    # launcher on win32 (guard-580).
+    env = dict(os.environ)
+    env["MIND_AGENT"] = agent
+    # guard-918: NEVER a hardcoded short cap here. The tick shells out to
+    # team-state-update.sh, which is an own-cloud world write whose latency
+    # regularly exceeds 60s; a fixed cap raises TimeoutExpired and would kill a
+    # curl still inside its own window. Derive from the knob the inner curl
+    # honors, plus headroom, so the outer cap always exceeds the inner one.
+    timeout_s = int(os.environ.get("RT_CURL_TIMEOUT", "150")) + 30
+    subprocess.run(
+        bash_cmd(str(script_dir / "heartbeat-tick.sh")),
+        env=env, capture_output=True, text=True, timeout=timeout_s,
+    )
+
 
 VALID_ENTRY_TYPES = {
     "decision", "failure", "finding", "approach_change",

@@ -134,8 +134,12 @@ def load_world_config(name: str, default: Optional[Dict[str, Any]] = None) -> Di
         try:
             from storage_backend import get_backend  # noqa: PLC0415
             get_backend().ensure_local(path)
-        except Exception:
-            pass
+        except Exception as e:
+            try:  # report, never raise — see note_swallowed_backend_error ()
+                from storage_backend import note_swallowed_backend_error
+                note_swallowed_backend_error("ensure_local", path, e)
+            except Exception:
+                pass
         if not path.is_file():
             result = dict(default)
         else:

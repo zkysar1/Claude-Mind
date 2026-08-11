@@ -49,8 +49,11 @@ an unresolvable default branch or an unreachable forge degrades to clean plus a
 stderr warning, never to a flag. Tier 1's all-clear is the loop's trust anchor,
 so a wrong tier-2 flag would cost more than a missed one.
 
---apply files ONE dedup'd Investigate per flagged goal, routed to asp-115
-(framework hygiene). The two lanes dedup on separate origin_signal keys
+--apply files ONE dedup'd Investigate per flagged goal, routed to the aspiration
+_escalation_target.resolve() picks (framework hygiene) — asp-115 upstream, whatever
+exists locally elsewhere. Do NOT re-hardcode the id here: this docstring said
+"routed to asp-115" after the code had already been wired to the resolver, which
+reads as a live hardcode to anyone auditing by grep (g-001-273, 2026-08-05). The two lanes dedup on separate origin_signal keys
 ("investigate:completed-not-committed-<goal-id>" and
 "investigate:stranded-unmerged-<goal-id>") because they prescribe different
 remedies — push the commit vs merge the pull request. stranded_no_pr is
@@ -88,6 +91,8 @@ PROJECT_ROOT = CORE_ROOT.parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, )
+from _owner_qualified_signal import (  # noqa: E402  (guard-2107, )
+    qualified_signal, signal_candidates)
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
 
 # : never hardcode the escalation aspiration —  is the UPSTREAM
@@ -963,10 +968,12 @@ STRANDED_SIGNAL_PREFIX = "investigate:stranded-unmerged-"
 
 
 def _existing_investigate(goal_id, all_goals,
-                          key_prefix="investigate:completed-not-committed-"):
+                          key_prefix="investigate:completed-not-committed-",
+                          source="world"):
     """True when an open Investigate for this goal already exists (dedup on the
-    stable origin_signal key). Scans the goals ALREADY read this run — asp-115,
-    where these Investigates are filed, is an active aspiration, so a prior
+    stable origin_signal key). Scans the goals ALREADY read this run — the resolved
+    escalation aspiration, where these Investigates are filed, is an active
+    aspiration in whichever queue resolve() picked, so a prior
     Investigate is present in `all_goals`. In-memory (no extra daemon round-
     trip) and inherently fail-closed: _read_goals is guard-383 fatal on a read
     error, so we never reach here with a partial queue.
@@ -976,23 +983,39 @@ def _existing_investigate(goal_id, all_goals,
     of the committed-not-pushed lane. The two describe the same goal but
     prescribe DIFFERENT remedies — push the commit vs merge the pull request —
     so collapsing them onto one key would let whichever fired first suppress
-    the other's actionable Investigate forever."""
-    key = f"{key_prefix}{goal_id}"
+    the other's actionable Investigate forever.
+
+    `source` is the QUEUE THE FLAGGED GOAL LIVES IN, not the queue this
+    Investigate is filed into (always the resolved escalation aspiration —
+    world/asp-115 upstream). That asymmetry IS the
+    bug guard-2107 names and g-115-4110 fixes: an agent-source `g-001-NN` id
+    is unique only within its owner's queue, but the key built from it lands
+    in WORLD, where every agent's dedup reads it — so the first agent to file
+    would suppress every other agent's genuinely-different goal of the same
+    id, forever. Matching BOTH forms keeps in-flight Investigates filed under
+    the pre-fix legacy key deduping against themselves."""
+    keys = signal_candidates(key_prefix, goal_id, source)
     for g in all_goals:
-        if (g.get("origin_signal") == key
+        if (g.get("origin_signal") in keys
                 and g.get("status") in ("pending", "in-progress")):
             return True
     return False
 
 
 def _file_investigate(entry):
-    """File one Investigate goal into  (world). Returns the filed goal
+    """File one Investigate goal into the resolved escalation aspiration
+    (world/asp-115 upstream). Returns the filed goal
     id or None. Idempotent via _existing_investigate (checked by caller).
 
-    Serves both flag classes. The daemon call, asp-115 routing and error
+    Serves both flag classes. The daemon call, escalation-aspiration routing and error
     handling are identical, so only the title / origin_signal / description
     differ by reason (g-115-3471)."""
     gid = entry["goal_id"]
+    # guard-2107 / : qualify the key with the flagged goal's OWNING
+    # agent when it came from an agent queue, because these Investigates file
+    # into WORLD where every agent's dedup reads them. World-source ids are
+    # already globally unique and are left byte-identical.
+    gsource = entry.get("source") or "world"
     if entry.get("reason") == "stranded_open_pr":
         pr = entry.get("pull_request") or {}
         body = {
@@ -1001,7 +1024,7 @@ def _file_investigate(entry):
             "priority": "HIGH",
             "participants": ["agent"],
             "category": "framework-architecture",
-            "origin_signal": f"{STRANDED_SIGNAL_PREFIX}{gid}",
+            "origin_signal": qualified_signal(STRANDED_SIGNAL_PREFIX, gid, gsource),
             "description": (
                 f"completed-not-committed-sweep tier 2 flagged {gid} "
                 f"('{entry['title']}', source={entry['source']}, "
@@ -1025,7 +1048,8 @@ def _file_investigate(entry):
             "priority": "HIGH",
             "participants": ["agent"],
             "category": "framework-architecture",
-            "origin_signal": f"investigate:completed-not-committed-{gid}",
+            "origin_signal": qualified_signal(
+                "investigate:completed-not-committed-", gid, gsource),
             "description": (
                 f"completed-not-committed-sweep flagged {gid} "
                 f"('{entry['title']}', source={entry['source']}, "
@@ -1198,7 +1222,10 @@ def main():
     investigate_created = []
     if args.apply:
         for entry in real_flagged:
-            if _existing_investigate(entry["goal_id"], all_goals):
+            # source= must mirror what _file_investigate WRITES, or the dedup
+            # looks for a key that is never minted and re-files every run.
+            if _existing_investigate(entry["goal_id"], all_goals,
+                                     source=entry.get("source") or "world"):
                 continue
             gid = _file_investigate(entry)
             if gid:
@@ -1207,7 +1234,8 @@ def main():
         # open PR may simply be a live working branch. It stays in the report.
         for entry in stranded:
             if _existing_investigate(entry["goal_id"], all_goals,
-                                     STRANDED_SIGNAL_PREFIX):
+                                     STRANDED_SIGNAL_PREFIX,
+                                     source=entry.get("source") or "world"):
                 continue
             gid = _file_investigate(entry)
             if gid:

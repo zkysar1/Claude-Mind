@@ -321,9 +321,53 @@ IF agents/<agent>/session/compact-checkpoint.yaml EXISTS:  # battery: compact_ch
 # {scanned: 0}). With --apply: releases the claim, flips status to
 # pending, clears matching team-state.in_flight. The 5-min stale threshold
 # guards against race conditions where Phase 4 was just starting.
+# Unconditional --apply stays CORRECT here (g-115-4004): the sweep now
+# compares each claim's claimed_by_sid (stamped by aspirations-claim.sh,
+# g-115-3176) against this process's MIND_SID, so a claim held by another
+# LIVE INSTANCE of this same agent on another box is KEPT rather than
+# released — previously "stranded" was inferred from diary activity alone,
+# so a peer instance's live claim could read as abandoned. Fixed at the root
+# instead of by adding dry-run-first ceremony to this line; a 120m grace
+# still prevents a genuinely dead instance from freezing a shared goal.
+# THE DIARY IS NOT BOX-LOCAL — an earlier version of this comment said it
+# was, and the correction is load-bearing below: session-manifest.yaml gives
+# execution-diary.jsonl `sync_tier: continuity` (remote-authoritative,
+# per-AGENT read-through cache) and its entries carry no session id, so a
+# peer instance's entries appear here as soon as this box pulls (g-306-132-c).
 # Direct py -3 invocation (not bash wrapper) — see rb-225/rb-247 for the
 # Windows bash subprocess hang.
 Bash: `py -3 core/scripts/stranded-claim-sweep.py --apply`
+
+# READING THE `possible-displacement` VERDICT (g-306-142) — IT IS A PROMPT TO
+# CHECK, NEVER A CONCLUSION TO ACT ON. A record carrying
+# `"verdict": "possible-displacement"` with `"ambiguous": true` (counted in
+# `summary["possible_displacement"]`) means that claim's claimed_by_sid is not
+# this session's WHILE the agent's diary shows activity for the goal. That fits
+# BOTH "another instance of me won the claim merge and I was displaced" AND the
+# ORDINARY case "a peer instance legitimately holds it and I never worked it" —
+# and no box-local store separates them, because the diary is not box-local
+# (see the sync_tier note above). The ordinary case is the COMMON firing.
+displacement_seen = any record in the sweep output with
+                    verdict == "possible-displacement"
+IF displacement_seen:
+    Bash: `board-read.sh --channel coordination --since 24h`
+    Look for a claim post on that goal_id from a DIFFERENT session_id — claim
+    posts are append-only, so BOTH claims survive the merge overwrite that
+    destroyed the evidence in the claim record itself (guard-1460).
+    IF such a post exists AND its session is live:
+        You were displaced. ABORT your work on that goal and do NOT re-select
+        it this iteration. Do NOT release the claim — post-merge it belongs to
+        the WINNER, and releasing would re-open the goal to a third instance,
+        widening the conflict you just detected.
+    ELSE:
+        Ordinary peer-claim case. Continue the iteration unchanged.
+# NEVER wire an automatic abort onto this verdict: under the ordinary reading
+# it would abort a peer's legitimate work on every firing. The sweep stays
+# report-only for the same reason — the consumer is this orchestrator, not the
+# script. g-306-143 owns finding a sound per-session discriminator; only if
+# that lands may this branch be strengthened.
+# Rationale (WHY the verdict is hedged and why the diary cannot decide it):
+#   core/config/rationale/possible-displacement-verdict.md
 
 # Phase -0.5c.2: Pending Phase-6 Spark Sentinel (g-115-1174)
 # Consumes the `pending_phase_6_spark` WM slot written by TWO producers:

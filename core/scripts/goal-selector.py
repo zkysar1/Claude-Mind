@@ -84,9 +84,14 @@ if hasattr(sys.stderr, "reconfigure"):
 import yaml  # Required — tree.py already depends on PyYAML
 
 from _paths import (WORLD_DIR, AGENT_DIR, META_DIR, CONFIG_DIR, CORE_ROOT,
-                    agents_root as _agents_root, read_agent_conf)
+                    ENVIRONMENT_ID, agents_root as _agents_root, read_agent_conf)
 from _fileops import locked_modify_yaml  # noqa: E402  ( applications_log)
 from wm import read_wm  # noqa: E402
+# : the board-routing-tag rule lives in peer_surface (the same module
+# that owns split_author) so directive-honor here, insight-trigger-gate, and the
+# sweep cannot drift apart about what `agent@env-id` means.
+from peer_surface import (parse_routing_tag,  # noqa: E402
+                          routing_tag_targets_agent)
 from cadence_signals import evaluate_cadence_signal  # noqa: E402  ( signal-gated cadence)
 # Single source of truth for terminal goal statuses — see aspirations.py.
 # Derived sets below (SKIP_STATUSES, ABANDONED_STATUSES) stay consistent if a new
@@ -474,6 +479,14 @@ AGENT_ASP_PATH = AGENT_DIR / "aspirations.jsonl" if AGENT_DIR else None
 # Agent identity (used for claim checking AND participant-based goal routing)
 AGENT_NAME = AGENT_DIR.name if AGENT_DIR else ""
 
+# Body identity ( part 1). AGENT_NAME names the MIND; under the
+# Mind/Body split several Bodies (separate sessions, possibly separate boxes)
+# share one mind key, so a name-only claim comparison cannot tell "mine" from
+# "my sibling's". The session id is the Body discriminator. Empty string when
+# MIND_SID is unset, which makes every Body-aware check below fail OPEN to the
+# pre-split behavior rather than guessing.
+BODY_SID = os.environ.get("MIND_SID", "") or ""
+
 # Meta-strategies (meta/)
 SKILL_QUALITY_PATH = META_DIR / "skill-quality.yaml"
 
@@ -827,6 +840,55 @@ def load_cell_return_config():
 CELL_RETURN_CONFIG = load_cell_return_config()
 
 
+def load_starvation_boost_config():
+    """Load anti-starvation boost params from core/config/aspirations.yaml.
+
+    g-115-5426 (2026-08-10). Params for apply_starvation_boost, the post-scoring
+    pass that rescues aged, unclaimed, HIGH-priority NON-recurring goals from
+    indefinite selection starvation. Recurring goals already have recurring_urgency
+    (overdue_ratio); one-shot goals had NO age-based term, so a one-shot goal's
+    score is essentially fixed at filing time and a lone HIGH goal in a sprawling,
+    low-completion aspiration never rises. DEFAULT ON, but no-regression by
+    construction: a goal younger than min_age_hours gets ZERO boost, so normal
+    selection is byte-identical for all but the genuine starvation population.
+    Same overlay/type-coerce shape as the sibling config loaders; priority_multipliers
+    (a nested dict) is merged key-by-key rather than type-coerced whole.
+    """
+    defaults = {
+        "enabled": True,
+        "min_age_hours": 12.0,
+        "full_boost_age_hours": 36.0,
+        "max_boost": 4.0,
+    }
+    priority_multipliers = {"HIGH": 1.0, "MEDIUM": 0.0, "LOW": 0.0}
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_config_overlay", Path(__file__).parent / "_config_overlay.py"
+        )
+        overlay = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(overlay)
+        asp_config = overlay.merged_config("aspirations.yaml")
+        sb = asp_config.get("starvation_boost", {})
+        if isinstance(sb, dict):
+            for k, default in defaults.items():
+                v = sb.get(k)
+                if v is not None:
+                    defaults[k] = type(default)(v)
+            pm = sb.get("priority_multipliers")
+            if isinstance(pm, dict):
+                for pk, pv in pm.items():
+                    if pv is not None:
+                        priority_multipliers[str(pk)] = float(pv)
+    except Exception:
+        pass
+    defaults["priority_multipliers"] = priority_multipliers
+    return defaults
+
+
+STARVATION_CONFIG = load_starvation_boost_config()
+
+
 def load_user_signal_boost_config():
     """Load user-signal boost params from core/config/aspirations.yaml.
 
@@ -1176,6 +1238,9 @@ def _compose_rows(core_doc):
 
 
 PRIORITY_MAP = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
+# Inverse of PRIORITY_MAP: numeric raw["priority"] -> name, for apply_starvation_boost
+# (), which gates the anti-starvation lift on the named-priority multipliers.
+_PRIORITY_NUM_TO_NAME = {v: k for k, v in PRIORITY_MAP.items()}
 
 
 def _ensure_list(val, default=None):
@@ -1243,8 +1308,55 @@ def read_yaml_file(path):
         return yaml.safe_load(f) or {}
 
 
-def _log_transient_allblocked_recovery(first_world, retry_world, retry_count):
+def _anomalies_path():
+    """Destination for goal-selector anomaly telemetry ( STEP 1).
+
+    A FUNCTION rather than an inline `Path(WORLD_DIR) / ...` build, so the
+    emitter's OUTPUT is patchable by exactly the seam tests already use for its
+    INPUTS. `test_goal_selector_allblocked_reread.py` patches eight module
+    attributes (read_jsonl, read_wm, score_goal, AGENT_DIR, ...) and could not
+    patch the destination, because there was nothing to patch — the path was
+    built inline from a module global at write time. That asymmetry IS the bug:
+    inputs were injectable, the output was not.
+
+    `GOAL_SELECTOR_ANOMALIES_PATH` lets a test that WANTS to assert on the
+    emitted record point it at tmp_path instead of suppressing it.
+    """
+    override = os.environ.get("GOAL_SELECTOR_ANOMALIES_PATH")
+    if override:
+        return Path(override)
+    return Path(WORLD_DIR) / "goal-selector-anomalies.jsonl"
+
+
+def _anomalies_write_refused():
+    """True when writing would append FIXTURE output to real deployment evidence.
+
+    Measured on cc-02 2026-08-01: goal-selector-anomalies.jsonl held 1014
+    records and ALL 1014 were fixture output (first/retry aspiration+goal counts
+    of 1/1/1/1, reproducing _world_with_blocked / _world_with_pending), spanning
+    2026-05-31 to a run that same morning. Zero real anomalies. The evidence file
+    for a live investigation was 100% noise, and it grew on every suite run.
+
+    Chokepoint rather than per-test discipline, deliberately: the same shape as
+    g-115-3329, where the spawn paths began REFUSING under PYTEST_CURRENT_TEST
+    with no explicit runtime dir. A fix that requires each test to remember to
+    patch WORLD_DIR only fixes the tests that exist today; this one holds for
+    every future test that reaches this emitter, which is the class the goal
+    asks for. Suppression is announced on stderr — a silent skip would trade one
+    invisible behavior for another.
+    """
+    return bool(os.environ.get("PYTEST_CURRENT_TEST")) and not os.environ.get(
+        "GOAL_SELECTOR_ANOMALIES_PATH")
+
+
+def _log_transient_allblocked_recovery(first_world, retry_world, retry_count,
+                                       event="transient_all_blocked_recovered"):
     """Record a transient all_blocked recovery for root-cause evidence ().
+
+    `event` is parameterized (g-115-4010 STEP 3) so the FAILURE branch — retry
+    also returned zero — emits a sibling record through this same counting and
+    fail-open path. Default preserves the original single-event behavior, so the
+    existing call site and signature are unchanged.
 
     Emitted by cmd_select when the FIRST collection pass returns zero candidates
     but a fresh re-read + re-collect finds work. The WORLD aspirations file lives
@@ -1264,23 +1376,36 @@ def _log_transient_allblocked_recovery(first_world, retry_world, retry_count):
         fa, fg = _counts(first_world)
         ra, rg = _counts(retry_world)
         content_changed = (fa != ra) or (fg != rg)
-        sys.stderr.write(
-            "[goal-selector] WARN transient all_blocked recovered: first pass 0 "
-            "candidates, retry found %d. world_content_changed_between_reads=%s "
-            "(first %d asps/%d goals, retry %d asps/%d goals). See g-115-1295.\n"
-            % (retry_count, content_changed, fa, fg, ra, rg))
+        if event == "transient_all_blocked_recovered":
+            sys.stderr.write(
+                "[goal-selector] WARN transient all_blocked recovered: first pass 0 "
+                "candidates, retry found %d. world_content_changed_between_reads=%s "
+                "(first %d asps/%d goals, retry %d asps/%d goals). See g-115-1295.\n"
+                % (retry_count, content_changed, fa, fg, ra, rg))
+        else:
+            sys.stderr.write(
+                "[goal-selector] all_blocked confirmed: retry ALSO returned 0 "
+                "candidates. world_content_changed_between_reads=%s "
+                "(first %d asps/%d goals, retry %d asps/%d goals). See g-115-4010.\n"
+                % (content_changed, fa, fg, ra, rg))
         try:
             rec = {
                 "ts": datetime.now().isoformat(timespec="seconds"),
-                "event": "transient_all_blocked_recovered",
+                "event": event,
                 "retry_candidates": retry_count,
                 "first_world_aspirations": fa, "retry_world_aspirations": ra,
                 "first_world_goals": fg, "retry_world_goals": rg,
                 "world_content_changed_between_reads": content_changed,
             }
-            path = Path(WORLD_DIR) / "goal-selector-anomalies.jsonl"
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(rec) + "\n")
+            if _anomalies_write_refused():
+                sys.stderr.write(
+                    "[goal-selector] anomaly telemetry SUPPRESSED under pytest — "
+                    "refusing to append fixture output to real deployment evidence. "
+                    "Set GOAL_SELECTOR_ANOMALIES_PATH to capture it. (g-115-4010)\n")
+            else:
+                path = _anomalies_path()
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec) + "\n")
         except Exception:
             pass
     except Exception:
@@ -1746,11 +1871,25 @@ def _liveness_confirms_dormant(name, last_active_iso, threshold_hours):
         return _LIVENESS_DORMANT_CACHE[name]
     try:
         import liveness_check as _lc
-        fresh_iso = _lc.fetch_fresh_signal(
-            name, str(WORLD_DIR), os.environ.get("STORAGE_BACKEND", "local"))
+        backend = os.environ.get("STORAGE_BACKEND", "local")
+        fresh_iso = _lc.fetch_fresh_signal(name, str(WORLD_DIR), backend)
+        # The shard OBJECT's write time is BODY activity; the last_active VALUE
+        # inside the authoritative shard is MIND liveness (-e). Supply
+        # both so this routing decision cannot disagree with the CLI verdict —
+        # object-time alone made a worker Body's write look like a live reducer.
+        # Provenance travels WITH the value (). read_shard_authoritative
+        # fails open to the local mirror, and a mirror value promoted to
+        # verdict=alive is a false ALIVE — here that would keep goals routed to a
+        # dead agent. Passing the provenance lets decide_liveness degrade to
+        # "unknown", which this function does not treat as dormant either way, so
+        # the failure stays in the goals-stay-routed direction.
+        auth_la_iso, auth_la_prov = _lc.fetch_authoritative_last_active_with_provenance(
+            name, str(WORLD_DIR))
         verdict = _lc.decide_liveness(
             last_active_iso, fresh_iso, threshold_hours=threshold_hours,
-            now=datetime.now())["verdict"]
+            now=datetime.now(),
+            authoritative_last_active_iso=auth_la_iso,
+            authoritative_provenance=auth_la_prov)["verdict"]
         dormant = (verdict == "dormant")
     except Exception:  # noqa: BLE001 — fail-safe toward NOT idle
         dormant = False
@@ -1858,15 +1997,41 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
                 else:
                     continue  # No expiry configured — legacy behavior
 
-            # Claim check (world goals only): skip goals claimed by another agent.
+            # Claim check (world goals only): skip goals claimed by someone else.
             # Expiry makes stale claims (older than claim_timeout_hours) fall through
             # so other agents can pick up abandoned work. The actual re-claim is still
             # atomic via aspirations-claim.sh — this only controls VISIBILITY.
             # For recurring goals, claim timeout is capped at 2x interval_hours so that
             # short-interval goals (e.g. 1h email check) don't stay claimed for 4h.
+            #
+            # "Someone else" has TWO forms, and they share one expiry ladder:
+            #   (a) another MIND — a different agent name. The original case.
+            #   (b) another BODY of THIS mind ( part 1) — same agent
+            #       name, different session. A name-only comparison waves this
+            #       straight through, so two Bodies of one mind re-select each
+            #       other's live claim every cycle and livelock. The claim does
+            #       NOT set status (status lands later, in aspirations-execute),
+            #       so the goal stays `pending` and keeps re-qualifying here.
+            # The expiry ladder is deliberately the liveness test for BOTH: a
+            # sibling Body's abandoned claim must age out exactly like a foreign
+            # agent's, and reusing the ladder keeps a network liveness probe off
+            # the per-goal selection hot path. stranded-claim-sweep.py remains
+            # the authority for actually releasing a dead Body's claim.
+            # Fail-open by construction: when either SID is absent (legacy record
+            # with no claimed_by_sid, or MIND_SID unset) `sibling_body` is False
+            # and this filter behaves exactly as it did before .
             if source == "world":
                 claimed = goal.get("claimed_by")
-                if claimed and claimed != AGENT_NAME:
+                claim_sid = goal.get("claimed_by_sid")
+                other_mind = bool(claimed) and claimed != AGENT_NAME
+                sibling_body = (
+                    bool(claimed)
+                    and claimed == AGENT_NAME
+                    and isinstance(claim_sid, str) and bool(claim_sid)
+                    and bool(BODY_SID)
+                    and claim_sid != BODY_SID
+                )
+                if other_mind or sibling_body:
                     if claim_timeout_hours is not None:
                         effective_timeout = claim_timeout_hours
                         if goal.get("recurring"):
@@ -2695,54 +2860,164 @@ def _resolve_category(goal, asp):
 BOARD_COORD_PATH = WORLD_DIR / "board" / "coordination.jsonl"
 
 
+# Raw weight applied to a targeted directive that carries no explicit `weight:`
+# tag. Raw, i.e. BEFORE WEIGHTS["directive_boost"] = 1.5, so the default lands at
+# +1.5 final -- deliberately the same magnitude strategic_focus_boost already
+# contributes in-lane, and BELOW what an author gets by stating a weight
+# explicitly. Stating a weight remains the way to ask for stronger influence.
+DIRECTIVE_DEFAULT_WEIGHT = 1.0
+
+
+def parse_directive_admission(msg, now=None):
+    """THE shared admission predicate for board directives ().
+
+    Returns None when `msg` is not an admitted directive, else a dict:
+    {id, tags, text, target_goals, target_categories, weight, weight_explicit}.
+
+    WHY THIS EXISTS. Two call sites used to decide admission independently and
+    disagreed on exactly one clause, with no shared code to keep them honest:
+
+      load_active_directives (SCORING)  -- required an explicit `weight:` tag,
+        `if weight == 0.0: continue`, so a directive with `target:` tags and no
+        `weight:` tag was dropped from scoring ENTIRELY.
+      emit_directive_honor_banner (guard-1310 MUST-SELECT banner) -- required
+        only `target:` tags + directed-at-this-agent. It never looked at weight.
+
+    Net effect: the banner fired a MUST-SELECT imperative for directives the
+    scorer had scored at ZERO. Measured over the whole coordination board (32
+    directive messages): 2 carried `weight:` (6.2%), 18 carried `target:`/
+    `category:` (56.2%), exactly ONE carried both and could therefore score
+    (3.1%). Of the 2 carrying `weight:`, one was `weight:high` -- float() raised,
+    the bare except swallowed it, weight stayed 0.0 -- so the number of
+    directives that have EVER influenced scoring is ONE. Authors of the 17
+    targeted-but-weightless: echo 7, alpha 4, bravo 3, zeta 2, foxtrot 1 --
+    fleet-wide, not one agent's habit. Sharpest single case: a USER ENDORSEMENT
+    relayed from the alert inbox (msg-20260801-141730-alpha, tags
+    [user-directive, endorsement, target:g-115-4005, ...]) contributed exactly
+    0.00 to the ranking. A user-endorsed goal was invisible to the scorer.
+
+    THE DECISION (resolution (a) of the two the filing goal named, chosen
+    deliberately -- see the goal's own "Do NOT fix only one side"):
+    scoring ADMITS a targeted directive with DIRECTIVE_DEFAULT_WEIGHT when
+    `weight:` is absent, rather than the banner being tightened to require
+    `weight:` (resolution (b)). Reasons, in order:
+
+      1. (b) would make a weightless USER ENDORSEMENT inert on BOTH paths --
+         no boost and no banner. That is strictly worse than today, where at
+         least the banner fires. The user-endorsement case is the one this
+         subsystem most needs to get right.
+      2. (a) makes the two predicates agree BY CONSTRUCTION rather than by
+         hand: after this change there is no such thing as an admitted
+         zero-weight directive, so the banner can no longer compel a selection
+         the scorer scored at zero. The defect closes at its root.
+      3. The 17 live weightless directives become effective immediately, which
+         is what their authors plainly intended by writing `target:` at all.
+
+    GUARD-1310 CALIBRATION CONSEQUENCE, stated explicitly because outcome 2 of
+    the filing goal requires it and because it is the real risk of choosing (a):
+    guard-1310 was calibrated in a world where the boost had ALREADY lifted the
+    target near the top -- its own text says "directive_boost pushed it to
+    #1/#2 every time and the LLM skipped it anyway". Under (a) a directive no
+    longer compels selection with zero numeric support, so the banner's
+    MUST-SELECT is better justified than before, NOT worse. But the boost is
+    bounded (+1.5 final, a nudge and never a veto -- Scorer Sovereignty
+    g-115-2812), so a directive-targeted goal can still rank below a strong
+    candidate and still raise the banner. That residual gap is guard-1310's
+    to close via the ack / justified-deferral path, exactly as today; this
+    change narrows it rather than eliminating it. Re-read guard-1310 before
+    raising DIRECTIVE_DEFAULT_WEIGHT -- raising it trades Scorer Sovereignty
+    for banner agreement, which is not this goal's call to make.
+
+    A non-numeric `weight:` value now fails LOUD (stderr, naming the directive
+    id) instead of silently zeroing. Silent zeroing is the worse failure: the
+    tag is PRESENT and LOOKS correct, so the author has no way to learn it did
+    nothing. The directive is still admitted at the default weight -- a typo in
+    one tag should not silently discard the whole directive.
+    """
+    if msg.get("type") != "directive":
+        return None
+    now = now or datetime.now()
+    tags = _ensure_list(msg.get("tags"))
+
+    # Expiry -- identical semantics on both paths (unchanged).
+    for tag in tags:
+        if tag.startswith("expires:"):
+            try:
+                if now > datetime.fromisoformat(tag[8:]):
+                    return None
+            except (ValueError, TypeError):
+                pass
+
+    # Weight: explicit when parseable, else the default. Never zero-admits.
+    weight = DIRECTIVE_DEFAULT_WEIGHT
+    weight_explicit = False
+    for tag in tags:
+        if not tag.startswith("weight:"):
+            continue
+        try:
+            weight = float(tag[7:])
+            weight_explicit = True
+        except (ValueError, TypeError):
+            print(f"[goal-selector] directive {msg.get('id')}: non-numeric "
+                  f"weight tag {tag!r} — falling back to default weight "
+                  f"{DIRECTIVE_DEFAULT_WEIGHT}", file=sys.stderr)
+
+    # An EXPLICIT `weight:0` is the author saying "this directive should have no
+    # effect" -- honour it by dropping the directive from BOTH paths. Found by
+    # the  fresh-eyes pass on this very function: without this clause
+    # the explicit zero was admitted, scored 0.00, and STILL fired the banner --
+    # i.e. it reproduced the exact defect  closed, in the one case the
+    # original `if weight == 0.0: continue` had covered by accident. Removing
+    # that line fixed the implicit-zero path and silently opened the explicit
+    # one. Note the asymmetry with a non-numeric weight, which falls back to the
+    # default rather than dropping: `weight:high` is a TYPO (intent unknown, so
+    # preserve the directive) while `weight:0` is an INSTRUCTION (intent stated,
+    # so obey it).
+    if weight_explicit and weight == 0.0:
+        return None
+
+    target_goals = [t[7:] for t in tags if t.startswith("target:")]
+    target_categories = [t[9:] for t in tags if t.startswith("category:")]
+    if not target_goals and not target_categories:
+        return None  # No targets = no effect (unchanged on both paths)
+
+    return {
+        "id": msg.get("id"),
+        "tags": tags,
+        "text": str(msg.get("text", "") or ""),
+        "target_goals": target_goals,
+        "target_categories": target_categories,
+        "weight": weight,
+        "weight_explicit": weight_explicit,
+        # Whether this directive may compel a MUST-SELECT. A NEGATIVE weight is
+        # a deprioritisation, so a banner ordering the agent to select it now is
+        # self-contradictory -- it stays admitted (scoring still applies the
+        # negative bias) but must not compel. Computed HERE, and read as a field
+        # by the banner, so the "one predicate" property survives: the banner
+        # does not re-derive a weight rule, it consumes one.
+        "compels_selection": weight > 0.0,
+    }
+
+
 def load_active_directives():
     """Load active (non-expired) directive messages from the coordination board.
 
     Returns a list of dicts: [{target_goals: [...], target_categories: [...], weight: float}]
-    Parses structured tags from directive messages (see board.md Directive Payload Schema).
+    Admission is delegated to parse_directive_admission -- the SAME predicate
+    emit_directive_honor_banner uses, so scoring and the banner cannot diverge.
     """
     if not BOARD_COORD_PATH.exists():
         return []
     directives = []
     now = datetime.now()
     for msg in read_jsonl(BOARD_COORD_PATH):
-        if msg.get("type") != "directive":
+        d = parse_directive_admission(msg, now)
+        if d is None:
             continue
-        tags = _ensure_list(msg.get("tags"))
-        # Parse expiry
-        expires = None
-        for tag in tags:
-            if tag.startswith("expires:"):
-                try:
-                    expires = datetime.fromisoformat(tag[8:])
-                except (ValueError, TypeError):
-                    pass
-        if expires and now > expires:
-            continue  # Expired
-        # Parse weight modifier
-        weight = 0.0
-        for tag in tags:
-            if tag.startswith("weight:"):
-                try:
-                    weight = float(tag[7:])
-                except (ValueError, TypeError):
-                    pass
-        if weight == 0.0:
-            continue  # No weight = no effect
-        # Parse targets
-        target_goals = []
-        target_categories = []
-        for tag in tags:
-            if tag.startswith("target:"):
-                target_goals.append(tag[7:])
-            elif tag.startswith("category:"):
-                target_categories.append(tag[9:])
-        if not target_goals and not target_categories:
-            continue  # No targets = no effect
         directives.append({
-            "target_goals": target_goals,
-            "target_categories": target_categories,
-            "weight": weight,
+            "target_goals": d["target_goals"],
+            "target_categories": d["target_categories"],
+            "weight": d["weight"],
         })
     return directives
 
@@ -2886,6 +3161,25 @@ def emit_strategic_focus_banner(scored, agent_name):
     are precisely what broke it (on live data BOTH its top-pick category test and
     its challenger category test missed). Returns the emitted warnings for tests.
     Fail-open throughout: never raises, never blocks selection.
+
+    CHALLENGED AND UPHELD 2026-08-02 (foxtrot, g-115-4046; LAPTOP-3IOFCNEO,
+    Linux 6.6.87.2-microsoft-standard-WSL2). The recurring-only test was filed as
+    a suspected gap: banner silent while ranks 1-8 were all non-recurring asp-115.
+    It is not a gap, for two independently sufficient measured reasons.
+    (1) The lane was DRAINED, not outranked. goal-selector returned 552 candidates
+    of which exactly ONE was asp-335 (g-335-09); the other 28 non-terminal goals
+    were legitimately excluded (hypothesis_gate 16 / deferred 9 / dependency 3, per
+    `goal-selector.sh blocked`), and asp-335 stood at 611/673 complete. guard-2110:
+    an ordering test against a drained lane restates the directive's exit condition
+    and is never a compliance signal.
+    (2) That sole lane candidate is ITSELF recurring -- a monitoring cadence. A
+    widened predicate would have fired the banner recommending one routine sweep
+    over another, and over verified-defect work (5 of ranks 1-7 were verified
+    defects), realizing exactly the risk the scalar paragraph above declines to
+    take. Even had the top pick been recurring, gap was 0.0 and the `gap <= 0`
+    guard below returns [] regardless.
+    Do not re-litigate without first re-measuring the lane's ELIGIBLE set from
+    goal-selector's own candidate list (guard-2110: never hand-roll that predicate).
     """
     if not agent_name or not scored:
         return []
@@ -2985,21 +3279,34 @@ def emit_directive_honor_banner(scored, agent_name, board_path=None):
         known_agents = set(get_active_agents())
     except Exception:  # pragma: no cover - fail-open guard
         known_agents = set()
+    # _paths.ENVIRONMENT_ID is the canonical world identity (env var, then
+    # .env.local) -- do NOT re-derive it here.  first shipped a local
+    # _self_env_id() copying insight-trigger-sweep._self_env; both duplicate a
+    # constant this module already imports, and the local copy referenced an
+    # unimported PROJECT_ROOT that py_compile cannot catch (a NameError, not a
+    # syntax error) inside a function whose only guard was `except OSError`.
+    # None is a legitimate value and fails OPEN toward visibility -- see
+    # peer_surface.routing_tag_targets_agent for why this consumer diverges.
+    self_env = ENVIRONMENT_ID
     warnings = []
     for msg in rows:
-        if msg.get("type") != "directive":
+        # SHARED admission predicate () -- type, expiry, weight and
+        # target parsing all come from parse_directive_admission, the same
+        # function load_active_directives uses. These two call sites previously
+        # decided admission independently and disagreed on the weight clause, so
+        # this banner could fire a MUST-SELECT for a directive the scorer had
+        # scored at 0.00. They cannot diverge again without changing that one
+        # function, which is the point.
+        d = parse_directive_admission(msg, now)
+        if d is None:
             continue
-        tags = _ensure_list(msg.get("tags"))
-        expires = None
-        for tag in tags:
-            if tag.startswith("expires:"):
-                try:
-                    expires = datetime.fromisoformat(tag[8:])
-                except (ValueError, TypeError):
-                    pass
-        if expires and now > expires:
-            continue  # expired -- same semantics as load_active_directives
-        text = str(msg.get("text", "") or "")
+        if not d["compels_selection"]:
+            # Negative weight = a deprioritisation. Scoring still applies it;
+            # a MUST-SELECT banner for it would contradict the author. Read as
+            # a FIELD, not re-derived here -- see parse_directive_admission.
+            continue
+        tags = d["tags"]
+        text = d["text"]
         # : an explicit routing tag takes PRECEDENCE over a loose
         # prose mention. A directive routed to agent X (requires_action_by:X or
         # a bare agent-name tag) but naming agent Y in an exclusionary prose
@@ -3009,19 +3316,28 @@ def emit_directive_honor_banner(scored, agent_name, board_path=None):
         # (routed requires_action_by:alpha, prose "bravo cannot deploy it well")
         # false-flagged bravo on every selection; self-authored directives
         # (author names self in prose) hit the identical trap.
+        # : BOTH predicates route through peer_surface's tag rule so
+        # the @env-qualified form the cross-deployment convention recommends is
+        # seen here. The third clause below is not redundant with the second: a
+        # bare QUALIFIED tag (`zeta@ayoai-mind`, no requires_action_by prefix)
+        # fails the plain known_agents membership, so without the agent-part
+        # check has_routing_tag would stay False and the prose fallback would
+        # fire -- re-opening the  false-flag the fallback gate closed.
         has_routing_tag = (
             any(t.startswith("requires_action_by:") for t in tags)
-            or any(t in known_agents for t in tags))
-        explicitly_directed = (agent_name in tags
-                               or f"requires_action_by:{agent_name}" in tags)
+            or any(t in known_agents for t in tags)
+            or any(parse_routing_tag(t)[0] in known_agents
+                   for t in tags if "@" in str(t)))
+        explicitly_directed = any(
+            routing_tag_targets_agent(t, agent_name, self_env) for t in tags)
         directed = explicitly_directed or (
             not has_routing_tag and agent_name.lower() in text.lower())
         if not directed:
             continue
-        did = msg.get("id")
+        did = d["id"]
         if did in acked:
             continue  # already honored (ack or justified-deferral)
-        target_goals = [t[7:] for t in tags if t.startswith("target:")]
+        target_goals = d["target_goals"]
         for gid in target_goals:
             if gid not in rank_by_id:
                 continue  # blocked/gated -> not an executable candidate
@@ -3581,6 +3897,11 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
         "skill": goal.get("skill"),
         "category": category,
         "tags": _ensure_list(goal.get("tags")),
+        # : age source for apply_starvation_boost (the anti-starvation
+        # post-pass). A one-shot goal's score is otherwise fixed at filing time,
+        # so an aged unclaimed HIGH goal never rises. Passthrough only; not a
+        # WEIGHTS/scoring field, so guard-760 does not apply.
+        "created_at": goal.get("created_at") or goal.get("created"),
         "recurring": bool(goal.get("recurring")),
         "recurring_overdue_ratio": round(overdue_ratio, 3),
         "recurring_interval_hours": round(interval, 3),
@@ -3742,6 +4063,61 @@ def apply_cell_return_boost(scored, config, *, cells_dir=None, agent=None, graph
         s.setdefault("breakdown", {})["cell_return_bonus"] = round(bonus, 2)
         s.setdefault("raw", {})["cell_return_ppr_mass"] = round(cell_score, 4)
         s["raw"]["cell_return_overlap"] = overlap
+    return scored
+
+
+def apply_starvation_boost(scored, config):
+    """Anti-starvation lift for aged, unclaimed, HIGH-priority NON-recurring goals.
+
+    g-115-5426 (2026-08-10). The 21-term score_goal formula has an age-based
+    anti-starvation term for RECURRING goals (recurring_urgency / overdue_ratio)
+    but NONE for one-shot goals: a one-shot goal's score is essentially fixed at
+    filing time, so a lone HIGH goal in a sprawling, low-completion, heterogeneous
+    aspiration (canonical: an alert-sweep Unblock in asp-115) never rises and can
+    sit unclaimed indefinitely while consolidate-before-expand momentum
+    (completion_pressure + tail_bonus + context_coherence) keeps winning. This pass
+    gives such a goal a bounded lift that ramps with how long it has been unclaimed,
+    so a starved HIGH goal eventually wins selection. This is the missing counterpart
+    to guard-1337/guard-1498, which cover starvation of a goal that ranks TOP and is
+    deviated-from forever; this covers a goal that never ranks top at all.
+
+    NO-REGRESSION BY CONSTRUCTION: a goal younger than min_age_hours receives ZERO
+    boost, so selection is byte-identical for all but the genuine starvation
+    population. Recurring goals are skipped (recurring_urgency already covers them).
+    The lift ramps linearly from 0 at min_age_hours to max_boost at
+    full_boost_age_hours, is scaled by the goal's priority_multiplier (HIGH-only by
+    default), and is clamped at max_boost. max_boost defaults BELOW directive_boost's
+    4.5 raw ceiling so a fresh user directive still outranks a starved goal.
+
+    Mutates and returns ``scored`` in place; records the lift in each boosted
+    candidate's breakdown + raw for telemetry. Same in-place + no-op-when-disabled
+    contract as apply_cell_return_boost. created_at is read from the scored entry
+    (emitted by score_goal); a missing/unparseable timestamp -> no boost (fail-open).
+    """
+    if not config.get("enabled"):
+        return scored
+    min_age = float(config.get("min_age_hours", 12.0))
+    full_age = float(config.get("full_boost_age_hours", 36.0))
+    max_boost = float(config.get("max_boost", 4.0))
+    pmults = config.get("priority_multipliers") or {}
+    span = full_age - min_age
+    for s in scored:
+        if s.get("recurring"):
+            continue
+        prio_name = _PRIORITY_NUM_TO_NAME.get((s.get("raw") or {}).get("priority"))
+        mult = float(pmults.get(prio_name, 0.0)) if prio_name else 0.0
+        if mult <= 0:
+            continue
+        age_h = hours_since(s.get("created_at"))
+        if age_h is None or age_h < min_age:
+            continue
+        ramp = 1.0 if span <= 0 else min(1.0, (age_h - min_age) / span)
+        boost = round(mult * max_boost * ramp, 2)
+        if boost <= 0:
+            continue
+        s["score"] = round(s["score"] + boost, 2)
+        s.setdefault("breakdown", {})["starvation_boost"] = boost
+        s.setdefault("raw", {})["starvation_age_hours"] = round(age_h, 2)
     return scored
 
 
@@ -4238,6 +4614,16 @@ def cmd_select(args):
             global_live_ids = global_live_ids_retry
         else:
             # Two independent signals agree: genuinely all-blocked.
+            #  STEP 3: emit the SIBLING record. Before this, only the
+            # success branch above logged, so "retry also empty" had no event and
+            # no counter — its count was zero BY CONSTRUCTION, not by measurement,
+            # and the failure mode under investigation was structurally
+            # unobservable. Any backoff tuned against that metric would have been
+            # tuned against a number that could not move (which is why STEP 4 is
+            # explicitly ordered after this one).
+            _log_transient_allblocked_recovery(
+                world_aspirations, world_retry, 0,
+                event="transient_all_blocked_retry_also_empty")
             # (Report blocked goals from the fresh retry read for consistency.)
             blocked = collect_blocked(all_aspirations_retry, known_blockers=known_blockers,
                                       global_done_ids=global_done_ids_retry,
@@ -4312,6 +4698,14 @@ def cmd_select(args):
     # the sort so the boost drives ranking (same placement rationale as the
     # recurring_debt_bonus / substantive_demotion passes above).
     apply_cell_return_boost(scored, CELL_RETURN_CONFIG)
+
+    # Anti-starvation lift (): rescue aged, unclaimed HIGH-priority
+    # NON-recurring goals that never rise under the fixed one-shot score (recurring
+    # goals already have recurring_urgency). Runs AFTER the other boosts and BEFORE
+    # the sort so the lift drives ranking; a goal younger than min_age_hours gets
+    # zero boost, so normal selection is byte-identical (no-regression by
+    # construction). See apply_starvation_boost.
+    apply_starvation_boost(scored, STARVATION_CONFIG)
 
     # Sort: highest score first, then lower aspiration number, then lower goal number
     scored.sort(key=lambda x: (-x["score"], x["aspiration_id"], x["goal_id"]))

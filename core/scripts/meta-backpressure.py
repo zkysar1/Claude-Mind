@@ -118,6 +118,57 @@ def cmd_monitor(args):
     print(json.dumps({"status": "created", "meta_change_id": args.change_id}))
 
 
+# Characters that end an allowlisted base key and begin a sub-part of it:
+# `[` (indexed element), `.` (dotpath child), `_` (suffixed sibling note).
+# MUST stay a tuple, not a string — `"" in "[._"` is True under substring
+# semantics, which would make every prefix match and swallow the whole file.
+_AUDIT_FIELD_BOUNDARY = ("[", ".", "_")
+
+
+def _is_audit_only_field(field, allowlist):
+    """True when `field` is an allowlisted append-only key, or a sub-part of one.
+
+    The allowlist names BASE keys (`roi_history`); monitors register the shape
+    actually written. Measured on the live store (g-115-4552): indexed elements
+    (`roi_history[81]`), and suffixed sibling notes (`roi_history_note`,
+    `roi_history_note_20260716`). The former exact-match test matched NONE of
+    them — `audit_only_skips` sat at 0 for the 99 days between the allowlist
+    shipping (2026-04-25) and this fix, while 4 append-only ROI records were
+    rolled back and destroyed. Stripping a trailing `[N]` would have caught the
+    2 indexed shapes and still missed the 2 suffixed ones.
+
+    The prefix must end ON a boundary character, so an allowlisted
+    `step_attribution` does not swallow a hypothetical `step_attributions`.
+
+    Erring toward matching is deliberate and asymmetric: an over-match declines
+    a rollback and RECORDS the decision in `audit_only_skips` (visible, and the
+    monitor's `new_value`/`old_value` are both preserved), while an under-match
+    silently destroys observability data that is recoverable only from
+    `rollback_history` and only if someone notices.
+    """
+    # Type-guard before any startswith ( fresh-eyes). The predicate this
+    # replaced was `field in file_audit`, which returns False for a non-str field
+    # and never raises. startswith raises AttributeError on a non-str field and
+    # TypeError on a non-str key, and cmd_check has no try/except around the call —
+    # so ONE malformed monitor would abort the whole check and skip EVERY other
+    # monitor, including legitimate rollbacks. backpressure.yaml is a shared
+    # own-cloud store with a merge handler, so a null field is reachable. Fail
+    # toward False: identical behavior to the old predicate for malformed input.
+    if not isinstance(field, str):
+        return False
+    for key in allowlist:
+        if not isinstance(key, str) or not key:
+            # An empty key would also over-match: field.startswith("") is True for
+            # everything, so any field beginning with a boundary char would match.
+            continue
+        if field == key:
+            return True
+        if (field.startswith(key)
+                and field[len(key):len(key) + 1] in _AUDIT_FIELD_BOUNDARY):
+            return True
+    return False
+
+
 def cmd_check(args):
     """Check all active monitors against a new learning_value.
 
@@ -171,7 +222,7 @@ def cmd_check(args):
         # Check for regression → rollback
         if monitor["consecutive_below_baseline"] >= regression_window:
             file_audit = audit_only_fields.get(monitor["strategy_file"], []) or []
-            if monitor["field"] in file_audit:
+            if _is_audit_only_field(monitor["field"], file_audit):
                 # Audit-only field: skip rollback, mark monitor closed, record
                 # the skip for parity with rollback_history. Removed from the
                 # active list in the post-loop filter so the same monitor does
@@ -228,6 +279,24 @@ def cmd_check(args):
     # Only report dead end candidates for fields that were JUST rolled back in
     # this check run. Avoids repeated registration on every subsequent call.
     # audit_only_skipped fields intentionally excluded — they are not failures.
+    #
+    #  — checked for base-vs-indexed assumptions; DELIBERATELY left
+    # keying on the FULL field name, here and in _check_dead_end_candidates.
+    # Only the allowlist match test needed base-awareness. Reasons:
+    #  1. Both sides of the dead-end comparison derive the key identically from
+    #     the same `field` string (this set from rollback_actions, the Counter
+    #     from rollback_history), so they are always in the same namespace and
+    #     a base-vs-indexed MISMATCH is structurally impossible.
+    #  2. The `field` recorded at the skip/rollback sites above is the RECOVERY
+    #     SOURCE — restoring roi_history idx 81/82 was only possible because
+    #     rollback_history carried the exact indexed name next to failed_value.
+    #     Base-normalizing the record would have made that repair ambiguous.
+    #  3. Base-normalizing only the dead-end key WOULD change behavior
+    #     (roi_history[81] + roi_history[82] would count as 2 rollbacks of one
+    #     field), and is moot for allowlisted fields anyway — after the fix they
+    #     never enter rollback_actions, so they never reach the dead-end check.
+    #  4. For tunables the per-element keying is right: selection_heuristics[3]
+    #     .description and .source are genuinely different knobs.
     newly_rolled_fields = {f"{a['strategy_file']}:{a['field']}" for a in rollback_actions}
     dead_end_candidates = _check_dead_end_candidates(data, newly_rolled_fields) if newly_rolled_fields else []
 

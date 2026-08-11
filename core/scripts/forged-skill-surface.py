@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Surface forged skills whose triggers match a goal's text — the Phase 4 reader.
+"""Print the forged-skill registry as a compact index — the Phase 4 reader.
 
 WHY THIS EXISTS (g-115-3811, sig-48). `world/forged-skills.yaml` is the registry
 of already-forged capabilities, and `.claude/rules/forged-skill-resolution.md`
@@ -16,39 +16,48 @@ reader at the action point rather than restate the rule. sig-48 is 7/7
 CONFIRMED, and its strongest recorded evidence (g-335-409) is that the working
 shape is an UNCONDITIONAL step, because then nothing has to remember.
 
-MATCHING: whole-phrase containment, triggers of >=2 words. A skill matches when
-one of its trigger phrases appears CONTIGUOUSLY in the goal text, after both
-sides are lowercased and all non-alphanumerics collapse to single spaces. This
-is what `.claude/rules/forged-skill-resolution.md` rule 1 literally asks for —
-"a forged skill whose triggers match the PHRASE" — and triggers are authored as
-natural-language phrases precisely so they can be phrase-matched.
+NO MATCHER (g-115-4475, retiring the one this file used to carry). Earlier
+versions filtered the registry per goal, on the theory that an advisory firing
+on most goals is one nobody reads. g-115-4446 scored five candidate matchers on
+a 30-goal hand-labelled sample (24 ground-truth goal->skill pairs) on BOTH
+precision and recall per guard-2224, and the frontier has no usable point.
+Re-run independently on a second box 2026-08-01 (echo, g-115-4475), same
+numbers:
 
-MEASURED, because the first version of this file asserted precision it did not
-have. That version required all TOKENS of a trigger to appear anywhere in the
-goal's keywords, reusing `gates/capability.py::_extract_keywords`. It read as
-strict and was not: that tokenizer strips stopwords hard, so `'clean up S3'`
-reduces to `['clean']`, `'add a runtime endpoint'` to `['runtime']`, and
-`'run tests'` to `['tests']`. A whole-phrase rule over one common word is
-vacuous. Swept over all 4,154 goals in the world queue:
+    matcher                   TP   FP   FN   prec    rec     F1   fire%
+    v2-phrase (what shipped)   0    4   24   0.00   0.00   0.00     10%
+    C1 all-content-tokens      3   37   21   0.07   0.12   0.09     63%
+    C2 >=2-content-tokens     19  256    5   0.07   0.79   0.13     97%
+    C3 phrase OR >=75%         6   46   18   0.12   0.25   0.16     77%
+    C4 trigger+gap-join        0    4   24   0.00   0.00   0.00     10%
 
-    token-subset (v1)          68.3% of goals fired, mean 1.43 skills
-    phrase containment          26.4%, mean 0.33  (one degenerate 1-word
-                                trigger, 'stale', caused 732 of 1,098 hits)
-    phrase + >=2 words (this)   11.4%, mean 0.16, median 0
+The shipped matcher's recall was ZERO — all four of its fires were false
+positives, so it surfaced nothing correct on any goal in the sample. Precision
+never exceeded 0.12 on any candidate, so tuning a threshold moves ALONG a bad
+frontier rather than off it. The measured reason is a vocabulary mismatch: goal
+text is PROBLEM vocabulary written by the filer, triggers are PROCEDURE
+vocabulary written by the forger, and their overlap is close to orthogonal to
+relevance.
 
-The >=2-word floor costs no coverage: exactly two triggers are single-word
-('stale', 'reap', both on scan-stale-jobs, which keeps its other seven), and
-the one skill left with no matchable trigger (run-game-session) has an EMPTY
-triggers list and was unreachable under every rule including v1.
+So this file no longer decides. It prints all of them, always. Recall is 1.00 by
+construction and there is no threshold left to drift. The precision objection
+that motivated the matcher applies to an ALERT claiming relevance, not to a MENU
+claiming only existence — different artifacts, different reading contracts.
 
-An advisory that fires on two thirds of goals is one nobody reads, which would
-reproduce the exact miss this file exists to prevent. A miss is cheaper here
-than noise, so the floor stays.
+MEASURED COST (2026-08-01, 42 skills): 2,426 characters of index body, 2,800
+including the header and footer lines; ~57ms wall clock for the registry read
+plus 42 front-matter reads. The character counts are the hard numbers; a token
+count is NOT asserted here because no tokenizer was available on the measuring
+box — chars/4 puts it near 700, and identifier-heavy text tokenizes worse than
+that, so treat that as a floor rather than a figure.
 
 REUSE, NOT REBUILD. The registry loader is `gates/capability.py`'s, which
-already reads this same file for the capability gate. Only the MATCHER is
-local — deliberately, per the measurement above: the capability gate wants
-recall, this advisory wants precision.
+already reads this same file for the capability gate. Descriptions come from
+each skill's own SKILL.md front matter via `_skill_md.parse_front_matter` —
+which handles YAML block scalars, where a naive `^description:` regex captures
+the `>-` marker instead of the folded text (2 of 42 skills, measured). Coverage
+is 42/42; a skill whose front-matter `name` diverges from its registry key is
+caught separately by the /verify-learning forged-skill-transport check.
 
 ADVISORY ONLY: always exits 0. This must never block goal execution.
 """
@@ -56,7 +65,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 from pathlib import Path
 
@@ -71,159 +79,105 @@ try:
 except Exception:  # pragma: no cover - import guard, advisory must not break
     _load_forged_skills = None
 
-# Minimum words in a normalized trigger for it to be matchable. See the
-# MEASURED block in the module docstring: below 2, a trigger collapses to a
-# single common word and the phrase rule stops discriminating.
-MIN_TRIGGER_WORDS = 2
+try:
+    from _skill_md import parse_front_matter  # noqa: E402
+except Exception:  # pragma: no cover - import guard, advisory must not break
+    parse_front_matter = None
+
+# Characters of description kept per row. Chosen against the measured render in
+# the docstring: the 42 skill NAMES alone are ~950 characters, so this is the
+# knob that sets the whole index's size. Widening it is the supported way to
+# trade tokens for detail; there is no per-goal filtering to tune instead.
+DESC_WIDTH = 34
 
 
-def _norm(s) -> str:
-    """Lowercase, collapse non-alphanumerics to single spaces, pad with spaces.
+def _one_line(text, width: int = DESC_WIDTH) -> str:
+    """Collapse whitespace and clip to `width` on a word boundary."""
+    s = " ".join(str(text or "").split())
+    if len(s) <= width:
+        return s
+    cut = s[:width]
+    sp = cut.rfind(" ")
+    # Only honour the word boundary when it does not throw away most of the
+    # budget — a single long token would otherwise clip to almost nothing.
+    if sp > width * 0.6:
+        cut = cut[:sp]
+    return cut.rstrip(" ,;:.-—")
 
-    The padding makes `sub in text` a word-boundary test, so 'aws cli' does not
-    match inside 'flaws climate'.
+
+def _description(skill_name: str) -> str:
+    """One-line description from the skill's own SKILL.md front matter."""
+    if parse_front_matter is None:
+        return ""
+    try:
+        fm = parse_front_matter(
+            PROJECT_ROOT / ".claude" / "skills" / str(skill_name) / "SKILL.md")
+    except Exception:
+        return ""
+    return str((fm or {}).get("description") or "")
+
+
+def build_index(wdir) -> list:
+    """Return [{skill, description, scripts}] for every registered skill.
+
+    Sorted by name: this is a menu, so a stable alphabetical order is what makes
+    it scannable. Never raises — an unreadable registry yields an empty index.
     """
-    return " " + re.sub(r"[^a-z0-9]+", " ", str(s).lower()).strip() + " "
-
-
-_rule_phrases_cache = None
-
-
-def rule_name_phrases() -> set:
-    """Normalized phrases that are the NAME of a framework rule file.
-
-    A trigger equal to a rule's basename is CITATION-PRONE, and citations
-    vastly outnumber invocations. Goal prose cites rules constantly, as a
-    governing constraint and often while NOT doing the thing: measured
-    verbatim in live goals -- "archive before delete MD applies", "so archive
-    before delete APPLIES IF any row is removed", "INVERTS archive before
-    delete md", "GOVERNED BY archive before delete md and the cost of that
-    protocol EXCEEDS THE HARM". Whole-phrase containment cannot tell a
-    citation from a request, so such a trigger fires on the rule's own
-    readership rather than on the skill's work.
-
-    This is a property of the trigger's WORDING, not of any goal, which is
-    why it belongs here rather than in a polarity parser: the fix is
-    registry-shaped and self-maintaining -- any future trigger named after a
-    rule is caught with no further edit.
-
-    MEASURED 2026-07-29 (g-115-3887), 663 live goals / 35 skills / 214
-    matchable triggers:
-      - EXACTLY 2 triggers equal a rule basename ('archive before delete' on
-        archive-aws-graveyard and archive-efs-graveyard). Zero collateral --
-        the rule touches only the two known-bad triggers.
-      - That one phrase produced 52 of ~100 total trigger hits; 11 of 12
-        sampled match contexts were citations.
-      - Excluding it: fire rate 13.1% (87/663) -> 10.0% (66/663), i.e. 21
-        goals whose ONLY signal was the citation.
-      - No loss of genuine reach: "graveyard this stale environment directory
-        and purge the bucket of dead objects" still matches both skills via
-        their action-shaped triggers.
-    Consistent with this module's stated tradeoff -- "a miss is cheaper here
-    than noise" -- and with guard-1828 (sweep the real corpus, quote the
-    number, never assert selectivity from design intent).
-    """
-    global _rule_phrases_cache
-    if _rule_phrases_cache is None:
-        out = set()
-        try:
-            for p in (PROJECT_ROOT / ".claude" / "rules").glob("*.md"):
-                out.add(_norm(p.stem.replace("-", " ")).strip())
-        except Exception:  # advisory must never break on a missing rules dir
-            out = set()
-        _rule_phrases_cache = out
-    return _rule_phrases_cache
-
-
-def match_skills(text: str, wdir) -> list:
-    """Return [{skill, matched_triggers, scripts}] for skills triggered by text.
-
-    A skill matches when one of its >=2-word trigger phrases appears
-    contiguously in the normalized goal text, EXCLUDING triggers that are the
-    name of a framework rule (see rule_name_phrases -- those fire on citations).
-    """
-    if not text or _load_forged_skills is None:
+    if _load_forged_skills is None:
         return []
     try:
         entries = _load_forged_skills(wdir)
     except Exception:
         return []
 
-    ntext = _norm(text)
-    rule_names = rule_name_phrases()
     out = []
     for entry in entries:
-        hits = []
-        for trig in entry.get("triggers") or []:
-            ntrig = _norm(trig)
-            if len(ntrig.split()) < MIN_TRIGGER_WORDS:
-                continue
-            if ntrig.strip() in rule_names:
-                continue
-            if ntrig in ntext:
-                hits.append(str(trig))
-        if hits:
-            out.append({
-                "skill": entry.get("skill"),
-                "matched_triggers": hits,
-                "scripts": entry.get("scripts") or [],
-            })
-    out.sort(key=lambda e: (-len(e["matched_triggers"]), str(e["skill"])))
+        name = entry.get("skill")
+        if not name:
+            continue
+        out.append({
+            "skill": str(name),
+            "description": _description(name),
+            "scripts": entry.get("scripts") or [],
+        })
+    out.sort(key=lambda e: e["skill"])
     return out
 
 
-def _goal_text(goal_id: str, source: str) -> str:
-    """Best-effort goal title+description lookup. Never raises."""
-    try:
-        import os
-        from _paths import agent_dir  # noqa
-        base = WORLD_DIR if source == "world" else agent_dir(os.environ.get("MIND_AGENT", ""))
-        path = Path(base) / "aspirations.jsonl"
-        if not path.is_file():
-            return ""
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or goal_id not in line:
-                continue
-            try:
-                rec = json.loads(line)
-            except Exception:
-                continue
-            for g in rec.get("goals") or []:
-                if g.get("id") == goal_id:
-                    return f"{g.get('title') or ''}\n{g.get('description') or ''}"
-    except Exception:
-        return ""
-    return ""
+def render(index: list, width: int = DESC_WIDTH) -> str:
+    """The printed menu body — one row per skill, no filtering."""
+    return "\n".join(
+        "  /%s — %s" % (e["skill"], _one_line(e["description"], width))
+        for e in index
+    )
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--goal", help="goal id to look up")
-    ap.add_argument("--source", default="world", choices=["world", "agent"])
-    ap.add_argument("--text", help="raw goal text (overrides --goal lookup)")
     ap.add_argument("--json", action="store_true", help="emit JSON")
-    args = ap.parse_args(argv)
+    # parse_known_args, not parse_args: callers holding the pre-
+    # pseudocode still pass --goal/--source. Those are now meaningless, but
+    # erroring on them would break this script's one hard invariant — it must
+    # never block goal execution — for every in-flight session on the fleet.
+    args, _ignored = ap.parse_known_args(argv)
 
-    text = args.text or (_goal_text(args.goal, args.source) if args.goal else "")
-
-    matches = match_skills(text, WORLD_DIR)
+    index = build_index(WORLD_DIR)
 
     if args.json:
-        print(json.dumps({"matches": matches, "count": len(matches)}, indent=2))
+        print(json.dumps({"skills": index, "count": len(index)}, indent=2))
         return 0
 
-    if not matches:
-        # Silent on the common case: an advisory that prints on every goal is
-        # one that stops being read.
+    if not index:
+        # Empty registry or an unreadable one. Say so on stderr rather than
+        # printing nothing, which would be indistinguishable from a world that
+        # genuinely has no forged skills.
+        print("[forged-skill-surface] registry empty or unreadable "
+              "(world/forged-skills.yaml)", file=sys.stderr)
         return 0
 
-    print("[forged-skill-surface] ▸ ALREADY FORGED — do not hand-roll these:")
-    for m in matches:
-        trg = ", ".join(m["matched_triggers"][:3])
-        print(f"  /{m['skill']}  (triggers: {trg})")
-        for s in (m["scripts"] or [])[:3]:
-            print(f"      script: {s}")
+    print("[forged-skill-surface] ▸ %d FORGED SKILLS ALREADY EXIST — "
+          "check here before hand-rolling a procedure:" % len(index))
+    print(render(index))
     print("[forged-skill-surface] Registry: world/forged-skills.yaml — "
           ".claude/rules/forged-skill-resolution.md rule 2: check the registry, "
           "do not reason about whether a skill 'should' exist.")

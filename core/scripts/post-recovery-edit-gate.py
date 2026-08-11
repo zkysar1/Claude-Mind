@@ -2,18 +2,37 @@
 """Post-recovery edit gate ().
 
 Refuses Edit/Write/MultiEdit on framework files when the bound agent is in
-the (state=IDLE, mode=autonomous) tuple. That combination is unambiguously
-"loop crashed or auto-recovered, no goal in flight" — any framework edit
-attempted there is an orphan by construction (canonical incident: charlie
-session d600a945, 2026-05-20, which landed a verify-learning check against
-a confabulated g-115-1014 referenced only by a stale pre-compaction summary).
+the (state=IDLE, mode=autonomous) tuple AND is not a worker Body. For a
+REDUCER that tuple means "loop crashed or auto-recovered, no goal in flight" —
+any framework edit attempted there is an orphan by construction (canonical
+incident: charlie session d600a945, 2026-05-20, which landed a verify-learning
+check against a confabulated g-115-1014 referenced only by a stale
+pre-compaction summary).
+
+That tuple was called "unambiguously" crashed until 2026-08-06, and the
+Mind/Body split made the word false: a WORKER Body never flips agent-state, so
+(IDLE, autonomous) is its normal healthy working condition. The gate fired on
+every framework edit a worker made, leaving the override as the only way
+through — the state in which a gate has stopped doing its job. See the
+worker-body exemption in main().
 
 Exempt tuples:
   - (IDLE, assistant)     — user-directed work
   - (IDLE, reader)        — already lacks edit capability via permissions
   - (RUNNING, autonomous) — loop owns the edit
+  - (IDLE, autonomous) + forked per-session WM — a WORKER Body, working normally
+  - (IDLE, autonomous) + stop-checkpoint.json  — mid-graceful-stop, see below
   - UNINITIALIZED         — first-boot work
   - NO_AGENT / NO_SID     — fail open, no binding to gate against
+
+The graceful-stop exemption is the same correction as the worker one, on a
+second population the "unambiguously crashed" wording also mis-described. The
+deferred stop sequence sets IDLE at D1 and the target mode only at D7, so every
+step between them — D4 consolidation above all — runs at (IDLE, autonomous) BY
+DESIGN. aspirations-graceful-stop/SKILL.md says so in its own Mode invariant:
+"the skill retains autonomous capabilities through D7 even though agent-state
+changes mid-skill." A framework edit there is not an orphan; the agent is
+executing a documented sequence with a deliberate stop in progress.
 
 In-scope paths (relative to PROJECT_ROOT):
   - .claude/skills/**
@@ -191,6 +210,83 @@ def main():
         mode = _read_mode(agent_dir)
         # Only the (IDLE, autonomous) tuple is in scope for this gate.
         if state != "IDLE" or mode != "autonomous":
+            approve_no_mutation()
+
+        # WORKER-BODY EXEMPTION (). The tuple above stopped being
+        # "unambiguously crashed" when the Mind/Body split landed: a WORKER is
+        # (IDLE, autonomous) BY DESIGN — it never flips agent-state, and that is
+        # its normal, healthy, work-in-flight condition. Without this check the
+        # gate fires on every framework edit a worker makes and the only way
+        # through is the override, which is how a gate stops being a gate. Live
+        # evidence in the ledger before the fix: 3 of the last 3 records were a
+        # worker, one of them editing worker-loop/SKILL.md itself.
+        #
+        # This NARROWS the gate by positively identifying a worker; it does not
+        # weaken the crashed-reducer catch the gate exists for. A crashed or
+        # auto-recovered REDUCER has no forked per-session working memory (it
+        # stays on the agent-wide WM), so the canonical incident — charlie
+        # session d600a945, an orphan edit against a confabulated goal id — is
+        # still refused exactly as before.
+        #
+        # Predicate: a Body with a forked sessions/<SID>/working-memory.yaml is
+        # a WORKER. Same one bash-agent-inject keys BODY_WM_PATH on and
+        # worker_reducer_liveness / reducer_self_fence derive. Derived LOCALLY
+        # rather than imported, following guard-2445 — so no module can quietly
+        # change another's meaning of "which Body is this".
+        if (agent_dir / "sessions" / sid / "working-memory.yaml").exists():
+            approve_no_mutation()
+
+        # GRACEFUL-STOP EXEMPTION (). Second population the tuple
+        # mis-describes, found the same way the worker one was: the deferred
+        # stop sequence sets IDLE at D1 (aspirations-graceful-stop/SKILL.md:268)
+        # and the target mode only at D7, so D4 consolidation — and every other
+        # step in that window — runs at (IDLE, autonomous) BY DESIGN. Without
+        # this the gate refuses framework edits for the whole stop and the only
+        # way through is the override, whose token must land IN the edit content
+        # and therefore becomes permanent cruft in a framework file. That cost is
+        # what made alpha abandon the edit outright on 2026-08-05 rather than
+        # override — so the ledger shows zero graceful-stop overrides while the
+        # false-positive was real. A ledger of ACCEPTED overrides cannot count
+        # REFUSALS; do not read its emptiness as evidence the gate never fired.
+        #
+        # Predicate: stop-checkpoint.json, written at GS-0 (SKILL.md:134) and
+        # cleared ONLY at D7.1 (SKILL.md:481), so its presence brackets exactly
+        # the stop sequence and nothing else. Derived LOCALLY per guard-2445
+        # rather than shelling out to stop-checkpoint.sh — this is a PreToolUse
+        # hot path and stop_checkpoint.py owns the same literal at
+        # CHECKPOINT_NAME.
+        #
+        # guard-1562 enumeration of what is NEWLY permitted: framework edits at
+        # (IDLE, autonomous), non-worker, WITH a checkpoint present. THREE
+        # members — member (c) was found by the fresh-eyes pass on this very
+        # change, after this comment had already been written claiming two.
+        # (a) a live graceful stop D1..D7.1 — legitimate per the Mode invariant.
+        # (b) an INTERRUPTED stop whose checkpoint outlived it. That is not the
+        #     canonical incident's state: a checkpoint exists only because a stop
+        #     was deliberately requested, and CLAUDE.md's Session Start Protocol
+        #     routes that exact tuple (checkpoint present + mode still
+        #     autonomous) straight into /aspirations-graceful-stop --resume. The
+        #     crashed-mid-goal reducer the gate exists for leaves NO checkpoint,
+        #     so the canonical incident (charlie d600a945) is still refused.
+        # (c) NOT BOX-LOCAL — a checkpoint written by ANOTHER instance of this
+        #     same agent on a DIFFERENT machine. stop-checkpoint.json is absent
+        #     from core/config/session-manifest.yaml, so owncloud_sync falls to
+        #     its unregistered heuristic and syncs any known data extension:
+        #     measured 2026-08-06, _session_file_machine_local(
+        #     "stop-checkpoint.json", ...) returns False, where agent-state
+        #     returns True. The record carries stop_started_at / target_mode /
+        #     last_updated / resume_count and NO machine or SID field, so this
+        #     gate has nothing to key box-identity on and cannot narrow (c)
+        #     itself. Registering the file machine_local in the manifest is the
+        #     fix, and it is NOT scoped here because the same cross-box leak
+        #     already misroutes the Session Start Protocol into
+        #     `--resume` for a stop that happened on another box — a larger,
+        #     PRE-EXISTING surface than this exemption. Tracked by .
+        #     Until that lands, member (c) is a KNOWN residual: it narrows the
+        #     gate slightly more than intended on a multi-box agent, and it
+        #     cannot re-open the canonical incident, which requires no
+        #     checkpoint to exist anywhere.
+        if (agent_dir / "session" / "stop-checkpoint.json").exists():
             approve_no_mutation()
 
         # Override path — log + approve, surface to stderr.

@@ -6,8 +6,9 @@
 #
 # Hot path:
 #   1. Skinny PROJECT_ROOT resolve (no _paths.sh)
-#   2. Positional goal_id + optional agent_name + --cross-lane flag
-#   3. POST /v1/aspirations/claim?id=<goal_id>&agent=<name>[&cross_lane=<reason>]
+#   2. Positional goal_id + optional agent_name + --cross-lane / --override-lane-pin
+#   3. POST /v1/aspirations/claim?id=<goal_id>&agent=<name>
+#        [&cross_lane=<reason>][&override_lane_pin=<reason>][&sid=..][&source=..]
 #   4. On 200, print goal JSON to stdout
 #
 set -euo pipefail
@@ -29,6 +30,7 @@ GOAL_ID=""
 AGENT=""
 CROSS_LANE=""
 DEVIATION=""
+OVERRIDE_LANE_PIN=""
 # (PASSTHROUGH array removed : it was written in three places and read
 # in none — a vestigial leftover of the pre-daemon cutover. Its only live effect
 # was the `-*` branch's shift-the-flag-only behavior, which is the defect fixed
@@ -40,18 +42,32 @@ while [[ $# -gt 0 ]]; do
         --cross-lane)
             CROSS_LANE="${2-}"
             shift $(( $# >= 2 ? 2 : 1 ));;
+        --override-lane-pin)
+            # Lane-pin gate escape hatch (). FORWARDED to the daemon,
+            # which is where the gate runs — a wrapper-side gate is bypassable by
+            # any direct endpoint POST (guard-742/guard-554: the live runtime code
+            # behind a daemon-routed wrapper is the daemon's implementation).
+            # The VALUE is the audited justification, not a boolean: it lands in
+            # world/override-bypass-ledger.jsonl under gate 'lane-pin-gate'.
+            OVERRIDE_LANE_PIN="${2-}"
+            shift $(( $# >= 2 ? 2 : 1 ));;
         --source)
-            # Accept-and-ignore for convention symmetry (). Many
-            # skill digests (aspirations-select Chaining, aspirations-execute
-            # Inputs, loop digest Phase 4) instruct callers to pass
-            # `--source {world|agent}` to ALL downstream aspirations-*.sh.
-            # claim has no per-source semantics — the daemon endpoint derives
-            # source from the goal-id — but without this case the value
-            # ("world" or "agent") fell through to the `-*` catch-all which
-            # shifts only the flag, leaving the value to be parsed as a
-            # positional agent_name. Result was a phantom claimed_by=world
-            # row that needed three manual repair calls per occurrence.
-            # Consume both flag + value here so the convention is honored.
+            # FORWARDED as of . Accepted since  for convention
+            # symmetry (aspirations-select Chaining, aspirations-execute Inputs,
+            # loop digest Phase 4 all tell callers to pass `--source
+            # {world|agent}` to every downstream aspirations-*.sh) but then
+            # DISCARDED, on the stated premise that "claim has no per-source
+            # semantics — the daemon endpoint derives source from the goal-id."
+            # That premise was never true: claim() hardcoded
+            # `_resolve_paths(ctx, "world")` and refused agent-queue goals 400
+            # rather than deriving anything. Accepting a flag and dropping it is
+            # what let the loop digest's note stand — "the script's arg parser
+            # does [support both sources], the endpoint does not."
+            #
+            # Both halves now do. An empty/absent value still sends nothing, so
+            # the endpoint's own "world" default keeps every existing caller
+            # byte-identical.
+            SOURCE="${2-}"
             shift $(( $# >= 2 ? 2 : 1 ));;
         --deviation)
             # Scorer Sovereignty Layer B (): the sanctioned-deviation
@@ -82,7 +98,7 @@ while [[ $# -gt 0 ]]; do
             # core/config, and world/scripts — no caller passes any flag but
             # --source and --deviation.
             echo "Error: unrecognized flag '$1'." >&2
-            echo "  Accepted: --deviation <code> | --cross-lane <reason> | --source <world|agent> | --goal[-id] <id>" >&2
+            echo "  Accepted: --deviation <code> | --cross-lane <reason> | --source <world|agent> | --goal[-id] <id> | --override-lane-pin <reason>" >&2
             echo "  Usage: aspirations-claim.sh <goal-id> [<agent-name>] [--deviation <code>]" >&2
             exit 1;;
         *)
@@ -173,19 +189,32 @@ except Exception:
     # Measured on this box: 101 `update_against_missing_checkpoint` rows in
     # agents/<agent>/session/checkpoint-miss.jsonl.
     #
-    # WHY source is hardcoded "world" rather than derived: reaching here means
-    # the daemon claim returned rc=0, which happens only after _find_goal
-    # succeeded against the WORLD queue (aspirations_write.py claim()), and the
-    # both-queues case is refused 409 upstream. So the goal is a world-queue
-    # goal by construction. Agent-queue goals never reach this function at all —
-    # claim() refuses them 400 `agent_queue_goal` BY DESIGN ("Agent-queue goals
-    # do not require claims... Proceed directly to execution"), so the claim
-    # chokepoint structurally cannot cover source=agent and Phase 2.95 remains
-    # LOAD-BEARING for that path. Do not "finish the job" by dropping the loop
-    # digest's `IF source==world` claim guard: every agent-source iteration
-    # would then start with a 400 the digest treats as "journal abort +
-    # LOOP_CONTINUE", which would silently stop executing the entire recurring
-    # cadence (.. all live in the agent queue).
+    # WHY source is "${SOURCE:-world}" and no longer the literal "world"
+    # (). The old text asserted the goal was "a world-queue goal by
+    # construction", because claim() hardcoded the world queue and answered
+    # agent-queue goals 400 `agent_queue_goal`. That is no longer true: claim()
+    # now honors `&source=agent` and runs the full session-scoped guard stack on
+    # the agent queue. Leaving the literal here would have written an anchor
+    # labelling an AGENT goal as source=world the moment that path went live —
+    # a defect this wrapper would have introduced into every downstream
+    # checkpoint reader, silently.
+    #
+    # THE LANDMINE BELOW IS STILL LIVE — the sequencing changed, the hazard did
+    # not. Do NOT "finish the job" by dropping the loop digest's
+    # `IF source==world` claim guard in the same change as an endpoint edit. The
+    # digest is LLM-read markdown and takes effect on every agent's NEXT
+    # iteration; mind_api/src is only picked up when the daemon recycles (there
+    # is no autoreload — verified 2026-08-06). Flip both together and
+    # agent-source iterations call a daemon that still 400s, which the digest
+    # reads as "journal abort + LOOP_CONTINUE", silently halting the entire
+    # recurring cadence (.. all live in the agent queue).
+    # Correct order: land the endpoint -> commit (post-commit recycles the
+    # daemon) -> confirm the LIVE endpoint accepts source=agent -> only then the
+    # digest. Phase 2.95 therefore REMAINS load-bearing as the agent queue's
+    # only serialization until that lands. Tracked by , which also
+    # carries the fourth call site the original note missed: Phase 5.3's release
+    # is world-guarded too, and a claim protocol with no matching release
+    # strands a claim on every recurring cadence goal.
     #
     # ENSURE, not overwrite: writes only when no checkpoint exists or it
     # anchors a DIFFERENT goal. When Phase 2.95 already ran it wrote a RICHER
@@ -225,8 +254,8 @@ except Exception:
         *)      asp_num="";;
     esac
     if [ -n "$asp_num" ] && [ "${cp_goal:-}" != "$goal_id" ]; then
-        printf '{"goal_id":"%s","aspiration_id":"asp-%s","source":"world","phase":"selected","selected_at":"%s"}' \
-            "$goal_id" "$asp_num" "$(date +%Y-%m-%dT%H:%M:%S)" \
+        printf '{"goal_id":"%s","aspiration_id":"asp-%s","source":"%s","phase":"selected","selected_at":"%s"}' \
+            "$goal_id" "$asp_num" "${SOURCE:-world}" "$(date +%Y-%m-%dT%H:%M:%S)" \
             | MIND_AGENT="$agent" bash "$CORE_ROOT/scripts/loop-state-save.sh" init \
                 >/dev/null \
             || echo "[aspirations-claim] WARN: iteration-checkpoint init failed for ${goal_id} (claim still succeeded)" >&2
@@ -294,6 +323,19 @@ if [ -n "$CROSS_LANE" ]; then
     ENCODED_CL="$(rt_url_encode "$CROSS_LANE")"
     QUERY="${QUERY}&cross_lane=${ENCODED_CL}"
 fi
+# Lane-pin override (). Omitted when empty, so a caller that never
+# passes it sends a byte-identical request to what a pre-change daemon receives.
+if [ -n "${OVERRIDE_LANE_PIN:-}" ]; then
+    QUERY="${QUERY}&override_lane_pin=$(rt_url_encode "${OVERRIDE_LANE_PIN}")"
+fi
+# : forward the queue selector. Omitted when empty so the endpoint's
+# "world" default applies and no existing caller changes behavior. Sending
+# `&source=world` explicitly would also be harmless, but omitting keeps the
+# request shape identical to what a pre-change daemon receives — which matters
+# during the window between this commit and the daemon recycle.
+if [ -n "${SOURCE:-}" ]; then
+    QUERY="${QUERY}&source=$(rt_url_encode "${SOURCE}")"
+fi
 
 rc=0
 RESPONSE="$(rt_call POST /v1/aspirations/claim --query "$QUERY" 2>&1)" || rc=$?
@@ -319,7 +361,9 @@ if goal is not None:
         exit 0;;
     2)
         # T2.2: parity with CLI cmd_claim exit code. cross_lane_refused -> exit 2.
-        if echo "$RESPONSE" | grep -q '"cross_lane_refused"'; then
+        # lane_pin_refused joins it (): same class — a routing-POLICY
+        # refusal with a documented override — not a malformed-request error.
+        if echo "$RESPONSE" | grep -qE '"(cross_lane_refused|lane_pin_refused)"'; then
             printf '%s\n' "$RESPONSE" >&2
             exit 2
         fi

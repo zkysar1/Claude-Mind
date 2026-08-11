@@ -83,13 +83,36 @@ and no gate. This rule plus its enforcement in
 
 ## Enforcement
 
-Three layers catch this at different moments:
+Four layers catch this at different moments — and the fourth has **no
+automated gate at all**. That row is stated rather than omitted because an
+enforcement table listing only the gated lanes reads as complete, which is
+exactly how the chat lane stayed invisible until 2026-08-03 (g-115-4787).
 
 | Moment | Mechanism | What it catches |
 |---|---|---|
 | Defer-time write | `capability-gate.py` invoked from `cmd_update_goal` when `field == defer_reason` and value is non-null. On match, ALSO files an Unblock goal atomically — see "Auto-conversion" below. | Prevents the wrong defer from being written in the first place AND queues the action the agent should perform instead. Override flag: `--force-defer "<justification>"`. |
 | Re-entry sweep | `aspirations-precheck` Phase 0.5b re-probe with canonical script | Catches defers that slipped through or whose premise has expired. Clears them automatically. |
 | Notification time | `/notify-user` Step 1.5 gate on approval-request patterns | Prevents the third leak path: agent bypasses the defer write and just emails the user asking for approval. |
+| **Chat reply** — handing the user a command block to run | **NONE. Honor-system by construction**, plus an optional post-hoc detective (see below). | Nothing. This is the largest lane and the only ungated one. See `capability-before-user.md` § "The Fourth Surface". |
+
+**Why no gate is possible here.** The first three layers all inspect a
+WRITTEN RECORD — a `participants` field, a `defer_reason` value, an outbound
+payload — and a PreToolUse hook fires on TOOL CALLS. Assistant prose is
+neither: writing "here, run these commands" in a reply routes identical work
+to the identical human while producing no record and invoking no tool, so
+there is nothing for a hook to intercept. This is a structural limit, not an
+unbuilt feature; do not file work to "add the missing gate".
+
+**A post-hoc detective IS possible, and that is the honest remedy.** Measured
+2026-08-08 (g-115-4787): assistant TEXT blocks are readable from the session
+transcript at `~/.claude/projects/<project-slug>/<sid>.jsonl` — 2,965 in a
+single live session — and fenced command blocks are extractable from them by
+regex. So a Layer-C sweep in the shape of
+`core/scripts/aspirations-rejection-audit.py` (scan recent transcripts, extract
+fenced blocks from assistant prose, cross-check the commands against
+`capability-gate.py`) is buildable. It catches the lane AFTER the fact, which
+is worth more than a fourth honor-system paragraph, and it is the only
+mechanism this lane can have.
 
 ## Auto-conversion at Defer Time (Layer D)
 

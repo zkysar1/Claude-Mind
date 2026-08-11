@@ -217,11 +217,75 @@ Read agents/<agent>/session/pending-questions.yaml
 # genuinely-pending signals are still caught (line below already documented "the
 # unread finding(s)"); this only aligns the board-read call with that intent.
 Bash: board-read.sh --channel findings --since 30d --unread-only --json
+  → RECORD SHAPE (measured 2026-08-01, bravo N=20, cc-05). Output is JSONL — one
+    object per LINE, not a JSON array; `json.load` on the whole stream raises
+    "Extra data". Keys are exactly:
+    `author, channel, id, reply_to, session_id, tags, text, timestamp, type`.
+    **The body field is `text`.** This is stated because every rule below says
+    "whose text opens with" and none of them names the key: a first implementation
+    that reads `content` / `body` / `message` gets `""` for every record, which
+    makes `(a-pre)` — the exclusion the next 40 lines argue is the most
+    consequential filter in this step — match NOTHING and drop silently out of the
+    pipeline. Measured on the same corpus, same run, only the key differing:
+    **0 receipts dropped of 39 findings on the wrong key, 28 on `text`.** There is
+    no error and no empty result to notice; the count simply comes back inflated by
+    28, which is the direction that forces a false `act_later` forever. Same class
+    as the Phase 2.3 / Phase 2.4 defects above — a step reading a field its store
+    does not have — and it survived for the same reason: the failure looks like a
+    signal, not like a bug.
   → filter to findings WHERE ('self_evolution' in tags OR 'self-drift' in tags)
     AND directed at this agent. **EVALUATE THE TESTS IN THIS ORDER — an
     explicit agent ROUTING TAG outranks a loose prose mention** (the same
     precedence `aspirations-select` Phase 2.07 states for directives). Taking
     (a)'s prose disjunct before (b)'s exclusion is what inflates the count:
+      (a-pre) **CADENCE-RECEIPT EXCLUSION — runs FIRST, before any tag or author
+           test, and applies REGARDLESS of author.** Drop any finding whose text
+           opens with this ritual's own post shape: `Fresh-eyes <n>-><n>`,
+           `Fresh-eyes N=<k>`, `sq-012 TENTATIVE`, or a bare `N=<k>` series-point
+           line. Phase 8 Step 2 REQUIRES every fire to post a status tagged
+           `self_evolution` + the author's own name, so these are mandated
+           receipts, not signals.
+           **MATCH THESE CASE-INSENSITIVELY, AND MATCH THE `-review`/`-code`/
+           `-tree`/`-program` SUFFIXED FORMS TOO — the literals above are written
+           in one casing and the fleet writes at least thirteen.** Measured
+           2026-08-01 (alpha, N=21, cc-04, over every self_evolution/self-drift
+           finding in the 30d window): opening tokens split **287 lowercase vs 40
+           capital** — `fresh-eyes-code` ×267, `FRESH-EYES-CODE` ×40, `Fresh-eyes`
+           ×27, `FRESH-EYES` ×13, `fresh-eyes` ×12, `fresh-eyes-review` ×4,
+           `sq-012 tentative` ×4 (lowercase, against the `sq-012 TENTATIVE`
+           literal above), plus `Fresh-eyes-TREE`, `fresh-eyes-tree`,
+           `FRESH-EYES-PROGRAM`, `Fresh-eyes-program`. A reader who implements the
+           shape list LITERALLY — which is what a pseudocode literal invites —
+           catches ~12% of the receipts it was written to catch.
+           This was measured BY this defect firing: alpha's own N=14 receipt
+           (`fresh-eyes N=14 (alpha, cc-04): COMPLIES at 42.7%...`, lowercase f)
+           survived a literal (a-pre) implementation, reached (a0), matched its own
+           `alpha` tag, and landed in `board_signals` as a self-evolution signal —
+           the exact echo-N=19 convergence above, reproduced one day later by the
+           fix meant to prevent it. The case gap lands PRECISELY on own-authored
+           receipts, because (a-pre) is the only test that can reach them (see the
+           next paragraph), so a case miss here is never harmless.
+           Note the direction, which is why this cannot wait for a tidier fix:
+           every escaped receipt INFLATES `self_evolution_signals_count`, and
+           Phase 5.5 reads that count as change-pressure — so the failure always
+           pushes toward a false `act_later`, never toward a missed one.
+           **Why this had to move ABOVE (a0) rather than live only in (b):** (b)
+           already carried this shape test, but (a0) short-circuits on the agent
+           tag before (b) is ever reached — and the tag on a receipt is the
+           AUTHOR'S OWN name. So for exactly the agent that posted them, the test
+           that would catch them was unreachable. The ritual then reads its own
+           output as input and the tally grows by one per fire, converging on a
+           permanent act_later. Measured 2026-08-01 (echo, N=19): of 29 unread
+           self_evolution/self-drift findings in 30d the filter kept 4 as
+           directed-at-echo and **all 4 were echo's own ritual output** — 2
+           literal cadence receipts, plus one sq-012 self-signal counted twice
+           because its own 10-minute correction is a separate post. Honest
+           partner-authored count 0; honest novel-signal count 1; filter said 4.
+           Every prior fix in this family (guard-1877; the N=15 `agent:`-prefix
+           fix) tightened the PARTNER side — the self side had no shape test at
+           all. Line 91's intent is preserved: a genuine own-authored FOLLOWUP
+           finding does not match these shapes and still counts. Owned by
+           `g-115-4087`.
       (a0) tags carry ANY agent name → that tag DECIDES. MIND_AGENT among them
            → directed. Another agent's name and not MIND_AGENT → it is THAT
            agent's own signal → EXCLUDE, and do not consult the text at all.
@@ -237,6 +301,22 @@ Bash: board-read.sh --channel findings --since 30d --unread-only --json
            unaffected; do not read that as the hole being harmless — it means
            the failure is invisible when it fires. Normalize the prefix before
            the membership test.
+           **THIRD FORM: @env-QUALIFIED (`<name>@<env-id>`)** — g-115-4188.
+           Same defect, one step further out: a qualified tag matches NEITHER
+           the bare test NOR the `agent:` prefix test, so it falls through to
+           (a1)/(b) exactly as the `agent:` form did. Normalize by splitting on
+           the FIRST `@` (every registry env-id contains a hyphen, so a
+           hyphen-joined form cannot be split back unambiguously), then decide
+           on the agent part — and on the env part, which carries real meaning
+           HERE: `<name>@<this deployment's ENVIRONMENT_ID>` is that agent,
+           while `<name>@<some other env-id>` is a PEER DEPLOYMENT's same-named
+           agent and is neither MIND_AGENT nor a local partner. Do NOT compare
+           only the text before the `@` (guard-2860 — never relax an ownership
+           test to a pattern); that reads a peer's agent as the local one.
+           Measured 2026-08-06 over 9110 board records: 353 bare routing tags
+           vs 7 qualified, and all 7 named a peer deployment — so this form is
+           rare-but-live today, and the convention actively recommends it.
+           Canonical implementation: `peer_surface.routing_tag_targets_agent`.
       (a1) no agent tag, and the finding's SUBJECT is this agent (a claim ABOUT
            it — not merely a row in a cross-agent comparison table, and not an
            @-broadcast mention) → directed.
@@ -343,6 +423,29 @@ FROM the agent_status read in 2.6:
         weight = b.confidence * (1.0 if staleness_days <= 14 else 0.5)   # fresh + confident = stronger
         belief_signals.append({holder: <partner>, claim: b.belief,
                                confidence: b.confidence, staleness_days, weight})
+  → **READ EACH BELIEF TO FULL LENGTH BEFORE CLASSIFYING IT.** A partner belief
+    states the OBSERVATION first and its QUALIFYING INTERPRETATION last, so a
+    fixed-width display slice reliably shows a drift claim and cuts the clause
+    retracting it. This is `guard-1421`'s rule ("a truncated entry is UNREAD — do
+    not tune the slice") on a third store, with `guard-2043`'s mechanism (what you
+    cut is what matters, because qualifiers accumulate at the END).
+    Measured 2026-08-06 (alpha N=44, `hostname` cc-04, `uname -r`
+    6.8.0-136-generic) over all four beliefs held about this agent — lengths
+    281/337/413/467 chars, **every qualifying clause past char 245** (offsets 247,
+    265, 305, 325), so a `[:130]` survey slice showed NONE of them. Read whole,
+    bravo's belief opens "alpha has moved off the asp-335 product lane" and closes
+    "the directive lane being drained fleet-wide **rather than deprioritised by any
+    one agent**" — an EXHAUSTION reading (Decision Rule 14), the opposite of the
+    drift its head states.
+  → **The stake is arithmetic, not presentation.** This classification becomes
+    `confirming_signal_fraction` below, so a truncated read is laundered into a
+    number the Phase 5.5 helper cannot audit. Measured here on one unchanged
+    signal set: 0.5 → `act_later`; 0.75 and 1.0 → `no_change`. Note the DIRECTION
+    — a belief's head states what CHANGED (that is why the partner wrote it), so
+    truncation is biased toward reading change-pressure the author explicitly
+    disclaimed: always toward a false `act_later`, the same direction as the Phase
+    2.3b receipt leak above. When a belief carries no explicit disclaimer, say the
+    classification is a judgment and report the fraction BOTH ways.
   → surface belief_signals to Phase 3 "Recent self-evolution signals" as
     "<partner> believes (conf {confidence}, {staleness_days}d old): {claim}"
   → these are WEIGHTED hypotheses, NOT verdicts: a low-confidence or stale
@@ -475,7 +578,7 @@ noted) and pass to the helper:
 # Build signals JSON from Phase 3 briefing content
 SIGNALS_JSON='{
   "portfolio_drift_score":          {0..1 — degree the portfolio has drifted from Self emphasis since last review},
-  "completion_health":              {0..1 — average completion ratio across active aspirations},
+  "completion_health":              {0..1 — mean completion ratio across active aspirations, EXCLUDING single-goal `asp-xw-` cross-world imports (guard-2829, guard-2804). Each such import is one goal wearing an aspiration's clothes: it contributes a hard 0.0 carrying the same weight as an 897-goal aspiration, so it does not measure portfolio health, it dilutes it. Measured 2026-08-06 (bravo, cc-05): 27 active world aspirations, 9 of them single-goal `asp-xw-` -> raw mean 0.5025 vs filtered 0.7537, a 0.25 swing from records that represent no completable work. WHY THIS EXCLUSION IS WRITTEN HERE AND NOT LEFT TO THE GUARDRAIL (guard-1984): guard-2829 names this exact field verbatim and is retrievable, and two consecutive bravo passes (N=20, N=21) still passed the RAW figure, each catching it only afterwards by reading the prior pass's handoff. A guardrail cannot outvote the instrument it guards -- it fires when a reader happens to retrieve it, while this line is read by everyone who runs the ritual. Same shape guard-1877/Phase 2.3b already demonstrated one phase up},
   "self_evolution_signals_count":   {int — count of recent self-evolution indicators in last 30d = len(pq_signals from Phase 2.3) + len(board_signals from Phase 2.3b, g-115-1214) + len(belief_signals from Phase 2.6b, g-306-28). A partner's belief ABOUT this agent (e.g. bravo's "cross-domain stretch" read of alpha) is an external self-evolution signal even when pending-questions.yaml AND the findings board are both empty — it was invisible before g-306-28},
   "confirming_signal_fraction":     {0..1 — fraction of the counted self_evolution signals that CONFIRM the current lane, so the act_later gate fires on NET-DIVERGENT signal not gross volume (this PULLS the g-115-1680 lever self-assess-and-decide.sh already has but that Phase 5.5 was leaving at the 0.0 default). Compute = confirming_beliefs / self_evolution_signals_count, where a belief_signal (Phase 2.6b) is CONFIRMING if STALE (staleness_days > 14 — an aged partner read is not current drift-pressure) OR AFFIRMING (its claim matches this agent's current Self focus + active-aspiration lane); DIVERGENT only when FRESH AND its claim suggests drift/contradiction from current Self. pq_signals + board_signals are genuine change-indicators (never confirming). Emit 0.0 only when self_evolution_signals_count == 0. WHY (g-115-1742, alpha 2026-07-03): an affirming partner-belief — a correct external read of a stable, in-lane Self — is STABILITY evidence, not change-pressure; counting it toward act_later was a false-positive treadmill (evo=5 = 3 fresh-affirming + 2 stale, self 2d fresh, portfolio in-lane → wrongly returned act_later, re-filing a follow-up Idea every review that partners correctly read this agent)},
   "self_last_updated_days":         {int — days_since_self_updated from Phase 2.1},
@@ -485,6 +588,30 @@ SIGNALS_JSON='{
 Bash: echo "$SIGNALS_JSON" | bash core/scripts/self-assess-and-decide.sh --review-type fresh-eyes-review
   → capture decision, rationale, recommended_action from JSON output
 ```
+
+**IF YOU SWEEP AN AXIS TO TEST WHETHER THE DECISION IS ROBUST, NEUTRALIZE THE
+OTHER AXES FIRST — otherwise the sweep is vacuous** (guard-3295, measured
+2026-08-10, zeta N=54, cc-02 / Linux 6.8.0-136-generic). Several agents adopted a
+practice of sweeping `confirming_signal_fraction` and reporting "ROBUST — returns
+the same verdict at EVERY value" as evidence the belief-classification judgment
+does not move the outcome. Measured on this helper, that report is true and
+carries no information: `drift >= 0.40` and `net-divergent >= 2.0` are each
+SUFFICIENT ALONE, so sweeping `confirming_signal_fraction` (0.00–1.00),
+`portfolio_drift_score` (0.10–0.70), AND `self_evolution_signals_count` (0–8) each
+returned `act_later` at every point — three constant sweeps, because in each one
+the OTHER axis was independently carrying the verdict. Only neutralizing both at
+once returned `no_change`.
+
+A sweep whose output never changes is measuring the HELD axes, not the swept one,
+and the constancy is what makes it look like a strong result — which is why three
+prior fires (N=44/45/47) each booked it as robustness and none re-examined it.
+The valid form: hold every other axis at a value that CANNOT produce the verdict,
+then sweep, and report the neutralized flip point rather than the constancy. On
+this helper those boundaries are `drift` flips at **0.40** with
+`confirming = 1.00`, and `confirming` flips to `no_change` at **0.75** with
+`drift = 0.05`. This paragraph lives here rather than only in guard-3295 because a
+guardrail cannot outvote the instrument it guards (guard-1984) — the same reason
+the `completion_health` exclusion two screens up is written inline.
 
 Branch on decision:
 
