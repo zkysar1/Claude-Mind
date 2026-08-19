@@ -22,9 +22,12 @@ sys.path.insert(0, str(SCRIPTS))
 from worker_reducer_liveness import (  # noqa: E402
     DEFAULT_ERROR_THRESHOLD,
     LIVE_MARKER,
+    TOKEN_FP_MARKER,
+    TOKEN_FP_UNKNOWN,
     VERDICT_CONTINUE,
     VERDICT_WIND_DOWN,
     _parse_machine,
+    _parse_token_fp,
     decide,
     poll,
 )
@@ -381,3 +384,256 @@ def test_poll_is_callable_as_a_library_without_mains_path_insert(tmp_path):
     r = json.loads(proc.stdout)
     assert r["verdict"] == VERDICT_CONTINUE
     assert r["expected_machine"] == "cc-04"
+
+
+# ── the token-fingerprint axis () ───────────────────────────────────
+#
+# `machine_id` structurally cannot see a SAME-BOX reducer restart: the claim row
+# stays LIVE on the machine this Body expects while a NEW runner holds it, so
+# every poll returned CONTINUE and the Body kept producing work nobody would
+# merge. That was this module's documented MEASURED LIMIT.
+#
+# The closing signal is a NON-REVERSIBLE digest of runner_token, never the token
+# itself. The raw value is the ConditionExpression bearer credential for
+# `heartbeat` and `release_runner`, so publishing it to close a liveness gap
+# would hand every reader the ability to forge a heartbeat (defeating
+# reclaim_if_stale) or release a live claim — i.e. would defeat the mechanism
+# this poll exists to protect. See owncloud_backend.runner_token_fingerprint.
+
+FP_A = "1f4c0a9b2e6d8035"
+FP_B = "9a3e7c15d0b84621"
+
+LIVE_LINE_FP = LIVE_LINE + ", token-fp " + FP_A
+
+
+def test_parse_token_fp_from_the_real_live_line():
+    assert _parse_token_fp(LIVE_LINE_FP) == FP_A
+
+
+def test_parse_token_fp_is_absent_on_a_pre_upgrade_live_line():
+    """A daemon predating the field emits the old line verbatim. Absent, not
+    empty-string and not a crash — the mixed-version fleet's whole upgrade path
+    runs through this returning None."""
+    assert _parse_token_fp(LIVE_LINE) is None
+
+
+def test_parse_token_fp_maps_the_literal_unknown_to_none():
+    """The emitter prints `unknown` when the daemon supplied no fingerprint. If
+    that survived as a STRING it would compare EQUAL across two genuinely
+    different reducers and read as 'no takeover' — the one direction this axis
+    must never fail in."""
+    assert _parse_token_fp(LIVE_LINE + ", token-fp " + TOKEN_FP_UNKNOWN) is None
+
+
+def test_parse_token_fp_ignores_a_marker_on_a_LATER_line():
+    """Scoping proof, and the case a naive whole-string find gets wrong.
+
+    poll() feeds stdout+stderr CONCATENATED, so anything the wrapper logs can
+    sit beside the summary line. A mis-scoped read is worse than no read: it
+    would manufacture a spurious 'the fp changed' and wind down a healthy
+    worker."""
+    noisy = LIVE_LINE + "\n[runner-claim] debug: token-fp " + FP_B
+    assert _parse_token_fp(noisy) is None
+
+
+def test_parse_token_fp_ignores_a_marker_on_an_EARLIER_line():
+    noisy = "[runner-claim] warn: cached token-fp " + FP_B + "\n" + LIVE_LINE_FP
+    assert _parse_token_fp(noisy) == FP_A
+
+
+# A TRUNCATED LIVE line: cut between the opening and closing quote of the
+# machine id, with a later line supplying a stray quote. Shared by the parity
+# test below so BOTH parsers are pinned to the SAME fixture — the point of the
+# pin is that a future reader cannot harden one parser and leave its sibling
+# behind, which is exactly what happened here (rb-1915, guard-1924).
+TRUNCATED_LIVE = (
+    "[runner-claim] status: LIVE (backend=own-cloud) — 'zeta' " + LIVE_MARKER
+    + "'cc-0\n[warn] peer 'cc-99' busy"
+)
+
+
+def test_neither_parser_reads_across_a_truncated_live_line():
+    """ fresh-eyes: `_parse_machine` was NOT line-scoped and this fixture
+    made it return `'cc-0\\n[warn] peer '` — a machine id that differs from
+    expected_machine, so decide() wound down a HEALTHY reducer. That is the
+    fail-UNSAFE direction, and truncated output (ssh cut, bounded read, OOM kill
+    mid-write) is likeliest exactly when a worker is polled during trouble.
+    `_parse_token_fp` was already scoped and returned None on the same bytes."""
+    # Positive control FIRST — without it a fixture that merely lacked the
+    # marker would satisfy the assertions below for an uninteresting reason.
+    intact = TRUNCATED_LIVE.split("\n", 1)[0] + "2', heartbeat 1s old"
+    assert _parse_machine(intact) == "cc-02", "fixture is not a parseable LIVE line"
+
+    assert _parse_machine(TRUNCATED_LIVE) is None
+    assert _parse_token_fp(TRUNCATED_LIVE) is None
+
+    # The consequence, not just the parse: an unreadable machine must be
+    # non-discriminating, never a takeover.
+    assert decide(0, _parse_machine(TRUNCATED_LIVE), "cc-02", 0)["verdict"] != (
+        VERDICT_WIND_DOWN
+    )
+
+
+def test_same_machine_changed_fp_is_a_restart_takeover():
+    """THE new capability. Machine is IDENTICAL in both operands — this verdict
+    is unreachable by the machine axis at any threshold, which is exactly why
+    the gap existed."""
+    r = decide(0, "cc-02", "cc-02", 0, observed_token_fp=FP_B, expected_token_fp=FP_A)
+    assert r["verdict"] == VERDICT_WIND_DOWN
+    assert "restart" in r["reason"]
+    assert FP_A in r["reason"] and FP_B in r["reason"]
+
+
+def test_same_machine_same_fp_still_continues():
+    """The other half of the two-way proof (guard-1220): the new branch must
+    NARROW the LIVE path, not break it. Without this, a fix that wound down on
+    every poll would pass the test above."""
+    r = decide(0, "cc-02", "cc-02", 0, observed_token_fp=FP_A, expected_token_fp=FP_A)
+    assert r["verdict"] == VERDICT_CONTINUE
+    assert r["expected_token_fp"] == FP_A
+
+
+def test_first_live_poll_learns_the_fp():
+    r = decide(0, "cc-02", None, 0, observed_token_fp=FP_A)
+    assert r["verdict"] == VERDICT_CONTINUE
+    assert r["expected_token_fp"] == FP_A
+
+
+def test_an_absent_observed_fp_is_non_discriminating_not_a_change():
+    """FAIL-SAFE ASYMMETRY, and it points the OTHER way from this module's usual
+    invariant on purpose. An absent fp is a fact about the plumbing's VERSION,
+    not a signal about the reducer. Reading absence as change would wind down
+    every worker in a mixed-version fleet at once — the same fleet-wide kill the
+    transient threshold exists to prevent."""
+    r = decide(0, "cc-02", "cc-02", 0, observed_token_fp=None, expected_token_fp=FP_A)
+    assert r["verdict"] == VERDICT_CONTINUE
+    # ...and the learned fp SURVIVES, so a fleet that upgrades mid-session does
+    # not silently disarm the axis it had already armed.
+    assert r["expected_token_fp"] == FP_A
+
+
+def test_an_absent_expected_fp_cannot_wind_down():
+    """The first poll after an upgrade has an observation and no baseline. One
+    known operand is not a comparison."""
+    r = decide(0, "cc-02", "cc-02", 0, observed_token_fp=FP_B, expected_token_fp=None)
+    assert r["verdict"] == VERDICT_CONTINUE
+    assert r["expected_token_fp"] == FP_B
+
+
+def test_machine_takeover_still_wins_the_message_when_both_axes_move():
+    """A cross-box takeover changes BOTH signals. Either ordering yields
+    wind-down, so this pins only the more useful diagnostic — the one naming the
+    two boxes."""
+    r = decide(0, "cc-05", "cc-02", 0, observed_token_fp=FP_B, expected_token_fp=FP_A)
+    assert r["verdict"] == VERDICT_WIND_DOWN
+    assert "takeover" in r["reason"]
+
+
+def test_legacy_positional_callers_keep_todays_behaviour_exactly():
+    """The compatibility contract that lets this ship into a running fleet: a
+    caller that never learned the new params gets the machine-only decision, and
+    the new key is present-but-None rather than absent (a KeyError in poll())."""
+    r = decide(0, "cc-02", "cc-02", 0)
+    assert r["verdict"] == VERDICT_CONTINUE
+    assert r["expected_token_fp"] is None
+
+
+@pytest.mark.parametrize("rc", [1, 2, 3, 4, 7])
+def test_every_non_live_branch_preserves_the_learned_fp(rc):
+    """A blip or a not-live poll must not erase the reducer identity — same
+    reasoning as test_transient_preserves_the_expected_machine, and it has to
+    hold on EVERY return path or a single transient rc silently disarms the
+    axis."""
+    assert decide(rc, None, "cc-02", 0, expected_token_fp=FP_A)["expected_token_fp"] == FP_A
+
+
+def test_the_token_fp_marker_is_still_what_the_emitter_actually_prints():
+    """The emitter join, same shape and same reason as the LIVE_MARKER contract
+    test above (guard-920). runner-claim.sh is bash-with-embedded-python and
+    cannot import this constant, so asserting against its SOURCE is the only
+    real link. Without this, a reformat upstream leaves every hand-copied
+    parsing test green while `_parse_token_fp` silently returns None and the
+    same-box-restart branch goes dead — the exact failure mode F2 found on the
+    machine axis, on the axis added to close F2's own measured limit."""
+    live_stmt = _emitter_branch("status: LIVE")
+    assert TOKEN_FP_MARKER in live_stmt, (
+        f"runner-claim.sh's LIVE branch no longer prints {TOKEN_FP_MARKER!r}, so "
+        "worker_reducer_liveness._parse_token_fp can no longer read the claim's "
+        "token fingerprint and SAME-BOX reducer-restart detection is dead "
+        "(machine_id cannot see it — that is the whole reason this axis exists). "
+        "Re-derive the parse against the emitter's new format — do NOT just "
+        f"update this assertion.\nLIVE statement now reads:\n{live_stmt[:300]}"
+    )
+
+
+def test_the_emitter_never_prints_the_raw_token():
+    """Security contract, asserted at the surface a reader actually sees.
+
+    `runner_token` authorises `heartbeat` and `release_runner` via
+    ConditionExpression, so a wrapper that echoed it would put a bearer
+    credential into every worker's captured stdout, its state file, and any log
+    that quotes a poll. The endpoint deliberately has no raw-token field to
+    print (RunnerClaim carries only the digest); this pins the wrapper end so a
+    future 'just add the token, it's easier to debug' edit fails here."""
+    text = (SCRIPTS / "runner-claim.sh").read_text(encoding="utf-8")
+    assert "runner_token_fp" in text, "the wrapper no longer reads the digest at all"
+    bare = [ln for ln in text.splitlines()
+            if "runner_token" in ln and "runner_token_fp" not in ln]
+    assert bare == [], (
+        "runner-claim.sh references the RAW runner_token: " + "; ".join(bare))
+
+
+def test_poll_persists_the_fp_and_winds_down_on_a_same_box_restart(tmp_path):
+    """End-to-end through the state file, on the shape that motivated the goal.
+
+    Both polls report the SAME machine, so the machine axis cannot fire; only
+    the fp moves. Two separate poll() calls because — exactly as with the
+    transient counter — each real poll is its own PROCESS, so the baseline can
+    only reach the second decision THROUGH the persisted state."""
+    scripts = _claim_stub(tmp_path, "echo \"%s\"\nexit 0\n" % (LIVE_LINE + ", token-fp " + FP_A))
+    agent_dir = tmp_path / "alpha"
+
+    first = poll("alpha", agent_dir, "SID1", scripts)
+    assert first["verdict"] == VERDICT_CONTINUE
+    assert first["expected_token_fp"] == FP_A
+    state = json.loads((agent_dir / "sessions" / "SID1" /
+                        "reducer-liveness-state.json").read_text(encoding="utf-8"))
+    assert state["expected_token_fp"] == FP_A
+
+    # Same box, re-minted token: a new runner stale-broke in.
+    _claim_stub(tmp_path, "echo \"%s\"\nexit 0\n" % (LIVE_LINE + ", token-fp " + FP_B))
+    second = poll("alpha", agent_dir, "SID1", scripts)
+    assert second["expected_machine"] == "cc-04"      # machine never moved
+    assert second["verdict"] == VERDICT_WIND_DOWN
+    assert "restart" in second["reason"]
+
+
+def test_poll_against_a_pre_upgrade_emitter_continues_and_learns_nothing(tmp_path):
+    """The mixed-version fleet, end to end: an old wrapper emits no fp clause,
+    so two polls in a row stay CONTINUE with a null baseline. A regression that
+    treated None as a change would wind down every worker whose box had not been
+    upgraded yet."""
+    scripts = _claim_stub(tmp_path, FAKE_LIVE)
+    agent_dir = tmp_path / "alpha"
+
+    for _ in range(2):
+        r = poll("alpha", agent_dir, "SID1", scripts)
+        assert r["verdict"] == VERDICT_CONTINUE
+        assert r["expected_token_fp"] is None
+
+
+def test_cli_seam_drives_the_fp_axis():
+    """The worker loop branches on rc, and the two new argv slots are how a
+    shell-side probe reaches this branch at all."""
+    restart = _cli("0", "cc-02", "cc-02", "0", str(DEFAULT_ERROR_THRESHOLD), FP_B, FP_A)
+    assert restart.returncode == 1
+    assert json.loads(restart.stdout)["verdict"] == VERDICT_WIND_DOWN
+
+    steady = _cli("0", "cc-02", "cc-02", "0", str(DEFAULT_ERROR_THRESHOLD), FP_A, FP_A)
+    assert steady.returncode == 0
+    assert json.loads(steady.stdout)["verdict"] == VERDICT_CONTINUE
+
+    # Trailing args omitted -> today's behaviour, unchanged.
+    legacy = _cli("0", "cc-02", "cc-02", "0")
+    assert legacy.returncode == 0
+    assert json.loads(legacy.stdout)["expected_token_fp"] is None

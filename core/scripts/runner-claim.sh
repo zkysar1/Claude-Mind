@@ -234,8 +234,16 @@ if op == "status":
               f"past the {stale_after}s threshold. A /start would reclaim this as a "
               f"crashed runner; treat it as NOT live.")
         sys.exit(4)
+    # : carry the runner-token FINGERPRINT (never the token) on the LIVE
+    # line so worker_reducer_liveness can see a SAME-BOX reducer restart — a new
+    # token under an unchanged machine_id, which `mid` alone cannot distinguish.
+    # A daemon that predates the field yields None, printed as `unknown`, which
+    # the consumer must treat as non-discriminating (see TOKEN_FP_MARKER there):
+    # a mixed-version fleet must degrade to today's machine-only behaviour, not
+    # wind every worker down.
+    fp = c.get("runner_token_fp") or "unknown"
     print(f"[runner-claim] status: LIVE (backend={backend}) — '{agent}' is RUNNING on "
-          f"'{mid}', heartbeat {age}s old (threshold {stale_after}s)")
+          f"'{mid}', heartbeat {age}s old (threshold {stale_after}s), token-fp {fp}")
     sys.exit(0)
 
 if r.get("noop"):

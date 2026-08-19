@@ -64,9 +64,12 @@ if goal.hypothesis_id:
     if result == "CONFIRMED" or result == "CORRECTED":
         if not goal.recurring:
             Bash: aspirations-update-goal.sh --source {source} <goal-id> status completed
-        Bash: aspirations-update-goal.sh --source {source} <goal-id> completed_date <today>
-        Bash: aspirations-update-goal.sh --source {source} <goal-id> achievedCount <N+1>
-        Update recurring streaks if applicable (see Recurring Streak Logic below)
+            Bash: aspirations-update-goal.sh --source {source} <goal-id> completed_date <today>
+            Bash: aspirations-update-goal.sh --source {source} <goal-id> achievedCount <N+1>
+        # RECURRING GOALS: do NOT write completed_date, achievedCount, lastAchievedAt,
+        # currentStreak or longestStreak by hand — the canonical close path already
+        # writes all five, so a hand-write here is a SECOND WRITER. It is not a
+        # harmless duplicate: see "Recurring Streak Logic" below (guard-1604).
         Unblock dependent goals
     elif result == "EXPIRED":
         Bash: aspirations-update-goal.sh --source {source} <goal-id> status expired
@@ -91,9 +94,43 @@ Bash: bash core/scripts/verify-check-eval.sh --goal <goal-id> --all
 Read JSON result:
   flags = []:                     all_passed → standard-pass path
   flags = ["checks_empty"]:       fall through to Q1/Q2/Q3 (LLM evidence)
+  flags = ["checks_unevaluatable"]: fall through to Q1/Q2/Q3 — same as checks_empty
   flags = ["checks_failed"]:      goal fails verification; mark pending; record blocker if warranted
   flags = ["has_string_checks"]:  structured passed but string checks exist; run Q1/Q2/Q3 too
 ```
+
+`checks_unevaluatable` (g-115-4849) means the evaluator COULD NOT RUN one or
+more checks — an unknown type name, a missing required field, a command outside
+the allowlist — as opposed to running them and finding the work undone. Until it
+existed both landed in `checks_failed`, so a goal that genuinely succeeded was
+marked `pending` because its check used a type name predicate.py does not
+implement.
+
+Measured on the live world queue 2026-08-11 (20 active aspirations, 145
+structured checks): **68 of 145 — 46.9% — cannot be evaluated**, split
+`not-in-allowlist` 29, `missing-command` 22, `unknown-type` 17. That is a
+static LOWER BOUND: it is computed by inspection rather than by calling
+`evaluate()`, because evaluating an allowlisted `command_succeeds` would
+actually run the command 145 times, and it cannot see run-time schema failures
+such as an unresolvable `after_ref`.
+
+**Do not read the type-name bucket as the whole population.** The first pass of
+this very measurement counted only unknown type names, got 17/145 = 11.7%, and
+was wrong by a factor of four — the two larger buckets dispatch to a real
+evaluator and then get refused before anything is checked, so a census keyed on
+`type not in PREDICATE_TYPES` cannot see them. The 71% figure in g-115-4849's
+description is the pre-alias type-name count; g-115-5186's alias tables cut that
+bucket specifically, which is why the type-name share fell while the true
+unevaluatable share did not.
+
+`all_passed` is **null** on this path, exactly as on `checks_empty`: nothing was
+verified, so it must not read `true`; nothing failed, so it must not read
+`false`. Exit code is 0 — only a genuine failure exits 1.
+
+A genuine failure OUTRANKS an unevaluatable one: when both are present the flag
+is `checks_failed`, because an unevaluatable check must never launder a real
+failure into a fall-through. The unevaluatable tally survives that branch in the
+separate `unevaluatable_count` field — read it rather than inferring from flags.
 
 ### Sub-Phase Checkpoint Helper (shared by Q1/Q2/Q3 and standard checks)
 
@@ -346,9 +383,12 @@ IF len(checks) > 0:
 if all_passed:
     if not goal.recurring:
         Bash: aspirations-update-goal.sh --source {source} <goal-id> status completed
-    Bash: aspirations-update-goal.sh --source {source} <goal-id> completed_date <today>
-    Bash: aspirations-update-goal.sh --source {source} <goal-id> achievedCount <N+1>
-    Update recurring streaks if applicable
+        Bash: aspirations-update-goal.sh --source {source} <goal-id> completed_date <today>
+        Bash: aspirations-update-goal.sh --source {source} <goal-id> achievedCount <N+1>
+    # RECURRING GOALS: do NOT write completed_date, achievedCount, lastAchievedAt,
+    # currentStreak or longestStreak by hand — the canonical close path already
+    # writes all five, so a hand-write here is a SECOND WRITER. It is not a
+    # harmless duplicate: see "Recurring Streak Logic" below (guard-1604).
 
     # OUTPUT-CENTRIC HANDOFF (arXiv 2603.28990: factual outputs > status)
     # Generate output_summary BEFORE unblocking — dependent goals need it.
@@ -403,17 +443,41 @@ IF source == "world":
 Recurring goals NEVER set status to "completed" — they stay "pending".
 Goal-selector time gate prevents re-selection until `interval_hours` elapses.
 
-```
-interval = goal.interval_hours (fallback: remind_days * 24, default: 24)
-elapsed = hours_since(goal.lastAchievedAt)
-Bash: aspirations-update-goal.sh --source {source} <goal-id> lastAchievedAt "$(date +%Y-%m-%dT%H:%M:%S)"
+**DO NOT WRITE ANY OF THESE FIELDS BY HAND (guard-1604).** `lastAchievedAt`,
+`currentStreak`, `longestStreak`, `completed_date` and `achievedCount` are all
+written by the canonical close path on a recurring goal. The block below
+DESCRIBES what that path computes so a reader can interpret the values — it is
+NOT a set of commands to run.
 
+Why this is worse than a harmless duplicate, which is the reason it needs a
+warning rather than a note: **`lastAchievedAt` is an INPUT to the derivation,
+read immediately before it is overwritten.** Setting it by hand to the current
+time collapses `elapsed` to ~0, and the close then derives an UNBROKEN streak
+from that corrupted input — so a wrong number arrives looking script-computed.
+Nothing errors, and the false value is always the flattering one. Measured
+(g-001-02, bravo, 2026-08-04): a true 19.1h gap against a 15.99h break threshold
+correctly yields streak = 1; the hand-written path recorded 4.
+
+**Re-running the close does NOT repair it.** The hand-write destroyed the only
+copy of the previous `lastAchievedAt`, so a second run reads the value the first
+run just wrote, computes `elapsed ≈ 0` again, and derives the same unbroken
+streak — deterministically, forever. Recovery needs the ORIGINAL timestamp from
+the store's `.history` snapshot; there is no in-band fix.
+
+The cost is a suppressed learning signal, not a cosmetic one: the streak-break
+reflector consumes this field, so a falsely-unbroken streak silently removes the
+very signal that a cadence was missed.
+
+```
+# DESCRIPTIVE — what the canonical close path computes. Do not execute.
+interval = goal.interval_hours (fallback: remind_days * 24, default: 24)
+elapsed  = hours_since(goal.lastAchievedAt)   # read BEFORE the overwrite
+                                              # (this is why a hand-write corrupts it)
 if elapsed is not None and elapsed > 2 * interval:
-    new_streak = 1  # Missed interval — reset
+    new_streak = 1                 # Missed interval — reset
 else:
     new_streak = currentStreak + 1
-Bash: aspirations-update-goal.sh --source {source} <goal-id> currentStreak <new_streak>
-Bash: aspirations-update-goal.sh --source {source} <goal-id> longestStreak <max(new_streak, longestStreak)>
+# the close path then writes lastAchievedAt, currentStreak and longestStreak
 ```
 
 ## Return Protocol

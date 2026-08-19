@@ -31,6 +31,7 @@ from _silent_zero_predicate import (  # noqa: E402
     has_scoring_consumer,
     invokes_framework_wrapper,
     reads_exit_status,
+    shape_selective_suppressions,
     silent_zero_violations,
 )
 
@@ -212,6 +213,118 @@ def test_predicate_components():
 def test_predicate_type_boundary_fails_open():
     for bad in (None, 123, [], {}):
         assert silent_zero_violations(bad) == []
+
+
+# ------------------------------- SECOND FORM: shape-selective parser ()
+#
+# The distinguishing test in this block is test_shape_filter_that_SURFACES_is_approved.
+# Measured over 106,031 Bash calls, a predicate that flagged the shape test without
+# checking its consequence would have been 51% false positives (327 hits: 63 silent,
+# 66 loud, remainder neither) -- and every false positive lands on the CORRECT
+# handling of this exact failure. That test is the gate's own positive control.
+
+# The  founding command, verbatim in structure: an invalid --all filter,
+# stderr discarded, and a line scanner that drops whatever is not JSON.
+SHAPE_FOUNDING = (
+    "bash core/scripts/guardrails-read.sh --all 2>/dev/null | py -3 -c \"\n"
+    "import sys,json\n"
+    "for line in sys.stdin:\n"
+    "    line=line.strip()\n"
+    "    if not line.startswith('{'): continue\n"
+    "    print(json.loads(line)['id'])\n\""
+)
+
+
+def test_shape_selective_founding_shape_is_denied():
+    """The  incident: 0 records read from a healthy 1000-entry store."""
+    reason = assert_denied(SHAPE_FOUNDING)
+    assert "DISCARDS" in reason
+    assert "guard-3052" in reason
+
+
+def test_shape_filter_that_SURFACES_is_approved():
+    """THE POSITIVE CONTROL -- the single most important case in this file.
+
+    The same shape test, but it PRINTS the offending bytes and stops. That is the
+    correct handling of a wrapper that refused, and it is what a careful caller
+    writes. Denying it would use the gate's own best evidence to train readers
+    past the gate. Measured 66 such calls against 63 genuine defects.
+    """
+    assert_approved(
+        "bash core/scripts/guardrails-read.sh --id guard-2814 2>&1 | py -3 -c \"\n"
+        "import sys,json\n"
+        "raw=sys.stdin.read()\n"
+        "if not raw.lstrip().startswith(('{','[')):\n"
+        "    print('!! NOT JSON:', raw[:300]); raise SystemExit(1)\n"
+        "print(len(json.loads(raw)))\n\""
+    )
+
+
+def test_shape_filter_with_pipestatus_is_approved():
+    """A discarding filter is fine when the producer's status is actually read."""
+    assert_approved(
+        SHAPE_FOUNDING + '\necho "producer_rc=${PIPESTATUS[0]}"'
+    )
+
+
+def test_shape_filter_override_is_approved():
+    assert_approved(SHAPE_FOUNDING + f"  # {OVERRIDE_TOKEN}: wrapper interleaves banners")
+
+
+def test_shape_filter_on_non_framework_producer_is_approved():
+    """No framework wrapper -> not this class. `cat` failing is loud on its own."""
+    assert_approved(
+        "cat some.jsonl | py -3 -c \"\n"
+        "import sys\n"
+        "for line in sys.stdin:\n"
+        "    if not line.startswith('{'): continue\n"
+        "    print(line)\n\""
+    )
+
+
+def test_shape_message_names_rewrite_carveout_and_override():
+    reason = assert_denied(SHAPE_FOUNDING)
+    assert "raise SystemExit" in reason, "must name the concrete working rewrite"
+    assert OVERRIDE_TOKEN in reason, "must name its own escape hatch"
+    assert "approved by this gate" in reason, (
+        "must state the loud form is deliberately allowed, or a reader will "
+        "conclude the gate is against shape tests as such"
+    )
+
+
+def test_both_forms_present_keeps_the_original_message():
+    """Ordering is deliberate: the coercion branch is checked first so a command
+    carrying both forms keeps its already-pinned message rather than silently
+    switching text."""
+    reason = assert_denied(
+        "bash core/scripts/guardrails-read.sh --all 2>/dev/null | py -3 -c \"\n"
+        "import sys,json\n"
+        "d=json.loads(sys.stdin.read() or '[]')\n"
+        "for line in sys.stdin:\n"
+        "    if not line.startswith('{'): continue\n\""
+    )
+    assert "exit status" in reason, "expected the coercion-form message"
+
+
+def test_shape_predicate_components():
+    assert shape_selective_suppressions(SHAPE_FOUNDING)
+    assert not shape_selective_suppressions(
+        "bash core/scripts/x.sh | py -3 -c \"\n"
+        "for l in sys.stdin:\n"
+        "    if not l.startswith('{'): print(l); raise SystemExit(1)\n\""
+    ), "surfacing the line is correct handling"
+    assert not shape_selective_suppressions(
+        "bash core/scripts/x.sh | py -3 -c \"print(1)\""
+    ), "no stdin consumption and no shape test"
+    assert not shape_selective_suppressions("cat f | py -3 -c \"\n"
+                                            "for l in sys.stdin:\n"
+                                            "    if not l.startswith('{'): continue\n\""
+                                            ), "no framework wrapper"
+
+
+def test_shape_predicate_type_boundary_fails_open():
+    for bad in (None, 123, [], {}):
+        assert shape_selective_suppressions(bad) == []
 
 
 # ------------------------------------------------------------- WIRING (guard-1943)

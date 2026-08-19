@@ -68,16 +68,27 @@ ELSE:
             Edit agents/<agent>/session/pending-questions.yaml:
                 Set status=resolved, resolution="<entry.reason> (auto-resolved by sweep)",
                 resolved_at=<now>
-        ELIF entry.verdict == "cleanup_only":
-            # Already terminal-with-resolution, OR answered-with-answer.
-            # For "answered with answer": flip status to resolved AND copy
-            # the answer into resolution (single LLM-side YAML edit per
-            # batch is fine — typically 14 in one pass for alpha).
-            IF entry.status == "answered":
-                Edit: status=resolved, resolution="<answer field copied>", resolved_at=<now>
-            # ELSE: already resolved with resolution; nothing to mutate.
-            #       The "cleanup_only" verdict surfaces them so the report
-            #       counts include them but no YAML edit fires.
+        ELIF entry.verdict == "needs_transition":
+            # ACTIONABLE. status=answered with a non-empty answer; only the
+            # status flip is outstanding. Copy the answer into resolution.
+            Edit: status=resolved, resolution="<answer field copied>", resolved_at=<now>
+            # Or discharge the whole batch in one call instead of editing YAML
+            # by hand — the script grew a writer for exactly this class:
+            #   Bash: pending-questions-sweep.sh sweep --apply-cleanup
+            # It preserves the `answer` field and sets status/resolved_at/
+            # resolution only. Kept OUT of plain --apply on purpose: --apply
+            # also runs unattended from precheck, and these entries carry a
+            # real user answer.
+        ELIF entry.verdict == "already_terminal":
+            # INERT. Already terminal with a resolution — NOTHING TO MUTATE.
+            # This class persists by DESIGN and re-classifies here on every
+            # sweep forever, so its count is a steady state, not a backlog.
+            # It shared the `cleanup_only` verdict with needs_transition until
+            # g-115-3753 / g-115-5025: one number covering "work to do" and
+            # "work already done" could report neither, and `cleanup_available`
+            # fired permanently because this half never reaches zero.
+            # Measured cc-07 2026-08-10: 38 cleanup_only was 24 + 14.
+            (no edit)
         ELIF entry.verdict in {"likely_resolved", "likely_stale"}:
             # Marginal cases — brief LLM judgment per entry. Read the entry
             # body, re-check the heuristic's reason against current world
@@ -91,15 +102,22 @@ ELSE:
             # user sees the count of long-pending entries on next /prime.
             (no edit)
     IF any status flipped to resolved: Bash: session-signal-set.sh pq-resolved
-    Report: "Pending questions: auto={counts.auto_resolve}, cleanup={counts.cleanup_only},
+    Report: "Pending questions: auto={counts.auto_resolve},
+             needs-transition={counts.needs_transition},
+             already-terminal={counts.already_terminal} (inert),
              confirmed={count of likely_* the LLM accepted}, kept={count kept pending},
              review={counts.flag_for_review}, total={counts.total}"
+    # Report the two SEPARATELY. Reporting their sum is the defect: a single
+    # number cannot distinguish a backlog from a steady state, and the inert
+    # half never falls, so the combined figure always read as debt.
+    # `counts.cleanup_only` still exists as their sum for older consumers, but
+    # nothing should key a decision on it.
 ```
 
 Sweep heuristics (priority order, from `core/scripts/pending-questions-sweep.py`):
 
-1. `cleanup_only` — already-terminal status with non-empty resolution
-2. `cleanup_only` — status=answered with non-empty answer (just needs status flip)
+1. `already_terminal` — already-terminal status with non-empty resolution (INERT, nothing to do)
+2. `needs_transition` — status=answered with non-empty answer (ACTIONABLE, just needs the status flip)
 3. `likely_resolved` — agent_answered + 7-day grace expired
 4. `likely_stale` — infra-state question (PID/port/VRAM/etc.) + 14-day age
 5. `likely_stale` — ritual entry (fresh-eyes-*) superseded by newer resolved sibling

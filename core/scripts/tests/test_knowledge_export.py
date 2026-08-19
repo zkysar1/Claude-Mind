@@ -69,6 +69,10 @@ def _build_world(root: Path, *, write_bodies: bool = False) -> Path:
                 "parent": "marine-biology",
                 "children": ["bleaching"],
                 "file": "world/knowledge/tree/marine-biology/coral-reefs.md",
+                # Date-only, as the live index stores it (1379/1379 nodes, measured
+                # 2026-08-12). 9-hook-internals below deliberately OMITS it, so the
+                # two-node fixture carries its own negative control.
+                "last_updated": "2026-04-28",
             },
             "9-hook-internals": {  # leading digit exercises _humanize_key
                 "summary": "framework plumbing per guard-321",
@@ -163,6 +167,14 @@ def test_read_tree_nodes_shapes_records(tmp_path: Path) -> None:
     assert reef["children"] == ["bleaching"]
     # category carries the file path so the projection's system/-suppression works.
     assert reef["category"] == "world/knowledge/tree/marine-biology/coral-reefs.md"
+    # Carried off the INDEX entry, not the node's front matter — a wiki client's
+    # "changed since your last visit" is keyed on it, and this reader dropped it
+    # entirely until . Negative control on the next line: an index entry
+    # without the key must yield "", never a fabricated or plausible-looking date,
+    # because the consumer treats "" as unknown and stays silent rather than
+    # claiming nothing changed (guard-3221).
+    assert reef["last_updated"] == "2026-04-28"
+    assert nodes["9-hook-internals"]["last_updated"] == ""
 
 
 def test_read_tree_nodes_missing_yaml_is_empty(tmp_path: Path) -> None:

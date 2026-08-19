@@ -44,6 +44,16 @@ from ..endpoints._jsonl_common import (
 
 VALID_STAGES = {"discovered", "active", "measurement-pending", "resolved", "archived"}
 
+# The order the branches in read() are tried, and therefore the order in which a
+# caller passing two selectors gets one silently chosen for it. Declared here as
+# data so the exactly-one guard can NAME the winner in its refusal, and so
+# test_pipeline_read_exactly_one.py can assert this list still matches the real
+# branch order rather than trusting a comment (guard-1943: pinning a constant
+# says nothing about the code it claims to describe).
+SELECTOR_PRECEDENCE = ("narrative", "stage", "id", "summary", "counts",
+                       "accuracy", "unreflected", "replay_candidates",
+                       "archive", "meta")
+
 # The outcome narrative is NOT always in `outcome_detail`. Ordered fallback chain,
 # canonical source for every reader (gap-062). Measured 2026-08-04 over the 351-record
 # replay-candidate population: outcome_detail wins on 260 (74.1%); 79 (22.5%) win on a
@@ -106,6 +116,53 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
 
     q = ctx.query
     jc = cache()
+
+    # --- exactly-one enforcement () --------------------------------
+    # The module docstring has declared these selectors "mutually exclusive --
+    # exactly one" since it was written, and nothing enforced it. Every branch
+    # below RETURNS, so a caller passing two gets whichever sits earlier in this
+    # function and is never told the other was dropped.
+    #
+    # Measured 2026-08-04 (zeta, cc-02): `--stage resolved` -> 90 records;
+    # `--stage resolved --unreflected` -> the SAME 90, byte-identical id
+    # sequence; `--unreflected` alone -> 4. A 22.5x over-count with no error,
+    # always in the direction that makes the reflection backlog look enormous.
+    #
+    # NOT rb-538 (multi-layer parsers dropping UNKNOWN flags). Here the flag is
+    # KNOWN at every layer: pipeline-read.sh parses it into FLAG_KEYS, forwards
+    # it, and the branch below implements it correctly. A parser-whitelist audit
+    # PASSES. It is dropped by BRANCH PRECEDENCE, which no whitelist check can
+    # detect -- so the enforcement has to live where the precedence is.
+    #
+    # WHY REFUSE RATHER THAN COMPOSE. Composing would change the response shape
+    # of every flag pair and would contradict the contract this module already
+    # states; refusing makes the implementation honor the contract it already
+    # declares. It also disarms the trap for EVERY future pair rather than the
+    # one pair that happened to bite -- the generalizable half. Costed against
+    # a corpus re-measured 2026-08-10: ZERO call sites combine --stage with
+    # anything, and exactly ONE combined any two selectors (aspirations-
+    # consolidate Step 0.1, corrected in this same change). A 400 here is
+    # strictly better than the silent wrong answer it replaces: the caller
+    # learns, in the response, which selector won and which were discarded.
+    selectors = [n for n in SELECTOR_PRECEDENCE
+                 if (q.get(n) if n in ("stage", "id") else flag(q, n))]
+    if len(selectors) > 1:
+        # narrative= is the ONE sanctioned composition -- it refines `id=` (a
+        # single record) or `stage=` (a filtered set), per the docstring. Three
+        # is never sanctioned: narrative+id+stage would drop the stage filter on
+        # the same precedence principle this guard exists to stop.
+        sanctioned = (len(selectors) == 2 and "narrative" in selectors
+                      and set(selectors) <= {"narrative", "id", "stage"})
+        if not sanctioned:
+            winner = selectors[0]
+            dropped = ", ".join(selectors[1:])
+            return Response.error(
+                400, "ambiguous_selectors",
+                f"Exactly one selector is required; got: {', '.join(selectors)}. "
+                f"These do not compose -- branch precedence would have answered "
+                f"'{winner}' and silently discarded {dropped}. Issue one call per "
+                f"selector and combine the results caller-side. (Only narrative= "
+                f"composes, with either id= or stage=.)")
 
     # Checked BEFORE stage/id: those two branches return early, so `narrative=1&id=X`
     # would otherwise be swallowed and answered with the raw record. Nothing existing
@@ -213,9 +270,42 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
         return Response.text("{}", content_type="application/json")
 
     if flag(q, "unreflected"):
+        # : this branch read _live_path ONLY and additionally filtered
+        # stage=="resolved", two compounding narrowing filters either of which was
+        # sufficient alone. Measured 2026-08-08 (echo, cc-03): it returned 8 of 63
+        # genuinely-unreflected records — a 7.9x under-report of the reflection
+        # backlog, inherited by EVERY consumer, since they all read this endpoint
+        # (iteration-close learning-gate, consolidation-precheck, quiescence-gate,
+        # /reflect --full-cycle Phase A).
+        #
+        # WHY IT WAS STARVATION AND NOT A COUNTING NIT: archiving here is
+        # AGE-driven, not completion-driven (ARCHIVE_AGE_DAYS=3). So a hypothesis
+        # resolved and not reflected within 3 days became PERMANENTLY invisible to
+        # the backlog that would have caused it to be reflected. The filter
+        # selected FOR the records least likely to have been reflected and hid
+        # exactly those.
+        #
+        # The union + live-wins dedup is replay_candidates' (below), reused rather
+        # than re-derived: archive first, live second, so the live copy wins the
+        # last-write — update_field probes live-first, so post-archival stamps land
+        # there and the archive copy is frozen at first-archival ().
         items = jc.get(_live_path(ctx))
-        unreflected = [r for r in items
-                       if r.get("stage") == "resolved" and not r.get("reflected", False)]
+        archive = jc.get(_archive_path(ctx))
+        _by_id: dict = {}
+        for r in list(archive) + list(items):
+            rid = r.get("id")
+            if rid is not None:
+                _by_id[rid] = r  # live iterates second → live copy wins
+        # stage: "archived" is now admitted alongside "resolved", matching the
+        # sibling branch. Keeping resolved-only would have re-imposed narrowing
+        # filter (2) on the union and hidden the archived-in-live tombstones this
+        # change exists to surface — a record does not stop being resolved-and-
+        # unreflected by aging past three days. The stage filter is kept (rather
+        # than dropped entirely) so genuinely un-resolved work — discovered,
+        # active, measurement-pending — still cannot enter a reflection backlog.
+        unreflected = [r for r in _by_id.values()
+                       if r.get("stage") in ("resolved", "archived")
+                       and not r.get("reflected", False)]
         return json_response_pretty(unreflected)
 
     if flag(q, "replay_candidates"):

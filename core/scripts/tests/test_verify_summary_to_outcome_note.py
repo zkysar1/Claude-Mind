@@ -141,6 +141,15 @@ def _stage(tmp_path):
     (core / "_goal-arg-normalize.sh").write_text(
         (SCRIPTS / "_goal-arg-normalize.sh").read_text(encoding="utf-8"),
         encoding="utf-8")
+    # Real bytes, same reason as the normalizer above:  moved the
+    # never-clobber probe+write OUT of iteration-close.sh and into this shared
+    # helper so a worker Body can call the same component (guard-2676). It IS
+    # the production behaviour these tests assert on — stubbing it would replace
+    # the thing under test with a guess and every assertion below would pass
+    # against the stub.
+    (core / "closure-evidence-write.sh").write_text(
+        (SCRIPTS / "closure-evidence-write.sh").read_text(encoding="utf-8"),
+        encoding="utf-8")
     (core / "aspirations-update-goal.sh").write_text(STUB_UPDATE, encoding="utf-8")
     (core / "aspirations-query.sh").write_text(STUB_QUERY, encoding="utf-8")
     for name in PASSTHROUGH_STUBS:
@@ -448,6 +457,22 @@ def test_metric_gate_falls_back_to_the_record(tmp_path):
         "the metric gate's empty-SUMMARY fallback no longer reads the goal "
         "record; the gate is starved again on the loop path")
     # The fallback is worthless if the producer stops writing the field it reads.
-    assert 'outcome_note "$SUMMARY"' in src, (
-        "do_verify no longer writes SUMMARY to outcome_note, so the consumer "
+    #
+    # FOLLOW THE WRITE, DO NOT WEAKEN THE PIN (). The literal
+    # `outcome_note "$SUMMARY"` used to sit in iteration-close.sh; it now lives
+    # in closure-evidence-write.sh, because a WORKER Body skips do_verify
+    # entirely and had no producer at all, so the write had to become a shared
+    # component both orchestrators call (guard-2676). That is a refactor, not a
+    # regression -- but deleting this assertion would retire the only thing
+    # tying producer to consumer, so it is re-pointed at BOTH halves instead:
+    # iteration-close must still route to the helper, and the helper must still
+    # perform the write. Either half alone can be true while the field goes
+    # unpopulated.
+    assert "closure-evidence-write.sh" in src, (
+        "do_verify no longer routes to closure-evidence-write.sh, so nothing on "
+        "the reducer close path writes SUMMARY to outcome_note and the consumer "
         "fallback above reads a field nothing populates")
+    helper_src = (SCRIPTS / "closure-evidence-write.sh").read_text(encoding="utf-8")
+    assert 'outcome_note "$SUMMARY"' in helper_src, (
+        "closure-evidence-write.sh no longer writes SUMMARY to outcome_note -- "
+        "the shared producer stopped populating the field the metric gate reads")

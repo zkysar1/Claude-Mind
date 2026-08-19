@@ -179,7 +179,10 @@ def _read_marker(backend, key: str):
     lm = obj.get("LastModified")
     age = (_now_utc() - lm).total_seconds() if lm is not None else None
     try:
-        body = json.loads(obj["Body"].read().decode("utf-8"))
+        # : one transport seam for every raw reader (a plain object
+        # passes through unchanged; a gzip one decodes).
+        from _owncloud_codec import decode_response
+        body = json.loads(decode_response(obj, key=key).decode("utf-8"))
     except Exception:
         body = {}          # unreadable body is not a reason to skip the cadence
     return age, (body if isinstance(body, dict) else {})

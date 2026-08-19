@@ -349,3 +349,65 @@ def test_idle_box_writes_body_heartbeat_but_not_agent_wide():
         assert r.returncode == 2, (
             "the state gate must still REFUSE (exit 2) on an IDLE box; the "
             f"hoist only moves the per-SID write above it. rc={r.returncode}")
+
+
+# --- 6. the carrier carries body_state () --------------------------
+#
+# THE THIRD WRITER. body-manifest.set_state/park_body/resume_body mirror the
+# state on TRANSITION, and their tests cover that. This one covers the writer
+# that keeps a LIVE Body's carrier current, which is the larger population: if
+# it silently stopped stamping, every running Body would read
+# `stale_state_unknown` on the peer side, the between-units stall verdict would
+# never fire again, and NOTHING would go red -- the detector would return to the
+# blindness  closed, silently. Exercised through the real script in a
+# staged root, because that is the only shape that proves the shell quoting and
+# the YAML extraction actually work (guard-920).
+
+def _carrier(agent_dir: Path) -> Path:
+    return agent_dir / "session" / f"body-heartbeat-{SID}.json"
+
+
+def _write_manifest(agent_dir: Path, state: str) -> None:
+    (agent_dir / "sessions" / SID).mkdir(parents=True, exist_ok=True)
+    (agent_dir / "sessions" / SID / "body-manifest.yaml").write_text(
+        # Single-quoted, which is how _render_manifest actually emits it --
+        # the extraction has to strip those, and a test using bare values
+        # would pass against an extractor that cannot.
+        f"unit_key: '{SID}'\nbody_state: '{state}'\nrole: 'worker'\n",
+        encoding="utf-8")
+
+
+def test_carrier_carries_the_body_state_from_the_manifest():
+    import json
+    for state in ("active", "parked", "closed-pending-merge"):
+        with tempfile.TemporaryDirectory() as tmpd:
+            root, adir = _stage_root(Path(tmpd), with_session_dir=True)
+            _write_manifest(adir, state)
+            r = _tick(root, adir, sid=SID)
+            c = _carrier(adir)
+            assert c.exists(), f"no carrier written. stderr={r.stderr[-400:]}"
+            doc = json.loads(c.read_text(encoding="utf-8"))
+            assert doc["body_state"] == state, (
+                f"carrier lost the manifest's body_state ({state!r}); the peer "
+                f"stall probe then cannot tell a closed Body from a dead one. "
+                f"doc={doc}")
+            # The pre-existing contract must survive the added field.
+            assert doc["sid"] == SID
+            assert doc["ts"], "the timestamp decides staleness and must remain"
+
+
+def test_carrier_is_valid_json_with_an_absent_manifest():
+    """FAIL-OPEN. A Body with no readable manifest still gets a well-formed
+    carrier with an EMPTY state -- which the reader renders
+    `stale_state_unknown` (never alerts), so a manifest problem can never be
+    reported as a stall on its own."""
+    import json
+    with tempfile.TemporaryDirectory() as tmpd:
+        root, adir = _stage_root(Path(tmpd), with_session_dir=True)
+        # deliberately no body-manifest.yaml
+        r = _tick(root, adir, sid=SID)
+        c = _carrier(adir)
+        assert c.exists(), f"no carrier written. stderr={r.stderr[-400:]}"
+        doc = json.loads(c.read_text(encoding="utf-8"))  # must still parse
+        assert doc["body_state"] == ""
+        assert doc["sid"] == SID

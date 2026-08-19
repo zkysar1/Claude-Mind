@@ -75,6 +75,15 @@ _N3_ALLOWED_EXACT = frozenset({
     "MACHINE_ID", "MACHINE_MULTI", "RUNTIME_DIR", "STORAGE_BACKEND",
     "STORAGE_S3_BUCKET", "STORAGE_DDB_SESSIONS_TABLE", "STORAGE_DDB_LOCK_TABLE",
     "OWNCLOUD_SYNC_INTERVAL", "OWNCLOUD_CACHE_TTL",
+    # : OWNCLOUD_PULL_EVERY_N is READ at _start_owncloud_sync_thread
+    # (0 disables the pull half) and is documented as an override at the constant
+    # above — but it was absent here, so `_load_env_local` silently skipped it and
+    # setting it in .env.local did nothing. It only ever worked when exported into
+    # the launch env, which is not where any other daemon setting lives. Same
+    # non-secret integer cadence knob as OWNCLOUD_SYNC_INTERVAL beside it, so it
+    # carries no additional exposure. Found while fixing the sibling defect on the
+    # sync-pause control; test_owncloud_sync_controls.py now pins read⇔loadable.
+    "OWNCLOUD_PULL_EVERY_N",
     "ENVIRONMENT_ID",
     # FR-4/FR-5 (BRD Shared-State-API): daemon auth token (a secret,
     # loaded like the MIND_AWS_* scoped-credential family) + the opt-in
@@ -339,7 +348,21 @@ def _start_owncloud_sync_thread(project_root: Path, shutdown: "threading.Event")
     logs and retries next interval, never killing the thread or the process. The
     thread is daemon=True (dies with the process) and waits on `shutdown` so a
     graceful stop ends it promptly. Tune cadence via OWNCLOUD_SYNC_INTERVAL (clamped to >=30s).
-    To pause sync, stop the daemon (mind-api-stop.sh).
+
+    TO PARK THE SWEEP (g-115-5968): set OWNCLOUD_SYNC_INTERVAL to a large value in
+    .env.local and recycle -- `bash core/scripts/mind-api-start.sh --restart`. The
+    interval is read ONCE here at thread start, so the restart is required and the
+    daemon startup line reports the value in effect. This is the ONLY working pause
+    recipe. Two others were documented and BOTH were dead: a `mind-api-stop` script
+    (named here, with a .sh, until 2026-08-12) has never existed -- only
+    mind-api-start.sh and mind-api-code-changed.sh do -- and OWNCLOUD_SYNC_DISABLE
+    has zero production reads anywhere in core/ or mind_api/ AND is absent from
+    _N3_ALLOWED_EXACT, so it never even reaches this process. That combination
+    failed OPEN: an
+    operator got no error and could run a destructive S3 delete believing the writer
+    was parked. Before naming a control here, check it is both READ and loadable
+    (in _N3_ALLOWED_EXACT, or a MIND_AWS_ key) -- test_owncloud_sync_controls.py
+    pins exactly that and will fail if this docstring names something dead.
 
     Returns the started Thread, or None when the sweep is not applicable."""
     if os.environ.get("STORAGE_BACKEND", "local").strip().lower() != "own-cloud":

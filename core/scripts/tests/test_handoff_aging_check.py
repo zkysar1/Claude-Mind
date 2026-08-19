@@ -84,6 +84,11 @@ def _make_args(**overrides):
         agent="bravo",
         board_escalation_log=None,
         no_board=True,
+        #  inbound pass. Present here so this helper keeps matching
+        # argparse output as the docstring claims; run() also reads both via
+        # getattr defaults, so a caller omitting them still works.
+        inbound_max_report=None,
+        no_inbound=False,
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -246,6 +251,153 @@ def test_missing_created_at_skipped():
     assert result["applied"] == 0
 
 
+# ─────────────────────── inbound pass () ───────────────────────
+# The outbound cases above cover work routed AWAY from self. These cover the
+# mirror — work routed TO self, which nothing aged before , so the
+# one queue an agent must DRAIN was the one queue with no aging sweep.
+
+
+def _make_inbound(goal_id: str, hours_ago, intended_agent="bravo",
+                  priority="MEDIUM", status="pending",
+                  age_field="created_at", handoff_to=None) -> dict:
+    """Synthesize an INBOUND goal (routed to self via intended_agent/handoff_to)."""
+    g = {
+        "id": goal_id,
+        "title": "Inbound work %s" % goal_id,
+        "status": status,
+        "priority": priority,
+        "intended_agent": intended_agent,
+        "participants": ["agent"],
+    }
+    if handoff_to is not None:
+        g["handoff_to"] = handoff_to
+    if hours_ago is not None and age_field:
+        g[age_field] = _iso(hours_ago)
+    return g
+
+
+def test_inbound_positive_control_aged_goal_is_named():
+    """POSITIVE CONTROL (the goal's explicit VERIFY requirement): an aged
+    inbound goal must be NAMED, not merely counted. A sweep reporting 0 over
+    an empty predicate is indistinguishable from a clean queue (guard-1715 /
+    rb-245), so the assertion is on the goal_id appearing in `reported`."""
+    mod = _import_module()
+    _install_mock_goals(mod, [_make_inbound("g-test-100", hours_ago=500.0)])
+    result = mod.run(_make_args(agent="bravo"))
+
+    ib = result["inbound"]
+    assert ib["matched_count"] == 1, ib
+    assert ib["aged_count"] == 1, ib
+    ids = [r["goal_id"] for r in ib["reported"]]
+    assert "g-test-100" in ids, "aged inbound goal must be NAMED, got %r" % ids
+
+
+def test_inbound_created_at_fallback_is_load_bearing():
+    """The fallback is not polish. Measured live 2026-08-11: only 2 of 196
+    inbound goals carried handoff_created_at while 196 carried created_at, so a
+    pass aged solely on handoff_created_at reports a 2-of-196 view that looks
+    like a nearly-clean queue. Pin that a created_at-only goal is still aged,
+    AND that the basis is reported so the age is not mistaken for routing age."""
+    mod = _import_module()
+    _install_mock_goals(mod, [_make_inbound("g-test-101", hours_ago=300.0,
+                                            age_field="created_at")])
+    ib = mod.run(_make_args(agent="bravo"))["inbound"]
+
+    assert ib["aged_count"] == 1, ib
+    row = ib["reported"][0]
+    assert row["age_basis"] == "created_at", row
+    assert ib["age_basis_breakdown"]["created_at"] == 1, ib["age_basis_breakdown"]
+
+
+def test_inbound_handoff_to_self_is_caught():
+    """The outbound pass SKIPS handoff_to == self by construction (only
+    partner-routed handoffs escalate there), so without this predicate those
+    goals are aged by nothing at all. Live count on cc-08 was 3, one of which
+    intended_agent did not also cover."""
+    mod = _import_module()
+    g = _make_inbound("g-test-102", hours_ago=400.0,
+                      intended_agent="either", handoff_to="bravo")
+    _install_mock_goals(mod, [g])
+    result = mod.run(_make_args(agent="bravo"))
+
+    assert result["candidate_count"] == 0, "still not an OUTBOUND candidate"
+    ib = result["inbound"]
+    assert ib["aged_count"] == 1, ib
+    assert ib["reported"][0]["routed_by"] == "handoff_to", ib["reported"][0]
+
+
+def test_inbound_either_is_not_inbound():
+    """'either' means UNROUTED and is the dominant value (898 of 1520 pending
+    live). Treating it as inbound would swallow ~59% of the queue and make the
+    pass meaningless."""
+    mod = _import_module()
+    _install_mock_goals(mod, [_make_inbound("g-test-103", hours_ago=900.0,
+                                            intended_agent="either")])
+    ib = mod.run(_make_args(agent="bravo"))["inbound"]
+
+    assert ib["matched_count"] == 0, "intended_agent='either' must not count as inbound"
+    assert ib["reported"] == []
+
+
+def test_inbound_fresh_goal_not_reported():
+    """Below-threshold inbound work must not be escalated (the idle path)."""
+    mod = _import_module()
+    _install_mock_goals(mod, [_make_inbound("g-test-104", hours_ago=1.0)])
+    ib = mod.run(_make_args(agent="bravo"))["inbound"]
+
+    assert ib["matched_count"] == 1, "matched (it IS inbound)"
+    assert ib["aged_count"] == 0, "but not aged past escalate_hours"
+    assert ib["reported"] == []
+
+
+def test_inbound_high_is_never_truncated_by_the_cap():
+    """The output bound exists so a ~200-row backlog is not emitted whole. It
+    must NEVER drop a HIGH row: silently truncating a HIGH goal reproduces the
+    exact failure this pass was built to fix (a HIGH directive sat pending
+    through four cycles, 2026-08-11)."""
+    mod = _import_module()
+    goals = [_make_inbound("g-test-high", hours_ago=500.0, priority="HIGH")]
+    goals += [_make_inbound("g-test-med-%d" % i, hours_ago=400.0 + i) for i in range(6)]
+    _install_mock_goals(mod, goals)
+    ib = mod.run(_make_args(agent="bravo", inbound_max_report=0))["inbound"]
+
+    ids = [r["goal_id"] for r in ib["reported"]]
+    assert ids == ["g-test-high"], (
+        "cap=0 must still report the HIGH row and nothing else, got %r" % ids)
+    assert ib["high_count"] == 1
+    assert ib["suppressed_count"] == 6, ib
+
+
+def test_inbound_cap_bounds_non_high_and_reports_suppression():
+    """A bounded view must never read as the whole queue — the suppressed
+    count is what keeps the bound honest."""
+    mod = _import_module()
+    goals = [_make_inbound("g-test-m%d" % i, hours_ago=400.0 + i) for i in range(9)]
+    _install_mock_goals(mod, goals)
+    ib = mod.run(_make_args(agent="bravo", inbound_max_report=3))["inbound"]
+
+    assert ib["aged_count"] == 9, ib
+    assert len(ib["reported"]) == 3, ib["reported"]
+    assert ib["suppressed_count"] == 6, ib
+    # oldest-first ordering: the 3 reported are the 3 largest ages
+    ages = [r["age_hours"] for r in ib["reported"]]
+    assert ages == sorted(ages, reverse=True), ages
+    assert min(ages) >= 406.0, ages
+
+
+def test_inbound_absent_when_disabled_and_outbound_keys_intact():
+    """--no-inbound is the escape hatch; the outbound contract is unchanged
+    either way (every pre-existing key still present with its old meaning)."""
+    mod = _import_module()
+    _install_mock_goals(mod, [_make_inbound("g-test-105", hours_ago=500.0)])
+    result = mod.run(_make_args(agent="bravo", no_inbound=True))
+
+    assert "inbound" not in result
+    for k in ("mode", "self_agent", "escalate_hours", "scanned", "candidates",
+              "candidate_count", "applied", "fired", "skipped_cooldown", "failed"):
+        assert k in result, "outbound key %r must survive the inbound addition" % k
+
+
 if __name__ == "__main__":
     import tempfile
     test_no_aged_handoff_noop()
@@ -266,4 +418,15 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as td:
         test_board_post_other_goal_does_not_suppress(Path(td))
     print("PASS test_board_post_other_goal_does_not_suppress")
-    print("OK: 7/7 passed")
+    # inbound pass ()
+    for _fn in (test_inbound_positive_control_aged_goal_is_named,
+                test_inbound_created_at_fallback_is_load_bearing,
+                test_inbound_handoff_to_self_is_caught,
+                test_inbound_either_is_not_inbound,
+                test_inbound_fresh_goal_not_reported,
+                test_inbound_high_is_never_truncated_by_the_cap,
+                test_inbound_cap_bounds_non_high_and_reports_suppression,
+                test_inbound_absent_when_disabled_and_outbound_keys_intact):
+        _fn()
+        print("PASS %s" % _fn.__name__)
+    print("OK: 15/15 passed")

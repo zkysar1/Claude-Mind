@@ -75,3 +75,56 @@ sweep in `stop_mode` is sanctioned (the next /start catches it via cadence) — 
 not a failure and not a guardrail violation. Match your felt sense of the work to its
 real risk profile, not to the severity of the surrounding language. (FW-5, 2026-05-25,
 7-agent feedback distillation.)
+
+## Detection outranks attribution (user directive, 2026-08-11)
+
+Verbatim, from a verified-sender message: *"I think if the results are generally
+increasing in quality, we do not have to figure out why that is. You realize there are
+5+ other developers constantly improving code around us? I think it is more that we
+need to know asap if there is something wrong."*
+
+The argument is stronger than its casual phrasing. Positive attribution is **confounded
+by construction**: 5+ humans change the same systems continuously, so "quality rose —
+why?" has no clean answer available to the fleet, and effort spent chasing one is spent
+against an unidentifiable model. "Something broke" has no such problem — it is
+observable regardless of who caused it, and its value decays with time in a way
+attribution never does.
+
+So when effort must be traded: **prefer reducing time-to-detection over improving
+explanation of improvement.** Two things this does NOT license, both easy to get wrong:
+
+- It does not say stop learning from FAILURES. Failure analysis is detection-side and
+  remains the core mission (rules 1-4 above). What is deprioritized is attribution of
+  *improvements* specifically.
+- It does not say stop measuring quality. Knowing quality is generally rising is the
+  precondition for the argument itself. What the fleet is released from is *explaining*
+  the rise.
+
+**Classify by consumer, not by name.** An instrument is attribution-side or
+detection-side according to what ACTS on its output, and the same store is often both.
+Measured 2026-08-11: `meta/improvement-velocity.yaml` (imp@k) reads as pure attribution
+from its name, but its consumer `meta-backpressure.py` uses it to ROLL BACK a
+meta-strategy change after consecutive goals below baseline — that is regression
+detection with an automatic remedy, i.e. exactly the capability this directive favors.
+Retiring imp@k as "attribution machinery" would have deleted a detector. Before
+retiring any instrument under this rule, grep for what consumes it and check whether a
+DECISION depends on it; a large reference count is not evidence, because most
+references are plumbing that exists to keep the file healthy (merge handlers, snapshot
+caps, reference scans) rather than to use it.
+
+**The latency asymmetry to design against.** Detection splits by cadence key, and the
+two halves fail in opposite directions:
+
+| family | cadence key | behaviour when the fleet is in trouble |
+|---|---|---|
+| liveness/stall (heartbeat, reducer-liveness poll, watchdog `--tick`) | wall-clock / per-iteration | keeps firing — degrades gracefully |
+| data-integrity (the ratchet family, scar-tissue, audit-baselines) | **completed-goal count** (`goal_cadence` 5/25/50/75/100/200 in `core/config/aspirations.yaml`) | fires SLOWER exactly as throughput drops |
+
+A goal-count cadence is a throughput-proportional clock, so its wall-clock latency is
+worst precisely when goals have stopped completing — which is one of the strongest
+signals that something IS wrong. The failure mode partially masks its own detector.
+This is a design observation, not a defect report: on a busy fleet these run often
+(measured on cc-07, `audit-baselines.yaml` and the learning-routing repair ledger were
+both ~1h old). Do not "fix" it by converting cadences to wall-clock without measuring —
+goal-count keying is what keeps these off a quiet box's critical path. Do carry it when
+reasoning about how fast a regression would surface.

@@ -106,18 +106,39 @@ class TestReadLocalPathsFailLoud(unittest.TestCase):
             f"META_DIR fell through to cruft path {cruft_meta!r}",
         )
 
-    def test_unset_agent_no_warning(self):
-        """MIND_AGENT unset → no warning, first-available conf used."""
+    def test_unset_agent_warns_only_when_ambiguous(self):
+        """MIND_AGENT unset → first-available conf used; warn iff 2+ confs.
+
+        This assertion is CONF-COUNT DEPENDENT and must stay that way
+        (g-115-6417). It previously asserted a flat "no WARN on unset", which
+        was correct only because every box it had ever run on carries exactly
+        one conf — the standard fleet topology (measured cc-07: 6 agent dirs,
+        1 conf). When _paths.py gained the unset-case warning to reach parity
+        with _paths.sh, that flat assertion would have gone RED on the first
+        2+-conf box to run it, and it would have read as a real regression on
+        that box alone — precisely the cross-box portability red this fleet
+        keeps rediscovering. Branch on the count instead of pinning one box's
+        topology.
+        """
         os.environ.pop("MIND_AGENT", None)
         stderr_buf = io.StringIO()
         with redirect_stderr(stderr_buf):
             paths = self._fresh_import_paths()
 
         err = stderr_buf.getvalue()
-        self.assertNotIn(
-            "[_paths] WARN", err,
-            f"No WARN should fire when MIND_AGENT is unset; got: {err!r}",
-        )
+        conf_count = len(list(paths.agents_root().glob("*/local-paths.conf")))
+        if conf_count > 1:
+            self.assertIn(
+                "[_paths] WARN", err,
+                f"{conf_count} confs make the unset fall-through ambiguous — "
+                f"it must be logged, not silent; got: {err!r}",
+            )
+        else:
+            self.assertNotIn(
+                "[_paths] WARN", err,
+                f"a single-conf fall-through is unambiguous and must stay "
+                f"silent; got: {err!r}",
+            )
         # WORLD_DIR still resolves to a real conf.
         cruft_world = paths.PROJECT_ROOT / "world"
         self.assertNotEqual(paths.WORLD_DIR, cruft_world)

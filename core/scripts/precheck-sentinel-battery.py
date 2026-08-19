@@ -20,7 +20,19 @@ Output (guard-614: structured output on EVERY exit path, including fail-open):
       ▸ SENTINEL: <slot> (phase <phase>) payload=<json> → dispatch: <section>
       [sentinel-battery] N set / M registered
   --json  — single JSON object {checked_at, registered, set: [{slot, phase,
-            payload, dispatch}], error?}
+            payload, dispatch}], findings: [...], blind: [...], error?}
+
+`findings` and `blind` are the COMPOSED-CALLER contract, and they are not
+decoration: `iteration-open.py::_findings_from` lifts `payload["findings"]`
+and `_blind_from` lifts `payload["blind"]` — those key NAMES are the whole
+interface. Emitting only `set` made this battery invisible inside
+`iteration-open.sh --apply`, which then printed "no findings; all dispatched
+lanes clean" while four always-run gates sat undispatched (measured 2026-08-18,
+zeta/cc-02: force_tree_maintain, force_experience_archival,
+fresh_eyes_dispatch_pending, force_metric_encoding_pending — all set, none
+surfaced). guard-318: confirm the producer's shape, never the caller's
+intuition. `set` is retained unchanged for direct readers; `findings` mirrors
+it in the sibling `precheck-always-run-battery` shape {name, phase, detail:[]}.
 
 "Set" follows _sentinel_registry.is_set — identical to the canary AND to the
 consumer phases' own gates: a fired_key dict with fired!=true is NOT set (the
@@ -73,15 +85,32 @@ def _emit(report: dict, as_json: bool) -> None:
         print(f"[sentinel-battery] {n_set} set / {n_reg} registered{err}")
 
 
+def _fail_open(report: dict, reason: str, as_json: bool) -> int:
+    """Record a fail-open exit as BLIND, then emit. Three call sites.
+
+    Fail-open must not mean fail-SILENT to a composed caller. Without the
+    `blind` entry an errored battery reaches iteration-open as zero findings
+    AND zero blind lanes, i.e. indistinguishable from a genuinely clean run —
+    the exact "a lane that FAILED must never read as clean" defect guard-4093
+    names, and it would defeat that script's own "NO FINDINGS REACHED — N
+    lane(s) blind" branch. Reasoned from the contract rather than observed in
+    the wild (unlike the `findings` gap above, which was measured).
+    """
+    report["error"] = reason
+    report["blind"].append({"name": "sentinel-battery", "phase": "0-pre..0-pre6",
+                            "reason": reason})
+    _emit(report, as_json)
+    return 0
+
+
 def run(wm_path_override: str | None, as_json: bool) -> int:
-    report: dict = {"checked_at": _now_iso(), "registered": 0, "set": []}
+    report: dict = {"checked_at": _now_iso(), "registered": 0, "set": [],
+                    "findings": [], "blind": []}
     try:
         import yaml  # noqa: F401
         from _sentinel_registry import battery_slots, is_set
     except Exception as exc:  # fail-open (import env broken)
-        report["error"] = f"import_failed: {exc}"
-        _emit(report, as_json)
-        return 0
+        return _fail_open(report, f"import_failed: {exc}", as_json)
 
     slots = battery_slots()
     report["registered"] = len(slots)
@@ -93,14 +122,10 @@ def run(wm_path_override: str | None, as_json: bool) -> int:
             from wm import wm_path as _resolve_wm_path  # same resolver as the canary
             wm_path = _resolve_wm_path()
         if not wm_path.exists():
-            report["error"] = "no_working_memory_file"
-            _emit(report, as_json)
-            return 0
+            return _fail_open(report, "no_working_memory_file", as_json)
         data = yaml.safe_load(wm_path.read_text(encoding="utf-8")) or {}
     except Exception as exc:  # torn read / parse error — fall back to per-phase reads
-        report["error"] = f"wm_read_failed: {exc}"
-        _emit(report, as_json)
-        return 0
+        return _fail_open(report, f"wm_read_failed: {exc}", as_json)
 
     wm_slots = data.get("slots", data) if isinstance(data, dict) else {}
     for spec in slots:
@@ -113,6 +138,18 @@ def run(wm_path_override: str | None, as_json: bool) -> int:
                 "phase": spec["phase"],
                 "payload": value,
                 "dispatch": spec["skill_section"],
+            }
+        )
+        # A SET sentinel IS a finding. Built in the SAME loop, from the same
+        # spec, so the two lists cannot drift apart -- a second pass would be
+        # the duplicate-interpretation defect iteration-open's own
+        # _findings_from docstring warns about. `name` also satisfies that
+        # function's `f.get("name") or f.get("sentinel")` fallback chain.
+        report["findings"].append(
+            {
+                "name": spec["slot"],
+                "phase": spec["phase"],
+                "detail": [f"SET -> dispatch {spec['skill_section']}"],
             }
         )
 

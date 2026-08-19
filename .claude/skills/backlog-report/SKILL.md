@@ -292,8 +292,96 @@ Window: "{resolves_no_earlier_than} – {resolves_by}" formatted as short dates.
 
 ## Phase 4: Write File
 
+### 4.0 REDACT credential-shaped strings BEFORE writing (MANDATORY — g-115-5997)
+
+This report is GENERATED from aspiration records, and those records are NOT
+git-tracked while this file IS. That makes this render step the exact point where
+a credential-shaped string in a goal description crosses from an untracked store
+into git history. Scrubbing the output file afterwards is futile — the next
+regeneration re-renders it, and a per-line `# secret-scanner: skip` marker is
+erased by the same regeneration.
+
+Before the Write, scan the rendered markdown and replace every match of the
+scanner's own pattern. Both sinks must test the same thing, so derive the pattern
+from the scanner rather than maintaining a second copy of it (guard-1280: route
+every sink through a single source of truth).
+
+**READ THE PATTERN FROM THE SCANNER AT RENDER TIME — do not trust the copy below:**
+
+```bash
+grep -oP "(?<=^patterns=')[^']+" core/scripts/check-no-hardcoded-secrets.sh
 ```
-Write: agents/<agent>/BACKLOG.md ← rendered markdown from Phase 3
+
+That one command is the whole instruction. The block below is a **dated snapshot
+(2026-08-12), not the source of truth** — a verbatim quote of an amendable
+upstream field protects against mis-transcription at write time and against
+nothing afterward (guard-2494 / guard-388). If the grep disagrees with the
+snapshot, the grep wins and this snapshot is stale; update it in passing.
+
+When you do transcribe it, quote it VERBATIM — do not re-factor it into a tidier
+form. The prefixes do not share one character class (`github_pat_` allows `_`,
+the five `gh*_` prefixes do not), so the obvious factoring
+`(ghp_|github_pat_|…)[A-Za-z0-9_]{20,}` silently widens the pattern. That exact
+mistake shipped in this step's first draft and was caught only by comparing the
+two strings as data, never by re-reading them — a paraphrase looks right.
+
+Snapshot of `patterns=` at `check-no-hardcoded-secrets.sh:99`:
+
+```
+(ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|gho_[A-Za-z0-9]{20,}|ghu_[A-Za-z0-9]{20,}|ghs_[A-Za-z0-9]{20,}|ghr_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16})
+```
+
+Replacements:
+
+```
+github/gh-token match  → [REDACTED-GITHUB-TOKEN]
+AKIA match             → AKIA-REDACTED-{last 4 chars}
+```
+
+Preserve the last 4 characters of an AWS key id. Goal records refer to these
+keys by their last four (e.g. "the key ending HOR"), so a full blanking destroys
+the only handle a reader has for matching a report line back to the record —
+and the last four alone are not a credential.
+
+Do NOT instead add `agents/<agent>/BACKLOG.md` to `allowed_path()` in the
+scanner. That blinds the scanner to every FUTURE secret rendered into this file,
+which is the same laundering path with the alarm switched off.
+
+MEASURED 2026-08-12 (alpha, hostname cc-04, uname -r 6.8.0-137-generic), which
+is why this step exists: `world/aspirations.jsonl` carried **8 distinct
+real-shaped AWS access key ids** (plus AWS's published documentation-placeholder
+key id, deliberately not reproduced here — writing that literal into this file
+trips the very scanner this step feeds, which is how it was found) across **40**
+field occurrences — 31 in
+`goals[].description`, 4 in `goals[].outcome_note`, 2 in `goals[].title`, 2 in
+an aspiration `motivation`, 1 in a `goals[].progress_note`. One of them reached
+git HEAD through this report (`agents/bravo/BACKLOG.md`, commit `d7ba643a0`),
+where `check-no-hardcoded-secrets.sh --scan-head` still exits 1 on it. The 38
+real-token occurrences (26 fields, 24 records) were redacted at source the same
+day to `AKIA-REDACTED-<last4>`; the 2 placeholder occurrences were deliberately
+left, being a published constant rather than a credential.
+
+Do not read that remediation as making this step redundant — it cleaned the
+CORPUS, and this step closes the PATH. The source store is a live, append-only
+work queue that any agent (or peer deployment) writes to continuously, so a
+clean scan today says nothing about the next render. Note the source included a
+`cross-world-signal` aspiration: an inbound peer-deployment signal can inject a
+credential-shaped string into this world with no gate between it and this
+render.
+
+Scope caveat worth carrying: every token found was an access **key id** — the
+public half of an AWS credential. An explicit probe for the dangerous half (a
+labelled secret access key with a 40-char value) found **zero** across the
+store. That lowers the urgency of a hit here; it does not remove the duty, since
+a key id still names an account.
+
+If a match is found, ALSO note it in the Phase 5 terminal summary
+(`⚠ N credential-shaped string(s) redacted from the report`) so the operator
+learns the source records are dirty. Redacting silently fixes the artifact and
+hides the upstream problem.
+
+```
+Write: agents/<agent>/BACKLOG.md ← rendered markdown from Phase 3 (post-redaction)
 
 IF agents/<agent>/BACKLOG.md already exists: overwrite (regenerated snapshot, not append-only)
 ```

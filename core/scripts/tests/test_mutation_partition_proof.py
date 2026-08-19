@@ -158,6 +158,38 @@ def test_target_is_byte_identical_after_every_mutant(bed):
     assert (bed / "target.txt").read_bytes() == before
 
 
+def test_rows_carry_the_restore_and_residue_fields(bed):
+    """A per-mutant row must forward BOTH restore fields, not just the tally.
+
+    g-115-6356: `restore_status` answers "target == BACKUP", which is NOT
+    "target is clean" -- a backup taken over pre-existing residue matches
+    itself. `residue_check` is the field that separates the two, and a matrix
+    that reports only `restore_status` reproduces the original false `ok` at
+    N-mutant scale, where a human is even less likely to re-check by hand.
+
+    `unavailable` is a THIRD value, distinct from clean and from RESIDUE: a
+    `sabotage_sed` mutant injects text the prover cannot know, so its
+    clean-check did not run. Both mutants below are sed-form, so both must say
+    so rather than defaulting to something that reads as a pass.
+    """
+    # Both mutants must be KILLED, or the run fails for an unrelated reason and
+    # this test would be asserting on a survivor report instead of a clean one.
+    (bed / "check_both.sh").write_text(
+        "grep -q '^GUARDED_TOKEN lives here$' target.txt && "
+        "grep -q '^UNRELATED_TOKEN lives here$' target.txt\n", encoding="utf-8")
+    rc, r = run_plan(bed, base(bed, test_cmd="bash check_both.sh", mutations=[
+        dict(name="m1", case="c1", **SINGLE_SITE),
+        dict(name="m2", case="c2",
+             sabotage_sed="0,/^UNRELATED_TOKEN lives here$/s//CHANGED/"),
+    ]))
+    assert rc == 0 and r["verdict"] == "PASS", r
+    for row in r["rows"]:
+        assert row["restore_status"] == "ok", row
+        assert row["residue_check"] == "unavailable", (
+            "a sed mutant's residue check cannot run; rendering that as clean "
+            f"is the absent-vs-zero masquerade (rb-245): {row}")
+
+
 def _both_tokens_check(bed):
     """A predicate both mutations below can kill, so neither is a survivor."""
     (bed / "check_both.sh").write_text(

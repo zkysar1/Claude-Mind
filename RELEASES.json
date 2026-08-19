@@ -1,5 +1,38 @@
 [
   {
+    "version": "2.9.4",
+    "previous_version": "2.9.3",
+    "date": "2026-08-19",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Promotion-pipeline fix: worktree-dest .git-file detection (-d to -e at 5 sites) restoring plant auto-commit + expect-commit verify on the --pr path; payload for the g-358-05 utilization-cutover promotion",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.9.3",
+    "previous_version": "2.9.2",
+    "date": "2026-08-19",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Promotion-hygiene follow-up to v2.9.2: forged-skill tagging invariant restored (audit-goal-citations tagged; scorer-criterion-contribution-probe stub completing zeta's gap-033 forge) — payload for the g-358-05 utilization-cutover promotion",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.9.2",
+    "previous_version": "2.9.1",
+    "date": "2026-08-19",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Utilization-counter sidecar cutover complete at frontier: reader seam + spool writer (default-OFF, g-358-05), parametrized store-cutover attestation engine (g-115-6589), gzip transport hardening, S3 egress instrumentation; plus 8 days of frontier framework work since v2.9.1",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.9.1",
     "previous_version": "2.9.0",
     "date": "2026-08-11",

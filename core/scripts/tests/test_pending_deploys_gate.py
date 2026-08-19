@@ -204,8 +204,13 @@ def test_gate_fast_exit_no_pending():
         r = _run_gate(repo, "--goal", "g-115-2688-b")
         assert r.returncode == 0, f"gate crashed: {r.stderr!r}"
         s = _summary(r)
+        # budget_skipped added  (loop-total budget). Kept as an EXACT
+        # equality rather than a subset check: this assertion is what caught the
+        # fast-exit path emitting a different shape from the main path, and
+        # loosening it to `>=` would have let that drift through silently.
         assert s == {"checked": 0, "cleared": 0, "failed": 0, "unverified": 0,
-                     "unblocks_filed": 0, "not_clean": False}, s
+                     "unblocks_filed": 0, "budget_skipped": 0,
+                     "not_clean": False}, s
 
 
 def test_gate_clears_on_ok():
@@ -393,3 +398,39 @@ def test_gate_refiles_when_only_skipped_exists():
         s = _summary(r)
         assert s["failed"] == 1, s
         assert s["unblocks_filed"] == 1, "skipped must NOT dedup -- fresh Unblock filed"
+
+
+def test_gate_empty_dir_entry_parses_goal_id():
+    """REGRESSION : `dir` is OPTIONAL and sits in the MIDDLE of the row
+    the gate emits. Tab is an IFS *whitespace* character, so the old
+    `IFS=$'\\t' read -r _repo _sha _dir _gid` COLLAPSED the two adjacent tabs of an
+    empty dir and shifted goal_id left into _dir. Two consequences, both silent:
+    every message rendered `(goal=?)` -- which reads as an ORPHANED entry, and is
+    how this was first misdiagnosed -- and the `-n "$_dir"` branch called
+    `resolve --dir g-335-328`, a goal-id used as a directory path, so the entry
+    could NEVER verify and was re-probed at every close forever while holding
+    not_clean. Measured on the live cc-02 store, which carried two such entries
+    for 18 days. The emitter/consumer pair now uses US (0x1f), which is not IFS
+    whitespace, so empty fields survive -- same remedy as
+    core/scripts/mutation-partition-proof.sh:79.
+
+    EVERY other test in this file passes d="/tmp/x". A non-empty fixture in the
+    only optional field is precisely why the harness could not see this.
+    """
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        repo = _setup_repo(Path(td))
+        _seed(repo, [_entry(sha="d" * 40, d="")])
+        r = _run_gate(repo, "--goal", "g-115-2688-b", FAKE_GH_CONCLUSION="success")
+        assert r.returncode == 0, r.stderr
+        # The goal-id must survive the split. Under the tab form _gid was empty
+        # and `${_gid:-?}` rendered `goal=?`; this assertion is the discriminator.
+        assert "goal=g-115-2688-b" in r.stderr, (
+            "goal_id lost in the row split -- an empty middle `dir` collapsed "
+            f"and shifted fields left; stderr={r.stderr!r}")
+        assert "goal=?" not in r.stderr, f"field shift still present; stderr={r.stderr!r}"
+        # ...and the empty-dir entry must complete its lifecycle, proving it took
+        # the no-dir branch rather than resolving a goal-id as a directory.
+        s = _summary(r)
+        assert s["cleared"] == 1 and s["not_clean"] is False, s
+        assert _load_store(repo) == [], "empty-dir entry not cleared from ledger"

@@ -32,6 +32,11 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 from _bash_helpers import BASH  # noqa: E402
+
+import pathlib
+import sys as _sys
+_sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+import _verify_corpus  # noqa: E402
 CORE_SCRIPTS = SCRIPT_DIR.parent
 PROJECT_ROOT = CORE_SCRIPTS.parent.parent
 VERIFIED_WM_SET = CORE_SCRIPTS / "verified-wm-set.sh"
@@ -197,7 +202,8 @@ class TestStrategicScanRoutingRegression(unittest.TestCase):
                                   "may contain the slot-write substring")
 
     def test_verify_learning_check_updated(self):
-        body = VERIFY_LEARNING_SKILL.read_text(encoding="utf-8")
+        # corpus, not the file () — this pins a CALL SITE
+        body = _verify_corpus.corpus_text()
         self.assertIn("verified-wm-set.sh last_strategic_scan", body,
                       "verify-learning SS2 must assert the verified routing")
 

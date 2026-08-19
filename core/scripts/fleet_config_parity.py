@@ -231,8 +231,45 @@ if [ -n "$RL" ]; then
   # the MACHINE_ID verdict fell through to the exec-time /proc/environ read on every
   # node. That is the false positive the two lines above exist to prevent, left live
   # on the third audited key: `_load_env_local` sets MACHINE_ID in-process AFTER
-  # exec, so a correctly-configured daemon shows it ABSENT from /proc/environ for
-  # its whole life (identical mechanism to the foxtrot g-115-3157 case above).
+  # exec, so a daemon that derives it that way shows it ABSENT from /proc/environ
+  # for its whole life (identical mechanism to the foxtrot g-115-3157 case above).
+  # THAT ABSENCE IS START-PATH DEPENDENT, NOT UNIVERSAL — corrected 2026-08-11 from
+  # alpha's resolution of hyp 2026-08-09_machineid-logline-arm-clears-drift-on-restart,
+  # which measured MACHINE_ID **PRESENT** in /proc/<pid>/environ on cc-03 (pid 1314666)
+  # and cc-04 (pid 1233253), and absent only on foxtrot/WSL2. A daemon exec'd from a
+  # shell that already exported MACHINE_ID lands it in the EXEC-TIME block, which is
+  # what Linux /proc/<pid>/environ shows; an in-process putenv would not appear there.
+  # So on those two boxes this arm is REDUNDANT-BUT-HARMLESS today, and the node it
+  # was really needed for is the one still reading 'unset'. Do NOT read that as an
+  # argument to remove it: it is the only arm that works when the daemon derives
+  # config in-process, and which boxes those are is not a fixed property.
+  # WHY THE EXEC ENV DIFFERS PER BOX IS NO LONGER UNMEASURED — and the answer is
+  # that it is not a property of the BOX at all. Measured 2026-08-11T22:0x (echo,
+  # hostname cc-03, uname -r 6.8.0-137-generic; hyp
+  # 2026-08-04_machine-id-unset-follows-rt-spawn-lineage, resolved CONFIRMED),
+  # reaching each node over THIS checker's own ssh transport with a CONTROL
+  # hostname echo. The discriminator is whether the CURRENT daemon was started
+  # through `_runtime.sh rt_spawn`, which unsets MACHINE_ID in the spawn subshell
+  # before exec. Compare each node's daemon start time against the last
+  # `rt_spawn -- attempting daemon start` stamp in its own mind_api/state/spawn.log:
+  #   cc-05  daemon 18:50:38  rt_spawn 18:50:39 (+1s)  -> environ ABSENT  -> unset
+  #   cc-02  daemon 19:01:09  rt_spawn 19:01:10 (+1s)  -> environ ABSENT  -> unset
+  #   cc-04  daemon 19:50:49  rt_spawn 08-10T04:15    -> environ PRESENT -> cc-04
+  #   cc-03  daemon 18:15:19  rt_spawn 08-11T05:46    -> environ PRESENT -> cc-03
+  # Four for four, two positive and two negative controls, all on one kernel line.
+  # So a node "flips" between PRESENT and ABSENT across its own restarts and the
+  # per-box split above is a snapshot of launch lineage, not a stable fact about
+  # the machine. Read a PRESENT/ABSENT reading as evidence about the last restart's
+  # path, never as a box attribute.
+  # THE ARM IS WIRED INTO THE VERDICT ONLY, NOT INTO THE JSON OUTPUT. `_daemon_val`
+  # prefers logline_MACHINE_ID (so drift is correctly clean on all four nodes), but
+  # the `machine_id_resolved` field emitted for the caller reads
+  # fields.get("resolved_MACHINE_ID") DIRECTLY -- the exec-time environ read, with
+  # no logline fallback. That is why cc-05 and cc-02 publish `unset` in --json while
+  # simultaneously passing. Verified by hand on both boxes with the exact collector
+  # line from this template: RL is non-empty and the sed yields cc-05 / cc-02, and
+  # their state/*.log files carry zero NUL bytes, so nothing about the READ is
+  # broken. Tracked separately; do not "fix" it by changing this say line.
   # Empty here on a daemon that started before the emitter landed, which falls
   # through to the old environ read — no regression, self-heals on next restart.
   say logline_MACHINE_ID "$(printf '%%s\n' "$RL" | sed -n 's/.*MACHINE_ID=\([^ ]*\).*/\1/p')"
@@ -795,6 +832,23 @@ def _is_real_drift(items):
     return [d for d in items if not d.startswith("INFO ")]
 
 
+def _node_label(r):
+    """Display label for a node row — NEVER read `agent` directly for rendering.
+
+    A node may legitimately carry no `agent` key: a fleet-agnostic box has no
+    resident agent, and _roster_parity already skips such rows by construction
+    (`if n.get("agent")`). Every rendering site must therefore tolerate the
+    absence, and one of them does not merely render badly — the drift-goal TITLE
+    calls `sorted()` over these values, and sorting a mix of str and None raises
+    TypeError. That is the worst possible placement: the crash fires only when
+    drift HAS been found, i.e. exactly when the goal most needs filing, so it
+    would present as "the checker stopped filing goals" rather than as a manifest
+    problem. Falling back to the host keeps the label truthful (a box with no
+    resident agent is best named by its box) and keeps the sort total.
+    """
+    return r.get("agent") or r.get("host") or "?"
+
+
 def _live_roster(world_dir=None):
     """Composed ``agent_status`` keys — the live fleet roster. -> (set|None, err|None)
 
@@ -1219,7 +1273,7 @@ def run(nodes_filter=None, want_json=False, file_investigate=False, strict=False
         for r in results:
             mark = {"PASS": "PASS ", "DRIFT": "DRIFT", "UNREACHABLE": "UNRCH"}[r["verdict"]]
             print("  [%s] %-8s %-16s %s" % (
-                mark, r["agent"], r["host"],
+                mark, _node_label(r), r["host"],
                 r.get("detail") or (r["observed"].get("storage_backend_resolved") or "")))
             for d in r["drift"]:
                 print("           - %s" % d)
@@ -1387,7 +1441,7 @@ def _file_investigate(nodes, payload, kind="drift"):
     lines = []
     if kind == "blackout":
         for r in nodes:
-            lines.append("- %s (%s): %s" % (r["agent"], r["host"],
+            lines.append("- %s (%s): %s" % (_node_label(r), r["host"],
                                             r.get("detail") or "UNREACHABLE"))
         # The self node is collected LOCALLY, so if it ALSO failed the cause is on
         # this box, not on five peers. Listing it as a peer row would inflate the
@@ -1401,7 +1455,7 @@ def _file_investigate(nodes, payload, kind="drift"):
             lines.append(
                 "- LOCAL COLLECTOR ALSO FAILED on %s (%s): %s  <- suspect THIS box "
                 "first; this is not a peer outage"
-                % (r["agent"], r["host"], r.get("detail") or "UNREACHABLE"))
+                % (_node_label(r), r["host"], r.get("detail") or "UNREACHABLE"))
         desc = (
             "Filed automatically by core/scripts/fleet-config-parity.sh at %s from %s.\n\n"
             "FLEET BLACKOUT: every non-self node (%d) is UNREACHABLE. This is NOT config "
@@ -1426,7 +1480,7 @@ def _file_investigate(nodes, payload, kind="drift"):
     else:
         for r in nodes:
             for d in _is_real_drift(r["drift"]):
-                lines.append("- %s (%s): %s" % (r["agent"], r["host"], d))
+                lines.append("- %s (%s): %s" % (_node_label(r), r["host"], d))
         desc = (
             "Filed automatically by core/scripts/fleet-config-parity.sh at %s from %s.\n\n"
             "CONFIGURATION DRIFT detected on %d node(s). These nodes are ALIVE — a liveness "
@@ -1442,7 +1496,7 @@ def _file_investigate(nodes, payload, kind="drift"):
                "\n".join(lines))
         )
         title = "Investigate: fleet config drift on %s" % ", ".join(
-            sorted(r["agent"] for r in nodes))
+            sorted(_node_label(r) for r in nodes))
     goal = {
         "title": title,
         "description": desc,

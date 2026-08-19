@@ -141,6 +141,104 @@ def test_save_history_skips_blacklisted_gate_firings_meta(sandbox, meta_sandbox,
 
 
 @with_sandbox
+def test_save_history_skips_blacklisted_gate_firings_segments_meta(sandbox, meta_sandbox, _fileops):
+    """meta/gate-firings-YYYY-MM-DD.jsonl (the GATE_FIRINGS_SEGMENTED flush
+    lane's date segments, 2026-08-17) must NOT create a .history snapshot —
+    same append-only audit class as the legacy file, written by every box's
+    iteration-close flush. Covered by the `gate-firings-*.jsonl` glob entry;
+    the glob branch is exercised via a name the exact-match entry cannot cover.
+    """
+    for name in ("gate-firings-2026-08-17.jsonl", "gate-firings-2027-01-01.jsonl"):
+        target = meta_sandbox / name
+        target.write_text(json.dumps({"gate": "test", "decision": "block"}) + "\n",
+                          encoding="utf-8")
+        _fileops.save_history(str(target), str(meta_sandbox), "test-agent",
+                              summary="segment flush")
+        history_path = meta_sandbox / ".history" / name
+        assert_true(not history_path.exists(),
+                    f"{name} snapshots should be blacklisted; "
+                    f"{history_path} unexpectedly exists")
+    # The matcher itself, both directions: segment shape yes, an unrelated
+    # meta file no, and the glob does not bleed into the world base.
+    assert_true(_fileops._is_snapshot_blacklisted(meta_sandbox, "gate-firings-2026-08-17.jsonl"),
+                "segment must be blacklisted under meta")
+    assert_true(not _fileops._is_snapshot_blacklisted(meta_sandbox, "gate-firings-summary.txt"),
+                "non-jsonl sibling must not be blacklisted")
+    assert_true(not _fileops._is_snapshot_blacklisted(sandbox, "gate-firings-2026-08-17.jsonl"),
+                "meta glob must not bleed into the world base")
+
+
+@with_sandbox
+def test_save_history_skips_blacklisted_utilization_sidecars_world(sandbox, meta_sandbox, _fileops):
+    """world/<kind>-utilization.jsonl must NOT create a .history snapshot.
+
+    g-358-05 item-4 prerequisite. The counter sidecars the not-yet-shipped
+    writer flushes once per maintenance tick are FULL REWRITES of a ~1-2MB
+    file, so an unblacklisted flush would move the O(N^2) churn the goal exists
+    to kill out of the content object and into .history/ — not a fix.
+
+    The two blacklist literals are pinned to `_utilization_store.counters_name`
+    here rather than re-typed, because `_fileops` is imported by nearly
+    everything and must not import that module back. This assertion is the only
+    thing standing between the two halves and a silent rename drift.
+    """
+    from _utilization_store import KINDS, counters_name
+
+    for kind in KINDS:
+        name = counters_name(kind)
+        assert_true(name in _fileops._SNAPSHOT_BLACKLIST["world"],
+                    f"counters_name({kind!r}) == {name!r} is not in the world "
+                    f"blacklist — the literals have drifted from their owner")
+        target = sandbox / name
+        target.write_text(json.dumps({"id": "rb-1", "utilization": {"times_helpful": 2}}) + "\n",
+                          encoding="utf-8")
+        _fileops.save_history(str(target), str(sandbox), "test-agent",
+                              summary="counter flush")
+        history_path = sandbox / ".history" / name
+        assert_true(not history_path.exists(),
+                    f"{name} snapshots should be blacklisted; "
+                    f"{history_path} unexpectedly exists")
+
+
+@with_sandbox
+def test_utilization_blacklist_widening_is_exactly_two_names(sandbox, meta_sandbox, _fileops):
+    """The widening must catch the sidecars and NOTHING adjacent (guard-2499).
+
+    Exact basenames were chosen over a `<kind>-*.jsonl` glob precisely so this
+    stays provable. The near-misses below are the ones a glob WOULD have taken:
+
+      - `<kind>.jsonl`          — the live content store (must still snapshot)
+      - `<kind>-archive.jsonl`  — retired records; coordination_merge measured
+                                  that a loose glob there would OVERRIDE their
+                                  existing merge registration
+      - `<kind>-YYYY-MM-DD.jsonl` — the date segments, deliberately NOT
+                                  blacklisted: unlike the append-only
+                                  meta/gate-firings-*.jsonl precedent these are
+                                  CONTENT, mutated in place, and segmentation
+                                  already fixes their churn on its own
+
+    The last two assertions are the POSITIVE CONTROL (guard-3534): they prove
+    the matcher can answer False in this same sandbox, so the True answers above
+    are a decision and not a stuck predicate.
+    """
+    from _utilization_store import KINDS, counters_name, segment_name
+    import datetime
+
+    for kind in KINDS:
+        assert_true(_fileops._is_snapshot_blacklisted(sandbox, counters_name(kind)),
+                    f"{counters_name(kind)} must be blacklisted under world")
+        for near_miss in (f"{kind}.jsonl",
+                          f"{kind}-archive.jsonl",
+                          segment_name(kind, datetime.date(2026, 8, 17))):
+            assert_true(not _fileops._is_snapshot_blacklisted(sandbox, near_miss),
+                        f"{near_miss} must NOT be blacklisted — the widening "
+                        f"is exactly the two static sidecar names")
+        # Base isolation: a WORLD pattern must not bleed into META.
+        assert_true(not _fileops._is_snapshot_blacklisted(meta_sandbox, counters_name(kind)),
+                    f"{counters_name(kind)} is world-only; it must not match under meta")
+
+
+@with_sandbox
 def test_save_history_does_not_skip_same_name_in_wrong_base(sandbox, meta_sandbox, _fileops):
     """gate-firings.jsonl pattern is META-only; a same-name file under WORLD must snapshot.
 
@@ -569,6 +667,14 @@ TESTS = [
     test_save_history_skips_blacklisted_presence_dir,
     test_save_history_skips_blacklisted_board_dir,
     test_save_history_skips_blacklisted_gate_firings_meta,
+    test_save_history_skips_blacklisted_gate_firings_segments_meta,
+    #  item-4 prerequisite — world utilization counter sidecars.
+    # This list is the INVISIBLE half's population: pytest collects by module
+    # attribute and never reads it, so a test added above but not here is green
+    # in pytest and simply ABSENT from `run-invisible-suites.sh`. Caught during
+    # this addition — pytest said 22 passed while main() said 20/20.
+    test_save_history_skips_blacklisted_utilization_sidecars_world,
+    test_utilization_blacklist_widening_is_exactly_two_names,
     test_save_history_does_not_skip_same_name_in_wrong_base,
     test_save_history_writes_gzip_compressed_snapshot,
     test_save_history_gzip_reduces_size_meaningfully,

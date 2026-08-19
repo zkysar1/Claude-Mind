@@ -74,6 +74,12 @@ GUARD_PATH = WORLD_DIR / "guardrails.jsonl"
 # () and the created-date parsing — is identical; the parser now lives in
 # the pure module, called internally by is_dead_entry.
 from _curation_predicate import is_dead_entry as _is_candidate  # noqa: E402
+#  reader seam. Reader-only; with no sidecar every join below falls
+# through to the embedded field, so behaviour is unchanged until the writer lands.
+from _utilization_store import (  # noqa: E402
+    load_counters as _load_counters,
+    utilization_of as _utilization_of,
+)
 
 
 def _read_jsonl(path):
@@ -88,8 +94,14 @@ def _read_jsonl(path):
     return out
 
 
-def _summarize(records, candidates, store_label, out=sys.stdout):
-    """Print counts + a sample of candidates so a human can sanity-check."""
+def _summarize(records, candidates, store_label, out=sys.stdout, counters=None):
+    """Print counts + a sample of candidates so a human can sanity-check.
+
+    ``counters`` is the g-358-05 sidecar map. It is passed in rather than
+    derived from ``store_label`` because that label is a DISPLAY string
+    ("Reasoning Bank"), not a KIND ("reasoning-bank") — mapping one to the other
+    here would be a second, silently-drifting name table.
+    """
     total_active = sum(1 for r in records if r.get("status") == "active")
     print(f"\n=== {store_label} ===", file=out)
     print(f"  Total records:         {len(records)}", file=out)
@@ -102,12 +114,12 @@ def _summarize(records, candidates, store_label, out=sys.stdout):
     # Show top 5 by retrieval_count
     samples = sorted(
         candidates,
-        key=lambda r: (r.get("utilization") or {}).get("retrieval_count", 0),
+        key=lambda r: _utilization_of(r, counters).get("retrieval_count", 0),
         reverse=True,
     )[:5]
     print(f"  Top 5 candidates by retrieval_count:", file=out)
     for r in samples:
-        util = r.get("utilization") or {}
+        util = _utilization_of(r, counters)
         title_or_rule = r.get("title") or r.get("rule", "")
         title_or_rule = (title_or_rule or "")[:60]
         print(f"    {r.get('id', '?'):10s}  "
@@ -185,10 +197,15 @@ def main():
 
     if args.store in ("rb", "both"):
         rb = _read_jsonl(RB_PATH)
+        # : one sidecar read per store, threaded into BOTH the predicate
+        # and the summary so the slate and the numbers printed beside it can
+        # never disagree about which counters they judged.
+        rb_counters = _load_counters("reasoning-bank")
         rb_candidates = [r for r in rb
                          if _is_candidate(r, args.min_retrievals,
-                                          args.min_age_days, today)]
-        _summarize(rb, rb_candidates, "Reasoning Bank")
+                                          args.min_age_days, today,
+                                          rb_counters)]
+        _summarize(rb, rb_candidates, "Reasoning Bank", counters=rb_counters)
         if args.apply and rb_candidates:
             rb_changed = _apply_retirement(
                 RB_PATH, [r["id"] for r in rb_candidates],
@@ -197,10 +214,13 @@ def main():
 
     if args.store in ("guard", "both"):
         guard = _read_jsonl(GUARD_PATH)
+        guard_counters = _load_counters("guardrails")
         guard_candidates = [r for r in guard
                             if _is_candidate(r, args.min_retrievals,
-                                             args.min_age_days, today)]
-        _summarize(guard, guard_candidates, "Guardrails")
+                                             args.min_age_days, today,
+                                             guard_counters)]
+        _summarize(guard, guard_candidates, "Guardrails",
+                   counters=guard_counters)
         if args.apply and guard_candidates:
             guard_changed = _apply_retirement(
                 GUARD_PATH, [r["id"] for r in guard_candidates],

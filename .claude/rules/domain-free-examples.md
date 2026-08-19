@@ -1,3 +1,24 @@
+---
+paths:
+  - "core/**"
+  - ".claude/rules/**"
+  - ".claude/skills/**"
+  - "mind_api/**"
+---
+
+<!--
+  Path-scoped (g-115-6469). These globs ARE this rule's own Scope section: the
+  rule governs example text inside core/, .claude/rules, .claude/skills and
+  mind_api, and explicitly does NOT apply to world/, meta/, agent dirs or forged
+  skills. So the scope and the trigger are the same set — the rule loads exactly
+  when you touch a file it governs.
+
+  Enforcement is independent of whether this text is in context:
+  core/scripts/domain-leak-check.sh is the Layer-C scanner and
+  marker-placement-gate.{py,sh} is the Layer-B PreToolUse gate. See
+  core/config/conventions/rules-loading.md.
+-->
+
 # Domain-Free Examples in Core Files
 
 ## Principle

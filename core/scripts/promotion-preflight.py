@@ -40,6 +40,20 @@ from pathlib import Path
 # Framework paths that SHOULD stay in lockstep across deployments (the portable
 # cognition core). Domain state (world/, meta/, agents/) is deployment-local by
 # design and is intentionally NOT compared.
+#
+# THIS LIST IS THE *CHECK* SET. `core/config/seed-manifest.yaml` `include:` is
+# the *COPY* set. The defect this gate exists to prevent is a promote that
+# clobbers target-ahead work, so any path the manifest COPIES and this list does
+# not CHECK is copied blind. `test_promotion_preflight_manifest_parity.py`
+# asserts every manifest entry is covered here or named in
+# MANIFEST_NOT_DRIFT_CHECKED below, so the two sets cannot silently diverge.
+#
+# : mind_api/ was copied and never checked. The wrappers are
+# daemon-only, so mind_api/src IS the live runtime path -- a downstream that had
+# evolved its own daemon got it overwritten while this gate exited 0 "safe to
+# promote". Listed as the manifest's two entries rather than a bare "mind_api"
+# so mind_api/bench stays out by CONSTRUCTION (the manifest excludes it, Q27
+# lean) instead of by a second exclusion rule that could drift from it.
 FRAMEWORK_PATHS = [
     "CLAUDE.md",
     "core/config",
@@ -47,7 +61,49 @@ FRAMEWORK_PATHS = [
     ".claude/skills",
     ".claude/rules",
     ".claude/settings.json",
+    "mind_api/src",
+    "mind_api/tests",
 ]
+
+# Manifest `include:` entries deliberately NOT drift-checked, each with the
+# reason. Consumed by the parity test: an entry that is neither covered by
+# FRAMEWORK_PATHS nor named here FAILS that test, so adding a path to the seed
+# manifest forces a decision instead of silently widening the copy set.
+#
+# Measured 2026-08-18 (): the copy set leads the check set by 12
+# entries. mind_api/src + mind_api/tests are closed above; the rest are recorded
+# here rather than absorbed, because "uncovered but known" and "uncovered and
+# unnoticed" look identical from inside the gate.
+MANIFEST_NOT_DRIFT_CHECKED = {
+    # `core/` is copied WHOLE; this gate checks core/config + core/scripts. The
+    # remainder (core/logs, core/tests, core/githooks, core/BOUNDARY.md ...) is
+    # a mix of genuinely machine-local output (logs) and real framework
+    # (githooks, tests/gates). Widening to bare "core" would newly report
+    # core/logs churn as drift on every run, so it needs its own exclusion
+    # design -- deliberately out of 's scope, not overlooked.
+    "core/": "copied whole; only core/config + core/scripts are checked "
+             "(core/logs is machine-local; widening needs its own exclusions)",
+    # Repo-furniture that legitimately differs per deployment. A promote
+    # overwriting these is expected, not drift.
+    ".env.example": "deployment-local credential template",
+    # NOT a clean "safe to clobber" -- recorded honestly because this dict is
+    # read as a set of justifications. sync-casualty-detect.py adds .gitignore
+    # back via its own EXTRA_FRAMEWORK_PATHS, citing it as 1 of 2 CONFIRMED sync
+    # casualties, i.e. a real overwrite happened here and mattered. It stays
+    # unchecked because the right treatment is the DEPLOYMENT_LOCAL bucket
+    # (visible, non-blocking -- what CLAUDE.md already gets), not FRAMEWORK_PATHS
+    # (blocking), and that is a scope decision this goal did not take.
+    ".gitignore": "deployment-local ignore set, BUT a confirmed sync casualty -- "
+                  "sync-casualty-detect.py compensates via EXTRA_FRAMEWORK_PATHS; "
+                  "open question is whether it belongs in DEPLOYMENT_LOCAL here",
+    ".gitattributes": "deployment-local",
+    "LICENSE": "static repo furniture",
+    "README.md": "deployment-specific front matter",
+    "SETUP.md": "deployment-specific setup steps",
+    "RELEASES.json": "per-deployment release ledger",
+    "requirements.txt": "deployment-local pin set",
+    "pytest.ini": "deployment-local test config",
+}
 
 # Build artifacts / machine-local / transient -- never features. Pruned from
 # the walk so they can never be mistaken for drift.

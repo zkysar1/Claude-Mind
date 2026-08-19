@@ -152,18 +152,69 @@ def test_world_prefix_matches_absolute_equivalent(roots):
 # (3) The one honest empty case still exits 0 — guard against over-tightening
 # ---------------------------------------------------------------------------
 
-def test_under_root_missing_file_stays_quiet(roots):
-    """Under a governed root with no snapshots -> 'No history', exit 0.
+def test_deleted_file_with_snapshots_still_lists(roots):
+    """THE property the retired test below was protecting, pinned directly.
 
-    A file that does NOT exist is deliberately included here: snapshots
+    g-115-4181 wrote `test_under_root_missing_file_stays_quiet`, which asserted
+    exit 0 for `never-existed.jsonl` and warned in its own docstring: "snapshots
     outlive their file, so 'missing on disk' must never by itself become an
     error. If this test ever fails, the fix has over-tightened into the
-    delete-then-restore workflow.
+    delete-then-restore workflow."
+
+    g-115-5021 asks for exactly that change, so the two goals appeared to
+    conflict. They do not, and the reason is that THE RETIRED TEST DID NOT
+    EXERCISE ITS OWN RATIONALE: `never-existed.jsonl` has no snapshots, so it is
+    not the delete-then-restore case at all. A file that was ever snapshotted
+    HAS snapshots, and the snapshot lookup runs BEFORE the missing-file check,
+    so that workflow never reaches the new branch.
+
+    This test pins the real property — save, delete, still list — instead of a
+    path that merely resembles it. Measured on the live store 2026-08-11 before
+    the fix and again after: `1 versions`, exit 0, both times.
+    """
+    world, meta = roots
+    f = world / "deleted-but-snapshotted.md"
+    f.write_text("v1\n", encoding="utf-8")
+    # history.py has no `save` subcommand — snapshots are written by
+    # _fileops.save_history, which is what history-save.sh shells out to. Going
+    # through the real writer (rather than hand-building a .history tree) is the
+    # point: a fabricated snapshot layout would pin this test to a directory
+    # shape instead of to the behaviour.
+    env = dict(os.environ)
+    env.update(MIND_WORLD=str(world), MIND_META=str(meta),
+               STORAGE_BACKEND="local", CORE_SCRIPTS=str(SCRIPTS))
+    saved = subprocess.run(
+        [sys.executable, "-c",
+         "import os, sys; sys.path.insert(0, os.environ['CORE_SCRIPTS']);"
+         "from _fileops import save_history, resolve_base_dir;"
+         "b = resolve_base_dir(sys.argv[1]);"
+         "sys.exit(1) if b is None else save_history(sys.argv[1], b, 'alpha', 'pin')",
+         str(f)],
+        cwd=str(SCRIPTS), env=env, capture_output=True, text=True,
+    )
+    assert saved.returncode == 0, f"save failed: {saved.stderr}"
+    f.unlink()
+    r = _run(roots, "list", str(f))
+    assert r.returncode == 0, f"{r.returncode}: {r.stderr}"
+    assert "History for" in r.stdout, r.stdout
+
+
+def test_under_root_missing_file_with_no_snapshots_is_an_error(roots):
+    """: in-scope + missing + NO snapshots is an ERROR, not an empty
+    store.
+
+    Before this, a typo'd path under a governed root returned the same
+    reassuring "No history" at exit 0 as a real file with an empty store, so a
+    mistyped path read as "nothing to lose". Same shape as the defect
+    g-115-4181 fixed one layer out (an error condition rendered as data) — it
+    simply stopped one branch short.
+
+    The sibling above is what keeps this from over-tightening; both must pass.
     """
     world, _meta = roots
     r = _run(roots, "list", str(world / "never-existed.jsonl"))
-    assert r.returncode == 0, f"{r.returncode}: {r.stderr}"
-    assert "No history" in r.stdout, r.stdout
+    assert r.returncode == 1, f"{r.returncode}: {r.stdout}{r.stderr}"
+    assert "does not exist" in r.stderr, r.stderr
 
 
 def test_under_root_existing_file_no_snapshots_stays_quiet(roots):

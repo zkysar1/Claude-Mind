@@ -155,11 +155,14 @@ Edit the node's .md file (NEVER Write — file already exists):
   - Update entities list if new entities discovered
 
 After writing content, check growth triggers:
-  Read core/config/tree.yaml for decompose_threshold, split_threshold
-  line_count = count lines in node .md body (excluding YAML front matter)
-  If line_count > decompose_threshold AND depth < D_max:
-    bash core/scripts/tree-update.sh --set <node-key> growth_state ready_to_decompose
-    Invoke /tree maintain
+  Read core/config/tree.yaml for split_threshold
+  Decompose is STRUCTURAL, not line-count (g-306-13; board msg-20260619-075228-bravo-086).
+  Do NOT compute a line count and do NOT set growth_state ready_to_decompose:
+  tree.py get_decompose_candidates selects on leaves-under-node >
+  K_max^(D_retrieval-1) and never reads decompose_threshold, so a line-count
+  flag is INERT — it writes a field no reader acts on. Ask the tool instead:
+    bash core/scripts/tree-read.sh --decompose-candidates
+    If the node is listed: Invoke /tree maintain
   Elif article_count > split_threshold:
     bash core/scripts/tree-update.sh --set <node-key> growth_state ready_to_split
     Invoke /tree maintain

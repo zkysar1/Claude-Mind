@@ -26,14 +26,16 @@ DEADLOCK, not transient contention). Class (a) degrades; class (b) wedges.
 `merge_handler_for` in `core/scripts/coordination_merge.py` dispatches on
 **basename**, against the `_HANDLERS` dict (85 entries measured 2026-08-02 by
 `grep -c '^\s*"[^"]*":\s*merge_' core/scripts/coordination_merge.py` — re-derive
-rather than trusting this number), plus **THREE path-pattern branches that run
+rather than trusting this number), plus **FIVE path-pattern branches that run
 BEFORE the dict lookup**:
 
 | # | Pattern | Effect |
 |---|---|---|
 | 1 | `.../team-state/agents/<name>.yaml` | registers — basenames are per-agent |
 | 2 | `.../health/<YYYY-MM-DD>.jsonl` | registers — basenames are dates (g-306-118-e) |
-| 3 | `core/config/**` | **un**-registers — a registered basename that also names an immutable framework config is deliberately NOT merged (g-115-3997) |
+| 3 | `<kind>-<YYYY-MM-DD>.jsonl` for reasoning-bank / guardrails | registers — routed to that store's OWN id-keyed handler, not append-only (g-358-05) |
+| 4 | `gate-firings-<YYYY-MM-DD>.jsonl` | registers — routed to the legacy file's `merge_append_only_jsonl` (g-358-08 / g-328-51 cutover, 2026-08-17). Measured BEFORE registration: `merge_handler_for("meta/gate-firings-2026-08-17.jsonl")` was `None` — the hottest dynamic-basename store in the fleet (every box flushes into the same live segment at every iteration close) was class (b) while the legacy file it replaces had always been class (a). Cure chosen per guard-1816: handler-registration, NOT a writer conversion, because the writer (`gate-firings-flush.py` → `locked_modify_jsonl`) already satisfies the class-(b) pattern AND the segment has no removal path (store-hygiene G5's age-cap keys on the legacy basename), so a line-union can never resurrect a deletion |
+| 5 | `core/config/**` | **un**-registers — a registered basename that also names an immutable framework config is deliberately NOT merged (g-115-3997) |
 
 ```bash
 # authoritative, and cheaper than reasoning about it
@@ -43,10 +45,11 @@ py -3 -c "import sys; sys.path.insert(0,'core/scripts'); import coordination_mer
 A non-`None` return means class (a). `None` means class (b).
 
 **Do NOT substitute a grep of the dict for that call — it is wrong in BOTH
-directions.** Branches 1 and 2 make a store class (a) with *no* basename entry,
-so a grep reports a false (b) on every agent shard and every health ledger;
-branch 3 makes a path class (b) *despite* a basename entry, so a grep reports a
-false (a) on the three colliding `core/config` names. The grep form was
+directions.** Branches 1-4 make a store class (a) with *no* basename entry,
+so a grep reports a false (b) on every agent shard, every health ledger and
+every date segment; branch 5 makes a path class (b) *despite* a basename entry,
+so a grep reports a false (a) on the three colliding `core/config` names. The
+grep form was
 documented here as authoritative until 2026-08-02, and its first failure mode
 (shards) already existed when it was written. Resolve per PATH, through the
 function; a basename is an input to the answer, not the answer.
@@ -325,9 +328,134 @@ holds them, which `_check_no_duplicate_id` treats as a corrupt state. So the
 writers were converted to `locked_rmw` instead.
 
 The general test, before reaching for the cheaper cure: **does any writer of this
-store delete or filter records?** If yes, registration is not merely more
+store delete, filter, OR MUTATE records?** If yes, registration is not merely more
 expensive to reason about — it is wrong. If no (a pure append log such as
 `changelog.jsonl` or a board channel), registration is the better cure.
+
+**"or MUTATE" was added 2026-08-09 (g-115-5457) — the test previously asked only
+about removal, and that omission silently passes two of the four stores it was
+applied to.** `merge_append_only_jsonl` dedups by SERIALIZED LINE and its
+docstring is explicit that records must be immutable ("two non-identical lines
+are distinct events"). So an in-place edit is not a milder version of a delete —
+it is a *different* corruption with the same cure-invalidating force: the two
+sides hold two versions of one logical record, the union keeps BOTH, and the
+store now has two records for one id, each missing the other's edit. Removal
+resurrects; mutation duplicates. A reader applying the removal-only test to a
+store whose only hazard is mutation gets a clean answer and ships a regression.
+(The journal.jsonl triage in `coordination_merge.py` had already found both legs
+independently and called them "(1)" and "(2)"; this line lifts that into the
+general test so it is not rediscovered per-store.)
+
+#### Measured application: the five per-agent stores (g-115-5457, 2026-08-09, alpha worker Body, hostname cc-07, `uname -r` 6.8.0-136-generic)
+
+The goal proposed registering five per-agent JSONL stores, noting they "are all
+APPEND-ONLY by contract" and that registering them "may be a small, low-risk
+change". Reading every writer disqualified **four of five** — a fourth
+independent reproduction of this convention's "the lookup-only predicate
+overstates the work" finding, and the first where the overstatement came from the
+*append-only* claim rather than from machine-locality.
+
+| store | verdict | disqualifying writer |
+|---|---|---|
+| `session/desync-warnings.jsonl` | **REGISTERED** (`merge_append_only_jsonl`) | none — 3 writers, all pure appends |
+| `session/execution-diary.jsonl` | refused — REMOVAL | `execution-diary.py cmd_trim`, wired at `iteration-close.sh:2842` every iteration |
+| `insights.jsonl` | refused — MUTATION | `insights-read.sh --mark-processed` sets `processed=True` on every entry and rewrites |
+| `experience.jsonl` | refused — REMOVAL | `archive_sweep` phase 2 filter (already recorded above) |
+| `experience-archive.jsonl` | refused — MUTATION | `experience_write.set_field` targets the archive when the id lives there |
+
+Three things worth carrying beyond the table:
+
+- **Two of the four were caught only by the MUTATION leg** added above. Under the
+  previous removal-only test both would have registered clean.
+- **The store that most needs the cure is the one that cannot have it.**
+  `execution-diary.jsonl`'s trim is itself a backend-bypassing
+  `open(tmp,"w")`+`os.replace` with `ensure_ascii=False` — i.e. it *causes* the
+  byte divergence that strands the fence — and that same trim is what forbids
+  registering the handler that would heal it. Its cure has to be a different
+  shape (route the trim through the backend), not this one.
+- **`locked_rmw` does not cure this wedge**, so the two `experience` stores are
+  not covered by being "(b) — FIXED" in the census above. That cure retries a
+  conflict; this failure is a fence that can never match, so the retry loops.
+  Both facts are true at once and the table's "FIXED" is scoped to the first.
+
+The `insights.jsonl` basename collision with
+`agents/<a>/.history/snapshots/insights.jsonl` was checked and is **not** a
+hazard: `.history` is in `_EXCLUDE_DIRS`, so the snapshot is machine-local and no
+handler can reach it. Note which leg answered that — the **directory prune**, not
+the basename policy. `_is_machine_local` alone returns `False` there and would
+have reported a collision hazard that does not exist, which is the same one-leg
+trap this convention documents above, firing in the opposite direction (a false
+POSITIVE rather than a false negative).
+
+### Registration is not a cure if the HANDLER itself can lose data (g-115-5294, 2026-08-08, alpha worker Body, hostname cc-07, `uname -r` 6.8.0-136-generic)
+
+Everything above decides whether a store may be *registered*. This applies
+AFTER registration: a class-(a) store is only ever as safe as its handler, and a
+handler that picks a whole sub-document by LWW drops every key the loser held
+alone. `team-state.yaml` is registered and passes both axes of the table above —
+and `_merge_strategic_focus` (`coordination_merge.py` L800-826) was losing
+one-sided keys the whole time. So "class (a)" answers *whether* a reconciler
+runs below the write, never *whether it conserves*.
+
+**The cure, and why its two halves are ONE change.** The merge half is a
+loser-first overlay — `out = dict(lose)` then `out.update(win)` — so every key
+the winner carries still wins (including an explicit `None`) while a key absent
+from the winner survives from the loser. The writer half stamps
+`strategic_focus.set_at` inside `team-state.py`'s `strategic_focus` branch
+whenever any `strategic_focus.*` field is written and the write does not set
+`set_at` itself. Fixing only the merge leaves a real amendment losing to a stale
+peer, because nothing bumped the field the ordering reads; fixing only the writer
+makes the winner correct and still discards the loser's one-sided keys. Neither
+half is sufficient, which is why they share one suite
+(`core/scripts/tests/test_strategic_focus_merge_and_stamp.py`, 11 tests) and one
+coupling assertion that fails if EITHER is reverted.
+
+**The general test is NOT "does the handler union one-sided keys".** Two cure
+shapes are both valid, and demanding the wrong one produces false findings:
+
+| shape | example | conserves because |
+|---|---|---|
+| enumerate every schema key | `merge_team_state` overrides all 5 merge-worthy top-level keys after its LWW base | no named key's fate depends on which side won; only opaque/future keys ride along, deliberately |
+| union-backfill the key set | `_merge_goal` / `_merge_aspiration_record` loop `sorted(set(a) | set(b))` | a key absent from the base is taken from whichever side has it |
+
+`_merge_strategic_focus` did NEITHER — its 5 schema keys were neither enumerated
+nor unioned — which is the actual defect signature. So the question to ask of any
+handler is: **for every key in the schema, is there a rule whose outcome does not
+depend on which side won the base-pick?**
+
+**Population, measured not asserted.** Nine LWW-base sites in
+`coordination_merge.py`; re-derive rather than trusting that number:
+
+```bash
+grep -n 'out = dict(win)\|out = dict(lose)' core/scripts/coordination_merge.py
+```
+
+Three carry a union-backfill (`_merge_aspiration_record` g-115-4163, `_merge_goal`
+g-115-5017, and this one) — so this is a RECURRING class with two prior cures at
+other sites, not a one-off. I audited exactly two of the remaining six:
+`merge_team_state` conserves by enumeration (so the child fix above is the
+complete fix for this path, not a partial one) and `merge_team_state_shard`
+whole-snapshot LWW is deliberate and documented. **The other five are unaudited by
+me** — do not read the count above as five defects, and do not read it as five
+non-defects either.
+
+**Two corrections to g-115-5294's own record, both measured.** It locates
+`_merge_strategic_focus` at L782-790 (actually L800-826 — line numbers had
+drifted, so grep for the symbol rather than editing from the cited range), and it
+states the amendment "currently wins by being longer". It does not: `_canon`
+orders **lexicographically, not by length**, so on an exact `set_at` tie the
+winner is whichever canonical form sorts higher — measured, a 63-char document
+beat a 101-char one. That error is not cosmetic; it made the first two versions
+of this cure's own coupling test set up the *opposite* of the adverse case they
+claimed, and pass vacuously.
+
+**Verified vs not.** Mutation matrix: baseline 11/11; restoring `out = dict(win)`
+kills `test_loser_only_key_survives`; removing the stamp bump kills
+`test_writing_primary_bumps_set_at` AND the coupling test. Writer-side tests run
+as subprocesses with `STORAGE_BACKEND=local` pinned explicitly (guard-955). NOT
+verified: no two-box live convergence run — the handler is exercised against
+fixtures, so the argument that both machines emit identical bytes rests on the
+commutativity tests, not on observation.
 
 ## The required pattern for a class-(b) writer
 
@@ -406,5 +534,11 @@ Assertion points that actually discriminate:
   fence-wedge sub-mechanisms
 - `rb-5250` — mutation-proof, because local-backend green is not evidence
 - `guard-472` — new `locked_*` callers in `_fileops.py`
+- `guard-1816` — enumerate the writers before choosing a merge semantic; step 4
+  is "record the decision here so the next reader inherits it"
+- `guard-1153` — the cross-granularity transplant a one-sided-key cure must NOT
+  become (preserve absent keys; never field-level tiebreak a key both sides hold)
+- `core/scripts/tests/test_strategic_focus_merge_and_stamp.py` — the coupled
+  merge+writer suite for the class-(a) handler-conservation defect above
 - `g-115-3177` (the meta_yaml cure), `g-115-3295` (this classification),
   `g-115-1899-b` (the correct-but-non-transferable aspirations conclusion)

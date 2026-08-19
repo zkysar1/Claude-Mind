@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import os
 import shutil
 import sys
 import tempfile
@@ -37,9 +38,36 @@ SCRIPT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 
+def _pin_body_wm(tmpdir: Path):
+    """Pin wm_path() to the fixture file via BODY_WM_PATH — the FIRST branch of
+    wm.wm_path(). Patching AGENT_DIR (below) is the SECOND branch and holds only
+    where BODY_WM_PATH is unset. On a WORKER Body the bash-agent-inject hook
+    exports BODY_WM_PATH into every call, so without this pin every write_wm
+    from this fixture landed on the LIVE per-Body working-memory.yaml —
+    measured 2026-08-16 (alpha worker, cc-08): the fixture's
+    `goals_completed_this_session: 0` overwrote the canonical top-level LIST
+    slot with an int, `wm-append.sh goals_completed_this_session` then refused
+    every Phase 4b hand-off row, and body-merge's list/int type-mismatch branch
+    silently dropped the Body's contribution (msg-20260816-183354-alpha-5099;
+    conftest rule: tests that override the WM path MUST set BODY_WM_PATH, never
+    patch AGENT_DIR alone). The only environment where the old isolation failed
+    was the only one where it mattered. Returns the prior value for restore."""
+    prev = os.environ.get("BODY_WM_PATH")
+    os.environ["BODY_WM_PATH"] = str(tmpdir / "session" / "working-memory.yaml")
+    return prev
+
+
+def _unpin_body_wm(prev):
+    if prev is None:
+        os.environ.pop("BODY_WM_PATH", None)
+    else:
+        os.environ["BODY_WM_PATH"] = prev
+
+
 def _load_crs_module(tmpdir: Path):
     """Import compact-restore-slots against a temp AGENT_DIR (mirrors the
-    proven harness in test_compact_restore_skip_slots.py)."""
+    proven harness in test_compact_restore_skip_slots.py). Callers MUST have
+    pinned BODY_WM_PATH first (_pin_body_wm) — see that helper for why."""
     for mod in ("_paths", "wm", "compact_restore_slots"):
         sys.modules.pop(mod, None)
 
@@ -95,6 +123,7 @@ VALID_CK = {"goals_completed": 3, "productive_goals": 2, "evolutions": 0,
 
 def _case_recover_when_null() -> int:
     tmpdir = Path(tempfile.mkdtemp(prefix="crs-recover-null-"))
+    prev_body_wm = _pin_body_wm(tmpdir)
     try:
         wm_path = _write_state(tmpdir, disk_loop_state=None, ck_loop_state=VALID_CK)
         crs = _load_crs_module(tmpdir)
@@ -108,11 +137,13 @@ def _case_recover_when_null() -> int:
               "from checkpoint (goals_completed=3)")
         return 0
     finally:
+        _unpin_body_wm(prev_body_wm)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _case_never_clobber_valid() -> int:
     tmpdir = Path(tempfile.mkdtemp(prefix="crs-no-clobber-"))
+    prev_body_wm = _pin_body_wm(tmpdir)
     try:
         disk_valid = {"goals_completed": 5, "productive_goals": 4, "evolutions": 1}
         ck_older = {"goals_completed": 1, "productive_goals": 1, "evolutions": 0}
@@ -129,6 +160,7 @@ def _case_never_clobber_valid() -> int:
               "preserved against older checkpoint (g-115-593 intent intact)")
         return 0
     finally:
+        _unpin_body_wm(prev_body_wm)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 

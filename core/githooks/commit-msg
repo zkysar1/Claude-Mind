@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# commit-msg — Layer B gates that need to READ THE COMMIT MESSAGE.
+#
+# Sibling of core/githooks/pre-commit (same core.hooksPath install, same
+# `_gate` telemetry shape, same $PY selection). Git invokes this hook with the
+# message file as $1 AFTER the message is composed, which is the one thing
+# pre-commit structurally cannot see — so a gate whose sanctioned bypass is a
+# commit-message TRAILER lives here. For a pathspec commit git exports
+# GIT_INDEX_FILE pointing at the temporary index, so `git diff --cached` inside
+# a gate below sees exactly what the commit will contain (verified by
+# test_hot_path_size_gate.py::test_pathspec_commit_is_seen_as_committed).
+#
+# Telemetry is BLOCK-ONLY, exactly as in pre-commit: a refusal logs one `block`
+# firing to meta/gate-firings.jsonl; clean passes log nothing (an own-cloud
+# gate-firings append is a whole-object S3 RMW — see the pre-commit header).
+set -e
+REPO="$(git rev-parse --show-toplevel)"
+MSG_FILE="$1"
+
+_gate() {
+  local id="$1"; shift
+  local rc=0
+  "$@" || rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  bash "$REPO/core/scripts/gate-log.sh" "$id" block \
+    --caller "core/githooks/commit-msg" \
+    --trigger "gate-exit=$rc" 2>/dev/null || true
+  exit "$rc"
+}
+
+case "$(uname -s 2>/dev/null || echo unknown)" in
+    MINGW*|MSYS*|CYGWIN*) PY="py -3" ;;
+    *) PY="python3" ;;
+esac
+
+# Gate M1: hot-path size budget (g-115-6470, 2026-08-18). CLAUDE.md, every
+# .claude/rules/*.md, the aspirations*/worker-loop/boot/prime/respond skills
+# and the loop digest may not GROW past their size at HEAD (a new member may
+# not exceed its set's new_file_cap). Bypass = trailer in the commit message:
+#   size-budget-override: <why this must live in the hot path>
+# audited to world/override-bypass-ledger.jsonl. Merge commits are skipped
+# inside the gate (MERGE_HEAD). Set: core/config/hot-path-budget.yaml.
+_gate hot-path-size-gate $PY "$REPO/core/scripts/hot-path-size-gate.py" --commit-msg-file "$MSG_FILE"
+
+# Gate M2: goal-claim backstop (g-115-6689 follow-through, 2026-08-19). Refuses
+# a commit whose message names a goal another SESSION holds a live claim on.
+# Closes the one execution path with no coordination edge: user-directed chat
+# work never calls aspirations-claim.sh, so two Bodies of the SAME agent can
+# build the same thing twice and neither can know (measured 2026-08-18 —
+# competing implementations of g-115-6689 in one evening). The commit is the
+# only moment every path reaches, and goal ids are already in commit messages
+# by convention. ABSTAINS on unset MIND_SID, on an unknown goal id, and on a
+# claim older than 120m (stranded-claim-sweep's territory) — a commit hook that
+# refuses on a missing env var wedges the whole repo, so this backstop takes
+# the loose side of that trade and lets claim() keep the strict one.
+# Bypass = trailer:  goal-claim-override: <why>  -> world/override-bypass-ledger.jsonl
+_gate goal-claim-commit-gate $PY "$REPO/core/scripts/goal-claim-commit-gate.py" --commit-msg-file "$MSG_FILE"
+
+exit 0

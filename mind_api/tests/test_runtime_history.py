@@ -119,11 +119,43 @@ def _http(method, port, path, query=None, *, agent="alpha"):
 # ---------------------------------------------------------------------------
 
 def test_list_no_history(running_daemon):
+    """The HONEST empty case: the file EXISTS and its store is empty.
+
+    This test used to point at `nope.md`, a path that does not exist, and
+    asserted 200 + "No history" — so it PINNED the g-115-5021 defect and a
+    correct fix would have failed it. That is the same shape as the
+    verify-learning check g-115-4876 had to rewrite: a check written to assert
+    two components agree will happily certify them agreeing on something wrong.
+
+    Creating the file is what makes this the empty-store case rather than the
+    missing-path case; the two are the branches the fix separates.
+    """
     project_root, port = running_daemon
-    f = project_root / "world" / "knowledge" / "nope.md"
+    f = project_root / "world" / "knowledge" / "exists-but-unsnapshotted.md"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text("content\n", encoding="utf-8")
     status, body = _http("GET", port, "/v1/history/list", {"file": str(f)})
     assert status == 200
     assert body == f"No history for {f}\n"
+
+
+def test_list_missing_path_is_an_error_not_an_empty_store(running_daemon):
+    """: an in-scope path that does not exist must NOT read as a
+    clean empty store. Before the fix a typo'd path returned the same
+    reassuring 200 "No history" as a real file with no snapshots, so it read
+    as "nothing to lose" — an error condition rendered as data."""
+    project_root, port = running_daemon
+    f = project_root / "world" / "knowledge" / "nope.md"
+    try:
+        _http("GET", port, "/v1/history/list", {"file": str(f)})
+        assert False, "expected HTTP 404 for a missing in-scope path"
+    except urllib.error.HTTPError as e:
+        assert e.code == 404
+        payload = json.loads(e.read())
+        assert payload["error"] == "path_missing"
+        # Byte-shared with the CLI mirror in core/scripts/history.py
+        # (guard-1189): one transport-neutral phrasing, used verbatim in both.
+        assert "and the path does not exist" in payload["detail"]
 
 
 def test_list_missing_param(running_daemon):
@@ -330,9 +362,18 @@ class TestByteCompat:
         assert body == cli
 
     def test_list_no_history_byte_compat(self, tmp_path):
+        # The file must EXIST (). Byte-compat compares CLI stdout to
+        # the daemon body, which is only meaningful on a DATA path: for an
+        # error the two transports legitimately diverge — the CLI writes stderr
+        # + exit 1 while the daemon returns a JSON error body, exactly as the
+        # pre-existing unresolved_base case already does. This test used
+        # `absent.md`, which was a data case before the fix and is an error case
+        # after, so it was asserting byte-equality across a transport boundary
+        # that no longer carries the same bytes.
         world, meta, agent = self._dirs(tmp_path)
         f = world / "knowledge" / "absent.md"
-        (world).mkdir(parents=True, exist_ok=True)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("exists but never snapshotted\n", encoding="utf-8")
         cli = _run_cli(world, meta, agent, ["list", str(f)])
         body = history_ep.list_versions(
             _FakeCtx(world, meta, agent, REPO_ROOT, {"file": str(f)})).body.decode("utf-8")

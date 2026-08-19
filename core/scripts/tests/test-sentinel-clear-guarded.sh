@@ -8,12 +8,20 @@
 # synthetic (`true`, `false`, `echo`) and the slot clear is redirected to a STUB.
 #
 # The stub trick is what makes "was the clear attempted?" directly observable
-# rather than inferred. sentinel-clear-guarded.sh resolves wm-set.sh via
+# rather than inferred. sentinel-clear-guarded.sh resolves its clear helper via
 # `dirname "${BASH_SOURCE[0]}"`, so copying it into a tmp dir beside a fake
-# wm-set.sh routes every clear to the fake, which records the call. A test that
+# helper routes every clear to the fake, which records the call. A test that
 # only asserted exit codes could not distinguish "refused to clear" from
 # "cleared and then reported failure" — which is the exact confusion the
 # primitive exists to prevent.
+#
+# THE STUB IS NAMED FOR THE HELPER THE SCRIPT ACTUALLY CALLS, and that name
+# changed in : the clear now routes through verified-wm-set.sh rather
+# than a bare wm-set.sh. Stubbing the old name would not fail loudly — the
+# script would look for a verified-wm-set.sh that is not there, every happy-path
+# case would report clear=no, and the suite would read as a behaviour regression
+# in the script rather than a stale stub. If a future change re-points the
+# clear, this stub's FILENAME moves with it.
 #
 # Run: bash core/scripts/tests/test-sentinel-clear-guarded.sh
 
@@ -46,15 +54,17 @@ cp "$SCRIPTS_DIR/_sentinel_registry.py" "$TMP/_sentinel_registry.py" 2>/dev/null
 
 CLEAR_LOG="$TMP/clear-calls.log"
 
-# Stub wm-set.sh — records every invocation so the test can assert whether a
-# clear was even ATTEMPTED, not merely whether the script exited non-zero.
-cat > "$TMP/wm-set.sh" <<'STUB'
+# Stub verified-wm-set.sh — records every invocation so the test can assert
+# whether a clear was even ATTEMPTED, not merely whether the script exited
+# non-zero. Honours CLEAR_STUB_RC so the clear-FAILURE branch can be forced;
+# defaults to 0 (success) for every case that does not set it.
+cat > "$TMP/verified-wm-set.sh" <<'STUB'
 #!/usr/bin/env bash
 cat >/dev/null   # drain the piped value
 echo "CLEAR:$1" >> "$CLEAR_LOG_PATH"
-exit 0
+exit "${CLEAR_STUB_RC:-0}"
 STUB
-chmod +x "$TMP/wm-set.sh" "$TMP/sentinel-clear-guarded.sh"
+chmod +x "$TMP/verified-wm-set.sh" "$TMP/sentinel-clear-guarded.sh"
 export CLEAR_LOG_PATH="$CLEAR_LOG"
 
 PASS=0
@@ -153,6 +163,19 @@ run_case "diagnostic names the slot left SET" 1 no \
     "LEFT SET" \
     -- --slot force_metric_encoding_pending --verify 'echo x' -- false
 
+# ── The clear itself FAILED () ────────────────────────────────────
+# Had ZERO coverage before this: the stub always exited 0, so every case above
+# is vacuous with respect to this branch — it can only be observed by forcing
+# the antecedent (guard-2982). It is also the branch that changed, since the
+# clear now routes through verified-wm-set.sh, whose whole contribution is
+# exiting non-zero when the write did not persist. The clear must still be
+# ATTEMPTED (clear=yes) and the script must NOT report success.
+export CLEAR_STUB_RC=1
+run_case "clear helper fails -> rc=3, reports slot still SET" 3 yes \
+    "clearing slot 'force_tree_maintain' FAILED" \
+    -- --slot force_tree_maintain --verify 'echo x' -- true
+unset CLEAR_STUB_RC
+
 # ── Slot validation against the registry SSOT ───────────────────────────────
 # Found by fresh-eyes review of the script itself: a typo'd slot ran the whole
 # pipeline, cleared the nonexistent slot, and reported success while the REAL
@@ -185,7 +208,7 @@ fi
 # from a dir with no registry beside the script — which is exactly the shape this
 # whole suite silently had before the registry copy above was added.
 NOREG="$(mktemp -d)"
-cp "$TMP/sentinel-clear-guarded.sh" "$TMP/wm-set.sh" "$NOREG/"
+cp "$TMP/sentinel-clear-guarded.sh" "$TMP/verified-wm-set.sh" "$NOREG/"
 : > "$CLEAR_LOG"
 noreg_out="$(bash "$NOREG/sentinel-clear-guarded.sh" --slot force_experience_archival \
               --verify 'echo x' -- true 2>&1)"

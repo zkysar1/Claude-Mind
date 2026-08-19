@@ -49,6 +49,13 @@ DIARY_SCRIPT = SCRIPT_DIR / "execution-diary.py"
 def with_sandbox(test_fn):
     """Spin up a tmp AGENT_DIR sandbox with the session/ scaffold."""
     def wrapped():
+        # These names are `test_*` at module level, so pytest COLLECTS them as
+        # well as main() running them. Swallowing the AssertionError would make
+        # pytest report PASS on a broken test (measured under this exact shape:
+        # a deliberately broken assertion here reported rc=0), so under pytest
+        # the failure must propagate and the return value must be None
+        # (return-not-None is a warning today and an error in future pytest).
+        under_pytest = bool(os.environ.get("PYTEST_CURRENT_TEST"))
         sandbox = Path(tempfile.mkdtemp(prefix=f"diary_hb_test_{test_fn.__name__}_"))
         agent_dir = sandbox / "alpha-test"
         (agent_dir / "session").mkdir(parents=True)
@@ -66,17 +73,51 @@ def with_sandbox(test_fn):
         os.environ["MIND_AGENT_DIR"] = str(agent_dir)
         os.environ.pop("MIND_SID", None)
 
+        # Suppress _advance_heartbeat's SHARED tick (execution-diary.py:94), which
+        # spawns heartbeat-tick.sh. It is rate-limited by this stamp file, so a
+        # fresh stamp makes the call return before the subprocess (see
+        # _tick_shared_heartbeat_if_due). Two independent reasons, both measured
+        # on cc-07 2026-08-10 ():
+        #
+        # 1. THE SANDBOX CANNOT REACH THAT SUBPROCESS'S GATE. heartbeat-tick.sh
+        #    refuses under agent-state=IDLE, but it asks session-state-get.sh,
+        #    which is IRREDUCIBLY LOCAL: it inlines _APD="agents" and resolves
+        #    $PROJECT_ROOT/agents/<agent>, so MIND_AGENT_DIR is invisible to it.
+        #    Against this sandbox it returns UNINITIALIZED, the `= "IDLE"` compare
+        #    never matches, and the gate falls open. That is a property of the
+        #    FIXTURE, not of the writer: on a real box the same gate holds, and was
+        #    verified holding on a live IDLE worker (heartbeat-tick.sh rc=2).
+        #
+        # 2. FALLING THROUGH THAT GATE WRITES PRODUCTION DATA. Past it,
+        #    heartbeat-tick.sh runs team-state-update.sh, live-phase-emit.sh and a
+        #    DDB runner-claim heartbeat. MIND_AGENT="alpha-test" has no
+        #    local-paths.conf, so _paths.sh falls through to the first available one
+        #    and WORLD_DIR resolves to the REAL world — the sandbox never contained
+        #    it. Measured: this file created a phantom `alpha-test` row in the live
+        #    team-state (fleet roster), which liveness-check.sh then reported as
+        #    verdict "alive". The graveyard holds SEVEN alpha-test retirements
+        #    across two days, i.e. it has been recreated and swept repeatedly.
+        #
+        # So the IDLE test below verifies the gate _advance_heartbeat OWNS. The
+        # subprocess's own gate is heartbeat-tick.sh's contract, tested against a
+        # real agent dir, and is not reachable from an env-redirected sandbox.
+        (agent_dir / "session" / "claim-renewal-last").touch()
+
         try:
             test_fn(sandbox, agent_dir)
             print(f"  [PASS] {test_fn.__name__}")
-            return True
+            return None if under_pytest else True
         except AssertionError as e:
             print(f"  [FAIL] {test_fn.__name__}: {e}")
             traceback.print_exc()
+            if under_pytest:
+                raise
             return False
         except Exception as e:
             print(f"  [ERROR] {test_fn.__name__}: {type(e).__name__}: {e}")
             traceback.print_exc()
+            if under_pytest:
+                raise
             return False
         finally:
             for k, v in prior_env.items():
@@ -171,6 +212,23 @@ def test_idle_state_does_not_advance_heartbeat(sandbox, agent_dir):
     a subsequent diary write must NOT re-falsify liveness. Otherwise the
     heartbeat_without_running desync (session-manifest.yaml) reappears via
     a new path — same bug, different writer.
+
+    SCOPE (g-115-5700, stated because a test that silently covers less than its
+    name implies is worse than one that covers nothing): this asserts the gate at
+    execution-diary.py:85 — the one _advance_heartbeat owns. The shared tick two
+    lines below it sits deliberately OUTSIDE that gate and is suppressed by the
+    fixture; see the stamp-file comment in with_sandbox for why the sandbox cannot
+    evaluate its gate and why letting it run writes to the real world.
+
+    This test therefore does NOT prove the agent-wide heartbeat is safe under
+    IDLE end-to-end — it proves this writer does not advance it by its own hand.
+    The other half lives in heartbeat-tick.sh's own IDLE gate (its `exit 2`).
+
+    HISTORY: from cd14fa03b (g-306-233, which added the shared tick) until
+    2026-08-10 this test failed on every box, and the swallow-decorator then in
+    with_sandbox converted the failure into a pytest PASS — so it read green while
+    asserting nothing. It was measured failing only through main(). The failure was
+    always the fixture escaping its sandbox, never a leak in the writer.
     """
     set_state(agent_dir, "IDLE")
     old = seed_old_heartbeat(agent_dir, age_seconds=1800)

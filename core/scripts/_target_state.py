@@ -863,6 +863,20 @@ _VERIFY_LEARNING_TRIGGER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Where a NEW verify-learning check actually lands. The 2,235-check corpus
+# moved out of SKILL.md into this registry on 2026-08-18 (), so
+# routing a Maintain-CHECK-ABOUT goal at the skill file would name a 175-line
+# document that no longer hosts checks — and probe_target_state would find the
+# assertion absent every time.
+#
+# CAVEAT, stated rather than hidden: this is a JSONL, so a check line's `raw`
+# is JSON-escaped. A substring probe matches plain text but MISSES any check
+# containing a quote or backslash. That biases the duplication gate toward
+# "not present", which allows a goal through — the same direction the gate
+# already failed safe in, and the opposite of the  incident where a
+# false "already_present" blocked legitimate work.
+_VERIFY_LEARNING_CHECK_HOST = "core/config/verify-learning-checks.jsonl"
+
 # "add/wire/ensure check to/in/into <skill-name>" — resolves to
 # .claude/skills/<skill-name>/SKILL.md. Strips optional leading slash
 # from the skill name (callers sometimes write "/respond").
@@ -906,7 +920,7 @@ def _extract_edit_target(title, description):
 
     # (b) verify-learning trigger phrase
     if _VERIFY_LEARNING_TRIGGER_RE.search(text):
-        return ".claude/skills/verify-learning/SKILL.md"
+        return _VERIFY_LEARNING_CHECK_HOST
 
     # (c) 'add/wire/ensure check to <skill-name>'
     m = _ADD_CHECK_TO_SKILL_RE.search(text)
@@ -914,7 +928,7 @@ def _extract_edit_target(title, description):
         return f".claude/skills/{m.group(1).lower()}/SKILL.md"
 
     # (d) default — verify-learning hosts the assertion lane
-    return ".claude/skills/verify-learning/SKILL.md"
+    return _VERIFY_LEARNING_CHECK_HOST
 
 
 def extract_targets(title, description):

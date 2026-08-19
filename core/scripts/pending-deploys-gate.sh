@@ -49,7 +49,30 @@ source "$SCRIPT_DIR/_paths.sh" 2>/dev/null || { echo '{"checked":0,"error":"path
 # ── Args ────────────────────────────────────────────────────────────────────
 AGENT="${MIND_AGENT:-}"
 GOAL=""
-TIMEOUT_MINS=3
+# THIS CONSTANT DRIVES TWO LIMITS, AND THEIR ORDERING IS LOAD-BEARING (guard-1737).
+#   (1) --timeout-mins -> deploy-verify.sh's own polling deadline  = TIMEOUT_MINS*60
+#   (2) sp_timeout     -> the hard subprocess kill below           = TIMEOUT_MINS*60+30
+# The +30 gap exists so deploy-verify ALWAYS reaches its own timeout first and
+# emits its considered {"status":"unverified"} verdict; the kill is only a
+# backstop. Invert that ordering and every slow-CI probe reports "invocation
+# error" instead, changing the reported CAUSE while nothing goes red. Any change
+# here must preserve (2) > (1). Fractional minutes are NOT available: deploy-verify
+# computes `deadline=$(( now + TIMEOUT_MINS * 60 ))` in bash integer arithmetic.
+#
+# WAS 3 (sp_timeout 210s) until g-115-5877. The gate runs INSIDE iteration-close,
+# which runs inside a foreground Bash tool call bounded at 120s, so 210 > 120 made
+# every close with a pending deploy DETERMINISTICALLY killed at the bound (exit
+# 143) — and killed HALF-APPLIED: lastAchievedAt advanced, claim released,
+# loop_state counters bumped and the commit created, while outcome_note still held
+# the PREVIOUS run's text and no health row was written. Every cheap signal reads
+# "closed", so a retry double-counts. Measured twice in one iteration (echo, cc-03,
+# 2026-08-11). 1 => 60s poll + 90s kill, which fits with headroom.
+#
+# Shortening the per-close CI wait does not weaken the obligation: an unresolved
+# entry is KEPT and re-probed at the next close (rc=2 path below). Verification is
+# spread across closes rather than blocking one close for three minutes — which is
+# what a pending-deploys TRACKER is for.
+TIMEOUT_MINS=1
 # Empty = resolve per deployment at FILING time (g-115-4166). A literal asp-115
 # is the UPSTREAM deployment's queue and exists in no other deployment, so
 # downstream every Unblock filed here failed aspiration_not_found — silently,
@@ -76,11 +99,30 @@ PD="$SCRIPT_DIR/pending-deploys.py"
 hp=(has-pending)
 [ -n "$GOAL" ] && hp+=(--goal-id "$GOAL")
 if ! python3 "$PD" --agent "$AGENT" "${hp[@]}" >/dev/null 2>&1; then
-    echo '{"checked":0,"cleared":0,"failed":0,"unverified":0,"unblocks_filed":0,"not_clean":false}'
+    # budget_skipped is carried HERE TOO (g-115-5877), not only on the main path.
+    # A key present on one exit and absent on another is shape drift: a consumer
+    # that reads it unconditionally KeyErrors on whichever path it forgot about,
+    # and this is the path taken in the overwhelmingly common case.
+    echo '{"checked":0,"cleared":0,"failed":0,"unverified":0,"unblocks_filed":0,"budget_skipped":0,"not_clean":false}'
     exit 0
 fi
 
-# ── Enumerate matching entries as repo<TAB>sha<TAB>dir<TAB>goal rows ─────────
+# ── Enumerate matching entries as repo<US>sha<US>dir<US>goal rows ───────────
+# US (0x1f), NOT tab. `dir` is OPTIONAL (empty for a repo-root deploy) and sits
+# in the MIDDLE, and tab is an IFS *whitespace* character — so `IFS=$'\t' read`
+# collapses the two adjacent tabs and shifts goal_id left into _dir. Measured on
+# cc-02 2026-08-14 against the live store, which held two such entries:
+#   printf 'REPO\tSHA\t\tGOALID\n' | IFS=$'\t' read -r a b c d  -> c=GOALID d=
+#   printf 'REPO\x1fSHA\x1f\x1fGOALID\n' | IFS=$'\x1f' read ... -> c=      d=GOALID
+# Consequence chain of the tab form: _dir receives the goal-id, so the `-n "$_dir"`
+# branch below calls `resolve --dir g-335-328` against a nonexistent directory,
+# which returns rc=2 UNVERIFIED, so the entry is KEPT and re-probed at EVERY close,
+# forever, while flagging not_clean=1 (SG-c then holds graceful stop). An entry with
+# an empty dir could therefore NEVER be verified. The `(goal=${_gid:-?})` rendering
+# in every message below was the visible symptom, and it reads as an ORPHANED entry
+# — which is how it was first diagnosed, wrongly. Same defect and same US remedy as
+# core/scripts/mutation-partition-proof.sh:79 and the two expansion-parsed sites in
+# iteration-close.sh (394, 1705); this was the site that missed that sweep.
 ls=(list --json)
 [ -n "$GOAL" ] && ls+=(--goal-id "$GOAL")
 entries_json="$(python3 "$PD" --agent "$AGENT" "${ls[@]}" 2>/dev/null || echo '[]')"
@@ -93,8 +135,9 @@ except Exception:
 for e in (data or []):
     if not isinstance(e, dict):
         continue
-    print("\t".join([str(e.get("repo", "")), str(e.get("sha", "")),
-                     str(e.get("dir", "")), str(e.get("goal_id", ""))]))
+    print("\x1f".join(str(v).replace("\x1f", " ").replace("\n", " ") for v in
+                      [e.get("repo", ""), e.get("sha", ""),
+                       e.get("dir", ""), e.get("goal_id", "")]))
 ' 2>/dev/null || true)"
 
 # ── File a HIGH Unblock for a FAILED deploy (dedup by repo@sha7) ─────────────
@@ -162,11 +205,51 @@ print(json.dumps({
     return 1
 }
 
-checked=0 cleared=0 failed=0 unverified=0 unblocks=0 not_clean=0
+checked=0 cleared=0 failed=0 unverified=0 unblocks=0 not_clean=0 budget_skipped=0
 sp_timeout=$(( TIMEOUT_MINS * 60 + 30 ))   # hard subprocess kill, past deploy-verify's own timeout
+
+# ── TOTAL-LOOP BUDGET (g-115-5877) ──────────────────────────────────────────
+# Per-entry bounding is NOT sufficient and that was the subtler half of the bug.
+# This loop runs `resolve` ONCE PER ENTRY, each with its own sp_timeout, so the
+# worst case is N * sp_timeout — a quantity with no upper bound at all, since N is
+# whatever the tracker has accumulated. Fixing only the per-entry constant leaves
+# two pending deploys blowing the same 120s foreground bound.
+#
+# The budget is spent on WHOLE entries, never by clamping sp_timeout down to the
+# remaining time: a clamped kill would fire BEFORE deploy-verify's own deadline and
+# invert the ordering the constant block above exists to protect (guard-1737).
+# deploy-verify takes integer minutes only, so the two limits cannot be scaled
+# together anyway. An entry therefore either runs with its ordering-correct pair or
+# is deferred untouched.
+#
+# A DEFERRED ENTRY IS NOT A LOST ONE. It takes the SAME path an in-progress CI run
+# takes (unverified): the entry is KEPT, the closure is flagged not-clean, and the
+# next close re-probes it. No new state, no new failure mode — deferral reuses the
+# existing fail-safe rather than inventing a second one.
+#
+# The FIRST entry always runs regardless of budget. Otherwise an explicit
+# --timeout-mins larger than the budget would silently verify NOTHING, ever, which
+# is a worse failure than overrunning once: it looks exactly like a clean gate.
+: "${MIND_PD_GATE_BUDGET_SECS:=100}"
+budget_secs="$MIND_PD_GATE_BUDGET_SECS"
+loop_start=$(date +%s 2>/dev/null || echo 0)
 if [ -n "$rows" ]; then
-    while IFS=$'\t' read -r _repo _sha _dir _gid; do
+    # IFS=$'\x1f' (US), NOT $'\t' — see the emitter comment above line 114. Tab is
+    # IFS whitespace, so an empty middle `dir` collapses and shifts goal_id into
+    # _dir, permanently un-verifying the entry. US is not whitespace; empty fields
+    # survive. If you change this delimiter, change the emitter in the SAME edit.
+    while IFS=$'\x1f' read -r _repo _sha _dir _gid; do
         [ -n "$_repo" ] && [ -n "$_sha" ] || continue
+        # Budget check BEFORE the probe, and never for the first entry.
+        if [ "$checked" -gt 0 ] && [ "$loop_start" != 0 ]; then
+            _now=$(date +%s 2>/dev/null || echo 0)
+            _elapsed=$(( _now - loop_start ))
+            if [ $(( _elapsed + sp_timeout )) -gt "$budget_secs" ]; then
+                budget_skipped=$(( budget_skipped + 1 )); not_clean=1
+                echo "[pending-deploys-gate] BUDGET: deferring ${_repo}@${_sha:0:7} (goal=${_gid:-?}) — ${_elapsed}s spent, next probe needs ${sp_timeout}s, budget ${budget_secs}s. Entry KEPT and re-probed at the next close; closure not-clean." >&2
+                continue
+            fi
+        fi
         checked=$(( checked + 1 ))
         rv=""
         # errexit is intentionally NOT enabled in this script (top is `set -uo
@@ -198,7 +281,18 @@ if [ "$not_clean" -eq 1 ]; then
     echo "[pending-deploys-gate] one or more deploys unresolved — clean-success closure refused; SG-c stop-hook will hold graceful stop until cleared" >&2
 fi
 
+if [ "$budget_skipped" -gt 0 ]; then
+    echo "[pending-deploys-gate] BUDGET: ${budget_skipped} entr(ies) deferred to the next close to stay inside the ${budget_secs}s loop budget — none were dropped" >&2
+fi
+
 nc="false"; [ "$not_clean" -eq 1 ] && nc="true"
-printf '{"checked":%d,"cleared":%d,"failed":%d,"unverified":%d,"unblocks_filed":%d,"not_clean":%s}\n' \
-    "$checked" "$cleared" "$failed" "$unverified" "$unblocks" "$nc"
+# budget_skipped is a NEW key, deliberately additive: existing consumers read the
+# six original keys positionally-by-name and are unaffected. It is reported on
+# STDOUT rather than stderr alone because this gate's stderr is redirected into a
+# log by both iteration-close seams, and stderr from a nested process inside a
+# backgrounded Bash call is not captured at all (guard-772) — so a deferral that
+# existed only as a warning would be invisible exactly when it matters.
+# NOTE: a deferred entry is NOT counted in `checked`. It was not checked.
+printf '{"checked":%d,"cleared":%d,"failed":%d,"unverified":%d,"unblocks_filed":%d,"budget_skipped":%d,"not_clean":%s}\n' \
+    "$checked" "$cleared" "$failed" "$unverified" "$unblocks" "$budget_skipped" "$nc"
 exit 0

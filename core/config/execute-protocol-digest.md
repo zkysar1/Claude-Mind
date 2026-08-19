@@ -358,7 +358,11 @@ IF productive:
     #   retrieval_audit, verbatim_anchors (each anchor is an OBJECT with
     #   "key"+"content" fields, not a bare string — also validation-enforced),
     #   content_path
-    echo '{"experience_refs": ["{experience_id}"]}' | Bash: wm-set.sh active_context.experience_refs
+    # Pipe the LIST, not a dict re-naming the key: wm.py cmd_set stores stdin
+    # VERBATIM at the dotted slot (`parent[key] = value`), so a dict here nests
+    # {"experience_refs":[...]} INSIDE experience_refs and Phase 9.5-exp's
+    # "empty, missing, or null" predicate passes on it forever (g-115-4876).
+    echo '["{experience_id}"]' | Bash: wm-set.sh active_context.experience_refs
 ```
 
 ## Phase 4.26: Context Utilization Feedback (SKIP under lightweight mode — no retrieval-session.json, so the iteration-close repair no-ops too)

@@ -37,7 +37,7 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta  # noqa: F401 — timedelta used by hypothesis-health
+from datetime import datetime, timedelta, timezone  # noqa: F401 — timedelta used by hypothesis-health
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -71,9 +71,17 @@ def _parse_iso(s):
     if not s:
         return None
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00").replace("+00:00", ""))
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00").replace("+00:00", ""))
     except (ValueError, TypeError):
         return None
+    # The Z / +00:00 strips above cover only the UTC spellings. A NON-UTC offset
+    # ("...-05:00") survives as an AWARE datetime, and all five call sites compare
+    # the result against a naive _now() — which raises TypeError and aborts the
+    # whole subcommand rather than skipping one record. Fleet stamps are naive UTC
+    # by fiat (CLAUDE.md § Naming Rules), so normalising here completes the intent
+    # those strips already express. Convert, never discard: dropping a -05:00
+    # tzinfo would read 00:00-05:00 as 00:00 UTC, five hours early.
+    return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
 
 
 def _load_config():
@@ -523,7 +531,19 @@ def cmd_hypothesis_health(args, config, compact):
     for h in active:
         horizon = h.get("horizon", "")
         formed = _parse_iso(h.get("formed_date"))
-        if horizon in ("session", "micro"):
+        # A future `resolves_no_earlier_than` floor OUTRANKS the horizon window —
+        # the record states it cannot be resolved yet, whatever its horizon says.
+        # Without this, a long-horizon record whose re-probe window elapsed counts
+        # as resolvable while its own floor is months out, inflating `flowing`
+        # against the low-water-mark (measured 2026-08-12: 140 of 311; ).
+        # The field arrives BOTH date-only and datetime; `_parse_iso` handles both
+        # and returns None on absent/garbage (the guard-420 None-guard), and a
+        # date-only floor opens at 00:00 of that day (guard-2458) — same semantics
+        # as goal-selector's `_parse_rne_dt`, the other consumer of this field.
+        rne = _parse_iso(h.get("resolves_no_earlier_than"))
+        if rne is not None and rne > now:
+            time_gated_active.append(h)
+        elif horizon in ("session", "micro"):
             resolvable_active.append(h)
         elif horizon == "short" and formed and formed + timedelta(hours=short_win) <= now:
             resolvable_active.append(h)
@@ -1410,8 +1430,143 @@ def cmd_run_all(args, config, compact):
 # CLI
 # ─────────────────────────────────────────────────────────────────────────
 
+def cmd_peer_thread_relay(args, config, compact):
+    """Surface peer-deployment thread replies that never reached the peer.
+
+    THE CALL SITE for peer-thread-relay-sweep (g-115-5890). It exists because
+    reclaim-routed-work.md is blunt about the alternative: "a sweep with no call
+    site is indistinguishable from a sweep that always returns clean." The
+    detector without this hook only ran when a human invoked it, which is how
+    the originating incident stayed invisible for days.
+
+    `compact` is accepted for signature parity and deliberately unused: the
+    predicate needs `origin_signal`, which the compact does not carry (verified
+    2026-08-12 — compact goal keys have `title` but no `origin_signal`). So the
+    sweep does its own live read, like _pipeline_query does.
+
+    Flags:
+      peer_thread_unrelayed  — directives are stranded; relay them.
+      peer_thread_ambiguous  — the name is both local and a peer's; needs the
+                               qualified `<agent>@<env-id>` form, never a guess.
+      peer_thread_sweep_error — the sweep could not run. NOT a clean result.
+      peer_thread_ack_close_failed — a peer-acked relay goal could not be
+                               closed; it will resurface in digests until it is.
+    """
+    ptr = (config.get("peer_thread_relay") or {})
+    window = str(ptr.get("board_window") or "2160h")
+    # --close-acked (2026-08-17): retire relay goals the peer has acknowledged by
+    # id on the local board. This is the ONE mutation this subcommand carries,
+    # and it is not box-dependent (the board is world-shared), so 's
+    # "never auto-relay from whichever box runs it" does not reach it. Without
+    # it, peer-acked relay goals sat non-terminal for 5 days and were mailed to
+    # the user as open asks of him. Config `close_acked: false` opts out.
+    argv = ["peer-thread-relay-sweep.sh", "--json", "--board-window", window]
+    if ptr.get("close_acked", True):
+        argv.append("--close-acked")
+    try:
+        out, err, rc = _run_script(argv, timeout=int(ptr.get("timeout_seconds") or 120))
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        return {"subcommand": "peer-thread-relay", "flags": ["peer_thread_sweep_error"],
+                "summary": "peer-thread-relay sweep did not run (%s) — NOT a clean result" % e}
+    try:
+        data = json.loads(out)
+    except (ValueError, TypeError):
+        # rc>1 is the wrapper's "I broke" code; rc 0/1 with unparseable stdout is
+        # equally a non-result. Either way, never report clean.
+        return {"subcommand": "peer-thread-relay", "flags": ["peer_thread_sweep_error"],
+                "summary": "peer-thread-relay sweep output unreadable (rc=%s) — NOT a clean "
+                           "result: %s" % (rc, (err or out or "")[:160])}
+
+    und = data.get("undelivered") or []
+    amb = data.get("ambiguous") or []
+    flags = []
+    if und:
+        flags.append("peer_thread_unrelayed")
+    if amb:
+        flags.append("peer_thread_ambiguous")
+    if und:
+        oldest = max((r.get("age_days") or 0) for r in und)
+        # The routing tag is `requires_action_by:`, NOT `forward-to:` ().
+        # This string used to prescribe forward-to, which board.py:143-157 warns
+        # "routes to NOBODY" because `forward-to:omni@zds-mind` parses to agent
+        # `forward-to:omni` and matches nothing. Following the instruction exactly
+        # therefore produced a relay that CLEARED this flag (_peer_thread_relay
+        # accepts forward-to, and even a bare `relay` tag) while notifying no one.
+        # Measured 2026-08-15 over a 5382-message 720h coordination scan: 14 relay
+        # posts carried a goal id and no requires_action_by against 9 that routed —
+        # 61% undeliverable, across four agents over 8 days, with this sweep
+        # reporting "clean" throughout.
+        summary = ("%d peer-thread directive(s) never relayed (oldest %.1fd): %s — "
+                   "relay via peer-board-post.sh or a board post tagged relay + "
+                   "requires_action_by:<agent>[@<env-id>] + the goal id "
+                   "(requires_action_by is the ONLY prefix that routes; "
+                   "forward-to: routes to nobody)"
+                   % (len(und), oldest, ", ".join(r["goal_id"] for r in und[:6])))
+    elif amb:
+        summary = "%d ambiguous peer-thread name(s) — need <agent>@<env-id>" % len(amb)
+    else:
+        summary = ("clean — all %d inbound peer-thread goal(s) have a relay post"
+                   % data.get("scanned", 0))
+
+    # THE DELIVERY-GAP SPLIT (). A FLAT "clean" is what hid the defect
+    # above: the sweep accepts a relay tag that notifies nobody, so "have a relay
+    # post" and "reached anybody" are different claims and only the first is
+    # measured. Appended to EVERY branch, not just the clean one — an unrouted
+    # relay is equally invisible on a run that also has strands.
+    #
+    # NO FLAG IS ADDED, DELIBERATELY. Flagging would re-flag 8 days of historical
+    # bare-relay posts under a rule nobody agreed to change, and guard-3628 reads
+    # a sweep that leaves a record untouched as possibly KEEPING it on purpose —
+    # which here it is: the breadth is documented in _peer_thread_relay.sweep's
+    # own docstring.  scope (c) asks for that call to be made
+    # deliberately: report the split, do not tighten the predicate.
+    unrouted = data.get("relayed_unrouted") or 0
+    relayed_n = len(data.get("relayed") or [])
+    if relayed_n:
+        summary += ("; %d relayed, %d of which route to NOBODY (no "
+                    "requires_action_by: tag naming a known agent)"
+                    % (relayed_n, unrouted))
+    # Peer-acked closes. Reported on every branch — a close is a MUTATION and
+    # must never be silent. A failed close is a "look" condition (the artifact
+    # will resurface in the next digest), so it earns its own flag.
+    acked = data.get("peer_acked") or []
+    ca = data.get("closed_acked") or {}
+    closed_n = len(ca.get("closed") or [])
+    failed = ca.get("failed") or []
+    if acked:
+        summary += ("; %d peer-acked relay goal(s): closed %d, failed %d"
+                    % (len(acked), closed_n, len(failed)))
+    if failed:
+        flags.append("peer_thread_ack_close_failed")
+        summary += " — FAILED closes: %s" % ", ".join(
+            "%s(%s rc=%s)" % (f.get("goal_id"), f.get("step"), f.get("rc")) for f in failed[:4])
+    return {
+        "subcommand": "peer-thread-relay",
+        "flags": flags,
+        "summary": summary,
+        "undelivered": und,
+        "ambiguous": amb,
+        "peer_acked": acked,
+        "closed_acked": ca,
+        "scanned": data.get("scanned", 0),
+        # The falsifying control travels with the result: a status-keyed
+        # predicate finds this many of the same population (0 on live data).
+        "status_keyed_control": data.get("status_keyed_control"),
+    }
+
+
+# Registered here, after the definition above, because SUBCMDS is declared
+# earlier in the file. This line is what gives the sweep its CALL SITE:
+# cmd_run_all iterates SUBCMDS, NOT DISPATCH, so a DISPATCH-only entry would
+# give this check a CLI name while it never fired in the precheck — the exact
+# "a sweep with no call site is indistinguishable from one that always returns
+# clean" defect  exists to fix, reintroduced one layer up. Caught by
+# reading cmd_run_all instead of assuming the two registries were the same one.
+SUBCMDS.append(("peer-thread-relay", cmd_peer_thread_relay))
+
 DISPATCH = {
     "run-all": cmd_run_all,
+    "peer-thread-relay": cmd_peer_thread_relay,
     "zombies": cmd_zombies,
     "pipeline-depth": cmd_pipeline_depth,
     "hypothesis-health": cmd_hypothesis_health,
@@ -1514,8 +1669,25 @@ def main():
         # multi-agent fleet the second is routine — any partner filing a goal
         # writes that queue. Reporting the race as a builder failure sends the
         # reader to debug a builder that is working fine.
-        if refresh_info is None:
+        # `refresh_info is None` has TWO causes and they are opposite findings.
+        # It used to render only the first, which on the production path is the
+        # one that essentially never happens: --compact-path is help-texted
+        # "(for tests)", so a live run reaching here is ALWAYS the second cause.
+        # Measured 2026-08-12 (bravo, cc-05, uname -r 6.8.0-137-generic, live
+        # 5-agent fleet): a run-all with no --compact-path reported "not
+        # auto-rebuilt (explicit --compact-path)" while the world queue had
+        # simply been written 1.6m into the detector pass by a partner. Cost ~4
+        # tool calls chasing a flag nobody passed. That is the exact
+        # misattribution the comment above forbids — it names the concurrent
+        # write as routine and then the code sent the reader to a builder fault
+        # by another name.
+        if refresh_info is None and args.compact_path:
             rebuilt = "not auto-rebuilt (explicit --compact-path)"
+        elif refresh_info is None:
+            # Fresh at the pre-probe, so no rebuild was attempted OR needed;
+            # the source moved during the run. Routine on a live fleet.
+            rebuilt = ("was fresh at run start — source written DURING the run; "
+                       "concurrent partner write, not a builder fault")
         elif refresh_info.get("rc") == 0:
             rebuilt = "rebuild SUCCEEDED — source written again since; likely a concurrent write, not a builder fault"
         else:

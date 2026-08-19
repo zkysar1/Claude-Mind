@@ -60,6 +60,17 @@ the Blocker Reference Schema TTL — it does NOT prove the underlying premise
 cleared, so every TTL hit needs a human/owner re-probe before action. The
 report is the deliverable. Escalate to --apply only if the population grows.
 
+`--post-routing` (g-115-3414) does NOT breach that posture, and is named apart
+from `--apply` so it cannot be mistaken for one: it drops a coordination-board
+routing breadcrumb and mutates NO goal. It exists because the routing this sweep
+hands to the LLM was being duplicated once per agent per iteration — measured at
+7 posts from 3 agents over ~29h on goals that never changed, with g-250-03-c
+alone accumulating 35 board mentions. Every one of those posts was individually
+CORRECT under the lane rule; what was missing was a SHARED, DURABLE cooldown, so
+the breadcrumb doubles as both the routing notice and the cooldown record —
+exactly as siblings inbox-alert-age-check (g-115-1533) and handoff-aging-check
+(g-115-1531) already do.
+
 Verdicts (only the first four are reported; still_blocked is the quiet case):
   all_resolved  — every block signal present on the goal has resolved.
                   Unblock-eligible. Check `resolution_basis` before acting:
@@ -97,12 +108,24 @@ JSON output:
     "pq_index_size": N,                      # fleet pq ids resolved
     "pq_corpus_complete": bool,              # false => dangling withheld
     "pq_unreadable_agents": [name, ...],     # never silent (guard-383 spirit)
+    # Routing cooldown (). `read_ok` / `degraded` are reported
+    # ALONGSIDE the counts because an empty cooldown set has two causes — a
+    # quiet board and a failed read — and the counts alone cannot separate them.
+    "routing_cooldown_hours": float,
+    "routing_cooldown_read_ok": bool,
+    "routing_cooldown_degraded": bool,       # board read failed => fails OPEN
+    "routing_breadcrumbs_seen": N,
+    "routing_suppressed_count": N,           # already routed inside the window
+    "routing_eligible_count": N,
+    "routing_posted": [{goal_id, detail}],   # only with --post-routing
+    "routing_post_failed": [{goal_id, detail}],
     "now": iso
   }
   entry = {goal_id, source, aspiration_id, intended_agent, title, verdict,
            blocked_since, days_blocked, blocked_by, blocked_by_status,
            blocked_by_resolved, blocker_ref_kind, blocker_ref_resolved,
-           blocker_ref_why, resolution_basis, blocked_by_raw_type}
+           blocker_ref_why, resolution_basis, blocked_by_raw_type,
+           already_routed_age_hours, routing_suppressed}
 
 Sibling pattern (rb-428 bash-consolidation family): defer-drift-check.py,
 reason-less-blocked-check.py, unblock-parent-status-sweep.py. Guards honored:
@@ -117,6 +140,8 @@ Reference: g-115-3241.
 import argparse
 import datetime as dt
 import json
+import math
+import subprocess
 import sys
 from pathlib import Path
 
@@ -128,9 +153,32 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse)
 from _dependency_graph import norm_blocked_by  # noqa: E402  SSOT (guard-547)
+from _runtime_bash import bash_cmd  # noqa: E402   Windows-safe bash resolution
 import _rt  # noqa: E402  canonical Python -> daemon client
 
 TERMINAL_STATUSES = ("completed", "archived", "skipped", "expired", "resolved")
+
+# ── Routing cooldown () ────────────────────────────────────────────
+# The tag written by `_post_routing_breadcrumb`, and the primary marker read
+# back by `_read_recent_routings`. The two LEGACY markers are the tags the
+# hand-written LLM routing posts actually carried during the measured
+# duplication (see this goal's record: "msg tags blocked-signal,foxtrot,..." and
+# "blocked-signal-sweep,foxtrot,..."). Recognising them costs nothing and lets
+# the cooldown honour a pre-existing manual post instead of re-routing over it.
+#
+# A legacy post that never tagged its goal_id simply does not register, because
+# `_read_recent_routings` keys on the `g-` tag — that is FAIL-OPEN (it does not
+# suppress), which is the safe direction for a cooldown.
+ROUTING_TAG = "blocked-signal-routed"
+_ROUTING_MARKERS = (ROUTING_TAG, "blocked-signal", "blocked-signal-sweep")
+
+# Default cooldown window. The measured duplication spanned ~29h with 7 posts
+# from 3 agents on UNCHANGED goals, so a window shorter than a day would not
+# have suppressed it. Deliberately a CLI arg with a documented default rather
+# than a new `core/config/aspirations.yaml` block: this goal did not ask for
+# per-deployment tuning, and guard-348 asks for a natural gate before adding
+# config surface. Promote it to config only when a second consumer needs it.
+DEFAULT_ROUTING_COOLDOWN_HOURS = 24.0
 
 # Board references are recognised but deliberately NOT resolved: a coordination
 # post is prose, and "was it answered" is a judgment the checker must not fake.
@@ -687,6 +735,165 @@ def _classify(goal, goal_index, pq_index, now, pq_complete=True):
     }
 
 
+def _routing_window_str(cooldown_hours):
+    """board-read --since needs an int+unit duration. Round up + 1h margin so
+    the read window safely covers the whole cooldown window (mirrors
+    inbox-alert-age-check._escalate_window_str)."""
+    return "%dh" % (int(math.ceil(cooldown_hours)) + 1)
+
+
+def _read_recent_routings(now, cooldown_hours, board_log_path=None):
+    """Return ({goal_id: most_recent_age_hours}, read_ok) for routing breadcrumbs
+    on the coordination board within the scan window — from ANY agent.
+
+    `read_ok` is returned SEPARATELY from the dict, and that is the point: an
+    empty dict has two causes that are otherwise indistinguishable — nothing was
+    routed recently (clean), or the read failed and fail-open emptied it
+    (degraded). Deriving the flag from the dict's truthiness cannot tell them
+    apart and would report a healthy quiet board as a failure. Same
+    discrimination `archive_degraded` provides for the archive read (rb-245:
+    a zero whose provenance is unknown is not a measurement).
+
+    THE SHARED, DURABLE COOLDOWN (g-115-3414), mirroring the pattern
+    inbox-alert-age-check (g-115-1533) and handoff-aging-check (g-115-1531)
+    already use, rather than inventing a second one. The board breadcrumb IS the
+    cooldown record because it is the only store with BOTH properties this needs:
+
+      - SHARED  — every agent reads the same coordination board, so agent B sees
+                  that agent A already routed this hit. A per-agent WM slot
+                  cannot do this, and that is exactly why 0.5b.2 abandoned
+                  `proactive_escalation_log` (g-115-1531).
+      - DURABLE — board posts persist in world/board/; a WM reset between
+                  iterations would re-arm a WM-based cooldown and re-fire.
+
+    Returns the SMALLEST age (most-recent post) per goal_id so the caller
+    compares against the freshest evidence, not the oldest.
+
+    `board_log_path` (tests only): read a JSON list of post dicts directly,
+    bypassing the daemon/subprocess board scan.
+
+    FAIL-OPEN: any read failure yields an empty dict -> no cooldown -> every hit
+    is eligible to route. That direction is deliberate. A cooldown that
+    fail-CLOSED would silence routing whenever the board is unreachable, which
+    converts a transient board fault into invisible blocked work — the exact
+    failure class 0.5b.12 exists to surface. A duplicate post is cheap; a
+    suppressed-and-forgotten hit is not.
+    """
+    posts = []
+    read_ok = True
+    if board_log_path is not None:
+        try:
+            with open(board_log_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            posts = data if isinstance(data, list) else []
+        except Exception:
+            posts = []
+            read_ok = False
+    else:
+        try:
+            proc = subprocess.run(
+                bash_cmd(SCRIPT_DIR / "board-read.sh",
+                         "--channel", "coordination",
+                         "--type", "status",
+                         "--since", _routing_window_str(cooldown_hours),
+                         "--json"),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+            if proc.returncode == 0:
+                for line in (proc.stdout or "").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        posts.append(json.loads(line))
+                    except Exception:
+                        continue
+            else:
+                read_ok = False
+                sys.stderr.write(
+                    "blocked-signal-resolution-check: board-read.sh exit=%d "
+                    "stderr=%s — fail-open (no cooldown this sweep)\n"
+                    % (proc.returncode, (proc.stderr or "").strip()[:200]))
+        except Exception as exc:
+            read_ok = False
+            sys.stderr.write(
+                "blocked-signal-resolution-check: board-read.sh exception (%s) "
+                "— fail-open (no cooldown this sweep)\n" % exc)
+
+    recent = {}
+    for p in posts:
+        if not isinstance(p, dict):
+            continue
+        tags = p.get("tags") or []
+        if not any(m in tags for m in _ROUTING_MARKERS):
+            continue
+        age = _age_hours_from(p.get("timestamp") or p.get("ts"), now)
+        if age is None:
+            continue
+        for t in tags:
+            # The breadcrumb tags the goal_id (`g-*`); lane/agent tags never do.
+            if isinstance(t, str) and t.startswith("g-"):
+                if t not in recent or age < recent[t]:
+                    recent[t] = age
+    return recent, read_ok
+
+
+def _age_hours_from(ts, now):
+    """Hours between `ts` and `now`, or None when unparseable."""
+    parsed = _parse_iso(ts)
+    if parsed is None:
+        return None
+    return (now - parsed).total_seconds() / 3600.0
+
+
+def _post_routing_breadcrumb(entry, no_board=False):
+    """Post the shared+durable routing breadcrumb. Returns (ok, detail).
+
+    Body goes on STDIN via `input=` — board-post.sh reads it with `BODY="$(cat)"`
+    and has NO --body flag (guard-1531 / guard-1036). Passing it as an argument
+    silently posts an empty body.
+    """
+    if no_board:
+        return True, "no_board"
+    gid = entry.get("goal_id") or "?"
+    lane = entry.get("intended_agent") or "unknown"
+    try:
+        tags = "%s,%s,lane:%s" % (ROUTING_TAG, gid, lane)
+        msg = ("Blocked-signal sweep (0.5b.12): [%s] verdict=%s basis=%s "
+               "blocked %s — routing to lane %s. Detective-only: no goal status "
+               "was mutated. %s"
+               % (gid, entry.get("verdict"), entry.get("resolution_basis"),
+                  ("%sd" % entry["days_blocked"]) if entry.get("days_blocked") is not None else "?d",
+                  lane, entry.get("title") or ""))
+        proc = subprocess.run(
+            bash_cmd(SCRIPT_DIR / "board-post.sh",
+                     "--channel", "coordination",
+                     "--type", "status",
+                     "--tags", tags),
+            input=msg,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+        if proc.returncode == 0:
+            return True, "posted"
+        sys.stderr.write(
+            "blocked-signal-resolution-check: board-post.sh exit=%d stderr=%s\n"
+            % (proc.returncode, (proc.stderr or "").strip()[:300]))
+        return False, "board_post_nonzero:%d" % proc.returncode
+    except Exception as exc:
+        sys.stderr.write(
+            "blocked-signal-resolution-check: board-post.sh exception (%s) — "
+            "skipping post\n" % exc)
+        return False, "board_post_exception:%s" % exc.__class__.__name__
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=("Flag status=blocked goals whose block signals "
@@ -695,6 +902,22 @@ def main():
                      "reason-less-blocked-check.py."),
     )
     ap.add_argument("--output", choices=["json", "human"], default="json")
+    # --post-routing, deliberately NOT named --apply (). Every sibling
+    # sweep in this family uses --apply to mean "MUTATE GOALS", and this sweep's
+    # detective-only posture is load-bearing and documented at its phase header.
+    # Reusing the family's mutation verb for a board post would invite exactly
+    # the misreading the header warns against. The flag posts a breadcrumb and
+    # touches no goal.
+    ap.add_argument("--post-routing", action="store_true",
+                    help=("Post the shared coordination-board routing breadcrumb "
+                          "for each non-suppressed hit. Never mutates a goal."))
+    ap.add_argument("--cooldown-hours", type=float,
+                    default=DEFAULT_ROUTING_COOLDOWN_HOURS,
+                    help="Routing-breadcrumb cooldown window (default: %(default)s).")
+    ap.add_argument("--board-routing-log", default=None,
+                    help=argparse.SUPPRESS)  # tests only: read posts from a JSON file
+    ap.add_argument("--no-board", action="store_true",
+                    help=argparse.SUPPRESS)  # tests only: skip the post subprocess
     args = ap.parse_args()
 
     now = dt.datetime.now()
@@ -756,6 +979,34 @@ def main():
     for v in buckets.values():
         v.sort(key=lambda e: (e["days_blocked"] is None, -(e["days_blocked"] or 0)))
 
+    # ── Routing cooldown () ────────────────────────────────────────
+    # Annotate EVERY surfaced hit, in all four buckets, because the phase routes
+    # from all four. The annotation gates the OUTBOUND BOARD POST only — the
+    # stdout surfacing below is untouched by design (this goal's CAVEAT: the
+    # stdout line is how the RUNNING agent learns the state, and suppressing it
+    # would hide the finding from the one agent positioned to act on it).
+    recent_routings, routing_read_ok = _read_recent_routings(
+        now, args.cooldown_hours,
+        Path(args.board_routing_log) if args.board_routing_log else None)
+    routing_suppressed = 0
+    routing_eligible = 0
+    routing_posted = []
+    routing_post_failed = []
+    for name in ("all_resolved", "disagreement", "dangling_ref", "undecidable"):
+        for e in buckets[name]:
+            age = recent_routings.get(e["goal_id"])
+            suppressed = age is not None and age < args.cooldown_hours
+            e["already_routed_age_hours"] = round(age, 2) if age is not None else None
+            e["routing_suppressed"] = suppressed
+            if suppressed:
+                routing_suppressed += 1
+                continue
+            routing_eligible += 1
+            if args.post_routing:
+                ok, detail = _post_routing_breadcrumb(e, no_board=args.no_board)
+                (routing_posted if ok else routing_post_failed).append(
+                    {"goal_id": e["goal_id"], "detail": detail})
+
     result = {
         "scanned": len(all_goals),
         "blocked_with_signal": blocked_with_signal,
@@ -775,6 +1026,20 @@ def main():
         # EMPTY archive is NOT a failure and must leave these two untouched.
         "archive_read_failed": archive_read_failed,
         "archive_degraded": bool(archive_read_failed),
+        #  routing cooldown. `routing_cooldown_read_ok` is reported
+        # SEPARATELY from the suppression count because an empty cooldown set has
+        # two causes that are otherwise indistinguishable: nothing was routed
+        # recently (clean), or the board read failed and fail-open emptied it
+        # (degraded). A reader must be able to tell those apart — the same
+        # discrimination `archive_degraded` above provides for the archive read.
+        "routing_cooldown_hours": args.cooldown_hours,
+        "routing_cooldown_read_ok": routing_read_ok,
+        "routing_cooldown_degraded": not routing_read_ok,
+        "routing_breadcrumbs_seen": len(recent_routings),
+        "routing_suppressed_count": routing_suppressed,
+        "routing_eligible_count": routing_eligible,
+        "routing_posted": routing_posted,
+        "routing_post_failed": routing_post_failed,
         "now": now.isoformat(timespec="seconds"),
     }
 

@@ -37,6 +37,7 @@ THREE measured traps this file exists to encode (g-115-3927, 2026-07-30):
 """
 import json
 import os
+import re
 import sys
 
 
@@ -79,6 +80,143 @@ def parse_routing_tag(tag):
     if text.startswith("requires_action_by:"):
         text = text.split(":", 1)[1]
     return split_author(text)
+
+
+# The CLOSED set of English routing verbs. A `<prefix>:<name>` tag is an
+# ADDRESSING ATTEMPT only when its prefix is one of these; every other prefix is
+# structured metadata and must stay silent ().
+#
+# ENUMERATE THE CLOSED THING, NOT THE OPEN ONE — that is the whole design, and
+# the two rejected alternatives both got it backwards. Board tags are free text
+# under no schema obligation, so the set of METADATA prefixes is open and grows
+# without bound; the set of English words meaning "send this to" is closed and
+# ~10 long. guard-2499's tell ("count the DISTINCT shapes the corpus already
+# contains") measured 44 distinct metadata prefixes across 1,289 distinct tags —
+# its stated threshold for "widening by enumeration cannot work".
+#
+# MEASURED 2026-08-16 (zeta, hostname cc-02, uname -r 6.8.0-137-generic), full
+# live corpus, 9,898 board posts over 720h on findings+coordination. The prior
+# predicate warned on ANY unrecognised colon prefix: 1,860 posts / 3,710 tag
+# instances, of which 3,575 were clear false positives — 2.8% precision. Four
+# candidates, all keeping 100% recall of the 104 genuine mis-addresses:
+#   allowlist metadata prefixes (from:/severity:/affects:/target:/action_type:)
+#                                                     -> 222 false firings left
+#   goal-id carve-out on the value                    -> 2,626 left
+#   value-is-a-known-agent-identity                   -> 0 left, but it breaks
+#     `test_no_roster_is_consulted` by construction, and that test pins a
+#     DELIBERATE decision (see the docstring below) — an unknown peer name is
+#     the case most likely to be mis-addressed, so it must still flag
+#   THIS (closed address-verb prefix set)             -> 0 left, 100% precision,
+#     and every previously-pinned behaviour unchanged
+#
+# `from:` needs no special case any more: it is provenance, not an address verb,
+# so the verb set subsumes the former `_NON_ROUTING_PREFIXES` denylist. Keeping
+# both would put two policies on one decision (communication-clarity rule 5).
+#
+# `routed` was added by this goal's OWN Q2 recall check, which is the reason to
+# run one: of the 3,606 instances this narrowing drops, 27 carry a value that
+# names a live agent, and 21 of those sit on a post with no properly-routing tag
+# at all. Read verbatim, all but two are ATTRIBUTIVE — `agent:zeta` on a finding
+# ABOUT zeta, `lane:alpha` emitted mechanically by blocked-signal-resolution-check,
+# `credit:foxtrot`, `cross-agent:echo`. Those are nouns, they were never delivery
+# attempts, and admitting them would re-open the metadata set this design closes.
+# `routed:` is the exception and it is decided on evidence, not symmetry: both
+# live instances (`routed:alpha` msg-20260718-090942-echo-3666, `routed:bravo`
+# msg-20260718-093054-echo-3670) are `insight_trigger` posts carrying NO
+# `requires_action_by:`, so aspirations-select Phase 2.07 SKIPped them and the
+# triggers reached nobody — exactly the defect this helper exists to catch. It is
+# also the past participle of `route`, already in the set, so it costs no new
+# policy. Net: +2 genuine, +0 false, measured on the same 9,917-post corpus.
+_ADDRESS_VERBS = frozenset({
+    "to", "cc", "fyi", "for", "fwd", "forward", "forward-to", "route",
+    "route-to", "routed", "relay", "relay-to", "notify", "attn",
+    "addressed-to", "deliver-to",
+})
+
+# The hyphenated attempt. Measured: 3 of the 6 stranded 2026-08-11 relays used
+# `relay-to-omni`, which parses to agent `relay-to-omni` and contains no colon,
+# so the colon rule alone cannot see it.
+_HYPHEN_ROUTING_RE = re.compile(
+    r"^(?:relay|forward|fwd|to|cc|fyi|route)-to-(?P<name>[a-z0-9][a-z0-9._-]*)$"
+)
+
+
+def suspected_routing_tags(tags):
+    """Tags that LOOK like an address but route to NOBODY -> [(tag, agent)].
+
+    THE DEFECT THIS NAMES (measured 2026-08-11, six posts over ten days by four
+    different agents): `requires_action_by:` is the ONLY prefix parse_routing_tag
+    strips, so `forward-to:omni@zds-mind` parses to agent `forward-to:omni` and
+    matches nothing. Board tags are free-form, so the poster gets NO feedback at
+    all — the message looks addressed and reaches no one.
+
+    NO ROSTER IS CONSULTED, deliberately. Requiring a roster would make this
+    silently weaker exactly where it matters most — a peer agent this world does
+    not enumerate is the case most likely to be mis-addressed. That is why
+    `forward-to:nobody-has-ever-heard-of-me` must still flag, and why the
+    otherwise-attractive "warn only when the value names a known agent" fix is
+    rejected: it scores perfectly on the corpus and is wrong on the case the
+    corpus does not contain.
+
+    THE PREFIX, NOT THE VALUE, IS THE DISCRIMINATOR (g-115-6347). The clause
+    above once read "a colon SURVIVING parse_routing_tag is already proof that a
+    prefix was used and not recognised". That inference is FALSE, and it made
+    this helper wrong 97% of the time: an unrecognised prefix is proof of a
+    prefix, never proof of an ADDRESS. `severity:enables` and `affects:g-326-292`
+    survive the parse and address nobody because they were never addressing
+    anyone. So a colon tag is an addressing attempt only when its prefix is in
+    `_ADDRESS_VERBS` (see the measurement there: 3,710 firings -> 135, precision
+    2.8% -> 100%, recall unchanged at 104/104).
+
+    WHAT THE NOISE WAS HIDING, which is the reason this mattered: `for:<agent>`
+    routes to nobody and appears 71 times across five agents — the single largest
+    genuine mis-address in the corpus, and larger than every previously-known
+    form combined (`to:` 13, `forward-to:` 13, `relay-to-` 5, `fyi:` 1). It was
+    invisible because it sat under 3,575 false firings. An advisory this noisy
+    does not merely get ignored; it conceals its own true positives.
+
+    THE SUPPRESSION CLAUSE IS LOAD-BEARING, and without it this helper would
+    cry wolf on correctly-addressed posts. Consumers test tags with `any()`, so
+    ONE routing tag is enough: a post carrying both `omni` and `to:omni@zds-mind`
+    routes fine and must NOT warn. Measured on a live post
+    (msg-20260814-163801-bravo-5214, answering a peer's urgent question) which
+    carries exactly that pair — reading the broken tag alone would have raised a
+    false alarm on a message that was delivered.
+    """
+    tag_list = [str(t) for t in (tags or [])]
+    routed = set()
+    suspects = []
+    for tag in tag_list:
+        agent, _env = parse_routing_tag(tag)
+        agent = agent or ""
+        if ":" in agent:
+            if agent.split(":", 1)[0].strip().lower() not in _ADDRESS_VERBS:
+                # Structured metadata (severity:, affects:, target:, from:, ...).
+                # Not an addressing attempt — stay silent, and do NOT add it to
+                # `routed` either: its value is not an agent.
+                continue
+            suspects.append((tag, agent.rsplit(":", 1)[1]))
+            continue
+        hyphen = _HYPHEN_ROUTING_RE.match(agent)
+        if hyphen:
+            suspects.append((tag, hyphen.group("name")))
+            continue
+        # A tag that parses to a bare name is a live address for that name.
+        if agent:
+            routed.add(agent)
+    # BOTH SIDES OF THIS JOIN MUST DRAW FROM THE SAME NAMESPACE (guard-1942).
+    # The FLAG path already case-normalises its half — the verb is matched as
+    # `.strip().lower()`, so `FOR:zeta` is recognised. The SILENCE path did not,
+    # so `for:Zeta` + a rescuing bare `zeta` compared "Zeta" against {"zeta"} and
+    # WARNED ON A POST THAT ROUTES FINE. Case-insensitive on one side of a
+    # membership test and not the other is a false positive in the one predicate
+    # whose entire value is precision — and re-arming FP noise here re-arms the
+    # rb-8030 mechanism (the fleet learns to ignore the advisory, and the class it
+    # detects goes permanently unseen). Compared lowered; `who` is RETURNED in its
+    # original case because callers print the tag verbatim.
+    routed_ci = {r.lower() for r in routed}
+    return [(tag, who) for tag, who in suspects
+            if who and who.lower() not in routed_ci]
 
 
 def routing_tag_targets_agent(tag, agent_name, self_env):

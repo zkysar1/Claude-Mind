@@ -48,6 +48,10 @@ except Exception:
 # this env. Pin local for the whole pytest session so test daemons stay on the
 # LocalBackend rather than reaching for real S3 (or 500-ing on from_env).
 os.environ["STORAGE_BACKEND"] = "local"
+# Same reasoning for the per-box gate-firings segmentation flag: _gate_log.log()
+# honours it on every lane (2026-08-18), and the byte-compat tests here read the
+# legacy filename. Pin OFF; core/scripts/tests/conftest.py does the same.
+os.environ.pop("GATE_FIRINGS_SEGMENTED", None)
 
 
 # Suppress the daemon stale-code check for the whole pytest session

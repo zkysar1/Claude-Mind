@@ -1,8 +1,10 @@
 """Gate firing telemetry — single append-only log of every gate decision.
 
 Read by the retirement evaluator (aspirations-evolve), per-gate tuning corpus
-generation, and the gate-stats dashboard. Storage:
-`{META_DIR}/gate-firings.jsonl` (append-only).
+generation, and the gate-stats dashboard. Storage: `{META_DIR}/gate-firings.jsonl`
+(legacy, append-only) plus `gate-firings-YYYY-MM-DD.jsonl` date segments once
+GATE_FIRINGS_SEGMENTED is on (store_name() is the one writer rule; firings_paths()
+the one reader rule).
 
 Decision taxonomy — exact strings, treat as enum:
   noop       Gate invoked but no trigger matched. Counted for invocation
@@ -115,6 +117,33 @@ def segment_name(day=None):
     return f"gate-firings-{day.isoformat()}.jsonl"
 
 
+# Writer flag for the segmented store ( / ). Per-box on purpose:
+# a box flips it only after the fleet's readers understand segments. Defined HERE,
+# beside segment_name(), so that EVERY writer lane — the spool flush
+# (gate-firings-flush.py) AND the direct locked append below — resolves the same
+# target from the same rule. Until 2026-08-18 the rule lived only in the flush
+# script, so the direct lane (`log()` on a process whose env did not carry
+# STORAGE_BACKEND=own-cloud) kept appending to the legacy file after the flip:
+# measured ~1000 whole-object RMWs on the 68 MB legacy object in the 12h after the
+# flag went fleet-wide, from CLI gate scripts (capability-gate, origin-signal-gate,
+# goal-duplication-gate, store-dupe-warn) on registry-native boxes. Every one of
+# those re-heated the object for every box's next pull sweep — the exact egress the
+# flip existed to remove.
+SEGMENTED_ENV = "GATE_FIRINGS_SEGMENTED"
+LEGACY_STORE_NAME = "gate-firings.jsonl"
+
+
+def segmented_enabled():
+    """True when this box writes new firings to today's date segment."""
+    return _os.environ.get(SEGMENTED_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
+def store_name(day=None):
+    """Basename every writer lane appends to: today's segment when the flag is
+    on, the legacy file otherwise. Readers accept both (firings_paths)."""
+    return segment_name(day) if segmented_enabled() else LEGACY_STORE_NAME
+
+
 def firings_paths(meta_dir=None):
     """Ordered paths comprising the gate-firings store, oldest-first.
 
@@ -156,6 +185,28 @@ def firings_paths(meta_dir=None):
 
 
 def _spool_active():
+    """Spool (own-cloud) or append directly (any other backend)?
+
+    Decided from the RESOLVED backend, not from a raw env read. A bare
+    subprocess on a registry-native box (ENVIRONMENT_ID set, STORAGE_BACKEND
+    not exported — every CLI gate script spawned from the loop's Bash lands
+    here) starts with STORAGE_BACKEND unset. The old env-only test then said
+    "not own-cloud", took the direct lane, and locked_append_jsonl's own
+    get_backend() bootstrapped the env from the registry and performed a
+    whole-object S3 RMW on the shared store — the very cost the spool exists
+    to avoid (measured 2026-08-18: the dominant writer of the legacy 68 MB
+    object after the segment flip). Resolve the same way get_backend() will,
+    then re-read: an explicit pin (guard-955 STORAGE_BACKEND=local, or any
+    deliberate override) is untouched because the bootstrap only setdefaults.
+    """
+    explicit = _os.environ.get("STORAGE_BACKEND", "").strip().lower()
+    if explicit:
+        return explicit == "own-cloud"
+    try:
+        from storage_backend import _bootstrap_env_defaults  # lazy: hot path stays cheap
+        _bootstrap_env_defaults()
+    except Exception:
+        return False
     return _os.environ.get("STORAGE_BACKEND", "").strip().lower() == "own-cloud"
 
 
@@ -253,7 +304,10 @@ def log(
             with open(dest / _SPOOL_NAME, "a", encoding="utf-8") as f:
                 f.write(_json.dumps(record, ensure_ascii=True) + "\n")
         else:
-            locked_append_jsonl(dest / "gate-firings.jsonl", record)
+            # Same target rule as the spool flush (store_name): with the
+            # segment flag on, the direct lane must not keep re-heating the
+            # legacy object either.
+            locked_append_jsonl(dest / store_name(), record)
     except Exception:
         return
 

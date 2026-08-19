@@ -62,6 +62,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from _paths import WORLD_DIR, AGENT_DIR, META_DIR, PROJECT_ROOT, agents_root as _agents_root  # type: ignore  # noqa: E402
+from _utilization_store import load_counters, utilization_of  # type: ignore  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -145,14 +146,14 @@ def _evidence(util):
     return score
 
 
-def _is_candidate(rec, today=None):
+def _is_candidate(rec, today=None, counters=None):
     """Apply the candidate filter. See module docstring."""
     if today is None:
         today = _today()
     if rec.get("status") != "active":
         return False
 
-    util = rec.get("utilization", {}) or {}
+    util = utilization_of(rec, counters) or {}
 
     # Auto-flagged forces inclusion (C.3 escape hatch — explicit "we tried
     # --infer N times and couldn't classify, please review").
@@ -183,7 +184,7 @@ def _is_candidate(rec, today=None):
     return True
 
 
-def _candidate_sort_key(rec):
+def _candidate_sort_key(rec, counters=None):
     """Sort: evidence asc, age desc, exposure desc.
 
     Ties go to the oldest, most-exposed entries — those have the strongest
@@ -191,7 +192,7 @@ def _candidate_sort_key(rec):
     retrieval_count alone since 2026-05-09 (times_skipped dropped — see
     module docstring on the inflation issue).
     """
-    util = rec.get("utilization", {}) or {}
+    util = utilization_of(rec, counters) or {}
     evidence = _evidence(util)
     created = _parse_date(rec.get("created")) or _today()
     age_days = (_today() - created).days
@@ -199,9 +200,9 @@ def _candidate_sort_key(rec):
     return (evidence, -age_days, -rc)
 
 
-def _summarize(rec, kind):
+def _summarize(rec, kind, counters=None):
     """Compact dict per record for JSON output."""
-    util = rec.get("utilization", {}) or {}
+    util = utilization_of(rec, counters) or {}
     created = _parse_date(rec.get("created"))
     age_days = (_today() - created).days if created else None
     out = {
@@ -245,11 +246,27 @@ def _record_kind(kind):
     return "guardrail" if kind == "guardrails" else "reasoning_bank"
 
 
+def _store_kind(kind):
+    """This script's CLI kind -> the sidecar store's kind (_utilization_store.KINDS).
+
+    Three vocabularies for the same two stores already exist here: the CLI says
+    `rb`, `_record_kind` says `reasoning_bank`, and the sidecar says
+    `reasoning-bank`. Mapping explicitly beats reusing `_record_kind`, whose
+    underscore form `_check_kind` would reject.
+    """
+    return "guardrails" if kind == "guardrails" else "reasoning-bank"
+
+
 def cmd_report(kind):
     """Full ranked list, evidence ascending."""
     path = _path_for(kind)
+    # Sidecar counters, loaded ONCE per command rather than per record — this is
+    # a file read, and the per-record helpers take the map ( item 1).
+    # Empty until the writer lands, at which point `utilization_of` falls through
+    # to the embedded field and behaviour is byte-identical to before conversion.
+    counters = load_counters(_store_kind(kind), WORLD_DIR)
     recs = [r for r in _read_jsonl(path) if r.get("status") == "active"]
-    summaries = [_summarize(r, _record_kind(kind)) for r in recs]
+    summaries = [_summarize(r, _record_kind(kind), counters) for r in recs]
     summaries.sort(key=lambda s: (s["evidence"], -(s["age_days"] or 0)))
     out = {
         "kind": kind,
@@ -262,13 +279,14 @@ def cmd_report(kind):
 def cmd_candidates(kind, limit):
     """Top-N retire candidates."""
     path = _path_for(kind)
+    counters = load_counters(_store_kind(kind), WORLD_DIR)
     recs = _read_jsonl(path)
     today = _today()
-    candidates = [r for r in recs if _is_candidate(r, today)]
-    candidates.sort(key=_candidate_sort_key)
+    candidates = [r for r in recs if _is_candidate(r, today, counters)]
+    candidates.sort(key=lambda r: _candidate_sort_key(r, counters))
     if limit and limit > 0:
         candidates = candidates[: int(limit)]
-    summaries = [_summarize(r, _record_kind(kind)) for r in candidates]
+    summaries = [_summarize(r, _record_kind(kind), counters) for r in candidates]
     out = {
         "kind": kind,
         "candidate_count": len(summaries),

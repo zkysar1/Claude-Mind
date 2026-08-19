@@ -63,6 +63,18 @@ from storage_backend import (
     # (tests, CLI) reach them unchanged.
     _DEFAULT_CUSTOMER, current_customer, set_customer, reset_customer,
 )
+# g-358-11: transport codec (gzip at rest, decoded into the local mirror). The
+# READ side is always on and magic-byte authoritative — a plain object decodes
+# to itself, so this is byte-identical to the pre-codec backend until a writer
+# is flipped (OWNCLOUD_GZIP_STORES, allowlisted keys only). One implementation
+# shared with every raw-boto3 caller; see _owncloud_codec's module docstring.
+from _owncloud_codec import (
+    decode_response as _codec_decode_response,
+    head_plain_md5 as _codec_head_plain_md5,
+    content_matches as _codec_content_matches,
+    should_encode as _codec_should_encode,
+    put_kwargs as _codec_put_kwargs,
+)
 
 # g-328-21: module logger for CAS (If-Match compare-and-swap) conflict telemetry.
 # Emits the running 409/412 conflict rate when a coordination-store merge-reconcile
@@ -109,6 +121,37 @@ def _conflict_backoff(attempt: int) -> float:
     is already lock-serialized (lower contention) so it keeps the modest additive
     jitter. Cap 1.0s; attempt 0 => uniform[0, 0.05]."""
     return random.uniform(0.0, min(0.05 * (2 ** attempt), 1.0))
+
+
+def _atomic_write_local(local: Path, body: bytes) -> None:
+    """Atomically materialize `body` at `local` (same-dir tmp + os.replace).
+
+    Every local-mirror write in this backend MUST route through here, never
+    through bare Path.write_bytes — write_bytes opens with O_TRUNC, so a
+    concurrent reader in the truncate-to-written window sees an EMPTY or
+    PARTIAL file. That window is not hypothetical: it is the mechanism behind
+    the g-115-6054 worker fork-WM wipe (a wm set reading the transiently-empty
+    file triggered the g-115-748 empty-file self-heal, which rebuilt the LIVE
+    working memory from template and destroyed every capture lane) and the
+    g-115-3253 mid-run suite-log truncation/NUL class. os.replace is atomic on
+    the same filesystem — readers see the old bytes or the new bytes, never
+    the window. Same idiom as owncloud_sync._save_manifest.
+    """
+    local.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=local.name + ".", suffix=".tmp",
+                                    dir=str(local.parent))
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(body)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, local)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def _coordination_merge_handler(path):
@@ -174,6 +217,43 @@ def _reraise_access_denied(e: ClientError, op: str) -> None:
         ) from e
 
 
+def runner_token_fingerprint(token: Optional[str]) -> Optional[str]:
+    """Non-reversible change-detection digest of a ``runner_token``.
+
+    THE RAW TOKEN MUST NEVER LEAVE THIS PROCESS, AND THAT IS A SECURITY
+    PROPERTY, NOT A STYLE CHOICE (g-306-224). ``runner_token`` is a BEARER
+    CREDENTIAL: it is the ``ConditionExpression`` that authorises two mutations
+    on someone else's claim — :meth:`OwnCloudBackend.heartbeat`
+    (``runner_token = :tok``) and :meth:`OwnCloudBackend.release_runner`
+    (``agent_state = :run AND runner_token = :tok``). ``release_runner``'s own
+    docstring names the property exactly: "that token condition is what
+    distinguishes a clean self-release from :meth:`reclaim_if_stale` (a PEER
+    breaking a crashed claim)". So anything holding the token can (a) forge a
+    heartbeat for another agent, which defeats ``reclaim_if_stale`` outright —
+    a crashed runner would never look stale and could never be reclaimed — and
+    (b) release a LIVE claim, forcing a healthy reducer to wind down mid-flight
+    with its Bodies' work unmerged. Both are precisely the failures the lease
+    exists to prevent, so publishing the token to close a liveness gap would
+    defeat the mechanism it is meant to strengthen. (rb-3271 class: a read
+    endpoint that returns a credential in its response body.) Independent
+    corroboration that the framework already treats this name as sensitive:
+    ``_transplant_pack.py`` carries ``runner-token`` in ``_LEAK_NAMES``.
+
+    A consumer that only needs to notice CHANGE does not need the value. The
+    fingerprint gives exactly that and nothing else: it is stable while the
+    token is, it moves when the token is re-minted, and it is useless as a
+    ``ConditionExpression`` value. Truncated SHA-256 over a UUID4 (122 bits of
+    entropy) has no feasible preimage, and 64 bits of digest makes a collision
+    — which would cost one MISSED wind-down, never a spurious one — negligible
+    across a table holding one row per agent.
+
+    Returns ``None`` for a missing/empty token (a never-claimed IDLE row), which
+    consumers must read as "unknown", never as "unchanged"."""
+    if not token:
+        return None
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+
+
 class RunnerClaim(NamedTuple):
     """One ``zds-sessions`` row projected for ownership resolution. The dynamic
     ``_owned_agents()`` resolver (design §3) consumes these by attribute
@@ -181,11 +261,19 @@ class RunnerClaim(NamedTuple):
     ``heartbeat_at`` is epoch-seconds as ``int`` — 0 when the row was never
     heartbeated (a create-only IDLE row), so the resolver's ``now - heartbeat_at``
     staleness math needs no per-call coercion. ``machine_id`` is ``None`` for a
-    never-claimed IDLE row."""
+    never-claimed IDLE row.
+
+    ``runner_token_fp`` is the :func:`runner_token_fingerprint` digest, added for
+    the worker reducer-liveness poll's same-box-restart detection (g-306-224).
+    There is deliberately NO raw-token field on this tuple: the projection is the
+    boundary the token must not cross, so making it unrepresentable here means a
+    future caller cannot leak it by adding one line to a response dict. Defaulted
+    so every existing positional construction stays valid."""
     agent: str
     machine_id: Optional[str]
     agent_state: str
     heartbeat_at: int
+    runner_token_fp: Optional[str] = None
 
 
 # Own-cloud writes use S3 PutObject(IfMatch=<etag>) compare-and-swap (fix #3 in
@@ -283,7 +371,30 @@ class OwnCloudBackend:
         self.cache_ttl = cache_ttl
         self.machine_id = machine_id
         self.runner_stale_seconds = runner_stale_seconds
-        _cfg = _BotoConfig(retries={"max_attempts": 3, "mode": "standard"})
+        # Explicit transport bounds (g-115-5853). Botocore's DEFAULTS are 60s
+        # connect / 60s read, so with max_attempts=3 one operation composed to a
+        # worst case of 3 x (60+60) = 360s. This was the ONLY unbounded surface
+        # in the own-cloud path -- every other layer is already capped (shell
+        # client 90s, python client 30s, file lock 10s) -- which is exactly why
+        # it survived: anyone auditing for "is there a timeout?" finds one at
+        # every layer they look at and concludes the path is bounded.
+        #
+        # WHY A LOWER read_timeout DOES NOT BREAK LARGE OBJECTS: botocore passes
+        # read_timeout to urllib3 as the PER-SOCKET-READ timeout -- the maximum
+        # gap BETWEEN bytes -- not a total-transfer deadline. A multi-MB store
+        # streams continuously and never approaches it; what the bound actually
+        # catches is a connection that has STOPPED delivering. So the real
+        # trade-off is stall-detection latency, not object size. (Documented
+        # urllib3/botocore semantics, not measured here.)
+        #
+        # Env-overridable so a box on a slow or high-latency link can raise them
+        # without a code change. Defaults hold the per-operation worst case at
+        # 3 x (10 + 30) = 120s, down from 360s.
+        _conn_to = float(os.environ.get("MIND_S3_CONNECT_TIMEOUT", "10") or 10)
+        _read_to = float(os.environ.get("MIND_S3_READ_TIMEOUT", "30") or 30)
+        _cfg = _BotoConfig(retries={"max_attempts": 3, "mode": "standard"},
+                           connect_timeout=_conn_to,
+                           read_timeout=_read_to)
         # Dedicated scoped creds (the least-privilege Zak_first_test user) when
         # given — kept SEPARATE from the process-wide AWS_* keys, which on this
         # deployment are the root keys used for unrelated lambda access and must
@@ -628,6 +739,11 @@ class OwnCloudBackend:
                 return local  # absent remotely (local may also be absent)
             raise
         etag = head["ETag"]
+        # g-358-11: the plaintext md5 an ENCODED writer recorded in metadata
+        # (None for a plain object). For an encoded object the ETag digests the
+        # compressed bytes, so byte-identity against the DECODED local mirror
+        # must go through this value — see _owncloud_codec.content_matches.
+        remote_plain_md5 = _codec_head_plain_md5(head)
         self._cache_check[str(local)] = now
         if local.exists() and self._etags.get(key) == etag:
             return local  # unchanged since our last download
@@ -641,7 +757,8 @@ class OwnCloudBackend:
         # owncloud_sync._pull_one (L781-805), so the read path and the sweep
         # path share ONE clobber-safety semantics.
         if local.exists():
-            decision = self._overwrite_decision(path, local, etag)
+            decision = self._overwrite_decision(path, local, etag,
+                                                remote_plain_md5=remote_plain_md5)
             if decision == "identical":
                 # local already byte-identical to S3; the empty post-restart
                 # cache only made it look stale. Adopt the ETag as the fence
@@ -649,7 +766,7 @@ class OwnCloudBackend:
                 # any local delta vs the old baseline is already ON S3 --
                 # nothing unpushed to mask, so re-stamp the baseline too.
                 self._etags[key] = etag
-                self._stamp_manifest_baseline(path, local.read_bytes())
+                self._stamp_manifest_baseline(path, local.read_bytes(), etag=etag)
                 return local
             if decision == "no_clobber":
                 # local is authoritative: it holds unpushed writes (local != the
@@ -669,19 +786,27 @@ class OwnCloudBackend:
                 return local
             # decision == "download" -> fall through to the pull below.
         obj = self.s3.get_object(Bucket=self.bucket, Key=key)
-        body = obj["Body"].read()
-        local.parent.mkdir(parents=True, exist_ok=True)
-        local.write_bytes(body)
+        # g-358-11: the mirror holds DECODED bytes — every consumer above the
+        # backend keeps reading plaintext, whatever the object's encoding.
+        body = _codec_decode_response(obj, key=key)
+        _atomic_write_local(local, body)
         self._etags[key] = etag
         # Reaching this line requires verdict=="download" or local-absent --
-        # both mean S3 is authoritative and the mirror now byte-equals S3,
-        # which is precisely the state the baseline exists to record.
-        self._stamp_manifest_baseline(path, body)
+        # both mean S3 is authoritative and the mirror now byte-equals S3
+        # (as plaintext), which is precisely the state the baseline records.
+        self._stamp_manifest_baseline(path, body, etag=etag)
         return local
 
-    def _stamp_manifest_baseline(self, path: PathLike, body: bytes) -> None:
+    def _stamp_manifest_baseline(self, path: PathLike, body: bytes,
+                                 etag: Optional[str] = None) -> None:
         """Stamp the persistent sync-manifest baseline for a just-pushed key
         (g-115-1946 — root fix for the cross-box lost-update lanes).
+
+        `etag` (g-358-11) records the S3 ETag the baseline was reconciled
+        against. `md5` stays the PLAINTEXT md5 (it is compared against local
+        bytes to detect unpushed writes); for a transport-encoded object the
+        ETag no longer equals that md5, so the sync layer's LIST pre-filter
+        needs the last-seen ETag to tell "S3 unchanged" without a HEAD.
 
         _put/_merge success previously advanced only the IN-PROCESS fence
         (self._etags); the PERSISTENT baseline was stamped only by the periodic
@@ -716,21 +841,29 @@ class OwnCloudBackend:
             # manifest). In-process lock; see _MANIFEST_STAMP_LOCK above.
             with _MANIFEST_STAMP_LOCK:
                 m = _load_manifest()
-                m[self._rel(path)] = {
+                entry = {
                     "mtime": local.stat().st_mtime_ns,
                     "md5": hashlib.md5(body).hexdigest(),
                 }
+                if etag:
+                    entry["etag"] = str(etag).strip('"')
+                m[self._rel(path)] = entry
                 _save_manifest(m)
         except Exception as e:  # noqa: BLE001 — fail-open by contract
             _LOG.warning(
                 "manifest baseline stamp failed for %s: %s (stale-baseline "
                 "window persists until next sweep)", path, e)
 
-    def _overwrite_decision(self, path: PathLike, local: Path, etag: str) -> str:
+    def _overwrite_decision(self, path: PathLike, local: Path, etag: str,
+                            remote_plain_md5: Optional[str] = None) -> str:
         """Classify whether _refresh may overwrite an EXISTING local file with
         the S3 object at ``etag``, mirroring owncloud_sync._pull_one (L781-805)
         so the read path shares the sweep path's no-clobber semantics
-        (g-115-1574 / rb-2096). Returns one of:
+        (g-115-1574 / rb-2096). ``remote_plain_md5`` (g-358-11) is the
+        writer-recorded plaintext md5 of a transport-ENCODED object (None for a
+        plain one): the "identical" test compares the decoded local mirror
+        against it, because an encoded object's ETag digests the compressed
+        bytes and can never equal a plaintext md5. Returns one of:
 
           "identical"  local is byte-identical to S3 -> skip the download; the
                        caller adopts the ETag as the fence token.
@@ -779,7 +912,7 @@ class OwnCloudBackend:
         # owncloud_sync does not import this module at top level).
         try:
             from owncloud_sync import (_load_manifest, _manifest_entry,
-                                       _etag_matches, _etag_is_multipart)
+                                       _etag_is_multipart)
         except Exception:
             # (g-115-2178) FAIL CLOSED: without the manifest/ETag helpers we
             # cannot verify local == baseline, so we cannot prove an S3 pull is
@@ -791,7 +924,9 @@ class OwnCloudBackend:
                 "failed for %s -- keeping local, refusing S3 overwrite "
                 "(g-115-2178/rb-3422)", self._rel(path))
             return "no_clobber"
-        if _etag_matches(etag, local_md5):
+        # g-358-11: plaintext-md5 metadata wins when present (encoded object);
+        # otherwise the classic single-part ETag == md5 rule (plain object).
+        if _codec_content_matches(etag, remote_plain_md5, local_md5):
             return "identical"
         # baseline_read_failed distinguishes a baseline-read EXCEPTION (the
         # manifest read raised -> NO trustworthy baseline -> FAIL CLOSED below)
@@ -898,7 +1033,7 @@ class OwnCloudBackend:
                     f"absent in S3 store: s3://{self.bucket}/{key}") from e
             _reraise_access_denied(e, "read_authoritative_bytes GetObject")
             raise
-        return obj["Body"].read()
+        return _codec_decode_response(obj, key=key)  # g-358-11: plaintext out
 
     def exists(self, path: PathLike) -> bool:
         try:
@@ -917,8 +1052,11 @@ class OwnCloudBackend:
                 return None
             raise
         # mtime_ns=0: S3 has no nanosecond mtime; callers that special-case mtime
-        # must tolerate 0 (FileStat contract). version is the ETag.
-        return FileStat(version=h["ETag"], size=int(h["ContentLength"]), mtime_ns=0)
+        # must tolerate 0 (FileStat contract). version is the ETag. plain_md5
+        # (g-358-11) is the writer-recorded plaintext md5 of an ENCODED object,
+        # None for a plain one — the sync layer's in-sync checks prefer it.
+        return FileStat(version=h["ETag"], size=int(h["ContentLength"]),
+                        mtime_ns=0, plain_md5=_codec_head_plain_md5(h))
 
     def head_last_modified(self, path: PathLike) -> Optional[float]:
         """S3 LastModified as epoch seconds, or None when the key is absent.
@@ -957,6 +1095,28 @@ class OwnCloudBackend:
             _reraise_access_denied(e, "delete_object DeleteObject")
             raise
         return True
+
+    def iter_paths_under(self, path: PathLike):
+        """Yield the LOCAL-shaped absolute Path for every S3 object whose key
+        sits under `path`'s prefix, recursively. Read-only companion to
+        delete_object: callers get handles they can feed straight back to
+        delete_object / head without touching keys or the client (g-115-6196
+        Lane-3 dir propagation; g-115-6229 backlog enumeration). Cost scales
+        with what is actually IN the store — a huge local-only dir whose
+        contents never synced (worker-box H4a skip) yields nothing, where a
+        local walk would enumerate every file."""
+        base = Path(path)
+        prefix = self._s3_key(base)
+        if prefix.endswith("/."):
+            prefix = prefix[:-1]
+        if not prefix.endswith("/"):
+            prefix += "/"
+        paginator = self.s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+            for o in page.get("Contents", []):
+                rest = o["Key"][len(prefix):]
+                if rest:
+                    yield base / rest
 
     def list_dir(self, path: PathLike) -> List[str]:
         prefix = self._s3_key(path)
@@ -1048,7 +1208,113 @@ class OwnCloudBackend:
         # the latest remote state, not a stale local cache.
         self._refresh(path, force_fresh=True)
 
+    def prefetch(self, path: PathLike) -> dict:
+        """Warm `_cache_check`/`_etags` for every object under `path` from ONE
+        bulk listing, so the reads that follow skip their per-file HEAD.
+
+        Why this exists (g-115-6660, operator-approved 2026-08-10): walking the
+        knowledge tree measured **1368 HEAD + 2 GET, 1.36 MB, 78.3s** — 78
+        seconds of round-trips moving almost no bytes. `_refresh` already has a
+        per-file TTL cache that skips the HEAD, but a walk touches each file
+        ONCE, so every file misses it and pays a HEAD. The listing returns the
+        same ETag token that freshness check compares, at ~1 request per 1000
+        keys. Measured in the same mail: 3 list calls for 2,717 keys in 0.8s.
+
+        THE ONLY INVARIANT THAT MATTERS: this may reduce requests, never change
+        what a read returns. So an entry is warmed ONLY where the listing PROVES
+        the local copy is already current — its md5 equals the object's ETag.
+        Every uncertain case falls through to the normal per-file path:
+          - no local copy      -> the read must GET it anyway
+          - multipart ETag     -> not the object md5; cannot compare (rb-2096)
+          - gzip-encoded       -> ETag digests COMPRESSED bytes, so a decoded
+                                  local mirror mismatches by construction. A
+                                  LIST cannot return the plaintext md5 (that
+                                  lives in object METADATA, HEAD-only), so
+                                  encoded objects simply keep their HEAD
+                                  (g-358-11 / `_codec_head_plain_md5`).
+        Every skip is COUNTED, not silent: a caller comparing `warmed` against
+        `listed` can see how much of the tree actually benefited, which is the
+        difference between a measurement and a hopeful assertion.
+
+        Batch validity deliberately inherits `cache_ttl` (default 30s) rather
+        than inventing a second expiry concept — the mail asked for "a decision
+        about how long a batch stays valid" and the existing TTL already IS that
+        decision, applied by the one code path that consumes it. A walk longer
+        than the TTL degrades to per-file HEADs for its tail; safe, not wrong.
+
+        Fail-open: a failed listing returns stats with `errors` set and warms
+        nothing, so the caller's reads behave exactly as they do today."""
+        stats = {"backend": "own-cloud", "listed": 0, "warmed": 0,
+                 "skipped_no_local": 0, "skipped_multipart": 0,
+                 "skipped_mismatch": 0, "skipped_machine_local": 0,
+                 "errors": 0, "ttl_seconds": self.cache_ttl}
+        root = Path(path)
+        try:
+            objs = self.list_objects(root)
+        except Exception as e:  # noqa: BLE001 — optimization must never raise
+            stats["errors"] += 1
+            stats["error"] = str(e)
+            return stats
+        stats["listed"] = len(objs)
+        now = time.monotonic()
+        for rel, etag, _size in objs:
+            try:
+                local = root / rel
+                if self._machine_local(local):
+                    stats["skipped_machine_local"] += 1
+                    continue
+                if not local.exists():
+                    stats["skipped_no_local"] += 1
+                    continue
+                tag = (etag or "").strip('"')
+                if "-" in tag:
+                    stats["skipped_multipart"] += 1
+                    continue
+                h = hashlib.md5()
+                with open(local, "rb") as f:
+                    for chunk in iter(lambda: f.read(65536), b""):
+                        h.update(chunk)
+                if h.hexdigest() != tag:
+                    stats["skipped_mismatch"] += 1
+                    continue
+                key = self._s3_key(local)
+            except Exception:  # noqa: BLE001 — one bad path must not stop the sweep
+                stats["errors"] += 1
+                continue
+            self._etags[key] = etag
+            self._cache_check[str(local)] = now
+            stats["warmed"] += 1
+        return stats
+
     # --- writes (with the If-Match fence) ----------------------------------
+    def _body_kwargs(self, path: PathLike, body: bytes) -> dict:
+        """put_object Body kwargs for ``body`` — the PLAINTEXT store bytes.
+
+        g-358-11 unit 3 (transport gzip). Returns the ENCODED form (gzip Body +
+        ``ContentEncoding`` + the plaintext-md5 / codec metadata, see
+        ``_owncloud_codec.put_kwargs``) when the writer flag
+        ``OWNCLOUD_GZIP_STORES`` NAMES this backend's ``env_id`` (the
+        deployment whose store this object belongs to — a peer-board-post
+        backend carries the PEER's env_id and stays plain until that
+        deployment is listed) AND the path's env-scoped logical path
+        (``_rel``, e.g. ``world/aspirations.jsonl``) is on the hot-store
+        allowlist; otherwise ``{"Body": body}`` — byte-for-byte the pre-codec
+        PUT. Both PUT sites (``_put`` and ``_merge_reconcile_put``) call this,
+        and every write path funnels through those two, so the flag governs
+        all writes at one seam.
+
+        Everything around the PUT keeps working on PLAINTEXT: the local mirror
+        write, the manifest baseline stamp (md5 of ``body``), and the merge
+        handlers (``_get_remote_raw`` decodes). Only the wire bytes change; the
+        returned ETag (the fence token) is whatever S3 computed for the stored
+        bytes, opaque to every If-Match / IfNoneMatch use. Default OFF —
+        reader-first rollout (g-328-39): a peer whose reader predates the codec
+        would pull the gzip bytes RAW into its local mirror, so the flag flips
+        only after the fleet-wide + downstream reader attestation."""
+        if _codec_should_encode(self._rel(path), self.env_id):
+            return _codec_put_kwargs(body)
+        return {"Body": body}
+
     def _put(self, path: PathLike, body: bytes) -> WriteResult:
         # g-115-1654: machine-local paths (_EXCLUDE_DIRS / _is_machine_local)
         # must NOT be pushed to S3 -- write the local file only, mirroring
@@ -1059,8 +1325,7 @@ class OwnCloudBackend:
         # through _put, so this single guard covers every write path.
         if self._machine_local(path):
             local = self._local(path)
-            local.parent.mkdir(parents=True, exist_ok=True)
-            local.write_bytes(body)
+            _atomic_write_local(local, body)
             return WriteResult(version=str(local.stat().st_mtime_ns),
                                fallback_used=False)
         # g-115-1875: UNIVERSAL test-isolation tripwire (fires below every
@@ -1085,7 +1350,8 @@ class OwnCloudBackend:
             handler = _coordination_merge_handler(path)
             if handler is not None:
                 return self._merge_reconcile_put(path, key, local, body, handler)
-        kw = dict(Bucket=self.bucket, Key=key, Body=body)
+        kw = dict(Bucket=self.bucket, Key=key)
+        kw.update(self._body_kwargs(path, body))  # g-358-11 transport encode
         fence = self._etags.get(key)
         if fence is None:
             # W1 fix (g-115-2370, from the g-115-2360 RCA of the 2026-07-16
@@ -1190,11 +1456,11 @@ class OwnCloudBackend:
                     "read; re-run the read-modify-write")
             raise
         # PUT succeeded — NOW make the local cache match what S3 holds.
-        local.write_bytes(body)
+        _atomic_write_local(local, body)
         self._etags[key] = r["ETag"]
         self._cache_check[str(local)] = time.monotonic()
         self._diverged_keys.discard(key)  # this write resolved any divergence
-        self._stamp_manifest_baseline(path, body)
+        self._stamp_manifest_baseline(path, body, etag=r["ETag"])
         return WriteResult(version=r["ETag"], fallback_used=False)
 
     def _get_remote_raw(self, key: str):
@@ -1210,7 +1476,8 @@ class OwnCloudBackend:
             if e.response["Error"]["Code"] in _NOT_FOUND:
                 return b"", None
             raise
-        return obj["Body"].read(), obj["ETag"]
+        # g-358-11: merge handlers see PLAINTEXT; the ETag stays the CAS token.
+        return _codec_decode_response(obj, key=key), obj["ETag"]
 
     def _merge_reconcile_put(self, path: PathLike, key: str, local: Path,
                              body: bytes, handler,
@@ -1238,7 +1505,8 @@ class OwnCloudBackend:
                 # it, rather than silently clobbering with un-merged local.
                 raise ConflictError(
                     f"coordination merge failed for {key}: {e}")
-            kw = dict(Bucket=self.bucket, Key=key, Body=merged)
+            kw = dict(Bucket=self.bucket, Key=key)
+            kw.update(self._body_kwargs(path, merged))  # g-358-11 transport encode
             if remote_etag is not None:
                 kw["IfMatch"] = remote_etag  # CAS on the version we merged against
             self._cas_writes += 1  # g-328-21: each merge attempt is a fenced write
@@ -1251,11 +1519,11 @@ class OwnCloudBackend:
                     time.sleep(_conflict_backoff(attempt))
                     continue  # S3 moved during merge; re-GET and re-merge
                 raise
-            local.write_bytes(merged)
+            _atomic_write_local(local, merged)
             self._etags[key] = r["ETag"]
             self._cache_check[str(local)] = time.monotonic()
             self._diverged_keys.discard(key)
-            self._stamp_manifest_baseline(path, merged)
+            self._stamp_manifest_baseline(path, merged, etag=r["ETag"])
             if saw_conflict:
                 self._cas_conflicts_resolved += 1  # g-328-21: retry recovered
                 _LOG.info(
@@ -1590,11 +1858,17 @@ class OwnCloudBackend:
                 if not skey.startswith(prefix):
                     continue  # defense-in-depth: never leak a peer env's claim
                 hb_raw = item.get("heartbeat_at", {}).get("N")
+                # The Scan carries no ProjectionExpression, so `item` already
+                # holds the raw runner_token. It is digested HERE and the raw
+                # value is dropped on the floor — this line is the boundary the
+                # token must not cross (see runner_token_fingerprint).
                 claims.append(RunnerClaim(
                     agent=skey[len(prefix):],
                     machine_id=item.get("machine_id", {}).get("S"),
                     agent_state=item.get("agent_state", {}).get("S", "IDLE"),
-                    heartbeat_at=int(hb_raw) if hb_raw is not None else 0))
+                    heartbeat_at=int(hb_raw) if hb_raw is not None else 0,
+                    runner_token_fp=runner_token_fingerprint(
+                        item.get("runner_token", {}).get("S"))))
             start_key = resp.get("LastEvaluatedKey")
             if not start_key:
                 break

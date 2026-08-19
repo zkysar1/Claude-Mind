@@ -237,6 +237,80 @@ def test_diverged_clone_is_reported_diverged_and_never_advises_reset(tmp_path):
             "banner must not prescribe a destructive reconcile: %r" % (banner,))
 
 
+def _squash_merge_topology(origin: Path, clone: Path) -> None:
+    """Reproduce a PROTECTED-branch estate's permanent ahead-count.
+
+    Upstream lands work SQUASHED (a new sha); the clone reconciles with a merge.
+    The result is a local commit that is not an ancestor of upstream, over a tree
+    that is byte-identical to it. Built with `commit-tree` rather than a real
+    `git merge` so the fixture cannot depend on how git happens to resolve two
+    sides making the same change -- the shape under test is the TREE relation,
+    and constructing it directly is what makes this deterministic.
+    """
+    _commit(clone, "local")                      # clone is now 1 ahead
+    subprocess.run(["git", "-C", str(clone), "fetch", "-q"], check=True)
+    up_tree = subprocess.run(
+        ["git", "-C", str(clone), "rev-parse", "origin/main^{tree}"],
+        capture_output=True, text=True, check=True).stdout.strip()
+    merge = subprocess.run(
+        ["git", "-C", str(clone), "commit-tree", up_tree,
+         "-p", "HEAD", "-p", "origin/main", "-m", "Merge remote-tracking branch"],
+        capture_output=True, text=True, check=True).stdout.strip()
+    subprocess.run(["git", "-C", str(clone), "reset", "-q", "--hard", merge], check=True)
+
+
+def test_ahead_with_identical_tree_is_topological_not_unpushed_work(tmp_path):
+    """guard-1996: on a protected estate the ahead-count measures TOPOLOGY.
+
+    Reporting it as "N unpushed commit(s) -- the push contract was missed" is a
+    false positive on exactly the repos that are healthiest (the ones receiving
+    PR traffic), and it manufactured g-335-1251: a goal to "land 14-day-old
+    unpushed work" whose three named commits had in fact merged the same day
+    they were authored, via PRs #97/#100/#101. Equal tree hashes mean there is
+    nothing to push and a PR would carry an empty diff.
+    """
+    origin = tmp_path / "origin"
+    _init_repo(origin)
+    clone = tmp_path / "Widget"
+    _clone(origin, clone)
+    _squash_merge_topology(origin, clone)
+
+    rec = PRF.freshness(clone, do_fetch=True)
+    assert rec["ahead"] > 0, (
+        "fixture must actually be ahead, else this pins nothing: %r" % (rec,))
+    assert rec["behind"] == 0, rec
+    assert rec["tree_identical"] is True, rec
+    assert rec["verdict"] == "ahead-topological", (
+        "an ahead-count over an IDENTICAL tree is squash-merge topology, not "
+        "stranded work: %r" % (rec,))
+
+    banner = PRF.render([rec], 1)
+    assert banner == "", (
+        "zero content divergence is a CLEAN state -- it must not reach the "
+        "banner at all, or the advisory trains its reader to ignore it: %r"
+        % (banner,))
+
+
+def test_genuine_ahead_still_warns_so_the_topological_case_is_a_discrimination(tmp_path):
+    """The pin above is only meaningful if the tool still catches real stranded
+    work. Same ahead-count, different TREE relation, opposite verdict -- so a
+    mutant that blanket-silences `ahead` fails here, and a mutant that drops the
+    tree check fails above."""
+    origin = tmp_path / "origin"
+    _init_repo(origin)
+    clone = tmp_path / "Widget"
+    _clone(origin, clone)
+    _commit(clone, "genuinely-unpushed")
+
+    rec = PRF.freshness(clone, do_fetch=True)
+    assert rec["verdict"] == "ahead", rec
+    assert rec["tree_identical"] is False, (
+        "trees genuinely differ here -- the check must have RUN and said so, "
+        "not been skipped: %r" % (rec,))
+    banner = PRF.render([rec], 1)
+    assert "push contract was missed" in banner, banner
+
+
 def test_repo_without_upstream_reports_no_upstream_not_in_sync(tmp_path):
     """A local-only branch has no remote to be fresh against. Calling that
     'in-sync' would silently promote 'unknown' to 'good'."""
@@ -393,7 +467,12 @@ def test_a_goal_that_simply_names_no_repo_stays_silent(monkeypatch, capsys):
     a failure -- it must stay quiet, or the advisory speaks on the common path
     and gets tuned out. Collapsing these two cases is what made the bug silent.
     """
-    monkeypatch.setattr(PRF, "goal_text", lambda gid, src: ("unrelated text", True))
+    # `meta=None` matches goal_text's out-dict contract (). The stub
+    # leaves it UNSET on purpose: an absent work_class is exactly the condition
+    # under which this test's assertion must hold, so the silence it pins is
+    # still pinned for the same reason it always was. Only the signature moved.
+    monkeypatch.setattr(PRF, "goal_text",
+                        lambda gid, src, meta=None: ("unrelated text", True))
     monkeypatch.setattr(PRF, "enumerate_repos", lambda: [Path("/x/Widget")])
     rc = PRF.main(["--goal-id", "g-1-1", "--no-fetch"])
     cap = capsys.readouterr()
@@ -444,3 +523,65 @@ def test_run_wrapper_does_not_exec_a_shell_script_without_an_interpreter():
         "exec bit and shebang are honored, which Windows does not do. Note "
         "guard-580's gate greps for [\"bash\", ...] literals and does NOT catch "
         "the no-interpreter form. body=%r" % (joined[:400],))
+
+
+# ---------------------------------------- the GENERATION-side call site ()
+
+GEN_SKILL = PROJECT_ROOT / ".claude" / "skills" / "generate-domain-goals" / "SKILL.md"
+
+
+def _section(text, header):
+    """The named '## ' section body, exclusive of the next '## '."""
+    return text.split(header, 1)[1].split("\n## ", 1)[0]
+
+
+def test_recon_asserts_clone_freshness_before_reading_product_repos():
+    """Phase 2 must FETCH-ASSERT before it reads, not merely warn about staleness.
+
+    g-115-6289. The gauntlet's adversarial re-probe (Phase 4) deliberately runs
+    from a different CONTEXT than the generator -- but against the SAME working
+    tree. So a stale clone makes both sides read identical stale bytes and
+    AGREE, and the resulting candidate looks better-evidenced than average
+    precisely because a citation was checked. Independence of context is not
+    independence of data source.
+
+    Anchored on the invocation LINE, not on the paragraph that explains the
+    rule: this insertion is mostly prose, and that prose names the script
+    repeatedly, so an unanchored grep would pass against a version with the
+    explanation and no command (guard-1099 verbatim).
+    """
+    text = GEN_SKILL.read_text(encoding="utf-8")
+    phase2 = _section(text, "## Phase 2: Recon")
+    code = [ln for ln in phase2.splitlines() if ln.strip().startswith("Bash:")]
+    assert code, "Phase 2 carries no executable line at all; got %r" % (phase2[:200],)
+    assert any("product-repo-freshness.py" in ln and "--repo" in ln for ln in code), (
+        "Phase 2 must assert clone freshness BEFORE reading the surfaces, via "
+        "the existing SSOT helper in its --repo shape. Without it the generator "
+        "and the Phase 4 verifier read the same stale tree and agree. got %r"
+        % (code,))
+
+
+def test_recon_tells_the_reader_that_silence_is_not_an_all_clear():
+    """The advisory is silent when clean, so a NEW call site must say how to
+    tell 'checked and clean' from 'never ran' -- otherwise this wiring
+    reproduces the very vacuity the helper was built to fix (guard-1084, and
+    the script's own CANNOT CHECK branch). `cannot_check` is the field that
+    distinguishes them, so the step has to name it."""
+    phase2 = _section(GEN_SKILL.read_text(encoding="utf-8"), "## Phase 2: Recon")
+    assert "cannot_check" in phase2, (
+        "Phase 2 must direct the reader to cannot_check; a silent advisory and "
+        "an advisory that never ran are otherwise byte-identical")
+
+
+def test_the_gauntlet_reasserts_the_clone_at_verify_time():
+    """Phase 2 alone is not sufficient and the gap is not theoretical: a partner
+    can push between recon and verification, so the tree that backed a citation
+    at read time can be behind by the time it is re-probed. The gauntlet
+    therefore re-asserts rather than trusting the Phase 2 result."""
+    gauntlet = _section(GEN_SKILL.read_text(encoding="utf-8"), "## Phase 4: VERIFY BEFORE FILING")
+    assert "product-repo-freshness.py" in gauntlet and "--repo" in gauntlet, (
+        "Phase 4 item 3 must re-assert the cited clone; its re-probe otherwise "
+        "reads the same tree the generator did and proves nothing about origin")
+    assert "PARTIAL" in gauntlet, (
+        "a citation from a behind>0 clone must be capped at PARTIAL, not "
+        "allowed to pass as VERIFIED")

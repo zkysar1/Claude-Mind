@@ -189,17 +189,26 @@ def slug_for(file_path) -> str:
     return slug or "pointer"
 
 
-def open_goal_exists(origin_signal: str, world_dir, agent_dir) -> bool:
-    """True if an OPEN goal with this origin_signal already exists in the world
-    or agent aspirations file. Direct JSONL read (daemon-free) so dedup works
-    even when the daemon is down. Fail-open: any error returns False (we then
-    attempt to file; the daemon's own duplication gate is the backstop)."""
+def open_goal_records(origin_signal: str, world_dir, agent_dir) -> list:
+    """Every OPEN goal carrying this origin_signal, as a list of goal dicts each
+    augmented with a "_source" key ("world" or "agent") naming the queue it came
+    from -- the value downstream `aspirations-*.sh --source` calls require.
+
+    Direct JSONL read (daemon-free) so callers work even when the daemon is
+    down. Fail-open: any error yields fewer records, never an exception.
+
+    A caller that only needs presence should use `open_goal_exists`, which
+    delegates here. The id-returning form exists because a filer that cannot
+    name the goal it deduped against also cannot CLOSE that goal when the
+    condition clears -- which is how box-scoped watchdog goals outlived their
+    condition by 7-17 days (g-115-4868)."""
+    out = []
     candidates = []
     if world_dir:
-        candidates.append(Path(world_dir) / "aspirations.jsonl")
+        candidates.append(("world", Path(world_dir) / "aspirations.jsonl"))
     if agent_dir:
-        candidates.append(Path(agent_dir) / "aspirations.jsonl")
-    for p in candidates:
+        candidates.append(("agent", Path(agent_dir) / "aspirations.jsonl"))
+    for source, p in candidates:
         try:
             if not p.exists():
                 continue
@@ -218,14 +227,21 @@ def open_goal_exists(origin_signal: str, world_dir, agent_dir) -> bool:
                     for goal in obj.get("goals", []):
                         if (goal.get("origin_signal") == origin_signal
                                 and goal.get("status") in OPEN_STATUSES):
-                            return True
+                            out.append(dict(goal, _source=source))
                     # Defensive: also honor a flat goal-shaped line.
                     if (obj.get("origin_signal") == origin_signal
                             and obj.get("status") in OPEN_STATUSES):
-                        return True
+                        out.append(dict(obj, _source=source))
         except OSError:
             continue
-    return False
+    return out
+
+
+def open_goal_exists(origin_signal: str, world_dir, agent_dir) -> bool:
+    """True if an OPEN goal with this origin_signal already exists in the world
+    or agent aspirations file. Fail-open: any error returns False (we then
+    attempt to file; the daemon's own duplication gate is the backstop)."""
+    return bool(open_goal_records(origin_signal, world_dir, agent_dir))
 
 
 def file_drift_goal(pointer_file, marker: dict, slug: str, project_root) -> dict:

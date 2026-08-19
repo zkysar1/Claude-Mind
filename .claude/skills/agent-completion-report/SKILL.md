@@ -5,6 +5,7 @@ user-invocable: true
 triggers:
   - "/agent-completion-report"
 tools_used: [Bash, Read, Write]
+companion_scripts: [core/scripts/completion-digest.sh, core/scripts/notify-user.sh]
 conventions: [aspirations, pipeline, tree-retrieval, reasoning-guardrails, board]
 minimum_mode: reader
 revision_id: "skill-bootstrap-agent-completion-report-ca45dd"
@@ -85,6 +86,59 @@ All data comes from framework scripts — no direct JSONL reads.
    # records in each trailing window, `--stage resolved` alone sees 100% at 2d
    # but only 75.9% at 7d and 29.8% at 30d — i.e. a week-long report silently
    # drops a quarter of its own subject matter. (g-115-4866.)
+   #
+   # ⚠ THOSE PERCENTAGES HAVE DECAYED — RE-MEASURE, DO NOT QUOTE THEM. Two
+   # independent measurements on 2026-08-15, hours apart on different boxes,
+   # each carrying its denominator (guard-3542 — a coverage rate over a moving n
+   # is meaningless without it):
+   #   bravo, cc-05, 6.8.0-137-generic, 216.1h window: 47 of 199 = 23.6% at 9d.
+   #     Store split at that instant: 50 resolved vs 1,127 archived.
+   #   alpha, cc-08, 6.8.0-137-generic,  48.5h window: 22 of  35 = 62.9% at 2d.
+   #     Store split at that instant: 34 resolved vs 1,148 archived.
+   # THE SECOND ONE IS THE LOAD-BEARING DATAPOINT, and it breaks the model the
+   # rest of this comment implies. The 2026-08-04 row reads coverage as a
+   # function of WINDOW WIDTH (100% at 2d, degrading to 29.8% at 30d), which
+   # invites the reading that a short report is safe. It is not: the 2-DAY
+   # figure itself fell 100% -> 62.9% in eleven days. A same-session report is
+   # the ONLY case still near-exact, and even that is not guaranteed to hold.
+   # So the resolved stage is not a time window with a fixed width; its
+   # effective lookback is set by ARCHIVAL CADENCE, and that cadence keeps
+   # tightening (2026-08-04: 86 resolved over ~4.5d; 2026-08-15: 50 then 34,
+   # both over ~2.3d or less, at a HIGHER resolution rate).
+   #
+   # RE-MEASURED 2026-08-18 (echo, cc-03, 6.8.0-137-generic, 15.35h report
+   # window). Store split at that instant: 49 resolved vs 1,204 archived.
+   #   same-day (2026-08-18):    6 of   6 = 100%
+   #   spanning 08-17 (~39h):   27 of  38 = 71.1%
+   #   lifetime:                47 of 811 = 5.8%
+   # THE 2-DAY FIGURE WENT BACK UP — 62.9% (08-15) -> ~71% (08-18). So the
+   # decay narrated above is NOT monotonic, and reading it as a trend line is
+   # the wrong model: it oscillates with archival cadence. Do not "correct" the
+   # 08-15 row toward this one; both are true readings of a quantity that moves
+   # in both directions, which is exactly why the instruction is to re-measure
+   # rather than to quote.
+   # AND DISCOUNT THE 100% (guard-2303 — check the instrument's resolution
+   # before reporting a change-detection result): `outcome_date` is DATE-ONLY,
+   # so a same-DAY window and the field's granularity are the same size. A
+   # same-day 100% is partly the instrument saying "I cannot resolve inside
+   # this window", not purely the store being complete. The 71.1% row spans two
+   # calendar days and is the more informative one.
+   #
+   # RE-MEASURED 2026-08-19 (zeta, cc-02, 6.8.0-137-generic, 79.6h window —
+   # 1,259 records / 6,092,274 B across BOTH stages): in-window 68, scoreable
+   # 50 = 73.5%. This row is here because it kills the LAST surviving piece of
+   # the width model: a 3.3-DAY window read 73.5%, ABOVE the 2-DAY 62.9% of
+   # 08-15 and level with the ~39h 71.1% of 08-18. Coverage is not a decreasing
+   # function of window width — a wider window can and did score higher. Only
+   # archival cadence sets it, so a NARROW window buys you nothing and no row
+   # here predicts your run.
+   #
+   # The instruction is unchanged and is now stronger: read BOTH stages. What
+   # changes is that no fixed percentage here can be trusted as guidance — the
+   # number is a snapshot of a moving quantity (guard-390: an artifact
+   # describing external state must cite what keeps it current; nothing does
+   # here). COMPUTE the coverage in your own run — you already hold both
+   # populations — and correct this comment in passing when it has moved again.
    Bash: bash core/scripts/pipeline-read.sh --stage resolved
    Bash: bash core/scripts/pipeline-read.sh --stage archived
    → Filter the UNION where outcome_date >= since date
@@ -126,7 +180,25 @@ All data comes from framework scripts — no direct JSONL reads.
         Bash: bash core/scripts/board-read.sh --channel <channel> --since {hours}h --json
       ELSE (lifetime):
         Bash: bash core/scripts/board-read.sh --channel <channel> --json
-      → Parse JSON output → store messages per channel
+      → The output is JSONL — one object per LINE, NOT a JSON array. A
+        whole-stream json.load raises JSONDecodeError("Extra data: line 2
+        column 1"). Parse line-by-line:
+          [json.loads(l) for l in out.splitlines() if l.strip().startswith("{")]
+      → A bare `except` around that parse is FORBIDDEN. It launders the raise
+        into 0, and the report then states the board was silent — a claim about
+        fleet coordination health. Measured 2026-08-03 (foxtrot): general 23 /
+        findings 248 / coordination 436 / decisions 13 = 720 messages reported
+        as 0. The 2026-08-02 report hit the identical zero and correctly
+        diagnosed it in its NARRATIVE, and the next run reproduced it unchanged
+        — because the narrative is not what the next agent executes; this file
+        is. That is why the fix belongs here and not in another report.
+      → POSITIVE-CONTROL a zero before believing it (guard-2421). This defect is
+        self-concealing: an empty board is a plausible reading, so nothing
+        prompts a second look. If a channel returns 0, re-read it at a wide
+        window (--since 720h) or check for a known post-id. Cheapest check
+        first: if you already hold a prior measurement that contradicts the
+        empty, believe the prior one and re-read.
+      → store messages per channel
       → Skip channels that output "is empty or does not exist"
     Cap: max 10 most recent messages per channel.
     If more exist, note: "... and {N} earlier messages"
@@ -294,6 +366,26 @@ Since: {since_timestamp} ({hours}h {min}m ago)
 
   If knowledge_debt_count == 0 AND debt_closure_events == 0: omit entire section.
 
+## Message Board — {total messages} in {hours}h (or "lifetime")
+  # Renders board_messages, collected in Phase 2 Step 10. This section was
+  # ABSENT from Phase 3 until 2026-08-09 while Step 10 still stored the data:
+  # board_messages was written and never read, so the rendering survived on the
+  # executing agent's inference rather than on instruction. It happened to keep
+  # working, which is why nothing surfaced it. Same lesson as Step 10's own —
+  # what is not written here is not what the next agent executes.
+  {For each channel in board_messages that has at least one message:}
+    - {channel} ({N}): {For each message, max 10, most recent first:}
+        {timestamp} {author}: {text, 120 chars}
+      {IF N > 10:} ... and {N - 10} earlier messages
+  {IF every channel is empty:}
+    Do NOT write an unqualified "board quiet". Name the control that
+    established the zero (e.g. "0 at 24h AND 0 at a 720h re-read") — an
+    unqualified zero here IS the false zero Step 10 warns about, and this
+    section is where it reaches the user as a claim about fleet coordination
+    health. A genuinely quiet board is plausible, so nothing else will prompt
+    a re-check.
+  (Channels with zero messages are omitted.)
+
 ## Outcome Delta
   {IF outcome_delta_available is false:}
     No outcome signal configured.
@@ -446,54 +538,81 @@ Note: `agents/<agent>/COMPLETION-REPORT.md` is the single latest-pointer report,
    Bash: echo "$(date +%Y-%m-%dT%H:%M:%S)" > agents/<agent>/session/last-report-timestamp
 ```
 
-## Phase 5.5: Notify the User
+## Phase 5.5: Notify the User — send the FLEET DIGEST, not the report
 
 The completion report is a primary user-visibility event — the user should
-receive it, not just find it on disk.
+receive it, not just find it on disk. But the file written in Phase 4 is BY an
+agent FOR agents (forensic, trap-numbered, no goal listed by name); the user's
+2026-08-17 direction is: "I do like receiving what goals are blocked or
+assigned to me through the completion report email — make them easier to
+read, be sure everything I need to quickly understand how it has been going is
+in there — as long as I receive one every day or two that is good." So the
+EMAIL is the deterministic user-facing digest, and the on-disk report stays
+the agents' forensic record.
 
-Notify the user about the completion report.
-(Check `world/forged-skills.yaml` for a skill whose triggers match "notify
-the user" and invoke it with:
-- category: `completion`
-- subject: build a stats-summary subject from the report data, e.g.,
-  `"Completion Report ({since_label}, {N} goals, {N_deep} deep)"`
-  (real example: `"Completion Report (31h, 6 goals, 1 deep)"`)
-- message-file: `agents/<agent>/COMPLETION-REPORT.md`
-  This is the latest-pointer file overwritten in Phase 4 Step 2 — it
-  always reflects the just-finished report — it is the single report file
-  written (its git history is the archive). This stable path eliminates the
-  timestamp-threading drift between Phase 4 and Phase 5.5 that an earlier
-  timestamped-archive design suffered. (N2 fresh-eyes finding, 2026-05-20.)
+```
+1. Build the digest (framework script reads the stores; do not hand-write it):
+   Bash: bash core/scripts/completion-digest.sh --agent <agent> \
+           --since <the since-timestamp Phase 1 resolved> \
+           [--notes-file agents/<agent>/session/digest-notes.md] \
+           --out agents/<agent>/session/fleet-digest.md \
+           --html-out agents/<agent>/session/fleet-digest.html
+   Both files carry the same data: the .md is the plain text the gates, ledger
+   and dedup read; the .html is what the user actually opens (cards, tables,
+   real bold — the 2026-08-17 "all text, hard to read, weird line breaks"
+   feedback).
+   --notes-file is OPTIONAL and bounded (<=12 lines): write it ONLY when you
+   have something the reader needs that the stores cannot say -- a decision
+   you took that he might override, a risk you see. Never restate the numbers.
 
-The notify skill MUST consume the file via `--message-file` (not via a
-re-constructed prose summary). The 2026-05-20 incident — completion
-emails arriving with only Title + UTC + reply-footer because the LLM
-hand-constructed an empty Body — was caused by re-summarizing the
-already-rich report file into a prose blurb that got dropped. The file
-on disk IS the deliverable; pass its path through.
+2. Send it through the framework chokepoint (routing gate + fleet-wide
+   prior-outreach dedup + sent ledger; the domain transport is the
+   world/scripts/notify-transport.sh slot):
+   Bash: bash core/scripts/notify-user.sh --agent <agent> --category user-digest \
+           --subject "Fleet digest — $(date +%Y-%m-%d)" \
+           --message-file agents/<agent>/session/fleet-digest.md \
+           --builder-arg=--html-file --builder-arg=agents/<agent>/session/fleet-digest.html \
+           --builder-arg=--disproof-waived \
+           --builder-arg="deterministic store-derived digest (completion-digest.sh); goal titles and question text are quoted verbatim from the records, whose claims were gated when filed"
+   The waiver is REQUIRED, not optional: the finding-disproof gate in
+   notify-build-payload.py matches universal/causal wording, and a digest
+   quoting 50 goal titles will always contain some. The digest is not an
+   agent-authored finding — the builder is the author and it makes no claims of
+   its own. Do NOT use this waiver for anything you wrote yourself.
+   rc 0 = sent.  rc 4 = another agent (or world) already sent a digest inside
+   the 20h window -- CORRECT, not a failure: the user asked for one every day
+   or two, not one per agent per cadence. Do NOT --allow-duplicate a digest.
+   rc 3/5/6 = see /notify-user Step 2; never block on it, the report is on disk.
+```
 
-The `notify-build-payload.py` helper (called by /notify-user Step 2)
-will refuse the send with rc=2 if the message body is too short, so a
-missing or trivial report file fails loud instead of producing a blank
-email.
+Category is `user-digest` (ALWAYS_SEND in `notification_routing_gate.py`) —
+NOT `completion`, which is the status-blurb category the routing gate
+suppresses fleet-wide (processor runs, rollbacks, per-goal closes). The digest
+is the batched "what needs you / what is blocked / how it is going" list that
+suppression re-routes INTO, so it is the one email the policy exists to keep.
 
-If no matching skill is registered, fall back to a `participants: [agent, user]`
-goal via `aspirations-add-goal.sh` with title
-`"User Notice: Completion Report available"` and
-`origin_signal: "idea:completion-report-available"`. Never block completion-report
-generation on notification failure — the report is already on disk.)
+The digest builder consumes the stores directly (`--message-file` semantics
+preserved: the file on disk IS the deliverable, never a re-summarised prose
+blurb — the 2026-05-20 blank-email incident). `notify-build-payload.py`
+refuses a too-short body with rc=2, so a missing digest fails loud.
+
+If `core/scripts/notify-user.sh` reports rc 5 (no transport slot in this
+world), fall back to a `participants: [agent, user]` goal via
+`aspirations-add-goal.sh` with title `"User Notice: Fleet digest available"`
+and `origin_signal: "idea:completion-report-available"`. Never block
+completion-report generation on notification failure.
 
 The skill ends here. Goal status management (if any) is the caller's responsibility.
 
 ## Chaining
 
 - **Called by**: User directly, OR by other skills (e.g., status report wrappers)
-- **Calls**: Notification forged skill (resolved via `world/forged-skills.yaml`) in Phase 5.5
-- **Modifies**: `agents/<agent>/session/last-report-timestamp`, `agents/<agent>/COMPLETION-REPORT.md`, `agents/<agent>/session/last-outcome-snapshot.yaml`
+- **Calls**: `core/scripts/completion-digest.sh` (digest builder) then `core/scripts/notify-user.sh --category user-digest` (framework dispatcher → domain transport slot) in Phase 5.5
+- **Modifies**: `agents/<agent>/session/last-report-timestamp`, `agents/<agent>/COMPLETION-REPORT.md`, `agents/<agent>/session/last-outcome-snapshot.yaml`, `agents/<agent>/session/fleet-digest.md`
 
 ## Return Protocol
 
 See `.claude/rules/return-protocol.md` — last action must be a tool call, not text.
-The terminal action is Phase 5.5's notification invocation (or its
+The terminal action is Phase 5.5's `notify-user.sh` invocation (or its
 `aspirations-add-goal.sh` fallback). The report files on disk are the
 deliverable; do not append a text summary.

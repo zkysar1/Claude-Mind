@@ -173,7 +173,71 @@ argv_strict_refuse_extra_positional() {
     exit 2
 }
 
-# argv_strict_help <script-name> <positional-form> <accepted-flags>
+# argv_strict_refuse_flaglike_value <script-name> <flag> <value> [accepted-flags]
+#
+# WHY A FOURTH ENTRY POINT ()
+# The three helpers above guard the FLAG position and the POSITIONAL position.
+# All three are structurally blind to the VALUE position, and not by oversight: a
+# token consumed as a flag's value never reaches the `-*)` arm at all, so the
+# unknown-flag refusal cannot see it no matter how strict it becomes. A
+# value-taking flag whose value is MISSING therefore swallows the NEXT FLAG as its
+# value, and the command answers a question nobody asked with exit 0.
+#
+# MEASURED on aspirations-query.sh (cc-07, uname -r 6.8.0-136-generic,
+# 2026-08-10), same store, same term, varying only the trailing flag:
+#     --title-contains 'directive-lane'                         -> n=20
+#     --title-contains 'directive-lane' --goal-field status pending -> n=12  (composes)
+#     --title-contains 'directive-lane' --goal-field id --full  -> n=0   (id == "--full")
+#     --title-contains 'directive-lane' --goal-status --full    -> n=0   (status == "--full")
+# Note the second line: the composition works. The zeros come from the value slot
+# eating a flag, NOT from the filters conflicting — which is what  was
+# filed believing, on a reading taken before the unknown-flag refusal existed.
+#
+# WHY IT REFUSES EVEN A PLAUSIBLE-LOOKING VALUE. 306 of 6086 live goal titles
+# contain a `--token` (122 distinct), so `--title-contains '--apply'` is a real
+# thing to want, and this refusal blocks it. That trade is deliberate and cheap in
+# ONE direction only: --title-contains is a SUBSTRING match, so dropping the
+# leading dashes never loses a match, while a silent zero is a false negative that
+# ends an investigation. The message therefore names the workaround rather than
+# just the rule.
+#
+# Exit 2, same contract as the three helpers above. Tests MUST pin rc == 2, not
+# merely non-zero: the daemon transport path also exits non-zero.
+argv_strict_refuse_flaglike_value() {
+    local script="$1" flag="$2" value="$3" accepted="${4-}"
+    # An EMPTY value is a different defect (value missing at end of argv) and is
+    # already caught loudly downstream by each wrapper's "filter required" check —
+    # do not claim it here, or that clearer error is replaced by a vaguer one.
+    case "$value" in
+        -?*) ;;
+        *) return 0;;
+    esac
+    {
+        printf "%s: %s was given '%s', which is a flag, not a value — refusing.\n" \
+            "$script" "$flag" "$value"
+        printf '  A value-taking flag whose value is MISSING swallows the NEXT FLAG as its\n'
+        printf '  value, so the command silently answers a different question and still exits\n'
+        printf '  0 (g-115-5128). A token eaten as a value never reaches the unknown-flag\n'
+        printf '  refusal, so that guard structurally cannot catch this one.\n'
+        printf '  If you did mean a literal value starting with "-": substring filters match\n'
+        printf '  anywhere, so drop the leading dashes — "apply" matches "--apply".\n'
+        if [ -n "$accepted" ]; then
+            printf '  Accepted flags: %s\n' "$accepted"
+        fi
+    } >&2
+    exit 2
+}
+
+# argv_strict_help <script-name> <positional-form> <accepted-flags> [<extra-note>]
+#
+# <extra-note> is OPTIONAL and prints last, after the refusal explanation. It
+# exists for facts a caller needs that are not flags — e.g. what keys a wrapper's
+# default projection emits (), which is invisible from the flag list
+# and is exactly what a caller guesses wrong. All 7 existing callers pass three
+# args and are unaffected: the parameter defaults to empty and prints nothing.
+# Deliberately NOT folded into <accepted-flags>: that literal is shared with the
+# REFUSAL messages, so anything added there would print on every unknown-flag
+# error too.
 #
 # WHY THIS SHIPS ALONGSIDE THE REFUSAL ()
 # `--help` is a `-*` token, so the refusal above catches it too — and turning
@@ -188,11 +252,17 @@ argv_strict_refuse_extra_positional() {
 # arm, calling this. Exits 0 — help is a successful invocation, not an error, and
 # a caller piping `--help` into a script must not see rc=2.
 argv_strict_help() {
-    local script="$1" form="$2" accepted="$3"
+    local script="$1" form="$2" accepted="$3" extra="${4:-}"
     printf 'Usage: %s %s\n' "$script" "$form"
     printf '  Accepted flags: %s\n' "$accepted"
     printf '  Any other flag is REFUSED with exit 2 (g-115-4733) — it is not silently\n'
     printf '  dropped, and the token after it is not promoted into a positional slot.\n'
+    # An `if`, NOT `[ -n "$extra" ] && printf`: adopting wrappers run under
+    # `set -e`, where that && list returns 1 whenever extra is empty (the case
+    # for all 7 three-arg callers) and would kill the script before `exit 0` —
+    # turning --help into a non-zero exit, which is precisely the regression
+    # the block above says this function exists to prevent.
+    if [ -n "$extra" ]; then printf '%s\n' "$extra"; fi
     exit 0
 }
 

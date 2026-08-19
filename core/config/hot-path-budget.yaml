@@ -1,0 +1,85 @@
+# core/config/hot-path-budget.yaml — the hot-path SET and its new-file caps
+# (, 2026-08-18).
+#
+# "Hot path" = prose that loads on EVERY turn (CLAUDE.md, every unscoped
+# .claude/rules/*.md) or on EVERY loop iteration (the aspirations* skills,
+# worker-loop, boot / prime / respond, the loop digest). A byte added here is
+# paid on every compaction cycle of every agent, forever — so growth here is
+# refused at commit time and has to be routed to an on-demand home instead
+# (core/config/rationale/, core/config/conventions/, the tree, the reasoning
+# bank). Convention: core/config/conventions/hot-path-size-budget.md.
+#
+# Enforced by core/githooks/commit-msg -> core/scripts/hot-path-size-gate.py:
+#   * a TRACKED member may not be larger in the commit than it is at HEAD.
+#     The cap IS the size at HEAD, so every shrink tightens the cap on its own
+#     and a diet commit needs no registry edit to lock in its gain;
+#   * a NEW member (untracked at HEAD) may not exceed its set's `new_file_cap`;
+#   * a commit-message trailer `size-budget-override: <why>` bypasses either
+#     rule for that one commit and is written to
+#     world/override-bypass-ledger.jsonl (gate `hot-path-size-gate`) — the
+#     count of those rows is the metric to watch;
+#   * merge commits are not gated (MERGE_HEAD present): a merge combines
+#     already-gated commits, and gating it would wedge every box's pull.
+#
+# There are deliberately NO per-file byte numbers in this file — HEAD is the
+# ratchet. `bash core/scripts/hot-path-size-gate.sh --check` prints the current
+# sizes and ratchets the corpus total in meta/audit-baselines.yaml
+# (`hot_path_total_bytes`, lower_is_better).
+#
+# Globs: `*` and `?` never cross a `/`; `**` does. A path with no wildcard is a
+# literal member. To budget a new surface, add a set (or a path to a set) —
+# never edit the gate script for a new file.
+version: 1
+override_trailer: "size-budget-override:"
+sets:
+  - name: claude-md
+    paths: ["CLAUDE.md"]
+    new_file_cap: 65536
+  - name: rules
+    paths: [".claude/rules/*.md"]
+    # A NEW always-loaded rule is ~two screens; anything larger belongs partly
+    # in a convention, or should be `paths:`-scoped in its front matter so it
+    # loads only when a matching file is touched.
+    new_file_cap: 8192
+  - name: loop-skills
+    paths: [".claude/skills/aspirations*/SKILL.md", ".claude/skills/worker-loop/SKILL.md"]
+    new_file_cap: 16384
+  - name: session-skills
+    paths: [".claude/skills/boot/SKILL.md", ".claude/skills/prime/SKILL.md", ".claude/skills/respond/SKILL.md"]
+    new_file_cap: 16384
+  - name: loop-digest
+    paths: ["core/config/aspirations-loop-digest.md"]
+    new_file_cap: 40960
+
+  # ── SECOND TIER: on-demand skills () ────────────────────────────
+  # MUST STAY LAST. `set_for` is first-match, so the hot-path sets above claim
+  # the aspirations*/worker-loop/boot/prime/respond skills and keep their
+  # stricter RATCHET rule; this set picks up everything else under
+  # .claude/skills/, base and forged alike.
+  #
+  # DIFFERENT RULE, DELIBERATELY: `ceiling` (not a ratchet). A skill is paid
+  # only when INJECTED, so the binding constraint is "must fit in one
+  # injection", not "never grow". Below the ceiling a skill grows freely — a
+  # ratchet across 120 skills would generate constant override noise for
+  # changes that cost nothing. Above it, only GROWTH is refused: an
+  # over-ceiling file may shrink or stay flat, so the extraction that fixes it
+  # is never blocked.
+  #
+  # WHY 65536: measured, not chosen. On 2026-08-18 four skill injections
+  # averaged 63,515 B, and an 88,887 B skill (start/SKILL.md) arrived in
+  # context explicitly truncated. A skill over this line reaches the model with
+  # its later content silently absent — for verify-learning/SKILL.md at
+  # 1,208,426 B that is most of the file, which is why a VERIFICATION skill
+  # could not see most of its own checks ().
+  #
+  # Blast radius when introduced: 16 of 120 skills were over the line, holding
+  # 62% of all skill bytes; 104 already complied. Nine of the sixteen were
+  # already governed by the hot-path sets above, so this tier newly constrains
+  # seven files totalling 1,850,572 B that nothing governed before.
+  # No `new_file_cap` here on purpose: a ceiling set bounds NEW files by its
+  # ceiling too, so a second number would be accepted, validated, and then never
+  # consulted. The loader refuses a ceiling set that declares a DIFFERENT
+  # new_file_cap rather than silently preferring one ( review).
+  - name: on-demand-skills
+    paths: [".claude/skills/*/SKILL.md"]
+    ceiling: 65536

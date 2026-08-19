@@ -36,8 +36,8 @@ STRICT=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --source)  SOURCE="$2"; shift 2 ;;
-    --target)  TARGET="$2"; shift 2 ;;
+    --source)  SOURCE="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+    --target)  TARGET="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
     --json)    JSON_OUTPUT=true; shift ;;
     --strict)  STRICT=true; shift ;;
     -h|--help)

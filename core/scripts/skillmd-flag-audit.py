@@ -83,14 +83,45 @@ UNVALIDATABLE = {
 # describing common plumbing, it is blanket-suppressing the four most frequently
 # typed flags in the codebase, and any real mismatch on them is invisible.
 #
-# LEFT IN PLACE DELIBERATELY, pending . Removing entries here RAISES
-# the finding count, and 's sequencing rule is explicit: land the set,
-# then seed the floor ONCE, or the seed encodes a transient. The six FIXes in
-# this file landed together and the floor is seeded against them; changing the
-# suppression set is a separate surface change whose false-positive rate is
-# UNMEASURED (a wrapper that forwards "$@" to a daemon accepting --json would
-# flag as a mismatch while being perfectly correct). Measure that FP rate first.
-UNIVERSAL_FLAGS = {"--help", "-h", "--json", "--output", "--source", "--agent"}
+# THE FOUR ARE NOW REMOVED (, measured 2026-08-11, alpha, hostname
+# cc-08, uname -r 6.8.0-137-generic). The prior note deferred this because
+# "removing entries here RAISES the finding count" and the FP rate was UNMEASURED.
+# Both premises were tested one flag at a time, patching only this constant and
+# running the real main():
+#
+#     removed alone   --source   --agent   --output   --json     ALL FOUR
+#     newly surfaced      0          0         0         0           0
+#     finding_count       5          5         5         5           5
+#
+# THE FP RATE IS 0/0 — UNDEFINED, NOT LOW, and the distinction is the whole
+# result. Removal surfaces nothing to classify, so there was never a false
+# positive to fear; there was also never a real mismatch being hidden. The prior
+# note's "any real mismatch on them is invisible" is therefore measurably false
+# ON THIS CORPUS, exactly as its own "not near-universal" measurement was false
+# in the other direction.
+#
+# THAT ZERO IS NOT "NO OPPORTUNITY" (rb-245 — a zero-count claim needs a probe
+# that the number can move at all). Two controls: adding a flag a real finding
+# names drops the count 5 -> 4, so the harness is wired; and 394 SKILL.md call
+# sites pass one of these four (--source 169, --json 144, --output 48,
+# --agent 33), so the suppression had 394 chances to hide a mismatch and hid
+# none. Every one of those call sites passes a flag its callee genuinely accepts.
+#
+# CONSEQUENCE FOR THE FLOOR: the count does not move, so 's sequencing
+# rule is satisfied with ZERO re-seeds — the blocker that deferred this work did
+# not exist. Do not re-seed for this change; meta/audit-baselines.yaml
+# skillmd_flag_mismatches stays at 5.
+#
+# --help/-h STAY, and are the only genuinely load-bearing members: emptying the
+# whole set surfaces exactly ONE finding, blocker-create-gate.py --help, which is
+# the argparse auto-flag FP (py_flags reads add_argument via AST and argparse
+# never declares --help explicitly). Removing them would report a real accepted
+# flag as unknown. sh_flag_surface already exempts them from refusal
+# classification for the same reason.
+#
+# Re-run before trusting this on a changed corpus: the numbers above are a
+# property of today's call sites, not of the flags.
+UNIVERSAL_FLAGS = {"--help", "-h"}
 
 _CASE_ARM = re.compile(r"^\s*\(?\s*((?:-{1,2}[A-Za-z0-9][A-Za-z0-9_-]*\s*\|\s*)*-{1,2}[A-Za-z0-9][A-Za-z0-9_-]*)(?:=\*)?\s*\)")
 _FLAG_TOKEN = re.compile(r"(?<![\w-])(--[A-Za-z][A-Za-z0-9-]*)")

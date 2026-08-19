@@ -9,6 +9,17 @@
 #   - core/scripts/scoring-criterion-audit.py  (the recommender that consumes
 #     this file + scans the live goal corpus)
 #   - meta/scoring-criterion-audit.jsonl  (append-only audit log)
+#   - core/scripts/scorer-criterion-contribution-probe.sh  (gap-033) — the third
+#     question in the set, and the one neither of the above answers. A grep over
+#     goal-selector.py answers "is the term WIRED?"; scoring-criterion-audit.sh
+#     answers "is its INPUT FIELD POPULATED?"; the probe answers "does it MOVE
+#     THE RANKING?" A criterion can pass both of the first two and still be
+#     decisively inert — measured 2026-08-19 on 1301 live candidates, `priority`
+#     fires on 100% and shifts 97.9% of them while leaving the top pick
+#     UNCHANGED. It derives fires / magnitude / rank-delta / noise-free-rank by
+#     subtraction on ONE selector run: re-running RE-ROLLS exploration_noise
+#     (guard-3562), so a two-run diff cannot separate a term's effect from the
+#     lottery — single-run is a correctness requirement, not a speed choice.
 #
 # Mirrors core/config/gates.yaml shape for consistency with the gate
 # retirement evaluator pattern. The recommender is descriptive — it never

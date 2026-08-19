@@ -281,3 +281,197 @@ def test_unresolved_constant_does_not_affect_an_explicit_arg(tmp_path,
     legacy = _write(tmp_path / "gate-firings.jsonl")
     monkeypatch.setattr(_gate_log, "META_DIR", None)
     assert _gate_log.firings_paths(tmp_path) == [legacy]
+
+
+# ---------------------------------------------------------------------------
+#  (Stage 2 cutover) -- the ECONOMIC claim, which nothing above pins.
+#
+# Every writer test above asserts where the flush GOES. None asserts what it
+# LEAVES ALONE, and that is the entire point of the flag: the seam exists to
+# stop re-PUTting a 64MB / 176k-record object to append ~1KB (measured cc-05
+# 2026-08-12; 44.75MB/127k when the seam landed 12 days earlier, so the object
+# is still growing). If a future change makes the flush touch the legacy file
+# as well -- a migration pass, a compaction, an "append to both for safety"
+# fallback -- every assertion in this file still passes, the reader still finds
+# every record, consumers still report the full window, and the ~40x saving is
+# silently gone with nothing looking broken. That is why this is asserted on
+# BYTES rather than on record counts: a correctness-preserving rewrite of the
+# legacy file is exactly the regression, and it is invisible to any check that
+# only asks whether the data is still readable.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("flag_on", [False, True])
+def test_flush_writes_only_the_live_segment(tmp_path, monkeypatch, flag_on):
+    """Flag ON: the legacy object is left byte-for-byte untouched.
+
+    PARAMETRIZED OVER BOTH FLAG STATES (rb-4133, same reasoning as
+    test_flush_report_names_the_resolved_target). The flag-OFF leg is not
+    ceremony -- it is the positive control that proves this test can observe a
+    legacy write at all. Without it, a test that broke and stopped exercising
+    the flush would report the legacy file unchanged and PASS, which is the
+    vacuous green this assertion is least able to afford.
+    """
+    monkeypatch.setenv("STORAGE_BACKEND", "local")  # guard-955
+    mod = _load_flush_module()
+    if flag_on:
+        monkeypatch.setenv(mod.SEGMENTED_ENV, "1")
+    else:
+        monkeypatch.delenv(mod.SEGMENTED_ENV, raising=False)
+
+    legacy = _write(tmp_path / "gate-firings.jsonl",
+                    '{"ts": "2026-07-23T00:00:00", "gate_id": "old"}\n')
+    before = legacy.read_bytes()
+
+    _write(tmp_path / mod.SPOOL_NAME,
+           '{"ts": "2026-08-12T00:00:00", "gate_id": "new"}\n')
+    monkeypatch.setattr(
+        sys, "argv",
+        ["gate-firings-flush.py", "--meta-dir", str(tmp_path), "--force"],
+    )
+    mod.main()
+
+    if flag_on:
+        assert legacy.read_bytes() == before, (
+            "segmented flush rewrote the legacy object -- the ~40x write-"
+            "amplification saving is gone even though every record is still "
+            "readable"
+        )
+        segment = tmp_path / segment_name()
+        assert segment.is_file(), "no live segment was written"
+        assert b'"gate_id": "new"' in segment.read_bytes()
+    else:
+        # Positive control: with the flag off the flush DOES write the legacy
+        # file, so the assertion above is capable of failing.
+        assert legacy.read_bytes() != before
+
+    # Either way the reader must still see both records -- segmenting must not
+    # cost a consumer any part of its window.
+    seen = sum(sum(1 for line in p.read_text().splitlines() if line.strip())
+               for p in firings_paths(tmp_path))
+    assert seen == 2, f"reader lost records across the cutover: {seen} != 2"
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-18 -- the DIRECT lane. `_gate_log.log()` has two writer lanes: the
+# own-cloud spool (drained by the flush above) and a direct locked append used
+# by every other backend -- and, until this fix, by any own-cloud process whose
+# env did not literally carry STORAGE_BACKEND=own-cloud (a bare CLI gate script
+# on a registry-native box). That lane never consulted the segment flag, so for
+# the 12h after the fleet flip it kept re-heating the 68 MB legacy object
+# (~1000 whole-object RMWs, measured on the store tail). Both defects are pinned
+# here: the direct lane must honour the flag, and the spool decision must be
+# made from the RESOLVED backend, not a raw env read.
+# ---------------------------------------------------------------------------
+
+import _gate_log as _gl  # noqa: E402
+
+
+def _direct_lane(monkeypatch, tmp_path):
+    monkeypatch.setenv("GATE_LOG_ALLOW_PYTEST", "1")
+    monkeypatch.setenv("STORAGE_BACKEND", "local")     # direct lane, hermetic
+    return tmp_path
+
+
+def _lines(p: Path):
+    return [ln for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()] \
+        if p.is_file() else []
+
+
+def test_direct_lane_default_is_the_legacy_file(tmp_path, monkeypatch):
+    meta = _direct_lane(monkeypatch, tmp_path)
+    monkeypatch.delenv(_gl.SEGMENTED_ENV, raising=False)
+    _gl.log("direct-lane-test", "pass", caller="test", meta_dir=meta)
+    assert len(_lines(meta / _gl.LEGACY_STORE_NAME)) == 1
+    assert not (meta / segment_name()).exists()
+
+
+def test_direct_lane_writes_the_segment_when_enabled(tmp_path, monkeypatch):
+    """The regression: flag ON, direct lane -> today's segment, legacy untouched."""
+    meta = _direct_lane(monkeypatch, tmp_path)
+    monkeypatch.setenv(_gl.SEGMENTED_ENV, "1")
+    legacy = _write(meta / _gl.LEGACY_STORE_NAME,
+                    '{"ts": "2026-07-23T00:00:00", "gate_id": "old"}\n')
+    before = legacy.read_bytes()
+
+    _gl.log("direct-lane-test", "block", caller="test", meta_dir=meta)
+
+    assert legacy.read_bytes() == before, (
+        "direct lane appended to the legacy object with the segment flag on")
+    seg = meta / segment_name()
+    assert len(_lines(seg)) == 1 and '"gate_id": "direct-lane-test"' in _lines(seg)[0]
+    # Round-trip: what the direct lane wrote, the reader finds.
+    assert seg in firings_paths(meta)
+    seen = sum(len(_lines(p)) for p in firings_paths(meta))
+    assert seen == 2
+
+
+def test_direct_lane_and_flush_lane_share_one_target_rule(tmp_path, monkeypatch):
+    """Mutation proof for the fix's shape: the two writer lanes must resolve the
+    same basename for the same flag value. A future edit that re-inlines the
+    rule in one lane fails here the moment the two drift."""
+    mod = _load_flush_module()
+    for value in ("", "0", "1", "yes"):
+        monkeypatch.setenv(_gl.SEGMENTED_ENV, value)
+        assert mod._store_path(tmp_path).name == _gl.store_name()
+
+
+def test_spool_decision_uses_the_resolved_backend_when_env_is_unset(monkeypatch):
+    """Registry-native box: STORAGE_BACKEND absent from env, bootstrap resolves
+    own-cloud -> spool. Explicit pin -> no bootstrap call at all."""
+    import storage_backend as sb
+    calls = []
+
+    def fake_bootstrap(*a, **k):
+        calls.append(1)
+        import os
+        os.environ.setdefault("STORAGE_BACKEND", "own-cloud")
+
+    monkeypatch.setattr(sb, "_bootstrap_env_defaults", fake_bootstrap)
+    monkeypatch.delenv("STORAGE_BACKEND", raising=False)
+    assert _gl._spool_active() is True
+    assert calls == [1]
+
+    # Explicit pins short-circuit: neither value consults the bootstrap.
+    calls.clear()
+    monkeypatch.setenv("STORAGE_BACKEND", "local")
+    assert _gl._spool_active() is False
+    monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
+    assert _gl._spool_active() is True
+    assert calls == []
+
+
+def test_spool_decision_is_false_when_nothing_resolves(monkeypatch):
+    """Fresh local-only clone: env unset AND the bootstrap has nothing to give
+    (or raises) -> direct lane, exactly as before this change."""
+    import storage_backend as sb
+    monkeypatch.delenv("STORAGE_BACKEND", raising=False)
+    monkeypatch.setattr(sb, "_bootstrap_env_defaults", lambda *a, **k: None)
+    assert _gl._spool_active() is False
+
+    def boom(*a, **k):
+        raise RuntimeError("no registry")
+    monkeypatch.setattr(sb, "_bootstrap_env_defaults", boom)
+    assert _gl._spool_active() is False
+
+
+def test_log_spools_instead_of_appending_when_env_unset_resolves_own_cloud(
+        tmp_path, monkeypatch):
+    """End-to-end for the measured incident: a bare process on a registry-
+    native box must land the record in the machine-local spool, never in the
+    shared store file."""
+    import storage_backend as sb
+    monkeypatch.setenv("GATE_LOG_ALLOW_PYTEST", "1")
+    monkeypatch.delenv("STORAGE_BACKEND", raising=False)
+    monkeypatch.setattr(sb, "_bootstrap_env_defaults",
+                        lambda *a, **k: __import__("os").environ.setdefault(
+                            "STORAGE_BACKEND", "own-cloud"))
+    monkeypatch.setenv(_gl.SEGMENTED_ENV, "1")
+
+    _gl.log("bare-process-gate", "pass", caller="test", meta_dir=tmp_path)
+
+    spool = tmp_path / _gl._SPOOL_NAME
+    assert len(_lines(spool)) == 1 and '"gate_id": "bare-process-gate"' in _lines(spool)[0]
+    assert not (tmp_path / _gl.LEGACY_STORE_NAME).exists()
+    assert not (tmp_path / segment_name()).exists()
+    assert firings_paths(tmp_path) == []      # the spool is not part of the store

@@ -13,6 +13,7 @@ mind_api/docs/lodestar-own-cloud-architecture.md:
 File basename starts with ``test_`` so domain-leak-check.sh skips it (the boto3 /
 S3 / DynamoDB tokens here are test infrastructure, not a domain leak).
 """
+import gzip
 import hashlib
 import json
 import sys
@@ -647,6 +648,96 @@ def test_list_runner_claims_idle_row_defaults(cloud):
     assert claim.agent_state == "IDLE"
 
 
+# --- runner_token fingerprint: publishable change-detection () ------
+#
+# The worker reducer-liveness poll must notice a SAME-BOX reducer restart (a new
+# runner_token under an unchanged machine_id), which machine_id structurally
+# cannot see. The filed fix shape was "return runner_token in the claim payload".
+# That is a capability leak, not a fix: runner_token is the ConditionExpression
+# bearer credential for heartbeat() and release_runner(), so anything holding it
+# can forge a heartbeat for another agent (defeating reclaim_if_stale, so a
+# crashed runner could never be reclaimed) or release a LIVE claim, forcing a
+# healthy reducer down mid-flight. A consumer that only needs to notice CHANGE
+# never needs the value — hence a non-reversible digest.
+
+def test_runner_token_fingerprint_is_deterministic_and_discriminating():
+    from owncloud_backend import runner_token_fingerprint as fp
+    assert fp("tokA") == fp("tokA")                  # stable while the token is
+    assert fp("tokA") != fp("tokB")                  # moves on a re-mint
+
+
+def test_runner_token_fingerprint_never_reveals_the_token():
+    """The whole security property in one assertion: the digest must not be the
+    token, must not contain it, and must not be reversible by inspection."""
+    from owncloud_backend import runner_token_fingerprint as fp
+    tok = "f47ac10b-58cc-4372-a567-0e02b2c3d479"     # UUID4 shape, as minted
+    d = fp(tok)
+    assert d != tok
+    assert tok not in d
+    assert d not in tok
+    assert len(d) == 16 and all(c in "0123456789abcdef" for c in d)
+
+
+def test_runner_token_fingerprint_is_none_for_a_missing_token():
+    """A never-claimed IDLE row has no token. None means UNKNOWN, and every
+    consumer must read it as non-discriminating rather than as 'unchanged' —
+    an `unknown` that compared equal across two different reducers would read
+    as 'no takeover', the one direction the axis must never fail in."""
+    from owncloud_backend import runner_token_fingerprint as fp
+    assert fp(None) is None
+    assert fp("") is None
+
+
+def test_list_runner_claims_carries_the_fingerprint_not_the_token(cloud):
+    from owncloud_backend import runner_token_fingerprint
+    a = _backend(cloud, machine_id="A")
+    a.acquire_runner("alpha", "tokA")
+    (claim,) = a.list_runner_claims()
+    assert claim.runner_token_fp == runner_token_fingerprint("tokA")
+    # The raw token must be UNREPRESENTABLE here, not merely unpopulated: the
+    # projection is the boundary the credential must not cross, so a future
+    # caller cannot leak it by adding one line to a response dict.
+    assert "runner_token" not in claim._fields
+    assert "tokA" not in repr(claim)
+
+
+def test_list_runner_claims_fingerprint_moves_on_a_same_box_remint(cloud):
+    """The exact scenario the axis exists for: SAME machine_id both times, so
+    the machine axis cannot fire and only the fingerprint separates the two
+    runners."""
+    from owncloud_backend import runner_token_fingerprint
+    a = _backend(cloud, machine_id="A")
+    a.acquire_runner("alpha", "tokA")
+    before = a.list_runner_claims()[0]
+
+    a.release_runner("alpha", "tokA")
+    a.acquire_runner("alpha", "tokB")                # new runner, same box
+    after = a.list_runner_claims()[0]
+
+    assert after.machine_id == before.machine_id == "A"
+    assert after.runner_token_fp != before.runner_token_fp
+    assert after.runner_token_fp == runner_token_fingerprint("tokB")
+
+
+def test_list_runner_claims_fingerprint_is_none_on_a_tokenless_row(cloud):
+    a = _backend(cloud, machine_id="A")
+    cloud["ddb"].put_item(
+        TableName=SESSIONS,
+        Item={"session_key": {"S": f"{ENV_ID}/delta"},
+              "agent_state": {"S": "IDLE"}})
+    (claim,) = a.list_runner_claims()
+    assert claim.runner_token_fp is None
+
+
+def test_runner_claim_stays_constructible_without_the_new_field():
+    """Compatibility contract: the field is DEFAULTED, so every pre-existing
+    positional construction in the tree keeps working and gets None (unknown)
+    rather than raising."""
+    from owncloud_backend import RunnerClaim
+    c = RunnerClaim("alpha", "A", "RUNNING", 123)
+    assert c.runner_token_fp is None
+
+
 # --- multi-root key mapping (from_env wiring) -------------------------------
 def _multiroot(cloud, world, meta, agents):
     from owncloud_backend import OwnCloudBackend
@@ -1082,7 +1173,16 @@ def test_put_normal_store_still_pushes_to_s3(cloud):
     b.write_text(p, "real\n")
     key = b._s3_key(p)
     head = cloud["s3"].head_object(Bucket=BUCKET, Key=key)  # raises if absent
-    assert head["ContentLength"] == len("real\n")
+    #  gzip-at-rest: reasoning-bank.jsonl is in the codec allowlist, so
+    # when OWNCLOUD_GZIP_STORES names this env the S3 object is COMPRESSED and its
+    # ContentLength is the compressed size, not len("real\n"). The test's intent
+    # is "the store still PUSHES to S3", so verify existence + DECODED content
+    # (magic-byte-authoritative, exactly as the codec reader does) -- robust
+    # whether the writer flag is set or not. ()
+    assert head["ContentLength"] > 0                        # object exists with content
+    raw = cloud["s3"].get_object(Bucket=BUCKET, Key=key)["Body"].read()
+    decoded = gzip.decompress(raw) if raw[:2] == b"\x1f\x8b" else raw
+    assert decoded == b"real\n"
 
 
 def test_refresh_machine_local_skips_s3_head(cloud, monkeypatch):

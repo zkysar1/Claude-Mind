@@ -205,6 +205,18 @@ def validate_record(rec, changed_fields=None):
             )
 
     confidence = rec["confidence"]
+    # : bools BEFORE the bound-check — Python bools ARE ints, so
+    # isinstance(True, (int, float)) is True and 0 <= True <= 1 passes, and
+    # float(True) = 1.0 then derives surprise 0 on a CONFIRMED record, which
+    # silently skips the /review-hypotheses Step 3.5 re-retrieve. Discriminate on
+    # TYPE, never on value: True == 1 and False == 0, so a value guard would
+    # reject the valid confidences 1 and 0. Full rationale + the end-to-end
+    # measurement live at the daemon twin,
+    # mind_api/src/world/pipeline_write.py::_validate_record (guard-547 parity —
+    # fix one and the other drifts).
+    if isinstance(confidence, bool):
+        raise ValueError(
+            f"Invalid confidence: {confidence!r} (must be a number 0.0-1.0, not a bool)")
     if not isinstance(confidence, (int, float)) or confidence < 0 or confidence > 1:
         raise ValueError(f"Invalid confidence: {confidence} (must be 0.0-1.0)")
 

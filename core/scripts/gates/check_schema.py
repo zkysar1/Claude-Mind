@@ -140,6 +140,26 @@ SELF_PASSING_REASONS = (
 )
 
 
+def is_schema_failure(reason: Optional[str]) -> bool:
+    """Is this passed=False reason a SCHEMA problem rather than a work-state one?
+
+    The one place the SCHEMA_REASONS membership test lives. It was previously
+    written inline in classify() only, which was fine while this gate was the
+    sole consumer -- but the same question is asked at VERIFY time by
+    verify-check-eval.py (g-115-4849), where a schema-broken check was
+    byte-indistinguishable from a genuinely failing one and routed a succeeded
+    goal back to `pending`. Two copies of the membership test would drift the
+    first time predicate.py grows a reason, and nothing would fail when they
+    did -- so both callers ask here instead.
+
+    CALLERS MUST TEST `passed` THEMSELVES FIRST. This function judges a reason
+    string in isolation and knows nothing about `passed`; a passed=True result
+    carrying a SELF_PASSING_REASONS reason is intercepted by classify()'s
+    vacuous branch BEFORE it ever gets here, and that ordering is load-bearing
+    (see the SELF_PASSING_REASONS comment above)."""
+    return any(s in (reason or "") for s in SCHEMA_REASONS)
+
+
 def _predicate_module():
     """Import predicate lazily so a gate import cannot drag in its cost or its
     failure modes at module load (the daemon imports this at startup)."""
@@ -236,7 +256,7 @@ def classify(check: Any) -> Dict[str, Any]:
                 "required": []}
 
     reason = (result.reason or "")
-    if any(s in reason for s in SCHEMA_REASONS):
+    if is_schema_failure(reason):
         return {"verdict": "invalid", "type": ptype, "reason": reason,
                 "required": required_fields(ptype) if ptype else []}
     if result.passed:

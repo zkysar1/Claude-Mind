@@ -34,7 +34,9 @@ fi
 # installer never ensured executability, so all 11 Layer-B gates were bypassed
 # fleet-wide for ~7 weeks. Idempotent (only chmods a non-exec hook) + fail-open
 # (a chmod hiccup must not block session start — guarded, never trips set -e).
-for _hook in pre-commit pre-push post-commit; do
+# commit-msg joined the chain 2026-08-18 (, hot-path size budget) —
+# it must be listed here or a mode-100644 checkout silently skips it too.
+for _hook in pre-commit pre-push post-commit post-merge commit-msg; do
     _hp="$REPO_ROOT/core/githooks/$_hook"
     if [ -f "$_hp" ] && [ ! -x "$_hp" ]; then
         if chmod +x "$_hp" 2>/dev/null; then

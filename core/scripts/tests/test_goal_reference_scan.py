@@ -70,6 +70,10 @@ def test_live_referent_blocks(tmp_path, rel):
     "core/scripts/evolution-log.jsonl",
     "core/scripts/changelog-archive.jsonl",     # matched by -archive suffix
     "core/scripts/pipeline-archive.jsonl",      # ditto, name never enumerated
+    "core/scripts/gate-firings.jsonl",          # enumerated legacy telemetry
+    "core/scripts/gate-firings-2026-08-17.jsonl",  # its date segment: matched by stem, name never enumerated (GATE_FIRINGS_SEGMENTED, 2026-08-17)
+    "core/scripts/reasoning-bank-utilization.jsonl",  #  counter sidecar (advisory stats, RMW-flushed)
+    "core/scripts/guardrails-utilization.jsonl",      # ditto
     "core/scripts/improvement-velocity.yaml",
     "core/board/findings.jsonl",
     "core/journal/2026-07-25.md",
@@ -81,6 +85,48 @@ def test_historical_mention_does_not_block(tmp_path, rel):
         f"{rel} wrongly counted as a live referent — this is the always-fires "
         f"failure mode:\n{r.stderr}")
     assert "historical" in r.stdout
+
+
+def test_sidecar_names_pinned_to_counters_name():
+    """The two sidecar literals in _HISTORICAL_NAMES must equal
+    _utilization_store.counters_name(kind) for every kind. The scanner
+    deliberately does NOT import the seam (it must keep working when the seam
+    module is absent), so this pin is the only thing keeping the literals from
+    drifting — the same pattern _fileops uses for its snapshot blacklist
+    (46a035a5b). A rename in the seam reddens here, not in production."""
+    sys.path.insert(0, str(SCRIPT.parent))
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_grs", SCRIPT)
+        grs = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(grs)
+        from _utilization_store import KINDS, counters_name
+        expected = {counters_name(k) for k in KINDS}
+        assert expected <= grs._HISTORICAL_NAMES, (
+            f"sidecar basenames {expected - grs._HISTORICAL_NAMES} missing from "
+            f"_HISTORICAL_NAMES — goal ids in a sidecar would count as live "
+            f"referents (the always-fires failure mode, 3ee1cf881 class)")
+    finally:
+        sys.path.remove(str(SCRIPT.parent))
+
+
+@pytest.mark.parametrize("rel", [
+    "core/scripts/reasoning-bank-2026-08-18.jsonl",
+    "core/scripts/guardrails-2026-08-18.jsonl",
+])
+def test_content_date_segment_stays_blocking(tmp_path, rel):
+    """rb/guardrail DATE SEGMENTS are the CONTENT store under a dynamic name —
+    they carry live source_goal referents exactly like the legacy file, which
+    is blocking. This is the deliberate NON-entry documented beside the sidecar
+    literals: it reddens if someone 'generalizes' the sidecar entries into a
+    <kind>-*.jsonl glob or a stem rule (the gate-firings stem rule does NOT
+    transfer — that store is append-only telemetry, these are content)."""
+    _write(tmp_path, rel, f'{{"source_goal": "{GOAL}"}}\n')
+    r = _run(tmp_path)
+    assert r.returncode == 1, (
+        f"{rel} classified historical — a content segment's goal refs must "
+        f"BLOCK relocation:\n{r.stdout}\n{r.stderr}")
 
 
 def test_historical_alone_still_reports_count(tmp_path):

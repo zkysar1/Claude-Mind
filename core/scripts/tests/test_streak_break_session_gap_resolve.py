@@ -207,3 +207,95 @@ def test_has_session_gap_malformed_lines_skipped():
         # Only the two valid entries count; they're 30min apart and bracketed
         # by a 3h trailing gap -> True.
         assert mod._has_session_gap(start, end, agent_dir, 2.0) is True
+
+
+# ---------------------------------------------------------------------------
+# Retention-horizon clamp ( x , 2026-08-17). iteration-close
+# trims the diary to its last 8h on every close, so a diary that starts 8h ago
+# says NOTHING about the 15h before it. Read naively, that void was "agent
+# inactive >= 2h" and suppressed every canary whose window exceeded ~10h —
+# measured on alpha: 49/49 session-gap suppressions since the trim landed had
+# windows >= 10.8h (median 92h), the 23.2h  drain-lane stall among
+# them, while the reducer had been closing goals continuously.
+# ---------------------------------------------------------------------------
+
+def _trimmed_active_diary(agent_dir: Path, now: datetime, hours: float = 8.0,
+                          every_min: int = 15) -> None:
+    """A diary the way iteration-close leaves it on a BUSY agent: continuous
+    activity, but only the last `hours` survive the trim."""
+    first = now - timedelta(hours=hours)
+    n = int(hours * 60 / every_min) + 1
+    _write_diary(agent_dir, [first + timedelta(minutes=every_min * i)
+                             for i in range(n)])
+
+
+def test_trimmed_diary_continuous_activity_is_not_a_gap():
+    """THE INCIDENT SHAPE. 23.2h window, diary trimmed to the last 8h with
+    activity every 15 min inside it -> the pre-horizon 15h is undecidable, the
+    retained 8h shows no gap -> False (canary FILES). Under the old code the
+    15h leading void returned True and the canary was suppressed."""
+    mod = _load_reflector_module()
+    with tempfile.TemporaryDirectory() as tmp:
+        agent_dir = Path(tmp) / "agent"
+        agent_dir.mkdir()
+        now = datetime(2026, 8, 17, 19, 52, 8)
+        _trimmed_active_diary(agent_dir, now)
+        start = now - timedelta(hours=23.22)
+        assert mod._has_session_gap(start, now, agent_dir, 2.0) is False
+
+
+def test_trimmed_diary_real_gap_inside_horizon_still_detected():
+    """The clamp must not blind the detector to a REAL gap that the retained
+    horizon does show: activity for 3h, silence for 4h, activity for 1h -> True."""
+    mod = _load_reflector_module()
+    with tempfile.TemporaryDirectory() as tmp:
+        agent_dir = Path(tmp) / "agent"
+        agent_dir.mkdir()
+        now = datetime(2026, 8, 17, 19, 52, 8)
+        first = now - timedelta(hours=8)
+        cluster_a = [first + timedelta(minutes=15 * i) for i in range(13)]  # 3h
+        cluster_b = [now - timedelta(minutes=15 * i) for i in range(5)]     # last 1h
+        _write_diary(agent_dir, cluster_a + cluster_b)
+        start = now - timedelta(hours=23.22)
+        assert mod._has_session_gap(start, now, agent_dir, 2.0) is True
+
+
+def test_window_entirely_before_horizon_is_undecidable():
+    """A Pass-2 canary whose [filed, recovered] window closed BEFORE the oldest
+    surviving entry: nothing retained can speak to it -> False (leave open),
+    not the old 'no entries in window -> whole span idle -> True'."""
+    mod = _load_reflector_module()
+    with tempfile.TemporaryDirectory() as tmp:
+        agent_dir = Path(tmp) / "agent"
+        agent_dir.mkdir()
+        now = datetime(2026, 8, 17, 19, 52, 8)
+        _trimmed_active_diary(agent_dir, now)
+        start = now - timedelta(hours=40)
+        end = now - timedelta(hours=20)
+        assert mod._has_session_gap(start, end, agent_dir, 2.0) is False
+
+
+def test_dormant_agent_diary_is_not_clamped_away():
+    """The trim only runs when the loop closes, so a DORMANT agent keeps its
+    last entries: window starts inside the retained span, activity stops, then
+    30h of nothing -> the trailing gap is real evidence -> True. The clamp
+    must not erase the case g-115-1319 was built for."""
+    mod = _load_reflector_module()
+    with tempfile.TemporaryDirectory() as tmp:
+        agent_dir = Path(tmp) / "agent"
+        agent_dir.mkdir()
+        now = datetime(2026, 8, 17, 19, 52, 8)
+        last_active = now - timedelta(hours=30)
+        _write_diary(agent_dir, [last_active - timedelta(minutes=15 * i)
+                                 for i in range(20)])  # ~5h of activity, then silence
+        start = last_active - timedelta(hours=2)
+        assert mod._has_session_gap(start, now, agent_dir, 2.0) is True
+
+
+def test_horizon_clamp_source_pin():
+    """Source pin: the clamp keys on the oldest entry in the WHOLE diary and
+    treats a fully-pre-horizon window as undecidable (False)."""
+    src = REFLECTOR_PATH.read_text(encoding="utf-8")
+    assert "if oldest > end_dt:" in src
+    assert "if oldest > start_dt:" in src
+    assert "start_dt = oldest" in src

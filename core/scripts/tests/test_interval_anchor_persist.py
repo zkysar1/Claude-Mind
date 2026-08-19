@@ -214,6 +214,141 @@ def test_persisted_anchor_bounds_the_cap():
         "documents the unbounded-ratchet behavior when the anchor is absent")
 
 
+# ---------------------------------------------------------------------------
+# : deliberate-raise anchor re-base (the FLOOR consumer's half)
+#
+# original_interval_hours feeds TWO consumers with opposite requirements. The
+# tests above pin the CAP side (immutable anchor -> bounded auto-extension).
+# These pin the FLOOR side: contract floor = original*contract_floor_ratio goes
+# stale-LOW when a cadence is deliberately RAISED, so a goal widened 24h->168h
+# kept floor = 24*0.33 = 7.92h and a deep-outcome streak could walk a weekly
+# cadence back toward ~8h.
+#
+# The discriminator must not weaken the cap: an auto-extension is bounded BY
+# CONSTRUCTION at original*cap_ratio, so only a write STRICTLY ABOVE that bound
+# re-bases. The at-cap test below is the one that would go red if the 
+# ratchet were reintroduced through this branch.
+# ---------------------------------------------------------------------------
+
+
+def test_deliberate_raise_rebases_anchor():
+    """A raise ABOVE original*cap_ratio is provably manual -> re-base the anchor.
+
+    g-100-02 is anchored at 4h. 24h > 4*3.0, so no auto-extension could have
+    produced it; the anchor must move to 24 so the contract floor becomes
+    24*0.33 = 7.92h instead of the stale 1.32h.
+    """
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _make_world(Path(tmpd))
+        with DaemonFixture(world, agent="delta") as df:
+            status, out = _update_goal(df.port, "g-100-02", "interval_hours", 24, "delta")
+            assert status == 200, f"update-goal status={status}; body={out!r}"
+            g = _find_goal(world, "g-100-02")
+            assert g is not None and g.get("interval_hours") == 24
+            assert g.get("original_interval_hours") == 24, (
+                "a raise above original*cap_ratio is unreachable by auto-extension and "
+                "must re-base the anchor so the contract floor tracks the deliberate "
+                f"cadence; got {g.get('original_interval_hours')!r}")
+
+
+def test_auto_extension_at_cap_does_not_rebase():
+    """A raise to EXACTLY original*cap_ratio is reachable by auto-extension -> no re-base.
+
+    This is the g-001-36 guard. If the strict `>` were ever relaxed to `>=`, the
+    anchor would follow each capped auto-extension (4 -> 12 -> 36 -> ...) and the
+    cap would ratchet unbounded again.
+    """
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _make_world(Path(tmpd))
+        with DaemonFixture(world, agent="delta") as df:
+            status, out = _update_goal(df.port, "g-100-02", "interval_hours", 12, "delta")
+            assert status == 200, f"update-goal status={status}; body={out!r}"
+            g = _find_goal(world, "g-100-02")
+            assert g is not None and g.get("interval_hours") == 12
+            assert g.get("original_interval_hours") == 4, (
+                "12h is exactly 3.0x the 4h anchor and therefore producible by a capped "
+                "auto-extension; the anchor must stay immutable or the g-001-36 ratchet "
+                f"reopens; got {g.get('original_interval_hours')!r}")
+
+
+def test_rebase_runs_twice_without_ratcheting():
+    """Run the write path TWICE (guard-3116): re-basing must not become a ratchet.
+
+    Write 1 is a deliberate raise (4 -> 24) and DOES re-base. Write 2 raises again
+    to 30h, which is inside the NEW anchor's cap (24*3.0 = 72) and so is
+    indistinguishable from an auto-extension — it must NOT re-base. Asserting only
+    the first write would leave a compounding anchor undetected, which is exactly
+    the failure shape a single-write fixture cannot see.
+    """
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _make_world(Path(tmpd))
+        with DaemonFixture(world, agent="delta") as df:
+            s1, o1 = _update_goal(df.port, "g-100-02", "interval_hours", 24, "delta")
+            assert s1 == 200, f"first update status={s1}; body={o1!r}"
+            assert _find_goal(world, "g-100-02").get("original_interval_hours") == 24
+
+            s2, o2 = _update_goal(df.port, "g-100-02", "interval_hours", 30, "delta")
+            assert s2 == 200, f"second update status={s2}; body={o2!r}"
+            g = _find_goal(world, "g-100-02")
+            assert g.get("interval_hours") == 30
+            assert g.get("original_interval_hours") == 24, (
+                "30h is within the re-based anchor's cap (24*3.0=72) so it is "
+                "auto-extension-shaped and must leave the anchor alone; a second "
+                f"re-base here is a compounding ratchet; got "
+                f"{g.get('original_interval_hours')!r}")
+
+
+def test_absent_anchor_path_unchanged_by_rebase_branch():
+    """The  write-once branch still wins when the anchor is ABSENT.
+
+    The re-base branch is an `elif`, so a goal with no anchor must still take the
+    original persist-PRE-update-cadence path even when the new value would clear
+    the cap bound. g-100-01 has no anchor and interval 4; writing 99 must anchor
+    to 4 (the pre-update cadence), NOT to 99.
+    """
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _make_world(Path(tmpd))
+        with DaemonFixture(world, agent="delta") as df:
+            status, out = _update_goal(df.port, "g-100-01", "interval_hours", 99, "delta")
+            assert status == 200, f"update-goal status={status}; body={out!r}"
+            g = _find_goal(world, "g-100-01")
+            assert g.get("original_interval_hours") == 4, (
+                "absent-anchor goals must keep taking the g-115-2049 pre-update-cadence "
+                f"path; got {g.get('original_interval_hours')!r}")
+
+
+def test_cli_daemon_rebase_parity():
+    """Both write paths carry the  re-base (guard-742 byte-parallel).
+
+    The daemon is the LIVE batch/manual apply path under daemon-only architecture,
+    so a CLI-only re-base is the half that never runs.
+    """
+    cli = CLI_FILE.read_text(encoding="utf-8")
+    daemon = DAEMON_FILE.read_text(encoding="utf-8")
+    for label, src in (("CLI", cli), ("daemon", daemon)):
+        assert "g-115-6104" in src, f"{label} lost the g-115-6104 re-base marker"
+        assert "_is_deliberate_raise(_anchor, _new_interval)" in src, (
+            f"{label} lost the deliberate-raise call")
+        assert "from _cadence_anchor import is_deliberate_raise" in src, (
+            f"{label} lost the shared-policy import — a local reimplementation is a "
+            "second place for cap_ratio to drift")
+
+
+def test_shared_policy_is_single_definition():
+    """cap_ratio is read from the SAME config block cargo-cult-detector reads.
+
+    If the two ever diverged, a write the detector COULD have produced would be
+    classified deliberate and re-base the anchor — the ratchet re-entering
+    through the new branch.
+    """
+    import _cadence_anchor
+    ccd = _load_ccd()
+    assert _cadence_anchor.cargo_cult_cap_ratio() == ccd._load_detector_config()["cap_ratio"], (
+        "the re-base discriminator and the cap it reasons about must read one value")
+    # Fail-safe default agrees with the detector's own default.
+    assert _cadence_anchor.DEFAULT_CAP_RATIO == 3.0
+
+
 if __name__ == "__main__":
     test_interval_update_persists_anchor_when_absent()
     test_interval_update_preserves_existing_anchor()
@@ -221,4 +356,10 @@ if __name__ == "__main__":
     test_cli_daemon_anchor_parity()
     test_propose_exempt_returns_none()
     test_persisted_anchor_bounds_the_cap()
+    test_deliberate_raise_rebases_anchor()
+    test_auto_extension_at_cap_does_not_rebase()
+    test_rebase_runs_twice_without_ratcheting()
+    test_absent_anchor_path_unchanged_by_rebase_branch()
+    test_cli_daemon_rebase_parity()
+    test_shared_policy_is_single_definition()
     print("ok")

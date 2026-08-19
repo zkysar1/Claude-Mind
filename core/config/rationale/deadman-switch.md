@@ -258,6 +258,103 @@ while the session is BUSY; this gap is about the net being SPENT while the
 session is idle-then-resurrected. They are independent residuals — the
 re-arm-first fix closes THIS one regardless of Q6's resolution.
 
+**Generalized 2026-08-11 (g-115-5834): the trigger is "no terminal pair has been
+emitted", not "the net fired".** An autocompact resume reaches the same
+unprotected state from the opposite direction — the net is armed at iteration N's
+terminal PAIR, so a `SessionStart:compact` resume that re-enters the loop body
+MID-iteration emits no pair at all and runs that entire iteration on whatever net
+already existed. Measured (bravo, `hostname` cc-05, `uname -r` 6.8.0-137-generic,
+session 0a35f258): resumed from autocompact #2 with in-flight goal g-001-02 at
+phase `selected`, the turn ended inside a spark sub-skill before the terminal
+pair, and the execution diary went silent 03:19:39 → 11:06 — **7h47m** — while 43
+goals completed across zeta, alpha and echo inside that same window. The obvious
+objection ("the prior iteration's net was still pending") is falsified by
+arithmetic: `delaySeconds` is clamped to [60, 3600], so any armed wakeup fires
+within an hour and no pending net can span 7h47m.
+
+⚠ **THAT ARITHMETIC IS FALSIFIED BY MEASUREMENT — the clamp bounds when a wakeup
+becomes ELIGIBLE, not when the session is RE-INVOKED (rb-8256).** Measured on
+echo/`hostname` cc-03, `uname -r` 6.8.0-137-generic, own-cloud, 2026-08-18: a net
+armed at ~00:33 with `delaySeconds=640`, tool result naming a fire time of
+**00:48:00**, against a last durable write (guard-4241) at **00:34:19** — so idle
+began at 00:34 — and the resulting `<<autonomous-loop-dynamic>>` firing re-invoked
+the session at **07:09:32**. That is 6h35m of silence and **6h21m past the
+scheduled fire**, on a 640s net. So a pending net CAN span multi-hour gaps, and
+the paragraph above cannot rule one out by clamp arithmetic alone.
+**CAUSE IS UNMEASURED and must not be asserted** — a `/login` occurred at ~07:16,
+minutes AFTER the firing, which is suggestive of a session-auth interruption but
+post-dates the wakeup and therefore explains nothing on its own; a platform-side
+scheduling delay is equally live. What this does NOT change: the deadman is still
+fail-safe in DIRECTION (worst case a slow loop, never a dead one), and the
+re-arm-first rule is still correct. What it DOES change is that "no net was armed"
+was never the only available explanation for the 7h47m gap, so the re-arm remedy
+is necessary and possibly not sufficient — and the "~10-minute resurrection
+latency" claimed in § Why 600s below is an upper-bound-under-ideal-delivery, not a
+measured property.
+
+### The distribution, measured (g-115-6629, 2026-08-19)
+
+The paragraph above is n=1. Here is the population, from the transcripts
+themselves — 9 files, 1.25M records, 4,336 armed wakeups, 2026-07-10 → 08-19:
+
+| agent / box / `uname -r` | due gaps | p50 | p90 | p99 | max |
+|---|---|---|---|---|---|
+| zeta / cc-02 / 6.8.0-137-generic | 1,424 | 149s | 269s | 1.90h | 17.37h |
+| echo / cc-03 / 6.8.0-137-generic | 1,262 | 137s | 226s | 3.75h | 39.98h |
+
+Method: for every idle gap ≥120s, find the newest wakeup armed at or before the
+silence began; the net becomes ELIGIBLE at `max(scheduled_fire, gap_start)` (it
+cannot fire while the session is busy) and latency is `gap_end - eligible`. Both
+halves come from one transcript on one machine, and transcript stamps are
+ISO-8601 Z (guard-2841 / guard-2613 satisfied). Gaps are split by what BROKE the
+silence, because a human typing `continue` is a different rescue mechanism: the
+`human-typed` class (n=19 / n=16) has p50 **7,106s / 14,328s** and max **39.98h**
+— folding it in would credit the deadman for rescues it never performed. Excluding
+it, the deadman-eligible class maxes at **5.74h (zeta) / 17.09h (echo)**.
+
+**VERDICT: delivery is NOT bounded.** The body is fast and strikingly consistent
+across boxes (p50 ≈ 2.3 min, p90 ≈ 4 min, p50 identical at 121.0s in the
+wakeup class on both), but the tail runs to hours. p99 alone is 1.9h and 3.75h.
+
+The structural reason is stronger than the statistic: **the net is delivered by
+re-invoking the very session that went silent.** If the session, process or
+container is gone, there is nothing to re-invoke, and delivery waits on an
+unbounded external event. An in-session net cannot detect its own session's
+absence — so "worst case a SLOW loop, never a dead one" holds only for a
+text-death *inside a live session*, which is a strictly narrower claim than the
+one § Why 600s makes.
+
+**Do NOT respond by tuning `delaySeconds`.** The clamp floor is 60s and the
+observed misses are 5.7–17.1h; no rung reaches them, because the delay is not
+where the time goes.
+
+**An external detector already exists — do not build a second one.**
+`ayoai-fleet-sweep.timer` runs on `zakbox1` (OUTSIDE every container), classifies
+all containers every 10 minutes, and emails on page-worthy conditions; since
+g-115-6551 it pages only for autonomous-mode agents in a stopped state. That is
+the bounded time-to-detection the in-session net cannot provide, and it is the
+capability this section would otherwise have proposed. The residual gap is the
+`zakbox1` SPOF — nothing watches the sweeper except its own stamp going stale —
+already owned by `g-115-6324` clause (2)(i). See
+`world/conventions/fleet-monitoring-coverage.md`.
+
+⚠ **The `system` co-writer column is NOT independent corroboration.** The
+2026-08-18 reading that read box/daemon-level absence from `system` changelog
+rows tracking the agent column at exactly 43.8% does not support that conclusion:
+`_fileops.py::_agent_name` returns `"system"` whenever `MIND_AGENT` is unset, and
+**98.3% of all 130,325 `system` rows are writes to `presence/<agent>.jsonl`** —
+emitted by `presence-tick.py`, a `PostToolUse` hook with `matcher='*'` that fires
+once per tool call. The column is therefore driven entirely by the loop's own tool
+calls, so a loop-only text-death drives it to silence at exactly the agent
+column's rate. Two columns, one producer: the agreement is what BOTH hypotheses
+predict. (`liveness_check.py` independently refuses presence as a cross-box signal
+— it does not sync to S3.)
+
+Both rule files therefore state
+the re-arm requirement over BOTH entry points; the one-shot restoration argument
+above (and its F2 reconciliation) applies unchanged, since a resume boundary is
+not a steady-state iteration either.
+
 Detective coverage (Layer C): `core/scripts/aspirations-rejection-audit.py` now
 flags `resurrection_risk` by arm CADENCE — a gap between consecutive
 deadman-sentinel arms exceeding 1h (longer than any legitimate iteration, so the

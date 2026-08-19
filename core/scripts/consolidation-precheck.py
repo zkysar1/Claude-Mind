@@ -8,10 +8,12 @@ invoke the full /aspirations-consolidate skill or load the housekeeping digest.
 IMPORTANT: This logic must match Step 0.1 (CONSOLIDATION TRIAGE GATE) in
 aspirations-consolidate/SKILL.md. If you add a check there, add it here too.
 
-Reads four files directly (no subprocess spawning):
+Reads five files directly (no subprocess spawning):
   1. <agent>/session/working-memory.yaml  — micro_hypotheses, encoding_queue,
      knowledge_debt, conclusions, violations, sensory_buffer
-  2. <world>/pipeline.jsonl               — unreflected resolved hypotheses
+  2. <world>/pipeline.jsonl + pipeline-archive.jsonl — REFLECTABLE unreflected
+     hypotheses (shared _reflectable filter — g-115-6173; matches Step 0.1's
+     endpoint-array + count_reflectable form on both corpus and predicate)
   3. <agent>/session/overflow-queue.yaml   — overflow encoding candidates
   4. <agent>/session/handoff.yaml          — consecutive_lean_sessions (ceiling)
 
@@ -48,6 +50,7 @@ except ImportError:
     sys.exit(0)
 
 from _paths import AGENT_DIR, WORLD_DIR
+import _reflectable  # : shared reflectable-vs-backlog split
 
 
 def _safe_len(val):
@@ -98,9 +101,31 @@ def main():
         # encoding_queue is a top-level key, not inside slots
         result["encoding_queue"] = _safe_len(wm.get("encoding_queue"))
 
-    # --- 2. Pipeline — unreflected resolved hypotheses ---
-    pipeline_path = WORLD_DIR / "pipeline.jsonl"
-    if pipeline_path.exists():
+    # --- 2. Pipeline — REFLECTABLE unreflected hypotheses ---
+    # : this block used to hand-roll live-only stage=="resolved",
+    # which diverged from the widened --unreflected endpoint (live+archive,
+    # stage in resolved/archived) the moment  landed — 0 here vs
+    # 377 there on the same store. Parity is restored by matching BOTH halves
+    # of the SKILL.md Step 0.1 instrument: same corpus (live + archive files —
+    # this script's no-subprocess/10s-self-destruct contract forbids calling
+    # the endpoint itself) and same predicate (the shared _reflectable filter;
+    # Step 0.1 applies it to the endpoint's array). Reflectable-only is the
+    # right semantic for a consolidation triage count: the widened TOTAL is
+    # dominated by UNRESOLVABLE/EXPIRED/no-outcome records nothing can ever
+    # reflect on (), and folding those into data_total made the
+    # lean fast path structurally dead.
+    # Union semantics mirror the endpoint (mind_api/src/world/pipeline.py
+    # --unreflected branch): dedup by id with the LIVE copy winning (a record
+    # can exist in BOTH stores — the archived-in-live tombstone case the
+    # endpoint's union exists for; counting files independently double-counts
+    # it), stage in (resolved, archived), not reflected — then the shared
+    # reflectable filter, which is what Step 0.1 applies to the endpoint's
+    # array. Same corpus + same predicate = same count (outcome 1).
+    _by_id = {}
+    for _pname in ("pipeline-archive.jsonl", "pipeline.jsonl"):  # live second: live wins
+        pipeline_path = WORLD_DIR / _pname
+        if not pipeline_path.exists():
+            continue
         with open(pipeline_path, "r", encoding="utf-8") as f:
             for line in f:
                 stripped = line.strip()
@@ -108,11 +133,17 @@ def main():
                     continue
                 try:
                     rec = json.loads(stripped)
-                    if (rec.get("stage") == "resolved"
-                            and not rec.get("reflected", False)):
-                        result["unreflected"] += 1
                 except json.JSONDecodeError:
                     continue
+                rid = rec.get("id")
+                if rid is not None:
+                    _by_id[rid] = rec
+    result["unreflected"] = sum(
+        1 for rec in _by_id.values()
+        if rec.get("stage") in ("resolved", "archived")
+        and not rec.get("reflected", False)
+        and _reflectable.is_reflectable(rec)
+    )
 
     # --- 3. Overflow queue ---
     overflow_path = AGENT_DIR / "session" / "overflow-queue.yaml"

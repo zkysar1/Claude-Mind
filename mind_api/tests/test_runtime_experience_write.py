@@ -297,10 +297,22 @@ def test_meta_update_requires_agent_header(running_daemon):
 
 
 def test_archive_sweep_roundtrip(running_daemon):
-    """Conftest experience records are recent (created within ~3 weeks) so none
-    are stale — the sweep is a no-op, confirming wiring + the agent gate.
-    Actual archiving is covered by the byte-compat test (seeded stale data)."""
-    _, port = running_daemon
+    """Recent experience records are not stale, so the sweep is a no-op —
+    confirming wiring + the agent gate. Actual archiving is covered by the
+    byte-compat test (seeded stale data).
+
+    The conftest records carry FIXED `created` dates (2026-05-10/12); this test
+    used to lean on them being "within ~3 weeks", which stopped being true on
+    the calendar and turned the no-op into `archived == 2` (2026-08-16). Re-stamp
+    them relative to NOW so the premise holds on every date."""
+    from datetime import datetime, timedelta
+    project_root, port = running_daemon
+    p = project_root / "agents" / "alpha" / "experience.jsonl"
+    fresh = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    recs = [json.loads(ln) for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    for r in recs:
+        r["created"] = fresh
+    p.write_text("".join(json.dumps(r) + "\n" for r in recs), encoding="utf-8")
     status, body = _post_json(port, "/v1/experience/archive-sweep", {}, None)
     assert status == 200, body
     assert json.loads(body)["archived"] == 0

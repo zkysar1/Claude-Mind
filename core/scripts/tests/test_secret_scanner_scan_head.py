@@ -181,6 +181,85 @@ def test_hook_invokes_scanner_with_no_arguments():
     assert "--scan-head" not in line[0], "hook must invoke the STAGED gate, not the audit"
 
 
+# ── binary scope: audit mode must match staged mode's scope () ──
+#
+# `git grep` emits a DIFFERENT line shape for a binary match --
+# `Binary file HEAD:blob.bin matches` rather than `HEAD:path:lineno:content` --
+# so the `sed 's/^HEAD://'` + `${gl%%:*}` extraction resolved the path field to
+# the literal string "Binary file HEAD". Two consequences: the report named a
+# file nobody could open, and the hit was suppressable by NEITHER bypass
+# (allowed_path() is keyed on real repo paths, and a binary carries no line to
+# hold a `# secret-scanner: skip` marker). One false positive would have wedged
+# the  recurring HEAD audit red with no remedy available to an agent.
+#
+# Staged mode was never affected: it pre-filters binaries out via numstat
+# (`[[ "$adds" == "-" ]] && continue`), which is why the fix is to make audit
+# mode match the scope staged mode ALREADY declares, not to widen either.
+
+
+def _binary_repo(tmp_path, name, *, also_text=False):
+    """A repo whose HEAD carries the key inside a BINARY blob.
+
+    with also_text=False the binary is the ONLY possible hit, so any report at
+    all came from the binary.
+    """
+    r = tmp_path / name
+    r.mkdir()
+    _git(tmp_path, "init", "-q", str(r))
+    _git(r, "config", "user.email", "t@example.com")
+    _git(r, "config", "user.name", "t")
+    (r / "blob.bin").write_bytes(b"\x00\x01\x02" + _FAKE_A.encode() + b"\x00\xff")
+    if also_text:
+        (r / "plain.txt").write_text("key = %s\n" % _FAKE_B)
+    _git(r, "add", "-A")
+    _git(r, "commit", "-q", "-m", "binary")
+    return r
+
+
+def test_scan_head_binary_only_repo_exits_zero(tmp_path):
+    """Scope pin: a binary-only hit is OUT of scope, exactly as when staged."""
+    r = _run(_binary_repo(tmp_path, "b1"), "--scan-head")
+    assert r.returncode == 0, (
+        "audit mode reported a binary that staged mode would have skipped; "
+        "stderr=%s" % r.stderr
+    )
+
+
+def test_scan_head_never_reports_the_binary_pseudo_path(tmp_path):
+    """Outcome 1: the report must never name the un-openable "Binary file HEAD".
+
+    Asserted against a repo that ALSO has a real text hit, so the scanner is
+    demonstrably producing a report -- an assertion that some string is absent
+    proves nothing if nothing was printed at all.
+    """
+    out = _run(_binary_repo(tmp_path, "b2", also_text=True), "--scan-head").stderr
+    assert "Binary file HEAD" not in out, out
+    assert "blob.bin" not in out, out
+
+
+def test_scan_head_still_detects_text_secret_alongside_a_binary(tmp_path):
+    """POSITIVE CONTROL for the two pins above.
+
+    Without this, `-I` could be silently disabling the whole HEAD scan and both
+    preceding tests would still pass -- rc=0 and "no pseudo-path in the report"
+    are exactly what a dead scanner produces. This is the g-115-4400 twin of the
+    probe-was-live control the module docstring describes for the exit code.
+    """
+    r = _run(_binary_repo(tmp_path, "b3", also_text=True), "--scan-head")
+    assert r.returncode == 1
+    assert "plain.txt" in r.stderr, r.stderr
+
+
+def test_staged_mode_binary_scope_is_unchanged(tmp_path):
+    """The fix touches the HEAD arm only; staged mode must be byte-for-byte
+    unaffected. Staging the binary alone still exits 0 via the numstat
+    pre-filter, as it always did."""
+    r = _binary_repo(tmp_path, "b4")
+    (r / "late.bin").write_bytes(b"\x00" + _FAKE_B.encode() + b"\xff")
+    _git(r, "add", "late.bin")
+    assert _run(r).returncode == 0
+
+
 # ── argument handling ─────────────────────────────────────────────────────
 
 def test_unknown_argument_is_rejected(repo):

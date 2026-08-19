@@ -1,3 +1,23 @@
+---
+paths:
+  - "core/config/**"
+  - "core/scripts/**"
+  - ".claude/skills/**"
+---
+
+<!--
+  Path-scoped (g-115-6469). This rule answers "where does this multi-paragraph
+  WHY go?" at the moment you are writing it — which is always while editing
+  extracted pseudocode in a digest, a SKILL.md, or a size-budgeted spec. Those
+  are the globs.
+
+  NOTE this rule has NO automated gate: nothing refuses a misplaced rationale.
+  It is scoped anyway because its trigger is unusually crisp (you are editing
+  one of these files or you are not), but that makes it the weakest of this
+  batch — if rationale files start drifting back inline, unscope it first.
+  See core/config/conventions/rules-loading.md.
+-->
+
 # Rationale Extraction (core/config/rationale/)
 
 ## Principle

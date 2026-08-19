@@ -386,6 +386,7 @@ def test_the_two_fences_never_both_fire():
 # guard-1943 / guard-2323 / guard-984: a green suite certifies the FUNCTION, never
 # the WIRING.
 
+import json        # noqa: E402
 import os          # noqa: E402
 import shutil      # noqa: E402
 import subprocess  # noqa: E402
@@ -639,3 +640,365 @@ def test_the_guard_runs_before_the_session_dir_is_used():
         f"the agent_dir guard must run before SESSION_DIR is assigned and long "
         f"before it is created (type_check={type_check} assign={assign} "
         f"mkdir={mkdir})")
+
+
+# ── : THE SAME-BOX RESTART AXIS (`superseded-token`) ────────────────
+#
+# The different-holder read above is blind to a reducer restart on the SAME box:
+# new token, unchanged machine_id. Since  the LIVE line carries a
+# `token-fp` digest, and a REDUCER can compare it against a hash of its own
+# runner-token file — the exact input runner-claim.sh acquires with — which makes
+# the axis decisive on the FIRST poll rather than a learned baseline.
+#
+# This trigger stops a HEALTHY loop, so the tests below weight the HOLD direction
+# deliberately: one proof it fires, and five that it stays inert on every
+# unreadable input (guard-1562).
+
+from reducer_self_fence import (  # noqa: E402
+    TOKEN_FP_UNKNOWN,
+    parse_token_fp,
+    read_own_token_fp,
+)
+
+MINE = "1f4c0a9b2e6d8035"
+THEIRS = "aa11bb22cc33dd44"
+
+_LIVE = ("[runner-claim] status: LIVE (backend=own-cloud) — 'zeta' is RUNNING on "
+         "'cc-02', heartbeat 272s old (threshold 3900s), token-fp {fp}")
+
+
+def test_same_box_restart_stands_down_on_the_token_axis():
+    """THE gap this axis exists to close: same machine, re-minted token.
+
+    machine_id is IDENTICAL on both sides, so `different-holder` cannot fire and
+    the pre-g-306-302 module reported HOLD here — a superseded reducer running on.
+    """
+    r = decide(0, "cc-02", "cc-02", 0, T,
+               observed_token_fp=THEIRS, self_token_fp=MINE)
+    assert r["verdict"] == VERDICT_STAND_DOWN
+    assert r["trigger"] == "superseded-token"
+    # Both digests must be NAMED — that is the whole diagnostic value of the axis.
+    assert MINE in r["reason"] and THEIRS in r["reason"]
+
+
+def test_the_token_axis_is_decisive_with_zero_failure_elapsed():
+    """Positive evidence, so it needs no accumulation — the scope (a) decision.
+
+    A reducer minted its own token, so a mismatch is proof of supersession rather
+    than a heuristic. Contrast `sustained-renewal-gap`, which is ambiguous and
+    therefore duration-gated.
+    """
+    r = decide(0, "cc-02", "cc-02", 0, T,
+               observed_token_fp=THEIRS, self_token_fp=MINE)
+    assert r["verdict"] == VERDICT_STAND_DOWN
+
+
+def test_matching_tokens_hold_and_say_so():
+    r = decide(0, "cc-02", "cc-02", 0, T,
+               observed_token_fp=MINE, self_token_fp=MINE)
+    assert r["verdict"] == VERDICT_HOLD
+    assert r["trigger"] == "holding"
+    assert MINE in r["reason"]
+
+
+@pytest.mark.parametrize("observed_fp,self_fp", [
+    (None, MINE),      # daemon predates the field / unparsable LIVE line
+    (THEIRS, None),    # own token file unreadable or empty
+    (None, None),      # neither side known
+])
+def test_an_unknown_fingerprint_is_non_discriminating_never_a_takeover(
+        observed_fp, self_fp):
+    """scope (c): absent or unreadable MUST hold, never fence.
+
+    This is the direction that matters. A mixed-version fleet, an unreadable
+    token file, or a mangled LIVE line must degrade to machine-only behaviour —
+    fencing every reducer on a missing field would be far worse than the gap.
+    """
+    r = decide(0, "cc-02", "cc-02", 0, T,
+               observed_token_fp=observed_fp, self_token_fp=self_fp)
+    assert r["verdict"] == VERDICT_HOLD
+
+
+def test_an_inert_token_axis_is_visible_in_the_reason():
+    """guard-1760: an inert check must not report the same clean verdict as an
+    armed one with nothing to distinguish them."""
+    armed = decide(0, "cc-02", "cc-02", 0, T,
+                   observed_token_fp=MINE, self_token_fp=MINE)["reason"]
+    inert = decide(0, "cc-02", "cc-02", 0, T,
+                   observed_token_fp=None, self_token_fp=MINE)["reason"]
+    assert armed != inert
+    assert "non-discriminating" in inert
+
+
+def test_different_holder_still_wins_over_the_token_axis():
+    """Ordering pin. Both are decisive, but a cross-box takeover must report the
+    machine-level trigger — it is the more legible diagnostic, and the existing
+    reason format is what operators already read."""
+    r = decide(0, "cc-05", "cc-02", 0, T,
+               observed_token_fp=THEIRS, self_token_fp=MINE)
+    assert r["trigger"] == "different-holder"
+
+
+def test_the_token_axis_cannot_fire_below_rc_zero():
+    """rc != 0 means no LIVE claim was observed at all, so there is no claim
+    fingerprint to compare against. The ambiguity branches must be untouched."""
+    for rc in list(FAILURE_RCS) + [4]:
+        r = decide(rc, None, "cc-02", 0, T,
+                   observed_token_fp=THEIRS, self_token_fp=MINE)
+        assert r["verdict"] == VERDICT_HOLD
+        assert r["trigger"] == "ambiguous-not-yet-decisive"
+
+
+# ── the parser: LINE-SCOPED, and `unknown` must not compare equal ────────────
+
+def test_parse_token_fp_reads_the_live_line():
+    assert parse_token_fp(_LIVE.format(fp=MINE)) == MINE
+
+
+def test_parse_token_fp_maps_the_unknown_literal_to_none():
+    """THE critical one. If `unknown` parsed through as a literal, two DIFFERENT
+    runners would both report `unknown`, compare EQUAL, and read as "no
+    takeover" — the single direction this axis must never fail in."""
+    assert parse_token_fp(_LIVE.format(fp=TOKEN_FP_UNKNOWN)) is None
+
+
+def test_parse_token_fp_is_scoped_to_the_live_line():
+    """A `token-fp` string in captured stderr — a traceback quoting this module,
+    a peer's diagnostic — must not be mistaken for this claim's fingerprint. A
+    mis-scoped read would manufacture a spurious supersession and stand a HEALTHY
+    reducer down.
+
+    THE FIXTURE IS THE POINT, and the obvious one does not test anything. With a
+    decoy placed AFTER a LIVE line that already carries its own fp, `find`
+    returns the real fp whether or not the search is line-scoped — the test
+    passes for the wrong reason (caught by mutation while writing this).
+
+    The discriminating case is a LIVE line with NO token-fp — an older
+    `runner-claim.sh` in a mixed-version fleet — followed by a decoy. Scoped:
+    None, correctly non-discriminating. Un-scoped: the decoy, a fabricated
+    fingerprint that would fence a healthy reducer.
+    """
+    live_without_fp = ("[runner-claim] status: LIVE (backend=own-cloud) — 'zeta' is "
+                       "RUNNING on 'cc-02', heartbeat 272s old (threshold 3900s)")
+    decoyed = live_without_fp + f"\n[some-other-tool] token-fp {THEIRS}\n"
+    assert parse_token_fp(decoyed) is None, (
+        "an un-scoped read fabricated a fingerprint from unrelated stderr")
+    # The weaker ordering case still holds: a decoy AFTER a real fp loses.
+    assert parse_token_fp(_LIVE.format(fp=MINE)
+                          + f"\n[some-other-tool] token-fp {THEIRS}\n") == MINE
+
+
+def test_parse_token_fp_returns_none_without_a_live_line():
+    assert parse_token_fp(f"[runner-claim] status: NOT LIVE — token-fp {THEIRS}") is None
+
+
+# ── the reader: containment + digest contract ────────────────────────────────
+
+def test_read_own_token_fp_matches_the_fingerprint_ssot(tmp_path):
+    """guard-920 join: the digest is computed locally (importing owncloud_backend
+    would drag boto3 into a per-tick fence), so it must be pinned equal to the
+    SSOT or the comparison is meaningless."""
+    from owncloud_backend import runner_token_fingerprint
+    p = tmp_path / "runner-token"
+    p.write_text("a-uuid4-like-value\n", encoding="utf-8")
+    assert read_own_token_fp(p) == runner_token_fingerprint("a-uuid4-like-value")
+
+
+def test_read_own_token_fp_strips_whitespace_the_way_runner_claim_does(tmp_path):
+    """runner-claim.sh sends `tr -d '[:space:]'` — ALL whitespace, not just the
+    ends. The two digests must agree byte-for-byte, so the normalization is part
+    of the contract."""
+    from owncloud_backend import runner_token_fingerprint
+    p = tmp_path / "runner-token"
+    p.write_text("  a-uuid4\n like-value \r\n", encoding="utf-8")
+    assert read_own_token_fp(p) == runner_token_fingerprint("a-uuid4like-value")
+
+
+def test_read_own_token_fp_never_returns_the_token(tmp_path):
+    """Containment is a security property: the raw value is a ConditionExpression
+    bearer credential and must not escape this function."""
+    secret = "super-secret-runner-token-value"
+    p = tmp_path / "runner-token"
+    p.write_text(secret, encoding="utf-8")
+    fp = read_own_token_fp(p)
+    assert secret not in fp and len(fp) == 16
+
+
+@pytest.mark.parametrize("content", ["", "   \n\t  "])
+def test_read_own_token_fp_is_none_for_an_empty_token(tmp_path, content):
+    p = tmp_path / "runner-token"
+    p.write_text(content, encoding="utf-8")
+    assert read_own_token_fp(p) is None
+
+
+def test_read_own_token_fp_is_none_when_unreadable(tmp_path):
+    assert read_own_token_fp(tmp_path / "does-not-exist") is None
+
+
+# ── backward compatibility + the deliberate divergence from the worker ───────
+
+def test_positional_callers_keep_their_exact_prior_verdict():
+    """Both fps are keyword-with-default, so every pre-existing 5-arg call — the
+    whole suite above, and the `decide-only` argv seam — is unchanged."""
+    assert decide(0, "cc-02", "cc-02", 0, T)["trigger"] == "holding"
+    assert decide(0, "cc-05", "cc-02", 0, T)["trigger"] == "different-holder"
+    assert decide(4, None, "cc-02", 0, T)["verdict"] == VERDICT_HOLD
+
+
+def test_the_reducer_axis_is_decisive_where_the_worker_axis_must_learn():
+    """The mirror asymmetry, asserted against the real worker module.
+
+    Same shape of evidence, different epistemic standing: the reducer MINTED its
+    token so a mismatch is positive proof, while the worker never held one and
+    can only notice the fp MOVED after learning a baseline from its first LIVE
+    poll. That is why the two implementations are separate rather than shared —
+    fusing them would put the two standards behind one branch.
+    """
+    from worker_reducer_liveness import decide as worker_decide
+    # Worker with NO learned baseline: the axis is inert, it keeps running.
+    w = worker_decide(0, "cc-02", "cc-02", 0, observed_token_fp=THEIRS,
+                      expected_token_fp=None)
+    assert w["verdict"] != "wind-down"
+    assert w["expected_token_fp"] == THEIRS, "the worker must LEARN the baseline"
+    # Reducer with no history at all: decisive immediately.
+    r = decide(0, "cc-02", "cc-02", 0, T,
+               observed_token_fp=THEIRS, self_token_fp=MINE)
+    assert r["verdict"] == VERDICT_STAND_DOWN
+
+
+def test_the_emitter_still_emits_the_marker_this_module_parses():
+    """guard-920: the LIVE line is produced by a bash script with embedded python
+    that cannot import from here, so a hand-copied marker can drift silently. Pin
+    the emitter's literal against this module's constant."""
+    from reducer_self_fence import TOKEN_FP_MARKER
+    emitter = (SCRIPTS / "runner-claim.sh").read_text(encoding="utf-8")
+    assert f"token-fp {{fp}}" in emitter, "the emitter no longer prints token-fp"
+    assert TOKEN_FP_MARKER.strip() in emitter
+    assert 'c.get("runner_token_fp") or "unknown"' in emitter, (
+        "the emitter's unknown-fallback changed; TOKEN_FP_UNKNOWN must follow it")
+
+
+# ──  / sq-019: the INTEGRATION path, which decide()-only tests miss ──
+#
+# Every test above drives decide() directly, so the plumbing in check() —
+# which fingerprint is read from the WIRE and which from THIS box's token file —
+# was entirely unguarded. Proven vacuous by mutation: swapping the two keyword
+# args at check()'s decide() call left all 79 tests GREEN
+# (mutation-proof-test.sh verdict FAIL, "VACUOUS TEST", sabotage_sites=2 —
+# both integration call sites were unguarded, not just one).
+#
+# NOTE WHY THE OBVIOUS ASSERT DOES NOT WORK: the swap changes only what decide()
+# SEES, not what check() STORES, so result["observed_token_fp"] is still correct
+# under sabotage. The discriminating assert is the REASON string, which names
+# each side ("mine <self> -> claim <observed>") and therefore inverts.
+
+from reducer_self_fence import check  # noqa: E402
+
+
+def _fake_claim(scripts_dir, fp, machine="cc-02", rc=0):
+    """Stub runner-claim.sh emitting a real-shaped LIVE line. check() shells out
+    to `<scripts_dir>/runner-claim.sh status --agent <a>`, so a stub here is the
+    whole seam — no daemon, no live claim, no second box."""
+    p = scripts_dir / "runner-claim.sh"
+    p.write_text(
+        "#!/usr/bin/env bash\n"
+        "echo \"[runner-claim] status: LIVE (backend=own-cloud) - 'zeta' is "
+        f"RUNNING on '{machine}', heartbeat 5s old (threshold 3900s), "
+        f"token-fp {fp}\"\n"
+        f"exit {rc}\n",
+        encoding="utf-8")
+    p.chmod(0o755)
+    return p
+
+
+def _token(tmp_path, value="my-own-runner-token"):
+    p = tmp_path / "runner-token"
+    p.write_text(value + "\n", encoding="utf-8")
+    return p
+
+
+def test_check_plumbs_each_fingerprint_to_the_side_it_belongs_on(tmp_path):
+    """The anti-swap pin. Reads the claim's fp off the WIRE and this box's fp
+    off the TOKEN FILE, and they must not be interchanged."""
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    _fake_claim(scripts, THEIRS)
+    tok = _token(tmp_path)
+    mine_fp = read_own_token_fp(tok)
+
+    r = check("zeta", scripts, "cc-02", tmp_path / "no-marker", 0, T, token_path=tok)
+
+    assert r["verdict"] == VERDICT_STAND_DOWN
+    assert r["trigger"] == "superseded-token"
+    assert r["observed_token_fp"] == THEIRS
+    assert r["self_token_fp"] == mine_fp
+    # THE discriminating assert -- the two above survive the swap, these do not.
+    assert f"mine {mine_fp}" in r["reason"], "self fp is not on the 'mine' side"
+    assert f"claim {THEIRS}" in r["reason"], "wire fp is not on the 'claim' side"
+
+
+def test_check_holds_when_the_claim_carries_my_own_token(tmp_path):
+    """The happy path through the real plumbing: same token both sides -> HOLD."""
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    tok = _token(tmp_path)
+    mine_fp = read_own_token_fp(tok)
+    _fake_claim(scripts, mine_fp)
+
+    r = check("zeta", scripts, "cc-02", tmp_path / "no-marker", 0, T, token_path=tok)
+    assert r["verdict"] == VERDICT_HOLD
+    assert r["trigger"] == "holding"
+    assert mine_fp in r["reason"]
+
+
+def test_check_holds_when_this_box_has_no_token_file(tmp_path):
+    """Scope (c) at the INTEGRATION level: an unreadable own token must leave the
+    axis non-discriminating even though the wire fp is present and DIFFERENT.
+    Decided at the fence, not merely inside decide()."""
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    _fake_claim(scripts, THEIRS)
+
+    r = check("zeta", scripts, "cc-02", tmp_path / "no-marker", 0, T,
+              token_path=tmp_path / "does-not-exist")
+    assert r["verdict"] == VERDICT_HOLD
+    assert r["self_token_fp"] is None
+    assert r["observed_token_fp"] == THEIRS
+
+
+def test_check_without_a_token_path_keeps_its_pre_change_behaviour(tmp_path):
+    """token_path is keyword-with-default, so an old caller gets both fps None
+    and the superseded-token branch cannot fire."""
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    _fake_claim(scripts, THEIRS)
+
+    r = check("zeta", scripts, "cc-02", tmp_path / "no-marker", 0, T)
+    assert r["self_token_fp"] is None
+    assert r["verdict"] == VERDICT_HOLD
+    assert r["trigger"] == "holding"
+
+
+def test_check_never_puts_the_raw_token_in_its_result(tmp_path):
+    """Containment at the boundary that actually leaves the process: check()'s
+    dict is printed as JSON to stdout and read by heartbeat-tick.sh."""
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    secret = "super-secret-runner-token-value"
+    tok = _token(tmp_path, secret)
+    _fake_claim(scripts, THEIRS)
+
+    r = check("zeta", scripts, "cc-02", tmp_path / "no-marker", 0, T, token_path=tok)
+    assert secret not in json.dumps(r)
+
+
+def test_the_main_decide_only_seam_also_orders_the_two_fps(tmp_path):
+    """sabotage_sites=2: the argv seam is the OTHER unguarded call site."""
+    out = subprocess.run(
+        [sys.executable, str(SCRIPTS / "reducer_self_fence.py"), "decide-only",
+         "0", "cc-02", "cc-02", "0", str(T), THEIRS, MINE],
+        capture_output=True, text=True)
+    payload = json.loads(out.stdout)
+    assert payload["trigger"] == "superseded-token"
+    assert f"mine {MINE}" in payload["reason"]
+    assert f"claim {THEIRS}" in payload["reason"]

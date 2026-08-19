@@ -294,6 +294,38 @@ def _classifier_subject(goal: dict) -> str:
     return ""
 
 
+def _route_notification(subject: str, body: str):
+    """Ask the fleet's notification-routing gate whether this escalation may
+    reach the USER (g-115-5825). Returns ("send"|"suppress", reason) or None
+    when the gate is unavailable — None means "behave as before" (send), which
+    is the gate's own inverted fail-safe direction: never let a missing module
+    silence a notification. Pure decision; the only I/O is a best-effort
+    telemetry row so the suppression is auditable (rb-7986: an unrecorded
+    routing decision is unfalsifiable either way).
+    """
+    try:
+        import notification_routing_gate as _nrg  # type: ignore
+    except Exception:
+        return None
+    try:
+        verdict, reason, _dest = _nrg.decide("blocker", subject, body)
+    except Exception:
+        return None
+    label = "suppress" if verdict == _nrg.SUPPRESS else "send"
+    try:
+        import _gate_log  # type: ignore
+        _gate_log.log(
+            "notify-user-routing-gate",
+            "block" if label == "suppress" else "pass",
+            caller="inbox-alert-age-check.py:_send_email",
+            trigger_matched="blocker",
+            payload=subject,
+        )
+    except Exception:
+        pass
+    return label, reason
+
+
 def _send_email(goal: dict, severity: str, age_hours: float, no_email: bool) -> tuple:
     """Fire the notification via world/scripts/email-send.sh. Returns (ok, detail).
 
@@ -331,6 +363,21 @@ def _send_email(goal: dict, severity: str, age_hours: float, no_email: bool) -> 
         # Provenance stamp — email-send.sh refuses payloads without it ().
         "XPayloadProvenance": "inbox-alert-age-check/v1",
     }
+    # Notification-routing gate ( user directive: "I actually do not
+    # want any emails anymore, if you can handle them"). This script calls
+    # email-send.sh DIRECTLY and therefore never passed through /notify-user
+    # Step 1.5b — a gate is only as broad as its entry points (guard-3448), and
+    # this entry point is what kept "Unclaimed alert" mail reaching the user
+    # after the policy shipped (his 2026-08-11 reply: "Why are these sent to
+    # me? Shouldn't these be sent to the agents to look into?"). Category is
+    # `blocker` (an unclaimed Unblock goal): SUPPRESS unless the alert text
+    # names a human-only class, in which case the gate's inverted fail-safe
+    # SENDS. On SUPPRESS nothing is dropped: the coordination-board breadcrumb
+    # (posted by the caller regardless of this verdict) IS the fleet-side
+    # destination — it is what tells agents to claim the goal.
+    verdict = _route_notification(subject, "\n".join(body_lines))
+    if verdict is not None and verdict[0] == "suppress":
+        return True, "suppressed_by_routing_gate:%s" % verdict[1]
     if no_email:
         return True, "no_email"
     try:
@@ -423,7 +470,21 @@ def run(args) -> dict:
     for g in goals:
         if not isinstance(g, dict):
             continue
-        if g.get("status") not in ("pending", "in-progress"):
+        # UNCLAIMED means: still `pending` AND nobody holds it. Until 2026-08-16
+        # this admitted `in-progress` goals and never read `claimed_by`, so a
+        # goal claimed 9h after filing kept escalating as "no agent has claimed
+        # it yet" — measured on : claimed 2026-08-09T01:35, still
+        # emailed to the user as unclaimed on 08-11 (66h after the claim) and
+        # again on 08-16 (7 days after). The escalation's own exit condition
+        # ("until claimed") was already satisfied and could never be observed
+        # by this predicate, so that alert re-notified forever ().
+        # A stale claim on a dead session is released by the stranded-claim
+        # sweep (claimed_by cleared, status back to pending), at which point
+        # the goal correctly re-enters this population — so reading claimed_by
+        # here does not hide genuinely orphaned alerts.
+        if g.get("status") != "pending":
+            continue
+        if g.get("claimed_by"):
             continue
         title = g.get("title", "") or ""
         if not title.startswith("Unblock"):

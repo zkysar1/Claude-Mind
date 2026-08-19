@@ -155,20 +155,46 @@ def _guard_signals(record):
     }
 
 
-def _last_active(record):
+def _utilization(record, counters=None):
+    """The record's utilization counters — sidecar-aware ().
+
+    `counters` is the caller-supplied sidecar map (id -> counters). It is a
+    PARAMETER rather than a load so this module keeps depending on stdlib +
+    yaml ALONE at import time; the seam pulls in `_paths`, which resolves
+    WORLD_DIR at import. Same reasoning (and same lazy-import shape) as the
+    `from _paths import PROJECT_ROOT` already inside `scan`. Default None =>
+    read the embedded field, byte-identical to pre-seam behaviour.
+
+    THIS IS THE RETIREMENT ENGINE'S CLOCK, and it fails in the destructive
+    direction. Once the writer lands, the embedded counters are a frozen
+    pre-split snapshot, so a guardrail retrieved or fired yesterday would read
+    as never-touched. That feeds BOTH paths that decide destruction: staleness
+    (makes it a retire candidate) and refresh-eligibility (removes the
+    cluster's protection). Both fail toward retiring, so a stale read here
+    inverts this engine's own DEFAULT-TO-KEEP invariant on exactly the
+    guardrails that are most in use.
+    """
+    if counters:
+        # Deferred, and deliberately inside the `counters` branch — see above.
+        # Reusing `utilization_of` rather than re-typing its sidecar-wins
+        # precedence keeps one implementation of that rule (guard-2676).
+        from _utilization_store import utilization_of as _uo
+        return _uo(record, counters)
+    return record.get("utilization") or {}
+
+
+def _last_active(record, counters=None):
     """last_active_at lives under `utilization` (stamped when times_active
     increments, once the daemon stamp ships - design Section 2). Absent today;
     read gracefully so the engine works pre-stamp."""
-    u = record.get("utilization") or {}
-    return u.get("last_active_at")
+    return _utilization(record, counters).get("last_active_at")
 
 
-def _last_retrieved(record):
-    u = record.get("utilization") or {}
-    return u.get("last_retrieved")
+def _last_retrieved(record, counters=None):
+    return _utilization(record, counters).get("last_retrieved")
 
 
-def effective_relevance(record):
+def effective_relevance(record, counters=None):
     """max(last_retrieved, last_active_at, last_relevant_at-or-created).
 
     last_relevant_at defaults (semantically) to `created` - guardrails have no
@@ -176,8 +202,8 @@ def effective_relevance(record):
     2). Returns None only when the record carries NO date signal at all
     (default-to-keep: a guard with no relevance clock is never eligible).
     """
-    lr = _parse_date(_last_retrieved(record))
-    la = _parse_date(_last_active(record))
+    lr = _parse_date(_last_retrieved(record, counters))
+    la = _parse_date(_last_active(record, counters))
     lra = _parse_date(record.get("last_relevant_at")) or _parse_date(record.get("created"))
     candidates = [d for d in (lr, la, lra) if d is not None]
     if not candidates:
@@ -185,9 +211,9 @@ def effective_relevance(record):
     return max(candidates)
 
 
-def staleness_days(record, today):
+def staleness_days(record, today, counters=None):
     """Days since effective_relevance, or None when no relevance signal."""
-    er = effective_relevance(record)
+    er = effective_relevance(record, counters)
     if er is None:
         return None
     return (today - er).days
@@ -434,15 +460,34 @@ def compute_cluster(guard_id, records=None, cfg=None):
     )
 
 
-def scan(today=None, scope_category=None, cfg=None, records=None, repo_root=None):
+def scan(today=None, scope_category=None, cfg=None, records=None, repo_root=None,
+         counters=None):
     """Emit stale ACTIVE candidates + clusters + refresh-eligibility + the
     guard-707 doc-grep result. READ-ONLY (writes nothing). Returns a
-    JSON-serialisable dict."""
+    JSON-serialisable dict.
+
+    `counters` (g-358-05): the utilization sidecar map. Loaded ONCE here and
+    threaded to every relevance read below, so a scan cannot mix sidecar and
+    embedded reads across candidates. Pass {} to force embedded reads (tests);
+    pass a dict to supply one.
+    """
     cfg = cfg or _load_config()
     today = today or date.today()
     if records is None:
         records = _read_guardrails()
     active = _active_records(records)
+
+    # Load the sidecar ONCE per scan. Fail-open to {} => embedded reads, i.e.
+    # exactly today's behaviour — same shape as the repo_root resolution below.
+    # Fail-open is the correct direction here and is worth stating: an empty
+    # map degrades to the pre-split read, whereas raising would take down a
+    # READ-ONLY scan over a counter store that is advisory by design.
+    if counters is None:
+        try:
+            from _utilization_store import load_counters as _load_counters
+            counters = _load_counters("guardrails")
+        except Exception:
+            counters = {}
 
     threshold = cfg["retire_threshold_days"]
     lookback = cfg["refresh_lookback_days"]
@@ -464,7 +509,7 @@ def scan(today=None, scope_category=None, cfg=None, records=None, repo_root=None
     for gid, rec in active.items():
         if scope_category and rec.get("category") != scope_category:
             continue
-        sd = staleness_days(rec, today)
+        sd = staleness_days(rec, today, counters)
         if sd is None or sd <= threshold:
             continue
         cluster = _compute_cluster_pure(
@@ -477,7 +522,8 @@ def scan(today=None, scope_category=None, cfg=None, records=None, repo_root=None
         refresh_eligible = False
         for m in cluster:
             mr = active.get(m, {})
-            for d in (_parse_date(_last_retrieved(mr)), _parse_date(_last_active(mr))):
+            for d in (_parse_date(_last_retrieved(mr, counters)),
+                      _parse_date(_last_active(mr, counters))):
                 if d is not None and (today - d).days <= lookback:
                     refresh_eligible = True
                     break
@@ -490,10 +536,10 @@ def scan(today=None, scope_category=None, cfg=None, records=None, repo_root=None
             "category": rec.get("category"),
             "source": rec.get("source"),
             "created": rec.get("created"),
-            "last_retrieved": _last_retrieved(rec),
-            "last_active_at": _last_active(rec),
+            "last_retrieved": _last_retrieved(rec, counters),
+            "last_active_at": _last_active(rec, counters),
             "last_relevant_at": rec.get("last_relevant_at"),
-            "times_active": (rec.get("utilization") or {}).get("times_active", 0),
+            "times_active": _utilization(rec, counters).get("times_active", 0),
             "staleness_days": sd,
             "cluster": sorted(cluster),
             "cluster_size": len(cluster),

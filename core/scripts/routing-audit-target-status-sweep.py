@@ -132,19 +132,45 @@ if str(SCRIPT_DIR) not in sys.path:
 from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, )
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
 
+#  lost-update guard. This sweep has the SAME scan-then-write shape as
+# unblock-parent-status-sweep, where the race was measured: `_mark_skipped`
+# rewrites outcome_note and flips status on a candidate chosen at scan time,
+# with nothing re-checking that the goal is still open at WRITE time. Same
+# blast radius too — a destroyed completion record on a goal another box just
+# finished. The refusal POLICY and the authoritative READ are both shared; only
+# the two thin seams below are local, so this file's `_read_aspirations` and
+# `_is_owncloud_backend` stay monkeypatchable (guard-2385).
+from _team_state import _is_owncloud_backend  # noqa: E402
+from _sweep_write_guard import (  # noqa: E402
+    reread_goal_authoritative as _shared_reread_goal_authoritative,
+    stale_candidate_reason as _shared_stale_candidate_reason,
+)
+
 
 # discovered_by constant set by post-decompose-routing-audit.py on both shapes
 ROUTING_AUDIT_DISCOVERER = "post-decompose-routing-audit"
 # origin_signal: exact forms emitted by _build_investigate_spec /
 # _build_either_resolve_spec — captures the TARGET goal-id in group 2.
+# `(?:-[a-z])?` matches the SSOT (aspirations.py GOAL_ID_RE). Both patterns in
+# this file need it, and they fail DIFFERENTLY, which is why one fix is not
+# enough (, measured cc-07 2026-08-10 on live goal  whose
+# signal is `routing-either-resolve:-a`):
+#   - THIS one is anchored on \s*$, so a suffixed id does not match AT ALL and
+#     the record falls through to the title fallback below. A silent miss.
+#   - The title fallback is UNANCHORED, so it then captures `` — a
+#     goal that DOES NOT EXIST — and the sweep decides a status question about
+#     a nonexistent record. That is the truncation class guard-2414 names, and
+#     it is reached precisely BECAUSE the anchored pattern above declined.
+# A fallback that is laxer than its primary converts a miss into a wrong
+# answer; fixing only the anchored one would have left that intact.
 ORIGIN_SIGNAL_PATTERN = re.compile(
-    r"^routing-(?:mismatch|either-resolve):(g-\d+-\d+)\s*$")
+    r"^routing-(?:mismatch|either-resolve):(g-\d+-\d+(?:-[a-z])?)\s*$")
 # Title prefix: "Investigate: routing-(mismatch|either-resolve) ..."
 TITLE_CLASS_PATTERN = re.compile(
     r"^\s*Investigate\s*:\s*routing-(?:mismatch|either-resolve)\b", re.IGNORECASE)
 # Title target fallback: "routing-(mismatch|either-resolve) <g-id> ..."
 TITLE_TARGET_PATTERN = re.compile(
-    r"routing-(?:mismatch|either-resolve)\s+(g-\d+-\d+)\b")
+    r"routing-(?:mismatch|either-resolve)\s+(g-\d+-\d+(?:-[a-z])?)\b")
 
 # : the audit's RECOMMENDED agent, parsed from the description clause
 # both spec builders (post-decompose-routing-audit._build_investigate_spec /
@@ -361,7 +387,26 @@ def _recommended_matches_current(g, target_id, intended_agent_idx):
     return matched, recommended, current
 
 
-def _mark_skipped(source, goal_id, note_detail):
+def _reread_goal_authoritative(source, goal_id):
+    """``(goal, provenance)`` from the STORE OF RECORD — seam over the shared
+    reader. Collaborators are passed explicitly and resolved as module globals
+    at call time so they stay monkeypatchable here (guard-2385)."""
+    return _shared_reread_goal_authoritative(
+        source, goal_id,
+        read_aspirations=_read_aspirations,
+        is_owncloud=_is_owncloud_backend,
+        label="routing-audit-target-status-sweep",
+    )
+
+
+def _stale_candidate_reason(source, goal_id):
+    """``None`` when the write may proceed, else the refusal reason."""
+    goal, prov = _reread_goal_authoritative(source, goal_id)
+    return _shared_stale_candidate_reason(goal, prov)
+
+
+def _mark_skipped(source, goal_id, note_detail, metrics_path=None,
+                  aspiration_id=None):
     """Mark routing-audit goal as skipped with target-resolved outcome_note.
 
     `note_detail` is the parenthesised reason suffix — terminal-status
@@ -373,7 +418,32 @@ def _mark_skipped(source, goal_id, note_detail):
     unblock-parent-status-sweep._mark_skipped — bash on Windows can resolve to
     WSL bash.exe with surprising PATH semantics; aspirations-update-goal.sh just
     shells aspirations.py with the same args).
+
+    g-115-6332: re-asserts the candidate predicate against the STORE OF RECORD
+    immediately before writing, and refuses when it no longer holds. The scan
+    that produced this candidate ran over the whole eligible set, so the
+    scan->apply gap is unbounded in principle.
     """
+    stale = _stale_candidate_reason(source, goal_id)
+    if stale is not None:
+        print(f"[routing-audit-target-status-sweep] REFUSED {goal_id}: {stale}",
+              file=sys.stderr)
+        # COUNT the refusal. A silent no-op is indistinguishable from never
+        # having raced, which would make this guard's own effectiveness
+        # unmeasurable — and an unmeasurable guard is the one that gets
+        # "simplified" away later.
+        _append_metric(metrics_path, {
+            "type": "routing_audit_refused_stale_candidate",
+            "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+            "goal_id": goal_id,
+            "source": source,
+            "aspiration_id": aspiration_id,
+            "note_detail": note_detail,
+            "reason": stale,
+            "agent": os.environ.get("MIND_AGENT", "") or None,
+        })
+        return False
+
     note = f"{OUTCOME_NOTE_PREFIX} {note_detail}"
     rc1, _, err1 = _py([str(SCRIPT_DIR / "aspirations.py"),
                         "--source", source, "update-goal",
@@ -393,9 +463,31 @@ def _mark_skipped(source, goal_id, note_detail):
 
 
 def _is_already_swept(g):
-    """Idempotency check: skip if outcome_note already names the sweep."""
+    """Idempotency: the note AND a terminal status — never the note alone.
+
+    g-115-5097, and the EXACT mirror of unblock-parent-status-sweep's guard —
+    this file documents itself as that sweep's mirror, and it mirrored the
+    defect too. _mark_skipped writes note then status as two non-atomic daemon
+    calls; keying dedup on the note alone makes the FIRST write the key, so a
+    partial success leaves the goal note-bearing and still pending, and every
+    later run skips it forever. Requiring a terminal status lets that state
+    re-qualify and self-heal on the next run.
+
+    Live instance this repairs without a migration: g-115-4016 carried
+    'routing-audit target resolved without action needed (target_id=g-115-4015,
+    target.status=completed)' with status=pending. It was left broken ON PURPOSE
+    by g-115-5097's author as the verification specimen.
+
+    As in the sibling sweep, main() pre-filters to pending/in-progress before
+    calling this, so the conjunct reads as always-false there — which is the
+    finding, not an oversight: the pre-fix guard could only ever fire on the
+    stranded goals, never on the fully-swept ones it claimed to protect. Kept
+    rather than deleted so the function remains correct if that filter changes.
+    """
     note = (g.get("outcome_note") or "")
-    return note.startswith(OUTCOME_NOTE_PREFIX)
+    if not note.startswith(OUTCOME_NOTE_PREFIX):
+        return False
+    return (g.get("status") or "") in TERMINAL_STATES
 
 
 def main():
@@ -543,7 +635,9 @@ def main():
                 "close_reason": close_reason,
             })
             if args.apply:
-                ok = _mark_skipped(source, g.get("id"), note_detail)
+                ok = _mark_skipped(source, g.get("id"), note_detail,
+                                   metrics_path=metrics_path,
+                                   aspiration_id=asp.get("id"))
                 entry["action"] = "marked" if ok else "mark_failed"
                 if ok:
                     applied += 1

@@ -185,6 +185,48 @@ _clear_in_flight() {
     return 0
 }
 
+# --- iteration-checkpoint clear () -------------------------------
+# SYMMETRY with the block above, and with claim. aspirations-claim.sh writes the
+# checkpoint (L262-266 `loop-state-save.sh init`); nothing ever cleared it, so
+# `loop-state-save.sh clear` shipped implemented, documented in its own header,
+# and with ZERO production call sites — the checkpoint was only ever corrected by
+# the NEXT claim's init.
+#
+# WHAT THAT COSTS, twice observed. Between a release and the next successful
+# claim the checkpoint asserts a goal that is not in flight, and the
+# SessionStart:compact hook reads it and emits "CRITICAL: Your in-flight goal is
+# <id> ... Resume execution on THIS goal. Do NOT re-run goal-selector.sh" — an
+# instruction that is wrong in every clause for a released goal and that forbids
+# the corrective action by name. alpha hit it via DEFER (cc-04, );
+# zeta hit it via explicit release-then-skip (cc-02, ).
+#
+# WHY HERE and not on each exit path: measured on this goal, the DEFER path
+# (aspirations-execute L234-244) does call release, and the SKIP path (L296,
+# "mark goal skipped, GOTO Phase 7") does NOT. So release is the right chokepoint
+# for the paths that reach it and is provably not the only one — which is why the
+# read-side cross-check in postcompact-restore.py was widened in the same change
+# rather than instead of this. Neither alone covers both paths.
+#
+# GOAL-CONDITIONAL, exactly like the body branch above and for the same reason:
+# an unconditional clear would unlink an anchor naming a DIFFERENT, live goal.
+# The compare-and-swap lives in `loop-state-save.sh clear --if-goal`, NOT here:
+# doing it in the caller means read -> pipe through python -> strip a trailing
+# \r before comparing, and skipping that strip makes the whole function inert on
+# Windows alone (the round-trip is text-mode; aspirations-claim.sh documents the
+# same trap at its own ENSURE check). The single-writer already holds the parsed
+# value, so it is the only place that should compare it.
+#
+# FAIL-OPEN: the daemon release has already committed by the time this runs. A
+# stale checkpoint is recoverable — the next claim re-inits it, and the read-side
+# cross-check in postcompact-restore.py now refuses to build a resume imperative
+# on one. A release reported as failed is not recoverable.
+_clear_iteration_checkpoint() {
+    [ -n "${MIND_AGENT:-}" ] || return 0
+    MIND_AGENT="$MIND_AGENT" bash "$CORE_ROOT/scripts/loop-state-save.sh" \
+        clear --if-goal "$GOAL_ID" >/dev/null 2>&1 || true
+    return 0
+}
+
 rc=0
 RESPONSE="$(rt_call POST /v1/aspirations/release --query "$QUERY")" || rc=$?
 
@@ -205,6 +247,7 @@ if goal is not None:
     print(json.dumps(goal, indent=2, ensure_ascii=False))
 "
         _clear_in_flight
+        _clear_iteration_checkpoint
         exit 0;;
     2)
         exit 1;;
@@ -229,6 +272,7 @@ if goal is not None:
     print(json.dumps(goal, indent=2, ensure_ascii=False))
 "
                 _clear_in_flight
+                _clear_iteration_checkpoint
                 exit 0
             fi
         fi

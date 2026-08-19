@@ -26,8 +26,8 @@ THRESHOLD="6"
 JSON_FLAG=""
 while [ $# -gt 0 ]; do
     case "$1" in
-        --agent) AGENT="$2"; shift 2 ;;
-        --threshold-hours) THRESHOLD="$2"; shift 2 ;;
+        --agent) AGENT="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --threshold-hours) THRESHOLD="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         --json) JSON_FLAG="--json"; shift ;;
         -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
         *) echo "liveness-check: unknown arg: $1" >&2; exit 2 ;;

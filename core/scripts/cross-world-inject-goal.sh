@@ -306,14 +306,14 @@ DRY_RUN=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --target)       TARGET="$2";      shift 2 ;;
-        --title)        TITLE="$2";       shift 2 ;;
-        --description)  DESCRIPTION="$2"; shift 2 ;;
-        --priority)     PRIORITY="$2";    shift 2 ;;
-        --category)     CATEGORY="$2";    shift 2 ;;
-        --reason)       REASON="$2";      shift 2 ;;
+        --target)       TARGET="$2";      shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --title)        TITLE="$2";       shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --description)  DESCRIPTION="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --priority)     PRIORITY="$2";    shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --category)     CATEGORY="$2";    shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --reason)       REASON="$2";      shift $(( $# >= 2 ? 2 : 1 )) ;;
         --shared)       SHARED=true;      shift   ;;
-        --target-aspiration) TARGET_ASPIRATION="$2"; shift 2 ;;
+        --target-aspiration) TARGET_ASPIRATION="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         --dry-run)      DRY_RUN=true;     shift   ;;
         --help|-h)      usage ;;
         *)              die "Unknown argument: $1. Use --help for usage." ;;

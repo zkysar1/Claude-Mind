@@ -1077,7 +1077,17 @@ echo '<stdin-json>' | bash core/scripts/experience-archive-goal.sh \
 # The wrapper moves <trace-path> to canonical
 # agents/<agent>/experience/exp-{goal.id}-{goal.skill_name_slug}.md.
 
-echo '{"experience_refs":["exp-{goal.id}-{goal.skill_name_slug}"]}' | Bash: wm-set.sh active_context.experience_refs
+# Pipe the LIST, not a dict re-naming the key. wm.py cmd_set ends in
+# `parent[key] = value` after resolve_slot(), so a dotted slot stores stdin
+# VERBATIM at that key: piping {"experience_refs":[...]} to the dotpath
+# ...active_context.experience_refs stored {"experience_refs":[...]} INSIDE
+# experience_refs, against the list schema at wm.py:154. That mattered because
+# Phase 9.5-exp's whole predicate is "empty, missing, or null" — a non-empty
+# dict is none of the three, so the experience gate returned PASS on a stale
+# ref from an unrelated goal (measured 3 days stale on cc-03, 11 days on cc-05).
+# The rule: pipe the value the dotpath NAMES. A dict goes to the PARENT path
+# (`wm-set.sh active_context`), never to the leaf that already names its key.
+echo '["exp-{goal.id}-{goal.skill_name_slug}"]' | Bash: wm-set.sh active_context.experience_refs
 ```
 
 ## Phase 4.26: Context Utilization Feedback — lightweight: SKIP if trivial_mode (backstop applies --all-unknown)

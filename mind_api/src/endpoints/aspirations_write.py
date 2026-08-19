@@ -68,13 +68,23 @@ from .. import file_locks, history, changelog
 # package gives us the pure evaluate() functions extracted in PR 7a.
 from _fileops import _atomic_write_with_fallback  # noqa: E402
 from storage_backend import get_backend  # noqa: E402  # s5c: own-cloud read freshness
+from _owncloud_codec import decode_response as _codec_decode_response  # noqa: E402  #  transport seam
 from ..agent_paths import assert_not_cruft, SESSIONS_DIRNAME  # noqa: E402
 import _gate_log  # noqa: E402
+from _cadence_anchor import is_deliberate_raise as _is_deliberate_raise  # noqa: E402
 # B9-deep: single-source census math (NOT a 3rd mirror) — folds evicted goals
 # back into progress so goal eviction is metric-neutral. _goal_census is a pure
 # leaf, resolvable via the same core/scripts sys.path entry file_locks adds.
 from _goal_census import effective_counts as _effective_counts, census_completed as _census_completed  # noqa: E402
 from _goal_census import all_evicted_ids as _all_evicted_ids  # noqa: E402  #  mint-site tombstone awareness
+# : the goal-field allowlist. Imported (never re-typed) so this LIVE
+# daemon path and aspirations.py::cmd_update_goal share one list — a hand-copied
+# twin here would drift silently while the CLI-side list still looked correct,
+# which is the guard-742/547 class this codebase keeps re-learning.
+from _goal_fields import (  # noqa: E402
+    is_known as _is_known_goal_field,
+    unknown_field_error as _unknown_goal_field_error,
+)
 # : claim()'s terminal-status refusal. REUSED, not redefined —
 # _goal_census.TERMINAL_STATUSES is drift-tested against
 # aspirations.TERMINAL_GOAL_STATUSES by
@@ -82,12 +92,18 @@ from _goal_census import all_evicted_ids as _all_evicted_ids  # noqa: E402  #  m
 #  /  both record that this definition is already duplicated
 # across subsystems. A fresh literal here would make that worse.
 from _goal_census import TERMINAL_STATUSES as _TERMINAL_STATUSES  # noqa: E402
+import _aspirations_resurrection as _resurrection  # noqa: E402  # archive-sweep resurrection predicate SSOT (2026-08-16)
 from gates.origin_signal import evaluate as _origin_signal_eval  # noqa: E402
 from gates.goal_duplication import evaluate as _goal_duplication_eval  # noqa: E402
 from gates.operator_offload import evaluate as _operator_offload_eval  # noqa: E402
 from gates.uncommitted_work import evaluate as _uncommitted_work_eval  # noqa: E402
 from gates.capability import evaluate as _capability_eval  # noqa: E402
 from gates.completion_artifact import evaluate as _completion_artifact_eval  # noqa: E402
+from gates.residual_work import (  # noqa: E402
+    evaluate as _residual_work_eval,
+    find_existing_successor as _rw_find_existing_successor,
+    build_successor_goal as _rw_build_successor,
+)
 from _override_helpers import audit_bulk_override as _audit_bulk_override  # noqa: E402
 # PR 7c additions:
 from gates.scaffolded_exploration import evaluate as _scaff_eval  # noqa: E402
@@ -308,7 +324,9 @@ def _authoritative_goal_lookup(live_path: Path, asp_id: str, goal_id: str):
     try:
         key = be._s3_key(str(live_path))
         obj = be.s3.get_object(Bucket=be.bucket, Key=key)
-        raw = obj["Body"].read().decode("utf-8", errors="replace")
+        # : decode through the one transport seam — the store may be
+        # gzip on the wire (magic-byte authoritative; plain passes through).
+        raw = _codec_decode_response(obj, key=key).decode("utf-8", errors="replace")
     except Exception as e:  # noqa: BLE001 — raw S3 read failed -> fail-open
         print(f"[daemon] persistence read-back unavailable "
               f"({type(e).__name__}); assuming persisted (fail-open, g-115-2208)",
@@ -504,6 +522,37 @@ def _find_aspiration(items: List[Dict[str, Any]], asp_id: str) -> Optional[Tuple
     return None
 
 
+def _archived_aspiration_hint(base_dir: Path, asp_id: str) -> str:
+    """Error-path-only suffix distinguishing "archived out of the live store"
+    from "never existed" (guard-1555: a lookup miss that collapses those two
+    cases is indistinguishable from a typo, and an id found in NEITHER store is
+    an anomaly to report rather than a silent skip).
+
+    Motivating incident (g-115-5969): the analyze-npc-behavior skill filed every
+    auto-generated improvement goal into asp-226 for the life of the skill. Once
+    asp-226 was archived, each call returned a bare "not found" — accurate about
+    the live store, yet `aspirations-read.sh --source world --id asp-226` STILL
+    resolved it from the archive with status=completed. That asymmetry cost a
+    two-step misdiagnosis: the refusal reads like a bad id, not a lifecycle event.
+
+    ONE-DIRECTIONAL BY DESIGN. A HIT is trustworthy and upgrades the message; a
+    MISS returns "" and changes nothing. The local aspirations-archive.jsonl is
+    S3-backed and is never pulled -- every caller reads the LIVE file and appends
+    here (g-115-3541) -- so the mirror may be stale and a miss can NEVER support a
+    "does not exist anywhere" claim. Fail-open: any read error returns "".
+    """
+    try:
+        for asp in _read_jsonl(base_dir / "aspirations-archive.jsonl"):
+            if asp.get("id") == asp_id:
+                status = asp.get("status") or "unknown"
+                return (f" -- it is ARCHIVED (status={status}) and add-goal "
+                        f"resolves targets in the LIVE store only. Retarget a "
+                        f"live aspiration, or re-open this one.")
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
 def _find_goal(items: List[Dict[str, Any]], goal_id: str) -> Optional[Tuple[int, int, Dict]]:
     """Return (asp_idx, goal_idx, asp_dict) or None."""
     for ai, asp in enumerate(items):
@@ -562,7 +611,23 @@ def _emit_e9_skip_observation(ctx, goal_id: str, new_status: str,
 
     title = goal.get("title", "")
     desc = goal.get("description", "")
+    # Mirrors core/scripts/aspirations.py::_emit_e9_skip_observation — see the
+    # long rationale there. Short form: `skip_reason` is a field NO writer sets
+    # (measured 2026-08-16, key structurally absent from every goal record), so
+    # this chain fell through to the fallback on 100% of skips while
+    # `outcome_note` held the actual rationale. outcome_note outranks
+    # defer_reason because on a skipped goal the defer is a stale leftover and
+    # the note is the skip decision. KEEP THE TWO COPIES IN SYNC.
+    # `str(...)` + `.strip()` fix three cases a fresh-eyes probe found in the
+    # bare `(x or "")[:300]` form, all introduced by the subscript: a dict
+    # raised `KeyError: slice(None, 300, None)` from OUTSIDE the try below (so
+    # this fail-open hook failed CLOSED, 500-ing an already-committed write), a
+    # list leaked into the f-string as "Reason: ['a', 'b']", and a
+    # whitespace-only note is truthy so it short-circuited past defer_reason
+    # into "Reason:    .". Keep `outcome_note` INSIDE this chain — the two-copy
+    # sync pin asserts on the chain's own text. See the CLI copy for detail.
     skip_reason = (goal.get("skip_reason")
+                   or str(goal.get("outcome_note") or "").strip()[:300]
                    or goal.get("defer_reason")
                    or "no reason given")
     # Skip trivial / mechanical goals — no encoding value.
@@ -1370,6 +1435,59 @@ def _run_update_goal_gates(ctx, goal_id: str, field: str, value
     """
     from ..server import Response
 
+    # blocker_ref SHAPE REFUSAL (). A blocker_ref must be absent,
+    # empty, or a dict -- never a scalar. add-goal already routes its ref
+    # through gates.blocker_ref.validate; this generic field-update path wrote
+    # whatever the wrapper's parse_value mirror encoded, so
+    # `aspirations-update-goal.sh <g> blocker_ref "<anything>"` stored a bare
+    # string.
+    #
+    # THIS IS THE LIVE HALF OF THE FIX, and the CLI twin in
+    # core/scripts/aspirations.py::cmd_update_goal carries the same refusal
+    # (guard-2323: port a core/scripts fix to its mind_api twin in the SAME
+    # change). Per the comment ~30 lines below, the framework is daemon-only, so
+    # every real invocation arrives HERE -- a refusal added only to the CLI copy
+    # would have been inert on the exact path that admits the defect
+    # (guard-742).
+    #
+    # WHY A REFUSAL rather than an advisory: a bare string is not a judgement
+    # call an author might defend, it is unreadable by every consumer. The
+    # read-side guards test `isinstance(br, dict) and br.get("type")`, so a
+    # scalar is SKIPPED rather than flagged; and no expires_at can be stored on
+    # a string, so the TTL that would force a re-probe never arms. The value
+    # gates work silently and indefinitely.
+    #
+    # MEASURED THREE TIMES, WHICH IS THE ACTUAL FINDING. The population is tiny
+    # and self-clearing (a ref disappears when its goal unblocks or completes),
+    # so every sweep reports "exactly ONE bare string" and looks stable while
+    # naming a DIFFERENT record each time:  (2026-07-29), 
+    # (2026-08-07),  (2026-08-11, a multi-sentence prose narrative --
+    # a third distinct malformed shape). A count that stays arithmetically true
+    # while its referent is replaced is invisible to exactly the check a careful
+    # reader would run ("is it still 1?"), which is why backfilling the named
+    # record was never the fix: the writer is live, so the residue regenerates.
+    #
+    # Clearing stays open (None / "" / {}) -- that is how the earlier instances
+    # were legitimately retired, and refusing it would break the unblock path.
+    if field == "blocker_ref" and value not in (None, "", {}):
+        if not isinstance(value, dict):
+            return Response.json({
+                "error": "blocker_ref_shape",
+                "gate": "blocker-ref-shape-gate",
+                "detail": (
+                    f"blocker_ref must be a JSON object, got "
+                    f"{type(value).__name__}. A scalar is unreadable by every "
+                    f"consumer: the read-side guards require a dict before any "
+                    f"branch acts, so it is silently skipped, and no expires_at "
+                    f"can be stored on it so the TTL never arms. Pass the "
+                    f"canonical shape, e.g. {{\"type\": \"partner-response\", "
+                    f"\"external_id\": \"<msg-or-goal-id>\"}}. To CLEAR it, "
+                    f"pass null. (g-115-3843)"
+                ),
+                "received_type": type(value).__name__,
+                "received_preview": repr(value)[:200],
+            }, status=400), None, None
+
     if field == "status" and value == "completed":
         unc_result = _uncommitted_work_eval(
             goal_id=goal_id,
@@ -1377,6 +1495,16 @@ def _run_update_goal_gates(ctx, goal_id: str, field: str, value
             repo_path=ctx.paths.project_root,
             world_dir=ctx.paths.world,
             agent_name=ctx.paths.agent_name,
+            # : WITHOUT THIS THE DELIVERY HALF OF THE GATE IS INERT.
+            # The gate blocks a committed-but-unpushed close only for the role
+            # contractually responsible for pushing (a worker Body does not
+            # push -- ). This framework is daemon-only, so EVERY real
+            # `aspirations-update-goal.sh <id> status completed` arrives here;
+            # the CLI wrapper's own $BODY_ROLE read is not on the production
+            # path. Read inline rather than via _header_override, whose
+            # contract is specifically an override JUSTIFICATION -- the
+            # empty-to-None coercion is identical, the meaning is not.
+            body_role=(ctx.headers.get("x-mind-body-role") or "").strip() or None,
         )
         if unc_result.get("would_block"):
             return Response.json({
@@ -1727,8 +1855,10 @@ def add_goal(ctx) -> "Response":  # type: ignore[name-defined]
             items = _read_jsonl(live_path)
             found = _find_aspiration(items, asp_id)
             if found is None:
-                return Response.error(404, "aspiration_not_found",
-                                      f"Aspiration {asp_id} not found in {source}")
+                return Response.error(
+                    404, "aspiration_not_found",
+                    f"Aspiration {asp_id} not found in {source}"
+                    + _archived_aspiration_hint(base_dir, asp_id))
             asp_idx, asp = found
 
             if "id" not in goal:
@@ -1879,6 +2009,37 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
             f"nested value, pass the parent field with full nested JSON "
             f"(e.g., field=verification value={{\"outcomes\":[...]}}). "
             f"For dotted-path navigation, use team-state.py.",
+        )
+
+    # UNKNOWN-FIELD GATE (). Direct sibling of the dotted-path check
+    # above — both refuse a name that would silently create a key on the shared
+    # goal record that no consumer reads. Measured before the gate: 147 distinct
+    # top-level keys across 2,791 live goals, 27 of them strays, including a
+    # `precondition_unmet` FIELD (that string is a defer_reason PREFIX) on a goal
+    # whose author believed it had been deferred. It never was, and nothing said so.
+    #
+    # Placed AFTER the dotted check and BEFORE source/agent resolution so a bad
+    # field name costs nothing: no path resolution, no gates, no lock.
+    if not _is_known_goal_field(field):
+        override = _header_override(ctx, "X-Mind-Allow-New-Field")
+        if not override:
+            return Response.json({
+                "error": "unknown_goal_field",
+                "gate": "goal-field-allowlist",
+                "field": field,
+                "message": _unknown_goal_field_error(field),
+            }, status=400)
+        # Overridden: the write proceeds, but a genuinely new field is now a
+        # DELIBERATE act with a justification on the audit ledger rather than a
+        # keystroke slip nobody ever sees.
+        _log_unstructured_override(
+            ctx.paths.world,
+            goal_id=goal_id,
+            defer_reason_text=f"new goal field {field!r}",
+            justification=override,
+            agent_name=ctx.paths.agent_name,
+            source="daemon:update_goal:allow-new-field",
+            which_checks_bypassed=["goal_field_allowlist"],
         )
 
     source = (ctx.query.get("source") or "world").lower()
@@ -2085,6 +2246,59 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
         except Exception:
             pass  # advisory must never break a durable write
 
+    # Structured-check schema on the verification-EDIT path — PRE-LOCK by
+    # . This ran INSIDE the lock until 2026-08-08, violating this
+    # function's own rule at the top ("Gates (run BEFORE the lock — slow I/O
+    # must not hold writers)"). _check_schema_eval -> classify() ->
+    # predicate.evaluate() reaches FIVE subprocess.run sites in
+    # core/scripts/predicate.py: L384 command_succeeds and L521
+    # metric_threshold (arbitrary shell, shell=True, up to MAX_COMMAND_TIMEOUT
+    # =120s each), plus L277 resolve_after_ref (git show), L668
+    # vcs_commits_since (git), and L795 pr_merged (`gh pr view` — a NETWORK
+    # round-trip to GitHub). Measured on the two shell handlers alone: a
+    # command_succeeds check at timeout_seconds=20 cost 20.0s + 20.0s = 40.0s
+    # of lock-held subprocess, and at the 120s ceiling one verification edit
+    # held world/aspirations.jsonl for up to 240s — blocking EVERY agent's
+    # goal write fleet-wide for that duration. The cost is doubled BY
+    # CONSTRUCTION, not incidentally: a no-regression policy must compare
+    # before against after, so it pays the command cost twice.
+    #
+    # THE ASYMMETRY THAT MAKES THIS SAFE. `new` needs NO goal load at all —
+    # check_schema.evaluate reads only goal["verification"]["checks"], so a
+    # synthetic {"verification": value} is byte-equivalent to the old
+    # candidate-overlay and carries ZERO TOCTOU. Only `cur` needs the stored
+    # record, and reading it unlocked is a BENIGN race in one direction only:
+    # a stale `cur` can list FEWER pre-existing invalid checks than the goal
+    # really has, which can only make `introduced` larger — i.e. the gate
+    # errs toward refusing, never toward wrongly admitting a regression. It
+    # cannot produce a false PASS.
+    if field == "verification":
+        try:
+            _pre_items = _read_jsonl(live_path)
+            _pre_found = _find_goal(_pre_items, goal_id)
+        except Exception:
+            _pre_found = None  # fail-open: the in-lock 404 below is authoritative
+        if _pre_found is not None:
+            _pre_goal = _pre_found[2]["goals"][_pre_found[1]]
+            cur = _check_schema_eval(_pre_goal, meta_dir=ctx.paths.meta,
+                                     agent_name=ctx.paths.agent_name or None)
+            new = _check_schema_eval({"verification": value},
+                                     meta_dir=ctx.paths.meta,
+                                     agent_name=ctx.paths.agent_name or None)
+            sig = lambda r: {(c["type"], c["reason"]) for c in r["invalid"]}  # noqa: E731
+            introduced = sig(new) - sig(cur)
+            if introduced:
+                return Response.error(
+                    400, "validation_failed",
+                    new["message"] + "\n  (verification edit refused: it "
+                    f"introduces {len(introduced)} NEW schema-invalid check(s). "
+                    "Pre-existing invalid checks on this goal are not blocking "
+                    "this edit — only the new one(s) are.)")
+            if new["warning"]:
+                import sys  # local-import convention (see _assert_no_prose_drift)
+
+                print(f"[daemon] {new['warning']}", file=sys.stderr)
+
     try:
         with file_locks.locked(live_path):
             items = _read_jsonl(live_path)
@@ -2148,24 +2362,15 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
             # passes, leaving them alone passes, adding a new broken one does not.
             # Signatures are (type, reason) pairs so a re-ordered checks list is
             # not mistaken for a regression.
-            if field == "verification":
-                cur = _check_schema_eval(goal, meta_dir=ctx.paths.meta,
-                                         agent_name=ctx.paths.agent_name or None)
-                new = _check_schema_eval(candidate, meta_dir=ctx.paths.meta,
-                                         agent_name=ctx.paths.agent_name or None)
-                sig = lambda r: {(c["type"], c["reason"]) for c in r["invalid"]}  # noqa: E731
-                introduced = sig(new) - sig(cur)
-                if introduced:
-                    return Response.error(
-                        400, "validation_failed",
-                        new["message"] + "\n  (verification edit refused: it "
-                        f"introduces {len(introduced)} NEW schema-invalid check(s). "
-                        "Pre-existing invalid checks on this goal are not blocking "
-                        "this edit — only the new one(s) are.)")
-                if new["warning"]:
-                    import sys  # local-import convention (see _assert_no_prose_drift)
-
-                    print(f"[daemon] {new['warning']}", file=sys.stderr)
+            #
+            # THE EVALUATION ITSELF NOW RUNS PRE-LOCK () — see the
+            # `if field == "verification":` block just above the `try:` that
+            # opens this lock. It stays OUT of here permanently: classify()
+            # shells out at five sites in predicate.py, one of them a network
+            # call to GitHub, and holding this lock across that blocks every
+            # agent's goal write fleet-wide. Do NOT move it back in for the
+            # convenience of having `goal` already loaded — `new` needs no goal
+            # at all, and a pre-lock `cur` can only err toward refusing.
 
             # === PR 7i in-lock status guards ===
             # Guards that need goal state run AFTER the goal load and BEFORE
@@ -2363,6 +2568,132 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
                         "gate_output": ca_result,
                     }, status=400)
 
+            # Layer-B residual-work gate (; Layer A = Step 8.55 in
+            # aspirations-state-update + guard-3601, honor-system). Refuses
+            # status=completed when the goal's outcome_note names undone work
+            # (deliberate scope narrowing — the  class: a spec on a
+            # COMPLETED record is invisible to every selector) and no LIVE
+            # carrier is cited. Accept paths: a cited pending/in-progress
+            # carrier goal id, an explicit owner decline, or the audited
+            # X-Mind-Override-Residual header. Runs in-lock because it reads
+            # goal.outcome_note; pure regex + in-memory scans, safe here.
+            #
+            # Layer D (mirror of the defer-gate auto-Unblock above): on block,
+            # file the suggested successor UNDER THIS SAME HELD LOCK before
+            # returning the 400, so the refusal never strands the agent at
+            # the same decision point. The status flip itself is NEVER
+            # committed (we are before `goal[field] = value`); only the
+            # successor is persisted. The agent's escape is one update: cite
+            # the filed id in outcome_note ("residual carried by g-NNN-NN"),
+            # then retry the close — accept path 1 then passes against the
+            # now-live successor.
+            if field == "status" and value == "completed":
+                rw_override = _header_override(
+                    ctx, "X-Mind-Override-Residual")
+                # THE OTHER QUEUE — the one that is NOT the ?source target
+                # (). `items` is the target queue, so this must be
+                # selected BY SOURCE: reading the agent queue unconditionally
+                # made both arguments identical on a `source=agent` close and
+                # the world queue was never loaded, so every world carrier
+                # reported live:false / status:null and the gate auto-filed
+                # duplicates for work already owned. Ported in the same change
+                # as the CLI twin in core/scripts/aspirations.py per
+                # guard-2323 — the daemon is the LIVE path, so a CLI-only fix
+                # would have been inert in production from the moment it
+                # landed.
+                _rw_other_items = None
+                if source == "agent":
+                    _rw_other_live = ctx.paths.world / "aspirations.jsonl"
+                else:
+                    _rw_other_live = (
+                        ctx.paths.agent / "aspirations.jsonl"
+                        if ctx.paths.agent is not None else None)
+                if _rw_other_live is not None and _rw_other_live.exists():
+                    try:
+                        _rw_other_items = _read_jsonl(_rw_other_live)
+                    except Exception:
+                        _rw_other_items = None  # fail-open cross-queue
+                rw_result = _residual_work_eval(
+                    goal_id=goal_id,
+                    outcome_note=str(goal.get("outcome_note") or ""),
+                    override=rw_override,
+                    items=items,
+                    other_items=_rw_other_items,
+                    world_dir=ctx.paths.world,
+                    agent_name=ctx.paths.agent_name or "",
+                    goal_priority=goal.get("priority"),
+                    goal_category=goal.get("category"),
+                )
+                if rw_result.get("would_block"):
+                    filed_successor_id = None
+                    filing_status = "not_attempted"
+                    existing = _rw_find_existing_successor(
+                        items, goal_id, _rw_other_items)
+                    if existing is not None:
+                        filing_status = (
+                            f"existing successor {existing.get('id')} "
+                            f"pending in {existing.get('_aspiration_id')} "
+                            f"({existing.get('_source')} queue, strategy="
+                            f"{existing.get('_match_strategy')}) — "
+                            f"idempotent skip; cite it in outcome_note")
+                    else:
+                        # Target routing: the original goal's own aspiration
+                        # first (a residual continues that aspiration's work
+                        # — consolidate-before-expand tail pull), then the
+                        # first active aspiration.
+                        _rw_target = asp
+                        if _rw_target is None or _rw_target.get(
+                                "status") not in (None, "active"):
+                            _rw_target = next(
+                                (a for a in items
+                                 if a.get("status") == "active"), None)
+                        if _rw_target is None:
+                            filing_status = ("no target aspiration "
+                                             "available — filing skipped")
+                        else:
+                            _rw_new_id = _allocate_goal_id(_rw_target)
+                            _rw_goal = _rw_build_successor(
+                                goal_id, rw_result, _rw_new_id)
+                            try:
+                                _validate_goal(_rw_goal)
+                                _rw_target.setdefault("goals", []).append(
+                                    _rw_goal)
+                                history.snapshot(
+                                    live_path, base_dir, agent,
+                                    summary=(f"residual-gate filed successor "
+                                             f"{_rw_new_id} for {goal_id}"))
+                                _atomic_write_jsonl(live_path, items)
+                                changelog.append(
+                                    base_dir, agent, live_path, "edit",
+                                    summary=(f"residual-gate filed successor "
+                                             f"{_rw_new_id} for {goal_id}"),
+                                    lines_changed=len(items))
+                                _jsonl_cache().invalidate(live_path)
+                                filed_successor_id = _rw_new_id
+                                filing_status = "filed"
+                            except (ValueError, OSError) as exc:
+                                # Fail-open: the refusal still stands; the
+                                # successor is best-effort.
+                                filing_status = f"filing failed: {exc}"
+                    return Response.json({
+                        "error": "residual_work_blocked",
+                        "gate": "residual-work-gate",
+                        "gate_output": rw_result,
+                        "filed_successor_id": filed_successor_id,
+                        "successor_filing_status": filing_status,
+                        "detail": (
+                            f"outcome_note on {goal_id} names undone work "
+                            f"(markers: "
+                            f"{', '.join(rw_result['matched_markers'])}) "
+                            f"with no live carrier cited. Either cite a "
+                            f"live carrier in outcome_note (e.g. 'residual "
+                            f"carried by "
+                            f"{filed_successor_id or 'g-NNN-NN'}') and "
+                            f"retry, record an explicit owner decline, or "
+                            f"pass --override-residual \"<justification>\" "
+                            f"(audited to residual-work-overrides.jsonl)."),
+                    }, status=400)
+
             # === Pre-mutation advisories (PR 7h) ===
             # Read pre-update state for advisories whose result depends on
             # the existing record (e.g., user_leg_scope on the current goal,
@@ -2440,6 +2771,37 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
                 and _prev_interval_hours > 0
             ):
                 goal["original_interval_hours"] = _prev_interval_hours
+
+            #  (DAEMON MIRROR of the aspirations.py cmd_update_goal
+            # deliberate-raise re-base; guard-742 byte-parallel). THIS is the live
+            # batch/manual apply path, so a CLI-only fix here is the half that
+            # never runs.
+            #
+            # The write-once branch above is correct for the CAP consumer
+            # (cargo-cult-detector: proposed = min(interval*multiplier,
+            # original*cap_ratio)) — a freely-mutable anchor there is the
+            #  unbounded ratchet it exists to stop. But the FLOOR consumer
+            # reads the SAME field (contract: floor = original*contract_floor_ratio)
+            # and goes stale-LOW when a cadence is deliberately raised: a goal
+            # widened 24h -> 168h kept floor = 24*0.33 = 7.92h, so a deep-outcome
+            # streak could walk a weekly cadence back toward ~8h. One field, two
+            # consumers, opposite requirements.
+            #
+            # Discriminator, needing no new field and no caller flag: an
+            # auto-extension is bounded BY CONSTRUCTION at original*cap_ratio, so a
+            # write STRICTLY ABOVE that bound provably did not come from one — only
+            # a manual or batch cadence edit can land there. The anchor therefore
+            # stays immutable for every automatic path and the cap cannot ratchet.
+            #
+            # Measured 2026-08-13 (zeta, hostname cc-02): of 50 recurring goals
+            # carrying both fields, 25 had interval > original and 6 sat ABOVE the
+            # cap bound (up to 7.0x). The 4 sitting EXACTLY at 3.0x are
+            # auto-extensions at their cap and are left alone by the strict >.
+            elif field == "interval_hours":
+                _anchor = goal.get("original_interval_hours")
+                _new_interval = goal.get("interval_hours")
+                if _is_deliberate_raise(_anchor, _new_interval):
+                    goal["original_interval_hours"] = _new_interval
 
             # === Cascade mutations (PR 7e/3) ===
             # All cascades happen INSIDE the lock so a concurrent read sees
@@ -2582,9 +2944,22 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
             # value=="completed"; agent from _agent_name(ctx) (the per-request
             # caller — NOT the daemon's env, which the CLI sibling uses).
             # Idempotent: only when unset, preserving complete-by / backfill.
+            # : `_stamped_completed_by` carries THIS write's decision
+            # down to the completed_by_sid stamp in step 9, so the pair lands
+            # together or not at all. Both halves were first-wins on their OWN
+            # guard — coherent per-field, wrong for a pair: on a goal that
+            # already carries the name and not the sid, this arm skips while the
+            # sid arm fires, filling the empty half from whoever issues the next
+            # write. Measured 2026-08-09 over the full store: 4239 completed
+            # goals in exactly that state, and 6 of 14 completion-SIDs already
+            # carrying more than one completed_by. Leaving the sid absent on
+            # those is the intended outcome — "an absent sid beats a wrong one"
+            # (_completed_by_sid, below).
+            _stamped_completed_by = False
             if (field == "status" and value == "completed"
                     and not goal.get("completed_by") and agent):
                 goal["completed_by"] = agent
+                _stamped_completed_by = True
 
             # 7. blocker_ref persist for status=blocked (mirror of lines
             # 2131-2136). The pre-lock header parse staged the validated ref
@@ -2646,7 +3021,17 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
                 # own name, not a widening of this one. The pop stays
                 # unconditional: the claim triple clears at EVERY terminal
                 # transition (guard-151).
-                if value == "completed" and not goal.get("completed_by_sid"):
+                #
+                # : "one coherent triple" was true field-by-field and
+                # false as a PAIR — each half guarded itself, so a write could
+                # fill one and skip the other. `_stamped_completed_by` is the
+                # join: the sid stamps only on the write that also stamped the
+                # name. Deliberately stricter than "completed_by was unset" — an
+                # unset name with no resolvable `agent` stamps nothing, and that
+                # must not license a sid, because a sid with no name beside it is
+                # exactly the shape this step was filed to remove.
+                if (value == "completed" and _stamped_completed_by
+                        and not goal.get("completed_by_sid")):
                     _cbs = _completed_by_sid(ctx, goal)
                     if _cbs:
                         goal["completed_by_sid"] = _cbs
@@ -2990,8 +3375,145 @@ def _append_jsonl(path: Path, item: Dict[str, Any]) -> None:
     """Append a single record to a JSONL file (for archive writes)."""
     assert_not_cruft(path.parent, "mkdir (_append_jsonl)")
     path.parent.mkdir(parents=True, exist_ok=True)
+    # aspirations-archive.jsonl is S3-backed. Every caller reads the LIVE file
+    # and appends here, so the archive itself is never pulled and the append
+    # extends a stale mirror (). Fail-open.
+    from storage_backend import ensure_local_before_append
+    ensure_local_before_append(path)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(item, ensure_ascii=True) + "\n")
+
+
+def _archive_replace_row(existing: Dict[str, Any],
+                         incoming: Dict[str, Any]) -> Dict[str, Any]:
+    """The archive row that results from archiving `incoming` when the archive
+    ALREADY holds `existing` for the same id. Aspiration-level fields: incoming
+    wins (it is the newest state). Goals: UNION by id, incoming wins on a
+    same-id clash, and a goal only the EXISTING row holds is KEPT.
+
+    The keep clause is the whole point. An archive row is the LAST home a
+    terminal goal record has (eviction re-homes nothing — see
+    aspirations-evict-completed.py "WHERE THE RECORDS GO"), and a resurrected
+    live copy is a stale SNAPSHOT that can carry FEWER goals than the row it
+    replaces. Measured 2026-08-16 on the first live run of the resurrection
+    reconcile: asp-240's live copy carried 2 goals, its archive row 7; a
+    wholesale replace dropped g-240-102/103/104/105/47 from the archive
+    (recovered from the S3 object version). Wholesale replace was
+    g-115-2604's shape; the union is what it should have been."""
+    out = dict(incoming)
+    incoming_goals = [g for g in (incoming.get("goals") or []) if isinstance(g, dict)]
+    have = {g.get("id") for g in incoming_goals}
+    kept = [g for g in (existing.get("goals") or [])
+            if isinstance(g, dict) and g.get("id") not in have]
+    if kept:
+        out["goals"] = incoming_goals + kept
+    return out
+
+
+def _archive_upsert(archive_path: Path, asp: Dict[str, Any]) -> str:
+    """Write `asp` into the archive: REPLACE the row that already carries its
+    id (via _archive_replace_row — goals unioned, never dropped), else append.
+    Returns "replaced" | "appended".
+
+    g-115-2604 gave archive_sweep replace-by-id because a record can already
+    sit in the archive when it is archived again — the live copy was
+    RESURRECTED (merge_aspirations is a union by id: an aspiration retired on
+    one box is re-added the next time a box that still holds it merges a stale
+    live file; a delete has no representation in that union) and then
+    re-completed / re-retired. The three single-record boundaries
+    (complete, complete-intent, retire) kept a bare append, so exactly the
+    aspirations most likely to be archived twice were the ones that doubled
+    their archive row (goal-completion audit, 2026-08-16). Same lock, same
+    fenced write path as archive_sweep; a miss is a plain append."""
+    archive = _read_jsonl(archive_path)
+    for i, existing in enumerate(archive):
+        if isinstance(existing, dict) and existing.get("id") == asp.get("id"):
+            archive[i] = _archive_replace_row(existing, asp)
+            _atomic_write_jsonl(archive_path, archive)
+            return "replaced"
+    _append_jsonl(archive_path, asp)
+    return "appended"
+
+
+def _reconcile_resurrected(items: List[Dict[str, Any]],
+                           archive: List[Dict[str, Any]],
+                           warnings: List[str]) -> List[str]:
+    """Re-apply the archive's disposition to RESURRECTED live copies.
+
+    THE CLASS (goal-completion audit, 2026-08-16 — measured 9 of 29 live
+    aspirations also present in the archive; 8 were resurrected retirements,
+    7 of them cross-world asp-xw-* stubs the 2026-08-10 sprint had retired as
+    duplicates of native goals): merge_aspirations is a UNION by aspiration
+    id, so removing a record from the live file (retire / complete /
+    archive_sweep) has no representation a peer's merge can see. Any box that
+    still holds the pre-retirement copy re-adds it, PRISTINE — goals back to
+    pending, no outcome_note, no last_modified — and the stub is selectable,
+    digest-emailed, and zombie-flagged again while the archive says it was
+    dispositioned. Same shape as write-loss lane (l) in the
+    daemon-only-architecture tree node ("a local delete having no
+    representation in the sync protocol so a read-through overlay resurrects
+    it"), one store up.
+
+    THE PREDICATE lives in core/scripts/_aspirations_resurrection.py — the
+    single source of truth shared with the read-only detector behind the
+    /verify-learning check (aspirations-resurrection-scan.py), so the sweep
+    and the alarm can never disagree about what a resurrection is. This
+    function is the APPLY side: for each (live goal, archived goal) pair the
+    predicate returns, the archive's disposition comes back — status + the
+    outcome fields the archive recorded — and when every remaining live goal
+    is terminal and nothing post-dates the archive, the aspiration is
+    re-marked with the archive's status so the classification loop below
+    archives it (replace-by-id, goals unioned) and drops it from the live
+    file. Left alone, on purpose (the predicate's post_archive_work): a live
+    goal the archive never saw (asp-328 shape: new goals filed against a
+    completed aspiration), a claim, or a last_modified past the stamp — a
+    sweep never overrules a live hand. Report-first is unnecessary: the ONLY
+    disposition this writes is one the archive already records a human/agent
+    having made. Returns the ids of the re-dispositioned goals."""
+    by_id = _resurrection.archive_by_id(archive)
+    now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    touched: List[str] = []
+    for a in items:
+        arch = by_id.get(a.get("id"))
+        if not arch:
+            continue
+        pairs, post_archive_work = _resurrection.classify(a, arch)
+        if not pairs:
+            continue
+        stamp = _resurrection.archive_terminal_stamp(arch)
+        redispositioned: List[str] = []
+        for g, ag in pairs:
+            g["status"] = ag["status"]
+            for f in ("outcome_note", "key_finding", "completed_date",
+                      "completed_by", "outcome_class", "skipped_at",
+                      "disposition_reason", "stranded_on_retire"):
+                if ag.get(f) is not None and g.get(f) in (None, ""):
+                    g[f] = ag[f]
+            g["resurrection_reconciled_at"] = now
+            redispositioned.append(g["id"])
+        _recompute_progress(a)
+        touched.extend(redispositioned)
+        still_open = [g["id"] for g in a.get("goals") or []
+                      if not g.get("recurring")
+                      and g.get("status") not in _TERMINAL_GOAL_STATUSES]
+        rearchived = False
+        if not post_archive_work and not still_open:
+            a["status"] = arch["status"]
+            a["archived"] = True
+            for key in ("retired_at", "completed_at"):
+                if arch.get(key) and not a.get(key):
+                    a[key] = arch[key]
+            rearchived = True
+        warnings.append(
+            f"RESURRECTION RECONCILE: {a['id']} is archived "
+            f"(status={arch.get('status')}, {stamp or 'undated'}) but a live "
+            f"copy resurfaced carrying {len(redispositioned)} goal(s) the "
+            f"archive had already dispositioned; re-applied the archived "
+            f"disposition to {', '.join(redispositioned)}"
+            + (" — aspiration re-marked for archival." if rearchived
+               else f" — aspiration kept live (post-archive work: "
+                    f"{'new/claimed/modified goals' if post_archive_work else 'open goals ' + ', '.join(still_open)})."))
+    return touched
 
 
 def complete(ctx) -> "Response":  # type: ignore[name-defined]
@@ -3138,7 +3660,9 @@ def complete(ctx) -> "Response":  # type: ignore[name-defined]
 
             # Archive BEFORE removing from live — crash safety:
             # aspiration exists in both (benign) rather than neither (data loss).
-            _append_jsonl(archive_path, asp)
+            # Upsert, not append: a resurrected copy re-completed here must
+            # replace its existing archive row (see _archive_upsert).
+            _archive_upsert(archive_path, asp)
 
             # Remove from live
             items.pop(idx)
@@ -3300,8 +3824,9 @@ def complete_intent(ctx) -> "Response":  # type: ignore[name-defined]
             # Normalize terminal goals before archive (clears stale defer state)
             _normalize_terminal_goals_in(asp)
 
-            # Archive BEFORE removing from live — crash safety
-            _append_jsonl(archive_path, asp)
+            # Archive BEFORE removing from live — crash safety (upsert: a
+            # resurrected copy re-completed here replaces its archive row).
+            _archive_upsert(archive_path, asp)
 
             # Remove from live
             items.pop(idx)
@@ -3479,6 +4004,13 @@ def _emit_streak_break_signal_daemon(ctx, goal_id: str,
         "processed": False,
     }
     try:
+        # streak-breaks.jsonl lives under agents/<a>/session/, which is NOT
+        # machine-local: _EXCLUDE_DIRS carries "sessions" (the per-SID dirs), not
+        # "session", so this file syncs to S3 (). It has no merge
+        # handler either, which makes a stale-base append costlier here than on a
+        # registered store. Fail-open — this block is already best-effort.
+        from storage_backend import ensure_local_before_append
+        ensure_local_before_append(log_path)
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception as e:
@@ -3502,6 +4034,14 @@ def complete_by(ctx):
                               "goal_id query parameter is required")
 
     source = params.get("source", "world")
+    # : _resolve_paths branches `if source == "agent" else world` with
+    # NO error arm, so any value that is not exactly "agent" — a typo (`agnet`),
+    # a case variant (`Agent`), a shell-mangled empty string — silently resolves
+    # to the WORLD queue and completes a goal there, reporting success. Every
+    # sibling write handler rejects here; this one and `retire` did not.
+    if source not in ("world", "agent"):
+        return Response.error(400, "invalid_source", f"source must be 'world' or 'agent', got '{source}'")
+
     agent = params.get("agent_name", "").strip() or _agent_name(ctx)
     # Reject flag-shaped or otherwise malformed agent names. Catches the
     # 2026-05-14 failure mode (.completed_by = '--completed-by'
@@ -3533,6 +4073,18 @@ def complete_by(ctx):
             asp_idx, goal_idx, asp = result
             goal = asp["goals"][goal_idx]
             goal["completed_by"] = agent
+            # Persist the caller's one-line finding ON THE GOAL RECORD. Until
+            # 2026-08-16 () it was read into a local and forwarded
+            # only to team-state's 50-row ring buffer, so the durable, shared,
+            # queryable artifact — the record every triage/drain lane reads —
+            # never carried it, and the same value evaporated from the world
+            # after 50 completions. Set for both branches (a recurring cycle's
+            # finding is as real as a one-shot's); never cleared on a re-run
+            # without a value, so an earlier finding is not blanked by a bare
+            # attribution call. Optional by design — see the team-state note
+            # below for why the ring-buffer append stays gated on it.
+            if key_finding:
+                goal["key_finding"] = key_finding
 
             #  outcome 5 — compute BEFORE either pop path clears the
             # holder fields this reads. Warn-only; see _nonholder_claim_warning
@@ -3675,6 +4227,21 @@ def complete_by(ctx):
     # means "written by the other writer" rather than "no executor", which is
     # precisely the un-auditable ambiguity this goal exists to remove.
     # A reader wanting the executor JOINS on goal_id against the goal record.
+    #
+    # WHY THIS STAYS GATED ON key_finding (decided 2026-08-16,  Q1,
+    # after measuring the reducer's close sequence rather than assuming it):
+    # the reducer path already appends this record UNCONDITIONALLY in
+    # iteration-close.sh do_state_update (key_finding defaults to "completed"),
+    # and it reaches complete-by TWICE per iteration without a key_finding —
+    # do_verify's IS_RECURRING branch, then aspirations Phase 5.3 attribution
+    # for one-shots — so an unconditional append here would write every reducer
+    # close two or three times into a 50-row ring buffer and halve its horizon.
+    # The invariant is ONE team-state writer per close path: reducer close ->
+    # do_state_update; direct closers (drain / triage / worker retrospective /
+    # any caller for whom THIS call is the close of record) -> pass
+    # --key-finding and this branch writes the row. Do not "fix" the gate by
+    # deduplicating on goal_id instead: recurring goals legitimately recur in
+    # the buffer once per cycle, and a goal_id dedup would erase that history.
     if key_finding:
         completion_record = {
             "goal_id": goal_id,
@@ -3703,6 +4270,13 @@ def retire(ctx) -> "Response":  # type: ignore[name-defined]
         return Response.error(400, "missing_asp_id", "query parameter 'asp_id' required")
 
     source = (ctx.query.get("source") or "world").strip()
+    # : see the identical guard in complete_by. Without it an invalid
+    # source resolves to WORLD and archives an aspiration in the wrong queue,
+    # reporting success. Retire is the higher-cost half of the pair — it moves a
+    # whole aspiration, not one goal.
+    if source not in ("world", "agent"):
+        return Response.error(400, "invalid_source", f"source must be 'world' or 'agent', got '{source}'")
+
     force = (ctx.query.get("force") or "").lower() == "true"
     # FW-2: agent-scoped writes MUST carry an explicit X-Mind-Agent header —
     # never silently fall back to the alphabetically-first agent's queue.
@@ -3756,7 +4330,10 @@ def retire(ctx) -> "Response":  # type: ignore[name-defined]
 
             archived_goal_ids = {g["id"] for g in asp.get("goals", [])}
             _normalize_terminal_goals_in(asp)
-            _append_jsonl(archive_path, asp)
+            # Upsert: a RESURRECTED copy re-retired here (the sprint-retired
+            # asp-xw stubs that came back pristine, 2026-08-16) must replace
+            # its archive row, not double it.
+            _archive_upsert(archive_path, asp)
             items.pop(idx)
             _clear_stale_blockers_inline(items, archived_goal_ids)
 
@@ -4390,6 +4967,97 @@ def _same_box_body_is_live(ctx, holder_sid: str,
         return False
 
 
+def _cross_box_body_is_live(ctx, agent_name: str, holder_sid: str,
+                            goal_id: str, stale_minutes: float) -> bool:
+    """Is `holder_sid` a LIVE worker Body of `agent_name` on ANOTHER box,
+    holding `goal_id`?
+
+    Cross-BOX sibling of `_same_box_body_is_live` (g-306-318). This is the last
+    cell of the holder-liveness matrix: g-306-140 closed worker-vs-worker on the
+    SAME box, g-306-132-a closed the absent-`running-session-id` cross-box case,
+    and what remained unguarded was the pairing that matters most under the
+    Mind/Body split — the REDUCER versus its own REMOTE workers. Measured
+    2026-08-18 07:20: a worker Body claimed a goal and the reducer on another
+    box claimed the SAME goal 14 s later, logged as a benign "dormant" takeover.
+
+    WHY NOT REUSE `_cross_box_holder_is_live`, which already reads this shard.
+    That helper keys on the AGENT-level `in_flight` row, which carries no
+    session id — and `_holder_session_is_live_runner`'s docstring rejects it
+    here for exactly that reason: it "would refuse a legitimate same-box
+    takeover whenever the mind happened to be alive elsewhere". The SID-keyed
+    `in_flight_bodies[<holder_sid>]` row answers the session-level question the
+    calling branch actually asks, so the objection does not reach it. That is a
+    behavioural difference, not a stylistic one, and it is pinned by
+    test_claim_cross_box_body_holder.py case D (a fresh agent-keyed `in_flight`
+    naming this very goal must STILL permit the takeover).
+
+    WHY `claimed_at` AND NOT `last_active` (guard-3604). `last_active` has a
+    known false-positive generator: `team-state-clear-in-flight.sh` BUMPS a
+    peer's `last_active` when policing it, so a dormant peer reads fresh for the
+    full window — and here a wrong "fresh" produces a wrong REFUSAL, which
+    wedges the goal. `claimed_at` on the per-SID row is written once by the Body
+    itself at claim time and no cross-agent maintenance write touches it.
+
+    KNOWN LIMIT, recorded rather than left to be rediscovered: `claimed_at` is
+    never refreshed, so a Body legitimately working ONE goal for longer than
+    `stale_minutes` ages out of this protection. That lands in the documented
+    fail-open direction (a wrong False merely permits a claim that is already
+    possible today), and the continuously-refreshed cross-box signal — the
+    syncable `session/body-heartbeat-<SID>.json` carrier — is a strictly larger
+    change than this one.
+
+    Returns True ONLY on positive confirmation. Every other path — missing
+    ids, unreadable shard, absent/!dict `in_flight_bodies`, no row for this sid,
+    a row naming a different goal, an unparseable or stale `claimed_at` —
+    returns False, i.e. permits the claim.
+    """
+    # Per-function `import sys`, hoisted ABOVE the try, for the reason spelled
+    # out at `_cross_box_holder_is_live`: this module does not import sys at
+    # module scope, so a bare `sys` in the except-clause raises NameError and
+    # the clause swallows it into `return False` — leaving this fallback
+    # permanently dead while still compiling and passing every test that does
+    # not reach it. That is the same silent-False class this helper exists to
+    # remove (F-003 of ).
+    import sys
+    try:
+        if not goal_id or not agent_name or not holder_sid:
+            return False
+        scripts_dir = str(ctx.paths.project_root / "core" / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        from _team_state import read_shard_authoritative
+        # Fails open to the LOCAL mirror on any backend error (documented
+        # contract). That degradation cannot manufacture a refusal on its own:
+        # a stale mirror fails the freshness gate below and permits the claim.
+        row = read_shard_authoritative(ctx.paths.world, agent_name)
+        if not isinstance(row, dict):
+            return False
+        bodies = row.get("in_flight_bodies")
+        if not isinstance(bodies, dict):
+            return False
+        body = bodies.get(str(holder_sid))
+        if not isinstance(body, dict):
+            return False
+        if str(body.get("goal_id") or "") != str(goal_id):
+            return False  # that Body is on a DIFFERENT goal -> not evidence
+        claimed_at = body.get("claimed_at")
+        if not claimed_at:
+            return False
+        try:
+            ca = datetime.strptime(str(claimed_at).strip()[:19],
+                                   "%Y-%m-%dT%H:%M:%S")
+        except (ValueError, TypeError):
+            return False  # unparseable -> ambiguous -> never refuse
+        age_s = (datetime.now() - ca).total_seconds()
+        return age_s <= (float(stale_minutes) * 60.0)
+    except Exception as e:  # noqa: BLE001 — fail-open, but never silently
+        print(f"[daemon claim] WARN: cross-box BODY liveness probe for "
+              f"{agent_name!r}/{holder_sid!r}/{goal_id!r} failed "
+              f"({type(e).__name__}: {e}); treating as not-live",
+              file=sys.stderr)
+        return False
+
+
 def _holder_session_is_live_runner(ctx, agent_name: str,
                                    holder_sid: str,
                                    goal_id: str) -> bool:
@@ -4425,11 +5093,22 @@ def _holder_session_is_live_runner(ctx, agent_name: str,
         `running-session-id` names only the reducer, so a LIVE non-reducer
         worker Body is indistinguishable from a dead prior session here. It now
         consults the per-Body heartbeat via _same_box_body_is_live (g-306-140).
-        Still deliberately NO cross-box fallback: that helper is goal-scoped on
-        `in_flight` and would refuse a legitimate same-box takeover whenever the
-        mind happened to be alive elsewhere. The per-Body heartbeat is SID-
-        scoped, so it answers the session-level question this branch actually
-        asks.
+        This branch USED to carry "still deliberately NO cross-box fallback",
+        and that was correct only about ONE helper. `_cross_box_holder_is_live`
+        is STILL not consulted here, for the reason that sentence gave: it is
+        goal-scoped on the AGENT-keyed `in_flight` row, which carries no session
+        id, so it would refuse a legitimate same-box takeover whenever the mind
+        happened to be alive elsewhere. But "no cross-box signal exists for a
+        SESSION" was never true — it just had not been wired. Absent a
+        heartbeat on THIS box the holder is not dormant, it is UNANSWERED, and a
+        remote worker Body never writes a heartbeat here at all, so the
+        same-box probe returns False for a perfectly live Body and the claim
+        fell through as a "dormant" takeover (measured 2026-08-18 07:20:
+        reducer took a worker Body's 14-second-old claim). So a SID-keyed
+        cross-box consult now follows it: `_cross_box_body_is_live` reads
+        `in_flight_bodies[holder_sid]` and refuses only on a FRESH row naming
+        THIS goal (g-306-318). Both consulted signals are SID-scoped, which is
+        what makes them answer the session-level question this branch asks.
       - absent/empty -> this box does not run this agent's loop, so the file
         is not stale, it is UNANSWERABLE (guard-2418). Previously this fell
         straight to False and a LIVE reducer on another box was silently
@@ -4477,8 +5156,19 @@ def _holder_session_is_live_runner(ctx, agent_name: str,
             # provably the bound agent here — the guard clause above returns
             # False unless agent_name == _agent_name(ctx) — so this resolves the
             # same session dir it always did ().
-            return _same_box_body_is_live(ctx, holder_sid, stale_minutes,
-                                          agent_name)
+            if _same_box_body_is_live(ctx, holder_sid, stale_minutes,
+                                      agent_name):
+                return True
+            # ...and if the holder has no heartbeat on THIS box, that is not
+            # evidence it is dormant — it is the cross-box shape (). A
+            # remote worker Body never writes a heartbeat here, so the same-box
+            # probe above returns False for a perfectly live Body and the claim
+            # used to fall through as a "dormant" takeover. Consult the SID-
+            # keyed `in_flight_bodies[holder_sid]` row, which is fleet-shared
+            # and answers the session-level question; the AGENT-keyed
+            # `in_flight` row is still NOT consulted here (see the docstring).
+            return _cross_box_body_is_live(ctx, agent_name, holder_sid,
+                                           goal_id or "", stale_minutes)
         if not hb_path.exists():
             return False
         import time as _time  # not imported at module scope
@@ -4823,9 +5513,13 @@ def claim(ctx) -> "Response":  # type: ignore[name-defined]
             # When the same goal_id exists in BOTH world and agent queues,
             # claim previously resolved to the world copy silently regardless
             # of caller intent. Now: if collision detected, refuse with 409
-            # so the caller picks a queue explicitly (agent-queue goals don't
-            # need claim; use recurring-close.sh or
-            # aspirations-update-goal.sh --source agent directly for those).
+            # so the caller picks a queue explicitly by re-issuing with
+            # &source=agent or &source=world. This comment previously carried
+            # the same falsified premise as the 409 body below it -- that
+            # agent-queue goals need no claim -- which  disproved and
+            #  removed from the loop. Both are corrected together
+            # (): a stale comment misleads the next EDITOR exactly as
+            # the stale string misled the next CALLER.
             #
             # Scoped to source=="world" (): this 409 exists to force the
             # caller to name a queue, so it is exactly redundant once they have.
@@ -4839,11 +5533,18 @@ def claim(ctx) -> "Response":  # type: ignore[name-defined]
                         if _find_goal(agent_items, goal_id) is not None:
                             return Response.error(409, "goal_id_collision",
                                 f"Goal {goal_id} exists in BOTH world and "
-                                f"agent queues. Claim is ambiguous. Rename "
-                                f"one queue's copy, OR for the agent-queue "
-                                f"goal call recurring-close.sh / "
-                                f"aspirations-update-goal.sh --source agent "
-                                f"directly (agent goals don't require claims).")
+                                f"agent queues. Claim is ambiguous — name the "
+                                f"queue explicitly and re-issue: &source=agent "
+                                f"claims the agent-queue copy under the same "
+                                f"session-scoped guards world goals get, "
+                                f"&source=world claims the world copy. "
+                                f"Renaming one queue's copy also resolves it. "
+                                f"Do NOT read this as 'agent goals don't "
+                                f"require claims' — they have carried claims "
+                                f"since g-306-238, and a reducer and its "
+                                f"worker Bodies are separate sessions of one "
+                                f"agent that have double-executed the same "
+                                f"goal.")
                     except Exception:
                         pass
             if found is None:
@@ -5297,6 +5998,18 @@ def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
             remaining: List[Dict[str, Any]] = []
             recovered = 0
 
+            # Resurrection reconcile FIRST (goal-completion audit 2026-08-16):
+            # a live copy of an aspiration the archive already holds as
+            # terminal gets the archive's disposition back on the goals the
+            # archive dispositioned, and — when nothing post-dates the
+            # archive — is re-marked so the classification below archives it
+            # (replace-by-id) instead of leaving a pristine pending zombie
+            # live forever. Reads the archive under the live lock; the
+            # classification loop re-reads it only when there is something
+            # to archive, so this is the one archive read on the no-op path.
+            resurrected_goal_ids = _reconcile_resurrected(
+                items, _read_jsonl(archive_path), warnings)
+
             for a in items:
                 if a.get("status") in ("completed", "retired"):
                     recurring = _find_recurring_goals(a)
@@ -5374,7 +6087,7 @@ def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
                     remaining.append(a)
 
             if not to_archive:
-                if recovered:
+                if recovered or resurrected_goal_ids:
                     history.snapshot(live_path, base_dir, agent,
                                     summary="archive-sweep (recovery only)")
                     _atomic_write_jsonl(live_path, remaining)
@@ -5386,6 +6099,7 @@ def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
                     "ok": True,
                     "archived_count": 0,
                     "recovered": recovered,
+                    "resurrected_reconciled": resurrected_goal_ids,
                     "warnings": warnings if warnings else None,
                 })
 
@@ -5402,13 +6116,18 @@ def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
             # archive copy in place. Extend-only here appended a second copy per
             # re-sweep (observed: asp-344 archived as completed, resurrected,
             # retired in live — a plain extend would have doubled it).
+            # Replace = aspiration-level fields from the incoming copy, goals
+            # UNIONED (_archive_replace_row) — a resurrected snapshot can carry
+            # fewer goals than the archive row it supersedes, and the archive
+            # is the last home those records have (2026-08-16, asp-240).
             archive = _read_jsonl(archive_path)
             incoming_by_id = {a.get("id"): a for a in to_archive}
             deduped_replaced = 0
             for i, existing in enumerate(archive):
                 eid = existing.get("id")
                 if eid in incoming_by_id:
-                    archive[i] = incoming_by_id.pop(eid)
+                    archive[i] = _archive_replace_row(
+                        existing, incoming_by_id.pop(eid))
                     deduped_replaced += 1
             archive.extend(incoming_by_id.values())
             for asp in archive:
@@ -5433,6 +6152,7 @@ def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
         "archived_count": len(to_archive),
         "deduped_replaced": deduped_replaced,
         "recovered": recovered,
+        "resurrected_reconciled": resurrected_goal_ids,
         "warnings": warnings if warnings else None,
     })
 

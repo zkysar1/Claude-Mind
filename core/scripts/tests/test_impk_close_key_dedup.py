@@ -23,18 +23,41 @@ WHY NOT completed_at: falsified before it was written. Recurring goals carry
 key would collapse every recurring close to one key — reintroducing the exact
 2,066-row destruction above.
 
-THE KEY: `{goal_id}:{selected_at}` read from the iteration checkpoint. One
-selection produces one close, so it names the close-EVENT rather than the goal.
-It is derived inside state-update-audit's cmd_velocity from a LOCAL file
-(`agents/<agent>/session/iteration-checkpoint.json`) — no daemon round-trip and
-no caller changes, so the hand-typed post-hoc command is covered without
-needing a new flag. The checkpoint is cleared by iteration-close's
-do_productivity_check(), which runs AFTER do_state_update(), so it is live for
-both the normal close and the post-hoc recovery window.
+THE KEY (g-115-5549, replacing the original source):
+`{goal_id}:{lastAchievedAt or completed_at}`, read from the GOAL RECORD.
 
-FAIL-OPEN EVERYWHERE: absent checkpoint, unreadable JSON, or a checkpoint
-naming a DIFFERENT goal all yield "" -> no --close-key -> byte-identical to the
+The coalesce is a SHAPE SELECTOR, not a fallback chain, and the two shapes are
+disjoint. A recurring goal cycles back to `pending` and advances
+`lastAchievedAt` + `achievedCount` on every close, and never gets a
+`completed_at`. A one-shot goal gets `completed_at` and never gets either of the
+others. Measured on the live store 2026-08-10: g-001-01 carries lastAchievedAt +
+achievedCount=83 and no completed_at; g-115-4542 carries completed_at and
+neither of the others. So the WHY-NOT-completed_at paragraph above still holds
+for completed_at ALONE — the recurring shape is covered by the first arm.
+
+WHAT THIS REPLACED, AND WHY THE ORIGINAL WAS INERT: the first version keyed on
+`selected_at` from `agents/<agent>/session/iteration-checkpoint.json`, a single
+box-local slot written at claim time. One selection does produce one close — the
+reasoning was sound — but the SLOT is not per-goal: any interleaving between
+claim and close leaves it naming an earlier goal, the guard fires, and the key
+is silently "". Measured 2026-08-09 on cc-04: of the closes eligible after that
+fix landed, NONE carried a key, including the fix's own close 11 seconds later
+(the checkpoint still held g-001-01 from 43 minutes prior). Present in the code,
+inert at runtime, for 100% of real closes.
+
+The goal record has no such slot — it IS the thing being closed. The cost is one
+daemon round-trip per close, which the checkpoint deliberately avoided; a local
+read that is wrong is not cheaper than a remote read that is right.
+
+FAIL-OPEN EVERYWHERE: query failure, unparseable payload, no matching record, or
+neither field present all yield "" -> no --close-key -> byte-identical to the
 pre-fix behaviour. The fix can never suppress a row it was not certain about.
+
+...BUT NO LONGER SILENTLY. The original's failure was invisible exactly where it
+was wrong: the only ledger counted an ABSENT checkpoint, while the mode actually
+observed (PRESENT but naming a different goal) was recorded nowhere. cmd_velocity
+now emits `impk_close_key_underivable` whenever a goal was named and no key came
+back, so an inert guard reports itself instead of reading as a working one.
 """
 
 from __future__ import annotations
@@ -54,6 +77,11 @@ SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 REPO_ROOT = SCRIPTS_DIR.parent.parent
 IMPK_PY = SCRIPTS_DIR / "meta-impk.py"
 AUDIT_PY = SCRIPTS_DIR / "state-update-audit.py"
+
+# Distinguishes "caller did not pass a record" from "caller passed None on
+# purpose" — None is the meaningful underivable-key case (), so it
+# cannot double as the default sentinel.
+_UNSET = object()
 
 
 def _import_audit():
@@ -233,72 +261,165 @@ def test_distinct_goals_sharing_a_timestamp_are_not_confused(tmp_path):
     assert len(_entries(meta)) == 2
 
 
-# ─────────────────── close-key derivation from the checkpoint ───────────────────
+# ─────────────────── close-key derivation from the goal record ──────────────────
 
-def _write_checkpoint(agent_dir: Path, payload):
-    sess = agent_dir / "session"
-    sess.mkdir(parents=True, exist_ok=True)
-    (sess / "iteration-checkpoint.json").write_text(
-        json.dumps(payload), encoding="utf-8")
+def _patch_query(mod, monkeypatch, rows, rc=0, raw=None):
+    """Serve `aspirations-query.sh` from a fixture; everything else is inert.
+
+    The fixture is the QUERY WRAPPER'S output, not a hand-made dict handed to
+    the parser, so the parse path under test is the production one (guard-920).
+    """
+    payload = raw if raw is not None else json.dumps(rows)
+    calls = []
+
+    def fake_run(argv, *a, **kw):
+        calls.append(argv)
+        if argv and "aspirations-query.sh" in argv[0]:
+            return payload, "", rc
+        return "", "", 0
+
+    monkeypatch.setattr(mod, "_run", fake_run, raising=True)
+    return calls
 
 
-def test_close_key_derived_from_checkpoint(tmp_path, monkeypatch):
+def test_close_key_derived_from_completed_at_one_shot(tmp_path, monkeypatch):
+    """One-shot shape: completed_at is the per-close stamp."""
     mod = _import_audit()
-    agent = tmp_path / "alpha"
-    _write_checkpoint(agent, {"goal_id": "g-115-4542", "aspiration_id": "asp-115",
-                              "source": "world", "phase": "selected",
-                              "selected_at": "2026-08-09T18:26:55"})
-    monkeypatch.setattr(mod, "AGENT_DIR", agent, raising=False)
-    assert mod._close_key("g-115-4542") == "g-115-4542:2026-08-09T18:26:55"
+    _patch_query(mod, monkeypatch, [
+        {"id": "g-115-4542", "completed_at": "2026-08-09T19:26:41"}])
+    assert mod._close_key("g-115-4542") == "g-115-4542:2026-08-09T19:26:41"
 
 
-def test_close_key_empty_when_checkpoint_names_another_goal(tmp_path, monkeypatch):
-    """A stale checkpoint must not mint a key for the goal being closed.
+def test_close_key_derived_from_last_achieved_at_recurring(tmp_path, monkeypatch):
+    """Recurring shape: no completed_at exists, lastAchievedAt advances instead.
 
-    Fail-open: a wrong key could suppress a legitimate row, which is strictly
-    worse than the double-count this fix exists to prevent.
+    This is the case the pre-g-115-4542 `completed_at` candidate could not serve
+    and the whole reason the coalesce exists.
     """
     mod = _import_audit()
-    agent = tmp_path / "alpha"
-    _write_checkpoint(agent, {"goal_id": "g-999-99",
-                              "selected_at": "2026-08-09T18:26:55"})
-    monkeypatch.setattr(mod, "AGENT_DIR", agent, raising=False)
+    _patch_query(mod, monkeypatch, [
+        {"id": "g-001-01", "recurring": True, "achievedCount": 83,
+         "lastAchievedAt": "2026-08-08T03:06:00"}])
+    assert mod._close_key("g-001-01") == "g-001-01:2026-08-08T03:06:00"
+
+
+def test_close_key_advances_between_recurring_closes(tmp_path, monkeypatch):
+    """THE PROPERTY THE WHOLE FIX RESTS ON, asserted directly.
+
+    Two cadence closes of the SAME recurring goal must mint DIFFERENT keys, or
+    the dedup destroys the 2,066 legitimate repeat rows measured on the live
+    store. Deriving the key twice from two successive record states is the only
+    assertion that tests "advances once per close" rather than merely "is
+    non-empty".
+    """
+    mod = _import_audit()
+    _patch_query(mod, monkeypatch, [
+        {"id": "g-001-01", "lastAchievedAt": "2026-08-08T03:06:00"}])
+    first = mod._close_key("g-001-01")
+    _patch_query(mod, monkeypatch, [
+        {"id": "g-001-01", "lastAchievedAt": "2026-08-09T03:11:00"}])
+    second = mod._close_key("g-001-01")
+    assert first and second
+    assert first != second, (
+        "a recurring goal's two closes minted the SAME key — the dedup would "
+        "suppress the second, which is the 2,066-row destruction this fix "
+        "exists to avoid")
+
+
+def test_close_key_prefers_last_achieved_at_when_both_present(tmp_path, monkeypatch):
+    """Coalesce ORDER is load-bearing, not cosmetic.
+
+    The shapes are disjoint on the live store, but a goal converted between
+    shapes could carry a stale completed_at. lastAchievedAt is the field that
+    advances, so it must win — otherwise a converted recurring goal silently
+    reverts to one-key-forever.
+    """
+    mod = _import_audit()
+    _patch_query(mod, monkeypatch, [
+        {"id": "g-001-01", "lastAchievedAt": "2026-08-09T03:11:00",
+         "completed_at": "2026-04-08T00:00:00"}])
+    assert mod._close_key("g-001-01") == "g-001-01:2026-08-09T03:11:00"
+
+
+def test_close_key_matches_on_projected_goal_id_key(tmp_path, monkeypatch):
+    """The endpoint projects `goal_id` alongside the raw store key `id`."""
+    mod = _import_audit()
+    _patch_query(mod, monkeypatch, [
+        {"goal_id": "g-115-4542", "completed_at": "2026-08-09T19:26:41"}])
+    assert mod._close_key("g-115-4542") == "g-115-4542:2026-08-09T19:26:41"
+
+
+def test_close_key_ignores_a_record_for_a_DIFFERENT_goal(tmp_path, monkeypatch):
+    """The exact failure mode of the source this replaced.
+
+    The old key came from a shared slot that could name another goal; the guard
+    caught it and silently returned "". Here the guard must still hold — but the
+    situation is now a query bug rather than the normal case.
+    """
+    mod = _import_audit()
+    _patch_query(mod, monkeypatch, [
+        {"id": "g-999-99", "completed_at": "2026-08-09T19:26:41"}])
     assert mod._close_key("g-115-4542") == ""
 
 
-def test_close_key_empty_when_checkpoint_absent(tmp_path, monkeypatch):
+def test_close_key_empty_when_query_fails(tmp_path, monkeypatch):
     mod = _import_audit()
-    agent = tmp_path / "alpha"
-    (agent / "session").mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(mod, "AGENT_DIR", agent, raising=False)
+    _patch_query(mod, monkeypatch, [], rc=1)
     assert mod._close_key("g-115-4542") == ""
 
 
-def test_close_key_empty_on_unreadable_checkpoint(tmp_path, monkeypatch):
+def test_close_key_empty_on_unparseable_payload(tmp_path, monkeypatch):
     mod = _import_audit()
-    agent = tmp_path / "alpha"
-    sess = agent / "session"
-    sess.mkdir(parents=True, exist_ok=True)
-    (sess / "iteration-checkpoint.json").write_text("{not json", encoding="utf-8")
-    monkeypatch.setattr(mod, "AGENT_DIR", agent, raising=False)
+    _patch_query(mod, monkeypatch, None, raw="not json at all")
     assert mod._close_key("g-115-4542") == ""
 
 
-def test_close_key_empty_when_selected_at_missing(tmp_path, monkeypatch):
-    """A checkpoint with no selected_at cannot name a close event."""
+def test_close_key_empty_on_empty_result(tmp_path, monkeypatch):
     mod = _import_audit()
-    agent = tmp_path / "alpha"
-    _write_checkpoint(agent, {"goal_id": "g-115-4542", "phase": "selected"})
-    monkeypatch.setattr(mod, "AGENT_DIR", agent, raising=False)
+    _patch_query(mod, monkeypatch, [])
+    assert mod._close_key("g-115-4542") == ""
+
+
+def test_close_key_empty_when_neither_stamp_present(tmp_path, monkeypatch):
+    """A goal still open (worker Body hand-off, or closed by a partner) has
+    neither field — no close has happened, so there is no close to name."""
+    mod = _import_audit()
+    _patch_query(mod, monkeypatch, [
+        {"id": "g-115-4542", "status": "in-progress"}])
     assert mod._close_key("g-115-4542") == ""
 
 
 def test_close_key_empty_for_empty_goal_id(tmp_path, monkeypatch):
+    """No goal named -> no query issued at all (the short-circuit is the point:
+    a goal-less legacy invocation must not pay a daemon round-trip)."""
+    mod = _import_audit()
+    calls = _patch_query(mod, monkeypatch, [
+        {"id": "g-115-4542", "completed_at": "2026-08-09T19:26:41"}])
+    assert mod._close_key("") == ""
+    assert calls == [], "empty goal_id must short-circuit before the query"
+
+
+def test_close_key_reads_the_goal_record_not_the_iteration_checkpoint(
+        tmp_path, monkeypatch):
+    """: pin the SOURCE, not just the output.
+
+    A checkpoint naming a DIFFERENT goal is the exact live condition that made
+    the previous implementation inert. Here it must be irrelevant — if this
+    assertion ever fails, the box-local slot has crept back in.
+    """
     mod = _import_audit()
     agent = tmp_path / "alpha"
-    _write_checkpoint(agent, {"goal_id": "", "selected_at": "2026-08-09T18:26:55"})
+    sess = agent / "session"
+    sess.mkdir(parents=True, exist_ok=True)
+    (sess / "iteration-checkpoint.json").write_text(
+        json.dumps({"goal_id": "g-001-01", "selected_at": "2026-08-09T18:53:48"}),
+        encoding="utf-8")
     monkeypatch.setattr(mod, "AGENT_DIR", agent, raising=False)
-    assert mod._close_key("") == ""
+    calls = _patch_query(mod, monkeypatch, [
+        {"id": "g-115-4542", "completed_at": "2026-08-09T19:26:41"}])
+    assert mod._close_key("g-115-4542") == "g-115-4542:2026-08-09T19:26:41"
+    assert any("aspirations-query.sh" in c[0] for c in calls), (
+        "the key must come from the goal record via the daemon-routed wrapper")
 
 
 def test_wrapper_forwards_close_key_flag():
@@ -370,26 +491,47 @@ def _velocity_args(goal_id):
     )
 
 
-def _patch_run(mod, monkeypatch, impk_stdout, impk_rc=0):
-    """Stub _run: backpressure returns empty, impk returns the given payload."""
+def _patch_run(mod, monkeypatch, impk_stdout, impk_rc=0, record=_UNSET):
+    """Stub _run: impk returns the given payload, the goal query returns `record`.
+
+    `record` defaults to a CLOSED one-shot goal so a key is derivable — the
+    common case. Pass `record=None` to model an underivable key (g-115-5549);
+    everything else still returns empty as before.
+    """
+    rec = ({"id": "g-001-01", "lastAchievedAt": "2026-08-09T18:53:48"}
+           if record is _UNSET else record)
+    rows = json.dumps([rec] if rec else [])
+
     def fake_run(argv, *a, **kw):
         if argv and "meta-impk.sh" in argv[0]:
             return impk_stdout, "", impk_rc
+        if argv and "aspirations-query.sh" in argv[0]:
+            return rows, "", 0
         return "", "", 0
     monkeypatch.setattr(mod, "_run", fake_run, raising=True)
 
 
-def _audit_with_checkpoint(tmp_path, monkeypatch, goal_id):
+def _audit_with_goal_record(tmp_path, monkeypatch, goal_id):
+    """: the key now comes from the goal record, not a local slot.
+
+    A stale iteration-checkpoint is written anyway, naming a DIFFERENT goal —
+    the live condition that made the previous source inert. It must have no
+    effect here; if these tests ever start depending on it, the box-local slot
+    has crept back in.
+    """
     mod = _import_audit()
     agent = tmp_path / "alpha"
-    _write_checkpoint(agent, {"goal_id": goal_id,
-                              "selected_at": "2026-08-09T18:53:48"})
+    sess = agent / "session"
+    sess.mkdir(parents=True, exist_ok=True)
+    (sess / "iteration-checkpoint.json").write_text(
+        json.dumps({"goal_id": "g-STALE-99",
+                    "selected_at": "2026-08-09T18:53:48"}), encoding="utf-8")
     monkeypatch.setattr(mod, "AGENT_DIR", agent, raising=False)
     return mod
 
 
 def test_velocity_flags_duplicate_suppression(tmp_path, monkeypatch):
-    mod = _audit_with_checkpoint(tmp_path, monkeypatch, "g-001-01")
+    mod = _audit_with_goal_record(tmp_path, monkeypatch, "g-001-01")
     _patch_run(mod, monkeypatch, json.dumps({
         "status": "duplicate_suppressed", "goal_id": "g-001-01",
         "learning_value": 0.7, "close_key": "g-001-01:2026-08-09T18:53:48"}))
@@ -400,7 +542,7 @@ def test_velocity_flags_duplicate_suppression(tmp_path, monkeypatch):
 
 def test_velocity_no_flag_on_recorded(tmp_path, monkeypatch):
     """Two-way control: the flag must be ABSENT on a normal recorded close."""
-    mod = _audit_with_checkpoint(tmp_path, monkeypatch, "g-001-01")
+    mod = _audit_with_goal_record(tmp_path, monkeypatch, "g-001-01")
     _patch_run(mod, monkeypatch, json.dumps({
         "status": "recorded", "goal_id": "g-001-01", "learning_value": 0.7}))
     out = mod.cmd_velocity(_velocity_args("g-001-01"))
@@ -412,7 +554,7 @@ def test_velocity_no_flag_on_recorded(tmp_path, monkeypatch):
 
 def test_velocity_suppression_parse_is_fail_open(tmp_path, monkeypatch):
     """An unreadable payload adds no flag and never breaks the audit record."""
-    mod = _audit_with_checkpoint(tmp_path, monkeypatch, "g-001-01")
+    mod = _audit_with_goal_record(tmp_path, monkeypatch, "g-001-01")
     _patch_run(mod, monkeypatch, "not json at all")
     out = mod.cmd_velocity(_velocity_args("g-001-01"))
     assert out["flags"] == []
@@ -423,3 +565,56 @@ def test_velocity_suppression_flag_is_not_hard_fail(tmp_path, monkeypatch):
     """The flag is informational — it must not drive a non-zero exit."""
     mod = _import_audit()
     assert not mod._has_hard_failure(["impk_duplicate_suppressed"])
+
+
+# ---------------------------------------------------------------------------
+# : an UNDERIVABLE key must announce itself.
+#
+# The source this replaced failed silently for 100% of real closes, and the one
+# ledger that existed counted only an ABSENT checkpoint — the mode actually
+# observed (present, naming another goal) was recorded nowhere. So "the guard
+# was never reached" and "the guard held" produced identical telemetry for a
+# full day. These are the two-way pins that make that impossible to repeat.
+# ---------------------------------------------------------------------------
+
+def test_velocity_flags_underivable_close_key(tmp_path, monkeypatch):
+    mod = _audit_with_goal_record(tmp_path, monkeypatch, "g-001-01")
+    _patch_run(mod, monkeypatch, json.dumps({
+        "status": "recorded", "goal_id": "g-001-01", "learning_value": 0.7}),
+        record=None)
+    out = mod.cmd_velocity(_velocity_args("g-001-01"))
+    assert "impk_close_key_underivable" in out["flags"], (
+        "an inert guard produced no signal — this is the exact defect "
+        "g-115-5549 was filed about")
+
+
+def test_velocity_no_underivable_flag_when_key_derives(tmp_path, monkeypatch):
+    """Two-way control: the flag must be ABSENT whenever a key WAS derived.
+
+    Without this, a flag that always fires would 'pass' the test above while
+    saying nothing — the vacuity failure mode guard-1220 names.
+    """
+    mod = _audit_with_goal_record(tmp_path, monkeypatch, "g-001-01")
+    _patch_run(mod, monkeypatch, json.dumps({
+        "status": "recorded", "goal_id": "g-001-01", "learning_value": 0.7}))
+    out = mod.cmd_velocity(_velocity_args("g-001-01"))
+    assert "impk_close_key_underivable" not in out["flags"]
+    assert out["flags"] == []
+
+
+def test_velocity_underivable_flag_is_not_hard_fail(tmp_path, monkeypatch):
+    """Informational, like its sibling: an underivable key is a REPORT, not a
+    failure. Making it fatal would break every close the moment the query
+    hiccups — strictly worse than the double-count it guards."""
+    mod = _import_audit()
+    assert not mod._has_hard_failure(["impk_close_key_underivable"])
+
+
+def test_velocity_underivable_flag_absent_when_no_goal_named(tmp_path, monkeypatch):
+    """A goal-less legacy invocation must stay byte-identical — no key is
+    expected, so its absence is not a finding."""
+    mod = _audit_with_goal_record(tmp_path, monkeypatch, "")
+    _patch_run(mod, monkeypatch, json.dumps({
+        "status": "recorded", "learning_value": 0.7}), record=None)
+    out = mod.cmd_velocity(_velocity_args(""))
+    assert "impk_close_key_underivable" not in out["flags"]

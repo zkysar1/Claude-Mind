@@ -36,7 +36,15 @@ from _paths import agent_dir as _agent_dir, agents_root as _agents_root, WORLD_D
 from _fileops import acquire_lock, release_lock  # noqa: E402
 
 # Mind framework areas (relative to PROJECT_ROOT)
-MIND_PY_PREFIXES = ("core/scripts/", "mind_api/src/")
+#
+# : core/scripts and mind_api/src are DIFFERENT SUITES and must stay
+# separate prefixes. They were one tuple feeding one bucket, so a mind_api/src
+# change was advised to run `pytest core/scripts/tests` — the one suite that
+# does not import it. The governing rule corrected exactly this mapping on
+# 2026-07-31 (); the rule was fixed and this renderer was not, so the
+# superseded guidance kept reaching every agent via the banner.
+MIND_PY_PREFIXES = ("core/scripts/",)
+MIND_DAEMON_PY_PREFIX = "mind_api/src/"
 MIND_PY_TEST_PREFIX = "core/scripts/tests/"
 MIND_WRAPPER_PREFIX = "core/scripts/"  # .sh wrappers (production)
 MIND_SKILL_PREFIX = ".claude/skills/"
@@ -123,7 +131,8 @@ def _git_changed_paths(repo: Path) -> list[str]:
 def _classify_mind(paths: list[str]) -> dict:
     """Bucket Mind-framework paths into suite-recommendation categories."""
     buckets: dict[str, list[str]] = {
-        "py_production": [],   # core/scripts/*.py, mind_api/src/*.py (non-test)
+        "py_production": [],    # core/scripts/*.py (non-test)
+        "py_daemon": [],        # mind_api/src/*.py — SEPARATE SUITE, see below
         "py_test": [],          # core/scripts/tests/*.py
         "sh_wrapper": [],       # core/scripts/*.sh (production wrapper)
         "skill_md": [],         # .claude/skills/*/SKILL.md
@@ -135,6 +144,8 @@ def _classify_mind(paths: list[str]) -> dict:
         # Order matters: tests/ is a prefix of scripts/
         if p.startswith(MIND_PY_TEST_PREFIX) and p.endswith(".py"):
             buckets["py_test"].append(p)
+        elif p.startswith(MIND_DAEMON_PY_PREFIX) and p.endswith(".py"):
+            buckets["py_daemon"].append(p)
         elif any(p.startswith(pref) for pref in MIND_PY_PREFIXES) and p.endswith(".py"):
             buckets["py_production"].append(p)
         elif p.startswith(MIND_WRAPPER_PREFIX) and p.endswith(".sh"):
@@ -151,15 +162,45 @@ def _classify_mind(paths: list[str]) -> dict:
     return buckets
 
 
+# --- Mind suite commands ----------------------------------------------------
+# Three invariants, and the rule table in
+# .claude/rules/run-full-suite-after-deep-code.md is their source of truth —
+# re-read it before changing these strings, never the quotes in a goal record.
+# The shared constraint behind all three: every emitted command is COPIED by an
+# agent into a shell, so it must be runnable as printed.
+#
+# 1. ONE ARM PER TREE. core/scripts and mind_api/src have different suites; a
+#    single command for both is how a mind_api/src change came to be advised to
+#    run a suite that does not import it ().
+# 2. EVERY pytest COMMAND CARRIES STORAGE_BACKEND=local. Mandatory on an
+#    own-cloud box (guard-955 / rb-2983): without it a tmp-world write collides
+#    on the PRODUCTION S3 key. The 2026-07-09 incident truncated
+#    world/aspirations.jsonl from 22 aspirations / 1366 goals to one fixture.
+#    The banner is where the command gets copied from, so an unpinned command
+#    here is the likeliest way that recurs. run-full-suite.sh self-pins and so
+#    emits no prefix — the invariant is on commands containing `pytest`.
+# 3. run-full-suite.sh IS THE core/scripts RUNNER, not bare pytest: bare pytest
+#    silently omits core/tests/gates plus the invisible and domain halves.
+MIND_CORE_SUITE_CMD = "bash core/scripts/run-full-suite.sh"
+MIND_DAEMON_SUITE_CMD = (
+    'STORAGE_BACKEND=local python -m pytest mind_api/tests -q -m "not daemon_integration"'
+)
+
+
 def _mind_recommendations(buckets: dict) -> list[str]:
     """Build the recommendation list from Mind buckets."""
     recs: list[str] = []
     if buckets["py_production"] or buckets["sh_wrapper"]:
-        recs.append("python -m pytest core/scripts/tests -q")
-    if buckets["py_test"] and not (buckets["py_production"] or buckets["sh_wrapper"]):
+        recs.append(MIND_CORE_SUITE_CMD)
+    if buckets["py_daemon"]:
+        # mind_api/tests is a DEFERRED testpath — run-full-suite.sh does NOT
+        # collect it, so the core arm above is not evidence about this tree.
+        recs.append(MIND_DAEMON_SUITE_CMD)
+    if buckets["py_test"] and not (buckets["py_production"] or buckets["sh_wrapper"]
+                                   or buckets["py_daemon"]):
         # Pure test-file changes still benefit from a full run to catch
         # collection/import regressions in the suite as a whole.
-        recs.append("python -m pytest core/scripts/tests -q")
+        recs.append(MIND_CORE_SUITE_CMD)
     if buckets["skill_md"]:
         # One skill-evaluate per touched skill — the skill name is the directory
         # immediately after .claude/skills/
@@ -240,7 +281,8 @@ def _emit_banner(goal_id: str, mind_buckets: dict, mind_recs: list[str],
             if not paths:
                 continue
             label = {
-                "py_production": "Production Python",
+                "py_production": "Production Python (core/scripts)",
+                "py_daemon": "Daemon Python (mind_api/src)",
                 "py_test": "Test files (Python)",
                 "sh_wrapper": "Wrapper shells",
                 "skill_md": "Skill pseudocode",
@@ -259,6 +301,15 @@ def _emit_banner(goal_id: str, mind_buckets: dict, mind_recs: list[str],
             print("Recommended Mind full-suite invocations:")
             for r in mind_recs:
                 print(f"  $ {r}")
+            if mind_buckets.get("py_daemon"):
+                # Said out loud because the failure it prevents is silent: a
+                # green run-full-suite.sh reads as whole-suite green, and
+                # mind_api/tests is in DEFERRED_TESTPATHS so that runner never
+                # collected it. Only printed when the tree is actually touched.
+                print("  NOTE: mind_api/tests is a DEFERRED testpath —"
+                      " run-full-suite.sh does NOT run it, so a green run of"
+                      " that runner is NOT evidence about mind_api/src."
+                      " The command above is the whole coverage for that tree.")
     else:
         print("Mind framework: no code-affecting changes detected.")
 

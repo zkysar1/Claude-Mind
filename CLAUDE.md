@@ -27,6 +27,11 @@ This is a **Claude-native data repository** — no traditional source code or bu
 core/                # Shareable cognitive framework (copy to any project)
   config/            # Framework definitions (immutable)
     conventions/     # On-demand convention reference files
+    environments/    # PEER DEPLOYMENT REGISTRY — one yaml per known Mind world
+                     # (ayoai-mind, claude-mind, zds-mind, local) giving each
+                     # one's storage backend. This world is NOT alone: peers
+                     # exist and share a live board channel. See
+                     # conventions/cross-deployment-channel.md.
   scripts/           # Utility scripts (framework infrastructure)
 meta/                # Agent-editable meta-strategies (independent of domain data)
   goal-selection-strategy.yaml, reflection-strategy.yaml  # Strategy files
@@ -151,91 +156,24 @@ Not mutually exclusive. A single event can spawn all four. See `aspirations-exec
 
 ## Agent-dir Resolution
 
-Agent directories are resolved through a centralized helper, not hardcoded
-`PROJECT_ROOT / agent_name` joins. This indirection exists so that Phase 2.5.D
-relocated all agent dirs under an `agents/` parent by flipping one constant.
+Agent directories are resolved through a centralized helper, never hardcoded
+`PROJECT_ROOT / agent_name` joins, so the layout can move by flipping constants:
+`AGENTS_PARENT_DIR` (currently `"agents"` — agent dirs live at
+`PROJECT_ROOT/agents/<name>`; empty string = legacy layout at `PROJECT_ROOT`),
+`SESSIONS_DIRNAME` (`"sessions"` — per-session dirs under each agent) and
+`SESSION_DIRNAME` (`"session"` — the agent-wide cross-session state dir).
 
-**AGENTS_PARENT_DIR** — empty string means agent dirs live at `PROJECT_ROOT`
-(legacy layout). Currently `"agents"` — agent dirs live at
-`PROJECT_ROOT/agents/<name>`.
-
-**Phase 2.6 added two more sync constants** for the per-session dir layout:
-- `SESSIONS_DIRNAME` (currently `"sessions"`) — parent under each agent for
-  per-session dirs (one per Claude Code session)
-- `SESSION_DIRNAME` (currently `"session"`) — agent-wide cross-session state dir
-
-The 6 framework-layer sync locations carry all three constants:
-
-| Layer | File | Constants |
-|-------|------|-----------|
-| Python CLI | `core/scripts/_paths.py` | `AGENTS_PARENT_DIR`, `SESSIONS_DIRNAME`, `SESSION_DIRNAME` |
-| Shell CLI | `core/scripts/_paths.sh` | same |
-| Daemon | `mind_api/src/agent_paths.py` | same |
-| Import-cycle-proof | `core/scripts/_agents.py` | same |
-| Import-cycle-proof | `core/scripts/path-resolution-hook.py` | same |
-| Import-cycle-proof | `core/scripts/_world_config.py` | `AGENTS_PARENT_DIR` (added 2026-05-20 after Phase 2.5.D regression where this helper still used the pre-relocation `root/agent/local-paths.conf` shape — all `world/config/*.yaml` overlay loads silently degraded to safe defaults for ~3 weeks until pytest collection collision surfaced 25 routing-table-empty failures) |
-| Import-cycle-proof | `core/scripts/_session_binding.py` | `AGENTS_PARENT_DIR`, `SESSIONS_DIRNAME` (Phase 2.6 resolver — re-exported to `migrate-to-phase-2-6.py`, `session-binding-write.py`, `_resolve_agent_from_sid.py`) |
-
-**Plus 5 inlined copies** that mirror the constants by hand because sourcing
-`_paths.sh` (or importing `_paths.py`) would violate the script's contract —
-either by exceeding the per-Bash-call latency budget (the `IRREDUCIBLY LOCAL`
-annotation at the top of each shell script) or by breaking the shell→python
-bridge that calls the helper via `py -3 -c "from <module> import ..."`:
-
-| File | Constants inlined | Reason |
-|------|-------------------|--------|
-| `core/scripts/cleanup-stale-bindings.sh` | `AGENTS_PARENT_DIR` (`_APD`), `SESSIONS_DIRNAME` (`_SDN`) | IRREDUCIBLY LOCAL — per-Bash-call latency budget |
-| `core/scripts/session-mode-get.sh` | `AGENTS_PARENT_DIR` (`_APD`) | IRREDUCIBLY LOCAL — session-state critical path |
-| `core/scripts/session-signal-exists.sh` | `AGENTS_PARENT_DIR` (`_APD`) | IRREDUCIBLY LOCAL — hook hot path |
-| `core/scripts/session-state-get.sh` | `AGENTS_PARENT_DIR` (`_APD`) | IRREDUCIBLY LOCAL — every loop iteration |
-| `core/scripts/_wake_signals.py` | `AGENTS_PARENT_DIR` (`_AGENTS_PARENT_DIR`) | imported via `py -3 -c "from _wake_signals import ..."` from shell — must stay self-contained |
-
-**Plus 2 literal-string hardcoders** bake the literal `agents/` path segment
-directly into a glob or prefix-check WITHOUT naming the constant — so the
-constant-definition audit grep below does NOT see them. They work for
-`AGENTS_PARENT_DIR=agents` but would break on any rename:
-
-| File | Hardcoded sites | Why not constant-routed |
-|------|-----------------|-------------------------|
-| `core/scripts/iteration-commit.sh` | `"$REPO"/agents/*/` agent-dir walk (~L221) + `[[ "$path" == agents/* ]]` namespace-filter prefix checks (~L591/657/706) | Namespace filter; never sources `_paths.sh`. Contrast `stop-hook.sh:128`, which DOES route its `*/session/` glob through `${AGENTS_PARENT_DIR}` — the gold-standard pattern these two should adopt. |
-| `core/scripts/seed-transplant.sh` | `"$DEST"/agents/*/session/agent-state` walk (~L99) | Walks a FOREIGN repo root (`$DEST`), not `PROJECT_ROOT` |
-
-When changing `AGENTS_PARENT_DIR`, `SESSIONS_DIRNAME`, or `SESSION_DIRNAME`,
-update ALL 12 constant-named sites AND the 2 literal-string hardcoders above.
-Audit with ALL THREE greps (the first finds constant-named sites; the second
-finds literal-`agents/` glob hardcoders — it also surfaces comments/tests/bench
-refs, so eyeball-filter to executable glob/prefix lines; the third finds
-`.parent`-based PROJECT_ROOT re-derivations from an agent-dir variable, which
-the constant-name and `agents/*` greps both miss):
-`grep -rn '^[[:space:]]*\(_APD=\|_SDN=\|_\?AGENTS_PARENT_DIR\|_\?SESSIONS_DIRNAME\|_\?SESSION_DIRNAME\)' core/scripts/ mind_api/`
-`grep -rn 'agents/\*' core/scripts/ mind_api/`
-`grep -rnE '(agent_dir|AGENT_DIR)\.parent' core/scripts/ mind_api/`
-Third-grep triage: a single `.parent` of `PROJECT_ROOT/agents/<agent>` yields
-the *agents-parent* dir (correct for sibling enumeration — goal-selector.py
-`collect_cross_agent_candidates`), but treating that `.parent` result AS
-PROJECT_ROOT, or joining it with `core`/`config`, is the g-115-1279 bug class
-(budget-meter `read_config` 404'd the config and pinned `cap_ms` to the 9000ms
-fallback vs the configured 90000ms). The fix forwards `$PROJECT_ROOT` from
-`_paths.sh` (SSOT); a `.parent.parent` fallback matches the current `agents/`
-layout.
-
-**Plus cross-agent glob consumers** sweep one file across ALL agent dirs via
-`agents_root().glob("*/...")` (CLI) or `ctx.paths.agents_root.glob("*/...")`
-(daemon). When correctly routed they auto-track an `AGENTS_PARENT_DIR` rename
-(need NO edit), but they are invisible to all THREE greps above — they neither
-define the constant, write a literal `agents/*`, nor use `.parent` — so a
-depth-1 redrift (`PROJECT_ROOT.glob("*/...")`, which matches NOTHING
-post-relocation) escapes every audit grep. This table is their only audit
-surface; check it on rename:
-
-| File(s) | Glob | Status |
-|---------|------|--------|
-| `core/scripts/skill-discovery.py` + `mind_api/src/endpoints/skill_discovery.py` | `*/journal.jsonl` + `*/session/execution-diary.jsonl` invocation sources | ✓ routed (`agents_root()` / `ctx.paths.agents_root`). Were depth-1 until g-115-1405 — the drift silently zeroed 2 of 4 invocation sources for EVERY skill, inflating `silently_undertriggering`. Regression-guarded by the `/verify-learning` glob-routing check + `test_skill_discovery*.py` byte-compat. |
-| `core/scripts/_paths.py`, `core/scripts/utilization-stats.py`, `mind_api/src/agent_paths.py` | `*/local-paths.conf` enumeration | ✓ routed (helper / imported `agents_root`) — the reference pattern to copy for any new cross-agent glob. |
-| `core/scripts/skill-coinvocation-discovery.py` | `*/skill-invocations.jsonl` ledger mining (co-invocation candidates) | ✓ routed (`read_ledger` base defaults to `agents_root()`; the `root=` param is a test-only override). Regression-guarded by the `/verify-learning` `skill-coinvocation-glob-routing` check + the `--apply` RMW tests in `test_skill_coinvocation_discovery.py` (g-304-24). |
-| `core/scripts/evolution-git-sweep.py` | `agent_self` git pathspecs (`*/self.md` + `agents/*/self.md`) + both-era path classifier | ✓ routed (second pathspec + classifier depth derive from `_agents_root()`; the legacy 2-part form is kept deliberately — git HISTORY contains pre-relocation commits). Was depth-1-only until 2026-07-11 (commit 973f9d52) — the drift zeroed `agent_self` backfill for ~6 weeks while LIVE D1 capture was also silent, leaving self.md revisions with no stream entries at all; 87-entry backfill applied on fix. |
-| `mind_api/src/endpoints/utilization.py` (~L280) | `*/local-paths.conf` enumeration | ✓ routed (`ctx.paths.agents_root`, fixed 2026-07-11 — was the table's last ⚠ LATENT `project_root / "agents"` hardcode, surfaced by the g-115-1405 audit). |
-| `core/scripts/gates/goal_duplication.py` (`_check_pending_queue`) | `*/aspirations.jsonl` per-agent pending-queue scan | ✓ routed (`_agents_root()`, fixed 2026-07-17 g-115-2461 — was a `project_root / "agents"` hardcode). `MIND_AGENTS_ROOT` env override exists for TEST hermeticity only (before it, tmp-world gate tests silently depended on live agent queues for their IDF corpus — every structural case scored 0.0 once hermetic). Regression-guarded by `test_goal_duplication_gate_pending_queue.py` P16 (two-root proof). |
+Those constants are mirrored at **12 constant-named sites, 5 inlined copies and
+2 literal-string hardcoders**, and every **cross-agent glob consumer**
+(`agents_root().glob("*/...")`) must route through the helper or it silently
+scans NOTHING after a relocation — a depth-1 redrift is invisible to every
+audit grep and has zeroed skill-discovery sources, self.md backfill and a
+learning-routing corpus (which fed an automatic writer). The site tables, the
+cross-agent glob consumer table with each row's incident history, and the three
+audit greps with their triage live in
+`core/config/conventions/agent-dir-resolution.md` — **read it BEFORE changing
+any of the three constants or adding any glob that sweeps agent dirs**
+(`load-conventions.sh agent-dir-resolution`).
 
 Helper API (available after sourcing `_paths.sh` or importing from `_paths`):
 - `agents_root()` — parent directory containing all agent dirs
@@ -304,6 +242,7 @@ When you need schema, script API, or protocol details for a subsystem, read the 
 | `goal-schemas.md` | Goal verification, recurring/deferred fields, goal scoring |
 | `goal-selection.md` | Mandatory goal-selector.sh, post-compaction fabrication guard |
 | `session-state.md` | Agent state machine, session scripts, generic YAML store, background jobs tracker |
+| `agent-dir-resolution.md` | `AGENTS_PARENT_DIR` / `SESSIONS_DIRNAME` / `SESSION_DIRNAME` sync-site tables (12 constant-named + 5 inlined + 2 literal hardcoders), the cross-agent glob consumer table with per-row incident history, the three audit greps + triage — read before changing a constant or adding a cross-agent glob (moved out of CLAUDE.md 2026-08-17) |
 | `infrastructure.md` | Error response protocol, infra health, verify-before-assuming details, knowledge reconciliation details |
 | `secrets.md` | Credentials convention, env-read.sh, security rules |
 | `working-memory.md` | Working memory schema, wm-*.sh script API, slot_meta, pruning rules |
@@ -320,7 +259,10 @@ When you need schema, script API, or protocol details for a subsystem, read the 
 | `retrieval-escalation.md` | 3-tier retrieval escalation: tree → codebase → web search |
 | `exhaustive-search-before-negation.md` | Exhaustive knowledge search protocol before negative conclusions |
 | `resource-locators.md` | Stable-fact encoding lane: locator schema, retrieval-before-discovery protocol |
-| `coordination.md` | Multi-agent coordination: claim protocol, board types/tags, circuit breaker, review gate, dependency chains, self-abstention, directive protocol, team state protocol |
+| `coordination.md` | Multi-agent coordination: claim protocol, board types/tags, circuit breaker, review gate, dependency chains, self-abstention, directive protocol (+ **Body scope** — an ADDITIVE directive reaches every Body through `directive_boost`, an EXCLUSIONARY one reaches none; scan/ack are reducer-only), team state protocol |
+| `partner-liveness.md` | Partner-liveness mechanism behind `check-team-state-before-silent.md`: `liveness-check.sh` verdict semantics + provenance, the guard-3604 fresh-signal false positive, the two-branch stale-`last_active` corroboration protocol with code, the 2026-07-14 incident, code consumers (moved out of the rule 2026-08-17, g-115-6581) |
+| `defer-routing.md` | `defer_reason` chokepoint mechanism behind `probe-before-defer.md`: the four enforcement layers (incl. the ungated chat lane), Layer-D auto-conversion invariants + override, the guard-3882 gradient, `blocker_ref_required`, `human_blocked:` caveats (moved out of the rule 2026-08-17, g-115-6581) |
+| `loop-terminal-protocol.md` | Terminal-call contract mechanism behind `return-protocol.md` + `schedule-wakeup-correctness.md`: the 2026-04-23 Trap incident, verify-learning/runtime enforcement wiring, the Explanatory-style layered defense, ScheduleWakeup platform facts + fail-safe property, the 2026-05-18 slash-prefix origin (moved out of the rules 2026-08-17, g-115-6581) |
 | `constitutional-rings.md` | Three-ring governance model: Ring 1 (immutable mission), Ring 2 (standards), Ring 3 (autonomous protocols) |
 | `learning-routing.md` | "Where does this learning go?" decision tree across all ten stores; multi-store encoding pairs; experience-vs-journal distinction |
 | `encoding-triggers.md` | Authoritative catalog of every encoding/tree-update trigger (Txx active, Exx gaps), stores, modes, and frequency — symmetric to `retrieval-triggers.md` |
@@ -328,9 +270,14 @@ When you need schema, script API, or protocol details for a subsystem, read the 
 | `gate-overrides.md` | `--override-all` bulk-bypass pattern, per-gate flag precedence, audit ledger schema, decision rule for which form to use |
 | `audit-baselines.md` | `meta/audit-baselines.yaml` schema, verdicts (seeded/stable/ratcheted/regressed), when to add a baseline, /verify-learning integration |
 | `temp-store.md` | Canonical agent temp store (`agents/<agent>/temp/`), temp-vs-scratch lifecycle, the agent-dir write-surface allowlist, `reports/` freeze + migration |
+| `artifact-reference-integrity.md` | D3 decision: NEITHER an artifact-anchor node type NOR a generalised rewrite-on-move engine. Measured — N is large only where artifacts never move (conventions, max 27) and median 1 where they do; of the live-surface refs whose referents THIS box owns, 15/15 dangle and only 3 are rewrite-recoverable, the rest PURGED not moved (dangling-ness is box-dependent — see the caveat, and `temp-citation-ratchet.py`, which counts citations for exactly that reason). The sanctioned remedy is FOLDING (dissolve the pointer, inline the detail, source recoverable from git — `temp-store.md` precedent); append-only stores are out of scope; the residual defect is retention, routed to D5/D7 |
 | `domain-recipe-seed-purity.md` | D1 decision (A): domain-specific upgrade recipes are `domain-leak-exempt` and travel in the seed; the 5 invariants (location/marker/FROM-state-guard/H3b/gate-scope), seed-down per-env-id semantics |
 | `fleet-secret-provisioning.md` | Bootstrap-key → remote-vault self-service provisioner formalized as a framework capability: mechanism (5 steps), 7 invariants, vault-file contract, secrets hygiene, clone-home companion (guard-131), transplant integration, dev-origination promotion; the domain-specific `core/scripts/provision-from-vault.sh` (marker-exempt) instantiates it |
 | `transfer-bundle-export-shape.md` | OKF-aligned export shape for `meta/transfer/` bundles: bundle=unit-of-distribution, concept=one md+YAML, one required `type` discriminator, consumers-preserve-unknown-keys, git-shippable interchange (contract-on-shape, not a field schema) |
+| `governed-store-write-classes.md` | Merge-protected vs fence-only store classification: `merge_handler_for` is the one-lookup classifier (basename-keyed), class (b) has no reconciler below the write so a stale fence is a PERMANENT wedge and the writer MUST use `locked_rmw` + in-cycle `force_fresh` read; sibling files differ (1 of 6 strategy files is merge-protected); why local-backend green proves nothing and the read-time assertion point |
+| `world-contract.md` | `ENVIRONMENT_ID` / `COMMONS_POLICY` world-identity primitives, the six world-contract elements, and the G1–G5 cross-world influence guardrails (design artifacts, not built enforcement) |
+| `cross-deployment-channel.md` | **This world is not alone.** Peer Mind deployments, the `core/config/environments/*.yaml` registry, the 139-inbound board channel that has been live since 2026-06-02 (outbound **VOLUME** is not measurable from this world's board; outbound **REACH** is — the peer reads this board, so deliver here and let its reply be the measurement: guard-2082 route + latency floor, guard-3596 ack≠completeness), the `<agent>@<env-id>` author format (and why the hyphen form is unparseable), when crossing is expected, `peer-board-post.sh`, and the never-inherit-the-caller's-storage-backend hazard (guard-955/rb-2983 class) |
+| `hot-path-size-budget.md` | The always-loaded prose surface (this file, every `.claude/rules/*.md`, the aspirations*/worker-loop/boot/prime/respond skills, the loop digest) may not GROW: `core/githooks/commit-msg` refuses a commit that leaves a budgeted file larger than at HEAD (set in `core/config/hot-path-budget.yaml`); bypass = `size-budget-override: <why>` trailer, audited to `world/override-bypass-ledger.jsonl`; `hot-path-size-gate.sh --check` ratchets the corpus total |
 
 Additional on-demand specs (not convention files):
 - `core/config/hypothesis-conventions.md` — Hypothesis record schemas, horizons, context manifests
@@ -391,7 +338,7 @@ The shared purpose lives in `world/program.md` (The Program). Each agent's ident
 ### Skill Invocation Rules
 - **Control skills** (/start, /stop, /open-questions): user-invocable only — Claude MUST NOT invoke these
 - **Mode control**: `/start <agent-name> --mode <mode>` to enter a mode, `/stop <agent-name>` to return to assistant (or `/stop <agent-name> --reader` for read-only). Agent name is REQUIRED on `/stop`.
-- **Hybrid skills** (/agent-completion-report, /backlog-report, /priority-review, /verify-learning): user-invocable AND agent-callable
+- **Hybrid skills** (/agent-completion-report, /backlog-report, /priority-review, /sprint-planning, /verify-learning, /generate-domain-goals): user-invocable AND agent-callable
 - **Internal skills**: `user-invocable: false` — invoked by agent during RUNNING state
 - **No blocking on user input in RUNNING state** — skills must never wait for, request, or depend on user input during autonomous execution
 
@@ -413,7 +360,7 @@ After any action that changes the world, check if knowledge tree nodes need upda
 | `<agent>/**` | Create, write, edit, delete | Per-agent private state |
 | `meta/**`          | Create, write, edit    | Agent-editable meta-strategies    |
 | `.claude/skills/**`, `.claude/rules/**`, `core/scripts/**`, `core/config/**`, `CLAUDE.md`, `.claude/settings.json` | Create, write, edit | **Framework — agent-editable, git-audited.** The agent evolves the framework itself (skills, rules, hooks, conventions, this file). Every edit is git-tracked + loop-committed; `settings.json` is additionally gated by the fail-closed `settings-structural-validator`. Be surgical (`implementation-discipline.md`) — bad edits are `git revert`-able. |
-| `.claude/settings.local.json`, `core/scripts/settings-structural-validator.{py,sh}` | **CONSTITUTIONAL ANCHOR — agent MUST NOT edit** | Hard-denied across all permission tiers, tamper-proof by a self-referential deny inside `settings.local.json` (mirrored in `~/.claude/settings.json`). The keystone that makes everything else safely editable. Changes need a user-authorized maintenance path, never an autonomous edit. Detail: `core/config/conventions/constitutional-rings.md`, rb-931. |
+| `.claude/settings.local.json`, `core/scripts/settings-structural-validator.{py,sh}` | **CONSTITUTIONAL ANCHOR — agent MUST NOT edit** | Hard-denied across all permission tiers, tamper-proof by a self-referential deny inside `settings.local.json` — that in-repo deny is the WHOLE mechanism, not one of two copies. An out-of-repo mirror in `~/.claude/settings.json` is optional per-box hardening that nothing provisions; tripwire advisory A1 fires everywhere and that is expected state, not drift (g-115-3676). Read A1 precisely: its predicate is a **missing DENY, not a missing FILE** (`anchor-tripwire.py:96` tests the deny list), so file-absent and file-present-without-a-deny emit the identical advisory. This clause read "measured absent on every box" until 2026-08-11; the file is PRESENT on every box ever measured, each carrying client-managed keys only and ZERO deny rules, with A1 firing regardless. The box COUNT and the per-box byte counts live in the convention linked below and are deliberately NOT duplicated here — this sentence and its twin went stale together precisely because the enumeration was carried twice. Never infer file-absence from the advisory. The keystone that makes everything else safely editable. Changes need a user-authorized maintenance path, never an autonomous edit. Detail: `core/config/conventions/constitutional-rings.md`, rb-931. |
 
 **The two-file settings rule** (#1 source of wrongly-user-gated goals): `.claude/settings.json` is **agent-editable** framework config (hooks, env, permission baseline) — edit it directly. `.claude/settings.local.json` is the **agent-MUST-NOT-edit** constitutional anchor + machine-local config. Do NOT create `participants:[user]` / user-gated goals to apply a verified framework patch to `.claude/skills/**`, `.claude/rules/**`, `core/**`, or `CLAUDE.md` — the agent is permitted to apply these itself (git is the safety net); user-gating them is a capability-routing violation (see `.claude/rules/capability-before-user.md`). The framework deny-list was loosened 2026-05-14 (g-115-732) but the behavioral layer was not updated to match until now — that split-brain caused the user-gated-goal spam (e.g. g-115-792) this rule eliminates.
 
@@ -485,7 +432,9 @@ and gitignored — not reachable by a cloud clone.
 | `/agent-completion-report` | Show what changed *(also agent-callable)* | ANY |
 | `/backlog-report` | Sprint planning backlog *(also agent-callable)* | ANY |
 | `/priority-review` | Priority dashboard — reorder aspirations *(also agent-callable)* | ANY |
+| `/sprint-planning` | Full sprint-planning pass: backlog + priority data, fleet-vantage directive check, hygiene lanes (dups/routing/priorities/recurring/reclaim/zombies), verified queue writes with ledger, published plan. `--ultra` (user-invoked only) escalates to a multi-agent verified pass *(also agent-callable — the recurring sprint goal fires it in standard mode)* | ANY (assistant+) |
 | `/encode-session` | Run a structured 7-lane learning pass on the current chat session: encode tree/rb/guardrails/experience, file Maintain goals for inline work, re-probe blockers, surface discoveries, propose verify-learning checks (sq-018), and check meta + Self for evolution signals *(also agent-callable; chat-mode analogue of the autonomous loop's Phase 6.5 + Phase 8)* | IDLE (assistant) |
+| `/generate-domain-goals` | Supply-side domain goal generation: recon product surfaces through six lenses (metric, journey, code-reality, revenue, distribution, critic), generate evidence-backed user-story candidates, adversarially verify every evidence claim BEFORE filing, file survivors into aspiration lanes with dedup handling + board announcement. Reads the domain's `goal-generation-brief` hook slot; supply-governed (skips when backlog healthy). `--ultra` (user-invoked only) fans out multi-agent generation+verification *(also agent-callable — the recurring generation goal fires it in standard mode)* | ANY (assistant+) |
 
 \*When started from RUNNING state, reader/assistant create an **observer session** that coexists
 with the autonomous loop. Observer sessions do not write to agent-state, agent-mode, or

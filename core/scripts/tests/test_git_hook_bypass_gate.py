@@ -234,3 +234,149 @@ def test_scan_command_multiple_findings():
         'git -c core.hooksPath=/dev/null commit --no-verify -m x'
     )]
     assert "no-verify" in forms and "hookspath-c" in forms
+
+
+# ── : `commit` must be git's OWN subcommand, not a bare token ────
+#
+# TWO false-positive instances, one defect. The gate matched `commit` anywhere in
+# the FLAT token stream and then scanned every later token for a short cluster
+# containing `n`:
+#   1. a heredoc commit MESSAGE containing ordinary prose ("bash -n clean on
+#      both") — rewording the prose, changing nothing else, was accepted;
+#   2. a pipeline with NO git invocation at all, where `git` and `commit` both
+#      arrived as quoted grep PATTERNS and `-rn` came from a third grep.
+# Fix: split on shell separators, and arm Form A only for a simple command whose
+# argv[0] basename is git and whose first non-option word is `commit`.
+
+FALSE_POSITIVES = [
+    # (label, command) — every one must APPROVE
+    ("grep pipeline, no git invocation at all",
+     'grep -n "commit" core/scripts/seed-transplant.sh | grep -i "git" | head -8'),
+    ("heredoc message mentioning a bare -n",
+     'git commit -F - <<EOF\nfix: bash -n clean on both\nEOF'),
+    ("heredoc message mentioning --no-verify as prose",
+     'git commit -F - <<EOF\ndocs: explain why --no-verify is banned\nEOF'),
+    ("heredoc message mentioning core.hooksPath as prose",
+     'git commit -F - <<EOF\ndocs: core.hooksPath=/dev/null is the rb-5390 form\nEOF'),
+    ("commit as a --grep VALUE on git log",
+     'git log --grep=commit -n 5'),
+    ("commit as prose in an echo, -n on an unrelated command",
+     'echo "remember to commit" ; ls -n'),
+    ("sed -n before a word 'commit' in an echo",
+     'sed -n "1,5p" f.txt && echo "commit done"'),
+    ("multi-line quoted message containing sed -n",
+     'git commit -m "line one\nsed -n stuff"'),
+]
+
+# Must still DENY. The narrowing is the risk, so the true-positive set is pinned
+# at least as hard as the false-positive one — including bypasses positioned
+# AFTER a separator, after a heredoc, and on their own LINE, each of which the
+# simple-command split could plausibly have dropped.
+TRUE_POSITIVES = [
+    ("plain --no-verify", 'git commit --no-verify -m "msg"'),
+    ("short -n", 'git commit -n -m "msg"'),
+    ("short cluster -anm", 'git commit -anm "msg"'),
+    ("global -C dir before subcommand", 'git -C /repo commit -n -m x'),
+    ("after a && separator", 'ls -la && git commit -n -m "sneaky"'),
+    ("on its own LINE", 'cd /repo\ngit commit -n -m x'),
+    ("after a TERMINATED heredoc", 'git commit -F - <<EOF\nmsg\nEOF\ngit commit -n -m x'),
+    ("after an UNTERMINATED heredoc (nothing may be stripped)",
+     'cat <<EOF\nnever terminated\ngit commit -n -m x'),
+    ("after a <<- indented-terminator heredoc",
+     'git commit -F - <<-EOF\n\tmsg\n\tEOF\ngit commit --no-verify -m x'),
+    ("after a quoted-delimiter heredoc",
+     "git commit -F - <<'EOF'\nmsg\nEOF\ngit commit -n -m x"),
+    ("flag BEFORE the heredoc on the same line", 'git commit -n -F - <<EOF\nmsg\nEOF'),
+    ("multi-line quoted message then -n", 'git commit -m "line one\nline two" -n'),
+]
+
+
+def test_g4695_false_positives_approve():
+    mod = _load_gate_module()
+    offenders = [(lbl, mod.scan_command(cmd))
+                 for lbl, cmd in FALSE_POSITIVES if mod.scan_command(cmd)]
+    assert not offenders, f"these must not deny: {offenders}"
+
+
+def test_g4695_true_positives_still_deny():
+    mod = _load_gate_module()
+    missed = [lbl for lbl, cmd in TRUE_POSITIVES if not mod.scan_command(cmd)]
+    assert not missed, (
+        f"the narrowing went too far — these bypasses now PASS: {missed}"
+    )
+
+
+def test_g4695_incident_command_in_production_shape():
+    """The literal second-instance command, through the real hook (guard-920)."""
+    assert _run(
+        'grep -n "commit" core/scripts/seed-transplant.sh | grep -i "git" '
+        '| head -8; echo ---; grep -rn "def .*commit" core/scripts/'
+    ) == ""
+
+
+def test_g4695_heredoc_prose_in_production_shape():
+    """The originating incident, through the real hook."""
+    assert _run('git commit -F - <<EOF\nfix: bash -n clean on both\nEOF') == ""
+
+
+def test_g4695_newline_is_a_command_boundary():
+    """Regression pin for a hole the narrowing OPENED and adversarial probing caught.
+
+    shlex eats newlines as whitespace, so without re-inserting a separator a
+    `git commit -n` on its own line joins the PREVIOUS line's argv — argv[0] is
+    then that line's command, not git, and a real bypass approves. The old flat
+    scan caught this case incidentally; the fix had to keep it.
+    """
+    mod = _load_gate_module()
+    assert mod.scan_command('cd /repo\ngit commit -n -m x'), \
+        "a bypass on its own line must still deny"
+    assert mod.scan_command('echo hi\ngit commit --no-verify -m x'), \
+        "a --no-verify on its own line must still deny"
+
+
+def test_g4695_multiline_message_does_not_swallow_the_next_command():
+    """The separator jump must be APPORTIONED between quoted and real newlines.
+
+    Found in fresh-eyes review of the 4695 fix itself. `lex.lineno` lags, and a
+    multi-line QUOTED token swallows its own line breaks AND the trailing
+    separator newline in ONE step — so the jump counts both. The first fix
+    tested only "does this token contain a newline?", which threw the real
+    separator away with the embedded ones and MERGED the next command into the
+    commit's argv.
+
+    Measured on `git commit -m "a\\nb"\\nsort -n f`: jump=2 (one embedded, one
+    real), no separator emitted, tokens
+    ['git','commit','-m','a\\nb','sort','-n','f'] — so a benign `sort -n` was
+    read as a flag on `git commit` and DENIED. That is precisely the
+    false-positive class this gate was narrowed to remove, firing on the most
+    ordinary shape there is: every multi-line commit message in this repo,
+    including the ones iteration-commit.sh writes. The single-line case stayed
+    correct throughout, which is why it hid.
+
+    Both directions are pinned: the benign command must survive the multi-line
+    message, and a real bypass after one must still be caught.
+    """
+    mod = _load_gate_module()
+    for n, cmd in enumerate((
+            'git commit -m "line1\nline2"\nsort -n /tmp/f',
+            'git commit -m "a\nb"\nhead -n 5 /tmp/f',
+            'git commit -m "a\nb\nc"\nsort -n f',
+            'git commit -m "a\nb" && sort -n f',
+    )):
+        assert mod.scan_command(cmd) == [], \
+            f"case {n}: a benign -n after a multi-line commit message must approve"
+
+    for n, cmd in enumerate((
+            'git commit -m "a\nb"\ngit commit -n -m x',
+            'git commit -m "a\nb"\ngit commit --no-verify -m y',
+            'git commit -m "a\nb" && git commit -n -m z',
+    )):
+        assert mod.scan_command(cmd), \
+            f"case {n}: a real bypass after a multi-line message must still deny"
+
+    # The mechanism itself, so a future edit cannot satisfy the cases above by
+    # accident: the separator IS emitted, and exactly once.
+    toks = mod._tokenize('git commit -m "a\nb"\nsort -n f')
+    assert toks.count(";") == 1, f"expected exactly one separator, got {toks}"
+    assert toks[toks.index(";") + 1] == "sort", \
+        f"the separator must land BEFORE the next command, got {toks}"

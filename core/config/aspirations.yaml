@@ -320,6 +320,9 @@ stale_cadence:
 #                (0.5b.1b) + handoff-aging-check (0.5b.2b) — they escalate aged
 #                unclaimed work to external parties (user email / partner board),
 #                so they fire reliably; not meter-gated ().
+#                Plus completed-not-closed-drain (0.5g.7) — the bounded
+#                per-iteration DRAIN obligation (); an obligation,
+#                not a sweep, so it is never dropped.
 #   medium:      aspirations-recover-recurring, monitor-stale-check,
 #                precheck-eval (run-all), blocker-recheck (Phase 0.5b.0.5),
 #                defer-recheck (Phase 0.5b.4).
@@ -333,7 +336,8 @@ stale_cadence:
 #                blocked-signal-resolution-check (0.5b.12),
 #                human-blocked-defer-join (0.5b.15),
 #                dependency-cycle-check (0.5b.16),
-#                hypothesis-terminal-goal-check (0.5b.17).
+#                hypothesis-terminal-goal-check (0.5b.17),
+#                locus-sweep (0.5b.18).
 #                All are themselves cadence-gated, so dropping them in tight
 #                zones is safe.
 #                NON-EXHAUSTIVE — this list is a REFLECTION of sweep_tier() in
@@ -849,6 +853,68 @@ l1_skew_check:
 # scope it keeps its OWN precheck phase and is NOT a cadence-battery entry — same
 # exclusion l1-skew carries, and there is no /scar-tissue-review skill to invoke.
 # Implementation: core/scripts/scar-tissue-check.py --cadence --post-board
+# --- COMPLETED-NOT-CLOSED TRIAGE CADENCE () ---
+# The reducer-verification lane for goals that are FINISHED but still held at
+# in-progress by a worker Body whose liveness carrier is dead. Nothing else
+# closes them: the selector correctly refuses to re-execute a goal claimed by the
+# same mind from another Body, and the reducer that would verify them is gone.
+#
+# WHY IT NEEDS A CADENCE AT ALL. The population is already emitted every single
+# iteration by stranded-claim-sweep.py, and it still reads as HEALTH — the
+# headline is `scanned=346 / kept=346 / released=0`, and a 100%-kept sweep looks
+# cleaner than a partial one. Measured 2026-08-15 (zeta, cc-02): 338
+# completed-not-closed, up from 305 on 08-14, while every iteration printed that
+# reassuring line. The triage script existed from 2026-08-15T14:22 with ZERO call
+# sites anywhere in the tree — the only reference was a suggestion string in the
+# sweep's own stderr. This block is the consumer half (rb-7741).
+#
+# NEVER give this lane an --apply. Both obvious remedies are measured-rejected:
+# RELEASE re-opens finished work to the scorer, which then ranks it FIRST on
+# fresh metadata (); BLIND-CLOSE by classifying outcome_note measured a
+# 58% false-positive rate flagging not-done, and 22 of 423 positive-verdict notes
+# say in the same head that they are NOT finished. A wrong predicate across 338
+# goals is unrecoverable at that scale.
+completed_not_closed_triage:
+  goal_cadence: 50              # Every N completed goals. Deliberately HALF of
+                                # scar_tissue_check's 100: this backlog is
+                                # GROWING (305 -> 338 in ~22h) and each stuck
+                                # goal is finished product/framework work already
+                                # paid for, so the sampling period should be
+                                # shorter than a slow structural-drift check.
+  wm_slot: last_completed_not_closed_triage
+  limit: 20                     # Rows printed per fire, OLDEST claim first. The
+                                # dropped count is always announced, so a bound
+                                # can never read as a smaller population.
+
+# Completed-not-closed DRAIN — the per-iteration OBLIGATION that consumes the
+# backlog the lane above only reports (, 2026-08-16). Read by
+# core/scripts/completed-not-closed-slate.py, acted on by aspirations-precheck
+# Phase 0.5g.7: every reducer iteration, dispose (close / release+defer / hold)
+# up to `per_iteration` of the OLDEST open+noted goals this agent owns
+# (in-progress OR pending, undeferred; claimed_by, or unclaimed + executed_by —
+# widened 2026-08-16 after the in-progress-only predicate missed 220 pending).
+# Measured before it existed: 360 of 361 open alpha claims were finished work
+# nobody closed, while the report lane fired on cadence and the recurring drain
+# goal lost in the selector to fresher work. Small on purpose — this is a
+# trickle that keeps steady state near zero now that worker-loop Phase 4a closes
+# each unit at end of unit; the bulk backlog is drained by the recurring goal.
+completed_not_closed_drain:
+  per_iteration: 3              # Goals the reducer MUST dispose per iteration.
+                                # A disposition is a JUDGMENT (LLM reads the
+                                # note + verification), never a predicate.
+  min_claim_age_hours: 6        # Rows younger than this are held back: a live
+                                # Body now closes its own unit at Phase 4a, so a
+                                # fresh noted-but-open row is a Body mid-close or
+                                # a Phase 3.7 STRANDED hold, not backlog.
+  hold_ttl_hours: 24            # A HOLD (`--hold <goal> --reason`) keeps its row
+                                # off the slate for this long, then it RESURFACES
+                                # with its hold_count. Without a hold memory the
+                                # oldest-first bound re-served the same held rows
+                                # every iteration and three permanent holds
+                                # starved everything behind them (fresh-eyes
+                                # review 2026-08-16). A lease, not an exclusion
+                                # (guard-3419); a 3rd hold = file an Investigate.
+
 scar_tissue_check:
   goal_cadence: 100             # Every N completed goals — structural drift is
                                 # slow-moving; measured 2026-07-26 -> 2026-08-01
@@ -1517,6 +1583,18 @@ starvation_boost:
     MEDIUM: 0.0
     LOW: 0.0
 
+# --- DEPENDENCY-PULL BOOST () ---
+# EVENT-keyed counterpart to starvation_boost above, which is TIME-keyed. Every
+# other anti-starvation term in goal-selector is time-keyed, so a consumer goal
+# that exists to drain a dependency could only ever fire on its interval, never
+# WHEN the dependency actually landed. A producer stamps `pull_signal` on the
+# consumer goal at the moment the dependency materializes; apply_pull_boost turns
+# that event into rank.
+pull_boost:
+  enabled: true             # no-regression comes from the pull_signal REQUIREMENT (~no goal carries one), not from this flag
+  boost: 4.0                # MEASURED, not picked: exploration_noise is ~U(0, 1.210) over 99.6% of candidates (cc-07, 1163 candidates, 2026-08-17), and the acceptance bar is beating a top substantive 2 points up — so the boost must clear 2 + 1.210 = 3.21 (guard-1895 (2): sizing against the deterministic deficit instead of the NOISE WIDTH is what makes a scorer fix look real and do nothing). Kept BELOW directive_boost's 4.5 raw max so a fresh USER directive still outranks a machine-set pull.
+  max_age_hours: 24.0       # SAFETY VALVE, load-bearing: measured against coordination_merge._merge_goal, a one-sided SET survives cross-box merge (good) but CLEAR-BY-KEY-REMOVAL is RESURRECTED and CLEAR-BY-NULL loses on a same-or-older last_modified (seconds resolution — a same-second tie is reachable). Without an age bound a lost clear pins the goal at rank 1 forever, which is worse than the starvation being fixed.
+
 # --- PRODUCTIVITY SELF-STOP GATE (Item 2) ---
 # Composite productivity score computed at end of each iteration (via
 # iteration-close.sh → productivity-stop-gate.sh). If the agent is padding the
@@ -1957,6 +2035,30 @@ runner_heartbeat:
   # (4h) shared with Paths A/C. Env override: WEDGE_STALE_MINUTES. Guarded by
   # test_phase_wedge_check.py::test_config_invariant_wedge_exceeds_heartbeat_stale.
   wedge_stale_minutes: 65
+  # Assistant-turn liveness window for recovery-gate Path D ().
+  # Path D is SUPPRESSED when the bound agent's runner session emitted an
+  # assistant turn within this many minutes, read from the Claude Code session
+  # transcript (assistant-turn-freshness.py). This is the ONLY Path-D
+  # discriminator not derived from the execution diary, and that is the whole
+  # point: a live user conversation emits ZERO diary writes BY CONSTRUCTION
+  # (the diary records loop phases, not conversational turns), so "wedged" and
+  # "alive-but-off-loop" are IDENTICAL in diary+heartbeat space. Three prior
+  # narrowings (, , ) were each diary-derived and each
+  # was followed by another false firing -- 5 across 4 agents, a FLOOR.
+  # INVARIANT: assistant_turn_fresh_minutes < wedge_stale_minutes (65). WHY: this
+  # probe is only reached once a phase_start has been unclosed longer than
+  # wedge_stale. If the window were >= that, an assistant turn from the very START
+  # of the wedge window -- plausibly the turn that WEDGED -- could suppress the
+  # recovery of its own wedge. Strictly below guarantees a suppressing turn
+  # post-dates the oldest part of the wedge window. Guarded by
+  # test_assistant_turn_freshness.py::test_config_invariant_fresh_below_wedge_stale.
+  # 60 reuses runner_heartbeat.stale_minutes rather than introducing a fourth
+  # independent constant: a conversation an hour silent is not distinguishable
+  # from an absent one. Env override: ASSISTANT_TURN_FRESH_MINUTES.
+  # DIRECTION (guard-3802): the predicate is point-freshness against a FIXED
+  # threshold, so P(suppress) DECREASES as a wedge lengthens -- it is not the
+  # window-length-is-the-severity-metric shape that silences the worst cases.
+  assistant_turn_fresh_minutes: 60
   # Watchdog STALLED-detection threshold (agent-watchdog.py StalledProbe, ).
   # The watchdog reports STALLED (not OK) when the runner-heartbeat is FRESH (loop
   # alive + re-ticking every iteration) but the execution-diary.jsonl mtime is
@@ -2002,9 +2104,59 @@ runner_heartbeat:
   # test_reducer_self_fence.py::test_config_invariant_stepdown_precedes_takeover.
   # NOTE the gap this does NOT close: a SAME-BOX reducer restart keeps the same
   # machine_id, so the different-holder read cannot see it (same measured limit
-  # worker_reducer_liveness.py states for its takeover proxy). Closing that needs
-  # the claims endpoint to expose runner_token.
+  # worker_reducer_liveness.py states for its takeover proxy).
+  #
+  # 2026-08-17 () — the SIGNAL now exists but THIS consumer does not
+  # read it yet, and the distinction matters: do not read the line above as
+  # "still blocked on the endpoint". `runner-claim.sh status` — the exact command
+  # reducer_self_fence.check() already runs — now carries `token-fp <digest>` on
+  # its LIVE line, and worker_reducer_liveness consumes it as a second takeover
+  # axis. reducer_self_fence.parse_machine() still reads only the machine id, so
+  # the same-box restart remains invisible HERE. Wiring it is deliberately NOT
+  # done as part of that goal: this module sets `stop-requested` on a HEALTHY
+  # loop, so every added trigger is weighed against guard-1562, and its
+  # conservative "every other signal HOLDS" posture is load-bearing rather than
+  # incidental (.claude/rules/stop-hook-compliance.md).
+  #
+  # And do NOT close it by exposing the raw token, which is what the previous
+  # wording invited. `runner_token` is the ConditionExpression bearer credential
+  # for heartbeat() and release_runner(): publishing it lets any reader forge a
+  # heartbeat (defeating reclaim_if_stale) or release a live claim. The digest is
+  # the publishable form — see owncloud_backend.runner_token_fingerprint.
   stepdown_seconds: 1950
+
+# --- Reducer self-promotion () — DEFAULT OFF, and it must stay off ---
+# Relaxes worker-loop Phase 0.5's NEVER-PROMOTE invariant behind six gates.
+# Decision logic: core/scripts/reducer_promotion.py (pure `decide`).
+# Spec + kill-test bar + RETIREMENT CRITERION:
+#   core/config/conventions/reducer-promotion.md
+#
+# SAFETY ARGUMENT IN ONE LINE: promotion waits for T_takeover (3900s), and
+# stepdown_seconds (1950s) above is strictly below it, so by the time a worker
+# may promote the old holder has had a full step-down window to yield. That
+# ordering is the whole proof — do NOT raise stepdown_seconds toward 3900
+# without re-deriving this.
+#
+# WHY enabled STAYS false today: the fence's T_stepdown is proven by CODE and by
+# unit tests, but not yet by kill-tests ON THIS FLEET. `fence_verified_at` is the
+# second, independent gate for exactly that reason — flipping `enabled` alone
+# cannot promote anything, so neither flag is a single point of failure.
+reducer_promotion:
+  # G1 master kill switch. Only an explicit `true` enables; absent means off.
+  enabled: false
+  # G2 ISO timestamp, written ONLY after the three kill-tests in the convention
+  # have been run and recorded on this fleet. Absent => every input HOLDs.
+  # This is the dependency lock (rb-4452): the invariant is fixed in reviewable
+  # form BEFORE the dependency exists, so it constrains the kill-test lane's
+  # design instead of being retrofitted onto it.
+  fence_verified_at: null
+  # G3 EXACT machine ids that may hold the reducer claim. Exact string equality,
+  # never a glob or prefix (guard-2860): the cardinality of what this admits must
+  # be a property of THIS LIST, reviewable here, not of what a pattern happens to
+  # match later on some box's disk. Laptop / on-demand / WSL boxes stay OFF the
+  # list deliberately — a box that sleeps is a box whose claim goes stale.
+  # Empty list = nothing is eligible, which is the correct default.
+  eligible_machines: []
 
 # --- Recovery gate (script-gated crashed-runner auto-recovery) ---
 # core/scripts/recovery-gate.sh fires from the SessionStart hook when ALL FOUR
@@ -2045,6 +2197,57 @@ runner_heartbeat:
 # its own thresholds from there with internal hardcoded fallbacks — core no
 # longer ships the domain process names. A fresh deployment without a stale
 # scanner inherits the world script's defaults or skips the scanner entirely.
+
+# ------------------------------------------------------------------
+# Git-drift + host-capacity detection ( — agent-watchdog GitDriftProbe)
+# ------------------------------------------------------------------
+# Nothing monitored per-box git divergence or host disk until 2026-08-14. Both
+# holes were found the same way — an operator asked a question. Measured
+# 2026-08-13: cc-07 forked at 342 ahead since 2026-08-08; cc-08 accumulated 223
+# main-bound commits in 3 days; cc-03 sat DORMANT 163 behind with no heal path
+# (0 ahead, 0 dirty, so nothing ever fired). Companion: zakbox1 reached 90% of
+# 905G with 450G of policy-retained .history payload, equally invisible.
+#
+# The probe reads these thresholds; it does NOT carry its own copies (guard-308
+# — a probe's default MUST reference the source of truth, never restate it).
+# Every value has an env override for a one-off run without editing config.
+git_drift:
+  # Local commits not on origin/main. A reducer pushes every iteration, so a
+  # standing `ahead` means the shared branch is not being fed from this box.
+  # 25 ~= a long single session's worth of iteration commits: high enough that
+  # ordinary in-flight work never trips it, low enough to catch a fork the day
+  # it starts rather than at 342. Env: GIT_DRIFT_AHEAD.
+  ahead_threshold: 25
+  # Commits on origin/main this box has not merged. Deliberately LOOSER than
+  # ahead: being behind is normal between pulls and self-heals at the next
+  # launch, whereas being ahead needs a human or a push. 50 catches the cc-03
+  # dormant-box class (163 behind, no loop, no heal) without firing on a box
+  # that simply has not pulled for an hour. Env: GIT_DRIFT_BEHIND.
+  behind_threshold: 50
+  # Commits on a LIVE Body's refs/workers/<agent>/<sid> carrier that are not
+  # reachable from origin/main. worker-ref-consume.sh is report-only with no
+  # scheduled caller ( owns the cadence), so durable-on-ref work can
+  # sit unlanded indefinitely — measured 58-318 across 6 refs on cc-02.
+  # ONLY live Bodies count: a CLOSED body's ref is frozen history by design and
+  # counting it is the false positive the first draft of  fell into.
+  # Env: GIT_DRIFT_UNCONSUMED.
+  unconsumed_threshold: 100
+  # Host filesystem holding PROJECT_ROOT, as df reports Use% — used/(used+free),
+  # which EXCLUDES root-reserved blocks and is therefore the number a human sees
+  # and the more conservative of the two. (used/total is ~4 points lower on a
+  # default ext4; on cc-02 2026-08-14 that is 92% vs 88%.) 80 leaves room to act
+  # before writes start failing. Env: GIT_DRIFT_DISK_PCT.
+  disk_used_pct_threshold: 80
+  # `git fetch` is the only network I/O in the watchdog tick, and the tick runs
+  # every iteration. Fetch at most this often; between fetches the counts come
+  # from the last-known remote ref and the payload carries stale_basis=true so a
+  # reader never mistakes a cached count for a fresh one. Env:
+  # GIT_DRIFT_FETCH_THROTTLE_MIN.
+  fetch_throttle_minutes: 30
+  # Consecutive breaching ticks before an Investigate goal is filed. 2 (not 1)
+  # because a fetch that races a partner's push can read one transient spike.
+  # Env: GIT_DRIFT_TICKS_TO_FILE.
+  ticks_to_file: 2
 
 # ------------------------------------------------------------------
 # Infra-health failing-streak alerting ( — asp-249)
@@ -2212,7 +2415,15 @@ history_vacuum:
   # local-only — the payload stays restorable from the graveyard indefinitely,
   # so a short LOCAL window is safe on the 98%-full disk. null disables
   # retention-drop (orphan-sweep only).
-  metadata_only_after_days: 30
+  # 30 -> 7 (2026-08-13, operator-directed): zakbox1 hit 90% of 905G and the
+  # measured cause was THIS window working as configured — cc-04 alone held
+  # 105G of blobs, 32,284 of 32,326 younger than 30d (~1,600 blobs/~3.5G per
+  # day churn), so 4 resident mirrors ≈ 450G of policy-retained payload. A
+  # 7-day window keeps a week of instant local restores and caps the fleet
+  # steady-state near ~100G; everything older is a graveyard fetch away.
+  # First tick after this lands drains ~3-4 weeks of cohort per box
+  # (archive-verify-then-delete, backgrounded, per-box lock — fail-safe).
+  metadata_only_after_days: 7
   # apply=true (): the tick now ARCHIVES orphans to the remote
   # graveyard, VERIFIES, then deletes locally (archive/verify failure => abort,
   # NO delete — fail-safe). Flipped ONLY after four independent proofs the
@@ -2262,3 +2473,50 @@ history_vacuum:
   # A vacuum lock dir older than this is presumed dead (backgrounded run
   # crashed before rmdir) and reclaimed, so GC is never wedged forever.
   stale_lock_reclaim_hours: 2
+
+# Aspirations hot-store eviction cadence (2026-08-14, operator-directed S3
+# cost-down; threshold approved verbatim "go 3"). The evictor
+# (aspirations-evict-completed.py) is metric-neutral (census) and merge-safe
+# (evicted_ids tombstones, ) — but it had NO call site and its 45d default
+# delivered 0.02% of the measured saving (). First hand-run
+# 2026-08-14T12:54 (cc-04): world 36.6MB -> 16.6MB, 54% smaller, 4,809 goals;
+# the store was 54.4 GB/day of whole-object PUT churn () and regrows
+# ~2.9MB/day without a cadence. Daily per-box tick via
+# aspirations-evict-tick.sh at iteration-close (the history_vacuum sibling
+# pattern); multi-box overlap harmless — eviction is idempotent and the merge
+# layer drops stale-replica resurrections at the tombstone set.
+#
+# THERE IS NO RECORD-LEVEL RECOVERY. This block and evict-tick.sh both claimed
+# "recoverable (.history 7d + lifecycle-exempt graveyard)" until 2026-08-18; both
+# halves were false and the clause is removed above. The evictor contains ZERO
+# graveyard code (`grep -c graveyard` = 0, no s3/put_object anywhere in it) — the
+# graveyard belongs to history_vacuum_archive.py, a DIFFERENT tool over a
+# DIFFERENT set, which is the adjacent-backup trap archive-before-delete.md names
+# as rb-6344. And ".history recovery" is verbatim the sentence the evictor's own
+# header retracts as "infeasible in practice" (measured 2026-08-11; it had already
+# sent one investigation hunting a store that cannot answer the question). Both
+# false claims were written into these two files three days AFTER that retraction.
+# Measured 2026-08-18 (alpha, cc-04): 6,069 evicted-id tombstones, of which 34
+# (0.56%) resolve to a record in aspirations-archive.jsonl. Per
+# archive-before-delete.md step 2 an unverifiable recovery layer is treated as
+# ABSENT; here it is measurably absent. Eviction is a ONE-WAY drop of goal
+# records, and that is BY DESIGN (the evictor's "a goal id is ephemeral by
+# design") — the defect was only ever the two comments promising otherwise.
+#
+# age_days 3 CUTS INSIDE THE COMPLETION-REPORT LOOKBACK, and nobody re-derived the
+# margin when the operator approved "go 3". The evictor's rationale justifies its
+# 45d default as "well beyond completion-report lookback (~7d) ... so no
+# record-consumer loses signal it actually uses". That derivation does not survive
+# 3d: agent-completion-report SKILL.md step 2 filters goal RECORDS on
+# `completed_at >= since`, so any report window wider than ~3 days silently
+# under-reports completed goals. Measured the same day: terminal non-recurring
+# goals in the live store bucket 194/447/113/54 at ages 0/1/2/3d and then hit
+# EXACTLY ZERO from day 4 out — while the positive control (non-terminal goals,
+# which eviction never touches) runs a smooth tail to 99d. The cliff is eviction,
+# not a quiet fleet. Tracked by ; do NOT change age_days here to "fix"
+# it — 3 is an operator decision ("go 3") and the tradeoff is the operator's.
+aspirations_eviction:
+  enabled: true
+  interval_hours: 24
+  age_days: 3
+  apply: true

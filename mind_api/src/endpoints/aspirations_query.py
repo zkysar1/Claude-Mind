@@ -17,6 +17,30 @@ projection still emits `goal_id` only. Before g-115-3473 the two projections
 had mutually exclusive id keys, which silently returned None for every record
 when a goal_id-keyed reader passed --full.
 
+THE DEFAULT PROJECTION IS EXACTLY SIX KEYS, and they are named here because a
+caller who filters the OUTPUT on a key that is not among them gets a silent
+empty (g-115-5752 failure (a): date-filtering on `created_at` matched nothing,
+including the caller's own goals filed that day):
+    goal_id, asp_id, source, title, status, category
+Anything else — created_at, priority, claimed_by, description, verification —
+requires `full=true`. Note the asymmetry that makes this easy to trip over:
+`goal_field_name=created_at` filters SERVER-side against the raw record and
+works fine; it is filtering the RETURNED ROWS that silently fails.
+
+FILTERING is a separate axis from PROJECTION, and conflating them was the other
+half of the g-115-5752 defect: `goal_field_name` matches the RAW goal record,
+where the identifier is `id`, while every projection above emits `goal_id`. So a
+caller who read `goal_id` out of a response and filtered on it got `[]` for a
+goal that exists. `goal_id` is now ALIASED to `id` before matching, and a field
+name that NO goal record carries is refused 400 `unknown_goal_field` instead of
+being answered with an empty array. The valid-key set in that refusal is READ
+FROM THE RECORDS, never hardcoded — a static list is a second copy of the goal
+schema that drifts silently the first time a field is added (the same drift
+surface the VALID_GOAL_STATUSES invariant at the bottom of this docstring warns
+about). The refusal keys on the field's EXISTENCE, not on the result size — see
+the comment at the check for why the result-size shape misses the over-broad
+half.
+
 Response: application/json — `json.dumps(results, indent=2, ensure_ascii=True)`,
 byte-for-byte matching `cmd_query`'s stdout. Always reads BOTH world and agent
 queues: `--source` is ACCEPTED BUT DOES NOT FILTER, so `--source agent` returns
@@ -54,7 +78,6 @@ VALID_GOAL_STATUSES = {
     "skipped", "expired", "decomposed", "superseded",
 }
 
-
 def _parse_goal_status(raw: str):
     """Mirror of aspirations.py:_parse_goal_status_list. Returns (set, error_str).
     error_str is non-empty on invalid input — caller maps to a 400."""
@@ -66,6 +89,19 @@ def _parse_goal_status(raw: str):
             f"Valid: {','.join(sorted(VALID_GOAL_STATUSES))}"
         )
     return wanted, ""
+
+
+# Keys a caller reasonably tries because they SEE them in this endpoint's own
+# output, but which do not exist on the raw goal record `_goal_matches` reads.
+# `goal_id` is aliased because it is the identifier key the default projection
+# emits (and full mode emits alongside `id`), so keying on it is the natural
+# mistake — measured twice, by two agents, a day apart ().
+# `asp_id` and `source` are deliberately NOT aliased: they are aspiration/store
+# metadata the endpoint attaches during projection, they have no per-goal
+# meaning, and inventing a match for them would be new behaviour rather than
+# the repair of a lie. They are named in the refusal message instead.
+_GOAL_FIELD_ALIASES = {"goal_id": "id"}
+_PROJECTION_ONLY_KEYS = ("asp_id", "source")
 
 
 def _goal_matches(goal: Dict[str, Any], status_filter, field_filter, title_substr) -> bool:
@@ -125,8 +161,12 @@ def query(ctx) -> "Response":  # type: ignore[name-defined]
             return Response.error(400, "invalid_goal_status", err)
 
     field_filter: Tuple[str, str] | None = None
+    field_key = None
     if raw_field_name is not None:
-        field_filter = (raw_field_name, raw_field_value)
+        # Alias BEFORE matching: matching reads the raw record, where the
+        # identifier is `id`; `goal_id` only exists after projection.
+        field_key = _GOAL_FIELD_ALIASES.get(raw_field_name, raw_field_name)
+        field_filter = (field_key, raw_field_value)
 
     jc = cache()
     sources: List[Tuple[str, List[Dict[str, Any]]]] = []
@@ -163,10 +203,16 @@ def query(ctx) -> "Response":  # type: ignore[name-defined]
         )
 
     results: List[Dict[str, Any]] = []
+    # Did the requested field name exist as a key on ANY goal record? One `in`
+    # test per goal, and only when a field filter is active — the expensive
+    # key-set enumeration below runs solely on the refusal path.
+    field_key_seen = False
     for source_name, aspirations in sources:
         for asp in aspirations:
             asp_id = asp.get("id", "")
             for goal in asp.get("goals", []):
+                if field_key is not None and not field_key_seen and field_key in goal:
+                    field_key_seen = True
                 if _goal_matches(goal, status_filter, field_filter, raw_title):
                     if full_mode:
                         # Full-record read (): raw goal dict + {asp_id,
@@ -197,6 +243,68 @@ def query(ctx) -> "Response":  # type: ignore[name-defined]
                             "status": goal.get("status", ""),
                             "category": goal.get("category", ""),
                         })
+
+    # A FIELD NAME NO RECORD CARRIES IS A VACUOUS FILTER, NOT A CLEAN RESULT
+    # (). Before this, `--goal-field goal_id ` returned `[]`
+    # with HTTP 200 for a goal that exists, because matching reads the raw
+    # record (key `id`) while every projection this endpoint emits shows
+    # `goal_id`. Two agents hit that exact call a day apart and both read the
+    # empty array as "no such goal".
+    #
+    # DELIBERATELY NOT GATED ON `not results`, which is the tempting shape and
+    # the wrong one. `_goal_matches` compares `str(goal.get(field)) != value`,
+    # so `goal.get()` returning None for an ABSENT key stringifies to "None" —
+    # and `--goal-field zzz_nonexistent None` therefore matches EVERY goal that
+    # lacks the key, i.e. all of them. That failure returns a full-store result
+    # with HTTP 200, and an over-broad answer never looks like a failure (the
+    # 35x and 157x measurements in aspirations-query.sh's own `-*)` comment).
+    # Keying the refusal on the KEY's existence rather than on the result size
+    # catches the empty case and the everything case with one test.
+    #
+    # An error, not a warning, for the same reason the 404 above is: this
+    # endpoint's entire response body is the JSON array, so there is nowhere a
+    # warning could go that a caller would read.
+    if field_key is not None and not field_key_seen:
+        known: set[str] = set()
+        for _src, aspirations in sources:
+            for asp in aspirations:
+                for goal in asp.get("goals", []):
+                    known.update(goal.keys())
+        # A STORE WITH ZERO GOAL RECORDS CANNOT VALIDATE A FIELD NAME, so it must
+        # not refuse one. `known` is empty iff no goal exists anywhere, and in
+        # that state EVERY field name is unseen — so without this the endpoint
+        # 400s on every filtered query against a fresh world, turning "no goals
+        # yet" into a caller error. The empty result is the honest answer there.
+        # Tested against `known` rather than a counter tracked in the main loop:
+        # same predicate, and it keeps the whole cost on the refusal path.
+        if not known:
+            return Response.text(
+                json.dumps(results, indent=2, ensure_ascii=True),
+                content_type="application/json",
+            )
+        # The live store carries ~148 distinct goal keys, so the bare sorted
+        # list is complete but hard to act on. Lead with close matches (this is
+        # a typo/wrong-name error by construction), then give the FULL list —
+        # never a truncated one, since the omitted key is exactly the one the
+        # caller was reaching for (guard-1941).
+        import difflib
+        suggestions = difflib.get_close_matches(raw_field_name, sorted(known), n=3, cutoff=0.6)
+        detail = (
+            f"unknown goal field: {raw_field_name!r} — no goal record in any "
+            f"queue carries that key, so this filter cannot match anything."
+        )
+        if suggestions:
+            detail += f" Did you mean: {', '.join(repr(s) for s in suggestions)}?"
+        detail += (
+            f" All {len(known)} valid field names: {', '.join(sorted(known))}"
+        )
+        if raw_field_name in _PROJECTION_ONLY_KEYS:
+            detail += (
+                f". Note {raw_field_name!r} appears in this endpoint's OUTPUT but is "
+                f"attached during projection — it is not a field of the goal record "
+                f"and cannot be filtered on."
+            )
+        return Response.error(400, "unknown_goal_field", detail)
 
     # cmd_query uses ensure_ascii=True — match byte-for-byte.
     return Response.text(

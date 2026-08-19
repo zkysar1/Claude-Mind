@@ -95,12 +95,12 @@ INCLUDE_UNTRACKED=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --goal-id) GOAL_ID="${2:-}"; shift 2 ;;
-    --title) TITLE="${2:-}"; shift 2 ;;
-    --outcome) OUTCOME="${2:-}"; shift 2 ;;
-    --repo) REPO="${2:-}"; shift 2 ;;
-    --type) TYPE="${2:-}"; shift 2 ;;
-    --message) EXTRA_MSG="${2:-}"; shift 2 ;;
+    --goal-id) GOAL_ID="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+    --title) TITLE="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+    --outcome) OUTCOME="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+    --repo) REPO="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+    --type) TYPE="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+    --message) EXTRA_MSG="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
     --dry-run) DRY_RUN=1; shift ;;
     --no-namespace-filter) NO_NAMESPACE_FILTER=1; shift ;;
     --include-untracked) INCLUDE_UNTRACKED=1; shift ;;
@@ -261,16 +261,30 @@ fi
 # accepted as best-effort here rather than closed with a fragile anchor.
 # Fail-open: when the anchor is genuinely absent (this path), the filter simply
 # does not fire.
+# FOREIGN-ANCHOR GUARD (, measured 2026-08-13): the row is
+# AGENT-keyed, so in_flight can name a DIFFERENT goal than the one being
+# committed (a held second claim, or a stale row) — and its claimed_at then
+# filters the CLOSING goal's own deliverables as "predating the claim"
+# (measured: closing  while the row held ; both deliverable
+# files silently dropped, close reported success). So the row's claimed_at is
+# used ONLY when in_flight.goal_id matches $GOAL_ID; on a mismatch the filter
+# stays inert (epoch 0 — the normal-path RULE above) with a loud ERROR, per
+# the same  bias: never silently drop self-authored work.
 committer_claimed_at_epoch=0
 committer_claimed_at_iso=""
 if [[ $INCLUDE_UNTRACKED -eq 0 && -n "${MIND_AGENT:-}" ]]; then
   paths_sh="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/team-state-read.sh"
   if [[ -x "$paths_sh" ]]; then
-    raw_claimed_at=$("$paths_sh" --field "agent_status.${MIND_AGENT}.in_flight.claimed_at" --json 2>/dev/null || echo '""')
-    committer_claimed_at_iso="${raw_claimed_at//\"/}"  # strip surrounding quotes
-    if [[ -n "$committer_claimed_at_iso" && "$committer_claimed_at_iso" != "null" ]]; then
-      # Convert ISO timestamp to epoch via py -3 (POSIX date doesn't parse ISO portably on Windows).
-      committer_claimed_at_epoch=$(CLAIMED_AT_E="$committer_claimed_at_iso" py -3 - 2>/dev/null <<'PYEOF' || echo 0
+    raw_inflight_goal=$("$paths_sh" --field "agent_status.${MIND_AGENT}.in_flight.goal_id" --json 2>/dev/null || echo '""')
+    inflight_goal_id="${raw_inflight_goal//\"/}"  # strip surrounding quotes
+    if [[ -n "$inflight_goal_id" && "$inflight_goal_id" != "null" && "$inflight_goal_id" != "$GOAL_ID" ]]; then
+      echo "[$SCRIPT_NAME] ERROR: FOREIGN anchor refused — team-state in_flight names goal_id=$inflight_goal_id but this commit closes $GOAL_ID. Pre-claim mtime filter DISABLED for this commit so the closing goal's own files cannot be silently dropped (g-115-6107)." >&2
+    else
+      raw_claimed_at=$("$paths_sh" --field "agent_status.${MIND_AGENT}.in_flight.claimed_at" --json 2>/dev/null || echo '""')
+      committer_claimed_at_iso="${raw_claimed_at//\"/}"  # strip surrounding quotes
+      if [[ -n "$committer_claimed_at_iso" && "$committer_claimed_at_iso" != "null" ]]; then
+        # Convert ISO timestamp to epoch via py -3 (POSIX date doesn't parse ISO portably on Windows).
+        committer_claimed_at_epoch=$(CLAIMED_AT_E="$committer_claimed_at_iso" py -3 - 2>/dev/null <<'PYEOF' || echo 0
 import os, sys, datetime
 try:
     t = os.environ.get("CLAIMED_AT_E", "")
@@ -280,6 +294,7 @@ except Exception:
     print(0)
 PYEOF
 )
+      fi
     fi
   fi
 fi

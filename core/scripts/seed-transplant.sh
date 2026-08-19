@@ -134,9 +134,38 @@ if [ ! -d "$DEST" ]; then
     fi
 fi
 
+# FAIL CLOSED (). Two call sites below (3b destination, 3e source)
+# both sent stderr to /dev/null and dropped the exit code — so ANY git failure
+# produced an empty string that both callers read as "working tree is clean".
+# (The old form is DESCRIBED, not quoted: a verbatim copy would be the only
+# match left for the very grep that verifies this fix, so the check would flag
+# its own documentation — guard-1099.) On this fleet the likeliest failure is
+# .git/index.lock contention from a partner's concurrent iteration-commit.sh,
+# which makes the check least trustworthy exactly when partners are committing.
+#
+# Echoes a marker line on failure so the result is NON-empty and every caller's
+# existing `[ -n ... ]` test trips into its dirty branch unchanged — the callers
+# keep their own semantics (3b REFUSES, 3e only WARNS). --no-optional-locks
+# stops the probe contending for index.lock at all; verified by running it on
+# git 2.43.0 rather than assumed (the flag was absent from core/scripts before
+# this fix). Sanctioned sibling idiom: iteration-commit.sh:492.
+git_status_or_dirty() {
+    _gs_out="$(git --no-optional-locks -C "$1" status --porcelain 2>&1)" || {
+        printf 'git status failed (rc=%s) — treating as DIRTY: %s\n' \
+            "$?" "${_gs_out:-<no stderr>}"
+        return 0
+    }
+    printf '%s' "$_gs_out"
+}
+
 # 3b. Destination git status
-if [ -d "$DEST/.git" ]; then
-    if [ -n "$(git -C "$DEST" status --porcelain 2>/dev/null)" ]; then
+# -e, not -d, at every $DEST/.git test in this file: a linked git WORKTREE has
+# a .git FILE (gitdir pointer), and promote-to-upstream --pr plants into one.
+# With -d, Step 12.5's auto-commit silently skipped there (731 files left
+# uncommitted, empty branch pushed, "No commits between main and promote/…" —
+# 2026-08-19 v2.9.3 run 2). git -C works identically in a worktree.
+if [ -e "$DEST/.git" ]; then
+    if [ -n "$(git_status_or_dirty "$DEST")" ]; then
         if [ $FORCE -eq 1 ]; then
             echo "  WARN: destination has uncommitted changes (--force overriding)"
         else
@@ -173,8 +202,8 @@ for d in agents world meta; do
     fi
 done
 
-# 3e. Source cleanliness
-if [ -n "$(git -C "$PROJECT_ROOT" status --porcelain 2>/dev/null)" ]; then
+# 3e. Source cleanliness (fail closed via git_status_or_dirty — )
+if [ -n "$(git_status_or_dirty "$PROJECT_ROOT")" ]; then
     echo "  WARN: source has uncommitted changes — seed will include uncommitted modifications."
 fi
 
@@ -250,7 +279,7 @@ fi
 # Step 5: Dry-run exit
 if [ $DRY_RUN -eq 1 ]; then
     echo "[seed-transplant] Dry run complete. Re-run without --dry-run to apply."
-    if [ $DO_DIFF -eq 1 ] && [ -d "$DEST/.git" -o -d "$DEST/CLAUDE.md" -o -d "$DEST/core" ]; then
+    if [ $DO_DIFF -eq 1 ] && [ -e "$DEST/.git" -o -d "$DEST/CLAUDE.md" -o -d "$DEST/core" ]; then
         py -3 "$SCRIPT_DIR/_seed_engine.py" diff --manifest "$MANIFEST" --source "$PROJECT_ROOT" --dest "$DEST"
     fi
     exit 0
@@ -455,7 +484,7 @@ py -3 "$SCRIPT_DIR/_seed_postactions.py" --manifest "$MANIFEST" --dest "$DEST" -
 
 # Step 12.5: Auto-commit (runs AFTER post-actions so regenerated files are
 # captured in the commit)
-if [ $DO_COMMIT -eq 1 ] && [ -d "$DEST/.git" ]; then
+if [ $DO_COMMIT -eq 1 ] && [ -e "$DEST/.git" ]; then
     echo "[seed-transplant] Committing planted files at destination..."
     # SAFE bare add-A + commit (reviewed ): $DEST is a fresh/re-init'd
     # (Step 11) single-purpose publication target, NOT the live shared
@@ -488,8 +517,15 @@ if [ $DO_COMMIT -eq 1 ] && [ -d "$DEST/.git" ]; then
     # DISCRIMINATOR: `git diff --cached --quiet` exits 0 when NOTHING is staged
     # and 1 when staged changes remain. Run it AFTER the failed commit — a hook
     # refusal leaves the index fully intact, an empty index stays empty.
+    # Second paragraph = the hot-path size-budget override trailer ().
+    # A plant legitimately REPLACES the destination's hot-path files with the
+    # upstream versions, which may be larger; without the trailer the
+    # destination's own core/githooks/commit-msg would refuse the plant. The
+    # SUBJECT line above is unchanged, so the `^chore: sync framework` grep
+    # still finds this commit.
     set +e
-    COMMIT_OUT="$(git -C "$DEST" commit -m "chore: sync framework ($TS)" -q 2>&1)"
+    COMMIT_OUT="$(git -C "$DEST" commit -m "chore: sync framework ($TS)" \
+        -m "size-budget-override: framework seed plant — hot-path files track the upstream versions" -q 2>&1)"
     COMMIT_RC=$?
     set -e
     if [ $COMMIT_RC -eq 0 ]; then
@@ -545,7 +581,7 @@ echo "[seed-transplant] Running verification..."
 # --expect-commit tells seed-verify that a commit was supposed to land here, which
 # turns a post-plant dirty tree from "expected" into a hard FAIL.
 EXPECT_FLAG=""
-if [ $DO_COMMIT -eq 1 ] && [ -d "$DEST/.git" ]; then
+if [ $DO_COMMIT -eq 1 ] && [ -e "$DEST/.git" ]; then
     EXPECT_FLAG="--expect-commit"
 fi
 # Forward the SAME manifest this plant used. Omitting it made seed-verify fall

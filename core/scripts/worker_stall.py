@@ -83,14 +83,40 @@ DEFAULT_STALE_MINUTES = 60.0
 # signal that tells a future reader whether the carrier pipeline works at all.
 V_ALIVE = "alive"                    # carrier fresh -> body is ticking
 V_STALLED_WITH_CLAIM = "stalled_with_claim"   # THE ALERT
-V_STALE_NO_CLAIM = "stale_no_claim"  # closed/finished body -> benign, never alerts
+V_STALE_NO_CLAIM = "stale_no_claim"  # carrier says CLOSED -> benign, never alerts
+V_STALLED_NO_CLOSE = "stalled_no_close"  # THE SECOND ALERT ()
+V_STALE_PARKED = "stale_parked"      # deliberately dormant -> benign, never alerts
+V_STALE_STATE_UNKNOWN = "stale_state_unknown"  # no state in carrier -> benign, COUNTED
 V_UNREADABLE = "unreadable"          # present but no usable ts
+
+# The `body_state` values that mean the Body FINISHED.
+#
+# MIRRORED from body-manifest.py CLOSED_STATES, which is the SSOT that declares
+# the active/parked-vs-closed partition ("a future state joins exactly one of
+# these two tuples and every consumer inherits the right answer"). Deliberately
+# NOT imported at runtime: body-manifest.py is hyphen-named (importlib-only) and
+# this module is loaded by agent-watchdog on every tick, so acquiring an import
+# that can fail would let a probe-module load error take out the probe. Drift is
+# caught LOUDLY at test time instead -- test_state_partition_matches_body_manifest
+# importlib-loads the real module and asserts these agree, the same
+# pin-the-divergence technique test_reducer_self_fence.py uses on its sibling.
+CLOSED_BODY_STATES = frozenset({"closed-pending-merge", "merged", "closed-stale"})
+# `parked` is a LIVE but deliberately dormant Body (body-manifest.park_body;
+# capped at PARK_MAX_HOURS=60 with an hourly reducer re-poll). Excluded from the
+# alert on purpose: its re-poll cadence is ~= this module's staleness threshold,
+# so alerting on it would fire on the NORMAL case, and a flag that fires
+# constantly stops being read at all -- the same reasoning `degraded_read` in
+# scan() gives for not voiding on a single unreadable carrier.
+PARKED_BODY_STATE = "parked"
+
+ALERTING_VERDICTS = frozenset({V_STALLED_WITH_CLAIM, V_STALLED_NO_CLOSE})
 
 
 def classify_body(
     carrier_age_minutes: Optional[float],
     holds_live_claim: bool,
     stale_minutes: float = DEFAULT_STALE_MINUTES,
+    body_state: Optional[str] = None,
 ) -> str:
     """Pure classifier -- the whole decision, with no I/O.
 
@@ -102,21 +128,72 @@ def classify_body(
 
     Note the asymmetry, which is the design: freshness alone can CLEAR a body
     (fresh carrier => alive, no claim lookup needed) but can never CONDEMN one.
-    Condemning requires the claim join, because a stale carrier is the normal
+    Condemning requires a SECOND signal, because a stale carrier is the normal
     resting state of every body that has ever finished.
+
+    `body_state` is that second signal for a CLAIMLESS body (g-306-319). Until
+    it existed, the only second signal was the claim join, so a worker that
+    text-died BETWEEN units -- after releasing unit N, before claiming N+1 --
+    was byte-identical to a cleanly-finished Body and got the benign
+    `stale_no_claim`. That was not an oversight: with no way to tell finished
+    from vanished, benign was the only choice that did not flood. The premise
+    expired when a Body was witnessed dying in exactly that window (alpha
+    worker, cc-07, 6h49m dark before its own 600s net resurrected it).
+
+    What changed is not the classifier's cleverness but the EVIDENCE reaching
+    it. `body_state` already existed, already populated, already written by the
+    close path -- but it lives in sessions/<SID>/body-manifest.yaml, and
+    `sessions` is in owncloud_sync._EXCLUDE_DIRS (walk-pruned, never pushed), so
+    a peer structurally could not read it. The fix carries that STRUCTURED field
+    into the carrier that IS published, rather than widening a predicate over
+    prose (guard-2499: when a classifier is blind, move to the structured field
+    the writer already knows at write time -- do not guess harder).
+
+    So a stale claimless body now splits four ways, and only one alerts:
+      closed-*  -> V_STALE_NO_CLAIM      the Body finished. Benign, and now
+                                          EARNED rather than assumed.
+      parked    -> V_STALE_PARKED        deliberately dormant. Benign.
+      absent    -> V_STALE_STATE_UNKNOWN a carrier written before this field
+                                          existed, or by a box that has not
+                                          pulled yet. Benign -- alerting here
+                                          would flood the fleet for exactly as
+                                          long as the rollout takes -- but
+                                          COUNTED by scan(), so the population
+                                          that cannot be judged stays visible
+                                          instead of silently absorbing stalls
+                                          (guard-4000: a fail-safe KEEP that
+                                          never reports is how an uncollectable
+                                          population grows unbounded).
+      anything  -> V_STALLED_NO_CLOSE    a Body that was LIVE at its last tick
+      else                                and never wrote a close. THE STALL.
+
+    The default for an unrecognised state is the ALERT, and that direction is
+    deliberate: any future non-closed, non-parked state is by construction a
+    live state, and a live Body that stopped ticking is the exact condition this
+    module hunts. Missing a stall is the failure that motivated the change;
+    a new state announcing itself as one false alert is the cheaper error.
     """
     if carrier_age_minutes is None:
         return V_UNREADABLE
     if carrier_age_minutes <= stale_minutes:
         return V_ALIVE
-    return V_STALLED_WITH_CLAIM if holds_live_claim else V_STALE_NO_CLAIM
+    if holds_live_claim:
+        return V_STALLED_WITH_CLAIM
+    state = (body_state or "").strip()
+    if not state:
+        return V_STALE_STATE_UNKNOWN
+    if state in CLOSED_BODY_STATES:
+        return V_STALE_NO_CLAIM
+    if state == PARKED_BODY_STATE:
+        return V_STALE_PARKED
+    return V_STALLED_NO_CLOSE
 
 
 def is_alerting(verdict: str) -> bool:
     """Single source of truth for which verdicts escalate. Callers must not
-    re-derive this with their own string comparison -- that is how a fifth
-    verdict added later silently starts or stops alerting."""
-    return verdict == V_STALLED_WITH_CLAIM
+    re-derive this with their own string comparison -- that is how a verdict
+    added later silently starts or stops alerting."""
+    return verdict in ALERTING_VERDICTS
 
 
 TERMINAL_STATUSES = {"completed", "skipped", "expired"}
@@ -194,11 +271,15 @@ def read_claims(world_store: Path) -> "tuple[Dict[str, str], str]":
         if scripts.is_dir() and str(scripts) not in sys.path:
             sys.path.insert(0, str(scripts))
         from storage_backend import get_backend  # noqa: PLC0415
+        from _owncloud_codec import decode_response  # noqa: PLC0415  # 
 
         b = get_backend()
-        body = b.s3.get_object(
-            Bucket=b.bucket, Key=b._s3_key(world_store)
-        )["Body"].read().decode("utf-8")
+        key = b._s3_key(world_store)
+        # : the queue may be gzip on the wire — decode through the one
+        # transport seam (magic-byte authoritative; a plain object passes through).
+        body = decode_response(
+            b.s3.get_object(Bucket=b.bucket, Key=key), key=key
+        ).decode("utf-8")
         return _claims_from_lines(body.splitlines()), "authoritative"
     except Exception:
         pass
@@ -346,6 +427,7 @@ def enumerate_carriers(agents_root: Path) -> "tuple[List[Dict[str, Any]], Dict[s
         if str(agents_root.parent / "core" / "scripts") not in sys.path:
             sys.path.insert(0, str(agents_root.parent / "core" / "scripts"))
         from storage_backend import get_backend  # noqa: PLC0415
+        from _owncloud_codec import decode_response  # noqa: PLC0415  # 
 
         b = get_backend()
         probe_key = b._s3_key(agents_root / "_probe" / "session" / "body-heartbeat-x.json")
@@ -376,9 +458,9 @@ def enumerate_carriers(agents_root: Path) -> "tuple[List[Dict[str, Any]], Dict[s
                     sid = key.rsplit("body-heartbeat-", 1)[-1][: -len(".json")]
                     try:
                         doc = json.loads(
-                            b.s3.get_object(Bucket=b.bucket, Key=key)["Body"]
-                            .read()
-                            .decode()
+                            decode_response(  #  transport seam
+                                b.s3.get_object(Bucket=b.bucket, Key=key), key=key
+                            ).decode()
                         )
                     except Exception as exc:
                         # The blanket catch stays, and narrowing by tuple is not
@@ -501,8 +583,32 @@ def scan(
     no goals -- reporting is the entire job, because the measured defect is that
     the signal was computed and never reported."""
     now = now or dt.datetime.now()
-    claims, claims_via = read_claims(world_store)
+    # ENUMERATE FIRST, then read claims -- the order is load-bearing, not
+    # cosmetic. The store set depends on WHICH agents own carriers, so the
+    # carrier list has to exist before the claim map can be scoped ().
     rows, enum_meta = enumerate_carriers(agents_root)
+    # A Body claims into the world queue OR its own agent queue, so a world-only
+    # map reads an agent-queue-only claim as NO CLAIM. In the reaper that made a
+    # protected row reapable (); here it makes a stalled Body SILENT,
+    # because `stalled_with_claim` is the alerting verdict and it requires a
+    # visible claim. Same scope gap, detection direction instead of reaping.
+    #
+    # Bounded by DISTINCT OWNING AGENTS, not by carriers: 9 reads for 11 carriers
+    # in the population measured 2026-08-08. The owner is already on every row
+    # from enumerate_carriers, so no extra lookup is needed to derive it.
+    #
+    # The union is deliberately GLOBAL rather than per-owner, and the cost of
+    # that choice is confined to one field: `held_goal` is now union-scoped, so
+    # for a sid present in a non-owning agent's queue it can name that queue's
+    # goal. The ALERT itself keys on claim PRESENCE, which is unaffected. Note
+    # `held_goal` was already only-one-of-many for a Body holding several claims
+    # (read_claims maps a sid to a single goal), so this widens an existing
+    # imprecision in a reported field rather than introducing one into a verdict.
+    claim_stores = [world_store] + [
+        agents_root / a / "aspirations.jsonl"
+        for a in sorted({r["agent"] for r in rows if r.get("agent")})
+    ]
+    claims, claims_via = read_claims_union(*claim_stores)
     bodies: List[Dict[str, Any]] = []
     # Per-item resilience is right, but the EVIDENCE must never be discarded
     # (guard-1893). Count what was dropped and keep the first error, so a
@@ -514,7 +620,12 @@ def scan(
             ts = _parse_iso(str((row.get("doc") or {}).get("ts") or ""))
             age = None if ts is None else (now - ts).total_seconds() / 60.0
             goal = claims.get(row["sid"])
-            verdict = classify_body(age, goal is not None, stale_minutes)
+            # : the second signal for a claimless body. Absent on a
+            # carrier written before the field existed, or by a box that has
+            # not pulled the writer yet -- classify_body renders that as
+            # V_STALE_STATE_UNKNOWN rather than guessing either way.
+            state = (row.get("doc") or {}).get("body_state")
+            verdict = classify_body(age, goal is not None, stale_minutes, state)
             bodies.append(
                 {
                     "agent": row["agent"],
@@ -522,6 +633,7 @@ def scan(
                     "host": (row.get("doc") or {}).get("host"),
                     "carrier_age_minutes": None if age is None else round(age, 1),
                     "held_goal": goal,
+                    "body_state": state,
                     "verdict": verdict,
                     "read_via": row.get("read_via"),
                 }
@@ -550,6 +662,25 @@ def scan(
     # defect this fix exists to end rather than relocate.
     usable = [b for b in bodies if b["verdict"] != V_UNREADABLE]
     all_carriers_unreadable = bool(bodies) and not usable
+    #  COVERAGE, per guard-3489: report how much of the population this
+    # scan could actually judge, as a first-class field beside the alert count.
+    # A stale claimless body with no `body_state` is un-judgeable for the
+    # between-units stall class -- it is rendered benign, which is the only
+    # non-flooding choice during rollout, and that is exactly why the count has
+    # to be visible. Without it a fleet of entirely pre-rollout carriers reports
+    # `alerts: []` in the same bytes as a fleet with nothing wrong.
+    #
+    # DELIBERATELY NOT folded into `degraded_read`. That flag means "this report
+    # does not bound the fleet", and an unknown-state carrier still bounds the
+    # with-claim stall class perfectly well. More decisively, it would be TRUE on
+    # every box until the writer propagates fleet-wide -- and a flag that fires
+    # constantly stops being read, which is the reasoning this function already
+    # applies to a single unreadable carrier.
+    state_unknown = sum(
+        1 for b in bodies if b["verdict"] == V_STALE_STATE_UNKNOWN)
+    state_known = sum(
+        1 for b in bodies
+        if b["verdict"] in (V_STALE_NO_CLAIM, V_STALE_PARKED, V_STALLED_NO_CLOSE))
     return {
         "scanned": len(bodies),
         "stale_minutes": stale_minutes,
@@ -572,6 +703,21 @@ def scan(
         "carrier_read_errors": enum_meta.get("carrier_read_errors", 0),
         "first_carrier_read_error": enum_meta.get("first_carrier_read_error"),
         "all_carriers_unreadable": all_carriers_unreadable,
+        # Stale-body close-vs-vanished coverage (). `state_unknown`
+        # counts bodies this scan could NOT judge on that axis.
+        #
+        # A PERSISTENT NON-ZERO HAS TWO CAUSES AND ONLY ONE IS A DEFECT, so do
+        # not read it as an alarm on its own. (a) Carriers of Bodies that DIED
+        # before this field existed: nothing rewrites a dead Body's carrier, so
+        # those stay unknown forever and are genuinely unjudgeable -- measured 4
+        # on cc-07 at rollout, aged 3.6 to 12.5 days. (b) A LIVE Body whose
+        # carrier lacks the field, which does mean the writer is not reaching
+        # that box -- heartbeat-tick.sh restamps every cycle, so a live Body's
+        # carrier is unknown only if the writer is absent or failing.
+        # The discriminator is `carrier_age_minutes`, which is already on every
+        # row: an unknown-state row that is FRESH is case (b).
+        "state_known": state_known,
+        "state_unknown": state_unknown,
         # Degraded if ANY leg fell back or lost data. The claim half is included
         # because it is the condemning one: a stale claim map is what turns a
         # finished body into a false alert. The enumeration half is included

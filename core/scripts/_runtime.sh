@@ -98,11 +98,25 @@ rt_warn() {
 # Mirrors the inline read in session-mode-get.sh and the auto-inject block
 # in retrieve.sh. Single source of truth so future mode-aware wrappers
 # don't re-invent the read pattern.
+#
+# The bound agent's dir is $AGENT_DIR from _paths.sh, which honors the
+# MIND_AGENT_DIR test-only override (; UNSET in production, where
+# it is byte-identical to agent_dir "$MIND_AGENT"). Re-deriving the dir here
+# from the agent NAME bypassed that override, so any test running a
+# mode-aware wrapper (retrieve.sh's --read-only auto-inject) read the LIVE
+# agent-mode of whatever agent this box happens to bind — green on an
+# autonomous box, red on an assistant/reader one, for the same tree
+# (test_retrieve_commons_hook 4x red on cc-09 in assistant mode, 2026-08-16).
 rt_session_mode() {
     if [ -z "${MIND_AGENT:-}" ]; then
         return 0
     fi
-    local mode_file="$(agent_dir "${MIND_AGENT}")/session/agent-mode"
+    local mode_file
+    if [ -n "${AGENT_DIR:-}" ]; then
+        mode_file="$AGENT_DIR/session/agent-mode"
+    else
+        mode_file="$(agent_dir "${MIND_AGENT}")/session/agent-mode"
+    fi
     if [ -f "$mode_file" ]; then
         tr -d '[:space:]' < "$mode_file" 2>/dev/null || true
     fi
@@ -439,6 +453,10 @@ rt_spawn() {
                 MIND_ALLOW_TMP_OWNCLOUD_PUT|STORAGE_BACKEND|STORAGE_S3_BUCKET|STORAGE_DDB_SESSIONS_TABLE|STORAGE_DDB_LOCK_TABLE|ENVIRONMENT_ID|MACHINE_ID|MACHINE_MULTI|OWNCLOUD_SYNC_INTERVAL|OWNCLOUD_CACHE_TTL|MIND_API_TOKEN|MIND_API_BIND) unset "$_v" ;;
             esac
         done
+        # guard-586: cap before the redirect creates the long-lived fd. Twin of
+        # the mind-api-start.sh spawn site — the two are independent spawn paths
+        # to the same file, so a cap on only one leaves the other unbounded.
+        declare -F cap_log_file >/dev/null 2>&1 && cap_log_file "$RT_SPAWN_LOG"
         cd "$PROJECT_ROOT" && \
         $py_cmd -m mind_api.src >> "$RT_SPAWN_LOG" 2>&1 &
         disown $! 2>/dev/null || true
@@ -514,6 +532,10 @@ rt_release_spawn_lock() {
 rt_log_spawn() {
     local stamp
     stamp="$(date +%Y-%m-%dT%H:%M:%S 2>/dev/null || echo unknown)"
+    # guard-586 inline rotation. `declare -F` guarded because this file sources
+    # _paths.sh CONDITIONALLY (on agent_dir being undefined, L26) — a caller that
+    # defines agent_dir by other means would leave cap_log_file undefined.
+    declare -F cap_log_file >/dev/null 2>&1 && cap_log_file "$RT_SPAWN_LOG"
     echo "[$stamp] rt_runtime: $*" >> "$RT_SPAWN_LOG" 2>/dev/null || true
 }
 
@@ -783,10 +805,10 @@ rt_curl() {
     declare -a extra_headers=()
     while [ $# -gt 0 ]; do
         case "$1" in
-            --query) query="$2"; shift 2;;
-            --body-string) body_string="$2"; shift 2;;
-            --agent) agent="$2"; shift 2;;
-            --header) extra_headers+=( -H "$2" ); shift 2;;
+            --query) query="$2"; shift $(( $# >= 2 ? 2 : 1 ));;
+            --body-string) body_string="$2"; shift $(( $# >= 2 ? 2 : 1 ));;
+            --agent) agent="$2"; shift $(( $# >= 2 ? 2 : 1 ));;
+            --header) extra_headers+=( -H "$2" ); shift $(( $# >= 2 ? 2 : 1 ));;
             *) echo "rt_curl: unknown flag: $1" >&2; return 2;;
         esac
     done
@@ -989,13 +1011,16 @@ rt_no_daemon_error() {
         echo "ERROR: daemon is REACHABLE but the request did not complete within RT_CURL_TIMEOUT=${RT_CURL_TIMEOUT}s." >&2
         echo "  Wrapper: $cmd" >&2
         echo "  Daemon health: OK (port ${port:-?})" >&2
-        echo "  Likely cause: write contention (OneDrive sync lock on world/*.jsonl) or large/cold request." >&2
-        echo "  The daemon's _atomic_write retries up to 10× with exponential backoff; worst case ~22s." >&2
+        echo "  Possible causes (do not assume the first): a one-time daemon warmup on the FIRST" >&2
+        echo "  request after idle (measured 73-99s across 3 boxes, 2026-08-14 g-115-6189 — retrieve.sh" >&2
+        echo "  now defaults its own bound to 240s for this reason); a large/cold request; or write" >&2
+        echo "  contention (sync lock on world/*.jsonl — _atomic_write retries 10x, worst case ~22s)." >&2
         echo "  Recovery options:" >&2
-        echo "    1. Retry — write contention is usually transient (<30s)." >&2
+        echo "    1. Retry — warmup is paid once per daemon idle period; contention is transient (<30s)." >&2
         echo "    2. Raise RT_CURL_TIMEOUT (current: ${RT_CURL_TIMEOUT}s) for this call if recurrent." >&2
         echo "    3. Inspect mind_api/state/spawn.log for _atomic_write retry storms." >&2
-        echo "    4. Inspect meta/file-contention-telemetry.jsonl for the contention history." >&2
+        echo "    4. Inspect meta/file-contention-telemetry.jsonl — written ONLY on lock contention" >&2
+        echo "       (_fileops.py), so its ABSENCE means no contention was recorded and rules that cause OUT." >&2
         exit 1
     fi
 

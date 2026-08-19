@@ -26,9 +26,11 @@ stopped guarding. Both halves are here deliberately.
 from __future__ import annotations
 
 import importlib.util
+import re
 import subprocess
 import sys
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -131,14 +133,22 @@ def test_pending_goal_must_be_a_goal_id_or_none(bad):
 
 
 def test_pending_goal_accepts_none_and_a_real_goal_id():
-    """The validator must not be so strict it refuses the live row."""
+    """The validator must not be so strict it refuses the live table."""
     assert we.LifecycleDisposition(
         kind=we.WORKER_ONLY, target="t", why="w").pending_goal is None
     assert we.LifecycleDisposition(
         kind=we.WORKER_ONLY, target="t", why="w",
         pending_goal="g-306-211").pending_goal == "g-306-211"
-    # The live table's only pending row must survive its own validator.
-    assert we.LIFECYCLE_DISPOSITIONS["prime"].pending_goal == "g-306-211"
+    # Every LIVE row must survive its own validator. This asserted the one pending
+    # row (`prime`, ) BY NAME until  shipped that disposition;
+    # a by-name assertion would now pin a value the table deliberately no longer
+    # carries. Quantifying over the table keeps the validator under test whether
+    # or not any row is currently pending, and still fails loudly if a future row
+    # is added with junk in the field — which is the property the by-name form
+    # was standing in for.
+    for stage, d in we.LIFECYCLE_DISPOSITIONS.items():
+        assert d.pending_goal is None or re.fullmatch(r"g-\d+-\d+", d.pending_goal), (
+            f"{stage!r} carries a malformed pending_goal {d.pending_goal!r}")
 
 
 @pytest.mark.parametrize("phase", sorted(set(we.WORKER_PHASES) | set(we.REDUCER_ONLY_PHASES)))
@@ -266,17 +276,37 @@ def test_cli_lifecycle_prints_every_canonical_stage():
         assert stage in r.stdout, f"{stage!r} missing from `lifecycle` output"
 
 
-def test_cli_lifecycle_marks_pending_dispositions():
+def test_cli_lifecycle_marks_pending_dispositions(capsys):
     """A DECLARED-but-UNBUILT row must be visibly pending in the human surface.
 
     The pending marker is what keeps the table from reading, in the indicative,
-    as a claim that the code already honours every row. `prime` is the live
-    instance (g-306-211 builds it); if that goal lands and the marker is
-    removed, this test is the prompt to check that it was removed because the
-    work SHIPPED, not because the row was tidied."""
-    assert we.LIFECYCLE_DISPOSITIONS["prime"].pending_goal == "g-306-211"
-    r = _cli("lifecycle")
-    assert "[PENDING g-306-211]" in r.stdout
+    as a claim that the code already honours every row.
+
+    This asserted the marker THROUGH the one live pending row (`prime`,
+    g-306-211) until 2026-08-16. The prior docstring set the exit condition
+    itself — "if that goal lands and the marker is removed, this test is the
+    prompt to check that it was removed because the work SHIPPED, not because
+    the row was tidied." It shipped: g-306-298 landed the per-unit tier the
+    g-306-211 user-directive addendum asked for (worker-loop Phase -0.5 now runs
+    rb --recent + the guardrail index ahead of the light-prime-done sentinel, and
+    reads the Program in the identity half), verified by that goal's four greps.
+
+    So the subject is gone, and a by-name assertion would silently test nothing.
+    The marker MECHANISM is pinned against a SYNTHETIC table instead — that keeps
+    the protection alive for the next declared-but-unbuilt row rather than
+    letting it lapse together with its last subject, which is the failure mode
+    this suite's own header calls "indistinguishable from `return True`"."""
+    synthetic = dict(we.LIFECYCLE_DISPOSITIONS)
+    stage = we.CANONICAL_LIFECYCLE_STAGES[0]
+    synthetic[stage] = we.LifecycleDisposition(
+        kind=we.WORKER_ONLY, target="t", why="w", pending_goal="g-999-01")
+    with mock.patch.object(we, "LIFECYCLE_DISPOSITIONS", synthetic):
+        assert we._main(["lifecycle"]) == 0
+    assert "[PENDING g-999-01]" in capsys.readouterr().out
+    # ...and the live table really is clean, which is the fact that forced this
+    # rewrite. If a future row is declared-but-unbuilt this flips red, which is
+    # the prompt to confirm the marker renders for it too.
+    assert [s for s, d in we.LIFECYCLE_DISPOSITIONS.items() if d.pending_goal] == []
 
 
 def test_existing_phase_cli_surfaces_unchanged():

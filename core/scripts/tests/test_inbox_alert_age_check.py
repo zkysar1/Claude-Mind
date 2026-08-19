@@ -161,8 +161,15 @@ def test_aged_high_alert_fires(tmp_path):
     fired = result["fired"][0]
     assert fired["goal_id"] == "g-test-002"
     assert fired["severity"] == "high"
-    assert fired["detail"] == "no_email", (
-        "test mode flag --no-email should short-circuit email-send.sh and return 'no_email'")
+    # Since 2026-08-16 ( / ) the USER email for a plain
+    # unclaimed-alert escalation is SUPPRESSED by the notification-routing gate
+    # (category `blocker`, no human-only class in the text) — the escalation
+    # still "fires" (board breadcrumb = fleet-side destination + cooldown), it
+    # just no longer emails the user. --no-email is therefore never reached on
+    # this path; the send-path assertion lives in test_human_only_text_sends.
+    assert fired["detail"].startswith("suppressed_by_routing_gate:"), (
+        "a plain unclaimed-alert escalation must be routed to the fleet (board), "
+        "not emailed to the user; got detail=%r" % fired["detail"])
 
 
 def test_cross_agent_board_cooldown_noop(tmp_path):
@@ -309,6 +316,79 @@ def test_classify_severity_bands():
     assert mod._classify_severity(20.0, th_swapped) == "high"
 
 
+def test_claimed_or_in_progress_goal_is_not_unclaimed(tmp_path):
+    """Case 9 (, 2026-08-16): a goal that someone HOLDS is not
+    "unclaimed", whatever its age.
+
+    Regression for the false-unclaimed escalation: the predicate admitted
+    `in-progress` goals and never read `claimed_by`, so g-115-5426 (claimed
+    2026-08-09T01:35, 9h after filing) was emailed to the user as "no agent has
+    claimed it yet" 66h AFTER the claim and again 7 days after — an exit
+    condition ("until claimed") the predicate could never observe.
+    Three shapes, all aged 30h (well past HIGH): claimed+in-progress,
+    claimed+still-pending, in-progress without a claimed_by. None may escalate.
+    A fourth, pending and unclaimed, is the positive control and MUST.
+    """
+    mod = _import_module()
+    held_in_progress = _make_unblock("g-test-101", hours_ago=30.0, status="in-progress")
+    held_in_progress["claimed_by"] = "alpha"
+    held_in_progress["claimed_at"] = _iso(21.0)
+    held_pending = _make_unblock("g-test-102", hours_ago=30.0, status="pending")
+    held_pending["claimed_by"] = "echo"
+    legacy_in_progress = _make_unblock("g-test-103", hours_ago=30.0, status="in-progress")
+    control = _make_unblock("g-test-104", hours_ago=30.0, status="pending")
+    _install_mock_aspirations(mod, [held_in_progress, held_pending, legacy_in_progress, control])
+
+    board_path = tmp_path / "board.json"
+    board_path.write_text("[]", encoding="utf-8")
+    result = mod.run(_make_args(apply=True, board_escalation_log=str(board_path)))
+
+    ids = [c["goal_id"] for c in result["candidates"]]
+    assert ids == ["g-test-104"], (
+        "only the pending+unclaimed goal may be a candidate; a held goal (any "
+        "status) and an in-progress goal are not 'unclaimed'. candidates=%r" % ids)
+    assert result["scanned"] == 4
+    assert result["applied"] == 1
+
+
+def test_human_only_text_sends(tmp_path):
+    """Case 10: the routing gate's inverted fail-safe is preserved — an
+    escalation whose alert text names a human-only class (here a credential)
+    still reaches the SEND path (observable as --no-email's 'no_email' detail),
+    because that is a thing the fleet cannot handle (notification-routing.md).
+    """
+    mod = _import_module()
+    g = _make_unblock("g-test-201", hours_ago=14.0,
+                      title="Unblock: Ayoai ❌: deploy needs a rotated API key from you")
+    _install_mock_aspirations(mod, [g])
+    board_path = tmp_path / "board.json"
+    board_path.write_text("[]", encoding="utf-8")
+    result = mod.run(_make_args(apply=True, board_escalation_log=str(board_path)))
+
+    assert result["applied"] == 1
+    assert result["fired"][0]["detail"] == "no_email", (
+        "human-only text must SEND (reach email-send.sh; short-circuited by "
+        "--no-email in tests); got %r" % result["fired"][0]["detail"])
+
+
+def test_gate_unavailable_falls_back_to_send(tmp_path):
+    """Case 11: if the routing gate cannot be consulted, behave as before
+    (SEND) — a missing module must never silence a notification. Exercised by
+    stubbing _route_notification to the None it returns on import failure.
+    """
+    mod = _import_module()
+    mod._route_notification = lambda subject, body: None
+    _install_mock_aspirations(mod, [_make_unblock("g-test-301", hours_ago=14.0)])
+    board_path = tmp_path / "board.json"
+    board_path.write_text("[]", encoding="utf-8")
+    result = mod.run(_make_args(apply=True, board_escalation_log=str(board_path)))
+
+    assert result["applied"] == 1
+    assert result["fired"][0]["detail"] == "no_email", (
+        "gate unavailable -> send path (fail-open toward SEND); got %r"
+        % result["fired"][0]["detail"])
+
+
 if __name__ == "__main__":
     import tempfile
     test_no_aged_alert_noop()
@@ -331,4 +411,13 @@ if __name__ == "__main__":
     print("PASS test_non_unblock_title_skipped")
     test_classify_severity_bands()
     print("PASS test_classify_severity_bands")
-    print("OK: 8/8 passed")
+    with tempfile.TemporaryDirectory() as td:
+        test_claimed_or_in_progress_goal_is_not_unclaimed(Path(td))
+    print("PASS test_claimed_or_in_progress_goal_is_not_unclaimed")
+    with tempfile.TemporaryDirectory() as td:
+        test_human_only_text_sends(Path(td))
+    print("PASS test_human_only_text_sends")
+    with tempfile.TemporaryDirectory() as td:
+        test_gate_unavailable_falls_back_to_send(Path(td))
+    print("PASS test_gate_unavailable_falls_back_to_send")
+    print("OK: 11/11 passed")

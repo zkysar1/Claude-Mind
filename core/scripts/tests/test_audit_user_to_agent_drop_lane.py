@@ -447,3 +447,145 @@ def test_apply_flag_cannot_reach_the_drop_lane():
     for forbidden in ("args.apply", "_update_goal_participants(",
                       "subprocess", "locked_append_jsonl", "_log_reclassification("):
         assert forbidden not in body, f"drop-lane assessor references {forbidden!r}"
+
+
+# --------------------------------------------------------------------------
+#  (a) -- a QUALIFIED grant must not recommend removing a human.
+#
+# The goal's diagnosis and `_scope_head`'s docstring are BOTH right, about
+# opposite failure directions of one predicate: scanning the whole cell reads a
+# refusal as a grant, and cutting at the period hides the carve-out where the
+# residual human leg lives. A token-presence test on prose cannot express
+# "granted EXCEPT when X" either way, so the fix is to stop claiming coverage
+# when a qualifier exists -- NOT to move the cut, which would reintroduce the
+# exact false-positive class the tests above already pin (guard-2260: the
+# goal's REMEDY is a separate claim from its DIAGNOSIS).
+# --------------------------------------------------------------------------
+
+# Head keys to `credential-grant`; the carve-out past the period is the real
+# human leg, and it is invisible to a head match.
+GRANT_CARVEOUT = ("| grant-020 | credential-grant for minted service keys. "
+                  "Excludes any credential requiring a human-owned account, which "
+                  "still routes to the user. | 2026-08-01 | user email | \"...\" "
+                  "| never |")
+GRANT_CLEAN = ("| grant-021 | credential-grant | 2026-08-01 | user email "
+               "| \"...\" | never |")
+
+
+def test_qualified_grant_downgrades_to_review_not_drop(tmp_path):
+    _write_grants(tmp_path, [GRANT_CARVEOUT])
+    grants = MOD._parse_standing_grants(tmp_path)
+    assert "grant-020" in grants["by_scope"].get("credential-grant", []), \
+        "precondition: the head must still key, or this test proves nothing"
+    v = MOD._assess_user_leg(
+        _cand(_goal("g-1", ["agent", "user"], scope="credential-grant")), grants)
+    assert v["verdict"] == "grant-qualified"
+    assert "grant-020" in v["grant_qualifiers"]
+    assert "human-owned account" in v["grant_qualifiers"]["grant-020"]
+
+
+def test_unqualified_grant_still_recommends_the_drop(tmp_path):
+    # The load-bearing negative: without this, disabling the lane entirely
+    # would pass the test above and look like a fix.
+    _write_grants(tmp_path, [GRANT_CLEAN])
+    grants = MOD._parse_standing_grants(tmp_path)
+    v = MOD._assess_user_leg(
+        _cand(_goal("g-2", ["agent", "user"], scope="credential-grant")), grants)
+    assert v["verdict"] == "grant-covered"
+    assert v["grants"] == ["grant-021"]
+
+
+def test_one_unqualified_grant_is_enough_and_it_alone_is_cited(tmp_path):
+    _write_grants(tmp_path, [GRANT_CARVEOUT, GRANT_CLEAN])
+    grants = MOD._parse_standing_grants(tmp_path)
+    v = MOD._assess_user_leg(
+        _cand(_goal("g-3", ["agent", "user"], scope="credential-grant")), grants)
+    assert v["verdict"] == "grant-covered"
+    # The qualified grant must not be cited as the authority for the drop.
+    assert v["grants"] == ["grant-021"]
+
+
+# --------------------------------------------------------------------------
+#  (b) -- the drop lane must REMEMBER refusals.
+# Measured downstream: 3 runs, 8 lifetime opportunities, 8 refusals, 0 true
+# positives, run 3 re-presenting run 2's six goals byte-for-byte and cold.
+# --------------------------------------------------------------------------
+
+def _ledger(tmp_path, rows):
+    p = tmp_path / MOD._REFUSAL_LEDGER
+    p.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    return p
+
+
+def test_previously_refused_candidate_is_suppressed_with_its_reason(tmp_path):
+    _ledger(tmp_path, [{"goal_id": "g-9", "run_date": "2026-08-05T01:02:03",
+                        "verdict": "keep", "reason": "the key is human-owned"}])
+    verdicts = [{"goal_id": "g-9", "verdict": "grant-covered", "reason": "orig"}]
+    n = MOD._apply_refusals(verdicts, MOD._load_refusal_ledger(tmp_path))
+    assert n == 1
+    assert verdicts[0]["verdict"] == "previously-refused"
+    assert verdicts[0]["prior_verdict"] == "grant-covered"
+    assert verdicts[0]["prior"]["reason"] == "the key is human-owned"
+    # The REASON must reach the reader: one refusal downstream was stored with a
+    # factually false reason and would otherwise be re-derived wrongly forever.
+    assert "the key is human-owned" in verdicts[0]["reason"]
+    assert "2026-08-05" in verdicts[0]["reason"]
+
+
+def test_a_qualified_review_is_suppressible_too(tmp_path):
+    _ledger(tmp_path, [{"goal_id": "g-10", "run_date": "d", "verdict": "keep",
+                        "reason": "r"}])
+    verdicts = [{"goal_id": "g-10", "verdict": "grant-qualified", "reason": "orig"}]
+    assert MOD._apply_refusals(verdicts, MOD._load_refusal_ledger(tmp_path)) == 1
+
+
+def test_keep_and_undeclared_are_never_suppressed(tmp_path):
+    # Suppressing `undeclared` would hide a backfill that is still owed, and
+    # suppressing `keep` would suppress a verdict that already says "leave it".
+    _ledger(tmp_path, [{"goal_id": "g-11", "run_date": "d", "verdict": "keep",
+                        "reason": "r"},
+                       {"goal_id": "g-12", "run_date": "d", "verdict": "keep",
+                        "reason": "r"}])
+    verdicts = [{"goal_id": "g-11", "verdict": "keep", "reason": "o"},
+                {"goal_id": "g-12", "verdict": "undeclared", "reason": "o"}]
+    assert MOD._apply_refusals(verdicts, MOD._load_refusal_ledger(tmp_path)) == 0
+    assert [v["verdict"] for v in verdicts] == ["keep", "undeclared"]
+
+
+def test_a_corrected_reason_supersedes_the_original(tmp_path):
+    _ledger(tmp_path, [
+        {"goal_id": "g-13", "run_date": "2026-08-01", "verdict": "keep",
+         "reason": "WRONG -- misread the grant"},
+        {"goal_id": "g-13", "run_date": "2026-08-09", "verdict": "keep",
+         "reason": "corrected: the account is human-owned"},
+    ])
+    led = MOD._load_refusal_ledger(tmp_path)
+    assert led["g-13"]["reason"].startswith("corrected:")
+
+
+def test_absent_ledger_suppresses_nothing_and_does_not_raise(tmp_path):
+    verdicts = [{"goal_id": "g-14", "verdict": "grant-covered", "reason": "o"}]
+    assert MOD._apply_refusals(verdicts, MOD._load_refusal_ledger(tmp_path)) == 0
+    assert verdicts[0]["verdict"] == "grant-covered"
+
+
+def test_record_refusal_refuses_without_a_reason(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(MOD, "_world_dir_for", lambda a: tmp_path)
+    monkeypatch.setattr(MOD, "_discover_agents", lambda: ["alpha"])
+    rc = MOD.main(["--record-refusal", "g-15"])
+    assert rc == 2
+    assert not (tmp_path / MOD._REFUSAL_LEDGER).exists()
+
+
+def test_record_refusal_writes_a_row_the_next_run_can_join_on(tmp_path, monkeypatch):
+    monkeypatch.setattr(MOD, "_world_dir_for", lambda a: tmp_path)
+    monkeypatch.setattr(MOD, "_discover_agents", lambda: ["alpha"])
+    rc = MOD.main(["--record-refusal", "g-16",
+                   "--refusal-reason", "the account is human-owned"])
+    assert rc == 0
+    led = MOD._load_refusal_ledger(tmp_path)
+    assert set(("run_date", "verdict", "reason")) <= set(led["g-16"])
+    assert led["g-16"]["reason"] == "the account is human-owned"
+    # Round-trip: the row it wrote must actually suppress on the next run.
+    verdicts = [{"goal_id": "g-16", "verdict": "grant-covered", "reason": "o"}]
+    assert MOD._apply_refusals(verdicts, led) == 1

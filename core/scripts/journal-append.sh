@@ -66,12 +66,12 @@ WORK_CLASS=""
 # Argument parsing — mirrors iteration-close.sh's flag style for consistency
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --goal) GOAL_ID="$2"; shift 2 ;;
-        --outcome-class) OUTCOME="$2"; shift 2 ;;
-        --summary) SUMMARY="$2"; shift 2 ;;
-        --session) SESSION_NUM="$2"; shift 2 ;;
-        --retrieval-influence) RETRIEVAL_INFLUENCE="$2"; shift 2 ;;
-        --work-class) WORK_CLASS="$2"; shift 2 ;;
+        --goal) GOAL_ID="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --outcome-class) OUTCOME="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --summary) SUMMARY="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --session) SESSION_NUM="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --retrieval-influence) RETRIEVAL_INFLUENCE="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --work-class) WORK_CLASS="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         *)
             echo "[journal-append] unknown arg: $1" >&2
             exit 2

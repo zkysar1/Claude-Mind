@@ -215,6 +215,24 @@ def test_complete_by_key_finding_cross_write(running_daemon):
     # warnings should be None (no team-state failure)
     assert resp.get("warnings") is None
 
+    # : the finding must land ON THE GOAL RECORD, not only in the
+    # team-state ring buffer. Before 2026-08-16 the value was read into a
+    # local and never assigned, so the durable, queryable record dropped it.
+    assert resp["goal"].get("key_finding") == "Discovered X improves Y"
+    on_disk = None
+    with open(world / "aspirations.jsonl", "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            for g in json.loads(line).get("goals", []):
+                if g.get("id") == "g-001-01":
+                    on_disk = g
+    assert on_disk is not None, "seeded goal vanished from the store"
+    assert on_disk.get("key_finding") == "Discovered X improves Y", (
+        "key_finding was returned in the response but not persisted to the "
+        "aspirations store — the drain/triage lanes read the record, not the "
+        "response")
+
     # Verify team-state.yaml was updated
     ts_path = world / "team-state.yaml"
     with open(ts_path, "r", encoding="utf-8") as f:

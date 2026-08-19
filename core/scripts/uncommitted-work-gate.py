@@ -87,6 +87,11 @@ def main() -> int:
                    help="Path to the repo to scan (default: framework repo).")
     p.add_argument("--output", choices=["json", "human"], default="json",
                    help="Output format (default: json).")
+    p.add_argument("--body-role", default=None,
+                   help="reducer|worker. Defaults to $BODY_ROLE. Only a "
+                        "reducer is blocked for committed-but-unpushed "
+                        "framework files: a worker Body does not push by "
+                        "contract (g-306-233).")
     args = p.parse_args()
 
     payload = evaluate(
@@ -95,15 +100,29 @@ def main() -> int:
         repo_path=Path(args.repo_path),
         world_dir=_resolve_world_dir(),
         agent_name=os.environ.get("MIND_AGENT", "").strip(),
+        # BODY_ROLE is read HERE, at the CLI boundary, and passed in — the
+        # gate module documents itself as reading no environment variables so
+        # it stays safe to call from any daemon thread. --body-role overrides
+        # it for tests and for callers that know their own role.
+        body_role=args.body_role or os.environ.get("BODY_ROLE", "").strip() or None,
     )
 
     if args.output == "json":
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         if payload["would_block"]:
-            print(f"BLOCKED: {len(payload['dirty_framework_files'])} dirty framework file(s):")
-            for f in payload["dirty_framework_files"]:
-                print(f"  {f}")
+            if payload["dirty_framework_files"]:
+                print(f"BLOCKED: {len(payload['dirty_framework_files'])} dirty framework file(s):")
+                for f in payload["dirty_framework_files"]:
+                    print(f"  {f}")
+            if payload.get("delivery_would_block"):
+                # Named explicitly because the remedy DIFFERS from the dirty
+                # case: these files are committed, so `git status` is clean and
+                # committing again does nothing. The fix is `git push`.
+                print(f"BLOCKED: {len(payload['undelivered_framework_files'])} framework "
+                      f"file(s) committed but NOT pushed to upstream (remedy: git push):")
+                for f in payload["undelivered_framework_files"]:
+                    print(f"  {f}")
         elif payload["dirty_framework_files"] and payload["override_applied"]:
             print(f"OVERRIDE: {len(payload['dirty_framework_files'])} dirty file(s) bypassed: "
                   f"{payload['override_applied']!r}")

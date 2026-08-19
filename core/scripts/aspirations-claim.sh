@@ -158,8 +158,13 @@ fi
 #     committed in the daemon) — log to stderr, return 0.
 #   - Only the rc=0 SUCCESS paths call this; conflict/rejection (rc 2/1) never
 #     reach here, so they post nothing.
-#   - Agent-queue goals carry NO claim (claimed_by unset in the response) -> skip
-#     the announce (single-agent access needs no coordination signal).
+#   - STALE AS WRITTEN, corrected : this said "Agent-queue goals carry
+#     NO claim (claimed_by unset in the response) -> skip the announce". That
+#     held while claim() answered agent-queue goals 400; since  it
+#     honors &source=agent and stamps claimed_by on BOTH paths, so the skip
+#     guard below no longer fires and agent-queue claims DO announce. The
+#     behavior was NOT changed here — see the guard's own comment for why that
+#     is an open decision rather than an oversight.
 _post_claim_effects() {
     local goal_id="$1" agent="$2" response="$3"
     local extracted claimed_by title
@@ -291,7 +296,73 @@ except Exception:
         --title "${title:-$goal_id}" --phase 4 \
         >/dev/null 2>&1 \
         || echo "[aspirations-claim] WARN: in_flight stamp failed for ${goal_id} (claim still succeeded)" >&2
-    # Only announce a REAL claim. Agent-queue no-claim (empty claimed_by) -> skip.
+    # --- claim-time diary breadcrumb () --------------------------
+    # FOURTH instance of the same fold as the three blocks above, and the only
+    # one that closes a claim-LOSS path rather than a drift path.
+    #
+    # stranded-claim-sweep's liveness predicate is "an execution-diary entry
+    # exists after claimed_at". Every diary-append point in aspirations-execute
+    # Phase 4 is CONDITIONAL (trivial_mode / non-empty inbound signals / infra
+    # SKIP / Gate D, which is OFF by default / a size-or-duration threshold / a
+    # probe surprise), and the unconditional phase_start/phase_end markers are
+    # written by iteration-close -- i.e. at CLOSE, after the window has already
+    # elapsed. So the uncovered window is exactly claim -> first close phase,
+    # which for a deep goal is the ENTIRE execution. Measured first-hand
+    # 2026-08-18 (zeta, cc-02): the sweep released  26 minutes into an
+    # execution that had already opened AND merged a PR, verdict "stranded",
+    # against a 5-minute stale threshold.
+    #
+    # THE ONE CLAIM-TIME WRITER THAT ALREADY EXISTED IS GATED THE WRONG WAY
+    # AROUND, which is why the fix is a write rather than a threshold change:
+    # scorer-verdict-gate.py emits its scorer_override entry only "on a
+    # sanctioned deviation", so an agent that DEVIATES is protected while one
+    # that takes the scorer's top pick -- the compliant and far more common
+    # path -- writes nothing and is the exposed one. Measured on cc-08
+    # 2026-08-18: three claims in one session all carried --deviation and so all
+    # had a claim-time entry; their claim->close gaps were 19m27s and 12m39s,
+    # both far past the 5-minute threshold, i.e. each would have been releasable
+    # without it.
+    #
+    # WHY HERE AND NOT IN THE SWEEP. The alternative (teach the sweep a second
+    # liveness signal) means another fail-safe KEEP branch -- exactly the shape
+    # guard-4000 warns about, since a KEEP that is right at 5 minutes is wrong at
+    # 10 days and an early-return branch cannot tell them apart because it never
+    # reads the age. Writing the breadcrumb makes the EXISTING predicate true by
+    # construction and adds no branch to the decision tree. The sweep's
+    # read-through-cache hazard (guard-3992) is already handled on its own side
+    # by the store-of-record diary probe.
+    #
+    # UNCONDITIONAL BY PLACEMENT: this sits ABOVE the `[ -z "$claimed_by" ]`
+    # early return below, so it fires on agent-queue claims too -- the same
+    # reasoning the in_flight block states for itself. Moving it below that
+    # return silently re-opens the gap for one entire queue.
+    #
+    # NOT refused on a worker Body, verified before being relied on: cmd_append
+    # exits 0 without writing when _is_observer_session() is true, and a worker's
+    # MIND_SID does differ from the reducer's -- but that predicate reads the
+    # LOCAL agents/<agent>/session/running-session-id, which a worker never
+    # writes, so the absent file yields False. Probed through the production
+    # function on cc-08 rather than re-implemented (guard-4323).
+    #
+    # FAIL-OPEN like its three siblings: a breadcrumb failure must never fail a
+    # claim that already committed in the daemon.
+    printf '{"entry_type":"observation","goal_id":"%s","content":"claim-time liveness breadcrumb for %s (source=%s) - g-115-6677"}' \
+        "$goal_id" "$goal_id" "${SOURCE:-world}" \
+        | MIND_AGENT="$agent" bash "$CORE_ROOT/scripts/execution-diary.sh" append \
+            >/dev/null 2>&1 \
+        || echo "[aspirations-claim] WARN: claim-time diary breadcrumb failed for ${goal_id} (claim still succeeded)" >&2
+    # Skip when the response carried no claimed_by. READ THE NEXT SENTENCE BEFORE
+    # RELYING ON THIS: the guard no longer separates agent-queue from world-queue
+    # claims. It was written when claim() answered agent-queue goals 400 and only
+    # world claims stamped claimed_by; since  claim() honors
+    # &source=agent and stamps claimed_by on BOTH paths (aspirations_write.py
+    # claim(), unconditional), so this predicate is now effectively always false
+    # and agent-queue claims DO announce on the coordination board. Nothing edited
+    # this line — its MEANING changed underneath it when the value it tests
+    # changed. Whether announcing a private-queue claim is desirable is an OPEN
+    # decision ( re-check): skipping it was justified as noise control on
+    # a single-agent queue, which is still arguable, but that is a behavior change
+    # and was deliberately not made here. Verified, not inferred ().
     [ -z "${claimed_by:-}" ] && return 0
     printf '%s' "Claiming ${goal_id}: ${title}" \
         | MIND_AGENT="$agent" bash "$CORE_ROOT/scripts/board-post.sh" \

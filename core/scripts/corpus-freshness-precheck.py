@@ -223,6 +223,28 @@ def verdict_for(rec):
         # existed as of that ref — so REVIEW stays the more informative answer
         # than CANNOT-CHECK, and both block the assertion anyway.
         return "REVIEW"
+    if rec.get("off_default") is True:
+        # ZERO matches read off a PARKED checkout (). The grep above
+        # uses `upstream`, which on a feature branch is origin/<that branch> --
+        # so the absence proves nothing about the default branch, where the
+        # code being asserted about actually lives. This is the identical
+        # argument to the fetch_verified branch below, applied to the other way
+        # a ref can be the wrong one: not out of date, but a different line of
+        # development entirely.
+        #
+        # DELIBERATELY PLACED AFTER the `matches` check, not before it. The
+        # harm is confined to the zero-match path; when there ARE matches the
+        # symbol demonstrably exists as of that ref, and REVIEW carries more
+        # information than CANNOT-CHECK while blocking the assertion just as
+        # firmly. Ordering it earlier would trade a useful answer for a vaguer
+        # one and buy no safety.
+        #
+        # It must be a VERDICT and not a prose note, on this file's own
+        # evidence: the fresh-eyes review recorded above found that the
+        # `note:` line about --no-fetch "did not stop it because the verdict
+        # and the exit code both said go". A warning beside a green verdict is
+        # the shape that already failed here once.
+        return "CANNOT-CHECK"
     if not rec.get("fetch_verified", False):
         # ZERO matches on a ref nobody verified is current is the dangerous
         # shape, not a clean one: absence of evidence produced by a stale
@@ -257,6 +279,14 @@ def render(records, pattern):
                 out.append("      none of the missing commits touch the claimed "
                            "surface — the staleness may not bear on this claim, "
                            "but confirm the pathspec actually names it")
+        if r.get("off_default") is True:
+            out.append("      OFF-DEFAULT: on %s, not %s. The grep read %s — that is "
+                       "this BRANCH's upstream, not the default branch, so a zero here "
+                       "says nothing about %s. Re-grep origin/%s before asserting a "
+                       "negative (g-115-6371)."
+                       % (r.get("branch") or "?", r.get("default_branch") or "?",
+                          r.get("grep_ref") or "?", r.get("default_branch") or "the default branch",
+                          r.get("default_branch") or "<default>"))
         if r.get("grep_error"):
             out.append("      grep FAILED on %s: %s — nothing was examined here"
                        % (r.get("grep_ref"), r["grep_error"]))

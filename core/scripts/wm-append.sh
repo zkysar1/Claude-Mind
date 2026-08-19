@@ -39,22 +39,69 @@ BODY="$(cat)"
 # shellcheck disable=SC1091
 source "$CORE_ROOT/scripts/_runtime.sh"
 
+# : capture the response instead of discarding it. The daemon has
+# reported `evicted` since , and this `> /dev/null` is why no operator
+# ever saw it — that field had never once reached a caller in the whole time it
+# existed. A fix is not shipped when the producer emits it; it is shipped when a
+# consumer displays it (guard-742/547 one layer further out — daemon-vs-wrapper
+# rather than CLI-vs-daemon).
+#
+# WHAT AN EVICTION MEANS HERE, post-: the newcomer is now protected, so
+# the entry destroyed is always an OLD one — the peer that has waited longest for
+# the reducer, which on a lane saturated at 100% load_bearing is precisely what
+# the priority exemption exists to rescue. That is worth one stderr line.
+# STDOUT stays silent on success (the documented contract above, and callers
+# parse it); diagnostics go to STDERR, which is the channel a non-blocking
+# notice belongs on.
 rc=0
-rt_call POST /v1/wm/append \
+RESP="$(rt_call POST /v1/wm/append \
     --query "slot=$(rt_url_encode "$SLOT")" \
-    --body-string "$BODY" > /dev/null || rc=$?
+    --body-string "$BODY" 2>/dev/null)" || rc=$?
+
+_emit_notice() {
+    # The captured group is a JSON string BODY, so its inner quotes are still
+    # backslash-escaped; un-escape them or the operator reads `\"load_bearing\"`
+    # in advice they are meant to copy.
+    case "$RESP" in
+        *'"warning"'*)
+            printf '%s\n' "$RESP" \
+                | sed -n 's/.*"warning"[[:space:]]*:[[:space:]]*"\(.*\)".*/[wm-append] \1/p' \
+                | sed 's/\\"/"/g' \
+                | head -1 >&2
+            ;;
+    esac
+    # `evicted` is a plain int and carries no `warning`, so it needs its own
+    # branch. EXTRACT then compare numerically. A `case` glob combining
+    # [[:space:]] with an optional-zero prefix was tried first and matched
+    # NEITHER `"evicted": 1` NOR `"evicted": 0` — i.e. it was silent always.
+    # That defect is only visible if you positive-control the NON-ZERO shape
+    # too (guard-2421): probing the zero shape alone returns "no match", which
+    # is exactly what correct filtering looks like, so an always-quiet emitter
+    # would have shipped looking right.
+    _n="$(printf '%s\n' "$RESP" \
+        | sed -n 's/.*"evicted"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)"
+    # `if`, not an `&&` chain: this file runs under `set -e`, so a trailing
+    # `&&` list whose final test fails returns non-zero from the function and
+    # aborts the wrapper BEFORE its `exit 0` — turning a successful append into
+    # a failed one on the quiet path, which is the common path.
+    if [ -n "${_n:-}" ] && [ "$_n" != "0" ]; then
+        _plural="entries"
+        [ "$_n" = "1" ] && _plural="entry"
+        echo "[wm-append] '$SLOT' is at its cap — $_n older $_plural evicted to make room. The victim is the OLDEST peer, i.e. the one that has waited longest for the reducer." >&2
+    fi
+}
 
 case $rc in
-    0) exit 0;;
+    0) _emit_notice; exit 0;;
     2) exit 1;;
     3)
         # DAEMON-ONLY (2026-05-29 cutover): no Python CLI fallback.
         if rt_try_autospawn; then
             rc=0
-            rt_call POST /v1/wm/append \
+            RESP="$(rt_call POST /v1/wm/append \
                 --query "slot=$(rt_url_encode "$SLOT")" \
-                --body-string "$BODY" > /dev/null || rc=$?
-            if [ "$rc" = "0" ]; then exit 0; fi
+                --body-string "$BODY" 2>/dev/null)" || rc=$?
+            if [ "$rc" = "0" ]; then _emit_notice; exit 0; fi
         fi
         rt_no_daemon_error "wm-append.sh";;
     *) exit $rc;;

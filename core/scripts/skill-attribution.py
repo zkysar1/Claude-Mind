@@ -486,6 +486,16 @@ def main():
                 'failing': failing,
                 'window_since': args.since or 'all_time',
                 'agents_scanned': agents,
+                # compute_join measures how much of the invocation stream the
+                # local diaries can classify at all. Emitted because the
+                # strategic-scan S4.6 marker instructs the reader to print
+                # ceiling_ratio beside the candidate count -- a near-zero ratio
+                # means the run is a COVERAGE measurement, not a skill-quality
+                # one. It was computed and discarded on every CLI path until
+                # 2026-08-16, so that instruction named a field no command
+                # emitted (guard-2046: a step naming both a command and a
+                # capture list is an unverified pairing).
+                'diary_coverage': join['diary_coverage'],
             }, indent=2, default=str))
         else:
             print(f"=== failing invocations ({len(failing)}) ===")

@@ -68,11 +68,20 @@ def with_sandbox(test_fn):
         prior_agent_dir = os.environ.get("MIND_AGENT_DIR")
         prior_world = os.environ.get("MIND_WORLD")
         prior_meta = os.environ.get("MIND_META")
+        prior_body_wm = os.environ.get("BODY_WM_PATH")
         try:
             os.environ["MIND_AGENT"] = "alpha"
             os.environ["MIND_AGENT_DIR"] = str(sandbox_agent)
             os.environ["MIND_WORLD"] = str(sandbox_world)
             os.environ["MIND_META"] = str(sandbox_meta)
+            # guard-862 / guard-3375 (): on a worker Body the
+            # injected BODY_WM_PATH outranks MIND_AGENT_DIR in wm.wm_path(),
+            # so the helper's read_wm() bypassed this sandbox and read live WM
+            # (returned 18 from 133 live rows against a 1-row fixture, cc-07
+            # 2026-08-17). Pin it to the sandbox WM path explicitly.
+            os.environ["BODY_WM_PATH"] = str(
+                sandbox_agent / "session" / "working-memory.yaml"
+            )
             # Reload modules so _paths picks up the sandbox env vars
             for mod in list(sys.modules):
                 if mod.startswith("_paths") or mod.startswith("wm") or mod == "goal_selector":
@@ -82,7 +91,8 @@ def with_sandbox(test_fn):
             for var, prior in (("MIND_AGENT", prior_agent),
                                ("MIND_AGENT_DIR", prior_agent_dir),
                                ("MIND_WORLD", prior_world),
-                               ("MIND_META", prior_meta)):
+                               ("MIND_META", prior_meta),
+                               ("BODY_WM_PATH", prior_body_wm)):
                 if prior is None:
                     os.environ.pop(var, None)
                 else:

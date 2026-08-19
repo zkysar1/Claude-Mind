@@ -505,6 +505,62 @@ META_GOAL_SELECTION = META_DIR / "goal-selection-strategy.yaml"
 _APPLICATIONS_LOG_CAP = 200
 
 
+def _agent_is_resident():
+    """True when MIND_AGENT names an agent CONFIGURED ON THIS BOX.
+
+    g-115-5850, direction (d). `goal-selector.sh select` is not read-only: it
+    writes `session/drain-lane-state.json` (the drain-lane cadence counter),
+    `session/scorer-verdict.json` (the input the claim chokepoint gates on), and
+    an `applications_log` entry attributed to MIND_AGENT. Every one of those
+    lands in whatever agent MIND_AGENT names — so the fleet-vantage recipe the
+    standing directive prescribes for its own exit condition
+    (`MIND_AGENT=<name> goal-selector.sh` once per live agent) FABRICATES
+    selector state for each partner as a side effect of measuring them. Measured
+    on cc-02 (`uname -r` 6.8.0-137-generic) 2026-08-13: zeta is the ONLY agent
+    with a `local-paths.conf` here, yet alpha, bravo, echo and foxtrot each
+    carried both files, all stamped 2026-08-11T20:23-20:25 — the exact timestamp
+    of the probe this goal's own description records as its second instance.
+
+    RESIDENCE, not liveness, is the right predicate: an agent is resident when
+    its dir carries a `local-paths.conf`, the same signal `_paths.
+    enumerate_agent_confs` uses to identify a configured agent on this machine
+    (and `inbound-reference-census._resident_agents` for the same purpose —
+    though that helper unconditionally adds the bound MIND_AGENT, which makes
+    the bound agent resident BY CONSTRUCTION and is exactly the clause that
+    cannot be reused here).
+
+    Who NEWLY gets refused, enumerated against live state per guard-1562: on a
+    box hosting N agents all N have a conf, so every agent's own loop writes
+    exactly as before, and the ONLY caller that changes behaviour is an explicit
+    `MIND_AGENT=<other>` cross-agent probe. No-regression by construction.
+
+    Fail-OPEN in both degenerate directions — `AGENT_DIR is None` (the writes
+    already no-op there) and any stat error return True, so a plumbing fault
+    restores the pre-fix behaviour rather than silently disabling a real agent's
+    scorer verdict. Suppressing a write nobody asked for is cheap; suppressing a
+    resident agent's claim-gate input would wedge its next claim.
+    """
+    if AGENT_DIR is None:
+        return True
+    try:
+        return (AGENT_DIR / "local-paths.conf").exists()
+    except OSError:
+        return True
+
+
+def _suppress_cross_agent_write(what):
+    """Emit the one-line stderr reason for a suppressed cross-agent-probe write.
+
+    Loud on purpose (guard-1977): a check that declines to act and says nothing
+    reports success by default, and its only observable state is silence — so a
+    reader cannot tell "suppressed correctly" from "never ran".
+    """
+    print(f"[goal-selector] {what} write SUPPRESSED — MIND_AGENT={AGENT_NAME!r} "
+          f"is not resident on this box (no agents/{AGENT_NAME}/local-paths.conf); "
+          f"cross-agent probe must not fabricate a partner's selector state "
+          f"(g-115-5850)", file=sys.stderr)
+
+
 def _record_strategy_application(strategy_path, summary):
     """Append a {ts, agent, sid, summary} entry to a meta-strategy's applications_log.
 
@@ -521,6 +577,15 @@ def _record_strategy_application(strategy_path, summary):
         "sid": (sid[:8] if isinstance(sid, str) and sid else "unknown"),
         "summary": summary,
     }
+    # (d): the entry is stamped with `agent` from the environment, so
+    # under a cross-agent probe it asserts that the PROBED agent consulted this
+    # strategy — a falsely-attributed telemetry row in a SHARED meta store, one
+    # per partner per fleet-vantage run. Guarded inside the helper rather than at
+    # the call site precisely because the docstring above invites other
+    # meta-strategy consumers to reuse it; they inherit the protection.
+    if not _agent_is_resident():
+        _suppress_cross_agent_write("applications_log")
+        return
     def _mut(data):
         if not isinstance(data, dict):
             data = {}
@@ -887,6 +952,78 @@ def load_starvation_boost_config():
 
 
 STARVATION_CONFIG = load_starvation_boost_config()
+
+
+# Hoisted to module level so the FALLBACK values are directly pinnable. They are
+# not merely a formality: the loader swallows every overlay failure, and a world
+# whose aspirations.yaml carries no pull_boost block runs on exactly these numbers.
+# A mutation control that corrupted the in-function literal came back GREEN,
+# because the test read load_pull_boost_config() and the shipped YAML overrode the
+# damage — the effective config was pinned while the default it falls back to was
+# not (guard-3534: a test is only protection if it can fail).
+_PULL_BOOST_DEFAULTS = {
+    "enabled": True,
+    "boost": 4.0,
+    "max_age_hours": 24.0,
+}
+
+
+def load_pull_boost_config():
+    """Load dependency-pull boost params from core/config/aspirations.yaml.
+
+    g-115-6590 (2026-08-17). Every existing anti-starvation term in this file is
+    TIME-keyed (recurring_urgency, starvation_boost, the drain lane, the monitor
+    interval arm); none is EVENT-keyed. A consumer goal that exists to drain a
+    dependency the moment it MATERIALIZES therefore cannot be lifted by anything
+    here — its urgency lives in the PRODUCER's event, which the scorer never sees.
+    A producer sets ``pull_signal`` on the consumer goal when the dependency lands;
+    this pass converts that event into rank.
+
+    THE DEFAULT BOOST IS MEASURED, NOT PICKED. guard-1895 (2): sizing a scorer fix
+    against the deterministic deficit rather than the NOISE WIDTH is what makes an
+    intervention look like a fix while changing almost nothing. Measured live on
+    this queue 2026-08-17 (cc-07, 1163 candidates): exploration_noise ~ U(0, 1.210)
+    applied to 99.6% of candidates, with 44 candidates inside one noise width of
+    the deterministic top. The goal's own acceptance bar is a pulled goal beating a
+    top substantive 2 points above it, so the boost must clear 2 + 1.210 = 3.21.
+    4.0 clears that and stays BELOW directive_boost's 4.5 raw ceiling, so a fresh
+    USER directive still outranks a machine-generated pull — the same ordering
+    argument load_starvation_boost_config makes for its own 4.0.
+
+    max_age_hours is a SAFETY VALVE, not decoration, and it is why this pass does
+    not depend on the clear working. Measured against coordination_merge._merge_goal
+    the same day: a one-sided SET survives cross-box merge even when the other side
+    is NEWER (good — the producer's write reaches the consumer), but CLEAR-BY-KEY-
+    REMOVAL is RESURRECTED by the one-sided-key loop even when the clearer is
+    strictly newer, and CLEAR-BY-NULL loses whenever the clearing write is not
+    strictly newer than the set (last_modified is seconds-resolution, so a same-
+    second tie is reachable). A lost clear would otherwise pin the consumer goal at
+    rank 1 forever — strictly worse than the starvation being fixed. Ageing the
+    signal out makes that failure self-healing.
+
+    Same overlay/type-coerce shape as the sibling config loaders.
+    """
+    defaults = dict(_PULL_BOOST_DEFAULTS)
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_config_overlay", Path(__file__).parent / "_config_overlay.py"
+        )
+        overlay = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(overlay)
+        asp_config = overlay.merged_config("aspirations.yaml")
+        pb = asp_config.get("pull_boost", {})
+        if isinstance(pb, dict):
+            for k, default in defaults.items():
+                v = pb.get(k)
+                if v is not None:
+                    defaults[k] = type(default)(v)
+    except Exception:
+        pass
+    return defaults
+
+
+PULL_CONFIG = load_pull_boost_config()
 
 
 def load_user_signal_boost_config():
@@ -1885,11 +2022,20 @@ def _liveness_confirms_dormant(name, last_active_iso, threshold_hours):
         # the failure stays in the goals-stay-routed direction.
         auth_la_iso, auth_la_prov = _lc.fetch_authoritative_last_active_with_provenance(
             name, str(WORLD_DIR))
+        # A row stamped by ANOTHER agent cannot certify its subject alive
+        # (, guard-3604): clearing a dormant peer's stranded in_flight
+        # bumps the CLEARED row's last_active, so a peer this fleet just policed
+        # reads fresh for a full window. This call site must pass the stamp too
+        # or the reallocation gate keeps the defect the CLI just lost — the
+        # verdict is what decides whether a dormant agent's routed goals are
+        # reclaimed, so a false "alive" here strands them indefinitely.
+        row_stamp = _lc.fetch_row_stamp(name, str(WORLD_DIR))
         verdict = _lc.decide_liveness(
             last_active_iso, fresh_iso, threshold_hours=threshold_hours,
             now=datetime.now(),
             authoritative_last_active_iso=auth_la_iso,
-            authoritative_provenance=auth_la_prov)["verdict"]
+            authoritative_provenance=auth_la_prov,
+            row_updated_by=row_stamp, row_agent=name)["verdict"]
         dormant = (verdict == "dormant")
     except Exception:  # noqa: BLE001 — fail-safe toward NOT idle
         dormant = False
@@ -1951,11 +2097,26 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
         if asp.get("status") != "active":
             continue
 
-        # Cooldown check
+        # Cooldown check. Reads last_selected, NOT last_worked ():
+        # `last_worked` has ZERO writers in core/scripts or mind_api and is absent
+        # from every live record (measured 2026-08-10: 0/28 world aspirations carry
+        # the key). It survives only as a seeded null in the three bootstrap
+        # templates, which is what made it look real. last_selected is the live
+        # field with these semantics, stamped by aspirations.py /
+        # aspirations_write.py when a goal is selected from the aspiration.
+        #
+        # hours_since, NOT days_since — load-bearing, not a style choice.
+        # last_selected is written as datetime.now().isoformat(timespec="seconds"),
+        # and days_since() calls date.fromisoformat(), which RAISES on any string
+        # carrying a time component (verified py3.12.3: date.fromisoformat(
+        # "2026-08-10T05:51:36") -> ValueError). days_since swallows it and returns
+        # None, so the obvious same-shape repoint — days_since(last_selected) —
+        # would leave this branch permanently dead and look fixed. That is the very
+        # defect being removed here, one level up. hours_since parses BOTH forms.
         cooldown = asp.get("cooldown_days", 0)
         if cooldown > 0:
-            lw = days_since(asp.get("last_worked"))
-            if lw is not None and lw < cooldown:
+            hs = hours_since(asp.get("last_selected"))
+            if hs is not None and hs < cooldown * 24:
                 continue
 
         # Use global done_ids if provided (cross-aspiration dependency enforcement),
@@ -3410,8 +3571,22 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
     raw["novelty_bonus"] = 1.0 if goal.get("achievedCount", 0) == 0 else 0
 
     # 7. recurring_urgency (log-scaled: base + log2(1 + overdue_ratio) * scale, capped at urgency_max)
-    # Logarithmic scaling preserves differentiation among overdue goals — a 72x-overdue
-    # goal scores higher than a 4x-overdue one, unlike the old linear cap at 5.0.
+    # Logarithmic scaling preserves differentiation among overdue goals ONLY BELOW the
+    # clamp — above it, every goal ties. This sentence claimed "a 72x-overdue goal scores
+    # higher than a 4x-overdue one" until 2026-08-11; that was true of the bare log curve
+    # and false from the day urgency_max landed, and it is the call-site copy the
+    # 2026-07-30 module-docstring correction missed (a docstring fix does not reach its
+    # call-site comments — guard-2333). MEASURED at the shipped defaults: the clamp binds
+    # at overdue_ratio 2.175 = 3.17x interval, ABOVE the starvation detector's own 2.0x
+    # threshold, so this term carries zero ordering information across exactly the
+    # population that is starved. Reproduced independently on two boxes: 11 of 12 rows
+    # >=2.0x tied at 4.0 spanning 2.12x..97.85x (zeta, cc-02, 527 candidates, 2026-07-30)
+    # and 11 of 41 recurring rows tied at the same ceiling (bravo, cc-05, 827 candidates,
+    # 2026-08-11). Full derivation in the module docstring; owned by  /
+    # , and see the  note at 7b for why the cancellation is exact.
+    # DO NOT "fix" the tie by raising or removing urgency_max: the cap is load-bearing
+    # (see next paragraph) and raising it only relocates the cancellation point — measured,
+    # prior tuning passes did not move the tally ( -> ).
     # urgency_max (, zeta-1477 fix) caps raw at a ceiling so heavily-overdue
     # recurring goals can no longer systematically out-score capped role_affinity
     # (1.5x ceiling × weight 1.0 = 1.5 max contribution) — bounds asymmetry while
@@ -3708,9 +3883,126 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
     # PLUS the standing user directive in team-state strategic_focus, ).
     # Both are "someone with authority said this matters more"; they share the
     # criterion and its 1.5 weight rather than splitting into two knobs.
+    # The strategic-focus addend is bound to a NAMED local, not left inline, because
+    # 13b-i below keys on IT and not on the composite. guard-2412: a composite
+    # criterion hides its addends from the breakdown, so `raw["directive_boost"] > 0`
+    # cannot tell a standing user directive apart from a board directive — and only
+    # the former carries the precedence claim that justifies waiving a sibling term.
+    _sf_boost = strategic_focus_boost(asp.get("id", ""), completion_ratio)
     raw["directive_boost"] = (
-        directive_boost_score(goal.get("id", ""), category)
-        + strategic_focus_boost(asp.get("id", ""), completion_ratio))
+        directive_boost_score(goal.get("id", ""), category) + _sf_boost)
+
+    # 13b-i. FLOOR class_balance_bonus AT ZERO INSIDE A LIVE strategic_focus LANE
+    # (). The balancer may still BOOST a directive lane; it may never
+    # PENALIZE one.
+    #
+    # MEASURED (foxtrot, LAPTOP-3IOFCNEO / WSL2, 2026-07-30T01:39, 413 candidates):
+    # every directive-aligned term favored the product goal (+1.500 directive_boost,
+    # +0.500 role_affinity, +0.450 variety_bonus, +0.240 completion_pressure) and one
+    # session-local term erased all of them — class_balance_bonus +0.640 on the
+    # framework goal vs -1.600 on the product goal, a -2.240 delta that flipped a
+    # +1.470 product win into a -0.770 loss. The asymmetry is structural, not an
+    # unlucky draw: class_balance_bonus spans raw [-2.0, +2.0] at weight 0.8 = a
+    # weighted swing of 3.2, while strategic_focus's entire authority is raw 1.0 at
+    # weight 1.5 = +1.5. A term with 2.1x the swing of the directive it is supposed
+    # to yield to will outvote it whenever the session is lane-heavy — which is
+    # exactly the state OBEYING the directive produces. Obedience fed the term that
+    # punished it.
+    #
+    # THOSE ARE THE CONFIGURED CAPS, AND ONLY THE PENALTY END IS REACHABLE — which
+    # makes this clamp SUFFICIENT rather than merely a mitigation. Do not size a
+    # future change off the 3.2 figure (fresh-eyes on this very commit, 8d1caf91,
+    # first concluded the clamp was insufficient by doing exactly that). Measured
+    # 2026-08-11 (bravo, cc-05) against the live targets product 0.40 / framework
+    # 0.30 / hygiene 0.15 / research 0.15: cbb = min(max_boost, deficit*max_boost*2)
+    # with deficit = target - observed, so on the BOOST side observed >= 0 bounds
+    # deficit <= target, and the x2 saturation needs deficit >= 0.5 — which NO
+    # configured target reaches. On the PENALTY side observed <= 1 lets deficit reach
+    # -(1-target) >= 0.6, which saturates for every class. Reachable weighted extremes:
+    #   framework +0.960 / -1.600   hygiene  +0.480 / -1.600
+    #   product   +1.280 / -1.600   research +0.480 / -1.600
+    # So the worst a NON-product competitor can gain from this term is +0.960, which
+    # cannot outvote the directive's +1.5 alone. The term could only ever ATTACK the
+    # lane, never defend it hard enough to matter — that asymmetry IS the mechanism,
+    # and flooring the penalty is therefore the whole fix, not half of it. Widening
+    # the clamp to also floor a competitor's positive bonus would be unnecessary.
+    #
+    # WHY NOT A WEIGHT CHANGE (the goal's check (b), and the lever to reach for
+    # first). Neither weight is the lever. Raising strategic_focus's is already
+    # refused, with reasons, by emit_strategic_focus_banner above: the directive is a
+    # PAIRWISE claim and the boost is a PER-GOAL SCALAR, so any value large enough to
+    # clear a routine sweep also overrides the verified-defect work aspirations.yaml's
+    # calibration comment deliberately excludes. Lowering class_balance_bonus's 0.8
+    # trades away work-mix balance EVERYWHERE, including the majority of sessions
+    # where no directive is active — paying globally to fix a scoped interaction.
+    # What is actually wrong is neither magnitude but the ORDERING: two terms with no
+    # declared precedence. So bound the interaction where it occurs and leave both
+    # weights alone. Same shape as apply_substantive_demotion (FW-1) — a targeted
+    # bound expressing a precedence the weighted sum cannot.
+    #
+    # SELF-RETIRING FOR FREE, which is why the predicate is the function and not a
+    # re-derived "is the lane live" test. strategic_focus_boost already returns 0.0
+    # when the directive names no such aspiration, when the prose parses to nothing,
+    # and when the lane has DRAINED (completion_ratio >= 1.0). Keying on its return
+    # inherits all three: no second copy to drift, and stale prose costs nothing here
+    # for the same reason it costs nothing there.
+    #
+    # Fleet-vantage re-measured 2026-08-11T13:32 (bravo, cc-05, one instant, per the
+    # directive's own exit rule):  executable excluding recurring + hypothesis
+    # goals reads alpha 0, bravo 0, echo 0, foxtrot 2, zeta 1. Not every agent reads
+    # zero, so the directive is LIVE and this clamp has a live subject. It is NOT
+    # conditioned on that measurement — the predicate above re-derives liveness on
+    # every call.
+    # The waived amount is recorded because a silently-zeroed term is the same
+    # invisibility this goal exists to fix — a reader must be able to see the
+    # waiver fired and what it cost. It rides OUT as a top-level candidate field
+    # (see `class_balance_penalty_waived` in the return dict), NOT as a raw key:
+    # KNOWN_CRITERIA is a manifest of things that GET WEIGHTS, and
+    # test_goal_selector_weights_contract asserts raw-keys == manifest. Putting
+    # telemetry in `raw` would force a manifest entry, which would in turn tell
+    # load_weights that a weight named class_balance_penalty_waived is legitimate
+    # — and a deployment adding one would silently start scoring telemetry. The
+    # passthrough precedent is `created_at` in the same return dict.
+    _cb_penalty_waived = None
+    if _sf_boost > 0 and raw.get("class_balance_bonus", 0.0) < 0:
+        _cb_penalty_waived = raw["class_balance_bonus"]
+        raw["class_balance_bonus"] = 0.0
+
+    # 13b-ii. ALSO FLOOR THE BONUS ON GOALS OUTSIDE A LIVE LANE ().
+    # The block above says "the balancer may still BOOST a directive lane; it may
+    # never PENALIZE one" — but the balancer decides the ORDERING either way: a
+    # bonus on the lane's COMPETITOR moves the comparison exactly as far as a
+    # penalty on the lane. 13b-i's own sufficiency argument ("the worst a
+    # non-product competitor can gain is +0.960, which cannot outvote the
+    # directive's +1.5 ALONE") evaluated the pair in isolation; the composed
+    # total also carries role_affinity, which legitimately OPPOSES the directive
+    # for some agents. Measured (zeta, cc-02 2026-08-12; reproduced cc-07
+    # 2026-08-13 via MIND_AGENT=zeta): framework cbb +1.0×0.8 = 0.800 plus
+    # role_affinity delta 0.700 consumed the directive's 1.500 EXACTLY —
+    # 9.32 == 9.32, a tie, so the standing user directive decided nothing and
+    # the pick fell to tiebreak. Same mechanism as 13b-i, opposite sign:
+    # obeying the product directive makes framework under-represented, which
+    # feeds the bonus that outranks the directive.
+    #
+    # SELF-RETIREMENT IS ASYMMETRIC HERE, stated rather than hidden: 13b-i keys
+    # on _sf_boost, inheriting all three retiring conditions (no directive /
+    # unparseable prose / lane drained) because it fires while scoring a LANE
+    # goal, whose own completion_ratio is in scope. This block fires while
+    # scoring a NON-lane goal, where the named lane's ratio is NOT in scope —
+    # so it inherits only the prose conditions (load_strategic_focus returns an
+    # empty aspiration set for absent/unparseable prose) and NOT the drain
+    # condition. Cost while drained-but-uncleared prose stands: non-lane goals
+    # forgo a positive cbb (reachable weighted max +1.28), a work-mix
+    # misallocation bounded by the fleet-vantage directive-hygiene cadence that
+    # clears stale prose. Accepted: a stale-prose window costing bounded
+    # rebalancing beats a live directive that cannot open a margin.
+    _cb_bonus_waived = None
+    if _cb_penalty_waived is None and _sf_boost == 0.0 \
+            and raw.get("class_balance_bonus", 0.0) > 0:
+        _sf = load_strategic_focus()
+        if _sf["aspirations"] and _sf["weight"] > 0:
+            _cb_bonus_waived = raw["class_balance_bonus"]
+            raw["class_balance_bonus"] = 0.0
 
     # 13c. handoff_bonus (cross-agent handoff routing).
     # A planning/reviewer agent files implementer-targeted goals via
@@ -3902,6 +4194,22 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
         # so an aged unclaimed HIGH goal never rises. Passthrough only; not a
         # WEIGHTS/scoring field, so guard-760 does not apply.
         "created_at": goal.get("created_at") or goal.get("created"),
+        # : producer-set dependency-pull signal, read by apply_pull_boost
+        # (the post-scoring pass). Passthrough only, exactly like created_at above —
+        # not a WEIGHTS/scoring field, so guard-760 and the KNOWN_CRITERIA contract
+        # do not apply. Absent on ~every goal; None is the overwhelming case.
+        "pull_signal": goal.get("pull_signal"),
+        # : the class_balance penalty waived by 13b-i for a goal inside a
+        # LIVE strategic_focus lane (None when no waiver fired — the common case).
+        # Telemetry, same posture as created_at above: passthrough only, not a
+        # WEIGHTS/scoring field, so guard-760 and the KNOWN_CRITERIA contract do
+        # not apply. Present so a waiver is auditable rather than a term that
+        # silently went to zero — the invisibility class the goal was filed over.
+        "class_balance_penalty_waived": _cb_penalty_waived,
+        # : the class_balance BONUS waived by 13b-ii for a goal
+        # OUTSIDE a live strategic_focus lane (None when no waiver fired).
+        # Same telemetry posture as the penalty field above.
+        "class_balance_bonus_waived": _cb_bonus_waived,
         "recurring": bool(goal.get("recurring")),
         "recurring_overdue_ratio": round(overdue_ratio, 3),
         "recurring_interval_hours": round(interval, 3),
@@ -4121,6 +4429,78 @@ def apply_starvation_boost(scored, config):
     return scored
 
 
+def apply_pull_boost(scored, config):
+    """EVENT-keyed lift for a consumer goal whose dependency has just materialized.
+
+    g-115-6590 (2026-08-17). Sibling of apply_starvation_boost and deliberately its
+    opposite: that pass is TIME-keyed (a goal rises because it has waited), this one
+    is EVENT-keyed (a goal rises because the thing it exists to consume has ARRIVED).
+    Every other anti-starvation term in this file is time-keyed, so a drain goal
+    could only ever fire on its interval, never WHEN a carrier landed.
+
+    NO-REGRESSION BY CONSTRUCTION, and more strongly than the sibling passes: the
+    boost requires a ``pull_signal`` dict on the goal, which ~no goal carries, so
+    selection is byte-identical for every candidate except the handful a producer
+    has explicitly pulled.
+
+    NOT RESTRICTED TO RECURRING GOALS, though the first consumer (g-306-284) is one.
+    Adding that condition would buy nothing the mechanism needs and would silently
+    no-op for a non-recurring consumer — a surprise with no failure signal. The
+    absent condition is the simpler code and the safer behaviour.
+
+    AGE IS A SAFETY VALVE (see load_pull_boost_config for the measurement): a lost
+    CLEAR must not pin a goal at rank 1 forever, so a signal older than
+    max_age_hours stops lifting on its own.
+
+    THE AGE IS PARSED HERE RATHER THAN VIA hours_since, and that is deliberate.
+    hours_since returns None for ANY future timestamp — it folds "stamped ahead of
+    me" into "corrupt" (goal-selector.py: "Negative = corrupt timestamp"). That is
+    right for its own callers, who ask "how long has this been waiting", but wrong
+    here: this signal is written on the PRODUCER's box and read on the CONSUMER's,
+    so a producer even seconds ahead of the reader stamps a set_at in the reader's
+    future, and inheriting hours_since would silently drop the pull — the exact
+    consumer-does-not-receive-what-the-producer-sent failure (guard-3221) this
+    mechanism exists inside. Caught by test_small_clock_skew_is_tolerated, which
+    failed on the first implementation. So: a SIGNED age, with a bounded skew
+    tolerance treated as live, and anything further ahead treated as bogus rather
+    than clamped — clamping would let a far-future stamp hold the boost for as long
+    as the skew, the unbounded case the valve exists to prevent. hours_since itself
+    is left alone; it is a shared helper with many callers and its semantics are
+    correct for them.
+
+    Mutates and returns ``scored`` in place; records the lift in breakdown + raw for
+    telemetry. Same in-place + no-op-when-disabled contract as the sibling passes.
+    A missing/unparseable set_at yields no boost (fail-open, like created_at above).
+    """
+    if not config.get("enabled"):
+        return scored
+    boost = float(config.get("boost", 4.0))
+    max_age = float(config.get("max_age_hours", 24.0))
+    skew_tolerance_h = 1.0
+    if boost <= 0:
+        return scored
+    now = datetime.now()
+    for s in scored:
+        sig = s.get("pull_signal")
+        if not isinstance(sig, dict):
+            continue
+        raw_set_at = sig.get("set_at")
+        if not raw_set_at or not isinstance(raw_set_at, str):
+            continue
+        try:
+            set_at = datetime.fromisoformat(raw_set_at)
+        except (ValueError, TypeError):
+            continue
+        age_h = (now - set_at).total_seconds() / 3600.0
+        if age_h > max_age or age_h < -skew_tolerance_h:
+            continue
+        age_h = max(0.0, age_h)
+        s["score"] = round(s["score"] + boost, 2)
+        s.setdefault("breakdown", {})["pull_boost"] = boost
+        s.setdefault("raw", {})["pull_signal_age_hours"] = round(age_h, 2)
+    return scored
+
+
 def overdue_exemption_level(ratio, interval_hours, config):
     """How exempt a stale recurring goal is from suppression, on [0.0, 1.0].
 
@@ -4231,6 +4611,37 @@ def apply_substantive_demotion(scored, config):
     return scored
 
 
+def candidate_sort_key(x):
+    """Sort key for the final candidate ranking: highest score first, then MOST
+    OVERDUE first among equal scores, then lower aspiration id, then lower goal
+    id. Non-recurring rows carry recurring_overdue_ratio 0.0, so their relative
+    order is byte-identical to the old (-score, aspiration_id, goal_id) key;
+    only a tie that INCLUDES a recurring row moves, and it moves toward the
+    stalest row — the same ordering apply_drain_lane already uses.
+
+    The overdue term exists because apply_substantive_demotion writes
+    `score = cap` onto EVERY non-exempt recurring row above the cap, so the tie
+    it produces is by construction all-recurring and the rows' ordering
+    information is gone by the time the sort runs (apply_drain_lane's docstring
+    says the same of the urgency cap). Under the old key that cluster was
+    ordered by aspiration-id STRING — unrelated to staleness, and a fixed
+    penalty on high-numbered aspirations. Measured 2026-08-17 (alpha, cc-09,
+    the g-306-284 stall): the reducer-only worker-ref drain lane (interval 8h)
+    carried the HIGHEST pre-demotion score of all ~1150 candidates in four
+    consecutive selector runs (15.45-16.02 vs a top substantive of
+    13.36-14.16), was demoted to the cap every time, and then sorted LAST of
+    the tied cluster in every run because "asp-306" > "asp-115" — behind rows
+    0.8x overdue while it stood at 1.7x. It went 22h unpicked while its
+    dependents (g-115-6466, g-115-6471, g-115-6472) waited on the merge.
+    """
+    return (
+        -x["score"],
+        -float(x.get("recurring_overdue_ratio") or 0.0),
+        x["aspiration_id"],
+        x["goal_id"],
+    )
+
+
 def _drain_lane_state_path(agent_dir):
     return None if agent_dir is None else agent_dir / "session" / "drain-lane-state.json"
 
@@ -4255,6 +4666,14 @@ def write_drain_lane_state(agent_dir, state):
     the lane fire LESS often — the safe direction for an anti-flood guard."""
     p = _drain_lane_state_path(agent_dir)
     if p is None:
+        return
+    # (d): a cross-agent probe must not advance a partner's cadence
+    # counter — that CONSUMES the partner's next real drain-lane slot. The
+    # READ above is deliberately left alone: suppressing only the write keeps
+    # the probe's returned ordering identical to what the agent itself would
+    # see, so the measurement stays faithful while the side effect stops.
+    if not _agent_is_resident():
+        _suppress_cross_agent_write("drain-lane state")
         return
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -4400,6 +4819,13 @@ def write_scorer_verdict(scored, agent_dir):
     gate simply does not run this iteration.
     """
     if agent_dir is None or not scored:
+        return
+    # (d): the highest-consequence of the three writes. This file is
+    # the claim chokepoint's input, so a cross-agent probe overwriting it aims
+    # the partner's NEXT claim at a verdict computed from THIS box's vantage —
+    # a scorer-sovereignty refusal on the partner's own legitimate top pick.
+    if not _agent_is_resident():
+        _suppress_cross_agent_write("scorer-verdict")
         return
     try:
         session_dir = agent_dir / "session"
@@ -4707,8 +5133,18 @@ def cmd_select(args):
     # construction). See apply_starvation_boost.
     apply_starvation_boost(scored, STARVATION_CONFIG)
 
-    # Sort: highest score first, then lower aspiration number, then lower goal number
-    scored.sort(key=lambda x: (-x["score"], x["aspiration_id"], x["goal_id"]))
+    # Dependency-pull lift (): the EVENT-keyed counterpart to the
+    # time-keyed passes above — a consumer goal rises the moment a producer says the
+    # dependency it exists to drain has ARRIVED. Runs LAST among the boosts and
+    # BEFORE the sort so the lift drives ranking; a goal with no pull_signal (which
+    # is ~all of them) gets zero boost, so selection is byte-identical outside the
+    # pulled set. See apply_pull_boost.
+    apply_pull_boost(scored, PULL_CONFIG)
+
+    # Sort: highest score first, then MOST OVERDUE first among equal scores, then
+    # lower aspiration id, then lower goal id. See candidate_sort_key for why
+    # the overdue tiebreak exists (the  stall, 2026-08-17).
+    scored.sort(key=candidate_sort_key)
 
     # Bounded drain lane (, decision (b)). Runs AFTER the sort
     # because it REORDERS rather than rescores, and BEFORE write_scorer_verdict

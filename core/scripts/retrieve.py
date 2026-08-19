@@ -85,6 +85,21 @@ from trigger_firings import record_firing  # g-304-07 telemetry — fail-open in
 # raw read. On the default LocalBackend, ensure_local() is identity and refresh()
 # is a no-op (zero added I/O) — the local read path is byte-for-byte unchanged.
 from storage_backend import get_backend
+# g-358-05: the reader seam for the segmented content stores. Top-level import is
+# safe HERE (unlike in mind_api/src/world/reasoning_bank.py, where it had to be
+# lazy) because this module already imports `_paths` at :80, so the WORLD_DIR
+# resolution it triggers is already paid. `_store_paths` below never lets its
+# module-level WORLD_DIR reach a read — see that docstring.
+from _utilization_store import store_paths as _seg_store_paths
+from _utilization_store import dedup_by_id as _dedup_by_id
+# g-358-05 reader seam for the reasoning-bank/guardrails counter split. Reader-only
+# and a no-op until the writer lands (see _utilization_store's module docstring).
+# PER-STORE (`load_counters`), not merged: every _sort_by_utility call site is
+# single-kind. A concurrent implementation imported `load_all_counters` here for a
+# merged read; both landed in one merge, so this import block briefly bound
+# `utilization_of` twice. One binding, one seam.
+from _utilization_store import (load_counters as _load_counters,
+                                utilization_of as _utilization_of)
 
 # Universal meta-lessons cap in retrieve output — prevents framework-category
 # entries from flooding domain retrieval. Tuned: 5 is enough to surface the
@@ -124,9 +139,43 @@ BELIEFS_PATH = WORLD_DIR / "knowledge" / "beliefs.yaml"
 #     there (guard-731: never retire on retrieval_count==0 alone).
 # DO NOT widen scope here alone. DO NOT INLINE — the twin at
 # mind_api/src/endpoints/retrieve.py re-binds _r.EXP_PATH to the same live file
-# per request, so a one-sided change fixes nothing (guard-130). Widening is also
-# not free (corpus +70%, and a bump would write into the archive); that cost is
-# UNMEASURED and is g-115-4970's job, not this comment's.
+# per request, so a one-sided change fixes nothing (guard-130).
+#
+# COST NOW MEASURED, and BOTH halves of the prior "not free" claim were wrong
+# (g-115-4970, 2026-08-12, zeta, hostname cc-02, uname -r 6.8.0-137-generic;
+# counts are a mutable-data snapshot — re-measure before relying on them,
+# guard-1876):
+#   - SCAN: EXP_PATH is per-AGENT, so the fleet-wide "+70%" is the wrong
+#     denominator. zeta = 726 live / 283 archive: +39% records, +24% bytes,
+#     +3.7ms to parse the archive. The +3.7ms is a STANDALONE json.loads loop
+#     over the file, NOT an in-situ measurement of this module's read path —
+#     so treat it as an order-of-magnitude figure, not a regression baseline.
+#     Against a real warm retrieve.sh call (657ms medium / 741ms deep, same
+#     box, measured end-to-end) that is ~0.5%; even off by 10x it is ~5%.
+#     Too small to justify a conditional either way.
+#   - WRITE AMPLIFICATION: structurally absent, not merely small. The bump is
+#     _locked_bump_jsonl(EXP_PATH, ...) — a HARDCODED path that re-reads that
+#     one file whole under lock and no-ops on ids absent from it. Merging
+#     archive records into `matching` CANNOT write to the archive. Verified by
+#     reading the call site (load_experiences) and the helper (L241).
+#   - REACH: the sort is stable and archive retrieval_count is 0 on 273/283, so
+#     archive records land BELOW live ones automatically — tail-fill only, never
+#     displacing a proven record. 67 of 139 categories change at deep; 45 return
+#     ZERO today (61 records, incl. product categories lodestar-mycelium-gateway
+#     and pearl-plan). 6 saturated categories hold 68% of live records and are
+#     provably inert — the scan is paid there and buys nothing.
+# DECISION: widen READ-ONLY, unconditionally (shape b). Rejected: (a) replace
+# live with live+archive — displaces proven records; (c) bump on archive hit —
+# re-arms the one-way door guard-731 warns about, and tail-fill already reaches
+# them; (d) un-archive on retrieval — mutates two stores on a READ path, and
+# rc==0 mostly means "never queried", not "proved unuseful". A lazy load (parse
+# the archive only when live < limit) is a single-use branch guarding 0.5%.
+# TO IMPLEMENT: derive the archive path from EXP_PATH at CALL time inside
+# load_experiences — do NOT add a second module-level constant. The twin
+# re-binds _r.EXP_PATH per request and calls this module's function, so a
+# derived path follows the re-bind for free and cannot drift (guard-130);
+# a second constant would need its own re-bind. Both comments move together
+# (guard-2323). Tracked by g-115-6084.
 EXP_PATH = AGENT_DIR / "experience.jsonl" if AGENT_DIR else None
 EI_PATH = AGENT_DIR / "experiential-index.yaml" if AGENT_DIR else None
 
@@ -161,6 +210,60 @@ from tree_match import (
     COSINE_BONUS_WEIGHT, _mmr_rerank,
 )
 
+def _goal_id_is_terminal(goal_id):
+    """True only when the local store POSITIVELY shows goal_id in a terminal state.
+
+    g-115-5887. Deliberately reads world/aspirations.jsonl directly, WITHOUT
+    get_backend().ensure_local(): this runs on every --goal-less retrieve, and a
+    per-call S3 materialize of a ~35MB store would put a network round-trip on
+    the retrieval hot path. Measured 2026-08-13 (alpha, hostname cc-04, uname -r
+    6.8.0-137-generic, own-cloud): 34,966,142 bytes / 33 aspirations / 7,105
+    goals; 51ms substring-prefiltered scan against a 0.53s warm retrieve (4.21s
+    cold) — ~10% warm, ~1% cold, so no staleness/time heuristic is needed to
+    afford it.
+
+    The staleness that read accepts fails in the SAFE direction, which is the
+    whole reason it is allowed. A stale local copy can only UNDER-report
+    terminality (an older snapshot is strictly less likely to show a goal
+    completed), so the worst case degrades to the exact pre-fix behaviour —
+    return the gid — and never rejects a live goal. That asymmetry is why
+    guard-980 ("read the store of record, not the local cache") does not bind
+    here: guard-980 governs concluding ABSENCE, where a cold cache manufactures
+    a false negative with real consequences. Every error path returns False for
+    the same reason: a read failure must never suppress inference.
+
+    Evicted goals are handled too. aspirations-evict-completed.py removes aged
+    terminal goals from the live `goals` list, so a long-stale in_flight naming
+    an evicted goal would otherwise read as "not found" -> not terminal — which
+    is precisely the aged case this check exists for. The archived_census
+    carries their ids, so they are consulted as well.
+    """
+    if not goal_id or WORLD_DIR is None:
+        return False
+    try:
+        from _goal_census import TERMINAL_STATUSES, census_evicted_ids
+        path = WORLD_DIR / "aspirations.jsonl"
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                # Cheap prefilter: the id must appear textually in the
+                # aspiration's line for the goal (or its census tombstone) to
+                # live there. A line may mention the id only as a REFERENCE in
+                # some other goal's prose, so a match here is not a hit —
+                # never return from this branch, fall through to the next line.
+                if goal_id not in line:
+                    continue
+                asp = json.loads(line)
+                for goal in (asp.get("goals") or []):
+                    if goal.get("id") == goal_id:
+                        return goal.get("status") in TERMINAL_STATUSES
+                for status, ids in census_evicted_ids(asp).items():
+                    if goal_id in ids:
+                        return status in TERMINAL_STATUSES
+    except Exception:
+        return False
+    return False
+
+
 def _infer_in_flight_goal_id():
     """Infer the agent's current in-flight goal_id from team-state.yaml.
 
@@ -169,6 +272,15 @@ def _infer_in_flight_goal_id():
     skills pass only --category (not --goal), which before this inference left
     retrieval-session.json unwritten and distill candidates with times_helpful=0
     AND times_noise=0. See g-115-137.
+
+    Also returns None when the named goal is already TERMINAL (g-115-5887). The
+    row is stamped inside aspirations-claim.sh, which ONLY world-source goals
+    invoke (guard-2835), so a run of agent-queue goals leaves it naming a
+    finished goal for an unbounded period — measured at 80 minutes stale, which
+    then mis-stamped a manifest and made utilization-feedback refuse with
+    goal_mismatch. This is a READ-SIDE validation: it never writes or clears the
+    row, so the evidence g-306-233 still needs stays intact (guard-2835 rule 4
+    and guard-2260 forbid remedying a stale row with a background sweep).
     """
     agent = os.environ.get("MIND_AGENT")
     if not agent or WORLD_DIR is None:
@@ -202,7 +314,16 @@ def _infer_in_flight_goal_id():
     if not inflight or not isinstance(inflight, dict):
         return None
     gid = inflight.get("goal_id")
-    return gid if isinstance(gid, str) and gid else None
+    if not (isinstance(gid, str) and gid):
+        return None
+    # g-115-5887: a non-empty-string check ALONE was the defect. Falling through
+    # to None here routes the caller to the existing no-goal path (manifest not
+    # goal-stamped) rather than to a WRONG goal, which is the strictly safer of
+    # the two failure modes: an unstamped manifest loses attribution, a
+    # mis-stamped one makes consumers act on another goal's identity.
+    if _goal_id_is_terminal(gid):
+        return None
+    return gid
 
 # ---------------------------------------------------------------------------
 # Helpers: file I/O (same patterns as experience.py, pipeline.py)
@@ -223,6 +344,61 @@ def read_jsonl(path):
             if stripped:
                 items.append(json.loads(stripped))
     return items
+
+def _store_paths(path, kind):
+    """Ordered content-store paths for a legacy store file, oldest-first (g-358-05).
+
+    `path` is the LEGACY store path (RB_PATH / GUARD_PATH) and the enumeration
+    base is derived from ITS parent — never from the module-level WORLD_DIR.
+    That is the load-bearing detail on the daemon path: the retrieve endpoint
+    monkeypatches `_r.RB_PATH` / `_r.GUARD_PATH` to the per-request world, so a
+    WORLD_DIR-derived base would silently read the DAEMON's world on every
+    request instead of the caller's. `_seg_store_paths` takes `world_dir`
+    explicitly for exactly this reason.
+
+    The legacy path is pinned unconditionally rather than left to the seam's
+    enumeration. `store_paths` includes it only when it can SEE it — locally or
+    in the backend listing — and on a cold own-cloud box neither is guaranteed;
+    it also returns [] outright when the base is unresolvable. Either miss would
+    read as an EMPTY store, which for guardrails means "no guardrails apply" and
+    for the reasoning bank means "no prior reasoning exists". That is the worst
+    available failure direction (it reads as a clean all-clear), and it is the
+    one direction this pin makes impossible. Duplication is impossible in the
+    other direction too: `store_paths` yields the legacy name at most once and
+    only ever prepends it, so the membership test below is exact.
+    """
+    try:
+        paths = list(_seg_store_paths(kind, path.parent))
+    except Exception:
+        # Fail toward the legacy read, never toward an empty store — see above.
+        return [path]
+    if path not in paths:
+        paths.insert(0, path)
+    return paths
+
+def _read_store(path, kind):
+    """Read a content store as its ordered segment set (g-358-05), with ids
+    appearing in more than one segment collapsed NEWEST-WINS.
+
+    Byte-identical to `read_jsonl(path)` until a writer emits segments, since
+    `_store_paths` resolves to the legacy file alone today — the dedup is inert
+    while no id can repeat.
+
+    THE DEDUP IS HERE AND IN THE DAEMON'S `reasoning_bank._load` BOTH, through
+    one shared helper rather than two implementations: these are the CLI and
+    daemon halves of the same read, and a stale-wins fix applied to only one of
+    them leaves half the fleet reading a retired guardrail as active.
+
+    `read_jsonl` is called as a MODULE GLOBAL on purpose: the daemon retrieve
+    endpoint patches `_r.read_jsonl` with a jsonl_cache-backed version, and a
+    reference captured at def time would not see the patch. Both shapes call
+    `ensure_local` first, so the seam's read-through-the-backend contract holds
+    on the CLI and daemon paths alike.
+    """
+    items = []
+    for p in _store_paths(path, kind):
+        items.extend(read_jsonl(p))
+    return _dedup_by_id(items)
 
 def read_yaml(path):
     """Read YAML file, return dict. Returns {} if missing/empty."""
@@ -1009,7 +1185,7 @@ def _tree_embedding_scores(categories, nodes):
             out[key] = raw[did]
     return out
 
-def _sort_by_utility(entries):
+def _sort_by_utility(entries, counters=None):
     """In-place sort by utilization.utilization_score desc, provenance weight
     desc (M-5), then created desc.
 
@@ -1033,6 +1209,28 @@ def _sort_by_utility(entries):
     null poignancy -> factor 1.0, so ordering is identical to pre-g-306-08 by
     default; records without a poignancy field (guardrails, pattern signatures)
     are unaffected.
+
+    `counters` (g-358-05) is the utilization sidecar map for the ONE store these
+    entries came from; None keeps the embedded-field reading. No kind dispatch
+    is needed here even though this sorter serves three stores, because every
+    call site is SINGLE-KIND — load_reasoning_bank passes rb counters,
+    load_guardrails passes guardrails counters, and load_pattern_signatures
+    passes None (pattern-signatures has no sidecar: _utilization_store.KINDS is
+    ('reasoning-bank', 'guardrails'), so asking for one would raise). Sharing
+    one map across a call's two sorts is why it is a PARAMETER rather than a
+    load inside this function: load_reasoning_bank sorts twice (domain here,
+    universal via sort_universal_rbs) and must not pay the read twice.
+
+    A concurrent implementation of g-358-05 loaded a kind-MERGED map inside this
+    function instead, on the premise that the lists arriving here are mixed. They
+    are not — all three call sites are single-kind, which is what makes the
+    per-store parameter both correct and more precise. Its measurement is worth
+    keeping though: while no sidecar exists a load is 2 is_file() checks (11us,
+    measured 2026-08-17) and `utilization_of` falls through to the embedded
+    field, so ordering is byte-identical to pre-seam behaviour. WHEN THE WRITER
+    LANDS each load becomes a real read of a small object — that is the point at
+    which to decide on caching, deliberately not now (nothing to cache yet, and a
+    cache would need an invalidation story).
     """
     cfg = _load_retrieval_config()
     blend = cfg.get("poignancy_blend_enabled", False)
@@ -1053,7 +1251,9 @@ def _sort_by_utility(entries):
         return _PROV_WEIGHTS.get(str(prov).upper(), _PROV_DEFAULT)
 
     def _key(r):
-        util = (r.get("utilization") or {}).get("utilization_score", 0) or 0
+        # No `or {}` guard: utilization_of documents that it returns {} rather
+        # than None precisely so callers can .get() directly (see its docstring).
+        util = _utilization_of(r, counters).get("utilization_score", 0) or 0
         # M-5: provenance is the secondary key (a trust signal — DIRECT over
         # HEARSAY at equal utility). When the poignancy blend is on, the
         # poignancy factor stays a lower-priority key so it still orders the
@@ -1117,7 +1317,7 @@ def load_reasoning_bank(categories, depth="medium", read_only=False, entry_type=
     """
     cap = SUPPLEMENTARY_CAPS.get(depth, SUPPLEMENTARY_CAPS["medium"])
     as_of_dt = _as_of_dt_or_raise(as_of)
-    records = read_jsonl(RB_PATH)
+    records = _read_store(RB_PATH, "reasoning-bank")
     # g-306-36: as_of set => point-in-time validity filter (versions valid at T,
     # status-agnostic). as_of None => current-active view (byte-identical path).
     if as_of_dt is None:
@@ -1132,7 +1332,13 @@ def load_reasoning_bank(categories, depth="medium", read_only=False, entry_type=
     universal = [r for r in active if is_universal_rb(r)]
     domain = [r for r in active if not is_universal_rb(r)
               and _entry_matches(r, categories)]
-    _sort_by_utility(domain)
+    # Sidecar counters loaded ONCE and shared by BOTH sorts below (g-358-05):
+    # this lane ranks twice — domain here, universal at sort_universal_rbs —
+    # and they are the same store, so a second read would be pure waste.
+    # Free today (absent sidecar returns {} immediately); measured cost once
+    # the writer lands is ~25 ms against this lane's ~100 ms store read.
+    _rb_counters = _load_counters("reasoning-bank")
+    _sort_by_utility(domain, _rb_counters)
     # g-306-77 b2: flag-gated embedding hybrid (widen + cosine re-rank) BEFORE
     # the cap, so semantic matches compete for slots by relevance. Skipped on
     # as_of reads — blending a historical view against the current-corpus
@@ -1141,7 +1347,7 @@ def load_reasoning_bank(categories, depth="medium", read_only=False, entry_type=
         domain = _embedding_blend(domain, active, categories,
                                   exclude=is_universal_rb)
     domain = domain[:cap]
-    sort_universal_rbs(universal)
+    sort_universal_rbs(universal, _rb_counters)
     # g-306-86: flag-gated relevance split of the universal cap. as_of reads
     # keep the pure utilization slice — same historical-view reasoning as the
     # domain-lane blend above.
@@ -1204,13 +1410,13 @@ def load_guardrails(categories, depth="medium", read_only=False, as_of=None):
     """
     cap = SUPPLEMENTARY_CAPS.get(depth, SUPPLEMENTARY_CAPS["medium"])
     as_of_dt = _as_of_dt_or_raise(as_of)
-    records = read_jsonl(GUARD_PATH)
+    records = _read_store(GUARD_PATH, "guardrails")
     if as_of_dt is None:
         active = [r for r in records if r.get("status") == "active"]
     else:
         active = [r for r in records if _valid_at(r, as_of_dt)]
     filtered = [r for r in active if _entry_matches(r, categories)]
-    _sort_by_utility(filtered)
+    _sort_by_utility(filtered, _load_counters("guardrails"))
     # g-306-77 b2: flag-gated embedding hybrid — see load_reasoning_bank.
     if as_of_dt is None:
         filtered = _embedding_blend(filtered, active, categories)
@@ -1253,6 +1459,10 @@ def load_pattern_signatures(categories, depth="medium", read_only=False, as_of=N
     else:
         active = [r for r in records if _valid_at(r, as_of_dt)]
     filtered = [r for r in active if _entry_matches(r, categories)]
+    # No counters arg (g-358-05): pattern-signatures has NO sidecar —
+    # _utilization_store.KINDS is ('reasoning-bank', 'guardrails') and
+    # _check_kind would raise. This lane keeps reading the embedded field, which
+    # is correct rather than a gap: nothing splits these counters out.
     _sort_by_utility(filtered)
     filtered = filtered[:cap]
 
@@ -1566,6 +1776,15 @@ _DEFAULT_RETRIEVAL_CFG = {
     "poignancy_blend_enabled": False,
     "poignancy_weight_min": 1.0,
     "poignancy_weight_max": 1.5,
+    # Poignancy assumed for a null/unparseable rating (g-115-6387). In RAW
+    # poignancy units (1-10) so it feeds the same linear map as a real rating —
+    # mirroring utility_weight_center, which is likewise expressed in the input's
+    # own units. DEFAULT 1.0 IS DELIBERATELY THE PRE-FIX BEHAVIOUR, not the
+    # measured corpus mean: an absent key must degrade to today (factor == min)
+    # rather than to a value this file cannot verify against the live corpus. The
+    # measured value ships in core/config/tree.yaml, where the re-derivation
+    # instruction lives next to it.
+    "poignancy_weight_center": 1.0,
     # PPR blend (g-306-44, BRD Gap 1b+1c; HippoRAG 2405.14831). DEFAULT OFF —
     # mirrors the poignancy blend above. When false, _ppr_weight() returns 1.0
     # for every node AND _score_weight_limit skips the PPR pass entirely, so
@@ -1576,6 +1795,13 @@ _DEFAULT_RETRIEVAL_CFG = {
     "ppr_blend_enabled": False,
     "ppr_weight_min": 1.0,
     "ppr_weight_max": 1.5,
+    # Normalized PPR score assumed for a candidate absent from the knowledge
+    # graph (g-115-6387). Same defect shape as poignancy_weight_center, but NO
+    # measured value ships: a PPR score is normalized per-query, so its mean is
+    # not a static corpus property the way poignancy's is. 0.0 reproduces the
+    # pre-fix factor (== ppr_weight_min) exactly. See _ppr_weight's docstring for
+    # why the per-query median is the likely right answer if the blend is enabled.
+    "ppr_weight_center": 0.0,
     "ppr_seed_top_n": 5,
     # Embedding-cosine hybrid for the supplementary stores (g-306-77 part b2;
     # index built by embedding-index-build.py, queried via _embedding_retrieval).
@@ -1680,25 +1906,50 @@ def _poignancy_weight(record, cfg=None):
 
     `record` is any dict carrying an optional top-level `poignancy` field
     (a tree-node `_tree.yaml` entry OR a reasoning-bank record). Missing, None,
-    or unparseable poignancy -> neutral 1.0, so legacy records are null-safe
-    with no backfill required.
+    or unparseable poignancy is treated as `poignancy_weight_center` — the
+    corpus-mean rating — so legacy records are null-safe with no backfill.
+
+    NULL IS CENTERED, NOT FLOORED (g-115-6387, 2026-08-16). This function used to
+    `return 1.0` for a null rating and call that "neutral". 1.0 is
+    poignancy_weight_min — the BOTTOM of the output range, not its middle — so an
+    unrated record was ranked as if it were the least significant thing in the
+    corpus, and could never be promoted at any k. It is the g-306-95 defect (see
+    _utility_weight, whose docstring explains the same centering) mirrored into
+    the sibling factor: unmeasured must read "assume average", and this read
+    "assume worst". Measured on cc-07 before the fix, over 7604 active rb records
+    (74.1% rated): an unrated record entered the top-k zero times at k=20/50/100/
+    200, while 100%/82%/78%/71% of ALL demotions were unrated records against a
+    25.9% corpus rate.
+
+    The fix substitutes the null INPUT and leaves the rated mapping alone, so:
+    (a) a real rating produces the identical factor it did before, and (b) every
+    factor stays within [lo, hi] and therefore >= lo, preserving the boost-only
+    property the A/B harness's displacement bound depends on. The clamp runs
+    AFTER the substitution, so even a mis-configured out-of-range center cannot
+    push the factor outside [lo, hi].
+
+    The default center is 1.0 — the pre-fix behaviour — so an absent config key
+    degrades to today rather than to an unverified value. The measured constant
+    ships in core/config/tree.yaml alongside its re-derivation instruction.
     """
     cfg = cfg or _load_retrieval_config()
     if not cfg.get("poignancy_blend_enabled", False):
         return 1.0
+    lo = float(cfg.get("poignancy_weight_min", 1.0))
+    hi = float(cfg.get("poignancy_weight_max", 1.5))
+    center = float(cfg.get("poignancy_weight_center", 1.0) or 1.0)
     p = record.get("poignancy")
     if p is None:
-        return 1.0
-    try:
-        p = float(p)
-    except (TypeError, ValueError):
-        return 1.0
+        p = center
+    else:
+        try:
+            p = float(p)
+        except (TypeError, ValueError):
+            p = center
     if p < 1.0:
         p = 1.0
     elif p > 10.0:
         p = 10.0
-    lo = float(cfg.get("poignancy_weight_min", 1.0))
-    hi = float(cfg.get("poignancy_weight_max", 1.5))
     # p=1 -> lo, p=10 -> hi (linear interpolation).
     return lo + (p - 1.0) / 9.0 * (hi - lo)
 
@@ -1767,18 +2018,44 @@ def _ppr_weight(graph_key, ppr_scores, cfg=None):
     the factor is always >= 1.0, so the blend can only PROMOTE graph-proximate
     records -- never demotes -- preserving the no-regression A/B criterion by
     construction (the same property the poignancy blend relies on).
+
+    NULL CENTERING (g-115-6387, 2026-08-16) -- SHAPE FIXED, VALUE DELIBERATELY
+    LEFT AT THE PRE-FIX DEFAULT. This function inherited _poignancy_weight's
+    "null -> 1.0" and therefore its defect: 1.0 is ppr_weight_min, the FLOOR, so
+    an unscored candidate was ranked as if the graph held the WORST possible
+    opinion of it rather than none at all.
+
+    That the null really is "unmeasured" was verified, not assumed from the code
+    shape: personalized_pagerank() initializes its rank vector over every node in
+    the adjacency and returns a distribution over all of them, so a merely
+    graph-DISTANT node gets a small NONZERO score. A None therefore means the
+    candidate is absent from the knowledge graph altogether -- never built, or a
+    key-resolution miss in _resolve_ppr_key (the rb-245 key-format class) -- which
+    is exactly the unmeasured case.
+
+    BUT THE POIGNANCY REMEDY DOES NOT TRANSFER, and this is why no measured value
+    ships here. Poignancy's center is a static corpus property (one mean over all
+    rated records, re-derivable on a cadence). A PPR score is normalized by THAT
+    QUERY's maximum in _compute_ppr_scores, so its distribution is per-query and
+    no static constant can be its mean. The likely correct fix is a per-query
+    statistic -- the median of ppr_scores.values(), which is already in hand at
+    this call -- but that is an unmeasured design choice for a blend that is
+    DEFAULT OFF, so it is not made here. The seam exists; the value stays 0.0,
+    which reproduces the pre-fix factor (lo) exactly and changes nothing today.
     """
     cfg = cfg or _load_retrieval_config()
     if not cfg.get("ppr_blend_enabled", False):
         return 1.0
     if not ppr_scores:
         return 1.0
-    score = ppr_scores.get(graph_key)
-    if score is None:
-        return 1.0
     lo = float(cfg.get("ppr_weight_min", 1.0))
     hi = float(cfg.get("ppr_weight_max", 1.5))
-    return lo + float(score) * (hi - lo)
+    center = float(cfg.get("ppr_weight_center", 0.0) or 0.0)
+    score = ppr_scores.get(graph_key)
+    if score is None:
+        score = center
+    score = min(1.0, max(0.0, float(score)))
+    return lo + score * (hi - lo)
 
 def _graph_node_key_candidates(key, node):
     """Knowledge-graph node ids ("node:<...>") a retrieval candidate may map to.

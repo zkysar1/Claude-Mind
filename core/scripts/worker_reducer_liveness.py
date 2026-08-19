@@ -35,17 +35,37 @@ blip would kill every worker in the fleet at once. These accumulate against
 `error_threshold` (default 3 consecutive) and only then wind down, per the
 design's "N consecutive rc=1 -> wind down too". Any rc=0 resets the counter.
 
-TAKEOVER DETECTION — and its MEASURED LIMIT. The design asks to wind down when
-"runner_token changed (a new reducer stale-broke in)". Measured 2026-08-03
-against GET /v1/admin/runner-claims: a claim row carries exactly
-{agent, machine_id, agent_state, heartbeat_at}. There is NO runner_token in
-the payload, so token-change detection is NOT implementable at this endpoint
-and is NOT implemented here. `machine_id` is the available proxy: a reducer
-that stale-breaks in from ANOTHER box changes it. The residual gap is a
-SAME-BOX reducer restart (new token, same machine_id), which this poll cannot
-see and will report as CONTINUE. That gap is stated rather than papered over
-(guard-1760: never report what you declined to look at as coverage); closing
-it requires the endpoint to expose the token.
+TAKEOVER DETECTION — TWO AXES, and the second one closes what this module used
+to call its MEASURED LIMIT. The design asks to wind down when "runner_token
+changed (a new reducer stale-broke in)". Measured 2026-08-03, a claim row from
+GET /v1/admin/runner-claims carried exactly {agent, machine_id, agent_state,
+heartbeat_at} — no token — so only `machine_id` was available and a SAME-BOX
+reducer restart (new token, unchanged machine_id) was invisible and reported as
+CONTINUE. That gap is now closed (g-306-224), but NOT the way the filing asked.
+
+  machine_id  — a reducer that stale-breaks in from ANOTHER box changes it.
+  token fp    — a NON-REVERSIBLE digest of runner_token, added to the endpoint,
+                to runner-claim.sh's LIVE line, and consumed here. It changes on
+                a re-mint, so it catches the same-box restart machine_id cannot.
+
+THE RAW TOKEN IS DELIBERATELY NOT EXPOSED, and this module must never ask for
+it. `runner_token` is the ConditionExpression bearer credential for the backend's
+`heartbeat` and `release_runner`: anything holding it can forge a heartbeat for
+another agent (defeating `reclaim_if_stale`, so a crashed runner could never be
+reclaimed) or release a LIVE claim, forcing a healthy reducer down mid-flight.
+Publishing it to close a liveness gap would defeat the mechanism this poll exists
+to protect. A consumer that only needs to notice CHANGE never needs the value —
+full argument in `owncloud_backend.runner_token_fingerprint`.
+
+FAIL-SAFE ASYMMETRY FOR THE NEW AXIS, and it points the OTHER way from this
+module's usual invariant, on purpose. An ABSENT fingerprint (`unknown` on the
+LIVE line: a daemon predating the field, a never-claimed row) is
+NON-DISCRIMINATING, exactly like an unparsed machine_id — it is a fact about the
+plumbing's version, not a signal about the reducer, so it must not wind anyone
+down. Treating absence as change would wind down every worker in a mixed-version
+fleet at once, which is the same fleet-wide-kill failure the transient threshold
+exists to prevent. Only an observed fp that DIFFERS from a previously observed fp
+is decisive. Genuine unreadability is still covered by `error_threshold`.
 
 The expected machine is LEARNED on the first LIVE poll rather than read from
 the body manifest. The manifest's `machine_id` field is written by the fork
@@ -84,13 +104,35 @@ TRANSIENT_RCS = (1, 2, 3)
 # outside this goal's scope fence. The contract test is the join.
 LIVE_MARKER = "is RUNNING on "
 
+# The token-fingerprint clause runner-claim.sh appends to that SAME LIVE line
+# (). Module-level for the same reason LIVE_MARKER is: the emitter is a
+# bash script with embedded python that cannot import from here, so a contract
+# test asserting the emitter still emits THIS string is the only real join
+# (guard-920 — pin the production shape, never a hand-copy that drifts with it).
+TOKEN_FP_MARKER = "token-fp "
+
+# What the emitter prints when the daemon supplied no fingerprint. Parsed back to
+# None so it is non-discriminating rather than a fingerprint literally spelled
+# "unknown" — which would otherwise compare EQUAL across two different reducers
+# and read as "no takeover", the one direction this axis must never fail in.
+TOKEN_FP_UNKNOWN = "unknown"
+
 
 def decide(rc, observed_machine, expected_machine, consecutive_errors,
-           error_threshold=DEFAULT_ERROR_THRESHOLD):
+           error_threshold=DEFAULT_ERROR_THRESHOLD,
+           observed_token_fp=None, expected_token_fp=None):
     """Pure decision function — no I/O, so tests can drive every branch.
 
-    Returns {verdict, reason, consecutive_errors, expected_machine}.
-    `consecutive_errors` in the result is the NEW value to persist.
+    Returns {verdict, reason, consecutive_errors, expected_machine,
+    expected_token_fp}. Both `expected_*` values in the result are the NEW
+    values to persist, as is `consecutive_errors`.
+
+    The token-fp pair is KEYWORD-with-default so every pre-existing positional
+    call (and every test pinning the 4/5-arg shape) stays valid and keeps its
+    old behaviour exactly: absent fingerprints are non-discriminating, so a
+    caller that never learned to pass them gets today's machine-only decision
+    rather than a new wind-down. That is the required direction for a
+    mixed-version fleet — see the module docstring's FAIL-SAFE ASYMMETRY note.
     """
     if rc == 0 and not observed_machine:
         # F5 (): rc==0 ALONE is not proof of life. `runner-claim.sh
@@ -121,6 +163,7 @@ def decide(rc, observed_machine, expected_machine, consecutive_errors,
                            f"claim, not a live reducer"),
                 "consecutive_errors": n,
                 "expected_machine": expected_machine,
+                "expected_token_fp": expected_token_fp,
             }
         return {
             "verdict": VERDICT_CONTINUE,
@@ -128,11 +171,16 @@ def decide(rc, observed_machine, expected_machine, consecutive_errors,
                        f"{n}/{error_threshold} consecutive — not yet decisive"),
             "consecutive_errors": n,
             "expected_machine": expected_machine,
+            "expected_token_fp": expected_token_fp,
         }
 
     if rc == 0:
         # Live claim. Counter resets — a run of transient faults that ends in a
         # successful poll was a blip, not a dying reducer.
+        #
+        # Machine is checked BEFORE token fp only because a cross-box takeover
+        # changes BOTH, and naming the two boxes is the more useful diagnostic.
+        # Neither ordering changes any verdict.
         if expected_machine and observed_machine and observed_machine != expected_machine:
             return {
                 "verdict": VERDICT_WIND_DOWN,
@@ -141,6 +189,31 @@ def decide(rc, observed_machine, expected_machine, consecutive_errors,
                            f"a reducer on {expected_machine!r}"),
                 "consecutive_errors": 0,
                 "expected_machine": expected_machine,
+                "expected_token_fp": expected_token_fp,
+            }
+        if (expected_token_fp and observed_token_fp
+                and observed_token_fp != expected_token_fp):
+            # SAME-BOX reducer restart — the axis machine_id structurally cannot
+            # see. The claim row is LIVE on the machine this Body expects, but
+            # the runner_token behind it was re-minted, which happens only when
+            # the old claim was released or stale-broken and a NEW runner
+            # acquired it. That new runner did not fork this Body, so nobody
+            # will merge its work.
+            #
+            # Both operands are digests, never the raw token, so printing them
+            # is safe AND is the whole diagnostic value of the axis — a reader
+            # can see that the identity moved without ever holding the
+            # credential (owncloud_backend.runner_token_fingerprint).
+            return {
+                "verdict": VERDICT_WIND_DOWN,
+                "reason": (f"reducer restart: claim is still LIVE on "
+                           f"{observed_machine or 'unknown-machine'!r}, but the "
+                           f"runner token was re-minted (fp "
+                           f"{expected_token_fp} -> {observed_token_fp}) — a new "
+                           f"runner holds the claim and did not fork this Body"),
+                "consecutive_errors": 0,
+                "expected_machine": expected_machine,
+                "expected_token_fp": expected_token_fp,
             }
         return {
             "verdict": VERDICT_CONTINUE,
@@ -148,6 +221,12 @@ def decide(rc, observed_machine, expected_machine, consecutive_errors,
             "consecutive_errors": 0,
             # First LIVE poll learns the machine; later ones keep it.
             "expected_machine": expected_machine or observed_machine,
+            # Same self-bootstrapping for the fp — and note the `or` is what
+            # makes an ABSENT observation non-destructive: a daemon that predates
+            # the field (observed None) leaves a previously-learned fp in place
+            # rather than erasing it, so a fleet that upgrades mid-session does
+            # not lose the axis it had already armed.
+            "expected_token_fp": expected_token_fp or observed_token_fp,
         }
 
     if rc in TRANSIENT_RCS:
@@ -161,6 +240,7 @@ def decide(rc, observed_machine, expected_machine, consecutive_errors,
                            f"long to keep claiming work"),
                 "consecutive_errors": n,
                 "expected_machine": expected_machine,
+                "expected_token_fp": expected_token_fp,
             }
         return {
             "verdict": VERDICT_CONTINUE,
@@ -168,6 +248,7 @@ def decide(rc, observed_machine, expected_machine, consecutive_errors,
                        f"{n}/{error_threshold} consecutive — not yet decisive"),
             "consecutive_errors": n,
             "expected_machine": expected_machine,
+            "expected_token_fp": expected_token_fp,
         }
 
     # rc == 4, or anything unrecognised. Both resolve toward the fail-safe:
@@ -181,6 +262,7 @@ def decide(rc, observed_machine, expected_machine, consecutive_errors,
                    f"never-promote invariant"),
         "consecutive_errors": 0,
         "expected_machine": expected_machine,
+        "expected_token_fp": expected_token_fp,
     }
 
 
@@ -201,16 +283,61 @@ def _parse_machine(stdout):
     Format: ... — 'zeta' is RUNNING on 'cc-02', heartbeat 272s old ...
     Returns None when absent; decide() treats an unknown machine as
     non-discriminating rather than as a takeover.
+
+    LINE-SCOPED, for the same reason :func:`_parse_token_fp` is, and it was NOT
+    until 2026-08-17 (g-306-224 fresh-eyes). Without the ``split`` below, ``rest``
+    runs to the end of the WHOLE capture, so a LIVE line truncated between the
+    opening and closing quote — an ssh/pipe cut, a bounded read, an OOM kill
+    mid-write — lets ``find("'", 1)`` match a quote on a LATER line. Measured on
+    ``"...— 'zeta' is RUNNING on 'cc-0\\n[warn] peer 'cc-99' busy"``: returned
+    ``'cc-0\\n[warn] peer '``, which differs from expected_machine and produced
+    verdict ``wind-down`` on a HEALTHY reducer. That is this module's
+    fail-UNSAFE direction, and truncated output is likeliest exactly when a
+    worker is being polled during trouble. ``_parse_token_fp`` returned None on
+    the identical input — the newer sibling was hardened and this one was not,
+    which is the parity gap rb-1915 / guard-1924 name. Both are now pinned to
+    the SAME truncation fixture so the next reader cannot harden one alone.
     """
     marker = LIVE_MARKER
     i = stdout.find(marker)
     if i < 0:
         return None
-    rest = stdout[i + len(marker):]
+    rest = stdout[i + len(marker):].split("\n", 1)[0]
     if not rest.startswith("'"):
         return None
     j = rest.find("'", 1)
     return rest[1:j] if j > 0 else None
+
+
+def _parse_token_fp(stdout):
+    """Pull the runner-token FINGERPRINT off that SAME LIVE summary line.
+
+    Format: ... heartbeat 272s old (threshold 3900s), token-fp 1f4c0a9b2e6d8035
+
+    Scoped to the LIVE line deliberately — the marker is searched only AFTER
+    LIVE_MARKER and only to the end of THAT line — so a `token-fp` string
+    appearing anywhere else in captured stderr (a traceback quoting this
+    module, a peer's diagnostic) cannot be mistaken for this claim's
+    fingerprint. A mis-scoped read here would be worse than no read: it would
+    manufacture a spurious "the fp changed" and wind down a healthy worker.
+
+    Returns None when absent, unparsable, or literally TOKEN_FP_UNKNOWN.
+    decide() treats a None fp as NON-discriminating, never as a change.
+    """
+    i = stdout.find(LIVE_MARKER)
+    if i < 0:
+        return None
+    line = stdout[i:].split("\n", 1)[0]
+    j = line.find(TOKEN_FP_MARKER)
+    if j < 0:
+        return None
+    rest = line[j + len(TOKEN_FP_MARKER):].strip()
+    if not rest:
+        return None
+    fp = rest.split()[0].strip(",.;:'\"")
+    if not fp or fp == TOKEN_FP_UNKNOWN:
+        return None
+    return fp
 
 
 def poll(agent, agent_dir, sid, scripts_dir, error_threshold=DEFAULT_ERROR_THRESHOLD):
@@ -236,6 +363,12 @@ def poll(agent, agent_dir, sid, scripts_dir, error_threshold=DEFAULT_ERROR_THRES
         state.get("expected_machine"),
         int(state.get("consecutive_errors") or 0),
         error_threshold,
+        # A state file written before  carries no expected_token_fp, so
+        # .get() yields None and the fp axis is simply non-discriminating until
+        # the first LIVE poll learns one. That is the whole upgrade path — no
+        # migration, and no wind-down caused by the upgrade itself.
+        observed_token_fp=_parse_token_fp(combined),
+        expected_token_fp=state.get("expected_token_fp"),
     )
     result["rc"] = proc.returncode
     result["poll_output"] = combined.strip()[:400]
@@ -246,6 +379,7 @@ def poll(agent, agent_dir, sid, scripts_dir, error_threshold=DEFAULT_ERROR_THRES
         sp.write_text(json.dumps({
             "consecutive_errors": result["consecutive_errors"],
             "expected_machine": result["expected_machine"],
+            "expected_token_fp": result["expected_token_fp"],
         }), encoding="utf-8")
     except Exception as exc:
         # F1 (). The old comment here read "never let a state-write
@@ -282,13 +416,20 @@ def poll(agent, agent_dir, sid, scripts_dir, error_threshold=DEFAULT_ERROR_THRES
 def main(argv):
     if len(argv) > 1 and argv[1] == "decide-only":
         # Test/inspection seam: decide() over argv, no daemon, no state file.
-        # rc observed expected consecutive [threshold]
+        # rc observed expected consecutive [threshold] [observed_fp] [expected_fp]
+        # The two fp args are trailing and optional so every existing 5/6-arg
+        # invocation keeps its exact meaning; an empty string means "absent",
+        # matching what _parse_token_fp returns for a fp-less LIVE line.
         rc = int(argv[2])
         observed = argv[3] or None
         expected = argv[4] or None
         consecutive = int(argv[5])
         threshold = int(argv[6]) if len(argv) > 6 else DEFAULT_ERROR_THRESHOLD
-        out = decide(rc, observed, expected, consecutive, threshold)
+        observed_fp = (argv[7] or None) if len(argv) > 7 else None
+        expected_fp = (argv[8] or None) if len(argv) > 8 else None
+        out = decide(rc, observed, expected, consecutive, threshold,
+                     observed_token_fp=observed_fp,
+                     expected_token_fp=expected_fp)
         print(json.dumps(out))
         return 0 if out["verdict"] == VERDICT_CONTINUE else 1
 

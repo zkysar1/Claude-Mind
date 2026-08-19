@@ -98,7 +98,17 @@ Trigger evolution check — the system evaluates its own strategy and generates 
        - Is encoding_gate rejecting too many observations? → lower threshold
        - Are evolution triggers firing too often/rarely? → adjust thresholds
        - Is the consolidation budget consistently maxing out? → increase max
-       - Are skills hitting max_skills ceiling? → increase if quality is high
+       - Are skills hitting max_skills ceiling? → the cap is RATCHET-DOWN ONLY:
+         tighten it, or retire skills. Do NOT try to raise it. `modifiable.max_skills`
+         in core/config/skill-gaps.yaml is {min: 10, max: 100, default: 100}, so the
+         modifiable MAXIMUM equals the default and step 104's bounds validation
+         refuses every increase. This line used to read "increase if quality is high",
+         which sent readers after a change the bounds cannot express (g-115-5533).
+         The one-way bound is deliberate, not an oversight: every skill's name and
+         description is loaded into the system prompt at startup, so the corpus is a
+         pure additive ratchet — forging adds and nothing subtracts — and a ceiling
+         that can only tighten is the counter-pressure (learning-philosophy.md rule 5).
+         Measured 2026-08-11: 116 skill dirs against a cap of 100.
 
      If change warranted:
        Validate new_value is within [min, max] bounds from config modifiable section
@@ -467,21 +477,33 @@ Trigger evolution check — the system evaluates its own strategy and generates 
        high_count = count where priority == "HIGH"
        IF active_count > 0 AND (high_count / active_count) > portfolio_review.priority_concentration_warn:
            Log: "PORTFOLIO WARN: {high_count}/{active_count} aspirations are HIGH — priority inflation detected"
-           # Identify demotion candidates: HIGH aspirations with no recent activity
-           # last_worked is available in compact data (null = never worked on)
+           # Identify demotion candidates: HIGH aspirations with no recent activity.
+           # last_selected is the LIVE recency field (stamped by aspirations.py /
+           # aspirations_write.py when a goal is selected from the aspiration).
+           # It is NOT last_worked: that field has ZERO writers anywhere and is
+           # absent from every live record, so this branch read permanently null
+           # (g-115-3097, measured 2026-08-10 — 0/28 world aspirations carry the
+           # key; it survives only as a seeded null in the bootstrap templates,
+           # which is what made it look real). The comment formerly here claimed
+           # "last_worked is available in compact data" — that claim was FALSE and
+           # was the thing making the wrong field look justified to a reader: 0 of
+           # 23 rendered compact records carried the key (measured 2026-07-29).
            stale_hours = portfolio_review.stale_threshold_sessions * 24
            FOR EACH HIGH aspiration:
                IF asp has no in-progress goals:
-                   # last_worked must be POPULATED to be evidence of staleness.
+                   # The recency field must be POPULATED to be evidence of staleness.
                    # The former `is null OR ...` form demoted every HIGH aspiration
                    # on deployments where the field is never written (measured
                    # 2026-07-30, g-029-82: null on all 9 HIGH aspirations INCLUDING
                    # ones at 78/97 and 78/92 goals completed — heavily worked, not
-                   # idle). Null means UNPOPULATED here, not "never worked on", and
-                   # demoting 9 of 9 flattens the priority signal rather than fixing
-                   # its inflation. If last_worked is null, derive recency from the
-                   # goals' own completed_date / last_modified, or skip the aspiration.
-                   IF asp.last_worked is NOT null AND hours_since(asp.last_worked) > stale_hours:
+                   # idle). KEEP that guard: it remains correct now that the field
+                   # is a real one, and it still covers records that legitimately
+                   # carry null — 10 of 28 on 2026-08-10, ALL of them asp-xw-*
+                   # cross-world imports, which per guard-2829 are an inbound queue
+                   # rather than portfolio entries and must not be read as idle HIGH
+                   # work. For a null last_selected, derive recency from the goals'
+                   # own completed_date / last_modified, or skip the aspiration.
+                   IF asp.last_selected is NOT null AND hours_since(asp.last_selected) > stale_hours:
                        Log: "PORTFOLIO DEMOTE: {asp.id} '{asp.title}' — HIGH with no activity for {stale_hours}+ hours"
                        Demote priority — field-merge, single positional call (daemon merges only this field):
                        Bash: aspirations-update.sh {asp.id} priority MEDIUM
@@ -715,7 +737,15 @@ Trigger evolution check — the system evaluates its own strategy and generates 
    (Stage 1: generation-time criteria, Stage 2: post-generation archive comparison).
    See create-aspiration Step 5. No separate filtering needed here.
 5. **Aspiration cap enforcement**: If > `max_active` aspirations exist:
-   - Use `aspirations-retire.sh --source {asp.source} <asp-id>` for never-started aspirations (no goals completed, last_worked is null)
+   - FIRST exclude `asp-xw-*` cross-world imports from cap-driven retirement entirely.
+     They are an inbound queue, not portfolio entries (guard-2829), and each arrives as
+     a single-goal aspiration with a null recency field — precisely the shape the
+     never-started branch below retires. Retiring one DISCARDS unprocessed work sent by
+     a peer deployment. 10 of 28 active aspirations were this shape on 2026-08-10.
+   - Use `aspirations-retire.sh --source {asp.source} <asp-id>` for never-started aspirations (no goals completed, `last_selected` is null)
+     — NOT `last_worked`: that field has zero writers and read null on every record, so
+     this branch was taken unconditionally and an aspiration WITH progress would have
+     been retired rather than completed (g-115-3097, measured 2026-08-10)
    - Use `aspirations-complete.sh --source {asp.source} <asp-id>` for aspirations that had progress
    - Then `aspirations-archive.sh` for sweep
    - Never exceed the cap
@@ -1159,16 +1189,43 @@ For each `recommendation` in {retire, tighten, widen, investigate, inert_candida
    Quote the gate's `fn_description` from gates.yaml as a hint about what's
    escaping.
 5. For `investigate`: READ the record's `reason` field before choosing a
-   priority — the evaluator emits `investigate` for at least TWO situations
+   priority — the evaluator emits `investigate` for at least THREE situations
    that need OPPOSITE responses, and collapsing them into the urgent reading
    is wrong (g-029-82):
-   - `fail_open` count > 0 (gate-retirement-eval.py ~L63) → the gate CODE has
-     a bug. File a HIGH-priority Investigate goal.
+   - `fail_open` count > 0 (gate-retirement-eval.py ~L63) → the gate MAY have
+     a code bug. **Do NOT file HIGH on this counter alone — verify the gate
+     actually threw. See the third bullet.**
    - an all-noop gate whose `fn_cost` outranks `fp_cost` → its own `reason`
      says this is "typically a WORKING preventive guard whose rare guarded
      condition did not occur in-window, NOT a dead gate." File a MEDIUM Idea
      goal asking whether the gate's SCOPE is right. Do NOT report a healthy
      guard as a code bug.
+   - **`fail_open` that is really a correct DECLINE mislabelled by the
+     decision taxonomy** — the gate refused bad input exactly as designed and
+     logged that refusal as `fail_open`. This is a taxonomy defect one layer
+     up from the gate code, and the first bullet's wording sends you at the
+     code. It has now manufactured a phantom investigation TWICE on the same
+     gate: a peer deployment filed HIGH g-001-292, and g-115-4180 (pending)
+     reproduced the premise as INVERTED — `printf '' | py -3
+     core/scripts/store_dupe_warn.py --store guardrails` returns rc=0 and logs
+     `{"decision":"fail_open","extra":{"reason":"JSONDecodeError"}}`,
+     byte-identical to the records under investigation. File NOTHING for a
+     gate whose taxonomy defect is already tracked.
+
+   **THE DISCRIMINATOR, and it is one read.** Before filing on `fail_open`,
+   open the actual firing records in `meta/gate-firings.jsonl` and look for
+   evidence the gate THREW. Do not take the recommendation's own `reason`
+   text as that evidence — measured 2026-08-11 (echo, hostname cc-03, uname -r
+   6.8.0-136-generic), the emitted reason instructs you to "inspect the
+   `gate_error` field on those firings" and **that field does not exist in the
+   firing schema at all**: all 119 `store-dupe-warn` fail_open records carry
+   keys `agent, caller, decision, extra, gate_id, payload_hash,
+   schema_version, session_id, ts` and nothing else. So the advice cannot be
+   followed, and its unfollowability is itself the tell — a genuine crash
+   would have left a trace somewhere. Read `extra.reason` instead: a value
+   like `JSONDecodeError` on empty stdin is a DECLINE, not a crash.
+   (guard-1675: an absent field is not a zero. rb-245: probe the schema before
+   concluding from a count.)
 6. For `inert_candidate`: file an Investigate goal to verify the gate is
    truly inert and route it to retirement or telemetry re-enable. The
    evaluator emits this when a prior retire/tighten/widen recommendation

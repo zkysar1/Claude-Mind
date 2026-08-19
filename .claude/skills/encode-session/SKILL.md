@@ -103,6 +103,25 @@ session — never reconstructed from prior-session memory (per
    # PROJECT_ROOT, no `.git` of its own) and reports 0 lines at rc=0 on an
    # ignored subtree. It reads exactly like a clean tree. guard-1947: an
    # instrument that cannot see is not one that saw nothing.
+   #
+   # SECOND BLIND SPOT, SAME CLASS, AND IT COSTS TRACKED FRAMEWORK CODE:
+   # `git status` CANNOT SEE STASHED WORK (g-115-6265, measured live 2026-08-14).
+   # This is a SHARED working tree with one git index. A partner agent that needs
+   # to clear the tree to unblock its own push will `git stash` YOUR uncommitted
+   # tracked changes — after which git status is clean-looking and this probe
+   # under-reports the session by however much was stashed. Measured: 226 lines
+   # of written-and-tested framework code reported as an almost-empty session.
+   #
+   # THE FINGERPRINT IS AN ASYMMETRY, and it is visible right here in step 1's
+   # own output: `git stash` without `-u` takes TRACKED changes and LEAVES
+   # untracked files, so the signature is a `??` new file whose implementation
+   # is absent from both HEAD and the working tree. If step 4 recalls writing
+   # code that step 1 cannot see — especially "I wrote a test for code that
+   # does not exist" — run `git stash list` BEFORE concluding it was never
+   # written or was reverted. Recover with `git stash apply` (3-way merge, and
+   # it KEEPS the stash), never `git apply` (straight patch; fails the moment
+   # upstream touched the same region, which is exactly when you need it).
+   # Full protocol incl. the inverted stash-overlap filter: guard-3796.
 2. Read agents/<agent>/session/working-memory.yaml
 3. Bash: aspirations-read.sh --summary
 4. Identify scope from in-context conversation memory:
@@ -843,6 +862,56 @@ every substantive assistant-mode turn and surfaces a nudge at multiples of
 counter must restart at 0 — otherwise the nudge re-fires on every
 subsequent turn (10, 20, 30, ...) instead of waiting for a fresh window.
 
+### Phase Final.5: Session-Close Commit (g-115-6126)
+
+Runs AFTER the summary block and proposals, BEFORE the Return Protocol
+terminal call. This is the chat-mode analogue of the loop's iteration-close
+commit, and it exists because assistant mode otherwise has NO commit/push
+obligation anywhere: `core/config/modes/assistant.md`, `respond/SKILL.md`,
+and `stop/SKILL.md` contain zero git protocol (measured 2026-08-13/14), the
+graceful-stop D6.65 push-flush runs only on the RUNNING-loop path, and
+`iteration-push.sh` self-heal-commits ONLY `agents/<self>/*` churn
+(g-115-2249 pathspec) — so a framework edit (`core/**`, `.claude/**`,
+`CLAUDE.md`) made in assistant mode is committed by NOTHING and sits
+uncommitted until a hand-sweep (measured: the g-115-6098 edit sat 01:05 →
+~10:20 on 2026-08-13 until swept as 77a8bd80a; three such hand-sweeps on
+08-11/12/13 are exactly this step, done manually).
+
+```
+# 1. Commit ALL tracked churn (framework + agent) with standard attribution.
+#    iteration-commit.sh no-ops on a clean tree, filters sensitive patterns
+#    (.env*, *.key, ...) and partner WIP (cross-agent mtime filter) — run it
+#    unconditionally. --outcome deep is REQUIRED: the script no-ops on
+#    routine by design, and a session that reached this skill has learning
+#    writes worth committing.
+#    THE `source` IS LOAD-BEARING, NOT DECORATION (measured 2026-08-19): a
+#    bare Bash tool call has $PROJECT_ROOT UNSET, so `--repo "$PROJECT_ROOT"`
+#    passes an EMPTY value and the script exits 1 with
+#    "missing required flag(s): --goal-id, --title, --outcome, --repo are all
+#    required" — naming all four flags you definitely passed. That error reads
+#    as a broken script, and an LLM that believes it skips the commit, which
+#    restores the exact assistant-mode gap g-115-6126 added this step to close.
+Bash: source core/scripts/_paths.sh && bash core/scripts/iteration-commit.sh \
+        --goal-id encode-session \
+        --title "session-close learning flush" --outcome deep \
+        --type chore --repo "$PROJECT_ROOT"
+
+# 2. Integrate + push (fetch, merge --no-edit — i.e. pull --no-rebase — then
+#    push). Same shared component the loop and D6.65 use; fail-soft by
+#    contract, so a network blip degrades to "committed locally, push next
+#    session" and is logged loudly. Never let a push failure block the
+#    terminal call.
+Bash: bash core/scripts/iteration-push.sh
+```
+
+**MIRROR ASYMMETRY — do NOT copy this step to `/aspirations-spark`.** The
+header rule ("the two skills must evolve together") covers the ENCODING
+lanes. This step is deliberately encode-session-ONLY: the autonomous loop
+already commits at iteration-close (`iteration-commit.sh` from
+state-update/iteration-close wiring) and pushes at `do_productivity_check`,
+so mirroring this step into the loop path would double-commit every
+iteration. The asymmetry is the fix, not an oversight.
+
 ## Chaining
 
 - **Called by**: User (`/encode-session`); agent (rare — only at end of complex
@@ -854,7 +923,9 @@ subsequent turn (10, 20, 30, ...) instead of waiting for a fresh window.
   `aspirations-add-goal.sh`, `aspirations-update-goal.sh`,
   `pattern-signatures-read.sh`, `spark-questions-increment.sh`,
   `meta-set.sh`, `meta-log-append.sh`, `wm-append.sh`,
-  `curriculum-contract-check.sh`, `git status / diff / log`.
+  `curriculum-contract-check.sh`, `git status / diff / log`,
+  `iteration-commit.sh` + `iteration-push.sh` (Phase Final.5 session-close
+  commit — g-115-6126).
 - **Modifies**: `world/knowledge/tree/`, `world/reasoning-bank.jsonl`,
   `world/guardrails.jsonl`, `world/aspirations.jsonl`,
   `agents/<agent>/aspirations.jsonl`, `agents/<agent>/experience/`,

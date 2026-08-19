@@ -69,8 +69,10 @@ def _run(argv, input_text=None, timeout=30):
 def _close_key(goal_id):
     """Idempotency token naming THIS goal's close, or "" when underivable.
 
-    `{goal_id}:{selected_at}` read from the iteration checkpoint. Chosen against
-    the live store rather than assumed (g-115-4542):
+    `{goal_id}:{lastAchievedAt or completed_at}`, read from the GOAL RECORD.
+
+    Three candidate sources were measured against the live store and rejected
+    (g-115-4542), and they stay rejected:
 
       - goal_id ALONE is wrong. Measured on 7,814 entries: 2,066 repeat rows
         across 332 goals, dominated by asp-001 recurring cadence closes
@@ -79,33 +81,69 @@ def _close_key(goal_id):
         snapshots for DIFFERENT goals land as little as 1s apart (375 pairs
         under 60s), while legitimate same-goal recurring re-closes reach down
         to 31s. The populations overlap; no threshold separates them.
-      - completed_at is wrong. Recurring goals carry completed_at=None and
-        advance lastAchievedAt instead, so it would collapse every recurring
-        close to one key and destroy the 2,066 rows above.
+      - completed_at ALONE is wrong, and this is the half that matters:
+        recurring goals never get one. They cycle back to `pending` and advance
+        `lastAchievedAt`/`achievedCount` instead, so keying on completed_at
+        would mint the SAME key for every cadence close and destroy the 2,066
+        rows above.
 
-    selected_at names the SELECTION, and one selection yields one close — so it
-    identifies the close event without a daemon round-trip. The checkpoint is a
-    local file cleared by iteration-close's do_productivity_check(), which runs
-    AFTER do_state_update(), so it is live for both the normal close and the
-    post-hoc recovery window that follows it.
+    THE COALESCE IS WHAT MAKES IT WORK, and the order is load-bearing.
+    `lastAchievedAt` first: it exists only on the recurring shape and advances
+    exactly once per close (daemon `complete-by`, aspirations_write.py — it
+    stamps `lastAchievedAt = now` and `achievedCount += 1` in the same block).
+    `completed_at` second: the one-shot shape, which closes once. Measured on
+    the live store 2026-08-10 — recurring g-001-01 carries lastAchievedAt +
+    achievedCount=83 and NO completed_at; one-shot g-115-4542 carries
+    completed_at and neither of the other two. The two shapes are disjoint, so
+    the coalesce is a shape selector, not a fallback chain.
 
-    FAIL-OPEN on every uncertainty (missing/corrupt checkpoint, no selected_at,
-    or a checkpoint naming a DIFFERENT goal): returns "", the flag is omitted,
+    WHY NOT THE ITERATION CHECKPOINT (the original source, g-115-4542, replaced
+    by g-115-5549): it named `selected_at` from
+    `agents/<agent>/session/iteration-checkpoint.json` — a single box-local slot
+    written at claim time. Any interleaving between claim and close leaves it
+    naming an EARLIER goal, the `cp.get("goal_id") != goal_id` guard fires, and
+    the key is silently "". Measured 2026-08-09 on cc-04: of the closes eligible
+    after that fix landed, NONE carried a key — including the fix's own close 11
+    seconds later, where the checkpoint still held g-001-01 from 43 minutes
+    prior. The protection was present in the code and inert at runtime.
+    `aspirations-claim.sh`'s own comment already described that anchor as
+    unreliable and silently fail-open; it was not retrieved when the source was
+    picked. The goal record has no such slot: it is the thing being closed.
+
+    This costs one daemon round-trip per close, which the checkpoint source
+    avoided. That trade is the point — a local read that is wrong is not cheaper
+    than a remote read that is right.
+
+    FAIL-OPEN on every uncertainty (query failure, unparseable payload, no
+    matching record, neither field present): returns "", the flag is omitted,
     and the append is unconditional exactly as before. A wrong key would
     suppress a legitimate row, which is strictly worse than the double-count
-    this guards against.
+    this guards against. Unlike the checkpoint source, a failure here is
+    OBSERVABLE — cmd_velocity emits `impk_close_key_underivable`, because the
+    defect this replaced was invisible precisely where it was wrong.
     """
     if not goal_id:
         return ""
+    out, _err, rc = _run(
+        ["aspirations-query.sh", "--goal-field", "id", goal_id, "--full"])
+    if rc != 0:
+        return ""
     try:
-        cp_path = Path(AGENT_DIR) / "session" / "iteration-checkpoint.json"
-        cp = json.loads(cp_path.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001 — absent/corrupt/unreadable all fail open
+        rows = json.loads(out or "[]")
+    except (json.JSONDecodeError, ValueError, TypeError):
         return ""
-    if not isinstance(cp, dict) or cp.get("goal_id") != goal_id:
+    if not isinstance(rows, list):
         return ""
-    selected_at = str(cp.get("selected_at") or "").strip()
-    return f"{goal_id}:{selected_at}" if selected_at else ""
+    # The raw store key is `id`; the query endpoint ALSO projects `goal_id`.
+    # Match either — keying on one alone would break silently if the projection
+    # changed, and this function's failure mode is a suppressed real row.
+    rec = next((r for r in rows
+                if isinstance(r, dict)
+                and goal_id in (r.get("id"), r.get("goal_id"))), None)
+    if rec is None:
+        return ""
+    stamp = str(rec.get("lastAchievedAt") or rec.get("completed_at") or "").strip()
+    return f"{goal_id}:{stamp}" if stamp else ""
 
 
 def compute_learning_value(tree_updated, artifacts_count, encoding_score, findings_count):
@@ -223,6 +261,17 @@ def cmd_velocity(args):
                 impk_flags.append("impk_duplicate_suppressed")
         except (json.JSONDecodeError, ValueError, TypeError, AttributeError):
             pass
+    # : THE OTHER HALF OF THE OBSERVABILITY GAP. The block above says
+    # "the guard held"; nothing said "the guard was never reached". The previous
+    # source failed silently for 100% of real closes and the only ledger that
+    # existed counted an ABSENT checkpoint — the mode actually observed (a
+    # checkpoint PRESENT but naming a different goal) was recorded nowhere at
+    # all, which is why an inert guard read as a working one for a full day.
+    # Informational, like its sibling: HARD_FAIL_FLAGS is a denylist and this is
+    # not in it, so an underivable key never fails the audit. Gated on args.goal
+    # so a goal-less legacy invocation stays byte-identical.
+    if args.goal and not close_key:
+        impk_flags.append("impk_close_key_underivable")
 
     return {
         "subcommand": "velocity",

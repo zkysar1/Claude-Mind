@@ -140,6 +140,96 @@ def _delete_checkpoint_safely(path, reason: str) -> bool:
         return False
 
 
+def _describe_discarded_checkpoint(checkpoint, wm, skip_slots=None):
+    """One-line summary of what a checkpoint held, for the path that DELETES it.
+
+    g-115-4882. The WRITE side counts what it saved — precompact-checkpoint.py
+    logs `{eq_count} encoding, {non_null}/{total} slots` — and the DISCARD side
+    counted nothing, printing only the mtime delta. So a real encoding_queue
+    loss on the stale-skip path was unmeasurable AFTER THE FACT BY CONSTRUCTION:
+    the checkpoint is unlinked, and precompact's count only ever went to stderr.
+    "No loss reported" read identically to "loss never looked for" (guard-1760,
+    rb-245 family).
+
+    This is deliberately the OBSERVABILITY half ONLY. Whether the stale-skip
+    should restore encoding_queue at all is a merge-semantics question the
+    SKIP_SLOTS comment above already names as open; this function takes no
+    position on it and changes no behavior. It exists so that decision finally
+    has a denominator.
+
+    Reports two things:
+      - the discarded encoding_queue count, distinguishing ABSENT from EMPTY.
+        precompact writes that key unconditionally, so absent means a format or
+        version mismatch rather than an empty queue, and collapsing the two
+        would hide exactly that (guard-1641: a count-like 0 is ambiguous
+        between "the producer counted zero" and "the producer never ran").
+      - slots the checkpoint held NON-EMPTY while live wm holds them empty or
+        null — the ones whose loss the live file does not already cover.
+
+    SKIP_SLOTS are excluded AND said to be excluded: they are never restored by
+    design, so naming them would report unrecoverable loss where none exists,
+    while dropping them silently would overstate the report's coverage — which
+    is the same reporting failure this function was written to end.
+
+    Every unreadable input returns UNKNOWN rather than a reassuring zero, for
+    the same reason: the caller is about to delete the only copy.
+
+    Pure — takes the two already-loaded documents, touches no filesystem and no
+    module globals. That is the testability contract `_is_checkpoint_stale` and
+    `_delete_checkpoint_safely` state for themselves, and it is what lets the
+    exec-slice tests in core/scripts/tests reach it without a live agent dir.
+    """
+    skip = SKIP_SLOTS if skip_slots is None else skip_slots
+
+    if not isinstance(checkpoint, dict):
+        return ("checkpoint contents UNKNOWN (not a mapping) — that is not "
+                "evidence it was empty")
+
+    if "encoding_queue" in checkpoint:
+        eq = checkpoint.get("encoding_queue") or []
+        eq_desc = f"{len(eq)} encoding_queue item(s)"
+    else:
+        eq_desc = ("encoding_queue key ABSENT from the checkpoint (precompact "
+                   "writes it unconditionally, so this is a format mismatch, "
+                   "NOT an empty queue)")
+
+    all_slots = checkpoint.get("all_slots") or {}
+    if not isinstance(all_slots, dict):
+        all_slots = {}
+
+    if not isinstance(wm, dict):
+        return (f"{eq_desc}; slot comparison UNAVAILABLE (live working memory "
+                f"unreadable) — the {len(all_slots)} checkpoint slot(s) are "
+                f"unclassified, NOT known-safe")
+
+    live = wm.get("slots") or {}
+    if not isinstance(live, dict):
+        live = {}
+
+    def _empty(value):
+        return value is None or value == [] or value == {} or value == ""
+
+    at_risk = sorted(
+        name for name, val in all_slots.items()
+        if name not in skip and not _empty(val) and _empty(live.get(name))
+    )
+    n_skipped = sum(1 for name in all_slots if name in skip)
+    if at_risk:
+        risk_desc = ", ".join(at_risk)
+    elif not all_slots:
+        # Same guard-1641 distinction the encoding_queue branch makes above, and
+        # it has to be made here too or the function is inconsistent with its own
+        # argument: a checkpoint carrying NO slots and one whose slots are all
+        # covered by live wm are different facts, and the reassuring phrasing
+        # belongs only to the second.
+        risk_desc = "n/a — the checkpoint carried NO slots at all"
+    else:
+        risk_desc = "none (every non-empty slot is also populated in live wm)"
+    return (f"{eq_desc}; slots held non-empty here but empty/null in live wm: "
+            f"{risk_desc} ({n_skipped} SKIP_SLOTS slot(s) excluded — never "
+            f"restored by design, so their loss here is not new)")
+
+
 def _recover_lost_loop_state():
     """Null-guarded loop_state recovery across compaction ().
 
@@ -224,6 +314,29 @@ def main():
             f"checkpoint stale (wm.yaml is {delta:.0f}s fresher than checkpoint) — "
             f"restore SKIPPED to prevent loop_state regression (g-115-684)"
         )
+        # : say WHAT is being discarded, BEFORE unlinking the only
+        # copy. Additive — the stale-skip still skips and still deletes.
+        #
+        # Fail-open and deliberately AFTER the SKIPPED line: this path never
+        # parsed the checkpoint before, so a malformed one still got deleted
+        # cleanly, and that must stay true. A diagnostic that can break the
+        # operation it describes is worse than no diagnostic (guard-1562).
+        #
+        # Both branches print to STDOUT, matching the SKIPPED line above rather
+        # than the WARN in _delete_checkpoint_safely: an unreadable checkpoint
+        # is exactly when this report matters most, and stderr is the channel a
+        # captured-output caller drops (guard-1680).
+        try:
+            _discarded = yaml.safe_load(CHECKPOINT_PATH.read_text(encoding="utf-8"))
+            _live_wm = read_wm()
+        except Exception as exc:  # noqa: BLE001 — any read/parse fault, never fatal
+            print(
+                f"  discarding: could not read checkpoint or wm for the discard "
+                f"report ({exc.__class__.__name__}: {exc}) — contents UNKNOWN, "
+                f"which is NOT the same as empty"
+            )
+        else:
+            print("  discarding: " + _describe_discarded_checkpoint(_discarded, _live_wm))
         _delete_checkpoint_safely(CHECKPOINT_PATH, "stale-skip")
         return
 

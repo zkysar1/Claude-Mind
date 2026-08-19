@@ -39,6 +39,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from _paths import AGENT_DIR
+from _dt import parse_naive_iso  # noqa: E402 -- guard-1398 SSOT, never raises
 
 
 def _now():
@@ -46,13 +47,21 @@ def _now():
 
 
 def _parse_ts(entry):
-    ts = entry.get("timestamp", "")
-    if not ts:
-        return None
-    try:
-        return datetime.fromisoformat(ts)
-    except (ValueError, TypeError):
-        return None
+    """Timestamp of a diary entry as a NAIVE datetime, or None ().
+
+    Delegates to ``_dt.parse_naive_iso`` (guard-1398 SSOT) instead of calling
+    ``datetime.fromisoformat`` directly. The raw call returns an AWARE datetime
+    for an offset-bearing stamp, while every consumer here does naive arithmetic
+    against ``_now()`` -- so a single tz-aware row raised
+    ``TypeError: can't compare offset-naive and offset-aware`` deep in the
+    caller rather than here, where it would have been obvious. The helper strips
+    tzinfo AFTER parsing, which is the part a ``.replace("Z", "")`` gets wrong.
+
+    Assumes ``entry`` is a dict; ``_load_markers`` guarantees that at its only
+    call site. Kept as an entry-shaped wrapper (rather than taking the raw
+    value) because that is the signature its caller already uses.
+    """
+    return parse_naive_iso(entry.get("timestamp"))
 
 
 def _load_markers(diary_path: Path):
@@ -68,6 +77,26 @@ def _load_markers(diary_path: Path):
             try:
                 e = json.loads(line)
             except json.JSONDecodeError:
+                continue
+            # : a line can parse as VALID JSON and still not be an
+            # object -- a bare array, string, number or null. All four were
+            # probed on cc-02 2026-08-08 and all four made the `.get` below
+            # raise AttributeError. The exception escaped through check_wedge()
+            # to main(), which exits 2, and recovery-gate.sh reads any nonzero
+            # as no-recovery -- so ONE malformed row disabled wedged-loop
+            # detection entirely until it aged out of the 8h trim window.
+            #
+            # The guard belongs HERE and not in the caller: phase-wedge-check's
+            # last_diary_activity already carries an identical isinstance check,
+            # and it did not help, because check_wedge calls _load_markers as
+            # its FIRST statement (guard-3001 -- a guard cannot protect what
+            # runs before it). This is the shared-loader half that fix
+            # deliberately left open.
+            #
+            # Skipped rather than coerced: a row that is not an object has no
+            # entry_type and cannot be a phase marker, so there is nothing to
+            # recover, and guessing would invent markers the diary never wrote.
+            if not isinstance(e, dict):
                 continue
             etype = e.get("entry_type")
             if etype not in ("phase_start", "phase_end"):

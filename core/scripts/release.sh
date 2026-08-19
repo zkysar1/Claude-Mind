@@ -65,11 +65,11 @@ require_value() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     major|minor|patch) KIND="$1"; shift;;
-    --summary) require_value "$1" "${2:-}"; SUMMARY="$2"; shift 2;;
+    --summary) require_value "$1" "${2:-}"; SUMMARY="$2"; shift $(( $# >= 2 ? 2 : 1 ));;
     --cross-world) CROSS_WORLD=1; shift;;
-    --recipe) require_value "$1" "${2:-}"; RECIPE="$2"; shift 2;;
-    --allow-non-breaking-cross-world) require_value "$1" "${2:-}"; ALLOW_NB_CW=1; ALLOW_NB_CW_REASON="$2"; shift 2;;
-    --force-release) require_value "$1" "${2:-}"; FORCE_RELEASE=1; FORCE_REASON="$2"; shift 2;;
+    --recipe) require_value "$1" "${2:-}"; RECIPE="$2"; shift $(( $# >= 2 ? 2 : 1 ));;
+    --allow-non-breaking-cross-world) require_value "$1" "${2:-}"; ALLOW_NB_CW=1; ALLOW_NB_CW_REASON="$2"; shift $(( $# >= 2 ? 2 : 1 ));;
+    --force-release) require_value "$1" "${2:-}"; FORCE_RELEASE=1; FORCE_REASON="$2"; shift $(( $# >= 2 ? 2 : 1 ));;
     --dry-run) DRY=1; shift;;
     -h|--help) usage; exit 0;;
     *) echo "ERROR: unknown argument: $1" >&2; usage; exit 2;;
@@ -88,11 +88,34 @@ fail() { echo "[release] ERROR: $*" >&2; exit 1; }
 # In a real cut the working tree must be clean (so the release commit carries
 # only the version bump) and we must be on main. In --dry-run these are
 # reported but not enforced (dry-run must be usable on a working tree).
-DIRTY="$(git -C "$PROJECT_ROOT" status --porcelain 2>/dev/null || true)"
+# FAIL CLOSED (). THIS IS THE WORST OF THE FIVE SITES: release.sh is
+# the sole v-tagger, so a fail-open here mints a version tag on a dirty tree,
+# upstream of everything the  provenance work protects. The old form
+# (`2>/dev/null || true`) discarded stderr AND the exit code, so any git failure
+# — most likely .git/index.lock contention from a partner's concurrent
+# iteration-commit.sh — produced an empty string that read as "clean".
+# stderr now lands IN the capture and rc is checked explicitly, so a failure is
+# non-empty and trips the dirty branch. --no-optional-locks stops this probe
+# contending for index.lock at all (verified on git 2.43.0, not assumed).
+# Sanctioned sibling idiom: iteration-commit.sh:492.
+DIRTY_RC=0
+DIRTY="$(git --no-optional-locks -C "$PROJECT_ROOT" status --porcelain 2>&1)" || DIRTY_RC=$?
+if [[ $DIRTY_RC -ne 0 ]]; then
+  DIRTY="git status failed (rc=$DIRTY_RC) — cannot verify tree is clean: ${DIRTY:-<no stderr>}"
+fi
 BRANCH="$(git -C "$PROJECT_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
 if [[ -n "$DIRTY" ]]; then
-  if [[ $DRY -eq 1 ]]; then say "[dry-run] note: working tree is dirty (would FAIL a real cut)";
-  else fail "working tree is dirty — commit or stash before cutting a release"; fi
+  # Distinguish "tree is dirty" from "probe could not run" (). Both
+  # REFUSE — that is the fail-closed guarantee — but "commit or stash" is the
+  # wrong instruction for a wedged git and would send an operator hunting for
+  # changes that are not there.
+  if [[ $DIRTY_RC -ne 0 ]]; then
+    if [[ $DRY -eq 1 ]]; then say "[dry-run] note: dirtiness probe FAILED (would FAIL a real cut): $DIRTY";
+    else fail "cannot verify the working tree is clean — refusing to tag. $DIRTY"; fi
+  else
+    if [[ $DRY -eq 1 ]]; then say "[dry-run] note: working tree is dirty (would FAIL a real cut)";
+    else fail "working tree is dirty — commit or stash before cutting a release"; fi
+  fi
 fi
 if [[ "$BRANCH" != "main" ]]; then
   if [[ $DRY -eq 1 ]]; then say "[dry-run] note: on branch '$BRANCH', not main (would FAIL a real cut)";

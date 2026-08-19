@@ -70,6 +70,28 @@ strategy_schemas:
       "reflection-strategy.yaml":
         - roi_history
         - reflection_quality_log
+        # adversarial_review LEAF counters ( fire #101, echo, 2026-08-16).
+        # Same character as roi_history: written by reflect/SKILL.md Step 0.35 purely
+        # to track "whether the pattern pays for itself", and read by NOTHING that
+        # makes a decision (measured: the only readers of adversarial_review are
+        # meta.yaml's own defaults and Step 0.35, which reads .triggers/.protocol
+        # and WRITES these three). Rolling them back loses evidence without changing
+        # behavior — the exact criterion this block states above.
+        # Live loss that motivated the entry: 2026-08-16T14:37:46-49, mc-800/801/802
+        # reverted times_fired 2->1, times_caught_bug 1->0, last_triggered
+        # 2026-08-16T11:08:27 -> 2026-04-27. The protocol had fired AND caught a bug
+        # that morning; backpressure erased the only record of it because imp@k was
+        # 0.16 ("5 consecutive goals below baseline").  fixed the MATCHING
+        # logic for allowlisted keys; this is the allowlist CONTENT gap it left.
+        # LEAVES, NOT THE BASE KEY, DELIBERATELY: _is_audit_only_field matches a base
+        # key plus any sub-part after a `[`/`.`/`_` boundary, so bare
+        # `adversarial_review` would ALSO exempt triggers.category_substrings,
+        # triggers.min_files_touched and protocol — which are genuine tunables that
+        # MUST stay rollback-eligible. Exact-match is tried first, so naming the three
+        # leaves protects the telemetry without weakening the gate on the knobs.
+        - adversarial_review.times_fired
+        - adversarial_review.times_caught_bug
+        - adversarial_review.last_triggered
       "step-attribution.yaml":
         - step_attribution
 

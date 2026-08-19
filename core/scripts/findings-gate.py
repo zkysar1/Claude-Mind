@@ -40,6 +40,61 @@ from _runtime_bash import bash_cmd  # noqa: E402  # : Windows-safe bash resoluti
 
 RESOLUTION_SUPPRESSION_CHARS = 50  # window after a match to check for resolution language
 
+# Negation disqualifier (). A trigger keyword sitting inside a NEGATED
+# clause describes something that is explicitly NOT a finding. The fleet's
+# standard exoneration idiom is "NOT caused by <goal-id>" — the way an agent
+# records that a failure is pre-existing rather than from its own change.
+#
+# DELIBERATELY REQUIRES THE NEGATION TO BE THE IMMEDIATELY PRECEDING TOKEN.
+# Measured over 13,486 real prose items (goal descriptions + experience files,
+# 774 root_cause trigger matches): this form suppresses 53, and every one of the
+# 53 was inspected individually and is a genuine negation. A 30-char window
+# suppresses 74 — 21 more — and several of those extra 21 are GENUINE findings
+# whose "not" negates a different verb ("Do NOT de-dupe before the root cause is
+# fixed", "WHY I DIDN'T USE IT — the root cause, and it is mine").
+#
+# Under-reaching is the safe direction here (guard-958): a missed suppression
+# costs one visible, skippable goal, while an over-suppression silently drops a
+# real finding. Do not widen this to a character window without re-running that
+# sample — the wide form was measured unsafe, not merely suspected.
+NEGATION_RE = re.compile(r"\b(not|never|no|without|nor|neither)\s+$", re.IGNORECASE)
+
+# Lines that carry no prose and therefore cannot name a finding.
+_MARKDOWN_RULE_RE = re.compile(r"^[-=_*]{3,}$")
+
+
+def _first_prose_fragment(text, limit=50):
+    """First prose line of `text`, truncated to `limit`, or "" if none exists.
+
+    The investigation-override path used to slice `text[:limit]` raw. On an
+    insight that opens with a markdown heading that produced a title containing
+    the heading marker AND two embedded newlines — g-335-709 was filed as
+    "Unblock: Fix # g-335-536 - findings\\n\\nResolved hypoth...". Skip blank
+    lines, headings and horizontal rules; the first real prose line names the
+    finding. Bullets are deliberately KEPT: a findings list written entirely as
+    bullets is prose-bearing, and skipping them would silently discard the
+    caller's deliberate --investigation-needs-action signal.
+    """
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#") or _MARKDOWN_RULE_RE.match(stripped):
+            continue
+        return stripped[:limit].rstrip() + ("…" if len(stripped) > limit else "")
+    return ""
+
+
+def _sanitize_fragment(fragment):
+    """Collapse all whitespace in a title fragment to single spaces.
+
+    Shared-surface invariant: no goal title may carry embedded newlines,
+    whatever signal path produced it. Both the keyword scan and the
+    investigation override converge on make_child_goal, so this is enforced
+    there rather than at each producer.
+    """
+    return re.sub(r"\s+", " ", fragment or "").strip()
+
 # Four structural signal patterns. Each is (name, match_pattern, resolution_filter_pattern).
 # match_pattern is compiled case-insensitive. resolution_filter_pattern is also
 # case-insensitive and checked in the RESOLUTION_SUPPRESSION_CHARS window
@@ -101,6 +156,21 @@ def scan_signals(insight_text):
     signals = []
     for name, match_re, resolution_re in SIGNAL_PATTERNS:
         for m in match_re.finditer(insight_text):
+            # Negation disqualifier (). Look at the text immediately
+            # before the match, confined to the CURRENT sentence — a negation in
+            # a previous sentence says nothing about this clause. Runs before the
+            # resolution filters because "is this even a claim?" is logically
+            # prior to "was this claim already resolved?".
+            sentence_head = re.split(r"[.!?\n]", insight_text[:m.start()])[-1]
+            if NEGATION_RE.search(sentence_head):
+                _gate_log(
+                    "findings-gate",
+                    "noop",
+                    trigger_matched=f"{name}:negated",
+                    caller="findings-gate.py:scan_signals",
+                    extra={"decision_path": "negation-suppression"},
+                )
+                continue
             # DO NOT SIMPLIFY: the resolution-language filter MUST check
             # BOTH the match content AND the 50-char window after. Checking
             # only the window misses resolution language inside the greedy
@@ -235,13 +305,18 @@ def load_dedup_titles(aspiration_id):
 
 def make_child_goal(signal, source_goal, source_category, insight_text):
     """Assemble the child-goal JSON per SKILL.md Step 8.5."""
+    # Shared-surface invariant (): every signal path converges here, so
+    # whitespace collapse is enforced once rather than at each producer. A goal
+    # title carrying an embedded newline breaks display, token-overlap dedup, and
+    # every line-oriented consumer downstream.
+    match = _sanitize_fragment(signal["match"])
     high_signal_types = {"root_cause", "bug_identified", "investigation_finding"}
     if signal["type"] in high_signal_types:
-        title = f"Unblock: Fix {signal['match']}"
+        title = f"Unblock: Fix {match}"
         priority = "HIGH"
         origin_prefix = "unblock:"
     else:
-        title = f"Idea: {signal['match']}"
+        title = f"Idea: {match}"
         priority = "MEDIUM"
         origin_prefix = "idea:"
     return {
@@ -252,7 +327,7 @@ def make_child_goal(signal, source_goal, source_category, insight_text):
         "participants": ["agent"],
         "category": source_category,
         "description": (
-            f"Found during {source_goal}: {signal['match']}\n\n"
+            f"Found during {source_goal}: {match}\n\n"
             f"Source: {insight_text}\n\n"
             f"Discovered by: Step 8.5 Actionable Findings Gate"
         ),
@@ -333,17 +408,30 @@ def main():
 
     # Step 2: investigation override.
     if args.is_investigation and len(signals) == 0 and args.investigation_needs_action:
-        signals.append({
-            "type": "investigation_finding",
-            "match": insight_text[:50].strip() + ("…" if len(insight_text) > 50 else ""),
-        })
-        _gate_log(
-            "findings-gate",
-            "block",
-            trigger_matched="investigation_finding",
-            caller="findings-gate.py:main",
-            extra={"decision_path": "investigation-override"},
-        )
+        fragment = _first_prose_fragment(insight_text)
+        if fragment:
+            signals.append({"type": "investigation_finding", "match": fragment})
+            _gate_log(
+                "findings-gate",
+                "block",
+                trigger_matched="investigation_finding",
+                caller="findings-gate.py:main",
+                extra={"decision_path": "investigation-override"},
+            )
+        else:
+            # No prose line anywhere in the insight, so nothing can name the
+            # finding. Filing a goal titled from a heading marker is worse than
+            # filing none — that was . Recorded as a distinct
+            # decision_path so this is visible in telemetry rather than silent.
+            print("▸ Step 8.5: investigation override requested but insight has no "
+                  "prose line to name the finding — no goal created", file=sys.stderr)
+            _gate_log(
+                "findings-gate",
+                "noop",
+                trigger_matched="investigation_finding:no-prose",
+                caller="findings-gate.py:main",
+                extra={"decision_path": "investigation-override-unnameable"},
+            )
 
     if len(signals) == 0:
         print("▸ Step 8.5: No actionable signals — passed")

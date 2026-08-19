@@ -99,14 +99,60 @@ def test_accepted_flag_is_not_flagged():
         assert skip is None, skip
 
 
-def test_universal_flags_never_flagged():
-    """--json/--source/--agent are common plumbing; flagging them would be noise."""
+def test_help_flags_are_suppressed_because_argparse_never_declares_them():
+    """--help/-h are the ONLY genuinely universal flags.
+
+    They must stay suppressed for a reason specific to them: py_flags reads
+    add_argument via AST, and argparse supplies --help without one, so a .py
+    wrapper that accepts --help perfectly well has no declaration to find.
+    Flagging it reports a real accepted flag as unknown. Measured g-115-5697:
+    emptying UNIVERSAL_FLAGS entirely surfaces exactly one finding, and it is
+    that FP (blocker-create-gate.py --help).
+    """
     with tempfile.TemporaryDirectory() as t:
         m = _fresh()
         m.SCRIPTS_DIR = _scripts(Path(t), {"one.sh": 'case "$1" in\n  --ok) ;;\nesac\n'})
-        for flag in ("--json", "--output", "--source", "--agent", "--help"):
+        for flag in ("--help", "-h"):
             finding, _ = m.audit_line(f"Bash: one.sh {flag}", {})
-            assert finding is None, f"{flag} is universal and must not be flagged"
+            assert finding is None, f"{flag} must stay suppressed"
+
+
+def test_the_four_formerly_universal_flags_are_now_CHECKED():
+    """The inverse pin, and the one that would catch a silent re-add ().
+
+    --json/--output/--source/--agent were suppressed on EVERY call site on the
+    stated ground that they are 'common plumbing'. Measured over the 467
+    SKILL.md-referenced wrappers, the most common of them appears on under a
+    quarter, and removing all four surfaces ZERO new findings across 394 real
+    call sites -- so the suppression cost nothing to drop and was hiding
+    nothing. It was not free, though: `passed -= UNIVERSAL_FLAGS` short-circuits
+    to `return None, None` BEFORE wrapper_surface() and WITHOUT recording a skip
+    reason, so a call site whose flags were all universal was counted in neither
+    the findings nor the skip census. Restoring these four moved
+    wrappers_resolved 278 -> 320.
+
+    This test asserts the OPPOSITE of the assertion it replaces. That is
+    deliberate: the old one encoded the 'common plumbing' claim as a contract,
+    so the claim could never be falsified by the suite that was supposed to
+    guard it.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        m = _fresh()
+        m.SCRIPTS_DIR = _scripts(Path(t), {"one.sh": 'case "$1" in\n  --ok) ;;\nesac\n'})
+        for flag in ("--json", "--output", "--source", "--agent"):
+            finding, _ = m.audit_line(f"Bash: one.sh {flag}", {})
+            assert finding is not None, (
+                f"{flag} must be CHECKED, not suppressed -- one.sh accepts only "
+                f"--ok, so passing {flag} is a genuine mismatch")
+            assert finding["unknown_flags"] == [flag], finding
+
+
+def test_universal_flags_holds_only_the_help_pair():
+    """Guards the constant itself, so a re-add cannot pass by editing one site."""
+    m = _fresh()
+    assert m.UNIVERSAL_FLAGS == {"--help", "-h"}, (
+        "re-adding a flag here suppresses it on EVERY call site and removes "
+        "those sites from the skip census too -- re-measure per g-115-5697 first")
 
 
 # ---- (3) THE CONSERVATISM CONTRACT -----------------------------------------

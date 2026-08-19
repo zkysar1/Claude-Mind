@@ -67,10 +67,37 @@ recovery fires automatically.
    and clearing semantics are SSOT in `session-manifest.yaml`.
 3. Writes `agents/<agent>/session/recovery-notice` with the cause (which
    conditions triggered) so the next user message surfaces a diagnostic.
+4. Appends `agents/<agent>/session/recovery-log.jsonl` — the audit trail.
 
 The script-gated nature means the LLM CANNOT call `session-state-set.sh`
-directly — it can only OBSERVE that recovery happened by reading the
-notice file or seeing state=IDLE on next entry.
+directly — it can only OBSERVE that recovery happened, via one of the two
+artifacts above.
+
+### Which artifact to read, and why it is NOT a free choice (g-115-6253)
+
+The two differ by `sync_tier` in `core/config/session-manifest.yaml`, and
+that difference decides which questions each can answer:
+
+| artifact | sync_tier | scope | use it for |
+|---|---|---|---|
+| `recovery-notice` | `machine_local` | THIS box only, one-shot (`/prime` cats then deletes it) | "did recovery fire on the box I am sitting on, just now?" |
+| `recovery-log.jsonl` | `continuity` | fleet-wide, append-only, durable | "how often has Path D fired, on which agents, and were those firings correct?" |
+
+**Never triage a cross-box or historical question with `recovery-notice`.**
+It is machine-local, so it NEVER reaches the shared store and no box can
+read another's — a fleet-wide sweep of it returns empty everywhere except
+the one machine you are on, and that empty reads exactly like "no
+recoveries happened." It is also consumed on read (`/prime` deletes it), so
+even locally it answers only about the most recent unread event.
+`recovery-log.jsonl` is the synced instrument and the only one that can
+support a false-positive audit.
+
+This is written down because the dead end has been walked: the g-115-6242
+investigation instructed readers to check every box's `recovery-notice`,
+which is structurally impossible. Any count of Path-D firings assembled
+that way is a floor, not a measurement — and one agent's absent
+`recovery-log.jsonl` is why the "5 false fires across 4 agents" figure in
+`assistant-turn-freshness.py` is itself explicitly a floor.
 
 ## Why This Is a Convention (Not Just a Rule)
 

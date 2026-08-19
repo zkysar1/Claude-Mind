@@ -28,7 +28,7 @@ while [[ $# -gt 0 ]]; do
         --recent)
             # --recent takes optional N (CLI default 5)
             if [ $# -gt 1 ] && [[ "$2" =~ ^[0-9]+$ ]]; then
-                RECENT="$2"; PASSTHROUGH+=("$1" "$2"); shift 2
+                RECENT="$2"; PASSTHROUGH+=("$1" "$2"); shift $(( $# >= 2 ? 2 : 1 ))
             else
                 RECENT="5"; PASSTHROUGH+=("$1"); shift
             fi;;

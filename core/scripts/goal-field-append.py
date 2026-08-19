@@ -99,6 +99,12 @@ RC_FIELD_SHAPE = 4
 RC_VALUE_SHAPE = 5
 RC_WRITE_FAILED = 6
 RC_VERIFY_FAILED = 7
+# 8 is deliberately UNUSED here: store-field-append.py already ships
+# RC_ANCHOR_ABSENT = 8 (a store-only concept). These two scripts are one family
+# with a shared contract, so a caller wrapping both must not have to remember
+# that rc 8 means different things on each side. Concurrent-modification is 9 on
+# BOTH — the aligned number is worth more than the smaller one.
+RC_CONCURRENT_MODIFICATION = 9
 
 
 def _run(argv, **kw):
@@ -187,6 +193,36 @@ def compose(pre: str, text: str, marker: str) -> str:
     return (pre + "\n\n" if pre else "") + text + "\n" + sentinel_for(marker)
 
 
+def cas_conflict(pre: str, current) -> "str | None":
+    """Describe a concurrent modification, or return None when it is safe to write.
+
+    The compare half of a compare-and-swap. `pre` is the value this process read
+    before composing; `current` is a re-read taken immediately before the write.
+    Equal means no writer landed in between and the composed value is still
+    correct — composing from `pre` is then identical to composing from `current`,
+    which is what guard-3020 ("re-read IMMEDIATELY BEFORE composing") requires.
+
+    The two unequal cases are reported apart on purpose: a pure APPEND by a peer
+    is the expected race and retrying resolves it, while a REWRITE means the
+    record no longer contains what this author read and a retry would land an
+    amendment on content nobody reviewed (the guard-1615/anchor hazard).
+    """
+    if not isinstance(current, str):
+        return f"pre-write re-read returned {type(current).__name__}, not text"
+    if current == pre:
+        return None
+    if pre and pre in current:
+        return (f"another writer appended {len(current) - len(pre)} chars between this "
+                f"script's read and its write (pre={len(pre)} now={len(current)}); "
+                "writing the value composed from the stale read would drop their text")
+    if not pre:
+        return (f"the field was empty at read time and now holds {len(current)} chars — "
+                "another writer created it between this script's read and its write")
+    return (f"the field changed between this script's read and its write "
+            f"(pre={len(pre)} now={len(current)}) and the PRE content is no longer "
+            "contained in it — the record was REWRITTEN, not appended to")
+
+
 def verify_post(pre: str, post, sentinel: str) -> "list[str]":
     """Return the list of verification problems; empty means the write is sound.
 
@@ -248,6 +284,55 @@ def main(argv=None) -> int:
              "composed value starts with '{' or '[' — the update wrapper would JSON-decode it "
              "rather than store it as text. Prefix the field's existing content or the appended "
              "text so it does not begin with a JSON opener.")
+
+    # PRE-WRITE RE-READ (the compare half of a compare-and-swap) — .
+    # read_goal() above and the write below are two separate subprocess
+    # round-trips with NOTHING serializing the span between them. Two concurrent
+    # invocations both read PRE, both compose PRE+their-own-text, and the second
+    # write clobbers the first — while verify_post() passes for BOTH, because
+    # each writer's own sentinel is present, its own PRE survived, and the length
+    # grew. Neither ever learns the other's text is gone. The idempotence marker
+    # does not cover this (it guards a retry of the SAME marker) and neither does
+    # store-field-append's --anchor (it is evaluated against the value read
+    # BEFORE the window opens, so both writers see it satisfied).
+    #
+    # WHY NOT locked_rmw, the goal's remedy (2): it is defined only in
+    # mind_api/src/file_locks.py — a per-process threading.Lock plus a file lock
+    # taken INSIDE the daemon. This script never opens the store; it shells out
+    # to daemon-routed wrappers. No daemon-side lock can span two round-trips
+    # this process issues, so remedy (2) is not implementable from here. Closing
+    # the span properly needs a compare-and-swap ENDPOINT (an If-Match on the
+    # field), which is a daemon protocol change and is filed separately rather
+    # than faked with a lock that cannot reach.
+    #
+    # AND class (a) does NOT rescue this. Every target store is merge-protected
+    # (core/config/conventions/governed-store-write-classes.md), but a merge
+    # handler reconciles LOCAL vs REMOTE divergence — here both writes land
+    # locally in sequence, so the handler never sees two versions to reconcile.
+    # Even across boxes it would not conserve: both sides carry the SAME key
+    # with different values, and _merge_goal's union-backfill only rescues keys
+    # one side LACKS. Per that convention's own  section, class (a)
+    # answers whether a reconciler runs below the write, never whether it
+    # conserves.
+    fresh = read_goal(args.goal_id, args.source)
+    current = fresh.get(args.field)
+    if current is None:
+        current = ""
+    if isinstance(current, str) and sentinel in current:
+        # A concurrent run of THIS marker landed while we were composing. That
+        # is the idempotent case, not a conflict — report it and change nothing.
+        out = {"ok": True, "changed": False,
+               "reason": "idempotent: marker landed concurrently between read and write",
+               "goal_id": args.goal_id, "field": args.field, "marker": args.marker,
+               "pre_len": len(pre)}
+        print(json.dumps(out, indent=2))
+        return RC_OK
+    conflict = cas_conflict(pre, current)
+    if conflict:
+        _die(RC_CONCURRENT_MODIFICATION,
+             "refusing to write — " + conflict + ". NOTHING WAS WRITTEN and no text was "
+             "lost. Re-run the identical command: the fresh read picks up their text and "
+             "the marker keeps the retry idempotent (g-115-5638).")
 
     # WRITE — positionally, no flags in the value slot (guard-1047 / guard-2460).
     res = _run(bash_cmd(

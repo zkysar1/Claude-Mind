@@ -48,8 +48,8 @@ FW_COMPAT="$CONFIG_DIR/compatibility.yaml"
 TARGET=""; BRANCH=""; DO_PR=0; DRY=0; LIVING_PROD=0; FORCE_PAST_PLAN=""; AUTO_MERGE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --target) TARGET="${2:-}"; [[ -z "$TARGET" || "$TARGET" == --* ]] && { echo "ERROR: --target requires a path" >&2; exit 2; }; shift 2;;
-    --branch) BRANCH="${2:-}"; [[ -z "$BRANCH" || "$BRANCH" == --* ]] && { echo "ERROR: --branch requires a value" >&2; exit 2; }; shift 2;;
+    --target) TARGET="${2:-}"; [[ -z "$TARGET" || "$TARGET" == --* ]] && { echo "ERROR: --target requires a path" >&2; exit 2; }; shift $(( $# >= 2 ? 2 : 1 ));;
+    --branch) BRANCH="${2:-}"; [[ -z "$BRANCH" || "$BRANCH" == --* ]] && { echo "ERROR: --branch requires a value" >&2; exit 2; }; shift $(( $# >= 2 ? 2 : 1 ));;
     --pr) DO_PR=1; shift;;
     # Opt-in merge of the PR this run just opened. OFF by default: the default
     # contract stays "open a PR, let a human or a later verified step merge it".
@@ -60,7 +60,7 @@ while [[ $# -gt 0 ]]; do
     # justification — a bare boolean would let the gate be waved through by
     # reflex, and the whole defect being fixed is a refusal nobody had to read.
     # The justification is echoed to stdout and carried into the plant log.
-    --force-past-plan) FORCE_PAST_PLAN="${2:-}"; [[ -z "$FORCE_PAST_PLAN" || "$FORCE_PAST_PLAN" == --* ]] && { echo "ERROR: --force-past-plan requires a justification string" >&2; exit 2; }; shift 2;;
+    --force-past-plan) FORCE_PAST_PLAN="${2:-}"; [[ -z "$FORCE_PAST_PLAN" || "$FORCE_PAST_PLAN" == --* ]] && { echo "ERROR: --force-past-plan requires a justification string" >&2; exit 2; }; shift $(( $# >= 2 ? 2 : 1 ));;
     -h|--help) sed -n '2,/^set -euo/p' "$0" | sed 's/^# \?//;/^set -euo/d'; exit 0;;
     *) echo "ERROR: unknown argument: $1" >&2; exit 2;;
   esac
@@ -163,11 +163,33 @@ say "$CRC_OUT"
 # against a tag that does not exist).
 source_provenance_drift() {
   SRC_DRIFT_KIND=""; SRC_DRIFT_DETAIL=""
-  local _dirty _head_sha _tag_sha
+  local _dirty _head_sha _tag_sha _drc=0
   _add() { SRC_DRIFT_KIND="${SRC_DRIFT_KIND:+$SRC_DRIFT_KIND }$1"
            SRC_DRIFT_DETAIL="${SRC_DRIFT_DETAIL:+$SRC_DRIFT_DETAIL; }$2"; }
 
-  _dirty="$(git -C "$PROJECT_ROOT" status --porcelain 2>/dev/null || true)"
+  # FAIL CLOSED (). `2>/dev/null || true` discarded BOTH stderr and
+  # the exit code, so ANY git failure produced an empty string that this
+  # function read as "working tree is clean". stderr is now routed INTO the
+  # capture and rc is checked explicitly, so a failure yields NON-empty output
+  # and reads as dirty. Sanctioned sibling idiom: iteration-commit.sh:492.
+  #
+  # The likeliest failure here is .git/index.lock contention from a partner's
+  # concurrent iteration-commit.sh — so the check was least trustworthy exactly
+  # when partners are committing, which is the live-fleet condition the
+  #  TOCTOU re-check exists for. That re-check calls this same
+  # predicate a second time, so a wedged git made BOTH calls report clean.
+  # --no-optional-locks removes the contention at the source: a status probe
+  # can no longer take that lock at all. Verified by running it on git 2.43.0
+  # (the goal required verifying, not assuming); the flag appeared nowhere in
+  # core/scripts before this fix.
+  #
+  # NOTE the asymmetry this restores: the TAG half below already fails CLOSED
+  # (rev-parse -q --verify routes to no-tag; the two unsuppressed rev-parse /
+  # rev-list calls abort under set -e). Only the dirty half swallowed.
+  _dirty="$(git --no-optional-locks -C "$PROJECT_ROOT" status --porcelain 2>&1)" || _drc=$?
+  if [[ $_drc -ne 0 ]]; then
+    _dirty="git status failed (rc=$_drc) — treating as DIRTY: ${_dirty:-<no stderr>}"
+  fi
   if [[ -n "$_dirty" ]]; then
     _add dirty "$(printf '%s' "$_dirty" | head -5 | tr '\n' ';')"
   fi
@@ -282,7 +304,7 @@ LP_FLAG=""; [[ $LIVING_PROD -eq 1 ]] && { LP_FLAG="--living-prod"; say "living-p
 
 # --- Dry-run stops here (no mutation of the target) ------------------------
 if [[ $DRY -eq 1 ]]; then
-  [[ $DO_PR -eq 1 ]] && say "[dry-run] would: create PR branch '$BRANCH' in target FIRST (plant commits there, not on target's main)"
+  [[ $DO_PR -eq 1 ]] && say "[dry-run] would: add an ISOLATED WORKTREE for PR branch '$BRANCH' FIRST and plant into it (the plant commits there; the live checkout at $TARGET never switches branch), then tear the worktree down after the push"
   [[ $LIVING_PROD -eq 1 ]] && say "[dry-run] would: seed-transplant.sh \"$TARGET\" --living-prod --plan  (read-only blast-radius report FIRST — g-306-90/guard-1056)"
   say "[dry-run] would: seed-transplant.sh \"$TARGET\" ${LP_FLAG:+$LP_FLAG }--force --commit  (domain-strip + transforms + verify${LP_FLAG:+; living-prod: deployment-local + dest forged skills preserved})"
   [[ $DO_PR -eq 1 && $AUTO_MERGE -eq 0 ]] && say "[dry-run] would: push branch '$BRANCH' + gh pr create (does NOT merge — pass --auto-merge to merge in-run)"
@@ -292,16 +314,74 @@ if [[ $DRY -eq 1 ]]; then
   exit 0
 fi
 
-# --- Step 4: (if --pr) create the PR branch in the target BEFORE planting ---
+# --- Step 4: (if --pr) create the PR branch in an ISOLATED WORKTREE ---------
 # The plant commit MUST land on the PR branch, not the target's main. If the
 # branch is created AFTER seed-transplant --commit (which commits onto whatever
 # branch is currently checked out), the commit is already on main and the PR
 # diff is EMPTY — the change is effectively merged by the agent (M2 violation).
 # (review F3, HIGH)
+#
+# WHY A WORKTREE AND NOT `git checkout -b` (). The previous form ran
+# `cd "$TARGET" && git checkout -b "$BRANCH"`, which SWITCHES THE LIVE CHECKOUT
+# to the PR branch — and leaves it there, because nothing switches it back. The
+# target is a working deployment whose agents read that tree; a promotion that
+# silently repoints their checkout at an unmerged branch is the one genuinely
+# unique hazard here, and it survives long past the promotion (a failed plant,
+# a failed verify, or a crashed run all exit with the live checkout moved).
+# A worktree gives the plant its own directory and its own HEAD, so the live
+# checkout's branch is never touched at all — not during, not after, not on any
+# failure path.
+#
+# PLANT_DIR is the seam: it is $TARGET in the normal (no --pr) flow, preserving
+# the existing "commit onto whatever branch is checked out" behaviour exactly,
+# and the isolated worktree under --pr. Every downstream step (plan, plant,
+# verify, push) reads PLANT_DIR; the ONE step that deliberately keeps reading
+# $TARGET is the living-prod autodetect above — see the note at Step 4a.
+PLANT_DIR="$TARGET"
+WT_DIR=""
+_wt_torn_down=0
+_wt_teardown() {
+  [[ -n "$WT_DIR" && $_wt_torn_down -eq 0 ]] || return 0
+  _wt_torn_down=1
+  # Teardown is unconditional, including on the failure paths, and loses
+  # NOTHING durable: `git worktree remove` deletes the checkout directory, not
+  # the branch. A plant that committed before failing leaves its commit on
+  # '$BRANCH' in $TARGET's object store, reachable with `git -C "$TARGET" log
+  # "$BRANCH"`. Leaving the worktree behind, by contrast, wedges the NEXT run —
+  # `git worktree add` refuses a branch already checked out elsewhere.
+  # --owner is explicit rather than left to derivation: the worktree may already
+  # be gone (a crash, a hand-cleanup) and derivation needs the directory to ask.
+  bash "$SCRIPT_DIR/worktree-teardown.sh" "$WT_DIR" --owner "$TARGET" --force --quiet \
+    || say "WARNING: worktree teardown reported a problem for $WT_DIR — remove it by hand (git -C \"$TARGET\" worktree remove --force \"$WT_DIR\")"
+}
 if [[ $DO_PR -eq 1 ]]; then
-  ( cd "$TARGET" && { git checkout -b "$BRANCH" 2>/dev/null || git checkout "$BRANCH"; } ) \
-    || fail "could not create/switch to PR branch '$BRANCH' in $TARGET"
-  say "PR branch ready in target: $BRANCH (the plant commits here, not on the target's main)"
+  WT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/promote-wt-XXXXXX")" \
+    || fail "could not create a temp dir for the promotion worktree"
+  rmdir "$WT_DIR" 2>/dev/null || true   # git worktree add wants to create it
+  trap _wt_teardown EXIT
+  # A branch cannot live in two worktrees, so if the target's LIVE checkout is
+  # already sitting on '$BRANCH' the add fails rc=128 with git's own message
+  # ("already used by worktree at <target>"), which does not say what to do.
+  # This is not a hypothetical: it is precisely the state the PRE-
+  # code left behind, so the FIRST run of this version against a
+  # previously-promoted target lands here. Diagnose it explicitly rather than
+  # forcing — `worktree add --force` would put the same branch in two working
+  # trees, and the whole point of this step is to stop touching the live one.
+  _live_branch="$(git -C "$TARGET" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+  if [[ "$_live_branch" == "$BRANCH" ]]; then
+    fail "the target's LIVE checkout at $TARGET is itself on '$BRANCH', so it cannot also be checked out in a worktree. This is the residue of a promotion run BEFORE g-115-4803 (which switched the live checkout and never switched it back). Move the deployment back to its own branch first — e.g. 'git -C \"$TARGET\" checkout main' — then re-run. Nothing has been mutated."
+  fi
+  # Reuse an existing branch when re-running a promotion; create it otherwise.
+  if git -C "$TARGET" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+    git -C "$TARGET" worktree add "$WT_DIR" "$BRANCH" \
+      || fail "could not add a worktree at '$WT_DIR' for existing branch '$BRANCH' in $TARGET"
+  else
+    git -C "$TARGET" worktree add -b "$BRANCH" "$WT_DIR" \
+      || fail "could not add a worktree at '$WT_DIR' for new branch '$BRANCH' in $TARGET"
+  fi
+  PLANT_DIR="$WT_DIR"
+  say "PR branch '$BRANCH' checked out in an ISOLATED WORKTREE: $WT_DIR"
+  say "  (the live checkout at $TARGET keeps its own branch — this promotion never switches it)"
 fi
 
 # --- Step 4a: living-prod blast-radius gate ( P1.5 / guard-1056) ----
@@ -322,8 +402,18 @@ if [[ $LIVING_PROD -eq 1 ]]; then
   # DO NOT PROMOTE over 151 prod-ahead files on Hop 2 — passed straight through
   # it into the plant. Distinguishing "could not assess" from "assessed, and the
   # answer is no" is the entire fix; collapsing them is what hid it.
+  # NOTE — this runs against PLANT_DIR while the LIVING_PROD *detection* above
+  # deliberately ran against $TARGET, and the split is load-bearing ().
+  # Detection asks "is the DEPLOYMENT living?", a property of the real clone: its
+  # strongest signal is `$TARGET/.mind-data`, which is gitignored and therefore
+  # ABSENT from any worktree. Detecting against the worktree would read a living
+  # production deployment as a fresh seed, drop --living-prod, and let the plant
+  # clobber the deployment-local files this flag exists to preserve. The PLAN, by
+  # contrast, is a blast-radius report and MUST describe the directory that is
+  # actually about to be mutated — reporting on $TARGET while planting into the
+  # worktree would make the report describe a different tree than the plant.
   set +e
-  bash "$SCRIPT_DIR/seed-transplant.sh" "$TARGET" --living-prod --plan
+  bash "$SCRIPT_DIR/seed-transplant.sh" "$PLANT_DIR" --living-prod --plan
   PLAN_RC=$?
   set -e
   case $PLAN_RC in
@@ -371,8 +461,8 @@ fi
 say "source provenance re-verified at plant time: tree clean and HEAD is the v$LOCAL commit"
 
 # --- Step 4b: seed-plant into the target (commits onto the CURRENT branch) --
-say "planting framework into $TARGET ${LP_FLAG:+(living-prod) }..."
-bash "$SCRIPT_DIR/seed-transplant.sh" "$TARGET" $LP_FLAG --force --commit || fail "seed plant failed"
+say "planting framework into $PLANT_DIR ${LP_FLAG:+(living-prod) }..."
+bash "$SCRIPT_DIR/seed-transplant.sh" "$PLANT_DIR" $LP_FLAG --force --commit || fail "seed plant failed"
 
 # --- Step 5: post-promotion verify -----------------------------------------
 # --expect-commit is load-bearing, not decorative (). Without it,
@@ -382,8 +472,8 @@ bash "$SCRIPT_DIR/seed-transplant.sh" "$TARGET" $LP_FLAG --force --commit || fai
 # that stop the PR were defeated by the same collapse, which is how a plant that
 # committed NOTHING reached "═══ PROMOTED ═══" with a PR open. Post-plant, a
 # dirty tree IS the failure; the flag is what lets the verifier say so.
-say "verifying plant at $TARGET ..."
-bash "$SCRIPT_DIR/seed-verify.sh" "$TARGET" --expect-commit || fail "post-promotion verify FAILED at $TARGET"
+say "verifying plant at $PLANT_DIR ..."
+bash "$SCRIPT_DIR/seed-verify.sh" "$PLANT_DIR" --expect-commit || fail "post-promotion verify FAILED at $PLANT_DIR"
 
 # --- Step 6: optional PR push (merges ONLY under --auto-merge) -------------
 if [[ $DO_PR -eq 1 ]]; then
@@ -412,13 +502,30 @@ if [[ $DO_PR -eq 1 ]]; then
     fi
   fi
   if [[ -z "$GH_BIN" ]]; then
-    say "WARNING: --pr requested but 'gh' is not installed/locatable. The plant is committed on branch '$BRANCH' at $TARGET."
-    say "Open a PR manually:  (cd \"$TARGET\" && git push -u origin \"$BRANCH\" && gh pr create ...)"
+    # The manual-recovery commands below are deliberately phrased against
+    # $TARGET, not $PLANT_DIR: the worktree is torn down when this script exits,
+    # but the branch and its commit live in $TARGET's object store and outlive
+    # it. `git -C "$TARGET" push` pushes a ref and does not care which branch
+    # $TARGET has checked out, so it is safe to hand an operator.
+    say "WARNING: --pr requested but 'gh' is not installed/locatable. The plant is committed on branch '$BRANCH' in $TARGET (planted via worktree $PLANT_DIR, which is torn down on exit)."
+    say "Open a PR manually:  git -C \"$TARGET\" push -u origin \"$BRANCH\" && gh pr create ..."
   else
+    # Pushed FROM the worktree: it shares $TARGET's git dir, so 'origin' and the
+    # branch ref are the same objects the live checkout sees. (1/7, .)
+    #
+    # MERGE RESOLUTION 2026-08-10, resolved on cc-07 ( prescribes
+    # "resolve toward the PLANT_DIR form"). Steps 1/7 and 2/7 of the live
+    # promotion sequence were built by different Bodies on different boxes and
+    # collided exactly here, because they changed ORTHOGONAL things on the same
+    # lines: 1/7 changed WHERE the push happens (worktree, never the target's
+    # live checkout), 2/7 changed WHAT happens after the PR exists (--auto-merge).
+    # Neither side was wrong, so neither is discarded — 2/7's machinery below
+    # runs from 1/7's $PLANT_DIR instead of $TARGET.
+    #
     # `git push` output is routed to stderr (>&2), NOT suppressed: stdout must
     # carry ONLY the PR URL that `gh pr create` prints, so --auto-merge has
     # something to act on. Silencing it would violate guard-139/guard-1972.
-    if PR_RAW="$( cd "$TARGET" && git push -u origin "$BRANCH" >&2 && \
+    if PR_RAW="$( cd "$PLANT_DIR" && git push -u origin "$BRANCH" >&2 && \
       "$GH_BIN" pr create --title "Promote framework v$LOCAL from $SELF_ROLE" \
         --body "Automated framework promotion v$LOCAL ($SELF_ROLE -> $TARGET_ROLE). The agent merges once mergeable + checks pass (user-granted 2026-06-06)." )"; then
       # Take the LAST non-empty stdout line, not the whole capture: gh may print
@@ -499,6 +606,10 @@ if [[ $DO_PR -eq 1 ]]; then
       fi
     fi
   fi
+  # Teardown right after the push rather than waiting for the EXIT trap, so the
+  # ═══ PROMOTED ═══ banner below is printed by a run that has already cleaned
+  # up. The trap stays armed and is a no-op after this (idempotent by flag).
+  _wt_teardown
 fi
 
 say "═══ PROMOTED v$LOCAL ($SELF_ROLE -> $TARGET_ROLE) ═══"

@@ -205,13 +205,40 @@ For each undrained file (oldest first):
 
    | verdict | meaning | required action |
    |---|---|---|
-   | `absent`  | the payload's effect is NOT in the store — unapplied work | **DISCARD IS BLOCKED.** Encode it, or leave it undrained. Never archive. |
+   | `absent`  | the payload's effect is NOT in the store — unapplied work | **DISCARD IS BLOCKED.** Verify store-wide first (below), THEN encode or leave undrained. Never archive. |
    | `encoded` | the effect is present in the store | DISCARD is safe to proceed |
    | `unknown` | shape unrecognised / store unreadable / effect not observable | fall back to LLM judgement, exactly as before |
 
    `unknown` is the common case for query-output captures and command scratch,
    which is correct — the probe narrows the judgement call, it does not replace
    it. Only `absent` constrains you, and only in the safe direction.
+
+   `absent` IS NOT AN INSTRUCTION TO ENCODE — IT IS A PROMPT TO CHECK, AND THE
+   TWO DIRECTIONS FAIL DIFFERENTLY. It fails SAFE for discard (over-retaining
+   costs disk) and UNSAFE for encoding (a duplicate is noisy; a re-entered
+   REFUTED claim is corrosive). The wording above led with encode until
+   2026-08-13 and that ordering is what nearly landed one. Measured that day
+   (bravo, `hostname` cc-05, `uname -r` 6.8.0-137-generic, g-001-343) on the 5
+   absent artifacts of type `guardrail` + `reasoning_bank` — the probe's OWN
+   native shapes, where its predicate is best tested and where NEITHER open
+   blocker (g-115-5372 `.json`-metric half, g-115-5979 `trace_md` half) applies:
+   **3 of 5 were ALREADY PRESENT** in `guardrails.jsonl`; **1 was genuinely
+   absent and WRONG** (`rb26` claimed a recurring-starvation coverage gap that
+   `rb-7403` already records as investigated and PHANTOM — different scales);
+   1 was absent and new. Actionable as stated on 1 of 5. So over-reporting is
+   NOT confined to the two owned shapes, and a fix scoped to them leaves the
+   class alive everywhere else.
+
+   So on `absent`, before encoding: run a STORE-WIDE existence probe (not a
+   category-scoped one — `guardrails-read.sh --active`, `reasoning-bank-read.sh
+   --active`; a bare call errors `at least one filter is required`), assert a
+   POSITIVE CONTROL that the corpus actually loaded, then check the result for
+   semantic overlap AND contradiction. The control is not optional ceremony:
+   the first store-wide probe of that measurement returned rc=1/empty and
+   rendered as "CONFIRMED ABSENT store-wide" — searching an empty blob always
+   misses, so an unreadable store manufactures the exact verdict that licenses
+   the write (the `learning-routing-audit` class in CLAUDE.md, where an empty
+   id-set silently licensed 17,466 nullings). Encoded: `rb-7698`.
 
    FAIL-OPEN: the probe never emits `absent` from an internal error (every
    failure path returns `unknown`) and always exits 0. A probe bug therefore

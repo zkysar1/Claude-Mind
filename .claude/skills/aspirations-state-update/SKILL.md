@@ -41,7 +41,7 @@ scans those journal lines and logs false claims to
 - `outcome_class`: Outcome tier (`"routine"` or `"deep"`) — default `"deep"`
 - `source`: Queue origin (`"world"` or `"agent"`) — pass `--source {source}` to all `aspirations-*.sh` calls
 
-For **deep** outcomes (default — all non-routine goals): all steps run (1-8, 8.5, 8.75). Step 8 performs IMMEDIATE tree encoding — the full precision manifest, curator quality gate, consistency scan, and tree write. This is the highest-fidelity path. Learning is the mission — every non-routine outcome gets immediate encoding.
+For **deep** outcomes (default — all non-routine goals): all steps run (1-8, 8.5, 8.55, 8.75). Step 8 performs IMMEDIATE tree encoding — the full precision manifest, curator quality gate, consistency scan, and tree write. This is the highest-fidelity path. Learning is the mission — every non-routine outcome gets immediate encoding.
 
 For **routine** outcomes (recurring goal, no findings): Steps 1-4 run (bookkeeping), then an abbreviated Step 7 (journal), then RETURN. Steps 5-8.75 are skipped because there is genuinely no insight to encode, no triggers to check, and no capability to propagate.
 
@@ -53,7 +53,7 @@ The loop MUST NOT continue to Phase 9 until state update is complete.
 
 ## State Update Protocol
 
-After EVERY goal execution (Steps 1-8, plus Steps 8.5 and 8.75 for deep outcomes):
+After EVERY goal execution (Steps 1-8, plus Steps 8.5, 8.55, and 8.75 for deep outcomes):
 
 ```
 1. UPDATE goal status via Bash: `aspirations-update-goal.sh --source {source} <goal-id> status <status>`
@@ -492,11 +492,14 @@ IF outcome_class == "routine":
      If Phase 8 wrote new insight above AND executing skill was NOT research-topic or reflect:
        Add {"op": "increment", "key": "<node.key>", "field": "article_count"} to the batch
    - Check growth triggers on the updated node:
-     Read core/config/tree.yaml for decompose_threshold, split_threshold
-     line_count = count lines in node .md body (excluding YAML front matter)
-     If line_count > decompose_threshold AND node depth < D_max:
-       bash core/scripts/tree-update.sh --set <node.key> growth_state ready_to_decompose
-       Invoke /tree maintain
+     Read core/config/tree.yaml for split_threshold
+     Decompose is STRUCTURAL, not line-count (g-306-13; board msg-20260619-075228-bravo-086).
+     Do NOT compute a line count and do NOT set growth_state ready_to_decompose:
+     tree.py get_decompose_candidates selects on leaves-under-node >
+     K_max^(D_retrieval-1) and never reads decompose_threshold, so a line-count
+     flag is INERT — it writes a field no reader acts on. Ask the tool instead:
+       bash core/scripts/tree-read.sh --decompose-candidates
+       If the node is listed: Invoke /tree maintain
      Elif article_count > split_threshold:
        bash core/scripts/tree-update.sh --set <node.key> growth_state ready_to_split
        Invoke /tree maintain
@@ -621,6 +624,49 @@ IF step_8_wrote_insight:   # True when Step 8 entered "compress into Key Insight
 
     Delete agents/<agent>/temp/findings-gate-insight.tmp.md
 # If Step 8 did not write insight: silent pass (no output)
+```
+
+```
+# ── Step 8.55: Residual-Work Carrier Check (scope-narrowed completions) ──
+# Origin: g-335-1176 (2026-08-12) + owner directive 2026-08-13 ("we need to
+# be a goal generator"). A goal was completed as analyst scope — premises
+# validated, verification criteria written, "no product code was written" —
+# and the implementation had NO pending carrier anywhere: the spec sat on a
+# completed record, which is a TERMINAL store nothing selects or executes.
+# Step 8.5 could not catch it: its input is the tree-insight text and its
+# keyword scan targets discovered problems, not deliberate scope narrowing.
+# This step's input is the OUTCOME narrative, and its unit is the gap
+# between FILED scope and EXECUTED scope.
+#
+# Unlike 8.5 this is not keyword-gated — it is ONE question, answered on
+# every deep completion:
+#
+#   "Does my outcome narrative name work that (a) the goal's description or
+#    verification asked for, or (b) my execution identified as needed,
+#    which I did NOT do?"
+#
+# Markers that force YES: "no code was written", "spec/criteria only",
+# "drafted, not sent", "recommended", "follow-up", "remainder", "out of
+# scope for this pass", "deferred to", "blocked on X landing", "successor".
+
+FOR each residual item (usually 0-3):
+    ONE of these MUST be true BEFORE the completion is final:
+    1. An EXISTING pending goal carries it — verified by live title-probe
+       (aspirations-query.sh --title-contains, never a remembered id;
+       rb-7425) — and outcome_note names that id ("residual carried by
+       g-NNN-NN").
+    2. FILE the carrier NOW (aspirations-add-goal.sh; Idea/Investigate/
+       Unblock per Cognitive Primitives) and name the new id in
+       outcome_note. If this execution produced verification criteria or a
+       spec, copy them INTO the successor's verification field — criteria
+       on a completed record are invisible to every selector
+       (g-335-1186 is the reference shape).
+    3. The OWNER explicitly declined the work — name the decision and where
+       it is recorded (goal id / board msg id).
+# Completing with residual work named only in prose converts identified
+# work into a record nothing executes. When in doubt, FILE THE GOAL — the
+# duplication gate is the safety net for over-filing; nothing is the
+# safety net for under-filing.
 ```
 
 ```
@@ -909,7 +955,12 @@ IF outcome_class == "deep":
     insight_has_ship = any(s in (insight_text or "").lower()
                             for s in ["shipped", "deployed", "released to", "landed in"])
     IF title_matches_ship OR insight_has_ship:
-        subject = f"Alpha shipped: {goal.title[:60]}"
+        # Agent name is READ, never hardcoded (g-335-1202, 2026-08-13). This
+        # line said "Alpha shipped:" literally, so every non-alpha agent that
+        # reached Trigger 1 emailed the user a FALSE ATTRIBUTION for its own
+        # work — and the user-facing channel is exactly where a wrong author
+        # is least recoverable. Caught by bravo at the moment of use.
+        subject = f"{AGENT_NAME.capitalize()} shipped: {goal.title[:60]}"
         message = (insight_text or goal.title)[:400]
         triggers.append(("shipped", "info", subject, message))
 
@@ -961,9 +1012,14 @@ IF triggers is empty:
     SKIP silent
 
 # ── Rate cap: max 3 immediate pushes per rolling hour ──
-# SINGLE SOURCE OF TRUTH for send history: wm.notification_log (owned by
-# /notify-user; written on successful send only). DO NOT introduce a
-# parallel counter — dual stores drift. Entry shape: {subject, category,
+# SINGLE SOURCE OF TRUTH for THIS AGENT'S per-hour push cadence:
+# wm.notification_log (owned by /notify-user; written on successful send
+# only). DO NOT introduce a parallel counter — dual stores drift. The
+# FLEET-WIDE "was the user already told this?" question is a different
+# store — world/notifications-sent.jsonl, written by email-send.sh and read
+# by notify-user Step 1.7 — and is not a duplicate of this one: this is a
+# per-agent rate cap, that is a cross-agent/cross-world topic dedup.
+# Entry shape: {subject, category,
 # sent_at: <ISO 8601 string>}. LLM parses sent_at via datetime.fromisoformat
 # before comparing.
 Bash: wm-read.sh notification_log
@@ -1015,9 +1071,24 @@ IF outcome_class == "deep":
 # See board.md Execution Feedback Schema for field definitions.
 
 IF outcome_class != "routine" AND source == "world":
-    # Determine who created the goal. For world goals, check if there's a
-    # created_by field or infer from the aspiration author / board handoff.
-    goal_created_by = goal.get("created_by") or goal.get("discovered_by") or "unknown"
+    # Determine who created the goal. `filed_by_agent` is the field that
+    # actually carries the creating AGENT — measured 2026-08-11 (zeta, cc-02)
+    # over all 4,196 asp-115 goals: filed_by_agent 95.9% present and holding
+    # real agent names (alpha 1148 / bravo 943 / zeta 912 / echo 482 /
+    # foxtrot 381 / omni 103 / delta 47), `created_by` present on **0**, and
+    # `discovered_by` present on 41.5% but holding a GOAL ID (85.9% match
+    # `g-NNN-NN`; 0.5% look like agent names) — it is the goal that DISCOVERED
+    # the work (sq-013 schema), never the author. So do NOT read discovered_by
+    # as an agent: it names the wrong entity type.
+    #
+    # NOT a measured defect, and the distinction matters before anyone "fixes"
+    # more than this line: the prior list read created_by -> discovered_by ->
+    # unknown, which predicts feedback addressed to a goal id on the 41.5%.
+    # That prediction was CHECKED and FALSIFIED — of 19 feedback posts in the
+    # trailing 30 days, 18 are addressed to an agent and **0** to a goal id, so
+    # the LLM path has been compensating for the stale list all along. This
+    # edit removes the compensation burden; it does not repair broken output.
+    goal_created_by = goal.get("filed_by_agent") or goal.get("created_by") or "unknown"
 
     IF goal_created_by != AGENT_NAME AND goal_created_by != "unknown":
         # Rate the goal on three dimensions (1-5 each)

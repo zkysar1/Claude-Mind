@@ -57,14 +57,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _paths import META_DIR  # noqa: E402
-from _gate_log import segment_name  # noqa: E402
+from _gate_log import (  # noqa: E402
+    LEGACY_STORE_NAME, SEGMENTED_ENV, segmented_enabled, store_name,
+)
 from storage_backend import LocalBackend  # noqa: E402
 
 SPOOL_NAME = "gate-firings.spool.jsonl"
 FLUSHING_NAME = "gate-firings.spool.flushing.jsonl"
 STAMP_NAME = "gate-firings.spool.last-flush"
 FLUSH_LOCK_NAME = "gate-firings.spool.flush.lock"
-STORE_NAME = "gate-firings.jsonl"
+STORE_NAME = LEGACY_STORE_NAME
 
 #  Stage 2: date-segmented flush target, DEFAULT OFF.
 #
@@ -81,22 +83,21 @@ STORE_NAME = "gate-firings.jsonl"
 # unfired and therefore RETIRABLE. That is a false all-clear, which is the worst
 # direction this system can fail in. The flag is per-box precisely so the seam
 # can be rolled out first.
-SEGMENTED_ENV = "GATE_FIRINGS_SEGMENTED"
-
-
-def _segmented_enabled() -> bool:
-    return os.environ.get(SEGMENTED_ENV, "").strip().lower() in ("1", "true", "yes")
+#
+# The flag name, its truthiness rule and the resolved basename live in _gate_log
+# (SEGMENTED_ENV / segmented_enabled / store_name) so this flush lane and the
+# direct locked-append lane inside _gate_log.log() can never disagree about
+# where a firing goes — they did, for the 12h after the fleet flip (2026-08-18).
+_segmented_enabled = segmented_enabled   # name kept for the tests that pin it
 
 
 def _store_path(meta: Path) -> Path:
     """Flush target: the legacy store, or today's segment when segmentation is on.
 
-    The segment basename comes from _gate_log.segment_name so the writer's
-    filename and the reader's matcher share one definition (see that function).
+    The basename comes from _gate_log.store_name so the writer's filename and
+    the reader's matcher share one definition (see segment_name there).
     """
-    if _segmented_enabled():
-        return meta / segment_name()
-    return meta / STORE_NAME
+    return meta / store_name()
 
 
 def _serialize(rec: dict) -> str:

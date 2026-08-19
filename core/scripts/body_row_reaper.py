@@ -194,7 +194,18 @@ def decide_row(
     # still sets `carrier_sid` in the evidence, so check that too or a mismatched
     # stale carrier would be read as a death certificate for a body it never
     # described.
-    if carrier_verdict == CV_FRESH_WRONG or ev.get("carrier_sid"):
+    #
+    # PRESENCE, not truth (). The sole producer
+    # (stranded-claim-sweep._body_carrier_verdict) writes this key on
+    # `str(doc.get("sid") or "") != sid`, so it fires for an UNIDENTIFIED writer
+    # too and stores the empty string. Under the old `ev.get("carrier_sid")` that
+    # row was falsy and fell through to R_REAP, while the same empty sid arriving
+    # as `fresh-wrong` was kept by the clause on the left — i.e. an anonymous
+    # carrier was distrusted when FRESH and trusted when STALE, which is backwards
+    # for a DELETE path and is the exact asymmetry the comment above says this
+    # check prevents. The key's PRESENCE is the signal; its value is only ever a
+    # display prefix (`[:8]`).
+    if carrier_verdict == CV_FRESH_WRONG or "carrier_sid" in ev:
         out["verdict"] = K_SID_MISMATCH
         return out
 

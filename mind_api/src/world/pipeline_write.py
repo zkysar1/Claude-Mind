@@ -98,6 +98,12 @@ def _append_to_archive(path: Path, item: Dict[str, Any]) -> None:
     """
     assert_not_cruft(path.parent, "mkdir (pipeline_write._append_to_archive)")
     path.parent.mkdir(parents=True, exist_ok=True)
+    # The live-path lock above bounds CONCURRENCY, not mirror STALENESS — two
+    # different guarantees, and the docstring's argument covers only the first.
+    # pipeline-archive.jsonl is S3-backed, and an append never reads it, so
+    # nothing on this path would otherwise pull it (). Fail-open.
+    from storage_backend import ensure_local_before_append
+    ensure_local_before_append(path)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(item, ensure_ascii=True) + "\n")
 
@@ -255,6 +261,26 @@ def _validate_record(rec: Dict[str, Any],
             raise ValueError(
                 f"Invalid surprise: {surprise!r} (must be int or null)")
     confidence = rec["confidence"]
+    # : reject bools BEFORE the numeric bound-check. Python bools ARE
+    # ints, so isinstance(True, (int, float)) is True and 0 <= True <= 1 passes
+    # -- a bool sailed straight through. Measured end-to-end:
+    # POST /v1/pipeline/update-field?field=confidence&value=true -> 200, stored
+    # confidence=True, surprise=0.
+    #
+    # Why that 0 matters: float(True) is 1.0, so a CONFIRMED record derives
+    # round((1 - 1.0) * 10) = 0. Since  made surprise a pure function
+    # of confidence, that 0 reads as "unsurprising" and SKIPS the
+    # /review-hypotheses Step 3.5 broad re-retrieve -- the exact under-stated
+    # class  was filed to end (47 of 158 records). The bound-check gap
+    # pre-dates that change; deriving surprise is what made it corrupting.
+    #
+    # Discriminate on TYPE, never on value: True == 1 and False == 0, so a
+    # value-based guard would reject the genuinely VALID confidences 1 and 0.
+    # Same shape the `surprise` check above already uses.
+    # Mirrored in core/scripts/pipeline.py::validate_record (guard-547 parity).
+    if isinstance(confidence, bool):
+        raise ValueError(
+            f"Invalid confidence: {confidence!r} (must be a number 0.0-1.0, not a bool)")
     if not isinstance(confidence, (int, float)) or confidence < 0 or confidence > 1:
         raise ValueError(f"Invalid confidence: {confidence} (must be 0.0-1.0)")
     # Position VALUE checks are scoped to writes that actually touch position
@@ -728,6 +754,7 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
         return Response.error(400, "validation_failed", str(e))
 
     live_path, archive_path, base_dir = _resolve_paths(ctx)
+    meta_path = base_dir / "pipeline-meta.json"
     agent = _agent_name(ctx)
 
     # Provenance stamps (). Formation always; resolution too when the
@@ -760,6 +787,34 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
             _jsonl_cache().invalidate(live_path)
     except OSError as e:
         return Response.error(500, "write_failed", str(e))
+
+    # Meta recomputation outside the live-path lock (mirrors move/update/
+    # update_field/archive_sweep -- the four ops that already do this).
+    #
+    # : add() was the ONE write op that invalidated the jsonl cache
+    # and never refreshed meta, so --counts under-reported a new hypothesis
+    # from the moment it was added until some LATER move/update/archive_sweep
+    # happened to refresh the file. Measured on the live store at fix time:
+    # meta reported active=284 against an actual 286 (+2 under-reported), while
+    # `discovered` was in sync at 78 -- i.e. the drift is TRANSIENT and
+    # self-healing, not cumulative, which is precisely why it survived this
+    # long unnoticed. The omission was checked before being fixed rather than
+    # assumed: no commit ever removed this call (the four grew in one at a
+    # time), add() carries no rationale comment, and the "add is the hot path"
+    # hypothesis is FALSIFIED by frequency -- add runs ONCE per record (1747
+    # to date) while move runs at least once for each of the 1669 records that
+    # ever left `discovered`, and every resolved record takes ~3 update_field
+    # calls on top. The op paying this cost least often was the only one
+    # exempt. Measured cost on the live store: 458ms cold / 118ms warm, of
+    # which _compute_meta is 7.3ms -- it is two file reads, and four
+    # more-frequent callers already pay it.
+    #
+    # Best-effort like the others: the record is already committed, and a
+    # stale counter must never turn a landed write into a reported failure.
+    try:
+        _update_meta(live_path, archive_path, meta_path)
+    except OSError:
+        pass  # best-effort; add already committed
 
     return Response.json({
         "ok": True,

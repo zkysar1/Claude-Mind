@@ -57,7 +57,7 @@ def test_helpers_are_the_ssot_objects_not_copies():
     discriminates — a pasted copy would report store-field-append.py and pass
     every behavioural assertion on the day it was pasted.
     """
-    for fn in (sfa.compose, sfa.verify_post, sfa.sentinel_for):
+    for fn in (sfa.compose, sfa.verify_post, sfa.sentinel_for, sfa.cas_conflict):
         assert Path(fn.__code__.co_filename).name == "goal-field-append.py", (
             f"{fn.__name__} is defined in {fn.__code__.co_filename} — the contract has been "
             "forked out of its SSOT")
@@ -67,6 +67,8 @@ def test_helpers_are_the_ssot_objects_not_copies():
     ssot = sfa._load_ssot()
     assert sfa.compose("A", "B", "m") == ssot.compose("A", "B", "m")
     assert sfa.sentinel_for("m") == ssot.sentinel_for("m")
+    assert sfa.cas_conflict("A", "A") == ssot.cas_conflict("A", "A")
+    assert sfa.cas_conflict("A", "A\n\nB") == ssot.cas_conflict("A", "A\n\nB")
 
 
 def test_missing_ssot_fails_loud_rather_than_degrading():
@@ -173,15 +175,18 @@ def test_anchor_absent_is_refused_with_its_own_exit_code(monkeypatch):
 def test_anchor_present_proceeds(monkeypatch):
     """Anti-vacuity for the test above: the guard must not refuse everything."""
     writes = []
-    # read_record is called TWICE — pre, then post for verification. The PRE
-    # read must lack the sentinel (or the idempotence branch short-circuits and
-    # this test would pass without ever exercising the anchor); the POST read
-    # carries it so verify_post is satisfied.
+    # read_record is called THREE times: PRE, the pre-write CAS re-read
+    # (), then POST for verification. The first two must return the
+    # SAME sentinel-free value — differing there is a concurrent modification
+    # and the write is correctly refused, and a sentinel in either one would
+    # short-circuit the idempotence branch so this test would pass without ever
+    # exercising the anchor. Only the POST read carries the sentinel, so
+    # verify_post is satisfied.
     state = {"n": 0}
 
     def _read(store, rid):
         state["n"] += 1
-        return _fake_record("some existing note" if state["n"] == 1
+        return _fake_record("some existing note" if state["n"] <= 2
                             else "some existing note\n\nnew text\n[appended:m1]")
 
     monkeypatch.setattr(sfa, "read_record", _read)

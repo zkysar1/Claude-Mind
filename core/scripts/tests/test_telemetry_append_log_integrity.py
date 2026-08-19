@@ -279,8 +279,12 @@ def test_push_lane_torn_local_self_heals(tmp_path, monkeypatch, capsys):
     be, full, local = _incident_files(tmp_path)
     full.write_bytes(local + b'{"ts": "2026-07-15T23:59:59", "gate_id": "to')
     snapshots = []
+    # **kw, not a bare (p): _snapshot_before_pull takes a keyword-only `summary`
+    # and the merge chokepoint now passes it (). A 1-arg stub pinned a
+    # signature the real function never had — the local-wins call site has passed
+    # `summary=` since ; these tests simply never reached it.
     monkeypatch.setattr(_mod, "_snapshot_before_pull",
-                        lambda p: snapshots.append(str(p)))
+                        lambda p, **kw: snapshots.append(str(p)))
     stats = {"scanned": 1, "in_sync": 0, "pushed": 0, "would_push": 0,
              "conflicts": 0, "errors": 0, "push_paths": []}
     out = _mod._sync_one(be, full, dry_run=False, stats=stats,
@@ -347,7 +351,7 @@ def test_nobaseline_owncloud_lane_merges_registered_store(tmp_path, monkeypatch)
     # No baseline + multi-machine + own-cloud authority: the old deterministic
     # reconcile PULLED S3 wholesale, dropping the locally-authored tail (the
     # cc-02 franken-copy heal path). Registered stores must union instead.
-    monkeypatch.setattr(_mod, "_snapshot_before_pull", lambda p: None)
+    monkeypatch.setattr(_mod, "_snapshot_before_pull", lambda p, **kw: None)
     be, full, _ = _incident_files(tmp_path)
     stats = {"scanned": 1, "in_sync": 0, "pushed": 0, "would_push": 0,
              "conflicts": 0, "errors": 0, "push_paths": []}
@@ -360,7 +364,7 @@ def test_nobaseline_owncloud_lane_merges_registered_store(tmp_path, monkeypatch)
 
 
 def test_nobaseline_owncloud_lane_unregistered_still_pulls(tmp_path, monkeypatch):
-    monkeypatch.setattr(_mod, "_snapshot_before_pull", lambda p: None)
+    monkeypatch.setattr(_mod, "_snapshot_before_pull", lambda p, **kw: None)
     be, full, _ = _incident_files(tmp_path, name="not-registered.jsonl")
     stats = {"scanned": 1, "in_sync": 0, "pushed": 0, "would_push": 0,
              "conflicts": 0, "errors": 0, "push_paths": []}
@@ -409,3 +413,119 @@ def test_backend_without_merge_put_preserves_legacy_behavior(tmp_path):
     assert be.merge_puts == []
     assert be.mirror_puts == [str(full)]  # legacy blind push preserved
     assert out == _md5(local)
+
+
+# ---------------------------------------------------------------------------
+# : the merge lane's .history label must name the lane it took.
+#
+# These live HERE rather than beside the other _snapshot_before_pull tests in
+# test_owncloud_sync.py because they need a merge-REGISTERED store, and
+# FakeMergeBackend / _incident_files above are the only fixture in the tree that
+# provides one. Duplicating a merge backend to keep the topical filing tidy
+# would mean testing the label against a second implementation of the thing.
+#
+# WHAT WENT WRONG. _try_merge_put called _snapshot_before_pull(full) with no
+# summary, so every merge inherited the DEFAULT label -- "pre-pull snapshot:
+# S3-authoritative overwrite of no-baseline local". On a merge not one clause of
+# that is true. It cost a full misdiagnosis:  read the note out of file
+# history (correctly preferring evidence over inference), and its mechanism
+# section, its framing and its first question all followed from a sentence that
+# described a branch the code never took.
+#
+# THE ASSERTION THAT MATTERS IS THE ABSENCE. A presence-only check ("the label
+# mentions the lane") passes just as happily on a label that ALSO still claims a
+# no-baseline overwrite, which is the pre-fix string with a prefix bolted on.
+_DEFAULT_SNAPSHOT_LABEL_MARKER = "no-baseline"
+
+
+def _capture_snapshot_summaries(monkeypatch):
+    """Record (path, summary) at the seam. summary is None when the caller
+    passed none, which is how the genuine no-baseline lanes reach the default."""
+    seen = []
+    monkeypatch.setattr(
+        _mod, "_snapshot_before_pull",
+        lambda p, *, summary=None: seen.append((str(p), summary)))
+    return seen
+
+
+@pytest.mark.parametrize(
+    "sync_kwargs,expected_lane",
+    [
+        ({"multi_machine": False}, "pushed_merged"),
+        ({"multi_machine": True, "own_cloud_authority": True},
+         "nobaseline_merged"),
+    ],
+    ids=["pushed_merged", "nobaseline_merged"],
+)
+def test_merge_lane_snapshot_label_names_the_lane_and_not_a_nobaseline_overwrite(
+    tmp_path, monkeypatch, sync_kwargs, expected_lane
+):
+    seen = _capture_snapshot_summaries(monkeypatch)
+    be, full, _ = _incident_files(tmp_path)
+    stats = {"scanned": 1, "in_sync": 0, "pushed": 0, "would_push": 0,
+             "conflicts": 0, "errors": 0, "push_paths": []}
+    _mod._sync_one(be, full, dry_run=False, stats=stats, **sync_kwargs)
+
+    assert stats.get(expected_lane) == 1, (
+        f"the {expected_lane} lane did not run, so this test proves nothing "
+        f"about its label; stats={stats}")
+    assert seen, "no snapshot was taken on the merge path at all"
+    _path, summary = seen[-1]
+
+    assert summary is not None, (
+        "the merge lane passed NO summary, so it inherits the default "
+        "'S3-authoritative overwrite of no-baseline local' label -- the exact "
+        "sentence that misrouted g-115-5125")
+    assert _DEFAULT_SNAPSHOT_LABEL_MARKER not in summary, (
+        f"a merge wrote a history note claiming a no-baseline overwrite: {summary!r}")
+    assert f"lane={expected_lane}" in summary, (
+        f"the note does not name the lane actually taken; got {summary!r}")
+
+
+def test_the_default_label_really_does_say_nobaseline(tmp_path, monkeypatch):
+    """Positive control for the absence assertion above.
+
+    Without this, a future edit to the default text would make
+    `"no-baseline" not in summary` pass for a reason that has nothing to do with
+    the merge lane being labelled correctly -- an absence test whose string can
+    no longer appear anywhere is vacuous, and it would stay green through a full
+    revert of the fix.
+    """
+    captured = {}
+    monkeypatch.setattr(
+        _mod, "_fileops_save_history_probe", lambda *a, **k: None, raising=False)
+
+    import types
+    fake_fileops = types.ModuleType("_fileops")
+    fake_fileops.resolve_base_dir = lambda full: Path(tmp_path)
+    fake_fileops.save_history = (
+        lambda full, base, source, summary=None: captured.update(summary=summary))
+    monkeypatch.setitem(sys.modules, "_fileops", fake_fileops)
+
+    f = tmp_path / "probe.jsonl"
+    f.write_bytes(b"x\n")
+    _mod._snapshot_before_pull(f)  # no summary -> the default
+
+    assert _DEFAULT_SNAPSHOT_LABEL_MARKER in (captured.get("summary") or ""), (
+        f"the default label no longer contains "
+        f"{_DEFAULT_SNAPSHOT_LABEL_MARKER!r}, so the merge-lane absence "
+        f"assertion above is now vacuous: {captured!r}")
+
+
+def test_genuine_nobaseline_pull_still_takes_the_default_label(tmp_path, monkeypatch):
+    """The fix must not over-apply: the S3-authoritative-at-bind PULL really IS
+    a no-baseline overwrite, so it keeps the default label. Relabelling every
+    call site would trade one wrong note for another."""
+    seen = _capture_snapshot_summaries(monkeypatch)
+    be = FakeMergeBackend()
+    f = tmp_path / "not-registered.md"
+    f.write_bytes(b"authored-local")
+    be.s3[str(f)] = b"s3-object"
+    stats = {"scanned": 1, "pulled": 0, "would_pull": 0, "skipped": 0,
+             "errors": 0, "in_sync": 0}
+    _mod._pull_one(be, f, dry_run=False, stats=stats, baseline_md5=None)
+
+    assert seen, "the no-baseline pull took no snapshot"
+    assert seen[-1][1] is None, (
+        f"the genuine no-baseline pull lane now passes an explicit summary "
+        f"({seen[-1][1]!r}); it should inherit the default, which is accurate there")

@@ -142,6 +142,56 @@ def test_append_knowledge_debt_invalid_400(running_daemon):
         raise AssertionError("expected 400 for unresolvable knowledge_debt node_key")
 
 
+def test_append_heals_int_in_goals_completed_list_slot(running_daemon):
+    """2026-08-16 worker-loop Phase 4b outage: the TOP-LEVEL
+    goals_completed_this_session (a LIST of hand-off rows) had been collapsed
+    to an int on 3 of 3 forked Bodies checked, and every append was refused
+    `not_a_list` forever — body-merge then dropped the Body's contribution
+    silently. An int there carries no rows, so it is always corruption: the
+    endpoint heals it to [] IN THE SAME REQUEST, appends, and says so."""
+    project_root, port = running_daemon
+    agent_dir = project_root / "agents" / "alpha"
+    wm_path = agent_dir / "session" / "working-memory.yaml"
+    data = _read_wm(agent_dir)
+    data["goals_completed_this_session"] = 0          # the collided counter shape
+    wm_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    status, body = _post(port, "/v1/wm/append", {"slot": "goals_completed_this_session"},
+                         json.dumps({"goal_id": "g-999-01", "aspiration_id": "asp-999",
+                                     "recurring": False}))
+    assert status == 200, body
+    out = json.loads(body)
+    assert out["ok"] is True and out["healed_from"] == "int:0", out
+    assert "warning" in out and "counter" in out["warning"], out
+    rows = _read_wm(agent_dir)["goals_completed_this_session"]
+    assert isinstance(rows, list) and rows[-1]["goal_id"] == "g-999-01", rows
+    # A second append is a plain append: no heal reported, both rows kept.
+    status, body = _post(port, "/v1/wm/append", {"slot": "goals_completed_this_session"},
+                         json.dumps({"goal_id": "g-999-02"}))
+    assert status == 200 and "healed_from" not in json.loads(body), body
+    assert [r["goal_id"] for r in _read_wm(agent_dir)["goals_completed_this_session"]] == \
+        ["g-999-01", "g-999-02"]
+
+
+def test_append_other_type_mismatch_still_refused(running_daemon):
+    """The heal is scoped to the ONE colliding slot: an int in any other array
+    slot, and a non-numeric scalar in this one, still refuse `not_a_list`."""
+    project_root, port = running_daemon
+    agent_dir = project_root / "agents" / "alpha"
+    wm_path = agent_dir / "session" / "working-memory.yaml"
+    data = _read_wm(agent_dir)
+    data["slots"]["known_blockers"] = 3
+    data["goals_completed_this_session"] = "seven"
+    wm_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    for slot in ("known_blockers", "goals_completed_this_session"):
+        try:
+            _post(port, "/v1/wm/append", {"slot": slot}, json.dumps({"id": "x"}))
+        except urllib.error.HTTPError as e:
+            assert e.code == 400
+            assert json.loads(e.read())["error"] == "not_a_list", slot
+        else:
+            raise AssertionError(f"expected not_a_list 400 for {slot}")
+
+
 def test_append_not_initialized_400(running_daemon):
     project_root, port = running_daemon
     # Use bravo, whose conftest dir has no working-memory.yaml.
@@ -256,3 +306,106 @@ def test_byte_compat_set_top_level(tmp_path):
     cli_wm = (cli_agent / "session" / "working-memory.yaml").read_bytes()
     dae_wm = (dae_agent / "session" / "working-memory.yaml").read_bytes()
     assert dae_wm == cli_wm
+
+
+# ---------------------------------------------------------------------------
+# : the WRAPPER layer — wm-append.sh discarded the daemon response
+# ---------------------------------------------------------------------------
+#
+#  fixed the DAEMON: a newly appended entry is never its own eviction
+# victim, and test_capture_eviction_newcomer.py pins that behaviour. This file
+# covers the layer that fix does not touch. wm-append.sh discarded the entire
+# response with `> /dev/null`, so `evicted` — reported by the daemon since
+#  — had never once reached a caller. A fix is not shipped when the
+# producer emits it; it is shipped when a consumer displays it (guard-742/547
+# one layer further out: daemon-vs-wrapper, not CLI-vs-daemon).
+#
+# Post- an eviction always destroys an OLD entry — the peer that has
+# waited longest for the reducer, which on a lane saturated at 100%
+# load_bearing is exactly what the priority exemption exists to rescue.
+#
+# known_blockers (array_limits 10) is used rather than a capture lane: the
+# behaviour is slot-agnostic, and known_blockers has no per-slot validation.
+
+_KB_LIMIT = 10
+
+
+def _seed_known_blockers(agent_dir: Path, n: int, *, load_bearing: bool):
+    """Write n incumbents straight to disk so cap state is exact, not inferred."""
+    p = agent_dir / "session" / "working-memory.yaml"
+    data = yaml.safe_load(p.read_text(encoding="utf-8"))
+    data.setdefault("slots", {})["known_blockers"] = [
+        {"id": f"seed-{i}", "reason": "incumbent",
+         "load_bearing": load_bearing, "_item_ts": "2020-01-01T00:00:00"}
+        for i in range(n)
+    ]
+    p.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+
+WM_APPEND_SH = REPO_ROOT / "core" / "scripts" / "wm-append.sh"
+
+
+@pytest.mark.skipif(not WM_APPEND_SH.exists(), reason="wm-append.sh missing")
+def test_wrapper_surfaces_eviction_on_stderr(running_daemon):
+    """The THIRD layer, and the one that made the daemon-side fix inert without
+    it: wm-append.sh discarded the entire response with `> /dev/null`, so the
+    `evicted` field the daemon has reported since g-306-289 never reached a
+    single operator. A daemon-only fix would have shipped and changed nothing
+    an agent can see (guard-742 class).
+
+    STDOUT must stay empty — the documented wrapper contract is "print nothing
+    on success" and callers parse it. The diagnostic goes to STDERR.
+    """
+    project_root, port = running_daemon
+    agent_dir = project_root / "agents" / "alpha"
+    _seed_known_blockers(agent_dir, _KB_LIMIT, load_bearing=True)
+
+    env = dict(os.environ)
+    env["RT_DIR"] = str(project_root / "mind_api" / "state")
+    env["MIND_AGENT"] = "alpha"
+    proc = subprocess.run(
+        ["bash", str(WM_APPEND_SH), "known_blockers"],
+        input=json.dumps({"id": "wrapper-probe", "reason": "destroyed"}),
+        text=True, env=env, cwd=str(REPO_ROOT), capture_output=True, timeout=60,
+    )
+
+    assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    assert proc.stdout.strip() == "", (
+        "the wrapper contract is silent-stdout on success; a diagnostic there "
+        f"would break every caller that parses it: {proc.stdout!r}")
+    assert "[wm-append]" in proc.stderr, (
+        "the eviction must reach the operator, not die in `> /dev/null`: "
+        f"{proc.stderr!r}")
+    assert "1 older entry evicted" in proc.stderr, proc.stderr
+    assert "OLDEST peer" in proc.stderr, proc.stderr
+
+    # : the newcomer is protected, so it is the entry that SURVIVES
+    # and an old peer is the one destroyed. Asserting this here keeps the
+    # wrapper test honest about which layer it is exercising.
+    arr = _read_wm(agent_dir)["slots"]["known_blockers"]
+    assert any(e.get("id") == "wrapper-probe" for e in arr), arr
+    assert len(arr) == _KB_LIMIT
+
+
+@pytest.mark.skipif(not WM_APPEND_SH.exists(), reason="wm-append.sh missing")
+def test_wrapper_stays_silent_on_an_ordinary_append(running_daemon):
+    """No-false-positive half for the wrapper. Almost every append is ordinary;
+    a wrapper that printed on all of them would train callers to ignore it."""
+    project_root, port = running_daemon
+    agent_dir = project_root / "agents" / "alpha"
+    _seed_known_blockers(agent_dir, 2, load_bearing=False)
+
+    env = dict(os.environ)
+    env["RT_DIR"] = str(project_root / "mind_api" / "state")
+    env["MIND_AGENT"] = "alpha"
+    proc = subprocess.run(
+        ["bash", str(WM_APPEND_SH), "known_blockers"],
+        input=json.dumps({"id": "quiet-probe", "reason": "fits"}),
+        text=True, env=env, cwd=str(REPO_ROOT), capture_output=True, timeout=60,
+    )
+
+    assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    assert proc.stdout.strip() == "", proc.stdout
+    assert "evicted to make room" not in proc.stderr, proc.stderr
+    assert any(e.get("id") == "quiet-probe"
+               for e in _read_wm(agent_dir)["slots"]["known_blockers"])

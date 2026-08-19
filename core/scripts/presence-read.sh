@@ -25,9 +25,9 @@ JSON_OUT="0"
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --agent) AGENT="$2"; shift 2 ;;
-        --since) SINCE="$2"; shift 2 ;;
-        --last) LAST="$2"; shift 2 ;;
+        --agent) AGENT="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --since) SINCE="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --last) LAST="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         --json) JSON_OUT="1"; shift ;;
         -h|--help)
             sed -n '2,15p' "$0"

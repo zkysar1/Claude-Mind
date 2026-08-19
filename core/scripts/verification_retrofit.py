@@ -175,7 +175,32 @@ def main(argv):
         }, indent=2))
         return 0
 
-    payload = {"outcomes": parsed["outcomes"], "checks": parsed["checks"]}
+    # : MERGE onto the goal's EXISTING verification object, never
+    # replace it. `update-goal` does a plain whole-value set with no merge on
+    # either the daemon path (mind_api/src/endpoints/aspirations_write.py) or the
+    # CLI twin (core/scripts/aspirations.py), so every sibling key this payload
+    # did not reconstruct was dropped at rc=0 -- guard-2444, on the exact field
+    # guard-2444 names as the destructive case. The goal record was already
+    # loaded above, so nothing structural prevented the merge; it simply was not
+    # done.
+    #
+    # Measured against the live world queue (5265 goals, 2026-08-04): 597 goals
+    # carry a `preconditions` key, 139 a NON-EMPTY preconditions list, and 27
+    # have non-empty preconditions AND no outcomes -- which is exactly this
+    # script's target population, since it exists to backfill goals that LACK
+    # outcomes. preconditions gate SELECTABILITY, so the loss neither errors nor
+    # warns: the goal keeps looking well-formed and simply starts being picked
+    # when it should not be. Other droppable siblings seen live: revision_note,
+    # not_verified_on_this_box, desiredEndState.
+    #
+    # parsed outcomes/checks deliberately WIN over any existing values -- writing
+    # them is the whole point of the retrofit. Everything else survives.
+    pre = goal.get("verification")
+    pre = dict(pre) if isinstance(pre, dict) else {}
+    payload = dict(pre)
+    payload["outcomes"] = parsed["outcomes"]
+    payload["checks"] = parsed["checks"]
+    preserved = sorted(k for k in pre if k not in ("outcomes", "checks"))
 
     if args.apply:
         # Invoke aspirations.py directly via the same Python interpreter to avoid
@@ -190,22 +215,48 @@ def main(argv):
             print(f"update-goal failed (rc={r.returncode}): {r.stderr}",
                   file=sys.stderr)
             return 1
+
+        # POST-APPLY ASSERTION, compared against the PRE parent -- NOT against
+        # the payload just constructed. Diffing the written value against the
+        # payload would be circular: a whole-value overwrite echoes the payload
+        # back perfectly, so that check passes exactly as well on the defect as
+        # on the fix. Re-reading the goal and diffing against `pre` is the only
+        # shape that can observe a dropped sibling, which is why the goal states
+        # this comparand explicitly rather than leaving it to the implementer.
+        post_goal, _post_asp, _post_src = _load_goal(args.goal_id, args.source)
+        post = (post_goal or {}).get("verification")
+        post = post if isinstance(post, dict) else {}
+        lost = sorted(k for k in pre if k not in post)
+        if lost:
+            print(f"SIBLING KEY LOSS after retrofit of {args.goal_id}: {lost} "
+                  f"were present in `verification` before the write and are absent "
+                  f"after. The merge did not take effect -- do NOT re-run until "
+                  f"this is understood; the pre-write values are recoverable from "
+                  f"the store's .history snapshot.", file=sys.stderr)
+            return 1
+
         print(json.dumps({
             "goal_id": args.goal_id,
             "source": src,
             "aspiration_id": asp_id,
             "applied": True,
             "verification": payload,
+            "preserved_sibling_keys": preserved,
+            "sibling_keys_verified": True,
         }, indent=2))
         return 0
 
-    # dry-run
+    # dry-run. `verification` here is the MERGED object, so the preview shows
+    # what --apply will actually write rather than the two reconstructed keys in
+    # isolation; preserved_sibling_keys names what the merge is carrying through,
+    # which is the part a reader needs to see BEFORE authorizing the write.
     print(json.dumps({
         "goal_id": args.goal_id,
         "source": src,
         "aspiration_id": asp_id,
         "parsed": True,
         "verification": payload,
+        "preserved_sibling_keys": preserved,
     }, indent=2))
     return 0
 

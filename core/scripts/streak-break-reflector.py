@@ -154,6 +154,26 @@ def _has_session_gap(start_dt: datetime, end_dt: datetime,
     long window still returns True via the "no entries" rule above —
     that's an inactivity signal, not an infrastructure error.
 
+    RETENTION HORIZON (g-333-03 x g-115-1319, measured 2026-08-17): the
+    diary is NOT append-only — iteration-close.sh trims it to its last
+    8h on EVERY close, so its evidence covers only [oldest surviving
+    entry, now]. Absence of entries BEFORE that horizon is a property of
+    the trim, not of the agent. Read naively, that void looked like
+    inactivity and suppressed EVERY canary whose window reached past
+    ~10h (8h trim + 2h threshold): of alpha's 49 session-gap
+    suppressions since the trim landed, the smallest window was 10.8h and
+    the median 92h — including the 23.2h g-306-284 drain-lane stall,
+    suppressed as "agent inactive" while the reducer had closed goals
+    all night. So the window is CLAMPED to the covered horizon below: a
+    portion of the window older than the oldest surviving entry is
+    UNDECIDABLE and never counts as a gap, and a window that lies
+    entirely before the horizon returns False — the same direction as
+    the missing-diary rule (leave the canary open / let it file), since
+    the trim destroys evidence of ACTIVITY only, never of idleness (a
+    dormant agent's diary is not trimmed, because nothing closes).
+    guard-4085 is the general rule: a windowed store cannot answer a
+    question about time it no longer retains.
+
     Closes the bravo 2026-05-20 catch-up cluster: 6 streak-break canaries
     from a 30h session gap stayed open under the streak_mult window
     because the recovery was always > 2 * interval. With this helper, the
@@ -168,6 +188,7 @@ def _has_session_gap(start_dt: datetime, end_dt: datetime,
     except OSError:
         return False
     timestamps: list[datetime] = []
+    oldest: datetime | None = None
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -177,8 +198,18 @@ def _has_session_gap(start_dt: datetime, end_dt: datetime,
             ts = datetime.fromisoformat(str(rec.get("timestamp", "")))
         except (json.JSONDecodeError, ValueError, TypeError):
             continue
+        if oldest is None or ts < oldest:
+            oldest = ts
         if start_dt <= ts <= end_dt:
             timestamps.append(ts)
+    # Retention-horizon clamp — see docstring. `oldest` is the oldest entry
+    # in the WHOLE diary (not the window): the trim removes a contiguous
+    # prefix, so evidence coverage is exactly [oldest, now].
+    if oldest is not None:
+        if oldest > end_dt:
+            return False  # whole window predates the retained horizon: undecidable
+        if oldest > start_dt:
+            start_dt = oldest
     span_hours = (end_dt - start_dt).total_seconds() / 3600.0
     if not timestamps:
         # No activity in the window at all. Only counts as a gap if the

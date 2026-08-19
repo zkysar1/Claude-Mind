@@ -2,9 +2,18 @@
 
 session_desync_check._classify_orphan frames each UNREGISTERED session/ file
 around whether its content survives a machine-move under the own-cloud sweep:
-  - data extension  -> sweep mirrors to S3 but NOT pulled on move -> info, register
+  - data extension  -> sweep MIRRORS to S3, but registration is what makes a
+    session file eligible for the both-diverged LOCAL-WINS auto-resolve, so an
+    unregistered one can wedge PERMANENTLY -> warning, register
   - signal-shaped   -> sweep keeps machine-local -> knowledge LOST on move -> warning
 The data-extension set is the SSOT owncloud_sync._SESSION_DATA_EXTS.
+
+SEVERITY CONTRACT (g-115-6352, 2026-08-16): both branches are now 'warning'.
+The data branch was 'info' until the severities were found INVERTED relative to
+consequence — the signal branch is recoverable (the file stays local and is
+regenerated) while the data branch has no healing path below it. Severity
+therefore no longer discriminates the two branches; `data_class` and the
+message do, which is why the data test pins the wedge language explicitly.
 """
 import sys
 from pathlib import Path
@@ -16,10 +25,15 @@ if str(SCRIPTS) not in sys.path:
 import session_desync_check as _mod  # noqa: E402
 
 
-def test_classify_orphan_data_ext_is_info_with_register_hint():
+def test_classify_orphan_data_ext_is_warning_with_register_hint():
     sev, dclass, desc = _mod._classify_orphan("notes.jsonl", 4096)
-    assert sev == "info" and dclass == "data"
+    assert sev == "warning" and dclass == "data"
     assert "continuity" in desc and "S3" in desc and "4096B" in desc
+    # Severity alone no longer separates the branches, so pin the consequence
+    # that motivated the promotion: an unregistered data file is INELIGIBLE for
+    # the auto-resolve and therefore wedges permanently rather than transiently.
+    assert "PERMANENT WEDGE" in desc
+    assert "ephemeral" in desc and "machine_local" in desc
 
 
 def test_classify_orphan_signal_extensionless_is_warning():
@@ -35,7 +49,7 @@ def test_classify_orphan_unknown_ext_is_warning():
 
 def test_classify_orphan_size_unknown_renders_gracefully():
     sev, dclass, desc = _mod._classify_orphan("x.yaml", None)
-    assert sev == "info" and "unknown size" in desc
+    assert sev == "warning" and "unknown size" in desc
 
 
 def test_classify_orphan_fallback_when_exts_unavailable(monkeypatch):

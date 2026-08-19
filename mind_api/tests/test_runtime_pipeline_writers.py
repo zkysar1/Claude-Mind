@@ -25,6 +25,16 @@ def _post(port: int, path: str, query: dict = None, body: bytes = b"",
         return resp.status, resp.read().decode("utf-8")
 
 
+def _get(port: int, path: str, query: dict = None, *, agent: str = "alpha"):
+    qs = urllib.parse.urlencode(query) if query else ""
+    url = f"http://127.0.0.1:{port}{path}?{qs}" if qs else f"http://127.0.0.1:{port}{path}"
+    req = urllib.request.Request(url, method="GET")
+    if agent:
+        req.add_header("X-Mind-Agent", agent)
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return resp.status, resp.read().decode("utf-8")
+
+
 def _post_expect_error(port: int, path: str, query: dict = None,
                        body: bytes = b"", *, agent: str = "alpha"):
     qs = urllib.parse.urlencode(query) if query else ""
@@ -181,6 +191,46 @@ def test_add_changelog_appended(pipeline_daemon):
     assert cl.exists()
     entries = _read_jsonl(cl)
     assert any("pipeline-add" in (e.get("summary", "") or "") for e in entries)
+
+
+def test_add_recomputes_meta(pipeline_daemon):
+    """Twin of test_move_recomputes_meta — add() must refresh meta too.
+
+    add() was the only pipeline write op that never called _update_meta, so a
+    newly-added hypothesis stayed invisible to --counts until some LATER move
+    or update happened to refresh the file (g-115-4212). Conftest seeds
+    stage_counts.discovered=0 and no `last_updated`, so both the increment and
+    the stamp assertions below fail against the unfixed writer.
+    """
+    project_root, port = pipeline_daemon
+    meta_path = project_root / "world" / "pipeline-meta.json"
+
+    before = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert before["stage_counts"]["discovered"] == 0
+    assert before.get("last_updated") is None
+
+    status, _ = _post(
+        port, "/v1/pipeline/add", body=json.dumps(_rec()).encode("utf-8"))
+    assert status == 200
+
+    after = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert (after["stage_counts"]["discovered"]
+            == before["stage_counts"]["discovered"] + 1)
+    assert after.get("last_updated") is not None
+    # Recomputed from the store, not blind-incremented: untouched stages hold.
+    assert after["stage_counts"]["active"] == 1
+    assert after["stage_counts"]["resolved"] == 1
+
+    # End-to-end through the READER, which is where the symptom was reported.
+    # This is not a restatement of the assertions above: `--counts` returns
+    # meta["stage_counts"] VERBATIM whenever pipeline-meta.json exists
+    # (pipeline.py:189) and only recomputes from the store when the file is
+    # ABSENT (:190-201). So on any store that has the file — every real one —
+    # a stale meta is what the reader reports, with no recompute to mask it.
+    counts = json.loads(_get(port, "/v1/pipeline/read", {"counts": "1"})[1])
+    assert counts["discovered"] == 1
+    assert counts["active"] == 1
+    assert counts["resolved"] == 1
 
 
 # ---------------------------------------------------------------------------

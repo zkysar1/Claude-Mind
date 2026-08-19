@@ -65,15 +65,69 @@ When tree + codebase aren't enough, search the web for external knowledge.
 - Tree + codebase fully answered the question
 - Topic is purely internal (private codebase knowledge)
 
+### Tier 2.5: Peer Worlds (Cross-Deployment, READ-ONLY)
+
+**All three tiers above are single-world by construction.** `retrieve.py` reads
+`WORLD_PATH` and nothing else — it has zero references to `ENVIRONMENT_ID`,
+`COMMONS_POLICY`, or any peer, and it never reads board channels (its one
+`board` occurrence is a comment). So an answer that lives in a peer Mind
+deployment is invisible to Tiers 1-3 even when every deployment is perfectly
+healthy. That is a substrate gap, not a diligence gap: no amount of Tier-1/2
+rigor can close it, which is what makes it different from every other
+"exhaustive search" failure mode.
+
+```bash
+bash core/scripts/peer-retrieve.sh <query terms...>        # add --json for the raw object
+```
+
+**When to use Tier 2.5**: before reporting that something does not exist,
+before answering a question whose subject another deployment owns, and any
+time the user's question spans the fleet rather than this world. It is cheap
+(filesystem reads) and read-only in every mode.
+
+**Read the exit code — it is the whole point.**
+
+| rc | meaning |
+|----|---------|
+| 0 | every registered world was fully read; an `empty` here is an EARNED negative |
+| 2 | usage error (empty query, or `--limit` below 1) — nothing was searched, so this is not a result at all |
+| 3 | **PARTIAL** — at least one world could not be fully read, so absence there is NOT evidence of absence |
+
+Each world reports two orthogonal fields, and conflating them is the failure
+this tier exists to prevent:
+
+- `status` — `hit` \| `empty` \| `unreachable` (did I find anything?)
+- `completeness` — `complete` \| `partial` (did I see everything?)
+
+A world can be `hit` **and** `partial` at once — that is the common case for a
+peer whose published output reached our board while its own store stays
+unreachable. `status: empty` is the ONLY value that licenses a negative
+conclusion, and it is unreachable-free by construction.
+
+**Two lanes per peer.** The `direct` lane reads the peer's world store when a
+`peer_world_path` is configured; the `channel` lane finds peer-authored content
+(`<agent>@<env-id>`) that already arrived on THIS world's board. The channel
+lane is always reachable but shows only what the peer chose to publish — it can
+never stand in for the direct lane, which is why an unreachable direct lane
+keeps the world `partial` even when the channel returns hits.
+
+**READ-ONLY, never import/merge.** Nothing retrieved is written into this
+world's stores, and every record keeps its `origin_env`. Rationale against
+`world-contract.md` G1-G5 lives in `peer_retrieve.py`'s module docstring. The
+reader never imports `_fileops`, so a peer read cannot inherit this world's
+storage backend (guard-955 / rb-2983 class) — `assert_no_fileops()` proves it
+at runtime rather than asserting it in prose.
+
 ## Mode Gates
 
-| Mode       | Tier 1 (Tree) | Tier 2 (Codebase) | Tier 3 (Web) |
-|------------|---------------|---------------------|--------------|
-| reader     | Yes           | Yes                 | No           |
-| assistant  | Yes           | Yes                 | Yes          |
-| autonomous | Yes           | Yes                 | Yes          |
+| Mode       | Tier 1 (Tree) | Tier 2 (Codebase) | Tier 2.5 (Peer worlds) | Tier 3 (Web) |
+|------------|---------------|---------------------|------------------------|--------------|
+| reader     | Yes           | Yes                 | Yes                    | No           |
+| assistant  | Yes           | Yes                 | Yes                    | Yes          |
+| autonomous | Yes           | Yes                 | Yes                    | Yes          |
 
 Tier 2 (Grep/Glob/Read) is inherently read-only — safe in all modes.
+Tier 2.5 (`peer-retrieve.sh`) is read-only by construction — safe in all modes.
 Tier 3 (WebSearch/WebFetch) requires assistant or autonomous mode.
 
 ## Sufficiency Evaluation Criteria

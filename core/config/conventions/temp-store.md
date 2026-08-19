@@ -23,6 +23,30 @@ files that used to scatter across `reports/` and ad-hoc locations.
   fresh clone. Unlike `session/`/`sessions/`, the ignore is now a portable
   committed `.gitignore` rule (it previously lived only in a machine-local
   `.git/info/exclude`, which did not travel to fresh boxes — the g-115-1765 bug).
+- **Purge reclaims the store of record — since g-115-6196 (`bba547e57`), and NOT
+  before.** The S3 sync above has a consequence that is easy to miss and was
+  live for a long time: because `temp/` is a real sync root, a local `find
+  -delete` reclaims *nothing*. Every purged file remained an object in the
+  authoritative store, so a purge was **not durable** (any `owncloud-pull.sh
+  --with-temp`, fresh clone, or transplant restored it) and the store was never
+  reclaimed. Measured at the time: one agent's local temp went to 31 files / 60 MB
+  while its S3 prefix held 23,125 objects / 3.33 GB. `temp-drain-purge.sh` now
+  pipes its exact deleted set into `owncloud_sync.py --purge-propagate`
+  (`temp-drain-purge.sh:694`), which `delete_object()`s each key. Three
+  properties worth knowing before relying on it:
+  (a) it is **ownership-gated** — a non-owner box refuses every key, so the S3
+  half of a purge is an owner-box act, which is also where residue accumulates;
+  (b) it is **fail-soft** — propagation failure degrades to the pre-fix
+  local-only behavior and is recorded in the report's `backend_propagation`
+  field rather than raised, so read that field instead of assuming;
+  (c) it is **not retroactive** — the historical backlog is untouched by design
+  and is owned separately by g-115-6229, so a still-growing prefix count is
+  expected and is not evidence the fix failed.
+  Verified on the owner box by HEAD on a specific key (alpha, `hostname` cc-04,
+  2026-08-15): present after push → **still present after a local `rm`** (the
+  defect, reproduced) → absent after propagate; with `--dry-run` correctly
+  reporting `would_delete` without deleting, and out-of-scope / other-agent
+  paths refused.
 
 ---
 
@@ -216,6 +240,29 @@ so Phase 1.5 **purges** it, rather than Phase 1 enumerating a bare `.json` as a
 drainable working doc and Phase 3 archiving megabytes of valueless scratch into
 `drained/`. The extension is the stable purge marker; a bare-named `.json` dump
 is treated as a working doc and drained. (g-115-2947)
+
+**The same rule applies to one-shot command INPUT, and that direction is the one
+that actually accumulates.** Everything above says "output" — dumps, stdout,
+"for inspection" — so a JSON body written to be piped INTO a script
+(`cat goal.json | aspirations-add-goal.sh`) reads as a legitimate `.json` working
+doc, and the rule above then converts it into permanent residue. An input payload
+is an IO buffer with no reuse value on exactly the same grounds as an output dump:
+once the command has run, the store holds the effect and the buffer holds nothing.
+Name it `.raw`/`.in`, or write it to `session/scratch/`.
+
+Measured 2026-08-16 (echo, cc-03, g-001-84): 153 of 209 root files in one temp/
+were one-shot command IO — 84 outputs, correctly `.raw`-named and purgeable, and
+69 inputs named `.json`, which had accumulated over 18 days. The input half is
+STRUCTURALLY STUCK, and that is why this is a convention change and not a naming
+preference: wrong extension to purge (Phase 1.5 skips `.json`), and Phase 2 cannot
+discard them either, because `drain-encode-probe.py` reads a goal payload whose
+goal was never filed as `absent` — 69 of 69 — and `absent` BLOCKS discard by
+design. Verified across four surfaces (both live queues, both archives) that the
+goals genuinely do not exist, and the cause is deliberate refusal, not loss:
+echo's `goal-duplication-gate` blocked 719 filings in the same window. So the
+payloads are refused-draft residue that the drain lane must never encode and
+cannot archive — a file class with no exit. Correct naming at write time is the
+only place this is cheap to fix. (g-001-84)
 
 Pure ephemera lands in temp/ legitimately — the framework's own guidance
 redirects test-suite output here (`.claude/rules/run-full-suite-after-deep-code.md`

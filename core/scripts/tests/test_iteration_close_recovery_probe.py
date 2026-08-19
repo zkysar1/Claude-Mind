@@ -79,10 +79,23 @@ def _cleanup_fake_agent_dir():
     fleet boxes do not hold s3:DeleteObject, so the local mirror goes, the backing
     object survives, and the next read re-materializes the shard UN-tombstoned.
     g-115-4327 had already measured exactly this inside _team_state.retire_agent a
-    week before this fixture was written. Retire through the GOVERNED write path
-    (locked_modify_yaml) so the tombstone reaches the backing store, then unlink
-    best-effort — tombstone FIRST, since the reverse order lets the governed write
-    re-create the file without the mark. See the conftest helper for the full trace.
+    week before this fixture was written.
+
+    NOR MAY IT BE AN IN-PROCESS WRITE — INCLUDING THE GOVERNED ONE. This docstring
+    prescribed exactly that (locked_modify_yaml, then a best-effort unlink) until
+    2026-08-10, and the prescription was already refuted by measurement when it was
+    written: the pollution and the cleanup sit on OPPOSITE SIDES of the guard-955
+    pin. The phantom row is written by the DAEMON, which runs own-cloud and lands
+    in S3; this pytest process is pinned STORAGE_BACKEND=local, so ANY in-process
+    write — governed or not — reaches the LOCAL MIRROR ONLY and the next read
+    discards it. Measured 2026-08-08 (cc-04): the in-process helper left the S3
+    object byte-identical (same LastModified, retired_by unchanged), while the
+    same retirement issued through team-state-retire.sh moved it and flipped
+    _is_retired to True.
+
+    So the retirement MUST go out through team-state-retire.sh, which puts the
+    write back on the daemon's own lane. That is what the shared helper below
+    does — do not re-implement it here. See the conftest helper for the full trace.
 
 
     MIND_WORLD TMP ISOLATION DOES NOT WORK HERE, ALSO MEASURED (do not "improve"
@@ -101,9 +114,32 @@ def _cleanup_fake_agent_dir():
     except ImportError:
         _retire = None
 
+    def _shard_present():
+        """AUTHORITATIVE first, local mirror as the union — never local alone.
+
+        guard-980: a bare Path.exists() is the wrong question on this backend.
+        The mirror is a read-through cache, so it reads False for a row the
+        DAEMON wrote to the backing store that this box has simply not read yet
+        — which is exactly the case this cleanup exists for. Measured 2026-08-08
+        (cc-04): the daemon advanced the phantom's row in S3 with NO local mirror
+        present at teardown, so a local-only gate skipped the retire and reported
+        success while the row sat latent and re-materialized on the next read.
+        The sibling conftest teardown enumerates the same way (backend list_dir
+        UNION local glob) after measuring the two lanes disagree in practice —
+        12 shards vs 11. Keep the union: OR, not either alone, so a local-only
+        file with no backing object is still cleaned.
+        """
+        try:
+            import storage_backend as _sb
+            if _sb.get_backend().exists(FAKE_AGENT_SHARD):
+                return True
+        except Exception:
+            pass
+        return FAKE_AGENT_SHARD.exists()
+
     def _clean():
         shutil.rmtree(FAKE_AGENT_DIR, ignore_errors=True)
-        if _retire is not None and FAKE_AGENT_SHARD.exists():
+        if _retire is not None and _shard_present():
             _retire(FAKE_AGENT_SHARD)
 
     _clean()

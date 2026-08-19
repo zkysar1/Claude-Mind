@@ -5,7 +5,13 @@
 # 0.5b.2b — closes the LLM-only-pseudocode gap surfaced by fresh-eyes-review
 # 2026-06-18 (; sibling of inbox-alert-age-check.sh / ).
 #
+# Also emits an `inbound` block (): pending goals routed TO self via
+# intended_agent/handoff_to, which nothing aged before. Report-only — it posts
+# nothing, so the caller must READ it (precheck Phase 0.5b.2b does).
+#
 # Usage: handoff-aging-check.sh [--apply] [--escalate-hours N] [--agent NAME]
+#                               [--inbound-max-report N]          # non-HIGH cap (default 5)
+#                               [--no-inbound]                    # skip the inbound pass
 #                               [--board-escalation-log <path>]  # tests only
 #                               [--no-board]                      # tests only
 set -euo pipefail

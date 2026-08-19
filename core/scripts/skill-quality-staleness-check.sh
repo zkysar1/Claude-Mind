@@ -31,7 +31,7 @@ while [ $# -gt 0 ]; do
         --check) MODE="check"; shift ;;
         --file-goal) MODE="file-goal"; shift ;;
         --json) JSON=1; shift ;;
-        --days) DAYS="$2"; shift 2 ;;
+        --days) DAYS="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         -h|--help)
             sed -n '2,18p' "$0" | sed 's/^# //; s/^#//'
             exit 0

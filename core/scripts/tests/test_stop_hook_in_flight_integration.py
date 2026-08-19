@@ -717,3 +717,95 @@ def test_symlinked_core_would_split_the_project_root(tmp_path):
         f"python resolved {py_root!r}, expected the REAL repo root -- if this "
         "now matches bash, the hazard is gone and _copy_core may be simplified")
     assert bash_root != py_root, "the split-brain hazard should still hold"
+
+
+# ── worker-net valve 5: the PARK stand-down () ─────────────────────
+#
+# TWO PARK VALVES ONCE EXISTED HERE AND THE FORK IS NOW RESOLVED (
+# reducer ruling, 2026-08-17). Both were built for  concurrently, on
+# boxes that could not see each other: a SENTINEL valve keyed on a `body-parked`
+# file with a 70-minute freshness bound, and this MANIFEST valve keyed on
+# `body_state: parked`. git auto-merged stop-hook.sh CLEANLY, which is the
+# dangerous case worker-loop/SKILL.md's Phase -0.2 comment warns about — the
+# conflicting file announced itself, the harmless-looking one did not. Both
+# logged the SAME gate name from different predicates, so the log could not say
+# which mechanism parked a Body.
+#
+# The manifest won on measurement, not preference: nothing ever wrote the
+# sentinel file (it was unreachable in production from the day it landed), its
+# stated reason to exist was a worker-loop constraint that no longer holds
+# (`parked` is non-active AND resumable there now), and the entire park
+# lifecycle — worker-loop's park/resume/park-expired calls, deadman-directive's
+# resumable branch — is already written against the manifest. The sentinel valve
+# and its three tests were REMOVED, not left inert. Full reasoning: the ruling on
+# the `decisions` board and the comment block at the valve itself.
+#
+# These two pin the surviving valve: that it fires, and that it stays DISJOINT
+# from the closed valve it sits next to.
+
+def test_worker_net_stands_down_on_a_PARKED_manifest(tmp_path):
+    """A PARKED Body's turn-end must ALLOW () — and this valve is what
+    makes parking work at all, not a convenience.
+
+    A park deliberately ends the turn with no `Skill(worker-loop)` and no
+    body-closing sentinel, so to every pre-existing discriminator it looks
+    exactly like a between-units text-death: fork WM present, no sentinel, no
+    stop-requested, manifest not in the closed set. It therefore fell through to
+    the BLOCK, whose instruction is "write the body-closing sentinel and end the
+    turn" — which would durably CLOSE the Body on the very turn it parked, and
+    defeat the entire feature. The Body would then need the user-only /start
+    that parking exists to remove.
+
+    Discriminator pair, one field apart: the closed-manifest test above
+    ('closed-pending-merge' → ALLOW as CLOSED) and
+    test_worker_net_blocks_when_there_is_no_runner_file ('active' → BLOCK). This
+    is the third value, and it must ALLOW for a DIFFERENT reason than the closed
+    one — hence its own gate name in the log. A shared name would make a parked
+    Body indistinguishable from a closed one in the only durable record of why
+    the turn was let go.
+
+    The fixture writes the quoted form _render_manifest emits (guard-920).
+    """
+    proc, _shard, root = _drive(tmp_path, closing=False, runner_file=False,
+                                scrub_env=True, body_state="parked")
+    log = _hook_log(root)
+
+    assert proc.returncode == 0, f"hook must fail-open: {proc.stderr[-2000:]}"
+    assert not _blocked(proc), (
+        "a PARKED Body's turn-end was BLOCKED — the BLOCK instructs it to write "
+        "the body-closing sentinel, which durably closes the Body on the turn "
+        "it parked and defeats auto-resume entirely.\n"
+        f"stdout:\n{proc.stdout}\nlog:\n{log}")
+    assert "gate=worker-net-body-parked" in log, (
+        "the stand-down fired under the wrong gate name — parked and closed "
+        "must be distinguishable in the log, since only one of them is coming "
+        f"back; log:\n{log}")
+    assert "BLOCK gate=worker-net" not in log, (
+        f"the net still BLOCKed despite the parked manifest; log:\n{log}")
+
+
+def test_the_parked_and_closed_valves_are_disjoint(tmp_path):
+    """Neither valve may swallow the other's state.
+
+    Both greps run against the same manifest line, so a loosened pattern (a
+    `parked` matcher that also matches `closed-pending-merge`, or a closed
+    matcher widened back to "not active") would silently collapse two verdicts
+    into one — and the collapse is invisible: both still ALLOW, so every test
+    that only checks the turn-end outcome keeps passing while the log stops
+    telling anyone whether the Body is ever coming back.
+    """
+    (tmp_path / "p").mkdir()
+    (tmp_path / "c").mkdir()
+    _proc_p, _s, root_p = _drive(tmp_path / "p", closing=False,
+                                 runner_file=False, scrub_env=True,
+                                 body_state="parked")
+    _proc_c, _s2, root_c = _drive(tmp_path / "c", closing=False,
+                                  runner_file=False, scrub_env=True,
+                                  body_state="closed-pending-merge")
+    log_p, log_c = _hook_log(root_p), _hook_log(root_c)
+    assert "gate=worker-net-body-parked" in log_p
+    assert "gate=worker-net-body-closed" not in log_p, (
+        f"the closed valve claimed a parked Body; log:\n{log_p}")
+    assert "gate=worker-net-body-closed" in log_c
+    assert "gate=worker-net-body-parked" not in log_c, (
+        f"the parked valve claimed a closed Body; log:\n{log_c}")

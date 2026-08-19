@@ -54,6 +54,13 @@ PROJECT_ROOT = CORE_ROOT.parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, )
+# Shared scope vocabulary (). Imported, never re-derived: the four
+# reclaim lanes and the coverage reporter all draw from this one table, and a
+# local copy here would drift from them silently.
+from gates.defer_scope import (  # noqa: E402
+    SENTINEL as _DEFER_SCOPE_SENTINEL,
+    classify as _defer_scope_classify,
+)
 
 import _rt
 from _paths import WORLD_DIR
@@ -262,13 +269,48 @@ def main() -> None:
         # Try to extract an env-var key.
         key = _extract_env_key(defer_reason)
         if key is None:
+            # A MISS HERE IS ABOUT THIS SWEEP'S KEY-SPACE, NOT ABOUT THE ITEM
+            # (, rb-7289). Measured on cc-05: scanned 17, eligible 17,
+            # skipped_no_key 16 — every one of them reported "human-only defer".
+            # Classifying the SAME population through the shared vocabulary in
+            # gates/defer_scope.py found 7 of 7 credential-lane defers KEYABLE,
+            # 6 of them by an IAM action string (`<service>:<PascalCaseAction>`)
+            # this file's ALL_CAPS_WITH_UNDERSCORE pattern cannot see.
+            #
+            # So before recording a miss, ask the shared classifier whether the
+            # text is keyable at all. It is imported rather than re-derived: a
+            # second predicate here would drift from the one the coverage
+            # reporter and the other three lanes use, which is the mismatch this
+            # goal exists to close.
+            scope = _defer_scope_classify("credential", defer_reason)
             skipped_no_key += 1
-            details.append({
-                "goal_id": goal["id"],
-                "action": "skipped_no_key",
-                "reason": "no env-read/credential indicator in defer text; human-only defer",
-                "defer_reason": defer_reason[:120],
-            })
+            if scope != _DEFER_SCOPE_SENTINEL:
+                # Keyable, but not by env-read. An IAM permission or an account
+                # grant is a real, recognised scope that this sweep has no probe
+                # for — which is a statement about the PROBE, not the defer.
+                details.append({
+                    "goal_id": goal["id"],
+                    "action": "skipped_no_key",
+                    "scope": scope,
+                    "reason": f"no env-var-shaped token found; defer_scope classifies "
+                              f"it as '{scope}', which env-read.sh cannot probe",
+                    "defer_reason": defer_reason[:120],
+                })
+            else:
+                # REPORT THE OBSERVATION, NOT THE CONCLUSION. The old wording
+                # said "human-only defer" — an inference this sweep is not
+                # entitled to draw from its own miss, and the reason the
+                # mismatch stayed invisible: a reader who sees "human-only"
+                # stops asking whose key-space failed to match.
+                details.append({
+                    "goal_id": goal["id"],
+                    "action": "skipped_no_key",
+                    "scope": scope,
+                    "reason": "no env-var-shaped or IAM-action-shaped token found "
+                              "in defer text (unrecognised by this sweep's "
+                              "key-space; NOT established as human-only)",
+                    "defer_reason": defer_reason[:120],
+                })
             continue
 
         # Re-probe the named env key.

@@ -37,6 +37,13 @@ def _run_cli(repo: Path, goal_id: str, override: str | None,
         args.extend(["--override", override])
     env = os.environ.copy()
     env["MIND_AGENT"] = agent
+    # BODY_ROLE is injected into every Bash call by the PreToolUse hook, so an
+    # inherited env carries whatever role THIS box happens to be — which made
+    # the CLI-vs-module parity assertions below depend on where they were run
+    # (a worker box and a reducer box would disagree). Pin it empty so the CLI
+    # sees the same "no role supplied" input the direct-module calls pass.
+    #  exposed this; the fragility pre-dates that change.
+    env.pop("BODY_ROLE", None)
     proc = subprocess.run(args, env=env, capture_output=True, text=True,
                           check=False)
     if proc.returncode not in (0, 1):

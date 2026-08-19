@@ -252,3 +252,122 @@ def test_unknown_flag_is_refused_with_exit_2():
 def test_missing_positionals_exit_2():
     res = _run_wrapper("g-1", "outcome_note")
     assert res.returncode == 2
+
+
+# ── 6. The concurrent-append race () ──────────────────────────────
+#
+# POSITIVE CONTROL. Every test below was written against the PRE-fix code and
+# watched go red before the fix existed — a concurrency test authored after the
+# fix proves nothing about the race, because the interleaving it claims to
+# reproduce may never have been reachable.
+#
+# The race: read_goal() and the write are two separate subprocess round-trips
+# with nothing serializing the span. A and B both read PRE, both compose
+# PRE+own-text, and B's write clobbers A's. Both pass verify_post(), because
+# each writer's own sentinel is present, its own PRE survived, and the length
+# grew — so neither ever learns the other's text is gone.
+
+def _concurrent_store(monkeypatch, *, pre, peer_text, field="outcome_note"):
+    """Fake store whose value mutates BETWEEN this process's read and its write.
+
+    The first query returns a snapshot of `pre`; the peer's append is applied to
+    the store immediately after that snapshot is handed back. That ordering IS
+    the race — every later query (including the fix's pre-write re-read) sees
+    the peer's value, exactly as a real concurrent writer would leave it.
+
+    `peer_text=None` disables the interleaving, giving the uncontended control.
+    """
+    store = {"goal_id": "g-1", "priority": "MEDIUM", field: pre}
+    state = {"queries": 0, "writes": []}
+
+    def fake_run(argv, **kw):
+        joined = " ".join(str(a) for a in argv)
+        if "aspirations-query.sh" in joined:
+            state["queries"] += 1
+            snapshot = json.dumps([dict(store)])
+            if state["queries"] == 1 and peer_text is not None:
+                store[field] = (store[field] + "\n\n" if store[field] else "") + peer_text
+            return _Res(stdout=snapshot)
+        if "aspirations-update-goal.sh" in joined:
+            state["writes"].append(argv[-1])
+            store[field] = argv[-1]
+            return _Res(stdout=json.dumps(dict(store)))
+        raise AssertionError(f"unexpected subprocess: {joined}")
+
+    monkeypatch.setattr(GFA, "_run", fake_run)
+    return store, state
+
+
+def test_peer_append_is_not_clobbered(monkeypatch):
+    """THE control. Asserts data CONSERVATION and nothing else.
+
+    Deliberately makes no claim about the exit code or about which branch ran:
+    a fix that conserved the peer's text some other way would satisfy this too.
+    The predicate is the defect itself — "is the other writer's text still
+    there" — which is what rc=0-and-a-printed-record cannot tell you
+    (guard-2460).
+    """
+    store, _ = _concurrent_store(monkeypatch, pre="ORIGINAL", peer_text="PEER-TEXT-B")
+    try:
+        GFA.main(["g-1", "outcome_note", "mA", "MY-TEXT-A"])
+    except SystemExit:
+        pass
+    assert "PEER-TEXT-B" in store["outcome_note"], (
+        "the peer's concurrent append was silently clobbered — this is the "
+        "g-115-5638 lost update"
+    )
+
+
+def test_concurrent_modification_is_refused_loudly(monkeypatch, capsys):
+    store, state = _concurrent_store(monkeypatch, pre="ORIGINAL", peer_text="PEER-TEXT-B")
+    with pytest.raises(SystemExit) as exc:
+        GFA.main(["g-1", "outcome_note", "mA", "MY-TEXT-A"])
+    assert exc.value.code == GFA.RC_CONCURRENT_MODIFICATION
+    assert state["writes"] == [], "a detected conflict must write NOTHING"
+    err = capsys.readouterr().err
+    assert "NOTHING WAS WRITTEN" in err, "the refusal must say no data was lost"
+
+
+def test_uncontended_append_still_writes(monkeypatch):
+    """No false positive: with no peer, the write proceeds exactly as before."""
+    store, state = _concurrent_store(monkeypatch, pre="ORIGINAL", peer_text=None)
+    rc = GFA.main(["g-1", "outcome_note", "mA", "MY-TEXT-A"])
+    assert rc == GFA.RC_OK
+    assert len(state["writes"]) == 1
+    assert "ORIGINAL" in store["outcome_note"] and "MY-TEXT-A" in store["outcome_note"]
+
+
+def test_concurrent_run_of_the_same_marker_is_idempotent_not_a_conflict(monkeypatch):
+    """A peer running OUR marker is a completed duplicate, not a lost update."""
+    store, state = _concurrent_store(
+        monkeypatch, pre="ORIGINAL",
+        peer_text="MY-TEXT-A\n" + GFA.sentinel_for("mA"))
+    rc = GFA.main(["g-1", "outcome_note", "mA", "MY-TEXT-A"])
+    assert rc == GFA.RC_OK
+    assert state["writes"] == [], "the work already landed — writing again would duplicate it"
+
+
+# ── 7. cas_conflict, the pure compare half ──────────────────────────────────
+
+def test_cas_conflict_none_when_unchanged():
+    assert GFA.cas_conflict("same", "same") is None
+
+
+def test_cas_conflict_reports_a_peer_append():
+    msg = GFA.cas_conflict("ORIGINAL", "ORIGINAL\n\nPEER")
+    assert msg is not None and "appended" in msg
+
+
+def test_cas_conflict_distinguishes_a_rewrite_from_an_append():
+    """A rewrite is a different hazard: a retry would land on unreviewed text."""
+    msg = GFA.cas_conflict("ORIGINAL", "COMPLETELY DIFFERENT")
+    assert msg is not None and "REWRITTEN" in msg
+
+
+def test_cas_conflict_reports_creation_from_empty():
+    msg = GFA.cas_conflict("", "created by a peer")
+    assert msg is not None and "empty at read time" in msg
+
+
+def test_cas_conflict_rejects_a_non_text_reread():
+    assert "not text" in GFA.cas_conflict("ORIGINAL", {"nested": 1})

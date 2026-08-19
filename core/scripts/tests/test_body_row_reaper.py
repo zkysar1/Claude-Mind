@@ -124,6 +124,41 @@ def test_stale_carrier_written_by_another_sid_is_kept():
     assert R.is_reaping(d["verdict"]) is False
 
 
+@pytest.mark.parametrize("carrier_sid", ["deadbeef", ""])
+def test_stale_mismatched_carrier_is_kept_whatever_the_sid_SPELLING(carrier_sid):
+    """The defining property is that the key is PRESENT, not that it is truthy.
+
+    guard-3080: pin the property, not the one known bad instance. The producer
+    (stranded-claim-sweep._body_carrier_verdict) writes `carrier_sid` on
+    `str(doc.get("sid") or "") != sid`, so it fires for an UNIDENTIFIED writer
+    too and stores `""` — every falsy value this key can hold, since the value
+    is `str(...)[:8]`.
+
+    The pre-fix predicate `ev.get("carrier_sid")` passed the "deadbeef" case
+    above and REAPED this one, so the suite was green over a live leak on a
+    DELETE path. Worse, the asymmetry ran the wrong way: the same empty sid
+    arriving as `fresh-wrong` was kept by the left-hand clause, so an anonymous
+    carrier was distrusted when fresh and trusted when stale.
+
+    This test fails against the pre-fix predicate for carrier_sid="" and passes
+    for "deadbeef" — which is what makes it a regression pin rather than a
+    restatement of the test above.
+    """
+    d = _decide(R.CV_STALE, holds_claim=False, ev={"carrier_sid": carrier_sid})
+    assert d["verdict"] == R.K_SID_MISMATCH
+    assert R.is_reaping(d["verdict"]) is False
+
+
+def test_fresh_wrong_and_stale_agree_on_an_anonymous_carrier():
+    """Both spellings of a mismatch must reach the same verdict for the same
+    evidence. Asserting the two ARE EQUAL (rather than each being K_SID_MISMATCH
+    separately) is what pins the symmetry itself: a future edit that re-splits
+    the branch would have to break this to pass."""
+    fresh = _decide(R.CV_FRESH_WRONG, holds_claim=False, ev={"carrier_sid": ""})
+    stale = _decide(R.CV_STALE, holds_claim=False, ev={"carrier_sid": ""})
+    assert fresh["verdict"] == stale["verdict"] == R.K_SID_MISMATCH
+
+
 # ── fail-safe on the unknown ─────────────────────────────────────────────────
 
 @pytest.mark.parametrize("token", [None, "", "some-future-verdict", "REAP"])
@@ -407,6 +442,142 @@ def test_unverifiable_readback_is_not_counted_as_reaped(monkeypatch):
     assert calls["cleared"] == [SID], "the write itself should have been attempted"
     assert out["reaped"] == 0, "but it cannot be counted without verification"
     assert out["decisions"][0]["apply_result"] == "readback-unreadable"
+
+
+# ── integration: a SYNTHETIC candidate through the REAL clear_body_row ───────
+# sq-019 / . Every reap-direction test above substitutes clear_body_row,
+# so the handler -> side-effect leg was covered only by stubs: nothing drove a
+# real candidate through the real removal primitive AND the guard-2305 read-back.
+# The trigger -> handler leg IS exercised live at loop entry, but with a
+# permanently EMPTY candidate set, and a live population of zero cannot supply a
+# positive control (guard-3122). This test mints the one it needs.
+#
+# ISOLATION IS THE WHOLE DIFFICULTY, not an incidental detail. Minting a fixture
+# row in the SHARED team-state is the guard-2611 phantom-shard defect, and
+# clear_body_row's own docstring records an instance: a parametrized test one
+# file over passed `no-such-agent-xyz` and a full-suite run left a real
+# `no-such-agent-xyz` shard in the shared store, which then tripped
+# test_active_agents_tripwire from an unrelated gate suite. So this runs against
+# a tmp world behind an in-process DaemonFixture, which pins MIND_WORLD,
+# MIND_META and STORAGE_BACKEND (the last is guard-955: an own-cloud write from
+# a tmp world collides on the PRODUCTION S3 key).
+
+def _seed_body_row(world: Path, agent: str, sid: str) -> Path:
+    import yaml
+    shard_dir = world / "team-state" / "agents"
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    shard = shard_dir / (agent + ".yaml")
+    shard.write_text(yaml.safe_dump({"in_flight_bodies": {sid: dict(LIVE_ROW)}}),
+                     encoding="utf-8")
+    (world / "aspirations.jsonl").write_text("", encoding="utf-8")  # no live claims
+    return shard
+
+
+def test_synthetic_candidate_through_the_REAL_clear_body_row_removes_the_KEY():
+    """The positive control the live path cannot supply.
+
+    Only the carrier verdict is stubbed — that is the TRIGGER leg, already
+    covered by the branch tests above. clear_body_row, the daemon write beneath
+    it, the shard read and the guard-2305 read-back all run for real.
+    """
+    import tempfile
+    import yaml
+
+    sys.path.insert(0, str(SCRIPT_DIR / "tests"))
+    from _daemon_fixture import DaemonFixture
+
+    agent, sid = "alpha", SID
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = Path(tmpd) / "world"
+        world.mkdir(parents=True)
+        shard = _seed_body_row(world, agent, sid)
+
+        before = yaml.safe_load(shard.read_text(encoding="utf-8"))
+        assert sid in before["in_flight_bodies"], "precondition: the row exists"
+
+        import importlib
+        import _paths
+
+        # RELOADING _paths IS LOAD-BEARING, and the first version of this test
+        # omitted it and READ LIVE STATE. _paths.py resolves
+        # `WORLD_DIR = _resolve_external(...)` at module scope, i.e. ONCE per
+        # process, and pytest has already imported it long before this fixture
+        # pins MIND_WORLD. The sweep's `from _paths import WORLD_DIR` is
+        # deliberately lazy (cycle-proof), but a lazy import still reads the
+        # CACHED module's frozen constant -- so merely loading the sweep inside
+        # the fixture, which is what this test first claimed was sufficient,
+        # changes nothing.
+        #
+        # Measured: without the reload the sweep read the REAL shard
+        # (rows_examined=2, including this very session's own row) and issued a
+        # real REAPING call for a live SID. It was harmless ONLY because the
+        # WRITE went to the fixture daemon's tmp world while the READ came from
+        # the real one, so the guard-2305 read-back reported
+        # `verify-failed-row-still-present` and refused to count it. That is the
+        # safety net doing its job, not isolation working.
+        #
+        # The try/finally spans the WHOLE fixture: on any failure path _paths
+        # must still be re-resolved, or every later test in this process
+        # inherits a WORLD_DIR pointing at a tmp dir that is about to be
+        # deleted. finally runs after __exit__ has restored the env, so the
+        # restoring reload below re-resolves against the real world.
+        try:
+            with DaemonFixture(world, agent=agent):
+                importlib.reload(_paths)
+                sweep = _load_sweep()
+                sweep._body_carrier_verdict = lambda a, s, f: ("stale", {})
+                out = sweep._reap_stale_body_rows(
+                    agent=agent, self_sid=None, stale_minutes=180.0,
+                    apply_changes=True,
+                )
+        finally:
+            importlib.reload(_paths)
+
+        assert out["rows_examined"] == 1, "the synthetic row must be seen: %r" % out
+        cand = out["decisions"][0]
+
+        # ANTI-VACUITY, and the trap this test would otherwise fall into:
+        # clear_body_row short-circuits to "not-resident" when the agent dir does
+        # not resolve, WITHOUT writing anything. A test that asserted only
+        # "the key is gone" would pass on a row that was never there to begin
+        # with, and a test that asserted only reaped==1 could pass on a
+        # short-circuit. The token proves the real write path actually ran.
+        assert cand.get("clear_token") == "cleared", (
+            "the REAL primitive must have written, not short-circuited on the "
+            "residency gate; token=%r result=%r" % (cand.get("clear_token"),
+                                                    cand.get("apply_result")))
+        assert cand["apply_result"] == "reaped", cand
+        assert out["reaped"] == 1, out
+
+        after = yaml.safe_load(shard.read_text(encoding="utf-8")) or {}
+        bodies = after.get("in_flight_bodies") or {}
+
+        # THE KEY IS ABSENT, NOT NULL (). This leg used to SET NULL,
+        # which left one permanent null-valued key per SID on a shared synced
+        # store. `not bodies.get(sid)` would be satisfied by BOTH, so the
+        # membership test is the assertion that actually discriminates.
+        assert sid not in bodies, (
+            "the row must be REMOVED; a null-valued key is the g-306-186 residue "
+            "this write exists to avoid. bodies=%r" % bodies)
+
+
+def test_the_real_path_leaves_the_SHARED_team_state_untouched():
+    """Guards the guard: proves the isolation above, rather than assuming it.
+
+    If the tmp-world pin ever stops taking, the test above would still pass
+    while writing to the live store — the exact guard-2611 failure it is
+    written to avoid, and one that shows up as an unrelated suite going red.
+    """
+    from _paths import WORLD_DIR
+    shared = Path(WORLD_DIR) / "team-state" / "agents" / "alpha.yaml"
+    fingerprint = shared.stat().st_mtime_ns if shared.exists() else None
+
+    test_synthetic_candidate_through_the_REAL_clear_body_row_removes_the_KEY()
+
+    now = shared.stat().st_mtime_ns if shared.exists() else None
+    assert now == fingerprint, (
+        "the shared alpha shard was written during an isolated tmp-world test — "
+        "the MIND_WORLD pin is not holding (guard-2611)")
 
 
 # ── the claim map's SCOPE () ────────────────────────────────────────

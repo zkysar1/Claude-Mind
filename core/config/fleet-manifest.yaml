@@ -202,3 +202,56 @@ nodes:
     # framework root differs from the container nodes. MACHINE_ID is not expected to
     # equal `host` here (the containers self-name cc-0N; this box does not).
     machine_id_check: skip
+
+  # ── Body boxes (added 2026-08-11, g-115-5434) ────────────────────────────────
+  # Registered because _box_parity had been reporting both as LIVE-BOX-NOT-IN-MANIFEST
+  # since 2026-08-09 — live Minds whose config drift no lane could see. EVERY field
+  # below is MEASURED, not guessed: `bash core/scripts/fleet-config-parity.sh` collected
+  # a full field set from both over ssh from cc-05, so `addr`/`user`/`shape` are proven
+  # by a successful non-self collection and `root` by its own `root_exists: yes`. That
+  # is the bar _box_parity's docstring sets — it warns against APPENDING GUESSED FIELDS
+  # ("trades a visible gap for invisible wrong data"), not against registering a box you
+  # have actually measured. Its separate argument — that a hand-maintained list will not
+  # start being hand-maintained — is about the SYSTEMIC fix and still stands; these two
+  # rows resolve the two boxes in front of us and do not claim to be that fix.
+  # Both self-report MACHINE_ID == host (cc-07 / cc-08), so no machine_id_check skip.
+  # BOTH ROWS BELOW ARE WORKER BODIES, AND THAT WILL LOOK LIKE DRIFT IF YOU MEASURE IT
+  # WRONG. Their HEADs sit far ahead of origin/main and legitimately never merge into it:
+  # measured 2026-08-11, cc-07 was 259 commits ahead and cc-08 114, both clean, both
+  # still growing. That is BY DESIGN — `iteration-push.sh --push-worker-ref` (g-306-264)
+  # pushes a worker Body's HEAD to refs/workers/<agent>/<sid> and STOPS, because "the
+  # shared branch remains the reducer's alone". Both HEADs were confirmed present on
+  # origin under exactly those refs, keyed by the same SIDs their body-heartbeat carriers
+  # name. So `git rev-list --count origin/main..HEAD` is the WRONG INSTRUMENT here: it
+  # measures distance from a branch a worker is designed never to reach, and reports a
+  # healthy Body as having hundreds of stranded commits. Ask instead whether HEAD is
+  # reachable from ANY origin ref (`git ls-remote origin 'refs/workers/*'`) — and note
+  # `git ls-remote --heads` CANNOT see these, since refs/workers/* are not heads.
+  - agent: alpha
+    host: cc-07
+    addr: 100.82.30.117
+    shape: lxc
+    user: root
+    root: /opt/ayoai-mind
+    # Resident agent PROVEN, not inferred from the tailnet name (guard-1574): exactly
+    # one agent dir carries a local-paths.conf here, and it is alpha's. Corroborated
+    # independently — g-115-5610 was filed from this box and self-describes as
+    # "alpha WORKER BODY ON hostname cc-07".
+  - host: cc-08
+    addr: 100.103.147.2
+    shape: lxc
+    user: root
+    root: /opt/ayoai-mind
+    # DELIBERATELY HAS NO `agent` KEY — this box is fleet-agnostic, not alpha's.
+    # Measured: ALL FIVE agents carry a local-paths.conf here (alpha + foxtrot both
+    # initialized), its body-heartbeat carriers name TWO different agents (alpha
+    # 2026-08-11, foxtrot 2026-08-07), and its tailnet name is un-prefixed. The control
+    # that makes that distinctive: cc-05 has 1 conf, cc-04 has alpha's, cc-07 has 1.
+    # Writing `agent: alpha` here would be exactly the invisible wrong data the note
+    # above warns about. An absent key is the honest encoding AND the supported one —
+    # _roster_parity builds its node set with `if n.get("agent")`, so an agent-less row
+    # is skipped there by construction, while _box_parity keys on `host` alone and so
+    # measures this box fully. `agent` is bound in _check_node but never used, so it
+    # affects no comparison. Do not "fix" this by inventing a placeholder agent name:
+    # a value that is not a live roster agent makes _roster_parity emit a permanent
+    # INFO calling it a retired node, which is false and trains readers to skim INFO.

@@ -118,6 +118,52 @@ def get_dirty_framework_files(repo_path: Path) -> List[str]:
     return sorted(set(dirty))
 
 
+def get_undelivered_framework_files(repo_path: Path) -> List[str]:
+    """Framework paths committed locally but NOT yet on HEAD's upstream.
+
+    This is the DELIVERY half of "commit and push after every framework
+    change". `get_dirty_framework_files` above enforces only the commit half,
+    which is why the gate's own rationale block (the 2026-05-07 orphan-code
+    audit: goals "status=completed ... but never shipped to git") stayed only
+    half-enforced for ~3 months. A commit that is never pushed is still never
+    shipped to git from every OTHER box's point of view, and it renders locally
+    as an unremarkable `ahead N` — so `git status` cannot surface it and a clean
+    tree passed the gate. Live instance: g-306-261 closed with its fix stranded
+    on one box for ~15h after a non-fast-forward push rejection (rb-6868).
+
+    Three-dot `@{u}...HEAD` (merge-base), not two-dot: when upstream has moved
+    ahead — which is the normal state on a live fleet, and precisely the state
+    a rejected push leaves behind — two-dot would also report the PARTNER's
+    incoming files as though this box owed them.
+
+    STALENESS IS DELIBERATELY NOT CORRECTED, and the direction is what makes
+    that safe. `@{u}` is a local tracking ref, only as fresh as the last fetch
+    (rb-4716). A stale ref can only make already-pushed commits look
+    undelivered — it OVER-reports, never under-reports, so the error lands on
+    the blocking side and is visible. Fetching here instead would put a network
+    round-trip in the path of every goal close.
+
+    Fail-open: any git error → []. Notably `@{u}` exits non-zero when the
+    branch has no upstream (a fresh local branch, detached HEAD), which is not
+    evidence of undelivered work.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), "diff", "--name-only", "@{u}...HEAD"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        print(f"[uncommitted-gate] git diff vs upstream failed: {exc} — fail-open",
+              file=sys.stderr)
+        return []
+    if result.returncode != 0:
+        # No upstream / detached HEAD / not a repo. Not evidence of a problem.
+        return []
+    undelivered = [p for p in (ln.strip() for ln in result.stdout.splitlines())
+                   if p and _is_framework_code(p)]
+    return sorted(set(undelivered))
+
+
 def _log_override(world_dir: Path, agent_name: str, goal_id: str,
                   justification: str, dirty_files: List[str]) -> None:
     """Append to <world_dir>/uncommitted-work-overrides.jsonl.
@@ -141,7 +187,8 @@ def _log_override(world_dir: Path, agent_name: str, goal_id: str,
 
 
 def evaluate(*, goal_id: str, override: Optional[str], repo_path: Path,
-             world_dir: Optional[Path], agent_name: str = "") -> dict:
+             world_dir: Optional[Path], agent_name: str = "",
+             body_role: Optional[str] = None) -> dict:
     """Run the gate. Pure function for the decision; explicit side effect on override.
 
     Args:
@@ -175,19 +222,51 @@ def evaluate(*, goal_id: str, override: Optional[str], repo_path: Path,
         effective_override = None
 
     dirty = get_dirty_framework_files(repo_path)
-    would_block = bool(dirty) and effective_override is None
 
-    if effective_override is not None and dirty:
+    # DELIVERY half (). Enforced ONLY for the role contractually
+    # responsible for pushing. A worker Body commits locally and deliberately
+    # does NOT push — that is the  contract, not an oversight — so
+    # blocking a worker here would refuse every legitimate worker close in the
+    # fleet. Its undelivered files are still REPORTED, because the reducer that
+    # consumes its carrier ref needs to know what is outstanding.
+    #
+    # An UNKNOWN role does not block either. BODY_ROLE is injected by the
+    # PreToolUse bash hook, so it is reliably present on the CLI path and may be
+    # absent on the daemon path; treating "absent" as "reducer" would make the
+    # gate's behaviour depend on which of the two call paths a caller happened
+    # to take. A false block stalls the loop for everyone, while the failure
+    # this gate catches is already visible in the payload — so unknown reports
+    # and warns rather than refusing.
+    undelivered = get_undelivered_framework_files(repo_path)
+    role = (body_role or "").strip().lower() or None
+    delivery_blocks = bool(undelivered) and role == "reducer"
+    if undelivered and role != "reducer":
+        print(f"[uncommitted-gate] NOTE: {len(undelivered)} framework file(s) "
+              f"committed but NOT pushed to upstream (body_role="
+              f"{role or 'unknown'}; not blocking): {', '.join(undelivered[:5])}"
+              + (" ..." if len(undelivered) > 5 else ""), file=sys.stderr)
+
+    would_block = (bool(dirty) or delivery_blocks) and effective_override is None
+
+    if effective_override is not None and (dirty or undelivered):
         if world_dir is None:
             print("[uncommitted-gate] WARN: no WORLD_DIR — skipping override log",
                   file=sys.stderr)
         else:
-            _log_override(world_dir, agent_name, goal_id, effective_override, dirty)
+            _log_override(world_dir, agent_name, goal_id, effective_override,
+                          sorted(set(dirty) | set(undelivered)))
 
+    # The three pre-existing keys keep their exact names and semantics — the
+    # daemon endpoints and aspirations.py read them positionally by name, and
+    # `dirty_framework_files` must NOT start carrying undelivered paths (they
+    # are a different failure with a different remedy: push, not commit).
     return {
         "would_block": would_block,
         "dirty_framework_files": dirty,
         "repo_path": str(repo_path),
         "goal_id": goal_id,
         "override_applied": effective_override,
+        "undelivered_framework_files": undelivered,
+        "delivery_would_block": delivery_blocks,
+        "body_role": role,
     }

@@ -124,3 +124,73 @@ def test_payload_str_short_dict_order_stable():
     """All-short dicts pass through untruncated with keys intact."""
     s = oeb._payload_str({"a": 1, "b": "short"})
     assert s == '{"a": 1, "b": "short"}'
+
+
+# --- the composed-caller seam (2026-08-18, ) -----------------------
+#
+# Every test above pins what the battery COMPUTES into `actionable`. None pinned
+# whether that reaches iteration-open.py, which composes this script as its
+# `entry-checks` stage and lifts payload["findings"] / payload["blind"] BY NAME.
+# Emitting only `actionable` made this stage structurally silent inside
+# `iteration-open.sh --apply`. It was one of TWO such stages (the other being
+# precheck-sentinel-battery, fixed in the same pass); only
+# precheck-always-run-battery already emitted `findings`, and that one working
+# sibling kept the wrapper's FINDINGS section non-empty on most runs, so nothing
+# ever looked dead — guard-4243.
+
+
+def _load_iteration_open():
+    s = importlib.util.spec_from_file_location(
+        "iteration_open", SCRIPTS / "iteration-open.py"
+    )
+    m = importlib.util.module_from_spec(s)
+    s.loader.exec_module(m)
+    return m
+
+
+def test_actionable_checks_reach_the_composed_caller(fake_state_dir, tmp_path, capsys):
+    """An ACTIONABLE entry check must survive the hop into iteration-open."""
+    wm = tmp_path / "wm.yaml"
+    wm.write_text('slots:\n  blocked_sleep_until: "2026-08-18T09:00:00"\n',
+                  encoding="utf-8")
+    report = _run(capsys, wm_path=str(wm))
+    assert report["actionable"], "precondition: the slot is actionable"
+
+    itopen = _load_iteration_open()
+    lifted = itopen._findings_from("entry-checks", report)
+    assert len(lifted) == len(report["actionable"]), (
+        "every actionable check must reach the composed caller -- if this is "
+        "empty the stage is invisible inside iteration-open again and its run "
+        "renders as an all-clear"
+    )
+    assert all(f["detail"] for f in lifted), "a finding with no detail is unactionable"
+
+    # NEGATIVE CONTROL: the pre-fix payload must lift NOTHING. Without it this
+    # test passes for a trivially green reason and cannot detect the regression
+    # it exists for (guard-2903/guard-2536: assert the path was REACHED).
+    pre_fix = {k: v for k, v in report.items() if k != "findings"}
+    assert itopen._findings_from("entry-checks", pre_fix) == [], (
+        "the pre-fix shape must lift ZERO, or this test cannot fail for the "
+        "right reason"
+    )
+
+
+def test_fail_open_reports_blind_rather_than_clean(tmp_path, capsys, monkeypatch):
+    """Fail-open must not read as fail-SILENT to the composed caller.
+
+    Zero findings AND zero blind is indistinguishable from a genuinely clean
+    run, which would defeat iteration-open's own "N lane(s) blind" branch
+    (guard-4093).
+    """
+    monkeypatch.delenv("MIND_AGENT", raising=False)
+    report = _run(capsys, agent="", wm_path=str(tmp_path / "nope.yaml"))
+    assert report.get("error"), "no agent binding is an error condition"
+
+    itopen = _load_iteration_open()
+    assert itopen._blind_from("entry-checks", report), (
+        "an errored battery must surface as BLIND, else its failure renders "
+        "as an all-clear"
+    )
+    assert itopen._findings_from("entry-checks", report) == [], (
+        "and it must not manufacture findings it never computed"
+    )

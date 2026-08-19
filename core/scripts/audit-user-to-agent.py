@@ -221,7 +221,7 @@ def _parse_standing_grants(world_dir: Path) -> dict:
     requirement of `.claude/rules/reclaim-routed-work.md` rule 4, applied to
     the grants table itself.
     """
-    out = {"by_scope": {}, "unkeyed": [], "error": None}
+    out = {"by_scope": {}, "unkeyed": [], "qualified": {}, "error": None}
     if world_dir is None:
         out["error"] = "no WORLD_PATH"
         return out
@@ -251,6 +251,17 @@ def _parse_standing_grants(world_dir: Path) -> dict:
         if not cells:
             continue
         head = _scope_head(cells[0])
+        # : everything the head CUT OFF is the qualifier, and that is
+        # where a carve-out lives ("...  Excludes credentials that require a
+        # human account."). `_scope_head` is right that scanning the whole cell
+        # inverts meaning, and the goal is right that the cut hides carve-outs —
+        # both are true, because a token-presence test on prose cannot express
+        # "granted EXCEPT when X" in either direction. So record the tail rather
+        # than choosing a side, and let the verdict refuse to claim coverage
+        # from a head match when a qualifier exists (see `_assess_user_leg`).
+        tail = cells[0][len(head):].strip().lstrip(".").strip()
+        if tail:
+            out["qualified"][grant_id] = tail[:220]
         hits = [s for s in sorted(VALID_USER_LEG_SCOPES)
                 if re.search(rf"(?<![\w-]){re.escape(s)}(?![\w-])", head, re.I)]
         if hits:
@@ -325,6 +336,81 @@ def _log_reclassification(world_dir: Path, record: dict) -> None:
               file=sys.stderr)
 
 
+_REFUSAL_LEDGER = "audit-user-to-agent-refusals.jsonl"
+
+
+def _load_refusal_ledger(world_dir) -> dict:
+    """goal_id -> the LATEST refusal record for it. Missing ledger -> {}.
+
+    The drop lane had no memory (g-115-5499): three runs surfaced the same six
+    goals byte-for-byte, 8 lifetime opportunities against 8 refusals and 0 true
+    positives. The determinations existed — in the deployment's prose
+    capability-routing convention, which the audit cannot parse. This is the
+    machine-readable half so a refusal recorded once is a refusal the next run
+    can join on.
+
+    Last-write-wins is deliberate: a re-refusal with a corrected reason must
+    supersede the original, because a refusal stored with a factually wrong
+    reason is worse than none — it gets re-derived wrongly on every future run.
+    """
+    if world_dir is None:
+        return {}
+    out = {}
+    for rec in _load_jsonl(world_dir / _REFUSAL_LEDGER):
+        gid = rec.get("goal_id")
+        if gid:
+            out[gid] = rec
+    return out
+
+
+def _record_refusal(world_dir, record: dict) -> tuple:
+    """Append one refusal to the ledger. Returns (ok, message).
+
+    Loud on failure, unlike `_log_reclassification`: that one logs an action
+    already taken, so losing the log loses a record. Losing THIS write loses
+    the suppression itself, and the goal silently re-surfaces forever — the
+    exact defect being fixed.
+    """
+    if world_dir is None:
+        return False, "no WORLD_PATH -- cannot record a refusal"
+    try:
+        locked_append_jsonl(str(world_dir / _REFUSAL_LEDGER), record)
+    except Exception as e:
+        return False, f"ledger append failed: {e}"
+    return True, str(world_dir / _REFUSAL_LEDGER)
+
+
+# Verdicts that ASK THE READER to act. Only these are suppressible: a `keep`
+# needs no memory (it already says "leave it alone"), and suppressing an
+# `undeclared` would hide a backfill that is still owed.
+_ACTIONABLE_VERDICTS = ("grant-covered", "grant-qualified")
+
+
+def _apply_refusals(verdicts: list, refusals: dict) -> int:
+    """Rewrite already-refused actionable verdicts in place. Returns the count.
+
+    A post-pass rather than a parameter on `_assess_user_leg`, so that function
+    keeps answering exactly one question — "is the user still needed?" — and its
+    existing tests keep pinning it unchanged.
+    """
+    n = 0
+    for v in verdicts:
+        if v.get("verdict") not in _ACTIONABLE_VERDICTS:
+            continue
+        prior = refusals.get(v.get("goal_id"))
+        if not prior:
+            continue
+        v["prior_verdict"] = v["verdict"]
+        v["verdict"] = "previously-refused"
+        v["prior"] = {k: prior.get(k) for k in ("run_date", "verdict", "reason")}
+        v["reason"] = (
+            f"already determined on {prior.get('run_date') or '(no date)'}: "
+            f"{prior.get('verdict') or 'refused'} -- {prior.get('reason') or '(no reason recorded)'}"
+        )
+        n += 1
+    return n
+
+
 def _assess_user_leg(cand: dict, grants: dict) -> dict:
     """Lane P drop-check for an ['agent', 'user'] goal.
 
@@ -384,9 +470,27 @@ def _assess_user_leg(cand: dict, grants: dict) -> dict:
                 "valid_scopes": sorted(VALID_USER_LEG_SCOPES)}
     covering = grants.get("by_scope", {}).get(scope, [])
     if covering:
-        return {**base, "verdict": "grant-covered", "grants": covering,
+        qualified = grants.get("qualified", {})
+        unqualified = [gid for gid in covering if gid not in qualified]
+        # : a grant whose scope cell continues past its declarative
+        # head is QUALIFIED, and the qualifier is where the carve-out lives —
+        # which is precisely the residual human leg. A label match against the
+        # head cannot see it, so it must not claim coverage. Downgrading to a
+        # REVIEW verdict is the one move that is safe in both directions: it
+        # neither recommends removing a human on evidence that cannot express
+        # an exception, nor silently drops the grant from the report.
+        # An UNqualified covering grant is unaffected and still recommends.
+        if not unqualified:
+            return {**base, "verdict": "grant-qualified", "grants": covering,
+                    "grant_qualifiers": {gid: qualified[gid] for gid in covering},
+                    "reason": f"user_leg_scope={scope!r} matches the head of "
+                              f"{', '.join(covering)}, but every one of those grants is "
+                              "QUALIFIED past its head, and a scope-label match cannot "
+                              "evaluate a carve-out. Read the qualifier and decide; this "
+                              "is NOT a recommendation to drop 'user'."}
+        return {**base, "verdict": "grant-covered", "grants": unqualified,
                 "reason": f"user_leg_scope={scope!r} is covered by "
-                          f"{', '.join(covering)} -- the user has standing-approved this "
+                          f"{', '.join(unqualified)} -- the user has standing-approved this "
                           "scope, so the user leg is already discharged. Drop 'user' from "
                           "participants; if the agent leg is also done, close the goal."}
     return {**base, "verdict": "keep",
@@ -420,6 +524,19 @@ def main(argv=None):
                          "discovered agent dir.")
     ap.add_argument("--output", choices=("text", "json"), default="text",
                     help="text (default) or json for programmatic consumers.")
+    ap.add_argument("--record-refusal", metavar="GOAL_ID", default=None,
+                    help="Record that this goal's drop-lane candidacy was considered "
+                         "and REFUSED, so future runs suppress it instead of "
+                         "re-presenting it cold. Requires --refusal-reason. Writes "
+                         f"world/{_REFUSAL_LEDGER} and exits without running the audit.")
+    ap.add_argument("--refusal-reason", metavar="TEXT", default=None,
+                    help="WHY the user leg is still real. REQUIRED with "
+                         "--record-refusal and deliberately not optional: a refusal "
+                         "stored without a reason gets re-derived from scratch, which "
+                         "is the defect the ledger exists to fix, and one stored with a "
+                         "WRONG reason is worse than none.")
+    ap.add_argument("--refusal-verdict", default="keep",
+                    help="Determination recorded (default: keep).")
     args = ap.parse_args(argv)
 
     _discovered = _discover_agents()
@@ -437,6 +554,29 @@ def main(argv=None):
     # this script must grow per-agent world resolution — today it does not.
     world_dir = _world_dir_for(agent_for_gate)
 
+    # --record-refusal is a WRITE mode and exits before the audit runs: mixing a
+    # write into a reporting run would make the report describe a state that the
+    # same invocation had already changed.
+    if args.record_refusal:
+        if not (args.refusal_reason or "").strip():
+            print("[audit-user-to-agent] --record-refusal requires --refusal-reason "
+                  "(a refusal with no reason is re-derived from scratch every run, "
+                  "which is the defect this ledger fixes).", file=sys.stderr)
+            return 2
+        rec = {
+            "goal_id": args.record_refusal,
+            "run_date": dt.datetime.now().isoformat(timespec="seconds"),
+            "verdict": args.refusal_verdict,
+            "reason": args.refusal_reason.strip(),
+            "recorded_by": agent_for_gate,
+        }
+        ok, msg = _record_refusal(world_dir, rec)
+        if not ok:
+            print(f"[audit-user-to-agent] refusal NOT recorded: {msg}", file=sys.stderr)
+            return 1
+        print(f"[audit-user-to-agent] refusal recorded for {args.record_refusal} -> {msg}")
+        return 0
+
     # Build the candidate list from world/aspirations.jsonl + every agent's file.
     all_user_goals = []
     if world_dir is not None:
@@ -453,6 +593,8 @@ def main(argv=None):
     grants = _parse_standing_grants(world_dir)
     leg_verdicts = [_assess_user_leg(c, grants)
                     for c in all_user_goals if c["shape"] == "agent-user"]
+    refusals = _load_refusal_ledger(world_dir)
+    suppressed = _apply_refusals(leg_verdicts, refusals)
     candidates = [c for c in all_user_goals
                   if c["shape"] == "user-only" and not c["deliberate"]]
     deliberate_user_only = [c for c in all_user_goals
@@ -575,6 +717,9 @@ def main(argv=None):
             "drop_lane": {
                 "assessed": len(leg_verdicts),
                 "counts": {k: len(v) for k, v in sorted(by_verdict.items())},
+                "suppressed_previously_refused": suppressed,
+                "actionable": sum(len(by_verdict.get(v, [])) for v in _ACTIONABLE_VERDICTS),
+                "refusal_ledger_size": len(refusals),
                 "verdicts": leg_verdicts,
             },
             "grants": {
@@ -620,11 +765,26 @@ def main(argv=None):
               f"{ {k: v for k, v in sorted(grants['by_scope'].items())} or '(none)'}")
     print("=" * 68)
 
+    # Outcome 4 (): say "everything here was already decided" instead
+    # of re-listing it. A run that re-presents six known refusals cold reads as
+    # six fresh opportunities, and invites a hurried reader to reverse six
+    # determinations they cannot see were already made.
+    actionable_now = sum(len(by_verdict.get(v, [])) for v in _ACTIONABLE_VERDICTS)
+    if suppressed and not actionable_now:
+        print(f"\nNo new drop-lane candidates: all {suppressed} were previously "
+              "refused and are recorded in the ledger.")
+    elif suppressed:
+        print(f"\nSuppressed {suppressed} previously-refused candidate(s); "
+              f"{actionable_now} remain(s) undetermined.")
+
     for verdict, label in (
         ("grant-covered", "DROP 'user' -- a standing grant already covers this leg"),
+        ("grant-qualified", "REVIEW -- grant head matches but is QUALIFIED; read the "
+                            "carve-out. NOT a recommendation to drop"),
         ("undeclared", "UNDECLARED user leg -- cannot be re-derived until backfilled"),
         ("keep", "keep -- user leg is real and ungranted"),
         ("deliberate", "deliberate -- user directed this routing"),
+        ("previously-refused", "previously refused -- already determined, not re-asked"),
     ):
         rows = by_verdict.get(verdict, [])
         if not rows:
@@ -633,8 +793,17 @@ def main(argv=None):
         for v in rows:
             print(f"  {v['goal_id']:<16} {v['status']:<9} "
                   f"scope={v['user_leg_scope'] or '-'}  {v['title'][:58]}")
-            if verdict in ("grant-covered", "undeclared"):
+            if verdict in ("grant-covered", "grant-qualified", "undeclared",
+                           "previously-refused"):
                 print(f"      -> {v['reason']}")
+            for gid, qual in (v.get("grant_qualifiers") or {}).items():
+                print(f"      qualifier on {gid}: {qual}")
+
+    if actionable_now:
+        print("\nTo stop a candidate re-surfacing cold on every run, record the "
+              "determination:")
+        print("  py -3 core/scripts/audit-user-to-agent.py --record-refusal <goal-id> \\")
+        print("      --refusal-reason \"<why the user leg is still real>\"")
 
     if grants.get("unkeyed"):
         print(f"\nGrants no goal can key to: {len(grants['unkeyed'])}")

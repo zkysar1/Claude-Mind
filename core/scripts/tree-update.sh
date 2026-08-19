@@ -33,6 +33,40 @@ _RUNTIME_SELF="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
+# --- Usage ----------------------------------------------------------------
+# Printed by --help (exit 0) and by a bare/unrecognized invocation (exit 1/2).
+# Before  both paths emitted "Use --help for options." and --help hit
+# the catch-all, so --help answered itself and named nothing — a dead end that
+# routed callers into guessing the call shape, and the specific guess that hangs
+# this wrapper is passing the JSON payload positionally (see the argv reject).
+# NOT the discovery mechanism of record: guard-136 / guard-2172 / guard-2350 say
+# derive a wrapper's surface from its parsing block, and
+# `py -3 core/scripts/wrapper-surface.py describe tree-update.sh` does that
+# mechanically. This text is the reflex-path courtesy, not a substitute.
+_usage() {
+    cat <<'USAGE'
+tree-update.sh — daemon-aware dispatcher for tree WRITE ops.
+
+  --set KEY FIELD VALUE
+  --add-child PARENT              child JSON on STDIN   [+--no-dedup +--accept-overflow N]
+  --remove-child PARENT CHILD
+  --increment KEY FIELD
+  --batch                         operations JSON on STDIN
+  --propagate KEY
+  --reconcile-capabilities
+  --reparent NODE NEW_PARENT
+  --record-maintenance            [+--backlog-mode +--stop-mode]
+                                  [+--with-run-record: run-record JSON on STDIN]
+
+Shared flags: --encoding-source SRC, --encoding-reason REASON
+
+JSON payloads go on STDIN, never as a positional argument (guard-2037):
+  echo '{"key":"my-node","summary":"..."}' | bash core/scripts/tree-update.sh --add-child parent-key
+
+Authoritative surface: py -3 core/scripts/wrapper-surface.py describe tree-update.sh
+USAGE
+}
+
 # --- Parse args -----------------------------------------------------------
 OP=""
 declare -a BODY_ARGS=()
@@ -94,12 +128,31 @@ while [[ $# -gt 0 ]]; do
         --encoding-reason)
             ENC_REASON="${2-}"
             shift $(( $# >= 2 ? 2 : 1 ));;
-        *) shift;;
+        --help|-h)
+            _usage
+            exit 0;;
+        *)
+            # ARGV-SHAPE REJECT — guard-3393 door (a), mirroring
+            # aspirations-add-goal.sh's "is not a CLI flag for this script".
+            # The previous `*) shift;;` SILENTLY DISCARDED unrecognized args,
+            # which is how a positionally-passed JSON payload disappears: the
+            # body is dropped, execution falls through to the stdin read with
+            # nothing piped, and the call then either wedges forever (open-but-
+            # idle stdin) or returns an opaque missing_param (closed stdin) —
+            # identical input, two outcomes, decided only by an inherited
+            # descriptor. Rejecting here never touches stdin, so it stays safe
+            # for hook-wired callers. Door (b) is closed separately below;
+            # neither guard substitutes for the other.
+            echo "Error: '$1' is not a recognized argument for this script." >&2
+            echo "       JSON payloads go on STDIN, not as a positional (guard-2037)." >&2
+            echo "Run: bash $0 --help" >&2
+            exit 2;;
     esac
 done
 
 if [ -z "$OP" ]; then
-    echo "Specify an update subcommand. Use --help for options." >&2
+    echo "Error: no update subcommand given." >&2
+    _usage >&2
     exit 1
 fi
 
@@ -127,7 +180,36 @@ case "$OP" in
     record-maintenance) [ "$WITH_RUN_RECORD" = true ] && _needs_stdin=true;;
 esac
 if [ "$_needs_stdin" = true ] && [ ! -t 0 ]; then
-    STDIN_DATA="$(cat)"
+    # BOUNDED READ — guard-3393 door (b) /  / guard-664 bash twin.
+    # `[ ! -t 0 ]` distinguishes a terminal from a non-terminal; it does NOT
+    # promise EOF. A backgrounded Bash task inherits an open, never-closing
+    # stdin, so the bare `STDIN_DATA="$(cat)"` this replaces blocked until the
+    # harness timeout and landed nothing — silent in the worst direction, since
+    # the phase looks busy and an agent that does not re-read the tree records
+    # the close as encoded. Reproduced here at rc=124 before the fix.
+    # Probe the FIRST line with a bounded timeout: real piped callers
+    # (`echo '<json>' | ...`) have data in the pipe buffer at exec, so the
+    # timeout never fires for them; an idle inherited descriptor times out and
+    # degrades to an empty payload, which the daemon rejects FAST and loudly
+    # (missing_param) instead of wedging. `|| [ -n "$first_chunk" ]` keeps
+    # single-line input that lacks a trailing newline (read exits nonzero on
+    # EOF but still fills the var).
+    _first_chunk=""
+    _rc_read=0
+    IFS= read -r -t 2 _first_chunk || _rc_read=$?
+    if [ "$_rc_read" -eq 0 ] || [ -n "$_first_chunk" ]; then
+        _rest="$(cat)"
+        if [ -n "$_rest" ]; then
+            STDIN_DATA="$_first_chunk"$'\n'"$_rest"
+        else
+            STDIN_DATA="$_first_chunk"
+        fi
+    elif [ "$_rc_read" -gt 128 ]; then
+        echo "tree-update.sh: stdin open but idle after 2s — proceeding without the --$OP payload (backgrounded-task guard, g-115-2291)" >&2
+    fi
+    # _rc_read == 1 with an empty var (immediate EOF, e.g. </dev/null): silent —
+    # the caller genuinely sent nothing, and the daemon's missing_param is the
+    # correct answer.
 fi
 
 # --- Daemon path ----------------------------------------------------------

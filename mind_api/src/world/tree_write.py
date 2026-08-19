@@ -876,6 +876,20 @@ def _stamp_progression(node: Dict[str, Any]) -> None:
     node["progression_updated_at"] = date.today().isoformat()
 
 
+# --- CALIBRATION stamp (; mirror of tree.py) -----------------------
+# MUST match tree.py._CALIBRATION_STAMP_FIELDS / _stamp_calibration byte-for-byte
+# (the byte-compat parity tests enforce CLI<->daemon equality). Deliberately a
+# SEPARATE key from progression_updated_at — see tree.py for why one selector
+# serving two field groups with different write triggers is unsound (guard-3358).
+_CALIBRATION_STAMP_FIELDS = ("accuracy",)
+
+
+def _stamp_calibration(node: Dict[str, Any]) -> None:
+    """Bump the CALIBRATION stamp (). Date-granular to match
+    tree.py._stamp_calibration exactly (byte-compat parity)."""
+    node["calibration_updated_at"] = date.today().isoformat()
+
+
 def _apply_set(tree: Dict[str, Any], key: str, field: str, value: Any,
                world_path: Path) -> Dict[str, Any]:
     """Non-confidence field set. Confidence is rejected upstream (handler)."""
@@ -890,6 +904,9 @@ def _apply_set(tree: Dict[str, Any], key: str, field: str, value: Any,
     # instead of reverting it via _merge_field_progression's never-regress tie.
     if field in _PROGRESSION_STAMP_FIELDS:
         _stamp_progression(node)
+    # : same for the CALIBRATION stamp (separate key, see above).
+    if field in _CALIBRATION_STAMP_FIELDS:
+        _stamp_calibration(node)
     #  (Option B): do NOT auto-bump per-node last_updated on a
     # metadata set. node .md front matter is the single source of truth
     # (); the _tree.yaml index last_updated is synced to it ONLY by

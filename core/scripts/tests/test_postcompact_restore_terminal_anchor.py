@@ -100,6 +100,83 @@ def test_live_anchor_still_emits_resume_imperative(monkeypatch, tmp_path, status
     assert "did NOT run" not in out
 
 
+# --- axis 2b: a DEFERRED anchor is refused too () -----------------
+#
+# The terminal branch above covers completed/skipped/expired. A DEFER leaves
+# status `pending` with a defer_reason, so it sails through that check and gets
+# the full "Resume execution on THIS goal. Do NOT re-run goal-selector.sh"
+# imperative — on a goal whose remaining half was deliberately routed away.
+# Observed live 2026-08-04 (alpha, cc-04,  deferred with
+# defer_reason precondition_unmet:studio_session_required).
+
+
+def _write_queue_deferred(path, goal_id, defer_reason, asp_id="asp-001"):
+    rec = {"id": asp_id, "title": "t", "status": "active",
+           "goals": [{"id": goal_id, "title": "g", "status": "pending",
+                      "defer_reason": defer_reason,
+                      "defer_reason_set_at": "2026-08-04T22:01:08"}]}
+    path.write_text(json.dumps(rec) + "\n", encoding="utf-8")
+
+
+def test_deferred_anchor_refuses_resume(monkeypatch, tmp_path):
+    """The originating incident, reproduced at the read side."""
+    mod, _agent, world = _load_module(monkeypatch, tmp_path)
+    _write_queue_deferred(world / "aspirations.jsonl", "g-001-01",
+                          "precondition_unmet:studio_session_required")
+
+    out = "\n".join(mod._format_iteration_ckpt_block(_ckpt()))
+
+    assert "STALE ANCHOR" in out
+    assert "DEFERRED" in out
+    assert "precondition_unmet:studio_session_required" in out, (
+        "name the defer_reason — a reader deciding whether to override needs "
+        "to see WHY it was parked, not just that it was")
+    assert RESUME_IMPERATIVE not in out
+
+
+def test_deferred_anchor_is_not_told_never_to_execute_the_goal(monkeypatch, tmp_path):
+    """Deliberately weaker than the terminal wording. A terminal goal is closed
+    and must not be touched; a deferred goal is LIVE work that is simply not in
+    flight, and may be selected again on its merits once the defer clears.
+    Telling the reader never to execute it would be its own wrong instruction."""
+    mod, _agent, world = _load_module(monkeypatch, tmp_path)
+    _write_queue_deferred(world / "aspirations.jsonl", "g-001-01", "blocked_on_x")
+
+    out = "\n".join(mod._format_iteration_ckpt_block(_ckpt()))
+
+    assert "do NOT write an outcome_note" not in out
+    assert "normal selection and fine" in out
+
+
+def test_a_pending_goal_without_a_defer_reason_still_resumes(monkeypatch, tmp_path):
+    """The false-positive guard for axis 2b, and the reason the sibling
+    'claimed_by is empty -> released' predicate was written and then REMOVED:
+    it fired here. A worker hands its goal to the reducer at in-progress with
+    the claim released (worker-loop Phase 4), and stranded-claim-sweep strips
+    claim fields by design — so an absent claim field is not evidence of an
+    event, while a defer_reason is."""
+    mod, _agent, world = _load_module(monkeypatch, tmp_path)
+    for status in ("pending", "in-progress", "blocked"):
+        _write_queue(world / "aspirations.jsonl", "g-001-01", status)
+        out = "\n".join(mod._format_iteration_ckpt_block(_ckpt()))
+        assert RESUME_IMPERATIVE in out, status
+        assert "STALE ANCHOR" not in out, status
+
+
+def test_deferred_but_ambiguous_id_does_not_get_a_confident_verdict(monkeypatch, tmp_path):
+    """When the id lives in both queues the defer_reason read may belong to the
+    OTHER copy. A confident 'this is deferred' about the wrong goal is worse
+    than the ambiguity note the reader already gets."""
+    mod, agent, world = _load_module(monkeypatch, tmp_path)
+    _write_queue_deferred(world / "aspirations.jsonl", "g-001-01", "blocked_on_x")
+    _write_queue(agent / "aspirations.jsonl", "g-001-01", "pending")
+
+    out = "\n".join(mod._format_iteration_ckpt_block(_ckpt()))
+
+    assert "STALE ANCHOR" not in out
+    assert "BOTH queues" in out
+
+
 # --- axis 3: surface, never swallow ----------------------------------------
 
 def test_terminal_branch_still_prints_the_full_block(monkeypatch, tmp_path):
@@ -185,4 +262,11 @@ def test_status_probe_never_raises(monkeypatch, tmp_path, bad):
 
     res = mod._goal_live_status(bad["goal_id"], bad["source"])
     assert isinstance(res, dict)
-    assert set(res) == {"status", "checked", "ambiguous", "note"}
+    # `defer_reason` joined the contract in : a DEFERRED goal keeps
+    # status `pending`, so a status-only probe reports it resumable and the
+    # caller emits the full resume imperative on a goal that was deliberately
+    # parked (observed cc-04, ). The exact-set assertion is kept
+    # rather than loosened to a subset — the point of this pin is that every
+    # caller can rely on the shape, and a silently-growing dict is how a
+    # consumer ends up reading a key that only sometimes exists.
+    assert set(res) == {"status", "checked", "ambiguous", "note", "defer_reason"}

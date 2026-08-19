@@ -35,6 +35,7 @@ SKILL_PATH = PROJECT_ROOT / ".claude" / "skills" / "verify-learning" / "SKILL.md
 
 sys.path.insert(0, str(PROJECT_ROOT / "core" / "scripts"))
 import _paths  # noqa: E402
+import _verify_corpus  # noqa: E402
 
 RB_JSONL = Path(_paths.WORLD_DIR) / "reasoning-bank.jsonl"
 GUARD_JSONL = Path(_paths.WORLD_DIR) / "guardrails.jsonl"
@@ -112,52 +113,57 @@ def main() -> int:
     missing_records: list[dict] = []
     checked = 0
 
-    with open(SKILL_PATH, encoding="utf-8") as f:
-        for line_no, line in enumerate(f, start=1):
-            if not line_carries_record_lookup(line):
+    # Corpus, not the file. The checks moved to a registry on 2026-08-18
+    # (); reading the thin SKILL.md took this gate from correctly
+    # FAILING on 5 missing records to vacuously PASSING on 0 checked — a gate
+    # that cannot fail is worse than an absent one. The corpus is
+    # byte-identical to the pre-cutover file, so line_no still addresses the
+    # same line it did before.
+    for line_no, line in enumerate(_verify_corpus.corpus_lines(), start=1):
+        if not line_carries_record_lookup(line):
+            continue
+        ids = list({m.group(0) for m in RECORD_ID_RX.finditer(line)})
+        if not ids:
+            continue
+        assertions = extract_assertions(line)
+        if not assertions:
+            continue
+        for rec_id in ids:
+            record = read_record(rec_id)
+            if record is None:
+                missing_records.append(
+                    {"line": line_no, "id": rec_id, "snippet": line.strip()[:160]}
+                )
                 continue
-            ids = list({m.group(0) for m in RECORD_ID_RX.finditer(line)})
-            if not ids:
-                continue
-            assertions = extract_assertions(line)
-            if not assertions:
-                continue
-            for rec_id in ids:
-                record = read_record(rec_id)
-                if record is None:
-                    missing_records.append(
-                        {"line": line_no, "id": rec_id, "snippet": line.strip()[:160]}
+            for field, allowed in assertions:
+                if field not in record:
+                    drift_cases.append(
+                        {
+                            "line": line_no,
+                            "id": rec_id,
+                            "field": field,
+                            "expected": allowed,
+                            "live": "<field-absent>",
+                            "snippet": line.strip()[:160],
+                        }
                     )
                     continue
-                for field, allowed in assertions:
-                    if field not in record:
-                        drift_cases.append(
-                            {
-                                "line": line_no,
-                                "id": rec_id,
-                                "field": field,
-                                "expected": allowed,
-                                "live": "<field-absent>",
-                                "snippet": line.strip()[:160],
-                            }
-                        )
-                        continue
-                    live_value = record[field]
-                    if isinstance(live_value, (list, dict)):
-                        continue
-                    live_str = str(live_value)
-                    if live_str not in allowed:
-                        drift_cases.append(
-                            {
-                                "line": line_no,
-                                "id": rec_id,
-                                "field": field,
-                                "expected": allowed,
-                                "live": live_str,
-                                "snippet": line.strip()[:160],
-                            }
-                        )
-                    checked += 1
+                live_value = record[field]
+                if isinstance(live_value, (list, dict)):
+                    continue
+                live_str = str(live_value)
+                if live_str not in allowed:
+                    drift_cases.append(
+                        {
+                            "line": line_no,
+                            "id": rec_id,
+                            "field": field,
+                            "expected": allowed,
+                            "live": live_str,
+                            "snippet": line.strip()[:160],
+                        }
+                    )
+                checked += 1
 
     if drift_cases or missing_records:
         print(

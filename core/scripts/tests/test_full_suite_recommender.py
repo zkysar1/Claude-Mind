@@ -78,7 +78,12 @@ class TestMindClassifier(unittest.TestCase):
             "irrelevant/elsewhere.py",  # should NOT match any bucket
         ]
         buckets = self.mod._classify_mind(paths)
-        self.assertEqual(buckets["py_production"], ["core/scripts/foo.py", "mind_api/src/agent_paths.py"])
+        # : the two trees are DIFFERENT SUITES and must not share a
+        # bucket. This assertion previously required them conflated, which is
+        # how the wrong-suite mapping stayed green while the governing rule
+        # already said otherwise.
+        self.assertEqual(buckets["py_production"], ["core/scripts/foo.py"])
+        self.assertEqual(buckets["py_daemon"], ["mind_api/src/agent_paths.py"])
         self.assertEqual(buckets["py_test"], ["core/scripts/tests/test_foo.py"])
         self.assertEqual(buckets["sh_wrapper"], ["core/scripts/foo.sh"])
         self.assertEqual(buckets["skill_md"], [".claude/skills/aspirations-execute/SKILL.md"])
@@ -98,13 +103,64 @@ class TestMindRecommendations(unittest.TestCase):
         recs = self.mod._mind_recommendations(
             self.mod._classify_mind(["core/scripts/foo.py"])
         )
-        self.assertIn("python -m pytest core/scripts/tests -q", recs)
+        # run-full-suite.sh, not bare pytest: the bare form omits
+        # core/tests/gates plus the invisible and domain halves.
+        self.assertIn("bash core/scripts/run-full-suite.sh", recs)
 
     def test_sh_wrapper_recommends_pytest(self):
         recs = self.mod._mind_recommendations(
             self.mod._classify_mind(["core/scripts/foo.sh"])
         )
-        self.assertIn("python -m pytest core/scripts/tests -q", recs)
+        self.assertIn("bash core/scripts/run-full-suite.sh", recs)
+
+    # --- : the wrong-suite mapping ---------------------------------
+    # These are the regression pins for the defect. Its shape matters for
+    # reading them: the classifier and the emitter were both CORRECT about
+    # which files they had; the only error was which command those files map
+    # to. So a bucket assertion alone cannot catch it — the pin has to be on
+    # the EMITTED STRING, which is what an agent copies into a shell.
+
+    def test_daemon_only_change_recommends_the_daemon_suite(self):
+        """A mind_api/src-only change must name mind_api/tests."""
+        recs = self.mod._mind_recommendations(
+            self.mod._classify_mind(["mind_api/src/endpoints/aspirations_write.py"])
+        )
+        self.assertTrue(any("mind_api/tests" in r for r in recs),
+                        f"no mind_api/tests command emitted: {recs}")
+
+    def test_daemon_only_change_does_not_recommend_the_core_suite(self):
+        """...and must NOT name core/scripts/tests, the suite that does not
+        import it. This is the assertion that fails under the pre-fix source;
+        the sibling above can pass while this one is the real pin."""
+        recs = self.mod._mind_recommendations(
+            self.mod._classify_mind(["mind_api/src/endpoints/aspirations_write.py"])
+        )
+        self.assertFalse(any("core/scripts/tests" in r for r in recs),
+                         f"daemon change advised to run the core suite: {recs}")
+
+    def test_both_trees_touched_emits_both_arms(self):
+        recs = self.mod._mind_recommendations(
+            self.mod._classify_mind(["core/scripts/foo.py", "mind_api/src/agent_paths.py"])
+        )
+        self.assertTrue(any("run-full-suite.sh" in r for r in recs), recs)
+        self.assertTrue(any("mind_api/tests" in r for r in recs), recs)
+
+    def test_every_emitted_pytest_command_pins_storage_backend(self):
+        """guard-955 / rb-2983. Unpinned, a tmp-world write collides on the
+        PRODUCTION S3 key — that truncated world/aspirations.jsonl from 22
+        aspirations / 1366 goals to one fixture on 2026-07-09. The banner is
+        where the command gets copied from. Swept over every input class so a
+        future arm cannot be added unpinned."""
+        for paths in (["mind_api/src/agent_paths.py"],
+                      ["core/scripts/foo.py"],
+                      ["core/scripts/foo.sh"],
+                      ["core/scripts/tests/test_foo.py"],
+                      ["core/scripts/foo.py", "mind_api/src/agent_paths.py"]):
+            recs = self.mod._mind_recommendations(self.mod._classify_mind(paths))
+            for r in recs:
+                if "pytest" in r:
+                    self.assertIn("STORAGE_BACKEND=local", r,
+                                  f"unpinned pytest command for {paths}: {r}")
 
     def test_skill_md_recommends_skill_evaluate(self):
         recs = self.mod._mind_recommendations(
@@ -200,7 +256,7 @@ class TestMainEntrypoint(unittest.TestCase):
         out = buf.getvalue()
         self.assertIn("FULL-SUITE TEST RECOMMENDER", out)
         self.assertIn("core/scripts/foo.py", out)
-        self.assertIn("python -m pytest core/scripts/tests -q", out)
+        self.assertIn("bash core/scripts/run-full-suite.sh", out)
 
     def test_fail_open_on_unexpected_error(self):
         """Any unexpected exception in main() returns exit 0 via outer try."""

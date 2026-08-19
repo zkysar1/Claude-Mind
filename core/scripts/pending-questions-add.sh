@@ -64,12 +64,12 @@ _require_value() {
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --id)              _require_value "$@"; ID="$2"; shift 2 ;;
-        --question)        _require_value "$@"; QUESTION="$2"; shift 2 ;;
-        --default-action)  _require_value "$@"; DEFAULT_ACTION="$2"; shift 2 ;;
-        --priority)        _require_value "$@"; PRIORITY="$2"; shift 2 ;;
-        --type)            _require_value "$@"; TYPE="$2"; shift 2 ;;
-        --context)         _require_value "$@"; CONTEXT="$2"; shift 2 ;;
+        --id)              _require_value "$@"; ID="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --question)        _require_value "$@"; QUESTION="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --default-action)  _require_value "$@"; DEFAULT_ACTION="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --priority)        _require_value "$@"; PRIORITY="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --type)            _require_value "$@"; TYPE="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --context)         _require_value "$@"; CONTEXT="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         --help|-h)         sed -n '2,30p' "$0"; exit 0 ;;
         *)                 echo "pending-questions-add: unknown arg: $1" >&2; exit 2 ;;
     esac

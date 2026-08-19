@@ -258,6 +258,14 @@ RB_VALID_APPLIES_TO = {"any", "framework", "domain", "specific"}
 # future entry types. Kept verbatim-in-sync with core/scripts/reasoning-bank.py.
 RB_VALID_ENTRY_TYPES = {"procedure"}
 GUARD_VALID_STATUSES = {"active", "retired"}
+# Canonical severity values. UPPERCASE is the corpus convention (CRITICAL/HIGH/
+# MEDIUM/LOW), and until  nothing enforced it: `severity` appeared in
+# GUARD_KNOWN_FIELDS as a NAME allowlist only, so any string passed straight
+# through. A one-time case migration therefore re-accumulated — 198 lowercase
+# records measured 2026-08-09 on cc-07, spread evenly across every day since
+# (~28/day), sourced from many goals rather than one guilty writer. There is no
+# single caller to fix; the write is the only chokepoint.
+GUARD_VALID_SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW")
 
 RB_REQUIRED_FIELDS = {"id", "title", "type", "category", "content", "applies_to"}
 RB_DEFAULT_FIELDS = {
@@ -463,6 +471,36 @@ def _normalize_tags(rec):
     rec["tags"] = out
 
 
+def _normalize_severity(rec):
+    """Canonicalize `severity` in-place, THEN refuse a still-invalid value.
+
+    ORDER IS THE DESIGN. Normalize first and validate the normalized value:
+    every one of the 198 non-canonical records measured was case-only
+    ("medium"/"high"/"low"), so this repairs 198/198 with ZERO refusals, while
+    a genuinely wrong value ("urgent", "P1") still fails loudly. A refuse-only
+    gate would have rejected all 198 legitimate writes; a normalize-only gate
+    would let "urgent" accumulate as the next silent variant.
+
+    Absent/None is LEGAL and left alone — 2046 of 2843 active records carry no
+    severity at all, so requiring it here would refuse the majority of writes
+    for a field nothing has ever required.
+    """
+    if "severity" not in rec:
+        return
+    sev = rec["severity"]
+    if sev is None:
+        return
+    if not isinstance(sev, str):
+        raise ValueError(
+            f"Invalid severity: {sev!r} (expected one of {list(GUARD_VALID_SEVERITIES)})")
+    canonical = sev.strip().upper()
+    if canonical not in GUARD_VALID_SEVERITIES:
+        raise ValueError(
+            f"Invalid severity: {sev!r} (expected one of {list(GUARD_VALID_SEVERITIES)}; "
+            f"case is normalized, so 'high' is accepted and stored as 'HIGH')")
+    rec["severity"] = canonical
+
+
 def _validate_utilization(util):
     """Validate the utilization object shape AND value invariants."""
     if not isinstance(util, dict):
@@ -614,6 +652,12 @@ def validate_guard_record(ctx, rec, *, skip_id: bool = False) -> None:
         raise ValueError(f"Invalid experience_ref format: {exp_ref!r} (expected exp-SLUG)")
     _validate_bitemporal(rec)
     _normalize_tags(rec)
+    # . Placed beside _normalize_tags because this validator ALREADY
+    # mutates — normalizing here is the in-file precedent, not a new liberty —
+    # and because spec.validate is the one hook every guardrail write passes
+    # through (append, post-write re-validate, set_field, and the bulk path),
+    # so a single call covers all four rather than four separate gates.
+    _normalize_severity(rec)
 
 
 def _rb_inject_source_goal(ctx, rec):

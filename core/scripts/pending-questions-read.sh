@@ -71,11 +71,11 @@ ALL_AGENTS=""
 PREFIX=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --status) STATUS="$2"; shift 2 ;;
-        --type)   TYPE="$2";   shift 2 ;;
-        --pq-path) PQ_PATH="$2"; shift 2 ;;
+        --status) STATUS="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --type)   TYPE="$2";   shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --pq-path) PQ_PATH="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         --all-agents) ALL_AGENTS=1; shift ;;
-        --prefix) PREFIX="$2"; shift 2 ;;
+        --prefix) PREFIX="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         *) echo "pending-questions-read: unknown arg '$1'" >&2; exit 2 ;;
     esac
 done

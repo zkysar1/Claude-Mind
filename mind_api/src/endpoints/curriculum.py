@@ -133,6 +133,14 @@ def _append_jsonl(path, item):
     p = Path(path)
     assert_not_cruft(p.parent, "mkdir (curriculum append_jsonl)")
     p.parent.mkdir(parents=True, exist_ok=True)
+    # curriculum-promotions.jsonl is S3-backed (agents/ root, no machine-local
+    # exclusion), and the `promote` caller does NOT _read_jsonl it first — so
+    # unlike the read helpers above, nothing on this path materializes it and the
+    # append extends a stale mirror. 's own audit scored this site
+    # "guarded" from a 3000-char lookback that saw _read_jsonl's ensure_local at
+    # :120; that helper is never called on the write path (). Fail-open.
+    from storage_backend import ensure_local_before_append
+    ensure_local_before_append(p)
     with open(p, "a", encoding="utf-8") as f:
         f.write(json.dumps(item, ensure_ascii=True) + "\n")
 

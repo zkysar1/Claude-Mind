@@ -74,16 +74,15 @@ re-entry.
 
 ## Sanctioned Exception: the deadman's-switch terminal-pair
 
-The silent-loop-death failure mode (a turn that ends on trailing TEXT
-instead of the terminal `Skill(aspirations)` call → no Stop event fires →
-the loop dies and sits dead for hours, observed 2026-06-21: 5 of 6 agents
-dead 1.5–4h) cannot be fixed by the Stop hook alone — Claude Code does not
-reliably emit the Stop event on a text-only turn-end (rb-629/guard-454),
-so the hook never fires to BLOCK it. The deadman's-switch closes that gap
+The silent-loop-death failure mode (a turn that ends on trailing TEXT instead
+of the terminal `Skill(aspirations)` call → no Stop event fires → the loop
+dies for hours; 2026-06-21: 5 of 6 agents dead 1.5–4h) cannot be fixed by the
+Stop hook alone — Claude Code does not reliably emit the Stop event on a
+text-only turn-end (rb-629/guard-454). The deadman's-switch closes that gap
 intrinsically: the agent arms its own resurrection.
 
 The mechanism is the **terminal-pair**. By default (Stage 5 onward,
-2026-06-23) — i.e. unless the per-agent opt-out flag
+2026-06-23) — unless the per-agent opt-out flag
 `agents/<agent>/session/deadman-disabled` is present — the iteration's
 terminal response emits TWO batched tool calls, in this exact order:
 
@@ -92,76 +91,44 @@ terminal response emits TWO batched tool calls, in this exact order:
 2. Skill(aspirations) with args='loop'
 ```
 
-Why this is NOT a violation of Anti-pattern C:
+Why this is NOT a violation of Anti-pattern C: `Skill(aspirations)` REMAINS the
+primary re-entry — the LAST call, continuing the loop synchronously. The
+ScheduleWakeup is a single replace-slot wakeup (the platform keeps ONE pending
+wakeup; each iteration's re-arm REPLACES the prior); on a healthy loop the
+session is never idle for `delaySeconds`, so it NEVER fires — the Skill chain
+always re-arms it forward first. It fires ONLY when the Skill chain breaks,
+which is "waiting on a signal the harness cannot track" (the absence of the
+next iteration) — the legitimate use, not state-machine advancement. The gate
+(`schedule-wakeup-gate.py`) passes the sentinel unconditionally; guard-511
+carries the matching carve-out. Verified platform facts (a tool batched after
+ScheduleWakeup executes; ScheduleWakeup is turn-terminal, hence the arm goes at
+the TERMINAL and never early; a wakeup fires after a text-only turn-end) and
+the fail-safe property (worst case a SLOW loop, never a dead one) are recorded
+in `core/config/conventions/loop-terminal-protocol.md` §4; design rationale in
+`core/config/rationale/deadman-switch.md`.
 
-- `Skill(aspirations)` REMAINS the primary re-entry — it is the LAST call
-  and is what continues the loop synchronously, exactly as today. The
-  ScheduleWakeup does NOT replace it.
-- The ScheduleWakeup is a single replace-slot wakeup (the platform keeps
-  ONE pending wakeup; each iteration's re-arm REPLACES the prior). On a
-  healthy loop the session is never idle for `delaySeconds`, so the wakeup
-  NEVER fires — the Skill chain always re-arms it forward first.
-- It fires ONLY when the Skill chain breaks (a text-death leaves the
-  session idle past `delaySeconds`). Then the sentinel resurrects the loop.
-  This is "waiting on a signal the harness cannot track" — the signal being
-  *the absence of the next iteration* — which is squarely the legitimate
-  use, not state-machine advancement.
+### Re-arm FIRST on resurrection — and on autocompact resume (rb-4345 / g-115-2771 / g-115-5834)
 
-Verified platform facts the design rests on (canary, 2026-06-21, dev
-session):
+The net is a SINGLE replace-slot wakeup — FIRING it consumes it, so a
+resurrected turn begins with **no net armed**; and an autocompact resume that
+re-enters the loop body MID-iteration reaches no terminal pair at all, so it
+runs under whatever net already existed — none, if the compaction landed before
+any close. The general trigger is "no terminal pair has been emitted", not "the
+net fired". Both have killed loops for hours (2026-07-19 cc-04: ~7h, resurrected
+turns text-died in an API storm without re-arming; 2026-08-11 cc-05: 7h47m —
+a pending net is NOT excluded: clamp≠delivery, 17.1h max, g-115-6629).
 
-- A tool batched AFTER ScheduleWakeup in the same response DOES execute
-  (so `Skill(aspirations)` after the arm runs — pending live re-validation
-  that the Skill specifically *re-enters* the loop, "Q5").
-- ScheduleWakeup is turn-terminal (ends the turn after the batch) — which
-  is why the arm must be at the TERMINAL, paired with Skill, never early
-  (an early arm would truncate the iteration).
-- A scheduled wakeup DOES fire after a text-only turn-end and re-invokes
-  the agent (the resurrection primitive — proven end-to-end).
-
-The gate (`schedule-wakeup-gate.py`) already passes the `<<autonomous-loop-dynamic>>`
-sentinel (`is_bad_slash_prefix` returns False), so the deadman call is
-approved unconditionally. guard-511 carries the matching carve-out.
-
-Fail-safe property: if the live Q5 re-validation shows `Skill(aspirations)`
-does NOT re-enter after ScheduleWakeup, the worst case is a SLOW loop
-(`delaySeconds`/iteration, driven by the wakeup) — still alive and still
-self-arming — NOT a dead loop. The change cannot make survival worse than
-the status quo.
-
-### Re-arm FIRST on resurrection (single-shot-net gap, rb-4345 / g-115-2771)
-
-The net is a SINGLE replace-slot wakeup — FIRING it consumes it. When the
-`<<autonomous-loop-dynamic>>` wakeup fires and resurrects a dead loop, the
-resurrected turn begins with **no net armed** — it is protected again only once
-its own terminal-pair re-arms at iteration close. If the resurrected turn
-text-dies BEFORE reaching that close, the single net is already spent and
-nothing remains to resurrect the loop: a SECOND silent death with no third net.
-This is not hypothetical and is WORSE than the original single death — the
-condition that killed the loop the first time (an API storm returning
-529/`overloaded_error`/ECONNRESET/timeout) commonly outlasts the 600s
-resurrection latency, so the resurrected turn is statistically likely to die the
-same way with the net already gone. Observed 2026-07-19 (cc-04): the deadman
-fired at 00:00:40 and resurrected the loop, the resurrected turns text-died
-00:00–00:04 during an API storm WITHOUT re-arming, and the loop stayed dead ~7h
-until recovery-gate zombie-recovery at 07:18.
-
-**RULE:** on a `<<autonomous-loop-dynamic>>` wakeup firing, the resurrected
-turn's FIRST tool call MUST be a
-`ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>", delaySeconds=600)` re-arm —
-restoring the net BEFORE any loop-entry work that could fail — THEN proceed to
-Phase -1.5. This is NOT the "arm early" mechanic F2 rejected: F2 forbade arming
-early in a STEADY-STATE iteration (where the turn-terminal arm would truncate a
-multi-turn iteration). The resurrection re-arm is a one-shot net-restoration at
-the very START of a resurrection turn; the iteration then runs normally and its
-terminal-pair re-arm at close simply REPLACES this restoration arm (double-arm
-is harmless under replace-slot semantics). Each resurrection thus re-establishes
-the net protecting the NEXT resurrection, so the loop keeps getting chances for
-as long as the storm persists instead of spending its one-and-only net on the
-first resurrection. The gate passes the sentinel unconditionally, so the re-arm
-is always approved.
-
-Rationale + full incident trace: `core/config/rationale/deadman-switch.md`.
+**RULE:** on a `<<autonomous-loop-dynamic>>` wakeup firing, **or on an autocompact
+resume that re-enters the loop body mid-iteration**, that turn's FIRST tool call
+MUST be a `ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>", delaySeconds=600)`
+re-arm — restoring the net BEFORE any loop-entry work that could fail — THEN
+proceed to Phase -1.5. This is NOT the "arm early" mechanic F2 rejected (that
+forbade arming early in a STEADY-STATE iteration, where a turn-terminal arm
+truncates a multi-turn iteration); it is a one-shot net-restoration at the very
+START of the turn, and the iteration's terminal-pair re-arm at close simply
+REPLACES it (double-arm is harmless under replace-slot semantics). The gate
+passes the sentinel unconditionally, so the re-arm is always approved. Full
+incident traces: `core/config/rationale/deadman-switch.md`.
 
 ### D. Using ScheduleWakeup for EXTERNAL polling the harness already tracks
 
@@ -185,14 +152,5 @@ C above) NOR to poll background Bash the harness auto-notifies on
 - `core/scripts/aspirations-rejection-audit.py` — Layer C detective
 - ScheduleWakeup tool documentation in the system prompt (the authoritative
   spec for the sentinel and the polling anti-pattern)
-
-## Origin
-
-Discovered 2026-05-18 from zeta session f1f3066e: four consecutive
-ScheduleWakeup calls with `prompt: "/aspirations loop"` over four hours
-(08:54 / 09:47 / 10:41 / 11:07 UTC), each followed ~2 min later by the
-"can only be invoked by Claude" rejection. Layer D audit of 18 transcripts
-showed zeta was the only agent doing this — alpha, delta, and echo all
-used `<<autonomous-loop-dynamic>>` or natural-language correctly. The
-pattern is easy to drift into once it survives in context, so the gate
-protects against future occurrences in any agent.
+- `core/config/conventions/loop-terminal-protocol.md` — platform facts,
+  fail-safe property, and the 2026-05-18 origin incident (moved from this rule)

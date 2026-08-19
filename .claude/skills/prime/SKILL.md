@@ -64,12 +64,27 @@ Bash: state=$(bash core/scripts/session-state-get.sh); echo "state=$state"
 # to L1 (write-time hook) and L2 (permission gate).
 Bash: validate-paths.sh
 
+# LANE-PIN REVIEW SURFACE (g-115-5901) — sibling of the L3 defense above: a
+# fail-open startup advisory that prints and never blocks. A lane pin is a
+# durable USER-DIRECTED restriction on this agent's entire work surface; its
+# `review_by` column says when a human should LOOK at it again, not when it
+# stops binding. Past that date this prints "still enforced — confirm or
+# retire" and keeps printing every startup until a human edits the registry row.
+#
+# The pin is NOT weakened by a lapsed date and the claim gate never consults
+# this — a hard expiry would silently hand the agent back a surface the user
+# deliberately took away. Before this existed the `expires` column was parsed
+# into a field NO caller anywhere in the tree ever read, so a pin could sit
+# unexamined forever and the dead field terminated the audit that would have
+# found it. Silent when no pin covers this agent, or when none is past due.
+Bash: lane-pin-review.sh
+
 IF state == "NO_AGENT":
   → World-only priming mode. Skip all agent-specific steps.
   → Bash: world-cat.sh program.md  # The Program — shared purpose
   → Bash: world-cat.sh knowledge/tree/_tree.yaml  # collective knowledge overview
-  → Bash: guardrails-read.sh --summary (shared safety rules — bounded index,
-    100% coverage; same budget + expansion rules as Phase 2 item 3)
+  → Bash: guardrail-manifest.sh (shared safety rules — id manifest, 100%
+    coverage; same budget + expansion rules as Phase 2 item 3)
   → Bash: reasoning-bank-read.sh --recent (shared lessons — bounded; see Phase 2 item 4)
   → Display:
     ═══ WORLD PRIME (no agent) ═══
@@ -144,12 +159,20 @@ token budget below, as a bounded index plus on-demand expansion, never in full.
    `--active` is not an option: measured 2026-07-27 at 1398 records / 2.66 MB
    (~665k tokens), larger than the whole context window — so the former
    unconditional-load instruction could never have executed.
-   - Bash: guardrails-read.sh --summary → one line per guardrail (id, category,
-     truncated rule). 160 KB (~40k tokens), covering 100% of active guardrails
-     (1398/1398 verified). Nothing is dropped — every guardrail is present by id.
-   - Treat the rule text in that index as ABSENT, not as read: the imperative
-     sits past the truncation ~85% of the time, so a slice shows you the topic
-     and hides the instruction (guard-1421).
+   - Bash: guardrail-manifest.sh → ids grouped by category, covering 100% of
+     active guardrails. Every guardrail is present by id; NO rule text is loaded.
+     Measured 2026-08-19 (zeta, cc-02, 6.8.0-137-generic): **52 KB / 4099
+     records / 324 categories / ~21k tokens** — inside the budget. It replaced
+     `--summary` (468 KB, ~3.2x over) after measurement showed the breach was
+     count-driven and unfixable per-line: rule text is 69.8% of that file and is
+     ALREADY truncated at exactly 80 chars (p50 = p90 = max = 80), so there was
+     no slack to reclaim, while the safety floor those callers state is id
+     coverage — not text coverage (g-115-6703). Growth is now COUNT-only
+     (~41 records/day ≈ +0.4 KB/day), so +30 days ≈ 64 KB / ~26k tokens, still
+     inside; it re-breaches only past ~4x today's record count.
+     `--summary` remains correct for callers that want the truncated text.
+   - The manifest carries NO rule text, so guard-1421 holds by construction
+     rather than by discipline: there is no truncated imperative to misread.
    - Before acting inside a guardrail's trigger zone, expand it IN FULL:
      `guardrails-read.sh --id guard-NNN`, or `--category <cat>` for a whole lane.
    - The always-load core is identified by the explicit `severity` marker —
@@ -172,7 +195,17 @@ token budget below, as a bounded index plus on-demand expansion, never in full.
    Budget ~9k tokens. Neither `--active` nor `--universal` is an option:
    `--universal` measured 4123 records / 10.8 MB (~2.7M tokens) — 79% of the
    store, so it was never a budget.
-   - Bash: reasoning-bank-read.sh --recent → 498 entries, 37 KB (~9k tokens).
+   - Bash: reasoning-bank-read.sh --recent → **10 entries, 42 KB (~12k tokens)**.
+     RE-MEASURED 2026-08-11 (foxtrot, LAPTOP-3IOFCNEO). This line read "498
+     entries, 37 KB (~9k tokens)" until then — off by 50x on the count, and the
+     shape is what changed, not just the number: 498 entries in 37 KB is ~76 B
+     each (a shallow id+title INDEX), while 10 in 42 KB is ~4.3 KB each (FULL
+     bodies). Same token cost, ~98% less recall breadth. Believed intended (the
+     bounding work in g-115-3407); the figure simply was not updated with it.
+     `--limit N` does NOT widen this — measured 3/25/100 all returning exactly
+     10, because the wrapper never reads the flag (g-115-4428: a PASSTHROUGH
+     array appended at 4 sites and read at zero, orphaned by the 2026-05-14
+     daemon cutover, so a mistyped or unsupported filter is swallowed rc=0).
    - Category-relevant entries load in Phase 3 via
      `retrieve.sh --category {cat} --depth {tier_depth}` (DEPTH_LIMITS:
      shallow 15 / medium 30 / deep 50) — the existing budgeted path.

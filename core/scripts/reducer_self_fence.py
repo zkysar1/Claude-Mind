@@ -56,13 +56,51 @@ consumer that conflation is harmless in the safe direction: both readings mean n
 peer has been observed holding the claim, so the reducer holds. (The same rc=4 is
 decisive for a worker. Copying either treatment across is the bug.)
 
-MEASURED LIMIT, stated rather than papered over (guard-1760): the claims payload
-carries {agent, machine_id, agent_state, heartbeat_at} and NO runner_token, so a
-SAME-BOX reducer restart — new token, same machine_id — is invisible to the
-different-holder read and reports HOLD. Closing that needs the endpoint to expose
-the token.
+THE SAME-BOX RESTART AXIS (g-306-302, 2026-08-17). A same-box reducer restart —
+new token, unchanged machine_id — is invisible to the different-holder read,
+because :func:`parse_machine` reads only the machine id. That gap is now closed
+by a SECOND decisive trigger, `superseded-token`.
+
+Since g-306-224 the LIVE line of `runner-claim.sh status` — the exact command
+:func:`check` already runs — carries `token-fp <digest>`, a non-reversible
+fingerprint of the row's runner_token. The signal was already on this module's
+wire, unread.
+
+WHY THIS IS DECISIVE ON THE FIRST POLL, where the worker's same axis is not.
+`runner-claim.sh` sources the claim's runner_token from
+`agents/<agent>/session/runner-token` (its line ~101, the acquire path), so a
+REDUCER can hash the very input its own claim was minted from and compare. A
+mismatch is positive evidence that the claim row holds a token this process did
+not mint — and the token is written only on acquire, so a different token means a
+different acquisition happened after this one. That is structurally the same
+class of evidence as `different-holder`, which is already decisive.
+
+`worker_reducer_liveness` cannot do this: a worker never minted a token, so it
+must LEARN a baseline from its first LIVE poll and can only detect that the fp
+MOVED while it watched. This module needs no history, which is why the two
+implementations differ rather than being shared.
+
+FALSE-POSITIVE ARGUMENT, owed because this trigger stops a HEALTHY loop
+(guard-1562). Both operands must be known or the branch does not fire, so the
+only way to mismatch is for the claim to hold a token differing from the one on
+this box's disk. Every such case is a re-mint, and a re-mint happens only when a
+new runner acquired the claim — i.e. exactly when this reducer IS superseded. The
+dangerous readings are the UNKNOWN ones, and all of them hold: an unreadable or
+empty token file, a fp the emitter printed as `unknown` (a daemon predating the
+field — a mixed-version fleet must degrade to machine-only behaviour, never fence
+every reducer), and an unparsable LIVE line all leave the comparison
+non-discriminating.
+
+Do NOT close any of this by exposing the raw token. `runner_token` is the
+ConditionExpression bearer credential for `heartbeat` and `release_runner`:
+publishing it lets any reader forge a heartbeat (defeating `reclaim_if_stale`) or
+release a live claim — the very failures the lease exists to prevent. Only
+digests cross this module's boundary; :func:`read_own_token_fp` hashes in place
+and never returns, stores, or prints the value it read. See
+`owncloud_backend.runner_token_fingerprint`.
 """
 
+import hashlib
 import json
 import os
 import subprocess
@@ -80,9 +118,27 @@ FAILURE_RCS = (1, 2, 3)
 # decide() call in a test or an inspection seam has a sane number.
 DEFAULT_STEPDOWN_SECONDS = 1950
 
+# Wire markers for the `runner-claim.sh status` LIVE line. DERIVED LOCALLY rather
+# than imported from worker_reducer_liveness, for the same reason the reducer/
+# worker role predicate in main() is (guard-2445): these two modules are
+# deliberate MIRRORS with opposite fail-safe directions, and a shared import
+# would let a future edit to one silently change the other's meaning. The real
+# join is a contract test against the emitter, which is a bash script with
+# embedded python that cannot import from either module (guard-920 — pin the
+# production shape, never a hand-copy that drifts with it).
+LIVE_MARKER = "is RUNNING on "
+TOKEN_FP_MARKER = "token-fp "
+
+# What the emitter prints when the daemon supplied no fingerprint. Parsed back to
+# None so it is non-discriminating, rather than a fingerprint literally spelled
+# "unknown" — which would compare EQUAL between two different runners and read as
+# "no takeover", the one direction this axis must never fail in.
+TOKEN_FP_UNKNOWN = "unknown"
+
 
 def decide(rc, observed_machine, self_machine, failure_elapsed_s,
-           t_stepdown=DEFAULT_STEPDOWN_SECONDS):
+           t_stepdown=DEFAULT_STEPDOWN_SECONDS,
+           observed_token_fp=None, self_token_fp=None):
     """Pure decision — no I/O. Returns {verdict, reason, trigger}.
 
     `failure_elapsed_s` is seconds of CONTINUOUS renewal failure (0 when the
@@ -93,6 +149,11 @@ def decide(rc, observed_machine, self_machine, failure_elapsed_s,
 
     `trigger` is the machine-readable branch name, so a caller can act on WHICH
     condition fired without re-parsing the prose reason.
+
+    `observed_token_fp` / `self_token_fp` are runner-token FINGERPRINTS, never
+    tokens. Both are KEYWORD-with-default so every pre-existing positional call
+    (including the `decide-only` argv seam and the whole existing unit suite)
+    stays valid and keeps its exact prior verdict.
     """
     if rc == 0:
         if observed_machine and self_machine and observed_machine != self_machine:
@@ -103,11 +164,50 @@ def decide(rc, observed_machine, self_machine, failure_elapsed_s,
                            f"{observed_machine!r}, but this reducer is running on "
                            f"{self_machine!r} — positive evidence of takeover"),
             }
+        if (self_token_fp and observed_token_fp
+                and observed_token_fp != self_token_fp):
+            # SAME-BOX reducer restart — the axis machine_id structurally cannot
+            # see, and the reason this branch exists at all. The claim is LIVE,
+            # the holder id matches (or is unreadable), but the runner_token
+            # behind it is not the one this process minted.
+            #
+            # Decisive on the FIRST poll, unlike the worker's mirror of this
+            # axis: `self_token_fp` is the digest of THIS box's runner-token
+            # file, which is the exact input runner-claim.sh acquires with, so a
+            # mismatch is positive evidence rather than a learned baseline. The
+            # token is written only on acquire, so a token that is not mine means
+            # an acquisition happened after mine.
+            #
+            # Both operands are digests, so printing them is safe AND is the
+            # diagnostic value of the axis — a reader sees the identity moved
+            # without ever holding the credential
+            # (owncloud_backend.runner_token_fingerprint).
+            return {
+                "verdict": VERDICT_STAND_DOWN,
+                "trigger": "superseded-token",
+                "reason": (f"superseded: the live claim is on "
+                           f"{observed_machine or 'an unreadable machine'!r} but its "
+                           f"runner token was re-minted (mine {self_token_fp} -> "
+                           f"claim {observed_token_fp}) — a new runner acquired the "
+                           f"claim, so this reducer no longer holds it even though "
+                           f"the machine id is unchanged"),
+            }
         if observed_machine and self_machine:
+            # Name the token axis's state rather than staying silent about it. An
+            # unreadable fp on either side makes `superseded-token` INERT for this
+            # poll, and an inert check that reports the same clean verdict as an
+            # armed one is exactly what guard-1760 forbids.
+            if self_token_fp and observed_token_fp:
+                fp_note = f"; runner token matches ({self_token_fp})"
+            else:
+                fp_note = (f"; token axis non-discriminating this poll "
+                           f"(mine={self_token_fp!r}, claim={observed_token_fp!r}) "
+                           f"— holder comparison is the only armed axis")
             return {
                 "verdict": VERDICT_HOLD,
                 "trigger": "holding",
-                "reason": f"this box ({self_machine!r}) still holds the live claim",
+                "reason": (f"this box ({self_machine!r}) still holds the live claim"
+                           f"{fp_note}"),
             }
         # One or both machine ids unknown. The comparison is NON-DISCRIMINATING,
         # not negative — treating an unreadable id as a takeover would stand a
@@ -166,6 +266,69 @@ def parse_machine(stdout):
         return None
     j = rest.find("'", 1)
     return rest[1:j] if j > 0 else None
+
+
+def parse_token_fp(stdout):
+    """Pull the runner-token FINGERPRINT off that SAME LIVE summary line.
+
+    Format: ... heartbeat 272s old (threshold 3900s), token-fp 1f4c0a9b2e6d8035
+
+    LINE-SCOPED deliberately: the marker is searched only AFTER LIVE_MARKER and
+    only to the end of THAT line, so a `token-fp` string appearing anywhere else
+    in captured stderr — a traceback quoting this module, a peer's diagnostic —
+    cannot be mistaken for this claim's fingerprint. A mis-scoped read is worse
+    than no read here: it would manufacture a spurious supersession and stand a
+    HEALTHY reducer down, which is the one failure this module must not have.
+
+    Returns None when absent, unparsable, or literally TOKEN_FP_UNKNOWN.
+    decide() treats a None fp as NON-discriminating, never as a change.
+    """
+    i = stdout.find(LIVE_MARKER)
+    if i < 0:
+        return None
+    line = stdout[i:].split("\n", 1)[0]
+    j = line.find(TOKEN_FP_MARKER)
+    if j < 0:
+        return None
+    rest = line[j + len(TOKEN_FP_MARKER):].strip()
+    if not rest:
+        return None
+    fp = rest.split()[0].strip(",.;:'\"")
+    if not fp or fp == TOKEN_FP_UNKNOWN:
+        return None
+    return fp
+
+
+def read_own_token_fp(token_path):
+    """Fingerprint of THIS box's runner token. The raw value never escapes.
+
+    The token is read, hashed, and dropped inside this function — no caller ever
+    receives it, and nothing returned from here can be used as a
+    ConditionExpression. That containment is the security property
+    (`owncloud_backend.runner_token_fingerprint`), not a stylistic preference.
+
+    Whitespace is stripped the way `runner-claim.sh` strips it before sending the
+    token (`tr -d '[:space:]'`, its line ~103) — ALL whitespace, not just the
+    ends. The digests must agree byte-for-byte or the comparison is meaningless,
+    so this normalization is part of the contract, not an implementation detail.
+
+    The digest is SHA-256 truncated to 16 hex chars, matching
+    `owncloud_backend.runner_token_fingerprint`. Computed locally rather than
+    imported because importing that module drags the whole storage backend
+    (and its cloud SDK) into a per-tick fence; a contract test pins the two to
+    the same value.
+
+    Returns None on anything unreadable or empty — an unknown self fp must leave
+    the comparison non-discriminating, never guess.
+    """
+    try:
+        raw = Path(token_path).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    token = "".join(raw.split())
+    if not token:
+        return None
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
 
 
 def read_failure_elapsed(marker_path, now_s):
@@ -232,8 +395,14 @@ def load_stepdown_seconds(config_path):
     return val if isinstance(val, int) and val > 0 else None
 
 
-def check(agent, scripts_dir, self_machine, marker_path, now_s, t_stepdown):
-    """Run the real poll and return decide()'s dict plus the raw evidence."""
+def check(agent, scripts_dir, self_machine, marker_path, now_s, t_stepdown,
+          token_path=None):
+    """Run the real poll and return decide()'s dict plus the raw evidence.
+
+    `token_path` is keyword-with-default so pre-existing callers keep working and
+    keep their exact prior verdict: with no path, both fps are None and the
+    `superseded-token` branch cannot fire.
+    """
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from _runtime_bash import bash_cmd  # guard-580/581: never a bare "bash" argv[0]
 
@@ -243,12 +412,21 @@ def check(agent, scripts_dir, self_machine, marker_path, now_s, t_stepdown):
     )
     combined = (proc.stdout or "") + (proc.stderr or "")
     observed = parse_machine(combined)
+    observed_fp = parse_token_fp(combined)
+    self_fp = read_own_token_fp(token_path) if token_path else None
     elapsed = read_failure_elapsed(marker_path, now_s)
 
-    result = decide(proc.returncode, observed, self_machine, elapsed, t_stepdown)
+    result = decide(proc.returncode, observed, self_machine, elapsed, t_stepdown,
+                    observed_token_fp=observed_fp, self_token_fp=self_fp)
     result["rc"] = proc.returncode
     result["observed_machine"] = observed
     result["self_machine"] = self_machine
+    # Digests only. There is deliberately no raw-token field on this dict for the
+    # same reason RunnerClaim has none: the result is printed as JSON to stdout
+    # and read by heartbeat-tick.sh, so making the token unrepresentable here
+    # means a future caller cannot leak it by adding one line.
+    result["observed_token_fp"] = observed_fp
+    result["self_token_fp"] = self_fp
     result["failure_elapsed_s"] = elapsed
     result["t_stepdown"] = t_stepdown
     result["poll_output"] = combined.strip()[:400]
@@ -258,13 +436,19 @@ def check(agent, scripts_dir, self_machine, marker_path, now_s, t_stepdown):
 def main(argv):
     if len(argv) > 1 and argv[1] == "decide-only":
         # Test/inspection seam: decide() over argv, no daemon, no marker file.
-        # rc observed self elapsed [t_stepdown]
+        # rc observed self elapsed [t_stepdown] [observed_token_fp] [self_token_fp]
+        # The two fps are trailing-optional so every pre-existing 5- and 6-arg
+        # invocation keeps its exact prior verdict. They are DIGESTS — this seam
+        # must never be handed a raw token.
         rc = int(argv[2])
         observed = argv[3] or None
         self_machine = argv[4] or None
         elapsed = int(argv[5])
         t_stepdown = int(argv[6]) if len(argv) > 6 else DEFAULT_STEPDOWN_SECONDS
-        out = decide(rc, observed, self_machine, elapsed, t_stepdown)
+        observed_fp = (argv[7] or None) if len(argv) > 7 else None
+        self_fp = (argv[8] or None) if len(argv) > 8 else None
+        out = decide(rc, observed, self_machine, elapsed, t_stepdown,
+                     observed_token_fp=observed_fp, self_token_fp=self_fp)
         print(json.dumps(out))
         return 0 if out["verdict"] == VERDICT_HOLD else 1
 
@@ -352,9 +536,14 @@ def main(argv):
         return 0
 
     marker = agent_dir / "session" / "claim-heartbeat-failure"
+    # Same file runner-claim.sh acquires with (its line ~101), which is what makes
+    # the fp comparison decisive rather than a learned baseline. Read and hashed
+    # inside read_own_token_fp; the raw value never reaches this scope.
+    token_file = agent_dir / "session" / "runner-token"
 
     import time
-    out = check(agent, scripts_dir, self_machine, marker, int(time.time()), t_stepdown)
+    out = check(agent, scripts_dir, self_machine, marker, int(time.time()), t_stepdown,
+                token_path=token_file)
     print(json.dumps(out))
     return 0 if out["verdict"] == VERDICT_HOLD else 1
 

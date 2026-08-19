@@ -686,6 +686,94 @@ def test_cli_door_recompletion_keeps_the_first_sid():
             "completed_at must not move either -- all three are one triple")
 
 
+# ── : the pair must land TOGETHER, or not at all ────────────────────
+# Everything above pins each half's own first-wins behaviour, and each half was
+# correct on its own terms. The defect lives BETWEEN them: two independent
+# guards on one conceptual pair, so a write can fill the empty half while
+# first-wins preserves the other -- producing a name and a session that never
+# co-occurred. Measured 2026-08-09 over the full store (8686 goals): 4239
+# completed goals carry completed_by with NO completed_by_sid and ZERO carry the
+# sid without the name, so that 4239-row reservoir is exactly the population
+# where the next `update-goal status=completed` would stamp a FOREIGN sid. 6 of
+# 14 distinct completion-SIDs already carry more than one completed_by value.
+#
+# Absent is the correct outcome on that backlog, not a regression:
+# `_completed_by_sid` states the principle verbatim -- an absent sid beats a
+# wrong one.
+
+def _preclaimed_world(root: Path, *, cli: bool) -> Path:
+    """A world whose goal ALREADY carries completed_by and no sid.
+
+    This is the state 4239 live rows are in. `status` stays non-terminal so the
+    close is a real transition; `completed_by` is a DIFFERENT agent from the one
+    closing, which is what makes a foreign stamp visible rather than plausible.
+    """
+    world = root / "world"
+    world.mkdir(parents=True, exist_ok=True)
+    gid = "g-101-01" if cli else "g-100-01"
+    asp = {
+        "id": "asp-101" if cli else "asp-100",
+        "title": "completed_by already set, sid still free",
+        "status": "active", "priority": "LOW",
+        "goals": [_goal(gid, claimed_by="delta", claimed_at="2026-08-03T10:00:00",
+                        claimed_by_sid=HOLDER_SID, status="in-progress",
+                        completed_by="zeta")],
+        "progress": {"completed_goals": 0, "total_goals": 1},
+    }
+    (world / "aspirations.jsonl").write_text(
+        json.dumps(asp, ensure_ascii=False) + "\n", encoding="utf-8")
+    return world
+
+
+def test_daemon_door_leaves_sid_absent_when_the_name_is_already_set():
+    """Daemon door: name already claimed -> the sid stays ABSENT, not foreign.
+
+    Reverting the guard makes this fail with completed_by_sid == ACTOR_SID
+    beside completed_by == "zeta" -- a pair that never occurred, and one no
+    downstream join can detect, because both values are individually legitimate.
+    """
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _preclaimed_world(Path(tmpd), cli=False)
+        with DaemonFixture(world, agent="delta") as df:
+            status, out = _update_goal(df.port, "g-100-01", "status", "completed",
+                                       "delta", sid=ACTOR_SID)
+            assert status == 200, f"update-goal status={status}; body={out!r}"
+            g = _find_goal(world, "g-100-01")
+            assert g is not None and g.get("status") == "completed", f"resp={out!r}"
+            assert g.get("completed_by") == "zeta", (
+                "first-wins on the NAME is unchanged by this fix; "
+                f"got {g.get('completed_by')!r}")
+            assert "completed_by_sid" not in g, (
+                "the sid must not be stamped by a write that did not also stamp "
+                f"the name; got {g.get('completed_by_sid')!r} beside "
+                f"completed_by={g.get('completed_by')!r}")
+            assert "claimed_by_sid" not in g, (
+                "narrowing the stamp must not narrow the pop (guard-151)")
+
+
+def test_cli_door_leaves_sid_absent_when_the_name_is_already_set():
+    """CLI half of the same invariant.
+
+    Carried on its own rather than assumed from the daemon arm: the two doors
+    are separate implementations that only a parity test ties together, and
+    every other behaviour in this file is pinned on both sides for that reason.
+    """
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _preclaimed_world(Path(tmpd), cli=True)
+        proc = _cli_update(world, sid=ACTOR_SID, terminal="completed")
+        assert proc.returncode == 0, (
+            f"CLI update-goal rc={proc.returncode}\nstderr={proc.stderr[-2000:]}")
+        g = _find_goal(world, "g-101-01")
+        assert g is not None and g.get("status") == "completed"
+        assert g.get("completed_by") == "zeta", (
+            f"first-wins on the NAME is unchanged; got {g.get('completed_by')!r}")
+        assert "completed_by_sid" not in g, (
+            "the CLI door must not stamp a sid on a write that did not also "
+            f"stamp the name; got {g.get('completed_by_sid')!r}")
+        assert "claimed_by_sid" not in g, (
+            "narrowing the stamp must not narrow the pop (guard-151)")
+
+
 if __name__ == "__main__":
     test_request_sid_is_preferred_over_claim_sid()
     test_falls_back_to_claim_sid_when_request_carries_none()
@@ -704,4 +792,6 @@ if __name__ == "__main__":
         test_non_completed_terminal_does_not_stamp(_t)
     test_cli_door_does_not_stamp_on_non_completed_terminal()
     test_cli_door_recompletion_keeps_the_first_sid()
+    test_daemon_door_leaves_sid_absent_when_the_name_is_already_set()
+    test_cli_door_leaves_sid_absent_when_the_name_is_already_set()
     print("ok")

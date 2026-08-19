@@ -87,6 +87,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent
 DEFAULT_SKILL_MD = REPO_ROOT / ".claude" / "skills" / "verify-learning" / "SKILL.md"
 
+sys.path.insert(0, str(SCRIPT_DIR))
+import _verify_corpus  # noqa: E402
+
 # Regexes anchored to the framework's path conventions. Deliberately
 # narrow — we only flag references with known framework prefixes to avoid
 # false positives on prose like "the script foo.py" without context.
@@ -277,6 +280,13 @@ _MODULE_SEARCH_DIRS = ("core/scripts", "mind_api/src", "mind_api/src/endpoints")
 
 def load_skill_md(path: Path) -> list[tuple[int, str]]:
     """Return [(lineno, raw_line)] from the verify-learning SKILL.md."""
+    # The verify-learning check corpus moved to a registry on 2026-08-18
+    # (); reading the now-175-line file drops assertions_scanned
+    # from 2,517 to 6. The corpus is byte-identical to the pre-cutover file,
+    # so the line numbers this function hands out stay exactly as they were.
+    # Every OTHER skill still reads from disk — this scanner globs all of them.
+    if path.resolve() == DEFAULT_SKILL_MD.resolve():
+        return list(enumerate(_verify_corpus.corpus_lines(), start=1))
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as e:

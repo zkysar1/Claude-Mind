@@ -1856,7 +1856,8 @@ _OBSERVED_TREE_FIELDS = [
 
 
 def test_tree_classify_covers_all_observed_fields():
-    valid = {"MAX", "NEWER", "PROGRESSION", "STRUCTURAL", "BASE"}
+    # CALIBRATION joined the class set in  (accuracy left BASE).
+    valid = {"MAX", "NEWER", "PROGRESSION", "CALIBRATION", "STRUCTURAL", "BASE"}
     for f in _OBSERVED_TREE_FIELDS:
         assert cm._classify_tree_field(f) in valid, f
     # named classes land where the  spec says
@@ -1868,6 +1869,11 @@ def test_tree_classify_covers_all_observed_fields():
     assert cm._classify_tree_field("capability_level") == "PROGRESSION"
     assert cm._classify_tree_field("children") == "STRUCTURAL"
     assert cm._classify_tree_field("parent") == "STRUCTURAL"
+    # : accuracy is data-derived and its DOWNGRADES must land, so it is
+    # CALIBRATION (plain LWW, no never-regress) and explicitly NOT PROGRESSION.
+    assert cm._classify_tree_field("accuracy") == "CALIBRATION"
+    assert cm._classify_tree_field("accuracy") != "PROGRESSION"
+    assert cm._classify_tree_field("calibration_updated_at") == "NEWER"
     # a future/unknown field defaults to the safe BASE class (total function)
     assert cm._classify_tree_field("some_future_field_zzz") == "BASE"
 
@@ -3041,3 +3047,352 @@ def test_alloc_nonce_merge_is_byte_commutative():
     ab = json.dumps(cm._merge_goals(a, b, "315"), sort_keys=True)
     ba = json.dumps(cm._merge_goals(b, a, "315"), sort_keys=True)
     assert ab == ba
+
+
+# ---------------------------------------------------------------------------
+# : split-store date segments (the FOURTH path-pattern branch)
+#
+# reasoning-bank / guardrails are being date-segmented so the ~112-117 adds/day
+# append to a small live segment instead of rewriting a 20.5MB / 9.4MB object.
+# Segment basenames are dates, so they cannot live in the basename-keyed
+# _HANDLERS dict. Until this branch existed a segment was UNREGISTERED, and for
+# a governed-store write-class (b) file that is a PERMANENT wedge rather than a
+# soft default -- which is why it lands before the writer does.
+# ---------------------------------------------------------------------------
+
+SEGMENT_KINDS = ("reasoning-bank", "guardrails")
+
+
+def test_segment_routes_to_its_own_store_handler():
+    # A segment is a SHARD of the store, so it takes the store's own handler --
+    # NOT merge_append_only_jsonl. "Append-dominated" is not "append-only":
+    # status->retired / next_review_eligible_at / valid_to still mutate records
+    # in place, and a line-union over a mutated record yields TWO lines for it.
+    assert cm.merge_handler_for("world/reasoning-bank-2026-08-16.jsonl") is cm.merge_reasoning_bank
+    assert cm.merge_handler_for("world/guardrails-2026-08-16.jsonl") is cm.merge_guardrails
+    # and specifically not the append-only handler
+    assert cm.merge_handler_for("world/reasoning-bank-2026-08-16.jsonl") is not cm.merge_append_only_jsonl
+
+
+def test_segment_handler_matches_the_whole_store_handler():
+    # The property that makes a shard safe: same schema, same treatment. Stated
+    # as an equality against the legacy file rather than by naming the handler,
+    # so re-registering either store keeps both halves in step automatically.
+    for kind in SEGMENT_KINDS:
+        whole = cm.merge_handler_for("world/%s.jsonl" % kind)
+        seg = cm.merge_handler_for("world/%s-2026-08-16.jsonl" % kind)
+        assert seg is whole, kind
+
+
+def test_segment_pattern_is_imported_not_retyped():
+    # _utilization_store owns segment_name (what the writer emits) beside
+    # _segment_re (what readers match) so the halves of that contract cannot
+    # drift. A private copy in coordination_merge would be a third definition.
+    src = (Path(cm.__file__)).read_text(encoding="utf-8")
+    assert "_utilization_store" in src
+    assert "import _utilization_store" in src
+    # the date shape itself must NOT be re-typed here
+    assert r"\d{4}-\d{2}-\d{2}" not in src
+
+
+def test_writer_emitted_name_is_what_the_branch_matches():
+    # End-to-end on the contract: feed the branch exactly what the writer will
+    # produce. A regex that drifts from segment_name is the silent failure the
+    # shared definition exists to prevent, and only this direction catches it.
+    import datetime
+    sys.path.insert(0, str(Path(cm.__file__).resolve().parent))
+    import _utilization_store as us
+    day = datetime.date(2026, 8, 16)
+    for kind in SEGMENT_KINDS:
+        name = us.segment_name(kind, day)
+        assert cm.merge_handler_for("world/" + name) is not None, name
+        assert cm._segment_store_kind(name) == kind
+
+
+def test_archives_keep_their_existing_registration():
+    # THE REASON THE DATE SHAPE IS STRICT, and it is stronger than the reader
+    # seam's version of this warning. A loose `<kind>-*.jsonl` glob would match
+    # the archives -- which are ALREADY registered as append-only -- so it would
+    # not merely fold 306 retired records into the live store, it would OVERRIDE
+    # an existing registration and change the archives' merge semantics.
+    for kind in SEGMENT_KINDS:
+        p = "world/%s-archive.jsonl" % kind
+        assert cm._segment_store_kind("%s-archive.jsonl" % kind) is None
+        assert cm.merge_handler_for(p) is cm.merge_append_only_jsonl
+
+
+def test_counter_sidecar_is_not_claimed_by_the_segment_branch():
+    # The sidecar has a STATIC basename (two of them), so it belongs in
+    # _HANDLERS as an ordinary entry -- and it needs a COUNTER-reconciling
+    # handler, not a content one.
+    #
+    # RESTATED 2026-08-17 ( item 4), per guard-4223: this test's second
+    # assertion was `merge_handler_for(...) is None`, which was a SNAPSHOT of
+    # "the ordinary entry does not exist yet", not a contract that it must never
+    # exist -- the comment above anticipated exactly the entry that has now
+    # landed. Delta measured before touching it: _HANDLERS 88 -> 90, added
+    # {reasoning-bank,guardrails}-utilization.jsonl, DROPPED NOTHING.
+    #
+    # The contract this test actually owns is unchanged and is now stated
+    # EXACTLY rather than by proxy: the SEGMENT branch must not claim these
+    # names, and they must not inherit the CONTENT store's handler (which would
+    # apply record semantics -- retired-dominates, collision-reid -- to a
+    # counters row whose id is a foreign key). Asserting the precise handler
+    # identity also keeps the "unintended addition" class the `is None` form
+    # used to catch: a future branch silently claiming these names goes RED.
+    sys.path.insert(0, str(Path(cm.__file__).resolve().parent))
+    import _utilization_store as us
+    content_handlers = (cm.merge_reasoning_bank, cm.merge_guardrails,
+                        cm.merge_append_only_jsonl)
+    for kind in SEGMENT_KINDS:
+        name = us.counters_name(kind)
+        assert cm._segment_store_kind(name) is None, name
+        handler = cm.merge_handler_for("world/" + name)
+        assert handler is cm.merge_utilization_counters, (name, handler)
+        assert handler not in content_handlers, (name, handler)
+
+
+def test_near_miss_names_are_rejected():
+    # Strict shape, not a prefix test. Each of these is a plausible sibling a
+    # loose matcher would swallow.
+    for name in (
+        "reasoning-bank-2026-8-6.jsonl",        # unpadded date
+        "reasoning-bank-2026-08-16.jsonl.bak",  # trailing suffix
+        "reasoning-bank-2026-08.jsonl",         # month only
+        "reasoning-bank-latest.jsonl",          # word where the date goes
+        "xreasoning-bank-2026-08-16.jsonl",     # prefixed
+        "pipeline-2026-08-16.jsonl",            # a different store's segment
+    ):
+        assert cm._segment_store_kind(name) is None, name
+
+
+def test_windows_separators_resolve():
+    # merge_handler_for normalises backslashes before splitting; the segment
+    # branch reads parts[-1] so it must work on both separators.
+    assert cm.merge_handler_for(r"C:\world\guardrails-2026-08-16.jsonl") is cm.merge_guardrails
+
+
+def test_import_failure_degrades_to_safe_freeze(monkeypatch):
+    # The lazy import keeps this module's stdlib+yaml-only dependency surface.
+    # If it ever fails, the answer must be None (safe-freeze) -- the same
+    # conservative default an unregistered store already gets -- and it must be
+    # cached rather than re-raised on every write.
+    monkeypatch.setattr(cm, "_SEGMENT_RES", None)
+    real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
+
+    def boom(name, *a, **kw):
+        if name == "_utilization_store":
+            raise ImportError("simulated")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setitem(sys.modules, "_utilization_store", None)
+    monkeypatch.setattr("builtins.__import__", boom)
+    try:
+        assert cm._segment_store_kind("reasoning-bank-2026-08-16.jsonl") is None
+        assert cm._SEGMENT_RES == {}          # cached, so no retry per write
+    finally:
+        monkeypatch.setattr(cm, "_SEGMENT_RES", None)
+
+
+def test_other_path_pattern_branches_still_work():
+    # The new branch sits between the health ledger and the core/config
+    # exclusion; pin the neighbours so a future insertion cannot reorder them
+    # unnoticed.
+    assert cm.merge_handler_for("w/team-state/agents/alpha.yaml") is cm.merge_team_state_shard
+    assert cm.merge_handler_for("agents/a/health/2026-08-16.jsonl") is cm.merge_append_only_jsonl
+    assert cm.merge_handler_for("core/config/skill-gaps.yaml") is None
+
+
+# ---------------------------------------------------------------------------
+#  / : gate-firings date segments (the FIFTH path-pattern branch)
+#
+# gate-firings-flush.py writes `meta/gate-firings-YYYY-MM-DD.jsonl` once
+# GATE_FIRINGS_SEGMENTED is set. Every box flushes into the SAME live segment at
+# every iteration close, so it is the hottest dynamic-basename store in the
+# fleet -- and until this branch existed it was UNREGISTERED: measured before the
+# cutover, merge_handler_for("meta/gate-firings-2026-08-17.jsonl") was None while
+# the legacy file it replaces has always been merge_append_only_jsonl.
+# ---------------------------------------------------------------------------
+
+
+def test_gate_firings_segment_is_registered_append_only():
+    assert cm.merge_handler_for("meta/gate-firings-2026-08-17.jsonl") is cm.merge_append_only_jsonl
+
+
+def test_gate_firings_segment_handler_matches_the_legacy_file():
+    # Same schema, same dedup identity, same treatment -- stated as an equality
+    # against the legacy file so re-registering it keeps the segments in step.
+    legacy = cm.merge_handler_for("meta/gate-firings.jsonl")
+    seg = cm.merge_handler_for("meta/gate-firings-2026-08-17.jsonl")
+    assert legacy is not None
+    assert seg is legacy
+
+
+def test_gate_firings_segment_pattern_is_imported_from_gate_log():
+    # _gate_log owns segment_name (what the flush emits) beside _SEGMENT_RE (what
+    # firings_paths matches). coordination_merge must import, never re-type.
+    src = (Path(cm.__file__)).read_text(encoding="utf-8")
+    assert "import _gate_log" in src
+    assert r"\d{4}-\d{2}-\d{2}" not in src
+
+
+def test_gate_firings_flush_emitted_name_is_what_the_branch_matches():
+    # End-to-end on the contract: feed the branch exactly what the writer emits.
+    import datetime
+    sys.path.insert(0, str(Path(cm.__file__).resolve().parent))
+    import _gate_log as gl
+    name = gl.segment_name(datetime.date(2026, 8, 17))
+    assert name == "gate-firings-2026-08-17.jsonl"
+    assert cm._is_gate_firings_segment(name)
+    assert cm.merge_handler_for("meta/" + name) is cm.merge_append_only_jsonl
+
+
+def test_gate_firings_near_miss_names_are_not_segments():
+    # The spool artifacts are machine-local per-box buffers (owncloud_sync
+    # _EXCLUDE_NAMES) and must never acquire a merge handler; the legacy file
+    # keeps its own basename registration; loose shapes are rejected.
+    for name in (
+        "gate-firings.jsonl",                 # legacy -- registered by basename, not here
+        "gate-firings.spool.jsonl",           # per-box spool, machine-local
+        "gate-firings.spool.flushing.jsonl",  # per-box spool, machine-local
+        "gate-firings-2026-8-7.jsonl",        # unpadded date
+        "gate-firings-2026-08-17.jsonl.bak",  # trailing suffix
+        "gate-firings-2026-08.jsonl",         # month only
+        "gate-firings-archive.jsonl",         # word where the date goes
+        "xgate-firings-2026-08-17.jsonl",     # prefixed
+    ):
+        assert not cm._is_gate_firings_segment(name), name
+    assert cm.merge_handler_for("meta/gate-firings.spool.jsonl") is None
+
+
+def test_gate_firings_segment_windows_separators_resolve():
+    assert cm.merge_handler_for(r"C:\meta\gate-firings-2026-08-17.jsonl") is cm.merge_append_only_jsonl
+
+
+def test_gate_firings_segment_import_failure_degrades_to_safe_freeze(monkeypatch):
+    # Same contract as the reasoning-bank/guardrails branch: an import failure
+    # answers False (unregistered -> safe-freeze) and is CACHED, not retried on
+    # every write.
+    monkeypatch.setattr(cm, "_GATE_FIRINGS_SEGMENT_RE", None)
+    real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
+
+    def boom(name, *a, **kw):
+        if name == "_gate_log":
+            raise ImportError("simulated")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setitem(sys.modules, "_gate_log", None)
+    monkeypatch.setattr("builtins.__import__", boom)
+    try:
+        assert cm._is_gate_firings_segment("gate-firings-2026-08-17.jsonl") is False
+        assert cm._GATE_FIRINGS_SEGMENT_RE is False   # cached
+        assert cm.merge_handler_for("meta/gate-firings-2026-08-17.jsonl") is None
+    finally:
+        monkeypatch.setattr(cm, "_GATE_FIRINGS_SEGMENT_RE", None)
+
+
+# --- counter sidecars: <kind>-utilization.jsonl ( item 4) -----------
+# Registered BEFORE the writer flips. An unregistered basename is governed-store
+# write-class (b), where the fence is the whole defense and a stale If-Match is a
+# permanent wedge — so these pins guard a wedge, not a cosmetic dispatch entry.
+
+def _util(recs):
+    return ("".join(json.dumps(r, ensure_ascii=True) + "\n" for r in recs)).encode()
+
+
+def test_counter_sidecars_are_merge_protected_not_fence_only():
+    """Both static sidecar basenames resolve to a handler (class (a))."""
+    for name in ("reasoning-bank-utilization.jsonl", "guardrails-utilization.jsonl"):
+        assert cm.merge_handler_for("world/" + name) is cm.merge_utilization_counters, name
+
+
+def test_counter_sidecar_merge_is_commutative():
+    a = _util([{"id": "rb-1", "utilization": {"times_helpful": 3, "retrieval_count": 10}}])
+    b = _util([{"id": "rb-1", "utilization": {"times_helpful": 5, "times_noise": 2}},
+               {"id": "rb-9", "utilization": {"times_helpful": 1}}])
+    assert cm.merge_utilization_counters(a, b) == cm.merge_utilization_counters(b, a)
+
+
+def test_counter_sidecar_takes_max_and_unions_counter_keys():
+    """MAX never loses an increment; both sides' counter keys survive."""
+    a = _util([{"id": "rb-1", "utilization": {"times_helpful": 3, "retrieval_count": 10}}])
+    b = _util([{"id": "rb-1", "utilization": {"times_helpful": 5, "times_noise": 2}}])
+    u = _recs(cm.merge_utilization_counters(a, b))[0]["utilization"]
+    assert u["times_helpful"] == 5          # MAX, not last-writer
+    assert u["retrieval_count"] == 10       # a-only key kept
+    assert u["times_noise"] == 2            # b-only key kept
+
+
+def test_counter_sidecar_never_reids_a_colliding_id():
+    """The sidecar id is a FOREIGN KEY into the content store.
+
+    _merge_id_keyed_jsonl re-ids a colliding record — correct for lock-allocated
+    rb-N/guard-N, and orphaning here. Two records on one id are the SAME record
+    counted on two boxes, so the answer is to merge, never to renumber.
+    """
+    a = _util([{"id": "guard-007", "utilization": {"times_active": 2}}])
+    b = _util([{"id": "guard-007", "utilization": {"times_active": 9}}])
+    out = _recs(cm.merge_utilization_counters(a, b))
+    assert len(out) == 1                       # merged, not split into two
+    assert out[0]["id"] == "guard-007"         # id NOT reallocated
+    assert out[0]["utilization"]["times_active"] == 9
+
+
+def test_counter_sidecar_is_not_line_union():
+    """A line-union would keep one line per (id, count) — duplicate ids on read."""
+    a = _util([{"id": "rb-1", "utilization": {"times_helpful": 1}}])
+    b = _util([{"id": "rb-1", "utilization": {"times_helpful": 2}}])
+    ids = [r["id"] for r in _recs(cm.merge_utilization_counters(a, b))]
+    assert ids == ["rb-1"], ids
+
+
+def test_counter_sidecar_merge_is_idempotent_and_empty_safe():
+    a = _util([{"id": "rb-1", "utilization": {"times_helpful": 3}}])
+    merged = cm.merge_utilization_counters(a, _util([]))
+    assert cm.merge_utilization_counters(merged, merged) == merged
+    assert cm.merge_utilization_counters(a, b"") == cm.merge_utilization_counters(b"", a)
+
+
+def test_counter_sidecar_raises_on_a_torn_line_rather_than_dropping_it():
+    """A MERGE must not silently drop a torn line — that loss is permanent.
+
+    The sidecar's READER (_utilization_store.load_counters) deliberately SKIPS
+    a malformed line: it loses one advisory counter for one call. A merge writes
+    the survivors BACK, so skipping there destroys the record for good. Raising
+    freezes the path loudly with both sides' bytes intact. This pin exists
+    because the first draft of the handler claimed the reader's policy in its
+    docstring while inheriting _parse_jsonl's raise — the test caught the
+    mismatch, and the raise is the behavior worth keeping.
+    """
+    blob = b'{"id": "rb-1", "utilization": {"times_helpful": 1}}\nnot json at all\n'
+    with pytest.raises(json.JSONDecodeError):
+        cm.merge_utilization_counters(blob, b"")
+
+
+def test_counter_sidecar_preserves_an_idless_record_instead_of_dropping_it():
+    """No id means unmergeable, NOT discardable — carried through by value."""
+    blob = b'{"id": "rb-1", "utilization": {"times_helpful": 1}}\n' \
+           b'{"utilization": {"times_helpful": 99}}\n'          # no id
+    out = _recs(cm.merge_utilization_counters(blob, b""))
+    assert len(out) == 2, out                       # nothing dropped
+    assert {r.get("id") for r in out} == {"rb-1", None}
+    # and it still converges: the id-less row dedups by value across both sides
+    both = _recs(cm.merge_utilization_counters(blob, blob))
+    assert len(both) == 2, both
+
+
+def test_counter_sidecar_output_is_sorted_by_id():
+    """Sorted output is what makes the merge byte-identical from either side."""
+    a = _util([{"id": "rb-9", "utilization": {}}, {"id": "rb-1", "utilization": {}}])
+    assert [r["id"] for r in _recs(cm.merge_utilization_counters(a, b""))] == ["rb-1", "rb-9"]
+
+
+def test_counter_sidecar_basenames_match_the_store_helper():
+    """The registry keys and _utilization_store.counters_name are one contract.
+
+    A rename on either side silently un-registers the store — the same
+    writer/reader drift segment_name() exists to prevent.
+    """
+    us = pytest.importorskip("_utilization_store")
+    for kind in us.KINDS:
+        assert us.counters_name(kind) in cm._HANDLERS, kind

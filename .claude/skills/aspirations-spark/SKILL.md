@@ -143,6 +143,36 @@ ELSE:
         these artifacts too — a worker's observation about domain
         infrastructure still belongs in a domain-scoped entry, and this block
         sits ABOVE that paragraph only because it must run before the SKIP.
+        # WORK-DISCOVERY RELAYS FILE GOALS HERE (2026-08-16, goal-completion
+        # audit D1). worker-loop's filing ruling (g-306-250, Case B) tells a
+        # worker that finds NEW SCOPE any Body could observe to "relay via
+        # spark_capture — the relay loses nothing but time". Until now that was
+        # false: the five handlers above make rb / guardrail / gotcha artifacts
+        # and NONE of them files a goal, so a Case-B relay arrived as a lesson
+        # and never as WORK. Workers now execute most units (7 SIDs vs 1
+        # reducer on alpha, 2026-08-16), so this was the largest hole in
+        # "completion seeds the next goal" (guard-3880: the reducer is the
+        # LAST moment a relayed finding can acquire an owner). The reducer is
+        # unconstrained by the worker ruling and files freely.
+        IF entry.sq_trigger == "sq-013"
+           OR entry.observation names actionable work needing an owner
+              (a defect to fix, a follow-up, a capability gap, a dependency):
+            Run the sq-013 work_discovery handler (below, "Work Discovery Spark
+            Handler") over entry.observation with `discovered_by = entry.goal_id`
+            and the SOURCE goal's aspiration as the default target — NOT the
+            goal the reducer is closing. Dedup FIRST and not only on the
+            worker's phrasing (guard-1204, guard-2228: `--title-contains` on
+            one stem is structurally incapable of finding a differently-worded
+            owner — try two distinct token sets, and check the source goal's
+            own outcome_note for an id it already filed, guard-3738). If a live
+            goal already owns it, cite that id and file nothing. Otherwise file
+            with the sq-013 origin_signal mapping and put
+            "relayed by <agent> worker Body (spark_capture from <entry.goal_id>),
+            filed at reducer spark replay" in the description so the provenance
+            is on the record, not only in the diary. Do NOT skip this because
+            the observation also produced an rb entry — a lesson and a work item
+            are different artifacts (worker-loop Phase 3.5 vs 3.66 draw the
+            same line).
     # PROVENANCE RECORD, fire branch (g-306-251). Written BEFORE the clear, on
     # the same crash-safety reasoning the next comment gives: a crash here leaves
     # the slot intact to re-replay (safe) plus a record already written (a
@@ -513,6 +543,35 @@ doubt between framework and domain, pick domain.
     # worth judging). Otherwise:
     Bash: cat agents/<agent>/session/retrieval-session.json   # may be absent
     IF file absent: SKIP this block
+    # guard-3968 — THIS FILE IS NOT KEYED TO THIS GOAL. It is a SINGLE per-agent
+    # file, overwritten by whichever goal last ran a goal-scoped retrieval, so a
+    # goal that performed no retrieval of its own silently inherits the PREVIOUS
+    # goal's manifest and would judge every signature in it against an outcome it
+    # never shaped — writing calibration data onto the wrong goal, in the one
+    # store whose entire purpose is measuring whether a retrieved pattern helped.
+    # The sibling consumer ALREADY carries this exact predicate
+    # (pre-apply-consult-gate.py:273, `d.get("goal_id") != goal_id`) — copy it,
+    # do not invent one. Verified against the live emitter (retrieve.py:2336):
+    # `goal_id` is a real top-level key, written as `effective_goal or None`, so
+    # an UNTIED retrieve.sh (no --goal) leaves it None — which correctly fails
+    # this comparison. THE STUB IS THE SAFE SHAPE AND THE POPULATED MANIFEST IS
+    # THE HARMFUL ONE, so the `retrieved_sigs is empty` check below does NOT
+    # subsume this one: it catches only the stub (measured g-115-6349 — the file
+    # carried a different goal's id and was skipped ONLY because that manifest
+    # happened to be a stub).
+    IF session.goal_id != the id of the goal being closed:
+        SKIP this block   # treat the manifest as ABSENT, not as this goal's
+                          # (guard-3968 ACTION, verbatim). Silent, exactly like
+                          # the file-absent branch above — it is the same case.
+                          # Do NOT fall through to the retrieved_sigs read
+                          # below (guard-137: no ambiguous fall-through).
+    # WHY SKIP RATHER THAN FAIL LOUD — this was the one open question in
+    # g-115-5278, and the two consumers are not symmetric: the sibling GATE's
+    # mismatch costs a skipped consult (recoverable, next iteration re-fires),
+    # while THIS block's costs a MISATTRIBUTED outcome in
+    # pattern-signatures.jsonl, which is durable. Skipping is fail-safe for the
+    # durable store; a louder branch here would also be the only non-silent SKIP
+    # among the three in this block, for no gain.
     # `retrieval_performed` IS a live key — but ONLY on the no-retrieval STUB that
     # iteration-close.sh writes (`"retrieval_performed": False`, L2506). The real
     # daemon-written manifest OMITS it, and ABSENT MEANS PERFORMED. That asymmetry
@@ -889,6 +948,60 @@ When sq-009 (or sq-c09 experiential variant) fires, it creates a hypothesis goal
             - Evidence consulted and reasoning chain
             - Why this confidence level was chosen
             - What would change the prediction
+        WORKER-BODY BRANCH (g-115-6155) — decide BEFORE the add call below.
+        experience-add.sh REFUSES on a worker Body ('BODY=worker — SKIPPED
+        agent-wide experience write'). The fence is CORRECT (encoding is
+        reducer-only). What must NOT happen is the improvised hand-off it
+        used to force: staging the payload JSON in agents/<agent>/temp/ and
+        naming the command in the outcome_note. The reducer inherits a
+        well-written command pointing at a file it cannot read, and when the
+        .md also fails to travel the formation is lost with no error anywhere
+        (measured: the 08-11 run of g-001-10 lost its formation entirely; the
+        08-13 run survived only because the .md happened to sync cross-box).
+        WHY NOT — AND THE REASON IS NOT THE ONE THIS COMMENT FIRST GAVE.
+        It said temp/ is MACHINE-LOCAL, citing temp-store.md. temp-store.md
+        says the OPPOSITE: temp/ is own-cloud S3-synced, NOT in _EXCLUDE_DIRS,
+        resumed by pull_temp at /start (lines 11-16 and the Cross-machine row,
+        54); session/scratch/ is the machine_local store. guard-3422 says it
+        outright — "agents/<agent>/temp/ is a FLEET-SYNCED surface, not local
+        scratch — under own-cloud every file written there propagates to every
+        box and every agent" — so the original claim contradicted a LIVE
+        guardrail, not merely a convention. Corrected 2026-08-15 (alpha,
+        hostname cc-04) after the very payload this branch was written about —
+        agents/alpha/temp/expadd-recency-flip.json — was found PRESENT on the
+        reducer's box. It had travelled after all.
+        THE REMEDY BELOW IS UNCHANGED AND MUST NOT BE REVERTED TO temp/
+        STAGING (g-115-6155). Learning that temp/ syncs makes staging look
+        safe; it is not, for two independent reasons. (1) The sync is
+        ASYNCHRONOUS and the local tree is a read-through cache, so a reducer
+        reading the instruction has NO guarantee the payload has materialised
+        yet — which is what the 08-11 loss and 08-13 near-loss actually look
+        like. Endpoints measured (absent when the reducer looked, present two
+        days later); the sync-lag mechanism itself is INFERRED, not verified.
+        (2) A same-box FORKED Body writes into an isolated tree that S3 never
+        sees at all, so temp/ staging fails outright there regardless of
+        timing. The goal record is the only channel carrying the instruction
+        and its payload ATOMICALLY, in both topologies. The .md is likewise
+        NOT a reliable carrier: survival is topology-dependent (cross-box
+        worker synced; same-box forked Body lost — both measured, g-115-6155).
+        IF this Body is a worker (fork WM present per worker-loop Phase -0,
+        or the add below just refused with the BODY=worker message):
+            - Still write the .md above — bonus redundancy where it survives.
+            - INLINE the complete experience JSON into THIS goal's
+              outcome_note, appended as a block headed exactly:
+                REDUCER-DEFERRED experience-add payload (pipe the JSON below
+                verbatim to core/scripts/experience-add.sh, then run the
+                pipeline-update-field command that follows it):
+              followed by the experience JSON and the exact
+              pipeline-update-field line from the end of this step. The
+              payload now travels wherever the instruction travels, so the
+              reducer can never see the instruction without its payload.
+            - Do NOT set experience_ref yourself: the ref would dangle until
+              the reducer runs the add, and dangling refs are null-swept by
+              learning-routing-repair (g-115-5646). The reducer sets it
+              right after the add.
+            - SKIP the experience-add.sh call and the pipeline-update-field
+              call below, and end Step 2.5 here.
         echo '<experience-json>' | bash core/scripts/experience-add.sh
         Experience JSON:
             id: "{experience_id}"
@@ -1176,17 +1289,66 @@ When sq-018 fires after goal completion:
      #   git log -1 --format='%an %ad' <sha>   per matched sha
      # If the framework file's commit is not this iteration's, DECLINE via the
      # step 2.1 route (log one accurate line, do NOT increment sparks_generated).
-     SHAS=$(git log --fixed-strings --grep "(${GID}):" --format=%H -n 50 --since=48.hours 2>/dev/null)
+     # SUBJECT-ONLY MATCH (g-115-5406). `git log --grep` matches the FULL COMMIT
+     # MESSAGE, not the subject, while iteration-commit.sh only guarantees the
+     # goal-id appears in the SUBJECT as `type(goal-id):`. So any commit whose
+     # BODY quotes the literal `(<goal-id>):` was unioned in — and the
+     # verify-learning check-naming convention emits exactly that string
+     # routinely. MEASURED (echo, cc-03, 2026-08-08): the g-001-01 window matched
+     # 4 shas, one of them `f24b9ff02`, whose subject is
+     # `feat(g-115-5168): 3 verify-learning checks ...` — a DIFFERENT goal, which
+     # matched on body line 12 and contributed a framework file to the scope set
+     # that this iteration never touched.
+     # This CORRECTS g-115-4666, which states the filter "unions all commits
+     # whose SUBJECT carries the goal-id" and calls the bound "intact and
+     # insufficient". Both halves were wrong: the match is on the message, and
+     # the leaked sha is not a close of the goal at all — so the bound was
+     # BROKEN, not merely loose. That distinction decides the remedy: a loose
+     # bound wants a discriminator the reader must notice (4666's fix), a broken
+     # one wants the match narrowed, which is this.
+     # The --grep stays as a cheap prefilter (it is a strict SUPERSET of the
+     # subject matches, so nothing is lost); the pipeline grep re-tests against
+     # `<sha>TAB<subject>`, and a hex sha cannot contain the pattern, so only a
+     # true subject hit survives.
+     SHAS=$(git log --fixed-strings --grep "(${GID}):" --format='%H%x09%s' -n 50 --since=48.hours 2>/dev/null \
+              | grep -F "(${GID}):" | cut -f1)
      if [ -n "$SHAS" ]; then
        SCOPE=$(printf '%s\n' "$SHAS" | while IFS= read -r s; do [ -n "$s" ] && git diff-tree --no-commit-id --name-only -r "$s" 2>/dev/null; done)
      else
        # (b) No commit yet — LEGITIMATE, not an error: guard-1320 fires this
        # spark inline after verify, BEFORE state-update runs iteration-commit.
-       # The working tree vs HEAD is then this goal's scope.
+       # The working tree vs HEAD is this goal's scope PLUS whatever a PREVIOUS
+       # goal left uncommitted (its edits made AFTER its own iteration-commit
+       # fired). The two are NOT separable by path. CORRECTED 2026-08-10
+       # (g-115-4157): this comment used to claim the working tree "is then this
+       # goal's scope" — false, with three independent reproductions across two
+       # boxes. The step-1 `git log -1 --format=%an %ad <sha>` discriminator
+       # cannot rescue it, because branch (b) is reached precisely BECAUSE there
+       # is no sha; and author does not discriminate either, since a prior goal
+       # in the SAME session has the same author. mtime does.
+       # PARTITION, DO NOT FILTER. Dropping the older files would convert a LOUD
+       # over-fire into a SILENT skip — the guard-2001 failure direction,
+       # indistinguishable from "nothing to do" — and branch (a) above already
+       # settles the trade for this producer: bias to over-fire, never silently
+       # drop. So every file is still reported; the prior-goal ones are LABELLED.
+       GSTART="<goal.started_at>"   # ISO stamp off the goal record, e.g. 2026-08-10T05:50:29
        SCOPE=$( { git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } )
      fi
-     printf '%s\n' "$SCOPE" | sed '/^$/d' | sort -u \
-       | grep -E '^(core/(scripts|config)|mind_api/src|\.claude/(skills|rules)|\.claude/settings\.json)' | head -20
+     FW=$(printf '%s\n' "$SCOPE" | sed '/^$/d' | sort -u \
+       | grep -E '^(core/(scripts|config)|mind_api/src|\.claude/(skills|rules)|\.claude/settings\.json)' | head -20)
+     printf '%s\n' "$FW"
+     # Branch (b) only (GSTART is unset in branch (a), so this stays silent there).
+     # `find -newermt` prints the path when mtime is NEWER than the stamp, so an
+     # EMPTY result means the file predates this goal's start = a prior goal's work.
+     [ -n "${GSTART:-}" ] && printf '%s\n' "$FW" | sed '/^$/d' | while IFS= read -r f; do
+       [ -e "$f" ] && [ -z "$(find "$f" -newermt "$GSTART" -print -quit 2>/dev/null)" ] \
+         && printf 'PRIOR-GOAL (mtime < %s) — this goal did NOT touch it: %s\n' "$GSTART" "$f"
+     done
+
+   A `PRIOR-GOAL` line means step 2 must NOT propose a check for that file:
+   this goal never opened it. Treat it as out of scope unless you can show
+   otherwise from your own edits this iteration. This is the discriminator
+   branch (b) previously had no way to supply.
 
    IF empty: SKIP — do NOT increment sparks_generated. Pure non-framework
    goals (domain-specific code, application logic, product features) have
@@ -1296,16 +1458,24 @@ When sq-018 fires after goal completion:
    Measure the lane, then route. ONE read supplies all four signals — do not add a
    second call:
    Bash: bash core/scripts/aspirations-read.sh --source world --id asp-115 2>/dev/null | py -3 -c "
-   import sys,json,datetime
+   import sys,json,re,datetime
    raw=sys.stdin.read(); i=raw.find('{')
    d=json.loads(raw[i:])
    goals=d.get('goals') or []
    open_=[g for g in goals if g.get('status') in ('pending','in-progress')]
-   # (a) WIDE counter: the population the duplication gate actually blocks against.
-   #     Text-based, matching the refusing gate, NOT an origin_signal proxy.
+   # (a) The counter is TEXT-based, never an origin_signal proxy. But it selects the
+   #     population the DRAIN ACTION can batch — goals whose DELIVERABLE is a NEW
+   #     verify-learning check — not every goal that mentions the subject. An explicit
+   #     add/new verb must precede the phrase IN THE TITLE, so a fix to an EXISTING
+   #     check ('Fix: verify-learning check for X is permanently RED') is excluded.
+   proposes=re.compile(r'\b(add|new)\b[^.]{0,40}?/?verify-learning\s+check', re.I)
+   lane=[g for g in open_ if proposes.search(g.get('title') or '')]
+   # WIDE and NARROW are REPORTED, never branched on — they are the two predicates
+   # tried before this one, kept visible so a reader can see which population a
+   # round was scoped against and how far each diverged.
    def cites(g):
        return 'verify-learning' in ((g.get('title') or '')+' '+(g.get('description') or '')).lower()
-   lane=[g for g in open_ if cites(g)]
+   wide=[g for g in open_ if cites(g)]
    narrow=[g for g in open_ if (g.get('origin_signal') or '').startswith('maintain:sq-018')]
    isdrain=lambda g:(g.get('origin_signal') or '').startswith('maintain:drain-verify-learning-check-lane')
    drain=[g for g in open_ if isdrain(g)]
@@ -1315,20 +1485,40 @@ When sq-018 fires after goal completion:
    recent=[g for g in goals if isdrain(g) and g.get('status')=='completed'
            and str(g.get('completed_at') or '') >= cut]
    print('LANE_DEPTH=%d' % len(lane))
+   print('LANE_WIDE=%d' % len(wide))
    print('LANE_NARROW=%d' % len(narrow))
    print('DRAIN_GOAL=%s' % (drain[0]['id'] if drain else ''))
    print('DRAIN_RECENT=%s' % ','.join(g['id'] for g in recent))
    "
 
-   Report BOTH counts in the log line. LANE_NARROW is kept only so a reader can see
-   how far the old proxy diverged; it must never drive a branch again.
+   Report ALL THREE counts in the log line, and state the selection rule beside the
+   number it produced: LANE_DEPTH counts open goals whose TITLE proposes ADDING a
+   verify-learning check. LANE_WIDE (any mention, title or description) and
+   LANE_NARROW (origin_signal proxy) are diagnostics only — neither may drive a
+   branch again. Both were tried as the driver and both failed the SAME way, in
+   opposite directions: the predicate did not match the population the drain ACTION
+   is defined over. Narrow starved the gate; wide armed a mis-scoped HIGH filing over
+   goals with no shared subject.
 
    IF LANE_DEPTH < 15:
        Proceed to step 3 — file a normal singleton. A shallow lane drains fine
        one-at-a-time and singletons keep per-check provenance sharpest.
-       (15, not 8: 8 was calibrated against the narrow counter's ~6. Against the
-       wide population — observed 26, 30, 38, 45 — anything below ~15 is a lane
-       that singletons can still clear.)
+       (15 is UNCHANGED, but what it judges is not. It was calibrated against the
+       WIDE population — observed 26, 30, 38, 45 — and that justification died with
+       the wide driver. It now judges the true lane, which has never been measured
+       above ~12 and read 1 on 2026-08-09. So this branch is DORMANT by design: it
+       fires only if genuine check-proposals ever accumulate to 15, which has not
+       happened once. That is the intended outcome, not a dead gate — every firing
+       of the consolidation branch to date was driven entirely by non-members, so a
+       branch that no longer fires on them has stopped being wrong, not stopped
+       working. Do NOT lower the threshold to make it fire again: nobody has
+       measured what depth of REAL check-proposals is worth batching, and 8 was
+       calibrated against a third population that is not this one either. If it
+       needs re-calibrating, measure first.
+       The producer DOES satisfy this predicate — step 3's own filed title,
+       "Maintain: add verify-learning check for <file>", matches — so this is not a
+       predicate no producer can reach (guard-3130). Verify that in the same edit if
+       step 3's title template ever changes.)
    ELIF DRAIN_GOAL is non-empty:
        # APPEND to the open drain goal instead of filing a 29th singleton. This is
        # exactly what alpha and zeta each did by hand when the duplication gate
@@ -1340,7 +1530,7 @@ When sq-018 fires after goal completion:
        -- ADDENDUM (<agent>, <today>, sq-018 spark on <goal.id>) --
        CHECK TO ADD: <one-line assertion>
        WHY: <what regression it catches>"
-       Log: "sq-018: lane depth <LANE_DEPTH> (narrow <LANE_NARROW>) >= 15 — appended to open drain goal <DRAIN_GOAL> instead of filing singleton #<LANE_DEPTH+1>"
+       Log: "sq-018: lane depth <LANE_DEPTH> (proposes-a-check in title; wide <LANE_WIDE>, narrow <LANE_NARROW>) >= 15 — appended to open drain goal <DRAIN_GOAL> instead of filing singleton #<LANE_DEPTH+1>"
        SKIP step 3 (no new goal), then continue to steps 4-5 normally.
    ELIF DRAIN_RECENT is non-empty:
        # (b) No drain is OPEN, but one COMPLETED within 48h — so the lane IS being
@@ -1353,7 +1543,7 @@ When sq-018 fires after goal completion:
        # when there is nowhere to put it does declining become the right answer.
        Record the check where its subject already has an owning suite (the ROUTING
        question in step 2.1), else carry it in your own goal's close notes.
-       Log: "sq-018: lane depth <LANE_DEPTH> (narrow <LANE_NARROW>), no open drain, but <DRAIN_RECENT> completed within 48h — declining to file an (N+1)th drain round"
+       Log: "sq-018: lane depth <LANE_DEPTH> (proposes-a-check in title; wide <LANE_WIDE>, narrow <LANE_NARROW>), no open drain, but <DRAIN_RECENT> completed within 48h — declining to file an (N+1)th drain round"
        SKIP step 3, then continue to steps 4-5 normally.
    ELSE:
        # Lane is deep, no drain is open, and none completed in 48h. File the DRAIN
@@ -1365,12 +1555,12 @@ When sq-018 fires after goal completion:
        # monotonic, so round N is never mistaken for round N-1:
        #   maintain:drain-verify-learning-check-lane-<YYYYMMDD>
        File a drain goal titled
-       "Drain the stuck verify-learning check lane — <LANE_DEPTH> open goals cite it, batch them in one pass"
+       "Drain the stuck verify-learning check lane — <LANE_DEPTH> open goals PROPOSE a check, batch them in one pass"
        with priority HIGH (a blocked lane outranks any single check it contains),
        participants ["agent"], category framework-hygiene, and a description that
        enumerates the pending sibling ids + this check. Then continue to steps 4-5.
-       State in the description that LANE_DEPTH is the WIDE count and name the
-       narrow count beside it — a successor who sees only one number cannot tell
+       State in the description that LANE_DEPTH counts title-proposes-a-check goals
+       and name LANE_WIDE and LANE_NARROW beside it — a successor who sees only one number cannot tell
        which population the round was scoped against, which is how rounds 1-6 each
        drained a subset and reported the lane clear.
 

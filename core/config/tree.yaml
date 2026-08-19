@@ -134,12 +134,39 @@ retrieval:
   # Boost-only by construction: poignancy_weight_min is 1.0, so the factor is
   # >= 1.0 always. The blend can only PROMOTE high-poignancy records, never
   # demote anything below its current effective score — this structurally
-  # satisfies the "no known-good knowledge hidden" A/B criterion. Null/absent
+  # satisfies the "no known-good knowledge hidden" A/B criterion. Enable + A/B
+  # before trusting in production.
+  #
+  # NULL CENTERING (, 2026-08-16). This comment used to say "null/absent
   # poignancy maps to 1.0 (neutral), so legacy records are null-safe with no
-  # backfill. Enable + A/B before trusting in production.
+  # backfill". 1.0 is poignancy_weight_min — the FLOOR of the range, not its
+  # middle — so an unrated record was not treated as neutral, it was ranked as if
+  # it were the least significant thing in the corpus. It is the  defect
+  # (see utility_weight_center above) mirrored into the sibling factor: unmeasured
+  # must read "assume average", and here it read "assume worst". Measured on cc-07
+  # before the fix: an unrated record could never be promoted into the top-k at any
+  # k (ent_null 0 at k=20/50/100/200), while 100%/82%/78%/71% of all demotions were
+  # unrated records against a 25.9% corpus rate.
+  # THE FIX IS THE NULL INPUT, NOT THE RATED MAPPING: null now enters the same
+  # linear map at `center` instead of short-circuiting to the floor, so the rated
+  # curve is untouched and every factor stays >= poignancy_weight_min. Boost-only
+  # therefore still holds, which is what the A/B harness's displacement bound
+  # depends on.
+  # RE-DERIVE when the corpus shifts materially: mean of `poignancy` over ALL
+  # rated records in BOTH ranked stores (reasoning-bank actives + tree nodes).
+  # Measured 2026-08-16 (, cc-07): n=7013 rated, mean 6.5822.
+  # Per-lane it is rb 6.8222 (5634 of 7603, 74.1%) and tree 5.6019 (1379 of 1406,
+  # 98.1%) — 5.1% apart in factor terms, so ONE shared constant is used. Pooled
+  # rather than rb-only because it is re-derivable from a single instruction; it
+  # leaves rb (which holds 1969 of the 1996 unrated records, 98.6%) within 1.0% of
+  # its lane average and the tree's 27 within 4.3% of theirs. Both are squarely
+  # "assume average" — nowhere near the +19% ceiling that made  a bug.
+  # A stale value only shifts the neutral point for UNRATED records; it cannot
+  # invert the rated ordering, so drift here degrades gracefully.
   poignancy_blend_enabled: false                # master flag — false = current behavior
-  poignancy_weight_min: 1.0                      # factor at poignancy=1 (and null→neutral)
+  poignancy_weight_min: 1.0                      # factor at poignancy=1
   poignancy_weight_max: 1.5                      # factor at poignancy=10
+  poignancy_weight_center: 6.5822                # poignancy assumed for null/unparseable
   # Embedding-cosine hybrid for the supplementary stores ( part b2;
   # validated by the  A/B gate: offline embedding-cosine beat the
   # token-overlap text-fallback ~5x on hit@3, 67% vs 13%, MRR .512 vs .129).

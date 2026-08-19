@@ -6,6 +6,10 @@ Never accept a negative conclusion from a single signal. Negative conclusions ar
 claims that something CAN'T be done, IS broken, DOESN'T work, or ISN'T available.
 They are uniquely dangerous because they prevent work.
 
+Mechanism, enforcement wiring, and the canonical incidents behind every rule
+below live in `core/config/conventions/negative-conclusions.md`
+(`load-conventions.sh negative-conclusions`). This file keeps the imperatives.
+
 ## Rules
 
 1. **Multi-signal requirement**: A negative conclusion requires 2+ independent
@@ -17,176 +21,110 @@ They are uniquely dangerous because they prevent work.
    without running `infra-health.sh check <component>`.
 4. **Silent failure awareness**: Commands with silent-failure flags (`-sf`, `-q`,
    `2>/dev/null`) are ZERO signals, not one. A silently-failed command that
-   returns empty output has told you nothing.
+   returns empty output has told you nothing. **A hand-written parser over a
+   framework script's output is the same class** — a `try/except` (or
+   `|| echo 0`) around a parse you wrote this turn converts a shape mismatch
+   into a confident zero, and sibling scripts do not agree on shape (JSONL vs
+   pretty-printed array). Before writing the parser, print the SHAPE and the
+   BYTE COUNT beside the record count in the same call: `bytes: 8044449`
+   next to `records: 0` is self-refuting. (guard-2298; do not expect retrieval
+   to surface this — it fires 932:4.)
+4a. **A background task's reported exit code is not the command's exit code**
+   (g-115-3202): a `<task-notification>` "completed (exit code 0)" is a claim
+   about the process the harness launched — a trailing pipe, a runner that
+   writes its verdict to a LOG, or a fail-open wrapper all return 0 over a
+   failed run. **Read the log before accepting the verdict.** No hook can fire
+   at that moment (a notification is not a tool call); the Read of the output
+   file is the one chokepoint, and it fires by hand.
 5. **Statistical / audit negations require schema verification** (rb-245):
-   Before concluding "field Y has value 0 across N records" or "N records
-   are missing field Y," read ONE record and verify field Y exists in the
-   schema. A zero-count audit against a misspelled, renamed, or nonexistent
-   field produces false positives that look authoritative. The schema
-   probe IS signal 2. Enforced by `core/scripts/zero-count-gate.py` (called
-   from aspirations-verify Q2); use `core/scripts/jsonl-field-probe.py`
-   to produce the probe evidence.
-
-   At blocker-creation time: `core/scripts/blocker-create-gate.py` (Step 2.55
-   of CREATE_BLOCKER) also enforces this. A blocker whose `failure_reason`
-   matches a statistical-negation pattern ("0 records", "all N have",
-   "none have", "missing field", "N% of records have Y=0") must include a
-   `schema_probe_evidence` field showing the claimed field was read from a
-   live record. Multi-signal rule 1 is enforced by the same gate: `evidence[]`
-   must have ≥2 entries with distinct tool/endpoint/evidence_type and
-   silent-failure commands (`-sf`, `-q`, `2>/dev/null`, `--silent`,
-   `--quiet`) count as zero.
+   Before concluding "field Y has value 0 across N records" or "N records are
+   missing field Y," read ONE record and verify field Y exists in the schema.
+   The schema probe IS signal 2. Enforced by `core/scripts/zero-count-gate.py`
+   (aspirations-verify Q2) and, at blocker-creation time, by
+   `core/scripts/blocker-create-gate.py` (Step 2.55 of CREATE_BLOCKER —
+   `schema_probe_evidence` required for statistical-negation
+   `failure_reason`s; `evidence[]` needs ≥2 distinct-tool entries, silent
+   commands count as zero); produce probe evidence with
+   `core/scripts/jsonl-field-probe.py`.
 
 ## Positive File-State Claims
 
-Negations are not the only dangerous assertions. A POSITIVE claim about a
-file's existence, mtime, contents, or last-updated field — stated without an
-in-turn read — is equally unverified. The failure mode: narrating from stale
-context (prior session, summary memory, model prior) rather than from the
-file as it exists right now.
-
-Rule: A claim about a specific file's existence, mtime, or content requires
-that file to have been Read, `ls`-probed, or `stat`-probed in the same turn
-as the claim. Claims about file state without in-turn evidence are unverified
-and MUST NOT be stated as fact.
-
-Enforced by `core/scripts/positive-state-gate.py` — takes the claim text plus
-a concatenation of in-turn tool outputs, pattern-matches positive file-state
-assertions (e.g., "handoff.yaml reflects session N", "X was updated at T",
-"file Y contains Z"), and exits 1 when the claimed path is not present in
-the evidence. Fail-open on parser errors. Called from aspirations-verify
-Q1 evidence check; advisory in agent-completion-report and
-aspirations-state-update Step 8.75.
-
-Anti-pattern (canonical incident): Asserting "handoff.yaml reflects session
-50" when the file did not exist on disk. The prior session's summary claimed
-session 50, and that claim was reused without re-reading. Fix: read the
-file (or `ls` the directory) before narrating its contents, every time.
+A POSITIVE claim about a file's existence, mtime, contents, or last-updated
+field — stated without an in-turn read — is as unverified as a negation.
+**Rule**: such a claim requires that file to have been Read, `ls`-probed, or
+`stat`-probed in the SAME TURN as the claim; without in-turn evidence it MUST
+NOT be stated as fact. Enforced by `core/scripts/positive-state-gate.py`
+(aspirations-verify Q1; advisory in agent-completion-report and
+aspirations-state-update Step 8.75). Canonical incident: "handoff.yaml
+reflects session 50" narrated from a summary while the file did not exist.
 
 ## Post-Insertion Verification
 
-A claim that an Edit or Write "succeeded" is not the same as a claim that the
-expected content is on disk right now. The Edit tool returns success as soon
-as the string replacement happens, but subsequent events — linter touches,
-parallel edits from another session, or a stale pre-autocompact summary
-carrying forward — can leave the file in a different state than the LLM
-remembers. The failure mode: asserting "Step 8.78 is at line 606, verified
-intact" from memory, when a fresh grep returns zero matches.
-
-Rules:
+An Edit/Write "succeeded" is not evidence the content is on disk NOW.
 
 1. **Verify-on-insert**: After any Edit or Write to a framework file
    (SKILL.md, core/scripts/, core/config/, .claude/rules/, world/conventions/),
    the next tool call in the same turn MUST be a Grep or Read that returns the
-   inserted content. The grep output is the evidence. Do not proceed to the
-   next task until the verification confirms presence.
-
-2. **Re-verify after linter/user notification**: When a system-reminder says
-   "file was modified by the user or by a linter," any prior claim about that
-   file's contents is invalidated. Re-read or re-grep before restating the
-   claim or building on it. The notification is a signal, not noise.
-
-3. **Summaries are claim snapshots, not filesystem snapshots**: Post-autocompact
-   summaries describe what the prior session INTENDED to write, not what is on
-   disk now. Treat every "X is at line Y, verified intact" carried forward as
-   a hypothesis requiring fresh evidence, not an established fact. This is
-   the insertion-side complement to the Positive File-State Claims rule above.
-
-Canonical incident (2026-04-20, asp-248 shape alpha): Pre-autocompact summary
-claimed "Step 8.78 inserted at line 606, verified intact after linter touched
-file." Post-autocompact verify-learning smoke test grep returned zero matches
-for `post-state-update-gate.sh` in `aspirations-state-update/SKILL.md`. Root
-cause: either the linter removed the step or the earlier "verified intact"
-was a false positive matching a different reference. Fix: re-insert
-immediately, then re-grep before proceeding. Applied protocol going forward:
-verify-on-insert after every Edit.
+   inserted content. Do not proceed until it does.
+2. **Re-verify after linter/user notification**: a "file was modified by the
+   user or by a linter" reminder invalidates every prior claim about that
+   file's contents. Re-read or re-grep before restating or building on it.
+3. **Summaries are claim snapshots, not filesystem snapshots**: a
+   post-autocompact summary describes what the prior session INTENDED to
+   write. Treat every carried-forward "X is at line Y, verified intact" as a
+   hypothesis requiring fresh evidence. (Canonical incident 2026-04-20: a
+   "verified intact" step was absent post-compaction; re-insert, then re-grep.)
 
 ## Causal Attribution Claims
 
-Beyond positive and negative state claims, a third category slips through:
-claims about WHY existing state is the way it is. The failure mode is
-inferring a cause→effect link from co-existence ("X is the way it is
-because Y exists") rather than observation, then writing the inference as
-if it were established fact. Plausible mechanisms are not the same as
-observed mechanisms.
-
-Rule: A claim that uses causal language — "because", "due to", "as a
-result of", "in response to", "compensating for", "caused by" — must rest
-on directly observed cause→effect evidence (git log entries, telemetry,
-dated audit trail, the agent's own first-person record of doing it). If
-the link is inferred from correlation, do not use causal connectors. Use
-one of these neutral forms instead:
+Claims about WHY existing state is the way it is are the third class. **Rule**:
+causal language — "because", "due to", "as a result of", "in response to",
+"compensating for", "caused by" — must rest on directly observed cause→effect
+evidence (git log, telemetry, dated audit trail, the agent's own first-person
+record). If the link is inferred from correlation, use a neutral form instead:
 
 - "observed: X. plausible mechanism: Y (inferred, not verified)"
 - "observed: X (per <audit-trail or commit reference>). therefore: Y"
 - "X exists; how it got that way is not recorded"
 
-Causal claims appear most often in:
-- code comments explaining why existing code or state is the way it is
-- reasoning-bank `content` and `failure_lesson` fields
-- knowledge-tree node summaries that narrate a system's history
-- verify-summary paragraphs that try to explain a failure
-- goal descriptions that justify the work by attributing prior failure to a cause
-
-The same rigor applies to all of them: same-turn evidence, or no causal
-language.
-
-Canonical incident (rb-734, 2026-05-08): a comment in
-`aspirations-spark/SKILL.md` sq-013 handler claimed "the 16 sq-013-derived
-goals all carry valid origin_signal because the LLM has been compensating
-after rejection." Two observations (16 goals exist + a gate exists that
-rejects missing signals) were chained into a causal claim without checking
-git history, audit log, or any trace that proved the link. The 16 goals
-could equally come from organic LLM judgment with the gate never having
-fired. The codification work itself (the discovery_type → origin_signal
-mapping) was correct; only the WHY-comment was unfounded. Fix going
-forward: when explaining why existing state exists, write observation +
-plausible-mechanism separately, never blurred.
+Same-turn evidence, or no causal connector — in code comments, reasoning-bank
+`content`/`failure_lesson`, tree-node histories, verify summaries and goal
+descriptions alike (rb-734: a "because the LLM has been compensating" comment
+chained two observations into an unverified cause and was retracted).
 
 ## Capability-Absence Claims ("Y Needs To Be Built")
 
-"Y needs to be built", "X must be created", "we need to add Z", and "there is
-no support for W yet" are negative conclusions too -- the build-side twin of
-"X doesn't exist". Both assert that a capability does NOT currently exist, and
-both misdirect work when wrong: the symmetric failure mode is building a
-duplicate of something that already exists (a script, a gate, a tree node, a
-convention) because no search was run first.
-
-Rule: Before concluding that something must be built, created, or added, apply
-the same discipline as any other negative conclusion -- the multi-signal
-requirement (rule 1) plus the exhaustive knowledge search of
-`core/config/conventions/exhaustive-search-before-negation.md`. Search the
-codebase, the skill/script registry, `world/forged-skills.yaml`, the knowledge
-tree, and `world/conventions/` for an existing implementation BEFORE filing
-build work; only when 2+ independent surfaces come back empty is "needs to be
-built" verified rather than assumed. Same root as
-`.claude/rules/encode-stable-facts.md` "retrieve before discovering" and
-`.claude/rules/capability-before-user.md` "check provisionability first". A
-goal-creation-time gate that flags build-verb goals lacking a prior-search
-note is a possible future hardening, deferred until the cycle detector shows
-the pattern is frequent enough to warrant it (g-305-10 scope decision).
+"Y needs to be built" / "there is no support for W yet" is a negative
+conclusion too — the build-side twin of "X doesn't exist"; when wrong it
+builds a duplicate. **Rule**: before concluding something must be built, apply
+rule 1 plus the exhaustive knowledge search of
+`core/config/conventions/exhaustive-search-before-negation.md` — codebase,
+skill/script registry, `world/forged-skills.yaml`, knowledge tree,
+`world/conventions/` — and only when 2+ independent surfaces come back empty is
+"needs to be built" verified rather than assumed.
 
 ## Anti-patterns
 
-- One failed curl = "it's down"
-- `curl -sf` returns empty = "service not running" (silent 404 ≠ connection refused)
-- SSH connection refused = "server is down" (could be stale host key)
+- One failed curl = "it's down"; `curl -sf` returns empty = "service not
+  running" (silent 404 ≠ connection refused); SSH refused = "server is down"
+  (could be a stale host key)
 - "I tried and it didn't work" without trying an alternative approach
-- One tree search = "it's not built" (search multiple queries, categories, and data stores)
+- One tree search = "it's not built" (search multiple queries, categories, and
+  data stores)
 - "98% of records have X=0" without probing whether X is the correct field
-  name (rb-245 — the original audit retracted after probing showed the
-  counter was at a different nested path)
+  name (rb-245)
 - "X is the way it is because Y caused it" without checking whether Y
-  actually caused X (rb-734 — comment claiming sq-013 valid signals came
-  from "LLM compensating after rejection" was retracted after acknowledging
-  no trace was ever consulted; observation and inference must be stated
-  separately, not blurred by a causal connector)
+  actually caused X (rb-734)
 - "We need to build a script/gate for X" without grepping `core/scripts/`,
-  `world/forged-skills.yaml`, and the tree first -- the capability often
-  already exists (build-side twin of the "it's not built" anti-pattern above)
+  `world/forged-skills.yaml`, and the tree first
+- Trusting a task notification's exit 0 without reading the log (guard-1431,
+  guard-1341, guard-1150, guard-1096)
 
-**Detail:** `core/config/conventions/negative-conclusions.md` for enforcement points,
-verification tiers, and silent failure catalog.
+**Detail:** `core/config/conventions/negative-conclusions.md` — enforcement
+points, verification tiers, silent-failure catalog, and the moved sections
+above (parser shapes, task exit codes, statistical negations at
+blocker-creation, positive file-state, post-insertion, causal attribution,
+capability-absence).
 
 **Knowledge-specific:** `core/config/conventions/exhaustive-search-before-negation.md`
 for the exhaustive knowledge search protocol before concluding something doesn't exist.

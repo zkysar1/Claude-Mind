@@ -600,6 +600,45 @@ def increment(ctx) -> "Response":  # type: ignore[name-defined]
 
     parent_key = field_name.split(".", 1)[0]
 
+    # --- counter spool lane (). DEFAULT-OFF. -----------------------
+    # When this box has been cleared for the cutover, a counter increment
+    # appends one line to a machine-local spool instead of read-modify-writing
+    # the CONTENT store. That RMW is the whole cost being removed: a 20.46MB /
+    # 9.37MB whole-object GET+PUT to change one integer, ~51 GB/day across the
+    # two stores at ~93-94% of all writes to them ().
+    #
+    # DELIBERATELY BEFORE `spec.path(ctx)` AND ANY READ. Reading the store to
+    # validate the id would re-introduce the whole-object GET half of the cost,
+    # so the spool path does not read at all — which means it cannot 404 on an
+    # unknown id the way the legacy path does. That is accepted rather than
+    # patched, because the alternative is worse in the direction that matters:
+    # an orphan sidecar entry is INERT (utilization_of only ever looks up ids of
+    # records that exist, so nothing reads it), whereas having the flusher drop
+    # ids it cannot find in the content store would silently discard every
+    # first-touch increment during any transient backend read failure. Dead
+    # weight beats silent loss.
+    #
+    # Scoped to the two stores the sidecar seam covers; every other store with
+    # an increment_prefix keeps the legacy path untouched.
+    if parent_key == "utilization":
+        try:
+            import _utilization_store as _us
+            store_name = (ctx.query.get("store") or "").strip()
+            if _us.spooled_enabled() and store_name in _us.KINDS:
+                if _us.record_increment(store_name, key, counter,
+                                        world_dir=ctx.paths.world):
+                    return Response.json({
+                        "ok": True,
+                        "spooled": True,
+                        "record": {spec.id_field: key},
+                    })
+                # record_increment returns False rather than raising, so a
+                # failed spool append falls through to the legacy RMW below and
+                # the increment is preserved. Never let the cheap path lose a
+                # counter to save a write.
+        except Exception:
+            pass    # any import/resolution fault -> legacy path, never a 500
+
     path = spec.path(ctx)
     try:
         # #38: increment is the classic lost-update — a counter += 1 read against

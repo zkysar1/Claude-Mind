@@ -36,15 +36,39 @@ def is_universal_rb(rec):
     return cat.startswith(FRAMEWORK_CATEGORY_PREFIX)
 
 
-def sort_universal_rbs(entries):
+def sort_universal_rbs(entries, counters=None):
     """Sort a list of universal entries by utilization_score desc, then created desc.
 
     Mutates and returns the list. Tie-break by recency ensures fresh lessons
     surface over old ones at equal utility.
+
+    `counters` (g-358-05) is the reasoning-bank utilization sidecar map; None
+    keeps the embedded-field reading, so every existing caller is unchanged.
+
+    THE IMPORT IS LAZY AND THE MODULE STAYS IMPORT-FREE AT TOP LEVEL — this is
+    the constraint `mind_api/src/world/reasoning_bank.py::_store_paths` measured
+    and documented, not a style choice. That module imports THIS one at daemon
+    module level (its own header notes `_rb_helpers` has no imports at all), and
+    `_utilization_store` resolves WORLD_DIR from `local-paths.conf` at import.
+    A top-level import here would therefore freeze a global at daemon LOAD in a
+    process whose path contract is per-request `ctx.paths`. Deferring keeps that
+    side effect out of module load, and `sys.modules` makes the repeat cost nil.
+    Note the frozen global is never consulted either way: `utilization_of` takes
+    the counters map explicitly and needs no world_dir — the same "pass it
+    explicitly" discipline `_store_paths` applies to `world`.
+
+    On ImportError the embedded field is used, which is exactly today's
+    behaviour — the conservative direction, never a silent empty.
     """
+    try:
+        from _utilization_store import utilization_of
+    except ImportError:
+        def utilization_of(rec, _c=None):
+            return rec.get("utilization") or {}
+
     entries.sort(
         key=lambda r: (
-            (r.get("utilization") or {}).get("utilization_score", 0) or 0,
+            (utilization_of(r, counters) or {}).get("utilization_score", 0) or 0,
             r.get("created", "") or "",
         ),
         reverse=True,

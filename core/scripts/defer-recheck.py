@@ -127,10 +127,32 @@ def _append_metric(path, record):
 # or "until g-226-19 executes" that predate the structured convention.
 # Both patterns collect ALL goal-ids mentioned — the caller checks whether
 # ALL of them are completed before clearing (safer than first-match).
-DEP_STRUCTURED = re.compile(r"(?:blocked_on_dependency|dependency|depends on):\s*(g-\d+-\d+)", re.IGNORECASE)
+# THE `(?:-[a-z])?` SUFFIX IS LOAD-BEARING (guard-2414, g-115-4674). Every id
+# captured here is fed to `by_id.get(...)` — see _extract_dep_ids' callers at
+# L270 and L295 — so a truncated capture does not fail loudly, it looks up a
+# DIFFERENT record and decides on that. Without the suffix, `g-250-03-c`
+# captures as `g-250-03`, which is not a goal at all: by_id returns None, the
+# "all deps completed" test can never pass, and the defer is frozen FOREVER.
+# STATE PLAINLY WHAT THIS FIX DID AND DID NOT DO (g-115-4674 audit, cc-07
+# 2026-08-10): it is a LATENT-defect hardening, NOT a live-bug fix. Diffed
+# old-vs-new extraction across all 35 live defer_reasons: the capture set
+# changed on ZERO of them. 4 non-terminal goals DO name a suffixed dependency
+# in their defer text (g-306-126 -> g-306-132-a, g-306-128 -> g-306-119-a,
+# g-326-57 and g-350-63 -> g-250-03-c), and in 2 of those the dependency is
+# already completed — but they are frozen because their prose matches NO
+# dependency pattern at all ("no recognized dependency pattern"), which the
+# suffix has nothing to do with. Do not read those two facts as cause and
+# effect; the first draft of this comment did, and the diff falsified it.
+# The justification for widening is the SSOT alone: GOAL_ID_RE in
+# aspirations.py admits `(-[a-z])?`, an extractor feeding by_id.get() must
+# match the SSOT, and the failure mode when it does not is silent — a
+# truncated id resolves to None and reads as a DELETED dependency
+# ("dep g-306-132 not found in queues"), i.e. a data problem rather than a
+# regex one. That is why this class survives once it does go live.
+DEP_STRUCTURED = re.compile(r"(?:blocked_on_dependency|dependency|depends on):\s*(g-\d+-\d+(?:-[a-z])?)", re.IGNORECASE)
 DEP_PROXIMITY = re.compile(
-    r"(?:(?:blocked on|awaiting|prerequisite|until)\s+(?:asp-\d+\s+)?(g-\d+-\d+))"
-    r"|(?:(g-\d+-\d+)\s+(?:blocked|executes|completes|deploys|lands|resolves|fires))",
+    r"(?:(?:blocked on|awaiting|prerequisite|until)\s+(?:asp-\d+\s+)?(g-\d+-\d+(?:-[a-z])?))"
+    r"|(?:(g-\d+-\d+(?:-[a-z])?)\s+(?:blocked|executes|completes|deploys|lands|resolves|fires))",
     re.IGNORECASE,
 )
 
@@ -146,7 +168,7 @@ DEP_GATED_CLAUSE = re.compile(
     r"gated\s+on\s+([^.;]+?)(?:[.;]|$)",
     re.IGNORECASE,
 )
-_GID_RE = re.compile(r"g-\d+-\d+", re.IGNORECASE)
+_GID_RE = re.compile(r"g-\d+-\d+(?:-[a-z])?", re.IGNORECASE)  # suffix load-bearing — see DEP_STRUCTURED note
 
 # Three additional precondition_unmet pattern handlers (g-115-340, iter-110).
 # Catch chronic narrative defers that the dep regexes above can't match:

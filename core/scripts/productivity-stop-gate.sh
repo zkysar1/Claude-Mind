@@ -564,12 +564,42 @@ try:
 except Exception:
     pass
 
-# Journal append
-# User-visible notification path: board post (self-stop type, above) is read
-# by the next LLM turn and by any reader-mode observer session; the journal
-# entry is the permanent audit trail. No separate notify-user call — that
-# skill is LLM-invoked, not shell-callable, and adding a fallback here would
-# create a silent failure mode that hides the real notification channel.
+# User-visible notification path (, user directive 2026-08-15).
+#
+# This block previously carried a comment declaring: "No separate notify-user
+# call — that skill is LLM-invoked, not shell-callable". BOTH of its premises
+# were wrong, which is why it is corrected here in the instrument rather than
+# only in a goal record (guard-2462):
+#   1. The transport IS shell/CLI-callable — notify-build-payload.py piped to
+#      world/scripts/email-send.sh, which is exactly what the recorder below
+#      invokes. world/scripts/notify-from-file.sh has done this since 2026-05-11.
+#   2. "The board post is read by the next LLM turn" fails in precisely THIS
+#      case: after this stop there is no next turn on this box, and /start is
+#      user-only. So the board post is written where nobody will read it until
+#      a human independently notices the box is quiet.
+# That gap is what the user experienced as the loop going quiet unnoticed.
+#
+# Called via sys.executable for the same reason as the session.py call above:
+# subprocess.run(["bash", ...]) resolves to System32/WSL bash on Windows. The
+# recorder always exits 0, so it can never block this stop.
+try:
+    _rec = subprocess.run(
+        [sys.executable,
+         str(_paths.CORE_ROOT / "scripts" / "stop-reason-record.py"),
+         "--path", "productivity-stop-gate", "--reason", msg, "--agent", agent],
+        capture_output=True, text=True, timeout=90,
+    )
+    # guard-1673 / guard-3737: forward the recorder's own before/verdict/failure
+    # lines into THIS script's log. Without them, "notified the user", "transport
+    # refused with a reason" and "never ran" are byte-identical from here.
+    if _rec.stderr.strip():
+        print(_rec.stderr.strip(), file=sys.stderr)
+except Exception as exc:
+    print(f"[productivity-gate] CRITICAL: stop-reason recorder did not run "
+          f"({type(exc).__name__}: {exc}) — stopping ANYWAY, and nobody has "
+          f"been told this box is going IDLE.", file=sys.stderr)
+
+# Journal append — the permanent local audit trail.
 from datetime import datetime
 now = datetime.now()
 jpath = agent_dir / "journal" / now.strftime("%Y") / now.strftime("%m") / f"{now:%Y-%m-%d}.md"

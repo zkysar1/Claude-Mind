@@ -921,7 +921,16 @@ candidate generation in Phases A-D via interestingness criteria. Stage 2
      Remove lowest-priority/oldest aspirations first:
        # Guard: NEVER archive aspirations with recurring goals (data layer blocks it)
        IF any goal has recurring == true: SKIP this aspiration
-       ELIF aspiration has no completed goals and last_worked is null:
+       # Guard: asp-xw-* are cross-world imports — an inbound queue, not portfolio
+       # entries (guard-2829). Each arrives as a single-goal aspiration with a null
+       # last_selected, i.e. exactly the "never started" shape retired below, so cap
+       # pressure would silently discard unprocessed work from a peer deployment.
+       # 10 of 28 active aspirations were this shape on 2026-08-10.
+       ELIF asp.id starts with "asp-xw-": SKIP this aspiration
+       # `last_selected`, NOT `last_worked` (g-115-3097): last_worked has zero writers
+       # and is absent from every live record, so that half of the AND was permanently
+       # true and this test silently reduced to "no completed goals".
+       ELIF aspiration has no completed goals and last_selected is null:
          Bash: aspirations-retire.sh --source {asp.source} <asp-id>   # never started
        ELSE:
          Bash: aspirations-complete.sh --source {asp.source} <asp-id>  # had progress

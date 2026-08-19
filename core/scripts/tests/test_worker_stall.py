@@ -67,11 +67,99 @@ def test_stale_with_live_claim_is_the_alert():
 
 
 def test_stale_without_claim_never_alerts():
-    """THE LOAD-BEARING NEGATIVE. A finished body's carrier is stale forever."""
-    for age in (60.1, 120.0, 1524.6, 1724.0, 100_000.0):
-        v = ws.classify_body(age, False)
-        assert v == ws.V_STALE_NO_CLAIM
-        assert not ws.is_alerting(v), f"age={age} must never alert without a claim"
+    """THE LOAD-BEARING NEGATIVE. A finished body's carrier is stale forever.
+
+    Now stated with the evidence that MAKES it benign (g-306-319): the carrier
+    says the Body closed. Before that field existed this assertion held for
+    every stale claimless body indiscriminately, which is precisely why a Body
+    that died between units was invisible.
+    """
+    for closed in sorted(ws.CLOSED_BODY_STATES):
+        for age in (60.1, 120.0, 1524.6, 1724.0, 100_000.0):
+            v = ws.classify_body(age, False, body_state=closed)
+            assert v == ws.V_STALE_NO_CLAIM
+            assert not ws.is_alerting(v), f"{closed} age={age} must never alert"
+
+
+def test_stale_claimless_but_never_closed_is_the_second_alert():
+    """THE DEFECT  CLOSES. A worker that text-dies BETWEEN units --
+    after releasing unit N, before claiming N+1 -- holds no claim, so the
+    claim-join cannot condemn it. Its carrier's last tick still says `active`,
+    and that is what separates it from a Body that finished."""
+    for age in (60.1, 120.0, 409.0, 100_000.0):
+        v = ws.classify_body(age, False, body_state="active")
+        assert v == ws.V_STALLED_NO_CLOSE
+        assert ws.is_alerting(v), f"age={age} active-but-stale must alert"
+
+
+def test_parked_body_is_dormant_by_design_not_stalled():
+    """A park is resumable and deliberately quiet; its re-poll cadence is ~= the
+    staleness threshold, so alerting would fire on the normal case."""
+    v = ws.classify_body(1000.0, False, body_state=ws.PARKED_BODY_STATE)
+    assert v == ws.V_STALE_PARKED
+    assert not ws.is_alerting(v)
+
+
+def test_absent_state_is_unknown_not_an_alert_and_not_a_clean_bill():
+    """A carrier written before the field existed, or by a box that has not
+    pulled the writer yet. Benign -- alerting would flood for the whole rollout
+    -- but it gets its OWN verdict so scan() can count what it could not judge
+    (guard-4000: a fail-safe KEEP that never reports grows unbounded)."""
+    for missing in (None, "", "   "):
+        v = ws.classify_body(120.0, False, body_state=missing)
+        assert v == ws.V_STALE_STATE_UNKNOWN
+        assert not ws.is_alerting(v)
+        # It must NOT be laundered into the earned-benign verdict: the two mean
+        # different things and only one of them is evidence.
+        assert v != ws.V_STALE_NO_CLAIM
+
+
+def test_unrecognised_state_defaults_to_alerting():
+    """Fail-safe direction: any future non-closed, non-parked state is by
+    construction a LIVE state, and a live Body that stopped ticking is the
+    condition this module hunts."""
+    v = ws.classify_body(120.0, False, body_state="some-future-live-state")
+    assert v == ws.V_STALLED_NO_CLOSE
+    assert ws.is_alerting(v)
+
+
+def test_a_held_claim_still_outranks_body_state():
+    """The original alert is unchanged: a stale body holding a live claim is
+    `stalled_with_claim` whatever its state says. A closed Body that still holds
+    a claim is a stranded claim, which is a stall by a different route."""
+    for state in (None, "active", "parked", "merged", "closed-pending-merge"):
+        assert ws.classify_body(120.0, True, body_state=state) == \
+            ws.V_STALLED_WITH_CLAIM
+
+
+def test_state_partition_matches_body_manifest():
+    """DRIFT PIN. worker_stall mirrors body-manifest's CLOSED_STATES rather than
+    importing it (a probe module agent-watchdog loads every tick must not
+    acquire an import that can fail). This test is what makes that safe: it
+    loads the REAL module and fails loudly if the partition moves -- the same
+    technique test_reducer_self_fence.py uses against its sibling.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "body_manifest_for_drift_check", CORE_SCRIPTS / "body-manifest.py")
+    bm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bm)
+
+    assert ws.CLOSED_BODY_STATES == frozenset(bm.CLOSED_STATES), (
+        "worker_stall.CLOSED_BODY_STATES has drifted from body-manifest."
+        "CLOSED_STATES -- update the mirror in worker_stall.py")
+    assert ws.PARKED_BODY_STATE in bm.CLOSEABLE_STATES
+    # EXHAUSTIVE, not merely consistent (guard-3948): every declared state must
+    # land in exactly one branch of classify_body. A sixth state added to
+    # VALID_STATES without a decision here would otherwise silently inherit the
+    # alerting default, which is safe but unconsidered.
+    for state in bm.VALID_STATES:
+        v = ws.classify_body(120.0, False, body_state=state)
+        if state in bm.CLOSED_STATES:
+            assert v == ws.V_STALE_NO_CLAIM, state
+        elif state == ws.PARKED_BODY_STATE:
+            assert v == ws.V_STALE_PARKED, state
+        else:
+            assert v == ws.V_STALLED_NO_CLOSE, state
 
 
 def test_boundary_is_inclusive_at_threshold():
@@ -147,10 +235,15 @@ def _carrier(agents_root: Path, agent: str, sid: str, host: str, ts: dt.datetime
 
 
 def test_scan_dead_body_is_silent(tmp_path, monkeypatch):
-    """A 25h-old carrier with no claim -- the live-measured dead-body shape."""
+    """A 25h-old carrier with no claim -- the live-measured dead-body shape.
+
+    Carries `body_state: merged` because that is what a genuinely-finished
+    Body's carrier says once the close path mirrors its state (g-306-319). The
+    silence is now EARNED from evidence rather than assumed from staleness.
+    """
     monkeypatch.setattr(ws, "enumerate_carriers", lambda root: _enum([
         {"agent": "alpha", "sid": "b18c61fa", "read_via": "authoritative",
-         "doc": {"sid": "b18c61fa", "host": "DESKTOP-X",
+         "doc": {"sid": "b18c61fa", "host": "DESKTOP-X", "body_state": "merged",
                  "ts": (dt.datetime(2026, 8, 6, 16, 0)
                         - dt.timedelta(minutes=1524.6)).strftime("%Y-%m-%dT%H:%M:%S")}},
     ]))
@@ -160,6 +253,71 @@ def test_scan_dead_body_is_silent(tmp_path, monkeypatch):
     assert rep["scanned"] == 1
     assert rep["alerts"] == []
     assert rep["bodies"][0]["verdict"] == ws.V_STALE_NO_CLAIM
+    # Coverage is reported, so a clean bill can be told from an unjudgeable one.
+    assert rep["state_known"] == 1
+    assert rep["state_unknown"] == 0
+
+
+def test_scan_alerts_on_a_body_that_died_between_units(tmp_path, monkeypatch):
+    """THE  CASE, end to end. Same carrier age and same absent claim as
+    the dead-body test above -- the ONLY difference is that this Body never
+    wrote a close. Before this change the two were byte-identical to the probe.
+    """
+    monkeypatch.setattr(ws, "enumerate_carriers", lambda root: _enum([
+        {"agent": "alpha", "sid": "d1aec55b", "read_via": "authoritative",
+         "doc": {"sid": "d1aec55b", "host": "cc-07", "body_state": "active",
+                 "ts": (dt.datetime(2026, 8, 6, 16, 0)
+                        - dt.timedelta(minutes=1524.6)).strftime("%Y-%m-%dT%H:%M:%S")}},
+    ]))
+    store = tmp_path / "a.jsonl"
+    _write_store(store, [{"id": "g-1", "status": "pending"}])
+    rep = ws.scan(tmp_path, store, now=dt.datetime(2026, 8, 6, 16, 0))
+    assert rep["scanned"] == 1
+    assert len(rep["alerts"]) == 1
+    a = rep["alerts"][0]
+    assert a["verdict"] == ws.V_STALLED_NO_CLOSE
+    assert a["held_goal"] is None, "the whole point: it holds no claim"
+    assert a["body_state"] == "active"
+    assert a["host"] == "cc-07"
+    assert rep["state_known"] == 1
+
+
+def test_scan_counts_bodies_it_could_not_judge(tmp_path, monkeypatch):
+    """A pre-rollout carrier is silent -- and SAID to be unjudged. Without the
+    count, an all-legacy fleet reports `alerts: []` in the same bytes as a fleet
+    with nothing wrong (guard-3489)."""
+    monkeypatch.setattr(ws, "enumerate_carriers", lambda root: _enum([
+        {"agent": "alpha", "sid": "old00001", "read_via": "authoritative",
+         "doc": {"sid": "old00001", "host": "cc-01",
+                 "ts": (dt.datetime(2026, 8, 6, 16, 0)
+                        - dt.timedelta(minutes=900)).strftime("%Y-%m-%dT%H:%M:%S")}},
+    ]))
+    store = tmp_path / "a.jsonl"
+    _write_store(store, [{"id": "g-1", "status": "pending"}])
+    rep = ws.scan(tmp_path, store, now=dt.datetime(2026, 8, 6, 16, 0))
+    assert rep["alerts"] == []
+    assert rep["bodies"][0]["verdict"] == ws.V_STALE_STATE_UNKNOWN
+    assert rep["state_unknown"] == 1
+    assert rep["state_known"] == 0
+
+    # The legacy population must NOT flip degraded_read -- it would be true on
+    # every box until the writer propagates fleet-wide, and a flag that fires
+    # constantly stops being read. Asserted DIFFERENTIALLY against a control
+    # identical but for the one variable, because degraded_read is a disjunction
+    # over five legs and this fixture already trips one of them
+    # (claims_read_via == "none", a property of the tmp claim store). An absolute
+    # `is False` here would test that unrelated leg and fail for a reason that
+    # has nothing to do with state coverage.
+    monkeypatch.setattr(ws, "enumerate_carriers", lambda root: _enum([
+        {"agent": "alpha", "sid": "old00001", "read_via": "authoritative",
+         "doc": {"sid": "old00001", "host": "cc-01", "body_state": "merged",
+                 "ts": (dt.datetime(2026, 8, 6, 16, 0)
+                        - dt.timedelta(minutes=900)).strftime("%Y-%m-%dT%H:%M:%S")}},
+    ]))
+    control = ws.scan(tmp_path, store, now=dt.datetime(2026, 8, 6, 16, 0))
+    assert control["state_unknown"] == 0, "control must differ in the variable"
+    assert control["degraded_read"] == rep["degraded_read"], (
+        "an unjudgeable state changed degraded_read; it must not")
 
 
 def test_scan_stalled_worker_alerts_and_names_the_goal(tmp_path, monkeypatch):
@@ -843,3 +1001,171 @@ def test_probe_is_registered(tmp_path):
     )
     assert any(isinstance(x, WD.WorkerStallProbe) for x in probes)
     assert "worker-stall" in [x.name for x in probes]
+
+
+# ── scan()'s claim SCOPE () ─────────────────────────────────────────
+# Sibling of the read_claims_union tests above, one layer up. Those pin the
+# HELPER; these pin what scan() actually READS, which is a different question
+# and was the gap: the helper landed with  and scan() kept calling
+# read_claims(world_store) directly.
+#
+# THESE TESTS HAVE TO MINT THEIR OWN POSITIVE CASE, and that is not incidental.
+# Measured on the live fleet 2026-08-08 (11 carriers, 9 agents, authoritative
+# read): ZERO carriers whose only non-terminal claim is agent-queue-side. The
+# defect is real in the code and dormant in the data, so no live run can supply
+# a positive control for it (guard-3122) -- a green scan of the real fleet is
+# equally consistent with the fix working and with it doing nothing.
+
+def _stale_carrier_rows(agent, sid, minutes=125, body_state="merged"):
+    """Carrier rows for the CLAIM-JOIN family below.
+
+    `body_state` defaults to a CLOSED one on purpose (g-306-319): these tests
+    vary the claim and hold everything else fixed, so the state must not be the
+    thing that decides them. With a claim they assert `stalled_with_claim`
+    (a held claim outranks any state); without one they assert `stale_no_claim`.
+    Leaving it absent would make them turn on `stale_state_unknown` instead and
+    quietly stop testing the claim join at all.
+    """
+    ts = (dt.datetime(2026, 8, 6, 16, 0)
+          - dt.timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%S")
+    return [{"agent": agent, "sid": sid, "read_via": "authoritative",
+             "doc": {"sid": sid, "host": "cc-08", "ts": ts,
+                     "body_state": body_state}}]
+
+
+def test_scan_alerts_when_the_only_claim_is_agent_queue_side(tmp_path, monkeypatch):
+    """: the alerting half of the same scope gap  fixed.
+
+    scan() alerts on stale AND holds-a-live-claim, so a claim it cannot see is a
+    Body that stalls SILENTLY. The failure direction is the mirror of the
+    reaper's: there a missed claim orphans in-flight work, here it suppresses the
+    only warning anyone gets.
+    """
+    monkeypatch.setattr(ws, "enumerate_carriers",
+                        lambda root: _enum(_stale_carrier_rows("foxtrot", "3ebc753b")))
+    world = tmp_path / "world.jsonl"
+    _write_store(world, [{"id": "g-other", "status": "in-progress",
+                          "claimed_by_sid": "someone-else"}])
+    agent_q = tmp_path / "foxtrot" / "aspirations.jsonl"
+    agent_q.parent.mkdir(parents=True, exist_ok=True)
+    _write_store(agent_q, [{"id": "g-335-989", "status": "pending",
+                            "claimed_by_sid": "3ebc753b"}])
+
+    # PREMISE, asserted rather than assumed: the world queue genuinely cannot
+    # see this claim, so the test is exercising the union and not a world hit.
+    world_only, _ = ws.read_claims(world)
+    assert "3ebc753b" not in world_only, world_only
+
+    rep = ws.scan(tmp_path, world, now=dt.datetime(2026, 8, 6, 16, 0))
+    assert len(rep["alerts"]) == 1, rep["bodies"]
+    a = rep["alerts"][0]
+    assert a["verdict"] == ws.V_STALLED_WITH_CLAIM
+    assert a["held_goal"] == "g-335-989", "the agent-queue claim must reach the verdict"
+
+
+def test_scan_still_stays_silent_when_NO_queue_holds_the_claim(tmp_path, monkeypatch):
+    """Anti-vacuity for the test above (guard-1793).
+
+    Identical carrier and identical world queue; the ONLY difference is that the
+    agent queue does not carry the claim either. A change that made scan() alert
+    on every stale carrier -- or a union that silently matched the wrong sid --
+    passes the test above and fails this one. Without this pair, "it alerted" is
+    not evidence the agent queue was read.
+    """
+    monkeypatch.setattr(ws, "enumerate_carriers",
+                        lambda root: _enum(_stale_carrier_rows("foxtrot", "3ebc753b")))
+    world = tmp_path / "world.jsonl"
+    _write_store(world, [{"id": "g-other", "status": "in-progress",
+                          "claimed_by_sid": "someone-else"}])
+    agent_q = tmp_path / "foxtrot" / "aspirations.jsonl"
+    agent_q.parent.mkdir(parents=True, exist_ok=True)
+    _write_store(agent_q, [{"id": "g-unrelated", "status": "pending",
+                            "claimed_by_sid": "a-different-sid"}])
+
+    rep = ws.scan(tmp_path, world, now=dt.datetime(2026, 8, 6, 16, 0))
+    assert rep["alerts"] == [], rep["bodies"]
+    assert rep["bodies"][0]["verdict"] == ws.V_STALE_NO_CLAIM
+
+
+def test_scan_claim_stores_are_scoped_to_the_agents_that_OWN_carriers(tmp_path, monkeypatch):
+    """The store set is bounded by DISTINCT OWNING AGENTS, not by carriers.
+
+    Two carriers for one agent must not read that agent's queue twice, and an
+    agent with no carrier must not be read at all -- on a 9-agent fleet the
+    difference is a per-tick cost that scan()'s own docstring promises to keep
+    small. Asserted on the paths actually opened, because a store set that
+    happened to be right by accident is not a contract.
+    """
+    rows = (_stale_carrier_rows("foxtrot", "3ebc753b")
+            + _stale_carrier_rows("foxtrot", "7d2cb8dd", minutes=200)
+            + _stale_carrier_rows("zeta", "03fda40a", minutes=5))
+    monkeypatch.setattr(ws, "enumerate_carriers", lambda root: _enum(rows))
+    world = tmp_path / "world.jsonl"
+    _write_store(world, [{"id": "g-1", "status": "pending"}])
+
+    seen = []
+    real = ws.read_claims
+    monkeypatch.setattr(ws, "read_claims",
+                        lambda p: (seen.append(str(p).replace("\\", "/")), real(p))[1])
+
+    ws.scan(tmp_path, world, now=dt.datetime(2026, 8, 6, 16, 0))
+
+    assert sum("/foxtrot/" in p for p in seen) == 1, f"foxtrot read once, got {seen}"
+    assert sum("/zeta/" in p for p in seen) == 1, f"zeta read once, got {seen}"
+    assert any(p.endswith("world.jsonl") for p in seen), seen
+    assert not any("/alpha/" in p for p in seen), f"no carrier, must not be read: {seen}"
+    assert len(seen) == 3, f"world + 2 distinct owners, got {seen}"
+
+
+# ------------------------------------------- alert rendering ()
+
+def _probe_with(monkeypatch, tmp_path, body):
+    """A WorkerStallProbe whose scan returns exactly one body."""
+    probe = WD.WorkerStallProbe(WD.WatchdogContext(
+        agent_name="zeta", agent_dir=tmp_path / "agents" / "zeta",
+        project_root_path=tmp_path))
+    probe.initialize()
+    rep = {"bodies": [body], "alerts": [body], "scanned": 1, "carriers_found": 1,
+           "rows_dropped": 0, "first_drop_error": None,
+           "enumeration_lost_everything": False, "claims_read_via": "authoritative",
+           "stale_minutes": 60.0, "degraded_read": False,
+           "state_known": 1, "state_unknown": 0,
+           "enumeration": {"read_via": "authoritative", "complete": True,
+                           "agents_enumerated": 1, "reason": None}}
+    monkeypatch.setattr(WD, "scan", lambda *a, **k: rep, raising=False)
+    monkeypatch.setattr(ws, "scan", lambda *a, **k: rep)
+    return probe
+
+
+def test_between_units_alert_does_not_say_holding_None(tmp_path, monkeypatch):
+    """The new verdict holds NO claim by definition, so the original summary --
+    which ends `while holding {held_goal}` unconditionally -- would render
+    "while holding None". That reads as a probe bug and buries the actionable
+    fact, which is that the Body never recorded a close."""
+    probe = _probe_with(monkeypatch, tmp_path, {
+        "agent": "alpha", "sid": "d1aec55b", "host": "cc-07",
+        "carrier_age_minutes": 409.0, "held_goal": None,
+        "body_state": "active", "verdict": ws.V_STALLED_NO_CLOSE,
+        "read_via": "authoritative"})
+    events = [e for e in probe.check() if e.event == "worker_stall"]
+    assert len(events) == 1, [e.event for e in probe.check()]
+    s = events[0].summary
+    assert "holding None" not in s, s
+    assert "died between units" in s, s
+    assert "never recorded a close" in s, s
+    assert "409.0" in s and "cc-07" in s, s
+
+
+def test_with_claim_alert_still_names_the_goal(tmp_path, monkeypatch):
+    """Anti-vacuity twin: the ORIGINAL alert must be unchanged. A rewrite that
+    dropped held_goal from every message would pass the test above."""
+    probe = _probe_with(monkeypatch, tmp_path, {
+        "agent": "foxtrot", "sid": "3ebc753b", "host": "cc-08",
+        "carrier_age_minutes": 125.0, "held_goal": "g-306-240",
+        "body_state": "active", "verdict": ws.V_STALLED_WITH_CLAIM,
+        "read_via": "authoritative"})
+    events = [e for e in probe.check() if e.event == "worker_stall"]
+    assert len(events) == 1
+    s = events[0].summary
+    assert "while holding g-306-240" in s, s
+    assert "died between units" not in s, s

@@ -59,7 +59,24 @@ SWEEP_LOGS = {
     "parent-supersession-sweep-metrics.jsonl": "parent-supersession",
     "unblock-parent-status-sweep-metrics.jsonl": "unblock-parent-status",
     "routing-audit-target-status-sweep-metrics.jsonl": "routing-audit-target",
+    # g-115-6415 — the FOURTH scan-then-write sweep. It writes status=COMPLETED
+    # (the other three write skipped/completed via their own paths), so it is
+    # squarely in guard-1231's scope: a terminal mutation with no consumer is
+    # invisible to the filer. This map is the whole registration surface — a
+    # sweep that emits a metrics log and is absent from here is silently
+    # unsurfaced, which is indistinguishable from a sweep that never fired.
+    "monitor-stale-check-metrics.jsonl": "monitor-stale",
 }
+
+#: Substring marking a REFUSAL record rather than a mutation. Refusal rows carry
+#: a `goal_id` and are not `run_summary`, so they satisfy the generic
+#: discriminator below and would be rendered by `_format_header` as
+#: "<goal>→terminal(<sweep>)" — asserting the exact opposite of what happened.
+#: Measured 2026-08-16 (zeta, hostname cc-02, uname -r 6.8.0-137-generic): 0
+#: refusal rows existed across all 14,630 lines of the three then-registered
+#: logs, so the mis-render was LATENT, never live. It stops being latent the
+#: moment any guarded sweep actually refuses.
+REFUSAL_TYPE_MARKER = "refused"
 DEFAULT_WINDOW_HOURS = 24  # first-run lookback when no watermark exists
 MAX_DISPLAY = 6            # cap the header line so a big batch stays one line
 
@@ -126,6 +143,17 @@ def _collect_new_mutations(metrics_dir, watermark):
             if not isinstance(rec, dict):
                 continue
             if rec.get("type") == "run_summary":
+                continue
+            # A REFUSAL is the opposite of a mutation: the sweep looked, decided
+            # the record was no longer safe to touch, and wrote NOTHING to the
+            # goal. Surfacing it as "<goal>→terminal" would report a status
+            # change that never happened, to the one reader positioned to act on
+            # it — a false positive in the direction that erodes trust in the
+            # whole surface. Substring rather than an exact-type list so a
+            # future guarded sweep naming its own refusal type is covered
+            # without an edit here (the three registered sweeps all name theirs
+            # `*_refused_stale_candidate`).
+            if REFUSAL_TYPE_MARKER in str(rec.get("type") or ""):
                 continue
             gid = rec.get("goal_id")
             if not gid:

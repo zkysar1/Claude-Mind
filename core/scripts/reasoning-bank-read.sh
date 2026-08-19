@@ -30,7 +30,7 @@ while [[ $# -gt 0 ]]; do
         --recent)
             # --recent may be bare (CLI default 10) or take an integer.
             if [ $# -gt 1 ] && [[ "$2" =~ ^[0-9]+$ ]]; then
-                RECENT="$2"; PASSTHROUGH+=("$1" "$2"); shift 2
+                RECENT="$2"; PASSTHROUGH+=("$1" "$2"); shift $(( $# >= 2 ? 2 : 1 ))
             else
                 RECENT="10"; PASSTHROUGH+=("$1"); shift
             fi;;

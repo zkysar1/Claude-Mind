@@ -10,7 +10,8 @@
 # Strategy:
 #   1. Exit code 2 when MIND_AGENT unset (error path).
 #   2. Exit code 2 when MIND_AGENT names a nonexistent agent dir.
-#   3. Exit code 1 for the live runner (heartbeat fresh → alive).
+#   3. Exit code 1 for the bound agent; JSON shape branches on the observed
+#      role — reducer (RUNNING, heartbeat fresh) vs worker/IDLE ().
 #   4. JSON output is well-formed and contains the 6 condition booleans.
 #   5. Stderr contains a verdict line + 6 per-condition labels.
 #
@@ -77,38 +78,66 @@ else
     echo "FAIL: scenario 2 JSON missing dead=false. stdout=$out"
 fi
 
-# ─── Scenario 3: live runner → rc=1 (ALIVE; heartbeat fresh) ───────────
-# Only runs when MIND_AGENT is set in parent env (means this test is
-# running in an actively-bound autonomous session — heartbeat-tick has
-# fired on this turn).
+# ─── Scenario 3: bound agent → rc=1 (not dead), JSON shape by ROLE ─────
+# Runs whenever MIND_AGENT is set in the parent env. That does NOT mean
+# "this box is the live RUNNING reducer": under one-mind-two-bodies a
+# worker Body box (and any assistant/reader session) binds the agent with
+# agent-state=IDLE and writes no runner-heartbeat BY DESIGN. Asserting
+# state_running=true + heartbeat_stale=false here encoded "the bound agent
+# on this box is a live RUNNING reducer" as an invariant, so the scenario
+# was RED on every worker-role box permanently while the helper was
+# correct (; a reducer box cannot observe that red at all).
+# The expectations therefore BRANCH on the observed role rather than
+# SKIP: a skip would silently drop scenario 3 on every worker box, which
+# is the coverage-loss shape this test family exists to prevent.
+#   reducer (agent-state == RUNNING): dead=false, state_running=true,
+#       heartbeat_stale=false (heartbeat-tick fired this turn).
+#   any other role (IDLE): dead=false, state_running=false — nothing to
+#       recover. heartbeat_stale is NOT asserted there: it is not
+#       role-determined (a reducer that stopped inside the staleness
+#       window reads fresh while IDLE), and the helper's rc=1 already
+#       proves the gate short-circuited on condition 1.
 if [[ -n "$SELF_AGENT" ]]; then
+    self_state=$(MIND_AGENT="$SELF_AGENT" bash "$SCRIPT_DIR/../session-state-get.sh" 2>/dev/null | tr -d '[:space:]')
+    if [[ "$self_state" == "RUNNING" ]]; then
+        role="reducer"; expect_running="True"
+    else
+        role="non-reducer (agent-state=${self_state:-unknown})"; expect_running="False"
+    fi
     out=$(MIND_AGENT="$SELF_AGENT" bash "$HELPER" 2>/dev/null); rc=$?
     if [[ "$rc" -eq 1 ]]; then
         pass_count=$((pass_count+1))
-        echo "PASS: scenario 3 (live agent=$SELF_AGENT → rc=1 ALIVE)"
+        echo "PASS: scenario 3 (bound agent=$SELF_AGENT role=$role → rc=1 not-dead)"
     else
         failures=$((failures+1))
-        echo "FAIL: scenario 3 expected rc=1 (alive), got rc=$rc — heartbeat may not be fresh; stdout=$out"
+        echo "FAIL: scenario 3 expected rc=1 (not dead), got rc=$rc — role=$role; stdout=$out"
     fi
 
-    # JSON validation: dead=false AND state_running=true (since we ARE running)
-    if echo "$out" | py -3 -c "
-import json, sys
+    # JSON validation: dead=false always; state_running mirrors the observed
+    # agent-state; heartbeat_stale=false only where a heartbeat is owed (reducer).
+    if echo "$out" | EXPECT_RUNNING="$expect_running" py -3 -c "
+import json, os, sys
 d = json.loads(sys.stdin.read())
 assert d.get('dead') is False, f'expected dead=false, got {d.get(\"dead\")}'
 conds = d.get('conditions', {})
-assert conds.get('state_running') is True, f'expected state_running=true, got {conds.get(\"state_running\")}'
-# heartbeat_stale should be false (heartbeat fresh for live runner)
-assert conds.get('heartbeat_stale') is False, f'expected heartbeat_stale=false, got {conds.get(\"heartbeat_stale\")}'
+expect_running = os.environ['EXPECT_RUNNING'] == 'True'
+assert conds.get('state_running') is expect_running, f'expected state_running={expect_running}, got {conds.get(\"state_running\")}'
+if expect_running:
+    # heartbeat_stale should be false (heartbeat fresh for a live reducer)
+    assert conds.get('heartbeat_stale') is False, f'expected heartbeat_stale=false, got {conds.get(\"heartbeat_stale\")}'
 " 2>/dev/null; then
         pass_count=$((pass_count+1))
-        echo "PASS: scenario 3 (JSON: dead=false, state_running=true, heartbeat_stale=false)"
+        if [[ "$expect_running" == "True" ]]; then
+            echo "PASS: scenario 3 (JSON: dead=false, state_running=true, heartbeat_stale=false)"
+        else
+            echo "PASS: scenario 3 (JSON: dead=false, state_running=false — $role, nothing to recover)"
+        fi
     else
         failures=$((failures+1))
-        echo "FAIL: scenario 3 JSON validation failed. stdout=$out"
+        echo "FAIL: scenario 3 JSON validation failed (role=$role, expected state_running=$expect_running). stdout=$out"
     fi
 else
-    echo "SKIP: scenario 3 (no MIND_AGENT in parent env — live-runner test requires bound session)"
+    echo "SKIP: scenario 3 (no MIND_AGENT in parent env — bound-agent test requires a bound session)"
 fi
 
 # ─── Scenario 4: JSON output structure (general) ───────────────────────

@@ -62,38 +62,60 @@ if [ "$STALE" = "1" ]; then
     #   COMPACT          — full canonical compact for Python consumers
     #                      (precheck-eval, findings-gate, etc. read directly).
     #                      No token cap; can grow large.
-    #   COMPACT_SUMMARY  — trimmed projection for LLM Read-tool consumption
-    #                      (~25k-token cap). Drops completed-non-recurring
-    #                      goals and prunes verbose fields.  (bravo
+    #   COMPACT_SUMMARY  — BOUNDED projection for LLM Read-tool consumption.
+    #                      Excludes terminal-status non-recurring goals, prunes
+    #                      verbose fields, and then enforces a hard BYTE BUDGET
+    #                      derived from the Read-tool cap.  (bravo
     #                      session 59 iter-18): full compact grew to 297KB
     #                      organically as 972 completed-non-recurring goals
     #                      accumulated across active aspirations; LLM Read of
-    #                      the full file failed at 123K tokens. Summary is
-    #                      ~57KB / ~24K tokens, under cap.
+    #                      the full file failed at 123K tokens.
+    #
+    # THE 2026-08-11 REGRESSION () AND WHY THE BOUND MOVED. The
+    # original projection's only bound was "drop completed-non-recurring +
+    # keep 15 fields", which is not a bound at all over a monotonically
+    # growing store: the summary reached 672,651 B, 2.57x the 262,144 B cap,
+    # so the caller contract ("IF path returned: Read it") could not complete.
+    # Field-trimming cannot fix that — id+title+status ALONE measured
+    # 360,889 B (1.38x cap) — so the projection is now row-budgeted, and the
+    # budget is a FRACTION OF THE CAP rather than a constant tuned to today's
+    # corpus, which is what makes it survive future growth.
+    #
+    # The projection moved OUT of this heredoc into _compact_summary.py. It
+    # lived here for months at 2.5x the cap precisely because a heredoc cannot
+    # be imported, so it could carry no regression test; the pin now lives in
+    # tests/test_compact_summary_budget.py.
+    #
     # indent=None + tight separators preserved (: indent=2 inflated
-    # 234KB → 335KB purely via whitespace). SSOT for both files.
+    # 234KB → 335KB purely via whitespace). SSOT for the FULL compact.
+    #
+    # Paths are passed via argv, never interpolated into the Python source
+    # (guard-165).
     python3 -c "
 import json, sys
-SUMMARY_KEEP = {'id','title','status','priority','category','skill','recurring','interval_hours','lastAchievedAt','participants','blocked_by','deferred_until','defer_reason','depends_on','started'}
+sys.path.insert(0, sys.argv[5])
+from _compact_summary import build_summary
 w = json.load(open(sys.argv[1]))
 a = json.load(open(sys.argv[2]))
 merged = w + a
-# Full canonical compact
+# Full canonical compact — no cap; Python consumers read THIS file.
 with open(sys.argv[3], 'w', encoding='utf-8') as fh:
     json.dump(merged, fh, indent=None, separators=(',', ':'), ensure_ascii=True)
-# LLM-facing summary projection
-summary = []
-for asp in merged:
-    new_asp = {k: v for k, v in asp.items() if k != 'goals'}
-    new_asp['goals'] = [
-        {k: v for k, v in g.items() if k in SUMMARY_KEEP}
-        for g in asp.get('goals', [])
-        if not (g.get('status') == 'completed' and not g.get('recurring'))
-    ]
-    summary.append(new_asp)
+# LLM-facing bounded projection.
+summary, stats = build_summary(merged)
 with open(sys.argv[4], 'w', encoding='utf-8') as fh:
     json.dump(summary, fh, indent=None, separators=(',', ':'), ensure_ascii=True)
-" "$COMPACT.tmp.w" "$COMPACT.tmp.a" "$COMPACT.tmp" "$COMPACT_SUMMARY.tmp"
+# Announce omissions on stderr. A projection that truncates quietly reads as a
+# complete portfolio, which is worse than one that is loudly partial.
+if stats['goals_omitted_for_budget']:
+    sys.stderr.write(
+        '[load-aspirations-compact] summary is BOUNDED: %d of %d eligible goals omitted '
+        'to stay under the %d-byte budget (Read cap %d). Dropped by tier: %s. '
+        'Per-aspiration counts are inline as goals_omitted. The FULL corpus is in %s.\n'
+        % (stats['goals_omitted_for_budget'], stats['goals_eligible'],
+           stats['budget_bytes'], stats['read_tool_cap'],
+           json.dumps(stats['dropped_by_tier'], sort_keys=True), sys.argv[6]))
+" "$COMPACT.tmp.w" "$COMPACT.tmp.a" "$COMPACT.tmp" "$COMPACT_SUMMARY.tmp" "$CORE_ROOT/scripts" "$COMPACT"
     mv "$COMPACT.tmp" "$COMPACT"
     mv "$COMPACT_SUMMARY.tmp" "$COMPACT_SUMMARY"
     rm -f "$COMPACT.tmp.w" "$COMPACT.tmp.a"

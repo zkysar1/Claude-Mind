@@ -1,0 +1,271 @@
+"""strategic_focus: one-sided-key preservation + a set_at that actually moves.
+
+g-115-5294. TWO defects, deliberately pinned in ONE file because they are NOT
+independent: preserving one-sided keys while set_at stays frozen means a
+preserved key is chosen by JSON string comparison rather than recency, so a test
+suite that covered only one half would certify a fix that still loses edits.
+
+  DEFECT 1  coordination_merge._merge_strategic_focus did `out = dict(win)`,
+            taking the winner's keys alone, so a key carried only by the LOSER
+            was silently dropped.
+  DEFECT 2  team-state.py cmd_update never bumped strategic_focus.set_at, while
+            _merge_strategic_focus orders on it. Live team-state carried set_at
+            2026-07-04T13:45:00 against a `primary` amended 2026-08-03, so a
+            cross-box merge saw EQUAL timestamps and fell through to
+            _order_by_ts's _canon content tiebreak. The amendment survived by
+            being the LONGER string. guard-1153 permits LWW only on a timestamp
+            written by the same mutation that writes the field.
+
+TESTED AS A PROPERTY, NOT AS THE KNOWN INSTANCE (guard-3080). The bad instance
+was "an amendment lost to a stale stamp"; the properties are "a one-sided key
+survives", "the winner's value wins including an explicit None", "a write bumps
+the stamp", and "recency beats string length". A test keyed to the specific
+2026-08-03 amendment would pass against a fix that only special-cased it.
+
+WHY THE PRE-EXISTING SUITE DID NOT CATCH DEFECT 1:
+test_coordination_merge.py::test_ts_acknowledged_by_and_completions_union
+asserts ONLY the acknowledged_by union, which the broken `dict(win)` code
+satisfies — acknowledged_by was the one key it unioned. Both sides of that
+test's strategic_focus carry identical key SETS, so no key is ever one-sided and
+the defect is unreachable from it. Every merge-side test below was confirmed RED
+against `out = dict(win)`.
+"""
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+import yaml
+
+CORE_SCRIPTS = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(CORE_SCRIPTS))
+
+import coordination_merge as cm  # noqa: E402
+
+TEAM_STATE_PY = CORE_SCRIPTS / "team-state.py"
+
+_BASE = {
+    "last_updated": None, "last_updated_by": None,
+    "strategic_focus": {"primary": None, "set_at": None, "acknowledged_by": []},
+    "active_blockers": [], "recent_completions": [], "agent_status": {},
+    "critical_blockers": [], "inbox_alert_backlog": None,
+}
+
+
+def _ts(**kw) -> bytes:
+    base = dict(_BASE)
+    base.update(kw)
+    return yaml.dump(base, default_flow_style=False, sort_keys=False).encode()
+
+
+def _focus(a: bytes, b: bytes) -> dict:
+    return yaml.safe_load(cm.merge_team_state(a, b).decode())["strategic_focus"]
+
+
+# --- DEFECT 1: the merge preserves one-sided keys ---------------------------
+
+def test_loser_only_key_survives():
+    """THE defining property. RED against `out = dict(win)`."""
+    a = _ts(strategic_focus={"primary": "newer", "set_at": "2026-08-03T10:00:00",
+                             "acknowledged_by": []})
+    b = _ts(strategic_focus={"primary": "older", "set_at": "2026-07-04T13:45:00",
+                             "rationale": "only-on-the-loser",
+                             "acknowledged_by": []})
+    m = _focus(a, b)
+    assert m["primary"] == "newer", "the newer set_at must still win the shared key"
+    assert m.get("rationale") == "only-on-the-loser", \
+        "a key carried only by the LOSER must survive the merge"
+
+
+def test_winner_value_wins_on_a_shared_key():
+    """Preservation must not invert into loser-wins. Guards the other direction:
+    a naive `dict(lose); update(...)` with the operands swapped would pass the
+    test above and fail this one."""
+    a = _ts(strategic_focus={"primary": "newer", "set_at": "2026-08-03T10:00:00",
+                             "rationale": "from-winner", "acknowledged_by": []})
+    b = _ts(strategic_focus={"primary": "older", "set_at": "2026-07-04T13:45:00",
+                             "rationale": "from-loser", "acknowledged_by": []})
+    assert _focus(a, b)["rationale"] == "from-winner"
+
+
+def test_winner_explicit_none_is_not_backfilled_from_the_loser():
+    """"Clearing" writes a None VALUE to a key that remains present. If the merge
+    treated None as absent and backfilled it, a cleared field would resurrect —
+    which is precisely the guard-1816 hazard this handler was audited against."""
+    a = _ts(strategic_focus={"primary": None, "set_at": "2026-08-03T10:00:00",
+                             "acknowledged_by": []})
+    b = _ts(strategic_focus={"primary": "stale-value",
+                             "set_at": "2026-07-04T13:45:00",
+                             "acknowledged_by": []})
+    assert _focus(a, b)["primary"] is None, \
+        "a deliberately cleared field must not be resurrected by the loser"
+
+
+def test_acknowledged_by_union_is_not_regressed():
+    a = _ts(strategic_focus={"primary": "X", "set_at": "2026-07-02T09:00:00",
+                             "acknowledged_by": ["echo"]})
+    b = _ts(strategic_focus={"primary": "X", "set_at": "2026-07-02T09:00:00",
+                             "rationale": "one-sided", "acknowledged_by": ["zeta"]})
+    m = _focus(a, b)
+    assert m["acknowledged_by"] == ["echo", "zeta"]
+    assert m.get("rationale") == "one-sided"
+
+
+# --- commutativity + convergence (verification outcome 3) ------------------
+
+def test_commutative_with_a_one_sided_key():
+    a = _ts(last_updated="2026-08-03T10:00:00",
+            strategic_focus={"primary": "newer", "set_at": "2026-08-03T10:00:00",
+                             "acknowledged_by": ["echo"]})
+    b = _ts(last_updated="2026-07-04T13:45:00",
+            strategic_focus={"primary": "older", "set_at": "2026-07-04T13:45:00",
+                             "rationale": "loser-only", "acknowledged_by": ["zeta"]})
+    assert cm.merge_team_state(a, b) == cm.merge_team_state(b, a)
+
+
+def test_multiround_convergence():
+    """Re-merging a merged result against either operand is a fixed point, so
+    repeated cross-box syncs cannot oscillate."""
+    a = _ts(last_updated="2026-08-03T10:00:00",
+            strategic_focus={"primary": "newer", "set_at": "2026-08-03T10:00:00",
+                             "acknowledged_by": ["echo"]})
+    b = _ts(last_updated="2026-07-04T13:45:00",
+            strategic_focus={"primary": "older", "set_at": "2026-07-04T13:45:00",
+                             "rationale": "loser-only", "acknowledged_by": ["zeta"]})
+    ab = cm.merge_team_state(a, b)
+    assert cm.merge_team_state(ab, a) == ab
+    assert cm.merge_team_state(ab, b) == ab
+    assert cm.merge_team_state(ab, ab) == ab
+
+
+# --- DEFECT 2: the writer bumps set_at -------------------------------------
+
+def _run(world: Path, *args: str) -> subprocess.CompletedProcess:
+    env = os.environ.copy()
+    env["MIND_AGENT"] = "alpha"
+    env["MIND_WORLD"] = str(world)
+    # guard-955: pinned explicitly rather than relying on the conftest autouse
+    # fixture. On an own-cloud box a subprocess inheriting the backend derives
+    # its S3 key from customer_prefix+env_id+filename — NOT from MIND_WORLD —
+    # so a tmp-world write would land on the production key.
+    env["STORAGE_BACKEND"] = "local"
+    return subprocess.run([sys.executable, str(TEAM_STATE_PY), *args],
+                          capture_output=True, text=True, env=env, timeout=60)
+
+
+@pytest.fixture()
+def world(tmp_path: Path) -> Path:
+    w = tmp_path / "world"
+    w.mkdir()
+    r = _run(w, "init")
+    assert r.returncode == 0, r.stderr
+    return w
+
+
+def _read_focus(world: Path) -> dict:
+    return (yaml.safe_load((world / "team-state.yaml").read_text(encoding="utf-8"))
+            or {}).get("strategic_focus") or {}
+
+
+def test_writing_primary_bumps_set_at(world: Path):
+    """THE defining property for defect 2. RED before the fix."""
+    r = _run(world, "update", "--field", "strategic_focus.set_at",
+             "--value", "2026-07-04T13:45:00")
+    assert r.returncode == 0, r.stderr
+    r = _run(world, "update", "--field", "strategic_focus.primary",
+             "--value", "amended directive")
+    assert r.returncode == 0, r.stderr
+    f = _read_focus(world)
+    assert f["primary"] == "amended directive"
+    assert f["set_at"] != "2026-07-04T13:45:00", \
+        "amending primary must bump set_at, or the merge orders on a frozen stamp"
+    assert f["set_at"] > "2026-07-04T13:45:00"
+
+
+def test_explicit_set_at_write_is_respected(world: Path):
+    """The escape hatch: a migration restating a historical stamp must not be
+    clobbered by an auto-bump."""
+    r = _run(world, "update", "--field", "strategic_focus.set_at",
+             "--value", "2026-07-04T13:45:00")
+    assert r.returncode == 0, r.stderr
+    assert _read_focus(world)["set_at"] == "2026-07-04T13:45:00"
+
+
+def test_unrelated_field_does_not_bump_set_at(world: Path):
+    """Negative control. Without it, a bump applied unconditionally on every
+    core-file write would pass every other test in this section."""
+    r = _run(world, "update", "--field", "strategic_focus.set_at",
+             "--value", "2026-07-04T13:45:00")
+    assert r.returncode == 0, r.stderr
+    r = _run(world, "update", "--field", "inbox_alert_backlog", "--value", "7")
+    assert r.returncode == 0, r.stderr
+    assert _read_focus(world)["set_at"] == "2026-07-04T13:45:00", \
+        "a write outside strategic_focus must leave its stamp alone"
+
+
+# --- the two defects are coupled ------------------------------------------
+
+def test_amendment_made_through_the_writer_wins_the_merge(world: Path):
+    """THE COUPLING TEST, and it must go through the WRITER to be worth anything.
+
+    An earlier draft of this test supplied both set_at values directly in YAML.
+    It passed — and it passed under BOTH mutations, because hand-written stamps
+    exercise only _order_by_ts, which already preferred recency before this fix.
+    Its docstring claimed to be the coupling test while guarding nothing
+    (guard-1793: a test whose subject is not on the path under test is vacuous no
+    matter how green it reads).
+
+    So: amend `primary` via the real CLI, take the team-state it produced, and
+    merge it against a stale document whose primary is deliberately the LONGER
+    string. Under a frozen stamp the two stamps compare EQUAL and the _canon
+    tiebreak hands the win to the longer stale side. Only a stamp the writer
+    actually moved lets recency decide. RED under M2."""
+    stale_stamp = "2026-07-04T13:45:00"
+    r = _run(world, "update", "--field", "strategic_focus.set_at",
+             "--value", stale_stamp)
+    assert r.returncode == 0, r.stderr
+    r = _run(world, "update", "--field", "strategic_focus.primary",
+             "--value", "short amendment")
+    assert r.returncode == 0, r.stderr
+
+    amended = (world / "team-state.yaml").read_bytes()
+    amended_focus = _read_focus(world)
+
+    # The stale side must carry the SAME KEY SET as the writer's output, with
+    # only `primary` longer. A second draft of this test hand-built a 3-key stale
+    # side against the writer's richer document, so _canon — which compares the
+    # WHOLE sub-document, not just primary — favoured the amendment on KEY COUNT.
+    # It went green under M2 for a reason unrelated to what it asserts. Mirroring
+    # the key set is what makes the tiebreak turn on primary length alone.
+    # _canon orders LEXICOGRAPHICALLY, not by length — a fact worth stating
+    # because 's description says the amendment "wins by being longer",
+    # and length is not what decides it. A first draft used a long primary
+    # starting with "a", which sorts BELOW "short amendment" and so failed to set
+    # up the adverse case at all; the assertion below caught that. "zzz" is
+    # chosen to sort ABOVE the amendment.
+    stale_focus = dict(amended_focus)
+    stale_focus["primary"] = (
+        "zzz stale directive that wins the canonical-JSON tiebreak by sorting "
+        "above the amendment")
+    stale_focus["set_at"] = stale_stamp
+    stale = _ts(strategic_focus=stale_focus)
+
+    # Guard the guard: confirm the tiebreak really would favour the stale side,
+    # so a future edit cannot quietly reduce this to a no-op again.
+    assert cm._canon(stale_focus) > cm._canon(amended_focus), \
+        "fixture no longer sets up the adverse tiebreak this test depends on"
+
+    assert _focus(amended, stale)["primary"] == "short amendment"
+    assert _focus(stale, amended)["primary"] == "short amendment"
+
+
+def test_equal_stamps_still_tiebreak_deterministically():
+    """The frozen-stamp path is not removed, only escaped: two genuinely
+    simultaneous writes must still converge to the same winner on both boxes."""
+    a = _ts(strategic_focus={"primary": "aaa", "set_at": "2026-08-03T09:00:00",
+                             "acknowledged_by": []})
+    b = _ts(strategic_focus={"primary": "zzz", "set_at": "2026-08-03T09:00:00",
+                             "acknowledged_by": []})
+    assert _focus(a, b) == _focus(b, a)

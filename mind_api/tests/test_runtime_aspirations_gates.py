@@ -473,3 +473,122 @@ def test_capability_skips_structured_defer_prefixes(running_daemon,
         f"capability gate must NOT be invoked for structured prefix; "
         f"got {called['n']} invocation(s)"
     )
+
+
+# ---------------------------------------------------------------------------
+# residual-work gate (update-goal status -> completed,  Layer B/D)
+# ---------------------------------------------------------------------------
+
+def _pass_prior_completion_gates(aspirations_write_module, monkeypatch):
+    """The uncommitted-work and completion-artifact gates run before the
+    residual gate on the completed path — force both to pass so these tests
+    exercise the residual gate alone (its own logic is covered in
+    core/tests/gates/test_residual_work_gate.py)."""
+    monkeypatch.setattr(
+        aspirations_write_module, "_uncommitted_work_eval",
+        lambda **kw: {"would_block": False, "dirty_framework_files": []})
+    monkeypatch.setattr(
+        aspirations_write_module, "_completion_artifact_eval",
+        lambda **kw: {"would_block": False, "missing_artifacts": [],
+                      "near_misses": {}, "checked_paths": 0,
+                      "goal_id": kw.get("goal_id"),
+                      "override_applied": None, "skipped_reason": None})
+
+
+def test_residual_work_only_fires_on_completed(running_daemon,
+                                               aspirations_write_module,
+                                               monkeypatch):
+    """Setting status to in-progress must NOT call the residual gate."""
+    _, port = running_daemon
+    _seed_goal(port)
+    called = {"n": 0}
+
+    def _track(**kw):
+        called["n"] += 1
+        return {"would_block": False, "matched_markers": []}
+
+    monkeypatch.setattr(aspirations_write_module,
+                        "_residual_work_eval", _track)
+
+    code, _ = _update_goal(port, "g-001-50", "status", "in-progress")
+    assert code == 200
+    assert called["n"] == 0, "residual gate must not fire for non-completed transitions"
+
+
+def test_residual_blocks_files_successor_then_citation_passes(
+        running_daemon, aspirations_write_module, monkeypatch):
+    """End-to-end Layer B + D against the REAL gate: a residual-marker
+    outcome_note blocks the close AND files a successor atomically; a retry
+    without citing dedups (no second successor); citing the filed id then
+    passes accept path 1."""
+    _, port = running_daemon
+    _seed_goal(port)
+    _pass_prior_completion_gates(aspirations_write_module, monkeypatch)
+
+    code, _ = _update_goal(
+        port, "g-001-50", "outcome_note",
+        "Premises validated; verification criteria written. "
+        "No product code was written this pass.")
+    assert code == 200
+
+    # First close attempt: 400 + successor filed under the same lock.
+    code, body = _update_goal(port, "g-001-50", "status", "completed")
+    assert code == 400
+    err = json.loads(body)
+    assert err["error"] == "residual_work_blocked"
+    assert err["gate"] == "residual-work-gate"
+    assert "no_code_written" in err["gate_output"]["matched_markers"]
+    filed_id = err["filed_successor_id"]
+    assert filed_id, f"expected a filed successor, got: {err}"
+    assert err["successor_filing_status"] == "filed"
+
+    # Second attempt without citing: still 400, dedup skips a second filing.
+    code, body = _update_goal(port, "g-001-50", "status", "completed")
+    assert code == 400
+    err2 = json.loads(body)
+    assert err2["filed_successor_id"] is None
+    assert "idempotent skip" in err2["successor_filing_status"]
+    assert filed_id in err2["successor_filing_status"]
+
+    # Cite the filed carrier -> accept path 1 -> the close passes.
+    code, _ = _update_goal(
+        port, "g-001-50", "outcome_note",
+        f"Premises validated; verification criteria written. No product "
+        f"code was written this pass. Residual carried by {filed_id}.")
+    assert code == 200
+    code, body = _update_goal(port, "g-001-50", "status", "completed")
+    assert code == 200, f"citing the live successor must pass: {body}"
+
+
+def test_residual_override_header_passes(running_daemon,
+                                         aspirations_write_module,
+                                         monkeypatch):
+    """X-Mind-Override-Residual lifts the block (real gate)."""
+    _, port = running_daemon
+    _seed_goal(port)
+    _pass_prior_completion_gates(aspirations_write_module, monkeypatch)
+
+    code, _ = _update_goal(
+        port, "g-001-50", "outcome_note",
+        "Spec only — the implementation phrase is quoted from the incident.")
+    assert code == 200
+    code, body = _update_goal(
+        port, "g-001-50", "status", "completed",
+        headers={"X-Mind-Override-Residual": "marker false-positive"})
+    assert code == 200, body
+
+
+def test_residual_clean_outcome_note_passes(running_daemon,
+                                            aspirations_write_module,
+                                            monkeypatch):
+    """A fully-executed outcome_note sails through the real gate."""
+    _, port = running_daemon
+    _seed_goal(port)
+    _pass_prior_completion_gates(aspirations_write_module, monkeypatch)
+
+    code, _ = _update_goal(
+        port, "g-001-50", "outcome_note",
+        "Implemented, tested (36/36), committed as abc1234; suite green.")
+    assert code == 200
+    code, body = _update_goal(port, "g-001-50", "status", "completed")
+    assert code == 200, body

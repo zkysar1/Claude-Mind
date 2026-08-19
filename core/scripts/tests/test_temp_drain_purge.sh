@@ -511,6 +511,51 @@ else
 fi
 rm -rf "$SYNTH3"
 
+echo "class-wide cited exemption (g-001-84):"
+# The over-broad sentinel above is necessary but NOT sufficient: '*.raw' does not
+# match the sentinel, so it passed through and exempted ALL 84 aged .raw files on
+# cc-03 (would_purge reported 0 against the dir the lane exists to drain). The
+# discriminator is the literal STEM — a family names artifacts an author made,
+# a stemless pattern names a whole file CLASS. Both directions are asserted here:
+# rejecting every glob would delete the 7 legitimately-cited families.
+SYNTH4="$(mktemp -d)"
+printf 'x\n' > "$SYNTH4/dump.raw"
+printf 'x\n' > "$SYNTH4/mergeback-a.raw"
+printf 'x\n' > "$SYNTH4/unrelated.jsonl"
+touch -d '200 minutes ago' "$SYNTH4"/*
+# NEGATIVE: a stemless class pattern is dropped — the whole extension still purges.
+PURGE_FIND_PRED=(); _purge_find_predicate 120 '*.raw' 2>/dev/null
+g6="$(find "$SYNTH4" "${PURGE_FIND_PRED[@]}" 2>/dev/null | sed 's#.*/##' | sort | tr '\n' ' ')"
+if [ "$g6" = "dump.raw mergeback-a.raw unrelated.jsonl " ]; then
+  echo "  [PASS] class-wide '*.raw' dropped — the .raw class still purges"
+else
+  echo "  [FAIL] class-wide '*.raw' honored, .raw class shielded: got '$g6'"; fails=$((fails+1))
+fi
+# POSITIVE CONTROL: a stem-bearing family wildcard over the SAME extension is honored.
+PURGE_FIND_PRED=(); _purge_find_predicate 120 'mergeback-*' 2>/dev/null
+g7="$(find "$SYNTH4" "${PURGE_FIND_PRED[@]}" 2>/dev/null | sed 's#.*/##' | sort | tr '\n' ' ')"
+if [ "$g7" = "dump.raw unrelated.jsonl " ]; then
+  echo "  [PASS] stem-bearing 'mergeback-*' still exempts its family (not a blanket glob ban)"
+else
+  echo "  [FAIL] family wildcard over a purgeable extension was dropped: got '$g7'"; fails=$((fails+1))
+fi
+if _purge_find_predicate 120 '*.raw' 2>&1 >/dev/null | grep -q 'class-wide'; then
+  echo "  [PASS] class-wide exemption warns on stderr (never silent)"
+else
+  echo "  [FAIL] class-wide exemption dropped SILENTLY"; fails=$((fails+1))
+fi
+# '*.*' reaches THIS branch, not the sentinel: the sentinel string carries no dot,
+# so '*.*' never matched it and was honored outright before the stem test existed.
+# Pinned separately from '*' because they take different branches ( review).
+PURGE_FIND_PRED=(); _purge_find_predicate 120 '*.*' 2>/dev/null
+g8="$(find "$SYNTH4" "${PURGE_FIND_PRED[@]}" 2>/dev/null | sed 's#.*/##' | sort | tr '\n' ' ')"
+if [ "$g8" = "dump.raw mergeback-a.raw unrelated.jsonl " ]; then
+  echo "  [PASS] '*.*' dropped — the sentinel never covered it, the stem test does"
+else
+  echo "  [FAIL] '*.*' honored, lane shielded: got '$g8'"; fails=$((fails+1))
+fi
+rm -rf "$SYNTH4"
+
 echo "cited-set lookup contract (g-306-111):"
 # UNKNOWN must be distinguishable from EMPTY, or a box with an unreadable world
 # purges everything. The missing-script case is the hermetic proxy for that.

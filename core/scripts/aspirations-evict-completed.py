@@ -30,18 +30,59 @@ WHAT IS EVICTED
       than --age-days ago (default 45 — well beyond completion-report lookback
       (~7d), reflection lookback, and trajectory's velocity window (last 5), so
       no record-consumer loses signal it actually uses)
+      ⚠ THAT DERIVATION IS ABOUT THE DEFAULT AND THE FLEET DOES NOT RUN THE
+      DEFAULT. The shipped cadence is age_days: 3 (operator-approved "go 3",
+      2026-08-14; core/config/aspirations.yaml § aspirations_eviction), which is
+      INSIDE the ~7d completion-report lookback this sentence relies on — and the
+      margin was never re-derived when the threshold moved 15x tighter. Measured
+      2026-08-18 (alpha, cc-04): terminal non-recurring goals in the live store
+      bucket 194/447/113/54 at ages 0/1/2/3d and then EXACTLY ZERO from day 4,
+      while non-terminal goals (which eviction never touches) tail smoothly to
+      99d. agent-completion-report step 2 filters goal RECORDS on `completed_at
+      >= since`, so any report window wider than ~3d under-reports. The other two
+      consumers named above (reflection lookback, trajectory velocity window) are
+      UNCHECKED. Tracked by g-115-6659 — do not treat this parenthetical as a
+      standing safety guarantee at the deployed value.
+      SELF-RETIRING: this block restates a value it does not own (the SSOT is
+      core/config/aspirations.yaml § aspirations_eviction), so it is subject to
+      the very drift guard-4282 describes. Its invalidation condition is written
+      into it: if age_days is ever raised above the ~7d lookback, the tension
+      described here no longer exists — DELETE this block rather than updating
+      the number, and re-derive the margin against whatever the new value is.
   Recurring goals, live work (pending/blocked/in-progress), and recently-terminal
   goals are NEVER evicted. Undateable goals are conservatively SKIPPED (never
   evicted on a guess).
 
 WHERE THE RECORDS GO
-  The full records remain recoverable from the .history snapshot that
-  locked_modify_jsonl takes automatically immediately before the write. We do NOT
+  Out of the live list, and NOT re-homed anywhere queryable by id. We do NOT
   append individual goal records to aspirations-archive.jsonl: that file holds
   whole-ASPIRATION records (each line a nested {id, goals:[...]}), and the cadence
   checks count it by iterating each line's `goals`. Writing goal-shaped lines
   there would be invisible to that count and would require a non-atomic two-file
-  write. Census + .history is simpler and crash-atomic (one locked write).
+  write. What IS retained is the per-status census + evicted-id set, which is what
+  every completion consumer actually reads (see _goal_census.py). Census is
+  simpler and crash-atomic (one locked write).
+
+  DO NOT read .history as a record-recovery path. locked_modify_jsonl does take a
+  snapshot immediately before the write, but it is a whole-FILE blob keyed by
+  write TIME with no goal-id index, under tiered retention (<=7d keep all, 8-30d
+  latest-per-day, 31+ latest-per-week) — and `census_is_legacy_blind` below
+  records evicted-id recovery from it as infeasible in practice. An earlier
+  version of this paragraph claimed the opposite ("the full records remain
+  recoverable from the .history snapshot"); measured 2026-08-11, that sentence
+  sent an investigation hunting a store that cannot answer the question.
+
+  CONSEQUENCE — A GOAL ID IS EPHEMERAL BY DESIGN. It stops resolving ~45 days
+  after the goal goes terminal AT THIS SCRIPT'S DEFAULT; at the cadence the fleet
+  actually runs (age_days: 3) the fuse is ~3 DAYS, which makes everything below
+  15x more urgent rather than less — the 39% figure was measured against the 45d
+  horizon and is a FLOOR, not a ceiling. Only recurring and non-terminal goals
+  persist indefinitely. So do not cite goal ids in PERMANENT artifacts (code comments,
+  rules, conventions) as if they were durable references — cite the append-only
+  stores instead (rb-NNN / guard-NNN), which nothing evicts. Measured 2026-08-11:
+  of 3432 distinct goal ids cited across core/ + .claude/ + CLAUDE.md, 1357 (39%)
+  already resolve to nothing, and the remainder are on the same rolling fuse.
+  (This paragraph cites dates rather than goal ids on purpose.)
 
 SAFETY
   - Routes through _fileops.locked_modify_jsonl -> DDB lock (cross-machine mutex)
@@ -130,6 +171,54 @@ def _eligible(goal: dict, cutoff: datetime) -> bool:
 _GOAL_SEQ_RE = re.compile(r"^g-(\d+)-(\d+)(-[a-z])?$")
 
 
+def _asp_num(asp) -> str:
+    """The numeric part of an aspiration id ( -> '335'), or None when the
+    id is not of that shape. None means UNSCOPED matching in `_parse_seq_id`,
+    which is `_conservation_violation`'s long-standing contract; all 19 live
+    aspiration ids match `^asp-\\d+$`, so the unscoped branch is unreachable on
+    real data and is pinned as such in test_capacity_suffix_parity.py."""
+    aid = str(asp.get("id", "") if isinstance(asp, dict) else "")
+    return aid[len("asp-"):] if aid.startswith("asp-") else None
+
+
+def _parse_seq_id(gid, asp_num):
+    """THE parser for the sequence-space goal-id grammar. Returns
+    (seq:int, is_suffixed:bool) for an id belonging to this aspiration's
+    sequence space, else None.
+
+    SINGLE SOURCE OF TRUTH, and that is the entire point (g-115-3868). This file
+    used to carry FOUR readings of one grammar: `_GOAL_SEQ_RE` here,
+    a `rstrip("a-z")` heuristic in `_capacity`, and a naive `startswith(prefix)`
+    in BOTH `_audit_violations` and `_repair`. g-115-4270 patched the rstrip half
+    to also strip a trailing hyphen — which fixed the live symptom and left the
+    divergence standing. Measured 2026-08-10 over 7,213 live ids: the two parsers
+    now agree on 100% of them, and still disagree on `12a`, `12ab` and `12-ab`,
+    where the heuristic counted and the regex skipped.
+
+    The naive prefix match was the other half of the apples-to-oranges the
+    original incident named: `in_list` counted the four `g-335-262-a..d` legs
+    while capacity did not, so the two sides of the pigeonhole inequality were
+    computed off different id sets. Both sides now come from here, so an id
+    contributes to BOTH sides or to NEITHER — which is what makes a false
+    violation unconstructable rather than merely absent today.
+
+    Ids outside the grammar (`g-xw-<ts>-NN` cross-world ids, foreign prefixes,
+    `g-NNN-12-a-b`) are deliberately outside BOTH sides."""
+    m = _GOAL_SEQ_RE.match(str(gid or ""))
+    if not m or (asp_num is not None and m.group(1) != asp_num):
+        return None
+    return int(m.group(2)), bool(m.group(3))
+
+
+def _in_list_sequence_goals(asp) -> int:
+    """Count of live goals inside this aspiration's sequence space — the left
+    side of the pigeonhole inequality, read through `_parse_seq_id` so it can
+    never disagree with `_capacity` about which ids exist."""
+    asp_num = _asp_num(asp)
+    return sum(1 for g in (asp.get("goals") or [])
+               if _parse_seq_id((g or {}).get("id"), asp_num) is not None)
+
+
 def _legacy_census_loose(asp: dict, in_list: int, capacity: int) -> bool:
     """: is the pigeonhole capacity a KNOWN-loose lower bound here?
 
@@ -180,17 +269,18 @@ def _conservation_violation(asp: dict):
     # Effective census (legacy counts + evicted-id set, ).
     census_sum = sum(census_by_status(asp).values())
     asp_id = str(asp.get("id", ""))
-    asp_num = asp_id[len("asp-"):] if asp_id.startswith("asp-") else None
+    asp_num = _asp_num(asp)
     max_seq = 0
     suffixed = 0
     counted = 0
     for g in goals:
-        m = _GOAL_SEQ_RE.match(str((g or {}).get("id") or ""))
-        if not m or (asp_num is not None and m.group(1) != asp_num):
+        parsed = _parse_seq_id((g or {}).get("id"), asp_num)
+        if parsed is None:
             continue
+        seq, is_suffixed = parsed
         counted += 1
-        max_seq = max(max_seq, int(m.group(2)))
-        if m.group(3):
+        max_seq = max(max_seq, seq)
+        if is_suffixed:
             suffixed += 1
     # Recorded evicted ids are real minted allocations — count their seqs toward
     # capacity (NOT toward counted: they are census-side, not in-list). Without
@@ -201,11 +291,12 @@ def _conservation_violation(asp: dict):
     for gid in all_evicted_ids(asp):
         if gid in live_id_set:
             continue
-        m = _GOAL_SEQ_RE.match(gid)
-        if not m or (asp_num is not None and m.group(1) != asp_num):
+        parsed = _parse_seq_id(gid, asp_num)
+        if parsed is None:
             continue
-        max_seq = max(max_seq, int(m.group(2)))
-        if m.group(3):
+        seq, is_suffixed = parsed
+        max_seq = max(max_seq, seq)
+        if is_suffixed:
             suffixed += 1
     if max_seq == 0:
         return None
@@ -290,34 +381,29 @@ def _capacity(asp) -> int:
     g-115-1936's independent completions-delta cross-check confirmed that excess
     is genuine phantom, not hidden high-seq eviction. (g-115-1951 / g-115-1938
     conservation canary)"""
-    prefix = str(asp.get("id", "")).replace("asp-", "g-", 1) + "-"   #  -> g-249-
+    # : reads the grammar through `_parse_seq_id`, the file's ONE
+    # parser. This function used to carry its own `rstrip("a-z")` heuristic —
+    # the second of four readings — which is what produced the opposite-verdict
+    # incident: on  the evict guard `_conservation_violation` (regex,
+    # suffix-aware) computed capacity 622 and passed, while `_audit_violations`
+    # (this heuristic) computed 618 and reported a 4-goal "CONSERVATION
+    # VIOLATION". Same aspiration, same data, opposite verdicts (rb-301), and
+    # the audit's remediation is `--repair-census --apply`, which SHRINKS a
+    # correct census to satisfy an undercounted ceiling — with
+    # `true_evicted_max: -4`, a target `_scale_by_status` turns into a census
+    # WIPE, not a shrink.  patched the heuristic; this removes it.
+    asp_num = _asp_num(asp)
     live_ids = [str(g.get("id", "")) for g in asp.get("goals", []) or []]
     max_seq = 0
     suffixed = 0
     for gid in dict.fromkeys(live_ids + all_evicted_ids(asp)):  # deduped, ordered
-        if not gid.startswith(prefix):
+        parsed = _parse_seq_id(gid, asp_num)
+        if parsed is None:
             continue
-        tail = gid[len(prefix):]
-        num = tail.rstrip("abcdefghijklmnopqrstuvwxyz")
-        # Both suffix spellings, bare (g-NNN-12a) and HYPHENATED (g-NNN-12-a).
-        # The hyphenated form is the one `_union_goals` actually mints and the
-        # one `_GOAL_SEQ_RE` above matches; this parser accepted only the bare
-        # form, so `262-a` rstripped to `262-`, failed .isdigit(), and the goal
-        # was dropped from BOTH max_seq and suffixed. Two parsers for one id
-        # grammar in one file, disagreeing (rb-301): on  the evict guard
-        # `_conservation_violation` (regex, suffix-aware) computed capacity 622
-        # and passed, while `_audit_violations` (this parser) computed 618 and
-        # reported a 4-goal "CONSERVATION VIOLATION" — opposite verdicts, same
-        # data. That audit line directs the operator to `--repair-census
-        # --apply`, which proportionally SHRINKS a correct census to satisfy the
-        # undercounted ceiling. The tell was `true_evicted_max: -4`, a negative
-        # headroom that no real allocation can produce. ()
-        if num.endswith("-"):
-            num = num[:-1]
-        if num.isdigit():
-            max_seq = max(max_seq, int(num))
-            if tail != num:            # had an alpha suffix
-                suffixed += 1
+        seq, is_suffixed = parsed
+        max_seq = max(max_seq, seq)
+        if is_suffixed:
+            suffixed += 1
     return max_seq + suffixed
 
 
@@ -328,9 +414,11 @@ def _audit_violations(items):
     id-space could ever have held. Sorted by excess desc."""
     out = []
     for asp in items:
-        goals = asp.get("goals", []) or []
-        prefix = str(asp.get("id", "")).replace("asp-", "g-", 1) + "-"
-        in_list = sum(1 for g in goals if str(g.get("id", "")).startswith(prefix))
+        # : both sides of the inequality now read one grammar. This
+        # counted by naive `startswith(prefix)` while `cap` counted by parser,
+        # so a `-a` leg landed on the left side only — the
+        # apples-to-oranges that manufactured the phantom EXCESS.
+        in_list = _in_list_sequence_goals(asp)
         cap = _capacity(asp)
         census_sum = sum(census_by_status(asp).values())
         claimed = in_list + census_sum
@@ -381,13 +469,29 @@ def _make_census_repair(stamp: str):
     partial fix)."""
     def _repair(items):
         for asp in items:
-            goals = asp.get("goals", []) or []
-            prefix = str(asp.get("id", "")).replace("asp-", "g-", 1) + "-"
-            in_list = sum(1 for g in goals if str(g.get("id", "")).startswith(prefix))
+            # : same parser as _audit_violations. These two MUST agree
+            # on in_list — the audit decides WHETHER to repair and this decides
+            # BY HOW MUCH, so a divergence here repairs to a target the
+            # post-repair guard below then rejects, aborting the write.
+            in_list = _in_list_sequence_goals(asp)
             cap = _capacity(asp)
             census_sum = sum(census_by_status(asp).values())  # legacy + ids
             if cap <= 0 or in_list + census_sum <= cap:
                 continue  # no violation — leave untouched
+            # : the SAME suppressor `_audit_violations` applies. Found
+            # while pinning audit/repair parity: this loop lacked it, so an
+            # aspiration the audit deliberately classifies as a KNOWN-LOOSE false
+            # positive (`_legacy_census_loose` — capacity provably undercounts
+            # pre-id-tracking evictions) was repaired anyway. Reachable, because
+            # `main()` gates this whole pass on the audit finding at least one
+            # violation ANYWHERE: one genuine violation elsewhere dragged every
+            # legacy-loose aspiration into a collateral census shrink the audit
+            # had just declared unwarranted. Fewer repairs is the safe direction
+            # — the post-repair guard below reads `_audit_violations`, which
+            # applies this same suppressor, so a skip here can never leave a
+            # survivor.
+            if _legacy_census_loose(asp, in_list, cap):
+                continue
             census = asp.setdefault(CENSUS_KEY, {})
             if not isinstance(census, dict):
                 census = {}
@@ -572,8 +676,10 @@ def main():
             print(f"               by_status {dict(before_bs)} -> {after_bs}")
         if not args.apply:
             print("[repair] DRY-RUN — re-run with --apply to write "
-                  "(prior records recoverable from .history; post-repair audit "
-                  "must be clean or the write aborts).")
+                  "(.history snapshots the WHOLE FILE, so this repair is "
+                  "roll-back-able as a unit — that is NOT per-record recovery, "
+                  "which WHERE THE RECORDS GO retracts as infeasible. "
+                  "Post-repair audit must be clean or the write aborts).")
             return 0
 
         from _fileops import locked_modify_jsonl
@@ -622,8 +728,11 @@ def main():
 
     if not args.apply:
         print(f"[evict] DRY-RUN — no write. Re-run with --apply to evict "
-              f"(projected ~{before_bytes - freed:,} bytes after; full records "
-              f"recoverable from .history; metrics held invariant by census).")
+              f"(projected ~{before_bytes - freed:,} bytes after; metrics held "
+              f"invariant by census). ONE-WAY: evicted goal RECORDS are not "
+              f"re-homed anywhere queryable by id — .history holds a whole-file "
+              f"snapshot with no goal-id index, so it can roll the file back but "
+              f"cannot answer 'what was g-NNN-NN'. See WHERE THE RECORDS GO.")
         return 0
 
     # APPLY: locked read-modify-write (DDB lock + If-Match + .history + canary).

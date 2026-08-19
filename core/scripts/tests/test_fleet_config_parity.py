@@ -1306,5 +1306,57 @@ def test_drift_line_carries_verdict_and_length_but_no_value():
         assert "sk-MUST-NEVER-APPEAR" not in d
 
 
+# ── Agent-less nodes: fleet-agnostic Body boxes () ──────────────────
+# cc-08 hosts a local-paths.conf for ALL FIVE agents and its body-heartbeat carriers
+# name two different ones, so it has no resident agent and its manifest row carries no
+# `agent` key. These three tests guard that shape end to end.
+
+def test_node_label_is_total_over_agent_less_nodes():
+    """_node_label must be total: a node may carry `agent: None` or no `agent` key.
+
+    The second assertion pins WHY the helper exists rather than leaving it to the
+    docstring — the raw form is not merely ugly on an agent-less node, it RAISES, and
+    it raises inside the drift-goal title, i.e. only once drift has been found.
+    """
+    rows = [{"agent": "alpha", "host": "cc-07"},
+            {"agent": None, "host": "cc-08"},
+            {"host": "cc-09"}]
+    assert [fcp._node_label(r) for r in rows] == ["alpha", "cc-08", "cc-09"]
+    with pytest.raises(TypeError):
+        sorted(r["agent"] for r in rows[:2])
+    assert sorted(fcp._node_label(r) for r in rows) == ["alpha", "cc-08", "cc-09"]
+
+
+def test_no_rendering_site_reads_agent_directly():
+    """Structural guard — this is the one that actually protects production.
+
+    The test above exercises expressions; reverting a production line would not fail
+    it. This one reads the module source, so restoring any of the five `r["agent"]`
+    rendering sites fails here.
+    """
+    src = (CORE_SCRIPTS / "fleet_config_parity.py").read_text(encoding="utf-8")
+    offenders = [ln.strip() for ln in src.splitlines() if 'r["agent"]' in ln]
+    assert not offenders, ("node rendering must go through _node_label(r) — an "
+                           "agent-less node makes these raise or print None: %s" % offenders)
+
+
+def test_manifest_body_boxes_do_not_perturb_roster_parity():
+    """The two Body rows must be invisible to _roster_parity, which keys on `agent`.
+
+    cc-07 reuses alpha (already a roster member, so the SET is unchanged) and cc-08
+    carries no `agent` at all (skipped by that function's `if n.get("agent")`). If
+    cc-08 ever gained a placeholder agent name, _roster_parity would emit a permanent
+    INFO calling it a retired node — false, and it trains readers to skim INFO lines.
+    """
+    yaml = pytest.importorskip("yaml")
+    manifest = yaml.safe_load(
+        (CORE_SCRIPTS.parent / "config" / "fleet-manifest.yaml").read_text(encoding="utf-8"))
+    nodes = manifest["nodes"]
+    assert {n.get("agent") for n in nodes if n.get("agent")} == {
+        "alpha", "bravo", "echo", "zeta", "foxtrot"}
+    assert [n["host"] for n in nodes if not n.get("agent")] == ["cc-08"]
+    assert {n["host"] for n in nodes} >= {"cc-07", "cc-08"}
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

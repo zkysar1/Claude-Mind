@@ -30,6 +30,11 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pathlib
+import sys as _sys
+_sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+import _verify_corpus  # noqa: E402
+
 
 def _find_repo_root() -> Path:
     here = Path(__file__).resolve()
@@ -53,7 +58,7 @@ def _vl_case_names() -> set:
     DRIVES the dynamic RP-presence grep (authoritative enforcement)."""
     m = re.search(
         r'case\s+"\$name"\s+in\s+([a-z0-9|\-]+)\)\s*continue',
-        VL.read_text(encoding="utf-8"),
+        _verify_corpus.corpus_text(),  # corpus, not the file ()
     )
     assert m, 'case "$name" in ...) continue arm not found in verify-learning SKILL.md'
     return set(m.group(1).split("|"))
@@ -63,7 +68,7 @@ def _vl_loop_names() -> set:
     """The ``for s in <names>; do grep -q ...`` MISSING_IN_RP_RULE loop."""
     m = re.search(
         r'for s in ([a-z0-9 \-]+);\s*do grep -q',
-        VL.read_text(encoding="utf-8"),
+        _verify_corpus.corpus_text(),  # corpus, not the file ()
     )
     assert m, "for s in ...; do grep -q loop not found in verify-learning SKILL.md"
     return set(m.group(1).split())

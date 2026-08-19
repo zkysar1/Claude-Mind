@@ -219,7 +219,8 @@ Read hypothesis process_score (if populated by /review-hypotheses Step 4.1):
 ```
 
 **For CONFIRMED (confirmed hypotheses):**
-- If `dual_classification == lucky_confirmed`: LOW PRIORITY extraction — the reasoning was flawed despite confirmed outcome. Create reasoning bank entry but tag `confidence: low`, add note: "Lucky confirmed — do not reinforce this reasoning pattern"
+- If `dual_classification == lucky_confirmed`: evaluate the SOUND-METHOD OVERRIDE (next bullet) FIRST. If the override FIRES: treat this record as `earned_confirmed` — run the full Strategy Validation step below, do NOT downgrade priority, and do NOT attach the "do not reinforce" note; record which discriminator fired. If the override does NOT fire: LOW PRIORITY extraction — the reasoning was flawed despite confirmed outcome. Create reasoning bank entry but tag `confidence: low`, add note: "Lucky confirmed — do not reinforce this reasoning pattern"
+  - **SOUND-METHOD OVERRIDE (guard-3427)** — `lucky_confirmed` is derived in Step 7.6c from the outcome and `confidence < 0.60` ALONE. It is a CONFIDENCE PROXY and cannot observe whether the METHOD was well-formed, so "the reasoning was flawed" above is an inference from that proxy, never a finding. This is the CONFIRMED-side twin of guard-2724, and the two are deliberately ASYMMETRIC because their errors are: a wrong `unlucky_corrected` suppresses a guardrail (a missing defense, eventually noticed), whereas a wrong `lucky_confirmed` stamps "do not reinforce" onto a method that WORKED — poisoning a validated strategy in a way nothing downstream will ever contradict. So this override is biased toward NOT attaching the note. Read the record's `outcome_detail`, `resolution_method`, and `measurement_channel` — the same three fields guard-2724 reads — and answer four questions: (a) was the `measurement_channel` pre-registered and CONCRETE (it names a specific store, path, query, or file) rather than chosen at resolution time? (b) does `outcome_detail` record a validity check — scan/population completeness, a positive control, an independent verifier — rather than only the verdict? (c) was a precondition the claim named actually gated before resolving? (d) did the resolver separate the CRITERION from the MECHANISM (guard-2727) instead of stopping at "the threshold was met"? If ANY answer shows positive evidence of soundness, the override FIRES — the method was sound and low confidence was calibrated conservatism, not luck. Attach the note ONLY when none of the four shows such evidence. MEASURED 3 of 3: `2026-08-04_widened-dispatch-surfaces-daemon-findings` (conf 0.40; explicit pre-mortem, a NAMED counter-mechanism priced at -0.15, a calibration gate it deliberately came in under); `2026-07-29_usage-lane-coverage-stays-thin` (conf 0.55; concrete pre-registered scan channel, Count 3 / ScannedCount 3955 completeness recorded, and `outcome_detail` goes on to ask which narrowing dominates — discriminator (d)); `2026-08-05_warned-budget-trap-reaches-implementer` (conf 0.55; a THREE-surface pre-registered channel, verified by a DIFFERENT agent than the implementer, precondition gated before resolving). Every one would have been poisoned by the literal branch. Trace + the goal-selector scoring consumer (`lucky_confirmed: +0.5`, so the misread is not confined to reflection): guard-3427.
 - Otherwise (earned_confirmed or unclassified): Strategy Validation step:
   1. Identify the key reasoning that led to the confirmed hypothesis
   2. Extract transferable reasoning chain (what steps were decisive?)
@@ -1307,9 +1308,13 @@ If new category detected without tree node:
   Add to _tree.yaml unmapped_categories
   Invoke /tree maintain (check if SPROUT needed)
 For each leaf node updated during this reflection:
-  line_count = count lines in node .md body (excluding YAML front matter)
-  If line_count > decompose_threshold AND depth < D_max:
-    bash core/scripts/tree-update.sh --set <node-key> growth_state ready_to_decompose
+  Decompose is STRUCTURAL, not line-count (g-306-13; board msg-20260619-075228-bravo-086).
+  Do NOT compute a line count and do NOT set growth_state ready_to_decompose:
+  tree.py get_decompose_candidates selects on leaves-under-node >
+  K_max^(D_retrieval-1) and never reads decompose_threshold, so a line-count
+  flag is INERT — it writes a field no reader acts on. Ask the tool instead:
+    bash core/scripts/tree-read.sh --decompose-candidates
+    If the node is listed: Invoke /tree maintain
   Elif article_count crossed split_threshold:
     bash core/scripts/tree-update.sh --set <node-key> growth_state ready_to_split
 If any growth_state changed OR unmapped_categories added:

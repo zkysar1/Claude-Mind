@@ -51,19 +51,44 @@ def is_dead_entry(
     min_retrievals: int,
     min_age_days: int,
     today: date,
+    counters=None,
 ) -> bool:
     """True iff ``rec`` is a heavily-retrieved, never-helpful, aged entry — the
     active-forgetting retirement criterion.
 
     Pure: ``today`` (a ``datetime.date``) is caller-supplied, so the function
     reads no wall-clock and is fully deterministic given its inputs.
+
+    ``counters`` (g-358-05) is the caller-supplied sidecar map, id -> counters.
+    It is a PARAMETER rather than a load precisely to keep the purity contract
+    above: this module resolves no path and does no I/O, and it is the shared
+    seam ``memevo_bench`` evaluates, so a load here would make the governance
+    eval depend on the live filesystem. Default None => read the embedded field,
+    which is byte-identical to pre-seam behaviour.
+
+    THIS IS THE HIGHEST-CONSEQUENCE JOIN IN THE SPLIT. Once the writer lands,
+    the embedded field is a frozen pre-split snapshot: an entry whose counters
+    have since moved would be judged on stale zeros and RETIRED while live.
+    Retirement is a write, so getting this one wrong loses knowledge rather than
+    merely misreporting it.
     """
     if rec.get("status") != "active":
         return False
     # Already pending retirement (or in some other lifecycle state).
     if rec.get("retirement_date"):
         return False
-    util = rec.get("utilization") or {}
+    if counters:
+        # Deferred import, and deliberately inside the `counters` branch. At
+        # module scope this would resolve WORLD_DIR at import time and break the
+        # no-path-resolution contract for every caller including memevo_bench;
+        # here it runs only when a caller has already imported the seam to build
+        # `counters`, so the module is in sys.modules and the import is free.
+        # Reusing `utilization_of` rather than re-typing its sidecar-wins
+        # precedence keeps one implementation of that rule (guard-2676).
+        from _utilization_store import utilization_of as _uo
+        util = _uo(rec, counters)
+    else:
+        util = rec.get("utilization") or {}
     rc = util.get("retrieval_count", 0) or 0
     helpful = util.get("times_helpful", 0) or 0
     cited = util.get("times_cited", 0) or 0

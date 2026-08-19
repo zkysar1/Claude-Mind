@@ -38,7 +38,7 @@ except ImportError:
     print("PyYAML required: pip install pyyaml", file=sys.stderr)
     sys.exit(1)
 
-from _paths import PROJECT_ROOT
+from _paths import resolve_file_path
 
 # Match channel scores for ranking (higher = more relevant)
 CHANNEL_SCORES = {
@@ -254,7 +254,17 @@ def build_concept_index(nodes):
         file_path = node.get("file")
         if not file_path:
             continue
-        md_path = PROJECT_ROOT / file_path
+        # `file` in _tree.yaml is VIRTUAL-prefixed ("world/knowledge/tree/...").
+        # It must go through the canonical resolver: under .mind-data storage
+        # WORLD_DIR is PROJECT_ROOT/.mind-data/world, so PROJECT_ROOT/world/
+        # does not exist and a bare join resolved 0 of 1363 node bodies —
+        # parse_front_matter's exists() gate then returned {} for every node and
+        # this index built from nothing, silently disabling Strategy 4 (the only
+        # token-level natural-language path into the tree). guard-132; the same
+        # resolver tree.py has used all along. Do NOT reintroduce PROJECT_ROOT
+        # here — the failure is silent, because an empty index and a genuinely
+        # entity-less corpus produce identical output.
+        md_path = resolve_file_path(file_path)
         fm = parse_front_matter(md_path)
 
         # confidence/capability_level are NOT read from .md — they live

@@ -118,7 +118,8 @@ def _fmt_age(delta):
 
 def decide_liveness(last_active_iso, fresh_signal_iso, threshold_hours=DEFAULT_THRESHOLD_HOURS, now=None,
                     retired_entry=None, authoritative_last_active_iso=None,
-                    authoritative_provenance=None):
+                    authoritative_provenance=None, row_updated_by=None,
+                    row_agent=None):
     """Pure liveness decision.
 
     Returns a dict: {verdict, reason, signal, last_active_age_min, fresh_age_min,
@@ -149,6 +150,13 @@ def decide_liveness(last_active_iso, fresh_signal_iso, threshold_hours=DEFAULT_T
     mirror. Only ``PROV_LOCAL_MIRROR`` changes behavior (degrade to unknown);
     None and PROV_AUTHORITATIVE are treated identically, so every pre-g-306-138
     caller stays byte-identical.
+
+    ``row_updated_by`` / ``row_agent`` (g-115-6410) are the shard row's last
+    WRITER and the row's OWN agent. When they differ, every freshness signal
+    this function receives was produced by that OTHER agent's write, so none of
+    them can certify the subject alive — see the cross-stamp guard below. Both
+    default to None, and an unknown ``row_agent`` disqualifies nothing, so every
+    pre-existing caller stays byte-identical.
     """
     if now is None:
         raise ValueError("now must be supplied (kept explicit for testability)")
@@ -192,6 +200,60 @@ def decide_liveness(last_active_iso, fresh_signal_iso, threshold_hours=DEFAULT_T
                            "life here: the shard survives retirement and the retirement write "
                            "itself refreshes it."),
                 **base}
+
+    # A ROW STAMPED BY ANOTHER AGENT CANNOT CERTIFY ITS OWN SUBJECT ALIVE
+    # (g-115-6410, guard-3604). team-state-clear-in-flight.sh sets
+    # `last_active = now` and then stamps `row_updated_by = <the clearer>`
+    # (_team_state.make_clear_in_flight_modifier -> stamp_row_metadata), so
+    # policing a DORMANT peer's stranded claim makes that peer read fresh for a
+    # full threshold window. Measured 2026-08-13 on echo: dormant at 419.1min ->
+    # alive at 1.8min, row_updated_by=bravo, echo never having woken; and
+    # 2026-08-16, foxtrot dead 11.64h while reading alive.
+    #
+    # THE BUMP IS DELIBERATE AND IS NOT THE THING TO FIX. Shard merges are
+    # whole-snapshot LWW on `last_active`, so an unstamped pop loses the merge
+    # and RESURRECTS the cleared claim. The write is correct; what is wrong is
+    # reading its side effect as evidence about the subject.
+    #
+    # WHY THIS DISQUALIFIES EVERY SIGNAL AND NOT MERELY THE FAST PATH. Measured
+    # on this goal before writing the fix: disqualifying only the fast path and
+    # falling through to the authoritative read still returns ALIVE, because the
+    # bumped value is precisely what that read returns — it must reach the store
+    # to win the LWW merge. The verdict merely moves from signal=last_active to
+    # signal=authoritative_last_active, and gets WORSE: provenance goes null ->
+    # "authoritative", erasing the `provenance: null` tell guard-3604 names as
+    # the self-concealing signature, under a reason string that then asserts
+    # "the mind is running". The shard OBJECT time is the same writer's push, so
+    # it is tainted too. All three inputs trace to one foreign write.
+    #
+    # UNKNOWN, never dormant: the peer may well be alive, and "dormant" is the
+    # one verdict goal-selector._liveness_confirms_dormant acts on, so a false
+    # dormant would leak an active agent's routed goals cross-agent. Unknown
+    # degrades toward goals-stay-routed, the same fail-safe direction as every
+    # other cannot-verify branch here.
+    #
+    # SCOPED TO FRESHNESS ON PURPOSE. A cross-stamp only ever manufactures a
+    # FALSE ALIVE; it cannot manufacture a false dormant. So an OLD stamp whose
+    # signals have all aged out is harmless and must keep reaching the dormant
+    # conclusion below — otherwise policing a peer once would render it
+    # permanently unjudgeable. Self-healing: the owner's next heartbeat stamps
+    # `row_updated_by` back to itself and the fast path returns.
+    cross_stamped = bool(row_updated_by) and bool(row_agent) and row_updated_by != row_agent
+    if cross_stamped:
+        fresh_signals = [n for n, a in (("last_active", la_age),
+                                        ("authoritative_last_active", ala_age),
+                                        ("fresh_signal", fs_age))
+                         if a is not None and a <= thr]
+        if fresh_signals:
+            return {"verdict": "unknown", "signal": None,
+                    "reason": (f"row was last written by '{row_updated_by}', not by '{row_agent}' — "
+                               f"the fresh signal(s) {', '.join(fresh_signals)} are an artifact of "
+                               f"that agent's write (a cross-agent in_flight clear bumps the CLEARED "
+                               f"row's last_active), not evidence '{row_agent}' is running; cannot "
+                               "verify, do NOT conclude alive. Read a signal with an INDEPENDENT "
+                               "writer (execution-diary.jsonl, working-memory.yaml) for real liveness "
+                               "inside this window"),
+                    **base}
 
     # Fast path: a fresh last_active is sufficient (common case, no fresh-signal
     # fetch needed by the caller).
@@ -400,6 +462,41 @@ def fetch_retirement_tombstone(agent, world_dir):
         return None
 
 
+def fetch_row_stamp(agent, world_dir):
+    """The shard row's ``row_updated_by`` (last writer), or None (g-115-6410).
+
+    Feeds ``decide_liveness``'s cross-stamp guard. Deliberately a LOCAL shard
+    read and NOT a store read: the whole point of the fast path is that a
+    same-agent row costs no authoritative fetch, so paying an S3 round-trip to
+    decide whether we may take the fast path would spend exactly what the fast
+    path exists to save. Same file, same fail-open posture, and the same
+    read-through-cache caveat as ``fetch_retirement_tombstone`` above.
+
+    COHERENT WITH ``--last-active`` BY CONSTRUCTION, which matters because the
+    guard compares a stamp against a timestamp and a split-brain pair would
+    make it meaningless. The wrapper's ``last_active`` comes from
+    ``team-state-read.sh``, whose composition (``_team_state.load_rows``) reads
+    these same local shard files without re-fetching — so both fields come off
+    one snapshot. Verified 2026-08-17: composed ``agent_status.echo.row_updated_by``
+    and the local ``echo.yaml`` agree.
+
+    Both failure directions are acceptable, which is why fail-open is safe here.
+    A local mirror BEHIND the store hides a cross-stamp -> today's behavior, no
+    worse. AHEAD of it -> an extra "unknown" -> goals stay routed. Neither can
+    manufacture a false ALIVE, and the second self-heals on the owner's next
+    heartbeat.
+    """
+    shard = os.path.join(world_dir, "team-state", "agents", f"{agent}.yaml")
+    try:
+        import yaml
+        with open(shard, "r", encoding="utf-8") as fh:
+            entry = yaml.safe_load(fh) or {}
+        val = entry.get("row_updated_by")
+        return str(val) if val else None
+    except Exception:  # noqa: BLE001 — fail-open, never block a liveness read
+        return None
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Liveness verdict combining last_active + an inherently-fresh signal.")
     ap.add_argument("--agent", required=True)
@@ -437,13 +534,24 @@ def main(argv=None):
     # an agent retired moments ago still has a fresh last_active.
     retired_entry = fetch_retirement_tombstone(args.agent, args.world_dir)
 
+    # Same reasoning, same cost, for the cross-stamp guard: a row stamped by
+    # another agent reads FRESH, so this must be available precisely on the
+    # fast path it disqualifies (g-115-6410). The fetch gate above deliberately
+    # stays unchanged — a cross-stamped fresh row returns "unknown" from the
+    # guard before ala/fs are consulted, so it still pays no store read.
+    row_stamp = fetch_row_stamp(args.agent, args.world_dir)
+
     result = decide_liveness(args.last_active, fresh_iso, args.threshold_hours, now=now,
                              retired_entry=retired_entry,
                              authoritative_last_active_iso=auth_la_iso,
-                             authoritative_provenance=auth_la_prov)
+                             authoritative_provenance=auth_la_prov,
+                             row_updated_by=row_stamp, row_agent=args.agent)
     result["agent"] = args.agent
     result["fresh_signal_iso"] = fresh_iso
     result["authoritative_last_active_iso"] = auth_la_iso
+    # Surfaced alongside the other raw inputs so a --json consumer can audit the
+    # cross-stamp verdict structurally instead of parsing it out of `reason`.
+    result["row_updated_by"] = row_stamp
     # authoritative_last_active_provenance is NOT set here: decide_liveness now
     # carries it in `base` for every verdict, so re-writing it would be a second
     # source of truth for the same field.

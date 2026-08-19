@@ -144,7 +144,8 @@ _TERMINAL_STATUSES = ("completed", "skipped", "expired")
 def _goal_live_status(goal_id, source):
     """Resolve an anchored goal's LIVE status. Returns a dict; NEVER raises.
 
-    Keys: `status` (str|None), `checked` (bool), `ambiguous` (bool), `note`.
+    Keys: `status` (str|None), `checked` (bool), `ambiguous` (bool), `note`,
+    `defer_reason` (str|None).
 
     `checked` is the load-bearing field, and it is why this returns a dict
     rather than a bare status string. "I read the queue and the goal is live"
@@ -171,13 +172,18 @@ def _goal_live_status(goal_id, source):
     bash-agent-inject's PATH shim and outside the daemon's env (guard-1097),
     so shelling out is the fragile path here, not the robust one.
     """
-    result = {"status": None, "checked": False, "ambiguous": False, "note": ""}
+    result = {"status": None, "checked": False, "ambiguous": False, "note": "",
+              "defer_reason": None}
     if not goal_id or goal_id == "?":
         result["note"] = "no goal_id on the checkpoint"
         return result
 
-    def _status_in(path):
-        """(found, status) for goal_id in one aspirations.jsonl. None on error."""
+    def _goal_in(path):
+        """The goal dict for goal_id in one aspirations.jsonl.
+
+        {} = queue read cleanly, id absent. None = unreadable (distinct, and the
+        distinction is the whole reason `checked` exists).
+        """
         try:
             if path is None or not path.exists():
                 return None
@@ -192,24 +198,39 @@ def _goal_live_status(goal_id, source):
                     continue
                 for goal in (asp.get("goals") or []):
                     if goal.get("id") == goal_id:
-                        return (goal.get("status") or "").strip().lower()
-            return ""          # queue read cleanly, id absent
+                        return goal
+            return {}          # queue read cleanly, id absent
         except Exception:
             return None        # unreadable — distinct from absent
 
+    def _status_of(goal):
+        if goal is None:
+            return None
+        return (goal.get("status") or "").strip().lower()
+
     world_path = (WORLD_DIR / "aspirations.jsonl") if WORLD_DIR else None
     agent_path = AGENT_DIR / "aspirations.jsonl"
-    world_status = _status_in(world_path)
-    agent_status = _status_in(agent_path)
+    world_goal = _goal_in(world_path)
+    agent_goal = _goal_in(agent_path)
+    world_status = _status_of(world_goal)
+    agent_status = _status_of(agent_goal)
 
     source = (source or "world").strip().lower()
     primary = world_status if source == "world" else agent_status
+    primary_goal = world_goal if source == "world" else agent_goal
     if primary is None:
         result["note"] = f"{source} queue unreadable — status not checked"
         return result
 
     result["checked"] = True
     result["status"] = primary or None
+    # : the field that distinguishes "in flight" from "deliberately
+    # parked" WITHOUT the status changing. A deferred goal stays `pending`, so a
+    # status-only check reports it resumable — and that is the path that produced
+    # this defect's first incident (defer on cc-04, ). The second
+    # incident's release-then-skip half was terminal and already caught.
+    if primary_goal:
+        result["defer_reason"] = (primary_goal.get("defer_reason") or "").strip() or None
     if world_status and agent_status:
         result["ambiguous"] = True
         result["note"] = (f"id exists in BOTH queues "
@@ -248,6 +269,40 @@ def _format_iteration_ckpt_block(iter_ckpt):
     live = _goal_live_status(goal_id, iter_ckpt.get("source"))
     is_terminal = live["checked"] and live["status"] in _TERMINAL_STATUSES
 
+    # : NOT-IN-FLIGHT WITHOUT BEING TERMINAL. The terminal branch below
+    # () covers completed/skipped/expired, which caught zeta's
+    # release-then-SKIP but missed both of the paths this goal was filed about:
+    # a DEFER leaves status `pending` with a defer_reason, and a bare RELEASE
+    # leaves status `pending` with claimed_by cleared. A status-only check calls
+    # both resumable and emits the full CRITICAL imperative on them.
+    #
+    # Requires `checked` — an unreadable queue must never manufacture this — and
+    # `not ambiguous`, because when the id lives in both queues the fields read
+    # here may belong to the other copy, and a confident "not in flight" about
+    # the wrong goal is worse than the ambiguity note the reader already gets.
+    #
+    # FAIL-SAFE DIRECTION: claimed_by is written BY the claim that writes this
+    # very checkpoint, so `checked and claimed_by is None` means the claim was
+    # given back. The risk of wrongly suppressing a live resume is bounded by
+    # that ordering; the risk of NOT suppressing is a confident instruction to
+    # redo work that was deliberately routed away.
+    #
+    # SCOPED TO defer_reason ON PURPOSE. The obvious sibling predicate — "status
+    # is live but claimed_by is empty, so the claim was released" — was written,
+    # measured against this module's own axis-2 contract test, and REMOVED. It
+    # fires on every pending/in-progress/blocked goal whose record simply has no
+    # claim field, which is not a stale anchor at all: a worker hands its goal to
+    # the reducer at in-progress with the claim released (worker-loop Phase 4),
+    # and stranded-claim-sweep strips claim fields by design. An absent field is
+    # not evidence of an event. defer_reason IS positive evidence, and the
+    # released case does not need a read-side predicate anyway — release is a
+    # chokepoint and now clears the anchor itself.
+    stale_reason = None
+    if (live["checked"] and not is_terminal and not live["ambiguous"]
+            and live["defer_reason"]):
+        stale_reason = (f"it is DEFERRED (status '{live['status']}', "
+                        f"defer_reason: {live['defer_reason']})")
+
     if is_terminal:
         # The one branch that must NOT tell the model to resume. An in-flight
         # assertion about a closed goal is self-falsifying, and the previous
@@ -266,6 +321,26 @@ def _format_iteration_ckpt_block(iter_ckpt):
             "ACTION: ignore the goal named above, and re-run "
             "/aspirations precheck + select to pick fresh work. Do NOT execute "
             f"{goal_id} and do NOT write an outcome_note onto that record.",
+        ])
+    elif stale_reason:
+        # Deliberately worded differently from the terminal branch. That goal is
+        # CLOSED and must not be touched; this one is live work that simply is
+        # not in flight here — it may be selected again on its merits, and
+        # telling you never to execute it would be its own wrong instruction.
+        out.extend([
+            "",
+            f"STALE ANCHOR — DO NOT RESUME FROM IT. This checkpoint names "
+            f"{goal_id}, but {stale_reason}.",
+            "No exit path cleared the anchor at the time this one was written "
+            "(g-115-4990); aspirations-release.sh now clears it via "
+            "`loop-state-save.sh clear --if-goal`, so an anchor still standing "
+            "here came from a path that does not route through release — the "
+            "skip path is the known one.",
+            "ACTION: re-run /aspirations precheck + select to pick fresh work. "
+            f"Do NOT resume {goal_id} from this anchor. If the selector offers "
+            "it again on its own merits, that is a normal selection and fine — "
+            "what is not fine is treating this anchor as evidence it was "
+            "in flight.",
         ])
     else:
         out.extend([

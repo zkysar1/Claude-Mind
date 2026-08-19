@@ -74,6 +74,15 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 import yaml  # noqa: E402
 
+# wm.py is importable by name (no hyphen) and four sibling CLI scripts already
+# import it this way — goal-selector.py, compact-restore-slots.py,
+# precompact-checkpoint.py, infra-health.py. Import rather than re-implement:
+# `enforce_slot_limit` is the eviction POLICY, and a second copy here is exactly
+# the drift this goal () exists to close. wm.py guards its CLI behind
+# `if __name__ == "__main__"`, so importing it has no side effects, and it never
+# imports body-merge back (verified — the only mentions there are comments).
+import wm  # noqa: E402
+
 
 def _load_body_manifest():
     """Load the hyphen-named body-manifest.py (not importable by name).
@@ -134,11 +143,34 @@ def _content_hash(item) -> str:
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()
 
 
-def _dedup_append(reducer_list: list, body_list: list) -> list:
+def _dedup_append(reducer_list: list, body_list: list, extra_seen=None) -> list:
     """Union: keep all reducer items (in order), append body items not already
-    present by content hash. Reducer order is preserved; new body items follow."""
+    present by content hash. Reducer order is preserved; new body items follow.
+
+    `extra_seen` is an OPTIONAL iterable of content hashes to treat as already
+    present even though they are not in `reducer_list`. It exists because the
+    live-slot dedup basis is destroyed by the one operation the protocol
+    mandates: CONSUMPTION.
+
+    THE BUG IT CLOSES (g-306-310 measured it, g-306-311 fixes it): dedup keys on
+    the reducer's CURRENT slot contents, so a consumed-and-cleared slot has an
+    EMPTY basis, and source Bodies retain their entries indefinitely and re-offer
+    the full set on the next close. Suppression held only while the entries were
+    still sitting in the slot -- so clearing the slot is precisely what
+    re-delivers it. That is why four closed drain trackers never found it: the
+    CRASH case (reducer still holds the items) dedups correctly and is the case
+    everyone tested.
+
+    Callers that can supply a durable consumed-watermark pass it here; callers
+    that cannot pass nothing and get the previous behaviour byte-for-byte. It is
+    opt-in specifically so the semantics of every OTHER array slot in the WM
+    merge do not move (guard-2485 -- a shared helper must not average away the
+    context one call site carries and the others do not).
+    """
     out = list(reducer_list)
     seen = {_content_hash(x) for x in reducer_list}
+    if extra_seen:
+        seen.update(extra_seen)
     for x in body_list:
         h = _content_hash(x)
         if h not in seen:
@@ -240,6 +272,45 @@ def merge_wm(reducer: dict, body: dict, baseline: dict | None = None) -> dict:
             m_slots[sk] = b_val
     merged["slots"] = m_slots
 
+    # Enforce array_limits on the MERGED slots (). Cap enforcement used
+    # to exist only on the APPEND path (wm.py cmd_append + its daemon mirror
+    # wm_write.py::append_slot), but generalize-down is how a worker Body's
+    # capture entries actually reach a reducer's WM, and that path is THIS merge,
+    # not append. So every cap declared in memory-pipeline.yaml was unapplied to
+    # the traffic that fills these lanes: measured 2026-08-17 on the reducer,
+    # spark_capture 69 against cap 50 and exp_capture 40 against cap 20, two
+    # independent lanes over by the same mechanism. `git log -S array_limits --
+    # body-merge.py` returns nothing, so this was never a regression — the merge
+    # path simply never enforced. The caps exist per  because these
+    # slots SURVIVE wm-reset and would otherwise grow without bound.
+    #
+    # Policy comes from wm.enforce_slot_limit, never a local copy of the sort —
+    # a second implementation of "which entry dies" is the drift this fixes.
+    # Config is read once for the whole merge rather than per slot.
+    _limits = wm.get_pruning_config(wm.read_config()).get("array_limits", {}) or {}
+    _evicted: dict[str, int] = {}
+    for sk, lim in _limits.items():
+        val = m_slots.get(sk)
+        if isinstance(val, list):
+            n = wm.enforce_slot_limit(val, lim)
+            if n:
+                _evicted[sk] = n
+    if _evicted:
+        # TOP-LEVEL `capture_evictions`, matching cmd_append. It is deliberately
+        # not slot_meta: slot_meta is reducer-wins just below, so a counter there
+        # would be dropped at exactly this step. Merge into whatever the merged
+        # dict already carries (either side may have appended) instead of
+        # overwriting, or a Body's write-path tally is lost the moment it lands.
+        ev = merged.get("capture_evictions")
+        if not isinstance(ev, dict):
+            ev = {}
+        else:
+            ev = dict(ev)
+        for sk, n in _evicted.items():
+            prev = ev.get(sk)
+            ev[sk] = (prev if isinstance(prev, int) else 0) + n
+        merged["capture_evictions"] = ev
+
     # slot_meta: reducer-wins; add Body-only slot metadata so a new Body slot
     # carries its meta forward (else wm.py would synthesize a default on access).
     r_meta = reducer.get("slot_meta") or {}
@@ -270,21 +341,47 @@ def _write_yaml_atomic(path: Path, data: dict) -> None:
     os.replace(tmp, path)
 
 
-def _enumerate_pending(sessions_root: Path, already: set) -> list:
+def _enumerate_pending(sessions_root: Path, already: set, backend=None) -> list:
     """Return [(unitKey, manifest_dict), ...] for closed-pending-merge Bodies
-    not already processed this run. Sorted by unitKey for determinism."""
+    not already processed this run. Sorted by unitKey for determinism.
+
+    CROSS-BOX (g-115-6240): the local dir is only half the truth. A worker Body
+    that SHIPPED from another box has its sessions/<unitKey>/ files in the STORE
+    and nothing on this filesystem, so a local-glob-only enumeration returned
+    zero for every cross-box leg — the NORMAL ship path's half of exactly the
+    defect g-306-187 fixed for the ORPHAN path in this same file, left behind on
+    the sibling call path. UNION the authoritative listing with the local glob
+    (never REPLACE: a local-only fork on THIS box must still drain when the
+    store errors or lags), then read each manifest authoritative-first.
+
+    `.resolve()` is load-bearing — a relative path makes _s3_key raise inside
+    the backend and the listing degrades silently (the _fleet_diary.py lesson).
+    """
     out = []
-    if not sessions_root.is_dir():
-        return out
-    for manifest_path in sorted(sessions_root.glob("*/body-manifest.yaml")):
-        unit_key = manifest_path.parent.name
+    unit_keys: set = set()
+    if sessions_root.is_dir():
+        unit_keys.update(
+            p.parent.name for p in sessions_root.glob(f"*/{bm._MANIFEST_FILENAME}"))
+    if backend is not None:
+        try:
+            unit_keys.update(backend.list_dir(sessions_root.resolve()))
+        except Exception:  # noqa: BLE001 — store listing is additive, never fatal
+            pass
+    for unit_key in sorted(unit_keys):
         if unit_key in already:
             continue
-        try:
-            manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
-        except (OSError, yaml.YAMLError):
+        manifest_path = sessions_root / unit_key / bm._MANIFEST_FILENAME
+        raw, _transient = _read_staged_bytes(backend, manifest_path)
+        if raw is None:
+            # Absent locally AND in the store (or a transport hiccup with no
+            # local copy). A store listing names unit-key dirs that may hold no
+            # manifest at all — skip rather than invent one.
             continue
-        if manifest.get("body_state") == _PENDING_STATE:
+        try:
+            manifest = yaml.safe_load(raw) or {}
+        except yaml.YAMLError:
+            continue
+        if isinstance(manifest, dict) and manifest.get("body_state") == _PENDING_STATE:
             out.append((unit_key, manifest))
     return out
 
@@ -319,6 +416,55 @@ def _get_backend():
         return get_backend()
     except Exception:  # noqa: BLE001 — fail-open to local-only
         return None
+
+
+def _store_has_unit_dirs(backend, sessions_root: Path) -> bool:
+    """True iff the STORE lists any entry under sessions/ ().
+
+    Sole purpose: keep generalize_down's sessions-pass reachable on a reducer
+    whose LOCAL sessions/ dir does not exist because every Body that shipped
+    did so from another box. Deliberately cheap and deliberately loose — it
+    answers "is it worth enumerating?", not "is there a pending Body?"; the
+    real predicate stays in _enumerate_pending, which reads each manifest.
+    Fail-closed to False so a store hiccup degrades to the previous
+    local-only behaviour rather than raising inside the gate.
+    """
+    if backend is None:
+        return False
+    try:
+        return bool(list(backend.list_dir(sessions_root.resolve())))
+    except Exception:  # noqa: BLE001 — absent/erroring store: nothing to add
+        return False
+
+
+def _mark_merged(unit_key: str, agent: str, pr: Path, manifest: dict) -> None:
+    """Set body_state on a Body we just processed, cross-box-safe ().
+
+    bm.set_state reads the LOCAL manifest first, so a Body whose manifest
+    exists ONLY in the store raises FileNotFoundError — which, before this
+    helper, would have escaped generalize_down and aborted the whole merge on
+    precisely the cross-box case the sessions-pass fix exists to serve. We
+    already hold the parsed manifest, so materialize the local mirror from it
+    and retry. Best-effort by contract: a Body whose state cannot be stamped
+    is re-enumerated next run and de-duplicated by content hash, which is far
+    cheaper than losing the merge that already succeeded.
+    """
+    try:
+        bm.set_state(unit_key, agent, _MERGED_STATE, pr)
+        return
+    except FileNotFoundError:
+        pass
+    except Exception:  # noqa: BLE001 — never abort a completed merge on a stamp
+        return
+    try:
+        _, session_dir, _ = bm._agent_paths(agent, unit_key, pr)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        local = dict(manifest)
+        local["body_state"] = _MERGED_STATE
+        (session_dir / bm._MANIFEST_FILENAME).write_text(
+            bm._render_manifest(local), encoding="utf-8")
+    except Exception:  # noqa: BLE001 — best-effort; re-enumeration is the fallback
+        pass
 
 
 def _read_staged_bytes(backend, path: Path):
@@ -645,19 +791,26 @@ def generalize_down(agent: str, project_root: Path | None = None,
         "merged_goal_ids": [],  # : completed goals that arrived from a Body
         "passes": 0,
     }
-    if not sessions_root.is_dir():
-        # No Body ever forked a sessions/<unitKey>/ dir -> skip the sessions-pass,
-        # but still drain staged orphans: their staging dir lives under session/
-        # (not sessions/), so cleanup-stale-bindings can leave staged WMs even
-        # when no sessions/ dir exists. . No sessions-pass ran -> the
-        # already-merged set is empty.
+    # : this gate used to read `if not sessions_root.is_dir()` — a
+    # purely LOCAL probe that short-circuited the entire sessions-pass on any
+    # box whose local sessions/ dir is absent, which is EVERY reducer receiving
+    # a worker that shipped from another box. Backend-routing _enumerate_pending
+    # alone would have left it unreachable behind this line, so the two changes
+    # are one fix and neither works without the other.
+    backend = _get_backend()
+    if not sessions_root.is_dir() and not _store_has_unit_dirs(backend, sessions_root):
+        # No Body ever forked a sessions/<unitKey>/ dir HERE OR IN THE STORE ->
+        # skip the sessions-pass, but still drain staged orphans: their staging
+        # dir lives under session/ (not sessions/), so cleanup-stale-bindings
+        # can leave staged WMs even when no sessions/ dir exists. . No
+        # sessions-pass ran -> the already-merged set is empty.
         _consume_staged(state_dir, reducer_wm_path, summary, set())
         _stamp_merged_goal_ids(reducer_wm_path, pre_goal_ids, summary)
         return summary  # nothing else to merge
 
     already: set = set()
     for _pass in range(max_passes):
-        pending = _enumerate_pending(sessions_root, already)
+        pending = _enumerate_pending(sessions_root, already, backend)
         if not pending:
             break
         summary["passes"] = _pass + 1
@@ -667,32 +820,53 @@ def generalize_down(agent: str, project_root: Path | None = None,
             summary["scanned"] += 1
             already.add(unit_key)
             body_wm_path = sessions_root / unit_key / bm._WM_FILENAME
-            if not body_wm_path.is_file():
+            # : authoritative-first, matching the manifest read above.
+            # A cross-box Body's WM exists ONLY in the store, so a local
+            # is_file() guard here would classify every shipped leg as "never
+            # forked a WM" and MARK IT MERGED — silently destroying exactly the
+            # divergence this pass exists to collect.
+            body_bytes, _bw_transient = _read_staged_bytes(backend, body_wm_path)
+            if _bw_transient:
+                # Transport error hid the store copy and no local copy exists.
+                # Leave the Body PENDING (no set_state) so it retries next run —
+                # consuming bytes we never saw is the one unrecoverable move.
+                if unit_key not in summary["staged_deferred"]:
+                    summary["staged_deferred"].append(unit_key)
+                # MUST drop it from `already`: _consume_staged's Guard 1 DELETES
+                # the staged copy of any unit_key in that set (correct when we
+                # merged it, data loss when we did not). Dropping it also lets
+                # the orphan path deliver the same divergence if it is staged.
+                already.discard(unit_key)
+                continue
+            if body_bytes is None:
                 # Manifest says pending but the Body never forked a WM file
                 # (or it was reaped). Nothing to merge — close it out.
-                bm.set_state(unit_key, agent, _MERGED_STATE, pr)
+                _mark_merged(unit_key, agent, pr, manifest)
                 summary["skipped"].append(unit_key)
                 continue
-            body_bytes = body_wm_path.read_bytes()
             baseline_hash = manifest.get("forked_wm_hash")
             if baseline_hash and hashlib.sha256(body_bytes).hexdigest() == baseline_hash:
                 # Body never diverged from its fork baseline -> no-op merge.
-                bm.set_state(unit_key, agent, _MERGED_STATE, pr)
+                _mark_merged(unit_key, agent, pr, manifest)
                 summary["noop"].append(unit_key)
                 continue
             body_wm = yaml.safe_load(body_bytes) or {}
             if not isinstance(body_wm, dict):
-                bm.set_state(unit_key, agent, _MERGED_STATE, pr)
+                _mark_merged(unit_key, agent, pr, manifest)
                 summary["skipped"].append(unit_key)
                 continue
             # 3-way delta (): load the fork-time baseline if preserved
             # so numeric counters merge by their net divergence from the common
             # ancestor, not a 2-way SUM that double-counts the shared baseline.
             # Absent baseline -> None -> 2-way fallback (backward-compatible).
-            baseline = _read_yaml(sessions_root / unit_key / bm._BASELINE_FILENAME) or None
+            # : authoritative-first like the manifest and WM reads.
+            # Absent everywhere -> None -> the retained 2-way fallback, so a
+            # cross-box leg degrades exactly as a local one always has.
+            baseline = _read_staged_yaml(
+                backend, sessions_root / unit_key / bm._BASELINE_FILENAME)
             reducer_wm = merge_wm(reducer_wm, body_wm, baseline)
             changed = True
-            bm.set_state(unit_key, agent, _MERGED_STATE, pr)
+            _mark_merged(unit_key, agent, pr, manifest)
             summary["merged"].append(unit_key)
         if changed:
             _write_yaml_atomic(reducer_wm_path, reducer_wm)  # copy-back

@@ -206,10 +206,29 @@ def cmd_list(args):
                the manifest itself is ~250 bytes; the user cares about
                the snapshot's logical size, not the manifest's.
     """
-    snapshots = _find_history_snapshots(resolve_target(args.file))
+    target = resolve_target(args.file)
+    snapshots = _find_history_snapshots(target)
     if not snapshots:
-        # Reached only when the path IS under a governed root (resolve_target
-        # exits otherwise), so this is now the one honest empty case.
+        # TWO conditions reach here (): an in-scope path with an
+        # empty store, and an in-scope path that DOES NOT EXIST. Both printed
+        # the same reassuring "No history" at exit 0, so a mistyped path read
+        # as "nothing to lose" — an error condition rendered as data.
+        #
+        # MUST stay byte-identical to the daemon mirror in
+        # mind_api/src/endpoints/history.py::list_versions (guard-1189): the
+        # same message is served over CLI stdout and the HTTP endpoint, so a
+        # transport-specific rewording breaks byte-compat even when the logic
+        # matches.
+        #
+        # The missing-file check sits INSIDE this branch deliberately —
+        # snapshots outlive the file they describe, and a post-delete listing
+        # is exactly what the recovery path needs (measured: a deleted file
+        # still lists its versions at exit 0). Hoisting it above the snapshot
+        # lookup would break that read.
+        if not target.exists():
+            print(f"No history for {args.file} — and the path does not exist",
+                  file=sys.stderr)
+            sys.exit(1)
         print(f"No history for {args.file}")
         return
 

@@ -8,7 +8,7 @@ script preserves the legacy argv shape, stdin JSON contract, output shape,
 and exit codes — subprocess callers in aspirations-execute/SKILL.md Step 2.55
 are unchanged.
 
-Hard check BEFORE writing a new blocker. Catches the five false-positive
+Hard check BEFORE writing a new blocker. Catches the six false-positive
 failure modes:
 
   1. Non-canonical probe (synthetic ssh/curl instead of the skill's
@@ -21,6 +21,11 @@ failure modes:
   5. credentials-required blocker without per-source identity enumeration
      (a self-serviceable grant wrongly routed to a human). Enforces
      guard-1160 / g-248-111.
+  6. credentials-required blocker naming an AWS action without an
+     efs-ssh.sh re-probe. Check 5 passes when the box enumeration is
+     complete and honest -- but the env-server instance profile is a
+     principal NO agent box holds, so local enumeration cannot reach it.
+     Enforces the LAST clause of guard-1160 (g-115-6540).
 
 Exit 1 with a specific reason when any check fails, unless
 `--override-blocker-gate "<justification>"` is passed. The override is

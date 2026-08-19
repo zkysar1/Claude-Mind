@@ -335,6 +335,15 @@ def project(
                 "body": redactor(str(n.get("body") or "")),
                 "parent": str(n.get("parent") or ""),
                 "children": [str(c) for c in (n.get("children") or []) if c],
+                # NOT redacted, like key/parent/children above and unlike the four text
+                # fields — an ISO date carries no secret and no agent name, so passing it
+                # through the redactor would only risk mangling it.
+                # Consumer: a client rendering "what changed since your last visit"
+                # (g-335-1146). No client can compute that without a per-node date,
+                # and the bundle-level generated_at/age_seconds describe the EXPORT, not
+                # the node. Emitted as "" when absent so the field's presence never
+                # implies a real timestamp — a consumer must treat "" as unknown, not old.
+                "last_updated": str(n.get("last_updated") or ""),
             }
         )
     for h in hypotheses:

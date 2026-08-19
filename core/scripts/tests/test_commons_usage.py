@@ -131,12 +131,38 @@ def test_null_attribution_yields_no_event_id(tmp_path):
 
 
 def test_missing_and_malformed_manifests_report_distinctly(tmp_path):
-    """Fail-open, but each cause must be nameable — rb-683: never silent."""
+    """Fail-open, but each cause must be nameable — rb-683: never silent.
+
+    AMENDED g-335-1205. The reader now has TWO sources: the manifest, then the
+    durable `commons-draw-log.jsonl` (the manifest is a single-goal snapshot the
+    daemon rewrites on every retrieval, so it is reliably gone by the time Step
+    1.6 reads it). A genuine miss therefore names BOTH attempts —
+    `<manifest_cause>+draw_ledger:<ledger_cause>` — so `startswith` here, not
+    equality.
+
+    That is a STRENGTHENING of this test's own contract, not a loosening: the
+    manifest cause is still named, and the fallback's outcome is now named too.
+    The extra assertion below pins that second half, so a future change that
+    silently drops the fallback attempt from the note still fails here.
+
+    NEVER RE-PIN THE FULL NOTE (guard-3300). The tail is derived from the
+    RUNTIME ENVIRONMENT — whether `world/commons-draw-log.jsonl` resolves on
+    this box — so equality there goes red on exactly the machines where the
+    ledger is real. Measured 2026-08-13 (alpha, cc-04): the same call returned
+    `no_manifest+draw_ledger:ok` run solo and `no_manifest+draw_ledger:no_draw_ledger`
+    in-suite. Assert the shape, never the value. (Independently converged on by
+    two agents from opposite directions — g-335-1205 forward from the code, and
+    g-115-6134 backward from the red — which is why both halves are kept.)
+    """
     (tmp_path / "session").mkdir(parents=True, exist_ok=True)
-    assert cu.signatures_from_manifest(tmp_path, "g-1")[2] == "no_manifest"
+    note = cu.signatures_from_manifest(tmp_path, "g-1")[2]
+    assert note.startswith("no_manifest"), note
+    assert "draw_ledger:" in note, (
+        f"the fallback attempt must be named too, never silently dropped: {note}")
 
     ad = _manifest(tmp_path, {"something_else": {}})
-    assert cu.signatures_from_manifest(ad, "g-1")[2] == "no_commons_patterns_key"
+    assert cu.signatures_from_manifest(ad, "g-1")[2].startswith(
+        "no_commons_patterns_key")
 
     (tmp_path / "session" / "retrieval-session.json").write_text(
         "{not json", encoding="utf-8")

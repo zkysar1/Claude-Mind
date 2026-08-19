@@ -165,6 +165,30 @@ def cmd_update(args):
             _append_nested(state, field, parsed)
         elif args.operation == "remove":
             _remove_nested(state, field, parsed)
+        #  / guard-1153: strategic_focus is LWW-ordered on set_at by
+        # coordination_merge._merge_strategic_focus, and guard-1153 permits LWW
+        # only on a timestamp written BY THE SAME MUTATION that writes the field.
+        # It was not: live team-state carried set_at 2026-07-04T13:45:00 while
+        # `primary` had been amended 2026-08-03, so a cross-box merge saw EQUAL
+        # timestamps and fell through to _order_by_ts's _canon content tiebreak —
+        # whether the amendment survived was decided by JSON string comparison,
+        # not recency. It happened to win by being longer. Luck, not design.
+        #
+        # The bump lives HERE, not at the call sites, deliberately: every
+        # amendment routes through this one branch, and the 2026-08-03 amendment
+        # forgot the bump precisely because bumping was a caller's job.
+        #
+        # An explicit set_at supplied BY the mutation is respected and never
+        # overwritten — that is the only way to restate a historical stamp
+        # (migrations, backfills).
+        if field == "strategic_focus" or field.startswith("strategic_focus."):
+            mutation_sets_set_at = (
+                field == "strategic_focus.set_at"
+                or (field == "strategic_focus"
+                    and isinstance(parsed, dict) and "set_at" in parsed))
+            if not mutation_sets_set_at:
+                _set_nested(state, "strategic_focus.set_at",
+                            datetime.now().strftime("%Y-%m-%dT%H:%M:%S"))
         # Enforce ring buffer on recent_completions
         if "recent_completions" in state:
             state["recent_completions"] = state["recent_completions"][-MAX_RECENT_COMPLETIONS:]

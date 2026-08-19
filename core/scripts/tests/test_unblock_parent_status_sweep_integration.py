@@ -19,8 +19,12 @@ Lanes:
   1. happy_path: Unblock + parent in terminal state (skipped) -> applied=1,
      status flips to skipped, outcome_note starts with "parent resolved
      without action needed".
-  2. idempotency_already_swept: Unblock with outcome_note already starting
-     with sweep phrase -> applied=0, status preserved.
+  2a. partial_write_is_repaired: Unblock carrying the sweep phrase but a
+     NON-terminal status (the state a failed second write leaves) -> applied=1,
+     status flips to skipped. Self-heals; g-115-5097 inverted this lane, which
+     previously asserted applied=0 and so pinned the defect.
+  2b. fully_swept_not_reprocessed: Unblock with the sweep phrase AND a terminal
+     status -> applied=0, untouched. Carries the no-double-mutate invariant.
   3. parent_pending_not_applied: Unblock + parent.status=pending ->
      candidates=0, applied=0, Unblock untouched.
 
@@ -199,13 +203,22 @@ def test_happy_path_parent_terminal_unblock_marked_skipped():
                 f"outcome_note must cite parent.status=skipped for audit; got {note!r}")
 
 
-def test_idempotency_already_swept_skipped():
-    """Idempotency: Unblock with outcome_note already starting with sweep
-    phrase -> applied=0, status preserved.
+def test_partial_write_is_repaired_not_sealed():
+    """ — END-TO-END self-heal, and this test's ASSERTIONS ARE INVERTED
+    from what they were before that goal.
 
-    This pins _is_already_swept: a re-run of the sweep does NOT double-mutate
-    a previously-swept Unblock. The Unblock stays pending (no second
-    status flip) and outcome_note is not appended/replaced.
+    It previously asserted applied==0 and "status must remain pending" for a
+    note-bearing goal — i.e. it pinned the DEFECT as correct behaviour, and did
+    so convincingly, because "a re-run must not double-mutate" is a real and
+    good invariant. The fixture just was not an already-swept goal. It is a
+    goal mid-way through a FAILED sweep: _mark_skipped writes outcome_note and
+    status as two non-atomic daemon calls, so note-without-terminal-status is
+    precisely the state left behind when write 2 fails. Treating it as "already
+    swept" is what made the sweep's own partial success seal the goal against
+    its own repair, permanently and silently.
+
+    The correct behaviour is to finish the job. Sibling unit-level pin:
+    test_partial_write_is_not_already_swept in test_unblock_parent_status_sweep.
     """
     pre_seeded_note = ("parent resolved without action needed "
                        "(parent_id=g-700-69, parent.status=skipped)")
@@ -218,18 +231,58 @@ def test_idempotency_already_swept_skipped():
             rc, out, err = _run_sweep(world, agent_dir, apply=True)
             assert rc == 0, f"sweep rc={rc}; stderr={err!r}"
             result = json.loads(out)
-            assert result["applied"] == 0, (
-                f"already-swept Unblock must not re-apply; got applied={result['applied']}")
-            assert len(result["candidates"]) == 0, (
-                f"already-swept Unblock must not surface as candidate; got {result['candidates']}")
+            assert result["applied"] == 1, (
+                f"a partial write (note, no terminal status) must be RETRIED and "
+                f"completed, not skipped as already-swept; got "
+                f"applied={result['applied']}")
 
-            # Verify on-disk state is untouched
             unblock = _read_goal(world, "g-700-73")
             assert unblock is not None
-            assert unblock["status"] == "pending", (
-                f"already-swept Unblock status must remain pending; got {unblock['status']!r}")
+            assert unblock["status"] == "skipped", (
+                f"the stranded Unblock must reach a terminal status on the next "
+                f"run; got {unblock['status']!r}")
+            assert unblock["outcome_note"].startswith(
+                "parent resolved without action needed"), (
+                f"the sweep phrase must survive the repair; got "
+                f"{unblock['outcome_note']!r}")
+
+
+def test_fully_swept_goal_is_not_reprocessed():
+    """The no-double-mutate invariant the inverted test above used to carry —
+    re-pinned against a goal that is genuinely swept (note AND terminal status)
+    rather than one that is merely note-bearing.
+
+    Note this passes for two independent reasons, and that is deliberate
+    belt-and-braces: main() excludes non-pending/in-progress goals before
+    _is_already_swept is ever consulted, AND the guard itself now requires a
+    terminal status. Either alone would hold; pinning the observable outcome
+    means a future refactor of either layer still has to keep it true.
+    """
+    pre_seeded_note = ("parent resolved without action needed "
+                       "(parent_id=g-700-69, parent.status=skipped)")
+    with tempfile.TemporaryDirectory() as tmpd:
+        world, agent_dir = _make_world_with_pair(
+            Path(tmpd),
+            parent_status="skipped",
+            unblock_outcome_note=pre_seeded_note,
+            unblock_extra={"status": "skipped"})
+        with DaemonFixture(world):
+            rc, out, err = _run_sweep(world, agent_dir, apply=True)
+            assert rc == 0, f"sweep rc={rc}; stderr={err!r}"
+            result = json.loads(out)
+            assert result["applied"] == 0, (
+                f"a fully-swept Unblock must not re-apply; got "
+                f"applied={result['applied']}")
+            assert len(result["candidates"]) == 0, (
+                f"a fully-swept Unblock must not surface as candidate; got "
+                f"{result['candidates']}")
+
+            unblock = _read_goal(world, "g-700-73")
+            assert unblock is not None
+            assert unblock["status"] == "skipped"
             assert unblock["outcome_note"] == pre_seeded_note, (
-                f"already-swept Unblock outcome_note must not change; got {unblock['outcome_note']!r}")
+                f"a fully-swept Unblock's outcome_note must not change; got "
+                f"{unblock['outcome_note']!r}")
 
 
 def test_parent_pending_not_applied():

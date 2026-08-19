@@ -262,10 +262,24 @@ def list_versions(ctx) -> "Response":  # type: ignore[name-defined]
 
     snapshots = _find_history_snapshots(ctx, file_path)
     if not snapshots:
-        # Reached only when the path IS under a governed root, so this is now
-        # the one honest empty case. Note a MISSING file is legitimately here:
-        # snapshots outlive the file they describe, and listing them after a
-        # delete is exactly when they are needed.
+        # TWO conditions reach here, and collapsing them is the 
+        # defect: an in-scope path with an empty store, and an in-scope path
+        # that DOES NOT EXIST (a typo, a wrong root). Both rendered the same
+        # reassuring "No history" at HTTP 200, so a mistyped path read as
+        # "nothing to lose" — an error condition rendered as data, the same
+        # shape  fixed one layer out.
+        #
+        # THE MISSING-FILE CHECK IS INSIDE THIS BRANCH ON PURPOSE, and that
+        # placement is the whole design. Snapshots OUTLIVE the file they
+        # describe, and listing them after a delete is exactly when they are
+        # needed — measured 2026-08-11: a file saved, then deleted, still
+        # lists `1 versions` at exit 0. Hoisting this check above the snapshot
+        # lookup (which is what "error when the path does not exist" sounds
+        # like) would break the recovery read this command exists for.
+        if not file_path.exists():
+            return Response.error(404, "path_missing",
+                                  f"No history for {file_raw} — and the path "
+                                  f"does not exist")
         return Response.text(f"No history for {file_raw}\n", content_type="text/plain")
 
     out = []

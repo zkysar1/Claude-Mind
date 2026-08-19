@@ -35,6 +35,13 @@ WM_PY = _SD / "wm.py"
 def _env() -> dict:
     env = os.environ.copy()
     env["MIND_AGENT"] = os.environ.get("MIND_AGENT", "bravo")
+    # guard-862 / guard-3375 (): on a worker Body the inherited
+    # BODY_WM_PATH routes the wm.py WRITER subprocesses to the per-Body WM
+    # while the daemon READER (_rt.wm_read) resolves the agent-wide WM — so
+    # every read-back was null (measured cc-07 2026-08-17). Drop it so both
+    # sides target the agent-wide WM, which this test already exercises
+    # safely via disjoint lock_stress_* slots.
+    env.pop("BODY_WM_PATH", None)
     return env
 
 

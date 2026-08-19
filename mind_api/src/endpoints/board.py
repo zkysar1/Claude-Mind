@@ -87,6 +87,13 @@ def _mark_read_append(ctx, channel: str, agent: str, messages: list, seen: set):
     try:
         assert_not_cruft(sidecar.parent, "mkdir (board reads sidecar)")
         sidecar.parent.mkdir(parents=True, exist_ok=True)
+        # <channel>-reads.jsonl is an S3-backed governed store (registered in
+        # coordination_merge._HANDLERS), and an append never reads the file — so
+        # without this nothing on the mark-read path ever pulls it and the append
+        # extends a stale mirror (). Fail-open by return value, never
+        # by raise; this whole block is already best-effort by design.
+        from storage_backend import ensure_local_before_append
+        ensure_local_before_append(sidecar)
         read_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
         with open(sidecar, "a", encoding="utf-8") as f:
             for m in messages:

@@ -286,8 +286,22 @@ def _validate_weight_bounds(file_rel, dotpath, value, bounds):
 
 def _next_meta_change_id(ctx) -> str:
     log_path = ctx.paths.meta / "meta-log.jsonl"
-    from storage_backend import get_backend
-    get_backend().ensure_local(log_path)  # own-cloud read-path fix 2026-07-02: materialize an S3-only file on a fresh box before the local read; no-op on LocalBackend and for out-of-root/git-shipped paths (keystone in owncloud_backend._refresh)
+    # own-cloud read-path fix 2026-07-02: materialize an S3-only file on a fresh
+    # box before the local read; no-op on LocalBackend and for out-of-root /
+    # git-shipped paths (keystone in owncloud_backend._refresh).
+    #
+    # FAIL-OPEN since . This call used to be bare, and _refresh
+    # bare-raises any non-404 ClientError — so an S3 throttle, outage, or expired
+    # credential 500'd the entire meta-SET write path (this runs first inside
+    # _append_log) and LOST the record. Present since 2026-07-02; the sibling
+    # log_record endpoint was given this shape in .
+    #
+    # What degrading costs, stated honestly: the id below is computed from
+    # whatever the local mirror holds, so a stale read can allocate an mc-NNN
+    # that S3 already contains. A duplicate id in an append-only audit log is
+    # recoverable; a dropped record is not.
+    from storage_backend import ensure_local_before_append
+    ensure_local_before_append(log_path, op="ensure_local(meta-log id-scan)")
     max_num = 0
     if log_path.exists():
         with open(log_path, "r", encoding="utf-8") as f:
