@@ -51,6 +51,7 @@ done
 _log() {
     local stamp
     stamp="$(date +%Y-%m-%dT%H:%M:%S)"
+    cap_log_file "$SPAWN_LOG"   # guard-586 inline rotation (see _paths.sh)
     echo "[$stamp] daemon-start: $*" >> "$SPAWN_LOG" 2>/dev/null || true
 }
 
@@ -660,6 +661,17 @@ if [ -z "$py_cmd" ]; then
 fi
 
 _log "spawning daemon with: $py_cmd -m mind_api.src"
+
+# guard-586: cap immediately BEFORE the redirect below. This is the load-bearing
+# call site, not _log's. The daemon's inherited stdout/stderr is ~87% of this
+# file's volume (measured cc-08: 1579 of 1817 lines) and has no shell append site
+# at all — the fd is opened once, here, and appended to for the process's whole
+# life. Capping at the moment that fd is created is the only point shell code
+# can bound it. Residual, stated rather than papered over: a daemon that spews
+# in a hot loop grows unbounded BETWEEN restarts (the shape of the 1.31 GB
+# cc-01 observation — 30000x this box's 43.9 KB/day steady state, so a burst,
+# not accumulation). Bounding that needs a check inside the daemon itself.
+cap_log_file "$SPAWN_LOG"
 
 (
     cd "$PROJECT_ROOT" && \

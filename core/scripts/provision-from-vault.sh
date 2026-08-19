@@ -128,10 +128,20 @@ if [ -f "$OUT" ] && grep -q '^MIND_AWS_ACCESS_KEY_ID=..*' "$OUT" 2>/dev/null && 
 fi
 
 # ── Reach the vault + read into memory (mechanism steps 2-3) ────────────────────
-# Bootstrap context: the world/ domain wrapper (efs-ssh.sh) is NOT yet present on a
-# cold node, so the canonical flags are inlined here (StrictHostKeyChecking=no,
-# UserKnownHostsFile=/dev/null) exactly as the validated reference used them. The
-# vault content is captured into a variable and never touches disk.
+# The vault content is captured into a variable and never touches disk.
+#
+# THE PARAGRAPH THAT STOOD HERE ASSERTED A PREMISE THIS FILE NOW RETIRES, and it
+# is quoted rather than deleted because it is the whole reason the defect shipped:
+#   "Bootstrap context: the world/ domain wrapper (efs-ssh.sh) is NOT yet present
+#    on a cold node, so the canonical flags are inlined here ... exactly as the
+#    validated reference used them."
+# True when written, and it justified inlining CONNECTION FLAGS in place of the
+# canonical wrapper. Flags are a snapshot of a transport; the wrapper IS the
+# transport. When the transport moved to SSM and port 22 closed (2026-08-06), the
+# inlined snapshot became a dead call that nothing updated -- see TRANSPORT
+# RESOLUTION below. The cold-node premise itself is still true; what changed is
+# that it no longer buys anything, because the SSH key it protects has nowhere
+# left to connect.
 # TEST SEAM (g-115-3180). VAULT_SSH_BIN overrides the ssh binary; unset in
 # production, so the default below is the only path real callers take. This seam
 # exists because the obvious stubbing technique DOES NOT WORK on Git Bash: tests
@@ -142,12 +152,65 @@ fi
 # PATH position 4. The real OpenSSH then ran and failed with "Could not resolve
 # hostname", which reads like a product bug and is not one. Matches the seam
 # pattern already used by test_provision_github_from_vault.py.
-echo "provision-from-vault: reading vault from ${VAULT_SSH_USER}@${VAULT_SSH_HOST}:${VAULT_REMOTE_PATH} ..." >&2
-VAULT_CONTENT="$("${VAULT_SSH_BIN:-ssh}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    -o BatchMode=yes -o ConnectTimeout=20 \
-    -i "$BOOTSTRAP_KEY_PATH" "${VAULT_SSH_USER}@${VAULT_SSH_HOST}" \
-    "cat '$VAULT_REMOTE_PATH'")" || {
-    echo "provision-from-vault: failed to read vault over SSH (check bootstrap key, host, path)" >&2
+# TRANSPORT RESOLUTION (g-335-1096). The raw-ssh path below is DEAD, not merely
+# discouraged: the world-open inbound-22 rule on the operator security group was
+# removed 2026-08-06 (g-335-852) when the shell wrapper moved to AWS SSM.
+# Measured on cc-07 2026-08-11 -- port 22 connect times out, while the canonical
+# wrapper returns `ok` on the same box seconds later. The operator is healthy;
+# only this transport is gone.
+#
+# The convention this script instantiates already prescribed the fix, and this
+# script took its escape hatch. fleet-secret-provisioning.md mechanism step 2:
+# "using the deployment's canonical remote-shell wrapper (OR ITS EXACT CONNECTION
+# FLAGS)". Inlined FLAGS cannot track a transport CHANGE -- only the wrapper can,
+# because the wrapper is the thing that gets updated when the transport moves.
+# That escape hatch is the root cause, not the ssh binary.
+#
+# The bootstrap-ordering property is RETIRED, explicitly, because it is no longer
+# satisfiable by anything (the goal permits "preserve or explicitly retire"). A
+# cold node's only bootstrap credential is the SSH key, and it now has NO
+# surviving transport. Measured on cc-07 2026-08-11: operator ports 22/443/8787/
+# 8686 all closed, 8080 the sole opening and nothing in core/ speaks it; SSM
+# requires the AWS credential THIS SCRIPT PROVISIONS, so routing through it is
+# circular. No ordering-preserving option remains, so the honest move is to name
+# the gap loudly rather than keep a dead call that times out looking like an
+# operator outage.
+_vault_read() {
+    if [ -n "${VAULT_SSH_BIN:-}" ]; then
+        # TEST SEAM (g-115-3180) -- preserved verbatim; see the note above for why
+        # PATH-stubbing `ssh` does not work on Git Bash.
+        "$VAULT_SSH_BIN" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o BatchMode=yes -o ConnectTimeout=20 \
+            -i "$BOOTSTRAP_KEY_PATH" "${VAULT_SSH_USER}@${VAULT_SSH_HOST}" \
+            "cat '$VAULT_REMOTE_PATH'"
+        return $?
+    fi
+    if [ -n "${VAULT_REMOTE_SHELL:-}" ] && [ -x "${VAULT_REMOTE_SHELL}" ]; then
+        # Canonical wrapper: it owns the transport and does not tell callers what
+        # it is, which is the whole point -- when SSM moves to something else this
+        # script needs no edit.
+        "$VAULT_REMOTE_SHELL" "cat '$VAULT_REMOTE_PATH'"
+        return $?
+    fi
+    return 127
+}
+
+echo "provision-from-vault: reading vault from ${VAULT_SSH_HOST}:${VAULT_REMOTE_PATH} ..." >&2
+VAULT_CONTENT="$(_vault_read)" || {
+    rc=$?
+    if [ "$rc" -eq 127 ]; then
+        echo "provision-from-vault: NO USABLE VAULT TRANSPORT — refusing to attempt the dead raw-ssh path." >&2
+        echo "  Port 22 on the operator was closed 2026-08-06 (g-335-852); a raw ssh here times out" >&2
+        echo "  after ~20s and reads like an operator OUTAGE, which is why this refuses instead." >&2
+        echo "  Set VAULT_REMOTE_SHELL to the deployment's canonical remote-shell wrapper, e.g." >&2
+        echo "    VAULT_REMOTE_SHELL=\"\$WORLD_PATH/scripts/efs-ssh.sh\" $0 $*" >&2
+        echo "  COLD-NODE GAP (g-335-1096): a node with only the bootstrap SSH key has no" >&2
+        echo "  surviving transport at all, and SSM needs the very credential this script" >&2
+        echo "  provisions. Cold-node bring-up needs a bootstrap-scoped cloud credential or an" >&2
+        echo "  operator endpoint on the one open port — neither exists yet." >&2
+    else
+        echo "provision-from-vault: failed to read vault (rc=$rc) — check bootstrap key, host, path" >&2
+    fi
     exit 1
 }
 if [ -z "$VAULT_CONTENT" ]; then

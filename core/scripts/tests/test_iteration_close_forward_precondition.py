@@ -26,12 +26,43 @@ legitimate blocked close. `test_blocked_close_does_not_warn` is the pin for
 that correction and is the load-bearing test in this file — it is the one that
 would have caught the goal's own proposal.
 
-WHY WARN AND NOT REFUSE: guard-2760 — adding a consumer of a failure signal
-whose remedy is destructive (halting a close mid-sequence) requires evidence
-that a reversible remedy is insufficient, and no loud warning had ever been
-tried. A refusal also has a live false-positive path on own-cloud, where the
-record is read through a cache and a verify that DID close the goal can still
-read stale.
+WHY IT WARNED, AND WHY IT NOW REFUSES (g-115-5573, 2026-08-09).
+The original decision was to WARN, on guard-2760: adding a consumer of a failure
+signal whose remedy is destructive (halting a close mid-sequence) requires
+evidence that a reversible remedy is insufficient, and no loud warning had ever
+been tried. That was correct at the time. Both of its premises have since been
+measured and both have fallen:
+
+  1. THE REVERSIBLE REMEDY WAS TRIED AND IS INSUFFICIENT. The warning landed in
+     8b4cb6f67 (2026-08-06 19:59 UTC). g-115-5104 was miscounted on 2026-08-09
+     ~21:12 — three days later, with the warning live. Its fix had shipped as
+     bd0e6c913, yet state-update, learning-gate and productivity all ran and
+     counted it closed while the record stayed at pending with no outcome_note,
+     returning shipped work to the selectable pool. A warning that is printed
+     and then walked past is not a remedy; that is exactly the evidence
+     guard-2760 asked for.
+  2. THE STALE-READ FALSE POSITIVE DOES NOT APPLY TO THIS PROBE.
+     _probe_goal_status reads via aspirations-read.sh, which sources
+     _runtime.sh and issues `rt_call GET /v1/aspirations/read` — daemon-routed,
+     with no Python CLI fallback. It is not the local read-through cache. And
+     verify and state-update run seconds apart on one box through one daemon,
+     so a verify that DID close the goal reads completed.
+
+The residual risk is handled by the FAIL LADDER, not by hope: the refusal fires
+only on TWO independent CLEAN positive reads (an open status AND a confirmed
+non-recurring goal). Every unknown proceeds. A daemon that is unreachable makes
+aspirations-read.sh fail loud, _probe_goal_status return "", and the phase
+PROCEED — so a store blip can never wedge a close.
+
+THE RECURRING CARVE-OUT IS WHAT MAKES THE REFUSAL SHIPPABLE, and its absence is
+why the predecessor could only ever warn. do_verify routes recurring goals to
+aspirations-complete-by.sh, which sets status back to "pending" on every cycle,
+outcome-independently (pinned by test_complete_by_recurring_status_reset.py). So
+pending is the NORMAL post-close state for a recurring goal and carries no
+information about whether verify landed. Refusing without the carve-out would
+have fired on 100% of recurring closes — measured 2026-08-09 on asp-115, 40 of
+45 recurring goals with achievedCount>0 sat at pending and 3 more at
+in-progress. That is a fleet-wide outage, not an edge case.
 
 HOW THESE TESTS RUN THE REAL CODE. The precondition sits AFTER the phase entry
 validation, so the cheap "validation-reject" invocation the sibling
@@ -53,7 +84,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from _runtime_bash import BASH  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / "iteration-close.sh"
-FUNC = "_warn_if_goal_not_closed"
+FUNC = "_assert_verify_landed"
 
 
 def _extract(func: str) -> str:
@@ -72,12 +103,23 @@ def _extract(func: str) -> str:
     return "\n".join(src[start:end + 1])
 
 
-def _run_predicate(status: str, phase: str = "state-update"):
-    """Source the real function with _probe_goal_status stubbed to `status`."""
+def _run_predicate(status: str, phase: str = "state-update",
+                   recurring: str = "false", claim_held: str = "false",
+                   raw: str | None = None):
+    """Source the real function with _probe_goal_record stubbed.
+
+    The stub emits the wide "<status>\\t<recurring>\\t<claim_held>" line the real
+    probe now returns (g-115-5216). `raw` overrides the whole line so the
+    genuinely-empty (unreadable-record) case can be exercised directly rather
+    than simulated with an empty status field. (The g-115-5573 tri-state
+    recurring probe this harness used to stub was retired at the 2026-08-13
+    reconcile — the record probe carries `recurring` in the same read.)
+    """
+    line = raw if raw is not None else f"{status}\t{recurring}\t{claim_held}"
     harness = f"""
 set -uo pipefail
 GOAL_ID="g-999-1"; GOAL_STATUS="completed"; SOURCE="world"; OUTCOME="deep"
-_probe_goal_status() {{ printf '%s' "{status}"; }}
+_probe_goal_record() {{ printf '%s' "{line}"; }}
 {_extract(FUNC)}
 {FUNC} "{phase}"
 echo "RC=$?"
@@ -88,15 +130,60 @@ echo "RC=$?"
 
 
 WARN_MARKER = "FORWARD-PRECONDITION WARNING"
+REFUSE_MARKER = "REFUSED"
 
 
 @pytest.mark.parametrize("status", ["pending", "in-progress"])
-def test_open_statuses_warn(status):
-    """The two statuses both incidents actually exhibited."""
-    r = _run_predicate(status)
-    assert WARN_MARKER in r.stderr, f"no warning for status={status}"
-    assert f"status={status}" in r.stderr, "the warning must name the status it saw"
-    assert "RC=0" in r.stdout, "the precondition must never change the phase's rc"
+@pytest.mark.parametrize("phase", ["state-update", "learning-gate"])
+def test_open_non_recurring_statuses_refuse(status, phase):
+    """The two statuses both incidents actually exhibited (: REFUSE).
+
+    Was test_open_statuses_warn, asserting RC=0. The rc flipped deliberately —
+    see the module docstring for the evidence that retired guard-2760's
+    warn-first posture. The phase is parametrized because a closer may run
+    learning-gate alone.
+    """
+    r = _run_predicate(status, phase=phase)
+    assert REFUSE_MARKER in r.stderr, f"no refusal for status={status}"
+    assert f"status={status}" in r.stderr, "the refusal must name the status it saw"
+    assert phase in r.stderr, "the refusal must name the phase it blocked"
+    assert "--phase verify" in r.stderr, "must print the verify-first retry command"
+    assert "RC=1" in r.stdout, "an open non-recurring record must HALT the phase"
+
+
+# (test_recurring_goal_proceeds was retired at the 2026-08-13 reconcile: it
+# asserted the healthy-recurring branch SAYS why it proceeds, and the merged
+# design adopts 's measurement that any output there is a false
+# positive — the branch is now silent. Its invariant is carried, sharpened, by
+# test_recurring_successful_close_does_not_warn below.)
+
+
+@pytest.mark.parametrize("status", ["pending", "in-progress"])
+def test_unknown_recurring_fails_open(status):
+    """Refuse on clean reads only. "" means the recurring answer is UNKNOWN.
+
+    Unreachable via the real record probe (a found record always carries a
+    definite recurring boolean — the unknown case is an EMPTY rec, pinned by
+    test_unreadable_record_fails_open). Kept because the refusal's authorizing
+    read must stay the clean "false" even if a stub or a future probe emits an
+    ambiguous line: a refusal must never rest on an ambiguous read.
+    """
+    r = _run_predicate(status, recurring="")
+    assert "RC=0" in r.stdout, f"unknown-recurring at {status} must fail OPEN"
+    assert REFUSE_MARKER not in r.stderr
+    assert "asserting neither" in r.stderr
+
+
+def test_carve_out_is_load_bearing_not_defensive():
+    """guard-3126: a mutation kill says "my case fires", not "the case was needed".
+
+    Same open status, ONLY the recurring flag differs -> opposite verdicts. That
+    is what makes the carve-out load-bearing rather than belt-and-braces.
+    """
+    rec = _run_predicate("pending", recurring="true")
+    plain = _run_predicate("pending", recurring="false")
+    assert "RC=0" in rec.stdout and "RC=1" in plain.stdout, (
+        "the recurring flag must decide the verdict at identical status")
 
 
 def test_blocked_close_does_not_warn():
@@ -109,24 +196,130 @@ def test_blocked_close_does_not_warn():
     original proposal and reintroduced that false positive.
     """
     r = _run_predicate("blocked")
+    # Assert on BOTH markers and the rc, not just the warn marker. Measured
+    # 2026-08-09 (): after the warn->refuse change, widening the
+    # predicate to include `blocked` made this path emit REFUSED rather than the
+    # warning — so a warn-only assertion passed vacuously through the exact
+    # regression this test is named for. A test that pins one branch's output
+    # string stops pinning anything the moment the branch's output changes.
     assert WARN_MARKER not in r.stderr, (
         "warned on a legitimate blocked close — the predicate has been widened "
         "back to 'not terminal'; see this module's docstring")
+    assert REFUSE_MARKER not in r.stderr, (
+        "REFUSED a legitimate blocked close — do_verify accepts "
+        "--status blocked, so this halts a valid close sequence")
+    assert "RC=0" in r.stdout, "a legitimate blocked close must not be halted"
 
 
 @pytest.mark.parametrize("status", ["completed", "skipped"])
 def test_closed_statuses_do_not_warn(status):
     r = _run_predicate(status)
     assert WARN_MARKER not in r.stderr, f"false positive on a closed goal ({status})"
+    assert REFUSE_MARKER not in r.stderr, f"REFUSED a closed goal ({status})"
+    assert "RC=0" in r.stdout, f"halted a closed goal ({status})"
 
 
 def test_unreadable_record_fails_open():
-    """_probe_goal_status prints "" for an unset/unparseable id, an unreadable
+    """_probe_goal_record prints "" for an unset/unparseable id, an unreadable
     queue, and g-xw-* ids whose aspiration is not derivable. All must be silent:
     the recovery block already models this as "asserting neither direction"."""
-    r = _run_predicate("")
+    r = _run_predicate("", raw="")
     assert WARN_MARKER not in r.stderr, "asserted a direction on an unreadable record"
+    assert REFUSE_MARKER not in r.stderr, (
+        "REFUSED on an unreadable record — a store-read blip now wedges every "
+        "close, which is the one failure mode the fail ladder exists to prevent")
     assert "RC=0" in r.stdout
+
+
+# ── : the recurring carve-out (kept under the  refusal) ─
+#
+# The warning was wrong on 100% of recurring closes, because a recurring goal
+# RETURNS to status=pending on a SUCCESSFUL close by design (guard-1483). Both
+# tests below are load-bearing and they pull in OPPOSITE directions: the first
+# is the fix, the second is its guard-1562 blast-radius pin. Deleting either
+# one alone leaves a suite that looks green while the other failure mode is
+# wide open.
+
+@pytest.mark.parametrize("status", ["pending", "in-progress"])
+def test_recurring_successful_close_does_not_warn(status):
+    """THE FIX. A healthy recurring close pops claimed_by
+    (aspirations_write.py L3592-3594) and cycles status back to pending. That
+    is not a half-closed goal and must not warn — and under the merged refusal
+    design it must not refuse either."""
+    r = _run_predicate(status, recurring="true", claim_held="false")
+    assert WARN_MARKER not in r.stderr, (
+        f"warned on a healthy recurring close (status={status}) — this is the "
+        f"100%-false-positive class g-115-5216 removed")
+    assert REFUSE_MARKER not in r.stderr, (
+        f"REFUSED a healthy recurring close (status={status}) — the carve-out "
+        f"is what makes the refusal shippable; without it this is a fleet-wide "
+        f"outage (see module docstring)")
+    assert "RC=0" in r.stdout
+
+
+@pytest.mark.parametrize("status", ["pending", "in-progress"])
+def test_recurring_with_live_claim_still_warns(status):
+    """THE BLAST-RADIUS PIN (guard-1562). Suppressing on `recurring` ALONE
+    would silence a recurring goal whose verify genuinely never ran — the exact
+    defect the warning exists to catch. A close that did not happen leaves the
+    claim live (both g-115-5001 incidents sat pending with one, ~19 and ~11
+    min), so claim_held keeps the warning honest for that case.
+
+    WARN, not refuse: the g-115-5104 field evidence behind the refusal is
+    non-recurring, and extending a destructive remedy to a population with no
+    evidence is what guard-2760 forbids (see the block comment above the
+    function)."""
+    r = _run_predicate(status, recurring="true", claim_held="true")
+    assert WARN_MARKER in r.stderr, (
+        "silenced a recurring goal that still holds its claim — the carve-out "
+        "has been widened to bare `recurring`, reopening the case the warning "
+        "was built for")
+    assert REFUSE_MARKER not in r.stderr, (
+        "REFUSED an abandoned recurring close — no field evidence supports a "
+        "destructive remedy for this population (guard-2760)")
+    assert "RC=1" not in r.stdout, "the abandoned-recurring branch must proceed"
+
+
+def test_carve_out_does_not_key_on_lastachievedat():
+    """Guard the CORRECTION, at the source level — the sibling of
+    test_predicate_is_not_the_terminal_set.
+
+    Five independent confirmations on g-115-5216 all proposed keying the
+    carve-out on "lastAchievedAt advanced during this close". guard-2197
+    falsifies that: recurring-precondition-sweep.py advances lastAchievedAt on a
+    precondition-SHELVED goal while never writing achievedCount, so a shelved
+    goal and a closed one are indistinguishable at that field — and the shelved
+    one is precisely the case that must keep warning. Reaching for it here would
+    read as principled (it is what the goal record prescribes) while silently
+    re-suppressing that population.
+    """
+    body = _extract(FUNC)
+    assert "lastAchievedAt" not in body, (
+        f"{FUNC} keys on lastAchievedAt; guard-2197 measured it advancing on "
+        f"precondition-shelved goals, so it cannot separate 'verify closed it' "
+        f"from 'the sweep shelved it' — see this test's docstring")
+
+
+def test_gate_probe_is_daemon_routed_not_the_local_cache_one():
+    """The gate must not consult _probe_is_recurring — guard-980.
+
+    That helper emits "false" from THREE distinct sites — the genuine answer,
+    goal-absent-from-file, and `|| echo "false"` on invocation failure — and it
+    reads the LOCAL aspirations.jsonl, a read-through cache under own-cloud.
+    A goal absent from this box therefore reads "false", which is the value
+    that AUTHORIZES a refusal here. The g-115-5573 tri-state probe that first
+    carried this pin was retired at the 2026-08-13 reconcile (the record probe
+    answers `recurring` on the same read); the invariant transfers to the
+    probe the gate consults now.
+    """
+    gate = _extract(FUNC)
+    assert "_probe_is_recurring" not in gate, (
+        "the gate consults the local-cache probe, which cannot express 'unknown'")
+    assert "_probe_goal_record" in gate, (
+        "the gate no longer consults the wide record probe — where does its "
+        "recurring answer come from?")
+    probe = _extract("_probe_goal_record")
+    assert "aspirations-read.sh" in probe, "record probe must be daemon-routed"
 
 
 def test_predicate_is_not_the_terminal_set():
@@ -153,6 +346,42 @@ def _code_lines():
     above it, so a raw substring count conflates prose with code (guard-1099)."""
     return [ln for ln in SCRIPT.read_text(encoding="utf-8").splitlines()
             if not ln.lstrip().startswith("#")]
+
+
+def test_probe_emits_the_three_fields_from_one_read():
+    """ widened the probe rather than adding a second read.
+
+    The whole carve-out rests on `recurring` and `claimed_by` being available
+    where `status` already was. If someone re-narrows the emitter, the carve-out
+    silently stops firing (both fields read empty -> every recurring close warns
+    again) with no test failing anywhere else, because the behavioural tests
+    above stub the probe out entirely.
+    """
+    src = SCRIPT.read_text(encoding="utf-8")
+    start = src.index("_probe_goal_record() {")
+    body = src[start:src.index("\n}\n", start)]
+    for field in ("status", "recurring", "claimed_by"):
+        assert field in body, f"_probe_goal_record no longer reads {field}"
+    assert 'aspirations-read.sh' in body
+    assert body.count("aspirations-read.sh") == 1, (
+        "_probe_goal_record must stay ONE read — the three fields ride along on "
+        "the round-trip that already fetched status (see its header comment)")
+
+
+def test_probe_goal_status_stays_narrow():
+    """guard-695: the wrapper's output shape is the back-compat contract.
+
+    Two other call sites and any external caller still expect a bare status
+    string. Pin that _probe_goal_status did not itself become the wide emitter.
+    """
+    src = SCRIPT.read_text(encoding="utf-8")
+    start = src.index("_probe_goal_status() {")
+    body = src[start:src.index("\n}\n", start)]
+    assert "_probe_goal_record" in body, (
+        "_probe_goal_status must delegate to the wide reader, not re-query")
+    assert "aspirations-read.sh" not in body, (
+        "_probe_goal_status re-queries the store — that is a second read per "
+        "call site, which the g-115-5216 split exists to avoid")
 
 
 def test_both_phases_call_it():

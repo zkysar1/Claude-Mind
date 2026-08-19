@@ -57,8 +57,27 @@ Action modes:
     --report (default): print JSON {candidates: [...], details: [...]}
     --apply: mark each candidate parent as status=completed with
         outcome_note "superseded by sibling decomposition: <sibling-ids>".
-        Idempotent: if the parent already has outcome_note containing
-        "superseded by sibling decomposition", skip the rewrite.
+
+        NO note-based idempotency guard exists here, and MUST NOT be added
+        (g-115-5097). This block claimed one until 2026-08-10; grep for
+        outcome_note in this file and the only hits are this docstring and the
+        write itself. The claim was simply false.
+
+        Do not "restore" it. The two sibling sweeps
+        (unblock-parent-status-sweep, routing-audit-target-status-sweep) DID
+        implement that guard and it was a defect in both: _mark_superseded
+        performs THREE non-atomic daemon writes (note, status, completed_date),
+        so keying dedup on the note makes the FIRST write the key — a partial
+        failure then leaves the parent note-bearing and still pending, and the
+        guard skips it on every later run, permanently sealing the goal against
+        its own repair. Adding the guard here would INSTALL that bug rather
+        than fix an omission.
+
+        Idempotency is instead supplied by the eligibility filter below: a
+        successfully superseded parent is status=completed, which the
+        pending/in-progress filter already excludes. A partial failure leaves it
+        pending, so the next run simply retries and self-heals — which is the
+        behaviour the two siblings had to be repaired back into.
 
 Eligibility filters (mirror defer-recheck.py):
     - status MUST be pending OR in-progress (not completed/skipped/blocked)
@@ -100,6 +119,11 @@ PROJECT_ROOT = CORE_ROOT.parent
 
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+from _team_state import _is_owncloud_backend  # noqa: E402
+from _sweep_write_guard import (  # noqa: E402
+    reread_goal_authoritative as _shared_reread_goal_authoritative,
+    stale_candidate_reason as _shared_stale_candidate_reason,
+)
 from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, )
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
 
@@ -322,14 +346,61 @@ def _newest_completion_age_hours(siblings_match):
     return (dt.datetime.now() - newest).total_seconds() / 3600
 
 
-def _mark_superseded(source, goal_id, sibling_ids):
+def _reread_goal_authoritative(source, goal_id):
+    """``(goal, provenance)`` from the STORE OF RECORD — seam over the shared
+    reader. Collaborators are passed explicitly and resolved as module globals
+    at call time so they stay monkeypatchable here (guard-2385)."""
+    return _shared_reread_goal_authoritative(
+        source, goal_id,
+        read_aspirations=_read_aspirations,
+        is_owncloud=_is_owncloud_backend,
+        label="parent-supersession-sweep",
+    )
+
+
+def _stale_candidate_reason(source, goal_id):
+    """``None`` when the write may proceed, else the refusal reason."""
+    goal, prov = _reread_goal_authoritative(source, goal_id)
+    return _shared_stale_candidate_reason(goal, prov)
+
+
+def _mark_superseded(source, goal_id, sibling_ids, metrics_path=None,
+                     aspiration_id=None):
     """Mark parent as completed with outcome_note. Returns True on success.
 
     INVARIANT: uses sys.executable directly. Same rationale as
     defer-recheck._clear_defer — bash on Windows can resolve to WSL
     bash.exe with surprising PATH semantics; aspirations-update-goal.sh
     just shells aspirations.py with the same args, so calling .py
-    directly loses nothing functional."""
+    directly loses nothing functional.
+
+    g-115-6332: re-asserts the candidate predicate against the STORE OF RECORD
+    immediately before writing, and refuses when it no longer holds.
+
+    WORTH SPELLING OUT because this sweep writes `completed` rather than
+    `skipped`, which reads like the harmless direction and is not. The
+    destructive half is the FIRST write: outcome_note is overwritten with a
+    template, so a goal another box closed seconds earlier loses its real
+    closure evidence and keeps a plausible-looking terminal status — damage
+    that leaves no anomaly for a status-based audit to notice."""
+    stale = _stale_candidate_reason(source, goal_id)
+    if stale is not None:
+        print(f"[parent-supersession-sweep] REFUSED {goal_id}: {stale}",
+              file=sys.stderr)
+        # COUNT the refusal — a silent no-op is indistinguishable from never
+        # having raced, which makes the guard's own effectiveness unmeasurable.
+        _append_metric(metrics_path, {
+            "type": "parent_supersession_refused_stale_candidate",
+            "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+            "goal_id": goal_id,
+            "source": source,
+            "aspiration_id": aspiration_id,
+            "sibling_ids": list(sibling_ids or []),
+            "reason": stale,
+            "agent": os.environ.get("MIND_AGENT", "") or None,
+        })
+        return False
+
     sibling_str = ", ".join(sibling_ids)
     note = f"superseded by sibling decomposition: {sibling_str}"
     # First write outcome_note (informational only — does NOT close goal).
@@ -499,7 +570,9 @@ def main():
                 "siblings": sibling_ids,
             })
             if args.apply:
-                ok = _mark_superseded(source, g.get("id"), sibling_ids)
+                ok = _mark_superseded(source, g.get("id"), sibling_ids,
+                                      metrics_path=metrics_path,
+                                      aspiration_id=asp.get("id"))
                 entry["action"] = "marked" if ok else "mark_failed"
                 if ok:
                     applied += 1

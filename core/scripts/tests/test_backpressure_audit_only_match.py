@@ -340,3 +340,177 @@ def test_daemon_call_site_actually_uses_the_predicate():
         "daemon cmd_check no longer routes through _is_audit_only_field")
     assert 'if mon["field"] in file_audit:' not in src, (
         "the pre-g-115-4552 exact-match predicate is back at the daemon call site")
+
+
+# ── the FILE half of the same expression () ────────────────────────
+#
+#  fixed the FIELD lookup and  ported it to the daemon. Both
+# left the FILE lookup an EXACT dict get:
+#
+#     file_audit = audit_only_fields.get(monitor["strategy_file"], []) or []
+#
+# `strategy_file` is stored VERBATIM from whatever the registrar was handed.
+# meta-yaml.py::cmd_set — the live registrar — decides a file is a strategy file
+# with a SUBSTRING test (`any(s in args.file for s in [...])`) and then passes
+# `args.file` through unchanged, so `meta-yaml.sh set --file meta/reflection-
+# strategy.yaml ...` registers the PREFIXED key. The daemon's `body["file"]` path
+# normalizes nothing either.
+#
+# MEASURED, live store, 2026-08-17 (zeta, cc-02), all 38 rollback_history records
+# read uncapped: ONE file appears under TWO spellings —
+#
+#     8x  'goal-selection-strategy.yaml'
+#     2x  'meta/goal-selection-strategy.yaml'
+#
+# So both spellings genuinely reach this gate; the prefixed form is not
+# hypothetical. What is NOT claimed: that a record has already been destroyed by
+# it. goal-selection-strategy.yaml is absent from the allowlist, so those two
+# rollbacks were correct either way. The defect is LATENT and one registration
+# away — a `meta/`-prefixed monitor on an ALLOWLISTED file (reflection-strategy
+# .yaml, step-attribution.yaml) resolves to `[]` and re-opens the exact
+# destroy-the-evidence class the two prior goals closed, with audit_only_skips
+# sitting at 0 the whole time. That counter is the same silent-zero tell as the
+# 99-day miss documented at the top of this file (guard-1093).
+
+# The live allowlist keys, verbatim from core/config/meta.yaml (fields trimmed —
+# only the KEY shape is under test here).
+FILE_ALLOWLIST = {
+    "reflection-strategy.yaml": ["roi_history", "reflection_quality_log"],
+    "step-attribution.yaml": ["step_attribution"],
+}
+
+
+@pytest.mark.parametrize("stored", [
+    "reflection-strategy.yaml",       # exact — must stay byte-identical
+    "meta/reflection-strategy.yaml",  # the live registrar's prefixed shape
+    "./meta/reflection-strategy.yaml",
+    "/abs/path/to/meta/reflection-strategy.yaml",
+    "meta\\reflection-strategy.yaml",  # Windows separator — os.path.basename
+                                       # does NOT split this on POSIX
+])
+def test_allowlist_resolves_regardless_of_path_shape(stored):
+    """Every spelling of one file must reach that file's allowlist."""
+    assert MOD._audit_allowlist_for(stored, FILE_ALLOWLIST) == [
+        "roi_history", "reflection_quality_log"]
+
+
+def test_exact_key_wins_before_any_basename_scan():
+    """Back-compat: an exact hit must not be re-resolved through the scan.
+
+    Two config keys can share a basename. The exact key is the caller's stated
+    intent and must win, or this fix would silently re-point existing monitors.
+    """
+    cfg = {
+        "meta/reflection-strategy.yaml": ["prefixed_only"],
+        "reflection-strategy.yaml": ["bare_only"],
+    }
+    assert MOD._audit_allowlist_for("meta/reflection-strategy.yaml", cfg) == ["prefixed_only"]
+    assert MOD._audit_allowlist_for("reflection-strategy.yaml", cfg) == ["bare_only"]
+
+
+@pytest.mark.parametrize("stored", [
+    "goal-selection-strategy.yaml",       # live, and deliberately NOT allowlisted
+    "meta/goal-selection-strategy.yaml",  # live, prefixed, also not allowlisted
+    "encoding-strategy.yaml",
+    "meta/reflection-strategy.yaml.bak",
+    "reflection-strategy.yml",            # different extension is a different file
+    "xreflection-strategy.yaml",
+    "meta/",
+    "",
+])
+def test_unallowlisted_files_get_nothing(stored):
+    """Negative control: over-matching here disables backpressure per-FILE.
+
+    A predicate that returned the first allowlist for anything would pass every
+    positive test above while making every tunable in the repo unrollbackable.
+    """
+    assert MOD._audit_allowlist_for(stored, FILE_ALLOWLIST) == []
+
+
+@pytest.mark.parametrize("stored", [None, 123, ["reflection-strategy.yaml"], {"a": 1}])
+def test_malformed_strategy_file_returns_empty_never_raises(stored):
+    """Same reachability argument as the field half: backpressure.yaml is a
+    shared own-cloud store with a merge handler, so a null field is reachable,
+    and one raise aborts the cycle for EVERY monitor including live rollbacks."""
+    assert MOD._audit_allowlist_for(stored, FILE_ALLOWLIST) == []
+
+
+@pytest.mark.parametrize("cfg", [None, [], "reflection-strategy.yaml", 7])
+def test_malformed_config_returns_empty(cfg):
+    """Absent/garbled audit_only_fields -> legacy unconditional-rollback."""
+    assert MOD._audit_allowlist_for("meta/reflection-strategy.yaml", cfg) == []
+
+
+def test_non_list_allowlist_value_is_ignored():
+    """A scalar under a key is not an allowlist; matching it would put a string
+    into `field in file_audit` and silently substring-match field names."""
+    assert MOD._audit_allowlist_for(
+        "meta/reflection-strategy.yaml",
+        {"reflection-strategy.yaml": "roi_history"}) == []
+
+
+def test_prefixed_registration_is_skipped_end_to_end(monkeypatch, capsys):
+    """THE REGRESSION. Pre-fix this rolled back and destroyed the record.
+
+    Identical to test_indexed_element_is_skipped_end_to_end except the monitor
+    registered the path the live registrar actually hands over.
+    """
+    result, monitor, state = _run_check(
+        monkeypatch, capsys, "roi_history[81]",
+        strategy_file="meta/reflection-strategy.yaml")
+
+    assert monitor["status"] == "audit_only_skipped"
+    assert result["rollback_actions"] == []
+    assert len(result["audit_only_skipped"]) == 1
+    assert len(state["rollback_history"]) == 0
+    assert result["audit_only_skipped"][0]["strategy_file"] == "meta/reflection-strategy.yaml", (
+        "the recorded path must be the ACTUAL registered spelling — "
+        "audit_only_skips is the recovery source, so it must not be normalized")
+
+
+def test_prefixed_tunable_still_rolls_back(monkeypatch, capsys):
+    """Negative control end-to-end: resolving the allowlist must not make the
+    whole FILE exempt. A tunable under the prefixed spelling still rolls back."""
+    result, monitor, state = _run_check(
+        monkeypatch, capsys, "depth_allocation.max_depth",
+        strategy_file="meta/reflection-strategy.yaml")
+    assert monitor["status"] == "rolled_back"
+    assert len(result["rollback_actions"]) == 1
+    assert len(state["rollback_history"]) == 1
+
+
+FILE_PARITY_CORPUS = [
+    "reflection-strategy.yaml", "meta/reflection-strategy.yaml",
+    "./meta/reflection-strategy.yaml", "meta\\reflection-strategy.yaml",
+    "/abs/meta/step-attribution.yaml", "step-attribution.yaml",
+    "goal-selection-strategy.yaml", "meta/goal-selection-strategy.yaml",
+    "reflection-strategy.yml", "meta/", "", None, 123,
+]
+
+
+@pytest.mark.parametrize("stored", FILE_PARITY_CORPUS)
+def test_cli_and_daemon_file_lookup_agree(stored):
+    """The daemon is the LIVE path (no-python-cli-fallback.md). A CLI-only fix
+    here is inert in production — which is precisely how the FIELD half of this
+    same expression stayed broken after g-115-4552 (guard-2323)."""
+    dmod = _import_daemon()
+    cli = MOD._audit_allowlist_for(stored, FILE_ALLOWLIST)
+    daemon = dmod._audit_allowlist_for(stored, FILE_ALLOWLIST)
+    assert cli == daemon, (
+        f"CLI/daemon file-lookup divergence on {stored!r}: "
+        f"CLI={cli} daemon={daemon}")
+
+
+def test_both_call_sites_route_through_the_file_helper():
+    """Symbol-present is not call-site-wired — the same one-layer-in shape the
+    field-half test above guards, now for the file half, on BOTH copies."""
+    root = SCRIPTS_DIR.parent.parent
+    for path, var in (
+        (SCRIPTS_DIR / "meta-backpressure.py", "monitor"),
+        (root / "mind_api" / "src" / "meta" / "meta_backpressure.py", "mon"),
+    ):
+        src = path.read_text(encoding="utf-8")
+        assert f'_audit_allowlist_for({var}["strategy_file"], audit_only_fields)' in src, (
+            f"{path.name} no longer routes the file lookup through the helper")
+        assert f'audit_only_fields.get({var}["strategy_file"]' not in src, (
+            f"{path.name}: the exact-match dict lookup is back at the call site")

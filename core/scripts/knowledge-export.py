@@ -165,6 +165,13 @@ def read_tree_nodes(world_path: Path) -> list[dict[str, object]]:
                 "parent": str(node.get("parent") or ""),
                 "children": [str(c) for c in (node.get("children") or []) if c],
                 "category": file_rel,
+                # Present on 1379/1379 nodes in the live index (measured 2026-08-12).
+                # DATE-ONLY ("2026-04-28"), never an instant — so a consumer computing
+                # "changed since X" has ONE-DAY granularity and must compare dates, not
+                # timestamps. Treating this as midnight and comparing against an instant
+                # silently drops every same-day change, which for a what-changed view
+                # means hiding exactly the newest learning (g-335-1146).
+                "last_updated": str(node.get("last_updated") or ""),
             }
         )
     return out
@@ -277,6 +284,12 @@ def write_okf_bundle(bundle: ProjectedBundle, out_dir: Path) -> dict[str, int]:
             "summary": str(n.get("summary") or ""),
             "parent": n.get("parent") or "",
             "children": list(n.get("children") or []),
+            # The second field this writer lost, and it was caught by the guard the
+            # first one left behind (test_okf_writer_loses_no_projected_field) rather
+            # than by review — the field was invisible to that test until the fixture
+            # carried it. Date-only; empty for an undated node, per invariant 5 and
+            # because a consumer must be able to tell "no date" from "old" (g-335-1146).
+            "last_updated": str(n.get("last_updated") or ""),
         }
         # Prefer the full node body (carried end-to-end for the kid-facing wiki); fall back
         # to the index summary when a node has no body. Already redacted by project().

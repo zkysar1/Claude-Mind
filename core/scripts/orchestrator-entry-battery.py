@@ -27,7 +27,20 @@ Output (guard-614: structured output on EVERY exit path):
   default — one line per ACTIONABLE check plus a summary + protocol footer:
       ▸ ENTRY: <name> (phase <phase>) payload=<json> → dispatch: <section>
       [entry-battery] N actionable / M checks
-  --json  — single JSON object {checked_at, checks, actionable: [...], error?}
+  --json  — single JSON object {checked_at, checks, actionable: [...],
+            findings: [...], blind: [...], error?}
+
+`findings` and `blind` are the COMPOSED-CALLER contract: `iteration-open.py`
+lifts `payload["findings"]` via `_findings_from` and `payload["blind"]` via
+`_blind_from`, by those key names. Emitting only `actionable` made this battery
+invisible inside `iteration-open.sh --apply` — it ran the stage, reported rc=0,
+and surfaced nothing. `actionable` is retained unchanged for direct readers
+(the orchestrator's own Phase -0.5a0 calls this script directly and reads the
+human lines); `findings` MIRRORS it for the composed path. Found 2026-08-18
+alongside the identical defect in precheck-sentinel-battery (g-115-6618): two
+of the three stages iteration-open composes were blind, and only
+precheck-always-run-battery — which already emitted `findings` — worked, which
+is why it was the sole lane ever reporting. guard-318.
 
 Fail-open: any error prints the summary/JSON with an `error` field and exits
 0 — the LLM falls back to per-phase checks. The battery must never block the
@@ -146,8 +159,22 @@ def _emit(report: dict, as_json: bool) -> None:
     print(PROTOCOL_FOOTER)
 
 
+def _fail_open(report: dict, reason: str, as_json: bool) -> int:
+    """Record a fail-open exit as BLIND, then emit. Mirrors the identical helper
+    in precheck-sentinel-battery.py — fail-open must not mean fail-SILENT to a
+    composed caller, or an errored battery is indistinguishable from a clean one
+    (guard-4093) and iteration-open's own "N lane(s) blind" branch is unreachable.
+    """
+    report["error"] = reason
+    report["blind"].append({"name": "entry-checks", "phase": "-0.5a..-0.5e",
+                            "reason": reason})
+    _emit(report, as_json)
+    return 0
+
+
 def run(agent_override: str | None, wm_path_override: str | None, as_json: bool) -> int:
-    report: dict = {"checked_at": _now_iso(), "checks": len(ENTRY_CHECKS), "actionable": []}
+    report: dict = {"checked_at": _now_iso(), "checks": len(ENTRY_CHECKS),
+                    "actionable": [], "findings": [], "blind": []}
 
     # Resolve agent state dir (agent-wide session/ dir holds both files).
     try:
@@ -156,13 +183,9 @@ def run(agent_override: str | None, wm_path_override: str | None, as_json: bool)
         agent = agent_override or os.environ.get("MIND_AGENT", "")
         state_dir = Path(agent_state_dir(agent)) if agent else None
     except Exception as exc:
-        report["error"] = f"paths_import_failed: {exc}"
-        _emit(report, as_json)
-        return 0
+        return _fail_open(report, f"paths_import_failed: {exc}", as_json)
     if state_dir is None:
-        report["error"] = "no_agent_binding (MIND_AGENT unset)"
-        _emit(report, as_json)
-        return 0
+        return _fail_open(report, "no_agent_binding (MIND_AGENT unset)", as_json)
 
     # WM slots (same resolver + torn-read posture as precheck-sentinel-battery).
     wm_slots: dict = {}
@@ -180,8 +203,16 @@ def run(agent_override: str | None, wm_path_override: str | None, as_json: bool)
             wm_slots = data.get("slots", data) if isinstance(data, dict) else {}
         else:
             report["error"] = "no_working_memory_file"
+            report["blind"].append({"name": "entry-checks/wm_slot", "phase": "-0.5a..-0.5e",
+                                    "reason": "no_working_memory_file"})
     except Exception as exc:
         report["error"] = f"wm_read_failed: {exc}"
+        report["blind"].append({"name": "entry-checks/wm_slot", "phase": "-0.5a..-0.5e",
+                                "reason": f"wm_read_failed: {exc}"})
+    # These two do NOT return: the file-kind checks below are still evaluable, so
+    # the battery degrades PARTIALLY rather than going dark. The blind entry is
+    # what tells a composed caller that the wm_slot half was not covered -- without
+    # it, a partial run and a full clean run are the same object.
 
     for spec in ENTRY_CHECKS:
         try:
@@ -204,6 +235,16 @@ def run(agent_override: str | None, wm_path_override: str | None, as_json: bool)
                 "phase": spec["phase"],
                 "payload": payload,
                 "dispatch": spec["skill_section"],
+            }
+        )
+        # An ACTIONABLE entry check IS a finding. Built in the SAME loop from the
+        # same spec so the two lists cannot drift; `detail` is a list, which
+        # iteration-open's _findings_from joins.
+        report["findings"].append(
+            {
+                "name": spec["name"],
+                "phase": spec["phase"],
+                "detail": [f"ACTIONABLE -> dispatch {spec['skill_section']}"],
             }
         )
 

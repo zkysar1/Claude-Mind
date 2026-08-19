@@ -134,6 +134,38 @@ fi
 
 if command -v python3 >/dev/null 2>&1; then PY="python3"; else PY="py -3"; fi
 
+# : RESIDUE PRE-CHECK, and it is the root-cause fix rather than the
+# detection one. `cmp` compares the target to the BACKUP, so it can only prove
+# "the file is what it was when this run started" — never "the file is clean".
+# When the target ALREADY contains the injected string at entry, the backup
+# captures that residue, restore faithfully writes it back, cmp matches, and the
+# run emits verdict PASS whose reason literally reads "restore left no sabotage
+# behind" while the sabotage is live. MEASURED 2026-08-16 (alpha, hostname cc-08,
+# uname -r 6.8.0-137-generic): deterministic, one run, on a two-site fixture with
+# one site pre-sabotaged. That is STRICTLY WORSE than the  incident it
+# was filed from, which at least returned FAIL.
+#
+# The property that makes this worth a hard refuse and not a warning: residue is
+# SELF-PERPETUATING. Once any run leaves the string behind — an interrupted run,
+# a concurrent run, a genuine restore failure — every subsequent run adopts it as
+# baseline and certifies it clean, forever, with the evidence deleted each time.
+# Refusing at entry breaks that chain at the only point where the file is still
+# known-good.
+#
+# Only the --sabotage-old/--sabotage-new form can be checked: the --sabotage-sed
+# form injects an expression whose output text is not knowable here. That case is
+# reported as `residue_check: unavailable` rather than silently passing, because
+# an unchecked lane that renders identically to a checked one is how this defect
+# stayed invisible (guard-1760).
+RESIDUE_CHECK="unavailable"
+if [[ -n "${SAB_NEW:-}" ]]; then
+  RESIDUE_CHECK="clean"
+  if grep -qF -- "$SAB_NEW" "$TARGET" 2>/dev/null; then
+    echo "ERROR: --target already contains the --sabotage-new string before this run started, so a backup taken now would capture RESIDUE and every verdict below would be about the wrong baseline. This is what a previous interrupted/concurrent run leaves behind; it is self-perpetuating and each run deletes the evidence. Remove the residue from '$TARGET' and re-run. Offending string: $SAB_NEW" >&2
+    exit 2
+  fi
+fi
+
 BACKUP="${TARGET}.mutation-backup.$$"
 cp -p "$TARGET" "$BACKUP" || { echo "ERROR: could not back up target" >&2; exit 2; }
 
@@ -144,11 +176,31 @@ restore() {
   [[ -f "$BACKUP" ]] || return 0
   cp -p "$BACKUP" "$TARGET" 2>/dev/null || true
   if cmp -s "$BACKUP" "$TARGET"; then
-    rm -f "$BACKUP"; RESTORE_STATUS="ok"
+    # : cmp proves target==backup, NOT target-is-clean. Re-check the
+    # injected string directly so a matching-but-dirty pair cannot report "ok".
+    # With the pre-check above this should be unreachable; it is kept because the
+    # two guards fail independently (the pre-check cannot see residue introduced
+    # DURING the run by a concurrent instance, which is measured-real: two
+    # overlapping runs on one target produced a false `sabotage_red:false`
+    # "vacuous test" verdict and a false baseline-red "broken test" verdict in
+    # the same pair).
+    if [[ "$RESIDUE_CHECK" != "unavailable" ]] && grep -qF -- "$SAB_NEW" "$TARGET" 2>/dev/null; then
+      RESIDUE_CHECK="RESIDUE"
+      RESTORE_STATUS="FAILED"
+      echo "CRITICAL: restore wrote a backup that ITSELF contains the sabotage string — '$TARGET' matches its backup but is NOT clean. SABOTAGE IS LIVE. The backup at '$BACKUP' is retained deliberately; it is the residue, not the recovery." >&2
+      return 0
+    fi
+    RESTORE_STATUS="ok"
   else
     RESTORE_STATUS="FAILED"
     echo "CRITICAL: restore verification FAILED — '$TARGET' does not match backup '$BACKUP'. SABOTAGE MAY BE LIVE. Manually restore from the backup file." >&2
   fi
+  #  outcome 3: the backup is NO LONGER deleted here. It used to be
+  # rm-ed the instant cmp matched — i.e. before the post-restore test had run —
+  # so the one artifact that could prove what happened was destroyed at exactly
+  # the moment the run was about to go red. It is now removed only on the
+  # success path (just before the PASS emit), which means every non-PASS exit,
+  # including a trap-driven one, leaves the residue recoverable.
 }
 trap restore EXIT INT TERM
 
@@ -171,6 +223,7 @@ emit() {
   SA="$SAB_APPLIED" SR="$SAB_RED" RG="$RESTORE_GREEN" TR="$TEST_RAN" RS="$RESTORE_STATUS" \
   RT="${RED_TESTS:-null}" RC="${RED_COUNT:-null}" RPE="${RED_PARSE_ERRORS:-null}" \
   SS="${SAB_SITES:-null}" SSB="${SAB_SITES_BASIS:-unmeasured}" \
+  RCK="${RESIDUE_CHECK:-unavailable}" \
   $PY -c '
 import os, json
 try:
@@ -195,6 +248,16 @@ print(json.dumps({
   "sabotage_applied": os.environ["SA"], "sabotage_red": os.environ["SR"],
   "restore_green": os.environ["RG"], "test_ran": os.environ["TR"],
   "restore_status": os.environ["RS"],
+  # . restore_status answers "does the target match its BACKUP", which
+  # is NOT "is the target clean" — a backup taken over pre-existing residue
+  # matches itself and reports ok. This field answers the second question
+  # separately so no consumer has to infer one from the other:
+  #   "clean"       the injected string is absent from the target after restore
+  #   "RESIDUE"     it is PRESENT — sabotage is live regardless of restore_status
+  #   "unavailable" NOT CHECKED (--sabotage-sed injects unknowable text). This is
+  #                 an absence of measurement, never a pass; a consumer that
+  #                 treats it as clean has reintroduced the original defect.
+  "residue_check": os.environ["RCK"],
   # null => not measured (no --junit-xml, or the parse failed).
   # []   => measured, and the RED run reported no failing testcase at all —
   #         a real signal, not an absence: the run went red WITHOUT any test
@@ -389,14 +452,23 @@ fi
 restore
 trap - EXIT INT TERM
 if [[ "$RESTORE_STATUS" == "FAILED" ]]; then
-  emit "RESTORE_FAILED" "restore did not reproduce the backup byte-for-byte — sabotage may be live in $TARGET; recover manually"
+  if [[ "$RESIDUE_CHECK" == "RESIDUE" ]]; then
+    emit "RESTORE_FAILED" "restore reproduced the backup byte-for-byte but the BACKUP ITSELF contains the sabotage string, so $TARGET is NOT clean — sabotage is LIVE. Do not read this as a test problem. The backup at $BACKUP is retained; it is the residue, not the recovery."
+  else
+    emit "RESTORE_FAILED" "restore did not reproduce the backup byte-for-byte — sabotage may be live in $TARGET; recover manually"
+  fi
   exit 3
 fi
 
 # --- Step 5: restored code must be GREEN again ---
 if run_test; then RESTORE_GREEN="true"; else
   RESTORE_GREEN="false"
-  emit "FAIL" "post-restore RED: the test fails after restore even though the file matched the backup — the test is flaky or has external state; investigate before trusting it"
+  #  outcome 5: this reason used to assert "the file matched the
+  # backup — the test is flaky or has external state", which points the reader
+  # at their own test and away from an unrestored file. That is a safety tool
+  # whose failure mode is MISDIRECTION. It now states what was and was not
+  # established, and names the two checks a reader should actually run.
+  emit "FAIL" "post-restore RED: the test fails after restore. What is established: the file matches its backup${RESIDUE_CHECK:+ and residue_check=$RESIDUE_CHECK}. What is NOT established: that the file is CLEAN — a backup taken over pre-existing residue matches itself, and --sabotage-sed cannot be residue-checked at all. Before concluding the test is flaky, grep $TARGET for the injected string and, if the target is under world/ or meta/, verify the AUTHORITATIVE copy with backend-cat.sh (NOT world-cat.sh, which reads the local mirror). The backup at $BACKUP is retained for exactly this."
   exit 1
 fi
 
@@ -408,5 +480,10 @@ PASS_REASON="mutation-proof: GREEN on real code -> RED under sabotage -> GREEN a
 if [[ "${SAB_SITES:-}" =~ ^[0-9]+$ ]] && (( SAB_SITES > 1 )); then
   PASS_REASON="${PASS_REASON}. CAVEAT: the sabotage changed ${SAB_SITES} sites (basis=${SAB_SITES_BASIS}), not one — this RED does NOT prove the test is anchored to the site under test, because a predicate that merely matches the token ANYWHERE in the file goes red too. Narrow the mutation to one site (e.g. --sabotage-sed '0,/re/s//new/') to prove anchoring."
 fi
+#  outcome 3: the ONLY place the backup is removed. Reaching here means
+# restore matched, residue_check did not fire, and the post-restore test is green
+# — the one state in which the backup has no evidentiary value. Every other exit
+# path, including the trap, now leaves it on disk.
+rm -f "$BACKUP"
 emit "PASS" "$PASS_REASON"
 exit 0

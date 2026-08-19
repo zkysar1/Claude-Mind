@@ -102,6 +102,15 @@ def _append(root, agent="alpha", content="probe"):
             "PROJECT_ROOT": str(root),
             "STORAGE_BACKEND": "own-cloud",
             "MIND_SID": "",
+            # : execution-diary.py refuses the shared tick under
+            # PYTEST_CURRENT_TEST, because that subprocess is the phantom
+            # team-state-shard writer. THIS suite is the sanctioned opt-in: it is
+            # the one place that legitimately counts tick invocations, and it is
+            # safe because _stage() relocates PROJECT_ROOT and overwrites
+            # heartbeat-tick.sh with a recorder stub (see above) — the tick
+            # invoked here can never reach the live world. Do NOT copy this var
+            # into a test that runs against the real core/scripts.
+            "MIND_DIARY_SHARED_TICK_TEST": "1",
         }
     )
     payload = json.dumps({"entry_type": "observation", "content": content})

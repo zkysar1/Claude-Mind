@@ -41,7 +41,7 @@ Body forks (Phase 2, g-306-65).
 | `mindKey` | string | The Personality this Body belongs to (= agent name; `agents/<mindKey>/`). |
 | `env_id` | string | The environment this Body acts in (`local` by default; an Ayoai place/universe id when embedded). |
 | `role` | enum | `worker` (acts in the env) \| `observer` (read-only — reader/assistant sessions). |
-| `body_state` | enum | `active` \| `closed-pending-merge` \| `merged` \| `closed-stale`. Lifecycle below. |
+| `body_state` | enum | `active` \| `parked` \| `closed-pending-merge` \| `merged` \| `closed-stale`. Lifecycle below. **`parked` is the only non-`active` state that is RESUMABLE** — read the split before writing any consumer. |
 | `started_at` | ISO-8601 | Local time the Body was forked (FORK-BODY). |
 | `forked_wm_hash` | sha256 | Hash of the Mind's `working-memory.yaml` at fork time (the merge baseline). `null` for a non-forking reducer Body (see routing below). |
 
@@ -53,6 +53,37 @@ is swept before merge — deferred to Phase 1D stale-Body preservation, g-306-64
 As of Phase 1C the `active`, `closed-pending-merge`, and `merged` writes are all
 wired (`closed-stale` remains the Phase 1D sweep). All are dormant until a 2nd
 worker Body forks.
+
+**`parked` is a CYCLE, not a step on that chain** (g-306-291, 2026-08-16):
+`active` <-> `parked`, written by `body-manifest.py park` / `resume` when the
+worker's Phase 0.5 reducer-liveness poll flips. It is the state of a Body that
+correctly stopped taking work — no reducer exists to merge it — but intends to
+resume, and it auto-resumes on the next hourly poll that finds a reducer. The
+only exit to the closed chain is EXPIRY (`park-expired`, `PARK_MAX_HOURS` 60h),
+which then runs the ordinary genuine-close path.
+
+**THE PREDICATE RULE FOR EVERY CONSUMER: test the CLOSED SET, never `!= active`.**
+Before `parked` existed, every non-`active` state was terminal, so "not active"
+and "closed" were the same predicate and the codebase used them interchangeably.
+Adding `parked` silently converted each of those into "refuse the Body that is
+deliberately alive" — the durable close this change exists to REMOVE, reappearing
+wherever the shorthand was used. Three live consumers carried it and were fixed in
+the same commit: the worker-loop Phase -0 closure gate, `deadman-directive.sh`'s
+resurrection prompt (which would have declined to resume AND declined to re-arm,
+leaving no wakeup at all), and `stop-hook.sh`'s worker-net (which would have
+BLOCKed the parked turn-end into a sentinel ceremony that closes the Body). Any
+NEW consumer must name the three closed states explicitly and let an unrecognised
+state fall toward RUNNING — a wrong close is unrecoverable without a human
+`/start`, a wrong continue is not.
+
+Consumers deliberately NOT changed, because they already test equality and are
+correct as-is: `body-merge.py` / `generalize_down` enumerate only
+`closed-pending-merge`, so a parked Body is never merged out from under itself;
+`cleanup-stale-bindings.sh` skips only `merged`, so an ABANDONED park (one whose
+wakeup chain broke) still has its forked WM preserved to staging when its dir is
+swept — verified, not assumed: a polling park refreshes `sessions/<SID>/`
+mtime hourly via the Phase -0.4 heartbeat tick, so it cannot reach that sweep's
+24h floor while it is alive.
 
 **Reducer is DERIVED, not stored** (rb / design SSOT `mind-engine-identity-bridge`):
 the reducer is whichever **worker** Body holds `agents/<mindKey>/session/running-session-id`
@@ -115,6 +146,50 @@ scaffolding.) See `core/scripts/body-merge.py` and
 not-merged, array+counter merge, active_context reducer-wins, timestamp
 latest-wins, loop_state recurse, body-only slot carry, hash short-circuit via
 the real fork path, multi-body).
+
+### Cross-box visibility of `sessions/` — DECIDED: box-local, never synced (E3, 2026-08-16)
+
+`agents/<agent>/sessions/` is walk-pruned from own-cloud sync (`owncloud_sync._EXCLUDE_DIRS`)
+AND `OwnCloudBackend._machine_local` (so a per-op backend write/read never touches
+S3 either). A reducer on box A therefore CANNOT read a worker's
+`sessions/<unitKey>/body-manifest.yaml` or `working-memory.yaml` from box B, ever.
+Measured 2026-08-16 (alpha, cc-09; live worker d1aec55b on cc-07): both files
+`_machine_local: True`, both ABSENT in the store; the store's whole `sessions/`
+listing for alpha is one stale unit holding one hand-pushed artifact and no manifest
+(matches `fleet_config_parity`'s 2026-08-07 finding — one manifest in the entire
+store, a test fixture). Two code paths (`body-merge._enumerate_pending`,
+`capture_fast_lane._enumerate_all_bodies`) still UNION `backend.list_dir(sessions_root)`
+"because a Body that shipped from another box has its files only in the store"; that
+listing can name unit dirs but never yields a manifest or WM, so the union is inert
+for cross-box Bodies (harmless — a store-only unit reads `None` and is skipped).
+
+This is a decision, not a gap, and it was made twice on evidence — do not re-open it
+by syncing `sessions/`: (1) g-306-119-b — a REMOTE Body's genuine close STAGES its
+WM + fork baseline + hash into `session/pending-body-merges/` (singular `session/`,
+syncable) and pushes each file EXPLICITLY (`body-manifest.py::_stage_and_push`;
+`owncloud-flush` cannot do it because `sweep()` pushes only claim-owning agent dirs
+and a worker box owns none); the reducer's `_consume_staged` reads authoritative-first
+and enumerates the store listing (g-306-187). (2) g-115-6240 deliberately REJECTED
+pushing `sessions/<unitKey>/` files ("a SECOND copy of the same bytes in the store …
+redundancy in a merge path is where later double-counting comes from"). The manifest
+is a per-box DURABLE CLOSURE RECORD for that box's stop-hook / deadman / cleanup —
+nothing on another box needs it; cross-box liveness rides team-state body rows, the
+worker-stall CARRIER (`worker_stall.enumerate_carriers`, authoritative store) and the
+DDB runner claim.
+
+**The one thing this leaves without transport is an ACTIVE remote Body's WM.** The
+close-time staged push fires only at genuine close, so `capture_fast_lane`
+(g-306-293), whose stated purpose is to rescue `load_bearing` captures from
+long-running ACTIVE Bodies before FIFO eviction, can enumerate only SAME-BOX Bodies —
+and its motivating measurement (a Body on cc-08, reducer on cc-04) is exactly the
+case it cannot serve. Its telemetry row is written only when something merged; the
+file did not exist in the store 1.5 days after landing. Payload is ALSO empty today:
+0 `load_bearing` entries across every reducer WM fleet-wide (alpha exp_capture 72 /
+hyp_capture 28, none flagged). Two independent reasons for one silent zero — the
+transport gap is owned by a Fix goal filed from this evaluation (see asp-306); build
+it only once workers actually flag entries, and build it as a small explicit push
+from the worker's `wm append` of a flagged entry to a `session/`-rooted per-unitKey
+file, NOT by widening the sync.
 
 ### Phase B — worker-goal retrospective (g-306-198, landed)
 
@@ -195,7 +270,53 @@ Each entry in `core/config/session-manifest.yaml` declares:
 | recovery_action | Meaning | Example files |
 |-----------------|---------|---------------|
 | `preserve` | Survives `/start --recover`. Either durable data (handoff.yaml, working-memory.yaml) or files whose owners idempotently regenerate them. | `agent-state`, `agent-mode`, `handoff.yaml`, `working-memory.yaml`, `execution-diary.jsonl`, `pending-questions.yaml` |
-| `clear` | `rm -f`'d by `/start --recover` because presence after a crash means "stale transient." | `loop-active`, `stop-loop`, `stop-requested`, `stop-target-mode`, `iteration-checkpoint.json`, `compact-pending`, `compact-checkpoint.yaml`, `runner-heartbeat`, `running-session-id`, `compact-checkpoint.json` |
+| `clear` | `rm -f`'d by `/start --recover` because presence after a crash means "stale transient." | `loop-active`, `stop-loop`, `stop-requested`, `stop-target-mode`, `last-stop-reason`, `iteration-checkpoint.json`, `compact-pending`, `compact-checkpoint.yaml`, `runner-heartbeat`, `running-session-id`, `compact-checkpoint.json` |
+
+## `last-stop-reason` — why a box went quiet (g-115-6322)
+
+Four framework paths stop the loop **on purpose** and, before 2026-08-15, told
+nobody: `productivity-stop-gate.sh` (composite score below floor),
+`recovery-gate.sh`'s zombie `RUNNING`→`IDLE` recovery, `recovery-gate.sh`'s
+`recovery-failed-permanent` circuit breaker (≥3 consecutive failed recoveries),
+and `reducer-self-fence.sh`'s cross-machine lease stepdown. Because `/start` is
+**user-only**, the box then sits IDLE until a human independently notices — which
+is exactly what the user reported as the loop "going into quiet mode and staying
+quiet unnoticed."
+
+All four now call `core/scripts/stop-reason-record.py`, which writes this file
+and fires the notification. Format is KEY=VALUE lines (`jq` is absent on some
+fleet boxes):
+
+```
+path=reducer-self-fence          # one of the closed VALID_PATHS set
+stopped_at=2026-08-15T23:11:04
+agent=bravo
+box=cc-05
+reason=reducer lease stand-down (different-holder): ...
+user_initiated=0                 # 1 when the USER ran /stop — records, never emails
+notified=sent                    # sent | throttled | failed | skipped-* | disabled
+```
+
+| Property | Value | Why |
+|---|---|---|
+| writer | `stop-reason-record.py` only | Single writer (guard-155); the four callers pass `--path`. |
+| `recovery_action` | `clear` | **Load-bearing.** A file surviving a restart would make the fleet sweeper read a *later* crash as EXPECTED-IDLE — a false negative on the one case it exists to catch. |
+| `sync_tier` | `machine_local` | A stop on this box says nothing about a peer; syncing would manufacture phantom stop reasons fleet-wide (same rationale as `running-session-id`). |
+| write mode | atomic `.tmp` + `os.replace` | guard-320 — the sweeper may read it concurrently, and a torn read misclassifies the box. |
+| blocking | never | The recorder always exits 0. A stop must never be blocked by its own announcement. |
+
+**Consumer**: `g-115-6320` (the out-of-loop fleet-liveness sweeper) reads this
+file to classify an IDLE box as **EXPECTED-IDLE** (a reason file exists — the
+stop was deliberate and has already been announced once) versus
+**UNEXPECTED-IDLE** (no reason file — the process died, nobody was told, alert).
+That distinction is the whole point of the file: without it, a sweeper can see
+that a box is idle but not whether anyone knows why.
+
+Notification is throttled per-path (default 60 min) using the *previous* reason
+file as the throttle state — deliberately no second stamp file to drift out of
+sync with it. Only a previously **sent** notification throttles: if a `failed`
+send throttled, one transport blip would silence that path for the whole window,
+which is the very failure mode this file exists to prevent.
 
 ## Manifest consumers
 

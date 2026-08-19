@@ -247,26 +247,88 @@ fi
 IP_DEFER_STREAK_ALARM="${ITERATION_PUSH_DEFER_STREAK_ALARM:-3}"
 case "$IP_DEFER_STREAK_ALARM" in ''|*[!0-9]*) IP_DEFER_STREAK_ALARM=3;; esac
 
+#  (wedge shape B): the paths that made THIS iteration's dirty-defer a
+# durable-cross-agent defer, space-separated, or empty. Script-scope on purpose —
+# `_heal_defer` is `local` to _selfheal_cross_agent_churn_remerge and the shape is
+# needed at the tick site ~350 lines later. Safe because that function is invoked
+# as `_selfheal_cross_agent_churn_remerge || _selfheal_rc=$?` in the CURRENT shell
+# (verified, not assumed — a subshell call would silently drop every assignment).
+_IP_DEFER_DURABLE=""
+
 _ip_streak_file() { printf '%s' "${GITDIR:+$GITDIR/iteration-push-defer-streak}"; }
 
 _ip_defer_streak_reset() {
   local f; f="$(_ip_streak_file)"
-  { [ -n "$f" ] && rm -f "$f"; } 2>/dev/null || true
+  { [ -n "$f" ] && rm -f "$f" "${f}-escalated"; } 2>/dev/null || true
+}
+
+# Capture WHICH paths conflicted, BEFORE `git merge --abort` destroys the
+# evidence (). Every conflict-abort site below logged "investigate
+# which store conflicted" and then immediately aborted, discarding the only
+# state that could answer it. Measured over 2026-08-01..08-18 on cc-02: 388
+# integrate attempts, 5 conflict events in 4 incidents — and ZERO of them
+# attributable to a store, so "agent-ledger conflict count over the window"
+# was not measurable AT ALL from this log. The instrument named the question
+# and destroyed its own answer one line earlier.
+#
+# Resolving each path's merge driver in the same breath is the point, not
+# decoration: a conflicted path reading `merge=unspecified` IS the driver gap,
+# named at the moment it actually bites, which is the one moment it is not a
+# guess. `--diff-filter=U` is valid ONLY in the MERGE_HEAD-present shape
+# (guard-1985) — every caller is already inside that branch, and the
+# empty-result line below keeps a silent probe from reading as "no paths".
+_ip_log_conflict_paths() {
+  local paths n p drv line=""
+  paths="$(git -C "$REPO" diff --name-only --diff-filter=U 2>/dev/null)"
+  if [ -z "$paths" ]; then
+    log "conflicted paths: NONE REPORTED — unmerged-path probe came back empty (not the same as 'no conflict'; see guard-1985)"
+    return 0
+  fi
+  n="$(printf '%s\n' "$paths" | grep -c . || true)"
+  while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    drv="$(git -C "$REPO" check-attr merge -- "$p" 2>/dev/null | sed 's/.*: merge: //')"
+    line="${line}${line:+, }${p} (merge=${drv:-unknown})"
+  done < <(printf '%s\n' "$paths" | head -12)
+  log "conflicted paths (${n}): ${line}"
 }
 
 _ip_defer_streak_tick() {  # $1 = shape (dirty-defer | conflict-abort)
-  local f n=0 since="" first=""
+  local f n=0 since="" first="" _rest=""
   f="$(_ip_streak_file)"
   [ -z "$f" ] && return 0
   if [ -f "$f" ]; then
     first="$(head -n 1 "$f" 2>/dev/null || echo "")"
-    n="${first%% *}"; since="${first#* }"
+    # 3-field format since : "n since shape" (older 2-field files
+    # parse identically — the shape field is simply absent).
+    n="${first%% *}"; _rest="${first#* }"; since="${_rest%% *}"
     case "$n" in ''|*[!0-9]*) n=0; since="";; esac
     [ "$since" = "$first" ] && since=""
   fi
   n=$(( n + 1 ))
   [ -z "$since" ] && since="$(date +%Y-%m-%dT%H:%M:%S)"
-  printf '%s %s\n' "$n" "$since" >"$f" 2>/dev/null || true
+  printf '%s %s %s\n' "$n" "$since" "${1:-unknown}" >"$f" 2>/dev/null || true
+  # --- Repeating-conflict escalation directive () -------------------
+  # A conflict-abort is the ONE shape retrying can never clear (the hint below
+  # says so), yet every caller of this script is fail-soft — a worker Body ran
+  # 85 commits behind on cc-08 retrying an identical conflict every cycle,
+  # which CONCEALED the peer fix sitting behind the blocked merge. At the Kth
+  # consecutive conflict (default 2), print an explicit caller-facing directive
+  # ONCE per streak (marker file keyed on `since`; reset clears it). Fail-open:
+  # a marker write failure just re-prints next cycle, which is harmless.
+  local IP_CONFLICT_ESCALATE="${ITERATION_PUSH_CONFLICT_ESCALATE:-2}"
+  case "$IP_CONFLICT_ESCALATE" in ''|*[!0-9]*) IP_CONFLICT_ESCALATE=2;; esac
+  if [ "${1:-}" = "conflict-abort" ] && [ "$n" -ge "$IP_CONFLICT_ESCALATE" ]; then
+    local mk="${f}-escalated" prev_since=""
+    [ -f "$mk" ] && prev_since="$(head -n 1 "$mk" 2>/dev/null || echo "")"
+    if [ "$prev_since" != "$since" ]; then
+      local cbehind
+      cbehind="$(git -C "$REPO" rev-list --count "$BRANCH..$UPSTREAM" 2>/dev/null || echo '?')"
+      log "═══ REPEATING MERGE CONFLICT — ESCALATION REQUIRED (g-306-315) ═══"
+      log "The last ${n} integrate attempts since ${since} ALL hit a TRUE content conflict (behind=${cbehind}). Retrying can NEVER clear this and every peer fix stays concealed behind the blocked merge. CALLER MUST ESCALATE NOW: (1) post a coordination-board escalation naming the conflicted path(s) from the merge output above + behind=${cbehind} + this box; (2) worker Body: append an sq-013 observation to spark_capture so the reducer files an Unblock — reducer: file the Unblock directly. Then continue the cycle on local code; do NOT hand-resolve mid-goal and do NOT stop the loop."
+      printf '%s\n' "$since" >"$mk" 2>/dev/null || true
+    fi
+  fi
   if [ "$n" -ge "$IP_DEFER_STREAK_ALARM" ]; then
     local behind ahead _hint
     behind="$(git -C "$REPO" rev-list --count "$BRANCH..$UPSTREAM" 2>/dev/null || echo '?')"
@@ -278,6 +340,17 @@ _ip_defer_streak_tick() {  # $1 = shape (dirty-defer | conflict-abort)
     _hint="read the defer reason above — a partner's staged entries (guard-741), index.lock contention, or dirty shared files — and clear it"
     if [ "${1:-}" = "conflict-abort" ]; then
       _hint="this is a TRUE cross-machine content conflict, NOT a dirty tree — resolve it by hand (git merge ${UPSTREAM}) and commit the resolution; retrying alone will never clear it"
+    elif [ "${1:-}" = "durable-crossagent-defer" ]; then
+      #  (wedge shape B). The dirty-defer hint above prescribes "clear
+      # it", which for THIS shape is the one FORBIDDEN action —  defers
+      # precisely to protect a partner's unpushed divergence in an identity file
+      # or the learning archive, so clearing destroys exactly what the defer was
+      # defending. Three operators on two boxes derived the procedure below by
+      # hand because no message anywhere stated it; one box stranded 92 commits.
+      # Reaching here also means git has NO commutative driver for the path (the
+      #  arm commits those before the defer), so waiting cannot help:
+      # nothing between the two refusals will ever resolve it.
+      _hint="DURABLE cross-agent file(s) differing from BOTH HEAD and ${UPSTREAM}, with no commutative git merge driver: ${_IP_DEFER_DURABLE:-see the defer line above}. Do NOT clear them — that DISCARDS a partner's unpushed work (g-115-6145) — and do NOT wait, as this shape never self-clears. SANCTIONED PROCEDURE (hand-derived 3x, g-115-6632): prove the local side safe by comparing record-id SETS across local / HEAD / ${UPSTREAM} — safe when local is a SUPERSET, or when the whole delta is one field rolling across a recurring occurrence with local the newer side — then COMMIT the partner file with that proof in the message and let the merge reconcile it. If you cannot prove it, post a coordination-board escalation naming the path(s) and leave the file untouched; never clear on a hunch"
     fi
     log "⚠ INTEGRATE-DEFER STREAK: ${n} consecutive integrate failure(s) (${1:-unknown}) since ${since} — behind=${behind}, ahead=${ahead}. The merge keeps failing, so this box CANNOT push (non-fast-forward) and is stranding (g-115-4484 class; every defer line is persisted in .git/iteration-push.log). ACT NOW: ${_hint}; do NOT wait for the stranded-depth alarm at ${ITERATION_PUSH_BULK_ALARM:-25} commits."
     if [ -n "${MIND_AGENT:-}" ] && [ -d "$REPO/agents/${MIND_AGENT}" ]; then
@@ -336,10 +409,18 @@ _ip_defer_streak_tick() {  # $1 = shape (dirty-defer | conflict-abort)
 # STORAGE_BACKEND unset in-shell.
 # The structural probe needs no config because tracking .mind-data/ IS what
 # local-backend MEANS: measured 0 tracked files in the own-cloud repo (dir
-# absent entirely) vs 407 in the local one. It also cannot produce a false
-# "local" for own-cloud — an own-cloud repo keeps world/ and meta/ external, so
-# there is nothing under .mind-data/ for git to track. Ordered last so an
-# explicit setting always wins; `head -1` short-circuits the ls-files walk.
+# absent entirely) vs 407 in the local one. Ordered last so an explicit setting
+# always wins; `head -1` short-circuits the ls-files walk.
+#
+# THE "cannot produce a false local for own-cloud" CLAIM THAT USED TO SIT HERE
+# IS RETIRED (). It rested on "an own-cloud repo keeps world/ and
+# meta/ external, so there is nothing under .mind-data/ for git to track", and
+# that stopped being true on 2026-07-28 when .mind-data/ became git-tracked on
+# own-cloud deployments (see .gitignore's MACHINE-LOCAL note, which even keeps
+# world+meta changelog.jsonl deliberately TRACKED). The resolver itself is still
+# correct — it returns own-cloud there, which is the truth — but BACKEND STOPPED
+# BEING A PROXY FOR TRACKEDNESS, and the classifier below was reading it as one.
+# Use _ip_mind_data_tracked() for the "is git responsible for this path" question.
 _ip_storage_backend() {
     local v="${STORAGE_BACKEND:-}"
     if [[ -z "$v" && -f "$REPO/.env.local" ]]; then
@@ -350,6 +431,27 @@ _ip_storage_backend() {
         v="local"
     fi
     printf '%s' "$v" | tr '[:upper:]' '[:lower:]'
+}
+
+# Is git RESPONSIBLE for .mind-data/ in this repo? ()
+# This is the question the .mind-data/* classifier arm actually needs, and it is
+# NOT the same question as the backend. A path that is gitignored can never be
+# dirty (the dirty set comes from `ls-files --others --exclude-standard` plus the
+# tracked diff), so if git tracks nothing here the arm is unreachable and this
+# returns false harmlessly. If git DOES track it, then a dirty file there is this
+# box's own write to a path the repo deliberately backs up — commit it, exactly
+# as the local backend already does, rather than deferring forever on it.
+# Memoized: the answer cannot change inside one run, and `head -1` short-circuits.
+_IP_MD_TRACKED=""
+_ip_mind_data_tracked() {
+    if [ -z "$_IP_MD_TRACKED" ]; then
+        if [ -n "$(git -C "$REPO" ls-files .mind-data 2>/dev/null | head -1)" ]; then
+            _IP_MD_TRACKED=yes
+        else
+            _IP_MD_TRACKED=no
+        fi
+    fi
+    [ "$_IP_MD_TRACKED" = yes ]
 }
 
 # --- Blocking-set narrowing () ------------------------------------
@@ -398,6 +500,141 @@ _ip_blocking_paths_from_merge_out() {
 # above (_ip_blocking_paths_from_merge_out / _ip_blocks), which the other
 # implementation does not have and which is the actual wedge fix.
 
+# : prove SEMANTIC identity between two git-resolvable versions of a
+# path, so byte-level serialization churn is not mistaken for a partner's work.
+#
+# WHY THIS EXISTS. Everything below decides between RESTORING a file and
+# DEFERRING the merge, and the only predicate it had was "git says this path
+# differs". That cannot distinguish a partner's real uncommitted work from
+# key-order churn by a re-serializing JSON writer or CRLF churn from a Windows
+# box. On an own-cloud fleet the churn case is the common one and it NEVER
+# self-clears — the sync layer re-churns the file, so every later iteration
+# defers again. Measured on cc-03 2026-08-10: 3 consecutive defers, 49 commits
+# behind, unable to push, on two files whose parsed content was byte-for-byte
+# equal to HEAD (672 vs 672 record ids, zero records differing on any field).
+#
+# Echoes exactly one of: identical | different | unparseable.
+# ONLY `identical` licenses a restore. Both other verdicts mean defer, and the
+# asymmetry is the whole design: a wrong `different` costs one retried merge,
+# a wrong `identical` destroys a partner's uncommitted work permanently.
+#
+# An EMPTY revspec prefix means the WORKING TREE, which is read from disk — not
+# via `git show`, because `git show <path>` resolves a rev/object and does not
+# read the worktree at all. Getting that wrong would compare the wrong bytes
+# and could license a restore over a file nobody had actually compared.
+_ip_semantic_verdict() {
+  local _lpfx="$1" _rpfx="$2" _rel="$3" _lf _rf _v
+  _lf="$(mktemp 2>/dev/null)" || { echo unparseable; return 0; }
+  _rf="$(mktemp 2>/dev/null)" || { rm -f "$_lf"; echo unparseable; return 0; }
+  _ip_extract_side() {   # $1 = prefix, $2 = destination
+    if [ -z "$1" ]; then cat -- "$REPO/$_rel" > "$2" 2>/dev/null
+    else git -C "$REPO" show "$1$_rel" > "$2" 2>/dev/null; fi
+  }
+  # A missing side (added/deleted path) is NOT provably identical -> defer.
+  if ! _ip_extract_side "$_lpfx" "$_lf" || ! _ip_extract_side "$_rpfx" "$_rf"; then
+    rm -f "$_lf" "$_rf"; echo unparseable; return 0
+  fi
+  # $SCRIPT_DIR, never "$REPO/core/scripts": $REPO is the repo being PUSHED,
+  # which --repo can point anywhere (in tests it is a bare temp clone with no
+  # core/ tree at all). Resolving the comparator against the target repo made
+  # every verdict `unparseable` -> defer, i.e. the fix silently did nothing.
+  _v="$(python3 "$SCRIPT_DIR/semantic_identity.py" \
+          "$_lf" "$_rf" --name "$_rel" 2>/dev/null)"
+  rm -f "$_lf" "$_rf"
+  # An absent/garbled verdict means the comparator itself failed. Fail SAFE.
+  case "$_v" in identical|different|unparseable) : ;; *) _v=unparseable ;; esac
+  echo "$_v"
+}
+
+# True only when EVERY supplied path is provably identical between the two
+# revspec prefixes. Short-circuits on the first non-identical verdict, so one
+# genuinely-modified file in a batch defers the whole batch — which is the
+# conservative reading and matches the all-or-nothing shape of the callers.
+_ip_all_semantically_identical() {
+  local _lpfx="$1" _rpfx="$2"; shift 2
+  local _p
+  [ "$#" -eq 0 ] && return 1     # nothing proven -> never license a restore
+  for _p in "$@"; do
+    [ "$(_ip_semantic_verdict "$_lpfx" "$_rpfx" "$_p")" = identical ] || return 1
+  done
+  return 0
+}
+
+# : DURABLE cross-agent state — agent IDENTITY and the learning
+# archive. The agents/* arm below restores (tracked) or deletes (untracked)
+# anything git names as blocking, with NO content check, at a measured ~1/day
+# over 12 days on one box. Both sibling arms already refuse to do that:
+# .mind-data/* COMMITS because clearing "would DISCARD encoded knowledge", and
+# the shared *) arm clears only on a provable `identical` verdict. This set is
+# the third arm's version of that same refusal.
+#
+# Matched on BASENAME first, deliberately: these names recur at several depths,
+# and a path-prefix test would miss the per-record files that are the bulk of
+# the archive (5595 experience/ + 488 journal/ files measured on one box).
+#
+# Deliberately NARROW rather than "every cross-agent file". Deferring instead of
+# clearing is not free — / show a permanent stall wearing a
+# transient's message when a re-dirtying path defers every iteration. Scoping to
+# identity + the archive bounds that risk to files that are rewritten rarely,
+# while leaving ordinary cross-agent churn (state.jsonl et al) on the existing
+# clear path.
+_ip_durable_crossagent() {
+  case "${1##*/}" in
+    aspirations.jsonl|experience.jsonl|experience-archive.jsonl|journal.jsonl|self.md)
+      return 0 ;;
+  esac
+  case "$1" in
+    agents/*/experience/*|agents/*/journal/*) return 0 ;;
+  esac
+  return 1
+}
+
+# : the question the deadlock poses is "who resolves a durable
+# cross-agent file that is dirty on a box that does not own it". The answer is
+# NOBODY — git does, at the merge, IF a commutative merge driver is configured
+# for that path. Then the third option opens: neither CLEAR (destroys the
+# partner's divergence, ) nor DEFER (a permanent wedge, since
+# iteration-commit.sh's namespace filter correctly refuses the same file and no
+# arbiter sits between the two refusals) but COMMIT, and let the driver union
+# the records on the way in.
+#
+# BOTH LEGS ARE LOAD-BEARING. `.gitattributes` is version-controlled so the
+# ATTRIBUTE is present in every clone, but the DRIVER lives in `.git/config`,
+# which is NOT — it is registered per-clone by install-git-hooks.sh. On a box
+# where that never ran, git silently falls back to its default text merge and
+# the union guarantee does not exist. Testing the attribute alone would be a
+# control that looks live and is not (guard-3130), so both are tested here.
+#
+# DO NOT substitute coordination_merge.merge_handler_for() for this, which is
+# what the filing goal proposed. That is the OWN-CLOUD arbiter and this is a GIT
+# decision, and the two disagree: measured 2026-08-17 on cc-08, merge_handler_for
+# registers 1 of the 7 durable cross-agent shapes (aspirations.jsonl) while the
+# git driver handles 5 — git-merge-ayoai-ledger.py carries experience.jsonl /
+# experience-archive.jsonl / journal.jsonl in its own _JSONL_ID_UNION set BEFORE
+# it consults that registry, and agents/*/journal/**/*.md routes to the separate
+# ayoai-journal-md section-union driver. Keying on the wrong layer's classifier
+# would keep deferring three files git can reconcile commutatively.
+#
+# self.md and agents/*/experience/*.md are `unspecified` and therefore still
+# defer — correctly: an identity file and a per-record document are not
+# commutative, and there is nothing to union.
+#
+# WORST CASE IS STRICTLY BETTER THAN THE STATUS QUO. If the driver cannot merge
+# it exits 1 with %A untouched, so git keeps the conflict and the integrate
+# aborts — the ordinary, self-announcing "MERGE CONFLICT ... will retry next
+# iteration" state, which a human or a later merge can resolve. That replaces a
+# dirty file that can be neither cleared nor committed and whose T_recovery is
+# INFINITY.
+_ip_git_mergeable() {
+  local _drv
+  _drv="$(git -C "$REPO" check-attr merge -- "$1" 2>/dev/null)"
+  _drv="${_drv##*: }"
+  case "$_drv" in
+    ''|unspecified|unset|text|binary) return 1 ;;
+  esac
+  [ -n "$(git -C "$REPO" config --get "merge.$_drv.driver" 2>/dev/null)" ]
+}
+
 _selfheal_cross_agent_churn_remerge() {
   local self="${MIND_AGENT:-}"
   if [ -z "$self" ]; then
@@ -408,9 +645,31 @@ _selfheal_cross_agent_churn_remerge() {
   # guard-741: the shared multi-agent index can hold a CONCURRENT agent's STAGED
   # cross-agent files. NEVER discard staged work — if the index has any staged
   # entry, defer (the bare merge already refuses on staged overlap anyway).
-  if [ -n "$(git -C "$REPO" diff --cached --name-only 2>/dev/null)" ]; then
-    log "self-heal: staged index entries present — guard-741, defer (never discard partner's staged work)"
-    return 1
+  local _staged=() _sp
+  while IFS= read -r -d '' _sp; do _staged+=("$_sp"); done \
+    < <(git -C "$REPO" diff --cached --name-only -z 2>/dev/null)
+  if [ "${#_staged[@]}" -gt 0 ]; then
+    # : this gate is the MEASURED source of the stranding, not the
+    # dirty-path arms below. A cross-agent DIRTY file never reaches a defer —
+    # it is routed to cross_dirty and restored with `git checkout --`. Measured
+    # on cc-07 (.git/iteration-push.log, 1719 lines): 1 of 1 deferred merges
+    # came from this gate and 0 from any dirty-path arm, while the cross-agent
+    # clearing path fired 12 times and healed.
+    #
+    # guard-741's INTENT is preserved exactly: never discard a partner's staged
+    # work. When every staged entry is provably identical to HEAD there is no
+    # partner work in the index to discard — that is proven, not assumed, and
+    # anything short of proof still defers.
+    if _ip_all_semantically_identical ":" "HEAD:" "${_staged[@]}"; then
+      log "self-heal: ${#_staged[@]} staged entr(ies) SEMANTICALLY identical to HEAD — serialization churn, unstaging rather than deferring (g-115-5717)"
+      if ! git -C "$REPO" reset -q -- "${_staged[@]}" 2>/dev/null; then
+        log "self-heal: unstaging churn-only index entries failed — defer"
+        return 1
+      fi
+    else
+      log "self-heal: staged index entries present — guard-741, defer (never discard partner's staged work)"
+      return 1
+    fi
   fi
 
   # Two blocking categories, cleared by different git verbs:
@@ -460,10 +719,36 @@ _selfheal_cross_agent_churn_remerge() {
   # Classify the dirty tree: agents/<self>/* is committed, agents/<other>/* is
   # cleared when it blocks, and a BLOCKING path outside agents/* defers the whole
   # tree untouched (never clear or commit core/world/shared work from the push
-  # path). Still all-or-nothing — over the blocking set rather than over every
-  # file that happens to be dirty.
+  # path). Still all-or-nothing over the CLEAR set — over the blocking set rather
+  # than over every file that happens to be dirty.
+  #
+  # : a defer decided mid-classification RECORDS ITSELF and lets the
+  # loop finish, instead of `return 1`-ing on the spot. The six defer arms below
+  # used to return immediately, which abandoned every self-namespace path already
+  # collected into self_paths — and self_paths is not STAGED until after both
+  # loops. So the routine case (a partner's durable store dirty from own-cloud
+  # sync) stranded this Body's own ledger churn uncommitted, where it cannot
+  # travel on refs/workers/<agent>/<sid> and the reducer never sees it at
+  # generalize-down. Measured cc-07 2026-08-16: 3 consecutive dirty-defer cycles,
+  # behind=17 ahead=6, agents/alpha/{aspirations,changelog,experience}.jsonl
+  # uncommitted the whole time while the classifier had correctly collected them.
+  #
+  # THE DEFER IS NOT WEAKENED — that distinction is the whole design. Recording
+  # the defer instead of returning changes WHEN we leave, never WHETHER: the
+  # clear-set is still discarded untouched, _heal_defer still returns 1, and
+  # 's "never clobber a partner's real divergence" is untouched. Only
+  # the independent self-commit, which was already unconditional on the success
+  # path, now also runs on the defer path.
+  #
+  # Collecting the FLAG rather than breaking is load-bearing: `git diff
+  # --name-only` is sorted, so whether a self path precedes the blocking partner
+  # path is decided by how the agent's own name sorts. Breaking on first defer
+  # would fix this for `alpha` and leave `zeta` broken — a correctness property
+  # must not depend on the agent's name.
   local rel name
   local self_paths=() cross_dirty=() cross_untracked=() storage_paths=()
+  local mergeable_cross=()   # : durable cross-agent paths git can union
+  local _heal_defer=0
   local _backend; _backend="$(_ip_storage_backend)"
   # blocks(): does git say THIS path blocks the merge? An empty blocking set
   # (unparseable message) answers yes for everything — the pre-4484 behaviour.
@@ -474,7 +759,60 @@ _selfheal_cross_agent_churn_remerge() {
         name="${rel#agents/}"; name="${name%%/*}"
         if [ "$name" = "$self" ]; then
           self_paths+=("$rel")                       # commit ALL self churn ()
-        elif _ip_blocks "$rel"; then
+        elif [ "$_heal_defer" = 0 ] && _ip_blocks "$rel"; then
+          # : give DURABLE cross-agent state the same content check the
+          # shared *) arm below already applies. `identical` still clears, so
+          #  is unregressed; `different` and `unparseable` defer,
+          # because `checkout --` restores to HEAD and the uncommitted work is
+          # then gone with no recovery path.
+          # : the question a clear must answer is "does restoring this
+          # discard work?", and after the merge the file carries the INCOMING
+          # origin bytes — so local-vs-$UPSTREAM is the deciding comparison, not
+          # local-vs-HEAD. Under own-cloud the sync routinely applies locally the
+          # exact bytes the pending merge is about to deliver, which is identical
+          # to origin and different from the (stale) HEAD: the HEAD-only test
+          # then defers forever and the wedge CANNOT self-clear. Measured three
+          # times by two operators, and all three were freed by hand-proving the
+          # blob equal to origin (cc-07 2026-08-17: zeta/aspirations.jsonl LOCAL
+          # 23 = ORIGIN 23, HEAD 22, byte-identical, wedged 3 cycles at
+          # behind=11/ahead=15).
+          # Either proof licenses the clear, so this only ever WIDENS the
+          # clear set — a file identical to HEAD still clears exactly as
+          # /6145 made it, and a file differing from BOTH still
+          # defers untouched, which is the property  exists to hold.
+          if _ip_durable_crossagent "$rel" \
+             && [ "$(_ip_semantic_verdict "" "HEAD:" "$rel")" != identical ] \
+             && [ "$(_ip_semantic_verdict "" "$UPSTREAM:" "$rel")" != identical ]; then
+            # MERGE RESOLUTION 2026-08-18 ( + , resolved on
+            # cc-08). The two fixes landed concurrently on the same block and
+            # are COMPLEMENTARY, not competing — they act at different levels of
+            # the same conditional, so taking either alone silently drops the
+            # other's guarantee:
+            #    widened the ENTRY CONDITION — a file byte-identical to
+            #     $UPSTREAM is safe to clear (own-cloud routinely applies locally
+            #     the exact bytes the pending merge will deliver), so it must not
+            #     reach the defer body at all.
+            #    added a third DISPOSITION inside the body — of what
+            #     still differs from BOTH, anything git holds a configured
+            #     commutative driver for is COMMITTED, not deferred.
+            # Combined lattice, strictly better than either side alone:
+            #   identical to HEAD ....................... clear (/6145)
+            #   identical to $UPSTREAM .................. clear ()
+            #   differs from both, git-mergeable ........ COMMIT ()
+            #   differs from both, not mergeable ........ defer  ()
+            # Ordering is load-bearing: the mergeable probe runs BEFORE the defer
+            # so the deadlock never forms; see _ip_git_mergeable.
+            if _ip_git_mergeable "$rel"; then
+              log "self-heal: DURABLE cross-agent file $rel differs from HEAD and $UPSTREAM, but git has a configured commutative merge driver — COMMIT it, the driver reconciles at the merge (g-115-6572)"
+              mergeable_cross+=("$rel"); continue
+            fi
+            log "self-heal: DURABLE cross-agent file $rel differs in CONTENT from BOTH HEAD and $UPSTREAM — defer, never clear (g-115-6145/g-115-6538)"
+            # Record the CAUSE so the streak alarm can name this shape instead of
+            # prescribing "clear it" (). Accumulates across paths; the
+            # alarm reads it ~350 lines below, in the same shell.
+            _IP_DEFER_DURABLE="${_IP_DEFER_DURABLE:+$_IP_DEFER_DURABLE }$rel"
+            _heal_defer=1; continue
+          fi
           cross_dirty+=("$rel")                      # clear ONLY what blocks
         fi
         ;;
@@ -485,18 +823,50 @@ _selfheal_cross_agent_churn_remerge() {
         # stranded a live agent: its tree is dirty with .mind-data writes on
         # essentially every tick, so once a second box pushed and a merge became
         # required, the merge deferred every iteration -> no merge -> no push
-        # (non-fast-forward) -> 10 unpushed commits and climbing. Under own-cloud
-        # this arm never fires: world/ and meta/ are external and gitignored.
-        if [ "$_backend" = "local" ]; then storage_paths+=("$rel")
-        elif _ip_blocks "$rel"; then
+        # (non-fast-forward) -> 10 unpushed commits and climbing.
+        #
+        # THE OLD LINE HERE READ "Under own-cloud this arm never fires: world/
+        # and meta/ are external and gitignored." That was true when written and
+        # is now FALSE — and it is the whole of . Measured on ZDS-Mind
+        # (cc-06, own-cloud, 2026-08-10): .mind-data/ is git-tracked there since
+        # 2026-07-28, so world+meta changelog.jsonl / gate-firings.jsonl /
+        # aspirations.jsonl / board/coordination.jsonl / tree/_tree.yaml /
+        # reasoning-bank.jsonl / retrieval-trace.jsonl DO go dirty — every close
+        # phase writes them AFTER iteration-commit staged them. `_backend` is
+        # correctly "own-cloud" there, so this arm deferred on EVERY iteration:
+        # a permanent stall wearing a transient's message ("retry next
+        # iteration" cannot succeed, because the next iteration recreates the
+        # condition), and silent, because rc=2 does not fail the loop. Observed
+        # five consecutive defers and a drift to ahead-15/behind-5.
+        #
+        # So gate on TRACKEDNESS, not on the backend that used to imply it.
+        # Where .mind-data/ is gitignored (this repo) nothing here is reachable,
+        # which makes the added arm a provable no-op rather than a behaviour
+        # change. Where it is tracked, committing is what the local backend has
+        # always done for the identical shape, and the tracked set is already
+        # curated to be merge-safe: the machine-local files that genuinely
+        # cannot merge (presence/, history-save-telemetry) were UNTRACKED for
+        # exactly that reason, while changelog.jsonl was kept because it routes
+        # to merge_append_only_jsonl and reconciled with 0 unique records lost.
+        if [ "$_backend" = "local" ] || _ip_mind_data_tracked; then storage_paths+=("$rel")
+        elif [ "$_heal_defer" = 0 ] && _ip_blocks "$rel"; then
           log "self-heal: blocking file outside agents/* ($rel) — defer (never clear core/world/shared work)"
-          return 1
+          _heal_defer=1; continue
         fi
         ;;
       *)
-        if _ip_blocks "$rel"; then
-          log "self-heal: blocking file outside agents/* ($rel) — defer (never clear core/world/shared work)"
-          return 1
+        if [ "$_heal_defer" = 0 ] && _ip_blocks "$rel"; then
+          # : a shared file whose CONTENT is provably identical to
+          # HEAD carries nothing to lose, so restoring it discards no work.
+          # Only `identical` takes this branch; `different` and `unparseable`
+          # both fall through to the defer below, unchanged.
+          if [ "$(_ip_semantic_verdict "" "HEAD:" "$rel")" = identical ]; then
+            log "self-heal: shared file $rel differs from HEAD only by serialization — restoring, not deferring (g-115-5717)"
+            cross_dirty+=("$rel")
+          else
+            log "self-heal: blocking file outside agents/* ($rel) — defer (never clear core/world/shared work)"
+            _heal_defer=1; continue
+          fi
         fi
         ;;
     esac
@@ -507,21 +877,29 @@ _selfheal_cross_agent_churn_remerge() {
         name="${rel#agents/}"; name="${name%%/*}"
         if [ "$name" = "$self" ]; then
           self_paths+=("$rel")
-        elif _ip_blocks "$rel"; then
+        elif [ "$_heal_defer" = 0 ] && _ip_blocks "$rel"; then
+          # : an UNTRACKED durable cross-agent file has NO HEAD side,
+          # so `git clean` destroys it outright — strictly worse than the tracked
+          # case, which at least restores a committed version. No semantic
+          # verdict is computable (one side does not exist), so defer flatly.
+          if _ip_durable_crossagent "$rel"; then
+            log "self-heal: DURABLE untracked cross-agent file $rel has no HEAD version — defer, never delete (g-115-6145)"
+            _heal_defer=1; continue
+          fi
           cross_untracked+=("$rel")
         fi
         ;;
       .mind-data/*)
         if [ "$_backend" = "local" ]; then storage_paths+=("$rel")
-        elif _ip_blocks "$rel"; then
+        elif [ "$_heal_defer" = 0 ] && _ip_blocks "$rel"; then
           log "self-heal: blocking file outside agents/* ($rel) — defer (never clear core/world/shared work)"
-          return 1
+          _heal_defer=1; continue
         fi
         ;;
       *)
-        if _ip_blocks "$rel"; then
+        if [ "$_heal_defer" = 0 ] && _ip_blocks "$rel"; then
           log "self-heal: blocking file outside agents/* ($rel) — defer (never clear core/world/shared work)"
-          return 1
+          _heal_defer=1; continue
         fi
         ;;
     esac
@@ -540,6 +918,12 @@ _selfheal_cross_agent_churn_remerge() {
   local _heal_stage=() _heal_spec=()
   [ "${#self_paths[@]}" -gt 0 ]    && { _heal_stage+=("${self_paths[@]}");    _heal_spec+=("agents/$self/"); }
   [ "${#storage_paths[@]}" -gt 0 ] && { _heal_stage+=("${storage_paths[@]}"); _heal_spec+=(".mind-data/"); }
+  # : the pathspec here is the EXACT file list, never a namespace dir.
+  # The sibling arms can use a directory because they own that namespace; this
+  # arm does not own the partner's, so limiting the commit to precisely the
+  # paths classified above is what keeps guard-741/836 intact — a partner's
+  # stage racing in after classification is still excluded from the commit.
+  [ "${#mergeable_cross[@]}" -gt 0 ] && { _heal_stage+=("${mergeable_cross[@]}"); _heal_spec+=("${mergeable_cross[@]}"); }
   if [ "${#_heal_stage[@]}" -gt 0 ]; then
     # Keep the ORIGINAL wording when there is no storage churn: the 
     # regression tests assert on it, and with storage_paths empty the extended
@@ -549,6 +933,12 @@ _selfheal_cross_agent_churn_remerge() {
       log "self-heal: committing ${#self_paths[@]} self-namespace + ${#storage_paths[@]} storage-root file(s) pre-merge (g-115-2249/g-115-3877)"
     else
       log "self-heal: committing ${#self_paths[@]} SELF-namespace file(s) pre-merge (g-115-2249)"
+    fi
+    # Emitted as a SEPARATE line, leaving both lines above byte-identical: the
+    #  regression tests assert those phrasings as exact substrings
+    # (guard-695 — never change a shape test code asserts against).
+    if [ "${#mergeable_cross[@]}" -gt 0 ]; then
+      log "self-heal: + ${#mergeable_cross[@]} git-mergeable durable cross-agent file(s) committed rather than deferred (g-115-6572)"
     fi
     if ! git -C "$REPO" add -- "${_heal_stage[@]}" 2>/dev/null; then
       log "self-heal: git add of self-namespace churn failed — defer"
@@ -560,6 +950,9 @@ _selfheal_cross_agent_churn_remerge() {
     if [ "${#storage_paths[@]}" -gt 0 ]; then
       _heal_msg="chore($self): pre-merge self+storage churn (iteration-push self-heal, g-115-2249/g-115-3877)"
     fi
+    if [ "${#mergeable_cross[@]}" -gt 0 ]; then
+      _heal_msg="chore($self): pre-merge churn + ${#mergeable_cross[@]} git-mergeable cross-agent ledger(s) (iteration-push self-heal, g-115-6572)"
+    fi
     if ! git -C "$REPO" commit -q -m "$_heal_msg" \
          -- "${_heal_spec[@]}" 2>/dev/null; then
       # Unstage what we staged so a failed heal leaves the index as found.
@@ -569,8 +962,53 @@ _selfheal_cross_agent_churn_remerge() {
     fi
   fi
 
+  # : the defer recorded during classification lands HERE — after the
+  # self/storage commit above, before the clear below. That position is the
+  # entire fix, and both halves of it matter:
+  #   AFTER the commit  — self-namespace churn is no longer stranded behind a
+  #                       partner file this Body does not own and cannot clear.
+  #   BEFORE the clear  — nothing in the clear-set is touched, so the defer is
+  #                       exactly as conservative as it was ().
+  # Returning 1 keeps the caller's contract identical: it still reports
+  # "merge DEFERRED" and still retries the merge next iteration.
+  if [ "$_heal_defer" = 1 ]; then
+    if [ "${#_heal_stage[@]}" -gt 0 ]; then
+      log "self-heal: deferring on cross-agent/shared churn, but ${#_heal_stage[@]} self+storage file(s) were COMMITTED first — not stranded behind the defer (g-115-6373)"
+    fi
+    return 1
+  fi
+
   if [ $(( ${#cross_dirty[@]} + ${#cross_untracked[@]} )) -gt 0 ]; then
     log "self-heal: clearing ${#cross_dirty[@]} tracked + ${#cross_untracked[@]} untracked cross-agent file(s), retrying merge once (g-115-1843)"
+    # NAME EVERY DISCARDED PATH (). The count line above was the ONLY
+    # record this branch left, which made the single destructive arm of this
+    # helper the one arm with no auditable trace. Three independent reasons the
+    # loss is otherwise invisible AFTER the fact, all measured 2026-08-13 (zeta,
+    # hostname cc-02, uname -r 6.8.0-137-generic):
+    #   1. the discarded content was never committed, so git history cannot show it;
+    #   2. this line reported a COUNT and no paths, so the push log cannot either;
+    #   3. the goal-record fingerprint of a reverted close (outcome_class survives,
+    #      completed_date nulled) SELF-ERASES as soon as the selector re-offers the
+    #      goal and it re-executes — which is how  was detected at all.
+    # So "did this ever discard a goal queue?" was unanswerable by construction:
+    # the branch fired 11 times in 12 days on ONE box, and nothing on disk could
+    # say whether any of those 11 took an aspirations.jsonl, an experience archive,
+    # a journal, or a self.md — all of which are tracked under agents/* and all of
+    # which this arm is eligible to clear. A count cannot answer "what did I lose".
+    # Emitted as SEPARATE lines, leaving the count line byte-identical, because
+    # test_iteration_push.py asserts that phrase as an exact substring at two sites
+    # (guard-695 — never change a shape test code asserts against).
+    local _cleared_rel
+    if [ "${#cross_dirty[@]}" -gt 0 ]; then
+      for _cleared_rel in "${cross_dirty[@]}"; do
+        log "self-heal: DISCARDING uncommitted tracked cross-agent work: $_cleared_rel"
+      done
+    fi
+    if [ "${#cross_untracked[@]}" -gt 0 ]; then
+      for _cleared_rel in "${cross_untracked[@]}"; do
+        log "self-heal: DISCARDING untracked cross-agent file: $_cleared_rel"
+      done
+    fi
     [ "${#cross_dirty[@]}" -gt 0 ]     && { git -C "$REPO" checkout -- "${cross_dirty[@]}" 2>/dev/null || true; }
     [ "${#cross_untracked[@]}" -gt 0 ] && { git -C "$REPO" clean -fdq -- "${cross_untracked[@]}" 2>/dev/null || true; }
   fi
@@ -591,12 +1029,70 @@ _selfheal_cross_agent_churn_remerge() {
   # separately with rc=2 so the caller ticks the right streak shape and prints
   # the conflict guidance the FIRST-merge path already prints for this shape.
   if [ -f "$GITDIR/MERGE_HEAD" ]; then
+    _ip_log_conflict_paths
     git -C "$REPO" merge --abort >/dev/null 2>&1 || true
     log "self-heal: churn healed, but the merge retry hit a TRUE content conflict (rc=${MERGE_RC}) — aborted cleanly"
     return 2
   fi
   log "self-heal: merge retry still failed after clearing churn (rc=${MERGE_RC}) — defer"
   return 1
+}
+
+# --- Worker carrier push () ----------------------------------------
+# The carrier push is INDEPENDENT of shared-tree integration. refs/workers/<agent>/<sid>
+# has exactly ONE writer by construction and touches no shared branch, so whether
+# `merge $UPSTREAM` succeeded, conflicted, or deferred says nothing about whether this
+# Body's HEAD should reach the reducer. The ref carries HEAD; integrating origin/main is
+# orthogonal to that.
+#
+# Before this helper existed the push lived ONLY in the block at the integrate/push seam
+# below, and every deferral path soft_exit'd past it. Measured 2026-08-16 (alpha worker
+# Body, cc-07): a 1-line diff in agents/zeta/aspirations.jsonl — a partner store file this
+# Body never touched, left dirty as ordinary own-cloud read-through-cache background state
+# — deferred the merge, so the commit never reached the reducer while the script exited 0.
+# On an own-cloud fleet box that condition is routine, not rare, and the worker neither
+# controls it nor has reason to notice it.
+#
+# Returns 0 when pushed / dry-run / not requested; 1 on unresolved identity or push failure.
+_ip_push_worker_ref() {
+  [ "$PUSH_WORKER_REF" = 1 ] || return 0
+  # Idempotence guard: the deferral seam and the seam block below are mutually
+  # exclusive today, but a future seam must not be able to double-push.
+  [ "${_IP_WREF_DONE:-0}" = 1 ] && return "${_IP_WREF_RC:-0}"
+  _IP_WREF_DONE=1
+  if [ -z "$WORKER_REF_AGENT" ] || [ -z "$WORKER_REF_SID" ]; then
+    log "--push-worker-ref: REFUSED — agent/sid unresolved (MIND_AGENT='$WORKER_REF_AGENT', MIND_SID='$WORKER_REF_SID')."
+    log "  A ref missing either segment would collide across bodies, which is the one property this carrier exists to guarantee."
+    _IP_WREF_RC=1; return 1
+  fi
+  WREF="refs/workers/${WORKER_REF_AGENT}/${WORKER_REF_SID}"
+  if [ "$DRY_RUN" = 1 ]; then
+    log "--push-worker-ref (dry-run): would push HEAD -> $WREF"
+    _IP_WREF_RC=0; return 0
+  fi
+  # No --force. The ref only ever advances for a given body (HEAD moves forward
+  # through commits and merges), so a non-fast-forward here means an assumption
+  # broke — single-writer, or a reset — and it should be LOUD rather than
+  # silently overwritten.
+  if git -C "$REPO" push origin "HEAD:$WREF" >/dev/null 2>&1; then
+    log "--push-worker-ref: pushed HEAD ($(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)) -> $WREF"
+    _IP_WREF_RC=0; return 0
+  fi
+  log "--push-worker-ref: push FAILED for $WREF — this Body's framework edits and local commits have NOT reached the reducer"
+  _IP_WREF_RC=1; return 1
+}
+
+# _ip_defer_exit: EVERY integrate-deferral seam exits through here, so the worker
+# carrier is flushed BEFORE the exit. Routing all three seams (conflict-abort,
+# conflict-after-selfheal, dirty-defer) through one helper is the point: the original
+# defect was not any one seam but that the push sat below all of them, so a fourth seam
+# added later would have stranded the carrier again in exactly the same way.
+_ip_defer_exit() {
+  if [ "$PUSH_WORKER_REF" = 1 ]; then
+    log "--push-worker-ref: integrate deferred, but the carrier is independent of it — pushing anyway"
+    _ip_push_worker_ref || true
+  fi
+  soft_exit 1
 }
 
 # --- Integrate (merge origin-ahead commits; never rebase, never force) -------
@@ -615,11 +1111,12 @@ if [ "$BEHIND" -gt 0 ]; then
       # Conflict state left behind? Abort it — the tree must NEVER be left
       # mid-merge for the loop to trip over.
       if [ -f "$GITDIR/MERGE_HEAD" ]; then
+        _ip_log_conflict_paths
         git -C "$REPO" merge --abort >/dev/null 2>&1 || true
         log "MERGE CONFLICT with $UPSTREAM — aborted cleanly, will retry next iteration."
         log "If this repeats every iteration it is a TRUE cross-machine content conflict (MERGE_HEAD was created — NOT the dirty-tree defer shape): resolve manually (git merge $UPSTREAM) or investigate which store conflicted."
         _ip_defer_streak_tick "conflict-abort"
-        soft_exit 1
+        _ip_defer_exit
       fi
       # Dirty tree — merge refused before starting (MERGE_HEAD absent). Try the
       # narrow cross-agent-churn self-heal (): if the entire blocking
@@ -638,7 +1135,7 @@ if [ "$BEHIND" -gt 0 ]; then
         log "MERGE CONFLICT with $UPSTREAM (surfaced by the churn self-heal retry) — aborted cleanly, will retry next iteration."
         log "If this repeats every iteration it is a TRUE cross-machine content conflict (MERGE_HEAD was created — NOT the dirty-tree defer shape): resolve manually (git merge $UPSTREAM) or investigate which store conflicted."
         _ip_defer_streak_tick "conflict-abort"
-        soft_exit 1
+        _ip_defer_exit
       else
         # `tail -n 1` lands on git's trailing "Updating <a>..<b>" line, which says
         # nothing about WHY (measured  — every defer in a 4-run repro
@@ -654,8 +1151,17 @@ if [ "$BEHIND" -gt 0 ]; then
         # of a wedge — the stranded-depth alarm below only fires once the backlog
         # has already grown past its cap. The defer line ABOVE names the blocking
         # paths, which is the "read the defer reason above" the alarm points at.
-        _ip_defer_streak_tick "dirty-defer"
-        soft_exit 1
+        # : a durable-cross-agent defer and an ordinary dirty-tree
+        # defer arrive here identically, but their remedies are OPPOSITE — the
+        # dirty-tree hint says "clear it", which for the durable shape destroys a
+        # partner's unpushed work. Split them by the cause recorded in the
+        # self-heal, not by re-deriving it here.
+        if [ -n "${_IP_DEFER_DURABLE:-}" ]; then
+          _ip_defer_streak_tick "durable-crossagent-defer"
+        else
+          _ip_defer_streak_tick "dirty-defer"
+        fi
+        _ip_defer_exit
       fi
     else
       log "integrated ${BEHIND} origin commit(s) into $BRANCH"
@@ -713,26 +1219,14 @@ fi
 # ls-remote, and deleted rc=0 leaving zero residue. Branch protection does not
 # reach refs/workers/*. A --dry-run was NOT treated as sufficient: server-side ref
 # hooks fire on a real push, so dry-run exercises a different path.
+# The push itself lives in _ip_push_worker_ref (defined above the integrate step) so
+# that the deferral seams can flush the same carrier through the same code ().
+# This block remains the CLEAN-INTEGRATE path: it is what runs when the merge succeeded
+# or none was needed.
 if [ "$PUSH_WORKER_REF" = 1 ]; then
-  if [ -z "$WORKER_REF_AGENT" ] || [ -z "$WORKER_REF_SID" ]; then
-    log "--push-worker-ref: REFUSED — agent/sid unresolved (MIND_AGENT='$WORKER_REF_AGENT', MIND_SID='$WORKER_REF_SID')."
-    log "  A ref missing either segment would collide across bodies, which is the one property this carrier exists to guarantee."
-    soft_exit 1
-  fi
-  WREF="refs/workers/${WORKER_REF_AGENT}/${WORKER_REF_SID}"
-  if [ "$DRY_RUN" = 1 ]; then
-    log "--push-worker-ref (dry-run): would push HEAD -> $WREF"
+  if _ip_push_worker_ref; then
     soft_exit 0
   fi
-  # No --force. The ref only ever advances for a given body (HEAD moves forward
-  # through commits and merges), so a non-fast-forward here means an assumption
-  # broke — single-writer, or a reset — and it should be LOUD rather than
-  # silently overwritten.
-  if git -C "$REPO" push origin "HEAD:$WREF" >/dev/null 2>&1; then
-    log "--push-worker-ref: pushed HEAD ($(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)) -> $WREF"
-    soft_exit 0
-  fi
-  log "--push-worker-ref: push FAILED for $WREF — this Body's framework edits and local commits have NOT reached the reducer"
   soft_exit 1
 fi
 
@@ -826,6 +1320,7 @@ if [ "$NO_FETCH" -eq 0 ] && printf '%s' "$PUSH_OUT" | grep -qiE 'non-fast-forwar
     RMERGE_RC=$?
     if [ "$RMERGE_RC" -ne 0 ]; then
       if [ -f "$GITDIR/MERGE_HEAD" ]; then
+        _ip_log_conflict_paths
         git -C "$REPO" merge --abort >/dev/null 2>&1 || true
         log "recovery merge CONFLICT with $UPSTREAM — aborted cleanly, will retry next iteration"
       else

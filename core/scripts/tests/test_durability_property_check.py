@@ -26,6 +26,10 @@ import types
 
 import pytest
 
+import sys as _sys
+_sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+import _verify_corpus  # noqa: E402
+
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1]
 
 
@@ -469,7 +473,10 @@ def test_all_three_checks_are_wired_into_verify_learning():
     """
     skill = SCRIPTS.parents[1] / ".claude" / "skills" / "verify-learning" / "SKILL.md"
     assert skill.is_file(), "verify-learning/SKILL.md not found at %s" % skill
-    text = skill.read_text(encoding="utf-8")
+    # Corpus, not the file: the verify-learning check corpus moved to
+    # core/config/verify-learning-checks.jsonl on 2026-08-18 ().
+    # This canary pins a CALL SITE, and the call site moved with it.
+    text = _verify_corpus.corpus_text()
 
     for sub in ("cited-temp-not-purged", "temp-durable-copy", "tree-node-recoverable",
                 "held-key-still-listed", "deadman-armed", "agent-binding-effective"):
@@ -489,7 +496,10 @@ def test_tree_node_baseline_entry_is_declared_in_verify_learning():
     still prints PASS.
     """
     skill = SCRIPTS.parents[1] / ".claude" / "skills" / "verify-learning" / "SKILL.md"
-    text = skill.read_text(encoding="utf-8")
+    # Corpus, not the file: the verify-learning check corpus moved to
+    # core/config/verify-learning-checks.jsonl on 2026-08-18 ().
+    # This canary pins a CALL SITE, and the call site moved with it.
+    text = _verify_corpus.corpus_text()
     assert "tree_nodes_without_prior_version" in text, (
         "verify-learning/SKILL.md no longer declares the "
         "tree_nodes_without_prior_version baseline entry — without it the ratchet "

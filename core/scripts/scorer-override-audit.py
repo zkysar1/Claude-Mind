@@ -3,9 +3,12 @@
 
 Scans every agent's execution-diary for ``entry_type=scorer_override`` entries
 (written by the Layer B claim gate, ``scorer-verdict-gate.py``) in the last N
-hours, groups by agent + sanctioned-deviation code, and flags HITS:
+hours, collapses claim RETRIES into decisions (g-115-6163: same
+(agent, claimed, scorer_top, deviation) tuple within RETRY_COLLAPSE_WINDOW_S of
+the cluster's first row is ONE decision — a retried claim emits one diary row
+per attempt), groups by agent + sanctioned-deviation code, and flags HITS:
 
-  * any single agent with MORE THAN 3 overrides in the window, OR
+  * any single agent with MORE THAN 3 override DECISIONS in the window, OR
   * any ``force-override`` use at all.
 
 The "file an Investigate goal" half of Layer C lives in the WRAPPER
@@ -81,6 +84,14 @@ WEIGHT_SIGNAL_CODES = frozenset({"force-override"})
 LANE_DISCIPLINE_CODES = frozenset({"cross-agent", "self-abstention"})
 RUNNABILITY_CODES = frozenset({"precondition-fail", "partner-claim", "blocker-gate"})
 STUCK_TOP_THRESHOLD = 3  # STRICTLY MORE THAN this many deviations over ONE scorer_top
+# : a single claim DECISION that is retried emits one diary row per
+# attempt, seconds apart, with an IDENTICAL (agent, claimed, scorer_top,
+# deviation) tuple. Same-tuple rows within this many seconds of their cluster's
+# FIRST row collapse into ONE decision (measured 2026-08-13: 26 raw rows -> 20
+# decisions, 23% retries). The window is ANCHORED, not chained: a same-tuple row
+# beyond the window is a NEW decision — e.g. a recurring goal re-claimed over the
+# same stuck top hours later (the  13x shape), which must NOT collapse.
+RETRY_COLLAPSE_WINDOW_S = 300
 
 
 def _classify(code: str) -> str:
@@ -133,6 +144,7 @@ def audit(since_hours: int = 24, root: Path | None = None) -> dict:
     # comment previously claimed the read was "purely local (see its docstring)"
     # while that docstring says the opposite — the same cache-is-authoritative
     # misbelief  fixed in stranded-claim-sweep.py.)
+    candidates: list[dict] = []
     for agent, text in read_fleet_diaries(root):
         lines = text.splitlines()
         for ln in lines:
@@ -151,36 +163,77 @@ def audit(since_hours: int = 24, root: Path | None = None) -> dict:
             if ts is None or ts < cutoff:
                 continue
             m = _OVERRIDE_RE.search(e.get("content", ""))
-            code = m.group(3).strip() if m else "unparsed"
-            claimed = m.group(1) if m else e.get("goal_id", "?")
-            top = m.group(2) if m else "?"
-            cls = _classify(code)  # 
-            a = per_agent.setdefault(
-                agent,
-                {"total": 0, "by_code": {}, "by_class": {}, "force": 0, "rows": []},
-            )
-            a["total"] += 1
-            a["by_code"][code] = a["by_code"].get(code, 0) + 1
-            a["by_class"][cls] = a["by_class"].get(cls, 0) + 1  # 
-            if code == FORCE_CODE:
-                a["force"] += 1
-            a["rows"].append(
+            candidates.append(
                 {
                     "agent": agent,
-                    "claimed": claimed,
-                    "scorer_top": top,
-                    "deviation": code,
+                    "claimed": m.group(1) if m else e.get("goal_id", "?"),
+                    "scorer_top": m.group(2) if m else "?",
+                    "deviation": m.group(3).strip() if m else "unparsed",
                     "timestamp": e.get("timestamp"),
+                    "_ts": ts,
+                    "_parsed": bool(m),
                 }
             )
-            # : track per-scorer_top recurrence globally. Only parsed
-            # rows carry a real top; an unparsed row (top="?") is not a goal, so
-            # it must never accumulate into a false stuck-at-top signal.
-            if m:
-                t = per_top.setdefault(top, {"count": 0, "agents": {}, "codes": {}})
-                t["count"] += 1
-                t["agents"][agent] = t["agents"].get(agent, 0) + 1
-                t["codes"][code] = t["codes"].get(code, 0) + 1
+
+    # : collapse claim RETRIES into decisions BEFORE any counting.
+    # Every row used to count as a distinct override, so one decision retried 4x
+    # inflated agents_over_threshold AND crossed the >3 stuck-top threshold by
+    # itself, manufacturing a false stuck_tops entry from a single decision.
+    # Anchored window per (agent, claimed, scorer_top, deviation): the first row
+    # of a cluster is kept and anchors the window; same-tuple rows within
+    # RETRY_COLLAPSE_WINDOW_S of the ANCHOR fold into it as retries; a row
+    # beyond the window starts a new decision (anchored, not chained — see the
+    # constant's comment for why).
+    candidates.sort(key=lambda c: (c["agent"], c["_ts"]))
+    anchors: dict[tuple, tuple[datetime, dict]] = {}
+    kept_rows: list[dict] = []
+    retries_collapsed = 0
+    for c in candidates:
+        key = (c["agent"], c["claimed"], c["scorer_top"], c["deviation"])
+        anchor = anchors.get(key)
+        if (
+            anchor is not None
+            and (c["_ts"] - anchor[0]).total_seconds() <= RETRY_COLLAPSE_WINDOW_S
+        ):
+            anchor[1]["retries"] += 1
+            retries_collapsed += 1
+            continue
+        row = {
+            "agent": c["agent"],
+            "claimed": c["claimed"],
+            "scorer_top": c["scorer_top"],
+            "deviation": c["deviation"],
+            "timestamp": c["timestamp"],
+            "retries": 0,
+            "_parsed": c["_parsed"],
+        }
+        anchors[key] = (c["_ts"], row)
+        kept_rows.append(row)
+
+    for row in kept_rows:
+        agent = row["agent"]
+        code = row["deviation"]
+        top = row["scorer_top"]
+        cls = _classify(code)  # 
+        a = per_agent.setdefault(
+            agent,
+            {"total": 0, "by_code": {}, "by_class": {}, "force": 0, "rows": []},
+        )
+        a["total"] += 1
+        a["by_code"][code] = a["by_code"].get(code, 0) + 1
+        a["by_class"][cls] = a["by_class"].get(cls, 0) + 1  # 
+        if code == FORCE_CODE:
+            a["force"] += 1
+        public = {k: v for k, v in row.items() if k != "_parsed"}
+        a["rows"].append(public)
+        # : track per-scorer_top recurrence globally. Only parsed
+        # rows carry a real top; an unparsed row (top="?") is not a goal, so
+        # it must never accumulate into a false stuck-at-top signal.
+        if row["_parsed"]:
+            t = per_top.setdefault(top, {"count": 0, "agents": {}, "codes": {}})
+            t["count"] += 1
+            t["agents"][agent] = t["agents"].get(agent, 0) + 1
+            t["codes"][code] = t["codes"].get(code, 0) + 1
 
     agents_over = {
         a: d["total"] for a, d in per_agent.items() if d["total"] > OVER_THRESHOLD
@@ -229,6 +282,10 @@ def audit(since_hours: int = 24, root: Path | None = None) -> dict:
         "evidence_rows": evidence_rows,
         "hits": hits,
         "total_overrides": sum(d["total"] for d in per_agent.values()),
+        # : collapse transparency — total_overrides counts DECISIONS;
+        # raw_rows counts diary rows before retry collapse.
+        "raw_rows": len(candidates),
+        "retries_collapsed": retries_collapsed,
     }
 
 
@@ -342,6 +399,7 @@ def build_investigate_goal(report: dict) -> dict | None:
     ev = "\n".join(
         f"  {r['agent']}: claimed {r['claimed']} over {r['scorer_top']} "
         f"(deviation={r['deviation']}) @ {r['timestamp']}"
+        + (f" [+{r['retries']} retries collapsed]" if r.get("retries") else "")
         for r in rows
     )
     clauses = _recommendation_clauses(report)

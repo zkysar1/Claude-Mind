@@ -360,7 +360,26 @@ def main(argv=None):
     world_dir, meta_dir = _resolve_dirs(args.world_dir, args.meta_dir)
 
     snapshots = list(_load_jsonl(world_dir / "productivity-snapshots.jsonl")) if world_dir else []
-    gate_firings = list(_load_jsonl(meta_dir / "gate-firings.jsonl")) if meta_dir else []
+    # Read through the store's composition seam (_gate_log.firings_paths — the
+    #  seam) rather than the hardcoded legacy filename. Once
+    # GATE_FIRINGS_SEGMENTED is set the flush writes date segments and the
+    # legacy file stops growing; a legacy-only read here would silently
+    # under-report every block after the cutover. Same shape as gate-stats.py /
+    # gate-retirement-eval.py / override-ledger-consume.py; fail-soft to the
+    # legacy path if the seam cannot be imported (broken env, mirrors
+    # _resolve_dirs).
+    gate_firings = []
+    if meta_dir:
+        try:
+            sys.path.insert(0, str(PROJECT_ROOT / "core" / "scripts"))
+            from _gate_log import firings_paths  # type: ignore
+            store_paths = firings_paths(meta_dir)
+        except Exception as e:  # pragma: no cover - exercised only on broken envs
+            print(f"WARN: gate-firings seam unavailable ({e}); reading legacy file only",
+                  file=sys.stderr)
+            store_paths = [meta_dir / "gate-firings.jsonl"]
+        for _p in store_paths:
+            gate_firings.extend(_load_jsonl(_p))
     overrides = list(_load_jsonl(world_dir / "override-bypass-ledger.jsonl")) if world_dir else []
     dup_overrides = list(_load_jsonl(world_dir / "goal-duplication-overrides.jsonl")) if world_dir else []
 

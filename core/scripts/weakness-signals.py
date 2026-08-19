@@ -106,7 +106,29 @@ def _write_report(path: Path, report: dict):
 AMBIENT_MIN_COHORT = 6  # below this many movers there is no "ambient" to filter
 
 
-def compute_guardrail_signals(guards, baseline_map, min_delta, ambient_mult, top_k):
+def _times_active(rec, counters=None):
+    """`times_active` for one record — sidecar-aware ().
+
+    `counters` is a PARAMETER rather than a load because this module imports
+    stdlib alone at module scope (its only `_paths` use is a lazy sys.path
+    insert further down); the seam resolves WORLD_DIR at import. Default None
+    => embedded read, byte-identical to pre-seam behaviour.
+
+    Silent-blanking is the failure mode to keep in view. Every signal here is a
+    DELTA against a baseline, so once the writer lands and `times_active` moves
+    to the sidecar, a frozen embedded read does not report a wrong number — it
+    reports `now == base` for every guardrail, every delta collapses to 0, and
+    the whole weakness-signal lane goes quiet while looking perfectly healthy.
+    An empty signal set is indistinguishable from "nothing is firing".
+    """
+    if counters:
+        from _utilization_store import utilization_of as _uo
+        return (_uo(rec, counters).get("times_active")) or 0
+    return ((rec.get("utilization") or {}).get("times_active")) or 0
+
+
+def compute_guardrail_signals(guards, baseline_map, min_delta, ambient_mult, top_k,
+                              counters=None):
     """Windowed guardrail deltas -> discriminating subset.
 
     The ambient-mult filter exists to exclude the mass-matched cohort (the
@@ -123,7 +145,7 @@ def compute_guardrail_signals(guards, baseline_map, min_delta, ambient_mult, top
         gid = g.get("id")
         if not gid:
             continue
-        now = ((g.get("utilization") or {}).get("times_active")) or 0
+        now = _times_active(g, counters)
         base = baseline_map.get(gid, 0)  # new-since-baseline: lifetime IS the window
         delta = now - base
         if delta > 0:
@@ -238,8 +260,22 @@ def main():
     baseline = report.get("signal_baseline") or {}
     have_baseline = bool(baseline.get("captured_at"))
 
+    # Load the guardrail counter sidecar ONCE (). Fail-open to {} =>
+    # embedded reads, i.e. exactly today's behaviour.
+    try:
+        from _utilization_store import load_counters as _load_counters
+        _counters = _load_counters("guardrails")
+    except Exception:
+        _counters = {}
+
+    # THIS MAP IS WRITTEN BACK AS THE NEXT BASELINE (see
+    # "guardrail_times_active" below), while compute_guardrail_signals measures
+    # the delta against the PREVIOUS one. So this read and that one must draw
+    # from the SAME source: converting only one of the pair would compare a
+    # sidecar `now` against an embedded `base`, and every delta would be the
+    # gap between two different fields rather than movement over time.
     current_guard_map = {
-        g["id"]: ((g.get("utilization") or {}).get("times_active")) or 0
+        g["id"]: _times_active(g, _counters)
         for g in guards if g.get("id") and g.get("status") in (None, "active")
     }
     current_sig_map = {
@@ -251,7 +287,7 @@ def main():
     if have_baseline:
         g_sig, median_delta = compute_guardrail_signals(
             guards, baseline.get("guardrail_times_active") or {},
-            args.min_delta, args.ambient_mult, args.top_k)
+            args.min_delta, args.ambient_mult, args.top_k, _counters)
         out["guardrail_signals"] = g_sig
         out["guardrail_median_delta"] = median_delta
         out["signature_signals"] = compute_signature_signals(

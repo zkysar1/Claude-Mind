@@ -191,3 +191,84 @@ def test_persist_merge_event_fail_open(tmp_path, monkeypatch, capsys):
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# --- F: error identity capture () --------------------------------
+# Measured 2026-08-10 (cc-02): errors==7 on 2126 of 2713 rows, and the durable
+# record said nothing about WHICH 7 objects — so a durability failure ran 3.5
+# days with a bare integer as its only surviving trace. These pin the identity
+# list AND the property that makes it trustworthy: the counter and the list are
+# written by one call, so they cannot drift apart (guard-1623).
+
+
+def test_record_error_writes_counter_and_identity_together():
+    """The whole point: one call, both consumers. A list that omits items the
+    counter counts is the dangerous half — an all-clear naming no cause."""
+    stats = {"errors": 0, "error_paths": []}
+    owncloud_sync._record_error(
+        stats, "/w/world/aspirations.jsonl", OSError("boom"), phase="put")
+    assert stats["errors"] == 1
+    assert len(stats["error_paths"]) == 1
+    rec = stats["error_paths"][0]
+    assert rec["path"] == "/w/world/aspirations.jsonl"
+    assert rec["phase"] == "put"
+    assert rec["exc"] == "OSError"
+    assert "boom" in rec["msg"]
+
+
+def test_error_count_and_identity_list_never_diverge():
+    """Invariant, not an example: after N recordings the counter equals the
+    list length plus whatever the cap truncated. Nothing can increment one
+    without the other, because no call site touches stats["errors"] directly."""
+    stats = {"errors": 0, "error_paths": []}
+    n = owncloud_sync._ERROR_PATHS_CAP + 5
+    for i in range(n):
+        owncloud_sync._record_error(
+            stats, f"/w/world/f{i}", RuntimeError("x"), phase="put")
+    assert stats["errors"] == n
+    assert len(stats["error_paths"]) == owncloud_sync._ERROR_PATHS_CAP
+    # Overflow is COUNTED, never silently dropped — a truncated list that
+    # looked complete would reintroduce the ambiguity this removes.
+    assert stats["error_paths_truncated"] == 5
+    assert (len(stats["error_paths"]) + stats["error_paths_truncated"]
+            == stats["errors"])
+
+
+def test_no_raw_error_counter_increments_remain_in_source():
+    """The drift guard has to hold for FUTURE call sites too. A raw
+    `stats["errors"] += 1` anywhere in the module is exactly the regression
+    that reintroduces a count with no identity."""
+    src = (Path(owncloud_sync.__file__)).read_text(encoding="utf-8")
+    assert 'stats["errors"] += 1' not in src, (
+        "raw error-counter increment found — use _record_error(...) so the "
+        "counter and error_paths cannot drift (g-115-5732 / guard-1623)")
+
+
+def test_error_paths_reaches_the_durable_log(tmp_path, monkeypatch):
+    """End-to-end: the identity must survive into the JSONL row, which is the
+    only place a post-hoc diagnosis can read it from."""
+    sink = tmp_path / "logs" / "owncloud-sweep-stats.jsonl"
+    monkeypatch.setattr(owncloud_sync, "_SWEEP_STATS_LOG", sink)
+    stats = {"scanned": 9, "in_sync": 8, "errors": 0, "error_paths": []}
+    owncloud_sync._record_error(
+        stats, "/w/world/board/general.jsonl", ValueError("nope"),
+        phase="push-stat")
+    owncloud_sync._log_sweep_stats(stats, source="sweep")
+    rows = _read_lines(sink)
+    assert len(rows) == 1
+    assert rows[0]["errors"] == 1
+    assert rows[0]["error_paths"][0]["path"] == "/w/world/board/general.jsonl"
+    assert rows[0]["error_paths"][0]["phase"] == "push-stat"
+
+
+def test_empty_error_paths_does_not_make_a_boring_run_interesting(
+        tmp_path, monkeypatch):
+    """Eager-init must not turn every healthy heartbeat into a logged row —
+    that would bury the forensic signal the sink exists to hold."""
+    sink = tmp_path / "logs" / "owncloud-sweep-stats.jsonl"
+    monkeypatch.setattr(owncloud_sync, "_SWEEP_STATS_LOG", sink)
+    stats = {"scanned": 800, "in_sync": 780, "skipped_unchanged": 20,
+             "pruned_agents": 4, "pushed": 0, "errors": 0,
+             "push_paths": [], "error_paths": []}
+    owncloud_sync._log_sweep_stats(stats, source="sweep")
+    assert not sink.exists()

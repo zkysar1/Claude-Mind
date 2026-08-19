@@ -103,6 +103,10 @@ def _advance_heartbeat():
 #   worker  — foreign-SID grace           7200s (sweep pops the claim)
 SHARED_HEARTBEAT_INTERVAL_S = 600
 
+# One-shot latch for the under-pytest suppression notice below. Module level so
+# the notice is emitted once per PROCESS; a suite makes thousands of diary writes.
+_SHARED_TICK_PYTEST_NOTICE = False
+
 
 def _tick_shared_heartbeat_if_due():
     """Keep BOTH liveness signals on the same cadence as the local heartbeat.
@@ -162,6 +166,46 @@ def _tick_shared_heartbeat_if_due():
     """
     import subprocess
     import time
+
+    #  / : THIS SUBPROCESS IS THE PHANTOM-SHARD WRITER, so it
+    # refuses under pytest unless a test explicitly opts in. The chain is
+    # heartbeat-tick.sh -> team-state-update.sh -> daemon shard write, and the
+    # DAEMON resolves its own world path — so no env var set in the test process
+    # can redirect it (measured; see the  block in tests/conftest.py,
+    # which falsifies both STORAGE_BACKEND=local and an MIND_WORLD tmp pin). A
+    # test binding a fake MIND_AGENT such as "alpha-test" therefore materialises
+    # a REAL row in the live fleet roster, which liveness-check.sh then certifies
+    # as "alive"; the graveyard holds seven alpha-test retirements across two days
+    # and the pollution has recurred at least four times.
+    #
+    # A CHOKEPOINT, not per-test discipline — the same shape as 's
+    # daemon-spawn refusal. The two existing defences are both partial by
+    # construction: a pre-touched claim-renewal-last stamp only protects tests that
+    # remember to write one, and the conftest purge fixture only tombstones the
+    # residue AFTER it has already landed in production. This holds for every
+    # future test that reaches this emitter, which is the class the goals ask for.
+    #
+    # ESCAPE HATCH: a test that legitimately exercises the tick sets
+    # MIND_DIARY_SHARED_TICK_TEST — but only after staging a relocated
+    # PROJECT_ROOT whose heartbeat-tick.sh is a stub recorder, as
+    # test_lease_renewal_cadence.py does. Setting it against the real core/scripts
+    # re-opens exactly this hole.
+    if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get(
+            "MIND_DIARY_SHARED_TICK_TEST"):
+        global _SHARED_TICK_PYTEST_NOTICE
+        if not _SHARED_TICK_PYTEST_NOTICE:
+            _SHARED_TICK_PYTEST_NOTICE = True
+            # Announced ONCE per process, not per call: a suite makes thousands of
+            # diary writes, and a per-call notice would bury real output. Silence
+            # entirely would trade one invisible behaviour for another (the
+            # goal-selector suppression makes the same argument).
+            print(
+                "[execution-diary] shared heartbeat tick SUPPRESSED under pytest "
+                "(set MIND_DIARY_SHARED_TICK_TEST=1 with a stubbed "
+                "heartbeat-tick.sh to exercise it) — g-115-5310",
+                file=sys.stderr,
+            )
+        return
 
     stamp = AGENT_DIR / "session" / "claim-renewal-last"
     try:

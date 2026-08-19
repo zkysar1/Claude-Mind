@@ -36,6 +36,26 @@ heuristic MUST be paired with an evidence gate before it acts):
      sweep having run: it is `deferrable`-tier and drops in a tight context
      zone, and a shelved goal whose lastAchievedAt was never advanced would
      otherwise read as starved.
+  3. CADENCE-PARKED — a recurring goal carrying `cadence_signal` fires IFF that
+     signal is PRESENT (pure gate), or once `cadence_fallback_days` elapses
+     (hybrid). While the signal is absent and the floor has not elapsed,
+     `goal-selector.collect_candidates` skips it DELIBERATELY. Reason 2 cannot
+     see this: `_structured_gates` reads verification.preconditions/fire_when,
+     and a signal-gated goal expresses its parking in `cadence_signal` (often
+     alongside a STRING precondition, which is also invisible to
+     `predicate.evaluate_all`). The selector's gate is mirrored by calling its
+     own `evaluate_cadence_signal`, so the two can never disagree.
+
+     Load-bearing: for this goal class the selector bypasses the hour gate
+     ENTIRELY, so `interval_hours` is a field it never reads — the ratio this
+     sweep computes describes nothing the selector did. MEASURED (g-001-81,
+     2026-08-12): zeta's g-001-07 read 30.7x its declared 1.33h while sitting
+     inside its own 3d fallback floor, and echo's copy was in the same state.
+     The Unblock filed from it asserted "nothing is parking it deliberately" —
+     the cadence gate was, on every cycle. Without this branch every
+     signal-gated goal whose signal is chronically absent files a HIGH Unblock
+     forever, and the design this reads (cadence_signals.py) targets 8
+     signal-gate + 33 hybrid goals against the 4 wired today.
 
 Deliberately NOT keyed on selector rank: measured across three consecutive runs
 on identical inputs, g-115-817's rank swung 4 -> 56 -> 8, because
@@ -87,6 +107,7 @@ sys.path.insert(0, str(HERE))
 import _paths  # noqa: E402
 import _rt  # noqa: E402  canonical Python -> daemon client
 from predicate import evaluate_all  # noqa: E402
+from cadence_signals import evaluate_cadence_signal  # noqa: E402  ()
 
 DEFAULT_MULTIPLIER = 3.0
 BASIS_WINDOW = 5
@@ -277,6 +298,51 @@ def _is_shelved(goal: dict) -> tuple[bool, str | None]:
     return False, None
 
 
+def _cadence_parked(goal: dict) -> tuple[bool, str | None]:
+    """(parked, reason) — mirrors goal-selector's signal-gated cadence gate.
+
+    See suppression reason 3 in the module docstring for WHY. This calls the
+    selector's own `evaluate_cadence_signal` rather than re-deriving the
+    predicate, so a future change to the gate cannot make the detector and the
+    selector disagree about which goals are parked (guard-2094: sweep the
+    condition, not the token).
+
+    Fail-open in the SAME direction as `_is_shelved`: `evaluate_cadence_signal`
+    returns True ("fire") on an unknown signal name or any probe error, which
+    yields not-parked here — a misconfigured signal surfaces the goal for a
+    human read rather than silently hiding it. Note the two fail-open
+    directions agree only because a "fire" verdict means "not parked"; do not
+    invert this without re-reading that module's contract.
+    """
+    signal = goal.get("cadence_signal")
+    if not signal:
+        return False, None
+    try:
+        if evaluate_cadence_signal(signal, goal):
+            return False, None  # signal PRESENT -> selector fires it; not parked
+    except Exception as e:  # noqa: BLE001 — mirror _is_shelved's visible swallow
+        print(f"[recurring-starvation] WARN cadence signal eval failed for "
+              f"{goal.get('id')}: {e}", file=sys.stderr)
+        return False, None
+
+    fallback_days = goal.get("cadence_fallback_days")
+    if fallback_days is None:
+        return True, f"signal-gate:{signal}"  # pure gate, signal absent -> skipped
+    try:
+        floor_h = float(fallback_days) * 24.0
+    except (TypeError, ValueError):
+        print(f"[recurring-starvation] WARN unreadable cadence_fallback_days on "
+              f"{goal.get('id')}: {fallback_days!r} — treating as NOT parked",
+              file=sys.stderr)
+        return False, None
+    age_h = _hours_since(goal.get("lastAchievedAt"))
+    if age_h is not None and age_h < floor_h:
+        return True, f"hybrid-floor:{signal}"
+    # Hybrid floor elapsed (or never achieved): the selector WILL fire it, so a
+    # goal still sitting here is genuinely overdue. Report it.
+    return False, None
+
+
 def _read_active(source: str) -> list:
     """Aspirations via the daemon (authoritative), fail-open to []."""
     try:
@@ -306,7 +372,8 @@ def _sources():
 def scan(multiplier: float, breaks: dict | None = None) -> tuple[list, dict]:
     """Return (starved_rows, stats). Pure enough to unit-test via `breaks`."""
     starved: list = []
-    stats = {"examined": 0, "shelved": 0, "no_interval": 0, "basis_suppressed": 0,
+    stats = {"examined": 0, "shelved": 0, "cadence_parked": 0,
+             "no_interval": 0, "basis_suppressed": 0,
              "unreadable_anchor": 0, "sources_seen": 0, "sources_unreadable": 0,
              "sources_empty_or_absent": 0, "sources_backend_fallback": 0,
              "sources_enumerate_failed": 0}
@@ -373,6 +440,20 @@ def scan(multiplier: float, breaks: dict | None = None) -> tuple[list, dict]:
                 p50 = _recent_actual_p50(goal.get("id", ""), break_actuals)
                 basis_h = float(interval)
                 basis_reason = "interval"
+                # basis_reason="interval" covers TWO cases a reader must not
+                # conflate: no usable samples (p50 is None -> the basis is the
+                # DECLARED cadence and is UNMEASURED), and samples exist but the
+                # declared cadence already covers them. Only the first is the
+                # cry-wolf class the basis gate exists to prevent, and reporting
+                # both identically is why a reader cannot tell an assumed cadence
+                # from a demonstrated one ( defect 3).
+                #
+                # Carried as a SEPARATE boolean rather than a new basis_reason
+                # value on purpose: six live assertions pin basis_reason ==
+                # "interval" exactly (test_streak_break_canary_basis L78/85/110/119,
+                # test_recurring_starvation_check L89/156), and this is a REPORTING
+                # fix — widening the enum would break them for no gain in signal.
+                basis_measured = p50 is not None
                 if p50 is not None and p50 > basis_h:
                     basis_h = float(p50)
                     basis_reason = "recent_actual_p50"
@@ -383,6 +464,14 @@ def scan(multiplier: float, breaks: dict | None = None) -> tuple[list, dict]:
                         # the demonstrated cadence explains it. Count it so
                         # the suppression is visible, not invisible.
                         stats["basis_suppressed"] += 1
+                    continue
+
+                parked, park_reason = _cadence_parked(goal)
+                if parked:
+                    # Deliberately parked by the selector's cadence gate, not
+                    # starved. Counted so the suppression is visible, never
+                    # invisible (same posture as basis_suppressed above).
+                    stats["cadence_parked"] += 1
                     continue
 
                 shelved, gate_type = _is_shelved(goal)
@@ -397,11 +486,43 @@ def scan(multiplier: float, breaks: dict | None = None) -> tuple[list, dict]:
                     "title": (goal.get("title") or "")[:70],
                     "age_hours": round(age_h, 1),
                     "anchor_field": anchor_field,
+                    # The anchor VALUE, not just its field name: it is the
+                    # EPISODE identity the dedup key is built from
+                    # (). The row carried only `anchor_field` before,
+                    # so a reader — and the dedup — could see WHICH clock was
+                    # used but never WHEN, and the key could not encode the
+                    # episode it was deduping.
+                    "anchor": anchor,
                     "interval_hours": interval,
                     "basis_hours": round(basis_h, 2),
                     "basis_reason": basis_reason,
                     "ratio": round(age_h / basis_h, 2),
                     "declared_ratio": round(age_h / float(interval), 2),
+                    "basis_measured": basis_measured,
+                    # The scale the scorer's exemption ACTUALLY uses (
+                    # defect 2). goal-selector.py:3409 computes
+                    #     overdue_ratio = max((elapsed - interval) / interval, 0.0)
+                    # which is exactly declared_ratio - 1. Neither ratio above sits
+                    # on that scale, so a "5.9x" headline reads as comfortably past
+                    # a documented exemption while the scorer sees 4.94 and demotes
+                    # anyway. Emitting the scorer's own number stops a diagnosing
+                    # reader starting from the wrong one.
+                    #
+                    # DO NOT rewrite this as "compared against 5.0". The bar is NOT
+                    # one constant, and asserting one is the same confident-wrong
+                    # shape this goal was filed about. goal-selector.py:4015
+                    # overdue_exemption_level takes THREE knobs and returns a GRADED
+                    # fraction in [0,1]: the pure-ratio arm divides by
+                    # substantive_demotion_overdue_exempt_ratio (5.0), but a
+                    # monitor-class goal (0 < interval <= short_interval_hours, 6.0)
+                    # takes the larger of that and ratio/short_interval_exempt_ratio
+                    # (1.0) — so a short-interval goal is fully exempt at 1x excess,
+                    # not 5x. apply_substantive_demotion consumes `>= 1.0` as a
+                    # binary; recurring_saturation consumes the graded value. Hence
+                    # the filed body names no number for the bar and tells the reader
+                    # to compare against the selector's exemption itself.
+                    "selector_excess_ratio": round(
+                        max(age_h - float(interval), 0.0) / float(interval), 2),
                     "intended_agent": goal.get("intended_agent"),
                 })
 
@@ -409,8 +530,44 @@ def scan(multiplier: float, breaks: dict | None = None) -> tuple[list, dict]:
     return starved, stats
 
 
-def _origin_signal(goal_id: str, source: str, agent: str | None = None) -> str:
+def _anchor_token(anchor) -> str | None:
+    """Compact, colon-free EPISODE token from a starvation anchor timestamp.
+
+    Digits only, so the key stays greppable and carries no `:` that a reader
+    could mistake for the `unblock:` prefix boundary. Returns None for a blank
+    or unusable anchor so `_origin_signal()` falls back to the un-anchored form
+    rather than minting `...-None` — same posture as the blank-agent fallback
+    below (a key that READS qualified while colliding is worse than the bug).
+    """
+    if not anchor:
+        return None
+    digits = "".join(ch for ch in str(anchor) if ch.isdigit())
+    return digits or None
+
+
+def _origin_signal(goal_id: str, source: str, agent: str | None = None,
+                   anchor: str | None = None) -> str:
     """The dedup key for one starvation Unblock. SINGLE SOURCE for both users.
+
+    WHY THE ANCHOR IS IN THE KEY (g-115-6398). Without it the key encodes no
+    EPISODE, so once any Unblock for an anchor goes terminal the anchor can
+    never be reported starved again — `_existing_origin_signals()` matches ANY
+    status, so a completed or SKIPPED holder silences it forever. The docstring
+    on that function defends any-status by arguing a completed Unblock means
+    "the goal fired, so its age reset and it cannot be starved again on the
+    same anchor" — true, but the key it was defending could not express it: a
+    genuinely NEW starvation minted the IDENTICAL key and was deduped against
+    the old episode. Keying on the anchor implements that stated intent
+    directly. Within one episode `lastAchievedAt` is constant, so re-filing is
+    still deduped; once the anchor fires it moves, and the next episode mints a
+    fresh key automatically — the lease releases itself with no close-on-clear
+    branch to forget (guard-3419).
+
+    Measured live 2026-08-16 (alpha, cc-07): of 5 starved recurring goals, 2
+    were silenced by terminal-only holders — g-326-85 by a COMPLETED g-326-293
+    and g-326-84 by a SKIPPED g-326-135. The skipped case is the sharper one:
+    a skipped Unblock is precisely where the anchor did NOT fire, so the
+    any-status rationale does not even hold on its own terms there.
 
     There are exactly two consumers — the pre-file dedup check in `main()` and
     the payload built in `_file_unblock()` — and they MUST agree. They were
@@ -445,21 +602,30 @@ def _origin_signal(goal_id: str, source: str, agent: str | None = None) -> str:
     """
     legacy = f"unblock:recurring-starved-{goal_id}"
     if source != "agent":
-        return legacy
-    owner = (agent if agent is not None
-             else os.environ.get("MIND_AGENT", "")).strip()
-    if not owner:
-        return legacy
-    return f"unblock:recurring-starved-{owner}-{goal_id}"
+        base = legacy
+    else:
+        owner = (agent if agent is not None
+                 else os.environ.get("MIND_AGENT", "")).strip()
+        base = legacy if not owner else (
+            f"unblock:recurring-starved-{owner}-{goal_id}")
+    token = _anchor_token(anchor)
+    return base if token is None else f"{base}-{token}"
 
 
 def _existing_origin_signals() -> set:
     """Every origin_signal already present across both queues, any status.
 
-    Any-status is deliberate: if the Unblock was completed, the goal fired, so
-    its age reset and it cannot be starved again on the same anchor. Re-filing
-    would only be possible after a genuinely new starvation, which carries a
-    fresh age.
+    Any-status is deliberate AND now safe, but it was not safe on its own. The
+    argument is: if the Unblock was completed, the goal fired, so its age reset
+    and it cannot be starved again on the same anchor; re-filing would only be
+    possible after a genuinely new starvation, which carries a fresh age. That
+    holds ONLY because `_origin_signal()` now puts the anchor IN the key, so a
+    fresh starvation really does mint a fresh key (g-115-6398). Before that the
+    key carried no age and this any-status match silenced the anchor forever.
+
+    Keeping any-status here is the guard-895 half — within ONE episode a
+    completed or skipped Unblock must still suppress a duplicate. The
+    across-episode release is the key's job, not this function's.
     """
     seen = set()
     for source in _sources():
@@ -467,6 +633,40 @@ def _existing_origin_signals() -> set:
             for goal in (asp.get("goals") or []):
                 sig = goal.get("origin_signal")
                 if sig:
+                    seen.add(sig)
+    return seen
+
+
+# Statuses at which a starvation Unblock will never be acted on again.
+# DELIBERATELY NOT `SKIP_STATUSES`, which answers a different question (which
+# recurring ANCHORS to scan) and includes `blocked`/`in-progress` — both of
+# which are live work whose Unblock SHOULD still suppress a duplicate. Also
+# deliberately local: the tree carries four disagreeing `TERMINAL_STATUSES`
+# constants (_goal_census, _dependency_graph, events), so importing one would
+# bind this dedup to a vocabulary chosen for another purpose.
+TERMINAL_HOLDER_STATUSES = {"completed", "skipped", "expired", "archived"}
+
+
+def _open_origin_signals() -> set:
+    """Signals with at least ONE non-terminal holder.
+
+    Used only for the LEGACY un-anchored key. That key cannot distinguish
+    episodes, so matching it any-status is exactly the permanent-silence bug:
+    a terminal pre-fix Unblock would suppress every future episode forever.
+    Matching it open-only keeps the transition safety it exists for (do not
+    re-file an Unblock this agent already has OPEN) while letting a terminal
+    one release (guard-3419: a lease with no release path is a one-shot).
+
+    A goal carrying no status at all counts as OPEN — the fail-safe direction
+    here is to suppress, since a missing status is a read problem and filing a
+    duplicate on the strength of one is the worse error.
+    """
+    seen = set()
+    for source in _sources():
+        for asp in _read_active(source):
+            for goal in (asp.get("goals") or []):
+                sig = goal.get("origin_signal")
+                if sig and (goal.get("status") or "") not in TERMINAL_HOLDER_STATUSES:
                     seen.add(sig)
     return seen
 
@@ -543,6 +743,22 @@ def _file_unblock(row: dict, errors: list | None = None) -> str | None:
     that noticed. (Measured 2026-07-30 while wiring g-115-3921.)
     """
     goal_id = row["goal_id"]
+    # Both notes default to the PRE- rendering when the field is absent,
+    # because rows are also hand-built by callers and tests
+    # (test_recurring_starvation_dedup_key.py builds one literally). A missing
+    # field must degrade to the old text, never to a wrong claim.
+    basis_note = "" if row.get("basis_measured", True) else (
+        "; UNMEASURED — no demonstrated cadence is on record, so this is the "
+        "cadence the goal DECLARES, not one it has been observed to keep"
+    )
+    _sel = row.get("selector_excess_ratio")
+    selector_note = "" if _sel is None else (
+        f"On the scorer's own scale this is {_sel}x overdue. Compare THAT number "
+        f"against the selector's overdue exemption, not the ratios above: those "
+        f"are elapsed/cadence and sit exactly 1.0 higher than the excess ratio "
+        f"the scorer computes, so a headline ratio can clear a documented "
+        f"exemption the scorer never sees at that value.\n\n"
+    )
     payload = {
         "title": f"Unblock: recurring goal {goal_id} has stopped firing "
                  f"({row['age_hours']}h = {row['ratio']}x its expected cadence)",
@@ -550,12 +766,16 @@ def _file_unblock(row: dict, errors: list | None = None) -> str | None:
             f"{goal_id} ('{row['title']}') last ran {row['age_hours']}h ago, "
             f"measured from its {row['anchor_field'].replace('_', ' ')} stamp.\n\n"
             f"That is {row['ratio']}x a {row['basis_hours']}h expected cadence "
-            f"(basis: {row['basis_reason'].replace('_', ' ')}), and "
+            f"(basis: {row['basis_reason'].replace('_', ' ')}{basis_note}), and "
             f"{row['declared_ratio']}x the {row['interval_hours']}h cadence the "
             f"goal declares for itself.\n\n"
-            f"It is not blocked, not deferred, not claimed, and its structured "
-            f"gates currently pass — so nothing is parking it deliberately and "
-            f"nothing has errored. It has simply not been picked.\n\n"
+            f"{selector_note}"
+            f"No blocker, no defer, no claim, and no failing structured gate was "
+            f"found. That is what was checked, and it does NOT establish that "
+            f"nothing is parking this goal: the scorer can deliberately cap a "
+            f"recurring goal's score beneath the best substantive candidate, and "
+            f"this detector never consults the scorer. Rule that out before "
+            f"concluding the goal has simply not been picked.\n\n"
             f"Ask why it is not being selected. Whether its declared cadence is "
             f"realistic is part of the question: a cadence the goal has never "
             f"actually met is itself a data-quality defect worth correcting, and "
@@ -574,7 +794,10 @@ def _file_unblock(row: dict, errors: list | None = None) -> str | None:
             "checks": [],
             "preconditions": [],
         },
-        "origin_signal": _origin_signal(goal_id, row["source"]),
+        # rb-3879: this payload and main()'s pre-file dedup are the two
+        # consumers of the key and MUST agree. Both pass the anchor.
+        "origin_signal": _origin_signal(goal_id, row["source"],
+                                        anchor=row.get("anchor")),
     }
     try:
         rec = _rt.aspirations_add_goal(row["aspiration_id"], payload,
@@ -642,10 +865,12 @@ def main() -> int:
     failures: list[dict] = []
     if args.apply and starved:
         existing = _existing_origin_signals()
+        open_sigs = _open_origin_signals()
         for row in starved:
             if len(filed) >= max(0, args.max_file):
                 break
-            sig = _origin_signal(row["goal_id"], row["source"])
+            sig = _origin_signal(row["goal_id"], row["source"],
+                                 anchor=row.get("anchor"))
             # Also honour the LEGACY unqualified key during the transition, so
             # the first post-fix run does not re-file every Unblock this agent
             # already has.
@@ -667,8 +892,34 @@ def main() -> int:
             # becomes a cross-agent suppressor and reintroduces the exact bug
             #  fixed — a partner's pre-fix legacy key would block us
             # again. Revisit this branch with that change, not after it.
+            # THERE ARE THREE KEY GENERATIONS, not two, and missing one
+            # re-files against a live open Unblock. (1) bare unqualified,
+            # (2) agent-qualified (), (3) anchored ().
+            # `unanchored` is generation 2 for an agent-source row and
+            # generation 1 for a world-source row — derived from
+            # _origin_signal() rather than re-typed, so it cannot drift from
+            # the real format (rb-3879). `bare` additionally covers an
+            # agent-source row whose holder predates .
+            #
+            # Measured 2026-08-16 before this line existed: checking only
+            # `bare` left  and  — both deduped by OPEN
+            # holders ( pending,  in-progress) — reading as
+            # WOULD FILE, because their holders carry the agent-qualified
+            # form that `bare` does not match.
+            unanchored = _origin_signal(row["goal_id"], row["source"])
             legacy = f"unblock:recurring-starved-{row['goal_id']}"
-            if sig in existing or legacy in existing:
+            # TWO SCOPES, TWO STATUS RULES — the asymmetry is the whole fix.
+            #
+            # `sig` carries the anchor, so it names ONE episode. Matching it at
+            # ANY status is correct and is the guard-895 half: a completed or
+            # skipped Unblock for THIS episode must still suppress a duplicate.
+            #
+            # `legacy` carries no anchor, so it names EVERY episode this goal
+            # will ever have. Matching it at any status is what made the first
+            # filing the last one, forever (guard-3419). It is matched OPEN-only
+            # — enough to keep the transition safety it was added for, while a
+            # terminal pre-fix holder releases instead of silencing.
+            if sig in existing or unanchored in open_sigs or legacy in open_sigs:
                 deduped += 1
                 continue
             before = len(failures)
@@ -740,6 +991,7 @@ def main() -> int:
 
     print(f"[recurring-starvation] {len(starved)} starved of {stats['examined']} "
           f"examined (shelved={stats['shelved']} "
+          f"cadence_parked={stats.get('cadence_parked', 0)} "
           f"basis_suppressed={stats['basis_suppressed']} N={args.multiplier} "
           f"basis_sources={stats.get('sources_seen', 0)}){caveat}")
     for row in starved[:10]:
@@ -788,8 +1040,13 @@ def main() -> int:
             print(f"    (nothing filed — all {failed} attempt(s) REFUSED, "
                   f"reasons above)")
         elif deduped:
-            print(f"    (nothing filed — {deduped} already have an open "
-                  f"origin_signal)")
+            # Say what was ACTUALLY checked. This read "already have an OPEN
+            # origin_signal" while the match was any-status, so a run silenced
+            # by a COMPLETED or SKIPPED holder printed the one property the
+            # code did not test and read as correctly-deduped ().
+            print(f"    (nothing filed — {deduped} already have a matching "
+                  f"origin_signal for this starvation episode, or an OPEN "
+                  f"pre-anchor one)")
         else:
             print("    (nothing filed)")
     return 0

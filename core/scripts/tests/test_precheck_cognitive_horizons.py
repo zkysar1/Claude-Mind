@@ -181,6 +181,154 @@ def test_hypothesis_health_missing_yaml_raises(tmp_path, monkeypatch):
         pe.cmd_hypothesis_health(_Args(), CONFIG, None)
 
 
+# ── resolves_no_earlier_than time-gate () ────────────────────────
+#
+# cmd_hypothesis_health built resolvable_active from horizon + formed_date ONLY
+# and never read `resolves_no_earlier_than`, so a record whose own floor is
+# months out counted as resolvable the moment its horizon window elapsed. That
+# inflates `flowing`, which is compared against hypothesis_pipeline_low_water_mark
+# to decide `stalled_pipeline` — a false-negative on a health check. Measured on
+# the live store 2026-08-12: 140 of 311 resolvable_active were time-gated.
+#
+# NOT a duplicate of /, which time-gated the same field in
+# the GOAL-SELECTOR. Same field, different consumer.
+
+# A `long` record formed well before the window closes — resolvable under the
+# horizon rule alone, so any exclusion below is attributable to the rne floor.
+def _elapsed_long(rne=None):
+    h = {"horizon": "long", "formed_date": (_FIXED_NOW - timedelta(hours=72)).isoformat()}
+    if rne is not None:
+        h["resolves_no_earlier_than"] = rne
+    return h
+
+
+def test_future_rne_excluded_from_resolvable(tmp_path, monkeypatch):
+    # The core defect: horizon says resolvable, the record's own floor says not yet.
+    _patch_pipeline(monkeypatch, discovered=[], active=[_elapsed_long("2026-09-15T00:00:00")])
+    _write_horizons(tmp_path)
+    monkeypatch.setattr(pe, "META_DIR", tmp_path)
+    r = pe.cmd_hypothesis_health(_Args(), CONFIG, None)
+    assert r["resolvable_active"] == 0
+    assert r["time_gated_active"] == 1
+
+
+def test_future_rne_date_only_form(tmp_path, monkeypatch):
+    # 249 of 277 live records carry the date-only shape — the majority path.
+    _patch_pipeline(monkeypatch, discovered=[], active=[_elapsed_long("2026-11-09")])
+    _write_horizons(tmp_path)
+    monkeypatch.setattr(pe, "META_DIR", tmp_path)
+    r = pe.cmd_hypothesis_health(_Args(), CONFIG, None)
+    assert r["resolvable_active"] == 0
+    assert r["time_gated_active"] == 1
+
+
+def test_date_only_floor_opens_at_midnight(tmp_path, monkeypatch):
+    # guard-2458: a date-only floor opens EARLY, at 00:00 of that day. _FIXED_NOW
+    # is 12:00 on 06-13, so a "2026-06-13" floor is already open — NOT time-gated.
+    # Pins the semantics shared with goal-selector's _parse_rne_dt so the two
+    # consumers of this field cannot drift apart.
+    _patch_pipeline(monkeypatch, discovered=[], active=[_elapsed_long("2026-06-13")])
+    _write_horizons(tmp_path)
+    monkeypatch.setattr(pe, "META_DIR", tmp_path)
+    r = pe.cmd_hypothesis_health(_Args(), CONFIG, None)
+    assert r["resolvable_active"] == 1
+    assert r["time_gated_active"] == 0
+
+
+def test_past_rne_does_not_widen_resolvable(tmp_path, monkeypatch):
+    # The gate only ever SUBTRACTS. A past floor must not promote a record whose
+    # horizon window has not elapsed — that would weaken the horizon rule.
+    fresh_long = {"horizon": "long",
+                  "formed_date": _FIXED_NOW.isoformat(),
+                  "resolves_no_earlier_than": "2020-01-01"}
+    _patch_pipeline(monkeypatch, discovered=[], active=[fresh_long])
+    _write_horizons(tmp_path)
+    monkeypatch.setattr(pe, "META_DIR", tmp_path)
+    r = pe.cmd_hypothesis_health(_Args(), CONFIG, None)
+    assert r["resolvable_active"] == 0
+    assert r["time_gated_active"] == 1
+
+
+def test_future_rne_outranks_session_and_micro(tmp_path, monkeypatch):
+    # session/micro are otherwise unconditionally resolvable; an explicit future
+    # floor is more specific than the horizon default and must win.
+    active = [{"horizon": "session", "formed_date": _FIXED_NOW.isoformat(),
+               "resolves_no_earlier_than": "2026-09-15"},
+              {"horizon": "micro", "formed_date": _FIXED_NOW.isoformat(),
+               "resolves_no_earlier_than": "2026-09-15T00:00:00"}]
+    _patch_pipeline(monkeypatch, discovered=[], active=active)
+    _write_horizons(tmp_path)
+    monkeypatch.setattr(pe, "META_DIR", tmp_path)
+    r = pe.cmd_hypothesis_health(_Args(), CONFIG, None)
+    assert r["resolvable_active"] == 0
+    assert r["time_gated_active"] == 2
+
+
+@pytest.mark.parametrize("rne", [None, "", "garbage", "not-a-date"])
+def test_absent_or_unparseable_rne_leaves_classification_unchanged(tmp_path, monkeypatch, rne):
+    # guard-420 None-guard: absent/unparseable must not crash and must not
+    # reclassify. _parse_iso returns None for all of these, so the horizon rule
+    # decides exactly as it did before the gate existed.
+    h = _elapsed_long() if rne is None else _elapsed_long(rne)
+    _patch_pipeline(monkeypatch, discovered=[], active=[h])
+    _write_horizons(tmp_path)
+    monkeypatch.setattr(pe, "META_DIR", tmp_path)
+    r = pe.cmd_hypothesis_health(_Args(), CONFIG, None)
+    assert r["resolvable_active"] == 1
+    assert r["time_gated_active"] == 0
+
+
+def test_time_gated_records_do_not_mask_a_stalled_pipeline(tmp_path, monkeypatch):
+    # The CONSEQUENCE test — the reason the miscount matters. Three time-gated
+    # records under a low-water-mark of 3: pre-fix `flowing` was 3 and the check
+    # reported healthy; post-fix flowing is 0 and `stalled_pipeline` fires.
+    active = [_elapsed_long("2026-09-15"), _elapsed_long("2026-10-01"),
+              _elapsed_long("2026-11-09")]
+    _patch_pipeline(monkeypatch, discovered=[], active=active)
+    _write_horizons(tmp_path)
+    monkeypatch.setattr(pe, "META_DIR", tmp_path)
+    r = pe.cmd_hypothesis_health(_Args(), {"hypothesis_pipeline_low_water_mark": 3}, None)
+    assert r["flowing_count"] == 0
+    assert r["time_gated_active"] == 3
+    assert "stalled_pipeline" in r["flags"]
+
+
+# ── _parse_iso offset normalisation ( fresh-eyes) ────────────────
+#
+# _parse_iso stripped only the UTC spellings (Z, +00:00). A non-UTC offset
+# survived as an AWARE datetime, and all five call sites compare the result
+# against a naive _now() — raising TypeError and aborting the WHOLE subcommand
+# rather than skipping one record. Zero live records carry that shape (0 of 277
+# measured 2026-08-12), so this is a latent crash, not an observed one.
+
+@pytest.mark.parametrize("raw,expected", [
+    ("2026-08-15T00:00:00-05:00", datetime(2026, 8, 15, 5, 0)),    # -05:00 -> 05:00 UTC
+    ("2026-08-15T00:00:00+05:30", datetime(2026, 8, 14, 18, 30)),  # +05:30 -> prior day 18:30 UTC
+    ("2026-08-15T00:00:00Z", datetime(2026, 8, 15, 0, 0)),
+    ("2026-08-15T00:00:00+00:00", datetime(2026, 8, 15, 0, 0)),
+    ("2026-08-15T00:00:00", datetime(2026, 8, 15, 0, 0)),
+    ("2026-08-15", datetime(2026, 8, 15, 0, 0)),
+])
+def test_parse_iso_normalises_offsets_to_naive_utc(raw, expected):
+    got = pe._parse_iso(raw)
+    # CONVERTED, not discarded: dropping a -05:00 tzinfo would read 00:00-05:00
+    # as 00:00 UTC — five hours early, and silently wrong rather than loud.
+    assert got == expected
+    assert got.tzinfo is None
+
+
+def test_offset_bearing_rne_does_not_abort_the_subcommand(tmp_path, monkeypatch):
+    # Pre-fix this raised TypeError out of cmd_hypothesis_health, so one badly
+    # shaped record took down the entire health check.
+    _patch_pipeline(monkeypatch, discovered=[],
+                    active=[_elapsed_long("2026-09-15T00:00:00-05:00")])
+    _write_horizons(tmp_path)
+    monkeypatch.setattr(pe, "META_DIR", tmp_path)
+    r = pe.cmd_hypothesis_health(_Args(), CONFIG, None)
+    assert r["time_gated_active"] == 1
+    assert r["resolvable_active"] == 0
+
+
 # ── init-seed parity (echo-2744 audit / ) ──────────────────────────
 
 def test_init_meta_seeds_cognitive_horizons():

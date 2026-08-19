@@ -1,3 +1,20 @@
+---
+paths:
+  - "core/scripts/**"
+  - "mind_api/**"
+---
+
+<!--
+  Path-scoped (g-115-6469). The rule's own "When This Applies" section names
+  exactly two surfaces — authoring/editing a wrapper in core/scripts/*.sh, and
+  implementing a daemon endpoint — so the trigger set is the governed set.
+
+  Enforcement does not depend on this text being in context:
+  core/scripts/check-no-python-cli-fallback.sh is a pre-commit gate that REFUSES
+  the regression, and a 24h recurring audit greps the wrappers. See
+  core/config/conventions/rules-loading.md.
+-->
+
 # No Python CLI Fallback
 
 ## Principle

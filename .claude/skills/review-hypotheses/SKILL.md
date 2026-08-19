@@ -118,6 +118,38 @@ Use retrieved context to:
 For each active hypothesis:
 
 ```
+-1. NO-DOUBLE-RESOLUTION GUARD (g-306-200). Before resolving a hypothesis
+    INDEPENDENTLY, check whether a worker Body already supplied evidence for it.
+    A worker writes evidence into the hyp_capture WM slot (worker-loop Phase 3.65)
+    and never resolves; body-merge delivers that slot into the reducer WM at
+    consolidate Step -1. Resolving without reading it produces a resolution that
+    looks correct in every respect and is simply under-informed — nothing else in
+    the loop would flag it.
+    Bash: bash core/scripts/hyp-capture-guard.sh --hypothesis-id <hypothesis-id>
+    ONE call, and it must stay one call. The wrapper reads the slot itself
+    precisely so no value has to cross a Bash-tool-call boundary. Do NOT
+    "simplify" this back into a wm-read line plus a `--slot-json "$slot"` line:
+    shell state does not survive between Bash calls (guard-128/guard-492), the
+    guard then reads an empty string, and it reports has_evidence:false against
+    a populated slot — silently, on every hypothesis. That was the shipped
+    state until 2026-08-11 and no test caught it, because the tests exercised
+    the function and nothing exercised the call site.
+    IF has_evidence: READ every entry's evidence_summary, and read the
+      outcome_note of each goal in goal_ids, BEFORE forming your own verdict.
+      Fold the evidence into the normal Step 2 assessment.
+    IF slot_read == "unreadable": the slot could not be read (daemon down,
+      or the slot holds a non-list). This is NOT "no evidence" — it is "I could
+      not look". Say so explicitly in the resolution's rationale rather than
+      resolving as though the slot were empty, and do not let it pass as a
+      clean check. slot_read == "empty" IS a clean check: the slot was read and
+      holds nothing, which is the normal single-Body case.
+    ADVISORY, NOT A VETO — the command always exits 0 and evidence never blocks
+    resolution. suggested_resolution is the worker's non-binding READ and you may
+    resolve against it on the same evidence. Blocking would trade an
+    under-informed resolution for a hypothesis nobody may ever close, which is
+    worse: evidence can be weighed, a stuck hypothesis cannot.
+    Absent worker Bodies the slot is empty and this is a no-op.
+
 0. Resolution time filter (token-saving skip):
    current_time = current date and time (ET)
 
@@ -314,9 +346,26 @@ ELIF threshold (resolves_no_earlier_than) has passed AND
     # resolved).
     #
     # ── "resolves_by has passed" — THE SHARED PREDICATE (Step 2.6a AND Step 4.0) ──
-    # A DATE-ONLY resolves_by (len <= 10, "YYYY-MM-DD") means END of that day:
-    #     date-only  -> passed IFF date.fromisoformat(rb[:10]) <  today
-    #     datetime   -> passed IFF datetime.fromisoformat(rb[:19]) < now
+    # A resolves_by denotes the END of its day WHATEVER ITS FORM. Truncate to
+    # date and compare strictly — one rule, no branch on string length:
+    #     ANY form -> passed IFF date.fromisoformat(str(rb)[:10]) < today
+    # DO NOT branch to a full-precision datetime compare for datetime-form
+    # values. That is what this block said until 2026-08-12, and it contradicted
+    # BOTH the shipped authority and its own line below ("it decides the same way
+    # for both the date-only and datetime forms"). A datetime form is not licence
+    # to compare at full precision: `2026-08-12T00:00:00` is a DATE carrying a
+    # midnight component, so a full-precision compare reads it as passed from
+    # 00:00:01 and expires it ~a day early — the exact defect the paragraph below
+    # warns about, surviving on the one branch the earlier fix did not cover.
+    # A midnight deadline would also give the record ZERO time on its own due
+    # date, which is a serialization artifact, never an author's intent.
+    # Measured 2026-08-12 (bravo, hostname cc-05, uname -r 6.8.0-137-generic):
+    # of 7 live active expiry candidates, 2 carried `2026-08-12T00:00:00` and sat
+    # simultaneously in the "must NOT expire" set and the expiry set — the
+    # two-branch rule would have destroyed both while the shipped authority
+    # correctly left them. Also note the sibling eligibility gate truncates too,
+    # so under the two-branch rule one record is "resolvable today" and "expired
+    # since midnight" at once — the two ends of one cadence disagreeing.
     # Do NOT feed a date-only value to a naive datetime parse. `2026-07-31` parses
     # to midnight, so "compare to current_time" makes a deadline that has ~24h left
     # read as already-passed from 00:00:01 onward — expiring the record up to a full

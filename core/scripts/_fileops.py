@@ -12,6 +12,7 @@ Imported by all write scripts to provide:
     increments, id allocation, dup checks, field updates).
 """
 
+import fnmatch
 import gzip
 import json
 import os
@@ -203,6 +204,8 @@ def _cruft_tripwire(base_dir, caller, operation):
 # file under WORLD doesn't accidentally exempt a same-named file under META.
 # Values are tuples of relative-path patterns:
 #   - trailing "/" matches everything under that directory prefix
+#   - an entry containing "*" or "?" is an fnmatch glob against the whole
+#     relative path (for dynamic-basename stores such as date segments)
 #   - otherwise the entry is an exact relative-path match
 #
 # Adding entries: pair every addition with a delete of the corresponding
@@ -212,9 +215,47 @@ _SNAPSHOT_BLACKLIST = {
     "world": (
         "presence/",            # per-agent liveness heartbeats (rewritten >>1Hz, zero historical interest)
         "board/",               # append-only coordination/findings/decisions/etc. logs — the file IS the history; full-file snapshots multiply storage O(N^2) with no restore value (changelog.jsonl keeps the audit trail). -b: pre- daemon direct-writes had accreted ~1.15G frozen board snapshots; blacklisting bounds board .history to zero in BOTH stores.
+        #  item-4 prerequisite: the two utilization counter sidecars the
+        # not-yet-shipped writer will flush once per maintenance tick. They are
+        # FULL REWRITES (an RMW of the whole ~1-2MB sidecar), not appends, so an
+        # unblacklisted flush would snapshot the whole file every tick — moving
+        # the O(N^2) churn this goal exists to kill out of the content object and
+        # into .history/, which is not a fix.
+        #
+        # Restore value is genuinely nil, which is step 1 of the history.md
+        # add-procedure and the only part worth arguing: these are ADVISORY
+        # retrieval-scoring counters with no cross-box read-after-write need (the
+        #  design says so, and _utilization_store.load_counters repeats
+        # it). A lost counter is a cosmetic scoring nuance; the changelog still
+        # records every write.
+        #
+        # EXACT basenames, deliberately NOT a `<kind>-*.jsonl` glob. The sidecar
+        # name is static (two of them), so a glob buys nothing and would match
+        # BOTH `<kind>-archive.jsonl` and every date segment. Sibling precedent
+        # for why that matters: coordination_merge's segment branch measured that
+        # a loose glob there would OVERRIDE the archives' existing registration.
+        # Names are owned by _utilization_store.counters_name(); this module is
+        # imported by nearly everything and must not import it back, so the two
+        # literals are pinned to counters_name() by test instead.
+        "reasoning-bank-utilization.jsonl",
+        "guardrails-utilization.jsonl",
+        # The date SEGMENTS are deliberately absent, and that is the non-obvious
+        # half. The meta/gate-firings-*.jsonl precedent above pushes the other
+        # way, but it does not transfer: gate-firings segments are append-only
+        # audit tail, while rb/guardrail segments are the CONTENT store and are
+        # mutated in place (status -> retired, valid_to, next_review_eligible_at),
+        # so they carry real restore value. Segmentation ALSO fixes their churn
+        # on its own — a write touches one small day-file instead of the 20.7MB
+        # whole store — so there is nothing left for a blacklist entry to buy.
     ),
     "meta": (
         "gate-firings.jsonl",   # append-only gate-decision audit log (file IS the history)
+        "gate-firings-*.jsonl", # its date segments (GATE_FIRINGS_SEGMENTED flush lane, 2026-08-17): same
+                                # append-only audit class, written by every box's iteration-close flush.
+                                # A glob rather than the strict date shape _gate_log._SEGMENT_RE owns,
+                                # because _gate_log imports THIS module (import cycle) and an over-match
+                                # here only skips a snapshot of a hypothetical `gate-firings-archive.jsonl`,
+                                # which would be the same audit-tail class anyway.
     ),
     "agent": (
         # Both are append-only telemetry ledgers on HOT paths, added when their
@@ -286,6 +327,12 @@ def _is_snapshot_blacklisted(base_dir, rel_path):
     for entry in patterns:
         if entry.endswith("/"):
             if rps == entry.rstrip("/") or rps.startswith(entry):
+                return True
+        elif "*" in entry or "?" in entry:
+            # fnmatchcase, not fnmatch: the on-disk names are exact and
+            # fnmatch's platform case-folding would let a Windows box match
+            # names a Linux box does not — one policy for one fleet.
+            if fnmatch.fnmatchcase(rps, entry):
                 return True
         elif rps == entry:
             return True
@@ -1482,19 +1529,74 @@ def _conflict_backoff(attempt):
     return min(0.05 * (2 ** attempt) + random.uniform(0, 0.05), 1.0)
 
 
+# Aggregate wall-clock budget for ONE conflict-retry composition ().
+# _CONFLICT_RETRY_CAP bounds the COUNT of cycles; nothing bounded their PRODUCT.
+# Each cycle issues several S3/DDB operations, and botocore independently retries
+# each one up to max_attempts, so the real exposure was
+# cap x ops-per-cycle x attempts x timeout -- a multi-minute caller hang built
+# entirely out of individually-bounded layers. THIS IS THE POINT: the defect was
+# never a missing timeout (every layer had one), it was a missing AGGREGATE
+# DEADLINE over their composition.
+_RMW_DEADLINE_DEFAULT = 120.0
+
+
+def _rmw_deadline_seconds():
+    """Wall-clock budget for one _rmw_with_conflict_retry composition.
+
+    Resolved per-call rather than cached at import so the env is always honored
+    (same reasoning as wm_path) and so tests can set a tiny budget without
+    reloading the module. A non-numeric or non-positive value falls back to the
+    default: failing back to BOUNDED is the safe direction, since the whole
+    purpose here is that no configuration accidentally restores the unbounded
+    composition this constant exists to cap.
+    """
+    raw = os.environ.get("MIND_RMW_DEADLINE_SECONDS", "").strip()
+    if not raw:
+        return _RMW_DEADLINE_DEFAULT
+    try:
+        val = float(raw)
+    except ValueError:
+        return _RMW_DEADLINE_DEFAULT
+    return val if val > 0 else _RMW_DEADLINE_DEFAULT
+
+
 def _rmw_with_conflict_retry(path, cycle_fn):
     """Run ``cycle_fn()`` (a full refresh->read->modify->write cycle, held under
     the caller's lock) and retry it on the active backend's optimistic-concurrency
-    ``conflict_error``, up to ``_CONFLICT_RETRY_CAP`` attempts. Returns cycle_fn's
-    value. ``cycle_fn`` MUST re-read fresh each call (begin with
+    ``conflict_error``, up to ``_CONFLICT_RETRY_CAP`` attempts OR until the
+    aggregate wall-clock deadline is spent, whichever comes first. Returns
+    cycle_fn's value. ``cycle_fn`` MUST re-read fresh each call (begin with
     ``get_backend().refresh(path)``) so each retry re-applies the modifier on the
-    latest remote state. Re-raises the conflict on the final attempt."""
+    latest remote state. Re-raises the conflict on the final attempt.
+
+    HONEST BOUND -- state it this way, do not round it down to `deadline`. The
+    budget is checked BETWEEN cycles and cannot interrupt a cycle already in
+    flight, so the true ceiling is::
+
+        deadline + (duration of one in-flight cycle)
+
+    That still converts an unbounded compounding product into "at most one more
+    cycle after the budget is spent", which is what lets the callers' existing
+    fail-open paths fire instead of blocking for minutes.
+
+    Deadline exhaustion re-raises the SAME conflict exception that cap
+    exhaustion already raises. That is deliberate, not laziness: every caller
+    already handles that path and releases its lock through the same ``finally``,
+    so this introduces no new failure mode and cannot strand a lock or leave a
+    half-applied write (guard-2227 -- the read is still asserted before any
+    write fires, because an aborted cycle simply never reaches its write).
+    """
     conflict_cls = get_backend().conflict_error
+    deadline_at = time.monotonic() + _rmw_deadline_seconds()
     for c_attempt in range(_CONFLICT_RETRY_CAP):
         try:
             return cycle_fn()
         except conflict_cls:
             if c_attempt == _CONFLICT_RETRY_CAP - 1:
+                raise
+            # monotonic, not wall time: a clock adjustment mid-RMW must not
+            # extend or collapse the budget.
+            if time.monotonic() >= deadline_at:
                 raise
             time.sleep(_conflict_backoff(c_attempt))
 

@@ -106,8 +106,26 @@ def _newer(x, y) -> bool:
 
 def _order_by_ts(a: dict, b: dict, field: str):
     """Return (winner, loser) ordered by ``field`` timestamp, breaking an equal
-    timestamp with a CONTENT tiebreak (larger canonical JSON wins). Symmetric:
-    both machines pick the same winner from the same two contents."""
+    timestamp with a CONTENT tiebreak: the LEXICOGRAPHICALLY-GREATER canonical
+    JSON wins. Symmetric: both machines pick the same winner from the same two
+    contents.
+
+    NOT "larger" / "longer" — this said "larger canonical JSON wins" for its
+    whole life and that reading is wrong in the direction that costs real time.
+    ``_canon(a) >= _canon(b)`` compares STRINGS, so the winner is decided at the
+    FIRST DIVERGENT CHARACTER and has no relation to size: measured on the live
+    stores, a 63-char document beat a 101-char one (g-115-5294, recorded in
+    governed-store-write-classes.md), and a 1953-char node lost to a 1942-char
+    one because index 1 of a list diverged on 'c' > 'a' (g-115-5411). The same
+    property is what makes ``"9" > "10"`` regress a counter — see
+    _GUARD_MONOTONIC_FIELDS below, which states it correctly and shows the
+    worked example.
+
+    Two separate agents each burned a full cycle building a replacement sized to
+    win before re-reading the code, and two versions of a coupling test set up
+    the OPPOSITE of the adverse case they claimed and passed vacuously. Pinned by
+    tests/test_order_by_ts_tiebreak_is_lexicographic.py so the loose wording
+    cannot come back."""
     ta, tb = (a or {}).get(field), (b or {}).get(field)
     if _newer(ta, tb):
         return a, b
@@ -177,8 +195,9 @@ def _merge_rb_record(a: dict, b: dict) -> dict:
       - utilization: per-counter MAX (see _merge_counters)
       - valid_to:    a set retirement bound dominates a null; else newer wins
       - everything else: PER-FIELD ``amended_fields`` recency tier, then the
-        deterministic content tiebreak (larger canon) when both sides are
-        unstamped or stamped identically
+        deterministic content tiebreak (lexicographically-greater canon — NOT
+        larger; see _order_by_ts) when both sides are unstamped or stamped
+        identically
       - key order:   canonicalized when the sides' key sequences diverged
         (_commutative_key_order — byte-commutativity on distinct-key adds).
 
@@ -618,6 +637,89 @@ def merge_guardrails(local: bytes, remote: bytes) -> bytes:
         record_merge_fn=_merge_guard_record, id_format=lambda n: f"guard-{n:03d}")
 
 
+# --- <kind>-utilization.jsonl : the counter SIDECARS ( item 4) -------
+def merge_utilization_counters(local: bytes, remote: bytes) -> bytes:
+    """Union two counter-sidecar blobs (``reasoning-bank-utilization.jsonl`` /
+    ``guardrails-utilization.jsonl``), keyed by the record ``id``, merging the
+    ``utilization`` dict with ``_merge_counters`` (union keys, MAX per counter).
+
+    REGISTERED RATHER THAN LEFT FENCE-ONLY, per the item-4 prerequisite: these
+    basenames are governed-store write-class (b) until a handler exists, and for
+    class (b) the fence is the WHOLE defense — a stale If-Match is a permanent
+    per-object wedge with nothing reconciling below the write
+    (``core/config/conventions/governed-store-write-classes.md``). Measured
+    before this landed: ``merge_handler_for`` returned None for both names while
+    the date SEGMENTS beside them were already class (a).
+
+    NOT ``_merge_id_keyed_jsonl``, and the difference is the whole reason this is
+    a separate function rather than one more thin wrapper. That helper RE-IDS a
+    record when two distinct records collide on an id — correct where the id is
+    lock-allocated and owned by the store (``rb-N``, ``guard-N``), and WRONG
+    here: a sidecar id is a FOREIGN KEY into the content store, so re-assigning
+    it would silently orphan that record's counters from the record they belong
+    to. Collision on an id is therefore not a conflict to resolve but the normal
+    case — the same record counted on two boxes — and the answer is to merge the
+    counters, never to renumber.
+
+    NOT ``merge_append_only_jsonl`` either: a sidecar entry is EDITED in place on
+    every increment, so a line-union would keep one line per (id, count) pair and
+    the store would grow a new line per increment per box while reads saw
+    duplicate ids — the ``insights.jsonl`` corruption shape this module already
+    catalogues.
+
+    Commutative: output is sorted by id, and the per-record merge canonicalizes
+    key order via ``_merge_counters`` -> ``_commutative_key_order``.
+
+    Counter loss is bounded and one-directional by construction — MAX never
+    loses an increment, it can only fail to gain one when a box's spool has not
+    flushed yet. These are advisory stats with no cross-box read-after-write
+    need (the whole premise of spooling them out of the content store), so a
+    late-arriving increment is correct-eventually rather than lost.
+
+    A TORN LINE RAISES HERE, THOUGH ``_utilization_store.load_counters`` SKIPS
+    ONE — and the divergence is deliberate, not an oversight. A READ that skips
+    a torn line loses one advisory counter for the duration of that call; a
+    MERGE that skips one writes the survivors BACK, so the loss becomes
+    permanent and silent. Raising instead freezes this path loudly and leaves
+    both sides' bytes intact for a human, which is the recoverable direction.
+    Inherited from ``_parse_jsonl``, the same way every sibling handler in this
+    module behaves — stated because the sidecar's own reader documents the
+    opposite policy for the opposite reason.
+
+    A record with NO ``id`` cannot be merged (the id is the only join key) but
+    is NOT dropped either: it is carried through keyed by its own canonical
+    bytes, so a union still converges and nothing is destroyed by a merge whose
+    job is to preserve. Dropping it would be the same silent-loss-on-write the
+    paragraph above rejects.
+    """
+    keyed: dict = {}
+    for rec in _parse_jsonl(local) + _parse_jsonl(remote):
+        if not isinstance(rec, dict):
+            # Non-dict JSON (a bare string/number line) has no id and no
+            # counters; preserve verbatim rather than discard, deduped by value.
+            keyed[("raw", _canon(rec))] = rec
+            continue
+        rid = rec.get("id")
+        if not rid:
+            keyed[("raw", _canon(rec))] = rec
+            continue
+        key = ("id", rid)
+        prev = keyed.get(key)
+        if prev is None:
+            keyed[key] = rec
+            continue
+        out = dict(prev)
+        for k, vb in rec.items():
+            if k not in out:
+                out[k] = vb
+            elif k == "utilization" and isinstance(out[k], dict) and isinstance(vb, dict):
+                out[k] = _merge_counters(out[k], vb)
+            elif out[k] != vb:
+                out[k] = out[k] if _canon(out[k]) >= _canon(vb) else vb
+        keyed[key] = _commutative_key_order(prev, rec, out)
+    return _dump_jsonl([keyed[k] for k in sorted(keyed)])
+
+
 # --- pattern-signatures.jsonl : union by id (id-keyed shape, ) -----
 def _sig_identity(rec: dict):
     """Stable cross-machine identity of a pattern-signature record:
@@ -799,10 +901,32 @@ def _merge_recent_completions(a: list, b: list) -> list:
 
 def _merge_strategic_focus(a: dict, b: dict) -> dict:
     """Newer ``set_at`` wins the scalar focus fields; ``acknowledged_by`` is
-    unioned so no acknowledgement from either machine is lost."""
+    unioned so no acknowledgement from either machine is lost. A key present on
+    only ONE side survives (g-115-5294).
+
+    The one-sided-key rule was ``out = dict(win)``, which took the winner's keys
+    alone and silently dropped any key the loser carried exclusively — the same
+    shape g-115-4163 and g-115-5017 repaired in two record handlers, missed here
+    because this is a sub-document merge inside team_state rather than a record
+    handler, so it sat outside the population both prior audits scanned.
+
+    WHY A PRESERVING MERGE IS SAFE HERE, AND WHY THAT IS NOT A GENERAL LICENCE
+    (guard-1816). A union-style handler resurrects deleted data whenever any
+    writer can emit a strict subset of what it read. Enumerated for this
+    sub-document: ``strategic_focus`` is a FIXED 5-key schema (team-state.py
+    ``EMPTY_STATE``, mirrored in mind_api/src/world/team_state.py), the write
+    surface is dot-path field-set rather than whole-map replacement, and no
+    command in the writer removes a key — "clearing" writes a None VALUE to a key
+    that REMAINS PRESENT. So the winner is never missing a key that a delete
+    removed, and preservation cannot resurrect a cleared field. Re-test that
+    enumeration before extending this pattern to an open map.
+    """
     a, b = a or {}, b or {}
-    win, _ = _order_by_ts(a, b, "set_at")
-    out = dict(win)
+    win, lose = _order_by_ts(a, b, "set_at")
+    # Loser first, winner overlaid: every key the winner carries wins (including
+    # an explicit None), and a key absent from the winner survives from the loser.
+    out = dict(lose)
+    out.update(win)
     out["acknowledged_by"] = _union_scalar_list(
         a.get("acknowledged_by") or [], b.get("acknowledged_by") or [])
     return out
@@ -1564,7 +1688,51 @@ def merge_aspirations(local: bytes, remote: bytes) -> bytes:
     """Union two aspirations.jsonl blobs by aspiration id (goals unioned by goal
     id within — see _merge_aspiration_record / _merge_goal). An aspiration on ONE
     side is kept; the SAME id on both is field-merged. Output sorted by aspiration
-    id for the byte-identical result the fenced PUT / commutativity relies on."""
+    id for the byte-identical result the fenced PUT / commutativity relies on.
+
+    A UNION CANNOT REPRESENT A DELETE, AND THAT IS DELIBERATE HERE — the remedy
+    lives OUTSIDE this function (g-115-6486). Archival removes the record from
+    aspirations.jsonl and appends it to aspirations-archive.jsonl, so a peer that
+    has not seen the removal re-adds its pre-archival copy PRISTINE on the next
+    sync (goals back to pending, no outcome_note). This is the resurrection class
+    guard-1816 warns about ("a merge handler is a valid cure only for an
+    APPEND-ONLY store"), and aspirations.jsonl genuinely has a removal path.
+
+    Why it is not fixed IN here: a handler's signature is (local, remote) -> bytes
+    for ONE file (see merge_handler_for), so it can never see the archive that
+    holds the tombstone. Representing the delete in-band would mean tombstone
+    LINES in the live queue plus a skip in every reader of the fleet's primary
+    work queue. Instead the ARCHIVE is the tombstone store and reconciliation runs
+    where cross-file reads are legal: _aspirations_resurrection.classify (the
+    predicate SSOT) applied by the daemon's archive_sweep ->
+    _reconcile_resurrected, invoked from aspirations-archive.sh on the reducer's
+    consolidation cadence, with aspirations-resurrection-scan.py as the read-only
+    /verify-learning detector over the same predicate.
+
+    DO NOT TRANSFER THE PIPELINE PRECEDENT HERE. _PIPELINE_STAGE_RANK (~40 lines
+    below) makes archival monotonic so a peer's metadata bump cannot revert a
+    resolution, and an aspiration status rank looks like the obvious analogue. It
+    is not: a hypothesis lifecycle is monotonic BY DESIGN, while an aspiration may
+    legitimately REOPEN — _check_not_archived permits modifying a live copy whose
+    id is also in the archive, and classify() exempts exactly that case as
+    ``post_archive_work``. A rank making retired/completed dominate active would
+    force every reopened aspiration back to terminal on the next sync, silently
+    and on every box. Measured 2026-08-17 (cc-08): asp-328 is live=active /
+    archive=completed with non-terminal goals inside — it is the ONLY remaining
+    live/archive overlap and a rank would revert it.
+
+    Scope of the damage, established by MUTATION rather than by reasoning (the
+    rank was implemented, the pins run, and the file restored byte-identically):
+    the rank inverts the aspiration's STATUS only. Its `goals` SURVIVE, because
+    _merge_aspiration_record unions them over BOTH arguments —
+    _merge_goals(a.goals, b.goals) — independent of which side won the base pick.
+    An earlier draft of this paragraph asserted the reopen's in-flight goals were
+    lost along with the status; that was plausible and false, and the mutation is
+    what caught it. The status inversion alone is disqualifying (a reopened
+    aspiration reading `completed` is invisible to the selector), so the refusal
+    stands on its own — but do not repeat the goal-loss claim.
+    Pinned by tests/test_merge_aspirations_reopen_not_monotonic.py, where exactly
+    ONE of the five assertions discriminates against the rank."""
     by_key: Dict[object, object] = {}
     for rec in _parse_jsonl(local) + _parse_jsonl(remote):
         k = (("id", rec["id"]) if isinstance(rec, dict) and rec.get("id")
@@ -1867,7 +2035,19 @@ def merge_spark_questions(local: bytes, remote: bytes) -> bytes:
 # name). The field-yaml stores named in the same  audit
 # (module-health.yaml, _tree.yaml, aspirations-meta.json) are a DISTINCT shape
 # and are deliberately NOT handled here (separate follow-up). .
-_LOG_TS_FIELDS = ("ts", "timestamp", "date", "at", "created_at", "created", "set_at")
+# `logged_at` APPENDED LAST, deliberately (). Lookup is FIRST-PRESENT
+# in tuple order, so appending can only change records that currently resolve to
+# "" -- it cannot reorder any store that already matches an earlier field. That
+# makes it a strictly narrowing change rather than a re-ordering of the existing
+# registered logs. Added because desync-warnings.jsonl stamps `logged_at` and
+# nothing else: registering it without this would have merged CORRECTLY and
+# commutatively while silently sorting the merged log by canonical JSON instead
+# of chronologically -- and chronological order is what jsonl_hygiene's
+# "keep newest" cap/rotate depends on, so a cap wired later would have trimmed
+# the wrong records. Measured: every `logged_at` writer in the tree emits an ISO
+# timestamp (%Y-%m-%dT%H:%M:%S); there is no non-timestamp use.
+_LOG_TS_FIELDS = ("ts", "timestamp", "date", "at", "created_at", "created", "set_at",
+                  "logged_at")
 
 
 def _log_ts(rec) -> str:
@@ -2481,9 +2661,28 @@ _TREE_MAX_FIELDS = ("retrieval_count", "times_helpful", "times_noise",
 # which  deliberately leaves un-bumped on a field poke. It merges NEWER
 # so the winning side's stamp is preserved.
 _TREE_NEWER_FIELDS = ("last_retrieved", "last_updated", "last_relevant_at",
-                      "progression_updated_at")
+                      "progression_updated_at", "calibration_updated_at")
 # LWW-by-last_updated with never-regress-on-tie.
 _TREE_PROGRESSION_FIELDS = ("confidence", "capability_level", "domain_confidence")
+# DATA-DERIVED calibration values -> plain LWW on the dedicated
+# calibration_updated_at stamp, with NO never-regress (). These are
+# recomputed from the shared pipeline corpus every sync, so a DOWNGRADE is the
+# normal, correct result and must be allowed to land -- which is exactly what
+# PROGRESSION's never-regress-on-tie forbids, so `accuracy` must NOT simply join
+# that class. It previously fell through to BASE, whose "safe self-correcting"
+# assumption holds only for fields some writer later re-writes with a fresh
+# last_updated; accuracy is recomputed IDENTICALLY every run and never converges,
+# so 12 of 12 nodes replanned the same downgrade forever ( measured the
+# full chain end-to-end on one box: the write LANDS and is reverted one read_tree
+# cycle later, with no peer involved). guard-1153: a decrement-able value must get
+# explicit merge semantics, never the handler's opaque default. guard-1170: use a
+# DEDICATED calibration timestamp, never bump per-node last_updated (that recreates
+#  index-ahead drift).
+# WHY A SEPARATE STAMP rather than reusing progression_updated_at: one selector key
+# serving two field groups with DIFFERENT write triggers is unsound (guard-3358) --
+# an accuracy-only edit would advance the PROGRESSION LWW key and let this box's
+# UNCHANGED confidence beat a peer's genuine earlier confidence edit.
+_TREE_CALIBRATION_FIELDS = ("accuracy",)
 # Structural -- reconciled in -b; ride the LWW base here.
 _TREE_STRUCTURAL_FIELDS = ("children", "parent", "depth", "child_count", "node_type")
 # capability_level maturity axis (core/scripts/tree.py capability-threshold map:
@@ -2544,6 +2743,38 @@ def _merge_field_progression(va, ta, vb, tb):
     return va if _canon(va) >= _canon(vb) else vb
 
 
+def _merge_field_calibration(va, sa, vb, sb, na, nb):
+    """CALIBRATION class (accuracy): plain LWW keyed on the node's dedicated
+    calibration_updated_at stamp (sa / sb), with NO never-regress -- a data-derived
+    DOWNGRADE is the normal result of recomputing over a grown corpus and MUST
+    land. On an EQUAL (or both-missing) stamp the winner is ambiguous, and the
+    stamp is DATE-granular (tree._stamp_calibration mirrors _stamp_progression's
+    day resolution for byte-compat parity), so same-day cross-box ties are the
+    COMMON case, not a corner. The tie is broken on each side's own sample_size
+    (na / nb): the side computed from MORE records is the more current value.
+    That is why the naive "add accuracy to PROGRESSION" fix is wrong -- its
+    never-regress tie picks the HIGHER accuracy, which on a same-day tie is
+    systematically the STALER one, reproducing g-115-5856 in a new place. Measured
+    live 2026-08-11: all 102 accuracy-carrying nodes also carry sample_size, so
+    the tiebreak is total over the real population, not partial. Equal sample_size
+    falls to the module's content tiebreak. Commutative: _newer is antisymmetric,
+    the sample_size compare is symmetric under the paired (va,sa,na)<->(vb,sb,nb)
+    swap, and _canon is machine-independent."""
+    if _newer(sa, sb):
+        return va
+    if _newer(sb, sa):
+        return vb
+    ia = isinstance(na, (int, float)) and not isinstance(na, bool)
+    ib = isinstance(nb, (int, float)) and not isinstance(nb, bool)
+    if ia and ib and na != nb:
+        return va if na > nb else vb
+    if ia and not ib:
+        return va
+    if ib and not ia:
+        return vb
+    return va if _canon(va) >= _canon(vb) else vb
+
+
 def _merge_tree_node(a: dict, b: dict) -> dict:
     """Reconcile two copies of the SAME tree node (same node key) from two
     machines. Base = the newer-last_updated copy (LWW via _order_by_ts) so every
@@ -2551,7 +2782,8 @@ def _merge_tree_node(a: dict, b: dict) -> dict:
     ride the later edit; then the class fields override:
       MAX          -> _merge_field_max          (larger counter)
       NEWER        -> _merge_field_newer         (strictly-newer ISO)
-      PROGRESSION  -> _merge_field_progression   (LWW-by-last_updated, never-regress tie)
+      PROGRESSION  -> _merge_field_progression   (LWW-by-progression stamp, never-regress tie)
+      CALIBRATION  -> _merge_field_calibration   (LWW-by-calibration stamp, sample_size tie, NO never-regress)
     A class field present on only ONE side is kept (an absent field never clobbers
     a present one), and loser-only BASE fields are preserved too (authored fields
     like origin_goal_id / valid_from / domain_class are NOT self-correcting, so a
@@ -2608,6 +2840,26 @@ def _merge_tree_node(a: dict, b: dict) -> dict:
             out[f] = a[f]
         elif f in b:
             out[f] = b[f]
+    # CALIBRATION merges key on the DEDICATED calibration_updated_at stamp
+    # (bumped by writers on any accuracy edit), falling back to last_updated for
+    # un-migrated nodes so their behavior stays byte-identical (backfill-safe,
+    # same posture as PROGRESSION above). Measured live 2026-08-11: 102 of 1379
+    # nodes carry accuracy and 0 carry the stamp yet, so the fallback governs the
+    # whole population until writers migrate it. sample_size is passed for the
+    # same-day tiebreak; it is MAX-merged elsewhere, but here each side's OWN
+    # value is what says which corpus that side's accuracy was computed over.
+    # Commutative: sa/sb and na/nb are each side's own values passed in (a, b)
+    # order and _merge_field_calibration is symmetric under the paired swap.
+    sa = a.get("calibration_updated_at", ta)
+    sb = b.get("calibration_updated_at", tb)
+    na, nb = a.get("sample_size"), b.get("sample_size")
+    for f in _TREE_CALIBRATION_FIELDS:
+        if f in a and f in b:
+            out[f] = _merge_field_calibration(a[f], sa, b[f], sb, na, nb)
+        elif f in a:
+            out[f] = a[f]
+        elif f in b:
+            out[f] = b[f]
     # Preserve loser-only fields the base lacks (-a fresh-eyes fix):
     # authored BASE fields (origin_goal_id / valid_from / domain_class) are NOT
     # self-correcting, so a loser-only one must not be silently dropped. `_lose`
@@ -2622,7 +2874,8 @@ def _merge_tree_node(a: dict, b: dict) -> dict:
 
 def _classify_tree_field(field: str) -> str:
     """The FIELD-CLASSIFICATION map as a TOTAL function: every per-node field name
-    -> its merge class ("MAX" | "NEWER" | "PROGRESSION" | "STRUCTURAL" | "BASE").
+    -> its merge class ("MAX" | "NEWER" | "PROGRESSION" | "CALIBRATION" |
+    "STRUCTURAL" | "BASE").
     Named classes get a dedicated rule in _merge_tree_node; STRUCTURAL is deferred
     to g-001-313-b; BASE rides the newer-last_updated LWW base. Total by
     construction -- an unrecognized (future) field defaults to BASE, the safe
@@ -2633,6 +2886,8 @@ def _classify_tree_field(field: str) -> str:
         return "NEWER"
     if field in _TREE_PROGRESSION_FIELDS:
         return "PROGRESSION"
+    if field in _TREE_CALIBRATION_FIELDS:
+        return "CALIBRATION"
     if field in _TREE_STRUCTURAL_FIELDS:
         return "STRUCTURAL"
     return "BASE"
@@ -2888,7 +3143,8 @@ def _sorted_list_union(la, lb):
 
 
 def _dict_key_union(ea, eb):
-    """Per-key union of two dicts (content-larger canonical wins a same-key clash;
+    """Per-key union of two dicts (the lexicographically-greater canonical form
+    wins a same-key clash — NOT the larger one, see _order_by_ts;
     a key on ONE side is kept). Keys emitted SORTED for byte-stability. Used for
     entity_index."""
     merged: Dict[str, object] = {}
@@ -2905,8 +3161,9 @@ def _dict_key_union(ea, eb):
 
 def _merge_tree_maintenance(ma, mb):
     """Reconcile the top-level maintenance cadence block. Per-key: numeric -> MAX
-    (grow-only cadence counters), else content-larger canonical. For the fixed-width
-    ISO timestamps the block carries, content-larger canonical IS the strictly-newer
+    (grow-only cadence counters), else lexicographically-greater canonical (NOT
+    larger — see _order_by_ts). For the fixed-width
+    ISO timestamps the block carries, lexicographically-greater canonical IS the strictly-newer
     value (lexical compare == chronological, per _newer's own contract), so no
     separate ISO detection is needed. Commutative + deterministic; a key on ONE side
     is kept. Keys emitted SORTED for byte-stability."""
@@ -4137,6 +4394,14 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     # id-keyed field-merge (records edited in place -> merge same-id copies)
     "reasoning-bank.jsonl": merge_reasoning_bank,
     "guardrails.jsonl": merge_guardrails,
+    # their counter SIDECARS ( item 4). STATIC basenames -- exactly two,
+    # from _utilization_store.KINDS -- so they belong in this dict, NOT in a
+    # sixth path-pattern branch (those exist only for DYNAMIC basenames: shards,
+    # date segments, health ledgers). Registered before the writer flips: an
+    # unregistered name is write-class (b), where a stale fence is a permanent
+    # wedge rather than a recoverable conflict.
+    "reasoning-bank-utilization.jsonl": merge_utilization_counters,
+    "guardrails-utilization.jsonl": merge_utilization_counters,
     # pattern signatures (): in-place-mutating writers (record-outcome
     # counter bumps, set-status retire) -> id-keyed field-merge, NOT line-union
     # (which would resurrect retired signatures). Mixed-format on-disk ids
@@ -4243,6 +4508,20 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     # CONCLUSION survives -- these are the append-only ones -- but re-probe rather
     # than inherit the number (guard-2364).
     "skill-invocations.jsonl": merge_append_only_jsonl,
+    # agents/<a>/session/desync-warnings.jsonl (, 2026-08-09, alpha
+    # worker Body, hostname cc-07, uname -r 6.8.0-136-generic). Certified
+    # append-only by reading ALL THREE writers, not by the name (rb-245):
+    #   session_desync_check.py:239  log_path.open("a")      -- append
+    #   recovery-gate.sh:242         printf '%s\n' >> ...    -- raw shell append
+    #   aspirations-graceful-stop/SKILL.md:110  >> ...       -- raw shell append
+    # No mutation flag in the schema (no processed/handled/acked -- contrast
+    # insights.jsonl below), no cap/rotate wired (no jsonl_hygiene caller names
+    # this path), no mark-processed path. Two of the three writers bypass the
+    # backend entirely, which is exactly the byte-divergence that strands the
+    # If-Match fence, so this store is both wedge-CAPABLE and safely curable by
+    # registration -- the combination that made it the one registerable member of
+    # the five-store population  examined.
+    "desync-warnings.jsonl": merge_append_only_jsonl,
     # board channels (board.py: "append-only -- never edited or deleted"; the
     # canonical 4 documented in CLAUDE.md -- all share the one append-only writer):
     "coordination.jsonl": merge_append_only_jsonl,
@@ -4368,11 +4647,36 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     # direction-pick could avoid dropping 7 real rows. The freeze was correct
     # behaviour protecting them; the union (21 rows) is the lossless reconcile.
     "complexity-ledger.jsonl": merge_append_only_jsonl,
+    # meta/context-diet-ledger.jsonl (): fourth member of the meta/*.jsonl
+    # append-only class, enrolled BEFORE its first row rather than after a
+    # divergence — the sibling above was found by a 270-sweep both-diverged freeze
+    # that would have dropped 7 real rows in either direction, and this store has
+    # the same multi-writer shape but worse odds: context-diet-report.py runs on
+    # EVERY box for EVERY agent, so cross-box concurrent appends are the normal
+    # case here, not the rare one.
+    # Writer-verified per the same protocol the three siblings used:
+    # context-diet-report.py's ledger block is the ONLY writer and it calls
+    # _fileops.locked_append_jsonl (pure append, no rewrite path), it has no
+    # deleter fleet-wide, and every row is an immutable {ts, box, static/dynamic
+    # metrics} snapshot. So the exclusion rationale that keeps other stores off
+    # this handler — a base-less union RESURRECTS deleted records — cannot apply,
+    # because nothing ever deletes.
+    "context-diet-ledger.jsonl": merge_append_only_jsonl,
     # world/auto-fix-evidence-sweep-metrics.jsonl (): writer RETIRED
     # (zero code references fleet-wide; last record 2026-06-23) — immutable
     # historical run_summary log, so line-union reconciles the residual
     # divergence and nothing can violate append-only going forward.
     "auto-fix-evidence-sweep-metrics.jsonl": merge_append_only_jsonl,
+    # world/telemetry/s3-cost-telemetry.jsonl (): weekly own-cloud
+    # storage snapshots. Append-only BY CONSTRUCTION — each row is an immutable
+    # {snapshot_at, bucket metrics} record written once per run via
+    # _fileops.locked_append_jsonl; no path rewrites, filters, prunes or expires
+    # it, so guard-1816's disqualifier (a removal path makes the union resurrect
+    # deleted records) does not reach it. Registered WITH the store's first write
+    # rather than after a wedge: two boxes running the weekly sweep in the same
+    # window is the expected case, and an unregistered synced JSONL both-diverges
+    # into a permanent fence (the /3992/3997 class).
+    "s3-cost-telemetry.jsonl": merge_append_only_jsonl,
     #  structured trio (per-file decisions on record in each handler):
     "infra-health.yaml": merge_infra_health,
     "goal-selection-strategy.yaml": merge_goal_selection_strategy,
@@ -4527,6 +4831,45 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     #     bytes -- 6.3% of the 295KB file in a single line -- and grows unbounded, one
     #     entry per close forever. A LINE-bounding sweep cannot see an array growing
     #     INSIDE a record.
+    #   --- the four per-agent stores REFUSED by  (2026-08-09, alpha
+    #   worker Body, hostname cc-07, uname -r 6.8.0-136-generic). The goal proposed
+    #   registering FIVE of them as "a small, low-risk change"; reading every
+    #   writer disqualified four. Recorded per guard-1816 step 4 so the next reader
+    #   inherits the refusals instead of re-deriving them -- and does not "fix" one
+    #   back into a regression.
+    #   agents/<a>/session/execution-diary.jsonl -> REMOVAL PATH, and it is LIVE.
+    #     execution-diary.py cmd_trim ("Remove entries older than N hours") builds
+    #     `kept` and rewrites via open(tmp,"w") + os.replace, and it is WIRED at
+    #     iteration-close.sh:2842 (`trim --hours 8`) on every iteration -- not dead
+    #     code. A line-union resurrects every trimmed entry. Note the trim is also
+    #     backend-BYPASSING with ensure_ascii=False, so this store is a wedge CAUSE
+    #     it cannot be cured of by registration.
+    #   agents/<a>/insights.jsonl -> IN-PLACE MUTATION. insights-read.sh
+    #     --mark-processed sets e['processed']=True for every entry and rewrites the
+    #     whole file with open(filepath,'w'). merge_append_only_jsonl dedups by
+    #     SERIALIZED LINE and its docstring requires records be immutable, so the
+    #     processed and unprocessed copies of one entry survive as TWO lines -- the
+    #     journal.jsonl failure mode (2), corruption rather than resurrection.
+    #     (Its .history/snapshots/insights.jsonl basename collision is NOT the
+    #     blocker: `.history` is in owncloud_sync._EXCLUDE_DIRS, so that path is
+    #     machine-local and can never reach a handler. Checked with the BOTH-LEGS
+    #     predicate -- the dir-prune leg is what catches it; _is_machine_local alone
+    #     returns False and would have reported a hazard that does not exist.)
+    #   agents/<a>/experience.jsonl -> ALREADY REFUSED, do not re-open. The
+    #     governed-store-write-classes convention records the evidence: archive_sweep
+    #     phase 2 rewrites live as [r for r in live_items if r["id"] not in
+    #     archived_ids] -- a removal -- so a union restores archived records to live
+    #     while the archive also holds them, which _check_no_duplicate_id treats as
+    #     corrupt. Cured instead by locked_rmw in experience_write.py.
+    #   agents/<a>/experience-archive.jsonl -> IN-PLACE MUTATION. set_field
+    #     (experience_write.py:518-519) picks `target = _archive_path(ctx)` when the
+    #     id lives in the archive, then rewrites the file. Same two-lines-per-record
+    #     corruption as insights.jsonl. Also already locked_rmw-cured.
+    #   RESIDUAL worth stating: locked_rmw cures the conflict-RETRY hazard, NOT the
+    #   byte-divergence wedge  is about -- retrying against a fence that
+    #   can never match loops forever. The two experience stores therefore have no
+    #   available cure via registration and their real fix is eliminating the
+    #   backend-bypassing writers, which is out of this goal's scope.
     # DEFERRED (writer not yet confirmed strictly append-only -- left unregistered
     # = safe-freeze, the conservative default; needs per-writer read before adding):
     #   scoring-criterion-audit.jsonl, and the
@@ -4585,22 +4928,108 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
 }
 
 
+# Which handler a date segment of each split store inherits. Segments are SHARDS
+# of these stores, so they take the store's own handler — see the fourth
+# path-pattern branch in merge_handler_for for why this is not append-only.
+_SEGMENT_HANDLERS = {
+    "reasoning-bank": merge_reasoning_bank,
+    "guardrails": merge_guardrails,
+}
+
+# Compiled segment matchers, populated on first use from _utilization_store.
+# Sentinel semantics: None = not attempted yet, {} = import failed (do not retry
+# on every call — a wedged import would otherwise pay an ImportError per write).
+_SEGMENT_RES: Optional[Dict[str, object]] = None
+
+
+def _segment_store_kind(basename: str) -> Optional[str]:
+    """Return the split-store kind whose date segment `basename` is, else None.
+
+    The pattern is IMPORTED from `_utilization_store`, which owns `segment_name`
+    (what the writer emits) beside `_segment_re` (what readers match) so the two
+    halves of that contract cannot drift. A private copy here would be a third
+    definition of the same thing.
+
+    Deliberately STRICT-date, inherited from that module: a loose
+    `<kind>-*.jsonl` form also matches `reasoning-bank-archive.jsonl`,
+    `guardrails-archive.jsonl` (both exist today) and the `<kind>-utilization.jsonl`
+    sidecar. Matching an archive here would hand 306 retired reasoning-bank
+    records to a union handler that treats them as live.
+
+    The sidecar is deliberately NOT covered by this branch: its basename is
+    STATIC (two of them), so it belongs in _HANDLERS as an ordinary entry, and it
+    needs a counter-reconciling handler rather than a content one. It gets that
+    entry when its writer lands — registering it now would claim a merge
+    semantics for a file whose write shape does not exist yet.
+
+    Import failure degrades to None (safe-freeze), the same conservative default
+    an unregistered store already receives.
+    """
+    global _SEGMENT_RES
+    if _SEGMENT_RES is None:
+        try:
+            import _utilization_store as _us
+            _SEGMENT_RES = {k: _us._segment_re(k) for k in _us.KINDS}
+        except Exception:  # noqa: BLE001 — any import/attr failure -> safe-freeze
+            _SEGMENT_RES = {}
+    for kind, rx in _SEGMENT_RES.items():
+        if kind in _SEGMENT_HANDLERS and rx.match(basename):
+            return kind
+    return None
+
+
+# Compiled gate-firings date-segment matcher, populated on first use from
+# _gate_log (which owns `segment_name`, what gate-firings-flush.py emits, beside
+# `_SEGMENT_RE`, what `firings_paths()` matches). Same sentinel semantics as
+# _SEGMENT_RES: None = not attempted, False = import failed (cached, no retry
+# per write).
+_GATE_FIRINGS_SEGMENT_RE = None
+
+
+def _is_gate_firings_segment(basename: str) -> bool:
+    """True when `basename` is a gate-firings date segment
+    (`gate-firings-YYYY-MM-DD.jsonl`), the file the GATE_FIRINGS_SEGMENTED
+    flush lane writes instead of the legacy `gate-firings.jsonl`.
+
+    The pattern is IMPORTED from `_gate_log`, never re-typed here, for the same
+    reason `_segment_store_kind` imports from `_utilization_store`: the writer's
+    filename and the reader's matcher are two halves of one contract and a
+    third private copy would be the drift it exists to prevent. Import failure
+    degrades to False (safe-freeze), the conservative default an unregistered
+    store already gets.
+    """
+    global _GATE_FIRINGS_SEGMENT_RE
+    if _GATE_FIRINGS_SEGMENT_RE is None:
+        try:
+            import _gate_log as _gl
+            _GATE_FIRINGS_SEGMENT_RE = _gl._SEGMENT_RE
+        except Exception:  # noqa: BLE001 — any import/attr failure -> safe-freeze
+            _GATE_FIRINGS_SEGMENT_RE = False
+    if not _GATE_FIRINGS_SEGMENT_RE:
+        return False
+    return bool(_GATE_FIRINGS_SEGMENT_RE.match(basename))
+
+
 def merge_handler_for(path) -> Optional[Callable[[bytes, bytes], bytes]]:
     """Return the commutative merge handler for ``path``, or None when the
     store is not merge-registered (the backend then keeps its safe-freeze
     behavior for that path).
 
-    Dispatch is by basename EXCEPT for THREE path-pattern branches that run
+    Dispatch is by basename EXCEPT for FIVE path-pattern branches that run
     BEFORE the _HANDLERS lookup, so a basename grep alone is NOT a complete
     classifier (see each branch's own comment below for why it exists):
       1. per-agent team-state shards  ``.../team-state/agents/<name>.yaml``
       2. per-agent daily health ledger ``.../health/<YYYY-MM-DD>.jsonl``
-      3. ``core/config/**`` EXCLUSION -- a registered basename that also names
+      3. split-store date segments ``<kind>-<YYYY-MM-DD>.jsonl`` for
+         reasoning-bank / guardrails -- routed to that store's OWN handler
+      4. gate-firings date segments ``gate-firings-<YYYY-MM-DD>.jsonl`` --
+         routed to the legacy file's append-only handler
+      5. ``core/config/**`` EXCLUSION -- a registered basename that also names
          an immutable framework config is deliberately NOT merged.
-    Branches 1 and 2 register stores whose basenames are DYNAMIC and therefore
-    unenumerable; branch 3 un-registers a path whose basename is AMBIGUOUS. So
+    Branches 1-4 register stores whose basenames are DYNAMIC and therefore
+    unenumerable; branch 5 un-registers a path whose basename is AMBIGUOUS. So
     the answer to "is this store merge-protected?" can be YES with no basename
-    entry (1, 2) and NO despite one (3) -- always resolve through this function,
+    entry (1-4) and NO despite one (5) -- always resolve through this function,
     never through a grep of the dict.
 
     Shard detail: basenames are dynamic (alpha.yaml/bravo.yaml/...) and so cannot
@@ -4631,6 +5060,66 @@ def merge_handler_for(path) -> Optional[Callable[[bytes, bytes], bytes]]:
     # on this box, so the line-union cannot collapse a distinct event.
     if (len(parts) >= 2 and parts[-2] == "health"
             and parts[-1].endswith(".jsonl")):
+        return merge_append_only_jsonl
+    # FOURTH path-pattern case (), dynamic-basename like branches 1 and 2:
+    # the reasoning-bank / guardrails content stores are being date-SEGMENTED
+    # (`<kind>-YYYY-MM-DD.jsonl`) so the ~112-117 adds/day append to a small live
+    # segment instead of rewriting a 20.5MB / 9.4MB object on every write. Segment
+    # names are dates, so a basename-keyed _HANDLERS entry could only cover days
+    # someone thought to enumerate.
+    #
+    # WITHOUT THIS BRANCH A SEGMENT IS UNREGISTERED, AND FOR THESE STORES THAT IS
+    # NOT A SOFT DEFAULT. They are governed-store write-class (b) — no reconciler
+    # below the write — so a stale fence is a PERMANENT wedge, not a retry. This
+    # must therefore land BEFORE any writer emits a segment, which is why it is
+    # here while the writer is not yet built.
+    #
+    # ROUTES TO THE STORE'S OWN HANDLER, NOT merge_append_only_jsonl. A segment is
+    # a SHARD of reasoning-bank / guardrails carrying the identical record schema,
+    # so it gets the identical treatment. "Append-DOMINATED" is not "append-only":
+    # non-counter fields are still mutated in place on these records (status ->
+    # retired, next_review_eligible_at, valid_to), and a line-union over a mutated
+    # record yields TWO lines for it — the insights.jsonl / experience-archive.jsonl
+    # corruption documented in the DEFERRED block above. The id-keyed handlers
+    # reconcile that correctly (retired-dominates, MAX counters) and are keyed on
+    # stable content identity rather than the volatile id, so they work on any
+    # SUBSET of the store rather than assuming they see all of it.
+    #
+    # RESIDUAL, stated rather than discovered later: _merge_id_keyed_jsonl's
+    # collision RE-ID path picks "the next free rb-N/guard-N" from the two blobs it
+    # was handed, which for a segment is a narrower view than the whole store, so a
+    # re-id could collide with an id living in a different segment. That is a real
+    # narrowing — and it is still strictly better than the alternative, because the
+    # alternative is the permanent wedge above rather than a correct merge. Revisit
+    # when the writer lands and ids can be allocated store-wide.
+    #
+    # The matcher is IMPORTED from _utilization_store, never re-typed: that module
+    # owns `segment_name` (what the writer will emit) beside `_segment_re` (what
+    # readers match) precisely so the two cannot drift, and a third private copy
+    # here would reintroduce exactly the drift it exists to prevent. The import is
+    # LAZY because this module otherwise depends on stdlib + yaml ALONE, and
+    # _utilization_store pulls in _paths (which resolves WORLD_DIR at import) — a
+    # module-level import would give a pure merge library a filesystem-resolution
+    # side effect. On ImportError we fall through to safe-freeze, the same
+    # conservative default an unregistered store already gets.
+    _seg_kind = _segment_store_kind(parts[-1])
+    if _seg_kind is not None:
+        return _SEGMENT_HANDLERS[_seg_kind]
+    # FIFTH path-pattern case ( /  cutover): the gate-firings
+    # date segments `meta/gate-firings-YYYY-MM-DD.jsonl` that gate-firings-flush.py
+    # writes once GATE_FIRINGS_SEGMENTED is set. Dynamic basenames like branches
+    # 1-4, and a HOT store -- every box flushes into the SAME live segment at
+    # every iteration close -- so an unregistered segment is not a soft default:
+    # a fenced-PUT 412 has no reconciler below the write and falls to the bare
+    # RMW retry, which loses more races in lockstep contention than the merge
+    # path the legacy file has always had. It inherits the legacy file's handler
+    # (merge_append_only_jsonl, `"gate-firings.jsonl"` in _HANDLERS): identical
+    # record schema, identical dedup identity (gate-firings-flush._serialize is
+    # pinned to json.dumps(rec, ensure_ascii=True) for exactly this reason), and
+    # NO removal path -- the G5 age-cap in store-hygiene.yaml is keyed on the
+    # legacy basename, so a segment is append-only for its whole life and a
+    # line-union can never resurrect a deletion (guard-1816 satisfied).
+    if _is_gate_firings_segment(parts[-1]):
         return merge_append_only_jsonl
     # Second PATH-PATTERN case (), for the opposite reason to the
     # shard branch above: that one exists because the basenames are DYNAMIC,

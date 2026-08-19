@@ -29,21 +29,41 @@ that. The alternative — inferring worker-completion from a MISSING journal ent
 — would be an effect standing in for a cause, i.e. a criterion broadened until
 it can be met (guard-2950). It is deliberately not implemented.
 
-FOUR LANES RUN, THREE ARE REPORTED (and the split is the point)
+FIVE LANES RUN, THREE ARE REPORTED (and the split is the point)
 ---------------------------------------------------------------
 The no-transcription contract is that this is a CALLER of the existing per-lane
-writers, never a re-implementation. Held literally, that partitions the seven
+writers, never a re-implementation. Held literally, that partitions the eight
 lanes by whether a writer exists that can accept a goal id:
 
   RUN      team_state       team-state-update.sh --field recent_completions
            journal          journal-append.sh --goal
            findings         findings-gate.sh --goal
+           experience       experience-archive-goal.sh --goal --trace-file
            impk             state-update-audit.sh velocity --goal
 
   REPORT   verification     post-hoc verify from goal record + commit diff
            execution_feedback  state-update-audit.sh execution-feedback needs
                             clarity/scope/verify RATINGS of the goal's spec
            user_notable     "would the user want to know?"
+
+THE EXPERIENCE LANE IS THE ONLY ONE WITH AN INPUT (g-306-199)
+-------------------------------------------------------------
+The other four lanes derive everything they write from the goal RECORD, which
+the reducer can always read. The experience lane cannot: an experience .md is a
+narrative of an execution the reducer never witnessed, and reconstructing one
+from the goal record is exactly the fabrication the REPORT lanes are withheld
+for. Its input is the worker's own `exp_capture` working-memory slot, written at
+worker-loop Phase 3.6 and carried to the reducer by `body-merge` at
+generalize-down — so this lane is applicable only where the executing Body left
+a capture, and is SKIPPED (never failed) where it did not. A skipped lane is not
+counted in `lanes_written`, so it can neither inflate the imp@k artifact count
+nor, on its own, license the marker.
+
+It calls `experience-archive-goal.sh` ONLY, though the goal's contract names
+`experience-add.sh` alongside it: the archive-goal endpoint already appends the
+record itself (`experience_write.archive_goal` -> `_append_record`) after copying
+the trace to the canonical `content_path`. Calling both would file the same
+experience twice.
 
 The three reported lanes have no mechanizable input: their writers exist but
 consume LLM judgment, and a script that supplies its own judgment scores is
@@ -91,6 +111,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -107,9 +128,29 @@ from _paths import agent_dir  # noqa: E402
 MARKER_FIELD = "retrospective_encoded"
 MARKER_SOURCE = "worker-retrospective"
 
-# Lanes this module CALLS. Order matters: the three writers run first so the
+# Lanes this module CALLS. Order matters: the four writers run first so the
 # imp@k lane can report how many of them actually landed.
-RUN_LANES = ("team_state", "journal", "findings", "impk")
+RUN_LANES = ("team_state", "journal", "findings", "experience", "impk")
+
+# The experience lane's input slot and the writer surface it calls. The slug is
+# baked into the experience id as `exp-<goal-id>-<slug>`, which the endpoint
+# validates against `^exp-[a-z0-9._-]+$` — keep it lowercase and hyphenated.
+EXP_SLOT = "exp_capture"
+EXP_SKILL_SLUG = "worker-retrospective"
+EXP_TYPE = "goal_execution"
+
+# The .md at content_path carries every anchor; the JSONL record carries a
+# bounded head of them, because that record is re-read on every experience
+# retrieval and a worker unit can capture 20+ anchors. When the bound bites, a
+# final anchor SAYS SO and points at the trace — a silent truncation here would
+# read as "that is all there was".
+ANCHOR_RECORD_MAX = 25
+
+# Narrative fields, in preference order. exp_capture is heterogeneous in the
+# live slot (measured cc-08 2026-08-10: 8 of 12 entries carry the Phase-3.6
+# shape, 4 carry a looser {summary,note,lesson,outcome,what_worked,what_failed}
+# shape), so the lane reads whichever is present instead of assuming one.
+EXP_NARRATIVE_FIELDS = ("execution_summary", "summary", "note", "lesson", "outcome")
 # Lanes whose writer needs LLM judgment — surfaced for the reducer to act on,
 # never auto-filled. See the module docstring.
 REPORT_LANES = ("verification", "execution_feedback", "user_notable")
@@ -119,6 +160,7 @@ _GOAL_ID_RE = re.compile(r"^g-(\d{1,4})-\d{1,4}$")
 SKIP_ALREADY = "already-retrospected"
 SKIP_NO_RECORD = "goal-record-not-found"
 SKIP_BAD_ID = "malformed-goal-id"
+SKIP_NO_CAPTURE = "no-exp-capture-entry"
 
 REFUSE_NOT_REDUCER = "not-reducer-body"
 
@@ -219,12 +261,144 @@ def decide(goal_ids, records: dict) -> dict:
     return {"plan": plan, "skipped": skipped}
 
 
+def index_captures(doc) -> dict:
+    """`exp_capture` slot value -> {goal_id: [entries]}, order preserved.
+
+    Pure. Rows without a usable `goal_id` are dropped rather than bucketed under
+    a placeholder: the id is what joins a capture to the goal being retrospected,
+    and an unjoinable narrative encoded against the wrong goal is worse than one
+    left in the slot for a human to look at. A non-list value yields {} — the
+    slot is absent on any Body that never captured.
+    """
+    idx: dict = {}
+    if not isinstance(doc, list):
+        return idx
+    for entry in doc:
+        if not isinstance(entry, dict):
+            continue
+        gid = str(entry.get("goal_id") or "").strip()
+        if gid:
+            idx.setdefault(gid, []).append(entry)
+    return idx
+
+
+def exp_summary(entries, item) -> str:
+    """One-line record summary from the first capture that carries narrative."""
+    for entry in entries or []:
+        for field in EXP_NARRATIVE_FIELDS:
+            text = " ".join(str(entry.get(field) or "").split())
+            if text:
+                return text[:300]
+    # No narrative anywhere: fall back to the goal's own title rather than
+    # writing an empty summary the endpoint would only warn about.
+    return f"Worker-executed goal {item['goal_id']}: {item['title']}"[:300]
+
+
+def exp_anchor_objects(entries) -> list:
+    """Capture anchors -> the `{key, content}` objects the record schema requires.
+
+    `exp_capture` writes `verbatim_anchors` as bare STRINGS (worker-loop Phase
+    3.6), while `_validate_record` rejects any anchor that is not a dict with
+    both `key` and `content`. That mismatch is the rb-245 class — two stores
+    agreeing on a field NAME and disagreeing on its SHAPE — so the transform is
+    explicit here rather than left to the writer.
+    """
+    seen, objs = set(), []
+    for entry in entries or []:
+        for anchor in entry.get("verbatim_anchors") or []:
+            if isinstance(anchor, dict):
+                # Already the record shape (a future capture writer, or a
+                # hand-authored entry) — take it as-is when it is well-formed.
+                key, content = anchor.get("key"), anchor.get("content")
+                if key is None or content is None:
+                    continue
+                key, content = str(key), str(content).strip()
+            else:
+                key, content = "", str(anchor).strip()
+            if not content or content in seen:
+                continue
+            seen.add(content)
+            objs.append({"key": key or f"anchor-{len(objs) + 1:02d}",
+                         "content": content})
+    if len(objs) > ANCHOR_RECORD_MAX:
+        dropped = len(objs) - ANCHOR_RECORD_MAX
+        objs = objs[:ANCHOR_RECORD_MAX] + [{
+            "key": "anchors-truncated",
+            "content": (f"{dropped} further anchor(s) omitted from this record; "
+                        f"all {dropped + ANCHOR_RECORD_MAX} are in the trace at "
+                        f"content_path"),
+        }]
+    return objs
+
+
+def render_trace(item, entries, agent, now_iso) -> str:
+    """Capture entries -> the experience .md body.
+
+    Mechanical formatting of what the worker already wrote — NOT a
+    reconstruction. Every field the slot carries is rendered; nothing is
+    inferred, scored, or summarised into a judgement the reducer did not make.
+    """
+    out = [
+        f"# {item['goal_id']} — {item['title']}",
+        "",
+        f"- **Aspiration**: {item['aspiration_id']}",
+        f"- **Category**: {item['category']}",
+        f"- **Encoded by**: `{MARKER_SOURCE}` (reducer-side) from the "
+        f"`{EXP_SLOT}` working-memory slot",
+        f"- **Reducer agent**: {agent}",
+        f"- **Encoded at**: {now_iso}",
+        f"- **Capture entries**: {len(entries)}",
+        "",
+        "> This goal was executed by a WORKER Body, which structurally skips the",
+        "> reducer-only encoding phases. The narrative below is the worker's own",
+        "> Phase 3.6 capture, carried here by generalize-down and encoded",
+        "> verbatim. It is first-hand, not reconstructed from the goal record.",
+        "",
+    ]
+    multi = len(entries) > 1
+    for n, entry in enumerate(entries, start=1):
+        if multi:
+            out += [f"## Capture {n} of {len(entries)}", ""]
+        for field in EXP_NARRATIVE_FIELDS:
+            text = str(entry.get(field) or "").strip()
+            if text:
+                out += [f"### {field.replace('_', ' ').title()}", "", text, ""]
+        for field in ("what_worked", "what_failed"):
+            text = str(entry.get(field) or "").strip()
+            if text:
+                out += [f"### {field.replace('_', ' ').title()}", "", text, ""]
+        meta = [f"- **{k.replace('_', ' ')}**: {entry[k]}"
+                for k in ("outcome_class", "surprise_level", "_item_ts")
+                if entry.get(k) is not None]
+        if meta:
+            out += ["### Capture metadata", ""] + meta + [""]
+        decisions = [d for d in (entry.get("key_decisions") or []) if str(d).strip()]
+        if decisions:
+            out += ["### Key decisions", ""]
+            out += [f"{i}. {str(d).strip()}" for i, d in enumerate(decisions, start=1)]
+            out += [""]
+        anchors = [str(a).strip() for a in (entry.get("verbatim_anchors") or [])
+                   if str(a).strip()]
+        if anchors:
+            out += ["### Verbatim anchors", ""]
+            out += [f"- `{a}`" for a in anchors]
+            out += [""]
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
 # ───────────────────────────── store access ──────────────────────────────
 
-def _run(argv, timeout=90):
+def _run(argv, timeout=90, stdin=None):
+    # `stdin` exists for the experience lane alone: `experience-archive-goal.sh`
+    # takes its extra record fields (verbatim_anchors, type) as optional stdin
+    # JSON, there being no CLI flag for them. Passing None keeps every other
+    # caller byte-identical — subprocess.run's default — and passing a string
+    # gives the wrapper a pipe that reaches EOF immediately, which matters
+    # because that wrapper bounds a non-EOF stdin with a 10s timeout (guard-664).
     try:
         p = subprocess.run(argv, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=timeout)
+                           encoding="utf-8", errors="replace", timeout=timeout,
+                           input=stdin)
         return p.returncode, p.stdout, p.stderr
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
         return -1, "", str(e)
@@ -275,6 +449,22 @@ def load_records(goal_ids, project_root: Path | None = None) -> dict:
                     g.setdefault("aspiration_id", asp)
                     out[gid] = g
     return out
+
+
+def load_exp_captures(root: Path) -> dict:
+    """Read the merged `exp_capture` slot -> {goal_id: [entries]}.
+
+    Read through `wm-read.sh`, never off disk: the slot is daemon-owned, and the
+    path itself is role-dependent (`BODY_WM_PATH` redirects a forked Body's WM),
+    so resolving it here would be a second copy of a rule that already has one.
+    An unreadable slot yields {} — which SKIPS the lane for every goal rather
+    than failing it, and so cannot stamp a marker on unencoded work.
+    """
+    rc, stdout, _err = _run(bash_cmd(
+        str(root / "core" / "scripts" / "wm-read.sh"), EXP_SLOT, "--json"))
+    if rc != 0:
+        return {}
+    return index_captures(_decode_first(stdout, "["))
 
 
 # ─────────────────────────────── the lanes ───────────────────────────────
@@ -332,6 +522,51 @@ def _lane_impk(item, agent, now_iso, root, artifacts_count):
                          "--artifacts-count", str(artifacts_count)))
 
 
+def _lane_experience(item, agent, now_iso, root, entries):
+    """Encode the worker's captures as an experience .md + record.
+
+    Called ONLY when `entries` is non-empty — the applicability test lives in
+    `retrospect` so that "no capture" is a SKIP rather than a lane failure, and
+    so this function keeps the plain `(rc, stdout, stderr)` shape every other
+    lane has.
+
+    The trace is written to a system temp file, not into the repo: the endpoint
+    COPIES it to the canonical `agents/<agent>/experience/<id>.md` and unlinks
+    the source once the record lands, so a repo-side staging file would be churn
+    in a synced tree at best and an orphan on any failure path at worst. The
+    endpoint also uniquifies the id, so a second pass over the same goal cannot
+    409 — though `decide`'s marker check means there should never be one.
+    """
+    trace_path = None
+    try:
+        fd, trace_path = tempfile.mkstemp(
+            prefix=f"exp-{item['goal_id']}-", suffix=".md")
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(render_trace(item, entries, agent, now_iso))
+        # verbatim_anchors and type have no CLI flag on the wrapper; they ride
+        # the optional stdin JSON, which the endpoint merges as `extra`.
+        payload = json.dumps({"type": EXP_TYPE,
+                              "verbatim_anchors": exp_anchor_objects(entries)})
+        return _run(
+            bash_cmd(str(root / "core" / "scripts" / "experience-archive-goal.sh"),
+                     "--goal", item["goal_id"],
+                     "--skill-slug", EXP_SKILL_SLUG,
+                     "--category", item["category"],
+                     "--summary", exp_summary(entries, item),
+                     "--trace-file", trace_path),
+            stdin=payload)
+    except OSError as e:
+        return -1, "", f"experience lane could not stage a trace file: {e}"
+    finally:
+        # The endpoint deletes the source after the record lands, so on the
+        # success path there is nothing here; this clears the FAILURE paths.
+        if trace_path:
+            try:
+                os.unlink(trace_path)
+            except OSError:
+                pass
+
+
 def _write_marker(item, agent, now_iso, root):
     marker = f"{now_iso}|{agent}|{MARKER_SOURCE}"
     return _run(bash_cmd(str(root / "core" / "scripts" / "aspirations-update-goal.sh"),
@@ -339,13 +574,18 @@ def _write_marker(item, agent, now_iso, root):
                          MARKER_FIELD, marker))
 
 
-def retrospect(item, agent, now_iso, root) -> dict:
-    """Run the four mechanizable lanes for one goal, then mark it.
+def retrospect(item, agent, now_iso, root, captures=None) -> dict:
+    """Run the mechanizable lanes for one goal, then mark it.
 
     The marker is written only when at least one lane landed: marking a goal
     whose every lane failed would record work that did not happen and suppress
     the retry forever, which is the failure mode the marker exists to prevent
     the opposite of.
+
+    `captures` is {goal_id: [exp_capture entries]} from `load_exp_captures`.
+    Defaulting it to None keeps every existing caller working and makes the
+    experience lane SKIP — the correct behaviour when no capture reached this
+    reducer, and the reason a skip is not counted as a write below.
     """
     lanes = {}
     for name, fn in (("team_state", _lane_team_state),
@@ -354,6 +594,20 @@ def retrospect(item, agent, now_iso, root) -> dict:
         rc, _out, err = fn(item, agent, now_iso, root)
         lanes[name] = {"rc": rc, "ok": rc == 0,
                        "err": (err or "").strip()[-200:] if rc != 0 else ""}
+
+    # Experience lane. Its input may legitimately be absent, which no other lane
+    # can be — see the module docstring. A skip reports ok=False so it never
+    # inflates `wrote`, and carries `skipped` so a reader can tell "there was
+    # nothing to encode" from "encoding failed".
+    entries = (captures or {}).get(item["goal_id"]) or []
+    if entries:
+        rc, _out, err = _lane_experience(item, agent, now_iso, root, entries)
+        lanes["experience"] = {"rc": rc, "ok": rc == 0, "entries": len(entries),
+                               "err": (err or "").strip()[-200:] if rc != 0 else ""}
+    else:
+        lanes["experience"] = {"rc": None, "ok": False, "entries": 0,
+                               "skipped": SKIP_NO_CAPTURE, "err": ""}
+
     wrote = sum(1 for v in lanes.values() if v["ok"])
     rc, _out, err = _lane_impk(item, agent, now_iso, root, wrote)
     lanes["impk"] = {"rc": rc, "ok": rc == 0, "artifacts_count": wrote,
@@ -426,14 +680,24 @@ def main(argv=None) -> int:
     # Refusing here rather than teaching each lane to distinguish wrote-from-
     # declined is the smaller fix AND the one matching the true invariant, and
     # the choice is measured, not inherited from the goal's phrasing: of the
-    # four lane writers, `journal-append.sh` is the ONLY one with a
-    # skip-and-exit-0 path — `team-state-update.sh`, `findings-gate.sh` and
-    # `state-update-audit.sh` have no early-exit-0 at all. A per-lane
-    # wrote-vs-declined protocol would therefore be a general mechanism built
-    # for a population of one, against writers whose skip paths do not exist
-    # (implementation-discipline: no speculative features, no single-use
-    # abstractions). If a SECOND writer ever grows this shape, revisit — that
-    # is the evidence this fix is waiting on.
+    # five lane writers, `journal-append.sh` is the ONLY one with a
+    # skip-and-exit-0 path — `team-state-update.sh`, `findings-gate.sh`,
+    # `state-update-audit.sh` and `experience-archive-goal.sh` have no
+    # early-exit-0 at all. A per-lane wrote-vs-declined protocol would
+    # therefore be a general mechanism built for a population of one, against
+    # writers whose skip paths do not exist (implementation-discipline: no
+    # speculative features, no single-use abstractions). If a SECOND writer
+    # ever grows this shape, revisit — that is the evidence this fix is
+    # waiting on.
+    #
+    # Re-measured when the experience lane landed (), because that
+    # lane's arrival is exactly the "second writer" event above and the count
+    # had to be re-derived rather than assumed. It is NOT that event: the lane
+    # calls `experience-archive-goal.sh`, which has no worker rail. Its SIBLING
+    # `experience-add.sh` does carry one (), so the rail exists on the
+    # add path and not on the archive-goal path that reaches the same store —
+    # an asymmetry in the defence, not in this module, and inert here because
+    # the refusal below stops a worker before either can be called.
     #
     # Fail direction is deliberate and OPPOSITE to journal-append.sh's. That
     # writer fails OPEN because it fires on every iteration close fleet-wide and
@@ -478,10 +742,22 @@ def main(argv=None) -> int:
         "mode": "apply" if args.apply else "dry-run",
     }
     if args.apply:
+        # Read the slot ONCE for the whole batch, not per goal: it is a single
+        # daemon round-trip and `merged_goal_ids` routinely carries several
+        # goals from the same Body.
+        captures = load_exp_captures(root)
+        summary["exp_capture_goals"] = sorted(captures)
         for item in plan:
-            summary["applied"].append(retrospect(item, args.agent, now_iso, root))
+            summary["applied"].append(
+                retrospect(item, args.agent, now_iso, root, captures))
     else:
         summary["would_apply"] = [p["goal_id"] for p in plan]
+        # Dry-run must be able to answer "will the experience lane fire?" — the
+        # whole point of the plan is to be inspectable before it writes.
+        captures = load_exp_captures(root)
+        summary["exp_capture_goals"] = sorted(captures)
+        summary["would_encode_experience"] = [p["goal_id"] for p in plan
+                                              if captures.get(p["goal_id"])]
 
     if args.output == "json":
         print(json.dumps(summary))

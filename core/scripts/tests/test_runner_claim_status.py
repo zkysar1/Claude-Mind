@@ -66,13 +66,21 @@ def _run(op: str, response: str, agent: str = "alpha"):
 
 def _claims_body(*, backend="own-cloud", agent="alpha", state="RUNNING",
                  age=60, stale_after=STALE, machine="cc-99", extra_agents=(),
-                 **overrides):
-    """Build a GET /v1/admin/runner-claims body with heartbeat `age` seconds old."""
+                 claim_fields=None, **overrides):
+    """Build a GET /v1/admin/runner-claims body with heartbeat `age` seconds old.
+
+    `claim_fields` merges extra keys into THIS agent's claim dict (as opposed to
+    `**overrides`, which patches the top-level body). Needed by the g-306-224
+    fingerprint tests, and deliberately unrestricted so a test can inject a key
+    the endpoint does NOT emit — that is how the wrapper is proven to read only
+    the digest and never a raw token.
+    """
     claims = [{"agent": a, "machine_id": "other-box", "agent_state": "RUNNING",
                "heartbeat_at": int(time.time()) - 30} for a in extra_agents]
     if agent is not None:
         claims.append({"agent": agent, "machine_id": machine, "agent_state": state,
-                       "heartbeat_at": (int(time.time()) - age) if age is not None else None})
+                       "heartbeat_at": (int(time.time()) - age) if age is not None else None,
+                       **(claim_fields or {})})
     body = {"backend": backend, "ok": True, "environment_id": "ayoai-mind",
             "runner_stale_seconds": stale_after, "claims": claims}
     body.update(overrides)
@@ -283,3 +291,80 @@ def test_claim_liveness_regex_still_takes_one_id_from_a_doubled_body():
     p = subprocess.run(f"grep -oE {pattern!r} | head -n1", shell=True,
                        input="g-306-118-bg-306-118-b", capture_output=True, text=True)
     assert p.stdout.strip() == "g-306-118-b"
+
+
+# ---------------------------------------------------------------------------
+# The runner-token FINGERPRINT clause on the LIVE line ()
+# ---------------------------------------------------------------------------
+#
+# worker_reducer_liveness must notice a SAME-BOX reducer restart — a re-minted
+# runner_token under an UNCHANGED machine_id — which the machine axis
+# structurally cannot see. The claim payload deliberately carries a
+# non-reversible DIGEST and never the token: runner_token is the
+# ConditionExpression bearer credential for heartbeat() and release_runner(), so
+# a reader holding it could forge a heartbeat (defeating reclaim_if_stale) or
+# release a live claim. This wrapper is the surface that publishes the digest.
+
+def _live_line(out: str) -> str:
+    for ln in out.splitlines():
+        if "status: LIVE" in ln:
+            return ln
+    raise AssertionError(f"no LIVE line in wrapper output: {out!r}")
+
+
+def test_live_line_carries_the_token_fingerprint_from_the_payload():
+    rc, out = _run("status", _claims_body(
+        age=60, claim_fields={"runner_token_fp": "1f4c0a9b2e6d8035"}))
+    assert rc == 0, out
+    assert "token-fp 1f4c0a9b2e6d8035" in _live_line(out)
+
+
+def test_live_line_prints_unknown_when_the_daemon_omits_the_fingerprint():
+    """A daemon predating the field emits no runner_token_fp. The wrapper must
+    still produce a well-formed LIVE line — and `unknown` must parse back to
+    NON-DISCRIMINATING on the consumer side, never to a fingerprint literally
+    spelled 'unknown' (which would compare EQUAL across two different reducers
+    and read as 'no takeover', the one direction the axis must never fail in)."""
+    rc, out = _run("status", _claims_body(age=60))
+    assert rc == 0, out
+    assert "token-fp unknown" in _live_line(out)
+
+
+def test_the_wrapper_never_prints_the_raw_token_even_if_the_payload_carries_one():
+    """Defence in depth. The endpoint has no raw-token field to send (RunnerClaim
+    carries only the digest), but a wrapper that echoed whatever it was handed
+    would turn any future upstream slip into a credential in every worker's
+    captured stdout and state file. The wrapper must read ONLY the fp key."""
+    rc, out = _run("status", _claims_body(
+        age=60, claim_fields={"runner_token_fp": "1f4c0a9b2e6d8035",
+                              "runner_token": "f47ac10b-58cc-4372-a567-0e02b2c3d479"}))
+    assert rc == 0, out
+    assert "f47ac10b" not in out
+    assert "token-fp 1f4c0a9b2e6d8035" in _live_line(out)
+
+
+def test_the_real_emitter_output_is_readable_by_the_real_parser():
+    """The end-to-end join, and the one that makes the other three more than
+    hand-copies (guard-920).
+
+    runner-claim.sh is bash-with-embedded-python and cannot import from
+    worker_reducer_liveness, so emitter and parser are linked only by a prose
+    format. Both `_parse_machine` and `_parse_token_fp` are driven here against
+    the LIVE output of the REAL wrapper block — so a reformat on either side
+    fails here instead of silently returning None and killing takeover
+    detection.
+    """
+    sys.path.insert(0, str(_SCRIPTS))
+    from worker_reducer_liveness import _parse_machine, _parse_token_fp
+
+    rc, out = _run("status", _claims_body(
+        age=60, machine="cc-02",
+        claim_fields={"runner_token_fp": "1f4c0a9b2e6d8035"}))
+    assert rc == 0, out
+    assert _parse_machine(out) == "cc-02"
+    assert _parse_token_fp(out) == "1f4c0a9b2e6d8035"
+
+    # ...and the pre-upgrade line must yield None, not the string "unknown".
+    _, old = _run("status", _claims_body(age=60, machine="cc-02"))
+    assert _parse_machine(old) == "cc-02"
+    assert _parse_token_fp(old) is None

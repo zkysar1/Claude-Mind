@@ -618,6 +618,32 @@ Before executing the Forge Process above, run through this quality gate. If
 any item is FAIL, iterate on the candidate skill before proceeding. A rushed
 forge becomes a zombie skill that undertriggers forever.
 
+### Extension before forge — DO THIS FIRST (decided g-115-5533, 2026-08-11)
+
+- [ ] Named the closest EXISTING skill and stated why it cannot absorb this gap.
+      "None is close" is a valid answer; not having looked is not.
+- [ ] Re-read the GAP RECORD itself, not a goal's paraphrase of it. gap-074 carried
+      an "evaluate satisfied-by-extension first" instruction that the forge GOAL's
+      description had dropped — executing from the goal text alone would have forged
+      a skill the gap record said not to.
+- [ ] If extension wins: add the capability to the existing skill (a companion script
+      and an amended registry row is the usual shape), set the gap's status to
+      `satisfied-by-extension`, and do NOT create a SKILL.md.
+
+**Why this is a gate and not a suggestion.** A forge is not free and its cost is
+permanent: Claude Code loads every skill's name and description into the system
+prompt at startup, so each new SKILL.md is standing per-turn weight on every agent
+forever, while extension costs zero. The corpus is a pure additive ratchet — forging
+adds, nothing subtracts — and `max_skills` is ratchet-down-only by construction
+(`modifiable.max_skills` is `{min: 10, max: 100, default: 100}`, so the modifiable
+maximum equals the default and the cap cannot be raised). Measured 2026-08-11: **116
+skill dirs against a cap of 100**, and 16 of 130 gaps had already been resolved as
+`satisfied-by-extension` — the practice was established and load-bearing while this
+file mentioned it **zero** times, so the cheaper path existed and was invisible at
+exactly the moment it was needed. Enforced-by-visibility only: `/verify-learning`
+check `skill-corpus-count-under-cap` counts the directories, and nothing refuses a
+forge (see `## Constraints`).
+
 ### Discovery signal
 - [ ] Description passes all items in "Writing Effective Descriptions" → Pre-forge description check
 - [ ] Name follows the `{verb}-{domain}-{noun}` convention and is not a reserved word

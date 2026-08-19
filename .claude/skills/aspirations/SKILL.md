@@ -318,7 +318,21 @@ IF agents/<agent>/session/compact-checkpoint.yaml EXISTS:  # battery: compact_ch
 # iteration's selector sees the goal as "owned" and skips it, the goal
 # sits frozen until /felt-sense-checkin (75-goal cadence) catches it.
 # Runs unconditionally — safe when no goals are claimed (exits 0 with
-# {scanned: 0}). With --apply: releases the claim, flips status to
+# {scanned: 0}). ITS COST IS NOT CONSTANT, and that sentence alone read as
+# though it were (g-115-6071): the sweep is O(THIS agent's outstanding
+# claims), and each foreign-sid claim past the 120m grace costs one REMOTE
+# round trip. Measured 2026-08-13 — zeta on cc-02, scanned=1, 1.26s; alpha on
+# cc-04, scanned=324 / carrier_checks=307, 215s (the BACKGROUNDED --apply run;
+# a separate same-day DRY-RUN read 234/249, and pairing that count with this
+# wall clock inflates per-check cost 31%), and it was killed twice at
+# the 120s and 150s Bash bounds. Same code, 170x apart, because alpha held 318
+# claims to everyone else's <=2. The probe is now memoized per (sid,
+# fresh_minutes) within a run — those 318 carried only SIX distinct sids — so
+# the read count is bounded by distinct HOLDERS, not by claim count. Read
+# `carrier_checks` vs `carrier_reads` in the output: their difference is the
+# saving, and a large `carrier_reads` is the signal that this agent's claim
+# backlog is the thing to fix, not the sweep.
+# With --apply: releases the claim, flips status to
 # pending, clears matching team-state.in_flight. The 5-min stale threshold
 # guards against race conditions where Phase 4 was just starting.
 # Unconditional --apply stays CORRECT here (g-115-4004): the sweep now
@@ -336,7 +350,32 @@ IF agents/<agent>/session/compact-checkpoint.yaml EXISTS:  # battery: compact_ch
 # peer instance's entries appear here as soon as this box pulls (g-306-132-c).
 # Direct py -3 invocation (not bash wrapper) — see rb-225/rb-247 for the
 # Windows bash subprocess hang.
-Bash: `py -3 core/scripts/stranded-claim-sweep.py --apply`
+# SILENCE IS NEVER A CLEAN NO-OP HERE (g-115-6071). main() emits its entire
+# result in ONE terminal print immediately before `return 0`, and an awk scan
+# of its whole body finds ZERO early returns — no `return`, no `sys.exit`, no
+# `raise SystemExit`. So a genuine scanned=0 run STILL prints its summary, and
+# a zero-byte result can only mean the run did not finish. That empty result
+# is byte-indistinguishable from the "safe when no goals are claimed" contract
+# above, which is why two kills on cc-04 read as clean passes and nothing
+# reported that stranded claims went unreleased for the whole session.
+# The wrapper below is the surfacing the goal asked for: the orchestrator used
+# to discard rc entirely. It prints the summary unchanged on the happy path
+# and a loud line otherwise — including the rc=0-with-no-output case, which
+# the rc check alone would miss and which was observed at least once.
+# INVOKE THE .sh WRAPPER, NEVER THE BARE .py (g-115-6188). The wrapper is a pure
+# exec passthrough — it sources _paths.sh and execs the same script with "$@" — so
+# stdout, args and the rc contract above are unchanged. What it adds is the env:
+# MIND_WORLD/WORLD_PATH come from the per-agent local-paths.conf that ONLY
+# _paths.sh reads, while STORAGE_BACKEND is set globally in .claude/settings.json.
+# A bare `py -3` therefore has STORAGE_BACKEND but no mappable world root, so the
+# sweep takes the own-cloud branch, fails to build the backend, and silently reads
+# every shard from the LOCAL MIRROR — on the orchestrator hot path, every
+# iteration, on every agent. Measured on cc-02: identical args, identical output
+# shape, `shard_provenance` local-mirror (bare) vs authoritative (wrapper). This
+# sweep decides whether a claim held by a live peer instance is released, so mirror
+# data here is exactly the stale input that makes it release a live claim or keep a
+# dead one. See guard-3864 / rb-7918.
+Bash: `out=$(bash core/scripts/stranded-claim-sweep.sh --apply 2>&1); rc=$?; printf '%s\n' "$out"; { [ $rc -eq 0 ] && [ -n "$out" ]; } || echo "[stranded-claim-sweep] DID NOT COMPLETE (rc=$rc, bytes=${#out}) — it always prints on every exit path, so this is NOT scanned=0: stranded claims were NOT released this iteration. Re-run it alone before trusting any claim state, and check this agent's outstanding-claim count."`
 
 # READING THE `possible-displacement` VERDICT (g-306-142) — IT IS A PROMPT TO
 # CHECK, NEVER A CONCLUSION TO ACT ON. A record carrying
@@ -395,7 +434,18 @@ IF displacement_seen:
 # arrives.
 #
 # Sentinel-lifecycle pattern (rb-428): wm-read → if non-null → action →
-# clear via `echo null | wm-set.sh`. One-shot. Lifecycle below.
+# clear via `echo null | verified-wm-set.sh`. One-shot. Lifecycle below.
+#
+# The clear routes through verified-wm-set.sh, not a bare wm-set.sh
+# (g-115-3698). THIS slot is the specimen the defect was measured on: a clear
+# that did not land left the sentinel SET, and because the write was
+# fire-and-forget nothing noticed — the next iteration re-entered this consumer
+# against already-handled state. It was distinguishable from a producer re-arm
+# only because `set_at` was UNCHANGED, which is a forensic accident, not a
+# signal anyone can rely on. verified-wm-set.sh writes, reads the slot back,
+# asserts equality, retries once, and fails loud. rc alone is not sufficient;
+# the read-back is the assertion. All four clears below share this rationale —
+# it is stated once, here.
 signal = Phase -0.5a0 battery payload for pending_phase_6_spark
          (fallback only if battery errored: Bash: wm-read.sh pending_phase_6_spark --json)
 IF signal is not null:
@@ -407,7 +457,7 @@ IF signal is not null:
         # fire Phase 6 spark on stale signals — they may not reflect current
         # work.
         Output: "▸ PENDING-PHASE-6-SPARK: expired (set {expires_at}, age > 60min) — clearing without action"
-        Bash: `echo 'null' | wm-set.sh pending_phase_6_spark`
+        Bash: `echo 'null' | verified-wm-set.sh pending_phase_6_spark`
     ELIF signal.outcome == "deep":
         # Dedup against the fast-stdout-path double-fire (g-115-1203).
         # recurring-close.sh writes THIS sentinel AND emits a stdout outcome-
@@ -448,7 +498,7 @@ IF signal is not null:
         Bash: dedup=$(bash core/scripts/wm-read.sh spark_fired_session --json | py -3 core/scripts/spark-fire-dedup.py check {signal.goal_id} --sentinel-set-at "{signal.set_at}" --producer "{signal.producer}")
         IF dedup == "skip":
             Output: "▸ PENDING-PHASE-6-SPARK: dedup-skip for {signal.goal_id} — spark already fired in-turn (fast-stdout path) at/after this sentinel's set_at; clearing sentinel without re-firing (g-115-1203 / g-115-1404)"
-            Bash: `echo 'null' | wm-set.sh pending_phase_6_spark`
+            Bash: `echo 'null' | verified-wm-set.sh pending_phase_6_spark`
         ELSE:
             # "fire" — bg-timeout path: no in-turn fire, so the set_at
             # comparison finds no same-close fire. (The legacy "5-min window
@@ -462,12 +512,12 @@ IF signal is not null:
                                             outcome_class=deep,
                                             summary={signal.summary}
             # Clear AFTER spark dispatch (one-shot).
-            Bash: `echo 'null' | wm-set.sh pending_phase_6_spark`
+            Bash: `echo 'null' | verified-wm-set.sh pending_phase_6_spark`
     ELSE:
         # outcome=routine — Phase 6 is skipped by the standard skip-rule.
         # Clear silently; the sentinel just records the close attempt.
         Output: "▸ PENDING-PHASE-6-SPARK: outcome=routine for {signal.goal_id} — Phase 6 skipped per skip-rule, clearing sentinel"
-        Bash: `echo 'null' | wm-set.sh pending_phase_6_spark`
+        Bash: `echo 'null' | verified-wm-set.sh pending_phase_6_spark`
     # Continue to Phase -0.5e.0.
 
 # Phase -0.5e.0: Quiescence-Cycle Fast-Path Short-Circuit (g-303-12)

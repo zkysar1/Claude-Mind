@@ -30,10 +30,20 @@ case $rc in
     0)
         # 200: parse response. Print archived_count to stdout
         # (matches legacy CLI "print(str(count))" shape).
+        # pruned_count/stamped_count go to STDERR, never stdout: the PRUNE is a
+        # DELETE (it permanently removes tombstones older than PRUNE_GRACE_DAYS
+        # from the live file), and reporting zero of it made the destructive
+        # half of this sweep invisible to every CLI caller — the observability
+        # gap archive-before-delete.md exists to close. Kept off stdout because
+        # callers parse it as a bare integer.
         # shellcheck disable=SC2086
         printf '%s' "$RESPONSE" | $(rt_python_launcher) -c "
 import json, sys
 resp = json.load(sys.stdin)
+pruned = resp.get('pruned_count', 0)
+stamped = resp.get('stamped_count', 0)
+if pruned or stamped:
+    sys.stderr.write('[pipeline-archive] pruned_count=%s stamped_count=%s\n' % (pruned, stamped))
 print(resp.get('archived_count', 0))
 "
         exit 0;;
@@ -50,6 +60,10 @@ print(resp.get('archived_count', 0))
                 printf '%s' "$RESPONSE" | $(rt_python_launcher) -c "
 import json, sys
 resp = json.load(sys.stdin)
+pruned = resp.get('pruned_count', 0)
+stamped = resp.get('stamped_count', 0)
+if pruned or stamped:
+    sys.stderr.write('[pipeline-archive] pruned_count=%s stamped_count=%s\n' % (pruned, stamped))
 print(resp.get('archived_count', 0))
 "
                 exit 0

@@ -28,6 +28,16 @@ Ayoai-Mind (dev)  →  Claude-Mind (staging)  →  ZDS-Mind (prod)
    - **Framework file promotions** (skills, scripts, rules, gates, conventions, CLAUDE.md, settings.json): **agent-doable** — run promotion-preflight.sh, reconcile drift, copy files. No user approval required. Git is the safety net.
    - **Infrastructure changes** (S3 backends, schema migrations, new daemon endpoints, .env credential changes, jar-keys vault edits, IAM policies, networking/VPC within already-authorized accounts): **agent-autonomous** — NO sign-off (Zachary 2026-07-01: "ungate me from signing off on things"; reversible technical infra is not protected by gating). The ONLY retained gate is **net-new recurring spend / new paid cloud accounts / billing-impact**, and even that is a *heads-up*, not a block.
 
+## Operator Runbook
+
+The end-to-end run procedure (worktree-at-tag method, plan-verdict triage
+decision table, force-past-plan ledger discipline, post-plant verification
+checklist, handoff) is standardized in
+`core/config/conventions/promotion-runbook.md`. When a promote's --plan
+verdict blocks, `bash core/scripts/promotion-plan-triage.sh` mechanically
+classifies every flagged file and emits the evidence ledger — only AUTHORED
+residue needs hand-forensics.
+
 ## Pre-Overwrite Drift Gate (MANDATORY)
 
 Promotion is a **RECONCILE, not a MIRROR.** Before overwriting ANY downstream
@@ -51,12 +61,12 @@ bash core/scripts/promotion-preflight.sh --source <incoming_repo> --target <repo
   source (or explicitly discard with sign-off) **before** the overwrite. Never
   promote past an exit-2 without resolving it.
 
-The gate compares only framework paths (`core/`, base `.claude/skills`,
-`.claude/rules`, `core/config`, `CLAUDE.md`, `settings.json`); it auto-excludes
-build artifacts (`__pycache__`, `*.pyc`, `.python-shim`, `_tmp_*`) and buckets
-domain forged skills + deployment-local files separately so they never count as
-drift. Read-only; safe to run anytime. Regression tests:
-`core/scripts/tests/test_promotion_preflight.py` (6/6).
+The gate compares only framework paths (`core/config`, `core/scripts`,
+`.claude/{skills,rules}`, `CLAUDE.md`, `settings.json`, `mind_api/{src,tests}`);
+it auto-excludes build artifacts (`__pycache__`, `*.pyc`, `.python-shim`,
+`_tmp_*`) and buckets domain forged skills + deployment-local files separately
+so they never count as drift. Read-only; safe anytime. Tests:
+`core/scripts/tests/test_promotion_preflight*.py`.
 
 ## What "Production" Means Here
 

@@ -68,6 +68,77 @@ for _arg in "$@"; do
     if [ "$_arg" = "--triage" ]; then exit "$FRAMEWORK_RC"; fi
 done
 
+# ── Per-half result record () ─────────────────────────────────────
+#
+# --triage globs chunk-*.log and nothing else, so its verdict covers the
+# chunked half alone. It was SILENT about the three halves below, and a silent
+# exclusion reads as coverage: measured 2026-08-02 (), triage printed
+# "2 environmental | 0 genuine" while two shell files in the invisible half were
+# red solo. The halves stream to THIS script's stdout and nothing durable is
+# written -- a real log dir holds chunk-*.log and nothing else (measured
+# 2026-08-10) -- so a later triage has nothing to read unless each half's result
+# is recorded HERE, at the moment it is produced.
+#
+# The dir comes from run-full-suite.py --print-out-dir, i.e. the SAME resolver
+# the run used. Re-deriving that default in bash would be a second source of
+# truth, free to drift from the one that decides where chunk-*.log actually
+# land. (The default moved off the synced tree in ; asking rather
+# than re-deriving is exactly why this wrapper needed no edit to follow it.)
+_OUT_ERR="$(mktemp 2>/dev/null || echo /tmp/rfs-outdir-err.$$)"
+_OUT_DIR="$(python3 "$SCRIPT_DIR_NATIVE/run-full-suite.py" --print-out-dir "$@" 2>"$_OUT_ERR")"
+if [ $? -ne 0 ] || [ -z "${_OUT_DIR:-}" ]; then
+    # Loud, never silent. Without the dir the halves below still RUN and still
+    # decide this script's exit code -- only the durable record is lost, so a
+    # LATER --triage will correctly say "NOT RECORDED" rather than inventing a
+    # pass. Say that out loud so the gap is attributable to this failure.
+    echo "=== !!! could not resolve the log dir (--print-out-dir) !!! ==="
+    echo "    The halves below will run normally, but their results will NOT be"
+    echo "    recorded, so a later --triage will report them as NOT RECORDED."
+    sed 's/^/    /' "$_OUT_ERR" 2>/dev/null
+    _OUT_DIR=""
+fi
+rm -f "$_OUT_ERR"
+
+# The half's summary line. LAST LINE IS THE WRONG ANSWER, and the first version
+# of this helper used it -- caught by the first live run rather than by reading.
+# Both runners print their real summary and THEN a list of failing files, so on
+# exactly the runs that matter the last line is a list item: the invisible half
+# recorded `  - test_runner_dead_check.sh` in place of
+# `invisible-suites: 95/102 files passed, 0 quarantined`. That names ONE of six
+# reds while reading like the whole story -- a fragment wearing a summary's
+# clothes, which is the same false-completeness this whole feature exists to
+# remove, reintroduced inside its own plumbing.
+#
+# "Last line containing `passed`" is grounded, not guessed: measured against
+# both live emitters (run-invisible-suites.sh `N/M files passed, K quarantined`
+# and run-domain-tests.sh `N/M unit(s) passed, K skipped`) plus pytest's own
+# `N passed`. It stays generic -- no per-runner shape is encoded here
+# (guard-2676) -- and the fallback is LABELLED so a fragment is never mistaken
+# for a summary a runner actually emitted.
+_summary_line() {
+    local s
+    s="$(grep -E 'passed' "$1" 2>/dev/null | tail -1)"
+    if [ -n "$s" ]; then printf '%s' "$s"; return 0; fi
+    s="$(awk 'NF{l=$0} END{print l}' "$1" 2>/dev/null)"
+    [ -n "$s" ] && printf 'no summary line; last output was: %s' "$s"
+}
+
+# $1=half $2=rc $3=ran(true|false) $4=summary
+_record_half() {
+    [ -n "${_OUT_DIR:-}" ] || return 0
+    python3 - "$_OUT_DIR/halves.jsonl" "$1" "$2" "$3" "$4" <<'PYEOF' || true
+import json, sys
+path, half, rc, ran, summary = sys.argv[1:6]
+try:
+    rc = int(rc)
+except ValueError:
+    rc = -1
+with open(path, "a", encoding="utf-8") as fh:
+    fh.write(json.dumps({"half": half, "rc": rc, "ran": ran == "true",
+                         "summary": summary[:400]}) + "\n")
+PYEOF
+}
+
 # Pytest-invisible suites (). run-full-suite.py drives pytest, which
 # by construction collects NEITHER main()-style .py files (no `def test_`) NOR
 # any .sh file — so before this call site the framework half of a "full suite"
@@ -88,8 +159,20 @@ done
 INVISIBLE_RC=0
 if [ -f "$SCRIPT_DIR/tests/run-invisible-suites.sh" ]; then
     echo "=== pytest-invisible suites: core/scripts/tests/run-invisible-suites.sh ==="
-    bash "$SCRIPT_DIR/tests/run-invisible-suites.sh"
-    INVISIBLE_RC=$?
+    # tee, so the operator still sees it stream AND a summary survives for
+    # --triage. PIPESTATUS[0] is the runner's rc, never tee's -- a trailing pipe
+    # otherwise reports the pipe's success as the command's (guard-1150), which
+    # here would record a red half as a pass.
+    _INV_LOG="$(mktemp 2>/dev/null || echo /tmp/rfs-invisible.$$)"
+    bash "$SCRIPT_DIR/tests/run-invisible-suites.sh" 2>&1 | tee "$_INV_LOG"
+    INVISIBLE_RC=${PIPESTATUS[0]}
+    _record_half invisible "$INVISIBLE_RC" true "$(_summary_line "$_INV_LOG")"
+    rm -f "$_INV_LOG"
+else
+    # An ABSENT runner is not a passing one. Recording it keeps --triage able to
+    # say which of the two it was, instead of printing NOT RECORDED and leaving
+    # the reader to guess whether the half ran and passed or never existed.
+    _record_half invisible 0 false "runner absent: core/scripts/tests/run-invisible-suites.sh"
 fi
 
 # Deferred testpaths (). run-full-suite.py's DEFERRED_TESTPATHS holds
@@ -180,8 +263,12 @@ if [ -n "${DEFERRED_PATHS:-}" ]; then
         [ -n "$_dp" ] || continue
         if [ "${RUN_DEFERRED:-0}" = "1" ]; then
             echo "=== deferred testpath (RUN_DEFERRED=1, own process): $_dp ==="
-            STORAGE_BACKEND=local python3 -m pytest "$_dp" -q -m "not daemon_integration"
-            _rc=$?
+            _DEF_LOG="$(mktemp 2>/dev/null || echo /tmp/rfs-deferred.$$)"
+            STORAGE_BACKEND=local python3 -m pytest "$_dp" -q \
+                -m "not daemon_integration" 2>&1 | tee "$_DEF_LOG"
+            _rc=${PIPESTATUS[0]}
+            _record_half deferred "$_rc" true "$_dp: $(_summary_line "$_DEF_LOG")"
+            rm -f "$_DEF_LOG"
             # `if` not `[ ] && x`: the && form evaluates to 1 when the test is
             # false, which would abort the loop under a future `set -e` (this
             # script is currently `set -uo pipefail`, so the && form is safe
@@ -196,6 +283,11 @@ if [ -n "${DEFERRED_PATHS:-}" ]; then
             echo "    Cover it separately on a quiet box:"
             echo "      STORAGE_BACKEND=local python3 -m pytest $_dp -q -m \"not daemon_integration\""
             echo "    Or fold it into this invocation with RUN_DEFERRED=1 (expect noise)."
+            # ran=false, NOT rc=0. This half is the one most easily misread as
+            # covered -- it is announced on every run and executed on almost
+            # none -- so --triage must be able to print DID NOT RUN rather than
+            # a pass it never earned.
+            _record_half deferred 0 false "NOT RUN: $_dp (RUN_DEFERRED=1 to include)"
         fi
     done <<< "$DEFERRED_PATHS"
 fi
@@ -217,8 +309,16 @@ fi
 DOMAIN_RC=0
 if [ -n "${WORLD_PATH:-}" ] && [ -f "$WORLD_PATH/scripts/run-domain-tests.sh" ]; then
     echo "=== domain test suite: $WORLD_PATH/scripts/run-domain-tests.sh ==="
-    bash "$WORLD_PATH/scripts/run-domain-tests.sh"
-    DOMAIN_RC=$?
+    _DOM_LOG="$(mktemp 2>/dev/null || echo /tmp/rfs-domain.$$)"
+    bash "$WORLD_PATH/scripts/run-domain-tests.sh" 2>&1 | tee "$_DOM_LOG"
+    DOMAIN_RC=${PIPESTATUS[0]}
+    _record_half domain "$DOMAIN_RC" true "$(_summary_line "$_DOM_LOG")"
+    rm -f "$_DOM_LOG"
+else
+    # A world with no domain runner is a supported configuration, not a
+    # breakage (see the existence-guard note above) -- but "supported" is not
+    # "passed", and only a recorded ran=false can say which one this was.
+    _record_half domain 0 false "no domain runner (world hook absent)"
 fi
 
 # Exit contract preserved exactly (0 clean | 1 genuine failures | 2

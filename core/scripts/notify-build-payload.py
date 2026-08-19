@@ -86,7 +86,7 @@ CATEGORY_TO_INFOTYPE = {
     # This category is SendInfoAlert-shaped (so it renders) AND must be listed in
     # notify-user Step 1.5's exempt tuple (so it never wedges). Adding one
     # WITHOUT the other re-breaks it — keep the two in sync.
-    "user-digest": "Goals Waiting On You",
+    "user-digest": "Fleet Digest",
 }
 
 # Minimum message length AFTER stripping. The silent-empty-email failure
@@ -231,6 +231,11 @@ def main():
                              "Justification required; echoed to stderr for audit. Use only "
                              "when the alert is genuinely time-critical and unfalsifiable-"
                              "by-command — never to route around the question.")
+    parser.add_argument("--html-file", default="",
+                        help="Path to a complete HTML document to send AS the email body "
+                             "(transport HTML-passthrough mode). --message/--message-file "
+                             "stays REQUIRED: it is the plain text the gates, ledger and "
+                             "dedup read. Not allowed for --category blocker.")
     parser.add_argument("--fenced-quotes", action="store_true",
                         help="This message QUOTES text this agent did not author, fenced "
                              "with '> '. Those lines are excluded from the disproof gate's "
@@ -336,10 +341,34 @@ def main():
     extract_self_identity(agent, project_root)
     body = message
 
+    html_doc = ""
+    if args.html_file:
+        hp = Path(args.html_file)
+        if not hp.exists():
+            print(f"[notify] --html-file not found: {args.html_file}", file=sys.stderr)
+            sys.exit(1)
+        html_doc = hp.read_text(encoding="utf-8", errors="replace").strip()
+        if not html_doc.lower().startswith(("<html", "<!doctype")):
+            print("[notify] --html-file must be a complete HTML document (starts with <html> or <!DOCTYPE)",
+                  file=sys.stderr)
+            sys.exit(1)
+        if args.category == "blocker":
+            print("[notify] --html-file is not supported for --category blocker", file=sys.stderr)
+            sys.exit(1)
+
     if args.category == "blocker":
         payload = {
             "ErrorMessage": body,
             "ErrorFrom": subject,
+        }
+    elif html_doc:
+        # HTML passthrough: the transport sends InfoMessage as-is when it is a
+        # complete document, and builds the subject from InfoType -- so the
+        # subject IS the InfoType here. No Title key (that would select the
+        # structured template and escape the HTML into a pre-wrap div).
+        payload = {
+            "InfoMessage": html_doc,
+            "InfoType": subject,
         }
     else:
         payload = {

@@ -68,10 +68,21 @@ def _ctx(role, agent_dir):
 # Note that probe shipped WITH a passing worker-inertness test of its own; that test
 # asserted the worker side and said nothing about the reducer roster, which is exactly
 # the gap this exhaustive pin covers.
+#
+# THIRD earning (): GitDriftProbe reddened the same three and was
+# classified WORKER-SAFE — the first probe since the filter landed to be added to
+# WORKER_SAFE_PROBES rather than excluded. The decision rests on measurement, not
+# on the probe reading box-level state alone: the boxes that actually forked were
+# cc-07 (342 ahead since 2026-08-08) and cc-08 (223 unpushed commits in 3 days),
+# and NEITHER was the reducer. A worker Body has the same checkout, the same host
+# disk, and pushes its own refs/workers/<agent>/<sid> carrier, so this is not
+# merely a probe a worker CAN run — it is the role where the condition it detects
+# accumulates. Excluding it would have left the measured incident undetected.
 ALL_REDUCER_PROBES = {
     "worker-stall", "running-sid", "heartbeat", "stalled", "background-job",
     "stop-hook-block", "daemon-health", "clock-skew", "freshness",
-    "mirror-wedge", "memory-headroom", "claim-heartbeat",
+    "mirror-wedge", "memory-headroom", "claim-heartbeat", "git-drift",
+    "infra-component",
 }
 
 # Excluded from workers because they read REDUCER-SHAPED STATE a worker
@@ -90,6 +101,21 @@ EXCLUDED_REDUCER_SHAPED = {
 # kill the in-loop tick along with the loop. Folding it into the set above would
 # lose that, and the next reader would think it was excluded for state reasons.
 EXCLUDED_PEER_SIDE = {"worker-stall"}
+
+# The THIRD bucket the accounting test below invited someone to name.
+# infra-component fits NEITHER of the two above, and forcing it into either
+# would record a false reason. It reads no reducer-shaped state (so not the
+# first), and its targets are external infrastructure rather than peer Bodies
+# (so not the second) — it would run perfectly well on a worker and report
+# exactly the right thing.
+#
+# It is excluded because it would report the right thing TWICE. Two Bodies of
+# one agent polling the same endpoint on the same cadence produce two alerts
+# for one fault, and a duplicated alert erodes trust in the signal faster than
+# a late one does. One poller per agent, and the reducer is the Body that is
+# always present. The cost of the exclusion is bounded and known: on a box
+# running only a worker, external components go unpolled until a reducer ticks.
+EXCLUDED_DUPLICATE_SUPPRESSED = {"infra-component"}
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +162,10 @@ def test_default_role_is_reducer(tmp_path):
 def test_worker_registers_exactly_the_box_level_probes(tmp_path):
     names = {p.name for p in wd.build_probes(_ctx("worker", tmp_path))}
     assert names == set(wd.WORKER_SAFE_PROBES)
-    assert len(names) == 5
+    # Literal, never len(WORKER_SAFE_PROBES) — the equality above already pins the
+    # set, so a self-derived count would assert nothing. This number is the second
+    # signature required when a probe joins the worker roster (git-drift, 2026-08-14).
+    assert len(names) == 6
 
 
 def test_reducer_still_registers_every_probe(tmp_path):
@@ -161,19 +190,24 @@ def test_worker_safe_probe_names_all_exist(tmp_path):
 
 
 def test_excluded_probes_are_accounted_for_by_reason(tmp_path):
-    """Every exclusion must have a STATED reason, and the two reasons differ.
+    """Every exclusion must have a STATED reason, and the reasons differ.
 
     Asserting the union alone would let a future probe be dropped from workers
     for no recorded reason — the exclusion list would still balance. Splitting
-    it forces each new exclusion into one of the two buckets, or into a third
-    one someone has to name.
+    it forces each new exclusion into one of the buckets, or into a new one
+    someone has to name. That invitation has now been taken up once:
+    infra-component arrived fitting neither original bucket and added
+    EXCLUDED_DUPLICATE_SUPPRESSED rather than being filed under a reason that
+    was not true of it.
     """
     all_names = {p.name for p in wd.build_probes(_ctx("reducer", tmp_path))}
     excluded = all_names - set(wd.WORKER_SAFE_PROBES)
-    assert excluded == EXCLUDED_REDUCER_SHAPED | EXCLUDED_PEER_SIDE
-    # The buckets are genuinely disjoint — a probe excluded for both reasons
-    # would mean one of the two rationales is wrong about it.
-    assert EXCLUDED_REDUCER_SHAPED & EXCLUDED_PEER_SIDE == set()
+    buckets = (EXCLUDED_REDUCER_SHAPED, EXCLUDED_PEER_SIDE,
+               EXCLUDED_DUPLICATE_SUPPRESSED)
+    assert excluded == set().union(*buckets)
+    # The buckets are genuinely disjoint — a probe excluded for two reasons
+    # would mean one of the rationales is wrong about it.
+    assert sum(len(b) for b in buckets) == len(set().union(*buckets))
 
 
 def test_peer_side_probe_is_not_offered_to_workers(tmp_path):

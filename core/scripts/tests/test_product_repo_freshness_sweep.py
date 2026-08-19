@@ -54,6 +54,25 @@ def _commit(repo, msg):
          "commit", "-q", "--allow-empty", "-m", msg)
 
 
+def _commit_content(repo, name, text, msg):
+    """A commit that actually CHANGES the tree.
+
+    `_commit` above uses --allow-empty, which is a fine shortcut for building
+    TOPOLOGY but produces zero CONTENT divergence — and content divergence is
+    precisely what the tree-identity filter measures (guard-1996 / g-115-6355).
+    An empty commit is therefore, correctly, no longer reported as unpushed
+    work: it is indistinguishable from the squash-merge topology the sweep now
+    excludes. So any fixture whose intent is "real unpushed WORK" must write a
+    file — the incident this sweep exists for was a completed FIX, and a fix
+    has content. `test_genuinely_absent_work_survives_the_cherry_filter` was
+    already written this way, for the same reason, one filter earlier.
+    """
+    (repo / name).write_text(text, encoding="utf-8")
+    _git(repo, "add", name)
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t",
+         "commit", "-q", "-m", msg)
+
+
 def _make_repo(root, name, with_remote=True):
     """A checkout on `main` whose base commit is pushed (when it has a remote)."""
     work = root / name
@@ -102,10 +121,10 @@ def test_sweep_sees_what_freshness_misses(tmp_path):
     """
     work = _make_repo(tmp_path, "work")
     _git(work, "checkout", "-q", "-b", "feature")
-    _commit(work, "unpushed one")
-    _commit(work, "unpushed two")
+    _commit_content(work, "one.txt", "one\n", "unpushed one")
+    _commit_content(work, "two.txt", "two\n", "unpushed two")
     _git(work, "checkout", "-q", "-b", "other")
-    _commit(work, "unpushed three")
+    _commit_content(work, "three.txt", "three\n", "unpushed three")
     _git(work, "checkout", "-q", "main")
 
     # freshness(): the current branch is in sync, so it reports nothing wrong.
@@ -134,10 +153,10 @@ def test_unpushed_total_is_distinct_not_a_per_branch_sum(tmp_path):
     """
     work = _make_repo(tmp_path, "shared")
     _git(work, "checkout", "-q", "-b", "feature")
-    _commit(work, "u1")
-    _commit(work, "u2")
+    _commit_content(work, "u1.txt", "u1\n", "u1")
+    _commit_content(work, "u2.txt", "u2\n", "u2")
     _git(work, "checkout", "-q", "-b", "other")
-    _commit(work, "u3")
+    _commit_content(work, "u3.txt", "u3\n", "u3")
     _git(work, "checkout", "-q", "main")
 
     r = rec_for(run_sweep(work), "shared")
@@ -154,7 +173,7 @@ def test_unpushed_total_is_distinct_not_a_per_branch_sum(tmp_path):
 def test_unpushed_on_default_branch_is_high(tmp_path):
     """The a55add9 class: committed to local main, never pushed."""
     work = _make_repo(tmp_path, "app")
-    _commit(work, "fix that never left this box")
+    _commit_content(work, "fix.txt", "the fix\n", "fix that never left this box")
     r = rec_for(run_sweep(work), "app")
     assert r["severity"] == "high"
     # Assert the fields that carry meaning, not the whole dict: an exact-dict
@@ -169,7 +188,7 @@ def test_unpushed_on_feature_branch_is_medium_not_high(tmp_path):
     """Severity must DISCRIMINATE — if everything is HIGH, nothing is."""
     work = _make_repo(tmp_path, "app")
     _git(work, "checkout", "-q", "-b", "wip")
-    _commit(work, "work in progress")
+    _commit_content(work, "wip.txt", "work in progress\n", "work in progress")
     _git(work, "checkout", "-q", "main")
     r = rec_for(run_sweep(work), "app")
     assert r["severity"] == "medium"
@@ -235,6 +254,127 @@ def test_genuinely_absent_work_survives_the_cherry_filter(tmp_path):
     assert len(r["unpushed"]) == 1
     assert r["unpushed"][0]["patches_absent"] == 1
     assert r["severity"] == "medium"
+
+
+def test_squash_merge_topology_with_identical_tree_is_not_flagged(tmp_path):
+    """`git cherry` cannot see a MULTI-commit squash — the  defect.
+
+    The cherry filter one test up catches a squash only when the branch was a
+    SINGLE commit, because then the squashed patch-id still matches. Squash N
+    commits and the combined patch matches NONE of the N originals, so every
+    one of them reports `+` and the branch sails through untouched.
+
+    THE MEASURED CASE, not a hypothetical. A live product repo reported HIGH at
+    `ahead 9, behind 0` while `HEAD^{tree}` and `origin/main^{tree}` were the
+    same hash and `git diff --name-only origin/main HEAD` listed zero files.
+    That false HIGH went on to generate a downstream product goal whose
+    acceptance criteria would have opened an EMPTY-diff PR against a protected
+    production repo — so this false positive manufactures work, it does not
+    merely add a line to a report.
+    """
+    bare = tmp_path / "topological.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True, timeout=30)
+    work = tmp_path / "topological"
+    subprocess.run(["git", "clone", "-q", str(bare), str(work)],
+                   capture_output=True, check=True, timeout=30)
+    _commit(work, "base")
+    _git(work, "branch", "-q", "-M", "main")
+    _git(work, "push", "-q", "-u", "origin", "main")
+
+    # TWO real commits on local main — what a locally-merged feature leaves
+    # behind. Each is its own patch, which is exactly what defeats cherry.
+    _commit_content(work, "a.txt", "A\n", "feat: a")
+    _commit_content(work, "b.txt", "B\n", "feat: b")
+
+    # Upstream takes the SAME content as ONE commit, pushed from a peer
+    # checkout. That is what a squash-merged PR does to the shared branch.
+    peer = tmp_path / "peer"
+    subprocess.run(["git", "clone", "-q", str(bare), str(peer)],
+                   capture_output=True, check=True, timeout=30)
+    # Bind explicitly to origin/main. `git init --bare` honours
+    # init.defaultBranch, which need not be `main`, so the bare repo's HEAD can
+    # name a branch nothing ever created and the clone lands on an UNBORN
+    # branch — after which `push origin main` fails and `_git` swallows the rc.
+    # That is how this fixture first ran: silent no-op push, origin/main left at
+    # the empty-tree base, and the trees differed for a reason having nothing to
+    # do with the code under test (guard-1091).
+    _git(peer, "checkout", "-q", "-B", "main", "origin/main")
+    (peer / "a.txt").write_text("A\n", encoding="utf-8")
+    (peer / "b.txt").write_text("B\n", encoding="utf-8")
+    _git(peer, "add", "a.txt", "b.txt")
+    _git(peer, "-c", "user.email=t@t", "-c", "user.name=t",
+         "commit", "-q", "-m", "squashed: a+b (#42)")
+    push = _git(peer, "push", "-q", "origin", "main")
+    assert push.returncode == 0, "fixture drift: peer push failed: %s" % push.stderr
+    _git(work, "fetch", "-q", "origin")
+
+    # FIXTURE PRECONDITIONS. Without these the assertions below can pass for
+    # the wrong reason — a fixture that stopped reproducing the measured state
+    # would report a green that means nothing (rb-245 / guard-2421).
+    assert _git(work, "rev-parse", "main^{tree}").stdout.strip() == \
+           _git(work, "rev-parse", "origin/main^{tree}").stdout.strip(), \
+        "fixture drift: the trees must be IDENTICAL or this is not the measured case"
+    cherry = _git(work, "cherry", "origin/main", "main").stdout
+    assert sum(1 for ln in cherry.splitlines() if ln.startswith("+")) == 2, \
+        "fixture drift: `git cherry` must STILL report both commits absent — if " \
+        "it does not, this no longer exercises the gap the tree check fills"
+
+    r = rec_for(run_sweep(work), "topological")
+    assert r["unpushed"] == [], \
+        "zero content divergence — a push here would carry an empty diff"
+    assert r["severity"] == "clean"
+    assert [t["branch"] for t in r["tree_identical_branches"]] == ["main"]
+    assert r["tree_identical_branches"][0]["upstream"] == "origin/main"
+
+
+def test_genuine_default_branch_divergence_survives_the_tree_filter(tmp_path):
+    """The positive control for the tree filter, on the lane it was added to.
+
+    Paired deliberately with the topology test above: a filter that dropped
+    everything would make that test pass while silencing the sweep's entire
+    reason to exist. Discrimination is the claim here, not exclusion.
+    """
+    work = _make_repo(tmp_path, "genuine-main")
+    _commit_content(work, "shipped.txt", "real work\n", "fix nobody pushed")
+
+    r = rec_for(run_sweep(work), "genuine-main")
+    assert r["tree_identical_branches"] == [], "real content must not be excluded"
+    assert r["severity"] == "high"
+    assert len(r["unpushed"]) == 1
+    u = r["unpushed"][0]
+    assert (u["branch"], u["on_default"]) == ("main", True)
+    assert u["tree_identical"] is False, \
+        "the compare must have RUN and answered 'differs' — None would mean unmeasured"
+
+
+def test_unmeasurable_tree_compare_does_not_promote_a_branch_to_clean(tmp_path):
+    """CANNOT CHECK, per branch: `None` is neither `False` nor `True`.
+
+    A remote is configured but nothing was ever pushed, so `origin/main` does
+    not exist and there is no ref to compare a tree against. The compare is
+    UNMEASURED — and an unmeasured check must leave the branch reported,
+    exactly as a failed `git status` leaves the repo non-clean. The opposite
+    default is the vacuity this script guards at every other level, and it
+    would be the worst version of it here: the promotion would be to silence.
+    """
+    bare = tmp_path / "never-pushed.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True, timeout=30)
+    work = tmp_path / "never-pushed"
+    subprocess.run(["git", "clone", "-q", str(bare), str(work)],
+                   capture_output=True, check=True, timeout=30)
+    _commit_content(work, "only-here.txt", "never left this box\n", "work")
+    _git(work, "branch", "-q", "-M", "main")
+
+    assert _git(work, "rev-parse", "--verify", "--quiet",
+                "origin/main").returncode != 0, \
+        "fixture drift: origin/main must NOT exist, or the compare is measurable"
+
+    r = rec_for(run_sweep(work), "never-pushed")
+    assert r["tree_identical_branches"] == []
+    assert len(r["unpushed"]) == 1
+    assert r["unpushed"][0]["tree_identical"] is None, \
+        "an unmeasurable compare must record None, never a measured False"
+    assert r["severity"] != "clean"
 
 
 def test_clean_repo_is_clean(tmp_path):
@@ -346,7 +486,7 @@ def test_sweep_ignores_goal_id_selection(tmp_path):
     spot it exists to remove.
     """
     work = _make_repo(tmp_path, "unnamed-by-any-goal")
-    _commit(work, "orphan")
+    _commit_content(work, "orphan.txt", "orphan work\n", "orphan")
     payload = run_sweep(work, extra=["--goal-id", "g-999-99"])
     assert payload["scanned"] == 1
     assert rec_for(payload, "unnamed-by-any-goal")["severity"] == "high"

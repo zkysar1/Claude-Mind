@@ -49,7 +49,7 @@ fi
 
 OWNER="$1"
 SCRIPT="$2"
-shift 2
+shift $(( $# >= 2 ? 2 : 1 ))
 
 # Identity/liveness scripts that MUST run under the CALLER's own identity and so
 # must NEVER be routed to the owner. SSOT for the exempt classification that was

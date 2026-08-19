@@ -147,7 +147,171 @@ ARRAY_SLOTS = {
     # Membership here also buys body-merge's _dedup_append content-hash dedup for
     # free — that helper keys off ARRAY_SLOTS, so no body-merge edit is needed.
     "exp_capture",
+    # hyp_capture (): the worker->reducer HYPOTHESIS-EVIDENCE bridge, third
+    # sibling, registered for the identical survival reason above. Separate from
+    # exp_capture for the same writer-knows-best reason: an exp_capture entry is a
+    # narrative the reducer encodes an experience FROM, while a hyp_capture entry is
+    # EVIDENCE INPUT to the existing /review-hypotheses resolution protocol, keyed to
+    # a real pipeline.jsonl hypothesis_id. It is never a second resolver — the worker
+    # supplies evidence, the reducer runs the full protocol, which is also what makes
+    # the no-double-resolution guard expressible at all.
+    "hyp_capture",
+    # encoding_capture (): the worker->reducer TREE bridge, fourth and
+    # last sibling, registered for the identical survival reason above. Separate
+    # from spark_capture on the learning-routing.md axis, not on a stylistic one:
+    # a spark is a LESSON about how to work (the reducer routes it to rb or a
+    # guardrail), while this is a DOMAIN FACT about the world the agent operates
+    # in (the reducer routes it to a knowledge-tree node). Merging them would
+    # force the reducer to re-derive a classification the executing session
+    # already knew — the same argument that separates 3.6 and 3.65.
+    # EXPECT THIS SLOT TO BE EMPTY MOST UNITS, and do not read that as breakage.
+    # Measured over one full worker session (alpha, cc-08, 2026-08-11, 5 units):
+    # 0 of 6 spark observations were tree-worthy domain facts — the domain facts
+    # that session DID learn (an alarm re-point, a mail-lane bucket scope) flowed
+    # through goal records instead. That is the conditional-slot pattern 3.5 and
+    # 3.65 already describe, not evidence the lane is dead; but if a later audit
+    # finds it still empty across many sessions AND finds tree nodes being
+    # encoded from goal records anyway, the honest conclusion is that goal
+    # records are the real bridge and this slot should be RETIRED rather than
+    # defended (learning-philosophy.md rule 5 — subtraction is learning too).
+    "encoding_capture",
 }
+
+# The capture lanes proper — the four worker->reducer bridges above, as an
+# ordered tuple so every consumer iterates them the same way. ARRAY_SLOTS is a
+# set and contains non-capture members (knowledge_debt, sensory_buffer, ...),
+# so it is the wrong thing to iterate when the question is "what did the worker
+# capture". .
+CAPTURE_SLOTS = ("spark_capture", "exp_capture", "hyp_capture", "encoding_capture")
+
+# : FIFO eviction at cap drops the OLDEST entry first, which is exactly
+# backwards for a capture the worker marked load-bearing — the longer a Body
+# runs, the more certain it is that its most important early finding is the one
+# destroyed. Measured on one ACTIVE Body (alpha, cc-08, 2026-08-15, 21 units):
+# 237 entries evicted (spark 144, exp 74, hyp 19) against caps of 50/20/10,
+# i.e. ~74% of everything spark_capture was ever handed. Second instance of the
+#  measurement (215 on cc-07), so this is the rule, not an outlier.
+#
+# A priority-merge lane whose entries are gone before the lane runs is
+# decorative, which is why the flag has to bite HERE and not only at merge time.
+# Flagged entries sort LAST and are therefore popped LAST: unflagged entries
+# absorb the whole cap pressure first. When a lane is ALL load-bearing the cap
+# still holds and the oldest flagged entry goes — a cap that could be defeated
+# by a field the writer controls is not a cap.
+#
+# MIRROR: wm_write.py::append_slot carries a byte-identical key. The DAEMON copy
+# is the live one (wrappers are daemon-only), so a wm.py-only edit changes
+# nothing at runtime — the  bug class.
+def _eviction_sort_key(x):
+    if not isinstance(x, dict):
+        return (0, "0000")
+    return (1 if x.get("load_bearing") else 0, x.get("_item_ts", "0000"))
+
+
+def _is_flagged(x) -> bool:
+    """The flag half of _eviction_sort_key, as a predicate.
+
+    Non-dicts sort as UNFLAGGED in the key above, so they must count as unflagged
+    here too — if the two disagreed about where the flagged block starts, the
+    floor below would index into the wrong entry.
+    """
+    return isinstance(x, dict) and bool(x.get("load_bearing"))
+
+
+# Share of a capped lane held open for UNFLAGGED entries. 0.2 is the value
+#  specified; it is deliberately a constant and not config, because the
+# daemon carries a mirror of this policy (see MIRROR note above) and a config key
+# read by only one of the two copies is a worse failure than a tuned number.
+UNFLAGGED_FLOOR_RATIO = 0.2
+
+
+def _unflagged_floor(limit: int) -> int:
+    """How many slots of `limit` are reserved for UNFLAGGED entries.
+
+    Zero below limit=2: a lane that holds one item cannot reserve a share of
+    itself without inverting the priority key outright. Capped at `limit - 1` so
+    the reservation can never starve flagged entries completely — the floor is a
+    guarantee that the lane keeps *hearing* unflagged content, not a demotion of
+    load_bearing.
+    """
+    if not limit or limit < 2:
+        return 0
+    return min(limit - 1, max(1, int(limit * UNFLAGGED_FLOOR_RATIO)))
+
+
+def enforce_slot_limit(arr, limit, item=None) -> int:
+    """Evict from `arr` IN PLACE until it fits `limit`; return how many were
+    dropped. Zero when `limit` is falsy or the list already fits.
+
+    `item`, when given, is the entry the CALLER just added and must survive
+    this call (g-306-308 / g-115-6541): an unflagged newcomer sorts to index 0
+    behind a slot full of load_bearing peers and would otherwise be popped by
+    the very write that created it. When the head of the sorted list IS that
+    entry (identity, not equality) the victim is the next-oldest peer instead.
+    The merge path (body-merge.py) passes nothing — every entry there is a
+    peer, so the plain oldest-first policy is right.
+
+    A RESERVED FLOOR (`_unflagged_floor`) keeps `limit * 0.2` slots open for
+    unflagged entries, and it applies on BOTH paths including the merge one,
+    where it is the thing that stops a reducer's generalize-down from discarding
+    a worker Body's routine observations wholesale. Above the floor the priority
+    key is untouched: unflagged peers are still evicted before flagged ones.
+    Below it the order inverts on purpose and the oldest FLAGGED entry goes
+    instead — the honest cost, since a lane at 100% flagged has no variance left
+    in the key and has stopped triaging anything at all.
+
+    SINGLE SOURCE OF TRUTH for the eviction POLICY, and it exists because there
+    are two entry points and only one of them ever enforced anything.
+    `cmd_append` is the WRITE path; `body-merge.py::merge_wm` is the
+    GENERALIZE-DOWN path, and generalize-down is how a worker Body's capture
+    entries actually reach a reducer's WM. Measured 2026-08-17 (g-306-309):
+    body-merge.py contained ZERO references to array_limits,
+    _eviction_sort_key or limit, so every cap in memory-pipeline.yaml was
+    unapplied to the traffic that fills these lanes — spark_capture 69/50 and
+    exp_capture 40/20 on the reducer. `git log -S` over that file finds no
+    commit that ever added OR removed those tokens, so this was never a
+    regression: the merge path simply never enforced.
+
+    Note the two paths fail in OPPOSITE directions, which is why this helper
+    fixes only half the problem by itself. Same day, same fleet: the reducer
+    (cc-04) sat OVER cap because merge never evicts, while a worker Body
+    (cc-08) sat exactly AT cap — spark 50/50, exp 20/20, both 100%
+    load_bearing — where an unflagged append is sorted to index 0 and popped
+    by the write that created it (g-306-308 / g-115-6541). Restoring
+    enforcement here makes that selection defect start to bite on this path
+    too; land them together or land this one knowing it goes live.
+
+    Kept deliberately free of config, slot names and counters so the two
+    callers can differ on all three: the caller decides WHICH slots are capped
+    and where the eviction tally is recorded.
+    """
+    if not limit or len(arr) <= limit:
+        return 0
+    arr.sort(key=_eviction_sort_key)
+    floor = _unflagged_floor(limit)
+    # Sorted (flag, ts) => unflagged occupy the PREFIX, so this count is ALSO the
+    # index of the oldest FLAGGED entry. Maintained incrementally in the loop
+    # rather than recomputed, so eviction stays O(n) rather than O(n^2).
+    n_unflagged = sum(1 for x in arr if not _is_flagged(x))
+    evicted = 0
+    while len(arr) > limit:
+        # TWO protections, and they are scoped to different UNITS (guard-4236).
+        # The floor is PER-WINDOW: it is a property of the LANE, so it still
+        # holds on the NEXT call. The `item` guard below is PER-CALL: it protects
+        # this newcomer only while this call runs. The per-call guard alone is
+        # what made N consecutive unflagged appends into a saturated lane keep
+        # exactly ONE — every previous newcomer became an unprotected peer that
+        # sorted first and was popped, a 90% loss at N=10 that no single-call
+        # test could see ( measured it;  is this fix).
+        _victim = n_unflagged if (len(arr) - n_unflagged) > limit - floor else 0
+        if item is not None and arr[_victim] is item and len(arr) > 1:
+            _victim = _victim + 1 if _victim + 1 < len(arr) else _victim - 1
+        if _victim < n_unflagged:
+            n_unflagged -= 1
+        arr.pop(_victim)
+        evicted += 1
+    return evicted
+
 
 # Slots that are maps with specific structure (not scalars)
 MAP_SLOTS = {
@@ -168,17 +332,48 @@ STRUCTURED_DICT_SLOTS = {"loop_state"}
 # or the cadence memory is destroyed and the next cadence-check duplicate-fires.
 # Discovered  (2026-04-21): wm-prune evicted last_fresh_eyes_review at
 # 132 min age; cadence-check then read last=0 and would have fired a duplicate
-# briefing. Patterns match slot names like last_fresh_eyes_review,
-# last_evolution_at_time, last_strategic_scan, last_strategic_scan_tick, etc.
+# briefing.
+#
+# MATCH THE CLASS, NOT A LIST OF VERBS (, 2026-08-18). This was eight
+# patterns of the shape `^last_.*_<verb>$`, enumerating the suffixes that
+# happened to exist when  was written — so protection depended on which
+# verb a slot's author chose, and every stamp named with an unenumerated verb was
+# evicted at evict_threshold_minutes. Measured live on this box: of 17
+# cadence/dispatch stamps, NINE were unprotected and three were nulled 8 minutes
+# before the measurement — `last_curriculum_eval` (verb not in the list),
+# `last_completed_not_closed_triage` (same), and `fresh_eyes_last_dispatch`
+# (whose name does not START with `last_`, so no `^last_` pattern could ever
+# reach it). `^last_.*_fire$` was written for a name shape that does not exist:
+# the real slot is `fresh_eyes_last_fire`.
+#
+# The sharpest casualty was the `*_last_dispatch` family — all six of the
+# consumption-aware stamps that stale-sentinel-canary uses as its ONLY
+# discriminator between "consumer kept up" and "consumer bypassed the gate."
+# Nulling them every 120 min defeats that protection on a 2-hour cycle and
+# false-fires "stale sentinel set for N iterations" Investigates.
+#
+# The class is: a slot recording WHEN SOMETHING LAST HAPPENED. Its name either
+# begins `last_` or carries `_last_` before the event name. Both anchored (a
+# prefix and a delimited infix) — deliberately not a bare `last` substring, which
+# would match unrelated slots. Measured across all 75 live slots: 10 newly
+# protected (every one a genuine stamp), 0 protection lost, 0 unrelated slots
+# swept in. Adding a stamp no longer requires editing this tuple, which is what
+# let the population drift out from under it.
+#
+# Over-protecting a scalar costs a stale value lingering; under-protecting one
+# destroys cadence memory and re-fires expensive rituals. guard-362 requires
+# class-(b) entities be allowlisted, and this direction is the safe one.
+#
+# EVERY PATTERN HERE MUST BE ^-ANCHORED. `_is_cadence_tracker` applies
+# `p.match()`, which anchors at position 0 regardless of the pattern — so a bare
+# infix `_last_` compiles fine, reads correctly, and matches NOTHING. All eight
+# original patterns opened with `^`, so the constraint was satisfied by accident
+# and never stated. Caught here only because the measurement above was written
+# with `.search()` while production uses `.match()`; write the infix as
+# `^.*_last_` so the two agree.
 CADENCE_TRACKER_PATTERNS = (
-    re.compile(r"^last_.*_review$"),
-    re.compile(r"^last_.*_at$"),
-    re.compile(r"^last_.*_at_time$"),
-    re.compile(r"^last_.*_tick$"),
-    re.compile(r"^last_.*_check$"),
-    re.compile(r"^last_.*_checkin$"),
-    re.compile(r"^last_.*_scan$"),
-    re.compile(r"^last_.*_fire$"),
+    re.compile(r"^last_"),
+    re.compile(r"^.*_last_"),
 )
 
 # Slots that survive cmd_reset BY NAME: their writer and reader sit on opposite
@@ -208,10 +403,81 @@ CADENCE_TRACKER_PATTERNS = (
 # transport + same boundary = same exemption. Omitting it would make the merge
 # report success while the narratives were wiped ~5 steps later, which is the
 #  failure verbatim, and silent for the same reason.
-RESET_SURVIVING_SLOTS = {"journal_cluster_summaries", "spark_capture", "exp_capture"}
+# hyp_capture () is the fourth member, same transport and same boundary:
+# it rides body-merge into the reducer WM at Step -1, and its consumer is the
+# /review-hypotheses resolution protocol, which runs well after the Step-5 reset.
+# The failure mode of omitting it is worse here than for its siblings, because the
+# evidence is keyed to a specific hypothesis_id: a wiped entry does not merely lose
+# a narrative, it lets the reducer resolve that hypothesis WITHOUT the worker's
+# evidence while every signal reports success — a silently under-informed
+# resolution rather than an obviously missing one.
+#
+# encoding_capture () is the fifth member and was MISSING here for its
+# whole life until  (2026-08-12) — it rides the identical body-merge
+# transport into the reducer WM at Step -1, and its INTENDED consumer (tree
+# encoding at aspirations-state-update Step 8) would run after the Step-5 reset,
+# so it needed this exemption from the day it shipped. Three siblings each got a
+# paragraph above when they were added; the fourth lane got ARRAY_SLOTS
+# registration in both files and nothing here, so a reset destroyed it while its
+# siblings survived.
+#
+# THAT CONSUMER DOES NOT EXIST — measured 2026-08-15 (alpha worker, cc-07), and
+# the sentence above said "its consumer ... runs" in both this file and the
+# wm_write.py twin until then. `encoding_capture` appears 0 times in
+# aspirations-state-update/SKILL.md (71,534 bytes; positive control in that same
+# file: encoding_queue 2, wm-read 6), and nothing bridges it to encoding_queue,
+# which state-update both writes and drains ITSELF for coordination-deferred
+# encodings. Full census outside agents/ is producer + registration + tests only:
+# wm.py 4, worker-loop SKILL.md 4, wm_write.py 3, tests 3. All three siblings do
+# have real drains (aspirations-spark Phase 6.5; worker_retrospective.py
+# RUN_LANES "experience" -> _lane_experience; /review-hypotheses +
+# hyp_capture_guard.py). This lane has none, so entries ride the transport into
+# the reducer WM correctly and are then read by nothing. Building the consumer is
+#  (HIGH, pending, unclaimed since 2026-08-06), which is HALF-shipped:
+# its worker/producer half landed, its reducer half did not.
+#
+# DO NOT apply the L167-176 "expect it empty / consider RETIRING it" branch on
+# the strength of that: measured the same day, alpha's agent-wide WM held 132
+# encoding_capture entries (spark 162, exp 72, hyp 28) — the second-largest
+# capture lane, not an empty one. The retirement branch is conditioned on the
+# lane being unused AND tree nodes flowing from goal records instead; the first
+# conjunct is false. This is a live, heavily-written, unread lane.
+#
+# WHY THE OMISSION WAS INVISIBLE, which is the part worth carrying: the parity
+# test (test_wm_reset_cadence.py) pins the CLI<->daemon mirror, so both copies
+# agreed — on the same wrong set. And its survive-assertion exercises exactly one
+# representative member (journal_cluster_summaries), so it passes for ANY subset
+# of the capture family. Two green checks, neither of which could see a missing
+# lane. The survive test now iterates all four capture lanes by name for that
+# reason; a fifth lane must be added there too, or it inherits this same silence.
+# capture_consumed_hashes () is the durable consumed-watermark for the
+# four capture lanes. It MUST survive the reset for the same reason the lanes do,
+# and for one more: the watermark exists precisely because the live slot's dedup
+# basis is destroyed by consumption, so a watermark that is itself wiped restores
+# the original bug while looking fixed. Written by capture_fast_lane._merge_flagged
+# at MERGE time; read back as _dedup_append(extra_seen=...).
+RESET_SURVIVING_SLOTS = {"journal_cluster_summaries", "spark_capture", "exp_capture",
+                         "hyp_capture", "encoding_capture", "capture_consumed_hashes"}
 
 def _is_cadence_tracker(slot_name):
-    """True if slot name matches a cadence-tracker pattern — do not evict."""
+    """True if slot name matches a cadence-tracker pattern — do not evict.
+
+    TOP_LEVEL_KEYS are excluded FIRST (g-115-6697). They hold session VALUES,
+    not cadence bookkeeping, so they are stale-from-neglect (guard-362 class a)
+    and must stay evictable. Exactly one of them — `last_goal_category`, which
+    holds a category string, not a timestamp — matches the `^last_` class
+    pattern, and it is the deliberate negative control in
+    `test-wm-prune-cadence-protection.sh` ("ensuring eviction still works").
+    Reusing the already-declared TOP_LEVEL_KEYS set keeps this a class rule:
+    an exception ENUMERATION here would be the mirror of the suffix-verb
+    enumeration this fix removed. Verified: no cadence stamp is a TOP_LEVEL_KEY.
+
+    KEEP THIS BODY IDENTICAL TO THE DAEMON MIRROR in
+    mind_api/src/endpoints/wm_write.py. The parity test compares the PATTERNS
+    tuple only, so a divergence in this FUNCTION is not currently caught.
+    """
+    if slot_name in TOP_LEVEL_KEYS:
+        return False
     return any(p.match(slot_name) for p in CADENCE_TRACKER_PATTERNS)
 
 # ---------------------------------------------------------------------------
@@ -585,6 +851,11 @@ def cmd_append(args):
     if root_slot_for_validation == "knowledge_debt" and isinstance(item, dict):
         _validate_knowledge_debt_entry(item)
 
+    # : initialized OUTSIDE the lock so the post-lock push below can
+    # read it on every path — the same NameError trap the _evicted counter
+    # documents in the daemon twin.
+    _carrier_path = None
+
     with wm_lock():
         data = read_wm()
         if not data:
@@ -600,6 +871,23 @@ def cmd_append(args):
         if arr is None:
             parent[key] = []
             arr = parent[key]
+        # SELF-HEAL the int-in-LIST-slot collision — TWIN of the daemon
+        # mind_api/src/endpoints/wm_write.py append (the LIVE path, guard-742);
+        # keep in sync. The TOP-LEVEL goals_completed_this_session is a LIST of
+        # hand-off rows; an int there is the loop_state counter's NAME leaking
+        # into the wrong key (2026-08-16, worker-loop Phase 4b outage — 3 of 3
+        # forked Bodies checked). An int carries no rows, so it is always
+        # corruption: heal to [] loudly and continue. Scoped to this one slot.
+        _healed_int = None
+        if (is_top and key == "goals_completed_this_session"
+                and isinstance(arr, (int, float)) and not isinstance(arr, bool)):
+            _healed_int = arr
+            parent[key] = []
+            arr = parent[key]
+            print(f"WARN: 'goals_completed_this_session' was {type(_healed_int).__name__}:"
+                  f"{_healed_int} (loop_state counter name collided with the top-level "
+                  f"hand-off LIST); reset to [] before appending — find the writer",
+                  file=sys.stderr)
         if not isinstance(arr, list):
             print(f"ERROR: '{args.slot}' is {type(arr).__name__}, not a list", file=sys.stderr)
             sys.exit(1)
@@ -664,16 +952,69 @@ def cmd_append(args):
         limits = pruning.get("array_limits", {})
         root_slot = args.slot.split(".")[0]
         limit = limits.get(root_slot)
-        if limit and len(arr) > limit:
-            # Remove oldest items (those without _item_ts first, then by _item_ts)
-            arr.sort(key=lambda x: x.get("_item_ts", "0000") if isinstance(x, dict) else "0000")
-            while len(arr) > limit:
-                arr.pop(0)
+        # Remove oldest items (those without _item_ts first, then by _item_ts),
+        # but EVICT UNFLAGGED BEFORE LOAD-BEARING (). Mirror of the
+        # daemon key in wm_write.py::append_slot — keep the two identical.
+        # The sort+pop itself now lives in enforce_slot_limit () so the
+        # merge path can apply the SAME policy instead of growing a second copy.
+        # : `item=` is the entry THIS call just added; the helper never
+        # picks it as its own eviction victim -- see the TWIN in
+        # wm_write.py::append_slot for the measurement and the full rationale.
+        # That daemon copy is the LIVE path (wrappers are daemon-only), so an
+        # edit here alone would be inert at runtime; both halves must move
+        # together (guard-742/547, the  bug class).
+        _evicted = enforce_slot_limit(arr, limit, item=item)
+        if _evicted:
+            # : mirror of the daemon counter in wm_write.py::append_slot.
+            # The DAEMON copy is the live one (wrappers are daemon-only), so this
+            # exists for parity — pinned by the shared-constants parity test, which
+            # is what makes forgetting one half loud instead of silent.
+            # TOP-LEVEL, not slot_meta: body-merge merges slot_meta reducer-wins, so
+            # a counter there is dropped at generalize-down.
+            _ev = data.get("capture_evictions")
+            if not isinstance(_ev, dict):
+                _ev = {}
+                data["capture_evictions"] = _ev
+            _prev = _ev.get(root_slot)
+            _ev[root_slot] = (_prev if isinstance(_prev, int) else 0) + _evicted
 
         if not is_top:
             update_modified(data, args.slot)
 
         write_wm(data)
+        # : mirror a LOAD-BEARING capture into this Body's
+        # session/-rooted carrier so capture_fast_lane can reach it from ANOTHER
+        # box (sessions/ is sync-excluded and machine-local, so the lane could
+        # otherwise only ever see same-box Bodies). Local append INSIDE the lock
+        # so carrier order matches WM order. TWIN of the daemon copy in
+        # wm_write.py::append_slot — the DAEMON one is the LIVE path
+        # (wrappers are daemon-only); this exists for parity, same as the
+        # eviction counter above.
+        if (root_slot_for_validation in CAPTURE_SLOTS
+                and isinstance(item, dict) and item.get("load_bearing")):
+            try:
+                import body_capture_carrier as _bcc
+                _carrier_path = _bcc.record_local(
+                    wm_path(), root_slot_for_validation, item)
+            except Exception:  # noqa: BLE001 — never fail a WM append
+                _carrier_path = None
+        if _evicted:
+            _out = {"ok": True, "slot": args.slot, "evicted": _evicted}
+            if _healed_int is not None:
+                _out["healed_from"] = f"{type(_healed_int).__name__}:{_healed_int}"
+            print(json.dumps(_out),
+                  file=sys.stderr)
+
+    # Push OUTSIDE the lock: this is a network round trip and wm_lock is
+    # stale-bounded, so holding it here would let a slow store look like a
+    # crashed writer. A failed push self-heals — the next append re-pushes the
+    # WHOLE carrier file, not a delta.
+    if _carrier_path is not None:
+        try:
+            import body_capture_carrier as _bcc
+            _bcc.push(_carrier_path)
+        except Exception:  # noqa: BLE001
+            pass
 
 def cmd_clear(args):
     """Clear (null out) a slot. RMW protected by wm_lock — see ."""

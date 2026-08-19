@@ -34,6 +34,13 @@ DIARY_SCRIPT = SCRIPT_DIR / "execution-diary.py"
 def with_sandbox(test_fn):
     """Spin up a tmp AGENT_DIR sandbox with the session/ scaffold."""
     def wrapped():
+        # These names are `test_*` at module level, so pytest COLLECTS them as
+        # well as main() running them. Swallowing the AssertionError would make
+        # pytest report PASS on a broken test (measured under this exact shape:
+        # a deliberately broken assertion here reported rc=0), so under pytest
+        # the failure must propagate and the return value must be None
+        # (return-not-None is a warning today and an error in future pytest).
+        under_pytest = bool(os.environ.get("PYTEST_CURRENT_TEST"))
         sandbox = Path(tempfile.mkdtemp(prefix=f"diary_observer_test_{test_fn.__name__}_"))
         agent_dir = sandbox / "alpha-test"
         (agent_dir / "session").mkdir(parents=True)
@@ -54,14 +61,18 @@ def with_sandbox(test_fn):
         try:
             test_fn(sandbox, agent_dir)
             print(f"  [PASS] {test_fn.__name__}")
-            return True
+            return None if under_pytest else True
         except AssertionError as e:
             print(f"  [FAIL] {test_fn.__name__}: {e}")
             traceback.print_exc()
+            if under_pytest:
+                raise
             return False
         except Exception as e:
             print(f"  [ERROR] {test_fn.__name__}: {type(e).__name__}: {e}")
             traceback.print_exc()
+            if under_pytest:
+                raise
             return False
         finally:
             for k, v in prior_env.items():

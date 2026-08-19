@@ -40,6 +40,12 @@ from _session_binding import (
 # to its primary auto-injection role.
 from hook_helpers import approve_no_mutation, stdin_json_or_approve, emit_deny  # noqa: E402
 
+# Max age of an iteration-checkpoint that may still supply MIND_GOAL_ID
+# (). Sized to outlive any real in-flight window -- the longest
+# measured single work unit is 92 min -- while rejecting the days-stale
+# agent-wide mirror described at the injection site below.
+GOAL_ID_MAX_AGE_SEC = 6 * 3600
+
 
 def _sanitize_reason(reason: str) -> str:
     """Reduce a reason string to a filesystem-safe sentinel-key fragment.
@@ -443,6 +449,10 @@ def main():
     # one Body == the reducer == today's behavior. Fail-open: any stat error ->
     # no env -> agent-wide WM. See conventions/session-state.md "Phase 1B".
     body_clause = ""
+    # Set to the per-session dir when this Body has a forked WM, so the
+    # MIND_GOAL_ID block below reuses the stat this branch already paid for
+    # instead of re-deriving (and re-stat'ing) the same predicate.
+    _body_state_dir = None
     _agent_m = (re.search(r"export MIND_AGENT=(\S+);", agent_clause)
                 or re.search(r"(?:^|[\s;&|(])MIND_AGENT=([^\s;&|)]+)", command))
     if _agent_m:
@@ -496,12 +506,67 @@ def main():
                 # export mislabels the reducer as a worker and the store rails
                 # would suppress reducer-only writes. Any change to who gets a
                 # body-WM-file MUST revisit this line and the rails keyed on it.
+                _body_state_dir = _body_wm.parent
                 body_clause = (f'export BODY_WM_PATH="{_body_wm.as_posix()}"; '
                                'export BODY_ROLE=worker; ')
         except OSError:
             body_clause = ""
 
-    expected_prefix = f'export PATH="{shim_path}:$PATH"; {agent_clause}{body_clause}export MIND_SID={sid};'
+    # MIND_GOAL_ID () — the in-flight goal id, for consumers that must
+    # attribute work PER GOAL rather than per agent.
+    #
+    # WHY HERE. world/scripts/product-pr-flow.sh has read this var
+    # forward-compatibly since 2026-08-01 and NOTHING set it, so its durable diary
+    # row landed goal_id="" on every entry. That is not cosmetic: the diary is what
+    # stranded-claim-sweep.py --apply reads, and that sweep decides PER GOAL — so a
+    # merged PR, the strongest signal a product goal emits, was the one signal it
+    # could not attribute. On 2026-08-12 it released a LIVE claim on 
+    # mid-execution (bravo, cc-05). The filing goal asked for "the widest chokepoint
+    # that knows the id ... which already exports MIND_AGENT/MIND_SID" and named
+    # aspirations-execute Phase 4 setup; those two are exported HERE, before EVERY
+    # Bash call, so this function is the chokepoint it was pointing at.
+    #
+    # SOURCE + WHY NO NEW I/O. iteration-checkpoint.json, resolved exactly as
+    # _paths.body_state_path resolves it (per-session file when this Body forked a
+    # WM, agent-wide otherwise) — the SAME predicate, taken from the stat the body
+    # branch above already performed, so the worker case adds zero stat calls. It is
+    # written by aspirations-claim.sh via loop-state-save.sh at claim time and
+    # removed by iteration-close.sh, so its lifetime IS the in-flight window.
+    #
+    # THE FRESHNESS GATE IS LOAD-BEARING, not defensive padding. Under own-cloud the
+    # AGENT-WIDE checkpoint is a synced mirror of whichever box runs the reducer, so
+    # a session with no fork (an observer, or a worker box reading the mirror) can
+    # read one that is days old. Measured cc-08 2026-08-12: the agent-wide file named
+    #  selected 2026-08-07 — five days stale — while the live per-session
+    # file named . Exporting a WRONG goal id is strictly worse than
+    # exporting none: it misattributes where "" merely abstains, which is the exact
+    # failure this variable exists to fix. So a stale checkpoint is treated as absent.
+    # The gate is deliberately ONE-SIDED (age only, no future bound): the mirror
+    # hazard lies entirely in the past direction, and rejecting a slightly
+    # future-dated stamp would suppress a genuinely fresh id under normal clock skew.
+    #
+    # The charset check is shell safety — the value is interpolated unquoted into the
+    # export clause, and every real goal id is [a-z0-9-] (g-NNN-NN / pt-NNN).
+    # Fail-open on every error path, like every other clause in this hook.
+    goal_clause = ""
+    if _agent_m:
+        try:
+            _ck_dir = _body_state_dir or (
+                _agent_dir(SCRIPT_DIR.parent.parent, _agent_m.group(1)) / "session")
+            _ck = json.loads(
+                (_ck_dir / "iteration-checkpoint.json").read_text(encoding="utf-8"))
+            _gid = str(_ck.get("goal_id") or "").strip()
+            _sel = str(_ck.get("selected_at") or "").strip()
+            if _gid and _sel and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", _gid):
+                _age = (datetime.now()
+                        - datetime.strptime(_sel, "%Y-%m-%dT%H:%M:%S")).total_seconds()
+                if _age <= GOAL_ID_MAX_AGE_SEC:
+                    goal_clause = f"export MIND_GOAL_ID={_gid}; "
+        except (OSError, ValueError, TypeError, AttributeError):
+            goal_clause = ""
+
+    expected_prefix = (f'export PATH="{shim_path}:$PATH"; '
+                       f'{agent_clause}{body_clause}{goal_clause}export MIND_SID={sid};')
     if command.startswith(expected_prefix):
         approve_no_mutation()
 

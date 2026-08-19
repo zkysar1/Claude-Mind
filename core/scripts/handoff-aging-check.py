@@ -43,12 +43,36 @@ the next sweep; aborting the precheck would be strictly worse):
   - board-read scan fails          → empty cooldown set (everything eligible fires)
   - board-post failure (per goal)  → log to stderr; --apply continues to remaining
 
+INBOUND PASS (g-115-5811) — the symmetric half, added 2026-08-11. Everything
+above is OUTBOUND: handoffs routed AWAY from self, escalated to the board so
+the target agent sees them. There was no pass over work routed TO self, so the
+one queue an agent is responsible for DRAINING was the only queue nothing aged.
+Measured twice in one day (2026-08-11): a HIGH user directive sat pending
+through four cycles, and a HIGH goal sat 111h after its block was cleared —
+both found BY HAND during unrelated sweeps, with no automated surface producing
+either. The inbound view is emitted under the `inbound` key; every pre-existing
+key keeps its name, meaning and value, so existing readers are unaffected.
+
+Three things about it that are load-bearing rather than incidental:
+  - It ages on handoff_created_at with a created_at (then started) FALLBACK.
+    Measured live: only 2 of 196 inbound goals carry handoff_created_at while
+    196 carry created_at, so a handoff_created_at-only pass reports a 2-of-196
+    view that is indistinguishable from a clean queue. `age_basis` is reported
+    per row because on most rows the age is a created_at proxy, NOT routing age.
+  - intended_agent == 'either' is NOT inbound. It means unrouted and is the
+    dominant value (898 of 1520 pending), so counting it would swallow most of
+    the queue.
+  - It is REPORT-ONLY and posts nothing. The outbound pass posts because its
+    reader is another agent; this pass's reader is the agent already running it.
+
 Exit codes: always 0. Use the JSON output's `applied` count to determine
 what changed.
 
 Usage:
     python3 handoff-aging-check.py [--apply] [--escalate-hours N]
                                    [--agent <name>]                  # default $MIND_AGENT
+                                   [--inbound-max-report N]          # non-HIGH cap (default 5)
+                                   [--no-inbound]                    # skip the inbound pass
                                    [--board-escalation-log <path>]   # tests only
                                    [--no-board]                      # tests only
 """
@@ -105,6 +129,28 @@ def _load_escalate_hours(args) -> float:
         sys.stderr.write(
             "handoff-aging-check: config load failed (%s) — using default 72\n" % exc)
         return 72.0
+
+
+def _load_inbound_max_report(args) -> int:
+    """Cap on reported NON-HIGH inbound rows. CLI > YAML > 5.
+
+    Same fail-open shape as _load_escalate_hours. HIGH rows are reported in
+    full regardless of this cap (see _inbound_pass) — the cap exists to stop a
+    ~200-row backlog being emitted whole, not to hide priority signal.
+    """
+    cli = getattr(args, "inbound_max_report", None)
+    if cli is not None:
+        return int(cli)
+    try:
+        import yaml  # type: ignore
+        with open(CORE_ROOT / "config" / "aspirations.yaml", "r", encoding="utf-8") as fh:
+            cfg = yaml.safe_load(fh) or {}
+        block = (cfg.get("handoff_aging") or {})
+        return int(block.get("inbound_max_report", 5))
+    except Exception as exc:
+        sys.stderr.write(
+            "handoff-aging-check: inbound config load failed (%s) — using default 5\n" % exc)
+        return 5
 
 
 def _resolve_self_agent(args) -> str:
@@ -281,6 +327,126 @@ def _post_board(goal: dict, handoff_to: str, age_hours: float, no_board: bool) -
         return False, "board_post_exception:%s" % exc.__class__.__name__
 
 
+def _inbound_age(g: dict, now: dt.datetime) -> tuple:
+    """Age of an INBOUND goal, with an explicit fallback chain.
+
+    Returns (age_hours, basis) where basis names WHICH field produced the age,
+    or (None, None) when no field parses.
+
+    THE FALLBACK IS NOT DEFENSIVE POLISH — WITHOUT IT THIS PASS SEES ALMOST
+    NOTHING. Measured on the live queue 2026-08-11 (cc-08): of the 196 pending
+    goals routed to alpha, only 2 carry `handoff_created_at` while 196 carry
+    `created_at`. A pass aged solely on handoff_created_at would therefore
+    report a 2-goal view of a 196-goal backlog — a number that looks like a
+    nearly-clean queue and is indistinguishable from one (guard-1802: measure
+    what the predicate EXCLUDES, not what it returns).
+
+    `basis` is returned rather than discarded because it changes what the age
+    MEANS: on 194 of those 196 the age is a created_at proxy (how long the goal
+    has existed) and NOT how long it has been routed to this agent. Reporting
+    the number without the basis would silently overstate routing age.
+    """
+    for field, basis in (("handoff_created_at", "handoff_created_at"),
+                         ("created_at", "created_at"),
+                         ("started", "started")):
+        age = _age_hours(g.get(field), now)
+        if age is not None:
+            return age, basis
+    return None, None
+
+
+def _inbound_pass(goals: list, self_agent: str, escalate_hours: float,
+                  max_report: int, now: dt.datetime) -> dict:
+    """Second pass: goals routed TO self that nothing else ages ().
+
+    The outbound pass above enumerates handoffs routed AWAY from self. There was
+    no symmetric pass, so the one queue an agent is responsible for DRAINING was
+    the one queue nothing aged — measured twice in one day on 2026-08-11
+    (a HIGH user directive sat pending through four cycles; a HIGH goal sat 111h
+    after its block was cleared), both found BY HAND during unrelated sweeps.
+
+    PREDICATE, measured against the live population rather than assumed:
+      status == pending AND (intended_agent == self OR handoff_to == self)
+    `intended_agent` is a plain string or None on every live row (never a list),
+    and its dominant value is 'either' (898 of 1520 pending) meaning UNROUTED —
+    'either' is deliberately NOT inbound, or the pass would swallow 59% of the
+    queue and mean nothing. `handoff_to` is set on only 24 pending rows but is
+    included because it is the EXPLICIT routing and the outbound pass skips it
+    for self by construction (line ~300); on this box it contributes 1 goal the
+    intended_agent predicate misses.
+
+    REPORT-ONLY, and that is deliberate. The outbound pass posts to the board
+    because its reader is ANOTHER agent who would otherwise never see the
+    handoff. This pass's reader is the agent already running it — the precheck
+    consumes this stdout every iteration — so a board post would add fleet noise
+    with no new reader. Escalation here means NAMING the backlog in the output.
+
+    BOUNDED, because the raw count is noise: 196 candidates on this box. The
+    signal is everything HIGH plus the oldest few of the rest. The suppressed
+    count is reported so a bounded view is never mistaken for the whole queue.
+    """
+    scanned_pending = 0
+    matched = []
+    for g in goals:
+        if not isinstance(g, dict):
+            continue
+        if g.get("status") != "pending":
+            continue
+        scanned_pending += 1
+        if not self_agent:
+            continue  # unresolved self: no row can be inbound — say nothing
+        if g.get("intended_agent") != self_agent and g.get("handoff_to") != self_agent:
+            continue
+        age, basis = _inbound_age(g, now)
+        if age is None:
+            matched.append({
+                "goal_id": g.get("id", ""),
+                "title": g.get("title", ""),
+                "priority": g.get("priority"),
+                "age_hours": None,
+                "age_basis": None,
+                "routed_by": "handoff_to" if g.get("handoff_to") == self_agent else "intended_agent",
+            })
+            continue
+        matched.append({
+            "goal_id": g.get("id", ""),
+            "title": g.get("title", ""),
+            "priority": g.get("priority"),
+            "age_hours": round(age, 2),
+            "age_basis": basis,
+            "routed_by": "handoff_to" if g.get("handoff_to") == self_agent else "intended_agent",
+        })
+
+    undateable = [m for m in matched if m["age_hours"] is None]
+    aged = [m for m in matched
+            if m["age_hours"] is not None and m["age_hours"] >= escalate_hours]
+    aged.sort(key=lambda m: m["age_hours"], reverse=True)
+
+    # Everything HIGH, plus the oldest non-HIGH up to the cap. HIGH is never
+    # truncated: a HIGH goal silently dropped by an output bound reproduces the
+    # exact failure this pass exists to fix.
+    high = [m for m in aged if m.get("priority") == "HIGH"]
+    rest = [m for m in aged if m.get("priority") != "HIGH"]
+    reported = high + rest[:max(0, int(max_report))]
+
+    return {
+        "self_agent": self_agent,
+        "escalate_hours": escalate_hours,
+        "scanned_pending": scanned_pending,
+        "matched_count": len(matched),
+        "aged_count": len(aged),
+        "high_count": len(high),
+        "undateable_count": len(undateable),
+        "reported": reported,
+        "suppressed_count": max(0, len(aged) - len(reported)),
+        "max_report": int(max_report),
+        "age_basis_breakdown": {
+            b: sum(1 for m in matched if m["age_basis"] == b)
+            for b in ("handoff_created_at", "created_at", "started")
+        },
+    }
+
+
 def run(args) -> dict:
     """Main sweep. Returns the JSON-shape result dict (also printed to stdout)."""
     escalate_hours = _load_escalate_hours(args)
@@ -343,7 +509,7 @@ def run(args) -> dict:
                     "detail": detail,
                 })
 
-    return {
+    result = {
         "mode": "apply" if args.apply else "dry_run",
         "self_agent": self_agent,
         "escalate_hours": escalate_hours,
@@ -355,6 +521,18 @@ def run(args) -> dict:
         "skipped_cooldown": skipped_cooldown,
         "failed": failed,
     }
+    # Inbound pass (). ADDITIVE: every key above is unchanged in name,
+    # meaning and value, so existing readers of this JSON are unaffected. The
+    # inbound view lives entirely under its own `inbound` key.
+    # getattr rather than attribute access: run() is importable and callers
+    # build their own Namespace (the test helper does). A hard access makes
+    # every pre-existing caller AttributeError the moment a new optional flag
+    # lands — which is exactly what happened when this pass was first wired.
+    if not getattr(args, "no_inbound", False):
+        result["inbound"] = _inbound_pass(
+            goals, self_agent, escalate_hours,
+            _load_inbound_max_report(args), now)
+    return result
 
 
 def main():
@@ -369,6 +547,12 @@ def main():
                    help="Test-only: path to a JSON file of coordination-board posts standing in for the live board scan.")
     p.add_argument("--no-board", action="store_true",
                    help="Test-only: skip the board-post.sh subprocess and pretend it succeeded.")
+    p.add_argument("--inbound-max-report", type=int, default=None,
+                   help="Cap on reported NON-HIGH inbound rows (default: config "
+                        "handoff_aging.inbound_max_report or 5). HIGH rows are never capped.")
+    p.add_argument("--no-inbound", action="store_true",
+                   help="Skip the inbound pass entirely (escape hatch; the outbound "
+                        "result keys are unaffected either way).")
     args = p.parse_args()
     result = run(args)
     json.dump(result, sys.stdout, indent=2)

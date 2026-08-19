@@ -105,7 +105,14 @@ re-introduces the clobber class g-115-1561 fixed.
   # On early-return (LOOP_CONTINUE or RETURN) emit phase-end before returning;
   # unmatched starts show as `in_flight` in the report (detectable, not fatal).
   Phase 0-1.  Bash: execution-diary.sh phase-start phase-0-precheck
-              Skill(aspirations-precheck)
+              Bash: bash core/scripts/iteration-open.sh --apply
+              # g-115-6468. THIS line is the amnesia-proof half: it writes the meter
+              # start/end stamps, runs the entry checks + all 9 always-run lanes, and
+              # prints a per-stage rc table, FINDINGS ONLY, candidates, and its own
+              # NEXT ACTION imperative — so a post-compaction resume re-derives the
+              # entry from disk instead of from a summary. Run it BEFORE the Skill and
+              # do NOT re-run what it already ran (the --apply lanes escalate twice).
+              Skill(aspirations-precheck)   # medium/deferrable + the LLM-judgment lanes
               Bash: execution-diary.sh phase-end phase-0-precheck
   Phase 1.5.  Strategic scan — IF scan_due (goal_cadence, recurring_settling, OR time_cadence)
               THEN Bash: execution-diary.sh phase-start phase-1-strategic-scan;
@@ -156,9 +163,20 @@ re-introduces the clobber class g-115-1561 fixed.
               Bash: execution-diary.sh phase-end phase-2-select --goal {goal.id}
   Phase 3.    IF compound: /decompose goal.id; if status==decomposed → LOOP_CONTINUE
   Phase 4.    Claim-conflict gate (live partner snapshot — see coordination.md
-              "in_flight Field"): Bash: team-state-read.sh --field
-              agent_status.<partner>.in_flight.goal_id --json. IF the returned
-              goal_id == goal.id, the partner already in_flight on this goal —
+              "in_flight Field"). Read BOTH shapes:
+              Bash: team-state-read.sh --field agent_status.<partner>.in_flight.goal_id --json
+              Bash: team-state-read.sh --field agent_status.<partner>.in_flight_bodies --json
+              # BOTH, or this HARD gate is permanently open (g-306-276). `in_flight`
+              # is REDUCER-OWNED — team-state-in-flight.sh SKIPs the stamp for any
+              # non-reducer Body and writes `in_flight_bodies.<sid>` instead — so a
+              # partner running as a WORKER Body is invisible in `in_flight`, which
+              # is EVERY live claim on a multi-body fleet. Measured 2026-08-10:
+              # in_flight null for all 4 live agents while 3 held body-row claims.
+              # `--field` returns the whole nested map; no new endpoint needed.
+              # Staleness is body_row_reaper's job (180min carrier grace), not this
+              # gate's — do not add a second freshness policy over one store.
+              IF goal.id == the first value, OR goal.id == any body row's goal_id,
+              the partner already holds this goal —
               do NOT post a claim, do NOT write team-state, journal the abort
               ("claim-conflict: <partner> in_flight on {goal.id}"),
               and LOOP_CONTINUE.   # no phase-end — phase-start is written AFTER the claim (below)

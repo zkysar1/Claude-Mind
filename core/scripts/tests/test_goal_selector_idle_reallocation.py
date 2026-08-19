@@ -97,7 +97,7 @@ _UNSET = object()
 
 def _collect_real_liveness(monkeypatch, goals, fresh_iso_or_exc,
                            reallocation_hours=8, auth_iso=_UNSET,
-                           auth_prov="authoritative"):
+                           auth_prov="authoritative", row_updated_by=_UNSET):
     """Collect with the REAL _liveness_confirms_dormant, BOTH authoritative
     fetches pinned, and the memo cache cleared.
 
@@ -122,6 +122,15 @@ def _collect_real_liveness(monkeypatch, goals, fresh_iso_or_exc,
     to exercise the split case: object fresh, mind stale. ``auth_prov`` defaults
     to "authoritative" so pre-existing call sites keep asserting the trusted-value
     behavior; pass "local-mirror" to exercise the fail-open-ladder degradation.
+
+    THREE probes now, not two (g-115-6410) — ``fetch_row_stamp`` is the third and
+    it is pinned for exactly the reason the paragraph above gives. Left unpinned
+    it reads the LIVE shard, and on this fleet every live row is self-stamped, so
+    the cross-stamp guard would never engage and every test here would pass while
+    proving nothing about it — accidental hermeticity, which is the failure the
+    two-probe lesson was already written about. It defaults to the agent's OWN
+    name (self-stamped => guard inert => every pre-existing call site keeps its
+    original meaning); pass another agent's name to exercise the cross-stamp.
     """
     import liveness_check as lc
     _pin_runner_identity(monkeypatch)
@@ -147,6 +156,11 @@ def _collect_real_liveness(monkeypatch, goals, fresh_iso_or_exc,
                             lambda *a, **k: auth_iso)
         monkeypatch.setattr(lc, "fetch_authoritative_last_active_with_provenance",
                             lambda *a, **k: (auth_iso, auth_prov))
+    # Third probe (). Default = the queried agent's own name, so the
+    # cross-stamp guard stays inert and every pre-existing case is unchanged.
+    monkeypatch.setattr(
+        lc, "fetch_row_stamp",
+        lambda agent, *a, **k: (agent if row_updated_by is _UNSET else row_updated_by))
     return {c["goal"]["id"] for c in gs.collect_candidates(
         _asps(goals), source="world", reallocation_hours=reallocation_hours)}
 
@@ -365,3 +379,47 @@ def test_owner_scoped_exclusion_is_narrow(monkeypatch):
         _goal("g-normal", intended="zeta"),
     ])
     assert ids == {"g-normal"}, ids
+
+
+# --- Cross-stamp wiring at THIS call site () ---------------------
+
+def test_liveness_crosscheck_passes_the_row_stamp(monkeypatch):
+    """_liveness_confirms_dormant must hand decide_liveness the row stamp.
+
+    THIS ASSERTS THE CALL, NOT THE OUTCOME, and the distinction is the whole
+    reason the test exists. The cross-stamp guard only ever converts
+    alive -> unknown, and this function acts solely on == "dormant", so BOTH
+    verdicts are falsy here: the wiring is behaviour-neutral TODAY and no
+    outcome-level assertion can detect whether it is present. That is exactly
+    the shape guard-2285 names — a parameter the callee accepts while no caller
+    passes it — so the contract is pinned at the call site instead, per
+    guard-2385's "record the new parameter and assert it, rather than merely
+    accepting it".
+
+    What it protects: the day someone makes this function act on "alive" or
+    "unknown", the defect reappears silently unless the stamp is already
+    flowing. Mutation proof: drop row_updated_by= from the goal-selector call
+    and this goes red while every other test in the file stays green.
+    """
+    import liveness_check as lc
+    seen = {}
+    monkeypatch.setattr(gs, "_LIVENESS_DORMANT_CACHE", {})
+    monkeypatch.setattr(lc, "fetch_fresh_signal", lambda *a, **k: "2026-08-16T00:00:00")
+    monkeypatch.setattr(lc, "fetch_authoritative_last_active_with_provenance",
+                        lambda *a, **k: ("2026-08-16T00:00:00", "authoritative"))
+    monkeypatch.setattr(lc, "fetch_row_stamp", lambda agent, *a, **k: "bravo")
+
+    real = lc.decide_liveness
+
+    def _spy(*a, **kw):
+        seen.update(kw)
+        return real(*a, **kw)
+    monkeypatch.setattr(lc, "decide_liveness", _spy)
+
+    gs._liveness_confirms_dormant("echo", "2026-08-16T00:00:00", 6)
+
+    assert seen.get("row_updated_by") == "bravo", (
+        "the stamp read for this agent must reach decide_liveness")
+    assert seen.get("row_agent") == "echo", (
+        "the row's OWN agent must travel with it — without it the guard cannot "
+        "tell a foreign stamp from a self-stamp and disqualifies nothing")

@@ -31,10 +31,43 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
+# Sidecar counters (g-358-05). LAZY + guarded on purpose: this module's contract
+# above is "pure, hermetic, no import-time path resolution", and it does no
+# sys.path manipulation of its own, so a hard top-level import would break
+# standalone importability for any caller that has not already put core/scripts
+# on the path. Absent sidecar module => embedded-field behaviour, unchanged.
+_SIDECAR = None  # None = not yet attempted, False = unavailable, else the module
 
-def _util(rec: dict) -> Optional[dict]:
-    u = rec.get("utilization")
-    return u if isinstance(u, dict) else None
+
+def _sidecar():
+    global _SIDECAR
+    if _SIDECAR is None:
+        try:
+            import _utilization_store as _m  # type: ignore
+            _SIDECAR = _m
+        except ImportError:
+            _SIDECAR = False
+    return _SIDECAR or None
+
+
+def _util(rec: dict, counters: Optional[dict] = None) -> Optional[dict]:
+    """Counters for one record: sidecar first, embedded field second (g-358-05).
+
+    The None return is LOAD-BEARING and is why this cannot just be
+    `utilization_of(...)`: `n_tracked` counts records that HAVE a utilization
+    object and is the denominator of every rate below. `utilization_of` returns
+    `{}` for "absent", which would mark every record tracked and silently
+    dilute hit_rate / retrieved_rate / mean_utilization_score. So the value
+    comes from the shared helper, and the absent-vs-present-but-empty
+    distinction is preserved here rather than duplicated from it.
+    """
+    m = _sidecar()
+    if m is not None:
+        u = m.utilization_of(rec, counters)
+        if u:
+            return u
+    embedded = rec.get("utilization")
+    return embedded if isinstance(embedded, dict) else None
 
 
 def _num(x) -> float:
@@ -47,7 +80,8 @@ def _num(x) -> float:
     return x
 
 
-def report(records: List[dict], high_exposure_min: int = 5) -> dict:
+def report(records: List[dict], high_exposure_min: int = 5,
+           counters: Optional[dict] = None) -> dict:
     """Compute retrieval-utility statistics over a list of store records.
 
     Returns:
@@ -61,7 +95,8 @@ def report(records: List[dict], high_exposure_min: int = 5) -> dict:
     `high_exposure_min` is the retrieval count above which a still-unhelpful entry
     is considered confidently noise (vs. simply not-yet-encountered).
     """
-    tracked = [(r, _util(r)) for r in records if _util(r) is not None]
+    tracked = [(r, u) for r, u in ((r, _util(r, counters)) for r in records)
+               if u is not None]
     n_total, n_tracked = len(records), len(tracked)
     if n_tracked == 0:
         return {"n_total": n_total, "n_tracked": 0, "hit_rate": None,
@@ -109,8 +144,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--store", required=True, help="path to a JSONL store")
     ap.add_argument("--high-exposure-min", type=int, default=5)
     args = ap.parse_args(argv)
+    # Sidecar counters live BESIDE the store, and the store kind is its stem —
+    # so a fixture store in a tmp dir resolves to that dir's sidecar (or to no
+    # sidecar at all, which load_counters returns as {}). Deliberately NOT
+    # WORLD_DIR: --store takes an arbitrary path, and pinning the live world
+    # here would report live counters against fixture records.
+    counters = None
+    m = _sidecar()
+    if m is not None:
+        store_path = Path(args.store)
+        try:
+            counters = m.load_counters(store_path.stem, store_path.parent)
+        except Exception:
+            counters = None
     print(json.dumps(report(load_records(args.store),
-                            high_exposure_min=args.high_exposure_min), indent=2))
+                            high_exposure_min=args.high_exposure_min,
+                            counters=counters), indent=2))
     return 0
 
 

@@ -158,11 +158,22 @@ class TestProductionScriptContents:
 
     def test_script_contains_routine_branch(self):
         src = RECURRING_CLOSE_SH.read_text(encoding="utf-8")
-        # The routine branch is the else clause of the conditional.
-        # Match on the OUTCOME=routine prefix which is unique to the
-        # new imperative (the pre- form did not prefix with
-        # OUTCOME=...).
-        assert "OUTCOME=routine" in src, (
+        # The routine branch is the else clause of the conditional, and its
+        # imperative must still carry an OUTCOME=... prefix (the pre-
+        # form had none).
+        #
+        # ASSERT ON THE INTERPOLATION, NOT ON A LITERAL "OUTCOME=routine"
+        # (, 2026-08-09). 's commit 75c6364d8 collapsed four
+        # hardcoded literals — OUTCOME=deep, OUTCOME=routine, and their two
+        # deadman-tagged twins — into ONE emit site that interpolates
+        # `OUTCOME=$OUTCOME$_dm_tag`. Behaviour is unchanged and the runtime
+        # output still reads "OUTCOME=routine"; only the source spelling moved.
+        # The old literal assertion therefore went red on a correct refactor,
+        # which is a stale PIN, not a regression — but it stayed red silently
+        # because that commit's closure never ran this sibling suite.
+        # This form still fails on the thing the pin exists for: an emit site
+        # with no OUTCOME prefix at all.
+        assert "OUTCOME=$OUTCOME" in src, (
             "routine-branch OUTCOME=... prefix missing — regression to unconditional form"
         )
         # The kill-the-loop reminder must still appear AFTER the

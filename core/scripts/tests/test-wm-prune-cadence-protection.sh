@@ -11,8 +11,23 @@
 #   2. last_evolution_at_time (200 min old) → must survive (matches _at_time)
 #   3. last_strategic_scan_tick (200 min old) → must survive (matches _tick)
 #   4. last_felt_sense_checkin (200 min old) → must survive (matches _checkin, )
-#   5. last_goal_category (200 min old) → MUST be evicted (not a cadence pattern)
-#      — this is the negative control ensuring eviction still works.
+#   5. last_goal_category (200 min old) → MUST be evicted (not a cadence tracker)
+#      — the negative control ensuring eviction still works. Since 
+#      it is also the control for the TOP_LEVEL_KEYS exclusion in
+#      _is_cadence_tracker: it OPENS WITH `last_` and so matches the `^last_`
+#      class pattern, but holds a category STRING rather than a timestamp, so
+#      it must stay evictable.
+#
+#      ⚠ THIS CASE MUST NOT BE READ BACK WITH `wm-read.sh` ().
+#      `last_goal_category` is a TOP_LEVEL_KEY, so wm-read resolves it to the
+#      TOP-LEVEL key — which this test never seeds and prune never touches —
+#      instead of to `slots['last_goal_category']`, which is what was seeded
+#      and what prune acts on. On any agent with a live category the read-back
+#      returned that live value and the case reported
+#      `FAIL: expected evicted, got val='<real category>'` while eviction had
+#      in fact worked perfectly. The test therefore passed ONLY on an agent
+#      whose top-level key happened to be unset, and its failure accused
+#      whoever last touched the predicate. Read the SLOT directly instead.
 #
 # Pass: all 5 cases match expected (exit 0, prints "TEST PASS").
 # Fail: exit 1 on any mismatch (prints the mismatch and "TEST FAIL").
@@ -92,12 +107,38 @@ check_slot() {
     fi
 }
 
+# Read a SLOT by name, bypassing wm-read.sh's TOP_LEVEL_KEYS resolution.
+# Required for any case whose name is also a TOP_LEVEL_KEY — see the header.
+check_slot_direct() {
+    local slot="$1"
+    local expect="$2"  # "present" or "evicted"
+    local val
+    val=$(WM_FILE="$WM_FILE" SLOT="$slot" python3 -c "
+import os, yaml
+with open(os.environ['WM_FILE'], 'r', encoding='utf-8') as f:
+    data = yaml.safe_load(f) or {}
+v = (data.get('slots') or {}).get(os.environ['SLOT'])
+print('null' if v is None else v)
+" 2>/dev/null || echo "ERR")
+    if [ "$expect" = "present" ]; then
+        if [ "$val" = "test_value_for_$slot" ]; then
+            echo "CASE $slot PASS: preserved (slot value intact)"; return 0
+        fi
+        echo "CASE $slot FAIL: expected preserved, got slots['$slot']='$val'"; return 1
+    fi
+    if [ "$val" = "null" ]; then
+        echo "CASE $slot PASS: evicted (slot cleared)"; return 0
+    fi
+    echo "CASE $slot FAIL: expected evicted, got slots['$slot']='$val'"; return 1
+}
+
 fails=0
 check_slot "last_fresh_eyes_review"     "present" || fails=$((fails+1))
 check_slot "last_evolution_at_time"     "present" || fails=$((fails+1))
 check_slot "last_strategic_scan_tick"   "present" || fails=$((fails+1))
 check_slot "last_felt_sense_checkin"    "present" || fails=$((fails+1))
-check_slot "last_goal_category"         "evicted" || fails=$((fails+1))
+# TOP_LEVEL_KEY name — must read the slot directly (see header).
+check_slot_direct "last_goal_category"  "evicted" || fails=$((fails+1))
 
 if [ $fails -gt 0 ]; then
     echo "TEST FAIL: $fails case(s) failed"

@@ -87,6 +87,15 @@ def _setup_temp_agent(tmpdir: Path):
 
 def run() -> int:
     tmpdir = Path(tempfile.mkdtemp(prefix="compact-restore-test-"))
+    # BODY_WM_PATH is the FIRST branch of wm.wm_path(); the AGENT_DIR patches
+    # below are the SECOND. On a WORKER Body the bash-agent-inject hook exports
+    # BODY_WM_PATH, so without pinning it every write_wm from this fixture
+    # lands on the LIVE per-Body working-memory.yaml (measured on the sibling
+    # test_compact_restore_loop_state_recovery.py, 2026-08-16, cc-08 — it wrote
+    # `goals_completed_this_session: 0` over the canonical LIST slot and killed
+    # worker-loop Phase 4b for that Body). Restored in the finally.
+    prev_body_wm = os.environ.get("BODY_WM_PATH")
+    os.environ["BODY_WM_PATH"] = str(tmpdir / "session" / "working-memory.yaml")
     try:
         wm_path = _setup_temp_agent(tmpdir)
 
@@ -168,6 +177,10 @@ def run() -> int:
         return 0
 
     finally:
+        if prev_body_wm is None:
+            os.environ.pop("BODY_WM_PATH", None)
+        else:
+            os.environ["BODY_WM_PATH"] = prev_body_wm
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 

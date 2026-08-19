@@ -112,6 +112,24 @@ def test_apply_completion_flips_status_in_tmp_world():
         os.environ["MIND_WORLD"] = str(world)
         os.environ.pop("MIND_AGENT", None)
         try:
+            #  added a store-of-record write guard ahead of the writes
+            # this test exercises. The guard reaches the store through the DAEMON
+            # (_rt), which resolves its own world and therefore cannot see this
+            # test's tmp `MIND_WORLD` — so without a stub the guard correctly
+            # reports the fixture goal ABSENT and refuses, and this test would
+            # fail for a reason that has nothing to do with the argv defect it
+            # pins.
+            #
+            # Stubbing the READ, not the JUDGEMENT, is what keeps the pin intact:
+            # `_stale_candidate_reason` still runs for real over this record, and
+            # every byte of the argv still reaches a real argparse in a real
+            # subprocess. The stub supplies exactly what a healthy store would
+            # return for the seeded goal — an open record with authoritative
+            # provenance. Patching `_stale_candidate_reason` instead would
+            # disarm the guard and let a future regression through silently.
+            mod._reread_goal_authoritative = lambda source, gid: (
+                {"id": gid, "status": "pending"}, "authoritative"
+            )
             ok, detail = mod._apply_completion(
                 {"id": goal_id, "_source": "world"}, "proc-1800000000"
             )

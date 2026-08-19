@@ -555,3 +555,183 @@ def test_human_output_mode():
     assert proc.returncode == 1
     assert "would_block: True" in proc.stdout
     assert "[FAIL] multi_signal" in proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# Check 6: efs_ssh_probe ()
+#
+# guard-1160 ends with "before concluding blocked, re-run the SAME call through
+# efs-ssh.sh" and did not reach: times_active 3218, times_helpful 2. Two measured
+# saves in different services (amplify:UpdateApp ;
+# s3:PutLifecycleConfiguration ) where the agent had ALREADY concluded
+# human-gated on a correct, exhaustive enumeration of box credentials. Check 5
+# cannot catch that class — the enumeration was honest and every LOCAL source
+# really was denied; the missing principal is not on this box at all.
+# ---------------------------------------------------------------------------
+
+def _cred_blocker(**over) -> dict:
+    """A credentials-required blocker that passes checks 1-5, so any refusal
+    below is attributable to check 6 alone (guard-4054: a failure at gate N is
+    uninterpretable without survival at N-1).
+
+    The two evidence tools are DISTINCT deliberately. The first draft used
+    `aws-exec.sh` for both, which silently failed `multi_signal` — so
+    `would_block` was True for a reason that had nothing to do with check 6, and
+    two assertions written to pin check 6 were pinning check 2 instead. The
+    mutation proof caught it: neutering check 6 left both tests green.
+    `test_efs_ssh_refuses_aws_action_without_the_probe` now asserts the failing
+    set EXACTLY, so this can never rot back.
+    """
+    b = {
+        "type": "credentials-required",
+        "affected_skills": [],
+        "failure_reason": "AccessDenied for s3:PutLifecycleConfiguration",
+        "evidence": [
+            {"tool": "aws-exec.sh", "command": "aws s3api put-bucket-lifecycle-configuration",
+             "output": "AccessDenied", "evidence_type": "command_exit"},
+            {"tool": "env-read.sh", "command": "env-read.sh --list-credential-sources",
+             "output": "default chain + profile mind", "evidence_type": "config_read"},
+        ],
+        "credential_source_enumeration": [
+            {"source": ".env.local default chain", "identity": "user/Zak_first_test",
+             "probed": True, "denied": True},
+            {"source": "~/.aws profile mind", "identity": "user/mind-svc",
+             "probed": True, "denied": True},
+        ],
+    }
+    b.update(over)
+    return b
+
+
+def _check(result: dict, name: str) -> dict:
+    return next(c for c in result["checks"] if c["name"] == name)
+
+
+def test_efs_ssh_refuses_aws_action_without_the_probe():
+    """The whole point: a complete local enumeration must NOT be sufficient."""
+    r = _call_module(_cred_blocker())
+    c = _check(r, "efs_ssh_probe")
+    assert c["passed"] is False
+    assert r["would_block"] is True
+    assert "s3:PutLifecycleConfiguration" in c["reason"]
+    assert "efs-ssh.sh" in c["reason"]
+    # Quotes guard-1160 rather than paraphrasing it.
+    assert "guard-1160" in c["reason"]
+    assert "re-run the SAME call through efs-ssh.sh" in c["reason"]
+    # ATTRIBUTION, and it is the load-bearing line: check 6 must be the ONLY
+    # failure, or `would_block` above is being earned by some other check and
+    # this test would stay green with check 6 deleted.
+    assert [x["name"] for x in r["checks"] if not x["passed"]] == ["efs_ssh_probe"]
+
+
+def test_efs_ssh_positive_control_probe_present_passes():
+    """Not a blanket refusal: evidence naming the wrapper passes unchanged."""
+    b = _cred_blocker()
+    b["evidence"].append({
+        "tool": "efs-ssh.sh",
+        "command": "bash world/scripts/efs-ssh.sh 'aws s3api put-bucket-lifecycle-configuration ...'",
+        "output": "AccessDenied", "evidence_type": "command_exit"})
+    r = _call_module(b)
+    assert _check(r, "efs_ssh_probe")["passed"] is True
+    assert r["would_block"] is False
+
+
+def test_efs_ssh_ignores_the_script_name_appearing_only_in_output():
+    """A denial message can quote the script name back at you. Crediting that
+    would let the ABSENCE of the probe satisfy the check FOR the probe."""
+    b = _cred_blocker()
+    b["evidence"].append({
+        "tool": "aws-exec.sh", "command": "aws s3api put-bucket-lifecycle-configuration",
+        "output": "hint: try world/scripts/efs-ssh.sh", "evidence_type": "command_exit"})
+    assert _check(_call_module(b), "efs_ssh_probe")["passed"] is False
+
+
+@pytest.mark.parametrize("blocker_type", [
+    "security-trust", "physical-hardware", "user_action", "infrastructure", "resource",
+])
+def test_efs_ssh_governs_only_credentials_required(blocker_type: str):
+    """Other HUMAN_ONLY types with no companion-script path stay exempt,
+    matching the canonical_probe precedent."""
+    b = _cred_blocker(type=blocker_type)
+    c = _check(_call_module(b), "efs_ssh_probe")
+    assert c["passed"] is True
+    assert "check skipped" in c["reason"]
+
+
+def test_efs_ssh_skipped_when_no_aws_action_is_named():
+    """Scope note: do NOT widen to every credentials blocker."""
+    b = _cred_blocker(failure_reason="the vendor portal needs a human to click approve",
+                      evidence=[
+                          {"tool": "curl", "command": "curl https://portal.example/api",
+                           "output": "401", "evidence_type": "http_status"},
+                          {"tool": "sts", "command": "aws sts get-caller-identity",
+                           "output": "user/x", "evidence_type": "command_exit"}])
+    c = _check(_call_module(b), "efs_ssh_probe")
+    assert c["passed"] is True
+    assert "no AWS service:Action" in c["reason"]
+
+
+def _prose_evidence() -> list:
+    return [{"tool": "curl", "command": "curl https://portal.example",
+             "output": "401", "evidence_type": "http_status"},
+            {"tool": "sts", "command": "aws sts get-caller-identity",
+             "output": "user/x", "evidence_type": "command_exit"}]
+
+
+def test_efs_ssh_lowercase_prose_label_is_damped():
+    """`error:AccessDenied` matches the service:Action SHAPE exactly and appears
+    in real logs. _NOT_AWS_SERVICES is what stops it demanding a probe.
+
+    The first version of this test used `Note:HumanApprovalRequired`, which the
+    regex rejects on its leading-[a-z] anchor BEFORE the damper is consulted —
+    so deleting _NOT_AWS_SERVICES entirely left it green. Measured: that input
+    yields zero regex hits; `error:AccessDenied` and `note:...` yield one each,
+    both damped. Pinned on an input that actually reaches the damper.
+    """
+    b = _cred_blocker(failure_reason="error:AccessDenied talking to the vendor portal",
+                      evidence=_prose_evidence())
+    c = _check(_call_module(b), "efs_ssh_probe")
+    assert c["passed"] is True
+    assert "no AWS service:Action" in c["reason"]
+
+
+def test_efs_ssh_capitalised_label_never_reaches_the_damper():
+    """The regex's leading-[a-z] anchor is a SECOND, independent filter, and it
+    carries every Capitalised prose label without help from the exclusion set."""
+    b = _cred_blocker(failure_reason="Note:HumanApprovalRequired for the vendor portal",
+                      evidence=_prose_evidence())
+    assert _check(_call_module(b), "efs_ssh_probe")["passed"] is True
+
+
+def test_efs_ssh_action_named_only_in_evidence_still_triggers():
+    """failure_reason is not the only place the action shows up."""
+    b = _cred_blocker(failure_reason="permission denied on the deploy")
+    b["evidence"][0]["output"] = "User is not authorized to perform amplify:UpdateApp"
+    c = _check(_call_module(b), "efs_ssh_probe")
+    assert c["passed"] is False
+    assert "amplify:UpdateApp" in c["reason"]
+
+
+def test_efs_ssh_override_bypasses_and_logs_to_the_gate_family_ledger(tmp_path: Path):
+    """Override path is consistent with the existing gate family."""
+    r = _call_module(_cred_blocker(),
+                     override_blocker_gate="env-server unreachable this cycle; re-probe filed",
+                     world_dir=tmp_path, agent="alpha")
+    assert r["would_block"] is False
+    ledger = tmp_path / "blocker-gate-overrides.jsonl"
+    assert ledger.is_file()
+    rec = json.loads(ledger.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert "efs_ssh_probe" in rec["which_checks_bypassed"]
+    assert rec["blocker_type"] == "credentials-required"
+    assert rec["agent"] == "alpha"
+
+
+def test_efs_ssh_cli_exits_1_and_module_agrees():
+    """The goal asks for exit 1 from the CLI, not merely a module verdict."""
+    blocker = _cred_blocker()
+    rc, out, _err = _run_cli(blocker)
+    assert rc == 1
+    assert out["would_block"] is True
+    assert _call_module(blocker)["would_block"] is out["would_block"]
+    names = [c["name"] for c in out["checks"]]
+    assert "efs_ssh_probe" in names

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Verify AGENTS_PARENT_DIR / SESSIONS_DIRNAME / SESSION_DIRNAME are in sync
-across all 12 declared sites per CLAUDE.md "Agent-dir Resolution" table.
+across all 12 declared sites per the sync-site tables in
+core/config/conventions/agent-dir-resolution.md (moved out of CLAUDE.md
+"Agent-dir Resolution" on 2026-08-17; the CLAUDE.md heading now points there).
 
 Canonical source: core/scripts/_paths.sh (the IRREDUCIBLY LOCAL shell helper
 that all bash callers source).
@@ -26,7 +28,8 @@ from pathlib import Path
 CANON_PATH = "core/scripts/_paths.sh"
 
 # 12 sync sites with per-file regex extraction patterns.
-# Source: CLAUDE.md "Agent-dir Resolution" tables (framework-layer + inlined).
+# Source: core/config/conventions/agent-dir-resolution.md sync-site tables
+#         (framework-layer + inlined) — formerly CLAUDE.md "Agent-dir Resolution".
 # Format: (path, [(regex_pattern, canon_key), ...])
 SITES = [
     # Framework-layer sync (6 sites — _paths.sh is canon, not self-checked):

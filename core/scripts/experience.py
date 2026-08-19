@@ -19,7 +19,7 @@ from pathlib import Path
 from _stdio import reconfigure_stdio  # noqa: E402
 reconfigure_stdio()
 
-from _paths import PROJECT_ROOT, WORLD_DIR, AGENT_DIR
+from _paths import PROJECT_ROOT, WORLD_DIR, AGENT_DIR, AGENTS_PARENT_DIR
 from _jsonl_helpers import set_nested_field
 
 # Per-agent experience stores (agent directory)
@@ -65,7 +65,7 @@ EXPERIENCE_ADD_SCHEMA_TEXT = (
     "\n"
     "Example:\n"
     "  echo '{\"id\":\"exp-foo\",\"type\":\"research\",\"category\":\"npc\",\n"
-    "    \"summary\":\"...\",\"content_path\":\"bravo/experience/foo.md\"}' \\\n"
+    "    \"summary\":\"...\",\"content_path\":\"agents/bravo/experience/foo.md\"}' \\\n"
     "    | experience-add.sh"
 )
 
@@ -209,12 +209,40 @@ def validate_record(rec):
     if stats is not None and not isinstance(stats, dict):
         raise ValueError("retrieval_stats must be a dict")
 
-    # Validate content_path file exists
-    content_path = Path(rec["content_path"])
-    if not content_path.is_absolute():
-        content_path = PROJECT_ROOT / content_path
-    if not content_path.exists():
-        raise ValueError(f"content_path file does not exist: {rec['content_path']}")
+    # Validate content_path file exists — across BOTH agent-dir path eras.
+    #
+    # Records written before the Phase-2.5.D relocation carry the agent name as
+    # the FIRST segment with no AGENTS_PARENT_DIR parent, and that data is LIVE:
+    # CLAUDE.md's experience-orphan-ratchet row records 845 of 3621 rows still
+    # in the legacy shape (measured 2026-07-29), which is why that ratchet joins
+    # on BASENAME rather than on the path. So the corpus is deliberately
+    # two-era and a single-era check here is a VALIDATOR defect, not a data
+    # defect — it must not be "fixed" by rewriting the records.
+    #
+    # Why it is permanent rather than cosmetic: cmd_update_field re-runs FULL
+    # record validation after every field write (guard-330 / rb-364, so
+    # update-field is not a back-door around add-time validation). A record
+    # whose content_path fails here therefore takes no field update ever again
+    # through the fenced path. Measured 2026-08-10 on cc-05: 374 of bravo's
+    # 1266 records (29.5%) were unwriteable this way. .
+    #
+    # The fallback is a SECOND EXACT PATH, never a basename match: relaxing an
+    # existence predicate into a pattern would let a genuinely dangling pointer
+    # validate, which is the failure this check exists to catch (guard-2860).
+    raw_content_path = rec["content_path"]
+    content_path = Path(raw_content_path)
+    if content_path.is_absolute():
+        found = content_path.exists()
+    else:
+        found = (PROJECT_ROOT / content_path).exists()
+        # Legacy era: prepend the agents parent. Skipped when the path already
+        # carries it (no agents/agents/...) and when the constant is empty (the
+        # pre-relocation layout, where the two forms are the same path).
+        if (not found and AGENTS_PARENT_DIR
+                and content_path.parts[:1] != (AGENTS_PARENT_DIR,)):
+            found = (PROJECT_ROOT / AGENTS_PARENT_DIR / content_path).exists()
+    if not found:
+        raise ValueError(f"content_path file does not exist: {raw_content_path}")
 
 # Goal-id embedded in an experience id: exp-{goal-id}-{slug}, where goal-id is
 # the canonical g-NNN-NN (2-4 digit tail). cmd_archive_goal builds ids as

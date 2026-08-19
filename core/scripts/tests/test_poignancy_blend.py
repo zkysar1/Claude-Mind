@@ -72,7 +72,14 @@ def test_factor_flag_off_is_neutral_even_for_max_poignancy():
     assert _retrieve._poignancy_weight({"poignancy": 10}, CFG_OFF) == 1.0
 
 
-def test_factor_null_poignancy_is_neutral():
+def test_factor_null_degrades_to_floor_when_center_unset():
+    # RENAMED from test_factor_null_poignancy_is_neutral (). The
+    # assertions are unchanged; the old NAME asserted a contract that is false.
+    # 1.0 is poignancy_weight_min — the FLOOR — so this is not "neutral", it is
+    # "assume worst". What this test actually pins is the DEGRADE-SAFE property:
+    # CFG_ON carries no poignancy_weight_center, and a missing key must reproduce
+    # the pre-fix behaviour exactly rather than a value the config cannot vouch
+    # for. See test_factor_null_is_centered_when_center_set for the live contract.
     assert _retrieve._poignancy_weight({}, CFG_ON) == 1.0
     assert _retrieve._poignancy_weight({"poignancy": None}, CFG_ON) == 1.0
 
@@ -99,7 +106,9 @@ def test_factor_clamps_below_1():
     assert _retrieve._poignancy_weight({"poignancy": 0}, CFG_ON) == 1.0
 
 
-def test_factor_unparseable_is_neutral():
+def test_factor_unparseable_degrades_to_floor_when_center_unset():
+    # RENAMED () for the same reason as the null case above: with no
+    # center configured an unparseable rating reproduces the pre-fix floor.
     assert _retrieve._poignancy_weight({"poignancy": "high"}, CFG_ON) == 1.0
 
 
@@ -107,6 +116,67 @@ def test_factor_is_boost_only():
     # Across the whole valid range, the factor is never below 1.0 (min) when on.
     for p in range(1, 11):
         assert _retrieve._poignancy_weight({"poignancy": p}, CFG_ON) >= 1.0
+
+
+# ── null centering () ──────────────────────────────────────────────
+# Null used to short-circuit to 1.0 == poignancy_weight_min, the FLOOR of the
+# output range, so an unrated record ranked as if it were the least significant
+# thing in the corpus and could never be promoted at any k. These pin the fixed
+# contract: null enters the SAME linear map at `center`, leaving the rated curve
+# untouched and every factor inside [min, max].
+
+CFG_CENTERED = dict(CFG_ON, poignancy_weight_center=6.5822)
+
+
+def test_factor_null_is_centered_when_center_set():
+    expected = 1.0 + (6.5822 - 1.0) / 9.0 * 0.5
+    for record in ({}, {"poignancy": None}, {"poignancy": "high"}):
+        assert abs(_retrieve._poignancy_weight(record, CFG_CENTERED) - expected) < 1e-9
+    # And it is strictly above the floor — the whole point of the fix.
+    assert _retrieve._poignancy_weight({}, CFG_CENTERED) > 1.0
+
+
+def test_centering_leaves_the_rated_mapping_byte_identical():
+    # Shape (a): only the null INPUT moved. A record that carries a real rating
+    # must score exactly what it scored before, or this is a ranking change for
+    # rated records rather than a null fix.
+    for p in (1, 2, 3, 5, 6.8, 7, 9, 10, 0, 15):
+        assert (_retrieve._poignancy_weight({"poignancy": p}, CFG_ON)
+                == _retrieve._poignancy_weight({"poignancy": p}, CFG_CENTERED))
+
+
+def test_centering_preserves_boost_only_for_every_input():
+    # The A/B harness's displacement bound assumes factor >= min for EVERY
+    # record. Includes adversarial inputs and an out-of-range center, which the
+    # post-substitution clamp must contain.
+    lo, hi = 1.0, 1.5
+    for cfg in (CFG_CENTERED, dict(CFG_ON, poignancy_weight_center=99),
+                dict(CFG_ON, poignancy_weight_center=-99),
+                dict(CFG_ON, poignancy_weight_center=None)):
+        for p in (None, "x", -99, 0, 1, 5, 10, 99, 10 ** 6):
+            assert lo <= _retrieve._poignancy_weight({"poignancy": p}, cfg) <= hi
+
+
+def test_centering_never_overrides_the_master_flag():
+    # A configured center must not resurrect the blend while it is disabled.
+    assert _retrieve._poignancy_weight(
+        {"poignancy": None}, dict(CFG_OFF, poignancy_weight_center=6.5822)) == 1.0
+
+
+def test_shipped_center_is_above_the_floor_and_in_range():
+    # The measured constant ships in core/config/tree.yaml; _DEFAULT_RETRIEVAL_CFG
+    # deliberately keeps 1.0 so an ABSENT key degrades to today (see the null test
+    # above). Guard the shipped value against a rating that is out of the 1-10
+    # domain, which would silently clamp instead of failing.
+    import yaml
+    from pathlib import Path
+    # Derived from __file__, never cwd — this test must not depend on where
+    # pytest was invoked from (core/scripts/tests/ -> ../../.. == PROJECT_ROOT).
+    tree_yaml = Path(__file__).resolve().parents[3] / "core" / "config" / "tree.yaml"
+    cfg = yaml.safe_load(tree_yaml.read_text(encoding="utf-8"))["retrieval"]
+    center = float(cfg["poignancy_weight_center"])
+    assert 1.0 < center <= 10.0, f"shipped center {center} is not a usable poignancy"
+    assert _retrieve._DEFAULT_RETRIEVAL_CFG["poignancy_weight_center"] == 1.0
 
 
 # ── _sort_by_utility: supplementary-store ordering ───────────────────────────

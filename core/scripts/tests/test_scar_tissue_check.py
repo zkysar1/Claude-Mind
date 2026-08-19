@@ -356,3 +356,209 @@ def test_cadence_fires_only_after_interval(monkeypatch):
     cadence = stc._load_cadence_config()["goal_cadence"]
     monkeypatch.setattr(stc, "_count_completed_goals", lambda: 1000 + cadence)
     assert stc._cadence_gate()[0] is True
+
+
+# ─────────────────────── subset-pair detector () ───────────────────────
+#
+# These pin the properties that make the subset slate trustworthy rather than
+# merely present. The detector's whole value is that a zero from it MEANS
+# something, so most of these assert on what it must NOT report.
+
+def _g(gid, rule, *, source="s1", created="2026-01-01", amended=None,
+       active=0, status="active"):
+    """A guardrail-shaped row. Deliberately separate from _entry: guardrails key
+    on source+created and carry `rule`, and reusing the title/created helper
+    would silently exercise a shape the detector never sees in production."""
+    r = {"id": gid, "status": status, "rule": rule, "source": source,
+         "created": created,
+         "utilization": {"times_active": active, "times_helpful": 0,
+                         "times_cited": 0, "times_inferred_helpful": 0,
+                         "retrieval_count": 0}}
+    if amended:
+        r["amended_fields"] = amended
+    return r
+
+
+def _pairs(rows, cap=25):
+    return stc.subset_pairs(rows, ("source", "created"), "rule", cap)
+
+
+def test_strict_prefix_is_detected_with_the_shorter_member_as_subset():
+    out = _pairs([_g("a", "AAA"), _g("b", "AAABBB")])
+    assert out["pairs_total"] == 1
+    p = out["pairs"][0]
+    assert p["subset_id"] == "a" and p["superset_id"] == "b"
+    assert p["subset_chars"] == 3 and p["superset_chars"] == 6
+
+
+def test_direction_does_not_depend_on_input_order():
+    """The forking mechanism produces the stale copy at either id, so the probe
+    must not infer direction from position (the goal's 18 live pairs run 15 one
+    way and 3 the other)."""
+    out = _pairs([_g("b", "AAABBB"), _g("a", "AAA")])
+    assert out["pairs"][0]["subset_id"] == "a"
+
+
+def test_identical_text_is_an_exact_duplicate_not_a_prefix_pair():
+    """str.startswith is True in BOTH directions for equal strings, so without an
+    explicit equality branch an exact duplicate would be reported twice as a
+    prefix pair — and the remedy for a duplicate differs from that for a fork."""
+    out = _pairs([_g("a", "SAME"), _g("b", "SAME")])
+    assert out["pairs_total"] == 0
+    assert out["exact_total"] == 1
+    assert out["exact_duplicates"][0]["ids"] == ["a", "b"]
+
+
+def test_same_text_in_a_different_group_is_not_a_pair():
+    """Grouping is load-bearing, not decoration: two rails may legitimately share
+    a prefix (a house phrasing) without being a fork of each other."""
+    assert _pairs([_g("a", "AAA", source="s1"),
+                   _g("b", "AAABBB", source="s2")])["pairs_total"] == 0
+    assert _pairs([_g("a", "AAA", created="2026-01-01"),
+                   _g("b", "AAABBB", created="2026-01-02")])["pairs_total"] == 0
+
+
+def test_rows_missing_a_grouping_field_are_excluded_and_counted():
+    """The manufactured-pair hazard: grouping on an absent field collapses every
+    such row into ONE bucket, so two unrelated rails would be compared and could
+    report a pair that shares nothing. Excluding them is correct — reporting the
+    exclusion is what keeps the resulting number honest (guard-1760)."""
+    out = _pairs([_g("a", "AAA", source=None), _g("b", "AAABBB", source=None),
+                  _g("c", "CCC", created=None), _g("d", "")])
+    assert out["pairs_total"] == 0
+    assert out["ungroupable"] == 4
+
+
+def test_zero_pairs_still_reports_its_denominators():
+    """The goal's explicit check: an empty slate must be distinguishable from a
+    probe that never ran. A bare 0 with no group counts cannot do that."""
+    out = _pairs([_g("a", "AAA"), _g("b", "ZZZ")])
+    assert out["pairs_total"] == 0 and out["exact_total"] == 0
+    assert out["groups"] == 1 and out["multi_member_groups"] == 1
+    assert out["group_fields"] == ["source", "created"]
+    assert out["text_field"] == "rule"
+
+
+def test_blind_spot_is_carried_in_the_result_not_only_in_a_comment():
+    out = _pairs([_g("a", "AAA")])
+    assert "byte-prefix" in out["blind_spot"]
+    assert out["blind_spot"] == stc.SUBSET_BLIND_SPOT
+
+
+def test_amended_flags_are_surfaced_for_both_members():
+    """amended_fields is the usual discriminator for which member is stale — in
+    all four twins named by the goal the subset has none and the superset carries
+    a `rule` stamp. Surfacing it saves the reader re-opening both records; the
+    probe still refuses to name a stale member, because it is not true by
+    construction."""
+    out = _pairs([_g("a", "AAA"),
+                  _g("b", "AAABBB", amended={"rule": "2026-08-01T00:00:00"})])
+    p = out["pairs"][0]
+    assert p["subset_amended"] is False and p["superset_amended"] is True
+
+
+def test_pairs_are_ordered_widest_gap_first_and_capped():
+    rows = [_g("s1", "A", source="g1"), _g("l1", "A" * 500, source="g1"),
+            _g("s2", "B", source="g2"), _g("l2", "B" * 100, source="g2")]
+    out = _pairs(rows, cap=1)
+    assert out["pairs_total"] == 2
+    assert len(out["pairs"]) == 1
+    assert out["pairs_truncated"] is True
+    assert out["pairs"][0]["superset_id"] == "l1"
+
+
+def test_untruncated_pair_list_is_not_flagged():
+    out = _pairs([_g("a", "AAA"), _g("b", "AAABBB")], cap=25)
+    assert out["pairs_truncated"] is False
+
+
+def test_retired_entries_are_outside_the_scan(tmp_path):
+    """A retired rail is already dispositioned; counting it would re-propose work
+    that is done and inflate the slate every run thereafter."""
+    p = _write_store(tmp_path, "g.jsonl", [
+        _g("a", "AAA", status="retired"), _g("b", "AAABBB")])
+    s = stc.corpus_stats(p, "guardrails", date(2026, 8, 1), 100, 30, 25)
+    assert s["subset_pairs"]["pairs_total"] == 0
+
+
+def test_corpus_stats_wires_the_scan_for_a_spec_backed_store(tmp_path):
+    p = _write_store(tmp_path, "g.jsonl", [_g("a", "AAA"), _g("b", "AAABBB")])
+    s = stc.corpus_stats(p, "guardrails", date(2026, 8, 1), 100, 30, 25)
+    assert s["subset_pairs"]["pairs_total"] == 1
+
+
+def test_store_without_a_spec_reports_none_not_an_empty_scan(tmp_path):
+    """None and {} are different claims: 'not run here' vs 'run and found none'."""
+    p = _write_store(tmp_path, "x.jsonl", [_g("a", "AAA")])
+    s = stc.corpus_stats(p, "some-other-store", date(2026, 8, 1), 100, 30, 25)
+    assert s["subset_pairs"] is None
+
+
+def test_missing_store_carries_the_subset_key_too(tmp_path):
+    """Both branches of corpus_stats must return the same keys — a shape that
+    differs by branch is how half A once printed a verdict over empty metrics."""
+    s = stc.corpus_stats(tmp_path / "nope.jsonl", "guardrails",
+                         date(2026, 8, 1), 100, 30, 25)
+    assert "subset_pairs" in s and s["subset_pairs"] is None
+
+
+def test_reasoning_bank_spec_keys_on_the_populated_fields():
+    """MEASURED, not stylistic: `source` is present on 74/7086 reasoning-bank rows
+    and `source_goal` on 7086/7086. Keying RB on `source` for symmetry with
+    guardrails would exclude 99% of the corpus and report a clean zero — the exact
+    false-negative this detector exists to prevent (guard-1902)."""
+    assert stc.SUBSET_SPEC["reasoning-bank"]["group_fields"] == ("source_goal", "created")
+    assert stc.SUBSET_SPEC["reasoning-bank"]["text_field"] == "content"
+    assert stc.SUBSET_SPEC["guardrails"]["group_fields"] == ("source", "created")
+    assert stc.SUBSET_SPEC["guardrails"]["text_field"] == "rule"
+
+
+def test_a_subset_pair_alone_is_signal():
+    """Neither existing signal channel can see this class: the file surface is
+    unchanged by a forked rail, and both members are heavily used so neither
+    meets the dead-entry criterion."""
+    result = {"file_surface": {"verdict": "flat"},
+              "stores": [{"slate_total": 0,
+                          "subset_pairs": {"pairs_total": 1, "exact_total": 0}}]}
+    assert stc.has_signal(result) is True
+
+
+def test_an_exact_duplicate_alone_is_signal():
+    result = {"file_surface": {"verdict": "flat"},
+              "stores": [{"slate_total": 0,
+                          "subset_pairs": {"pairs_total": 0, "exact_total": 2}}]}
+    assert stc.has_signal(result) is True
+
+
+def test_clean_subset_scan_does_not_manufacture_signal():
+    result = {"file_surface": {"verdict": "flat"},
+              "stores": [{"slate_total": 0,
+                          "subset_pairs": {"pairs_total": 0, "exact_total": 0}}]}
+    assert stc.has_signal(result) is False
+
+
+def test_has_signal_tolerates_a_store_with_no_subset_key():
+    """The pre-existing callers in this file construct store dicts without the
+    new key; has_signal must not raise on them."""
+    result = {"file_surface": {"verdict": "flat"}, "stores": [{"slate_total": 0}]}
+    assert stc.has_signal(result) is False
+
+
+def test_render_prints_the_numbers_and_the_blind_spot(tmp_path):
+    p = _write_store(tmp_path, "g.jsonl", [
+        _g("a", "AAA"), _g("b", "AAABBB", amended={"rule": "x"})])
+    s = stc.corpus_stats(p, "guardrails", date(2026, 8, 1), 100, 30, 25)
+    text = stc.render({"file_surface": {"verdict": "flat", "metrics": {}},
+                       "stores": [s]})
+    assert "subset-pair scan: 1 prefix pair(s)" in text
+    assert "a ⊂ b" in text
+    assert "BLIND SPOT" in text
+
+
+def test_render_says_not_run_rather_than_zero_for_an_unspecced_store(tmp_path):
+    p = _write_store(tmp_path, "x.jsonl", [_g("a", "AAA")])
+    s = stc.corpus_stats(p, "some-other-store", date(2026, 8, 1), 100, 30, 25)
+    text = stc.render({"file_surface": {"verdict": "flat", "metrics": {}},
+                       "stores": [s]})
+    assert "NOT RUN for this store" in text
+    assert "not a zero, an absence" in text

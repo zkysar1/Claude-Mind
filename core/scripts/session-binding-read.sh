@@ -30,7 +30,7 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --field)
             FIELD="$2"
-            shift 2
+            shift $(( $# >= 2 ? 2 : 1 ))
             ;;
         --json)
             EMIT_JSON=1

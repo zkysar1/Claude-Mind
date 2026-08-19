@@ -53,19 +53,19 @@ while [[ $# -gt 0 ]]; do
             TYP="${2-}"; PASSTHROUGH+=(--type "${2-}"); shift $(( $# >= 2 ? 2 : 1 ));;
         --most-retrieved)
             if [ $# -gt 1 ] && [[ "$2" =~ ^[0-9]+$ ]]; then
-                MOST="$2"; PASSTHROUGH+=("$1" "$2"); shift 2
+                MOST="$2"; PASSTHROUGH+=("$1" "$2"); shift $(( $# >= 2 ? 2 : 1 ))
             else
                 MOST="10"; PASSTHROUGH+=("$1"); shift
             fi;;
         --least-retrieved)
             if [ $# -gt 1 ] && [[ "$2" =~ ^[0-9]+$ ]]; then
-                LEAST="$2"; PASSTHROUGH+=("$1" "$2"); shift 2
+                LEAST="$2"; PASSTHROUGH+=("$1" "$2"); shift $(( $# >= 2 ? 2 : 1 ))
             else
                 LEAST="10"; PASSTHROUGH+=("$1"); shift
             fi;;
         --recent)
             if [ $# -gt 1 ] && [[ "$2" =~ ^[0-9]+$ ]]; then
-                RECENT="$2"; PASSTHROUGH+=("$1" "$2"); shift 2
+                RECENT="$2"; PASSTHROUGH+=("$1" "$2"); shift $(( $# >= 2 ? 2 : 1 ))
             else
                 RECENT="10"; PASSTHROUGH+=("$1"); shift
             fi;;

@@ -166,6 +166,32 @@ def test_twin_has_upsert(path):
         f"{path.name}: append is not gated on the upsert result"
     )
 
+    # ── The healing block: the only assertions here that the buggy version fails.
+    #
+    # Measured at b4da74a5 (): the historical single-match version
+    # satisfies ALL THREE assertions above — it has the knowledge_debt branch,
+    # the `_upserted = False` guard, AND the gated append — while breaking on
+    # the first node_key match. So this test was green on the exact regression
+    # its own docstring names, and the four behaviour tests earlier in this file
+    # could not see it either, because they exercise the LOCAL MIRROR `_upsert`
+    # rather than these files. Nothing in this module reads the real
+    # implementations for behaviour at all; these tokens are the whole join.
+    #
+    # Token-pinned on purpose. A rename that breaks these SHOULD fail loudly —
+    # the mirror is only honest for as long as something asserts the shape it
+    # mirrors, and a silent un-pin returns this file to green-on-the-defect.
+    assert re.search(r"_matches\s*=\s*\[", src), (
+        f"{path.name}: the upsert stops at the FIRST node_key match. It must "
+        f"collect ALL matches (_matches), or duplicates already present in the "
+        f"slot are never collapsed and the entry is re-recorded every scan"
+    )
+    assert re.search(r"_oldest\s*=\s*min\(", src), (
+        f"{path.name}: the upsert does not carry the OLDEST _item_ts forward "
+        f"(_oldest = min(...)). Without it a surviving entry is stamped with "
+        f"the newest write and the debt's real age is silently reset, which "
+        f"defeats every age-ordered consumer of the slot"
+    )
+
 
 def test_both_twins_compile():
     for path in (CLI, DAEMON):

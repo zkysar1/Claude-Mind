@@ -123,6 +123,7 @@ ENCODING_SCORE=""
 FINDINGS_COUNT=""
 OVERRIDE_UNCOMMITTED=""
 OVERRIDE_MISSING_ARTIFACT=""
+OVERRIDE_RESIDUAL=""
 
 # g-284-04: Recovery instructions on non-zero exit. The trap below reads
 # _CURRENT_PHASE (set by each do_* function at entry) and prints
@@ -144,15 +145,36 @@ _CURRENT_PHASE=""
 # Prints the live status string, or nothing when unreadable (no GOAL_ID,
 # unparseable id, read failure). Error-path only (rc!=0), so the daemon read
 # is off the hot path. Never returns non-zero (trap safety).
-_probe_goal_status() {
-    local gid="${GOAL_ID:-}" asp src st
+# Prints "<status>\t<recurring>\t<claim_held>" for the live goal record, where
+# the last two are the literals "true"/"false". Prints nothing when unreadable.
+#
+# ONE read, three fields (g-115-5216). The record was ALREADY fully parsed here
+# to extract `status`; `recurring` and `claimed_by` ride along on the same
+# aspirations-read round-trip and cost nothing. Callers that need only the
+# status keep using the narrow _probe_goal_status wrapper below, whose output
+# shape is deliberately unchanged (guard-695 — a widened shared helper breaks
+# strict-equality assertions in test code, and only on a full-suite run).
+#
+# WHY `claimed_by` AND NOT `lastAchievedAt`. The obvious "did this close
+# actually happen" signal is a freshly-advanced lastAchievedAt, and that is the
+# discriminator five independent confirmations on g-115-5216 converged on. It is
+# wrong: guard-2197 measured recurring-precondition-sweep.py advancing
+# lastAchievedAt on a PRECONDITION-SHELVED goal while never writing
+# achievedCount, deliberately, so overdue_ratio does not inflate. A shelved goal
+# and a genuinely-closed one are therefore indistinguishable at that field —
+# which is exactly the case the warning must keep firing on. claimed_by carries
+# no such ambiguity: aspirations_write.py L3592-3594 pops it in the recurring
+# branch of complete-by BEFORE touching lastAchievedAt, and both g-115-5001
+# incidents left the claim live (~19 and ~11 min).
+_probe_goal_record() {
+    local gid="${GOAL_ID:-}" asp src rec st
     [[ -z "$gid" ]] && return 0
     [[ "$gid" =~ ^g-([0-9]+)- ]] || return 0   # g-xw-* etc: aspiration id not derivable
     asp="asp-${BASH_REMATCH[1]}"
     # ${SOURCE:-world agent} unquoted on purpose: try the caller's source when
     # given, else probe both queues (a missing --source is a common way to land here).
     for src in ${SOURCE:-world agent}; do
-        st="$(bash "$SCRIPT_DIR/aspirations-read.sh" --source "$src" --id "$asp" 2>/dev/null \
+        rec="$(bash "$SCRIPT_DIR/aspirations-read.sh" --source "$src" --id "$asp" 2>/dev/null \
               | PGS_GID="$gid" python3 -c '
 import json, os, sys
 try:
@@ -162,11 +184,44 @@ except Exception:
 asp = data if isinstance(data, dict) else (data[0] if data else {})
 for g in asp.get("goals", []):
     if g.get("id") == os.environ["PGS_GID"]:
-        print(g.get("status") or "")
+        print("\t".join([
+            g.get("status") or "",
+            "true" if g.get("recurring") else "false",
+            "true" if g.get("claimed_by") else "false",
+        ]))
         break
-' 2>/dev/null)" || st=""
-        if [[ -n "$st" ]]; then printf '%s' "$st"; return 0; fi
+' 2>/dev/null)" || rec=""
+        # Gate the source loop on the STATUS field, not on the whole line: a
+        # found-but-statusless goal now yields a non-empty "\tfalse\tfalse",
+        # which would otherwise stop the loop early where it used to fall
+        # through to the next queue.
+        st="${rec%%$'\t'*}"
+        if [[ -n "$st" ]]; then printf '%s' "$rec"; return 0; fi
     done
+    return 0
+}
+
+# Narrow back-compat contract: prints the live status string alone, exactly as
+# before g-115-5216. Kept as a wrapper so its two callers below (and any test
+# that stubs it) see no change in shape (guard-695).
+#
+# RECONCILE NOTE (2026-08-13, cc-07): the g-115-5573 tri-state
+# _probe_goal_recurring that lived here was RETIRED in the fork reconcile —
+# _probe_goal_record carries `recurring` (and `claim_held`) in the SAME read,
+# so a second aspirations-read round-trip bought nothing. Its load-bearing
+# invariant — unknown must stay distinguishable from a clean "false", because
+# "false" authorizes a REFUSAL — survives structurally: the record probe prints
+# NOTHING unless a record with a non-empty status was found, so `rec == ""` is
+# the unknown case and fails open, and a found record always carries a definite
+# recurring boolean. (Its other caution — never read recurring from the LOCAL
+# aspirations.jsonl cache via _probe_is_recurring, guard-980 — still stands and
+# applies to the record probe's daemon-backed read, which is why neither helper
+# touches the local file.)
+_probe_goal_status() {
+    local rec
+    rec="$(_probe_goal_record)"
+    [[ -z "$rec" ]] && return 0
+    printf '%s' "${rec%%$'\t'*}"
     return 0
 }
 
@@ -184,36 +239,17 @@ for g in asp.get("goals", []):
 # never as "verified absent" — the emptiness is load-bearing in do_verify only
 # in the safe direction (empty => write; non-empty => refuse to overwrite).
 _probe_goal_outcome_note() {
-    local gid="${GOAL_ID:-}" note
+    local gid="${GOAL_ID:-}"
     [[ -z "$gid" ]] && return 0
-    # ONE call, and deliberately no --source loop (g-115-5214). This wrapper
-    # never parsed --source: it hit the catch-all arm and was appended to a
-    # PASSTHROUGH array nothing reads, so it never reached the request. The
-    # endpoint is union-by-design too — aspirations_query.py builds `sources`
-    # from world + agent unconditionally and 404s only if NEITHER store exists
-    # — so ONE invocation already covers both queues and the old
-    # `for src in ${SOURCE:-world agent}` loop ran the identical query twice.
-    # Verified at the layer that can REFUSE, not at the wrapper's parser
-    # (guard-1914). --json was swallowed the same way; the endpoint always
-    # emits JSON. Behaviour is unchanged in both SOURCE states: set, the loop
-    # ran once; unset, twice with identical results.
-    # Keep this invocation on ONE line — shape-based test pins locate this call
-    # by source text and stop matching if it is reshaped (guard-2921).
-    note="$(bash "$SCRIPT_DIR/aspirations-query.sh" \
-              --goal-field id "$gid" --full 2>/dev/null \
-          | PGON_GID="$gid" python3 -c '
-import json, os, sys
-try:
-    rows = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
-gid = os.environ["PGON_GID"]
-for g in rows or []:
-    if g.get("id") == gid or g.get("goal_id") == gid:
-        sys.stdout.write(g.get("outcome_note") or "")
-        break
-' 2>/dev/null)" || note=""
-    if [[ -n "$note" ]]; then printf '%s' "$note"; fi
+    # DELEGATES to the shared helper (g-115-5158). The query shape and its
+    # fail-open contract now live in exactly ONE place, because a WORKER Body
+    # needs the same probe and worker-loop must call a shared component rather
+    # than restate it (guard-2676, the no-transcription contract). Keeping the
+    # function name means the two in-file consumers — this do_verify
+    # never-clobber check and do_state_update's metric-gate input — are
+    # unchanged at their call sites.
+    bash "$SCRIPT_DIR/closure-evidence-write.sh" --goal "$gid" \
+        ${SOURCE:+--source "$SOURCE"} --probe-only 2>/dev/null || true
     return 0
 }
 
@@ -288,22 +324,141 @@ _quality_flag_suffix() {
 # that against what it guards: each incident left already-committed work (~45min
 # in g-315-532) sitting re-executable in the selector. 10 test files invoke these
 # phases and now pay the read too.
-_warn_if_goal_not_closed() {
-    local phase="$1" live
-    live="$(_probe_goal_status)"
+# g-115-5001 established the forward READ (unconditional, on the success path,
+# at both close phases). Two successors evolved it IN PARALLEL, neither aware
+# of the other (fork window; sig-29 class), merged at the 2026-08-13 cc-07
+# reconcile:
+#   - g-115-5573 (local) escalated warn -> REFUSAL: warning and proceeding
+#     still let the loop count the goal closed, advance its counters and score
+#     productivity over a record that stayed open — the goal then re-entered
+#     the selectable pool carrying no outcome_note and was a candidate for
+#     re-execution (observed: g-115-5104). That field evidence is exactly what
+#     the original WARN-NOT-REFUSE decision said would justify escalation
+#     (guard-2760's own clause).
+#   - g-115-5216 (origin) kept the warn but fixed its recurring
+#     false-positive: ONE _probe_goal_record read (status + recurring +
+#     claim_held) instead of two round-trips, and a claim_held discriminator
+#     separating a healthy recurring close from an abandoned one.
+# The function below keeps 5573's refusal and 5216's probe + carve-out.
+#
+# THE FAIL LADDER IS THE DESIGN. Refuse ONLY on independent CLEAN positive
+# reads; every unknown proceeds. A close phase that wedges on a transient
+# store blip is worse than the miscount it prevents, because it stops the
+# loop rather than mislabelling one goal.
+#
+#   rec unreadable ("")                  -> PROCEED (fail-open, `*)` arm)
+#   status completed/blocked/skipped     -> PROCEED (verify wrote SOMETHING)
+#   status pending|in-progress ...
+#     ... recurring true, claim released -> PROCEED SILENTLY. A recurring goal
+#         RETURNS to pending on a successful close BY DESIGN (guard-1483), so
+#         pending carries no information here — the old warning was wrong on
+#         100% of these closes (g-115-5216: confirmed on 4 agents / 4 goals /
+#         3 boxes / both queues; 63 world-queue recurring goals tripped it
+#         twice per close). Worse than noise: the remedy it printed
+#         (--phase verify) DOUBLE-BUMPS achievedCount, currentStreak and
+#         lastAchievedAt on an already-closed recurring goal (the increments
+#         in aspirations_write.py's recurring branch are unconditional, no
+#         same-window guard). Silence is correctness, not leniency.
+#     ... recurring true, claim HELD     -> WARN, proceed. guard-1562: a bare
+#         `recurring` carve-out would also silence a recurring goal whose
+#         verify genuinely did NOT run — the real defect. claim_held separates
+#         them: a successful recurring close pops claimed_by BEFORE touching
+#         lastAchievedAt, an abandoned one leaves it live, and both g-115-5001
+#         incidents sat pending WITH a live claim. The printed remedy is safe
+#         for THIS branch — verify never ran, so re-running it bumps once, not
+#         twice. NOT escalated to a refusal: the g-115-5104 evidence behind
+#         the refusal is non-recurring, and extending a destructive remedy to
+#         a population with no field evidence is what guard-2760 forbids.
+#         Residual set newly permitted by the silent branch (recurring +
+#         verify failed + never claimed, i.e. a hand-run close) is covered by
+#         recurring-starvation-check.sh, which runs every precheck, anchors on
+#         the cadence rather than on this close, and is shelve-aware
+#         (_is_shelved).
+#     ... recurring false                -> REFUSE.
+#
+# There is no "recurring unknown while status known" branch: the record probe
+# prints nothing unless it found a record with a non-empty status, and a found
+# record carries a definite recurring boolean. The retired tri-state probe's
+# unknown case (g-115-5573) collapses into rec == "".
+#
+# NOTE these comments live ABOVE the function deliberately:
+# test_iteration_close_forward_precondition.py extracts the function BODY and
+# asserts it never mentions the fields the carve-out must not key on — prose
+# inside the body would trip the source-level pins it enforces.
+_assert_verify_landed() {
+    local phase="$1" rec rest live recurring claim_held
+    rec="$(_probe_goal_record)"
+    # Empty rec (unreadable record) leaves all three empty -> `*)` arm ->
+    # silent, which is the fail-open direction the recovery block models.
+    #
+    # Parsed by expansion, NOT `IFS=$'\t' read`: tab is IFS whitespace, so
+    # read COLLAPSES a run of tabs and an empty middle field shifts the next
+    # field left — a stubbed "pending\t\tfalse" put "false" into `recurring`
+    # and an AMBIGUOUS read authorized a refusal (measured at the 2026-08-13
+    # reconcile; pinned by test_unknown_recurring_fails_open). Expansion
+    # preserves empty fields.
+    live="${rec%%$'\t'*}"
+    rest="${rec#*$'\t'}"
+    recurring="${rest%%$'\t'*}"
+    claim_held="${rest#*$'\t'}"
+    # A malformed line with no tabs leaves recurring == the whole line, which
+    # is neither "true" nor "false" -> the neither-direction arm proceeds.
     case "$live" in
-        pending|in-progress)
-            echo "" >&2
-            echo "[iteration-close] ⚠ FORWARD-PRECONDITION WARNING (g-115-5001):" >&2
-            echo "  Goal ${GOAL_ID:-?} is status=$live at the ENTRY of $phase — verify has NOT closed it." >&2
-            echo "  This phase will still run and will report success, but the goal record stays open:" >&2
-            echo "  it remains a live goal-selector candidate and may be re-executed." >&2
-            echo "  Run verify FIRST, then re-run this phase:" >&2
-            echo "    bash core/scripts/iteration-close.sh --phase verify --goal ${GOAL_ID:-<id>} --status ${GOAL_STATUS:-completed} --source ${SOURCE:-world} --outcome ${OUTCOME:-<deep|routine>}" >&2
-            echo "" >&2
-            ;;
+        pending|in-progress) ;;
+        *) return 0 ;;
     esac
-    return 0
+
+    if [[ "$recurring" == "true" ]]; then
+        [[ "$claim_held" != "true" ]] && return 0
+        echo "" >&2
+        echo "[iteration-close] ⚠ FORWARD-PRECONDITION WARNING (g-115-5001):" >&2
+        echo "  Goal ${GOAL_ID:-?} is status=$live at the ENTRY of $phase with a LIVE CLAIM — verify has NOT closed it." >&2
+        echo "  (Recurring: pending alone would be normal after a complete-by cycle, but a successful" >&2
+        echo "  recurring close releases the claim first — a held claim means the close never landed.)" >&2
+        echo "  This phase will still run and will report success, but the goal record stays open:" >&2
+        echo "  it remains a live goal-selector candidate and may be re-executed." >&2
+        echo "  Run verify FIRST, then re-run this phase:" >&2
+        echo "    bash core/scripts/iteration-close.sh --phase verify --goal ${GOAL_ID:-<id>} --status ${GOAL_STATUS:-completed} --source ${SOURCE:-world} --outcome ${OUTCOME:-<deep|routine>}" >&2
+        echo "" >&2
+        return 0
+    fi
+
+    if [[ "$recurring" != "false" ]]; then
+        # Refusal requires the CLEAN "false" — anything else asserts neither
+        # direction and proceeds (the fail ladder above). Unreachable via the
+        # real probe (a found record carries a definite boolean), but a stub
+        # or a future probe may not honor that, and a refusal must never rest
+        # on an ambiguous read.
+        echo "" >&2
+        echo "[iteration-close] ⚠ FORWARD-PRECONDITION WARNING (g-115-5001):" >&2
+        echo "  Goal ${GOAL_ID:-?} is status=$live at the ENTRY of $phase — verify has NOT closed it." >&2
+        echo "  Could not determine whether this goal is recurring — asserting neither" >&2
+        echo "  direction and PROCEEDING (a refusal must never rest on an ambiguous read)." >&2
+        echo "" >&2
+        return 0
+    fi
+
+    echo "" >&2
+    echo "[iteration-close] ✖ REFUSED — FORWARD PRECONDITION FAILED (g-115-5573):" >&2
+    echo "  Goal ${GOAL_ID:-?} is status=$live at the ENTRY of $phase, and it is NOT recurring." >&2
+    echo "  verify did not close this goal, so running $phase would report success over an" >&2
+    echo "  open record: the loop would count the goal closed while it stays a live" >&2
+    echo "  goal-selector candidate with no outcome_note, and may be re-executed." >&2
+    echo "  Run verify FIRST, then re-run this phase:" >&2
+    # --outcome is UNCONDITIONAL with an explicit <deep|routine> placeholder, NOT
+    # `${OUTCOME:+ ...}` and NOT `${OUTCOME:-deep}`. Ported here from the g-115-4996
+    # trap hint (see the `verify)` arm of the _CURRENT_PHASE trap above, which carries
+    # the full rationale) when the g-115-5573 refactor relocated this line out of the
+    # inline warn block: do_verify REFUSES a call without --outcome, so a hint that
+    # omits the flag prints the failing command back at the caller; and for verify
+    # --outcome is a BEHAVIOURAL gate (the uncommitted-work auto-override arms only on
+    # `deep`), so defaulting a caller who never chose is the silent-wrong class.
+    # The two edits collided in git and the port is deliberate — do not "simplify" it
+    # back to the conditional form (guard-3035: a refactor invalidates the inherited
+    # claim that a fix travelled with the code).
+    echo "    bash core/scripts/iteration-close.sh --phase verify --goal ${GOAL_ID:-<id>} --status ${GOAL_STATUS:-completed} --source ${SOURCE:-world} --outcome ${OUTCOME:-<deep|routine>}" >&2
+    echo "" >&2
+    return 1
 }
 
 _print_recovery_instructions() {
@@ -402,14 +557,14 @@ _print_recovery_instructions() {
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --phase)   PHASE="$2"; shift 2 ;;
-        --goal)    GOAL_ID="$2"; shift 2 ;;
-        --status)  GOAL_STATUS="$2"; shift 2 ;;
+        --phase)   PHASE="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --goal)    GOAL_ID="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --status)  GOAL_STATUS="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         # WORLD_AGENT_ONLY: cross-agent goals arrive with MIND_AGENT already
         # overridden to the owner (g-115-978 Option 3); enum stays world|agent.
-        --source)  SOURCE="$2"; shift 2 ;;
-        --outcome) OUTCOME="$2"; shift 2 ;;
-        --summary) SUMMARY="$2"; shift 2 ;;
+        --source)  SOURCE="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --outcome) OUTCOME="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --summary) SUMMARY="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         # g-115-4208: file-based alternative to --summary. The prose is read
         # VERBATIM from disk, so the shell never sees it and backticks, $(...)
         # and bare $ survive intact. --summary takes an inline double-quoted
@@ -418,10 +573,10 @@ while [[ $# -gt 0 ]]; do
         # is the dangerous shape — measured four times in one session, once
         # silently deleting the exact command a goal description existed to
         # record. Precedent for the flag: notify-build-payload.py --message-file.
-        --summary-file) SUMMARY_FILE="$2"; shift 2 ;;
+        --summary-file) SUMMARY_FILE="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         # g-242-10: documented opt-out for the Phase 4.26 gate. Forwarded to
         # phase-4-26-gate.sh; logs to world/phase-4-26-overrides.jsonl.
-        --no-retrieval-applicable) NO_RETRIEVAL_APPLICABLE="$2"; shift 2 ;;
+        --no-retrieval-applicable) NO_RETRIEVAL_APPLICABLE="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         # g-115-228: state-update-audit velocity quality inputs. Forwarded only
         # at --phase state-update. Validation (range/type) happens downstream
         # in state-update-audit.py argparse — keep this layer thin.
@@ -430,9 +585,9 @@ while [[ $# -gt 0 ]]; do
         # caller knows tree was updated but mtime probing won't see it
         # (programmatic update path, mtime-touched-back, etc.).
         --tree-updated-override) TREE_UPDATED_OVERRIDE="true"; shift ;;
-        --artifacts-count)  ARTIFACTS_COUNT="$2"; shift 2 ;;
-        --encoding-score)   ENCODING_SCORE="$2"; shift 2 ;;
-        --findings-count)   FINDINGS_COUNT="$2"; shift 2 ;;
+        --artifacts-count)  ARTIFACTS_COUNT="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --encoding-score)   ENCODING_SCORE="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --findings-count)   FINDINGS_COUNT="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         # Forward --override-uncommitted to the aspirations-update-goal.sh
         # status=completed call inside do_verify. Without this, audit-only
         # Investigate goals (no source-code changes) and other goals that
@@ -440,7 +595,7 @@ while [[ $# -gt 0 ]]; do
         # iteration-close — the gate fires correctly at the update layer
         # but iteration-close was previously stripping the override path.
         # Logged to world/uncommitted-work-overrides.jsonl by the gate.
-        --override-uncommitted) OVERRIDE_UNCOMMITTED="$2"; shift 2 ;;
+        --override-uncommitted) OVERRIDE_UNCOMMITTED="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         # Forward --override-missing-artifact to the aspirations-update-goal.sh
         # status=completed call inside do_verify. Mirrors --override-uncommitted
         # forwarding above. Without this, goals whose description path-strings
@@ -450,7 +605,20 @@ while [[ $# -gt 0 ]]; do
         # goal-completion-artifact-gate.py fires at the update layer but
         # iteration-close was previously stripping the override path. Logged
         # to world/missing-artifact-overrides.jsonl by the gate.
-        --override-missing-artifact) OVERRIDE_MISSING_ARTIFACT="$2"; shift 2 ;;
+        --override-missing-artifact) OVERRIDE_MISSING_ARTIFACT="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        # Forward --override-residual to the aspirations-update-goal.sh
+        # status=completed call inside do_verify. Third member of the same
+        # family as the two above, and it was MISSING until g-335-1216
+        # (2026-08-13): gates/residual_work.py names this flag verbatim in its
+        # own refusal message ("or pass --override-residual \"<justification>\""),
+        # but iteration-close stripped it, so the escape hatch the gate
+        # advertises was unreachable from the standard close path — the caller
+        # got `unknown arg: --override-residual` (rc=2) and the only way past a
+        # false positive was to bypass do_verify entirely, skipping the
+        # pending-deploys gate, the ordered-write intent marker, completed_date,
+        # outcome_class, the diary breadcrumb, the board post and clear-in-flight.
+        # Logged to world/residual-work-overrides.jsonl by the gate.
+        --override-residual) OVERRIDE_RESIDUAL="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
@@ -772,7 +940,18 @@ do_verify() {
         # because iteration-commit.sh no-ops on routine — the gate retains
         # protective value for routine-with-dirty-code (orphan-code signal).
         if [[ "$GOAL_STATUS" == "completed" && "$OUTCOME" == "deep" && -z "$OVERRIDE_UNCOMMITTED" ]]; then
-            OVERRIDE_UNCOMMITTED="auto: iteration-commit.sh scheduled in state-update (g-280-03 wiring)"
+            if [[ "${BODY_ROLE:-}" == "worker" ]]; then
+                # A WORKER Body never reaches do_state_update, so the reason
+                # above would be FALSE in its audit ledger row. Its commits
+                # travel by worker-loop Phase 3.8 (iteration-push
+                # --push-worker-ref, ordered before this close) and the
+                # daemon's uncommitted-work gate is body-role aware for the
+                # delivery half (g-115-5335); the ledger row must say which
+                # path was actually taken (2026-08-16, g-115-6337 review).
+                OVERRIDE_UNCOMMITTED="auto: worker Body — HEAD pushed to refs/workers/<agent>/<sid> in worker-loop Phase 3.8 (no state-update phase runs for a worker)"
+            else
+                OVERRIDE_UNCOMMITTED="auto: iteration-commit.sh scheduled in state-update (g-280-03 wiring)"
+            fi
         fi
         # Forward --override-uncommitted only when the caller passed it (or
         # the auto-override above set it) AND status is completed (the only
@@ -788,6 +967,13 @@ do_verify() {
         fi
         if [[ "$GOAL_STATUS" == "completed" && -n "$OVERRIDE_MISSING_ARTIFACT" ]]; then
             update_cmd+=(--override-missing-artifact "$OVERRIDE_MISSING_ARTIFACT")
+        fi
+        # No auto-override counterpart here, deliberately. The two flags above
+        # each have an auto-set path for a case the gate cannot see; residual
+        # work has none — an unfiled residual is exactly what the gate exists to
+        # catch, so it must stay caller-asserted and audited, never inferred.
+        if [[ "$GOAL_STATUS" == "completed" && -n "$OVERRIDE_RESIDUAL" ]]; then
+            update_cmd+=(--override-residual "$OVERRIDE_RESIDUAL")
         fi
         "${update_cmd[@]}"
         if [[ "$GOAL_STATUS" == "completed" ]]; then
@@ -837,18 +1023,32 @@ do_verify() {
     # Non-fatal: the goal's status is already committed above, so aborting here
     # would strand the close in a state the caller cannot read from the rc. The
     # failure is announced instead of swallowed.
+    # DELEGATED to closure-evidence-write.sh (g-115-5158) so a WORKER Body can
+    # produce the same evidence by CALLING the same component. Before this, a
+    # worker skipped verify (worker-loop Phase 4 named do_verify Step 3
+    # explicitly; since 2026-08-16 Phase 4a CALLS do_verify for the status write,
+    # after that producer) and therefore had NO producer at all — its notes were written
+    # by hand, so the rate was dispositional rather than mechanical. Arming any
+    # enforcement gate on outcome_note would then have refused 100% of worker
+    # closures while passing reducer ones. Semantics are unchanged here:
+    # write-if-absent, never clobber, guarded on non-empty SUMMARY, non-fatal.
+    # g-115-6633: on the WORKER path this call is a BACKFILL, not a first write.
+    # worker-loop Phase 3.9 already wrote the rich narrative for THIS occurrence
+    # seconds ago, so an existing note is not prior-occurrence residue and the
+    # recurring-supersede branch must not replace it with our one-line summary.
+    # On the REDUCER path this call IS the first write of the occurrence, so
+    # superseding a genuine prior-occurrence note stays correct and the flag is
+    # NOT passed. Role-conditional here is consistent with this function, which
+    # already branches on BODY_ROLE for its terminal NEXT line (guard-2783: the
+    # complement is stated rather than left implicit).
+    _ce_flags=()
+    if [[ "${BODY_ROLE:-}" == "worker" ]]; then
+        _ce_flags+=(--no-supersede)
+    fi
     if [[ -n "$SUMMARY" ]]; then
-        local _existing_note
-        _existing_note="$(_probe_goal_outcome_note)"
-        if [[ -z "$_existing_note" ]]; then
-            if bash "$SCRIPT_DIR/aspirations-update-goal.sh" --source "$SOURCE" "$GOAL_ID" outcome_note "$SUMMARY"; then
-                echo "[iteration-close] verify: outcome_note written to $GOAL_ID (${#SUMMARY} chars)"
-            else
-                echo "[iteration-close] ⚠ verify: outcome_note write FAILED for $GOAL_ID — the summary is still in the execution diary and the board, but NOT on the record. Re-run: bash core/scripts/aspirations-update-goal.sh --source $SOURCE $GOAL_ID outcome_note \"...\"" >&2
-            fi
-        else
-            echo "[iteration-close] verify: outcome_note already present on $GOAL_ID (${#_existing_note} chars) — verify summary NOT written (never clobber). It is in the execution diary and the board." >&2
-        fi
+        bash "$SCRIPT_DIR/closure-evidence-write.sh" --goal "$GOAL_ID" \
+            --source "$SOURCE" --summary "$SUMMARY" \
+            --prefix "[iteration-close] verify:" "${_ce_flags[@]+"${_ce_flags[@]}"}" || true
     fi
 
     # Execution diary breadcrumb for postcompact recovery.
@@ -868,9 +1068,43 @@ print(json.dumps({
     # Post board claim-release / completion message (world goals only)
     if [[ "$SOURCE" == "world" && "$GOAL_STATUS" == "completed" ]]; then
         local msg="Completed: ${SUMMARY:-$GOAL_ID} [$GOAL_ID]"
+        local post_tags="$GOAL_ID"
+        # ── Cross-world completion ECHO (g-361-03, goal-completion audit) ──
+        # A goal a PEER deployment injected (asp-xw-* sandbox) or filed
+        # (--target-aspiration) had no return path: the peer only learned of
+        # our completion by reading this board unprompted. The peer DOES read
+        # this board and cites our ids back (cross-deployment-channel.md, two
+        # measured round-trips), so an explicitly ADDRESSED post IS the
+        # delivery mechanism the convention prescribes when peer-board-post is
+        # unreachable: BOTH the bare `<agent>` tag (installed base) and
+        # `requires_action_by:<agent>@<env-id>` (exact form), plus a request
+        # for an acknowledging --reply-to. xw_origin.py folds the four
+        # provenance shapes live records carry into one address and prints
+        # nothing for a goal with no peer origin — the common case pays one
+        # local file scan and posts exactly what it posted before. Fail-open:
+        # a provenance lookup must never fail a close.
+        local xw_json="" xw_addr="" xw_agent="" xw_env=""
+        xw_json="$(python3 "$SCRIPT_DIR/xw_origin.py" --goal "$GOAL_ID" --source "$SOURCE" 2>/dev/null || true)"
+        if [[ -n "$xw_json" ]]; then
+            read -r xw_addr xw_agent xw_env < <(XWJ="$xw_json" python3 -c '
+import json, os
+d = json.loads(os.environ["XWJ"])
+print(d.get("address") or "-", d.get("agent") or "-", d.get("env") or "-")
+' 2>/dev/null || echo "- - -")
+            if [[ "$xw_env" != "-" ]]; then
+                post_tags="$GOAL_ID,cross-deployment,xw-completion,${xw_env}"
+                if [[ "$xw_addr" != "-" ]]; then
+                    post_tags="${post_tags},${xw_agent},requires_action_by:${xw_addr}"
+                    msg="Completed (cross-world echo to ${xw_addr} — this goal came from your deployment; please --reply-to this post to acknowledge, or re-file if the outcome does not close your side): ${SUMMARY:-$GOAL_ID} [$GOAL_ID]"
+                else
+                    msg="Completed (cross-world echo to ${xw_env} — origin recorded env-only, no agent to address; a peer reading this board please acknowledge with --reply-to): ${SUMMARY:-$GOAL_ID} [$GOAL_ID]"
+                fi
+                echo "[iteration-close] cross-world completion echo: $GOAL_ID originated from ${xw_addr:-$xw_env} — Completed: post addressed to the peer (tags: $post_tags)"
+            fi
+        fi
         # Informational: board-post failure is non-fatal, but surface stderr so
         # network/write issues don't silently disappear.
-        echo "$msg" | bash "$SCRIPT_DIR/board-post.sh" --channel coordination --type complete --tags "$GOAL_ID" || true
+        echo "$msg" | bash "$SCRIPT_DIR/board-post.sh" --channel coordination --type complete --tags "$post_tags" || true
     fi
 
     # g-284-06 Step 3: Clear team-state.in_flight HERE (moved from do_state_update).
@@ -1142,7 +1376,18 @@ with open(os.environ["GD_FILE"], "a", encoding="utf-8") as f:
         # non-recurring close rather than only when the caller remembered the
         # flag. do_state_update's sentinel remains the backstop for the case this
         # stdout line is emitted but not acted on.
-        echo "[iteration-close] NEXT: Phase 6 spark REQUIRED for $GOAL_ID (outcome=deep, non-recurring) — invoke Skill(aspirations-spark) BEFORE the state-update phase. In-turn spark is recorded by spark-fire-dedup; the sentinel self-clears either way."
+        if [[ "${BODY_ROLE:-}" == "worker" ]]; then
+            # A WORKER Body reaches this close via worker-loop Phase 4a and
+            # its spark obligation is Phase 3.5 spark_capture (replayed by
+            # the reducer at generalize-down) — Skill(aspirations-spark) is
+            # reducer-only (REDUCER_ONLY_PHASES). Emitting the reducer's
+            # imperative here would contradict worker-loop Phase 4c and
+            # invite a worker to run a phase it must skip (2026-08-16,
+            # g-115-6337 review). Say what the worker's next step IS.
+            echo "[iteration-close] NEXT (worker Body): spark for $GOAL_ID was captured in worker-loop Phase 3.5 (spark_capture; the reducer replays it) — do NOT invoke Skill(aspirations-spark). Continue to worker-loop Phase 4b (hand-off row) then Phase 5 (re-enter for the next unit)."
+        else
+            echo "[iteration-close] NEXT: Phase 6 spark REQUIRED for $GOAL_ID (outcome=deep, non-recurring) — invoke Skill(aspirations-spark) BEFORE the state-update phase. In-turn spark is recorded by spark-fire-dedup; the sentinel self-clears either way."
+        fi
     fi
     # ── End Phase-6 spark imperative ──────────────────────────────────────────
 
@@ -1163,8 +1408,12 @@ do_state_update() {
 
     # g-115-5001: read the goal record forward before reporting success over it.
     # Unconditional and on the success path — the whole defect is that every
-    # existing read sits behind rc!=0. See _warn_if_goal_not_closed.
-    _warn_if_goal_not_closed "state-update"
+    # existing read sits behind rc!=0. g-115-5573: that read now REFUSES rather
+    # than warning, so a phase can no longer report success over an open record.
+    # Invoked BARE so `set -euo pipefail` (L65) turns the non-zero return into a
+    # loud abort whose EXIT trap prints the verify-first retry command.
+    # See _assert_verify_landed for the fail-open ladder.
+    _assert_verify_landed "state-update"
 
     # ── Phase-6 spark sentinel for NON-recurring deep closes (g-115-2848) ──
     # MOVED here from do_verify: do_state_update REQUIRES --outcome (validated
@@ -1337,39 +1586,52 @@ print(json.dumps({
     fi
     # ── End Phase 4.25 per-goal experience check ──
 
-    # ── exp_capture drain: worker execution narratives -> experience records ──
-    # (g-306-199.) Worker Bodies write an execution narrative to the exp_capture
-    # WM slot at worker-loop Phase 3.6; body-merge carries it here at
-    # generalize-down. Encoding is reducer-only-by-design
-    # (worker_execute.LIFECYCLE_DISPOSITIONS), so this is the only side of the
-    # split that can do it — and until now nothing did. The slot shipped with a
-    # writer, four registration sync sites and six green tests, and NO consumer:
-    # measured 2026-08-10, 8 conforming entries held narratives for 8
-    # worker-completed goals, 7 of which had ZERO experience records of any kind.
+    # ── exp_capture drain: RETIRED here (g-306-280) — do not re-add ──
+    # ⚠ THE PREMISE BELOW IS FALSE — measured g-306-203, 2026-08-11. The
+    # "concurrent worker Body had already shipped" claim was never true:
+    # worker_retrospective.py has NO `experience` RUN_LANE and no reference to
+    # exp_capture in ANY of its four revisions (RUN_LANES is ("team_state",
+    # "journal", "findings", "impk"); `git show <rev>:...` returns 0 for both
+    # `experience` and `exp_capture` at every rev). So this site's drain was
+    # retired as a duplicate of something that does not exist, and exp_capture
+    # has had ZERO consumers since — sitting at its cap of 20, where the next
+    # worker capture becomes the first to FIFO-evict the oldest.
     #
-    # WHY HERE AND NOT IN A SKILL.md PHASE. The sibling spark_capture drain is an
-    # LLM-elected block in aspirations-spark/SKILL.md, and guard-399's amendment
-    # (2) measured that prose and a `Bash:` line inside a loaded digest are the
-    # SAME enforcement class — both need the model to ELECT to run them, and the
-    # commons-retrieval slot that shape was tried on fired 0 times in 7 days. The
-    # operative test is "WHO executes it", so the call belongs in a script the
-    # flow already runs. It is possible to satisfy that here only because the
-    # drain is a mechanical transport: the worker already authored the narrative,
-    # and the reducer maps its fields without judgment.
+    # Still do NOT re-add it HERE: the placement argument below is independent
+    # of the false ownership claim and remains correct. The remedy is to BUILD
+    # the `experience` lane in worker_retrospective.py, which is where both this
+    # tombstone and body-merge.sh already say it lives. See body-merge.sh (~L25)
+    # for the same correction and the reason not to revert g-306-280.
     #
-    # UNCONDITIONAL — deliberately NOT gated on $OUTCOME or _su_is_recurring like
-    # the two blocks above. Those enforce something about THIS goal; this drains
-    # a queue filled by OTHER goals on other boxes. Gating it on this close's
-    # outcome class would strand worker narratives behind a run of routine
-    # reducer closes, which is the same never-fires failure the block exists to
-    # end. Cheap when idle: one WM read, then it stops on an empty slot.
+    # ── RESOLVED 2026-08-15 (measured, alpha worker cc-07). THE REMEDY LANDED,
+    # so the two paragraphs above are HISTORY and no longer describe live state.
+    # worker_retrospective.py RUN_LANES is now ("team_state", "journal",
+    # "findings", "experience", "impk") with `_lane_experience` (~L525) and
+    # EXP_SLOT = "exp_capture" (L138). exp_capture HAS a consumer; it is NOT at
+    # cap-with-no-drain; the deferral target this tombstone points at exists, so
+    # "do not re-add it HERE" is now settled rather than provisional. Read the
+    # module before re-deriving the lane's status from this comment — the text
+    # above is kept for the placement reasoning, which is still right. Corrected
+    # in body-merge.sh (~L41) in the same change.
     #
-    # `_winpath` per the file-local rule for every `python3 <file-arg>` call.
-    # Fail-open by contract (the drain exits 0 on every path), so a non-zero rc
-    # means it was never reached — the one case it cannot report on itself.
-    python3 "$(_winpath "$SCRIPT_DIR/exp_capture_drain.py")" --apply \
-        || echo "[iteration-close] WARN: exp_capture drain did not run (rc=$?) — worker execution narratives stay queued in the slot for the next close" >&2
-    # ── End exp_capture drain ──
+    # STILL OPEN — encoding_capture, the LAST orphaned lane of the four, has no
+    # consumer anywhere (0 mentions in aspirations-state-update/SKILL.md, the
+    # file both wm.py and wm_write.py name as its consumer; 132 live entries
+    # unread in the reducer WM). Owner: g-306-201 (HIGH, pending), half-shipped.
+    #
+    # ORIGINAL (retained verbatim; its first paragraph is the false one):
+    # A drain stood at this site (g-306-199) and was a DUPLICATE: a concurrent
+    # worker Body had already shipped the same capability as worker_retrospective.py's
+    # `experience` RUN_LANE. Theirs wins on idempotency (goal-keyed
+    # `retrospective_encoded` on the DURABLE SHARED goal record, vs this site's
+    # per-box ephemeral WM slot) and on bounding anchor count.
+    #
+    # It is NOT re-constructible here, which is why this is a tombstone and not a
+    # relocation note: the surviving lane is MERGE-scoped (argparse requires
+    # --goal-ids or --from-merge-summary) and `merged_goal_ids` is computed inside
+    # body-merge.py. do_state_update has no merge summary to pass. The lane is now
+    # chained from core/scripts/body-merge.sh — still bash-owned, so guard-399's
+    # "WHO executes it" test is satisfied without an LLM-elected SKILL.md line.
 
     # g-115-453: session YAML lint (advisory). Catches malformed YAML in
     # <agent>/session/*.yaml at write-time rather than days later when a
@@ -2022,7 +2284,22 @@ print(sha)
         # union. guard-1802: diff the consumer's predicate against the producer's
         # population and measure what it EXCLUDES — a subset predicate and a
         # genuinely clean queue emit the identical all-clear.
+        # THIRD partition, g-115-6060: `benign_squash_merged` is read here and
+        # deliberately EXCLUDED from the warning count rather than unioned in.
+        # It is landed work — a squash-merge rewrites the sha, so the goal's own
+        # commit is off-default permanently even though the deliverable shipped.
+        # Unioning it would resurrect, one layer up at consumption, the exact
+        # false positive that was just removed at detection — the same
+        # detection-fixed / consumption-reintroduced mistake the comment block
+        # above records happening the first time. Excluding it is a DECISION,
+        # not blindness, which is why the key is referenced in code and not only
+        # in this comment: the parity test strips comments precisely so a
+        # documented-but-unread key cannot pass for a handled one.
+        _benign_n=$(echo "$_landed_json" | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d.get('benign_squash_merged') or []))" 2>/dev/null || echo 0)
         _stranded_n=$(echo "$_landed_json" | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d.get('stranded') or []) + len(d.get('stranded_no_pr') or []))" 2>/dev/null || echo 0)
+        if [[ "${_benign_n:-0}" != "0" ]]; then
+            echo "[iteration-close] NOTE: ${GOAL_ID} has ${_benign_n} commit(s) that landed via squash-merge — off the default branch by sha, on it by content. Not stranded; no action needed (g-115-6060)." >&2
+        fi
         if [[ "${_stranded_n:-0}" != "0" ]]; then
             echo "[iteration-close] ADVISORY: ${GOAL_ID} closed but its commits are NOT on the remote default branch — the work is on a branch nobody has landed." >&2
             echo "$_landed_json" | python3 -c "
@@ -2184,7 +2461,7 @@ for e in list(d.get('stranded') or []) + list(d.get('stranded_no_pr') or []):
         echo "  RECOVER NOW — do NOT re-run --phase state-update (it would double-journal + double-commit). Run the velocity subcommand alone:" >&2
         echo "    bash core/scripts/state-update-audit.sh velocity --goal $GOAL_ID --category $category --tree-updated --artifacts-count <n> --encoding-score <0.0-1.0> --findings-count <n>" >&2
         echo "  Safe post-hoc BECAUSE the unmeasured path wrote nothing: state-update-audit.py cmd_velocity early-returns on not-measured, before meta-impk is ever invoked. So this call records the goal's FIRST and only snapshot." >&2
-        echo "  Do NOT run it after a MEASURED close: meta-impk.py cmd_snapshot appends with NO per-goal dedup and recomputes the 5/10/20 rolling averages from all entries, so a second entry double-weights this goal. Run it ONLY when you saw this advisory." >&2
+        echo "  Do NOT run it after a MEASURED close. g-115-4542 (2026-08-09) added a --close-key (goal_id:selected_at, derived inside state-update-audit.py) so a repeat snapshot IS suppressed rather than double-weighted -- but ONLY while the iteration checkpoint is live. do_productivity_check() deletes that checkpoint, after which _close_key fails open to empty, the flag is omitted, and a second entry double-weights this goal across the 5/10/20 rolling averages. Run it ONLY when you saw this advisory." >&2
     fi
 
     # Step 8.79 Post-State-Update METRIC Gate (g-115-724, rb-917 content-gate
@@ -2523,7 +2800,8 @@ do_learning_gate() {
     # g-115-5001: same forward read as state-update. BOTH phases are wired, not
     # just the first: g-115-4718 showed learning-gate reporting success over an
     # open record independently, and a closer may run learning-gate alone.
-    _warn_if_goal_not_closed "learning-gate"
+    # g-115-5573: now a refusal, same as state-update — see _assert_verify_landed.
+    _assert_verify_landed "learning-gate"
 
     # Retrieval-performed tracking (g-001-132). retrieve.py --goal auto-writes
     # retrieval-session.json when intelligent retrieval fires (Phase 4). A bare
@@ -2571,6 +2849,21 @@ except Exception:
     fi
 
     if [[ "$current_file_goal" != "$GOAL_ID" || "$current_file_stub" == "stub" ]]; then
+        # g-115-5887 acceptance 6: NAME the foreign goal_id BEFORE the overwrite
+        # below destroys it. current_file_goal was read (L2624), tested (L2628)
+        # and then silently discarded — 3 occurrences in this whole file, none
+        # of them a print — so a MIS-STAMPED manifest was indistinguishable from
+        # a genuine no-consult. The close reported only performed=false, which
+        # reads as an accusation against the agent, while the one value that
+        # identifies the real cause was thrown away. Measured 2026-08-13
+        # (alpha/cc-04): g-115-5216 carried 2 goal-tied SUBJECT+MECHANISM consult
+        # rows in world/retrieval-trace.jsonl and still closed performed=false,
+        # climbing the drift streak to 2 and forcing a redundant consult.
+        # Emitted BEFORE the write so a crash mid-write still leaves the
+        # discriminator in the log. Diagnostic only — no behavior change.
+        if [[ -n "$current_file_goal" && "$current_file_goal" != "$GOAL_ID" ]]; then
+            echo "[iteration-close] retrieval-manifest MISMATCH: on-disk manifest belongs to goal '$current_file_goal', this close is '$GOAL_ID' (kind=$current_file_stub) — overwriting with a no-retrieval stub. A mismatch is NOT evidence the agent skipped its consult; cross-check world/retrieval-trace.jsonl for goal-tied rows before reading performed=false as a miss (g-115-5887)." >&2
+        fi
         # Missing or stale file — write no-retrieval stub so this iteration is
         # detectable in retrospective analysis. utilization_pending=false means
         # neither gate runs feedback (correct — nothing was retrieved to score).
@@ -2699,18 +2992,26 @@ except Exception: print("false")' 2>/dev/null || echo false)"
     fi
     # ── end pre-apply-consult drift gate ──────────────────────────────────
 
-    # Check unreflected hypotheses count — signal via exit; LLM sees stderr
+    # Check REFLECTABLE unreflected hypotheses — signal via exit; LLM sees stderr.
+    # g-115-6173: the g-115-5358 widening made the raw --unreflected length the
+    # full never-reflected BACKLOG (measured 2026-08-14: 383, of which 378 are
+    # structurally unreflectable — UNRESOLVABLE/EXPIRED/no-outcome), so len()
+    # here fired this nudge on every close forever. Count via the shared
+    # _reflectable filter (outcome CONFIRMED/CORRECTED) so a firing means
+    # "reflection work actually exists".
     local unreflected
-    unreflected="$(bash "$SCRIPT_DIR/pipeline-read.sh" --unreflected | python3 -c "
-import json, sys
+    unreflected="$(bash "$SCRIPT_DIR/pipeline-read.sh" --unreflected | SCRIPTS_DIR="$SCRIPT_DIR" python3 -c "
+import json, os, sys
+sys.path.insert(0, os.environ['SCRIPTS_DIR'])
 try:
+    import _reflectable
     d = json.load(sys.stdin)
-    print(len(d) if isinstance(d, list) else 0)
+    print(_reflectable.count_reflectable(d) if isinstance(d, list) else 0)
 except Exception:
     print(0)
 " || { echo "[iteration-close] WARN: pipeline-read --unreflected failed — defaulting to 0 (LLM may miss unreflected hypothesis count)" >&2; echo "0"; })"
     if [[ "$unreflected" -gt 0 ]]; then
-        echo "[iteration-close] LLM-ACTION: $unreflected unreflected hypothesis/es — digest § LEARNING-GATE item 3" >&2
+        echo "[iteration-close] LLM-ACTION: $unreflected reflectable unreflected hypothesis/es — digest § LEARNING-GATE item 3" >&2
     fi
 
     # Tree growth check — report candidate count if any
@@ -2872,6 +3173,34 @@ do_productivity_check() {
     # shape the two staleness checks below use — because it would silence the
     # stranded-depth and integrate-defer alarms, which exist to be READ IN-TURN.
     { bash "$SCRIPT_DIR/iteration-push.sh" --repo "$PROJECT_ROOT"; } || true
+    # Load-bearing capture priority-merge lane (g-306-293). THE NAMED CADENCE for
+    # the fast lane: this phase runs once per reducer iteration, where the full
+    # generalize_down runs only at aspirations-consolidate Step -1.
+    #
+    # Why it is worth a call here at all: generalize_down enumerates ONLY
+    # closed-pending-merge Bodies, so an ACTIVE worker's captures are invisible
+    # to the reducer no matter how often consolidation runs. Measured 2026-08-15
+    # (alpha, cc-08): one Body 21 units deep held 237 capture entries no reducer
+    # could see. This pass reads ACTIVE Bodies too and copies forward only the
+    # entries the worker flagged `load_bearing`.
+    #
+    # Placed immediately after the push and BEFORE the maintenance battery on
+    # purpose: it writes the reducer WM, so anything downstream that reads WM
+    # this iteration sees the merged captures rather than next iteration's copy.
+    # It never marks a Body merged and deletes nothing — generalize_down stays
+    # the sole owner of Body lifecycle, so the worst case here is a no-op.
+    # Idempotent by content hash, so the later full merge does not double-apply.
+    # `|| true` + the script's own unconditional exit 0: an accelerator sitting
+    # in front of a merge that will happen anyway must never fail the close.
+    # stdout is DELIBERATELY UNREDIRECTED — the one-line summary is the
+    # telemetry the completion bar asks for and it exists to be READ IN-TURN
+    # (same reasoning as the push above); the per-run JSONL under
+    # agents/<agent>/session/capture-fast-lane.jsonl carries the trend.
+    # `python3` (not `py -3`) is correct inside this .sh — it sources _paths.sh —
+    # and the path routes through `_winpath` per the file-local rule for every
+    # `python3 <file-arg>` call (the shim needs C:/ paths on Windows).
+    { python3 "$(_winpath "$SCRIPT_DIR/capture_fast_lane.py")"; } \
+        2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
     # Phase 4.25 drift compliance check (g-248-16, rb-428). Warn-only — surfaces
     # when experience.jsonl is stale because the LLM-only experience-add.sh
     # call has drifted out of the hot path. Never blocks iteration.
@@ -3021,6 +3350,52 @@ do_productivity_check() {
     python3 "$(_winpath "$SCRIPT_DIR/agent-watchdog.py")" --tick \
         2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
 
+    # Worker-ref consumption lane (g-306-283) — the wired executable caller for
+    # worker-ref-consume.sh, which had ZERO call sites from its landing
+    # (g-306-264, 2026-08-06) until 2026-08-13: workers pushed carrier refs and
+    # nothing ever SHOWED them to the reducer, so completed framework work
+    # stranded invisibly while main re-implemented it from scratch — measured
+    # re-do with quality regression (g-115-5945 N6), backlog regrowth ~35
+    # real-work commits/day (N3). This phase is reducer-only by the worker
+    # phase split, so the report runs exactly where consumption decisions live.
+    # Throttled on a marker mtime (iteration-push FETCH_HEAD idiom) because the
+    # report fetches refs/workers/* from origin, and timeout-bounded like the
+    # GROUND producer below for the same reason. --check prints the per-ref
+    # report plus a LOUD banner when an outstanding TIP breaches depth/age
+    # thresholds. Advisory and fail-open; it deliberately files NO goals — the
+    # ACTING lane is the recurring consume/disposition world goal (g-306-283
+    # shape b), so this hook is the between-runs visibility half.
+    WR_MARKER="$PROJECT_ROOT/.git/worker-ref-report.last"
+    WR_INTERVAL_MIN="${WORKER_REF_REPORT_INTERVAL_MIN:-60}"
+    WR_DUE=1
+    if [[ "$WR_INTERVAL_MIN" -gt 0 && -f "$WR_MARKER" ]] 2>/dev/null; then
+        WR_CT="$(date -r "$WR_MARKER" +%s 2>/dev/null || echo "")"
+        case "$WR_CT" in
+            ''|*[!0-9]*) ;;   # unreadable mtime -> run anyway
+            *) WR_AGE_MIN=$(( ($(date +%s) - WR_CT) / 60 ))
+               [[ "$WR_AGE_MIN" -ge 0 && "$WR_AGE_MIN" -lt "$WR_INTERVAL_MIN" ]] && WR_DUE=0;;
+        esac
+    fi
+    if [[ "$WR_DUE" -eq 1 ]]; then
+        # Touch-first is deliberate thrash protection (a hanging check must not
+        # retry every iteration) — but it means a FAILED check has already
+        # advanced its own cadence, so the failure needs a DURABLE record: the
+        # WARN below goes to stderr, which is invisible whenever this script
+        # runs backgrounded (guard-772). F-001 of g-306-287: emit a gate-log
+        # row (worker-ref-report-check, fail_open) so a dark visibility path
+        # is detectable in meta/gate-firings.jsonl rather than merely
+        # un-narrated. Clean passes log nothing (own-cloud append cost — same
+        # posture as the pre-commit suite's BLOCK-only telemetry).
+        touch "$WR_MARKER" 2>/dev/null || true
+        timeout 45 bash "$SCRIPT_DIR/worker-ref-consume.sh" --check \
+            2>>"$CORE_ROOT/logs/iteration-close-stderr.log" \
+            || { echo "[iteration-close] WARN: worker-ref-consume --check did not complete (non-fatal; stranded-ref visibility not refreshed this iteration)" >&2
+                 bash "$SCRIPT_DIR/gate-log.sh" worker-ref-report-check fail_open \
+                   --caller "iteration-close:worker-ref-report" \
+                   --gate-error "worker-ref-consume --check rc!=0 or 45s timeout; cadence marker already advanced, next attempt in ${WR_INTERVAL_MIN}min" \
+                   >/dev/null 2>&1 || true; }
+    fi
+
     # GROUND producer (g-335-830) — Pattern B domain-overlay seam, same shape as
     # the pipeline-reconcile-gate and outcome-metrics hooks above: CORE stays
     # domain-agnostic and fires the script only if a domain supplies one, so a
@@ -3031,11 +3406,12 @@ do_productivity_check() {
     # been doing?" answers from disk instead of inventing. Placed here because
     # a close is the moment the agent actually HAS something true to report.
     #
-    # Fire-and-forget / fail-open, and `timeout`-bounded because this is the
-    # only hook in this phase that touches the network — a hung remote must not
-    # become the loop's iteration time. The script itself exits 0 on every
-    # benign no-op (no live server, no key, nothing to report), so the WARN
-    # below fires only for a real delivery failure.
+    # Fire-and-forget / fail-open, and `timeout`-bounded because this and the
+    # worker-ref lane above are the two hooks in this phase that touch the
+    # network — a hung remote must not become the loop's iteration time. The
+    # script itself exits 0 on every benign no-op (no live server, no key,
+    # nothing to report), so the WARN below fires only for a real delivery
+    # failure.
     if [[ -n "${WORLD_DIR:-}" && -f "$WORLD_DIR/scripts/sis-self-summary-post.sh" ]]; then
         timeout 25 bash "$WORLD_DIR/scripts/sis-self-summary-post.sh" \
             --goal-id "$GOAL_ID" >/dev/null \
@@ -3152,6 +3528,16 @@ do_productivity_check() {
     bash "$SCRIPT_DIR/history-vacuum-tick.sh" \
         >>"$CORE_ROOT/logs/iteration-close-stderr.log" 2>&1 || true
 
+    # Aspirations hot-store eviction tick (2026-08-14, operator-directed S3
+    # cost-down). Daily per-box cadence for aspirations-evict-completed.py,
+    # which had NO call site (g-115-5771) while its target file was 54.4
+    # GB/day of whole-object PUT churn (g-358-02). Same LOCAL-tick +
+    # fail-open (`|| true`) + stderr-sink contract as the vacuum tick above;
+    # 24h stamp + per-box lock + backgrounded inside the wrapper. Config:
+    # aspirations.yaml § aspirations_eviction (age_days 3, operator-approved).
+    bash "$SCRIPT_DIR/aspirations-evict-tick.sh" \
+        >>"$CORE_ROOT/logs/iteration-close-stderr.log" 2>&1 || true
+
     # Orphan-root sweep (plan v1 D5, 2026-05-19) — periodic detector for
     # cruft directories at the wrong root (external-path-resolution drift).
     # Six scans: Mode A duplicates (world-parent), Mode B skeleton dirs
@@ -3204,6 +3590,17 @@ do_productivity_check() {
     # NOTE: only emits for the productivity-check phase (not verify/state-update/
     # learning-gate) because those are mid-iteration. This line is the iteration
     # boundary marker.
+    # Precheck-gap detector (2026-08-17, alpha assistant review, cc-09): prints
+    # whether Phase 0-1 (Skill(aspirations-precheck)) actually ran, measured from
+    # the meter's own start/log stamps vs iterations closed. Placed HERE, in the
+    # one tool output the return protocol guarantees the loop LLM reads every
+    # iteration, because the measured failure shape was a post-autocompact loop
+    # that re-entered Skill(aspirations) and ran "the always-run calls" it
+    # remembered from the summary — skipping the whole precheck battery for
+    # 4+ iterations (cc-04: 19 closes, ~3 prechecks, 16:36→00:28). Fail-open,
+    # always exit 0, one line normally; loud banner only when >= 1 iteration
+    # closed since the precheck last started.
+    bash "$SCRIPT_DIR/precheck-gap-check.sh" 2>/dev/null || true
     echo ""
     echo "[iteration-close] ═══ ITERATION COMPLETE ═══"
     # Deadman's-switch terminal-pair (DEFAULT-ON since Stage 5, 2026-06-23).

@@ -160,9 +160,44 @@ working_memory_pruning:
                                     # several times the size of a spark, and one
                                     # is written per EXECUTED goal rather than
                                     # per spark-worthy insight (which is often
-                                    # zero). 20 covers a long worker run between
-                                    # consolidations without letting an
-                                    # unconsumed slot grow the WM without bound.
+                                    # zero).
+                                    #
+                                    #  — THE ORIGINAL RATIONALE HERE WAS
+                                    # FALSIFIED BY MEASUREMENT AND IS RECORDED SO
+                                    # IT IS NOT RE-DERIVED. It read "20 covers a
+                                    # long worker run between consolidations".
+                                    # That was an estimate of worker run length
+                                    # made before any real one existed. The first
+                                    # measured one (alpha, cc-07, SID c4d40b86)
+                                    # did 135 appends against this cap of 20:
+                                    #   exp_capture   135 appends,  20 kept -> 115 destroyed
+                                    #   spark_capture 136 appends,  50 kept ->  86 destroyed
+                                    #   hyp_capture    24 appends,  10 kept ->  14 destroyed
+                                    #   encoding_capture (UNCAPPED) 52 -> 52, 0 lost
+                                    # The uncapped lane is the positive control:
+                                    # appends == surviving exactly, so appends are
+                                    # 1:1 with entries and the subtraction above is
+                                    # arithmetic, not inference. 215 entries lost.
+                                    #
+                                    # THE CAPS ARE DELIBERATELY NOT RAISED. Raising
+                                    # them trades a silent data loss for a silent
+                                    # unbounded growth (the reset-surviving reason
+                                    # above is real). Eviction is now COUNTED
+                                    # instead — see capture_evictions in
+                                    # wm_write.py::append_slot — so the cost of any
+                                    # future cap choice is measurable rather than
+                                    # estimated. Size from that counter, not from a
+                                    # guess about run length; that guess is what
+                                    # failed here.
+    hyp_capture: 10                 # g-306-200: same reset-surviving reason again,
+                                    # lowest cap of the three on purpose — an entry
+                                    # is written only when execution surfaces
+                                    # evidence bearing on a REAL pipeline.jsonl
+                                    # hypothesis, which is rarer than one-per-goal.
+                                    # A low cap is also the safer direction here:
+                                    # overflow drops the OLDEST evidence, and stale
+                                    # evidence for an already-resolved hypothesis is
+                                    # the entry you most want dropped first.
   item_stale_minutes:               # Item-level age thresholds
     micro_hypotheses: 180           # 3 hours — unresolved micros
     sensory_buffer: 60              # 1 hour

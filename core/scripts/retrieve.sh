@@ -25,7 +25,25 @@ CORE_ROOT="$PROJECT_ROOT/core"
 
 # Source _runtime.sh now (early) so rt_session_mode is available for the
 # auto-inject below.
+# Capture whether the CALLER set a client bound BEFORE sourcing — _runtime.sh
+# defaults RT_CURL_TIMEOUT to 90 at source time, which erases the distinction
+# between "caller chose 90" and "nobody chose".
+_RETRIEVE_CALLER_TIMEOUT="${RT_CURL_TIMEOUT:-}"
 source "$CORE_ROOT/scripts/_runtime.sh"
+
+# : wrapper-local client bound, 240s, applied only when the caller
+# set nothing. The first /v1/retrieve after daemon idle pays a ONE-TIME
+# warmup measured ABOVE the old 90s default: 96s/99s (foxtrot, two runs),
+# 72.9s light-load and ~180s under load + include-framework (cc-08) — so the
+# first consult of a session failed reliably by a few seconds while every
+# later call ran 2-3s, and the failure read as an empty consult. 240s clears
+# every measured warmup with headroom. This is the "bound raised above
+# measured p99" arm of the fix (verification outcome 4); the deeper fix —
+# warming the retrieval index at daemon startup — is a daemon-side change
+# tracked separately. An explicit caller RT_CURL_TIMEOUT is always honored.
+if [ -z "$_RETRIEVE_CALLER_TIMEOUT" ]; then
+    RT_CURL_TIMEOUT=240
+fi
 
 # --- Auto-inject --read-only for reader/assistant mode --------------------
 # MIND_AGENT comes from the bash-agent-inject PreToolUse hook. If it's unset
@@ -177,22 +195,63 @@ _commons_draw() {
     return 0
 }
 
+# : capture-then-emit with an empty-body guard, replacing the old
+# stream-through `0) exit 0`. /v1/retrieve NEVER legitimately returns zero
+# bytes — even a nonsense category returns the meta+stores JSON envelope
+# (measured 93KB for a match-nothing query) — so rc=0 with an empty body is a
+# transport/daemon anomaly, and passing it through is how a timed-out consult
+# reads as "no guardrails apply" (the confident wrong answer this goal was
+# filed on; same signature class as goal-selector.sh's  guard, and
+# the same exit code 7 so rc logs identify the family). Temp capture lives
+# OUTSIDE the synced tree (: the own-cloud sync rewrites files
+# under agents/<agent>/ mid-run). Elapsed ms is measured here because the
+# generic rt_no_daemon_error cannot know the endpoint or this call's wall
+# time (verification outcome 1 requires both in the diagnostic).
+_retrieve_now_ms() {
+    local t
+    t="$(date +%s%3N 2>/dev/null)"
+    case "$t" in
+        ''|*[!0-9]*) echo $(( $(date +%s) * 1000 ));;
+        *) echo "$t";;
+    esac
+}
+
+_RETRIEVE_OUT="$(mktemp "${TMPDIR:-/tmp}/retrieve-out.XXXXXX")"
+trap 'rm -f "$_RETRIEVE_OUT"' EXIT
+_T0="$(_retrieve_now_ms)"
+
+# One rt_call site, retried once through the autospawn path — both attempts
+# go through the SAME capture + guard below (guard-3448: a gate is only as
+# broad as its entry points; the pre-fix wrapper had two independent rc=0
+# exits).
 rc=0
-rt_call GET /v1/retrieve --query "$QUERY" || rc=$?
+rt_call GET /v1/retrieve --query "$QUERY" > "$_RETRIEVE_OUT" || rc=$?
+if [ "$rc" = "3" ]; then
+    # DAEMON-ONLY (2026-05-14 cutover): no Python CLI fallback.
+    if rt_try_autospawn; then
+        rc=0
+        rt_call GET /v1/retrieve --query "$QUERY" > "$_RETRIEVE_OUT" || rc=$?
+    fi
+fi
+_ELAPSED_MS=$(( $(_retrieve_now_ms) - _T0 ))
 
 case $rc in
-    0) _commons_draw; exit 0;;
+    0)
+        if [ ! -s "$_RETRIEVE_OUT" ]; then
+            echo "[retrieve.sh] FATAL: GET /v1/retrieve returned rc=0 with an EMPTY body after ${_ELAPSED_MS}ms (bound RT_CURL_TIMEOUT=${RT_CURL_TIMEOUT}s) — the g-115-6189 silent-empty signature. A genuinely-empty retrieval is a non-empty JSON envelope, so this is a transport/daemon fault, NOT 'no guardrails apply'. Do not treat this consult as performed." >&2
+            exit 7
+        fi
+        cat "$_RETRIEVE_OUT"
+        _commons_draw
+        exit 0;;
     2)
         # Daemon answered with HTTP 4xx/5xx; body already on stderr.
+        echo "[retrieve.sh] GET /v1/retrieve failed with a daemon 4xx/5xx after ${_ELAPSED_MS}ms." >&2
         exit 1;;
     3)
-        # DAEMON-ONLY (2026-05-14 cutover): no Python CLI fallback.
-        if rt_try_autospawn; then
-            rc=0
-            rt_call GET /v1/retrieve --query "$QUERY" || rc=$?
-            if [ "$rc" = "0" ]; then _commons_draw; exit 0; fi
-        fi
+        echo "[retrieve.sh] GET /v1/retrieve did not complete: transport failure after ${_ELAPSED_MS}ms (bound RT_CURL_TIMEOUT=${RT_CURL_TIMEOUT}s)." >&2
         rt_no_daemon_error "retrieve.sh";;
     *)
+        echo "[retrieve.sh] GET /v1/retrieve failed rc=$rc after ${_ELAPSED_MS}ms." >&2
         exit $rc;;
 esac

@@ -942,3 +942,107 @@ These fields are **documented and writeable** as of Tranche A. The scorer
 dimensions that read them (`class_balance_bonus`, `user_signal_boost`) land
 in Tranche C. Writing these fields before Tranche C is safe — they are
 preserved by the script layer but not yet consumed.
+
+---
+
+# Dependency-Pull Signal (`pull_signal`)
+
+Optional EVENT-keyed lift for a consumer goal (g-115-6590, 2026-08-17). Every
+anti-starvation term in `goal-selector.py` is TIME-keyed — `recurring_urgency`,
+`starvation_boost`, the bounded drain lane, the monitor interval arm — so a goal
+that exists to CONSUME a dependency could only ever fire on its own interval,
+never at the moment the dependency actually landed. Its urgency lives in the
+PRODUCER's event, which the scorer never saw. A producer stamps `pull_signal` on
+the consumer goal when the dependency materializes; `apply_pull_boost` turns that
+event into rank. Default absent: a goal without this field scores exactly as
+before.
+
+## Field
+
+```yaml
+pull_signal: null                            # default - no pull, no boost
+pull_signal:
+  set_at: "2026-08-17T23:00:00"              # REQUIRED, naive ISO (TZ=UTC fleet-wide)
+  by: "alpha/cc-07"                          # who/where set it, for audit
+  reason: "carrier ref, 4 framework files"   # what materialized, one line
+```
+
+## Semantics
+
+A signal is LIVE when `set_at` parses and its age is within
+`pull_boost.max_age_hours` (default 24h), tolerating up to 1h of clock skew ahead
+of the reader. A live signal adds `pull_boost.boost` (default 4.0) to the goal's
+score in a post-scoring pass, recorded as `breakdown.pull_boost` and
+`raw.pull_signal_age_hours`.
+
+**Boost sizing is measured, not chosen** (guard-1895 (2)). `exploration_noise` is
+~U(0, 1.210) applied to 99.6% of candidates (measured cc-07, 1163 candidates,
+2026-08-17), with 44 candidates inside one noise width of the deterministic top.
+Any lift smaller than the noise width changes almost nothing WHILE LOOKING LIKE A
+FIX. The default clears the noise plus the 2-point acceptance gap, and stays
+below `directive_boost`'s 4.5 raw ceiling so a fresh USER directive still
+outranks a machine-set pull.
+
+## THE CLEAR IS FRAGILE — the age bound is not optional
+
+Measured against `coordination_merge._merge_goal` (2026-08-17), the SET and the
+CLEAR do not have symmetric durability across boxes:
+
+| operation | cross-box outcome |
+|---|---|
+| SET, one-sided | **survives**, even when the other side is NEWER (the one-sided-key loop keeps it) |
+| CLEAR by removing the key | **RESURRECTED** — the stale side's value is re-added, even when the clearer is strictly newer |
+| CLEAR by `null`, clearer strictly newer | cleared |
+| CLEAR by `null`, same-or-older `last_modified` | **stale SET survives** (`last_modified` is seconds-resolution, so a same-second tie is reachable) |
+
+Two rules follow, and they are the whole reason this field is safe to ship:
+
+1. **CLEAR by setting `pull_signal: null` — NEVER by removing the key.** Removal
+   is resurrected by the merge.
+2. **The consumer must not DEPEND on the clear.** `max_age_hours` ages the signal
+   out on its own, so a lost clear degrades to "boost expires late" instead of
+   "this goal is pinned at rank 1 forever" — which would be strictly worse than
+   the starvation the field exists to fix.
+
+`aspirations-update-goal.sh` writes stamp `last_modified` (`cmd_update_goal`), so
+a clear through that path is normally the newer write; the age bound covers the
+cases where it is not.
+
+## Producer / consumer
+
+| Field | Written by | Read by |
+|-------|-----------|---------|
+| `pull_signal` | a PRODUCER at the moment the dependency lands — e.g. worker-loop Phase 3.8 after a carrier ref push carrying non-merge framework content; the reducer's hourly `worker-ref-consume --check` report lane | `goal-selector.py` `apply_pull_boost` (post-scoring pass); cleared by the consumer goal's close path |
+
+## Set via
+
+```
+aspirations-update-goal.sh <goal-id> pull_signal '{"set_at":"2026-08-17T23:00:00","by":"alpha/cc-07","reason":"carrier ref, 4 framework files"}'
+aspirations-update-goal.sh <goal-id> pull_signal null        # the CLEAR — null, never key removal
+```
+
+## Validation
+
+None at the write layer: `aspirations-update-goal.sh` accepts arbitrary field
+names today (see g-115-6573). The consumer is defensive instead — a non-dict
+`pull_signal`, a missing/unparseable `set_at`, an aged-out signal, or a stamp
+more than 1h in the reader's future all yield NO boost and never raise.
+
+## Backward compatibility
+
+Absent on every existing goal, and absence is the no-op path, so selection is
+byte-identical for every candidate that carries no signal. `score_goal` emits the
+key as `None` when the goal lacks it, so consumers may use `.get()` or `[]`
+safely.
+
+## Cross-references
+
+- `core/scripts/goal-selector.py` — `apply_pull_boost`, `load_pull_boost_config`,
+  `_PULL_BOOST_DEFAULTS`
+- `core/config/aspirations.yaml` — the `pull_boost` block
+- `core/scripts/tests/test_goal_selector_pull_boost.py` — 20 pins incl. the
+  acceptance bar with the old scorer as positive control
+- `guard-1895` — size a scorer fix against the NOISE WIDTH, not the deterministic
+  deficit
+- `guard-3221` — a conditional feature must read the artifact the CONSUMER
+  receives, not the store the PRODUCER wrote to

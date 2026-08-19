@@ -759,3 +759,35 @@ def test_asks_come_before_the_framework_background(tmp_path):
         "the background must still be present — it was moved, not deleted"
     assert body.index("g-first") < body.index("WHY YOU ARE HEARING ABOUT IT NOW"), \
         "the goals must appear BEFORE the framework background"
+
+
+def test_dispatcher_rc4_means_superseded_by_the_fleet_digest_not_failed(tmp_path, monkeypatch):
+    """Since 2026-08-17 the daily FLEET DIGEST (agent-completion-report) lists
+    this same population under `user-digest`, and the framework dispatcher
+    dedups that category fleet-wide (rc 4). The user HAS been told, so the
+    schedule is satisfied -- a 'failed' verdict here would re-fire every sweep."""
+    mod = _load_module()
+    import subprocess as sp
+    import types
+
+    class FakeBuilt:
+        returncode = 0
+        stdout = '{"InfoMessage":"x","InfoType":"Fleet Digest","XPayloadProvenance":"notify-build-payload/v1"}'
+        stderr = ""
+
+    def fake_run(argv, **kw):
+        # first call: payload builder; second: email-send.sh -> dispatcher rc 4
+        s = " ".join(str(a) for a in argv)
+        if "notify-build-payload" in s:
+            return FakeBuilt()
+        return sp.CompletedProcess(argv, 4, "", "[notify-dispatch] DUPLICATE: digest already sent this window")
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    sender = tmp_path / "scripts"
+    sender.mkdir()
+    (sender / "email-send.sh").write_text("#!/usr/bin/env bash\nexit 4\n")
+    monkeypatch.setenv("WORLD_PATH", str(tmp_path))
+    monkeypatch.setenv("MIND_WORLD", str(tmp_path))
+    g = _goal("g-1", 100)
+    cand = {"goal": g, "aspiration_id": "asp-999", "shape": "agent-user", "deliberate": False}
+    ok, why = mod._send_digest_email("t", [(cand, g, 100.0, "blocked_since")], 72.0, False)
+    assert (ok, why) == (True, "superseded_by_fleet_digest"), (ok, why)

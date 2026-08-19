@@ -30,6 +30,7 @@ Run: STORAGE_BACKEND=local python -m pytest \
      core/scripts/tests/test_clear_in_flight_call_site_scoping.py -q
 """
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -439,20 +440,47 @@ def test_every_release_success_path_clears_in_flight():
     leaves the retry path silently un-cleared — and the retry path is the one
     that runs when the daemon had to be spawned, i.e. exactly the
     cold-start case a human is least likely to exercise by hand.
+
+    GENERALISED 2026-08-11 (g-115-4990), and the reason is the pin's own
+    failure mode. It asserted the LAST statement before each `exit 0` was
+    literally `_clear_in_flight` — correct while release had exactly one
+    cleanup, and a strict-subset predicate the moment it had two. Adding a
+    second (`_clear_iteration_checkpoint`, immediately before the same exits)
+    turned this red without any success path losing its in_flight clear. The
+    form below is STRICTER, not looser: it discovers every `_clear_*` function
+    the script defines and requires ALL of them before EVERY success exit, so a
+    third cleanup wired into one arm and not the other fails here rather than
+    passing because it happened not to be the adjacent one.
     """
     lines = _release_lines()
+    src = "\n".join(lines)
+    defined = set(re.findall(r"^(_clear_[a-z_]+)\(\)\s*\{", src, re.M))
+    assert defined, "no _clear_* cleanup functions found — the pin has no subject"
+
     success = [i for i, ln in enumerate(lines)
                if ln.strip() in ("exit 0", "exit 0;;")]
     assert len(success) >= 2, (
         f"expected at least the two daemon success paths, found {len(success)}: "
         f"{[lines[i] for i in success]}")
     for i in success:
-        preceding = [ln for ln in lines[:i] if ln.strip()]
-        assert preceding and preceding[-1].strip() == "_clear_in_flight", (
+        # The contiguous run of cleanup calls immediately preceding this exit.
+        # Contiguity is retained from the original pin: a cleanup that drifts
+        # above the response-printing block is a cleanup that can be skipped by
+        # an early return added later.
+        preceding = [ln.strip() for ln in lines[:i] if ln.strip()]
+        run = set()
+        for stmt in reversed(preceding):
+            if stmt in defined:
+                run.add(stmt)
+                continue
+            break
+        missing = defined - run
+        assert not missing, (
             f"success exit at line {i + 1} ({lines[i].strip()!r}) is not "
-            f"preceded by _clear_in_flight — its preceding statement is "
-            f"{preceding[-1].strip()!r}. A release on this path leaves the "
-            f"busy signal standing.")
+            f"preceded by {sorted(missing)} — the cleanup calls immediately "
+            f"before it are {sorted(run) or 'none'}, and its preceding "
+            f"statement is {preceding[-1]!r}. A release on this path leaves "
+            f"that state standing.")
 
 
 def test_release_reducer_clear_is_cas_scoped_to_the_released_goal():

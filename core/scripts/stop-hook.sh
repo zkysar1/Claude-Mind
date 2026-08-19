@@ -367,6 +367,74 @@ if [ ! -f "$RUNNER_FILE" ] || { [ -n "$RUNNER_SID" ] && [ "$HOOK_SID" != "$RUNNE
         # and correct. Same style as _BODY_WM / _CLOSE_SENTINEL above.
         if [ -f "$HOOK_AGENT_DIR/session/stop-requested" ]; then
             echo "$(date +%Y-%m-%dT%H:%M:%S) ALLOW gate=worker-net-stop-requested sid=$HOOK_SID agent=$HOOK_AGENT" >> "$LOG" 2>/dev/null || true
+        elif grep -Eq "^body_state: '?parked'?[[:space:]]*$" \
+                "$HOOK_AGENT_DIR/sessions/$HOOK_SID/body-manifest.yaml" 2>/dev/null; then
+            # THIS IS THE ONE PARK VALVE ( reducer ruling, 2026-08-17,
+            # zeta holding the runner claim on cc-02). A second valve keyed on a
+            # `body-parked` FILE with a 70-minute freshness bound briefly existed
+            # further down this chain — built concurrently for  by two
+            # Bodies that could not see each other, git-auto-merged CLEANLY so
+            # nothing announced the collision. Both emitted THIS gate name from
+            # different predicates, so the log could not say which mechanism
+            # parked a Body. The sentinel valve was removed, not left inert.
+            #
+            # WHY THE MANIFEST WON, measured rather than argued: (a) nothing ever
+            # wrote the sentinel file — the valve was unreachable in production
+            # from the day it landed (positive control: `body-closing`, the
+            # sibling sentinel, has six producers); (b) its stated reason to
+            # exist — "worker-loop Phase -0 refuses any state but 'active', so a
+            # parked Body must stay 'active' or it can never resume" — was true
+            # when written and is now FALSE: Phase -0 keys on the CLOSED SET, and
+            # worker-loop/SKILL.md says so explicitly ("NOT merely 'not active',
+            # since `parked` is non-active and resumable"); (c) the whole park
+            # lifecycle is already written against the manifest — worker-loop
+            # calls `body-manifest.py park` / `resume` / `park-expired`, and
+            # `deadman-directive.sh` branches on `body_state: parked` as
+            # RESUMABLE. The manifest is also externally legible to Phase -0, the
+            # deadman prompt and the fleet sweeper, which is 's
+            # constraint 2; a file only this hook reads is not.
+            #
+            # THE 70-MINUTE BOUND WAS DELIBERATELY NOT PORTED, and this is the
+            # part worth carrying: the two bounds measure DIFFERENT CLOCKS, so
+            # "port it" was never well-defined. The sentinel's mtime measured
+            # TIME SINCE LAST POLL (a live park re-touched the file every cycle)
+            # — a liveness clock. `parked_at` measures TOTAL PARK DURATION and is
+            # deliberately preserved across re-parks (body-manifest.py L451), so
+            # it is a patience cap. Copying 70 minutes onto the patience cap
+            # would force-close a correctly-waiting Body after roughly ONE poll
+            # cycle, because the park wakeup is armed at 3600s: a 70-minute cap
+            # leaves ten minutes of margin. That converts every park into a
+            # close, which is the exact outcome  exists to prevent.
+            # Park already expires by AGE via `park-expired` (parked_at vs
+            # PARK_MAX_HOURS=60.0), so the ruling's literal ask was already
+            # satisfied; what was declined is SHORTENING it. The liveness clock
+            # is a real second axis and is not free here — see rb/guard from
+            #  and the follow-up Idea goal.
+            #
+            # 5th safety valve (): a PARKED Body's turn-end is
+            # legitimate and must not be trapped. A park is what a worker does
+            # when its reducer is gone — it holds an armed re-poll wakeup and
+            # ends the turn deliberately, having written NO body-closing
+            # sentinel (it intends to resume, so it must never be queued for
+            # merge). Without this valve every one of those turn-ends hits the
+            # BLOCK below, whose instruction is "write the body-closing sentinel
+            # and end the turn" — which would durably CLOSE the Body and defeat
+            # the entire point of parking. This was the open implementation risk
+            # the goal named; the answer is that it lands on the BLOCK, so the
+            # valve is required rather than optional.
+            #
+            # DELIBERATELY ITS OWN BRANCH, not `parked` bolted into the
+            # closed-state alternation below. Both branches produce the same
+            # ALLOW, so folding them would be invisible in behaviour — and that
+            # is exactly the argument FOR splitting them: this log line is the
+            # only durable record of WHY a worker turn-end was let go, and
+            # "parked, coming back on its own" vs "closed, done" is the one
+            # distinction the fleet sweeper and the user actually need
+            # (constraint 2 of the goal). A merged branch would report every
+            # parked Body as finished. Same fail-toward-protection property as
+            # the closed valve: a missing or unreadable manifest matches
+            # neither and falls through to the BLOCK.
+            echo "$(date +%Y-%m-%dT%H:%M:%S) ALLOW gate=worker-net-body-parked sid=$HOOK_SID agent=$HOOK_AGENT" >> "$LOG" 2>/dev/null || true
         elif grep -Eq "^body_state: '?(closed-pending-merge|merged|closed-stale)'?[[:space:]]*$" \
                 "$HOOK_AGENT_DIR/sessions/$HOOK_SID/body-manifest.yaml" 2>/dev/null; then
             # 4th safety valve (2026-08-09, cc-08 04:39->04:49): a GENUINELY-

@@ -150,6 +150,21 @@ if ! bash "$SCRIPT_DIR/session-signal-set.sh" stop-requested 2>/dev/null; then
     exit 0
 fi
 
+# : the stand-down is now committed — this box stops being the reducer
+# and only the user-only /start can rejoin it. guard-772 (cited above for the
+# durable marker) applies with full force to the USER-facing half too: this tick
+# normally runs inside a backgrounded Bash call, so every echo below is invisible
+# to a human. The durable marker tells a later reader; this tells the user NOW.
+# stderr intentionally un-redirected (guard-3737); -f not -x (guard-1124).
+if [ -f "$SCRIPT_DIR/stop-reason-record.py" ]; then
+    python3 "$SCRIPT_DIR/stop-reason-record.py" \
+        --path reducer-self-fence --agent "$AGENT" \
+        --reason "reducer lease stand-down ($TRIGGER): $REASON" \
+        || echo "[reducer-self-fence] WARN: stop-reason recorder exited non-zero; stand-down may be unannounced." >&2
+else
+    echo "[reducer-self-fence] WARN: stop-reason-record.py missing — standing down with nobody told." >&2
+fi
+
 echo "[reducer-self-fence] ═══ STANDING DOWN AS REDUCER ═══" >&2
 echo "[reducer-self-fence] trigger=$TRIGGER" >&2
 echo "[reducer-self-fence] $REASON" >&2

@@ -144,6 +144,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -317,10 +318,63 @@ def _read_goal_claim_fields(
 # five notes said DONE and one 5,701-char note opened "ACCEPTANCE NOT MET —
 # do NOT close this." A reader who pattern-matches "big note => finished"
 # retires real work silently, which is worse than the duplicate execution
-# this guard prevents. So the record carries `note_head` (the note's FIRST
-# LINE, which is where the verdict lives) precisely so the next reader judges
-# the verdict rather than the size.
+# this guard prevents. So the record carries `note_head` — the note's first
+# VERDICT-BEARING line — precisely so the next reader judges the verdict
+# rather than the size.
+#
+# "first verdict-bearing line", NOT "first line" (, measured
+# 2026-08-15 over the live population of 334 candidates on alpha/cc-04). This
+# comment used to say the verdict lives on the first line. For 180 of 334
+# (53.9%) it does not: a worker Body opens its note with a PROVENANCE STAMP
+# (`alpha worker Body @ hostname cc-07, uname -r 6.8.0-136-generic, ...`) and
+# puts the verdict on line 2 (`BUILT AND LIVE. 4 commits: ...`). 92 heads were
+# provenance carrying no verdict word at all, so a reader following this
+# field's own instruction got NOTHING — on the majority of exactly the
+# population it exists to serve. That is the mechanical reason the
+# completed-not-closed backlog reached 334 while the lane reporting it worked
+# correctly the whole time: the tool was right, the population was right, and
+# the one field a reader is told to judge by was blank.
+#
+# The unit test pinning this field (`test_completed_not_closed_note_keeps_and_
+# quotes_first_line`) passed throughout, because its fixture opens with a bare
+# verdict line and no provenance preamble — the production shape is what it
+# does not replicate (guard-920).
+#
+# DISPLAY-ONLY: the KEEP decision is `note_len >= _NOTE_EVIDENCE_MIN_CHARS`
+# and never this field, so changing the extraction cannot change any verdict,
+# release, or keep. Fallback is the original first line, so it can never
+# return empty and never returns LESS than the previous behaviour.
 _NOTE_EVIDENCE_MIN_CHARS = 1000
+
+# Matches a provenance/attribution preamble line — who/where/on-what-kernel a
+# note was written. Deliberately narrow: it names the box-identity tokens the
+# fleet actually stamps, not a general "looks boring" heuristic, because a
+# false match here SKIPS a line that might have been the verdict.
+_PROVENANCE_HEAD_RE = re.compile(
+    r"(worker\s+Body|hostname\s+cc-|uname\s+-r|STORAGE_BACKEND=)", re.I)
+
+# Bound the skip. A note whose first 3 non-empty lines are all provenance is
+# pathological; scanning further would risk walking into body prose and
+# quoting a mid-argument sentence as though it were the verdict.
+_MAX_PROVENANCE_SKIP = 3
+
+
+def _verdict_head(note: str) -> str:
+    """First verdict-bearing line of `note` — see the block comment above.
+
+    Skips up to `_MAX_PROVENANCE_SKIP` leading provenance lines. Falls back to
+    the original first non-empty line when every candidate is provenance-shaped
+    (or the note has nothing else), so this is a strict improvement on the
+    previous `first non-empty line` behaviour and never returns empty for a
+    non-empty note.
+    """
+    lines = [ln.strip() for ln in note.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    for ln in lines[:_MAX_PROVENANCE_SKIP]:
+        if not _PROVENANCE_HEAD_RE.search(ln):
+            return ln
+    return lines[0]
 
 # Recurring goals are EXCLUDED, and this is load-bearing rather than tidy: on
 # a standing cadence a populated outcome_note is the PREVIOUS cycle's note and
@@ -385,7 +439,7 @@ def _note_evidence_map(source: str) -> Dict[str, Dict[str, Any]]:
                     continue
                 note = g.get("outcome_note")
                 note = note if isinstance(note, str) else ""
-                head = next((ln.strip() for ln in note.splitlines() if ln.strip()), "")
+                head = _verdict_head(note)
                 out[gid] = {
                     "note_len": len(note),
                     "note_head": head[:220],
@@ -477,9 +531,12 @@ def _apply_completion_guard(
             f"verifies and closes it, and releasing it converts 'held for the "
             f"reducer' into 'available to anyone' — whereupon the scorer ranks "
             f"it FIRST because its metadata is fresh. LENGTH IS NOT VERDICT "
-            f"(guard-2852c): read the note's own first line, quoted here, "
+            f"(guard-2852c): read the note's own verdict line, quoted here, "
             f"before deciding — some long notes say ACCEPTANCE NOT MET. "
-            f"First line: {comp['note_head']!r} (g-115-5177)."
+            f"Verdict line: {comp['note_head']!r} (g-115-5177). This is the "
+            f"first line that is not a provenance stamp, NOT necessarily line "
+            f"1 — 53.9% of live notes open with a box/kernel attribution and "
+            f"carry the verdict below it (g-115-6337)."
         )
     else:
         record["reason"] = (
@@ -1472,9 +1529,16 @@ def main() -> int:
         # guard-1419 shape the eager init was written to remove. Only the
         # arrival counter closes it, so neither number is published alone.
         #
-        # carrier_checks : times the body-carrier verdict was computed.
+        # carrier_checks : times the body-carrier verdict was NEEDED.
+        # carrier_reads  : times that cost a remote round trip (
+        #   memo miss). checks - reads is the memo's saving on THIS run, and
+        #   reads is what the wall-clock actually tracks (~0.9s each, measured
+        #   cc-04). Both ship or neither: carrier_checks alone cannot
+        #   distinguish a cheap run from an expensive one, which is the whole
+        #   quantity this sweep was timing out on.
         # kept_live_carrier : times it kept a claim (verdict fresh-correct).
         "carrier_checks": 0,
+        "carrier_reads": 0,
         "kept_live_carrier": 0,
         # authoritative_checks : times the store-of-record diary gate was
         #   reached — i.e. release candidates that survived every cheaper guard.
@@ -1516,6 +1580,90 @@ def main() -> int:
     # has-pending subprocess cost is paid only when a release is actually about
     # to happen (never on the common scanned=0 / all-kept path).
     bg_pending: Optional[bool] = None
+
+    # : per-RUN memo for the body-carrier probe, keyed by the same
+    # (sid, fresh_minutes) the probe is a pure function of (agent is fixed for
+    # the whole sweep). Each miss is ONE remote round trip —
+    # _body_carrier_verdict calls backend.read_authoritative_bytes — and the
+    # loop below is O(this agent's outstanding claims), so the cost is
+    # claims x round-trip with nothing between them.
+    #
+    # MEASURED 2026-08-13 (zeta, hostname cc-02, uname -r 6.8.0-137-generic).
+    # The runtime is NOT a property of the sweep; it is a property of how many
+    # claims the running agent is holding, which is why the same code takes
+    # 1.26s here and timed out twice on cc-04:
+    #   zeta   scanned=1   carrier_checks=0   -> 1.26s wall
+    #   alpha  scanned=324 carrier_checks=307 -> 215s wall (~0.70s/check)
+    # CARRY THE RUN MODE WITH EVERY FIGURE — there are TWO alpha runs from that
+    # day and only the mode distinguishes them: 307 checks / 324 scanned / 215s
+    # is the BACKGROUNDED --apply run that terminated; 234 checks / 249 scanned
+    # is an earlier same-day DRY-RUN. Pairing the dry-run's check count with the
+    # apply run's wall clock yields ~0.92s/check, inflating per-check cost 31% —
+    # and per-check cost is exactly the number a future fix gets sized from.
+    # That pairing was written here first and stood for one commit (guard-3104:
+    # never compare raw counts across runs without checking the window matched).
+    # Live world store the same day: alpha holds 318 claims (303 in-progress,
+    # 313 past the 120m foreign grace, p50 age 90h, max 143h) against <=2 for
+    # every other agent — and all 318 carry just SIX distinct claimed_by_sid
+    # values (178/93/22/19/5/1). So the 307 probes resolve to 6 distinct reads;
+    # everything else is the same file fetched again.
+    #
+    # WHY THIS IS SAFE — and NOT for the reason first written here. The original
+    # comment argued the 900s freshness window is "an order of magnitude longer
+    # than even the 215s run, so a carrier cannot cross the fresh/stale boundary
+    # mid-sweep." That is FALSE: the boundary is `age_min <= fresh_minutes`, so
+    # any carrier whose age starts within 215s of 15m crosses it during the run.
+    # A long window does not prevent crossing; it only makes crossing require
+    # the age to start near the boundary. Surfaced by sq-016 on this goal's own
+    # close, one step after the patch shipped. The real argument is stronger:
+    #
+    #   1. The direction aging can hide is the SAFE one. Absent a new write a
+    #      carrier only gets OLDER, so a memoized `fresh-correct` can outlive
+    #      the truth by at most one run — and `fresh-correct` is the sole KEEP
+    #      verdict. Keeping is this module's declared fail-direction ("the worst
+    #      case is DELAY, never deadlock", foreign-session guard below).
+    #   2. The unsafe direction needs the FILE TO CHANGE mid-run: a body
+    #      resurrecting and writing a heartbeat, so a memoized `stale` is
+    #      applied where a fresh read would now say `fresh-correct`. That
+    #      exposure is NOT introduced here — pre-memo, every claim read BEFORE
+    #      the resurrection carried the identical wrong verdict. The memo widens
+    #      it to that body's remaining claims in the same run, and the run
+    #      shrank ~30x in exchange.
+    #   3. In return the memo REMOVES an incoherence. Pre-memo one body's 307
+    #      claims were judged at 307 different instants, so a resurrection at
+    #      t=100s released its early claims and kept its late ones — a split
+    #      verdict on one body. Per-run memoization makes it all-or-nothing per
+    #      body: one snapshot, one answer.
+    #
+    # Generalized as rb-7785: the safety of caching a TIME-DEPENDENT verdict is
+    # never "the window is long relative to the run" — it is "which direction
+    # can the cached value be wrong in, and is that the fail-safe direction?"
+    #
+    # Deliberately LOCAL rather than a decorator on _body_carrier_verdict: two
+    # test modules monkeypatch that symbol, and a process-global cache would
+    # also outlive a single main() call in-process. A local dict is per-run by
+    # construction and leaves the probe itself untouched.
+    #
+    # The cached `ev` is COPIED out on every read (guard-1663 — never hand a
+    # caller a mutable object owned by a cache; the consumer below splats it
+    # into a record that later code writes to).
+    carrier_memo: Dict[tuple, tuple] = {}
+
+    def _carrier_verdict_memoized(sid: str, fresh_minutes: int) -> tuple:
+        key = (sid, fresh_minutes)
+        if key not in carrier_memo:
+            # Counted HERE, at the round trip itself — never at the call site
+            # from the memo's SIZE. A size-derived counter measures distinct
+            # KEYS, which is invariant under deleting the cache: with the memo
+            # defeated the dict still ends up the same size, so the counter
+            # reports the same saving while every read is being paid. That was
+            # this patch's first shape, and a mutation run (`if key not in` ->
+            # `if True`) left both new tests GREEN — the tests were pinning a
+            # number that could not move. The counter has to sit on the work.
+            summary["carrier_reads"] += 1
+            carrier_memo[key] = _body_carrier_verdict(agent, sid, fresh_minutes)
+        verdict, ev = carrier_memo[key]
+        return verdict, dict(ev)
 
     for entry in claimed:
         goal_id = entry.get("goal_id", "")
@@ -1727,9 +1875,16 @@ def main() -> int:
             # (guard-358 fresh-wrong) — falls through to exactly the behavior
             # that shipped before this block existed. So the worst case of a
             # broken/never-synced carrier is today's behavior, never worse.
-            carrier_verdict, carrier_ev = _body_carrier_verdict(
-                agent, claimed_by_sid, args.carrier_fresh_minutes
+            carrier_verdict, carrier_ev = _carrier_verdict_memoized(
+                claimed_by_sid, args.carrier_fresh_minutes
             )
+            # carrier_checks counts how many times the verdict was NEEDED;
+            # carrier_reads (incremented inside the memo, at the round trip)
+            # counts how many times it cost one. Publishing only the first
+            # would make the memo invisible, and this module's own convention
+            # is that a counter never ships alone (see the arrival/fired pairs
+            # above). carrier_checks - carrier_reads IS the saving, readable
+            # straight off any production run.
             summary["carrier_checks"] += 1
             record["body_carrier"] = {"verdict": carrier_verdict, **carrier_ev}
             if carrier_verdict == "fresh-correct":
@@ -2045,6 +2200,26 @@ def main() -> int:
         }
 
     print(json.dumps(summary, indent=2, ensure_ascii=False))
+
+    # Point the reader at the triage lane at the exact moment this population is
+    # computed (). These goals are KEPT deliberately -- finished work
+    # held by a Body that then died -- and the count alone has never been enough
+    # to act on: it sits inside a large JSON summary with no next step, so 260
+    # finished goals accumulated over ~7 days with nobody closing them.
+    #
+    # stderr, and AFTER the stdout JSON above, so this can never corrupt the
+    # machine-readable output that other consumers parse.
+    _held = summary.get("kept_completed_not_closed") or 0
+    if _held:
+        print(
+            f"[stranded-claim-sweep] {_held} goal(s) KEPT as "
+            f"completed-not-closed: finished work whose holder may be gone. "
+            f"This is not a backlog of unread records -- nothing closes them "
+            f"but the reducer. To triage:\n"
+            f"    bash core/scripts/completed-not-closed-triage.sh\n"
+            f"  (report-only; it has no --apply and cannot change claim state)",
+            file=sys.stderr,
+        )
     return 0
 
 

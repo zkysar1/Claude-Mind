@@ -5,6 +5,12 @@ the turn ends, and the loop dies. Every skill must terminate with a tool call,
 not a text paragraph. The *kind* of tool call depends on whether the skill is
 a sub-skill returning control up, or the orchestrator closing an iteration.
 
+The incident behind the two-case split, the verification wiring, and the layered
+defense against the Explanatory output style live in
+`core/config/conventions/loop-terminal-protocol.md` (`load-conventions.sh
+loop-terminal-protocol`); the deadman design and its incident traces in
+`core/config/rationale/deadman-switch.md`. This file keeps the imperatives.
+
 ## The Two Cases
 
 There are exactly two valid terminal tool calls, selected by role:
@@ -16,59 +22,32 @@ There are exactly two valid terminal tool calls, selected by role:
 
 ### Deadman's-switch pair (orchestrator, DEFAULT-ON since 2026-06-23)
 
-By default (Stage 5 onward — see rationale doc), the orchestrator's terminal
-response is the **pair** `[ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>",
+By default (Stage 5 onward), the orchestrator's terminal response is the
+**pair** `[ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>",
 delaySeconds=600), Skill(aspirations) args='loop']`. This does NOT violate the
 "terminal must be `Skill(aspirations)`" contract above: `Skill(aspirations)` is
 still the LAST call and the primary re-entry. The `ScheduleWakeup` is armed
 immediately before it as a self-resurrection NET that fires only if a text-death
 breaks the Skill chain (it never fires on a healthy loop). It is NOT a
-substitute for the Skill call (reconciles guard-511 / schedule-wakeup-correctness.md
-Anti-pattern C). Opt-out per agent: when
+substitute for the Skill call (reconciles guard-511 /
+schedule-wakeup-correctness.md Anti-pattern C). Opt-out per agent: when
 `agents/<agent>/session/deadman-disabled` is present → terminal is
-`Skill(aspirations)` alone, exactly as the table above (the pre-deadman
-behavior). Rationale: `core/config/rationale/deadman-switch.md`.
+`Skill(aspirations)` alone. Rationale: `core/config/rationale/deadman-switch.md`.
 
-**Re-arm FIRST on resurrection (single-shot-net gap, rb-4345 / g-115-2771).**
-The deadman is a SINGLE replace-slot wakeup — firing CONSUMES it. When a
-`<<autonomous-loop-dynamic>>` wakeup fires and resurrects a dead loop, that
-resurrected turn starts with NO net. If it then text-dies before re-arming (the
-likely case: under an API storm the first tool calls fail with
-529/ECONNRESET/timeout and the model narrates → text-end), the net is gone and
-the loop dies silently a SECOND time with nothing left to resurrect it — the
-exact 7h death of 2026-07-19 (cc-04: wakeup fired 00:00:40, resurrected turns
-text-died 00:00–00:04 during an API storm WITHOUT re-arming, dead until 07:18
-zombie-recovery). RULE: on a `<<autonomous-loop-dynamic>>` firing, the **FIRST
-tool call of the resurrected turn is a `ScheduleWakeup(prompt=
-"<<autonomous-loop-dynamic>>", delaySeconds=600)` re-arm** — restore the net
-BEFORE any work that might fail. Then proceed with the normal loop entry
-(Phase -1.5 onward); the iteration's later terminal-pair re-arm is harmless
-(replace-slot semantics make a double-arm a no-op). Restoring the net first
-costs one tool call and converts "death during resurrection" from a multi-hour
-silent death into at most one more 600s resurrection cycle.
-
-## The Trap
-
-The failure mode observed on 2026-04-23 (alpha session 58) was:
-
-1. Sub-skill /reflect finished its work and emitted a terminal Bash echo (correct — sub-skill case).
-2. Orchestrator resumed, ran the four iteration-close phases successfully.
-3. Orchestrator then produced a friendly text summary of what happened.
-4. Orchestrator emitted a terminal Bash echo to "comply" with this rule.
-5. **Turn ended.** No `Skill(aspirations)` call was made.
-6. The Stop hook did not log a BLOCK for the runner SID — investigation
-   (2026-04-24) against 1151 BLOCK entries for `agent=alpha` found zero
-   entries for the active runner SID, indicating Claude Code does not fire
-   the Stop event reliably when a turn ends with a text message and no
-   pending tool call. The Stop hook therefore cannot be relied on as the
-   sole enforcement layer for this contract.
-7. Loop died silently — `agent-state` stayed `RUNNING`, `running-session-id`
-   stayed set, but no new turn fired until the user sent a message.
-
-Root cause: the previous version of this rule said only "terminate with Bash, not
-text" — which made the Bash echo feel like the correct terminal action even at
-iteration close. It was not. Bash is the sub-skill terminal; `Skill(aspirations)`
-is the orchestrator terminal. Conflating them kills the loop.
+**Re-arm FIRST on resurrection AND on an autocompact resume (rb-4345 /
+g-115-2771 / g-115-5834).** The deadman is a SINGLE replace-slot wakeup — firing
+CONSUMES it, so a resurrected turn starts with NO net; and a
+`SessionStart:compact` resume that re-enters the loop MID-iteration emits no
+terminal pair at all, so it runs the whole iteration on whatever net existed —
+none, if the compaction landed before any close. Both have produced multi-hour
+silent deaths (7h 2026-07-19; 7h47m 2026-08-11 — a pending net is NOT
+excluded: clamp≠delivery, 17.1h max, g-115-6629). **RULE: on a
+`<<autonomous-loop-dynamic>>` firing or an autocompact resume that re-enters the
+loop mid-iteration, the FIRST tool call of that turn is a
+`ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>", delaySeconds=600)`
+re-arm** — restore the net BEFORE any work that might fail, then proceed with
+the normal loop entry (Phase -1.5 onward). The iteration's later terminal-pair
+re-arm is harmless (replace-slot semantics make a double-arm a no-op).
 
 ## Required SKILL.md section
 
@@ -135,48 +114,16 @@ Before the final tool call of any turn, ask:
   `stop-loop`, or `pending-agents` is set. A terminal text paragraph without a
   tool call triggers the hook regardless of autocompact status.
 
-## Verification
+## Verification and enforcement (summary)
 
-`/verify-learning` enforces (1) with a dynamic grep: it iterates every
-`.claude/skills/*/SKILL.md`, skips the exempt list above, and fails on any
-remaining file that lacks `## Return Protocol`. New forged skills inherit the
-requirement via the `.claude/skills/forge-skill` template (Step 3). The exempt
-list is the single source of truth for (1) — edit it in
-`.claude/skills/verify-learning/SKILL.md` if a genuinely new user-only skill
-is added.
-
-The orchestrator-vs-sub-skill split in rules (2) and (3) is enforced at
-runtime by `core/scripts/iteration-close.sh` and `core/scripts/recurring-close.sh`,
-which now print an explicit imperative as the terminal line of their stdout:
-```
-[iteration-close] ═══ ITERATION COMPLETE ═══
-[iteration-close] NEXT ACTION REQUIRED: Call Skill(aspirations) with args='loop' as your VERY NEXT tool call.
-```
-Emitted from the final line of `do_productivity_check()` in iteration-close.sh
-and the final line of recurring-close.sh. The Stop hook
-(`core/scripts/stop-hook.sh`) reads `iteration-checkpoint.json` at BLOCK time
-and restates the phase-specific required next action in its decision payload.
-
-## Layered Defense When Combined With Explanatory Output Style
-
-The Explanatory output style mandates trailing `✶ Insight ─────` blocks
-"before AND after writing code." That mandate collides with rule (2) above:
-the trailing insight makes prose, not the tool, the last content of the
-message, and the turn ends. Four screenshot-evidenced silent loop deaths on
-2026-04-29 (rb-629, guard-454) all matched this shape.
-
-The combination has four enforcement layers — the same pattern documented
-under `capability-routing-enforcement` for honor-system rules:
-
-| Layer | Defense | Artifact |
-|-------|---------|----------|
-| **A** — tactical (LLM remembers) | This rule + the tree node below | `.claude/rules/return-protocol.md`, `world/knowledge/tree/system/system-constraints-loop/return-protocol-vs-explanatory-style.md` |
-| **B** — automated gate | `/start` refuses mode=autonomous + Explanatory style at session entry | `world/scripts/output-style-mode-guard.sh` (Layer-B gate, exit 2 refused / 3 override+audit) |
-| **C** — preventive observability | Stop hook flags trailing-text patterns post-hoc with specific diagnostic | `world/scripts/trailing-text-detector.py` (4 sub-patterns: insight_block HIGH, phase_summary HIGH, next_step_narration MEDIUM, trailing_prose LOW) |
-| **D** — recurring audit | 24h transcript scan via the detector, files Investigate on hit | `g-115-315` (recurring under asp-115, interval 24h) |
-
-Wiring goals: `g-115-316` (HIGH, Idea — Layer-B into /start Phase 0.6),
-`g-115-317` (MEDIUM, Idea — Layer-C into stop-hook.sh).
-
-See `world/knowledge/tree/system/system-constraints-loop/return-protocol-vs-explanatory-style.md`
-for the full incident shape, decision procedure, and diagnostic signature.
+`/verify-learning` enforces the `## Return Protocol` section requirement with a
+dynamic grep over every SKILL.md minus the exempt list above (edit the exempt
+list in `.claude/skills/verify-learning/SKILL.md` if a genuinely new user-only
+skill is added). At runtime `iteration-close.sh` / `recurring-close.sh` print
+the `═══ ITERATION COMPLETE ═══` + `NEXT ACTION REQUIRED: Call Skill(aspirations)
+with args='loop'` imperative as their terminal line, and the Stop hook restates
+the phase-specific next action at BLOCK time. Against the Explanatory-style
+collision (trailing `✶ Insight` blocks — four silent deaths on 2026-04-29,
+rb-629, guard-454) there are four layers (A this rule + tree node, B `/start`
+refuses autonomous+Explanatory, C the trailing-text detector, D a 24h
+transcript audit) — table and wiring in the convention.

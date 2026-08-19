@@ -13,10 +13,27 @@
 # Detection model (the non-obvious part):
 #   A re-added `python3 .../scripts/X.py <subcmd>` line is SYNTACTICALLY
 #   identical in a re-introduced daemon fallback and in a legitimate pure-CLI
-#   wrapper. The discriminator is `rt_call`: the 35 daemon-aware wrappers call
-#   rt_call and MUST be daemon-only; the ~280 pure-CLI wrappers have no
-#   rt_call and legitimately exec python. So a python-script invocation is a
+#   wrapper. The discriminator is `rt_call`: a daemon-aware wrapper calls
+#   rt_call and MUST be daemon-only; a pure-CLI wrapper has no rt_call and
+#   legitimately execs python. So a python-script invocation is a
 #   regression ONLY inside a file that also contains rt_call.
+#   Scale, re-measured 2026-08-17 ( sweep): 116 of 551 core/scripts/*.sh
+#   are in scope. This comment previously read "35 daemon-aware / ~280 pure-CLI"
+#   — stale by 3.3x, flagged by a prior sweep that judged it out of scope to fix.
+#   The DENOMINATOR moved 502 -> 551 in six days while the NUMERATOR held at
+#   exactly 116: 49 new wrappers, none of them daemon-aware. That is not a
+#   regression this gate detects (it watches for fallbacks coming BACK), but it
+#   does say the daemon-only surface is static while the wrapper corpus grows.
+#   Counts are DESCRIPTIVE only: scan() computes membership per-file at run time,
+#   so behaviour never depended on them. Re-derive rather than trust a number here.
+#
+#   WHICH grep IS THE MEMBERSHIP TEST — the easy thing to get wrong, and a prior
+#   sweep did: it is the BARE `grep -Eq 'rt_call' "$f"` at scan()'s rt_call branch,
+#   over the WHOLE file, which yields 116. The comment-stripping just above it
+#   applies to $body/$code — the candidate lines judged for a python invocation —
+#   NOT to membership. So "files carrying a NON-COMMENT rt_call" (114 here) is a
+#   different, narrower set than the one this script actually gates on, and the
+#   2-file gap is exactly the files that only MENTION rt_call in a comment.
 #   `_fallback_exec` and the `python3 -m core.scripts.` module form are
 #   unambiguous regressions anywhere in core/scripts/*.sh.
 #

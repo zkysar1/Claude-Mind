@@ -18,10 +18,66 @@
 # POSIX perms), so they are re-applied per machine and are intentionally OUT of
 # this git-regression scope.
 #
-# Consumed by: /verify-learning (see core/config/verification-checklist.md).
+# TWO MODES, MEASURING DIFFERENT THINGS — both are needed ():
+#
+#   (default)  FILESYSTEM scan: is this file executable ON THIS BOX RIGHT NOW.
+#              Answers "will a direct-exec chain work here". Consumed by
+#              /verify-learning.
+#   --staged   GIT INDEX scan of staged *.sh: what mode is about to be
+#              COMMITTED. Answers "will this file be executable on every OTHER
+#              box". Consumed by the pre-commit hook (Gate 13).
+#
+# The distinction is the whole point and the filesystem check CANNOT stand in
+# for the index check. What propagates fleet-wide is the mode git records, and
+# the two diverge exactly where this bug lives: on a clone with
+# `core.filemode=false` (the default git picks on Windows, and this repo was
+# authored on Windows) a `chmod +x` never reaches the index, so the filesystem
+# reports executable while the commit carries 100644. The filesystem gate then
+# passes on the box that introduces the defect, and the breakage surfaces on a
+# Linux checkout — which is precisely the  incident above, and
+# precisely the case a pre-commit gate exists to stop at the source.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"  # core/scripts
+
+if [[ "${1:-}" == "--staged" ]]; then
+    # Index modes for staged core/scripts *.sh. Ask git for the PATHS and then
+    # ask git for each path's MODE — never hand-parse `--raw`.
+    #
+    # WHY NOT --raw (measured, and this shipped wrong once): rename detection is
+    # ON BY DEFAULT, so a rename inside core/scripts emits
+    # ":100755 100644 <sha> <sha> R100\t<old>\t<new>" — TWO tabs. An awk that
+    # strips to the FIRST tab then reports "<old>\t<new>" as the path and names
+    # the OLD path, which no longer exists, so the "chmod +x <file>" fix line is
+    # unrunnable. The bug hid because the obvious test moves a file INTO
+    # core/scripts from outside the pathspec, which git renders as a plain add
+    # with ONE tab (guard-920: replicate the literal production shape, not a
+    # convenient one; guard-1083: never write a parsing pipe against an output
+    # shape you have not looked at).
+    #
+    # --name-only yields exactly the NEW path for a rename, one per line;
+    # --diff-filter=d drops deletions (no mode to gate); core.quotePath=false
+    # keeps non-ASCII paths literal instead of C-quoted.
+    bad=""
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        mode="$(git ls-files -s -- "$p" 2>/dev/null | awk '{print $1; exit}')"
+        [ -n "$mode" ] || continue
+        [ "$mode" = "100755" ] || bad="${bad}${mode}  ${p}"$'\n'
+    done < <(git -c core.quotePath=false diff --cached --name-only --diff-filter=d \
+                 -- 'core/scripts/*.sh' 2>/dev/null)
+    bad="$(printf '%s' "$bad" | sed '/^$/d' | sort)"
+    if [[ -n "$bad" ]]; then
+        echo "FAIL: staged core/scripts *.sh with a non-executable mode in the INDEX —" >&2
+        echo "      they will land at 100644 and break direct-exec chains on every Linux checkout:" >&2
+        printf '%s\n' "$bad" | sed 's/^/  /' >&2
+        echo "Fix: chmod +x <file> && git add <file>" >&2
+        echo "     (if the mode will not stick: git config core.filemode true, or" >&2
+        echo "      git update-index --chmod=+x <file> to set it in the index directly)" >&2
+        exit 1
+    fi
+    exit 0
+fi
 
 missing="$(find "$SCRIPT_DIR" -name '*.sh' -type f ! -perm -u+x 2>/dev/null | sort)"
 

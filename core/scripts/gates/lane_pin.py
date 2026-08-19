@@ -65,6 +65,7 @@ and never raises.
 """
 from __future__ import annotations
 
+import datetime
 import re
 from pathlib import Path
 from typing import Optional
@@ -119,6 +120,31 @@ _GENERIC = frozenset({
 })
 
 _WORD_RE = re.compile(r"[a-z0-9][a-z0-9\-/+_.]*")
+
+# Metadata columns, read by HEADER NAME rather than by position.
+#
+# `expires` was read as `cells[6]` from the day this module shipped, and nothing
+# anywhere in the tree ever read the parsed value -- a dead field ().
+# `review_by` is read by name instead, and `expires` is moved onto the same path,
+# because a positional read is invisible to the person who inserts a column in
+# the middle of the registry table: both fields would silently start reading
+# their neighbour's text, with no error and no test failure. Fail-open in the
+# module's posture -- a missing header row or a missing column yields "", and the
+# feature simply does not fire.
+_METADATA_COLUMNS = ("granted", "expires", "review_by")
+
+
+def _norm_header(cell: str) -> str:
+    """Header cell -> canonical column key ('Review By' -> 'review_by').
+
+    Deliberately NOT `_strip_markdown`: that strips `_` as emphasis, so the
+    header `review_by` normalized to `reviewby` and the column silently read
+    empty while its neighbours parsed fine (caught by round-tripping the live
+    registry, g-115-5901). Only `*` and backtick are emphasis here; every other
+    non-alphanumeric run collapses to `_`, so `Review By`, `review-by` and
+    `review_by` all land on the same key.
+    """
+    return re.sub(r"[^a-z0-9]+", "_", _norm(re.sub(r"[*`]+", "", cell or ""))).strip("_")
 
 
 def _norm(text) -> str:
@@ -225,6 +251,7 @@ def parse_pins(text: str):
         nxt = _NEXT_HEADING_RE.search(section)
         if nxt:
             section = section[:nxt.start()]
+        header = []
         for line in section.splitlines():
             line = line.strip()
             if not line.startswith("|") or not line.endswith("|"):
@@ -235,6 +262,8 @@ def parse_pins(text: str):
             pin_id = _strip_markdown(cells[0]).strip()
             # Skip the header row and the |----|----| separator.
             if not pin_id or pin_id.lower() == "id" or set(pin_id) <= set("-: "):
+                if pin_id.lower() == "id":
+                    header = [_norm_header(c) for c in cells]
                 continue
             agent = _norm(_strip_markdown(cells[1]))
             if not agent:
@@ -249,18 +278,84 @@ def parse_pins(text: str):
             out_phrases, out_tokens = _build_matcher(out_cell, exclude)
             # A token in BOTH columns discriminates nothing — drop it from both.
             shared = in_tokens & out_tokens
-            pins.append({
+            pin = {
                 "id": pin_id,
                 "agent": agent,
                 "in_phrases": in_phrases,
                 "out_phrases": out_phrases,
                 "in_tokens": (in_tokens - shared) - _GENERIC,
                 "out_tokens": (out_tokens - shared) - _GENERIC,
-                "expires": _norm(cells[6]) if len(cells) > 6 else "",
-            })
+            }
+            for col in _METADATA_COLUMNS:
+                idx = header.index(col) if col in header else -1
+                pin[col] = _norm(cells[idx]) if 0 <= idx < len(cells) else ""
+            pins.append(pin)
     except Exception:
         return []
     return pins
+
+
+_ISO_DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+
+
+def _as_date(cell) -> Optional[datetime.date]:
+    """First ISO date inside a cell, or None. Prose around it is fine."""
+    m = _ISO_DATE_RE.search(cell or "")
+    if not m:
+        return None
+    try:
+        return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+
+
+def review_status(pin: dict, today=None) -> Optional[dict]:
+    """Is this pin PAST its review_by date? None when it is not, or cannot say.
+
+    THE PIN IS NEVER WEAKENED BY THIS, AND `evaluate` DELIBERATELY DOES NOT CALL
+    IT. A hard expiry would silently hand an agent back a work surface the user
+    took away on purpose — a lapsed review date is evidence that nobody has
+    looked lately, which is the opposite of evidence that the constraint should
+    end. So a lapsed `review_by` changes exactly one thing: the pin starts SAYING
+    SO at startup, and keeps saying so until a human confirms or retires it. Only
+    the user retires a pin, by deleting the row.
+
+    Returning None on an absent/unparseable date is the fail-open direction that
+    matches the rest of this module: a registry that cannot be read must never
+    manufacture a prompt, because a prompt nobody can act on trains the reader to
+    scroll past the ones that matter.
+    """
+    try:
+        if not isinstance(pin, dict):
+            return None
+        due = _as_date(pin.get("review_by"))
+        if due is None:
+            return None
+        today = today or datetime.date.today()
+        if isinstance(today, str):
+            today = _as_date(today)
+            if today is None:
+                return None
+        if today <= due:
+            return None
+        granted = _as_date(pin.get("granted"))
+        days_since_grant = (today - granted).days if granted else None
+        age = ("granted %d days ago" % days_since_grant if days_since_grant is not None
+               else "grant date not recorded")
+        return {
+            "pin_id": pin.get("id", ""),
+            "agent": pin.get("agent", ""),
+            "review_by": due.isoformat(),
+            "granted": granted.isoformat() if granted else "",
+            "days_overdue": (today - due).days,
+            "days_since_grant": days_since_grant,
+            "message": (
+                "%s is past review_by (%s, %d days ago), %s, STILL ENFORCED — "
+                "confirm or retire." % (pin.get("id", "pin"), due.isoformat(),
+                                        (today - due).days, age)),
+        }
+    except Exception:
+        return None
 
 
 def _goal_text(goal: dict) -> str:

@@ -173,6 +173,64 @@ gates:
     tuning_notes: "INVERSION. Tighten patterns: 'approve' alone is not enough; need 'approve' AND deploy/commit/push together."
     retirement_eligible: false
 
+  # Registered 2026-08-16 (alpha fresh-eyes): the id had been logged to
+  # meta/gate-firings.jsonl since 2026-08-15 by /notify-user Step 1.5b ()
+  # and, from 2026-08-16, by inbox-alert-age-check.py — with no row here, so its
+  # firings were keyed to an id the registry did not know. Pure decide() in
+  # core/scripts/notification_routing_gate.py; policy in
+  # world/conventions/notification-routing.md.
+  - id: notify-user-routing-gate
+    script: core/scripts/notification_routing_gate.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: "core/scripts/notify_dispatch.py", phase: "dispatch() step 1 (framework chokepoint -- every sender, incl. direct email-send.sh callers re-entered via the world transport)" }
+      - { file: ".claude/skills/notify-user/SKILL.md", phase: "Step 1.5b (delegates to notify-user.sh)" }
+      - { file: "core/scripts/inbox-alert-age-check.py", phase: "_send_email (pre-send routing)" }
+      #  swept the direct callers that never entered Step 1.5b.
+      - { file: "core/scripts/evolution-complete.py", phase: "_email_user (per-event category)" }
+      - { file: "core/scripts/meta-backpressure.py", phase: "_email_rollback" }
+      - { file: "core/scripts/stop-reason-record.py", phase: "_send_notification" }
+      - { file: "world/scripts/billing-accuracy-guard.sh", phase: "alert (human-only override)" }
+      - { file: "world/scripts/daily-cost-report.sh", phase: "send (user-digest)" }
+      - { file: "world/scripts/processor-run.sh", phase: "run-complete (suppresses + breadcrumb)" }
+      # Explicit NON-sites, recorded so a future sweep does not "complete the
+      # wiring" and break them:
+      #   core/scripts/user-blocker-escalation-check.py — carries explicit
+      #     recorded categories instead; its all-clear is `info`, which this
+      #     gate would SUPPRESS, and that send is user-requested (D3).
+      #   .claude/skills/aspirations-consolidate/SKILL.md — routes through the
+      #     notify-user forged skill, so it is covered by Step 1.5b above.
+    dominant_risk: FP
+    asymmetry_magnitude: high
+    keyword_bias: strict
+    override_flag: null
+    fp_cost: high
+    fn_cost: low
+    fp_description: "A notification the user genuinely needs (decision-needed, human-only blocker) suppressed as fleet-handleable; the fleet-side destination (board/goal) is the only trace."
+    fn_description: "A fleet-handleable status/completion/update email reaches the user; one more email he asked not to get."
+    rb_evidence: ["rb-7986"]
+    tuning_notes: "INVERTED fail-safe: unknown category -> SEND. Suppression classes are keyed to the existing HUMAN_ONLY_PATTERNS SSOT; every SUPPRESS returns a destination (never null). Since 2026-08-17 the gate runs inside core/scripts/notify_dispatch.py, the framework chokepoint every sender passes through (a direct email-send.sh call re-enters it), so the g-115-6422 bypass class is closed structurally."
+    retirement_eligible: false
+  - id: notify-user-outreach-gate
+    script: core/scripts/notification_outreach.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: "core/scripts/notify_dispatch.py", phase: "dispatch() step 2 (prior-outreach dedup, fleet-wide ledger world/notifications-sent.jsonl + peer user-outreach board mirrors)" }
+      - { file: ".claude/skills/notify-user/SKILL.md", phase: "Step 1.7" }
+    dominant_risk: FP
+    asymmetry_magnitude: medium
+    keyword_bias: fuzzy
+    override_flag: "--allow-duplicate '<what is new>' / EMAIL_SEND_ALLOW_DUPLICATE"
+    fp_cost: medium
+    fn_cost: medium
+    fp_description: "A genuinely new message on a recurring topic refused as a duplicate; the refusal prints the prior rows and the override records what is new, so the cost is one re-run."
+    fn_description: "The user receives the same question again from another agent or another world -- the 2026-08-16 complaint verbatim."
+    rb_evidence: ["rb-7986", "rb-8085"]
+    tuning_notes: "Windows: blocker 24h, else 7d. Match: normalized subject == | subject Jaccard>=0.6 | shared goal/guard/pq ids | body Jaccard>=0.7 -- but two messages that each name ids and share NONE never match on body shape (two outages are two topics). Suppressions are recorded, never dropped."
+    retirement_eligible: false
+
   - id: cargo-cult-detector
     script: core/scripts/cargo-cult-detector.py
     embedded: false
@@ -674,6 +732,42 @@ gates:
     tuning_notes: "Instrumented g-115-3148. Was ALREADY enforcing at the call site since it shipped (iteration-close.sh:912 exits 1) — the 'arm it' step that goal was filed for had no work in it. What was missing was OBSERVABILITY: with no _gate_log, the only trace was world/phase-4-26-overrides.jsonl, which records overridden blocks and NOTHING else, so blocks that STOOD and every pass were invisible and the pass/block split was unmeasurable. Note also the gate fires in do_state_update, which is AFTER do_verify writes status=completed — it halts the close-out, it does not prevent completion. Measured baseline before instrumentation (2026-08-01): 25 overridden blocks over 98 days, all 5 agents, 25 distinct goals, by method infer 20 / all_unknown 4 / all_noise 1; 24 of the 25 fall on or after 2026-07-25, the day g-115-3113/3123 made the predicate reachable — dated correlation, not a verified per-row cause. Do NOT tune from override VOLUME alone: several of those rows are the foreclosed-remedy FP above, not genuine no-signal closes. Use gate-stats.sh --gate phase-4-26-gate once firings accumulate, and fix the remedy reachability (g-115-3173) before reading the FP ratio as a tuning signal."
     retirement_eligible: false
 
+  - id: fresh-eyes-dispatch-observation
+    script: .claude/skills/aspirations-precheck/SKILL.md
+    embedded: true
+    instrumented: true
+    sites:
+      - { file: ".claude/skills/aspirations-precheck/SKILL.md", phase: "Phase 0-pre3 (fresh-eyes dispatch, beside the fresh_eyes_last_dispatch stamp)" }
+    dominant_risk: FN
+    asymmetry_magnitude: high
+    keyword_bias: balanced
+    override_flag: null
+    fp_cost: low
+    fn_cost: high
+    fp_description: "There is effectively no FP: this gate never blocks and never advises. A spurious row costs one spooled local append and one line of telemetry, and a wrong `merged_payloads` value is self-describing in the row."
+    fn_description: "A dispatch goes unrecorded, and g-115-4254's pooled sample cannot fill. That is not hypothetical: the hypothesis accumulated ZERO observations in the 8 days after filing, while dispatches were demonstrably happening, because merged_payloads reached no durable store at all."
+    rb_evidence: []
+    tuning_notes: "TELEMETRY-ONLY, not an enforcement gate -- it emits one `pass` row per DISPATCH and never blocks, so `keyword_bias` is inert here (there is no keyword matching to tune) and `balanced` is recorded rather than `generous` specifically to keep it out of gate-retirement-eval's FN-dominant keyword-widening branch. Registered under g-115-5323 so gate-retirement-eval can see the firings at all (_gate_log.log docstring: an unregistered gate_id is invisible to the evaluator). WHY THE DISPATCH SIDE AND NOT THE WRITE SIDE -- the observation unit is a dispatch, and two sentinel writes that MERGE produce only one dispatch, so instrumenting iteration-close's write point would inflate the denominator. There is a second, independent reason the write side is wrong: merged_payloads is computed only in fresh-eyes-sentinel-merge.py, which runs ONLY when an unconsumed payload already exists, so a merge-side probe would record 100% merged and never see the unmerged case the hypothesis needs as its baseline. WHY ONLY THE DISPATCH BRANCH IS LOGGED (deliberate, against guard-502's every-branch default) -- the no-dispatch case fires on every precheck iteration, so logging it would be a per-close append; the observation unit is the dispatch, and the merged/unmerged split is read off `extra.merged_payloads` (absent or 1 = unmerged, >=2 = merged), so noop rows carry no information the sample needs. RETIREMENT CRITERION AT BIRTH (guard-769) -- this gate exists to feed one starved hypothesis. Retire it once g-115-4254 has resolved on >=10 pooled non-null observations, OR once gate-stats.sh shows >=10 rows with a non-null `extra.merged_payloads` spread across >=2 agents and no open hypothesis consuming them. It is NOT load-bearing for any enforcement path, so retirement costs nothing but the sample."
+    retirement_eligible: true
+
+  - id: worker-ref-report-check
+    script: core/scripts/iteration-close.sh
+    embedded: true
+    instrumented: true
+    sites:
+      - { file: "core/scripts/iteration-close.sh", phase: "worker-ref report cadence (do_productivity_check, beside WR_MARKER)" }
+    dominant_risk: FN
+    asymmetry_magnitude: high
+    keyword_bias: balanced
+    override_flag: null
+    fp_cost: low
+    fn_cost: high
+    fp_description: "No FP path: this is failure-only telemetry. A spurious row costs one spooled append and is self-describing."
+    fn_description: "A failed/timed-out worker-ref --check leaves stranded-ref visibility un-refreshed with the cadence marker ALREADY advanced (touch-first thrash protection), and the only trace was a stderr WARN that guard-772 shows is invisible on backgrounded runs — the exact dark path g-306-287 F-001 measured. Worker-authored product work can strand silently behind it (live case: g-326-187 reached a reducer only via scorer rank, not via any instrument)."
+    rb_evidence: []
+    tuning_notes: "TELEMETRY-ONLY, failure-only (decision=fail_open, emitted from the || branch of the worker-ref-consume --check invocation; clean passes log nothing — own-cloud append cost, same posture as the pre-commit suite BLOCK-only telemetry). Registered so the rows are visible to gate-retirement-eval at all (_gate_log.log docstring: an unregistered gate_id is invisible to the evaluator). Keyword fields are inert — there is no keyword matching here; `balanced` keeps it out of the FN-dominant keyword-widening branch. RETIREMENT CRITERION AT BIRTH (guard-769): retire when the touch-after-success alternative lands (making the failure self-retrying) OR when 30 days of firings show zero rows while worker Bodies are demonstrably active — either means the dark path is closed or never taken."
+    retirement_eligible: true
+
 # ─── Gates discovered in core/scripts/ but not in the Session-56 audit.
 # These need their own asymmetry analysis before tuning. Listed here so the
 # audit dashboard knows they exist and can prompt for the missing data.
@@ -719,3 +813,8 @@ pending_audit:
   - check-no-hardcoded-secrets.sh       # Gate 8 — secret-content scanner; security class, NEVER count-retire
   - session-manifest-gate.sh            # Gate 9 — sync_tier completeness (conditional: manifest staged)
   - check-no-ownership-flag.sh          # Gate 11 — OWNERSHIP_MODE reintro (g-115-1737)
+  # commit-msg hook (core/githooks/commit-msg) — same _gate wrapper, same
+  # block-only telemetry. Lives in commit-msg because its bypass is a
+  # commit-message trailer, which pre-commit runs too early to see.
+  - hot-path-size-gate.py               # Gate M1 — hot-path prose may not grow past HEAD (g-115-6470); overrides -> world/override-bypass-ledger.jsonl
+  - goal-claim-commit-gate.py           # Gate M2 — commit names a goal another SESSION holds live (g-115-6689 follow-through); backstop for chat work that never calls claim(); overrides -> world/override-bypass-ledger.jsonl

@@ -22,7 +22,7 @@ days=1
 emit_json=false
 while [ $# -gt 0 ]; do
   case "$1" in
-    --days) days="$2"; shift 2 ;;
+    --days) days="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
     --json) emit_json=true; shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac

@@ -79,7 +79,48 @@ _STAGED_BASELINE_SUFFIX = "-wm-baseline.yaml"
 _STAGED_HASH_SUFFIX = "-wm.hash"
 
 VALID_ROLES = ("reducer", "worker", "observer")
-VALID_STATES = ("active", "closed-pending-merge", "merged", "closed-stale")
+# : `parked` is a RESUMABLE state and is deliberately NOT a close.
+# A worker winds down when its reducer is gone (worker-loop Phase 0.5 rc=1),
+# because executing with no merger accumulates work nobody will ever merge. That
+# DECISION is correct; its terminality was the defect — the reducer returned and
+# the worker stayed closed, because reopening needs a user-only /start.
+#
+# WHY IT IS A STATE AND NOT A SENTINEL. A park spans many turns (hourly re-poll,
+# capped at PARK_MAX_HOURS), and every sentinel in this file is CONSUMED by the
+# first handler that reads it — which is exactly why the stop-hook needed its
+# 4th safety valve to read body_state rather than the vanished `body-closing`.
+# A park needs the durable record for the same reason.
+#
+# WHERE IT MUST *NOT* APPEAR, and both are load-bearing:
+#   - body-merge.generalize_down enumerates `closed-pending-merge` ONLY, so a
+#     parked Body is never consumed. That is automatic, not a special case, and
+#     it is the property that makes parking safe (see park_body).
+#   - the stop-hook's closed-state grep. `parked` matching there would stand the
+#     worker-net down as though the Body were finished; it gets its own valve.
+VALID_STATES = ("active", "parked", "closed-pending-merge", "merged",
+                "closed-stale")
+# The park's own upper bound. A reducer absent this long is a human matter and
+# the wind-down board post already went out, so the Body closes durably for real.
+PARK_MAX_HOURS = 60.0
+
+# THE PARTITION, NAMED ONCE (). Before `parked` existed every non-active
+# state was terminal, so `!= "active"` and "is closed" were the same predicate and
+# the codebase used them interchangeably — in body-manifest, in worker-loop's
+# Phase -0 gate, in the deadman resurrection prompt, and in the stop-hook
+# worker-net. Adding one resumable non-active state turned each of those into a
+# different bug, and they are not the same bug: the gate REFUSED work, the prompt
+# WEDGED with no wakeup left, the hook would have CLOSED the Body, and
+# close_body_on_genuine would have consumed the sentinel while staging NOTHING —
+# leaving an expired park permanently unclosed with its WM stranded.
+#
+# So the partition is declared here rather than re-derived at each site. A future
+# state joins exactly one of these two tuples and every consumer inherits the
+# right answer.
+#
+# CLOSEABLE, not "active": a park is a live Body that may legitimately be closed
+# (its cap expired, or a user stopped it) and MUST stage its WM when that happens.
+CLOSEABLE_STATES = ("active", "parked")
+CLOSED_STATES = ("closed-pending-merge", "merged", "closed-stale")
 # -a: the ONLY accepted --reducer-sid value. Not a SID and never one —
 # a cross-box reducer's SID cannot be read from this machine (running-session-id
 # is machine_local; the DDB claim stores a runner-token, not a SID). Rejecting
@@ -389,6 +430,43 @@ def read_manifest(sid: str, agent: str, project_root: Path | None = None) -> dic
     return data or {}
 
 
+def _mirror_state_to_carrier(sid: str, agent: str, new_state: str,
+                             project_root: Path | None = None) -> None:
+    """Mirror body_state into the SYNCABLE per-Body heartbeat carrier ().
+
+    THIS WRITE IS WHAT KEEPS THE PEER-SIDE STALL PROBE FROM FLOODING, and it is
+    the half that is easy to omit. heartbeat-tick.sh stamps the state on every
+    tick, so a LIVE Body's carrier is current -- but a Body's last tick happens
+    BEFORE its close, so without this mirror a cleanly-closed Body leaves a
+    carrier still reading `active`. It then goes stale holding no claim, and
+    worker_stall.classify_body -- correctly, on the evidence it has -- calls
+    that a stall. Every clean close would become a false alert, which is the
+    exact flood the split exists to prevent. The two writers ship together or
+    neither ships.
+
+    Fail-open by contract, and narrowly (guard-373): a carrier that is absent,
+    unreadable, or not a JSON object leaves the field alone. The reader renders
+    a missing/stale state as `stale_state_unknown`, which never alerts, so a
+    failure here degrades to today's behaviour rather than to a false alarm. A
+    close must never fail because a diagnostic mirror could not be written.
+    """
+    try:
+        _, _, state_dir = _agent_paths(agent, sid, project_root)
+        carrier = state_dir / f"body-heartbeat-{sid}.json"
+        if not carrier.is_file():
+            return
+        doc = json.loads(carrier.read_text(encoding="utf-8"))
+        if not isinstance(doc, dict):
+            return
+        doc["body_state"] = new_state
+        _write_atomic(carrier, json.dumps(doc) + "\n")
+    except (OSError, ValueError, TypeError):
+        # json.JSONDecodeError subclasses ValueError; FileNotFoundError
+        # subclasses OSError. Narrow on purpose -- a NameError or AttributeError
+        # here is a logic bug and must not be swallowed as a benign skip.
+        return
+
+
 def set_state(sid: str, agent: str, new_state: str,
               project_root: Path | None = None) -> Path:
     """Mutate body_state in place (preserving every other field). Returns path."""
@@ -400,7 +478,113 @@ def set_state(sid: str, agent: str, new_state: str,
     _, session_dir, _ = _agent_paths(agent, sid, project_root)
     manifest_path = session_dir / _MANIFEST_FILENAME
     _write_atomic(manifest_path, _render_manifest(data))
+    # AFTER the manifest write, never before: the manifest is the record of
+    # truth and the carrier is a mirror of it, so a crash between the two must
+    # leave a correct manifest with a stale mirror (benign -- the reader treats
+    # a state it cannot trust as unknown), never a carrier claiming a close the
+    # manifest never recorded.
+    _mirror_state_to_carrier(sid, agent, new_state, project_root)
     return manifest_path
+
+
+def park_body(sid: str, agent: str, project_root: Path | None = None) -> str:
+    """Park a worker Body whose reducer is gone. RESUMABLE — never a close.
+
+    Returns 'parked' (state transitioned, park clock started), 'already-parked'
+    (idempotent re-park; the ORIGINAL parked_at is preserved so the cap measures
+    the whole park, not the last re-poll), 'no-forked-wm' (not a worker), or
+    'not-active' (the Body is closed/merged — a close never becomes a park).
+
+    THE ONE THING THIS DELIBERATELY DOES NOT DO IS STAGE THE WM, and the goal's
+    own spec asked for the opposite ("the SAME durable handoff as today: board
+    post, staged WM, pushed ref"). Staging here would be actively destructive,
+    for the reason close_body_on_genuine's docstring already gives in its own
+    words: a Body queued for merge that then keeps working "loses turns 2+ of WM
+    divergence (the reducer merges + marks `merged`, then the worker keeps
+    diverging into a now-merged manifest that the sessions-pass never
+    revisits)". A parked Body is BY CONSTRUCTION one that intends to resume, so
+    staging it is that hazard by design rather than by accident.
+
+    It is also pointless, which is the cleaner argument: the trigger for parking
+    is that NO REDUCER EXISTS, so there is nothing to merge into for the whole
+    duration of the park. And when the reducer does return, the right outcome is
+    that this Body RESUMES (rc=0 -> resume_body) — not that its half-finished
+    session is consumed as final.
+
+    Divergence is not at risk in the meantime: if the box dies mid-park the
+    stale-binding path stages the WM exactly as it does for any abrupt end, and
+    if the park EXPIRES the caller runs the ordinary genuine-close path, which
+    stages and pushes through the single existing writer.
+    """
+    _, session_dir, _ = _agent_paths(agent, sid, project_root)
+    if not (session_dir / _WM_FILENAME).is_file():
+        return "no-forked-wm"
+    data = read_manifest(sid, agent, project_root)
+    state = data.get("body_state")
+    if state == "parked":
+        return "already-parked"
+    if state != "active":
+        return "not-active"
+    data["body_state"] = "parked"
+    data["parked_at"] = _now_iso_local()
+    _write_atomic(session_dir / _MANIFEST_FILENAME, _render_manifest(data))
+    # : this function writes the manifest directly rather than through
+    # set_state (it must set `parked_at` in the SAME atomic write), so it needs
+    # its own mirror -- a park is precisely the case that would otherwise
+    # false-alert. A parked Body may sit dormant for hours between re-polls, so
+    # a carrier left reading `active` goes stale and reads as a stall.
+    _mirror_state_to_carrier(sid, agent, "parked", project_root)
+    return "parked"
+
+
+def resume_body(sid: str, agent: str, project_root: Path | None = None) -> str:
+    """Return a parked Body to active. Returns 'resumed', 'not-parked', or
+    'no-forked-wm'.
+
+    `parked_at` is CLEARED on resume so a later re-park starts a fresh clock —
+    a Body that parked, resumed, and parked again has not been unattended for
+    the sum of both, and carrying the stale stamp would expire it early.
+    """
+    _, session_dir, _ = _agent_paths(agent, sid, project_root)
+    if not (session_dir / _WM_FILENAME).is_file():
+        return "no-forked-wm"
+    data = read_manifest(sid, agent, project_root)
+    if data.get("body_state") != "parked":
+        return "not-parked"
+    data["body_state"] = "active"
+    data.pop("parked_at", None)
+    _write_atomic(session_dir / _MANIFEST_FILENAME, _render_manifest(data))
+    # : same reason as park_body -- direct manifest write, so its own
+    # mirror. Leaving a resumed Body's carrier reading `parked` would suppress a
+    # genuine stall (the benign side of the split), which is the failure
+    # direction this whole change exists to close.
+    _mirror_state_to_carrier(sid, agent, "active", project_root)
+    return "resumed"
+
+
+def park_expired(sid: str, agent: str, project_root: Path | None = None,
+                 max_hours: float = PARK_MAX_HOURS) -> bool:
+    """True iff a parked Body has been parked longer than `max_hours`.
+
+    FAIL-SAFE TOWARD STAYING PARKED: a missing, empty, or unparseable
+    `parked_at` returns False. The alternative — treating an unreadable stamp as
+    expired — would durably close a Body on a field-format problem, and a wrong
+    close is the unrecoverable direction (Phase -0 then refuses every further
+    unit and only a user-only /start reopens it). A park that runs long is
+    visible on the board and costs nothing but an hourly poll.
+    """
+    data = read_manifest(sid, agent, project_root)
+    if data.get("body_state") != "parked":
+        return False
+    stamp = (data.get("parked_at") or "").strip()
+    if not stamp:
+        return False
+    try:
+        parked = datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%S")
+    except (ValueError, TypeError):
+        return False
+    elapsed = (datetime.datetime.now() - parked).total_seconds() / 3600.0
+    return elapsed > max_hours
 
 
 def _stage_and_push(session_dir: Path, state_dir: Path, data: dict) -> bool:
@@ -584,9 +768,17 @@ def close_body_on_genuine(sid: str, agent: str,
         # this Body at EVERY subsequent turn-end and never clears (-b).
         _unlink_quiet(sentinel)
         return "bad-manifest"
-    if data.get("body_state") != "active":
+    if data.get("body_state") not in CLOSEABLE_STATES:
         _unlink_quiet(sentinel)
         return "not-active"  # already closed/merged -> don't re-queue
+    # PARKED IS CLOSEABLE (), and this line is load-bearing rather than
+    # permissive. A park ends for real two ways — its 60h cap expires, or the user
+    # stops the box — and BOTH route here. Under the old `!= "active"` test this
+    # branch returned 'not-active', consuming the sentinel while staging nothing:
+    # the manifest would sit at `parked` forever with its divergent WM stranded,
+    # and the close would report as a benign no-op. `not-active` still means what
+    # it says (a Body already closed or merged must never be re-queued); it simply
+    # no longer means "not the string active".
     # FIX 1+2 (-b): a REMOTE Body's reducer lives on another box and
     # can never see this Body's sessions/<sid>/ dir (walk-pruned by
     # _EXCLUDE_DIRS), so marking alone strands the WM. Stage into session/
@@ -605,7 +797,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name in ("write", "read", "set-state", "is-reducer",
-                 "close-body-on-genuine", "push-staged"):
+                 "close-body-on-genuine", "push-staged",
+                 "park", "resume", "park-expired"):
         sp = sub.add_parser(name)
         sp.add_argument("--sid", required=True)
         sp.add_argument("--agent", required=True)
@@ -623,6 +816,8 @@ def main(argv=None):
                                  "from this machine and must never be passed")
         if name == "set-state":
             sp.add_argument("state", choices=VALID_STATES)
+        if name == "park-expired":
+            sp.add_argument("--max-hours", type=float, default=PARK_MAX_HOURS)
     args = parser.parse_args(argv)
 
     try:
@@ -638,6 +833,22 @@ def main(argv=None):
             print("true" if is_reducer(args.sid, args.agent) else "false")
         elif args.cmd == "close-body-on-genuine":
             print(close_body_on_genuine(args.sid, args.agent))
+        elif args.cmd == "park":
+            print(park_body(args.sid, args.agent))
+        elif args.cmd == "resume":
+            print(resume_body(args.sid, args.agent))
+        elif args.cmd == "park-expired":
+            # EXIT CODE, not stdout, is the contract — the caller is worker-loop
+            # pseudocode branching in bash. 0 = expired (stop re-parking, take
+            # the genuine close), 1 = not expired (keep parking). Text is for a
+            # human reading the transcript. Note this inverts the usual
+            # true-is-0 shell reading in the SAFE direction: any error path
+            # below returns 2/3, which is neither, so a broken probe never reads
+            # as "expired" and can never durably close a Body by accident.
+            expired = park_expired(args.sid, args.agent,
+                                   max_hours=args.max_hours)
+            print("expired" if expired else "not-expired")
+            return 0 if expired else 1
         elif args.cmd == "push-staged":
             # --sid IS the unitKey here. Used by cleanup-stale-bindings.sh's
             # crash-preserve path, which stages in bash and cannot reach the

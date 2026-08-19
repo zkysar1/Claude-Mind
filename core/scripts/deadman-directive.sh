@@ -160,9 +160,20 @@ DELAY=600
 # produced. The stop-hook stands down on the same manifest read
 # (gate=worker-net-body-closed), so the closed branch's text-free turn-end is
 # ALLOWed rather than trapped.
+#
+# `parked` IS RESUMABLE AND MUST NOT BE READ AS CLOSED (). The predicate
+# above is "anything other than active", written when the only non-active states
+# were terminal — so adding `parked` to VALID_STATES silently recruited this
+# prompt into wedging the exact Body the park exists to keep alive: it would
+# decline to resume AND decline to re-arm, which is a permanent stop with no
+# wakeup left, i.e. the durable close that  removed, reintroduced through
+# the net. Reachable whenever a park turn dies before arming its own 3600s poll,
+# leaving the previous unit's 600s net in the slot. So the branch is now an
+# explicit CLOSED-SET test, not a not-active test: a state this prompt has never
+# heard of resolves toward RESUMING (recoverable) rather than stopping dead.
 cat <<EOF
 [deadman] WORKER NET ARMED — your terminal response MUST be EXACTLY these TWO batched tool calls, in this order:
-  (1) ScheduleWakeup(prompt='Your worker Body loop may have stopped without reaching its terminal Skill(worker-loop) call. FIRST read agents/<agent>/sessions/<your-SID>/body-manifest.yaml — the DURABLE closure record (the body-closing sentinel is CONSUMED by the stop-hook on a genuine close, so its absence proves nothing). IF body_state is anything other than active (closed-pending-merge / merged / closed-stale), OR the body-closing sentinel EXISTS (a close is in flight): this Body closed deliberately — do NOT resume and do NOT re-arm; end the turn with a Bash echo saying so (the stop-hook stands down on the closed manifest). ONLY IF body_state is active: re-arm this same wakeup FIRST (natural-language prompt, delaySeconds=${DELAY}) so the net is restored before any work that could fail, then resume by calling Skill(worker-loop). NEVER call Skill(aspirations) — that is the reducer-only re-entry (guard-517/guard-463).', delaySeconds=${DELAY})
+  (1) ScheduleWakeup(prompt='Your worker Body loop may have stopped without reaching its terminal Skill(worker-loop) call. FIRST read agents/<agent>/sessions/<your-SID>/body-manifest.yaml — the DURABLE closure record (the body-closing sentinel is CONSUMED by the stop-hook on a genuine close, so its absence proves nothing). IF body_state is one of closed-pending-merge / merged / closed-stale, OR the body-closing sentinel EXISTS (a close is in flight): this Body closed deliberately — do NOT resume and do NOT re-arm; end the turn with a Bash echo saying so (the stop-hook stands down on the closed manifest). IF body_state is parked: this Body is PARKED awaiting a reducer, which is RESUMABLE and is NOT a close — re-arm this same wakeup FIRST at delaySeconds=3600, then resume by calling Skill(worker-loop) (its Phase 0.5 poll decides resume-or-re-park; do not decide that here). IF body_state is active, or is any value not named above: re-arm this same wakeup FIRST (natural-language prompt, delaySeconds=${DELAY}) so the net is restored before any work that could fail, then resume by calling Skill(worker-loop). NEVER call Skill(aspirations) — that is the reducer-only re-entry (guard-517/guard-463).', delaySeconds=${DELAY})
   (2) Skill(worker-loop) — the PRIMARY re-entry and the LAST call.
 Both calls, every work unit. Skill ALONE keeps THIS unit alive but leaves the NEXT one unprotected against a silent text-death.
 EOF

@@ -18,11 +18,28 @@ is appended as one JSONL line to meta/experiments/poignancy-ab-results.jsonl
 Usage:
   py -3 core/scripts/poignancy-ab-probe.py [--top-k N] [--synthetic] [--no-record]
 
-Today every reasoning-bank record's poignancy is null (the field was just
-introduced), so a real-data A/B is a trivial no-op: identical rankings, nothing
-hidden — itself a valid result. --synthetic assigns deterministic synthetic
-poignancy (1 + zlib.crc32(id) % 10) to every record so the A/B exercises the ON
-path and demonstrates the boost-only guarantee on a populated corpus.
+CORRECTED 2026-08-16 (g-115-6387). This docstring used to claim "today every
+reasoning-bank record's poignancy is null (the field was just introduced), so a
+real-data A/B is a trivial no-op". That was true when written and is now FALSE:
+measured on cc-07, 5,634 of 7,603 active records carry a real rating (74.1%,
+mean 6.82), and the tree lane is at 98.1% (1,379 of 1,406, mean 5.60). A real
+mode run is therefore a genuine A/B over a mostly-rated corpus, NOT a no-op —
+do not skip real mode on the strength of the old claim, and do not read a
+"nothing changed" result as confirmation of it.
+
+--synthetic assigns deterministic synthetic poignancy (1 + zlib.crc32(id) % 10)
+to every record. It remains useful for exercising the ON path against a corpus
+with 100% coverage and a uniform distribution, which real data does not have.
+
+WHAT THE UNRATED-RECORD FIELDS ARE FOR (added g-115-6387). `_poignancy_weight`
+used to map null to 1.0, which is the FLOOR of [min, max] rather than the mean —
+so an unrated record was not neutral, it was ranked as if it were the least
+significant thing in the corpus, and could never be promoted. This probe now
+reports `entered_null_poignancy` (an unrated record CAN now enter the top-k;
+under the old floor behaviour this was 0 at every k by construction) and
+`left_unrated_share` against `corpus_unrated_share` — a demotion share far above
+the corpus rate is the signature of that defect. `poignancy_weight_center` is
+recorded on every line so a reader can tell which regime produced it.
 """
 from __future__ import annotations
 
@@ -36,20 +53,28 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPT_DIR))
 
 import retrieve as R  # noqa: E402  (path set above)
+from _utilization_store import load_counters, utilization_of  # noqa: E402
 
 
-def _utilization_score(rec):
-    return (rec.get("utilization") or {}).get("utilization_score", 0) or 0
+def _utilization_score(rec, counters=None):
+    # Sidecar first, embedded second (). The corpus here is always
+    # reasoning-bank (R.RB_PATH), so the kind is fixed and the caller loads
+    # counters once rather than per record.
+    return (utilization_of(rec, counters) or {}).get("utilization_score", 0) or 0
 
 
-def _topk_ids(records, k):
+def _topk_ids(records, k, counters=None):
     """Sort a COPY via retrieve._sort_by_utility under the currently-cached
-    config, return the top-k ids (in ranked order)."""
-    ranked = R._sort_by_utility(list(records))
+    config, return the top-k ids (in ranked order).
+
+    `counters` is threaded through (g-358-05) so this probe ranks by the SAME
+    inputs production does. Without it the probe would validate a ranking the
+    live path no longer performs once the counter writer lands."""
+    ranked = R._sort_by_utility(list(records), counters)
     return [r.get("id") for r in ranked[:k]]
 
 
-def _run(records, k):
+def _run(records, k, counters=None):
     """Return (baseline_topk_ids, treatment_topk_ids) for the same corpus under
     flag-off then flag-on. Mutates the process-wide retrieval config cache and
     restores it."""
@@ -58,14 +83,14 @@ def _run(records, k):
     try:
         off = dict(base_cfg, poignancy_blend_enabled=False)
         R._RETRIEVAL_CFG_CACHE = off
-        baseline = _topk_ids(records, k)
+        baseline = _topk_ids(records, k, counters)
 
         on = dict(base_cfg, poignancy_blend_enabled=True)
         # Ensure the weight knobs are sane even if tree.yaml omitted them.
         on.setdefault("poignancy_weight_min", 1.0)
         on.setdefault("poignancy_weight_max", 1.5)
         R._RETRIEVAL_CFG_CACHE = on
-        treatment = _topk_ids(records, k)
+        treatment = _topk_ids(records, k, counters)
         return baseline, treatment
     finally:
         R._RETRIEVAL_CFG_CACHE = prev
@@ -91,7 +116,10 @@ def main(argv=None):
             r["poignancy"] = 1 + (zlib.crc32(key.encode("utf-8")) % 10)
 
     k = args.top_k
-    baseline, treatment = _run(records, k)
+    # Loaded ONCE here and reused by both the ranking and the displacement
+    # check below () — same store, so a second read would be waste.
+    _counters = load_counters("reasoning-bank", Path(R.RB_PATH).parent)
+    baseline, treatment = _run(records, k, _counters)
 
     base_set, treat_set = set(baseline), set(treatment)
     entered = sorted(treat_set - base_set)   # promoted into top-k by the blend
@@ -108,12 +136,21 @@ def main(argv=None):
     # caught during  development.
     max_factor = float(R._load_retrieval_config().get("poignancy_weight_max", 1.5))
     by_id = {r.get("id"): r for r in records}
-    entered_utils = [_utilization_score(by_id.get(rid, {})) for rid in entered]
+    entered_utils = [_utilization_score(by_id.get(rid, {}), _counters) for rid in entered]
     max_entered_util = max(entered_utils) if entered_utils else 0.0
     known_good_hidden = [
         rid for rid in left
-        if _utilization_score(by_id.get(rid, {})) > max_entered_util * max_factor
+        if _utilization_score(by_id.get(rid, {}), _counters) > max_entered_util * max_factor
     ]
+
+    # Unrated-record movement (). Computed from the poignancy the
+    # records actually carried AT RANKING TIME, so under --synthetic the set is
+    # empty by construction rather than reporting the pre-override state.
+    null_ids = {r.get("id") for r in records if r.get("poignancy") is None}
+    corpus_unrated_share = (len(null_ids) / len(records)) if records else 0.0
+    entered_null = sorted(rid for rid in entered if rid in null_ids)
+    left_null = sorted(rid for rid in left if rid in null_ids)
+    left_unrated_share = (len(left_null) / len(left)) if left else None
 
     result = {
         "experiment": "poignancy-blend",
@@ -122,10 +159,24 @@ def main(argv=None):
         "top_k": k,
         "corpus_size": len(records),
         "records_with_real_poignancy": real_poignancy_count,
+        # Which null-handling regime produced this line. 1.0 == the pre-
+        # floor-as-neutral behaviour; anything above it is the centered mapping.
+        "poignancy_weight_center": float(
+            R._load_retrieval_config().get("poignancy_weight_center", 1.0) or 1.0
+        ),
         "max_factor": max_factor,
         "max_entered_utilization": max_entered_util,
         "topk_entered": entered,
         "topk_left": left,
+        # Unrated records promoted INTO the top-k. Structurally 0 at every k while
+        # null maps to the floor — a nonzero value is the fix working.
+        "entered_null_poignancy": entered_null,
+        "n_entered_null_poignancy": len(entered_null),
+        "left_null_poignancy": left_null,
+        # Share of demotions that are unrated, against the corpus rate. Far above
+        # the corpus rate = unrated records are being systematically demoted.
+        "left_unrated_share": left_unrated_share,
+        "corpus_unrated_share": corpus_unrated_share,
         "known_good_hidden": known_good_hidden,
         "no_known_good_hidden": len(known_good_hidden) == 0,
     }

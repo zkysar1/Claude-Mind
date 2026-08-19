@@ -113,18 +113,28 @@ class FileStat:
     ``version`` is the optimistic-concurrency token: ``str(st_mtime_ns)`` for
     the local backend, an object version token (ETag) for a remote backend. ``mtime_ns`` is 0 for
     non-filesystem backends (callers that special-case mtime must tolerate 0).
+
+    ``plain_md5`` (g-358-11) is the writer-recorded md5 of the PLAINTEXT
+    content for a remote object stored transport-encoded (gzip), read from
+    object metadata; None for plain objects and for the local backend. When a
+    remote object is encoded its ``version`` (ETag) digests the COMPRESSED
+    bytes, so "is local byte-identical to remote?" must compare against
+    ``plain_md5`` — see ``_owncloud_codec.content_matches``. ``size`` is the
+    stored (possibly compressed) size for a remote backend.
     """
 
-    __slots__ = ("version", "size", "mtime_ns")
+    __slots__ = ("version", "size", "mtime_ns", "plain_md5")
 
-    def __init__(self, version: str, size: int, mtime_ns: int = 0):
+    def __init__(self, version: str, size: int, mtime_ns: int = 0,
+                 plain_md5=None):
         self.version = version
         self.size = size
         self.mtime_ns = mtime_ns
+        self.plain_md5 = plain_md5
 
     def __repr__(self) -> str:
         return (f"FileStat(version={self.version!r}, size={self.size}, "
-                f"mtime_ns={self.mtime_ns})")
+                f"mtime_ns={self.mtime_ns}, plain_md5={self.plain_md5!r})")
 
 
 class WriteResult:
@@ -196,6 +206,18 @@ class StorageBackend(Protocol):
     # remote-only file it materializes the local cache, so the subsequent
     # raw read sees it.
     def refresh(self, path: PathLike) -> None: ...
+
+    # Warm the freshness cache for EVERY object under `path` from a bulk
+    # listing, so the reads that follow can skip their per-file remote
+    # freshness probe. Purely an optimization with one hard invariant: it may
+    # only ever REDUCE remote requests, never change what a read returns. A
+    # backend warms an entry only where the listing PROVES the local copy is
+    # current; every uncertain case (no local copy, an opaque version token,
+    # an encoded object) is left alone so the normal per-file path runs.
+    # Returns a stats dict for measurement; callers must treat it as advisory
+    # and must never require it to have warmed anything. No-op for
+    # LocalBackend, where a read has no per-file remote cost to save.
+    def prefetch(self, path: PathLike) -> dict: ...
 
     # --- writes ------------------------------------------------------------
     def write_text(self, path: PathLike, content: str,
@@ -312,6 +334,15 @@ class LocalBackend:
         # pull. Importantly this reads NOTHING — callers insert refresh() before
         # an in-lock read, and on the local (default) path that must add zero I/O.
         return None
+
+    def prefetch(self, path: PathLike) -> dict:
+        # No-op for the same reason refresh() is: a local read issues no remote
+        # freshness probe, so there is no per-file cost for a bulk listing to
+        # amortize. Deliberately walks NOTHING — a stat sweep here would add
+        # real I/O to the default path to optimize a cost that does not exist.
+        # The zero counts are honest ("nothing needed warming"), not a failure.
+        return {"backend": "local", "listed": 0, "warmed": 0, "skipped": 0,
+                "reason": "local backend — reads have no per-file remote cost"}
 
     # --- atomic write: byte-for-byte identical to the legacy
     #     _fileops._atomic_write_with_fallback it replaces (tmp-write +
@@ -746,6 +777,49 @@ def note_swallowed_backend_error(op: str, path, exc: BaseException) -> None:
         )
     except Exception:
         pass
+
+
+def ensure_local_before_append(path, *, op: str = "ensure_local") -> Optional[str]:
+    """Materialize an S3-only file locally BEFORE a raw ``open(path, "a")``.
+
+    An append does not read the file, so nothing else on a raw-append path will
+    ever pull it. On an own-cloud box whose mirror is behind S3 the append then
+    extends a STALE base, and the bytes S3 already holds past that offset are
+    what the next sync has to reconcile. Measured on ``meta-log.jsonl``
+    (g-115-3534): the daemon appended at byte 1,307,327 while the local mirror
+    was 1,306,073 — 1,254 bytes behind.
+
+    FAIL-OPEN, and that direction is the whole point. ``OwnCloudBackend._refresh``
+    bare-``raise``s any non-404 ``ClientError``, so an S3 throttle, outage, or
+    expired credential would turn a *durability* improvement into a 500 that
+    LOSES the record — strictly worse than the pre-fix behavior, which always
+    landed the append locally and let the sync sweep carry it up. An audit log
+    must not become less durable than it was.
+
+    Returns ``None`` when the materialize succeeded, or a short
+    ``"ExcType: message"`` string when it failed and the caller is about to
+    append onto a possibly-stale mirror. A caller that owns a response body
+    SHOULD surface that string (the ``stale_base`` field, per guard-1661: a
+    write path's success response must carry evidence the caller can check
+    without a second read). A caller with no response body may ignore it — the
+    stderr diagnostic from ``note_swallowed_backend_error`` still fires.
+
+    NEVER RAISES. The nested report-guard is load-bearing for the same reason
+    ``note_swallowed_backend_error`` documents: on the benign "bare subprocess
+    without daemon env" path the backend import is what failed.
+    """
+    try:
+        get_backend().ensure_local(path)
+        return None
+    except Exception as e:  # noqa: BLE001 — durability beats precision here
+        try:  # report, never raise
+            note_swallowed_backend_error(op, path, e)
+        except Exception:
+            pass
+        try:
+            return "{}: {}".format(type(e).__name__, e)[:200]
+        except Exception:
+            return "unrepresentable backend error"
 
 
 def get_backend() -> StorageBackend:

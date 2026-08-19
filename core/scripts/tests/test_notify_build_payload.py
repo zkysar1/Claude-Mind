@@ -410,3 +410,41 @@ def test_output_is_valid_json(fake_root):
     assert payload["Title"] == 'Subject with "quotes" and \\ backslash'
     assert "em-dash —" in payload["Body"]
     assert "✅" in payload["Body"]
+
+
+def test_html_file_selects_transport_passthrough_shape(fake_root, tmp_path):
+    """--html-file: InfoMessage IS the document and InfoType IS the subject; no
+    Title key, because Title selects the structured template, which would
+    html-escape the document into a pre-wrap div (2026-08-17 fleet-digest
+    readability fix). The plain message stays required -- gates and the
+    outreach ledger read it."""
+    doc = tmp_path / "d.html"
+    doc.write_text("<html><body><h1>Fleet digest</h1><p>needs you: g-1-1</p></body></html>", encoding="utf-8")
+    rc, out, err = run_helper([
+        "--agent", "alpha", "--category", "user-digest",
+        "--subject", "Fleet digest — 2026-08-17",
+        "--message", "Fleet digest — 2026-08-17. Needs you: g-1-1 (credential). Done: 12 goals. Blocked: 3.",
+        "--html-file", str(doc), "--disproof-waived", "test",
+        "--project-root", str(fake_root),
+    ])
+    assert rc == 0, f"stderr: {err}"
+    payload = json.loads(out)
+    assert payload["InfoMessage"].startswith("<html>") and "g-1-1" in payload["InfoMessage"]
+    assert payload["InfoType"] == "Fleet digest — 2026-08-17"
+    assert "Title" not in payload and "Body" not in payload
+    assert payload["XPayloadProvenance"] == "notify-build-payload/v1"
+
+
+def test_html_file_refused_when_not_a_document_or_for_blocker(fake_root, tmp_path):
+    frag = tmp_path / "frag.html"
+    frag.write_text("<p>not a document</p>", encoding="utf-8")
+    common = ["--agent", "alpha", "--subject", "s", "--message", "A message long enough to pass the body floor guard here.",
+              "--project-root", str(fake_root)]
+    rc, _out, err = run_helper(["--category", "info", "--html-file", str(frag), *common])
+    assert rc == 1 and "complete HTML document" in err
+    doc = tmp_path / "d.html"
+    doc.write_text("<html><body>x</body></html>", encoding="utf-8")
+    rc, _out, err = run_helper(["--category", "blocker", "--html-file", str(doc), *common])
+    assert rc == 1 and "not supported for --category blocker" in err
+    rc, _out, err = run_helper(["--category", "info", "--html-file", str(tmp_path / "missing.html"), *common])
+    assert rc == 1 and "not found" in err

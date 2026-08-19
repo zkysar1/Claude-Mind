@@ -136,10 +136,56 @@ Read the inputs. Cache each result so Phase 3 can synthesize without re-reading.
 # the verdict streak, the Decision Rules, and — critically — the RETRACTIONS
 # that prior reviewers recorded so their successors would not re-derive a
 # finding already investigated and closed.
+#
+# ⚠ THIS STEP WAS UNREACHABLE AS WRITTEN — TWO INDEPENDENT DEFECTS, EITHER
+# SUFFICIENT ALONE (measured 2026-08-11, alpha, cc-04, Linux 6.8.0-136-generic).
+# (1) `tree-read.sh --node` RETURNS METADATA ONLY — key/file/summary/depth/
+# confidence — at every depth. It NEVER returns the body, so "capture ALL
+# Decision Rules" and "every paragraph containing RETRACTED" were satisfiable
+# in full while delivering none of it. The step did not fail; it returned a
+# rich-looking summary, which is why it survived. (guard-3312 — which named
+# this class for the sibling /fresh-eyes-review and explicitly exonerated the
+# other rituals as leaf nodes. That exoneration is FALSE, and this block is
+# the correction.)
+# (2) EVEN WITH A BODY, THE PARENT IS THE WRONG FILE FOR HALF THE CAPTURE.
+# The per-review assessment entries moved OUT to a depth-4 child on 2026-08-01
+# (the parent's own summary says so verbatim: "Per-review assessment entries
+# live in the -assessments child"). The parent kept the Decision Rules. So the
+# two halves of this capture now live in two different files, and this step
+# named only one of them for ten months' worth of passes.
+# (a) THE ASSESSMENT ENTRIES — the depth-4 child, read DIRECTLY.
+#     ⚠ ORDERING IS OLDEST-FIRST: entries are APPENDED, so the newest is at the
+#     BOTTOM. This is the OPPOSITE of /fresh-eyes-review's directive-lane-series-
+#     <agent>.md, which is newest-FIRST. Do not carry a read direction across the
+#     two rituals — `head` here returns 2026-07-31 entries and they look current.
+#     ONE self-contained call: shell state does NOT persist between Bash calls,
+#     so a $VAR assigned in a previous Bash: line is empty here. Re-source, and
+#     compute the start line inside the same invocation.
+Bash: source core/scripts/_paths.sh && \
+  F="$WORLD_PATH/knowledge/tree/system/tree-taxonomy-review-mechanism/l1-taxonomy-health/l1-taxonomy-health-assessments.md" && \
+  L=$(grep -n '^### ' "$F" | tail -3 | head -1 | cut -d: -f1) && \
+  sed -n "${L},\$p" "$F"
+
+# (b) THE DECISION RULES + RETRACTIONS — the parent node file, read DIRECTLY.
+#     105 lines / ~45KB and it reads WHOLE (its own summary tracks this at 77.5%
+#     of the Read cap). If a future split pushes it over, grep the headings first
+#     rather than truncating blind. The `world/` prefix IS resolved for Read
+#     (path-resolution.md) — unlike a bare `world/` arg to Bash, which is not.
+Read world/knowledge/tree/system/tree-taxonomy-review-mechanism/l1-taxonomy-health.md
+
+# (c) OPTIONAL — the tree-read call this step used to make is still useful as a
+#     one-line index (it names the child files and the current verdict streak in
+#     its summary), but it is NOT the prior-series read and must not stand in for
+#     (a) or (b).
 Bash: bash core/scripts/tree-read.sh --node l1-taxonomy-health
-  → capture: the last 2-3 assessment entries, ALL Decision Rules, and every
+
+  → capture from (a): the last 2-3 assessment entries IN FULL
+  → capture from (b): ALL Decision Rules, and every
     paragraph containing "RETRACTED" / "recorded so the next reviewer" /
     "does not re-run" / "FALSIFIED"
+  → **THE COUNTER COMES FROM (a)'s LAST HEADING, NEVER FROM THE CADENCE GOAL
+    COUNT.** The headings are `### YYYY-MM-DD -- world-count NNNN`; that
+    world-count is what the next entry's diff is measured against.
   → carry these into Phase 3. Before writing ANY finding, check it against
     them: a signal the series has already investigated and closed is NOT a
     new finding, however fresh the instrument reading looks.

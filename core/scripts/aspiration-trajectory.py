@@ -19,7 +19,7 @@ Output: JSON object with trajectory data including:
 """
 import json
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 # --- Path setup ---
@@ -193,28 +193,74 @@ def find_aspiration(asp_id, asp_sources):
                 return rec
     return None
 
+# Fields carrying a real completion time, most precise first. `completed_at` is
+# a full timestamp; `completed_date` is DATE-ONLY, so it is the fallback rather
+# than the primary -- several goals routinely close on the same day and the
+# consumers below care about their order. `started` is the last resort because a
+# goal's claim time is not its completion time, but it is a real instant and so
+# still orders correctly against the others far more often than not.
+_COMPLETION_TIME_FIELDS = ("completed_at", "completed_date", "started")
+
+
+def goal_completion_order_key(g):
+    """Total order on real completion time ().
+
+    THE BUG THIS REPLACES WAS A PARTITION WEARING AN ORDERING'S CLOTHES. The old
+    key was `(0, started)` when `started` existed and `(1, epoch + seq_days)`
+    otherwise, and its comment stated the intent as "goals with timestamps sort
+    first; goals without sort after" -- which IS the defect, not a description of
+    it. Every timestamped goal preceded every un-timestamped one regardless of
+    when either actually completed, and the un-timestamped bucket was ordered by
+    a FABRICATED date synthesized from the goal-id sequence number.
+
+    That is fatal here specifically because every consumer of this array takes a
+    trailing recency slice or walks it pairwise (see get_completed_goals). Since
+    the daemon stamps `started` at CLAIM time, every newly-claimed goal joins
+    bucket 0 and bucket 1 can never gain a member -- so the "last N goals" window
+    was pinned to a frozen historical set that receded further from the present
+    with every goal closed. Measured on ZDS asp-025: 96 completed, 58 timestamped
+    and 38 not, so the last-5 window was drawn entirely from the un-timestamped
+    tail and reported velocity=0.00 for an aspiration that was producing
+    artifacts that week.
+
+    THE RESIDUAL PARTITION HERE IS DELIBERATE, MEASURED, AND POINTS THE OTHER
+    WAY. A goal carrying none of the three fields has no time information at all,
+    so no key can place it honestly; this returns a sentinel that sorts it LAST
+    rather than inventing an instant for it. Two things make that the safe
+    direction rather than a smaller copy of the same mistake. It covers 5 of 4487
+    live completed goals (0.11%) against the old key's 38-of-96 (40%) in the
+    measured case. And those 5 are the NEWEST goals, not ancient ones -- the
+    stamp is written by the daemon around close, so the unstamped population is
+    whatever just closed. Sending them to the far past, which is the reflexive
+    choice, would push the freshest work out of the recency window and reproduce
+    the exact defect being fixed. Python's sort is stable, so they hold their
+    file order among themselves.
+    """
+    for field in _COMPLETION_TIME_FIELDS:
+        raw = g.get(field)
+        if not raw:
+            continue
+        try:
+            return (0, datetime.fromisoformat(str(raw)))
+        except (ValueError, TypeError):
+            continue
+    return (1, datetime.min)
+
+
 def get_completed_goals(asp):
-    """Extract completed goals sorted by start/completion time."""
+    """Completed goals in true completion order, oldest first.
+
+    ORDER IS LOAD-BEARING FOR FOUR CONSUMERS, so do not weaken this to a
+    partition again: compute_learning_velocity and detect_diminishing_returns
+    each take a trailing `[-window:]` slice, detect_plateau delegates to the
+    former, and detect_inflection_points walks adjacent pairs (a discontinuity
+    in the ordering manufactures a spurious jump at the seam). The commissioning
+    goal named only the first three; the fourth is why the enumeration is
+    written down here (guard-1737).
+    """
     goals = asp.get("goals", [])
     completed = [g for g in goals if g.get("status") == "completed"]
-    # Sort by started timestamp if available, else by goal ID sequence number.
-    # Two-element tuple: (has_timestamp:0/1, timestamp_or_sequence).
-    # Goals with timestamps sort first (by time); goals without sort after (by ID).
-    def sort_key(g):
-        started = g.get("started")
-        if started:
-            try:
-                return (0, datetime.fromisoformat(started))
-            except (ValueError, TypeError):
-                pass
-        gid = g.get("id", "g-000-99")
-        parts = gid.rsplit("-", 1)
-        try:
-            seq = int(parts[-1])
-        except (ValueError, IndexError):
-            seq = 99
-        return (1, datetime(2000, 1, 1) + timedelta(days=seq))
-    completed.sort(key=sort_key)
+    completed.sort(key=goal_completion_order_key)
     return completed
 
 def count_learning_artifacts(goal, reasoning_bank, guardrails, pattern_sigs,

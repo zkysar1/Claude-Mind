@@ -34,10 +34,35 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
 
+# compact-restore-slots.py does `import _paths`, which resolves against sys.path.
+# Under pytest the conftest puts core/scripts there, so this file passed there and
+# failed ONLY through main() with ModuleNotFoundError: No module named '_paths'
+# (). Making the module importable from both entry points is what keeps
+# the two surfaces reporting the same thing — a file whose main() and pytest runs
+# disagree teaches whichever answer the reader happened to look at.
+sys.path.insert(0, str(SCRIPT_DIR))
+
+
+class Unreachable(Exception):
+    """A test whose assertion CANNOT be evaluated inside an env-redirected sandbox.
+
+    Distinct from both pass and fail on purpose. The alternative — weakening the
+    assertion until it goes green — makes the suite agree with the code by
+    construction and destroys the signal. A SKIP keeps the gap legible and is
+    never tallied as a pass on either surface (g-115-5700).
+    """
+
 
 def with_sandbox(test_fn):
     """Spin up a tmp AGENT_DIR sandbox with minimal WM scaffolding."""
     def wrapped():
+        # These names are `test_*` at module level, so pytest COLLECTS them as
+        # well as main() running them. Swallowing the AssertionError would make
+        # pytest report PASS on a broken test (measured under this exact shape:
+        # a deliberately broken assertion here reported rc=0), so under pytest
+        # the failure must propagate and the return value must be None
+        # (return-not-None is a warning today and an error in future pytest).
+        under_pytest = bool(os.environ.get("PYTEST_CURRENT_TEST"))
         sandbox = Path(tempfile.mkdtemp(prefix=f"compact_restore_test_{test_fn.__name__}_"))
         agent_dir = sandbox / "zeta-test"
         (agent_dir / "session").mkdir(parents=True)
@@ -48,11 +73,26 @@ def with_sandbox(test_fn):
 
         # Set sandbox env vars so _paths resolves into the sandbox
         prior_env = {k: os.environ.get(k) for k in
-                     ("MIND_AGENT", "MIND_WORLD", "MIND_META", "MIND_AGENT_DIR")}
+                     ("MIND_AGENT", "MIND_WORLD", "MIND_META", "MIND_AGENT_DIR",
+                      "BODY_WM_PATH")}
         os.environ["MIND_AGENT"] = "zeta-test"
         os.environ["MIND_WORLD"] = str(world_dir)
         os.environ["MIND_META"] = str(meta_dir)
         os.environ["MIND_AGENT_DIR"] = str(agent_dir)
+        # MIND_AGENT_DIR IS NOT ENOUGH TO SANDBOX A WM WRITE. wm.wm_path()
+        # returns Path(BODY_WM_PATH) unconditionally when that var is set, and
+        # bash-agent-inject.py injects it for every bound session that has a
+        # body-manifest — i.e. on every worker Body. So without this pop, every
+        # wm.py call below wrote to the LIVE per-Body working memory and the test
+        # then read an absent sandbox file: the two FileNotFoundErrors and the
+        # 'no checkpoint' failure were all this one cause (measured cc-07,
+        # 2026-08-10,  — a canary slot written under this exact env
+        # landed in the live body WM and changed its md5).
+        #
+        # The direction of the damage is what makes this a pop and not a
+        # workaround: the failures were the SAFE half. A test that silently
+        # rewrites production working memory would have gone on passing.
+        os.environ.pop("BODY_WM_PATH", None)
 
         # Force re-import to pick up sandbox paths
         for mod in list(sys.modules):
@@ -62,14 +102,24 @@ def with_sandbox(test_fn):
         try:
             test_fn(sandbox, agent_dir)
             print(f"  [PASS] {test_fn.__name__}")
-            return True
+            return None if under_pytest else True
+        except Unreachable as e:
+            print(f"  [SKIP] {test_fn.__name__}: {e}")
+            if under_pytest:
+                import pytest
+                pytest.skip(str(e))   # raises -> a REAL pytest skip, not a pass
+            return "skip"
         except AssertionError as e:
             print(f"  [FAIL] {test_fn.__name__}: {e}")
             traceback.print_exc()
+            if under_pytest:
+                raise
             return False
         except Exception as e:
             print(f"  [ERROR] {test_fn.__name__}: {type(e).__name__}: {e}")
             traceback.print_exc()
+            if under_pytest:
+                raise
             return False
         finally:
             for k, v in prior_env.items():
@@ -189,6 +239,32 @@ def test_compact_restore_preserves_live_loop_state(sandbox, agent_dir):
     run compact-restore-slots.py. Post-restore loop_state must still be X
     (the SKIP_SLOTS behavior). Y must NOT clobber X.
     """
+    # UNREACHABLE-FROM-SANDBOX GUARD (). compact-restore-slots.py:45
+    # sets CHECKPOINT_PATH = body_state_path(AGENT_DIR.name, ...), which throws
+    # away the already-correct AGENT_DIR and re-derives agents_root()/<name> from
+    # PROJECT_ROOT. _paths.AGENT_DIR honors MIND_AGENT_DIR; agent_dir(name) does
+    # not, by design (it is the cross-agent enumeration base). So the subprocess
+    # looks under the REAL agents/ tree while this fixture writes to a tmp dir,
+    # reports "no checkpoint", and returns before the SKIP_SLOTS branch under test.
+    #
+    # Deliberately CONDITIONAL, not an unconditional skip: it compares the two
+    # paths, so if body_state_path ever becomes env-aware this test resumes on its
+    # own instead of staying dark. Writing the checkpoint to the resolved location
+    # instead is NOT the fix — that path is inside the live agents/ tree, which is
+    # the very sandbox escape this file was repaired to stop.
+    from _paths import body_state_path
+    resolved = body_state_path(agent_dir.name, "compact-checkpoint.yaml")
+    expected = agent_dir / "session" / "compact-checkpoint.yaml"
+    if resolved != expected:
+        raise Unreachable(
+            "compact-restore-slots.py reads the checkpoint via "
+            f"body_state_path -> {resolved}, outside this sandbox "
+            f"({expected}); it takes no --checkpoint override, so the "
+            "end-to-end SKIP_SLOTS branch cannot be exercised hermetically. "
+            "The mechanism it guards is still pinned by "
+            "test_loop_state_in_skip_slots."
+        )
+
     # Initialize WM
     subprocess.run([sys.executable, str(SCRIPT_DIR / "wm.py"), "init"],
                    capture_output=True, env=os.environ.copy(), check=True)
@@ -313,10 +389,17 @@ def main():
     ]
     print(f"# g-283-03: compact-restore loop_state shape invariance — {len(tests)} tests")
     failures = 0
+    skipped = 0
     for t in tests:
-        if not t():
+        result = t()
+        if result == "skip":
+            skipped += 1
+        elif not result:
             failures += 1
-    print(f"# Done: {len(tests) - failures}/{len(tests)} passed")
+    # Skips are reported separately and NEVER folded into the passed count — an
+    # aggregate that hides them is how an unevaluated assertion reads as coverage.
+    print(f"# Done: {len(tests) - failures - skipped}/{len(tests)} passed, "
+          f"{skipped} skipped, {failures} failed")
     return 0 if failures == 0 else 1
 
 

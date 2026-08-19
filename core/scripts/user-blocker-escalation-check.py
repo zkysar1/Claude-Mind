@@ -584,6 +584,23 @@ def _send_digest_email(agent: str, batch: list, cadence_hours: float,
     digest says and overlaps directive D5 ("shrink the input"), which is a
     separate goal. This change is the transport/routing defect only.
     """
+    # DO NOT ROUTE EITHER BRANCH THROUGH notification_routing_gate.decide
+    # (). Both categories here are TRANSPORT-shape selectors for
+    # notify-build-payload.py, and only one of them coincides with a routing
+    # verdict. `user-digest` is ALWAYS_SEND in the gate, so that branch is
+    # unaffected either way — but `info` is FLEET_HANDLEABLE, so feeding the
+    # all-clear to the gate would SUPPRESS it. That is the one send in this
+    # file the user asked for by name (D3: "yes, I do like this, it would give
+    # me comfort"), and its whole value is that it arrives on a fixed schedule
+    # whether or not anything is waiting — silence is the regression, and a
+    # skipped send and a quiet week produce the identical empty inbox.
+    #
+    # So this caller satisfies the  outcome by the OTHER branch:
+    # it carries an explicit recorded category justifying an unconditional
+    # send, rather than by passing through the gate. The two categories differ
+    # for transport-shape reasons documented at length above ();
+    # collapsing them to one, or "completing the wiring" by adding a decide()
+    # call, breaks a user-directed requirement.
     if batch:
         oldest = max((t[2] or 0.0) for t in batch)
         subject = "%d goal(s) waiting on you (oldest %.0fh)" % (len(batch), oldest)
@@ -651,6 +668,15 @@ def _send_digest_email(agent: str, batch: list, cadence_hours: float,
             input=built.stdout, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=120,
         )
+        if sent.returncode == 4:
+            # The framework dispatcher (email-send.sh re-enters it) refused the
+            # send because a `user-digest` already went out inside the fleet
+            # window -- since 2026-08-17 that is the daily FLEET DIGEST from
+            # agent-completion-report, which lists this exact population (same
+            # audit-user-to-agent predicate) with more context. The user has
+            # been told; this cadence is satisfied, not failed. Treating rc 4
+            # as failure would re-fire the escalation every run and file noise.
+            return True, "superseded_by_fleet_digest"
         if sent.returncode != 0:
             return False, "email_rc=%d %s" % (
                 sent.returncode, (sent.stderr or "").strip()[:200])

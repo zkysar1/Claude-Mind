@@ -298,6 +298,39 @@ def test_project_preserves_parent_child_links() -> None:
     assert node["children"] == ["bleaching"]
 
 
+def test_project_carries_last_updated_with_absent_control() -> None:
+    """A wiki client's "what changed since your last visit" is keyed on this field.
+
+    Sibling of the parent/child test above — it checks what must SURVIVE, and this
+    field survived NOTHING until g-335-1146: two independent field-by-field dict
+    rebuilds (here and read_tree_nodes) each named six keys and dropped it, which is
+    invisible because a comprehension listing its keys looks identical whether or not
+    it lists them all.
+
+    The NEGATIVE CONTROL is the load-bearing half (guard-3221). Asserting only that a
+    dated node keeps its date passes against any implementation that emits a non-empty
+    string, including one that fabricates a default. The consumer distinguishes "no
+    date" from "old" and goes silent rather than claiming nothing changed — which only
+    works if an undated node arrives as "" instead of a plausible-looking stamp.
+    """
+    nodes = [
+        {"key": "dated", "category": "marine-biology/reefs", "title": "Dated",
+         "summary": "", "parent": "marine-biology", "children": [],
+         "last_updated": "2026-04-28"},
+        {"key": "undated", "category": "marine-biology/reefs", "title": "Undated",
+         "summary": "", "parent": "marine-biology", "children": []},
+    ]
+    bundle = project(
+        tree_nodes=nodes, reasoning=[], guardrails=[], hypotheses=[],
+        redactor=Redactor(agent_names=("alpha",)),
+    )
+    by_key = {n["key"]: n for n in bundle.tree}
+    assert by_key["dated"]["last_updated"] == "2026-04-28"
+    # Control: present as a key, empty as a value. A MISSING key would also fail the
+    # consumer safely, but "" is the contract the exporter and the client agree on.
+    assert by_key["undated"]["last_updated"] == ""
+
+
 def test_project_redacts_exposed_strings() -> None:
     f = _fixtures()
     bundle = project(

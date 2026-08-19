@@ -327,3 +327,36 @@ def test_score_weight_limit_ppr_boosts_via_path_key_not_basename():
     assert eff["bbb"] > eff["aaa"]
     assert abs(eff["bbb"] - eff["aaa"] * 1.5) < 1e-9
     assert scored[0][0] == "bbb"
+
+
+# ── null centering seam () ─────────────────────────────────────────
+# _ppr_weight inherited _poignancy_weight's "null -> 1.0", which is
+# ppr_weight_min (the FLOOR): a candidate absent from the knowledge graph was
+# scored as if the graph held the WORST opinion of it rather than none. The
+# SHAPE is fixed (the floor is no longer hardcoded) but NO measured value ships,
+# because a PPR score is normalized per-query and therefore has no static corpus
+# mean the way poignancy does. These pin that decision so a later reader cannot
+# set a nonzero center without deliberately changing a test.
+
+def test_ppr_weight_center_defaults_to_behaviour_preserving_zero():
+    assert _retrieve._DEFAULT_RETRIEVAL_CFG["ppr_weight_center"] == 0.0
+    # Default center reproduces the pre-fix factor for an absent candidate...
+    assert _retrieve._ppr_weight("node:absent", {"node:x": 1.0}, PPR_CFG_ON) == 1.0
+    # ...identically whether the key is present in cfg or missing entirely.
+    assert _retrieve._ppr_weight(
+        "node:absent", {"node:x": 1.0},
+        dict(PPR_CFG_ON, ppr_weight_center=0.0)) == 1.0
+
+
+def test_ppr_weight_center_seam_is_wired_and_bounded():
+    # The seam works when a center IS supplied (proves it is not dead code)...
+    assert _retrieve._ppr_weight(
+        "node:absent", {"node:x": 1.0},
+        dict(PPR_CFG_ON, ppr_weight_center=1.0)) == 1.5
+    # ...and boost-only survives every input, including an out-of-range center
+    # and a scored node, which the clamp must contain within [min, max].
+    for center in (None, -99, 0.0, 0.5, 1.0, 99):
+        for key in ("node:absent", "node:x"):
+            f = _retrieve._ppr_weight(
+                key, {"node:x": 0.25}, dict(PPR_CFG_ON, ppr_weight_center=center))
+            assert 1.0 <= f <= 1.5, f"center={center} key={key} -> {f}"

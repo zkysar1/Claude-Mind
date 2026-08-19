@@ -71,6 +71,12 @@ import retrieve as _r  # noqa: E402
 # index as the "real" function (which would create infinite recursion on the
 # first cache miss). tree_match.build_concept_index is never patched.
 from tree_match import build_concept_index as _real_build_concept_index  # noqa: E402
+#  reader seam. Imported from core/scripts directly — there is no daemon
+# twin by construction, so this side cannot drift from the CLI side.
+from _utilization_store import (  # noqa: E402
+    load_all_counters as _load_all_counters,
+    utilization_of as _utilization_of,
+)
 
 from ..yaml_cache import cache as _yaml_cache
 from ..jsonl_cache import cache as _jsonl_cache
@@ -304,6 +310,14 @@ def handle(ctx) -> "Response":  # type: ignore[name-defined]
             # to an age cap and its high-value protection is unreachable
             # (, measured 2026-08-04). Widening one side alone fixes
             # nothing: this re-bind points at the same live file per request.
+            # DECIDED 2026-08-12 (): widen READ-ONLY, unconditionally.
+            # Measured cheap (+0.5% of a warm call) and the archive CANNOT be
+            # written to — the bump target is a hardcoded EXP_PATH. When landing
+            # it (), derive the archive path from EXP_PATH at CALL time
+            # inside _r.load_experiences; do NOT add a second constant HERE. A
+            # derived path follows this re-bind for free, a second constant would
+            # need its own re-bind line and would silently read the wrong agent's
+            # archive if anyone forgot it. Full evidence in the twin.
             _r.EXP_PATH = (agent_dir / "experience.jsonl") if agent_dir else None
             _r.EI_PATH = (agent_dir / "experiential-index.yaml") if agent_dir else None
             _r.FRAMEWORK_WORLD_CONVENTIONS_DIR = world / "conventions"
@@ -402,8 +416,16 @@ def handle(ctx) -> "Response":  # type: ignore[name-defined]
                         tree_summary_by_key.get(k, "")),
                 } for k in tree_node_keys]
 
+                #  reader seam, loaded ONCE for the three call sites
+                # below. Merged across kinds because `supp_items` mixes
+                # reasoning-bank and guardrail records, so no single `kind`
+                # applies. No daemon twin exists by construction — this is the
+                # same module core/scripts/retrieve.py uses (see that module's
+                # docstring), so the two sides cannot drift apart.
+                _util_counters = _load_all_counters()
+
                 def _times_active(rec):
-                    u = (rec.get("utilization")
+                    u = (_utilization_of(rec, _util_counters)
                          if isinstance(rec, dict) else None)
                     if isinstance(u, dict):
                         v = u.get("times_active", 0)
@@ -482,6 +504,33 @@ def handle(ctx) -> "Response":  # type: ignore[name-defined]
                                                     "pattern_signature")
                     supp_detail.append({
                         "id": iid, "type": "pattern_signature",
+                        "summary": text[:300],
+                        "distinctive_tokens": _r._distinctive_tokens(text),
+                    })
+                # Experiences (). `counts.experiences` below has
+                # tallied these since v1 while this loop did not exist, so the
+                # session recorded HOW MANY experiences were retrieved and never
+                # WHICH — and utilization-feedback classifies supplementary_items,
+                # not counts. That asymmetry is why `retrieval_stats.times_useful`
+                # had no enforced writer: retrieve.py bumps the mechanical half
+                # (retrieval_count, :1479) but the judgement half could not even be
+                # offered for classification. Measured 2026-08-11 before this loop
+                # existed: the 40 most-retrieved records (retrieval_count 26-38) all
+                # read times_useful 0 / utility_ratio 0.0, which makes the archive
+                # sweep's never-archive-high-value guard (rc>=5 AND ur>=0.5)
+                # unsatisfiable by construction.
+                # `_item_text_for_tokens` has no experience branch and falls through
+                # to its `summary` default, which is exactly right here — that IS
+                # the experience record's text field.
+                for item in experiences:
+                    iid = item.get("id", "")
+                    if not iid:
+                        continue
+                    # No re-derivation — see the membership note above.
+                    supp_items.append({"id": iid, "type": "experience"})
+                    text = _r._item_text_for_tokens(item, "experience")
+                    supp_detail.append({
+                        "id": iid, "type": "experience",
                         "summary": text[:300],
                         "distinctive_tokens": _r._distinctive_tokens(text),
                     })

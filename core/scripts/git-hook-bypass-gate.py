@@ -11,11 +11,23 @@ so enforcement sits here, at the tool-invocation layer, before git is called.
 
 FORMS refused (each token-anchored — never a raw substring, so a commit
 MESSAGE that mentions ``--no-verify`` or ``core.hooksPath`` does not trip the
-gate; guard-958 surgical-scoping. Known residual false-positive, same trade
-the gradle-tests gate documents: shlex flattens HEREDOC bodies into the token
-stream, so one command that both runs ``git commit`` and writes a heredoc
-whose body contains a bare ``--no-verify`` token will deny — split the
-commands or use the override token):
+gate; guard-958 surgical-scoping).
+
+SCOPE IS ONE SIMPLE COMMAND (g-115-4695). The line is split on control
+operators AND on newlines, and Forms A/B/C arm only for a simple command whose
+argv[0] basename is git and whose first non-option word is ``commit``. Heredoc
+BODIES are removed before tokenization — they are stdin, never argv. This
+replaced a flat scan that matched ``commit`` as a bare token anywhere, which
+produced two measured false positives: a commit-message heredoc containing
+ordinary prose (``bash -n clean on both`` — rewording it, and nothing else, was
+accepted), and a pipeline with NO git invocation at all, where ``git`` and
+``commit`` arrived as quoted grep PATTERNS. The docstring here previously
+described the heredoc case as an accepted residual trade; it is now fixed, and
+the false-positive/true-positive matrices in the test file are the contract.
+Note the narrowing itself opened a hole that adversarial probing caught — a
+newline is a command boundary, so without re-inserting it a bypass on its own
+line joined the previous line's argv and approved (pinned by
+``test_g4695_newline_is_a_command_boundary``):
 
   A. ``--no-verify`` on a ``git commit`` (also the short ``-n`` and any short
      cluster containing ``n`` positioned after the ``commit`` subcommand —
@@ -88,6 +100,21 @@ LEDGER_RELPATH = Path("core/logs/git-hook-bypass-overrides.jsonl")
 
 _GIT_NAMES = frozenset({"git", "git.exe"})
 _SHORT_CLUSTER_RE = re.compile(r"^-[a-zA-Z]+$")
+# Control operators only — see _split_simple_commands for why redirections are excluded.
+_SEPARATORS = frozenset({";", ";;", "&&", "||", "|", "|&", "&"})
+# Heredoc introducer: << or <<- then an optionally quoted word. Anchored on an
+# identifier so a bit-shift or a `<<` inside quotes cannot look like one.
+_HEREDOC_RE = re.compile(r"<<-?\s*([\'\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+# NAME=value prefixes (`GIT_CONFIG_COUNT=1 git commit …`). Anchored on the shell's
+# own rule: a leading assignment is NAME=…, where NAME cannot start with a digit.
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# git GLOBAL options whose value is a SEPARATE token, so the subcommand scan must
+# skip two. Glued forms (-ccore.x=y, --git-dir=…) are handled by the generic
+# startswith("-") branch and need no entry here.
+_GIT_VALUE_OPTS = frozenset({
+    "-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path",
+    "--config-env", "--super-prefix",
+})
 _HOOKSPATH_ASSIGN_RE = re.compile(r"^core\.hookspath=(.*)$", re.IGNORECASE)
 _CONFIG_ENV_RE = re.compile(r"^--config-env=core\.hookspath=", re.IGNORECASE)
 _GIT_CONFIG_PARAMS_RE = re.compile(r"^GIT_CONFIG_PARAMETERS=.*core\.hookspath", re.IGNORECASE)
@@ -120,10 +147,147 @@ def _basename_lower(tok: str) -> str:
 
 
 def _tokenize(command: str) -> list[str] | None:
+    """Tokenize with SHELL OPERATORS as their own tokens.
+
+    `shlex.split` leaves `;` glued to the preceding word (`shlex.split('a; b')`
+    -> `['a;', 'b']`) while emitting `|` and `&&` standalone — so a separator
+    scan over its output silently misses every semicolon. `punctuation_chars`
+    fixes that and, critically, does NOT reach inside quotes: measured,
+    `git log --grep="commit|foo"` still yields one token `--grep=commit|foo`,
+    and `git commit -m "fix; use sed -n here"` still yields one message token.
+    That property is what lets Form A below scan a commit's OWN argv while
+    prose in the message stays out of reach.
+    """
     try:
-        return shlex.split(command, comments=False, posix=True)
+        lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        lex.commenters = ""
+        out: list[str] = []
+        prev_line = lex.lineno
+        for tok in lex:
+            out.append(tok)
+            # A NEWLINE IS A COMMAND BOUNDARY and shlex eats it as whitespace, so
+            # it is re-inserted here as an explicit separator. Without this, a
+            # `git commit -n` on its OWN LINE joins the previous line's argv and
+            # `_git_commit_argv` reads that line's argv[0] instead — a real bypass
+            # would pass. Caught by adversarial probe, not by the existing suite.
+            #
+            # `lex.lineno` LAGS: it is read after the token is consumed, so an
+            # increase means newline(s) were consumed while producing THIS token.
+            #
+            # THE JUMP MUST BE APPORTIONED, not merely tested. A multi-line
+            # QUOTED token swallows its own line breaks, and the trailing
+            # separator newline is consumed in the SAME step — so the jump counts
+            # both and a bare "does this token contain a newline?" test throws the
+            # separator away with the embedded ones. Measured on
+            # `git commit -m "a\nb"\nsort -n f`: jump=2, one embedded + one real,
+            # and the earlier `\n not in tok` guard emitted NO separator, merging
+            # `sort -n` into the commit's argv and DENYING a benign command. That
+            # is the exact false-positive class this gate was scoped to remove
+            # (), and it fired on the ordinary shape — every multi-line
+            # commit message in this repo — while the single-line case stayed
+            # correct, which is why it hid.
+            #
+            # newlines INSIDE the token are quoted content; the remainder are real
+            # command boundaries. Only the remainder may separate.
+            if lex.lineno > prev_line:
+                if (lex.lineno - prev_line) - tok.count("\n") > 0:
+                    out.append(";")
+                prev_line = lex.lineno
+        return out
     except ValueError:
         return None  # unbalanced quotes — out of reach, approve
+
+
+def _strip_heredoc_bodies(command: str) -> str:
+    """Drop heredoc BODIES before tokenization — they are stdin, never argv.
+
+    The originating incident (g-115-4695): `git commit -F - <<EOF` with a message
+    reading "bash -n clean on both" was REFUSED, because shlex flattens the body
+    into the token stream and Form A read that `-n` as a flag on the commit.
+    Rewording the prose — changing nothing else — was accepted.
+
+    Removed here rather than filtered afterwards because after shlex there is no
+    way left to tell a body word from a real flag.
+
+    FAIL-SAFE ON AMBIGUITY: if no terminator line is found, NOTHING is stripped.
+    Over-stripping would swallow a later `git commit -n` on the same line and
+    turn a false positive (annoying) into a false negative (a real bypass through
+    an unguarded commit), so an unterminated heredoc keeps every token.
+    """
+    if "<<" not in command:
+        return command
+    lines = command.split("\n")
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        i += 1
+        m = _HEREDOC_RE.search(line)
+        if not m:
+            continue
+        delim = m.group(2)
+        j = i
+        while j < len(lines) and lines[j].strip() != delim:
+            j += 1
+        if j < len(lines):      # terminator found — drop body AND terminator
+            i = j + 1
+        # else: unterminated — strip nothing, keep scanning from i
+    return "\n".join(out)
+
+
+def _split_simple_commands(tokens: list[str]) -> list[list[str]]:
+    """Split a token stream into simple commands on shell separators.
+
+    ONLY control operators split (`;`, `&&`, `||`, `|`, `|&`, `&`, `;;`).
+    Redirections deliberately do NOT: `git commit -m x > out.log` is one
+    command, and `2>&1` tokenizes to `2`, `>&`, `1` — `>&` is not a member,
+    so exact matching keeps it joined.
+    """
+    cmds: list[list[str]] = []
+    cur: list[str] = []
+    for tok in tokens:
+        if tok in _SEPARATORS:
+            if cur:
+                cmds.append(cur)
+            cur = []
+        else:
+            cur.append(tok)
+    if cur:
+        cmds.append(cur)
+    return cmds
+
+
+def _git_commit_argv(cmd: list[str]) -> list[str] | None:
+    """Return the argv AFTER `commit` when `cmd` really is a `git commit`.
+
+    `commit` must be git's OWN subcommand — argv[0]'s basename is git, and
+    `commit` is the first non-option word after any leading env assignments and
+    any git GLOBAL options. Returns None otherwise, so a bare `commit` token
+    appearing as a grep pattern, a filename, or heredoc prose can never arm
+    Form A. That conflation is the whole defect (g-115-4695): the gate matched
+    `commit` anywhere in the flat token stream, so a pipeline with no git
+    invocation at all — `grep -n "commit" f | grep -i "git" | head` — refused
+    on the `-n`/`-rn` of an unrelated grep.
+    """
+    i = 0
+    while i < len(cmd) and _ENV_ASSIGN_RE.match(cmd[i]):
+        i += 1
+    if i >= len(cmd) or _basename_lower(cmd[i]) not in _GIT_NAMES:
+        return None
+    i += 1
+    while i < len(cmd):
+        tok = cmd[i]
+        if tok in _GIT_VALUE_OPTS:      # takes a SEPARATE value token: -c k=v, -C dir
+            i += 2
+        elif tok.startswith("-"):       # glued/standalone: -ccore.x=y, --config-env=…, --no-pager
+            i += 1
+        else:
+            break
+    if i < len(cmd) and cmd[i].lower() == "commit":
+        return cmd[i + 1:]
+    return None
 
 
 def find_override(tokens: list[str]) -> str | None:
@@ -148,6 +312,7 @@ def scan_command(command: str) -> list[tuple[str, str]]:
     """
     if "git" not in command:
         return []
+    command = _strip_heredoc_bodies(command)
     tokens = _tokenize(command)
     if not tokens:
         return []
@@ -158,8 +323,6 @@ def scan_command(command: str) -> list[tuple[str, str]]:
 
     findings: list[tuple[str, str]] = []
     lowered = [t.lower() for t in tokens]
-    has_commit = "commit" in lowered
-    commit_idx = lowered.index("commit") if has_commit else -1
 
     # ── Form D: persistent config writes (self-contained; no commit needed) ──
     if "config" in lowered:
@@ -186,57 +349,77 @@ def scan_command(command: str) -> list[tuple[str, str]]:
                     ))
             # bare key / --get reads: diagnostic, approved.
 
-    if not has_commit:
+    # Forms A/B/C are COMMIT-SCOPED, and the scope is one SIMPLE COMMAND — not
+    # the whole line (). Each is evaluated only against a simple
+    # command that really is a `git commit`, so an unrelated pipeline stage
+    # cannot contribute either the `commit` token or the short flag.
+    commit_cmds = []
+    for cmd in _split_simple_commands(tokens):
+        post = _git_commit_argv(cmd)
+        if post is not None:
+            commit_cmds.append((cmd, post))
+    if not commit_cmds:
         return findings
 
-    # ── Form A: --no-verify / -n on git commit ──
-    if "--no-verify" in tokens:
-        findings.append(("no-verify", "--no-verify on git commit"))
-    else:
-        for tok in tokens[commit_idx + 1:]:
-            if tok == "--":
-                break
-            if _SHORT_CLUSTER_RE.match(tok) and "n" in tok[1:]:
+    for cmd, post_commit in commit_cmds:
+        # ── Form A: --no-verify / -n on git commit ──
+        # Scanned over the commit's OWN argv. `--no-verify` likewise: a bare
+        # `--no-verify` in a heredoc body or an echo payload belongs to no git
+        # commit and must not deny.
+        if "--no-verify" in post_commit:
+            findings.append(("no-verify", "--no-verify on git commit"))
+        else:
+            for tok in post_commit:
+                if tok == "--":
+                    break
+                if _SHORT_CLUSTER_RE.match(tok) and "n" in tok[1:]:
+                    findings.append((
+                        "no-verify-short",
+                        f"short flag {tok!r} after `commit` contains `n` "
+                        "(git parses it as --no-verify)",
+                    ))
+                    break
+
+        # ── Form B: core.hooksPath injected via -c / --config-env ──
+        # Over the WHOLE simple command: these are git GLOBAL options and sit
+        # BEFORE the subcommand, so post_commit would not contain them.
+        for i, tok in enumerate(cmd):
+            m = _HOOKSPATH_ASSIGN_RE.match(tok)
+            if m and i > 0 and cmd[i - 1] == "-c":
+                value = m.group(1)
+                if value.replace("\\", "/").strip("/") != CANONICAL_HOOKS_PATH:
+                    findings.append((
+                        "hookspath-c",
+                        f"-c {tok} — redirects the hook chain for this commit",
+                    ))
+            elif tok.startswith("-c") and len(tok) > 2:
+                m2 = _HOOKSPATH_ASSIGN_RE.match(tok[2:])
+                if m2 and m2.group(1).replace("\\", "/").strip("/") != CANONICAL_HOOKS_PATH:
+                    findings.append((
+                        "hookspath-c",
+                        f"{tok} — redirects the hook chain for this commit",
+                    ))
+            elif _CONFIG_ENV_RE.match(tok):
                 findings.append((
-                    "no-verify-short",
-                    f"short flag {tok!r} after `commit` contains `n` "
-                    "(git parses it as --no-verify)",
+                    "hookspath-config-env",
+                    f"{tok} — redirects the hook chain via --config-env",
+                ))
+
+        # ── Form C: env-var equivalents on the same command line ──
+        for tok in cmd:
+            if _GIT_CONFIG_PARAMS_RE.match(tok) or _GIT_CONFIG_KEY_RE.match(tok):
+                findings.append((
+                    "hookspath-env",
+                    f"{tok.split('=', 1)[0]}=... sets core.hooksPath for this commit",
                 ))
                 break
 
-    # ── Form B: core.hooksPath injected via -c / --config-env ──
-    for i, tok in enumerate(tokens):
-        m = _HOOKSPATH_ASSIGN_RE.match(tok)
-        if m and i > 0 and tokens[i - 1] == "-c":
-            value = m.group(1)
-            if value.replace("\\", "/").strip("/") != CANONICAL_HOOKS_PATH:
-                findings.append((
-                    "hookspath-c",
-                    f"-c {tok} — redirects the hook chain for this commit",
-                ))
-        elif tok.startswith("-c") and len(tok) > 2:
-            m2 = _HOOKSPATH_ASSIGN_RE.match(tok[2:])
-            if m2 and m2.group(1).replace("\\", "/").strip("/") != CANONICAL_HOOKS_PATH:
-                findings.append((
-                    "hookspath-c",
-                    f"{tok} — redirects the hook chain for this commit",
-                ))
-        elif _CONFIG_ENV_RE.match(tok):
-            findings.append((
-                "hookspath-config-env",
-                f"{tok} — redirects the hook chain via --config-env",
-            ))
-
-    # ── Form C: env-var equivalents on the same command line ──
-    for tok in tokens:
-        if _GIT_CONFIG_PARAMS_RE.match(tok) or _GIT_CONFIG_KEY_RE.match(tok):
-            findings.append((
-                "hookspath-env",
-                f"{tok.split('=', 1)[0]}=... sets core.hooksPath for this commit",
-            ))
-            break
-
-    return findings
+    # Two `git commit`s on one line would otherwise report the same form twice.
+    deduped: list[tuple[str, str]] = []
+    for f in findings:
+        if f not in deduped:
+            deduped.append(f)
+    return deduped
 
 
 def _log_override(justification: str, command: str) -> None:

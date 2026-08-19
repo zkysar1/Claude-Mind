@@ -11,8 +11,16 @@ _RUNTIME_SELF="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
+# Shared unknown-flag refusal (, rolled out here by ).
+# Sourced BEFORE _runtime.sh so the refusal is cheap and cannot be masked by a
+# daemon failure.
+# shellcheck disable=SC1091
+source "$CORE_ROOT/scripts/_argv_strict.sh"
+# ONE literal, referenced by BOTH the --help arm and the refusal — two strings
+# that must agree is the drift surface the refusal exists to remove.
+_ACCEPTED_FLAGS="--stage <stage> | --id <rec-id> | --summary | --counts | --accuracy | --unreflected | --replay-candidates | --narrative | --archive | --meta"
+
 declare -a FLAG_KEYS=()
-declare -a PASSTHROUGH=()
 STAGE=""
 REC_ID=""
 
@@ -21,27 +29,47 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --stage)
             STAGE="${2-}"
-            PASSTHROUGH+=(--stage "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
         --id)
             REC_ID="${2-}"
-            PASSTHROUGH+=(--id "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
-        --summary)            FLAG_KEYS+=(summary);            PASSTHROUGH+=("$1"); shift;;
-        --counts)             FLAG_KEYS+=(counts);             PASSTHROUGH+=("$1"); shift;;
-        --accuracy)           FLAG_KEYS+=(accuracy);           PASSTHROUGH+=("$1"); shift;;
-        --unreflected)        FLAG_KEYS+=(unreflected);        PASSTHROUGH+=("$1"); shift;;
-        --replay-candidates)  FLAG_KEYS+=(replay_candidates);  PASSTHROUGH+=("$1"); shift;;
+        --summary)            FLAG_KEYS+=(summary);            shift;;
+        --counts)             FLAG_KEYS+=(counts);             shift;;
+        --accuracy)           FLAG_KEYS+=(accuracy);           shift;;
+        --unreflected)        FLAG_KEYS+=(unreflected);        shift;;
+        --replay-candidates)  FLAG_KEYS+=(replay_candidates);  shift;;
         # --narrative: normalized outcome narrative (gap-062). Emits
         # {id, stage, outcome, narrative_key, narrative, chars} per record; the
         # 10-key fallback chain lives ONCE in mind_api/src/world/pipeline.py
         # (NARRATIVE_CHAIN) instead of being re-derived by each caller.
         # Composes with --id (one record) and --stage (filtered).
-        --narrative)          FLAG_KEYS+=(narrative);          PASSTHROUGH+=("$1"); shift;;
-        --archive)            FLAG_KEYS+=(archive);            PASSTHROUGH+=("$1"); shift;;
-        --meta)               FLAG_KEYS+=(meta);               PASSTHROUGH+=("$1"); shift;;
+        --narrative)          FLAG_KEYS+=(narrative);          shift;;
+        --archive)            FLAG_KEYS+=(archive);            shift;;
+        --meta)               FLAG_KEYS+=(meta);               shift;;
+        -h|--help)
+            # BEFORE the -*) arm: --help is a `-*` token, and refusing it with
+            # exit 2 would be a regression the refusal introduced rather than a
+            # defect it fixed (). Help exits 0.
+            argv_strict_help "$(basename "$0")" "<at least one filter>" \
+                "$_ACCEPTED_FLAGS";;
+        -*)
+            # REFUSE (). Every unrecognized flag used to land in a
+            # write-only PASSTHROUGH array (now deleted — it was never read), so
+            # the query silently answered a BROADER question than the caller
+            # asked and still exited 0. An over-broad READ returns rows and never
+            # looks like a failure, which is why this has to fail loudly rather
+            # than be documented. Caller scan first ( procedure):
+            # 0 blocking callers, 0 unresolved, 0 hazards across 5 roots.
+            argv_strict_refuse_unknown "$(basename "$0")" "$1" "$_ACCEPTED_FLAGS";;
         *)
-            PASSTHROUGH+=("$1"); shift;;
+            # KNOWN RESIDUAL, deliberately not fixed here ( ->
+            # ). This wrapper takes ZERO positionals and a stray one is
+            # still swallowed; the filter-required check below catches a
+            # positional ALONE (rc=1, loud), so it cannot produce a wrong answer
+            # by itself. The blast radius of refusing extra positionals fleet-wide
+            # is unmeasured, and guard-1562 requires enumerating what would NEWLY
+            # fire before shipping a refusal.
+            shift;;
     esac
 done
 

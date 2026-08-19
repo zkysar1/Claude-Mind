@@ -96,10 +96,10 @@ FINDINGS_COUNT=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --source)  SOURCE="$2"; shift 2 ;;
-        --summary) SUMMARY="$2"; shift 2 ;;
-        --outcome) OUTCOME="$2"; shift 2 ;;
-        --goal)    GOAL_ID="$2"; shift 2 ;;
+        --source)  SOURCE="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --summary) SUMMARY="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --outcome) OUTCOME="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --goal)    GOAL_ID="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         # § STATE-UPDATE quality flags — forwarded to iteration-close.sh
         # --phase state-update ONLY (mirrors iteration-close.sh:179-186).
         # Pass them on THIS call: guard-1235 rules out any post-hoc amend,
@@ -110,13 +110,35 @@ while [[ $# -gt 0 ]]; do
         # do-not-re-run conclusion still stands on the other two writers.)
         --tree-updated)          TREE_UPDATED="true"; shift ;;
         --tree-updated-override) TREE_UPDATED_OVERRIDE="true"; shift ;;
-        --artifacts-count)       ARTIFACTS_COUNT="$2"; shift 2 ;;
-        --encoding-score)        ENCODING_SCORE="$2"; shift 2 ;;
-        --findings-count)        FINDINGS_COUNT="$2"; shift 2 ;;
+        --artifacts-count)       ARTIFACTS_COUNT="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --encoding-score)        ENCODING_SCORE="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --findings-count)        FINDINGS_COUNT="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         # Forward --override-uncommitted to iteration-close.sh do_verify
         # (the only wrapped phase that consumes it).  — was missing
         # the twin patch from b13325b which only updated iteration-close.sh.
-        --override-uncommitted) OVERRIDE_UNCOMMITTED="$2"; shift 2 ;;
+        #
+        # DO NOT "fix" this by adding --override-missing-artifact and
+        # --override-residual to match iteration-close.sh (checked and rejected,
+        # , 2026-08-13). That symmetry argument is wrong here, and the
+        # asymmetry is correct: all THREE completion gates fire from exactly one
+        # site — cmd_update_goal's `field == "status" and value == "completed"`
+        # branch (aspirations.py ~1799 / ~1864 / ~1974) — and a RECURRING goal
+        # never reaches it. iteration-close.sh do_verify routes recurring goals
+        # to aspirations-complete-by.sh, and the daemon REFUSES the direct write
+        # outright (`invalid_status_transition: Cannot set status=completed on
+        # recurring goal. Use complete-by for cycle tracking`, observed live on
+        # ). So those two flags would be DEAD on this path — accepted,
+        # forwarded, and never consulted, which is worse than absent because it
+        # advertises an override that silently does nothing.
+        #
+        # By that same argument --override-uncommitted is itself now VESTIGIAL:
+        # its gate is at ~1974, on the same unreachable branch. It predates the
+        # complete-by routing ( is 2026-05-08) and is kept only because
+        # removing a flag callers may still pass is a breaking change with no
+        # benefit. Harmless, but do not read its presence as evidence that the
+        # completion gates fire here — that inference is what makes the
+        # add-the-other-two "fix" look right.
+        --override-uncommitted) OVERRIDE_UNCOMMITTED="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         -*) echo "recurring-close: unknown flag $1" >&2; exit 2 ;;
         *)
             if [[ -z "$GOAL_ID" ]]; then
@@ -259,6 +281,48 @@ if [[ "$FINAL_OUTCOME" != "$ORIGINAL_OUTCOME" ]]; then
 fi
 OUTCOME="$FINAL_OUTCOME"
 
+# ─── close out phase-4-execute () ───────────────────────────────────
+# Phase 4's phase-END lives at the tail of the Phase-4 body in the loop digest,
+# and the recurring shortcut never walks that far: its terminal imperative sends
+# the LLM straight from here to Skill(aspirations-spark) and LOOP_CONTINUE. So on
+# the recurring path phase-4-execute got a start and never an end, and phase-4 is
+# the one duration worth costing. Measured before this line existed — alpha/cc-07
+# start=6 end=2, bravo/cc-05 start=9 end=4 — while EVERY phase this script wraps
+# paired exactly (verify 7/7, state-update 9/9, learning-gate 6/6). That contrast
+# is the fingerprint: the gap is precisely the phase nobody emits an end for.
+#
+# Script-side, not a digest instruction telling the LLM to emit it first: this
+# shortcut exists to REMOVE LLM-owned steps from the close, so re-adding one at
+# the exact seam would reintroduce the drift the shortcut was built to prevent
+# (the  / g-283 signal-mutation rationale).
+#
+# POSITION IS CONSTRAINED FROM BOTH SIDES — do not move this line:
+#   BELOW  — it must precede the first wrapped phase, or the recorded end lands
+#            after phase-5-verify's start and the diary is out of order.
+#   ABOVE  — it must stay OUT of the span that test_recurring_close_quality_flags.py
+#            extracts (the quality-flag array build, up to the first wrapped
+#            phase). That test executes the span standalone under `set -u`, and
+#            this line references $SCRIPT_DIR and $GOAL_ID, which are unbound in
+#            an isolated fragment — placing it there fails all 5 of those tests
+#            with "SCRIPT_DIR: unbound variable". Measured, not hypothesised:
+#            that is exactly where this line was first written.
+#
+# AND DO NOT SPELL THE ANCHOR STRINGS IN THIS COMMENT. That test locates its
+# span with a plain text.index() on two literals; a comment QUOTING them becomes
+# the first match, so the test then extracts and executes this prose instead of
+# the real block and reports a nonsense array. Also measured — the first draft
+# of this comment named both anchors and broke the same 5 tests a second time,
+# by a completely different mechanism than the first. Describing a matcher's
+# pattern inside the text it scans is itself a match.
+#
+# Failure suppressed and `|| true`, mirroring iteration-close.sh::_emit_marker —
+# telemetry must never block a close; a broken diary writer is a dev-env bug, not
+# a close failure. Arg shape copied from that helper's live call, not from the
+# --help text (guard-920); the --note lands in the record's `content` field.
+bash "$SCRIPT_DIR/execution-diary.sh" phase-end phase-4-execute \
+    --goal "$GOAL_ID" --note "emitted by recurring-close (shortcut path)" \
+    >/dev/null 2>&1 || true
+
 # ─────────────────────────── 4 iteration-close phases ───────────────────────────
 # verify routes recurring goals through aspirations-complete-by.sh
 # (see iteration-close.sh do_verify, IS_RECURRING branch).
@@ -273,6 +337,8 @@ COMMON=(--goal "$GOAL_ID" --source "$SOURCE")
 
 MAX_RC=0
 PHASE_RESULTS=""
+FAILED_PHASES=""       # space-separated names, for the repair imperative ()
+FAILED_RETRY_CMDS=""   # one exact retry command per failed phase, newline-separated
 
 run_phase() {
     local phase_name="$1"; shift
@@ -282,6 +348,16 @@ run_phase() {
     if [[ $rc -ne 0 ]]; then
         echo "[recurring-close] PHASE FAILED: $phase_name (rc=$rc) — continuing to next phase" >&2
         PHASE_RESULTS+="${phase_name}=fail(${rc}) "
+        FAILED_PHASES+="${phase_name} "
+        # Capture the retry argv FROM THE CALL THAT FAILED rather than
+        # reconstructing it in the imperative. The four phases take genuinely
+        # different flag sets (verify alone takes --status/--outcome/
+        # --override-uncommitted; productivity takes no --goal at all), so a
+        # hand-written retry line is one refactor away from naming a shape the
+        # script never invokes — guard-920, the same defect class as a
+        # regression test pinned to a contract-ideal arg shape. %q quotes each
+        # word so a --summary containing spaces survives copy-paste.
+        FAILED_RETRY_CMDS+="bash core/scripts/iteration-close.sh $(printf '%q ' "$@")"$'\n'
         [[ $rc -gt $MAX_RC ]] && MAX_RC=$rc
     else
         PHASE_RESULTS+="${phase_name}=ok "
@@ -996,19 +1072,55 @@ echo "[recurring-close] ═══ ITERATION COMPLETE ═══"
 # `touch agents/<agent>/session/deadman-disabled` (reverts to byte-identical
 # pre-deadman imperative). See aspirations/SKILL.md Return Protocol +
 # core/config/rationale/deadman-switch.md.
+#
+# The proceed text is COMPUTED ONCE into _next_action and then either printed
+# on its own (clean close) or folded in as the LAST step of the repair sequence
+# (failed close). Deliberately not duplicated across the two paths: a second
+# copy of the proceed line is how the two would silently diverge, and this
+# block's whole defect () was that a reader could not tell the two
+# situations apart from the text.
 if [ -f "$AGENT_DIR/session/deadman-disabled" ]; then
+    _dm_tag=""
     if [[ "$OUTCOME" == "deep" ]]; then
-        echo "[recurring-close] OUTCOME=deep — NEXT ACTION REQUIRED: Call Skill(aspirations-spark) FIRST (Phase 6 fires on deep; NOT wrapped by recurring-close.sh), THEN Skill(aspirations) with args='loop'."
+        _next_action="Call Skill(aspirations-spark) FIRST (Phase 6 fires on deep; NOT wrapped by recurring-close.sh), THEN Skill(aspirations) with args='loop'."
     else
-        echo "[recurring-close] OUTCOME=routine — NEXT ACTION REQUIRED: Call Skill(aspirations) with args='loop' as your VERY NEXT tool call."
+        _next_action="Call Skill(aspirations) with args='loop' as your VERY NEXT tool call."
     fi
 else
+    _dm_tag=" (deadman-switch ON)"
     _dm_pair="emit the deadman pair as the loop re-entry (BOTH calls MANDATORY, in this order) — (1) ScheduleWakeup(prompt='<<autonomous-loop-dynamic>>', delaySeconds=600), the self-resurrection net, do NOT omit it; THEN (2) Skill(aspirations) with args='loop' (the LAST call). Skill ALONE keeps THIS iteration alive but leaves the NEXT unprotected against a silent text-death — arm the net EVERY iteration"
     if [[ "$OUTCOME" == "deep" ]]; then
-        echo "[recurring-close] OUTCOME=deep (deadman-switch ON) — NEXT ACTION REQUIRED: Call Skill(aspirations-spark) FIRST (Phase 6 fires on deep; NOT wrapped by recurring-close.sh), THEN ${_dm_pair}."
+        _next_action="Call Skill(aspirations-spark) FIRST (Phase 6 fires on deep; NOT wrapped by recurring-close.sh), THEN ${_dm_pair}."
     else
-        echo "[recurring-close] OUTCOME=routine (deadman-switch ON) — NEXT ACTION REQUIRED: ${_dm_pair}."
+        _next_action="${_dm_pair}."
     fi
+fi
+
+if [[ $MAX_RC -ne 0 ]]; then
+    # A phase FAILED. Before  this printed the proceed line above
+    # byte-identically to a clean close, so the only signal was `exit $MAX_RC`
+    # — which no reader of the imperative sees. The graceful-degradation
+    # wrapper () that let the later phases run anyway is CORRECT and is
+    # untouched; the defect was that its outcome never reached the text.
+    echo "[recurring-close] ⚠ PHASE FAILURE — MAX_RC=$MAX_RC — failed: ${FAILED_PHASES% } — phases: ${PHASE_RESULTS% }"
+    echo "[recurring-close] This close did NOT fully apply. Do NOT proceed as if it did."
+    echo "[recurring-close] Why this outranks the exit code: a failed VERIFY leaves the goal in-progress with a STALE lastAchievedAt, and lastAchievedAt is the field the selector scores recurring urgency from — so the goal comes back ranked MAXIMALLY overdue and re-runs work that already ran (g-115-5187, the completed-not-closed class reached from the close side)."
+    echo "[recurring-close] NEXT ACTION REQUIRED — REPAIR FIRST, in this order:"
+    echo "[recurring-close]   1. Re-run ONLY the failed phase(s). Exact argv, as invoked:"
+    # `|| [[ -n "$_cmd" ]]` is load-bearing, not defensive boilerplate: a bare
+    # `while read` DROPS a final line that lacks a trailing newline, and the
+    # dropped line here is the only actionable content in the whole repair
+    # imperative — the same shape of defect this goal exists to fix, one level
+    # down. run_phase appends $'\n' today so the bare form happens to work, but
+    # that couples two distant pieces of code with nothing asserting the link.
+    printf '%s' "$FAILED_RETRY_CMDS" | while IFS= read -r _cmd || [[ -n "$_cmd" ]]; do
+        [[ -n "$_cmd" ]] && echo "[recurring-close]        $_cmd"
+    done
+    echo "[recurring-close]   2. Read the goal back and assert lastAchievedAt falls inside THIS iteration. An UNMOVED lastAchievedAt is positive proof the retry cannot double-count, so the retry is safe (guard-1185)."
+    echo "[recurring-close]   3. ONLY once the retry succeeds, re-enter the loop: OUTCOME=$OUTCOME$_dm_tag — $_next_action"
+    echo "[recurring-close]   If the retry keeps failing, file it rather than looping — a repeat here is a real blocker, not contention."
+else
+    echo "[recurring-close] OUTCOME=$OUTCOME$_dm_tag — NEXT ACTION REQUIRED: $_next_action"
 fi
 echo "[recurring-close] A Bash echo or text summary as the terminal action kills the loop (see .claude/rules/return-protocol.md)."
 
@@ -1018,8 +1130,15 @@ echo "[recurring-close] A Bash echo or text summary as the terminal action kills
 # recurring path. Append-only, fail-open (|| true) — runs BEFORE `exit $MAX_RC`
 # so it never affects the close exit code. Controlled values → printf JSON is
 # injection-safe and avoids a python spawn on this hot path.
-printf '{"ts":"%s","script":"recurring-close","goal_id":"%s","outcome":"%s","agent":"%s","event":"iteration-complete-imperative"}\n' \
+# max_rc + phases added : PHASE_RESULTS was echoed once to stderr and
+# persisted NOWHERE, so 439 recurring closes had fired this imperative without a
+# single record of whether a phase failed — the frequency question ("how often
+# does this happen?") was not answerable retrospectively at all. These two
+# fields make it answerable prospectively; %s is safe because both are
+# script-controlled (an rc integer and a fixed "<name>=ok|fail(N) " vocabulary).
+printf '{"ts":"%s","script":"recurring-close","goal_id":"%s","outcome":"%s","agent":"%s","max_rc":%s,"phases":"%s","event":"iteration-complete-imperative"}\n' \
     "$(date +%Y-%m-%dT%H:%M:%S)" "${GOAL_ID:-unknown}" "${OUTCOME:-unknown}" "${MIND_AGENT:-unknown}" \
+    "${MAX_RC:-0}" "${PHASE_RESULTS% }" \
     >> "$CORE_ROOT/logs/imperative-fires.jsonl" 2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
 
 exit $MAX_RC

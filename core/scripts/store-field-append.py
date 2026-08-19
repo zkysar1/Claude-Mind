@@ -99,6 +99,7 @@ _gfa = _load_ssot()
 sentinel_for = _gfa.sentinel_for
 compose = _gfa.compose
 verify_post = _gfa.verify_post
+cas_conflict = _gfa.cas_conflict
 
 RC_OK = 0
 RC_USAGE = 2
@@ -108,6 +109,7 @@ RC_VALUE_SHAPE = 5
 RC_WRITE_FAILED = 6
 RC_VERIFY_FAILED = 7
 RC_ANCHOR_ABSENT = 8          # store-side only; no goal-side equivalent
+RC_CONCURRENT_MODIFICATION = 9  # same number on the goal side, deliberately ()
 
 # Per-store wiring. `canaries` are keys a hypothetical projection could not
 # produce — presence of any ONE proves the read is the real record.
@@ -268,6 +270,32 @@ def main(argv=None) -> int:
              "composed value starts with '{' or '[' — an update wrapper may JSON-decode it "
              "rather than store it as text. Prefix the existing content or the appended text "
              "so it does not begin with a JSON opener.")
+
+    # PRE-WRITE RE-READ (compare-and-swap) — . Inherited from the SSOT
+    # by import, never re-typed: the read at the top of main() and the write
+    # below are two subprocess round-trips with nothing serializing the span, so
+    # a peer's append landing in between is clobbered by this write while BOTH
+    # writers' verify_post() passes. --anchor does NOT cover this — it is checked
+    # against the value read BEFORE the window opens, so both writers see it
+    # satisfied. Full rationale (including why locked_rmw cannot reach across a
+    # subprocess boundary, and why class-(a) merge protection does not conserve
+    # a same-key append) is in the goal-field-append.py call site.
+    fresh_row = read_record(args.store, args.record_id)
+    current = fresh_row.get(args.field)
+    if current is None:
+        current = ""
+    if isinstance(current, str) and sentinel in current:
+        print(json.dumps({"ok": True, "changed": False,
+                          "reason": "idempotent: marker landed concurrently between read and write",
+                          "store": args.store, "id": args.record_id, "field": args.field,
+                          "marker": args.marker, "pre_len": len(pre)}, indent=2))
+        return RC_OK
+    conflict = cas_conflict(pre, current)
+    if conflict:
+        _die(RC_CONCURRENT_MODIFICATION,
+             "refusing to write — " + conflict + ". NOTHING WAS WRITTEN and no text was "
+             "lost. Re-run the identical command: the fresh read picks up their text and "
+             "the marker keeps the retry idempotent (g-115-5638).")
 
     # WRITE positionally. Never a flag in the value slot: these wrappers refuse
     # unknown leading-dash args with exit 2, and the pre-strict versions slid the

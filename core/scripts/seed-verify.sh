@@ -88,9 +88,24 @@ run_check "Cruft absence" "warn" "3" \
 
 # --- Check 4: Git state report ---
 echo "[4] Git state at destination"
-if [ -d "$DEST/.git" ]; then
+# -e, not -d: a linked git WORKTREE has a .git FILE (gitdir pointer), and the
+# promote --pr path plants into exactly such a worktree. With -d this whole
+# check skipped there, which blinded --expect-commit and let a 731-file
+# uncommitted plant sail to "PROMOTED" (2026-08-19, v2.9.3 run 2 — the same
+# dead-gate collapse  fixed, resurrected by the path shape).
+if [ -e "$DEST/.git" ]; then
     BRANCH="$(git -C "$DEST" branch --show-current 2>/dev/null || echo '(no branch)')"
-    STATUS="$(git -C "$DEST" status --porcelain 2>/dev/null)"
+    # FAIL CLOSED (). `2>/dev/null` discarded stderr and the exit
+    # code, so a git failure produced an empty STATUS that the report below
+    # renders as "clean" — a verification tool asserting cleanliness it never
+    # established. stderr now lands in the capture and rc is checked, so a
+    # failure is non-empty and reports as drift. --no-optional-locks keeps this
+    # probe off .git/index.lock (verified on git 2.43.0, not assumed).
+    STATUS_RC=0
+    STATUS="$(git --no-optional-locks -C "$DEST" status --porcelain 2>&1)" || STATUS_RC=$?
+    if [ $STATUS_RC -ne 0 ]; then
+        STATUS="git status failed (rc=$STATUS_RC) — cannot verify clean: ${STATUS:-<no stderr>}"
+    fi
     LAST="$(git -C "$DEST" log --oneline -1 2>/dev/null || echo '(no commits)')"
     REMOTE="$(git -C "$DEST" remote -v 2>/dev/null | head -1 || echo '(no remote)')"
     echo "   branch=$BRANCH"

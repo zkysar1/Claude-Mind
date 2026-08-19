@@ -175,8 +175,188 @@ def test_foreign_ids_stay_outside_the_sequence_space():
     assert _evict._capacity(asp) == 1
 
 
-def test_bare_suffix_form_still_parses():
-    """Backward-compat only. The corpus scan found ZERO bare-suffix ids, so this
-    pins that the fix ADDED the hyphenated spelling rather than swapping which
-    single spelling is understood."""
-    assert _evict._capacity(_asp("asp-335", ["g-335-1", "g-335-12a"])) == 13
+# ------------------------------------------ : one grammar, one parser
+#
+#  (above) fixed the SYMPTOM and left the divergence standing: it
+# taught `_capacity`'s `rstrip("a-z")` heuristic to also strip a trailing hyphen,
+# so the two readings agreed on every id the corpus happened to contain. Measured
+# 2026-08-10 (alpha, cc-07 / Linux 6.8.0-137-generic) over all 7,213 live goal +
+# evicted ids in 19 aspirations: ZERO divergences, and still three synthetic
+# ones — `12a`, `12ab`, `12-ab`, where the heuristic counted and the regex did
+# not. Agreement held by luck of population, not by construction.
+#
+# It was also never only TWO readings. The naive `startswith(prefix)` in
+# `_audit_violations` (and its twin in `_repair`) is the OTHER half of the
+# apples-to-oranges the incident named: `in_list=622` counted the four
+# `-a..d` legs, `capacity=618` did not, and the excess was the
+# difference between two id sets rather than a fact about the census.
+#
+# All four now read `_parse_seq_id`. The tests below pin the property that makes
+# the class unconstructable rather than merely absent: an id contributes to BOTH
+# sides of the pigeonhole inequality or to NEITHER.
+
+_ALL_SPELLINGS = [
+    "g-500-12",       # plain            — 7,163 of 7,213 live ids
+    "g-500-12-a",     # hyphenated letter —    50 of 7,213 live ids
+    "g-500-12a",      # bare letter      — 0 live, and unmintable (below)
+    "g-500-12ab",     # bare multi       — 0 live, unmintable
+    "g-500-12-ab",    # hyphenated multi — 0 live, unmintable
+    "g-500-12-a-b",   # two suffixes     — 0 live, unmintable
+    "g-500-12-1",     # numeric tail     — 0 live, unmintable
+    "g-xw-20260728T184008-01",  # cross-world id — outside the sequence space
+    "g-501-12",       # another aspiration's sequence space
+]
+
+
+def test_every_spelling_contributes_to_both_sides_or_neither():
+    """The load-bearing invariant. For EVERY id spelling, the left side of the
+    pigeonhole inequality (`in_list`) and the right side (`capacity`) must make
+    the same decision about whether that id exists. A spelling counted on one
+    side only is exactly what manufactured `excess=4` on a clean asp-335."""
+    for gid in _ALL_SPELLINGS:
+        base = _asp("asp-500", ["g-500-1"])
+        with_id = _asp("asp-500", ["g-500-1", gid])
+        counted_left = (_evict._in_list_sequence_goals(with_id)
+                        - _evict._in_list_sequence_goals(base)) > 0
+        counted_right = _evict._capacity(with_id) != _evict._capacity(base)
+        assert counted_left == counted_right, (
+            f"{gid}: in_list counted={counted_left} but capacity counted="
+            f"{counted_right} — the two sides read different grammars")
+
+
+def test_no_spelling_can_manufacture_a_violation():
+    """The consequence of the invariant above, stated as the outcome that
+    matters: adding ANY single id to a clean aspiration must not make the audit
+    report a violation, because a lone extra goal cannot exceed its own ceiling.
+    The old code could — a prefixed id the parser rejected raised in_list
+    without raising capacity."""
+    for gid in _ALL_SPELLINGS:
+        asp = _asp("asp-500", ["g-500-1", "g-500-2", gid])
+        assert _evict._audit_violations([asp]) == [], gid
+        assert _evict._conservation_violation(asp) is None, gid
+
+
+def test_bare_suffix_form_is_unmintable_so_symmetry_is_the_right_pin():
+    """Replaces the  backward-compat pin that asserted `_capacity`
+    still understood the BARE spelling (`g-335-12a` -> 13).
+
+    That pin was dropped deliberately, not incidentally. The bare spelling is
+    not merely unused — it is UNMINTABLE: the goal-id validator on the write
+    path rejects it, so no sanctioned write can produce one. Teaching ONE of two
+    counters to accept an id the other cannot is what the divergence WAS.
+    Symmetry is the property worth pinning; agreeing on an impossible id is not.
+    """
+    from aspirations import GOAL_ID_RE   # the write-path validator, verbatim
+
+    assert GOAL_ID_RE.match("g-335-262-a"), "hyphenated suffix must be mintable"
+    for unmintable in ("g-335-12a", "g-335-12ab", "g-335-12-ab", "g-335-12-a-b"):
+        assert not GOAL_ID_RE.match(unmintable), unmintable
+        # ...and both counters ignore it, so no phantom excess appears.
+        asp = _asp("asp-335", ["g-335-10", unmintable])
+        assert _evict._in_list_sequence_goals(asp) == 1
+        assert _evict._capacity(asp) == 10
+        assert _evict._audit_violations([asp]) == []
+
+
+def test_evict_reader_accepts_everything_the_write_validator_can_mint():
+    """Cross-file grammar parity, the drift this whole goal is about seen one
+    layer out. The evict-side reader must be a SUPERSET of the write-side
+    validator: any id that can be minted must be visible to the conservation
+    guard, or a real allocation sits outside the ceiling that is supposed to
+    bound it. (The reverse is not required — the reader is deliberately wider,
+    since the validator's bounded widths exclude legacy ids it must still read.)
+    """
+    from aspirations import GOAL_ID_RE
+
+    for gid in ("g-115-01", "g-115-999", "g-115-5740", "g-335-262-a", "g-001-42"):
+        assert GOAL_ID_RE.match(gid), f"fixture {gid} must be mintable"
+        assert _evict._parse_seq_id(gid, None) is not None, (
+            f"{gid} is mintable but invisible to the evict-side parser")
+
+
+# A census that VIOLATES without tripping `_legacy_census_loose`: that
+# suppressor requires BOTH no recorded evicted_ids AND in_list < capacity, so
+# recording one evicted id defeats it and the violation is reported for real.
+_VIOLATING_GIDS = ["g-500-10", "g-500-11-a", "g-500-12a",
+                   "g-xw-20260728T184008-01"]
+_VIOLATING_CENSUS = {"by_status": {"completed": 40},
+                     "evicted_ids": {"completed": ["g-500-9"]}}
+
+
+def test_repair_and_audit_count_in_list_the_same_way():
+    """`_audit_violations` decides WHETHER to repair; `_repair` decides BY HOW
+    MUCH. Both carried their own `startswith(prefix)` count. A divergence
+    between them repairs to a target the post-repair guard then rejects, so the
+    whole write aborts — a silent no-op dressed as a fix."""
+    audit = _evict._audit_violations(
+        [_asp("asp-500", _VIOLATING_GIDS, census=_VIOLATING_CENSUS)])
+    assert len(audit) == 1, "fixture must violate, else this proves nothing"
+    # The two out-of-grammar ids (bare-suffix, cross-world) must be excluded
+    # from in_list, exactly as they are from capacity.
+    assert audit[0]["in_list"] == 2, audit
+
+    repair = _evict._make_census_repair("2026-01-01T00:00:00")
+    # Raises if ANY violation survives, so returning at all is the parity proof.
+    repaired = repair([_asp("asp-500", _VIOLATING_GIDS,
+                            census=_VIOLATING_CENSUS)])
+    assert _evict._audit_violations(repaired) == []
+
+
+def test_repair_skips_what_the_audit_suppresses():
+    """The audit and the repair must agree on WHICH aspirations violate, not
+    only on how in_list is counted. `_repair` lacked `_legacy_census_loose`, so
+    an aspiration the audit classified as a known-loose FALSE POSITIVE was
+    shrunk anyway — collateral damage from one genuine violation elsewhere,
+    since main() gates the whole repair pass on the audit being non-empty."""
+    loose = _asp("asp-500", ["g-500-10", "g-500-11-a"],
+                 census={"by_status": {"completed": 40}})   # no evicted_ids
+    assert _evict._legacy_census_loose(
+        loose, _evict._in_list_sequence_goals(loose), _evict._capacity(loose))
+    assert _evict._audit_violations([loose]) == [], "audit must suppress this"
+
+    before = dict(loose["archived_census"]["by_status"])
+    # Repair a batch containing BOTH the suppressed aspiration and a genuine
+    # violation — the shape main() actually produces.
+    out = _evict._make_census_repair("2026-01-01T00:00:00")([
+        _asp("asp-500", ["g-500-10", "g-500-11-a"],
+             census={"by_status": {"completed": 40}}),
+        _asp("asp-501", _VIOLATING_GIDS[:2] + ["g-501-12a"],
+             census={"by_status": {"completed": 40},
+                     "evicted_ids": {"completed": ["g-501-9"]}}),
+    ])
+    assert out[0]["archived_census"]["by_status"] == before, (
+        "the audit-suppressed aspiration must be left untouched")
+
+
+def test_two_parsers_are_now_one():
+    """Structural: the second parser is GONE, not merely aligned. A future edit
+    that reintroduces a local id parse in this file should fail here rather than
+    wait for the next opposite-verdict incident.
+
+    Walks the AST rather than the source text — the prose in this file's own
+    docstrings names both deleted constructs, so a text scan reports them
+    present forever and the pin never fails (it would be a permanent red, which
+    is the same uselessness as a permanent green)."""
+    import ast
+
+    tree = ast.parse((SCRIPTS / "aspirations-evict-completed.py")
+                     .read_text(encoding="utf-8"))
+    seq_re_reads, rstrips, prefix_startswith = 0, 0, 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id == "_GOAL_SEQ_RE":
+            if isinstance(node.ctx, ast.Load):
+                seq_re_reads += 1
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr == "rstrip":
+                rstrips += 1
+            if (node.func.attr == "startswith" and len(node.args) == 1
+                    and isinstance(node.args[0], ast.Name)
+                    and node.args[0].id == "prefix"):
+                prefix_startswith += 1
+    assert rstrips == 0, "the rstrip id heuristic is back — that was parser #2"
+    assert prefix_startswith == 0, (
+        "a naive startswith(prefix) id count is back — that was the other side "
+        "of the apples-to-oranges")
+    assert seq_re_reads == 1, (
+        f"_GOAL_SEQ_RE is read {seq_re_reads}x; it must be read ONLY inside "
+        "_parse_seq_id — a second read is a second reading of the grammar")

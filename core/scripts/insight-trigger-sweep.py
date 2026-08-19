@@ -72,6 +72,14 @@ except Exception:
 # : reuse the canonical <agent>@<env-id> splitter — do NOT re-derive
 # peer detection (cross-deployment-channel.md "Addressing an agent").
 from peer_surface import split_author  # noqa: E402
+# : the environments-registry READER is shared with
+# peer-thread-relay-sweep so the peer name set cannot fork. Policy stays local.
+from _peer_registry import load_env_registry as _shared_load_env_registry  # noqa: E402
+# : the framework's own lock primitive, NOT a hand-rolled lock file.
+# acquire_lock is an atomic O_CREAT|O_EXCL create (never exists()+write — TOCTOU)
+# with a stale-break, and it routes through the storage backend, which is what
+# makes the run mutex work ACROSS BOXES rather than only on this one.
+from _fileops import acquire_lock, release_lock  # noqa: E402
 
 BOARD_DIR = WORLD_DIR / "board"
 WORLD_ASPS = WORLD_DIR / "aspirations.jsonl"
@@ -99,6 +107,42 @@ CHANNEL_EXCLUDE_SUFFIXES = ("-reads.jsonl", "-archive.jsonl")
 GRACE_HOURS = 1.0
 WINDOW_HOURS = 24.0
 MAX_GOALS_PER_RUN = 10
+
+#  — RUN MUTEX. load_converted_ids() is a pre-loop SNAPSHOT and the
+# filing loop never adds a newly-filed msg_id back into it, so two OVERLAPPING
+# runs both snapshot before either writes and both file the same trigger.
+# MEASURED:  / , identical origin_signal
+# insight_trigger:msg-20260811-230106-bravo-5014, filed 11 seconds apart from a
+# board post that exists exactly once.
+#
+# WHY A LOCK RATHER THAN THE TWO CHEAPER SHAPES. Re-reading converted_ids
+# immediately before each file only NARROWS the window (both runs can still
+# re-read before either writes); adding each filed msg_id to the in-memory set
+# fixes nothing here at all, because `pending` is already deduped against the
+# snapshot so no single run files the same msg_id twice. Only serializing the
+# snapshot-through-filing section ELIMINATES it: a second run cannot enter until
+# the first has finished writing, so its snapshot necessarily SEES those writes.
+#
+# The lock lives under WORLD_DIR on purpose. The backend resolves a governed
+# path to the distributed lock, so this excludes runs on OTHER BOXES — which is
+# the case that matters, since any box may run this sweep. CAVEAT, stated
+# because it is invisible at the call site: that holds when a governed root is
+# in the env, which insight-trigger-sweep.sh guarantees by sourcing _paths.sh.
+# A bare `py -3 core/scripts/insight-trigger-sweep.py` has no governed root, so
+# _fileops._lock_backend() falls back to a LOCAL file lock (it warns once on
+# stderr) and the mutex degrades to same-box-only. Prefer the wrapper.
+SWEEP_LOCK = WORLD_DIR / "insight-trigger-sweep.lock"
+# Short: a contending run should SKIP, not queue. The sweep is periodic and
+# idempotent, so the run already holding the lock covers the same triggers —
+# waiting buys nothing and risks two runs finishing back-to-back.
+SWEEP_LOCK_TIMEOUT = 5
+# Generous: the stale-break compares NOW against the lock file's mtime, which is
+# stamped at CREATE and never refreshed, so this must exceed the whole critical
+# section or a live holder gets its lock broken mid-filing and the race returns.
+# Worst case is MAX_GOALS_PER_RUN daemon add-goal writes at the wrapper's
+# RT_CURL_TIMEOUT=180s ceiling. 600s sits far above the realistic worst case and
+# far below the sweep's cadence, so a crashed run costs at most one skipped tick.
+SWEEP_LOCK_STALE_SECONDS = 600
 
 #  outcome 2: the CONVERSION window above is 24h while this sweep's
 # cadence is 5.33h, so a run that slips a day drops triggers with no trace —
@@ -379,21 +423,18 @@ def _load_env_registry():
     fewer entries, never an abort — a missing registry degrades to "no peers
     known", which preserves the bare-name-means-local installed base.
     """
-    registry = {}
-    try:
-        import yaml
-        if ENV_REGISTRY_DIR.is_dir():
-            for p in sorted(ENV_REGISTRY_DIR.glob("*.yaml")):
-                try:
-                    data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-                except Exception:
-                    continue
-                env_id = str(data.get("environment_id") or "").strip()
-                if env_id:
-                    registry[env_id] = data
-    except Exception:
-        pass
-    return registry
+    # Delegates to _peer_registry (), the SSOT for reading that
+    # directory. The loader moved because a SECOND consumer
+    # (peer-thread-relay-sweep) needed the same names and THIS module's filename
+    # is hyphenated, so it cannot be imported — a copy would have been FORCED
+    # rather than chosen, and  says why that is dangerous: "a second
+    # copy would drift and getting it wrong pushes local work at a peer."
+    #
+    # ONLY the loader is shared. The POLICY built on it in resolve_addressing
+    # below (which envs are peers when self_env is unresolvable) deliberately
+    # DIVERGES from the relay sweep's and must not be unified — see the
+    # "Deliberate non-sharing" note in _peer_registry.py.
+    return _shared_load_env_registry(ENV_REGISTRY_DIR)
 
 
 def _self_env():
@@ -897,54 +938,109 @@ def main():
     # must never reach the filing loop, and refusal-first beats dedup (the
     # safety verdict outranks the bookkeeping one).
     triggers, addressing_refused, collision_set = resolve_addressing(raw_triggers)
-    converted_ids = load_converted_ids()
-    pending = []
-    skipped = []
-    for t in triggers:
-        if t["msg_id"] in converted_ids:
-            skipped.append({"msg_id": t["msg_id"], "reason": "already_converted"})
-            continue
-        pending.append(t)
-
-    filed = []
-    overflow = []
-    audit_stale = []  # : skipped because target already terminal
-    affects_missing = []  # : filed-with-warning when target not found
-    for t in pending:
-        if len(filed) >= MAX_GOALS_PER_RUN:
-            overflow.append(t)
-            continue
-        #  / rb-1150: re-probe affects:<goal-id> target status
-        # before filing the Apply. Authors of insight_triggers tag with
-        # `affects:<goal-id>` when the action points at a specific goal;
-        # absent that tag we file unchanged (no probe target available).
-        if t.get("affects_goal"):
-            target_status = probe_goal_status(t["affects_goal"])
-            if target_status in TERMINAL_GOAL_STATES:
-                note_result = {"posted": False, "msg_id": None}
-                if not dry_run:
-                    note_result = _emit_audit_stale_note(t, target_status)
-                audit_stale.append({
-                    "msg_id": t["msg_id"],
-                    "author": t["author"],
-                    "affects_goal": t["affects_goal"],
-                    "target_status": target_status,
-                    "action": t["action"],
-                    "note_result": note_result,
-                })
+    #  CRITICAL SECTION opens here and closes after the filing loop.
+    # It spans exactly snapshot -> file, because that pair IS the race; the
+    # read-only work above (load_triggers, resolve_addressing) is deliberately
+    # left outside so the lock is held for as little time as possible.
+    #
+    # --dry-run does NOT take the lock, and that is deliberate rather than an
+    # oversight. A dry run writes nothing, so it cannot produce a duplicate; and
+    # taking the lock would break this goal's own regression guard, which calls
+    # for a --dry-run IMMEDIATELY AFTER a live run to confirm it reports filed=0
+    # / skipped=N. If the dry run blocked on the live run's lock it could report
+    # nothing at all, destroying the diagnostic. /prime Step 5.5b's
+    # `--dry-run --json` consumer is unaffected for the same reason.
+    sweep_lock_held = False
+    if not dry_run:
+        try:
+            acquire_lock(SWEEP_LOCK, timeout=SWEEP_LOCK_TIMEOUT,
+                         stale_seconds=SWEEP_LOCK_STALE_SECONDS)
+            sweep_lock_held = True
+        except TimeoutError:
+            # Another live run holds the mutex. SKIP — do not wait, do not file.
+            # This is a success, not a failure: the holder is sweeping the same
+            # triggers, so there is no work to lose and rc=0 keeps the recurring
+            # tick from reporting a phantom error.
+            #
+            # The output is deliberately LOUD and structurally distinct. A bare
+            # `filed: 0` here is TRUE but reads exactly like a clean no-op run,
+            # which is the false-clean shape this fleet keeps rediscovering
+            # (guard-1760: report what was NOT looked at, never only what was).
+            skip_summary = {
+                "mode": "skipped-another-run-holds-lock",
+                "lock_skipped": True,
+                "lock_path": str(SWEEP_LOCK),
+                "scanned": 0,
+                "filed": 0,
+                "skipped": 0,
+                "reason": ("another insight-trigger-sweep run holds the run mutex; "
+                           "this run filed nothing and inspected nothing"),
+            }
+            if args.json:
+                print(json.dumps(skip_summary, indent=2))
+            else:
+                print("[insight-trigger-sweep] SKIPPED — another run holds the run "
+                      f"mutex ({SWEEP_LOCK}). Nothing was scanned and nothing was "
+                      "filed; the run that holds it covers these triggers. "
+                      "This is not an error.")
+            return 0
+    try:
+        converted_ids = load_converted_ids()
+        pending = []
+        skipped = []
+        for t in triggers:
+            if t["msg_id"] in converted_ids:
+                skipped.append({"msg_id": t["msg_id"], "reason": "already_converted"})
                 continue
-            elif target_status is None:
-                # Target not found — file as-is with a warning (per
-                # acceptance criteria: "target missing -> file as-is with
-                # warning"). The warning lands in the affects_missing list
-                # and is surfaced in the summary.
-                affects_missing.append({
-                    "msg_id": t["msg_id"],
-                    "affects_goal": t["affects_goal"],
-                    "warning": "affects target not found in any queue at filing time",
-                })
-        result = file_goal(t, dry_run=dry_run)
-        filed.append({"trigger": t, "result": result})
+            pending.append(t)
+
+        filed = []
+        overflow = []
+        audit_stale = []  # : skipped because target already terminal
+        affects_missing = []  # : filed-with-warning when target not found
+        for t in pending:
+            if len(filed) >= MAX_GOALS_PER_RUN:
+                overflow.append(t)
+                continue
+            #  / rb-1150: re-probe affects:<goal-id> target status
+            # before filing the Apply. Authors of insight_triggers tag with
+            # `affects:<goal-id>` when the action points at a specific goal;
+            # absent that tag we file unchanged (no probe target available).
+            if t.get("affects_goal"):
+                target_status = probe_goal_status(t["affects_goal"])
+                if target_status in TERMINAL_GOAL_STATES:
+                    note_result = {"posted": False, "msg_id": None}
+                    if not dry_run:
+                        note_result = _emit_audit_stale_note(t, target_status)
+                    audit_stale.append({
+                        "msg_id": t["msg_id"],
+                        "author": t["author"],
+                        "affects_goal": t["affects_goal"],
+                        "target_status": target_status,
+                        "action": t["action"],
+                        "note_result": note_result,
+                    })
+                    continue
+                elif target_status is None:
+                    # Target not found — file as-is with a warning (per
+                    # acceptance criteria: "target missing -> file as-is with
+                    # warning"). The warning lands in the affects_missing list
+                    # and is surfaced in the summary.
+                    affects_missing.append({
+                        "msg_id": t["msg_id"],
+                        "affects_goal": t["affects_goal"],
+                        "warning": "affects target not found in any queue at filing time",
+                    })
+            result = file_goal(t, dry_run=dry_run)
+            filed.append({"trigger": t, "result": result})
+    finally:
+        # : released the instant filing ends, so the out-of-window
+        # digest half below runs OUTSIDE the mutex. That half writes board
+        # digests, not goals, and carries its own dedup (oow_routed_ids), so it
+        # is not this goal's race — and holding the lock across it would extend
+        # the critical section well past what the stale window is sized for.
+        if sweep_lock_held:
+            release_lock(SWEEP_LOCK)
 
     if dry_run:
         filed_count = len(filed)

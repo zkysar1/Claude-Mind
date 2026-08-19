@@ -49,6 +49,14 @@ def _iso(offset_h=0):
     return (datetime.now() - timedelta(hours=offset_h)).strftime("%Y-%m-%dT%H:%M:%S")
 
 
+def _iso_s(offset_h=0, plus_s=0):
+    """Timestamp offset_h hours ago, shifted forward by plus_s seconds — for
+    retry-collapse tests that need sub-window spacing (g-115-6163)."""
+    return (datetime.now() - timedelta(hours=offset_h) + timedelta(seconds=plus_s)).strftime(
+        "%Y-%m-%dT%H:%M:%S"
+    )
+
+
 def test_clean_at_threshold_is_not_a_hit(tmp_path):
     # Exactly 3 -> NOT over (threshold is STRICTLY >3).
     _write(tmp_path, "alpha", [_line("alpha", f"g-{i}", "g-t", "precondition-fail", _iso(1)) for i in range(3)])
@@ -173,10 +181,13 @@ def test_stuck_at_top_recommends_routing_not_weights(tmp_path):
 def test_concentrated_lane_deviations_are_stuck_routing(tmp_path):
     # The  shape: 13 cross-agent all over ONE top -> stuck-at-top routing,
     # NOT weights, even though the code-class is lane-discipline.
+    # Timestamps spread 10 min apart (): identical-tuple rows are 13
+    # DISTINCT re-claim decisions here, so each must sit outside the 300s retry
+    # window — same-timestamp rows would now correctly collapse to ONE decision.
     _write(
         tmp_path,
         "bravo",
-        [_line("bravo", "g-x", "g-001-339", "cross-agent", _iso(1)) for _ in range(13)],
+        [_line("bravo", "g-x", "g-001-339", "cross-agent", _iso_s(4, i * 600)) for i in range(13)],
     )
     r = MOD.audit(since_hours=24, root=tmp_path)
     assert r["stuck_tops"]["g-001-339"]["count"] == 13
@@ -218,6 +229,81 @@ def test_force_override_recommends_weights(tmp_path):
     g = MOD.build_investigate_goal(r)
     assert "WEIGHT/ENUM SIGNAL" in g["description"]
     assert "enum/weights gap" in g["title"]
+
+
+# ── : claim RETRIES collapse into decisions before any counting ──
+
+
+def test_retries_collapse_to_one_decision(tmp_path):
+    # The measured alpha cluster: ONE claim decision retried 4x over 65s emits 4
+    # identical-tuple rows. Counted raw, alpha is 1 short of over-threshold and
+    # the top gains 4 recurrences; collapsed, it is ONE decision.
+    _write(
+        tmp_path,
+        "alpha",
+        [_line("alpha", "g-115-6083", "g-335-1215", "partner-claim", _iso_s(1, s)) for s in (0, 20, 45, 65)],
+    )
+    r = MOD.audit(since_hours=24, root=tmp_path)
+    assert r["raw_rows"] == 4
+    assert r["retries_collapsed"] == 3
+    assert r["per_agent"]["alpha"]["total"] == 1
+    assert r["total_overrides"] == 1
+
+
+def test_collapsed_retries_annotate_evidence_rows(tmp_path):
+    # A hit whose decision was retried carries the collapse count into the
+    # Investigate goal evidence — the transparency half of .
+    _write(
+        tmp_path,
+        "echo",
+        [_line("echo", "g-1", "g-t", "force-override", _iso_s(1, s)) for s in (0, 30)],
+    )
+    r = MOD.audit(since_hours=24, root=tmp_path)
+    assert r["hits"] is True  # force-override hits at decision count 1
+    assert len(r["force_override_rows"]) == 1  # 2 rows -> 1 decision
+    assert r["force_override_rows"][0]["retries"] == 1
+    g = MOD.build_investigate_goal(r)
+    assert "[+1 retries collapsed]" in g["description"]
+
+
+def test_retry_collapse_prevents_false_stuck_top(tmp_path):
+    # 4 retries of ONE decision would cross the >3 stuck-top threshold by
+    # themselves — the "manufactures false stuck_tops" half of the defect.
+    _write(
+        tmp_path,
+        "alpha",
+        [_line("alpha", "g-115-6083", "g-335-1215", "partner-claim", _iso_s(1, s)) for s in (0, 20, 45, 65)],
+    )
+    r = MOD.audit(since_hours=24, root=tmp_path)
+    assert r["stuck_tops"] == {}
+    assert r["hits"] is False
+
+
+def test_same_tuple_beyond_window_is_a_new_decision(tmp_path):
+    # Anchored window: a same-tuple row >300s after the cluster ANCHOR is a new
+    # decision. Rows at 0s / 250s / 500s -> 250s folds into the 0s anchor, 500s
+    # is beyond it and anchors a second decision (chained semantics would give 1).
+    _write(
+        tmp_path,
+        "alpha",
+        [_line("alpha", "g-1", "g-t", "partner-claim", _iso_s(1, s)) for s in (0, 250, 500)],
+    )
+    r = MOD.audit(since_hours=24, root=tmp_path)
+    assert r["per_agent"]["alpha"]["total"] == 2
+    assert r["retries_collapsed"] == 1
+
+
+def test_distinct_claims_within_window_never_collapse(tmp_path):
+    # 4 DIFFERENT goals claimed seconds apart share agent/top/code but are
+    # distinct decisions — over-threshold must still fire on genuine volume.
+    _write(
+        tmp_path,
+        "bravo",
+        [_line("bravo", f"g-{i}", "g-t", "self-abstention", _iso_s(1, i * 10)) for i in range(4)],
+    )
+    r = MOD.audit(since_hours=24, root=tmp_path)
+    assert r["retries_collapsed"] == 0
+    assert r["agents_over_threshold"] == {"bravo": 4}
 
 
 # ──  / : _parse_ts offset-aware hardening regression guard ──

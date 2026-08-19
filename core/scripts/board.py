@@ -139,6 +139,26 @@ def cmd_post(args):
                           file=sys.stderr)
             except Exception:
                 pass
+        # : WARN (do NOT block) on a tag that LOOKS like an address but
+        # routes to nobody — `requires_action_by:` is the only recognised
+        # prefix, so `forward-to:omni@zds-mind` parses to agent
+        # `forward-to:omni` and matches nothing. Free-form tags mean the poster
+        # otherwise gets no feedback at all. Suppressed when another tag on the
+        # same post already routes to that agent. Fail-open. Twin:
+        # board_write.py daemon post handler.
+        try:
+            from peer_surface import suspected_routing_tags
+            _tags = [t.strip() for t in args.tags.split(",")] if args.tags else []
+            for bad_tag, who in suspected_routing_tags(_tags):
+                print(f"[board-post] WARN: tag '{bad_tag}' looks like it "
+                      f"addresses '{who}' but routes to NOBODY — "
+                      f"`requires_action_by:` is the only recognised prefix. "
+                      f"Use 'requires_action_by:{who}' or "
+                      f"'requires_action_by:{who}@<env-id>' (a bare '{who}' "
+                      f"also routes). Posting anyway; not blocking.",
+                      file=sys.stderr)
+        except Exception:
+            pass
         return {
             "id": generate_message_id(channel, author, items=items),
             "author": author,

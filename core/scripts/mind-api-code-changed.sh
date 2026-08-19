@@ -23,6 +23,15 @@
 #                                            core/scripts/tree_match.py
 #                                            core/scripts/predicate.py
 #                                            core/scripts/aspirations.py
+#                                            core/scripts/peer_surface.py
+#
+#      peer_surface.py added 2026-08-14 (): board_write.py's post
+#      handler now imports suspected_routing_tags from it for the routing-tag
+#      advisory, which puts it in the daemon's import surface. Caught by
+#      test_daemon_import_surface.py in the same run that introduced the
+#      import — without this entry a commit touching ONLY peer_surface.py
+#      would diff clean, post-commit would skip the restart, and the daemon
+#      would serve the old matcher.
 #
 #      predicate.py + aspirations.py added 2026-08-08 (, reducer pass on
 #      hostname cc-04, uname -r 6.8.0-136-generic). Both entered the daemon surface
@@ -199,6 +208,7 @@ for _attempt in 1 2 3; do
         core/scripts/tree_match.py \
         core/scripts/predicate.py \
         core/scripts/aspirations.py \
+        core/scripts/peer_surface.py \
         2>&1)"
     _diff_rc=$?
     if [ "$_diff_rc" -eq 0 ]; then

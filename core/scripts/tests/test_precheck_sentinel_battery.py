@@ -226,3 +226,95 @@ def test_battery_registry_order_is_protocol_order():
     # a lexicographic sort would not, so the fix cannot silently regress.
     assert _phase_rank("0-pre2") < _phase_rank("0-pre10")
     assert sorted(["0-pre10", "0-pre2"]) == ["0-pre10", "0-pre2"]  # text sort is wrong
+
+
+# --- the composed-caller seam (2026-08-18) ----------------------------------
+#
+# Everything above pins what the battery COMPUTES. Nothing pinned whether the
+# result REACHES the script that runs it, and that is where it broke: the
+# battery emitted only `set`, while iteration-open.py lifts `payload["findings"]`
+# / `payload["blind"]` by those key names. So `iteration-open.sh --apply` ran the
+# lane, got rc=0, surfaced nothing, and printed "no findings; all dispatched
+# lanes clean" while FOUR always-run gates sat set and undispatched (measured
+# 2026-08-18, zeta/cc-02: force_tree_maintain, force_experience_archival,
+# fresh_eyes_dispatch_pending, force_metric_encoding_pending).
+#
+# Every test above passed throughout — they had to, since the computation was
+# correct the whole time. guard-1943: a green suite certifies the FUNCTION,
+# never the WIRING. These two tests are the wiring.
+
+
+def _load_iteration_open():
+    spec = importlib.util.spec_from_file_location(
+        "iteration_open", SCRIPTS_DIR / "iteration-open.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_set_sentinels_reach_the_composed_caller(tmp_path):
+    """A SET sentinel must survive the hop into iteration-open's findings list.
+
+    Asserted through the REAL consumer function against the REAL battery
+    payload, not against a hand-built dict — a fixture of my own shape would
+    re-encode the same assumption that caused the defect (guard-318: confirm
+    the producer's shape, never the caller's intuition).
+    """
+    wm = {
+        "slots": {
+            "force_tree_maintain": {"triggered_at": "2026-08-18T00:00:00",
+                                    "source": "encoding-drift", "threshold": 3},
+            "fresh_eyes_dispatch_pending": {"fired": True, "core_count": 3,
+                                            "loc_changed": 431},
+        }
+    }
+    wm_path = tmp_path / "working-memory.yaml"
+    wm_path.write_text(yaml.safe_dump(wm), encoding="utf-8")
+
+    report = _run_battery(wm_path)
+    assert len(report["set"]) == 2, "precondition: both sentinels are set"
+
+    itopen = _load_iteration_open()
+    lifted = itopen._findings_from("sentinel-battery", report)
+    names = {f["name"] for f in lifted}
+    assert names == {"force_tree_maintain", "fresh_eyes_dispatch_pending"}, (
+        f"the composed caller must see every set sentinel, got {names} -- if this "
+        f"is empty the battery is invisible inside iteration-open again and its "
+        f"run will render as an all-clear"
+    )
+    assert all(f["detail"] for f in lifted), "a finding with no detail is unactionable"
+
+    # NEGATIVE CONTROL: reproduce the pre-fix shape and prove it lifts nothing.
+    # Without this the assertion above passes for a trivially green reason and
+    # cannot distinguish a working seam from a consumer that accepts anything
+    # (guard-2903/guard-2536: assert the path was REACHED, not just that no
+    # error occurred).
+    pre_fix = {k: v for k, v in report.items() if k != "findings"}
+    assert itopen._findings_from("sentinel-battery", pre_fix) == [], (
+        "the pre-fix payload must lift ZERO -- if it lifts anything, this test "
+        "cannot detect the regression it exists for"
+    )
+
+
+def test_fail_open_reports_blind_rather_than_clean(tmp_path):
+    """Fail-open must not read as fail-SILENT to a composed caller.
+
+    An errored battery reaching iteration-open with zero findings AND zero
+    blind entries is indistinguishable from a genuinely clean run, which would
+    defeat that script's own "NO FINDINGS REACHED -- N lane(s) blind" branch.
+    guard-4093: a lane that FAILED must never read as clean.
+    """
+    missing = tmp_path / "does-not-exist.yaml"
+    report = _run_battery(missing)
+
+    assert report.get("error"), "a missing WM file is an error condition"
+    itopen = _load_iteration_open()
+    blind = itopen._blind_from("sentinel-battery", report)
+    assert blind, (
+        "an errored battery must surface as BLIND to the composed caller; "
+        "otherwise its failure is rendered as an all-clear"
+    )
+    assert itopen._findings_from("sentinel-battery", report) == [], (
+        "and it must not manufacture findings it never computed"
+    )

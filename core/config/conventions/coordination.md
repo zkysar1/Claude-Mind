@@ -369,7 +369,14 @@ directive across all three agents).
 
 Why this is safe:
 - `pending-questions.yaml` is gitignored at `.gitignore:81 */session/`
-- `pending-questions-sweep.py` is **read-only by design** (its docstring is the SoT)
+- `pending-questions-sweep.py` is **read-only unless an apply flag is passed**
+  (its docstring is the SoT). This line read "read-only by design" until
+  2026-08-10; that was false from the moment `--apply` shipped, and the safety
+  argument here rested on it. The writers are `--apply` (verdict=auto_resolve)
+  and `--apply-cleanup` (verdict=needs_transition), both atomic via
+  tempfile + os.replace. Neither runs without being asked, so the argument still
+  holds for the READ path — but a caller passing an apply flag IS a writer and
+  must be counted as one.
 - The runner only writes pending-questions.yaml during rare consolidation Step 2.8;
   same-second concurrent writes between an observer and runner are extremely rare
 - The file is small (kB-scale) and append-mostly; read-modify-write races are tolerable
@@ -421,14 +428,68 @@ text is a human-readable summary. Tags carry structured metadata:
 
 ### Protocol Flow
 
-1. **Post**: Sender agent posts directive to coordination channel with relevant tags
-2. **Scan**: Receiving agent's Phase 2.07 (Directive Scan) reads directives since last scan
-3. **Score**: `goal-selector.py` reads active directives, applies `directive_boost`
-   as a weighted scoring criterion to matching goals/categories
-4. **Acknowledge**: Receiving agent posts `--type status --reply-to <directive-id>`
-   with tag `acknowledged,<agent-name>`
-5. **Expire**: Directives auto-expire per their `expires` tag, or `scope: session`
-   directives expire at session end
+The **Body scope** column is load-bearing — see the subsection below before
+assuming a directive reached the Body you meant it for.
+
+| # | Step | Who runs it | Body scope |
+|---|---|---|---|
+| 1 | **Post**: Sender posts directive to coordination channel with relevant tags | sender | any Body |
+| 2 | **Scan**: Receiver's Phase 2.07 (Directive Scan) reads directives since last scan | `aspirations-select` | **REDUCER ONLY** |
+| 3 | **Score**: `goal-selector.py` reads active directives, applies `directive_boost` as a weighted scoring criterion to matching goals/categories | `goal-selector.py` | **EVERY Body** |
+| 4 | **Acknowledge**: Receiver posts `--type status --reply-to <directive-id>` with tag `acknowledged,<agent-name>` | `aspirations-select` | **REDUCER ONLY** |
+| 5 | **Expire**: Directives auto-expire per their `expires` tag, or `scope: session` directives expire at session end | mechanical | n/a |
+
+### Body Scope — what actually reaches a worker
+
+A worker Body skips `/prime` and strategic-scan, so it never *reads* the board.
+It does **not** follow that a directive cannot steer it: **steps 2 and 4 are
+reducer-only, but step 3 runs on every Body**, because `goal-selector.py` reads
+`world/board/coordination.jsonl` itself rather than being handed the board by a
+prior phase, and `worker-loop` calls `goal-selector.sh` like any other Body. The
+board-reading half and the board-*acting* half are different halves.
+
+Measured 2026-08-17 (zeta, `hostname` cc-02, `uname -r` 6.8.0-137-generic) on a
+live 1,228-candidate selector run: **21 candidates carried `directive_boost=1.5`**
+— exactly the goals targeted by the standing directive in force at the time. The
+key is present-and-`0.0` on the untargeted candidates including rank 1, so the
+zeros are real absences rather than a missing field (the rb-245 check).
+
+So the contract has three parts, and only the first is what a naive reading
+expects:
+
+1. **Additive directives DO reach every Body — through the score, not the board.**
+   A `priority_shift` / `focus_window` directive carrying `target:<goal-id>` tags
+   raises those goals for the reducer and every worker alike. No peek is needed
+   and none should be added: a worker directive-read would duplicate scoring that
+   already happens, at the cost of a board call per cycle.
+2. **Exclusionary directives reach NO Body through scoring at all** — this is the
+   genuine gap, and it is not the one the worker-blindness framing predicts.
+   `directive_boost` is purely ADDITIVE: it can raise an in-lane goal's score but
+   has no mechanism to *suppress* an out-of-lane candidate. A lane pin ("take only
+   X and Y, skip everything else") therefore has no representation in the selector
+   whatsoever and can only be honored by the agent at claim time. On the reducer
+   that honoring exists (Phase 2.07's guard-1310 MUST-SELECT banner); a worker has
+   no equivalent. Steer exclusively at your peril — prefer expressing the same
+   intent additively, or encode it in the goal records. (guard-2912.)
+3. **`target:` must name a GOAL id.** `target_goals` is compared against goal ids,
+   so `target:asp-NNN` contributes exactly zero boost while looking like a
+   correctly-formed directive. Enumerate the goals and tag them individually.
+
+The LLM-side work that is genuinely reducer-only is Phase 2.07's judgment half:
+acknowledgment replies (step 4), insight-trigger processing, and the guard-1310
+honor banner. A directive is therefore *scored* fleet-wide but *answered* by one
+Body — which is the correct division, since N Bodies acking one directive would be
+N times the board noise for no added signal.
+
+**This corrects the premise of g-306-222**, which filed the defect as "structurally
+invisible to every worker Body, which ranks purely by goal-selector score" and
+prescribed steering via priority fields instead. The scorer reads `directive_boost`
+as well as `priority`, so board steering does work on workers — for additive
+directives. Documenting it as "board-directives-are-reducer-only", the resolution
+that goal proposed, would have shipped a contract that is false in the common case
+and silent on the real gap (2). Note also that steering which must produce *work*
+still has to reach a queue: a board post alone is advisory context and the selector
+only sees queues (guard-732).
 
 ### Rules
 
@@ -905,6 +966,62 @@ audit trail (immutable, queryable per-event). team-state.in_flight is the live
 snapshot (mutable, lookup-by-agent). Both write at the same instant; do not rely on
 one to derive the other.
 
+**TWO SURFACES. READING ONLY `in_flight` IS A PERMANENTLY-OPEN GATE, NOT A PARTIAL
+ONE** (g-306-223, documenting the shard g-306-132-d shipped). A Mind can run several
+Bodies, and the two surfaces are written by *disjoint* sets of them:
+
+| surface | written by | writer |
+|---|---|---|
+| `agent_status.<agent>.in_flight` | the REDUCER Body only — this box's `session/running-session-id` exists AND equals this session's `MIND_SID` | `team-state-in-flight.sh` |
+| `agent_status.<agent>.in_flight_bodies.<MIND_SID>` | every OTHER Body (cross-box worker: rsid file absent; same-box worker: rsid mismatch) | same script, SKIP-then-body-row branch |
+
+The branch is exclusive: a non-reducer Body **never** touches `in_flight` (that
+guarantee is what stops a worker blanking its reducer's live row), and a reducer
+never writes a body row. **No SID means no row at all** — an unkeyed body row could
+not be cleared by its owner.
+
+So a consumer reading only `in_flight` does not see "the last claimer"; on a
+worker-executed goal it sees **nothing**. Measured 2026-08-16 (zeta, `hostname`
+cc-02, `uname -r` 6.8.0-137-generic, own-cloud, live 5-agent fleet, two reads 22
+min apart): `in_flight` **null for all five agents** while `in_flight_bodies`
+carried **7 live claims** (alpha 5, bravo 2). Same shape measured 2026-08-10 on
+four agents (guard-997's corrected mechanism clause). Workers now execute most
+units, so this is the ordinary state, not an edge case.
+
+**Do not read the older framing that says two Bodies "overwrite each other" so the
+snapshot shows the last claimer.** That described the pre-shard store. The failure
+mode inverted rather than shrinking: a blind reader used to undercount N live
+claims as 1, and now undercounts them as **0** — which is worse, because zero is
+indistinguishable from "partner genuinely idle" and therefore fails silently
+(guard-997).
+
+**Read obligation — read BOTH, and union them.** Canonical form:
+
+```bash
+team-state-read.sh --field agent_status.<partner>.in_flight.goal_id --json
+team-state-read.sh --field agent_status.<partner>.in_flight_bodies --json   # whole map
+```
+
+Staleness is the REAPER's job, not each reader's: `body_row_reaper.py` (g-306-191,
+wired via `stranded-claim-sweep`) deletes rows whose carrier has been stale for
+`DEFAULT_REAP_STALE_MINUTES` (180). Do NOT add a second freshness heuristic in a
+consumer — it would drift from the reaper's and put two policies on one store. The
+bound to know: a dead Body can withhold a goal for at most ~3h, which is the safe
+direction versus a duplicate claim.
+
+**Reader inventory, measured 2026-08-16.** Bodies-aware: the loop digest Phase-4
+claim-conflict hard gate, `aspirations-select` Phase 2 partner-claim filter
+(g-306-276), `goal-pickup-coordination-check.py` (g-306-160),
+`stranded-claim-sweep.py`, `_cross_agent_attribution_filter.py`, and — since
+g-306-301, later the same day — `gates/goal_duplication.py`
+(`_check_partner_in_flight`). Bodies-BLIND at that date — each reads
+`in_flight` and never `in_flight_bodies`: `iteration-commit.sh`,
+`.claude/skills/aspirations-graceful-stop/SKILL.md`, `tree.py`. Blindness is not
+automatically a defect (a consumer that only ever asks about the reducer's own row
+is correct as written) — but a consumer that asks "is any Body of this Mind on this
+goal?" and reads one field is wrong, silently, in the permissive direction. Check
+which question yours asks before adding a reader.
+
 **Write contract.**
 
 | When | Caller | Action |
@@ -915,6 +1032,20 @@ one to derive the other.
 | Crash forward-recovery | `iteration-close.sh` do_recover Case B | `team-state-clear-in-flight.sh --agent <self> --if-goal "$_gid"` — scoped to the CHECKPOINT's goal, **not** `$GOAL_ID`. `do_recover` never reads `$GOAL_ID` and `--phase recover` is invoked without `--goal`, so scoping it to `$GOAL_ID` would compare against an empty string, which the endpoint coerces back to `None` — an unconditional clear wearing a CAS flag. |
 | Goal release (failure / re-select) | `aspirations-execute` release path | `team-state-clear-in-flight.sh --agent <self>` — deliberately UNSCOPED: release normalizes whatever row is present, including a malformed one. |
 | Claim-conflict abort (partner already in_flight on same goal) | `aspirations-execute` Phase 4 pre-claim | abort + return to select; do NOT write in_flight |
+| Phase 4 claim by a NON-reducer Body | `team-state-in-flight.sh` SKIP branch — **AUTOMATIC**, same call site | Writes `agent_status.<agent>.in_flight_bodies.<MIND_SID>` and leaves `in_flight` untouched. Fail-open: a failed body-row write logs a WARN and does NOT fail the claim (visibility is not correctness). With no `MIND_SID` it writes NO row and says so on stderr. |
+| Body turn-end, clean | `worker_close_in_flight_clear.clear_body_row` | Pops `in_flight_bodies.<sid>`, sweeps null siblings, and removes the whole `in_flight_bodies` key once it empties (so no `{}` is left behind). |
+| Body death, unclean (crash / kill / text-death under API storm) | `body_row_reaper.py` (g-306-191), wired via `stranded-claim-sweep` | Reaps rows whose carrier has been stale ≥ `DEFAULT_REAP_STALE_MINUTES` (180). This is the ONLY reclaimer for the unclean path — `clear_body_row` runs only on a clean turn-end. Measured at filing: 4 live phantom rows fleet-wide, oldest 66.3h. |
+
+⚠ **Clearing: use the dedicated clearer, and know it is TWO surfaces.**
+`team-state-update.sh --field in_flight --value null` does NOT clear the row — a bare
+leaf name is a valid 1-segment path, so `_set_nested` creates a NEW TOP-LEVEL
+`in_flight` key and the wrapper prints a success line for a write that never touched
+the row you meant (guard-3780, measured). Pass the full dotted path
+`agent_status.<agent>.<field>`, prefer `team-state-clear-in-flight.sh --agent <a>
+--if-goal <goal-id>` for the reducer row, and note a single-field clear leaves the
+SID-keyed body row STRANDED (g-306-160, measured 30h stale). `aspirations-release.sh
+::_clear_in_flight` is the reference implementation that handles both. Verify by
+reading back the nested path, never by the success line.
 
 ### `last_fresh_eyes_run` Field — Cross-Agent Coverage Window
 
@@ -969,14 +1100,85 @@ path falls through to `peer_files = set()` and the gate proceeds with
 own-agent cooldown only. The cross-agent layer is additive; it can never
 prevent dispatch that would have fired without it.
 
+### Proxy-With-Proof — supplying a starved peer's attestation (g-115-6592)
+
+**The rule: a verifiable fact must never be a scheduling problem.** When a fleet
+gate waits on an agent-local attestation that any peer can VERIFY from shared
+evidence — git ancestry, byte-identity to `origin/main`, an object HEAD in the
+store of record — a peer MAY supply that field after 24h of starvation. The
+holdout is not withholding anything; it is simply busy, and the fact was true
+the whole time.
+
+This is the FALLBACK, not the first answer. Where a gate can check the evidence
+itself, build that instead (g-115-6578 A, attest-by-proof) — this section covers
+the window while A is unbuilt and the gates A does not reach. Motivating trace:
+`rb-8202`, a ~5-second one-command chore that starved 3 days at HIGH because the
+selector has no dependency-pull term, so a fleet-blocking chore competes on the
+same axis as the holder's own product work.
+
+**The shape.** Write ONLY the specific field, through the ordinary row-routed
+update:
+
+```bash
+bash core/scripts/team-state-update.sh \
+  --field agent_status.<holdout>.<the-one-field> \
+  --value '{"...": "...", "attested_by": "<peer> proxy", "proof": "<the checkable evidence>"}'
+```
+
+Four properties make this safe, and three of them are enforced by the writer
+rather than by this text:
+
+- `route_field` sends `agent_status.<holdout>.*` to the holdout's OWN row file,
+  so no shared object is touched and no other writer contends.
+- `stamp_row_metadata` records `row_updated_by: <you>` automatically. The proxy
+  is self-attributing whether or not the payload says so — put `attested_by` in
+  the payload anyway, because that is the half a human reads.
+- It does **not** bump `last_active`. That is the load-bearing difference from
+  the cross-agent `in_flight` clear, which DOES bump it and makes a dormant peer
+  read `alive` for up to the full 6h window (`guard-3604`). A proxy attestation
+  leaves every liveness signal honest.
+- The write is durable across the owner's next write because the owner refreshes
+  from the store of record before its read-modify-write.
+
+Then: post the proof to the coordination board (precedent
+`msg-20260817-193329-alpha-5467`), and **file nothing on the holdout**. No goal,
+no board request, no nudge — the work is done.
+
+Never touch `in_flight`, never flip the gate's own flag, and never override its
+verdict. In the precedent the fail-closed cutover check read SAFE 5/5 **on its
+own** once the missing evidence was present; the verdict was never overridden,
+only the evidence supplied. If supplying the fact does not clear the gate, the
+gate is telling you the fact is not what was missing — stop.
+
+**The boundary: proxy applies to FACTS, never to consent, credentials, or
+judgment calls.** "This commit is an ancestor of that one" is a fact any peer can
+check. "I approve this" and "I accept this risk" are not, and no amount of
+evidence makes them proxyable. A hand-stamp the holdout later writes SUPERSEDES
+the proxy — it is the owner's own record and outranks a peer's reading of it.
+
+**Enforcement: none. This section is honor-system**, in the same way
+`guard-349`'s standing-grants section is — nothing in the tree reads it, and no
+gate refuses a write that ignores it. Stated plainly because a documented control
+with no reader looks exactly like a live one (`guard-3130`, `guard-3485`), and a
+convention that implies enforcement it does not have is worse than one that
+admits it. Cross-references: `guard-4215` (cost burn is revenue-class — the
+class of gate most worth unblocking), `rb-8202`, g-115-6578 A.
+
 ### Integration Points
 
 - **Boot** (Step 2): Read `world/team-state.yaml` → display strategic focus and recent completions
 - **Boot** (continuation Step 0.5): Read team state for fast situational awareness
 - **Prime** (Phase 2): Read team-state and surface partner.in_flight in the PRIMED summary
 - **Precheck** (iteration top): Read team-state and surface partner.in_flight in the iteration header
-- **Select** (candidate filter): Drop goals from the candidate set whose goal_id matches partner.in_flight.goal_id
-- **Execute Phase 4** (claim-conflict gate): Read team-state immediately before posting board claim; if partner.in_flight.goal_id == selected → abort + log + re-select. Otherwise proceed — `aspirations-claim.sh` stamps `in_flight` AND posts the board claim automatically (g-115-3199 / g-115-2123); no LLM-side call for either.
+- **Select** (candidate filter): Drop goals from the candidate set whose goal_id matches partner.in_flight.goal_id **OR any `partner.in_flight_bodies.<sid>.goal_id`** — both shapes, per "TWO SURFACES" above. Reading only the first opens this filter completely on a worker-executed goal (g-306-276).
+- **Execute Phase 4** (claim-conflict gate): Read team-state immediately before posting board claim; if the selected goal matches partner.in_flight.goal_id **or any partner.in_flight_bodies.<sid>.goal_id** → abort + log + re-select. Otherwise proceed — `aspirations-claim.sh` stamps the appropriate surface AND posts the board claim automatically (g-115-3199 / g-115-2123); no LLM-side call for either.
+
+  The two bullets above are the only integration points that make a COORDINATION
+  DECISION from this field, so they are the two that must union both surfaces;
+  Prime and Precheck merely display it, and a display that omits body rows
+  under-reports live work without mis-routing it. Until both surfaces are read
+  everywhere, **the board `claim` post is the PRIMARY cross-Body claim signal,
+  not a supplement to `in_flight`** (guard-997).
 - **State Update** (Step 3.5): After meta update, append to recent_completions and update agent_status
 - **iteration-close.sh**: After completion, call `team-state-clear-in-flight.sh` to release the live snapshot
 - **All-Blocked** (B0): Before concluding partner is silent, read `agent_status.<partner>.last_active` and apply the 6h pre-silence threshold per `.claude/rules/check-team-state-before-silent.md`

@@ -112,23 +112,40 @@ def _classify_orphan(name, size):
 
     Returns (severity, data_class, description):
       - data extension (in _SESSION_DATA_EXTS): the Phase-2 fail-safe heuristic
-        MIRRORS it to S3, but it is NOT in the continuity pull-set, so it will not
-        auto-resume on another machine -> severity 'info', register as
-        continuity (resume) or ephemeral (don't).
+        MIRRORS it to S3, AND — because registration is what makes a session file
+        eligible for the both-diverged LOCAL-WINS auto-resolve — an unregistered
+        one can wedge PERMANENTLY -> severity 'warning'.
       - signal-shaped (extensionless / unknown ext): the sweep keeps it
         MACHINE-LOCAL -> any knowledge in it is LOST on a move -> severity
         'warning'. (Also the fallback when _SESSION_DATA_EXTS could not import.)
+
+    SEVERITY HISTORY (g-115-6352, 2026-08-16). The data branch was 'info' and its
+    message named only the machine-move resume gap. That understated the actual
+    consequence by a lot, and it is why 11 orphans accumulated across the fleet
+    UNDER A WORKING DETECTOR — the check fired every time and read as advisory.
+    The severities were also inverted relative to consequence: the signal branch
+    (recoverable — the file stays local and is regenerated) was 'warning' while
+    the data branch (permanently wedge-capable, no healing path) was 'info'.
+    Detection was never the gap; the advice was.
     """
     suffix = Path(name).suffix.lower()
     sz = f"{size}B" if isinstance(size, int) else "unknown size"
     if _SESSION_DATA_EXTS is not None and suffix in _SESSION_DATA_EXTS:
-        return ("info", "data",
+        return ("warning", "data",
                 f"Orphan DATA file '{name}' ({sz}) is unregistered in "
-                f"session-manifest.yaml. The own-cloud sweep mirrors it to S3 "
-                f"(known data extension), but it is NOT in the continuity "
-                f"pull-set, so it will NOT auto-resume on a machine-move. "
-                f"Register it: sync_tier=continuity if it must resume on another "
-                f"machine, else sync_tier=ephemeral.")
+                f"session-manifest.yaml. Session files are SYNC-BY-DEFAULT with "
+                f"that manifest as a DENYLIST, so a known data extension is "
+                f"MIRRORED to S3 — but the both-diverged LOCAL-WINS auto-resolve "
+                f"requires manifest registration with sync_tier "
+                f"continuity|ephemeral. Unregistered means INELIGIBLE, and these "
+                f"single-writer session files deliberately have no merge handler "
+                f"(guard-907), so nothing heals a divergence: a both-diverged "
+                f"fence on this file is a PERMANENT WEDGE, not a delayed resume. "
+                f"It also will not auto-resume on a machine-move. Register it — "
+                f"sync_tier=continuity if it must resume on another machine, "
+                f"ephemeral if losing it is harmless, machine_local if it is "
+                f"per-box state that should never sync (which removes the wedge "
+                f"class outright rather than healing it).")
     return ("warning", "signal",
             f"Orphan file '{name}' ({sz}) is unregistered AND signal-shaped "
             f"(no known data extension), so the own-cloud sweep keeps it "

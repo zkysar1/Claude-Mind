@@ -28,8 +28,22 @@ thesis, so this cadence reports them side by side and keeps them clearly labelle
 
   half A — FILE surface   : complexity_budget.measure/append_and_delta (trend + verdict)
   half B — STORE corpus   : guardrails.jsonl + reasoning-bank.jsonl active-vs-retired
-                            ratio, never-marked-helpful population, and a BOUNDED
-                            retirement slate
+                            ratio, never-marked-helpful population, a BOUNDED
+                            retirement slate, and a SUBSET-PAIR slate (below)
+
+SUBSET PAIRS — the third half-B measurement (g-115-5053)
+--------------------------------------------------------
+An entry whose text is a strict byte-PREFIX of a sibling's is a fork, not a
+duplicate opinion: the shorter one is pre-amendment text re-inserted under a
+fresh id while the amended text kept the original id (``_guard_identity`` keys on
+``(created, rule)``, so every in-place ``rule`` amendment is a fork candidate).
+Both copies stay ACTIVE and both are served — utilization accrues independently
+on each — so a retrieval landing on the short member returns the rule MINUS the
+extension block someone paid to learn.
+
+This class had been rediscovered by accident three times (g-115-3331, g-115-4065,
+g-335-732) before this detector existed. Three discoveries by three accidents
+means a fourth accident was the plan.
 
 PROPOSAL ONLY — STRUCTURAL, NOT A FLAG
 --------------------------------------
@@ -92,6 +106,13 @@ import complexity_budget as _cb  # noqa: E402
 # re-deriving the criterion) is what guarantees this proposal matches what
 # bulk-retire-dead-entries.py --apply would actually select.
 from _curation_predicate import is_dead_entry as _is_dead  # noqa: E402
+#  reader seam. Reader-only and a behavioural no-op until the writer
+# lands: with no sidecar, `utilization_of` returns the embedded field unchanged.
+from _utilization_store import (  # noqa: E402
+    KINDS as _UTIL_KINDS,
+    load_counters as _load_counters,
+    utilization_of as _utilization_of,
+)
 
 RB_PATH = WORLD_DIR / "reasoning-bank.jsonl"
 GUARD_PATH = WORLD_DIR / "guardrails.jsonl"
@@ -100,6 +121,34 @@ DEFAULT_LEDGER_REL = "complexity-ledger.jsonl"
 DEFAULT_SLATE_CAP = 25
 DEFAULT_MIN_RETRIEVALS = 100
 DEFAULT_MIN_AGE_DAYS = 30
+
+# Per-store spec for subset-pair detection. The fields differ PER STORE and the
+# difference is MEASURED, not stylistic (guard-1902 — sample the schema, do not
+# guess it). Field coverage over the live corpus, 2026-08-11:
+#
+#   guardrails      source 3121/3121   created 3121/3121   rule    3121/3121
+#   reasoning-bank  source   74/7086   created 7086/7086   content 7086/7086
+#                   source_goal 7086/7086
+#
+# So keying reasoning-bank on ``source`` — the obvious symmetry — would silently
+# exclude 99% of that corpus and report a clean zero. ``source_goal`` is its
+# populated analogue.
+SUBSET_SPEC = {
+    "guardrails": {"group_fields": ("source", "created"), "text_field": "rule"},
+    "reasoning-bank": {"group_fields": ("source_goal", "created"),
+                       "text_field": "content"},
+}
+
+# Printed in the report, NOT only in this comment. A detector that does not
+# publish its own blind spot invites its silence to be read as coverage
+# (guard-1760); this one sees a deliberately narrow slice.
+SUBSET_BLIND_SPOT = (
+    "BLIND SPOT: this probe sees ONLY twins that share every grouping field AND "
+    "stand in an exact byte-prefix relation. Semantic near-duplicates with "
+    "different wording are invisible to it — the four near-duplicate rails found "
+    "by hand in g-115-4065 would most likely NOT appear here. A zero is evidence "
+    "about byte-prefix forks, not about corpus duplication in general."
+)
 
 
 # ─────────────────────────── half A: file surface ───────────────────────────
@@ -161,18 +210,102 @@ def _read_jsonl(path) -> List[dict]:
     return recs
 
 
-def _never_helpful(rec: dict) -> bool:
+def _never_helpful(rec: dict, counters=None) -> bool:
     """True when an entry has NO helpful signal of any kind.
 
     Counts the same three attestation channels the utilization system uses
     (explicit helpful, citation, inferred-helpful backstop) so this population
     matches the retirement predicate's notion of 'produced no value' rather than
     a narrower explicit-only read that would overstate the problem.
+
+    ``counters`` is the g-358-05 sidecar map (id -> counters). It defaults to
+    None so any caller that has not been converted keeps today's exact
+    behaviour — with no counters the read falls through to the embedded field.
+    Passing it MATTERS here specifically: once the writer lands, the embedded
+    field is a frozen pre-split snapshot, so reading it would report entries as
+    never-helpful on stale counts and propose live entries for retirement.
     """
-    u = rec.get("utilization") or {}
+    u = _utilization_of(rec, counters)
     return (int(u.get("times_helpful", 0) or 0) == 0
             and int(u.get("times_cited", 0) or 0) == 0
             and int(u.get("times_inferred_helpful", 0) or 0) == 0)
+
+
+def subset_pairs(active: List[dict], group_fields, text_field, cap,
+                 counters=None) -> dict:
+    """Find ACTIVE entries whose text is a strict byte-prefix of a sibling's.
+
+    Siblings = same value in every ``group_fields`` entry. Reported separately
+    from EXACT duplicates: a prefix pair means one member is missing an extension
+    block, while an exact pair means two ids carry the identical rule. The
+    remedies differ, so collapsing them would hide which one you have.
+
+    NOT a retirement decision. This returns both ids and their utilisation and
+    stops there — which member is stale is a judgment that needs the pair read
+    (``amended_fields`` is usually the discriminator, but not by construction).
+
+    ``ungroupable`` is REPORTED, never silently dropped: an entry missing a
+    grouping field or its text cannot be compared, and a probe that excludes rows
+    without saying so reports a clean number over a corpus it did not read
+    (measured: 520 of 7014 active reasoning-bank rows are ungroupable here).
+    Grouping on a missing field would be worse — every such row would collide
+    into one bucket and manufacture pairs that share nothing.
+    """
+    groups: Dict[tuple, List[dict]] = {}
+    ungroupable = 0
+    for r in active:
+        key = tuple(r.get(f) for f in group_fields)
+        if any(v in (None, "") for v in key) or not (r.get(text_field) or "").strip():
+            ungroupable += 1
+            continue
+        groups.setdefault(key, []).append(r)
+
+    def _u(rec, field):
+        return int(_utilization_of(rec, counters).get(field, 0) or 0)
+
+    def _row(sub, sup):
+        return {"subset_id": sub.get("id"), "superset_id": sup.get("id"),
+                "subset_chars": len(sub.get(text_field) or ""),
+                "superset_chars": len(sup.get(text_field) or ""),
+                "group": {f: sub.get(f) for f in group_fields},
+                "subset_times_active": _u(sub, "times_active"),
+                "superset_times_active": _u(sup, "times_active"),
+                # The usual discriminator, surfaced so the reader does not have to
+                # re-open both records to form a first opinion.
+                "subset_amended": bool(sub.get("amended_fields")),
+                "superset_amended": bool(sup.get("amended_fields"))}
+
+    pairs: List[dict] = []
+    exact: List[dict] = []
+    multi = 0
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        multi += 1
+        for i in range(len(members)):
+            for j in range(i + 1, len(members)):
+                a, b = members[i], members[j]
+                ta = a.get(text_field) or ""
+                tb = b.get(text_field) or ""
+                if ta == tb:
+                    exact.append({"ids": sorted([a.get("id"), b.get("id")]),
+                                  "chars": len(ta),
+                                  "group": {f: a.get(f) for f in group_fields}})
+                elif tb.startswith(ta):
+                    pairs.append(_row(a, b))
+                elif ta.startswith(tb):
+                    pairs.append(_row(b, a))
+
+    # Widest gap first: the pair whose short member is missing the most text is
+    # where a retrieval landing on the wrong copy loses the most.
+    pairs.sort(key=lambda p: p["superset_chars"] - p["subset_chars"], reverse=True)
+    return {"pairs": pairs[:cap], "pairs_total": len(pairs),
+            "pairs_truncated": len(pairs) > len(pairs[:cap]),
+            "exact_duplicates": exact[:cap], "exact_total": len(exact),
+            "groups": len(groups), "multi_member_groups": multi,
+            "ungroupable": ungroupable,
+            "group_fields": list(group_fields), "text_field": text_field,
+            "blind_spot": SUBSET_BLIND_SPOT}
 
 
 def corpus_stats(path, label, today, min_retrievals, min_age_days,
@@ -186,19 +319,26 @@ def corpus_stats(path, label, today, min_retrievals, min_age_days,
                 "total": None, "active": None, "retired": None,
                 "retire_ratio": None, "never_helpful": None,
                 "never_helpful_pct": None, "slate": [], "slate_total": 0,
-                "slate_truncated": False}
+                "slate_truncated": False, "subset_pairs": None}
 
     recs = _read_jsonl(p)
+    # : this store's counter sidecar, read ONCE for every join below.
+    # `label` is already exactly a KIND ("guardrails" / "reasoning-bank"), so the
+    # precise per-kind loader applies rather than the merged one. Guarded on
+    # membership because `_check_kind` RAISES on an unknown kind: a future third
+    # store added to SUBSET_SPEC but not to KINDS must degrade to today's
+    # embedded-field read, never take down the whole check.
+    counters = _load_counters(label) if label in _UTIL_KINDS else {}
     total = len(recs)
     active = [r for r in recs if r.get("status") == "active"]
     retired = [r for r in recs if r.get("status") == "retired"]
-    nh = [r for r in active if _never_helpful(r)]
+    nh = [r for r in active if _never_helpful(r, counters)]
 
     candidates = []
     for r in active:
         try:
             if _is_dead(r, today=today, min_retrievals=min_retrievals,
-                        min_age_days=min_age_days):
+                        min_age_days=min_age_days, counters=counters):
                 candidates.append(r)
         except Exception:
             # A predicate error on ONE record must not zero the whole slate.
@@ -207,7 +347,7 @@ def corpus_stats(path, label, today, min_retrievals, min_age_days,
     # Sort the proposal so the highest-volume/lowest-value entries surface first —
     # a bounded slate should spend its budget where the carrying cost is greatest.
     candidates.sort(
-        key=lambda r: int((r.get("utilization") or {}).get("retrieval_count", 0) or 0),
+        key=lambda r: int(_utilization_of(r, counters).get("retrieval_count", 0) or 0),
         reverse=True)
 
     slate_total = len(candidates)
@@ -215,13 +355,18 @@ def corpus_stats(path, label, today, min_retrievals, min_age_days,
     slate = [{"id": r.get("id"),
               "title": (r.get("title") or r.get("rule") or "")[:80],
               "created": r.get("created"),
-              "retrieval_count": int((r.get("utilization") or {}).get("retrieval_count", 0) or 0)}
+              "retrieval_count": int(_utilization_of(r, counters).get("retrieval_count", 0) or 0)}
              for r in shown]
+
+    spec = SUBSET_SPEC.get(label)
+    subsets = (subset_pairs(active, spec["group_fields"], spec["text_field"],
+                            slate_cap, counters) if spec else None)
 
     return {
         "store": label,
         "present": True,
         "path": str(p),
+        "subset_pairs": subsets,
         "total": total,
         "active": len(active),
         "retired": len(retired),
@@ -377,7 +522,15 @@ def has_signal(result: dict) -> bool:
     """
     if result["file_surface"].get("verdict") in ("growing", "mixed"):
         return True
-    return any(s.get("slate_total", 0) > 0 for s in result["stores"])
+    if any(s.get("slate_total", 0) > 0 for s in result["stores"]):
+        return True
+    # A subset pair is signal on its own: it means a live retrieval can return
+    # pre-amendment text, which no other measurement on this page would surface.
+    for s in result["stores"]:
+        sp = s.get("subset_pairs") or {}
+        if sp.get("pairs_total", 0) or sp.get("exact_total", 0):
+            return True
+    return False
 
 
 def render(result: dict) -> str:
@@ -421,6 +574,46 @@ def render(result: dict) -> str:
         else:
             lines.append("  PROPOSED retirement slate: none "
                          "(no active entry meets the dead-entry criterion)")
+
+        sp = s.get("subset_pairs")
+        if sp is None:
+            lines.append("  subset-pair scan: NOT RUN for this store "
+                         "(no entry in SUBSET_SPEC) — not a zero, an absence")
+        else:
+            # Always print the numbers, including the zeros. "0 pairs over 3032
+            # groups" is a measurement; a missing line is indistinguishable from a
+            # probe that never ran (the check this goal asked for by name).
+            lines.append(
+                f"  subset-pair scan: {sp['pairs_total']} prefix pair(s), "
+                f"{sp['exact_total']} exact duplicate(s) over "
+                f"{sp['multi_member_groups']} multi-member group(s) of "
+                f"{sp['groups']}; {sp['ungroupable']} entries ungroupable"
+                f" (key={'+'.join(sp['group_fields'])}, text={sp['text_field']})")
+            shown = sp["pairs"]
+            if shown:
+                trunc = (f" (showing {len(shown)} of {sp['pairs_total']})"
+                         if sp["pairs_truncated"] else "")
+                lines.append(f"    prefix pairs — subset is missing text the "
+                             f"superset carries{trunc}:")
+                for p in shown:
+                    gap = p["superset_chars"] - p["subset_chars"]
+                    amend = ("superset amended" if p["superset_amended"]
+                             and not p["subset_amended"] else
+                             "both amended" if p["superset_amended"]
+                             and p["subset_amended"] else
+                             "subset amended" if p["subset_amended"] else
+                             "neither amended")
+                    lines.append(
+                        f"      {p['subset_id']} ⊂ {p['superset_id']}  "
+                        f"-{gap} chars  active {p['subset_times_active']}"
+                        f"/{p['superset_times_active']}  ({amend})")
+            if sp["exact_duplicates"]:
+                lines.append("    exact duplicates — two ids, byte-identical text:")
+                for e in sp["exact_duplicates"]:
+                    lines.append(
+                        f"      {' == '.join(str(i) for i in e['ids'])}"
+                        f"  ({e['chars']} chars)")
+            lines.append("    " + sp["blind_spot"])
     lines.append("")
     lines.append("PROPOSAL ONLY — this script cannot retire anything (no --apply path).")
     lines.append("To act on a slate, an agent runs:")

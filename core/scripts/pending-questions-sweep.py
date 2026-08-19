@@ -16,13 +16,29 @@ Output contract:
   JSON to stdout with at least `{"subcommand","summary","flags":[],...}`.
   Exit 0 = clean (no flags raised). Exit 1 = flags raised (LLM should review
   the flagged entries). Exit 2 = input error (missing file, bad YAML).
-  No side effects — script never writes pending-questions.yaml. The LLM
-  consumes the verdicts and applies them in consolidation-housekeeping Step 2.8.
+  READ-ONLY BY DEFAULT. With NO apply flag the script never writes
+  pending-questions.yaml; the LLM consumes the verdicts and applies them in
+  consolidation-housekeeping Step 2.8. TWO flags opt into writing, and nothing
+  else in this script mutates the file:
+    --apply          → discharges verdict=auto_resolve
+    --apply-cleanup  → discharges verdict=needs_transition
+  Both go through `_apply_auto_resolve`, which sets status / resolved_at /
+  resolution ONLY (never `answer`) and is atomic via tempfile + os.replace.
+  This paragraph read "No side effects — script never writes
+  pending-questions.yaml" until 2026-08-10, which had been false since --apply
+  shipped — and `core/config/conventions/coordination.md` cites THIS docstring
+  as the source of truth for a concurrency-safety argument about observer vs
+  runner writes, so the stale claim was load-bearing somewhere else.
   Fail-open at every layer: a malformed entry yields verdict=no_action with a
   reason, never a crash.
 
 Verdicts assigned per entry (priority order — see HEURISTIC_CHAIN below):
-  cleanup_only      — already terminal, just YAML housekeeping pending
+  already_terminal  — INERT. Terminal status + non-empty resolution. NOTHING TO DO.
+                      Reported, never flagged, never applied. This class persists by
+                      DESIGN and re-classifies on every sweep forever.
+  needs_transition  — ACTIONABLE. status=answered with a non-empty answer; the only
+                      thing missing is the status flip to `resolved`. Discharged by
+                      `--apply-cleanup`; reaches zero when the work is done.
   auto_resolve      — high-confidence: no-op default_action + age > 14d
   likely_resolved   — agent_self_answered + 7d grace
   likely_stale      — infra question + 14d, OR superseded ritual
@@ -231,17 +247,34 @@ def _is_decision_log(entry):
 # ---------------------------------------------------------------------------
 
 def _h_already_terminal(entry, now, ctx):
-    """Heuristic 1: status already terminal AND has resolution → cleanup only."""
+    """Heuristic 1: status already terminal AND has resolution → INERT.
+
+    Emits `already_terminal`, NOT the old shared `cleanup_only` (g-115-3753 /
+    g-115-5025). This class is NOTHING TO DO and persists by design: an entry
+    that is terminal-with-resolution re-classifies here on every sweep forever,
+    so its count is a steady state and can never reach zero. Sharing one verdict
+    with the actionable heuristic below made the combined count unreadable —
+    neither "there is work" nor "there is none" could be told from it, which is
+    the silent-failure-discriminator class (a metric whose clean state and dirty
+    state look identical). Measured on cc-07 2026-08-10: 38 `cleanup_only` was
+    24 actionable + 14 inert, and the flag fired on all 38.
+    """
     status = entry.get("status")
     if status in TERMINAL_STATUSES and entry.get("resolution"):
-        return ("cleanup_only", f"already {status} with non-empty resolution", 1.0)
+        return ("already_terminal", f"already {status} with non-empty resolution", 1.0)
     return None
 
 
 def _h_answered_not_cleaned(entry, now, ctx):
-    """Heuristic 2: status=answered AND has answer → cleanup only."""
+    """Heuristic 2: status=answered AND has answer → ACTIONABLE.
+
+    Emits `needs_transition`. This IS a backlog: the user's answer is already
+    recorded and only the status flip to `resolved` is outstanding, so the count
+    falls to zero once the work is done. Discharged by `--apply-cleanup`, which
+    is deliberately NOT folded into `--apply` — see the flag's help text.
+    """
     if entry.get("status") == "answered" and entry.get("answer"):
-        return ("cleanup_only", "answered with non-empty answer; transition to resolved", 0.95)
+        return ("needs_transition", "answered with non-empty answer; transition to resolved", 0.95)
     return None
 
 
@@ -535,7 +568,8 @@ def cmd_sweep(args):
     counts = {
         "total": len(results),
         "auto_resolve": 0,
-        "cleanup_only": 0,
+        "already_terminal": 0,
+        "needs_transition": 0,
         "likely_resolved": 0,
         "likely_stale": 0,
         "flag_for_review": 0,
@@ -546,10 +580,23 @@ def cmd_sweep(args):
         if v in counts:
             counts[v] += 1
 
+    # BACK-COMPAT, deliberately derived rather than emitted by a heuristic:
+    # `cleanup_only` no longer exists as a verdict, but it stays in `counts` as
+    # the sum of the two halves it used to conflate, so an older consumer reading
+    # counts["cleanup_only"] keeps seeing the same number instead of a KeyError.
+    # It is NOT what any flag or applier keys on any more — that is the whole
+    # point of the split (g-115-3753 / g-115-5025).
+    counts["cleanup_only"] = counts["already_terminal"] + counts["needs_transition"]
+
     flags = []
     if counts["auto_resolve"]:
         flags.append("auto_resolvable")
-    if counts["cleanup_only"]:
+    # Fires on the ACTIONABLE half ONLY. Keyed on the combined count it fired
+    # forever: `already_terminal` never reaches zero by design, so the flag was
+    # on permanently and carried no information. Measured on cc-07 2026-08-10 —
+    # 14 of the 38 were inert, so the flag would still have been on after every
+    # piece of real work was finished.
+    if counts["needs_transition"]:
         flags.append("cleanup_available")
     if counts["likely_resolved"] or counts["likely_stale"]:
         flags.append("candidates_for_resolution")
@@ -557,20 +604,29 @@ def cmd_sweep(args):
         flags.append("stale_entries_need_review")
 
     summary = (
-        f"sweep: {counts['auto_resolve']} auto, {counts['cleanup_only']} cleanup, "
+        f"sweep: {counts['auto_resolve']} auto, "
+        f"{counts['needs_transition']} needs-transition, "
+        f"{counts['already_terminal']} already-terminal (inert), "
         f"{counts['likely_resolved'] + counts['likely_stale']} likely, "
         f"{counts['flag_for_review']} review, {counts['no_action']} no-action "
         f"out of {counts['total']} total"
     )
 
     applied = 0
+    apply_ids = set()
     if getattr(args, "apply", False):
-        auto_ids = {
+        apply_ids |= {
             r.get("id") for r in results
             if r.get("verdict") == "auto_resolve" and r.get("id")
         }
+    if getattr(args, "apply_cleanup", False):
+        apply_ids |= {
+            r.get("id") for r in results
+            if r.get("verdict") == "needs_transition" and r.get("id")
+        }
+    if apply_ids:
         results_by_id = {r.get("id"): r for r in results if r.get("id")}
-        applied = _apply_auto_resolve(path, auto_ids, results_by_id)
+        applied = _apply_auto_resolve(path, apply_ids, results_by_id)
         if applied:
             summary = f"{summary}; applied={applied}"
 
@@ -641,6 +697,21 @@ def main(argv=None):
         help=(
             "sweep only: mutate pending-questions.yaml in place — mark "
             "verdict=auto_resolve entries as status=resolved with timestamp."
+        ),
+    )
+    parser.add_argument(
+        "--apply-cleanup",
+        action="store_true",
+        help=(
+            "sweep only: ALSO discharge verdict=needs_transition entries "
+            "(status=answered with a non-empty answer) by flipping them to "
+            "status=resolved. Deliberately SEPARATE from --apply rather than "
+            "folded into it: --apply runs unattended from precheck, and these "
+            "entries carry a real user answer, so bulk-closing them without an "
+            "explicit opt-in is a large unattended state change. The entry's "
+            "`answer` field is never touched — the writer sets status, "
+            "resolved_at and resolution only. verdict=already_terminal is "
+            "NEVER applied by either flag: it is inert by construction."
         ),
     )
     args = parser.parse_args(argv)

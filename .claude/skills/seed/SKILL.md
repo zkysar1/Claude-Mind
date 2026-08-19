@@ -177,7 +177,7 @@ destination, applying transformations at copy time.
 **Step 11**: Handle git.
   - If `--fresh-git`: `Bash: rm -rf <dest>/.git && git -C <dest> init`
   - Else: preserve existing `.git/`.
-  - If `--commit`: `Bash: git -C <dest> add -A && git -C <dest> commit -m "Seed transplant from <source> at <ISO-timestamp>"`
+  - If `--commit`: `Bash: git -C <dest> add -A && git -C <dest> commit -m "Seed transplant from <source> at <ISO-timestamp>" -m "size-budget-override: framework seed plant — hot-path files track the upstream versions"` (the second `-m` is the g-115-6470 hot-path size-budget trailer: a plant may legitimately grow the destination's hot-path files to the upstream sizes, and its `commit-msg` hook refuses growth without it)
 
 **Step 12**: Run post-copy actions.
   For each entry in `manifest.post_copy_actions`:

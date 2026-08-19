@@ -152,8 +152,15 @@ def enumerate_repos():
     return out
 
 
-def goal_text(goal_id, source):
-    """Returns (text, lookup_ok).
+def goal_text(goal_id, source, meta=None):
+    """Returns (text, lookup_ok); fills `meta` with side-channel goal fields.
+
+    `meta` is an OPTIONAL out-dict rather than a third return value precisely so
+    the (text, lookup_ok) shape stays byte-identical for every existing caller
+    and test. main() needs `work_class` to decide whether an empty selection is
+    worth reporting (see the zero-selection notice below), and re-reading the
+    goal through a second wrapper spawn to get one field would double the cost
+    of the slowest step in this script.
 
     `lookup_ok` is the load-bearing half and the reason this does not just
     return a string. "The goal names no repo" and "the goal could not be read"
@@ -184,6 +191,8 @@ def goal_text(goal_id, source):
             any_read_ok = True
             for g in data.get("goals") or []:
                 if g.get("id") == goal_id:
+                    if meta is not None:
+                        meta["work_class"] = g.get("work_class") or ""
                     return ("%s %s" % (g.get("title") or "",
                                        g.get("description") or ""), True)
     return "", any_read_ok
@@ -266,13 +275,43 @@ def select_repos(repos, text):
 def freshness(repo, do_fetch=True):
     """behind/ahead vs the tracked upstream. Every failure is reported, never raised."""
     rec = {"repo": str(repo), "name": repo.name, "behind": None, "ahead": None,
-           "branch": None, "upstream": None, "verdict": "unknown", "detail": ""}
+           "branch": None, "upstream": None, "verdict": "unknown", "detail": "",
+           "tree_identical": None, "default_branch": "", "off_default": None}
 
     rc, branch, err = _git(repo, "rev-parse", "--abbrev-ref", "HEAD")
     if rc != 0:
         rec["detail"] = "cannot read HEAD: %s" % (err or "rc=%d" % rc)
         return rec
     rec["branch"] = branch
+
+    # WHICH BRANCH the counts below are measured against (). Every
+    # number in this function is computed versus THIS branch's upstream, so a
+    # checkout parked on a stale feature branch pulls that branch, reports
+    # in-sync, and IS in-sync -- for the wrong ref. That is correct arithmetic
+    # to a question nobody asked, and it reads as "fresh". Measured 2026-08-16
+    # by the repo-hygiene sweep: 22 of 59 product checkouts were parked, and
+    # the shape had already produced a FALSE "this code does not exist" finding
+    # about product code that was present on origin/main the whole time.
+    #
+    # sweep_status() has carried `on_default` since it was written; freshness()
+    # -- the MOMENT-OF-ACTION path, the one that runs right before a goal reads
+    # a tree -- never had it. The periodic sweep saw the estate and the advisory
+    # standing at the point of use did not.
+    #
+    # TRI-STATE ON PURPOSE, and the None is the load-bearing part.
+    # `_default_branch` returns "" for "cannot tell" and its own docstring
+    # forbids callers reading that as "not the default branch", so an unknown
+    # default yields None and NEVER escalates. Only a positive comparison sets
+    # True. This narrowing is deliberate and is what keeps the advisory quiet
+    # enough to be read (guard-4031: when a predicate is narrowed to kill false
+    # positives, say what the narrowing drops -- here it drops repos with no
+    # discoverable default branch, which stay silent rather than guessing).
+    rec["default_branch"] = _default_branch(repo)
+    if rec["default_branch"]:
+        # A detached HEAD reports the literal "HEAD" here and compares unequal,
+        # which is the right answer: reading from a detached tree carries the
+        # same false-negative risk as reading from a feature branch.
+        rec["off_default"] = (branch != rec["default_branch"])
 
     rc, upstream, err = _git(repo, "rev-parse", "--abbrev-ref", "@{upstream}")
     if rc != 0:
@@ -313,7 +352,45 @@ def freshness(repo, do_fetch=True):
     elif behind:
         rec["verdict"] = "behind"
     elif ahead:
-        rec["verdict"] = "ahead"
+        # guard-1996: on a PROTECTED-branch estate an ahead-count measures
+        # TOPOLOGY, not unshipped content. main is protected so every real
+        # change lands via PR and lands SQUASHED (a NEW sha), while the local
+        # checkout reconciles with `git merge origin/main` -- so each merge adds
+        # a commit upstream will never contain and `ahead` only ever grows. The
+        # count is therefore permanently non-zero on exactly the repos that are
+        # healthiest (the ones receiving PR traffic), and "N unpushed commits"
+        # is FALSE there: the push contract was honoured, via PR.
+        #
+        # The property that actually matters is CONTENT identity, and it is one
+        # command. Equal tree hashes mean zero content divergence -- nothing is
+        # stranded, there is nothing to push, and a PR would carry an empty diff.
+        #
+        # Scoped to the ahead-ONLY branch deliberately. When `behind` is also
+        # non-zero the trees legitimately differ (upstream holds commits this
+        # checkout lacks), and `diverged` already prescribes the right action
+        # ("reconcile first"), so widening this check there would trade a true
+        # verdict for a confusing one.
+        rc_h, head_tree, _ = _git(repo, "rev-parse", "HEAD^{tree}")
+        rc_u, up_tree, _ = _git(repo, "rev-parse", "%s^{tree}" % upstream)
+        if rc_h == 0 and rc_u == 0 and head_tree and head_tree == up_tree:
+            rec["tree_identical"] = True
+            rec["verdict"] = "ahead-topological"
+            rec["detail"] = (rec["detail"] + " | " if rec["detail"] else "") + \
+                            ("%d local commit(s) not upstream, but HEAD^{tree} == "
+                             "%s^{tree} (%s) -- zero content divergence; squash-merge "
+                             "topology, nothing to push (guard-1996)"
+                             % (ahead, upstream, head_tree[:12]))
+        else:
+            # Trees differ, OR the comparison itself failed. A FAILED comparison
+            # must not read as "content is stranded" nor as "content is safe" --
+            # fall through to the honest `ahead` verdict and say the check could
+            # not run, so the reader knows which of the two answers is missing.
+            rec["tree_identical"] = False if (rc_h == 0 and rc_u == 0) else None
+            rec["verdict"] = "ahead"
+            if rec["tree_identical"] is None:
+                rec["detail"] = (rec["detail"] + " | " if rec["detail"] else "") + \
+                                "tree-identity check could not run (rev-parse rc " \
+                                "%d/%d) -- treating as genuinely ahead" % (rc_h, rc_u)
     else:
         rec["verdict"] = "in-sync"
     return rec
@@ -341,16 +418,29 @@ def _default_branch(repo):
 
 
 def _dirty_paths(repo):
-    """Paths git reports as dirty. Uses -z so filenames are never re-quoted.
+    """Paths git reports as dirty, or None when the probe itself FAILED.
 
-    Without -z, git quotes paths containing spaces/unicode and the parse
-    silently drops them — which would under-report exactly the trees most
-    likely to hold hand-edited work. With -z the record is `XY <path>` and a
-    rename adds a bare second token; a chunk without the 3-char prefix IS
-    that token, so both shapes are accepted rather than assumed away.
+    Uses -z so filenames are never re-quoted. Without -z, git quotes paths
+    containing spaces/unicode and the parse silently drops them — which would
+    under-report exactly the trees most likely to hold hand-edited work. With
+    -z the record is `XY <path>` and a rename adds a bare second token; a chunk
+    without the 3-char prefix IS that token, so both shapes are accepted rather
+    than assumed away.
+
+    NONE-VS-EMPTY IS THE POINT (g-115-5013 defect A). This returned `[]` for
+    BOTH `rc != 0` and a genuinely clean tree, so a `git status` that could not
+    run at all was indistinguishable from "nothing is dirty here" — and the
+    caller turned that into `dirty_files: 0, severity: clean`. That is the same
+    vacuity the enclosing file already guards twice at the whole-scan level
+    (CANNOT CHECK on a zero enumeration, and on a failed goal lookup); it
+    simply survived one level down, per-repo, where nothing was looking.
+    The distinction has to live HERE because this is the only frame that still
+    knows the rc — collapse it into a list and no caller can recover it.
     """
     rc, out, _ = _git(repo, "status", "--porcelain", "-z")
-    if rc != 0 or not out:
+    if rc != 0:
+        return None
+    if not out:
         return []
     paths = []
     for chunk in out.split("\0"):
@@ -368,6 +458,13 @@ def _patches_absent_upstream(repo, branch, default_branch, fallback):
     the commits, and the local originals will never appear on a remote by
     sha for as long as the branch exists. `git cherry` compares PATCH
     equivalence instead — `+` genuinely absent, `-` already upstream.
+
+    NECESSARY BUT NOT SUFFICIENT, and this docstring claimed otherwise until
+    2026-08-16. Patch equivalence recognises a squash only when the branch was a
+    SINGLE commit; squash N and the combined patch matches none of the N
+    originals, so all N still report `+`. `_branch_tree_identical_upstream`
+    below is the second filter that catches what this one structurally cannot
+    (g-115-6355) — do not read a `+` from here as "content is stranded".
 
     This is not a theoretical refinement. On the first real run of this sweep
     (cc-08, 56 repos, 2026-08-06) FOUR branches were flagged and `git cherry`
@@ -395,6 +492,65 @@ def _patches_absent_upstream(repo, branch, default_branch, fallback):
     return sum(1 for ln in out.splitlines() if ln.startswith("+"))
 
 
+def _branch_tree_identical_upstream(repo, branch, default_branch):
+    """Does `branch` hold ZERO content divergence from a remote ref? Tri-state.
+
+    Returns ``(verdict, upstream_ref, tree)``. Verdict is True (identical),
+    False (differs), or **None when the comparison could not be made** — the
+    same three-state contract `_dirty_paths` uses one function up, and for the
+    same reason: collapse None into False and a tooling failure renders
+    byte-identically to "this branch genuinely holds unpushed work"; collapse
+    it into True and the failure promotes a branch to clean. Only this frame
+    still knows which of the two happened.
+
+    WHY THIS EXISTS BESIDE `_patches_absent_upstream`. `git cherry` compares
+    PATCH equivalence, which catches a squash-merge only when the branch was a
+    SINGLE commit: squashing N commits produces one combined patch whose id
+    matches none of the N originals, so every one of them reports `+` and the
+    branch survives that filter intact. Not theoretical — the g-115-6355
+    measurement. A live product repo reported HIGH at `ahead 9, behind 0` while
+    `HEAD^{tree}` and `origin/main^{tree}` were the SAME hash and `git diff
+    --name-only origin/main HEAD` listed zero files. The false HIGH then
+    generated a downstream product goal whose acceptance criteria would have
+    opened an EMPTY-diff PR against a protected production repo, so the cost of
+    this false positive is not a noisy line — it is manufactured work aimed at
+    a protected branch.
+
+    Equal tree hashes mean zero content divergence: nothing is stranded and a
+    push would carry an empty diff (guard-1996 — on a protected-branch estate
+    an ahead-count measures TOPOLOGY, not unshipped content, because every real
+    change lands squashed via PR while the local checkout reconciles by merge).
+
+    `origin/<branch>` is preferred with `origin/<default_branch>` as the
+    fallback, mirroring `_patches_absent_upstream`'s base choice rather than
+    inventing a second convention: a feature branch is destined for the default
+    branch, so content already sitting there is content nobody can lose.
+    """
+    rc_b, br_tree, _ = _git(repo, "rev-parse", "--verify", "--quiet",
+                            "%s^{tree}" % branch)
+    if rc_b != 0 or not br_tree:
+        return None, "", ""
+
+    compared, seen = False, set()
+    for cand in (branch, default_branch):
+        if not cand or cand in seen:
+            continue
+        seen.add(cand)
+        up = "origin/%s" % cand
+        rc_u, up_tree, _ = _git(repo, "rev-parse", "--verify", "--quiet",
+                                "%s^{tree}" % up)
+        if rc_u != 0 or not up_tree:
+            continue          # no such remote ref — try the next candidate
+        compared = True
+        if br_tree == up_tree:
+            return True, up, br_tree
+    # `compared` is the whole point of the flag: it separates "every candidate
+    # remote ref was missing, so nothing was measured" from "the refs resolved
+    # and the trees genuinely differ". Without it both return False and an
+    # unmeasurable repo silently reports a measured divergence.
+    return (False if compared else None), "", br_tree
+
+
 def sweep_status(repo):
     """Unpushed-on-any-branch + stale-dirty for ONE repo. Never raises.
 
@@ -418,9 +574,18 @@ def sweep_status(repo):
     real (different) finding — the `backup-git-repo-offbox` skill's territory
     — so it is reported as `no_remote` with NO commit count attached.
     """
+    # `dirty_probe_ok` / `branch_probe_failures` answer a DIFFERENT question
+    # from the counts beside them — not "how much was found" but "was the
+    # search able to run" — so they are separate fields rather than a sentinel
+    # value smuggled into `dirty_files` (guard-3116: derive a field's guard
+    # from the question it answers, never by mirroring its neighbour). A
+    # reader, and `render_sweep`, must be able to tell 0-because-clean from
+    # 0-because-unmeasured, and only these fields carry that.
     rec = {"repo": str(repo), "name": repo.name, "no_remote": False,
            "unpushed": [], "unpushed_total": 0, "merged_equivalent": [],
+           "tree_identical_branches": [],
            "dirty_files": 0, "dirty_age_h": None, "default_branch": "",
+           "dirty_probe_ok": True, "branch_probe_failures": [],
            "severity": "clean", "detail": ""}
 
     rc, remotes, _ = _git(repo, "remote")
@@ -442,10 +607,16 @@ def sweep_status(repo):
         for br in [b for b in branches.splitlines() if b.strip()]:
             rc, n, _ = _git(repo, "rev-list", "--count", br, "--not", "--remotes")
             if rc != 0:
+                # A branch whose count could not be read is UNMEASURED, not
+                # zero. `continue` alone drops it from `unpushed`, which renders
+                # byte-identically to "this branch has nothing unpushed" — the
+                # per-branch instance of the same vacuity as _dirty_paths above.
+                rec["branch_probe_failures"].append(br)
                 continue
             try:
                 cnt = int(n)
             except Exception:
+                rec["branch_probe_failures"].append(br)
                 continue
             if cnt > 0:
                 absent = _patches_absent_upstream(repo, br, rec["default_branch"], cnt)
@@ -455,8 +626,29 @@ def sweep_status(repo):
                     # can never appear on a remote by sha. Not unpushed work.
                     rec["merged_equivalent"].append(br)
                     continue
+                # TREE IDENTITY — AFTER the patch-id filter, never before it.
+                # The two tests answer the same question with different power,
+                # and the ORDER is what keeps `merged_equivalent` meaning what
+                # it has always meant: a single-commit squash satisfies BOTH,
+                # so running this first would silently re-bucket every record
+                # the cherry filter is already pinned to classify. This branch
+                # therefore only ever catches what `git cherry` CANNOT see.
+                tree_same, tree_up, br_tree = _branch_tree_identical_upstream(
+                    repo, br, rec["default_branch"])
+                if tree_same is True:
+                    rec["tree_identical_branches"].append({
+                        "branch": br, "count": cnt, "upstream": tree_up,
+                        "tree": br_tree[:12],
+                    })
+                    continue
                 rec["unpushed"].append({
                     "branch": br, "count": cnt, "patches_absent": absent,
+                    # False = measured, and the content genuinely diverges.
+                    # None = the compare could not run, and the branch STAYS
+                    # REPORTED: a check that failed is never a promotion to
+                    # clean, which is the direction this file guards everywhere
+                    # else (CANNOT CHECK on a failed status/branch probe).
+                    "tree_identical": tree_same,
                     "on_default": bool(rec["default_branch"]) and br == rec["default_branch"],
                 })
 
@@ -487,6 +679,9 @@ def sweep_status(repo):
                 rec["unpushed_total"] = sum(u["count"] for u in rec["unpushed"])
 
     dirty = _dirty_paths(repo)
+    if dirty is None:
+        rec["dirty_probe_ok"] = False
+        dirty = []
     rec["dirty_files"] = len(dirty)
     if dirty:
         newest = None
@@ -515,6 +710,17 @@ def sweep_status(repo):
         rec["detail"] = "no remote configured — nothing here is pushed anywhere"
     elif rec["dirty_age_h"] is not None and rec["dirty_age_h"] > DIRTY_AGE_HOURS:
         rec["severity"] = "low"
+
+    # A repo whose probes partly FAILED must never render as `clean` — that is
+    # the state this whole change exists to make unreachable. ONLY the clean
+    # label is promoted: a real high/medium finding outranks "part of the search
+    # did not run", and render_sweep emits the CANNOT CHECK line at every
+    # severity, so demoting a genuine finding to `unknown` would hide the
+    # louder signal to surface the quieter one.
+    if rec["severity"] == "clean" and (
+            not rec["dirty_probe_ok"] or rec["branch_probe_failures"]):
+        rec["severity"] = "unknown"
+        rec["detail"] = "probe failure — see the CANNOT CHECK line(s) below"
     return rec
 
 
@@ -557,6 +763,21 @@ def render_sweep(records, scanned):
         if r["dirty_age_h"] is not None and r["dirty_age_h"] > DIRTY_AGE_HOURS:
             lines.append("  %-6s %s: working tree dirty (%d file(s)), untouched for %.0fh"
                          % ("LOW", r["name"], r["dirty_files"], r["dirty_age_h"]))
+        # PROBE-FAILURE LINES, emitted at EVERY severity rather than only under
+        # `unknown` ( defect A). A repo can carry a genuine high
+        # finding AND a failed dirty probe; gating these on the severity label
+        # would drop the caveat exactly where the record looks most
+        # authoritative. `dirty_files: 0` and `unpushed: []` are the two numbers
+        # a reader trusts, so when either is unmeasured it has to be said in the
+        # same breath as the number itself.
+        if not r.get("dirty_probe_ok", True):
+            lines.append("  CANNOT CHECK %s: `git status` failed — the dirty-file "
+                         "count for this repo is UNMEASURED, not 0" % r["name"])
+        if r.get("branch_probe_failures"):
+            lines.append("  CANNOT CHECK %s: unpushed count unreadable on %d branch(es) "
+                         "(%s) — those branches are UNMEASURED, not clean"
+                         % (r["name"], len(r["branch_probe_failures"]),
+                            ", ".join(r["branch_probe_failures"][:5])))
         if r["severity"] == "unknown":
             lines.append("  UNKNOWN %s: %s" % (r["name"], r["detail"] or "no detail"))
     return "\n".join(lines)
@@ -566,7 +787,20 @@ def render(records, selected_count):
     """Human banner. Silent when every selected repo is in-sync — an advisory
     that speaks on the clean path gets tuned out, and then it is not an
     advisory at all (the pre-edit-context-gate desensitization lesson)."""
-    noisy = [r for r in records if r["verdict"] != "in-sync"]
+    # "ahead-topological" is a CLEAN verdict, not a quiet problem: trees are
+    # byte-identical to upstream, so there is no action for the reader to take.
+    # It joins "in-sync" here for the same reason the docstring gives -- an
+    # advisory that speaks on the clean path gets tuned out. The record still
+    # carries the ahead count and tree_identical=True for any JSON consumer.
+    CLEAN_VERDICTS = ("in-sync", "ahead-topological")
+    # An OFF-DEFAULT checkout is reported even when its verdict is clean, and
+    # that is the whole point of the field (): the dangerous case is
+    # precisely the one that looks healthy, because "in-sync" is computed
+    # against the parked branch's own upstream. Before this, such a repo fell
+    # in CLEAN_VERDICTS and render() returned "" -- the advisory was SILENT on
+    # the one shape that produces a false "this code does not exist".
+    noisy = [r for r in records
+             if r["verdict"] not in CLEAN_VERDICTS or r.get("off_default") is True]
     if not records:
         return ""
     if not noisy:
@@ -574,6 +808,19 @@ def render(records, selected_count):
     lines = ["[product-repo-freshness] %d of %d repo(s) need attention "
              "BEFORE you read or edit them:" % (len(noisy), selected_count)]
     for r in noisy:
+        if r.get("off_default") is True:
+            # Emitted BEFORE and IN ADDITION TO any verdict line below, never
+            # instead of it. The two facts are independent and have different
+            # remedies -- "behind on the default branch" is a pull, "on another
+            # branch entirely" is not -- and collapsing them would lose the one
+            # the reader cannot recover from the numbers.
+            lines.append("  OFF-DEFAULT %s is on %s, not %s — every count here is "
+                         "measured against %s, so a clean verdict does NOT mean the "
+                         "default branch's content is present. A read of this tree can "
+                         "produce a FALSE 'this code does not exist'; confirm against "
+                         "origin/%s before asserting any negative."
+                         % (r["name"], r["branch"], r["default_branch"],
+                            r.get("upstream") or "its own upstream", r["default_branch"]))
         if r["verdict"] == "behind":
             lines.append("  BEHIND  %s by %d commit(s) on %s — `git -C %s pull --ff-only` "
                          "first; a read of this tree right now is a read of the past"
@@ -585,13 +832,101 @@ def render(records, selected_count):
         elif r["verdict"] == "ahead":
             lines.append("  AHEAD   %s by %d unpushed commit(s) on %s — the post-execution "
                          "push contract was missed somewhere" % (r["name"], r["ahead"], r["branch"]))
-        else:
+        elif r["verdict"] not in CLEAN_VERDICTS:
+            # Guarded rather than a bare `else` because the noisy set now admits
+            # repos whose verdict IS clean (off-default only). A bare else would
+            # print "IN-SYNC <repo> — no detail" directly beneath the OFF-DEFAULT
+            # warning, which reads as a contradiction and undercuts it.
             lines.append("  %-7s %s — %s" % (r["verdict"].upper(), r["name"],
                                              r["detail"] or "no detail"))
     return "\n".join(lines)
 
 
+def _force_lf_stdout():
+    r"""Emit LF, never CRLF — on every platform and in every output mode.
+
+    Python's text-mode stdout translates "\n" to os.linesep, so on Windows
+    `--list` emitted one trailing CR per repo path. `IFS= read -r r` PRESERVES
+    that CR, so every consumer then ran `git -C '<path><CR>'` -> "cannot change
+    to '...': Invalid argument", rc=128, across all 57 repos. No finding
+    printed, and the count line still read a healthy "scanning 57 repo(s)" — so
+    by the convention's own rule the reader correctly concluded ALL CLEAN while
+    literally nothing had been examined. Measured 2026-08-03 on
+    DESKTOP-O91DLK2 (Windows 10 / MSYS2); board msg-20260803-155838-alpha-5117.
+
+    FIXED IN THE PRODUCER, NOT THE CONSUMERS. Five convention steps read this
+    output; five `| tr -d '\r'` pipes are five things to keep in sync, and they
+    had already drifted — only ONE of the five carried the pipe (g-115-5056
+    audited the other four and found them to be LLM-read invocations and prose,
+    with no shell capture to strip). One line here makes "this script never
+    emits CR" an invariant of the script instead of a habit of its readers.
+
+    Applied to EVERY mode rather than just --list: --json and the banners have
+    no use for CR either, and scoping it to one branch leaves the next output
+    mode to rediscover this. Fail-open — `reconfigure` needs a real
+    TextIOWrapper, and a caller that has replaced sys.stdout (a test harness
+    capturing into StringIO) must not crash an advisory probe.
+
+    THIS MUTATES PROCESS-GLOBAL STATE, which is why it lives in main() and not
+    at import: main() runs in a process dedicated to this script. Under pytest
+    sys.stdout IS a real TextIOWrapper (measured), so an in-process main() call
+    genuinely reconfigures the HOST's captured stdout — checked and harmless
+    (it sets the value Linux already uses), and `corpus-freshness-precheck.py`,
+    the one production importer of this module, calls helpers only and never
+    main(). If a future caller starts invoking main() in-process on Windows,
+    re-check that assumption before trusting this note.
+    """
+    try:
+        sys.stdout.reconfigure(newline="\n")
+    except Exception:
+        pass
+
+
+def vacuity(enumerated_count, selected_count, lookup_ok=True):
+    """The ONE place that decides whether a run actually EXAMINED anything.
+
+    Returns ``(cannot_check, reason)``. This is the class fix requested by
+    g-115-6001 after a THIRD vacuity was filed against this script: the first
+    two (g-115-5013 CRLF probes, g-115-5056 unaudited --list call sites) were
+    point-fixed, and the recurring failure is not any single predicate but the
+    script's DEFAULT DIRECTION on an unproductive path — it kept finding new
+    ways to render "checked nothing" as "checked and clean". Routing every exit
+    through one predicate means a future path that selects nothing inherits the
+    loud answer instead of having to remember to ask for it.
+
+    WHY THE JSON CHANNEL NEEDS THIS WHEN STDERR ALREADY WARNS. The stderr
+    notice added by g-115-5013 fires correctly (verified on cc-08 2026-08-12:
+    `--goal-id g-326-98` emits the full CANNOT CHECK line, `goal_lookup_ok`
+    True, `selected_count` 0). But `--json` is a SEPARATE CHANNEL on a separate
+    stream, and it carried only `selected_count: 0` — so a caller that consumes
+    stdout, or captures the two streams apart, had to DERIVE the vacuity from a
+    count. That derivation is exactly what the text channel refuses to leave to
+    its reader, and the goal that filed this quoted the JSON payload as evidence
+    of silence while the stderr line was being printed the whole time.
+
+    DELIBERATELY UNGATED, unlike the stderr notice. That notice is gated on
+    ``work_class == "product"`` because an ungated advisory fires on 80.7% of
+    goals and stops being read (the measured g-115-5013 tie-break). Noise
+    tuning is a HUMAN-attention concern; a machine consumer asked for this data
+    explicitly and must always be able to tell "examined nothing" from
+    "examined, all clean". So the two channels answer the same question with
+    the same predicate but different exposure rules, and that asymmetry is
+    intended rather than an oversight.
+    """
+    if not enumerated_count:
+        return True, "no repos were enumerated"
+    if not lookup_ok:
+        return True, "the goal could not be read, so its repos are unknown"
+    if not selected_count:
+        return True, ("the goal matched none of the %d enumerated repo(s) — "
+                      "selection is by repository DIRECTORY NAME, so a goal "
+                      "citing paths, packages or class names matches nothing"
+                      % enumerated_count)
+    return False, None
+
+
 def main(argv=None):
+    _force_lf_stdout()
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--goal-id")
@@ -645,9 +980,12 @@ def main(argv=None):
                 _git(r, "fetch", "--quiet", "--all", timeout=FETCH_TIMEOUT_S)
         records = [sweep_status(r) for r in targets]
         if args.json:
+            cannot, why = vacuity(len(enumerated), len(targets))
             print(json.dumps({"mode": "sweep", "scanned": len(targets),
                               "fetched": not args.no_fetch,
                               "dirty_age_hours": DIRTY_AGE_HOURS,
+                              "cannot_check": cannot,
+                              "cannot_check_reason": why,
                               "records": records}, indent=2))
         else:
             print(render_sweep(records, len(targets)))
@@ -658,10 +996,11 @@ def main(argv=None):
         return 0
 
     lookup_ok = True
+    goal_meta = {}
     if args.repo:
         selected = [Path(r) for r in args.repo if _is_repo(r)]
     else:
-        text, lookup_ok = goal_text(args.goal_id, args.source)
+        text, lookup_ok = goal_text(args.goal_id, args.source, goal_meta)
         selected = select_repos(enumerated, text)
 
     if not lookup_ok:
@@ -679,12 +1018,61 @@ def main(argv=None):
               "--repo <path> to check specific repos regardless."
               % (args.goal_id, len(enumerated)), file=sys.stderr)
 
+    if enumerated and not selected and (
+            args.repo or (lookup_ok and goal_meta.get("work_class") == "product")):
+        # DEFECT B (). The goal was read FINE and simply names no
+        # repo, so both guards above stay quiet — and `render()` returns "" for
+        # an empty record list, so the plain-text channel printed ZERO BYTES at
+        # rc=0. Measured on cc-05: --goal-id  (selected=1, verdict
+        # in-sync) and --goal-id  (selected=0, nothing examined) were
+        # byte-identical on stdout. Silence could not distinguish "checked,
+        # fresh" from "matched nothing, checked nothing" — the same failure
+        # grammar as the two guards above, one layer further down.
+        #
+        # WHY `work_class == "product"` GATES THIS, when  asked for it
+        # on every zero selection. Both that goal and the test directly below
+        # (`..._stays_silent`, from the  fresh-eyes pass) are right,
+        # and they collide: one says an unexplained zero is a vacuity, the other
+        # says an advisory that speaks on the common path gets tuned out and
+        # stops being an advisory at all. The tiebreaker is a count neither had.
+        # Measured over all 4,355 completed goals with the live matcher: an
+        # ungated notice fires on 3,516 of them — 80.7%, including 97.3% of
+        # `framework` goals, which have no product repo to check and for which
+        # silence is the CORRECT answer, exactly as that test argues. Gating on
+        # work_class fires on 727 (16.7%), and every one of those is a product
+        # goal whose repo genuinely went unexamined. Same defect closed, 4.8x
+        # less noise, and the older test passes unchanged rather than being
+        # overridden — which is the sign this reconciles the two rather than
+        # picking a winner.
+        #
+        # Selection matches a repo's DIRECTORY NAME against the goal text, and
+        # code goals routinely cite paths, packages and class names instead:
+        #  pushed a 10-file commit to Ayoai-Environment-Server while
+        # naming only the Java package `AyoServer`, and selected 0. WHETHER to
+        # widen the match is a separate question, measured and decided against
+        # under  (b2) — making the zero audible is correct either way
+        # and deliberately does not presuppose that answer.
+        if args.repo:
+            print("[product-repo-freshness] CANNOT CHECK: --repo named %d path(s), "
+                  "none of which is a git repo, so NOTHING was examined. This is "
+                  "NOT an all-clear." % len(args.repo), file=sys.stderr)
+        else:
+            print("[product-repo-freshness] CANNOT CHECK: goal %r names none of "
+                  "the %d enumerated repo(s), so NOTHING was examined. This is NOT "
+                  "an all-clear. Selection is by repository DIRECTORY NAME, so a "
+                  "goal citing paths, packages or class names instead matches "
+                  "nothing. Pass --repo <path> to check specific repos regardless."
+                  % (args.goal_id, len(enumerated)), file=sys.stderr)
+
     records = [freshness(r, do_fetch=not args.no_fetch) for r in selected]
 
     if args.json:
+        cannot, why = vacuity(len(enumerated), len(selected), lookup_ok)
         print(json.dumps({"enumerated_count": len(enumerated),
                           "selected_count": len(selected),
                           "goal_lookup_ok": lookup_ok,
+                          "cannot_check": cannot,
+                          "cannot_check_reason": why,
                           "records": records}, indent=2))
     else:
         banner = render(records, len(selected))

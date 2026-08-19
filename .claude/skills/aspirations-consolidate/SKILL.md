@@ -29,6 +29,34 @@ The mode is still `autonomous` at invocation time (D4). If Phase -1.4 step order
   8.7 (user goal recap), and 10 (restart).
   Used by /stop to run proper consolidation without restarting the loop.
 
+- `goals_completed_this_session` (int) — close-EVENT count for the session,
+  passed by `/aspirations` (SKILL.md L727/L735). The orchestrator derives it
+  from `loop_state.goals_completed`, NOT from working memory.
+- `session_count` (int), `evolutions_this_session` (int) — passed in the same
+  two calls.
+
+  These three were passed by the caller but UNDECLARED here until g-115-4935,
+  and that gap is the root cause of the defect it fixes. Undeclared, Step 8.87
+  reached for a working-memory field that merely SHARES THE NAME
+  `goals_completed_this_session` — a top-level WM key (wm.py TOP_LEVEL_KEYS)
+  holding a LIST, not this int. That read also lands AFTER Step 5's wm-reset,
+  which returns the list to its `[]` template value because the only top-level
+  field surviving reset is SESSION_IDENTITY_FIELDS = {"session_start"}. So the
+  team-state field published a stale prior-session figure: measured 2026-08-04
+  (alpha, cc-04) at 125 where the true count was 270 — and 270 is exactly what
+  `loop_state.goals_completed`, i.e. this parameter, already held.
+
+  Prefer this parameter over any working-memory read for the session count.
+  The two rejected alternatives, recorded so the choice is not silently
+  re-litigated: adding the WM field to SESSION_IDENTITY_FIELDS would make it
+  survive until `wm clear-identity` at /stop D4.5, so a session ending without
+  a graceful stop leaks its count into the next one — reproducing the same
+  stale-count symptom by another route. Recomputing from the world store via
+  `completed_by` would change what the field MEANS (currently-completed goals
+  rather than close events; measured 255 vs 270 on the same session, the gap
+  being recurring-goal closes) and is a deliberate semantic change, not a bug
+  fix.
+
 ---
 
 **Step 0: Load Conventions** — `Bash: load-conventions.sh` with each name from the `conventions:` front matter. Read only the paths returned (files not yet in context). If output is empty, all conventions already loaded — proceed to next step.
@@ -109,10 +137,21 @@ The mode is still `autonomous` at invocation time (D4). If Phase -1.4 step order
 
 0.1. CONSOLIDATION TRIAGE GATE:
    # This logic is duplicated in core/scripts/consolidation-precheck.py.
-   # If you change the checks here, update that script to match.
+   # If you change the checks here, update that script to match. Parity on the
+   # unreflected field is MEASURED, not assumed (g-115-6173): both instruments
+   # must yield the SAME count on one store snapshot — the script mirrors the
+   # endpoint's union (live+archive, dedup by id, live wins) and both apply
+   # the shared core/scripts/_reflectable.py filter.
    # ── PRE-SCAN (2 script calls + 1 file check) ────────────────────────
    triage_wm      = Bash: wm-read.sh --json
-   triage_unrefl  = Bash: pipeline-read.sh --unreflected --counts
+   # g-115-4878: was `--unreflected --counts`, which returned the stage-counts
+   # object (branch precedence: counts is tried before unreflected) and carried
+   # NO `active_unreflected` key on any response shape. So unreflected_count was
+   # permanently 0 for every agent on every session end, silently, and the `# 0
+   # if none` comment is how it hid -- a permanent zero reads as "none exist"
+   # rather than "this key never existed". The endpoint now REFUSES the pair
+   # with 400 ambiguous_selectors instead of answering the wrong one.
+   triage_unrefl  = Bash: pipeline-read.sh --unreflected
    triage_overflow = test -f agents/<agent>/session/overflow-queue.yaml
 
    # ── EXTRACT COUNTS ──────────────────────────────────────────────────
@@ -121,7 +160,14 @@ The mode is still `autonomous` at invocation time (D4). If Phase -1.4 step order
    debt_count        = len(triage_wm.slots.knowledge_debt)        # null/[] → 0
    conclusions_count = len(triage_wm.slots.conclusions)           # null/[] → 0
    violations_count  = len(triage_wm.slots.recent_violations)     # null/[] → 0
-   unreflected_count = triage_unrefl.active_unreflected           # 0 if none
+   # g-115-6173: count the REFLECTABLE subset, not the raw array length. The
+   # g-115-5358 widening made the raw length the truthful never-reflected
+   # BACKLOG (measured 2026-08-14: 383 = 181 UNRESOLVABLE + 150 EXPIRED + 47
+   # no-outcome + 5 reflectable) — dominated by records /reflect can never
+   # learn from (g-115-4558), so len() here kept data_total nonzero forever
+   # and the lean fast path was structurally dead. Filter SSOT:
+   # core/scripts/_reflectable.py (outcome in {CONFIRMED, CORRECTED}).
+   unreflected_count = count of triage_unrefl records where str(outcome).upper() in {"CONFIRMED", "CORRECTED"}   # reflectable only; [] → 0
    has_overflow      = triage_overflow                            # boolean
 
    data_total = micro_count + encoding_count + debt_count + conclusions_count + unreflected_count
@@ -182,7 +228,12 @@ Read core/config/memory-pipeline.yaml (replay_priority_order)
 
 0.5. Unreflected Hypothesis Sweep:
    Bash: pipeline-read.sh --unreflected
-   IF unreflected hypotheses exist:
+   # g-115-6173: gate on the REFLECTABLE subset (outcome CONFIRMED/CORRECTED —
+   # SSOT core/scripts/_reflectable.py), not array non-emptiness. The widened
+   # array carries a permanent floor of structurally-unreflectable records
+   # (UNRESOLVABLE/EXPIRED/no-outcome), so a bare existence check would invoke
+   # the sweep on every full consolidation forever with nothing to reflect on.
+   IF any record has outcome in {CONFIRMED, CORRECTED}:
      invoke /review-hypotheses --learn
      # This reflects on each unreflected hypothesis, sets reflected: true,
      # and pushes encoding items into encoding_queue for Step 1.
@@ -408,10 +459,14 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
          {"op": "set", "key": "<node.key>", "field": "capability_level", "value": "<item.metadata_updates.capability_level>"}
        ]}' | bash core/scripts/tree-update.sh --batch
        # Growth triggers
-       Read core/config/tree.yaml for decompose_threshold, split_threshold
-       line_count = count lines in node .md body (excluding YAML front matter)
-       If line_count > decompose_threshold AND node depth < D_max:
-           bash core/scripts/tree-update.sh --set <node.key> growth_state ready_to_decompose
+       Read core/config/tree.yaml for split_threshold
+       Decompose is STRUCTURAL, not line-count (g-306-13; board msg-20260619-075228-bravo-086).
+       Do NOT compute a line count and do NOT set growth_state ready_to_decompose:
+       tree.py get_decompose_candidates selects on leaves-under-node >
+       K_max^(D_retrieval-1) and never reads decompose_threshold, so a line-count
+       flag is INERT — it writes a field no reader acts on. Ask the tool instead:
+         bash core/scripts/tree-read.sh --decompose-candidates
+         If the node is listed: Invoke /tree maintain
        # Capability event logging
        IF item.metadata_updates.capability_level crosses threshold:
            Log capability event via evolution-log-append.sh
@@ -585,9 +640,13 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
        ]}' | bash core/scripts/tree-update.sh --batch
      Set last_update_trigger: {type: "experience-distillation", session: N}
      Check growth triggers (same as Step 2 growth trigger block):
-       line_count = count lines in node .md body
-       If line_count > decompose_threshold AND depth < D_max:
-         bash core/scripts/tree-update.sh --set <node-key> growth_state ready_to_decompose
+       Decompose is STRUCTURAL, not line-count (g-306-13; board msg-20260619-075228-bravo-086).
+       Do NOT compute a line count and do NOT set growth_state ready_to_decompose:
+       tree.py get_decompose_candidates selects on leaves-under-node >
+       K_max^(D_retrieval-1) and never reads decompose_threshold, so a line-count
+       flag is INERT — it writes a field no reader acts on. Ask the tool instead:
+         bash core/scripts/tree-read.sh --decompose-candidates
+         If the node is listed: Invoke /tree maintain
      Log: "EXPERIENCE DISTILLATION: {node_key} enriched from {count} experiences"
    
    Budget: max 5 nodes per consolidation (largest clusters first)
@@ -610,6 +669,11 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
    Bash: wm-read.sh --json
    Archive working memory to journal entry (summary only).
    This captures any remaining WM state before it is destroyed by reset.
+
+   Do NOT source the session goal count from this read (g-115-4935). It
+   arrives as the `goals_completed_this_session` PARAMETER — see ## Parameters
+   — which is immune to the reset below. Step 8.87 and Step 9.7 both use that
+   parameter.
 5. Bash: wm-reset.sh
    # journal_cluster_summaries survives this reset (wm.py RESET_SURVIVING_SLOTS,
    # g-115-1992) — Step 9 consumes it one-shot and clears it.
@@ -794,7 +858,17 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
 
 8.87. Team State Session Summary:
    # Update shared team state with session-end summary
-   goals_this_session = count goals_completed_this_session from working memory
+   goals_this_session = the `goals_completed_this_session` PARAMETER (g-115-4935).
+   # Do NOT read it from working memory here. The WM key of the SAME NAME is a
+   # different object (a list, not this int) and Step 5's wm-reset has already
+   # returned it to `[]`, so a read here publishes an empty or stale count to
+   # every partner that reads team-state. See ## Parameters for the measurement
+   # and for the two rejected alternatives.
+   # NOT affected by the same reset, verified 2026-08-10: `current_focus` below
+   # is the literal "session ended", and `blocked_data` comes from the live
+   # `goal-selector.sh blocked` call — neither reads working memory. Step 9's
+   # handoff reads `journal_cluster_summaries`, which survives reset by design
+   # (wm.py RESET_SURVIVING_SLOTS), so it is unaffected too.
 
    # Gather blocked data for critical path (used by both Step 8.87 and Step 9)
    Bash: goal-selector.sh blocked
@@ -1017,10 +1091,36 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
    Critical-path sourcing convention (LLM responsibility when composing
    `critical_path`) — mandatory, no narrative freedom:
    - `primary_blocker.goal_id`, `.title`, `.cause` MUST be read directly
-     from `world/aspirations.jsonl`. The `cause` field MUST be the goal's
-     actual `defer_reason` (for `status: pending` with non-null
-     `defer_reason`) OR `blocked_reason` (for `status: blocked`). If both
-     are null/empty, the goal is NOT a blocker — do not list it.
+     from `world/aspirations.jsonl`. Source `cause` by STATUS:
+     - `status: pending` with non-null `defer_reason` → quote
+       `defer_reason` verbatim.
+     - `status: blocked` → compose from the fields that actually exist on
+       a blocked record. Measured 2026-08-11 across all 5 live blocked
+       goals: `blocked_since` 5/5, `blocked_by` 4/5, `blocker_ref` 2/5,
+       `defer_reason` 0/5. Prefer, in order:
+         1. `blocker_ref.why` (dict form only — the richest text);
+         2. `blocker_ref.type` + `.external_id` (e.g.
+            `partner-response:g-326-118`);
+         3. `blocked by <blocked_by joined>` — the most widely populated;
+         4. `blocked since <blocked_since>` — universal, so this arm
+            always yields a quotable string.
+     - **`blocker_ref` HAS TWO SHAPES AND BOTH ARE LIVE.** It is a dict
+       (`type`/`external_id`/`unblock_goal`/`why`/`created_at`/`expires_at`)
+       on some records and a BARE STRING holding an unblocking goal id on
+       others — both measured on the same day. Test the type before
+       subscripting; on a string, treat it as `blocked_by` and use arm 3.
+     - **A `status: blocked` goal IS a blocker. Always list it.** Never
+       drop one for want of a cause string. The previous wording named
+       `blocked_reason`, WHICH IS NOT A FIELD ON GOAL RECORDS (0 of 4,208
+       asp-115 records carry the key), and paired it with "if both are
+       null/empty, the goal is NOT a blocker — do not list it". Those two
+       clauses composed into silent under-reporting in the healthy-looking
+       direction: a compliant author found every blocked goal "empty",
+       listed none, and the handoff read as an unblocked frontier
+       (g-115-3361). Fixing only the field NAMES would leave that escape
+       clause live and re-break on the next schema change, so the default
+       is inverted here: status decides whether a goal is listed, and the
+       cause string is best-effort.
    - Do NOT narrate a `cause` that cannot be quoted verbatim from the
      goal record. Hallucinating a plausible-sounding defer reason (e.g.,
      "blocked on user-initiated X") when the field is null is a
@@ -1036,10 +1136,15 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
    - `top_bottlenecks[]` entries follow the same sourcing rule as
      `primary_blocker`. Rank by `downstream_count` computed from
      `blocked_by` / `depends_on` edges, not by subjective importance.
-   - If no goal has a non-null `defer_reason` AND no goal has
-     `status: blocked`, emit `critical_path: {}` — an empty object is
-     the correct representation of "nothing blocks the frontier",
-     not a fabricated placeholder.
+   - Emit `critical_path: {}` ONLY when no goal has a non-null
+     `defer_reason` AND no goal has `status: blocked`. An empty object is
+     the correct representation of "nothing blocks the frontier", not a
+     fabricated placeholder — but it is also the single most dangerous
+     value in this payload, because `/boot` Step 0.5 sub-step 4c shows it
+     to the resuming session as an all-clear. Before emitting `{}`, COUNT
+     the blocked goals (`aspirations-query.sh --goal-status blocked`); a
+     non-zero count means `{}` is wrong no matter how empty the cause
+     fields look. This is the check that would have caught g-115-3361.
 
    ```
    Bash: echo '<payload>' | bash core/scripts/handoff-yaml-build.sh
@@ -1073,7 +1178,11 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
      Notify the user about the session end.
      (Check `world/forged-skills.yaml` for a skill whose triggers match
      "notify the user" and invoke it with:
-     - subject: "Session ended — <goals_completed_this_session> goals closed"
+     - subject: "Session ended — <goals_completed_this_session parameter> goals closed"
+       # The PARAMETER, not a working-memory read (g-115-4935). Same post-reset
+       # staleness as Step 8.87, and NOT among the siblings that goal named —
+       # it is the most user-visible one, since the count lands in the subject
+       # line of the session-end email at every /stop.
      - message: a concise wrap-up — goals completed, aspirations
        completed/archived, tree nodes encoded, knowledge debt delta, any
        blockers surfacing in the handoff, and the fact that the loop has

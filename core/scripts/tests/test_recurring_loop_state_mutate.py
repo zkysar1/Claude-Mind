@@ -80,6 +80,15 @@ def _run_gate(agent_name: str, goal_id: str, outcome: str) -> tuple[int, str, st
     """
     env = os.environ.copy()
     env["MIND_AGENT"] = agent_name
+    # guard-862 / guard-3375 (): on a worker Body, bash-agent-inject
+    # sets BODY_WM_PATH to the LIVE per-Body WM, and wm.wm_path() checks it
+    # FIRST — outranking MIND_AGENT entirely. Inheriting it made the gate
+    # mutate live Body loop_state and fail all 8 cases against live counters
+    # (measured cc-07 2026-08-17). Pin it to the fixture so the subprocess
+    # resolves the sandbox WM on every box class.
+    env["BODY_WM_PATH"] = str(
+        _agent_dir(agent_name) / "session" / "working-memory.yaml"
+    )
 
     proc = subprocess.run(
         [sys.executable, str(GATE_PY), "--goal-id", goal_id, "--outcome", outcome],

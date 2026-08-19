@@ -622,3 +622,125 @@ def test_external_id_reaches_the_verdict_ladder_end_to_end():
     entry = _classify(goal, _index(_DONE))
     assert entry["verdict"] == "all_resolved", entry
     assert entry["resolution_basis"] == "referent_terminal_external", entry
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Routing-breadcrumb cooldown ()
+#
+# The sweep is detective-only, so the LLM does the lane routing — and with N
+# agents each running precheck, the SAME unresolved hit was routed to the
+# coordination board once per agent per round. Measured: 7 posts from 3 agents
+# over ~29h on goals that never changed. The two sibling sweeps
+# (inbox-alert-age-check , handoff-aging-check ) already
+# solve this with a shared+durable board breadcrumb; this pins that the same
+# mechanism now works here.
+#
+# These tests use the `board_log_path` seam rather than the daemon so they are
+# hermetic — no board reads, no board writes, no live fleet state.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _routing_log(tmp_path, name, tags, age_hours, now=NOW):
+    """Write a one-post board fixture aged `age_hours` before `now`."""
+    import json
+    p = tmp_path / name
+    ts = (now - dt.timedelta(hours=age_hours)).isoformat(timespec="seconds")
+    p.write_text(json.dumps([{"timestamp": ts, "tags": tags}]), encoding="utf-8")
+    return p
+
+
+def test_fresh_breadcrumb_is_seen_and_keyed_on_the_goal_id(tmp_path):
+    mod = _import()
+    log = _routing_log(tmp_path, "fresh.json",
+                       [mod.ROUTING_TAG, "g-111-11", "lane:either"], 2.0)
+    recent, read_ok = mod._read_recent_routings(NOW, 24.0, log)
+    assert read_ok is True
+    assert recent == {"g-111-11": 2.0}, recent
+
+
+def test_a_breadcrumb_older_than_the_window_does_not_suppress(tmp_path):
+    """The load-bearing NEGATIVE control. Without it, a test suite cannot tell
+    'the cooldown works' from 'any breadcrumb at all suppresses forever' — and
+    the second is a silent-forever bug, since a stale post would permanently
+    hide a hit the lane owner never acted on."""
+    mod = _import()
+    log = _routing_log(tmp_path, "stale.json",
+                       [mod.ROUTING_TAG, "g-111-11"], 48.0)
+    recent, read_ok = mod._read_recent_routings(NOW, 24.0, log)
+    assert read_ok is True
+    # It is SEEN (the reader reports it) but its age exceeds the window, so the
+    # caller's `age < cooldown_hours` comparison must not suppress.
+    assert recent["g-111-11"] == 48.0
+    assert not (recent["g-111-11"] < 24.0)
+
+
+def test_legacy_hand_written_routing_tags_are_honoured(tmp_path):
+    """The duplicated posts this goal was filed over carried `blocked-signal` /
+    `blocked-signal-sweep`, not the new marker. Recognising them means the
+    cooldown respects a manual post instead of re-routing over it."""
+    mod = _import()
+    for legacy in ("blocked-signal", "blocked-signal-sweep"):
+        log = _routing_log(tmp_path, "legacy-%s.json" % legacy,
+                           [legacy, "g-222-22", "foxtrot"], 1.0)
+        recent, _ = mod._read_recent_routings(NOW, 24.0, log)
+        assert recent == {"g-222-22": 1.0}, (legacy, recent)
+
+
+def test_a_post_without_a_goal_id_tag_cannot_suppress_anything(tmp_path):
+    """Fail-open in the safe direction: a routing-marked post that never tagged
+    its goal_id keys to nothing, so it suppresses nothing rather than
+    suppressing everything."""
+    mod = _import()
+    log = _routing_log(tmp_path, "no-gid.json", [mod.ROUTING_TAG, "foxtrot"], 1.0)
+    recent, read_ok = mod._read_recent_routings(NOW, 24.0, log)
+    assert read_ok is True
+    assert recent == {}, recent
+
+
+def test_unreadable_board_reports_degraded_and_suppresses_nothing(tmp_path):
+    """read_ok is returned SEPARATELY from the dict on purpose. An empty dict
+    has two causes — a quiet board and a failed read — and a consumer that
+    derived the flag from the dict's truthiness could never tell them apart,
+    reporting a healthy quiet board as a failure (rb-245: a zero whose
+    provenance is unknown is not a measurement)."""
+    mod = _import()
+    recent, read_ok = mod._read_recent_routings(
+        NOW, 24.0, tmp_path / "does-not-exist.json")
+    assert recent == {}
+    assert read_ok is False
+
+
+def test_quiet_board_is_read_ok_not_degraded(tmp_path):
+    """The other half of the pair above: genuinely nothing routed recently must
+    report read_ok=True, or every clean run would look like an outage."""
+    import json
+    mod = _import()
+    p = tmp_path / "empty.json"
+    p.write_text(json.dumps([]), encoding="utf-8")
+    recent, read_ok = mod._read_recent_routings(NOW, 24.0, p)
+    assert recent == {}
+    assert read_ok is True
+
+
+def test_most_recent_post_wins_when_a_goal_was_routed_twice(tmp_path):
+    """The caller compares against the freshest evidence, so a goal routed at
+    both 2h and 30h must key to 2h — otherwise the older post would let a
+    just-routed hit re-route immediately."""
+    import json
+    mod = _import()
+    p = tmp_path / "two.json"
+    posts = []
+    for age in (30.0, 2.0):
+        ts = (NOW - dt.timedelta(hours=age)).isoformat(timespec="seconds")
+        posts.append({"timestamp": ts, "tags": [mod.ROUTING_TAG, "g-333-33"]})
+    p.write_text(json.dumps(posts), encoding="utf-8")
+    recent, _ = mod._read_recent_routings(NOW, 24.0, p)
+    assert recent == {"g-333-33": 2.0}, recent
+
+
+def test_scan_window_covers_the_whole_cooldown_with_margin():
+    """A read window narrower than the cooldown would drop the very breadcrumbs
+    the comparison needs, silently shortening the cooldown to the window."""
+    mod = _import()
+    assert mod._routing_window_str(24.0) == "25h"
+    assert mod._routing_window_str(0.5) == "2h"
+    assert mod._routing_window_str(23.1) == "25h"

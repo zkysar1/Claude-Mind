@@ -15,13 +15,13 @@ orphan-root-sweep.sh + _orphan_root_helpers.py for `is_mode_d_cruft`
 and got hit_ratio=1.0 → verdict=already_present → blocked a legitimate
 Maintain goal. The fix wires _is_maintain_check_about_goal +
 _extract_edit_target so the probe instead checks
-.claude/skills/verify-learning/SKILL.md (where the new check needs to
+core/config/verify-learning-checks.jsonl (where the new check needs to
 land).
 
 Tests cover both the predicate (regex matching) and the
 edit-target priority chain:
-  (a) g-115-875 canonical replay -> verify-learning SKILL.md
-  (b) generic verify-learning trigger -> verify-learning SKILL.md
+  (a) g-115-875 canonical replay -> verify-learning check registry
+  (b) generic verify-learning trigger -> verify-learning check registry
   (c) explicit "add check to <skill-name>" -> that skill's SKILL.md
   (d) explicit .claude/skills/<name>/SKILL.md path -> that path
   (e) Maintain without "check" -> unchanged behavior (predicate false)
@@ -84,16 +84,16 @@ class TestMaintainCheckAbout:
 
     def test_a_g115875_canonical_replay(self):
         """ canonical incident: predicate fires, target_files
-        REPLACED with [.claude/skills/verify-learning/SKILL.md], NOT the
+        REPLACED with [core/config/verify-learning-checks.jsonl], NOT the
         assertion-target files (orphan-root-sweep.sh, _orphan_root_helpers.py).
         target_kind == 'maintain-check-about'.
         """
         assert _is_maintain_check_about_goal(G_115_875_TITLE) is True
         result = extract_targets(G_115_875_TITLE, G_115_875_DESC)
         assert result["target_files"] == [
-            ".claude/skills/verify-learning/SKILL.md"
+            "core/config/verify-learning-checks.jsonl"
         ], (
-            f"expected target_files replaced with verify-learning SKILL.md; "
+            f"expected target_files replaced with the verify-learning check registry; "
             f"got {result['target_files']}"
         )
         assert result["target_kind"] == "maintain-check-about"
@@ -106,14 +106,14 @@ class TestMaintainCheckAbout:
     def test_b_generic_verify_learning_trigger(self):
         """Phrase-based trigger: 'add verify-learning check asserting X'
         with no explicit SKILL.md path and no other source files —
-        edit_target resolves to verify-learning SKILL.md via priority
+        edit_target resolves to the verify-learning check registry via priority
         rule (b)."""
         title = "Maintain: add verify-learning check asserting daemon health"
         desc = "Ensure daemon-health.sh exits 0 when daemon responds."
         assert _is_maintain_check_about_goal(title) is True
         result = extract_targets(title, desc)
         assert result["target_files"] == [
-            ".claude/skills/verify-learning/SKILL.md"
+            "core/config/verify-learning-checks.jsonl"
         ]
         assert result["target_kind"] == "maintain-check-about"
 
@@ -190,7 +190,7 @@ class TestExtractEditTargetPriority:
     def test_a_beats_b_explicit_path_over_verify_learning_phrase(self):
         """Explicit .claude/skills/X/SKILL.md in text wins over a
         verify-learning trigger phrase that would otherwise route to
-        verify-learning SKILL.md."""
+        verify-learning check registry."""
         title = "Maintain: add verify-learning check"
         desc = "See .claude/skills/aspirations-execute/SKILL.md for the host."
         result = _extract_edit_target(title, desc)
@@ -203,7 +203,7 @@ class TestExtractEditTargetPriority:
         title = "Maintain: add verify-learning check"
         desc = "Wire the check; consider also exposing in add check to /respond chain."
         result = _extract_edit_target(title, desc)
-        assert result == ".claude/skills/verify-learning/SKILL.md"
+        assert result == "core/config/verify-learning-checks.jsonl"
 
     def test_c_add_check_to_specific(self):
         """When neither (a) nor (b) fires, 'add check to <skill>'
@@ -215,11 +215,11 @@ class TestExtractEditTargetPriority:
 
     def test_d_default_to_verify_learning(self):
         """When no specific signal exists, default (d) routes through
-        verify-learning SKILL.md."""
+        verify-learning check registry."""
         title = "Maintain: add check"
         desc = "Generic Maintain-CHECK-ABOUT with no targeting hint."
         result = _extract_edit_target(title, desc)
-        assert result == ".claude/skills/verify-learning/SKILL.md"
+        assert result == "core/config/verify-learning-checks.jsonl"
 
 
 # ─── Predicate edge-case tests ──────────────────────────────────────────

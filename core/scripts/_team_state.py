@@ -270,8 +270,16 @@ def load_rows_authoritative_with_provenance(world_dir):
         from owncloud_backend import OwnCloudBackend
         be = OwnCloudBackend.from_env()
     except Exception as e:  # noqa: BLE001 — fail-open to the local mirror
+        # Print str(e), not just the type. The type alone is uninformative:
+        # every distinct cause here (no mappable world root, missing S3 env,
+        # absent credentials, S3 error) arrives as a bare label, and the label
+        # names none of them. Measured  — recovering the message the
+        # exception already carried cost a full investigation, and the message
+        # ("neither MIND_WORLD/WORLD_PATH nor MIND_META/META_PATH is set")
+        # identified the cause on sight. Exception messages here carry env-var
+        # NAMES and paths, never values (guard-724).
         print(f"[_team_state] authoritative read unavailable "
-              f"({type(e).__name__}); using local mirror", file=sys.stderr)
+              f"({type(e).__name__}: {e}); using local mirror", file=sys.stderr)
         return (local, {"by_agent": {n: PROV_LOCAL_MIRROR for n in local},
                         "roster": PROV_LOCAL_MIRROR})
     d = rows_dir(world_dir)
@@ -286,7 +294,7 @@ def load_rows_authoritative_with_provenance(world_dir):
                 names.add(n[:-5])
     except Exception as e:  # noqa: BLE001 — S3 list failed; local roster stands
         print(f"[_team_state] authoritative roster list failed "
-              f"({type(e).__name__}); local roster only", file=sys.stderr)
+              f"({type(e).__name__}: {e}); local roster only", file=sys.stderr)
         roster = PROV_LOCAL_MIRROR
     out = dict(local)
     prov = {}
@@ -394,7 +402,7 @@ def read_shard_authoritative_with_provenance(world_dir, agent):
             return (doc, PROV_AUTHORITATIVE)
     except Exception as e:  # noqa: BLE001 — fail-open to the local mirror
         print(f"[_team_state] authoritative shard read of {agent!r} failed "
-              f"({type(e).__name__}); using local mirror", file=sys.stderr)
+              f"({type(e).__name__}: {e}); using local mirror", file=sys.stderr)
     row = _local()
     return (row, PROV_LOCAL_MIRROR if row else PROV_NONE)
 

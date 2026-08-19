@@ -105,6 +105,19 @@ _HISTORICAL_NAMES = {
     "aspiration-events.jsonl",
     "improvement-velocity.yaml",   # imp@k per-goal telemetry
     "retrieval-trace.jsonl",       # per-retrieval trace
+    #  counter sidecars (writer not yet flipped): advisory retrieval-
+    # scoring stats keyed by rb-N/guard-N, flushed as a full RMW per maintenance
+    # tick. Same telemetry class as improvement-velocity.yaml above. EXACT
+    # basenames, deliberately not a <kind>-*.jsonl glob — a glob would also
+    # match <kind>-archive.jsonl (already suffix-matched) and every future
+    # CONTENT date segment, which must stay BLOCKING: rb/guardrail segments
+    # carry live source_goal referents exactly like the legacy store, so their
+    # deliberate NON-entry here mirrors _fileops._SNAPSHOT_BLACKLIST's same
+    # decision (46a035a5b). Literals pinned to _utilization_store.counters_name()
+    # by test (test_goal_reference_scan.py), not by import — this scanner must
+    # keep working when the seam module is absent.
+    "reasoning-bank-utilization.jsonl",
+    "guardrails-utilization.jsonl",
 }
 _HISTORICAL_DIR_PARTS = {"board", "journal", "health", "experience", "logs",
                          "sessions", "temp", "drained", "presence"}
@@ -132,6 +145,15 @@ def is_historical(p: Path, rel: Path) -> bool:
     if p.name.endswith("-archive.jsonl"):
         return True
     if p.name in _HISTORICAL_NAMES:
+        return True
+    # gate-firings date segments (`gate-firings-YYYY-MM-DD.jsonl`, the
+    # GATE_FIRINGS_SEGMENTED flush lane, cutover 2026-08-17) are the SAME
+    # append-only telemetry as the enumerated `gate-firings.jsonl` above, under
+    # a dynamic basename the name-set cannot hold. Matched by STEM for the same
+    # reason archives are matched by suffix: measured on the first live segment,
+    # 344 goal-id mentions in one day — an unmatched segment re-introduces the
+    # always-fires failure mode for every goal a gate has ever fired on.
+    if p.name.startswith("gate-firings-") and p.name.endswith(".jsonl"):
         return True
     return any(part in _HISTORICAL_DIR_PARTS for part in rel.parts)
 

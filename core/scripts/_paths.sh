@@ -208,7 +208,8 @@ if [ -n "$_AGENT_DIR_OVERRIDE" ] && [ -f "$_AGENT_DIR_OVERRIDE/local-paths.conf"
 elif [ -n "$AGENT_NAME" ] && [ -f "$(agent_dir "$AGENT_NAME")/local-paths.conf" ]; then
     source "$(agent_dir "$AGENT_NAME")/local-paths.conf"
 else
-    # MIND_AGENT unset — use the first available conf that actually sets
+    # MIND_AGENT unset OR naming an unprovisioned agent (see the two-case note
+    # below) — use the first available conf that actually sets
     # WORLD_PATH (hooks/daemon don't have the env var). An empty or partial
     # conf (e.g. an abandoned `/start <agent>` that created the agent dir + an
     # empty local-paths.conf at Phase A2 but never completed Phase B path
@@ -234,11 +235,26 @@ else
         [ -f "$_CC" ] && _CONF_COUNT=$((_CONF_COUNT + 1))
     done
     unset _CC
+    # TWO DISTINCT CASES REACH THIS BRANCH, and only one of them is ambiguity
+    # (). The conf-count suppression above is correct for the UNSET
+    # case and WRONG for the named-but-missing case:
+    #   (a) MIND_AGENT unset            -> genuine ambiguity; warn only when 2+
+    #       confs make the pick non-obvious (the  hook-miss signal).
+    #   (b) MIND_AGENT SET but its conf is absent -> ALWAYS an error, at ANY
+    #       conf count. Nothing is ambiguous: a specific agent was named and it
+    #       is not provisioned here. AGENT_DIR still resolves to that named
+    #       (nonexistent) dir while WORLD/META come from someone else's conf, so
+    #       the process looks healthy on world reads and misroutes agent-private
+    #       writes. _paths.py has warned on this case since ; this side
+    #       was silent because the `-z "$AGENT_NAME"` guard excludes it. Measured
+    #       2026-08-17 (cc-07): identical input, python warned, bash said nothing.
     for _CONF in "$(agents_root)"/*/local-paths.conf; do
         [ -f "$_CONF" ] || continue
         source "$_CONF"
         if [ -n "${WORLD_PATH:-}" ]; then
-            if [ -z "$AGENT_NAME" ] && [ "$_CONF_COUNT" -gt 1 ]; then
+            if [ -n "$AGENT_NAME" ]; then
+                echo "[_paths] WARN: MIND_AGENT='$AGENT_NAME' but $(agent_dir "$AGENT_NAME")/local-paths.conf does not exist. Falling through to first-available conf ($(basename "$(dirname "$_CONF")")) for WORLD/META; AGENT_DIR still points at the named agent. Likely a test polluter set MIND_AGENT without restoring it (g-115-960 / g-115-6417)." >&2
+            elif [ "$_CONF_COUNT" -gt 1 ]; then
                 echo "[_paths] WARN: MIND_AGENT unset, falling through to first agent: $(basename "$(dirname "$_CONF")"). This is usually a hook miss -- check core/logs/bash-inject-misses.jsonl for the SID (g-115-1146)." >&2
             fi
             break
@@ -336,6 +352,59 @@ git_available() {
         return 1
     fi
     export MIND_GIT_AVAILABLE=1
+    return 0
+}
+
+# --- cap_log_file PATH [MAX_BYTES] [KEEP_LINES] — guard-586 inline rotation ---
+# Size cap then truncate-to-last-N-lines, for append-only plain-text logs that
+# no code path reads (spawn.log). Format-agnostic on purpose: spawn.log is a
+# MIXED sink (shell `[ts] daemon-start:` lines plus the daemon's raw
+# stdout/stderr), so jsonl_hygiene.py does not apply to it.
+#
+# DISPOSITION: truncate, NOT archive-then-truncate. archive-before-delete.md
+# scopes itself to "records the system cannot trivially regenerate", and the
+# blast-radius check says spawn.log is not one: it is a write-only diagnostic
+# sink with ZERO production readers (the only two greps that touch it are tests
+# driving their own RT_SPAWN_LOG tmp override), and mirror_health.py:16
+# independently records it as "unbounded, rotation-fragile, and historical"
+# while deliberately declining to depend on it. The newest KEEP_LINES are
+# retained, so this is a bounded window, not a delete — and archiving a
+# multi-gigabyte daemon stdout transcript would cost more disk than the
+# unboundedness it is meant to protect against.
+#
+# COPYTRUNCATE, NOT `tail > tmp && mv tmp log` — this is the one place the
+# obvious precedent (iteration-close.sh:2266) is WRONG, and silently so.
+# spawn.log is held open on fd 1 AND fd 2 by a daemon that outlives every shell
+# here (verified on cc-08: flags=0102001, O_APPEND set on both). `mv` swaps the
+# inode, so the daemon keeps appending to the orphaned one: its output vanishes
+# and the freed space is not reclaimed until the daemon restarts. Measured under
+# a live O_APPEND writer — mv landed 5/40 subsequent lines, copytruncate 39/40
+# (the 1 is the inherent sub-ms truncate race; with O_APPEND that is a dropped
+# line, never interleaved corruption). `cat tmp > path` keeps the SAME inode, so
+# every open fd follows the file to its new end.
+#
+# Fail-open by contract, mirroring the `|| true` posture of the two callers that
+# log here: a rotation must never be able to break a daemon spawn. Every path
+# returns 0.
+cap_log_file() {
+    local path="${1:-}"
+    local max_bytes="${2:-${MIND_LOG_CAP_BYTES:-10485760}}"   # 10 MiB
+    local keep_lines="${3:-${MIND_LOG_CAP_KEEP_LINES:-2000}}"
+    [ -n "$path" ] && [ -f "$path" ] || return 0
+    local size
+    size="$(stat -c%s "$path" 2>/dev/null || stat -f%z "$path" 2>/dev/null || echo 0)"
+    # Single stat, then out — the under-cap case is the hot path and costs one fork.
+    [ "$size" -gt "$max_bytes" ] 2>/dev/null || return 0
+    local tmp="${path}.cap.$$"
+    if tail -n "$keep_lines" "$path" > "$tmp" 2>/dev/null \
+       && cat "$tmp" > "$path" 2>/dev/null; then
+        # Record the truncation IN the log, so a reader who finds the file
+        # starting mid-stream sees why rather than suspecting corruption.
+        printf '[%s] log-cap: truncated %s (was %s bytes; kept last %s lines)\n' \
+            "$(date +%Y-%m-%dT%H:%M:%S 2>/dev/null || echo unknown)" \
+            "$path" "$size" "$keep_lines" >> "$path" 2>/dev/null || true
+    fi
+    rm -f "$tmp" 2>/dev/null || true
     return 0
 }
 

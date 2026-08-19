@@ -401,6 +401,31 @@ def _stamp_progression(node):
     node["progression_updated_at"] = date.today().isoformat()
 
 
+# --- CALIBRATION stamp () ------------------------------------------
+# _CALIBRATION_STAMP_FIELDS MUST match coordination_merge._TREE_CALIBRATION_FIELDS
+# (the merge-side SSOT). Same contract as the PROGRESSION pair above and a
+# DELIBERATELY SEPARATE stamp, not a reuse of progression_updated_at: one selector
+# key serving two field groups with different write triggers is unsound
+# (guard-3358) -- an accuracy-only edit would advance the PROGRESSION LWW key and
+# let an UNCHANGED confidence beat a peer's genuine earlier confidence edit.
+# Without this stamp `accuracy` fell to the merge's BASE class, which rides
+# last_updated -- a field  deliberately does NOT advance on a field poke
+# -- so an accuracy-only write was STRUCTURALLY unable to win and reverted one
+# read_tree cycle later, forever ( measured the chain; guard-1153,
+# guard-1170).
+_CALIBRATION_STAMP_FIELDS = ("accuracy",)
+
+
+def _stamp_calibration(node):
+    """Bump the CALIBRATION stamp on a node (). Call from any writer
+    that changes a _CALIBRATION_STAMP_FIELDS value. Date-granular to match
+    _stamp_progression (CLI/daemon byte-compat parity). Unlike PROGRESSION, the
+    merge's same-day tie does NOT fall to never-regress -- it breaks on
+    sample_size -- because a data-derived accuracy DOWNGRADE is the normal result
+    of recomputing over a grown corpus and must land."""
+    node["calibration_updated_at"] = date.today().isoformat()
+
+
 # ---------------------------------------------------------------------------
 # Helpers: node operations
 # ---------------------------------------------------------------------------
@@ -2298,6 +2323,9 @@ def cmd_set(args):
         # data-derived downgrade instead of reverting it via never-regress.
         if field in _PROGRESSION_STAMP_FIELDS:
             _stamp_progression(node)
+        # : same for the CALIBRATION stamp (separate key, see above).
+        if field in _CALIBRATION_STAMP_FIELDS:
+            _stamp_calibration(node)
         #  (Option B): do NOT auto-bump per-node last_updated on a
         # metadata --set. node .md front matter is the single source of truth
         # (); the _tree.yaml index last_updated is synced to it ONLY by
@@ -2807,6 +2835,8 @@ def cmd_batch(args):
                 node[field] = value
                 if field in _PROGRESSION_STAMP_FIELDS:
                     _stamp_progression(node)  #  (see cmd_set)
+                if field in _CALIBRATION_STAMP_FIELDS:
+                    _stamp_calibration(node)  #  (see cmd_set)
                 #  (Option B): no per-node last_updated auto-bump on
                 # batch --set, same as cmd_set above. node .md fm is the single
                 # source of truth (); the index last_updated is synced

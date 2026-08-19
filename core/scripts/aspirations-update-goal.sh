@@ -40,16 +40,18 @@ source "$CORE_ROOT/scripts/_argv_strict.sh"
 # fresh-eyes F-002). These were two copies until the review: the helper's own
 # comment asserted they came from one, which was simply false, and two strings
 # that must agree are the drift surface the refusal exists to remove.
-_ACCEPTED_FLAGS="--source --force-defer --override-agent-match --override-uncommitted --cross-lane --override-missing-artifact --blocker-ref --force-unstructured-defer --override-blocker-gate"
+_ACCEPTED_FLAGS="--source --force-defer --override-agent-match --override-uncommitted --cross-lane --override-missing-artifact --override-residual --blocker-ref --force-unstructured-defer --override-blocker-gate --allow-new-field"
 
 # --- Parse args -----------------------------------------------------------
 SOURCE_VAL="world"
 FORCE_DEFER=""
 OVERRIDE_UNCOMMITTED=""
 OVERRIDE_MISSING_ARTIFACT=""
+OVERRIDE_RESIDUAL=""
 BLOCKER_REF=""
 FORCE_UNSTRUCTURED_DEFER=""
 OVERRIDE_BLOCKER_GATE=""
+ALLOW_NEW_FIELD=""
 CROSS_LANE=""
 declare -a PASSTHROUGH=()
 declare -a PASSTHROUGH_SOURCE=()
@@ -94,6 +96,12 @@ while [[ $# -gt 0 ]]; do
             OVERRIDE_MISSING_ARTIFACT="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
+        --override-residual)
+            # : bypass the Layer-B residual-work completion gate
+            # (outcome_note names undone work, no live carrier cited).
+            OVERRIDE_RESIDUAL="${2-}"
+            PASSTHROUGH+=("$1" "${2-}")
+            shift $(( $# >= 2 ? 2 : 1 ));;
         --blocker-ref)
             BLOCKER_REF="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
@@ -107,6 +115,14 @@ while [[ $# -gt 0 ]]; do
             # credentials-required blocker_ref. Same flag name + same ledger
             # as blocker-create-gate.py's override (Door A).
             OVERRIDE_BLOCKER_GATE="${2-}"
+            PASSTHROUGH+=("$1" "${2-}")
+            shift $(( $# >= 2 ? 2 : 1 ));;
+        --allow-new-field)
+            # : bypass the goal-field allowlist. Justification-bearing
+            # and audited to world/override-bypass-ledger.jsonl by the daemon, so
+            # a genuinely new field stays a readable decision rather than a
+            # keystroke slip that silently mutates the shared goal schema.
+            ALLOW_NEW_FIELD="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
         -h|--help)
@@ -203,10 +219,19 @@ fi
 declare -a HEADER_ARGS=()
 [ -n "$FORCE_DEFER" ] && HEADER_ARGS+=(--header "X-Mind-Force-Defer: $FORCE_DEFER")
 [ -n "$OVERRIDE_UNCOMMITTED" ] && HEADER_ARGS+=(--header "X-Mind-Override-Uncommitted: $OVERRIDE_UNCOMMITTED")
+# : carry this Body's role to the daemon so the uncommitted-work
+# gate can enforce its DELIVERY half. BODY_ROLE is injected into every Bash
+# call by the PreToolUse hook (bash-agent-inject.py), so it is present here
+# and absent inside the daemon process -- which is why it has to travel as a
+# header rather than being read on the far side. Empty when unset, and the
+# gate treats an unknown role as report-but-do-not-block.
+[ -n "${BODY_ROLE:-}" ] && HEADER_ARGS+=(--header "X-Mind-Body-Role: $BODY_ROLE")
 [ -n "$OVERRIDE_MISSING_ARTIFACT" ] && HEADER_ARGS+=(--header "X-Mind-Override-Missing-Artifact: $OVERRIDE_MISSING_ARTIFACT")
+[ -n "$OVERRIDE_RESIDUAL" ] && HEADER_ARGS+=(--header "X-Mind-Override-Residual: $OVERRIDE_RESIDUAL")
 [ -n "$BLOCKER_REF" ] && HEADER_ARGS+=(--header "X-Mind-Blocker-Ref: $BLOCKER_REF")
 [ -n "$FORCE_UNSTRUCTURED_DEFER" ] && HEADER_ARGS+=(--header "X-Mind-Force-Unstructured-Defer: $FORCE_UNSTRUCTURED_DEFER")
 [ -n "$OVERRIDE_BLOCKER_GATE" ] && HEADER_ARGS+=(--header "X-Mind-Override-Blocker-Gate: $OVERRIDE_BLOCKER_GATE")
+[ -n "$ALLOW_NEW_FIELD" ] && HEADER_ARGS+=(--header "X-Mind-Allow-New-Field: $ALLOW_NEW_FIELD")
 [ -n "$CROSS_LANE" ] && HEADER_ARGS+=(--header "X-Mind-Cross-Lane: $CROSS_LANE")
 
 rc=0

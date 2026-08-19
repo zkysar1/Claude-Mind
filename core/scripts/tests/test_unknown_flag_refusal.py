@@ -110,6 +110,21 @@ CASES = [
         "aspirations-query.sh",
         ["--nonexistent-flag", "SLID", "--goal-field", "id", BOGUS_GOAL],
     ),
+    # First of the 22-wrapper rollout (). Same read-wrapper reasoning as
+    # aspirations-query.sh above: it cannot mutate, and the bogus id keeps the
+    # REVERTED path cheap — a swallowed flag falls through to `--id <bogus>`
+    # returning nothing rather than dragging the whole pipeline over the daemon.
+    #
+    # WHY THIS ONE FIRST, and it is not arbitrary: the  caller scan
+    # (core/scripts/unknown-flag-caller-scan.py) reported pipeline-read.sh READY
+    # — 0 blocking callers, 0 unresolved, 0 hazards across 5 roots. The goal's
+    # order is load-bearing (enumerate callers -> fix them -> THEN refuse),
+    # because 's single caller passed TWO unrecognised flags and
+    # refusing first would have disarmed a never-clobber guard downstream.
+    (
+        "pipeline-read.sh",
+        ["--nonexistent-flag", "SLID", "--id", BOGUS_PIPE],
+    ),
 ]
 
 WRAPPERS = [c[0] for c in CASES]

@@ -202,6 +202,20 @@ _perform_recovery() {
         printf 'PERMANENT_RECOVERY_FAILURE: %s consecutive failed recoveries. Last cause: %s. Run "/start %s --recover --force" to clear.\n' \
             "$fail_count" "$cause" "$agent" > "$_adir/session/recovery-failed-permanent" 2>/dev/null || true
         echo "[recovery-gate] CRITICAL: $agent has $fail_count consecutive failed recoveries; refusing automatic retry. Run '/start $agent --recover --force' to clear." >&2
+        # : this branch REFUSES to recover, so the box stays stuck and
+        # only a user-only command can clear it. Announce it. Existence-tested
+        # with -f, never -x (guard-1124: own-cloud mirror sync strips +x).
+        # stderr is deliberately NOT redirected — the recorder's own
+        # before/verdict/failure lines must reach this script's log, or an inert
+        # notification is indistinguishable from a working one (guard-3737).
+        if [[ -f "$SCRIPT_DIR/stop-reason-record.py" ]]; then
+            python3 "$SCRIPT_DIR/stop-reason-record.py" \
+                --path recovery-failed-permanent --agent "$agent" \
+                --reason "$fail_count consecutive failed recoveries; refusing automatic retry. Last cause: $cause" \
+                || echo "[recovery-gate] WARN: stop-reason recorder exited non-zero; $agent is stuck and may be unannounced." >&2
+        else
+            echo "[recovery-gate] WARN: stop-reason-record.py missing — $agent is stuck with nobody told." >&2
+        fi
         return 2
     fi
 
@@ -277,6 +291,21 @@ _perform_recovery() {
     # should not see a permanent signal next session.
     rm -f "$_adir/session/recovery-failure-count" 2>/dev/null || true
     rm -f "$_adir/session/recovery-failed-permanent" 2>/dev/null || true
+
+    # : recovery SUCCEEDED, which means state is now IDLE and the
+    # autonomous loop is NOT running. Recovering the state is not the same as
+    # resuming the work — only the user-only /start does that — so without this
+    # the box sits quietly IDLE and correct. Announced AFTER the state-set
+    # succeeded so the claim in the email ("went IDLE") is true when sent.
+    # stderr intentionally un-redirected (guard-3737); -f not -x (guard-1124).
+    if [[ -f "$SCRIPT_DIR/stop-reason-record.py" ]]; then
+        python3 "$SCRIPT_DIR/stop-reason-record.py" \
+            --path recovery-gate-zombie --agent "$agent" \
+            --reason "crashed runner recovered to IDLE: $cause" \
+            || echo "[recovery-gate] WARN: stop-reason recorder exited non-zero; $agent recovered to IDLE possibly unannounced." >&2
+    else
+        echo "[recovery-gate] WARN: stop-reason-record.py missing — $agent recovered to IDLE with nobody told." >&2
+    fi
 
     # Session-telemetry crash close (WP4, 2026-06-03). The runner crashed — no
     # graceful-stop D6.6 close ran — so finalize its durable telemetry record
@@ -614,6 +643,13 @@ _check_hung_autocompact() {
 #     calibration above cannot supply, because a fresh /start writes a NEW
 #     heartbeat while inheriting an OLD phase_start — breaking the ages-together
 #     coupling that whole invariant rests on.
+#   - the assistant-turn liveness veto () suppresses when the runner
+#     session emitted an assistant turn within assistant_turn_fresh_minutes,
+#     read from the Claude Code transcript. This is the ONLY gate here not
+#     derived from the execution diary, and it exists because no diary-derived
+#     gate CAN reach the remaining false-fire class: a live user conversation
+#     writes nothing to the diary, so an alive-but-off-loop agent and a wedged
+#     one are indistinguishable to every other gate in this list.
 #   - phase-wedge-check.py fails OPEN to no-recovery (rc!=0) on any error.
 _check_wedged_loop() {
     local agent="$1"
@@ -712,7 +748,89 @@ _check_wedged_loop() {
     local bg_rc=$?
     [[ $bg_rc -eq 1 ]] || return 0
 
-    local cause="wedged loop: heartbeat=fresh, state=RUNNING, execution-diary phase_start unclosed past wedge threshold, runner older than wedge threshold, no stop-requested, no pending bg job (g-328-23, g-328-45)"
+    # Assistant-turn liveness veto () — the LAST gate, and the only
+    # one here not derived from the execution diary. Every gate above reads the
+    # diary or the heartbeat, and a live user conversation moves NEITHER: the
+    # diary records loop phases, not conversational turns, so "wedged" and
+    # "alive-but-off-loop" are identical in diary+heartbeat space. That is why
+    # the three prior narrowings ( calibration,  runner-age,
+    #  liveness veto) were each followed by another false firing —
+    # 5 across 4 agents, and that count is a FLOOR. Measured on foxtrot
+    # 2026-08-14: 5h35m of TOTAL diary silence with the heartbeat fresh, while
+    # a user conversation was live. The  veto did not malfunction;
+    # there genuinely was no diary activity for it to see.
+    #
+    # rc semantics mirror phase-wedge-check.py above (0 = the condition holds):
+    #   0 -> a recent assistant turn exists            -> SUPPRESS (return 0)
+    #   1 -> no recent turn / nothing to say           -> proceed to recovery
+    #   2 -> transcript present but unreadable         -> SUPPRESS (guard-487
+    #        fail-closed-as-suppressed, which agrees with this function's
+    #        fail-open-to-no-recovery contract rather than conflicting with it)
+    # rc=1 deliberately covers "no running-session-id" and "no transcript":
+    # ABSENCE IS NOT EVIDENCE OF LIVENESS. Measured cc-02 2026-08-15 — only the
+    # box-RESIDENT agent has either, so treating absent as a suppression would
+    # disable Path D everywhere except the one box, which is a deletion of
+    # Path D rather than a narrowing. Same reasoning as the runner-token gate
+    # above: an undeterminable signal must not silently disable the
+    # genuine-wedge path, the costlier failure.
+    #
+    # Cost is a 400KB TAIL read, never a full parse — 1.6ms against a live
+    # 281MB transcript on cc-02 (21ms/60MB on cc-08), inside the hook budget.
+    # Stdout is CAPTURED, not discarded, so the age that caused a suppression
+    # rides into the log line below (guard-3802: a suppressed alarm must carry
+    # the severity it suppressed, or a suppression and a healthy run emit the
+    # same silence).
+    local turn_json turn_rc
+    turn_json="$(MIND_AGENT="$agent" python3 "$SCRIPT_DIR/assistant-turn-freshness.py" 2>/dev/null)"
+    turn_rc=$?
+    # PROCEED TO RECOVERY ONLY ON A RECOGNISED NO-TURN VERDICT — every other
+    # outcome SUPPRESSES (guard-487: a suppression gate fails CLOSED). This is an
+    # ALLOWLIST and must stay one. rc=1 conflates "no recent turn" with "I could
+    # not measure" (guard-2173), so no rc test can tell a verdict from a crash;
+    # the probe prints JSON on every documented path, so a {..."verdict"...}
+    # payload is the exact discriminator for "it actually ran".
+    #
+    # Two measured rounds produced this, and round 1 was too narrow. Round 1
+    # () treated EMPTY stdout as the error: _paths/_dt import at module
+    # level, outside every try where main()'s belt-and-braces cannot reach them,
+    # and Python exits 1 on a module-level exception — landing a broken import on
+    # the proceed-to-recovery branch. Measured cc-02 2026-08-15: one broken import
+    # -> rc=1, 0 bytes, a LIVE agent recovered, traceback eaten by 2>/dev/null.
+    # Round 2 — the fresh-eyes pass over round 1's OWN fix — measured that the
+    # same class survived whenever the failure produced OUTPUT: a non-JSON message
+    # at rc=49 and a truncated payload at rc=1 BOTH still recovered a live agent.
+    # Emptiness was one shape of "could not measure", never the invariant.
+    #
+    # The `}` anchor is load-bearing: it is what rejects a truncated `{"verdict": `
+    # write. Command substitution strips print()'s trailing newline, so a healthy
+    # payload really does end in `}`. COUPLING, stated so it cannot rot silently:
+    # this gate now depends on the probe's emit SHAPE, not only its rc — if
+    # assistant-turn-freshness.py stops emitting a "verdict" key, Path D goes
+    # permanently quiet (the fail-safe direction, but silent). Scenarios 2 and 4
+    # of test_recovery_gate_assistant_turn.sh pin that shape from this side.
+    #
+    # The 2>/dev/null swallow deliberately STAYS: the stdout shape is sufficient
+    # signal alone, and guard-2175 warns that making stderr load-bearing would
+    # activate every latent defect feeding it on the SUCCESS path, where the
+    # defect-detecting test cannot see it.
+    if [[ "$turn_rc" -ne 1 || "$turn_json" != \{*'"verdict"'*\} ]]; then
+        echo "[recovery-gate] Path D suppressed for $agent by assistant-turn liveness: ${turn_json:-<probe emitted nothing; died before its own emit>} (rc=$turn_rc)" >&2
+        return 0
+    fi
+
+    # The probe's VERDICT rides into the cause, not just the conclusion. rc=1 has
+    # two materially different readings that a bare "no recent assistant turn"
+    # cannot separate: `no_recent_assistant_turn` means the transcript was READ
+    # and showed nothing recent (a measurement), while `no_transcript` /
+    # `no_running_session_id` mean there was nothing to read (an absence). Both
+    # correctly proceed to recovery — absence is not liveness — but they are not
+    # the same event, and the OFF-BOX case is always the absence one. Without the
+    # verdict, every remote agent's recovery is textually identical to a measured
+    # local one in recovery-log.jsonl, which is the durable fleet-wide instrument
+    # a cross-box triage actually reads (see core/config/conventions/recovery-gate.md
+    # "Which artifact to read"). Recording the conclusion without the evidence is
+    # what makes a log unable to answer the question it was kept for.
+    local cause="wedged loop: heartbeat=fresh, state=RUNNING, execution-diary phase_start unclosed past wedge threshold, runner older than wedge threshold, no stop-requested, no pending bg job, no recent assistant turn [probe: ${turn_json:-unavailable}] (g-328-23, g-328-45, g-115-6253)"
     _perform_recovery "$agent" "$cause"
 }
 

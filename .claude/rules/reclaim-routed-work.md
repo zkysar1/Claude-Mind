@@ -52,14 +52,12 @@ first will hold work frozen indefinitely**:
 premise still holds AND the reason is still a valid reason to stop.
 
 Canonical incident (2026-07-28, measured): a standing grant stated verbatim
-that a named condition "is no longer a valid `defer_reason` — the correct
-response is to start one." The condition itself was still true and was
-re-probed correctly on a cadence. Two goals stayed frozen for 6 and 8 days
-past the grant, stranding a cluster of downstream dependents, because every
-sweep tested the premise and nothing tested the rule. The automated gate the
-sweeps delegate to reads only the "agent-provisionable capability" table and
-never the standing-grants table, so it returned `matches: 0` on the exact
-text the grant had invalidated.
+that a named condition "is no longer a valid `defer_reason`"; the condition
+was still true and was re-probed correctly on a cadence, so two goals stayed
+frozen 6 and 8 days past the grant — every sweep tested the premise and
+nothing tested the rule. Full trace and the sweep-tooling map:
+`core/config/conventions/defer-routing.md` §5 (`load-conventions.sh
+defer-routing`).
 
 ## Rules
 
@@ -85,15 +83,11 @@ text the grant had invalidated.
    token it invalidates. A grant whose consequence is buried in prose cannot
    reach the sweep that needs it, which is precisely how the canonical
    incident happened.
-
-   The same obligation runs in BOTH directions, and both halves were measured
-   empty on 2026-07-29. A routing that never declares WHY the user is attached
-   cannot be re-derived by anything: 20 of 28 `[agent, user]` goals carried no
-   `user_leg_scope`, so no grant could reach them. And a grant whose scope
-   *head* avoids the shared vocabulary can never be applied: 4 of 5 standing
-   grants were unkeyable, carrying real permission the audit is structurally
-   unable to act on. Declaring the leg and wording the grant are one duty seen
-   from two ends — neither alone closes anything.
+   The obligation runs in BOTH directions: a routing that never declares WHY
+   the user is attached (`user_leg_scope`) cannot be re-derived by anything,
+   and a grant whose scope head avoids the shared vocabulary can never be
+   applied. Both halves were measured empty on 2026-07-29 (20 of 28
+   `[agent, user]` goals unscoped; 4 of 5 standing grants unkeyable).
 
 5. **Escalate what genuinely remains.** Items that survive both axes are the
    real human-only residue. Batch them into a digest for the next user
@@ -108,40 +102,17 @@ text the grant had invalidated.
    record that they were skipped.
 
 7. **A reclaim predicate must not be narrower than the gate that creates the
-   population.** When it is, the gate's *correct* operation is what fills the
-   blind spot, and the sweep reports clean forever while the backlog grows
-   behind it. Measured: `audit-user-to-agent.py` required
-   `participants == ["user"]` while the creation-time advisory tested
-   `"user" in participants` — and because `capability-before-user.md` tells
-   the fleet to file `[agent, user]` whenever both legs are real, every
-   correctly-routed goal landed exactly where the audit could not see it.
-   Live candidate set: zero, against 28 invisible goals. Before trusting any
-   reclaim sweep, diff its predicate against the creating gate's, literally,
-   and measure what it EXCLUDES rather than what it returns. A zero-result
-   run and a genuinely clean queue produce the same output (guard-1802,
-   rb-5650).
-
-   **Second instance, and the variant a predicate diff will NOT catch:**
-   `blocker-recheck.py` enumerated only the `known_blockers` working-memory
-   slot. `create-blocker.py` writes the blocker to TWO places — that slot AND
-   `blocker_ref` on the goal record — and its own comment calls the WM entry
-   "the authoritative record" and the goal copy "a redundancy". That is
-   inverted with respect to durability: the WM slot is per-agent, per-box and
-   ephemeral, while the goal record is shared, fleet-wide and durable.
-   Measured 2026-08-01: all five agents read `known_blockers=null` while six
-   non-terminal goals carried a live `blocker_ref`, so the sweep reported
-   `total_blockers: 0` — the same permanent all-clear as the first instance,
-   from a different cause. Here the predicate was not narrower than the
-   creating gate's; it was pointed at the wrong one of the two stores that
-   gate writes. So diffing predicates cannot find this variant. The question
-   that does: **which store does the creating gate write DURABLY, and is that
-   the store I am reading?** Widen the READ; do not assume the WRITE widens
-   with it — this sweep's clear path is a keyword match with no probe behind
-   it (guard-1978), and extending it over goal records would mutate other
-   agents' goals, so the goal-sourced half is deliberately report-only.
-   (guard-1242 — the `--goal-status blocked` projection omits `blocker_ref`
-   entirely, so the obvious probe for this population returns a false zero
-   too.)
+   population** — the gate's *correct* operation then fills the blind spot and
+   the sweep reports clean forever (measured: `audit-user-to-agent.py` required
+   `participants == ["user"]` while the creating advisory tested `"user" in
+   participants`; live candidate set zero against 28 invisible goals —
+   guard-1802, rb-5650). Before trusting any reclaim sweep, diff its predicate
+   against the creating gate's, literally, and measure what it EXCLUDES. And
+   the variant a predicate diff cannot catch: **which store does the creating
+   gate write DURABLY, and is that the store I am reading?** —
+   `blocker-recheck.py` read the ephemeral WM slot while the durable
+   `blocker_ref` on six goals went unread, `total_blockers: 0` (guard-1978,
+   guard-1242). Widen the READ; do not assume the WRITE widens with it.
 
 ## Anti-patterns
 
@@ -168,43 +139,15 @@ text the grant had invalidated.
 
 ## Cross-references
 
-- `guard-1783` — the enforcement-time rail: when a premise probe comes back
-  still-true, check the RULE axis before re-deferring
-- `rb-5633` — the measured incident trace behind this rule (orphaned sweeps,
-  the 72.5% structured-prefix launder, and the untested rule axis)
-- `guard-1802` / `rb-5650` — rule 4a: the audit predicate that was a strict
-  subset of its creating gate's, so correct routing drained it to zero; plus
-  the `user_leg_scope` <-> standing-grant join and why it matches only a
-  grant's declarative head
-- `core/scripts/gates/user_leg_scope.py` — SSOT for the scope vocabulary and
-  the creation-time advisory whose predicate lane P must mirror
-- `core/scripts/gates/defer_scope.py` — the SHARED scope set the four lanes
-  draw from, so a lane extension does not fork a fifth vocabulary. Lane
-  `user-leg` is `VALID_USER_LEG_SCOPES` BY IMPORT from the SSOT above, never
-  re-typed. Read it before adding a scope to ANY lane; two of the shapes it
-  declares were already in lane P's enum, which is why one set rather than
-  four. Its consumer `core/scripts/defer-scope-coverage.py` turns each
-  sweep's printed exclusion count into keyable/unkeyable per lane WITH the
-  observed text — report-only, it never writes a scope onto a goal
-- `rb-7289` — the measured warning about those exclusion counts: a sweep's
-  "cannot key N items" is a claim about the SWEEP's key-space, not the
-  population. `credential-defer-recheck` called 16 of 17 defers human-only
-  when 7 of 7 in its lane were keyable, 6 by an IAM action string its
-  env-var-shaped predicate could not see. Read five skipped items verbatim
-  before believing any such aggregate
-- `guard-349` — read the standing-grants section before routing to the user.
-  This rule generalizes it: guard-349 is scoped to commit/push approval and
-  is honor-system only, because no code reads that section.
+- `core/config/conventions/defer-routing.md` §5 — incident traces, the
+  sweep-tooling map (lane P/B/Q auditors, the PREMISE-axis recheck family,
+  `gates/user_leg_scope.py` + `gates/defer_scope.py` SSOTs,
+  `defer-scope-coverage.py`), rb-5633 / rb-5650 / rb-7289, guard-1783 /
+  guard-1802 / guard-349
 - `.claude/rules/capability-before-user.md` — gates the routing decision at
   creation; this rule governs the accumulated backlog it leaves behind
-- `.claude/rules/probe-before-defer.md` — gates the defer at write time, and
-  its rule 4 (re-probe on re-entry) is the PREMISE axis of this rule
+- `.claude/rules/probe-before-defer.md` — gates the defer at write time; its
+  rule 4 (re-probe on re-entry) is the PREMISE axis of this rule
 - `.claude/rules/verify-before-assuming.md` — a stale routing decision is an
   unverified negative claim about the agent's own capability
 - `core/config/conventions/learning-routing.md` — where reclaim findings go
-- `core/scripts/audit-user-to-agent.{sh,py}` — lane P auditor
-- `core/scripts/audit-deferred-defers.{sh,py}` — lane B auditor
-- `core/scripts/pending-questions-sweep.{sh,py}` — lane Q auditor
-- `core/scripts/blocker-recheck.{sh,py}`, `defer-recheck`,
-  `precondition-defer-recheck`, `credential-defer-recheck` — the PREMISE-axis
-  recheck family

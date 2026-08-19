@@ -126,7 +126,22 @@ if [[ "$MODE" == "head" ]]; then
     # `path:lineno:content` shape to the shared regroup loop below; that
     # shared shape is what keeps the two modes from drifting into two
     # different report formats.
-    raw=$(git grep -nE "$patterns" HEAD 2>/dev/null || true)
+    # -I skips BINARY files, matching the scope staged mode ALREADY declares at
+    # its numstat pre-filter below ("regex on binary is noise", ~L147). Audit
+    # mode scanning them was the anomaly, not a feature: `git grep` emits a
+    # DIFFERENT line shape for a binary match — `Binary file HEAD:blob.bin
+    # matches` — which the `sed 's/^HEAD://'` + `${gl%%:*}` extraction below
+    # resolves to the literal path "Binary file HEAD". That named a file nobody
+    # could open, and it was suppressable by NEITHER bypass: allowed_path() is
+    # keyed on real repo paths, and a binary carries no line to hold a
+    # `# secret-scanner: skip` marker. One false positive would therefore wedge
+    # the g-115-4398 recurring HEAD audit red with no remedy available.
+    # Measured (g-115-4400): -I drops the binary line and leaves the text match
+    # and its correct path untouched — it costs no detection on anything staged
+    # mode would have scanned. Deliberately NOT `-a` (treat binaries as text):
+    # that keeps the unusable report and answers the scope question differently
+    # in the two modes, which is the drift this comment block exists to prevent.
+    raw=$(git grep -I -nE "$patterns" HEAD 2>/dev/null || true)
     raw=$(printf '%s\n' "$raw" | sed 's/^HEAD://')
     # The allowlist is applied to RESULTS here, not to inputs as in staged
     # mode. Staged mode can pre-filter because numstat hands it a short,

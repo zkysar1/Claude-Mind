@@ -44,7 +44,8 @@ except ImportError:
     print("PyYAML required: pip install pyyaml", file=sys.stderr)
     sys.exit(1)
 
-from _paths import PROJECT_ROOT, WORLD_DIR, AGENT_DIR, CORE_ROOT
+from _paths import PROJECT_ROOT, WORLD_DIR, AGENT_DIR, CORE_ROOT, META_DIR
+from _utilization_store import load_counters, utilization_of  # type: ignore
 
 # --- producer-side token helpers (single source of truth, ) --------
 # This module CONSUMES what retrieve.py's _distinctive_tokens produces. The
@@ -190,8 +191,89 @@ def update_tree_nodes(helpful_keys, noise_keys, inferred_helpful_keys=None):
 
 
 # ---------------------------------------------------------------------------
-# Supplementary item feedback (reasoning bank + guardrails)
+# Supplementary item feedback (reasoning bank + guardrails + experiences)
 # ---------------------------------------------------------------------------
+
+# Experience records do NOT share the rb/guardrail counter shape, which is why
+# they need their own writer rather than another `store` string below ():
+#   - counters nest under `retrieval_stats`, not `utilization`
+#   - the helpful counter is `times_useful`, not `times_helpful`
+#   - there is no `times_active` / `auto_flagged_for_review` equivalent
+# So /v1/store/increment cannot reach them: it takes a dotted `utilization.*`
+# path against a store registered with the rb/guardrail schema.
+#
+# The write shape below is the one that MEASURABLY works (probed 2026-08-11,
+# echo cc-03, on a live record). Both halves were verified, and the losing half
+# is the one a reader would reach for first:
+#   DOTTED  `field=retrieval_stats.times_useful` -> {"error":"dotted_field_rejected"}
+#   WHOLE   `field=retrieval_stats value=<json blob>` -> accepted, AND the
+#           server-side recompute fires (times_useful 0->1 took utility_ratio
+#           0.0->1.0, matching times_useful/max(retrieval_count,1)).
+# guard-2645 documents the inverse — that the whole-object form SKIPS the
+# recompute — which was true before  landed and is now stale; the
+# measurement above is what settled it. Do not "restore" the dotted form.
+EXPERIENCE_STAT_FOR_FIELD = {
+    # rb/guardrail counter -> experience retrieval_stats counter
+    "times_helpful": "times_useful",
+    "times_noise": "times_noise",
+    # Inferred hits get their OWN key rather than folding into times_useful.
+    # utility_ratio is derived from times_useful alone, and both live consumers
+    # (the encoding-weight adaptation's high/low buckets, and the archive
+    # sweep's rc>=5 AND ur>=0.5 never-archive guard) read that ratio as
+    # evidence a human-equivalent judgement marked the record useful. Folding
+    # heuristic --infer hits in would make the ratio mean something weaker
+    # without any consumer being told, which is exactly the vacuous-signal trap
+    # this goal's own caution names (rb-7404). Probed 2026-08-11: an extra key
+    # inside retrieval_stats round-trips intact and leaves utility_ratio
+    # untouched, so the separation costs nothing.
+    "times_inferred_helpful": "times_inferred_useful",
+}
+
+
+def _increment_experience_stat(item_id, field):
+    """Increment one `retrieval_stats` counter on an experience record.
+
+    Read-modify-write against the daemon (GET /v1/experience/read then POST
+    /v1/experience/update-field) because the store exposes no increment verb —
+    see the shape note above. Uses _rt directly rather than the .sh wrapper for
+    the same reason increment_supplementary does: a Python child cannot reach
+    the daemon-aware wrapper on Windows (rb-225/rb-247).
+
+    Fail-soft in the same direction as its siblings — a daemon error prints to
+    stderr and returns, never breaking the feedback flow. Silence is the one
+    behaviour to avoid: `times_inferred_helpful` once dropped on the floor for
+    two sessions precisely because a write failure was swallowed.
+    """
+    stat = EXPERIENCE_STAT_FOR_FIELD.get(field)
+    if stat is None:
+        return  # counter has no experience-side equivalent; nothing to write
+    try:
+        raw = _rt.rt_call("GET", "/v1/experience/read",
+                          query={"id": item_id})
+        rec = json.loads(raw)
+        if isinstance(rec, list):
+            rec = rec[0] if rec else {}
+        stats = rec.get("retrieval_stats")
+        if not isinstance(stats, dict):
+            # No counter block to increment. Do NOT synthesise one: a record
+            # without retrieval_stats was never bumped by retrieve.py either,
+            # so writing a fresh block here would manufacture a denominator
+            # that no retrieval produced.
+            print(f"[utilization-feedback] Skipped {item_id}: no retrieval_stats "
+                  f"block on the record", file=sys.stderr)
+            return
+        current = stats.get(stat, 0)
+        stats[stat] = (current if isinstance(current, int) else 0) + 1
+        _rt.rt_call("POST", "/v1/experience/update-field",
+                    query={"id": item_id, "field": "retrieval_stats",
+                           "value": json.dumps(stats)})
+    except _rt.RtError as e:
+        print(f"[utilization-feedback] Increment failed for {item_id} "
+              f"(experience retrieval_stats.{stat}): {e}", file=sys.stderr)
+    except Exception as e:
+        print(f"[utilization-feedback] Warning: increment failed for {item_id}: {e}",
+              file=sys.stderr)
+
 
 def increment_supplementary(item_id, item_type, field):
     """Increment a utilization counter via the daemon store endpoint.
@@ -209,6 +291,11 @@ def increment_supplementary(item_id, item_type, field):
         store = "reasoning-bank"
     elif item_type == "guardrail":
         store = "guardrails"
+    elif item_type == "experience":
+        # Different counter shape entirely — routed to its own writer, not to
+        # /v1/store/increment. See EXPERIENCE_STAT_FOR_FIELD above.
+        _increment_experience_stat(item_id, field)
+        return
     else:
         return  # pattern_signatures don't have utilization increment paths
 
@@ -272,12 +359,17 @@ def _current_inferred_unknown(item_id, item_type):
         return 0
     if item_type == "reasoning_bank":
         path = WORLD_DIR / "reasoning-bank.jsonl"
+        _kind = "reasoning-bank"
     elif item_type == "guardrail":
         path = WORLD_DIR / "guardrails.jsonl"
+        _kind = "guardrails"
     else:
         return 0
     if not Path(path).exists():
         return 0
+    # Counters live in a sidecar as of ; utilization_of() prefers it and
+    # falls through to the embedded field, so this reads correctly either way.
+    counters = load_counters(_kind, WORLD_DIR)
     try:
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
@@ -290,12 +382,115 @@ def _current_inferred_unknown(item_id, item_type):
                     continue
                 if rec.get("id") != item_id:
                     continue
-                util = rec.get("utilization") or {}
+                util = utilization_of(rec, counters) or {}
                 v = util.get("times_inferred_unknown", 0)
                 return int(v) if isinstance(v, int) else 0
     except OSError:
         return 0
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Reflection-quality feedback ()
+# ---------------------------------------------------------------------------
+# THE WRITE THAT WAS NEVER IMPLEMENTED. aspirations-execute/SKILL.md has stated
+# for a long time that "helpful items with source_reflection_id write positive
+# downstream signal to meta/reflection-strategy.yaml -> reflection_quality_log".
+# No script did. Measured 2026-08-09: the log was [] and
+# reflection_effectiveness_by_type read total=0 on all three types, while 2,651
+# non-null source_reflection_id values sat on rb/guardrail records. Two
+# downstream consumers were therefore permanently inert -- /reflect Step 5.8
+# consolidated an always-empty log, and Step 0.3's MR-Search depth gate
+# (total >= 3) could never open.
+#
+# THIS IS THE FORWARD SIGNAL ONLY, AND THAT IS DELIBERATE. `source_reflection_id`
+# records which reflection PRODUCED an item; the log needs whether that item was
+# later HELPFUL on a downstream goal. Those are different facts and the second is
+# not recoverable from the first, so there is no backfill -- the log starts empty
+# and accumulates from here.
+#
+# `helpful` is always True on this path: only the supp_helpful loop calls it.
+# The field is written explicitly rather than implied so a future inferred- or
+# noise-signal lane can join the same log without changing its shape.
+_REFLECTION_QUALITY_LOG_CAP = 500
+
+
+def _source_reflection_id(item_id, item_type):
+    """Read an item's source_reflection_id, or None. Fail-soft by contract --
+    this feeds a soft meta-learning signal, never a gate, so any read problem
+    degrades to "no signal" rather than breaking the feedback flow."""
+    if WORLD_DIR is None:
+        return None
+    if item_type == "reasoning_bank":
+        path = WORLD_DIR / "reasoning-bank.jsonl"
+    elif item_type == "guardrail":
+        path = WORLD_DIR / "guardrails.jsonl"
+    else:
+        return None
+    if not Path(path).exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("id") != item_id:
+                    continue
+                rid = rec.get("source_reflection_id")
+                return rid if isinstance(rid, str) and rid.strip() else None
+    except OSError:
+        return None
+    return None
+
+
+def log_reflection_quality(entries):
+    """Append {reflection_id, downstream_goal, helpful} rows to
+    meta/reflection-strategy.yaml -> reflection_quality_log.
+
+    ONE locked cycle for the whole batch, not one per item: the caller holds a
+    list of helpful items from a single goal, and a per-item write would take
+    the lock N times to record N facts about one event.
+
+    `reflection-strategy.yaml` is a FENCE-ONLY store (no merge handler below the
+    write -- verified via coordination_merge.merge_handler_for), so the
+    read-modify-write must happen INSIDE the lock or a concurrent writer's
+    entries are silently clobbered. locked_modify_yaml reads inside the lock it
+    guards the write with, which is exactly that property; do not replace it
+    with a read-then-write pair.
+
+    Returns the number of entries appended. Fail-soft: never raises.
+    """
+    if not entries or META_DIR is None:
+        return 0
+    strategy_path = Path(META_DIR) / "reflection-strategy.yaml"
+    if not strategy_path.exists():
+        return 0
+
+    def _mut(data):
+        if not isinstance(data, dict):
+            data = {}
+        log = data.get("reflection_quality_log")
+        if not isinstance(log, list):
+            log = []
+        log.extend(entries)
+        if len(log) > _REFLECTION_QUALITY_LOG_CAP:
+            log = log[-_REFLECTION_QUALITY_LOG_CAP:]
+        data["reflection_quality_log"] = log
+        return data
+
+    try:
+        from _fileops import locked_modify_yaml
+        locked_modify_yaml(strategy_path, _mut)
+        return len(entries)
+    except Exception as e:
+        print(f"[utilization-feedback] reflection_quality_log append failed: {e}",
+              file=sys.stderr)
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -434,11 +629,13 @@ def _live_times_active_index():
     if WORLD_DIR is None:
         return idx
     for fname in ("reasoning-bank.jsonl", "guardrails.jsonl"):
+        # Sidecar counters (), keyed by store kind = the basename stem.
+        counters = load_counters(fname[: -len(".jsonl")], WORLD_DIR)
         for rec in _read_jsonl_simple(WORLD_DIR / fname):
             iid = rec.get("id")
             if not iid:
                 continue
-            util = rec.get("utilization") if isinstance(rec, dict) else None
+            util = utilization_of(rec, counters) if isinstance(rec, dict) else None
             if isinstance(util, dict):
                 v = util.get("times_active", 0)
                 if isinstance(v, int) and not isinstance(v, bool):
@@ -795,9 +992,21 @@ def main():
     supp_h = 0
     supp_ih = 0
     supp_n = 0
+    # : collect the reflection-quality rows as we go and write them in
+    # ONE locked cycle after the loop, rather than taking the lock per item to
+    # record N facts about a single goal.
+    _rq_entries = []
     for item in supp_helpful:
         increment_supplementary(item["id"], item["type"], "times_helpful")
         supp_h += 1
+        _rid = _source_reflection_id(item["id"], item["type"])
+        if _rid:
+            _rq_entries.append({
+                "reflection_id": _rid,
+                "downstream_goal": args.goal,
+                "helpful": True,
+            })
+    rq_logged = log_reflection_quality(_rq_entries)
     for item in supp_inferred_helpful:
         increment_supplementary(item["id"], item["type"], "times_inferred_helpful")
         supp_ih += 1
@@ -922,6 +1131,11 @@ def main():
                           "auto_flagged": auto_flagged},
         "unknown": len(unknown_ids),
         "module_health_updates": _m6_updates,
+        # : rows appended to reflection_quality_log this call. Surfaced
+        # so the signal is observable from the caller's own output -- the defect
+        # being fixed was invisible for months precisely because nothing reported
+        # on it either way.
+        "reflection_quality_logged": rq_logged,
     }
     if inference_stats is not None:
         result["inference_stats"] = inference_stats

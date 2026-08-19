@@ -259,6 +259,41 @@ def test_true_conflict_aborts_cleanly(tmp_path):
     assert r_soft.returncode == 0
 
 
+def test_conflict_names_the_paths_and_their_merge_drivers(tmp_path):
+    """A conflict abort must ATTRIBUTE itself: name each unmerged path and the
+    merge driver it resolved to (g-115-6593).
+
+    Before this, every abort site logged "investigate which store conflicted"
+    and then ran `git merge --abort` on the next line, destroying the only
+    state that could answer it -- 388 integrates / 6 conflict events / 17d on
+    cc-02 produced ZERO attributable conflicts, so any gate phrased as
+    "agent-ledger conflict count over the window" was unsatisfiable by
+    construction.
+
+    THE ORDERING IS THE INVARIANT, and the last assertion is what pins it:
+    `git diff --diff-filter=U` returns EMPTY once the merge is aborted, so
+    moving the capture below the abort still logs a line -- the NONE REPORTED
+    one -- and every other assertion here would still pass. That branch
+    existing is what makes this test discriminating rather than decorative.
+    """
+    origin, a, b = _clone_pair(tmp_path)
+    _commit_file(b, "base.txt", "B version\n", "B: rewrite base")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "base.txt", "A version\n", "A: rewrite base")
+
+    r = _run_push(a, *_default_flags("--strict"))
+    assert r.returncode == 1
+    assert "MERGE CONFLICT" in r.stderr
+
+    line = [ln for ln in r.stderr.splitlines() if "conflicted paths" in ln]
+    assert line, f"no conflict-attribution line in stderr:\n{r.stderr}"
+    attribution = line[0]
+    assert "base.txt" in attribution, attribution
+    assert "merge=" in attribution, attribution
+    # Capture must precede the abort -- see the docstring.
+    assert "NONE REPORTED" not in attribution, attribution
+
+
 def test_dry_run_mutates_nothing(tmp_path):
     origin, a, b = _clone_pair(tmp_path)
     _commit_file(b, "from_b.txt", "b\n", "B: change")
@@ -501,6 +536,12 @@ def test_selfheal_dirty_tracked_crossagent_clears_and_merges(tmp_path):
     assert "self-heal: clearing" in r.stderr
     assert "after churn self-heal" in r.stderr
     assert "push OK" in r.stderr
+    #  shipped these DISCARDING lines with no test;  folds
+    # the assertion in here rather than filing a third goal. One line PER cleared
+    # tracked path. The count line above stays byte-identical (guard-695).
+    assert ("self-heal: DISCARDING uncommitted tracked cross-agent work: "
+            "agents/bravo/state.jsonl") in r.stderr, r.stderr
+    assert "clearing 1 tracked + 0 untracked cross-agent file(s)" in r.stderr
 
     # A fully converged; origin holds BOTH A's commit and B's bravo change
     _must(a, "fetch", "-q", "origin", "main")
@@ -530,6 +571,10 @@ def test_selfheal_untracked_crossagent_clears_and_merges(tmp_path):
     assert r.returncode == 0, f"stderr: {r.stderr}"
     assert "self-heal: clearing" in r.stderr
     assert "push OK" in r.stderr
+    #  (sq-018/sq-019 addendum): one line PER cleared untracked path.
+    assert ("self-heal: DISCARDING untracked cross-agent file: "
+            "agents/bravo/new.jsonl") in r.stderr, r.stderr
+    assert "clearing 0 tracked + 1 untracked cross-agent file(s)" in r.stderr
     # untracked collision removed → merge brought origin's committed version
     assert (a / "agents/bravo/new.jsonl").read_text() == "from-b\n"
     assert _must(a, "status", "--porcelain") == ""
@@ -979,3 +1024,658 @@ def test_defer_streak_survives_dry_run(tmp_path):
     assert r.returncode == 0
     assert streak.is_file() and streak.read_text().split()[0] == "1", \
         "dry-run must neither tick nor reset the streak"
+
+
+def test_repeating_conflict_prints_escalation_directive_once(tmp_path):
+    """: a conflict-abort is the one shape retrying can never clear,
+    so at the 2nd consecutive conflict the tick prints a caller-facing
+    ESCALATION REQUIRED directive — exactly once per streak (marker keyed on
+    the streak's `since` stamp), with the shape persisted as the streak file's
+    3rd field so the repeat is attributable."""
+    origin, a, b = _clone_pair(tmp_path)
+    # TRUE content conflict: both sides COMMIT divergent rewrites of base.txt
+    # (clean tree on A, so the merge starts and conflicts — not a dirty defer).
+    _commit_file(b, "base.txt", "B v2\n", "B: rewrite base")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "base.txt", "A v2\n", "A: rewrite base differently")
+
+    streak = a / ".git" / "iteration-push-defer-streak"
+    marker = a / ".git" / "iteration-push-defer-streak-escalated"
+
+    r1 = _run_push(a, *_default_flags())
+    assert r1.returncode == 0, r1.stderr            # fail-soft, never blocks
+    assert "TRUE cross-machine content conflict" in r1.stderr, r1.stderr
+    assert "ESCALATION REQUIRED" not in r1.stderr, "must not escalate at n=1"
+    fields = streak.read_text().split()
+    assert fields[0] == "1" and fields[2] == "conflict-abort", fields
+
+    r2 = _run_push(a, *_default_flags())
+    assert r2.returncode == 0, r2.stderr
+    assert "REPEATING MERGE CONFLICT — ESCALATION REQUIRED" in r2.stderr, r2.stderr
+    assert marker.is_file(), "one-shot marker must persist the streak's since stamp"
+    assert marker.read_text().strip() == streak.read_text().split()[1]
+
+    r3 = _run_push(a, *_default_flags())
+    assert r3.returncode == 0, r3.stderr
+    assert "ESCALATION REQUIRED" not in r3.stderr, \
+        "directive is once-per-streak; n=3 must not re-print"
+    assert streak.read_text().split()[0] == "3"
+
+
+# --------------------------------------------------------------------------- #
+# tracked .mind-data/ under a NON-local backend ()
+# --------------------------------------------------------------------------- #
+def test_tracked_mind_data_commits_under_own_cloud(tmp_path):
+    """A dirty, merge-blocking .mind-data/ path must be COMMITTED whenever git
+    TRACKS .mind-data/ — including under own-cloud, where the old arm gated on
+    `_backend = local` and deferred instead.
+
+    This is the g-115-5703 shape, measured on ZDS-Mind (cc-06, own-cloud) where
+    .mind-data/ has been git-tracked since 2026-07-28: every close phase
+    re-dirties the world/meta ledgers that iteration-commit just staged, so the
+    merge deferred on EVERY iteration -- a permanent stall wearing a transient's
+    message, silent because rc=2 does not fail the loop.
+
+    Pre-fix this asserts False on the very first assertion: the run logs
+    'blocking file outside agents/* (.mind-data/world/changelog.jsonl) — defer'.
+    """
+    origin, a, b = _clone_pair(tmp_path)
+    ledger = ".mind-data/world/changelog.jsonl"
+
+    # Make .mind-data/ TRACKED on both sides — that is what the fix keys on.
+    _commit_file(a, ledger, '{"seq":1}\n', "A: seed tracked mind-data ledger")
+    _must(a, "push", "-q", "origin", "main")
+    _must(b, "pull", "-q", "origin", "main")
+
+    # B advances the ledger; A holds the SAME path dirty => git refuses the
+    # merge with "local changes would be overwritten", which is the real error
+    # the deferral message never surfaced.
+    _commit_file(b, ledger, '{"seq":1}\n{"seq":2}\n', "B: append")
+    _must(b, "push", "-q", "origin", "main")
+    (a / ledger).write_text('{"seq":1}\n{"seq":3}\n', encoding="utf-8")
+
+    env = {**os.environ, "MIND_AGENT": "testagent", "STORAGE_BACKEND": "own-cloud"}
+    (a / "agents" / "testagent").mkdir(parents=True)
+    r = subprocess.run(
+        [BASH, str(PUSH_SH), "--repo", str(a), *_default_flags()],
+        capture_output=True, text=True, timeout=120, env=env,
+    )
+    out = r.stdout + r.stderr
+
+    assert "blocking file outside agents/*" not in out, (
+        "tracked .mind-data/ must not veto the self-heal under own-cloud "
+        f"(g-115-5703). Output:\n{out}"
+    )
+    assert "storage-root" in out, (
+        f"expected the storage-root commit path to fire. Output:\n{out}"
+    )
+    # The heal must COMMIT the ledger, never discard it: A's own row survives.
+    assert '{"seq":3}' in (a / ledger).read_text(encoding="utf-8"), \
+        "self-heal must commit .mind-data churn, never checkout -- it away"
+    assert r.returncode == 0
+
+
+# --------------------------------------------------------------------------- #
+# : serialization churn must not strand the box
+#
+# Measured 2026-08-10 (echo, cc-03): 3 consecutive integrate-defers, 49 commits
+# behind, unable to push -- on two files whose PARSED content was identical to
+# HEAD (672 vs 672 record ids, zero records differing on any field; the .yaml
+# differed only by CRLF). The predicate was "git says this path differs", which
+# cannot tell a partner's real work from a re-serializing writer's key order.
+#
+# The gate that actually deferred is the STAGED-INDEX one, not a dirty-path arm:
+# a cross-agent dirty file is routed to cross_dirty and restored, never deferred.
+# Measured on cc-07 (.git/iteration-push.log, 1719 lines): 1 of 1 deferred merges
+# came from the staged gate, 0 from any dirty-path arm.
+# --------------------------------------------------------------------------- #
+
+def _env_agent(name: str = "testagent") -> dict:
+    return {**os.environ, "MIND_AGENT": name, "STORAGE_BACKEND": "local"}
+
+
+def _run_push_as(repo: Path, agent: str, *flags: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [BASH, str(PUSH_SH), "--repo", str(repo), *flags],
+        capture_output=True, text=True, timeout=120, env=_env_agent(agent),
+    )
+
+
+PARTNER_JSONL = "agents/partner/experience.jsonl"
+CANON = '{"id":"e1","kind":"note","n":1}\n{"id":"e2","kind":"note","n":2}\n'
+REORDERED = '{"n":1,"id":"e1","kind":"note"}\n{"kind":"note","n":2,"id":"e2"}\n'
+REAL_EDIT = '{"id":"e1","kind":"note","n":1}\n{"id":"e2","kind":"note","n":999}\n'
+
+
+def _setup_merge_required(tmp_path):
+    """A and B both touch the partner file; A ends up behind AND ahead."""
+    origin, a, b = _clone_pair(tmp_path)
+    _commit_file(a, PARTNER_JSONL, CANON, "seed partner store")
+    _must(a, "push", "-q", "origin", "main")
+    _must(b, "pull", "-q", "origin", "main")
+    # B advances the SAME file, so the merge must touch it.
+    _commit_file(b, PARTNER_JSONL,
+                 CANON.replace('"n":2', '"n":22'), "B: real partner work")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "from_a.txt", "a\n", "A: local work")   # A ahead -> non-ff
+    return origin, a, b
+
+
+def test_staged_serialization_churn_unstages_instead_of_deferring(tmp_path):
+    """THE measured case: staged key-order churn must not strand the merge."""
+    origin, a, b = _setup_merge_required(tmp_path)
+    (a / PARTNER_JSONL).write_text(REORDERED, encoding="utf-8", newline="\n")
+    _must(a, "add", PARTNER_JSONL)                    # STAGED, churn-only
+    assert _must(a, "diff", "--cached", "--name-only") == PARTNER_JSONL
+
+    r = _run_push_as(a, "testagent", *_default_flags())
+
+    assert "SEMANTICALLY identical" in r.stderr, r.stderr
+    assert "guard-741, defer" not in r.stderr, r.stderr
+    # The merge actually completed and B's real work survived.
+    _must(a, "fetch", "-q", "origin", "main")
+    assert '"n":22' in (a / PARTNER_JSONL).read_text(encoding="utf-8")
+
+
+def test_staged_real_partner_work_still_defers(tmp_path):
+    """FAIL-SAFE CONTROL: a genuine staged difference must still defer.
+
+    Same wedged tree as the test above -- the ONLY difference is that the staged
+    content genuinely differs from HEAD. If this ever passes, the discriminator
+    has been inverted and the self-heal is discarding a partner's work.
+    """
+    origin, a, b = _setup_merge_required(tmp_path)
+    (a / PARTNER_JSONL).write_text(REAL_EDIT, encoding="utf-8", newline="\n")
+    _must(a, "add", PARTNER_JSONL)                    # STAGED, REAL change
+
+    r = _run_push_as(a, "testagent", *_default_flags())
+
+    assert "guard-741, defer" in r.stderr, r.stderr
+    assert "SEMANTICALLY identical" not in r.stderr, r.stderr
+    # The staged work is still staged -- nothing was discarded.
+    assert _must(a, "diff", "--cached", "--name-only") == PARTNER_JSONL
+
+
+def test_staged_unparseable_churn_still_defers(tmp_path):
+    """A file the comparator cannot parse is NOT proven identical -> defer."""
+    origin, a, b = _setup_merge_required(tmp_path)
+    (a / PARTNER_JSONL).write_text("this is not json\n", encoding="utf-8",
+                                   newline="\n")
+    _must(a, "add", PARTNER_JSONL)
+
+    r = _run_push_as(a, "testagent", *_default_flags())
+    assert "guard-741, defer" in r.stderr, r.stderr
+
+
+def test_dirty_shared_yaml_crlf_churn_does_not_block_merge(tmp_path):
+    """The .yaml/CRLF half: a shared file differing only by line endings.
+
+    Exercises the dirty-path arm (`*)`) rather than the staged gate, which is
+    the case the goal's verification names explicitly.
+    """
+    origin, a, b = _clone_pair(tmp_path)
+    _commit_file(a, "shared/config.yaml", "alpha: 1\nbeta: 2\n", "seed shared")
+    _must(a, "push", "-q", "origin", "main")
+    _must(b, "pull", "-q", "origin", "main")
+    _commit_file(b, "shared/config.yaml", "alpha: 1\nbeta: 3\n", "B: real edit")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "from_a.txt", "a\n", "A: local work")
+    # A's copy differs from its OWN HEAD by line endings only (a Windows writer).
+    (a / "shared/config.yaml").write_text("alpha: 1\r\nbeta: 2\r\n",
+                                          encoding="utf-8", newline="")
+
+    r = _run_push_as(a, "testagent", *_default_flags())
+
+    assert "only by serialization" in r.stderr, r.stderr
+    assert "blocking file outside agents/*" not in r.stderr, r.stderr
+
+
+def test_semantic_identity_helper_verdicts():
+    """Unit-pin the comparator itself, including the fail-safe direction."""
+    sys.path.insert(0, str(SCRIPT_DIR.parent))
+    from semantic_identity import compare, IDENTICAL, DIFFERENT, UNPARSEABLE
+
+    assert compare(CANON, REORDERED, "e.jsonl") == IDENTICAL
+    assert compare("a: 1\n", "a: 1\r\n", "c.yaml") == IDENTICAL
+    assert compare("x", "x", "anything.bin") == IDENTICAL
+    assert compare(CANON, REAL_EDIT, "e.jsonl") == DIFFERENT
+    # ORDER is content for an append-only store -- must NOT read as identical.
+    assert compare('{"id":"a"}\n{"id":"b"}\n', '{"id":"b"}\n{"id":"a"}\n',
+                   "e.jsonl") == DIFFERENT
+    assert compare(CANON, "not json", "e.jsonl") == UNPARSEABLE
+    assert compare("a: [1,2\n", "a: [1,2]\n", "c.yaml") == UNPARSEABLE
+    assert compare("p", "q", "blob.bin") == UNPARSEABLE
+
+
+# ---------------------------------------------------------------------------
+# : DURABLE cross-agent state must not be cleared unconditionally.
+#
+# The agents/* self-heal branch restored/deleted anything git named as blocking
+# with NO content check, while both sibling branches refused to (.mind-data/*
+# COMMITS, the shared *) arm clears only on a provable `identical`). These pin
+# the third branch's version of that refusal, scoped to identity + the learning
+# archive. Non-durable cross-agent churn (state.jsonl, new.jsonl) still clears —
+# t1/t2 above are the unchanged control.
+# ---------------------------------------------------------------------------
+
+def test_selfheal_durable_crossagent_content_divergence_defers(tmp_path):
+    """ outcome 1: agents/<other>/aspirations.jsonl with GENUINE
+    content divergence defers instead of being checkout-restored to HEAD.
+    `checkout --` is unrecoverable, so a wrong clear destroys partner work."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {"agents/bravo/aspirations.jsonl": CANON})
+    _commit_file(b, "agents/bravo/aspirations.jsonl",
+                 '{"id":"e3","kind":"note","n":3}\n', "B: bravo asp v2")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "core/scripts/dur1.sh", "echo dur1\n", "A: framework work")
+    # A holds UNCOMMITTED, genuinely-different content on a DURABLE path
+    (a / "agents/bravo/aspirations.jsonl").write_text(
+        REAL_EDIT, encoding="utf-8", newline="\n")
+
+    r = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    assert r.returncode == 1, f"should defer, not clear: {r.stderr}"
+    assert "merge DEFERRED" in r.stderr
+    assert "g-115-6145" in r.stderr, r.stderr
+    # THE POINT: the uncommitted partner work is still on disk, byte-identical.
+    assert (a / "agents/bravo/aspirations.jsonl").read_text() == REAL_EDIT
+
+
+def test_selfheal_durable_crossagent_serialization_only_still_clears(tmp_path):
+    """ outcome 2: a DURABLE path differing from HEAD only by key
+    ORDER carries nothing to lose, so it still clears (g-115-5717 unregressed).
+    Without this the fix would trade a data-loss bug for a permanent stall."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {"agents/bravo/aspirations.jsonl": CANON})
+    _commit_file(b, "agents/bravo/aspirations.jsonl",
+                 '{"id":"e9","kind":"note","n":9}\n', "B: bravo asp v2")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "core/scripts/dur2.sh", "echo dur2\n", "A: framework work")
+    # Semantically IDENTICAL to A's HEAD — same records, reordered keys.
+    (a / "agents/bravo/aspirations.jsonl").write_text(
+        REORDERED, encoding="utf-8", newline="\n")
+
+    r = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    assert r.returncode == 0, f"serialization-only must still clear: {r.stderr}"
+    assert "self-heal: clearing" in r.stderr
+    assert "push OK" in r.stderr
+    assert (a / "agents/bravo/aspirations.jsonl").read_text() == \
+        '{"id":"e9","kind":"note","n":9}\n'
+
+
+# ---------------------------------------------------------------------------
+# : the defer predicate must compare local against the INCOMING
+# version, not only against HEAD.
+#
+# HEAD is the version this box is moving AWAY from. own-cloud sync routinely
+# writes the partner's incoming bytes into the working copy between fetch and
+# merge, which makes local `different` from HEAD and IDENTICAL to origin — a
+# file with nothing to lose. The HEAD-only test deferred on it, and could not
+# self-clear (each sync re-dirties it), so the box rode to the stranded alarm.
+# Measured three times by three operators before the predicate was changed.
+# ---------------------------------------------------------------------------
+
+def test_selfheal_durable_untracked_crossagent_defers(tmp_path):
+    """: an UNTRACKED durable cross-agent file has NO HEAD side, so
+    `git clean` destroys it with no recovery path at all — strictly worse than
+    the tracked case. No semantic verdict is possible; defer unconditionally."""
+    origin, a, b = _clone_pair(tmp_path)
+    _commit_file(b, "agents/bravo/self.md", "# bravo identity\n",
+                 "B: new bravo self.md")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "core/scripts/dur3.sh", "echo dur3\n", "A: framework work")
+    (a / "agents" / "bravo").mkdir(parents=True, exist_ok=True)
+    (a / "agents/bravo/self.md").write_text(
+        "# LOCAL UNCOMMITTED IDENTITY\n", encoding="utf-8", newline="\n")
+
+    r = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    assert r.returncode == 1, f"should defer, not delete: {r.stderr}"
+    assert "merge DEFERRED" in r.stderr
+    assert "g-115-6145" in r.stderr, r.stderr
+    # THE POINT: the unrecoverable file still exists with its local content.
+    assert (a / "agents/bravo/self.md").read_text() == \
+        "# LOCAL UNCOMMITTED IDENTITY\n"
+
+
+# ---------------------------------------------------------------------------
+# : the defer above is CORRECT and is also half of a DEADLOCK.
+#
+# iteration-push refuses to clear the file (never clobber partner divergence),
+# and iteration-commit.sh's namespace filter refuses to commit it (never commit
+# another agent's namespace). Both are right; nothing arbitrates between them,
+# so the file stays dirty forever and every later merge defers on it. Measured
+# cc-07 2026-08-17: six consecutive integrate failures, behind=12, ahead 27->28,
+# sole blocker agents/zeta/aspirations.jsonl. T_recovery = INFINITY.
+#
+# The arbiter the deadlock lacks already exists — git's own commutative merge
+# driver. When one is CONFIGURED for the path, the third option is COMMIT, and
+# the driver unions at the merge.
+#
+# The two legs are independent in production and so are they here: .gitattributes
+# is version-controlled, the driver lives in unversioned .git/config. Testing the
+# attribute alone would pass on a box where the union guarantee does not exist.
+# ---------------------------------------------------------------------------
+
+def _install_ledger_attrs(repo: Path, pattern: str = "agents/*/aspirations.jsonl") -> None:
+    """Version-controlled half: the merge ATTRIBUTE, present in every clone."""
+    _commit_file(repo, ".gitattributes", f"{pattern} merge=ayoai-ledger\n",
+                 "attrs: route the ledger")
+
+
+def _install_ledger_driver(repo: Path) -> None:
+    """Unversioned half: the DRIVER, registered per-clone by install-git-hooks.sh."""
+    _must(repo, "config", "merge.ayoai-ledger.driver",
+          f"{BASH} {CORE_SCRIPTS / 'git-merge-ayoai-ledger.sh'} %O %A %B %P")
+    _must(repo, "config", "merge.ayoai-ledger.name", "test ledger merge")
+
+
+def _durable_wedge_fixture(tmp_path):
+    """The measured deadlock: A holds uncommitted divergence on a partner's
+    durable ledger that also blocks an incoming merge."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {"agents/bravo/aspirations.jsonl": CANON})
+    _commit_file(b, "agents/bravo/aspirations.jsonl",
+                 '{"id":"e3","kind":"note","n":3}\n', "B: bravo asp v2")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "core/scripts/wedge.sh", "echo wedge\n", "A: framework work")
+    (a / "agents/bravo/aspirations.jsonl").write_text(
+        REAL_EDIT, encoding="utf-8", newline="\n")
+    return origin, a, b
+
+
+def test_selfheal_durable_crossagent_commits_when_git_can_merge_it(tmp_path):
+    """ outcome 1: with BOTH legs present the file is COMMITTED, not
+    deferred — so the dirty path that could be neither cleared nor committed is
+    gone and the box can integrate again."""
+    origin, a, b = _durable_wedge_fixture(tmp_path)
+    _install_ledger_attrs(a)
+    _install_ledger_driver(a)
+
+    r = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    assert "g-115-6572" in r.stderr, r.stderr
+    # The defer arm must NOT have fired — that is the deadlock half being fixed.
+    assert "g-115-6145" not in r.stderr, r.stderr
+    # THE POINT: the wedge is gone. The path is no longer dirty, so it can never
+    # again block the merge on the next iteration, and the one on the one after.
+    assert _must(a, "status", "--porcelain", "--",
+                 "agents/bravo/aspirations.jsonl").strip() == ""
+    # ...and the partner's divergence was PRESERVED into git rather than
+    # discarded: `checkout --` would have destroyed exactly this content.
+    assert "999" in _must(a, "show", "HEAD:agents/bravo/aspirations.jsonl")
+
+
+def test_selfheal_durable_crossagent_defers_when_driver_is_not_configured(tmp_path):
+    """ outcome 2 — THE SECOND LEG, and the one that rots silently.
+
+    .gitattributes ships in every clone, so the attribute is present even on a
+    box where install-git-hooks.sh never ran. There git falls back to its default
+    text merge and the union guarantee does not exist, so committing a partner's
+    ledger would be an ordinary conflicting write. Attribute-only must DEFER."""
+    origin, a, b = _durable_wedge_fixture(tmp_path)
+    _install_ledger_attrs(a)          # attribute present...
+    # ...driver deliberately NOT registered.
+
+    r = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    assert r.returncode == 1, f"attribute without driver must defer: {r.stderr}"
+    assert "g-115-6145" in r.stderr, r.stderr
+    assert "g-115-6572" not in r.stderr, r.stderr
+    assert (a / "agents/bravo/aspirations.jsonl").read_text() == REAL_EDIT
+
+
+def test_selfheal_durable_crossagent_defers_for_unmergeable_paths(tmp_path):
+    """ outcome 3: scope is not over-wide. self.md carries NO merge
+    attribute — an identity file is not commutative and there is nothing to
+    union — so it still defers even with the driver fully configured."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {"agents/bravo/self.md": "# bravo v1\n"})
+    _commit_file(b, "agents/bravo/self.md", "# bravo v2\n", "B: bravo self v2")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "core/scripts/scope.sh", "echo scope\n", "A: framework work")
+    _install_ledger_attrs(a)          # routes aspirations.jsonl, NOT self.md
+    _install_ledger_driver(a)
+    (a / "agents/bravo/self.md").write_text(
+        "# LOCAL UNCOMMITTED IDENTITY\n", encoding="utf-8", newline="\n")
+
+    r = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    assert r.returncode == 1, f"unmergeable path must still defer: {r.stderr}"
+    assert "g-115-6145" in r.stderr, r.stderr
+    assert (a / "agents/bravo/self.md").read_text() == \
+        "# LOCAL UNCOMMITTED IDENTITY\n"
+
+
+# : the clear decision must compare local vs the INCOMING origin
+# version, not local vs HEAD.
+#
+# Under own-cloud the sync applies locally the exact bytes the pending merge is
+# about to deliver. That content is identical to origin and DIFFERENT from the
+# stale HEAD, so the HEAD-only predicate deferred forever and the wedge could
+# never self-clear — measured three times by two operators, each freed by
+# hand-proving the blob equal to origin. The pair below pins both directions:
+# identical-to-origin now clears, and different-from-BOTH still defers
+# ( unregressed).
+# ---------------------------------------------------------------------------
+
+def test_selfheal_durable_crossagent_identical_to_origin_clears(tmp_path):
+    """ outcome 1: a durable cross-agent file whose content is
+    byte-identical to the INCOMING origin version no longer defers.
+
+    RED against pre-fix HEAD (the HEAD-only predicate sees `different` and
+    defers), because A's local copy matches what B pushed, not A's HEAD."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {"agents/bravo/aspirations.jsonl": CANON})
+    incoming = '{"id":"e7","kind":"note","n":7}\n'
+    _commit_file(b, "agents/bravo/aspirations.jsonl", incoming, "B: bravo asp v2")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "core/scripts/dur6538a.sh", "echo dur\n", "A: framework work")
+    # The own-cloud sync has already landed B's exact bytes in A's worktree:
+    # DIFFERENT from A's HEAD (still CANON), IDENTICAL to origin/main.
+    (a / "agents/bravo/aspirations.jsonl").write_text(
+        incoming, encoding="utf-8", newline="\n")
+
+    r = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    assert r.returncode == 0, f"identical-to-origin must clear: {r.stderr}"
+    assert "push OK" in r.stderr, r.stderr
+    # Nothing was lost: the merge delivered the very bytes the clear discarded.
+    assert (a / "agents/bravo/aspirations.jsonl").read_text() == incoming
+
+
+def test_selfheal_durable_crossagent_differs_from_both_still_defers(tmp_path):
+    """ outcome 2: content that diverges from BOTH HEAD and origin
+    still defers and is never cleared — g-115-6145 unregressed.
+
+    This is the arm that must NOT widen: here the local bytes exist nowhere
+    else, so a clear would destroy them with no recovery path.
+
+    ITS FORCED-FAILURE CONTROL IS A MUTATION, MEASURED RATHER THAN ASSUMED
+    (guard-3534), and it needs one because this arm is green both before and
+    after the fix by construction — so a pre-fix run cannot prove it tests
+    anything. Inverting the origin comparison (`!= identical` ->
+    `= identical`) makes the predicate clear on genuine divergence and takes
+    this test RED. Dropping the HEAD leg instead does NOT fail it: that
+    mutation was run and this test stayed green, because REAL_EDIT differs
+    from origin too. Carried here from a duplicate implementation of this
+    same goal (cc-07, 2026-08-18) whose test twin was dropped in the merge —
+    the measurement is the only part of it that was not redundant."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {"agents/bravo/aspirations.jsonl": CANON})
+    _commit_file(b, "agents/bravo/aspirations.jsonl",
+                 '{"id":"e8","kind":"note","n":8}\n', "B: bravo asp v2")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "core/scripts/dur6538b.sh", "echo dur\n", "A: framework work")
+    # Matches neither HEAD (CANON) nor origin (e8) — genuinely unique local work.
+    (a / "agents/bravo/aspirations.jsonl").write_text(
+        REAL_EDIT, encoding="utf-8", newline="\n")
+
+    r = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    assert r.returncode == 1, f"divergent-from-both must defer: {r.stderr}"
+    assert "merge DEFERRED" in r.stderr
+    assert "g-115-6538" in r.stderr, r.stderr
+    assert (a / "agents/bravo/aspirations.jsonl").read_text() == REAL_EDIT
+
+
+# ---------------------------------------------------------------------------
+# : a defer must not abandon self-namespace churn already collected.
+#
+# self_paths is populated inside the classification loop but STAGED after it, so
+# every one of the six defer arms used to `return 1` past the staging. The
+# routine trigger is the  arm: a partner's durable store goes dirty
+# from own-cloud sync, the classifier correctly refuses to clear it, and this
+# Body's own ledger churn is stranded uncommitted as collateral — where it
+# cannot travel on refs/workers/<agent>/<sid> and the reducer never sees it.
+# Measured cc-07 2026-08-16: 3 consecutive dirty-defer cycles at behind=17
+# ahead=6 with agents/alpha/{aspirations,changelog,experience}.jsonl dirty
+# throughout.
+#
+# Both tests below assert the SAME two properties together, because either one
+# alone is satisfiable by a wrong fix: committing self churn (the repair) AND
+# leaving the partner file untouched (, which must not be weakened to
+# get it). The existing durable-defer tests above are the no-self-churn control.
+# ---------------------------------------------------------------------------
+
+def test_selfheal_defer_commits_self_churn_before_giving_up(tmp_path):
+    """ outcomes 1+2. A durable partner file defers the merge; the
+    self-namespace churn dirty alongside it is committed anyway."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {"agents/bravo/aspirations.jsonl": CANON,
+                          "agents/alpha/ledger.jsonl": "v1\n"})
+    _commit_file(b, "agents/bravo/aspirations.jsonl",
+                 '{"id":"e7","kind":"note","n":7}\n', "B: bravo asp v2")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "core/scripts/g6373a.sh", "echo a\n", "A: framework work")
+    # SELF churn (must survive) + DURABLE partner divergence (must defer)
+    (a / "agents/alpha/ledger.jsonl").write_text(
+        "dirty-self\n", encoding="utf-8", newline="\n")
+    (a / "agents/bravo/aspirations.jsonl").write_text(
+        REAL_EDIT, encoding="utf-8", newline="\n")
+
+    r = _run_push_env(a, "alpha", *_default_flags("--strict"))
+
+    # THE DEFER IS UNCHANGED — still defers, still clears nothing.
+    assert r.returncode == 1, f"must still defer: {r.stderr}"
+    assert "merge DEFERRED" in r.stderr
+    assert "g-115-6145" in r.stderr, r.stderr
+    assert (a / "agents/bravo/aspirations.jsonl").read_text() == REAL_EDIT, \
+        "the defer was weakened — partner work was cleared"
+    # THE FIX — self churn reached a commit despite the defer.
+    assert _must(a, "show", "HEAD:agents/alpha/ledger.jsonl") == "dirty-self", \
+        "self-namespace churn was abandoned by the defer (the g-115-6373 bug)"
+    assert "g-115-6373" in r.stderr, r.stderr
+
+
+def test_selfheal_defer_commits_self_churn_when_self_sorts_after_partner(tmp_path):
+    """The ordering half, and the reason the fix RECORDS the defer rather than
+    breaking out of the loop.
+
+    `git diff --name-only` is sorted, so whether a self path is classified
+    before the blocking partner path is decided by how the agent's own name
+    sorts against the partner's. Here it sorts AFTER (zeta > bravo), so the
+    defer is reached while self_paths is still EMPTY. A fix that committed
+    what it had at the moment of the defer would pass the test above and fail
+    this one — leaving the bug live for every agent whose name sorts late."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {"agents/bravo/aspirations.jsonl": CANON,
+                          "agents/zeta/ledger.jsonl": "v1\n"})
+    _commit_file(b, "agents/bravo/aspirations.jsonl",
+                 '{"id":"e8","kind":"note","n":8}\n', "B: bravo asp v2")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "core/scripts/g6373b.sh", "echo b\n", "A: framework work")
+    (a / "agents/bravo/aspirations.jsonl").write_text(
+        REAL_EDIT, encoding="utf-8", newline="\n")
+    (a / "agents/zeta/ledger.jsonl").write_text(
+        "dirty-self-late\n", encoding="utf-8", newline="\n")
+    # Pin the premise rather than assuming it: if git ever stopped emitting the
+    # dirty set sorted, this test would silently stop testing ordering at all.
+    dirty = _must(a, "diff", "--name-only").splitlines()
+    assert dirty.index("agents/bravo/aspirations.jsonl") \
+         < dirty.index("agents/zeta/ledger.jsonl"), \
+        f"premise broken — partner must be classified first: {dirty}"
+
+    r = _run_push_env(a, "zeta", *_default_flags("--strict"))
+
+    assert r.returncode == 1, f"must still defer: {r.stderr}"
+    assert (a / "agents/bravo/aspirations.jsonl").read_text() == REAL_EDIT
+    assert _must(a, "show", "HEAD:agents/zeta/ledger.jsonl") == "dirty-self-late", \
+        "self churn classified AFTER the defer point was abandoned"
+
+
+# --------------------------------------------------------------------------- #
+#  (wedge shape B): the streak alarm's remedy must match the defer's
+# SHAPE. A durable-cross-agent defer and an ordinary dirty-tree defer reach the
+# alarm identically, but their remedies are OPPOSITE — the dirty-tree hint says
+# "clear it", which for a durable path DESTROYS the partner divergence that
+#  deferred to protect. Same class as the conflict-abort/dirty-defer
+# split (guard-1985) one layer down.
+# --------------------------------------------------------------------------- #
+def _run_until_streak_alarm(a: Path, agent: str, n: int = 3) -> list:
+    """Run the fail-soft push n times so the 3rd trips INTEGRATE-DEFER STREAK."""
+    outs = []
+    for _ in range(n):
+        r = _run_push_env(a, agent, *_default_flags())
+        assert r.returncode == 0, r.stderr          # fail-soft, never blocks
+        outs.append(r.stderr)
+    return outs
+
+
+def test_durable_crossagent_defer_streak_names_its_shape_not_clear_it(tmp_path):
+    """The alarm on a DURABLE cross-agent defer must state the sanctioned
+    procedure and must NOT prescribe clearing.
+
+    guard-2536: the negative assertion ("does not say clear it") is paired with
+    a positive reached-the-path marker — the streak file's 3rd field, which is
+    the shape string the tick was actually called with. Without that pairing the
+    negative would pass just as happily against a run where no alarm fired."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {"agents/bravo/aspirations.jsonl": CANON})
+    _commit_file(b, "agents/bravo/aspirations.jsonl",
+                 '{"id":"e3","kind":"note","n":3}\n', "B: bravo asp v2")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "core/scripts/dur6632.sh", "echo dur\n", "A: framework work")
+    # Genuinely divergent from BOTH HEAD and origin, and re-dirties every pass.
+    (a / "agents/bravo/aspirations.jsonl").write_text(
+        REAL_EDIT, encoding="utf-8", newline="\n")
+
+    outs = _run_until_streak_alarm(a, "alpha")
+
+    # REACHED-THE-PATH: the tick recorded THIS shape, not dirty-defer.
+    streak = a / ".git" / "iteration-push-defer-streak"
+    assert streak.is_file(), "no streak file — the alarm path never ran"
+    fields = streak.read_text().split()
+    assert fields[0] == "3", fields
+    assert fields[2] == "durable-crossagent-defer", \
+        f"wrong shape recorded — the split did not fire: {fields}"
+
+    alarm = outs[2]
+    assert "INTEGRATE-DEFER STREAK" in alarm, alarm
+    assert "SANCTIONED PROCEDURE" in alarm, alarm
+    assert "Do NOT clear them" in alarm, alarm
+    # The offending path is named, so the operator need not re-derive the set.
+    assert "agents/bravo/aspirations.jsonl" in alarm, alarm
+    # NEGATIVE: the dirty-tree remedy must not appear on this shape.
+    assert "and clear it" not in alarm, \
+        f"durable defer still prescribes the FORBIDDEN action: {alarm}"
+    # The partner's uncommitted work survived all three passes.
+    assert (a / "agents/bravo/aspirations.jsonl").read_text() == REAL_EDIT
+
+
+def test_ordinary_dirty_defer_still_gets_the_clear_it_hint(tmp_path):
+    """POSITIVE CONTROL for the test above. An ordinary dirty-tree defer is
+    unchanged: it still reports shape dirty-defer and still says "clear it".
+    Without this, the sibling test would pass against a build that simply
+    deleted the dirty-tree hint outright."""
+    origin, a, b = _clone_pair(tmp_path)
+    # Blocker outside agents/* and .mind-data/* — the plain dirty-tree shape.
+    _commit_file(b, "base.txt", "B v2\n", "B: rewrite base")
+    _must(b, "push", "-q", "origin", "main")
+    (a / "base.txt").write_text("A dirty uncommitted\n", encoding="utf-8")
+
+    outs = _run_until_streak_alarm(a, "alpha")
+
+    streak = a / ".git" / "iteration-push-defer-streak"
+    assert streak.is_file(), "no streak file — the alarm path never ran"
+    fields = streak.read_text().split()
+    assert fields[2] == "dirty-defer", f"control shape changed: {fields}"
+
+    alarm = outs[2]
+    assert "INTEGRATE-DEFER STREAK" in alarm, alarm
+    assert "and clear it" in alarm, alarm
+    assert "SANCTIONED PROCEDURE" not in alarm, \
+        f"durable hint leaked onto an ordinary dirty defer: {alarm}"

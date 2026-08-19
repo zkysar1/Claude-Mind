@@ -90,6 +90,22 @@ os.environ["STORAGE_BACKEND"] = "local"
 # "am I inside a hermetic pytest session?" signal the tripwire keys off.
 os.environ["MIND_ALLOW_TMP_OWNCLOUD_PUT"] = "1"
 
+# Gate-firings segmentation is a PER-BOX deployment flag (settings.json env,
+# fleet-wide since 2026-08-17). Pin it OFF for the session so every lane that
+# writes a firing — _gate_log.log()'s direct locked append (which honours the
+# flag since 2026-08-18) and gate-firings-flush.py — lands on the legacy
+# filename the existing assertions read (test_layer_d_telemetry,
+# test_store_dupe_warn, test_phase_4_26_gate, ...). Tests that exercise the
+# segment lane opt in with monkeypatch.setenv(SEGMENTED_ENV, "1")
+# (test_gate_firings_paths). Same shape as the STORAGE_BACKEND pin above: the
+# box's live setting must not decide what a hermetic test observes.
+# REACH: pytest-collected files ONLY. test_layer_d_telemetry is a main()-style
+# INVISIBLE file, so this pop never reached it and it went red fleet-wide the
+# moment settings.json set the flag (2026-08-18); run-invisible-suites.sh
+# carries the mirror `unset` for that half, and the test now reads through
+# firings_paths() so it is correct under either flag value.
+os.environ.pop("GATE_FIRINGS_SEGMENTED", None)
+
 # Hermetic embedding index (). Sibling of the STORAGE_BACKEND pin
 # above and for the same reason: a test can redirect the STORE to a tmp path,
 # but retrieve.py's `_embedding_blend` calls `cosine_scores(query)` with no
@@ -114,6 +130,40 @@ os.environ["MIND_EMBEDDING_INDEX_DIR"] = str(
     Path(__file__).resolve().parent / "_no_such_embedding_index"
 )
 
+# : CLEAR the world/meta path vars for the whole pytest session, so a
+# run cannot inherit them from whatever shell launched it. Unlike the three pins
+# above, this is a pop and not an assignment -- the choice is measured, not
+# symmetric with STORAGE_BACKEND, and the reasoning is the whole point:
+#
+#   1. PRODUCTION RUNS WITH THESE UNSET. The PreToolUse[Bash] hook injects only
+#      PATH/MIND_AGENT/MIND_SID; it exports neither var. Sourcing _paths.sh
+#      DOES export both, so whether a test process has them set is decided by
+#      how the launching shell happened to be built. Clearing reproduces the
+#      production shape; pinning would manufacture a shape production lacks.
+#   2. PINNING BUYS NOTHING OVER THE FALLBACK. Measured on this box: with
+#      MIND_WORLD unset, _paths resolves /opt/ayoai-mind/.mind-data/world --
+#      byte-identical to what the shell exports. A pin to the real world is a
+#      no-op with a second source of truth attached; a pin to a tmp world would
+#      break every test that reads real world content.
+#   3. A PIN WOULD BE A SECOND RESOLVER. Subprocesses inherit os.environ, so a
+#      pinned value hands each child a world computed at THIS import, bypassing
+#      the local-paths.conf / .mind-data chain the child would otherwise run.
+#      Clearing keeps _paths the single source of truth (guard: SSOT).
+#
+# What this does NOT buy, stated because the adjacent comment at the S3-key
+# note below is the load-bearing limit: it is NOT isolation. Neither clearing
+# nor pinning redirects a DAEMON-performed write -- the daemon resolves its own
+# world path, so no env var set in the test process can move it. This removes
+# launching-shell dependence only.
+#
+# PLACEMENT IS ABOVE THE _paths PRE-IMPORT, NOT MERELY ABOVE THE SNAPSHOT.
+# _paths computes WORLD_DIR/META_DIR as module-level constants, and the
+# pre-import below runs before the snapshot -- so a pop placed next to the
+# snapshot would clear the env while leaving the shell's value already baked
+# into the module cache for the rest of the session.
+os.environ.pop("MIND_WORLD", None)
+os.environ.pop("MIND_META", None)
+
 # Pre-import _paths to lock AGENT_DIR into the module cache before any test
 # module pops MIND_AGENT. Without this, a test that pops the env BEFORE
 # _paths is first imported caches AGENT_DIR=None for the whole session.
@@ -137,6 +187,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 _UNSET = object()
 _BOOTSTRAP_MIND_AGENT = os.environ.get("MIND_AGENT", _UNSET)
 _BOOTSTRAP_MIND_WORLD = os.environ.get("MIND_WORLD", _UNSET)
+# : MIND_META was absent from this snapshot AND from the restore
+# below, so unlike its world sibling it had no per-test isolation at all -- a
+# module that set it at import time leaked into every later test. Snapshotted
+# here for symmetry of PROTECTION (both vars now restored per test), which is
+# a different question from the pin-vs-clear choice made above.
+_BOOTSTRAP_MIND_META = os.environ.get("MIND_META", _UNSET)
 _BOOTSTRAP_MIND_BACKEND = os.environ.get("STORAGE_BACKEND", _UNSET)
 _BOOTSTRAP_ALLOW_TMP_PUT = os.environ.get("MIND_ALLOW_TMP_OWNCLOUD_PUT", _UNSET)
 
@@ -165,6 +221,14 @@ def _restore_env_per_test():
         os.environ.pop("MIND_WORLD", None)
     else:
         os.environ["MIND_WORLD"] = _BOOTSTRAP_MIND_WORLD
+    # : MIND_META gets the same per-test restore its world sibling
+    # has always had. Both are cleared at module scope above, so on a normal run
+    # both branches pop -- the else-branch exists for a caller that deliberately
+    # sets them before importing conftest.
+    if _BOOTSTRAP_MIND_META is _UNSET:
+        os.environ.pop("MIND_META", None)
+    else:
+        os.environ["MIND_META"] = _BOOTSTRAP_MIND_META
     # Keep the storage backend pinned local across tests that may mutate it
     # (lodestar-s7 test isolation — see the module-level set above).
     if _BOOTSTRAP_MIND_BACKEND is _UNSET:
@@ -177,6 +241,25 @@ def _restore_env_per_test():
         os.environ.pop("MIND_ALLOW_TMP_OWNCLOUD_PUT", None)
     else:
         os.environ["MIND_ALLOW_TMP_OWNCLOUD_PUT"] = _BOOTSTRAP_ALLOW_TMP_PUT
+    # : restore the DERIVED backend, not just the INPUT env var above.
+    # get_backend() memoizes _ACTIVE_BACKEND process-wide AND freezes the
+    # governed-root map INTO that instance, so restoring STORAGE_BACKEND=local
+    # is not enough -- the next get_backend() returns the cached object and
+    # ignores the env entirely. A test that builds an own-cloud backend against
+    # its own tmp world therefore leaves every later test in the process holding
+    # a backend whose roots point at a tmp dir that no longer exists, surfacing
+    # as `ValueError: <tmp>/world/pipeline.lock is not under any configured root`
+    # from owncloud_backend._rel -- attributed to the victim file, arbitrarily
+    # far from the test that caused it. Reset here so each test derives the
+    # backend from the env this fixture just restored.
+    #
+    # Guarded on sys.modules rather than importing: conftest must not force the
+    # storage_backend import (and its side effects) onto runs that never touch
+    # it. No try/except -- if the reset helper is missing or raises, that is a
+    # real signal and swallowing it would recreate a silent-failure class.
+    _sb = sys.modules.get("storage_backend")
+    if _sb is not None and hasattr(_sb, "reset_backend_for_tests"):
+        _sb.reset_backend_for_tests()
     yield
 
 

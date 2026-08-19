@@ -14,6 +14,19 @@ a FILED GOAL whose central claim ("ZERO of 8 peer requests converted") was
 false; four had converted. The wrong claim reached a coordination-board post
 and a user report, and all three had to be retracted.
 
+SECOND FORM (g-115-5343): the same failure without any `or '[]'`, produced by a
+parser that drops non-JSON lines --
+
+    bash core/scripts/guardrails-read.sh --all 2>/dev/null | py -3 -c "
+      for line in sys.stdin:
+          if not line.startswith('{'): continue     # discards the usage error
+          ..."
+
+Measured: silent_zero_violations() returns [] on this, so the form above was
+uncovered. Refused only when the non-conforming line is DISCARDED -- the same
+test that SURFACES it and stops is correct handling and stays approved. Full
+noise measurement in _silent_zero_predicate.py.
+
 WHY A GATE AND NOT A RULE. Two honor-system rails (guard-1587, rb-245) were
 live in context during all three founding incidents and prevented none of them.
 The population is ad-hoc, LLM-composed commands, so no committed-code audit can
@@ -50,8 +63,10 @@ from hook_helpers import (  # noqa: E402
 )
 from _silent_zero_predicate import (  # noqa: E402
     OVERRIDE_TOKEN,
+    shape_selective_suppressions,
     silent_zero_violations,
     suggest_rewrite,
+    suggest_shape_rewrite,
 )
 
 
@@ -85,6 +100,47 @@ def build_reason(idioms) -> str:
     return head + body + tail
 
 
+def build_shape_reason(idioms) -> str:
+    """Compose the deny message for the shape-selective form ().
+
+    Kept SEPARATE from build_reason because the two forms need opposite advice:
+    the coercion message says "read the status, moving the message does not help",
+    while this one's cheapest fix IS to surface the message. A merged message
+    would have to hedge, and a hedged gate message is one a reader skims.
+    """
+    head = (
+        "silent-zero pipeline refused: {} silently DISCARDS every line the "
+        "wrapper wrote that is not JSON -- including its error.\n\n"
+        "MECHANISM: when the wrapper refuses (an invalid flag, a missing "
+        "required filter) it writes a usage message and exits non-zero. Your "
+        "filter drops that line, so the loop sees nothing and reports 0 "
+        "records -- byte-identical to a healthy call against an empty store. "
+        "The shape test is doing the work of a SECOND error suppressor on top "
+        "of any stderr redirect: even with stderr merged into stdout, the "
+        "diagnostic is thrown away before you can read it (guard-3052).\n"
+    ).format(", ".join("`{}`".format(i) for i in idioms))
+
+    body = "\nUse either of:\n\n  " + "\n\n  ".join(suggest_shape_rewrite(None))
+
+    # CONCATENATED, NOT .format() -- deliberately, and this is not style. The
+    # example below contains a literal `{`, which str.format reads as an unclosed
+    # replacement field and raises on. The gate's fail-open then swallows the
+    # exception and the deny silently degrades to an approve: a gate that reports
+    # "nothing wrong" because its own error message was malformed. That is the
+    # exact defect class this file exists to refuse, and it shipped here first.
+    tail = (
+        "\n\nNOTE the same test is CORRECT when it stops instead of skipping -- "
+        "`if not raw.startswith('{'): print(raw[:400]); raise SystemExit(1)` is "
+        "approved by this gate, deliberately. Only the discarding form is "
+        "refused.\n"
+        "If the wrapper genuinely interleaves non-JSON on success, put "
+        + OVERRIDE_TOKEN
+        + " anywhere in the command to bypass.\n"
+        "See g-115-5343, guard-3052, and .claude/rules/verify-before-assuming.md."
+    )
+    return head + body + tail
+
+
 def main():
     payload = stdin_json_or_approve()
     if not isinstance(payload, dict):
@@ -99,6 +155,12 @@ def main():
     idioms = silent_zero_violations(command)
     if idioms:
         emit_deny(build_reason(idioms))
+
+    # Second form. Checked AFTER the coercion form so that a command carrying
+    # both keeps its original, already-pinned message.
+    dropped = shape_selective_suppressions(command)
+    if dropped:
+        emit_deny(build_shape_reason(dropped))
 
     approve_no_mutation()
 

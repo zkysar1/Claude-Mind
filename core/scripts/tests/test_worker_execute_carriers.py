@@ -337,3 +337,56 @@ def test_carrier_table_did_not_disturb_the_phase_or_lifecycle_contracts():
     is that all three are edited in the same file."""
     assert we.WORKER_PHASES == ("select", "claim", "execute")
     assert we.lifecycle_gaps() == []
+
+
+def test_product_repo_commit_does_not_share_the_mind_repo_worker_ref():
+    """: the two git-ref rows point at DIFFERENT remotes.
+
+    Both are `git-ref`, which is exactly why this is worth pinning: the kinds
+    match, so nothing structural stops a future tidy-up from collapsing them.
+    Collapsing would fail in the dangerous direction -- a worker that committed
+    to a sibling product repo and ran only `iteration-push.sh
+    --push-worker-ref` would read `carried`, while its work sat on one box.
+    refs/workers/* lives in the Mind repo and worker-ref-consume.sh fetches
+    only that remote; it cannot reach /opt/GitHub/<repo>.
+    """
+    product = we.OUTPUT_CLASS_CARRIERS["product-repo-commit"]
+    local = we.OUTPUT_CLASS_CARRIERS["local-git-commit"]
+    framework = we.OUTPUT_CLASS_CARRIERS["framework-file-edit"]
+
+    # REPOINTED 2026-08-11 by the  evil-merge audit. This line read
+    # `product.kind == local.kind == we.GIT_REF` and was RED at HEAD, and the
+    # cause is the merge itself rather than either author. Merge 46d59e2eb fused
+    # two independent implementations of this same row: parent 424611376 wrote
+    # kind=GIT_REF AND this test file; parent dbcdaee8d wrote kind=UPSTREAM_REMOTE
+    # and had no test file at all. The two edits sat in different regions, so git
+    # merged both CLEANLY and took dbcdaee8d's ROW with 424611376's TEST -- a
+    # composite neither author wrote and neither would have shipped. Nothing
+    # announced it; only running the suite did.
+    #
+    # The surviving row is the correct one, so the test moved rather than the
+    # code. UPSTREAM_REMOTE is right on the merits: this carrier is a DIFFERENT
+    # repository's origin, which no refs/workers/* ref can reach. And it makes
+    # this test's own stated worry -- "the kinds match, so nothing structural
+    # stops a future tidy-up from collapsing them" -- obsolete in the good
+    # direction: distinct kinds stop the collapse structurally, which is a
+    # stronger guarantee than the assertion below was written to provide.
+    # So pin the DIVERGENCE. Re-collapsing these kinds is the regression.
+    assert local.kind == framework.kind == we.GIT_REF   # the Mind-side pair
+    assert product.kind == we.UPSTREAM_REMOTE           # deliberately NOT git-ref
+    assert product.kind != local.kind                   # the premise, inverted
+
+    # startswith, NOT `in`. The first draft of this test asserted
+    # `"refs/workers/" not in product.target` and failed against a correct
+    # table, because that target's prose says "NOT refs/workers/*" -- a
+    # substring test cannot tell an assertion from its negation. Same defect
+    # class as the file-level `grep -l ConditionExpression` screen this goal
+    # re-ran: there, a comment explaining why a guard was REJECTED counted as
+    # evidence the guard was present. The target field's job is to name the
+    # mechanism, so anchor on where it starts.
+    assert local.target.startswith("refs/workers/")
+    assert framework.target.startswith("refs/workers/")
+    assert not product.target.startswith("refs/workers/")
+
+    # The Mind-side rows share one ref by design; this one must not join them.
+    assert product.target not in (local.target, framework.target)

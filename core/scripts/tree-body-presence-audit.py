@@ -74,6 +74,7 @@ import yaml
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _paths import WORLD_DIR, assert_world_dir  # noqa: E402
 from storage_backend import get_backend  # noqa: E402
+from _owncloud_codec import decode_response as _codec_decode_response  # noqa: E402  # 
 
 # core/scripts/<this>.py -> parents[2] == PROJECT_ROOT (matches _paths' own
 # derivation). Used only for the rare non-"world/"-prefixed file field.
@@ -120,9 +121,10 @@ def _remote_registered(backend, tree_root, world_dir, project_root):
     non-mutating, which is why it is hand-rolled here.
     """
     try:
-        obj = backend.s3.get_object(Bucket=backend.bucket,
-                                    Key=backend._s3_key(tree_root / "_tree.yaml"))
-        remote = yaml.safe_load(obj["Body"].read().decode("utf-8")) or {}
+        key = backend._s3_key(tree_root / "_tree.yaml")
+        obj = backend.s3.get_object(Bucket=backend.bucket, Key=key)
+        # : decode through the one transport seam (plain passes through).
+        remote = yaml.safe_load(_codec_decode_response(obj, key=key).decode("utf-8")) or {}
     except Exception as ex:  # noqa: BLE001 - best-effort; fall back to the local registry
         # Carry the CAUSE. "unreadable" alone cannot distinguish AccessDenied (a
         # real permissions gap needing action — the  scoped-identity

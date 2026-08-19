@@ -19,6 +19,11 @@ This module is the DETERMINISTIC, TESTABLE contract the worker-loop skill
     every session stage mapped to exactly one declared worker disposition, so a
     lifecycle asymmetry fails loudly at edit time instead of surfacing by
     surprise. See "lifecycle contract" below.
+  - SKILL_LIFECYCLE_STAGE / skill_eligibility(skill) -- the SKILL bridge
+    (g-115-5664): a goal record names its skill ("/replay --sharp-wave"), a
+    third vocabulary that nothing mapped to the two tables above, so a worker
+    could be handed a goal whose skill IS a reducer-only lifecycle stage. The
+    disposition is DERIVED from LIFECYCLE_DISPOSITIONS, never restated.
   - worker_wm_path(agent, unit_key)     -- the worker writes ONLY its own forked
     Body WM, reusing the Phase-1A reducer-aware activation signal (the forked
     body-WM-file's existence). Mirrors mind_api/src/agent_paths.py::wm_path so
@@ -39,7 +44,9 @@ from __future__ import annotations
 
 import argparse
 import collections
+import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -72,7 +79,20 @@ WORKER_PHASES = ("select", "claim", "execute")
 # labels so the worker-loop skill can gate by the same identifiers the full loop
 # uses.
 REDUCER_ONLY_PHASES = frozenset({
-    "verify",             # Phase 5   -- outcome verification
+    # "verify" here is Phase 5 as an LLM PHASE -- /aspirations-verify's hypothesis
+    # outcomes, Q1/Q2/Q3 escalation, streak tracking, dependent-goal unblocking.
+    # It is NOT the mechanical status write. Since 2026-08-16 a worker records the
+    # status IT judged for the unit it just executed by a scoped call to the shared
+    # close writer (worker-loop Phase 4a -> `iteration-close.sh --phase verify`,
+    # i.e. do_verify: status/completed_date/outcome_class, complete-by for
+    # recurring, board post, goal-scoped in_flight clear). Measured before that
+    # change (alpha reducer, cc-04, ): 360 of 361 open claims were
+    # finished work left at in-progress "for the reducer", and no reducer lane
+    # ever flipped one -- worker_retrospective.py has no close lane and
+    # body-merge.py only names ids. Capturing the caller-declared outcome is
+    # part of executing; running the LLM verify phase is the phase. Do not read
+    # Phase 4a as a violation of this entry.
+    "verify",             # Phase 5   -- outcome verification (LLM phase)
     # A worker does NOT run the spark PHASE -- it creates no rb/guardrail/tree
     # artifact (that would make it an Nth reducer). It DOES record raw spark
     # observations into the `spark_capture` WM slot during execute
@@ -245,12 +265,17 @@ CANONICAL_LIFECYCLE_STAGES = (
 
 LIFECYCLE_DISPOSITIONS = {
     "prime": LifecycleDisposition(
-        kind=SCOPED_CALL, target="prime", mode="light (Self + guardrail index + rb recency)",
+        kind=SCOPED_CALL, target="prime",
+        mode="light, TWO TIERS: identity (Self + Program) once per worker session behind "
+             "the light-prime-done sentinel; recency (rb --recent + guardrail index) on "
+             "EVERY re-entry, ahead of that sentinel",
         why="A worker reasons with the same identity and rails as its reducer, so it needs "
-            "prime's INPUT side; it must not run prime's reducer-side state writes. "
-            "Today the worker-loop runs no prime at all -- the asymmetry that motivated "
-            "this whole table.",
-        pending_goal="g-306-211"),
+            "prime's INPUT side; it must not run prime's reducer-side state writes. The "
+            "per-unit recency tier exists because a session-scoped prime alone leaves every "
+            "unit after the first on entry-time rails -- measured at ~18.5h on cc-07 "
+            "2026-08-16, against a user directive (g-306-211 addendum) whose rationale is "
+            "unit gaps of 15-92 min. Landed by g-306-298; worker-loop/SKILL.md Phase -0.5 "
+            "is the implementation."),
     "boot-continuity": LifecycleDisposition(
         kind=WORKER_ONLY, target="worker-loop Phase -0 body-identity re-verify",
         why="/boot is the reducer's session entry and touches running-session-id and "
@@ -332,7 +357,11 @@ LIFECYCLE_DISPOSITIONS = {
         why="The per-iteration encode+reflect block. Applied ONCE to the MERGED state of all "
             "Bodies at generalize-down, not per-Body. This stage is the lifecycle twin of "
             "REDUCER_ONLY_PHASES minus spark and productivity-check, which have their own "
-            "rows because their worker dispositions differ."),
+            "rows because their worker dispositions differ. The STATUS FLIP of the worker's "
+            "own goal is not this stage: worker-loop Phase 4a records the caller-declared "
+            "outcome through the shared close writer (iteration-close.sh --phase verify, "
+            "the mechanical do_verify), because a completion left at in-progress reaches no "
+            "reducer lane and no selector -- see the REDUCER_ONLY_PHASES 'verify' note."),
     "productivity-stop": LifecycleDisposition(
         kind=REDUCER_ONLY_BY_DESIGN, target="productivity-stop-gate.sh",
         why="A worker's close condition is work-exhaustion or reducer-death, never a "
@@ -356,6 +385,178 @@ PHASE_LIFECYCLE_STAGE = {
     "learning-gate": "reducer-iteration",
     "productivity-check": "productivity-stop",
 }
+
+
+# --------------------------- skill eligibility () ---------------------------
+#
+# WHY A FOURTH TABLE, AND WHY THE ORIGINATING GOAL'S PREMISE WAS WRONG.
+#  was filed asserting "the disposition table already knows which
+# skills are reducer-only, so the missing piece is a lookup, not a new list."
+# MEASURED while implementing it: FALSE. The tables above are keyed by PHASE and
+# by LIFECYCLE STAGE. A goal record's `skill` field is a THIRD vocabulary
+# ("/replay --sharp-wave"), and nothing anywhere bridged it to the other two. So
+# the lookup had no table to look in. This is that bridge -- and it is a bridge,
+# not a second list of reducer-only things: the DISPOSITION is still read from
+# LIFECYCLE_DISPOSITIONS, so flipping a stage's kind moves every skill mapped to
+# it automatically and no reducer-only fact is stated twice (guard-2676).
+#
+# MEASURED 2026-08-10 (alpha worker Body, hostname cc-08, uname -r
+# 6.8.0-136-generic). goal-selector.sh offered  "Run hippocampal replay"
+# as the sanctioned top pick, with the drain-lane banner reading verbatim "This
+# IS the sanctioned top pick — claim it without a deviation code." That goal
+# carries skill "/replay --sharp-wave"; LIFECYCLE_DISPOSITIONS["replay"] is
+# REDUCER_ONLY_BY_DESIGN; /replay's body calls guardrails-add.sh. A worker that
+# followed the banner would have written guardrails derived from its own
+# UNMERGED state -- the Nth-reducer defect the whole convergence forbids -- and
+# nothing in the loop prompted the check. It was caught only by opening the
+# skill before claiming.
+#
+# WHERE THIS DELIBERATELY DOES *NOT* LIVE. The obvious fix is to filter inside
+# goal-selector when the caller is a worker. LIFECYCLE_DISPOSITIONS["select"]
+# forbids exactly that, in as many words: "A worker selects exactly like the
+# reducer -- same scorer, same candidate set. There is no worker-specific
+# selection logic and there must not be one." So the scorer stays untouched and
+# byte-identical for both roles, and the eligibility question is answered HERE,
+# by the module that already owns the role split, and consulted by worker-loop
+# Phase 1. The consulting loop walks DOWN the ranked list rather than burning a
+# cycle, so a refusal costs one lookup and never a select pass.
+
+# skill -> the lifecycle stage that skill IS. Disposition is derived, never
+# restated. Keys are the bare skill token; args ("--sharp-wave") are stripped by
+# normalize_skill before lookup.
+SKILL_LIFECYCLE_STAGE = {
+    "/replay": "replay",
+    # The reducer-iteration row's own `why` calls itself "the per-iteration
+    # encode+reflect block", so reflect belongs to it by that row's own words
+    # even though the target string lists only the five aspirations-* phases.
+    "/reflect": "reducer-iteration",
+    # Encodes to FOUR stores (guardrails-add.sh, reasoning-bank-add.sh,
+    # tree-update.sh, meta-set.sh -- measured by grep, not inferred). It is the
+    # heaviest encoder reachable from a goal's skill field.
+    "/review-hypotheses": "reducer-iteration",
+    "/aspirations-verify": "reducer-iteration",
+    "/aspirations-complete-review": "reducer-iteration",
+    "/aspirations-state-update": "reducer-iteration",
+    "/aspirations-evolve": "reducer-iteration",
+    "/aspirations-learning-gate": "reducer-iteration",
+    "/aspirations-consolidate": "consolidate-merge",
+    # Added 2026-08-11 (alpha, hostname cc-08, uname -r 6.8.0-137-generic) by
+    # the route this table documents: a worker met the fail-open, judged it by
+    # hand, and wrote the answer down so the next one does not have to.
+    #  ("drain 15 accumulated temp/ working docs ... + purge 7 stale
+    # ephemera") was offered at rank 2 of 960 carrying starvation_boost 4.00,
+    # skill field EMPTY -- so skill_eligibility returned the "maps to no
+    # lifecycle stage" green and proved nothing. The skill is named only in the
+    # goal DESCRIPTION ("Invoke /drain-temp"), which no bridge reads.
+    # Its own front matter settles it: it "encodes its reusable value into the
+    # right store (knowledge tree / reasoning bank / guardrails / experience)",
+    # i.e. three of the four stores /review-hypotheses is refused for, and it is
+    # invoked from aspirations-precheck -- a phase workers skip outright. The
+    # material it encodes is the Body's OWN accumulated working notes, which is
+    # the unmerged-state half of the Nth-reducer defect rather than the
+    # /tree-style "content supplied in the goal" carve-out below.
+    "/drain-temp": "reducer-iteration",
+}
+
+# THE PINNED NEGATIVES, and they are the load-bearing half of this table
+# (guard-2860: "the test proving the carve-out works cannot fail in the
+# dangerous direction; the load-bearing ones are the exclusions").
+#
+# The tempting rule is "a skill that calls an encoding script is reducer-only".
+# That rule is WRONG and would strand real worker work. Both rows below call
+# encoding scripts or sit near the reducer's vocabulary, and both are legitimate
+# worker work:
+#
+#   /tree                     calls tree-update.sh, and a worker uses it for
+#                             GOAL-DIRECTED artifact creation from content
+#                             supplied in the goal. Measured the same session:
+#                              encoded a principal directive carried
+#                             in full in the goal record. The forbidden thing is
+#                             LOOP-PHASE encoding over the Body's OWN unmerged
+#                             experience -- a different act that happens to share
+#                             a script.
+#   /agent-completion-report  zero encoding calls, user-invocable: true,
+#                             minimum_mode: reader. The reducer-only phase is
+#                             complete-review, whose skill is
+#                             /aspirations-complete-review -- a DIFFERENT skill.
+#                             Refusing this one on name-similarity is the exact
+#                             sloppiness this set exists to prevent.
+#
+# Membership here is asserted DISJOINT from SKILL_LIFECYCLE_STAGE at import, so
+# a future edit cannot quietly add a skill to both and have the refusal silently
+# win. Prose would not have survived that edit; this does.
+SKILL_ELIGIBLE_DESPITE_ENCODING = frozenset({
+    "/tree",
+    "/agent-completion-report",
+})
+
+_SkillEligibilityFields = collections.namedtuple(
+    "_SkillEligibilityFields", "eligible skill stage disposition reason")
+
+
+def normalize_skill(skill: "str | None") -> "str | None":
+    """The bare skill token from a goal's `skill` field, or None.
+
+    Goal records carry the invocation, not the name: "/replay --sharp-wave",
+    "/review-hypotheses --resolve". Lookup is on the first whitespace-delimited
+    token. A leading slash is added when absent so "replay" and "/replay" agree
+    -- goal records have been observed carrying both shapes, and a bridge that
+    matched only one would refuse half the population it was written for.
+    """
+    parts = str(skill or "").split()
+    if not parts:
+        return None
+    token = parts[0]
+    return token if token.startswith("/") else "/" + token
+
+
+def skill_eligibility(skill: "str | None") -> _SkillEligibilityFields:
+    """Whether a WORKER Body may claim a goal carrying `skill`.
+
+    UNKNOWN SKILLS ARE ELIGIBLE, and the fail direction is deliberate. 919 of
+    938 live candidates carry no skill at all (measured cc-08 2026-08-10), so a
+    fail-closed default would refuse a worker essentially everything and strand
+    the role outright. The refusal set is therefore a POSITIVE list whose
+    cardinality is a property of THIS CODE and not of whatever happens to be in
+    the queue (guard-2860's test, applied in its tightening mirror).
+
+    The residual risk that leaves is real and is named rather than papered over:
+    a reducer-only skill nobody added to the bridge reads as eligible. That is
+    exactly the status quo this change improves on -- it is not made worse by
+    the default -- and it is why worker-loop Phase 1 still instructs a human-eyes
+    check rather than treating a green here as proof.
+    """
+    norm = normalize_skill(skill)
+    if norm is None:
+        return _SkillEligibilityFields(
+            True, None, None, None,
+            "no skill named on the goal -- ordinary worker-eligible work")
+    if norm in SKILL_ELIGIBLE_DESPITE_ENCODING:
+        return _SkillEligibilityFields(
+            True, norm, None, None,
+            f"{norm} is a PINNED worker-eligible skill: it touches encoding "
+            f"scripts or reducer-adjacent naming but is goal-directed work, not "
+            f"a reducer lifecycle stage")
+    stage = SKILL_LIFECYCLE_STAGE.get(norm)
+    if stage is None:
+        return _SkillEligibilityFields(
+            True, norm, None, None,
+            f"{norm} maps to no lifecycle stage -- eligible by default (the "
+            f"bridge is a positive list of reducer-only skills; see "
+            f"skill_eligibility.__doc__ for why unknown is not fail-closed)")
+    disp = LIFECYCLE_DISPOSITIONS[stage]
+    if disp.kind == REDUCER_ONLY_BY_DESIGN:
+        return _SkillEligibilityFields(
+            False, norm, stage, disp.kind,
+            f"{norm} IS lifecycle stage {stage!r}, declared "
+            f"{REDUCER_ONLY_BY_DESIGN} ({disp.target}). A worker running it "
+            f"would encode from its own unmerged state -- the Nth-reducer "
+            f"defect. Leave the goal for the reducer and take the next "
+            f"candidate.")
+    return _SkillEligibilityFields(
+        True, norm, stage, disp.kind,
+        f"{norm} IS lifecycle stage {stage!r}, declared {disp.kind} -- "
+        f"worker-eligible")
 
 
 # --------------------------- carrier contract () ---------------------------
@@ -559,7 +760,15 @@ OUTPUT_CLASS_CARRIERS = {
             "reproduced one repo over. Its own ROW rather than folded into "
             "local-git-commit because the two fail in DIFFERENT repositories: pushing "
             "the Mind worker ref carries neither the sibling commit nor any signal that "
-            "one is pending, so a green framework-file-edit check says nothing here."),
+            "one is pending, so a green framework-file-edit check says nothing here.\n"
+            "            Where a deploy hold forbids merging (guard-3139), a DRAFT PR is "
+            "still a COMPLETE carrier — the reducer can see and review it; only the merge "
+            "waits. So a hold is never a reason to leave the commit unpushed, which is the "
+            "failure this row names. (Restored 2026-08-11 by the g-115-2473 evil-merge "
+            "audit: this clause was dropped by merge 46d59e2eb, an undocumented sync merge "
+            "where two Bodies had independently written this same row and git took one "
+            "side cleanly. The ROW survived — only this clause did not, which is why a "
+            "raw at-HEAD token check reads the loss as benign supersession.)"),
 }
 
 
@@ -598,6 +807,76 @@ def unreachable_output_classes() -> "list[str]":
         for name, row in sorted(OUTPUT_CLASS_CARRIERS.items())
         if row.kind == NO_CARRIER
     ]
+
+
+def git_ref_delivery(produced, agent=None, sid=None) -> "tuple[str, str]":
+    """For GIT_REF-carried classes, ask whether the ref ACTUALLY LANDED on origin.
+
+    `stranded_outputs()` below answers "is there a CHANNEL for this class?" by
+    reading the carrier table. That is a question about design, and on
+    2026-08-16 it answered `carried (6 output class(es))` for a commit that
+    never left the box: the merge deferred, iteration-push.sh soft_exit'd
+    before reaching its push block, and the table -- correctly, on its own
+    terms -- still reported a carrier. Phase 3.7's stated purpose is catching
+    exactly the case where an artifact reaches the reducer via nothing, so a
+    table-only answer is not enough for the classes whose carrier is a push
+    that can silently fail (g-115-6368).
+
+    Returns (verdict, detail):
+      "n/a"        no GIT_REF class was named -- nothing to verify
+      "verified"   the remote ref equals local HEAD
+      "stranded"   the remote ref is ABSENT or does not equal HEAD
+      "unverified" the check could not run (identity unresolved, no remote,
+                   git unavailable, network error). Deliberately NOT "verified":
+                   an unrunnable check is ignorance, never an all-clear.
+    """
+    git_classes = sorted(
+        c for c in set(produced)
+        if OUTPUT_CLASS_CARRIERS.get(c) and OUTPUT_CLASS_CARRIERS[c].kind == GIT_REF
+    )
+    if not git_classes:
+        return "n/a", ""
+
+    agent = agent or os.environ.get("MIND_AGENT") or AGENT_NAME
+    sid = sid or os.environ.get("MIND_SID")
+    if not agent or not sid:
+        return "unverified", (
+            f"agent/sid unresolved (MIND_AGENT={agent!r}, MIND_SID={sid!r}) — "
+            "cannot name the ref"
+        )
+
+    wref = f"refs/workers/{agent}/{sid}"
+
+    def _git(*args):
+        return subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), *args],
+            capture_output=True, text=True, timeout=30,
+        )
+
+    try:
+        head = _git("rev-parse", "HEAD")
+        if head.returncode != 0:
+            return "unverified", f"git rev-parse HEAD failed: {head.stderr.strip()[:160]}"
+        head_sha = head.stdout.strip()
+        remote = _git("ls-remote", "origin", wref)
+        if remote.returncode != 0:
+            return "unverified", f"git ls-remote failed: {remote.stderr.strip()[:160]}"
+    except (OSError, subprocess.SubprocessError) as exc:
+        return "unverified", f"{type(exc).__name__}: {exc}"
+
+    line = remote.stdout.strip()
+    if not line:
+        return "stranded", (
+            f"{wref} is ABSENT on origin; local HEAD is {head_sha[:9]}. "
+            f"Affected classes: {', '.join(git_classes)}"
+        )
+    remote_sha = line.split()[0]
+    if remote_sha != head_sha:
+        return "stranded", (
+            f"{wref} points at {remote_sha[:9]} but local HEAD is {head_sha[:9]}. "
+            f"Affected classes: {', '.join(git_classes)}"
+        )
+    return "verified", f"{wref} == HEAD {head_sha[:9]}"
 
 
 def stranded_outputs(produced) -> "list[str]":
@@ -674,6 +953,34 @@ def lifecycle_gaps() -> "list[str]":
         elif stage not in canonical:
             gaps.append(
                 f"phase {phase!r} maps to stage {stage!r}, which is not canonical")
+
+    # The skill bridge () is part of THIS contract, not a separate one:
+    # it is a third key into the same disposition table, so it fails here rather
+    # than behind a command someone has to remember to run.
+    for skill, stage in sorted(SKILL_LIFECYCLE_STAGE.items()):
+        if stage not in canonical:
+            gaps.append(
+                f"skill {skill!r} maps to stage {stage!r}, which is not canonical")
+        elif stage not in declared:
+            gaps.append(
+                f"skill {skill!r} maps to stage {stage!r}, which has no "
+                f"disposition row")
+        if normalize_skill(skill) != skill:
+            gaps.append(
+                f"skill key {skill!r} is not in normalized form "
+                f"({normalize_skill(skill)!r}) -- lookups would never match it")
+    # Disjointness is the pin that makes the negatives survive a future edit.
+    both = sorted(SKILL_ELIGIBLE_DESPITE_ENCODING & set(SKILL_LIFECYCLE_STAGE))
+    for skill in both:
+        gaps.append(
+            f"skill {skill!r} is in BOTH SKILL_LIFECYCLE_STAGE and "
+            f"SKILL_ELIGIBLE_DESPITE_ENCODING -- the refusal would silently win "
+            f"over an explicit worker-eligible pin")
+    for skill in sorted(SKILL_ELIGIBLE_DESPITE_ENCODING):
+        if normalize_skill(skill) != skill:
+            gaps.append(
+                f"pinned-eligible skill {skill!r} is not in normalized form "
+                f"({normalize_skill(skill)!r}) -- the pin would never match")
     return gaps
 
 
@@ -761,6 +1068,33 @@ def _main(argv=None) -> int:
                                 "2 on an unknown class")
     p_chk.add_argument("classes", nargs="+",
                        help=f"one or more of: {', '.join(CANONICAL_OUTPUT_CLASSES)}")
+    p_chk.add_argument("--verify-delivery", action="store_true",
+                       help="for git-ref-carried classes, ALSO check the remote ref "
+                            "actually equals local HEAD (exit 1 if it does not). "
+                            "Run this AFTER iteration-push.sh --push-worker-ref, never "
+                            "before: at Phase 3.7 the push has not happened yet and HEAD "
+                            "is legitimately ahead of the ref, so it would always fire. "
+                            "Without this flag the check reads the carrier TABLE only "
+                            "and says so (g-115-6368).")
+    p_skill = sub.add_parser("skill-eligible",
+                             help="exit 0 (+'eligible') if a WORKER Body may claim a "
+                                  "goal carrying <skill>, exit 1 (+'reducer-only') if "
+                                  "that skill IS a reducer-only lifecycle stage "
+                                  "(worker-loop Phase 1 gate)")
+    # REMAINDER, not "*", and the smoke test is what forced it: the PRODUCTION
+    # arg shape is the goal record's skill field verbatim -- "/replay
+    # --sharp-wave" -- and under nargs="*" argparse claims "--sharp-wave" as an
+    # unknown OPTION and exits 2 on the one input this command exists to judge
+    # (guard-920: replicate the literal production arg shape, not the
+    # contract-ideal one). REMAINDER takes everything after the subcommand
+    # verbatim, so both the quoted single-arg form and the bare multi-token form
+    # work.
+    p_skill.add_argument("skill", nargs=argparse.REMAINDER, default=[],
+                         help="the goal's skill field, args and all "
+                              "(e.g. /replay --sharp-wave); empty means no skill")
+    sub.add_parser("reducer-only-skills",
+                   help="print every skill a worker must not claim, with the "
+                        "lifecycle stage each one IS")
     args = ap.parse_args(argv)
 
     if args.cmd == "phases":
@@ -824,7 +1158,55 @@ def _main(argv=None) -> int:
             print(f"error: {exc.args[0]}", file=sys.stderr)
             return 2
         if not stranded:
-            print(f"carried ({len(set(args.classes))} output class(es))")
+            # The carrier TABLE is satisfied, which answers "is there a channel
+            # for this class" -- a question about DESIGN.
+            #
+            # WHY DELIVERY VERIFICATION IS OPT-IN AND NOT THE DEFAULT (measured,
+            # ): worker-loop calls this at Phase 3.7, which runs BEFORE
+            # Phase 3.8 pushes the carrier. At that moment HEAD is LEGITIMATELY
+            # ahead of the ref on every healthy unit -- the push has not happened
+            # yet -- so a default-on delivery check reports STRANDED always, and
+            # a check that always fires is a check nobody reads. It would also
+            # make this CLI's exit code depend on ambient repo state, which is
+            # the live-state coupling that makes a test unsatisfiable against any
+            # real box.
+            #
+            # So the default STATES what it checked (the table, not delivery) and
+            # --verify-delivery asks the stronger question. Use the flag AFTER
+            # the push, never before it.
+            n = len(set(args.classes))
+            if not getattr(args, "verify_delivery", False):
+                print(f"carried ({n} output class(es)) -- carrier TABLE only")
+                print(
+                    "NOTE: this answers 'is there a channel for this output class', NOT "
+                    "'did the artifact land'. For the git-ref classes, re-run with "
+                    "--verify-delivery AFTER iteration-push.sh --push-worker-ref.",
+                    file=sys.stderr,
+                )
+                return 0
+            verdict, detail = git_ref_delivery(args.classes)
+            if verdict == "stranded":
+                print(f"STRANDED: {detail}")
+                print(
+                    "The carrier table has a channel for these classes, but the ref did "
+                    "NOT land. DO NOT report this work unit complete: run "
+                    "`bash core/scripts/iteration-push.sh --push-worker-ref` and re-check; "
+                    "if it still fails, record the stranding in the goal's outcome_note "
+                    "and leave the goal in-progress.",
+                    file=sys.stderr,
+                )
+                return 1
+            if verdict == "verified":
+                print(f"carried ({n} output class(es); git-ref delivery VERIFIED: {detail})")
+            elif verdict == "unverified":
+                print(f"carried ({n} output class(es)) -- carrier TABLE only")
+                print(
+                    f"NOTE: git-ref delivery NOT verified ({detail}). This answers "
+                    "'is there a channel for this class', not 'did the artifact land'.",
+                    file=sys.stderr,
+                )
+            else:  # "n/a" -- no git-carried class named
+                print(f"carried ({n} output class(es))")
             return 0
         # Deliberately loud and prescriptive: the caller is a worker about to
         # report COMPLETE, and the whole defect was that this moment passed in
@@ -835,6 +1217,20 @@ def _main(argv=None) -> int:
               "the reducer. Record the stranding in the goal's outcome_note and "
               "leave the goal in-progress.", file=sys.stderr)
         return 1
+    if args.cmd == "skill-eligible":
+        verdict = skill_eligibility(" ".join(args.skill))
+        print("eligible" if verdict.eligible else "reducer-only")
+        # The reason goes to stderr so `$(... skill-eligible ...)` captures the
+        # one-word verdict cleanly while a human (or a loop transcript) still
+        # sees WHY. A silent skip is the half of this fix that would rot.
+        print(verdict.reason, file=sys.stderr)
+        return 0 if verdict.eligible else 1
+    if args.cmd == "reducer-only-skills":
+        for skill, stage in sorted(SKILL_LIFECYCLE_STAGE.items()):
+            disp = LIFECYCLE_DISPOSITIONS[stage]
+            if disp.kind == REDUCER_ONLY_BY_DESIGN:
+                print(f"{skill:<32} {stage:<20} {disp.kind}")
+        return 0
     return 2
 
 

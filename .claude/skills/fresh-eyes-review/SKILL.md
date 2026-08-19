@@ -74,11 +74,119 @@ re-reading.
 # Rule 1a REQUIRES a series with >=3 points — a single reading cannot distinguish
 # "under the floor and correcting" from "under the floor and stuck", and those
 # call for opposite responses.
-Bash: bash core/scripts/tree-read.sh --node directive-lane-compliance
-  → capture: this agent's prior series points, ALL Decision Rules, and the
-    measurement recipe (which is load-bearing — see 2.2b SOURCE below)
-  → carry these into Phase 3. Append this pass's point to the node's series
-    table at Phase 5.6 rather than leaving it only in the temp/ briefing.
+# ⚠ `tree-read.sh --node` RETURNS METADATA ONLY — summary, child_count,
+# retrieval_count, poignancy. NO BODY, at any depth. Running it and reading its
+# output IS NOT reading the series: this step is satisfiable exactly as written
+# while leaving you with no prior series at all. That is `guard-3312`, and it has
+# now caught FOUR consecutive passes (N=57, N=62, N=64, N=65) — including two that
+# followed the instruction. A guardrail cannot outvote the instrument it guards
+# (guard-1984), so the paths are named HERE.
+#
+# Read the FILES, in this order. `world/` is external and bare Bash path args are
+# NOT hook-rewritten (path-resolution.md), so $WORLD_PATH must be resolved — and
+# resolved INSIDE EACH INVOCATION. Shell state does NOT persist between Bash
+# calls: a `source _paths.sh` standing on its own line leaves $WORLD_PATH EMPTY in
+# the next one, so (a) degrades to `sed /knowledge/tree/...` → "No such file or
+# directory" and delivers nothing — the same empty-handed outcome as the
+# metadata-only defect above, just louder. That split shape shipped HERE on
+# 2026-08-11 (in the very edit that fixed the metadata-only half) and was measured
+# broken the same day; /fresh-eyes-tree's Phase 2.0 carries the correct
+# self-contained form. It can also read rc=0 when piped (guard-1150) — judge by
+# the OUTPUT, never the exit status.
+  # (a) YOUR OWN SERIES ROW — two levels down, and the ONLY place the readings live.
+  #     ⚠ THE SHARDS HAVE DIVERGED — THERE IS NO FLEET-WIDE "TOP" OR "TAIL". This
+  #     line read "Read its TOP entry" until 2026-08-12, and guard-3312's action_hint
+  #     still asserted the shards are "newest-FIRST". Measured that day (bravo, cc-05,
+  #     all five shards): alpha IS newest-first (N=66 at line 129, archived rows at
+  #     1031) — so the old instruction was right for the agent who wrote it — while
+  #     bravo (N=18..N=41) and foxtrot (N=38..N=42) are OLDEST-first with the newest
+  #     point at the TAIL, and echo/zeta are index/rollup splits in a third shape
+  #     entirely. So `sed '1,140p'` returns alpha's NEWEST row and bravo's OLDEST
+  #     rows, silently, and both look like a series. Note the bravo-specific
+  #     "read the TAIL" correction recorded at N=40 is the same mistake mirrored —
+  #     do not adopt it fleet-wide either.
+  #     DERIVE N AS THE MAX OVER SECTION HEADINGS — order-independent, so it is
+  #     correct under every layout above. Exclude forward-reference headings
+  #     ("Handoff to N=k"): those name an entry that does not exist yet (guard-2653).
+  #     ⚠ THE EXCLUSION MUST BE CASE-INSENSITIVE (`-vi`), and it was `-v` until
+  #     2026-08-16. Fleet agents write the pre-registration heading in more than one
+  #     casing: bravo writes `### HANDOFF to N=k` in caps, which the case-SENSITIVE
+  #     `Handoff to N=` filter does not match, so the forward reference leaks into the
+  #     MAX and the probe returns the NEXT pass's number. Measured that day on bravo's
+  #     shard, same file, same run, only the flag differing: `-v` -> 57, `-vi` -> 56,
+  #     against a true newest entry of `## N=56`. The failure is silent and off-by-one
+  #     in the direction that makes the briefing overwrite its own successor's slot.
+  #     Note this is the SAME case lesson Phase 2.3b's (a-pre) block measured at length
+  #     one screen below ("MATCH THESE CASE-INSENSITIVELY... 287 lowercase vs 40
+  #     capital") — learned there, never propagated to this sibling filter in the same
+  #     file. When you fix a casing assumption in one filter, grep the file for the
+  #     others (guard-2653 is about WHAT to exclude; this is about the MATCH surviving
+  #     how five different agents actually type it).
+  #     ⚠ THE PROBE TAKES THE MAX OVER **THREE** SHAPES — headings, `| **N=`-leading
+  #     rows, and the FIRST `N=` token of any other table row.
+  #     Heading-only was wrong for echo by THREE on 2026-08-17 (returned 15 against a
+  #     true 71) because echo writes rows as TABLE ROWS (`| **N=68** …`), which no
+  #     heading grep can see at any casing. Do NOT "simplify" this to a single union
+  #     regex: the obvious form `^(#{1,4} |\| \*\*)N=[0-9]+` requires N= IMMEDIATELY
+  #     after the prefix and so returns EMPTY for alpha and zeta, whose headings carry
+  #     other text first. Measured that day across all five shards, both forms — the
+  #     union regressed 2 of 5 to nothing while the max-of-both regressed none.
+  #     ⚠ THE THIRD BRANCH TAKES THE **FIRST** `N=` PER ROW, NOT THE MAX WITHIN IT,
+  #     AND THAT DISTINCTION IS THE WHOLE BRANCH. A row's own index appears FIRST (in
+  #     its date cell or at the head of its verdict cell); any other `N=` later in the
+  #     same row is prose referring to a DIFFERENT point — including a FORWARD one.
+  #     Measured 2026-08-18 (zeta, `hostname` cc-02, `uname -r` 6.8.0-137-generic):
+  #     a max-within-row variant read echo as **74** when echo's newest row is **73**,
+  #     because echo's own N=73 row names N=74 in its body. guard-2653's `handoff to
+  #     N=` filter does not catch that phrasing and cannot be widened to (the forms
+  #     are unbounded prose) — position is the reliable discriminator, not wording.
+  Bash: source core/scripts/_paths.sh && S="$WORLD_PATH/knowledge/tree/system/directive-lane-compliance/directive-lane-series-$MIND_AGENT.md"; { grep -E '^#{1,4} ' "$S" | grep -viE 'handoff to N=' | grep -oE 'N=[0-9]+'; grep -oE '^\| \*\*N=[0-9]+' "$S"; grep -viE 'handoff to N=' "$S" | awk '/^\|/ { if (match($0, /N=[0-9]+/)) print substr($0, RSTART, RLENGTH) }'; } | grep -oE '[0-9]+' | sort -n | tail -1
+  #     VERIFIED against ground truth 2026-08-18 (zeta, cc-02, 6.8.0-137-generic), all
+  #     five shards, old two-branch vs new three-branch, same run:
+  #       alpha 83→83 · bravo 61→61 · echo 73→73 · foxtrot 57→57 · **zeta 34→79**
+  #     Zero regressions, zero over-matches, and zeta corrected by **45**.
+  #     ⛔ THE PRIOR NOTE HERE WAS WRONG ABOUT WHY, AND THE WRONG REASON IS WHAT MADE
+  #     IT UNFIXABLE. It read "zeta has 0 table rows, so its shape is a third one
+  #     neither branch reads" and left the probe alone. zeta has **111** table rows.
+  #     Its index is an INLINE token inside a cell — `| 2026-08-17 21:01 | … | **N=79
+  #     — THE N=77 RECOVERY…** |`, and in older rows `… ** N=74, fresh-eyes, …` — so
+  #     the cell does not START with `N=`, which is the only thing branch 2 can see.
+  #     "No rows" pointed at a missing shape (nothing to do); "rows whose N= is not at
+  #     the cell head" points at a missing MATCH (one awk). A correct diagnosis was
+  #     available from `grep -cE '^\|'`, one command, and the note stood for a day.
+  #     The 34 it returned is a stray prose token, which is why it reads as plausible
+  #     rather than as an error — a wrong-but-well-formed N is the dangerous shape.
+  #     Whatever this probe returns, guard-2421 still applies: positive-control it
+  #     against a shard whose N you have confirmed from the rows before trusting it.
+  #     ⚠ AND WHEN YOU DO, THE SHARD-INDEX TABLE IS NOT THAT ANCHOR. It is a
+  #     hand-maintained prose cell with no writer and no check. echo's read
+  #     `| *(this node)* | 68– | (empty — next row lands here) |` for three consecutive
+  #     fires while N=68/69/70 sat in the tail directly below it — so the fallback this
+  #     line used to prescribe is precisely what produced the off-by-three. The
+  #     trustworthy anchor is the ROWS THEMSELVES (the second half of the probe above,
+  #     or a targeted `grep -n 'N=' | tail`). A wrong index is embarrassing; the real
+  #     cost is the wrong PRIOR POINT it carries into Rule 11 — a wrong drift score and
+  #     therefore a wrong verdict. Then read the section around that heading/row.
+  # (b) The parent's Decision Rules + measurement recipe (load-bearing — see 2.2b
+  #     SOURCE below). The parent is over the Read cap, so grep its headers and
+  #     sed the ranges you need; do NOT Read it whole.
+  Bash: source core/scripts/_paths.sh && grep -n '^#\{2,4\} ' "$WORLD_PATH/knowledge/tree/system/directive-lane-compliance.md"
+  # (c) OPTIONAL index only: tree-read.sh --node directive-lane-compliance. Useful
+  #     for child_count / confidence. Never a substitute for (a).
+  → **N COMES FROM (a)'s MAX SECTION HEADING, NEVER FROM THE CADENCE GOAL COUNT.**
+    (Said "TOP HEADING" until 2026-08-12 — correct only for a newest-first shard;
+    see the divergence measurement in (a) above.) The
+    cadence diff (`current - last`, typically ~25-30) is NOT the series index and
+    the two are never close. Both N=57 and N=65 drafted entire briefings numbered
+    with the diff (32 and 27, against true 57 and 65).
+  → **RE-DERIVE THE PRIOR POINT'S Phase 5.5 INPUTS from (a) before scoring your
+    own** (Decision Rule 11). This is the half that bites hardest: at N=65 the
+    prior fire had scored drift 0.45 → `act_later`, and this pass — four hours
+    later on the same box, after EVERY measured window had fallen — first scored
+    drift 0.35 → `no_change`. A wrong INDEX is embarrassing; a wrong VERDICT is
+    the actual cost, and only the prior point's numbers expose it.
+  → carry these into Phase 3. Append this pass's point to the series table in
+    (a) at Phase 5.6 rather than leaving it only in the temp/ briefing.
 
 # WHY 2.0 EXISTS AND WHY IT IS FIRST. Both sibling rituals learned this the hard
 # way and wrote it into their own Phase 2.0 (fresh-eyes-program reads
@@ -100,7 +208,30 @@ Bash: load-aspirations-compact.sh
 IF path returned: Read it
 Extract for each active aspiration:
   - id, title, priority
-  - goals: (completed / total), top 3 goal titles with status
+  - goals: (completed / total) — READ `progress.completed_goals` /
+    `progress.total_goals`, the aspiration-level field already in this file.
+    **Do NOT count `status == "completed"` in the record's `goals` array.** That
+    array holds ONLY NON-TERMINAL goals: measured 2026-08-11 (alpha, `hostname`
+    cc-04, `uname -r` 6.8.0-136-generic) its status histogram is
+    `{pending, skipped, in-progress, blocked, decomposed}` — the `completed`
+    bucket is absent ENTIRELY, across all 22 active aspirations. So the count is
+    a structural ZERO for every aspiration, every lane, every fire, and the
+    `completion_health` derived from it is **0.0000** — maximally unhealthy,
+    which is the direction that forces act_now/act_later. Positive control, same
+    file, same run: asp-335 reads **0/122** from the goals array and **989/1106**
+    from `progress`, against 989 completed of 1111 in the full store. Same defect
+    class as 2.2b/2.3/2.4 below (a step reading a field its store does not
+    carry), one phase earlier — and, like those, it fails as a plausible SIGNAL
+    rather than as an error.
+    `guard-3410` already carried this rule and did not prevent it: it was created
+    **2h53m before this fire** (foxtrot, g-335-804, 10:21) with
+    `retrieval_count: 0`, and the next agent to run the ritual reproduced the
+    defect anyway — a guardrail cannot outvote the instrument it guards
+    (`guard-1984`), which is why this correction is written HERE and not left in
+    the guardrail. Note its `action_hint` routes you to a SECOND store
+    (`precheck-eval.sh` or `aspirations-read.sh --source world`); `progress` is
+    cheaper, needs no extra read, and reconciles exactly on `completed_goals`.
+  - top 3 goal titles with status
 
 # 2.2b STANDING USER DIRECTIVE — read BEFORE assessing alignment (g-115-3136)
 # The Phase 3 "are we working on the right problems" verdict is an assessment
@@ -141,14 +272,27 @@ Bash: team-state-read.sh --field strategic_focus --json
   → SOURCE: measure against the FULL store —
     `aspirations-read.sh --source world --active` (and `--source agent`) — NOT
     the `aspirations-compact.json` that Phase 2.2 above tells you to load. The
-    compact is a 9-field projection (category, discovered_by, filed_by_agent,
-    id, participants, priority, status, title, work_class) carrying NONE of
-    `completed_date` / `completed_by` / `recurring` / `lastAchievedAt`. Every
-    field this measurement needs is absent, so the count is structurally ZERO
-    for any agent, any lane, any window — while the aspiration-level completion
+    compact omits `completed_date` and `completed_by` entirely, so the count is
+    structurally ZERO for any agent, any lane, any window — while the
+    aspiration-level completion
     ratios Phase 2.2 wants from the same file are perfectly correct, which is
     what makes the file look like the right source. (bravo 2026-07-29: returned
     0 closes in a session where the reviewer had personally closed ten goals.)
+  → THE REASON IS STRONGER THAN A MISSING FIELD, and the earlier wording here
+    got it wrong in a way that invites the wrong fix (corrected g-115-3622,
+    alpha, cc-07, 2026-08-11 — measured on a live 544-goal compact). Two
+    corrections. FIRST: the compact DOES carry `recurring` (83 goals),
+    `lastAchievedAt` (76) and `achievedCount` (76) — this block used to list all
+    four fields as absent, which is false for three of them, and it is precisely
+    WHY the recurring half of the measurement above works while the one-off half
+    does not. SECOND, and the load-bearing part: the compact holds **ZERO
+    completed goals at all**. A completed one-off goal is not a record missing a
+    date field — it is ABSENT from the projection entirely, because the compact
+    carries non-terminal goals. Recurring goals stay countable only because a
+    recurring goal returns to `pending` and never leaves.
+    So do NOT "fix" this by adding `completed_date` to the compact: no field
+    addition can count records the projection does not contain. Reading the FULL
+    store is the only remedy, which is what this SOURCE line already prescribes.
   → AND the one-live-record probe above must sample a record the predicate will
     ACTUALLY COUNT. Goal records are heterogeneous — a `field in record`
     membership test swept across the whole corpus can pass on a differently
@@ -156,6 +300,29 @@ Bash: team-state-read.sh --field strategic_focus --json
     and clearing the rb-245 check while the zero stands. Probe a record that
     matches the predicate's own filter (same source, same status, same
     recurring-ness), or the probe is a second way to be wrong. (sig-54.)
+  → RULE 16 SUBSTITUTION POPULATION (g-115-4865): when the parent's Decision
+    Rule 16 (guard-2424) substitution measurement runs — scoring what REPLACED
+    a drained or fallen lane against Self's PRIMARY mandate — compute it
+    through `world/scripts/directive-lane-share.py` and report BOTH splits it
+    prints: the aspiration-id split AND the work_class split (the "by
+    work_class" table). **The BARE call prints both — `--lane` and
+    `--work-class` do NOT select a split.** They are value-taking
+    CONFIGURATION flags (`--lane <comma-ids>`, `--work-class <kind>`, default
+    `product`); a bare `--lane` exits 2 with "expected one argument". This
+    line named them in backticks beside each split until 2026-08-15, which
+    reads as the invocation for that split and cost N=53 a turn — the same
+    correct-comment-beside-a-copyable-wrong-line shape `/felt-sense-checkin`
+    Phase 8 fixed in its own `journal-add.sh` call line on 2026-08-11. An
+    aspiration id is a FILING LOCATION, not a work kind: measured at alpha
+    N=33 (48h window, n=38 one-off batch-filtered), the on-mandate share read
+    7.9% by aspiration id and 36.8% by work_class — a 28.9pp gap, one-signed
+    toward INDICTING the agent, because server/backend product work filed
+    under asp-115 is invisible as product work to the aspiration-id split
+    (checked by title, not inferred: 9 of the 11 asp-115 product-classified
+    closes were exactly the Self-mandate lane). STATE EXPLICITLY which
+    population the verdict is scored over; a verdict that names no population
+    inherits the condemning default, and the series shards are scored by
+    aspiration id up to alpha N=71 (see the shard head note).
   → IF null/absent: no standing directive; the internal gate is the standard.
     Say so explicitly rather than silently omitting the check.
 
@@ -247,7 +414,43 @@ Bash: board-read.sh --channel findings --since 30d --unread-only --json
            receipts, not signals.
            **MATCH THESE CASE-INSENSITIVELY, AND MATCH THE `-review`/`-code`/
            `-tree`/`-program` SUFFIXED FORMS TOO — the literals above are written
-           in one casing and the fleet writes at least thirteen.** Measured
+           in one casing and the fleet writes at least thirteen.**
+           **THE SUFFIX IS OPTIONAL — ANCHOR ON THE OPENING TOKEN, NOT ON A
+           SUFFIXED FORM.** Copyable predicate, IGNORECASE, matched against the
+           START of `text`:
+           `^\s*(?:⚠\s*)?(?:fresh[- ]eyes\b|sq-012\s+tentative\b|n=\d+\b|correction\b[^\n]{0,80}?(?:fresh[- ]eyes|n=\d+))`.
+           **The `correction…` alternative and the leading `⚠` are LOAD-BEARING —
+           a CORRECTION to a ritual post is a second receipt for the same fire.**
+           The shapes above all describe a ritual post's OPENING token, so a
+           correction that opens "CORRECTION to my own Fresh-eyes N=57 post …"
+           matches none of them and survives as a signal — the ritual then reads
+           its own erratum as external change-pressure, one extra count per
+           corrected fire. This is the echo-N=19 finding measured verbatim ("one
+           sq-012 self-signal counted twice because its own 10-minute correction
+           is a separate post"), which was recorded there and never encoded in
+           the predicate. Measured 2026-08-16 (bravo N=58, `hostname` cc-05,
+           `uname -r` 6.8.0-137-generic) over all 97 self_evolution/self-drift
+           findings unread in 30d: survivors 19 → 17, dropping exactly two, BOTH
+           ritual corrections — `msg-20260816-165514-bravo-5085` (mine) and
+           `msg-20260729-170301-foxtrot-5015` (foxtrot's N=7 correction, 18 days
+           earlier), so this is fleet-wide and long-standing, not one agent's
+           quirk. Negative control, same run: a substantive non-ritual correction
+           ("CORRECTION: the env-server retry budget is 3, not 5") still
+           SURVIVES, which is what keeps this a receipt filter rather than a
+           correction filter — the `[^\n]{0,80}?` leash is what requires the
+           opening clause to NAME the ritual. Widening measured over the full
+           live population before adoption, never against the motivating example
+           (guard-2499).
+           The sentence directly above says "match the SUFFIXED forms too", which
+           invites building the suffix INTO the pattern; do not. Measured
+           2026-08-12 (echo, N=54, cc-03 / Linux 6.8.0-137-generic) on the same
+           corpus, same run, only the pattern differing: a regex requiring the
+           suffix (`fresh[- ]eyes[- ](review|code|tree|program)`) dropped **16 of
+           82**, where the anchored form dropped **70 of 82 (85.4%)** — survivors
+           66 vs 12, again in the false-`act_later` direction. The bare
+           `Fresh-eyes <n>-><n>` and `Fresh-eyes N=<k>` shapes named at the top of
+           this block carry no suffix at all, so a suffix-requiring pattern misses
+           the majority of the receipts the block exists to catch. Measured
            2026-08-01 (alpha, N=21, cc-04, over every self_evolution/self-drift
            finding in the 30d window): opening tokens split **287 lowercase vs 40
            capital** — `fresh-eyes-code` ×267, `FRESH-EYES-CODE` ×40, `Fresh-eyes`
@@ -613,6 +816,97 @@ this helper those boundaries are `drift` flips at **0.40** with
 guardrail cannot outvote the instrument it guards (guard-1984) — the same reason
 the `completion_health` exclusion two screens up is written inline.
 
+**COMPUTE `P = len(pq_signals) + len(board_signals)` BEFORE YOU READ THE BELIEFS,
+AND SAY WHAT IT WAS. When `P >= 2` the belief classification cannot change the
+verdict** (guard-3390, measured 2026-08-11, zeta N=57, cc-02 / Linux
+6.8.0-136-generic). The `confirming_signal_fraction` spec above declares
+`pq_signals + board_signals` **never confirming**, so the confirming count can
+never exceed the belief count `B`. With `N = P + B`, that makes
+
+> `net_divergent = N − confirming_count >= N − B = P`, for **every** possible
+> classification of **every** belief.
+
+The helper fires `act_later` at `net >= 2.0`. So `P >= 3` forces `act_later`
+before a single belief is read, and `P <= 1` is the only regime where Phase 2.6b
+decides anything (and then only while `drift < 0.40`, which is independently
+sufficient). Verified across the full `(P, B)` grid at max-honest
+`confirming = B/N` with drift neutralized: `P=0,1` → `no_change` at every `B`;
+`P=2,3` → `act_later`, with one boundary cell (below). This **supersedes** the
+single-instance form N=56 recorded ("`no_change` was unreachable this fire").
+
+⚠ **`P == 2` is a knife-edge: `net` is then EXACTLY 2.0, so the verdict is
+decided by the decimal precision you type.** Measured at `P=2, B=4, N=6`, the
+same true quotient 4/6: `0.6666` → `act_later`; `0.6667` → `no_change`;
+`0.666667` → `no_change`; `0.6666666666666666` → `act_later`. **The rationale
+string prints `net=2.0 @67%conf` in all four cases** — byte-identical across a
+verdict flip, so a reader auditing the decision from its own stated rationale
+cannot see which way it went, or that precision decided it. The spec gives the
+quotient and never the precision; at `P == 2` that unstated choice *is* the
+verdict. Pass it at full float precision, or declare the boundary explicitly.
+
+⚠ **The printed `net` is ROUNDED, so `net=2.0` in a rationale does NOT mean the
+`>= 2.0` threshold was met — at ANY `N`, not only at `P == 2`.** Measured 2026-08-12
+(echo, N=54, cc-03 / Linux 6.8.0-137-generic) at `P=0, B=4, N=4`, drift neutralized
+to 0.05: `confirming=0.50` → `act_later`; `confirming=0.51` → **`no_change` with the
+rationale reading `net=2.0@51%conf`**. True net is 4·0.49 = 1.96, displayed as 2.0.
+So a reader auditing a decision from its own stated rationale can see the firing
+threshold printed on a run that did not fire. The knife-edge paragraph above frames
+this as a `P == 2` property; it is a property of the DISPLAY, and `P == 2` is only
+where it also happens to decide the verdict. Recompute `N·(1−confirming)` yourself
+before believing any `net` you read — including one this helper printed.
+REPLICATED on a second box 2026-08-12 (bravo, N=43, cc-05 / Linux 6.8.0-137-generic):
+same `P=0, B=4, N=4`, same 0.50 → `act_later` / 0.51 → `no_change` pair, byte-identical
+`net=2.0@51%conf`. Same parameters, not a second parameter point — it rules out a
+one-box parse artifact and says nothing about other `N`. **The band is SYMMETRIC —
+measured, same run:** `net=2.0` is printed across true_net ∈ **[1.95, 2.05]**, i.e. for
+`confirming` 0.4875→`act_later` through 0.5125→`no_change`. So the printed `net` spans
+BOTH verdicts and cannot discriminate at all. The confirming % is rounded too (0.4875
+prints `49%`, 0.505 prints `50%`), so `confirming=0.50` (fires) and `confirming=0.505`
+(does not) emit **byte-identical numbers** — `net=2.0`, `50%conf` — for opposite
+decisions. The `decision` field still tells you WHAT was decided; what the rationale
+cannot tell you is that the margin was ±0.05 rather than exact. Never quote a printed
+`net` as the margin.
+
+That same run confirms the boundary FORM two paragraphs down: at `N = 4` the flip is
+at `confirming > 0.50` (4·0.50 = 2.0 fires, 4·0.49 = 1.96 does not), which is
+`N·(1−confirming) < 2.0` and neither 0.75 nor 5/7. Quote the inequality, never a
+fraction. `drift` re-verified at 0.40 the same run (0.39 → `no_change`, 0.40 →
+`act_later`) with `confirming` held at 1.00.
+
+Sharpening line 611 while here: `confirming` flips at **`> 5/7 = 0.7143`** when
+`N = 7` (0.714 → `act_later`, 0.72 → `no_change`), not at 0.75 — the boundary is
+`N·(1−confirming) < 2.0`, which depends on `N`, so quote it as that inequality
+rather than as a fixed fraction. `drift` flips at 0.40 as recorded (0.39 →
+`no_change`, 0.40 → `act_later`).
+
+⚠ **THERE IS A THIRD SUFFICIENT AXIS, AND EVERY PARAGRAPH ABOVE NAMES ONLY TWO.
+`signal_actionable_score >= 0.40` fires `act_later` ON ITS OWN**, boundary in
+(0.35, 0.40]. Measured 2026-08-12 (alpha, N=69, `hostname` cc-04, `uname -r`
+6.8.0-137-generic) with `drift` neutralized to 0.05 and `confirming` held at 1.00:
+0.20 / 0.30 / **0.35 → `no_change`**, **0.40** / 0.49 / 0.50 / 0.55 →
+`act_later`, the rationale reading `weak-but-present signal: actionable=<v>` with
+no other axis named. It went unrecorded for 69 fires because this field is scored
+by hand from "how clearly do the signals map to a specific Self edit", and a
+review that finds diffuse signal scores it ~0.20 — so it had never crossed.
+
+**It also MASKS the drift boundary the paragraph above tells you to verify.** At
+`actionable = 0.55` the documented 0.39/0.40 drift sweep returns `act_later` at
+BOTH points, so a reader running that control on a high-actionable pass sees a
+constant sweep and books it as robustness — the exact vacuity guard-3295 exists to
+prevent, reached through an axis guard-3295 does not name. So when neutralizing
+for ANY sweep, neutralize `signal_actionable_score` to <= 0.35 as well, not just
+`drift` and `confirming`. Three axes, not two.
+
+This is a **recipe** constraint, not a helper bug — the helper accepts
+`confirming = 1.00` happily; the never-confirming rule two screens up is what
+makes `net >= P` unavoidable, so that is where a fix would go. Keep reading the
+beliefs to full length when you will ACT on their content (guard-1421/2043 still
+bind) — just do not report the classification as having determined a verdict it
+could not reach. With a 5-agent fleet `B` is capped near 4 (one belief per
+partner, supersede-not-grow) while `P >= 2` is the ordinary case, since board
+counts own-authored ritual output (line 91) and pq counts any own-scope decision
+in 30d. The step is usually inert, not usually decisive.
+
 Branch on decision:
 
 - **`act_now`** — apply the Self edit inline via the existing autonomous
@@ -676,6 +970,31 @@ cost forever; under-encoding loses one signal once):
 - **guardrails** — a prescriptive rule with a trigger condition.
   `guardrails-add.sh` with rule + trigger_condition.
 - **drop** — already captured, too thin, or a one-cycle anomaly.
+
+**CITE ONLY A RECEIPT YOU CAPTURED (g-115-4405).** If an observation encoded here
+needs a board pointer, post FIRST and cite the id `board-post.sh` printed on
+stdout — never one recalled from context. Note this skill's own Phase 8 post is
+its LAST tool call, so it cannot be the source of an id cited here; if you have
+no captured receipt, cite the goal id or the tree node instead. Both resolve.
+
+**VERIFY A BOARD ID ACROSS ALL CHANNELS — this is the actual lesson, and it cost
+a goal to learn.** g-115-4405 was filed claiming this step invented
+`msg-20260801-042738-alpha-611`, "verified 3 ways" as existing on no channel. It
+exists: `reasoning.jsonl`, authored by alpha at the exact claimed timestamp. All
+three verifications had searched `findings` and `coordination` only, against a
+board that carries EIGHT channels. The suffix cited as proof of fabrication
+("-611, off-pattern against findings -55xx") is the reasoning-channel counter —
+the strongest stated evidence for the accusation was confirmation of
+authenticity. A channel-incomplete probe does not return "unknown"; it returns a
+confident, specific, wrong "this never existed."
+
+So before concluding any `msg-…` is fabricated, sweep with
+`py -3 core/scripts/board-citation-check.py` (add `--exit-on-hits` for gate use).
+It resolves citations in live surfaces against ALL channels — which is the whole
+point of it — and classifies non-resolving ones as `dangling` or as a schema
+`example`. A citation to a PEER deployment's post will not resolve here and is
+EXPECTED (`core/config/conventions/cross-deployment-channel.md`). Dangling
+citations are real (30 measured 2026-08-10); this one was not.
 
 The encoding writes are self-evidencing (the new/edited tree, reasoning-bank,
 and guardrail records); no separate log line is required. Do NOT add a

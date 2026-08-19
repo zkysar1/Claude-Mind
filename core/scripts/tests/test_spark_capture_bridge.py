@@ -330,3 +330,81 @@ def test_array_limit_is_configured():
     assert isinstance(limits.get(SLOT), int) and limits[SLOT] > 0, (
         "spark_capture has no array_limits entry -- an unconsumed slot survives "
         "every reset and grows without bound (g-306-176)")
+
+
+# ---------------------------------------------------------------------------
+#  -- the CONSUME case. The CRASH case (reducer still holds the items)
+# dedups correctly and is what every prior test exercised; that is exactly why
+# four closed drain trackers never found this. These two pin the other case.
+# ---------------------------------------------------------------------------
+
+def test_dedup_append_consume_case_does_not_re_acquire():
+    """A CLEARED reducer slot must not re-acquire a batch the Body still holds.
+
+    Source Bodies retain their flagged entries indefinitely, so every close
+    re-offers the full set (guard-4154). Before the consumed-watermark, dedup
+    keyed ONLY on the reducer's live slot -- so the consumer's mandated clear
+    emptied the dedup basis and the next merge re-appended everything. The clear
+    was the thing that caused the re-delivery.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "bmg_t", Path(__file__).resolve().parents[1] / "body-merge.py")
+    bmg = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bmg)
+
+    batch = [_entry("g-306-311", "observation one"),
+             _entry("g-306-311", "observation two")]
+
+    # CRASH case (regression guard): reducer still holds them -> no duplication.
+    assert len(bmg._dedup_append(batch, batch)) == 2, (
+        "the CRASH case regressed -- live-slot dedup must still suppress")
+
+    # CONSUME case: reducer slot cleared, Body re-offers the same batch.
+    assert len(bmg._dedup_append([], batch)) == 2, (
+        "precondition: with an EMPTY basis and no watermark the batch re-lands "
+        "-- this is the bug, and it must still reproduce without extra_seen")
+
+    watermark = [bmg._content_hash(e) for e in batch]
+    assert bmg._dedup_append([], batch, extra_seen=watermark) == [], (
+        "CONSUME case: a cleared slot re-acquired an already-merged batch even "
+        "with the consumed-watermark supplied (g-306-311)")
+
+    # A genuinely NEW entry must still get through -- a watermark that suppresses
+    # everything is not a fix, it is a different outage.
+    fresh = _entry("g-306-311", "observation three")
+    got = bmg._dedup_append([], batch + [fresh], extra_seen=watermark)
+    assert got == [fresh], (
+        "the watermark suppressed a NEW entry -- dedup must be exact, not a "
+        "blanket mute")
+
+
+def test_reset_preserves_consumed_watermark():
+    """The watermark exists BECAUSE consumption destroys the live dedup basis.
+
+    A watermark wiped by wm-reset therefore restores the original bug while
+    looking fixed -- the second cleanup predicate guard-2552 names, and the one
+    wm.py:313-316 warns a new lane must join 'or it inherits this same silence'.
+    """
+    payload = {"spark_capture": ["deadbeef", "cafebabe"]}
+    original = os.environ.get("BODY_WM_PATH")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        os.environ["BODY_WM_PATH"] = str(Path(tmpdir) / "working-memory.yaml")
+        try:
+            wm.cmd_init(SimpleNamespace())
+            data = wm.read_wm()
+            data["slots"]["capture_consumed_hashes"] = payload
+            wm.write_wm(data)
+
+            wm.cmd_reset(SimpleNamespace())
+
+            after = wm.read_wm()
+            assert after["slots"].get("capture_consumed_hashes") == payload, (
+                "wm-reset wiped capture_consumed_hashes -- the consumed "
+                "watermark must survive the reset or the next merge re-delivers "
+                "every already-consumed entry (g-306-311, guard-2552)")
+        finally:
+            if original is None:
+                os.environ.pop("BODY_WM_PATH", None)
+            else:
+                os.environ["BODY_WM_PATH"] = original

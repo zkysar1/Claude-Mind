@@ -164,18 +164,47 @@ def test_discovered_by_alone_yields_no_target():
 
 # ---- Case 7: idempotency ---------------------------------------------------
 
+SWEEP_NOTE = ("routing-audit target resolved without action needed "
+              "(target_id=g-115-1328, target.status=completed)")
+
+
 def test_is_already_swept_true():
+    """Swept means note AND terminal status. The `status` key was added in
+    g-115-5097 — without it this fixture asserted that the note ALONE proves a
+    completed sweep, which is the defect (see the partial-write test below)."""
     mod = _import_sweep()
-    g = {"outcome_note": "routing-audit target resolved without action needed "
-                         "(target_id=g-115-1328, target.status=completed)"}
+    g = {"outcome_note": SWEEP_NOTE, "status": "skipped"}
     assert mod._is_already_swept(g) is True
 
 
 def test_is_already_swept_false():
     mod = _import_sweep()
-    g = {"outcome_note": "some other note"}
+    g = {"outcome_note": "some other note", "status": "pending"}
     assert mod._is_already_swept(g) is False
     assert mod._is_already_swept({}) is False
+
+
+def test_partial_write_is_not_already_swept():
+    """. POSITIVE CONTROL: RED against the pre-fix guard.
+
+    _mark_skipped writes note then status as two non-atomic daemon calls, so
+    note-without-terminal-status is exactly the state a failed second write
+    leaves behind. Keying dedup on the note alone made that state permanently
+    self-sealing — the sweep skipped it forever and reported it as already-swept
+    rather than as a failure.
+
+    Live instance this repairs with no migration: g-115-4016, deliberately left
+    broken by g-115-5097's author as the verification specimen.
+    """
+    mod = _import_sweep()
+    for stranded_status in ("pending", "in-progress"):
+        g = {"outcome_note": SWEEP_NOTE, "status": stranded_status}
+        assert mod._is_already_swept(g) is False, (
+            f"note-bearing goal with status={stranded_status!r} must re-qualify "
+            f"for retry, not be treated as swept (g-115-5097)")
+    for terminal in sorted(mod.TERMINAL_STATES):
+        g = {"outcome_note": SWEEP_NOTE, "status": terminal}
+        assert mod._is_already_swept(g) is True, terminal
 
 
 # ---- Case 8: terminal-state set -------------------------------------------

@@ -150,17 +150,64 @@ def _add(val, ctx_start, ctx_end):
 
 # Pattern A: multiplier like "1.8x", "2x", "0.5X". Trailing boundary
 # enforced by lookahead to avoid eating into the next token.
-for m in re.finditer(r"\b(\d+(?:\.\d+)?[xX])\b", text):
+#
+# The leading (?<![:\d.]) is LOAD-BEARING, not defensive padding. `\b` alone
+# treats the ":" in a clock time as a word boundary, so the fleet-wide
+# time-FUZZING convention -- writing "16:3x-16:4x" instead of a precise
+# minute -- reads as two multipliers, "3x" and "4x". The gate then reports
+# `distinct_count: 2` and arms force_metric_encoding_pending, sending the next
+# iteration to encode a redacted timestamp into the tree as a Verified Value.
+# Measured 2026-08-14 (bravo, hostname cc-05, uname -r 6.8.0-137-generic) over
+# the LIVE world corpus -- 2535 goals, 832 carrying an outcome_note: the
+# lookbehind drops 114 occurrences across exactly 6 tokens (0x,1x,2x,3x,4x,5x)
+# and EVERY sampled instance is a fuzzed clock ("2026-08-11T22:0x",
+# "04:4x-04:5x"), while all 202 genuine multiplier matches survive untouched.
+# So this is not one agent's note -- the gate has been misfiring fleet-wide on
+# a convention the fleet is told to use.
+#
+# Measuring the drop over the full population rather than over the examples
+# that motivated the fix is guard-2499's discipline applied in the NARROWING
+# direction: its stated case is widening a blind detector, and the symmetric
+# hazard here is a narrowing that also silences real signal. It does not --
+# 202 kept, 0 genuine multipliers lost.
+for m in re.finditer(r"(?<![:\d.])\b(\d+(?:\.\d+)?[xX])\b", text):
     _add(m.group(1), m.start(), m.end())
 
+# Shared numeric token for the two-number comparison patterns (B and C), so
+# they cannot drift apart. Two things it fixes, both measured:
+#
+# 1. COMMA GROUPS. Without the `\d+(?:,\d{3})+` alternative the engine starts
+#    matching at `119` inside `4,119` -- the "," is a word boundary, so `\b`
+#    permits it -- and "description 4,119 -> 9,429 chars" was extracted as
+#    "119 -> 9". That delta appears nowhere in the text, yet it was emitted as
+#    a Verified-Value candidate and armed force_metric_encoding_pending,
+#    sending the next iteration to encode a manufactured number into the tree.
+#    The comma alternative is FIRST so it is preferred over the bare form.
+# 2. LEFT ANCHOR. `(?<![:\d.,])` is the same load-bearing guard Pattern A
+#    carries, for the same reason -- guard-2059: a regex alternative beginning
+#    with a digit matches INSIDE a larger number unless left-anchored. Here it
+#    additionally drops clock fragments (":29\n-> 2026") and dotted versions,
+#    the guard-3790 lexical-class hazard that motivated Pattern A's lookbehind.
+#
+# Measured 2026-08-15 (alpha, hostname cc-04, uname -r 6.8.0-137-generic) over
+# the LIVE corpus of 825 outcome_notes, OLD vs NEW in one pass (guard-2201):
+# Pattern C 372 -> 349 matches, Pattern B 51 -> 49. EVERY one of the 27 drops
+# was classified rather than sampled, and GENUINE LOSSES = 0: each drop was
+# either absorbed into a whole comma-grouped number (25 newly captured whole,
+# e.g. "1,587,488 -> 895,299" replacing the bogus "488 -> 895") or excluded by
+# the lookbehind as a clock/version fragment. Same narrowing discipline, and
+# same result shape, as Pattern A's "202 kept, 0 genuine multipliers lost".
+_NUM = r"\d+(?:,\d{3})+|\d+(?:\.\d+)?"
+_NSTART = r"(?<![:\d.,])"
+
 # Pattern B: baseline comparison "X vs Y" (both numeric)
-for m in re.finditer(r"\b(\d+(?:\.\d+)?)\s+vs\s+(\d+(?:\.\d+)?)\b", text):
+for m in re.finditer(_NSTART + r"(" + _NUM + r")\s+vs\s+(" + _NUM + r")\b", text):
     val = f"{m.group(1)} vs {m.group(2)}"
     _add(val, m.start(), m.end())
 
 # Pattern C: delta "X -> Y" or "X --> Y" (ASCII arrow). Permits surrounding
 # space but normalizes to a single arrow.
-for m in re.finditer(r"\b(\d+(?:\.\d+)?)\s*-+>\s*(\d+(?:\.\d+)?)\b", text):
+for m in re.finditer(_NSTART + r"(" + _NUM + r")\s*-+>\s*(" + _NUM + r")\b", text):
     val = f"{m.group(1)} -> {m.group(2)}"
     _add(val, m.start(), m.end())
 

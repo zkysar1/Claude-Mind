@@ -66,7 +66,18 @@ def _setup_temp_agent(tmpdir: Path, wm_slot_value: dict, ck_slot_value: dict):
 
 
 def _run_restore(tmpdir: Path):
-    """Patch module bindings and invoke compact-restore-slots main()."""
+    """Patch module bindings and invoke compact-restore-slots main().
+
+    BODY_WM_PATH is the FIRST branch of wm.wm_path(); the AGENT_DIR patches
+    below are the SECOND. On a WORKER Body the bash-agent-inject hook exports
+    BODY_WM_PATH, so without pinning it every write_wm from this fixture lands
+    on the LIVE per-Body working-memory.yaml (measured on the sibling
+    test_compact_restore_loop_state_recovery.py, 2026-08-16, cc-08 — it wrote
+    `goals_completed_this_session: 0` over the canonical LIST slot and killed
+    worker-loop Phase 4b for that Body). Pinned for the duration of the call
+    and restored in the finally."""
+    prev_body_wm = os.environ.get("BODY_WM_PATH")
+    os.environ["BODY_WM_PATH"] = str(tmpdir / "session" / "working-memory.yaml")
     os.environ["MIND_AGENT_DIR_OVERRIDE"] = str(tmpdir)
 
     for mod in ("_paths", "wm", "compact_restore_slots"):
@@ -92,7 +103,13 @@ def _run_restore(tmpdir: Path):
         f"Test invariant broken: {HYP_SLOT} is in SKIP_SLOTS — pick a different name"
     )
 
-    crs_mod.main()
+    try:
+        crs_mod.main()
+    finally:
+        if prev_body_wm is None:
+            os.environ.pop("BODY_WM_PATH", None)
+        else:
+            os.environ["BODY_WM_PATH"] = prev_body_wm
 
 
 def _read_slot(wm_path: Path) -> dict:

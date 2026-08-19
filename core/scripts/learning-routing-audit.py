@@ -128,15 +128,79 @@ def _read_jsonl(path, active_only=False):
     return records
 
 
+def _segment_paths(path, kind):
+    """Ordered content-store paths for a SEGMENTED store, oldest-first ().
+
+    `reasoning-bank.jsonl` and `guardrails.jsonl` are being split into
+    date-shaped `<kind>-YYYY-MM-DD.jsonl` segments. Today no writer emits one, so
+    this returns exactly the legacy file and every caller is byte-identical.
+
+    THE LEGACY PATH IS PINNED UNCONDITIONALLY, and here that is not merely
+    defensive. `store_paths` returns [] when the base is unresolvable and omits
+    the legacy file when it can see neither a local copy nor a backend listing —
+    and in THIS module an empty store is the destructive direction, not a
+    quiet one: every id that fails to load makes every reference to it read as
+    DANGLING, and `learning-routing-repair.py --apply` (fired automatically by
+    `tree.py::_post_remove_sweep_dangling`) NULLS whatever this audit calls
+    dangling. That is the g-115-5646 incident verbatim — 17,466 fields nulled
+    over 13 days, 94.7% of them valid — reached there through a depth-1 glob
+    rather than a missing segment, but by the identical mechanism.
+    """
+    try:
+        from _utilization_store import store_paths  # lazy: see _read_store_jsonl
+        paths = list(store_paths(kind, path.parent))
+    except Exception:
+        return [path]
+    if path not in paths:
+        paths.insert(0, path)
+    return paths
+
+
+def _read_store_jsonl(path, kind, active_only=False):
+    """Read a segmented content store, THROUGH THE BACKEND ().
+
+    `_read_jsonl` reads the local filesystem directly and gates on
+    `path.exists()`. Under own-cloud the local tree is a read-through CACHE, so a
+    segment nobody on this box has touched yet simply does not exist locally and
+    would be skipped in silence — the same false-dangling path the docstring
+    above describes. `store_paths` states this as a contract on its callers
+    ("CALLERS MUST READ THROUGH THE BACKEND"), so materialize first.
+
+    Applied to the LEGACY file too, not only to segments. On a cold box the
+    legacy object is equally unmaterialized, and a zero-record read of it is the
+    worst possible input to this module. That is today's latent behaviour and
+    fixing it here costs one no-op call on LocalBackend, where `ensure_local` is
+    the identity.
+
+    Fail-soft in the SAFE direction at every step: an unavailable backend, an
+    import failure, or a per-path error all degrade to the direct read this
+    module already did, never to a short corpus.
+    """
+    try:
+        from storage_backend import get_backend  # type: ignore
+        backend = get_backend()
+    except Exception:
+        backend = None
+    records = []
+    for p in _segment_paths(path, kind):
+        if backend is not None:
+            try:
+                p = Path(backend.ensure_local(p))
+            except Exception:
+                pass
+        records.extend(_read_jsonl(p, active_only=active_only))
+    return records
+
+
 def load_reasoning_bank():
-    return _read_jsonl(RB_JSONL, active_only=True)
+    return _read_store_jsonl(RB_JSONL, "reasoning-bank", active_only=True)
 
 
 def load_guardrails():
     # active_only=True is intentional: an RB entry linked to a RETIRED guardrail
     # is stale knowledge (the rule no longer applies) and must surface as dangling.
     # Do not widen this filter to include retired — that would mask real drift.
-    return _read_jsonl(GUARDRAILS_JSONL, active_only=True)
+    return _read_store_jsonl(GUARDRAILS_JSONL, "guardrails", active_only=True)
 
 
 def load_pipeline():
@@ -176,6 +240,13 @@ def load_all_experiences():
     fields were nulled over 13 days; 16,541 of them (94.7%) pointed at records
     that existed. Old values survive in
     world/.history/learning-routing-repair-YYYY-MM-DD.jsonl.
+
+    The two fixes contribute SEPARATELY, which is worth keeping because it is
+    what shows the archive union is not an afterthought: measured on this box the
+    glob repair alone takes 319 -> 26, and the archive union then takes 26 -> 14
+    (a further -46%). Live-only reads would leave every reference to a rotated
+    experience reported as dangling — the same false-positive class, one rotation
+    later.
     """
     global _AGENT_CORPUS_OWNED
     _AGENT_CORPUS_OWNED = world_owns_agent_corpus()

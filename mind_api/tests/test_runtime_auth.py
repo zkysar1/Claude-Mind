@@ -250,3 +250,121 @@ def test_runner_claims_scan_accessdenied_returns_actionable_hint(monkeypatch):
     assert "AccessDenied" in body["error"]
     assert "hint" in body, "AccessDenied-on-Scan must carry an actionable hint"
     assert "dynamodb:Scan" in body["hint"]
+
+
+# --- : the claim projection publishes a DIGEST, never the token -----
+
+def _fp_ctx(monkeypatch, claims):
+    """Wire runner_claims() to a mocked own-cloud backend returning `claims`."""
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    repo_root = _Path(__file__).resolve().parents[2]
+    monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
+    monkeypatch.setenv("ENVIRONMENT_ID", "test-fleet-env")
+
+    scripts_dir = str(repo_root / "core" / "scripts")
+    if scripts_dir not in _sys.path:
+        _sys.path.insert(0, scripts_dir)
+    import storage_backend
+
+    class _Backend:
+        runner_stale_seconds = 3900
+
+        def list_runner_claims(self):
+            return claims
+
+    monkeypatch.setattr(storage_backend, "get_backend", lambda: _Backend())
+
+    class _Paths:
+        project_root = repo_root
+
+    class _Ctx:
+        paths = _Paths()
+        headers = {"x-mind-agent": "alpha"}
+
+    return _Ctx()
+
+
+def test_runner_claims_returns_the_token_fingerprint(monkeypatch):
+    """The consumer-facing half: a worker Body needs to notice a SAME-BOX
+    reducer restart (a re-minted runner_token under an unchanged machine_id),
+    which machine_id structurally cannot see. The digest is what carries it."""
+    import sys as _sys
+    from pathlib import Path as _Path
+    scripts_dir = str(_Path(__file__).resolve().parents[2] / "core" / "scripts")
+    if scripts_dir not in _sys.path:
+        _sys.path.insert(0, scripts_dir)
+    from owncloud_backend import RunnerClaim, runner_token_fingerprint
+
+    from mind_api.src.endpoints.admin import runner_claims
+
+    fp = runner_token_fingerprint("f47ac10b-58cc-4372-a567-0e02b2c3d479")
+    ctx = _fp_ctx(monkeypatch, [
+        RunnerClaim(agent="alpha", machine_id="cc-04", agent_state="RUNNING",
+                    heartbeat_at=1755000000, runner_token_fp=fp)])
+
+    resp = runner_claims(ctx)
+    assert resp.status == 200
+    body = json.loads(resp.body)
+    (claim,) = body["claims"]
+    assert claim["runner_token_fp"] == fp
+    assert claim["machine_id"] == "cc-04"
+
+
+def test_runner_claims_never_leaks_a_raw_token_even_if_the_row_carries_one(monkeypatch):
+    """THE security pin, and it must not be provable by RunnerClaim's shape alone.
+
+    `runner_token` is the ConditionExpression bearer credential for heartbeat()
+    and release_runner(): anything holding it can forge a heartbeat for another
+    agent (defeating reclaim_if_stale, so a crashed runner could never be
+    reclaimed) or release a LIVE claim, forcing a healthy reducer down
+    mid-flight. RunnerClaim deliberately has no raw-token field — but a test that
+    only fed it a RunnerClaim would pass for that reason alone and would go on
+    passing if the endpoint switched to serialising whatever object it was
+    handed. So this feeds a duck-typed row that DOES expose `runner_token`, which
+    passes only because the projection is an EXPLICIT field list (guard-3357).
+    """
+    from mind_api.src.endpoints.admin import runner_claims
+
+    TOKEN = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+
+    class _LeakyRow:
+        agent = "alpha"
+        machine_id = "cc-04"
+        agent_state = "RUNNING"
+        heartbeat_at = 1755000000
+        runner_token_fp = "1f4c0a9b2e6d8035"
+        runner_token = TOKEN            # must NOT reach the wire
+
+    resp = runner_claims(_fp_ctx(monkeypatch, [_LeakyRow()]))
+    assert resp.status == 200
+    # Response.body is BYTES — scan the decoded wire form, not the object, so
+    # this catches a leak in ANY field rather than only in a key we predicted.
+    wire = resp.body.decode("utf-8") if isinstance(resp.body, bytes) else resp.body
+    assert TOKEN not in wire, "the raw runner_token reached the response body"
+    (claim,) = json.loads(resp.body)["claims"]
+    assert set(claim) == {"agent", "machine_id", "agent_state", "heartbeat_at",
+                          "runner_token_fp"}, (
+        "the claim projection grew a key — if that key is (or can carry) the raw "
+        "runner_token, this endpoint now hands every reader a credential that "
+        "authorises heartbeat() and release_runner() on someone else's claim")
+
+
+def test_runner_claims_tolerates_a_row_predating_the_fingerprint(monkeypatch):
+    """Mixed-version tolerance: the endpoint reads the field with a getattr
+    default, so a backend that predates g-306-224 yields null rather than a 500.
+    Null means UNKNOWN — the consumer treats it as non-discriminating, never as
+    'unchanged' (worker_reducer_liveness FAIL-SAFE ASYMMETRY)."""
+    from mind_api.src.endpoints.admin import runner_claims
+
+    class _OldRow:
+        agent = "alpha"
+        machine_id = "cc-04"
+        agent_state = "RUNNING"
+        heartbeat_at = 1755000000
+
+    resp = runner_claims(_fp_ctx(monkeypatch, [_OldRow()]))
+    assert resp.status == 200
+    (claim,) = json.loads(resp.body)["claims"]
+    assert claim["runner_token_fp"] is None

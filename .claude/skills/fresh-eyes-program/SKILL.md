@@ -133,8 +133,44 @@ re-reading.
 # Decision Rules, the two attested Program edits, and the extraction caveats
 # that prior reviewers recorded so their successors would not re-derive a
 # finding already investigated and closed.
-Bash: bash core/scripts/tree-read.sh --node program-alignment-health
-  → capture: the last 2-3 assessment-history rows, ALL Decision Rules, and every
+# ⚠ `tree-read.sh --node` RETURNS METADATA ONLY — summary, child_count,
+# retrieval_count, poignancy. NO BODY, at any depth. Running it and reading its
+# output IS NOT reading the series: this step was satisfiable exactly as written
+# while leaving you with no prior series at all. That is `guard-3312`; its general
+# form is `guard-2046` (a step naming BOTH a command AND a capture list is an
+# UNVERIFIED PAIRING — nothing checks the command can produce the named content,
+# and the mismatch is silent because the call still exits rc=0).
+#
+# THIS NODE IS A LEAF, AND THAT DOES NOT EXEMPT IT. guard-3312 originally
+# exonerated the sibling rituals on the grounds that their nodes are leaves. That
+# covers only the SHARDING half of the defect (readings living in child files);
+# the metadata-only half is universal and depth-independent, and is sufficient
+# ALONE. Measured here 2026-08-11: a leaf node, 93,953 bytes, and `--node`
+# returns none of it. Do not re-derive the leaf exemption.
+#
+# Read the FILE. `world/` is external and bare Bash path args are NOT
+# hook-rewritten (path-resolution.md), so $WORLD_PATH must be resolved INSIDE
+# EACH INVOCATION — shell state does not persist between Bash calls, and a
+# `source _paths.sh` on its own line leaves it EMPTY in the next one.
+  # (a) THE LAST THREE PASSES — the front matter's `detail` / `detail_prior` /
+  #     `detail_prior_2` keys, which are the three most recent assessments in
+  #     date order BY CONSTRUCTION. Verified 2026-08-11: 4,428 bytes, all three
+  #     keys present.
+  Bash: source core/scripts/_paths.sh && sed -n '1,60p' "$WORLD_PATH/knowledge/tree/system/program-alignment-health.md"
+  # (b) ALL 9 DECISION RULES. Header-anchored, never line-numbered — the block
+  #     moves as the file grows. Verified 2026-08-11: 6,518 bytes, rules 1-9
+  #     present, and DR9 is the highest shorthand used anywhere in the node.
+  #     Do NOT Read the node whole — 93,953 bytes is near the ~25k-TOKEN cap.
+  Bash: source core/scripts/_paths.sh && awk '/^## Decision Rules/{f=1} f&&/^## Verified Values/{exit} f' "$WORLD_PATH/knowledge/tree/system/program-alignment-health.md"
+  # (c) OPTIONAL index only: tree-read.sh --node program-alignment-health. Useful
+  #     for retrieval_count / poignancy. NEVER a substitute for (a) or (b).
+  → ⚠ DO NOT take "the last 2-3 assessments" BY FILE POSITION. Measured
+    2026-08-11: the dated `### ` sections are NOT date-sorted — file order runs
+    08-11, 08-10, 08-08, 08-09, so neither "first 3" nor "last 3" returns the
+    three most recent. The sibling series files are each internally consistent
+    (review newest-FIRST, tree oldest-first) and this one is neither, which is
+    precisely why (a) reads the front matter instead.
+  → capture from (a)+(b): the last 3 passes, ALL 9 Decision Rules, and every
     paragraph containing "Corrected" / "caveat" / "RETRACTED" / "already filed"
   → carry these into Phase 3. Before writing ANY finding, check it against
     them: a signal the series has already investigated and closed is NOT a

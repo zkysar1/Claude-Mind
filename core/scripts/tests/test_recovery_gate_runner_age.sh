@@ -15,8 +15,9 @@
 # HOW THIS TESTS THE REAL THING. recovery-gate.sh has no main guard, so sourcing
 # it whole would run Paths A/B/C/D against the LIVE agent. Instead the harness
 # extracts the shipped `_check_wedged_loop` function text with awk and sources
-# just that, stubbing its five dependencies (session-state-get, heartbeat-stale,
-# phase-wedge-check, session-signal-exists, background-jobs) plus agent_dir and
+# just that, stubbing its six dependencies (session-state-get, heartbeat-stale,
+# phase-wedge-check, session-signal-exists, background-jobs,
+# assistant-turn-freshness) plus agent_dir and
 # _perform_recovery. So the assertions run the REAL branch ordering and the REAL
 # runner-age condition from the shipped file — not a re-implementation of the
 # predicate in the test, which is the failure mode that lets a pin pass while
@@ -69,6 +70,16 @@ printf '#!/usr/bin/env bash\nexit 1\n'       > "$SCRIPT_DIR/background-jobs.sh"
 # Stands in for the pure diary detector: WEDGED, past a 65min threshold.
 printf 'import json\nprint(json.dumps({"verdict":"wedged","age_minutes":71.0,"threshold_minutes":65.0}))\n' \
     > "$SCRIPT_DIR/phase-wedge-check.py"
+# Assistant-turn liveness veto (): NO recent turn -> rc 1 -> does not
+# suppress, so these scenarios exercise the runner-age gate rather than this one.
+# WITHOUT this stub the real probe runs, resolves the LIVE bound agent's
+# transcript, finds this very session's assistant turn, and suppresses every
+# scenario — which is what happened when the gate first landed. Scenario 4's
+# mutation proof is what caught it: it reported "neutered gate still suppressed
+# ... scenarios 1-3 prove nothing" rather than letting three vacuous PASSes
+# through.
+printf 'import json,sys\nprint(json.dumps({"verdict":"no_recent_assistant_turn","suppress":False}))\nsys.exit(1)\n' \
+    > "$SCRIPT_DIR/assistant-turn-freshness.py"
 chmod +x "$SCRIPT_DIR"/*.sh
 
 agent_dir() { echo "$ADIR"; }

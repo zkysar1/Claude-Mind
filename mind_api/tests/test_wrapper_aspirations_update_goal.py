@@ -114,11 +114,19 @@ def test_wrapper_encodes_typed_values(running_daemon):
     project_root, port = running_daemon
     goal_id = _seed_goal(project_root, port)
 
-    # bool
+    # bool. Uses `artifact_producing`, a REGISTERED boolean goal field, because
+    # the field-allowlist gate () now refuses unregistered names at the
+    # write. This case previously wrote `decomposed`, which is not a field at all
+    # — it is a `status` VALUE, and the real field is `decomposed_into`. That the
+    # write succeeded anyway is exactly the defect the gate closes: an arbitrary
+    # plausible-sounding name silently became a key no consumer reads. The name
+    # was always incidental here (this test pins parse_value ENCODING, per its
+    # docstring), so retargeting it costs the test nothing and stops it pinning
+    # the permissive behavior as if it were the contract.
     rc, out, _ = _run(
-        [goal_id, "decomposed", "true"], project_root=project_root)
+        [goal_id, "artifact_producing", "true"], project_root=project_root)
     assert rc == 0
-    assert json.loads(out)["decomposed"] is True
+    assert json.loads(out)["artifact_producing"] is True
 
     # int
     rc, out, _ = _run(

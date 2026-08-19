@@ -129,9 +129,51 @@ def test_worker_prompt_checks_closure_before_rearming():
     # The closure check precedes the first re-arm mention.
     assert p.index("body-manifest.yaml") < p.lower().index("re-arm")
     # The LIVE branch still re-arms BEFORE resuming work (rb-4345 preserved).
-    assert "ONLY IF body_state is active" in p
-    assert p.index("ONLY IF body_state is active") < p.index("re-arm this same wakeup")
-    assert p.index("re-arm this same wakeup") < p.index("then resume by calling")
+    # rindex, not index: the parked branch () also re-arms-then-resumes,
+    # so an index-based assertion would silently retarget onto THAT branch and
+    # keep passing even if the live branch lost its ordering entirely.
+    live = p.index("IF body_state is active")
+    assert live < p.index("re-arm this same wakeup", live)
+    assert p.index("re-arm this same wakeup", live) < p.index("then resume by calling", live)
+
+
+def test_worker_prompt_treats_parked_as_resumable_not_closed():
+    """: `parked` is a WIND-DOWN, not a close. Pin both halves.
+
+    The branch this prompt used to carry was "anything other than active ->
+    do NOT resume and do NOT re-arm". That predicate was written when every
+    non-active state was terminal, so adding `parked` to VALID_STATES recruited
+    this prompt into wedging the exact Body parking exists to keep alive: a
+    permanent stop with no wakeup left in the slot — the durable close g-306-291
+    removed, reintroduced through the net. Reachable whenever a park turn dies
+    before arming its own 3600s poll, leaving the previous unit's 600s net armed.
+
+    The fix is a CLOSED-SET test, so this also pins the fail-safe DIRECTION: an
+    unrecognised state must resolve toward resuming (recoverable) rather than
+    stopping dead (not).
+    """
+    p = worker_prompt()
+    parked = p.index("IF body_state is parked")
+    closed = p.index("IF body_state is one of")
+
+    # The parked branch resumes and re-arms — the two things the closed branch
+    # forbids. Assert on the parked SLICE, not the whole prompt, or the closed
+    # branch's own "do NOT resume" satisfies a whole-string search.
+    slice_ = p[parked:p.index("IF body_state is active")]
+    assert "RESUMABLE" in slice_ and "is NOT a close" in slice_
+    assert "re-arm this same wakeup FIRST" in slice_
+    assert "3600" in slice_, "a park re-polls hourly, not every 600s"
+    assert "do NOT resume" not in slice_ and "do NOT re-arm" not in slice_
+
+    # The closed branch must NOT have widened back into a not-active test.
+    closed_slice = p[closed:parked]
+    assert "anything other than active" not in closed_slice
+    for state in ("closed-pending-merge", "merged", "closed-stale"):
+        assert state in closed_slice
+    assert "parked" not in closed_slice, "parked must never be listed as closed"
+
+    # Fail-safe direction: an unknown state resumes rather than stopping dead.
+    assert "any value not named above" in p
 
 
 def test_reducer_role_is_retired_and_refuses_loudly():

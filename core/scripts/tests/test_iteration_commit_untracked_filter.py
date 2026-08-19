@@ -111,12 +111,39 @@ def _setup_repo(tmpdir: Path) -> Path:
 
 
 def _mock_team_state_read(tmpdir: Path, claimed_at_iso: str | None) -> Path:
-    """Create a shim team-state-read.sh that emits the desired claimed_at."""
+    """Create a field-aware shim team-state-read.sh.
+
+    Since the g-115-6107 foreign-anchor guard, iteration-commit.sh queries
+    in_flight.goal_id BEFORE in_flight.claimed_at and uses the row's claimed_at
+    only when goal_id matches the --goal-id being committed. A single-value
+    shim would answer the goal_id query with the timestamp → mismatch → filter
+    permanently off. Dispatch on --field instead: goal_id answers "g-test-01"
+    (the --goal-id every test here passes → MATCHING row), claimed_at answers
+    the configured value, partner fields answer null. The null variant answers
+    null for both (no in_flight at all).
+    """
     shim = tmpdir / "team-state-read.sh"
     if claimed_at_iso is None:
-        body = '#!/usr/bin/env bash\necho "null"\nexit 0\n'
+        goal_line = "echo null"
+        claim_line = "echo null"
     else:
-        body = f'#!/usr/bin/env bash\necho \'"{claimed_at_iso}"\'\nexit 0\n'
+        goal_line = "echo '\"g-test-01\"'"
+        claim_line = f"echo '\"{claimed_at_iso}\"'"
+    body = f"""#!/usr/bin/env bash
+field=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --field) field="${{2:-}}"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$field" in
+  agent_status.alpha.in_flight.goal_id) {goal_line} ;;
+  agent_status.alpha.in_flight.claimed_at) {claim_line} ;;
+  *) echo null ;;
+esac
+exit 0
+"""
     shim.write_text(body)
     shim.chmod(0o755)
     return shim

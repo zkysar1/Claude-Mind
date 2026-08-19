@@ -84,6 +84,7 @@ if hasattr(sys.stderr, "reconfigure"):
 sys.path.insert(0, str(Path(__file__).parent))
 from _paths import AGENT_DIR, CONFIG_DIR, CORE_ROOT  # noqa: E402
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
+import _reflectable  # : reflectable-vs-backlog split for --unreflected
 
 
 # Bare goal-id-shaped tag (e.g. ""): a finding carrying a bare goal
@@ -760,14 +761,23 @@ def _count_tree_decompose_candidates():
 
 
 def _count_unreflected_hypotheses():
-    """Count hypotheses from pipeline-read --unreflected (JSON array). 0 on error."""
+    """Count REFLECTABLE unreflected hypotheses (JSON array -> outcome filter).
+
+    g-115-6173: the raw --unreflected count is the full never-reflected
+    backlog (384 measured), dominated by UNRESOLVABLE/EXPIRED/no-outcome
+    records that /reflect-on-outcome can never consume (g-115-4558). Feeding
+    that raw number into _DRAINABLE_PRIORITY pinned primary_target to
+    'hypothesis' with a 100%-undrainable target — the B6.8 all-blocked drain
+    then routed forever at work that cannot drain. Only the reflectable
+    subset is drainable, so only it counts here. 0 on error.
+    """
     try:
         raw = _rt.rt_call("GET", "/v1/pipeline/read", query="unreflected=1")
         stripped = (raw or "").strip()
         if not stripped:
             return 0
         obj = json.loads(stripped)
-        return len(obj) if isinstance(obj, list) else 0
+        return _reflectable.count_reflectable(obj)
     except Exception as e:
         print(f"[quiescence-gate] unreflected-hypothesis count failed: {e}", file=sys.stderr)
         return 0

@@ -1441,3 +1441,319 @@ def test_telemetry_gate_is_registered_in_gates_yaml():
     assert row is not None, "goal-pickup-coordination missing from core/config/gates.yaml"
     assert row["instrumented"] is True
     assert row["script"] == "core/scripts/goal-pickup-coordination-check.py"
+
+
+# --- Done-but-pending disposition ( / gap-100) ------------------
+# These pin the PURE half of the extension. The git/gh probes it feeds on
+# (_own_goal_commits, _sha_on_origin_main, _live_pr_state) are impure and
+# fail-open by contract, exactly like the product-repo probes above.
+
+
+def test_external_surface_is_all_not_any_so_a_mixed_surface_stays_visible():
+    m = _import()
+    # All-external -> the git rail is blind and the caller must be told so.
+    assert m._surface_is_external(["world/scripts/a.sh", "meta/b.yaml"]) is True
+    # ONE in-repo path makes git informative again. If this were `any`, a goal
+    # touching both trees would report CANNOT-SEE while git could have answered.
+    assert m._surface_is_external(["world/scripts/a.sh", "core/scripts/b.py"]) is False
+    assert m._surface_is_external(["core/scripts/b.py"]) is False
+    # No paths at all is NOT blindness — it is the ordinary "prose named no
+    # path" case, which must fall through to GENUINELY-PENDING.
+    assert m._surface_is_external([]) is False
+    assert m._surface_is_external(None) is False
+
+
+def test_merged_own_commit_yields_done_and_merged_and_obliges_a_coverage_read():
+    m = _import()
+    verdict, obliges = m.classify_shipped(
+        [{"hash": "a" * 40, "subject": "fix(g-1-1): x", "on_origin_main": True}],
+        [], [], False)
+    assert verdict == "DONE-AND-MERGED"
+    # The obligation is the whole point: gap-100's PARTIALLY-DONE is a READING
+    # of verify-step coverage, so the classifier must hand that judgement back
+    # rather than fabricate a verdict it cannot measure.
+    assert "PARTIALLY-DONE" in obliges
+
+
+def test_an_undeterminable_sha_is_never_read_as_merged_or_as_unshipped():
+    m = _import()
+    # on_origin_main=None means the object is absent from this clone (rc=128).
+    # It must not satisfy DONE-AND-MERGED...
+    verdict, _ = m.classify_shipped(
+        [{"hash": "b" * 40, "subject": "fix(g-1-1): x", "on_origin_main": None}],
+        [], [], False)
+    assert verdict != "DONE-AND-MERGED"
+    # ...and it must not collapse to GENUINELY-PENDING either: a commit naming
+    # this goal exists, which is evidence of work whatever its merge state.
+    assert verdict == "WORK-EXISTS-UNMERGED"
+
+
+def test_open_pr_outranks_unmerged_commits_and_demands_the_live_reread():
+    m = _import()
+    verdict, obliges = m.classify_shipped(
+        [{"hash": "c" * 40, "subject": "fix(g-1-1): x", "on_origin_main": False}],
+        [{"repo": "r", "number": 9, "state": "OPEN"}], [], False)
+    assert verdict == "OPEN-PR-STALE"
+    assert "live" in obliges.lower()
+
+
+def test_a_merged_pr_does_not_trigger_the_open_pr_verdict():
+    m = _import()
+    # Only OPEN state counts. A MERGED PR with no local commit evidence is not
+    # a stale-PR situation; treating every PR hit as OPEN would send the caller
+    # to rebase something that already landed.
+    verdict, _ = m.classify_shipped(
+        [], [{"repo": "r", "number": 9, "state": "MERGED"}], [], False)
+    assert verdict != "OPEN-PR-STALE"
+
+
+def test_branch_hit_alone_is_work_not_nothing():
+    m = _import()
+    verdict, _ = m.classify_shipped([], [], [{"repo": "r", "branch": "fix/g-1-1"}], False)
+    assert verdict == "WORK-EXISTS-UNMERGED"
+
+
+def test_external_blindness_beats_a_clean_report_but_loses_to_evidence():
+    m = _import()
+    # Nothing found + blind rail -> say "cannot see", never "nothing shipped".
+    assert m.classify_shipped([], [], [], True)[0] == "CANNOT-SEE"
+    # Evidence outranks blindness: a merged commit is an ANSWER, and reporting
+    # CANNOT-SEE over it would discard the strongest signal available.
+    assert m.classify_shipped(
+        [{"hash": "d" * 40, "subject": "s", "on_origin_main": True}],
+        [], [], True)[0] == "DONE-AND-MERGED"
+
+
+def test_all_rails_clean_and_visible_is_genuinely_pending():
+    m = _import()
+    verdict, obliges = m.classify_shipped([], [], [], False)
+    assert verdict == "GENUINELY-PENDING"
+    assert "normally" in obliges.lower()
+
+
+def test_disposition_never_touches_race_risk():
+    m = _import()
+    # classify_shipped returns a 2-tuple of strings and nothing else — it
+    # cannot flip race_risk even by accident. Fusing the two questions would
+    # make every already-shipped goal read as a partner collision to the
+    # digest's yield branch.
+    out = m.classify_shipped(
+        [{"hash": "e" * 40, "subject": "s", "on_origin_main": True}], [], [], False)
+    assert isinstance(out, tuple) and len(out) == 2
+    assert all(isinstance(x, str) for x in out)
+
+
+def test_a_recurring_goals_prior_cycle_commits_do_not_read_as_done():
+    m = _import()
+    # The exact live false positive: , achievedCount 302,
+    # lastAchievedAt 2026-08-09T09:23:30, three commits from 08-04/06/08. A
+    # recurring goal's id is in a commit subject on EVERY cycle it has ever
+    # run, so without the filter this verdict is wrong 100% of the time for
+    # every recurring goal in the queue.
+    prior = [{"hash": "a" * 40, "subject": "chore(g-115-105): x",
+              "date": "2026-08-08T01:04:51+00:00", "on_origin_main": True}]
+    assert m.classify_shipped(prior, [], [], False,
+                              goal_recurring=True,
+                              goal_last_achieved="2026-08-09T09:23:30"
+                              )[0] == "GENUINELY-PENDING"
+    # Same commits, NON-recurring goal -> the filter must not fire.
+    assert m.classify_shipped(prior, [], [], False)[0] == "DONE-AND-MERGED"
+
+
+def test_a_recurring_goal_shipped_this_cycle_is_still_seen():
+    m = _import()
+    # The filter must not blind the classifier to work done AFTER the last
+    # achievement — otherwise a recurring goal could never report DONE.
+    this_cycle = [{"hash": "b" * 40, "subject": "chore(g-115-105): x",
+                   "date": "2026-08-09T11:00:00+00:00", "on_origin_main": True}]
+    assert m.classify_shipped(this_cycle, [], [], False,
+                              goal_recurring=True,
+                              goal_last_achieved="2026-08-09T09:23:30"
+                              )[0] == "DONE-AND-MERGED"
+
+
+def test_unparseable_recurring_timestamp_falls_toward_doing_the_work():
+    m = _import()
+    # DELIBERATELY the opposite fail-safe direction from classify_board_mentions,
+    # which KEEPS a hit on an unparseable timestamp. The two errors are not
+    # symmetric: a false DONE-AND-MERGED ends the investigation, a false
+    # GENUINELY-PENDING costs one redundant look.
+    bad = [{"hash": "c" * 40, "subject": "s", "date": "not-a-date",
+            "on_origin_main": True}]
+    assert m.classify_shipped(bad, [], [], False, goal_recurring=True,
+                              goal_last_achieved="2026-08-09T09:23:30"
+                              )[0] == "GENUINELY-PENDING"
+    # A missing lastAchievedAt is equally unparseable -> same direction.
+    assert m.classify_shipped(
+        [{"hash": "d" * 40, "subject": "s", "date": "2026-08-09T11:00:00+00:00",
+          "on_origin_main": True}], [], [], False,
+        goal_recurring=True, goal_last_achieved=None)[0] == "GENUINELY-PENDING"
+
+
+def test_pure_agent_store_churn_is_not_shipped_evidence():
+    m = _import()
+    # THE DOMINANT false positive: 141 of the 200 most recent goal-id-named
+    # commits on this box (70%) touched nothing but agents/. The loop stamps
+    # bookkeeping commits with the goal id exactly like real ones.
+    churn = [{"hash": "a" * 40, "subject": "chore(g-350-148): x",
+              "date": "2026-08-07T17:26:24+00:00", "on_origin_main": True,
+              "files": ["agents/echo/changelog.jsonl",
+                        "agents/echo/experience.jsonl",
+                        "agents/echo/experience/exp-g-350-148.md"]}]
+    assert m.classify_shipped(churn, [], [], False)[0] == "GENUINELY-PENDING"
+
+
+def test_one_non_store_file_makes_a_commit_count():
+    m = _import()
+    # all(), not any(): a commit that touched real code AND incidental store
+    # churn is still shipped work. Dropping it would trade one false positive
+    # for a false negative in the destructive direction.
+    mixed = [{"hash": "b" * 40, "subject": "fix(g-1-1): x",
+              "date": "2026-08-09T11:00:00+00:00", "on_origin_main": True,
+              "files": ["agents/alpha/journal.jsonl", "core/scripts/thing.py"]}]
+    assert m.classify_shipped(mixed, [], [], False)[0] == "DONE-AND-MERGED"
+
+
+def test_a_commit_with_no_file_list_is_not_assumed_to_be_churn():
+    m = _import()
+    # Absence of evidence about the files is not evidence they were all
+    # bookkeeping — fail toward counting it, which is the direction that keeps
+    # a reader looking rather than closing.
+    unknown = [{"hash": "c" * 40, "subject": "fix(g-1-1): x",
+                "date": "2026-08-09T11:00:00+00:00", "on_origin_main": True}]
+    assert m.classify_shipped(unknown, [], [], False)[0] == "DONE-AND-MERGED"
+
+
+def test_store_churn_is_dropped_before_the_recurring_filter_not_after():
+    m = _import()
+    # Order matters: a recurring goal whose only fresh commit is churn must
+    # still land on GENUINELY-PENDING rather than surviving on recency.
+    fresh_churn = [{"hash": "d" * 40, "subject": "chore(g-115-105): x",
+                    "date": "2026-08-09T11:00:00+00:00", "on_origin_main": True,
+                    "files": ["agents/alpha/journal.jsonl"]}]
+    assert m.classify_shipped(fresh_churn, [], [], False, goal_recurring=True,
+                              goal_last_achieved="2026-08-09T09:23:30"
+                              )[0] == "GENUINELY-PENDING"
+
+
+def test_commit_goal_id_reads_the_subject_scope_not_a_body_citation():
+    m = _import()
+    # The pure core of the --grep-matches-the-whole-message fix. `git log
+    # --grep <goal-id>` matches the BODY too, so a commit whose narrative
+    # merely cites a goal arrives at the probe as that goal's work. Measured
+    # live:  (a due recurring goal) read WORK-EXISTS-UNMERGED purely
+    # because a DIFFERENT goal's commit named it in its verification section.
+    assert m.commit_goal_id("fix(g-115-105): stall analyzer was blind") == "g-115-105"
+    # A subject scoped to another goal must NOT resolve to the cited one — this
+    # is what the probe now filters on.
+    assert m.commit_goal_id("fix(g-115-5270): shipped_verdict was wrong") != "g-115-105"
+    # MEASURED, and it corrected my first draft of this test: with no
+    # `type(scope):` form, commit_goal_id falls back to a bare goal-id search
+    # in the SUBJECT, so this DOES resolve. That is fine for the probe's
+    # purpose — the filter's job is to exclude BODY citations, not to demand a
+    # conventional-commit scope — but the assertion has to say what is true.
+    assert m.commit_goal_id("chore: routine churn touching g-115-105") == "g-115-105"
+    # A subject with no goal id anywhere makes no authorship claim at all.
+    assert m.commit_goal_id("chore: unrelated routine churn") != "g-115-105"
+
+
+# ── private agent-queue namespacing of the two git lanes () ─────────
+# THE COLLISION, measured on this box 2026-08-15: 29 of 73 distinct agent-queue
+# goal ids exist in more than one agent's queue, and `` exists in all
+# five. Git history is keyed on that id alone, so both git lanes read five
+# agents' commits as one goal's. The two lanes fail in OPPOSITE directions and
+# the pins below assert both — a pin on only the ledger half would leave the
+# silent half live, which is the more dangerous one (a false DONE is loud and
+# gets argued with; a missing race warning is never seen).
+
+def _foreign(files, subject="chore(g-001-01): Reflect and journal"):
+    return {"hash": "f" * 40, "subject": subject, "files": files}
+
+
+def test_foreign_agent_work_needs_proof_not_absence_of_mine():
+    m = _import()
+    # PROVABLE: another agent's dir, mine absent.
+    assert m.commit_is_foreign_agent_work(["agents/echo/journal.jsonl"], "alpha")
+    # MINE PRESENT anywhere -> never foreign, even alongside a partner's dir
+    # (a merge or a cross-agent sweep still contains my work).
+    assert not m.commit_is_foreign_agent_work(
+        ["agents/echo/journal.jsonl", "agents/alpha/journal.jsonl"], "alpha")
+    # UNATTRIBUTABLE: framework-only. 4.8% of the live g-001-* population
+    # (61 of 1268 commits/90d). The filing goal's prescribed remedy — REQUIRE
+    # agents/<me>/ — drops exactly these and turns a false DONE into a false
+    # PENDING. Conservatism is the design (guard-2499).
+    assert not m.commit_is_foreign_agent_work(["core/scripts/goal-selector.py"], "alpha")
+    # Unknown self, or no file list: never claim proof.
+    assert not m.commit_is_foreign_agent_work(["agents/echo/x"], "")
+    assert not m.commit_is_foreign_agent_work([], "alpha")
+
+
+def test_direction_one_a_partners_same_id_commit_is_not_my_shipped_work():
+    """LEDGER half. classify_shipped is fed by _own_goal_commits, so the drop has
+    to happen there — proven here through the classifier the verdict reads."""
+    m = _import()
+    partner = [{"hash": "a" * 40, "subject": "chore(g-001-01): Reflect and journal",
+                "date": "2026-08-15T10:00:00+00:00", "on_origin_main": True,
+                "files": ["agents/echo/journal.jsonl",
+                          ".claude/rules/run-full-suite-after-deep-code.md"]}]
+    # Unfiltered, this is the live false DONE: real partner commits, real verdict.
+    assert m.classify_shipped(partner, [], [], False)[0] == "DONE-AND-MERGED"
+    # Filtered as a private agent-queue id, the ledger is empty and the goal is
+    # correctly still to do.
+    kept = [c for c in partner
+            if not m.commit_is_foreign_agent_work(c["files"], "alpha")]
+    assert kept == []
+    assert m.classify_shipped(kept, [], [], False)[0] == "GENUINELY-PENDING"
+
+
+def test_direction_two_a_partners_same_id_commit_still_surfaces_as_a_race():
+    """RACE half — the silent one. The same commit the ledger must EXCLUDE must
+    still be VISIBLE to the overlap lane when it touches a path this goal named.
+    Measured live: bravo's g-001-06 commit touching core/scripts/pipeline-archive.sh
+    was invisible before this fix."""
+    m = _import()
+    commits = [_foreign(["agents/bravo/journal.jsonl",
+                         "core/scripts/pipeline-archive.sh"],
+                        subject="chore(g-001-06): Pipeline and experience archival")]
+    paths, kw = {"core/scripts/pipeline-archive.sh"}, {"pipeline", "archival"}
+
+    # Before: the same-id exemption swallowed it whole.
+    assert m.classify_overlap(paths, kw, commits, "g-001-06") == (False, [])
+    # After: re-admitted, flagged, and race_risk raised.
+    race, ov = m.classify_overlap(paths, kw, commits, "g-001-06",
+                                  agent_queue_private=True, me="alpha")
+    assert race is True and len(ov) == 1
+    assert ov[0]["matched_paths"] == ["core/scripts/pipeline-archive.sh"]
+    assert ov[0]["foreign_agent_work"] is True
+
+
+def test_the_keyword_route_stays_shut_for_a_readmitted_foreign_commit():
+    """The measurement that overruled the filing goal's plain re-admission. Over
+    alpha's whole agent queue / 168h: re-admitting everything surfaces 60
+    keyword-only hits and 1 path hit. All 60 are the same shape — five agents run
+    an identically TITLED per-agent recurring goal, so the title matches itself
+    every cycle forever and race_risk on g-001-01 would pin True fleet-wide."""
+    m = _import()
+    sibling = [_foreign(["agents/echo/journal.jsonl"])]      # no shared path
+    paths, kw = set(), {"reflect", "journal"}                # identical title
+    race, ov = m.classify_overlap(paths, kw, sibling, "g-001-01",
+                                  agent_queue_private=True, me="alpha")
+    assert (race, ov) == (False, []), "identical sibling titles carry no signal"
+
+
+def test_a_world_goal_is_untouched_by_all_of_it():
+    """is_private_agent_queue is the only switch. A world id names ONE record, so
+    both lanes must behave exactly as before — and a cross-agent goal resolves
+    against an agent queue but names a genuinely contendable record, so it is
+    NOT private either."""
+    m = _import()
+    assert m.is_private_agent_queue("world") is False
+    assert m.is_private_agent_queue("agent", "bravo") is False
+    assert m.is_private_agent_queue("agent") is True
+
+    commits = [_foreign(["agents/echo/journal.jsonl", "core/scripts/x.py"])]
+    # Defaults off: byte-identical classification to the pre-fix behaviour.
+    assert m.classify_overlap({"core/scripts/x.py"}, set(), commits,
+                              "g-001-01") == (False, [])
+    # And a foreign commit is only ever dropped from the ledger under the flag.
+    assert m.commit_is_foreign_agent_work(commits[0]["files"], "alpha") is True

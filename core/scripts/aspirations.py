@@ -20,6 +20,7 @@ from _stdio import reconfigure_stdio  # noqa: E402
 reconfigure_stdio()
 
 from _paths import WORLD_DIR, AGENT_DIR, META_DIR, CORE_ROOT, CONFIG_DIR
+from _cadence_anchor import is_deliberate_raise as _is_deliberate_raise
 from _gate_log import log as _gate_log
 from _goal_census import effective_counts as _effective_counts  # B9-deep census-augmented counts
 from _goal_census import all_evicted_ids as _all_evicted_ids  #  mint-site tombstone awareness
@@ -1542,6 +1543,32 @@ def cmd_update_goal(args):
     field = args.field
     value = parse_value(args.value)
 
+    # UNKNOWN-FIELD GATE (). Twin of the daemon check in
+    # mind_api/src/endpoints/aspirations_write.py::update_goal — BOTH import the
+    # same list from _goal_fields, so this is a second CALL SITE and never a
+    # second copy of the policy. Runs before the lock: a bad field name should
+    # cost no I/O.
+    #
+    # DOTTED NAMES ARE DELIBERATELY NOT MINE. A dotted path is also an
+    # unregistered name, so this gate would happily answer first — with the
+    # wrong error. The dedicated dotted-path check further down owns that case
+    # and emits the `BLOCKED:` contract message that
+    # tests/test_dotted_path_rejection.sh () pins, and the daemon twin
+    # gets this ordering for free by running its dotted check FIRST. Skipping
+    # dotted names here restores that same precedence on the CLI side.
+    # Caught by the full suite, not by review: both refuse, both exit 1, and no
+    # stray key is ever created — so the defect was invisible except to the one
+    # fixture that asserts WHICH refusal the caller is told about.
+    from _goal_fields import is_known as _is_known_goal_field, \
+        unknown_field_error as _unknown_goal_field_error
+    if "." not in field and not _is_known_goal_field(field):
+        justification = getattr(args, "allow_new_field", None)
+        if not justification:
+            print(_unknown_goal_field_error(field), file=sys.stderr)
+            sys.exit(1)
+        print(f"[update-goal] --allow-new-field: writing unregistered field "
+              f"{field!r} on {goal_id} — {justification}", file=sys.stderr)
+
     # Full-cycle lock: read + archive cross-check + write are atomic
     from _fileops import acquire_lock, release_lock
     lock_path = LIVE_PATH.with_suffix(".lock")
@@ -1562,6 +1589,55 @@ def cmd_update_goal(args):
         # (post-update state) plus the goal's current user_leg_scope.
         if field == "participants":
             _warn_missing_user_leg_scope(goal_id, value, goal.get("user_leg_scope"))
+
+        # blocker_ref SHAPE REFUSAL (). A blocker_ref must be absent,
+        # empty, or a dict -- never a scalar. This is the ONLY generic write path
+        # for the field: cmd_add_goal already routes through
+        # gates.blocker_ref.validate (and so does the unblock circuit breaker),
+        # but this function writes whatever parse_value() returns, and
+        # parse_value has no per-field type enforcement -- so
+        # `aspirations-update-goal.sh <g> blocker_ref "<anything>"` stored a bare
+        # string.
+        #
+        # WHY A REFUSAL AND NOT AN ADVISORY, which is the opposite of the two
+        # advisories bracketing it: a bare string is not a judgement call the
+        # author might defend, it is unreadable by every consumer. The read-side
+        # guards test `isinstance(br, dict) and br.get("type")`, so a scalar is
+        # SKIPPED rather than flagged; and an expires_at cannot be stored on a
+        # string, so the TTL that would force a re-probe never arms. The value
+        # therefore gates work silently and forever.
+        #
+        # MEASURED THREE TIMES, AND THAT IS THE ACTUAL FINDING. The population is
+        # tiny and self-clearing (a blocker_ref disappears when its goal unblocks
+        # or completes), so every sweep reports "exactly ONE bare string" and
+        # looks stable -- while naming a DIFFERENT record each time: 
+        # (2026-07-29),  (2026-08-07),  (2026-08-11, a
+        # multi-sentence prose narrative -- a third distinct malformed shape).
+        # A count that stays arithmetically true while its referent is replaced
+        # is invisible to exactly the check a careful reader would run, and it
+        # is why backfilling the named record was never the fix: the writer is
+        # live, so the residue regenerates. Refuse at the write, and the backfill
+        # becomes a consequence rather than the remedy.
+        #
+        # Clearing stays open (None / "" / {}) -- that is how the earlier
+        # instances were legitimately retired, and refusing it would break the
+        # normal unblock path.
+        if field == "blocker_ref" and value not in (None, "", {}):
+            if not isinstance(value, dict):
+                print(
+                    f"REFUSED: blocker_ref must be a JSON object, got "
+                    f"{type(value).__name__} ({value!r:.120}). A scalar is "
+                    f"unreadable by every consumer -- the read-side guards "
+                    f"require a dict before any branch acts, so it is silently "
+                    f"skipped, and no expires_at can be stored on it so the TTL "
+                    f"never arms. Pass the canonical shape, e.g. "
+                    f"'{{\"type\": \"partner-response\", \"external_id\": "
+                    f"\"<msg-or-goal-id>\"}}' (valid types: "
+                    f"{', '.join(BLOCKER_REF_TYPES)}). To CLEAR it, pass null. "
+                    f"(g-115-3843)",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
 
         # Capability-absence advisory (). Deliberately mirrors the
         # user_leg_scope advisory directly above — same chokepoint, same stderr
@@ -1784,6 +1860,134 @@ def cmd_update_goal(args):
                 print(
                     f"[completion-artifact-gate] "
                     f"--override-missing-artifact on {goal_id}: {ca_override}",
+                    file=sys.stderr,
+                )
+
+        # Layer-B residual-work gate (; Layer A = Step 8.55 in
+        # aspirations-state-update + guard-3601). Refuses status=completed when
+        # outcome_note names undone work (the  class — a spec on a
+        # COMPLETED record is invisible to every selector) and no LIVE carrier
+        # is cited. On block, Layer-D files the suggested successor into the
+        # in-memory items and commits it via _write_live_under_lock before
+        # exit 1 — mirror of the defer-gate auto-Unblock below. guard-2323 /
+        # guard-742: the LIVE path is the daemon mirror in
+        # mind_api/src/endpoints/aspirations_write.py (update_goal, in-lock
+        # completed branch) — keep both sides in sync.
+        if field == "status" and value == "completed":
+            from gates.residual_work import (
+                evaluate as _residual_work_eval,
+                find_existing_successor as _rw_find_existing_successor,
+                build_successor_goal as _rw_build_successor,
+            )
+            rw_override = getattr(args, "override_residual", None)
+            # THE OTHER QUEUE — the one that is NOT the --source target
+            # (). `items` is whatever LIVE_PATH points at, so this
+            # must be selected BY SOURCE: reading the agent queue
+            # unconditionally made both arguments identical on a
+            # `--source agent` close and the world queue was never loaded,
+            # so every world carrier reported live:false / status:null and
+            # the gate auto-filed duplicates for work already owned.
+            _rw_other_items = None
+            if getattr(args, "source", "world") == "agent":
+                _rw_other_live = WORLD_DIR / "aspirations.jsonl"
+            else:
+                _rw_other_live = (
+                    AGENT_DIR / "aspirations.jsonl"
+                    if AGENT_DIR is not None else None)
+            if _rw_other_live is not None and _rw_other_live.exists():
+                try:
+                    _rw_other_items = read_jsonl(_rw_other_live)
+                except Exception:
+                    _rw_other_items = None  # fail-open cross-queue
+            rw_result = _residual_work_eval(
+                goal_id=goal_id,
+                outcome_note=str(goal.get("outcome_note") or ""),
+                override=rw_override,
+                items=items,
+                other_items=_rw_other_items,
+                world_dir=WORLD_DIR,
+                agent_name=(AGENT_DIR.name if AGENT_DIR else ""),
+                goal_priority=goal.get("priority"),
+                goal_category=goal.get("category"),
+            )
+            if rw_result.get("would_block"):
+                filed_successor_id = None
+                rw_filing_status = "not_attempted"
+                existing = _rw_find_existing_successor(
+                    items, goal_id, _rw_other_items)
+                if existing is not None:
+                    rw_filing_status = (
+                        f"existing successor {existing.get('id')} pending in "
+                        f"{existing.get('_aspiration_id')} "
+                        f"({existing.get('_source')} queue, strategy="
+                        f"{existing.get('_match_strategy')}) — idempotent "
+                        f"skip; cite it in outcome_note")
+                else:
+                    # Target: the original goal's own aspiration (a residual
+                    # continues that aspiration's work), else first active.
+                    _rw_target = asp
+                    if _rw_target is None or _rw_target.get(
+                            "status") not in (None, "active"):
+                        _rw_target = next(
+                            (a for a in items
+                             if a.get("status") == "active"), None)
+                    if _rw_target is None:
+                        rw_filing_status = ("no target aspiration available "
+                                            "— filing skipped")
+                    else:
+                        # Allocate g-NNN-NN under the target — same live +
+                        # evicted-id max as _file_unblock_under_existing_lock
+                        # ( tombstone awareness).
+                        _rw_asp_num = (_rw_target.get("id", "")
+                                       .replace("asp-", ""))
+                        _rw_max_seq = 0
+                        _rw_live_ids = [g.get("id", "")
+                                        for g in _rw_target.get("goals", [])]
+                        for gid in _rw_live_ids + _all_evicted_ids(_rw_target):
+                            m = re.match(r"^g-\d{3}-(\d{2,4})", gid)
+                            if m:
+                                _rw_max_seq = max(_rw_max_seq,
+                                                  int(m.group(1)))
+                        _rw_new_id = f"g-{_rw_asp_num}-{_rw_max_seq + 1:02d}"
+                        _rw_goal = _rw_build_successor(
+                            goal_id, rw_result, _rw_new_id)
+                        try:
+                            validate_goal(_rw_goal)
+                            _rw_target.setdefault("goals", []).append(
+                                _rw_goal)
+                            recompute_progress(_rw_target)
+                            _write_live_under_lock(
+                                items,
+                                f"residual-gate filed successor "
+                                f"{_rw_new_id} for {goal_id}")
+                            filed_successor_id = _rw_new_id
+                            rw_filing_status = (f"Filed successor "
+                                                f"{_rw_new_id} in "
+                                                f"{_rw_target.get('id')}")
+                        except (ValueError, OSError) as exc:
+                            rw_filing_status = f"filing failed: {exc}"
+                print(
+                    f"BLOCKED: closing {goal_id} as 'completed' but its "
+                    f"outcome_note names undone work (markers: "
+                    f"{', '.join(rw_result['matched_markers'])}) with no "
+                    f"live carrier cited. Residual clause: "
+                    f"\"{(rw_result.get('residual_clause') or '')[:160]}\"\n\n"
+                    f"Either:\n"
+                    f"  1. Cite a live carrier in outcome_note (e.g. "
+                    f"'residual carried by "
+                    f"{filed_successor_id or 'g-NNN-NN'}') and retry\n"
+                    f"  2. Record an explicit owner decline in outcome_note "
+                    f"and retry\n"
+                    f"  3. Pass --override-residual \"<justification>\" "
+                    f"(audited to world/residual-work-overrides.jsonl)\n\n"
+                    f"Residual-gate successor routing: {rw_filing_status}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            if rw_override and rw_result.get("matched_markers"):
+                print(
+                    f"[residual-work-gate] --override-residual on "
+                    f"{goal_id}: {rw_override}",
                     file=sys.stderr,
                 )
 
@@ -2182,6 +2386,38 @@ def cmd_update_goal(args):
         ):
             goal["original_interval_hours"] = _prev_interval_hours
 
+        # : RE-BASE the anchor on a DELIBERATE cadence raise.
+        #
+        # The write-once branch above is correct for the CAP consumer
+        # (cargo-cult-detector: proposed = min(interval*multiplier,
+        # original*cap_ratio)) — a freely-mutable anchor there is exactly the
+        #  unbounded ratchet it was written to stop. But the FLOOR
+        # consumer reads the SAME field (contract: floor =
+        # original*contract_floor_ratio) and goes stale-LOW when a cadence is
+        # deliberately raised: a goal widened 24h -> 168h kept floor =
+        # 24*0.33 = 7.92h, so a deep-outcome streak could walk a weekly cadence
+        # back toward ~8h. One field, two consumers, opposite requirements.
+        #
+        # The discriminator needs no new field and no caller flag. An
+        # auto-extension is bounded BY CONSTRUCTION at original*cap_ratio, so a
+        # write STRICTLY ABOVE that bound provably did not come from one — only
+        # a manual or batch cadence edit can land there. Re-basing on exactly
+        # those writes keeps the anchor immutable for every automatic path, so
+        # the cap cannot ratchet.
+        #
+        # Measured 2026-08-13 (zeta, hostname cc-02, uname -r 6.8.0-137-generic)
+        # over the live world store: of 50 recurring goals carrying both fields,
+        # 25 had interval > original and 6 sat ABOVE the cap bound (up to 7.0x
+        # —  at 168h vs anchor 24h). Those 6 are unreachable by
+        # auto-extension and are the manual-raise population this branch fixes.
+        # The 4 sitting EXACTLY at 3.0x are auto-extensions at their cap and are
+        # correctly left alone by the strict inequality.
+        elif field == "interval_hours":
+            _anchor = goal.get("original_interval_hours")
+            _new_interval = goal.get("interval_hours")
+            if _is_deliberate_raise(_anchor, _new_interval):
+                goal["original_interval_hours"] = _new_interval
+
         # Stamp last_modified on every successful field write. A general
         # last-touched timestamp (originally -a for the stale-read gate,
         # retired ). Single timestamp per cmd_update_goal call
@@ -2248,10 +2484,22 @@ def cmd_update_goal(args):
         # Scoped to value=="completed" (attribution = who completed it); agent
         # from MIND_AGENT. Idempotent: only when unset, preserving explicit
         # /aspirations-complete-by attribution and external backfill.
+        # : `_stamped_completed_by` carries THIS write's decision down to
+        # the completed_by_sid stamp below, so the pair lands together or not at
+        # all. Both halves were first-wins on their OWN guard, which is coherent
+        # per-field and wrong for a pair: on a goal that already carries the name
+        # and not the sid, this arm skips while the sid arm fires, filling the
+        # empty half from whoever happens to issue the next write. Measured
+        # 2026-08-09 over the full store: 4239 completed goals in exactly that
+        # state, and 6 of 14 completion-SIDs already carrying more than one
+        # completed_by. Leaving the sid absent on those is the intended outcome —
+        # "an absent sid beats a wrong one" (aspirations_write.py _completed_by_sid).
+        _stamped_completed_by = False
         if field == "status" and value == "completed" and not goal.get("completed_by"):
             _completed_by_agent = os.environ.get("MIND_AGENT", "").strip()
             if _completed_by_agent:
                 goal["completed_by"] = _completed_by_agent
+                _stamped_completed_by = True
 
         # Persist blocker_ref alongside defer_reason when one was validated.
         # Store under the canonical key so goal-selector, quiescence-gate, and
@@ -2362,7 +2610,17 @@ def cmd_update_goal(args):
             # it. completed_at / completed_by / completed_by_sid are now one
             # coherent first-wins triple. The pop stays unconditional: the claim
             # triple clears at EVERY terminal transition (guard-151).
-            if value == "completed" and not goal.get("completed_by_sid"):
+            #
+            # : "one coherent first-wins triple" was true field-by-field
+            # and false as a PAIR — each half guarded itself, so a write could
+            # fill one and skip the other. `_stamped_completed_by` is the join:
+            # the sid stamps only on the write that also stamped the name. Note
+            # this is deliberately stricter than "completed_by was unset" — an
+            # unset name with no resolvable agent stamps nothing, and that must
+            # not license a sid, because a sid with no name beside it is exactly
+            # the shape  was filed to remove.
+            if (value == "completed" and _stamped_completed_by
+                    and not goal.get("completed_by_sid")):
                 _cbs = (os.environ.get("MIND_SID", "").strip()
                         or goal.get("claimed_by_sid"))
                 if _cbs:
@@ -2393,7 +2651,45 @@ def _emit_e9_skip_observation(goal_id, new_status, goal):
     """
     title = goal.get("title", "")
     desc = goal.get("description", "")
-    skip_reason = goal.get("skip_reason") or goal.get("defer_reason") or "no reason given"
+    # `outcome_note` is IN this chain because it is where the skip rationale
+    # actually lands. `skip_reason` is not a field any writer sets — measured
+    # 2026-08-16 (bravo, cc-05, ): the key is structurally ABSENT from
+    # every goal record, so with only skip_reason+defer_reason the fallback
+    # fired on 100% of skips and the buffer read "Reason: no reason given" for
+    # five goals carrying 85-3316 chars of recorded rationale each. That is a
+    # manufactured false alarm: it reads as a hygiene problem ("5 goals skipped
+    # blind") when the true count is zero, which trains the reader to discount
+    # the buffer. rb-245 class — a zero produced by reading a field the store
+    # does not carry. `pending-questions-sweep.py` already reads
+    # ("outcome_note", "completion_note", "skip_reason") for the same question,
+    # so the correct precedence was already established one file over.
+    # ORDER: outcome_note outranks defer_reason because on a SKIPPED goal the
+    # defer is a stale leftover from before the skip decision, while
+    # outcome_note IS the skip decision. Reachable, not inert: this function
+    # fires on the STATUS write, and the framework's own documented order is
+    # "outcome_note FIRST, then set status=skipped" (see the superseded-status
+    # guard above, ~L2017; agent-watchdog.py writes the pair in exactly that
+    # order), so the note is on the record by the time we read it here.
+    # `str(...)` and `.strip()` are both load-bearing, and a fresh-eyes probe
+    # (, same goal that added this line) found all three cases the
+    # bare `(x or "")[:300]` form got wrong — every one INTRODUCED by the
+    # subscript, since the pre-fix chain had none:
+    #   dict  -> `KeyError: slice(None, 300, None)`. Raised OUTSIDE the try
+    #            below and from an unguarded call site, so a hook documented
+    #            "fail-open, never blocks the status-change return path" failed
+    #            CLOSED, after the status write had already committed.
+    #   list  -> returned a LIST, which the f-string then embedded as
+    #            "Reason: ['a', 'b']".
+    #   "  \n" -> whitespace is truthy, so it short-circuited PAST
+    #            defer_reason and the fallback: "Reason:    ." — strictly worse
+    #            than the "no reason given" it was meant to replace.
+    # Keep `outcome_note` INSIDE this parenthesized chain: the two-copy sync
+    # pin in test_e9_skip_observation_reason.py asserts on the chain's own
+    # text, so hoisting the lookup to a local would silently defeat it.
+    skip_reason = (goal.get("skip_reason")
+                   or str(goal.get("outcome_note") or "").strip()[:300]
+                   or goal.get("defer_reason")
+                   or "no reason given")
     # Skip trivial / mechanical goals — no encoding value.
     if len(desc) < 40 and len(title) < 30:
         return
@@ -2661,6 +2957,15 @@ def main():
     p_ug.add_argument("goal_id", type=str, help="Goal ID")
     p_ug.add_argument("field", type=str, help="Field to update")
     p_ug.add_argument("value", type=str, help="New value")
+    # : the goal-field allowlist bypass. Deliberately shaped like
+    # --force-defer above (justification-bearing, echoed for audit) rather than a
+    # bare boolean: a genuinely new field should be a decision someone can read
+    # back later, not a flag someone reaches for to make an error message stop.
+    p_ug.add_argument("--allow-new-field", default=None,
+                      help="Justification for writing a goal field that is not in "
+                           "_goal_fields.GOAL_KNOWN_FIELDS. Register the field in "
+                           "core/scripts/_goal_fields.py in the same change that "
+                           "ships its writer. Echoed to stderr for auditability.")
     # --force-defer is the defer-time analogue of blocker-create-gate's
     # --override-blocker-gate and capability-gate's --override-agent-match.
     # Required to bypass the capability-gate check when field == defer_reason.
@@ -2729,6 +3034,17 @@ def main():
                            "the path was renamed / removed / a typo in the "
                            "description (e.g., .json vs .jsonl). Logged to "
                            "world/missing-artifact-overrides.jsonl.")
+    # --override-residual is the close-time bypass for the Layer-B
+    # residual-work gate (): outcome_note names undone work but no
+    # live carrier is cited. Use only for genuine marker false-positives
+    # (e.g. the note QUOTES residual vocabulary while all work was done).
+    p_ug.add_argument("--override-residual", dest="override_residual",
+                      default=None,
+                      help="Justification for closing a goal as 'completed' "
+                           "when its outcome_note matches residual-work "
+                           "markers with no live carrier cited. Bypasses the "
+                           "residual-work gate; logged to "
+                           "world/residual-work-overrides.jsonl.")
     # --blocker-ref is the structured companion to a narrative defer_reason.
     # Required for any non-null, non-structured-prefix defer_reason write so
     # the quiescence gate can distinguish genuine external gating from

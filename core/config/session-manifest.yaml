@@ -118,6 +118,33 @@ files:
     required_when_idle: false
     required_when_running: false
 
+  #  (user directive 2026-08-15: "the loop goes into quiet mode and
+  # stays quiet unnoticed"). Four framework paths stop the loop ON PURPOSE —
+  # productivity-stop-gate, recovery-gate's zombie RUNNING->IDLE, recovery-gate's
+  # recovery-failed-permanent circuit breaker, and reducer-self-fence's lease
+  # stepdown. `/start` is USER-ONLY, so after any of them the box sits IDLE until
+  # a human independently notices. This file is the machine-readable record of
+  # WHICH path fired and why, and it is what lets the out-of-loop fleet sweeper
+  # () separate EXPECTED-IDLE (a reason file exists — deliberate, and
+  # already announced once) from UNEXPECTED-IDLE (no reason file — the process
+  # died, nobody was told, alert).
+  # Contents are KEY=VALUE lines (path, stopped_at, agent, box, reason,
+  # user_initiated, notified) — same rationale as claim-heartbeat-failure below:
+  # jq is absent on some fleet boxes.
+  # recovery_action: clear is LOAD-BEARING, not housekeeping. A file left behind
+  # after the agent restarts would make the sweeper read a LATER crash as
+  # EXPECTED-IDLE — a false negative on precisely the case it exists to catch.
+  # sync_tier: machine_local for the same reason as running-session-id: a stop on
+  # this box says nothing about a peer, and syncing would manufacture phantom
+  # stop reasons fleet-wide.
+  - file: last-stop-reason
+    purpose: which deliberate-stop path fired and why (absent = no deliberate stop since the last /start)
+    writer: stop-reason-record.py (from productivity-stop-gate.sh, recovery-gate.sh x2, reducer-self-fence.sh)
+    recovery_action: clear
+    sync_tier: machine_local
+    required_when_idle: false
+    required_when_running: false
+
   - file: runner-heartbeat
     purpose: freshness probe (mtime-based) — heartbeat-stale.sh reads this
     writer: heartbeat-tick.sh (aspirations loop Phase -0.5, /start autonomous seed, interruptible-sleep.sh 60s tick)
@@ -214,6 +241,26 @@ files:
   - file: iteration-checkpoint.json
     purpose: in-flight obligation tracker for graceful-stop recovery
     writer: aspirations loop
+    recovery_action: clear
+    sync_tier: machine_local
+    required_when_idle: false
+    required_when_running: false
+
+  # machine_local is load-bearing here, not housekeeping (). This file
+  # is a BOX-LOCAL bracket: written at graceful-stop entry, cleared at the final
+  # housekeeping step, and it carries stop_started_at / target_mode /
+  # last_updated / resume_count with NO machine or session identifier — so once
+  # it crosses boxes nothing downstream can tell whose stop it describes.
+  # Unregistered, the sync filter fell through to its fail-safe heuristic, which
+  # mirrors any known data extension, so a .json sentinel SYNCED. The Session
+  # Start Protocol probes it on every IDLE start and, on a hit with mode still
+  # autonomous, routes straight into the graceful-stop resume handler — so a
+  # synced-in checkpoint made a fresh session on box B resume a stop that
+  # happened on box A. The probe is itself a read, so under read-through caching
+  # the probe MATERIALISES the file: the defect was self-triggering.
+  - file: stop-checkpoint.json
+    purpose: interrupted-stop sentinel (graceful-stop in progress ON THIS BOX)
+    writer: stop-checkpoint.sh (/stop GS-0 entry, cleared at final housekeeping)
     recovery_action: clear
     sync_tier: machine_local
     required_when_idle: false
@@ -352,6 +399,37 @@ files:
     writer: agent-completion-report Phase 5
     recovery_action: preserve
     sync_tier: continuity
+    required_when_idle: false
+    required_when_running: false
+
+  # The three Phase 5.5 digest artifacts. Registered 2026-08-17 (, echo,
+  # cc-03): the SKILL.md has named all three paths since the phase shipped, and
+  # none was declared here — so the Write-tool manifest gate REFUSED the one an
+  # LLM writes by hand (digest-notes.md) while the two a bash script writes went
+  # through unnoticed. The gate is Write-tool-only, so the gap was invisible
+  # until an agent actually took the documented optional path. All three are
+  # regenerable from the stores; losing them costs one rebuild.
+  - file: fleet-digest.md
+    purpose: plain-text user-facing fleet digest (the gates, ledger and dedup read this one)
+    writer: completion-digest.sh (agent-completion-report Phase 5.5)
+    recovery_action: regenerate
+    sync_tier: ephemeral
+    required_when_idle: false
+    required_when_running: false
+
+  - file: fleet-digest.html
+    purpose: HTML rendering of the same digest — the body the user actually opens
+    writer: completion-digest.sh (agent-completion-report Phase 5.5)
+    recovery_action: regenerate
+    sync_tier: ephemeral
+    required_when_idle: false
+    required_when_running: false
+
+  - file: digest-notes.md
+    purpose: optional bounded (<=12 line) LLM-authored note prepended to the digest — only what the stores cannot say
+    writer: agent-completion-report Phase 5.5 (hand-written, optional)
+    recovery_action: regenerate
+    sync_tier: ephemeral
     required_when_idle: false
     required_when_running: false
 
@@ -634,8 +712,8 @@ files:
   # that should have been released. Cheap to lose, dangerous to keep.
   - file: 'body-heartbeat-*.json'
     glob: true
-    purpose: cross-box Body liveness carrier — {sid, agent, host, ts}; consulted by stranded-claim-sweep's foreign-SID grace
-    writer: heartbeat-tick.sh (per-SID, above the IDLE state gate)
+    purpose: cross-box Body liveness carrier — {sid, agent, host, ts, body_state}; consulted by stranded-claim-sweep's foreign-SID grace and by worker_stall's peer-side stall probe. body_state (g-306-319) mirrors body-manifest.yaml, which a peer CANNOT read (it lives under sessions/, an owncloud_sync._EXCLUDE_DIRS walk-prune); without it a Body that closed and a Body that died between units are byte-identical to the probe. Empty string when the manifest is unreadable — the reader renders that as stale_state_unknown, which never alerts.
+    writer: heartbeat-tick.sh (per-SID, above the IDLE state gate); body_state ALSO mirrored on transition by body-manifest.py set_state / park_body / resume_body, because a Body's last tick precedes its close
     recovery_action: clear
     sync_tier: continuity
     required_when_idle: false
@@ -924,6 +1002,130 @@ files:
     writer: sweep-mutation-surface.py (read by its own _read_watermark)
     recovery_action: preserve
     sync_tier: machine_local
+    required_when_idle: false
+    required_when_running: false
+
+  # ── Orphans registered 2026-08-16 () ─────────────────────
+  # WHY registration is the cure. Session files are SYNC-BY-DEFAULT with this
+  # manifest as a DENYLIST (owncloud_sync.py:235 says so verbatim). An
+  # UNREGISTERED basename carrying a data extension (_SESSION_DATA_EXTS) falls
+  # through _session_file_machine_local and therefore SYNCS — while the
+  # both-diverged LOCAL-WINS auto-resolve (_is_single_writer_session_file,
+  # ) requires manifest registration with sync_tier
+  # continuity|ephemeral. Unregistered => INELIGIBLE. Verified 2026-08-16
+  # against coordination_merge.merge_handler_for: all ten below return None
+  # (class (b), fence-only per governed-store-write-classes.md), so nothing
+  # heals a divergence and a both-diverged fence is a PERMANENT wedge.
+  # A merge handler is the WRONG lane by design — guard-907 is explicit that
+  # single-writer session files are DELIBERATELY not merge-registered, because
+  # a union of two sessions' private state is semantically wrong. The
+  # discriminator between working-memory.yaml (heals itself, same
+  # single-writer shape, also no handler) and drain-lane-state.json (wedged
+  # ~36h / 212 conflict-skips on cc-02) is REGISTRATION, not the handler.
+  #
+  # THE POPULATION IS BOX-DEPENDENT AND THIS LIST IS A UNION, NOT A CENSUS.
+  # The filing scan (zeta, cc-02, 2026-08-15) found 11; an independent re-scan
+  # (bravo, cc-05, 2026-08-16) found 7 — six overlap, five of cc-02's are
+  # absent here, and agent-inbox-inverse-audit.json is one cc-02 never saw. A
+  # session-dir scan enumerates what THIS box happens to hold, so NO single
+  # box can observe the whole population and a same-box re-scan reporting zero
+  # is not evidence the class is closed. The manifest is fleet-wide and
+  # committed, so registering the union is safe (an entry for a file absent
+  # here is inert) and necessary. Positive controls that make any re-scan
+  # valid: agent-state must classify machine_local=True and
+  # working-memory.yaml machine_local=False — without both, read no buckets.
+  #
+  # NOT registered, deliberately: sel2.json / sel3.json (stale zeta selector
+  # debug captures, ~100KB each, 2026-07-19). They are debris to be deleted,
+  # not state — registering would legitimize them. They do not exist on cc-05,
+  # so they could not be READ before deleting (archive-before-delete), and
+  # deleting another agent's files sight-unseen is exactly what that rule
+  # forbids. Left for a session on their own box.
+  - file: drain-lane-state.json
+    purpose: per-BOX goal-selector cadence counter (invocations_since_pick, k, eligible_count, last_pick_goal_id, ts). machine_local because merging or syncing two boxes' selector counters is meaningless — and because never being pushed means it can never diverge, which ELIMINATES the wedge class rather than healing it. This is the worked specimen for this whole block — it wedged on cc-02 for ~36h / 212 conflict-skips, and it exists on 5 of 7 agents, so the exposure was fleet-wide.
+    writer: goal-selector.py (write_baseline at every selector invocation)
+    recovery_action: clear
+    sync_tier: machine_local
+    required_when_idle: false
+    required_when_running: false
+
+  - file: pending-deploys.yaml
+    purpose: in-flight deploy tracking consumed across sessions by the stop-hook pending-deploys gate. Product-delivery state — a permanent wedge here silently freezes deploy tracking with no healing path, which is why it is continuity rather than ephemeral.
+    writer: iteration-close.sh / deploy-detect-hook.sh / deploy-verify.sh
+    recovery_action: preserve
+    sync_tier: continuity
+    required_when_idle: false
+    required_when_running: false
+
+  - file: pending-escalations.yaml
+    purpose: registered self-escalations awaiting a reply, carried across sessions until answered or aged out. Cross-session meaning — losing it silently drops escalations that were never resolved.
+    writer: self-escalation-register.sh / escalation-reply-scan.sh / pending_escalations.py (domain)
+    recovery_action: preserve
+    sync_tier: continuity
+    required_when_idle: false
+    required_when_running: false
+
+  - file: escalation-scan-watermark.txt
+    purpose: high-water mark for the escalation email scan, so every in-window email is read EXACTLY once across successive runs rather than re-read from a newest-N truncation. continuity (not machine_local) precisely BECAUSE the exactly-once property should survive a machine move — losing it re-reads the whole backlog (measured ~112 emails in a post-ask storm). Reset by deleting the file.
+    writer: escalation-reply-scan.sh (domain)
+    recovery_action: preserve
+    sync_tier: continuity
+    required_when_idle: false
+    required_when_running: false
+
+  - file: pr-merge-state-cache.json
+    purpose: per-agent cache of PR merge state, so the merged-PR predicate does not re-query GitHub on every evaluation. ephemeral because it is a pure CACHE — the facts it holds are global (GitHub) and re-queryable, so losing it costs one re-query and nothing else. Note both ephemeral and continuity are auto-resolve eligible, so the wedge fix does not turn on this choice; the tier only decides whether it joins the continuity pull-set, and a rebuildable cache should not. g-115-3406 read the same writer and reached the same conclusion independently.
+    writer: predicate.py (_pr_cache_load / _pr_cache_save)
+    recovery_action: clear
+    sync_tier: ephemeral
+    required_when_idle: false
+    required_when_running: false
+
+  - file: tree-write-conflicts.jsonl
+    purpose: append-only diagnostic log of tree-write fence conflicts, paired with the per-node tree-write-baselines directory. ephemeral rather than continuity — it is per-box diagnostic history, and ephemeral makes it auto-resolve eligible (LOCAL-WINS) so a divergence costs some diagnostic history instead of permanently wedging the file. Deliberately NOT given a merge handler despite being append-only (guard-907 — the union of two sessions' fence records is not meaningful).
+    writer: tree_write_fence.py
+    recovery_action: preserve
+    sync_tier: ephemeral
+    required_when_idle: false
+    required_when_running: false
+
+  - file: spark-gap-telemetry.jsonl
+    purpose: append-only telemetry on Phase-6 spark gaps (which closes fired a spark and which did not). Diagnostic trend data, regenerated continuously by the loop; safe to lose on divergence.
+    writer: iteration-close.sh
+    recovery_action: preserve
+    sync_tier: ephemeral
+    required_when_idle: false
+    required_when_running: false
+
+  - file: checkpoint-miss.jsonl
+    purpose: append-only telemetry recording iteration-checkpoint write misses (claim-time anchor vs loop-state-save). Diagnostic only — the loop does not read it to make decisions, so losing it on divergence costs trend data and nothing else.
+    writer: aspirations-claim.sh / loop-state-save.py
+    recovery_action: preserve
+    sync_tier: ephemeral
+    required_when_idle: false
+    required_when_running: false
+
+  - file: mdl-existing-corpus.jsonl
+    purpose: cached corpus snapshot for the MDL gate's description-length comparison at state-update time. A rebuildable cache derived from the live stores, not a record of anything — regenerating it is cheap, so ephemeral.
+    writer: mdl_gate.py (via aspirations-state-update)
+    recovery_action: clear
+    sync_tier: ephemeral
+    required_when_idle: false
+    required_when_running: false
+
+  - file: cnc-drain-holds.jsonl
+    purpose: per-agent HOLD ledger for the completed-not-closed drain (aspirations-precheck Phase 0.5g.7). One row per `completed-not-closed-slate.sh --hold <goal> --reason` -- {goal_id, held_at, reason, agent, sid}; the slate holds a row back for completed_not_closed_drain.hold_ttl_hours and then re-serves it with its hold_count. Rows older than 30d are pruned on the next append, so it is bounded by construction. Touches no goal record. continuity because the reducer moves boxes and a lost ledger re-serves yesterday's holds (harmless, but the whole point of the ledger); losing it can never hide a row -- a missing ledger reads as an empty hold set (fail-open). Registered 2026-08-16 (fresh-eyes review of the Phase-1 drain).
+    writer: completed-not-closed-slate.py --hold (reducer-only lane)
+    recovery_action: preserve
+    sync_tier: continuity
+    required_when_idle: false
+    required_when_running: false
+
+  - file: agent-inbox-inverse-audit.json
+    purpose: output of the agent-inbox inverse audit (which expected inbound messages have no matching inbox record). Per-box audit artifact, regenerated by re-running the audit. Registered 2026-08-16 — this one was invisible to the cc-02 filing scan and is the direct evidence that the orphan population cannot be enumerated from a single box.
+    writer: agent-inbox-inverse-audit.sh (domain)
+    recovery_action: clear
+    sync_tier: ephemeral
     required_when_idle: false
     required_when_running: false
 

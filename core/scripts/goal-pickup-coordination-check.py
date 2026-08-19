@@ -100,6 +100,23 @@ JSON output:
     "affected_paths": [str, ...],      # extracted from goal prose
     "keywords": [str, ...],            # significant tokens from goal title
     "race_risk": bool,                 # overlapping commit OR uncommitted OR SURVIVING board claim/complete
+    # --- done-but-pending disposition ( / gap-100) ---
+    # Answers "has THIS GOAL's own work already shipped?" — orthogonal to
+    # race_risk, which answers "is a PARTNER on my surface?". Never folded
+    # into race_risk: an already-shipped goal is not a collision.
+    "shipped_verdict": "DONE-AND-MERGED" | "OPEN-PR-STALE"
+                     | "WORK-EXISTS-UNMERGED" | "CANNOT-SEE"
+                     | "GENUINELY-PENDING",
+    "shipped_obliges": str,            # what THIS verdict obliges the caller to do
+    "own_goal_commits": [              # commits whose SUBJECT names this goal id
+      {"hash", "short", "date", "subject", "on_origin_main": True|False|None}
+      # RECURRING goals: commits at or before lastAchievedAt are dropped —
+      # a recurring id appears in every prior cycle's subject ()
+      # None = UNDETERMINABLE (sha absent from this clone) — never "not merged"
+    ],
+    # product_pr_hits entries additionally carry "live_pr" when the PR is OPEN:
+    #   {"mergeable", "mergeStateStatus", "headRefOid",
+    #    "checks_state": "green"|"none"|"red"|"unknown"}
     "overlapping_commits": [
       {"hash", "short", "subject", "committed_goal_id",
        "matched_paths": [...], "matched_keywords": [...]}
@@ -279,26 +296,52 @@ def _path_overlap(affected, committed_file):
 
 
 def classify_overlap(affected_paths, keywords, commits, own_goal_id,
-                     min_shared_keywords=2):
+                     min_shared_keywords=2, agent_queue_private=False, me=""):
     """Pure overlap classifier. `commits` is a list of dicts with keys
     {hash, subject, files}. Returns (race_risk, overlapping_commits) where each
     overlapping entry records WHY it matched. A commit whose own scope goal id
     equals `own_goal_id` is excluded (the agent's own work on this goal).
+
+    THE PRIVATE-QUEUE CARVE-OUT (g-115-6353). The exclusion above says "my own
+    in-progress commit", and for a private agent-queue id that premise is simply
+    false for a partner's commit: the id collides across queues, so their
+    `g-001-01` is a DIFFERENT goal and the exemption is silently swallowing a
+    partner's work. Such a commit is re-admitted to classification — but on the
+    PATH route ONLY, never the keyword route.
+
+    That asymmetry is measured, not stylistic, and the filing goal prescribed
+    plain re-admission. Over alpha's full agent queue against a 168h window
+    (2026-08-15, cc-07): re-admitting everything surfaces **60 keyword-only and 1
+    path-overlap** hit. The 60 are all one shape — five agents run the identically
+    TITLED per-agent recurring goal, so `extract_keywords` matches its own title
+    against itself every cycle, forever, on every agent. `race_risk` on g-001-01
+    would flip False -> True permanently, fleet-wide, carrying zero information.
+    The 1 is real (a partner commit touching `core/scripts/pipeline-archive.sh`,
+    a path the goal itself named) and is exactly the silent miss worth closing:
+    a SHARED path is contended no matter whose private queue the id lives in.
+    60:1 says the keyword route must stay shut and the path route must open.
     """
     overlapping = []
     for cm in commits:
         subject = cm.get("subject") or ""
         cgid = commit_goal_id(subject)
-        if own_goal_id and cgid == own_goal_id:
-            continue  # the agent's own in-progress commit on THIS goal
         files = cm.get("files") or []
+        keyword_route = True
+        foreign = False
+        if own_goal_id and cgid == own_goal_id:
+            foreign = bool(agent_queue_private) and commit_is_foreign_agent_work(
+                files, me)
+            if not foreign:
+                continue  # the agent's own in-progress commit on THIS goal
+            keyword_route = False  # path evidence only — see docstring
         matched_paths = sorted({
             f for f in files
             if any(_path_overlap(ap, f) for ap in affected_paths)
         })
         commit_kw = extract_keywords(subject)
         matched_keywords = sorted(keywords & commit_kw)
-        if matched_paths or len(matched_keywords) >= min_shared_keywords:
+        if matched_paths or (
+                keyword_route and len(matched_keywords) >= min_shared_keywords):
             overlapping.append({
                 "hash": cm.get("hash", ""),
                 "short": (cm.get("hash", "") or "")[:9],
@@ -306,6 +349,10 @@ def classify_overlap(affected_paths, keywords, commits, own_goal_id,
                 "committed_goal_id": cgid,
                 "matched_paths": matched_paths,
                 "matched_keywords": matched_keywords,
+                # Legible provenance: without it a re-admitted hit reads as an
+                # ordinary overlap on a commit whose subject names THIS goal id,
+                # which is the most confusing possible presentation (guard-1760).
+                "foreign_agent_work": foreign,
             })
     return (len(overlapping) > 0, overlapping)
 
@@ -440,6 +487,44 @@ def is_private_agent_queue(source, cross_agent_owner=None):
     unchanged.
     """
     return source == "agent" and not cross_agent_owner
+
+
+def commit_is_foreign_agent_work(files, me):
+    """Pure. True when this commit is PROVABLY another agent's work: it touches at
+    least one `agents/<other>/` path and none of `agents/<me>/` (g-115-6353).
+
+    The GIT companion of is_private_agent_queue above. That predicate established
+    that a private agent-queue id names a per-agent record, so the SAME id in two
+    queues is two different goals — measured on this box 2026-08-15: 29 of 73
+    distinct agent-queue ids exist in more than one queue, and `g-001-01` exists in
+    all five. Git history is keyed on that colliding id alone (`type(goal-id):`),
+    so both git lanes read every agent's commits as if they were one goal's.
+
+    DELIBERATELY CONSERVATIVE, and the conservatism is the design. Three cases
+    return False: the commit touches my dir (mine, or a merge that includes mine);
+    it touches NO agent dir at all (framework-only — genuinely unattributable, and
+    4.8% of the live g-001-* population, measured over 1,268 commits/90d); or `me`
+    is unknown. Only provable foreignness is acted on. The prescribed remedy in the
+    filing goal was the mirror image — REQUIRE `agents/<me>/` — which drops that
+    4.8% and converts a false DONE into a false PENDING (guard-2499: measure the
+    changed predicate's recall over the live population before adopting it).
+
+    The roster is derived from the paths themselves, never a hardcoded partner
+    list: any `agents/<X>/` with X != me is someone else's dir, so this tracks
+    fleet size instead of the era it was written in (guard-3611).
+    """
+    me = (me or "").strip()
+    if not me or not files:
+        return False
+    others = False
+    for f in files:
+        m = _AGENT_DIR_RE.match(f or "")
+        if not m:
+            continue
+        if m.group(1) == me:
+            return False
+        others = True
+    return others
 
 
 def classify_board_mentions(goal_id, me, messages, goal_recurring=False,
@@ -1356,7 +1441,17 @@ def _scan_product_repos(goal_id, surface_text, affected_paths, keywords,
                 )
             if gh_ok:
                 for pr in _gh_pr_hits(p, goal_id):
-                    result["pr_hits"].append({"repo": n, **pr})
+                    entry = {"repo": n, **pr}
+                    # : re-read the LIVE mergeable/checks state for
+                    # OPEN PRs only. Gated on state so the common case (no PR,
+                    # or a long-merged one) costs nothing, and so the extra
+                    # network is spent exactly where the recorded verdict is
+                    # known to expire under it (guard-3034).
+                    if str(pr.get("state", "")).upper() == "OPEN":
+                        live = _live_pr_state(p, pr.get("number"))
+                        if live:
+                            entry["live_pr"] = live
+                    result["pr_hits"].append(entry)
         for n, p in repos:
             commits = _git_log_commits_at(p, since_hours)
             if commits:
@@ -1623,6 +1718,329 @@ def _agent_live_state():
     return out
 
 
+# --- Done-but-pending DISPOSITION ( / gap-100) ------------------
+#
+# Everything above answers "is a PARTNER racing me on the same SURFACE?".
+# gap-100 asks a different question at the same moment: "has THIS GOAL's own
+# work already shipped?" — and after nine identical hand-runs the answer was
+# still being re-derived from memory each time.
+#
+# WHY THIS EXTENDS THE RACE PROBE RATHER THAN FORGING A SEPARATE SKILL. The
+# evidence is ALREADY being gathered here and then deliberately thrown away:
+# classify_overlap skips every commit whose subject scope IS this goal's id
+# ("the agent's own in-progress commit on THIS goal"), which is exactly right
+# for the race question and exactly the evidence the shipped question needs.
+# _repo_branch_hits and _gh_pr_hits are already goal-id-keyed. And this script
+# already RUNS at Phase 4 pre-claim (aspirations-loop-digest.md), so the
+# disposition arrives with nothing to remember — a separate skill would have
+# reproduced the reach failure gap-100 was filed about.
+#
+# WHAT IS DELIBERATELY NOT DECIDED HERE. gap-100 names PARTIALLY-DONE as a
+# fourth verdict (: a merged PR covering 5 of 6 verify steps). Judging
+# verify-step coverage is reading, not matching, so this classifier does not
+# emit it — it emits DONE-AND-MERGED and OBLIGES the caller to check coverage
+# before closing. A fabricated PARTIALLY-DONE would be the more dangerous
+# output: it reads as a measurement.
+
+_RS, _US = "\x1e", "\x1f"
+
+_EXTERNAL_PREFIXES = ("world/", "meta/")
+
+# Routed through _paths so an AGENTS_PARENT_DIR rename tracks automatically —
+# CLAUDE.md's "Agent-dir Resolution" audit greps cannot see a literal "agents/"
+# baked into a prefix check, and this file would be invisible to all three.
+try:
+    from _paths import AGENTS_PARENT_DIR as _APD
+except Exception:
+    _APD = "agents"
+_STORE_PREFIXES = ((_APD.rstrip("/") + "/"),) if _APD else ()
+
+# Same routing, one capture group deeper: which agent's dir a file lives in.
+# Consumed by commit_is_foreign_agent_work (defined earlier — Python resolves
+# module globals at CALL time, and keeping every AGENTS_PARENT_DIR derivation in
+# this one block is worth more than co-location with its single caller).
+_AGENT_DIR_RE = re.compile(
+    r"^" + re.escape(_APD.rstrip("/")) + r"/([^/]+)/") if _APD else re.compile(r"(?!)")
+
+
+def _surface_is_external(affected_paths):
+    """True when every path the goal prose names lives under an EXTERNAL,
+    gitignored root (world/, meta/). Pure.
+
+    Load-bearing, and the reason CANNOT-SEE exists as a verdict (g-335-986):
+    when the deliverable is under world/scripts, `git log --grep <goal-id>`
+    returns nothing for a goal that was fully executed and shipped. Git
+    absence there is BLINDNESS, not evidence of absence — reporting it as
+    GENUINELY-PENDING is how a finished goal gets re-implemented. Same class
+    as guard-1947 (full-suite-recommender reports "no code changes" for every
+    domain-script edit ever made, because it detects via git).
+
+    ALL-not-ANY on purpose: one in-repo path makes the git rail informative
+    again, so a mixed surface is seen, not blind."""
+    paths = [p for p in (affected_paths or ()) if p]
+    if not paths:
+        return False
+    return all(p.startswith(_EXTERNAL_PREFIXES) for p in paths)
+
+
+def _is_store_churn(commit):
+    """True when EVERY file a commit touched lives under the agent-store root.
+
+    THE DOMINANT FALSE POSITIVE, and it is not a tail case. The loop stamps
+    every commit `type(goal-id): title`, INCLUDING the bookkeeping commits that
+    carry an agent's own journal / experience / changelog churn. Measured over
+    the 200 most recent goal-id-named commits on this box: **141 of them (70%)
+    touched nothing but agents/**. So for the majority of goals that have been
+    worked on at all, the only commit naming them is bookkeeping — and counting
+    it returns DONE-AND-MERGED for work that never shipped.
+
+    Caught live on g-350-148, a `work_class: product` goal whose deliverable
+    PR (#8, GetUserWebAppApiKey) was still OPEN and whose product-repo main had
+    not moved since 2026-08-06: the verdict read DONE-AND-MERGED on the
+    strength of ed8f9263c, a Mind-repo commit touching only
+    agents/echo/{changelog,experience,experience-meta} plus one experience .md.
+
+    A commit with NO file list (older probe shape, or a parse miss) is NOT
+    treated as churn — absence of evidence about the files is not evidence
+    that they were all bookkeeping. Pure."""
+    files = commit.get("files")
+    if not files:
+        return False
+    return all(f.startswith(_STORE_PREFIXES) for f in files) if _STORE_PREFIXES \
+        else False
+
+
+def classify_shipped(own_commits, pr_hits, branch_hits, external_surface,
+                     goal_recurring=False, goal_last_achieved=None):
+    """Pure disposition classifier. Returns (verdict, obliges).
+
+    `own_commits` entries carry {"hash","subject","date","on_origin_main"}
+    where on_origin_main is True / False / None (None = undeterminable, e.g.
+    the sha is not in this clone — NEVER read as 'not merged').
+
+    Precedence is evidence-first: positive evidence always outranks blindness,
+    and blindness always outranks a clean report.
+
+    RECURRING GOALS DROP PRIOR-CYCLE COMMITS, and without this the classifier
+    is not merely imprecise on them — it is wrong every single time. A
+    recurring goal's id appears in a commit subject on EVERY cycle it has ever
+    run, so an unfiltered read returns DONE-AND-MERGED for a goal that is due
+    right now. Caught on this function's second production invocation:
+    g-115-105 (achievedCount 302, lastAchievedAt 2026-08-09T09:23:30) returned
+    DONE-AND-MERGED on three commits dated 08-04, 08-06 and 08-08 — all prior
+    cycles. Same class, same goal, as the g-115-2978 stale-claim incident that
+    classify_board_mentions already guards twenty lines up.
+
+    FAIL-SAFE DIRECTION IS DELIBERATELY OPPOSITE to that sibling, and the
+    divergence is the point. There an unparseable timestamp KEEPS the hit,
+    because a false yield is safer than a missed race. Here an unparseable
+    timestamp DROPS the commit, because the two errors are not symmetric: a
+    false DONE-AND-MERGED tells the reader the work is finished and ENDS the
+    investigation, while a false GENUINELY-PENDING costs one redundant look.
+    Fall toward doing the work."""
+    own_commits = [c for c in (own_commits or ()) if not _is_store_churn(c)]
+    if goal_recurring:
+        kept = []
+        for c in own_commits:
+            try:
+                if parse_naive_iso(c.get("date")) > parse_naive_iso(
+                        goal_last_achieved):
+                    kept.append(c)
+            except Exception:
+                continue  # unparseable -> drop (see docstring)
+        own_commits = kept
+    merged = [c for c in own_commits if c.get("on_origin_main") is True]
+    if merged:
+        return ("DONE-AND-MERGED",
+                "Read the merged commit(s) against this goal's verification "
+                "outcomes BEFORE closing. Full coverage -> close on evidence, "
+                "zero code. A SUBSET is gap-100's PARTIALLY-DONE -> leave "
+                "in-progress and execute only the remainder.")
+    open_prs = [p for p in (pr_hits or [])
+                if str(p.get("state", "")).upper() == "OPEN"]
+    if open_prs:
+        return ("OPEN-PR-STALE",
+                "Do NOT re-implement. Re-read the LIVE mergeable/checks state "
+                "(live_pr on each hit) — a recorded green is a timestampless "
+                "fact about a moving target (guard-3034). Rebase/merge the PR "
+                "instead of opening a competing one.")
+    if own_commits or branch_hits:
+        return ("WORK-EXISTS-UNMERGED",
+                "Work naming this goal exists but nothing reached origin/main. "
+                "Find it and finish it — do not start over. Unpushed local "
+                "commits are invisible work (rb-6868).")
+    if external_surface:
+        return ("CANNOT-SEE",
+                "This goal's surface is under an EXTERNAL gitignored root, so "
+                "the git rail is BLIND, not negative (g-335-986). Read the "
+                "goal's outcome_note and the coordination board before "
+                "treating this as unstarted.")
+    return ("GENUINELY-PENDING",
+            "No shipped-work evidence on any rail. Execute normally.")
+
+
+def _own_goal_commits(goal_id, since_hours, cwd=None,
+                      agent_queue_private=False, me="", dropped_foreign=None):
+    """Commits anywhere in the repo whose SUBJECT names this goal id — the
+    loop stamps every commit `type(goal-id): title`, so history is the
+    per-goal ledger (gap-100 step 1). Fail-open [].
+
+    "whose SUBJECT names this goal id" is not the same as "this goal's work" when
+    the id is a private agent-queue id, because that id collides across queues
+    (g-115-6353). Provably-foreign commits are dropped here rather than in
+    classify_shipped, because everything downstream — the verdict, `shipped_obliges`,
+    the `own_goal_commits` payload a reader inspects — treats this list as THIS
+    goal's ledger; filtering later would leave the payload lying while the verdict
+    was right.
+
+    LATENT, NOT LIVE, ON THIS BOX — stated because the numbers look alarming and
+    two pre-existing filters are incidentally masking most of them. Live run
+    2026-08-15 (alpha, cc-07) on `g-001-01 --source agent`: 15 own_goal_commits,
+    only 1 of them mine, verdict nonetheless GENUINELY-PENDING. `_is_store_churn`
+    drops 13 (pure `agents/**` bookkeeping) and the recurring `lastAchievedAt`
+    filter absorbs the rest. Flip the one incidental mask and the defect is
+    immediate: `classify_shipped(<those same real commits>, goal_recurring=False)`
+    returns **DONE-AND-MERGED**, sourced entirely from echo's and zeta's work. 13
+    of alpha's 23 agent-queue goals are non-recurring, and 12 foreign commits
+    already survive the churn filter by touching one shared `.claude/` or
+    `core/scripts/` file. Neither mask was designed for this; the filing agent hit
+    it live on cc-03.
+    """
+    if not goal_id:
+        return []
+    try:
+        out = subprocess.check_output(
+            # _since_arg, NOT an f-string — a float in git approxidate is a
+            # SILENT total failure here, not a rounding error. Measured on this
+            # box 2026-08-09 while dogfooding this very function:
+            # `--since="168.0 hours ago"` returns ZERO commits with rc=0 on a
+            # repo with thousands, so every invocation reported
+            # GENUINELY-PENDING regardless of evidence — including for a goal
+            # committed 30 minutes earlier. The nine unit tests below stayed
+            # green throughout, because they pin the pure classifier and this
+            # is the impure probe that feeds it. _since_arg's own docstring
+            # already documented this exact trap, twenty lines up.
+            ["git", "log", "--all", _since_arg(since_hours),
+             f"--grep={goal_id}", "--no-merges", "--name-only",
+             f"--format={_RS}%H{_US}%cI{_US}%s", "--max-count=25"],
+            cwd=(str(cwd) if cwd else None), stderr=subprocess.DEVNULL,
+            timeout=20,
+        ).decode("utf-8", "replace")
+    except Exception:
+        return []
+    commits = []
+    for rec in out.split(_RS):
+        rec = rec.strip("\n")
+        if not rec:
+            continue
+        head, _, body = rec.partition("\n")
+        parts = head.split(_US)
+        if len(parts) < 3 or not parts[0].strip():
+            continue
+        subject = parts[2].strip()
+        # --grep matches the WHOLE MESSAGE, so a commit that merely CITES this
+        # goal id in its body arrives here as if it were this goal's work.
+        # Measured live:  (a due recurring goal) read
+        # WORK-EXISTS-UNMERGED purely because a DIFFERENT goal's commit
+        # narrative named it. commit_goal_id reads the SUBJECT only —
+        # preferring the `type(goal-id):` scope the loop stamps, falling back
+        # to a bare goal id in the subject (measured; an earlier draft of this
+        # comment claimed scope-only and was wrong). Either way it never reads
+        # the body, and the body is where a citation lives.
+        if commit_goal_id(subject) != goal_id:
+            continue
+        files = [ln.strip() for ln in body.split("\n") if ln.strip()]
+        if agent_queue_private and commit_is_foreign_agent_work(files, me):
+            # A partner's DIFFERENT goal wearing the same colliding id. Recorded
+            # rather than silently dropped: on this box the live  lane
+            # goes 15 commits -> 1, and an unexplained 14-commit shrink reads as
+            # "git found nothing" (guard-1760).
+            if dropped_foreign is not None:
+                dropped_foreign.append({
+                    "short": parts[0].strip()[:9],
+                    "date": parts[1].strip(),
+                    "subject": subject[:100],
+                    "agent_dirs": sorted({
+                        m.group(1) for f in files
+                        for m in [_AGENT_DIR_RE.match(f)] if m}),
+                })
+            continue
+        commits.append({"hash": parts[0].strip(), "short": parts[0].strip()[:9],
+                        "date": parts[1].strip(),
+                        "subject": subject[:100],
+                        "files": files})
+    return commits
+
+
+def _sha_on_origin_main(sha, cwd=None):
+    """True / False / None. None means UNDETERMINABLE — the object is not in
+    this clone (rc=128), which is not an answer and must never be rendered as
+    'not merged'. The rc=1-vs-anything-else split is the same distinction
+    /is-change-live enforces, and collapsing it is how an unfetched sha gets
+    reported as unshipped."""
+    if not sha:
+        return None
+    try:
+        rc = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", sha, "origin/main"],
+            cwd=(str(cwd) if cwd else None), stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=15, check=False,
+        ).returncode
+    except Exception:
+        return None
+    if rc == 0:
+        return True
+    if rc == 1:
+        return False
+    return None
+
+
+def _live_pr_state(repo_dir, number, timeout_s=20):
+    """LIVE re-read of one PR's mergeability + checks (gap-100 step 6).
+
+    The recorded '{ok: true, checks_state: green}' in a worker's note is a
+    TIMESTAMPLESS fact about a moving target: on the g-335-972 encounter the
+    note said green while the live probe read mergeable=CONFLICTING, because
+    main had advanced under the open PR in the intervening 7 hours
+    (guard-3034). So this never trusts a recorded verdict.
+
+    `gh pr checks` exit codes are NOT portable — a PR with no CI returns 1 on
+    some gh builds and 8 on others, so the '*' default renders a clean 0-check
+    PR as red (rb-3541). Disambiguate on the MESSAGE, never the code.
+    Fail-open: None on any error."""
+    if not number:
+        return None
+    state = {}
+    try:
+        out = subprocess.check_output(
+            ["gh", "pr", "view", str(number), "--json",
+             "mergeable,mergeStateStatus,headRefOid"],
+            cwd=str(repo_dir), stderr=subprocess.DEVNULL, timeout=timeout_s,
+        ).decode("utf-8", "replace")
+        got = json.loads(out or "{}")
+        if isinstance(got, dict):
+            state.update({k: got.get(k) for k in
+                          ("mergeable", "mergeStateStatus", "headRefOid")})
+    except Exception:
+        return None
+    try:
+        proc = subprocess.run(
+            ["gh", "pr", "checks", str(number)], cwd=str(repo_dir),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=timeout_s, check=False,
+        )
+        blob = (proc.stdout or b"").decode("utf-8", "replace")
+        if proc.returncode == 0:
+            state["checks_state"] = "green"
+        elif "no checks reported" in blob.lower():
+            state["checks_state"] = "none"
+        else:
+            state["checks_state"] = "red"
+    except Exception:
+        state["checks_state"] = "unknown"
+    return state
+
+
 def _build_advisory(goal_id, race_risk, overlapping, partners,
                     matched_uncommitted=None, partner_in_flight=None,
                     board_hits=None, product=None):
@@ -1640,6 +2058,11 @@ def _build_advisory(goal_id, race_risk, overlapping, partners,
             why.append("kw=" + ",".join(c["matched_keywords"][:4]))
         if c.get("matched_goal_id"):
             why.append("goal-id-in-subject")
+        if c.get("foreign_agent_work"):
+            # Without this the reader sees a commit whose subject names THEIR OWN
+            # goal id flagged as a race, which is the most confusing possible
+            # presentation of a correct finding ().
+            why.append("PARTNER's different goal, same colliding agent-queue id")
         repo_tag = f"[{c['repo']}] " if c.get("repo") else ""
         parts.append(
             f"{repo_tag}{c['short']} '{c['subject'][:60]}' ({'; '.join(why)})")
@@ -1739,6 +2162,16 @@ def main():
                          "product deliverables ship sparsely and the already-"
                          "shipped race spans days — the g-115-2156 PR was "
                          "pushed ~24h before the duplicate claim).")
+    ap.add_argument("--shipped-since-hours", type=float, default=168.0,
+                    help="lookback for commits whose SUBJECT names this goal "
+                         "id — the done-but-pending probe (default 168 = 7d). "
+                         "Much wider than the race window because the two "
+                         "questions have different clocks: a race is minutes "
+                         "to hours old, while already-shipped work sits "
+                         "pending for as long as nothing writes back to the "
+                         "goal record (measured 6h45m to >24h across gap-100's "
+                         "nine encounters). Cheap — a subject grep, not a "
+                         "tree walk.")
     ap.add_argument("--output", choices=["json", "human"], default="json")
     args = ap.parse_args()
 
@@ -1752,10 +2185,19 @@ def main():
     affected_paths = extract_paths(surface_text)
     keywords = extract_keywords(title)
 
+    # Resolved BEFORE the git lane, not just before the board lane: a private
+    # agent-queue id is a property of the GOAL, and all three lanes key on it
+    # (). It used to be computed between them, which is how the git
+    # lanes ended up namespace-blind while the board lane was fixed.
+    me = os.environ.get("MIND_AGENT", "")
+    agent_queue_private = is_private_agent_queue(
+        args.source, args.cross_agent_owner)
+
     commits = _git_log_commits(args.since_hours)
     race_risk, overlapping = classify_overlap(
         affected_paths, keywords, commits, args.goal_id,
-        min_shared_keywords=args.min_shared_keywords)
+        min_shared_keywords=args.min_shared_keywords,
+        agent_queue_private=agent_queue_private, me=me)
     partners = _read_partners()
 
     # Uncommitted (partner in-flight) probe — . Gated on a partner
@@ -1775,9 +2217,6 @@ def main():
     # Board probe — . The only partition-surviving surface: consult it
     # unconditionally (NOT gated on partner_in_flight — the whole point is that
     # team-state can be frozen while a partner is mid-claim on another box).
-    me = os.environ.get("MIND_AGENT", "")
-    agent_queue_private = is_private_agent_queue(
-        args.source, args.cross_agent_owner)
     board_hits = classify_board_mentions(
         args.goal_id, me, _board_recent_mentions(args.board_since_hours),
         goal_recurring=bool((goal or {}).get("recurring")),
@@ -1808,12 +2247,36 @@ def main():
         race_risk = True
     overlapping.extend(product["commits"])
 
+    # --- Done-but-pending disposition ( / gap-100) -------------
+    # Deliberately does NOT touch race_risk. The two questions are separate
+    # and fusing them would corrupt both: a goal whose OWN work already
+    # shipped is not a partner race, and flipping race_risk here would make
+    # every already-shipped goal read as a collision to the digest's yield
+    # branch.
+    dropped_foreign = []
+    own_commits = _own_goal_commits(args.goal_id, args.shipped_since_hours,
+                                    agent_queue_private=agent_queue_private,
+                                    me=me, dropped_foreign=dropped_foreign)
+    for c in own_commits:
+        c["on_origin_main"] = _sha_on_origin_main(c["hash"])
+    shipped_verdict, shipped_obliges = classify_shipped(
+        own_commits, product["pr_hits"], product["branch_hits"],
+        _surface_is_external(affected_paths),
+        goal_recurring=bool((goal or {}).get("recurring")),
+        goal_last_achieved=(goal or {}).get("lastAchievedAt"))
+
     advisory = _build_advisory(args.goal_id, race_risk, overlapping, partners,
                                matched_uncommitted=matched_uncommitted,
                                partner_in_flight=partner_in_flight,
                                board_hits=board_hits, product=product)
 
     result = {
+        "shipped_verdict": shipped_verdict,
+        "shipped_obliges": shipped_obliges,
+        "own_goal_commits": own_commits,
+        # Non-empty ONLY for a private agent-queue id: partners' commits wearing
+        # the same colliding id, excluded from the ledger above ().
+        "own_goal_commits_dropped_foreign": dropped_foreign,
         "goal_id": args.goal_id,
         "since_hours": args.since_hours,
         "affected_paths": sorted(affected_paths),
@@ -1827,6 +2290,9 @@ def main():
         # Say that the board lane was NOT consulted, rather than reporting an
         # empty lane that reads identically to "consulted, found nothing"
         # (guard-1760). True only for a private agent-queue id ().
+        # Key name is board-scoped for compatibility; the FLAG now governs all
+        # three lanes — board (short-circuit), _own_goal_commits (drop foreign),
+        # classify_overlap (re-admit foreign on path evidence) — see .
         "board_namespace_private": agent_queue_private,
         "product_surfaces": product["surfaces"],
         "product_repos_scanned": product["repos_scanned"],
@@ -1889,6 +2355,8 @@ def main():
                    "overlapping_commits": len(overlapping),
                    "board_hits": len(board_hits),
                    "product_repos_scanned": len(product["repos_scanned"]),
+                   "shipped_verdict": shipped_verdict,
+                   "own_goal_commits": len(own_commits),
                    "partner_in_flight": bool(partner_in_flight)})
     except Exception:
         pass  # best-effort; telemetry must never change the advisory verdict
@@ -1903,6 +2371,12 @@ def main():
               f"stale_claims={len(stale_claims)} "
               f"product={len(product['commits'])}c/"
               f"{len(product['branch_hits'])}b/{len(product['pr_hits'])}pr")
+        # Printed on EVERY run, including GENUINELY-PENDING. A disposition
+        # shown only when it is interesting teaches the reader that silence
+        # means "not checked", which is the ambiguity the telemetry block
+        # below was added to remove.
+        print(f"  shipped_verdict={shipped_verdict} "
+              f"(own_goal_commits={len(own_commits)}) — {shipped_obliges}")
         if advisory:
             print("  " + advisory)
     else:

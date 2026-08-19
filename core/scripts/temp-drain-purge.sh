@@ -172,6 +172,24 @@ assert_safe_temp_dir() {
 # file and revert this whole change with no signal — the change would look
 # installed while doing nothing. It is detected by testing each pattern against
 # a sentinel name no real artifact carries, and dropped LOUDLY on stderr.
+#
+# CLASS vs FAMILY — the sentinel above is NECESSARY BUT NOT SUFFICIENT, measured
+# 2026-08-16 (echo, cc-03). Every wildcard named above carries a literal STEM
+# ("mergeback-", "-"), which is what makes it a family: it names a
+# bounded set of artifacts an author actually produced. A pattern with NO literal
+# stem ("*.raw") names an entire file CLASS instead, and the sentinel cannot see
+# the difference — "*.raw" does not match the sentinel, so it passed through and
+# exempted ALL 84 aged .raw files on this box, reporting would_purge:0 against a
+# dir the lane was built to drain. 8 of 100 cited basenames carried glob
+# metacharacters and all 8 passed the sentinel, shielding 86 files.
+#
+# The offending citation was scraped from guard-3510's rule TEXT, where "*.raw"
+# appears as PROSE describing a redirect failure — not as an assertion that any
+# .raw file is evidence. So the discriminator is on SHAPE, not on provenance: a
+# citation that names a class is un-honorable no matter who wrote it, because
+# honoring it disables that extension in Lane 1 entirely. Dropped LOUDLY, same
+# as the sentinel case; the two branches are kept separate so "*"/"*.*" keep
+# their own message and the sentinel's test hook stays reachable.
 _PURGE_OVERBROAD_SENTINEL='zzz-overbroad-sentinel-9f3a2c'
 _purge_find_predicate() {
   local age_min="$1"; shift
@@ -185,6 +203,28 @@ _purge_find_predicate() {
       $_b) echo "temp-drain-purge: WARN — ignoring over-broad cited exemption '$_b' (matches any filename; honoring it would disable Lane 1 entirely)" >&2
            continue ;;
     esac
+    # A cited pattern with NO literal stem (leading wildcard) names a file CLASS,
+    # not a family of artifacts, so it is not a citation this lane can honor.
+    # See the "CLASS vs FAMILY" note above the sentinel for the measurement.
+    #
+    # THIS BRANCH ALSO CATCHES '*.*', WHICH THE SENTINEL ABOVE NEVER DID — measured,
+    # not assumed. The sentinel tests each pattern against a literal string that
+    # contains no dot, so '*.*' does not match it and was HONORED before this
+    # branch existed: a second silent lane-disabling pattern the over-broad guard
+    # was believed to cover. Only a bare '*' reaches the sentinel. Do not "simplify"
+    # by folding the two branches together on the assumption they overlap.
+    #
+    # KNOWN FALSE REJECT, latent: a pattern LEADING with a bracket expression
+    # ('[abc]foo.txt') names a bounded 3-file family but strips to an empty stem,
+    # so it is refused here and its cited evidence becomes purgeable. That is the
+    # harmful direction, so it is stated rather than left implicit. Measured
+    # 2026-08-16: 0 of 100 live cited basenames begin with '[' or '?'. If one ever
+    # does, widen the strip to skip a leading bracket group — do NOT drop the
+    # stem test.
+    if [ -z "${_b%%[*?[]*}" ]; then
+      echo "temp-drain-purge: WARN — ignoring class-wide cited exemption '$_b' (no literal stem; names a file CLASS, not an artifact family — honoring it would disable that whole extension in Lane 1)" >&2
+      continue
+    fi
     PURGE_FIND_PRED+=( ! -name "$_b" )
   done
   PURGE_FIND_PRED+=( -mmin "+$age_min" )
@@ -285,6 +325,7 @@ gc_drained_archive() {
   # would discard them). The stdout `echo "$count"` contract below is unchanged,
   # so existing 3-arg callers/tests that capture it keep working verbatim.
   GC_DRAINED_FILES=""               # basenames this lane would delete / deleted
+  GC_DRAINED_PATHS=""               # ABSOLUTE paths, for backend delete-propagation ()
   GC_DRAINED_COUNT=0
   [ -d "$drained_dir" ] || { echo 0; return 0; }
   list="$(find "$drained_dir" -maxdepth 1 -type f -mtime "+$age_days" 2>/dev/null || true)"
@@ -334,6 +375,7 @@ gc_drained_archive() {
     while IFS= read -r f; do
       [ -n "$f" ] || continue
       GC_DRAINED_FILES="${GC_DRAINED_FILES}$(basename "$f")"$'\n'
+      GC_DRAINED_PATHS="${GC_DRAINED_PATHS}${f}"$'\n'
     done <<< "$untracked"
   fi
   if [ "$count" -gt 0 ] && [ "$dry_run" -eq 0 ]; then
@@ -436,6 +478,20 @@ EOF
 # rm. Caller MUST have asserted temp_dir safe. Sourceable + unit-tested.
 cleanup_stray_dirs() {
   local temp_dir="${1:-}" age_min="${2:-120}" dry_run="${3:-0}" list count=0 d
+  # Count ALSO published as a global (STRAY_COUNT) so main() can call this
+  # WITHOUT command substitution — a $(...) subshell would discard the
+  # STRAY_PURGED_PATHS global below, exactly the trap Lane 2's call site
+  # documents for GC_DRAINED_FILES (and which the first draft of the
+  # propagation wiring fell into: stray_would=3 against dirs=0, measured).
+  # The stdout `echo "$count"` contract is unchanged for existing unit tests.
+  STRAY_COUNT=0
+  # ABSOLUTE dir paths (one per line, TRAILING SLASH) of purged / would-purge
+  # stray dirs, for the backend delete-propagation pass () — same
+  # no-subshell global idiom as GC_DRAINED_FILES. The slash tells
+  # --purge-propagate to resolve the dir by S3-prefix listing rather than
+  # expecting a file key; the dir's files are deliberately NOT enumerated
+  # here (see the collection site below for the measured 153k-file reason).
+  STRAY_PURGED_PATHS=""
   [ -d "$temp_dir" ] || { echo 0; return 0; }
   list="$(find "$temp_dir" -mindepth 1 -maxdepth 1 -type d ! -name drained -mmin "+$age_min" 2>/dev/null || true)"
   [ -z "$list" ] && { echo 0; return 0; }
@@ -456,12 +512,21 @@ cleanup_stray_dirs() {
       continue
     fi
     count=$((count + 1))
+    # Record the DIR (trailing slash = dir marker for --purge-propagate),
+    # NEVER its file list: propagation resolves the dir by S3-prefix listing,
+    # so the cost scales with what is actually in the store. A local
+    # enumeration here is the wrong cost model — measured 153,453 files under
+    # one scratch dir (npmci-probe/, worker-box local-only, 0 S3 objects),
+    # where the first draft's per-file bash string append went O(N^2) and
+    # hung the dry-run smoke at 99% CPU for 8+ minutes ().
+    STRAY_PURGED_PATHS="${STRAY_PURGED_PATHS}${d%/}/"$'\n'
     if [ "$dry_run" -eq 0 ]; then
       case "$d" in "$temp_dir"/*) find "$d" -delete 2>/dev/null || true ;; esac
     fi
   done <<EOF
 $list
 EOF
+  STRAY_COUNT="$count"
   echo "$count"
 }
 
@@ -506,7 +571,7 @@ main() {
     # citation_lookup is "n/a" here (Lane 1 never ran) rather than omitted: the
     # field must exist on BOTH exit paths or a strict-field consumer KeyErrors
     # on a fresh agent — the same schema-parity finding the lane fields carry.
-    printf '{"purged":0,"would_purge":0,"files":[],"drained_gc_purged":0,"drained_gc_would_purge":0,"drained_gc_files":[],"stray_purged":0,"stray_would_purge":0,"citation_lookup":"n/a","dry_run":%s,"age_min":%d,"drained_age_days":%d,"temp_dir":"%s","note":"temp dir does not exist"}\n' \
+    printf '{"purged":0,"would_purge":0,"files":[],"drained_gc_purged":0,"drained_gc_would_purge":0,"drained_gc_files":[],"stray_purged":0,"stray_would_purge":0,"citation_lookup":"n/a","backend_propagation":{"skipped":"no-temp-dir"},"dry_run":%s,"age_min":%d,"drained_age_days":%d,"temp_dir":"%s","note":"temp dir does not exist"}\n' \
       "$([ "$DRY_RUN" -eq 1 ] && echo true || echo false)" "$AGE_MIN" "$DRAINED_AGE_DAYS" "$temp_dir"
     return 0
   fi
@@ -541,8 +606,21 @@ EOF
   ephemera_list="$(find "$temp_dir" "${PURGE_FIND_PRED[@]}" 2>/dev/null || true)"
   if [ -z "$ephemera_list" ]; then count=0; else count="$(printf '%s\n' "$ephemera_list" | grep -c . || true)"; fi
 
+  # Delete FROM THE CAPTURED LIST (per-file bounded find, the Lane-2 idiom),
+  # not by re-running the predicate: the backend delete-propagation pass below
+  # () consumes this same list, and a second predicate pass could
+  # match a file that aged into eligibility between the two find runs —
+  # locally deleted but never propagated, i.e. permanent remote residue by
+  # construction. Driving both deletes from one list makes the local set and
+  # the propagated set identical.
   if [ "$count" -gt 0 ] && [ "$DRY_RUN" -eq 0 ]; then
-    find "$temp_dir" "${PURGE_FIND_PRED[@]}" -delete 2>/dev/null || true
+    local _pf
+    while IFS= read -r _pf; do
+      [ -n "$_pf" ] || continue
+      find "$_pf" -maxdepth 0 -type f -delete 2>/dev/null || true
+    done <<EOF
+$ephemera_list
+EOF
   fi
 
   # Build the files JSON array (basenames) in pure bash — temp ephemera names
@@ -605,7 +683,12 @@ EOF
     gc_count=0
     echo "temp-drain-purge: WARN — cited set UNKNOWN; Lane 2 (drained/ GC) SKIPPED this run rather than deleting by age alone (g-306-102)." >&2
   fi
-  stray_count="$(cleanup_stray_dirs "$temp_dir" "$AGE_MIN" "$DRY_RUN")"
+  # Called WITHOUT command substitution (Lane-2's documented idiom): a $(...)
+  # subshell would discard the STRAY_PURGED_PATHS global the propagation pass
+  # below consumes. Count comes back via the STRAY_COUNT global; the stdout
+  # contract stays for the unit tests that capture it.
+  cleanup_stray_dirs "$temp_dir" "$AGE_MIN" "$DRY_RUN" >/dev/null
+  stray_count="$STRAY_COUNT"
 
   # ── Lane 0 (REPORT-ONLY, ). Deletes nothing in either mode, so it is
   # unaffected by --dry-run and its count is emitted identically on both paths.
@@ -628,15 +711,42 @@ EOF
   fi
   dot_files_json="$dot_files_json]"
 
+  # ── Backend delete-propagation (). agents/<agent>/temp is a
+  # configured sync root (OwnCloudBackend._roots; guard-3422), so a local-only
+  # purge leaves every deleted file as an object in the authoritative store —
+  # measured 23,125 objects / 3.33 GB for one agent against a 31-file local
+  # tree. Feed the exact union of the three lanes' deleted sets to
+  # owncloud_sync --purge-propagate, which delete_object()s each key
+  # (guard-1493: the S3 lane; the local unlinks above are the other lane; the
+  # versioned bucket is the recovery layer). FAIL-SOFT: a failed or
+  # unavailable propagation degrades to the pre-fix local-only behavior and
+  # is recorded in the report — it never blocks the purge, whose primary job
+  # is local pressure relief. Under STORAGE_BACKEND=local the CLI no-ops
+  # with empty stdout and the report records the skip. In --dry-run the CLI
+  # runs with --dry-run (would_delete counts, zero backend writes).
+  local all_purged_paths="" backend_prop='{"skipped":"nothing-purged"}'
+  [ -n "$ephemera_list" ] && all_purged_paths="${ephemera_list}"$'\n'
+  [ -n "${GC_DRAINED_PATHS:-}" ] && all_purged_paths="${all_purged_paths}${GC_DRAINED_PATHS}"
+  [ -n "${STRAY_PURGED_PATHS:-}" ] && all_purged_paths="${all_purged_paths}${STRAY_PURGED_PATHS}"
+  if [ -n "$all_purged_paths" ]; then
+    local _prop_out _prop_dry=()
+    [ "$DRY_RUN" -eq 1 ] && _prop_dry=( --dry-run )
+    _prop_out="$(printf '%s' "$all_purged_paths" | python3 "$script_dir/owncloud_sync.py" --purge-propagate ${_prop_dry[@]+"${_prop_dry[@]}"} 2>/dev/null || true)"
+    case "$_prop_out" in
+      '{'*) backend_prop="$_prop_out" ;;
+      *)    backend_prop='{"skipped":"backend-not-owncloud-or-cli-unavailable"}' ;;
+    esac
+  fi
+
   local purged gc_purged stray_purged
   if [ "$DRY_RUN" -eq 1 ]; then
     purged=0; gc_purged=0; stray_purged=0
   else
     purged="$count"; gc_purged="$gc_count"; stray_purged="$stray_count"
   fi
-  printf '{"purged":%d,"would_purge":%d,"files":%s,"drained_gc_purged":%d,"drained_gc_would_purge":%d,"drained_gc_files":%s,"stray_purged":%d,"stray_would_purge":%d,"unmanaged_dotfiles":%d,"unmanaged_dotfile_names":%s,"citation_lookup":"%s","dry_run":%s,"age_min":%d,"drained_age_days":%d,"temp_dir":"%s"}\n' \
+  printf '{"purged":%d,"would_purge":%d,"files":%s,"drained_gc_purged":%d,"drained_gc_would_purge":%d,"drained_gc_files":%s,"stray_purged":%d,"stray_would_purge":%d,"unmanaged_dotfiles":%d,"unmanaged_dotfile_names":%s,"citation_lookup":"%s","backend_propagation":%s,"dry_run":%s,"age_min":%d,"drained_age_days":%d,"temp_dir":"%s"}\n' \
     "$purged" "$count" "$files_json" "$gc_purged" "$gc_count" "$gc_files_json" "$stray_purged" "$stray_count" \
-    "$dot_count" "$dot_files_json" "$citation_lookup" \
+    "$dot_count" "$dot_files_json" "$citation_lookup" "$backend_prop" \
     "$([ "$DRY_RUN" -eq 1 ] && echo true || echo false)" "$AGE_MIN" "$DRAINED_AGE_DAYS" "$temp_dir"
   return 0
 }

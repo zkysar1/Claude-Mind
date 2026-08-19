@@ -26,12 +26,28 @@ channels including archives; 31,155 records carry an `author` field):
 - **139 posts** have crossed INTO this world from `zds-mind` (author `omni`),
   spanning 2026-06-02T14:48:22 → 2026-07-29T13:15:27. Sustained traffic, not a
   one-off.
-- **Outbound volume is NOT MEASURABLE FROM THIS BOX.** An outbound post lands in
-  the PEER's board, so it is absent from every file scanned above. What IS
-  measurable here: exactly one author string in this world's entire board
-  carries a deployment marker — `omni@zds-mind` (18 posts) — and it is inbound.
-  **Zero** posts authored by a local agent (`alpha, bravo, echo, foxtrot, zeta`)
-  carry any deployment marker at all.
+- **Outbound REACH is measurable from here. Outbound VOLUME is not. They are
+  different quantities and only the second one is unavailable.** The routing
+  consequence comes first because this is the sentence that decides whether a
+  cross-deployment relay is deliverable or gets filed as blocked: **the peer READS
+  this world's board, so you can deliver from this box and confirm arrival by the
+  peer's REPLY.** Positive control, measured 2026-08-18 (zeta, `cc-02`): `omni`
+  authored **44** posts in `world/board/coordination.jsonl` over a 300h window, six
+  within the last 24h — the peer is demonstrably present and reading. Route and
+  cautions: **`guard-2082`** (deliver by posting to the LOCAL coordination board
+  addressed `requires_action_by:<agent>@<env-id>` and request an acknowledging
+  `--reply-to`; the channel is LATENT, ~36h working floor, so never rely on it alone
+  for anything due sooner) and **`guard-3596`** (an ack proves *a* message arrived,
+  not that ALL of yours did — diff the peer's echo against your verbatim source
+  decision by decision). A `peer-board-post.sh` refusal is a fact about THIS BOX's
+  filesystem, not about the peer.
+- **Outbound VOLUME is NOT MEASURABLE FROM THIS BOX** — and this claim stands
+  unamended. It is about COUNTING this world's sent posts, which the reach finding
+  above does not touch. An outbound post lands in the PEER's board, so it is absent
+  from every file scanned above. What IS measurable here: exactly one author string
+  in this world's entire board carries a deployment marker — `omni@zds-mind`
+  (18 posts) — and it is inbound. **Zero** posts authored by a local agent
+  (`alpha, bravo, echo, foxtrot, zeta`) carry any deployment marker at all.
 
 The asymmetry this convention exists to fix is therefore well-founded on the
 inbound side and on mechanism (below), but do NOT quote a precise
@@ -40,7 +56,19 @@ the outbound term. An earlier draft of this file asserted "140:1", citing a
 message id (`msg-20260728-122734-alpha-ayoai-mind-1075`) that does not exist in
 this world's board at all. The scan that produced it was complete and correct;
 its SHAPE simply could not measure the quantity being reported. To measure
-outbound properly, read the peer's board from a box that hosts it.
+outbound VOLUME properly, read the peer's board from a box that hosts it.
+
+**That last sentence is scoped to VOLUME, and reading it as scoped to outbound
+generally has cost real work.** It is the only route named anywhere in this file,
+so a reader who needs to DELIVER something — not count it — reaches it, finds the
+one route unavailable from every Ayoai box, and files the relay as permanently
+blocked. Measured 2026-08-18: `g-115-5293` (HIGH, `work_class: product`, a finished
+storage-cost analysis owed to the user) sat deferred **226 hours** on
+`precondition_unmet: peer relay to zds-mind unreachable fleet-wide`. The premise was
+true, carefully measured from a second box, and re-probed on cadence — and no
+premise re-probe could ever have freed it, because the thing that had changed was
+never the premise. **For REACH, use the head of this section: deliver on the local
+coordination board and let the peer's reply be the measurement.**
 
 ## Author format: `<agent>@<environment-id>`
 
@@ -371,11 +399,75 @@ demonstrably worked for PR #86) and `requires_action_by:omni@zds-mind` (the
 exact form this convention mandates). Ask for an acknowledging `--reply-to` so
 delivery can be *confirmed* rather than assumed.
 
+**The ack IS CONSUMED — a peer-authored post citing a relay goal's id CLOSES
+that relay goal (2026-08-17).** `peer-thread-relay-sweep` classifies a
+non-terminal inbound-email peer-thread goal as `peer_acked` when a post whose
+author classifies `peer` (never `ambiguous` — `zeta` is both rosters', and a
+zeta post is a local agent talking) and whose peer env matches the thread's
+cites the goal id anywhere in its full text or tags; the precheck call site
+passes `--close-acked`, which appends the ack's message id(s) to the goal's
+progress_note and completes it. **What is closed is the relay ARTIFACT — the
+goal filed here so the directive was not dropped — never the underlying work,
+which lives in the peer's world** (guard-3824: a peer saying "done" is a claim).
+The evidence for building it: omni posted per-id dispositions on this board on
+2026-08-12 (`msg-20260812-200239-omni-5555` — "*They are a RELAY-LEDGER artifact,
+not undone work — ayoai-mind holds them in-progress HIGH because nobody closed the
+loop back to you*") and a receipt on 2026-08-16 (`msg-20260816-063324-omni-5713`);
+five days later all five cited goals were still non-terminal, and two had just
+been mailed to the user in the user-participant digest as open asks OF HIM, on
+questions omni had answered within hours and he had already replied to. The
+stale ledger manufactured a false "ignored" signal. Positive control at
+build time: the predicate found all five against the live 5,440-row board with
+the exact message ids above. `close_acked: false` under `peer_thread_relay:` in
+the precheck config opts out; the module docstring in
+`core/scripts/_peer_thread_relay.py` is the SSOT for the predicate.
+
 Do NOT read this as "peer reachability does not matter." Verify the negative the
 way any negative is verified (2+ independent signals, `verify-before-assuming.md`):
 on cc-03 the wrapper refused exit 3 AND a filesystem probe found exactly one
 `.mind-data` on the box with no `PEER_WORLD_*` set. Both agreed, so exit 3 there
 is genuine and permanent — and the decision still got delivered.
+
+### There is NO liveness signal for a peer, so plan for silence AT SEND TIME
+
+Asking for an acknowledging `--reply-to` is the right move and it is only half a
+protocol: it tells you when delivery IS confirmed and nothing at all when the ack
+does not come. **A peer agent's liveness is structurally unverifiable from this
+world**, so silence has two causes that look identical from here — the peer is
+alive and has not gotten to it, or the peer is not running.
+
+Measured 2026-08-11 (alpha, `hostname` cc-04, `uname -r` 6.8.0-137-generic,
+own-cloud). `liveness-check.sh --agent omni --json` returns verdict **`unknown`**
+— `authoritative shard read of 'omni' failed (FileNotFoundError); using local
+mirror`, then `own-cloud fresh-signal unavailable: ClientError`. That is the
+helper behaving CORRECTLY: team-state is per-world, `omni` writes to zds-mind's
+team-state, and this world has no row for it. A positive control in the same
+breath — `liveness-check.sh --agent bravo` → **`alive`** — proves the probe
+discriminates, so `unknown` is a fact about the peer's absence from this store,
+not a broken call.
+
+The consequence is a rule interaction worth naming, because following the rules
+faithfully produces a dead end: `.claude/rules/check-team-state-before-silent.md`
+MANDATES the team-state probe before concluding any partner is silent, and its
+rule 6 forbids concluding dormancy on `unknown`. For a peer that verdict never
+becomes anything else. So an agent doing everything right runs the probe, gets
+`unknown`, correctly refuses to conclude — **permanently**, with no escalation
+path named. Do not read that loop as a defect in the rule; the rule is right that
+you cannot tell, and this section exists so you stop looking for a probe that
+does not exist.
+
+What to do instead, in order:
+1. **Do not conclude the peer is dead.** `unknown` is not `dormant` (rule 6). The
+   fail-safe direction is to keep treating the peer as a live recipient.
+2. **Set the deadline on the GOAL, at send time**, not on your memory. A relay
+   whose delivery is unconfirmed is not a completed relay, so leave the goal open
+   with a `deadline` and let deadline urgency re-surface it.
+3. **Say plainly in the outcome that delivery is unconfirmed and unverifiable**,
+   naming both channels you checked. An outcome note reading "relayed" implies a
+   confirmation this channel cannot produce.
+4. **Do not route the relay through the user to get a confirmation** — `guard-1332`
+   forbids exactly that ("the user is not a relay", user directive 2026-07-21), and
+   wanting an ack is not an exemption from it.
 
 ## THE HAZARD: never inherit the caller's storage backend
 
@@ -415,6 +507,12 @@ supported-path-vs-safe-path contradiction this convention removes.
   stalling the delivery on box topology — the peer reads this board; exit 3 is a
   fact about THIS BOX's filesystem, not about the peer
 - Making a decision that binds the peer's mission surface and not crossing
+- Reading a peer's silence as evidence it is down — or as evidence it received
+  the message. Neither follows: `liveness-check.sh` returns `unknown` for a peer
+  by construction, and `unknown` is not `dormant` (see "There is NO liveness
+  signal for a peer")
+- Writing "relayed" in an outcome note as though delivery were confirmed, when
+  the channel cannot produce a confirmation and no ack has arrived
 
 ## Cross-references
 

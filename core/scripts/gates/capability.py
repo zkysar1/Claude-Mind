@@ -150,6 +150,79 @@ def _match_event_gated_patterns(text: str) -> list:
     return [p for p in EVENT_GATED_PATTERNS if p in lo]
 
 
+# --- Unscoped fleet-wide capability negative (ADVISORY, g-115-6588) ----------
+# guard-1412: "every reachability or availability claim MUST name the machine it
+# was measured FROM." A defer_reason that universally quantifies a capability
+# negative over the fleet -- "no agent in the fleet can obtain a shell on X",
+# "unreachable fleet-wide" -- almost always generalises a SINGLE-BOX
+# measurement, and it freezes the goal for every box including the ones that
+# can. Canonical incident 2026-08-17: a goal was re-deferred twelve minutes
+# after being cleared, on "no agent in the fleet can obtain a shell on zakpod1",
+# while the clearing agent held a working shell on exactly that host.
+#
+# ADVISORY, NOT A REFUSAL -- and the measurement is why (guard-1562: enumerate
+# what a fail-closed flip would NEWLY refuse before flipping). Measured against
+# all 163 live defer_reasons across the world + every agent queue on
+# 2026-08-17: a first-cut predicate flagged 2 (1.2%) of which ONE was a false
+# positive -- a legitimate `human_blocked:` compliance/values judgment that
+# tripped an incidental token. Tightening to require a REACHABILITY verb and
+# exempting the human lane gives 1 hit in 163 (0.6%), precision 1/1. One true
+# positive in a 163-row corpus does not buy a hard block: at that volume a
+# single false refusal costs more than the defect it prevents, and the failure
+# it guards against is a stale goal, not data loss. So this reports and does
+# not refuse -- same posture as the user_leg_scope creation-time advisory.
+#
+# The three predicates are ANDed, and each is load-bearing:
+#   FLEET  -- universal quantification. A box-scoped claim is fine and common.
+#   REACH  -- a machine-reachability verb. Without it the human lane matches.
+#   BOX    -- the ESCAPE HATCH. Naming any host, or writing "measured from",
+#             clears the advisory, so the fix is always to add the evidence
+#             rather than to reword around the check.
+_UNSCOPED_FLEET_QUANTIFIER = re.compile(
+    r"\bfleet[- ]wide\b"
+    r"|\bno\s+(?:\w+\s+){0,2}(?:agent|box|machine|body)s?\s+(?:in the fleet\s+)?can\b"
+    r"|\bno\s+agent\s+in\s+the\s+fleet\b"
+    r"|\bnobody\s+can\b|\bno\s+one\s+can\b",
+    re.I,
+)
+# POLARITY: do NOT require a negative verb here. In the canonical incident the
+# negation lives in the QUANTIFIER -- "no agent in the fleet CAN OBTAIN a shell"
+# -- so a negative-verb list double-counts the negation and misses exactly the
+# case this exists for (measured: the first cut scored 0 on the real text). The
+# quantifier already supplies the "no"; this predicate only has to recognise
+# that the thing being denied is machine REACHABILITY, whatever its polarity.
+_UNSCOPED_REACHABILITY_CLAIM = re.compile(
+    r"\b(unreachable|not reachable|no route|no connectivity|denied"
+    r"|shell|ssh|reach|access|connect|log ?in|route)\b",
+    re.I,
+)
+# Any concrete host token, or an explicit provenance phrase, satisfies the rule.
+_SCOPED_TO_A_BOX = re.compile(
+    r"\bcc-\d\d\b|\bzak\w+\b|\bDESKTOP-[\w-]+\b|\bLAPTOP-[\w-]+\b"
+    r"|\bhostname\b|\bmeasured\s+(?:from|on)\b"
+    r"|\bfrom\s+[A-Za-z][\w.-]*\d[\w.-]*\b",
+    re.I,
+)
+# A human gate is a claim about a PERSON's decision, never about whether a
+# machine can reach something -- exempt outright rather than relying on REACH
+# to miss it. This is the exemption that removed the measured false positive.
+_HUMAN_BLOCKED_PREFIX = re.compile(r"^\s*human_blocked:", re.I)
+
+
+def _match_unscoped_fleet_negative(text: str) -> Optional[str]:
+    """Return the offending claim when a defer makes an unscoped fleet-wide
+    reachability negative, else None. Advisory only -- never refuses."""
+    if not text or _HUMAN_BLOCKED_PREFIX.match(text):
+        return None
+    if _SCOPED_TO_A_BOX.search(text):
+        return None
+    q = _UNSCOPED_FLEET_QUANTIFIER.search(text)
+    r = _UNSCOPED_REACHABILITY_CLAIM.search(text)
+    if q and r:
+        return f"{q.group(0)} ... {r.group(0)}"
+    return None
+
+
 # --- User-only-precondition exemption (g-115-372) ---------------------------
 USER_ONLY_PRECONDITION_SUBSTRINGS = [
     "roblox_studio_session_required",
@@ -1508,6 +1581,9 @@ def evaluate(failure_reason: str, *,
 
     narrative_matches = _match_narrative_patterns(failure_reason)
     event_gated_matches = _match_event_gated_patterns(failure_reason)
+    # Advisory only -- never feeds would_block. See the predicate's comment for
+    # the 163-row measurement that chose advisory over refusal.
+    unscoped_fleet_claim = _match_unscoped_fleet_negative(failure_reason)
     session_req_matches = _match_session_requirement_patterns(failure_reason)
     session_req_classification = None
     if session_req_matches:
@@ -1834,6 +1910,11 @@ def evaluate(failure_reason: str, *,
         "session_requirement_classification": session_req_classification,
         "event_gated_detected": bool(event_gated_matches),
         "event_gated_patterns": event_gated_matches,
+        # ADVISORY (g-115-6588 / guard-1412). Deliberately absent from
+        # would_block: a defer that names no box is still WRITTEN, it is just
+        # reported. Clear it by naming the host or writing "measured from <box>".
+        "unscoped_fleet_negative_detected": unscoped_fleet_claim is not None,
+        "unscoped_fleet_negative_claim": unscoped_fleet_claim,
         "cure_action": cure_action,
         "cure_overrides_exemption": cure_action is not None,
         # g-115-3813: non-null means a cure WAS registered for the matched

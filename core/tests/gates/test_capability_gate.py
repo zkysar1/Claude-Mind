@@ -16,6 +16,15 @@ Strategy:
     drift.
   * For keyword_block, use the stable real skill name
     "felt-sense-checkin" as the match anchor.
+  * Where a fixture also needs an ACTION VERB, pick one from _STOPWORDS
+    ("run", "start", "build"), never a matchable verb like "deploy".
+    _extract_keywords drops stopwords from the failure reason, so a
+    stopword verb can never be promoted to a matched keyword; a
+    non-stopword verb becomes one the moment any skill registers a
+    trigger containing it. That is drift this file cannot see coming —
+    _entry_tokens tokenizes multi-word triggers into bare words, so a
+    new forged skill can add a common verb to the keyword space without
+    anyone touching the gate (g-115-6138).
   * Use a fake MIND_AGENT name (test-alpha-zzz) so the CLI doesn't
     inherit a real alpha/bravo/zeta local-paths.conf.
 """
@@ -334,17 +343,72 @@ def test_narrative_plus_keyword_blocks():
 # Suggest-unblock payload
 # ---------------------------------------------------------------------------
 
+# Shared by the payload test and its invariant pin, so that changing the verb
+# here is what the pin actually measures (g-115-6138). The first word is the
+# ACTION VERB and must stay in _STOPWORDS — see the pin for why.
+_KEYWORD_BLOCK_VERB = "run"
+_KEYWORD_BLOCK_FR = f"{_KEYWORD_BLOCK_VERB} the felt-sense-checkin module"
+
+
 def test_suggest_unblock_keyword_block_payload():
-    """suggest_unblock + keyword_block → full payload with title/desc."""
-    fr = "deploy the felt-sense-checkin module"
+    """suggest_unblock + keyword_block → full payload with title/desc.
+
+    The action verb MUST be a member of _STOPWORDS (here "run"). This test's
+    whole purpose is rb-574 — the title is built from the ACTION VERB while
+    matched_capability preserves the MATCHED KEYWORD separately — so it only
+    has force while those two differ. A non-stopword verb can silently become
+    a capability keyword the moment any skill registers a trigger containing
+    it, at which point action_verb == matched_keyword and every assertion
+    below still passes while proving nothing.
+
+    That is not hypothetical: this fixture read "deploy the felt-sense-checkin
+    module" until g-115-6138. Nothing in the gate changed — the forged skill
+    efs-file-put (2026-08-11) registered the trigger "deploy file to EFS", and
+    _entry_tokens tokenizes trigger phrases into bare words, so "deploy"
+    entered the keyword space and outranked the anchor. Re-pinning the
+    expectation to "deploy" would have turned this test green and vacuous.
+    A stopword verb is structurally immune instead of merely un-collided:
+    _extract_keywords drops stopwords from the failure reason, so no registry
+    row can ever promote one to a matched keyword.
+    """
+    fr = _KEYWORD_BLOCK_FR
+    verb = _KEYWORD_BLOCK_VERB
     rc, cli, _ = _run_cli(fr, suggest_unblock=True, for_goal_id="g-test-001")
     mod = _call_module(fr, suggest_unblock=True, for_goal_id="g-test-001")
     assert cli == mod
     assert cli["unblock_suggested"] is True
-    # action_verb "deploy" wins over matched_keyword.
-    assert cli["unblock_title"] == "Unblock: deploy for g-test-001"
+    # action_verb wins over matched_keyword.
+    assert cli["unblock_title"] == f"Unblock: {verb} for g-test-001"
     assert "Capability gate matched" in cli["unblock_description"]
     assert cli["matched_capability"]["matched_keyword"] == "felt-sense-checkin"
+    # The pin has force only while the two differ (rb-574). If a future edit
+    # collapses them, fail HERE with the reason rather than passing silently.
+    assert cli["matched_capability"]["matched_keyword"] != verb
+
+
+def test_suggest_unblock_fixture_verb_is_stopword_immune():
+    """g-115-6138 regression pin: the fixture verb above must be a stopword.
+
+    Guards the invariant, not the incident. A verb outside _STOPWORDS is
+    eligible to become a capability keyword as soon as any forged skill or
+    SKILL.md registers a trigger containing it — the exact drift that broke
+    the sibling test. Asserting the property directly means a future author
+    who swaps the verb back to a matchable one fails on this line, which
+    names the constraint, instead of on an assertion that looks like a
+    stale expected string.
+    """
+    from gates.capability import _IMPERATIVE_VERBS, _STOPWORDS
+    # Derived from the SHARED constant, never re-typed — a pin that hardcodes
+    # its own copy of the fixture cannot notice the fixture changing, which is
+    # the only edit it exists to catch.
+    verb = _KEYWORD_BLOCK_VERB
+    assert _KEYWORD_BLOCK_FR.split()[0] == verb
+    # Matchable as an ACTION VERB (so the title is still built from it)...
+    assert verb in _IMPERATIVE_VERBS
+    # ...but never extractable as a CAPABILITY KEYWORD from a failure reason.
+    assert verb in _STOPWORDS
+    # The verb the incident used is the counter-example that motivated this.
+    assert "deploy" in _IMPERATIVE_VERBS and "deploy" not in _STOPWORDS
 
 
 def test_suggest_unblock_cure_block_payload():
@@ -371,8 +435,15 @@ def test_suggest_unblock_no_block_returns_false():
 
 
 def test_suggest_unblock_unset_omits_payload():
-    """Without --suggest-unblock, none of the unblock_* fields appear."""
-    fr = "deploy the felt-sense-checkin module"
+    """Without --suggest-unblock, none of the unblock_* fields appear.
+
+    Shares the blocking fixture above rather than duplicating the literal.
+    This case is immune to the g-115-6138 drift on its own terms — it asserts
+    field ABSENCE, which holds for any input — but it is only non-vacuous
+    while the input WOULD have produced a payload with the flag on, so it
+    wants the same known-blocking string, not an arbitrary one.
+    """
+    fr = _KEYWORD_BLOCK_FR
     rc, cli, _ = _run_cli(fr)
     mod = _call_module(fr)
     assert cli == mod

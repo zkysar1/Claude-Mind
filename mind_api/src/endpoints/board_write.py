@@ -202,6 +202,27 @@ def post(ctx) -> "Response":  # type: ignore[name-defined]
                             f"parent; not blocking)")
                 except Exception:
                     pass
+            # : WARN (do NOT block) on a tag that LOOKS like an address
+            # but routes to nobody. Board tags are free-form, so a poster who
+            # writes `forward-to:omni@zds-mind` (parses to agent
+            # `forward-to:omni`) currently gets NO feedback at all — the post
+            # looks addressed and reaches no one. Measured: six such posts over
+            # ten days by four different agents, including two time-critical
+            # user relays to a peer deployment; `requires_action_by:` is the
+            # only recognised prefix. Suppressed when another tag on the SAME
+            # post already routes to that agent, because consumers test with
+            # any() and one good tag is enough. Fail-open. Twin: board.py.
+            try:
+                from peer_surface import suspected_routing_tags
+                for bad_tag, who in suspected_routing_tags(tags):
+                    reply_warnings.append(
+                        f"tag '{bad_tag}' looks like it addresses '{who}' but "
+                        f"routes to NOBODY — `requires_action_by:` is the only "
+                        f"recognised prefix. Use 'requires_action_by:{who}' or "
+                        f"'requires_action_by:{who}@<env-id>' (a bare '{who}' "
+                        f"also routes). Posting anyway; not blocking.")
+            except Exception:
+                pass
             # Key order MUST match board.py:128-142 for byte-compat.
             msg = {
                 "id": _generate_message_id(author, items),

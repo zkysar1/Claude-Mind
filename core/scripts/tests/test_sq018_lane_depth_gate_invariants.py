@@ -81,18 +81,41 @@ def _route_region(body: str) -> str:
 
 
 def counter_is_text_based(region: str) -> bool:
-    """(a) The lane count matches on CONTENT, not an origin_signal proxy.
+    """(a) The lane count is TEXT-based, and matches the DRAIN-ABLE population.
 
-    The population that actually seals the lane is every open goal the
-    duplication gate blocks against, i.e. anything citing verify-learning.
-    Measured divergence at the time of the fix: narrow 9 vs wide 45.
+    Two drivers were tried before this one and both failed the same way — the
+    predicate did not match the population the drain ACTION is defined over:
+
+      NARROW (origin_signal ^= maintain:sq-018) starved the gate; measured
+        intersection 6 of a 30-goal union.
+      WIDE (verify-learning anywhere in title+description) armed a mis-scoped
+        HIGH drain over goals with no shared subject. Measured 2026-08-09:
+        wide 67, of which the drain action could batch exactly 1. The wide
+        driver's stated justification — "this equals the population the
+        duplication gate blocks against" — was separately falsified by a
+        two-probe test: the verify-learning token contributes ZERO to
+        duplication blocking, file-path overlap is the whole mechanism.
+
+    So the driver is a TITLE predicate requiring an explicit add/new verb
+    before "verify-learning check" — the shape of step 3's own filed title.
+    WIDE and NARROW must remain REPORTED (a reader has to see which
+    population a round was scoped against) and must never drive a branch.
     """
-    cites_is_text = "'verify-learning' in ((g.get('title')" in region
-    lane_uses_cites = "lane=[g for g in open_ if cites(g)]" in region
+    lane_uses_title_proposes = "lane=[g for g in open_ if proposes.search(" in region
     lane_not_signal_based = (
         "lane=[g for g in open_ if (g.get('origin_signal')" not in region
     )
-    return cites_is_text and lane_uses_cites and lane_not_signal_based
+    lane_not_wide_driven = "lane=[g for g in open_ if cites(g)]" not in region
+    # both prior counters stay visible as diagnostics
+    reports_wide = "LANE_WIDE" in region and "'verify-learning' in ((g.get('title')" in region
+    reports_narrow = "LANE_NARROW" in region
+    return (
+        lane_uses_title_proposes
+        and lane_not_signal_based
+        and lane_not_wide_driven
+        and reports_wide
+        and reports_narrow
+    )
 
 
 def drain_probe_has_recency_window(region: str) -> bool:
@@ -201,6 +224,24 @@ PRE_FIX_ROUTE_REGION = """
    "sq-018: no spark", and continue to steps 4-5. Do NOT file.
 """
 
+# The WIDE-driver defect (), isolated. This is the form that shipped
+# 2026-07-30 to fix the narrow counter and overshot: text-based, so it satisfies
+# the ORIGINAL wording of invariant (a), while counting 67 goals the drain action
+# cannot batch. Kept as a distinct fixture from PRE_FIX_REGION because the two
+# defects point in OPPOSITE directions and a predicate that rejects one can still
+# accept the other — which is exactly how this one survived the first fix.
+WIDE_DRIVER_REGION = """
+2.5. LANE-DEPTH GATE
+   def cites(g):
+       return 'verify-learning' in ((g.get('title') or '')+' '+(g.get('description') or '')).lower()
+   lane=[g for g in open_ if cites(g)]
+   narrow=[g for g in open_ if (g.get('origin_signal') or '').startswith('maintain:sq-018')]
+   print('LANE_DEPTH=%d' % len(lane))
+   print('LANE_NARROW=%d' % len(narrow))
+   IF LANE_DEPTH < 15:
+       Proceed to step 3.
+"""
+
 # The self-introduced ordering defect, isolated: decline placed above append.
 INVERTED_ORDER_REGION = """
    IF LANE_DEPTH < 15:
@@ -269,6 +310,24 @@ def test_gate_predicate_rejects_pre_fix_text(predicate):
         f"{predicate.__name__} PASSED against the known-defective pre-fix text. The "
         f"predicate has been weakened into a tautology and can no longer catch a "
         f"regression — which is the exact failure mode this file exists to prevent."
+    )
+
+
+def test_counter_predicate_rejects_the_wide_driver():
+    """The  defect: text-based, but counting a population the drain cannot batch.
+
+    This is a SEPARATE rejection from test_gate_predicate_rejects_pre_fix_text.
+    PRE_FIX_REGION is the origin_signal driver (too narrow); WIDE_DRIVER_REGION is
+    the substring driver (too wide). A predicate that only rejects the narrow form
+    passes on the wide one and vice versa, so both fixtures are load-bearing —
+    and the wide form is the one that satisfied the ORIGINAL invariant (a) while
+    being broken, which is why it went unnoticed through four measurements.
+    """
+    assert not counter_is_text_based(WIDE_DRIVER_REGION), (
+        "counter_is_text_based PASSED against the wide-substring driver — the exact "
+        "defect g-115-4716 fixed. Measured 2026-08-09: wide 67, drain-able 1. A drain "
+        "goal filed HIGH over 67 goals with no shared subject is a mis-scoped umbrella "
+        "no executor can satisfy."
     )
 
 

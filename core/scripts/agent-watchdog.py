@@ -50,6 +50,9 @@ Active probes:
     auto-bump of stale-but-unchanged pointers; deduped Investigate goal on
     canonical drift. Replaces the clock-based recurring re-verify goal
     (logic in pointer_freshness.py).
+  - GitDriftProbe — per-box ahead/behind vs origin/main, LIVE-Body carrier-ref
+    unconsumed depth, and host disk used% (g-115-6128). Throttled fetch; files
+    ONE box-scoped Investigate goal and retires it when the drift clears.
 
 LOG FORMATS
 -----------
@@ -106,6 +109,7 @@ import argparse
 import http.client
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -152,6 +156,33 @@ try:
 except Exception:
     ESCALATION_ASP, _ESCALATION_ASP_VIA, ESCALATION_SOURCE = (
         "asp-115", "fallback:import-failed", "world")
+
+
+def _box_id() -> str:
+    """Stable per-BOX identity, for probes whose dedup key must be box-scoped.
+
+    Delegates to the fleet SSOT (`_session_telemetry._machine_id`: MACHINE_ID
+    env, else hostname, else "unknown") rather than re-deriving it, so a box
+    that renames itself in one place renames everywhere. `reducer_self_fence`
+    already carries a second variant of this resolution; do not add a third.
+
+    TOTAL BY CONTRACT — it must never raise. Both callers invoke it OUTSIDE
+    their fail-open try blocks (`_file_*_goal` computes the signal before the
+    try, and `_close_*_goal` does the same), so a raise here would propagate
+    out of the probe and kill the whole tick.
+
+    The "unknown" floor deliberately re-creates the pre-g-115-6369 collision
+    for boxes that cannot resolve an identity at all: two such boxes share a
+    key and suppress each other. That is the FAIL-SAFE direction — it degrades
+    to exactly the old behaviour rather than to something worse — but it is a
+    floor, not a design goal. A box reaching it has a real configuration gap
+    (no MACHINE_ID and no resolvable hostname) worth fixing at the source.
+    """
+    try:
+        from _session_telemetry import _machine_id
+        return _machine_id()
+    except Exception:
+        return "unknown"
 
 
 def read_text_safe(p: Path) -> Optional[str]:
@@ -1739,24 +1770,59 @@ class MirrorWedgeProbe(Probe):
                              f"stale reads until reconciled ({goal.get('goal_id') or goal.get('error')})"),
                 ))
         elif v == "healthy":
-            if self.fired:
+            # Deliberately NOT gated on self.fired. `fired` is per-episode and
+            # lives in watchdog-prev-state.json, which is box-local and
+            # ephemeral — a reset or a fresh box zeroes it, and a goal filed by
+            # the previous episode would then be unclosable by this mechanism
+            # forever. That is the same "filed, never closed" defect one level
+            # up, so the close has to be able to run without it. Cost is one
+            # local JSONL read per tick (no daemon, early-returns on no match);
+            # the subprocess only runs when a closable goal actually exists.
+            closed = self._close_wedge_goal()
+            if self.fired or closed.get("closed"):
                 events.append(Event(
                     probe=self.name, event="mirror_wedge_cleared", severity="info",
-                    payload={"after_ticks": self.consecutive_wedged},
-                    summary="mirror wedge cleared — conflict streaks drained",
+                    payload={"after_ticks": self.consecutive_wedged,
+                             "closed": closed},
+                    summary=("mirror wedge cleared — conflict streaks drained"
+                             + (f" ({closed.get('detail')})" if closed.get("detail") else "")),
                 ))
             self.consecutive_wedged = 0
             self.fired = False
         # 'unknown': no live signal — hold state unchanged.
         return events
 
+    def _origin_signal(self) -> str:
+        """Dedup key for this probe's escalation goal. ONE builder, two callers.
+
+        BOX-scoped, and now genuinely so: the wedge is BOX-LOCAL state, the
+        repair must run ON the wedged box, and a box-agnostic key would let box
+        A's open goal mask box B's simultaneous wedge.
+
+        WHY THIS IS A METHOD RATHER THAN A LITERAL (g-115-6369): the key was
+        previously written out twice — once here and once in `_close_wedge_goal`
+        — and guard-3419 makes those two the SAME feature, because the file path
+        takes a lease and the close path is the only thing that releases it. Two
+        literals can drift apart silently, and the failure mode of that drift is
+        the worst one available: goals that can be filed and never closed, i.e.
+        a permanently disabled detector. GitDriftProbe already had the builder;
+        this probe did not. Do not inline this back.
+
+        WHY IT NEEDED A BOX COMPONENT AT ALL, since the old comment claimed to
+        be box-scoped and was not lying when it was written: commit a6093f817
+        ("box-scope the mirror-wedge Investigate signal") moved this key from
+        FLEET-global to AGENT-scoped on 2026-07-18, when one agent ran on one
+        box and the agent name was a faithful box proxy. The Mind/Body split
+        (first live worker Body ~2026-08-05) broke that equivalence, and NOTHING
+        FAILED — the code kept doing exactly what it always did; only the world
+        changed underneath it. The comment silently became a false guarantee.
+        """
+        return (f"investigate:mirror-wedge-detected-"
+                f"{self.ctx.agent_name}-on-{_box_id()}")
+
     def _file_wedge_goal(self, verdict: dict) -> dict:
         """File one deduped Investigate goal. Fail-open ({filed: False, error})."""
-        # Box-scoped signal (fresh-eyes F1): the wedge is BOX-LOCAL state, so
-        # dedup per agent/box — a box-agnostic signal would let box A's open
-        # goal mask box B's simultaneous wedge, and the repair must run ON the
-        # wedged box.
-        origin_signal = f"investigate:mirror-wedge-detected-{self.ctx.agent_name}"
+        origin_signal = self._origin_signal()
         try:
             from _paths import WORLD_DIR
             import importlib
@@ -1791,6 +1857,17 @@ class MirrorWedgeProbe(Probe):
                 ),
                 "category": "framework-infrastructure",
                 "origin_signal": origin_signal,
+                # Box-scoped repair must reach the box that can perform it
+                # ( defect 2, measured by zeta 2026-08-11). Without
+                # this, routing falls through to `category`, which is
+                # box-agnostic: every peer's wedge goal landed on ONE agent
+                # (filed_by bravo/alpha/echo/foxtrot -> intended_agent zeta in
+                # all four cases) who could only ever repair their own box,
+                # while HIGH + role_affinity kept those goals at the top of that
+                # agent's selector. Maximally attractive and structurally
+                # unfinishable is the worst combination for a dedup lease — it
+                # is why these aged for 7-17 days instead of closing.
+                "intended_agent": self.ctx.agent_name,
             }
             from _runtime_bash import BASH as _bash
             # --override-duplication (): this probe ALREADY owns exact
@@ -1829,6 +1906,96 @@ class MirrorWedgeProbe(Probe):
             return {"filed": True, "goal_id": goal_id, "error": None}
         except Exception as e:  # noqa: BLE001 — filing failure must not kill the event
             return {"filed": False, "goal_id": None, "error": f"{type(e).__name__}: {e}"}
+
+    def _close_wedge_goal(self) -> dict:
+        """Retire the goal THIS probe filed, once the wedge it describes is gone.
+
+        The probe filed and never closed, so its goals outlived their condition:
+        measured 2026-08-11, three were open fleet-wide at 7, 14 and 17 days,
+        and this box's own log shows the wedge cleared 4h after filing
+        (mirror_wedged 2026-08-04T03:50:37 -> mirror_wedge_cleared 07:50:52).
+        Detection was never lost -- the critical event still emits on the dedup
+        path -- but the queue kept a HIGH goal whose description is a snapshot of
+        the OLD episode's file list and sweep counts, and a later wedge silently
+        reuses it, so whoever picks it up is handed the wrong evidence.
+
+        Closed as `skipped`, never `completed`: the investigation did not happen,
+        the need evaporated. Calling that completion would buy a completion-rate
+        point with a false claim.
+
+        Two guards, both narrowing, because auto-mutating queue state from a
+        background probe must only ever touch what this probe itself created:
+          - origin_signal equality -- box-scoped via the shared _origin_signal()
+            builder, so only goals THIS probe filed on THIS box match. A
+            hand-filed wedge goal is untouched. Both this path and the file path
+            MUST read the key from that one builder: they are the take and the
+            release of a single lease (guard-3419), and a key they disagree on
+            is a goal that can be filed and never closed.
+          - status == pending AND no claimed_by -- never yank work a partner (or
+            this agent) has started. guard-1007: route via the board instead.
+            An in-progress goal is therefore left open BY DESIGN; its owner
+            closes it, and this method reports that rather than forcing it.
+        Fail-open throughout: a close failure degrades to a stale goal, which is
+        the status quo ante, and must never kill the tick.
+        """
+        origin_signal = self._origin_signal()
+        try:
+            from _paths import WORLD_DIR
+            import importlib
+            pf = importlib.import_module("pointer_freshness")
+            open_goals = pf.open_goal_records(origin_signal, WORLD_DIR, self.ctx.agent_dir)
+            if not open_goals:
+                return {"attempted": False, "detail": None}
+            closed, held = [], []
+            from _runtime_bash import BASH as _bash
+            for g in open_goals:
+                gid = g.get("id")
+                if not gid:
+                    continue
+                if g.get("status") != "pending" or g.get("claimed_by"):
+                    held.append(f"{gid}:{g.get('status')}"
+                                f"{'/claimed' if g.get('claimed_by') else ''}")
+                    continue
+                # Word this as an OBSERVATION, never as "auto-closed". It is written
+                # BEFORE the status write (so a partial failure leaves the goal open
+                # WITH an explanation) — which means a note asserting the close would
+                # be a false claim sitting on a still-open goal in exactly the case
+                # the write-order exists to protect. What IS true at this instant is
+                # the mirror-health verdict; state that, and let `status` carry the
+                # close. ( fresh-eyes.)
+                note = (f"agent-watchdog MirrorWedgeProbe observed mirror-health "
+                        f"healthy on {self.ctx.agent_name}'s box, so the wedge this "
+                        f"goal was filed for is gone"
+                        + (f" (cleared after {self.consecutive_wedged} wedged tick(s))"
+                           if self.consecutive_wedged else "")
+                        + ". No investigation was performed — the condition resolved on "
+                          "its own. The probe is retiring this goal as `skipped`; if the "
+                          "status still reads open, that write did not land and the goal "
+                          "is safe to close by hand (g-115-4868).")
+                ok = True
+                for field, value in (("outcome_note", note), ("status", "skipped")):
+                    proc = subprocess.run(
+                        [_bash, "core/scripts/aspirations-update-goal.sh", gid,
+                         field, value, "--source", g.get("_source", "world")],
+                        capture_output=True, text=True,
+                        cwd=str(self.ctx.project_root_path), timeout=60,
+                    )
+                    if proc.returncode != 0:
+                        held.append(f"{gid}:close-failed")
+                        ok = False
+                        break
+                if ok:
+                    closed.append(gid)
+            parts = []
+            if closed:
+                parts.append("closed " + ",".join(closed))
+            if held:
+                parts.append("held " + ",".join(held))
+            return {"attempted": True, "closed": closed, "held": held,
+                    "detail": "; ".join(parts) or None}
+        except Exception as e:  # noqa: BLE001 — a close failure must not kill the tick
+            return {"attempted": True, "closed": [], "held": [],
+                    "detail": f"error: {type(e).__name__}: {e}"}
 
     def to_dict(self) -> dict:
         return {"consecutive_wedged": self.consecutive_wedged, "fired": self.fired}
@@ -2199,6 +2366,740 @@ class MemoryHeadroomProbe(Probe):
             self.over = bool(state.get("over", False))
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# GitDriftProbe — per-box git divergence + carrier depth + host capacity
+# ─────────────────────────────────────────────────────────────────────────────
+
+_GIT_DRIFT_ENV = {
+    "ahead_threshold": "GIT_DRIFT_AHEAD",
+    "behind_threshold": "GIT_DRIFT_BEHIND",
+    "unconsumed_threshold": "GIT_DRIFT_UNCONSUMED",
+    "disk_used_pct_threshold": "GIT_DRIFT_DISK_PCT",
+    "fetch_throttle_minutes": "GIT_DRIFT_FETCH_THROTTLE_MIN",
+    "ticks_to_file": "GIT_DRIFT_TICKS_TO_FILE",
+}
+
+
+def _git_drift_config() -> dict:
+    """Read the `git_drift` block from aspirations.yaml; env overrides win.
+
+    guard-308: a probe's defaults must REFERENCE the source of truth, never
+    restate it. The literals below are a last-resort floor for a corrupt or
+    missing config file, not a second copy of the policy — every one of them
+    is the same value the YAML carries, and the YAML is what documents WHY.
+    """
+    cfg: dict = {}
+    try:
+        cfg_path = Path(__file__).resolve().parent.parent / "config" / "aspirations.yaml"
+        with cfg_path.open(encoding="utf-8") as f:
+            cfg = ((yaml.safe_load(f) or {}).get("git_drift") or {})
+    except Exception:  # noqa: BLE001 — a config read must never kill the tick
+        cfg = {}
+    out = {
+        "ahead_threshold": 25,
+        "behind_threshold": 50,
+        "unconsumed_threshold": 100,
+        "disk_used_pct_threshold": 80,
+        "fetch_throttle_minutes": 30,
+        "ticks_to_file": 2,
+    }
+    for key in out:
+        val = cfg.get(key)
+        if isinstance(val, (int, float)) and val >= 0:
+            out[key] = val
+        raw = os.environ.get(_GIT_DRIFT_ENV[key], "").strip()
+        if raw:
+            try:
+                parsed = float(raw) if "." in raw else int(raw)
+            except ValueError:
+                continue
+            # The SAME >= 0 guard the config path uses. Without it an env typo
+            # like GIT_DRIFT_AHEAD=-5 parses cleanly and makes every metric
+            # breach forever — a sign error is the one malformed value that does
+            # NOT look malformed, so it is the one that reaches production.
+            if parsed >= 0:
+                out[key] = parsed
+    return out
+
+
+def _git(root: Path, *args: str, timeout: float = 20.0) -> tuple[int, str, str]:
+    """Run one git command in `root`. Never raises; a failure is (rc, '', err)."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), *args],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        return proc.returncode, (proc.stdout or "").strip(), (proc.stderr or "").strip()
+    except Exception as e:  # noqa: BLE001 — includes TimeoutExpired and FileNotFoundError
+        return 127, "", f"{type(e).__name__}: {e}"
+
+
+def _disk_used_pct(path: Path) -> Optional[float]:
+    """Host filesystem usage as `df` reports Use%, or None if unreadable.
+
+    df's Use% is used/(used+avail) — it EXCLUDES root-reserved blocks, so it
+    runs a few points HIGHER than used/total and is both the number a human
+    sees and the more conservative of the two (cc-02 2026-08-14: 92% vs 88%).
+    shutil.disk_usage is used rather than shelling out to df because guard-326
+    requires a probe to be implementable on every platform the fleet runs —
+    df is absent on Windows, /proc is absent on macOS, and this call is neither.
+    """
+    try:
+        usage = shutil.disk_usage(str(path))
+    except Exception:  # noqa: BLE001
+        return None
+    denom = usage.used + usage.free
+    if denom <= 0:
+        return None
+    return round(100.0 * usage.used / denom, 1)
+
+
+def _live_body_sids(world_dir) -> Optional[set]:
+    """SIDs of Bodies the fleet currently reports as live, or None if unreadable.
+
+    Source is team-state `in_flight_bodies`, the same store worker-ref-consume.sh
+    consults before it will retire a carrier ref. None means "could not tell" and
+    the caller must SKIP the carrier axis rather than assume — counting a CLOSED
+    body's ref is the false positive the first draft of g-115-6128 fell into
+    (that history is frozen by design, not unconsumed work).
+    """
+    try:
+        import _team_state
+        rows = _team_state.load_rows(world_dir) or {}
+    except Exception:  # noqa: BLE001
+        return None
+    sids = set()
+    for row in rows.values():
+        if not isinstance(row, dict):
+            continue
+        for sid, body in (row.get("in_flight_bodies") or {}).items():
+            if isinstance(body, dict) and sid:
+                sids.add(str(sid))
+    return sids
+
+
+class GitDriftProbe(Probe):
+    """Per-box git divergence, carrier-ref depth, and host disk ().
+
+    THE GAP. Until 2026-08-14 nothing monitored any of these three, and every
+    divergence measured on 2026-08-13 was found the same way — an operator asked
+    a question. cc-07 forked at 342 ahead since 2026-08-08; cc-08 accumulated 223
+    main-bound commits in 3 days; cc-03 sat DORMANT 163 behind (0 ahead, 0 dirty,
+    so no launch and no loop ever fired a heal path). The companion metric is here
+    for the same reason and not as scope creep: zakbox1 reached 90% of 905G with
+    450G of policy-retained .history payload, and was exactly as invisible. One
+    `shutil.disk_usage` call closes it while the probe is already running per-box.
+
+    WHY ALL THREE IN ONE PROBE. They share the only expensive thing — the
+    throttled fetch — and they share a single question: "is this box's work
+    reaching, or able to reach, everyone else?" Splitting them would triple the
+    per-tick fetch cost to report one condition each.
+
+    THE CARRIER AXIS IS LIVENESS-GATED, and that gate is the whole correctness
+    argument for it. `refs/workers/<agent>/<sid>` belongs to a Body; when that
+    Body closes, its ref is frozen HISTORY, not outstanding work. Counting closed
+    refs is the false positive g-115-6128's first draft fell into, so an
+    unreadable liveness source SKIPS the axis (payload records why) rather than
+    guessing. Absence of signal is not health — but here the fail-open direction
+    is silence, because the alternative is a standing false alarm on every box.
+
+    ADVISORY BY CONTRACT. It emits an event, files ONE deduped Investigate goal,
+    and posts once to the findings board. It never pushes, never merges, never
+    prunes. The remedies (push the branch, consume the carrier, reclaim disk) are
+    deliberate acts with their own goals — g-115-5945 owns the consume cadence.
+
+    THE GOAL IT FILES IS A LEASE, SO IT HAS A RELEASE PATH (guard-3419). Dedup
+    keyed on open-goal existence suppresses re-filing for as long as the goal is
+    open, which means a dedup with no close silently disables the detector
+    forever. `_close_drift_goal` retires the goal as `skipped` once every metric
+    is back under threshold — never `completed`, because no investigation
+    happened; the condition resolved. MirrorWedgeProbe learned this the
+    expensive way (three goals open at 7, 14 and 17 days) and this probe inherits
+    the fix rather than the defect.
+    """
+
+    name = "git-drift"
+
+    def __init__(self, ctx: WatchdogContext) -> None:
+        super().__init__(ctx)
+        self.consecutive_breach = 0
+        self.fired = False
+        self.last_fetch_ts = 0.0
+
+    # ---- measurement -----------------------------------------------------
+
+    def _maybe_fetch(self, root: Path, cfg: dict) -> bool:
+        """Throttled fetch of origin/main + the worker-ref namespace.
+
+        Returns True when a fetch ran THIS tick. The tick runs every iteration
+        and this is its only network I/O, so the throttle is what keeps the
+        probe off the loop's critical path; between fetches the counts come from
+        the last-known remote refs and the payload says so (stale_basis).
+        """
+        throttle_s = float(cfg["fetch_throttle_minutes"]) * 60.0
+        now = time.time()
+        if throttle_s > 0 and (now - self.last_fetch_ts) < throttle_s:
+            return False
+        self.last_fetch_ts = now
+        _git(root, "fetch", "--quiet", "origin", "main", timeout=30.0)
+        _git(root, "fetch", "--quiet", "--prune", "origin",
+             "+refs/workers/*:refs/workers/*", timeout=45.0)
+        return True
+
+    def _ahead_behind(self, root: Path) -> dict:
+        rc, out, err = _git(root, "rev-list", "--left-right", "--count",
+                            "origin/main...HEAD")
+        if rc != 0:
+            return {"ahead": None, "behind": None, "error": err[:160] or f"rc={rc}"}
+        try:
+            behind, ahead = (int(x) for x in out.split())
+        except (ValueError, TypeError):
+            return {"ahead": None, "behind": None,
+                    "error": f"unparseable rev-list output: {out!r}"}
+        return {"ahead": ahead, "behind": behind, "error": None}
+
+    def _carrier_depths(self, root: Path) -> dict:
+        # Local import, matching MirrorWedgeProbe: WORLD_DIR's module-level bind
+        # sits inside a try/except, so a failed _paths import leaves the NAME
+        # undefined rather than None — importing here turns that into a caught
+        # ImportError and a clean SKIP instead of a NameError mid-probe.
+        try:
+            from _paths import WORLD_DIR as _world
+        except Exception:  # noqa: BLE001
+            _world = None
+        live = _live_body_sids(_world) if _world is not None else None
+        if live is None:
+            return {"skipped": True,
+                    "reason": "team-state in_flight_bodies unreadable — carrier "
+                              "axis skipped rather than counting closed-body refs",
+                    "refs": [], "max_unconsumed": None}
+        rc, out, _ = _git(root, "for-each-ref", "--format=%(refname)", "refs/workers/")
+        if rc != 0:
+            return {"skipped": True, "reason": f"for-each-ref rc={rc}",
+                    "refs": [], "max_unconsumed": None}
+        refs = []
+        for refname in [ln.strip() for ln in out.splitlines() if ln.strip()]:
+            parts = refname.split("/")
+            sid = parts[-1] if len(parts) >= 4 else ""
+            if sid not in live:
+                continue  # closed body — frozen history, not unconsumed work
+            rc2, cnt, _ = _git(root, "rev-list", "--count", f"origin/main..{refname}")
+            if rc2 != 0 or not cnt.isdigit():
+                continue
+            refs.append({"ref": refname, "sid": sid, "unconsumed": int(cnt)})
+        return {"skipped": False, "reason": None, "refs": refs,
+                "max_unconsumed": max((r["unconsumed"] for r in refs), default=0)}
+
+    # ---- probe -----------------------------------------------------------
+
+    def check(self) -> list[Event]:
+        root = self.ctx.project_root_path
+        cfg = _git_drift_config()
+        rc, _, _ = _git(root, "rev-parse", "--git-dir", timeout=10.0)
+        if rc != 0:
+            return []  # not a git repo — fail open, nothing to report
+
+        fetched = self._maybe_fetch(root, cfg)
+        ab = self._ahead_behind(root)
+        carrier = self._carrier_depths(root)
+        disk_pct = _disk_used_pct(root)
+
+        breaches = []
+        if ab["ahead"] is not None and ab["ahead"] > cfg["ahead_threshold"]:
+            breaches.append(f"ahead={ab['ahead']} (>{cfg['ahead_threshold']})")
+        if ab["behind"] is not None and ab["behind"] > cfg["behind_threshold"]:
+            breaches.append(f"behind={ab['behind']} (>{cfg['behind_threshold']})")
+        if (carrier["max_unconsumed"] is not None
+                and carrier["max_unconsumed"] > cfg["unconsumed_threshold"]):
+            breaches.append(f"live-carrier-unconsumed={carrier['max_unconsumed']} "
+                            f"(>{cfg['unconsumed_threshold']})")
+        if disk_pct is not None and disk_pct > cfg["disk_used_pct_threshold"]:
+            breaches.append(f"disk={disk_pct}% (>{cfg['disk_used_pct_threshold']}%)")
+
+        # Every field a reader needs to act is in the payload, including the
+        # ones that explain a SILENCE (guard-1955: a probe whose schema has no
+        # field for a cause cannot be used to rule that cause out).
+        payload = {
+            "agent": self.ctx.agent_name,
+            "branch": _git(root, "rev-parse", "--abbrev-ref", "HEAD")[1] or None,
+            "ahead": ab["ahead"], "behind": ab["behind"],
+            "ahead_behind_error": ab["error"],
+            "carrier_refs": carrier["refs"],
+            "carrier_max_unconsumed": carrier["max_unconsumed"],
+            "carrier_skipped": carrier["skipped"],
+            "carrier_skip_reason": carrier["reason"],
+            "disk_used_pct": disk_pct,
+            "fetched_this_tick": fetched,
+            "stale_basis": not fetched,
+            "thresholds": cfg,
+            "breaches": breaches,
+            "consecutive_breach": self.consecutive_breach,
+        }
+
+        if breaches:
+            self.consecutive_breach += 1
+            payload["consecutive_breach"] = self.consecutive_breach
+            if self.consecutive_breach >= cfg["ticks_to_file"] and not self.fired:
+                goal = self._file_drift_goal(payload)
+                # Mark fired only when the goal LANDED or an open one already
+                # covers this box; a genuine filing failure retries next tick
+                # rather than losing the episode (the  lesson).
+                if goal.get("filed") or goal.get("dedup"):
+                    self.fired = True
+                payload["goal"] = goal
+                payload["board"] = self._post_board_alert(payload, goal)
+                return [Event(
+                    probe=self.name, event="git_drift", severity="critical",
+                    payload=payload,
+                    summary=(f"{self.name}: {self.ctx.agent_name}'s box breached "
+                             f"{len(breaches)} threshold(s) on "
+                             f"{self.consecutive_breach} consecutive ticks — "
+                             f"{'; '.join(breaches)} "
+                             f"({goal.get('goal_id') or goal.get('error')})"),
+                )]
+            return []
+
+        cleared = self._close_drift_goal()
+        self.consecutive_breach = 0
+        was_fired = self.fired
+        self.fired = False
+        if was_fired or cleared.get("closed"):
+            payload["closed"] = cleared
+            return [Event(
+                probe=self.name, event="git_drift_cleared", severity="info",
+                payload=payload,
+                summary=("git drift cleared — every metric back under threshold"
+                         + (f" ({cleared.get('detail')})" if cleared.get("detail") else "")),
+            )]
+        return []
+
+    # ---- escalation ------------------------------------------------------
+
+    def _origin_signal(self) -> str:
+        # BOX-scoped, like MirrorWedgeProbe's: the drift is box-local state and
+        # the remedy (push, consume, reclaim disk) must run ON this box, so a
+        # box-agnostic key would let box A's open goal mask box B's divergence.
+        #
+        # This probe inherited BOTH the agent-name-as-box-proxy shape AND the
+        # comment above from MirrorWedgeProbe, so it carried the identical
+        #  defect: `agent_name` is os.environ MIND_AGENT and nothing
+        # more, which stopped being a box proxy the moment one agent could run
+        # two Bodies on two boxes. Fixed here in the same change, because a
+        # fleet-wide assumption fixed in one of its two homes is the shape that
+        # reads as fixed while still being live.
+        return (f"investigate:git-drift-detected-"
+                f"{self.ctx.agent_name}-on-{_box_id()}")
+
+    def _file_drift_goal(self, payload: dict) -> dict:
+        """File one deduped Investigate goal. Fail-open ({filed: False, error})."""
+        origin_signal = self._origin_signal()
+        try:
+            from _paths import WORLD_DIR
+            import importlib
+            pf = importlib.import_module("pointer_freshness")
+            if pf.open_goal_exists(origin_signal, WORLD_DIR, self.ctx.agent_dir):
+                return {"filed": False, "dedup": True, "goal_id": None,
+                        "error": "open goal exists (dedup)"}
+            refs = "; ".join(f"{r['ref']} ({r['unconsumed']} unconsumed)"
+                             for r in payload.get("carrier_refs") or []) or "none live"
+            body = {
+                "title": (f"Investigate: git/capacity drift on {self.ctx.agent_name}'s box "
+                          f"— {'; '.join(payload['breaches'])}"),
+                "priority": "HIGH",
+                "participants": ["agent"],
+                "description": (
+                    f"agent-watchdog GitDriftProbe on {self.ctx.agent_name}'s box "
+                    f"breached threshold on {payload['consecutive_breach']} consecutive "
+                    f"ticks: {'; '.join(payload['breaches'])}. "
+                    f"branch={payload['branch']} ahead={payload['ahead']} "
+                    f"behind={payload['behind']} disk_used={payload['disk_used_pct']}% "
+                    f"live-carrier-refs: {refs}. "
+                    f"Counts are {'FRESH (fetched this tick)' if payload['fetched_this_tick'] else 'from the LAST-KNOWN remote ref (no fetch this tick — throttled)'}. "
+                    f"REMEDY IS BOX-LOCAL and belongs to whoever runs on this box: "
+                    f"push the shared branch for `ahead`; merge origin/main for `behind`; "
+                    f"`bash core/scripts/worker-ref-consume.sh` for carrier depth "
+                    f"(g-115-5945 owns the standing cadence); reclaim disk for capacity. "
+                    # --tick, NOT --once: run_once only calls initialize() and
+                    # snapshots RunningSidProbe, so it reports NOTHING about this
+                    # probe. Naming the wrong flag here would hand the reader a
+                    # command that returns silence and reads as "condition gone".
+                    f"Re-measure with `MIND_AGENT={self.ctx.agent_name} py -3 "
+                    f"core/scripts/agent-watchdog.py --tick` before acting — this "
+                    f"goal is a SNAPSHOT and the probe retires it automatically "
+                    f"once every metric is back under threshold. "
+                    f"Auto-filed by GitDriftProbe (g-115-6128)."
+                ),
+                "category": "framework-infrastructure",
+                "origin_signal": origin_signal,
+                # Box-scoped repair must reach the box that can perform it
+                # (the  lesson MirrorWedgeProbe carries).
+                "intended_agent": self.ctx.agent_name,
+            }
+            from _runtime_bash import BASH as _bash
+            _override_reason = (
+                "GitDriftProbe owns exact box-scoped dedup via "
+                "open_goal_exists(origin_signal) plus a close path; the "
+                "goal-dup-gate's keyword check false-positives on the generic "
+                "git/drift/push tokens that every fleet-git goal shares (g-115-6128).")
+            proc = subprocess.run(
+                [_bash, "core/scripts/aspirations-add-goal.sh", ESCALATION_ASP,
+                 "--source", ESCALATION_SOURCE,
+                 "--override-duplication", _override_reason],
+                input=json.dumps(body, ensure_ascii=True),
+                capture_output=True, text=True,
+                cwd=str(self.ctx.project_root_path), timeout=60,
+            )
+            if proc.returncode != 0:
+                return {"filed": False, "goal_id": None,
+                        "error": (proc.stderr or proc.stdout or "non-zero exit").strip()[:200]}
+            try:
+                goal_id = json.loads(proc.stdout).get("id")
+            except (json.JSONDecodeError, AttributeError):
+                goal_id = None
+            return {"filed": True, "goal_id": goal_id, "error": None}
+        except Exception as e:  # noqa: BLE001 — filing must not kill the event
+            return {"filed": False, "goal_id": None, "error": f"{type(e).__name__}: {e}"}
+
+    def _post_board_alert(self, payload: dict, goal: dict) -> dict:
+        """One findings post per episode — the FLEET-visible half.
+
+        Not redundant with the goal: the goal carries intended_agent=<this
+        agent> so the box that can fix it sees it, which is exactly what keeps
+        it OFF every partner's selector. Divergence on this box is a fact
+        partners need (they read origin/main too), and the board is where
+        cross-box awareness lives.
+        """
+        try:
+            from _runtime_bash import BASH as _bash
+            text = (f"GitDriftProbe: {self.ctx.agent_name}'s box breached "
+                    f"{'; '.join(payload['breaches'])} on "
+                    f"{payload['consecutive_breach']} consecutive watchdog ticks. "
+                    f"branch={payload['branch']} ahead={payload['ahead']} "
+                    f"behind={payload['behind']} disk={payload['disk_used_pct']}% "
+                    f"live-carrier-max-unconsumed={payload['carrier_max_unconsumed']}. "
+                    f"Goal: {goal.get('goal_id') or goal.get('error')}. "
+                    f"Remedy is box-local (g-115-6128).")
+            proc = subprocess.run(
+                [_bash, "core/scripts/board-post.sh", "--channel", "findings",
+                 "--type", "finding",
+                 "--tags", f"git-drift,{self.ctx.agent_name},auto-probe"],
+                input=text, capture_output=True, text=True,
+                cwd=str(self.ctx.project_root_path), timeout=60,
+            )
+            if proc.returncode != 0:
+                return {"posted": False,
+                        "error": (proc.stderr or proc.stdout or "non-zero exit").strip()[:160]}
+            return {"posted": True, "msg_id": (proc.stdout or "").strip()[:64]}
+        except Exception as e:  # noqa: BLE001
+            return {"posted": False, "error": f"{type(e).__name__}: {e}"}
+
+    def _close_drift_goal(self) -> dict:
+        """Release the lease this probe took (guard-3419).
+
+        Two narrowing guards, both deliberate: origin_signal equality means only
+        goals THIS probe filed on THIS box can match, and pending-and-unclaimed
+        means work someone has started is never yanked out from under them
+        (guard-1007 — route via the board instead). Closed as `skipped`, never
+        `completed`: no investigation happened, the condition resolved.
+
+        Deliberately NOT gated on self.fired. `fired` lives in
+        watchdog-prev-state.json, which is box-local and ephemeral — a reset or
+        a fresh box zeroes it, and a goal filed by a previous episode would then
+        be unclosable by this mechanism forever, which is the same
+        filed-never-closed defect one level up.
+        """
+        origin_signal = self._origin_signal()
+        try:
+            from _paths import WORLD_DIR
+            import importlib
+            pf = importlib.import_module("pointer_freshness")
+            open_goals = pf.open_goal_records(origin_signal, WORLD_DIR, self.ctx.agent_dir)
+            if not open_goals:
+                return {"attempted": False, "detail": None}
+            closed, held = [], []
+            from _runtime_bash import BASH as _bash
+            for g in open_goals:
+                gid = g.get("id")
+                if not gid:
+                    continue
+                if g.get("status") != "pending" or g.get("claimed_by"):
+                    held.append(f"{gid}:{g.get('status')}"
+                                f"{'/claimed' if g.get('claimed_by') else ''}")
+                    continue
+                # Stated as an OBSERVATION and written BEFORE the status write, so
+                # a partial failure leaves an open goal carrying a TRUE sentence
+                # rather than a false claim that it was closed.
+                note = ("agent-watchdog GitDriftProbe re-measured this box and every "
+                        "git/capacity metric is back under threshold, so the drift this "
+                        "goal was filed for is gone. No investigation was performed — the "
+                        "condition resolved. The probe is retiring this goal as `skipped`; "
+                        "if the status still reads open, that write did not land and the "
+                        "goal is safe to close by hand (g-115-6128).")
+                ok = True
+                for field, value in (("outcome_note", note), ("status", "skipped")):
+                    proc = subprocess.run(
+                        [_bash, "core/scripts/aspirations-update-goal.sh", gid,
+                         field, value, "--source", g.get("_source", "world")],
+                        capture_output=True, text=True,
+                        cwd=str(self.ctx.project_root_path), timeout=60,
+                    )
+                    if proc.returncode != 0:
+                        held.append(f"{gid}:close-failed")
+                        ok = False
+                        break
+                if ok:
+                    closed.append(gid)
+            parts = []
+            if closed:
+                parts.append("closed " + ",".join(closed))
+            if held:
+                parts.append("held " + ",".join(held))
+            return {"attempted": True, "closed": closed, "held": held,
+                    "detail": "; ".join(parts) or None}
+        except Exception as e:  # noqa: BLE001 — a close failure must not kill the tick
+            return {"attempted": True, "closed": [], "held": [],
+                    "detail": f"error: {type(e).__name__}: {e}"}
+
+    def to_dict(self) -> dict:
+        return {"consecutive_breach": self.consecutive_breach,
+                "fired": self.fired,
+                "last_fetch_ts": self.last_fetch_ts}
+
+    def from_dict(self, state: dict) -> None:
+        if isinstance(state, dict):
+            self.consecutive_breach = int(state.get("consecutive_breach") or 0)
+            self.fired = bool(state.get("fired"))
+            try:
+                self.last_fetch_ts = float(state.get("last_fetch_ts") or 0.0)
+            except (TypeError, ValueError):
+                self.last_fetch_ts = 0.0
+
+
+def _watchdog_infra_components() -> list[dict]:
+    """Components this box should poll, from the WORLD overlay
+    `world/config/watchdog-infra-components.yaml`. Empty list on any failure.
+
+    Domain-free by construction: core names no component and no endpoint. A
+    deployment opts a component in by editing its own world config; a fresh
+    world with no such file polls nothing and this probe is inert.
+
+    Imported lazily so a world-resolution problem can degrade THIS probe
+    rather than the whole watchdog — the other eleven probes have nothing to
+    do with the world overlay and must keep running without it.
+
+    INERT UNDER PYTEST unless MIND_WATCHDOG_INFRA_TEST is set. The role tests
+    call check() on the whole reducer set against the REAL project root, so
+    without this the suite would shell out to live probes, hit the network, and
+    write the real world/infra-health.yaml — a unit test mutating production
+    monitoring state. Same PYTEST_CURRENT_TEST chokepoint the daemon-spawn
+    refusal uses (g-115-3329). It gates only the CONFIG, not the probe logic:
+    a test exercising this probe sets .components directly and monkeypatches
+    _infra_health_check, so the transition machinery stays fully covered.
+    """
+    if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get(
+            "MIND_WATCHDOG_INFRA_TEST"):
+        return []
+    try:
+        from _world_config import load_world_config
+        cfg = load_world_config("watchdog-infra-components", {})
+    except Exception:
+        return []
+    raw = cfg.get("components")
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        comp = str(entry.get("component") or "").strip()
+        if not comp:
+            continue
+        try:
+            interval = int(entry.get("interval_minutes",
+                                     InfraComponentProbe.DEFAULT_INTERVAL_MIN))
+        except (TypeError, ValueError):
+            interval = InfraComponentProbe.DEFAULT_INTERVAL_MIN
+        out.append({"component": comp, "interval_minutes": max(1, interval)})
+    return out
+
+
+def _infra_health_check(root: Path, agent: str, component: str,
+                        timeout: float = 60.0) -> dict:
+    """Run one `infra-health check <component>` and return its parsed JSON.
+
+    Calls infra-health.py with THIS interpreter rather than shelling through
+    the .sh wrapper. The wrapper's whole body is `exec python3 infra-health.py
+    "$@"` after sourcing _paths/_platform, so bash buys nothing here — and it
+    costs the CreateProcess/System32 bash lottery (rb-225/rb-247), which on
+    Windows can block forever on a wedged WSL launcher. A monitoring probe
+    must not be able to hang the loop it monitors.
+
+    Returns {} when the check could not be RUN (non-zero rc, timeout,
+    unparseable output). That is deliberately distinct from a check that ran
+    and reported failure: the caller reports the two differently, because
+    "the prober is broken" and "the target is broken" need different humans.
+    """
+    try:
+        r = subprocess.run(
+            [sys.executable, str(root / "core" / "scripts" / "infra-health.py"),
+             "check", component],
+            cwd=str(root), capture_output=True, text=True, timeout=timeout,
+            env={**os.environ, "MIND_AGENT": agent},
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return {}
+    if r.returncode != 0:
+        return {}
+    try:
+        parsed = json.loads((r.stdout or "").strip() or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+class InfraComponentProbe(Probe):
+    """Polls opted-in infra-health components on a cadence, so a silent
+    external failure is caught by a clock instead of by someone noticing.
+
+    WHY THIS EXISTS. infra-health carries dozens of registered components and
+    nothing ran `check` on a schedule — every entry was probed only when a
+    human or a goal happened to ask, so components sat unread for weeks and
+    the streak-notifier downstream had nothing fresh to reason about. This
+    probe is the narrow fix: a short opt-in list, polled on the tick the loop
+    already pays for. The broad question (should EVERYTHING be on a cadence,
+    and what owns check-all) is deliberately out of scope and tracked
+    separately — a poller that checks everything is a poller someone disables.
+
+    THE THREE OUTCOMES ARE NOT TWO. A check can report the target is broken,
+    report the target is fine, or fail to reach the target at all. That last
+    one — infra-health's `no_target` — is a fact about the OBSERVER, not the
+    target: most boxes in a fleet have no route to a given host, and treating
+    unreachable as failure would alert continuously about healthy hardware
+    while training everyone to ignore the probe. So no_target is silent, and
+    it does NOT clear a prior failure either (losing sight of a broken thing
+    is not the same as it being fixed).
+
+    TRANSITION-BASED, like every other probe here: an event fires when the
+    condition CHANGES, not on every tick, so a component down for a day
+    produces one critical event rather than a hundred.
+
+    Not in WORKER_SAFE_PROBES, on purpose. Nothing it reads is reducer-shaped,
+    so a worker COULD run it — but two Bodies polling the same endpoint on the
+    same cadence means two alerts for one fault, and a duplicate alert is
+    worse than a late one. One poller per agent: the reducer.
+
+    Cross-tick state: last_polled (component -> epoch seconds of last poll)
+    and condition (component -> last reported condition, for transitions).
+    """
+
+    name = "infra-component"
+    DEFAULT_INTERVAL_MIN = 30
+    MAX_PER_TICK = 1        # bound the cost added to any single iteration close
+    CHECK_TIMEOUT_S = 60.0
+
+    def __init__(self, ctx: WatchdogContext) -> None:
+        super().__init__(ctx)
+        self.components = _watchdog_infra_components()
+        self.last_polled: dict = {}   # component -> epoch seconds
+        self.condition: dict = {}     # component -> "ok" | "failed" | "error"
+
+    def check(self) -> list[Event]:
+        if not self.components:
+            return []
+
+        now = time.time()
+        due = []
+        for spec in self.components:
+            last = self.last_polled.get(spec["component"])
+            if last is None:
+                overdue = float("inf")          # never polled — poll now
+            else:
+                elapsed = now - float(last)
+                # A negative elapsed means the wall clock moved backwards
+                # (NTP step, VM resume). Re-poll rather than wait out a
+                # bogus interval.
+                if 0 <= elapsed < spec["interval_minutes"] * 60:
+                    continue
+                overdue = elapsed
+            due.append((overdue, spec))
+
+        if not due:
+            return []
+        due.sort(key=lambda d: d[0], reverse=True)   # most overdue first
+
+        events: list[Event] = []
+        for _, spec in due[:self.MAX_PER_TICK]:
+            comp = spec["component"]
+            self.last_polled[comp] = now
+            result = _infra_health_check(
+                self.ctx.project_root_path, self.ctx.agent_name, comp,
+                timeout=self.CHECK_TIMEOUT_S,
+            )
+            prev = self.condition.get(comp)
+
+            if not result:
+                # The check could not be run at all — a misconfigured
+                # component name, a missing probe script, a timeout. Report
+                # once so it cannot sit silently broken forever, then stay
+                # quiet: an unrunnable prober is not an incident, it is
+                # maintenance.
+                if prev != "error":
+                    self.condition[comp] = "error"
+                    events.append(Event(
+                        probe=self.name, event="infra_check_unrunnable",
+                        severity="info",
+                        payload={"component": comp},
+                        summary=(f"{self.name}: infra_check_unrunnable — "
+                                 f"'{comp}' could not be checked (bad component "
+                                 f"name, missing probe script, or timeout). "
+                                 f"Nothing is watching it until this is fixed."),
+                    ))
+                continue
+
+            status = str(result.get("status") or "")
+
+            if status == "failed":
+                if prev != "failed":
+                    self.condition[comp] = "failed"
+                    events.append(Event(
+                        probe=self.name, event="infra_component_failed",
+                        severity="critical",
+                        payload={"component": comp,
+                                 "error": result.get("error"),
+                                 "detail": result.get("detail")},
+                        summary=(f"{self.name}: infra_component_failed — "
+                                 f"{comp}: {result.get('error') or result.get('detail') or 'no detail'}"),
+                    ))
+            elif status == "ok":
+                if prev == "failed":
+                    events.append(Event(
+                        probe=self.name, event="infra_component_recovered",
+                        severity="info",
+                        payload={"component": comp, "detail": result.get("detail")},
+                        summary=(f"{self.name}: infra_component_recovered — "
+                                 f"{comp}: {result.get('detail') or 'ok'}"),
+                    ))
+                self.condition[comp] = "ok"
+            # no_target and any unrecognised status: silent, and the prior
+            # condition is left alone (see class docstring).
+
+        return events
+
+    def to_dict(self) -> dict:
+        return {"last_polled": self.last_polled, "condition": self.condition}
+
+    def from_dict(self, state: dict) -> None:
+        if not state:
+            return
+        lp = state.get("last_polled")
+        if isinstance(lp, dict):
+            self.last_polled = {k: v for k, v in lp.items()
+                                if isinstance(v, (int, float))}
+        cond = state.get("condition")
+        if isinstance(cond, dict):
+            self.condition = {k: str(v) for k, v in cond.items()}
+
+
 # Probes that read ONLY box-level state — daemon port, mirror, clock, memory,
 # store freshness. None of them reads agent-state, running-session-id or
 # runner-heartbeat, so they are correct on a worker Body exactly as written.
@@ -2213,6 +3114,13 @@ class MemoryHeadroomProbe(Probe):
 # probe: a typo'd filter is indistinguishable from a working one at the call site.
 WORKER_SAFE_PROBES = frozenset({
     "daemon-health", "clock-skew", "freshness", "mirror-wedge", "memory-headroom",
+    # git-drift joins the worker set deliberately, and the incident record is the
+    # argument: cc-07 forked at 342 ahead and cc-08 held 223 unpushed commits, and
+    # neither box was the reducer. A worker Body has the same checkout, the same
+    # host disk, and pushes its own carrier ref — so this probe is not merely
+    # SAFE there, it is where the condition it detects actually accumulates
+    # ().
+    "git-drift",
 })
 
 
@@ -2357,10 +3265,24 @@ class WorkerStallProbe(Probe):
                     payload={**body, "stale_minutes": report.get("stale_minutes"),
                              "degraded_read": report.get("degraded_read")},
                     summary=(
+                        # TWO alerting verdicts since , and they need
+                        # different sentences. This summary used to end "while
+                        # holding {held_goal}" unconditionally -- for a Body
+                        # that died BETWEEN units held_goal is None BY
+                        # DEFINITION (holding no claim is the whole condition),
+                        # so the single form renders "while holding None",
+                        # which reads as a probe bug and hides the actionable
+                        # fact: it never wrote a close.
                         f"WORKER STALL: {body.get('agent')} body {sid} on "
                         f"{body.get('host')} last ticked "
                         f"{body.get('carrier_age_minutes')}m ago while holding "
                         f"{body.get('held_goal')}"
+                        if body.get("held_goal") is not None else
+                        f"WORKER STALL (died between units): {body.get('agent')} "
+                        f"body {sid} on {body.get('host')} last ticked "
+                        f"{body.get('carrier_age_minutes')}m ago holding no claim, "
+                        f"and never recorded a close "
+                        f"(body_state={body.get('body_state')!r})"
                     ),
                 ))
             elif is_alerting(was or "") and not is_alerting(verdict):
@@ -2411,6 +3333,8 @@ def build_probes(ctx: WatchdogContext) -> list[Probe]:
         FreshnessProbe(ctx),
         MirrorWedgeProbe(ctx),
         MemoryHeadroomProbe(ctx),
+        GitDriftProbe(ctx),
+        InfraComponentProbe(ctx),
     ]
     if ctx.body_role == "worker":
         return [p for p in probes if p.name in WORKER_SAFE_PROBES]

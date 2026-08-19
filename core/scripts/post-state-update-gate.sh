@@ -591,8 +591,19 @@ PYEOF
     if [ -n "$REDUCED_SCRIPTS" ]; then
       while IFS= read -r f; do
         [ -z "$f" ] && continue
-        # shellcheck disable=SC2086
-        n=$(git diff --numstat $BASE_FOR_LOC -- "$f" 2>/dev/null | awk 'NF>=2 {print $1+$2; exit}' || echo 0)
+        # Sum across all ranges via RANGES, mirroring the LOC_CHANGED consumer
+        # above. This site was MISSED by the  migration that replaced
+        # the single BASE_FOR_LOC string with multi-range RANGES: BASE_FOR_LOC is
+        # assigned ONLY in the working-tree branch, so under `set -u` a
+        # SUCCESSFUL committed-scope run reached here with it unset and aborted
+        # the gate before emit_json — taking the whole files[] payload with it.
+        # The two sibling numstat consumers (mode-only exclusion, LOC_CHANGED)
+        # were migrated; this one kept the retired variable.
+        n=$(while IFS= read -r _r; do
+          [ -z "$_r" ] && continue
+          # shellcheck disable=SC2086
+          git diff --numstat $_r -- "$f" 2>/dev/null || true
+        done <<< "$RANGES" | awk 'NF>=2 {s+=$1+$2} END {print s+0}')
         [ -z "$n" ] && n=0
         LOC_REDUCED=$((LOC_REDUCED + n))
       done <<< "$REDUCED_SCRIPTS"

@@ -45,13 +45,11 @@
     "DISABLE_AUTOUPDATER": "1",
     "PYTHONUTF8": "1",
     "PYTHONIOENCODING": "utf-8",
-    "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
-    "DISABLE_AUTOUPDATER": "1",
     "GATE_D_ENABLED": "",
     "GATE_D_WORLD": "ayoai",
-    "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
-    "DISABLE_AUTOUPDATER": "1",
-    "GATE_D_CORPUS_PATH": "<PROJECT_ROOT>\\core\\config\\gate-d-corpus-zds-2026-06-10.jsonl"
+    "GATE_D_CORPUS_PATH": "<PROJECT_ROOT>\\core\\config\\gate-d-corpus-zds-2026-06-10.jsonl",
+    "GATE_FIRINGS_SEGMENTED": "1",
+    "OWNCLOUD_GZIP_STORES": "ayoai-mind"
   },
   "skillListingBudgetFraction": 0.05,
   "hooks": {
@@ -92,6 +90,41 @@
           {
             "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/bash-path-resolution-hook.sh",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/bare-bash-authoring-gate.sh",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/gradle-tests-gate.sh",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/full-suite-imperative-gate.sh",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/trailing-echo-exit-gate.sh",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/silent-zero-gate.sh",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/git-hook-bypass-gate.sh",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/git-restore-uncommitted-gate.sh",
             "timeout": 15
           }
         ]
@@ -148,6 +181,11 @@
             "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/settings-structural-validator.sh",
             "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/tree-write-fence.sh check",
+            "timeout": 10
           }
         ]
       },
@@ -198,6 +236,11 @@
             "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/pre-edit-context-gate.sh",
             "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/tree-write-fence.sh check",
+            "timeout": 10
           }
         ]
       },
@@ -248,6 +291,11 @@
             "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/pre-edit-context-gate.sh",
             "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/tree-write-fence.sh check",
+            "timeout": 10
           }
         ]
       }
@@ -260,6 +308,11 @@
             "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/context-reads-record.sh",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/tree-write-fence.sh record",
+            "timeout": 10
           }
         ]
       },
@@ -293,6 +346,11 @@
           },
           {
             "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/tree-write-fence.sh record",
+            "timeout": 10
+          },
+          {
+            "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/owncloud-push-on-write.sh",
             "timeout": 30
           }
@@ -328,6 +386,11 @@
           },
           {
             "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/tree-write-fence.sh record",
+            "timeout": 10
+          },
+          {
+            "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/owncloud-push-on-write.sh",
             "timeout": 30
           }
@@ -360,6 +423,11 @@
             "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/evolution-record.sh",
             "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/tree-write-fence.sh record",
+            "timeout": 10
           },
           {
             "type": "command",

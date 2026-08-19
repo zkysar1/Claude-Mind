@@ -173,9 +173,32 @@ if [ -n "${MIND_SID:-}" ]; then
         # suppression was added three lines below the comment block warning
         # against it.)
         _HB_CARRIER="$AGENT_DIR/session/body-heartbeat-$MIND_SID.json"
-        printf '{"sid":"%s","agent":"%s","host":"%s","ts":"%s"}\n' \
+        # : carry this Body's CURRENT body_state alongside the
+        # timestamp. The peer-side stall probe (worker_stall.classify_body)
+        # could not tell a Body that CLOSED from one that DIED between units --
+        # both go stale holding no claim -- so it called both benign and a
+        # worker that text-died after releasing unit N and before claiming N+1
+        # was invisible. The structured state that distinguishes them already
+        # exists and is already populated, but body-manifest.yaml lives under
+        # `sessions/`, which is in owncloud_sync._EXCLUDE_DIRS (walk-pruned,
+        # never pushed), so a peer STRUCTURALLY cannot read it. This carrier is
+        # published (the  exemption), so mirroring the field here is
+        # what makes it reachable at all.
+        #
+        # Read with a file test rather than `2>/dev/null` -- L31-32 of this file
+        # and rb-400 forbid suppressing the diagnostic, and a manifest that
+        # fails to parse should still print why. An empty value is the fail-open
+        # direction: the reader renders it `stale_state_unknown`, which never
+        # alerts, so a Body whose manifest is unreadable can never be reported
+        # as a stall on the strength of that failure alone.
+        _HB_STATE=""
+        if [ -f "$_HB_BODY_DIR/body-manifest.yaml" ]; then
+            _HB_STATE="$(sed -n 's/^body_state:[[:space:]]*//p' \
+                "$_HB_BODY_DIR/body-manifest.yaml" | head -1 | tr -d '"'\'' \t\r')"
+        fi
+        printf '{"sid":"%s","agent":"%s","host":"%s","ts":"%s","body_state":"%s"}\n' \
             "$MIND_SID" "${MIND_AGENT:-}" "$(hostname || echo unknown)" \
-            "$(date +%Y-%m-%dT%H:%M:%S)" > "$_HB_CARRIER.tmp" \
+            "$(date +%Y-%m-%dT%H:%M:%S)" "$_HB_STATE" > "$_HB_CARRIER.tmp" \
             && mv -f "$_HB_CARRIER.tmp" "$_HB_CARRIER" || true
     fi
 fi

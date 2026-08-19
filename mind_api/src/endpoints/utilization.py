@@ -109,12 +109,67 @@ def _evidence(util):
     return score
 
 
-def _is_candidate(rec, today=None):
+_SIDECAR = None  # None = not yet attempted, False = unavailable, else the module
+
+
+def _sidecar():
+    """The sidecar counter store, or None when it cannot be imported here.
+
+    THE IMPORT IS LAZY BY NECESSITY, not by style — the same constraint
+    world/reasoning_bank.py documents: no module under mind_api/src injects
+    core/scripts into sys.path at import time, so a TOP-LEVEL
+    `from _utilization_store import ...` would newly resolve (or fail to) at
+    daemon start and could take the whole endpoint module down. Cached after the
+    first attempt so the per-record path is a global lookup, not repeated import
+    machinery.
+
+    On ImportError every caller below falls back to the embedded field, which is
+    exactly today's behaviour — the conservative direction, never a silent empty.
+    """
+    global _SIDECAR
+    if _SIDECAR is None:
+        try:
+            import _utilization_store as _m  # type: ignore
+            _SIDECAR = _m
+        except ImportError:
+            _SIDECAR = False
+    return _SIDECAR or None
+
+
+def _util_of(rec, counters=None):
+    """Counters for one record — sidecar when present, else the embedded field."""
+    m = _sidecar()
+    if m is not None:
+        return m.utilization_of(rec, counters) or {}
+    embedded = rec.get("utilization")
+    return embedded if isinstance(embedded, dict) else {}
+
+
+def _load_counters(ctx, kind: str):
+    """Sidecar counters for a store kind. {} when the sidecar is unavailable.
+
+    The CLI kind is `guardrails`/`rb`; the sidecar's KINDS are
+    `guardrails`/`reasoning-bank`. Mapping explicitly rather than reusing
+    _record_kind, whose underscore form (`reasoning_bank`) the sidecar rejects.
+    """
+    m = _sidecar()
+    if m is None:
+        return {}
+    store_kind = "guardrails" if kind == "guardrails" else "reasoning-bank"
+    try:
+        return m.load_counters(store_kind, ctx.paths.world)
+    except Exception:
+        # A stats sidecar must never take down a report endpoint (same posture
+        # as load_counters' own malformed-line skip).
+        return {}
+
+
+def _is_candidate(rec, today=None, counters=None):
     if today is None:
         today = _today()
     if rec.get("status") != "active":
         return False
-    util = rec.get("utilization", {}) or {}
+    util = _util_of(rec, counters)
     if rec.get("auto_flagged_for_review"):
         return True
     if _evidence(util) > 0:
@@ -133,8 +188,8 @@ def _is_candidate(rec, today=None):
     return True
 
 
-def _candidate_sort_key(rec):
-    util = rec.get("utilization", {}) or {}
+def _candidate_sort_key(rec, counters=None):
+    util = _util_of(rec, counters)
     evidence = _evidence(util)
     created = _parse_date(rec.get("created")) or _today()
     age_days = (_today() - created).days
@@ -142,8 +197,8 @@ def _candidate_sort_key(rec):
     return (evidence, -age_days, -rc)
 
 
-def _summarize(rec, kind):
-    util = rec.get("utilization", {}) or {}
+def _summarize(rec, kind, counters=None):
+    util = _util_of(rec, counters)
     created = _parse_date(rec.get("created"))
     age_days = (_today() - created).days if created else None
     out = {
@@ -193,8 +248,9 @@ def _out(obj: Any) -> "Response":  # type: ignore[name-defined]
 # ---------------------------------------------------------------------------
 
 def _report(ctx, kind: str) -> "Response":  # type: ignore[name-defined]
+    counters = _load_counters(ctx, kind)
     recs = [r for r in _read_jsonl(_store_path(ctx, kind)) if r.get("status") == "active"]
-    summaries = [_summarize(r, _record_kind(kind)) for r in recs]
+    summaries = [_summarize(r, _record_kind(kind), counters) for r in recs]
     summaries.sort(key=lambda s: (s["evidence"], -(s["age_days"] or 0)))
     return _out({"kind": kind, "active_count": len(summaries), "items": summaries})
 
@@ -209,13 +265,14 @@ def _candidates(ctx, kind: str) -> "Response":  # type: ignore[name-defined]
             limit = int(limit_raw)
         except ValueError:
             return Response.error(400, "invalid_param", "limit must be an integer")
+    counters = _load_counters(ctx, kind)
     recs = _read_jsonl(_store_path(ctx, kind))
     today = _today()
-    candidates = [r for r in recs if _is_candidate(r, today)]
-    candidates.sort(key=_candidate_sort_key)
+    candidates = [r for r in recs if _is_candidate(r, today, counters)]
+    candidates.sort(key=lambda r: _candidate_sort_key(r, counters))
     if limit and limit > 0:
         candidates = candidates[: int(limit)]
-    summaries = [_summarize(r, _record_kind(kind)) for r in candidates]
+    summaries = [_summarize(r, _record_kind(kind), counters) for r in candidates]
     return _out({
         "kind": kind,
         "candidate_count": len(summaries),

@@ -218,9 +218,28 @@ def _read_local_paths():
     # resolving WORLD_DIR=None and crashing the daemon at tree.py import when
     # the daemon ran agent-agnostic without MIND_AGENT — the SessionStart hook
     # spawns it before any agent binding exists.)
-    for conf in sorted(agents_root().glob("*/local-paths.conf")):
+    # Mirror of the _paths.sh unset-case warning (). This side was
+    # silent when MIND_AGENT is UNSET while the bash side warned, exactly
+    # inverting the named-but-missing asymmetry above — each helper warned on
+    # the one case the other stayed quiet about, so the same event was loud or
+    # silent depending only on which language the caller was written in.
+    # Gated on 2+ confs for the same reason _paths.sh gates it: with exactly one
+    # conf the pick is unambiguous and the warning is pure noise. The daemon is
+    # the caller that reaches this agent-agnostically (SessionStart spawns it
+    # before any binding exists), so on a multi-conf box it is the one that most
+    # needs the signal.
+    confs = sorted(agents_root().glob("*/local-paths.conf"))
+    for conf in confs:
         parsed = _parse_conf(conf)
         if parsed.get("WORLD_PATH"):
+            if not agent and len(confs) > 1:
+                print(
+                    f"[_paths] WARN: MIND_AGENT unset, falling through to first "
+                    f"agent: {conf.parent.name}. This is usually a hook miss -- "
+                    f"check core/logs/bash-inject-misses.jsonl for the SID "
+                    f"(g-115-1146 / g-115-6417).",
+                    file=sys.stderr,
+                )
             return parsed
     return {}
 

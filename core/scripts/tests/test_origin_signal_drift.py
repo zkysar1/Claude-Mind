@@ -31,6 +31,11 @@ import pytest
 from _goal_source import infer
 from gates.origin_signal import ALLOWED_PREFIXES, is_valid
 
+import pathlib
+import sys as _sys
+_sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+import _verify_corpus  # noqa: E402
+
 SCRIPT = Path(__file__).resolve().parents[1] / "check-origin-signal-drift.py"
 
 # The two prefixes this goal reconciled, with a representative concrete suffix.
@@ -148,7 +153,10 @@ def test_checker_is_wired_into_verify_learning():
     """
     skill = (Path(__file__).resolve().parents[3]
              / ".claude" / "skills" / "verify-learning" / "SKILL.md")
-    text = skill.read_text(encoding="utf-8", errors="replace")
+    # Corpus, not the file: the verify-learning check corpus moved to
+    # core/config/verify-learning-checks.jsonl on 2026-08-18 ().
+    # This canary pins a CALL SITE, and the call site moved with it.
+    text = _verify_corpus.corpus_text()
     assert "check-origin-signal-drift.py" in text, (
         "verify-learning/SKILL.md no longer invokes check-origin-signal-drift.py "
         "— the docs->gate drift guard is unwired and silently stopped running "

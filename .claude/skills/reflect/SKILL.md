@@ -236,10 +236,67 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
 
 # Phase A: Outcome Reflection
 1. Bash: wm-read.sh micro_hypotheses --json → if non-empty, invoke /reflect-on-outcome Mode: Batch Micro
+   # ⚠ RUN THIS BEFORE ANY STORE-MINING STEP — THE ORDER IS LOAD-BEARING, NOT
+   # COSMETIC. Resolved micro-hypotheses are where THIS agent records fixes it
+   # has already shipped. Every store you mine later (rollback_history,
+   # changelog, alert logs, pipeline) is a DATED HISTORICAL LOG, so a fix that
+   # landed mid-window leaves pre-fix entries sitting in it that read exactly
+   # like current state. The micros are the fix-date index that disambiguates.
+   # MEASURED 2026-08-19 (echo, cc-03, fire #104): mining backpressure
+   # rollback_history first produced a HIGH finding + guardrail + filed goal
+   # asserting roi_history and adversarial_review counters were being reverted
+   # live. Micro #8 in this very slot — outcome CONFIRMED, resolved
+   # 2026-08-17T14:45 — recorded that fire #101 of THIS SAME GOAL had shipped
+   # the allowlist that fixed it, production-verified. The guardrail and goal
+   # had to be rewritten and the goal downgraded HIGH -> LOW. Reading this slot
+   # first costs one wm-read and would have scoped the finding correctly the
+   # first time. (rb-2585 / rb-1204 — compare against fix dates before
+   # investigating; guard-3399 for the inverse direction.)
 1.5. invoke /reflect-on-outcome Mode: Execution for goals completed this session with notable outcomes
      (only if not already reflected via --on-hypothesis pathway — check goal IDs)
 1.75. invoke /reflect-maintain Mode: Curate Aspirations (groom stuck goals before reflecting on hypotheses)
 2. Bash: pipeline-read.sh --unreflected → get unreflected resolved hypotheses
+   # ⛔ EXPECT ZERO REFLECTABLE, AND DO NOT RE-DERIVE WHY — the zero is CORRECT.
+   # Recorded as a bare count for five consecutive fires of g-001-01 (#100-#104,
+   # population 390 -> 404 -> 405), each pass re-deriving it as new because
+   # nothing here said it was known (rb-7613; guard-1984 — a guardrail cannot
+   # outvote the instrument it guards, which is why this lives HERE).
+   #
+   # MEASURED 2026-08-19 (echo, hostname cc-03, uname -r 6.8.0-137-generic), on
+   # the live payload — 405 records, 1,183,294 bytes:
+   #   by STAGE   : archived 404, resolved 1
+   #   by OUTCOME : EXPIRED 173, UNRESOLVABLE 185, none 47   (conservation: 358 + 47 = 405)
+   #   reflected  : False on all 405
+   # ZERO carry CONFIRMED / CORRECTED / REFUTED. An ABC chain needs a prediction
+   # that MET REALITY; an EXPIRED hypothesis aged out unmeasured and an
+   # UNRESOLVABLE one hit a denominator floor, so neither ever produced one.
+   # There is nothing to chain — this step is not broken.
+   #
+   # ⚠ THE WORD "resolved" IN THIS STEP'S OWN TEXT IS THE TRAP. It invites a
+   # filter on `status`, and pipeline records have NO `status` field — the
+   # discriminator is `stage` (guard-2869: status is null on 709 of 733 rows,
+   # and `pipeline-read.sh` has no `--status` flag, so a status-keyed filter
+   # returns a confident structural zero). guard-2869 did NOT prevent this on
+   # the 2026-08-19 pass: the wrong count was computed first and caught only by
+   # the rb-245 one-record schema probe afterwards.
+   #
+   # POSITIVE CONTROL — the ONLY number that should ever alarm:
+   #   [r for r in payload if r.get("outcome") in ("CONFIRMED","CORRECTED","REFUTED")
+   #                       and not r.get("reflected")]
+   # That set is 0 today. A nonzero value means genuine ABC input is going
+   # unreflected; a large `--unreflected` count means nothing on its own.
+   #
+   # THE LANE IS HEALTHY, which inverts the severity every open owner implies:
+   # precheck-eval the same hour counted 51 resolved hypotheses in the pipeline
+   # and exactly ONE was unreflected (2026-08-11_move-desync-classifies-as-stale-path,
+   # itself UNRESOLVABLE). So 50 of 51 were reflected promptly. The defect is only
+   # that terminal-outcome records are never MARKED reflected, so they accumulate
+   # here permanently and the count grows monotonically — a drain/marking problem
+   # with no correctness impact on learning.
+   #
+   # ROUTE NOTHING. Owned FIVE times over: g-115-4335, g-115-4558, g-115-6338,
+   # g-115-6543, g-001-08. Attach a fresh measurement to the newest rather than
+   # filing #6 (their counts are stale by construction — rb-5818).
 3. For each unreflected hypothesis:
    invoke /reflect-on-outcome Mode: Hypothesis with: hypothesis-id
 # Phase B: Self-Model Reflection
@@ -523,7 +580,19 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
      # where the true answer is 779. The field is real and fully populated: 1296
      # of 1299 nodes carry a nonzero count in `_tree.yaml`, max 433. This step
      # already reads `_tree.yaml` below for cross-references — use the same read.
-     Bash: world-cat.sh knowledge/tree/_tree.yaml   # nodes[] carries retrieval_count
+     #
+     # `nodes` IS A DICT (key -> node object), NOT A LIST — iterate `.values()`.
+     # This line read "nodes[] carries retrieval_count" until 2026-08-16, and the
+     # bracket notation plus the `for n in nodes` on the staleness line below both
+     # say list. Iterating a dict yields its KEYS (strings), so `n.retrieval_count`
+     # is absent on every element and the lint reports `retrieval_count present on
+     # 0 of 1407` — a structural zero, which is the EXACT failure this g-115-4110
+     # note was written to fix, reproduced one layer down. A correction can carry
+     # the defect forward in a new costume: this one was right about the FILE and
+     # wrong about the SHAPE, so following it literally still returns zero.
+     # Measured cc-02 2026-08-16 (zeta, uname -r 6.8.0-137-generic): as `.values()`,
+     # retrieval_count present on 1407/1407, 1265 at rc>10, 980 stale >14d.
+     Bash: world-cat.sh knowledge/tree/_tree.yaml   # d["nodes"] is a DICT of node objects
      #
      # BOUND THE OUTPUT. At real numbers this predicate matches 984 nodes with
      # retrieval_count > 10, of which 779 are >14d stale — an unbounded
@@ -531,7 +600,7 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
      # items in one pass and bury every other signal in working memory. Flag the
      # TOP 5 by retrieval_count and report the full count alongside, so the
      # backlog stays visible without being transcribed.
-     stale = [n for n in nodes if n.retrieval_count > 10 and days_since(n.last_updated) > 14]
+     stale = [(k, n) for k, n in nodes.items() if n.retrieval_count > 10 and days_since(n.last_updated) > 14]
      Log: "▸ Tree lint: {len(stale)} stale high-retrieval nodes (of {len(hi)} with rc>10) — flagging top 5"
      FOR EACH node in sorted(stale, by retrieval_count desc)[:5]:
          echo '{"node_key": "<key>", "reason": "stale-high-retrieval", "retrieval_count": <N>, "days_since_update": <M>, "total_stale_at_scan": <len(stale)>, "priority": "MEDIUM"}' | wm-append.sh knowledge_debt
@@ -539,6 +608,11 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
      
      # Cross-reference discovery: nodes that share entities but aren't linked
      Bash: world-cat.sh knowledge/tree/_tree.yaml  # entity_index
+     # EXPECT EMPTY, and read that as "this sub-step is inert", not "no shared
+     # entities exist". Measured cc-02 2026-08-16: entity_index has 0 entries and
+     # cross_references 0, against 1407 nodes — so nothing populates it and the
+     # join below has no input. Said here so the next reader does not investigate
+     # why a correctly-guarded step produced nothing.
      IF entity_index is non-empty:
          FOR EACH entity appearing in 2+ nodes:
              Check if those nodes have cross-references to each other in their .md files

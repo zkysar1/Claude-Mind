@@ -34,10 +34,10 @@ AGENT=""
 SCOPE=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --since) SINCE="$2"; shift 2 ;;
-    --since-goal) SINCE_GOAL="$2"; shift 2 ;;
-    --agent) AGENT="$2"; shift 2 ;;
-    --scope) SCOPE="$2"; shift 2 ;;
+    --since) SINCE="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+    --since-goal) SINCE_GOAL="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+    --agent) AGENT="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+    --scope) SCOPE="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
     -h|--help)
       sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
       exit 0 ;;

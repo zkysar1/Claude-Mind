@@ -114,9 +114,39 @@ if WORLD_DIR:
         str(WORLD_DIR / "conventions"),
     ])
 
-# Individual files tracked outside any tracked prefix
+# Individual files tracked outside any tracked prefix.
+#
+# BOTH compact files must be listed, and the summary was missing for as long as
+# it has existed (). `load-aspirations-compact.sh` emits the SUMMARY
+# path (its line 108) and invalidates the SUMMARY path (its line 102), but only
+# the full compact was named here — and the summary lives under
+# agents/<agent>/session/, which matches no TRACKED_PREFIXES. So
+# is_in_scope_advisory() returned False for it and cmd_check_file `continue`d,
+# printing NOTHING on rc=0 **unconditionally, on every invocation, for every
+# agent, on every box** — not the intended "already read, reuse it" dedup.
+# Every caller follows `IF path returned: Read it`, so the IF never fired and
+# the loop proceeded with no portfolio in context: precheck could not compute
+# active_count, strategic-scan S1 reviewed zero recurring goals, S3/S4a computed
+# over an empty list — each reporting a clean pass (the rb-245 vacuous-zero
+# family, sitting on a loader most major loop phases depend on). Measured
+# 2026-08-11 (zeta, hostname cc-02, uname -r 6.8.0-136-generic) with a positive
+# control: check-file on aspirations-compact.json printed 60 bytes while
+# check-file on aspirations-compact-summary.json printed 0, same session, same
+# tracker state, only the filename differing.
+#
+# cmd_invalidate gates on this SAME list, which is what proves the omission was
+# an oversight rather than a design choice: the wrapper already invalidates the
+# summary on regeneration, and that call had been a silent no-op too.
+#
+# Adding an entry here widens is_in_scope (the BLOCKING re-read gate) as well as
+# is_in_scope_advisory (guard-2601 — check the wider caller before extending a
+# shared predicate). That is correct and not a new posture: the full compact
+# beside it already carries exactly these semantics, as does load-tree-summary's
+# _summary.json via TRACKED_PREFIXES. A generated cache is precisely what the
+# re-read dedup is for, and regeneration clears it via the invalidate above.
 TRACKED_FILES = [
-    str(AGENT_DIR / "session" / "aspirations-compact.json")
+    str(AGENT_DIR / "session" / "aspirations-compact.json"),
+    str(AGENT_DIR / "session" / "aspirations-compact-summary.json"),
 ] if AGENT_DIR else []
 
 # Advisory-ONLY extension prefixes (). The read-before-edit ADVISORY

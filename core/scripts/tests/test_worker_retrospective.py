@@ -182,20 +182,60 @@ def _stub(monkeypatch, rec: _Recorder, store):
     monkeypatch.setattr(wr, "_lane_team_state", rec.lane("team_state"))
     monkeypatch.setattr(wr, "_lane_journal", rec.lane("journal"))
     monkeypatch.setattr(wr, "_lane_findings", rec.lane("findings"))
+    monkeypatch.setattr(wr, "_lane_experience", rec.lane("experience"))
     monkeypatch.setattr(wr, "_lane_impk", rec.lane("impk"))
     monkeypatch.setattr(wr, "_write_marker", rec.marker(store))
 
 
 def test_retrospect_runs_four_lanes_and_marks(monkeypatch):
+    """No captures reached this reducer, so the experience lane is inapplicable.
+
+    Every OTHER lane derives what it writes from the goal record, so all of them
+    always run; the experience lane alone has an input that can be absent. It is
+    SKIPPED here rather than failed, and a skip must not count as a write.
+    """
     store = {"g-306-1": _rec("g-306-1")}
     rec = _Recorder()
     _stub(monkeypatch, rec, store)
     item = wr.decide(["g-306-1"], store)["plan"][0]
     out = wr.retrospect(item, "zeta", "2026-08-07T00:00:00", Path("/nonexistent"))
-    assert sorted(n for n, _ in rec.calls) == sorted(wr.RUN_LANES)
+    assert sorted(n for n, _ in rec.calls) == sorted(
+        set(wr.RUN_LANES) - {"experience"})
+    assert out["lanes"]["experience"]["skipped"] == wr.SKIP_NO_CAPTURE
+    assert out["lanes"]["experience"]["ok"] is False
     assert out["lanes_written"] == 3          # impk is not an artifact of itself
     assert out["marked"] is True
     assert out["pending_judgment_lanes"] == list(wr.REPORT_LANES)
+
+
+def test_retrospect_runs_the_experience_lane_when_a_capture_arrived(monkeypatch):
+    """With a capture in hand, all five lanes run and the extra write counts."""
+    store = {"g-306-1": _rec("g-306-1")}
+    rec = _Recorder()
+    _stub(monkeypatch, rec, store)
+    item = wr.decide(["g-306-1"], store)["plan"][0]
+    captures = {"g-306-1": [{"goal_id": "g-306-1", "execution_summary": "did a thing"}]}
+    out = wr.retrospect(item, "zeta", "2026-08-07T00:00:00", Path("/nonexistent"),
+                        captures)
+    assert sorted(n for n, _ in rec.calls) == sorted(wr.RUN_LANES)
+    assert out["lanes"]["experience"]["ok"] is True
+    assert out["lanes"]["experience"]["entries"] == 1
+    assert out["lanes_written"] == 4
+    # The imp@k lane must see the experience write in its artifact count —
+    # otherwise the retrospective under-reports what it produced.
+    assert out["lanes"]["impk"]["artifacts_count"] == 4
+
+
+def test_a_capture_for_a_different_goal_does_not_leak_into_this_one(monkeypatch):
+    """Captures are joined by goal_id. A near-miss must skip, never mis-encode."""
+    store = {"g-306-1": _rec("g-306-1")}
+    rec = _Recorder()
+    _stub(monkeypatch, rec, store)
+    item = wr.decide(["g-306-1"], store)["plan"][0]
+    out = wr.retrospect(item, "zeta", "2026-08-07T00:00:00", Path("/nonexistent"),
+                        {"g-306-2": [{"goal_id": "g-306-2", "note": "other goal"}]})
+    assert out["lanes"]["experience"]["skipped"] == wr.SKIP_NO_CAPTURE
+    assert "experience" not in [n for n, _ in rec.calls]
 
 
 def test_a_goal_cannot_be_retrospected_twice(monkeypatch):
@@ -249,12 +289,15 @@ def test_impk_artifacts_count_reports_only_lanes_that_landed(monkeypatch):
 # double-escaping both. These tests exercise the real lane functions with only
 # `_run` captured, which is the narrowest seam that still covers argv shape.
 
-def _capture(monkeypatch):
+def _capture(monkeypatch, stdout=""):
     seen = {}
 
-    def _fake_run(argv, timeout=90):
+    # `**kw` because the experience lane passes `stdin=` — a fake narrower than
+    # the real signature would TypeError instead of testing anything.
+    def _fake_run(argv, timeout=90, **kw):
         seen["argv"] = list(argv)
-        return (0, "", "")
+        seen["stdin"] = kw.get("stdin")
+        return (0, stdout, "")
 
     monkeypatch.setattr(wr, "_run", _fake_run)
     return seen
@@ -321,6 +364,136 @@ def test_lane_argv_flags_match_each_wrapper_surface(monkeypatch):
     wr._lane_team_state(item, "zeta", "2026-08-07T00:00:00", root)
     assert _flag(seen["argv"], "--field") == "recent_completions"
     assert _flag(seen["argv"], "--operation") == "append"
+
+    seen = _capture(monkeypatch)
+    wr._lane_experience(item, "zeta", "2026-08-07T00:00:00", root,
+                        [{"goal_id": "g-306-1", "execution_summary": "x" * 40}])
+    for f in ("--goal", "--skill-slug", "--category", "--summary", "--trace-file"):
+        assert f in seen["argv"], f
+    assert _flag(seen["argv"], "--skill-slug") == wr.EXP_SKILL_SLUG
+
+
+# ──────────────── : the experience lane ────────────────
+#
+# The lane differs from its four siblings in one way that drives every test
+# here: its input is the worker's `exp_capture` slot, which can be absent,
+# heterogeneous, or shaped differently from what the record schema accepts.
+
+
+def test_index_captures_buckets_by_goal_and_drops_unjoinable_rows():
+    doc = [{"goal_id": "g-1-1", "note": "a"}, {"goal_id": "g-1-1", "note": "b"},
+           {"goal_id": "g-2-2", "note": "c"},
+           {"note": "no goal id"}, {"goal_id": "   "}, "junk", None]
+    idx = wr.index_captures(doc)
+    assert sorted(idx) == ["g-1-1", "g-2-2"]
+    assert [e["note"] for e in idx["g-1-1"]] == ["a", "b"]     # order preserved
+
+
+def test_index_captures_returns_empty_for_a_non_list_slot():
+    for value in (None, {}, "", 7):
+        assert wr.index_captures(value) == {}
+
+
+def test_anchor_strings_become_the_key_content_objects_the_schema_requires():
+    """exp_capture writes STRINGS; `_validate_record` rejects anything but dicts
+    carrying both `key` and `content`. Pinning the transform pins the join."""
+    objs = wr.exp_anchor_objects([{"verbatim_anchors": ["rc=2", "core/x.py:41"]}])
+    assert all(isinstance(o, dict) and "key" in o and "content" in o for o in objs)
+    assert [o["content"] for o in objs] == ["rc=2", "core/x.py:41"]
+
+
+def test_anchor_objects_dedup_across_entries_and_preserve_a_dict_anchor():
+    objs = wr.exp_anchor_objects([
+        {"verbatim_anchors": ["dup", {"key": "given", "content": "kept"}]},
+        {"verbatim_anchors": ["dup", "  ", "fresh"]},
+    ])
+    assert [o["content"] for o in objs] == ["dup", "kept", "fresh"]
+    assert objs[1]["key"] == "given"          # an explicit key is not overwritten
+
+
+def test_anchor_truncation_announces_itself_rather_than_dropping_silently():
+    # Every number below is a LITERAL on purpose. The first version of this test
+    # sized its input as `ANCHOR_RECORD_MAX + 7` and asserted `== MAX + 1`, which
+    # made it self-adjusting: raising the cap to 9999 left it green while the
+    # record grew unbounded. A mutation proof caught it (M1, VACUOUS), so the
+    # bound is pinned by value here and the input size no longer tracks it.
+    assert wr.ANCHOR_RECORD_MAX == 25
+    objs = wr.exp_anchor_objects(
+        [{"verbatim_anchors": [f"anchor-value-{i}" for i in range(32)]}])
+    assert len(objs) == 26                     # 25 kept + 1 truncation notice
+    assert objs[-1]["key"] == "anchors-truncated"
+    assert "7 further anchor" in objs[-1]["content"]
+
+
+def test_summary_prefers_narrative_and_falls_back_to_the_title():
+    item = wr.decide(["g-306-1"], {"g-306-1": _rec("g-306-1", title="A title")})["plan"][0]
+    assert wr.exp_summary([{"execution_summary": "  ran   the thing  "}], item) \
+        == "ran the thing"
+    # The looser live shape carries `note`/`lesson` instead — measured, not assumed.
+    assert wr.exp_summary([{"note": "loose shape"}], item) == "loose shape"
+    assert "A title" in wr.exp_summary([{}], item)
+    assert "A title" in wr.exp_summary([], item)
+
+
+def test_render_trace_carries_every_captured_field():
+    item = wr.decide(["g-306-1"], {"g-306-1": _rec("g-306-1")})["plan"][0]
+    body = wr.render_trace(item, [{
+        "execution_summary": "SUMMARY-TOKEN",
+        "key_decisions": ["DECISION-TOKEN"],
+        "verbatim_anchors": ["ANCHOR-TOKEN"],
+        "outcome_class": "deep",
+        "surprise_level": 6,
+        "what_worked": "WORKED-TOKEN",
+    }], "zeta", "2026-08-07T00:00:00")
+    for token in ("SUMMARY-TOKEN", "DECISION-TOKEN", "ANCHOR-TOKEN",
+                  "WORKED-TOKEN", "deep", "g-306-1"):
+        assert token in body, token
+    # A trace shorter than MIN_TRACE_BYTES (200) only warns at the endpoint, but
+    # a real capture should clear it comfortably — a near-empty .md would be a
+    # worse record than none.
+    assert len(body.encode("utf-8")) > 200
+
+
+def test_render_trace_survives_the_loose_capture_shape():
+    """4 of 12 live entries carry no execution_summary. They must still render."""
+    item = wr.decide(["g-306-1"], {"g-306-1": _rec("g-306-1")})["plan"][0]
+    body = wr.render_trace(item, [{"goal_id": "g-306-1", "lesson": "LESSON-TOKEN"}],
+                           "zeta", "2026-08-07T00:00:00")
+    assert "LESSON-TOKEN" in body
+
+
+def test_experience_lane_sends_type_and_anchors_on_stdin(monkeypatch):
+    """Neither field has a CLI flag on the wrapper, so a regression that dropped
+    the stdin payload would silently file records with no anchors at all."""
+    seen = _capture(monkeypatch)
+    item = wr.decide(["g-306-1"], {"g-306-1": _rec("g-306-1")})["plan"][0]
+    wr._lane_experience(item, "zeta", "2026-08-07T00:00:00", Path("/nonexistent"),
+                        [{"verbatim_anchors": ["rc=2"]}])
+    payload = json.loads(seen["stdin"])
+    assert payload["type"] == wr.EXP_TYPE
+    assert payload["verbatim_anchors"] == [{"key": "anchor-01", "content": "rc=2"}]
+
+
+def test_experience_lane_writes_a_real_trace_file_and_cleans_it_up(monkeypatch):
+    """The endpoint rejects a missing or empty trace, so the staged file must
+    actually exist with content AT CALL TIME — and must not be left behind."""
+    seen = {}
+
+    def _fake_run(argv, timeout=90, **kw):
+        path = Path(argv[argv.index("--trace-file") + 1])
+        seen["existed"] = path.exists()
+        seen["bytes"] = path.stat().st_size if path.exists() else 0
+        seen["path"] = path
+        return (1, "", "boom")            # failure path: cleanup must still fire
+
+    monkeypatch.setattr(wr, "_run", _fake_run)
+    item = wr.decide(["g-306-1"], {"g-306-1": _rec("g-306-1")})["plan"][0]
+    rc, _out, _err = wr._lane_experience(
+        item, "zeta", "2026-08-07T00:00:00", Path("/nonexistent"),
+        [{"execution_summary": "y" * 300}])
+    assert seen["existed"] is True and seen["bytes"] > 200
+    assert rc == 1
+    assert not seen["path"].exists()      # no orphan left on the failure path
 
 
 # ──────── : reducer-only guard against skip-and-exit-0 writers ────────

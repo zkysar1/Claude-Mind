@@ -49,13 +49,23 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --goal-status)
             GOAL_STATUS="${2-}"
+            argv_strict_refuse_flaglike_value "$(basename "$0")" --goal-status \
+                "$GOAL_STATUS" "$_ACCEPTED_FLAGS"
             shift $(( $# >= 2 ? 2 : 1 ));;
         --title-contains)
             TITLE_CONTAINS="${2-}"
+            argv_strict_refuse_flaglike_value "$(basename "$0")" --title-contains \
+                "$TITLE_CONTAINS" "$_ACCEPTED_FLAGS"
             shift $(( $# >= 2 ? 2 : 1 ));;
         --goal-field)
             GOAL_FIELD_NAME="${2-}"
             GOAL_FIELD_VALUE="${3-}"
+            # BOTH slots, not just the value: `--goal-field --full pending` eats the
+            # flag as the NAME and is just as silent as eating it as the value.
+            argv_strict_refuse_flaglike_value "$(basename "$0")" '--goal-field <name>' \
+                "$GOAL_FIELD_NAME" "$_ACCEPTED_FLAGS"
+            argv_strict_refuse_flaglike_value "$(basename "$0")" '--goal-field <value>' \
+                "$GOAL_FIELD_VALUE" "$_ACCEPTED_FLAGS"
             shift $(( $# >= 3 ? 3 : ($# >= 2 ? 2 : 1) ));;
         --full)
             # Boolean flag (no value): full-record read mode ().
@@ -71,8 +81,24 @@ while [[ $# -gt 0 ]]; do
             # copy of $_ACCEPTED_FLAGS that must agree with it — the exact drift
             # surface the single-literal rule above exists to remove (found by
             # fresh-eyes on this goal's own diff).
+            # 4th arg (): the default projection is invisible from the
+            # flag list, and guessing it wrong is a MEASURED failure — a caller
+            # filtered on created_at, which the projection does not emit, and
+            # read the resulting nothing as "no goals". Naming the six keys here
+            # is the cheap half of that fix; the loud half is the endpoint's
+            # unknown_goal_field refusal.
+            #
+            # The `extra` slot is the right home for this and a leading printf
+            # block is not, even though argv_strict_help exits 0 as its last act:
+            # the helper has ALWAYS taken a 4th arg and prints it after the flag
+            # list, which is where a reader looks for notes.
             argv_strict_help "$(basename "$0")" "<at least one filter> [--full]" \
-                "$_ACCEPTED_FLAGS";;
+                "$_ACCEPTED_FLAGS" \
+"  Default projection emits SIX keys: goal_id, asp_id, source, title, status, category.
+  Anything else (created_at, priority, defer_reason, claimed_by, ...) requires --full.
+  --goal-field matches the RAW record, so it filters on fields the projection does
+  not show; the identifier there is \`id\`, and \`goal_id\` is accepted as an alias.
+  A name no record carries is REFUSED, not answered with an empty array.";;
         -*)
             # REFUSE (). Every unrecognized flag used to land in a
             # write-only PASSTHROUGH array, so the query silently answered a

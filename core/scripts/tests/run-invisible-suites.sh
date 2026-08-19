@@ -58,6 +58,13 @@ TESTS_DIR="$PROJECT_ROOT/core/scripts/tests"
 # exactly the population the pytest conftest autouse pin can NEVER protect —
 # this export is their only fence. Do not remove.
 export STORAGE_BACKEND=local
+# Same class, second flag (2026-08-18): the pytest conftest pops
+# GATE_FIRINGS_SEGMENTED so hermetic tests observe the legacy gate-firings
+# filename, but main()-style files never see that pop — test_layer_d_telemetry
+# went red on every box the moment settings.json set the flag to 1 fleet-wide.
+# Unset it here for the whole invisible half; a suite that exercises the
+# segment lane sets it explicitly for itself.
+unset GATE_FIRINGS_SEGMENTED
 
 PER_FILE_TIMEOUT="${PER_FILE_TIMEOUT:-300}"
 

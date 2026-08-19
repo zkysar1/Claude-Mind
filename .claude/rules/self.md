@@ -64,6 +64,25 @@ truncates post-compaction identity restoration (Session Start Protocol Phase
 -0.5d) at a fraction of the file. Narrative detail belongs in the journal,
 not the front matter. Enforced at edit time by `guard-380` action_hint step 4.
 
+⚠ **The "roughly 100k bytes" above is ~4 bytes/token, and that ratio is a
+property of the CONTENT, not of the cap. Do not carry it to another file.**
+Measured on `world/knowledge/tree/system/program-alignment-health.md`:
+**2.48 B/token** (99,564 B → 40,171 tokens, bravo/cc-05, 2026-08-12) and
+**2.51 B/token** (77,690 B → 30,937 tokens, zeta, 2026-08-09) — two boxes,
+two sizes, agreeing. At that density 25k tokens is ~62k bytes, so the 4 B/tok
+figure understates tokens ~1.6x. It is not a rounding error: a pre-read
+estimate using this rule's ratio put that file at 99.6% of cap when it was at
+**161%**, and the Read came back at 53% of the file. ID-dense markdown (goal
+ids, guard ids, shas, timestamps, tables) tokenizes far denser than prose.
+What is NOT measured is a self.md's own ratio — identity files are
+prose-dominant, so ~4 B/tok is plausible there and the 28%-of-cap
+reassurance below is consistent with every fleet size ever measured. Treat
+4 B/tok as an unverified upper-bound estimate for prose and **2.5 B/tok as
+the measured floor for anything id-dense**; when it matters, get the real
+number from a truncation notice (it prints the token count) rather than
+converting. (hyp `2026-08-04_program-alignment-node-crosses-read-cap`,
+CONFIRMED; the density finding was not predicted by the claim.)
+
 **Do NOT trim a self.md on byte count alone.** The unitless "~25k" above misled
 two agents on the SAME DAY (2026-07-31) into reading it as BYTES and concluding
 their identity files were at or past the cap: zeta at 28,125 bytes recorded the

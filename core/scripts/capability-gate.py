@@ -188,6 +188,22 @@ def main(argv=None) -> int:
             file=sys.stderr,
         )
 
+    # ADVISORY, never a refusal (g-115-6588 / guard-1412). Printed to stderr on
+    # BOTH output modes because the JSON branch below is consumed as machine
+    # data by cmd_update_goal -- an advisory added to that payload alone would
+    # be parsed and dropped. The exit code is untouched: the defer still writes.
+    if result.get("unscoped_fleet_negative_detected"):
+        print(
+            f"[capability-gate] ADVISORY unscoped fleet-wide claim: "
+            f"\"{result.get('unscoped_fleet_negative_claim')}\" -- this defer "
+            f"asserts a capability negative for the WHOLE fleet but names no "
+            f"box. guard-1412: name the machine it was measured FROM "
+            f"(\"...unreachable FROM cc-04\", or \"measured on <host>\"). A "
+            f"single-box measurement generalised fleet-wide freezes the goal "
+            f"for boxes that can do it. Not refused -- the defer still applies.",
+            file=sys.stderr,
+        )
+
     if args.output == "json":
         print(json.dumps(result, indent=2))
     else:

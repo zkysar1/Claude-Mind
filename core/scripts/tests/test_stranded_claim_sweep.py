@@ -2326,6 +2326,63 @@ def test_completed_not_closed_note_keeps_and_quotes_first_line(
     assert "LENGTH IS NOT VERDICT" in record["reason"]
 
 
+# --- production-shape note_head regression () --------------------
+# The fixture above opens with a bare verdict line. THE LIVE POPULATION DOES
+# NOT: measured 2026-08-15 over all 334 candidates (alpha, hostname cc-04,
+# uname -r 6.8.0-137-generic, own-cloud), 180 (53.9%) open with a worker-Body
+# provenance stamp and 92 of those carry no verdict word anywhere in line 1.
+# So the assertion above passed for months while the field it pins was blank
+# for the majority of real goals — the production shape is precisely what the
+# fixture failed to replicate (guard-920). These tests carry that shape.
+_PROVENANCE_NOTE = (
+    "alpha worker Body @ hostname cc-07, uname -r 6.8.0-136-generic, "
+    "2026-08-08T06:46-07:2x.\n"
+    "BUILT AND LIVE. 4 commits: 633400693, 9dd024191, aa61605fb, 6dda7720f.\n"
+    "Held in-progress for the reducer; completed_by unset.\n"
+    + ("x" * 4000)
+)
+
+
+def test_note_head_skips_provenance_stamp_and_quotes_the_verdict(
+        tmp_agent, monkeypatch, capsys):
+    """The verbatim production shape: provenance on line 1, verdict on line 2."""
+    agent_name, agent_dir, diary = tmp_agent
+    mod, fake = _import_and_patch_rt(monkeypatch)
+    _stale_claim_setup(mod, fake, monkeypatch, agent_dir,
+                       {"outcome_note": _PROVENANCE_NOTE})
+
+    summary = _run_main(mod, ["--stale-minutes", "5"], capsys)
+
+    record = summary["stranded"][0]
+    head = record["completion_evidence"]["note_head"]
+    # The verdict, not the box identity.
+    assert head == ("BUILT AND LIVE. 4 commits: 633400693, 9dd024191, "
+                    "aa61605fb, 6dda7720f.")
+    assert "worker Body" not in head and "uname -r" not in head
+    # The KEEP decision is unchanged — this field is display-only.
+    assert record["verdict"] == "completed-not-closed"
+    assert summary["kept_completed_not_closed"] == 1
+    assert summary["released"] == 0
+
+
+def test_verdict_head_falls_back_and_never_returns_empty(monkeypatch):
+    """Fallback contract: never empty, never LESS than the old behaviour."""
+    mod, _ = _import_and_patch_rt(monkeypatch)
+    # No provenance → unchanged (the pre-existing behaviour is preserved).
+    assert mod._verdict_head("DONE.\nbody") == "DONE."
+    # Leading blank lines are skipped, as before.
+    assert mod._verdict_head("\n\n  DONE.  \nbody") == "DONE."
+    # All-provenance → falls back to line 1 rather than returning nothing.
+    allprov = ("alpha worker Body @ cc-07\nhostname cc-07\nuname -r 6.8.0\n"
+               "uname -r 6.8.0\n")
+    assert mod._verdict_head(allprov) == "alpha worker Body @ cc-07"
+    # Empty / whitespace-only stays empty.
+    assert mod._verdict_head("") == ""
+    assert mod._verdict_head("\n  \n") == ""
+    # The skip is BOUNDED: a 4th provenance line is not scanned past.
+    assert mod._verdict_head(allprov + "REAL VERDICT") == "alpha worker Body @ cc-07"
+
+
 def test_negative_control_no_note_still_strands(tmp_agent, monkeypatch, capsys):
     """NEGATIVE CONTROL: no evidence → the sweep still works.
 
@@ -2540,3 +2597,126 @@ def test_pipeline_read_failure_fails_open_to_release(
 
     summary = _run_main(mod, ["--stale-minutes", "5"], capsys)
     assert summary["stranded"][0]["verdict"] == "stranded"
+
+
+# ---------------------------------------------------------------------------
+#  — per-run carrier memo.
+#
+# The sweep's wall clock is O(this agent's outstanding claims) x one REMOTE
+# round trip per foreign-sid claim past grace, and nothing deduped those reads.
+# Measured 2026-08-13 (alpha, cc-04, the BACKGROUNDED --apply run — the mode is
+# load-bearing, see the sweep's own memo comment): alpha held 318 claims carrying
+# only SIX distinct claimed_by_sid values, so 307 probes resolved to 6 distinct
+# files and the sweep timed out as an ALWAYS-RUN entry call. These tests pin the
+# dedup in both directions — it must collapse repeats AND must not merge
+# distinct sids.
+#
+# `carrier_reads` is what the wall clock tracks; `carrier_checks` is what the
+# logic needed. Asserting only the first would pass against a memo that had
+# been removed, so both are pinned in one test.
+# ---------------------------------------------------------------------------
+
+
+def _many_claimed_goals(fake, specs, claimed_at):
+    """N in-progress claimed goals: `specs` is [(goal_id, sid), ...]."""
+    fake.set_query_response([
+        {"goal_id": gid, "asp_id": "asp-test", "source": "world",
+         "title": "T", "status": "in-progress"}
+        for gid, _sid in specs
+    ])
+    fake.set_active_aspirations([{
+        "id": "asp-test",
+        "goals": [
+            {"id": gid, "claimed_at": claimed_at.isoformat(), "claimed_by_sid": sid}
+            for gid, sid in specs
+        ],
+    }])
+
+
+def test_carrier_probe_is_memoized_per_sid_within_one_run(
+        tmp_agent, monkeypatch, capsys):
+    """Repeat sids cost ONE remote read; distinct sids still cost one each."""
+    agent_name, agent_dir, diary = tmp_agent
+    mod, fake = _import_and_patch_rt(monkeypatch)
+    _patch_agent_dir(monkeypatch, mod, agent_dir)
+    _patch_no_bg(monkeypatch, mod)
+    _stub_subprocess(monkeypatch, mod)
+    monkeypatch.setenv("MIND_SID", "1111-this-session")
+
+    claimed_at = (dt.datetime.now() - dt.timedelta(minutes=200)).replace(microsecond=0)
+    _many_claimed_goals(fake, [
+        ("g-memo-1", "aaaa-peer"),
+        ("g-memo-2", "aaaa-peer"),
+        ("g-memo-3", "aaaa-peer"),
+        ("g-memo-4", "aaaa-peer"),
+        ("g-memo-5", "bbbb-peer"),
+    ], claimed_at)
+    fake.set_team_in_flight(None)
+    # Fresh carriers for BOTH sids: every claim is kept, so this test measures
+    # the probe accounting and never the release path.
+    _write_carrier(agent_dir, "aaaa-peer", age_minutes=2)
+    _write_carrier(agent_dir, "bbbb-peer", age_minutes=2)
+
+    summary = _run_main(
+        mod,
+        ["--apply", "--stale-minutes", "5", "--foreign-sid-grace-minutes", "120",
+         "--carrier-fresh-minutes", "15"],
+        capsys,
+    )
+
+    assert summary["scanned"] == 5
+    # Every claim still NEEDED a verdict — the memo must not skip the logic.
+    assert summary["carrier_checks"] == 5
+    # ...but only two distinct (sid, fresh_minutes) keys were ever fetched.
+    assert summary["carrier_reads"] == 2, (
+        "expected one remote read per distinct sid; got "
+        f"{summary['carrier_reads']} — memo removed or keyed wrongly"
+    )
+    # Positive control: without the memo these are equal. This is the assertion
+    # that actually fails if the dedup is reverted.
+    assert summary["carrier_reads"] < summary["carrier_checks"]
+    # The dedup must not change any VERDICT: all five are still held.
+    assert summary["kept_live_carrier"] == 5
+    assert summary["released"] == 0
+    verdicts = {r["goal_id"]: r["body_carrier"]["verdict"]
+                for r in summary["stranded"]}
+    assert set(verdicts.values()) == {"fresh-correct"}
+    assert len(verdicts) == 5
+
+
+def test_carrier_memo_reports_reads_equal_to_checks_when_all_sids_differ(
+        tmp_agent, monkeypatch, capsys):
+    """CONTROL — the memo must not under-report on a worst case.
+
+    With no repeated sid there is nothing to save, and `carrier_reads` must
+    equal `carrier_checks`. Without this, a memo that wrongly collapsed
+    DISTINCT sids to one read would still pass the test above's `<` assertion
+    while silently applying one body's liveness verdict to another's claim.
+    """
+    agent_name, agent_dir, diary = tmp_agent
+    mod, fake = _import_and_patch_rt(monkeypatch)
+    _patch_agent_dir(monkeypatch, mod, agent_dir)
+    _patch_no_bg(monkeypatch, mod)
+    _stub_subprocess(monkeypatch, mod)
+    monkeypatch.setenv("MIND_SID", "1111-this-session")
+
+    claimed_at = (dt.datetime.now() - dt.timedelta(minutes=200)).replace(microsecond=0)
+    _many_claimed_goals(fake, [
+        ("g-memo-d1", "cccc-peer"),
+        ("g-memo-d2", "dddd-peer"),
+        ("g-memo-d3", "eeee-peer"),
+    ], claimed_at)
+    fake.set_team_in_flight(None)
+    for sid in ("cccc-peer", "dddd-peer", "eeee-peer"):
+        _write_carrier(agent_dir, sid, age_minutes=2)
+
+    summary = _run_main(
+        mod,
+        ["--apply", "--stale-minutes", "5", "--foreign-sid-grace-minutes", "120",
+         "--carrier-fresh-minutes", "15"],
+        capsys,
+    )
+
+    assert summary["carrier_checks"] == 3
+    assert summary["carrier_reads"] == 3
+    assert summary["kept_live_carrier"] == 3

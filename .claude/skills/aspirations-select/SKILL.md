@@ -92,12 +92,34 @@ ranked_goals = parsed_output  # JSON array of scored candidates
 # gate anyway. The authoritative gate still runs in the orchestrator (digest
 # Phase 4) immediately before aspirations-claim.sh, because partner state can
 # flip between this filter and the claim attempt.
+#
+# BOTH SHAPES ARE REQUIRED, AND READING ONLY `in_flight` OPENS THIS FILTER
+# COMPLETELY (g-306-276). `in_flight` is REDUCER-OWNED: team-state-in-flight.sh
+# stamps it only when this box's running-session-id exists AND equals MIND_SID,
+# and SKIPs for every other Body — writing `in_flight_bodies.<sid>` instead.
+# So a partner running as a WORKER Body is invisible in `in_flight`. Measured
+# 2026-08-10 (alpha, cc-07): `in_flight` was null for ALL four live agents
+# fleet-wide while alpha/bravo/foxtrot each held live claims in body rows, and
+# the only non-null `in_flight` anywhere was a test fixture. This is the same
+# defect g-306-160 already repaired in goal-pickup-coordination-check.py — that
+# fix's own comment records the gate "silently opened"; this is the second of
+# the three readers, and the digest Phase 4 hard gate is the third.
+#
+# Staleness is the REAPER's job, not this filter's: body_row_reaper (wired via
+# stranded-claim-sweep, which stop-hook/worker-loop/consolidate all call) deletes
+# rows whose carrier has been stale for DEFAULT_REAP_STALE_MINUTES (180). Do NOT
+# add a second freshness heuristic here — it would drift from the reaper's and
+# put two policies on one store. The bound to know: a dead Body can withhold a
+# goal for at most ~3h, which is the safe direction versus a duplicate claim.
 Bash: team-state-read.sh --field agent_status.<partner>.in_flight.goal_id --json
-IF returned value is a non-null string:
-    partner_in_flight_id = returned value
-    ranked_goals = [g for g in ranked_goals if g.goal_id != partner_in_flight_id]
+Bash: team-state-read.sh --field agent_status.<partner>.in_flight_bodies --json
+    # `--field` returns the whole nested map, so no new endpoint/helper is needed.
+partner_held_ids = ({first call's value} if it is a non-null string else {})
+                 | {b.goal_id for b in second call's values if b is a dict and b.goal_id}
+IF partner_held_ids is non-empty:
+    ranked_goals = [g for g in ranked_goals if g.goal_id not in partner_held_ids]
     IF len(ranked_goals) == 0:
-        Output: "▸ Partner holds the only candidate goal ({partner_in_flight_id}) — yielding"
+        Output: "▸ Partner holds the only candidate goal(s) ({partner_held_ids}) — yielding"
         RETURN (goal = None, selection_reason = "all_blocked", selection_context = {by_reason: {partner_held: 1}, blocked_count: 1})
 ```
 
@@ -579,6 +601,39 @@ IF host chooses to pre-fetch:
 # do NOT remove this step — without it, execution has no description or verification criteria
 Bash: aspirations-read.sh --source {goal.source} --id {goal.aspiration_id}
 goal = find by goal_id in returned aspiration's goals array
+
+# THEN READ, IN THIS ORDER, BEFORE ANY SCOPE REASONING:
+#   goal.outcome_note · goal.outcome_notes (PLURAL — a real second field, guard-3512) · goal.progress_note
+# Live population, asp-335 (bravo, hostname cc-05, uname -r 6.8.0-137-generic,
+# 2026-08-13): outcome_note on 520 of 1212 goals, progress_note on 13,
+# outcome_notes on 2. This is not a rare field — it is present on 43% of the
+# aspiration, so a reader who skips it is skipping the handoff by default.
+#
+# WHY THIS LIST AND NOT THE ONE TWO LINES ABOVE. The comment above names
+# "description and verification" twice, and that framing IS the defect: it tells
+# the reader what matters, and the field recording what has ALREADY BEEN BUILT
+# is not in it. `status: pending` does NOT mean unstarted — under the Mind/Body
+# split a worker finishes a goal and hands it back pending, because verify is a
+# reducer-only phase (guard-2803).
+#
+# THE COST LANDS HERE, ONE PHASE BEFORE guard-2803's OWN TRIGGER. That guardrail
+# fires after aspirations-claim.sh returns, which is correct and still too late:
+# selection is where "this goal is bigger than it says" gets decided, and that
+# decision is made from the description while the answer sits unread in the same
+# record. Three occurrences of exactly that, escalating, and guard-2803 was
+# already written and active (times_active 763) for all three:
+#   2026-08-05 g-335-818  (bravo) caught AT claim — worked as designed
+#   2026-08-13 g-335-1173 (alpha) ~15 min re-deriving scope already written down
+#   2026-08-13 g-335-1201 (bravo) FULL duplicate implementation of a partner's
+#                                 open PR (#193 vs #194), merged before discovery
+# A guardrail cannot outvote the instrument it guards (guard-1984), which is why
+# the fix is these lines and not a fourth guardrail.
+#
+# TELL, and it is counter-intuitive: a re-derived conclusion arriving CORRECT is
+# not reassurance — it is the signature. It matched because it was already
+# recorded. In g-335-1201 two independent implementations converged on
+# byte-compatible wire formats, which read as strong validation of the design and
+# was ALSO the proof that one of them never needed writing.
 ```
 
 ## Phase 2.94: Scorer-Divergence Deviation Code (Scorer Sovereignty Layer B, g-115-2812)

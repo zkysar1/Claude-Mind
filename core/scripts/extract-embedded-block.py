@@ -124,6 +124,19 @@ def read_host(path, source):
     repo-relative path; the worktree read does not.
     """
     if source in (None, "worktree"):
+        # The verify-learning check corpus moved to a registry on 2026-08-18
+        # (); reading the thin SKILL.md takes --list from 371 named
+        # blocks to 0. Worktree reads only — an explicit `staged` or git-ref
+        # read is asking for a specific REVISION of the file and must still get
+        # the file.
+        # Compare RESOLVED paths. Callers pass both forms — the default is
+        # relative, the test harness passes an absolute path — and a normpath
+        # comparison of the two never matches, silently reading the thin file.
+        _repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        _want = os.path.realpath(os.path.join(_repo, DEFAULT_CHECK_FILE))
+        if os.path.realpath(os.path.join(_repo, path)) == _want:
+            import _verify_corpus
+            return _verify_corpus.corpus_text()
         # die(), not a bare open(): an unreadable host file is the CALLER being
         # wrong, so it must report ERROR(2). Letting OSError escape gives a raw
         # traceback and exit 1 -- this tool's FAIL code -- which is the same

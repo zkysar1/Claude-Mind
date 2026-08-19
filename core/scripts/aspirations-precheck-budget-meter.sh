@@ -36,6 +36,9 @@
 #                independently on two boxes; this merge reconciles them and
 #                restores the "last two" referent above, which BOTH fixes had
 #                broken by appending into that pair.)
+#                completed-not-closed-drain (0.5g.7): the per-iteration DRAIN
+#                obligation () — bounded to a few rows, but an
+#                obligation, so it must not be the first thing dropped.
 #   medium:      aspirations-recover-recurring, monitor-stale-check,
 #                precheck-eval, blocker-recheck, defer-recheck,
 #                precondition-defer-recheck, recurring-starvation-check
@@ -47,11 +50,11 @@
 #                parent-supersession-sweep, unblock-parent-status-sweep,
 #                defer-drift-check, reason-less-blocked-check,
 #                blocked-signal-resolution-check, dependency-cycle-check,
-#                hypothesis-terminal-goal-check,
+#                hypothesis-terminal-goal-check, locus-sweep,
 #                fresh-eyes-cadence, fresh-eyes-program-cadence,
 #                strategic-scan-cadence,
 #                felt-sense-cadence, l1-skew-cadence, scar-tissue-cadence,
-#                health-regression-cadence,
+#                completed-not-closed-cadence, health-regression-cadence,
 #                curriculum-cadence, evolution-cadence
 #
 # Unknown sweep names default to medium tier (conservative — less likely to
@@ -104,11 +107,11 @@ now_ms() {
 # Section PB check that asserts the SKILL.md tier table matches.
 sweep_tier() {
     case "$1" in
-        tree-debt-gate|experience-archival-gate|evolution-finalize-gate|fresh-eyes-code-gate|dependency-timeout-check|inbox-alert-age-check|handoff-aging-check|user-blocker-escalation-check)
+        tree-debt-gate|experience-archival-gate|evolution-finalize-gate|fresh-eyes-code-gate|dependency-timeout-check|inbox-alert-age-check|handoff-aging-check|user-blocker-escalation-check|completed-not-closed-drain)
             echo "always-run" ;;
         aspirations-recover-recurring|monitor-stale-check|precheck-eval|blocker-recheck|defer-recheck|precondition-defer-recheck|recurring-starvation-check)
             echo "medium" ;;
-        pending-questions-sweep|recurring-precondition-sweep|parent-supersession-sweep|unblock-parent-status-sweep|routing-audit-target-status-sweep|credential-defer-recheck|defer-drift-check|reason-less-blocked-check|blocked-signal-resolution-check|dependency-cycle-check|hypothesis-terminal-goal-check|reclaim-defer-audit|reclaim-user-participant-audit|human-blocked-defer-join|fresh-eyes-cadence|fresh-eyes-program-cadence|fresh-eyes-tree-cadence|strategic-scan-cadence|felt-sense-cadence|l1-skew-cadence|scar-tissue-cadence|health-regression-cadence|curriculum-cadence|evolution-cadence)
+        pending-questions-sweep|recurring-precondition-sweep|parent-supersession-sweep|unblock-parent-status-sweep|routing-audit-target-status-sweep|credential-defer-recheck|defer-drift-check|reason-less-blocked-check|blocked-signal-resolution-check|dependency-cycle-check|hypothesis-terminal-goal-check|locus-sweep|reclaim-defer-audit|reclaim-user-participant-audit|human-blocked-defer-join|fresh-eyes-cadence|fresh-eyes-program-cadence|fresh-eyes-tree-cadence|strategic-scan-cadence|felt-sense-cadence|l1-skew-cadence|scar-tissue-cadence|completed-not-closed-cadence|health-regression-cadence|curriculum-cadence|evolution-cadence)
             echo "deferrable" ;;
         *)
             # Unknown sweep name — surface to stderr so a missing registration

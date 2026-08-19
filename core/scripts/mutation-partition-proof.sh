@@ -175,6 +175,15 @@ row = {
   # letting a killed tally imply more than it earned (guard-1856).
   "broad": bool(isinstance(sites, int) and sites > 1),
   "restore_status": (main or {}).get("restore_status"),
+  # : restore_status answers "target == backup", which is NOT
+  # "target is clean" — a backup taken over pre-existing residue matches
+  # itself. The RESIDUE case maps onto restore_status "FAILED", so the
+  # RESTORE_FAILED detection below already catches it unchanged; this field
+  # exists for the OTHER value. "unavailable" (--sabotage-sed, whose injected
+  # text is unknowable) means the clean-check DID NOT RUN, and a row that
+  # renders that identically to "clean" is how the original defect stayed
+  # invisible. Absence of measurement, never a pass.
+  "residue_check": (main or {}).get("residue_check"),
   "control": None if ctl is None else {
       "verdict": ctl.get("verdict"),
       # blind == the control did NOT detect the mutation == VACUOUS

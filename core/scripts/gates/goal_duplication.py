@@ -395,6 +395,48 @@ def _extract_signals(goal: dict):
         source_name = "prose"
     file_paths_all = set(_FILE_PATH_RE.findall(text))
 
+    # : an OUTCOME declares what the goal will CHANGE; a CHECK
+    # declares how you would CONFIRM it. Only the first is target-file
+    # co-signal. A path reachable ONLY through a check is a probe target — the
+    # ledger the check reads, the canonical script it shells — and promoting it
+    # to full co-signal blocks legitimate goals against every other goal that
+    # genuinely touches that file. Measured twice in one boot on 2026-07-27,
+    # both false blocks, both needing an audited --override-duplication.
+    #
+    # THE PERVERSE INCENTIVE IS THE REASON THIS IS WORTH FIXING RATHER THAN
+    # OVERRIDING: the better a goal's verification (canonical scripts, real
+    # ledgers), the likelier the false block — so the cheapest way to stop being
+    # blocked is to write WEAKER verification, or to reach for the override by
+    # habit, which erodes the audit value of every override in the ledger.
+    #
+    # SCOPE CORRECTED FROM THE FILING (measured 2026-08-11, alpha/cc-08, over
+    # the 845  goals carrying a non-empty checks list). The goal proposed
+    # excluding paths that appear only inside `verification.checks[].command`.
+    # That field barely exists: of 1,669 check elements, 1,572 (94.2%) are plain
+    # STRINGS and only 22 carry a `command` key at all. Of the 346 goals whose
+    # path co-signal comes only from checks, the proposed rule reaches 15 —
+    # 4.3% — and leaves 331 untouched. So the exclusion keys on the checks
+    # CONTAINER, not on a field inside it, which is also the shape-independent
+    # form: it behaves identically whether a check is a string, a dict with
+    # `command`, or a dict shape nobody has written yet.
+    #
+    # FALL BACK WHEN THERE ARE NO OUTCOMES, or the fix inverts into the worse
+    # failure. A goal with checks and no outcomes would otherwise lose ALL
+    # file-path co-signal and sail past duplicate detection entirely — trading
+    # a false block for a false ADMIT, and a false admit is silent.
+    _v = goal.get("verification") or {}
+    if source_name == "verification" and (_v.get("outcomes") or []):
+        _outcome_paths = set(_FILE_PATH_RE.findall(
+            " ".join(str(x) for x in (_v.get("outcomes") or []) if x)))
+        # Keep only paths the OUTCOMES vouch for. Paths seen solely in checks
+        # stay stripped from the keyword text below (they are still in
+        # file_paths_all at that point), so a probe path cannot dodge this by
+        # re-entering as a keyword stem — the same trap the strip loop below
+        # was written to close for exclusion-context paths.
+        _vouched_paths = _outcome_paths & file_paths_all
+    else:
+        _vouched_paths = set(file_paths_all)
+
     # Strip ALL detected paths (incl. exclusion-context ones) from the text
     # before keyword extraction so a path like retrieve.sh never leaks its stem
     # ("retrieve") into keywords — the exclusion filter below must remove the
@@ -425,7 +467,14 @@ def _extract_signals(goal: dict):
     }
 
     # : drop exclusion-context-only paths from the co-signal set.
-    file_paths = {fp for fp in file_paths_all
+    # Iterates _vouched_paths, NOT file_paths_all (): this line used
+    # to rebuild from file_paths_all and so would have silently DISCARDED the
+    # probe-path filter above — the fix would have been a no-op that reads as
+    # applied. The strip loop above still uses file_paths_all deliberately, so a
+    # probe path is removed from the keyword text too and cannot re-enter as a
+    # stem. Any future filter must narrow _vouched_paths, never re-source from
+    # file_paths_all.
+    file_paths = {fp for fp in _vouched_paths
                   if not _path_in_exclusion_context(text_lower, fp.lower())}
     return file_paths, keywords, source_name
 
@@ -901,19 +950,61 @@ def _check_partner_in_flight(goal, file_paths, keywords, self_agent,
         if agent_name == self_agent:
             continue
         inflight = status.get("in_flight")
-        if not isinstance(inflight, dict):
-            continue
-        title = inflight.get("title") or ""
-        goal_id = inflight.get("goal_id") or ""
-        if not title and not goal_id:
-            continue
-        partner_inflights.append({
-            "agent": agent_name,
-            "goal_id": goal_id,
-            "title": title,
-            "phase": inflight.get("phase"),
-            "claimed_at": inflight.get("claimed_at"),
-        })
+        if isinstance(inflight, dict):
+            title = inflight.get("title") or ""
+            goal_id = inflight.get("goal_id") or ""
+            if title or goal_id:
+                partner_inflights.append({
+                    "agent": agent_name,
+                    "goal_id": goal_id,
+                    "title": title,
+                    "phase": inflight.get("phase"),
+                    "claimed_at": inflight.get("claimed_at"),
+                })
+        # : Body-keyed rows. `in_flight` is REDUCER-OWNED —
+        # team-state-in-flight.sh stamps it only when this box's
+        # running-session-id equals MIND_SID, and for every OTHER Body it takes
+        # a mutually exclusive branch writing `in_flight_bodies.<sid>` instead.
+        # So a partner running as a WORKER Body was invisible here, and this
+        # check's peer set silently emptied. Measured 2026-08-16 (zeta, hostname
+        # cc-02, uname -r 6.8.0-137-generic): the reducer surface carried 1 live
+        # claim fleet-wide while the per-Body surface carried 6 more (alpha 5,
+        # bravo 1) — this check saw 1 of 7. Earlier the same day it saw 0 of 7.
+        # THE EXPOSURE SCALES WITH BODY-PARALLELISM, NOT TIME: a single-Body
+        # agent's only Body IS its reducer, so it stamps the reducer surface
+        # normally and was always visible. Anyone measuring this fix before/after
+        # must segment by how Body-parallel the agents in the window were.
+        #
+        # Third of the three readers  identified (after
+        # goal-pickup-coordination-check.py and the select partner-claim filter);
+        # the pattern below is COPIED from that landed fix, not re-derived.
+        # Row keys verified against a live record before writing this filter
+        # (guard-2559): a body row carries exactly {claimed_at, goal_id, phase,
+        # title} — identical to the reducer row, so it maps 1:1 onto the append.
+        #
+        # Each body is a SEPARATE candidate, never merged: two Bodies of one Mind
+        # hold genuinely concurrent claims on DIFFERENT goals, so collapsing them
+        # would drop every claim but one (guard-2325 — a derived enumeration does
+        # not save a structural check whose key is non-unique).
+        #
+        # The goal_id guard is deliberately STRICTER than the reducer branch
+        # above (which accepts title-or-goal_id). A cleared body row is DELETED
+        # as of , so the common case never reaches here — but pre-fix
+        # null residue survives on any box that has not yet run a close, and a
+        # hand-edit can still leave one (guard-3443: a bare object listing
+        # returns every key, and this store holds more than one population).
+        bodies = status.get("in_flight_bodies")
+        if isinstance(bodies, dict):
+            for _sid, body in bodies.items():
+                if not isinstance(body, dict) or not body.get("goal_id"):
+                    continue
+                partner_inflights.append({
+                    "agent": agent_name,
+                    "goal_id": body.get("goal_id"),
+                    "title": body.get("title") or "",
+                    "phase": body.get("phase"),
+                    "claimed_at": body.get("claimed_at"),
+                })
 
     prov_caveat = _partner_read_caveat(ts_prov, self_agent,
                                        composed_peers=set(agent_status),
@@ -930,6 +1021,60 @@ def _check_partner_in_flight(goal, file_paths, keywords, self_agent,
 
     MIN_UNIQUE_HITS = 2
 
+    # ⚠ READ THIS BLOCK TO "PORTED:" BEFORE CONCLUDING ANYTHING ABOUT CURRENT
+    # BEHAVIOUR. It is HISTORICAL: first the defect, then the fix that closed
+    # it. The hardening IS landed here (`has_specific` + the demotion branch
+    # below), and the FP counts quoted are PRE-hardening evidence that MOTIVATED
+    # the port — not a live risk profile. Measured 2026-08-16 (): a
+    # reader stopped two lines short of "PORTED:", filed a goal asserting this
+    # check was still unhardened, and cited those counts as a current hazard.
+    # rb-2059 is the governing rule — verify a gate's DEPLOYED threshold and
+    # coverage before quantifying its behaviour.
+    #
+    # : this was the ONLY one of the three overlap checks that
+    # hard-blocked on RAW unweighted overlap. _check_recent_completions
+    # (L619-678) and _check_pending_queue (L2047-2058) both gate their strong
+    # path on a structural co-signal; that hardening never landed here, so a
+    # two-generic-token coincidence against a partner's title hard-blocked a
+    # filing (canonical FP:  vs  on "amplify"+"report",
+    # file_path_hits: []; second measured FP: two tokens [lambda, mount],
+    # guard-2742's 2026-08-11 qualification).
+    #
+    # WHY THIS CHECK'S FALSE POSITIVES COST THE MOST: a recent_completions FP
+    # blocks against FINISHED work and merely annoys; a partner_in_flight FP
+    # blocks against LIVE work, so it reads as a claim conflict and agents
+    # defer to it instead of overriding. Measured 2026-08-12 (alpha, hostname
+    # cc-04, uname -r 6.8.0-137-generic) over meta/gate-firings.jsonl for
+    # ts 2026-08-10..12, attributed by the extra.failing_checks field: 53
+    # blocks named partner_in_flight as SOLE cause and only 8 were overridden
+    # (15%), against 47 sole-cause recent_completions blocks of which 27 were
+    # overridden (57%). The unhardened check was trusted ~4x more readily than
+    # its hardened sibling, so its FPs are the ones that silently drop work.
+    #
+    # PORTED: the token-shape co-signal + the per-term IDF floor.
+    # DELIBERATELY NOT PORTED: the sibling's aggregate WEIGHT_THRESHOLD (1.5).
+    # That threshold is calibrated to corpora of ~50 (recent_completions) and
+    # ~337 (pending_queue) entries. This corpus is the partner in_flight titles
+    # — measured 1-5. _compute_idf returns idf=0.0 for every term when df==n,
+    # so at n=1 (the common single-partner case) `weighted` is exactly 0.0 and
+    # a WEIGHT_THRESHOLD test would be permanently False — i.e. mirroring the
+    # sibling "exactly" would silently DISABLE this check in its most common
+    # configuration. Verified by direct probe before this edit. The token-shape
+    # discriminator is corpus-INDEPENDENT and is what the sibling's own comments
+    # (L665-670) identify as the real discriminator; the IDF floor self-disables
+    # to 0.0 at n<=2 and filters cluster-common tokens at larger n. This is the
+    # rb-4385 "mirror the whole discriminator" principle applied with the one
+    # term that does not transfer removed on measured grounds, not forgotten.
+    all_terms = set(file_paths) | set(keywords)
+    # _compute_idf takes entries with a `key_finding` field; wrap the partner
+    # titles in that shape, exactly as _check_pending_queue does (L2050).
+    _pseudo_entries = [{"key_finding": pi["title"] or ""}
+                       for pi in partner_inflights]
+    idf, idf_n = (_compute_idf(_pseudo_entries, all_terms)
+                  if all_terms else ({}, 0))
+    idf_floor = (math.log(idf_n / (1 + STRUCT_IDF_DF_CEIL))
+                 if idf_n > (1 + STRUCT_IDF_DF_CEIL) else 0.0)
+
     proposed_id = goal.get("id") or ""
     matches = []
     advisories = []
@@ -941,7 +1086,48 @@ def _check_partner_in_flight(goal, file_paths, keywords, self_agent,
         hit_paths = sorted(fp for fp in file_paths if fp.lower() in text)
         hit_kws = sorted(kw for kw in keywords if kw in text)
         unique_hits = len(hit_paths) + len(hit_kws)
-        if unique_hits >= MIN_UNIQUE_HITS:
+        # HARD block requires a co-signal beyond bare generic vocabulary: a
+        # shared file path, a rare structured identifier, OR a compound token
+        # (word-HYPHEN-word). Overlaps consisting ONLY of bare plain words are
+        # topical noise (guard-2842: read the DISCRIMINATOR, not the verdict).
+        #
+        # THE COMPOUND CLAUSE IS DELIBERATE AND IS WHERE THIS CHECK MUST DIVERGE
+        # FROM ITS SIBLING. _is_structural_identifier EXCLUDES word-HYPHEN-word
+        # compounds () because in _check_recent_completions the corpus
+        # is ~50 FINISHED goals, where domain compounds (own-cloud, env-server)
+        # recur constantly and are therefore cluster-common vocabulary. This
+        # corpus is 1-5 LIVE partner titles, where a shared compound means a
+        # partner has that exact scope loaded RIGHT NOW. Measured 2026-08-12
+        # (alpha, hostname cc-04, uname -r 6.8.0-137-generic) by extracting real
+        # tokens through _extract_signals:
+        #   TRUE POSITIVE  (this file's own gate test CASE 1, genuine duplicate
+        #     work): hits = ['execution-diary', 'observer-session'] — compounds,
+        #     _is_structural_identifier False for BOTH.
+        #   FALSE POSITIVE ( vs ; and guard-2742's 2026-08-11
+        #     [lambda, mount] case): hits = ['amplify', 'lambda', 'report'] —
+        #     bare plain words, _is_structural_identifier False for all.
+        # A faithful port of the sibling's predicate scores BOTH as non-specific
+        # and so DEMOTES THE TRUE POSITIVE — verified by running this file's gate
+        # test against that version: CASE 1 and CASE 6 both regressed. Hyphenation
+        # separates the two populations cleanly; structural-identifier shape does
+        # not separate them at all. Hence the divergence is measured, not stylistic.
+        has_specific = bool(hit_paths) or any(
+            (_is_structural_identifier(k) and idf.get(k, idf_floor) >= idf_floor)
+            or ("-" in k)
+            for k in hit_kws)
+        if unique_hits >= MIN_UNIQUE_HITS and not has_specific:
+            # Vocabulary-only overlap against LIVE work. DEMOTE to advisory:
+            # stays visible to the caller (and to guard-2742's route-to-partner
+            # judgment) but never hard-blocks the filing.
+            advisories.append({
+                "agent": pi["agent"],
+                "goal_id": pi["goal_id"],
+                "unique_hits": unique_hits,
+                "keyword_hits": hit_kws[:5],
+                "demoted": ("vocabulary-only — no file-path or rare "
+                            "structural-identifier co-signal (g-115-3424)"),
+            })
+        elif unique_hits >= MIN_UNIQUE_HITS:
             matches.append({
                 "agent": pi["agent"],
                 "goal_id": pi["goal_id"],
@@ -959,24 +1145,36 @@ def _check_partner_in_flight(goal, file_paths, keywords, self_agent,
                 "unique_hits": unique_hits,
             })
 
+    # : report the demoted count separately from the sub-threshold
+    # count. They are different branches and conflating them makes the gate's
+    # own output unable to say which one ran (guard-3478) — a vocabulary-only
+    # demotion reported as "sub-threshold" would hide the very behaviour this
+    # hardening introduces.
+    demoted_n = sum(1 for a in advisories if a.get("demoted"))
+    subthreshold_n = len(advisories) - demoted_n
+
     if matches:
         return {
             "name": "partner_in_flight",
             "passed": False,
             "reason": ("overlap with " + str(len(matches)) +
                        " partner in_flight goal(s) [N>=" +
-                       str(MIN_UNIQUE_HITS) + ", source=" + source_name + "]"),
+                       str(MIN_UNIQUE_HITS) + " + structural co-signal" +
+                       ", source=" + source_name + "]"),
             "matches": matches,
             "advisories": advisories[:5],
+            "demoted_count": demoted_n,
         }
     return {
         "name": "partner_in_flight",
         "passed": True,
         "reason": ("no blocking overlap (source=" + source_name +
-                   ", " + str(len(advisories)) + " sub-threshold advisories)" +
+                   ", " + str(subthreshold_n) + " sub-threshold advisories, " +
+                   str(demoted_n) + " vocabulary-only demoted)" +
                    prov_caveat),
         "matches": [],
         "advisories": advisories[:5],
+        "demoted_count": demoted_n,
     }
 
 

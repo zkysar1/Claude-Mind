@@ -282,13 +282,13 @@ DRY_RUN=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --target)    TARGET="$2"; shift 2 ;;
-        --channel)   CHANNEL="$2"; shift 2 ;;
-        --reason)    REASON="$2"; shift 2 ;;
+        --target)    TARGET="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --channel)   CHANNEL="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --reason)    REASON="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         --shared)    SHARED=true; shift ;;
-        --type)      MSG_TYPE="$2"; shift 2 ;;
-        --tags)      TAGS="$2"; shift 2 ;;
-        --inject-goal) INJECT_GOAL="$2"; shift 2 ;;
+        --type)      MSG_TYPE="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --tags)      TAGS="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --inject-goal) INJECT_GOAL="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         --dry-run)   DRY_RUN=true; shift ;;
         --help|-h)   usage ;;
         *)           die "Unknown argument: $1. Use --help for usage." ;;

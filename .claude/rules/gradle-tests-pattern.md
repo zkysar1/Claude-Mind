@@ -1,3 +1,27 @@
+---
+paths:
+  - "**/*.gradle"
+  - "**/*.gradle.kts"
+  - "**/build.gradle*"
+  - "**/settings.gradle*"
+  - "**/gradlew*"
+---
+
+<!--
+  THIS IS THE g-115-6469 `paths:` EXPERIMENT — the first path-scoped rule in
+  this repo. If you are reading this because the rule surprised you, see
+  core/config/conventions/rules-loading.md for the design, the instrument and
+  how to read out the result.
+
+  Why THIS rule was chosen as the probe: its enforcement does not depend on the
+  rule text at all. gradle-tests-gate.sh is a PreToolUse[Bash] hook wired in
+  .claude/settings.json, and gradle-tests-audit.py is the detective. So if
+  `paths:` turns out to suppress this file more aggressively than intended, the
+  gate still refuses a bad pattern and nothing regresses — the worst case is a
+  lost explanation, not a lost defence. No other rule in the set has that
+  property as cleanly.
+-->
+
 # Gradle `--tests` Pattern Correctness
 
 ## Principle

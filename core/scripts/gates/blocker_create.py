@@ -1,9 +1,10 @@
 """Blocker-create gate logic — daemon-safe extraction (PR 7a/3).
 
-Hard checks BEFORE writing a new blocker. Catches the five canonical
+Hard checks BEFORE writing a new blocker. Catches the six canonical
 false-positive failure modes (non-canonical probe / single-signal / unverified
 statistical claim / infra blocker without infra-health probe / credentials-required
-without per-source identity enumeration). See the CLI
+without per-source identity enumeration / credentials-required naming an AWS
+action without an efs-ssh.sh re-probe). See the CLI
 wrapper docstring for the full failure-mode catalog and the rb-NNN crosslinks.
 
 Public API:
@@ -51,8 +52,12 @@ from _skill_md import get_companion_scripts  # type: ignore
 
 try:  # normal package import (core/scripts on sys.path)
     from gates.credential_enum import check as _credential_enum_check
+    # SSOT for the governed type string — checks 5 and 6 govern the same
+    # blocker type and must never drift to two spellings of it.
+    from gates.credential_enum import GOVERNED_TYPE as _CREDENTIALS_TYPE
 except ImportError:  # loaded with gates/ itself on sys.path
     from credential_enum import check as _credential_enum_check  # type: ignore
+    from credential_enum import GOVERNED_TYPE as _CREDENTIALS_TYPE  # type: ignore
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent  # core/scripts/
@@ -278,6 +283,119 @@ def _check_infra_health(blocker: dict) -> dict:
             "reason": "infra_health_check present"}
 
 
+_EFS_SSH_SCRIPT = "efs-ssh.sh"
+
+# The last three sentences of guard-1160 — the clause this check exists to make
+# REACHABLE. The entry is ~1700 chars and this sits at its end, so a reader acts
+# on the first clause (enumerate box credentials), satisfies it honestly, and
+# never gets here. Measured utilization when this shipped: times_active 3218,
+# times_helpful 2. guard-4058 forbids answering that with a reword and
+# guard-1869 forbids appending recurrence N+1, so the answer is a gate.
+_GUARD_1160_CLAUSE = (
+    "The env-server EC2 instance reached by world/scripts/efs-ssh.sh DOES "
+    "carry an instance profile — assumed-role/Zak_first_test_role, a DIFFERENT "
+    "principal from the near-identically-named user/Zak_first_test — and holds "
+    "permissions BOTH local users are denied. ... So before concluding "
+    "blocked, re-run the SAME call through efs-ssh.sh."
+)
+
+# An AWS action reads `service:ActionName` (s3:PutLifecycleConfiguration,
+# amplify:UpdateApp). Deliberately NOT "any AccessDenied anywhere": the goal's
+# scope note forbids widening the trigger, and the population this governs is
+# already narrow (credentials-required blocker CREATION only).
+_AWS_ACTION_RE = re.compile(r"(?<![\w.])([a-z][a-z0-9-]{1,30}):([A-Z][A-Za-z0-9]{2,50})(?![\w])")
+
+# Prose labels that happen to match the regex shape (`Note:Something`). This is
+# a FALSE-POSITIVE DAMPER, not a completeness claim — an unlisted prose label
+# would merely demand an efs-ssh probe on a credentials blocker, which is the
+# fail-CLOSED direction and clears with one justified override. The reverse
+# error is the 86h/3-day human-gating this check exists to prevent, so the
+# asymmetry is deliberate; do not "fix" it by widening the exclusions.
+_NOT_AWS_SERVICES = frozenset({
+    "note", "reason", "error", "warning", "output", "command", "tool", "ref",
+    "http", "https", "file", "see", "todo", "fixme", "eg", "ie", "cf",
+})
+
+
+def _names_aws_action(blocker: dict) -> Optional[str]:
+    """First AWS `service:Action` named in the failure_reason or the evidence."""
+    blobs = [str(blocker.get("failure_reason") or "")]
+    for e in blocker.get("evidence") or []:
+        if isinstance(e, dict):
+            blobs.extend(str(e.get(k) or "")
+                         for k in ("command", "output", "tool", "error", "detail"))
+        else:
+            blobs.append(str(e))
+    for blob in blobs:
+        for m in _AWS_ACTION_RE.finditer(blob):
+            if m.group(1).lower() not in _NOT_AWS_SERVICES:
+                return m.group(0)
+    return None
+
+
+def _evidence_has_efs_ssh(blocker: dict) -> bool:
+    """Did any evidence entry actually invoke the privileged remote-shell wrapper?
+
+    Matches on `tool` and `command` ONLY — never on `output`. A denial message
+    can quote the script name back at you, and crediting that would let the
+    absence of the probe satisfy the check for the probe.
+    """
+    for e in blocker.get("evidence") or []:
+        if isinstance(e, dict):
+            blob = " ".join(str(e.get(k) or "") for k in ("tool", "command"))
+        else:
+            blob = str(e)
+        if _EFS_SSH_SCRIPT in blob:
+            return True
+    return False
+
+
+def _check_efs_ssh_probe(blocker: dict) -> dict:
+    """Check 6: a credentials-required blocker naming an AWS action must have
+    re-run that call through efs-ssh.sh before concluding blocked.
+
+    TWO measured saves in different services, and in BOTH the agent had already
+    concluded human-gated on a CORRECT, exhaustive enumeration of box
+    credentials: amplify:UpdateApp (g-115-3795, 2026-07-29) and
+    s3:PutLifecycleConfiguration (g-115-6143, 2026-08-17). Check 5
+    (_check_credential_enumeration) cannot catch this — the enumeration was
+    complete and honest; every LOCAL source really was denied. The missing
+    principal is not on this box at all, so no amount of local enumeration
+    reaches it.
+
+    Governs ONLY `credentials-required`. Every other type — including the other
+    HUMAN_ONLY_BLOCKER_TYPES with no companion-script path (security-trust,
+    physical-hardware, user_action) — passes untouched, matching the
+    canonical_probe precedent.
+    """
+    name = "efs_ssh_probe"
+    if (blocker.get("type") or "") != _CREDENTIALS_TYPE:
+        return {"name": name, "passed": True,
+                "reason": f"not a {_CREDENTIALS_TYPE} blocker; check skipped"}
+    action = _names_aws_action(blocker)
+    if not action:
+        return {"name": name, "passed": True,
+                "reason": "no AWS service:Action named in failure_reason or "
+                          "evidence; check skipped"}
+    if _evidence_has_efs_ssh(blocker):
+        return {"name": name, "passed": True,
+                "reason": f"evidence invokes {_EFS_SSH_SCRIPT} "
+                          f"(action named: {action})"}
+    return {
+        "name": name, "passed": False,
+        "reason": (
+            f"credentials-required blocker names the AWS action `{action}` but "
+            f"no evidence entry invokes {_EFS_SSH_SCRIPT}. guard-1160: "
+            f"\"{_GUARD_1160_CLAUSE}\" "
+            f"Enumerating every credential on THIS box cannot reach that "
+            f"principal — it is not on this box. Re-run the same call via "
+            f"world/scripts/efs-ssh.sh and add the result to evidence[] "
+            f"(tool/command naming {_EFS_SSH_SCRIPT}), or pass "
+            f"--override-blocker-gate \"<justification>\"."
+        ),
+    }
+
+
 def _check_credential_enumeration(blocker: dict) -> dict:
     """Check 5: credentials-required blockers must enumerate per-source identities.
 
@@ -331,7 +449,7 @@ def evaluate(blocker: dict, *, probe_command: Optional[str] = None,
              override_blocker_gate: Optional[str] = None,
              world_dir: Optional[Path] = None,
              agent_name: str = "") -> dict:
-    """Run all five checks. See module docstring for return shape + side effects.
+    """Run all six checks. See module docstring for return shape + side effects.
 
     Args:
         blocker: parsed blocker JSON dict (type, affected_skills,
@@ -350,6 +468,7 @@ def evaluate(blocker: dict, *, probe_command: Optional[str] = None,
         _check_schema_probe(blocker),
         _check_infra_health(blocker),
         _check_credential_enumeration(blocker),
+        _check_efs_ssh_probe(blocker),
     ]
     failing = [c for c in checks if not c.get("passed")]
     would_block = bool(failing) and not override_blocker_gate

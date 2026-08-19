@@ -39,6 +39,26 @@ Usage
   py -3 core/scripts/tree-code-ref-drift.py --output json
   py -3 core/scripts/tree-code-ref-drift.py --node <path>   # one node
   py -3 core/scripts/tree-code-ref-drift.py --exit-on-drift # rc=1 when drift found
+
+Call site
+---------
+Recurring goal g-115-5633, interval 168h, wired by g-115-4236. Until then this
+script had NO caller at all — only its own test file named it — which made it
+indistinguishable from a scanner that always returns clean. Stated here so the
+next reader can answer "does this run?" without re-deriving the audit.
+
+Gate on `confirmed_total` only; leads never set a failing status. Read the
+verdict from `--output json`, NOT from the exit code: rc=1 means a CONFIRMED
+finding *or* an uncaught traceback (g-115-4239 defect 1), and nothing about the
+rc distinguishes them.
+
+The recurring lane was chosen over an aspirations-precheck sweep because it is
+the only candidate carrying an open-loop starvation detector (precheck Phase
+0.5c.1, g-115-3921) — a cadence that can silently stop firing is the same defect
+as a scanner with no caller, one level up. Keep the caller a SUBPROCESS: an
+in-process cadence calling scan() twice in one interpreter activates the stale
+module-global `_line_cache` (g-115-4239 defect 3, which names g-115-4236 by id
+as its trigger).
 """
 
 import argparse

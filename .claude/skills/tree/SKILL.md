@@ -383,10 +383,31 @@ Read {node.file}
 #      never tests SHAPE, so it collects two shapes that keep-newest-N damages.
 #      Measured: 3 of 3 crit3 nodes hand-examined in ONE maintain run were three
 #      DIFFERENT shapes — the mixed case is the normal case, not the edge case.
-#      Enumerate heading structure and per-section line spans FIRST — use RANGED
+#      Enumerate heading structure and per-section size FIRST — use RANGED
 #      Reads (offset/limit); a full Read truncates exactly the node this fork is
-#      for — then route on shape, never on size:
-#        grep -n '^#\{1,3\} ' {node.file}     # headings + line numbers => spans
+#      for — then route on shape, never on total size.
+#
+#      ⚠ MEASURE **BYTES** PER SECTION, NOT LINE SPANS. This block said "line
+#      spans" until 2026-08-17 and the unit is wrong by up to 7x, silently, in
+#      the direction that hides the dominant section. Measured that day (foxtrot,
+#      `hostname` LAPTOP-3IOFCNEO, `uname -r` 6.6.87.2-microsoft-standard-WSL2)
+#      on a per-agent series shard (an index TABLE plus dated narrative entries):
+#      its `## Series` TABLE section is
+#      **456 B/line** against **63 B/line** for the narrative entry sections, so
+#      by lines it is 6.4% of the node and by bytes it is **32.5%**. The
+#      consequence is not academic — a RANGED Read of just its first 215 lines
+#      returned **35,462 tokens and was REFUSED for exceeding the 25,000 cap**,
+#      i.e. the fork's own prescribed measurement step cannot complete on a
+#      table-dense node while reporting a small line count. Tables, `|`-rows, id
+#      lists and timestamps tokenize far denser than prose (the same density trap
+#      `.claude/rules/self.md` measures at 2.48-2.51 B/token for ID-dense
+#      markdown). One awk pass gives the honest profile and costs no context:
+#        grep -nE '^#{1,3} ' {node.file}      # headings + line numbers
+#        awk '/^## /{if(n!="")printf "%-70s L=%4d B=%7d\n",n,nl,nb; n=substr($0,1,70); nl=0; nb=0; next}
+#             {if(n==""){pl++;pb+=length($0)+1}else{nl++;nb+=length($0)+1}}
+#             END{printf "%-70s L=%4d B=%7d\n",n,nl,nb; printf "%-70s L=%4d B=%7d\n","[PREAMBLE]",pl,pb}' {node.file}
+#      Read the B column. A single section holding >30% of the node's bytes is
+#      the finding, whatever its line count says.
 #
 #        (a) APPEND-GROWN SERIES — dated sections, newer supersedes older,
 #            roughly UNIFORM section size.
@@ -406,6 +427,47 @@ Read {node.file}
 #            that keep-newest-N removes while nearly all the cost is retained.
 #            -> NO CUT. Report the finding as per-entry size discipline and route
 #               it to the node's active writer (board findings post). STOP.
+#
+#        (d) ONE SECTION DOMINATES — a SINGLE non-newest section holds >30% of the
+#            node's BYTES. Shapes (a)-(c) all reason about newest-vs-oldest
+#            ENTRIES, so none of them tests this and the fork routes it to (a) by
+#            default. keep-newest-N then cannot reach the cap NO MATTER HOW MANY
+#            entries it deletes, because the dominant section is not an entry —
+#            so the rollup pays its full destructive cost and still leaves the
+#            node unreadable. Two live cases, both measured 2026-08-17 (foxtrot,
+#            LAPTOP-3IOFCNEO, 6.6.87.2-microsoft-standard-WSL2):
+#              · a per-agent SERIES SHARD — its `## Series` index TABLE is 82,104
+#                of 252,815 B (32.5%) and ~35.7k est tokens, i.e. **over the 25k
+#                cap BY ITSELF**. Archiving every one of its 28 dated entries
+#                still leaves the node 1.46x over cap. Untouchable by rollup.
+#              · a FAILURE-MODE CATALOG node — 284,057 B, 4.9x cap,
+#                `refresh_sections: 30`, `recommended_action: distill`. Its cost
+#                was 145,425 B (51%) of dated `### n=NN` cycle entries accumulated
+#                **under a `## Cross-references` heading**, plus a second 72,423 B
+#                (25%) append series. 76.7% of a "catalog" node was series, filed
+#                where no heading said so.
+#            -> Route by WHAT the dominant section IS, never by the crit3 label:
+#               a mis-nested SERIES (dated subsections under a non-series heading)
+#               -> SPLIT it out to its own child, then the parent is a catalog and
+#                  the child is a pure shape (a) the standard rollup handles safely
+#                  on a later pass. This is the CORRECT sequencing for a mixed
+#                  node — do not try to fix both halves in one operation.
+#               an INDEX/TABLE that is the node's quantitative ladder (read by
+#                  fresh-eyes Decision Rule 11) -> it is the content that must
+#                  SURVIVE. NO CUT of the table. Route per-row size discipline to
+#                  its writer, subject to the SOLE-WRITER RULE below.
+#            The tell that you are in (d) and not (a): the dated entries look
+#            uniform and unremarkable, and the byte profile has one row an order
+#            of magnitude above its neighbours. A line-span profile hides it —
+#            see the MEASURE BYTES warning above.
+#            Worked precedent: the catalog case above was split 4 ways on measured
+#            natural boundaries (parent 284,057 -> 39,377 B, under both the 25k
+#            cap and the 20k crit3 re-trigger), verbatim, `tree-split-verify.py`
+#            lines=3634 matched=3634 missing=0. Note the honest side effect —
+#            `--distill-candidates` went 822 -> 823, because one mixed node was
+#            replaced by two pure series. A count-based debt metric got WORSE from
+#            an operation that strictly improved the tree; judge this arm by
+#            "is the most-retrieved node readable", not by the candidate count.
 #
 #      SOLE-WRITER RULE: a per-agent series shard has ONE owner. Never rewrite
 #      another agent's sole-writer node wholesale — route the finding to its

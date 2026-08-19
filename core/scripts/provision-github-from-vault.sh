@@ -111,9 +111,15 @@ SSH_CONFIG_PATH="$SSH_KEY_DIR/config"
 DEPLOY_TITLE="fleet-deploy-${AGENT}"
 
 # ── Reach the vault + read the ONE token into memory ───────────────────────────
-# Reuses provision-from-vault.sh's vault-reach shape (same bootstrap key, same
-# canonical SSH flags for the cold-node case where the world/ wrapper is absent).
+# Reuses provision-from-vault.sh's vault-reach shape (same bootstrap key, and
+# now the same TRANSPORT resolution — see g-335-1096 there).
 # The token is captured into a variable and never touches disk.
+#
+# The clause removed here read "same canonical SSH flags for the cold-node case
+# where the world/ wrapper is absent". It is worth naming because it is how the
+# defect SPREAD: this file copied the sibling's inlined FLAGS *and its rationale*,
+# so one dead transport became two, and fixing either alone would have left the
+# other silently broken. Copying a justification copies its expiry date too.
 if [ -n "${PROVISION_GH_VAULT_FILE:-}" ]; then
     # Test seam: read a local vault file instead of SSH.
     [ -f "$PROVISION_GH_VAULT_FILE" ] || { echo "provision-github-from-vault: PROVISION_GH_VAULT_FILE not found: $PROVISION_GH_VAULT_FILE" >&2; exit 1; }
@@ -128,12 +134,26 @@ else
         echo "provision-github-from-vault: VAULT_SSH_HOST and VAULT_REMOTE_PATH are required." >&2
         exit 2
     fi
-    echo "provision-github-from-vault: reading vault from ${VAULT_SSH_USER}@${VAULT_SSH_HOST}:${VAULT_REMOTE_PATH} ..." >&2
-    VAULT_CONTENT="$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        -o BatchMode=yes -o ConnectTimeout=20 \
-        -i "$BOOTSTRAP_KEY_PATH" "${VAULT_SSH_USER}@${VAULT_SSH_HOST}" \
-        "cat '$VAULT_REMOTE_PATH'")" || {
-        echo "provision-github-from-vault: failed to read vault over SSH (check bootstrap key, host, path)" >&2
+    # TRANSPORT (g-335-1096) — same dead shape as provision-from-vault.sh, fixed
+    # the same way. The bare `ssh` here reached operator port 22, closed
+    # 2026-08-06 by g-335-852; measured on cc-07 2026-08-11 it times out. See
+    # that script's TRANSPORT RESOLUTION block for the full reasoning, including
+    # why inlining a wrapper's FLAGS cannot survive a transport change.
+    #
+    # This sibling never had a VAULT_SSH_BIN seam (its seam is the
+    # PROVISION_GH_VAULT_FILE branch above), so only the wrapper branch is added.
+    if [ -z "${VAULT_REMOTE_SHELL:-}" ] || [ ! -x "${VAULT_REMOTE_SHELL}" ]; then
+        echo "provision-github-from-vault: NO USABLE VAULT TRANSPORT — refusing the dead raw-ssh path." >&2
+        echo "  Port 22 on the operator was closed 2026-08-06 (g-335-852); a raw ssh times out" >&2
+        echo "  after ~20s and reads like an operator OUTAGE, which is why this refuses instead." >&2
+        echo "  Set VAULT_REMOTE_SHELL to the canonical remote-shell wrapper, e.g." >&2
+        echo "    VAULT_REMOTE_SHELL=\"\$WORLD_PATH/scripts/efs-ssh.sh\" $0" >&2
+        echo "  (or set PROVISION_GH_VAULT_FILE for the local-file path)." >&2
+        exit 1
+    fi
+    echo "provision-github-from-vault: reading vault from ${VAULT_SSH_HOST}:${VAULT_REMOTE_PATH} ..." >&2
+    VAULT_CONTENT="$("$VAULT_REMOTE_SHELL" "cat '$VAULT_REMOTE_PATH'")" || {
+        echo "provision-github-from-vault: failed to read vault via VAULT_REMOTE_SHELL (check wrapper, host, path)" >&2
         exit 1
     }
 fi

@@ -956,3 +956,82 @@ def test_claim_lane_pin_refusal_precedes_cross_lane(running_daemon):
                           "sid": CLAIMER_SID})
     assert status == 400
     assert json.loads(body)["error"] == "lane_pin_refused"
+
+
+# ---------------------------------------------------------------------------
+# claim 409 goal_id_collision — 
+#
+# This path had ZERO test references before now (a repo-wide grep for
+# "goal_id_collision" across mind_api/tests and core/scripts/tests returned
+# nothing), which is how its advice text stayed wrong for two days after the
+# premise behind it was falsified.
+#
+# The message is the whole point of the branch. The 409 refuses either way, so a
+# test that asserts only the status code would pass against the stale body and
+# guard nothing — the caller's next action is decided entirely by what the text
+# tells them to do, and the stale text told them to skip the claim.
+# ---------------------------------------------------------------------------
+
+def _seed_colliding_agent_copy(project_root: Path, goal_id="g-001-01"):
+    """Put the SAME goal id in the agent queue as the world queue holds."""
+    agent_asp = {
+        "id": "asp-100", "title": "Agent", "status": "active",
+        "priority": "LOW", "archived": False,
+        "goals": [
+            {"id": goal_id, "title": "Colliding agent copy", "status": "pending",
+             "recurring": False},
+        ],
+        "progress": {"completed_goals": 0, "total_goals": 1, "recurring_goals": 0},
+    }
+    path = project_root / "agents" / "alpha" / "aspirations.jsonl"
+    path.write_text(json.dumps(agent_asp, ensure_ascii=True) + "\n", encoding="utf-8")
+
+
+def test_claim_collision_returns_409(running_daemon):
+    """Same id in both queues, claimed as source=world -> 409 goal_id_collision."""
+    project_root, port = running_daemon
+    world = project_root / "world"
+    _seed_aspiration(world, _make_asp_with_unclaimed_goal())
+    _seed_colliding_agent_copy(project_root)
+
+    status, body = _post(port, "/v1/aspirations/claim",
+                         {"id": "g-001-01", "agent": "alpha",
+                          "sid": CLAIMER_SID, "source": "world"})
+    assert status == 409, f"expected 409, got {status}: {body}"
+    assert json.loads(body)["error"] == "goal_id_collision"
+
+
+def test_claim_collision_body_does_not_advise_skipping_the_claim(running_daemon):
+    """The 409 body must not repeat the premise  falsified.
+
+    The stale text ended '...directly (agent goals don't require claims).' That
+    advice is what this test exists to keep dead: agent-queue goals have carried
+    claims since g-306-238, and a reducer and its worker Bodies are separate
+    sessions of one agent that have double-executed the same goal by following it.
+
+    Asserted as a NEGATIVE on the claim-exemption phrasing rather than an exact
+    string match on the replacement, so rewording the guidance stays free while
+    resurrecting the falsified premise does not.
+    """
+    project_root, port = running_daemon
+    world = project_root / "world"
+    _seed_aspiration(world, _make_asp_with_unclaimed_goal())
+    _seed_colliding_agent_copy(project_root)
+
+    status, body = _post(port, "/v1/aspirations/claim",
+                         {"id": "g-001-01", "agent": "alpha",
+                          "sid": CLAIMER_SID, "source": "world"})
+    assert status == 409
+    detail = json.loads(body).get("detail", "")
+
+    lowered = detail.lower()
+    for banned in ("don't require claims", "do not require claims",
+                   "need no claim", "carry no claim"):
+        assert banned not in lowered or "do not read this as" in lowered, (
+            "the 409 body resurrects the claim-exemption premise falsified by "
+            "g-306-238: %r" % detail)
+
+    # And it must still tell the caller how to proceed -- a refusal that names no
+    # next step is why the stale advice was followed in the first place.
+    assert "source=agent" in lowered, (
+        "the 409 body must name the queue-explicit re-issue; got %r" % detail)

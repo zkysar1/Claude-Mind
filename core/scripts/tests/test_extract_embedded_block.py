@@ -62,12 +62,12 @@ HOST = "\n".join([
 ])
 
 
-def run(args, host_path=None):
+def run(args, host_path=None, cwd=None):
     argv = [sys.executable, str(SCRIPT), "--json"]
     if host_path:
         argv += ["--file", str(host_path)]
     argv += args
-    p = subprocess.run(argv, capture_output=True, text=True, cwd=str(REPO))
+    p = subprocess.run(argv, capture_output=True, text=True, cwd=str(cwd or REPO))
     payload = json.loads(p.stdout) if p.stdout.strip().startswith("{") else {}
     return p.returncode, payload, p.stderr
 
@@ -312,7 +312,13 @@ def test_live_corpus_extracts_executable_bodies():
     sys.path.insert(0, str(REPO / "core" / "scripts"))
     from _runtime_bash import BASH  # bare "bash" argv[0] is refused (guard-580)
 
-    text = LIVE_CORPUS.read_text(encoding="utf-8")
+    # The corpus moved to a registry on 2026-08-18 (). This test's
+    # stated intent is "assert against the REAL corpus", so it follows the
+    # corpus rather than the 175-line skill file that no longer hosts checks.
+    # Reading LIVE_CORPUS directly here bypassed read_host, so the production
+    # redirect could not cover it.
+    import _verify_corpus
+    text = _verify_corpus.corpus_text()
     names = [c["name"] for c in eeb.list_checks(text)]
     assert len(names) > 250, "corpus shrank unexpectedly — re-baseline before trusting this"
 
@@ -333,27 +339,42 @@ def test_live_corpus_extracts_executable_bodies():
         "fault rather than the corpus: %s" % multi)
 
 
-def test_live_worktree_and_git_ref_agree():
-    """Covers read_host's git plumbing, which no fixture reaches.
+def test_live_worktree_and_git_ref_agree(tmp_path):
+    """Covers read_host's git plumbing, which no synthetic-host fixture reaches.
 
     A committed, unmodified file must extract identically from the worktree and
     from HEAD. If they diverge, the git path is broken -- and the authoring-time
     consumer depends on that path being the only difference.
+
+    Uses a THROWAWAY git repo rather than the live corpus. It used to compare
+    worktree-vs-HEAD on verify-learning/SKILL.md, and g-115-6689 made that
+    subject uniquely unfit: the worktree read of THAT path is redirected to the
+    check registry while a git-ref read still returns the file, so the two
+    disagree by design and the check name is not in HEAD's copy at all. A temp
+    repo restores what the test was actually for — real `git show` plumbing,
+    against bytes that are identical on both sides — and removes the coupling
+    to a file whose two read paths are deliberately different.
     """
-    if not LIVE_CORPUS.exists():
-        import pytest
-        pytest.skip("verify-learning SKILL.md not present on this box")
-    dirty = subprocess.run(["git", "diff", "--quiet", "--",
-                            str(LIVE_CORPUS.relative_to(REPO))],
-                           cwd=str(REPO)).returncode != 0
-    if dirty:
-        import pytest
-        pytest.skip("corpus has uncommitted edits — worktree/HEAD divergence expected")
-    rel = str(LIVE_CORPUS.relative_to(REPO)).replace("\\", "/")
-    _, wt, _ = run(["--name", "no-stray-roots", "--file", rel, "--from", "worktree"])
-    _, head, _ = run(["--name", "no-stray-roots", "--file", rel, "--from", "HEAD"])
-    assert wt["body"] == head["body"]
+    import pytest
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    host = repo / "host-skill.md"
+    host.write_text(HOST, encoding="utf-8")
+    env_git = ["git", "-c", "user.email=t@t", "-c", "user.name=t"]
+    for cmd in (["init", "-q"], ["add", "host-skill.md"],
+                ["commit", "-q", "-m", "fixture"]):
+        r = subprocess.run(env_git + cmd, cwd=str(repo),
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            pytest.skip(f"git unavailable for the plumbing fixture: {r.stderr.strip()[:120]}")
+
+    _, wt, _ = run(["--name", "multi-line", "--file", "host-skill.md",
+                    "--from", "worktree"], cwd=repo)
+    _, head, _ = run(["--name", "multi-line", "--file", "host-skill.md",
+                      "--from", "HEAD"], cwd=repo)
+    assert wt["body"] == head["body"], "git-ref read diverged from the worktree read"
     assert head["source"] == "HEAD"
+    assert head["continuation_lines"] == 3, "the git path must capture continuations too"
 
 
 # ------------------------------------------------- extraction-failure rc ----

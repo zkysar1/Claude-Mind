@@ -83,6 +83,21 @@ def _run(df, world: Path, argv_log: Path, extra: list) -> subprocess.CompletedPr
     env["MIND_WORLD"] = str(world)
     env["STORAGE_BACKEND"] = "local"   # guard-955
     env["COMMONS_HOOK_ARGV_LOG"] = str(argv_log)
+    # Pin the SESSION MODE the wrapper reads, not just the world. retrieve.sh
+    # auto-injects --read-only when the bound agent's session/agent-mode is
+    # reader/assistant (rt_session_mode), and the commons hook never draws
+    # under --read-only (pin 4). Without this pin the wrapper read the LIVE
+    # agents/alpha/session/agent-mode of whatever box ran the suite: pins 1-3
+    # and 6 were green on an autonomous box and red on an assistant/reader one
+    # for the same tree (4x red on cc-09 assistant, 2026-08-16 — the class
+    # guard-2015 names: env-dependence reproduces cross-platform, so it was
+    # filed as a portability red). MIND_AGENT_DIR is _paths.sh's test-only
+    # agent-dir override (); rt_session_mode honors it via $AGENT_DIR.
+    fixture_agent_dir = df.project_root / "agents" / df.agent
+    (fixture_agent_dir / "session").mkdir(parents=True, exist_ok=True)
+    (fixture_agent_dir / "session" / "agent-mode").write_text("autonomous\n",
+                                                              encoding="utf-8")
+    env["MIND_AGENT_DIR"] = str(fixture_agent_dir)
     return subprocess.run(
         [BASH, str(RETRIEVE), "--category", CATEGORY, "--supplementary-only"] + extra,
         capture_output=True, text=True, timeout=180, env=env, cwd=str(PROJECT_ROOT),

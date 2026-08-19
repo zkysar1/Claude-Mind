@@ -156,6 +156,81 @@ def _is_audit_only_field(field, allowlist) -> bool:
     return False
 
 
+def _audit_allowlist_basename(path) -> str:
+    """Last path segment of `path`, splitting on BOTH separators.
+
+    DO NOT INLINE. Must match core/scripts/meta-backpressure.py
+    ::_audit_allowlist_basename exactly (guard-130).
+
+    Both separators, because this repo runs on Linux and Windows and
+    `strategy_file` is whatever string the caller typed — os.path.basename on
+    POSIX does not split a backslash.
+    """
+    if not isinstance(path, str):
+        return ""
+    return path.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def _audit_allowlist_for(strategy_file, audit_only_fields) -> list:
+    """The audit-only allowlist for `strategy_file`, matched by BASENAME.
+
+    DO NOT INLINE. Must match core/scripts/meta-backpressure.py
+    ::_audit_allowlist_for exactly (guard-130). Layer 1 must not import from
+    core/scripts (core/BOUNDARY.md), so this is a deliberate mirror — and THIS
+    file is the live path under no-python-cli-fallback, so a CLI-only fix here
+    is inert in production (guard-2323 / guard-547; that exact divergence is
+    what g-115-5305 fixed one expression below this one).
+
+    WHY (g-115-6413, measured 2026-08-17 on cc-02). `strategy_file` is stored
+    VERBATIM from the caller: the CLI writes `args.file` (cmd_monitor) and this
+    module writes `body["file"]` (register) with no normalization anywhere. The
+    live registrar is `meta-yaml.py::cmd_set`, which gates on a SUBSTRING test
+    (`any(s in args.file for s in [...])`) and then forwards `args.file`
+    unchanged — so `meta-yaml.sh set --file meta/reflection-strategy.yaml ...`
+    registers a monitor keyed `meta/reflection-strategy.yaml`.
+
+    The lookup this replaces was an EXACT dict `.get()`, so that monitor missed
+    the allowlist entirely and every field it protects — roi_history, the
+    original wk-001 systematic_bias field (rb-504) — silently became
+    rollback-eligible again, with `audit_only_skips` staying at 0.
+
+    Not hypothetical: the live `rollback_history` carries BOTH spellings for one
+    file — `meta/goal-selection-strategy.yaml` (mc-001, mc-002) and
+    `goal-selection-strategy.yaml` (mc-003 onward, 7 more). Two keys, one file.
+
+    Scope is its two arguments and nothing else — no ctx, no path resolution, no
+    globals (guard-2601: a predicate's name states the condition, never the
+    scope of the data it reads).
+
+    Exact match is tried FIRST, so a config whose keys already match a monitor
+    behaves byte-for-byte as before; the basename scan is reached only where the
+    old code returned the `[]` default. An unmatched `strategy_file` still yields
+    `[]` — identical to the previous `.get(..., []) or []`, so this adds no new
+    failure direction.
+
+    The `isinstance(str)` guard is NOT decoration and must precede the `.get()`:
+    an unhashable `strategy_file` (list/dict) raises TypeError inside `.get`,
+    which `_cycle` does not catch, so ONE malformed monitor would abort the whole
+    cycle and skip every other monitor — including legitimate rollbacks.
+    backpressure.yaml is a shared own-cloud store with a merge handler, so a
+    malformed value is reachable. The pre-existing `.get(mon[...], [])` had this
+    same hole; the guard closes it rather than preserving it. Same reachability
+    argument as `_is_audit_only_field`'s type guard (g-115-4552 fresh-eyes).
+    """
+    if not isinstance(audit_only_fields, dict) or not isinstance(strategy_file, str):
+        return []
+    exact = audit_only_fields.get(strategy_file)
+    if isinstance(exact, list):
+        return exact
+    base = _audit_allowlist_basename(strategy_file)
+    if not base:
+        return []
+    for key, val in audit_only_fields.items():
+        if isinstance(val, list) and _audit_allowlist_basename(key) == base:
+            return val
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Path + IO helpers
 # ---------------------------------------------------------------------------
@@ -498,7 +573,9 @@ def check(ctx) -> "Response":  # type: ignore[name-defined]
                 mon["consecutive_above_baseline"] += 1
 
             if mon["consecutive_below_baseline"] >= regression_window:
-                file_audit = audit_only_fields.get(mon["strategy_file"], []) or []
+                # BASENAME-matched, not an exact dict lookup (): the
+                # stored strategy_file is whatever string the registrar was handed.
+                file_audit = _audit_allowlist_for(mon["strategy_file"], audit_only_fields)
                 if _is_audit_only_field(mon["field"], file_audit):
                     mon["status"] = "audit_only_skipped"
                     skip = {

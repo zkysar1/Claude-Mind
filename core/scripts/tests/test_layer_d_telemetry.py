@@ -117,23 +117,36 @@ def _run_update_goal(tmp_world: Path, tmp_meta: Path, goal_id: str,
 
 
 def _read_layer_d_firings(tmp_meta: Path) -> list[dict]:
-    """Return the list of capability-gate-layer-d records from the temp
-    meta/gate-firings.jsonl. Empty list when the file is absent."""
-    path = tmp_meta / "gate-firings.jsonl"
-    if not path.is_file():
-        return []
+    """Return the list of capability-gate-layer-d records from the temp meta
+    gate-firings store. Empty list when nothing was written.
+
+    Reads through `_gate_log.firings_paths` — the ONE reader rule — not the
+    legacy filename. Since 2026-08-18 the writer honours GATE_FIRINGS_SEGMENTED
+    (settings.json sets it to 1 fleet-wide) and appends to a
+    `gate-firings-YYYY-MM-DD.jsonl` segment; the pytest conftest pops that flag,
+    but this is a main()-style file that pytest never collects, so the pop can
+    never reach it (guard-955 class) and the legacy-filename read returned 0
+    firings on every box (measured cc-09, 2026-08-18: red under the box flag,
+    green with GATE_FIRINGS_SEGMENTED=0). run-invisible-suites.sh now also
+    unsets the flag for the whole invisible half; this reader is the
+    belt-and-braces half — correct under either flag value.
+    """
+    from _gate_log import firings_paths  # noqa: E402  (CORE_SCRIPTS is on sys.path)
     out = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if rec.get("gate_id") == "capability-gate-layer-d":
-                out.append(rec)
+    for path in firings_paths(tmp_meta):
+        if not path.is_file():
+            continue
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("gate_id") == "capability-gate-layer-d":
+                    out.append(rec)
     return out
 
 

@@ -314,3 +314,6 @@ agents/*/temp/*
 .mind-data/**/local-paths.conf
 .mind-data/world/*-log.jsonl
 .mind-data/world/**/*-log.jsonl
+
+# stray 0-byte artifact re-created by tooling in the repo root (g-315-537)
+logs.log

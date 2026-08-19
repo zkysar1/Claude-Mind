@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import _paths  # noqa: E402
-from tree import read_tree, write_tree, _load_competence_config, _graduate_node_level, _stamp_progression  # noqa: E402
+from tree import read_tree, write_tree, _load_competence_config, _graduate_node_level, _stamp_progression, _stamp_calibration  # noqa: E402
 from tree_match import find_nodes  # noqa: E402
 from pipeline import read_jsonl, LIVE_PATH, ARCHIVE_PATH  # noqa: E402
 
@@ -228,8 +228,20 @@ def apply_plan(plan, tree, dry_run=False):
         if not node:
             continue
         confidence_changed = "confidence" in mutations
+        # DELIBERATELY a separate flag, not folded into confidence_changed
+        # (guard-3116: do not mirror a neighbour's guard by analogy — ask what
+        # question each field answers). confidence_changed additionally gates
+        # _graduate_node_level; an accuracy-only edit must stamp WITHOUT
+        # regrading capability_level, which is a confidence-derived axis.
+        accuracy_changed = "accuracy" in mutations
         for field, value in mutations.items():
             node[field] = value
+        # Stamps come AFTER the mutation loop and in the SAME pass (guard-3358:
+        # write the group first and its selector key last — a group written
+        # without its selector is indistinguishable from never having been
+        # written once any merge runs, which is precisely the  defect).
+        if accuracy_changed:
+            _stamp_calibration(node)  # : durable under own-cloud merge
         if confidence_changed:
             _stamp_progression(node)  # : durable under own-cloud merge
             old_level, new_level = _graduate_node_level(node, competence)

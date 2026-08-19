@@ -34,17 +34,17 @@ while [[ $# -gt 0 ]]; do
             PASSTHROUGH+=("$1"); shift;;
         --override-signal)
             HEADERS+=(--header "X-Mind-Override-Signal: ${2-}")
-            PASSTHROUGH+=("$1" "${2-}"); shift 2;;
+            PASSTHROUGH+=("$1" "${2-}"); shift $(( $# >= 2 ? 2 : 1 ));;
         --override-duplication)
             HEADERS+=(--header "X-Mind-Override-Duplication: ${2-}")
-            PASSTHROUGH+=("$1" "${2-}"); shift 2;;
+            PASSTHROUGH+=("$1" "${2-}"); shift $(( $# >= 2 ? 2 : 1 ));;
         --override-all)
             # Send a single bulk header; the daemon fans this into any
             # unset per-gate slot (X-Mind-Override-Signal, X-Mind-Override-
             # Duplication) and audits the bulk override to
             # world/override-bypass-ledger.jsonl. Per-gate headers always win.
             HEADERS+=(--header "X-Mind-Override-All: ${2-}")
-            PASSTHROUGH+=("$1" "${2-}"); shift 2;;
+            PASSTHROUGH+=("$1" "${2-}"); shift $(( $# >= 2 ? 2 : 1 ));;
         *)
             PASSTHROUGH+=("$1"); shift;;
     esac

@@ -302,6 +302,16 @@ def _email_user(entry, event):
             f"  bash core/scripts/history.py restore {file_path} <snapshot-name>"
         )
         info_type = "Self-Evolution"
+        # `decision-needed`, and this is the one classification in the sweep
+        # that MUST NOT be `completion` despite reading like a status report.
+        # The body above literally asks for a judgement ("If you disagree with
+        # this edit, you can roll it back"), and on 2026-04-22 the user traded
+        # "ask first" for "notify after, revert if wrong" — the notification IS
+        # the consideration he accepted in exchange for the autonomy. Suppress
+        # it and the agent silently rewrites its own identity with the user
+        # never told, which makes guard-380's promise false and the autonomy
+        # unearned. ALWAYS_SEND, unconditionally.
+        routing_category = "decision-needed"
     elif event == "rollback":
         subject = f"Auto-rollback: {file_kind} {file_path}"
         body = (
@@ -312,6 +322,9 @@ def _email_user(entry, event):
             f"stream for audit; the file has been restored to its pre-edit state from .history/."
         )
         info_type = "Self-Program-Evolution-Rollback"
+        # The fleet DETECTED the regression and ALREADY restored the file — the
+        # directive's own example of what not to be told about.
+        routing_category = "completion"
     else:
         print(f"WARN: unknown notify event={event!r}", file=sys.stderr)
         return None
@@ -319,6 +332,30 @@ def _email_user(entry, event):
     if os.environ.get("MIND_EVOLUTION_NOTIFY_DRYRUN", "").strip() in ("1", "true", "yes"):
         print(f"NOTIFY DRY-RUN: would email about {event} ({subject})", file=sys.stderr)
         return f"dry-run:{event}:{revision_id}"
+
+    # Notification-routing gate (). Category is set per-event above,
+    # NOT once for the function: the two events sit on opposite sides of this
+    # policy and collapsing them to one category would either silence the
+    # guard-380 identity notification or keep mailing rollback status.
+    _nrg = None
+    try:
+        import notification_routing_gate as _nrg  # type: ignore
+        label, gate_reason, _dest = _nrg.decide_and_log(
+            routing_category, subject, body,
+            caller="evolution-complete.py:_email_user")
+    except Exception as exc:  # noqa: BLE001 - inverted fail-safe: send
+        label, gate_reason = ("send",
+                              "routing gate unimportable (%s) — inverted "
+                              "fail-safe sends" % type(exc).__name__)
+    if label == "suppress":
+        ok, detail = _nrg.post_suppression_breadcrumb(
+            subject, body, caller="evolution-complete.py:_email_user",
+            reason=gate_reason, tags=[event, file_kind or "unknown"])
+        if ok:
+            return f"suppressed:{event}:{revision_id}"
+        # Breadcrumb did not land -> suppressing would DELETE, not re-route.
+        print(f"WARN: suppression breadcrumb failed ({detail}) — sending instead",
+              file=sys.stderr)
 
     payload = {
         "InfoType": info_type,

@@ -73,6 +73,28 @@ bash core/scripts/promote-to-upstream.sh --target <dest-clone> \
 
 Merge the PR yourself once mergeable (guard-680 grant); sync the dest clone.
 
+**The dest clone's own checked-out branch is never touched** (g-115-4803). Under
+`--pr` the promote plants into an isolated worktree of the dest — created before
+the plan, torn down after the push — so the destination's live checkout stays on
+whatever branch it was on, on every path including a failed plant, a failed
+verify, and a crash. It used to `git checkout -b` in the dest itself and leave it
+there, which silently repointed a working deployment at an unmerged branch. So
+"sync the dest clone" above now means pull the merged main, not un-switch a
+branch. If a run dies before teardown, the leftover worktree is removed with
+`bash core/scripts/worktree-teardown.sh <path> --owner <dest-clone> --force`;
+`--owner` is required whenever the directory is already gone, because otherwise
+the owning repo is derived FROM that directory.
+
+Note the two worktrees are different and both are load-bearing: the SOURCE-side
+one above pins the tag so the payload cannot drift mid-run (guard-678), and this
+DEST-side one keeps the promotion out of a live deployment's checkout. The
+source-side worktree still needs its gitignored files copied in (`local-paths.conf`,
+`.env.local`); the dest-side one deliberately does not, and must not be given
+them — the plant's living-prod protections read `None` from an unlocatable dest
+registry and fail SAFE toward preserving every skill dir, whereas the living-prod
+DETECTION runs against the real clone precisely because `.mind-data` is gitignored
+and absent from any worktree.
+
 **`SOURCE DRIFTED MID-PROMOTION` — what it means and what to do** (g-115-3514).
 The promote asserts clean-tree + `HEAD == vX.Y.Z` twice: once at Step 1, and
 again immediately before the plant. The second check exists because the plant

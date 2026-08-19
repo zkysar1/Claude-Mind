@@ -18,9 +18,15 @@ Invariants checked (HARD = exit 1 on failure; ADVISORY = report only):
   H3  .claude/settings.json passes the structural validator's _validate()
       (A/C/D/E/F protected deny concepts + protected hooks + top-level
       keys) — reuses the validator (single source of truth, like Gate 5).
-  A1  ~/.claude/settings.json carries the out-of-repo mirror (advisory:
-      a missing mirror weakens defence-in-depth but the in-repo self
-      anchor still holds).
+  A1  ~/.claude/settings.json carries a deny rule naming settings.local.json
+      (advisory). NOTE the predicate is the DENY LIST, never file existence:
+      file-absent and file-present-carrying-no-deny emit the IDENTICAL
+      advisory, so A1 can never distinguish them and a reader must never
+      infer file-absence from it. Measured present-with-zero-denies on every
+      box checked (cc-03/cc-04/cc-05/cc-08), so A1 firing is EXPECTED STATE,
+      not drift — nothing in the repo provisions the mirror and the agent
+      must not create one (an anchor the agent can write is one it can
+      un-write). The in-repo self-anchor is the whole mechanism regardless.
 
 Exit 0 = all hard invariants hold. Exit 1 = drift (caller files a HIGH
 Investigate + notifies the user). Fail-closed: inability to evaluate a
@@ -95,8 +101,13 @@ def main() -> int:
     user_deny = _deny_list(USER_SETTINGS)
     if not any("settings.local.json" in s for s in user_deny):
         advisories.append(
-            "A1: ~/.claude/settings.json missing the out-of-repo mirror "
-            "(defence-in-depth weakened; in-repo self-anchor still holds)"
+            "A1: ~/.claude/settings.json carries no deny rule naming "
+            "settings.local.json (the file may be present or absent — this "
+            "predicate cannot tell, it reads only the deny list). Optional "
+            "out-of-repo hardening is therefore not in place; the in-repo "
+            "self-anchor is the whole mechanism and still holds. EXPECTED "
+            "STATE on every box: nothing in the repo provisions the mirror, "
+            "and the agent must NOT create it. Do not escalate on A1 alone."
         )
 
     report = {

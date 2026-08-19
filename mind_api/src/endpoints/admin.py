@@ -184,7 +184,7 @@ def owncloud_pull(ctx) -> "Response":  # type: ignore[name-defined]
 
 def owncloud_sync_file(ctx) -> "Response":  # type: ignore[name-defined]
     """POST /v1/admin/owncloud-sync-file?path=<file>[&dry_run=1] — push ONE
-    governed file to S3 with baseline stamping, using the daemon's creds.
+    governed file to S3, using the daemon's creds.
 
     The per-file complement of owncloud-flush: the PostToolUse push shim
     (core/scripts/owncloud-push-on-write.sh) calls this so a governed Write/
@@ -195,8 +195,12 @@ def owncloud_sync_file(ctx) -> "Response":  # type: ignore[name-defined]
     deployments, where the bare-CLI fallback lacks the daemon-only creds.
 
     SSOT: invokes the SAME `owncloud_sync.sync_file()` the CLI `--file` mode
-    runs (multi_machine=False → local IS authoritative → baseline-stamping
-    push). Safe against arbitrary paths: sync_file's own governed-root /
+    runs (multi_machine=False → local IS authoritative → push). It does NOT
+    stamp a manifest baseline, and this docstring claimed twice that it did
+    until g-115-5356 measured it: sync_file calls _sync_one without
+    baseline_md5, discards the md5 it returns, and never opens the manifest.
+    Callers must not treat a 200 here as proof a baseline now exists.
+    Safe against arbitrary paths: sync_file's own governed-root /
     machine-local / peer-agent filters decide skips; this endpoint reports
     the skip reason rather than second-guessing them. `dry_run=1` maps to
     the shim's OWNCLOUD_PUSH_HOOK_DRYRUN liveness probe. No-op under the
@@ -447,13 +451,26 @@ def runner_claims(ctx) -> "Response":  # type: ignore[name-defined]
 
     FR-7 fleet observability: returns all DDB session rows for the current
     ENVIRONMENT_ID — agent name, owning machine_id, agent_state (RUNNING/IDLE),
-    and heartbeat_at (epoch-sec) — so a fleet-health view can show which machine
-    owns each agent's RUNNING slot and how fresh its heartbeat is. Read-only, no
-    agent/token param (unlike the acquire/heartbeat/release trio). Env-scoped in
-    the backend (`list_runner_claims` filters on the `<customer><env-id>/` prefix),
-    so a fleet env never sees prod's rows. No-op under the local backend (empty
-    claims list); import/DDB errors return 500 with the reason (a read-only
-    health probe must degrade to a diagnostic, never a stack)."""
+    heartbeat_at (epoch-sec), and runner_token_fp — so a fleet-health view can
+    show which machine owns each agent's RUNNING slot and how fresh its heartbeat
+    is. Read-only, no agent/token param (unlike the acquire/heartbeat/release
+    trio). Env-scoped in the backend (`list_runner_claims` filters on the
+    `<customer><env-id>/` prefix), so a fleet env never sees prod's rows. No-op
+    under the local backend (empty claims list); import/DDB errors return 500 with
+    the reason (a read-only health probe must degrade to a diagnostic, never a
+    stack).
+
+    `runner_token_fp` (g-306-224) is a NON-REVERSIBLE digest of the row's
+    `runner_token`, and this endpoint MUST NEVER be extended to return the raw
+    token. The token is the `ConditionExpression` bearer credential for
+    `heartbeat` and `release_runner`, so publishing it here would let any reader
+    forge a heartbeat for another agent (defeating `reclaim_if_stale`) or release
+    a live claim out from under a healthy reducer — the exact failures the lease
+    exists to prevent. The full argument, and the reason the raw value is not even
+    representable on `RunnerClaim`, is in `owncloud_backend.runner_token_fingerprint`.
+    The fingerprint carries everything a liveness consumer needs: it CHANGES on a
+    same-box reducer restart (new token, unchanged machine_id), which `machine_id`
+    alone cannot see, and it authorises nothing."""
     from ..server import Response
     backend = os.environ.get("STORAGE_BACKEND", "local").strip().lower()
     if backend != "own-cloud":
@@ -505,7 +522,11 @@ def runner_claims(ctx) -> "Response":  # type: ignore[name-defined]
         "runner_stale_seconds": getattr(be, "runner_stale_seconds", None),
         "claims": [
             {"agent": c.agent, "machine_id": c.machine_id,
-             "agent_state": c.agent_state, "heartbeat_at": c.heartbeat_at}
+             "agent_state": c.agent_state, "heartbeat_at": c.heartbeat_at,
+             # Digest, never the raw token — see the docstring above. `None` on a
+             # never-claimed IDLE row, which a consumer must read as UNKNOWN
+             # (non-discriminating), never as "unchanged".
+             "runner_token_fp": getattr(c, "runner_token_fp", None)}
             for c in claims
         ],
     })

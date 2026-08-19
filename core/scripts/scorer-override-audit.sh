@@ -24,7 +24,7 @@ DERIVE_FROM=""
 POSITIONAL=""
 while [ $# -gt 0 ]; do
     case "$1" in
-        --derive-from) DERIVE_FROM="${2:-}"; shift 2 ;;
+        --derive-from) DERIVE_FROM="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         *)             POSITIONAL="$1";      shift ;;
     esac
 done

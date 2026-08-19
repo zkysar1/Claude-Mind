@@ -46,6 +46,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -87,6 +88,100 @@ TESTS_DIR = SCRIPT_DIR / "tests"          # last-resort fallback; see _testpaths
 # or when the accumulated resource is identified -- at which point this list
 # should shrink to empty.
 DEFERRED_TESTPATHS = {"mind_api/tests"}
+
+# ── Scope declaration for --triage () ─────────────────────────────
+#
+# triage() globs chunk-*.log and NOTHING ELSE, so its verdict is scoped to the
+# chunked pytest half alone. That verdict is HONEST about the population it
+# read, which is exactly what makes it dangerous: nothing in its output named
+# what it declined to look at, so a "0 genuine" read as a clean SUITE. Measured
+# 2026-08-02 (, echo, cc-03, 16 chunks): triage printed
+# `2 environmental | 0 genuine` while two shell files in the pytest-invisible
+# half were red, and red SOLO -- genuine. Closing on that verdict ships past
+# real reds. This is guard-1760 (a runner reports what it RAN, never what it
+# declined to look for) and the enumerator-all-clear-boundary pattern: the
+# qualifier in an all-clear is self-declared and may be narrower than the
+# action it authorizes.
+#
+# THE HALVES ARE FOUR, NOT TWO. The goal that motivated this named "invisible
+# or domain"; the deferred testpath is a third, and it is the one that by
+# default does NOT RUN AT ALL -- so silence about it is doubly misleading.
+# Keeping the list here rather than in the shell makes it the one place that
+# answers "what is outside triage's window".
+OTHER_HALVES = (
+    ("invisible", "pytest-invisible suites (main()-style .py + all .sh)"),
+    ("deferred", "deferred testpaths (NOT RUN unless RUN_DEFERRED=1)"),
+    ("domain", "domain test suite (world-provided hook)"),
+)
+
+# One JSON object per half, appended by run-full-suite.sh AFTER the chunked
+# half returns. It lives in the log dir beside chunk-*.log so a later --triage
+# -- which runs nothing and re-reads what a prior run wrote -- can report the
+# other halves instead of being silent about them.
+#
+# WHY A FILE AND NOT A PARSE OF THE RUN LOG: measured on this box 2026-08-10,
+# a real log dir contains chunk-*.log and nothing else. There is no run log in
+# it -- the other halves stream to the shell's stdout, which an operator may or
+# may not have redirected, and never to a path this tool can find. So the
+# summary has to be RECORDED at the moment it is produced or it is gone.
+HALVES_RECORD = "halves.jsonl"
+
+
+def read_halves(out):
+    """Read the per-half records a prior run wrote. Missing file -> []."""
+    p = Path(out) / HALVES_RECORD
+    if not p.is_file():
+        return []
+    rows = []
+    for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(r, dict) and r.get("half"):
+            rows.append(r)
+    return rows
+
+
+def print_scope_declaration(out):
+    """Name every half OUTSIDE triage's window. Returns the failed-half list.
+
+    Printed on EVERY triage path -- clean, contended and genuine alike. The
+    clean path is the one that matters: a failing run already prompts the
+    reader to look further, while a clean one is where an unstated scope turns
+    into "the suite is green". So this must not be conditional on there being
+    something to report.
+    """
+    recorded = {r.get("half"): r for r in read_halves(out)}
+    failed = []
+    print("\nSCOPE -- this triage read the chunked pytest half ONLY.")
+    for key, label in OTHER_HALVES:
+        r = recorded.get(key)
+        if r is None:
+            print("  %-10s NOT RECORDED -- this triage says NOTHING about it. "
+                  "%s" % (key, label))
+            continue
+        if not r.get("ran", True):
+            print("  %-10s DID NOT RUN -- %s" % (key, r.get("summary") or label))
+            continue
+        rc = r.get("rc")
+        state = "PASS" if rc == 0 else "FAIL(rc=%s)" % rc
+        print("  %-10s %-11s %s" % (key, state, r.get("summary") or label))
+        if rc != 0:
+            failed.append(key)
+    if failed:
+        # Said as a sentence, not left to be inferred from a table. The whole
+        # defect this block exists to close is a reader taking a clean verdict
+        # for a clean suite, and a reader who has just been told "0 genuine"
+        # is exactly the reader who will not re-derive it from an rc column.
+        print("  => %d half/halves above FAILED. The verdict below is about the "
+              "chunked half and does NOT cover them." % len(failed))
+    else:
+        print("  A verdict below is evidence about the chunked half only.")
+    return failed
 
 
 def _testpaths():
@@ -237,6 +332,58 @@ def _looks_aborted(text):
     return tally[3] < 100 and not has_counts
 
 
+_HANG_RE = re.compile(r"Timeout \((\d+:\d{2}:\d{2})\)!")
+_FRAME_RE = re.compile(r'File "([^"]+)", line (\d+) in (\S+)')
+# Frames belonging to the runner itself, never to the code that hung.
+_FRAME_NOISE = ("/_pytest/", "\\_pytest\\", "/pluggy/", "\\pluggy\\",
+                "site-packages", "dist-packages", "<frozen", "/pytest/")
+
+
+def _hang_marker(text):
+    """(duration, file, line, test) for a faulthandler timeout abort, else None.
+
+    A DETERMINISTIC HANG IS NOT CONTENTION, AND THE REMEDIES ARE OPPOSITE
+    (g-115-6226). The documented response to a bad verdict is to climb the chunk
+    ladder and re-run when quiet; against a hang that is pure waste -- it
+    reproduces solo, every time. Measured on DESKTOP-O91DLK2: three runs, two of
+    them BYTE-IDENTICAL 6990-byte logs, before the hang was recognised as a hang.
+
+    WHAT THE CLASSIFIER SAID BEFORE THIS EXISTED, measured here on a real Linux
+    faulthandler log rather than assumed: `_progress_tally` returns None (a hung
+    `-q` run never prints a `[NN%]` marker), so `_looks_aborted` is FALSE and the
+    silent-zero branch fires instead -- reporting "log empty, truncated, or
+    corrupted". That is a third wrong direction: it points at the NUL/own-cloud
+    log-corruption remedy for a run whose log is intact and complete.
+
+    Parsed against REAL output, not an assumed shape -- pytest emits
+    `Timeout (0:00:05)!` then `Thread 0x... (most recent call first):` then the
+    frames. Frame order is deepest-first, so the deepest NON-RUNNER frame is the
+    code that actually hung; a test that hangs inside subprocess would otherwise
+    be reported as a subprocess.py defect.
+    """
+    m = _HANG_RE.search(text)
+    if not m:
+        return None
+    frames = _FRAME_RE.findall(text[m.end():])
+    if not frames:
+        return (m.group(1), None, None, None)
+    # PREFER THE TEST FRAME EXPLICITLY rather than inferring it as "the first
+    # non-runner frame". A test that hangs inside subprocess has STDLIB frames
+    # below it, and stdlib is not site-packages, so a noise-list alone names
+    # subprocess.py as the culprit -- which is the single most likely real shape
+    # here, since the whole  defect is a subprocess call that never
+    # returns. Caught by test_hang_marker_walks_past_runner_frames on the first
+    # run of that test, against the exact stack the incident produced.
+    for path, line, func in frames:
+        norm = path.replace("\\", "/")
+        if norm.rsplit("/", 1)[-1].startswith("test_") or "/tests/" in norm:
+            return (m.group(1), path, line, func)
+    for path, line, func in frames:
+        if not any(n in path for n in _FRAME_NOISE):
+            return (m.group(1), path, line, func)
+    return (m.group(1), frames[0][0], frames[0][1], frames[0][2])
+
+
 def _positional_profile(text):
     """Failure rate in the first vs last third of the run.
 
@@ -313,12 +460,30 @@ def classify(text, failed, chunks=None):
                 "that no longer exists. This is CORRUPTION, not contention: do "
                 "NOT climb the chunk ladder (a re-run overwrites this evidence). "
                 "Re-run with --out pointed OUTSIDE the synced tree." % (i, nul))
+        # HANG CHECK (). Its own `if`, like the NUL check above and for
+        # the same reason: a hang carries the OPPOSITE remedy to contention, so it
+        # must surface even alongside other reasons. It is checked BEFORE the two
+        # branches below because it EXPLAINS them -- a hung run has no counts and
+        # no final progress marker, and attributing that to corruption sends the
+        # reader to the wrong lane entirely.
+        hang = _hang_marker(chunk)
+        if hang:
+            dur, path, line, func = hang
+            where = ("%s:%s in %s" % (path, line, func)) if path else "UNKNOWN LOCATION"
+            reasons.append(
+                "chunk %02d HUNG after %s -- faulthandler aborted it at %s. This "
+                "is a DETERMINISTIC HANG, not contention: it reproduces SOLO, so "
+                "do NOT climb the chunk ladder and do NOT re-run 'when quiet' "
+                "(measured g-115-6226: three runs, two byte-identical logs). "
+                "Re-run that ONE file with a short -o faulthandler_timeout=90 to "
+                "reproduce in 90s instead of the full window."
+                % (i, dur, where))
         if _looks_aborted(chunk):
             tally = _progress_tally(chunk)
             reasons.append(
                 "chunk %02d stopped at %d%% -- it never finished, so the totals "
                 "are missing its tests" % (i, tally[3] if tally else 0))
-        elif _progress_tally(chunk) is None and not re.search(
+        elif not hang and _progress_tally(chunk) is None and not re.search(
                 r"\d+\s+(passed|failed)\b", chunk):
             # SILENT-ZERO CHUNK (, 2026-07-27). _looks_aborted returns
             # False when there is NO progress output at all -- `if not tally:
@@ -368,8 +533,24 @@ def classify(text, failed, chunks=None):
 
     # Fallback for a single un-chunked log. Skipped when per-chunk logs were
     # supplied, since the loop above already judged each one honestly.
-    if not chunks and _looks_aborted(text):
-        reasons.append("run produced progress output but never reached 100% (aborted)")
+    #
+    # THE HANG CHECK IS REPEATED HERE ON PURPOSE (guard-3448: a gate is only as
+    # broad as its entry points). classify() has TWO ways in -- the per-chunk
+    # loop above and this un-chunked path -- and a detector wired into only one
+    # of them presents as mechanical while being honour-system at the second
+    # door. An un-chunked run is exactly how someone reproduces a suspected hang.
+    if not chunks:
+        hang = _hang_marker(text)
+        if hang:
+            dur, path, line, func = hang
+            where = ("%s:%s in %s" % (path, line, func)) if path else "UNKNOWN LOCATION"
+            reasons.append(
+                "run HUNG after %s -- faulthandler aborted it at %s. This is a "
+                "DETERMINISTIC HANG, not contention: it reproduces SOLO, so do "
+                "NOT climb the chunk ladder and do NOT re-run 'when quiet'."
+                % (dur, where))
+        if _looks_aborted(text):
+            reasons.append("run produced progress output but never reached 100% (aborted)")
 
     if reasons:
         return "contended", reasons
@@ -645,6 +826,10 @@ def triage(out, root, env):
     for r in reasons:
         print("  - %s" % r)
 
+    # BEFORE the verdict is acted on, not after: the reader must know what this
+    # window excludes while they are still deciding what the numbers mean.
+    failed_halves = print_scope_declaration(out)
+
     if not candidates:
         # A contended verdict with NOTHING in the FAILED list is the common and
         # most deceptive shape: every per-chunk line reads "0 failed" and the
@@ -658,8 +843,11 @@ def triage(out, root, env):
             print("Re-run with more --chunks; do not read the totals above.")
             print("=" * 66)
             return 2
+        if failed_halves:
+            print("Nothing to triage in the CHUNKED half -- but %s FAILED "
+                  "(see SCOPE above)." % ", ".join(failed_halves))
         print("=" * 66)
-        return 0
+        return 1 if failed_halves else 0
 
     print("\nStep 2-3: solo re-run + ownership, per candidate")
     genuine_unowned, genuine_owned, environmental, errored = [], [], [], []
@@ -711,8 +899,41 @@ def triage(out, root, env):
             print("\nNothing to file: no candidate reproduced solo -- all %d were "
                   "environmental, so the run's failures were not regressions."
                   % len(environmental))
+    # A "nothing to file" sentence is precisely where a scoped verdict gets read
+    # as a whole-suite all-clear, so the exclusion is restated at the point of
+    # the conclusion rather than only in the header block.
+    if failed_halves:
+        print("\nBut do NOT read the above as a clean suite: %s FAILED "
+              "(see SCOPE above). This triage did not examine %s."
+              % (", ".join(failed_halves), " or ".join(failed_halves)))
     print("=" * 66)
-    return 1 if (genuine_unowned or errored or ownership_unknown) else 0
+    return 1 if (genuine_unowned or errored or ownership_unknown
+                 or failed_halves) else 0
+
+
+def _git_head(root):
+    """Current HEAD sha, or None when it cannot be read.
+
+    Returns None rather than raising: a suite run must never fail because the
+    tree is not a git checkout, git is missing, or the call hangs. Callers MUST
+    render None as "NOT RUN" and never as "unchanged" -- a check that reports
+    what it RAN but stays silent about what it declined to look for is how a
+    detector becomes decorative (guard-1760, the same defect that hid the
+    three-testpaths gap for five weeks).
+    """
+    # The RESULT is guarded as well as the call, deliberately: the suite's own
+    # tests stub subprocess.run and some stubs RETURN None instead of raising,
+    # so a try/except around only the call still dies on `r.returncode`. Caught
+    # by test_run_full_suite_triage.py the first time this shipped.
+    try:
+        r = subprocess.run(["git", "rev-parse", "HEAD"],
+                           capture_output=True, text=True,
+                           cwd=str(root), timeout=10)
+        if r is None or r.returncode != 0:
+            return None
+        return (r.stdout or "").strip() or None
+    except Exception:
+        return None
 
 
 def main(argv=None):
@@ -722,12 +943,55 @@ def main(argv=None):
     ap.add_argument("--triage", action="store_true",
                     help="triage the chunk logs already in --out; does NOT re-run the suite")
     ap.add_argument("--out", default=None,
-                    help="log directory (default: agents/<agent>/temp/suite-run)")
+                    help="log directory (default: <tmpdir>/ayoai-suite-run-<agent>, "
+                         "deliberately OFF the synced tree -- see g-115-6409)")
     ap.add_argument("--include-daemon-integration", action="store_true",
                     help="DANGEROUS with a live daemon; see Live-Daemon Exception")
     ap.add_argument("--confirm-solo", action="store_true",
                     help="on a contended verdict, re-run the worst-hit file alone to prove it")
+    ap.add_argument("--print-out-dir", action="store_true",
+                    help="resolve and print the log dir, then exit (for run-full-suite.sh)")
     args = ap.parse_args(argv)
+
+    # Resolved BEFORE the testpaths check so --print-out-dir answers even on a
+    # box whose pytest.ini is unusable: the shell needs somewhere to record the
+    # other halves' results precisely when the framework half is the thing that
+    # failed. The mkdir on that path is a temp log dir and costs nothing.
+    # DEFAULT IS OFF THE SYNCED TREE, and that is the whole point ().
+    # This used to default to agents/<agent>/temp/suite-run. Under own-cloud that
+    # directory is a FLEET-SYNCED surface (guard-3422), and the sync layer REPLACES
+    # a file at a NEW INODE while a writer still holds an fd on the old one -- the
+    # writer then keeps writing into an orphaned inode nobody will ever read.
+    # Chunk logs are exactly that shape: line ~1027 opens the log and holds the fd
+    # across a multi-minute subprocess.run(stdout=fh).
+    #
+    # Measured 2026-08-17 (alpha, hostname cc-04, uname -r 6.8.0-137-generic,
+    # own-cloud). Paired control, same producer and flags, ~1 min apart:
+    #   redirect into agents/<agent>/temp/ -> 0 bytes, rc=0
+    #   redirect into tempfile.gettempdir() -> 129,157 bytes, rc=0
+    # An inode watch caught the swap directly: ino=2010435 size=0 -> ino=2009953
+    # size=551, then frozen while the producer ran 71 more seconds. Clean prefix,
+    # ZERO NUL bytes, rc=0 -- so the corruption is indistinguishable from a short
+    # run, which is why it read as "contended" for three false INVALID verdicts.
+    # Duration is the discriminator, not size: a 13.2 MB fast write survives and a
+    # 60-second trickle does not.
+    #
+    # gettempdir() (not a hardcoded /tmp) honours TMPDIR/TEMP/TMP, so this stays
+    # portable to the MSYS2 and WSL2 boxes; it returns an absolute path, keeping
+    # the guard-552 resolver contract. --out still overrides for anyone who wants
+    # the logs kept somewhere durable.
+    agent = os.environ.get("MIND_AGENT", "").strip()
+    out = Path(args.out) if args.out else (
+        Path(tempfile.gettempdir()) / ("ayoai-suite-run-" + (agent or "shared")))
+    out.mkdir(parents=True, exist_ok=True)
+
+    # One resolver, two callers (). run-full-suite.sh appends the
+    # per-half records that --triage later reads, and it must write them into
+    # the SAME dir this resolution picked -- re-deriving the default in bash
+    # would be a second source of truth free to drift from this one.
+    if args.print_out_dir:
+        print(str(out))
+        return 0
 
     testpaths = _testpaths()
     if not testpaths:
@@ -735,11 +999,6 @@ def main(argv=None):
               "named nothing that exists, and %s is absent)" % TESTS_DIR,
               file=sys.stderr)
         return 3
-
-    agent = os.environ.get("MIND_AGENT", "").strip()
-    out = Path(args.out) if args.out else (
-        PROJECT_ROOT / "agents" / (agent or "shared") / "temp" / "suite-run")
-    out.mkdir(parents=True, exist_ok=True)
 
     if args.triage:
         # Constraint 1 governs the solo re-runs too -- they are real pytest
@@ -765,6 +1024,16 @@ def main(argv=None):
             old.unlink()
         except OSError:
             pass
+    # Same reasoning, same moment: a halves record left by an EARLIER run would
+    # otherwise be reported by this run's --triage as though it described this
+    # run -- and a stale PASS is worse than no record at all, because "NOT
+    # RECORDED" is loud while a stale PASS reads as coverage. Cleared here (the
+    # run path) rather than in the shell, so it happens exactly once and before
+    # the shell appends anything.
+    try:
+        (out / HALVES_RECORD).unlink()
+    except OSError:
+        pass
 
     # Non-recursive glob per root, matching pytest's own default discovery for
     # these trees (all three are flat -- verified 2026-07-31: 0 nested test
@@ -797,6 +1066,16 @@ def main(argv=None):
           "daemon_integration %s"
           % ("INCLUDED" if args.include_daemon_integration else "excluded"))
 
+    # : record HEAD BEFORE the first chunk. The chunk file lists are
+    # computed AT LAUNCH, so a merge landing mid-run hands later chunks paths
+    # that may no longer exist -- chunk 00 runs against one tree and the rest
+    # against another, and the TOTAL is a mixed-tree number that means nothing.
+    # Measured 2026-08-18 on cc-07: the worker loop's Phase -0.3 pull integrated
+    # 4 origin commits mid-run, two of them DELETING files the later chunks had
+    # already been handed. DETECT, do not prevent: the runner cannot own the
+    # loop's pull policy, but it can refuse to certify a run whose tree moved.
+    head_at_launch = _git_head(PROJECT_ROOT)
+
     combined = []
     tot_p = tot_f = tot_e = 0
     for i, group in enumerate(groups):
@@ -821,8 +1100,48 @@ def main(argv=None):
     print("\n" + "=" * 66)
     print("TOTAL: %d passed, %d failed, %d errors" % (tot_p, tot_f, tot_e))
 
+    # Tree-move check runs BEFORE every other verdict and outranks all of them
+    # (). A mixed-tree run is uninterpretable in BOTH directions: a
+    # CLEAN is the dangerous case (looks certified, certifies nothing) and a
+    # GENUINE invites filing regressions against files the merge changed or
+    # deleted. Exit 2 reuses the existing "invalid, re-measure" contract that
+    # callers already honour rather than adding a fourth exit code.
+    head_at_finish = _git_head(PROJECT_ROOT)
+    if head_at_launch is None or head_at_finish is None:
+        print("  tree-move check: NOT RUN (HEAD unreadable) -- this run is NOT "
+              "certified against a mid-run merge")
+    elif head_at_launch != head_at_finish:
+        print("VERDICT: INVALID (tree-moved) -- this number means NOTHING")
+        print("  HEAD at launch: %s" % head_at_launch)
+        print("  HEAD at finish: %s" % head_at_finish)
+        print("  Chunk file lists are computed AT LAUNCH, so later chunks ran "
+              "against a different tree than chunk 00 -- possibly against "
+              "paths the merge deleted.")
+        print("  classify() would have said: %s" % verdict)
+        for r in reasons:
+            print("    - %s" % r)
+        print("\nRe-run on a settled tree. Do NOT climb the chunk ladder -- no "
+              "rung fixes a tree that moved, and do NOT file regressions from "
+              "this run.")
+        print("On a worker Body the merge is Phase -0.3 "
+              "(iteration-push.sh --no-push), which fires on EVERY turn-end "
+              "re-entry, so any suite longer than one turn is exposed at every "
+              "turn boundary.")
+        print("=" * 66)
+        return 2
+
     if verdict == "contended":
-        print("VERDICT: INVALID (contended) -- this number means NOTHING")
+        # A HANG AND CONTENTION BOTH INVALIDATE THE RUN, SO THE EXIT CODE IS THE
+        # SAME 2 -- but the LABEL and the remedy must differ, because the
+        # documented contention remedy (climb the ladder, re-run when quiet) is
+        # exactly what a deterministic hang defeats. Relabel rather than adding a
+        # fourth verdict: the enum drives the exit code, and callers already
+        # treat 2 as "invalid, re-measure", which is still correct here.
+        hung = [r for r in reasons if "HUNG after" in r]
+        if hung:
+            print("VERDICT: INVALID (HUNG) -- this number means NOTHING")
+        else:
+            print("VERDICT: INVALID (contended) -- this number means NOTHING")
         for r in reasons:
             print("  - %s" % r)
         if args.confirm_solo and files_failing:
@@ -836,7 +1155,11 @@ def main(argv=None):
             print("  solo: %d passed, %d failed -> %s"
                   % (sp, sf, "ENVIRONMENTAL (green solo)" if sf == 0
                      else "some failures are GENUINE"))
-        print("\nRe-run when the fleet is quiet, or raise --chunks.")
+        if hung:
+            print("\nFix or skip the hanging test -- re-running and raising "
+                  "--chunks CANNOT help a deterministic hang.")
+        else:
+            print("\nRe-run when the fleet is quiet, or raise --chunks.")
         print("Do NOT file regressions from this run. Do NOT wave it away either.")
         print("=" * 66)
         return 2

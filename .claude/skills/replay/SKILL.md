@@ -148,6 +148,26 @@ Read the original evaluation record (scoring, reasoning)
 # silently dropped per full sweep.
 # NOT a legacy artifact: the genuinely-bare 73 are spread 2026-04 (34), 2026-07 (19),
 # 2026-05 (13), 2026-06 (7) — this month is the second-largest cohort.
+#   ^ READ THAT AS COUNTS, NOT RATES — the "second-largest cohort" ranking is an
+#   artifact of month SIZE and inverts once normalized. Re-measured 2026-08-11
+#   (foxtrot, hostname LAPTOP-3IOFCNEO, uname -r 6.6.87.2-microsoft-standard-WSL2)
+#   over the 444 scoreable replay candidates: empty-outcome_detail by month runs
+#   2026-04 20/38 = 52.6% · 2026-05 10/43 = 23.3% · 2026-06 6/38 = 15.8% ·
+#   2026-07 44/239 = 18.4% · 2026-08 13/84 = 15.5%. July ranks high by COUNT only
+#   because it holds 239 of 444 records — by RATE it is among the best months, and
+#   the trend since April is monotone-ish improvement that has been flat since June.
+#   So the sentence above is right that the gap is not confined to legacy records,
+#   but its evidence does not support that: a raw-count ranking over unequal
+#   denominators cannot distinguish "this month is worse" from "this month is
+#   bigger" (guard-3141 — composition is the denominator that makes a count
+#   decomposable). NOTE THE POPULATIONS DIFFER and neither figure supersedes the
+#   other: 29.2% is over 459 resolved+archived records, 20.9% is over the 444
+#   scoreable REPLAY CANDIDATES (recently-replayed excluded), so do not read
+#   29.2% -> 20.9% as a measured improvement. Rate-split by outcome, same run:
+#   CONFIRMED 78/344 = 22.7% empty vs CORRECTED 15/100 = 15.0% — so a
+#   violation-first batch is drawn from the BETTER-documented half, and a batch
+#   scoring 0/10 bare is unremarkable (expected ~1.5) rather than evidence the
+#   gate improved. Compare a batch against the CORRECTED row, never the pool row.
 # CONTEXT, so this is not re-derived as a regression: the g-303-15 audit measured
 # ~53% missing (`pipeline.py:322`) and the g-303-27 resolution-evidence gate
 # (guard-870 / guard-1126) has since roughly HALVED it. The gate is working. What it
@@ -162,6 +182,15 @@ Read the original evaluation record (scoring, reasoning)
 # exactly the distinction this step needs and a blank string cannot carry. The
 # ten-key order lives ONCE in mind_api/src/world/pipeline.py NARRATIVE_CHAIN.
 # `--narrative` alone covers the live+archive union; add `--stage resolved` to filter.
+# OUTPUT SHAPE (bravo, cc-05, 2026-08-13 — cost 2 turns to rediscover): the call
+# emits a PRETTY-PRINTED JSON **LIST** wrapping the record, not one JSONL line and
+# not a bare dict. So `json.loads(line)` over a concatenation of N calls parses
+# ZERO records, and `.get()` on each decoded value raises AttributeError on a list.
+# Accumulating N calls into one file needs a streaming `JSONDecoder().raw_decode`
+# loop plus a flatten step. Both failures are SILENT in the bad direction — a
+# "0 narratives parsed" reads as a finding about the CORPUS (the bare-record rate
+# this very block is about) when it is a fact about your parser. Assert the parsed
+# count equals the number of ids you asked for before drawing any conclusion.
 outcome_text = the `narrative` field of that call
   # `result` is usually the bare verdict string ("CONFIRMED") — use it for the
   # verdict, never as the narrative. It is deliberately NOT in the chain.
@@ -234,6 +263,120 @@ any rate or divergence as a finding, re-measure it over the unfiltered resolved 
 or state explicitly that the number is batch-scoped and not comparable to a corpus
 average. A guardrail cannot outvote the instrument it guards — guard-2129 sits in the
 guardrail store, and this paragraph is the instrument.
+
+**THE CORPUS RE-MEASUREMENT IS NOT SELF-INTERPRETING — RUN A MEANINGLESS-MARKER CONTROL
+IN THE SAME CALL.** Re-measuring tells you the delta; it does not tell you how large a
+delta this instrument produces from *nothing*, and a small-but-nonzero result is exactly
+where that matters. Split the same corpus on a marker with NO theoretical link to the
+hypothesis (title contains a common word, id is even, category name length) and read its
+delta as the noise floor. Anything at or below the floor is nothing, however good the
+story is.
+
+Measured 2026-08-15 (zeta, `hostname` cc-02, `uname -r` 6.8.0-137-generic, 535 resolved):
+4 of 6 corrected hypotheses in the batch asserted something was *eliminated / clean /
+holds / is-not* — a stability-or-absence claim, coherent and connected to an existing
+rule (`verify-before-assuming`), which is what made it persuasive. Corpus re-measurement:
+**27.1% (23/85) vs 27.8% (125/450), delta -0.7pp, z=-0.14.** The control — titles
+containing `the|a|of|to|and|in` — returned **+9.9pp**, roughly 14x the hypothesized
+effect. Without the control, -0.7pp reads as "small, maybe real, worth watching"; with
+it, the pattern is an order of magnitude below the floor and unambiguously nothing.
+
+Note the control is also a live warning about the corpus: a bare-common-word split moving
+~10pp means title-derived splits carry a large confound (likely title LENGTH). Do NOT
+chase that number either — guard-1923 (bare-common-word over-match) is exactly this trap,
+and the control's job is to be discarded, not investigated.
+
+**Run a SECOND control with no possible confound — the common-word one is not enough on
+its own.** Its own caveat above concedes it carries a title-LENGTH confound, which means a
+reader cannot tell how much of its delta is noise and how much is that confound; a floor
+you cannot decompose is a weak floor.
+
+⚠ **CORRECTED 2026-08-18 (zeta, `hostname` cc-02, `uname -r` 6.8.0-137-generic,
+g-001-05, 570 scoreable candidates, base corrected rate 29.3%). This block used to
+prescribe the parity of a checksum over the record id, `sum(ord(c) for c in id) % 2 == 0`,
+and asserted it "cannot correlate with length, topic, author, month, or outcome". That
+assertion is MEASURED FALSE. Record ids begin `YYYY-MM-DD_`, so ten date characters enter
+the checksum — the "meaningless" marker is a deterministic function of the record's DATE,
+and date is the strongest predictor of `CORRECTED` in this corpus.** Decisive one-call
+experiment; same pool, same construction, only the prefix moved:
+
+| split (identical construction) | delta |
+|---|---|
+| checksum over the DATE PREFIX ALONE, `id[:10]` | **+6.91pp** |
+| checksum over the FULL id (what this block prescribed) | **+7.22pp** |
+| checksum over the id MINUS the date, `id[11:]` | **−1.00pp** |
+| checksum over the TITLE (contains no date) | **+1.20pp** |
+
+~96% of the "floor" was ten characters of date. **Use `id[11:]`, not `id`** — and prefer a
+permutation floor over any single fixed split.
+
+WHY date carries outcome here is a POOL ARTIFACT and must NOT be reported as a change in
+resolution practice. Corrected-rate by outcome month runs 0.0% (2026-04, n=18) · 0.0%
+(05, n=10) · 0.0% (06, n=35) · 34.5% (07, n=194) · 36.0% (08, n=258). This very skill
+produces the early zeros: Step 3.6 encodes chronic-CORRECTED records and the
+`replay_candidates` endpoint then EXCLUDES them, so OLD corrected records are
+preferentially drained from the pool — measured, 67 pool records at `replay_count >= 3`
+and **zero** of them CORRECTED. The pool ages into a CONFIRMED-only tail.
+
+THE REPLICATION WAS THE TRAP, and it is the reusable half. +6.7pp (foxtrot, `hostname`
+LAPTOP-3IOFCNEO, 527 records) / +7.5pp (bravo, cc-05, 528) / +7.2pp (zeta, cc-02, 570) across three
+boxes read as "a stable property of this corpus, not one box's artifact" — and it IS
+stable, but the stable property is a CONFOUND, not a floor. Three probes agreeing because
+they share one construction are ONE probe (sig-222). Cross-box agreement tests
+PORTABILITY; it cannot test VALIDITY. (Common-word replicates the same way: 9.7 / 9.9 /
+13.2 / 13.0pp.)
+
+**The honest floor is a permutation distribution, not one split.** 2000 random balanced
+splits of the same 570-record pool: |delta| median **2.57pp**, p90 **6.29pp**, p95
+**7.57pp**, p99 **9.72pp**, max 13.68pp. Only **6.3%** of random splits reach the 7.22pp
+the checksum returned — the prescribed control was not sampling the middle of the noise
+distribution, it sat near its 94th percentile. Compute the distribution for the pool in
+front of you and use its **p95 as the bar**; it is ~10 lines and it re-derives per corpus
+instead of inheriting a constant (guard-1511 — a threshold swept against one corpus
+snapshot does not travel).
+
+DIRECTION OF THE ERROR, so nobody over-corrects it later: the old floor was ~3x too HIGH
+(7.2pp against a 2.6pp median), so it **discarded real signal and never manufactured
+any**. Markers previously rejected as "below the checksum floor" are UNDETERMINED, not
+refuted — digit-in-title −2.0pp, comparative-title +3.3pp (n=10), and
+resolved-after-`resolves_by` −9.1pp, the last of which is above p95 and worth re-testing.
+Today's hypothesized marker (`position` states a threshold/aggregate, **+4.8pp**, n=250
+vs 320) stays DISCARDED on the better evidence: **21.2%** of random splits reach 4.8pp.
+
+Carry the number, not just the method: **on this corpus a random split moves ~2.6pp at the
+median and reaches ~7.6pp at p95 (2000 permutations, 2026-08-18).** Do not inherit
+"6-10pp", and never use a single fixed "meaningless" split as the floor — the one this
+block used to prescribe was ~96% date.
+
+⚠ **PERMUTE AT THE MARKER'S GROUP SIZE, NOT BALANCED — and note this error runs the
+OPPOSITE way from every other correction above.** "2000 random *balanced* splits" is the
+floor for a 50/50 marker. A marker DISCOVERED IN THE BATCH is almost never 50/50: the
+batch is 10 records, so anything it surfaces is rare in the corpus, and the noise floor
+for a rare group is several times the balanced one. Measured 2026-08-19 (alpha, `hostname`
+cc-04, `uname -r` 6.8.0-137-generic, g-001-05, 564 scoreable candidates, base corrected
+rate 29.4%, 2000 permutations per row):
+
+| group size | median \|delta\| | p95 |
+|---|---|---|
+| 5 | 10.66pp | **30.84pp** |
+| 7 | 13.59pp | **29.80pp** |
+| 10 | 9.60pp | **29.96pp** |
+| 20 | 5.77pp | 20.15pp |
+| 50 | 5.01pp | 13.79pp |
+| 100 | 3.12pp | 10.25pp |
+| 282 (balanced) | 2.84pp | **7.80pp** |
+
+The balanced row REPLICATES the 2026-08-18 zeta figure (7.80 vs 7.57pp, different pool,
+different box, same construction) — so it is the positive control, not a rival number. At
+n=7 the bar is **3.8x** higher. Live instance from the run that measured this: the batch
+suggested "the narrative reports a defect in the MEASUREMENT INSTRUMENT rather than in the
+claim" (2 of 10 in-batch vs 1.2% of the corpus). Corpus re-measurement gave **+28.06pp
+(n=7 vs 557)** — a 3.6x exceedance of the balanced p95, and it would have been ENCODED.
+Against the size-matched floor, **20.3%** of random splits reach it: nothing. Every other
+correction in this block made the floor too HIGH (discarding real signal, the safe
+direction); this one makes it too LOW, so it MANUFACTURES findings — the direction that
+puts a fabricated lesson into the stores. Compute the floor at the size your marker
+actually has. (guard-4363; extends guard-3858.)
 
 ```
 1. SHARED CONDITIONS in corrected hypotheses:
@@ -556,7 +699,23 @@ FOR EACH candidate stamped above:
         IF still unverified: name the id in the Step 6 report under Spaced
         Repetition Stats. Do NOT continue silently — an unstamped candidate
         re-enters the next batch and consumes a slot.
-Report BOTH numbers: "stamped N, verified M". Only M is a measurement.
+Report BOTH numbers: "stamped N, verified M". Only M is a measurement — and only
+when the instrument producing it is INDEPENDENT of the write. Before using any
+filtered or derived surface as a read-back, ask whether a field this step just
+wrote appears in that surface's OWN selection criteria. If it does, that surface
+cannot verify the write at ANY value. Here it does: `--replay-candidates` excludes
+on `next_review_date > today` (mind_api/src/world/pipeline.py:283) and on
+`replay_count >= 5` (:272), and this step sets `next_review_date = today+7`, which
+is ALWAYS > today. So a batched `--replay-candidates` read-back is GUARANTEED to
+report M=0 on a fully successful stamp — absence CAUSED BY success, an inverted
+signal rather than a lossy one, which no amount of inspecting the reader's field
+list reveals. Do NOT substitute it for the per-id loop above to save N calls: that
+is the natural optimization and it is precisely what breaks. The per-id
+`pipeline-read.sh --id` above is the correct instrument because record identity
+does not depend on any field this step writes. (guard-1755; measured 2026-08-07,
+echo, cc-03, g-001-05: "stamped 10, verified 0" with all ten writes landed, where
+the repair invited by M=0 is a re-stamp that double-increments `replay_count` on
+ten healthy records and pushes them toward the `>= 5` archive cap early.)
 ```
 
 Both filters now exclude the candidate for 7 days: Step 1's `last_replayed`

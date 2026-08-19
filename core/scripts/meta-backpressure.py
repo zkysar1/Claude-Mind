@@ -169,6 +169,82 @@ def _is_audit_only_field(field, allowlist):
     return False
 
 
+def _audit_allowlist_basename(path):
+    """Last path segment of `path`, splitting on BOTH separators.
+
+    DO NOT INLINE. Must match mind_api/src/meta/meta_backpressure.py
+    ::_audit_allowlist_basename exactly (guard-130).
+
+    Both separators, because this repo runs on Linux and Windows and
+    `strategy_file` is whatever string the caller typed — os.path.basename on
+    POSIX does not split a backslash.
+    """
+    if not isinstance(path, str):
+        return ""
+    return path.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def _audit_allowlist_for(strategy_file, audit_only_fields):
+    """The audit-only allowlist for `strategy_file`, matched by BASENAME.
+
+    DO NOT INLINE. Must match mind_api/src/meta/meta_backpressure.py
+    ::_audit_allowlist_for exactly (guard-130; the two files may not import
+    each other — core/BOUNDARY.md).
+
+    WHY (g-115-6413, measured 2026-08-17 on cc-02). `strategy_file` is stored
+    VERBATIM from the caller: the CLI writes `args.file` (cmd_monitor) and the
+    daemon writes `body["file"]` (register) with no normalization anywhere. The
+    live registrar is `meta-yaml.py::cmd_set`, which gates on a SUBSTRING test
+    (`any(s in args.file for s in [...])`) and then forwards `args.file`
+    unchanged — so `meta-yaml.sh set --file meta/reflection-strategy.yaml ...`
+    registers a monitor keyed `meta/reflection-strategy.yaml`.
+
+    The lookup this replaces was an EXACT dict `.get()`, so that monitor missed
+    the allowlist entirely and every field it protects — roi_history, the
+    original wk-001 systematic_bias field (rb-504) — silently became
+    rollback-eligible again, with `audit_only_skips` staying at 0.
+
+    Not hypothetical: the live `rollback_history` carries BOTH spellings for one
+    file — `meta/goal-selection-strategy.yaml` (mc-001, mc-002) and
+    `goal-selection-strategy.yaml` (mc-003 onward, 7 more). Two keys, one file.
+
+    This is the same silent-allowlist-bypass class g-115-4552 (field match) and
+    g-115-5305 (CLI/daemon divergence) each fixed one expression away, surviving
+    in the FILE half of the same lookup.
+
+    Scope is its two arguments and nothing else — no path resolution, no
+    globals, no root (guard-2601: a predicate's name states the condition, never
+    the scope of the data it reads).
+
+    Exact match is tried FIRST, so a config whose keys already match a monitor
+    behaves byte-for-byte as before; the basename scan is reached only where the
+    old code returned the `[]` default. An unmatched `strategy_file` still yields
+    `[]` — identical to the previous `.get(..., []) or []`, so this adds no new
+    failure direction.
+
+    The `isinstance(str)` guard is NOT decoration and must precede the `.get()`:
+    an unhashable `strategy_file` (list/dict) raises TypeError inside `.get`,
+    which cmd_check does not catch, so ONE malformed monitor would abort the
+    whole cycle and skip every other monitor — including legitimate rollbacks.
+    backpressure.yaml is a shared own-cloud store with a merge handler, so a
+    malformed value is reachable. The pre-existing `.get(mon[...], [])` had this
+    same hole; the guard closes it rather than preserving it. Same reachability
+    argument as `_is_audit_only_field`'s type guard (g-115-4552 fresh-eyes).
+    """
+    if not isinstance(audit_only_fields, dict) or not isinstance(strategy_file, str):
+        return []
+    exact = audit_only_fields.get(strategy_file)
+    if isinstance(exact, list):
+        return exact
+    base = _audit_allowlist_basename(strategy_file)
+    if not base:
+        return []
+    for key, val in audit_only_fields.items():
+        if isinstance(val, list) and _audit_allowlist_basename(key) == base:
+            return val
+    return []
+
+
 def cmd_check(args):
     """Check all active monitors against a new learning_value.
 
@@ -221,7 +297,9 @@ def cmd_check(args):
 
         # Check for regression → rollback
         if monitor["consecutive_below_baseline"] >= regression_window:
-            file_audit = audit_only_fields.get(monitor["strategy_file"], []) or []
+            # BASENAME-matched, not an exact dict lookup (): the
+            # stored strategy_file is whatever string the registrar was handed.
+            file_audit = _audit_allowlist_for(monitor["strategy_file"], audit_only_fields)
             if _is_audit_only_field(monitor["field"], file_audit):
                 # Audit-only field: skip rollback, mark monitor closed, record
                 # the skip for parity with rollback_history. Removed from the
@@ -715,6 +793,34 @@ def _email_rollback(rollback_entry):
     if os.environ.get("MIND_EVOLUTION_NOTIFY_DRYRUN", "").strip() in ("1", "true", "yes"):
         print(f"NOTIFY DRY-RUN: would email rollback ({subject})", file=sys.stderr)
         return f"dry-run:rollback:{revision_id}"
+
+    # Notification-routing gate (). An auto-rollback is a `completion`:
+    # backpressure DETECTED the regression and ALREADY restored the file, which
+    # is verbatim the class the 2026-08-10 directive names -- "if there is an
+    # error, you handle it, i do not need to know". The gate still SENDS when the
+    # subject or body names a human-only class, so a rollback that touched a
+    # credential or a billing path is not silenced by this.
+    _nrg = None
+    try:
+        import notification_routing_gate as _nrg  # type: ignore
+        label, gate_reason, _dest = _nrg.decide_and_log(
+            "completion", subject, body,
+            caller="meta-backpressure.py:_email_rollback")
+    except Exception as exc:  # noqa: BLE001 - inverted fail-safe: send
+        label, gate_reason = ("send",
+                              "routing gate unimportable (%s) — inverted "
+                              "fail-safe sends" % type(exc).__name__)
+    if label == "suppress":
+        ok, detail = _nrg.post_suppression_breadcrumb(
+            subject, body, caller="meta-backpressure.py:_email_rollback",
+            reason=gate_reason, tags=["auto-rollback", file_kind or "unknown"])
+        if ok:
+            return f"suppressed:rollback:{revision_id}"
+        # The breadcrumb did NOT land, so suppressing now would DELETE the
+        # notification rather than re-route it (). Fall through and
+        # send: the user getting an email he did not need is the cheap error.
+        print(f"WARN: suppression breadcrumb failed ({detail}) — sending instead",
+              file=sys.stderr)
 
     payload = {
         "InfoType": "Self-Program-Evolution-Rollback",

@@ -80,12 +80,33 @@ def main() -> int:
                 "test_canary": "this_should_disappear",
                 "test_marker_a": "remove_me",
             }
-            # RESET_SURVIVING_SLOTS member — content payload (not a timestamp),
+            # RESET_SURVIVING_SLOTS members — content payloads (not timestamps),
             # written pre-reset and consumed post-reset ().
+            #
+            # EVERY member is seeded by name, deliberately (). This block
+            # used to carry journal_cluster_summaries ALONE as a representative, so
+            # the survive-assertion below passed for ANY subset of the four worker
+            # capture lanes — and encoding_capture was in fact absent from
+            # RESET_SURVIVING_SLOTS for its whole life while its three siblings were
+            # present. The parity test could not see it either: both the CLI and
+            # daemon copies agreed, on the same wrong set. A representative member is
+            # not coverage of a family. If a fifth capture lane is added, add it here.
             surviving_slots = {
                 "journal_cluster_summaries": [
                     {"label": "asp-115", "summary": "framework fixes cluster"},
                     {"label": "asp-001", "summary": "recurring upkeep cluster"},
+                ],
+                "spark_capture": [
+                    {"goal_id": "g-000-01", "observation": "worker spark payload"},
+                ],
+                "exp_capture": [
+                    {"goal_id": "g-000-01", "execution_summary": "worker narrative"},
+                ],
+                "hyp_capture": [
+                    {"goal_id": "g-000-01", "hypothesis_id": "2026-01-01_probe"},
+                ],
+                "encoding_capture": [
+                    {"goal_id": "g-000-01", "fact": "worker tree-worthy fact"},
                 ],
             }
 
@@ -193,6 +214,10 @@ SHARED_WM_CONSTANTS = (
     "MAP_SLOTS",
     "CADENCE_TRACKER_PATTERNS",
     "RESET_SURVIVING_SLOTS",
+    # : the four worker->reducer capture lanes, as an ordered tuple.
+    # Joins this list rather than getting its own bespoke check so a fifth lane
+    # is covered by being registered, not by someone remembering to add a test.
+    "CAPTURE_SLOTS",
 )
 
 
@@ -330,6 +355,91 @@ def test_daemon_reset_endpoint_preserves_surviving_slot():
                 "non-preserved slot should be nulled by reset"
             assert after.get("session_start") == "2026-07-12T00:00:00", \
                 "session identity lost across daemon reset"
+
+
+# --- : the predicate must match the CLASS, not a list of verbs ------
+
+# Class (b) in guard-362's terms — "age IS signal". Every name here is a real
+# live slot measured on 2026-08-18, and NINE of them were unprotected under the
+# old eight-suffix-verb enumeration. The `*_last_dispatch` family is the sharpest
+# case: those are the consumption-aware stamps stale-sentinel-canary uses as its
+# ONLY discriminator between "consumer kept up" and "consumer bypassed the gate",
+# so nulling them at evict_threshold_minutes defeats that protection on a 2h
+# cycle and false-fires "stale sentinel" Investigates.
+CADENCE_CLASS_SLOTS = (
+    # were already protected (the eight enumerated verbs)
+    "last_fresh_eyes_review", "last_strategic_scan", "last_strategic_scan_tick",
+    "last_felt_sense_checkin", "last_l1_skew_check", "last_scar_tissue_check",
+    "last_evolution_at_time", "last_reflection_at",
+    # were NOT — verb absent from the enumeration
+    "last_curriculum_eval", "last_completed_not_closed_triage",
+    # were NOT — name does not START with `last_`, so no `^last_` pattern
+    # could ever reach them however many verbs were listed
+    "fresh_eyes_last_dispatch", "fresh_eyes_last_fire",
+    "force_tree_maintain_last_dispatch", "force_metric_encoding_last_dispatch",
+    "force_experience_archival_last_dispatch",
+    "force_evolution_finalize_last_dispatch",
+    "force_pre_apply_consult_last_dispatch",
+    "force_metric_encoding_pending_last_dispatch",
+)
+
+# Class (a) — "age IS staleness", must stay evictable. The negative control
+# guard-362's action_hint requires: without it, `lambda _: True` passes.
+NON_CADENCE_SLOTS = (
+    "active_context", "active_strategy", "knowledge_debt", "known_blockers",
+    "micro_hypotheses", "sensory_buffer", "conclusions", "loop_state",
+    "spark_capture", "exp_capture", "consolidation_health", "curator_overflow",
+    "belief_contradiction_streaks", "portfolio_health_signal",
+    # `last_goal_category` is the sharp one and the reason the TOP_LEVEL_KEYS
+    # exclusion exists: it OPENS WITH `last_` yet holds a category string, not
+    # a timestamp — stale-from-neglect, so it must stay evictable. It is the
+    # standing negative control in test-wm-prune-cadence-protection.sh
+    # (), and the first cut of the class rewrite broke it. The
+    # 75-slot measurement did NOT catch it, because it is a TOP_LEVEL_KEY and
+    # so never appeared in the `slots` dict that measurement enumerated — the
+    # full suite caught it. Measure the population your predicate will actually
+    # be APPLIED to, not the one that is convenient to list.
+    "last_goal_category",
+)
+
+
+def test_cadence_predicate_covers_the_whole_stamp_class():
+    """Class-(b) survival + class-(a) negative control (guard-362 action_hint).
+
+    Pins the DEFECT, not just the current pattern text: before g-115-6697 this
+    was eight `^last_.*_<verb>$` patterns, so a stamp's protection depended on
+    which verb its author happened to choose and on the name starting `last_`.
+    """
+    unprotected = [s for s in CADENCE_CLASS_SLOTS if not wm._is_cadence_tracker(s)]
+    assert not unprotected, (
+        "cadence/dispatch stamps left evictable by CADENCE_TRACKER_PATTERNS "
+        f"(wm-prune nulls these at evict_threshold_minutes): {unprotected}"
+    )
+
+    over = [s for s in NON_CADENCE_SLOTS if wm._is_cadence_tracker(s)]
+    assert not over, (
+        f"non-cadence slots wrongly exempted from eviction: {over}"
+    )
+
+
+def test_cadence_patterns_are_anchored_for_match_semantics():
+    """`_is_cadence_tracker` applies `p.match()`, which anchors at position 0
+    whatever the pattern says — so an un-anchored infix (`_last_`) compiles
+    cleanly, reads correctly, and matches NOTHING.
+
+    All eight original patterns opened with `^`, so this held by accident and
+    was never stated. It was violated within minutes of the g-115-6697 rewrite
+    and caught only because the exploratory measurement used `.search()` while
+    production uses `.match()`.
+    """
+    for pat in wm.CADENCE_TRACKER_PATTERNS:
+        assert pat.pattern.startswith("^"), (
+            f"pattern {pat.pattern!r} is not ^-anchored; _is_cadence_tracker "
+            f"uses .match(), so it can never fire. Write an infix as '^.*_x_'."
+        )
+
+    # Direct proof against the exact shape that regressed.
+    assert wm._is_cadence_tracker("fresh_eyes_last_dispatch")
 
 
 if __name__ == "__main__":

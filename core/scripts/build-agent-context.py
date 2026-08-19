@@ -32,6 +32,17 @@ except ImportError:
 
 from _paths import PROJECT_ROOT, WORLD_DIR, AGENT_DIR, META_DIR, AGENT_NAME
 
+#  utilization seam. Imported at TOP LEVEL here — deliberately unlike
+# guardrail_retire/weakness-signals, which defer it: this module already imports
+# _paths on the line above, so the WORLD_DIR resolution is paid either way and a
+# lazy import would buy nothing. Both shapes carry their own reason so neither
+# gets "fixed" to match the other. load_all_counters (not load_counters) because
+# the two sorts below span BOTH stores — guardrails and reasoning bank.
+from _utilization_store import (
+    load_all_counters as _load_all_counters,
+    utilization_of as _utilization_of,
+)
+
 # Store paths
 TREE_PATH = WORLD_DIR / "knowledge" / "tree" / "_tree.yaml"
 RB_PATH = WORLD_DIR / "reasoning-bank.jsonl"
@@ -253,8 +264,9 @@ def build_context(categories, role, repo_path, max_tokens):
 
     # Fallback: if nothing matched, include top 3 most-retrieved
     if not cat_guards:
+        _counters = _load_all_counters()
         active_guards.sort(
-            key=lambda g: g.get("utilization", {}).get("retrieval_count", 0),
+            key=lambda g: _utilization_of(g, _counters).get("retrieval_count", 0),
             reverse=True,
         )
         cat_guards = active_guards[:3]
@@ -302,8 +314,9 @@ def build_context(categories, role, repo_path, max_tokens):
 
     # Fallback: if nothing matched, include top 3 most-retrieved
     if not cat_rb:
+        _counters = _load_all_counters()
         active_rb.sort(
-            key=lambda r: r.get("utilization", {}).get("retrieval_count", 0),
+            key=lambda r: _utilization_of(r, _counters).get("retrieval_count", 0),
             reverse=True,
         )
         cat_rb = active_rb[:3]

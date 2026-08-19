@@ -64,7 +64,7 @@ while [[ $# -gt 0 ]]; do
         --review-type)
             [[ $# -ge 2 ]] || { echo "self-assess-and-decide: --review-type requires a value" >&2; exit 2; }
             REVIEW_TYPE="$2"
-            shift 2
+            shift $(( $# >= 2 ? 2 : 1 ))
             ;;
         --help|-h)
             sed -n '2,40p' "$0"

@@ -350,8 +350,47 @@ def cmd_update(args) -> int:
 
 
 def cmd_clear(args) -> int:
-    """Remove the checkpoint file. No-op if absent."""
+    """Remove the checkpoint file. No-op if absent.
+
+    --if-goal <id> makes this a COMPARE-AND-SWAP: clear only when the checkpoint
+    names that goal. It exists because `clear` had no CAS and therefore no safe
+    caller (g-115-4990): the only place that wants to clear is a goal exiting —
+    defer, release, skip — and an unconditional clear there would unlink an
+    anchor naming a DIFFERENT, live goal. Mirrors `team-state-clear-in-flight.sh
+    --if-goal`, the CAS aspirations-release.sh already relies on for the
+    in_flight surface, so the two cleanups in that script read the same way.
+
+    Doing the compare HERE rather than in the calling shell is the point. The
+    caller would otherwise have to `read` the checkpoint, pipe it through
+    python, and strip a trailing \\r before comparing — the whole round-trip is
+    text-mode on Windows, so `goal_id` arrives as "g-NNN-NN\\r" and never
+    compares equal, silently making the caller inert on exactly one platform
+    (the same trap aspirations-claim.sh documents at its own ENSURE check).
+    The single-writer already has the parsed value; nothing else should re-derive
+    it.
+
+    A mismatch is exit 0, not an error: "the anchor moved on" is the normal
+    outcome of a stale release, not a failure the caller should react to.
+    """
     path = _checkpoint_path()
+    want = (getattr(args, "if_goal", None) or "").strip()
+    if want:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return 0
+        except Exception as exc:                      # unreadable/corrupt
+            # Deliberately do NOT clear. An unparseable checkpoint is a
+            # different defect, and unlinking it would destroy the evidence
+            # while looking like a successful cleanup.
+            print(f"[loop-state-save] WARN: checkpoint unreadable, not cleared "
+                  f"({exc.__class__.__name__})", file=sys.stderr)
+            return 0
+        have = str((data or {}).get("goal_id") or "").strip()
+        if have != want:
+            print(f"iteration-checkpoint NOT cleared: anchored to "
+                  f"{have or '<none>'}, release named {want}")
+            return 0
     try:
         path.unlink()
         print(f"iteration-checkpoint cleared: {path}")
@@ -388,6 +427,9 @@ def main():
     p_update.set_defaults(func=cmd_update)
 
     p_clear = sub.add_parser("clear", help="Remove the checkpoint file")
+    p_clear.add_argument("--if-goal", dest="if_goal", default=None,
+                         help="Compare-and-swap: clear ONLY if the checkpoint "
+                              "names this goal id (g-115-4990)")
     p_clear.set_defaults(func=cmd_clear)
 
     p_read = sub.add_parser("read", help="Print checkpoint JSON or 'null' if absent")

@@ -109,18 +109,29 @@ def test_parent_id_unparseable_returns_none():
     assert mod._parse_parent_id(g) is None
 
 
-def test_origin_signal_must_match_exact_form():
-    """origin_signal regex requires 'unblock:<g-NNN-NN>' exactly — does
-    not consume narrative suffixes like 'unblock:g-115-129-precondition'."""
+def test_narrative_suffix_is_not_absorbed_into_the_id():
+    """A narrative suffix must not be consumed INTO the goal-id.
+
+    ASSERTION FLIPPED IN g-115-5647, deliberately. This test previously
+    asserted that 'unblock:g-115-129-precondition' parses to None, on the
+    reasoning that the end-anchored regex "rejects the suffix". But rejecting
+    the whole signal is not the same as not absorbing the suffix, and the
+    live corpus is full of exactly this shape — 'unblock:g-335-983-unshipped-
+    duplicate-prs' is a real goal whose parent the sweep could not find. The
+    old assertion pinned the narrowness that WAS the defect.
+
+    The property genuinely worth protecting is that the id ends where the
+    digits end: g-115-129, never g-115-129-precondition. That is what the
+    embedded pattern guarantees (\\d+ cannot match a letter) and what this
+    test now checks.
+    """
     mod = _import_sweep()
-    # narrative suffix after the goal-id — NOT exact form
     g = {
         "id": "g-001",
-        "title": "Unblock: do the thing",  # title path also no match
+        "title": "Unblock: do the thing",   # no id in the title path
         "origin_signal": "unblock:g-115-129-precondition",
     }
-    # origin_signal regex anchored at $ rejects suffix — falls through
-    assert mod._parse_parent_id(g) is None
+    assert mod._parse_parent_id(g) == "g-115-129"
 
 
 def test_unblock_title_matcher_accepts_canonical_and_whitespace():
@@ -146,13 +157,20 @@ def test_unblock_title_matcher_rejects_other_prefixes():
 
 
 def test_idempotency_already_swept_detection():
-    """Once outcome_note carries the parent-resolved phrase, subsequent
-    sweeps must not re-mark the goal — prevents double-write loops."""
+    """Once a goal is FULLY swept — note AND terminal status — subsequent
+    sweeps must not re-mark it; prevents double-write loops.
+
+    The `already` fixture gained an explicit terminal status in g-115-5097.
+    Before that it carried the note and no status at all, which pinned the
+    defect by omission: it asserted that a note ALONE proves a completed
+    sweep. It does not — see test_partial_write_is_not_already_swept.
+    """
     mod = _import_sweep()
     already = {
         "id": "g-001",
         "title": "Unblock: x for g-002",
         "origin_signal": "unblock:g-002",
+        "status": "skipped",
         "outcome_note": ("parent resolved without action needed "
                          "(parent_id=g-002, parent.status=skipped)"),
     }
@@ -161,6 +179,7 @@ def test_idempotency_already_swept_detection():
         "id": "g-001",
         "title": "Unblock: x for g-002",
         "origin_signal": "unblock:g-002",
+        "status": "pending",
         "outcome_note": "",
     }
     assert mod._is_already_swept(fresh) is False
@@ -168,8 +187,50 @@ def test_idempotency_already_swept_detection():
     bare = {
         "id": "g-001",
         "title": "Unblock: x for g-002",
+        "status": "pending",
     }
     assert mod._is_already_swept(bare) is False
+
+
+def test_partial_write_is_not_already_swept():
+    """ — the load-bearing pin. POSITIVE CONTROL: this fixture is
+    RED against the pre-fix guard (`note.startswith(...)` alone returns True).
+
+    _mark_skipped writes note then status as two non-atomic daemon calls. If
+    write 2 fails, the goal carries the sweep's note while status is STILL
+    pending. Keying dedup on the note alone made that state permanently
+    self-sealing: the sweep skipped it on every later run, so its own partial
+    success blocked its own repair — invisibly, because the sweep reported the
+    goal as already-swept rather than as a failure.
+
+    Requiring a terminal status means this state re-qualifies and self-heals.
+    """
+    mod = _import_sweep()
+    note = ("parent resolved without action needed "
+            "(parent_id=g-002, parent.status=skipped)")
+    for stranded_status in ("pending", "in-progress"):
+        stranded = {
+            "id": "g-001",
+            "title": "Unblock: x for g-002",
+            "origin_signal": "unblock:g-002",
+            "status": stranded_status,
+            "outcome_note": note,
+        }
+        assert mod._is_already_swept(stranded) is False, (
+            f"note-bearing goal with status={stranded_status!r} must re-qualify "
+            f"for retry, not be treated as swept (g-115-5097)"
+        )
+    # Every terminal status counts as swept, not just the one _mark_skipped
+    # writes — a goal closed some other way after the note landed is done too.
+    for terminal in sorted(mod.TERMINAL_STATES):
+        done = {
+            "id": "g-001",
+            "title": "Unblock: x for g-002",
+            "origin_signal": "unblock:g-002",
+            "status": terminal,
+            "outcome_note": note,
+        }
+        assert mod._is_already_swept(done) is True, terminal
 
 
 def test_terminal_states_set():
@@ -466,3 +527,443 @@ def test_g115_2681_genuine_wait_outside_window_still_sweeps():
     # Boundary: just INSIDE (899s lead) must be guarded.
     ts_in = {"g-999-00": "2026-07-01T00:14:59"}
     assert mod._provenance_fp_guard(g_edge, "g-999-00", ts_in) is not None
+
+
+# ---------------------------------------------------------------------------
+# guard-1890 / guard-2390 — archive resolution + the dead-sentinel regression
+#
+# The defect these pin (measured 2026-08-13, alpha, hostname cc-04, uname -r
+# 6.8.0-137-generic): the sweep resolved a parent with
+# `status_idx.get(parent_id, "archived")` — a SENTINEL meaning "absent from the
+# active scan", which the docstring called "the supersession signal". 
+# then removed "archived" from TERMINAL_STATES as a bogus goal status. Both
+# changes are individually correct; together they killed the branch, because the
+# sentinel could no longer pass its own terminal test. The sweep then reported
+# `parent not in terminal state (parent.status=archived)` about goals carrying no
+# such status — a sentinel reaching a human-readable audit record (guard-2390).
+#
+# Neither existing test could catch it: test_terminal_states_set pins the SET and
+# test_status_index_builder pins the ACTIVE index. Nothing covered their
+# INTERACTION, which is the whole defect. That is why these are behavioural pins
+# on the resolution helpers rather than another constant assertion.
+# ---------------------------------------------------------------------------
+
+
+def test_archived_id_set_keys_on_membership_not_frozen_status():
+    """An archived aspiration's goals are dead regardless of the status they
+    froze with — its ASPIRATION being archived is the signal, not the goal's
+    own stale status field. A goal frozen as `pending` inside an archived
+    aspiration must still register as archived, or the sweep re-derives the
+    terminal question from a field that stopped being maintained."""
+    mod = _import_sweep()
+    archived = [
+        ({"id": "asp-90", "goals": [
+            {"id": "g-90-01", "status": "completed"},
+            {"id": "g-90-02", "status": "pending"},    # froze mid-flight
+            {"id": "g-90-03"},                          # no status at all
+        ]}, "world"),
+        ({"id": "asp-91", "goals": [{"id": "g-91-01", "status": "blocked"}]},
+         "agent"),
+    ]
+    ids = mod._build_archived_id_set(archived)
+    assert ids == {"g-90-01", "g-90-02", "g-90-03", "g-91-01"}
+
+
+def test_archived_id_set_empty_archive_is_valid_not_degraded():
+    """A fresh world has an empty archive. That is a valid state, NOT a
+    failure — treating it as degraded would make every clean world look
+    broken."""
+    mod = _import_sweep()
+    assert mod._build_archived_id_set([]) == set()
+
+
+def test_archive_read_degrades_while_active_read_stays_fatal():
+    """The asymmetry is the safety property (guard-1890, guard-383).
+
+    Losing the ARCHIVE falls back to pre-fix behaviour: an archived parent
+    reads as unresolvable, so the Unblock is left alone — a false-NEGATIVE,
+    the sweep does less, visibly. Losing an ACTIVE source would make a
+    still-pending parent look absent and could sweep a LIVE Unblock, so it
+    must stay fatal. A future refactor that makes both degrade would silently
+    arm exactly that.
+    """
+    mod = _import_sweep()
+
+    def _boom(*a, **kw):
+        raise mod._rt.RtError("simulated daemon failure")
+
+    orig = mod._rt.aspirations_read
+    try:
+        mod._rt.aspirations_read = _boom
+        # ARCHIVE: degrades to None, never raises, never exits.
+        assert mod._read_archived_aspirations("world") is None
+        # ACTIVE: guard-383 fatal — a silent [] would poison the merged
+        # world+agent aggregate with a complete-looking lie.
+        try:
+            mod._read_aspirations("world")
+        except SystemExit as e:
+            assert e.code == 1
+        else:
+            raise AssertionError(
+                "_read_aspirations must exit(1) on a source read failure; "
+                "degrading it would let a live Unblock be swept against an "
+                "apparently-absent parent")
+    finally:
+        mod._rt.aspirations_read = orig
+
+
+def test_absence_sentinel_never_collides_with_terminal_states():
+    """The regression pin for the dead branch itself.
+
+    `archived` is deliberately NOT a member of TERMINAL_STATES (g-303-21), so
+    resolving an absent parent to that STRING can never mark it terminal. The
+    sweep must therefore decide absence by ARCHIVE MEMBERSHIP, and the two
+    mechanisms must stay distinct. If a future edit re-adds "archived" to
+    TERMINAL_STATES to "fix" an absent parent, this fails and points at the
+    membership path instead — the parity test would fail too, from the other
+    side.
+    """
+    mod = _import_sweep()
+    assert "archived" not in mod.TERMINAL_STATES
+    # The resolution path exists and is membership-based, not string-based.
+    assert callable(mod._build_archived_id_set)
+    assert callable(mod._read_archived_aspirations)
+    # An absent id resolves to None from the ACTIVE index — never to a string
+    # that could be interpolated into a reason as though it were a real status
+    # (guard-2390).
+    idx = mod._build_status_index([({"id": "asp-1", "goals": [
+        {"id": "g-1", "status": "pending"}]}, "world")])
+    assert idx.get("g-does-not-exist") is None
+
+
+# --- : successor/residual-scope guard ------------------------------
+
+
+def test_successor_guard_live_incident_shape_guarded():
+    """The  shape: description asserts 'case A - successor
+    preserving <parent> sanctioned scope'. Created ~4h BEFORE the parent
+    completed, so every timestamp guard passes it — the TEXT is the only
+    discriminator. Must return a reason, never None."""
+    mod = _import_sweep()
+    g = {
+        "id": "g-350-215",
+        "title": "Unblock: DEV host infra (ReplicaServer + PlayerProfiles)",
+        "origin_signal": "unblock:g-350-202",
+        "description": ("filed by alpha worker Body on cc-07 — case A - "
+                        "successor preserving g-350-202 sanctioned scope: "
+                        "that goal's product outcome is the carved tree "
+                        "LOADS in DEV, and the require rewrite (PR #6) "
+                        "delivers only the self-consistency half"),
+    }
+    reason = mod._successor_scope_guard(g)
+    assert reason is not None
+    assert "g-115-6223" in reason
+    assert "PRECONDITION" in reason
+
+
+def test_successor_guard_each_marker_word_fires():
+    mod = _import_sweep()
+    for marker in ("successor", "Successor Unblock carrying scope",
+                   "residual scope from the parent",
+                   "the remainder of the parent's outcome",
+                   "PR #6 delivers only the self-consistency half",
+                   "case A - preserving sanctioned scope"):
+        g = {"title": "Unblock: x for g-1-1", "description": marker,
+             "origin_signal": ""}
+        assert mod._successor_scope_guard(g) is not None, marker
+
+
+def test_successor_guard_matches_title_and_origin_signal_too():
+    mod = _import_sweep()
+    by_title = {"title": "Unblock: successor for g-1-1", "description": "",
+                "origin_signal": ""}
+    assert "title" in mod._successor_scope_guard(by_title)
+    by_os = {"title": "Unblock: x for g-1-1", "description": "",
+             "origin_signal": "unblock:residual-of-g-1-1"}
+    assert "origin_signal" in mod._successor_scope_guard(by_os)
+
+
+def test_successor_guard_plain_wait_unblock_still_sweepable():
+    """The sweep's whole population must not be guarded away: a plain
+    Layer-D defer-time Unblock with wait semantics returns None."""
+    mod = _import_sweep()
+    plain = {
+        "title": "Unblock: deploy access for g-115-9999",
+        "origin_signal": "unblock:g-115-9999",
+        "description": "Filed at defer time; waiting on parent credential grant.",
+    }
+    assert mod._successor_scope_guard(plain) is None
+
+
+def test_successor_guard_case_a_is_case_sensitive():
+    """Under IGNORECASE the 'case A' marker would match the common prose
+    shape 'in case a goal…' — the alternative is deliberately split out
+    case-sensitive. Lowercase prose must NOT trip the guard."""
+    mod = _import_sweep()
+    prose = {"title": "Unblock: retry for g-1-1",
+             "description": "re-probe in case a partner is idle; in case a "
+                            "goal stalls the selector re-ranks",
+             "origin_signal": ""}
+    assert mod._successor_scope_guard(prose) is None
+    filed = {"title": "Unblock: retry for g-1-1",
+             "description": "filed by echo worker Body, case A, carrying the "
+                            "parent's sanctioned scope",
+             "origin_signal": ""}
+    assert mod._successor_scope_guard(filed) is not None
+
+
+def test_successor_guard_ignores_outcome_note():
+    """outcome_note is written by this sweep itself (and by re-open
+    narratives recording the oscillation), so successor words THERE must
+    not key the guard — only description/title/origin_signal count."""
+    mod = _import_sweep()
+    g = {"title": "Unblock: x for g-1-1", "description": "", "origin_signal": "",
+         "outcome_note": "re-opened: this successor was wrongly swept"}
+    assert mod._successor_scope_guard(g) is None
+
+
+# ---------------------------------------------------------------------------
+# MERGE NOTE (2026-08-14, cc-08). The two blocks below are the SAME guard's
+# suites, written independently on two Bodies ( and ) from
+# the same live instance. BOTH are kept: the implementations were unified into
+# _successor_marker_guard and _successor_scope_guard is now an alias of it, so
+# every pin below exercises the one surviving function. Deleting either block to
+# "clean up the merge" would discard measured coverage — the g-6223 block owns
+# the multi-field (title/origin_signal) and outcome_note-exclusion pins, the
+# g-6252 block owns the English-false-positive and case-letter-variant pins, and
+# neither is a superset of the other.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+#  — the SUCCESSOR guard. The sweep's premise ("parent terminal =>
+# the Unblock is moot") inverts for a successor, whose whole reason for
+# existing is that the parent completed leaving residual scope.
+#
+# All six records below are the LIVE shapes measured on 2026-08-14 (alpha,
+# hostname cc-07), not invented fixtures.
+# ---------------------------------------------------------------------------
+
+# The real record, verbatim in the fields the guards read.
+_G350215 = {
+    "id": "g-350-215",
+    "title": ("Unblock: provision the DEV-place host infra the carved GameSystem "
+              "tree requires to load (ReplicaServer, PlayerProfiles, ProfileStore, "
+              "Signal, Types, Utils.Net, AyoTypes)"),
+    "status": "pending",
+    "created_at": "2026-08-14T03:35:05",
+    "origin_signal": ("unblock: g-350-202 require rewrite (PR #6) delivers tree "
+                      "self-consistency but load in DEV needs host infra measured "
+                      "absent (foxtrot probe 2026-08-14)"),
+    "description": ("FILED BY alpha WORKER BODY ON cc-08 (case A - successor "
+                    "preserving g-350-202 sanctioned scope: that goal's product "
+                    "outcome is 'the carved tree LOADS in DEV')"),
+}
+_G350202_DONE = {"g-350-202": "2026-08-14T07:40:03"}
+
+
+def test_g115_6252_successor_marker_guards_the_live_case_a_shape():
+    """The canonical instance.  declares itself a successor in its
+    own description and was nonetheless marked with the sweep's note
+    "parent resolved without action needed (parent_id=g-350-202,
+    parent.status=completed)" — a record that contradicts itself on its face.
+    """
+    mod = _import_sweep()
+    # The parent link resolves (so the goal genuinely reaches the guards).
+    assert mod._parse_parent_id(_G350215) == "g-350-202"
+    reason = mod._successor_marker_guard(_G350215)
+    assert reason is not None
+    assert "SUCCESSOR" in reason
+    assert "g-115-6252" in reason
+
+
+def test_g115_6252_temporal_guard_reads_the_successor_shape_backwards():
+    """THE LOAD-BEARING PIN — why this is a SECOND guard, not a tuning.
+
+    `_provenance_fp_guard` asks whether the Unblock was created AT/AFTER the
+    parent completed. A successor is filed DURING the parent's close, hours
+    BEFORE the completion stamp lands, so that guard clears the sweep with the
+    reason "genuine wait: Unblock long predates parent completion". Measured
+    lead on the live pair: 07:40:03 - 03:35:05 = 14698s against
+    CLOSE_SEQUENCE_WINDOW_S=900.
+
+    The guard therefore grows MORE confident the longer the parent took —
+    exactly inverted. If someone later merges the two guards or widens
+    CLOSE_SEQUENCE_WINDOW_S to "cover this case", this test fails and says why.
+    """
+    mod = _import_sweep()
+    assert mod._provenance_fp_guard(_G350215, "g-350-202", _G350202_DONE) is None
+    lead = (mod._parse_ts(_G350202_DONE["g-350-202"])
+            - mod._parse_ts(_G350215["created_at"])).total_seconds()
+    assert lead > mod.CLOSE_SEQUENCE_WINDOW_S
+    # ...and the successor guard is what actually catches it.
+    assert mod._successor_marker_guard(_G350215) is not None
+
+
+def test_g115_6252_second_live_instance_uses_different_wording():
+    """, the OTHER real successor in the live Unblock population,
+    writes "worker-loop ruling Case A" — capital C. A predicate anchored on
+    lowercase `case` alone misses it, which is how it first escaped."""
+    mod = _import_sweep()
+    g = {
+        "id": "g-115-6161",
+        "title": ("Unblock: grant lambda:UpdateFunctionConfiguration on "
+                  "RotateAPIKey+RevokeAPIKey to ayoai-fleet-agent"),
+        "status": "pending",
+        "description": ("Filed by alpha worker Body on cc-07 (worker-loop ruling "
+                        "Case A — carries the unfinished IAM leg of "
+                        "g-115-6080/g-115-6078)."),
+    }
+    assert mod._successor_marker_guard(g) is not None
+
+
+def test_g115_6252_uppercase_a_is_the_discriminator_against_english():
+    """`case a` is ordinary English and appears throughout goal descriptions —
+    "in which case a", "worst case a", "special-case a single filename".
+    Measured: case-insensitive matching pulled 7 such English hits into a
+    45-hit whole-population set. The uppercase A is what separates the
+    ruling's case letter from the article. Do not "tidy" this to IGNORECASE.
+    """
+    mod = _import_sweep()
+    for english in (
+        "Either (a) it is load-bearing, in which case a 13% population rate is "
+        "the defect and the close path should require it.",
+        "This cannot introduce a false positive — worst case a genuinely-stale "
+        "refusal re-surfaces late.",
+        "Do NOT special-case a single filename — the registry scope is the "
+        "finding.",
+    ):
+        g = {"id": "g-x", "title": "Unblock: something", "description": english}
+        assert mod._successor_marker_guard(g) is None, english[:48]
+
+
+def test_g115_6252_case_letter_variants_all_match():
+    """The ruling marker is written case/Case/CASE across the live corpus; only
+    the `A` is pinned, so all three spellings must reach the guard."""
+    mod = _import_sweep()
+    for spelling in ("case A", "Case A", "CASE A"):
+        g = {"id": "g-x", "title": "Unblock: x",
+             "description": f"Filed by alpha worker Body on cc-07 ({spelling} "
+                            f"under the g-306-250 ruling)."}
+        assert mod._successor_marker_guard(g) is not None, spelling
+
+
+def test_g115_6252_ordinary_blocked_unblock_still_sweeps():
+    """RECALL CONTROL — the guard must not quietly turn the sweep into a no-op.
+
+    Measured on the live corpus: 2 of 32 Unblock-titled non-terminal goals carry
+    a successor marker, so 30 of 32 stay sweepable. These are real titles from
+    that unflagged 30.
+    """
+    mod = _import_sweep()
+    for gid, desc in (
+        ("g-115-5799", "Reap the two wedged stdin-writer processes on cc-03 "
+                       "(pids 660157, 3102967) — cross-box, needs the owner."),
+        ("g-335-944", "Merge PR #130 (g-335-936 PDF font-embedding assertion) — "
+                      "blocked only by a GitHub required-check that never ran."),
+        ("g-328-36", "Run own-cloud bootstrap pull on the affected Windows box — "
+                     "heal the 5-file knowledge gap."),
+    ):
+        g = {"id": gid, "title": "Unblock: x", "description": desc}
+        assert mod._successor_marker_guard(g) is None, gid
+
+
+def test_g115_6252_each_secondary_token_is_independently_pinned():
+    """Every token in the union carries its own pin, or it is not protected.
+
+    Found by mutation-testing the pins themselves: deleting `\\bsuccessor\\b`
+    from the pattern turned ZERO tests red, because on the current corpus every
+    real successor also carries the ruling's case letter — so the token buys no
+    measurable recall TODAY and reads as removable. It is not: the case letter
+    exists only because the worker-loop g-306-250 ruling obliges a WORKER to
+    stamp it (see _successor_marker_guard's KNOWN LIMIT), while these three are
+    the natural-language forms a REDUCER-filed successor would use, and the
+    reducer is exactly the filer the case-letter marker cannot reach.
+
+    An unpinned token in a guard is indistinguishable from dead weight the next
+    reader should delete. This test is what makes that judgement explicit rather
+    than leaving it to a mutation run nobody will repeat.
+    """
+    mod = _import_sweep()
+    for token, sentence in (
+        ("successor",
+         "This is the successor of g-350-202, carrying what that goal did not "
+         "finish."),
+        ("unfinished remainder",
+         "Filed while closing g-350-202 — this is the unfinished remainder of "
+         "that goal."),
+        ("sanctioned scope",
+         "Preserves the sanctioned scope of g-350-202; not new agenda."),
+    ):
+        g = {"id": "g-x", "title": "Unblock: x", "description": sentence}
+        assert mod._successor_marker_guard(g) is not None, token
+        # ...and the sentence carries NO case letter, so the pin fails if the
+        # token is deleted rather than passing via a different branch.
+        assert "case A" not in sentence and "Case A" not in sentence
+
+
+def test_g115_6252_missing_description_does_not_crash():
+    """A goal with no description must return None, not raise — the sweep runs
+    unattended from aspirations-precheck --apply."""
+    mod = _import_sweep()
+    assert mod._successor_marker_guard({"id": "g-x", "title": "Unblock: x"}) is None
+    assert mod._successor_marker_guard(
+        {"id": "g-x", "title": "Unblock: x", "description": None}) is None
+
+
+# ── the marker must NOT fire on ordinary English (, 2026-08-15) ─────
+# The suite above pins that each marker word FIRES. Nothing pinned the other
+# half, and that is exactly where the defect lived: a bare `[Rr]emainder` branch
+# matched ordinary prose in 3 of 3 live instances hand-checked and ZERO genuine
+# successors. A hit here makes an ORDINARY Unblock permanently undischargeable —
+# the  under-discharge direction, introduced by the fix for the
+# opposite one, exactly as 's description predicted ("a fix that only
+# narrows it makes  worse").
+
+def test_successor_guard_does_not_fire_on_ordinary_english_remainder():
+    mod = _import_sweep()
+    # All three verbatim from live goal descriptions on 2026-08-15.
+    for gid, prose in (
+        ("g-115-4212", "it will read fresh for the entire remainder of the day "
+                       "no matter how many adds land"),
+        ("g-115-4216", "g-115-4166 closed the literal asp-115 write sites (25 -> 1, "
+                       "the remainder being cross-world-inject-goal.sh:109)"),
+    ):
+        g = {"title": "Unblock: x for g-1-1", "description": prose, "origin_signal": ""}
+        assert mod._successor_scope_guard(g) is None, (
+            f"{gid}: ordinary-English 'remainder' must not read as a successor marker")
+
+
+def test_successor_remainder_still_fires_when_it_names_its_object():
+    """The narrowing kept the author's intent from 's own fixture — the
+    successor sense of 'remainder' is always OF something. Requiring the object is
+    the entire difference from the retired bare token."""
+    mod = _import_sweep()
+    for prose in ("carries the remainder of the parent's outcome",
+                  "picks up the remainder of g-350-202's sanctioned scope",
+                  "the unfinished remainder of that work"):
+        g = {"title": "Unblock: x for g-1-1", "description": prose, "origin_signal": ""}
+        assert mod._successor_scope_guard(g) is not None, prose
+
+
+def test_the_two_hand_verified_successors_still_match_on_case_letter():
+    """Both real successors on the live corpus match `[Cc]ase A`, not `remainder`.
+    That is WHY retiring the bare token cost no coverage — pinned so a future
+    'tidy' of the case-letter branch cannot quietly remove the only token that
+    actually protects them."""
+    mod = _import_sweep()
+    g = {"title": "Unblock: provision the DEV-place host infra",
+         "description": "FILED BY alpha WORKER BODY ON cc-08 (case A - successor "
+                        "preserving g-350-202 sanctioned scope: ...)",
+         "origin_signal": ""}
+    reason = mod._successor_scope_guard(g)
+    assert reason is not None and "case A" in reason
+
+
+def test_bare_remainder_branch_stays_retired():
+    """Mutation guard. The retired branch is invisible to the behavioural tests
+    above once it is gone, so pin the pattern itself — re-adding `|\\b[Rr]emainder\\b`
+    would make all three assertions above pass ONLY because the narrowed branch
+    also matches, and the regression would ship green."""
+    mod = _import_sweep()
+    assert r"\b[Rr]emainder\b" not in mod.SUCCESSOR_MARKER_PATTERN.pattern
+    assert r"[Rr]emainder of (?:the parent|g-\d)" in mod.SUCCESSOR_MARKER_PATTERN.pattern

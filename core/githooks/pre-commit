@@ -174,3 +174,27 @@ _gate check-no-ownership-flag bash "$REPO/core/scripts/check-no-ownership-flag.s
 # Companion authoring-time layer: bare-bash-authoring-gate.sh (PreToolUse[Bash])
 # covers the ad-hoc `py -3 -c` surface this gate structurally cannot reach.
 _gate check-no-bare-bash $PY "$REPO/core/scripts/check-no-bare-bash.py"
+
+# Gate 13: exec bit on staged core/scripts *.sh (g-115-6640, 2026-08-18).
+# A *.sh committed at mode 100644 is NOT executable on a Linux checkout, so
+# every DIRECT-EXEC chain through it (`exec "$DIR/foo.sh"`, `./foo.sh`) dies
+# with 'Permission denied' — while `bash foo.sh` callers keep working, which is
+# why g-115-1901 hid until an exec-chain hit it on echo's boot.
+#
+# check-sh-exec-bits.sh already existed for this and had NO CALLER — its only
+# registration was a line in core/config/verification-checklist.md, the 2000+
+# item catalog that verify-learning's own Step 3 declares "too large to load in
+# one context window". It was cited but unreachable, so the normalization it
+# guards could regress silently. (Same shape as the routing-is-not-reachability
+# finding: naming a recipient is not delivering to one.)
+#
+# --staged checks the INDEX mode, not the filesystem, and that difference is
+# the reason this gate can work at all: on a clone with core.filemode=false —
+# git's default on Windows, and this repo was authored there — a `chmod +x`
+# never reaches the index, so a filesystem check passes on the very box that
+# introduces the defect. Scoped to staged files (Gate 1/7/12 precedent), so it
+# refuses NEW introductions and never blocks an unrelated commit. Verified
+# against five cases: 100644 add REFUSED, 100755 add allowed, nothing-staged
+# allowed, staged DELETION allowed (no mode to gate), and a rename INTO
+# core/scripts at 100644 REFUSED.
+_gate check-sh-exec-bits bash "$REPO/core/scripts/check-sh-exec-bits.sh" --staged

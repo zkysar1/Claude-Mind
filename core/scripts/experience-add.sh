@@ -23,7 +23,17 @@ SCHEMA=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --schema) SCHEMA=1; shift;;
-        *) shift;;
+        --help|-h)
+            # A stdin-body reader HANGS on --help without this branch (guard-3145).
+            echo "Usage: bash $0 < record.json   — the record is JSON on STDIN; there are NO field flags." >&2
+            echo "Canonical form: core/config/conventions/stdin-json-inputs.md" >&2
+            exit 0;;
+        *)
+            # Was `*) shift;;` — silently discarded flags, then blocked forever in
+            # BODY="$(cat)" wherever stdin never delivers EOF ().
+            echo "Error: '$1' is not a CLI flag for this script — the record goes in the JSON body via stdin." >&2
+            echo "Run: bash $0 --help" >&2
+            exit 2;;
     esac
 done
 

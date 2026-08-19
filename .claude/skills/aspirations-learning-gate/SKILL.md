@@ -200,8 +200,20 @@ Verify Phase 4.25 experience archival completed for non-routine outcomes.
 
 ```
 IF outcome_class == "deep":
-    Bash: wm-read.sh active_context.experience_refs --json
-    IF experience_refs is empty, missing, or null:
+    # ASK THE STORE, NOT THE POINTER (g-115-4876). This gate used to read
+    # active_context.experience_refs and pass on "not empty/missing/null".
+    # That predicate is GOAL-AGNOSTIC — it never compared the stored refs
+    # against THIS goal — so any non-empty leftover passed it forever.
+    # Measured: cc-03 passed on a ref 3 days stale from an unrelated goal,
+    # cc-05 on one 11 days stale. The WM pointer is a cache of the last
+    # writer's intent; the experience STORE is the thing the gate is
+    # actually asserting about, and it is keyed BY goal.
+    Bash: experience-read.sh --goal {goal.id}
+    # rc is NOT the discriminator — measured, BOTH a hit and a miss return
+    # rc=0 (a miss returns the empty array `[]`). A gate keying on rc would
+    # pass unconditionally, which is this same defect in a new costume.
+    # Branch on the returned ARRAY being empty.
+    IF the returned array is empty:
         Output: "▸ EXPERIENCE GATE CATCH: Phase 4.25 skipped for {goal.id} — writing recovery record"
         experience_id = "exp-{goal.id}-recovery"
         Write agents/<agent>/experience/{experience_id}.md with:

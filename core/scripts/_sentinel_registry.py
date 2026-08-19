@@ -36,10 +36,38 @@ SENTINELS: list[dict] = [
         "dispatch_slot": "force_tree_maintain_last_dispatch",
         "canary_tracked": True,
     },
+    # The "run experience-read.sh FIRST" clause is guard-2939 delivered at the
+    # moment of use, and it is here because delivery — not encoding — is what was
+    # missing. That guardrail describes this exact failure precisely (recurring
+    # goal, cycle N>1, bare `exp-<goal-id>` id and path both already taken by
+    # cycle 1) and had utilization times_active=32 / times_helpful=0 when bravo
+    # reproduced it on 2026-08-14 (cc-05, ): Write clobbered a real
+    # 5,318-byte experience file and returned "has been updated successfully",
+    # which reads as success. Only the store's `duplicate_id` refusal surfaced it,
+    # and that is luck — an id that happened to be unique against a colliding
+    # content_path destroys the file and reports total success.
+    #
+    # 32 activations with 0 credits is the signature of a guardrail that MATCHES
+    # but never REACHES anyone (guard-1984: a guardrail cannot outvote the
+    # instrument it guards; guard-2462: fix the instrument, not the prose). This
+    # dispatch line is the instrument — it is what an agent reads immediately
+    # before composing the record.
+    #
+    # It names the COMMAND and the guard ID deliberately, and does NOT paraphrase
+    # guard-2939's content: per guard-2494 a verbatim quote of an amendable
+    # upstream field is a snapshot that decays. The wrapper API and the id are
+    # stable; the guardrail's wording is not.
     {
         "slot": "force_experience_archival",
         "phase": "0-pre2",
-        "skill_section": "aspirations-precheck Phase 0-pre2 (Experience Archival Gate; compose + experience-add.sh)",
+        "skill_section": (
+            "aspirations-precheck Phase 0-pre2 (Experience Archival Gate; compose + experience-add.sh"
+            " — FIRST run `bash core/scripts/experience-read.sh --goal <goal-id>`: if it returns any"
+            " record, this goal already has one, so the bare `exp-<goal-id>` id AND"
+            " `agents/<agent>/experience/exp-<goal-id>.md` path are BOTH taken and Write will"
+            " silently overwrite the existing file while reporting success. Use a unique slug."
+            " See guard-2939)"
+        ),
         "fired_key": False,
         "dispatch_slot": None,
         "canary_tracked": False,
