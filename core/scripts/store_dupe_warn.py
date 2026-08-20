@@ -86,21 +86,39 @@ STORES = {
         "filename": "guardrails.jsonl",
         "fields": ("rule",),
         "threshold": 0.45,
+        "refuse_threshold": 0.75,
         "label": "guardrail",
     },
     "reasoning-bank": {
         "filename": "reasoning-bank.jsonl",
         "fields": ("title",),
         "threshold": 0.55,
+        "refuse_threshold": 0.75,
         "label": "reasoning-bank entry",
     },
     "pattern-signatures": {
         "filename": "pattern-signatures.jsonl",
         "fields": ("name", "description"),
         "threshold": 0.55,
+        "refuse_threshold": 0.75,
         "label": "pattern signature",
     },
 }
+
+# refuse_threshold (g-115-6948): the ENFORCEMENT tier above the advisory
+# `threshold`. Past it the daemon append REFUSES with a pointer to the existing
+# entry (409 near_duplicate; body field allow_near_dup:true / wrapper
+# --allow-near-dup bypasses). Calibrated from the full gate-firings history
+# 2026-08-20 (n=6,550 invocations across the fleet): the nearest-neighbour
+# similarity of every add that was NOT warned maxes at 0.500 (p99 0.294), while
+# 20 of the 26 warned adds were verbatim twins at exactly 1.0 (guard-4090
+# measured two of them landing anyway — the advisory tier cannot stop what it
+# warns about). 0.75 sits 0.25 above the highest legitimate-add collision ever
+# measured and 0.25 below the twin cluster: on the full history it refuses 22
+# of 26 warned adds and zero of the ~6,500 clean ones. The reworded-duplicate
+# class (guard-1486-vs-1485, jaccard 0.112) stays out of reach of ANY lexical
+# threshold — that class belongs to the recurring near-dup consolidation
+# review, not this gate.
 
 # Records in these states are not live knowledge; warning about them is noise.
 _INACTIVE_STATUSES = {"retired", "superseded", "archived"}
@@ -230,6 +248,47 @@ def check(record: dict, store: str, corpus: Optional[List[Tuple[str, str]]] = No
     _mark("pass", corpus_size=len(corpus), nearest_id=near_id,
           similarity=round(sim, 4), threshold=cfg["threshold"])
     return format_warning(store, cfg["label"], near_id, sim, cfg["threshold"], near_text)
+
+
+def refuse_check(record: dict, store: str,
+                 corpus: List[Tuple[str, str]]) -> Optional[dict]:
+    """ENFORCEMENT-tier check (g-115-6948): dict verdict when `record` crosses
+    the store's refuse_threshold against `corpus`, else None.
+
+    PURE — corpus is required (the daemon caller already holds the store's
+    items via its jsonl cache; re-reading the file here would double the I/O
+    and race the cache). Raises nothing on its own inputs by construction:
+    any internal surprise is the CALLER's fail-open responsibility (rb-605 —
+    anticipation gates fail open; store.py wraps this call in a broad except).
+
+    Returns {"nearest_id", "similarity", "refuse_threshold", "nearest_text"}
+    — the caller-verifiable evidence guard-1661 requires a governed-store
+    refusal to carry.
+    """
+    cfg = STORES.get(store)
+    if cfg is None:
+        return None
+    thr = cfg.get("refuse_threshold")
+    if not thr:
+        return None
+    candidate = signal_text(record, cfg["fields"])
+    if not candidate:
+        return None
+    import mdl_gate
+    cand_id = str(record.get("id") or "")
+    if cand_id:
+        corpus = [(i, t) for i, t in corpus if i != cand_id]
+    if not corpus:
+        return None
+    near_id, sim, near_text = mdl_gate.nearest(candidate, corpus)
+    if near_id is None or sim < thr:
+        return None
+    return {
+        "nearest_id": near_id,
+        "similarity": round(sim, 4),
+        "refuse_threshold": thr,
+        "nearest_text": " ".join(near_text.split())[:160],
+    }
 
 
 # Its OWN gate id — deliberately not routed through mdl_gate.run_assess to inherit

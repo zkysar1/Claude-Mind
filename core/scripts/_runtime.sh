@@ -875,6 +875,22 @@ rt_curl() {
     # DNS failure, timeout). $() strips trailing newlines, so the marker is
     # the reliable splitter — but only if it's present.
     if [ $curl_rc -ne 0 ] || [[ "$result" != *"${RT_MARKER}"* ]]; then
+        if [ "$curl_rc" -eq 3 ]; then
+            # curl rc=3 = URL MALFORMED — deterministic and LOCAL: the request
+            # was never sent, so this is not "daemon unreachable" and neither
+            # retry nor respawn can change the outcome (/guard-4418:
+            # a justification sentence mis-bound to the agent-name positional
+            # put spaces into a query param; the rc=3 was mapped to return 3,
+            # rt_call respawned and retried, the wrapper burned the full
+            # RT_CURL_TIMEOUT window, and rt_no_daemon_error then blamed
+            # warmup/contention — the wrong tree, six times in one morning).
+            # Return 2 (hard error, body-on-stderr contract) so no caller
+            # retries a deterministic failure.
+            echo "rt_curl: curl exit 3 (URL malformed) — request NEVER SENT: $url" >&2
+            echo "  Likely cause: illegal characters (e.g. spaces) in a query or path segment —" >&2
+            echo "  often a flag value or justification mis-bound to a positional argument." >&2
+            return 2
+        fi
         return 3
     fi
 

@@ -289,11 +289,19 @@ def test_load_rb_entry_type_no_matches_returns_empty():
     assert universal == []
 
 
-def test_bump_set_with_entry_type_filter_excludes_nonprocedure():
+def test_bump_set_with_entry_type_filter_excludes_nonprocedure(monkeypatch):
     """The bump-set==return-set invariant holds UNDER the entry_type filter:
     counter-bump fires ONLY on returned (procedure) entries; ordinary entries —
     even category-matching ones — keep their pre-call retrieval_count (the filter
     runs BEFORE the bump, so non-procedure counters are never polluted)."""
+    #  lane pin: this test verifies the invariant through the LEGACY
+    # evidence channel (embedded store counters). With
+    # UTILIZATION_COUNTERS_SPOOLED on, the bump spool-routes and the embedded
+    # copy deliberately stays untouched — the spool-lane version of the same
+    # invariant is pinned in test_utilization_spool.py
+    # (test_retrieve_bump_only_matched_records_spool). The legacy lane stays
+    # live for flag-off boxes and the failed-spool fallback.
+    monkeypatch.delenv("UTILIZATION_COUNTERS_SPOOLED", raising=False)
     p = Path(_TMPDIR) / "reasoning-bank.jsonl"
     procs = [_make_rb(f"rb-p-{i:02d}", "x", score=i * 0.001, entry_type="procedure")
              for i in range(5)]
@@ -389,7 +397,7 @@ def test_load_pattern_signatures_filters_and_sorts():
 # Counter-bump invariance — most important regression check
 # ---------------------------------------------------------------------------
 
-def test_bump_set_equals_return_set():
+def test_bump_set_equals_return_set(monkeypatch):
     """Bumps fire ONLY on records actually returned (post-filter, post-sort,
     post-cap). This is the utility_ratio alignment invariant: helpful++ in
     utilization-feedback.py increment_supplementary targets
@@ -403,6 +411,8 @@ def test_bump_set_equals_return_set():
     on-disk state: rc bumped on exactly the 20 returned IDs. The 40
     matching-but-cap-rejected records keep their pre-call rc.
     """
+    #  lane pin — see test_bump_set_with_entry_type_filter above.
+    monkeypatch.delenv("UTILIZATION_COUNTERS_SPOOLED", raising=False)
     p = Path(_TMPDIR) / "reasoning-bank.jsonl"
     # Score from 0.0 to 0.059 — top-20 by score will be rb-m-040 .. rb-m-059
     matching = [_make_rb(f"rb-m-{i:03d}", "x", score=i * 0.001) for i in range(60)]

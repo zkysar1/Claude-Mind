@@ -4487,6 +4487,14 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     "productivity-snapshots.jsonl": merge_append_only_jsonl,
     "gate-firings.jsonl": merge_append_only_jsonl,
     "trigger-firings.jsonl": merge_append_only_jsonl,
+    # citation-credit dedup ledger (): multi-writer — every box's
+    # reducer sweeps its local HEAD and claims commits here, so unregistered
+    # it would safe-freeze on the first both-diverged conflict (rb-3150 class)
+    # and cross-box dedup would silently decay into double-crediting.
+    # Append-only VERIFIED per guard-1816's standard: exactly one writer
+    # (citation-credit-sweep.py, locked_append_jsonl claim-first rows) and no
+    # prune/trim/rotate/rewrite path exists.
+    "citation-credit-ledger.jsonl": merge_append_only_jsonl,
     # per-agent skill-invocation telemetry ledger (-e). Its SIBLING
     # store, the per-date health ledger, cannot appear in this basename-keyed
     # table at all -- see the third path-pattern branch in merge_handler_for.

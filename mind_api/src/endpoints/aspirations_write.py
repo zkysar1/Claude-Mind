@@ -2326,6 +2326,17 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
 
             goal = asp["goals"][goal_idx]
 
+            # : a session whose claim was taken over used to learn
+            # nothing here and keep working. This is the earliest point at
+            # which the displaced Body reliably touches the daemon, so it is
+            # where it finds out. Appended to `warnings` (not printed) because
+            # daemon stderr goes to the daemon log while the wrapper re-emits
+            # resp["warnings"] to the caller's stderr -- the reachability the
+            # stderr-only take-over log never had.
+            _disp = _displaced_claim_warning(ctx, goal, goal_id)
+            if _disp:
+                warnings.append(_disp)
+
             # Prose-verification-drift on description / verification edits
             # (): the add path validates via _assert_no_prose_drift,
             # but the description / verification edit path does not — catch
@@ -4788,6 +4799,74 @@ def _audit_stale_claim_takeback_inline(ctx, *, goal_id: str,
               f"failed: {e}", file=sys.stderr)
 
 
+def _audit_cross_session_takeover_inline(ctx, *, goal_id: str,
+                                         agent_name: str,
+                                         holder_sid: str,
+                                         claim_sid: str,
+                                         category: Optional[str] = None,
+                                         title: Optional[str] = None) -> None:
+    """Log a same-agent cross-session take-over to override-bypass-ledger.jsonl.
+
+    g-306-329. The take-over was ALREADY logged before this existed — with
+    print(file=sys.stderr), from inside the daemon, which no session can read.
+    So two things were true at once: the code's own comment claimed the event
+    "must leave a trace", and the trace reached nobody. The displaced Body
+    learned nothing (measured 2026-08-19: the loser found out at commit-gate
+    time, 34 minutes later), and the take-over rate was unmeasurable, so nobody
+    could tell whether g-306-328 had reduced it.
+
+    THIS IS THE AUDIT HALF ONLY, AND SHIPPING IT ALONE IS DELIBERATE. g-306-329
+    forbids closing the reader-side question by adding a durable field with no
+    consumer. This one has a consumer that already exists: the ledger is
+    registered merge-append-only in coordination_merge.py, so records from every
+    box accumulate rather than colliding, and the established read is a grep by
+    gate tag (the same shape hot-path-size-budget.md documents for its own gate):
+
+        grep -c '"gate": "claim-cross-session-takeover"' \\
+            "$WORLD_PATH/override-bypass-ledger.jsonl"
+
+    NOTIFYING the displaced session is a separate and much harder problem — no
+    channel exists that a worker polls mid-unit (it reads no board between claim
+    and close, and its preamble runs only BETWEEN units). That half is NOT
+    solved here and must not be reported as solved.
+
+    A take-over of a DORMANT holder is sanctioned recovery, not a guard bypass,
+    so it carries its own gate tag for filtering — same reasoning as
+    'claim-staleness-takeback' above. Fail-open: a ledger write failure never
+    blocks the claim (warn to stderr only)."""
+    import sys
+    if not goal_id or not holder_sid or not claim_sid:
+        return
+    context = {
+        "goal_id": goal_id,
+        "agent": agent_name,
+        "displaced_sid": holder_sid,
+        "claiming_sid": claim_sid,
+    }
+    if category:
+        context["category"] = category
+    if title:
+        context["title"] = title[:200]
+    record = {
+        "ts": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "override_token": None,
+        "justification": (
+            f"cross-session take-over: dormant sid={holder_sid} -> "
+            f"sid={claim_sid} (agent {agent_name})")[:1000],
+        "gate": "claim-cross-session-takeover",
+        "agent": agent_name or (ctx.paths.agent_name or None),
+        "session_id": claim_sid,
+        "context": context,
+    }
+    try:
+        from _fileops import locked_append_jsonl
+        ledger_path = ctx.paths.world / "override-bypass-ledger.jsonl"
+        locked_append_jsonl(str(ledger_path), record)
+    except Exception as e:
+        print(f"[daemon claim] WARN: cross-session-takeover ledger write "
+              f"failed: {e}", file=sys.stderr)
+
+
 def _cross_box_holder_is_live(ctx, agent_name: str, goal_id: str,
                               stale_minutes: float) -> bool:
     """Is this agent's mind LIVE on ANOTHER box and holding `goal_id`?
@@ -5010,6 +5089,54 @@ def _cross_box_body_is_live(ctx, agent_name: str, holder_sid: str,
     ids, unreadable shard, absent/!dict `in_flight_bodies`, no row for this sid,
     a row naming a different goal, an unparseable or stale `claimed_at` —
     returns False, i.e. permits the claim.
+
+    THE BOOLEAN RETURN IS DELIBERATELY UNCHANGED (g-306-328). The real
+    distinction — POSITIVE evidence the Body is not on this goal, versus NO
+    EVIDENCE EITHER WAY — now lives in `_cross_box_body_liveness` below, whose
+    third state (`None`) is the `unknown` verdict `guard-2223` requires of any
+    predicate that can fail to reach its store. This wrapper collapses `None`
+    back to `False` so the claim decision is byte-identical to before, and
+    emits the distinction as telemetry instead. Rationale for NOT acting on it
+    yet: refusing on unanswered turns a telemetry fault into a failed claim
+    (the `guard-1562` shape), and the two paths that produce a missing row
+    — a body-row write that failed and only WARNed, and a Body with no
+    `MIND_SID` that never attempted one — point at OPPOSITE remedies. Neither
+    is distinguishable from HERE (both arrive as `no_row_for_sid`; separating
+    them needs a writer-side marker), so the distribution is measured first.
+    """
+    verdict, reason = _cross_box_body_liveness(
+        ctx, agent_name, holder_sid, goal_id, stale_minutes)
+    # decision is chosen by the CALLER's observable control-flow effect, per
+    # guard-1743: True refuses the claim (`block`); every other verdict permits
+    # it (`pass`). `fail_open` is reserved for the branch that actually RAISED,
+    # because gate-retirement-eval has an investigate-on-fail_open rule and a
+    # mislabel manufactures HIGH investigations into events that never
+    # happened. The semantic class rides in `extra`, never in `decision`.
+    _log_cross_box_body_liveness(ctx, agent_name=agent_name,
+                                 holder_sid=holder_sid, goal_id=goal_id,
+                                 verdict=verdict, reason=reason)
+    return verdict is True
+
+
+def _cross_box_body_liveness(ctx, agent_name: str, holder_sid: str,
+                             goal_id: str, stale_minutes: float):
+    """Tri-state core of `_cross_box_body_is_live` ().
+
+    Returns `(verdict, reason)`:
+      `(True,  "live")`   — positive confirmation: a fresh row for this SID
+                            names this goal. The caller REFUSES the claim.
+      `(False, reason)`   — POSITIVE evidence this Body is not working this
+                            goal: its row names a DIFFERENT goal, or its row
+                            for this goal has aged past `stale_minutes`.
+      `(None,  reason)`   — UNANSWERED: the store could not be reached, or it
+                            was reached and simply has no row for this SID.
+                            An absent row is NOT evidence of dormancy — the
+                            writer is fail-open by contract
+                            (`coordination.md:1035`: "a failed body-row write
+                            logs a WARN and does NOT fail the claim").
+
+    The `False`/`None` split is the whole point: only the `False` reasons are
+    grounded in something the store actually said.
     """
     # Per-function `import sys`, hoisted ABOVE the try, for the reason spelled
     # out at `_cross_box_holder_is_live`: this module does not import sys at
@@ -5021,7 +5148,7 @@ def _cross_box_body_is_live(ctx, agent_name: str, holder_sid: str,
     import sys
     try:
         if not goal_id or not agent_name or not holder_sid:
-            return False
+            return None, "no_ids"
         scripts_dir = str(ctx.paths.project_root / "core" / "scripts")
         if scripts_dir not in sys.path:
             sys.path.insert(0, scripts_dir)
@@ -5031,31 +5158,81 @@ def _cross_box_body_is_live(ctx, agent_name: str, holder_sid: str,
         # a stale mirror fails the freshness gate below and permits the claim.
         row = read_shard_authoritative(ctx.paths.world, agent_name)
         if not isinstance(row, dict):
-            return False
+            return None, "shard_unreadable"
         bodies = row.get("in_flight_bodies")
         if not isinstance(bodies, dict):
-            return False
+            return None, "no_bodies_map"
         body = bodies.get(str(holder_sid))
         if not isinstance(body, dict):
-            return False
+            # THE STRUCTURAL CASE. Absent row != dormant Body: it is also what
+            # a failed fail-open row write and an absent MIND_SID both look
+            # like from here. Counted, not acted on.
+            return None, "no_row_for_sid"
         if str(body.get("goal_id") or "") != str(goal_id):
-            return False  # that Body is on a DIFFERENT goal -> not evidence
+            return False, "row_other_goal"  # store SAID: on a different goal
         claimed_at = body.get("claimed_at")
         if not claimed_at:
-            return False
+            return None, "no_claimed_at"
         try:
             ca = datetime.strptime(str(claimed_at).strip()[:19],
                                    "%Y-%m-%dT%H:%M:%S")
         except (ValueError, TypeError):
-            return False  # unparseable -> ambiguous -> never refuse
+            return None, "unparseable_claimed_at"
         age_s = (datetime.now() - ca).total_seconds()
-        return age_s <= (float(stale_minutes) * 60.0)
+        if age_s <= (float(stale_minutes) * 60.0):
+            return True, "live"
+        return False, "stale"  # store SAID: this claim has aged out
     except Exception as e:  # noqa: BLE001 — fail-open, but never silently
         print(f"[daemon claim] WARN: cross-box BODY liveness probe for "
               f"{agent_name!r}/{holder_sid!r}/{goal_id!r} failed "
               f"({type(e).__name__}: {e}); treating as not-live",
               file=sys.stderr)
-        return False
+        return None, f"probe_error:{type(e).__name__}: {e}"
+
+
+def _log_cross_box_body_liveness(ctx, *, agent_name: str, holder_sid: str,
+                                 goal_id: str, verdict, reason: str) -> None:
+    """Emit one `cross-box-body-liveness` firing per probe ().
+
+    Why a durable sink and not another `print` to daemon stderr: the defect
+    this instrumentation serves is precisely that a daemon-side observation
+    lands where its audience cannot read it (the `guard-2352` class). Firings
+    go to the CALLING agent's `meta/gate-firings.jsonl` — same `ctx.paths.meta`
+    + `agent_name` override `_gate_log_layer_d` uses, and for the same reason
+    (the module-level `META_DIR` is frozen at daemon startup to whichever
+    agent's `local-paths.conf` was first found).
+
+    ALL FOUR OUTCOMES ARE LOGGED, not just the refusal. A telemetry surface
+    that records only the escape path cannot answer "how often did this
+    predicate have no evidence?" — which is the one question the next decision
+    on `g-306-328` turns on (`guard-2293`).
+    """
+    if verdict is True:
+        decision, klass = "block", "live"
+    elif verdict is False:
+        decision, klass = "pass", "dormant"
+    elif str(reason).startswith("probe_error"):
+        decision, klass = "fail_open", "unanswered"
+    else:
+        decision, klass = "pass", "unanswered"
+    _gate_log.log(
+        "cross-box-body-liveness",
+        decision,
+        trigger_matched=str(reason).split(":", 1)[0],
+        payload=goal_id,
+        gate_error=(str(reason).split(":", 1)[1].strip()
+                    if decision == "fail_open" and ":" in str(reason)
+                    else None),
+        extra={
+            "verdict_class": klass,
+            "reason": reason,
+            "holder_sid": holder_sid,
+            "holder_agent": agent_name,
+            "source": "daemon",
+        },
+        meta_dir=ctx.paths.meta,
+        agent_name=ctx.paths.agent_name or None,
+    )
 
 
 def _holder_session_is_live_runner(ctx, agent_name: str,
@@ -5350,6 +5527,85 @@ def _completed_by_sid(ctx, goal: dict) -> Optional[str]:
     process IS the session. Same asymmetry as `completed_by` (g-115-1562).
     """
     return (ctx.query.get("sid") or "").strip() or goal.get("claimed_by_sid")
+
+
+def _displaced_claim_warning(ctx, goal: dict, goal_id: str) -> Optional[str]:
+    """Tell a session AT ITS NEXT WRITE that its own claim was taken over.
+
+    g-306-329, the notify half. Its sibling `_nonholder_claim_warning` below
+    warns the INTRUDER ("you are acting on a goal someone else holds"). Nothing
+    warned the DISPLACED party, so a Body whose claim was taken kept working and
+    found out at commit-gate time -- measured 2026-08-19, 34 minutes later.
+
+    WHY THE SIBLING DOES NOT ALREADY COVER THIS, which is the whole reason this
+    function exists rather than a flag on that one. Its same-agent branch returns
+    None unless `_holder_session_is_live_runner(...)` is True. A worker Body is
+    NOT its agent's autonomous runner, so when a worker takes the claim the
+    sibling goes quiet for the very session that just lost it. That is the same
+    conditional-on-runner logic rb-8513 found in the claim path ("exclusivity is
+    CONDITIONAL, the takeover is SANCTIONED"), reaching one layer further than
+    anyone had noticed.
+
+    That gate is RIGHT for the sibling and WRONG here, and the asymmetry is the
+    design: the sibling stays quiet for a dormant holder because releasing a dead
+    session's claim is ordinary cleanup and the recovery sweeps must never be
+    nagged. But the fact THIS function reports -- "your claim is gone" -- is true
+    regardless of who holds it now or whether they are live, so gating it on the
+    new holder's liveness suppresses it exactly when a worker did the taking.
+
+    PURE BY CONTRACT: reads only the goal dict already in hand. No liveness
+    probe, no I/O, no network. That is what makes it safe to call on the hot
+    update_goal path, where the sibling (which probes) deliberately is not.
+
+    ABSENCE-SAFE (guard-4500): returns None whenever either sid is missing. A
+    fail-open writer means `claimed_by_sid` is absent both when there is no
+    claiming session AND when a legacy caller sent none, and those are the same
+    read here -- so absence must never be reported as displacement. WARN-ONLY,
+    never a refusal: it reports a fact the caller needs, and a wrong warning
+    costs a confused reader while a wrong refusal would wedge live work.
+
+    THE MESSAGE ADDRESSES TWO AUDIENCES ON PURPOSE, AND THAT IS WHY IT DOES NOT
+    LEAD WITH "your claim was taken". This condition -- caller sid != holder sid
+    -- is reached by two different callers and the goal record cannot tell them
+    apart: a genuinely displaced executor, and a legitimate out-of-band writer
+    that never held the claim. stranded-claim-sweep.py POSTs update-goal to set
+    status=pending when clearing a dead session's claim (and
+    parent-supersession-sweep / routing-audit-target-status-sweep write
+    similarly), so an unconditional "YOUR CLAIM IS GONE" would assert
+    displacement to a sweep that was never displaced -- a false statement, and
+    exactly the nagging the sibling's docstring warns recovery paths must not
+    get. So the headline states only the OBSERVED fact (ownership mismatch) and
+    the displacement reading is offered conditionally, with the sweep case named
+    as expected. If you ever want the unconditional wording, you need the
+    displaced identity from a source that records it -- the
+    claim-cross-session-takeover ledger rows carry `displaced_sid` -- not from
+    this dict.
+    """
+    try:
+        caller_sid = (ctx.query.get("sid") or "").strip() or None
+        holder_sid = goal.get("claimed_by_sid")
+        holder = goal.get("claimed_by")
+        if not caller_sid or not holder_sid or not holder:
+            return None
+        if holder_sid == caller_sid:
+            return None            # caller still holds it -- nothing to say
+        if holder != _agent_name(ctx):
+            return None            # cross-agent is the sibling's branch
+        return (f"CLAIM-OWNERSHIP MISMATCH on {goal_id}: this write came from "
+                f"sid={caller_sid}, but the claim is held by sid={holder_sid} "
+                f"(same agent {holder}, claimed_at={goal.get('claimed_at')}). "
+                f"The write was APPLIED (warn-only). "
+                f"IF YOU WERE EXECUTING THIS GOAL you have been DISPLACED by a "
+                f"cross-session take-over: another session is working it now, "
+                f"so stop executing on the assumption you own it -- duplicated "
+                f"side effects are the cost. Confirm with: grep "
+                f"'\"gate\": \"claim-cross-session-takeover\"' "
+                f"world/override-bypass-ledger.jsonl. "
+                f"IF YOU ARE A RECOVERY SWEEP or other out-of-band writer "
+                f"(stranded-claim-sweep, parent-supersession-sweep, ...), this "
+                f"is EXPECTED and needs no action (g-306-329).")
+    except Exception:
+        return None
 
 
 def _nonholder_claim_warning(ctx, goal: dict, goal_id: str,
@@ -5840,6 +6096,17 @@ def claim(ctx) -> "Response":  # type: ignore[name-defined]
                           f"{goal_id}: dormant sid={holder_sid} -> "
                           f"sid={claim_sid} (agent {agent_name})",
                           file=_sys.stderr)
+                    # : the line above is written INSIDE the daemon,
+                    # so the displaced session cannot read it and the event was
+                    # invisible to audit. Emit the same fact durably, to the
+                    # ledger four sibling claim-events already use. This makes
+                    # take-overs COUNTABLE; it does not notify the loser, which
+                    # is the separate half  leaves open.
+                    _audit_cross_session_takeover_inline(
+                        ctx, goal_id=goal_id, agent_name=agent_name,
+                        holder_sid=holder_sid, claim_sid=claim_sid,
+                        category=goal.get("category"),
+                        title=goal.get("title"))
                     claim_summary = (f"claim {goal_id} (cross-session "
                                      f"take-over from dormant {holder_sid})")
 

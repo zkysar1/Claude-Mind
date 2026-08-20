@@ -76,8 +76,9 @@ means anything (.claude/rules/run-full-suite-after-deep-code.md):
    the VERDICT line itself. Redirect to a file OUTSIDE any synced tree, then
    Read it.
 5. `VERDICT: CLEAN` SCOPES TO THE CHUNKED PYTEST HALF ONLY. Also grep `^FAIL`
-   for the invisible (main()-style + shell) suites, and note `mind_api/tests`
-   is DEFERRED -- a green full-suite run is not evidence about `mind_api/src`.
+   for the invisible (main()-style + shell) suites and the domain half --
+   each half reports separately and none may ride under the chunked verdict.
+   (mind_api/tests folded into the chunked pool 2026-08-20, g-115-6942.)
 
 On an own-cloud box `STORAGE_BACKEND=local` is MANDATORY for any test runner,
 including bash aggregators and direct `python3 test_*.py` (guard-955): a

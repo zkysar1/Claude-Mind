@@ -264,6 +264,44 @@ def _goal_id_is_terminal(goal_id):
     return False
 
 
+def _body_role():
+    """`worker` | `reducer` | `unknown` — which Body this retrieval is FOR.
+
+    DERIVED INLINE rather than imported from `worker_retrospective.body_role`,
+    which is a documented convention and not laziness: that function's own
+    docstring records the same predicate as "derived independently at
+    journal-append.sh, stop-hook.sh, post-recovery-edit-gate.py,
+    worker_reducer_liveness and reducer_self_fence — DELIBERATELY NOT SHARED, so
+    no module can quietly change another's meaning of 'which Body is this'".
+    This is the sixth site. Two further reasons specific to HERE:
+
+      * CONTEXT (guard-2485). `body_role()` resolves the agent dir through
+        `agent_dir(agent)`. Inside the daemon that is WRONG: the endpoint swaps
+        `_r.AGENT_DIR` per request under its lock, so the requesting agent's dir
+        is the module global — not whatever `agent_dir()` derives from process
+        state. Reading AGENT_DIR is the only form that is correct on both the
+        CLI and the daemon path.
+      * SIGNATURE. `body_role()` defaults its sid from `os.environ["MIND_SID"]`
+        and the daemon process env holds the DAEMON's sid, not the caller's.
+        The endpoint now swaps MIND_SID from the `x-ayoai-sid` header exactly
+        as Decision #58 already swaps MIND_AGENT for this very function; that
+        swap is what makes the env read correct here.
+
+    Three-way ON PURPOSE (guard-2913 — an unevaluated check is not a passed
+    one). The caller folds `unknown` into the reducer branch, but it does so
+    explicitly at the call site rather than here, so the fold stays visible.
+    """
+    sid = os.environ.get("MIND_SID", "")
+    if not sid or AGENT_DIR is None:
+        return "unknown"
+    try:
+        if (AGENT_DIR / "sessions" / sid / "working-memory.yaml").exists():
+            return "worker"
+    except OSError:
+        return "unknown"
+    return "reducer"
+
+
 def _infer_in_flight_goal_id():
     """Infer the agent's current in-flight goal_id from team-state.yaml.
 
@@ -322,6 +360,35 @@ def _infer_in_flight_goal_id():
     # the two failure modes: an unstamped manifest loses attribution, a
     # mis-stamped one makes consumers act on another goal's identity.
     if _goal_id_is_terminal(gid):
+        return None
+    # g-115-6748: the in_flight row is AGENT-keyed with NO sid — worker-loop
+    # Phase 4a states the sharing outright ("a worker and its reducer share one
+    # row") — so on a WORKER Body this row names the REDUCER's goal, running on
+    # another box. Measured 2026-08-19 (alpha worker, cc-07, SID d1aec55b): a
+    # worker executing g-115-6653 stamped its manifest with g-363-20, the
+    # reducer's goal on cc-04. That is MISATTRIBUTION, strictly worse than the
+    # missing attribution the g-115-5887 note above prefers, and it was harmless
+    # only while the consumers were blind — fixing their path is what arms it.
+    #
+    # Gating on a sid comparison CANNOT work and is the tempting wrong fix: the
+    # row carries {goal_id, title, claimed_at, phase} and no sid at all, so any
+    # `claimed_by_sid == MIND_SID` test compares against a field that does not
+    # exist and silently never fires. On a worker the inference is unsound in
+    # PRINCIPLE, not merely stale, so the fix is not to infer.
+    #
+    # Returning None routes the caller to the no-goal path — the same fail-safe
+    # the terminal-goal check above already chose. Downstream that also trips
+    # the g-304-01 auto-read-only gate, so a --goal-less retrieval on a worker
+    # stops bumping utilization counters as well as not stamping the manifest.
+    # That is the intended trade and worth stating: a lost count beats a count
+    # attributed to another Body's goal.
+    #
+    # FAIL OPEN. Only "worker" suppresses. "unknown" (no MIND_SID, no AGENT_DIR,
+    # OSError) falls through WITH "reducer" to the current behaviour, because
+    # unknown fires whenever MIND_SID is unset — folding it into the worker
+    # branch would disable goal-stamping fleet-wide and regress g-115-137, the
+    # fix this inference exists to serve.
+    if _body_role() == "worker":
         return None
     return gid
 
@@ -415,7 +482,7 @@ def read_yaml(path):
     return data if isinstance(data, dict) else {}
 
 def _locked_bump_jsonl(path, should_bump_fn, counter_path=("utilization", "retrieval_count"),
-                      timestamp_path=("utilization", "last_retrieved")):
+                      timestamp_path=("utilization", "last_retrieved"), kind=None):
     """Read JSONL under lock, bump retrieval counters on matching records, write back.
 
     Closes the read-modify-write race against `*-add.sh` / `reasoning-bank.py`
@@ -433,6 +500,10 @@ def _locked_bump_jsonl(path, should_bump_fn, counter_path=("utilization", "retri
             ("retrieval_stats", "retrieval_count") for experience.jsonl.
         timestamp_path: Tuple identifying the last_retrieved field. Same pair
             as counter_path with `_count` → `_retrieved` rename.
+        kind: Optional sidecar spool kind ("reasoning-bank" / "guardrails").
+            When set AND UTILIZATION_COUNTERS_SPOOLED is on, the bump is
+            spool-routed (see below) instead of rewriting the store. None
+            (pattern-signatures, experience) always takes the legacy RMW.
 
     Returns the (possibly bumped) records list. Returns the original (un-bumped)
     snapshot when the file does not exist — callers should handle empty.
@@ -449,6 +520,48 @@ def _locked_bump_jsonl(path, should_bump_fn, counter_path=("utilization", "retri
     get_backend().ensure_local(p)
     if not p.exists():
         return []
+
+    # g-358-22: spool-route the retrieval bump for sidecar-covered kinds. The
+    # legacy path below is a per-call full-store RMW — history snapshot + fenced
+    # whole-object PUT + changelog row — repeated once per store per retrieval
+    # call, which survived the g-358-05 flip as its dominant residual churn
+    # (measured 2026-08-20: an 83-PUT burst of ~3.7MB objects in 10 minutes
+    # where the only diff was utilization.retrieval_count/last_retrieved).
+    # Same flag, spool, and fallback idiom as the store endpoint's increment
+    # branch (mind_api/src/endpoints/store.py). The read here is LOCAL-only
+    # (no refresh, no lock — nothing races an O_APPEND delta), and world_dir
+    # is derived from the store path itself because the daemon swaps RB_PATH/
+    # GUARD_PATH per request — ambient env may name a different agent's world.
+    # last_retrieved is NOT written here: the spool line's `ts` carries it,
+    # and utilization-flush.py stamps the sidecar (sidecar wins wholesale in
+    # utilization_of, so a store-side stamp would be invisible anyway).
+    if kind is not None:
+        try:
+            import _utilization_store as _us
+            if _us.spooled_enabled() and kind in _us.KINDS:
+                records = []
+                with open(p, "r", encoding="utf-8") as f:
+                    for line in f:
+                        stripped = line.strip()
+                        if stripped:
+                            records.append(json.loads(stripped))
+                failed_ids = set()
+                for rec in records:
+                    if should_bump_fn(rec) and not _us.record_increment(
+                            kind, rec.get("id"), counter_path[-1],
+                            world_dir=p.parent):
+                        failed_ids.add(rec.get("id"))
+                if not failed_ids:
+                    return records
+                # record_increment returns False rather than raising, so the
+                # rare failed appends fall through to the legacy RMW below —
+                # narrowed to ONLY the failed ids, or the spooled majority
+                # would double-count. Never let the cheap path lose a counter.
+                _spooled_ok_fn = should_bump_fn
+                should_bump_fn = (lambda rec: rec.get("id") in failed_ids
+                                  and _spooled_ok_fn(rec))
+        except Exception:
+            pass    # any import/flag fault -> full legacy path, bump preserved
     base_dir = resolve_base_dir(p)
     lock_path = p.with_suffix(".lock")
     acquire_lock(lock_path)
@@ -986,6 +1099,7 @@ def _embedding_blend(matched, active, categories, exclude=None):
     """
     cfg = _load_retrieval_config()
     if not cfg.get("embedding_blend_enabled", False):
+        _BLEND_STATS["supplementary_blend_status"] = "off"
         return matched
     try:
         from _embedding_retrieval import cosine_scores
@@ -995,7 +1109,30 @@ def _embedding_blend(matched, active, categories, exclude=None):
     except Exception:
         scores = {}
     if not scores:
+        # Flag ON but nothing scored: absent/corrupt index, unloadable
+        # encoder, or an empty query. Distinguish index-absent — it is the
+        # one state a box can FIX (build the index) and the one that hid
+        # for 25 days (g-115-6860).
+        status = "no_scores"
+        try:
+            from _embedding_retrieval import index_available
+            if not index_available():
+                status = "no_scores:index_absent"
+        except Exception:
+            pass
+        _BLEND_STATS["supplementary_blend_status"] = status
+        global _BLEND_DEGRADED_WARNED
+        if not _BLEND_DEGRADED_WARNED:
+            _BLEND_DEGRADED_WARNED = True
+            print("[retrieve] embedding blend DEGRADED (%s): "
+                  "embedding_blend_enabled=true but no cosine scores — "
+                  "supplementary retrieval is serving the token-overlap "
+                  "baseline. If the index is absent, provision per "
+                  "g-115-3115 then: python3 core/scripts/"
+                  "embedding-index-build.py --build (g-115-6860)"
+                  % status, file=sys.stderr)
         return matched
+    _BLEND_STATS["supplementary_blend_status"] = "served"
     try:
         min_cos = float(cfg.get("embedding_min_cosine", 0.35))
     except (TypeError, ValueError):
@@ -1028,6 +1165,22 @@ def _embedding_blend(matched, active, categories, exclude=None):
 # PREVIOUS request's numbers. Clearing on read makes a stale carry-over
 # impossible rather than merely unlikely.
 _UNIVERSAL_SPLIT_STATS: "dict" = {}
+
+# g-115-6860 — per-request carrier for the SUPPLEMENTARY (domain-RB +
+# guardrail) blend outcome. Same channel + pop semantics as
+# _UNIVERSAL_SPLIT_STATS above (g-115-4039): producer _embedding_blend,
+# consumer _log_retrieval_trace, cleared unconditionally in the loaders.
+# Motivating incident: embedding_blend_enabled=true fleet-wide since 07-25
+# while this box had NO index — cosine_scores returned {} and the blend's
+# degraded branch is byte-identical to "no semantic hits", so 25 days of
+# queries served the token-overlap baseline (the 13%-hit@3 arm of the
+# g-306-77 A/B) with zero telemetry. g-115-4039 gave the UNIVERSAL lane a
+# status field; this is the same visibility for the domain/guardrail lane.
+# Values: "off" | "served" | "no_scores" | "no_scores:index_absent".
+_BLEND_STATS: "dict" = {}
+# One-time-per-process stderr warning flag for the degraded case (mirrors the
+# g-115-3387 encoder-fallback diagnostic: soft must not mean SILENT).
+_BLEND_DEGRADED_WARNED = False
 
 
 def _universal_relevance_split(universal_sorted, categories, stats=None):
@@ -1367,6 +1520,10 @@ def load_reasoning_bank(categories, depth="medium", read_only=False, entry_type=
     # this protects the request after a FAILED one. (g-115-4039 fresh-eyes;
     # guard-1663 — never let a process-global carry across owners.)
     _UNIVERSAL_SPLIT_STATS.clear()
+    # g-115-6860: same unconditional-clear reasoning for the supplementary
+    # blend-status carrier (written by _embedding_blend on both the RB and
+    # guardrail calls; load_guardrails clears too for guardrail-only paths).
+    _BLEND_STATS.clear()
     # g-306-86 (cont.): as_of reads never run the blend, so there is no pull-slot
     # outcome to report. Leaving the carrier empty (rather than writing zeros)
     # keeps "the lane did not run" distinct from "the lane ran and picked none" —
@@ -1387,7 +1544,7 @@ def load_reasoning_bank(categories, depth="medium", read_only=False, entry_type=
             return (rec.get("id") in bump_ids
                     and rec.get("status") == "active")
 
-        _locked_bump_jsonl(RB_PATH, _should_bump)
+        _locked_bump_jsonl(RB_PATH, _should_bump, kind="reasoning-bank")
 
     return domain, universal
 
@@ -1410,6 +1567,10 @@ def load_guardrails(categories, depth="medium", read_only=False, as_of=None):
     """
     cap = SUPPLEMENTARY_CAPS.get(depth, SUPPLEMENTARY_CAPS["medium"])
     as_of_dt = _as_of_dt_or_raise(as_of)
+    # g-115-6860: unconditional carrier clear for guardrail-only request
+    # paths (load_reasoning_bank has the mirror clear) — as_of requests
+    # skip the blend, so the carrier must be empty rather than stale.
+    _BLEND_STATS.clear()
     records = _read_store(GUARD_PATH, "guardrails")
     if as_of_dt is None:
         active = [r for r in records if r.get("status") == "active"]
@@ -1429,7 +1590,7 @@ def load_guardrails(categories, depth="medium", read_only=False, as_of=None):
             return (rec.get("id") in bump_ids
                     and rec.get("status") == "active")
 
-        _locked_bump_jsonl(GUARD_PATH, _should_bump)
+        _locked_bump_jsonl(GUARD_PATH, _should_bump, kind="guardrails")
 
     return filtered
 
@@ -2398,6 +2559,13 @@ def _log_retrieval_trace(category, depth, read_only, items_returned,
     both emitted n_reasoning_bank=5. The cosine path silently not running was
     unmeasurable fleet-wide.
       universal_cosine_status    — off | no_slots | no_scores | ran
+
+    Supplementary blend field (g-115-6860) — PRESENT ONLY when _embedding_blend
+    ran on this request (absent on as_of reads). The domain-RB/guardrail twin
+    of universal_cosine_status: without it, flag-ON with no index was
+    byte-identical to "no semantic hits" and a box served the token baseline
+    for 25 days unmeasured.
+      supplementary_blend_status — off | served | no_scores | no_scores:index_absent
       n_universal_pull_slots     — configured pull slots for this request
       n_universal_cosine_picked  — slots filled by cosine (>= min_cosine)
       n_universal_backfilled     — slots filled by utilization-order backfill
@@ -2484,6 +2652,13 @@ def _log_retrieval_trace(category, depth, read_only, items_returned,
         if _UNIVERSAL_SPLIT_STATS:
             record.update(_UNIVERSAL_SPLIT_STATS)
             _UNIVERSAL_SPLIT_STATS.clear()
+        # g-115-6860 — supplementary blend outcome, same pop semantics.
+        # Absent key = the blend lane did not run on this request (as_of /
+        # early return); "no_scores:index_absent" = flag ON but this box has
+        # no built index — the degraded state that hid for 25 days.
+        if _BLEND_STATS:
+            record.update(_BLEND_STATS)
+            _BLEND_STATS.clear()
         # Same best-effort append pattern as _record_fallback_hit. Single-line
         # JSON under PIPE_BUF (4 KB) is single-write atomic on most filesystems
         # — torn-line risk is observability-grade, not durable-state-grade.

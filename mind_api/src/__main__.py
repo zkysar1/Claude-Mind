@@ -449,6 +449,29 @@ def _start_owncloud_sync_thread(project_root: Path, shutdown: "threading.Event")
             except Exception as e:  # noqa: BLE001 — a bad tick never kills the thread
                 print(f"[owncloud-sync] sweep error (retry next tick): {e}",
                       file=sys.stderr)
+            # : drain the utilization-counter spools into the shared
+            # sidecars. The flusher is fully self-gating (absent/empty spool =
+            # ~2-stat no-op; 300s min-interval stamp; 500-line burst override;
+            # flush lock; fail-open with spool retained), so a per-cycle call is
+            # cheap and safe on flipped AND un-flipped boxes alike. This call is
+            # the flusher's ONLY caller: it shipped 2026-08-18 with no invocation
+            # anywhere (found 2026-08-19 when the flip-adoption measurement showed
+            # increments spooling locally and never reaching the sidecar — the
+            # write half of the rb-8458 adoption gap). Subprocess rather than
+            # import: the script filename is not import-safe and its own _paths
+            # resolution is the designed entry.
+            try:
+                import subprocess
+                fr = subprocess.run(
+                    [sys.executable,
+                     str(project_root / "core" / "scripts" / "utilization-flush.py")],
+                    capture_output=True, text=True, timeout=60)
+                fout = ((fr.stdout or "") + (fr.stderr or "")).strip()
+                if fout:
+                    print(fout, file=sys.stderr)
+            except Exception as e:  # noqa: BLE001 — drain must never kill the thread
+                print(f"[utilization-flush] error (retry next cycle): {e}",
+                      file=sys.stderr)
             #  Gap A: every Nth cycle, run the PULL half so peer S3
             # advances reach this box's mirror for raw-read consumers. Cheap on
             # a quiescent fleet (flat LIST per root + local ETag pre-filter);

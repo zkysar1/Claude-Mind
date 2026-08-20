@@ -119,6 +119,21 @@ ALLOWED_PREFIXES = (
     # _goal_source.infer(); check-origin-signal-drift.py re-runs the diff.
     "skill-discovery-audit:",   # aspirations-evolve Step 9.5.5 forged-skill audit
     "blocker_pattern:",         # aspirations-all-blocked MW#5 T1 Unblock synthesis
+    # Same cycle-detector lane, THIRD reconciliation (). Surfaced by
+    # test_every_origin_signal_literal_carries_a_registered_prefix against
+    # world/scripts/unit-economics-readout.py:556, whose threshold-move branch
+    # stamps `unit-economics-move:{prior}`. MEASURED behaviour before the fix
+    # was (b), not (a): the title starts "Investigate: " so Layer-D auto-derive
+    # REWROTE the signal to `investigate:<title-slug>` and the goal DID file —
+    # silently degraded, not silently dead. Two consequences, and the second
+    # corrects what the surfacing goal predicted. The `{prior}` timestamp is the
+    # branch's own DEDUP DISCRIMINATOR (re-running the readout against the same
+    # prior must not double-file), and the rewrite erases it. And infer() on the
+    # derived signal returns "agent-self" — NOT null, as predicted — so this
+    # automated filer was MISATTRIBUTED to the agent's own initiative rather
+    # than left absent. A wrong lane is worse than a null one: a null shows up
+    # in a null-source scan and a misattribution does not.
+    "unit-economics-move:",     # unit-economics-readout.py threshold-move auto-file
     "idle_fallback",
     "program-change-proposal:",
     # _goal_source.infer() parity (). These prefixes were already

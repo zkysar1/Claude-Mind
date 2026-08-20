@@ -127,6 +127,80 @@ def test_non_owncloud_refuses_even_if_endpoint_later_adds_noop_key():
 
 
 # ---------------------------------------------------------------------------
+# THE LOCAL ARM () — the gate keys on CAPABILITY, not backend NAME.
+#
+# The pin above is about a backend with NO claim store. A local backend now MAY
+# have one: the git-ref arm backs the same lease with refs/mind/claim/<env>/<agent>.
+# The two sections are not in tension — together they say the gate must ask "did a
+# real claim store answer?", which the daemon reports as `claim_store`, rather
+# than "is the backend named own-cloud?". A name-keyed predicate refused the git
+# backend forever however live its claim was, which is the defect  fixed;
+# the docstring at the top of this file anticipated that backend arriving by
+# promotion and the predicate could not see it.
+# ---------------------------------------------------------------------------
+
+def test_local_backend_with_claim_store_reports_live():
+    """Criterion 1: a real verdict naming the holder, NOT rc=4 REFUSE."""
+    body = _claims_body(backend="local", claim_store=True,
+                        machine="cc-77", age=60)
+    rc, out = _run("status", body)
+    assert rc == 0, f"live local-backend claim must report LIVE, got rc={rc}: {out!r}"
+    assert "LIVE" in out
+    assert "cc-77" in out, f"verdict must name the holder machine: {out!r}"
+
+
+def test_local_backend_with_claim_store_refuses_when_stale():
+    """A claim store answering does not make a STALE claim live — the freshness
+    branch must still apply once the capability gate is passed."""
+    body = _claims_body(backend="local", claim_store=True, age=STALE + 600)
+    rc, out = _run("status", body)
+    assert rc == 4, f"stale claim must REFUSE even with a claim store: {out!r}"
+    assert "STALE" in out
+
+
+def test_local_backend_with_claim_store_refuses_when_not_running():
+    body = _claims_body(backend="local", claim_store=True, state="IDLE")
+    rc, out = _run("status", body)
+    assert rc == 4
+    assert "NOT-RUNNING" in out
+
+
+def test_local_backend_with_claim_store_refuses_when_agent_absent():
+    body = _claims_body(backend="local", claim_store=True, agent=None,
+                        extra_agents=("bravo",))
+    rc, out = _run("status", body)
+    assert rc == 4
+    assert "ABSENT" in out
+
+
+def test_absent_claim_store_field_falls_back_to_legacy_predicate():
+    """Backward compatibility, pinned explicitly rather than left implicit.
+
+    A daemon older than the `claim_store` field omits it entirely. The gate must
+    then behave EXACTLY as before (`backend == "own-cloud"`), so upgrading the
+    wrapper ahead of the daemon cannot start reporting local boxes as alive —
+    and, in the other direction, cannot start refusing own-cloud.
+    """
+    legacy_local = _claims_body(backend="local", age=60)      # no claim_store key
+    rc, out = _run("status", legacy_local)
+    assert rc == 4, f"legacy local body must REFUSE: {out!r}"
+
+    legacy_owncloud = _claims_body(backend="own-cloud", age=60)  # no claim_store key
+    rc, out = _run("status", legacy_owncloud)
+    assert rc == 0, f"legacy own-cloud body must stay LIVE: {out!r}"
+
+
+def test_claim_store_false_refuses_regardless_of_backend_name():
+    """Fail-safe direction: an explicit `claim_store: false` refuses even when
+    the backend calls itself own-cloud. Capability beats name in BOTH directions,
+    so a backend that knows it cannot witness a claim is believed."""
+    body = _claims_body(backend="own-cloud", claim_store=False, age=60)
+    rc, out = _run("status", body)
+    assert rc == 4, f"explicit claim_store:false must REFUSE: {out!r}"
+    assert "REFUSE" in out
+
+
+# ---------------------------------------------------------------------------
 # The live / not-live decision
 # ---------------------------------------------------------------------------
 

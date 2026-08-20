@@ -278,7 +278,20 @@ if [ -n "$rows" ]; then
 fi
 
 if [ "$not_clean" -eq 1 ]; then
-    echo "[pending-deploys-gate] one or more deploys unresolved — clean-success closure refused; SG-c stop-hook will hold graceful stop until cleared" >&2
+    # SG-c does NOT hold the stop, and this line used to say it did (g-335-1313).
+    # stop-hook.sh:487-504 is a roll-then-ALLOW backstop in the not-RUNNING gate:
+    # it calls `pending-deploys.py roll-handoff` for VISIBILITY and then exits 0.
+    # Its own comment is explicit — "NEVER blocks the stop (an un-clearable
+    # framework-CI obligation must not wedge a session)" — and boot/SKILL.md 4d
+    # calls the carry-over an "awareness surface only". No gate anywhere blocks
+    # on pending deploys (Gate 2.5 is pending-agents, Gate 2.6 background-jobs).
+    # The false wording cost a real goal: a reader saw it in the stderr log,
+    # believed a /stop was wedged, and filed MEDIUM work whose stated reason to
+    # act did not exist. A message asserting a consequence in ANOTHER component
+    # is a claim about that component's code, and nothing keeps the two in sync
+    # (guard-4282, same class inverted — here the prose went stale, not the value).
+    # Describe only what THIS gate did; name the visibility path, not a hold.
+    echo "[pending-deploys-gate] one or more deploys unresolved — clean-success closure refused; entries kept and re-probed at the next close, and rolled into handoff.yaml at session end for the next boot to surface (SG-c is visibility-only and never blocks a stop)" >&2
 fi
 
 if [ "$budget_skipped" -gt 0 ]; then

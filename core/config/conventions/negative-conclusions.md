@@ -302,6 +302,87 @@ mapping) was correct; only the WHY-comment was unfounded. Fix going
 forward: when explaining why existing state exists, write observation +
 plausible-mechanism separately, never blurred.
 
+#### Separating them is not enough — POSITION decides whether the hedge is read (2026-08-19, g-115-6823)
+
+The fix above ("write observation + plausible-mechanism separately, never
+blurred") was FOLLOWED and still failed, which is why this sub-section exists.
+guard-4449 was filed carrying a correct neutral form in its own text:
+
+> Mechanism INFERRED as an argv/exec length ceiling [...] — measured behaviour
+> is certain, the exact cause is not.
+
+That clause sat ~1,000 characters into the `rule` field (measured 1,035 on the
+recorded original). The field OPENED with
+`tree-update.sh --set passes VALUE as a positional argv and SILENTLY TRUNCATES
+a large one`, and the companion goal title was `Fix: tree-update.sh --set
+SILENTLY TRUNCATES a large value at ~8KB` — no hedge at all. Both assertions
+were falsified within the hour (`--set` reproduced clean at 12,000 / 17,708 /
+20,000 B through the exact failing shape). The observation was real; only the
+mechanism was invented.
+
+**Why the head of the field is the whole budget.** guard-1421 measured, across
+1,382 active guardrails, that a survey slice shows the topic and hides the
+imperative ~85% of the time, and that no slice width fixes it. Its remedy is to
+survey by **id + title ONLY**, treating rule text as absent.
+
+⚠ **That remedy is not implementable as written, and this file asserted the
+wrong reason for it until 2026-08-19.** The original claim here — "a guardrail
+record has NO title field" — is FALSE: ~12% carry one (5 of a 40-record live
+sample via `retrieve.sh`; the reasoning bank is 100%). The true constraint is
+the instrument, not the schema. `guardrails-read.sh --summary` — the actual
+survey surface, 4,190 lines — emits `id: [category] <rule truncated>` and
+**never the title, even for records that have one** (verified on guard-1244,
+which does). So there is no title lane to survey by, for any record.
+
+This STRENGTHENS the writer-side rule rather than weakening it. The head of
+`rule` is what a survey shows for 100% of guardrails, titled or not — so a
+hedge placed anywhere but that head is unread BY CONSTRUCTION, and the entry
+radiates a confidence its author did not intend. (Measured alpha,
+DESKTOP-O91DLK2, 2026-08-19, during the /encode-session pass that shipped this
+section — found by reading guard-1244 for an unrelated reason and noticing it
+had a `title`. The section's advice survived; its stated justification did not.)
+
+**This is not guard-1421's rejected "tune the slice."** That was a READER-side
+move — widen the window until the payload fits — and guard-1421 killed it with
+numbers (at 200 chars you still miss 70%), because the author's payload position
+and the reader's cut point are uncorrelated. The rule here is the WRITER-side
+complement: move the payload into the window that already survives. It is what
+makes guard-1421's own remedy epistemically sound rather than systematically
+over-confident, so the two compose — do not read them as opposed.
+
+**Scope is deliberately two surfaces, not "everywhere"** (guard-336): a goal's
+`title` and the first clause of a guardrail's `rule`. Those are the two measured
+here and the two that survive truncation on the paths that matter (selector
+scan, `--summary` index, human skim). Widening it to "every field" would be a
+universal quantifier with no enforcement behind it.
+
+#### Derive the deliverable from whichever half is MEASURED
+
+The companion failure is scope, not wording. A defect filing carries a measured
+OBSERVATION and an inferred MECHANISM; whoever executes it inherits the
+mechanism as scope, so falsifying the mechanism destroys the goal.
+
+Worked example, same incident. g-115-6823 was scoped to the mechanism — "add a
+length cap to `--set` / route it through the stdin path" — and became worthless
+the moment `--set` was cleared, requiring a full rewrite of title and
+description. Re-scoped to the OBSERVATION ("a silent partial write happened and
+nothing in the tree-write path compares stored bytes against sent bytes"), the
+deliverable is correct under every candidate mechanism including the one still
+unknown, and it survived the falsification that killed the original.
+
+**The rule is conditional, not absolute.** Where the mechanism IS measured,
+scope to it — that is the smallest correct fix, and reaching for a general
+detector instead is the speculative-feature anti-pattern
+(`implementation-discipline.md` rule 2). Where the mechanism is INFERRED, the
+deliverable must be one that stays correct if it is falsified. Ask before
+filing: *if the mechanism turns out to be wrong, is any of this work still
+right?* If the answer is no, the goal is scoped to a guess.
+
+Distinct from `retrieve-before-deciding.md` #11, which fires on the same filing
+moment: #11 says CONSULT the corpus about the remedy before writing it down;
+this says DERIVE the remedy from the measured half. #11 can be satisfied in full
+and still leave a goal that dies with its mechanism.
+
 ### Capability-absence claims ("Y needs to be built")
 
 "Y needs to be built", "X must be created", "we need to add Z", and "there is

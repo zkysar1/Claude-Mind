@@ -218,6 +218,13 @@ SHARED_WM_CONSTANTS = (
     # Joins this list rather than getting its own bespoke check so a fifth lane
     # is covered by being registered, not by someone remembering to add a test.
     "CAPTURE_SLOTS",
+    # : the dynamic append lanes that sit in no other registry
+    # (notification_log, proactive_escalation_log). The append refusal unions
+    # every constant above with this one, so a drift here silently changes which
+    # slots the LIVE daemon path will mint — the same  class the rest
+    # of this list exists to pin. Only the literal EXTRA is pinned; the union
+    # itself is derived from members already covered here.
+    "APPEND_CREATABLE_EXTRA",
 )
 
 

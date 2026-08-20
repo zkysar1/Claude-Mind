@@ -94,6 +94,16 @@ REASON_TAG_PATTERNS = [
     ("stale-claim-takeback", [r"stale[- ]claim take[- ]?back", r"intended_agent stale", r"dormant.*reallocation"]),
     ("handoff-routing", [r"handoff_to="]),
     ("test-fixture", [r"test[- ]fixture", r"test justification"]),
+    # . Same-agent cross-session take-over of a DORMANT holder, newly
+    # emitted by aspirations_write._audit_cross_session_takeover_inline. Added
+    # in the SAME change as the emitter, deliberately: a new justification
+    # cluster with no pattern here falls straight to "untagged", which is the
+    # ~95%-untagged defect the block above was written to fix. It is a DISTINCT
+    # tag rather than a widening of stale-claim-takeback because the two events
+    # differ in who is displaced (another AGENT vs another SESSION of this one)
+    # and in what sanctions them (claim age vs holder dormancy) — folding them
+    # would make the take-over rate this tag exists to measure unreadable.
+    ("cross-session-takeover", [r"cross[- ]session take[- ]?over"]),
 ]
 
 

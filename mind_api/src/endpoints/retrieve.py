@@ -293,8 +293,28 @@ def handle(ctx) -> "Response":  # type: ignore[name-defined]
         # Saved-as-None means "was unset" → pop on restore (never write "").
         # Same lock-scope rule as `saved` above — capture inside the lock.
         _saved_env_agent = os.environ.get("MIND_AGENT")
+        # : swap MIND_SID for the SAME reason and in the SAME place.
+        # _infer_in_flight_goal_id() now also asks which BODY the request is for
+        # (worker vs reducer), because the team-state in_flight row it reads is
+        # AGENT-keyed with no sid and therefore names the REDUCER's goal on a
+        # worker Body. That predicate reads os.environ["MIND_SID"], and the
+        # daemon process env holds the DAEMON's startup sid — exactly the defect
+        # Decision #58 fixed for MIND_AGENT one line above. The requester's sid
+        # arrives in the `x-mind-sid` header (already consumed further down for
+        # the body-scoped manifest path), so read it HERE too rather than
+        # threading a parameter through retrieve.py's signature.
+        # Absent header ⇒ pop, never set "": _body_role() treats a missing sid as
+        # "unknown" and falls through to the pre-existing behaviour, so a caller
+        # that sends no sid is unaffected. Restored in the same finally-block as
+        # MIND_AGENT, with the same saved-as-None ⇒ pop discipline.
+        _saved_env_sid = os.environ.get("MIND_SID")
+        _req_sid = (ctx.headers.get("x-mind-sid") or "").strip()
         try:
             os.environ["MIND_AGENT"] = explicit_agent
+            if _req_sid:
+                os.environ["MIND_SID"] = _req_sid
+            else:
+                os.environ.pop("MIND_SID", None)
             _r.WORLD_DIR = world
             _r.AGENT_DIR = agent_dir
             _r.TREE_PATH = world / "knowledge" / "tree" / "_tree.yaml"
@@ -609,6 +629,13 @@ def handle(ctx) -> "Response":  # type: ignore[name-defined]
                 os.environ.pop("MIND_AGENT", None)
             else:
                 os.environ["MIND_AGENT"] = _saved_env_agent
+            # : same discipline for the sid. Restoring this is not
+            # cosmetic — a leaked worker sid would make the NEXT request (any
+            # agent) resolve as a worker and silently stop inferring its goal.
+            if _saved_env_sid is None:
+                os.environ.pop("MIND_SID", None)
+            else:
+                os.environ["MIND_SID"] = _saved_env_sid
 
     meta = {
         "category": category,

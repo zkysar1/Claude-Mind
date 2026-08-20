@@ -290,6 +290,13 @@ if [ -n "${DEFERRED_PATHS:-}" ]; then
             _record_half deferred 0 false "NOT RUN: $_dp (RUN_DEFERRED=1 to include)"
         fi
     done <<< "$DEFERRED_PATHS"
+elif [ "$_DEFERRED_RESOLVE_RC" -eq 0 ]; then
+    # Empty set + healthy resolver (the designed end state since ):
+    # record it explicitly, or --triage prints "NOT RECORDED -- says NOTHING"
+    # forever about a half that intentionally has no members. Guarded on the
+    # resolver rc: a FAILED resolve must stay unrecorded -- that silence is
+    # ignorance, not coverage (guard-1947).
+    _record_half deferred 0 true "deferred set empty -- all declared testpaths ran in the chunked pool"
 fi
 
 # Domain-test hook slot (). Pattern B per

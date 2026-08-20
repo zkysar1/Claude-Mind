@@ -205,6 +205,70 @@ def test_same_agent_dormant_session_takeover_allowed():
             assert _goal(world).get("claimed_by_sid") == LIVE_SID
 
 
+# --- 4a. the allowed take-over is recorded DURABLY () -------------
+def test_dormant_takeover_is_recorded_to_override_ledger():
+    """The take-over must leave a trace something OTHER than the daemon can read.
+
+    Before g-306-329 this event was logged only with print(file=sys.stderr)
+    from INSIDE the daemon. The code's own comment claimed it "must leave a
+    trace", and it did not: the displaced Body learned nothing (measured
+    2026-08-19 -- the loser found out at commit-gate time, 34 min later), and
+    the take-over rate was unmeasurable, so nobody could tell whether
+    g-306-328 had reduced it.
+
+    Asserts the DURABLE half only. Notifying the displaced session is the
+    separate, harder half g-306-329 leaves open -- do not extend this test to
+    imply it is covered.
+
+    The second phase is a NEGATIVE CONTROL and is the point of the test: a
+    same-session re-claim is a no-op, so it must add NO row. Without it a
+    ledger write fired unconditionally on every claim would pass phase one.
+    """
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _make_world(Path(tmpd), claimed_by="alpha",
+                            claimed_by_sid=OTHER_SID)
+        ledger = world / "override-bypass-ledger.jsonl"
+        with DaemonFixture(world, agent="alpha") as df:
+            # holder is NOT the running session -> dormant -> take-over allowed
+            _seed_session(df.project_root, "alpha", running_sid=LIVE_SID,
+                          heartbeat_age_s=0.0)
+            code, body = _claim(df.port, "alpha", LIVE_SID)
+            assert code == 200, f"take-over must succeed; got {code}: {body}"
+
+            assert ledger.exists(), (
+                "the take-over wrote NO ledger file -- the event is durable "
+                "nowhere, which is the g-306-329 defect itself")
+            rows = [json.loads(ln) for ln
+                    in ledger.read_text(encoding="utf-8").splitlines()
+                    if ln.strip()]
+            hits = [r for r in rows
+                    if r.get("gate") == "claim-cross-session-takeover"]
+            assert len(hits) == 1, (
+                f"expected exactly 1 take-over row, got {len(hits)} "
+                f"of {len(rows)} ledger row(s): {rows}")
+
+            rec = hits[0]
+            rctx = rec.get("context") or {}
+            # BOTH sids must be present: an audit row naming only the winner
+            # cannot answer "who was displaced", which is the whole question.
+            assert rctx.get("displaced_sid") == OTHER_SID, rec
+            assert rctx.get("claiming_sid") == LIVE_SID, rec
+            assert rctx.get("goal_id") == "g-300-01", rec
+            assert rec.get("agent") == "alpha", rec
+
+            # NEGATIVE CONTROL: same-session re-claim is a no-op -> no new row.
+            code2, body2 = _claim(df.port, "alpha", LIVE_SID)
+            assert code2 == 200, f"{code2} {body2}"
+            rows2 = [json.loads(ln) for ln
+                     in ledger.read_text(encoding="utf-8").splitlines()
+                     if ln.strip()]
+            hits2 = [r for r in rows2
+                     if r.get("gate") == "claim-cross-session-takeover"]
+            assert len(hits2) == 1, (
+                "a same-session re-claim is a no-op and must add NO take-over "
+                f"row; ledger grew to {len(hits2)} hits: {rows2}")
+
+
 # --- 4b. holder IS the runner but heartbeat STALE -> fail open, allow -------
 def test_stale_heartbeat_fails_open_and_allows():
     with tempfile.TemporaryDirectory() as tmpd:
@@ -301,9 +365,14 @@ def test_release_clears_claimed_by_sid():
                 f"claimed_by_sid outlived its claim: {g.get('claimed_by_sid')}")
 
 
-def _update_goal(port: int, agent: str, field: str, value: str) -> tuple[int, str]:
+def _update_goal(port: int, agent: str, field: str, value: str,
+                 sid: str | None = None) -> tuple[int, str]:
     url = (f"http://127.0.0.1:{port}/v1/aspirations/update-goal"
            f"?id=g-300-01&field={field}&source=world")
+    # sid is optional so existing callers are unaffected; the 
+    # displacement warning is keyed on it, so that test must send one.
+    if sid:
+        url += f"&sid={sid}"
     # The endpoint requires a JSON *value* as the body, not a bare string.
     req = urllib.request.Request(url, data=json.dumps(value).encode("utf-8"),
                                  method="POST")
@@ -367,3 +436,74 @@ def test_caller_without_sid_now_refused():
             assert "missing_claim_sid" in body, body
             assert _goal(world).get("claimed_by_sid") == LIVE_SID, (
                 "a sid-less caller must NOT erase the holder's recorded identity")
+
+
+# --- 11. the DISPLACED session learns at its NEXT WRITE () --------
+def test_displaced_session_is_warned_on_next_write():
+    """The half  is titled after: 'Displaced Body learns nothing.'
+
+    Before this, a take-over was announced only by print(file=sys.stderr) from
+    INSIDE the daemon, which no session can read. The displaced Body kept
+    executing and found out at commit-gate time -- measured 2026-08-19, 34
+    minutes later.
+
+    The sibling _nonholder_claim_warning did NOT cover this: its same-agent
+    branch returns None unless the new holder is the agent's live autonomous
+    RUNNER, and a worker Body is not the runner (rb-8513). So the warning went
+    quiet for exactly the session that had just lost its claim. This test pins
+    the case that gate suppressed -- the taker here (LIVE_SID) is the running
+    session precisely so the fixture is realistic, and the assertion is about
+    the DISPLACED party being told, not about the taker.
+
+    Warn-only by contract: the write is APPLIED (200). A refusal here would
+    wedge live work, and guard-4500 is explicit that a fail-open visibility
+    field must not become the input to a refusal.
+    """
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _make_world(Path(tmpd), claimed_by="alpha",
+                            claimed_by_sid=OTHER_SID)
+        with DaemonFixture(world, agent="alpha") as df:
+            _seed_session(df.project_root, "alpha", running_sid=LIVE_SID,
+                          heartbeat_age_s=0.0)
+            code, body = _claim(df.port, "alpha", LIVE_SID)
+            assert code == 200, f"take-over must succeed: {code} {body}"
+            assert _goal(world).get("claimed_by_sid") == LIVE_SID
+
+            # The DISPLACED session writes, as it would while still executing
+            # the goal it believes it owns.
+            code, body = _update_goal(df.port, "alpha", "outcome_note",
+                                      "displaced session still working",
+                                      sid=OTHER_SID)
+            assert code == 200, (
+                f"the write must be APPLIED, warn-only: {code} {body}")
+            warns = json.loads(body).get("warnings") or []
+            hits = [w for w in warns
+                    if "CLAIM-OWNERSHIP MISMATCH on g-300-01" in w]
+            assert hits, (
+                "the displaced session received NO warning -- this IS the "
+                f"g-306-329 defect. warnings={warns}")
+            # The displacement reading must be OFFERED, but conditionally: this
+            # same condition is reached by recovery sweeps that never held the
+            # claim, so an unconditional "your claim was taken" would be false
+            # for them (stranded-claim-sweep POSTs update-goal to clear claims).
+            assert "DISPLACED" in hits[0], hits
+            assert "RECOVERY SWEEP" in hits[0], (
+                "the sweep audience must be named, or the warning reads as an "
+                f"alarm to callers for whom it is expected: {hits}")
+            # Both sids must appear: a warning that does not name the new
+            # holder cannot be acted on, and one that does not name the caller
+            # cannot be trusted as being about this session.
+            assert LIVE_SID in hits[0], hits
+            assert OTHER_SID in hits[0], hits
+
+            # NEGATIVE CONTROL: the CURRENT holder writing must NOT be warned.
+            # Without this, a warning fired unconditionally on every write
+            # would pass the assertions above.
+            code, body = _update_goal(df.port, "alpha", "outcome_note",
+                                      "holder writing normally", sid=LIVE_SID)
+            assert code == 200, f"{code} {body}"
+            warns2 = json.loads(body).get("warnings") or []
+            assert not [w for w in warns2
+                        if "CLAIM-OWNERSHIP MISMATCH" in w], (
+                "the current holder must not be told it does not hold its own "
+                f"claim: {warns2}")

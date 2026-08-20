@@ -45,6 +45,21 @@ _print_record() {
 import json, sys
 resp = json.load(sys.stdin)
 rec = resp.get('record') or resp
+# : SURFACE THE SPOOL LANE. On a spooled increment () the
+# daemon returns {'ok':true,'spooled':true,'record':{'id':...}} and that record
+# is a bare id BY DESIGN — the spool path deliberately does not read the content
+# store. Printing only the record made a working write indistinguishable from a
+# no-op: the caller sees {'id':'rb-2648'}, re-reads the CONTENT store, finds the
+# embedded utilization block unchanged (frozen by design post-cutover) and
+# concludes the counter was lost. It was not; it lands in the sidecar at flush.
+# Two agents reached that wrong conclusion before this line existed.
+if resp.get('spooled'):
+    rec = dict(rec)
+    rec['spooled'] = True
+    rec['where'] = ('appended to this box local spool; lands in the '
+                    '<kind>-utilization.jsonl SIDECAR at flush, NOT in the '
+                    'content record. Read counters via utilization_of(), never '
+                    'from the record embedded utilization block.')
 print(json.dumps(rec, indent=2, ensure_ascii=False))
 "
 }

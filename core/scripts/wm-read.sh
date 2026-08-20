@@ -13,27 +13,37 @@ _RUNTIME_SELF="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
+# : shared strict-argv refusal helpers (uniform message contract).
+# Sourced BEFORE _runtime.sh so a refusal cannot be masked by a daemon failure.
+# shellcheck disable=SC1091
+source "$CORE_ROOT/scripts/_argv_strict.sh"
+
 # --- Parse args -----------------------------------------------------------
 SLOT=""
 AS_JSON=0
-declare -a PASSTHROUGH=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        -h|--help)
+            echo "Usage: wm-read.sh <slot> [--json]"
+            exit 0;;
         --json)
             AS_JSON=1
-            PASSTHROUGH+=("$1")
             shift;;
         --*)
-            PASSTHROUGH+=("$1")
-            shift;;
+            # : was a silent append to the dead PASSTHROUGH
+            # accumulator — a mistyped flag vanished and the read answered
+            # with the filter missing (rc=0, wrong population, rb-245 shape).
+            argv_strict_refuse_unknown "wm-read.sh" "$1" "--json (plus one <slot> positional)";;
         *)
-            # Positional argument — slot name. First positional wins;
-            # additional ones are passed through to fallback as-is.
+            # Positional argument — slot name. First positional wins; a SECOND
+            # positional used to be silently swallowed () and is now
+            # refused like an unknown flag.
             if [ -z "$SLOT" ]; then
                 SLOT="$1"
+            else
+                argv_strict_refuse_extra_positional "wm-read.sh" "$1" 1 "--json"
             fi
-            PASSTHROUGH+=("$1")
             shift;;
     esac
 done

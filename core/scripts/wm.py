@@ -184,6 +184,95 @@ ARRAY_SLOTS = {
 # capture". .
 CAPTURE_SLOTS = ("spark_capture", "exp_capture", "hyp_capture", "encoding_capture")
 
+#  — APPEND-CREATABLE LANE REGISTRY.
+#
+# WHY IT EXISTS: resolve_slot() returns (slots_dict, name, False) for ANY
+# unrecognised name, and both append paths then do `parent[key] = []`. So a
+# MISTYPED slot name has always been accepted at rc=0 / HTTP 200, minting a
+# brand-new lane that no consumer iterates and no carrier mirrors. The write
+# reports success and the entry is gone. MEASURED 2026-08-19 (alpha worker Body,
+# hostname cc-08, uname -r 6.8.0-137-generic, own-cloud) across the two live WM
+# files on that box — ten orphan lanes, against ZERO references anywhere in the
+# tree for any of them:
+#   spark / exp / encoding                 truncations of the *_capture lanes
+#   --json / --stdin-json / --load-bearing a FLAG consumed as the slot argument
+#   handoff_rows / recent_findings / experience_candidates / encoding_candidates
+#
+# WHY THE REFUSAL IS SCOPED TO LANE *CREATION*, NOT TO EVERY APPEND: a
+# registry-only check would refuse ~25 legitimate slots. Most live WM slots sit
+# in NO static registry — they are minted on demand by wm-set.sh (episode_chain,
+# consolidation_health, the force_* signals), which is the sanctioned pattern.
+# guard-4044 states the asymmetry that makes refusing those the worse direction:
+# a dropped write is unrecoverable, a skipped read is not. So an append to a
+# lane that ALREADY EXISTS is untouched; only MINTING one requires registration.
+# That scoping is also why the check is not keyed on capture-lane SHAPE: 7 of
+# the 10 orphans measured above carry no `capture` token at all, so a
+# shape-matched predicate would have missed most of the real population.
+#
+# WHY A REFUSAL RATHER THAN A WIDER CONSUMER: no consumer can retroactively find
+# data it was never told about, so there is nothing to widen. A loud 400 is
+# recoverable in one retry; a silent 200 is not recoverable at all.
+#
+# EXTENDING IT: register a new append target here (or in one of the unioned
+# registries). test_wm_append_unknown_slot.py derives the production population
+# from the `wm-append.sh <slot>` call sites in the tree and fails when one is
+# unregistered — so forgetting is loud at authoring time rather than silent at
+# runtime, which is the guard-2552 staleness mode this registry would otherwise
+# inherit. Keep the constant in sync with the daemon twin in
+# mind_api/src/endpoints/wm_write.py; the parity test pins it.
+APPEND_CREATABLE_EXTRA = {"notification_log", "proactive_escalation_log"}
+
+
+def append_creatable_slots():
+    """Root slot names an append may CREATE: every static registry, unioned."""
+    return (set(ARRAY_SLOTS) | set(CAPTURE_SLOTS) | set(DEFAULT_SLOT_TYPES)
+            | set(MAP_SLOTS) | set(TOP_LEVEL_KEYS) | set(RESET_SURVIVING_SLOTS)
+            | set(STRUCTURED_DICT_SLOTS) | set(APPEND_CREATABLE_EXTRA))
+
+
+def unknown_lane_refusal(slot, lane_exists):
+    """Reason to refuse this append, or None to allow it.
+
+    TWIN of _unknown_lane_refusal in mind_api/src/endpoints/wm_write.py. The
+    DAEMON copy is the LIVE path (wrappers are daemon-only), so editing this one
+    alone changes NOTHING at runtime while looking correct in the diff
+    (guard-742/547). Both halves move together.
+
+    Two checks with deliberately different scope:
+      1. A leading-dash root is refused ALWAYS, existing lane or not — no slot
+         is legitimately named after a command-line flag, and the three orphan
+         `--*` lanes measured above prove the arg loops mint them.
+      2. An unregistered root is refused only when the append would CREATE the
+         lane (see the registry comment for why creation is the right seam).
+    """
+    root = str(slot).split(".")[0]
+    if root.startswith("-"):
+        return (f"slot name {root!r} starts with '-', which is a command-line "
+                f"FLAG, not a slot. The wm-append/wm-clear/wm-set arg loops are "
+                f"bare catch-alls where the LAST positional wins, so a trailing "
+                f"flag silently becomes the slot name. Re-run with the slot as "
+                f"the only positional argument.")
+    if lane_exists:
+        return None
+    creatable = append_creatable_slots()
+    if root in creatable:
+        return None
+    # Near-miss on shared `_`-delimited TOKENS as well as substring, because the
+    # measured typos split both ways: `spark`/`exp` are substrings of their real
+    # lane, while `experience_capture` is not a substring of `exp_capture` and
+    # only the shared `capture` token connects them.
+    tokens = {t for t in root.split("_") if t}
+    near = sorted(n for n in creatable
+                  if (root in n or n in root
+                      or tokens & {t for t in n.split("_") if t}))[:6]
+    hint = f" Did you mean: {', '.join(near)}?" if near else ""
+    return (f"slot {root!r} is not a registered append target and does not "
+            f"exist, so this append would mint a new lane that no consumer "
+            f"reads and no carrier mirrors.{hint} If the lane is genuinely new, "
+            f"register it in APPEND_CREATABLE_EXTRA (wm.py AND the daemon twin "
+            f"in mind_api/src/endpoints/wm_write.py).")
+
+
 # : FIFO eviction at cap drops the OLDEST entry first, which is exactly
 # backwards for a capture the worker marked load-bearing — the longer a Body
 # runs, the more certain it is that its most important early finding is the one
@@ -868,6 +957,12 @@ def cmd_append(args):
             sys.exit(1)
 
         arr = parent.get(key)
+        # : refuse BEFORE minting the lane below. TWIN of the daemon
+        # copy in wm_write.py::append_slot (the LIVE path, guard-742).
+        _refusal = unknown_lane_refusal(args.slot, arr is not None)
+        if _refusal:
+            print(f"ERROR: {_refusal}", file=sys.stderr)
+            sys.exit(1)
         if arr is None:
             parent[key] = []
             arr = parent[key]

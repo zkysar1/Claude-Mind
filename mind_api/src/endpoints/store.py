@@ -198,6 +198,115 @@ def _commit(ctx, spec, path: Path, items: List[dict], summary: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Near-duplicate refusal ()
+# ---------------------------------------------------------------------------
+# The wrapper-side advisory (store_dupe_warn.py in the *-add.sh wrappers) warns
+# and never blocks — and guard-4090 measured the consequence: every warned twin
+# still landed. This is the enforcement tier at the SINGLE write chokepoint all
+# add paths share. Past the store's refuse_threshold the append returns 409
+# near_duplicate with a pointer to the existing entry, and that entry's
+# times_inferred_helpful is incremented post-lock (independent re-derivation of
+# the same content is usefulness evidence — same counter as the board
+# findings-citation lane; never times_cited, which carries zero weight in the
+# active utilization_score v1). Body field `allow_near_dup: true` (popped in
+# append(), never stored) bypasses. Anticipation gate ⇒ every failure inside
+# the check or its side effects fails OPEN and the add proceeds (rb-605,
+# guard-3803: the deny-message construction sits inside the same boundary).
+
+_INCREMENT_WRAPPER = {
+    "guardrails": "guardrails-increment.sh",
+    "reasoning-bank": "reasoning-bank-increment.sh",
+}
+
+
+class _IncrementCtx:
+    """Minimal ctx shim to drive increment() in-process (the board_write.py
+    _SubCtx pattern). Forwards paths + headers so the increment is attributed
+    to the refused writer's agent."""
+
+    __slots__ = ("paths", "headers", "query", "body")
+
+    def __init__(self, ctx, query):
+        self.paths = ctx.paths
+        self.headers = ctx.headers
+        self.query = query
+        self.body = b""
+
+
+def _near_dup_verdict(spec, store_key: str, rec: dict, items: list):
+    """refuse_check() over the in-lock items snapshot. Returns the evidence
+    dict or None; ANY internal failure returns None (fail-open)."""
+    try:
+        import store_dupe_warn as _sdw
+        cfg = _sdw.STORES.get(store_key or "")
+        if not cfg or not cfg.get("refuse_threshold"):
+            return None
+        corpus = []
+        for d in items:
+            if not isinstance(d, dict):
+                continue
+            if str(d.get("status", "")).lower() in _sdw._INACTIVE_STATUSES:
+                continue
+            text = _sdw.signal_text(d, cfg["fields"])
+            if text:
+                corpus.append((str(d.get(spec.id_field, "")), text))
+        return _sdw.refuse_check(rec, store_key, corpus)
+    except Exception:
+        return None
+
+
+def _near_dup_refusal_response(store_key: str, verdict: dict) -> "Response":  # type: ignore[name-defined]
+    """The 409 body. Carries the caller-verifiable evidence guard-1661
+    requires — nearest id, measured similarity, threshold, existing text —
+    plus the strengthen-instead instruction the Phase 6.5 protocol names."""
+    from ..server import Response
+    near_id = verdict["nearest_id"]
+    wrapper = _INCREMENT_WRAPPER.get(store_key)
+    strengthen = (
+        f"bash core/scripts/{wrapper} {near_id} utilization.times_helpful"
+        if wrapper else f"increment {near_id} utilization.times_helpful"
+    )
+    return Response.json({
+        "error": "near_duplicate",
+        "nearest_id": near_id,
+        "similarity": verdict["similarity"],
+        "refuse_threshold": verdict["refuse_threshold"],
+        "existing": verdict["nearest_text"],
+        "detail": (
+            f"REFUSED: this record scores {verdict['similarity']:.2f} against "
+            f"{near_id} (refuse threshold {verdict['refuse_threshold']}). "
+            f"{near_id}.times_inferred_helpful was incremented. If this "
+            f"restates {near_id}, STRENGTHEN it instead: {strengthen} — or "
+            f"retire it as superseded and re-add. Genuinely distinct? Re-send "
+            f"with --allow-near-dup (body field allow_near_dup:true)."
+        ),
+    }, status=409)
+
+
+def _near_dup_side_effects(ctx, store_key: str, verdict: dict) -> None:
+    """Post-lock: one gate-firings `block` row + the strengthen increment.
+    Both best-effort — a telemetry or increment failure must not turn a
+    clean refusal into a 500."""
+    try:
+        import _gate_log
+        _gate_log.log("store-dupe-warn", "block", caller="store.append",
+                      payload={"store": store_key},
+                      extra={"nearest_id": verdict["nearest_id"],
+                             "similarity": verdict["similarity"],
+                             "threshold": verdict["refuse_threshold"]})
+    except Exception:
+        pass
+    try:
+        increment(_IncrementCtx(ctx, {
+            "store": store_key,
+            "id": verdict["nearest_id"],
+            "field": "utilization.times_inferred_helpful",
+        }))
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
 
@@ -220,6 +329,11 @@ def append(ctx) -> "Response":  # type: ignore[name-defined]
     rec, err = _parse_body(ctx)
     if err:
         return err
+
+    # 0. Near-dup override flag (). Popped BEFORE any validate —
+    # it is a transport flag, not a record field, and the unknown-field gate
+    # would otherwise 400 on it. Never stored.
+    allow_near_dup = bool(rec.pop("allow_near_dup", False))
 
     # 1. Script-owned timestamp (overwrite unconditionally, ignore stdin).
     if spec.created_field:
@@ -287,12 +401,28 @@ def append(ctx) -> "Response":  # type: ignore[name-defined]
                     spec.validate(ctx, rec, skip_id=False)
                 except (ValueError, TypeError) as e:  # B10: TypeError -> 400, not 500
                     return Response.error(400, "validation_failed", str(e))
+            # Near-dup refusal () — inside the lock so the corpus is
+            # the exact fresh snapshot this append would extend; side effects
+            # (telemetry + strengthen increment) fire post-lock, because the
+            # increment takes this same store's lock.
+            if not allow_near_dup:
+                verdict = _near_dup_verdict(
+                    spec, ctx.query.get("store"), rec, items)
+                if verdict:
+                    near_dup_refusal.update(verdict)
+                    return _near_dup_refusal_response(
+                        ctx.query.get("store"), verdict)
             items.append(rec)
             _commit(ctx, spec, path, items,
                     f"store-append {ctx.query.get('store')} "
                     f"{rec.get(spec.id_field)}")
             return Response.json({"ok": True, "record": rec})
-        return file_locks.locked_rmw(path, _cycle)
+        near_dup_refusal: Dict[str, Any] = {}
+        resp = file_locks.locked_rmw(path, _cycle)
+        if near_dup_refusal:
+            _near_dup_side_effects(
+                ctx, ctx.query.get("store"), near_dup_refusal)
+        return resp
     except OSError as e:
         return Response.error(500, "write_failed", str(e))
 

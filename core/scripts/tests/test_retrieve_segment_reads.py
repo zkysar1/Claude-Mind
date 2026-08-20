@@ -320,15 +320,16 @@ def test_both_loaders_read_through_the_segmented_reader():
             f"{fn_name} still reads the legacy file directly"
 
 
-def test_counter_bumps_stay_on_the_legacy_path():
-    """The counter WRITES are the 93% churn this goal exists to kill, and they
-    move with the WRITER (a later unit), not with this reader. Pinned so a future
-    edit does not half-flip the write side while only the read side is ready."""
+def test_counter_bumps_carry_the_spool_kind():
+    """The counter WRITES were the 93% churn; the writer unit () moved
+    them behind the sidecar spool. Pinned so a future edit does not silently
+    drop the `kind` argument — a kind-less call is a permanent full-store RMW
+    per retrieval regardless of the UTILIZATION_COUNTERS_SPOOLED flag."""
     import inspect
     rb_src = inspect.getsource(_retrieve.load_reasoning_bank)
     guard_src = inspect.getsource(_retrieve.load_guardrails)
-    assert "_locked_bump_jsonl(RB_PATH, _should_bump)" in rb_src
-    assert "_locked_bump_jsonl(GUARD_PATH, _should_bump)" in guard_src
+    assert '_locked_bump_jsonl(RB_PATH, _should_bump, kind="reasoning-bank")' in rb_src
+    assert '_locked_bump_jsonl(GUARD_PATH, _should_bump, kind="guardrails")' in guard_src
 
 
 # ---------------------------------------------------------------------------

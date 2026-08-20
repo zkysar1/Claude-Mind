@@ -222,6 +222,21 @@ def update(ctx) -> "Response":  # type: ignore[name-defined]
             _append_nested(state, field, parsed)
         elif operation == "remove":
             _remove_nested(state, field, parsed)
+        #  / guard-1153, ported from the CLI dispatch (team-state.py)
+        # per guard-2323 — it landed CLI-side only, which is inert in a
+        # daemon-only deployment: strategic_focus is LWW-ordered on set_at by
+        # coordination_merge, and the stamp must ride the SAME mutation that
+        # writes the field or cross-box merges fall to the content tiebreak.
+        # An explicit set_at supplied BY the mutation is respected (the only
+        # way to restate a historical stamp — migrations, backfills).
+        if field == "strategic_focus" or field.startswith("strategic_focus."):
+            mutation_sets_set_at = (
+                field == "strategic_focus.set_at"
+                or (field == "strategic_focus"
+                    and isinstance(parsed, dict) and "set_at" in parsed))
+            if not mutation_sets_set_at:
+                _set_nested(state, "strategic_focus.set_at",
+                            datetime.now().strftime("%Y-%m-%dT%H:%M:%S"))
         if "recent_completions" in state:
             state["recent_completions"] = state["recent_completions"][-MAX_RECENT_COMPLETIONS:]
         return _stamp_metadata(state, agent)

@@ -43,7 +43,7 @@ from pathlib import Path
 
 from _gate_log import log as _gate_log
 from _git_state_absence_patterns import GIT_STATE_ABSENCE_PATTERNS
-from _paths import agent_dir as _agent_dir
+from _paths import agent_dir as _agent_dir, retrieval_session_path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CORE_ROOT = SCRIPT_DIR.parent
@@ -119,7 +119,7 @@ def _load_retrieval_manifest(agent_dir):
     """
     if agent_dir is None:
         return {}
-    path = agent_dir / "session" / "retrieval-session.json"
+    path = retrieval_session_path(agent_dir)  # body-aware, 
     if not path.is_file():
         return {}
     try:

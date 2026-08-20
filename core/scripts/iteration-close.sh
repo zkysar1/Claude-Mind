@@ -752,7 +752,10 @@ print("false")
 # Fail-open: always returns 0. Callers run under `set -e`; a feedback blip must
 # never abort the phase (the pending flag itself drives the retry).
 _repair_utilization_pending() {
-    local ret_file="$AGENT_DIR/session/retrieval-session.json"
+    # Body-aware (g-115-6653): on a worker Body the manifest lives at
+    # sessions/<sid>/body-retrieval-session.json, so the hand-composed
+    # agent-wide path made this repair a no-op for every worker-executed goal.
+    local ret_file; ret_file="$(retrieval_session_path "$AGENT_DIR")"
     [[ -f "$ret_file" ]] || return 0
     local pending
     # Env-var names are deliberately RUP_-prefixed, NOT the GID/RET_FILE pair the
@@ -2337,7 +2340,7 @@ for e in list(d.get('stranded') or []) + list(d.get('stranded_no_pr') or []):
             --artifact-produced commit \
             --artifact-ref "${_commit_sha:-}" \
             --artifact-write-time "$(date +%Y-%m-%dT%H:%M:%S)" \
-            --manifest "$AGENT_DIR/session/retrieval-session.json" \
+            --manifest "$(retrieval_session_path "$AGENT_DIR")" \
             >/dev/null 2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
     fi
 
@@ -2822,7 +2825,12 @@ do_learning_gate() {
     # stale (refers to a prior goal) and gets overwritten with a no-retrieval
     # stub. Either way a per-iteration retrieval-summary line is emitted — grep
     # over N iterations gives retrieval_using_ratio.
-    local ret_file="$AGENT_DIR/session/retrieval-session.json"
+    # Body-aware (g-115-6653). This site is the one that did ACTIVE harm on a
+    # worker: finding the agent-wide file absent/stale, it overwrote it with a
+    # no-retrieval STUB while the real manifest sat unread in sessions/<sid>/ —
+    # so the learning gate recorded retrieval_performed=false for every
+    # worker-executed goal, and the ratio it feeds was measuring the wrong file.
+    local ret_file; ret_file="$(retrieval_session_path "$AGENT_DIR")"
     local current_file_goal=""
     local current_file_stub="stub"
     local perf="false"   # g-115-2201: retrieval-performed flag for the pre-apply-consult drift gate below
@@ -3304,6 +3312,16 @@ do_productivity_check() {
     # line — the same identity merge_append_only_jsonl unions by), so `|| true`
     # is safe: a missed tick just leaves the spool for the next iteration.
     python3 "$(_winpath "$SCRIPT_DIR/gate-firings-flush.py")" \
+        >>"$CORE_ROOT/logs/iteration-close-stderr.log" 2>&1 || true
+    # Citation-credit sweep (g-115-6948): converts commit-message rb-/guard-
+    # citations (measured 84/day fleet-wide vs 1-7 explicit helpful events/day)
+    # into times_inferred_helpful increments — the mechanical consultation-
+    # credit lane. Self-gating: internal 3600s min-interval marker makes this a
+    # stat-check no-op between harvests; fleet-shared ledger in meta/ dedups
+    # across boxes; daemon preflight + claim-first ledgering bound outage cost
+    # to zero (preflight) or one commit's credits (mid-sweep death). Same
+    # idempotent/cheap/fail-open contract as the sibling sweeps.
+    python3 "$(_winpath "$SCRIPT_DIR/citation-credit-sweep.py")" --quiet \
         >>"$CORE_ROOT/logs/iteration-close-stderr.log" 2>&1 || true
     # Pending-deploys re-probe sweep (SG-b, g-115-2688-b). The do_verify gate
     # resolves the CLOSING goal's deploy obligations; this all-sweep re-probes

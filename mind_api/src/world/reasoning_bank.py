@@ -307,6 +307,23 @@ def guard_read(ctx) -> "Response":  # type: ignore[name-defined]
         items = _load(jc, paths)
         return json_response_pretty([r for r in items if r.get("category") == category])
 
+    severity = q.get("severity")
+    if severity:
+        # Full ACTIVE records for one severity tier (). Consumer:
+        # guardrail-manifest.sh, which prepends the CRITICAL always-load core
+        # (full rule text — their trigger zones are not self-announcing, so
+        # the expand-on-demand path structurally cannot cover them; see
+        # prime-store-load-budget.md "The CRITICAL admission rule") above the
+        # id manifest. Case-insensitive match: the marker's case is canonical
+        # UPPER since , but a reader must not silently drop a
+        # non-canonical straggler written by an unmigrated box.
+        want = str(severity).upper()
+        items = _load(jc, paths)
+        return json_response_pretty([
+            r for r in items
+            if r.get("status") == "active"
+            and str(r.get("severity") or "").upper() == want])
+
     if flag(q, "summary"):
         items = _load(jc, paths)
         lines = []
@@ -316,7 +333,7 @@ def guard_read(ctx) -> "Response":  # type: ignore[name-defined]
             lines.append(f"{rec.get('id', '?')}: [{cat}] {rule}")
         return plain_lines(lines)
 
-    return missing_flag_error(["active", "id", "category", "summary"])
+    return missing_flag_error(["active", "id", "category", "summary", "severity"])
 
 
 def register(routes) -> None:

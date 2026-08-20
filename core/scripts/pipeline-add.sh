@@ -17,17 +17,29 @@ _RUNTIME_SELF="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
+# : shared strict-argv refusal helpers (uniform message contract).
+# Sourced BEFORE _runtime.sh so a refusal cannot be masked by a daemon failure.
+# shellcheck disable=SC1091
+source "$CORE_ROOT/scripts/_argv_strict.sh"
+
 # --- Parse args -----------------------------------------------------------
 SCHEMA=0
-declare -a PASSTHROUGH=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        -h|--help)
+            echo "Usage: printf '%s' '<json>' | pipeline-add.sh"
+            exit 0;;
         --schema)
             SCHEMA=1
-            PASSTHROUGH+=("$1"); shift;;
+            shift;;
         *)
-            PASSTHROUGH+=("$1"); shift;;
+            # : was a silent append to the dead PASSTHROUGH
+            # accumulator. Worst case measured: `--help` fell through here,
+            # then BODY="$(cat)" below blocked FOREVER waiting on stdin —
+            # a 120s Bash-tool timeout plus a backgrounded orphan. Refusing
+            # BEFORE the cat converts the hang into an immediate error.
+            argv_strict_refuse_unknown "pipeline-add.sh" "$1" "(none — the record JSON arrives on STDIN)";;
     esac
 done
 

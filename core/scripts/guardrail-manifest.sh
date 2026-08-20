@@ -45,4 +45,24 @@ if [ -z "$SUMMARY" ]; then
     exit 1
 fi
 
-printf '%s\n' "$SUMMARY" | python3 "$SCRIPT_DIR/guardrail_manifest.py" "$@"
+# CRITICAL always-load core (): fetch the few severity=CRITICAL
+# records IN FULL and hand them to the transformer, which renders them whole
+# ABOVE the id manifest. Their admission rule (prime-store-load-budget.md) is
+# that the trigger zone is NOT self-announcing — the one class the id manifest
+# plus expand-on-demand structurally cannot cover. ADDITIVE and fail-open: any
+# failure here degrades to the plain manifest (yesterday's shape) with a
+# stderr warn — never block the index over its enhancement. Same capture
+# discipline as SUMMARY above (guard-1150: no pipe, no 2>&1 into the payload).
+CRIT_ARGS=()
+CRIT_JSON=""
+if CRIT_JSON="$(bash "$SCRIPT_DIR/guardrails-read.sh" --severity CRITICAL)" \
+        && [ -n "$CRIT_JSON" ]; then
+    CRIT_FILE="$(mktemp)"
+    trap 'rm -f "$CRIT_FILE"' EXIT
+    printf '%s\n' "$CRIT_JSON" > "$CRIT_FILE"
+    CRIT_ARGS=(--critical-json-file "$CRIT_FILE")
+else
+    echo "[guardrail-manifest] WARN: severity=CRITICAL fetch failed or empty — emitting the id manifest without the CRITICAL-full section." >&2
+fi
+
+printf '%s\n' "$SUMMARY" | python3 "$SCRIPT_DIR/guardrail_manifest.py" "${CRIT_ARGS[@]+"${CRIT_ARGS[@]}"}" "$@"

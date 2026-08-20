@@ -46,6 +46,43 @@ CLEAN = "clean.txt"
 FEATURE_TOKEN = "UNCOMMITTED-FEATURE-WORK"
 
 
+def _sh(p) -> str:
+    r"""Render a path the way the SHELL will see it in a command string.
+
+    These tests hand the gate a *shell command string*, and in production that
+    string is executed by bash (the Bash tool runs Git Bash on Windows). Bash
+    strips unquoted backslashes, so `str(Path)` on Windows builds
+    `git checkout -- C:\repo\dirty.txt`, which reaches git as the single
+    token `C:repodirty.txt` -- a path that does not exist. The command destroys
+    NOTHING, and the gate is CORRECT to stay silent on it.
+
+    MEASURED 2026-08-19 (alpha, DESKTOP-O91DLK2), against a real throwaway repo,
+    comparing gate-fires against whether the work was ACTUALLY destroyed:
+
+        form                 gate fires   actually destroys
+        unquoted backslash   False        False   <- what str(Path) produced
+        quoted backslash     True         True
+        forward slash        True         True
+
+    Zero false negatives, zero false positives -- bash and shlex.split were
+    verified byte-identical across all four quoting forms. So the 15 Windows
+    failures this helper fixes were the TEST asserting the gate should warn
+    about a command that cannot do harm, not a hole in the gate.
+
+    The silent-half cases were worse than red: they passed VACUOUSLY, because a
+    mangled pathspec never fires for any reason, so they would also have passed
+    against a completely dead gate.
+
+    as_posix() is a no-op on Linux, so this changes nothing there. Do NOT
+    "fix" this by normalising backslashes inside the gate: that would make the
+    gate diverge from the shell and warn about harmless commands (and see
+    rb-168 -- self-normalising applies to a path arriving as ARGV, not to one
+    embedded in a shell command string whose tokenisation is bash's).
+    g-115-6636.
+    """
+    return Path(p).as_posix()
+
+
 def _env_without_agent() -> dict:
     """Production shape property 1 — the gate must not need MIND_AGENT."""
     env = os.environ.copy()
@@ -106,7 +143,7 @@ def _fired(proc) -> bool:
     "git checkout -- {p} && echo done",     # chained
 ])
 def test_fires_on_destructive_form_against_dirty_path(repo, template):
-    proc = _run(template.format(p=str(repo / DIRTY)))
+    proc = _run(template.format(p=_sh(repo / DIRTY)))
     assert _fired(proc), f"expected advisory for: {template}"
     assert DIRTY in proc.stdout
 
@@ -118,18 +155,18 @@ def test_fires_via_cd_prefix_with_relative_path(repo):
     `cd`. Without that, a relative path would silently resolve against the hook
     process cwd and find nothing — a false ALL-CLEAR, the dangerous direction.
     """
-    proc = _run(f"cd {repo} && git checkout -- {DIRTY}")
+    proc = _run(f"cd {_sh(repo)} && git checkout -- {DIRTY}")
     assert _fired(proc)
 
 
 def test_fires_via_git_C_with_relative_path(repo):
-    proc = _run(f"git -C {repo} checkout -- {DIRTY}")
+    proc = _run(f"git -C {_sh(repo)} checkout -- {DIRTY}")
     assert _fired(proc)
 
 
 def test_fires_on_whole_tree_pathspec(repo):
     """`git checkout -- .` is the maximally destructive form."""
-    proc = _run(f"cd {repo} && git checkout -- .")
+    proc = _run(f"cd {_sh(repo)} && git checkout -- .")
     assert _fired(proc)
 
 
@@ -144,7 +181,7 @@ def test_fires_on_merge_conflict_resolution_forms(repo, flag):
     most destructive forms git has. Remove either flag's absence from
     _VALUE_FLAGS and this goes red.
     """
-    proc = _run(f"cd {repo} && git checkout {flag} {DIRTY}")
+    proc = _run(f"cd {_sh(repo)} && git checkout {flag} {DIRTY}")
     assert _fired(proc), f"{flag} must not swallow the pathspec"
 
 
@@ -156,7 +193,7 @@ def test_fires_when_semicolon_chains_the_next_command(repo):
     semicolon that matches no file. Silent false negative. The `&&` form was
     already covered and passes -- which is exactly why this one hid.
     """
-    proc = _run(f"cd {repo} && git checkout -- {DIRTY}; echo done")
+    proc = _run(f"cd {_sh(repo)} && git checkout -- {DIRTY}; echo done")
     assert _fired(proc)
 
 
@@ -177,7 +214,7 @@ def test_many_pathspecs_are_not_silently_truncated(repo):
     _git(repo, "add", *pads)
     _git(repo, "commit", "-q", "-m", "pad")
     specs = " ".join(pads) + f" {DIRTY}"
-    proc = _run(f"cd {repo} && git checkout -- {specs}")
+    proc = _run(f"cd {_sh(repo)} && git checkout -- {specs}")
     assert _fired(proc), "the dirty path must be examined, not truncated away"
 
 
@@ -193,7 +230,7 @@ def test_many_pathspecs_are_not_silently_truncated(repo):
     ("git commit -m 'restore checkout'", "prose mentioning both words"),
 ])
 def test_silent_on_non_destructive_forms(repo, template, why):
-    cmd = template.format(p=str(repo / DIRTY), c=str(repo / CLEAN))
+    cmd = template.format(p=_sh(repo / DIRTY), c=_sh(repo / CLEAN))
     assert not _fired(_run(cmd)), f"false positive ({why}): {cmd}"
 
 
@@ -205,38 +242,38 @@ def test_silent_on_branch_name_not_a_path(repo):
     guessed structurally (contains a slash, exists on disk) would misfire here.
     """
     _git(repo, "branch", "somefeature")
-    assert not _fired(_run(f"cd {repo} && git checkout somefeature"))
+    assert not _fired(_run(f"cd {_sh(repo)} && git checkout somefeature"))
 
 
 def test_silent_on_nonexistent_pathspec(repo):
-    assert not _fired(_run(f"cd {repo} && git checkout -- no/such/file.txt"))
+    assert not _fired(_run(f"cd {_sh(repo)} && git checkout -- no/such/file.txt"))
 
 
 def test_silent_on_untracked_file(repo):
     """`-uno` is load-bearing: checkout/restore do not touch untracked files, so
     counting them would be a pure false positive."""
     (repo / "untracked.txt").write_text("scratch\n", encoding="utf-8")
-    assert not _fired(_run(f"cd {repo} && git checkout -- untracked.txt"))
+    assert not _fired(_run(f"cd {_sh(repo)} && git checkout -- untracked.txt"))
 
 
 def test_silent_on_quoted_prose_mentioning_the_command(repo):
     """guard-958: a token-anchored predicate must not trip on authored text."""
-    p = str(repo / DIRTY)
+    p = _sh(repo / DIRTY)
     assert not _fired(_run(f'echo "never run git checkout -- {p}"'))
 
 
 def test_silent_when_not_a_bash_tool(repo):
-    assert not _fired(_run(f"git checkout -- {repo / DIRTY}", tool_name="Edit"))
+    assert not _fired(_run(f"git checkout -- {_sh(repo / DIRTY)}", tool_name="Edit"))
 
 
 def test_silent_on_unbalanced_quotes(repo):
     """Unparseable shell line — fail open rather than guess."""
-    assert not _fired(_run(f"git checkout -- '{repo / DIRTY}"))
+    assert not _fired(_run(f"git checkout -- '{_sh(repo / DIRTY)}"))
 
 
 def test_override_suppresses_the_advisory(repo):
     cmd = (f'GIT_RESTORE_UNCOMMITTED_OVERRIDE="mutation scratch, disposable" '
-           f'git checkout -- {repo / DIRTY}')
+           f'git checkout -- {_sh(repo / DIRTY)}')
     assert not _fired(_run(cmd))
 
 
@@ -247,7 +284,7 @@ def test_advisory_payload_carries_every_delivered_field(repo):
     reach the model. Each field is asserted separately so a narrowing edit fails
     here loudly instead of producing a gate that fires and communicates nothing.
     """
-    proc = _run(f"git checkout -- {repo / DIRTY}")
+    proc = _run(f"git checkout -- {_sh(repo / DIRTY)}")
     d = json.loads(proc.stdout)
     hso = d["hookSpecificOutput"]
     assert hso["hookEventName"] == "PreToolUse"
@@ -267,6 +304,47 @@ def test_wrapper_delivers_on_both_channels(repo):
     human-at-the-terminal half of the delivery. A future 2>/dev/null 'tidy-up'
     would mute it silently — this pins both channels through the real wrapper.
     """
-    proc = _run(f"git checkout -- {repo / DIRTY}", target=WRAPPER, cwd=SCRIPTS.parents[1])
+    proc = _run(f"git checkout -- {_sh(repo / DIRTY)}", target=WRAPPER, cwd=SCRIPTS.parents[1])
     assert _fired(proc), "wrapper must deliver the structured payload"
     assert "ADVISORY" in proc.stderr, "wrapper must not suppress the stderr channel"
+
+
+# ── WINDOWS PATH SHAPES: the gate must track BASH, not guess ────────────────
+# Added . Everything above renders paths through _sh() (forward
+# slashes), which is what an agent actually writes into a Bash command. These
+# two pin the NATIVE Windows shapes, and together they state the contract the
+# gate is measured against: fire exactly when the command can really destroy
+# work, and stay silent when it cannot. Any future change that "helpfully"
+# normalises backslashes inside the gate turns the second one red.
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows path shapes")
+def test_fires_on_quoted_windows_backslash_path(repo):
+    r"""A QUOTED backslash path survives bash verbatim and git accepts it.
+
+    Measured: bash passes `C:\repo\dirty.txt` through unchanged inside double
+    quotes, git restores it, and the uncommitted work is gone. So this form is
+    genuinely destructive and the gate MUST warn. It was uncovered before
+    g-115-6636 — the suite only ever built unquoted paths.
+    """
+    proc = _run('git checkout -- "%s"' % (repo / DIRTY))
+    assert _fired(proc), "quoted backslash path is destructive — must warn"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows path shapes")
+def test_silent_on_unquoted_windows_backslash_path(repo):
+    r"""An UNQUOTED backslash path cannot destroy anything, so silence is right.
+
+    Bash strips the backslashes before git ever sees them: `C:\repo\dirty.txt`
+    arrives as the single token `C:repodirty.txt`, which matches no file, so the
+    command is a no-op that errors. Verified by running it through real bash and
+    confirming the uncommitted work SURVIVED.
+
+    This is the exact shape that produced 15 red tests on Windows and the
+    "the gate is silently inert" report behind g-115-6636. It was the test that
+    was wrong, not the gate. Do not make this one pass by teaching the gate to
+    un-mangle backslashes — that would warn about harmless commands and, worse,
+    make the gate's model of a command disagree with the shell that runs it.
+    """
+    assert not _fired(_run(f"git checkout -- {repo / DIRTY}")), (
+        "bash mangles this to a nonexistent path; warning would be a false positive"
+    )

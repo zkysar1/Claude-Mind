@@ -26,6 +26,7 @@ tests here pin that BOTH call sites import the one shared list rather than keepi
 hand-typed copies — a test that exercised only the CLI copy would pass while the
 defect stayed fully open (guard-742/547, the same class this codebase re-learns).
 """
+import json
 import pathlib
 import subprocess
 import sys
@@ -47,8 +48,33 @@ _PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 class _StubPaths:
     project_root = pathlib.Path(".")
-    world = pathlib.Path(".")
+    # Deliberately NOT cwd, and deliberately not a real directory. On the ADMIT
+    # path `update_goal` reaches `log_unstructured_override(ctx.paths.world, ...)`,
+    # which appends to `world / "blocker-gate-overrides.jsonl"` — so a
+    # cwd-relative world made every run of this file drop a real audit ledger at
+    # PROJECT_ROOT. That artifact was then committed (989031be4) and shipped on
+    # origin/main, arming a merge wedge on every box whose test run recreated it
+    # (). The autouse fixture below replaces this per test; the poison
+    # value is what guarantees that deleting the fixture can never silently
+    # restore the cwd write — the ledger would land somewhere unwritable instead,
+    # and the positive control in the override test would fail.
+    world = pathlib.Path("/nonexistent/g-115-6814-stub-world-not-patched")
     agent_name = "test-agent"
+
+
+@pytest.fixture(autouse=True)
+def _stub_world(tmp_path, monkeypatch):
+    """Point the stub's world at a per-test tmp dir, for EVERY test here.
+
+    Module-wide rather than applied only to the one test that writes today. The
+    allowlist gate fires BEFORE path resolution, so *which* tests reach I/O is a
+    property of which ones the gate ADMITS — and that set changes whenever the
+    allowlist does. Scoping the redirect to the current writer would leave the
+    next admitted test to rediscover this at PROJECT_ROOT, which is exactly how
+    the artifact got committed the first time.
+    """
+    monkeypatch.setattr(_StubPaths, "world", tmp_path)
+    return tmp_path
 
 
 class _StubCtx:
@@ -122,7 +148,7 @@ def test_known_fields_pass_the_allowlist_gate(good):
         )
 
 
-def test_override_header_admits_a_new_field():
+def test_override_header_admits_a_new_field(_stub_world):
     """The escape hatch must actually open, or the gate is a wall.
 
     A genuinely new field is a deliberate act with a justification on the audit
@@ -137,6 +163,23 @@ def test_override_header_admits_a_new_field():
     assert "unknown_goal_field" not in body, (
         "the override header did not admit the field: " + body[:300]
     )
+
+    # POSITIVE CONTROL, and the pin against  regressing. This is the
+    # ONE test that runs past the gate into real I/O, and the writer is
+    # best-effort — `log_unstructured_override` swallows every write error and
+    # returns None. So pointing `world` at the wrong place does not fail: it
+    # silently disables the audit trail while the assertion above still passes.
+    # Asserting the record landed in the tmp dir is a complete inverse of the
+    # defect: if the write went to cwd (PROJECT_ROOT) instead, this is missing.
+    ledger = _stub_world / "blocker-gate-overrides.jsonl"
+    assert ledger.exists(), (
+        "the field was admitted but no override record reached the audit ledger "
+        f"at {ledger} — either the world path is wrong (the write escaped to cwd, "
+        "which is the g-115-6814 defect) or the logging call was dropped"
+    )
+    record = json.loads(ledger.read_text(encoding="utf-8").splitlines()[0])
+    assert record["source"] == "daemon:update_goal:allow-new-field", record
+    assert record["justification"] == "shipping its writer in this change", record
 
 
 def test_cli_twin_refuses_without_touching_the_store():

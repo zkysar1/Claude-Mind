@@ -63,8 +63,20 @@ When forming a negative conclusion about capabilities, features, or possibilitie
    `experience-read.sh --category|--goal|--type|--recent`.
 
 5. **Retrieval escalation**: Follow `core/config/conventions/retrieval-escalation.md`
-   — Tier 1 (tree) → Tier 2 (codebase) → Tier 3 (web search) before concluding
-   something doesn't exist.
+   — Tier 1 (tree) → Tier 2 (codebase) → **Tier 2.5 (peer worlds)** → Tier 3 (web
+   search) before concluding something doesn't exist.
+
+   **Tier 2.5 is `core/scripts/peer-retrieve.sh`, and it answers with TWO fields
+   that must BOTH be read**: `status` (`hit` / `empty` / `unreachable` — "did I
+   find anything?") and `completeness` (`complete` / `partial` — "did I see
+   everything?"). **Only `status: empty` at `completeness: complete` (rc=0)
+   licenses a negative conclusion.** rc=3 means the reader ran fine but at least
+   one world could not be fully read, so the lane came back `partial` — and a
+   `partial` or `unreachable` lane found nothing for exactly the reason a
+   `2>/dev/null` command finds nothing (rule 4 of `verify-before-assuming.md`:
+   it never looked). Peer deployments hold their own trees, reasoning banks and
+   guardrails, so "not in MY world" is not "not built", and a sibling world is
+   the independent second signal that rule's multi-signal requirement asks for.
 
 6. **Search the GOAL QUEUE — not just the code** (added 2026-07-14, zeta). A large
    class of invocations lives in a **recurring goal's `description`**, never in

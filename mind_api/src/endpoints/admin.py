@@ -254,6 +254,40 @@ def owncloud_sync_file(ctx) -> "Response":  # type: ignore[name-defined]
     })
 
 
+def _local_claim_store(ctx):
+    """Git-ref claim store for a non-own-cloud backend, or None when unusable.
+
+    The local arm of single-runner enforcement (g-306-331). Before this existed,
+    every non-own-cloud backend returned a no-op success from the four runner
+    endpoints, so a local-backend deployment had NO cross-machine claim at all:
+    nothing stopped two boxes running the same agent and neither could see the
+    other. git's rejected non-fast-forward push supplies the same
+    compare-and-swap the own-cloud record store was providing, with no new
+    service.
+
+    Returns None — preserving the historical no-op exactly — when git or a
+    remote is missing. Never raises: a claim-store construction failure must
+    degrade to today's behaviour, not 500 the endpoint.
+    """
+    scripts_dir = str(ctx.paths.project_root / "core" / "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    try:
+        from git_ref_claim import GitRefClaimStore
+    except Exception:  # noqa: BLE001 — absent module ⇒ historical no-op
+        return None
+    root = str(ctx.paths.project_root)
+    try:
+        if not GitRefClaimStore.available(root):
+            return None
+        return GitRefClaimStore(
+            repo_root=root,
+            env_id=os.environ.get("ENVIRONMENT_ID", "ayoai-mind"),
+        )
+    except Exception:  # noqa: BLE001 — same degrade-to-no-op contract
+        return None
+
+
 def _runner_preamble(ctx, *, need_token: bool = True):
     """Shared front-half for the three runner-claim endpoints (design §4):
     validate query params, short-circuit non-own-cloud backends, ensure
@@ -271,11 +305,19 @@ def _runner_preamble(ctx, *, need_token: bool = True):
             status=400))
     backend = os.environ.get("STORAGE_BACKEND", "local").strip().lower()
     if backend != "own-cloud":
-        # Single machine / local store — there is no DDB claim to mutate. A
-        # no-op success keeps the caller's gated path uniform across backends.
+        # Local arm: a git ref supplies the CAS the own-cloud store does ().
+        # Returned as a callable so the four endpoints keep calling
+        # `get_backend().<method>(...)` unchanged — the store implements the
+        # same runner method names as OwnCloudBackend.
+        store = _local_claim_store(ctx)
+        if store is not None:
+            return (backend, (lambda: store), None)
+        # No git/remote — fall back to the historical no-op success, which keeps
+        # the caller's gated path uniform across backends.
         return (backend, None, Response.json(
-            {"backend": backend, "ok": True, "noop": True,
-             "reason": "non-own-cloud backend — no cross-machine DDB claim"}))
+            {"backend": backend, "ok": True, "noop": True, "claim_store": False,
+             "reason": "non-own-cloud backend with no usable git remote — "
+                       "no cross-machine claim store"}))
     scripts_dir = str(ctx.paths.project_root / "core" / "scripts")
     if scripts_dir not in sys.path:
         sys.path.insert(0, scripts_dir)
@@ -473,10 +515,19 @@ def runner_claims(ctx) -> "Response":  # type: ignore[name-defined]
     alone cannot see, and it authorises nothing."""
     from ..server import Response
     backend = os.environ.get("STORAGE_BACKEND", "local").strip().lower()
+    local_store = None
     if backend != "own-cloud":
-        return Response.json(
-            {"backend": backend, "ok": True, "claims": [],
-             "reason": "non-own-cloud backend — no cross-machine DDB claims"})
+        # Local arm (). Unlike the three mutating endpoints this one is
+        # a read, so an empty list here is what `runner-claim.sh status` reads as
+        # "no live runner" — hence `claim_store`, which distinguishes "asked a
+        # real store and it was empty" from "there was no store to ask".
+        local_store = _local_claim_store(ctx)
+        if local_store is None:
+            return Response.json(
+                {"backend": backend, "ok": True, "claims": [],
+                 "claim_store": False,
+                 "reason": "non-own-cloud backend with no usable git remote — "
+                           "no cross-machine claim store"})
     scripts_dir = str(ctx.paths.project_root / "core" / "scripts")
     if scripts_dir not in sys.path:
         sys.path.insert(0, scripts_dir)
@@ -487,7 +538,7 @@ def runner_claims(ctx) -> "Response":  # type: ignore[name-defined]
             {"backend": backend, "ok": False, "error": f"import failed: {e}"},
             status=500)
     try:
-        be = get_backend()
+        be = local_store if local_store is not None else get_backend()
         claims = be.list_runner_claims()
     except Exception as e:  # noqa: BLE001 — DDB Scan error must not 500-with-stack
         msg = str(e)
@@ -511,6 +562,12 @@ def runner_claims(ctx) -> "Response":  # type: ignore[name-defined]
         return Response.json(payload, status=500)
     return Response.json({
         "backend": backend, "ok": True,
+        # TRUE means "a real claim store answered", which is what distinguishes
+        # an empty `claims` list from the absence of any store to ask. Callers
+        # must treat a MISSING field as the legacy predicate (`backend ==
+        # "own-cloud"`), never as false — an older daemon omits it entirely and
+        # would otherwise start reporting every own-cloud box as unclaimable.
+        "claim_store": True,
         "environment_id": os.environ.get("ENVIRONMENT_ID", "ayoai-mind"),
         # The freshness threshold a caller must apply to heartbeat_at to decide
         # "live" vs "stale". Reported here rather than re-derived caller-side so

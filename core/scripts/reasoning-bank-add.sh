@@ -21,12 +21,14 @@ CORE_ROOT="$PROJECT_ROOT/core"
 
 # --- Parse args -----------------------------------------------------------
 SCHEMA=0
+ALLOW_NEAR_DUP=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --schema) SCHEMA=1; shift;;
+        --allow-near-dup) ALLOW_NEAR_DUP=1; shift;;
         --help|-h)
             # A stdin-body reader HANGS on --help without this branch (guard-3145).
-            echo "Usage: bash $0 < record.json   — the record is JSON on STDIN; there are NO field flags." >&2
+            echo "Usage: bash $0 < record.json   — the record is JSON on STDIN; field values NEVER come from flags. --allow-near-dup bypasses the near-duplicate refusal (g-115-6948)." >&2
             echo "Canonical form: core/config/conventions/stdin-json-inputs.md" >&2
             exit 0;;
         *)
@@ -49,6 +51,19 @@ BODY="$(cat)"
 # --- Daemon path ----------------------------------------------------------
 # shellcheck disable=SC1091
 source "$CORE_ROOT/scripts/_runtime.sh"
+
+# : forward the near-dup override as a transport field the daemon
+# pops before validation. Injected here (not by the caller) so the flag stays
+# a CLI concern and the JSON contract on stdin is unchanged.
+if [ "${ALLOW_NEAR_DUP}" = "1" ]; then
+    # shellcheck disable=SC2086
+    BODY="$(printf '%s' "$BODY" | $(rt_python_launcher) -c "
+import json, sys
+d = json.load(sys.stdin)
+d['allow_near_dup'] = True
+print(json.dumps(d, ensure_ascii=False))
+")"
+fi
 
 # --- Advisory near-duplicate warning () --------------------------
 # Prints ONE stderr advisory when this record closely resembles an existing
@@ -79,7 +94,13 @@ RESPONSE="$(rt_call POST /v1/store/append \
 
 case $rc in
     0) _print_record "$RESPONSE"; exit 0;;
-    2) exit 1;;
+    2)
+        # Surface the daemon's refusal verbatim before the nonzero exit
+        # (guard-1673: never discard the consumer's precise reason; guard-1720:
+        # a rejected write must not read as success). A 409 near_duplicate
+        # () carries the strengthen-instead pointer the writer needs.
+        if [ -n "${RESPONSE:-}" ]; then printf '%s\n' "$RESPONSE" >&2; fi
+        exit 1;;
     3)
         # DAEMON-ONLY (2026-05-15 cutover): no Python CLI fallback.
         if rt_try_autospawn; then
@@ -88,6 +109,10 @@ case $rc in
                 --query "store=reasoning-bank" \
                 --body-string "$BODY")" || rc=$?
             if [ "$rc" = "0" ]; then _print_record "$RESPONSE"; exit 0; fi
+            if [ "$rc" = "2" ]; then
+                if [ -n "${RESPONSE:-}" ]; then printf '%s\n' "$RESPONSE" >&2; fi
+                exit 1
+            fi
         fi
         rt_no_daemon_error "reasoning-bank-add.sh";;
     *) exit $rc;;

@@ -148,7 +148,15 @@ def test_wrapper_rb_update_field_missing_args(running_daemon):
 # reasoning-bank-increment.sh
 # ===========================================================================
 
-def test_wrapper_rb_increment(running_daemon):
+def test_wrapper_rb_increment(running_daemon, monkeypatch):
+    # LANE PIN (2026-08-20): this test asserts the LEGACY embedded-counter RMW.
+    # Post  the session env of any flipped box carries
+    # UTILIZATION_COUNTERS_SPOOLED=1, which leaks into the in-process test
+    # daemon and routes the increment to the spool — freezing the embedded
+    # counter and failing this test only on flipped boxes (env-dependence,
+    # not portability). Pin the legacy lane explicitly; the spool lane has
+    # its own tests (test_utilization_spool.py + *_spooled_surface twins).
+    monkeypatch.delenv("UTILIZATION_COUNTERS_SPOOLED", raising=False)
     project_root, _ = running_daemon
     live = _rb_path(project_root)
     # rb-002 has times_helpful=3
@@ -164,6 +172,37 @@ def test_wrapper_rb_increment_missing_args(running_daemon):
     r = _run_wrapper(project_root, "reasoning-bank-increment.sh", ["rb-002"])
     assert r.returncode == 1
     assert "Usage" in r.stderr
+
+
+def test_wrapper_rb_increment_spooled_surface(running_daemon, monkeypatch):
+    """f40656f72 (): on the spool lane the wrapper must SAY so.
+
+    The spool path returns a bare-id record BY DESIGN (it never reads the
+    content store), so before the `spooled`/`where` surface existed a working
+    spooled write printed byte-identically to a no-op — two agents re-read the
+    content store, found the embedded counter frozen (also by design,
+    g-358-05), and filed a false HIGH data-loss goal. This pins the reporting
+    hop; the daemon-side spool behavior is pinned in test_utilization_spool.py.
+    The running_daemon fixture is an in-process thread, so monkeypatching this
+    process's env is what its spooled_enabled() reads.
+    """
+    project_root, _ = running_daemon
+    monkeypatch.setenv("UTILIZATION_COUNTERS_SPOOLED", "1")
+    live = _rb_path(project_root)
+    before = next(x for x in _read_jsonl(live) if x["id"] == "rb-002")
+    before_count = before["utilization"]["times_helpful"]
+    r = _run_wrapper(project_root, "reasoning-bank-increment.sh",
+                     ["rb-002", "utilization.times_helpful"])
+    assert r.returncode == 0, f"stderr: {r.stderr}"
+    out = json.loads(r.stdout)
+    assert out.get("spooled") is True, (
+        "spool-lane increment did not surface `spooled` — the ambiguity that "
+        f"produced the g-115-6850 false alarm is back. stdout: {r.stdout[:200]}")
+    assert "SIDECAR" in (out.get("where") or "")
+    # The content store must be untouched on this lane — that is the design
+    # the reporting surface exists to explain.
+    after = next(x for x in _read_jsonl(live) if x["id"] == "rb-002")
+    assert after["utilization"]["times_helpful"] == before_count
 
 
 # ===========================================================================
@@ -237,8 +276,16 @@ def test_wrapper_guard_update_field_missing_args(running_daemon):
 # guardrails-increment.sh
 # ===========================================================================
 
-def test_wrapper_guard_increment(running_daemon):
+def test_wrapper_guard_increment(running_daemon, monkeypatch):
     # Seeds lack trigger_condition/source — add a valid record, then increment.
+    # LANE PIN (2026-08-20): this test asserts the LEGACY embedded-counter RMW.
+    # Post  the session env of any flipped box carries
+    # UTILIZATION_COUNTERS_SPOOLED=1, which leaks into the in-process test
+    # daemon and routes the increment to the spool — freezing the embedded
+    # counter and failing this test only on flipped boxes (env-dependence,
+    # not portability). Pin the legacy lane explicitly; the spool lane has
+    # its own tests (test_utilization_spool.py + *_spooled_surface twins).
+    monkeypatch.delenv("UTILIZATION_COUNTERS_SPOOLED", raising=False)
     project_root, _ = running_daemon
     live = _guard_path(project_root)
     _run_wrapper(project_root, "guardrails-add.sh", [],
@@ -256,3 +303,24 @@ def test_wrapper_guard_increment_missing_args(running_daemon):
                      ["guard-001"])
     assert r.returncode == 1
     assert "Usage" in r.stderr
+
+
+def test_wrapper_guard_increment_spooled_surface(running_daemon, monkeypatch):
+    """Guardrails twin of test_wrapper_rb_increment_spooled_surface — both
+    wrappers carry the f40656f72 reporting surface; pin both or a partial
+    revert passes."""
+    project_root, _ = running_daemon
+    _run_wrapper(project_root, "guardrails-add.sh", [],
+                 stdin_data=json.dumps(_guard_rec(id="guard-401")))
+    monkeypatch.setenv("UTILIZATION_COUNTERS_SPOOLED", "1")
+    live = _guard_path(project_root)
+    before = next(x for x in _read_jsonl(live) if x["id"] == "guard-401")
+    before_count = before["utilization"]["times_helpful"]
+    r = _run_wrapper(project_root, "guardrails-increment.sh",
+                     ["guard-401", "utilization.times_helpful"])
+    assert r.returncode == 0, f"stderr: {r.stderr}"
+    out = json.loads(r.stdout)
+    assert out.get("spooled") is True, f"stdout: {r.stdout[:200]}"
+    assert "SIDECAR" in (out.get("where") or "")
+    after = next(x for x in _read_jsonl(live) if x["id"] == "guard-401")
+    assert after["utilization"]["times_helpful"] == before_count

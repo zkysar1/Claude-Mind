@@ -160,31 +160,29 @@ token budget below, as a bounded index plus on-demand expansion, never in full.
    (~665k tokens), larger than the whole context window — so the former
    unconditional-load instruction could never have executed.
    - Bash: guardrail-manifest.sh → ids grouped by category, covering 100% of
-     active guardrails. Every guardrail is present by id; NO rule text is loaded.
-     Measured 2026-08-19 (zeta, cc-02, 6.8.0-137-generic): **52 KB / 4099
-     records / 324 categories / ~21k tokens** — inside the budget. It replaced
-     `--summary` (468 KB, ~3.2x over) after measurement showed the breach was
-     count-driven and unfixable per-line: rule text is 69.8% of that file and is
-     ALREADY truncated at exactly 80 chars (p50 = p90 = max = 80), so there was
-     no slack to reclaim, while the safety floor those callers state is id
-     coverage — not text coverage (g-115-6703). Growth is now COUNT-only
-     (~41 records/day ≈ +0.4 KB/day), so +30 days ≈ 64 KB / ~26k tokens, still
-     inside; it re-breaches only past ~4x today's record count.
-     `--summary` remains correct for callers that want the truncated text.
-   - The manifest carries NO rule text, so guard-1421 holds by construction
-     rather than by discipline: there is no truncated imperative to misread.
+     active guardrails, prefixed (since 2026-08-20, g-115-6965) by every
+     severity=CRITICAL rule IN FULL. Measured 2026-08-19 (zeta, cc-02): id
+     manifest **52 KB / 4099 records / ~21k tokens**; ~70 KB / ~28k with the
+     CRITICAL section — inside the budget. It replaced `--summary` (468 KB,
+     ~3.2x over): that breach was count-driven and per-line compression was
+     measured EXHAUSTED, while the safety floor the callers state is id
+     coverage, not text coverage (g-115-6703; evidence in the transformer
+     docstring). Growth is COUNT-only (~41 records/day ≈ +0.4 KB/day) —
+     re-breach needs ~4x today's count. `--summary` remains correct for
+     callers that want the truncated text.
+   - The id rollup carries NO truncated rule text, so guard-1421 holds by
+     construction: nothing is half-shown (CRITICAL entries arrive whole).
    - Before acting inside a guardrail's trigger zone, expand it IN FULL:
      `guardrails-read.sh --id guard-NNN`, or `--category <cat>` for a whole lane.
    - The always-load core is identified by the explicit `severity` marker —
      NEVER by a utilization count (guard-841 / rb-1824: times_active is
      cumulative, so passive always-on rails read healthy-HIGH and a count
-     threshold would drop exactly the wrong entries). The marker's CASE is now
-     canonical — `CRITICAL`/`HIGH`/`MEDIUM`/`LOW`, uppercase, matching CLAUDE.md
-     Priority Values (g-115-3573, 2026-08-02: 408 records normalized, zero
-     non-canonical remain) — so it can be compared without case-folding. It is
-     still not usable as a SELECTOR: 1594/2123 (75%) carry no severity at all
-     and only 3 are CRITICAL. Until it is populated, the 100%-coverage index
-     above IS the safety floor — do not substitute a ranked slice for it.
+     threshold would drop exactly the wrong entries). Canonical case: UPPER
+     (g-115-3573). The manifest REALIZES the tier (g-115-6965): every
+     severity=CRITICAL rule rides above the rollup whole (15 of 4,198
+     active, 2026-08-20; the fetch degrades fail-open to the plain
+     manifest). Severity stays ADDITIVE, never a selector — the id manifest
+     remains the 100%-coverage floor; never substitute a ranked slice.
    - The admission rule for the CRITICAL always-load tier (both clauses: the
      harm outlives the loop, AND the trigger zone is not self-announcing) is
      `core/config/rationale/prime-store-load-budget.md` → "The CRITICAL
@@ -202,10 +200,9 @@ token budget below, as a bounded index plus on-demand expansion, never in full.
      each (a shallow id+title INDEX), while 10 in 42 KB is ~4.3 KB each (FULL
      bodies). Same token cost, ~98% less recall breadth. Believed intended (the
      bounding work in g-115-3407); the figure simply was not updated with it.
-     `--limit N` does NOT widen this — measured 3/25/100 all returning exactly
-     10, because the wrapper never reads the flag (g-115-4428: a PASSTHROUGH
-     array appended at 4 sites and read at zero, orphaned by the 2026-05-14
-     daemon cutover, so a mistyped or unsupported filter is swallowed rc=0).
+     `--recent N` widens it (verified 3→3, 25→25). A mistyped flag is now
+     REFUSED loudly at exit 2 (g-115-4428, fixed 2026-08-20 — formerly
+     swallowed rc=0), and a BOUNDED-LOAD stderr warning fires past 8192 B/entry.
    - Category-relevant entries load in Phase 3 via
      `retrieve.sh --category {cat} --depth {tier_depth}` (DEPTH_LIMITS:
      shallow 15 / medium 30 / deep 50) — the existing budgeted path.

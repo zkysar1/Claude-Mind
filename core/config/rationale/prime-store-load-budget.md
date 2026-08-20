@@ -180,6 +180,39 @@ index gets the full ~2.7M-token JSON load with no error and no warning (verified
 2026-07-27: 10,804,345 bytes, vs 10,789,367 for `--universal` alone). Anyone
 extending this policy will reach for that combination first; it does not work.
 
+## The CRITICAL tier is REALIZED (2026-08-20, g-115-6965)
+
+Until 2026-08-20 the CRITICAL always-load tier was doctrine without a
+mechanism: the admission rule above defined which guardrails must load whole,
+but prime loaded ZERO rule text — the id manifest (g-115-6703) deliberately
+carries none, and the CRITICAL class is definitionally the one
+expand-on-demand cannot cover (its trigger zone is not self-announcing, so
+nothing prompts the expansion).
+
+The mechanism now lives inside the manifest pipeline itself, not beside it:
+`guardrail-manifest.sh` fetches `guardrails-read.sh --severity CRITICAL`
+(full ACTIVE records for one tier — the read shape added for this) and
+`guardrail_manifest.py --critical-json-file` renders those rules WHOLE above
+the id rollup. Three contracts, each pinned by test:
+
+1. **Whole, above** — full rule text, sorted by id, before the rollup
+   (guard-1421's honest mode: "fewer entries read whole").
+2. **Additive, never a filter** — the CRITICAL ids ALSO remain in the id
+   rollup, so `--assert-total` and the 100%-coverage floor are untouched
+   (guard-841 stays satisfied; severity selects what loads IN ADDITION,
+   never what loads INSTEAD).
+3. **Degrades, never refuses** — any failure in the fetch or the file parse
+   warns on stderr and emits the plain manifest (yesterday's shape). The
+   refusal posture stays reserved for the id-coverage floor.
+
+Budget accounting covers the whole payload: 15 CRITICAL of 4,198 active at
+realization ≈ +16 KB → ~70 KB / ~28k est tokens, inside the 40k budget with
+the g-115-6893 emit-time tripwire unchanged. The scaling exposure moved from
+record COUNT (rollup, ~13 B/record) to CRITICAL-RATING discipline (~1 KB per
+rated rule): ~30 CRITICAL ratings cost what ~2,300 new records do, so the
+admission rule above is now load-bearing for the byte budget too — rate
+severity against it, not against felt importance.
+
 ## Cross-references
 
 - guard-1421 — a truncating survey display leaves the entry UNREAD; the two

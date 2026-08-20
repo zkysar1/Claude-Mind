@@ -131,6 +131,52 @@ RESET_SURVIVING_SLOTS = {"journal_cluster_summaries", "spark_capture", "exp_capt
 # question is "what did the worker capture".
 CAPTURE_SLOTS = ("spark_capture", "exp_capture", "hyp_capture", "encoding_capture")
 
+#  — mirror of wm.py APPEND_CREATABLE_EXTRA. THIS copy is the LIVE
+# one: wm-append.sh is daemon-only, so it routes here and the refusal below is
+# what actually runs; the wm.py twin exists for parity and is pinned by
+# test_wm_reset_cadence.py. The full rationale — why the seam is lane CREATION
+# rather than every append, why it is not keyed on capture-lane shape, and the
+# ten orphan lanes measured on cc-08 2026-08-19 — lives on the wm.py definition.
+APPEND_CREATABLE_EXTRA = {"notification_log", "proactive_escalation_log"}
+
+
+def _append_creatable_slots() -> set:
+    """Root slot names an append may CREATE: every static registry, unioned."""
+    return (set(ARRAY_SLOTS) | set(CAPTURE_SLOTS) | set(DEFAULT_SLOT_TYPES)
+            | set(MAP_SLOTS) | set(TOP_LEVEL_KEYS) | set(RESET_SURVIVING_SLOTS)
+            | set(STRUCTURED_DICT_SLOTS) | set(APPEND_CREATABLE_EXTRA))
+
+
+def _unknown_lane_refusal(slot: str, lane_exists: bool):
+    """Reason to refuse this append, or None to allow it. Mirror of
+    wm.py::unknown_lane_refusal — keep BYTE-equivalent in behaviour. A
+    leading-dash root is refused ALWAYS; an unregistered root is refused only
+    when the append would CREATE the lane."""
+    root = str(slot).split(".")[0]
+    if root.startswith("-"):
+        return (f"slot name {root!r} starts with '-', which is a command-line "
+                f"FLAG, not a slot. The wm-append/wm-clear/wm-set arg loops are "
+                f"bare catch-alls where the LAST positional wins, so a trailing "
+                f"flag silently becomes the slot name. Re-run with the slot as "
+                f"the only positional argument.")
+    if lane_exists:
+        return None
+    creatable = _append_creatable_slots()
+    if root in creatable:
+        return None
+    # Shared `_`-delimited TOKENS as well as substring — see the wm.py twin for
+    # why the substring test alone misses `experience_capture` -> `exp_capture`.
+    tokens = {t for t in root.split("_") if t}
+    near = sorted(n for n in creatable
+                  if (root in n or n in root
+                      or tokens & {t for t in n.split("_") if t}))[:6]
+    hint = f" Did you mean: {', '.join(near)}?" if near else ""
+    return (f"slot {root!r} is not a registered append target and does not "
+            f"exist, so this append would mint a new lane that no consumer "
+            f"reads and no carrier mirrors.{hint} If the lane is genuinely new, "
+            f"register it in APPEND_CREATABLE_EXTRA (wm.py AND the daemon twin "
+            f"in mind_api/src/endpoints/wm_write.py).")
+
 
 def _eviction_sort_key(x):
     """Evict UNFLAGGED entries before load-bearing ones; oldest-first within
@@ -612,6 +658,11 @@ def append_slot(ctx) -> "Response":  # type: ignore[name-defined]
                 return Response.error(400, "unresolvable_slot",
                                       f"cannot resolve path '{slot}'")
             arr = parent.get(key)
+            # : refuse BEFORE minting the lane below. THIS is the LIVE
+            # copy; the wm.py twin exists for parity (guard-742).
+            _refusal = _unknown_lane_refusal(slot, arr is not None)
+            if _refusal:
+                return Response.error(400, "unknown_slot", _refusal)
             if arr is None:
                 parent[key] = []
                 arr = parent[key]

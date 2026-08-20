@@ -193,8 +193,9 @@ def _mind_recommendations(buckets: dict) -> list[str]:
     if buckets["py_production"] or buckets["sh_wrapper"]:
         recs.append(MIND_CORE_SUITE_CMD)
     if buckets["py_daemon"]:
-        # mind_api/tests is a DEFERRED testpath — run-full-suite.sh does NOT
-        # collect it, so the core arm above is not evidence about this tree.
+        # mind_api/tests folded into run-full-suite's chunked pool 2026-08-20
+        # (); the targeted command stays recommended as the FAST
+        # direct-coverage arm for mind_api/src changes.
         recs.append(MIND_DAEMON_SUITE_CMD)
     if buckets["py_test"] and not (buckets["py_production"] or buckets["sh_wrapper"]
                                    or buckets["py_daemon"]):
@@ -302,14 +303,14 @@ def _emit_banner(goal_id: str, mind_buckets: dict, mind_recs: list[str],
             for r in mind_recs:
                 print(f"  $ {r}")
             if mind_buckets.get("py_daemon"):
-                # Said out loud because the failure it prevents is silent: a
-                # green run-full-suite.sh reads as whole-suite green, and
-                # mind_api/tests is in DEFERRED_TESTPATHS so that runner never
-                # collected it. Only printed when the tree is actually touched.
-                print("  NOTE: mind_api/tests is a DEFERRED testpath —"
-                      " run-full-suite.sh does NOT run it, so a green run of"
-                      " that runner is NOT evidence about mind_api/src."
-                      " The command above is the whole coverage for that tree.")
+                # mind_api/tests folded into the chunked pool 2026-08-20
+                # () — run-full-suite.sh now collects it, so a green
+                # runner IS evidence about mind_api/src. The targeted command
+                # stays the fast direct arm. Only printed when touched.
+                print("  NOTE: mind_api/tests runs inside run-full-suite.sh"
+                      " since 2026-08-20 (g-115-6942); the command above is"
+                      " the fast targeted arm for this tree, not the only"
+                      " coverage.")
     else:
         print("Mind framework: no code-affecting changes detected.")
 

@@ -232,6 +232,12 @@ def test_universal_rb_never_widened_into_domain(monkeypatch, stores):
 
 
 def test_cap_after_widen_and_bump_set_equals_return_set(monkeypatch, stores):
+    #  lane pin: bump-set==return-set is verified here through the
+    # LEGACY evidence channel (embedded store counters); with
+    # UTILIZATION_COUNTERS_SPOOLED on the bump spool-routes and the embedded
+    # copy deliberately stays untouched. Spool-lane twin:
+    # test_utilization_spool.py::test_retrieve_bump_only_matched_records_spool.
+    monkeypatch.delenv("UTILIZATION_COUNTERS_SPOOLED", raising=False)
     _, guard_p = stores
     _retrieve._RETRIEVAL_CFG_CACHE = _cfg(True)
     # 21 token-matched + 1 high-cosine widened; shallow cap = 20. The widened
@@ -327,6 +333,8 @@ def test_split_slots_zero_disables(monkeypatch):
 
 
 def test_split_bump_set_equals_returned_universal(monkeypatch, stores):
+    #  lane pin — see test_cap_after_widen_and_bump_set above.
+    monkeypatch.delenv("UTILIZATION_COUNTERS_SPOOLED", raising=False)
     rb_p, _ = stores
     cfg = _cfg(True)
     cfg["universal_relevance_slots"] = 2
@@ -571,3 +579,83 @@ def test_dirty_carrier_from_a_failed_request_does_not_leak_into_an_as_of_row(
         (tmp_path / "retrieval-trace.jsonl").read_text().splitlines()[0])
     leaked = {k: v for k, v in row.items() if "universal" in k}
     assert leaked == {}, f"B inherited A's pull-slot numbers: {leaked}"
+
+
+# ── 8. : supplementary blend-status carrier ────────────────────────
+# The domain/guardrail twin of the universal_cosine_status field above. The
+# motivating incident: embedding_blend_enabled=true fleet-wide since 07-25
+# while this box had no index — the blend's `if not scores: return matched`
+# branch is byte-identical to "no semantic hits", so 25 days of queries served
+# the token baseline with zero telemetry. These pin the four status values,
+# the trace pop, and the pop's no-inherit property.
+
+
+def test_blend_status_off(monkeypatch):
+    _retrieve._RETRIEVAL_CFG_CACHE = _cfg(False)
+    _retrieve._BLEND_STATS.clear()
+    _retrieve._embedding_blend([], [], QUERY)
+    assert _retrieve._BLEND_STATS == {"supplementary_blend_status": "off"}
+
+
+def test_blend_status_index_absent(monkeypatch, capsys):
+    _retrieve._RETRIEVAL_CFG_CACHE = _cfg(True)
+    monkeypatch.setattr(er, "cosine_scores", lambda q, **k: {})
+    monkeypatch.setattr(er, "index_available", lambda **k: False)
+    _retrieve._BLEND_STATS.clear()
+    monkeypatch.setattr(_retrieve, "_BLEND_DEGRADED_WARNED", False)
+    _retrieve._embedding_blend([], [], QUERY)
+    assert _retrieve._BLEND_STATS == {
+        "supplementary_blend_status": "no_scores:index_absent"}
+    # The one-time stderr diagnostic fires exactly once per process.
+    err = capsys.readouterr().err
+    assert "embedding blend DEGRADED" in err
+    _retrieve._embedding_blend([], [], QUERY)
+    assert "DEGRADED" not in capsys.readouterr().err, \
+        "warning must be once-per-process, not per-query"
+
+
+def test_blend_status_no_scores_index_present(monkeypatch):
+    _retrieve._RETRIEVAL_CFG_CACHE = _cfg(True)
+    monkeypatch.setattr(er, "cosine_scores", lambda q, **k: {})
+    monkeypatch.setattr(er, "index_available", lambda **k: True)
+    _retrieve._BLEND_STATS.clear()
+    monkeypatch.setattr(_retrieve, "_BLEND_DEGRADED_WARNED", True)
+    _retrieve._embedding_blend([], [], QUERY)
+    assert _retrieve._BLEND_STATS == {
+        "supplementary_blend_status": "no_scores"}
+
+
+def test_blend_status_served(monkeypatch):
+    _retrieve._RETRIEVAL_CFG_CACHE = _cfg(True)
+    rec = _rb("rb-served-1", "unrelated", "graceful shutdown sequencing doc")
+    monkeypatch.setattr(er, "cosine_scores",
+                        lambda q, **k: {"rb-served-1": 0.9})
+    _retrieve._BLEND_STATS.clear()
+    _retrieve._embedding_blend([rec], [rec], QUERY)
+    assert _retrieve._BLEND_STATS == {
+        "supplementary_blend_status": "served"}
+
+
+def test_trace_pops_blend_status_and_does_not_inherit(monkeypatch, tmp_path):
+    monkeypatch.setattr(_retrieve, "WORLD_DIR", tmp_path)
+    _retrieve._BLEND_STATS.clear()
+    _retrieve._BLEND_STATS["supplementary_blend_status"] = \
+        "no_scores:index_absent"
+    _retrieve._log_retrieval_trace(
+        category="q1", depth="medium", read_only=True,
+        items_returned={"tree_nodes": 1}, effective_goal=None,
+        supplementary_only=False, include_framework=False)
+    rows = (tmp_path / "retrieval-trace.jsonl").read_text().splitlines()
+    row1 = json.loads(rows[0])
+    assert row1["supplementary_blend_status"] == "no_scores:index_absent"
+    assert _retrieve._BLEND_STATS == {}, "trace write must POP the carrier"
+
+    # A second request that never runs the blend must not inherit row1's value.
+    _retrieve._log_retrieval_trace(
+        category="q2", depth="medium", read_only=True,
+        items_returned={"tree_nodes": 1}, effective_goal=None,
+        supplementary_only=False, include_framework=False)
+    rows = (tmp_path / "retrieval-trace.jsonl").read_text().splitlines()
+    row2 = json.loads(rows[1])
+    assert "supplementary_blend_status" not in row2, \
+        "absent key means 'lane did not run' — inheritance breaks that"

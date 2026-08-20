@@ -783,7 +783,18 @@ def cmd_failing_streak(args):
     if args.window_hours is not None:
         window_hours = args.window_hours
 
-    data = load_health()
+    if getattr(args, "health_file", None):
+        # Hermetic override (g-115-6942): read a seeded fixture instead of the
+        # live world file, so the streak test no longer depends on a component
+        # HAPPENING to be mid-streak (the live-state decay its header always
+        # predicted). Same lock-less read contract as load_health().
+        try:
+            with open(args.health_file, encoding="utf-8") as fh:
+                data = yaml.safe_load(fh) or {}
+        except OSError:
+            data = {}
+    else:
+        data = load_health()
     components = data.get("components") or {}
     now = datetime.now()
     window = timedelta(hours=window_hours)
@@ -1070,6 +1081,7 @@ def build_parser():
     p_streak.add_argument("--threshold", type=int, default=None, help="Override failing_streak_threshold (default: aspirations.yaml infra_health.failing_streak_threshold, fallback 3)")
     p_streak.add_argument("--window-hours", type=float, default=None, help="Override recency window (default: aspirations.yaml infra_health.window_hours, fallback 6)")
     p_streak.add_argument("--alert-file", type=str, default=None, help="Optional: append alerting components as JSONL for downstream notify-user dedup")
+    p_streak.add_argument("--health-file", type=str, default=None, help="Read component health from this YAML instead of world/infra-health.yaml (hermetic tests; pair with --no-sync-blockers)")
     p_streak.add_argument("--no-sync-blockers", action="store_true", help="Skip per-agent WM known_blocker sync (g-115-360). Use when running ad-hoc / outside an agent context.")
 
     p_fresh = sub.add_parser("probe-freshness", help="Report whether the probe store is fresh enough to trust a streak-alert result (stale=true means a 0-alert result may be false-healthy)")

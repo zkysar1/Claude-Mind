@@ -12,17 +12,30 @@ _RUNTIME_SELF="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
-declare -a PASSTHROUGH=()
+# : shared strict-argv refusal helpers (uniform message contract).
+# Sourced BEFORE _runtime.sh so a refusal cannot be masked by a daemon failure.
+# shellcheck disable=SC1091
+source "$CORE_ROOT/scripts/_argv_strict.sh"
+
 FIELD=""
 AS_JSON=0
 
 # Value-arg pattern: "${2-}" + safe shift; see retrieve.sh for rationale.
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --field) FIELD="${2-}"; PASSTHROUGH+=(--field "${2-}"); shift $(( $# >= 2 ? 2 : 1 ));;
-        --json)  AS_JSON=1; PASSTHROUGH+=("$1"); shift;;
+        -h|--help)
+            echo "Usage: team-state-read.sh [--field <dotpath>] [--json]"
+            exit 0;;
+        --field) FIELD="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
+        --json)  AS_JSON=1; shift;;
         *)
-            PASSTHROUGH+=("$1"); shift;;
+            # : this arm silently appended to a dead PASSTHROUGH
+            # accumulator (fed the pre-2026-05-14 CLI fallback, read by nothing
+            # since), so a mistyped filter vanished and the call answered the
+            # WRONG population with rc=0 (the rb-245 authoritative-false-count
+            # shape). Refuse loudly. Exit 2 per the _argv_strict.sh convention
+            # (the daemon path exits 1, so tests need a distinct rc).
+            argv_strict_refuse_unknown "team-state-read.sh" "$1" "--field <dotpath> | --json";;
     esac
 done
 

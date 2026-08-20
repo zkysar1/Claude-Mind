@@ -78,8 +78,18 @@ def probe_secret(name):
         # surface as UNKNOWN on the timeout branch, i.e. as "we could not tell",
         # on a box where the answer was simply available.
         from _runtime_bash import bash_cmd
+        # `has NAME`, NOT a bare `NAME`. env-read.sh dispatches to subcommands
+        # (status|missing|has|value|register); a bare name is a USAGE ERROR that
+        # exits 2 for every key on every box. The first version of this function
+        # did exactly that, so the secret lane reported ABSENT universally —
+        # including for keys sitting in .env.local. Caught 2026-08-19 by a
+        # positive control (STORAGE_S3_BUCKET, demonstrably present here, came
+        # back "absent"), which is the only thing that could have caught it:
+        # a usage error and a real absence are byte-identical from the caller.
+        # `has` also keeps this derived-only — it exits a code and prints no
+        # secret VALUE, so nothing sensitive can reach a caller or a log.
         r = subprocess.run(
-            bash_cmd(str(script), name),
+            bash_cmd(str(script), "has", name),
             capture_output=True, text=True, timeout=30,
         )
     except ImportError:
@@ -88,9 +98,16 @@ def probe_secret(name):
         return UNKNOWN, "env-read.sh timed out"
     except OSError as e:
         return UNKNOWN, f"could not run env-read.sh: {e}"
-    if r.returncode == 0 and r.stdout.strip():
-        return PRESENT, "resolves via env-read.sh"
-    return ABSENT, f"env-read.sh rc={r.returncode}"
+    # Measured contract: 0 = present, 1 = absent, 2 = usage/dispatch error.
+    # Only rc=1 is a REFUTATION. Anything else is the accessor failing to
+    # answer, which is UNKNOWN — the distinction this module exists to keep,
+    # and the one its own first version collapsed.
+    if r.returncode == 0:
+        return PRESENT, "env-read.sh has: rc=0"
+    if r.returncode == 1:
+        return ABSENT, "env-read.sh has: rc=1 (key not in .env.local)"
+    return UNKNOWN, (f"env-read.sh has: rc={r.returncode} — accessor did not "
+                     f"answer, so presence is UNESTABLISHED, not refuted")
 
 
 def probe_peer_world(env_id):

@@ -103,38 +103,31 @@ already declared three paths). `bash core/scripts/run-full-suite.sh` now covers
 `pytest <path>` command below, which remain accurate for targeted runs and are
 NOT sufficient for a deep-code closure claim.
 
-**It does NOT cover `mind_api/tests`, and no single invocation does. A green
-`run-full-suite.sh` is not a whole-suite green.** That path is listed in
-`DEFERRED_TESTPATHS` (`run-full-suite.py`): still collected, still named, but
-announced-and-skipped rather than run. Cover it separately, on a quiet box:
+**`mind_api/tests` is IN the chunked pool since 2026-08-20 (g-115-6942)** — a
+green `run-full-suite.sh` IS evidence about `mind_api/src`. History, kept
+because its lessons generalize: the tree spent 2026-07-31→08-20 in
+`DEFERRED_TESTPATHS` (announced-and-skipped; opt-in `RUN_DEFERRED=1`) after
+failing en masse at end-of-invocation — 411 reds at rung 16, 271 at rung 20 —
+while passing alone; neither ladder escalation nor an own process fixed it.
+The cause landed as **g-115-5651**: `get_backend()` memoizes `_ACTIVE_BACKEND`
+process-wide while conftest restored only the env VAR, so one own-cloud test
+poisoned every later test in its process. The reset fixture now lives in BOTH
+test-tree conftests (the mind_api mirror closed the mixed-chunk vector), and
+the fold-back was accepted on measurement (cc-10, 6.8.0-137-generic,
+2026-08-20): standalone 1,386/1,386 green; own-process at end-of-invocation
+green; folded acceptance run 16,099 passed / 5 failed with every red pre-owned
+and none in `mind_api/tests`. Four genuine reds the measurement surfaced were
+fixed, not skipped (set_at daemon/CLI parity port, claim-sid harness pin,
+citation lane pin, conftest MIND_SID coverage). The `DEFERRED_TESTPATHS`
+mechanism stays for future trees — empty is its designed end state. Lasting
+lesson (guard-1760): the runner reports what it RAN, never what it declined to
+look for; when a suite's scope is configurable, check the config against the
+runner before trusting a green.
 
-```bash
-STORAGE_BACKEND=local python3 -m pytest mind_api/tests -q -m "not daemon_integration"
-```
-
-It is daemon-heavy and sorts last, so inside the chunk pool it always ran after
-~8,000 other tests and failed en masse — 411 failures at rung 16, 271 at rung
-20 — while passing 1128/1135 alone. Two things that look like fixes are not:
-
-- **Escalating the ladder did not fix it.** Rung 20 only moved the cliff from
-  chunk 14 to chunk 17. This is a structural exception, not a rung problem.
-- **Giving it its own process did not fix it either.** That was shipped first,
-  on exactly the reasoning you would expect ("it passes alone, so it needs a
-  fresh process"), and measured the same day: it fails en masse in its own
-  process too, when that process runs at the end of the invocation. So the
-  resource is not process-local. (Its SCOPE beyond that — within one invocation
-  vs across concurrent ones — is itself unmeasured; see the candidate list below.)
-
-The cause remains **UNMEASURED**, and the candidate list is wider than
-"accumulation." Two were probed and disproved (cross-tree pollution;
-port/daemon exhaustion). A third is live and was measured on this box
-2026-07-31: **two `run-full-suite.sh` invocations running CONCURRENTLY** for
-~11 minutes, because an earlier run was still in its post-chunk phases
-(invisible / domain / deferred) when a new one launched. The trap is specific
-and easy to repeat — **reading the chunked-half `TOTAL:` line makes a run look
-finished when it is not.** If earlier ladder escalations overlapped the same
-way, the end-of-invocation mass failure may be cross-invocation contention
-rather than intra-invocation accumulation. Before diagnosing anything from a
+A separate trap discovered on this rule's history is still live: **two
+`run-full-suite.sh` invocations running CONCURRENTLY** (measured 2026-07-31,
+~11 min overlapped — the chunked-half `TOTAL:` line makes a run look finished
+while post-chunk phases are still writing). Before diagnosing anything from a
 suite run, confirm no other run is live:
 
 ```bash
@@ -170,26 +163,6 @@ one phantom "live run" whose only cited PID was the guard's own wrapper. Two
 separate calls, always. (guard-1238 is the general form — "never use a pattern
 that appears in the probing command itself"; the bracket is a partial mitigation
 of it, not an exemption from it.)
-
-What IS settled: the tree is healthy alone. Run by itself with a verified-clear
-process table, `mind_api/tests` fails **7 tests across 3 files**, all
-`TestByteCompat` — the known byte-compat reds, matching its earlier baseline.
-So the mass failure is environmental, never a `mind_api/src` regression; do not
-triage it as one. `g-115-4326` owns the cause. Note the remedy below is correct
-under every candidate above, which is why it ships while the cause is open —
-do not read its presence as evidence for any one mechanism.
-
-`RUN_DEFERRED=1` folds it back into the invocation for anyone who wants it —
-expect the noise described above. It is opt-in rather than default because a
-runner that reports ~250 phantom failures on every closure trains agents to
-disbelieve its verdict, and this runner's verdict has already been measured
-wrong three times (see the GENUINE warning below).
-
-Why it hid so long: the runner reports what it RAN and never what it declined
-to look for (`guard-1760`). The verification path and the blind spot were the
-same artifact — the tool you would use to detect the gap was the tool with the
-gap. When a suite's scope is configurable, check the config against the
-runner before trusting a green.
 
 **`VERDICT: GENUINE` CAN BE FALSE — and this is the first row in this file that
 says so. Read it before acting on any large failure count.** Every row below
@@ -450,9 +423,8 @@ runs whenever no live daemon is present. Enforced by `guard-672`.
 >
 > **6. `VERDICT: CLEAN` SCOPES TO THE CHUNKED PYTEST HALF ONLY.** It is not a
 > whole-suite all-clear. Also `grep '^FAIL'` for the invisible (`main()`-style
-> and shell) half, which the runner reports separately, and remember
-> `mind_api/tests` is deferred by default (§ Scope: THREE testpaths). A genuine
-> red in the invisible half rides out under a clean verdict otherwise.
+> and shell) half and the domain half, which the runner reports separately. A
+> genuine red in those halves rides out under a clean verdict otherwise.
 >
 > **7. WHEN THE VERDICT IS NOT CLEAN, RUN `--triage`.** It re-reads the chunk
 > logs the run already wrote (it does not re-run the suite) and chains
@@ -610,7 +582,7 @@ Or wait for a quiet window with the fleet stopped. Enforced by `guard-1448`.
 | `core/scripts/*.py` (non-test) | `bash core/scripts/run-full-suite.sh` (covers `core/scripts/tests` + `core/tests/gates` + the invisible and domain halves; NOT `mind_api/tests`). The narrower `python -m pytest core/scripts/tests -q` is fine for a targeted re-run but is NOT sufficient for a closure claim — see § Scope: THREE testpaths. | exit code 0, all collected tests pass |
 | `core/scripts/gates/capability.py`, `capability-gate.py`, or the defer→Unblock path in `aspirations.py` | ALSO run `bash core/scripts/tests/run-asp-257-suite.sh` — 4 of its 6 suites are `main()`-style files pytest collects 0 tests from, so pytest-green says NOTHING about them (they sat red 3 days undetected, masking a real NameError — g-115-2343 / rb-3678) | aggregator prints `6/6 suites passed` |
 | Any change whose test coverage lives in a pytest-INVISIBLE file — a `main()`-style `.py` (no top-level `def test_`) **or any `.sh`, which pytest cannot collect at all**. Measured 2026-07-29 (cc-05): 71 `.py` + 19 shell = 90 files. Do not trust that count; re-derive with `bash core/scripts/tests/run-invisible-suites.sh --list`, which prints the split. | `bash core/scripts/tests/run-invisible-suites.sh` — dynamic population runner; known-reds are quarantined inline with their tracking goal IDs (g-115-2349 baseline sweep found 9 silent reds of 69). **Since g-115-3957 this runner is invoked automatically by `core/scripts/run-full-suite.sh`**, so a full-suite run already covers it; invoke it directly only when you want the invisible half alone. | runner exits 0 (`N/N files passed, M quarantined`) |
-| `mind_api/src/*.py` | `STORAGE_BACKEND=local python -m pytest mind_api/tests -q -m "not daemon_integration"` — **96 files / 1,135 tests that test this code directly.** This row previously sent you to `core/scripts/tests` on the theory that "runtime is exercised by daemon-aware wrappers"; that is indirect coverage of a tree whose own suite the runner never collected, and it was wrong for as long as it stood (g-115-3748). **This command is the whole coverage for this row — `run-full-suite.sh` does NOT run `mind_api/tests` by default** (see § Scope: THREE testpaths), so a green full-suite run is not evidence about `mind_api/src`. | exit 0 |
+| `mind_api/src/*.py` | `STORAGE_BACKEND=local python -m pytest mind_api/tests -q -m "not daemon_integration"` — ~1,386 tests that test this code directly (the fast targeted arm). Since 2026-08-20 (g-115-6942) `run-full-suite.sh` also collects this tree in its chunked pool, so a green full-suite run IS evidence about `mind_api/src`; before that it was deferred and this command was the whole coverage (g-115-3748 history in § Scope: THREE testpaths). | exit 0 |
 | `core/scripts/*.sh` (production wrapper) | Whatever the wrapper's daemon endpoint suite covers — typically `python -m pytest core/scripts/tests -q -k <endpoint>` | exit 0 |
 | `.claude/skills/*/SKILL.md` | Re-read the edited pseudocode + `bash core/scripts/domain-leak-check.sh`; if the change alters skill BEHAVIOR (not just prose), also `/verify-learning` for cross-skill grep checks. (Do NOT use `skill-evaluate.sh` here. A bare `skill-evaluate.sh <skill-name>` errors `unknown subcommand`: it needs a subcommand (read/report/underperforming/score), and `score --skill <s> --goal <g>` rates RUNTIME skill-on-goal performance, not a static SKILL.md edit.) | re-read confirms intent; domain-leak-check clean; verify-learning passes if behavior changed |
 | `.claude/rules/*.md` | No automated check — re-read the rule and confirm wording matches intent | manual review |

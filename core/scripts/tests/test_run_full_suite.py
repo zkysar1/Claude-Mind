@@ -239,11 +239,13 @@ def test_derives_roots_from_pytest_ini(tmp_path, monkeypatch):
 def test_deferred_testpaths_are_excluded_from_collection(tmp_path, monkeypatch):
     """A declared path in DEFERRED_TESTPATHS is NOT collected into the pool.
 
-    It is deferred because it fails en masse at end-of-invocation while
-    passing alone; running it in the pool hands every closure ~250 phantom
-    failures under a verdict labelled trustworthy.
+    The MECHANISM is pinned with a synthetic entry: the live set is empty
+    since g-115-6942 (mind_api/tests folded back after g-115-5651 fixed the
+    backend-cache poisoning), and the set exists precisely so a future tree
+    can be deferred again — this test must keep working when it is.
     """
-    deferred = sorted(RFS.DEFERRED_TESTPATHS)[0]
+    deferred = "synthetic/deferred-tree"
+    monkeypatch.setattr(RFS, "DEFERRED_TESTPATHS", {deferred})
     root = _ini(tmp_path, ["core/scripts/tests", deferred])
     monkeypatch.setattr(RFS, "PROJECT_ROOT", root)
     got = [p.relative_to(root).as_posix() for p in RFS._testpaths()]

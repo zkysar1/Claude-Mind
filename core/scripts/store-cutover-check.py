@@ -51,6 +51,22 @@ from _runtime_bash import bash_cmd  # noqa: E402  (guard-580/581)
 
 ATTESTATION_MAX_AGE_DAYS = 30
 
+# Liveness window for the worker-carrier proof lane (). A carrier ref
+# only counts as evidence while a RUNNING Body is still pushing to it, and
+# guard-3660 is the authority on that join: "compare claimed_at against now;
+# 74h+ is stale, single-digit hours is live". This picks the CONSERVATIVE end of
+# that band — 6h, the same partner-liveness threshold
+# `.claude/rules/check-team-state-before-silent.md` already uses fleet-wide, so
+# the number is an existing constant rather than a new invention.
+#
+# Erring SHORT is the fail-closed direction HERE, and it is worth stating which
+# way that runs because it inverts between the two consumers of guard-3660:
+# retirement asks "may I DELETE this ref" (short window = delete a live Body's
+# carrier = bad), while this lane asks "may I TRUST this ref as proof" (short
+# window = fall back to the hand-stamp = safe). Same guardrail, opposite
+# safe directions. Do not import a threshold from the retirement side.
+BODY_LIVENESS_MAX_AGE_HOURS = 6
+
 # Known cutovers. Each entry is the full parameter set; --seam-commit /
 # --consumers / --field / --flag override or replace an entry ad hoc.
 STORES = {
@@ -152,6 +168,87 @@ def _fetch_origin_main() -> bool:
         return False
 
 
+def _fetch_worker_refs() -> bool:
+    """Make refs/workers/* readable locally, for the carrier proof lane.
+
+    WITHOUT THIS THE LANE IS A SILENT ZERO. The refs are pushed by worker Bodies
+    on OTHER boxes; a box that has never run worker-ref-consume.sh has none of
+    them locally, so every carrier candidate would resolve to "ref not readable"
+    and the lane would report exactly what an agent with no live Body reports.
+    A proof source that quietly finds nothing is worse than no proof source: it
+    reads as evidence of absence (guard-1665 class).
+
+    NO --prune, deliberately, and this is the one flag that matters here. Pruning
+    DELETES local refs whose remote counterpart is gone, which is a RETIREMENT
+    decision that guard-3660 governs (a ref may be gone from origin while its
+    Body is mid-goal). A read-only proof lane must never retire anything.
+    """
+    try:
+        return _git("fetch", "origin", "+refs/workers/*:refs/workers/*",
+                    timeout=60).returncode == 0
+    except Exception:
+        return False
+
+
+def _live_body_sids(bodies: dict | None, now: datetime) -> list[str]:
+    """SIDs whose in_flight_bodies row is LIVE (the guard-3660 liveness join).
+
+    This is the substantive half of the carrier lane, not the ancestry check:
+    ancestry says the ref CONTENT is good, this says the ref belongs to a Body
+    that is still running. Every uncertain row is dropped rather than assumed
+    live — an unreadable row falls back to the other lanes, which is safe.
+    """
+    live: list[str] = []
+    if not isinstance(bodies, dict):
+        return live
+    for sid, row in sorted(bodies.items()):
+        if not isinstance(row, dict) or not isinstance(sid, str) or not sid:
+            continue
+        when = _parse_ts(str(row.get("claimed_at") or "")
+                         .split("+")[0].split("Z")[0])
+        if when is None:
+            continue
+        # A FUTURE stamp passes. Negative age means clock skew between boxes,
+        # and skew is not staleness — rejecting it would drop a genuinely live
+        # Body over a few seconds of drift. The content checks below are what
+        # actually guarantee reader-capability; this join only scopes WHICH
+        # refs are current.
+        if (now - when).total_seconds() / 3600.0 <= BODY_LIVENESS_MAX_AGE_HOURS:
+            live.append(sid)
+    return live
+
+
+def _prove_commit(commit: str, ciso: str, seam_commit: str,
+                  consumers: list[str], now: datetime) -> dict:
+    """Ancestry + consumer byte-identity + recency for ONE candidate commit.
+
+    Extracted from derive_proof so both proof lanes apply the IDENTICAL test —
+    a second lane with its own copy of these three checks would drift, and the
+    drift would show up as one lane proving a box the other refuses.
+    """
+    when = _parse_ts(ciso.split("+")[0].split("Z")[0])
+    if when is None:
+        return {"proven": False, "reason": "unparseable_commit_date",
+                "commit": commit[:9]}
+    age_days = (now - when).total_seconds() / 86400
+    if age_days > ATTESTATION_MAX_AGE_DAYS:
+        return {"proven": False, "reason": "iteration_commit_stale",
+                "commit": commit[:9], "age_days": round(age_days, 1)}
+    anc = _git("merge-base", "--is-ancestor", seam_commit, commit)
+    if anc.returncode != 0:
+        return {"proven": False, "reason": "seam_not_ancestor",
+                "commit": commit[:9]}
+    diff = _git("diff", "--name-only", commit, "origin/main", "--", *consumers)
+    if diff.returncode != 0:
+        return {"proven": False, "reason": "diff_failed", "commit": commit[:9]}
+    changed = [l for l in diff.stdout.splitlines() if l.strip()]
+    if changed:
+        return {"proven": False, "reason": "consumers_diverge_from_main",
+                "commit": commit[:9], "diff_files": changed[:10]}
+    return {"proven": True, "commit": commit[:9],
+            "committed_at": ciso, "age_days": round(age_days, 1)}
+
+
 def _agents_on_main() -> list[str]:
     """Agent names present as agents/<name>/ directories on origin/main."""
     try:
@@ -167,42 +264,72 @@ def _agents_on_main() -> list[str]:
         return []
 
 
-def derive_proof(agent: str, seam_commit: str, consumers: list[str]) -> dict:
+def derive_proof(agent: str, seam_commit: str, consumers: list[str],
+                 bodies: dict | None = None) -> dict:
     """Evidence-derived attestation for one agent, from git alone.
 
+    TWO proof lanes, tried in order; the FIRST that proves wins and the winner
+    is named in the result (`lane`, and `ref` for the carrier lane) so a reader
+    can audit which candidate carried the verdict:
+
+      agent_namespace   — the newest commit touching agents/<agent>/ on
+                          origin/main. The original lane.
+      worker_carrier_ref — the tip of refs/workers/<agent>/<sid> for each LIVE
+                          Body (g-115-6672). A Body is a checkout too.
+
+    WHY THE SECOND LANE EXISTS. Under one-Mind-many-Bodies, the newest
+    agents/<agent>/ commit proves the tree of whichever Body committed LAST and
+    says nothing about the others — so an agent whose Bodies run on several
+    boxes is proven by exactly one of them. A Body that has not committed
+    agent-namespace churn recently falls to the hand-stamp, which is the chore
+    this whole file exists to delete. Its carrier ref is a direct statement of
+    that Body's HEAD, pushed every work unit.
+
+    `bodies` is the agent's team-state `in_flight_bodies` map. Omitted (the
+    default) means the carrier lane does not run at all, so every existing
+    caller and test keeps the single-lane behaviour byte-for-byte.
+
     Every uncertain branch returns proven=False with a reason — the caller
-    falls back to the hand-stamp, never to an assumption.
+    falls back to the hand-stamp, never to an assumption. When BOTH lanes fail
+    the reported `reason` is the agent-namespace lane's, unchanged, with the
+    carrier attempts listed under `carrier_candidates` for diagnosis: the
+    original reason is what operators and the existing detail keys already key
+    on, and a new lane must not relabel a failure it did not cause.
     """
+    now = datetime.now()
     try:
         out = _git("log", "-1", "--format=%H|%cI", "origin/main",
                    "--", f"agents/{agent}/")
         line = out.stdout.strip()
         if out.returncode != 0 or "|" not in line:
-            return {"proven": False, "reason": "no_iteration_commit"}
-        commit, ciso = line.split("|", 1)
-        when = _parse_ts(ciso.split("+")[0].split("Z")[0])
-        if when is None:
-            return {"proven": False, "reason": "unparseable_commit_date",
-                    "commit": commit[:9]}
-        age_days = (datetime.now() - when).total_seconds() / 86400
-        if age_days > ATTESTATION_MAX_AGE_DAYS:
-            return {"proven": False, "reason": "iteration_commit_stale",
-                    "commit": commit[:9], "age_days": round(age_days, 1)}
-        anc = _git("merge-base", "--is-ancestor", seam_commit, commit)
-        if anc.returncode != 0:
-            return {"proven": False, "reason": "seam_not_ancestor",
-                    "commit": commit[:9]}
-        diff = _git("diff", "--name-only", commit, "origin/main",
-                    "--", *consumers)
-        if diff.returncode != 0:
-            return {"proven": False, "reason": "diff_failed",
-                    "commit": commit[:9]}
-        changed = [l for l in diff.stdout.splitlines() if l.strip()]
-        if changed:
-            return {"proven": False, "reason": "consumers_diverge_from_main",
-                    "commit": commit[:9], "diff_files": changed[:10]}
-        return {"proven": True, "commit": commit[:9],
-                "committed_at": ciso, "age_days": round(age_days, 1)}
+            primary = {"proven": False, "reason": "no_iteration_commit"}
+        else:
+            commit, ciso = line.split("|", 1)
+            primary = _prove_commit(commit, ciso, seam_commit, consumers, now)
+        if primary.get("proven"):
+            primary["lane"] = "agent_namespace"
+            return primary
+
+        attempts = []
+        for sid in _live_body_sids(bodies, now):
+            ref = f"refs/workers/{agent}/{sid}"
+            tip = _git("log", "-1", "--format=%H|%cI", ref)
+            tline = tip.stdout.strip()
+            if tip.returncode != 0 or "|" not in tline:
+                attempts.append({"ref": ref, "reason": "carrier_ref_unreadable"})
+                continue
+            commit, ciso = tline.split("|", 1)
+            proof = _prove_commit(commit, ciso, seam_commit, consumers, now)
+            if proof.get("proven"):
+                proof["lane"] = "worker_carrier_ref"
+                proof["ref"] = ref
+                return proof
+            attempts.append({"ref": ref, "reason": proof.get("reason"),
+                             **{k: proof[k] for k in ("commit", "diff_files")
+                                if k in proof}})
+        if attempts:
+            primary["carrier_candidates"] = attempts
+        return primary
     except Exception as exc:
         return {"proven": False, "reason": f"git_error: {exc}"}
 
@@ -264,8 +391,14 @@ def evaluate_roster(roster: dict, proofs: dict, field: str,
             continue
         proof = proofs.get(name) or {"proven": False, "reason": "no_proof_run"}
         if proof.get("proven"):
+            # `lane` / `ref` name WHICH candidate proved this agent ().
+            # Without them a derived attestation is unauditable the moment there
+            # is more than one lane: "basis: derived" plus a bare sha does not
+            # say whether it came from the agent namespace or some Body's
+            # carrier ref, and those are claims about different checkouts.
             attested.append({"agent": name, "basis": "derived", **{
-                k: proof[k] for k in ("commit", "committed_at", "age_days")
+                k: proof[k]
+                for k in ("commit", "committed_at", "age_days", "lane", "ref")
                 if k in proof}})
             continue
         seam = row.get(field)
@@ -507,7 +640,14 @@ def cmd_check(cfg: dict) -> int:
         }, indent=2))
         return 2
     roster = ts.get("agent_status") or {}
-    proofs = {name: derive_proof(name, cfg["seam_commit"], cfg["consumers"])
+    # Carrier refs live on the remote; a box that has never run
+    # worker-ref-consume.sh has none locally, and the lane would then find
+    # nothing while looking exactly like "this agent has no live Body".
+    # Reported like fetch_ok, for the same reason: a failed fetch can only
+    # UNDER-prove, which is the UNSAFE direction, but it must be visible.
+    workers_fetch_ok = _fetch_worker_refs()
+    proofs = {name: derive_proof(name, cfg["seam_commit"], cfg["consumers"],
+                                 bodies=row.get("in_flight_bodies"))
               for name, row in roster.items()
               if isinstance(row, dict) and not row.get("retired_at")}
     local = _local_report(cfg["seam_commit"], cfg["consumers"],
@@ -534,6 +674,7 @@ def cmd_check(cfg: dict) -> int:
         "flag": cfg.get("flag"),
         "seam_commit": cfg["seam_commit"][:9],
         "fetch_ok": fetch_ok,
+        "worker_refs_fetch_ok": workers_fetch_ok,
         "guidance": (
             "SAFE: every live box is reader-capable AND the box you are "
             "standing on (local_box) carries the seam; the writer flag may be "

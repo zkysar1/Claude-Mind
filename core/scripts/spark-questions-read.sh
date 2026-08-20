@@ -11,21 +11,34 @@ _RUNTIME_SELF="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
+# : shared strict-argv refusal helpers (uniform message contract).
+# Sourced BEFORE _runtime.sh so a refusal cannot be masked by a daemon failure.
+# shellcheck disable=SC1091
+source "$CORE_ROOT/scripts/_argv_strict.sh"
+
 declare -a FLAG_KEYS=()
-declare -a PASSTHROUGH=()
 REC_ID=""
 
 # Value-arg pattern: "${2-}" + safe shift; see retrieve.sh for rationale.
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        -h|--help)
+            echo "Usage: spark-questions-read.sh (--id <id> | --active | --candidates | --all | --summary)"
+            exit 0;;
         --id)
-            REC_ID="${2-}"; PASSTHROUGH+=(--id "${2-}"); shift $(( $# >= 2 ? 2 : 1 ));;
-        --active)     FLAG_KEYS+=(active);     PASSTHROUGH+=("$1"); shift;;
-        --candidates) FLAG_KEYS+=(candidates); PASSTHROUGH+=("$1"); shift;;
-        --all)        FLAG_KEYS+=(all);        PASSTHROUGH+=("$1"); shift;;
-        --summary)    FLAG_KEYS+=(summary);    PASSTHROUGH+=("$1"); shift;;
+            REC_ID="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
+        --active)     FLAG_KEYS+=(active); shift;;
+        --candidates) FLAG_KEYS+=(candidates); shift;;
+        --all)        FLAG_KEYS+=(all); shift;;
+        --summary)    FLAG_KEYS+=(summary); shift;;
         *)
-            PASSTHROUGH+=("$1"); shift;;
+            # : this arm silently appended to a dead PASSTHROUGH
+            # accumulator (fed the pre-2026-05-14 CLI fallback, read by nothing
+            # since), so a mistyped filter vanished and the call answered the
+            # WRONG population with rc=0 (the rb-245 authoritative-false-count
+            # shape). Refuse loudly. Exit 2 per the _argv_strict.sh convention
+            # (the daemon path exits 1, so tests need a distinct rc).
+            argv_strict_refuse_unknown "spark-questions-read.sh" "$1" "--id <id> | --active | --candidates | --all | --summary";;
     esac
 done
 
