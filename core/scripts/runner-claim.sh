@@ -184,11 +184,25 @@ backend = r.get("backend", "?")
 # box as ALIVE. Handling status first makes the contract independent of that.
 if op == "status":
     agent = os.environ.get("AGENT", "")
-    if backend != "own-cloud":
-        # THE fail-safe the design turns on: ZDS runs a git backend and receives
-        # this by promotion. A backend with no claim store cannot witness a live
-        # runner, so it must refuse — a `0` here would make the cross-box worker
-        # look activatable on a deployment where it explicitly is not.
+    # CAPABILITY, NOT BACKEND NAME (). The question this gate must ask
+    # is "did a real claim store answer?" — the daemon reports that as
+    # `claim_store`. Keying on the NAME was right only while own-cloud was the
+    # sole implementation; the local arm now backs the same lease with a git ref
+    # (refs/mind/claim/<env>/<agent>, CAS via a rejected non-fast-forward push),
+    # and a name-keyed gate would refuse it forever however live the claim was.
+    # That is this defect exactly: the comment below already anticipated a git
+    # backend arriving by promotion, and the predicate could not see it.
+    # A MISSING field means a daemon older than the field — fall back to the
+    # literal legacy predicate, so behaviour against such a daemon (and against
+    # own-cloud generally) is unchanged rather than newly refusing.
+    claim_store = r.get("claim_store")
+    if claim_store is None:
+        claim_store = (backend == "own-cloud")
+    if not claim_store:
+        # THE fail-safe the design turns on: a backend with no claim store
+        # cannot witness a live runner, so it must refuse — a `0` here would
+        # make the cross-box worker look activatable on a deployment where it
+        # explicitly is not.
         print(f"[runner-claim] status: REFUSE (backend={backend}) — this backend "
               f"has no cross-machine claim store, so no live runner can be "
               f"confirmed for '{agent}'. {r.get('reason','')}".rstrip())

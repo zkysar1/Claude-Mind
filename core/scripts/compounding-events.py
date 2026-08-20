@@ -52,7 +52,7 @@ import os
 import sys
 from pathlib import Path
 
-from _paths import WORLD_DIR, assert_world_dir, AGENT_DIR
+from _paths import WORLD_DIR, assert_world_dir, AGENT_DIR, retrieval_session_path
 from _fileops import locked_append_jsonl
 
 _SCHEMA_VERSION = 1
@@ -280,7 +280,7 @@ def is_enabled():
 def _default_manifest_path():
     if AGENT_DIR is None:
         return None
-    return AGENT_DIR / "session" / "retrieval-session.json"
+    return retrieval_session_path(AGENT_DIR)  # body-aware, 
 
 
 # supplementary_detail `type` -> our entry_kind. pattern_signature is

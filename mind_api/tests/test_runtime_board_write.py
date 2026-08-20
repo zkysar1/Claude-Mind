@@ -188,11 +188,17 @@ def test_channels_lists(running_daemon):
     assert names["general"]["last_timestamp"] == "2026-05-12T10:01:00"
 
 
-def test_post_findings_citation_increments(running_daemon):
+def test_post_findings_citation_increments(running_daemon, monkeypatch):
     """ attribution end-to-end through the daemon, including the
     g-115-2351 regex regression: a 4-digit ID (rb-3742) must attribute —
     the pre-fix _CITE_RE \\d{3} silently excluded every ID past 999.
     Non-findings channels must not attribute (channel gate)."""
+    # LANE PIN (guard-4522): this test asserts the LEGACY embedded-counter
+    # surface (tih lands in the store record). On a box whose session env
+    # carries UTILIZATION_COUNTERS_SPOOLED=1 ( cutover), the flag
+    # leaks into the in-process daemon and the citation increment routes to
+    # the spool — embedded stays 0 and this fails only on flipped boxes.
+    monkeypatch.delenv("UTILIZATION_COUNTERS_SPOOLED", raising=False)
     project_root, port = running_daemon
     world = project_root / "world"
 

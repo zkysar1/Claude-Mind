@@ -44,7 +44,10 @@ except ImportError:
     print("PyYAML required: pip install pyyaml", file=sys.stderr)
     sys.exit(1)
 
-from _paths import PROJECT_ROOT, WORLD_DIR, AGENT_DIR, CORE_ROOT, META_DIR
+from _paths import (
+    PROJECT_ROOT, WORLD_DIR, AGENT_DIR, CORE_ROOT, META_DIR,
+    retrieval_session_path,
+)
 from _utilization_store import load_counters, utilization_of  # type: ignore
 
 # --- producer-side token helpers (single source of truth, ) --------
@@ -84,7 +87,13 @@ import _rt
 # ---------------------------------------------------------------------------
 
 TREE_PATH = WORLD_DIR / "knowledge" / "tree" / "_tree.yaml"
-SESSION_PATH = AGENT_DIR / "session" / "retrieval-session.json" if AGENT_DIR else None
+# Body-aware (): a worker Body's manifest is written to
+# sessions/<sid>/body-retrieval-session.json, so composing the agent-wide path
+# by hand made this whole module inert on a worker — `goal_mismatch` against a
+# live manifest one directory away. Binding at module scope is sanctioned for a
+# one-shot CLI (see _paths.body_state_path); the read AND the write-back below
+# both follow this constant, so routing it here fixes both.
+SESSION_PATH = retrieval_session_path(AGENT_DIR) if AGENT_DIR else None
 
 
 def now_str():

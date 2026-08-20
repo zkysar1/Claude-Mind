@@ -30,8 +30,21 @@ this script exists to preserve, and would look identical to a clean run.
 """
 import argparse
 import collections
+import json
 import re
 import sys
+
+# : prime's guardrail-index store-load budget, enforced at EMIT time.
+# 40k tokens is the budget prime/SKILL.md Phase 2 item 3 states; conversion at
+# the MEASURED 2.5 B/token ID-dense floor (self.md rule, guard-1478 class) so
+# the token estimate is an UPPER bound and the warning fires EARLY, never late.
+# WARN, never refuse: an absent index is strictly worse than an oversized one
+# (the  lesson — a refusal here would hand prime NO index at all).
+# The paired verify-learning check (Section 4T) is the fail-level layer. The
+# first breach of this budget reached 3.2x over, silently, because the budget
+# lived in prose with no gate — that is the shape this constant retires.
+BUDGET_TOKENS = 40_000
+ID_DENSE_BYTES_PER_TOKEN = 2.5
 
 # `guard-001: [category] rule text`  — the colon is optional so the parser does
 # not hinge on a punctuation detail of the emitter it does not own.
@@ -81,6 +94,49 @@ def build(lines):
     return text, count, len(cats), bad, continuations
 
 
+def render_critical(path):
+    """(section_text, n) for the CRITICAL always-load core, or ("", 0).
+
+    g-115-6965: the id manifest realizes the coverage floor but loads NO rule
+    text — including for the CRITICAL tier, whose admission rule (see
+    prime-store-load-budget.md) is precisely that the trigger zone is NOT
+    self-announcing, so the expand-on-demand path cannot cover it. This
+    section prepends those few rules IN FULL (guard-1421 honest mode:
+    "fewer entries read whole").
+
+    DEGRADES, NEVER REFUSES — the asymmetry with build() is deliberate: the
+    refusal there guards the id-coverage floor; this section is additive, and
+    its absence is exactly yesterday's behavior. Any failure warns on stderr
+    and returns empty. The CRITICAL ids also remain in the id manifest below,
+    so --assert-total semantics are untouched.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            recs = json.load(fh)
+        assert isinstance(recs, list)
+        recs = [r for r in recs if isinstance(r, dict)]
+    except Exception as e:
+        sys.stderr.write(
+            "[guardrail-manifest] WARN: CRITICAL section unavailable ({}: {}) "
+            "— emitting the id manifest without it (yesterday's shape, not a "
+            "coverage loss).\n".format(type(e).__name__, e))
+        return "", 0
+    if not recs:
+        return "", 0
+    parts = [
+        "=== CRITICAL guardrails ({}) — the always-load core: harm outlives "
+        "the loop AND the trigger zone is not self-announcing. Read in full; "
+        "these are the rules expansion-on-demand cannot save you from: "
+        "===".format(len(recs))
+    ]
+    for rec in sorted(recs, key=lambda r: str(r.get("id") or "")):
+        parts.append("{} [{}]:".format(rec.get("id", "?"),
+                                       rec.get("category", "?")))
+        parts.append(str(rec.get("rule") or "(no rule)"))
+        parts.append("")
+    return "\n".join(parts) + "\n", len(recs)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument(
@@ -93,6 +149,12 @@ def main():
         "--stats",
         action="store_true",
         help="emit a trailing coverage line to STDERR (never stdout, so callers can consume stdout verbatim)",
+    )
+    ap.add_argument(
+        "--critical-json-file",
+        default=None,
+        help="JSON array of full CRITICAL records; rendered whole ABOVE the id "
+             "manifest (additive — failures degrade to no section, never refuse)",
     )
     args = ap.parse_args()
 
@@ -121,13 +183,38 @@ def main():
         )
         return 2
 
+    crit_text, crit_n = ("", 0)
+    if args.critical_json_file:
+        crit_text, crit_n = render_critical(args.critical_json_file)
+        text = crit_text + text
+
+    # Budget accounting covers the WHOLE emitted payload, critical section
+    # included — prime pays for every byte on stdout, not just the rollup.
+    nbytes = len(text.encode("utf-8"))
+    est_tokens = int(nbytes / ID_DENSE_BYTES_PER_TOKEN)
+    if est_tokens > BUDGET_TOKENS:
+        # Bytes AND est-tokens AND the record-count denominator together — a
+        # token estimate without its denominator is the guard-2529/guard-2191
+        # failure (nothing to sanity-check the conversion against).
+        sys.stderr.write(
+            "[guardrail-manifest] BUDGET BREACH: {} bytes ~= {} est tokens at the "
+            "{} B/token ID-dense floor, over prime's {}-token budget ({} records / "
+            "{} categories). Every session start of every agent pays this load. "
+            "Retire or consolidate guardrails, or re-derive the budget deliberately "
+            "— the first breach reached 3.2x over in silence (g-115-6893).\n".format(
+                nbytes, est_tokens, ID_DENSE_BYTES_PER_TOKEN, BUDGET_TOKENS,
+                count, ncats
+            )
+        )
     sys.stdout.write(text)
     if args.stats:
         sys.stderr.write(
-            "[guardrail-manifest] {} records / {} categories / {} bytes / {} wrapped-text "
-            "continuation line(s) folded (100% id coverage; expand rule text with "
-            "guardrails-read.sh --id <id> or --category <cat>)\n".format(
-                count, ncats, len(text.encode("utf-8")), continuations
+            "[guardrail-manifest] {} records / {} categories / {} bytes (~{} est "
+            "tokens of a {}-token budget) / {} wrapped-text continuation line(s) "
+            "folded / {} CRITICAL rule(s) in full (100% id coverage; expand rule "
+            "text with guardrails-read.sh --id <id> or --category <cat>)\n".format(
+                count, ncats, nbytes, est_tokens, BUDGET_TOKENS, continuations,
+                crit_n
             )
         )
     return 0

@@ -70,6 +70,45 @@ from pathlib import Path
 # through _fileops.locked_modify_yaml and is deliberately out of scope.
 _TREE_MARKER = os.path.join("knowledge", "tree")
 
+# --- over-cap write advisory ( remedy, 2026-08-19) -----------------
+# PINNED COPIES of the read-cap detector's constants. Importing tree.py here
+# would put a multi-thousand-line module (plus yaml) on the hook critical path
+# the wrapper's first line declares latency-budgeted; reading tree.yaml per
+# hook fire costs a yaml parse for two numbers that change ~never. Drift is
+# caught by test_tree_write_fence_overcap.py, which asserts equality against
+# tree.py CHARS_PER_TOKEN and tree.yaml pruning.distill_token_cap (the same
+# pin-test pattern test_goal_claim_commit_gate.py uses for STALE_GRACE).
+#
+# The advisory fires at the FULL cap, not the detector's 0.8 proactive
+# trigger, deliberately: the sweep owns the proactive band, and a per-touch
+# nag that fires on every node in the 80-100% band becomes wallpaper. Every
+# banner this emits means "the file you just touched is unreadable NOW".
+#
+# Banner-only, no ledger row: the DIVERGED path ledgers because a conflict is
+# otherwise invisible after the moment passes, but an over-cap node is
+# durably visible already — tree-read.sh --distill-candidates lists it
+# tier-0 until it is folded. Writing over_cap rows into a file named
+# tree-write-conflicts.jsonl would also hand its consumers a second record
+# shape for no new information.
+CHARS_PER_TOKEN = 2.3     # == tree.py CHARS_PER_TOKEN (measured floor, id-dense)
+READ_CAP_TOKENS = 25000   # == tree.yaml pruning.distill_token_cap
+
+
+def est_tokens(path):
+    """~tree.py's estimate via os.path.getsize: bytes / CHARS_PER_TOKEN.
+
+    tree.py's _analyze_node_body divides CHAR count by the same ratio. bytes >=
+    chars (UTF-8), so this stat-only estimate runs equal-or-HIGH vs the
+    detector's — the fail-safe direction, and a one-directional guarantee:
+    every node the sweep lists at full cap, this warns on too. The reverse can
+    over-warn slightly on heavily non-ASCII nodes; that is accepted in exchange
+    for keeping a file read off the hook path. 0 when unreadable.
+    """
+    try:
+        return int(os.path.getsize(path) / CHARS_PER_TOKEN)
+    except Exception:
+        return 0
+
 
 def _now():
     return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
@@ -192,9 +231,18 @@ def record(path, store_path):
                 "reason": "unreadable", "path": str(path)}
     k = _key(path)
     rec = {"key": k, "sha256": h, "at": _now()}
-    return {"op": "record", "scoped": True,
-            "recorded": save_baseline(store_path, k, rec),
-            "sha256": h[:12], "path": str(path)}
+    out = {"op": "record", "scoped": True,
+           "recorded": save_baseline(store_path, k, rec),
+           "sha256": h[:12], "path": str(path)}
+    # Over-cap advisory (): record fires PostToolUse on BOTH Read and
+    # Edit/Write of a node, and both moments are action-relevant — a Read of an
+    # over-cap node came back TRUNCATED (rb-2077), and a write to one grew a
+    # file no future Read returns whole. The banner rides the same verdict so
+    # main() can print it to stderr (this function stays pure/testable).
+    et = est_tokens(path)
+    if et > READ_CAP_TOKENS:
+        out["over_cap"] = {"est_tokens": et, "cap": READ_CAP_TOKENS}
+    return out
 
 
 def check(path, store_path):
@@ -266,7 +314,23 @@ def main(argv):
         return 0  # no agent bound -> nothing to fence against
 
     if op == "record":
-        print(json.dumps(record(path, store)))
+        rec_out = record(path, store)
+        oc = rec_out.get("over_cap")
+        if oc:
+            # Same channel discipline as the DIVERGED banner: stderr only (the
+            # wrapper discards stdout by design). No ledger — the node stays
+            # durably visible in tree-read.sh --distill-candidates until folded.
+            print(
+                "[tree-write-fence] ⚠ OVER-CAP: %s is ~%s est_tokens (Read cap "
+                "~%s). Reads of this node come back TRUNCATED and appends deepen "
+                "a file no one can read whole. You touched it — fold it: apply "
+                "the archive+keep-newest rollup (tree-read.sh --distill-candidates "
+                "lists it tier-0), or claim its fold goal before adding content."
+                % (rec_out["path"], "{:,}".format(oc["est_tokens"]),
+                   "{:,}".format(oc["cap"])),
+                file=sys.stderr,
+            )
+        print(json.dumps(rec_out))
         return 0
 
     if op == "check":

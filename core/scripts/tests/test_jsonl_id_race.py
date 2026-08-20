@@ -56,6 +56,11 @@ def _post_append(port: int, store: str, record: dict) -> tuple[int, str]:
         return e.code, e.read().decode("utf-8", errors="replace")
 
 
+# allow_near_dup on every racer: these fixtures are near-identical BY DESIGN
+# (the property under test is id allocation under concurrency, not content
+# novelty), and the daemon's near-duplicate refusal tier () would
+# otherwise 409 every racer after the first at similarity 1.0. The field is
+# the refusal tier's sanctioned bypass — popped server-side, never persisted.
 def _rb_record(i: int) -> dict:
     return {
         "title": f"race entry {i}",
@@ -64,6 +69,7 @@ def _rb_record(i: int) -> dict:
         "content": f"concurrent allocator probe {i}",
         "applies_to": "framework",
         "tags": [TEST_TAG],
+        "allow_near_dup": True,
     }
 
 
@@ -75,6 +81,7 @@ def _guard_record(i: int) -> dict:
         "source": "id-race-test",
         "when_to_use": "never",
         "tags": [TEST_TAG],
+        "allow_near_dup": True,
     }
 
 

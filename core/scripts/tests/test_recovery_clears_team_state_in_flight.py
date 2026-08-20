@@ -12,15 +12,18 @@ Two assertions:
      (fail-open invariant — recovery must complete even if cross-agent
      cleanup errors).
 
-The test backs up the live team-state.yaml, seeds a known state, runs the
-script, asserts, then restores the backup.
+The test seeds a known state into an ISOLATED TMP WORLD, runs the script
+against it, and asserts. It never reads or writes the live shared world.
 """
 
 from __future__ import annotations
 
+import atexit
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -34,10 +37,30 @@ except ImportError:
     print("PyYAML required: pip install pyyaml", file=sys.stderr)
     sys.exit(2)
 
-from _paths import WORLD_DIR  # type: ignore
+# --- Isolated tmp world — NEVER the live store (guard-708, ) -------
+# This test SEEDS and DELETES team-state.yaml. Pointed at the LIVE world (as it
+# was until 2026-08-19) it replaced the fleet's shared cross-agent store with a
+# two-key stub and leaned on a backup/restore dance, which fails two ways:
+#   1. a crash, kill or suite timeout between seed and restore leaves the stub
+#      in place — MEASURED, an orphaned `team-state.yaml.rb671-test-backup.79624`
+#      was found on DESKTOP-O91DLK2, so that path has already been taken; and
+#      `strategic_focus.current_priority` read the literal "test" from the seed
+#      below, live, which is the boost directive every product lane depends on;
+#   2. even on the happy path the restore CLOBBERS any partner write landing in
+#      the window (guard-708 names this as data loss, not just flakiness).
+# MIND_WORLD is the highest-priority world override in _paths.sh (L298) and
+# _paths.py (L340); team-state.py resolves WORLD_DIR through it at import, so
+# redirecting it isolates the subprocess writer as well as this process.
+# MIND_META is deliberately NOT redirected — guard-708 says verify rather than
+# cargo-cult, and the whole chain (session-manifest-clear.sh -> session_snapshot.py
+# -> team-state.py) reads no meta. RT_DIR is likewise not set: guard-1547 applies
+# only to tests that can spawn a daemon, and that same chain has ZERO rt_call /
+# _runtime.sh reach (positive control: board-post.sh has 3).
+_TMP_WORLD = tempfile.mkdtemp(prefix="rb671-world-")
+atexit.register(shutil.rmtree, _TMP_WORLD, True)
 
+WORLD_DIR = Path(_TMP_WORLD)
 TEAM_STATE_PATH = WORLD_DIR / "team-state.yaml"
-BACKUP_PATH = TEAM_STATE_PATH.with_suffix(f".yaml.rb671-test-backup.{os.getpid()}")
 MANIFEST_CLEAR_SH = CORE_SCRIPTS / "session-manifest-clear.sh"
 TEST_AGENT = "test-rb671"
 
@@ -87,6 +110,12 @@ def run_manifest_clear() -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env["MIND_AGENT"] = TEST_AGENT
     env["MIND_WORLD"] = str(WORLD_DIR)
+    # guard-955: pin the backend for the child. Without it, on an own-cloud box
+    # the tmp-world write is pushed to the PRODUCTION S3 key — which would make
+    # the tmp redirect above look like isolation while still reaching the shared
+    # store. The sibling isolated-world test (test_team_state_clear_body_row.py
+    # `_cli`) pins it for the same reason.
+    env["STORAGE_BACKEND"] = "local"
     # Forward-slash relative path; Git Bash on Windows mangles drive-letter
     # paths (Errno 2 / "No such file or directory") when the colon survives.
     return subprocess.run(
@@ -137,8 +166,6 @@ def setup_test_agent_dir() -> Path:
 def teardown_test_agent_dir(agent_dir: Path) -> None:
     """Remove the test agent directory tree. Fail loud — leaving test-rb671/
     behind silently pollutes later runs."""
-    import shutil
-
     if agent_dir.exists():
         shutil.rmtree(agent_dir)
 
@@ -146,12 +173,10 @@ def teardown_test_agent_dir(agent_dir: Path) -> None:
 def main() -> int:
     failures: list[str] = []
 
-    # Back up live team-state.yaml.
-    backed_up = False
-    if TEAM_STATE_PATH.exists():
-        BACKUP_PATH.write_bytes(TEAM_STATE_PATH.read_bytes())
-        backed_up = True
-        print(f"backed up live team-state.yaml to {BACKUP_PATH.name}")
+    # No backup/restore: the world is a throwaway tmp dir (see the module
+    # header). Deleting that dance is the point of the fix, not a shortcut —
+    # a restore step is exactly what could clobber a partner's write.
+    print(f"isolated tmp world: {WORLD_DIR}")
 
     agent_dir = setup_test_agent_dir()
 
@@ -198,29 +223,14 @@ def main() -> int:
             )
 
     finally:
-        # Tear down test agent dir.
+        # The agent dir is the one artifact still OUTSIDE the tmp world:
+        # agent_dir() resolves under the repo's agents/ parent and is not
+        # governed by MIND_WORLD, so it still needs explicit teardown.
         teardown_test_agent_dir(agent_dir)
 
-        # Remove the TEST_AGENT row file the clear seeded into the LIVE
-        # world's rows dir ( sharding).
-        try:
-            from _team_state import row_path
-            p = row_path(WORLD_DIR, TEST_AGENT)
-            if p.exists():
-                p.unlink()
-        except Exception as e:
-            print(f"WARN: row-file cleanup failed: {e}", file=sys.stderr)
-
-        # Restore live team-state.yaml.
-        if backed_up:
-            TEAM_STATE_PATH.write_bytes(BACKUP_PATH.read_bytes())
-            BACKUP_PATH.unlink()
-            print(f"\nrestored live team-state.yaml from backup")
-        else:
-            # No live file existed before the test — make sure we don't leave
-            # the test seed behind.
-            if TEAM_STATE_PATH.exists():
-                TEAM_STATE_PATH.unlink()
+        # The seeded team-state.yaml and the  row file both live inside
+        # the tmp world, which atexit removes wholesale — no per-file cleanup,
+        # and nothing to restore, because nothing shared was ever touched.
 
     if failures:
         print(f"\nFAIL ({len(failures)}):")

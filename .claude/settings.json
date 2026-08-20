@@ -49,7 +49,8 @@
     "GATE_D_WORLD": "ayoai",
     "GATE_D_CORPUS_PATH": "<PROJECT_ROOT>\\core\\config\\gate-d-corpus-zds-2026-06-10.jsonl",
     "GATE_FIRINGS_SEGMENTED": "1",
-    "OWNCLOUD_GZIP_STORES": "ayoai-mind"
+    "OWNCLOUD_GZIP_STORES": "ayoai-mind",
+    "UTILIZATION_COUNTERS_SPOOLED": "1"
   },
   "skillListingBudgetFraction": 0.05,
   "hooks": {

@@ -87,7 +87,19 @@ TESTS_DIR = SCRIPT_DIR / "tests"          # last-resort fallback; see _testpaths
 # Revisit when  (classifier) and  (the 7 real reds) land,
 # or when the accumulated resource is identified -- at which point this list
 # should shrink to empty.
-DEFERRED_TESTPATHS = {"mind_api/tests"}
+#
+# 2026-08-20 (): it shrank to empty. The "accumulated resource" was
+# identified and fixed -- 's process-wide backend-cache poisoning
+# (conftest restored the env var but not the derived _ACTIVE_BACKEND), whose
+# reset fixture now exists in BOTH test-tree conftests (the mind_api mirror
+# landed with this change, closing the mixed-chunk vector). mind_api/tests
+# was re-measured on this box before folding: standalone 1,386/1,386 green,
+# and own-process at END of invocation (the historically fatal position)
+# green. Four genuine reds found by that measurement were fixed, not skipped:
+# set_at parity port (guard-2323), claim-sid harness pin, citation lane pin
+# (guard-4522), conftest MIND_SID coverage. The mechanism below stays for
+# future entries; the set being empty is the designed end state.
+DEFERRED_TESTPATHS = set()
 
 # ── Scope declaration for --triage () ─────────────────────────────
 #
@@ -936,6 +948,66 @@ def _git_head(root):
         return None
 
 
+def _populated_agents(agents_root_dir=None):
+    """Agent dirs on THIS box carrying an identity file. -> (names|None, reason)
+
+    Filed by omni from ZDS-Mind (g-306-325): a run-full-suite there reported 132
+    GENUINE unowned failures, 45 files, every one a fixture that assumes a
+    POPULATED MULTI-AGENT layout -- a second agent dir with real content, a live
+    peer to probe, or forked worker Bodies. On a single-agent deployment those
+    assumptions are false, the code under test behaves CORRECTLY, and the test
+    fails anyway. Since run-full-suite-after-deep-code makes a green suite the
+    closure criterion for every deep core/scripts change, that criterion is
+    UNSATISFIABLE there, and a permanently-red suite is indistinguishable from
+    one nobody reads.
+
+    self.md is the evidence, not local-paths.conf and not the team-state roster:
+
+      - `local-paths.conf` is WRONG here and the mistake is pre-recorded. Per
+        agent-dir-resolution.md, on any given box only the RESIDENT agent has a
+        conf (cc-04 has one for alpha alone), so conf-enumeration "would silently
+        degrade fleet mode to single-agent" -- i.e. it would produce exactly the
+        false single-agent verdict this function must never produce.
+      - The team-state roster is wrong for a DIFFERENT reason, and this is the
+        subtle one: it is the LIVE FLEET roster, and the fixtures do not read it.
+        They read local agent dirs. On ZDS the roster names several agents while
+        `agents/alpha`, `agents/delta` and `agents/zeta` hold only `session/` --
+        so a roster-based count would say "fleet", the clause would not fire, and
+        the suite would stay red. LOCAL-box evidence is not a degraded proxy for
+        the roster here; it is the correct question. Do not "fix" this to use
+        team-state.
+      - self.md is what `fleet_config_parity._has_agent_identity` uses for the
+        same discriminator ("is this roster row an agent at all"), backed by
+        rb-4246 and guard-1574 (never resolve a fleet member by NAME alone).
+        The predicate is duplicated rather than imported to keep the test runner
+        free of a dependency on a checker module that pulls in yaml +
+        _team_state; the rule it encodes is stable and cited above.
+
+    Returns (None, reason) when the check could not run -- callers MUST NOT read
+    that as a single-agent verdict. Mirrors `_has_agent_identity`'s root probe:
+    without it a missing or misresolved agents root makes every lookup a
+    confident False, i.e. N negatives instead of N unknowns, which is the vacuous
+    pass (`mandatory-step-vacuity`: a step that silently has nothing to do is
+    indistinguishable from one that ran clean).
+    """
+    if agents_root_dir is None:
+        try:
+            sys.path.insert(0, str(SCRIPT_DIR))
+            from _paths import agents_root          # the ONLY sanctioned resolver
+            agents_root_dir = agents_root()
+        except Exception as e:                       # noqa: BLE001
+            return None, "agents root unresolved (%s)" % e
+    try:
+        root = Path(agents_root_dir)
+        if not root.is_dir():
+            return None, "agents root is not a directory: %s" % root
+        names = sorted(d.name for d in root.iterdir()
+                       if d.is_dir() and (d / "self.md").is_file())
+        return names, None
+    except OSError as e:
+        return None, "agents root unreadable (%s)" % e
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--chunks", type=int, default=4,
@@ -947,6 +1019,11 @@ def main(argv=None):
                          "deliberately OFF the synced tree -- see g-115-6409)")
     ap.add_argument("--include-daemon-integration", action="store_true",
                     help="DANGEROUS with a live daemon; see Live-Daemon Exception")
+    ap.add_argument("--fleet-layout", choices=("auto", "include", "exclude"),
+                    default="auto",
+                    help="fleet_layout-marked tests (fixtures needing a populated "
+                         "multi-agent layout). auto=exclude only when this box has "
+                         "<2 agent dirs with a self.md; include/exclude force it")
     ap.add_argument("--confirm-solo", action="store_true",
                     help="on a contended verdict, re-run the worst-hit file alone to prove it")
     ap.add_argument("--print-out-dir", action="store_true",
@@ -1066,6 +1143,35 @@ def main(argv=None):
           "daemon_integration %s"
           % ("INCLUDED" if args.include_daemon_integration else "excluded"))
 
+    # fleet_layout decision (). ALWAYS narrated, never silent: this
+    # clause NARROWS what runs, and a runner that reports what it ran but not
+    # what it declined to look for is how the mind_api gap hid for five weeks
+    # (guard-1760). The evidence is printed with the verdict so a reader can
+    # check the premise instead of trusting the label.
+    agent_names, roster_err = _populated_agents()
+    if args.fleet_layout == "auto":
+        if agent_names is None:
+            # UNKNOWN is not single-agent. Fail toward running MORE tests: a
+            # false "fleet" costs some red tests on a single-agent box, a false
+            # "single-agent" silently deletes coverage everywhere else.
+            exclude_fleet_layout = False
+            fleet_why = "auto -> INCLUDED (roster undeterminable: %s)" % roster_err
+        elif len(agent_names) < 2:
+            exclude_fleet_layout = True
+            fleet_why = ("auto -> excluded (effectively single-agent: %d agent "
+                         "dir(s) with self.md%s)"
+                         % (len(agent_names),
+                            (" -- " + ", ".join(agent_names)) if agent_names else ""))
+        else:
+            exclude_fleet_layout = False
+            fleet_why = ("auto -> INCLUDED (%d agent dirs with self.md: %s)"
+                         % (len(agent_names), ", ".join(agent_names)))
+    else:
+        exclude_fleet_layout = (args.fleet_layout == "exclude")
+        fleet_why = "forced --fleet-layout %s" % args.fleet_layout
+    print("  fleet_layout %s: %s"
+          % ("excluded" if exclude_fleet_layout else "INCLUDED", fleet_why))
+
     # : record HEAD BEFORE the first chunk. The chunk file lists are
     # computed AT LAUNCH, so a merge landing mid-run hands later chunks paths
     # that may no longer exist -- chunk 00 runs against one tree and the rest
@@ -1080,8 +1186,22 @@ def main(argv=None):
     tot_p = tot_f = tot_e = 0
     for i, group in enumerate(groups):
         cmd = [sys.executable, "-u", "-m", "pytest", *group, "-q"]
+        # ONE -m carrying every clause. A SECOND -m does not AND with the first;
+        # pytest keeps only the last and SILENTLY DISCARDS the earlier one.
+        # Measured 2026-08-19 on test_daemon_orphan_prevention.py: `-m "not
+        # daemon_integration"` alone collected 0 files, and adding a second
+        # harmless `-m` collected 1 -- i.e. the daemon exclusion vanished. Two
+        # -m flags here would quietly repeal the Live-Daemon Exception (constraint
+        # 2 in this module's docstring) and let the suite hijack the live daemon
+        # out from under the running fleet. Append terms to this list, never a
+        # second -m.
+        marker_terms = []
         if not args.include_daemon_integration:
-            cmd += ["-m", "not daemon_integration"]
+            marker_terms.append("not daemon_integration")
+        if exclude_fleet_layout:
+            marker_terms.append("not fleet_layout")
+        if marker_terms:
+            cmd += ["-m", " and ".join(marker_terms)]
         log = out / ("chunk-%02d.log" % i)
         print("  chunk %02d: %d files ..." % (i, len(group)), end="", flush=True)
         with open(log, "w", encoding="utf-8", errors="replace") as fh:

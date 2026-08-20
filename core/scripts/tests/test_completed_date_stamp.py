@@ -206,11 +206,12 @@ def test_cli_daemon_completed_date_parity():
     """Both write-path implementations carry the  completion stamp.
 
     guard-2323 / guard-547: under daemon-only architecture the daemon is the ONLY
-    live path, so a CLI-side-only fix is inert from the moment it lands -- and
-    mind_api/tests sits in DEFERRED_TESTPATHS, so a green run-full-suite is not
-    evidence of parity. This guard lives in core/scripts/tests (which DOES run in
-    the normal closure suite) precisely so the parity check cannot be skipped
-    along with the daemon suite.
+    live path, so a CLI-side-only fix is inert from the moment it lands. When
+    this guard was written, mind_api/tests sat in DEFERRED_TESTPATHS (a green
+    run-full-suite said nothing about parity); that tree folded back into the
+    default run 2026-08-20 (g-115-6942), but the check stays here in
+    core/scripts/tests — a source-level parity pin is cheaper than a daemon
+    round-trip and keeps working if a tree is ever deferred again.
     """
     assert CLI_FILE.is_file(), f"CLI aspirations missing: {CLI_FILE}"
     assert DAEMON_FILE.is_file(), f"daemon aspirations_write missing: {DAEMON_FILE}"

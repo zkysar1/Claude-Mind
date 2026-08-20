@@ -94,7 +94,12 @@ sufficient knowledge. Context manifests and quality ratings are NOT needed for c
 - Keep searches targeted — 2-3 specific queries, not exhaustive
 - **Sufficiency check**: Does tree + codebase answer the question?
   - **YES** → use combined knowledge, proceed to Step 4b
-  - **NO** → check mode for Tier 3 eligibility
+  - **NO** → proceed to Tier 2.5
+
+### Tier 2.5 — Peer Worlds
+
+- Bash: `peer-retrieve.sh --json "{topic}"` — a peer Mind deployment may already hold what this world does not, so only `status: empty` at `completeness: complete` (rc=0) supports "nobody has this"; rc=3 / `partial` (or `status: unreachable`) means a lane was BLIND and its emptiness is not evidence
+- **Sufficiency check**: **YES** → proceed to Step 4b · **NO** → check mode for Tier 3 eligibility
 
 ### Tier 3 — Web Search (assistant/autonomous only)
 

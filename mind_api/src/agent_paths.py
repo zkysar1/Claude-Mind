@@ -169,10 +169,21 @@ class AgentPaths:
         (the forked body-WM-file), so a reducer/observer — or no `unit_key` —
         collapses to today's agent-wide path, inert until a 2nd Body forks. This
         keeps concurrent Bodies from clobbering each other's retrieval/
-        utilization audit trail. The reducer-side consumers (utilization-feedback,
-        phase-4-26-gate, exhaustive-search-gate, iteration-close) still read the
-        agent-wide manifest; the Phase-2 worker-execute path adopts this resolver
-        when worker Bodies run the consuming phases.
+        utilization audit trail.
+
+        CONSUMERS NOW AGREE WITH THIS WRITER (g-115-6653, 2026-08-19). Until
+        then every consumer composed `AGENT_DIR/"session"/"retrieval-session.json"`
+        by hand, so on a worker Body they read a file this method never returns —
+        utilization-feedback reported `goal_mismatch` and phase-4-26-gate went
+        fail-open GREEN against a live 48-item manifest one directory away. All
+        nine sites (utilization-feedback, phase-4-26-gate, exhaustive-search-gate,
+        compounding-events, pre-apply-consult-gate, iteration-close x3,
+        utilization-gate) now route through the CLI mirrors
+        `_paths.py::retrieval_session_path` / `_paths.sh::retrieval_session_path`,
+        pinned against this method by
+        core/scripts/tests/test_retrieval_session_path_parity.py. Change one side
+        and that parity test fails — which is the point, because a writer and its
+        readers drifting apart silently is exactly what this cost.
         """
         if unit_key:
             if self.body_wm_path(unit_key).exists():

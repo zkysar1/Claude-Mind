@@ -118,6 +118,32 @@ def aggregate(deltas):
     return out
 
 
+def latest_retrieval_ts(deltas):
+    """Per-id max spool `ts` across retrieval_count lines: {id: "YYYY-MM-DD..."}.
+
+    Pure, same contract as `aggregate` (g-358-22). The spool line's `ts` is the
+    only carrier of WHEN a spool-routed retrieval bump happened — the writer
+    (retrieve.py's spool branch) deliberately skips the store-side
+    `last_retrieved` stamp because `utilization_of` prefers the sidecar
+    WHOLESALE, so a sidecar entry whose last_retrieved froze at seed time would
+    make an actively-retrieved record read as retrieval-idle to retirement
+    sweeps — the same false-idle hazard class the first-touch seeding answers
+    for counters. Malformed/absent ts lines are dropped, not guessed at
+    (mirrors `aggregate`); ISO strings compare lexically = chronologically.
+    """
+    out = {}
+    for d in deltas:
+        rec_id = d.get("id")
+        ts = d.get("ts")
+        if not rec_id or d.get("counter") != "retrieval_count":
+            continue
+        if not isinstance(ts, str) or len(ts) < 10:
+            continue
+        if ts > out.get(rec_id, ""):
+            out[rec_id] = ts
+    return out
+
+
 def _seed_from_content(kind, missing_ids, world_dir=None):
     """Embedded counters for ids that have no sidecar entry yet.
 
@@ -189,7 +215,8 @@ def _seed_from_content(kind, missing_ids, world_dir=None):
     return found
 
 
-def apply_deltas(existing, agg, seeds, counter_names, recompute=None):
+def apply_deltas(existing, agg, seeds, counter_names, recompute=None,
+                 last_ts=None):
     """Merge aggregated deltas into the sidecar map. Pure; returns a new map.
 
     `existing` and the result are both {id: counters_dict}. Every counter named
@@ -197,6 +224,11 @@ def apply_deltas(existing, agg, seeds, counter_names, recompute=None):
     `recompute_utilization_score` documents that its callers MUST have
     normalized first and that a missing key signals schema drift and "should
     fail loudly, not silently coerce to 0".
+
+    `last_ts` ({id: max spool ts} from `latest_retrieval_ts`, g-358-22) stamps
+    `last_retrieved` = max(existing, ts date) on touched records. String field,
+    so it rides OUTSIDE `counter_names` (the int-normalization above never sees
+    it) and outside the delta sum; max keeps a fresher seed/peer value.
     """
     out = {rec_id: dict(counters) for rec_id, counters in existing.items()}
     for rec_id, counters in agg.items():
@@ -208,6 +240,12 @@ def apply_deltas(existing, agg, seeds, counter_names, recompute=None):
                 base[name] = 0
         for counter, delta in counters.items():
             base[counter] = base.get(counter, 0) + delta
+        ts = (last_ts or {}).get(rec_id)
+        if ts:
+            prior = base.get("last_retrieved")
+            day = ts[:10]
+            if not isinstance(prior, str) or day > prior:
+                base["last_retrieved"] = day
         if recompute is not None:
             try:
                 recompute({"utilization": base})
@@ -254,7 +292,8 @@ def _drain(kind, flushing: Path, world_dir, counter_names, recompute,
                 existing[it["id"]] = dict(counters) if isinstance(counters, dict) else {}
         seeds = _seed_from_content(
             kind, [i for i in agg if i not in existing], world_dir)
-        merged = apply_deltas(existing, agg, seeds, counter_names, recompute)
+        merged = apply_deltas(existing, agg, seeds, counter_names, recompute,
+                              last_ts=latest_retrieval_ts(deltas))
         changed["n"] = len(agg)
         return [{"id": rec_id, "utilization": merged[rec_id]}
                 for rec_id in sorted(merged)]

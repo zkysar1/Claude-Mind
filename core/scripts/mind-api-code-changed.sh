@@ -24,6 +24,7 @@
 #                                            core/scripts/predicate.py
 #                                            core/scripts/aspirations.py
 #                                            core/scripts/peer_surface.py
+#                                            core/scripts/git_ref_claim.py
 #
 #      peer_surface.py added 2026-08-14 (): board_write.py's post
 #      handler now imports suspected_routing_tags from it for the routing-tag
@@ -86,6 +87,15 @@
 #                              retrieve.py
 #        trigger_firings    <- core/scripts/retrieve.py:82 (eager, via retrieve)
 #        tree_idf           <- retrieve.py:1663 + tree_match.py:520 (LAZY)
+#
+#      Added 2026-08-20 ( — near-dup refusal at store append):
+#        store_dupe_warn    <- mind_api/src/endpoints/store.py _near_dup_verdict
+#                              (LAZY, in-function) — owns the refuse_threshold
+#                              config; a stale daemon copy silently serves OLD
+#                              thresholds against the live corpus
+#        mdl_gate           <- store_dupe_warn.refuse_check (LAZY) — the
+#                              tokenize/jaccard/nearest primitives the verdict
+#                              is computed with
 #
 #      NOTE on experience.py: it is in the pathspec but is NOT in the computed
 #      surface — mind_api/src/store_registry.py:327 says "Do NOT `from experience
@@ -203,12 +213,15 @@ for _attempt in 1 2 3; do
         core/scripts/retrieve.py \
         core/scripts/tree_idf.py \
         core/scripts/trigger_firings.py \
+        core/scripts/store_dupe_warn.py \
+        core/scripts/mdl_gate.py \
         core/scripts/experience.py \
         core/scripts/tree.py \
         core/scripts/tree_match.py \
         core/scripts/predicate.py \
         core/scripts/aspirations.py \
         core/scripts/peer_surface.py \
+        core/scripts/git_ref_claim.py \
         2>&1)"
     _diff_rc=$?
     if [ "$_diff_rc" -eq 0 ]; then

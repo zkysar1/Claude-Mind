@@ -939,6 +939,57 @@ CRITICAL contract (do not weaken):
 - `blocked_sleep_until` is NOT cleared here. Phase -0.5e is the single owner of
   expire/clear on re-entry.
 
+### B7.2a: Commit first — the idle path's only commit point
+
+`iteration-commit.sh` is wired inside `iteration-close.sh`'s `do_state_update`
+(the g-280-03 wiring) — which runs **only when a goal closes**. The all-blocked
+path closes no goal, yet B0/B2/B2.5/B3/B4/B5/B6.7/B6.8 all write durable
+artifacts: guardrails, reasoning-bank entries, tree nodes, new goals, defer
+refreshes, board posts. None of it was ever committed by any mechanism.
+
+MEASURED on downstream prod (omni, 2026-08-08, ZDS g-012-88 — back-ported to
+the frontier 2026-08-19): 16 dirty files against 0 unpushed commits, holding a
+new guardrail, a substantial tree-node section, a filed digest goal with its
+rule-axis reasoning, and two defer refreshes. All real learning, uncommitted,
+because no goal had closed since the last iteration-close. **The exposure
+window is longest exactly when nothing will sweep it in** — the idle path is
+the path that runs during long quiet stretches, and a session that ends or
+crashes mid-idle loses the lot.
+
+This placement (inside B7.2, before the sleep call) covers BOTH sleep paths,
+because the quiescence-approved branch (B6.5 rc=0 / B6.8 drain) and the B7
+backoff branch both funnel through B7.2. One call, both routes — and the
+terminal-call contract below is preserved because the commit Bash call runs
+BEFORE the sleep Bash call.
+
+```
+# `--goal-id all-blocked` is a deliberate synthetic label, not a real goal (there
+# is none — that IS the gap). It is not format-validated, produces a clean
+# `chore(all-blocked): ...` subject, and can never collide with sq-018's
+# per-goal ledger grep (`git log --grep "(g-NNN-NN):"`), so nothing that reads
+# commit history by goal-id is polluted. Routing through iteration-commit.sh
+# rather than a bare `git commit` keeps the namespace filter and the
+# over-inclusion attribution audit.
+# `--outcome deep` is REQUIRED: the script skips outright on `routine`
+# ("skip: outcome=routine (no commit by design)" — verified).
+# WHAT IT COSTS ON A CYCLE THAT WROTE NOTHING SUBSTANTIVE, stated honestly
+# because the obvious claim is wrong: it does NOT no-op. `world/changelog.jsonl`
+# is appended by the loop's OWN script-mediated reads and writes, so a truly
+# clean tree is rare here — three consecutive attempts to reach that branch all
+# found 1-2 dirty files and committed them (measured on downstream prod). Expect
+# a small `chore(all-blocked)` commit carrying a changelog delta on most idle
+# cycles. That is bounded and harmless, and it is much cheaper than the failure
+# it replaces (stranding a guardrail or a tree-node section through an idle
+# stretch). Do not "fix" the noise by gating on cleanliness without
+# re-measuring — the gate would rarely fire and would reintroduce the
+# stranding risk for the cycles that matter.
+# NEVER BLOCK THE SLEEP: on any non-zero rc, log it and continue to the sleep
+# below. A failed commit must not strand the loop awake.
+Bash: bash core/scripts/iteration-commit.sh --goal-id all-blocked \
+        --title "Maintain: encode learning produced on the idle path" \
+        --outcome deep --repo "$PROJECT_ROOT"
+```
+
 ```
 # Magic Wand #2 (alpha session-60): when arriving from B6.5 with quiescence
 # approval, prepend QUIESCENCE_SLEEP=1 so interruptible-sleep.sh demotes

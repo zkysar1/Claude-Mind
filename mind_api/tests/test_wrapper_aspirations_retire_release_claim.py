@@ -36,6 +36,14 @@ def _run(wrapper, args, *, project_root: Path, agent: str = "alpha"):
     env["MIND_AGENT"] = agent
     env["MSYS_NO_PATHCONV"] = "1"
     env["RT_DIR"] = str(project_root / "mind_api" / "state")
+    # Production shape ALWAYS carries a sid (bash-agent-inject injects
+    # MIND_SID into every hooked Bash call, and the claim endpoint's
+    # missing_claim_sid gate refuses without one). The inject hook fails OPEN
+    # on timeout and is absent in un-hooked launch contexts (background
+    # tasks, cron, CI), so inheriting the session env makes these tests
+    # flake on exactly those runs. Pin a deterministic sid instead of
+    # depending on inheritance — setdefault keeps a test's own override.
+    env.setdefault("MIND_SID", "pytest-wrapper-harness-sid")
     proc = subprocess.run(
         [_bash(), wrapper.as_posix(), *args],
         env=env, capture_output=True, text=True, check=False,

@@ -63,7 +63,31 @@ def _stub_git(tmp_path: Path, body: str) -> dict:
     git.chmod(0o755)
     env = os.environ.copy()
     env["PATH"] = f"{bindir}{os.pathsep}{env.get('PATH', '')}"
+    # The PATH prepend above is sufficient on POSIX and USELESS on Windows:
+    # Git-for-Windows' bash.exe REBUILDS PATH at startup, so the inherited
+    # Windows PATH is discarded and the stub dir never appears in bash's
+    # PATH at all (measured 2026-08-19 — bash's first two entries were
+    # /mingw64/bin, /usr/bin, and `type git` resolved to the real git). The
+    # stub itself is fine: it is executable (`test -x` passes) and runs
+    # correctly when invoked by absolute path.
+    #
+    # So the dir is ALSO published here for _bash() to prepend from inside
+    # the script, where bash has finished its startup. It must be in MSYS
+    # form (/c/Users/...), NOT C:/Users/...: a POSIX PATH splits on ':', so
+    # a drive colon cuts the entry in two — measured, bash's PATH[0] became
+    # the bare string "C" and PATH[1] a driveless /Users/... that matches
+    # nothing. That silent split is why four separate prepend spellings all
+    # appeared to be "ignored". .
+    env["MIND_TEST_STUB_BIN"] = _msys(bindir)
     return env
+
+
+def _msys(p) -> str:
+    """C:/Users/x -> /c/Users/x. Identity on POSIX, where as_posix() is already
+    the right form and there is no drive letter to collide with the separator."""
+    s = Path(p).as_posix()
+    m = re.match(r"^([A-Za-z]):/(.*)$", s)
+    return f"/{m.group(1).lower()}/{m.group(2)}" if m else s
 
 
 FAIL_LOUD = 'echo "fatal: unable to create \'.git/index.lock\': File exists" >&2\nexit 128'
@@ -71,6 +95,13 @@ FAIL_SILENT = "exit 128"   # non-zero, NOTHING on stderr — mode C
 
 
 def _bash(script: str, env=None, cwd=None):
+    # Prepend any stub bindir from INSIDE the script. Doing it via the env dict
+    # alone is a no-op under Git-for-Windows bash, which rebuilds PATH at
+    # startup — see _stub_git. Non-PATH env vars DO survive that rebuild, which
+    # is why the dir travels in its own variable.
+    stub = (env or {}).get("MIND_TEST_STUB_BIN")
+    if stub:
+        script = 'export PATH="%s:$PATH"\n' % stub + script
     return subprocess.run([BASH, "-c", script], capture_output=True, text=True,
                           timeout=60, env=env, cwd=cwd)
 

@@ -90,7 +90,7 @@ CORE_ROOT = SCRIPT_DIR.parent
 PROJECT_ROOT = CORE_ROOT.parent
 
 sys.path.insert(0, str(SCRIPT_DIR))
-from _paths import agent_dir as _agent_dir  # noqa: E402
+from _paths import agent_dir as _agent_dir, retrieval_session_path  # noqa: E402
 
 
 # Substring needles checked case-insensitively against title + description.
@@ -268,7 +268,7 @@ def _consult_already_done(agent: str, goal_id: str) -> bool:
     (measured, g-115-2179).
     """
     try:
-        p = _agent_dir(agent) / "session" / "retrieval-session.json"
+        p = retrieval_session_path(_agent_dir(agent))  # body-aware, 
         d = json.loads(p.read_text(encoding="utf-8"))
         if d.get("goal_id") != goal_id:
             return False

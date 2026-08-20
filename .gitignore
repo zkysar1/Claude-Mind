@@ -40,6 +40,15 @@ tmp_*
 # goal-selector-raw.txt above. Added 2026-06-03 cruft cleanup.
 /gsel_*
 /tmp-*
+# The audit ledger belongs at $WORLD_PATH/blocker-gate-overrides.jsonl. A test
+# stub whose `paths.world` was cwd-relative made `pytest mind_api/tests` write a
+# real one at repo ROOT on every run; it was then committed (989031be4) and
+# shipped on origin/main, so every box that ran the suite recreated the file and
+# armed a merge wedge on it (g-115-6814). The writing test is fixed and the
+# tracked copy removed — this anchor is the net that stops any future root-level
+# stray from being `git add -A`'d back in. Anchored so it can never mask a
+# legitimate ledger elsewhere in the tree.
+/blocker-gate-overrides.jsonl
 # Corrupted-path artifacts: a Windows drive-letter path (e.g. C:/Users/...)
 # treated as RELATIVE by POSIX/MSYS Python or bash creates a literal top-
 # level entry whose ':' is filesystem-mangled. TWO manglings occur in this

@@ -14,8 +14,12 @@ _RUNTIME_SELF="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
+# : shared strict-argv refusal helpers (uniform message contract).
+# Sourced BEFORE _runtime.sh so a refusal cannot be masked by a daemon failure.
+# shellcheck disable=SC1091
+source "$CORE_ROOT/scripts/_argv_strict.sh"
+
 declare -a FLAG_KEYS=()
-declare -a PASSTHROUGH=()
 REC_ID=""
 CATEGORY=""
 GOAL=""
@@ -41,41 +45,50 @@ _take_optional_int() {
 # (--most-retrieved / --least-retrieved / --recent below already check $#.)
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        -h|--help)
+            echo "Usage: experience-read.sh (--id | --category | --goal | --hypothesis | --type | --most-retrieved [N] | --least-retrieved [N] | --recent [N] | --summary | --archive | --meta | --validate)"
+            exit 0;;
         --id)
-            REC_ID="${2-}"; PASSTHROUGH+=(--id "${2-}"); shift $(( $# >= 2 ? 2 : 1 ));;
+            REC_ID="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
         --category)
-            CATEGORY="${2-}"; PASSTHROUGH+=(--category "${2-}"); shift $(( $# >= 2 ? 2 : 1 ));;
+            CATEGORY="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
         --goal)
-            GOAL="${2-}"; PASSTHROUGH+=(--goal "${2-}"); shift $(( $# >= 2 ? 2 : 1 ));;
+            GOAL="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
         --hypothesis)
-            HYPOTHESIS="${2-}"; PASSTHROUGH+=(--hypothesis "${2-}"); shift $(( $# >= 2 ? 2 : 1 ));;
+            HYPOTHESIS="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
         --type)
-            TYP="${2-}"; PASSTHROUGH+=(--type "${2-}"); shift $(( $# >= 2 ? 2 : 1 ));;
+            TYP="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
         --most-retrieved)
             if [ $# -gt 1 ] && [[ "$2" =~ ^[0-9]+$ ]]; then
-                MOST="$2"; PASSTHROUGH+=("$1" "$2"); shift $(( $# >= 2 ? 2 : 1 ))
+                MOST="$2"; shift $(( $# >= 2 ? 2 : 1 ))
             else
-                MOST="10"; PASSTHROUGH+=("$1"); shift
+                MOST="10"; shift
             fi;;
         --least-retrieved)
             if [ $# -gt 1 ] && [[ "$2" =~ ^[0-9]+$ ]]; then
-                LEAST="$2"; PASSTHROUGH+=("$1" "$2"); shift $(( $# >= 2 ? 2 : 1 ))
+                LEAST="$2"; shift $(( $# >= 2 ? 2 : 1 ))
             else
-                LEAST="10"; PASSTHROUGH+=("$1"); shift
+                LEAST="10"; shift
             fi;;
         --recent)
             if [ $# -gt 1 ] && [[ "$2" =~ ^[0-9]+$ ]]; then
-                RECENT="$2"; PASSTHROUGH+=("$1" "$2"); shift $(( $# >= 2 ? 2 : 1 ))
+                RECENT="$2"; shift $(( $# >= 2 ? 2 : 1 ))
             else
-                RECENT="10"; PASSTHROUGH+=("$1"); shift
+                RECENT="10"; shift
             fi;;
-        --summary)  FLAG_KEYS+=(summary); PASSTHROUGH+=("$1"); shift;;
-        --archive)  FLAG_KEYS+=(archive); PASSTHROUGH+=("$1"); shift;;
-        --meta)     FLAG_KEYS+=(meta);    PASSTHROUGH+=("$1"); shift;;
+        --summary)  FLAG_KEYS+=(summary); shift;;
+        --archive)  FLAG_KEYS+=(archive); shift;;
+        --meta)     FLAG_KEYS+=(meta); shift;;
         --validate)
-            VALIDATE=1; FLAG_KEYS+=(validate); PASSTHROUGH+=("$1"); shift;;
+            VALIDATE=1; FLAG_KEYS+=(validate); shift;;
         *)
-            PASSTHROUGH+=("$1"); shift;;
+            # : this arm silently appended to a dead PASSTHROUGH
+            # accumulator (fed the pre-2026-05-14 CLI fallback, read by nothing
+            # since), so a mistyped filter vanished and the call answered the
+            # WRONG population with rc=0 (the rb-245 authoritative-false-count
+            # shape). Refuse loudly. Exit 2 per the _argv_strict.sh convention
+            # (the daemon path exits 1, so tests need a distinct rc).
+            argv_strict_refuse_unknown "experience-read.sh" "$1" "--id <id> | --category <cat> | --goal <g> | --hypothesis <h> | --type <t> | --most-retrieved [N] | --least-retrieved [N] | --recent [N] | --summary | --archive | --meta | --validate";;
     esac
 done
 

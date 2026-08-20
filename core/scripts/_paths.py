@@ -96,6 +96,14 @@ def body_state_path(name: str, filename: str, sid: "str | None" = None) -> Path:
     Returns agents/<name>/sessions/<sid>/<filename> when THIS session is a
     non-reducer Body, else agents/<name>/session/<filename>.
 
+    NOTE this helper is NAME-based, so it rebuilds the agent dir via
+    `agent_dir(name)` and therefore does NOT honour the `MIND_AGENT_DIR`
+    override seam. That is correct for its five callers (compact/iteration
+    checkpoints, which are always under the real agent dir) but makes it the
+    wrong base for anything that must respect a caller-resolved AGENT_DIR —
+    see `retrieval_session_path` below, which is DIR-based for exactly that
+    reason and so deliberately does not delegate here.
+
     The activation signal is the EXISTENCE of the forked working-memory.yaml
     under the per-session dir — the same signal worker_execute.worker_wm_path
     and context_reads.tracker_path already use. Only a non-reducer body ever
@@ -131,6 +139,74 @@ def body_state_path(name: str, filename: str, sid: "str | None" = None) -> Path:
         if (body_dir / "working-memory.yaml").exists():
             return body_dir / filename
     return agent_state_dir(name) / filename
+
+
+def retrieval_session_path(agent_dir_path, sid: "str | None" = None) -> Path:
+    """Effective retrieval/utilization manifest path ().
+
+    CLI-side mirror of `AgentPaths.retrieval_session_path`
+    (mind_api/src/agent_paths.py) — the SAME mirror-pair relationship
+    `_paths.agents_root()` already has with `AgentPaths.agents_root`, and
+    pinned against it by test_retrieval_session_path_parity.py so the two
+    cannot drift.
+
+    WHY THIS EXISTS. The WRITER was Body-aware and every CONSUMER was not.
+    The retrieve endpoint has routed a worker Body's manifest to
+    `sessions/<sid>/body-retrieval-session.json` since Phase 1D (g-306-64),
+    but utilization-feedback, phase-4-26-gate, exhaustive-search-gate,
+    compounding-events and pre-apply-consult-gate each composed
+    `AGENT_DIR/"session"/"retrieval-session.json"` by hand, so on a worker
+    Body they read a file the writer never wrote.
+
+    That is not merely a lost counter. Measured on cc-07 2026-08-19 with a
+    live manifest of 48 pending items sitting one directory away:
+    utilization-feedback returned `{"status":"goal_mismatch",
+    "session_goal":null}` and phase-4-26-gate returned
+    `verdict:"pass", reason:"empty retrieval population"` — a gate whose
+    purpose is to BLOCK completion until utilization is attested went
+    silently GREEN. A fail-open gate is the more serious half, because a lost
+    counter announces itself as a zero while a passing gate announces nothing.
+    Workers execute most units now, so this was most of the corpus.
+
+    The agent-wide file being NON-EMPTY is what hid it: the commons-retrieval
+    hook writes `{"commons_patterns": ...}` there, so consumers never took
+    their own `no_session_file` branch and instead reported `goal_mismatch`,
+    which reads as a CALLER error (wrong --goal) rather than a wiring gap.
+
+    Reducer, observer, single-Body and no-SID sessions all take the
+    agent-wide fallback, so this is byte-identical to the pre-Body layout
+    everywhere except a forked worker.
+
+    TAKES THE AGENT DIRECTORY, NOT THE AGENT NAME, and that is load-bearing
+    rather than a style choice. `AGENT_DIR` honours the `MIND_AGENT_DIR`
+    override seam (`_paths.py` L401-405, `_paths.sh` L347) while
+    `agent_dir(name)` rebuilds from PROJECT_ROOT and does not. A name-based
+    version of this function therefore SILENTLY DISCARDS a caller-resolved
+    agent dir — which is a second way to derive one path, i.e. the
+    single-source-of-truth violation this fix exists to remove, reintroduced
+    one layer down. Caught by the full suite: every consumer test drives the
+    real script through `MIND_AGENT_DIR=<tmp>`, and a name-based resolver
+    read the LIVE agent dir instead, so `phase-4-26-gate` reported
+    "no retrieval-session.json — fail-open" against a manifest the test had
+    just written. In production the same slip would point every consumer at
+    the wrong agent dir under any deployment that sets the seam.
+
+    Pass whatever dir the caller already resolved (`AGENT_DIR`, or an
+    `agent_dir(name)` result where that is the pre-existing semantics) so this
+    function never re-derives, and never disagrees with, its caller.
+    """
+    agent_dir_path = Path(agent_dir_path)
+    if sid is None:
+        sid = (os.environ.get("MIND_SID") or "").strip()
+    if sid:
+        body_dir = agent_dir_path / SESSIONS_DIRNAME / sid
+        # SAME activation signal as body_state_path/worker_wm_path: only a
+        # NON-reducer Body forks a per-session working-memory.yaml. Repeated
+        # here rather than delegated because that helper is name-based (see
+        # its docstring) — if this predicate ever changes, both must move.
+        if (body_dir / "working-memory.yaml").exists():
+            return body_dir / "body-retrieval-session.json"
+    return agent_dir_path / SESSION_DIRNAME / "retrieval-session.json"
 
 
 # --- External path configuration ---

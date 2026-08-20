@@ -287,7 +287,15 @@ def test_rb_set_field_recomputes_on_utilization(running_daemon):
 # Reasoning-bank: store/increment (== reasoning-bank.py rb_increment)
 # ===========================================================================
 
-def test_rb_increment_counter(running_daemon):
+def test_rb_increment_counter(running_daemon, monkeypatch):
+    # LANE PIN (2026-08-20): this test asserts the LEGACY embedded-counter RMW.
+    # Post  the session env of any flipped box carries
+    # UTILIZATION_COUNTERS_SPOOLED=1, which leaks into the in-process test
+    # daemon and routes the increment to the spool — freezing the embedded
+    # counter and failing this test only on flipped boxes (env-dependence,
+    # not portability). Pin the legacy lane explicitly; the spool lane has
+    # its own tests (test_utilization_spool.py + *_spooled_surface twins).
+    monkeypatch.delenv("UTILIZATION_COUNTERS_SPOOLED", raising=False)
     project_root, port = running_daemon
     # rb-002 has times_helpful=3, retrieval_count=5 → score 3/5=0.6
     status, body = _post(port, "/v1/store/increment",
@@ -325,7 +333,12 @@ def test_rb_increment_invalid_counter(running_daemon):
     assert "invalid_counter" in body
 
 
-def test_rb_increment_not_found(running_daemon):
+def test_rb_increment_not_found(running_daemon, monkeypatch):
+    # LANE PIN (2026-08-20): the 404 is LEGACY-lane behavior. The spool lane
+    # returns 200 on an unknown id BY DOCUMENTED DESIGN (store.py: the spool
+    # path never reads the store, so it cannot 404; an orphan sidecar entry is
+    # inert). Same env-leak class as the counter tests above.
+    monkeypatch.delenv("UTILIZATION_COUNTERS_SPOOLED", raising=False)
     _, port = running_daemon
     status, _ = _post_err(port, "/v1/store/increment",
                           {"store": "reasoning-bank",
@@ -487,8 +500,16 @@ def test_guard_set_field_not_found(running_daemon):
 # Guardrails: store/increment (== reasoning-bank.py guard_increment)
 # ===========================================================================
 
-def test_guard_increment_counter(running_daemon):
+def test_guard_increment_counter(running_daemon, monkeypatch):
     # Append a valid record first (seeds lack trigger_condition/source).
+    # LANE PIN (2026-08-20): this test asserts the LEGACY embedded-counter RMW.
+    # Post  the session env of any flipped box carries
+    # UTILIZATION_COUNTERS_SPOOLED=1, which leaks into the in-process test
+    # daemon and routes the increment to the spool — freezing the embedded
+    # counter and failing this test only on flipped boxes (env-dependence,
+    # not portability). Pin the legacy lane explicitly; the spool lane has
+    # its own tests (test_utilization_spool.py + *_spooled_surface twins).
+    monkeypatch.delenv("UTILIZATION_COUNTERS_SPOOLED", raising=False)
     project_root, port = running_daemon
     _post(port, "/v1/store/append", {"store": "guardrails"},
           json.dumps(_guard_rec(id="guard-200")).encode("utf-8"))
@@ -518,7 +539,12 @@ def test_guard_increment_invalid_prefix(running_daemon):
     assert "invalid_field" in body
 
 
-def test_guard_increment_not_found(running_daemon):
+def test_guard_increment_not_found(running_daemon, monkeypatch):
+    # LANE PIN (2026-08-20): the 404 is LEGACY-lane behavior. The spool lane
+    # returns 200 on an unknown id BY DOCUMENTED DESIGN (store.py: the spool
+    # path never reads the store, so it cannot 404; an orphan sidecar entry is
+    # inert). Same env-leak class as the counter tests above.
+    monkeypatch.delenv("UTILIZATION_COUNTERS_SPOOLED", raising=False)
     _, port = running_daemon
     status, _ = _post_err(port, "/v1/store/increment",
                           {"store": "guardrails",

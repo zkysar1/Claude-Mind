@@ -163,8 +163,22 @@ class _IdentityBackend:
         return path
 
 
-def _bind_inference(monkeypatch, world, row):
-    """Point the inference at a tmp world with `row` as the agent's team-state."""
+def _bind_inference(monkeypatch, world, row, role="reducer"):
+    """Point the inference at a tmp world with `row` as the agent's team-state.
+
+    `role` PINS the Body role (g-115-6748), and pinning it is not optional
+    hygiene — without it these tests read the role of whatever Body is running
+    pytest. `_body_role()` derives from `AGENT_DIR/sessions/$MIND_SID/
+    working-memory.yaml`, and a worker Body's own shell exports MIND_SID while
+    AGENT_DIR resolves to the real agent dir, so that file EXISTS and the
+    inference correctly returns None. Measured: with the role unpinned,
+    `test_inference_still_returns_a_live_in_flight_goal` passes on a reducer box
+    and FAILS on a worker box, on the same tree — an environment-dependent
+    assertion masquerading as a behavioural one.
+
+    Default "reducer" is the pre-g-115-6748 semantics every existing caller was
+    written against, so their meaning is preserved exactly.
+    """
     import _team_state
 
     monkeypatch.setenv("MIND_AGENT", "alpha")
@@ -172,6 +186,20 @@ def _bind_inference(monkeypatch, world, row):
     monkeypatch.setattr(retrieve, "get_backend", lambda: _IdentityBackend())
     monkeypatch.setattr(_team_state, "read_agent_row",
                         lambda *a, **k: row, raising=False)
+
+    agent_dir = world.parent / "agent"
+    monkeypatch.setattr(retrieve, "AGENT_DIR", agent_dir)
+    if role == "unknown":
+        # `unknown` is reached by an ABSENT sid, which is the case that fires on
+        # every non-Body caller — hence it must fall through to the reducer
+        # behaviour, not the worker one.
+        monkeypatch.delenv("MIND_SID", raising=False)
+        return
+    monkeypatch.setenv("MIND_SID", "sid-under-test")
+    if role == "worker":
+        wm = agent_dir / "sessions" / "sid-under-test" / "working-memory.yaml"
+        wm.parent.mkdir(parents=True, exist_ok=True)
+        wm.write_text("slots: {}\n", encoding="utf-8")
 
 
 def test_inference_returns_none_for_terminal_in_flight(tmp_path, monkeypatch):
@@ -217,6 +245,111 @@ def test_inference_unaffected_when_no_in_flight(tmp_path, monkeypatch):
 
     _bind_inference(monkeypatch, world, {"in_flight": "not-a-dict"})
     assert retrieve._infer_in_flight_goal_id() is None
+
+
+# ------------------------------------------------ Body role ()
+
+
+@pytest.mark.parametrize("role,expected", [
+    ("worker", None),
+    ("reducer", "g-001-350"),
+    ("unknown", "g-001-350"),
+])
+def test_worker_body_does_not_inherit_the_reducers_in_flight_goal(
+        tmp_path, monkeypatch, role, expected):
+    """: the in_flight row is AGENT-keyed with no sid, so on a WORKER
+    Body it names the REDUCER's goal — measured 2026-08-19 (alpha worker, cc-07,
+    SID d1aec55b: a worker executing g-115-6653 stamped its manifest g-363-20,
+    the reducer's goal on cc-04).
+
+    All three roles in ONE parametrize on purpose. The worker row is the fix;
+    the reducer row is the positive control that the fix did not become
+    "return None always" (which would silently regress g-115-137 and satisfy a
+    worker-only test perfectly); and the unknown row pins the FAIL-OPEN
+    direction, which is the half most likely to be broken by a later
+    simplification. `unknown` fires whenever MIND_SID is unset — i.e. for every
+    non-Body caller — so folding it in with `worker` would disable goal-stamping
+    fleet-wide while still passing both other rows.
+    """
+    world = _write_world(tmp_path, [
+        _asp("asp-001", [{"id": "g-001-350", "status": "in-progress"}]),
+    ])
+    _bind_inference(monkeypatch, world,
+                    {"in_flight": {"goal_id": "g-001-350",
+                                   "claimed_at": "2026-08-19T00:00:00"}},
+                    role=role)
+    assert retrieve._infer_in_flight_goal_id() == expected
+
+
+@pytest.mark.parametrize("role,expected", [
+    ("worker", "worker"), ("reducer", "reducer"), ("unknown", "unknown"),
+])
+def test_body_role_is_three_way(tmp_path, monkeypatch, role, expected):
+    """The predicate keeps THREE values, not a bool (guard-2913: an unevaluated
+    check is not a passed one). A future refactor to `_is_worker() -> bool`
+    would erase the distinction between "this is the reducer" and "I could not
+    tell", and only the caller's comment would remember which way unknown fell.
+    """
+    world = _write_world(tmp_path, [_asp("asp-001", [])])
+    _bind_inference(monkeypatch, world, {}, role=role)
+    assert retrieve._body_role() == expected
+
+
+def test_body_role_reads_the_swappable_module_global_not_a_resolver(
+        tmp_path, monkeypatch):
+    """The daemon swaps `_r.AGENT_DIR` per request under its lock, so the role
+    MUST come from that global. A version resolving the agent dir itself (e.g.
+    via `agent_dir(agent)` or `_paths`) would read the DAEMON's process state
+    and mis-classify every request — which is the same defect class as the
+    in_flight row this whole fix is about, one level down.
+
+    Asserted by pointing AGENT_DIR at a directory that only the module global
+    knows about: if the function consulted any resolver instead, it could not
+    find this file and would answer `reducer`.
+    """
+    world = _write_world(tmp_path, [_asp("asp-001", [])])
+    monkeypatch.setenv("MIND_SID", "sid-under-test")
+    elsewhere = tmp_path / "somewhere-no-resolver-would-look"
+    wm = elsewhere / "sessions" / "sid-under-test" / "working-memory.yaml"
+    wm.parent.mkdir(parents=True, exist_ok=True)
+    wm.write_text("slots: {}\n", encoding="utf-8")
+    monkeypatch.setattr(retrieve, "AGENT_DIR", elsewhere)
+    assert retrieve._body_role() == "worker"
+
+    monkeypatch.setattr(retrieve, "AGENT_DIR", None)
+    assert retrieve._body_role() == "unknown"
+
+
+def test_daemon_endpoint_swaps_the_sid_it_was_handed(tmp_path):
+    """WIRING tripwire, because the CLI-side unit tests above cannot see it.
+
+    `_body_role()` reads os.environ["MIND_SID"], and in production the ONLY
+    caller is the daemon (retrieve.py's CLI main() was deleted at the 2026-05-14
+    cutover). The daemon process env holds the DAEMON's startup sid, so without
+    a per-request swap the predicate would answer for the wrong Body — exactly
+    the defect Decision #58 fixed for MIND_AGENT. Every test above would still
+    be green with that swap missing, which is why this asserts the wiring
+    textually rather than trusting the unit coverage.
+    """
+    root = SCRIPTS.parent.parent
+    src = (root / "mind_api" / "src" / "endpoints" / "retrieve.py").read_text(
+        encoding="utf-8")
+    assert "x-mind-sid" in src, (
+        "the retrieve endpoint no longer reads the x-mind-sid header — "
+        "_body_role() would then classify every request by the DAEMON's sid")
+    # Assert the SWAP form specifically, not the bare env name. A mutation that
+    # deleted only the swap was NOT caught by `'os.environ["MIND_SID"]' in src`,
+    # because the RESTORE block below it contains that same substring — the
+    # tripwire read as green against an endpoint that had stopped swapping
+    # entirely. Found by running the mutation, not by reading the assertion.
+    assert 'os.environ["MIND_SID"] = _req_sid' in src, (
+        "the retrieve endpoint no longer swaps MIND_SID per request "
+        "(g-115-6748); the Body-role check in _infer_in_flight_goal_id is inert "
+        "on the daemon path, which is the only path production uses")
+    assert 'os.environ.pop("MIND_SID", None)' in src, (
+        "the retrieve endpoint no longer RESTORES MIND_SID; a leaked worker "
+        "sid makes the next request — any agent — resolve as a worker and "
+        "silently stop inferring its goal")
 
 
 def test_single_definition_so_no_daemon_twin_to_port(tmp_path):

@@ -125,6 +125,30 @@ CASES = [
         "pipeline-read.sh",
         ["--nonexistent-flag", "SLID", "--id", BOGUS_PIPE],
     ),
+    #  completion rollout (2026-08-20): the remaining 13 of the goal's
+    # 15+1 population, guarded in one pass. Read wrappers carry a valid-but-bogus
+    # secondary filter for the same reverted-path-cheapness reason as
+    # aspirations-query.sh above; the three stdin pipeline wrappers rely on
+    # _run()'s input="" so a REVERTED parse falls through to an empty-stdin
+    # daemon refusal rather than the 120s stdin hang the fix removed.
+    ("reasoning-bank-read.sh", ["--nonexistent-flag", "SLID", "--id", "rb-999999"]),
+    ("guardrails-read.sh", ["--nonexistent-flag", "SLID", "--id", "guard-999999"]),
+    ("board-read.sh", ["--nonexistent-flag", "SLID", "--channel", "refusal-fixture-nonexistent"]),
+    ("journal-read.sh", ["--nonexistent-flag", "SLID", "--recent", "1"]),
+    ("pattern-signatures-read.sh", ["--nonexistent-flag", "SLID", "--id", "sig-999999"]),
+    ("spark-questions-read.sh", ["--nonexistent-flag", "SLID", "--id", "sq-999999"]),
+    ("team-state-read.sh", ["--nonexistent-flag", "SLID", "--field", "refusal.fixture.nonexistent"]),
+    ("experience-read.sh", ["--nonexistent-flag", "SLID", "--id", "exp-refusal-fixture-999999"]),
+    ("wm-read.sh", ["--nonexistent-flag", "SLID", "refusal_fixture_slot"]),
+    ("pipeline-add.sh", ["--nonexistent-flag", "SLID"]),
+    ("pipeline-meta-update.sh", ["--nonexistent-flag", "SLID", "refusal-fixture-field", "v"]),
+    ("pipeline-update.sh", ["--nonexistent-flag", "SLID", BOGUS_PIPE]),
+    # experience-update-field.sh is deliberately NOT here: its  fix
+    # adopted argv_strict_parse, joining the four *-update-field siblings whose
+    # refusal predates this file's message contract ( wording, usage
+    # on stderr, no --help arm). It is pinned in
+    # test_experience_update_field_argv.py against the parse-family contract
+    # its siblings actually implement.
 ]
 
 WRAPPERS = [c[0] for c in CASES]

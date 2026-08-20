@@ -808,3 +808,29 @@ row over appending an eleventh.
 > g-115-3376 + g-115-3692, whose premise reads "4/6 red on stale expectations" —
 > that premise now looks stale itself and wants a re-derive by whoever holds it.
 > Domain **54/54**, 1 skipped. `mind_api/tests` deferred, not run.
+
+## 2026-08-20 — alpha, `hostname` cc-10, `uname -r` 6.8.0-137-generic (the fold-back acceptance runs, g-115-6942)
+
+> **`mind_api/tests` left `DEFERRED_TESTPATHS` this day** — these are the runs
+> that justified it. (1) Standalone post-fix baseline: **1,386/1,386 green**
+> (the tree's first fully green standalone; the prior session's baseline had 4
+> genuine reds — set_at daemon/CLI parity, 2×claim-sid harness, citation lane —
+> all fixed, not skipped, in `a2b8d94d7`). (2) `RUN_DEFERRED=1` full run:
+> `VERDICT: INVALID (tree-moved)` — self-inflicted, a commit landed mid-run
+> (rb-8554: commit FIRST, then measure) — but its deferred half launched
+> post-commit in its own process at END of invocation, the historically fatal
+> position, and was **green at [100%]**. (3) Folded acceptance run (default
+> path, 4×275-file chunks): `TOTAL: 16,099 passed, 5 failed, 0 errors` /
+> `VERDICT: GENUINE`; `--triage`: **1 environmental, 4 genuine-owned
+> (g-115-6805, g-115-6759, g-115-6840, g-115-5637), 0 unowned — none in
+> `mind_api/tests`**. The new `deferred PASS — "deferred set empty"` half
+> record fired.
+>
+> Same-run other halves: invisible 108/109 — `test-infra-health-streak.sh`, a
+> PREDICTED live-state decay (its own header foresaw it: if future maintenance
+> clears the tracked live component, the test needs a seeded fixture +
+> --health-file override); fixed
+> that way this day (hermetic fixture + `--health-file` on streak-alert),
+> invisible re-run **109/109**. Domain 55/56 + 1 skipped — the red is
+> `test_contract_deadline_alert_discrimination.py::test_producer_shape_has_not_drifted`,
+> owned g-115-6952.

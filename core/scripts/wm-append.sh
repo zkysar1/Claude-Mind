@@ -20,11 +20,39 @@ PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
 # --- Parse args -----------------------------------------------------------
+# EXACTLY ONE positional — the slot name. No flags, no second argument.
+#
+# : this was a bare catch-all (`case "$1" in *) SLOT="$1"; shift;;`)
+# that ASSIGNED on every token, so the LAST one won and any token at all became
+# the slot name. Both halves have to be refused, and only one of them is a flag:
+#
+#   `wm-append.sh spark_capture --json`        -> slot=--json. Caught downstream
+#       since , but the wrapper discards the daemon's stderr, so the
+#       operator sees rc=1 with EMPTY stdout and stderr (measured 2026-08-19,
+#       alpha worker Body, hostname cc-07, uname -r 6.8.0-137-generic).
+#   `wm-append.sh spark_capture exp_capture`   -> slot=exp_capture. BOTH names
+#       are registered, so the unknown-lane refusal has no basis to object: the
+#       entry lands in the WRONG lane at HTTP 200. Nothing downstream can catch
+#       this one — it is the half a leading-dash-only fix misses.
+#
+# Refuse HERE rather than leaning on the daemon: this is the call site, the
+# offending token can be named verbatim, and no round trip is spent. guard-4437
+# is the general form — last-wins arg handling silently voids the earlier value
+# and still exits 0.
 SLOT=""
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        *) SLOT="$1"; shift;;
+_seen=0
+for arg in "$@"; do
+    case "$arg" in
+        -*)
+            echo "Error: '$arg' starts with '-', so it is a command-line flag, not a slot name. wm-append.sh accepts no flags — pass the slot as the only argument. Usage: wm-append.sh <slot>" >&2
+            exit 1;;
     esac
+    if [ "$_seen" -ne 0 ]; then
+        echo "Error: unexpected second argument '$arg' — the slot is already '$SLOT'. wm-append.sh takes exactly one positional, and silently preferring one over the other is the defect this refusal exists to prevent. Usage: wm-append.sh <slot>" >&2
+        exit 1
+    fi
+    SLOT="$arg"
+    _seen=1
 done
 
 if [ -z "$SLOT" ]; then

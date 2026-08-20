@@ -930,6 +930,69 @@ def apply_reachability(entry, reachability_status):
     return entry
 
 
+def apply_merged_pr_tier1(entry, pr_status, merge_default_status):
+    """Correct a flagged committed_not_pushed entry whose absent SHAs ALL belong
+    to a MERGED pull request whose merge commit is confirmed on the default
+    branch — the work shipped under a rewritten sha. PURE (forge + containment
+    injected). g-115-6873 / g-115-6834.
+
+    THE GAP THIS CLOSES, which is a gap BETWEEN correct mechanisms rather than a
+    bug in any one of them. `all_merged_on_default` already encodes exactly this
+    carve-out, and until now it was reachable ONLY from classify_stranded — i.e.
+    only for OFF-DEFAULT shas, commits still reachable from some remote branch.
+    That premise ("which remote branch are these commits on?") has no answer once
+    the branch is DELETED, and a forge deletes the source branch on merge BY
+    DEFAULT. So the moment a squash-merged branch is auto-deleted its sha stops
+    being off-default and becomes reachable from no remote ref at all — which is
+    TIER 1, where no merged-pull-request check ran. The carve-out protected the
+    TRANSIENT state (branch still present) and missed the STEADY one (branch
+    cleaned up), so its coverage decayed to zero exactly as a repo tidies up
+    after itself. The other two tier-1 correctors decline for reasons that are
+    each correct: apply_reachability maps only ABSENT / STRANDED_WORKER_REF away
+    from the push remedy, and a squash-merged-then-deleted sha is neither (it is
+    still reachable from the pull-request ref); apply_superseded requires
+    byte-identity in HEAD, which decays as later commits touch the same files.
+
+    Measured (g-115-6781): a pull request MERGED as a squash (parent_count=1),
+    head branch deleted, its head sha reachable from no remote branch, all five
+    touched files byte-identical between that sha and the merge commit, and the
+    merge commit an ancestor of the default branch. Tier 1 filed a HIGH
+    Investigate reading "Push the commit (or re-do the work if it was lost)" — a
+    remedy that is impossible (the branch is gone) and, on its second clause,
+    destructive (the work is live).
+
+    NOT A SUPPRESSOR, matching apply_reachability and apply_superseded: the entry
+    keeps its SHAs and stays in the report under a corrected reason. What it
+    stops is the --apply write of a remedy that cannot work.
+
+    CONSERVATIVE — every uncertainty declines to bless, inherited wholesale from
+    all_merged_on_default: an UNAVAILABLE forge probe, a CLOSED-unmerged record,
+    a null merge_commit_sha, a merge commit not confirmed on the default branch,
+    and an empty sha set all keep committed_not_pushed. A sha with NO record at
+    all also declines, rather than being skipped over — blessing an entry on the
+    strength of the shas that happened to be probed is the one direction this
+    must never fail (verify-before-assuming rule 4). An unreachable forge must
+    never convert a flagged sweep into a clean one (g-115-3471), and this is the
+    lane that detects real deliverable loss (rb-3135 / g-115-2570).
+
+    Runs AFTER apply_superseded and apply_reachability and defers to both: a
+    superseded entry has its content in HEAD, and a misrouted verdict is a
+    statement about the sha itself — both are more specific than "a pull request
+    carrying it merged".
+    """
+    if entry.get("reason") != "committed_not_pushed":
+        return entry
+    absent = entry.get("shas_absent_local_only") or []
+    records = [pr_status.get(s) for s in absent]
+    if not absent or any(r is None for r in records):
+        return entry
+    if all_merged_on_default(records, merge_default_status):
+        entry["reason"] = "benign_merged_pr"
+        entry["merged_pull_requests"] = sorted(
+            {r.get("number") for r in records if r.get("number")})
+    return entry
+
+
 # ─────────────────────────── impure git probe ───────────────────────────
 
 def discover_candidate_repos():
@@ -1918,6 +1981,31 @@ def main():
                 if r.get("state") == "MERGED" and r.get("merge_commit_sha")}),
         candidate_repos, default_refs)
 
+    # : give TIER 1 the merged-pull-request carve-out tier 2 has had
+    # since . Its own probes are built here rather than reusing the two
+    # above, because those are keyed on tier 2's OFF-DEFAULT shas and tier 1's
+    # absent shas are a disjoint set by construction — reusing them would look
+    # correct and silently return None for every tier-1 sha. Placed after the
+    # tier-2 preamble only because it needs default_refs, the same staging reason
+    # apply_reachability sits where it does; it belongs to tier 1 and touches
+    # nothing tier 2 produces. Staged narrowest-last like every other probe in
+    # this sweep: only entries STILL flagged after the superseded and
+    # reachability passes reach the forge, so a clean sweep pays nothing.
+    tier1_pr_status = build_pr_status(
+        sorted({s for e in real_flagged
+                for s in (e.get("shas_absent_local_only") or [])}),
+        candidate_repos)
+    tier1_merge_default_status = build_default_status(
+        sorted({r["merge_commit_sha"] for r in tier1_pr_status.values()
+                if r.get("state") == "MERGED" and r.get("merge_commit_sha")}),
+        candidate_repos, default_refs)
+    for e in real_flagged:
+        apply_merged_pr_tier1(e, tier1_pr_status, tier1_merge_default_status)
+    merged_pr = [e for e in real_flagged
+                 if e.get("reason") == "benign_merged_pr"]
+    real_flagged = [e for e in real_flagged
+                    if e.get("reason") == "committed_not_pushed"]
+
     stranded_all = []
     for g in all_goals:
         entry = classify_stranded(
@@ -1992,6 +2080,8 @@ def main():
         "benign_squash_merged": squash_merged,
         "misrouted_reachability_count": len(misrouted),
         "misrouted_reachability": misrouted,
+        "benign_merged_pr_count": len(merged_pr),
+        "benign_merged_pr": merged_pr,
         "pr_probe_unavailable": pr_probe_unavailable,
         "investigate_created": investigate_created,
         "applied": bool(args.apply),
@@ -2004,6 +2094,7 @@ def main():
               f"benign_superseded={len(benign_superseded)} "
               f"benign_squash_merged={len(squash_merged)} "
               f"misrouted_reachability={len(misrouted)} "
+              f"benign_merged_pr={len(merged_pr)} "
               f"repos={len(candidate_repos)} applied={bool(args.apply)}")
         for e in real_flagged:
             print(f"  [{e['reason']}] {e['goal_id']} ({e['source']}): "
@@ -2031,6 +2122,14 @@ def main():
                   f"tier-1 would have said 'push it', but the canonical prober "
                   f"returns {','.join(e.get('reachability_verdicts') or ['?'])} "
                   f"| local-only={e['shas_absent_local_only']} | {e['title']}")
+        for e in merged_pr:
+            nums = ",".join(f"#{n}" for n in (e.get("merged_pull_requests") or [])) or "?"
+            print(f"  [benign_merged_pr log-only] {e['goal_id']} "
+                  f"({e['source']}): tier-1 would have said 'push it', but PR "
+                  f"{nums} merged and its merge commit is on the default branch "
+                  f"— the sha is unreachable because the head branch is gone, "
+                  f"not because the work is | "
+                  f"local-only={e['shas_absent_local_only']} | {e['title']}")
         for e in squash_merged:
             pr = e.get("pull_request") or {}
             print(f"  [benign_squash_merged log-only] {e['goal_id']} "

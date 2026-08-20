@@ -17,22 +17,35 @@ _RUNTIME_SELF="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
+# : shared strict-argv refusal helpers (uniform message contract).
+# Sourced BEFORE _runtime.sh so a refusal cannot be masked by a daemon failure.
+# shellcheck disable=SC1091
+source "$CORE_ROOT/scripts/_argv_strict.sh"
+
 # --- Parse args -----------------------------------------------------------
 FIELD=""
 VALUE=""
-declare -a PASSTHROUGH=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        -h|--help)
+            echo "Usage: pipeline-meta-update.sh <field> <value>"
+            exit 0;;
         -*)
-            PASSTHROUGH+=("$1"); shift;;
+            # : was a silent append to the dead PASSTHROUGH
+            # accumulator — a mistyped flag vanished, and on the write wrappers
+            # that slides the NEXT token into a positional slot (the 
+            # clobber class). Refuse loudly, before any stdin read can block.
+            argv_strict_refuse_unknown "pipeline-meta-update.sh" "$1" "(none — takes <field> <value> positionals)";;
         *)
             if [ -z "$FIELD" ]; then
                 FIELD="$1"
             elif [ -z "$VALUE" ]; then
                 VALUE="$1"
+            else
+                argv_strict_refuse_extra_positional "pipeline-meta-update.sh" "$1" 2 ""
             fi
-            PASSTHROUGH+=("$1"); shift;;
+            shift;;
     esac
 done
 

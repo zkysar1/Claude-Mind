@@ -85,7 +85,7 @@ if hasattr(sys.stderr, "reconfigure"):
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import WORLD_DIR, AGENT_DIR  # noqa: E402
+from _paths import WORLD_DIR, AGENT_DIR, retrieval_session_path  # noqa: E402
 from _gate_log import log as _gate_log  # noqa: E402
 
 GATE_ID = "phase-4-26-gate"  # MUST match the id in core/config/gates.yaml
@@ -123,7 +123,12 @@ def _load_session(goal_id):
     """
     if AGENT_DIR is None:
         return {}, "no-agent-dir"
-    path = AGENT_DIR / "session" / "retrieval-session.json"
+    # Body-aware (). Composing the agent-wide path by hand made this
+    # gate return verdict=pass / "empty retrieval population" on EVERY
+    # worker-executed goal, while the real manifest sat unread in
+    # sessions/<sid>/. A fail-open gate is the dangerous half of that defect:
+    # a lost counter shows up as a zero, a passing gate shows up as nothing.
+    path = retrieval_session_path(AGENT_DIR)
     if not path.exists():
         return {}, "no-session"
     try:

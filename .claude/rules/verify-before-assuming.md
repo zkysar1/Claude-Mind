@@ -14,7 +14,10 @@ below live in `core/config/conventions/negative-conclusions.md`
 
 1. **Multi-signal requirement**: A negative conclusion requires 2+ independent
    verification signals before acceptance. "Independent" means different tools,
-   different endpoints, or different evidence types.
+   different endpoints, different evidence types, or a different WORLD — Tier 2.5
+   `peer-retrieve.sh` asks the peer Mind deployments, and only `status: empty` at
+   `completeness: complete` is a signal at all; rc=3 / `partial` means a lane was
+   blind, which is rule 4's silent failure arriving through a new door.
 2. **Cost-proportional verification**: If the conclusion blocks multiple goals
    or hours of work, require more signals and try harder to disprove it.
 3. **Infrastructure-specific**: MUST NOT declare infrastructure unavailable
@@ -87,10 +90,16 @@ record). If the link is inferred from correlation, use a neutral form instead:
 - "observed: X (per <audit-trail or commit reference>). therefore: Y"
 - "X exists; how it got that way is not recorded"
 
-Same-turn evidence, or no causal connector — in code comments, reasoning-bank
-`content`/`failure_lesson`, tree-node histories, verify summaries and goal
-descriptions alike (rb-734: a "because the LLM has been compensating" comment
-chained two observations into an unverified cause and was retracted).
+Same-turn evidence, or no causal connector, on every surface the convention
+lists (rb-734).
+
+**Place the hedge where it survives, and scope the work to the measured half.**
+A guardrail survey shows the head of `rule` — `--summary` prints it even for the
+~12% that carry a `title` — and guard-1421 measured the imperative past that
+slice 85% of the time. So put the uncertainty in a goal's TITLE and in a
+guardrail `rule`'s FIRST clause; mid-field it reads as certainty. Then scope the
+deliverable to whichever half is MEASURED — it must stay correct if the
+inferred mechanism is falsified.
 
 ## Capability-Absence Claims ("Y Needs To Be Built")
 

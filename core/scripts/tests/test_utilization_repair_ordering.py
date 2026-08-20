@@ -44,6 +44,7 @@ from _bash_helpers import BASH  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 ITER_CLOSE = PROJECT_ROOT / "core" / "scripts" / "iteration-close.sh"
+PATHS_SH = PROJECT_ROOT / "core" / "scripts" / "_paths.sh"
 
 
 # ---------------------------------------------------------------- structural
@@ -179,8 +180,20 @@ def harness(tmp_path):
             argv_log.unlink()
 
         harness_sh = tmp_path / "harness.sh"
+        # `_paths.sh` is sourced FIRST because production does exactly that
+        # (iteration-close.sh:69) and the extracted helper calls into it —
+        # `retrieval_session_path` since . Omitting it made this
+        # harness a shape production never runs: the helper died `command not
+        # found` (rc=127) while the real script was fine, i.e. the test failed
+        # for a reason that could not happen in production (guard-920 — the
+        # tested shape must BE the production shape).
+        #
+        # ORDER MATTERS. _paths.sh assigns AGENT_DIR itself, so the tmp
+        # override is re-assigned AFTER the source or it would be clobbered
+        # and every case would read the LIVE agent dir.
         harness_sh.write_text(
             "set -euo pipefail\n"
+            f'source "{PATHS_SH}"\n'
             f'AGENT_DIR="{agent_dir}"\n'
             f'GOAL_ID="{goal_id}"\n'
             f'SCRIPT_DIR="{script_dir}"\n'

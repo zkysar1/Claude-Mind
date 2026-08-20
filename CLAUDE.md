@@ -397,7 +397,8 @@ Follow the retrieval escalation convention (`core/config/conventions/retrieval-e
 
 1. **Tier 1 — Knowledge Tree**: `retrieve.sh --category {category} --depth medium` or intelligent retrieval protocol
 2. **Tier 2 — Codebase Exploration**: Grep/Glob/Read on the primary workspace (from `agents/<agent>/self.md`)
-3. **Tier 3 — Web Search**: WebSearch/WebFetch (assistant/autonomous mode only)
+3. **Tier 2.5 — Peer Worlds**: `peer-retrieve.sh` — only `status: empty` at `completeness: complete` licenses a negative; rc=3 / `partial` means a lane was blind, not empty
+4. **Tier 3 — Web Search**: WebSearch/WebFetch (assistant/autonomous mode only)
 
 Stop at the first tier that provides sufficient knowledge. Never say "I don't have context"
 without attempting all eligible tiers.

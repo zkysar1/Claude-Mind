@@ -768,6 +768,24 @@ gates:
     tuning_notes: "TELEMETRY-ONLY, failure-only (decision=fail_open, emitted from the || branch of the worker-ref-consume --check invocation; clean passes log nothing — own-cloud append cost, same posture as the pre-commit suite BLOCK-only telemetry). Registered so the rows are visible to gate-retirement-eval at all (_gate_log.log docstring: an unregistered gate_id is invisible to the evaluator). Keyword fields are inert — there is no keyword matching here; `balanced` keeps it out of the FN-dominant keyword-widening branch. RETIREMENT CRITERION AT BIRTH (guard-769): retire when the touch-after-success alternative lands (making the failure self-retrying) OR when 30 days of firings show zero rows while worker Bodies are demonstrably active — either means the dark path is closed or never taken."
     retirement_eligible: true
 
+  - id: cross-box-body-liveness
+    script: mind_api/src/endpoints/aspirations_write.py
+    embedded: true
+    instrumented: true
+    sites:
+      - { file: "mind_api/src/endpoints/aspirations_write.py", phase: "_cross_box_body_is_live wrapper (same-agent cross-session claim contest)" }
+    dominant_risk: FN
+    asymmetry_magnitude: high
+    keyword_bias: balanced
+    override_flag: null
+    fp_cost: low
+    fn_cost: high
+    fp_description: "A wrong `block` refuses a legitimate cross-session takeover, wedging one goal until the holder's row ages past stale_minutes. Bounded and self-clearing."
+    fn_description: "A wrong `pass` lets a second Body of the same agent claim a goal a live Body already holds — two Bodies build one goal. Measured 2026-08-19T08:20:59 (alpha): SID d1aec55b claimed g-306-323, cd5fd3b9 claimed it 2m later and won; the loser discovered it only when goal-claim-commit-gate refused its commit at 08:57, discarding ~34min of work (commit d48cde62). Two such events in ~25h across the predicate's two sub-paths."
+    rb_evidence: [rb-8513]
+    tuning_notes: "MEASUREMENT-FIRST, ALL-OUTCOMES telemetry (g-306-328). The predicate's boolean is UNCHANGED — this registration exists to measure the distribution BEFORE deciding whether to change it, because the two remedies point opposite ways and nothing distinguished them. Read `extra.verdict_class`, not `decision`: `live` (block) and `dormant` (pass) are grounded in something the store SAID; `unanswered` (also pass) means the probe never got an answer, and per guard-2223 that third state must not fold into either pole. `extra.reason` splits it further — `no_row_for_sid` is the structural class the writer's fail-open contract produces (coordination.md:1035), and it is NOT evidence of dormancy. `decision` is set by observable control-flow effect per guard-1743, so `fail_open` is reserved for the branch that genuinely RAISED (gate-retirement-eval investigates on fail_open; mislabelling unanswered as fail_open would manufacture HIGH investigations at every cycle). All four outcomes log, not just the refusal — a surface that records only the escape path cannot answer the one question this instrumentation exists for (guard-2293). RETIREMENT CRITERION AT BIRTH (guard-769): retire when the g-306-328 decision lands — either the consumer starts acting on `unanswered` (then this becomes ordinary gate telemetry and needs its own asymmetry row), or a measured decision records that it should not, at which point the distribution has served its purpose and only the block/pass rows are worth keeping."
+    retirement_eligible: true
+
 # ─── Gates discovered in core/scripts/ but not in the Session-56 audit.
 # These need their own asymmetry analysis before tuning. Listed here so the
 # audit dashboard knows they exist and can prompt for the missing data.

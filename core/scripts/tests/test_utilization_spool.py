@@ -467,5 +467,213 @@ def test_non_utilization_increment_is_untouched_by_the_branch(guard_store,
     assert not (guard_store / us.spool_name("guardrails")).exists()
 
 
+def test_flusher_has_a_caller_in_the_daemon_sync_loop():
+    """utilization-flush.py shipped 2026-08-18 with ZERO callers — increments
+    spooled locally and never reached the shared sidecar, found only when the
+    2026-08-19 flip-adoption measurement went looking for sidecar PUTs (the
+    write half of the rb-8458 adoption gap). This pin asserts the invocation
+    in the daemon's own-cloud sync loop stays wired: a capability with no
+    caller is indistinguishable from one that was never built."""
+    main_py = Path(__file__).resolve().parents[3] / "mind_api" / "src" / "__main__.py"
+    src = main_py.read_text(encoding="utf-8")
+    sync_thread_body = src.split("def _start_owncloud_sync_thread", 1)[-1]
+    assert "utilization-flush.py" in sync_thread_body, (
+        "mind_api/src/__main__.py sync thread no longer invokes "
+        "utilization-flush.py — the counter spools have no drain again (g-358-05)")
+    assert "subprocess.run" in sync_thread_body, (
+        "the utilization-flush reference exists in the sync thread but no "
+        "subprocess.run invocation found — a comment is not a caller")
+
+
+# --- the retrieve bump branch () -----------------------------------
+#
+# retrieve.py's `_locked_bump_jsonl` was the residual churn driver AFTER the
+#  endpoint flip: one full-store RMW (history snapshot + fenced PUT +
+# changelog row) per store per retrieval call, just to +1 retrieval_count on
+# the matched records. These tests pin the spool-routing of that bump — same
+# flag, same spool, same fall-back-on-False contract as the endpoint branch
+# above.
+
+
+def _load_retrieve():
+    """Load retrieve.py once, with the same env guard as
+    test_retrieve_write_locking.py. `_locked_bump_jsonl` takes its path
+    explicitly, so the module-level RB_PATH/GUARD_PATH bindings are unused."""
+    if "retrieve_spool_test" in sys.modules:
+        return sys.modules["retrieve_spool_test"]
+    import tempfile
+    orig_world = os.environ.get("MIND_WORLD")
+    orig_agent = os.environ.get("MIND_AGENT")
+    os.environ["MIND_WORLD"] = tempfile.mkdtemp(prefix="retrieve-spool-test-")
+    os.environ.pop("MIND_AGENT", None)
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "retrieve_spool_test", _SCRIPTS / "retrieve.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["retrieve_spool_test"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    finally:
+        if orig_world is not None:
+            os.environ["MIND_WORLD"] = orig_world
+        else:
+            os.environ.pop("MIND_WORLD", None)
+        if orig_agent is not None:
+            os.environ["MIND_AGENT"] = orig_agent
+
+
+@pytest.fixture
+def bump_store(world, monkeypatch):
+    monkeypatch.setattr(us, "_backend_names", lambda base: None)
+    monkeypatch.setenv("MIND_WORLD", str(world))
+    _content(world, "guardrails", [
+        {"id": "guard-1", "rule": "x", "status": "active",
+         "utilization": {"times_helpful": 41, "retrieval_count": 100}},
+        {"id": "guard-2", "rule": "y", "status": "active",
+         "utilization": {"retrieval_count": 5}},
+    ])
+    return world
+
+
+def _bump(world, monkeypatch=None, ids=("guard-1", "guard-2")):
+    rmod = _load_retrieve()
+    wanted = set(ids)
+    return rmod._locked_bump_jsonl(
+        world / "guardrails.jsonl",
+        lambda rec: rec.get("id") in wanted and rec.get("status") == "active",
+        kind="guardrails")
+
+
+def test_retrieve_bump_flag_off_takes_the_legacy_rmw(bump_store, monkeypatch):
+    monkeypatch.delenv(us.SPOOLED_ENV, raising=False)
+    _bump(bump_store)
+    recs = {json.loads(l)["id"]: json.loads(l) for l in
+            (bump_store / "guardrails.jsonl").read_text().splitlines()}
+    assert recs["guard-1"]["utilization"]["retrieval_count"] == 101
+    assert "last_retrieved" in recs["guard-1"]["utilization"]
+    assert not (bump_store / us.spool_name("guardrails")).exists()
+
+
+def test_retrieve_bump_flag_on_spools_and_does_not_rewrite_the_store(
+        bump_store, monkeypatch):
+    """THE ASSERTION THAT IS THE GOAL: with the flag on, one retrieval call
+    writes zero bytes to the multi-megabyte content store."""
+    monkeypatch.setenv(us.SPOOLED_ENV, "1")
+    content = bump_store / "guardrails.jsonl"
+    before = content.read_bytes()
+    returned = _bump(bump_store)
+    assert content.read_bytes() == before          # NOT rewritten
+    lines = [json.loads(l) for l in
+             (bump_store / us.spool_name("guardrails")).read_text().splitlines()]
+    assert {(l["id"], l["counter"], l["delta"]) for l in lines} == {
+        ("guard-1", "retrieval_count", 1), ("guard-2", "retrieval_count", 1)}
+    assert all(len(l.get("ts", "")) >= 10 for l in lines)
+    assert {r["id"] for r in returned} == {"guard-1", "guard-2"}
+
+
+def test_retrieve_bump_kind_none_keeps_the_legacy_path(bump_store, monkeypatch):
+    """Control: pattern-signatures / experience call without `kind` — the flag
+    alone must not divert them (they have no spool kind to drain into)."""
+    monkeypatch.setenv(us.SPOOLED_ENV, "1")
+    rmod = _load_retrieve()
+    rmod._locked_bump_jsonl(
+        bump_store / "guardrails.jsonl",
+        lambda rec: rec.get("id") == "guard-1")
+    recs = {json.loads(l)["id"]: json.loads(l) for l in
+            (bump_store / "guardrails.jsonl").read_text().splitlines()}
+    assert recs["guard-1"]["utilization"]["retrieval_count"] == 101
+    assert not (bump_store / us.spool_name("guardrails")).exists()
+
+
+def test_retrieve_bump_only_matched_records_spool(bump_store, monkeypatch):
+    monkeypatch.setenv(us.SPOOLED_ENV, "1")
+    _bump(bump_store, ids=("guard-2",))
+    lines = [json.loads(l) for l in
+             (bump_store / us.spool_name("guardrails")).read_text().splitlines()]
+    assert [l["id"] for l in lines] == ["guard-2"]
+
+
+def test_retrieve_bump_failed_spool_falls_back_for_only_the_failed_id(
+        bump_store, monkeypatch):
+    """A False from record_increment must neither lose that counter NOR
+    double-count the ids that DID spool: the legacy RMW runs narrowed."""
+    monkeypatch.setenv(us.SPOOLED_ENV, "1")
+    real = us.record_increment
+    monkeypatch.setattr(
+        us, "record_increment",
+        lambda kind, rid, counter, **kw: False if rid == "guard-2"
+        else real(kind, rid, counter, **kw))
+    _bump(bump_store)
+    recs = {json.loads(l)["id"]: json.loads(l) for l in
+            (bump_store / "guardrails.jsonl").read_text().splitlines()}
+    assert recs["guard-2"]["utilization"]["retrieval_count"] == 6   # legacy
+    assert recs["guard-1"]["utilization"]["retrieval_count"] == 100  # spooled, untouched
+    lines = [json.loads(l) for l in
+             (bump_store / us.spool_name("guardrails")).read_text().splitlines()]
+    assert [l["id"] for l in lines] == ["guard-1"]
+
+
+def test_retrieve_bump_round_trip_stamps_last_retrieved(bump_store, monkeypatch):
+    """End to end: bump -> spool -> flush -> sidecar. retrieval_count sums on
+    top of the seeded embedded value AND last_retrieved advances — without the
+    flusher stamp, the sidecar (which wins WHOLESALE in utilization_of) would
+    freeze last_retrieved at seed time and actively-retrieved records would
+    read as retrieval-idle to retirement sweeps."""
+    monkeypatch.setenv(us.SPOOLED_ENV, "1")
+    _bump(bump_store, ids=("guard-1",))
+    _bump(bump_store, ids=("guard-1",))
+    uf.flush_kind("guardrails", str(bump_store),
+                  ["times_helpful", "retrieval_count"], None, _Args())
+    counters = us.load_counters("guardrails", bump_store)["guard-1"]
+    assert counters["retrieval_count"] == 102   # 100 embedded + 2
+    assert counters["times_helpful"] == 41      # preserved through the split
+    import datetime as _dt
+    assert counters["last_retrieved"] == _dt.date.today().isoformat()
+
+
+# --- last_retrieved stamping (flusher half of ) ---------------------
+
+
+def test_latest_retrieval_ts_maxes_and_filters():
+    got = uf.latest_retrieval_ts([
+        {"id": "a", "counter": "retrieval_count", "delta": 1,
+         "ts": "2026-08-19T09:00:00"},
+        {"id": "a", "counter": "retrieval_count", "delta": 1,
+         "ts": "2026-08-20T07:00:00"},
+        {"id": "a", "counter": "times_helpful", "delta": 1,
+         "ts": "2026-08-21T00:00:00"},          # wrong counter — ignored
+        {"id": "b", "counter": "retrieval_count", "delta": 1},   # no ts
+        {"id": "b", "counter": "retrieval_count", "delta": 1, "ts": 12345},
+    ])
+    assert got == {"a": "2026-08-20T07:00:00"}
+
+
+def test_apply_deltas_stamps_last_retrieved_forward_only():
+    merged = uf.apply_deltas(
+        {"a": {"retrieval_count": 3, "last_retrieved": "2026-01-01"},
+         "b": {"retrieval_count": 1, "last_retrieved": "2026-12-31"}},
+        {"a": {"retrieval_count": 1}, "b": {"retrieval_count": 1}},
+        {}, ["retrieval_count"],
+        last_ts={"a": "2026-08-20T07:00:00", "b": "2026-08-20T07:00:00"})
+    assert merged["a"]["last_retrieved"] == "2026-08-20"   # advanced
+    assert merged["b"]["last_retrieved"] == "2026-12-31"   # never regressed
+
+
+def test_without_the_stamp_last_retrieved_would_freeze(bump_store, monkeypatch):
+    """Forced-failure control (guard-3534): prove the round-trip assertion can
+    go red. Flushing WITHOUT the last_ts wiring leaves last_retrieved absent
+    from the sidecar entry — the exact freeze the stamp exists to prevent."""
+    monkeypatch.setenv(us.SPOOLED_ENV, "1")
+    _bump(bump_store, ids=("guard-1",))
+    flushing = bump_store / (us.spool_name("guardrails") + ".flushing")
+    (bump_store / us.spool_name("guardrails")).rename(flushing)
+    deltas, _ = uf._parse_lossy(flushing)
+    merged = uf.apply_deltas(
+        {}, uf.aggregate(deltas),
+        {"guard-1": {"times_helpful": 41, "retrieval_count": 100}},
+        ["times_helpful", "retrieval_count"])   # no last_ts — pre-fix shape
+    assert "last_retrieved" not in merged["guard-1"]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

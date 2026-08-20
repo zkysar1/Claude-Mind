@@ -164,6 +164,168 @@ def get_undelivered_framework_files(repo_path: Path) -> List[str]:
     return sorted(set(undelivered))
 
 
+def _delivery_repo_roots(world_dir: Optional[Path]) -> List[Path]:
+    """Repos (beyond the framework repo) whose work must REACH THE DEFAULT
+    BRANCH before a goal may close — the cross-repo half of the 2026-05-07
+    orphan-code rationale that scope-v1 deliberately deferred.
+
+    The list is DOMAIN STATE, so it lives in the world, not here:
+    `<world_dir>/delivery-repos.yaml`, shape `roots: ["/abs/path-or-glob", ...]`
+    (globs expand; non-repos and non-dirs are silently dropped). No file, or no
+    world_dir, means no cross-repo scanning — the gate stays exactly as
+    portable as before for domains that never declare delivery repos.
+
+    Parsed with a deliberately narrow hand parser (a `roots:` list of quoted
+    scalars) rather than importing yaml: this module is imported by daemon
+    endpoints, and a parse failure of an OPTIONAL enrichment file must degrade
+    to "feature off", never to an ImportError in the write path.
+    """
+    if world_dir is None:
+        return []
+    manifest = world_dir / "delivery-repos.yaml"
+    try:
+        if not manifest.is_file():
+            return []
+        raw = manifest.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    entries: List[str] = []
+    in_roots = False
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("roots:"):
+            in_roots = True
+            continue
+        if in_roots:
+            if stripped.startswith("- "):
+                entries.append(stripped[2:].strip().strip('"').strip("'"))
+            else:
+                in_roots = False
+    roots: List[Path] = []
+    import glob as _glob
+    for e in entries:
+        for hit in sorted(_glob.glob(e)):
+            hp = Path(hit)
+            if hp.is_dir() and (hp / ".git").exists():
+                roots.append(hp)
+    return roots
+
+
+def _repo_default_ref(repo: Path) -> Optional[str]:
+    """origin's default branch ref, e.g. 'refs/remotes/origin/master'."""
+    r = subprocess.run(
+        ["git", "-C", str(repo), "symbolic-ref", "refs/remotes/origin/HEAD"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip()
+    # No origin/HEAD symref (common on plain clones that never ran
+    # `remote set-head`): fall back to whichever conventional default exists.
+    for cand in ("refs/remotes/origin/master", "refs/remotes/origin/main"):
+        rc = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify",
+                             "--quiet", cand], capture_output=True, text=True,
+                            timeout=10)
+        if rc.returncode == 0:
+            return cand
+    return None
+
+
+def get_stranded_repos(roots: List[Path], fresh_hours: int = 48) -> List[dict]:
+    """The 'built but never connected' probe ( /  class).
+
+    For each delivery repo, two ways work can be DONE-looking without having
+    shipped, both measured live twice in one six-hour window before this
+    existed:
+
+      dirty_tracked   — modified tracked files sitting in the working tree.
+        Untracked files are deliberately ignored here (unlike the framework
+        scan): product repos carry build output (.next/, dist/, venvs) whose
+        presence is noise, and a NEW product file that matters is always
+        accompanied by a tracked-file edit wiring it in.
+
+      stranded_commits — commits younger than `fresh_hours` reachable from any
+        local or origin ref but NOT from origin's default branch: committed,
+        possibly even pushed to a side branch with a PR nobody merged — and
+        invisible to every other box's default checkout. Age-bounded so one
+        crusty historical branch does not veto every close forever; older
+        strandings are reported in `stale_stranded_commits` (visibility
+        without a veto).
+
+    STALENESS HANDLING is the inverse of get_undelivered_framework_files: a
+    stale origin/<default> UNDER-delivers (a PR merged remotely five minutes
+    ago is not yet in the local ref), which would FALSE-BLOCK precisely the
+    most diligent merge-then-close flow. So on a would-block hit — and only
+    then — the ref is refreshed with one targeted fetch and the repo
+    re-checked. The network round-trip is confined to the failing path.
+
+    Fail-open per repo: any git error drops that repo from the result with a
+    stderr note. A gate that cannot probe must not veto.
+    """
+    findings: List[dict] = []
+    for repo in roots:
+        try:
+            finding = _check_one_repo(repo, fresh_hours)
+            if finding is not None and (finding["dirty_tracked"]
+                                        or finding["stranded_commits"]):
+                # One retry after a targeted default-branch refresh, so a
+                # remotely-merged PR does not read as stranded (see docstring).
+                subprocess.run(
+                    ["git", "-C", str(repo), "fetch", "origin",
+                     "--quiet", "--no-tags"],
+                    capture_output=True, text=True, timeout=30,
+                )
+                finding = _check_one_repo(repo, fresh_hours)
+            if finding is not None and (finding["dirty_tracked"]
+                                        or finding["stranded_commits"]
+                                        or finding["stale_stranded_commits"]):
+                findings.append(finding)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            print(f"[uncommitted-gate] delivery-repo probe failed for "
+                  f"{repo}: {exc} — fail-open for this repo", file=sys.stderr)
+    return findings
+
+
+def _check_one_repo(repo: Path, fresh_hours: int) -> Optional[dict]:
+    default_ref = _repo_default_ref(repo)
+    if default_ref is None:
+        print(f"[uncommitted-gate] {repo}: no origin default ref — skipping",
+              file=sys.stderr)
+        return None
+
+    st = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain",
+         "--untracked-files=no"],
+        capture_output=True, text=True, timeout=15,
+    )
+    if st.returncode != 0:
+        return None
+    dirty = sorted({p for p in (_parse_porcelain_line(l)
+                                for l in st.stdout.splitlines()) if p})
+
+    def _rev_list(extra: List[str]) -> List[str]:
+        r = subprocess.run(
+            ["git", "-C", str(repo), "rev-list", "--branches",
+             "--remotes=origin", "--not", default_ref, *extra],
+            capture_output=True, text=True, timeout=15,
+        )
+        if r.returncode != 0:
+            return []
+        return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+
+    fresh = _rev_list([f"--since={fresh_hours}.hours.ago"])
+    allc = _rev_list([])
+    stale = [c for c in allc if c not in set(fresh)]
+    return {
+        "repo": str(repo),
+        "default_ref": default_ref,
+        "dirty_tracked": dirty,
+        "stranded_commits": fresh[:20],
+        "stale_stranded_commits": stale[:20],
+    }
+
+
 def _log_override(world_dir: Path, agent_name: str, goal_id: str,
                   justification: str, dirty_files: List[str]) -> None:
     """Append to <world_dir>/uncommitted-work-overrides.jsonl.
@@ -246,9 +408,31 @@ def evaluate(*, goal_id: str, override: Optional[str], repo_path: Path,
               f"{role or 'unknown'}; not blocking): {', '.join(undelivered[:5])}"
               + (" ..." if len(undelivered) > 5 else ""), file=sys.stderr)
 
-    would_block = (bool(dirty) or delivery_blocks) and effective_override is None
+    # CROSS-REPO delivery half ( / : two goals in one
+    # six-hour window closed 'completed' with their product-repo commits
+    # stranded on unmerged branches — built, reported done, never connected).
+    # Scanned only when the domain declares delivery repos; blocks REGARDLESS
+    # of body role: the worker commit-not-push contract () covers the
+    # framework repo's carrier-ref flow, while product repos are push+PR+merge
+    # for every role. Overridable like everything else here — a goal that
+    # legitimately closes with a PR still open passes
+    # --override-uncommitted "PR #N open", which puts the pointer on the audit
+    # ledger instead of leaving the stranding silent.
+    stranded = get_stranded_repos(_delivery_repo_roots(world_dir))
+    stranded_blocks = any(f["dirty_tracked"] or f["stranded_commits"]
+                          for f in stranded)
+    for f in stranded:
+        if f["stale_stranded_commits"] and not (f["dirty_tracked"]
+                                                or f["stranded_commits"]):
+            print(f"[uncommitted-gate] NOTE: {f['repo']} carries "
+                  f"{len(f['stale_stranded_commits'])} stranded commit(s) "
+                  f"older than the freshness window (reporting, not blocking)",
+                  file=sys.stderr)
 
-    if effective_override is not None and (dirty or undelivered):
+    would_block = (bool(dirty) or delivery_blocks or stranded_blocks) \
+        and effective_override is None
+
+    if effective_override is not None and (dirty or undelivered or stranded):
         if world_dir is None:
             print("[uncommitted-gate] WARN: no WORLD_DIR — skipping override log",
                   file=sys.stderr)
@@ -269,4 +453,6 @@ def evaluate(*, goal_id: str, override: Optional[str], repo_path: Path,
         "undelivered_framework_files": undelivered,
         "delivery_would_block": delivery_blocks,
         "body_role": role,
+        "stranded_repos": stranded,
+        "stranded_would_block": stranded_blocks,
     }

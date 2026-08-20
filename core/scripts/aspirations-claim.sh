@@ -105,7 +105,32 @@ while [[ $# -gt 0 ]]; do
             if [ -z "$GOAL_ID" ]; then
                 GOAL_ID="$1"
             elif [ -z "$AGENT" ]; then
+                # Agent names are fleet identifiers, never prose. A value that
+                # fails this pattern is almost always a justification sentence
+                # mis-bound after `--deviation <code>` (/guard-4418:
+                # the sentence reached the claim query as agent=<prose>, curl
+                # exited 3 URL-malformed, and the retry loop misread it as
+                # daemon trouble — six timed-out claims in one morning).
+                # NOTE: --deviation takes ONLY the enum code. Justifications
+                # go in the goal outcome / override ledger, not on the claim.
+                if [[ ! "$1" =~ ^[a-z0-9_-]+$ ]]; then
+                    echo "Error: agent-name positional looks like prose, refusing: '$1'" >&2
+                    echo "  Agent names match ^[a-z0-9_-]+\$. If this text is a justification:" >&2
+                    echo "  --deviation takes ONLY the enum code (no justification argument);" >&2
+                    echo "  --cross-lane and --override-lane-pin are the flags that take a reason string." >&2
+                    echo "  Usage: aspirations-claim.sh <goal-id> [<agent-name>] [--deviation <code>]" >&2
+                    exit 1
+                fi
                 AGENT="$1"
+            else
+                # A third positional was previously dropped SILENTLY — the
+                # unquoted-justification variant (`--deviation <code> multi
+                # word reason`) would bind "multi" as a phantom agent and
+                # swallow the rest. Refuse loudly instead.
+                echo "Error: unexpected extra positional argument: '$1'" >&2
+                echo "  goal-id and agent-name are already set (goal='$GOAL_ID', agent='$AGENT')." >&2
+                echo "  Usage: aspirations-claim.sh <goal-id> [<agent-name>] [--deviation <code>]" >&2
+                exit 1
             fi
             shift;;
     esac
@@ -167,22 +192,65 @@ fi
 #     is an open decision rather than an oversight.
 _post_claim_effects() {
     local goal_id="$1" agent="$2" response="$3"
-    local extracted claimed_by title
-    # Extract claimed_by + title[:60] from the claim response, tab-separated.
-    # Fail-open on any parse error (empty -> skip).
+    local extracted claimed_by title multiunit _rest
+    # Extract claimed_by + title[:60] + a multi-unit marker from the claim
+    # response, tab-separated. Fail-open on any parse error (empty -> skip).
     extracted="$(printf '%s' "$response" | $(rt_python_launcher) -c "
-import json, sys
+import json, re, sys
 try:
     resp, _ = json.JSONDecoder().raw_decode(sys.stdin.read())
     g = resp.get('goal') or {}
     cb = (g.get('claimed_by') or '').strip()
     t = (g.get('title') or '').replace(chr(9), ' ').replace(chr(10), ' ')[:60]
-    print(cb + chr(9) + t)
+    # : does this goal's own text instruct one-unit-per-pass? Same
+    # trigger worker-loop Phase 2.95 states in prose, evaluated here so BOTH
+    # orchestrators get it (see the advisory note below).
+    _blob = (g.get('title') or '') + ' ' + (g.get('description') or '')
+    _mu = re.search(
+        r'one at a time|one per pass|one unit per|one PR (?:each|per)'
+        r'|multi-unit|one[- ]by[- ]one',
+        _blob, re.I,
+    )
+    print(cb + chr(9) + t + chr(9) + (_mu.group(0) if _mu else ''))
 except Exception:
-    print(chr(9))
+    print(chr(9) + chr(9))
 " 2>/dev/null)" || true
     claimed_by="${extracted%%$'\t'*}"
-    title="${extracted#*$'\t'}"
+    _rest="${extracted#*$'\t'}"
+    title="${_rest%%$'\t'*}"
+    multiunit="${_rest#*$'\t'}"
+    # --- multi-unit claim advisory () -----------------------------
+    # WHY HERE AND NOT IN A SKILL. The unit-level claim (unit-claim.sh) shipped
+    # wired into the WORKER path only, as worker-loop Phase 2.95 — so a reducer,
+    # which also executes goals through aspirations-execute Phase 4, had no
+    # unit-claim step and the two could build the same unit concurrently. The
+    # obvious fix is a second prose block in aspirations-execute/SKILL.md; this
+    # is the same fix with two advantages and one cost avoided:
+    #   * COVERAGE. Both orchestrators call THIS wrapper (aspirations/SKILL.md
+    #     and worker-loop/SKILL.md), so one insertion covers both entry points.
+    #     A per-skill insertion covers only the skill it is written into, and a
+    #     guard enforced at one entry point says nothing about the other
+    #     (guard-4376) -- which is exactly how the gap arose.
+    #   * BUDGET. aspirations-execute/SKILL.md is in the `loop-skills` hot-path
+    #     set under a RATCHET (may not exceed its size at HEAD), so a prose
+    #     insertion costs a `size-budget-override:` trailer plus a ledger row,
+    #     and is then paid on every loop iteration of every agent forever.
+    #     core/scripts/*.sh is in no budgeted set: this costs zero hot-path
+    #     bytes. Sizes at decision time: aspirations-execute/SKILL.md 77,977 B
+    #     within a 1,106,805 B loop-skills set.
+    # ADVISORY, NOT A GATE, deliberately. A wrapper-side GATE is bypassable by a
+    # direct endpoint POST and belongs in the daemon (guard-742/guard-554); this
+    # is a reminder printed to the caller that just claimed, and the caller
+    # reading this stderr IS the actor that would acquire the unit claim.
+    # It always fires on a match rather than first checking for a held unit
+    # claim: the goal claim precedes the unit claim by construction, so at this
+    # moment none is held, and skipping the extra subprocess keeps the claim
+    # path cheap.
+    if [ -n "$multiunit" ]; then
+        printf '%s\n' "[aspirations-claim] ADVISORY (g-306-323): ${goal_id} names a per-unit protocol (matched \"${multiunit}\"). Before writing any code, NAME your unit and claim it:" >&2
+        printf '%s\n' "    bash core/scripts/unit-claim.sh acquire ${goal_id} <unit-token>" >&2
+        printf '%s\n' "  rc=1 means another Body holds that unit — pick a different one, never --force past a live holder. Release it when the unit ends. The goal claim is FREE between units, so nothing else records which unit is in flight." >&2
+    fi
     # --- iteration-checkpoint anchor () --------------------------
     # Third instance of the same fold as the two blocks below: creation was
     # LLM-discretionary (ONE executable `loop-state-save.sh init` call site in

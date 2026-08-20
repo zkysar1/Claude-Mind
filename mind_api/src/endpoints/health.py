@@ -65,6 +65,19 @@ def clock_posture() -> dict:
 def health(ctx) -> "Response":  # type: ignore[name-defined]
     from ..server import Response  # local import — avoids cycle at module load
     uptime_s = round(time.monotonic() - _START_TIME, 3)
+    # Whether THIS process routes counter increments to the spool ().
+    # The flip travels via settings.json env, which the stale-code recycle
+    # boundary (mind-api-code-changed.sh: mind_api/src/** + core/scripts/_*.py)
+    # deliberately cannot see — so a daemon can sit indefinitely with the flag
+    # on disk but not in its env (measured 2026-08-19: 5 active agents, 5.65h,
+    # zero adopters). This field is the remote per-box verification for any
+    # env-flag cutover: same guard-559/rb-2022 class as git_head_sha above —
+    # in-process state diverged from disk truth, remedy is a restart.
+    try:
+        import _utilization_store as _us
+        utilization_spooled = _us.spooled_enabled()
+    except Exception:  # never 500 the health probe over a diagnostic field
+        utilization_spooled = None
     return Response.json(
         {
             "ok": True,
@@ -73,6 +86,7 @@ def health(ctx) -> "Response":  # type: ignore[name-defined]
             "pid": ctx.pid,
             "port": ctx.port,
             "git_head_sha": _STARTUP_SHA,
+            "utilization_spooled": utilization_spooled,
             **clock_posture(),
         }
     )

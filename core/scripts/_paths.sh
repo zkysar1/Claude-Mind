@@ -183,6 +183,40 @@ agent_state_dir() {
     printf '%s/%s' "$(agent_dir "$1")" "$SESSION_DIRNAME"
 }
 
+retrieval_session_path() {
+    # Effective retrieval/utilization manifest path, Body-aware ().
+    # Shell mirror of _paths.py::retrieval_session_path and of
+    # mind_api/src/agent_paths.py::AgentPaths.retrieval_session_path — see the
+    # Python docstring for why the two halves must agree.
+    #
+    # The activation signal is the forked per-session working-memory.yaml, the
+    # same predicate body_state_path() uses: only a NON-REDUCER Body has one,
+    # so a reducer/observer/single-Body session takes the agent-wide fallback
+    # and behaves byte-identically to the pre-Body layout.
+    #
+    # NOTE THE BASENAME DIFFERS BY SIDE — body-retrieval-session.json vs
+    # retrieval-session.json. That asymmetry is why callers must use this
+    # helper rather than composing "$(agent_state_dir "$1")/retrieval-session.json"
+    # by hand: the hand-built form resolved to a file the writer never writes,
+    # which left the whole utilization lane inert on every worker Body.
+    #
+    # TAKES THE AGENT DIRECTORY, NOT THE AGENT NAME. $AGENT_DIR honours the
+    # MIND_AGENT_DIR override seam (see L347 below) while agent_dir() rebuilds
+    # from PROJECT_ROOT and does not — so a name-based version would silently
+    # discard a caller-resolved agent dir, which is the same single-source-of-
+    # truth violation this helper exists to remove. Pass whatever dir the
+    # caller already resolved.
+    #
+    # Args: $1=agent_dir (a PATH), $2=sid (optional; defaults to $MIND_SID)
+    local _adir="$1"
+    local _sid="${2:-${MIND_SID:-}}"
+    if [ -n "$_sid" ] && [ -f "$_adir/$SESSIONS_DIRNAME/$_sid/working-memory.yaml" ]; then
+        printf '%s/%s/%s/body-retrieval-session.json' "$_adir" "$SESSIONS_DIRNAME" "$_sid"
+        return 0
+    fi
+    printf '%s/%s/retrieval-session.json' "$_adir" "$SESSION_DIRNAME"
+}
+
 # --- External path configuration ---
 # world/ and meta/ live at user-supplied external paths (shared drive, NAS, etc.).
 # Each agent stores its own config in <agent>/local-paths.conf.

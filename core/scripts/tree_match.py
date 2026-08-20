@@ -243,6 +243,65 @@ def _norm_separators(s):
     return "-".join(re.findall(r'[a-z0-9]+', s))
 
 
+# Below this many nodes a bulk listing costs more than the HEADs it saves.
+# Derived from the measurement in `_prefetch_tree_root` below: the listing is
+# 3 requests / 0.9s and a HEAD is ~0.094s (135.1s / 1436), so break-even is
+# ~10 nodes. 50 is a deliberate margin — every real caller passes the whole
+# tree (1437 nodes), and the small-`nodes` case is `find_nodes_by_text`'s
+# `leaf_only` filter, which must not pay a full-tree listing to save a handful
+# of HEADs.
+_PREFETCH_MIN_NODES = 50
+
+
+def _prefetch_tree_root(node_count):
+    """One bulk listing that warms the freshness cache for every node body the
+    loop below is about to read. Optimization ONLY — never changes what a read
+    returns, and never raises.
+
+    WHY: `parse_front_matter` calls `get_backend().ensure_local(p)` per node
+    (the own-cloud read-path fix, 2026-07-02). A tree walk touches each file
+    ONCE, so every file misses `_refresh`'s per-file TTL cache and pays a HEAD.
+    `prefetch` gets the same ETag token from a paginated listing at ~1 request
+    per 1000 keys, and warms an entry only where the listing PROVES the local
+    copy current (md5 == ETag) — see OwnCloudBackend.prefetch.
+
+    MEASURED here, on this call site, cold in-process caches, live store
+    (zeta, hostname cc-02, uname -r 6.8.0-137-generic, 1437 nodes / _tree.yaml
+    1,486,779 B):
+        without: 1436 HEAD          , 135.1s, 3036 terms
+        with   : 3 LIST + 1 HEAD    ,   1.8s, 3036 terms
+        -> 359x fewer requests, 75x faster, INDEX BYTE-IDENTICAL
+    Verify a change here by COUNTING head_object calls, never by reading
+    `stats["warmed"]`: warmed=N with N HEADs still paid is a reachable state
+    that reads as total success (g-115-6671).
+
+    PATH SPELLING IS LOAD-BEARING and is why the root is resolved through the
+    same `resolve_file_path` the loop uses. `prefetch` warms
+    `_cache_check[str(root / rel)]` while `_refresh` reads
+    `_cache_check[str(self._local(path))]`, and `_local` is identity — neither
+    side normalizes. Both spellings here come from `resolve_file_path`, so they
+    agree (measured True above). If the loop's path derivation ever changes,
+    re-measure the HEAD count rather than trusting `warmed`.
+
+    LocalBackend.prefetch is a documented no-op that walks nothing, so this
+    costs a dict return on the default backend.
+    """
+    if node_count < _PREFETCH_MIN_NODES:
+        return
+    # Lazy, fail-open — same posture as parse_front_matter's ensure_local
+    # below: an optimization must never break retrieval.
+    try:
+        from storage_backend import get_backend
+        get_backend().prefetch(resolve_file_path("world/knowledge/tree"))
+    except Exception as e:
+        try:  # report, never raise (g-306-218)
+            from storage_backend import note_swallowed_backend_error
+            note_swallowed_backend_error(
+                "prefetch", "world/knowledge/tree", e)
+        except Exception:
+            pass
+
+
 def build_concept_index(nodes):
     """Build entity-term -> [node_keys] index from .md front matter entities.
 
@@ -250,6 +309,7 @@ def build_concept_index(nodes):
     Returns dict mapping lowercase entity terms to lists of node keys.
     """
     index = {}
+    _prefetch_tree_root(len(nodes))
     for key, node in nodes.items():
         file_path = node.get("file")
         if not file_path:

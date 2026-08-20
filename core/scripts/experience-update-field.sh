@@ -19,14 +19,28 @@ _RUNTIME_SELF="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
-# --- Parse positional args ------------------------------------------------
-if [ $# -lt 3 ]; then
-    echo "Usage: experience-update-field.sh <rec_id> <field> <value>" >&2
+# --- Parse args -----------------------------------------------------------
+# STRICT (). This was the LAST unguarded member of the six
+# <id> <field> <value> siblings: it read $1/$2/$3 blindly, so
+# `<id> <field> --value-file <path>` stored the literal string "--value-file"
+# as the field value with rc=0 — the write-side swallow that clobbered
+# guard-1615 on the sibling wrappers (). Same two rules as the four
+# guarded siblings, enforced BEFORE _runtime.sh so the refusal is cheap and
+# cannot be masked by a daemon failure: unknown leading-dash argument is an
+# ERROR (exit 2), a 4th positional is an ERROR (exit 2). Also gains
+# --value-file/--value-stdin support, the sanctioned long-value form.
+# shellcheck disable=SC1091
+source "$CORE_ROOT/scripts/_argv_strict.sh"
+
+argv_strict_parse "experience-update-field.sh" 3 "$@"
+REC_ID="${ARGV_POS[0]:-}"
+FIELD="${ARGV_POS[1]:-}"
+VALUE="$(argv_strict_resolve_value "experience-update-field.sh" "${ARGV_POS[2]:-}")"
+
+if [ -z "$REC_ID" ] || [ -z "$FIELD" ] || [ -z "$VALUE" ]; then
+    argv_strict_usage "experience-update-field.sh" 3
     exit 1
 fi
-REC_ID="$1"
-FIELD="$2"
-VALUE="$3"
 
 # --- Daemon path ----------------------------------------------------------
 # shellcheck disable=SC1091

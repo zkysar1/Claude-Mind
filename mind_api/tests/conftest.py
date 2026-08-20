@@ -133,10 +133,15 @@ for _leaky in ("MIND_WORLD", "MIND_META"):
 # Adding it would reduce safety in the exact tree where a production leak was
 # observed, which is the wrong direction and outside this goal.
 _UNSET = object()
+# MIND_SID rides along (): wrapper harnesses forward it to
+# subprocess wrappers, and the claim endpoint's missing_claim_sid gate makes
+# its presence behavior-changing — a test that pops it from os.environ (or a
+# launch context where the inject hook never ran) otherwise leaks that state
+# into every later test in the process.
 _BOOTSTRAP_ENV = {
     key: os.environ.get(key, _UNSET)
     for key in ("STORAGE_BACKEND", "MIND_WORLD", "MIND_META",
-                "MIND_AGENT", "RT_STALENESS_WARNED")
+                "MIND_AGENT", "MIND_SID", "RT_STALENESS_WARNED")
 }
 
 
@@ -154,6 +159,19 @@ def _restore_env_per_test():
             os.environ.pop(key, None)
         else:
             os.environ[key] = value
+    # : restore the DERIVED backend too, not just the input env vars
+    # — the mirror of core/scripts/tests/conftest.py's  reset, which
+    # this directory lacked. get_backend() memoizes _ACTIVE_BACKEND
+    # process-wide and freezes the governed-root map into the instance, and
+    # mind_api/src imports storage_backend by that exact module name
+    # (store_registry, server, admin), so in a mixed full-suite chunk a prior
+    # test's backend — built against a tmp world that no longer exists —
+    # survives the env restore above and poisons this directory's in-process
+    # daemons. Guarded on sys.modules (never force the import); no try/except
+    # (a raising reset is real signal, per the core conftest's rationale).
+    _sb = sys.modules.get("storage_backend")
+    if _sb is not None and hasattr(_sb, "reset_backend_for_tests"):
+        _sb.reset_backend_for_tests()
     yield
 
 

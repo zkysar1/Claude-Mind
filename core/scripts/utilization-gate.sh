@@ -54,7 +54,7 @@ if [ -z "${MIND_AGENT:-}" ]; then
     exit 0
 fi
 
-SESSION_FILE="$(agent_dir "$MIND_AGENT")/session/retrieval-session.json"
+SESSION_FILE="$(retrieval_session_path "$(agent_dir "$MIND_AGENT")")"  # body-aware, 
 
 # No session file = no retrieval happened for this goal — pass silently
 if [ ! -f "$SESSION_FILE" ]; then

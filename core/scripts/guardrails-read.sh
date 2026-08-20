@@ -11,22 +11,38 @@ _RUNTIME_SELF="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
+# : shared strict-argv refusal helpers (uniform message contract).
+# Sourced BEFORE _runtime.sh so a refusal cannot be masked by a daemon failure.
+# shellcheck disable=SC1091
+source "$CORE_ROOT/scripts/_argv_strict.sh"
+
 declare -a FLAG_KEYS=()
-declare -a PASSTHROUGH=()
 REC_ID=""
 CATEGORY=""
+SEVERITY=""
 
 # Value-arg pattern: "${2-}" + safe shift; see retrieve.sh for rationale.
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        -h|--help)
+            echo "Usage: guardrails-read.sh (--id <id> | --category <cat> | --active | --summary | --severity <TIER>)"
+            exit 0;;
         --id)
-            REC_ID="${2-}"; PASSTHROUGH+=(--id "${2-}"); shift $(( $# >= 2 ? 2 : 1 ));;
+            REC_ID="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
         --category)
-            CATEGORY="${2-}"; PASSTHROUGH+=(--category "${2-}"); shift $(( $# >= 2 ? 2 : 1 ));;
-        --active)   FLAG_KEYS+=(active);  PASSTHROUGH+=("$1"); shift;;
-        --summary)  FLAG_KEYS+=(summary); PASSTHROUGH+=("$1"); shift;;
+            CATEGORY="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
+        --active)   FLAG_KEYS+=(active); shift;;
+        --severity)
+            SEVERITY="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
+        --summary)  FLAG_KEYS+=(summary); shift;;
         *)
-            PASSTHROUGH+=("$1"); shift;;
+            # : this arm silently appended to a dead PASSTHROUGH
+            # accumulator (fed the pre-2026-05-14 CLI fallback, read by nothing
+            # since), so a mistyped filter vanished and the call answered the
+            # WRONG population with rc=0 (the rb-245 authoritative-false-count
+            # shape). Refuse loudly. Exit 2 per the _argv_strict.sh convention
+            # (the daemon path exits 1, so tests need a distinct rc).
+            argv_strict_refuse_unknown "guardrails-read.sh" "$1" "--id <id> | --category <cat> | --active | --summary | --severity <TIER>";;
     esac
 done
 
@@ -35,13 +51,14 @@ source "$CORE_ROOT/scripts/_runtime.sh"
 QUERY=""
 [ -n "$REC_ID" ]   && QUERY="id=$(rt_url_encode "$REC_ID")"
 [ -n "$CATEGORY" ] && { [ -n "$QUERY" ] && QUERY+="&"; QUERY+="category=$(rt_url_encode "$CATEGORY")"; }
+[ -n "$SEVERITY" ] && { [ -n "$QUERY" ] && QUERY+="&"; QUERY+="severity=$(rt_url_encode "$SEVERITY")"; }
 for key in "${FLAG_KEYS[@]+"${FLAG_KEYS[@]}"}"; do
     [ -n "$QUERY" ] && QUERY+="&"
     QUERY+="${key}=1"
 done
 
 if [ -z "$QUERY" ]; then
-    echo "Error: at least one filter is required (--id, --category, --active, --summary)." >&2
+    echo "Error: at least one filter is required (--id, --category, --active, --summary, --severity)." >&2
     exit 1
 fi
 rc=0

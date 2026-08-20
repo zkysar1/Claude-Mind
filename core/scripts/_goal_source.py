@@ -45,7 +45,12 @@ def infer(origin_signal):
                        # second reconciliation () — same lane, found
                        # by diffing prescribed SKILL.md literals against
                        # ALLOWED_PREFIXES; both are automated sweeps
-                       "skill-discovery-audit:", "blocker_pattern:")):
+                       "skill-discovery-audit:", "blocker_pattern:",
+                       # third reconciliation () — unit-economics-readout.py
+                       # threshold-move auto-file; without it the Layer-D rewrite
+                       # made this automated filer infer as "agent-self", i.e.
+                       # misattributed rather than null
+                       "unit-economics-move:")):
         return "cycle-detector"
     if sig == "idle_fallback" or sig.startswith((
             "decomposition:", "parent_aspiration:", "unblock:",

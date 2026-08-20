@@ -110,9 +110,22 @@ ENTRY_CHECKS = [
 
 # Always-run entry calls the battery deliberately does NOT invoke (each is
 # time-dependent or state-mutating and must run exactly once, by its phase).
+#
+# stranded-claim-sweep is named as the .sh WRAPPER, not the bare .py, and that
+# is load-bearing (guard-3864 / rb-7918 / ). Only the wrapper sources
+# _paths.sh, which reads the per-agent local-paths.conf for MIND_WORLD --
+# STORAGE_BACKEND is set globally in settings.json, so a bare `py -3` has the
+# backend but no mappable world root, silently falls back to the LOCAL MIRROR,
+# and decides whether a live peer's claim gets released from stale data. This
+# footer is the line the protocol relies on surviving summarization after an
+# autocompact, so naming the forbidden form here propagates it fleet-wide, every
+# iteration. Measured 2026-08-19 (zeta, cc-02, both forms in one turn):
+# shard_provenance "local-mirror" (bare .py) vs "authoritative" (wrapper).
+# The other three .py entries below are CORRECT as-is -- their SKILL.md phases
+# invoke them as `py -3 core/scripts/<name>.py`; only this one has a wrapper.
 PROTOCOL_FOOTER = (
     "[entry-battery] always-run entry calls (protocol order, invoke each ONCE): "
-    "stranded-claim-sweep.py --apply (-0.5c.1) -> quiescence-cycle-cache.py check "
+    "stranded-claim-sweep.sh --apply (-0.5c.1) -> quiescence-cycle-cache.py check "
     "(-0.5e.0) -> dry-idle-cycle-cache.py check (-0.5e.0b) -> idle-tick.sh (-0.5e) "
     "-> quiescence-gate.py verify-wake (-0.5e') -> identity restore (-0.5d)"
 )

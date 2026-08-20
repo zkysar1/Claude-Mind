@@ -289,7 +289,19 @@ def _email_user(entry, event):
     signal_source = entry.get("signal_source") or "(none)"
 
     if event == "material-self":
-        subject = f"Self edited: {file_path}"
+        # Subject must say WHAT CHANGED, not which file changed. file_path is a
+        # constant for this event — it is always the agent's own self.md — so the
+        # old f"Self edited: {file_path}" produced a byte-identical subject on
+        # every send, telling the reader nothing. section_changed is the
+        # discriminator that was already on the entry and simply never reached
+        # the envelope. (Back-ported from downstream prod 2026-08-19: omni
+        # measured 5 of 43 sends in 7 days all carrying the identical subject —
+        # ZDS ; subject-clarity principle per that world's guard-164.)
+        _section = (entry.get("section_changed") or "").strip()
+        subject = (
+            f"Changed my own instructions: {_section}" if _section
+            else "Changed my own instructions"
+        )
         body = (
             f"{agent or '?'} autonomously edited {file_path}.\n\n"
             f"Change class: {change_class}\n"

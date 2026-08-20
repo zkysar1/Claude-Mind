@@ -84,6 +84,30 @@ _LOG = logging.getLogger(__name__)
 
 PathLike = Union[str, os.PathLike]
 
+# g-358-17: APPEND-MOSTLY PLAINTEXT stores eligible for the range-tail delta
+# pull. Matched against the env-scoped logical path (`_rel`), prefix-wise.
+#
+# Scoped to an allowlist rather than tried everywhere because the probe is only
+# a WIN where appends dominate: on an in-place-edited store (aspirations,
+# reasoning-bank, guardrails, gate-firings — g-358-03 measured all four SHRINK)
+# the md5 test fails and we pay one extra small range request before the full
+# GET we would have done anyway. Correctness never depends on this list (the
+# md5 equality below is an exact proof either way); cost does.
+#
+# These two are the stores no other g-358 lever can reach. gzip (g-358-11)
+# cannot touch world/board/* — it must stay PLAINTEXT until Claude-Mind and
+# ZDS-Mind carry the gzip reader, because peers write INTO our board with their
+# own checkout's backend (BOARD_PATTERN_DEFERRED). Sharding (g-358-12) is the
+# lever for aspirations, not for an append log. Encoded (gz) objects are
+# excluded by construction: the tail of a gzip stream is not a suffix of the
+# plaintext, so `_codec_head_plain_md5(head) is None` is a REQUIRED guard, not
+# a nicety.
+_RANGE_TAIL_STORES = (
+    "world/board/",
+    "world/changelog.jsonl",
+    "meta/changelog.jsonl",
+)
+
 # S3/DDB error codes that mean "object/item absent" across boto3 surfaces.
 _NOT_FOUND = {"404", "NoSuchKey", "NotFound", "ResourceNotFoundException"}
 _PRECONDITION = {"PreconditionFailed", "412"}
@@ -690,6 +714,100 @@ class OwnCloudBackend:
                 "own-cloud test against a mocked S3.")
 
     # --- reads -------------------------------------------------------------
+    def _range_tail_pull(self, path: PathLike, key: str, head: dict,
+                         local: Path, etag: str) -> Optional[bytes]:
+        """g-358-17: try to refresh an APPEND-MOSTLY plaintext object by GETting
+        only the bytes past the local mirror's end. Returns the complete new
+        body on success, or None to fall back to the full GET.
+
+        WHY THIS IS SAFE, and it is the whole design: the returned bytes are
+        accepted ONLY when md5(local_prefix + tail) equals the object's ETag.
+        For a single-part plaintext object the ETag IS the content md5, so that
+        equality is an EXACT PROOF that the concatenation is byte-identical to
+        what a full GET would have returned. Every guard below is therefore a
+        COST filter (don't spend a range request that is unlikely to pay), not
+        a correctness gate — a wrong guess costs one small range GET and then
+        falls back. Do not "strengthen" a guard on correctness grounds; the
+        proof does not live in them.
+
+        In particular this does NOT lean on the caller's "download" verdict to
+        mean local == baseline. It does not: `_overwrite_decision` also returns
+        "download" for a no-baseline first pull and for a multipart ETag (see
+        its docstring). The baseline equality is re-established here explicitly.
+
+        RMW SAFETY (guard-2227): the local prefix is read ONCE into memory and
+        the SAME bytes are both hashed and written back. Nothing appends to the
+        file in place, so a concurrent writer cannot slip between the hash and
+        the write — the caller writes the exact buffer that was proven.
+        """
+        # (1) PLAIN only. An encoded object's ETag digests the COMPRESSED bytes
+        # and its tail is not a suffix of the plaintext mirror, so neither the
+        # concatenation nor the md5 test is meaningful.
+        if _codec_head_plain_md5(head) is not None or head.get("ContentEncoding"):
+            return None
+        # (2) Single-part only: a multipart ETag ('<hex>-N') is not a content
+        # md5, so the proof above is unavailable.
+        try:
+            from owncloud_sync import (_etag_is_multipart, _load_manifest,
+                                       _manifest_entry)
+        except Exception:
+            return None  # no helpers -> no proof -> full GET (never fail open)
+        if _etag_is_multipart(etag):
+            return None
+        # (3) The object must have GROWN. Equal or shrunk is an in-place edit
+        # (or a truncation) and there is no tail to fetch.
+        try:
+            remote_len = int(head.get("ContentLength", 0))
+            local_size = local.stat().st_size
+        except (OSError, TypeError, ValueError):
+            return None
+        if local_size <= 0 or remote_len <= local_size:
+            return None
+        # (4) Allowlisted append-mostly store (see _RANGE_TAIL_STORES).
+        try:
+            rel = self._rel(path)
+        except Exception:
+            return None
+        if not any(rel == s or rel.startswith(s) for s in _RANGE_TAIL_STORES):
+            return None
+        # (5) The mirror must be exactly the last-pulled prefix: local == the
+        # persistent manifest baseline. A local that diverged from baseline
+        # would already have been caught as "no_clobber" upstream, but the
+        # no-baseline first-pull path reaches "download" too, and there the
+        # mirror is not proven to be a prefix of anything.
+        try:
+            local_bytes = local.read_bytes()
+        except OSError:
+            return None
+        try:
+            _mtime, baseline_md5 = _manifest_entry(
+                _load_manifest().get(rel))
+        except Exception:
+            return None
+        if not baseline_md5:
+            return None
+        if hashlib.md5(local_bytes).hexdigest() != baseline_md5:
+            return None
+        # Fetch ONLY the appended bytes.
+        try:
+            obj = self.s3.get_object(Bucket=self.bucket, Key=key,
+                                     Range=f"bytes={local_size}-")
+            tail = obj["Body"].read()
+        except ClientError:
+            return None  # range unsupported/raced -> full GET
+        if not tail:
+            return None
+        candidate = local_bytes + tail
+        # THE PROOF. Reuses the production equality helper rather than
+        # re-implementing ETag quote-stripping and the multipart rule
+        # (guard-4323: validate through the production predicate).
+        if _codec_content_matches(etag, None,
+                                  hashlib.md5(candidate).hexdigest()):
+            _LOG.debug("owncloud range-tail hit: %s +%d bytes (of %d)",
+                       rel, len(tail), remote_len)
+            return candidate
+        return None
+
     def _refresh(self, path: PathLike, force_fresh: bool) -> Path:
         """Ensure the local cache file is current vs S3, returning its path. On a
         fresh-enough cache (within cache_ttl) and not force_fresh, skips the HEAD.
@@ -785,6 +903,19 @@ class OwnCloudBackend:
                 self._diverged_keys.add(key)
                 return local
             # decision == "download" -> fall through to the pull below.
+            # g-358-17: for an append-mostly PLAINTEXT store, try fetching only
+            # the bytes past the mirror's end first. Deliberately placed INSIDE
+            # the local.exists() arm and AFTER the no-clobber verdict: the tail
+            # path needs a local prefix to extend, and it must never pre-empt
+            # the data-protection decision above. Returns None whenever the
+            # md5 proof is unavailable, costing at most one small range GET
+            # before the full GET below runs exactly as it always has.
+            tail_body = self._range_tail_pull(path, key, head, local, etag)
+            if tail_body is not None:
+                _atomic_write_local(local, tail_body)
+                self._etags[key] = etag
+                self._stamp_manifest_baseline(path, tail_body, etag=etag)
+                return local
         obj = self.s3.get_object(Bucket=self.bucket, Key=key)
         # g-358-11: the mirror holds DECODED bytes — every consumer above the
         # backend keeps reading plaintext, whatever the object's encoding.

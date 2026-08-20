@@ -84,3 +84,64 @@ class TestExitCodes:
         bcp.main(["x", "--path", "/nonexistent/xyz"])
         out = capsys.readouterr().out
         assert "DECLINE" in out and "do NOT defer" in out
+
+
+class TestSecretAccessorContract:
+    """The rc contract of `env-read.sh has`, pinned per-code.
+
+    The first version of probe_secret invoked `env-read.sh <NAME>` with no
+    subcommand. env-read.sh dispatches to status|missing|has|value|register, so
+    a bare name is a usage error exiting 2 — for every key, on every box. The
+    secret lane therefore reported ABSENT universally, including for keys
+    plainly present in .env.local, and two goals were declined on that reading.
+
+    What makes it worth three tests rather than one: a usage error and a real
+    absence are byte-identical at the call site (non-zero rc, no stdout). Only
+    a POSITIVE control — a key known to exist coming back "absent" — can
+    surface it, which is exactly how it was found (g-115-6754, 2026-08-19).
+    """
+
+    def _stub_run(self, monkeypatch, returncode):
+        seen = {}
+
+        class _R:
+            def __init__(self, rc):
+                self.returncode, self.stdout, self.stderr = rc, "", ""
+
+        def fake_run(cmd, **kw):
+            seen["cmd"] = cmd
+            return _R(returncode)
+
+        monkeypatch.setattr(bcp.subprocess, "run", fake_run)
+        return seen
+
+    def test_rc0_is_present(self, monkeypatch):
+        self._stub_run(monkeypatch, 0)
+        st, _ = bcp.probe_secret("SOME_KEY")
+        assert st == bcp.PRESENT
+
+    def test_rc1_is_absent(self, monkeypatch):
+        # rc=1 is the ONLY refutation. `has` returns it for a key genuinely
+        # missing from .env.local.
+        self._stub_run(monkeypatch, 1)
+        st, _ = bcp.probe_secret("SOME_KEY")
+        assert st == bcp.ABSENT
+
+    def test_rc2_is_unknown_not_absent(self, monkeypatch):
+        # The regression. rc=2 is env-read.sh refusing to dispatch — the
+        # accessor did not answer, so presence is UNESTABLISHED. Reporting
+        # ABSENT here is what broke the lane.
+        self._stub_run(monkeypatch, 2)
+        st, why = bcp.probe_secret("SOME_KEY")
+        assert st == bcp.UNKNOWN
+        assert "UNESTABLISHED" in why
+
+    def test_invokes_the_has_subcommand(self, monkeypatch):
+        # Pins the CALL SHAPE, not just the rc mapping. Without the `has`
+        # positional every real invocation returns 2, so a future refactor that
+        # drops it would put the lane back to universal-absent while all three
+        # rc tests above still pass (they stub subprocess and never see it).
+        seen = self._stub_run(monkeypatch, 0)
+        bcp.probe_secret("SOME_KEY")
+        assert "has" in seen["cmd"]
+        assert seen["cmd"].index("has") < seen["cmd"].index("SOME_KEY")

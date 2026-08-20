@@ -19,6 +19,9 @@ review is the third moment: BEFORE applying fixes derived from review.
 - Any moment where fixes are about to be applied based on review
   findings (NOT findings derived from a failing test or other
   ground-truth signal)
+- Before opening or merging a PR in a product/deployment repo — step 4's
+  consultation applies at the pre-merge moment too (downstream-prod
+  extension, 2026-08-13; see "Product-repo scope" below)
 
 ## Protocol
 
@@ -33,8 +36,10 @@ review is the third moment: BEFORE applying fixes derived from review.
    Python test for code behavior, env probe for shell/config state, regex
    tester for pattern bugs, file read for state claims. Do not re-state
    from memory. The probe IS the answer.
-4. **Pre-apply consultation** (MANDATORY for framework-file fixes:
-   `core/`, `.claude/`, `world/conventions/`, `core/config/`):
+4. **Pre-apply consultation** (MANDATORY for framework-file fixes —
+   `core/`, `.claude/`, `world/conventions/`, `core/config/` — AND for
+   product-repo changes at the pre-merge moment; see "Product-repo scope"
+   below):
    For each fix about to be applied, run **TWO** queries — one phrased around
    the SUBJECT (what is being changed), one around the MECHANISM (how it is
    being changed, i.e. the shape of the edit operation):
@@ -75,11 +80,33 @@ review is the third moment: BEFORE applying fixes derived from review.
 8. **Report** — state findings, applied fixes, test results. Per
    `communication-clarity.md` rule 6: assert observed evidence.
 
+## Product-repo scope (back-ported from downstream prod, 2026-08-13)
+
+Step 4 was scoped to framework files, so product/deployment-repo work (web
+apps, product code) rode the honor system — and both misses that motivated
+this extension happened in ONE merge (measured on downstream prod by omni,
+ZDS rb-1212): a guardrail already described the exact defect being fixed AND
+named the sibling PR that later collided mid-flight, and another guardrail
+mandated the repo's pre-merge scanner, which was skipped and run only
+retroactively. Neither was consulted, because nothing required it.
+
+Rule: before designing a fix, opening a PR, or merging in a product/
+deployment repo, run the same TWO queries (subject + mechanism). For a
+merge, the MECHANISM query is the merge operation itself ("merging a PR to
+an auto-deploying repo") — that is what surfaces the merge-readiness rails
+and any repo-specific pre-merge scanner the domain registers. This does not
+add an approval wait (standing merge grants are untouched); it adds the same
+20-second consultation framework files already get. Honor-system like the
+rest of step 4 — no gate counts these queries; it is written down because it
+was measured.
+
 ## Anti-patterns
 
 - "I think there's a bug here" — state cleanly or do not state
 - Re-asserting from in-context memory instead of running a probe
 - Applying a framework-file fix without running step 4
+- Opening or merging a product-repo PR without step 4's queries (and the
+  domain's merge-readiness checklist where one exists)
 - Stopping at "the fix passed tests" — if step 4 was skipped, a passing
   test does not falsify a guard violation
 - Treating step 4 as a category lookup ("I'll check the

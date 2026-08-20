@@ -87,8 +87,28 @@ def _runner_from(fire_names=(), errors=()):
     return runner
 
 
-def _run_json(capsys, runner):
-    rc = battery.run(True, check_runner=runner)
+class _MemCounterStore:
+    """In-memory injectable counter store () — keeps the engine tests
+    hermetic (no filesystem write, no MIND_AGENT dependence). `data` is
+    inspectable after a run to assert increment/reset behavior. `modify` mirrors
+    the file store: mutate a copy, then persist it (the file store holds the lock
+    across the same read-mutate-write)."""
+
+    def __init__(self, data=None):
+        self.data = dict(data or {})
+
+    def modify(self, mutate_fn):
+        counters = dict(self.data)
+        mutate_fn(counters)
+        self.data = dict(counters)
+        return counters
+
+
+def _run_json(capsys, runner, store=None):
+    rc = battery.run(
+        True, check_runner=runner,
+        counter_store=store if store is not None else _MemCounterStore(),
+    )
     out = capsys.readouterr().out
     assert rc == 0
     return json.loads(out.splitlines()[0])
@@ -106,7 +126,8 @@ def test_all_noop(capsys):
 
 
 def test_all_noop_default_summary(capsys):
-    rc = battery.run(False, check_runner=_runner_from())
+    rc = battery.run(False, check_runner=_runner_from(),
+                     counter_store=_MemCounterStore())
     out = capsys.readouterr().out
     assert rc == 0
     assert f"all {len(reg.cadences())} cadence gates noop" in out
@@ -123,7 +144,8 @@ def test_single_fire_carries_dispatch_and_meter(capsys):
 
 
 def test_single_fire_human_output(capsys):
-    battery.run(False, check_runner=_runner_from(fire_names={"evolution"}))
+    battery.run(False, check_runner=_runner_from(fire_names={"evolution"}),
+                counter_store=_MemCounterStore())
     out = capsys.readouterr().out
     assert "CADENCE FIRE: evolution (phase 0.5j)" in out
     assert "aspirations-evolve" in out
@@ -150,7 +172,8 @@ def test_check_error_is_fail_open_and_surfaced(capsys):
 
 def test_check_error_prints_to_stderr(capsys):
     # guard-424: fail LOUD with stderr, never silent.
-    battery.run(True, check_runner=_runner_from(errors={"curriculum"}))
+    battery.run(True, check_runner=_runner_from(errors={"curriculum"}),
+                counter_store=_MemCounterStore())
     err = capsys.readouterr().err
     assert "[cadence-battery]" in err
     assert "check_errors" in err
@@ -158,6 +181,148 @@ def test_check_error_prints_to_stderr(capsys):
 
 def test_json_shape(capsys):
     rep = _run_json(capsys, _runner_from(fire_names={"felt-sense"}))
-    assert set(rep.keys()) >= {"checked_at", "registered", "fired"}
+    assert set(rep.keys()) >= {"checked_at", "registered", "fired", "escalation"}
     for f in rep["fired"]:
         assert set(f.keys()) == {"name", "phase", "meter_name", "dispatch"}
+
+
+# ------------------------------------------- starvation escalation ()
+# The battery is now STATEFUL: a per-cadence consecutive-FIRE counter escalates
+# SUSTAINED starvation (due-and-skipped N prechecks running), distinct from the
+# momentary co-firing of 1-3 cadences in one iteration. Every case injects an
+# in-memory _MemCounterStore, so the suite never touches disk.
+
+
+def test_counter_increments_on_consecutive_fire(capsys):
+    # A cadence that FIREs every run (due, never dispatched) accumulates count.
+    store = _MemCounterStore()
+    for _ in range(3):
+        _run_json(capsys, _runner_from(fire_names={"felt-sense"}), store)
+    assert store.data["felt-sense"] == 3
+
+
+def test_counter_resets_to_zero_on_noop(capsys):
+    # A noop (rc!=0 = dispatched OR not-due) resets the counter — no longer starved.
+    store = _MemCounterStore({"felt-sense": 4})
+    _run_json(capsys, _runner_from(fire_names=set()), store)  # felt-sense noops
+    assert store.data.get("felt-sense", 0) == 0
+
+
+def test_no_escalation_below_threshold(capsys):
+    # Default threshold 5 — four consecutive fires must NOT escalate.
+    store = _MemCounterStore()
+    rep = None
+    for _ in range(4):
+        rep = _run_json(capsys, _runner_from(fire_names={"felt-sense"}), store)
+    assert rep["escalation"] is None
+    assert store.data["felt-sense"] == 4
+
+
+def test_escalation_fires_at_threshold(capsys):
+    # The fifth consecutive fire crosses the default threshold and escalates.
+    store = _MemCounterStore()
+    rep = None
+    for _ in range(5):
+        rep = _run_json(capsys, _runner_from(fire_names={"felt-sense"}), store)
+    assert rep["escalation"] is not None
+    assert rep["escalation"]["threshold"] == 5
+    assert rep["escalation"]["dispatch_one"]["name"] == "felt-sense"
+    assert rep["escalation"]["dispatch_one"]["phase"] == "0.5f"
+
+
+def test_escalation_respects_injected_threshold(capsys):
+    # threshold= override: two fires escalate at threshold 2.
+    store = _MemCounterStore()
+    rep = None
+    for _ in range(2):
+        battery.run(True, check_runner=_runner_from(fire_names={"evolution"}),
+                    counter_store=store, threshold=2)
+        rep = json.loads(capsys.readouterr().out.splitlines()[0])
+    assert rep["escalation"] is not None
+    assert rep["escalation"]["dispatch_one"]["name"] == "evolution"
+
+
+def test_escalation_picks_highest_count_oldest_starved(capsys):
+    # Two starved cadences: fresh-eyes-review at 7 beats felt-sense at 6.
+    store = _MemCounterStore({"fresh-eyes-review": 6, "felt-sense": 5})
+    rep = _run_json(
+        capsys,
+        _runner_from(fire_names={"fresh-eyes-review", "felt-sense"}),
+        store,
+    )  # -> 7 and 6
+    assert rep["escalation"]["dispatch_one"]["name"] == "fresh-eyes-review"
+    starved = {s["name"]: s["count"] for s in rep["escalation"]["starved"]}
+    assert starved == {"fresh-eyes-review": 7, "felt-sense": 6}
+
+
+def test_escalation_tiebreak_prefers_felt_sense(capsys):
+    # Equal counts -> felt-sense wins the tie (its starvation is the origin class).
+    store = _MemCounterStore({"fresh-eyes-review": 5, "felt-sense": 5})
+    rep = _run_json(
+        capsys,
+        _runner_from(fire_names={"fresh-eyes-review", "felt-sense"}),
+        store,
+    )  # -> both 6, tie
+    assert rep["escalation"]["dispatch_one"]["name"] == "felt-sense"
+
+
+def test_escalation_human_output_is_loud(capsys):
+    # The default (human) emit prints a LOUD, actionable line naming exactly one.
+    store = _MemCounterStore({"felt-sense": 4})
+    battery.run(False, check_runner=_runner_from(fire_names={"felt-sense"}),
+                counter_store=store)  # -> 5, escalates
+    out = capsys.readouterr().out
+    assert "CADENCE STARVATION" in out
+    assert "felt-sense" in out
+    assert "EXACTLY" in out and "ONE" in out
+
+
+def test_dispatched_cadence_stops_escalating(capsys):
+    # felt-sense starved to 5, then IS dispatched (noops) -> reset, no escalation.
+    store = _MemCounterStore({"felt-sense": 5})
+    rep = _run_json(capsys, _runner_from(fire_names=set()), store)  # noop -> reset
+    assert store.data["felt-sense"] == 0
+    assert rep["escalation"] is None
+
+
+def test_stale_counter_key_is_pruned_no_phantom_escalation(capsys):
+    # A counter key for a cadence NOT in the current registry (removed/renamed)
+    # would otherwise keep a >= N count forever (never fires or noops => never
+    # resets) and escalate a phantom. It must be PRUNED, not escalated.
+    store = _MemCounterStore({"a-removed-cadence": 99, "felt-sense": 0})
+    rep = _run_json(capsys, _runner_from(fire_names=set()), store)  # all noop
+    assert "a-removed-cadence" not in store.data  # pruned from the persisted map
+    assert rep["escalation"] is None              # no phantom escalation
+
+
+# --- pure helpers (fastest, no engine) ---------------------------------------
+
+
+def test_update_counters_increments_and_resets():
+    counters = {"a": 3, "b": 1}
+    battery._update_counters(counters, fired_names=["a"], noop_names=["b"])
+    assert counters == {"a": 4, "b": 0}
+
+
+def test_update_counters_leaves_errored_untouched():
+    # A name in NEITHER list (errored check this run) keeps its prior count.
+    counters = {"a": 3}
+    battery._update_counters(counters, fired_names=[], noop_names=[])
+    assert counters == {"a": 3}
+
+
+def test_pick_oldest_starved_none_below_threshold():
+    assert battery._pick_oldest_starved({"a": 4, "b": 2}, 5, ["a", "b"]) is None
+
+
+def test_pick_oldest_starved_highest_then_felt_sense_then_order():
+    order = ["fresh-eyes-review", "felt-sense", "evolution"]
+    # highest count wins
+    assert battery._pick_oldest_starved(
+        {"fresh-eyes-review": 7, "felt-sense": 6}, 5, order) == "fresh-eyes-review"
+    # tie -> felt-sense
+    assert battery._pick_oldest_starved(
+        {"fresh-eyes-review": 6, "felt-sense": 6}, 5, order) == "felt-sense"
+    # tie, no felt-sense -> registry order
+    assert battery._pick_oldest_starved(
+        {"evolution": 6, "fresh-eyes-review": 6}, 5, order) == "fresh-eyes-review"

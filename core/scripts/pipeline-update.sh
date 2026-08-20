@@ -19,19 +19,32 @@ _RUNTIME_SELF="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
+# : shared strict-argv refusal helpers (uniform message contract).
+# Sourced BEFORE _runtime.sh so a refusal cannot be masked by a daemon failure.
+# shellcheck disable=SC1091
+source "$CORE_ROOT/scripts/_argv_strict.sh"
+
 # --- Parse args -----------------------------------------------------------
 REC_ID=""
-declare -a PASSTHROUGH=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        -h|--help)
+            echo "Usage: printf '%s' '<json>' | pipeline-update.sh <rec_id>"
+            exit 0;;
         -*)
-            PASSTHROUGH+=("$1"); shift;;
+            # : was a silent append to the dead PASSTHROUGH
+            # accumulator — a mistyped flag vanished with rc=0, and the update
+            # JSON arrives on STDIN, so a flag-only invocation then blocked on
+            # the stdin read. Refuse loudly, before the cat.
+            argv_strict_refuse_unknown "pipeline-update.sh" "$1" "(none — the update JSON arrives on STDIN; takes <rec_id>)";;
         *)
             if [ -z "$REC_ID" ]; then
                 REC_ID="$1"
+            else
+                argv_strict_refuse_extra_positional "pipeline-update.sh" "$1" 1 ""
             fi
-            PASSTHROUGH+=("$1"); shift;;
+            shift;;
     esac
 done
 

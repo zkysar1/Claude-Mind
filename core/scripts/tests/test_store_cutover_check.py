@@ -217,9 +217,10 @@ def test_cmd_check_actually_wires_the_local_report(monkeypatch, capsys):
     monkeypatch.setattr(scc, "_read_team_state",
                         lambda: ({"agent_status": {"alpha": _row()}}, None))
     monkeypatch.setattr(scc, "derive_proof",
-                        lambda a, s, c: {"proven": True, "commit": "abc",
-                                         "committed_at": "2026-08-18T00:00:00",
-                                         "age_days": 0.1})
+                        lambda a, s, c, **kw: {"proven": True, "commit": "abc",
+                                               "committed_at": "2026-08-18T00:00:00",
+                                               "age_days": 0.1})
+    monkeypatch.setattr(scc, "_fetch_worker_refs", lambda: True)
     monkeypatch.setattr(scc, "_head_commit", lambda: "deadbee")
 
     rc = scc.cmd_check(scc.STORES["utilization"])
@@ -380,9 +381,10 @@ def test_origin_main_losing_the_symbol_vetoes_an_otherwise_SAFE_fleet(monkeypatc
     monkeypatch.setattr(scc, "_read_team_state",
                         lambda: ({"agent_status": {"alpha": _row()}}, None))
     monkeypatch.setattr(scc, "derive_proof",
-                        lambda a, s, c: {"proven": True, "commit": "abc",
-                                         "committed_at": "2026-08-18T00:00:00",
-                                         "age_days": 0.1})
+                        lambda a, s, c, **kw: {"proven": True, "commit": "abc",
+                                               "committed_at": "2026-08-18T00:00:00",
+                                               "age_days": 0.1})
+    monkeypatch.setattr(scc, "_fetch_worker_refs", lambda: True)
     monkeypatch.setattr(scc, "_local_report",
                         lambda s, c, sym=None: {"seam_present": True})
     monkeypatch.setattr(scc, "_head_commit", lambda: "deadbee")
@@ -571,3 +573,197 @@ def test_symbol_report_reads_the_named_ref_and_fails_closed_on_unreadable(monkey
     assert r["ref"] == "origin/main"
     assert [u["consumer"] for u in r["unreadable"]] == [
         "core/scripts/gate-stats.py"]
+
+
+# ── worker-carrier proof lane () ───────────────────────────────────
+# A Body is a checkout too. The agent_namespace lane proves whichever Body
+# committed agents/<agent>/ last and says nothing about the others, so an agent
+# whose other Bodies run elsewhere falls to the hand-stamp this file exists to
+# delete. These pin the second lane, its liveness join, and — the half most
+# likely to rot — that the verdict NAMES which candidate proved the agent.
+
+SEAM = "seamseamseamseamseamseamseamseamseamseam"
+REF_SID = "cd5fd3b9-5b97-439a-9914-196c1c8f5c00"
+
+
+def _bodies(sid=REF_SID, hours_ago=0.5, **extra):
+    """An in_flight_bodies map with one row, aged `hours_ago`."""
+    return {sid: {"claimed_at": (datetime.now()
+                                 - timedelta(hours=hours_ago)).isoformat(),
+                  "goal_id": "g-x", "phase": "4", **extra}}
+
+
+def _lane_git(monkeypatch, *, agent_commit=None, ref_commit=None,
+              ancestors=("*",), diff_for=None, days_old=1):
+    """Drive BOTH proof lanes independently of a real repo.
+
+    agent_commit=None  -> the agents/<agent>/ lane finds no commit (rc=1), which
+                          is exactly the dormant-Body case the carrier lane
+                          exists to rescue.
+    ancestors          -> commits the seam is an ancestor of ('*' = all).
+    diff_for           -> {commit: "path\n"} making that commit's consumers
+                          diverge from origin/main.
+    """
+    when = (datetime.now() - timedelta(days=days_old)).isoformat()
+    diff_for = diff_for or {}
+
+    def fake_git(*args, **kw):
+        if args[0] == "log":
+            if "origin/main" in args:                    # agent_namespace lane
+                return (_Proc(0, f"{agent_commit}|{when}\n") if agent_commit
+                        else _Proc(1, ""))
+            return (_Proc(0, f"{ref_commit}|{when}\n") if ref_commit
+                    else _Proc(1, ""))                   # carrier lane
+        if args[0] == "merge-base":
+            hit = "*" in ancestors or args[3] in ancestors
+            return _Proc(0 if hit else 1, "")
+        if args[0] == "diff":
+            return _Proc(0, diff_for.get(args[2], ""))
+        return _Proc(0, "")
+
+    monkeypatch.setattr(scc, "_git", fake_git)
+
+
+def test_live_carrier_ref_proves_what_the_namespace_lane_cannot(monkeypatch):
+    """Fixture pin 1: no recent agents/<agent>/ commit + a LIVE carrier ref
+    carrying the seam -> proven, with the proving ref NAMED."""
+    cfg = scc.STORES[GF]
+    _lane_git(monkeypatch, agent_commit=None, ref_commit="cafebabe1234")
+    out = scc.derive_proof("alpha", SEAM, cfg["consumers"], bodies=_bodies())
+    assert out["proven"] is True
+    assert out["lane"] == "worker_carrier_ref"
+    assert out["ref"] == f"refs/workers/alpha/{REF_SID}"
+    assert out["commit"] == "cafebabe1"
+
+
+def test_a_stale_body_row_carrier_ref_proves_nothing(monkeypatch):
+    """Fixture pin 2: the SAME ref, reachable and carrying the seam, proves
+    nothing once its Body row is stale — the guard-3660 liveness join is the
+    substantive half, so this must fail for the LIVENESS reason and not because
+    the content went bad. Content is held identical to the passing test above."""
+    cfg = scc.STORES[GF]
+    _lane_git(monkeypatch, agent_commit=None, ref_commit="cafebabe1234")
+    stale = _bodies(hours_ago=scc.BODY_LIVENESS_MAX_AGE_HOURS + 1)
+    out = scc.derive_proof("alpha", SEAM, cfg["consumers"], bodies=stale)
+    assert out["proven"] is False
+    assert out["reason"] == "no_iteration_commit"      # fell back, unrelabelled
+    assert "carrier_candidates" not in out             # never even considered
+
+
+def test_the_agent_namespace_lane_still_wins_when_it_can_prove(monkeypatch):
+    """No regression on the landed lane: when it proves, it proves, and it
+    names itself — the carrier lane must not silently take over."""
+    cfg = scc.STORES[GF]
+    _lane_git(monkeypatch, agent_commit="aaaa1111bbbb", ref_commit="cafebabe1234")
+    out = scc.derive_proof("alpha", SEAM, cfg["consumers"], bodies=_bodies())
+    assert out["proven"] is True
+    assert out["lane"] == "agent_namespace"
+    assert out["commit"] == "aaaa1111b"
+    assert "ref" not in out
+
+
+def test_omitting_bodies_keeps_the_single_lane_behaviour(monkeypatch):
+    """The default is byte-identical to before: no bodies -> no carrier lane,
+    so every pre-existing caller and test is unaffected."""
+    cfg = scc.STORES[GF]
+    _lane_git(monkeypatch, agent_commit=None, ref_commit="cafebabe1234")
+    out = scc.derive_proof("alpha", SEAM, cfg["consumers"])
+    assert out["proven"] is False
+    assert out["reason"] == "no_iteration_commit"
+    assert "carrier_candidates" not in out
+
+
+def test_a_live_ref_that_lacks_the_seam_is_reported_not_swallowed(monkeypatch):
+    """A live Body whose ref does NOT carry the seam must not prove, and the
+    attempt must be visible — a proof lane that fails silently is unauditable."""
+    cfg = scc.STORES[GF]
+    _lane_git(monkeypatch, agent_commit=None, ref_commit="cafebabe1234",
+              ancestors=())                                # seam ancestor of nothing
+    out = scc.derive_proof("alpha", SEAM, cfg["consumers"], bodies=_bodies())
+    assert out["proven"] is False
+    assert out["reason"] == "no_iteration_commit"
+    assert out["carrier_candidates"][0]["reason"] == "seam_not_ancestor"
+    assert out["carrier_candidates"][0]["ref"].endswith(REF_SID)
+
+
+def test_a_live_ref_whose_consumers_diverge_names_the_file(monkeypatch):
+    """Ancestry is not identity on the carrier lane either (the guard the
+    agent lane already carries) — and the diverging file is surfaced."""
+    cfg = scc.STORES[GF]
+    _lane_git(monkeypatch, agent_commit=None, ref_commit="cafebabe1234",
+              diff_for={"cafebabe1234": "core/scripts/gate-stats.py\n"})
+    out = scc.derive_proof("alpha", SEAM, cfg["consumers"], bodies=_bodies())
+    assert out["proven"] is False
+    c = out["carrier_candidates"][0]
+    assert c["reason"] == "consumers_diverge_from_main"
+    assert c["diff_files"] == ["core/scripts/gate-stats.py"]
+
+
+def test_an_unreadable_carrier_ref_is_reported_not_proven(monkeypatch):
+    """A live body row whose ref is not fetched locally must not prove. This is
+    the failure _fetch_worker_refs exists to prevent, and it must be legible."""
+    cfg = scc.STORES[GF]
+    _lane_git(monkeypatch, agent_commit=None, ref_commit=None)
+    out = scc.derive_proof("alpha", SEAM, cfg["consumers"], bodies=_bodies())
+    assert out["proven"] is False
+    assert out["carrier_candidates"][0]["reason"] == "carrier_ref_unreadable"
+
+
+def test_live_body_sids_drops_every_uncertain_row():
+    """The liveness join fails CLOSED on anything it cannot read, and accepts a
+    future stamp (clock skew between boxes is not staleness)."""
+    now = datetime.now()
+    fresh = (now - timedelta(hours=1)).isoformat()
+    old = (now - timedelta(hours=scc.BODY_LIVENESS_MAX_AGE_HOURS + 1)).isoformat()
+    future = (now + timedelta(minutes=5)).isoformat()
+    bodies = {"live": {"claimed_at": fresh}, "old": {"claimed_at": old},
+              "skewed": {"claimed_at": future}, "junk": {"claimed_at": "nope"},
+              "missing": {}, "notadict": "x"}
+    assert scc._live_body_sids(bodies, now) == ["live", "skewed"]
+    assert scc._live_body_sids(None, now) == []
+    assert scc._live_body_sids({}, now) == []
+
+
+def test_the_verdict_names_the_lane_that_proved_each_agent():
+    """evaluate_roster must carry lane/ref through — without them a derived
+    attestation cannot be audited once more than one lane exists."""
+    roster = {"alpha": _row()}
+    proofs = {"alpha": {"proven": True, "commit": "abc123def",
+                        "committed_at": "2026-08-19T00:00:00", "age_days": 0.1,
+                        "lane": "worker_carrier_ref",
+                        "ref": f"refs/workers/alpha/{REF_SID}"}}
+    r = scc.evaluate_roster(roster, proofs, FIELD, NOW)
+    assert r["verdict"] == "SAFE"
+    entry = r["attested"][0]
+    assert entry["lane"] == "worker_carrier_ref"
+    assert entry["ref"].endswith(REF_SID)
+
+
+def test_cmd_check_fetches_worker_refs_and_passes_the_body_rows(monkeypatch, capsys):
+    """The wiring pin. derive_proof gaining a bodies= parameter is inert unless
+    cmd_check FETCHES the refs and actually passes each agent's rows — the
+    'built but never called' failure this file has hit before."""
+    seen = {}
+    monkeypatch.setattr(scc, "_fetch_origin_main", lambda: True)
+    monkeypatch.setattr(scc, "_fetch_worker_refs",
+                        lambda: seen.setdefault("fetched", True))
+    row = _row()
+    row["in_flight_bodies"] = _bodies()
+    monkeypatch.setattr(scc, "_read_team_state",
+                        lambda: ({"agent_status": {"alpha": row}}, None))
+
+    def spy(agent, seam, consumers, bodies=None):
+        seen["bodies"] = bodies
+        return {"proven": True, "commit": "abc", "lane": "agent_namespace"}
+
+    monkeypatch.setattr(scc, "derive_proof", spy)
+    monkeypatch.setattr(scc, "_local_report",
+                        lambda s, c, sym=None: {"seam_present": True})
+    monkeypatch.setattr(scc, "_head_commit", lambda: "deadbee")
+    monkeypatch.setattr(scc, "_symbol_report",
+                        lambda sym, cons, ref: {"symbol_present": True})
+    scc.cmd_check(dict(scc.STORES[GF]))
+    out = json.loads(capsys.readouterr().out)
+    assert seen.get("fetched") is True
+    assert REF_SID in (seen.get("bodies") or {})
+    assert out["worker_refs_fetch_ok"] is True

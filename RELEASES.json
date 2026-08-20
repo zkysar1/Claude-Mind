@@ -1,5 +1,27 @@
 [
   {
+    "version": "2.10.1",
+    "previous_version": "2.10.0",
+    "date": "2026-08-20",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Publishability fix: genericize domain token in suite-baselines note (unblocks the v2.10.0 promote payload)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.10.0",
+    "previous_version": "2.9.4",
+    "date": "2026-08-20",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Context-bloat arc: prime guardrail index 487KB->71KB (id manifest + CRITICAL always-load core), near-dup refusal tier + citation credit usefulness signal, budget tripwires",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.9.4",
     "previous_version": "2.9.3",
     "date": "2026-08-19",

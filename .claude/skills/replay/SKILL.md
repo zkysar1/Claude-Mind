@@ -97,6 +97,35 @@ Apply spaced repetition filter:
     Skip
   Prefer hypotheses never replayed (replay_count == 0)
 
+  ⚠ THIS PREFERENCE AND THE PRIORITY ORDER ABOVE ARE ANTI-CORRELATED, AND
+  NOTHING HERE SAYS WHICH DOMINATES. Resolving it rc-first costs the entire
+  violation enrichment. Measured 2026-08-19 (zeta, hostname cc-02, uname -r
+  6.8.0-137-generic, 588-record pool), replay_count x surprise:
+
+      rc   surp>=6   surp==5   surp<5
+       0         1        12      194
+       1        67        25      110
+       2        31         4       49
+
+  The never-replayed stratum is surprise-POOR (194 of 207 below 5; exactly ONE
+  record at rc==0 AND surprise>=6), because spaced repetition is WORKING — a
+  high-surprise record gets replayed, so it accumulates rc and leaves the rc==0
+  stratum. The two preferences therefore pull apart by construction and will
+  keep doing so.
+  Cost, measured on the same run: sorting (rc asc, surprise desc) and taking the
+  top 8 produced a batch at 30% CORRECTED — the corpus BASE rate of 29.2% — while
+  rule 1's own population (surprise>=5) runs 69.0% CORRECTED, a +39.8pp
+  enrichment. Sorting rc-first did not weaken the enrichment; it discarded ALL of
+  it, and the resulting batch looks perfectly normal.
+  RESOLUTION: order by the PRIORITY RULES first and use replay_count only to
+  break ties WITHIN a priority band. The spaced-repetition filter (7-day skip +
+  `next_review_date`) already prevents re-replaying anything recent, so rc==0 is
+  not needed as a freshness guard — it is a tiebreak, and promoting it to the
+  primary key silently inverts what this step selects for.
+  (Do not read this as contradicting guard-2129: rule 1 IS enriched for
+  corrections, by 39.8pp, so every batch-scoped corrected-rate remains
+  upward-biased and still must be re-measured against the corpus.)
+
 Select top N candidates (N = max_replay_items from config, default 10)
 
    # Add experience-backed candidates
@@ -488,9 +517,16 @@ the wrong-prediction shape as a calibration GUARDRAIL, then marks the hypothesis
 so it stops cycling. (Refs: g-115-1093, g-115-1104,
 agents/echo/reports/chronic-re-replay-encoding-gap-2026-05-22.md.)
 
-SCHEMA NOTE (verified 2026-05-27, g-115-1104): there is NO stored
-`reconsolidation_updates` field on pipeline records — the investigation's
-"reconsolidation_updates is empty" was a conceptual description, not a field.
+SCHEMA NOTE (verified 2026-05-27, g-115-1104; CORRECTED 2026-08-19, g-001-05,
+zeta/cc-02): this note used to read "there is NO stored `reconsolidation_updates`
+field on pipeline records." That is FALSE as written and a reader who greps will
+find the field and distrust the rest of the note. Measured over the 588-record
+replay-candidate pool: `replay_metadata.reconsolidation_updates` is PRESENT on
+164 records (27.9%) and NON-EMPTY on 3. So the field exists but is inert — which
+leaves the note's actual CONCLUSION intact and is why the correction is a
+premise-swap, not a reversal: a key that is empty on 98% of the records carrying
+it cannot serve as an idempotency guard, whether or not it exists. State the
+measured reason, not the absent-field reason.
 The idempotency guard is `replay_metadata.encoded_via_chronic` instead: once a
 chronic-corrected hypothesis is encoded here, the flag stops re-processing here
 AND makes Step 1's spaced-repetition filter skip it. Dotted field names are

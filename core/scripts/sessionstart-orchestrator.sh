@@ -124,6 +124,27 @@ printf '%s' "$STDIN_JSON" | bash "$SCRIPT_DIR/recovery-gate.sh" || true
 # silent on a clean WM, a loud quarantine block on detection.
 printf '%s' "$STDIN_JSON" | bash "$SCRIPT_DIR/wm-contamination-check.sh" || true
 
+# ─── Step 2.6: local-backend-staleness-check.sh ────────────────────────────
+# Warn when a STORAGE_BACKEND=local clone is behind origin, or when another
+# machine pushed recently. Under the local backend the git remote is the ONLY
+# cross-machine sync point and nothing consulted it at session start; a box was
+# measured running two full sessions 457 commits behind, reading every world
+# store from a week-stale tree, silently ().
+#
+# Unconditional, NOT source=compact-gated: staleness is a property of the clone,
+# not of how this SessionStart was triggered — a fresh terminal on a stale box is
+# exactly the case that went unreported.
+#
+# Placed AFTER recovery-gate deliberately. It is advisory and must never be able
+# to perturb runner identity or crashed-runner detection, so it runs once those
+# have settled. It reads nothing they write and writes nothing at all.
+#
+# Own-cloud boxes return before the fetch, so they pay nothing. Fail-open by
+# construction (no network / no upstream / detached HEAD all exit 0 silently),
+# and `|| true` keeps the chain's contract even if the script itself is edited
+# badly later.
+bash "$SCRIPT_DIR/local-backend-staleness-check.sh" || true
+
 # ─── Steps 3+4: source=compact only ────────────────────────────────────────
 if [ "$SOURCE" = "compact" ]; then
     # postcompact-restore.sh — re-inject context. Writes its restoration

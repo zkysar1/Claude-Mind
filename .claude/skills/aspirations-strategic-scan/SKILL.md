@@ -69,6 +69,16 @@ that data and looks for signals that demand new work.
 # stores (`/opt/ayoai-mind/agents/*/experience*.jsonl`) and compare the newest
 # fleet-wide timestamp to your newest local one. A local-only read of a world
 # sensor is a claim about this box, never about the sensor.
+# ⚠ THAT COMPARISON CANNOT RUN ON THE WORST CASE: `mine == 0` yields no local
+# timestamp, and `len(entries) < 2 -> continue` drops the sensor BEFORE any
+# detector — no signal, no warning, no count, so "healthy" and "invisible to this
+# box" print identically (guard-1715). Measured 2026-08-19 (alpha, cc-04,
+# 6.8.0-137-generic), top-10 sensors / 6 stores: 10/10 cross-agent, 9/10 local <
+# fleet; `g-353-03` read **mine 0 of 12** (bravo holds all 12), `g-115-151`
+# (production health, ach=140) mine 1/5 with local newest 26d behind fleet. The
+# only mine==fleet row was alpha-private by construction. SO: report the
+# `mine/fleet` census per sensor and name `mine == 0` rows as DROPPED. Owned by
+# g-115-3215 — file nothing.
 #
 # OPEN OWNERS (re-verify status before acting — g-115-3246's premise expired with
 # the header above): **g-115-3246** (in-progress, titled "S1 inert on absent
@@ -347,6 +357,7 @@ IF opened < len(stale_nodes):
 #   2026-08-17T01:0x  3 of **29**  echo (cc-03, 6.8.0-137-generic)  opened 29/29; members 101d/37d/50d — the SAME THREE for a tenth consecutive reading — split **29 raw / 8 re-verify / 21 suspect**, total **1408**, EXPLORE **50**. Histogram {31:2,33:1,36:8,37:10,44:1,48:1,50:1,77:1,88:1,89:1,99:1,101:1}. FIRST ROW AFTER THE FALL, AND ON A DIFFERENT BOX — that is its whole point. It is exactly bravo's 22:1x buckets **+1 on every bucket** plus a new **{31:2}** cohort, and critically the vanished bucket STAYS vanished: bravo's missing {96:1} would read {97:1} here and does not appear. So the fall was durable and cross-box, not a momentary parse difference — which is the one thing a single reading could not establish, since bravo's row had to assert permanence from one snapshot. **The denominator is therefore non-monotone in BOTH directions inside one roster: 28 -> 27 -> 29.** Direction alone now tells you nothing; a rise of +2 here is two genuine 31d entrants (calendar) sitting on top of a real exit (work), and only the BUCKETS separate them. Do not read 27 -> 29 as the fall being reversed or as drift returning. Re-verify cohort STILL 8 — NINTH consecutive day, so the raw-vs-honest overstatement is now 29 vs 21 (+38%) and every one of the eleven arrivals since 08-11 has landed in `suspect`. FOLDED (alpha, cc-04, 6.8.0-137-generic, 2026-08-17T08:2x, opened 29/29) rather than given its own row per the g-115-4058 practice — byte-identical histogram, members (101d/37d/50d) and 29/8/21 split, screened at the configured 30d. Its one addition is the growth-independence control on the FALL: total **1413** against echo's 1408 hours earlier with **EXPLORE flat at 50** and the stale set unmoved by a single member or bucket, so the tree gained 5 nodes across the first post-fall interval without the vanished {96} bucket returning or any new member appearing. That extends the "rise is calendar, fall is work" reading with the one control it lacked — the fall survives tree growth, not just the passage of a day. FOLDED AGAIN (foxtrot, `hostname` LAPTOP-3IOFCNEO, `uname -r` 6.6.87.2-microsoft-standard-WSL2, 2026-08-17T16:1x, opened 29/29): 3 of 29, members 101d/37d/50d, split 29 raw / 8 re-verify / 21 suspect, histogram byte-identical to echo's row and total **1413** / EXPLORE **50** byte-identical to alpha's fold. Its one addition is that 1413/50 is now measured on a SECOND KERNEL FAMILY — every reading since 08-11 except this one is 6.8.0-13x-generic, and the 08-15 rows set the precedent that a total agreeing across two kernels is a property of the shared store rather than of the reading box. Twelfth consecutive reading with the same three members, and the ninth day at re-verify 8.
 #   2026-08-17T23:3x  3 of **30**  echo (cc-03, 6.8.0-137-generic)  opened 30/30; members 101d/50d/37d — the SAME THREE for a THIRTEENTH consecutive reading — split **30 raw / 8 re-verify / 22 suspect**, total **1417**, EXPLORE **51**. Histogram {31:2,33:1,36:8,37:10,44:1,48:1,50:1,77:1,88:1,89:1,99:1,101:1,**134:1**}. SAME BOX, SAME CALENDAR DAY as the 01:0x row above — every bucket is byte-identical to it (no aging in between, as expected 22h apart within one day) with **exactly one addition: {134:1}**. That isolates the mechanism perfectly, and it is the cleanest instance of the FOURTH mechanism in the paragraph directly below: a 134d node cannot cross a 30d line by aging, and EXPLORE moved 50 -> 51 over the same interval, so the entrant is a CLASS event. The node is `cross-domain-methodologies` (its trigger is non-structural, which is why the numerator held at 3 despite the denominator moving). ITS ONE ADDITION IS TO BOUND bravo's 08-16T22:1x claim rather than contradict it: bravo measured a node entering EXPLORE and NOT joining the denominator, and concluded "a new EXPLORE node joins on its 31st day, not on arrival". That node was YOUNG. This one was already 134d past threshold and joined **IMMEDIATELY**. So the two readings are consistent and the correct rule is **past-threshold-at-class-entry**, not a 31-day wait — which matters because the two phrasings predict opposite things for exactly the case that moves this metric. Re-verify cohort STILL 8 — TENTH consecutive day, raw-vs-honest overstatement now 30 vs 22 (+36%), and all twelve arrivals since 08-11 have landed in `suspect`.
 #   2026-08-18T01:4x  3 of **31**  alpha (cc-04, 6.8.0-137-generic)  opened 31/31; members 102d/51d/38d — the SAME THREE for a FOURTEENTH consecutive reading — split **31 raw / 8 re-verify / 23 suspect**, total **1418**, EXPLORE **53**. Histogram {31:1,32:2,34:1,37:8,38:10,45:1,49:1,51:1,78:1,89:1,90:1,100:1,102:1,135:1} = echo's 23:3x buckets +1 on every bucket (the {134:1} class entrant aged to 135 and STAYED — confirming past-threshold-at-class-entry members persist like any other) plus one new {31:1} calendar entrant. EXPLORE 51 -> 53 with the stale set moving only by that one 31d arrival, extending bravo's bounding: two more class entries, neither joining the denominator on arrival. Re-verify cohort STILL 8 — ELEVENTH consecutive day; overstatement 31 vs 23 (+35%). No new mechanism otherwise; folded here as one line per the g-115-4058 practice. FOLDED (echo, cc-03, 6.8.0-137-generic, 2026-08-18T07:2x, opened 31/31): 3 of 31, same three members 102d/38d/51d, split 31/8/23, histogram byte-identical — INCLUDING total **1418** and EXPLORE **53**. Second box same day agreeing on BOTH totals, which is the 08-15 standard for calling 1418/53 a property of the shared store rather than of cc-04; this is the first row in ~a week where total and EXPLORE would otherwise have been measured only once. Re-verify cohort STILL 8 — TWELFTH consecutive day. FOLDED AGAIN (alpha, cc-04, 6.8.0-137-generic, 2026-08-18T22:2x, opened 31/31): 3 of 31, same three members 102d/51d/38d, split 31/8/23, histogram byte-identical to both rows above, EXPLORE **53** unchanged — but total **1428** against their 1418. THIRD box this date, and its one addition is the largest single growth interval this roster has measured: the tree gained **10 nodes in ~15h** with EXPLORE flat and the stale set unmoved by a single member or bucket. Prior growth controls were +1 to +5, small enough that a reader could wonder whether the stale set simply had not had time to notice; +10 with zero movement makes the denominator's independence from tree growth a much harder claim to explain away. Re-verify cohort STILL 8 — THIRTEENTH consecutive day.
+#   2026-08-19T15:2x  3 of **32**  foxtrot (`hostname` LAPTOP-3IOFCNEO, `uname -r` 6.6.87.2-microsoft-standard-WSL2)  opened 32/32; members 103d/52d/39d — the SAME THREE for a FIFTEENTH consecutive reading — split **32 raw / 8 re-verify / 24 suspect**, total **1443**, EXPLORE **54**. Histogram {31:1,32:1,33:2,35:1,38:8,39:10,46:1,50:1,52:1,79:1,90:1,91:1,101:1,103:1,136:1} = alpha's 08-18T01:4x buckets +1 on every bucket plus one new {31:1} calendar entrant, with the 135d class entrant now at 136 and still present. Screened at the CONFIGURED 30d read from aspirations.yaml. Re-verify cohort STILL 8 — FOURTEENTH consecutive day; overstatement 32 vs 24 (+33%). Its one addition is a CROSS-KERNEL growth control: this is the only reading since 08-17 not on 6.8.0-13x-generic, and against alpha's 08-18T22:2x row the tree grew **1428 -> 1443 (+15)** and **EXPLORE 53 -> 54** while the stale set did not move by a single member or bucket — so the denominator's independence from BOTH tree growth and class entry now holds across two kernel families, not one. Prior rows established each separately on 6.8.0-137 only.
 # A DENOMINATOR CAN GROW BY A NODE THAT WAS ALREADY PAST THRESHOLD — a FOURTH
 # mechanism, and the paragraph below does not cover it. My histogram is zeta's
 # 08-13 buckets +1 on every bucket PLUS an extra {41:1}. Aging cannot produce
@@ -859,6 +870,19 @@ FOR EACH asp in active_asps:
 # asp-115's ~3.8% — the first same-box interval in this roster where the non-115 pool
 # grew proportionally FASTER than asp-115, which is what actual de-concentration would
 # look like if it persisted. One interval is not a trend; do not read it as one.
+#   FOLDED (foxtrot, `hostname` LAPTOP-3IOFCNEO, `uname -r` 6.6.87.2-microsoft-standard-WSL2,
+#   2026-08-19T15:2x; 2000 pending/in-progress across 25 active aspirations, 189 distinct
+#   categories): **39.2% / 62.5% (24 `framework-*` labels) / 81.9%**. Verdicts unchanged —
+#   axis 2 still the only fire. Full-store, verified by GOAL COUNT (2967) and
+#   `goals_omitted` key-presence 0/25; the loader's stderr independently named the summary
+#   as BOUNDED (1788 of 2023 omitted), so both disambiguators agreed. Its one addition is a
+#   SECOND instance of the non-115-grows-faster interval the row above calls "not a trend":
+#   against THIS box's own 08-18T09:5x row, asp-115 rose **1611 -> 1638 (+1.7%)** while
+#   non-115 rose **341 -> 362 (+6.2%)** — same direction as alpha's cc-04 interval, on a
+#   different kernel family, over a non-overlapping window. Two same-box intervals is still
+#   not a trend, but it is no longer a single observation. Share fell 82.5% -> 81.9% on a
+#   denominator that rose 1952 -> 2000: both terms up, share down — ordinary dilution, NOT
+#   remediation.
 
 # DO NOT READ THE FALLING SHARE AS THE CONCENTRATION RESOLVING — the arithmetic
 # says the opposite. asp-115 grew 1376 -> 1615 (+239) and `framework-*` grew
@@ -1565,6 +1589,27 @@ coverage, never as suppression working. NOTE the `per_agent` sub-keys are NOT
 all five agents here, which is guard-2046 again (a capture list is prose and
 nothing checks the command emits those names). Print `per_agent` raw before
 naming its fields; `ceiling_ratio` is the discriminator and it is emitted.
+
+✔ **THE PEER SEED IS STABLE ACROSS DAYS, NOT MERELY HOURS — which is what makes the
+repeat-on-one-box discriminator usable at all.** Measured 2026-08-19T15:2x (foxtrot,
+`hostname` LAPTOP-3IOFCNEO, `uname -r` 6.6.87.2-microsoft-standard-WSL2, own-cloud,
+read-only): **0 candidates at BOTH `--min-failures 2` and `1`, distinct members 0** —
+the undecidable case — `ceiling_ratio` **0.0084 (204 of 24237)**, inside the
+~0.0026-0.009 band, so this is a COVERAGE measurement and not a skill-quality one.
+Routed nothing. `--failing-invocations` reported `failing_count: 1` against 0 surfaced
+candidates; read that gap as coverage, never as suppression working.
+
+Its one addition: my four peer diaries are the SAME batched seed measured on this box on
+2026-08-17 at 10:4x AND 16:1x — zeta `08-05T17:35`, echo `17:48`, alpha `18:05`, bravo
+`18:16`, all ending `08-06T02:09..02:13` — now unchanged across **two calendar days and
+~29 hours**, with only the resident diary advancing (foxtrot `08-19T06:56..15:21`). The
+prior claim was "stable across hours on one box"; three readings spanning two days make it
+stable across days. That matters because every discriminator in this marker rests on
+repeating a reading on ONE box and expecting the slice to hold — if peer slices were
+re-pulled opportunistically, a same-box repeat would prove nothing. Note also
+`diary_windows` (14/17/21/14/10 here) is the field to read beside the span: 24-47
+in-span invocations against 4410-5193 totals, i.e. ~0.5-1.0% each, unchanged in shape
+from every prior row.
 
 ```
 Bash: py -3 core/scripts/skill-evaluate.py reconsolidation --min-failures 2 --apply

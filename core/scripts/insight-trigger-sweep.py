@@ -926,7 +926,15 @@ def file_goal(trigger, *, dry_run=False):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Convert findings-channel insight_triggers to goals.")
+    # NOT "findings-channel" — this said so until 2026-08-19 () while the
+    # module docstring above correctly said "EVERY live board channel", and the run
+    # scans 9 (board_channels()). Measured that day: of 1853 insight_triggers on the
+    # board, 497 are OUTSIDE findings (coordination 16, coordination-archive 36,
+    # decisions 1, findings-archive 444). A reader trusting --help would conclude
+    # those channels are uncovered and file work to "add" coverage that already
+    # exists. --help is the surface a reader checks first; keep it in step with the
+    # docstring.
+    ap = argparse.ArgumentParser(description="Convert insight_triggers from every live board channel to goals.")
     ap.add_argument("--dry-run", action="store_true", help="Probe-only mode; no writes.")
     ap.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
     args = ap.parse_args()

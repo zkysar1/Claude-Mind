@@ -28,6 +28,28 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+#  — this file's two "must approve" negative cases require
+# agents/alpha/journal/ and agents/alpha/experience/ to EXIST as populated
+# top-level dirs. That is a property of the DEPLOYMENT's agent roster, not of
+# the code under test.
+#
+# The comment at the "two EXISTING toplevels" case below records the previous
+# attempt at this same problem: the fixture used to use session/, which is
+# gitignored and "exists only on boxes where alpha has RUN", and the case
+# false-failed on cc-05 () where it was mis-triaged as a hook
+# multi-path parsing defect. The remedy was to switch to journal/ + experience/
+# "because they are both GIT-TRACKED so they exist on every clone".
+#
+# That remedy holds across CLONES of one deployment and NOT across DEPLOYMENTS.
+# Measured by omni on ZDS-Mind (hostname cc-06, 2026-08-19): there agents/alpha
+# is a stub holding only session/, so those toplevels genuinely do not exist,
+# the L1 path hook CORRECTLY denies, and this test CORRECTLY fails against
+# healthy code. Marked rather than re-fixed because no choice of path fixes it:
+# the assumption is that a SECOND agent is populated at all.
+pytestmark = pytest.mark.fleet_layout
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 CORE_SCRIPTS = SCRIPT_DIR.parent
 PROJECT_ROOT = CORE_SCRIPTS.parent.parent

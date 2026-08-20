@@ -11,8 +11,12 @@ _RUNTIME_SELF="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
+# : shared strict-argv refusal helpers (uniform message contract).
+# Sourced BEFORE _runtime.sh so a refusal cannot be masked by a daemon failure.
+# shellcheck disable=SC1091
+source "$CORE_ROOT/scripts/_argv_strict.sh"
+
 declare -a FLAG_KEYS=()
-declare -a PASSTHROUGH=()
 SESSION=""
 DATE=""
 RECENT=""
@@ -21,22 +25,31 @@ RECENT=""
 # (--recent below already checks $#.)
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        -h|--help)
+            echo "Usage: journal-read.sh (--session <sid> | --date <d> | --recent [N] | --summary | --meta | --latest)"
+            exit 0;;
         --session)
-            SESSION="${2-}"; PASSTHROUGH+=(--session "${2-}"); shift $(( $# >= 2 ? 2 : 1 ));;
+            SESSION="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
         --date)
-            DATE="${2-}"; PASSTHROUGH+=(--date "${2-}"); shift $(( $# >= 2 ? 2 : 1 ));;
+            DATE="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
         --recent)
             # --recent takes optional N (CLI default 5)
             if [ $# -gt 1 ] && [[ "$2" =~ ^[0-9]+$ ]]; then
-                RECENT="$2"; PASSTHROUGH+=("$1" "$2"); shift $(( $# >= 2 ? 2 : 1 ))
+                RECENT="$2"; shift $(( $# >= 2 ? 2 : 1 ))
             else
-                RECENT="5"; PASSTHROUGH+=("$1"); shift
+                RECENT="5"; shift
             fi;;
-        --summary) FLAG_KEYS+=(summary); PASSTHROUGH+=("$1"); shift;;
-        --meta)    FLAG_KEYS+=(meta);    PASSTHROUGH+=("$1"); shift;;
-        --latest)  FLAG_KEYS+=(latest);  PASSTHROUGH+=("$1"); shift;;
+        --summary) FLAG_KEYS+=(summary); shift;;
+        --meta)    FLAG_KEYS+=(meta); shift;;
+        --latest)  FLAG_KEYS+=(latest); shift;;
         *)
-            PASSTHROUGH+=("$1"); shift;;
+            # : this arm silently appended to a dead PASSTHROUGH
+            # accumulator (fed the pre-2026-05-14 CLI fallback, read by nothing
+            # since), so a mistyped filter vanished and the call answered the
+            # WRONG population with rc=0 (the rb-245 authoritative-false-count
+            # shape). Refuse loudly. Exit 2 per the _argv_strict.sh convention
+            # (the daemon path exits 1, so tests need a distinct rc).
+            argv_strict_refuse_unknown "journal-read.sh" "$1" "--session <sid> | --date <d> | --recent [N] | --summary | --meta | --latest";;
     esac
 done
 
