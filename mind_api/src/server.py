@@ -18,7 +18,7 @@ import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 from urllib.parse import parse_qs, urlsplit
 
 from . import __version__
@@ -104,7 +104,8 @@ class RequestContext:
     and port, and the request body bytes for POST endpoints.
     """
 
-    __slots__ = ("method", "path", "query", "body", "paths", "pid", "port", "headers", "tenant")
+    __slots__ = ("method", "path", "query", "body", "_paths", "_paths_factory",
+                 "pid", "port", "headers", "tenant")
 
     def __init__(
         self,
@@ -112,21 +113,40 @@ class RequestContext:
         path: str,
         query: Dict[str, str],
         body: bytes,
-        paths: AgentPaths,
+        paths: Optional[AgentPaths],
         pid: int,
         port: int,
         headers: Dict[str, str],
         tenant: str = "default",
+        paths_factory: Optional[Callable[[], AgentPaths]] = None,
     ):
         self.method = method
         self.path = path
         self.query = query
         self.body = body
-        self.paths = paths
+        self._paths = paths
+        self._paths_factory = paths_factory
         self.pid = pid
         self.port = port
         self.headers = headers
         self.tenant = tenant
+
+    @property
+    def paths(self) -> AgentPaths:
+        """Resolved agent paths — resolved LAZILY on first access (g-367-03).
+
+        On a pre-init deployment (no world configured yet, no local-paths.conf,
+        no .mind-data/) AgentPathResolver.resolve() raises RuntimeError. Eager
+        per-request resolution 500'd EVERY route including /v1/admin/health,
+        whose contract is "always succeeds when the daemon is up" — breaking
+        the spawn-confirmation probe in mind-api-start.sh:66. Deferring to
+        first ACCESS lets path-free admin endpoints serve pre-init while
+        endpoints that touch paths keep the identical loud RuntimeError
+        (mapped to 500 by _serve's generic handler). Loud-at-use preserved.
+        """
+        if self._paths is None and self._paths_factory is not None:
+            self._paths = self._paths_factory()
+        return self._paths
 
 
 # --- HTTP handler -----------------------------------------------------------
@@ -178,7 +198,10 @@ class _Handler(BaseHTTPRequestHandler):
             body = _normalize_request_body(body)
 
             agent_header = self.headers.get("X-Mind-Agent", "")
-            paths = self.resolver.resolve(agent_header)
+            # g-367-03: do NOT resolve here. Resolution happens lazily at the
+            # first ctx.paths access (see RequestContext.paths) so a pre-init
+            # deployment can still serve /v1/admin/health and the other
+            # path-free admin routes.
 
             # X-Mind-Tenant: H9-light tenant seam (Phase 5). Today the
             # value is propagated through ctx for future use but does NOT
@@ -196,11 +219,12 @@ class _Handler(BaseHTTPRequestHandler):
                 path=path,
                 query=query,
                 body=body,
-                paths=paths,
+                paths=None,
                 pid=self.pid,
                 port=self.port,
                 headers={k.lower(): v for k, v in self.headers.items()},
                 tenant=tenant_header,
+                paths_factory=lambda: self.resolver.resolve(agent_header),
             )
 
             # FR-4 (daemon auth, BRD Shared-State-API): bearer-token

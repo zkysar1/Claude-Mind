@@ -158,7 +158,17 @@ def _resolve_world_team_state(project_root: Path) -> Path | None:
     local = project_root / "world" / "team-state.yaml"
     if local.is_file():
         return local
-    for child in sorted(_agents_root(project_root).iterdir()):
+    # Pre-init tolerance (g-367-03): a bare clone has no agents root at all,
+    # and this function is reached at daemon IMPORT time via the
+    # capability_route ACTIVE_AGENTS shim — iterdir() on the missing dir
+    # raised FileNotFoundError and killed the daemon before /health existed
+    # (measured 2026-08-21 on a pristine coach-mind clone). Absent root ==
+    # team-state absent == None, exactly this function's documented contract.
+    try:
+        children = sorted(_agents_root(project_root).iterdir())
+    except OSError:
+        return None
+    for child in children:
         conf = child / "local-paths.conf"
         if not conf.is_file():
             continue

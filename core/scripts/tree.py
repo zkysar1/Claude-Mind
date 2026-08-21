@@ -31,8 +31,43 @@ except ImportError:
 from _paths import PROJECT_ROOT, WORLD_DIR, META_DIR, CONFIG_DIR, resolve_file_path
 
 REPO_ROOT = str(PROJECT_ROOT)
-TREE_PATH = str(WORLD_DIR / "knowledge" / "tree" / "_tree.yaml")
 TREE_CONFIG = str(CONFIG_DIR / "tree.yaml")
+
+
+def _tree_path() -> str:
+    """The tree store path, computed at ACCESS time — never at import.
+
+    WORLD_DIR is None on a pre-init deployment (no world configured yet), and
+    the daemon imports this module via endpoints load_all() BEFORE /start can
+    configure anything — the prior eager module-level `WORLD_DIR / ...` killed
+    the daemon at import on a bare clone (g-367-03, measured 2026-08-21 on a
+    pristine coach-mind clone; same class as the 2026-06-14 empty-conf incident
+    in _paths.py). Failing here at USE time with a clear message preserves the
+    _paths.py hard-cut defense (loud, no silent PROJECT_ROOT/world fallback)
+    without taking the daemon down before /health exists.
+
+    An explicitly-set module-level TREE_PATH wins (tests monkeypatch
+    `tree.TREE_PATH`; a real setattr shadows the PEP 562 __getattr__ below,
+    and this globals() check makes in-module callers honor it too).
+    """
+    tp = globals().get("TREE_PATH")
+    if tp is not None:
+        return str(tp)
+    import _paths
+    wd = _paths.WORLD_DIR
+    if wd is None:
+        raise RuntimeError(
+            "world not configured (WORLD_DIR unresolved) — tree storage is "
+            "unavailable until /start configures world paths (g-367-03)"
+        )
+    return str(wd / "knowledge" / "tree" / "_tree.yaml")
+
+
+def __getattr__(name: str):
+    """PEP 562: serve TREE_PATH lazily to external attribute readers."""
+    if name == "TREE_PATH":
+        return _tree_path()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # Override key convention: "<config-file-stem>.<in-file-dotted-path>".
@@ -313,10 +348,10 @@ def _enforce_dedup(parent_key, child_key, summary, tree_dict, no_dedup=False, co
 
 def read_tree():
     """Parse _tree.yaml and return the full dict."""
-    if not os.path.exists(TREE_PATH):
-        print("Tree file not found: " + TREE_PATH, file=sys.stderr)
+    if not os.path.exists(_tree_path()):
+        print("Tree file not found: " + _tree_path(), file=sys.stderr)
         sys.exit(1)
-    with open(TREE_PATH, "r", encoding="utf-8") as f:
+    with open(_tree_path(), "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
     if not isinstance(data, dict) or "nodes" not in data:
         print("Invalid tree file: missing 'nodes' key", file=sys.stderr)
@@ -330,9 +365,9 @@ def safe_read_tree():
     l1-emergence-detector) where missing tree is "no signal," not a CLI
     error. CLI commands keep using read_tree() for the loud-fail behavior."""
     try:
-        if not os.path.exists(TREE_PATH):
+        if not os.path.exists(_tree_path()):
             return None
-        with open(TREE_PATH, "r", encoding="utf-8") as f:
+        with open(_tree_path(), "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
         if not isinstance(data, dict) or "nodes" not in data:
             return None
@@ -345,7 +380,7 @@ def write_tree(data):
     """Atomic write with locking, history, and sort_keys=False to preserve key order."""
     from _fileops import acquire_lock, release_lock, save_history, append_changelog, resolve_base_dir, _agent_name
     data["last_updated"] = date.today().isoformat()
-    path = Path(TREE_PATH)
+    path = Path(_tree_path())
     path.parent.mkdir(parents=True, exist_ok=True)
     base_dir = resolve_base_dir(path)
     lock_path = path.with_suffix(".lock")
@@ -361,7 +396,7 @@ def write_tree(data):
                 with open(tmp, "w", encoding="utf-8") as f:
                     yaml.dump(data, f, default_flow_style=None, sort_keys=False,
                               allow_unicode=True, width=200)
-                os.replace(tmp, TREE_PATH)
+                os.replace(tmp, _tree_path())
                 break
             except (PermissionError, OSError) as e:
                 if attempt == max_retries - 1:
@@ -2177,7 +2212,7 @@ def cmd_record_maintenance(args):
         captured["decompose_count"] = decompose_count
         return tree
 
-    locked_modify_yaml(TREE_PATH, _do_record)
+    locked_modify_yaml(_tree_path(), _do_record)
     maintenance = captured["maintenance"]
     distill_count = captured["distill_count"]
     decompose_count = captured["decompose_count"]
@@ -2352,7 +2387,7 @@ def cmd_set(args):
         data["last_updated"] = date.today().isoformat()
         return data
 
-    locked_modify_yaml(TREE_PATH, _do_set)
+    locked_modify_yaml(_tree_path(), _do_set)
 
     # : post-lock body-presence advisory — enriching a bodiless node
     # is the desync signature (registered, enriched, retrieved, no content).
@@ -2520,7 +2555,7 @@ def cmd_add_child(args):
         tree["last_updated"] = date.today().isoformat()
         return tree
 
-    locked_modify_yaml(TREE_PATH, _do_add)
+    locked_modify_yaml(_tree_path(), _do_add)
 
     # : post-lock body-presence advisory. Silent on the canonical
     # body-first /tree add flow; fires when a registration lands with no body.
@@ -2617,7 +2652,7 @@ def cmd_remove_child(args):
         data["last_updated"] = date.today().isoformat()
         return data
 
-    locked_modify_yaml(TREE_PATH, _do_remove)
+    locked_modify_yaml(_tree_path(), _do_remove)
 
     # : sweep dangling cross-refs in dependent stores (experience,
     # reasoning-bank, guardrails). Without this, deleting a tree node leaves
@@ -2710,7 +2745,7 @@ def cmd_increment(args):
         captured["node"] = dict(node)
         return data
 
-    locked_modify_yaml(TREE_PATH, _bump)
+    locked_modify_yaml(_tree_path(), _bump)
 
     out = apply_defaults(captured["node"])
     out["key"] = key
@@ -3000,7 +3035,7 @@ def cmd_batch(args):
         tree["last_updated"] = date.today().isoformat()
         return tree
 
-    locked_modify_yaml(TREE_PATH, _do_batch)
+    locked_modify_yaml(_tree_path(), _do_batch)
 
     # : post-lock body-presence advisory for nodes this batch
     # REGISTERED (add-child) or ENRICHED (set). Deliberately excludes parents
@@ -3201,7 +3236,7 @@ def cmd_propagate(args):
         tree["last_updated"] = date.today().isoformat()
         return tree
 
-    locked_modify_yaml(TREE_PATH, _do_propagate)
+    locked_modify_yaml(_tree_path(), _do_propagate)
 
     result = {
         "source_node": key,
@@ -3253,7 +3288,7 @@ def cmd_reconcile_capabilities(args):
         tree["last_updated"] = date.today().isoformat()
         return tree
 
-    locked_modify_yaml(TREE_PATH, _do_reconcile)
+    locked_modify_yaml(_tree_path(), _do_reconcile)
 
     result = {
         "reconciled": len(captured["changes"]),
@@ -3408,7 +3443,7 @@ def cmd_reparent(args):
         tree["last_updated"] = date.today().isoformat()
         return tree
 
-    locked_modify_yaml(TREE_PATH, _do_reparent)
+    locked_modify_yaml(_tree_path(), _do_reparent)
 
     # S9: log the L1 pick for this reparent (fail-open). Crosses-L1
     # reparents are the highest-signal events in the log — they directly
