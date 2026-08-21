@@ -122,6 +122,55 @@ end with full context.
    Emit a CAPABILITY UNLOCK log line when the level rises.
 ```
 
+## Section C2 — Tree Freshness Sweep (read-side)
+
+The write steps above encode NEW content. This sweep keeps EXISTING nodes
+truthful — it operationalizes `knowledge-freshness.md` + guard-1710 (sweep
+every artifact still asserting a corrected conclusion) + guard-1538
+(gap/absence claims need re-verification) inside the encoding lanes, where
+the session's evidence is still in context. Added 2026-08-21 after a
+measured miss: a node's "Open (unfiled)" claim sat stale ~3 weeks through
+every agent's encode passes because no lane ever re-read standing claims —
+the user had to prompt the tree review that found it in one probe.
+
+Inputs — bounded to nodes whose subject the session actually touched:
+(a) every node retrieved this pass (Lane 1.0 snapshot / Phase 8
+retrieval-session), and (b) the catalog node of any subsystem where the
+session ran a MAJOR OPERATION (promotion, seed plant, migration, incident,
+measurement campaign) — probe `tree-find-node.sh --text "<subsystem>"
+--top 3` for those.
+
+For each such node, four checks:
+
+```
+1. CLAIM RECONCILIATION — scan for standing claims: "Open", "unfiled",
+   "pending", "not yet", "TODO", "CONTESTED", "no X exists", "nothing
+   does Y", dated as-of assertions. Did this session's work COMPLETE or
+   OVERTAKE one? → rewrite the claim IN PLACE ("RESOLVED (g-NNN): ...",
+   keeping enough of the original that the history reads). Never retire
+   on age alone — evidence only.
+2. CONTRADICTION CHECK — does session EVIDENCE (a measurement, probe
+   output, live-fire outcome) contradict what the node asserts? →
+   correct the wrong sentence WHERE IT STANDS, citing the evidence
+   inline (date, box, command). A contradiction outranks an addendum:
+   never append a correction below text that still asserts the old
+   conclusion (guard-1710).
+3. LIVE-FIRE ADDENDUM — if the operation's catalog node keeps dated
+   addenda (## YYYY-MM-DD sections), append this session's event in the
+   node's OWN format: what fired, what held, what was newly filed,
+   traces (rb/guard/goal ids).
+4. BOLSTER AGAINST REPEAT — if the session hit a mistake or wrong path
+   that an EXISTING node could have prevented but its text lacked the
+   warning: add the missing gotcha / decision rule to that node, so the
+   next reader fails differently. If the node HAD the warning and it
+   was not retrieved, that is a RETRIEVAL gap — route to the blind-spot
+   lens (encode-session Lane 4.2), not a node edit.
+```
+
+Every edit follows write step 6 (front matter + T21) and Section D
+coordination. Report counts per pass: claims reconciled / contradictions
+corrected / addenda appended / nodes bolstered.
+
 ## Section D — Cross-Agent Coordination (T23)
 
 Before writing to a tree node, check for in-flight encoding by another
@@ -149,14 +198,44 @@ Both lanes are consumers for `knowledge_debt` entries filed by:
 - `/respond` Step 7.5f (E6) — review-finding debt
 - aspirations-execute Phase 4.5 (E7) — probe-outcome surprise dual-write
 
-Auto-resolve on read: if `node.last_updated >= debt.created` (date-only,
-[:10] slice on both), the encoding pass that landed already covered the
-debt — mark `resolved=true`. Filter resolved entries when writing back.
+Algorithm (SSOT — consumers carry the invocation and this pointer, never a
+re-statement. Reconciled 2026-08-21: this section said `>= 5` while the
+operational lane said `>= 2` and the null-key lane below existed only in
+the skill — the exact drift this digest exists to prevent):
 
-Cadence-driven inline resolution: HIGH-priority OR sessions_deferred >= 5
-debts are tackled inline in the current pass (Lane 1.6 / Phase 8 second
-pass). Lower-priority entries carry forward via `sessions_deferred + 1`,
-dropped at 10 (configurable).
+```
+1. AUTO-RESOLVE on node update: node.last_updated >= debt.created —
+   date-only [:10] compare on BOTH sides (node stores date-only; >= not >
+   so a same-day node edit counts) → resolution_method:
+   auto_resolved_by_node_update.
+2. NULL-KEY LANE (the MAJORITY shape, not an anomaly — /respond files
+   debt precisely when no single node covers the correction, so
+   node_key=null is DESIGNED; g-115-5150): extract the first g-\d+-\d+
+   from reason / routed_goal / source_goal; derive asp-<NNN> from it
+   (aspirations-read.sh --id takes an ASPIRATION id — a goal id returns
+   not_found, which reads like "the goal is gone"); routed goal
+   status=completed → auto_resolved_by_routed_goal. No goal id, or goal
+   not completed → fall through. NEVER resolve null-key debt on age —
+   "it got old" is not evidence the gap was filled.
+3. INLINE RESOLUTION when priority==HIGH OR sessions_deferred >= 2: read
+   the target, resolve from in-context knowledge or a quick probe
+   (front matter last_update_trigger: {type: "debt-reconciliation"});
+   else sessions_deferred += 1 and carry.
+4. MAX-DEFER CEILING (10): DURABLE DROP FIRST — write the full reason to
+   execution-diary BEFORE removing the entry (a dropped entry's only
+   other trace is a log line that dies with the session; null-key
+   renders as "DROPPED debt for null", naming nothing recoverable). A
+   HIGH debt at ceiling ALSO files a MEDIUM Investigate — 10 failed
+   sweeps is a finding about the RESOLVER. Then max_defer_dropped.
+5. WRITE-BACK: filter resolved entries yourself and wm-set the slot.
+   knowledge_debt is NOT in item_stale_minutes, so wm-prune's
+   array-item gate is unreachable for this slot — resolved entries
+   otherwise live forever.
+```
+
+RMW caveat: the sweep is wm-read → mutate → wm-set across separate calls;
+a concurrent `wm-append knowledge_debt` between them is lost. Accepted
+limitation, same as consolidate Step 2.25.
 
 ## Section F — Chunked Encoding (E13)
 

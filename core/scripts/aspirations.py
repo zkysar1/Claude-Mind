@@ -543,18 +543,13 @@ def validate_goal(goal):
     if "reallocatable" in goal:
         if not isinstance(goal["reallocatable"], bool):
             raise ValueError(f"Goal {goal['id']}: reallocatable must be a boolean")
-    # Validate depends_on field (output-passing dependencies, arXiv 2603.28990)
-    if "depends_on" in goal:
-        deps = goal["depends_on"]
-        if not isinstance(deps, list):
-            raise ValueError(f"Goal {goal['id']}: depends_on must be a list")
-        raw_blocked = goal.get("blocked_by", [])
-        blocked_by = set(raw_blocked if isinstance(raw_blocked, list) else [raw_blocked])
-        for dep in deps:
-            if not isinstance(dep, dict) or "goal_id" not in dep:
-                raise ValueError(f"Goal {goal['id']}: each depends_on entry must have 'goal_id'")
-            if dep["goal_id"] not in blocked_by:
-                raise ValueError(f"Goal {goal['id']}: depends_on goal_id '{dep['goal_id']}' must also appear in blocked_by")
+    # Validate depends_on field (output-passing dependencies, arXiv 2603.28990).
+    # Delegates to the shared gates.depends_on_consistency module ()
+    # for the same guard-547 reason as the two gates below it: this check lived
+    # here alone for the life of the field, and the daemon _validate_goal subset
+    # omits it — so under no-python-cli-fallback it was inert on every real
+    # filing. 5 of 6 live carriers violate the invariant it "enforced".
+    _check_depends_on_consistency(goal)
     # Validate abstained_by field (self-abstention, arXiv 2603.28990)
     if "abstained_by" in goal:
         val = goal["abstained_by"]
@@ -637,6 +632,19 @@ from gates.prose_verification import (  # noqa: E402
     evaluate as _prose_verification_evaluate,
 )
 from gates.check_schema import evaluate as _check_schema_evaluate  # noqa: E402
+from gates.depends_on_consistency import (  # noqa: E402
+    evaluate as _depends_on_consistency_evaluate,
+)
+
+
+def _check_depends_on_consistency(goal):
+    # Delegates to the shared gate, raising ValueError so validate_goal's
+    # existing contract (raise → caller surfaces) is preserved. The daemon
+    # calls the SAME evaluate() from _assert_depends_on_consistency, so the two
+    # write paths can no longer drift apart (guard-547).
+    result = _depends_on_consistency_evaluate(goal)
+    if result["would_block"]:
+        raise ValueError(result["message"])
 
 
 def _check_prose_verification_drift(goal):

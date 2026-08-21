@@ -427,6 +427,42 @@ gates:
 
   # ─── Asymmetry: FN > FP (medium-high) ────────────────────────────────
 
+  - id: depends-on-consistency
+    script: core/scripts/gates/depends_on_consistency.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: "mind_api/src/endpoints/aspirations_write.py", phase: "goal add validation" }
+      - { file: "mind_api/src/endpoints/aspirations_write.py", phase: "aspiration add validation" }
+      - { file: "core/scripts/aspirations.py", phase: "goal write validation" }
+    dominant_risk: FN
+    asymmetry_magnitude: medium
+    keyword_bias: strict
+    override_flag: null
+    fp_cost: low
+    fn_cost: medium
+    fp_description: "Author must add the prerequisite ids to blocked_by and write depends_on as {goal_id, expects} objects (~1 min)."
+    fn_description: "A goal carrying depends_on with no matching blocked_by is invisible to goal-selector's sequencing predicate, so it is offered for execution as if it had no prerequisite. Two same-day instances (g-335-1319/20/21, g-326-495/499); in the first the scorer offered a frontend goal at rank 1 while a partner held a live claim on the backend goal authoring the route it would POST to."
+    rb_evidence: ["g-115-6979", "g-335-1320"]
+    tuning_notes: >-
+      NEW 2026-08-20 (g-115-6979). Third instance of the CLI-only-check
+      orphaning this file already documents for prose-verification-drift
+      below: aspirations.py::validate_goal enforced goal-schemas.md:636
+      ("each depends_on.goal_id MUST also appear in blocked_by") for the life
+      of the field, while the daemon _validate_goal subset omitted it — so
+      under no-python-cli-fallback it was inert on every real filing.
+      Measured over 2771 live goal records: 6 non-empty depends_on carriers,
+      exactly 1 conforming; 4 used bare id strings instead of
+      {goal_id, expects} dicts. Wired at the ADD sites ONLY, never in
+      _validate_goal — 5 live records violate the invariant, and routing it
+      through update_goal's in-lock candidate validation would wedge every
+      status change on them (same reasoning as _assert_no_invalid_checks).
+      Expect a LOW firing rate: the field appears on 8 of 2771 records. A
+      long noop streak here is genuine rarity, not the orphaning above —
+      distinguish them by checking that the ADD-site call still exists,
+      not by the streak length.
+    retirement_eligible: false
+
   - id: prose-verification-drift
     script: core/scripts/aspirations.py
     embedded: true

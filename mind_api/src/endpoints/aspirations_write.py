@@ -111,6 +111,7 @@ from gates.capability_route import evaluate as _cap_route_eval, ACTIVE_AGENTS as
 from gates.lane_pin import evaluate as _lane_pin_eval  # noqa: E402
 from gates.category_suggest import evaluate as _category_suggest_eval  # noqa: E402
 from gates.description_length import evaluate as _desc_len_eval  # noqa: E402
+from gates.depends_on_consistency import evaluate as _depends_on_eval  # noqa: E402
 from gates.approval_reference import evaluate as _approval_ref_eval  # noqa: E402
 from gates.prose_verification import evaluate as _prose_verification_eval  # noqa: E402
 from gates.check_schema import evaluate as _check_schema_eval  # noqa: E402
@@ -507,6 +508,39 @@ def _assert_no_invalid_checks(goal: Dict[str, Any], *, ctx=None) -> None:
     )
     if verdict["warning"]:
         print(f"[daemon] {verdict['warning']}", file=sys.stderr)
+    if verdict["would_block"]:
+        raise ValueError(verdict["message"])
+
+
+def _assert_depends_on_consistency(goal: Dict[str, Any], *, ctx=None) -> None:
+    """Raise ValueError when depends_on is not backed by blocked_by ().
+
+    THIRD SIBLING of _assert_no_prose_drift / _assert_no_invalid_checks, and the
+    same orphaning story: aspirations.py::validate_goal has enforced
+    goal-schemas.md:636 ("each depends_on.goal_id MUST also appear in
+    blocked_by") since the field existed, but the daemon _validate_goal subset
+    omits it, and under no-python-cli-fallback the daemon IS the live write path.
+    Measured 2026-08-20 over 2771 live goals: 6 non-empty depends_on carriers,
+    exactly 1 conforming.
+
+    The failure this prevents is quiet. blocked_by is the only field
+    goal-selector.py reads for sequencing, so a goal carrying depends_on alone is
+    offered for execution exactly as if it had no prerequisite — it LOOKS
+    sequenced and is not. Two instances landed the same day (g-335-1319/20/21 and
+    g-326-495/499): in the first, the scorer offered a frontend goal at rank 1
+    while a partner held a live claim on the backend goal authoring the very
+    route it would POST to. Both halves look correct in isolation, which is what
+    makes it a divergence engine rather than a merge conflict.
+
+    ADD SITES ONLY — see the module docstring's wiring note. Five live records
+    violate this invariant today; routing it through _validate_goal would wedge
+    every status change on them.
+    """
+    verdict = _depends_on_eval(
+        goal,
+        meta_dir=(ctx.paths.meta if ctx is not None else None),
+        agent_name=((ctx.paths.agent_name or None) if ctx is not None else None),
+    )
     if verdict["would_block"]:
         raise ValueError(verdict["message"])
 
@@ -1897,6 +1931,11 @@ def add_goal(ctx) -> "Response":  # type: ignore[name-defined]
                 # a plausible-looking type name that predicate.py cannot dispatch
                 # — the shape of 18 of the 19 invalid checks now in the queue.
                 _assert_no_invalid_checks(goal, ctx=ctx)
+                # depends_on/blocked_by parity (). Third instance of
+                # the same CLI-only-check orphaning: a goal carrying depends_on
+                # with no matching blocked_by is invisible to the selector's
+                # sequencing predicate and gets offered as if unblocked.
+                _assert_depends_on_consistency(goal, ctx=ctx)
             except ValueError as e:
                 return Response.error(400, "validation_failed", str(e))
 
@@ -6689,6 +6728,7 @@ def _validate_aspiration(asp: Dict[str, Any], *, auto_id: bool = False) -> None:
         # validator); telemetry falls back to the module-default meta_dir.
         _assert_no_prose_drift(goal)
         _assert_no_invalid_checks(goal)  # , same ADD-path parity
+        _assert_depends_on_consistency(goal)  # , same ADD-path parity
 
 
 # ---------------------------------------------------------------------------

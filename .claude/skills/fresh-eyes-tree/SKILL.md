@@ -326,12 +326,29 @@ print(json.dumps({
 # for an unrelated reason, so treat the catch as luck and this step as the method.
 #
 # RUN THIS BEFORE writing ANY sentence about restructure/decompose/distill activity.
-Bash: git log --all --since="14 days ago" --date=short --format="%h %ad %s" \
+# NO `--since` (g-115-6959 / guard-4539), and this site is the one where it
+# mattered most. `git log --since` is a TRAVERSAL CUTOFF, not a filter: git
+# walks from the tip and STOPS at the first commit older than the cutoff, so
+# ONE old-dated commit at the tip hides every recent commit behind it (measured
+# on a fixture 2026-08-20: 7 commits 67 SECONDS old returned EMPTY). This probe
+# exists PRECISELY to refute a false "the lane is idle" finding — so an empty
+# result here re-authorizes the exact wrong conclusion the step was written to
+# prevent, and the 2026-07-31 incident above would repeat with git itself as
+# the false witness. Filter on the committer timestamp instead.
+# NO count bound either, and that is measured, not lazy: this probe does not
+# pass --no-merges, and the 14-day window holds 5613 commits (2026-08-20) — a
+# --max-count=5000 draft DROPPED a real row here on its first run. The full
+# --all walk without --name-only costs 0.156s against 18010 commits, so a bound
+# buys nothing and can only reintroduce a silent miss. Widening to 60 days makes
+# that worse, not better.
+Bash: CUT=$(( $(date +%s) - 1209600 ))   # 14 days; 60 days = 5184000
+      git log --all --date=short --format="%ct %h %ad %s" \
+        | awk -v c="$CUT" '$1 >= c' | cut -d' ' -f2- \
         | grep -iE "decompose|distill|reparent|prune|split.*node|tree maintain" | head -15
   → If this returns rows, the lane is ACTIVE regardless of what S9 shows. Report
     BOTH, and attribute activity to git, never to the pick-log's silence.
   → If it returns nothing, you still may not conclude "idle" from S9 alone — widen
-    the window before making the claim (--since="60 days ago").
+    the window before making the claim (set CUT to 5184000 seconds back = 60 days).
 
 # 2.3 Tree growth log — L1-OPS-ONLY history (L1_ADD / L1_RENAME).
 # READ THIS BEFORE CONCLUDING THE LOG IS BROKEN. Its only non-test writers are

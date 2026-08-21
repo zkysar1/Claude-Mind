@@ -171,10 +171,21 @@ def test_every_spawn_log_writer_is_capped():
 def test_the_cap_precedes_each_spawn_redirect():
     """Order matters: capping AFTER the redirect would bound the file only on
     the next spawn, one whole daemon lifetime late."""
-    for fname, redirect in (("mind-api-start.sh", '$py_cmd -m mind_api.src >> "$SPAWN_LOG"'),
-                            ("_runtime.sh", '$py_cmd -m mind_api.src >> "$RT_SPAWN_LOG"')):
+    # Match the two halves SEPARATELY rather than as one contiguous literal:
+    # the spawn line legitimately carries other redirections between them
+    # ( added `</dev/null` so the daemon inherits no caller stdin), and
+    # a contiguous-substring matcher turns that into a StopIteration whose
+    # traceback says nothing about what actually changed (guard-4432 — a
+    # literal-token detector must fail legibly, never opaquely).
+    for fname, spawn, redirect in (("mind-api-start.sh", "$py_cmd -m mind_api.src", '>> "$SPAWN_LOG"'),
+                                   ("_runtime.sh", "$py_cmd -m mind_api.src", '>> "$RT_SPAWN_LOG"')):
         lines = (CORE_SCRIPTS / fname).read_text(encoding="utf-8").splitlines()
-        spawn_i = next(i for i, ln in enumerate(lines) if redirect in ln)
+        matches = [i for i, ln in enumerate(lines) if spawn in ln and redirect in ln]
+        assert matches, (
+            f"{fname}: no line contains both {spawn!r} and {redirect!r}. The spawn "
+            f"redirect moved or was renamed — re-point this test at it rather than "
+            f"deleting the assertion.")
+        spawn_i = matches[0]
         caps = [i for i, ln in enumerate(lines) if "cap_log_file" in ln and not ln.strip().startswith("#")]
         assert any(i < spawn_i for i in caps), (
             f"{fname}: no cap_log_file call before the spawn redirect at line {spawn_i + 1}")

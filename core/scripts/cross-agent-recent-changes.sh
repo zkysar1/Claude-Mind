@@ -107,7 +107,41 @@ fi
 # Fail-open: if git exits non-zero (not a repo, bad timestamp), we emit
 # empty and exit 0. The caller fresh-eyes-code Phase 1 already handles
 # empty target lists by falling through to Phase 4 "no target files" finding.
-GIT_FILES=$(git log --since="$SINCE" --name-only --pretty=format: 2>/dev/null | sed '/^$/d' | sort -u || true)
+# NO `--since` ( / guard-4539). `git log --since` is a TRAVERSAL
+# CUTOFF, not a filter: git walks from the tip and STOPS at the first commit
+# older than the cutoff, so ONE old-dated commit at the tip hides every recent
+# commit behind it. Measured on a fixture 2026-08-20: 7 commits 67 SECONDS old
+# behind one old-dated tip returned EMPTY. Commit dates go non-monotonic in
+# ordinary operation (rebase, cherry-pick, --amend --date, a merged long-lived
+# branch, peer clock skew).
+# Triaged as ACTION-AUTHORIZING, not reports-only: this list is fresh-eyes-code's
+# review TARGET SET, and empty makes Phase 1 fall through to Phase 4 "no target
+# files" — i.e. a review that should have happened silently does not, and the
+# output is indistinguishable from a genuinely quiet window.
+# $SINCE is an ISO stamp, so the cutoff is converted with python3 (already this
+# script's idiom, twice below) rather than `date -d`, which is GNU-only.
+SINCE_EPOCH=$(SINCE="$SINCE" python3 - <<'PYEOF' 2>/dev/null || true
+import datetime, os, sys
+raw = (os.environ.get("SINCE") or "").strip().replace("Z", "+00:00")
+try:
+    print(int(datetime.datetime.fromisoformat(raw).timestamp()))
+except Exception:
+    sys.exit(2)
+PYEOF
+)
+if [ -n "$SINCE_EPOCH" ]; then
+  GIT_FILES=$(git log --name-only --pretty=format:"%x01%ct" 2>/dev/null \
+    | awk -v c="$SINCE_EPOCH" '
+        /^\x01/ { keep = (substr($0,2) + 0) >= c; next }
+        keep && length($0) { print }
+      ' | sed '/^$/d' | sort -u || true)
+else
+  # Unparseable $SINCE: fail OPEN to the whole history rather than to empty.
+  # This probe scopes a review, so an over-broad target list costs reading time
+  # while an empty one silently cancels the review.
+  echo "cross-agent-recent-changes.sh: could not parse --since '$SINCE' to epoch; scanning full history" >&2
+  GIT_FILES=$(git log --name-only --pretty=format: 2>/dev/null | sed '/^$/d' | sort -u || true)
+fi
 
 # Optional scope filter. SCOPE is a plain prefix (e.g. "core/"), not a regex.
 if [ -n "$SCOPE" ]; then

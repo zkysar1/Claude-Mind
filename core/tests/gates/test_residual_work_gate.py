@@ -340,3 +340,79 @@ class TestBuildSuccessor:
 
     def test_active_statuses_constant(self):
         assert ACTIVE_STATUSES == ("pending", "in-progress")
+
+
+# ---------------------------------------------------------------------------
+# Accept path 4 — provenance disclaimer vs genuine residual ()
+# ---------------------------------------------------------------------------
+
+# The exact clause that tripped the gate closing  (zeta, cc-02,
+# 2026-08-20). Verbatim on purpose: guard-920 — a regression test must
+# replicate the literal production input, not a contract-ideal paraphrase.
+G335_1320_CLAUSE = (
+    "No code was written by me and no PR was opened; the work landed in "
+    "Vinheim-Web-App PR #229 (commit 410d953, 'feat(sessions): the unified "
+    "session view')."
+)
+
+
+class TestProvenanceAcceptPath:
+    def test_g335_1320_clause_no_longer_blocks(self):
+        """THE REGRESSION: attribution + artifact ref must not block."""
+        r = _eval(G335_1320_CLAUSE)
+        assert r["would_block"] is False
+        assert r["provenance_found"] is True
+        # The marker still MATCHES — the fix is an accept path, not a
+        # weakened marker. Losing the match would hide the case from audit.
+        assert "no_code_written" in r["matched_markers"]
+
+    def test_positive_control_genuine_residual_still_blocks(self):
+        """THE CONTROL: same marker, no attribution, no artifact -> blocks.
+
+        If this ever goes green the fix has over-widened and the gate has
+        stopped catching real stranded work — which is the failure mode the
+        gate exists to prevent, and strictly worse than the false positive
+        being fixed here.
+        """
+        r = _eval("No code was written; the implementation still needs doing.")
+        assert r["would_block"] is True
+        assert r["provenance_found"] is False
+
+    def test_attribution_without_artifact_still_blocks(self):
+        """Prose alone is unfalsifiable — both conjuncts are required."""
+        r = _eval("No code was written; the work landed in another repo.")
+        assert r["would_block"] is True
+        assert r["provenance_found"] is False
+
+    def test_artifact_without_attribution_still_blocks(self):
+        """A bare sha near a residual is a cross-reference, not provenance."""
+        r = _eval("No code was written. Context for the reviewer: 410d953.")
+        assert r["would_block"] is True
+        assert r["provenance_found"] is False
+
+    def test_provenance_is_clause_scoped_not_note_scoped(self):
+        """A citation in a DIFFERENT sentence must not suppress the marker.
+
+        This is the blanket-bypass failure mode: long outcome_notes routinely
+        cite some merged PR about an unrelated matter, and a note-wide scan
+        would let any of them lift a genuine residual.
+        """
+        note = ("Background: the parser rewrite landed in PR #101 "
+                "(commit 1a2b3c4). Separately, no code was written for the "
+                "retry path and it still needs implementing.")
+        r = _eval(note)
+        assert r["would_block"] is True
+        assert r["provenance_found"] is False
+
+    def test_explicit_override_still_outranks_provenance(self):
+        """Precedence (): an EXPLICIT signal always outranks an
+        INFERRED one, and a passed override is always audited."""
+        r = _eval(G335_1320_CLAUSE, override="justified")
+        assert r["override_applied"] == "justified"
+        assert r["would_block"] is False
+
+    def test_hex_word_is_not_read_as_a_commit(self):
+        """'defaced' is 7 chars of [a-f] — the digit requirement excludes it."""
+        r = _eval("No code was written; the work landed in the defaced repo.")
+        assert r["provenance_found"] is False
+        assert r["would_block"] is True

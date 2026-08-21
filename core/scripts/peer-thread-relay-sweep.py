@@ -53,11 +53,32 @@ ESCALATE_AGE_DAYS = 1.0
 
 
 def _run(script, *args, timeout=90):
-    """Run a core/scripts wrapper. guard-580: never a bare "bash" argv[0]."""
+    """Run a core/scripts wrapper. guard-580: never a bare "bash" argv[0].
+
+    On FAILURE with no stdout, fall back to stderr — that is where the
+    wrappers put their refusal, so returning stdout alone reported every
+    failure as `output: ""`. Measured 2026-08-20 (zeta, cc-02): the
+    close_acked failure row for g-115-6985 read {rc: 1, output: ""} while
+    the discarded stderr carried 12,088 bytes naming the actual refusal
+    (uncommitted-work-gate, stranded_would_block). A failure reporter that
+    drops the failure's own diagnostic is indistinguishable from a silent
+    wrapper, and sends the reader hunting a phantom.
+
+    Deliberately NOT `2>&1` and deliberately NOT applied on success:
+    guard-1963 (never merge stderr into a captured data stream) — the
+    substitution fires only when rc != 0 AND stdout is empty, i.e. when
+    there is no payload to corrupt. load_goals/load_board discard the rc
+    and json-parse this value, but both guard the parse and skip
+    unparseable input, so their behaviour is unchanged (an empty string and
+    a stderr blob both fail to parse and yield the same []).
+    """
     try:
         p = subprocess.run(bash_cmd(script, *args), capture_output=True,
                            text=True, timeout=timeout)
-        return p.stdout, p.returncode
+        out = p.stdout
+        if p.returncode != 0 and not (out or "").strip():
+            out = p.stderr or ""
+        return out, p.returncode
     except (OSError, subprocess.SubprocessError):
         return "", 1
 

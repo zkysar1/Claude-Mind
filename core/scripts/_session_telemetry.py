@@ -45,6 +45,20 @@ import socket
 import datetime
 from pathlib import Path
 
+# Agent-dir constants, never literals (CLAUDE.md "Agent-dir Resolution": a
+# literal copy is invisible to the audit greps and silently resolves to nothing
+# after a relocation). This module builds agent paths from an INJECTED
+# project_root — the tests pass a tmp_path — so it cannot use agent_dir()/
+# agent_sessions_root(), which re-derive from the real PROJECT_ROOT. Importing
+# the constants keeps the injectable root AND keeps the sites greppable.
+# Deliberately NOT wrapped in a literal fallback: a telemetry module that cannot
+# resolve agent dirs must fail loudly at import, not mis-reap quietly.
+try:
+    from _paths import AGENTS_PARENT_DIR, SESSIONS_DIRNAME, SESSION_DIRNAME
+except ImportError:  # pragma: no cover - direct-script import path
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _paths import AGENTS_PARENT_DIR, SESSIONS_DIRNAME, SESSION_DIRNAME
+
 SCHEMA_VERSION = 1
 
 # Telemetry records live under world/telemetry/<_RECORDS_SUBDIR>/<agent>/<sid>.json.
@@ -345,7 +359,8 @@ def _runner_recently_active(agent, cutoff_dt, project_root):
     pre-autocompact SID)."""
     if project_root is None:
         return True
-    hb = project_root / "agents" / agent / "session" / "runner-heartbeat"
+    hb = (project_root / AGENTS_PARENT_DIR / agent / SESSION_DIRNAME
+          / "runner-heartbeat")
     try:
         if not hb.exists():
             return False
@@ -353,6 +368,73 @@ def _runner_recently_active(agent, cutoff_dt, project_root):
         return mtime >= cutoff_dt
     except Exception:
         return True
+
+
+def _body_recently_active(agent, cutoff_dt, project_root):
+    """True if ANY worker Body of `agent` touched its per-session heartbeat
+    at/after `cutoff_dt` — i.e. a Body is alive on THIS machine.
+
+    WHY THIS EXISTS (g-115-6939). `_runner_recently_active` reads the AGENT-WIDE
+    `runner-heartbeat`, which a worker Body is designed NEVER to write: a worker
+    is `agent-state=IDLE` by design, and heartbeat-tick.sh REFUSES the agent-wide
+    write on a non-RUNNING agent. So for every worker the file is ABSENT, the
+    absent branch returns False ("no autonomous runner -> reapable"), and
+    `reap_stale_active` flips the EXECUTING Body's live record to
+    status=unknown mid-execution. Measured cc-08 2026-08-19: `reaped_ids`
+    contained the executing SID. Until this predicate existed, the 24h freshness
+    window was the ONLY thing protecting a live worker — protection by accident,
+    not by design.
+
+    This is the `check-team-state-before-silent` shape at the file level: an
+    ABSENT signal read as evidence of death, when absence is the designed steady
+    state of the population being judged.
+
+    THE SAME-BOX SIGNAL IS THE CORRECT ONE, and the choice is load-bearing.
+    heartbeat-tick.sh writes TWO per-Body heartbeats:
+      * `sessions/<SID>/body-heartbeat` — same-box, pure mtime, walk-pruned from
+        the sync (`sessions` is in owncloud_sync._EXCLUDE_DIRS), so it never
+        leaves this machine. THIS is what we read.
+      * `session/body-heartbeat-<SID>.json` — the syncable carrier. Wrong here
+        twice over: its mtime does NOT survive the sync (the file is copied, so
+        the timestamp is meaningless to an mtime comparison), and it can be
+        written by ANOTHER machine — which would make this reaper believe a
+        locally-dead agent is alive whenever it runs anywhere in the fleet, and
+        defer local orphans forever.
+    Reading same-box mtime is also consistent with the caller, which already
+    skips records whose `machine_id` is not this machine.
+
+    Fail-safe in the same direction as its sibling: ambiguity returns True (do
+    NOT reap), because reaping a live record is data corruption while leaving an
+    orphan one cycle longer is harmless."""
+    if project_root is None:
+        return True
+    sessions_root = (project_root / AGENTS_PARENT_DIR / agent
+                     / SESSIONS_DIRNAME)
+    try:
+        if not sessions_root.is_dir():
+            return False
+        for hb in sessions_root.glob("*/body-heartbeat"):
+            try:
+                mtime = datetime.datetime.fromtimestamp(hb.stat().st_mtime)
+            except Exception:
+                # A heartbeat we cannot stat is not evidence of death.
+                return True
+            if mtime >= cutoff_dt:
+                return True
+        return False
+    except Exception:
+        return True
+
+
+def _agent_recently_active(agent, cutoff_dt, project_root):
+    """True if `agent` has ANY live session on this machine — reducer OR worker.
+
+    The predicate `reap_stale_active` actually needs. `_runner_recently_active`
+    alone answers only "is a live AUTONOMOUS RUNNER present", which is a strictly
+    narrower question than "is it safe to reap this agent's active records", and
+    the gap between the two is the entire worker-Body population."""
+    return (_runner_recently_active(agent, cutoff_dt, project_root)
+            or _body_recently_active(agent, cutoff_dt, project_root))
 
 
 def reap_stale_active(world_dir=None, project_root=None, freshness_hours=24,
@@ -367,8 +449,13 @@ def reap_stale_active(world_dir=None, project_root=None, freshness_hours=24,
         so one machine never clobbers another's live record;
       * ``started_at`` is older than ``freshness_hours`` — the §8.6 #1 grace
         window; a just-force-closed record gets time to close normally first;
-      * the owning agent's autonomous runner is NOT recently alive
-        (``runner-heartbeat`` mtime older than ``liveness_hours``).
+      * the owning agent has NO live session on this machine — neither an
+        autonomous runner (agent-wide ``runner-heartbeat``) nor any worker Body
+        (``sessions/<SID>/body-heartbeat``), both by mtime against
+        ``liveness_hours``. The worker half is NOT belt-and-suspenders: a worker
+        is ``agent-state=IDLE`` by design and therefore NEVER writes the
+        agent-wide heartbeat, so before g-115-6939 every live worker read as
+        reapable and its in-flight record was corrupted mid-execution.
 
     The liveness guard is load-bearing, NOT belt-and-suspenders: an autonomous
     runner stays ``active`` for the WHOLE session (the record is immutable
@@ -420,7 +507,7 @@ def reap_stale_active(world_dir=None, project_root=None, freshness_hours=24,
                     summary["skipped_fresh"] += 1
                     continue
                 if agent not in live_cache:
-                    live_cache[agent] = _runner_recently_active(
+                    live_cache[agent] = _agent_recently_active(
                         agent, live_cutoff, pr)
                 if live_cache[agent]:
                     summary["skipped_live"] += 1

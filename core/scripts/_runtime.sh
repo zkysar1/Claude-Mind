@@ -457,8 +457,16 @@ rt_spawn() {
         # the mind-api-start.sh spawn site — the two are independent spawn paths
         # to the same file, so a cap on only one leaves the other unbounded.
         declare -F cap_log_file >/dev/null 2>&1 && cap_log_file "$RT_SPAWN_LOG"
-        cd "$PROJECT_ROOT" && \
-        $py_cmd -m mind_api.src >> "$RT_SPAWN_LOG" 2>&1 &
+        # guard-4452 (): `cd X && cmd &` backgrounds the WHOLE
+        # AND-LIST — bash parses it as `( cd X && cmd ) &` — so it forks an
+        # INTERMEDIATE SHELL that sits in do_wait for the daemon's entire life
+        # holding the caller's fds, and `disown $!` disowns THAT shell, not the
+        # daemon. Keeping `cd` on its own line makes `&` apply to a simple
+        # command, so no wrapper is created and `$!` is the daemon itself.
+        # `</dev/null` ensures the daemon inherits no caller stdin (guard-4527).
+        # Twin of the mind-api-start.sh spawn site — fix both or neither.
+        cd "$PROJECT_ROOT" || exit 1
+        $py_cmd -m mind_api.src </dev/null >> "$RT_SPAWN_LOG" 2>&1 &
         disown $! 2>/dev/null || true
     ) >/dev/null 2>&1
 }

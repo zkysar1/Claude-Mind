@@ -411,7 +411,10 @@ tag retrieves them cross-agent. Single source of truth.
   `recurring-close.sh` (β path — terminal), `experience-read.sh` (--goal mode),
   `team-state-read.sh` (--author mode), `load-conventions.sh`.
 - **Reads**: target files (via Read tool), experience traces (--goal mode),
-  team-state recent_completions (--author mode), git log (--since mode).
+  team-state recent_completions (--author mode), git history via
+  `cross-agent-recent-changes.sh --since <iso>` (that is the WRAPPER's own CLI
+  flag; the wrapper filters on committer timestamp internally and does NOT pass
+  `git log --since`, which is a traversal cutoff — g-115-6959 / guard-4539).
 - **Modifies**: board findings channel (append), journal (append), recurring
   goal state (β path only). Does NOT modify the reviewed files — findings are
   advisory; fixes happen via follow-up goals.

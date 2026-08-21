@@ -673,9 +673,18 @@ _log "spawning daemon with: $py_cmd -m mind_api.src"
 # not accumulation). Bounding that needs a check inside the daemon itself.
 cap_log_file "$SPAWN_LOG"
 
+# guard-4452 (): `cd X && cmd &` backgrounds the WHOLE AND-LIST —
+# bash parses it as `( cd X && cmd ) &` — so it forks an INTERMEDIATE SHELL
+# that sits in do_wait for the daemon's entire life holding the caller's fds,
+# and `disown $!` disowns THAT shell, not the daemon. On POSIX that wrapper is
+# never reaped: _force_kill_tree's non-Windows branch kills the child and
+# returns before it ever reads parent_pid. Keeping `cd` on its own line makes
+# `&` apply to a simple command, so no wrapper is created and `$!` is the
+# daemon itself. `</dev/null` ensures no caller stdin is inherited (guard-4527).
+# Twin of the _runtime.sh rt_spawn site — fix both or neither.
 (
-    cd "$PROJECT_ROOT" && \
-    $py_cmd -m mind_api.src >> "$SPAWN_LOG" 2>&1 &
+    cd "$PROJECT_ROOT" || exit 1
+    $py_cmd -m mind_api.src </dev/null >> "$SPAWN_LOG" 2>&1 &
     disown $! 2>/dev/null || true
 ) >/dev/null 2>&1
 

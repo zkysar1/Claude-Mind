@@ -756,7 +756,20 @@ def _record_auth_check(
     hist[prov] = hist.get(prov, 0) + 1
 
 
-DEFAULT_CARRIER_FRESH_MINUTES = 15
+# CALIBRATED AGAINST THE CARRIER'S WRITE CADENCE, NOT AGAINST THE GRACE IT
+# OVERRIDES (). A freshness window must exceed the longest plausible
+# gap between two writes of the signal it reads, or it manufactures false-stale
+# verdicts on live holders. The carrier is written by heartbeat-tick.sh, whose
+# only worker call site is worker-loop Phase -0.4 — the TOP OF EACH CYCLE, not a
+# wall-clock timer — so its write cadence IS the worker unit cadence, measured at
+# 15-92 min (.claude/skills/worker-loop/SKILL.md:162). At the former value of 15
+# the veto covered only the first 15 minutes of a cycle: a worker on a 92-minute
+# unit was demonstrably-alive 16% of the time and fell through to release for the
+# rest — the mid-execution claim pop () this veto exists to prevent.
+# 100 clears the measured 92 max with margin and stays 20 min below the
+# 120-minute foreign-sid grace, so the grace stays reachable. Both bounds are
+# pinned by test_carrier_window_brackets_the_worker_cycle_cadence.
+DEFAULT_CARRIER_FRESH_MINUTES = 100
 
 try:
     # SSOT for the reap threshold lives with the decision logic, not here — a
@@ -1464,13 +1477,16 @@ def main() -> int:
         help=f"How recent the cross-box body carrier "
              f"(<agent>/session/body-heartbeat-<SID>.json) must be for its "
              f"holder to count as demonstrably ALIVE, which HOLDS the claim "
-             f"past --foreign-sid-grace-minutes. Deliberately much shorter than "
-             f"that grace: the carrier is rewritten every heartbeat tick, so a "
-             f"live worker refreshes it continuously, while a dead one goes "
-             f"stale inside this window and then falls through to the ordinary "
-             f"grace. Raising it past the grace would make the grace "
-             f"unreachable; lowering it only reverts toward pre-g-306-208 "
-             f"behavior. Default: {DEFAULT_CARRIER_FRESH_MINUTES}.",
+             f"past --foreign-sid-grace-minutes. CALIBRATE IT AGAINST THE "
+             f"CARRIER'S WRITE CADENCE, not against that grace. The carrier is "
+             f"NOT refreshed continuously: heartbeat-tick.sh writes it, and its "
+             f"only worker call site is worker-loop Phase -0.4 — the top of each "
+             f"cycle — so a worker mid-unit writes nothing, and measured unit "
+             f"gaps run 15-92 min. A window under that gap reports a live worker "
+             f"stale and releases its claim mid-execution. Bounded on BOTH "
+             f"sides: above the measured gap, and below the grace (at or past "
+             f"the grace the grace becomes unreachable). Default: "
+             f"{DEFAULT_CARRIER_FRESH_MINUTES}.",
     )
     parser.add_argument(
         "--completion-note-min-chars",

@@ -407,6 +407,25 @@ direction); this one makes it too LOW, so it MANUFACTURES findings — the direc
 puts a fabricated lesson into the stores. Compute the floor at the size your marker
 actually has. (guard-4363; extends guard-3858.)
 
+⚠ **REPORT THE EXCEEDANCE PROBABILITY, NOT THE p95 COMPARISON — at small n the test above
+degenerates.** A group of n records can take only n+1 distinct corrected-rates, so the delta
+is QUANTIZED and the size-matched p95 lands *on* an attainable value; `|delta| >= p95` then
+resolves on a tie. Measured 2026-08-20 (zeta, `hostname` cc-02, `uname -r` 6.8.0-137-generic,
+584 narrative-bearing candidates, base 30.5%): a batch-discovered marker gave **+36.60pp at
+n=3 against a size-matched p95 of exactly 36.60pp** — the boolean printed SURVIVES while
+**20.9%** of random splits reached the same value. One in five is noise. Compute
+`fraction of permutations with |perm_delta| >= |delta|` and treat anything above ~5% as
+nothing, whatever the p95 says.
+
+**De-circularize BEFORE computing any of this.** A marker discovered inside a
+violation-enriched batch is partly measuring its own selection. Re-run with the batch
+EXCLUDED from both arms: on the run above, only 2 of 5 in-group records were batch members,
+and dropping them took n from 5 to 3 — which is exactly what exposed the quantization. If the
+marker has NO members outside the batch, it is a pure selection artifact; encode nothing.
+Same run, both controls replicated and are worth keeping as the instrument's self-check:
+balanced p95 **7.19pp** (vs 7.57 / 7.80 on two other boxes) and the date-free `id[11:]`
+checksum at **−2.04pp** (vs −1.00pp).
+
 ```
 1. SHARED CONDITIONS in corrected hypotheses:
    Group all corrected hypotheses

@@ -1310,8 +1310,11 @@ When sq-018 fires after goal completion:
      # subject matches, so nothing is lost); the pipeline grep re-tests against
      # `<sha>TAB<subject>`, and a hex sha cannot contain the pattern, so only a
      # true subject hit survives.
-     SHAS=$(git log --fixed-strings --grep "(${GID}):" --format='%H%x09%s' -n 50 --since=48.hours 2>/dev/null \
-              | grep -F "(${GID}):" | cut -f1)
+     # NO `--since`: a TRAVERSAL CUTOFF, not a filter — one old-dated tip
+     # silently empties this, and empty takes the WRONG branch (guard-4539).
+     SHAS=$(git log --fixed-strings --grep "(${GID}):" --format='%ct%x09%H%x09%s' -n 50 2>/dev/null \
+              | awk -v c="$(( $(date +%s) - 172800 ))" -F'\t' '$1 >= c' \
+              | grep -F "(${GID}):" | cut -f2)
      if [ -n "$SHAS" ]; then
        SCOPE=$(printf '%s\n' "$SHAS" | while IFS= read -r s; do [ -n "$s" ] && git diff-tree --no-commit-id --name-only -r "$s" 2>/dev/null; done)
      else

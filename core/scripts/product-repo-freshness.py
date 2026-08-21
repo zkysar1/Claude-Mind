@@ -91,6 +91,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 FETCH_TIMEOUT_S = 25
 DIRTY_AGE_HOURS = 24
+# --pull throttle: skip the NETWORK fetch for a repo fetched within this many
+# minutes. Local evaluation and the ff-only advance always run (see
+# pull_status). 0 = always fetch. Measured cost of an unthrottled all-repo
+# fetch on cc-08 2026-08-20: 44s across 61 repos.
+PULL_INTERVAL_MIN = 120
 
 
 def _git(repo, *args, timeout=10):
@@ -724,6 +729,206 @@ def sweep_status(repo):
     return rec
 
 
+def pull_status(repo, interval_min=PULL_INTERVAL_MIN, do_fetch=True):
+    """ACTUATE the advice this script has only ever printed ().
+
+    Every other mode here DETECTS. Line 825 renders the literal remedy
+    `git -C <repo> pull --ff-only` as text, and nothing in the tree ever runs
+    it: measured on cc-08 2026-08-20, 35 of 61 enumerated repos were behind
+    origin (worst 33), 0 ahead, 0 dirty, with 43 last fetched at the
+    provisioning clone 6.1 days earlier. The framework's response to that gap
+    has been NINE guardrails (guard-3822 / 2000 / 1385 / 3566 / 2204 / 1044 /
+    2528 / 2005 / 1805) all restating "fetch before trusting a product-repo
+    read". Nine restatements of one imperative is the signature of a
+    behavioural rule doing a mechanical job; this is the mechanical half.
+
+    WHY THE THROTTLE GATES THE FETCH AND NOT THE PULL. The obvious design --
+    "skip the repo if FETCH_HEAD is young" -- is WRONG here, and subtly:
+    `--sweep` already fetches all repos, so it refreshes FETCH_HEAD while
+    leaving every working tree exactly as stale as before. A FETCH_HEAD-keyed
+    pull throttle would therefore be SILENCED by the very sweep that just
+    proved the trees are behind. So the split follows iteration-push.sh's
+    precedent instead: the NETWORK fetch is throttled (expensive, ~44s across
+    61 repos measured), and the LOCAL evaluation always runs. The advance is
+    `merge --ff-only <upstream>`, never `git pull` -- pull would perform its
+    own unthrottled fetch and defeat the throttle it sits behind.
+
+    THE SKIP LADDER IS ORDERED BY WHAT IT PROTECTS, most irreversible first.
+    Two of its rungs encode contracts this module documents elsewhere and that
+    a naive reading inverts:
+
+      * `_dirty_paths` returns None for a FAILED PROBE and [] for a clean
+        tree. Treating None as clean would pull over a tree whose state is
+        unknown -- reintroducing the g-115-5013 vacuity one level up.
+      * `_default_branch` returns "" for UNKNOWN, and its own docstring warns
+        callers not to read that as "not the default branch". Unknown skips.
+
+    A dirty tree is NEVER touched: on a shared box those edits may be a
+    same-box partner's in-flight work, and pre-execution.md's Step 2 forbids
+    stashing or checking out over them.
+
+    OFF-DEFAULT IS A SKIP *AND* THE LOUDEST REPORT, which looks contradictory
+    until you see what it protects. 13 of 61 repos here sit on leftover
+    feature branches. Fast-forwarding one advances the FEATURE branch, so the
+    working tree still does not contain origin/main's content and a grep still
+    returns the inverted answer -- the pull would consume the anomaly while
+    fixing nothing. Switching branches is worse: the branch may belong to a
+    live goal or another agent. So the only correct action is to leave it and
+    say so loudly, which is what outcome 3 asks for.
+
+    Returns a record; never raises, never blocks.
+    """
+    name = Path(repo).name
+    rec = {"repo": str(repo), "name": name, "action": None, "detail": "",
+           "branch": None, "default_branch": None, "behind": None,
+           "ahead": None, "fetched": False}
+
+    rc, cur, _ = _git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    rec["branch"] = cur if rc == 0 else None
+    rc_u, upstream, _ = _git(repo, "rev-parse", "--abbrev-ref", "@{u}")
+    if rc_u != 0 or not upstream:
+        rec["action"] = "skipped-no-upstream"
+        rec["detail"] = "no upstream tracking ref"
+        return rec
+
+    dirty = _dirty_paths(repo)
+    if dirty is None:
+        rec["action"] = "skipped-dirty-probe-failed"
+        rec["detail"] = ("`git status` could not run — NOT an all-clear, so "
+                         "nothing was advanced")
+        return rec
+    if dirty:
+        rec["action"] = "skipped-dirty"
+        rec["detail"] = ("%d uncommitted path(s) — may be a same-box partner's "
+                         "in-flight work; never pulled over" % len(dirty))
+        return rec
+
+    default = _default_branch(repo)
+    rec["default_branch"] = default or None
+    if not default:
+        rec["action"] = "skipped-default-unknown"
+        rec["detail"] = "default branch undeterminable — not read as off-default"
+        return rec
+    if cur != default:
+        # MERGED-vs-UNMERGED is what makes this warning actionable instead of
+        # ambient. 13 undifferentiated "off-default" lines train a reader to
+        # skip the section; 3 safe-to-return plus 10 explained does not.
+        # `merge-base --is-ancestor HEAD origin/<default>` is exact: when it
+        # holds, EVERY commit on this branch is already contained in the
+        # default branch, so returning the checkout would lose nothing. When
+        # it does not, the tree holds work origin lacks and must be left
+        # alone. Reported either way -- this mode still never switches a
+        # branch, because deciding to move someone else's checkout is not a
+        # decision a per-goal precondition should be making.
+        rc_a, _, _ = _git(repo, "merge-base", "--is-ancestor", "HEAD",
+                          "origin/%s" % default)
+        rec["branch_merged_into_default"] = (rc_a == 0)
+        rc_b, bm, _ = _git(repo, "rev-list", "--count",
+                           "HEAD..origin/%s" % default)
+        rec["behind_default"] = int(bm) if rc_b == 0 and bm.isdigit() else None
+        rec["action"] = "skipped-off-default"
+        rec["detail"] = (
+            "on %s, not %s (%s behind origin/%s) — a read of this tree can "
+            "return a FALSE 'this code does not exist'. Fast-forwarding would "
+            "advance %s and leave that hazard intact, so it is reported, not "
+            "pulled. %s"
+            % (cur, default,
+               "?" if rec["behind_default"] is None else rec["behind_default"],
+               default, cur,
+               "Branch is fully merged into %s — dead residue, safe to return."
+               % default if rec["branch_merged_into_default"] else
+               "Branch holds UNMERGED work — leave it alone."))
+        return rec
+
+    gitdir = Path(repo) / ".git"
+    fetch_head = gitdir / "FETCH_HEAD" if gitdir.is_dir() else None
+    fresh = False
+    if interval_min > 0 and fetch_head is not None and fetch_head.exists():
+        age_min = (time.time() - fetch_head.stat().st_mtime) / 60.0
+        fresh = age_min < interval_min
+    if do_fetch and not fresh:
+        frc, _, ferr = _git(repo, "fetch", "--quiet", "origin",
+                            timeout=FETCH_TIMEOUT_S)
+        rec["fetched"] = (frc == 0)
+        if frc != 0:
+            rec["action"] = "skipped-fetch-failed"
+            rec["detail"] = "fetch failed: %s" % (ferr or "rc=%s" % frc)[:160]
+            return rec
+
+    rc_c, counts, _ = _git(repo, "rev-list", "--left-right", "--count",
+                           "HEAD...%s" % upstream)
+    if rc_c != 0 or len(counts.split()) != 2:
+        rec["action"] = "skipped-count-failed"
+        rec["detail"] = "could not compute ahead/behind against %s" % upstream
+        return rec
+    ahead, behind = (int(x) for x in counts.split())
+    rec["ahead"], rec["behind"] = ahead, behind
+
+    if ahead:
+        rec["action"] = "skipped-ahead"
+        rec["detail"] = ("%d local commit(s) origin lacks — never fast-forwarded "
+                         "over" % ahead)
+        return rec
+    if behind == 0:
+        rec["action"] = "current"
+        return rec
+
+    mrc, _, merr = _git(repo, "merge", "--ff-only", upstream, timeout=60)
+    if mrc != 0:
+        rec["action"] = "ff-failed"
+        rec["detail"] = (merr or "rc=%s" % mrc)[:160]
+        return rec
+    rec["action"] = "pulled"
+    rec["detail"] = "fast-forwarded %d commit(s) from %s" % (behind, upstream)
+    return rec
+
+
+def render_pull(records):
+    """Pull banner. ALWAYS speaks, for the same reason render_sweep does.
+
+    This mode MUTATES working trees, so silence would make an actuating pass
+    indistinguishable from one that never ran -- the failure this whole file
+    exists to prevent, in its most consequential mode.
+    """
+    from collections import Counter
+    tally = Counter(r["action"] for r in records)
+    out = ["[product-repo-pull] %d repo(s): %s" % (
+        len(records),
+        ", ".join("%s=%d" % (k, v) for k, v in sorted(tally.items())) or "none")]
+
+    pulled = [r for r in records if r["action"] == "pulled"]
+    if pulled:
+        out.append("  ADVANCED (working trees moved):")
+        for r in sorted(pulled, key=lambda x: -(x["behind"] or 0)):
+            out.append("    %-42s +%d commit(s)" % (r["name"], r["behind"]))
+
+    offd = [r for r in records if r["action"] == "skipped-off-default"]
+    if offd:
+        out.append("  OFF-DEFAULT — READ HAZARD, not pulled (a grep here can "
+                   "return a false negative):")
+        for r in offd:
+            bd = r.get("behind_default")
+            out.append("    %-42s on %-38s %s behind %s  [%s]"
+                       % (r["name"], r["branch"],
+                          "?" if bd is None else bd, r["default_branch"],
+                          "MERGED — safe to return"
+                          if r.get("branch_merged_into_default")
+                          else "UNMERGED — leave alone"))
+
+    for label, key in (("DIRTY — left alone", "skipped-dirty"),
+                       ("AHEAD — local commits, left alone", "skipped-ahead"),
+                       ("COULD NOT CHECK", "skipped-dirty-probe-failed"),
+                       ("COULD NOT CHECK", "skipped-default-unknown"),
+                       ("FETCH FAILED", "skipped-fetch-failed"),
+                       ("FF REFUSED", "ff-failed")):
+        rows = [r for r in records if r["action"] == key]
+        if rows:
+            out.append("  %s:" % label)
+            for r in rows:
+                out.append("    %-42s %s" % (r["name"], r["detail"]))
+    return "\n".join(out)
+
+
 def render_sweep(records, scanned):
     """Sweep banner. Unlike render(), this ALWAYS speaks — even on a clean run.
 
@@ -939,6 +1144,17 @@ def main(argv=None):
                     help="unpushed-on-any-branch + stale-dirty across ALL enumerated "
                          "repos (g-335-833). Ignores --goal-id selection by design: "
                          "the incident class is work in a repo NO goal named.")
+    ap.add_argument("--pull", action="store_true",
+                    help="fast-forward every enumerated repo that is behind "
+                         "origin on its DEFAULT branch (g-115-6937). Ignores "
+                         "--goal-id by design — the incident class is a read "
+                         "of a repo no goal named. Skips dirty, ahead, and "
+                         "off-default trees and reports them instead. Never "
+                         "blocks; always exits 0.")
+    ap.add_argument("--pull-interval-min", type=int, default=PULL_INTERVAL_MIN,
+                    help="throttle the NETWORK fetch per repo (default %d min; "
+                         "0 = always fetch). The local ff-only advance is NOT "
+                         "throttled." % PULL_INTERVAL_MIN)
     args = ap.parse_args(argv)
 
     enumerated = enumerate_repos()
@@ -963,6 +1179,22 @@ def main(argv=None):
         payload = {"enumerated": [str(r) for r in enumerated], "count": len(enumerated)}
         print(json.dumps(payload, indent=2) if args.json
               else "\n".join(str(r) for r in enumerated))
+        return 0
+
+    if args.pull:
+        targets = [Path(r) for r in args.repo if _is_repo(r)] if args.repo else enumerated
+        records = [pull_status(r, args.pull_interval_min, not args.no_fetch)
+                   for r in targets]
+        if args.json:
+            cannot, why = vacuity(len(enumerated), len(targets))
+            print(json.dumps({"mode": "pull", "scanned": len(targets),
+                              "fetched": not args.no_fetch,
+                              "pull_interval_min": args.pull_interval_min,
+                              "cannot_check": cannot,
+                              "cannot_check_reason": why,
+                              "records": records}, indent=2))
+        else:
+            print(render_pull(records))
         return 0
 
     if args.sweep:

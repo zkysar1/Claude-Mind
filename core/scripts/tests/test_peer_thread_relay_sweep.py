@@ -477,3 +477,61 @@ def test_close_acked_with_no_prior_note_writes_only_ours():
         calls.append(args); return ("ok", 0)
     mod.close_acked([{"goal_id": "g-1-1", "peer_acked_via": ["m"]}], {"g-1-1": {}}, run=fake_run)
     assert calls[0][2].startswith("[peer-thread-relay-sweep --close-acked]")
+
+
+# ---------------------------------------------------------------------------
+# _run's own return contract ()
+#
+# WHY THESE EXIST. Every close_acked test above injects `fake_run`, and those
+# fakes return a NON-EMPTY output on failure (e.g. ("daemon refused", 1)) —
+# i.e. the fixtures encoded the contract the docstring promises ("failures
+# carry the wrapper's rc + output") while the real `_run` returned p.stdout
+# alone and so produced ("", 1) for every refusal. The fake was more correct
+# than the code, and because nothing exercised `_run` itself, the whole file
+# stayed green across that divergence. Measured live 2026-08-20 (zeta, cc-02):
+# the failure row for  read {rc: 1, output: ""} while the discarded
+# stderr held 12,088 bytes naming the actual refusal.
+# ---------------------------------------------------------------------------
+
+class _FakeProc:
+    def __init__(self, stdout, stderr, returncode):
+        self.stdout, self.stderr, self.returncode = stdout, stderr, returncode
+
+
+def _patch_subprocess(mod, monkeypatch, proc):
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: proc)
+
+
+def test_run_falls_back_to_stderr_when_the_call_fails_with_no_stdout(monkeypatch):
+    """The live failure shape: wrappers write refusals to stderr and nothing to
+    stdout. Returning stdout alone reports every such failure as output:""."""
+    mod = _load_wrapper()
+    _patch_subprocess(mod, monkeypatch, _FakeProc("", "uncommitted_work_blocked", 1))
+    out, rc = mod._run("core/scripts/whatever.sh", "arg")
+    assert rc == 1
+    assert out == "uncommitted_work_blocked", (
+        "a failure with empty stdout must surface stderr, else the failure "
+        "reporter drops the failure's own diagnostic: %r" % (out,)
+    )
+
+
+def test_run_does_not_append_stderr_to_a_nonempty_failure_payload(monkeypatch):
+    """guard-1963: never merge stderr into a captured data stream. When the call
+    failed but still produced stdout, that stdout is the payload and must come
+    back unmodified — the substitution is a fallback, not a concatenation."""
+    mod = _load_wrapper()
+    _patch_subprocess(mod, monkeypatch, _FakeProc('{"partial": true}', "noise", 1))
+    out, rc = mod._run("core/scripts/whatever.sh")
+    assert (out, rc) == ('{"partial": true}', 1)
+
+
+def test_run_never_returns_stderr_on_success(monkeypatch):
+    """The success path is the one load_goals/load_board json-parse, and they
+    DISCARD the rc — so stderr leaking in here would corrupt a live payload
+    rather than merely confuse a log line. A wrapper that warns on stderr while
+    succeeding is ordinary; its warning must not reach the parser."""
+    mod = _load_wrapper()
+    _patch_subprocess(mod, monkeypatch, _FakeProc('[{"id": "g-1-1"}]', "WARN: slow", 0))
+    out, rc = mod._run("core/scripts/aspirations-read.sh")
+    assert (out, rc) == ('[{"id": "g-1-1"}]', 0)
+    assert "WARN" not in out

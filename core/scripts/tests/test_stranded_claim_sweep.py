@@ -2720,3 +2720,71 @@ def test_carrier_memo_reports_reads_equal_to_checks_when_all_sids_differ(
     assert summary["carrier_checks"] == 3
     assert summary["carrier_reads"] == 3
     assert summary["kept_live_carrier"] == 3
+
+
+# ── constant calibration: the carrier window vs the cadence that WRITES it ──
+#
+# . DEFAULT_CARRIER_FRESH_MINUTES is a freshness bound on a signal
+# written once per worker cycle, so it must bracket that cycle from BOTH sides.
+# Pinned here rather than left to prose because a config value and the prose
+# justifying it are two artifacts that drift apart silently (guard-4282): this
+# flag's help asserted the carrier "refreshes continuously" while its only
+# worker call site was the top of each cycle, and the window sat at the very
+# bottom of the measured gap distribution for as long as that went unchecked.
+
+_WORKER_CYCLE_GAP_MAX_MIN = 92  # derived; re-anchored by the test below
+
+
+def _load_sweep_constants():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_scs_constants", CORE_SCRIPTS / "stranded-claim-sweep.py"
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_carrier_window_brackets_the_worker_cycle_cadence():
+    mod = _load_sweep_constants()
+    window = mod.DEFAULT_CARRIER_FRESH_MINUTES
+    grace = mod.DEFAULT_FOREIGN_SID_GRACE_MINUTES
+
+    # LOWER bound. Below the longest worker cycle gap, the keep-veto reports a
+    # LIVE worker stale and its claim falls through to release mid-execution —
+    # the  pop this veto was added () to prevent.
+    assert window > _WORKER_CYCLE_GAP_MAX_MIN, (
+        f"carrier window {window}m does not cover the measured worker cycle "
+        f"gap ({_WORKER_CYCLE_GAP_MAX_MIN}m). A worker mid-unit writes no "
+        f"carrier, so it would be judged stale while actively working."
+    )
+
+    # UPPER bound. At or past the grace the grace is unreachable, so a
+    # genuinely dead holder's claim would never fall through to release.
+    assert window < grace, (
+        f"carrier window {window}m must stay below the foreign-sid grace "
+        f"{grace}m or the grace becomes unreachable."
+    )
+
+
+def test_worker_cycle_gap_figure_still_matches_its_source():
+    """The window above is DERIVED from a measurement recorded in the worker
+    loop. If that measurement is revised, fail here so the derived window is
+    revisited rather than left calibrated against a number nobody re-checked.
+    """
+    import re
+
+    skill = PROJECT_ROOT / ".claude" / "skills" / "worker-loop" / "SKILL.md"
+    text = skill.read_text(encoding="utf-8", errors="replace")
+    m = re.search(r"measured unit gaps of (\d+)-(\d+) min", text)
+    assert m, (
+        f"the 'measured unit gaps of N-M min' anchor is gone from {skill}. "
+        f"Re-anchor _WORKER_CYCLE_GAP_MAX_MIN before trusting "
+        f"DEFAULT_CARRIER_FRESH_MINUTES — the window is derived from it."
+    )
+    assert int(m.group(2)) == _WORKER_CYCLE_GAP_MAX_MIN, (
+        f"worker cycle gap upper bound moved to {m.group(2)}m; "
+        f"re-derive DEFAULT_CARRIER_FRESH_MINUTES against it."
+    )
