@@ -174,6 +174,30 @@ def _git(*args, cwd=None):
         return ""
 
 
+def _parse_git_time(s):
+    """An ISO-ish git timestamp -> epoch seconds. Never raises.
+
+    Used to apply this detector's window on %ct instead of `git log --since`
+    (g-115-6959 / guard-4539). Accepts the offset-less form, the trailing-Z
+    form, and the `+0000` form `strftime('%z')` emits. On a value it cannot
+    parse it returns a bound that CANNOT exclude anything — -inf for the lower
+    bound is not available here, so callers get 0 (epoch) — because every
+    historical failure of this window has been a silently-EMPTY candidate set,
+    and a parse error must not become a third route to one.
+    """
+    from datetime import datetime, timezone
+    raw = (s or "").strip().replace("Z", "+00:00")
+    for candidate in (raw, raw[:19]):
+        try:
+            parsed = datetime.fromisoformat(candidate)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return int(parsed.timestamp())
+        except Exception:
+            continue
+    return 0
+
+
 def is_framework(rel: str) -> bool:
     rel = rel.replace("\\", "/")
     segs = rel.split("/")
@@ -315,15 +339,42 @@ def audit_sync(sync: dict, lookback_days: int, at: str = "HEAD") -> dict:
     # be dead code.
     since_abs = (base - timedelta(days=lookback_days)).strftime("%Y-%m-%dT%H:%M:%S%z")
 
+    # Window bounds moved OFF `--since`/`--until` and onto %ct ( /
+    # guard-4539). The comment above records this detector already being
+    # silently zeroed once by a `--since` git could not parse; this is the
+    # SECOND way that flag empties the set, and it survives correct formatting:
+    # `--since` is a TRAVERSAL CUTOFF, not a filter, so git stops the walk at
+    # the first commit older than the bound and ONE old-dated commit hides
+    # every local commit behind it (measured on a fixture 2026-08-20: 7 commits
+    # 67 SECONDS old returned EMPTY). Failure direction is identical and just
+    # as silent -- zero candidates reads as "no casualties", which is this
+    # tool's all-clear. The walk is already bounded by `{sha}^` and a pathspec,
+    # so no count bound is needed.
+    # ASYMMETRIC fail-open, and the asymmetry is load-bearing: _parse_git_time
+    # returns 0 when it cannot parse, which widens the LOWER bound (include
+    # everything back to the epoch) but would CLOSE the upper bound to nothing.
+    # A 0 upper bound would exclude every commit -- the silently-empty
+    # candidate set this whole change exists to prevent, reintroduced by the
+    # guard against it. Both bounds must fail toward INCLUDING more.
+    _since_ct = _parse_git_time(since_abs)
+    _until_ct = _parse_git_time(when) or (1 << 62)
     candidates = []
     for f in fw:
-        log = _git("log", f"--since={since_abs}",
-                   f"--until={when}", "--format=%H%x1f%s", f"{sha}^", "--", f)
+        log = _git("log", "--format=%ct%x1f%H%x1f%s", f"{sha}^", "--", f)
         for line in log.splitlines():
             p = line.split("\x1f")
-            if len(p) != 2:
+            if len(p) != 3:
                 continue
-            lsha, lsubj = p
+            lct, lsha, lsubj = p
+            try:
+                ct = int(lct)
+            except ValueError:
+                # Unparseable stamp: KEEP the commit. This detector's failure
+                # mode has twice been a silently-empty candidate set; dropping
+                # on a bad timestamp would be a third way to reach it.
+                ct = None
+            if ct is not None and not (_since_ct <= ct <= _until_ct):
+                continue
             if INCOMING_SUBJECT_RE.search(lsubj):
                 continue     # another INCOMING promotion/transplant, not local work
             candidates.append((f, lsha))

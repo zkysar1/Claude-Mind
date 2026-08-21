@@ -150,6 +150,34 @@ Apply this protocol whenever the agent is about to output or act on:
   rather than a CAPABILITY, which is why the capability-shaped phrases in this list
   do not fire on it.)
 
+## Scope the search to the REPOS you actually searched, and name them
+
+A product that spans repositories makes a single-repo sweep *feel* exhaustive
+while being blind by construction — the sweep really was exhaustive, over one
+repo, and nothing in its output says so. Before stating any "no live path does
+X" conclusion:
+
+1. **Enumerate the repos in scope and name them in the claim.** Write "no path
+   in <repo>" — never "no path", which silently promotes a repo-scoped finding
+   into a product-wide one.
+2. **For every REMOVED call site the conclusion rests on, ask MOVED or DIED.**
+   A deletion has two causes that look identical from inside one repo. The tell
+   for a relocation is usually sitting in the same repo: a test pinning the
+   absence ("this action must STAY GONE", "no longer imported here") or a
+   tombstone comment naming the successor. Nobody writes a regression test to
+   protect an accident, so an absence-pinning test is evidence of a deliberate
+   move, not of a death.
+3. **Query PRODUCTION for the artifact the claim says is never created**, before
+   reading any source. It is the cheapest signal available and it is decisive.
+
+Canonical incident (g-364-27 → g-364-28, 2026-08-20): an "exhaustive origin/main
+sweep" concluded no live path wrote a required registration row and spawned two
+forward-fix goals, one of which another agent executed. The writer had been
+extracted into the sibling app months earlier and had 22 live production rows,
+one serving a running customer world. The removed call site the sweep relied on
+was pinned by a same-repo test naming exactly that relocation. See rb-8634,
+guard-4588, rb-8518 (corrected).
+
 ## Anti-Patterns
 
 - Searching one node and concluding a feature doesn't exist
@@ -158,6 +186,12 @@ Apply this protocol whenever the agent is about to output or act on:
 - Concluding "not possible" from a single tool/library limitation without checking
   if alternative approaches exist in the knowledge base
 - Declaring "we'd need to build X" without searching for existing implementations
+- Grepping ONE repo of a multi-repo product and stating the negation unqualified
+- Reading a deleted call site as "the capability died" without checking whether it
+  MOVED — especially when a test in the same repo pins the absence (that test is
+  the fingerprint of a relocation)
+- Concluding a row/record is never written without once querying the production
+  store for it
 
 ## Relationship to Verify Before Assuming
 

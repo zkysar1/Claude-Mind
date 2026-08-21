@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.11.0",
+    "previous_version": "2.10.1",
+    "date": "2026-08-21",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Tree freshness: digest Section C2 (claim reconciliation, contradiction check, live-fire addenda, bolster-against-repeat) + encode-session 14% diet + debt-algorithm SSOT reconciliation; ~218 fleet commits since v2.10.1",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.10.1",
     "previous_version": "2.10.0",
     "date": "2026-08-20",

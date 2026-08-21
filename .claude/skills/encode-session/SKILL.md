@@ -83,45 +83,24 @@ session — never reconstructed from prior-session memory (per
 1. Bash: git status --short
    Bash: git log --oneline -10
    Bash: git diff --stat
-   # Single source of truth for chat-session scope: uncommitted working-tree
-   # changes. Do NOT add a HEAD@{1}..HEAD probe here — chat sessions usually
-   # have not committed yet, so the reflog scope would be empty and the
-   # working-tree scope is the only one that captures session work.
-   #
-   # THESE THREE PROBES CANNOT SEE world/ OR meta/, AND THEIR SILENCE ABOUT
-   # THOSE PATHS IS NOT EVIDENCE NOTHING CHANGED (g-115-3392). Both are
-   # EXTERNAL gitignored paths (`.gitignore` `/.mind-data/`), so an edit to a
-   # convention, a knowledge-tree node, or a meta strategy file produces NO
-   # line here, on any box, for any agent, ever. Step 4's in-context
-   # conversation memory is the ONLY source of scope for them — that is not a
-   # fallback, it is the primary and only path, so do not let an empty
-   # `git status` short-circuit step 4.
-   #
-   # Do NOT "fix" this with `git -C "$WORLD_PATH" status` — MEASURED and it
-   # fails SILENTLY (2026-08-02, cc-03). `.mind-data/` lives INSIDE the repo,
-   # so `git -C` there resolves to the PARENT repo (`--show-toplevel` =
-   # PROJECT_ROOT, no `.git` of its own) and reports 0 lines at rc=0 on an
-   # ignored subtree. It reads exactly like a clean tree. guard-1947: an
-   # instrument that cannot see is not one that saw nothing.
-   #
-   # SECOND BLIND SPOT, SAME CLASS, AND IT COSTS TRACKED FRAMEWORK CODE:
-   # `git status` CANNOT SEE STASHED WORK (g-115-6265, measured live 2026-08-14).
-   # This is a SHARED working tree with one git index. A partner agent that needs
-   # to clear the tree to unblock its own push will `git stash` YOUR uncommitted
-   # tracked changes — after which git status is clean-looking and this probe
-   # under-reports the session by however much was stashed. Measured: 226 lines
-   # of written-and-tested framework code reported as an almost-empty session.
-   #
-   # THE FINGERPRINT IS AN ASYMMETRY, and it is visible right here in step 1's
-   # own output: `git stash` without `-u` takes TRACKED changes and LEAVES
-   # untracked files, so the signature is a `??` new file whose implementation
-   # is absent from both HEAD and the working tree. If step 4 recalls writing
-   # code that step 1 cannot see — especially "I wrote a test for code that
-   # does not exist" — run `git stash list` BEFORE concluding it was never
-   # written or was reverted. Recover with `git stash apply` (3-way merge, and
-   # it KEEPS the stash), never `git apply` (straight patch; fails the moment
-   # upstream touched the same region, which is exactly when you need it).
-   # Full protocol incl. the inverted stash-overlap filter: guard-3796.
+   # Working-tree scope is the single source of truth for chat sessions (no
+   # HEAD@{1} range — chat sessions usually have not committed). THREE BLIND
+   # SPOTS, all guard-1947 class (an instrument that cannot see is not one
+   # that saw nothing):
+   # - world/ + meta/ are EXTERNAL gitignored (g-115-3392): these probes emit
+   #   NO line for them, ever. Step 4's in-context memory is the ONLY scope
+   #   source there — an empty git status must not short-circuit step 4. And
+   #   do NOT reach for `git -C "$WORLD_PATH" status`: it resolves to the
+   #   PARENT repo and reports 0 lines at rc=0 on the ignored subtree
+   #   (measured 2026-08-02) — reads exactly like a clean tree.
+   # - STASHED work is invisible (g-115-6265; measured cost: 226 lines of
+   #   tested framework code reported as an almost-empty session). Shared
+   #   tree, one index: a partner clearing the tree stashes YOUR tracked
+   #   changes. Fingerprint: a `??` file whose implementation exists in
+   #   neither HEAD nor the working tree ("I wrote a test for code that does
+   #   not exist"). Run `git stash list` BEFORE concluding work was never
+   #   written; recover with `git stash apply` (3-way, keeps the stash),
+   #   never `git apply`. Full protocol: guard-3796.
 2. Read agents/<agent>/session/working-memory.yaml
 3. Bash: aspirations-read.sh --summary
 4. Identify scope from in-context conversation memory:
@@ -222,6 +201,30 @@ For each domain topic discussed with substantive new content:
   IF no node exists for a substantive new topic:
     PROPOSE creating it (do NOT auto-create from chat-context — too easy to
     over-encode). Print proposal: parent, key, summary.
+
+THEN — Tree Freshness Sweep (digest Section C2; added 2026-08-21 after a
+measured miss: a node's stale "Open (unfiled)" claim survived every encode
+pass for ~3 weeks until the user manually prompted a tree review). New
+content is only half the tree lane — the other half keeps EXISTING nodes
+truthful. Over (a) every node Lane 1.0 retrieved and (b) the catalog node
+of any subsystem where this session ran a MAJOR OPERATION (promotion,
+plant, migration, incident, measurement campaign — probe
+tree-find-node.sh --text "<subsystem>" --top 3), run C2's four checks:
+  1. CLAIM RECONCILIATION — standing claims ("Open", "pending", "not yet",
+     "no X exists", dated as-of) that this session COMPLETED or OVERTOOK →
+     rewrite IN PLACE ("RESOLVED (g-NNN): ..."). Evidence only, never age.
+  2. CONTRADICTION CHECK — session evidence contradicting a node assertion
+     → correct the wrong sentence WHERE IT STANDS, citing the evidence
+     (guard-1710: never append a correction below text still asserting the
+     old conclusion).
+  3. LIVE-FIRE ADDENDUM — the operation's catalog node keeps dated addenda
+     → append this session's event in the node's OWN format.
+  4. BOLSTER AGAINST REPEAT — a mistake this session made that an existing
+     node could have prevented but lacked the warning for → add the
+     gotcha/decision rule to that node so future-self fails differently.
+     (Node HAD it but wasn't retrieved → that's Lane 4.2's blind-spot lens,
+     not a node edit.)
+  Print per action: RECONCILED|CORRECTED|ADDENDUM|BOLSTERED tree:<key>
 ```
 
 ### 1.2 Reasoning Bank
@@ -331,160 +334,56 @@ non-trivial diagnosis) that future readers would benefit from re-reading:
     summary: <one-line>
     tree_nodes_related: <nodes touched in 1.1>
     tags: ["chat-derived", ...]
-    # verbatim_anchors is OPTIONAL, but IF included EACH element MUST be an
-    # object {"key": "<tag>", "content": "<excerpt>"} — a bare string exits 1
-    # (experience.py; g-115-2847, hit live registering exp-g-115-2839).
-    # ALL FIVE of id/type/category/content_path/summary are required. Omitting
-    # category or content_path returns:
-    #   {"error":"validation_failed",
-    #    "detail":"Missing required fields: {'category', 'content_path'}"}
-    # *** THIS FAILURE IS EASY TO MISS (g-115-2847, 2026-07-21). *** The error
-    # object parses as JSON, so a caller that reads `.id` off the response gets
-    # None and may print "ENCODED experience: None" while NOTHING was written.
-    # ALWAYS confirm the write landed before reporting success:
-    #   Bash: grep -c "<experience_id>" agents/<agent>/experience.jsonl   → 1
-    # Schema-valid types: goal_execution, hypothesis_formation, research,
-    # reflection, user_correction, user_interaction, execution_reflection,
-    # chat_session (added g-115-425, 2026-05-08). Use "chat_session" for
-    # chat-mode encoding — semantically distinct from goal_execution
-    # (single-goal trace) and user_interaction (Q&A). The .md front matter
-    # may use descriptive type values (not validated), but the JSON body to
-    # experience-add.sh MUST use a schema type or the call exits 1.
+    # ALL FIVE of id/type/category/content_path/summary are REQUIRED, and a
+    # validation failure is EASY TO MISS (g-115-2847): the error object
+    # parses as JSON, so reading `.id` off it yields None and "ENCODED
+    # experience: None" prints while NOTHING was written. ALWAYS confirm
+    # before reporting:
+    #   Bash: grep -c "<experience_id>" agents/<agent>/experience.jsonl → 1
+    # verbatim_anchors elements must be {"key","content"} OBJECTS, never bare
+    # strings. The JSON `type` must be a schema value — "chat_session" for
+    # chat-mode (vs goal_execution = single-goal trace, user_interaction =
+    # Q&A); full type list + schema in the experience convention (loaded via
+    # front matter). The .md front matter type is free-form; the JSON is not.
   Print: ENCODED experience:<experience_id>  (only after the grep confirms 1)
 ELSE (pure Q&A, trivial chat): SKIP.
 ```
 
 ### 1.6 Knowledge-Debt Sweep (E17)
 
-Chat-mode counterpart of `aspirations-consolidate` Step 2.25. `/respond` Step 6
-appends entries to WM `knowledge_debt` when a user correction has broader
-implications than the immediate tree nodes the `_tree.yaml` scan finds. In a
-pure assistant-only session, the autonomous-loop consolidation never fires, so
-those debt entries accumulate indefinitely with no resolver. This lane is that
-resolver.
-
-Run AFTER 1.1–1.5 so any debt whose target node was just edited by this
-session's encoding pass auto-resolves via the mtime check.
+Chat-mode counterpart of `aspirations-consolidate` Step 2.25 — the resolver
+for WM `knowledge_debt` entries filed by `/respond` (in an assistant-only
+session nothing else consumes them, so they accumulate indefinitely). Runs
+AFTER 1.1–1.5 so debts whose target node this pass just edited auto-resolve
+on the date check. Co-located with encoding rather than a top-level lane
+because it writes the same stores via the same machinery.
 
 ```
 Bash: bash core/scripts/wm-read.sh knowledge_debt --json
+IF empty or null:
+  Print: "DEBT SWEEP: no outstanding entries — skip."  → Lane 2.
 
-IF returned array is empty or null:
-  Print: "DEBT SWEEP: no outstanding entries — skip."
-  PROCEED to Lane 2.
+Apply digest Section E's algorithm VERBATIM (HIGH-first, then oldest):
+  auto-resolve on node update (date-only >= compare, both sides [:10])
+  → null-key goal-routing (the MAJORITY shape; derive asp-<NNN> from the
+    goal id; NEVER resolve null-key debt on age)
+  → inline resolution when HIGH or sessions_deferred >= 2
+    (last_update_trigger: {type: "debt-reconciliation"})
+  → durable-drop at ceiling 10: execution-diary BEFORE removal, and a
+    HIGH debt at ceiling ALSO files a MEDIUM Investigate
+  → self-filtered write-back via wm-set (wm-prune cannot reach this slot).
 
-For each debt entry (process in order: HIGH-priority first, then oldest first):
-
-  # AUTO-RESOLVE: node was updated on or after the day the debt was filed.
-  # Date-only compare (not timestamp) because node.last_updated is stored
-  # date-only (YYYY-MM-DD) while debt.created is a full ISO timestamp.
-  # DO NOT change to `>` or to a full-timestamp compare — same-day node
-  # edits (the common case when /encode-session runs immediately after
-  # an autonomous Phase 8 or Lane 1.1 touched the node) would be missed.
-  Bash: bash core/scripts/tree-read.sh --node <debt.node_key> 2>/dev/null | py -3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('last_updated',''))"
-  Capture returned value as node_last_updated.
-  node_date = node_last_updated[:10]   # YYYY-MM-DD
-  debt_date = debt.created[:10]        # YYYY-MM-DD
-  IF node_date >= debt_date AND node_last_updated is non-empty:
-      Mark entry.resolved = true, entry.resolution_method = "auto_resolved_by_node_update"
-      Log: "AUTO-RESOLVED debt for {debt.node_key} — node updated {node_date} (debt filed {debt_date})"
-      continue
-
-  # NULL-KEY LANE (g-115-5150). The check above CANNOT fire when node_key is
-  # null, and null is the MAJORITY shape, not an anomaly: /respond Step 6 files
-  # debt precisely when a correction has BROADER implications than any single
-  # node the _tree.yaml scan found, so "no one node" is the DESIGNED common
-  # case for this slot. `tree-read.sh --node null` returns nothing ->
-  # node_last_updated stays empty -> the entry falls through to the
-  # carry-forward increment on EVERY sweep, forever, until the max-defer
-  # ceiling silently DISCARDS it. Measured 2026-08-06 (alpha): all five live
-  # entries carried node_key null, all priority HIGH, all already at
-  # sessions_deferred 6 of 10 — i.e. four sweeps from being dropped, with the
-  # sweep itself supplying the increments. The resolver was built for a shape
-  # its producer does not usually emit.
-  IF debt.node_key is null or empty:
-      Extract the first goal id matching g-\d+-\d+ from debt.reason (also check
-        debt.routed_goal / debt.source_goal if present).
-      IF such a goal id was found:
-          # Derive the aspiration from the goal id — asp-<NNN> from g-<NNN>-<NN>.
-          # aspirations-read.sh --id takes an ASPIRATION id; passing a GOAL id
-          # returns {"error":"not_found"}, which reads exactly like "the goal is
-          # gone" and would wrongly resolve nothing.
-          Bash: bash core/scripts/aspirations-read.sh --id asp-<NNN>
-          Find the goal in the returned goals[] and read its status.
-          IF status == "completed":
-              Mark entry.resolved = true,
-                   entry.resolution_method = "auto_resolved_by_routed_goal"
-              Log: "AUTO-RESOLVED null-key debt — routed goal {gid} completed: {debt.reason first 60 chars}"
-              continue
-      # Fall through deliberately when there is no goal id, or the goal is not
-      # yet completed. Do NOT resolve a null-key debt on AGE — a debt whose
-      # condition is still TRUE must stay open, and "it got old" is not evidence
-      # the underlying gap was filled. That load-bearing negative is the whole
-      # difference between resolving a debt and discarding it.
-
-  # INLINE RESOLUTION for HIGH-priority OR aged debts
-  IF entry.priority == "HIGH" OR (entry.sessions_deferred ?? 0) >= 2:
-    Read the target node .md file
-    Decide: can this debt be resolved from in-context conversation knowledge
-      (the chat session may have produced the missing content), OR from
-      a quick probe (Bash, Read, grep) using domain-provisionable scripts?
-    IF resolvable inline:
-      Edit the node — append the missing/corrected content to the
-        relevant section (Key Insights, Verified Values, etc.) AND set
-        last_update_trigger in the front matter:
-          last_update_trigger: {type: "debt-reconciliation"}
-        (T21 will auto-fill .session and .source; last_updated also bumps.)
-      Mark entry.resolved = true, entry.resolution_method = "inline_chat_resolution"
-      Log: "RESOLVED debt for {debt.node_key}: <one-line summary of what was added>"
-    ELSE:
-      entry.sessions_deferred = (entry.sessions_deferred ?? 0) + 1
-      Log: "CARRIED forward debt for {debt.node_key} (sessions_deferred={N})"
-  ELSE:
-    # Low-priority + young: just carry forward
-    entry.sessions_deferred = (entry.sessions_deferred ?? 0) + 1
-
-  # MAX-DEFER CEILING: drop stale debts that never resolve (mirrors Step 2.25)
-  IF entry.sessions_deferred >= 10:
-    # DURABLE DROP FIRST (g-115-5150). `resolution_method: max_defer_dropped` is
-    # a DISCARD wearing the word "resolved" — the gap it recorded is still open,
-    # nobody was told, and the only trace was a Log line that dies with the
-    # session. Worse for the null-key majority: the message rendered literally as
-    # "DROPPED debt for null", naming nothing recoverable. So write the reason
-    # somewhere that outlives the entry BEFORE removing it, and never drop a HIGH
-    # debt into a log line alone.
-    Bash: echo '{"entry_type":"observation","content":"KNOWLEDGE DEBT DROPPED (ceiling {sessions_deferred}): node_key={debt.node_key or \"null\"} priority={entry.priority} source_goal={debt.source_goal} — {debt.reason}"}' | bash core/scripts/execution-diary.sh append
-    IF entry.priority == "HIGH":
-      # A HIGH debt reaching the ceiling means 10 sweeps failed to resolve it.
-      # That is a finding about the resolver, not just about this entry.
-      Bash: echo '{"title":"Investigate: HIGH knowledge debt hit the max-defer ceiling","description":"Dropped at sessions_deferred={N}. node_key={debt.node_key or null}. source_goal={debt.source_goal}. Verbatim reason, preserved because the entry is being discarded: {debt.reason}","priority":"MEDIUM","participants":["agent"],"category":"framework-maintenance","tags":["knowledge-debt","max-defer-drop"],"origin_signal":"investigate:knowledge-debt-ceiling"}' | bash core/scripts/aspirations-add-goal.sh --source world asp-115
-    Mark entry.resolved = true, entry.resolution_method = "max_defer_dropped"
-    Log: "DROPPED debt for {debt.node_key} — deferred {sessions_deferred} sessions, ceiling reached (reason preserved to execution-diary)"
-
-# Build the filtered array — DROP every entry where resolved == true.
-# DO NOT rely on wm-prune.sh to clean these later: knowledge_debt is NOT
-# listed in `item_stale_minutes` (memory-pipeline.yaml + wm.py:249-253
-# defaults), so the array-item-prune gate at wm.py:685 is unreachable for
-# this slot. The protected-slot rule at wm.py:704 only fires if the outer
-# gate passes. Resolved entries would otherwise live forever.
-new_array = [e for e in array if not e.get("resolved")]
-echo '<new_array as JSON>' | bash core/scripts/wm-set.sh knowledge_debt
+The digest is the SSOT — do NOT re-inline the algorithm here. The two
+copies drifted once (digest said >=5 while this lane said >=2, and the
+null-key lane existed only here; reconciled 2026-08-21).
 
 Report:
-  "DEBT SWEEP: {auto_resolved} auto-resolved (node already updated),
-                {inline_resolved} resolved inline,
-                {carried} carried forward,
-                {dropped} dropped (max-defer ceiling)
-                of {total_entries} total."
+  "DEBT SWEEP: {auto} auto-resolved, {inline} resolved inline,
+               {carried} carried forward, {dropped} dropped of {total}."
 ```
 
-**Why "Lane 1.6" and not a top-level Lane**: knowledge-debt resolution writes
-to the same stores (T, mostly) as Lane 1.1–1.5 and uses the same `tree-update.sh`
-machinery. Co-locating with encoding keeps Lane 2+ focused on cognitive
-primitives + discovery + meta. It also means a single Lane 1 summary line in
-the Phase Final block covers both new encoding and debt resolution.
-
-**Cross-reference**: `core/config/conventions/encoding-triggers.md` E17 row.
+**Cross-reference**: `core/config/conventions/encoding-triggers.md` E17 row;
+`core/config/encoding-protocol-digest.md` Section E (algorithm SSOT).
 
 ## Lane 2: Out-of-Cycle Work (Maintain Cognitive Primitive)
 
@@ -816,9 +715,11 @@ Same handler as `/aspirations-spark` sq-012, but on chat-session input.
 
 ```
 ═══ ENCODE-SESSION COMPLETE ═══════════════════════
-Lane 1 (Encoding):       <N> tree updates, <N> rb entries, <N> guardrails,
-                         <N> pattern candidates, <N> experiences,
-                         <N> debt resolved (<N> auto, <N> inline, <N> carried, <N> dropped)
+Lane 1 (Encoding):       <N> tree updates (<N> reconciled / <N> corrected /
+                         <N> addenda / <N> bolstered — the C2 freshness sweep),
+                         <N> rb entries, <N> guardrails, <N> pattern candidates,
+                         <N> experiences, <N> debt resolved (<N> auto, <N>
+                         inline, <N> carried, <N> dropped)
 Lane 2 (Maintain):       <N> goals filed
 Lane 3 (Unblocks):       <N> defer reasons cleared
 Lane 4 (Discovery):      <N> work goals filed, <N> blind spots, <N> assumptions, <N> forge gaps
@@ -833,26 +734,14 @@ Proposals (require user OK to write):
 ```
 
 **Mark every proposal's stated MECHANISM as PROBED or INFERRED.** A proposal
-carries two separable claims: the ACTION ("recategorize guard-X") and the
-MECHANISM that justifies it ("because a domain category under-retrieves it").
-The mechanism is a factual assertion about how the system behaves, and it can
-be FALSE while the action is still right — so it needs evidence in its own
-right, not the action's plausibility standing in for it. If the mechanism was
-not probed during this session, write `INFERRED` and name the one probe that
-would settle it; do not present an unprobed mechanism in the same voice as a
-measured one.
-
-Canonical incident (2026-07-26): a proposal shipped as "guard-NNN is filed
-under a product-specific category … a domain category on a domain-agnostic
-rule **under-retrieves it**". When the user asked to improve it, the probe
-returned that guardrail at rank 12 of 40 on free-text retrieval — the stated
-mechanism was false. The real loss was narrower (the token-overlap fallback
-fires ONLY when the category match returns empty, so an *exact-category* read
-never reaches it), and the recategorization was still correct. One bullet of
-unprobed causal reasoning had been shipped in the same register as measured
-findings. `communication-clarity.md` rule 6 governs verify summaries and
-reports; this extends the same standard to forward-looking proposals, which
-rule 6 does not name.
+carries two separable claims: the ACTION and the MECHANISM justifying it.
+The mechanism is a factual assertion about how the system behaves — it can
+be FALSE while the action is still right, so it needs evidence in its own
+right. If it was not probed this session, write `INFERRED` and name the one
+probe that would settle it; never present an unprobed mechanism in the same
+voice as a measured one. Canonical incident + relation to
+communication-clarity rule 6:
+`core/config/rationale/proposal-mechanism-marking.md`.
 
 The terminal Bash call (per Return Protocol below) also resets the
 `assistant_turn_count` working-memory slot — see Return Protocol for the

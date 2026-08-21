@@ -166,7 +166,23 @@ if [ -n "$GOAL_ID" ]; then
   # commit's body ("closes the gap ()") lacks the colon and no
   # longer cross-unions into that goal's scope. Zero recall loss: every
   # iteration-commit subject carries "(<goal-id>):".
-  GOAL_SHAS=$(git log --fixed-strings --grep "(${GOAL_ID}):" --format=%H -n 50 --since=48.hours 2>/dev/null || true)
+  # NO `--since` ( / guard-4539). `git log --since` is a TRAVERSAL
+  # CUTOFF, not a filter: git walks from the tip and STOPS at the first commit
+  # older than the cutoff, so ONE old-dated commit at the tip hides every
+  # recent commit behind it. Measured on a fixture 2026-08-20: 7 commits 67
+  # SECONDS old behind one old-dated tip returned EMPTY for
+  # `--since='60 minutes ago'`. Commit dates go non-monotonic in ordinary
+  # operation (rebase, cherry-pick, --amend --date, a merged long-lived
+  # branch, peer clock skew).
+  # Empty here means the fresh-eyes gate DOES NOT FIRE, so the failure is
+  # silent and in the permissive direction -- a review that should have
+  # happened simply does not, and nothing says so.
+  # `--grep` is highly selective and `-n 50` bounds the walk, so the 48h
+  # window is applied below on the COMMITTER TIMESTAMP (%ct) in awk instead.
+  _GATE_CUTOFF=$(( $(date +%s) - 172800 ))   # 48h, matching the old --since
+  GOAL_SHAS=$(git log --fixed-strings --grep "(${GOAL_ID}):" \
+                --format='%ct %H' -n 50 2>/dev/null \
+              | awk -v c="$_GATE_CUTOFF" '$1 >= c { print $2 }' || true)
   SHA_LIST=$(printf '%s\n%s\n' "$SHA_LIST" "$GOAL_SHAS" | sed '/^$/d' | sort -u)
 fi
 

@@ -1071,16 +1071,70 @@ def test_behind_count_fails_open_without_origin(tmp_path):
     assert M._git_behind_count(tmp_path / "does-not-exist") is None
 
 
-def test_since_arg_integer_minutes():
-    # git approxidate silently mishandles FLOAT hour strings (git 2.43,
-    # observed live 2026-07-17): "2.0 hours ago" parses as NO filter
-    # (full-history scan -> 6-day-old commits flagged as 2h races) while
-    # "48.0 hours ago" parses as an EMPTY window (0 commits). Integer
-    # minutes are unambiguous and preserve fractional hours.
-    assert M._since_arg(2.0) == "--since=120 minutes ago"
-    assert M._since_arg(48.0) == "--since=2880 minutes ago"
-    assert M._since_arg(0.5) == "--since=30 minutes ago"
-    assert M._since_arg(0.001) == "--since=1 minutes ago"  # floor of 1
+def test_since_arg_is_gone_no_probe_may_use_git_log_since():
+    # . `_since_arg` was DELETED, not merely unused: `git log
+    # --since` is a traversal cutoff, so any bound built from it can DROP
+    # commits a %ct filter keeps, and leaving a convenient helper in the
+    # module invites the cutoff straight back in. This pins the removal AND
+    # the absence of `--since` from every argv in the module, which is the
+    # property that actually matters -- a future re-introduction fails here.
+    assert not hasattr(M, "_since_arg")
+
+    # Test the ARGVS, not the file text. A substring scan also matches prose
+    # in docstrings and comments (it did, on the first draft of this test),
+    # which makes the guard fire on documentation and teaches the next reader
+    # to weaken it. Walk the AST instead and inspect only list literals that
+    # are actually a `git log ...` command line.
+    import ast
+    tree = ast.parse(Path(M.__file__).read_text(encoding="utf-8"))
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.List):
+            continue
+        literals = [e.value for e in node.elts
+                    if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+        if "git" not in literals or "log" not in literals:
+            continue
+        for elt in node.elts:
+            # a bare literal, e.g. "--since=2 hours ago"
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                if "--since" in elt.value:
+                    offenders.append(elt.value)
+            # an f-string, e.g. f"--since={n} minutes ago"
+            elif isinstance(elt, ast.JoinedStr):
+                lit = "".join(v.value for v in elt.values
+                              if isinstance(v, ast.Constant)
+                              and isinstance(v.value, str))
+                if "--since" in lit:
+                    offenders.append(lit)
+    assert not offenders, (
+        f"a git-log --since bound came back into a probe argv: {offenders}. "
+        "--since is a TRAVERSAL CUTOFF -- use --max-count plus "
+        "_ct_cutoff/_within_cutoff instead (guard-4539)")
+
+
+def test_ct_cutoff_is_epoch_seconds_back_from_now():
+    now = 1_800_000_000
+    assert M._ct_cutoff(2.0, now_epoch=now) == now - 7200
+    assert M._ct_cutoff(48.0, now_epoch=now) == now - 172800
+    assert M._ct_cutoff(0.5, now_epoch=now) == now - 1800
+
+
+def test_within_cutoff_keeps_recent_drops_old_and_keeps_unparseable():
+    cut = 1_000_000
+    rows = [
+        {"hash": "a", "ct": "1000001"},          # newer than cutoff
+        {"hash": "b", "ct": "1000000"},          # exactly at cutoff -> kept
+        {"hash": "c", "ct": "999999"},           # older -> dropped
+        {"hash": "d", "ct": None},               # unreadable -> KEPT
+        {"hash": "e", "ct": "not-a-number"},     # unreadable -> KEPT
+    ]
+    kept = {c["hash"] for c in M._within_cutoff(rows, cut)}
+    assert kept == {"a", "b", "d", "e"}, kept
+    # The fail-open direction is the whole point: this filter replaced a bound
+    # whose failure mode was DROPPING real work, and an unreadable timestamp
+    # must not silently reproduce it. Over-reporting costs a second look;
+    # under-reporting authorizes duplicate work.
 
 
 def test_git_log_commits_float_window_excludes_old(tmp_path, monkeypatch):
@@ -1110,6 +1164,60 @@ def test_git_log_commits_float_window_excludes_old(tmp_path, monkeypatch):
 
 
 import os  # noqa: E402  (used by the float-window fixture above)
+
+
+def test_old_dated_tip_does_not_hide_recent_commits(tmp_path, monkeypatch):
+    """THE regression pin for  / guard-4539.
+
+    `git log --since` is a TRAVERSAL CUTOFF, not a filter: git walks from the
+    tip and stops at the first commit older than the cutoff, so ONE old-dated
+    commit at the tip hides every recent commit behind it. Commit dates go
+    non-monotonic in ordinary operation (rebase, cherry-pick, --amend --date,
+    a merged long-lived branch, peer clock skew), so this is not exotic.
+
+    This probe's empty result AUTHORIZES pickup, so a false empty does not
+    merely under-report -- it green-lights duplicate work.
+
+    The fixture is the measured one: N recent commits, then one old-dated
+    commit at the TIP. Pre-fix this returned ZERO.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _run_git(["-c", "init.defaultBranch=main", "init", "-q"], repo)
+    for i in range(1, 8):
+        (repo / f"f{i}.txt").write_text(f"{i}\n", encoding="utf-8")
+        _run_git(["add", "."], repo)
+        _run_git(["commit", "-q", "-m", f"feat(g-888-0{i}): recent work {i}"],
+                 repo)
+    # ...then an OLD-DATED commit at the TIP. This is the cutoff trigger.
+    old = "2020-01-01T00:00:00"
+    (repo / "tip.txt").write_text("tip\n", encoding="utf-8")
+    _run_git(["add", "."], repo)
+    _sp.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+             "commit", "-q", "-m", "chore: old-dated tip"],
+            cwd=str(repo), check=True, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+            env={**os.environ, "GIT_COMMITTER_DATE": old,
+                 "GIT_AUTHOR_DATE": old})
+
+    monkeypatch.setattr(M, "PROJECT_ROOT", repo)
+    monkeypatch.setattr(M, "_git_fetch_remote", lambda *a, **k: None)
+    subjects = [c["subject"] for c in M._git_log_commits(2.0)]
+
+    # POSITIVE CONTROL: prove the old-dated tip really does defeat `--since`
+    # in THIS fixture, so a green assertion below cannot be vacuous.
+    since_out = _sp.run(
+        ["git", "log", "--all", "--since=120 minutes ago", "--format=%H"],
+        cwd=str(repo), check=True, stdout=_sp.PIPE, stderr=_sp.DEVNULL,
+    ).stdout.decode()
+    assert since_out.strip() == "", (
+        "fixture no longer reproduces the traversal cutoff -- `--since` "
+        "returned commits, so this test can no longer detect a regression")
+
+    assert len(subjects) == 7, subjects
+    for i in range(1, 8):
+        assert any(f"recent work {i}" in s for s in subjects), (i, subjects)
+    # The old-dated tip itself is correctly OUTSIDE the 2h window.
+    assert not any("old-dated tip" in s for s in subjects), subjects
 
 
 def test_scan_skips_when_no_surface_named(tmp_path, monkeypatch):

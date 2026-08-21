@@ -345,6 +345,102 @@ def test_runner_recently_active_branches(tmp_path):
     assert st._runner_recently_active("bravo", cutoff, tmp_path) is False
 
 
+def _set_body_heartbeat(project_root, agent, sid, when):
+    """Create agents/<agent>/sessions/<sid>/body-heartbeat with mtime == `when`.
+
+    The SAME-BOX per-Body signal (heartbeat-tick.sh), deliberately NOT the
+    syncable `session/body-heartbeat-<sid>.json` carrier — that one's mtime does
+    not survive the sync and it can be written by another machine."""
+    hb = (project_root / st.AGENTS_PARENT_DIR / agent / st.SESSIONS_DIRNAME
+          / sid / "body-heartbeat")
+    hb.parent.mkdir(parents=True, exist_ok=True)
+    hb.write_text("tick", encoding="utf-8")
+    ts = when.timestamp()
+    os.utime(hb, (ts, ts))
+    return hb
+
+
+def test_body_recently_active_branches(tmp_path):
+    """. A worker Body never writes the agent-wide runner-heartbeat
+    (it is agent-state=IDLE by design and heartbeat-tick.sh refuses the write),
+    so its liveness has to be read from the per-session heartbeat instead."""
+    cutoff = _NOW - datetime.timedelta(hours=6)
+    # project_root None -> True (cannot verify -> treat as alive -> do NOT reap)
+    assert st._body_recently_active("alpha", _NOW, None) is True
+    # no sessions dir at all -> False (nothing claims to be alive)
+    assert st._body_recently_active("alpha", cutoff, tmp_path) is False
+    # a STALE body heartbeat is not liveness
+    _set_body_heartbeat(tmp_path, "alpha", "sid-old",
+                        _NOW - datetime.timedelta(hours=12))
+    assert st._body_recently_active("alpha", cutoff, tmp_path) is False
+    # ANY fresh Body makes the agent live on this box
+    _set_body_heartbeat(tmp_path, "alpha", "sid-live", _NOW)
+    assert st._body_recently_active("alpha", cutoff, tmp_path) is True
+    # scoped to the named agent — bravo's Body must not vouch for charlie
+    _set_body_heartbeat(tmp_path, "bravo", "sid-b", _NOW)
+    assert st._body_recently_active("charlie", cutoff, tmp_path) is False
+
+
+def test_agent_recently_active_ors_runner_and_body(tmp_path):
+    """The predicate the reaper actually needs. Either signal alone is enough;
+    absence of BOTH is what makes an agent reapable."""
+    cutoff = _NOW - datetime.timedelta(hours=6)
+    assert st._agent_recently_active("alpha", cutoff, tmp_path) is False
+    # runner only (a reducer)
+    _set_heartbeat(tmp_path, "alpha", _NOW)
+    assert st._agent_recently_active("alpha", cutoff, tmp_path) is True
+    # body only (a worker) — the case that was broken
+    assert st._runner_recently_active("worker", cutoff, tmp_path) is False
+    _set_body_heartbeat(tmp_path, "worker", "sid-w", _NOW)
+    assert st._agent_recently_active("worker", cutoff, tmp_path) is True
+
+
+def test_live_worker_record_survives_a_reap(tmp_path):
+    """THE OUTCOME-2 PIN, and the one that discriminates.
+
+    Reproduces the measured incident (cc-08 2026-08-19, again on cc-07
+    2026-08-20 with a live Body): a worker's ACTIVE record, older than the 24h
+    freshness window, with a fresh per-Body heartbeat and NO agent-wide
+    runner-heartbeat. Before the fix `reaped_ids` contained the EXECUTING SID
+    and the record was flipped to status=unknown mid-execution.
+
+    Note the freshness window is deliberately expired here. That window was the
+    only thing incidentally protecting live workers, and it protects nothing
+    once a session runs longer than a day — the live specimen that motivated
+    this was 115.7h old."""
+    _seed_record(tmp_path, "worker", "sid-executing", machine_id="machine-A")
+    _set_body_heartbeat(tmp_path, "worker", "sid-executing", _NOW)
+    # the agent-wide heartbeat is ABSENT, exactly as on a real worker box
+    assert not (tmp_path / st.AGENTS_PARENT_DIR / "worker" / st.SESSION_DIRNAME
+                / "runner-heartbeat").exists()
+
+    summary = st.reap_stale_active(world_dir=tmp_path, project_root=tmp_path,
+                                   now=_NOW, machine_id="machine-A")
+
+    assert summary["reaped"] == 0, (
+        "a live worker Body's in-flight record was reaped — this is the "
+        "g-115-6939 corruption, not a stale-orphan cleanup"
+    )
+    assert "sid-executing" not in summary["reaped_ids"]
+    assert summary["skipped_live"] == 1
+    assert _read(tmp_path, "worker", "sid-executing")["status"] == "active"
+
+
+def test_a_genuinely_dead_worker_is_still_reaped(tmp_path):
+    """The negative control. Without this, a fix that simply never reaps would
+    pass the test above while disabling the reaper entirely."""
+    _seed_record(tmp_path, "worker", "sid-dead", machine_id="machine-A")
+    _set_body_heartbeat(tmp_path, "worker", "sid-dead",
+                        _NOW - datetime.timedelta(hours=48))
+
+    summary = st.reap_stale_active(world_dir=tmp_path, project_root=tmp_path,
+                                   now=_NOW, machine_id="machine-A")
+
+    assert summary["reaped"] == 1
+    assert "sid-dead" in summary["reaped_ids"]
+    assert _read(tmp_path, "worker", "sid-dead")["status"] == "unknown"
+
+
 def test_reap_stale_active_flips_to_unknown(tmp_path):
     _seed_record(tmp_path, "zeta", "sid-orphan", machine_id="machine-A")
     summary = st.reap_stale_active(world_dir=tmp_path, project_root=tmp_path,

@@ -64,6 +64,15 @@ from typing import Optional
 import yaml  # type: ignore
 
 from _fileops import locked_append_jsonl  # type: ignore
+
+# Bound for the git_log_48h walk, which no longer uses `--since` ( /
+# guard-4539 — see the argv comment at that call site for why, twice over).
+# Measured 2026-08-20 on the live tree: 919 commits in the 48h window (HEAD,
+# merges included), so this is ~3.3x headroom; 0.347s vs 1.705s unbounded, and
+# this gate runs on every goal filing. Truncation is REPORTED in the check's
+# `reason` rather than absorbed, because the whole defect being fixed here is a
+# bound that shrank the window in silence.
+_DUP_LOG_WALK_MAX = 3000
 from _gate_log import log as _gate_log  # type: ignore
 from _paths import agents_root as _agents_root  # type: ignore
 from _dt import parse_naive_iso  # type: ignore  (shared tzinfo-stripping naive-ISO parse, /)
@@ -1321,11 +1330,27 @@ def _check_git_log(goal, file_paths, project_root, self_agent="", world_dir=None
         }
     try:
         out = subprocess.run(
-            # git approxidate rejects the bare unit-letter form "48h" (returns
-            # 0 commits, silently disabling this check); use "N.units.ago".
-            #  — this check was dead since inception (0/15155 firings).
-            ["git", "log", "--since=48.hours.ago",
-             "--name-only", "--pretty=format:COMMIT %H %s"],
+            # NO `--since` AT ALL ( / guard-4539). This check has now
+            # been silently disabled by that flag TWICE, for two different
+            # reasons, and the first one cost 15155 firings:
+            #   (1) FORMAT — git approxidate rejects the bare unit-letter form
+            #       "48h" and returns 0 commits. Fixed in , which
+            #       found the check "dead since inception (0/15155 firings)".
+            #   (2) TRAVERSAL CUTOFF — `--since` does not FILTER, it STOPS the
+            #       walk at the first commit older than the cutoff, so ONE
+            #       old-dated commit at the tip hides every recent commit
+            #       behind it. Measured on a fixture 2026-08-20: 7 commits 67
+            #       SECONDS old returned EMPTY. Non-monotonic commit dates are
+            #       ordinary (rebase, cherry-pick, --amend --date, a merged
+            #       long-lived branch, peer clock skew).
+            # Both fail SILENTLY and in the permissive direction: no overlap
+            # found => no duplicate => the goal gets filed. So the window moves
+            # onto %ct, parsed below, and the walk is bounded by COUNT instead.
+            # --max-count=3000 measured against 919 commits in the live 48h
+            # window (HEAD, merges included) — 3.3x headroom, 0.347s versus
+            # 1.705s unbounded, and this gate runs on every goal filing.
+            ["git", "log", f"--max-count={_DUP_LOG_WALK_MAX}",
+             "--name-only", "--pretty=format:COMMIT %ct %H %s"],
             capture_output=True, text=True, timeout=10,
             encoding="utf-8", errors="replace",
             cwd=str(project_root),
@@ -1348,12 +1373,36 @@ def _check_git_log(goal, file_paths, project_root, self_agent="", world_dir=None
     lines = (out.stdout or "").splitlines()
     raw_matches = []
     current = None
+    # The 48h window, applied HERE on %ct instead of by `--since` in the argv
+    # above. `current is None` now means "this commit is outside the window (or
+    # we have not seen a COMMIT header yet)", so its file lines are skipped.
+    cutoff = int(dt.datetime.now().timestamp()) - 48 * 3600
+    n_commits = 0
+    oldest_ct = None
     for line in lines:
         line = line.strip()
         if not line:
             continue
         if line.startswith("COMMIT "):
-            current = line[len("COMMIT "):][:80]
+            n_commits += 1
+            rest = line[len("COMMIT "):]
+            ts, _, disp = rest.partition(" ")
+            try:
+                _ct = int(ts)
+                in_window = _ct >= cutoff
+                if oldest_ct is None or _ct < oldest_ct:
+                    oldest_ct = _ct
+            except ValueError:
+                # Unparseable timestamp: KEEP the commit. This filter replaced
+                # a bound whose failure mode was dropping real commits, and
+                # silently reproducing that on a bad stamp would re-disable the
+                # check a third time. An extra advisory match costs a reader a
+                # second look; a missed one files a duplicate goal.
+                in_window = True
+                disp = rest
+            current = disp[:80] if in_window else None
+            continue
+        if current is None:
             continue
         # sorted() — set iteration is per-process; first-match
         # `goal_file_pattern` must be deterministic.
@@ -1432,10 +1481,27 @@ def _check_git_log(goal, file_paths, project_root, self_agent="", world_dir=None
             "matches": [],
             "advisories": demoted[:5],
         }
+    # A clean PASS is what authorizes filing, so if the walk was truncated the
+    # reason must say the window was incomplete rather than reading as "nothing
+    # was there". This check has been silently narrowed twice already; a bound
+    # that reports its own ceiling cannot make that three.
+    # Hitting the ceiling is NOT by itself truncation: --max-count always
+    # returns its full budget on a repo larger than the budget, so a bare
+    # `n_commits >= MAX` test fires on EVERY run here (12k+ commits) and trains
+    # the reader to ignore it. Measured on the live gate while adding this.
+    # Real truncation is running out of BUDGET before running out of WINDOW --
+    # i.e. the oldest commit we managed to walk is still inside the 48h window,
+    # so older in-window commits exist that we never looked at.
+    reason = "no file-path overlap with recent 48h commits"
+    if (n_commits >= _DUP_LOG_WALK_MAX
+            and oldest_ct is not None and oldest_ct >= cutoff):
+        reason += (" [INCOMPLETE: walk hit the --max-count="
+                   + str(_DUP_LOG_WALK_MAX) + " ceiling, so commits beyond it "
+                   "were not examined — duplicate detection may under-report]")
     return {
         "name": "git_log_48h",
         "passed": True,
-        "reason": "no file-path overlap with recent 48h commits",
+        "reason": reason,
         "matches": [],
     }
 

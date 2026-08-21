@@ -634,6 +634,29 @@ depends_on:
 
 **Rules:**
 - Each `depends_on.goal_id` MUST also appear in `blocked_by` (structural consistency)
+  — **enforced at the goal-ADD sites** (daemon and CLI) by
+  `core/scripts/gates/depends_on_consistency.py` since 2026-08-20, g-115-6979.
+  It had gone unenforced for the life of the field: `aspirations.py::validate_goal`
+  carried the check, but the daemon's `_validate_goal` subset omits it and under
+  `no-python-cli-fallback` the daemon IS the live write path — the same orphaning
+  that produced the prose-verification false-negatives (g-115-1440). Measured over
+  2771 live goal records: 6 non-empty `depends_on` carriers, **exactly 1 conforming**;
+  4 used bare id strings rather than `{goal_id, expects}` objects.
+- **These two fields are not interchangeable, and the difference is the whole point.**
+  `blocked_by` SEQUENCES — `goal-selector.py` reads it and only it (zero occurrences
+  of `depends_on` in that file), so a prerequisite named nowhere else suppresses
+  nothing and the goal is offered as if unblocked. `depends_on` carries the
+  output-passing payload for the injection protocol below. A goal written with
+  `depends_on` alone LOOKS sequenced and is not (guard-4554).
+- Do NOT resolve that by teaching the selector to read `depends_on`. Its predicate
+  tests membership against `done_ids`, a **set** (`goal-selector.py:2127`), and a
+  `{goal_id, expects}` dict is unhashable — a union raises `TypeError` on the first
+  dict-shaped carrier it scores, crashing the fleet's mandatory selection entry
+  point rather than suppressing anything.
+- The gate is wired at ADD sites ONLY, never in `_validate_goal`. Pre-existing
+  violators must stay mutable: routing it through `update_goal`'s in-lock candidate
+  validation would make every status change on them fail. Same reasoning as
+  `_assert_no_invalid_checks`.
 - When a dependency resolves, the verify skill reads the `handoff` board message for the
   completed goal and prepends the factual output to the dependent goal's description
   as a `## Predecessor Output` section

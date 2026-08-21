@@ -26,6 +26,9 @@ Accept paths (any ONE lifts the block, mirroring Step 8.55):
      X-Mind-Override-Residual) — audited to
      `<world_dir>/residual-work-overrides.jsonl`.
   3. outcome_note records an explicit owner decline.
+  4. the residual CLAUSE is a provenance disclaimer, not undone work —
+     attribution language plus a concrete artifact reference (PR / sha) in
+     the same sentence that tripped the marker (g-115-6980).
 
 PRECEDENCE IS LOAD-BEARING, AND IT USED TO BE WRONG (g-115-6254). Paths 2 and
 3 were swapped, and every path returned EARLY, so an owner-decline INFERRED
@@ -72,6 +75,7 @@ Output dict shape (evaluate):
       "residual_clause": str | None,          # sentence behind the suggestion
       "carrier_refs_found": [{"goal_id": str, "live": bool, "status": str|None}],
       "owner_decline_found": bool,
+      "provenance_found": bool,               # accept path 4 (clause-scoped)
       "successor_title": str | None,          # Layer-D suggestion
       "successor_description": str | None,
       "successor_priority": str,
@@ -146,6 +150,48 @@ OWNER_DECLINE_RE = re.compile(
     r"(?:\bowner\b.{0,40}?\bdeclin\w+|\bdeclined\s+by\s+(?:the\s+)?"
     r"(?:owner|user)\b|\buser\s+declined\b)",
     re.IGNORECASE | re.DOTALL,
+)
+
+# --- Accept path 4: PROVENANCE () ---------------------------------
+# A residual marker and an ATTRIBUTION DISCLAIMER are lexically identical:
+# "No code was written" reads the same whether it means "the work is undone"
+# or "someone else already did it". The canonical clause () is
+# BOTH at once — it trips `no_code_written` and, in the same breath, names
+# the artifact that refutes it.
+#
+# Two conjuncts are required, and each covers the other's failure mode:
+#   ATTRIBUTION_RE  — credits the work to somewhere else. Action-shaped
+#                     phrases ONLY: guard-1892 forbids matcher text that is
+#                     the NAME of a rule/policy, because such a phrase fires
+#                     on the rule's READERSHIP rather than on the work.
+#   ARTIFACT_REF_RE — a concrete, checkable referent (PR number or commit
+#                     sha). Attribution prose alone is unfalsifiable; a
+#                     named artifact is something a reader can go check.
+#
+# PRESENCE IS NOT REACHABILITY (guard-3398, guard-4556). The right proof is
+# the remote — `gh pr view <N>` reporting MERGED, or `git merge-base
+# --is-ancestor <sha> origin/main`. This gate CANNOT run either: the module
+# contract above is "reads no environment variables; no subprocess calls",
+# and it executes inside the daemon's write lock. So this path is INFERRED,
+# is ranked LAST with the other inferred signal, and is reported separately
+# as `provenance_found` so an auditor can tell which path lifted the block.
+# Do NOT promote it above the queue-verified carrier or the explicit
+# override — an inferred signal must never pre-empt an explicit one, which
+# is the precedence bug  already paid for once.
+ATTRIBUTION_RE = re.compile(
+    r"\b(?:landed\s+in|shipped\s+in|merged\s+(?:in|as|at)|"
+    r"was\s+already\s+(?:shipped|done|merged|implemented|fixed|landed)|"
+    r"already\s+(?:shipped|done|merged|implemented|fixed|landed)|"
+    r"(?:work|fix|change)\s+(?:was\s+)?(?:done|written|implemented)\s+by|"
+    r"implemented\s+in)\b",
+    re.IGNORECASE,
+)
+
+# Hex-sha shape with at least one digit — the digit requirement keeps
+# ordinary a-f words ("defaced", "deadbeef") from reading as commits.
+ARTIFACT_REF_RE = re.compile(
+    r"(?:\bPR\s*#?\d+\b|\bpull/\d+\b|\b(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b)",
+    re.IGNORECASE,
 )
 
 LEDGER_BASENAME = "residual-work-overrides.jsonl"
@@ -230,6 +276,7 @@ def evaluate(goal_id: str,
         "residual_clause": None,
         "carrier_refs_found": [],
         "owner_decline_found": False,
+        "provenance_found": False,
         "successor_title": None,
         "successor_description": None,
         "successor_priority": (goal_priority if goal_priority in
@@ -273,13 +320,26 @@ def evaluate(goal_id: str,
             live_found = True
     result["owner_decline_found"] = bool(OWNER_DECLINE_RE.search(text))
 
+    # The clause behind the first marker — computed ONCE here because three
+    # separate consumers need it below (the override audit row, the
+    # provenance scan, and the Layer-D successor title).
+    clause = _residual_clause(text, first_start or 0)
+
+    # Provenance is scanned against the CLAUSE, never the whole note. A long
+    # outcome_note routinely cites some PR and says "already done" about a
+    # DIFFERENT matter than the one that tripped the marker; scanning the
+    # whole text would let any unrelated citation suppress a real residual.
+    # Requiring both conjuncts inside the one sentence that tripped the
+    # marker is what keeps this from becoming a blanket bypass.
+    result["provenance_found"] = bool(
+        ATTRIBUTION_RE.search(clause) and ARTIFACT_REF_RE.search(clause))
+
     # Accept path 2 — the audited override. Ranked ABOVE the owner-decline
     # inference and evaluated even when a live carrier was found, because an
     # override that was PASSED must always be recorded and always audited:
     # the silent-bypass failure was `override_applied` reading None with an
     # empty ledger while the caller reported success.
     if override:
-        clause = _residual_clause(text, first_start or 0)
         result["residual_clause"] = clause
         result["override_applied"] = override
         _append_override_ledger(world_dir, {
@@ -297,12 +357,31 @@ def evaluate(goal_id: str,
     if live_found:
         return result
 
-    # Accept path 3: owner decline, INFERRED from prose. Last because it is
-    # the only accept path that cannot be verified against anything.
+    # Accept path 3: owner decline, INFERRED from prose. Ranked below the
+    # verifiable paths because it cannot be checked against anything.
     if result["owner_decline_found"]:
         return result
 
-    clause = _residual_clause(text, first_start or 0)
+    # Accept path 4: PROVENANCE, INFERRED from prose (). The clause
+    # credits the work to a named artifact instead of naming work still to do.
+    #
+    # The gate's original cost model said a false positive is cheap — "one
+    # educational refusal with a working escape named in the message". That
+    # was MEASURED FALSE on 2026-08-20: closing  filed TWO spurious
+    # HIGH successors (the gate auto-files on every attempt, and an override
+    # permits the close without suppressing the Layer-D file), and one of them
+    # ranked #1 of 1325 candidates and consumed a full iteration of a DIFFERENT
+    # agent on a DIFFERENT box before being recognised as spurious.
+    #
+    # It is also selective against the population the framework is actively
+    # draining: completed-not-closed goals can ONLY be closed honestly by
+    # saying the work was already done by someone else, so the drain lanes
+    # (precheck 0.5g.6/0.5g.7) manufacture exactly the sentence this marker
+    # punishes. Left unfixed, the cheapest way past the gate is to DELETE the
+    # attribution — evidence-laundering that trains false credit.
+    if result["provenance_found"]:
+        return result
+
     result["residual_clause"] = clause
 
     # Block + Layer-D suggestion. Title from the residual clause (the

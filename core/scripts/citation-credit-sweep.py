@@ -84,10 +84,24 @@ def _now() -> str:
 
 
 def commits_in_window(repo: Path, days: int) -> List[Tuple[str, str]]:
-    """[(sha, full message)] oldest-first, bounded to the window."""
+    """[(sha, full message)] oldest-first, bounded to the window.
+
+    Windowed on COMMITTER TIMESTAMP, not `git log --since` (g-115-6959 /
+    guard-4539). `--since` is a TRAVERSAL CUTOFF, not a filter: git walks from
+    the tip and STOPS at the first commit older than the bound, so ONE
+    old-dated commit at the tip hides every recent commit behind it (measured
+    on a fixture 2026-08-20: 7 commits 67 SECONDS old returned EMPTY). Commit
+    dates go non-monotonic in ordinary operation (rebase, cherry-pick,
+    --amend --date, a merged long-lived branch, peer clock skew).
+
+    Here a hidden commit is credit that is never awarded and never will be:
+    the sweep is cadence-driven and ledgers what it has SEEN, so a commit the
+    window skipped is not retried later -- by the next run it has aged out of
+    the window entirely. Silent, permanent under-credit.
+    """
+    cutoff = int(datetime.now().timestamp()) - int(days) * 86400
     out = subprocess.run(
-        ["git", "log", f"--since={days} days ago", "--reverse",
-         "--format=%H%x1f%B%x1e"],
+        ["git", "log", "--reverse", "--format=%ct%x1f%H%x1f%B%x1e"],
         capture_output=True, text=True, cwd=str(repo), timeout=120)
     if out.returncode != 0:
         raise RuntimeError(f"git log failed: {out.stderr.strip()[:200]}")
@@ -96,7 +110,18 @@ def commits_in_window(repo: Path, days: int) -> List[Tuple[str, str]]:
         chunk = chunk.strip("\n\r ")
         if not chunk or "\x1f" not in chunk:
             continue
-        sha, msg = chunk.split("\x1f", 1)
+        parts = chunk.split("\x1f", 2)
+        if len(parts) != 3:
+            continue
+        ct, sha, msg = parts
+        try:
+            if int(ct.strip()) < cutoff:
+                continue
+        except ValueError:
+            # Unparseable stamp: KEEP. Credit is awarded at most once per sha
+            # (the ledger dedupes), so an extra candidate is harmless while a
+            # dropped one is credit lost for good.
+            pass
         commits.append((sha.strip(), msg))
     return commits
 

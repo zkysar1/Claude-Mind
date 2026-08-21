@@ -20,8 +20,10 @@ done; alpha burned execution time rediscovering it.
 This check is the missing third probe: at goal-pickup, BEFORE claiming, look at
 what was actually COMMITTED in the last N hours and warn when a recent commit
 touched the same surface (files or title-keywords) as the goal about to be
-claimed. Two cheap probes — `git log --since=<N>h` over the affected surface +
-the partner `last_active` snapshot — exactly as g-305-03 specifies.
+claimed. Two cheap probes — a bounded `git log` over the affected surface,
+windowed on COMMITTER TIMESTAMP (see `_ct_cutoff`; NOT `git log --since`, which
+is a traversal cutoff — g-115-6959 / guard-4539) + the partner `last_active`
+snapshot — exactly as g-305-03 specifies.
 
 UNCOMMITTED EXTENSION (g-115-1505): the committed-log probe above is blind to a
 partner's IN-FLIGHT edit that has not been committed yet — the exact 2026-06-16
@@ -985,15 +987,98 @@ def _read_goal(source, goal_id):
     return None
 
 
-def _since_arg(since_hours):
-    """`--since` argument formatted with INTEGER minutes. Never interpolate a
-    float into git approxidate: on git 2.43 `--since="2.0 hours ago"` silently
-    parses as NO filter (full-history scan → 6-day-old commits flagged as
-    2h-window races, observed live 2026-07-17 on g-115-817 pickup) while
-    `--since="48.0 hours ago"` parses as an empty window (0 commits → the
-    probe scans nothing). Same float, opposite failure directions — integer
-    minutes preserve fractional hours and are unambiguous. Pure."""
-    return f"--since={max(1, int(round(float(since_hours) * 60)))} minutes ago"
+# Bound for the count-limited walk that REPLACED `--since` in every probe
+# below (). Sized against measured volume in this repo on 2026-08-20:
+# 519 commits in the busiest 48h window, 1562 in 168h (the widest default,
+# --shipped-since-hours), 12198 reachable from --all in total. 5000 leaves ~3x
+# headroom over the widest window while still bounding a pathological repo.
+# Cost is not the reason for the bound and never was: --max-count=2000 measured
+# 0.290s against --since's 0.249s on the same tree.
+_LOG_WALK_MAX = 5000
+
+
+def _ct_cutoff(since_hours, now_epoch=None):
+    """Epoch-seconds cutoff for a since_hours window. Pure.
+
+    Replaces `--since` as this module's time bound. `git log --since` is a
+    TRAVERSAL CUTOFF, not a filter: git walks from the tip and STOPS at the
+    first commit dated before the cutoff, so ONE old-dated commit at the tip
+    hides every recent commit behind it (guard-4539). Measured on a fixture
+    2026-08-20: 7 commits 67 seconds old behind one old-dated tip returned
+    EMPTY for `--since='60 minutes ago'`, and 7 for a %ct filter. Commit dates
+    go non-monotonic in ordinary operation — rebase, cherry-pick,
+    `--amend --date`, a merged long-lived branch, peer clock skew.
+
+    Every probe in this module fails in the SILENT direction on an empty
+    result: empty AUTHORIZES pickup (no overlap found) or reports
+    GENUINELY-PENDING (no shipped work found). So a false empty here does not
+    merely under-report — it green-lights duplicate work.
+
+    The predecessor `_since_arg` was deleted rather than kept as a prefilter:
+    a `--since` bound can only DROP rows a %ct filter would keep, so retaining
+    a convenient helper would just invite the cutoff back in.
+    """
+    now = int(now_epoch if now_epoch is not None
+              else dt.datetime.now().timestamp())
+    return now - int(round(float(since_hours) * 3600))
+
+
+def _within_cutoff(commits, cutoff, key="ct"):
+    """Commits whose committer timestamp is at or after `cutoff`. Pure.
+
+    A record missing/unparseable in `key` is KEPT, deliberately: this filter
+    replaced a bound whose failure mode was dropping real work, and an
+    unreadable timestamp must not silently reproduce that. Over-reporting an
+    overlap costs a second look; under-reporting authorizes duplicate work.
+    """
+    kept = []
+    for c in commits:
+        raw = c.get(key)
+        try:
+            if int(raw) >= cutoff:
+                kept.append(c)
+        except (TypeError, ValueError):
+            kept.append(c)
+    return kept
+
+
+def _warn_if_walk_truncated(walked, cutoff, where):
+    """Announce on stderr when the count-bounded walk ran out of BUDGET before
+    it ran out of WINDOW.
+
+    The bound REPLACED a time bound whose defining flaw was silence: a
+    `--since` walk cut short by one old-dated tip returned empty and looked
+    exactly like 'nothing happened'. A count bound can under-report too, so the
+    difference that matters is not that this bound cannot truncate — it is that
+    truncation SAYS SO.
+
+    Hitting the ceiling is NOT by itself truncation, and testing for that alone
+    is a false-positive generator: `--max-count` always returns its full budget
+    on a repo bigger than the budget, so `len(walked) >= _LOG_WALK_MAX` fires on
+    EVERY run of a large repo and teaches the reader to ignore the warning.
+    (Measured on the sibling gate while this was being written — it fired on a
+    fully-covered window.) The real condition is that the OLDEST commit we
+    managed to walk is still inside the window: then in-window commits exist
+    beyond the budget that this probe never examined.
+
+    Advisory only; never changes the result, never raises.
+    """
+    if len(walked) < _LOG_WALK_MAX:
+        return
+    cts = []
+    for c in walked:
+        try:
+            cts.append(int(c.get("ct")))
+        except (TypeError, ValueError):
+            continue
+    if not cts or min(cts) < cutoff:
+        return          # the walk reached past the window — fully covered
+    print(f"[goal-pickup-coord] WARNING: {where} walk hit the "
+          f"--max-count={_LOG_WALK_MAX} ceiling while still INSIDE the "
+          f"window, so in-window commits older than the {_LOG_WALK_MAX}th "
+          f"were never examined. Overlap detection may under-report — widen "
+          f"_LOG_WALK_MAX if this repo is genuinely this busy.",
+          file=sys.stderr)
 
 
 def _git_fetch_remote(timeout_s=10, cwd=None):
@@ -1070,9 +1155,16 @@ def _git_behind_count(repo_dir, timeout_s=10):
 
 def _parse_name_only_log(out):
     """Parse RS/US-separated `git log --name-only` output into
-    [{hash, subject, files}]. Pure; shared by the mind-repo and product-repo
-    log probes (g-115-2428 extraction — behavior identical to the original
-    inline parser)."""
+    [{hash, ct, subject, files}]. Pure; shared by the mind-repo and product-repo
+    log probes (g-115-2428 extraction).
+
+    The head is `%H US %ct US %s` (g-115-6959 added `%ct`): both callers dropped
+    `--since` for a count-bounded walk plus a committer-timestamp filter, and
+    that filter needs the timestamp to reach Python. A head carrying only two
+    fields still parses — `ct` comes back None and `_within_cutoff` KEEPS the
+    record rather than dropping it, so a format/parser skew degrades to
+    over-reporting instead of to the silent empty this change exists to remove.
+    """
     rs, us = "\x1e", "\x1f"
     commits = []
     for rec in out.split(rs):
@@ -1080,9 +1172,14 @@ def _parse_name_only_log(out):
         if not rec:
             continue
         head, _, body = rec.partition("\n")
-        h, _, subject = head.partition(us)
+        parts = head.split(us)
+        h = parts[0].strip()
+        ct = parts[1].strip() if len(parts) >= 3 else None
+        subject = parts[2] if len(parts) >= 3 else (
+            parts[1] if len(parts) == 2 else "")
         files = [ln.strip() for ln in body.split("\n") if ln.strip()]
-        commits.append({"hash": h.strip(), "subject": subject, "files": files})
+        commits.append({"hash": h, "ct": ct, "subject": subject,
+                        "files": files})
     return commits
 
 
@@ -1097,17 +1194,20 @@ def _git_log_commits(since_hours):
     file lists parse unambiguously. Fail-open: any git error returns []."""
     _git_fetch_remote()
     rs, us = "\x1e", "\x1f"
-    fmt = f"{rs}%H{us}%s"
+    fmt = f"{rs}%H{us}%ct{us}%s"
     try:
         out = subprocess.check_output(
-            ["git", "log", "--all", _since_arg(since_hours),
+            ["git", "log", "--all", f"--max-count={_LOG_WALK_MAX}",
              "--no-merges", "--name-only", f"--format={fmt}"],
             cwd=str(PROJECT_ROOT), stderr=subprocess.DEVNULL,
         ).decode("utf-8", "replace")
     except Exception as e:
         print(f"[goal-pickup-coord] git log failed: {e}", file=sys.stderr)
         return []
-    return _parse_name_only_log(out)
+    walked = _parse_name_only_log(out)
+    cutoff = _ct_cutoff(since_hours)
+    _warn_if_walk_truncated(walked, cutoff, "mind repo")
+    return _within_cutoff(walked, cutoff)
 
 
 # ── Product-repo probe: impure helpers () ──────────────────────────
@@ -1296,16 +1396,19 @@ def _git_log_commits_at(repo_dir, since_hours):
     of every clone in a workspace container. Scans --all so fetched
     remote-tracking refs are visible. Fail-open: any git error → []."""
     rs, us = "\x1e", "\x1f"
-    fmt = f"{rs}%H{us}%s"
+    fmt = f"{rs}%H{us}%ct{us}%s"
     try:
         out = subprocess.check_output(
-            ["git", "log", "--all", _since_arg(since_hours),
+            ["git", "log", "--all", f"--max-count={_LOG_WALK_MAX}",
              "--no-merges", "--name-only", f"--format={fmt}"],
             cwd=str(repo_dir), stderr=subprocess.DEVNULL,
         ).decode("utf-8", "replace")
     except Exception:
         return []
-    return _parse_name_only_log(out)
+    walked = _parse_name_only_log(out)
+    cutoff = _ct_cutoff(since_hours)
+    _warn_if_walk_truncated(walked, cutoff, f"product repo {repo_dir}")
+    return _within_cutoff(walked, cutoff)
 
 
 def _repo_branch_hits(repo_dir, goal_id):
@@ -1910,17 +2013,25 @@ def _own_goal_commits(goal_id, since_hours, cwd=None,
         return []
     try:
         out = subprocess.check_output(
-            # _since_arg, NOT an f-string — a float in git approxidate is a
-            # SILENT total failure here, not a rounding error. Measured on this
-            # box 2026-08-09 while dogfooding this very function:
-            # `--since="168.0 hours ago"` returns ZERO commits with rc=0 on a
-            # repo with thousands, so every invocation reported
-            # GENUINELY-PENDING regardless of evidence — including for a goal
-            # committed 30 minutes earlier. The nine unit tests below stayed
-            # green throughout, because they pin the pure classifier and this
-            # is the impure probe that feeds it. _since_arg's own docstring
-            # already documented this exact trap, twenty lines up.
-            ["git", "log", "--all", _since_arg(since_hours),
+            # NO `--since` here (). Two independent failure modes hit
+            # this one argv, and only the second is fixed by formatting.
+            # (1) TRAVERSAL CUTOFF: `--since` stops the walk at the first
+            #     commit older than the cutoff, so ONE old-dated commit at the
+            #     tip hides every recent commit behind it (guard-4539; measured
+            #     on a fixture 2026-08-20 — 7 commits 67s old returned EMPTY).
+            # (2) FLOAT APPROXIDATE: `--since="168.0 hours ago"` returned ZERO
+            #     commits with rc=0 on a repo with thousands (measured
+            #     2026-08-09 dogfooding this function), so every invocation
+            #     reported GENUINELY-PENDING regardless of evidence — including
+            #     for a goal committed 30 minutes earlier.
+            # Both are SILENT and both fail in the same direction: no shipped
+            # work found ⇒ the goal reads as genuinely pending ⇒ finished work
+            # gets redone. `--grep` is highly selective, so `--max-count` alone
+            # bounds the walk; the window is applied below against `%cI`, which
+            # this format already carries. The nine unit tests stayed green
+            # through (2), because they pin the pure classifier and this is the
+            # impure probe that feeds it.
+            ["git", "log", "--all",
              f"--grep={goal_id}", "--no-merges", "--name-only",
              f"--format={_RS}%H{_US}%cI{_US}%s", "--max-count=25"],
             cwd=(str(cwd) if cwd else None), stderr=subprocess.DEVNULL,
@@ -1928,6 +2039,8 @@ def _own_goal_commits(goal_id, since_hours, cwd=None,
         ).decode("utf-8", "replace")
     except Exception:
         return []
+    _shipped_cutoff = (dt.datetime.now().astimezone()
+                       - dt.timedelta(hours=float(since_hours)))
     commits = []
     for rec in out.split(_RS):
         rec = rec.strip("\n")
@@ -1937,6 +2050,20 @@ def _own_goal_commits(goal_id, since_hours, cwd=None,
         parts = head.split(_US)
         if len(parts) < 3 or not parts[0].strip():
             continue
+        # The window, applied HERE rather than by `--since` in the argv above
+        # (). %cI carries the offset, so parse tz-AWARE and compare
+        # against an aware `now` — a naive strip would mis-window any commit
+        # authored on a box in another zone. Fail-open on an unparseable stamp:
+        # KEEP the commit. This filter replaced a bound whose failure was
+        # dropping real shipped work, and re-creating that on a bad timestamp
+        # would reintroduce the exact defect. Over-reporting shipped work costs
+        # a second look; under-reporting redoes finished work.
+        try:
+            _committed = dt.datetime.fromisoformat(parts[1].strip())
+            if _committed < _shipped_cutoff:
+                continue
+        except (TypeError, ValueError):
+            pass
         subject = parts[2].strip()
         # --grep matches the WHOLE MESSAGE, so a commit that merely CITES this
         # goal id in its body arrives here as if it were this goal's work.
