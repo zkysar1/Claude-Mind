@@ -63,10 +63,19 @@ def _active_agents() -> tuple:
     return get_active_agents()
 
 
-# Back-compat shim: callers (capability-route-gate.py CLI) may still import
-# ACTIVE_AGENTS as a constant. Resolved once at import; if the agent set
-# changes mid-process, callers must re-import or call _active_agents().
-ACTIVE_AGENTS = _active_agents()
+# Back-compat shim: callers (capability-route-gate.py CLI, aspirations_write
+# in the daemon) may still import ACTIVE_AGENTS as a constant. Served lazily
+# via PEP 562 so (a) the roster is computed at ACCESS time — a plain attribute
+# read stays fresh across /start adding an agent, and a `from ... import`
+# binds the roster as of ITS import moment, same as before; and (b) importing
+# this module can never crash on pre-init deployment state — the prior eager
+# `ACTIVE_AGENTS = _active_agents()` ran get_active_agents() at import and
+# killed the daemon on a bare clone with no agents root (g-367-03, measured
+# 2026-08-21; _agents.py is now tolerant too, this is the second layer).
+def __getattr__(name: str):
+    if name == "ACTIVE_AGENTS":
+        return _active_agents()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _load_routing_tables() -> tuple:

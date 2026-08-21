@@ -58,6 +58,8 @@ def _set_default_agent():
         return
     project_root = Path(__file__).resolve().parents[3]
     agents_root = project_root / _AGENTS_PARENT_DIR if _AGENTS_PARENT_DIR else project_root
+    if not agents_root.is_dir():
+        return  # pre-init clone: no agents/ yet, nothing to default to (g-367-03)
     for entry in sorted(agents_root.iterdir()):
         if entry.is_dir() and (entry / "local-paths.conf").is_file():
             os.environ["MIND_AGENT"] = entry.name
@@ -578,6 +580,9 @@ def _purge_phantom_team_state_shards():
         from _agents import AGENTS_PARENT_DIR as _APD
     except Exception:
         yield
+        return
+    if _WD is None:
+        yield  # pre-init clone: no world configured, nothing to purge (g-367-03)
         return
     shards = _P(_WD) / "team-state" / "agents"
     yield

@@ -106,12 +106,17 @@ from _utilization_store import (load_counters as _load_counters,
 # top-utility meta-lessons without dominating the reasoning_bank result.
 UNIVERSAL_RB_CAP = 5
 
-# Collective domain stores (world/)
-TREE_PATH = WORLD_DIR / "knowledge" / "tree" / "_tree.yaml"
-RB_PATH = WORLD_DIR / "reasoning-bank.jsonl"
-GUARD_PATH = WORLD_DIR / "guardrails.jsonl"
-SIGS_PATH = WORLD_DIR / "pattern-signatures.jsonl"
-BELIEFS_PATH = WORLD_DIR / "knowledge" / "beliefs.yaml"
+# Collective domain stores (world/). None-guarded like EXP_PATH/EI_PATH below:
+# WORLD_DIR is None on a pre-init deployment (the _paths.py hard-cut), and the
+# daemon imports this module at load_all() before any world exists (g-367-03).
+# None is correct, not a placeholder — the daemon endpoint rebinds every one of
+# these per-request from ctx paths (mind_api/src/endpoints/retrieve.py, the
+# _swap_lock block), and CLI consumers None-guard (`if R.TREE_PATH else {}`).
+TREE_PATH = WORLD_DIR / "knowledge" / "tree" / "_tree.yaml" if WORLD_DIR else None
+RB_PATH = WORLD_DIR / "reasoning-bank.jsonl" if WORLD_DIR else None
+GUARD_PATH = WORLD_DIR / "guardrails.jsonl" if WORLD_DIR else None
+SIGS_PATH = WORLD_DIR / "pattern-signatures.jsonl" if WORLD_DIR else None
+BELIEFS_PATH = WORLD_DIR / "knowledge" / "beliefs.yaml" if WORLD_DIR else None
 
 # Per-agent stores (agent directory)
 #
@@ -1660,10 +1665,12 @@ def load_pattern_signatures(categories, depth="medium", read_only=False, as_of=N
 
 FRAMEWORK_RULES_DIR = PROJECT_ROOT / ".claude" / "rules"
 FRAMEWORK_CORE_CONVENTIONS_DIR = CONFIG_DIR / "conventions"
-# WORLD_DIR is always a Path (never None) thanks to the fallback chain in
-# _paths.py; the `.exists()` check below in `_framework_file_sources` handles
-# fresh worlds where the conventions subdir is absent.
-FRAMEWORK_WORLD_CONVENTIONS_DIR = WORLD_DIR / "conventions"
+# WORLD_DIR is None on a pre-init deployment (the _paths.py hard-cut retired
+# the old always-a-Path fallback chain — g-367-03), so guard the join; the
+# check in `_framework_file_sources` skips both the None case and fresh worlds
+# where the conventions subdir is absent. The daemon endpoint rebinds this
+# per-request from ctx paths, same as the store paths above.
+FRAMEWORK_WORLD_CONVENTIONS_DIR = WORLD_DIR / "conventions" if WORLD_DIR else None
 
 # Tier ordering. Rules apply across every domain, core conventions are the
 # next-broadest scope, world conventions are domain-specific. Sorting by
@@ -1705,7 +1712,7 @@ def _framework_file_sources():
     if FRAMEWORK_CORE_CONVENTIONS_DIR.exists():
         for p in sorted(FRAMEWORK_CORE_CONVENTIONS_DIR.glob("*.md")):
             yield p, "core-convention"
-    if FRAMEWORK_WORLD_CONVENTIONS_DIR.exists():
+    if FRAMEWORK_WORLD_CONVENTIONS_DIR is not None and FRAMEWORK_WORLD_CONVENTIONS_DIR.exists():
         for p in sorted(FRAMEWORK_WORLD_CONVENTIONS_DIR.glob("*.md")):
             yield p, "world-convention"
 
