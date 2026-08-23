@@ -1196,6 +1196,53 @@ def _query_inprogress_no_claim(agent: str, source: str = "agent") -> List[Dict[s
     return out
 
 
+def _query_parked_inprogress(source: str) -> List[Dict[str, Any]]:
+    """Fourth shape (2026-08-21 selection-stack review): PARKED in-progress —
+    status == "in-progress" AND a non-null defer_reason, claimed or not.
+
+    Not crash residue: an agent that discovers mid-execution it cannot finish
+    (wrong box, missing dependency) and writes a defer_reason WITHOUT
+    resetting status has deliberately parked the goal in a state the model
+    cannot express. The selector skips in-progress (never a candidate) and
+    collect_blocked's SKIP_STATUSES excludes it (never classified) — so the
+    goal is invisible in BOTH directions, with no timeout, until someone
+    converts it. Live specimen: g-326-256 (echo, parked 2026-08-15, found
+    2026-08-21 — 6 days absent from every surface while its defer_reason
+    said exactly what it was waiting on).
+
+    DETECT-ONLY: the sanctioned conversion (status->pending + blocked_by
+    [<dep>] when the defer names a dependency so it auto-releases on
+    completion, else pending with the defer kept) is a judgment call about
+    the parker's intent, so this leg reports and never mutates — regardless
+    of --apply. Fail-open like the sibling queries: any read/decode error
+    yields an empty list.
+    """
+    try:
+        raw = _rt.aspirations_read(source=source, active=True)
+    except _rt.RtError:
+        return []
+    try:
+        decoded = _rt.tolerant_decode_aggregate("active", raw)
+    except Exception:
+        return []
+    asps = decoded.get("aspirations", []) if isinstance(decoded, dict) else decoded
+    out: List[Dict[str, Any]] = []
+    for asp in asps or []:
+        asp_id = asp.get("id", "")
+        for g in asp.get("goals", []) or []:
+            if g.get("status") != "in-progress" or not g.get("defer_reason"):
+                continue
+            out.append({
+                "goal_id": g.get("id", ""),
+                "asp_id": asp_id,
+                "source": source,
+                "claimed_by": g.get("claimed_by"),
+                "defer_head": str(g.get("defer_reason"))[:120],
+                "last_modified": g.get("last_modified"),
+            })
+    return out
+
+
 def _read_all_in_flight_goal_ids() -> set:
     """Goal-ids ANY agent's team-state in_flight currently names ().
 
@@ -2215,6 +2262,24 @@ def main() -> int:
             "errors": [f"leg-failed: {type(exc).__name__}: {exc}"],
         }
 
+    # --- parked in-progress detector (fourth shape, 2026-08-21) -----------
+    # in-progress + defer_reason: deliberately parked mid-execution, invisible
+    # to BOTH selector surfaces with no timeout (see _query_parked_inprogress).
+    # DETECT-ONLY — reports identically under dry-run and --apply; conversion
+    # is the reader's call. Wrapped like the body-row reaper: an optional leg
+    # must never fail the sweep, and the paired counter is always published so
+    # a reader can tell "no parks" from "leg never ran".
+    try:
+        parked = (_query_parked_inprogress("agent")
+                  + _query_parked_inprogress("world"))
+        summary["parked_in_progress"] = parked
+        summary["parked_in_progress_count"] = len(parked)
+    except Exception as exc:  # noqa: BLE001
+        summary["parked_in_progress"] = []
+        summary["parked_in_progress_count"] = 0
+        summary["parked_in_progress_error"] = (
+            f"leg-failed: {type(exc).__name__}: {exc}")
+
     print(json.dumps(summary, indent=2, ensure_ascii=False))
 
     # Point the reader at the triage lane at the exact moment this population is
@@ -2234,6 +2299,19 @@ def main() -> int:
             f"but the reducer. To triage:\n"
             f"    bash core/scripts/completed-not-closed-triage.sh\n"
             f"  (report-only; it has no --apply and cannot change claim state)",
+            file=sys.stderr,
+        )
+    _parked = summary.get("parked_in_progress_count") or 0
+    if _parked:
+        print(
+            f"[stranded-claim-sweep] {_parked} goal(s) PARKED in-progress "
+            f"(status in-progress + defer_reason set): invisible to BOTH "
+            f"selector surfaces — never a candidate, never classified "
+            f"blocked — with no timeout. Convert each to the sanctioned "
+            f"shape: status->pending plus blocked_by:[<dep>] when the defer "
+            f"names a dependency (auto-releases when the dep completes), "
+            f"else pending with the defer kept. This sweep never converts "
+            f"(detect-only leg).",
             file=sys.stderr,
         )
     return 0

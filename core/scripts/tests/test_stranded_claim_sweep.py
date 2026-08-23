@@ -2788,3 +2788,55 @@ def test_worker_cycle_gap_figure_still_matches_its_source():
         f"worker cycle gap upper bound moved to {m.group(2)}m; "
         f"re-derive DEFAULT_CARRIER_FRESH_MINUTES against it."
     )
+
+
+# ---------------------------------------------------------------------------
+# Parked in-progress detector (fourth shape, 2026-08-21 selection-stack review)
+# ---------------------------------------------------------------------------
+
+
+def test_parked_inprogress_detected(tmp_agent, monkeypatch, capsys):
+    """in-progress + defer_reason (the  shape) is reported by the
+    detect-only leg — even when claimed by ANOTHER agent, since detection is
+    read-only and the park is invisible to both selector surfaces."""
+    agent_name, agent_dir, diary = tmp_agent
+    mod, fake = _import_and_patch_rt(monkeypatch)
+    _patch_agent_dir(monkeypatch, mod, agent_dir)
+    fake.set_query_response([])
+    fake.set_active_aspirations([{
+        "id": "asp-park", "status": "active",
+        "goals": [
+            {"id": "g-park-01", "status": "in-progress",
+             "claimed_by": "someone-else",
+             "defer_reason": "blocked_on_dependency g-park-99 — wrong box",
+             "last_modified": "2026-08-15T06:38:46"},
+            {"id": "g-park-02", "status": "pending",
+             "defer_reason": "precondition_unmet:window"},
+            {"id": "g-park-03", "status": "in-progress",
+             "claimed_by": agent_name},
+        ],
+    }], source="agent")
+
+    summary = _run_main(mod, [], capsys)
+
+    parked = summary["parked_in_progress"]
+    assert summary["parked_in_progress_count"] == 1, summary
+    assert parked[0]["goal_id"] == "g-park-01"
+    assert parked[0]["claimed_by"] == "someone-else"
+    assert parked[0]["defer_head"].startswith("blocked_on_dependency")
+    # detect-only: the leg must not have released or flipped anything
+    assert summary["released"] == 0
+
+
+def test_parked_counter_published_when_clean(tmp_agent, monkeypatch, capsys):
+    """Paired-counter contract: a clean run publishes parked_in_progress_count
+    == 0 (a reader must be able to tell 'no parks' from 'leg never ran')."""
+    agent_name, agent_dir, diary = tmp_agent
+    mod, fake = _import_and_patch_rt(monkeypatch)
+    _patch_agent_dir(monkeypatch, mod, agent_dir)
+    fake.set_query_response([])
+
+    summary = _run_main(mod, [], capsys)
+
+    assert summary["parked_in_progress"] == []
+    assert summary["parked_in_progress_count"] == 0

@@ -26,6 +26,9 @@ strategy_schemas:
     # Adversarial review pattern — originated from rb-356 release-scope bug catch
     max_adversarial_trigger_substrings: 12
     max_adversarial_protocol_questions: 8
+    # Two-pass review pattern — originated from rb-8720 disjoint-defect-sets measurement
+    max_two_pass_trigger_substrings: 12
+    max_two_pass_protocol_questions: 8
 
   evolution:
     file: "meta/evolution-strategy.yaml"
@@ -92,6 +95,13 @@ strategy_schemas:
         - adversarial_review.times_fired
         - adversarial_review.times_caught_bug
         - adversarial_review.last_triggered
+        # two_pass_review LEAF counters (2026-08-21, bravo): same character and
+        # same reasoning as the adversarial_review leaves above — telemetry
+        # written by reflect/SKILL.md Step 0.36, read by nothing that decides.
+        # Leaves only; triggers/protocol stay rollback-eligible tunables.
+        - two_pass_review.times_fired
+        - two_pass_review.times_caught_bug
+        - two_pass_review.last_triggered
       "step-attribution.yaml":
         - step_attribution
 
@@ -271,6 +281,40 @@ initial_state:
         - what predicate gates the release/end path?
         - is the release predicate a superset of the acquire predicate?
         - does any test exercise the release path without prior acquire-success?
+      last_triggered: null
+      times_fired: 0
+      times_caught_bug: 0
+    # Two-pass review pattern (rb-8720 origin, 2026-08-21).
+    # A predicate-probe pass and a timing/seam-semantics pass over the same
+    # freshly shipped territory catch DISJOINT defect sets — pass 1 verifying
+    # a predicate does not verify WHEN a recorded value means what it claims.
+    two_pass_review:
+      triggers:
+        category_substrings:
+          - cleanup
+          - purge
+          - deletion
+          - drain
+          - watermark
+          - retention
+          - cadence
+          - escalation
+          - lifecycle
+        min_files_touched: 2
+      protocol:
+        - 'PASS 1 - predicate probes: for each shipped mechanism, state its falsifiable
+          predicate and probe it LIVE (fire the hook, dry-run the sweep, invoke the gate).
+          Never verify by re-reading the code you just wrote.'
+        - 'PASS 2 - seams and timing semantics, run as a SEPARATE sweep after pass 1: for
+          each recorded value (timestamp, watermark, counter), ask WHEN it is computed
+          versus WHAT WINDOW its consumer treats it as covering (rb-8720: a completion-time
+          stamp licenses actions over the enumeration-to-write gap it never observed).'
+        - 'PASS 2 also asks: for each variable expansion in a shipped step, what happens
+          when it is empty or unset (bare-variable class, guard-687/guard-968); and for
+          each pair of cooperating steps, what state change between them breaks the second.'
+        - 'Never mark pass-1-verified territory done for pass 2: pass 1 verified the
+          predicate, not the semantics. Measured 2026-08-21: the two passes caught
+          disjoint defect sets over the same files.'
       last_triggered: null
       times_fired: 0
       times_caught_bug: 0

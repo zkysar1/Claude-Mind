@@ -66,6 +66,11 @@ def test_retrieve_basic_returns_full_shape(running_daemon):
     assert meta["read_only"] is True
     assert "items_returned" in meta
     assert "timestamp" in meta
+    # embedding_channel self-reports the semantic channel's per-box health on
+    # EVERY response (2026-08-21): "off" | "alive" | "DEAD: <reason>". A box
+    # with fleet flags ON but no local index must say so, not omit the key.
+    ec = meta["embedding_channel"]
+    assert ec in ("off", "alive") or ec.startswith("DEAD"), ec
     # framework_rules omitted unless include_framework=1.
     assert "framework_rules" not in data
     assert "include_framework" not in meta
@@ -364,3 +369,25 @@ def test_retrieve_concurrent_requests_dont_interleave(running_daemon):
     for body in bodies:
         data = json.loads(body)
         assert data["meta"]["category"] == "alpha"
+
+
+def test_retrieve_serves_when_daemon_started_before_world_was_configured(
+        running_daemon, monkeypatch):
+    """ twin of the find-node test: /v1/retrieve reaches
+    build_concept_index through the swapped CLI module, so it has the same
+    exposure to a WORLD_DIR frozen at None by a pre-init daemon start."""
+    import sys
+    from mind_api.src.endpoints import retrieve as retrieve_mod
+
+    paths_mod = sys.modules.get("_paths")
+    assert paths_mod is not None, "daemon import should have loaded _paths"
+    with retrieve_mod._concept_cache_lock:
+        retrieve_mod._concept_cache.clear()
+    monkeypatch.setattr(paths_mod, "WORLD_DIR", None)
+
+    _, port = running_daemon
+    status, body = _get(port, "/v1/retrieve",
+                        {"category": "alpha", "depth": "deep", "read_only": "1"})
+    assert status == 200, body
+    keys = [n["key"] for n in json.loads(body)["tree_nodes"]]
+    assert "alpha-test-node" in keys

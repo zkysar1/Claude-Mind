@@ -787,6 +787,29 @@ Review the full goal list for:
 - Correct blocked_by chain (tests after builds, analysis after research)
 - Appropriate priority (tests same priority as what they verify)
 
+**Fresh-eyes / cold-reader pass (MANDATORY when >3 goals go to independent
+implementers).** The goals will be executed by an agent that was NOT in the
+conversation that produced them. Read each goal AS THAT AGENT:
+
+1. **Cold-reader context** — does the description carry everything a stranger
+   needs (files/paths, the WHY, prerequisites), or does it silently assume
+   context that lived only in the originating chat? If it assumes, inline the
+   missing context now — the executor cannot ask.
+2. **Sequencing is `blocked_by`, nothing else** — the selector reads ONLY
+   `blocked_by` (not `depends_on`, not prose, not priority — guard-4554). Every
+   ordering you INTEND must be an explicit `blocked_by` edge, or the executor
+   may run steps out of order. (Re-confirms Step 4b.5 at review time.)
+3. **Success criteria live in `verification.outcomes`, not description prose** —
+   a mandate buried in prose is honored ~24% of the time
+   (prose-mandate-reporting-rate node, g-115-5489), and prose criteria under a
+   synonym header ("Acceptance:", "Done when:") slip the write-time
+   prose-verification gate, whose marker set is narrower than the population it
+   must cover (guard-4894). Move every acceptance bullet into
+   `verification.outcomes`; machine-checkable ones into `verification.checks`.
+
+Fix in place before Step 5 — the batch analogue of `pre-completion-review.md`:
+self-critique before the executor inherits the gap.
+
 ### Step 4.5: Examples
 
 Don't copy these — use them to calibrate scope-based planning.

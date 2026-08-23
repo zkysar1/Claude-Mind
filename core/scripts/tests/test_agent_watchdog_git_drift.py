@@ -270,11 +270,17 @@ def test_disk_breach_fires(monkeypatch, tmp_path):
     monkeypatch.setenv("GIT_DRIFT_DISK_PCT", "80")
     monkeypatch.setenv("GIT_DRIFT_TICKS_TO_FILE", "1")
     monkeypatch.setattr(WD, "_disk_used_pct", lambda _p: 92.0)
+    # Pinned LOW so this is a genuine breach under the both-conditions rule
+    # (2026-08-22). Before that rule this test passed on the percentage alone,
+    # and the unpinned real free space of the box running the suite silently
+    # decided the outcome.
+    monkeypatch.setattr(WD, "_disk_free_gib", lambda _p: 3.0)
     repo = _seed_repo(tmp_path)
     p = _probe(monkeypatch, repo)
     events = p.check()
     assert len(events) == 1
     assert events[0].payload["disk_used_pct"] == 92.0
+    assert events[0].payload["disk_free_gib"] == 3.0
     assert any("disk=92.0%" in b for b in events[0].payload["breaches"])
 
 
@@ -452,3 +458,66 @@ def test_non_git_directory_is_silent(monkeypatch, tmp_path):
     plain.mkdir()
     p = _probe(monkeypatch, plain)
     assert p.check() == []
+
+
+# ---------------------------------------------------------------------------
+# Disk breach requires BOTH a percentage over threshold AND an absolute free
+# floor (2026-08-22). A bare percentage filed five HIGH goals in one hour for a
+# 905 GiB volume with 169 GiB free.
+# ---------------------------------------------------------------------------
+
+def test_disk_free_floor_is_configured():
+    cfg = WD._git_drift_config()
+    assert cfg["disk_free_floor_gib"] == 15
+
+
+def test_large_volume_over_pct_but_plenty_free_does_not_breach(monkeypatch, tmp_path):
+    """THE 2026-08-22 FALSE ALARM, verbatim: 905 GiB at 81% = 169 GiB free.
+    Five HIGH goals in one hour across four containers, every one correctly
+    ignored. Drives the real probe -- an earlier draft of this test recomputed
+    the threshold expression by hand, which asserts nothing about the code."""
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("GIT_DRIFT_DISK_PCT", "80")
+    monkeypatch.setenv("GIT_DRIFT_TICKS_TO_FILE", "1")
+    monkeypatch.setattr(WD, "_disk_used_pct", lambda _p: 81.0)
+    monkeypatch.setattr(WD, "_disk_free_gib", lambda _p: 169.0)
+    repo = _seed_repo(tmp_path)
+    p = _probe(monkeypatch, repo)
+    assert p.check() == []
+
+
+def test_small_volume_over_pct_and_low_free_still_breaches(monkeypatch, tmp_path):
+    """The case the percentage exists for: a 40 GiB root at 97% = 1.2 GiB free.
+    The absolute floor must not cost us this."""
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("GIT_DRIFT_DISK_PCT", "80")
+    monkeypatch.setenv("GIT_DRIFT_TICKS_TO_FILE", "1")
+    monkeypatch.setattr(WD, "_disk_used_pct", lambda _p: 97.0)
+    monkeypatch.setattr(WD, "_disk_free_gib", lambda _p: 1.2)
+    repo = _seed_repo(tmp_path)
+    events = _probe(monkeypatch, repo).check()
+    assert len(events) == 1
+    assert any("1.2GiB free" in b for b in events[0].payload["breaches"])
+
+
+def test_unreadable_free_lets_percentage_speak_alone(monkeypatch, tmp_path):
+    """None free must not SUPPRESS -- it cannot confirm headroom, so the
+    percentage is allowed to fire on its own."""
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("GIT_DRIFT_DISK_PCT", "80")
+    monkeypatch.setenv("GIT_DRIFT_TICKS_TO_FILE", "1")
+    monkeypatch.setattr(WD, "_disk_used_pct", lambda _p: 95.0)
+    monkeypatch.setattr(WD, "_disk_free_gib", lambda _p: None)
+    repo = _seed_repo(tmp_path)
+    assert len(_probe(monkeypatch, repo).check()) == 1
+
+
+def test_disk_free_gib_reads_real_filesystem(tmp_path):
+    got = WD._disk_free_gib(tmp_path)
+    assert got is not None and got > 0
+
+
+def test_disk_free_gib_returns_none_on_error(monkeypatch):
+    monkeypatch.setattr(WD.shutil, "disk_usage",
+                        lambda p: (_ for _ in ()).throw(OSError("gone")))
+    assert WD._disk_free_gib(Path(".")) is None

@@ -42,10 +42,11 @@ Pipeline (mirrors aspirations.py cmd_add_goal order):
     - capability-gate (gates.capability.evaluate) on non-empty defer_reason.
       Override: X-Mind-Force-Defer. Layer-D auto-Unblock filing is NOT
       performed here — daemon returns the suggestion in the payload; auto-
-      filing lives in aspirations.py cmd_update_goal (fallback path).
+      filing lives in aspirations.py cmd_update_goal (CLI path, which
+      wrappers no longer call — daemon-only since 2026-05-14).
 
-Out of scope here — wrappers must still use the fallback (direct python)
-path to get these:
+Out of scope here — these live only in the CLI path, so daemon-routed
+writes (i.e. every wrapper write) do NOT get them:
   - structured-prefix validation, defer_reason_set_at / blocker_ref
     cascades (the rest of cmd_update_goal's mutation pipeline)
   - blocker-create-gate (used by a different code path — CREATE_BLOCKER)
@@ -69,7 +70,9 @@ from .. import file_locks, history, changelog
 from _fileops import _atomic_write_with_fallback  # noqa: E402
 from storage_backend import get_backend  # noqa: E402  # s5c: own-cloud read freshness
 from _owncloud_codec import decode_response as _codec_decode_response  # noqa: E402  #  transport seam
-from ..agent_paths import assert_not_cruft, SESSIONS_DIRNAME  # noqa: E402
+from ..agent_paths import (  # noqa: E402
+    assert_not_cruft, SESSIONS_DIRNAME, SESSION_DIRNAME,
+)
 import _gate_log  # noqa: E402
 from _cadence_anchor import is_deliberate_raise as _is_deliberate_raise  # noqa: E402
 # B9-deep: single-source census math (NOT a 3rd mirror) — folds evicted goals
@@ -108,10 +111,12 @@ from _override_helpers import audit_bulk_override as _audit_bulk_override  # noq
 # PR 7c additions:
 from gates.scaffolded_exploration import evaluate as _scaff_eval  # noqa: E402
 from gates.capability_route import evaluate as _cap_route_eval, ACTIVE_AGENTS as _ACTIVE_AGENTS  # noqa: E402
+from gates.field_shrink import evaluate as _field_shrink_eval  # noqa: E402
 from gates.lane_pin import evaluate as _lane_pin_eval  # noqa: E402
 from gates.category_suggest import evaluate as _category_suggest_eval  # noqa: E402
 from gates.description_length import evaluate as _desc_len_eval  # noqa: E402
 from gates.depends_on_consistency import evaluate as _depends_on_eval  # noqa: E402
+from gates.intended_agent_vocab import evaluate as _intended_agent_vocab_eval  # noqa: E402
 from gates.approval_reference import evaluate as _approval_ref_eval  # noqa: E402
 from gates.prose_verification import evaluate as _prose_verification_eval  # noqa: E402
 from gates.check_schema import evaluate as _check_schema_eval  # noqa: E402
@@ -429,8 +434,12 @@ def _validate_goal(goal: Dict[str, Any], *, require_id: bool = True) -> None:
     """Basic schema check — id format, status enum, type checks.
 
     Subset of aspirations.py::validate_goal. Skips verification-schema and
-    co_parent_id checks (those depend on cross-record state). Callers that
-    need the full validation should use the fallback path.
+    co_parent_id checks (those depend on cross-record state). There is no
+    fuller path to send callers to — wrappers are daemon-only (2026-05-14)
+    — so CLI-only checks that matter at write time are restored one by one
+    as shared gates/ modules called from the ADD sites (the _assert_*
+    siblings below; guard-547), never from here (see each for the
+    update-path blast-radius reasoning).
 
     require_id=False is the g-328-29 auto-allocation path: the add endpoint
     mints goal ids in-lock AFTER validation, so id absence is legal there.
@@ -537,6 +546,38 @@ def _assert_depends_on_consistency(goal: Dict[str, Any], *, ctx=None) -> None:
     every status change on them.
     """
     verdict = _depends_on_eval(
+        goal,
+        meta_dir=(ctx.paths.meta if ctx is not None else None),
+        agent_name=((ctx.paths.agent_name or None) if ctx is not None else None),
+    )
+    if verdict["would_block"]:
+        raise ValueError(verdict["message"])
+
+
+def _assert_intended_agent_vocab(goal: Dict[str, Any], *, ctx=None) -> None:
+    """Raise ValueError on an off-vocabulary intended_agent (selection-stack
+    review 2026-08-21).
+
+    FOURTH SIBLING of the three parity gates above, same orphaning story: the
+    CLI validate_goal has checked intended_agent against the live vocabulary
+    since g-282-02, the daemon _validate_goal subset omits it, and under
+    no-python-cli-fallback the daemon is the live write path. Measured: 5 live
+    goals carried "agent"/"reducer"/"any" — insight-trigger-sweep copied the
+    board tag requires_action_by:<x> verbatim (all normalized 2026-08-21; the
+    sweep now normalizes off-roster targets to "either" before filing).
+
+    The read side tolerates off-vocab (g-115-3482 falls through to "either"),
+    which is exactly why the write must refuse: the stored value misleads every
+    reader, the fall-through is roster-dependent (invisible on a box whose
+    roster read fails), and a typo of a real agent name silently converts a
+    deliberate routing into a broadcast. Fail-open on an unresolvable or empty
+    roster (rb-1028) — a fresh install must not refuse its first agent's name.
+
+    ADD SITES ONLY — same _validate_goal blast-radius reasoning as the three
+    siblings: legacy off-vocab carriers can arrive via merge from another box,
+    and wedging their status changes is worse than the drift.
+    """
+    verdict = _intended_agent_vocab_eval(
         goal,
         meta_dir=(ctx.paths.meta if ctx is not None else None),
         agent_name=((ctx.paths.agent_name or None) if ctx is not None else None),
@@ -1760,7 +1801,12 @@ def _file_routing_audit_investigate(ctx, goal: Dict[str, Any]) -> Optional[str]:
                 # alloc_nonce () — third mint site; appends directly,
                 # so it needs its own stamp. See add_goal() for rationale.
                 "alloc_nonce": uuid.uuid4().hex,
-                "intended_agent": "bravo",
+                # Roster-aware: this direct append bypasses the add-path vocab
+                # gate, and a literal "bravo" is off-vocab on deployments
+                # without one (e.g. single-agent prod).
+                "intended_agent": (
+                    "bravo" if "bravo" in _valid_intended_agents()
+                    else "either"),
                 "work_class": "framework",
             }
             try:
@@ -1813,6 +1859,44 @@ def add_goal(ctx) -> "Response":  # type: ignore[name-defined]
         return Response.error(400, "invalid_body", f"body must be JSON goal object: {e}")
     if not isinstance(goal, dict):
         return Response.error(400, "invalid_body", "body must be a JSON object")
+
+    # UNKNOWN-FIELD GATE, ADD half ( item 3 — selection-stack review
+    # 2026-08-21). The update endpoint has refused unknown field names since
+    # item 1 (see update_goal), but a brand-new goal could still be BORN with
+    # arbitrary keys — the allowlist was enforced everywhere except the moment
+    # a record is created. Same SSOT (_goal_fields), same header override, same
+    # audit trail. Checked on the CALLER's payload before the daemon stamps its
+    # own defaults (all of which are registered names), and before path
+    # resolution so a keystroke slip costs nothing. Scoped to THIS endpoint —
+    # the bulk aspiration add (_validate_aspiration) is framework-constructed
+    # and, on a cross-deployment transplant, may legitimately carry fields a
+    # lagging local allowlist has not learned yet; refusing there, where no ctx
+    # (and so no override header) exists, would wedge seed plants with no
+    # escape hatch.
+    _unknown_fields = [k for k in goal if not _is_known_goal_field(k)]
+    if _unknown_fields:
+        override = _header_override(ctx, "X-Mind-Allow-New-Field")
+        if not override:
+            return Response.json({
+                "error": "unknown_goal_field",
+                "gate": "goal-field-allowlist",
+                "field": _unknown_fields[0],
+                "unknown_fields": _unknown_fields,
+                "message": _unknown_goal_field_error(_unknown_fields[0]) + (
+                    f" ({len(_unknown_fields)} unknown fields in this add: "
+                    f"{_unknown_fields})" if len(_unknown_fields) > 1 else ""),
+            }, status=400)
+        # Overridden: a genuinely new field is a DELIBERATE act with a
+        # justification on the audit ledger rather than a keystroke slip.
+        _log_unstructured_override(
+            ctx.paths.world,
+            goal_id=goal.get("id") or "<auto>",
+            defer_reason_text=f"new goal field(s) {_unknown_fields!r} at add",
+            justification=override,
+            agent_name=ctx.paths.agent_name,
+            source="daemon:add_goal:allow-new-field",
+            which_checks_bypassed=["goal_field_allowlist"],
+        )
 
     live_path, base_dir = _resolve_paths(ctx, source)
     agent = _agent_name(ctx)
@@ -1936,6 +2020,11 @@ def add_goal(ctx) -> "Response":  # type: ignore[name-defined]
                 # with no matching blocked_by is invisible to the selector's
                 # sequencing predicate and gets offered as if unblocked.
                 _assert_depends_on_consistency(goal, ctx=ctx)
+                # intended_agent vocabulary parity (selection-stack review
+                # 2026-08-21). Fourth instance: an off-vocab routing hint
+                # ("any"/"reducer"/a typo) names nobody, misleads readers,
+                # and routes nondeterministically per box.
+                _assert_intended_agent_vocab(goal, ctx=ctx)
             except ValueError as e:
                 return Response.error(400, "validation_failed", str(e))
 
@@ -2282,6 +2371,38 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
             _cap_msg = _cap_advise(value, field=field, goal_id=goal_id)
             if _cap_msg:
                 warnings.append(_cap_msg)
+        except Exception:
+            pass  # advisory must never break a durable write
+
+    # Defer-target existence advisory (). Same twin shape as the
+    # capability-absence advisory directly above, and THIS is the live half for
+    # the same reason: a version of this check that lived only in
+    # core/scripts/aspirations.py emitted nothing through the wrapper on an
+    # end-to-end probe (guard-742/guard-2323 re-derived by measurement).
+    #
+    # Fires on the FIELD, deliberately NOT on `_is_narrative_defer`. That
+    # predicate is False for every STRUCTURED_DEFER_PREFIXES value, and
+    # structured defers are where dependency ids live: measured 2026-08-22, of
+    # the 79 non-terminal defers citing a goal id, 79 were structured and 0 were
+    # narrative. Gating on it would have fired on zero of the real population
+    # while reviewing as correct — the guard-1802 class.
+    #
+    # Advisory, never a refusal: of 51 cited ids resolving nowhere, 41 still
+    # have a world-surface footprint and 20 appear in committed framework files,
+    # so the citations were mostly RIGHT and the store lost the records.
+    # Refusing would block correct writes to punish a defect elsewhere.
+    if field == "defer_reason" and value not in (None, ""):
+        try:
+            from gates.defer_target_existence import (
+                evaluate as _defer_target_eval,
+                sources_for as _defer_target_sources,
+            )
+            _dt = _defer_target_eval(
+                goal_id, value,
+                _defer_target_sources(ctx.paths.world, ctx.paths.agents_root),
+            )
+            if _dt.get("message"):
+                warnings.append(_dt["message"])
         except Exception:
             pass  # advisory must never break a durable write
 
@@ -2788,6 +2909,58 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
                             f"the X-Mind-Blocker-Ref header — g-115-3532)",
                         )
                     value = _norm_ref
+
+            # === field-shrink guard () — DAEMON HALF ===
+            # MUST run here: the predicate needs the OLD value, so it cannot
+            # live in the pre-lock _run_update_goal_gates chain (which sees only
+            # the incoming write). Byte-parallel with the cmd_update_goal half
+            # (guard-547) — both import the same gates.field_shrink predicate
+            # rather than re-deriving the thresholds, so CLI and daemon cannot
+            # disagree about what a catastrophic shrink is (guard-330).
+            #
+            # NOT wrapped in try/except, deliberately: the predicate is pure
+            # length arithmetic with no dependency to fail, and a fail-open
+            # handler here would also cover the refusal-message construction —
+            # turning a compose-time bug into a silent approval (guard-3803).
+            _shrink = _field_shrink_eval(field, goal.get(field), value)
+            if _shrink["blocked"]:
+                _shrink_override = _header_override(
+                    ctx, "X-Mind-Override-Shrink")
+                _gate_log.log(
+                    "field-shrink-guard",
+                    "override" if _shrink_override else "block",
+                    caller="daemon:update_goal",
+                    trigger_matched=_shrink["decision_path"],
+                    payload=goal_id,
+                    override_reason=_shrink_override,
+                    extra={"field": field, "old_len": _shrink["old_len"],
+                           "new_len": _shrink["new_len"],
+                           "ratio": _shrink["ratio"]},
+                    meta_dir=ctx.paths.meta,
+                    agent_name=ctx.paths.agent_name,
+                )
+                if not _shrink_override:
+                    return Response.json({
+                        "error": "field_shrink_blocked",
+                        "gate": "field-shrink-guard",
+                        "field": field,
+                        "old_len": _shrink["old_len"],
+                        "new_len": _shrink["new_len"],
+                        "ratio": _shrink["ratio"],
+                        "detail": f"{_shrink['message']} (goal {goal_id})",
+                    }, status=400)
+            else:
+                _gate_log.log(
+                    "field-shrink-guard", "noop",
+                    caller="daemon:update_goal",
+                    trigger_matched=_shrink["decision_path"],
+                    payload=goal_id,
+                    extra={"field": field, "old_len": _shrink["old_len"],
+                           "new_len": _shrink["new_len"],
+                           "ratio": _shrink["ratio"]},
+                    meta_dir=ctx.paths.meta,
+                    agent_name=ctx.paths.agent_name,
+                )
 
             # Capture old_status BEFORE the mutation — the selection_count
             # cascade compares old vs new to stay idempotent on redundant
@@ -5085,6 +5258,112 @@ def _same_box_body_is_live(ctx, holder_sid: str,
         return False
 
 
+# The tri-state core's `None` reasons that mean ABSENCE OF EVIDENCE — the only
+# ones `_cross_box_body_is_live` escalates to the heartbeat carrier (,
+# re-landed by ). Deliberately NOT every `None`: `shard_unreadable`,
+# `no_claimed_at`, `unparseable_claimed_at` and `probe_error:*` are also
+# unanswered but were left permitting the claim by the original fix, and
+# widening here would change behaviour that fix never touched. `no_ids` is
+# excluded because `_body_carrier_is_fresh` cannot act without those ids anyway.
+_ABSENT_ROW_REASONS = frozenset({"no_bodies_map", "no_row_for_sid"})
+
+
+def _body_carrier_is_fresh(ctx, agent_name: str, holder_sid: str,
+                           stale_minutes: float) -> bool:
+    """Is `holder_sid` emitting a FRESH cross-box body heartbeat? ()
+
+    The SECOND, INDEPENDENT-WRITER signal, consulted ONLY where
+    `_cross_box_body_liveness` found no `in_flight_bodies[<sid>]` row at all.
+
+    WHY A SECOND SIGNAL EXISTS HERE. The per-SID row is written FAIL-OPEN
+    (`coordination.md`:1035 — "a failed body-row write logs a WARN and does NOT
+    fail the claim (visibility is not correctness)"; with no `MIND_SID` it
+    writes no row at all). g-306-318 later promoted that same row to the SOLE
+    EVIDENCE for a claim REFUSAL without revisiting its writer's posture, so at
+    the consumer "the write failed" and "the Body is dormant" became
+    byte-identical — and the fall-through asserted the second. Two Bodies of one
+    agent then built one goal (2026-08-19T08:20:59 vs 08:23:02; 34 min of work
+    discarded). A predicate is only as sound as the write that feeds it.
+
+    THE DOCTRINE IS ALREADY THE FRAMEWORK'S, for the sibling field.
+    `.claude/rules/check-team-state-before-silent.md` rules 5-6: a FRESH stamp
+    is positive evidence of life, a STALE/ABSENT one is AMBIGUOUS and never
+    evidence of death, and the remedy is corroboration from a signal with an
+    INDEPENDENT WRITER. This carries that across: absent row => UNANSWERED.
+
+    WHY THIS CARRIER IS GENUINELY INDEPENDENT (the `guard-4390` test, run at
+    re-land time rather than assumed). The row is written by
+    `team-state-in-flight.sh` at claim time; the carrier by `heartbeat-tick.sh`
+    at the top of every worker cycle — verified 2026-08-21 that heartbeat-tick
+    never writes `in_flight_bodies`, so this is writer diversity and not merely
+    label diversity. Crucially the carrier's writer does NOT survive the failure
+    being tested for: if the Body is dead, heartbeat-tick stops, so a FRESH
+    carrier discriminates rather than agreeing under both hypotheses.
+
+    READ AUTHORITATIVELY, never off the local mirror (guard-980): under
+    own-cloud the local tree is a read-through cache, so `Path.exists()` on a
+    peer's carrier proves nothing. `read_authoritative_bytes` is the backend's
+    generic primitive for exactly this and is implemented by BOTH backends.
+
+    POSITIVE CONFIRMATION ONLY — this can never manufacture a refusal on its
+    own. It is consulted only where the caller already returned False, so every
+    failure path here (missing ids, unreadable carrier, malformed doc, absent or
+    unparseable `ts`, a stale `ts`, a CLOSED `body_state`) returns False and
+    leaves today's take-over behaviour byte-identical. That direction is
+    deliberate: refusing a claim because a telemetry read failed is the
+    `guard-1562` trade and could wedge every claim on a box whose team-state
+    writes are broken. This can only NARROW the take-over window, never widen it.
+
+    `body_state` IS consulted, but only to WITHDRAW liveness: a Body in the
+    CLOSED SET is not live however fresh its last stamp, and its claim should
+    remain takeable. It is never used to ASSERT liveness — nothing clears that
+    field on a crash, so refusing on state alone would convert a transient crash
+    into a permanent wedge (the rb-4081 stale-status-field class).
+    """
+    import sys
+    try:
+        if not agent_name or not holder_sid:
+            return False
+        # Same bound-agent-vs-foreign split as `_same_box_body_is_live`, and for
+        # the same  reason: `ctx.paths.agent` is INJECTED, not derived
+        # from agents_root, so re-deriving it would silently change the bound
+        # caller's resolution wherever a fixture injects a different agent dir.
+        # `SESSION_DIRNAME` (singular, the agent-wide state dir) is the
+        # constant, never a literal "session" segment — CLAUDE.md "Agent-dir
+        # Resolution" names hardcoded copies as a class its audit greps miss.
+        if str(agent_name) == str(ctx.paths.agent_name):
+            state_dir = ctx.paths.state_dir
+        else:
+            state_dir = (ctx.paths.agents_root / str(agent_name)
+                         / SESSION_DIRNAME)
+        carrier = state_dir / f"body-heartbeat-{holder_sid}.json"
+        doc = json.loads(
+            get_backend().read_authoritative_bytes(carrier).decode("utf-8"))
+        if not isinstance(doc, dict):
+            return False
+        # CLOSED SET, never "not active" — `parked` is RESUMABLE and a parked
+        # Body is alive (). Testing "not active" here would treat a
+        # live parked Body as takeable.
+        if str(doc.get("body_state") or "") in (
+                "closed-pending-merge", "merged", "closed-stale"):
+            return False
+        ts = doc.get("ts")
+        if not ts:
+            return False
+        try:
+            t = datetime.strptime(str(ts).strip()[:19], "%Y-%m-%dT%H:%M:%S")
+        except (ValueError, TypeError):
+            return False  # unparseable -> ambiguous -> never refuse
+        return (datetime.now() - t).total_seconds() <= (
+            float(stale_minutes) * 60.0)
+    except Exception as e:  # noqa: BLE001 — fail-open, but never silently
+        print(f"[daemon claim] WARN: cross-box BODY carrier probe for "
+              f"{agent_name!r}/{holder_sid!r} failed "
+              f"({type(e).__name__}: {e}); treating as not-live",
+              file=sys.stderr)
+        return False
+
+
 def _cross_box_body_is_live(ctx, agent_name: str, holder_sid: str,
                             goal_id: str, stale_minutes: float) -> bool:
     """Is `holder_sid` a LIVE worker Body of `agent_name` on ANOTHER box,
@@ -5120,28 +5399,46 @@ def _cross_box_body_is_live(ctx, agent_name: str, holder_sid: str,
     never refreshed, so a Body legitimately working ONE goal for longer than
     `stale_minutes` ages out of this protection. That lands in the documented
     fail-open direction (a wrong False merely permits a claim that is already
-    possible today), and the continuously-refreshed cross-box signal — the
-    syncable `session/body-heartbeat-<SID>.json` carrier — is a strictly larger
-    change than this one.
+    possible today).
+
+    THAT LIMIT STILL STANDS, and g-306-328 did NOT lift it. The
+    continuously-refreshed `session/body-heartbeat-<SID>.json` carrier IS now
+    read (`_body_carrier_is_fresh`), but ONLY where the row is ABSENT. A PRESENT
+    row with a stale `claimed_at` is evidence and keeps permitting the claim, so
+    a Body working one goal past `stale_minutes` still ages out exactly as
+    described above. Lifting that is a separate judgement about how long one
+    Body may hold one goal, not a plumbing gap — do not read the carrier's
+    arrival as having closed it.
 
     Returns True ONLY on positive confirmation. Every other path — missing
     ids, unreadable shard, absent/!dict `in_flight_bodies`, no row for this sid,
     a row naming a different goal, an unparseable or stale `claimed_at` —
     returns False, i.e. permits the claim.
 
-    THE BOOLEAN RETURN IS DELIBERATELY UNCHANGED (g-306-328). The real
-    distinction — POSITIVE evidence the Body is not on this goal, versus NO
-    EVIDENCE EITHER WAY — now lives in `_cross_box_body_liveness` below, whose
-    third state (`None`) is the `unknown` verdict `guard-2223` requires of any
-    predicate that can fail to reach its store. This wrapper collapses `None`
-    back to `False` so the claim decision is byte-identical to before, and
-    emits the distinction as telemetry instead. Rationale for NOT acting on it
-    yet: refusing on unanswered turns a telemetry fault into a failed claim
-    (the `guard-1562` shape), and the two paths that produce a missing row
-    — a body-row write that failed and only WARNed, and a Body with no
-    `MIND_SID` that never attempted one — point at OPPOSITE remedies. Neither
-    is distinguishable from HERE (both arrive as `no_row_for_sid`; separating
-    them needs a writer-side marker), so the distribution is measured first.
+    THE RETURN IS BOOLEAN; THE EVIDENCE IS TRI-STATE. The real distinction —
+    POSITIVE evidence the Body is not on this goal, versus NO EVIDENCE EITHER
+    WAY — lives in `_cross_box_body_liveness` below, whose third state (`None`)
+    is the `unknown` verdict `guard-2223` requires of any predicate that can
+    fail to reach its store.
+
+    THE TWO ABSENT-ROW REASONS ARE NOW ACTED ON (g-306-328, re-landed by
+    g-115-6943 inside the tri-state contract). `no_bodies_map` and
+    `no_row_for_sid` escalate to `_body_carrier_is_fresh` — a SECOND signal with
+    an INDEPENDENT WRITER — and refuse ONLY on a FRESH carrier. This is NOT
+    "refusing on unanswered" (the `guard-1562` objection, which correctly still
+    stands): a stale, absent or unreadable carrier permits the claim exactly as
+    before, so the change can only NARROW the take-over window. The two paths
+    that produce a missing row — a body-row write that failed and only WARNed,
+    and a Body with no `MIND_SID` that never attempted one — remain
+    indistinguishable from here and STILL point at opposite remedies; the
+    escalation sidesteps that by not needing to tell them apart. It asks a
+    different question (is that session alive?) of a different writer.
+
+    EVERY OTHER `None` REASON STILL COLLAPSES TO `False`: `shard_unreadable`,
+    `no_ids`, `no_claimed_at`, `unparseable_claimed_at` and `probe_error:*` are
+    unanswered too, but the original fix deliberately left them permitting the
+    claim and this re-land does not widen past it. `row_other_goal` and `stale`
+    are `False` because they are EVIDENCE, not the absence of it.
     """
     verdict, reason = _cross_box_body_liveness(
         ctx, agent_name, holder_sid, goal_id, stale_minutes)
@@ -5154,7 +5451,41 @@ def _cross_box_body_is_live(ctx, agent_name: str, holder_sid: str,
     _log_cross_box_body_liveness(ctx, agent_name=agent_name,
                                  holder_sid=holder_sid, goal_id=goal_id,
                                  verdict=verdict, reason=reason)
-    return verdict is True
+    if verdict is True:
+        return True
+    if reason in _ABSENT_ROW_REASONS:
+        # THE ABSENT-ROW CASES ARE **UNANSWERED**, NOT DORMANT (,
+        # re-landed by  inside the tri-state contract).
+        # Reaching one means the FAIL-OPEN writer left no evidence — it never
+        # ran, its write only WARNed, or the caller had no `MIND_SID`
+        # (`coordination.md`:1035) — which says nothing about the Body. The
+        # goal record has ALREADY told us `holder_sid` holds THIS goal, so the
+        # only open question is whether that session is alive, and the carrier
+        # answers exactly that with an INDEPENDENT WRITER.
+        #
+        # SCOPED BY REASON, NOT BY BARE `verdict is None`. The core returns
+        # `None` for seven reasons; only these two are absence-of-evidence.
+        # `shard_unreadable`, `no_claimed_at`, `unparseable_claimed_at` and
+        # `probe_error` keep permitting the claim exactly as before — widening
+        # to every `None` would change behaviour the reverted commit
+        # deliberately left alone. `row_other_goal` and `stale` are already
+        # `False`: those are EVIDENCE, not the absence of it, and overriding
+        # real evidence with a liveness ping would refuse take-overs that are
+        # legitimate today.
+        #
+        # guard-4390 CHECK, run before trusting this as corroboration: the
+        # carrier's writer is `heartbeat-tick.sh` (every cycle), the row's is
+        # `team-state-in-flight.sh` (once, at claim). Different writer,
+        # different trigger, and heartbeat-tick STOPS when the Body dies — so
+        # a FRESH carrier genuinely discriminates the failure being tested for
+        # rather than agreeing under both hypotheses.
+        #
+        # A stale/absent/unreadable carrier still returns False, so take-over
+        # behaviour on no-evidence is unchanged and this can only NARROW the
+        # window, never widen it (the `guard-1562` fail-open direction).
+        return _body_carrier_is_fresh(ctx, agent_name, holder_sid,
+                                      stale_minutes)
+    return False
 
 
 def _cross_box_body_liveness(ctx, agent_name: str, holder_sid: str,
@@ -6729,6 +7060,7 @@ def _validate_aspiration(asp: Dict[str, Any], *, auto_id: bool = False) -> None:
         _assert_no_prose_drift(goal)
         _assert_no_invalid_checks(goal)  # , same ADD-path parity
         _assert_depends_on_consistency(goal)  # , same ADD-path parity
+        _assert_intended_agent_vocab(goal)  # selection-stack review 2026-08-21, same ADD-path parity
 
 
 # ---------------------------------------------------------------------------

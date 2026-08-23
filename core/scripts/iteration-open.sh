@@ -32,9 +32,36 @@ source "$_SELF/_paths.sh" 2>/dev/null || true
 _DRY=0
 for _a in "$@"; do [ "$_a" = "--dry-run" ] && _DRY=1; done
 
-python3 "$_SELF/iteration-open.py" "$@"
-_rc=$?
+# stdout is CAPTURED rather than streamed so the wrapper can COUNT it. A
+# zero-byte run is the one failure this wrapper cannot otherwise see: _emit()
+# prints the STAGE table unconditionally, so zero stdout PROVES the report was
+# never emitted (killed mid-run, import-time death) — yet run mode forces exit 0,
+# and rc=0 + silence is indistinguishable from "ran clean" to the caller, whose
+# SKILL.md then disposes nothing and resumes. Measured on foxtrot
+# (LAPTOP-3IOFCNEO, WSL2 6.18.33.2) 2026-08-21: --apply gave rc=0 / 0 bytes /
+# ~370s while the standalone fallback returned two real findings minutes later.
+# NOT reproducible on cc-07 (Linux 6.8.0-137-generic, worker Body): rc=0, 1988
+# bytes, 65s. Root cause is NOT established, so this makes the failure LOUD
+# instead of pretending to cure it (guard-4093 / guard-1715 — a quiet run is not
+# a clean one). Capture costs no interactivity: this is a ~2 KB batch report and
+# python block-buffers to a pipe regardless.
+_OUT="$(mktemp 2>/dev/null)" || _OUT=""
+if [ -n "$_OUT" ]; then
+    python3 "$_SELF/iteration-open.py" "$@" > "$_OUT"
+    _rc=$?
+    cat "$_OUT"
+    _bytes="$(wc -c < "$_OUT" 2>/dev/null || echo -1)"
+    rm -f "$_OUT"
+else
+    # mktemp unavailable — run unchanged and DO NOT claim anything about the
+    # byte count. -1 means "not measured", never "empty": a silence warning
+    # invented from a failed measurement is the defect in the other direction.
+    python3 "$_SELF/iteration-open.py" "$@"
+    _rc=$?
+    _bytes=-1
+fi
 
 if [ "$_DRY" = "1" ]; then exit "$_rc"; fi
 [ "$_rc" -ne 0 ] && echo "[iteration-open] wrapper_failed — fall back to the batteries directly: orchestrator-entry-battery.sh, precheck-sentinel-battery.sh, precheck-always-run-battery.sh --apply, then goal-selector.sh"
+[ "$_bytes" = "0" ] && echo "[iteration-open] SILENT RUN — ZERO bytes of output at rc=$_rc. This is NOT an all-clear: iteration-open.py always prints a STAGE table, so no output means the report was never emitted. Treat the always-run stage as BLIND and run the fallbacks directly: orchestrator-entry-battery.sh, precheck-sentinel-battery.sh, precheck-always-run-battery.sh --apply, then goal-selector.sh"
 exit 0

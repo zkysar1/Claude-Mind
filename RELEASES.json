@@ -1,5 +1,27 @@
 [
   {
+    "version": "2.12.1",
+    "previous_version": "2.12.0",
+    "date": "2026-08-23",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Complete the gap-131 forge: land-stranded-pr had a registry entry and both companion scripts but no SKILL.md, so seed-preflight correctly refused the v2.12.0 promotion. Split-surface forge — the external world propagated, git-tracked .claude/skills/ did not.",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.12.0",
+    "previous_version": "2.11.0",
+    "date": "2026-08-23",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Framework v2.12.0 — 1,100 commits since v2.11.0 across 265 framework files. Includes the ZDS-authored displaced-id-audit shell wrapper and the merged two-half disk-breach fix (absolute free-space floor + host-volume surface naming), both back-ported up during the 2026-08-23 promotion reconcile.",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.11.0",
     "previous_version": "2.10.1",
     "date": "2026-08-21",

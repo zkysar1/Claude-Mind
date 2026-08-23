@@ -113,6 +113,69 @@ def test_temp_pressure_dedup_existing_drain_goal(tmp_path, monkeypatch):
     assert r["suggested_goal"] is None
 
 
+def test_temp_pressure_stalled_goal_escalates(tmp_path, monkeypatch):
+    #  +  (2026-08-21): an open drain goal OLDER than
+    # drain_goal_max_age_hours with pressure still >= threshold is, by
+    # observation, never getting picked (rank #120/151 for weeks). The flag
+    # must flip pending -> stalled and carry the escalation payload the
+    # precheck SKILL acts on (invoke /drain-temp this iteration).
+    import datetime as dt
+    old = (dt.datetime.now() - dt.timedelta(hours=72)).strftime("%Y-%m-%dT%H:%M:%S")
+    goals = [{"id": "g-001-99", "status": "pending",
+              "title": "Maintain: drain accumulated temp/ working docs",
+              "created_at": old, "priority": "HIGH"}]
+    r = _run(tmp_path, monkeypatch, n_flat=25, goals=goals)
+    assert r["flags"] == ["temp_drain_stalled"]
+    assert r["suggested_goal"] is None, "escalation must NEVER file a second goal"
+    esc = r["escalation"]
+    assert esc["goal_id"] == "g-001-99"
+    assert esc["age_hours"] > 48
+    assert esc["max_age_hours"] == 48
+    assert esc["pressure"] == 25
+    assert "STALLED" in r["summary"]
+
+
+def test_temp_pressure_fresh_goal_still_pending(tmp_path, monkeypatch):
+    # A drain goal YOUNGER than the max age keeps the original dedup behavior:
+    # pending, no escalation — the scorer/drain-lane still gets its chance.
+    import datetime as dt
+    recent = (dt.datetime.now() - dt.timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%S")
+    goals = [{"id": "g-001-99", "status": "pending",
+              "title": "Maintain: drain accumulated temp/ working docs",
+              "created_at": recent}]
+    r = _run(tmp_path, monkeypatch, n_flat=25, goals=goals)
+    assert r["flags"] == ["temp_drain_pending"]
+    assert r["escalation"] is None
+
+
+def test_temp_pressure_unstamped_age_stays_pending(tmp_path, monkeypatch):
+    # No created_at on the goal (the pre-existing fixtures' shape): age is
+    # unverifiable, so escalation is conservatively withheld — never escalate
+    # on an age you cannot read (verify-before-assuming).
+    goals = [{"id": "g-001-99", "status": "pending",
+              "title": "Maintain: drain accumulated temp/ working docs"}]
+    r = _run(tmp_path, monkeypatch, n_flat=25, goals=goals)
+    assert r["flags"] == ["temp_drain_pending"]
+    assert r["escalation"] is None
+
+
+def test_temp_pressure_stalled_respects_config_override(tmp_path, monkeypatch):
+    # drain_goal_max_age_hours is config-tunable; a 100h ceiling keeps a 72h
+    # goal in pending. Also pins the threshold surfacing in the result.
+    import datetime as dt
+    old = (dt.datetime.now() - dt.timedelta(hours=72)).strftime("%Y-%m-%dT%H:%M:%S")
+    goals = [{"id": "g-001-99", "status": "pending",
+              "title": "Maintain: drain accumulated temp/ working docs",
+              "created_at": old}]
+    cfg = {"temp_pressure": {"warn_threshold": 10, "drain_goal_threshold": 20,
+                             "drain_goal_max_age_hours": 100}}
+    _seed_temp(tmp_path, 25)
+    monkeypatch.setattr(pe, "AGENT_DIR", tmp_path)
+    r = pe.cmd_temp_pressure(_Args(), cfg, _compact(goals))
+    assert r["flags"] == ["temp_drain_pending"]
+    assert r["thresholds"]["drain_goal_max_age_hours"] == 100
+
+
 def test_temp_pressure_other_agent_drain_goal_not_deduped(tmp_path, monkeypatch):
     # : the undrained-doc COUNT is scoped to AGENT_DIR/temp (the bound
     # agent's store), so the existing-drain-goal DEDUP must ALSO be agent-scoped.

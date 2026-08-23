@@ -129,7 +129,17 @@ re-reading.
 ```
 # 2.0 PRIOR SERIES — read this FIRST, before any instrument (g-115-3527, 2026-07-28)
 # program-alignment-health is the accumulated memory of every prior program
-# review: the verdict streak (~79% no_change over 29 known passes — 23 of 29), the
+# review: the verdict streak (the node publishes "78% no_change (29 of 37)" — but
+# ⚠ DO NOT RE-STAMP THAT FIGURE WITH TODAY'S DATE. It is stamped **2026-07-30** in
+# the node and it is NOT re-derivable there: the node retains only THREE dated
+# "### " assessment sections (its own fold discipline GCs the older rows), so
+# neither 29 nor 37 can be recomputed, and the node separately names a 37th pass
+# dated 2026-08-22 — a denominator of 37 cannot be true on both dates. Quote it as
+# "78% (29 of 37), as measured 2026-07-30, not re-derivable from the node" or not
+# at all. Measured and resolved CONFIRMED at hypothesis
+# 2026-08-08_sibling-rituals-unpinned-series; this very line previously read
+# "as of 2026-08-22" because I carried the stale denominator forward under a fresh
+# date in the same session that resolved the hypothesis predicting it), the
 # Decision Rules, the two attested Program edits, and the extraction caveats
 # that prior reviewers recorded so their successors would not re-derive a
 # finding already investigated and closed.
@@ -157,10 +167,17 @@ re-reading.
   #     date order BY CONSTRUCTION. Verified 2026-08-11: 4,428 bytes, all three
   #     keys present.
   Bash: source core/scripts/_paths.sh && sed -n '1,60p' "$WORLD_PATH/knowledge/tree/system/program-alignment-health.md"
-  # (b) ALL 9 DECISION RULES. Header-anchored, never line-numbered — the block
-  #     moves as the file grows. Verified 2026-08-11: 6,518 bytes, rules 1-9
-  #     present, and DR9 is the highest shorthand used anywhere in the node.
-  #     Do NOT Read the node whole — 93,953 bytes is near the ~25k-TOKEN cap.
+  # (b) EVERY DECISION RULE THE BLOCK CONTAINS — DR1 through the highest-numbered
+  #     one you find, whatever that number is TODAY. Header-anchored, never
+  #     line-numbered: the block moves as the file grows AND the rules ACCRETE.
+  #     ⚠ DO NOT STOP AT A COUNT THIS COMMENT NAMES. This line read "ALL 9
+  #     DECISION RULES … DR9 is the highest shorthand used anywhere in the node"
+  #     until 2026-08-22, by which point DR10, DR11, DR12 had landed and the pass
+  #     reading it was adding DR13 — so a reviewer obeying it literally would have
+  #     dropped the four rules the series had most recently learned, including the
+  #     one about this exact failure. The awk below already emits the whole block;
+  #     the only thing that can truncate it is a reader who trusts a stale number.
+  #     Do NOT Read the node whole — it sits near the ~25k-TOKEN cap.
   Bash: source core/scripts/_paths.sh && awk '/^## Decision Rules/{f=1} f&&/^## Verified Values/{exit} f' "$WORLD_PATH/knowledge/tree/system/program-alignment-health.md"
   # (c) OPTIONAL index only: tree-read.sh --node program-alignment-health. Useful
   #     for retrieval_count / poignancy. NEVER a substitute for (a) or (b).
@@ -170,8 +187,9 @@ re-reading.
     three most recent. The sibling series files are each internally consistent
     (review newest-FIRST, tree oldest-first) and this one is neither, which is
     precisely why (a) reads the front matter instead.
-  → capture from (a)+(b): the last 3 passes, ALL 9 Decision Rules, and every
-    paragraph containing "Corrected" / "caveat" / "RETRACTED" / "already filed"
+  → capture from (a)+(b): the last 3 passes, EVERY Decision Rule the block
+    contains (see the count warning above), and every paragraph containing
+    "Corrected" / "caveat" / "RETRACTED" / "already filed"
   → carry these into Phase 3. Before writing ANY finding, check it against
     them: a signal the series has already investigated and closed is NOT a
     new finding, however fresh the instrument reading looks.

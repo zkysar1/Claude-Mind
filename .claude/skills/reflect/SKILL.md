@@ -157,6 +157,42 @@ IF adversarial_review exists AND goal context is available:
 # the sub-skill naturally addresses them during pattern extraction.
 ```
 
+## Step 0.36: Two-Pass Review Check (rb-8720 origin)
+
+Originated from the 2026-08-21 temp/scratchpad shipment review: a first
+fresh-eyes pass probed every shipped predicate live and came back green over
+territory where a second pass — asking WHEN each recorded value is computed
+versus WHAT WINDOW its consumer treats it as covering — found two real
+defects (a completion-time watermark stamp licensing an unobserved window,
+and a bare-variable step). The passes caught DISJOINT defect sets; neither
+question class reviews the other's.
+
+```
+# Step 0.36: Two-pass review trigger check — same shape and gating as Step 0.35
+IF two_pass_review exists AND goal context is available:
+    combined      = lowercase((goal.category OR "") + " " + (goal.description OR goal.title OR ""))
+    files_touched = length(goal.files_changed OR [])
+
+    matched_substring = first(s for s in two_pass_review.triggers.category_substrings
+                              if s in combined)
+    IF matched_substring is not null
+       AND files_touched >= two_pass_review.triggers.min_files_touched:
+        Emit: "TWO_PASS_REVIEW_TRIGGERED (matched: {matched_substring}, files: {files_touched})"
+        Emit: two_pass_review.protocol  # the two passes' question classes
+
+        # Bump counters — same telemetry pattern as Step 0.35. The three leaves
+        # are audit_only in core/config/meta.yaml (mc-800/801/802 class), so
+        # backpressure cannot erase the record of a fire.
+        Bash: meta-set.sh reflection-strategy.yaml two_pass_review.last_triggered "$(date +%Y-%m-%dT%H:%M:%S)"
+        Bash: meta-set.sh reflection-strategy.yaml two_pass_review.times_fired $(($OLD_VALUE + 1))
+        # A bug surfaced through the protocol bumps two_pass_review.times_caught_bug
+        # via the same mechanism.
+
+# Advisory, like Step 0.35 — the emitted passes join retrieval_context. The one
+# non-negotiable: run pass 1 and pass 2 as SEPARATE sweeps over the same files,
+# never merged into one walkthrough — merging is what re-blinds pass 2.
+```
+
 ## Mode Routing
 
 ### `--on-hypothesis <hypothesis-id>` — Single Hypothesis Reflection
@@ -262,15 +298,19 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
    # nothing here said it was known (rb-7613; guard-1984 — a guardrail cannot
    # outvote the instrument it guards, which is why this lives HERE).
    #
-   # MEASURED 2026-08-19 (echo, hostname cc-03, uname -r 6.8.0-137-generic), on
-   # the live payload — 405 records, 1,183,294 bytes:
-   #   by STAGE   : archived 404, resolved 1
-   #   by OUTCOME : EXPIRED 173, UNRESOLVABLE 185, none 47   (conservation: 358 + 47 = 405)
-   #   reflected  : False on all 405
-   # ZERO carry CONFIRMED / CORRECTED / REFUTED. An ABC chain needs a prediction
-   # that MET REALITY; an EXPIRED hypothesis aged out unmeasured and an
+   # MEASURED 2026-08-22 (echo, hostname cc-03, uname -r 6.8.0-137-generic), on
+   # the live payload — 418 records, 1,232,091 bytes:
+   #   by STAGE   : archived 417, resolved 1
+   #   by OUTCOME : UNRESOLVABLE 187, EXPIRED 183, none 47, CONFIRMED 1
+   #                (conservation: 370 + 47 + 1 = 418)
+   # (prior reading 2026-08-19: 405 records, archived 404, EXPIRED 173 /
+   #  UNRESOLVABLE 185 / none 47 — the population only grows, so a count here is
+   #  a dated observation, never a standing fact. guard-1818.)
+   # The EXPIRED + UNRESOLVABLE + none mass carries no ABC input: a chain needs a
+   # prediction that MET REALITY; an EXPIRED hypothesis aged out unmeasured and an
    # UNRESOLVABLE one hit a denominator floor, so neither ever produced one.
-   # There is nothing to chain — this step is not broken.
+   # There is nothing to chain in that mass — this step is not broken.
+   # But do NOT read that as "the whole payload is inert" — run the control below.
    #
    # ⚠ THE WORD "resolved" IN THIS STEP'S OWN TEXT IS THE TRAP. It invites a
    # filter on `status`, and pipeline records have NO `status` field — the
@@ -283,8 +323,18 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
    # POSITIVE CONTROL — the ONLY number that should ever alarm:
    #   [r for r in payload if r.get("outcome") in ("CONFIRMED","CORRECTED","REFUTED")
    #                       and not r.get("reflected")]
-   # That set is 0 today. A nonzero value means genuine ABC input is going
-   # unreflected; a large `--unreflected` count means nothing on its own.
+   # RUN IT. Do not read a number off this comment — it was 0 on 2026-08-19 and
+   # 1 on 2026-08-22 (2026-08-09_prose-mandate-rate-generalizes, CONFIRMED,
+   # stage=resolved, resolved_by zeta 6 min before that pass reached this step).
+   # A nonzero value means genuine ABC input is going unreflected and IS the
+   # work; a large `--unreflected` count means nothing on its own. The two
+   # numbers move independently — the mass above grew 405 -> 418 across the same
+   # window in which the control went 0 -> 1, so neither predicts the other.
+   # WHEN IT IS NONZERO, CHECK OWNERSHIP BEFORE CHAINING: these records are the
+   # shared target of g-001-08 ("Resolve unreflected hypotheses"), claimed 16x in
+   # 4 days across three agents. A record another LIVE agent resolved minutes ago
+   # is theirs — `liveness-check.sh --agent <resolved_by> --json`, and abstain on
+   # `alive`. Reflecting it anyway races a conflicting ABC chain onto one record.
    #
    # THE LANE IS HEALTHY, which inverts the severity every open owner implies:
    # precheck-eval the same hour counted 51 resolved hypotheses in the pipeline
@@ -440,6 +490,25 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
 
      # 3. Experience records with negative relative_advantage clustered by approach
      #    (already windowed — recent 20; unchanged by g-115-1905)
+     #
+     # ⛔ THIS SOURCE IS INERT, AND ITS ZERO IS STRUCTURAL — DO NOT RE-DERIVE IT.
+     # `relative_advantage` IS NOT A FIELD ON EXPERIENCE RECORDS. Measured
+     # 2026-08-22 (echo, cc-03): the key is present on 0 of 20 recent records and
+     # no similarly-named key exists anywhere in the schema, which is
+     # {archived, archived_date, category, content_path, created, goal_id,
+     #  hypothesis_id, id, reasoning_chain, retrieval_stats, summary, type,
+     #  tree_nodes_related, verbatim_anchors}. So the filter below reads a
+     # missing key and yields 0 on EVERY pass — "no negative experiences" is not
+     # what it means (guard-1641: a 0 is ambiguous between counted-zero and
+     # never-produced; here it is provably the latter).
+     # ALREADY OWNED, THREE TIMES OVER — file nothing, cite these: rb-8048
+     # ("weakness analysis gates on >=2 signals while 3 of its 4 sources cannot
+     # contribute"), rb-7831 (the general mechanism: an AND-threshold silently
+     # becomes unreachable as its sources are individually and CORRECTLY
+     # retired), and goal g-115-5115. With source 2 retired (g-115-2141) and
+     # this one inert, only sources 1 and 4 can fire, so the `>= 2` synthesis
+     # gate below needs BOTH — which is why passes routinely end at 1 signal and
+     # synthesise nothing. That is the known state, not a fresh discovery.
      Bash: experience-read.sh --recent 20
      negative_experiences = filter WHERE relative_advantage < -0.1
      IF len(negative_experiences) >= 3:

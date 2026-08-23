@@ -103,10 +103,19 @@ def wm_lock():
         release_lock(lock)
 
 # Top-level keys (not inside slots:)
+# `capture_evictions` is a per-session tally of captures destroyed by the
+# array_limits cap (written top-level by cmd_append/body-merge). Its TOP-LEVEL
+# placement is deliberate and must not be "fixed" into slot_meta: slot_meta is
+# reducer-wins at generalize-down, so a Body's tally there is DROPPED on merge
+# (body-merge.py:299, wm.py:1082). Membership here is the READ path — without it
+# resolve_slot looks under slots:, misses, and returns null, which is byte-identical
+# to the answer for a key that does not exist. Measured 2026-08-22 (alpha, cc-04):
+# on-disk {exp_capture: 2, sensory_buffer: 45} read back as null. What this counter
+# detects is DATA LOSS, so an unreadable one is worse than none (learning-philosophy).
 TOP_LEVEL_KEYS = {
     "encoding_queue", "session_id", "session_start",
     "goals_completed_this_session", "aspiration_touched_last",
-    "last_goal_category",
+    "last_goal_category", "capture_evictions",
 }
 
 # Session-identity fields: survive `wm reset` (which runs mid-session at
@@ -117,6 +126,17 @@ TOP_LEVEL_KEYS = {
 # across autocompact (identity→slot) or leaks stale state across sessions
 # (slot→identity).
 SESSION_IDENTITY_FIELDS = {"session_start"}
+
+# : TOP-LEVEL keys that must survive wm-reset but are NOT identity.
+# Hand-mirrored in mind_api/src/endpoints/wm_write.py — wm-reset is DAEMON-ONLY,
+# so that copy is the one that runs in production; keep them in sync (guard-2552).
+#
+# Deliberately SEPARATE from SESSION_IDENTITY_FIELDS: clear-identity NULLS every
+# member of that set, so putting a key there to survive reset would make
+# clear-identity destroy it. RESET_SURVIVING_SLOTS cannot express it either — it
+# is consulted only inside the `existing_slots.items()` loop, which a top-level
+# key never enters.
+RESET_SURVIVING_TOP_LEVEL = {"capture_evictions"}
 
 # Default slot types — used by init/reset when config is unavailable
 DEFAULT_SLOT_TYPES = [
@@ -510,6 +530,19 @@ CADENCE_TRACKER_PATTERNS = (
 # registration in both files and nothing here, so a reset destroyed it while its
 # siblings survived.
 #
+# ┌─ HISTORICAL as of 2026-08-22 (, zeta, cc-02, 6.8.0-137-generic) ─┐
+# │ THE CONSUMER NOW EXISTS. The narrative below is the record of a defect     │
+# │ that has since been FIXED — read it as history, not as current state.      │
+# │ `worker_retrospective.py` RUN_LANES is now ("team_state", "journal",       │
+# │ "findings", "experience", "encoding", "impk") at L133; ENC_SLOT =          │
+# │ "encoding_capture" (L164); `load_enc_captures` (L496) is called at L933    │
+# │ and L947; `_lane_encoding` (L666) is dispatched at L788. So 's    │
+# │ reducer half LANDED. Twin stale claims corrected in the same change:       │
+# │ iteration-close.sh (~L1656) and body-merge.sh (~L57).                      │
+# │ Placed ABOVE the narrative per guard-4079: the next reader's entry point   │
+# │ is the TOP of the block, and a defect narrative with the fix buried below  │
+# │ reads as a live defect report.                                             │
+# └───────────────────────────────────────────────────────────────────────────┘
 # THAT CONSUMER DOES NOT EXIST — measured 2026-08-15 (alpha worker, cc-07), and
 # the sentence above said "its consumer ... runs" in both this file and the
 # wm_write.py twin until then. `encoding_capture` appears 0 times in
@@ -1305,16 +1338,37 @@ def _do_prune(args):
         if isinstance(slot_val, list) and slot_name in limits:
             limit = limits[slot_name]
             if len(slot_val) > limit:
-                # Sort by _item_ts, remove oldest
+                # : DELIBERATELY pure FIFO — do NOT "unify" this with
+                # enforce_slot_limit despite that helper being the declared
+                # SSOT for the APPEND path. Measured on this twin: the shared
+                # policy evicts UNFLAGGED first, and unflagged == UNDELIVERED
+                # for a Body that has not closed (the fast lane mirrors only
+                # flagged entries), so unifying loses undelivered captures FIFO
+                # keeps. limit=10, floor=2, undelivered lost FIFO vs shared:
+                # 8F+4U 0 vs 2; 4F+8U 0 vs 2; 2F+10U 0 vs 2; 10F+2U 0 vs 0;
+                # unflagged-older 2 vs 2. Never better, worse in 4 of 5.
+                # TWIN of mind_api/src/endpoints/wm_write.py, the LIVE path
+                # (guard-742/2323) — keep in sync.
+                _n = 0
                 slot_val.sort(key=lambda x: x.get("_item_ts", "0000") if isinstance(x, dict) else "0000")
                 while len(slot_val) > limit:
                     removed = slot_val.pop(0)
+                    _n += 1
                     report["pruned_items"].append({
                         "slot": slot_name,
                         "item_summary": str(removed.get("claim", removed.get("reason", "?")))[:80] if isinstance(removed, dict) else "?",
                         "reason": "array_limit",
                     })
                 if not args.dry_run:
+                    # Persist the tally — this path recorded evictions only into
+                    # the transient `report`, invisible to capture_evictions.
+                    if _n:
+                        _ev = data.get("capture_evictions")
+                        if not isinstance(_ev, dict):
+                            _ev = {}
+                            data["capture_evictions"] = _ev
+                        _prev = _ev.get(slot_name)
+                        _ev[slot_name] = (_prev if isinstance(_prev, int) else 0) + _n
                     update_modified(data, slot_name)
 
     # Also check encoding_queue (top-level)
@@ -1369,6 +1423,15 @@ def cmd_reset(args):
                 data[k] = v
                 preserved.append(k)
 
+        # : top-level NON-identity survivors. Same read-inside-the-lock
+        # requirement as the identity loop above.
+        preserved_top_level = []
+        for k in RESET_SURVIVING_TOP_LEVEL:
+            v = existing.get(k)
+            if v is not None:
+                data[k] = v
+                preserved_top_level.append(k)
+
         # Preserve cadence-tracker slots — they hold "last X fired at"
         # timestamps that drive iteration cadences (last_felt_sense_checkin,
         # last_strategic_scan, etc). Eviction at reset causes duplicate
@@ -1399,6 +1462,8 @@ def cmd_reset(args):
         status_parts.append(f"{len(cadence_preserved)} cadence trackers")
     if surviving_preserved:
         status_parts.append("reset-surviving: " + ", ".join(sorted(surviving_preserved)))
+    if preserved_top_level:
+        status_parts.append("top-level: " + ", ".join(sorted(preserved_top_level)))
     if status_parts:
         print(f"Working memory reset to template state ({len(slot_types)} slots; preserved: {'; '.join(status_parts)}).")
     else:

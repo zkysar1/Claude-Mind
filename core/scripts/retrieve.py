@@ -760,8 +760,11 @@ def load_tree_nodes(categories, depth, read_only=False):
 
     limit = DEPTH_LIMITS.get(depth, 50)
 
-    # Build concept index once (shared across multi-category)
-    concept_index = build_concept_index(nodes)
+    # Build concept index once (shared across multi-category). WORLD_DIR is
+    # this module's global: import-bound in a CLI process, SWAPPED per request
+    # by the daemon endpoint — pass it so node bodies resolve against the
+    # world being served, never _paths' import-time value (g-367-08).
+    concept_index = build_concept_index(nodes, world_root=WORLD_DIR)
     entity_index = tree.get("entity_index", {})
 
     # Match across all categories, merge with dedup (keep best channel)
@@ -1312,6 +1315,85 @@ def _tree_doc_id_for(node):
         rel = rel[:-3]
     return ("tree:" + rel) if rel else None
 
+FRAMEWORK_DOC_HEADER_CAP = 12
+FRAMEWORK_DOC_BODY_CHARS = 400
+
+
+def framework_doc_id(entry):
+    """This framework doc's embedding-index id: 'framework:' + the entry's
+    repo-relative path, no .md. Namespace-disjoint from rb-*/guard-*/tree:
+    so every existing id join ignores these rows and vice versa.
+
+    DEFINED HERE AND CALLED BY THE BUILDER, deliberately — not mirrored into
+    it. embedding-index-build.py already imports this module as R, and the
+    dependency runs one way (retrieve does not import the builder), so the
+    write side and the read side of this join can share one function.
+    The tree lane's equivalent pair is two hand-maintained copies whose
+    docstrings say "MUST mirror" each other; that is the shape g-306-45
+    measured as a join matching ZERO real records while the feature shipped
+    silently inert, and g-115-3763 measured again on the freshness mirror.
+    One definition cannot drift from itself.
+    """
+    p = str((entry or {}).get("path") or "").replace("\\", "/")
+    if p.endswith(".md"):
+        p = p[:-3]
+    return ("framework:" + p) if p else None
+
+
+def framework_doc_text(entry):
+    """The embedded surface for a framework doc: title + section headers +
+    body sample.
+
+    Mirrors the SHAPE build.tree_doc_text settled on (name + summary + first
+    body paragraph), with headers standing in for the summary a rule file
+    does not have. Headers earn their place: _build_framework_index already
+    collects them because section names carry the discriminative tokens
+    ("Anti-patterns", "Multi-signal requirement"), and on a paraphrase query
+    they are often the only surface naming the concept. Both are capped so
+    one long convention cannot dominate its own embedding.
+    """
+    e = entry or {}
+    parts = [str(e.get("title") or "")]
+    tags = e.get("tags") or []
+    if isinstance(tags, list) and tags:
+        parts.append(" ".join(str(t) for t in tags[:FRAMEWORK_DOC_HEADER_CAP]))
+    body = str(e.get("content") or "")[:FRAMEWORK_DOC_BODY_CHARS]
+    if body:
+        parts.append(body)
+    return " ".join(p for p in parts if p).strip()
+
+
+def _framework_embedding_scores(categories, entries):
+    """g-306-340 — flag-gated framework-lane cosine scores, keyed by the
+    caller's PATH namespace.
+
+    Returns {path: cosine} for every framework doc present in the persisted
+    index, or {} when `embedding_framework_channel_enabled` is off, the index
+    is absent/degraded, or anything fails. Same structural graceful
+    degradation as _tree_embedding_scores and _embedding_blend: an
+    un-provisioned box has no index, cosine_scores returns {}, and this lane
+    silently stays on the token baseline it has always used.
+    """
+    cfg = _load_retrieval_config()
+    if not cfg.get("embedding_framework_channel_enabled", False):
+        return {}
+    try:
+        from _embedding_retrieval import cosine_scores
+        query = " ".join(c for c in categories
+                         if isinstance(c, str) and c).strip()
+        raw = cosine_scores(query) if query else {}
+    except Exception:
+        raw = {}
+    if not raw:
+        return {}
+    out = {}
+    for e in (entries or []):
+        did = framework_doc_id(e)
+        if did is not None and did in raw:
+            out[e.get("path")] = raw[did]
+    return out
+
+
 def _tree_embedding_scores(categories, nodes):
     """g-306-83 — flag-gated tree-lane cosine scores, joined back to the
     caller's BASENAME namespace.
@@ -1802,11 +1884,51 @@ def load_framework_rules(categories):
 
     Returns [] when categories is empty/falsy — symmetric with
     `_entry_matches_text`, which requires at least one query token.
+
+    g-306-340 adds a flag-gated SEMANTIC eligibility channel alongside the
+    token one. Measured on cc-13 with the embedding channel alive: the
+    paraphrase "is my teammate agent actually down or just quiet" still
+    missed partner-liveness.md, because the tree and rb/guardrail lanes had
+    gone semantic and this one had not. Docs whose query-cosine clears the
+    lane floor now join the match set even when token overlap missed them.
+    DEFAULT OFF, per the same per-lane A/B discipline g-306-83 set — each
+    lane enables on its own evidence, never on a sibling's.
     """
     if not categories:
         return []
     entries = _build_framework_index()
     matches = [e for e in entries if _entry_matches_text(e, categories)]
+
+    emb = _framework_embedding_scores(categories, entries)
+    if emb:
+        # Lane-specific floor falling back to the shared value, mirroring
+        # g-306-92's reasoning for the tree lane: embedding_min_cosine was
+        # tuned on the supplementary rb/guardrail lane's evidence, so
+        # retuning it here would silently move THAT lane. Deleting the
+        # override key restores the shared behaviour exactly.
+        cfg = _load_retrieval_config()
+        try:
+            min_cos = float(cfg.get("embedding_framework_min_cosine",
+                                    cfg.get("embedding_min_cosine", 0.35)))
+        except (TypeError, ValueError):
+            min_cos = 0.35
+        seen = {e.get("path") for e in matches}
+        for e in entries:
+            p = e.get("path")
+            if p in seen:
+                continue
+            score = emb.get(p)
+            if score is not None and score >= min_cos:
+                matches.append(e)
+                seen.add(p)
+
+    # Sort is deliberately UNCHANGED — tier then path, exactly as before, so
+    # a semantically-admitted doc ranks like any other match rather than on a
+    # second ranking policy invented here. NOTE for the A/B: because the cap
+    # cuts in tier order, a world-convention admitted by cosine can still be
+    # trimmed by FRAMEWORK_RULES_CAP when 15 higher-tier docs already matched.
+    # Whether that starves the semantic channel is a QUESTION FOR THE
+    # MEASUREMENT, not something to pre-solve by reordering the lane.
     matches.sort(key=lambda e: (_FRAMEWORK_TIER_RANK.get(e["source_tier"], 99),
                                 e["path"]))
     return matches[:FRAMEWORK_RULES_CAP]
@@ -1823,13 +1945,35 @@ def load_experiences(categories, depth, read_only=False):
     records = read_jsonl(EXP_PATH)
     limit = EXP_LIMITS.get(depth, 5)
 
-    # Filter by any category match + not archived
+    # Filter by any category match + not archived.
+    #
+    # Uses `_entry_matches` — the SAME predicate as load_reasoning_bank,
+    # load_guardrails and load_pattern_signatures (strict bidirectional
+    # category match, then the ≥2-distinct-≥5-char-token text fallback added
+    # 2026-05-12 for retrieval-triggers.md G9/R3). This loader was the one
+    # supplementary store G9 never reached, and it kept a NARROWER matcher
+    # than any sibling: one-directional containment (`c in exp_cat`, so
+    # "npc-intelligence" did NOT match a "npc-intelligence-evaluation"
+    # record) and no text fallback at all.
+    #
+    # That omission is why `retrieval_stats.times_useful` had no live writer
+    # (g-115-6908). The g-115-5725 wire-in (2026-08-11, 08e87d67a) correctly
+    # taught retrieve.py to emit {"type":"experience"} into
+    # supplementary_items and utilization-feedback.py to route that type to
+    # _increment_experience_stat — but it fed those on a list this filter
+    # left EMPTY for every free-text query, which is the query shape
+    # guard-519 explicitly instructs agents to use. Measured 2026-08-21
+    # (zeta, hostname cc-02, uname -r 6.8.0-137-generic) across 4,198 live
+    # records from 7 agents: 1,186 records created since the wire-in, ZERO
+    # with times_useful > 0; the archive sweep's never-archive-high-value
+    # guard (rc>=5 AND utility_ratio>=0.5) protected a population of exactly
+    # 0. Before/after panel: 5 free-text queries returned 0 experiences each
+    # while two exact-category queries returned 15 each.
     matching = []
     for r in records:
         if r.get("archived", False):
             continue
-        exp_cat = r.get("category", "").lower()
-        if any(c.lower() in exp_cat for c in categories):
+        if _entry_matches(r, categories):
             matching.append(r)
 
     # Sort by retrieval_count descending (most-proven first)
@@ -1989,6 +2133,11 @@ _DEFAULT_RETRIEVAL_CFG = {
     # _score_weight_limit). Separate flag from the supplementary blend so
     # each lane enables on its own A/B evidence.
     "embedding_tree_channel_enabled": False,
+    # g-306-340: framework-lane embedding channel (semantic eligibility in
+    # load_framework_rules over .claude/rules + core/config/conventions +
+    # world/conventions). Its OWN flag for the same reason the tree lane has
+    # one — each lane enables on its own A/B evidence.
+    "embedding_framework_channel_enabled": False,
 }
 
 _RETRIEVAL_CFG_CACHE = None
@@ -2008,6 +2157,32 @@ def _load_retrieval_config():
         pass
     _RETRIEVAL_CFG_CACHE = merged
     return merged
+
+
+def embedding_channel_status():
+    """One-line per-request health of the semantic (embedding) channel.
+
+    The two embedding flags are fleet-shared but the index is PER-BOX, so a
+    box can serve token-only retrieval for weeks with nothing saying so
+    (cc-13 measured 2026-08-21: 5/7 known-target paraphrase queries missed
+    with both flags ON and no index — the g-115-3581 silent-DEAD class).
+    Cheap probes only — flag read + index-file stat; the model is never
+    loaded here (a degraded sentence-transformers box pays ~28s per load,
+    g-115-3577). Deep capability probing stays in embedding-index-build.py
+    --stats (channel=alive|DEAD).
+    """
+    cfg = _load_retrieval_config()
+    if not (cfg.get("embedding_blend_enabled")
+            or cfg.get("embedding_tree_channel_enabled")):
+        return "off"
+    try:
+        from _embedding_retrieval import index_available
+        if not index_available():
+            return ("DEAD: flags ON but no per-box index -- token-only on "
+                    "this box (build: embedding-index-build.py --build)")
+    except Exception as exc:  # same structural degradation contract as the blend
+        return "DEAD: _embedding_retrieval unavailable (%s)" % exc
+    return "alive"
 
 def _utility_weight(node, cfg=None):
     """Clamp(`1.0 + (utility_ratio - center)`, min, max); neutral 1.0 for underretrieved nodes.

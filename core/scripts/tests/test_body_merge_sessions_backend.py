@@ -27,11 +27,17 @@ different instrument, and mislabelling it hides which of the two it is
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 CORE_SCRIPTS = Path(__file__).resolve().parents[1]
+if str(CORE_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(CORE_SCRIPTS))
+
+import wm  # noqa: E402  — for CAPTURE_SLOTS; see the parameterized lane test below
 
 
 def _load(modname: str, filename: str):
@@ -104,16 +110,21 @@ def _reducer_wm(pr: Path) -> dict:
             encoding="utf-8")) or {}
 
 
-def _store_body(unit: str = UNIT, spark=None, state: str = "closed-pending-merge") -> dict:
-    """A shipped Body present ONLY in the store — no local sessions/ dir at all."""
+def _store_body(unit: str = UNIT, spark=None, state: str = "closed-pending-merge",
+                slot: str = "spark_capture") -> dict:
+    """A shipped Body present ONLY in the store — no local sessions/ dir at all.
+
+    `slot` defaults to spark_capture so every test written before 2026-08-22 keeps
+    its exact payload; only the parameterized lane test below varies it.
+    """
     manifest = {
         "unitKey": unit, "mindKey": AGENT, "role": "worker",
         "body_state": state, "remote_body": True, "machine_id": "cc-99",
     }
-    wm = {"slots": {"spark_capture": spark if spark is not None else [
+    body_wm = {"slots": {slot: spark if spark is not None else [
         {"goal_id": "g-1", "observation": "cross-box learning"}]}}
     return {f"{unit}/body-manifest.yaml": _y(manifest),
-            f"{unit}/working-memory.yaml": _y(wm)}
+            f"{unit}/working-memory.yaml": _y(body_wm)}
 
 
 # ── THE DEFECT PIN ──────────────────────────────────────────────────────────
@@ -215,3 +226,46 @@ def test_active_body_in_the_store_is_not_merged(tmp_path, monkeypatch):
 
     assert summary["merged"] == [], summary
     assert summary["scanned"] == 0, summary
+
+
+# ── EVERY LANE, NOT JUST THE REPRESENTATIVE ONE () ─────────────────
+
+@pytest.mark.parametrize("slot", sorted(wm.CAPTURE_SLOTS))
+def test_every_capture_lane_survives_the_cross_box_path(tmp_path, monkeypatch, slot):
+    """All six tests above seed `spark_capture` and only spark_capture, so until
+    2026-08-22 the cross-box path was proven for ONE of the four capture lanes.
+
+    That is the g-115-6054 lesson — a representative member is not coverage of a
+    family — and it is the THIRD time it has surfaced inside g-306-204 alone.
+    The residual risk was small but not zero: the lanes share `merge_wm`'s slot
+    loop (pinned in test_capture_lane_chain.py), but the array_limits
+    enforcement that runs on the MERGED slots is keyed PER SLOT, so a
+    lane-specific failure on this path was possible and nothing would have
+    caught it.
+
+    Parameterized over `wm.CAPTURE_SLOTS` rather than a written-out list of four,
+    so a fifth lane is covered by being REGISTERED — the same discipline
+    test_capture_lane_chain.py and test_wm_reset_cadence.py already apply.
+
+    Deliberately additive: the six tests above are left byte-for-byte alone.
+    Their docstrings record which are DEFECT PINS and which are REGRESSION
+    GUARDS (measured, not asserted — see the module docstring), and rewriting
+    them to loop would blur a distinction guard-1943 exists to keep sharp.
+    """
+    pr = _mk_reducer(tmp_path, {"slots": {slot: []}})
+    store = SessionsStore(_store_body(slot=slot))
+    monkeypatch.setattr(merge, "_get_backend", lambda: store)
+
+    assert not (pr / "agents" / AGENT / "sessions").is_dir(), "precondition: no local dir"
+
+    summary = merge.generalize_down(AGENT, pr)
+
+    assert summary["merged"] == [UNIT], (
+        f"{slot}: a cross-box Body carrying this lane did not merge at all: {summary}"
+    )
+    landed = (_reducer_wm(pr)["slots"] or {}).get(slot) or []
+    assert any(e.get("observation") == "cross-box learning" for e in landed), (
+        f"{slot}: the Body merged but this lane's payload did not reach the "
+        f"reducer (lane holds {landed!r}) — a worker's learning in this lane "
+        f"would be silently lost on every cross-box ship"
+    )

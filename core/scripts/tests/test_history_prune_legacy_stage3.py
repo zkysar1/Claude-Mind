@@ -128,7 +128,16 @@ def _run(cmd_argv):
 
 @test
 def deletes_old_subtree_with_new_store_coverage():
-    """All snapshots aged >30d AND new-store has manifest → deleted."""
+    """All snapshots aged >30d AND new-store coverage is complete → deleted.
+
+    FIXTURE CORRECTED (g-115-5513): this test previously planted TWO legacy
+    snapshots against ONE manifest and asserted deletion — i.e. it PINNED the
+    count-blind coverage gate as correct behavior, which is the exact defect
+    the goal was filed against. The intent ("aged out + covered ⇒ delete") is
+    unchanged and still the thing under test; only the fixture moved, so that
+    "covered" now means what the word claims. A second save supplies the
+    second manifest.
+    """
     with sandbox() as world:
         leg_dir = world / ".history" / "data.txt"
         _plant_legacy_snap(world, "data.txt", "2026-04-01T09-00-00",
@@ -136,6 +145,7 @@ def deletes_old_subtree_with_new_store_coverage():
         _plant_legacy_snap(world, "data.txt", "2026-04-02T09-00-00",
                            "alpha", b"old2", mtime_age_days=44)
         _plant_new_store(world, "data.txt", "beta", b"new content")
+        _plant_new_store(world, "data.txt", "beta", b"new content 2")
 
         assert leg_dir.exists()
         with _capture() as (out, _):
@@ -366,6 +376,123 @@ def deletes_only_eligible_subtrees_in_mixed_set():
         assert not (world / ".history" / "a.txt").exists(), "A should be deleted"
         assert (world / ".history" / "b.txt").exists(), "B should remain (recent)"
         assert (world / ".history" / "c.txt").exists(), "C should remain (no coverage)"
+
+
+# ---------------------------------------------------------------------------
+# Shortfall gate () — coverage must INTERSECT the deletion set, not
+# merely be PRESENT beside it.
+#
+# The original coverage gate asked "does .history/snapshots/<rel>/ hold AT LEAST
+# ONE manifest". The new store writes one manifest PER VERSION, so that predicate
+# answers "did this path migrate at all", never "did THESE snapshots migrate".
+# It is rb-6344 exactly: presence of a backup is not intersection with the set
+# about to be destroyed, and guard-1308 names the same step.
+#
+# Measured on the live world store 2026-08-09 (alpha, hostname cc-04): 14 legacy
+# dirs held snapshots, 13 would PASS, and THREE of those had FEWER manifests than
+# legacy snapshots — board/coordination.jsonl 502 vs 431, board/findings.jsonl
+# 186 vs 62, board/general.jsonl 26 vs 21. Total 200 snapshots that the gate
+# would have declared covered.
+#
+# WHY A COUNT AND NOT A SET: the two trees are keyed differently by construction
+# (a legacy snapshot is <ts>_<agent><ext>.gz; a new-store manifest is
+# <ts>_<agent>.yaml written at a DIFFERENT instant by the migration), so there is
+# no honest identity join between them. A count comparison is the strongest
+# predicate available that cannot pass while short, and it fails SAFE — it can
+# only ever refuse a deletion the old gate would have allowed.
+# ---------------------------------------------------------------------------
+
+@test
+def refuses_subtree_with_fewer_manifests_than_legacy_snapshots():
+    """3 legacy snapshots vs 1 manifest → REFUSE. RED before .
+
+    This is the exact live shape: board/findings.jsonl had 186 legacy snapshots
+    against 62 manifests and passed the presence gate. Against the count-blind
+    predicate this test fails, because the dir is deleted.
+    """
+    with sandbox() as world:
+        leg_dir = world / ".history" / "data.txt"
+        for i, day in enumerate((45, 44, 43)):
+            _plant_legacy_snap(world, "data.txt", f"2026-04-0{i+1}T09-00-00",
+                               "alpha", f"old{i}".encode(), mtime_age_days=day)
+        # Exactly ONE manifest — the old gate's threshold, and 2 short.
+        _plant_new_store(world, "data.txt", "beta", b"new content")
+
+        with _capture() as (out, _):
+            _run(["prune-legacy", "--apply"])
+        assert leg_dir.exists(), (
+            "subtree with FEWER manifests than legacy snapshots must be "
+            f"preserved, but it was deleted: {leg_dir}"
+        )
+        assert "shortfall" in out.getvalue().lower(), (
+            "the refusal must name the shortfall so a reader can act on it; "
+            f"got: {out.getvalue()}"
+        )
+
+
+@test
+def shortfall_dirs_are_reported_explicitly_in_dry_run():
+    """A dry run must NAME each short dir with both counts, not pass silently.
+
+    g-115-5513 verification outcome 2. Silent passing is what let 200 snapshots
+    read as covered: the gate is real, well-commented and looks careful, so a
+    reader has no prompt to check it.
+    """
+    with sandbox() as world:
+        for i, day in enumerate((45, 44)):
+            _plant_legacy_snap(world, "short.txt", f"2026-04-0{i+1}T09-00-00",
+                               "alpha", f"s{i}".encode(), mtime_age_days=day)
+        _plant_new_store(world, "short.txt", "beta", b"new short")
+
+        with _capture() as (out, _):
+            _run(["prune-legacy"])          # dry run, no --apply
+        text = out.getvalue()
+        assert "short.txt" in text, f"short dir not named in dry run: {text}"
+        assert "2 legacy" in text and "1 manifest" in text, (
+            f"dry run must show BOTH counts so the shortfall is checkable: {text}"
+        )
+        assert (world / ".history" / "short.txt").exists(), (
+            "dry run must never delete"
+        )
+
+
+@test
+def equal_counts_still_delete():
+    """Coverage EQUAL to the deletion set stays eligible — the gate tightens
+    only where it was actually blind, and does not become a blanket refusal."""
+    with sandbox() as world:
+        leg_dir = world / ".history" / "even.txt"
+        _plant_legacy_snap(world, "even.txt", "2026-04-01T09-00-00",
+                           "alpha", b"a", mtime_age_days=45)
+        _plant_legacy_snap(world, "even.txt", "2026-04-02T09-00-00",
+                           "alpha", b"b", mtime_age_days=44)
+        # Two distinct saves → two manifests.
+        _plant_new_store(world, "even.txt", "beta", b"new-1")
+        _plant_new_store(world, "even.txt", "beta", b"new-2")
+
+        with _capture() as (out, _):
+            _run(["prune-legacy", "--apply"])
+        assert not leg_dir.exists(), (
+            f"equal coverage must remain eligible; output: {out.getvalue()}"
+        )
+
+
+@test
+def surplus_manifests_still_delete():
+    """MORE manifests than legacy snapshots is the healthy shape (nine of the
+    live world dirs looked like this) and must stay eligible."""
+    with sandbox() as world:
+        leg_dir = world / ".history" / "surplus.txt"
+        _plant_legacy_snap(world, "surplus.txt", "2026-04-01T09-00-00",
+                           "alpha", b"a", mtime_age_days=45)
+        for i in range(3):
+            _plant_new_store(world, "surplus.txt", "beta", f"new-{i}".encode())
+
+        with _capture() as (out, _):
+            _run(["prune-legacy", "--apply"])
+        assert not leg_dir.exists(), (
+            f"surplus coverage must remain eligible; output: {out.getvalue()}"
+        )
 
 
 def main():

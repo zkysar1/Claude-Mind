@@ -1062,6 +1062,103 @@ def test_repeating_conflict_prints_escalation_directive_once(tmp_path):
     assert streak.read_text().split()[0] == "3"
 
 
+def test_repeating_dirty_defer_prints_its_own_escalation_directive_once(tmp_path):
+    """: a repeating DEFER strands the box exactly as a repeating
+    CONFLICT does, so it gets an escalation on the same contract.
+
+    THE ASYMMETRY THIS PINS. Before this change the defer lane emitted nothing
+    a caller could act on: the ⚠ streak WARNING starts at 3 while the conflict
+    lane escalates at 2, it re-prints every cycle instead of once per streak,
+    and worker-loop Phase -0.3 greps only the '— ESCALATION REQUIRED (g-'
+    headline. Measured cc-08 2026-08-20: two consecutive defers on a dirty
+    repo-root blocker-gate-overrides.jsonl, 39 commits behind and climbing,
+    ZERO escalation, while origin/main ALREADY CARRIED the fix.
+
+    The n=1 assertion is the discriminator, not decoration: without it this
+    test would pass against a directive that fired on EVERY defer, which is the
+    noise the once-per-streak marker exists to prevent.
+    """
+    origin, a, b = _clone_pair(tmp_path)
+    # DIRTY-TREE defer (not a conflict): B commits, A leaves base.txt dirty and
+    # uncommitted, so git refuses to START the merge. Same shape as
+    # test_defer_streak_survives_dry_run above.
+    _commit_file(b, "base.txt", "B v2\n", "B: rewrite base")
+    _must(b, "push", "-q", "origin", "main")
+    (a / "base.txt").write_text("A dirty uncommitted\n", encoding="utf-8")
+
+    streak = a / ".git" / "iteration-push-defer-streak"
+    marker = a / ".git" / "iteration-push-defer-streak-escalated-defer"
+    conflict_marker = a / ".git" / "iteration-push-defer-streak-escalated"
+
+    r1 = _run_push(a, *_default_flags())
+    assert r1.returncode == 0, r1.stderr            # fail-soft, never blocks
+    assert "ESCALATION REQUIRED" not in r1.stderr, "must not escalate at n=1"
+    fields = streak.read_text().split()
+    assert fields[0] == "1" and fields[2] == "dirty-defer", fields
+
+    r2 = _run_push(a, *_default_flags())
+    assert r2.returncode == 0, r2.stderr
+    assert "REPEATING INTEGRATE DEFER — ESCALATION REQUIRED" in r2.stderr, r2.stderr
+    # A SEPARATE headline from the conflict lane (guard-2586: a fallback path
+    # and a failure path must never emit the same message — here the remedies
+    # are opposite, clear-the-file vs hand-resolve-the-merge).
+    assert "REPEATING MERGE CONFLICT" not in r2.stderr, \
+        "the two lanes must stay distinguishable; their remedies are opposite"
+    # ...but both carry the tail worker-loop Phase -0.3 branches on, so one
+    # predicate covers both shapes.
+    assert "— ESCALATION REQUIRED (g-" in r2.stderr, r2.stderr
+    # The whole point of carrying $2 through: the blocking path is NAMED, so the
+    # escalation is actionable without re-deriving it on the wedged box.
+    assert "base.txt" in r2.stderr, r2.stderr
+    assert "Blocking path(s):" in r2.stderr, r2.stderr
+
+    assert marker.is_file(), "one-shot marker must persist the streak's since stamp"
+    assert marker.read_text().strip() == streak.read_text().split()[1]
+    assert not conflict_marker.is_file(), \
+        "the defer lane must not consume the conflict lane's marker"
+
+    r3 = _run_push(a, *_default_flags())
+    assert r3.returncode == 0, r3.stderr
+    assert "ESCALATION REQUIRED" not in r3.stderr, \
+        "directive is once-per-streak; n=3 must not re-print"
+    assert streak.read_text().split()[0] == "3"
+    # n=3 is where the pre-existing ⚠ WARNING starts. It still fires, and that
+    # is deliberate — the directive replaced nothing, it filled a hole below it.
+    assert "INTEGRATE-DEFER STREAK" in r3.stderr, r3.stderr
+
+
+def test_streak_reset_clears_BOTH_lane_markers(tmp_path):
+    """A surviving marker silently suppresses the NEXT streak of its shape.
+
+    Pins the reset, not the tick: `_ip_defer_streak_reset` removes the streak
+    file plus both `-escalated` markers. If only the conflict marker were
+    cleared, a box that wedged, recovered and re-wedged on a dirty file would
+    escalate exactly once in its lifetime and then go quiet forever — the
+    failure mode is invisible because the second wedge looks identical to the
+    first from inside the box.
+    """
+    origin, a, b = _clone_pair(tmp_path)
+    _commit_file(b, "base.txt", "B v2\n", "B: rewrite base")
+    _must(b, "push", "-q", "origin", "main")
+    (a / "base.txt").write_text("A dirty uncommitted\n", encoding="utf-8")
+
+    streak = a / ".git" / "iteration-push-defer-streak"
+    marker = a / ".git" / "iteration-push-defer-streak-escalated-defer"
+
+    _run_push(a, *_default_flags())
+    r2 = _run_push(a, *_default_flags())
+    assert "REPEATING INTEGRATE DEFER" in r2.stderr, r2.stderr
+    assert marker.is_file() and streak.is_file()
+
+    # Clear the blocker; the next run integrates and must reset BOTH.
+    _must(a, "checkout", "--", "base.txt")
+    r3 = _run_push(a, *_default_flags())
+    assert r3.returncode == 0, r3.stderr
+    assert not streak.is_file(), "a clean integrate must reset the streak"
+    assert not marker.is_file(), \
+        "a surviving defer marker suppresses the NEXT dirty-file wedge forever"
+
+
 # --------------------------------------------------------------------------- #
 # tracked .mind-data/ under a NON-local backend ()
 # --------------------------------------------------------------------------- #

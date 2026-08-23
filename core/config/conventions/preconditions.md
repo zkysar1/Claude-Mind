@@ -50,10 +50,23 @@ probes, custom state queries, readiness checks).
 ```yaml
 - type: command_succeeds
   id: pc-pipeline-ready
-  command: "bash core/scripts/pipeline-read.sh --counts --min 1"
+  command: "bash core/scripts/pipeline-read.sh --counts"
   timeout_seconds: 30                 # default 30, capped at 120
   selector_skip: false                # default false; set true for expensive checks
 ```
+
+> ⚠ **This predicate passes on EXIT 0, so it cannot express a threshold.** The
+> example above read `--counts --min 1` until 2026-08-21 (g-115-5438) and was
+> doubly wrong: `pipeline-read.sh` has no `--min` (its accepted set is
+> `--stage --id --summary --counts --accuracy --unreflected --replay-candidates
+> --narrative --archive --meta`), and the flag was silently swallowed into a
+> write-only PASSTHROUGH array — so the exemplar looked like a ">= 1 record"
+> check while actually passing whenever the command ran at all, including on an
+> empty pipeline. Since the wrapper now REFUSES unknown flags it would exit 2
+> and the precondition would read as permanently unmet. Nothing live used it
+> (this block was its only occurrence in the tree), but it is the block people
+> copy. **For a genuine threshold, write a script that exits non-zero below it**
+> and invoke that by fixed path — per the no-interpolation rule below.
 
 **Safety allowlist**: `command` MUST start with one of:
 - `bash core/scripts/` — framework scripts under PROJECT_ROOT

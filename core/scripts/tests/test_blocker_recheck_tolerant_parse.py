@@ -112,6 +112,40 @@ def test_null_literal_returns_none_no_diagnostic():
     assert err == "", f"'null' literal must not emit a diagnostic, got {err!r}"
 
 
+# ── Case 3b: the PRODUCTION body shape — 'null' WITH a trailing newline ───
+def test_null_literal_with_trailing_newline_returns_none():
+    """guard-920 / self.md 7th state: Case 3 fixtures a BARE 'null', but the
+    daemon does not emit one. Measured on cc-02 2026-08-21 via
+    `_rt.wm_read(slot='known_blockers', as_json=True)`: the body is
+    `'null\\n'`. The early-return guard used `.lstrip()`, which strips only
+    LEADING whitespace, so `'null\\n'.lstrip() != 'null'` and the empty slot
+    fell through to `tolerant_decode_aggregate`, which correctly classifies
+    Python None as a non-dict-and-non-list aggregate -> SystemExit(1).
+
+    Effect: blocker-recheck died rc=1 with ZERO stdout on every agent whose
+    known_blockers slot is null -- the common case (g-115-4328 measured all
+    five fleet agents reading null). The goal-record population that same
+    fix moved INTO the script (_read_goal_blocker_refs) never ran, because
+    the WM read killed the process first.
+
+    Case 3 passed throughout: it reached the defect, sat at the right layer,
+    discriminated correctly, and asserted against a fixture production never
+    produces. Sibling create-blocker.py:109 uses `.strip()` on the same slot.
+    """
+    result, err = _decode("known_blockers", "null\n")
+    assert result is None, (
+        f"the daemon's real empty-slot body is 'null\\n' -- got {result!r}"
+    )
+    assert err == "", f"'null\\n' must not emit a diagnostic, got {err!r}"
+
+
+# ── Case 3c: CRLF variant (Windows daemon) ────────────────────────────────
+def test_null_literal_with_crlf_returns_none():
+    result, err = _decode("known_blockers", "null\r\n")
+    assert result is None, f"expected None for 'null\\r\\n', got {result!r}"
+    assert err == "", f"'null\\r\\n' must not emit a diagnostic, got {err!r}"
+
+
 # ── Case 4: valid empty list ──────────────────────────────────────────────
 def test_valid_empty_list():
     result, err = _decode("known_blockers", "[]")
@@ -230,6 +264,55 @@ def test_read_blockers_empty_slot_returns_empty_list():
     try:
         result = M._wm_read_blockers()
         assert result == [], f"empty slot must map to [], got {result!r}"
+    finally:
+        M._rt = orig_rt
+
+
+# ── Case 11b: the END-TO-END path against the shape production ACTUALLY emits ─
+def test_read_blockers_empty_slot_with_trailing_newline_returns_empty_list():
+    """Case 11's twin, and the one with mutation sensitivity.
+
+    Case 11 stubs `wm_read` returning a BARE "null". The live daemon returns
+    `'null\\n'` (measured on cc-02 2026-08-21). That difference is not
+    cosmetic: it is the whole defect. Case 11 passed continuously while
+    `_tolerant_decode` used `.lstrip()`, so the end-to-end test asserting the
+    empty-slot contract could not observe the empty-slot contract being
+    broken -- for 64 days, on the lane that runs every precheck iteration.
+
+    Revert `_tolerant_decode` to `.lstrip()` and THIS test fails
+    (SystemExit(1) out of tolerant_decode_aggregate) while Case 11 still
+    passes. That asymmetry is the point: a fixture is only a regression guard
+    for the shape it actually carries, so the stub must carry the producer's
+    bytes, not the contract's idealized spelling.
+
+    Same defect class as rb-4832 (an invented fixture body that fingerprints
+    to None and green-passes a dedup test it never exercised) -- framework
+    surface rather than domain, reached from the opposite direction.
+    """
+
+    class _StubRt:
+        class RtError(Exception):
+            def __init__(self, body=""):
+                self.body = body
+                super().__init__(body)
+
+        @staticmethod
+        def wm_read(slot, as_json):
+            return "null\n"  # the daemon's REAL empty-slot body
+
+        @staticmethod
+        def tolerant_decode_aggregate(source, raw):
+            import importlib
+            return importlib.import_module("_rt").tolerant_decode_aggregate(source, raw)
+
+    orig_rt = M._rt
+    M._rt = _StubRt
+    try:
+        result = M._wm_read_blockers()
+        assert result == [], (
+            "the daemon's real empty-slot body 'null\\n' must map to [], "
+            f"got {result!r}"
+        )
     finally:
         M._rt = orig_rt
 

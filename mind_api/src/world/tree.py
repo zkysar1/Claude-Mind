@@ -27,14 +27,17 @@ from ..yaml_cache import cache
 
 
 # Make core/scripts/ importable so we can call tree_match.find_nodes
-# directly. This is path-stable (no per-agent state baked in — tree_match
-# imports only _paths.PROJECT_ROOT, which is computed from __file__).
+# directly. NOT path-stable on its own: tree_match's node-body resolver falls
+# back to _paths.WORLD_DIR, which this process bound ONCE at import — None if
+# the daemon started before any world existed, or agent A's world while
+# serving agent B. Every call below therefore passes ctx.paths.world
+# explicitly ().
 _SCRIPTS_DIR = Path(__file__).resolve().parents[3] / "core" / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-# Imported once at module load. The import side effects of tree_match are
-# limited to capturing PROJECT_ROOT — safe across per-request agents.
+# Imported once at module load. Safe across per-request agents ONLY because
+# the world root is supplied per call (see above).
 from tree_match import build_concept_index, _match_nodes, _score_and_limit  # noqa: E402
 
 
@@ -61,16 +64,18 @@ _concept_cache_lock = threading.Lock()
 _CONCEPT_CACHE_MAX = 8  # bounded; expect ~1 entry per agent's tree
 
 
-def _cached_concept_index(nodes: dict) -> dict:
-    nodes_id = id(nodes)
+def _cached_concept_index(nodes: dict, world_root) -> dict:
+    # The index is determined by the nodes dict AND the world the bodies are
+    # read from; key on both so a stale root can never serve a fresh request.
+    cache_key = (id(nodes), str(world_root))
     with _concept_cache_lock:
-        entry = _concept_cache.get(nodes_id)
+        entry = _concept_cache.get(cache_key)
     if entry is not None:
         return entry[0]
     # Build outside the lock — file I/O can be slow on cold caches.
-    idx = build_concept_index(nodes)
+    idx = build_concept_index(nodes, world_root=world_root)
     with _concept_cache_lock:
-        _concept_cache[nodes_id] = (idx, nodes)  # anchor pins the dict
+        _concept_cache[cache_key] = (idx, nodes)  # anchor pins the dict
         if len(_concept_cache) > _CONCEPT_CACHE_MAX:
             _concept_cache.pop(next(iter(_concept_cache)))
     return idx
@@ -107,7 +112,7 @@ def find(ctx) -> "Response":  # type: ignore[name-defined]
     # interior nodes from matches (semantically equivalent to building the
     # index on filtered nodes; see CLI's tree_match.find_nodes for the
     # canonical shape).
-    concept_index = _cached_concept_index(full_nodes)
+    concept_index = _cached_concept_index(full_nodes, ctx.paths.world)
 
     if leaf_only:
         nodes = {k: v for k, v in full_nodes.items() if not v.get("children")}

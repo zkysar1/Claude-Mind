@@ -145,8 +145,71 @@ printf '%s' "$STDIN_JSON" | bash "$SCRIPT_DIR/wm-contamination-check.sh" || true
 # badly later.
 bash "$SCRIPT_DIR/local-backend-staleness-check.sh" || true
 
+# ─── Step 2.7: housekeeping tick (P1, 2026-08-21) ──────────────────────────
+# Per-box temp-purge + scratchpad-GC cadence (housekeeping-tick.py). Assistant
+# boxes never reach iteration-close's productivity-check, so session start is
+# their ONLY cadence surface — this box's whole temp/scratchpad backlog
+# accrued exactly that way. The inline cost is a decide (one JSON read +
+# mtime compare, milliseconds); when due it stamps and spawns its worker
+# DETACHED, so session start never waits on a sweep. Self-gating (6h marker
+# in <agent>/session/housekeeping-tick-state.json) makes the double wiring
+# with iteration-close a no-op race at worst (idempotent dry-run/find).
+# Subshell-sources _paths.sh for the python3 shim guarantee (CLAUDE.md Python
+# Invocation rule); cygpath for the native-Python file arg. Fail-open + the
+# chain's `|| true` contract: advisory hygiene must never perturb session
+# start (this runs AFTER recovery-gate for the same reason the staleness
+# check does).
+(
+  # shellcheck disable=SC1091
+  . "$SCRIPT_DIR/_paths.sh" 2>/dev/null || true
+  _hk="$SCRIPT_DIR/housekeeping-tick.py"
+  command -v cygpath >/dev/null 2>&1 && _hk="$(cygpath -w "$_hk" 2>/dev/null || echo "$_hk")"
+  python3 "$_hk" --tick --source session-start
+) >/dev/null 2>&1 || true
+
 # ─── Steps 3+4: source=compact only ────────────────────────────────────────
 if [ "$SOURCE" = "compact" ]; then
+    # ─── Step 2.9: clear the context-reads manifest () ───────────
+    # THE GUARANTEED CLEAR. The compaction that just happened evicted file
+    # contents from context, so every "already in context" assertion in the
+    # tracker is now false: the re-read dedup gate refuses a needed re-read and
+    # the skill-dedup gate refuses a needed skill invocation, both silently.
+    #
+    # WHY HERE AND NOT ONLY IN PreCompact. PreCompact's clear is pre-hoc and
+    # cannot be relied on alone — its matcher in settings.json is 'auto', so a
+    # manual /compact fires no PreCompact hook at all, and the hook can time out
+    # mid-sequence (measured on the filing session: SessionStart reported
+    # compact-checkpoint.yaml missing). SessionStart source=compact is the
+    # resume event itself: if it does not fire there is no post-compaction turn
+    # to protect, so it strictly dominates as the place that must not be missed.
+    # It is also the semantically correct moment — clear the manifest BECAUSE
+    # the content was evicted, after it was evicted.
+    #
+    # SOURCE-GATED, and that is load-bearing (guard-404): this runs for compact
+    # ONLY, never startup or resume. A startup-side clear would wipe a manifest
+    # whose content genuinely IS in context.
+    #
+    # SESSION-SCOPED, equally load-bearing. --session-id routes through
+    # tracker_path(), so a worker Body clears its own
+    # sessions/<SID>/body-context-reads.txt and a reducer clears the agent-wide
+    # file — never each other's. Dropping the flag would make a co-resident
+    # worker's compaction wipe the reducer's manifest: a cross-session
+    # shared-state mutation, the exact thing guard-404 forbids.
+    #
+    # FIRST in the block, before postcompact-restore, so nothing restore does
+    # can be undone by the wipe. Fail-open (`|| true`) and stdout suppressed —
+    # this block's other two scripts deliberately keep stdout for the LLM, and a
+    # bookkeeping line does not belong in that channel.
+    _CR_SID=$(printf '%s' "$STDIN_JSON" | (py -3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null || python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null) || echo "")
+    if [ -n "$_CR_SID" ]; then
+        _CR_AGENT=$(python3 "$SCRIPT_DIR/_resolve_agent_from_sid.py" "$_CR_SID" 2>/dev/null || echo "")
+        if [ -n "$_CR_AGENT" ]; then
+            MIND_AGENT="$_CR_AGENT" MIND_SID="$_CR_SID" \
+                bash "$SCRIPT_DIR/context-reads-clear.sh" --session-id "$_CR_SID" \
+                >/dev/null 2>&1 || true
+        fi
+    fi
+
     # postcompact-restore.sh — re-inject context. Writes its restoration
     # output to stdout for the LLM to read. DO NOT swallow stdout.
     printf '%s' "$STDIN_JSON" | bash "$SCRIPT_DIR/postcompact-restore.sh" || true

@@ -122,6 +122,28 @@ Apply spaced repetition filter:
   `next_review_date`) already prevents re-replaying anything recent, so rc==0 is
   not needed as a freshness guard — it is a tiebreak, and promoting it to the
   primary key silently inverts what this step selects for.
+
+  ⚠ THAT RESOLUTION IS NOT SUFFICIENT WHEN THE BAND IS COARSE, and "within a
+  priority band" is exactly where it hides. `surprise` is a small integer, so
+  band 1's top tie group is large and the "tiebreak" ends up doing most of the
+  selecting — reproducing the rc-first failure through the back door while
+  looking like compliance. Measured 2026-08-21 (foxtrot,
+  `hostname` LAPTOP-3IOFCNEO, `uname -r` 6.6.87.2-microsoft-standard-WSL2,
+  626-record pool): NO record scored `surprise >= 7` at all, so rule 2
+  contributed nothing and rule 1's top tie group was the 118 records at
+  `surprise == 6`. The anti-correlation PERSISTS INSIDE that single band —
+  CORRECTED by replay_count runs rc=0 **50.0%** (n=12), rc=1 **70.4%** (n=71),
+  rc=2 **93.9%** (n=33). So an rc-asc tiebreak selects the band's LEAST-enriched
+  corner. Following the RESOLUTION literally produced a batch at 30.0%
+  CORRECTED against a 27.3% corpus (+2.7pp — the enrichment gone); stratifying
+  the same 8 slots across rc 3/3/2 gave 50.0%. FIX: when the top band is larger
+  than N, STRATIFY across replay_count rather than sorting by it, and stratify
+  on the TIEBREAK axis — never on `outcome`, which is the variable every rate
+  below is computed over (selecting on it makes the reported rate circular).
+  Check the band's surprise ceiling before trusting the priority sort: if the
+  ceiling is also the modal value, the priority rules have already stopped
+  discriminating.
+
   (Do not read this as contradicting guard-2129: rule 1 IS enriched for
   corrections, by 39.8pp, so every batch-scoped corrected-rate remains
   upward-biased and still must be re-measured against the corpus.)
@@ -346,6 +368,42 @@ produces the early zeros: Step 3.6 encodes chronic-CORRECTED records and the
 `replay_candidates` endpoint then EXCLUDES them, so OLD corrected records are
 preferentially drained from the pool — measured, 67 pool records at `replay_count >= 3`
 and **zero** of them CORRECTED. The pool ages into a CONFIRMED-only tail.
+
+⚠ **THE MECHANISM ABOVE IS CONFIRMED — AND THE MONTH FIGURES IT QUOTES ARE POOL-SCOPED,
+WHICH MAKES THEM THE OPPOSITE OF THE CORPUS. Name your population before quoting any
+corrected-rate.** Re-measured 2026-08-22 (zeta, `hostname` cc-02, `uname -r`
+6.8.0-137-generic, g-001-05) on BOTH arms in one run. The counterfactual the paragraph
+above never had: `encoded_via_chronic` is TRUE on **125** records in the full
+resolved+archived store and on **ZERO** of the 664 pool records — so the drain is real and
+complete, not inferred. But run the same by-month split on the full store and the sign
+flips:
+
+| | 03 | 04 | 05 | 06 | 07 | 08 |
+|---|---|---|---|---|---|---|
+| full store (n=863) | 60% | 51% | 50% | 42% | 43% | **39%** |
+| replay pool (n=623) | — | **0%** (n=35) | **0%** (n=20) | **0%** (n=42) | 37% | 36% |
+
+The corpus runs **OLD = MORE corrected**; the pool runs OLD = *zero*, because every
+pre-July CORRECTED record has been encoded and excluded. So "date carries outcome" is
+true in both arms **in opposite directions**, and a reader who computes corrected-rate
+by month without naming the population gets the opposite answer with no error to warn
+them. That is why `id[11:]` remains the right control — it strips the date either way.
+
+**Consequence for this step's headline number.** Base corrected is **30.5% (pool)** vs
+**42.6% (full store)** — the arms differ by **12.1pp before any marker is tested**. The
+rule-1 (`surprise>=5`) enrichment this series has recorded four times as
++39.8/+39.2/+39.0/+38.5pp is therefore POOL-SCOPED; the same band against the true
+resolved corpus is 72.9% vs 42.6% = **+30.2pp**. Real either way — a magnitude
+correction, not a refutation. Step 3's own instruction already says "re-measure over the
+unfiltered **resolved corpus**"; the recorded executions used `--replay-candidates`. Read
+the resolved+archived union (`pipeline-read.sh --stage resolved` + `--stage archived`)
+for any RATE.
+
+**Do NOT re-derive the permutation floors from this.** Measured the same run, the noise
+floor is robust to the arm — balanced p95 **6.85** (full store) vs **7.16** (pool);
+size-50 14.18 vs 13.59; size-10 33.02 vs 29.98 — because the floor is a function of group
+size and n, not of the base rate. Fix the denominator of the RATE and leave the floors
+alone. (guard-4757.)
 
 THE REPLICATION WAS THE TRAP, and it is the reusable half. +6.7pp (foxtrot, `hostname`
 LAPTOP-3IOFCNEO, 527 records) / +7.5pp (bravo, cc-05, 528) / +7.2pp (zeta, cc-02, 570) across three

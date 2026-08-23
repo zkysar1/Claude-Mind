@@ -793,8 +793,24 @@ def _print_ownership(path, root, indent="      "):
                 "  <- WEAK match on the subsystem name, not the test file; verify"
             print("%sowner: %s [%s] %s%s" % (indent, gid, status, title, note))
     else:
-        print("%sowner: NONE -- no goal in either queue names this test "
-              "(%d open goal(s) scanned)" % (indent, rows_scanned))
+        # SAY WHAT WAS SEARCHED, NOT WHAT WAS CONCLUDED (, guard-4432).
+        # This used to read "no goal in either queue names this test (N open
+        # goal(s) scanned)". Two problems, and N is what made them invisible:
+        # it counts goals SCANNED, not fields or statuses SEARCHED, so a
+        # four-digit N reads as exhaustive coverage and the reader stops.
+        # (a) The scan is title+description, which is broad but not everything
+        #     -- a goal citing the test only in an outcome_note is not found.
+        # (b) OPEN statuses ONLY, deliberately (a completed goal naming this
+        #     test means a REGRESSION, which is a thing to file, not to
+        #     suppress). But an unqualified "no goal in either queue" reads as
+        #     ALL goals, so the one exclusion most likely to explain a
+        #     surprising NONE is the one the message hides.
+        # guard-4432 is the general form: a literal-token scan that finds zero
+        # may report "not found"; it may not assert the positive conclusion,
+        # and above all may not attach an action instruction to it.
+        print("%sowner: NONE -- no %s goal matched '%s' in title or description "
+              "(%d goal(s) scanned; outcome_note and completed goals NOT searched)"
+              % (indent, "/".join(OPEN_STATUSES), Path(path).stem, rows_scanned))
     if commits:
         print("%srecent commits (7d): %s" % (indent, commits[0]))
     else:

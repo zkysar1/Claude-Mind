@@ -126,19 +126,82 @@ def _load_index(index_dir):
     return emb, ids, model_name
 
 
+# --- Degradation visibility (, 2026-08-20) -------------------------
+# The five `return {}` paths below were INDISTINGUISHABLE to every caller, which
+# is the whole defect this instrument exists to remove: `embedding_blend_enabled`
+# is a git-tracked SHARED flag while the index is a per-box GITIGNORED artifact,
+# so a box with the flag on and no index serves the token baseline forever while
+# the config reads "enabled". Measured 25 days on cc-04 ( filing) and
+# independently on cc-08 the same way (index dir, ~/.ayoai-vendor/py and
+# ~/.ayoai-emb all absent). It has bitten the TEST suite too, in this same file:
+# see the  note above, where a test passed for 17 days only because
+# cosine_scores was silently returning {}.
+#
+# WARN ONCE PER REASON PER PROCESS, never per call. Retrieval is a hot path —
+# a per-call warning would flood every command on an unprovisioned box and get
+# muted, which reproduces the silence it is meant to break.
+#
+# NEVER RAISES. This module's contract (docstring property 1) is that the
+# retrieval path cannot be broken by this file, so the recorder is itself
+# wrapped: a failure to REPORT a degradation must never become a degradation.
+_last_degradation = None   # None == the last call SERVED embeddings
+_warned_reasons = set()
+
+
+def _degrade(reason, detail="", warn=True):
+    """Record why the blend degraded, warn once per reason, return {}."""
+    global _last_degradation
+    try:
+        _last_degradation = {"reason": reason, "detail": str(detail)[:200]}
+        if warn and reason not in _warned_reasons:
+            _warned_reasons.add(reason)
+            import sys
+            sys.stderr.write(
+                f"[embedding-blend] DEGRADED to token-overlap: {reason}"
+                f"{(' — ' + str(detail)[:200]) if detail else ''}\n"
+                "[embedding-blend]   embedding_blend_enabled is ON but this box "
+                "cannot serve embeddings; retrieval is running the token baseline.\n"
+                "[embedding-blend]   Provision: core/scripts/embedding-index-build.py --build "
+                "(see g-115-3115 for the vendor stack), or turn the flag off.\n"
+            )
+    except Exception:  # pragma: no cover - reporting must never break retrieval
+        pass
+    return {}
+
+
+def last_degradation():
+    """The last cosine_scores outcome: None if it SERVED, else {reason, detail}.
+
+    Lets a caller or trace emit blend-served-vs-degraded without re-deriving it.
+    Read it immediately after a cosine_scores call — it is per-process, not
+    per-request, and a later call overwrites it.
+    """
+    return _last_degradation
+
+
 def cosine_scores(query, index_dir=None):
     """{doc_id: cosine_similarity} for `query` against the persisted index.
 
     Returns {} (graceful degrade — caller falls back to token-overlap) when the
     query is empty, the index is missing/empty, the model is unavailable, or ANY
     error occurs. NEVER raises into the retrieval hot path.
+
+    Each of those paths now records a DISTINCT reason via _degrade(); read it
+    with last_degradation(). An empty query is recorded but NOT warned — it is a
+    normal no-op, not a degraded box, and warning on it would train readers to
+    ignore the warning that matters.
     """
+    global _last_degradation
     if not query or not isinstance(query, str):
-        return {}
+        return _degrade("empty-query", warn=False)
     try:
-        emb, ids, model_name = _load_index(_resolve_index_dir(index_dir))
+        d = _resolve_index_dir(index_dir)
+        emb, ids, model_name = _load_index(d)
         if emb is None or emb.shape[0] == 0 or not ids:
-            return {}
+            # Absent vs present-but-empty are different operator actions:
+            # provision the index, versus rebuild an index that built to zero.
+            return _degrade(
+                "index-empty" if index_available(d) else "index-absent", str(d))
         enc = _get_model(model_name)
         # encode_query applies model-appropriate query-side preprocessing
         # (bge instruction prefix; plain for symmetric models). Test stubs
@@ -150,12 +213,23 @@ def cosine_scores(query, index_dir=None):
                             show_progress_bar=False)[0]
         # Both sides are unit-normalized, so dot product == cosine similarity.
         scores = emb @ qv.astype("float32")
+        _last_degradation = None   # SERVED — the positive half of the signal
         return {ids[i]: float(scores[i]) for i in range(len(ids))}
-    except Exception:
-        return {}
+    except Exception as e:
+        # Covers the encoder path (_get_model raising when the vendored stack or
+        # the model files are absent) and anything numpy raises. The class name
+        # is carried because "which import failed" is the operator's next step.
+        return _degrade("encoder-or-runtime-error", f"{type(e).__name__}: {e}")
 
 
 def clear_caches():
     """Test hook — drop the model + index caches so a test can rebind them."""
+    global _last_degradation
     _encoders.clear()
     _index_cache.clear()
+    # Reset the degradation state too. Without this a test that provokes a
+    # degradation leaks BOTH the recorded reason and the warn-once suppression
+    # into every later test in the same process — and the suppression is the
+    # dangerous half, since it would silence the warning a later test asserts on.
+    _last_degradation = None
+    _warned_reasons.clear()

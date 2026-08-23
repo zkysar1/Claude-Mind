@@ -100,7 +100,29 @@ os.environ["RT_STALENESS_WARNED"] = "1"
 # `project_root` fixture and is not knowable at import time. With these unset,
 # _resolve_src falls to .mind-data/ (absent under a tmp root) and then to the
 # fixture's own local-paths.conf — the hermetic path, as measured above.
-for _leaky in ("MIND_WORLD", "MIND_META"):
+# BODY_WM_PATH rides the same pop for a DIFFERENT store and a different
+# injector (). bash-agent-inject.py exports it on every WORKER box so
+# wm.py routes working-memory I/O to the forked per-Body file; wm.py:51 reads it
+# BEFORE MIND_AGENT_DIR, so it wins over any agent-dir a test hands down. The
+# `running_daemon` fixture below runs the daemon IN-PROCESS, and
+# aspirations_write.py::_emit_e9_skip_observation shells out to wm.py with
+# `os.environ.copy()` -- so an unpopped BODY_WM_PATH sends the E9 sensory_buffer
+# append into the LIVE Body's working memory instead of the tmp path the test
+# asserts on. Measured on cc-08: the two e9 cascade tests fail `assert 262 > 262`
+# on a worker box and pass on a reducer box, and six synthetic fixture goal
+# titles ("A clearly substantive goal title", ...) had accumulated in live fleet
+# state, bound for the reducer's encoding pipeline. That second half is the worse
+# one -- guard-2484's exact shape: a test writing into live fleet state while
+# reporting success.
+#
+# POP, never pin: BODY_WM_PATH is per-SESSION, so there is no correct value to
+# pin, and a blanket set would break the tests that assert on their own agent
+# dir. Unset is the hermetic state -- wm.py then falls through to the agent-dir
+# path the fixtures already control. guard-862 names this env var as the
+# sanctioned seam for redirecting wm.py in tests; popping it here leaves that
+# seam free for a test that wants it, rather than pre-empting it with the host
+# box's live path.
+for _leaky in ("MIND_WORLD", "MIND_META", "BODY_WM_PATH"):
     os.environ.pop(_leaky, None)
 
 
@@ -140,9 +162,42 @@ _UNSET = object()
 # into every later test in the process.
 _BOOTSTRAP_ENV = {
     key: os.environ.get(key, _UNSET)
+    # BODY_WM_PATH is captured AFTER the pop loop above, so it reads _UNSET and
+    # the fixture re-pops it before every test -- the same shape MIND_WORLD
+    # already has. The module-level pop alone is not enough: it fires once at
+    # collection, so any test that sets the var (legitimately, per guard-862)
+    # would leak the redirect into every test collected after it.
     for key in ("STORAGE_BACKEND", "MIND_WORLD", "MIND_META",
-                "MIND_AGENT", "MIND_SID", "RT_STALENESS_WARNED")
+                "MIND_AGENT", "MIND_SID", "RT_STALENESS_WARNED",
+                "BODY_WM_PATH")
 }
+
+
+@pytest.fixture(autouse=True)
+def _pin_intended_agent_roster(monkeypatch):
+    """Pin gates.intended_agent_vocab's roster to a fixed fixture superset.
+
+    Mirror of the core/scripts/tests/conftest.py fixture of the same name —
+    see its docstring for the full rationale (the gate resolves the LIVE
+    deployment roster env-independently, so unpinned daemon-POSTing tests
+    carrying fixture agent names are green on dev-fleet rosters and 400 on a
+    single-agent prod deployment after promotion). g-115-5651: a pin that
+    exists in only one test-tree conftest leaves the other tree exposed in
+    mixed chunks, so the two copies MUST stay identical.
+    """
+    try:
+        _core_scripts = str(REPO_ROOT / "core" / "scripts")
+        if _core_scripts not in sys.path:  # autouse: guard against per-test growth
+            sys.path.insert(0, _core_scripts)
+        from gates import intended_agent_vocab as _iav
+    except ImportError:
+        yield
+        return
+    monkeypatch.setattr(
+        _iav, "_resolve_roster",
+        lambda: ("alpha", "bravo", "charlie", "delta", "echo",
+                 "foxtrot", "omni", "zeta"))
+    yield
 
 
 @pytest.fixture(autouse=True)

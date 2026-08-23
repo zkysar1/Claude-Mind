@@ -2240,6 +2240,137 @@ def _mem_total_kb() -> Optional[int]:
     return None
 
 
+def _mem_available_kb() -> Optional[int]:
+    """MemAvailable in kB, or None where /proc/meminfo is absent/unreadable.
+
+    The HOST-TRUTH half of this probe. Inside an LXC/LXD container without
+    lxcfs, /proc/meminfo reports the HOST's memory, so this reading reflects
+    real host pressure even though `_claude_rss_kb` below can only enumerate
+    this container's OWN pid namespace. That asymmetry is exactly what made
+    the single-process signal blind on a container host — see the probe
+    docstring's SECOND INCIDENT.
+    """
+    txt = read_text_safe(Path("/proc/meminfo"))
+    if not txt:
+        return None
+    for line in txt.splitlines():
+        if line.startswith("MemAvailable:"):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                return int(parts[1])
+    return None
+
+
+def _mem_avail_floor() -> float:
+    """Fraction of MemTotal below which FREE memory is reported, whoever is
+    consuming it. Override with AGENT_WATCHDOG_MEM_AVAIL_PCT (1-100).
+
+    Deliberately low (10%): this is the "about to have real trouble" line, not
+    a capacity-planning line, and it must not compete for attention with the
+    disk advisory that fires at a benign 80%.
+    """
+    raw = os.environ.get("AGENT_WATCHDOG_MEM_AVAIL_PCT", "").strip()
+    if raw:
+        try:
+            v = float(raw)
+            if 0 < v <= 100:
+                return v / 100.0
+        except ValueError:
+            pass
+    return 0.10
+
+
+def _swap_kb() -> tuple[Optional[int], Optional[int]]:
+    """(SwapTotal, SwapFree) in kB, or (None, None) where unreadable.
+
+    THE EARLIEST SIGNAL IN THE CHAIN, and the one the 2026-08-22 zakbox1
+    incident proved nothing was watching. Swap fills BEFORE MemAvailable
+    moves: at the moment that box was unreachable with load 306-364, a
+    contemporaneous reading called RAM healthy at 38/62 GiB while swap was
+    94% consumed. Both were true. Sustained swap pressure means the kernel is
+    paging to disk, and pages under reclaim are uninterruptible I/O, so the
+    D-state task count — which Linux counts in load average — explodes while
+    CPU looks unremarkable. That is what starves sshd's fork and drops
+    tailscaled off the control plane.
+    """
+    txt = read_text_safe(Path("/proc/meminfo"))
+    if not txt:
+        return (None, None)
+    total = free = None
+    for line in txt.splitlines():
+        for key, setter in (("SwapTotal:", "t"), ("SwapFree:", "f")):
+            if line.startswith(key):
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    if setter == "t":
+                        total = int(parts[1])
+                    else:
+                        free = int(parts[1])
+    return (total, free)
+
+
+def _swap_floor() -> float:
+    """Fraction of SwapTotal below which FREE swap is reported. Override with
+    AGENT_WATCHDOG_SWAP_FREE_PCT (1-100).
+
+    25% by default: routine Linux swap use is normal and must not alarm, but
+    three quarters consumed means the kernel has already pushed out what it
+    easily can and is working for the rest.
+    """
+    raw = os.environ.get("AGENT_WATCHDOG_SWAP_FREE_PCT", "").strip()
+    if raw:
+        try:
+            v = float(raw)
+            if 0 < v <= 100:
+                return v / 100.0
+        except ValueError:
+            pass
+    return 0.25
+
+
+def _notify_critical_memory(subject: str, message: str) -> dict:
+    """Best-effort human alert through the FRAMEWORK notification chokepoint.
+
+    Routes via notify-user.sh, which resolves the domain's transport slot --
+    core never names an address or a transport (domain-free-examples.md). The
+    probe already dedups on transition, and notify_dispatch applies its own
+    prior-outreach and duplicate gates, so this cannot become a per-tick mail
+    loop.
+
+    FAIL-OPEN, always: a watchdog that dies because email is down is worse
+    than the condition it was reporting. Every failure mode is captured into
+    the returned dict and folded into the event payload instead of raised.
+    """
+    try:
+        from _runtime_bash import bash_cmd
+        script = Path(__file__).resolve().parent / "notify-user.sh"
+        if not script.is_file():
+            return {"sent": False, "reason": "notify-user.sh absent"}
+        # bash_cmd resolves BASH explicitly (guard-580: a bare "bash" argv[0]
+        # reaches the System32 WSL stub on win32 and can HANG FOREVER -- the
+        # worst possible failure for an alert path) and passes the script via
+        # as_posix (guard-581: bash strips the backslashes of a str(WindowsPath)
+        # and silently resolves a nonexistent file).
+        proc = subprocess.run(
+            # decision-needed, NOT blocker. Verified by dry-run: the routing
+            # gate SUPPRESSES 'blocker' as "a status report the fleet can handle
+            # itself" and re-routes it to the findings board -- the same silent
+            # fate this whole notification exists to escape. 'decision-needed'
+            # is an ALWAYS_SEND category, and it is the honest one: the fleet
+            # cannot add RAM, set a per-container cap, or reboot a host, so a
+            # human genuinely has to decide.
+            bash_cmd(script, "--category", "decision-needed",
+                     "--subject", subject, "--message", message),
+            capture_output=True, text=True, timeout=60,
+        )
+        # 0 sent | 3 suppressed (re-routed to board) | 4 duplicate |
+        # 5 no transport | 6 transport failed -- all are outcomes, not crashes.
+        return {"sent": proc.returncode == 0, "rc": proc.returncode,
+                "detail": (proc.stderr or proc.stdout or "").strip()[:300]}
+    except Exception as exc:  # noqa: BLE001 - fail-open by contract
+        return {"sent": False, "reason": f"{type(exc).__name__}: {exc}"[:200]}
+
+
 def _claude_rss_kb() -> list[tuple[int, str, int]]:
     """(pid, comm, VmRSS_kB) for each live Claude Code process.
 
@@ -2299,9 +2430,32 @@ class MemoryHeadroomProbe(Probe):
     gigabyte. Protecting the victim does not create headroom. Ending the
     session does — which is why this probe reports rather than re-nices.
 
+    SECOND INCIDENT (2026-08-22, zakbox1, Ubuntu 24.04.4, 6.8.0-137-generic,
+    ~64 GiB, ~17 LXD containers). `Out of memory: Killed process 279635
+    (claude.exe) total-vm:25473820kB`, preceded by ~55 minutes of tasks
+    blocked >368s in D state; tailscaled and ayoai-fleet-sweep.service both
+    died, the host stayed pingable, and sshd accepted TCP without ever
+    reaching its banner. The probe above did NOT fire, and could not have:
+    it measured `max(per-process RSS) / MemTotal` against a 60% floor, so on
+    a 64 GiB box ONE process had to reach ~38 GiB. Ten containers at ~6 GiB
+    each sum to a fatal 60 GiB while every individual reading is ~9% — and
+    worse, each container enumerates only its OWN pid namespace while
+    /proc/meminfo reports the WHOLE HOST, so the numerator is container-local
+    and the denominator host-wide. Every container independently concluded it
+    was fine. The design was correct for the single-agent 7.7 GiB box it was
+    born on, where one process IS the whole population, and silently wrong
+    the moment it moved to a multi-tenant host.
+
+    So the probe now carries TWO independent triggers and fires on either:
+      - `largest_process` — the original signal, unchanged.
+      - `host_available`  — MemAvailable below a floor, whoever is consuming
+        it. Namespace-independent, catches non-Claude consumers, and needs no
+        process enumeration, so it survives the blindness above.
+
     Advisory by contract: it emits an event and never mutates state. The
-    remedy (a deliberate /stop + /start rotation) belongs to a human or to a
-    later goal, not to a probe running inside the process it is measuring.
+    remedy (a deliberate /stop + /start rotation, or a per-container memory
+    limit) belongs to a human or to a later goal, not to a probe running
+    inside the process it is measuring.
     """
 
     name = "memory-headroom"
@@ -2315,11 +2469,42 @@ class MemoryHeadroomProbe(Probe):
         if not total_kb:
             return []  # not Linux, or /proc unreadable — fail open
         procs = _claude_rss_kb()
-        if not procs:
-            return []
-        pid, comm, rss_kb = max(procs, key=lambda r: r[2])
-        frac = rss_kb / float(total_kb)
+        avail_kb = _mem_available_kb()
+        # NOTE: no early return on an empty `procs`. A container that can see
+        # NO claude process is precisely the pid-namespace case the second
+        # incident turned on — the host can still be starved, and MemAvailable
+        # is readable from inside. Bail only when NEITHER signal is available.
+        swap_total_kb, swap_free_kb = _swap_kb()
+        if not procs and avail_kb is None and not swap_total_kb:
+            return []  # nothing measurable — fail open
+
         threshold = _mem_headroom_threshold()
+        floor = _mem_avail_floor()
+        swap_floor = _swap_floor()
+
+        pid: Optional[int] = None
+        comm: Optional[str] = None
+        rss_kb = 0
+        frac = 0.0
+        if procs:
+            pid, comm, rss_kb = max(procs, key=lambda r: r[2])
+            frac = rss_kb / float(total_kb)
+        rss_total_kb = sum(r[2] for r in procs)
+        avail_frac = (avail_kb / float(total_kb)) if avail_kb is not None else None
+
+        # A box with swap disabled (SwapTotal 0) must never register as
+        # "no swap free" -- that is not pressure, it is a configuration.
+        swap_free_frac = (swap_free_kb / float(swap_total_kb)
+                          if swap_total_kb and swap_free_kb is not None else None)
+
+        triggers = []
+        if procs and frac >= threshold:
+            triggers.append("largest_process")
+        if avail_frac is not None and avail_frac < floor:
+            triggers.append("host_available")
+        if swap_free_frac is not None and swap_free_frac < swap_floor:
+            triggers.append("swap_exhausted")
+
         payload = {
             "pid": pid,
             "comm": comm,
@@ -2330,30 +2515,87 @@ class MemoryHeadroomProbe(Probe):
             "pct_of_memtotal": round(frac * 100.0, 1),
             "threshold_pct": round(threshold * 100.0, 1),
             "claude_process_count": len(procs),
+            # Aggregate, not just the max: N sibling agents each individually
+            # under threshold are what actually exhausts a multi-tenant host.
+            "claude_rss_total_kb": rss_total_kb,
+            "claude_rss_total_gib": round(rss_total_kb / 1048576.0, 2),
+            "mem_available_kb": avail_kb,
+            "mem_available_gib": (None if avail_kb is None
+                                  else round(avail_kb / 1048576.0, 2)),
+            "pct_available": (None if avail_frac is None
+                              else round(avail_frac * 100.0, 1)),
+            "avail_floor_pct": round(floor * 100.0, 1),
+            "swap_total_kb": swap_total_kb,
+            "swap_free_kb": swap_free_kb,
+            "pct_swap_free": (None if swap_free_frac is None
+                              else round(swap_free_frac * 100.0, 1)),
+            "swap_floor_pct": round(swap_floor * 100.0, 1),
+            "triggers": triggers,
         }
 
-        if frac >= threshold and not self.over:
+        if triggers and not self.over:
             self.over = True
+            if "swap_exhausted" in triggers:
+                why = (f"swap {payload['pct_swap_free']}% free "
+                       f"(floor {payload['swap_floor_pct']}%) — the kernel is "
+                       f"paging to disk; sustained swap pressure shows up as "
+                       f"D-state tasks and a load-average spike, NOT as low "
+                       f"RAM. Host has {payload['pct_available']}% available")
+            elif "host_available" in triggers:
+                why = (f"host has {payload['mem_available_gib']} GiB available "
+                       f"= {payload['pct_available']}% of "
+                       f"{payload['mem_total_gib']} GiB "
+                       f"(floor {payload['avail_floor_pct']}%); "
+                       f"{payload['claude_process_count']} visible agent "
+                       f"process(es) hold {payload['claude_rss_total_gib']} GiB")
+            else:
+                why = (f"{comm} pid {pid} at {payload['rss_gib']} GiB = "
+                       f"{payload['pct_of_memtotal']}% of "
+                       f"{payload['mem_total_gib']} GiB "
+                       f"(threshold {payload['threshold_pct']}%)")
+            summary = (f"{self.name}: memory_pressure [{'+'.join(triggers)}] — "
+                       f"{why}. An OOM kill selects the largest process and "
+                       f"NOTHING restarts it (g-115-4699) — rotate the "
+                       f"session, and cap per-container memory on a shared "
+                       f"host (2026-08-22 zakbox1).")
+            # Reach a human. This probe logged to a box-local jsonl and nothing
+            # else, which is why the 2026-08-22 escalation was invisible until
+            # someone walked to the console.
+            try:
+                payload["notified"] = _notify_critical_memory(
+                    f"Memory pressure on {_box_id()}: {'+'.join(triggers)}",
+                    summary + "\n\n" + json.dumps(payload, indent=2, default=str),
+                )
+            except Exception as exc:  # noqa: BLE001 - fail-open at BOTH layers
+                # _notify_critical_memory swallows its own failures, so reaching
+                # here means the notifier itself was replaced or is broken in a
+                # way it could not catch. The tick still has to finish: a
+                # watchdog that dies because mail is down is strictly worse than
+                # the condition it was trying to report.
+                payload["notified"] = {
+                    "sent": False,
+                    "reason": f"{type(exc).__name__}: {exc}"[:200],
+                }
             return [Event(
                 probe=self.name, event="memory_pressure", severity="critical",
-                payload=payload, include_processes=True,
-                summary=(f"{self.name}: memory_pressure — {comm} pid {pid} at "
-                         f"{payload['rss_gib']} GiB = {payload['pct_of_memtotal']}% "
-                         f"of {payload['mem_total_gib']} GiB "
-                         f"(threshold {payload['threshold_pct']}%). An OOM kill "
-                         f"selects the largest process and NOTHING restarts it "
-                         f"(g-115-4699) — rotate the session."),
+                payload=payload, include_processes=True, summary=summary,
             )]
 
         # Hysteresis: only clear once well back under, so a reading parked at
-        # the boundary cannot flap a critical event every tick.
-        if self.over and frac < threshold * 0.9:
+        # the boundary cannot flap a critical event every tick. BOTH signals
+        # must have recovered — an unreadable one cannot veto the recovery.
+        proc_recovered = frac < threshold * 0.9
+        avail_recovered = avail_frac is None or avail_frac > floor * 1.1
+        swap_recovered = swap_free_frac is None or swap_free_frac > swap_floor * 1.1
+        if (self.over and not triggers and proc_recovered and avail_recovered
+                and swap_recovered):
             self.over = False
             return [Event(
                 probe=self.name, event="memory_pressure_cleared", severity="info",
                 payload=payload,
                 summary=(f"{self.name}: memory_pressure_cleared — "
-                         f"{payload['pct_of_memtotal']}% of MemTotal"),
+                         f"{payload['pct_of_memtotal']}% of MemTotal, "
+                         f"{payload['pct_available']}% available"),
             )]
 
         return []
@@ -2375,6 +2617,7 @@ _GIT_DRIFT_ENV = {
     "behind_threshold": "GIT_DRIFT_BEHIND",
     "unconsumed_threshold": "GIT_DRIFT_UNCONSUMED",
     "disk_used_pct_threshold": "GIT_DRIFT_DISK_PCT",
+    "disk_free_floor_gib": "GIT_DRIFT_DISK_FREE_GIB",
     "fetch_throttle_minutes": "GIT_DRIFT_FETCH_THROTTLE_MIN",
     "ticks_to_file": "GIT_DRIFT_TICKS_TO_FILE",
 }
@@ -2400,6 +2643,7 @@ def _git_drift_config() -> dict:
         "behind_threshold": 50,
         "unconsumed_threshold": 100,
         "disk_used_pct_threshold": 80,
+        "disk_free_floor_gib": 15,
         "fetch_throttle_minutes": 30,
         "ticks_to_file": 2,
     }
@@ -2452,6 +2696,23 @@ def _disk_used_pct(path: Path) -> Optional[float]:
     if denom <= 0:
         return None
     return round(100.0 * usage.used / denom, 1)
+
+
+def _disk_free_gib(path: Path) -> Optional[float]:
+    """Free space in GiB, or None if unreadable.
+
+    The SCALE half of the disk breach. A percentage is scale-blind, and that is
+    not a theoretical complaint: on 2026-08-22 a 905 GiB volume at 81% used --
+    169 GiB free, entirely healthy -- filed five HIGH `Investigate` goals in one
+    hour across four containers. Nobody actioned them, correctly, because they
+    were noise; and the noise was running while the box was actually dying of
+    something else. An alert that cries wolf trains its reader to ignore it.
+    """
+    try:
+        usage = shutil.disk_usage(str(path))
+    except Exception:  # noqa: BLE001
+        return None
+    return round(usage.free / (1024.0 ** 3), 1)
 
 
 def _live_body_sids(world_dir) -> Optional[set]:
@@ -2603,6 +2864,7 @@ class GitDriftProbe(Probe):
         ab = self._ahead_behind(root)
         carrier = self._carrier_depths(root)
         disk_pct = _disk_used_pct(root)
+        disk_free_gib = _disk_free_gib(root)
 
         breaches = []
         if ab["ahead"] is not None and ab["ahead"] > cfg["ahead_threshold"]:
@@ -2613,8 +2875,44 @@ class GitDriftProbe(Probe):
                 and carrier["max_unconsumed"] > cfg["unconsumed_threshold"]):
             breaches.append(f"live-carrier-unconsumed={carrier['max_unconsumed']} "
                             f"(>{cfg['unconsumed_threshold']})")
-        if disk_pct is not None and disk_pct > cfg["disk_used_pct_threshold"]:
-            breaches.append(f"disk={disk_pct}% (>{cfg['disk_used_pct_threshold']}%)")
+        # BOTH conditions must hold. Percentage alone is scale-blind (81% of
+        # 905 GiB is 169 GiB free -- five false HIGH goals in one hour on
+        # 2026-08-22); an absolute floor alone would miss a small volume at 97%
+        # where the percentage is the meaningful signal. Requiring both keeps
+        # the small-volume protection and drops the large-volume noise.
+        # An UNREADABLE free reading does not suppress: it cannot confirm
+        # headroom, so the percentage is allowed to speak alone (fail toward
+        # alerting, the same direction guard-1448 argues for).
+        if (disk_pct is not None and disk_pct > cfg["disk_used_pct_threshold"]
+                and (disk_free_gib is None
+                     or disk_free_gib < cfg["disk_free_floor_gib"])):
+            # Say WHOSE filesystem this is. `shutil.disk_usage` measures the
+            # filesystem CONTAINING the path, and on a shared-fs container that
+            # is the HOST volume, not the container's own tree -- the docstring
+            # on _disk_used_pct has always said "host filesystem" but the breach
+            # string did not, and the breach string is what becomes the filed
+            # goal's TITLE. Measured 2026-08-19 by omni (ZDS /529) and
+            # re-confirmed on cc-06 2026-08-23 (905G/694G/174G/80%, same device
+            # as zakbox1): the LXD pool is shared by 16 containers, and one
+            # agent's whole footprint is ~31G. So a goal reading "disk=81.3%"
+            # filed into a container's queue is UNDISCHARGEABLE BY CONSTRUCTION:
+            # deleting everything the agent owns moves the host 82% -> ~78%,
+            # while the goal keeps scoring well on urgency and keeps being
+            # selected. Naming the surface in the title is what lets the reader
+            # route it instead of attempting it (guard-846).
+            #
+            # This is the SECOND half of the fix. The floor above stops the
+            # large-volume false alarm from firing at all; this stops the ones
+            # that DO fire from being mis-routed. Back-ported up from ZDS-Mind
+            # during the 2026-08-23 Claude-Mind -> ZDS-Mind promotion reconcile
+            # (guard-119): the two deployments fixed the same defect from
+            # opposite ends and both halves were worth keeping.
+            breaches.append(
+                f"host-disk={disk_pct}% with {disk_free_gib}GiB free "
+                f"(>{cfg['disk_used_pct_threshold']}% AND "
+                f"<{cfg['disk_free_floor_gib']}GiB); filesystem containing "
+                f"{root} -- on a shared-fs container this is the HOST volume "
+                f"and is not reclaimable from inside)")
 
         # Every field a reader needs to act is in the payload, including the
         # ones that explain a SILENCE (guard-1955: a probe whose schema has no
@@ -2629,6 +2927,7 @@ class GitDriftProbe(Probe):
             "carrier_skipped": carrier["skipped"],
             "carrier_skip_reason": carrier["reason"],
             "disk_used_pct": disk_pct,
+            "disk_free_gib": disk_free_gib,
             "fetched_this_tick": fetched,
             "stale_basis": not fetched,
             "thresholds": cfg,

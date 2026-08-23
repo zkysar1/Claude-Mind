@@ -197,3 +197,87 @@ def test_cli_no_match_returns_empty_list(tree_env):
     rc, cli_out = _run_cli(tree_env, "totally unrelated xyzzy")
     assert rc == 0
     assert cli_out == []
+
+
+# ---------------------------------------------------------------------------
+# : node bodies resolve against the world that OWNS the tree, never
+# against the import-bound _paths.WORLD_DIR -- None on a daemon started before
+# its world existed, agent A's world on a daemon serving agent B. Fourth daemon
+# call site of the  class (the other three live in tree.py / the
+# retrieve endpoint / retrieve.py). These tests also reference _TREE_CACHE and
+# _load_tree_cached, which  asked to see pinned.
+# ---------------------------------------------------------------------------
+
+def _entity_world(tmp_path: Path) -> Path:
+    """A tmp world whose one eligible node carries an `entities` list in its
+    .md front matter. The probe text below shares NO token with the node key
+    or summary, so the only channel that can score it is the entity channel
+    (+1.5 exact) -- a hit proves the body was actually read."""
+    world = tmp_path / "entity-world"
+    tree_dir = world / "knowledge" / "tree"
+    tree_dir.mkdir(parents=True)
+    (tree_dir / "payments-ledger.md").write_text(
+        "---\nentities:\n  - acmeledger\n---\n# ledger\n", encoding="utf-8")
+    tree = {
+        "nodes": {
+            "root": {"summary": "tree root", "depth": 0, "children": []},
+            "payments-ledger": {
+                "summary": "reconciliation of monthly statements",
+                "depth": 2, "children": [],
+                "file": "world/knowledge/tree/payments-ledger.md",
+            },
+        },
+        "entity_index": {},
+    }
+    import yaml
+    (tree_dir / "_tree.yaml").write_text(
+        yaml.safe_dump(tree, sort_keys=False), encoding="utf-8")
+    return world
+
+
+@pytest.fixture
+def pre_init_daemon(monkeypatch):
+    """Model the daemon that bound _paths.WORLD_DIR = None at import, and
+    isolate the module-level tree cache on both sides of the test."""
+    import _paths
+    from gates import category_suggest as cs
+    monkeypatch.setattr(_paths, "WORLD_DIR", None)
+    cs._TREE_CACHE.clear()
+    yield
+    cs._TREE_CACHE.clear()
+
+
+def test_pre_init_daemon_positive_control_module_global_path_raises(
+        tmp_path: Path, pre_init_daemon):
+    """Under WORLD_DIR=None the bare tree_match path still raises -- so the
+    test below cannot pass vacuously."""
+    import yaml
+    from tree_match import build_concept_index
+    world = _entity_world(tmp_path)
+    nodes = yaml.safe_load((world / "knowledge" / "tree" / "_tree.yaml")
+                           .read_text(encoding="utf-8"))["nodes"]
+    with pytest.raises(RuntimeError, match="WORLD_DIR unresolved"):
+        build_concept_index(nodes)
+
+
+def test_pre_init_daemon_entity_channel_resolves_against_world_dir(
+        tmp_path: Path, pre_init_daemon):
+    """The daemon's call shape (aspirations_write.py: evaluate(text,
+    world_dir=ctx.paths.world)) must neither raise nor lose the entity
+    channel when the module global is None."""
+    world = _entity_world(tmp_path)
+    matches = evaluate("acmeledger outage", world_dir=world)
+    assert [m["key"] for m in matches] == ["payments-ledger"]
+    assert matches[0]["score"] == 1.5  # entity channel only; no key/summary overlap
+
+
+def test_explicit_tree_path_resolves_bodies_under_its_own_world(
+        tmp_path: Path, pre_init_daemon):
+    """An explicit canonical tree_path owns its bodies: the world root is
+    derived from the tree's location, not from world_dir (documented unused)."""
+    world = _entity_world(tmp_path)
+    other = tmp_path / "some-other-world"
+    other.mkdir()
+    matches = evaluate("acmeledger outage", world_dir=other,
+                       tree_path=world / "knowledge" / "tree" / "_tree.yaml")
+    assert [m["key"] for m in matches] == ["payments-ledger"]

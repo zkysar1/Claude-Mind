@@ -320,9 +320,14 @@ def test_byte_compat_set_top_level(tmp_path):
 # producer emits it; it is shipped when a consumer displays it (guard-742/547
 # one layer further out: daemon-vs-wrapper, not CLI-vs-daemon).
 #
-# Post- an eviction always destroys an OLD entry — the peer that has
-# waited longest for the reducer, which on a lane saturated at 100%
-# load_bearing is exactly what the priority exemption exists to rescue.
+# Post- an eviction always destroys an OLD entry. WHICH old entry is
+# floor-aware since  and this comment named the wrong branch until
+# : when flagged entries exceed (cap - _unflagged_floor) the oldest
+# FLAGGED one goes, otherwise the oldest UNFLAGGED one goes. The seed below is
+# 100% load_bearing, so THIS test exercises the FLAGGED branch — the recoverable
+# one, since a flagged entry was mirrored to the Body's carrier at append time
+# and still reaches the reducer from there. The unflagged branch is the
+# unrecoverable one (the WM slot is that entry's only copy).
 #
 # known_blockers (array_limits 10) is used rather than a capture lane: the
 # behaviour is slot-agnostic, and known_blockers has no per-slot validation.
@@ -377,7 +382,27 @@ def test_wrapper_surfaces_eviction_on_stderr(running_daemon):
         "the eviction must reach the operator, not die in `> /dev/null`: "
         f"{proc.stderr!r}")
     assert "1 older entry evicted" in proc.stderr, proc.stderr
-    assert "OLDEST peer" in proc.stderr, proc.stderr
+
+    # : the notice must NAME BOTH victim branches and must not assert
+    # the one it cannot observe. The wrapper receives `evicted` as a bare COUNT,
+    # so claiming a victim class is a claim beyond what its path saw
+    # (guard-2947). The previous wording said the victim is unconditionally "the
+    # one that has waited longest for the reducer" — false in the flagged branch
+    # THIS test's own 100%-load_bearing seed exercises, and not harmlessly: a
+    # peer Body read that line, concluded that relaying through a capture lane
+    # would destroy another goal's undelivered observation, and routed around
+    # the lane when the append it declined would have evicted a carrier-backed
+    # peer.
+    assert "floor-aware" in proc.stderr, proc.stderr
+    for branch in ("FLAGGED", "UNFLAGGED"):
+        assert branch in proc.stderr, (
+            f"the notice must name the {branch} branch so the reader can tell a "
+            f"recoverable eviction from an unrecoverable one: {proc.stderr!r}")
+    # Negative control on the specific false claim, so a revert to the
+    # unconditional wording fails here rather than silently re-misinforming.
+    assert "The victim is the OLDEST peer" not in proc.stderr, (
+        "regressed to the unconditional victim claim g-306-353 removed: "
+        f"{proc.stderr!r}")
 
     # : the newcomer is protected, so it is the entry that SURVIVES
     # and an old peer is the one destroyed. Asserting this here keeps the

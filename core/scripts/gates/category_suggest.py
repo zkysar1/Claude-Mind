@@ -89,6 +89,72 @@ def score_node(key: str, node: dict, text_tokens: set[str],
     return score
 
 
+# Parsed-tree + concept-index cache.
+#
+# evaluate() re-read and re-parsed _tree.yaml AND rebuilt the concept index on
+# EVERY call. Measured 2026-08-21 (echo, cc-03): 2.1s per call against a
+# 1,531,241-byte tree, with module import at 0.03s — i.e. the cost is entirely
+# per-call, not startup. That dominated goal-selector's category resolution
+# (: 23.0s / 33.6% of every select) and is paid again by every daemon
+# aspirations_write that suggests a category.
+#
+# Keyed on (path, mtime_ns, size) so an edited tree invalidates naturally — a
+# bare path key would serve stale nodes after any /tree write, which on this
+# corpus is frequent. Cheap: one stat() per call.
+#
+# SAFE TO SHARE (guard-1663 — never mutate a record from a shared cache):
+# evaluate only iterates `nodes.items()` and appends to a LOCAL results list;
+# neither `nodes` nor `concept_index` is mutated downstream. Verified before
+# caching, not assumed. Any future caller that needs to mutate either MUST copy
+# first.
+_TREE_CACHE: dict = {}
+
+
+def _load_tree_cached(tree_path: Path, world_root: Optional[Path] = None):
+    """Return (nodes, concept_index, error_reason). error_reason is None on success.
+
+    Mirrors the error branches evaluate() used inline, so telemetry reasons are
+    unchanged.
+
+    ``world_root`` is the world that OWNS this tree: node bodies are resolved
+    under it when the concept index is built, and it is part of the cache key
+    because the index depends on it. A long-lived daemon MUST pass it:
+    tree_match's fallback is the import-bound ``_paths.WORLD_DIR``, which is
+    None on a daemon started before its world existed (the add-goal request
+    then 500s from assert_world_dir) and agent A's world on a daemon serving
+    agent B (the entity channel silently empties). g-367-14 — the fourth
+    daemon call site of the g-367-08 class.
+    """
+    try:
+        st = tree_path.stat()
+    except OSError:
+        return None, None, "tree read/parse error"
+    key = (str(tree_path), st.st_mtime_ns, st.st_size, str(world_root))
+    hit = _TREE_CACHE.get(key)
+    if hit is not None:
+        return hit[0], hit[1], None
+
+    try:
+        with open(tree_path, "r", encoding="utf-8") as f:
+            tree = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError):
+        return None, None, "tree read/parse error"
+    if not isinstance(tree, dict):
+        return None, None, "tree root not a dict"
+    nodes = tree.get("nodes", {})
+    if not nodes:
+        return None, None, "tree has no nodes"
+
+    concept_index = build_concept_index(nodes, world_root=world_root)
+    # Bound the cache: a long-running daemon would otherwise retain one entry
+    # per tree revision for the life of the process. Only the current revision
+    # is ever hit, so keeping the newest few is sufficient.
+    if len(_TREE_CACHE) >= 3:
+        _TREE_CACHE.clear()
+    _TREE_CACHE[key] = (nodes, concept_index)
+    return nodes, concept_index, None
+
+
 def evaluate(text: str, *, top_n: int = 3,
              world_dir: Optional[Path] = None,
              tree_path: Optional[Path] = None) -> List[dict]:
@@ -110,28 +176,24 @@ def evaluate(text: str, *, top_n: int = 3,
             _emit_telemetry(text, [], reason="no world_dir")
             return []
         tree_path = world_dir / "knowledge" / "tree" / "_tree.yaml"
+        world_root = world_dir
+    else:
+        # An explicit tree_path leaves world_dir unused (documented above), so
+        # the bodies' root is the world that owns THIS tree -- derivable only
+        # when it sits at the canonical <world>/knowledge/tree/_tree.yaml.
+        # Otherwise None: tree_match falls back to its module global, the
+        # pre- behaviour, which is correct in a fresh CLI process.
+        world_root = (tree_path.parents[2]
+                      if tree_path.parts[-3:-1] == ("knowledge", "tree") else None)
 
     if not tree_path.exists():
         _emit_telemetry(text, [], reason="tree file missing")
         return []
 
-    try:
-        with open(tree_path, "r", encoding="utf-8") as f:
-            tree = yaml.safe_load(f)
-    except (OSError, yaml.YAMLError):
-        _emit_telemetry(text, [], reason="tree read/parse error")
+    nodes, concept_index, err = _load_tree_cached(tree_path, world_root)
+    if err:
+        _emit_telemetry(text, [], reason=err)
         return []
-
-    if not isinstance(tree, dict):
-        _emit_telemetry(text, [], reason="tree root not a dict")
-        return []
-
-    nodes = tree.get("nodes", {})
-    if not nodes:
-        _emit_telemetry(text, [], reason="tree has no nodes")
-        return []
-
-    concept_index = build_concept_index(nodes)
     text_lower = text.lower()
     text_tokens = tokenize(text)
 

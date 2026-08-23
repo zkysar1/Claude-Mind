@@ -834,3 +834,21 @@ row over appending an eleventh.
 > invisible re-run **109/109**. Domain 55/56 + 1 skipped — the red is
 > `test_contract_deadline_alert_discrimination.py::test_producer_shape_has_not_drifted`,
 > owned g-115-6952.
+
+> **2026-08-21 (temp/scratchpad plan closure, bravo, `hostname` DESKTOP-O91DLK2,
+> `uname -r` = MSYS2 3.5.7-2.x86_64 / Windows 10 19045, `sys.platform = win32`,
+> assistant session, no local autonomous fleet, 4 chunks × ~281 files):
+> `TOTAL: 16,588 passed, 62 failed, 0 errors` / `VERDICT: GENUINE`, counts
+> rising toward the tail (4/11/17/30). `--triage`: **1 environmental |
+> 20 genuine-owned | 0 genuine-UNOWNED** — owners g-115-6805, g-115-7097
+> (filed for this same box's earlier runs), g-115-6967. Domain+invisible
+> failing families (`probe_web_surface`, `secret_scope_census`,
+> `deploy-hold-check`, `stale_jobs_scan_probe`, `check-sh-exec-bits`) all
+> carry live pending owners too — swept by id, none unowned. The four
+> commits under test (aae4570e0..9ea1ffe71: purge watermark + git guard,
+> housekeeping-tick, temp_drain_stalled escalation, scratchpad closure)
+> appear in NO failing set; their targeted suites (purge shell suite,
+> 20 tick tests, 34 precheck tests, 26 hook tests) all green. Note the
+> tail-rising distribution was NOT contention this time: solos stayed red
+> and every red was pre-owned — the discriminator did its job in the other
+> direction.

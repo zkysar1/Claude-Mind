@@ -124,14 +124,31 @@ All data comes from framework scripts — no direct JSONL reads.
    # this window", not purely the store being complete. The 71.1% row spans two
    # calendar days and is the more informative one.
    #
-   # RE-MEASURED 2026-08-19 (zeta, cc-02, 6.8.0-137-generic, 79.6h window —
-   # 1,259 records / 6,092,274 B across BOTH stages): in-window 68, scoreable
-   # 50 = 73.5%. This row is here because it kills the LAST surviving piece of
-   # the width model: a 3.3-DAY window read 73.5%, ABOVE the 2-DAY 62.9% of
-   # 08-15 and level with the ~39h 71.1% of 08-18. Coverage is not a decreasing
-   # function of window width — a wider window can and did score higher. Only
-   # archival cadence sets it, so a NARROW window buys you nothing and no row
-   # here predicts your run.
+   # SERIES — each entry (date, window, resolved-stage coverage, denominator).
+   # APPEND YOUR READING HERE; do not add another dated paragraph. Five had
+   # accumulated by 2026-08-21 and the sixth would have cost more to read than
+   # the number is worth (learning-philosophy.md rule 5):
+   #   08-04 2d 100% (n≈?) · 08-15 2d 62.9% (n=35) · 08-18 39h 71.1% (n=38)
+   #   08-19 79.6h 73.5% (n=68) · 08-21 20.2h 81.1% (n=37, split 44/1261)
+   #   08-21 9.7h 65.0% (n=20, split 48/1262)  <- SECOND 08-21 reading, ~8h later
+   #   08-21 9.5h 75.0% (n=28, split 56/1262)  <- THIRD 08-21 reading, ~2h later
+   #   08-22 25h(date-floored) 100% (n=22, split 60/1262)
+   #   08-22 15.2h(date-floored 16.2h) 100% (n=14, split 62/1278)
+   # THE TWO 08-22 ROWS ARE BOTH 100% AND NEITHER MEANS THE INSTRUMENT IMPROVED: both
+   # windows are SAME-DAY, and outcome_date is date-only, so the floor swallows the
+   # whole window and the field cannot resolve inside it (guard-2303). The second row
+   # scored 100% on a window 10h NARROWER than the first — read together with the
+   # 08-21 trio, that is a fourth demonstration that width is not the driver.
+   # THE THREE 08-21 ROWS ARE THE CHEAPEST PROOF OF THE INSTRUCTION BELOW: same day,
+   # same box. 81.1% (20.2h) -> 65.0% (9.7h) -> 75.0% (9.5h). If window width set
+   # coverage, the two NARROW rows would agree — they are 0.2h apart and they differ
+   # by TEN POINTS, while the WIDEST row scored highest of all three. The store
+   # barely moved across the whole day (44/1261 -> 48/1262 -> 56/1262). Archival
+   # cadence is the only driver, so no row predicts any other.
+   # READ THE SERIES, NEVER A ROW. It is not monotonic and not a function of
+   # window width — a 3.3-DAY window (73.5%) beat a 2-DAY one (62.9%), and a
+   # 20.2h window beat both. Only archival cadence sets it, so a NARROW window
+   # buys you nothing and no row here predicts your run.
    #
    # The instruction is unchanged and is now stronger: read BOTH stages. What
    # changes is that no fixed percentage here can be trusted as guidance — the
@@ -581,7 +598,18 @@ the agents' forensic record.
    its own. Do NOT use this waiver for anything you wrote yourself.
    rc 0 = sent.  rc 4 = another agent (or world) already sent a digest inside
    the 20h window -- CORRECT, not a failure: the user asked for one every day
-   or two, not one per agent per cadence. Do NOT --allow-duplicate a digest.
+   or two, not one per agent per cadence. Do NOT --allow-duplicate a digest to
+   get YOUR mail sent -- that is the failure mode, and it is the common one.
+   DO override, with --allow-duplicate and the reason, when this digest carries
+   something the prior send could not have: a finding measured AFTER it. The
+   gate's own message names the operative test ("does this ADD anything he has
+   not been told") -- answer it with the fleet-wide prior-outreach ledger scan
+   the standing directive requires, positive-controlled so a zero is real, then
+   log the override as a reversible pending question. A prior send is DATED
+   EVIDENCE, NOT COVERAGE (guard-3438), and a do-not-re-relay note guards the
+   content while saying nothing about the address (guard-3944). Measured
+   2026-08-22 (zeta, g-001-04): 58 ledger rows, ZERO on the topic against a
+   positive control of 21 -- the refusal was correct and the override was too.
    rc 3/5/6 = see /notify-user Step 2; never block on it, the report is on disk.
 ```
 

@@ -98,6 +98,72 @@ print(json.dumps({
     "phase": os.environ.get("PHASE") or None,
 }, sort_keys=True))' 2>/dev/null)" || _BODY_VALUE=""
         if [ -n "$_BODY_VALUE" ]; then
+            # ── Birth carrier () ─────────────────────────────────
+            # WHY A ROW CAN EXIST THAT NOTHING CAN EVER REAP: this row write
+            # and the carrier write gate on DIFFERENT predicates. Here the
+            # gate is `-d "$_AGENT_DIR"` (checked above); heartbeat-tick.sh
+            # writes the carrier only under `-d "$AGENT_DIR/$SESSIONS_DIRNAME/
+            # $MIND_SID"` — the per-SID dir. So a Body whose per-SID dir is
+            # absent gets a ROW and can never get a CARRIER, and
+            # body_row_reaper.decide_row returns K_NO_CARRIER unconditionally
+            # for a carrier-absent row (line ~212, upstream of the reap
+            # branch) — unreapable AT ANY AGE, so more sweeps cannot help.
+            # Measured 2026-08-22 (alpha, cc-07): two such rows live at 5.3h
+            # and 3.2h, both already past DEFAULT_REAP_STALE_MINUTES (180).
+            # The population REGENERATES; it is not a backlog of old rows.
+            #
+            # The carrier FILE lives in the agent-wide `session/` dir, never
+            # under `sessions/<SID>/`, so it never needed the narrower gate.
+            # Using the IDENTICAL predicate as the row is what guard-2611
+            # requires of any per-principal writer — an asymmetric pair
+            # re-opens the hole from the other end.
+            #
+            # WRITTEN BEFORE THE ROW, and the order is the point: a crash
+            # between the two must land on the carrier side, because the
+            # reaper iterates ROWS (an orphan carrier is inert) while an
+            # orphan row is the phantom this closes.
+            #
+            # This weakens no KEEP and touches no DELETE path — it changes the
+            # POPULATION. A Body that dies leaves a carrier that simply stops
+            # being refreshed, so it goes CV_STALE and the EXISTING reap branch
+            # collects it on schedule. That is what makes the bound
+            # aspirations-select already documents ("a dead Body can withhold a
+            # goal for at most ~3h") true for these rows; today it is false for
+            # exactly this population.
+            #
+            # Created ONLY when absent: refreshing a live carrier is
+            # heartbeat-tick's job, and clobbering its timestamp here would put
+            # two writers on one signal.
+            #
+            # `body_state` is deliberately empty — no body-manifest exists at
+            # claim time, and the reader renders an empty value
+            # `stale_state_unknown`, which never alerts (fail-open, matching
+            # heartbeat-tick.sh's own empty-value semantics).
+            #
+            # BARE `|| true`-style fallback, never `2>/dev/null` (rb-400): a
+            # silenced carrier failure recreates the very invisible
+            # no-carrier row this block exists to prevent.
+            # mkdir -p, and it is NOT defensive boilerplate: the residency gate
+            # above proves the AGENT dir exists, while this write lands in
+            # `<agent>/session/` — a DIFFERENT directory. Measured 2026-08-22
+            # (fresh-eyes on this very change): 2 of 11 agent dirs on this box
+            # have no `session/` at all. Without the mkdir the redirect fails,
+            # the `||` prints a WARN nobody reads, and the row is created with
+            # NO CARRIER — reproducing, one level down, the exact
+            # gate-narrower-than-the-write defect this whole block exists to
+            # close. Safe under guard-2611: residency is already established,
+            # so this only ever creates a resident agent's own state dir.
+            _IF_STATE_DIR="$(agent_state_dir "$AGENT")"
+            mkdir -p "$_IF_STATE_DIR" 2>&1 || echo "[team-state-in-flight] WARN: could not create $_IF_STATE_DIR (birth carrier will be skipped; claim unaffected)" >&2
+            _IF_CARRIER="$_IF_STATE_DIR/body-heartbeat-$MIND_SID.json"
+            if [ -d "$_IF_STATE_DIR" ] && [ ! -f "$_IF_CARRIER" ]; then
+                printf '{"sid":"%s","agent":"%s","host":"%s","ts":"%s","body_state":"%s"}\n' \
+                    "$MIND_SID" "$AGENT" "$(hostname || echo unknown)" \
+                    "$(date +%Y-%m-%dT%H:%M:%S)" "" > "$_IF_CARRIER.tmp" \
+                    && mv -f "$_IF_CARRIER.tmp" "$_IF_CARRIER" \
+                    && echo "[team-state-in-flight] birth carrier written: body-heartbeat-${MIND_SID}.json" >&2 \
+                    || echo "[team-state-in-flight] WARN: birth carrier write failed for ${AGENT}/${MIND_SID} (claim unaffected)" >&2
+            fi
             # FAIL-OPEN, like the reducer stamp the claim wraps: a visibility
             # row must never fail a claim that already committed in the daemon.
             MIND_AGENT="$AGENT" bash "$CORE_ROOT/scripts/team-state-update.sh" \

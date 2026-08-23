@@ -297,3 +297,47 @@ def test_wrapper_preserves_dry_run_rc_but_fails_open_in_run_mode(tmp_path):
     )
     assert dry.returncode == 1, "an unreadable registry must FAIL the dry-run check"
     assert "unreadable" in (dry.stderr or "")
+
+
+def test_wrapper_calls_a_silent_run_blind_instead_of_passing_it_off_as_clean(tmp_path):
+    """rc=0 with ZERO stdout is the one failure this wrapper cannot otherwise see.
+
+    _emit() prints the STAGE table unconditionally, so zero stdout PROVES the
+    report was never emitted -- yet run mode forces exit 0, which makes silence
+    indistinguishable from "ran clean" to a caller whose SKILL.md says to dispose
+    what it prints. Measured on foxtrot (LAPTOP-3IOFCNEO, WSL2 6.18.33.2)
+    2026-08-21: `--apply` returned rc=0 / 0 bytes / ~370s while the standalone
+    fallback returned two real findings minutes later, and the run was read as an
+    all-clear. Not reproducible on cc-07 (Linux 6.8.0-137-generic); root cause is
+    NOT established, so what is pinned here is that the failure is LOUD, not that
+    it is cured (guard-4093 / guard-1715).
+
+    The stub-sibling shape is required, not incidental: the wrapper resolves
+    iteration-open.py from its OWN dirname, so copying it beside a stub is the
+    only way to force a silent run without touching the real script.
+    """
+    from _bash_helpers import BASH  # guard-580: never a bare "bash" argv[0]
+
+    wrapper = tmp_path / "iteration-open.sh"
+    wrapper.write_bytes((SCRIPTS / "iteration-open.sh").read_bytes())
+    stub = tmp_path / "iteration-open.py"
+
+    stub.write_text("import sys\nsys.exit(0)\n", encoding="utf-8")
+    silent = subprocess.run(
+        [BASH, wrapper.as_posix(), "--apply"],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert silent.returncode == 0, "run mode must stay fail-open"
+    assert "SILENT RUN" in silent.stdout
+    assert "BLIND" in silent.stdout, "the warning must route the reader to the fallbacks"
+
+    # NEGATIVE CONTROL. Without this half the assertion above would pass just as
+    # happily against a wrapper that printed the warning unconditionally, which is
+    # a detector that can never be wrong and therefore never useful (guard-3534).
+    stub.write_text('print("STAGE  rc  elapsed  note")\n', encoding="utf-8")
+    noisy = subprocess.run(
+        [BASH, wrapper.as_posix(), "--apply"],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert noisy.returncode == 0
+    assert "SILENT RUN" not in noisy.stdout, "output present must never be called silent"

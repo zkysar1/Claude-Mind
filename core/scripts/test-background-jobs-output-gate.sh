@@ -148,6 +148,27 @@ run_case "8. size only (no format)" "" \
 run_case "9. empty artifacts list (backward compat)" "" \
   "[]"
 
+# --- : LEGACY ELEMENT SHAPES (rb-8845, guard-4813, guard-514) -------
+# cmd_register validated only that --output-artifacts was a LIST, so a bare list
+# of path STRINGS was accepted; three days later check_output_artifacts raised
+# AttributeError ('str' object has no attribute 'get') and `check --id` died on a
+# record ALREADY in the store. The writer is now strict, but that cannot reach
+# rows written before it (guard-2475), so the reader must absorb the old shape.
+# Case 10 is the regression pin; case 11 pins that absorbing it did not turn the
+# reader into a silent accept-anything.
+
+run_case "10. legacy bare-string spec is tolerated, not a crash" "missing" \
+  "[\"$SB/does-not-exist.jsonl\"]"
+
+run_case "11. non-string non-dict element fails cleanly" "artifact_not_a_spec" \
+  "[42]"
+
+# Positive control for case 10: the SAME path as a proper dict spec must yield
+# the SAME verdict. Without it, "missing" in case 10 could come from the
+# normalization dropping the path entirely rather than from the file's absence.
+run_case "12. control — dict spec for the same path agrees with case 10" "missing" \
+  "[{\"path\":\"$SB/does-not-exist.jsonl\",\"min_bytes\":1}]"
+
 echo ""
 echo "Total: $PASS passed, $FAIL failed"
 exit $FAIL

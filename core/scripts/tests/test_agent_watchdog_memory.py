@@ -61,10 +61,18 @@ class _Ctx:
     """Minimal stand-in — MemoryHeadroomProbe reads no context state."""
 
 
-def _probe(monkeypatch, *, total_kb, procs):
-    """A probe wired to synthetic memory readings."""
+def _probe(monkeypatch, *, total_kb, procs, avail_kb="healthy"):
+    """A probe wired to synthetic memory readings.
+
+    `avail_kb` defaults to a comfortably healthy 50% of MemTotal so the
+    pre-existing single-process tests below exercise ONLY the signal they were
+    written for. Pass an explicit value to drive the host_available trigger.
+    """
+    if avail_kb == "healthy":
+        avail_kb = None if not total_kb else int(total_kb * 0.5)
     monkeypatch.setattr(WD, "_mem_total_kb", lambda: total_kb)
     monkeypatch.setattr(WD, "_claude_rss_kb", lambda: procs)
+    monkeypatch.setattr(WD, "_mem_available_kb", lambda: avail_kb)
     return WD.MemoryHeadroomProbe(_Ctx())
 
 
@@ -236,3 +244,316 @@ def test_probe_is_registered(tmp_path):
     assert "memory-headroom" in names, (
         f"MemoryHeadroomProbe not registered in build_probes(): {names}"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. host_available trigger — the 2026-08-22 zakbox1 OOM (multi-container host)
+#
+# The single-process signal is structurally blind there: each container
+# enumerates only its OWN pid namespace while /proc/meminfo reports the whole
+# host, so N containers each at ~9% of MemTotal sum to a fatal load with every
+# individual reading far under the 60% floor.
+# ─────────────────────────────────────────────────────────────────────────────
+
+HOST = 64 * GIB  # the zakbox1 shape
+
+
+def test_avail_floor_defaults_to_10_percent(monkeypatch):
+    monkeypatch.delenv("AGENT_WATCHDOG_MEM_AVAIL_PCT", raising=False)
+    assert WD._mem_avail_floor() == pytest.approx(0.10)
+
+
+def test_avail_floor_honours_valid_override(monkeypatch):
+    monkeypatch.setenv("AGENT_WATCHDOG_MEM_AVAIL_PCT", "25")
+    assert WD._mem_avail_floor() == pytest.approx(0.25)
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "abc", "0", "-5", "101", "10%"])
+def test_malformed_avail_override_falls_back(monkeypatch, raw):
+    monkeypatch.setenv("AGENT_WATCHDOG_MEM_AVAIL_PCT", raw)
+    assert WD._mem_avail_floor() == pytest.approx(0.10)
+
+
+def test_fires_when_host_starved_though_every_process_is_small(monkeypatch):
+    """THE REGRESSION TEST for the zakbox1 OOM. This container sees its own
+    6 GiB agent on a 64 GiB host — 9.4%, nowhere near the 60% floor — while
+    the host has 3 GiB left because ~10 sibling containers hold the rest."""
+    monkeypatch.delenv("AGENT_WATCHDOG_MEM_PCT", raising=False)
+    monkeypatch.delenv("AGENT_WATCHDOG_MEM_AVAIL_PCT", raising=False)
+    p = _probe(monkeypatch, total_kb=HOST,
+               procs=[(279635, "claude.exe", 6 * GIB)],
+               avail_kb=3 * GIB)
+    events = p.check()
+    assert len(events) == 1, "host starvation must fire even with a small local process"
+    ev = events[0]
+    assert ev.severity == "critical"
+    assert ev.payload["triggers"] == ["host_available"]
+    assert ev.payload["pct_of_memtotal"] == pytest.approx(9.4, abs=0.2)
+    assert ev.payload["pct_available"] == pytest.approx(4.7, abs=0.2)
+    assert "host has" in ev.summary
+
+
+def test_fires_when_no_claude_process_is_visible_at_all(monkeypatch):
+    """PID-namespace blindness in its purest form: the probe can see no agent
+    process whatsoever, and the host is still starving. The pre-fix code
+    returned [] on an empty proc list and could never report this."""
+    monkeypatch.delenv("AGENT_WATCHDOG_MEM_AVAIL_PCT", raising=False)
+    p = _probe(monkeypatch, total_kb=HOST, procs=[], avail_kb=1 * GIB)
+    events = p.check()
+    assert len(events) == 1
+    assert events[0].payload["triggers"] == ["host_available"]
+    assert events[0].payload["claude_process_count"] == 0
+
+
+def test_healthy_host_with_small_processes_stays_quiet(monkeypatch):
+    """The other half of the contract — this must not become a noise source."""
+    monkeypatch.delenv("AGENT_WATCHDOG_MEM_PCT", raising=False)
+    monkeypatch.delenv("AGENT_WATCHDOG_MEM_AVAIL_PCT", raising=False)
+    p = _probe(monkeypatch, total_kb=HOST,
+               procs=[(1, "claude", 6 * GIB), (2, "claude", 5 * GIB)],
+               avail_kb=30 * GIB)
+    assert p.check() == []
+
+
+def test_payload_carries_aggregate_not_just_max(monkeypatch):
+    """`max()` is what went blind; the aggregate is the number a reader needs
+    to see that N small processes are collectively the problem."""
+    monkeypatch.delenv("AGENT_WATCHDOG_MEM_AVAIL_PCT", raising=False)
+    p = _probe(monkeypatch, total_kb=HOST,
+               procs=[(1, "claude", 6 * GIB), (2, "claude", 5 * GIB),
+                      (3, "claude.exe", 4 * GIB)],
+               avail_kb=2 * GIB)
+    ev = p.check()[0]
+    assert ev.payload["rss_kb"] == 6 * GIB            # max, unchanged
+    assert ev.payload["claude_rss_total_kb"] == 15 * GIB  # sum, new
+    assert ev.payload["claude_rss_total_gib"] == pytest.approx(15.0, abs=0.01)
+
+
+def test_both_triggers_can_fire_together(monkeypatch):
+    monkeypatch.delenv("AGENT_WATCHDOG_MEM_PCT", raising=False)
+    monkeypatch.delenv("AGENT_WATCHDOG_MEM_AVAIL_PCT", raising=False)
+    p = _probe(monkeypatch, total_kb=BOX,
+               procs=[(1, "claude", int(BOX * 0.7))], avail_kb=int(BOX * 0.05))
+    ev = p.check()[0]
+    assert ev.payload["triggers"] == ["largest_process", "host_available"]
+
+
+def test_host_trigger_dedups_like_the_process_trigger(monkeypatch):
+    monkeypatch.delenv("AGENT_WATCHDOG_MEM_AVAIL_PCT", raising=False)
+    p = _probe(monkeypatch, total_kb=HOST, procs=[], avail_kb=1 * GIB)
+    assert len(p.check()) == 1
+    assert p.check() == []
+
+
+def test_clears_only_when_both_signals_recover(monkeypatch):
+    """A recovered process reading must not clear the event while the HOST is
+    still starving — that would report all-clear into an ongoing incident."""
+    monkeypatch.setenv("AGENT_WATCHDOG_MEM_PCT", "60")
+    monkeypatch.delenv("AGENT_WATCHDOG_MEM_AVAIL_PCT", raising=False)
+    p = _probe(monkeypatch, total_kb=BOX,
+               procs=[(1, "claude", int(BOX * 0.70))], avail_kb=int(BOX * 0.05))
+    assert len(p.check()) == 1
+
+    # Process shrinks well under, host still starved → still no all-clear.
+    monkeypatch.setattr(WD, "_claude_rss_kb", lambda: [(1, "claude", int(BOX * 0.20))])
+    assert p.check() == []
+    assert p.over is True
+
+    # Host recovers too → now it clears.
+    monkeypatch.setattr(WD, "_mem_available_kb", lambda: int(BOX * 0.50))
+    events = p.check()
+    assert len(events) == 1
+    assert events[0].event == "memory_pressure_cleared"
+    assert p.over is False
+
+
+def test_unreadable_available_cannot_veto_recovery(monkeypatch):
+    """MemAvailable absent (older kernel) must not wedge the probe permanently
+    over-threshold once the process signal has recovered."""
+    monkeypatch.setenv("AGENT_WATCHDOG_MEM_PCT", "60")
+    p = _probe(monkeypatch, total_kb=BOX,
+               procs=[(1, "claude", int(BOX * 0.70))], avail_kb=None)
+    assert len(p.check()) == 1
+    monkeypatch.setattr(WD, "_claude_rss_kb", lambda: [(1, "claude", int(BOX * 0.20))])
+    events = p.check()
+    assert len(events) == 1
+    assert events[0].event == "memory_pressure_cleared"
+
+
+def test_mem_available_parses_meminfo(monkeypatch, tmp_path):
+    """The parser reads MemAvailable, not MemFree — they differ by reclaimable
+    cache and MemFree would fire constantly on a healthy box."""
+    meminfo = ("MemTotal:       65792316 kB\n"
+               "MemFree:          812344 kB\n"
+               "MemAvailable:   12345678 kB\n")
+    monkeypatch.setattr(WD, "read_text_safe", lambda p: meminfo)
+    assert WD._mem_available_kb() == 12345678
+    assert WD._mem_total_kb() == 65792316
+
+
+def test_mem_available_returns_none_when_absent(monkeypatch):
+    monkeypatch.setattr(WD, "read_text_safe", lambda p: "MemTotal: 100 kB\n")
+    assert WD._mem_available_kb() is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. swap_exhausted trigger — the signal that was missing entirely on
+# 2026-08-22. Swap fills BEFORE MemAvailable moves, so this is the earliest
+# reliable warning in the chain that ends in a global OOM.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _swap_probe(monkeypatch, *, total_kb, procs, avail_kb, swap_total, swap_free):
+    monkeypatch.setattr(WD, "_mem_total_kb", lambda: total_kb)
+    monkeypatch.setattr(WD, "_claude_rss_kb", lambda: procs)
+    monkeypatch.setattr(WD, "_mem_available_kb", lambda: avail_kb)
+    monkeypatch.setattr(WD, "_swap_kb", lambda: (swap_total, swap_free))
+    monkeypatch.setattr(WD, "_notify_critical_memory",
+                        lambda s, m: {"sent": True, "stub": True})
+    return WD.MemoryHeadroomProbe(_Ctx())
+
+
+def test_swap_floor_defaults_to_25_percent(monkeypatch):
+    monkeypatch.delenv("AGENT_WATCHDOG_SWAP_FREE_PCT", raising=False)
+    assert WD._swap_floor() == pytest.approx(0.25)
+
+
+@pytest.mark.parametrize("raw", ["", "abc", "0", "-1", "101"])
+def test_malformed_swap_override_falls_back(monkeypatch, raw):
+    monkeypatch.setenv("AGENT_WATCHDOG_SWAP_FREE_PCT", raw)
+    assert WD._swap_floor() == pytest.approx(0.25)
+
+
+def test_fires_on_swap_exhaustion_while_ram_reads_healthy(monkeypatch):
+    """THE 2026-08-22 zakbox1 READING, verbatim: MemAvailable 47% (healthy by
+    every RAM measure) while SwapFree is 5.8% of SwapTotal. Neither existing
+    trigger fires; this one must, because that box was already thrashing."""
+    monkeypatch.delenv("AGENT_WATCHDOG_MEM_PCT", raising=False)
+    monkeypatch.delenv("AGENT_WATCHDOG_MEM_AVAIL_PCT", raising=False)
+    monkeypatch.delenv("AGENT_WATCHDOG_SWAP_FREE_PCT", raising=False)
+    p = _swap_probe(monkeypatch, total_kb=65579460,
+                    procs=[(279635, "claude.exe", 5149116)],
+                    avail_kb=30822764,          # 47% available — looks fine
+                    swap_total=8388604, swap_free=483908)   # 5.8% free
+    events = p.check()
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.payload["triggers"] == ["swap_exhausted"]
+    assert ev.payload["pct_swap_free"] == pytest.approx(5.8, abs=0.2)
+    assert ev.payload["pct_available"] == pytest.approx(47.0, abs=0.5)
+    assert "paging to disk" in ev.summary
+    assert ev.payload["notified"]["sent"] is True
+
+
+def test_swap_disabled_is_not_pressure(monkeypatch):
+    """SwapTotal 0 is a configuration, not an exhausted swap. Dividing by it
+    would either crash or report 0% free forever."""
+    monkeypatch.delenv("AGENT_WATCHDOG_SWAP_FREE_PCT", raising=False)
+    p = _swap_probe(monkeypatch, total_kb=BOX, procs=[(1, "claude", GIB)],
+                    avail_kb=BOX // 2, swap_total=0, swap_free=0)
+    assert p.check() == []
+
+
+def test_healthy_swap_stays_quiet(monkeypatch):
+    monkeypatch.delenv("AGENT_WATCHDOG_SWAP_FREE_PCT", raising=False)
+    p = _swap_probe(monkeypatch, total_kb=BOX, procs=[(1, "claude", GIB)],
+                    avail_kb=BOX // 2, swap_total=8 * GIB, swap_free=7 * GIB)
+    assert p.check() == []
+
+
+def test_unreadable_swap_does_not_block_other_triggers(monkeypatch):
+    monkeypatch.delenv("AGENT_WATCHDOG_MEM_AVAIL_PCT", raising=False)
+    p = _swap_probe(monkeypatch, total_kb=HOST, procs=[], avail_kb=1 * GIB,
+                    swap_total=None, swap_free=None)
+    ev = p.check()[0]
+    assert ev.payload["triggers"] == ["host_available"]
+    assert ev.payload["pct_swap_free"] is None
+
+
+def test_swap_cannot_veto_recovery_when_unreadable(monkeypatch):
+    monkeypatch.setenv("AGENT_WATCHDOG_MEM_PCT", "60")
+    p = _swap_probe(monkeypatch, total_kb=BOX, procs=[(1, "claude", int(BOX * .7))],
+                    avail_kb=BOX // 2, swap_total=None, swap_free=None)
+    assert len(p.check()) == 1
+    monkeypatch.setattr(WD, "_claude_rss_kb", lambda: [(1, "claude", int(BOX * .2))])
+    assert p.check()[0].event == "memory_pressure_cleared"
+
+
+def test_swap_still_low_blocks_all_clear(monkeypatch):
+    """A recovered RAM reading must not report all-clear while swap is still
+    exhausted — the box is still thrashing."""
+    monkeypatch.setenv("AGENT_WATCHDOG_MEM_PCT", "60")
+    monkeypatch.delenv("AGENT_WATCHDOG_SWAP_FREE_PCT", raising=False)
+    p = _swap_probe(monkeypatch, total_kb=BOX, procs=[(1, "claude", int(BOX * .7))],
+                    avail_kb=BOX // 2, swap_total=8 * GIB, swap_free=int(0.05 * 8 * GIB))
+    assert len(p.check()) == 1
+    monkeypatch.setattr(WD, "_claude_rss_kb", lambda: [(1, "claude", int(BOX * .2))])
+    assert p.check() == []          # swap still 5% free
+    assert p.over is True
+    monkeypatch.setattr(WD, "_swap_kb", lambda: (8 * GIB, 7 * GIB))
+    assert p.check()[0].event == "memory_pressure_cleared"
+
+
+def test_swap_parses_meminfo(monkeypatch):
+    meminfo = ("MemTotal:       65579460 kB\n"
+               "MemAvailable:   30822764 kB\n"
+               "SwapTotal:       8388604 kB\n"
+               "SwapFree:         483908 kB\n")
+    monkeypatch.setattr(WD, "read_text_safe", lambda p: meminfo)
+    assert WD._swap_kb() == (8388604, 483908)
+
+
+def test_swap_returns_none_pair_when_meminfo_absent(monkeypatch):
+    monkeypatch.setattr(WD, "read_text_safe", lambda p: None)
+    assert WD._swap_kb() == (None, None)
+
+
+# ── notification is FAIL-OPEN ────────────────────────────────────────────────
+
+def test_check_survives_a_notifier_that_raises(monkeypatch):
+    """A watchdog that dies because mail is down is worse than the condition
+    it was reporting. The tick must complete and the event must still be
+    emitted, with the delivery failure recorded in the payload."""
+    monkeypatch.delenv("AGENT_WATCHDOG_SWAP_FREE_PCT", raising=False)
+    monkeypatch.setattr(WD, "_mem_total_kb", lambda: BOX)
+    monkeypatch.setattr(WD, "_claude_rss_kb", lambda: [(1, "claude", GIB)])
+    monkeypatch.setattr(WD, "_mem_available_kb", lambda: BOX // 2)
+    monkeypatch.setattr(WD, "_swap_kb", lambda: (8 * GIB, int(0.01 * 8 * GIB)))
+    p = WD.MemoryHeadroomProbe(_Ctx())
+
+    def _boom(subject, message):
+        raise RuntimeError("smtp exploded")
+    monkeypatch.setattr(WD, "_notify_critical_memory", _boom)
+
+    events = p.check()          # must NOT propagate
+    assert len(events) == 1
+    assert events[0].severity == "critical"
+    assert events[0].payload["notified"]["sent"] is False
+    assert "RuntimeError" in events[0].payload["notified"]["reason"]
+
+
+def test_real_notifier_swallows_a_broken_subprocess(monkeypatch):
+    """The inner layer's own fail-open contract, tested against the REAL
+    function (the previous version of this test patched the function out and
+    then called it, so it only ever exercised its own stub)."""
+    import subprocess as _sp
+
+    def _explode(*a, **k):
+        raise OSError("no bash")
+    monkeypatch.setattr(_sp, "run", _explode)
+    got = WD._notify_critical_memory("s", "m")
+    assert got["sent"] is False
+    assert "OSError" in got["reason"]
+
+
+def test_notify_reports_nonzero_rc_without_raising(monkeypatch):
+    """rc 3/4/5/6 from notify-user.sh are outcomes (suppressed, duplicate, no
+    transport, transport failed) — recorded, never raised."""
+    import subprocess as _sp
+
+    class _R:
+        returncode = 5
+        stdout = "no transport configured"
+        stderr = ""
+    monkeypatch.setattr(_sp, "run", lambda *a, **k: _R())
+    got = WD._notify_critical_memory("s", "m")
+    assert got["sent"] is False and got["rc"] == 5

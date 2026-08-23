@@ -273,6 +273,26 @@ def _fleet_population(timeout: int) -> Dict[str, Any]:
     product = 0
     by_holder: Dict[str, int] = {}
     scanned = 0
+    #  run 3: the headline `noted` is a DENOMINATOR, and reporting it
+    # without this split overstates the drainable backlog ~7x. Two sub-populations
+    # inside it are not undrained work at all:
+    #   recurring — a recurring goal legitimately carries its LAST fire's note
+    #     while pending its NEXT. Closing one banks nothing; it kills the cadence.
+    #     (This goal is itself recurring and appeared in its own actionable list.)
+    #   deferred  — a non-recurring goal carrying a defer_reason is parked against
+    #     a NAMED gate, i.e. already routed. It is not waiting to be noticed.
+    # guard-2529: a sweep that filters before counting must report what the filter
+    # EXCLUDED. guard-2273: print the unfiltered population beside the filtered
+    # count. So these are reported ALONGSIDE `noted`, never subtracted from it.
+    recurring = 0
+    deferred = 0
+    # guard-4434: a NULL claimed_by beside a NON-NULL claimed_by_sid IS a claim.
+    # `by_holder`/`claimed_and_noted` key on the NAME only, so such a record reads
+    # as unclaimed here. Counted separately rather than folded in — changing the
+    # existing ownership tallies is a behaviour change this reporting fix does not
+    # make; naming the gap is what lets a reader see it. Measured 2026-08-21: 2 of
+    # 225, the same pair guard-4434 named on 2026-08-19 (, ).
+    sid_only_claimed = 0
     for asp in asps:
         asp_id = str(asp.get("id") or "")
         for goal in (asp.get("goals") or []):
@@ -287,10 +307,18 @@ def _fleet_population(timeout: int) -> Dict[str, Any]:
                 product += 1
             if min_chars is not None and len(note) >= min_chars:
                 over_threshold += 1
+            # Recurring wins over deferred: a recurring goal is legitimate
+            # re-pending whether or not it also carries a defer.
+            if goal.get("recurring"):
+                recurring += 1
+            elif goal.get("defer_reason"):
+                deferred += 1
             holder = goal.get("claimed_by")
             if holder:
                 claimed_noted += 1
                 by_holder[holder] = by_holder.get(holder, 0) + 1
+            elif goal.get("claimed_by_sid"):
+                sid_only_claimed += 1
 
     out.update({
         "readable": True,
@@ -303,6 +331,10 @@ def _fleet_population(timeout: int) -> Dict[str, Any]:
         "min_chars": min_chars,
         "over_threshold": over_threshold if min_chars is not None else None,
         "by_holder": dict(sorted(by_holder.items(), key=lambda kv: -kv[1])),
+        "recurring": recurring,
+        "deferred": deferred,
+        "undrained": noted - recurring - deferred,
+        "sid_only_claimed": sid_only_claimed,
     })
     return out
 
@@ -335,11 +367,24 @@ def _render_fleet(pop: Dict[str, Any], this_agent: str) -> None:
         label = f"note >= {pop['min_chars']} chars"
         print(f"  {label:<20}: {pop['over_threshold']}  "
               f"(the sweep's own keep threshold, read from its source)")
+    if pop.get("sid_only_claimed"):
+        print(f"    ...of which claimed_by is NULL but claimed_by_sid is SET: "
+              f"{pop['sid_only_claimed']} — guard-4434 says these ARE claims; the two "
+              f"lines above count them as unclaimed")
     if pop["by_holder"]:
         holders = ", ".join(f"{k}={v}" for k, v in list(pop["by_holder"].items())[:6])
         print(f"  by holder           : {holders}")
     print(f"  scanned             : {pop['non_terminal_scanned']} non-terminal goals "
           f"across {pop['aspirations']} active aspirations")
+    if pop.get("recurring") is not None:
+        print()
+        print("  WHAT IS INSIDE THAT NUMBER (guard-2529: report what the filter excludes):")
+        print(f"    recurring           : {pop['recurring']}  "
+              f"legitimately re-pending between fires — closing one KILLS THE CADENCE")
+        print(f"    deferred (non-recur): {pop['deferred']}  "
+              f"parked against a NAMED gate — already routed, not waiting to be noticed")
+        print(f"    UNDRAINED           : {pop['undrained']}  "
+              f"<- the drainable class; the other two are not backlog")
     print()
     print("  READ THIS AS A DENOMINATOR, NOT A VERDICT. An outcome_note means work")
     print("  happened under the goal; it does not mean the goal is finished. The")

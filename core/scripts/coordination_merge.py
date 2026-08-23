@@ -2784,6 +2784,11 @@ def _merge_tree_node(a: dict, b: dict) -> dict:
       NEWER        -> _merge_field_newer         (strictly-newer ISO)
       PROGRESSION  -> _merge_field_progression   (LWW-by-progression stamp, never-regress tie)
       CALIBRATION  -> _merge_field_calibration   (LWW-by-calibration stamp, sample_size tie, NO never-regress)
+      BASE         -> per-field amended_fields stamp (g-115-5411), applied BELOW
+                      all four loops above so recency can never regress a counter
+                      or revert a calibration downgrade. Backfill-safe: unstamped
+                      on both sides ties and keeps the LWW base, so behaviour is
+                      byte-identical until writers stamp.
     A class field present on only ONE side is kept (an absent field never clobbers
     a present one), and loser-only BASE fields are preserved too (authored fields
     like origin_goal_id / valid_from / domain_class are NOT self-correcting, so a
@@ -2860,6 +2865,66 @@ def _merge_tree_node(a: dict, b: dict) -> dict:
             out[f] = a[f]
         elif f in b:
             out[f] = b[f]
+    # The stamp map needs its OWN merge rule, and it needs one FIRST: without it
+    # `amended_fields` is itself an unrecognized field, so it classifies BASE and
+    # rides the LWW base, and one box's whole map replaces the other's -- losing
+    # the very ordering evidence the tier below reads, one level down. That is
+    # guard-1153 addition (2) verbatim: "the metadata field you ADD to fix a
+    # merge is ITSELF merged". Union-of-keys plus per-key MAX via
+    # _merge_stamp_map, which also sorts on the way out (: this map is
+    # a nested VALUE, and json/yaml emit insertion order, so an unsorted union
+    # reaches the output BYTES and breaks commutativity).
+    ma, mb = a.get(_AMEND_STAMP_FIELD), b.get(_AMEND_STAMP_FIELD)
+    if isinstance(ma, dict) and isinstance(mb, dict):
+        out[_AMEND_STAMP_FIELD] = _merge_stamp_map(ma, mb)
+    elif isinstance(ma, dict):
+        out[_AMEND_STAMP_FIELD] = ma
+    elif isinstance(mb, dict):
+        out[_AMEND_STAMP_FIELD] = mb
+    # BASE-class amendment recency, PER FIELD (). BASE is the DEFAULT
+    # class, so summary / entities / saturated_topics / maintain_exempt /
+    # origin_goal_id / valid_from / domain_class -- and every field added later --
+    # ride the newer-last_updated LWW base. But last_updated is DATE-granular by
+    # design ( is its SSOT: it tracks .md article freshness, and
+    #  deliberately does NOT bump it on a field poke), so two edits on
+    # the same day can NEVER be ordered by recency and _order_by_ts always falls
+    # through to its LEXICOGRAPHIC content tiebreak. That tiebreak's winner is
+    # arbitrary with respect to INTENT and is a stable FIXED POINT: every merge
+    # re-derives the same winner and re-pushes it, so retrying can never win.
+    # Measured  -- two live write attempts plus an offline simulation
+    # over the real bytes in BOTH arg orders, all four losing to the incumbent.
+    #
+    # This adopts the SAME per-field tier _merge_rb_record / _merge_guard_record /
+    # _merge_sig_record already use -- deliberately NOT a transplant of a
+    # sibling's record-level key. guard-1153 addition (1) forbids moving a merge
+    # tier between handlers without re-deriving it against MERGE GRANULARITY, and
+    # a record-level stamp inside a per-field handler degrades to
+    # newer-write-wins-everything, deterministically discarding concurrent
+    # amendments to the record's other fields (). It is also why the
+    # goal's own recommended option -- keying BASE LWW on one node-level sub-day
+    # stamp the way PROGRESSION does -- is NOT what landed: PROGRESSION governs
+    # three tightly-coupled fields one writer bumps together, whereas BASE is the
+    # open-ended default class, so a node-level stamp would be a foreign
+    # timestamp for every BASE field except the one just written.
+    #
+    # Strictly BELOW the MAX / NEWER / PROGRESSION / CALIBRATION loops so recency
+    # can never regress a counter, un-advance a monotonic date, or revert a
+    # data-derived calibration downgrade. Backfill-safe: with no stamps on either
+    # side both _field_stamp calls return "" (_ts_key(None)), the sides tie, and
+    # out[k] keeps the base-pick value -- byte-identical to the pre-change merge
+    # for every node until writers start stamping.
+    #
+    # Commutative: the visited key set is the INTERSECTION (same under swap), and
+    # when the stamps differ the newer side wins regardless of arg order; when
+    # they tie nothing is assigned and out keeps the content-fixed base value.
+    for k, va in a.items():
+        if k not in b or k == _AMEND_STAMP_FIELD:
+            continue
+        if _classify_tree_field(k) != "BASE":
+            continue
+        sa, sb = _field_stamp(a, k), _field_stamp(b, k)
+        if sa != sb:
+            out[k] = va if sa > sb else b[k]
     # Preserve loser-only fields the base lacks (-a fresh-eyes fix):
     # authored BASE fields (origin_goal_id / valid_from / domain_class) are NOT
     # self-correcting, so a loser-only one must not be silently dropped. `_lose`
@@ -5018,12 +5083,71 @@ def _is_gate_firings_segment(basename: str) -> bool:
     return bool(_GATE_FIRINGS_SEGMENT_RE.match(basename))
 
 
+def merge_tree_node_md(ours: bytes, theirs: bytes):
+    """Section-union merge for ``world/knowledge/tree/**/*.md`` ().
+
+    Moves 1,555 tree nodes from write-class (b) (fence-only: a stale fence is a
+    PERMANENT wedge because no reconciler sits below the write) to class (a).
+
+    THE BASE IS ABSENT AND THAT IS THE DECIDING FACT (g-115-6954). The handler
+    contract is (bytes, bytes) -> bytes with no base argument, and ``.history``
+    holds ZERO snapshots for tree-node .md against 1,555 live nodes, so no base
+    can be recovered — and a per-box recovered base would break the
+    commutativity the mirror requires. Section-union is precisely the algorithm
+    that does not need one: ``merge_sections`` treats an empty base as "every
+    section on both sides is an addition", which is the correct reading here.
+
+    REFUSES rather than guesses. Returning None leaves the backend's safe-freeze
+    in place, which is the status quo this goal narrowed from "every concurrent
+    edit freezes" to "same-heading divergence freezes". Two refusal paths:
+      * conflicts non-empty — the same heading diverged on both sides. Only a
+        reader can resolve that; auto-picking is how rb-3683 happened.
+      * UnicodeDecodeError — a side that will not decode must NEVER be treated
+        as empty, or a one-sided edit silently becomes a whole-file overwrite.
+
+    Rejected alternatives are recorded in
+    core/config/conventions/governed-store-write-classes.md: (a) whole-file
+    front-matter LWW loses a section on the same-date two-section case, and (b)
+    body LINE-union can drop an interleaved section body while keeping its
+    heading (rb-3683) — silent corruption INSIDE a section.
+    """
+    # Imported lazily: _section_merge lives beside this file, and a deferred
+    # import keeps module load order irrelevant. After the first call it is a
+    # cached sys.modules lookup, so the hot path pays nothing.
+    from _section_merge import merge_sections
+    try:
+        ours_text = ours.decode("utf-8")
+        theirs_text = theirs.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    # CANONICAL ARGUMENT ORDER — this is what makes the merge byte-for-byte
+    # commutative, and without it the handler is NOT (measured ).
+    # merge_sections emits ours-sections-then-theirs-sections, so with the base
+    # absent EVERY section is an addition and the output order follows the
+    # CALLER's argument order: merge(a,b) and merge(b,a) both keep all content
+    # but differ byte-for-byte. Two own-cloud boxes merging the same divergent
+    # pair see opposite (ours, theirs) by construction, so each would write a
+    # different byte string for the same logical content — different hashes,
+    # perpetual mirror divergence, on a file the merge just "succeeded" on.
+    # Sorting the two SIDES (not the sections) is the minimal fix: it is
+    # content-derived, so every box picks the same one, while each document's
+    # own section order is left intact. Sorting sections alphabetically would
+    # also be deterministic but would scramble the deliberate narrative order
+    # of a knowledge node on its first merge.
+    if theirs_text < ours_text:
+        ours_text, theirs_text = theirs_text, ours_text
+    merged, conflicts = merge_sections("", ours_text, theirs_text)
+    if conflicts:
+        return None
+    return merged.encode("utf-8")
+
+
 def merge_handler_for(path) -> Optional[Callable[[bytes, bytes], bytes]]:
     """Return the commutative merge handler for ``path``, or None when the
     store is not merge-registered (the backend then keeps its safe-freeze
     behavior for that path).
 
-    Dispatch is by basename EXCEPT for FIVE path-pattern branches that run
+    Dispatch is by basename EXCEPT for SIX path-pattern branches that run
     BEFORE the _HANDLERS lookup, so a basename grep alone is NOT a complete
     classifier (see each branch's own comment below for why it exists):
       1. per-agent team-state shards  ``.../team-state/agents/<name>.yaml``
@@ -5034,6 +5158,9 @@ def merge_handler_for(path) -> Optional[Callable[[bytes, bytes], bytes]]:
          routed to the legacy file's append-only handler
       5. ``core/config/**`` EXCLUSION -- a registered basename that also names
          an immutable framework config is deliberately NOT merged.
+      6. tree-node markdown ``world/knowledge/tree/**/*.md`` -- section-union
+         (g-115-7071); 1,555 unique basenames make per-node registration
+         structurally impossible.
     Branches 1-4 register stores whose basenames are DYNAMIC and therefore
     unenumerable; branch 5 un-registers a path whose basename is AMBIGUOUS. So
     the answer to "is this store merge-protected?" can be YES with no basename
@@ -5160,6 +5287,15 @@ def merge_handler_for(path) -> Optional[Callable[[bytes, bytes], bytes]]:
     # preserving the prior meta.yaml behavior for that shape.
     if parts[-2:-1] == ["config"] and (len(parts) < 3 or parts[-3] == "core"):
         return None
+    # SIXTH path-pattern case (): tree-node markdown. Basename-keying
+    # is structurally impossible here — _HANDLERS is basename-keyed and every one
+    # of the 1,555 nodes has a UNIQUE basename, so per-node registration could
+    # never be written. Same reason branches 1-4 exist.
+    if (parts[-1].endswith(".md")
+            and "tree" in parts and "knowledge" in parts
+            and parts.index("knowledge") + 1 < len(parts)
+            and parts[parts.index("knowledge") + 1] == "tree"):
+        return merge_tree_node_md
     if parts[-1] == "meta.yaml":
         return merge_meta_index
     return _HANDLERS.get(os.path.basename(str(path)))

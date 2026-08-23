@@ -75,9 +75,26 @@ source "$CORE_ROOT/scripts/_runtime.sh"
 # rather than CLI-vs-daemon).
 #
 # WHAT AN EVICTION MEANS HERE, post-: the newcomer is now protected, so
-# the entry destroyed is always an OLD one — the peer that has waited longest for
-# the reducer, which on a lane saturated at 100% load_bearing is precisely what
-# the priority exemption exists to rescue. That is worth one stderr line.
+# the entry destroyed is always an OLD one. WHICH old one is NOT fixed, and this
+# comment asserted the wrong half of it until . Victim selection became
+# floor-aware in  (wm_write.py::append_slot):
+#   flagged > (limit - _unflagged_floor)  -> the oldest FLAGGED entry goes
+#   otherwise                             -> the oldest UNFLAGGED entry goes
+# Those two victims have OPPOSITE recoverability. A flagged entry was mirrored to
+# this Body's session/-rooted carrier at append time, which is uncapped and lives
+# in the store, and capture_fast_lane delivers from there — so evicting it drops a
+# redundant second copy. An unflagged entry was never mirrored anywhere: the WM
+# slot is its only existence, so its eviction is the unrecoverable one.
+# THE WRAPPER CANNOT TELL THEM APART. The daemon reports `evicted` as a bare
+# COUNT, so this layer must not name a victim class it did not observe
+# (guard-2947). Saying "the one that has waited longest for the reducer"
+# unconditionally is false in the flagged branch, and it is not a harmless
+# imprecision: a prior Body read that line, concluded that relaying through this
+# lane would destroy another goal's undelivered observation, and routed around the
+# lane entirely — when the append it declined to make would have evicted a
+# carrier-backed peer. Measured cc-08 2026-08-22 on the live path: spark_capture at
+# 50/50 with flagged=40 == limit-floor, one flagged append, unflagged held at 10.
+# That is worth one stderr line.
 # STDOUT stays silent on success (the documented contract above, and callers
 # parse it); diagnostics go to STDERR, which is the channel a non-blocking
 # notice belongs on.
@@ -115,7 +132,7 @@ _emit_notice() {
     if [ -n "${_n:-}" ] && [ "$_n" != "0" ]; then
         _plural="entries"
         [ "$_n" = "1" ] && _plural="entry"
-        echo "[wm-append] '$SLOT' is at its cap — $_n older $_plural evicted to make room. The victim is the OLDEST peer, i.e. the one that has waited longest for the reducer." >&2
+        echo "[wm-append] '$SLOT' is at its cap — $_n older $_plural evicted to make room. Victim selection is floor-aware (g-306-316) and this wrapper sees only the COUNT, not the class: if flagged entries exceed (cap - unflagged_floor) the oldest FLAGGED one goes, and that one is carrier-backed so it still reaches the reducer; otherwise the oldest UNFLAGGED one goes, and that IS an unrecoverable loss (the WM slot is its only copy). Do not route around this lane on the assumption that every eviction destroys undelivered mail — on a lane saturated with flagged entries it does not (g-306-353)." >&2
     fi
 }
 

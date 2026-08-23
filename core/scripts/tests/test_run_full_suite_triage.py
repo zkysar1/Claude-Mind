@@ -424,7 +424,49 @@ def test_true_negative_still_reports_unowned_and_files(monkeypatch, capsys):
     result = RFS._print_ownership("core/scripts/tests/test_thing.py", ".")
     out = capsys.readouterr().out
     assert result == []
-    assert "owner: NONE" in out and "open goal(s) scanned" in out
+    assert "owner: NONE" in out and "goal(s) scanned" in out
+
+
+def test_unowned_message_declares_what_it_searched(monkeypatch, capsys):
+    """The NONE branch must say what was SEARCHED, not only what was concluded.
+
+    g-115-6139 / guard-4432. The message used to read "no goal in either queue
+    names this test (N open goal(s) scanned)", and N is what made the gap
+    invisible: it counts goals SCANNED, not fields or statuses SEARCHED, so a
+    four-digit N reads as exhaustive and the reader stops there. Two exclusions
+    were hidden behind it -- the scan is title+description (an outcome_note
+    citation is not found), and it is OPEN-statuses only by design, so the
+    single most likely explanation for a surprising NONE was the one the
+    message did not mention.
+
+    Measured on the live queue 2026-08-22 (alpha, cc-07), 2105 open goals /
+    12.4 MB: across the 12 files that failed a real suite run, TITLE-only
+    matching finds 7 of 29 owners (24.1%) and 5 of the 12 files have ZERO title
+    hits. So the description half of the scan is load-bearing and worth naming
+    -- a reader who assumes title-only would distrust a correct answer, and one
+    who assumes "everything" would over-trust a NONE.
+    """
+    monkeypatch.setattr(
+        RFS.subprocess, "run",
+        lambda *a, **k: _FakeRun(0, json.dumps(
+            [{"goal_id": "g-999-99", "status": "pending",
+              "title": "Unrelated", "description": "nothing to do with it"}])))
+    RFS._print_ownership("core/scripts/tests/test_thing.py", ".")
+    out = capsys.readouterr().out
+
+    assert "title or description" in out, (
+        "must name the FIELDS searched -- otherwise the reader cannot tell a "
+        "title-only scan from a title+description one")
+    assert "outcome_note" in out and "NOT searched" in out, (
+        "must name what it did NOT search; an unqualified NONE reads as total")
+    for status in RFS.OPEN_STATUSES:
+        assert status in out, (
+            f"must name the status scope ({status}) -- a COMPLETED goal naming "
+            "this test is deliberately excluded, and that exclusion is the most "
+            "likely explanation for a surprising NONE")
+    assert "no goal in either queue" not in out, (
+        "the old unqualified phrasing asserts a positive conclusion the scan "
+        "cannot support (guard-4432)")
 
 
 # ── F3: a shared subsystem name is not ownership (guard-1801) ───────────────

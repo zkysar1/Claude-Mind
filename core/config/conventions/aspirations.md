@@ -130,8 +130,16 @@ Two script families — world (default) and agent — operate on separate queues
 > completes it is archived, and all of its goals leave that query — a lookup by
 > goal-id then returns NOT-FOUND, which is byte-identical to the answer for a
 > goal that never existed. Any lookup deciding "is goal X done?" must ALSO read
-> `aspirations-read.sh --archive --json` (2026-07-26: 353 archived aspirations /
-> 2278 completed goals — not a rare edge). Prefer keeping the two results
+> `aspirations-read.sh --archive` (2026-07-26: 353 archived aspirations /
+> 2278 completed goals — not a rare edge; re-measured 2026-08-21: 370 archived).
+> No `--json`: this wrapper never accepted one and `--archive` already returns a
+> JSON list. The flag was silently DROPPED until g-115-5438 made the wrapper
+> refuse unknown flags, at which point this documented command became rc=2 —
+> which is how a doc-only caller of a swallowed flag surfaces. Confirmed live
+> 2026-08-22 (cc-08): `aspirations-query.sh --title-contains <x> --json` now
+> exits 2 with an empty STDOUT and the refusal on STDERR, so a caller that pipes
+> it into a JSON parser reads a clean "0 hits" and can conclude an owned test red
+> is unowned. Drop the flag; the output is already JSON. Prefer keeping the two results
 > DISTINCT rather than merging them: a goal completed inside an archived
 > aspiration is more finished than a merely-completed live one, and an id in
 > NEITHER store is an anomaly worth reporting rather than skipping.

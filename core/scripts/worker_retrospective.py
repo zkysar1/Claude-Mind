@@ -130,7 +130,7 @@ MARKER_SOURCE = "worker-retrospective"
 
 # Lanes this module CALLS. Order matters: the four writers run first so the
 # imp@k lane can report how many of them actually landed.
-RUN_LANES = ("team_state", "journal", "findings", "experience", "impk")
+RUN_LANES = ("team_state", "journal", "findings", "experience", "encoding", "impk")
 
 # The experience lane's input slot and the writer surface it calls. The slug is
 # baked into the experience id as `exp-<goal-id>-<slug>`, which the endpoint
@@ -138,6 +138,32 @@ RUN_LANES = ("team_state", "journal", "findings", "experience", "impk")
 EXP_SLOT = "exp_capture"
 EXP_SKILL_SLUG = "worker-retrospective"
 EXP_TYPE = "goal_execution"
+
+# The encoding lane (): `encoding_capture` was the LAST of the four
+# worker->reducer capture lanes with no consumer anywhere — producer shipped,
+# reducer half did not, and 132 entries rode the transport into the reducer WM
+# to be read by nothing.
+#
+# WHY A LANE HERE RATHER THAN A STANDALONE DRAIN SCRIPT: the standalone shape was
+# already tried and RETIRED for the sibling lane — `exp_capture_drain.py` was
+# deleted in 659dbef14 () in favour of a lane in this module, and
+# body-merge.sh:33 records that its placement argument survives independently of
+# the ownership claim that surrounded it. Rebuilding that artifact for lane 4
+# would re-create exactly what was removed for lane 2. A lane also rides a
+# dispatch consolidation ALREADY calls, so it cannot go inert the way a fresh
+# call site can (the hyp_capture guard shipped inert at its only call site with a
+# fully green unit suite — guard-1943).
+#
+# WHY THE SINK IS `encoding_queue` AND NOT A DIRECT TREE WRITE: tree PLACEMENT is
+# LLM judgment, which is why the worker's `suggested_node` is explicitly
+# NON-binding ("the reducer decides placement", worker-loop SKILL.md ~L760).
+# Every other lane in this module is mechanizable; this one is not. So the lane
+# hands the fact to the queue that consolidation already drains toward the tree
+# (learning-routing.md: `wm.encoding_queue[].target_article`) and lets the
+# judgment happen where it already lives, instead of auto-writing nodes.
+ENC_SLOT = "encoding_capture"
+ENC_QUEUE_SLOT = "encoding_queue"
+ENC_REPLAY_PRIORITY = "standard_deferred"
 
 # The .md at content_path carries every anchor; the JSONL record carries a
 # bounded head of them, because that record is re-read on every experience
@@ -161,6 +187,17 @@ SKIP_ALREADY = "already-retrospected"
 SKIP_NO_RECORD = "goal-record-not-found"
 SKIP_BAD_ID = "malformed-goal-id"
 SKIP_NO_CAPTURE = "no-exp-capture-entry"
+SKIP_NO_ENCODING = "no-encoding-capture-entry"
+
+#: . Reported by a capture lane whose SLOT READ FAILED. Deliberately not
+#: a `SKIP_*`: a skip means "there was nothing to encode" and permits the marker,
+#: while this means "we could not see whether there was anything" and forbids it.
+SLOT_UNREADABLE = "capture-slot-read-failed"
+
+#: The lanes whose input is a worker capture slot, i.e. the only lanes whose
+#: failure can lose something a retry cannot reconstruct. The other three write
+#: from the goal record, which survives on disk.
+CAPTURE_LANES = ("experience", "encoding")
 
 REFUSE_NOT_REDUCER = "not-reducer-body"
 
@@ -389,12 +426,15 @@ def render_trace(item, entries, agent, now_iso) -> str:
 # ───────────────────────────── store access ──────────────────────────────
 
 def _run(argv, timeout=90, stdin=None):
-    # `stdin` exists for the experience lane alone: `experience-archive-goal.sh`
-    # takes its extra record fields (verbatim_anchors, type) as optional stdin
-    # JSON, there being no CLI flag for them. Passing None keeps every other
-    # caller byte-identical — subprocess.run's default — and passing a string
-    # gives the wrapper a pipe that reaches EOF immediately, which matters
-    # because that wrapper bounds a non-EOF stdin with a 10s timeout (guard-664).
+    # `stdin` carries a JSON record body for the two lanes whose callee takes one
+    # that way: the experience lane (`experience-archive-goal.sh` reads its extra
+    # record fields — verbatim_anchors, type — as optional stdin JSON, there being
+    # no CLI flag for them) and the encoding lane (`wm-append.sh <slot>` takes the
+    # item to append as its stdin body). Passing None keeps every other caller
+    # byte-identical — subprocess.run's default — and passing a string gives the
+    # callee a pipe that reaches EOF immediately, which matters because
+    # experience-archive-goal.sh bounds a non-EOF stdin with a 10s timeout
+    # (guard-664).
     try:
         p = subprocess.run(argv, capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=timeout,
@@ -457,14 +497,125 @@ def load_exp_captures(root: Path) -> dict:
     Read through `wm-read.sh`, never off disk: the slot is daemon-owned, and the
     path itself is role-dependent (`BODY_WM_PATH` redirects a forked Body's WM),
     so resolving it here would be a second copy of a rule that already has one.
-    An unreadable slot yields {} — which SKIPS the lane for every goal rather
-    than failing it, and so cannot stamp a marker on unencoded work.
+    An unreadable slot yields the `UNREADABLE` sentinel (g-306-348), NOT {}. The
+    lane then reports BLIND rather than SKIP and the marker is withheld, so the
+    goal stays eligible for a later retrospective instead of being recorded as
+    done. This docstring previously claimed the {} return "cannot stamp a marker
+    on unencoded work"; that was false and is corrected here — see
+    `load_enc_captures` for the measurement.
+    """
+    return _load_capture_slot(root, EXP_SLOT)
+
+
+def load_enc_captures(root: Path) -> dict:
+    """Read the merged `encoding_capture` slot -> {goal_id: [entries]}.
+
+    Same contract as `load_exp_captures` — an unreadable slot yields the
+    `UNREADABLE` sentinel, so the lane reports BLIND and the marker is withheld,
+    while the DRIVER still completes (the loop is never blocked on a store fault).
+
+    FIXED 2026-08-22 (g-306-348). The hazard this docstring used to describe, kept
+    because the reasoning is what makes the fix legible: an unreadable slot
+    returned {} — byte-identical to a genuinely empty slot — so the lane reported
+    SKIP, and a SKIP does NOT withhold the marker. `wrote` counts the lanes that
+    LANDED, so the other lanes succeeding was enough to fire `_write_marker`, and
+    a marked goal is never retrospected again. A transient store fault therefore
+    orphaned that goal's captures PERMANENTLY. Verified 2026-08-21: with the
+    loader returning {} and the other lanes stubbed to succeed, `wrote=4` and the
+    marker fired.
+
+    Note the correction recorded on g-306-348: `_lane_encoding` returning rc=-1 on
+    an all-malformed batch never protected against this from the inside either,
+    because `wrote` is summed across ALL lanes and the three mechanizable ones run
+    first. There was one defect, at the marker decision — not a good lane plus a
+    leaky loader. The fix is therefore at the marker decision (`retrospect`), with
+    the sentinel only supplying the information it needs.
+    """
+    return _load_capture_slot(root, ENC_SLOT)
+
+
+class _UnreadableSlot:
+    """Sentinel: the capture slot's READ FAILED — distinct from "slot is empty".
+
+    Deliberately NOT a dict and deliberately truthy. Both choices are defensive:
+    a caller that forgets to check for this sentinel and does `(captures or {})`
+    would silently degrade it to "empty" — which is the exact bug this type
+    exists to remove — so it must not be falsy and must not quack like a mapping.
+    The only sanctioned consumer is `_capture_lane_input` below.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostic only
+        return "<capture-slot-unreadable>"
+
+
+#: Returned by `_load_capture_slot` when the slot could not be READ.
+UNREADABLE = _UnreadableSlot()
+
+
+def _load_capture_slot(root: Path, slot: str):
+    """Shared body for the two capture loaders above (two live call sites).
+
+    Read through `wm-read.sh`, never off disk: the slot is daemon-owned, and the
+    path itself is role-dependent (`BODY_WM_PATH` redirects a forked Body's WM),
+    so resolving it here would be a second copy of a rule that already has one.
+
+    Returns `{goal_id: [entries]}` on a successful read — possibly EMPTY, which
+    means "the slot really holds nothing" — or the `UNREADABLE` sentinel when the
+    read itself failed. Those two were the same value ({}) until g-306-348, and
+    collapsing them is what let a transient store fault stamp the marker on
+    unencoded work and orphan a Body's captures permanently.
     """
     rc, stdout, _err = _run(bash_cmd(
-        str(root / "core" / "scripts" / "wm-read.sh"), EXP_SLOT, "--json"))
+        str(root / "core" / "scripts" / "wm-read.sh"), slot, "--json"))
     if rc != 0:
-        return {}
+        return UNREADABLE
     return index_captures(_decode_first(stdout, "["))
+
+
+def _capture_lane_input(captures, goal_id):
+    """-> (entries, unreadable). The ONE place the UNREADABLE sentinel is decoded.
+
+    Three inputs, three meanings, and the middle one is the whole point:
+      * `None`       -> the caller supplied no captures at all (the default that
+                        keeps every pre-existing caller working)  -> SKIP
+      * `UNREADABLE` -> the slot read FAILED; we do not know what was in it -> the
+                        lane is BLIND, which must withhold the marker
+      * a dict       -> a real read; an absent goal_id genuinely means "nothing
+                        was captured for this goal"                 -> SKIP
+    """
+    if captures is UNREADABLE:
+        return [], True
+    return ((captures or {}).get(goal_id) or []), False
+
+
+def _slot_goal_ids(captures) -> list:
+    """Goal ids a capture slot covers, for the run summary. UNREADABLE -> [].
+
+    The empty list is NOT the whole story and must never be reported alone — an
+    unreadable slot and an empty one both render as [] here, which is precisely
+    the conflation g-306-348 removed from the lane logic. Callers pair this with
+    `summary["unreadable_capture_slots"]`, which names the slots that were blind.
+    """
+    if captures is UNREADABLE:
+        return []
+    return sorted(captures or {})
+
+
+def _unreadable_slots(captures, enc_captures) -> list:
+    """Names of the capture slots whose READ failed this run, for the summary.
+
+    Empty is the healthy case. A non-empty list means the run was partly BLIND,
+    and every goal in it had its marker withheld — so the run is a RETRY
+    CANDIDATE rather than a completed pass, however clean the counts look.
+    """
+    blind = []
+    if captures is UNREADABLE:
+        blind.append(EXP_SLOT)
+    if enc_captures is UNREADABLE:
+        blind.append(ENC_SLOT)
+    return blind
 
 
 # ─────────────────────────────── the lanes ───────────────────────────────
@@ -567,6 +718,123 @@ def _lane_experience(item, agent, now_iso, root, entries):
                 pass
 
 
+def enc_observation(entry) -> str:
+    """Render one `encoding_capture` entry as an encoding_queue observation.
+
+    Read DEFENSIVELY: capture slots carry no enforced schema (guard-4044), and
+    the sibling spark bridge broke on exactly this by assuming a field was
+    present. Every field below is optional except the fact itself; an entry with
+    no usable fact yields "" and is dropped by the caller rather than queued as
+    an empty node request.
+
+    `evidence` is carried verbatim and is the field that earns this lane its
+    keep: the reducer writes the node later and cannot re-measure what it never
+    observed, so a queued fact with no traceable measurement is precisely the
+    drift these captures exist to prevent.
+    """
+    if not isinstance(entry, dict):
+        return ""
+    fact = str(entry.get("fact") or "").strip()
+    if not fact:
+        return ""
+    parts = [fact]
+    evidence = str(entry.get("evidence") or "").strip()
+    if evidence:
+        parts.append(f"Evidence: {evidence}")
+    supersedes = str(entry.get("supersedes") or "").strip()
+    if supersedes and supersedes.lower() != "null":
+        # Surfaced FIRST-CLASS, not buried: a fact that CORRECTS an encoded
+        # belief is the highest-value thing a worker hands up, and it is exactly
+        # what a free-text spark buries.
+        parts.append(f"SUPERSEDES: {supersedes}")
+    return " | ".join(parts)
+
+
+def _lane_encoding(item, agent, now_iso, root, entries):
+    """Hand worker-captured world-facts to `encoding_queue` for consolidation.
+
+    Called ONLY when `entries` is non-empty — the applicability test lives in
+    `retrospect`, so "no capture" is a SKIP rather than a lane failure and this
+    function keeps the plain `(rc, stdout, stderr)` shape every other lane has.
+
+    This lane does NOT write tree nodes. `suggested_node` rides along as
+    `target_article` but is explicitly NON-binding; consolidation decides
+    placement. See the ENC_* constants block for why.
+
+    The WM write goes through `bash_cmd(wm-append.sh)` like every other
+    subprocess in this file, NOT through `wm.py` directly. Two reasons, and the
+    first one is the load-bearing one: `wm-append.sh` is DAEMON-ONLY since the
+    2026-05-29 cutover, and `wm_write.py::append_slot` — not `wm.py::cmd_append`
+    — is the live write path (guard-742). Under `own-cloud` with a daemon
+    serving the fleet, a direct CLI append writes through a different backend
+    resolution than every other writer on the box, which is the split-brain
+    class `.claude/rules/no-python-cli-fallback.md` exists to prevent. Second,
+    `bash_cmd` is what makes a bash wrapper safe to call from a Python
+    subprocess at all (guard-580/581: resolved BASH, `as_posix()` script path),
+    so the Windows-path hazard that might argue for the direct call is already
+    handled here.
+    """
+    # Intra-batch dedup on the OBSERVATION text — the thing that would become a
+    # node — so one fact captured twice cannot become two nodes. This is the
+    # only one of the three duplication paths that was open:
+    #   1. same goal retrospected twice  -> closed by the marker (a marked goal
+    #      is never re-planned; `decide` skips it).
+    #   2. duplicate entries in the SLOT -> closed upstream: `encoding_capture`
+    #      is in wm.ARRAY_SLOTS, which is what body-merge's `_dedup_append`
+    #      keys off, so identical captures collapse at generalize-down.
+    #   3. duplicate facts in ONE batch  -> open until here. `encoding_queue` is
+    #      deliberately NOT in ARRAY_SLOTS (verified), so nothing downstream
+    #      would have collapsed them.
+    # Keyed on observation ONLY, not on the whole payload: `suggested_node` is a
+    # non-binding hint, so two captures of the same fact differing only in their
+    # hint are still ONE node and must not both queue.
+    queued = 0
+    seen_observations = set()
+    for entry in entries:
+        observation = enc_observation(entry)
+        if not observation:
+            continue
+        if observation in seen_observations:
+            continue
+        seen_observations.add(observation)
+        suggested = entry.get("suggested_node") if isinstance(entry, dict) else None
+        if isinstance(suggested, str) and suggested.strip().lower() in ("", "null"):
+            suggested = None
+        payload = json.dumps({
+            "source_goal": item["goal_id"],
+            "observation": observation,
+            "target_article": suggested,
+            "replay_priority": ENC_REPLAY_PRIORITY,
+            "captured_by": agent,
+            "captured_at": now_iso,
+        })
+        rc, _out, err = _run(
+            bash_cmd(str(root / "core" / "scripts" / "wm-append.sh"),
+                     ENC_QUEUE_SLOT),
+            stdin=payload)
+        if rc != 0:
+            # RECORD WHAT LANDED (). The batch is appended one entry at
+            # a time, so a failure here leaves `queued` entries in the slot and
+            # the rest nowhere. Naming the count in the error is what makes the
+            # partial state legible in the lane result — `retrospect` withholds
+            # the marker on this, and whoever reads the retry needs to know that
+            # the first `queued` will arrive a SECOND time (encoding_queue is not
+            # in wm.ARRAY_SLOTS, so nothing collapses them across invocations).
+            detail = (err or "").strip() or "encoding_queue append failed"
+            return rc, "", (
+                f"{detail} — after {queued} of {len(entries)} entr"
+                f"{'y' if len(entries) == 1 else 'ies'} queued; a retry re-queues "
+                f"those {queued}")
+        queued += 1
+    if queued == 0:
+        # Entries existed but none carried a usable fact. That is a lane that
+        # ran and found nothing to queue, NOT a success — reporting rc=0 here
+        # would let an all-malformed batch count toward `wrote` and stamp the
+        # marker, suppressing the retry forever on work that was never encoded.
+        return -1, "", "no encoding_capture entry carried a usable `fact`"
+    return 0, f"queued {queued}", ""
+
+
 def _write_marker(item, agent, now_iso, root):
     marker = f"{now_iso}|{agent}|{MARKER_SOURCE}"
     return _run(bash_cmd(str(root / "core" / "scripts" / "aspirations-update-goal.sh"),
@@ -574,7 +842,8 @@ def _write_marker(item, agent, now_iso, root):
                          MARKER_FIELD, marker))
 
 
-def retrospect(item, agent, now_iso, root, captures=None) -> dict:
+def retrospect(item, agent, now_iso, root, captures=None,
+               enc_captures=None) -> dict:
     """Run the mechanizable lanes for one goal, then mark it.
 
     The marker is written only when at least one lane landed: marking a goal
@@ -599,8 +868,11 @@ def retrospect(item, agent, now_iso, root, captures=None) -> dict:
     # can be — see the module docstring. A skip reports ok=False so it never
     # inflates `wrote`, and carries `skipped` so a reader can tell "there was
     # nothing to encode" from "encoding failed".
-    entries = (captures or {}).get(item["goal_id"]) or []
-    if entries:
+    entries, exp_blind = _capture_lane_input(captures, item["goal_id"])
+    if exp_blind:
+        lanes["experience"] = {"rc": None, "ok": False, "entries": 0,
+                               "unreadable": True, "err": SLOT_UNREADABLE}
+    elif entries:
         rc, _out, err = _lane_experience(item, agent, now_iso, root, entries)
         lanes["experience"] = {"rc": rc, "ok": rc == 0, "entries": len(entries),
                                "err": (err or "").strip()[-200:] if rc != 0 else ""}
@@ -608,13 +880,60 @@ def retrospect(item, agent, now_iso, root, captures=None) -> dict:
         lanes["experience"] = {"rc": None, "ok": False, "entries": 0,
                                "skipped": SKIP_NO_CAPTURE, "err": ""}
 
+    # Encoding lane (). Same optional-input contract as the experience
+    # lane above, and the same reason a skip must report ok=False: it must never
+    # inflate `wrote`, because `wrote > 0` is what stamps the marker that
+    # suppresses the retry forever.
+    enc_entries, enc_blind = _capture_lane_input(enc_captures, item["goal_id"])
+    if enc_blind:
+        lanes["encoding"] = {"rc": None, "ok": False, "entries": 0,
+                             "unreadable": True, "err": SLOT_UNREADABLE}
+    elif enc_entries:
+        rc, _out, err = _lane_encoding(item, agent, now_iso, root, enc_entries)
+        lanes["encoding"] = {"rc": rc, "ok": rc == 0, "entries": len(enc_entries),
+                             "err": (err or "").strip()[-200:] if rc != 0 else ""}
+    else:
+        lanes["encoding"] = {"rc": None, "ok": False, "entries": 0,
+                             "skipped": SKIP_NO_ENCODING, "err": ""}
+
     wrote = sum(1 for v in lanes.values() if v["ok"])
     rc, _out, err = _lane_impk(item, agent, now_iso, root, wrote)
     lanes["impk"] = {"rc": rc, "ok": rc == 0, "artifacts_count": wrote,
                      "err": (err or "").strip()[-200:] if rc != 0 else ""}
+
+    # THE MARKER DECISION (). `wrote > 0` alone is not sufficient, and
+    # that was the whole defect: the marker suppresses the retry FOREVER, so it
+    # may only be stamped when nothing was lost or left unseen.
+    #
+    # Two ways a CAPTURE lane leaves work unrecorded, and neither shows up in
+    # `wrote` because `wrote` counts what LANDED, never what was missed:
+    #   * BLIND  — the slot read failed, so we cannot know what was in it. This
+    #     is guard-4093's shape exactly: an aggregate with any blind lane is
+    #     UNREACHABLE, not empty, and only an all-lanes-were-read result licenses
+    #     the negative conclusion "there was nothing to encode".
+    #   * LOSSY  — the lane HAD entries and failed. `_lane_encoding` appends one
+    #     entry at a time and returns on the first failure, so a 5-entry batch
+    #     failing at 3 leaves 1-2 queued and 3-5 nowhere.
+    # Only the two capture lanes are consulted. team_state / journal / findings
+    # write from the GOAL RECORD, which is still on disk for a later retry, so a
+    # failure there loses nothing and must not withhold the marker indefinitely.
+    #
+    # WITHHOLDING COSTS DUPLICATES, AND THAT TRADE IS DELIBERATE. A retry re-runs
+    # the whole batch, and `encoding_queue` is NOT in wm.ARRAY_SLOTS (verified
+    # 2026-08-22: it sits in TOP_LEVEL_KEYS instead), so `_dedup_append` will not
+    # collapse a re-queued entry and `seen_observations` is per-call. So a partial
+    # failure that retries duplicates whatever already landed. That is the correct
+    # direction: a duplicate queue entry is visible and removable, an orphaned
+    # capture is neither. True idempotence needs a stable payload plus
+    # `encoding_queue` in ARRAY_SLOTS, which drags in that slot's cap and eviction
+    # semantics (guard-2552) — a separate change, not this one.
+    blind_lanes = sorted(n for n, v in lanes.items() if v.get("unreadable"))
+    lossy_lanes = sorted(n for n in CAPTURE_LANES
+                         if not lanes[n]["ok"] and lanes[n].get("entries"))
+    withheld = blind_lanes + lossy_lanes
     marked = False
     marker_err = ""
-    if wrote > 0:
+    if wrote > 0 and not withheld:
         rc, _out, err = _write_marker(item, agent, now_iso, root)
         marked = rc == 0
         marker_err = (err or "").strip()[-200:] if rc != 0 else ""
@@ -624,6 +943,7 @@ def retrospect(item, agent, now_iso, root, captures=None) -> dict:
         "lanes_written": wrote,
         "marked": marked,
         "marker_error": marker_err,
+        "marker_withheld_for": withheld,
         "pending_judgment_lanes": list(REPORT_LANES),
     }
 
@@ -746,18 +1066,37 @@ def main(argv=None) -> int:
         # daemon round-trip and `merged_goal_ids` routinely carries several
         # goals from the same Body.
         captures = load_exp_captures(root)
-        summary["exp_capture_goals"] = sorted(captures)
+        enc_captures = load_enc_captures(root)
+        summary["exp_capture_goals"] = _slot_goal_ids(captures)
+        summary["encoding_capture_goals"] = _slot_goal_ids(enc_captures)
+        summary["unreadable_capture_slots"] = _unreadable_slots(captures,
+                                                                enc_captures)
         for item in plan:
             summary["applied"].append(
-                retrospect(item, args.agent, now_iso, root, captures))
+                retrospect(item, args.agent, now_iso, root, captures,
+                           enc_captures))
     else:
         summary["would_apply"] = [p["goal_id"] for p in plan]
         # Dry-run must be able to answer "will the experience lane fire?" — the
-        # whole point of the plan is to be inspectable before it writes.
+        # whole point of the plan is to be inspectable before it writes. Same
+        # for the encoding lane: a dry run that cannot show it firing would make
+        # the lane's activation unverifiable before it writes to the queue.
         captures = load_exp_captures(root)
-        summary["exp_capture_goals"] = sorted(captures)
-        summary["would_encode_experience"] = [p["goal_id"] for p in plan
-                                              if captures.get(p["goal_id"])]
+        enc_captures = load_enc_captures(root)
+        summary["exp_capture_goals"] = _slot_goal_ids(captures)
+        summary["encoding_capture_goals"] = _slot_goal_ids(enc_captures)
+        summary["unreadable_capture_slots"] = _unreadable_slots(captures,
+                                                                enc_captures)
+        # An unreadable slot answers "will this lane fire?" with "unknown", not
+        # "no" — `_capture_lane_input` is the one decoder, so the dry run reports
+        # the same blindness the apply path would act on rather than a confident
+        # empty list ().
+        summary["would_encode_experience"] = [
+            p["goal_id"] for p in plan
+            if _capture_lane_input(captures, p["goal_id"])[0]]
+        summary["would_encode_encoding"] = [
+            p["goal_id"] for p in plan
+            if _capture_lane_input(enc_captures, p["goal_id"])[0]]
 
     if args.output == "json":
         print(json.dumps(summary))

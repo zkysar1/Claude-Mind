@@ -127,11 +127,18 @@ def main():
     pa_msg = f", {pending_agents_count} agents" if pending_agents_count else ""
     log(f"saved checkpoint #{compact_count}: {eq_count} encoding, {non_null_slots}/{total_slots} slots, {prior_count} prior{pa_msg}")
 
-    # Clear context reads tracker — post-compaction context may not retain file contents
-    context_reads_path = AGENT_DIR / "session" / "context-reads.txt"
-    if context_reads_path.exists():
-        context_reads_path.unlink()
-        log("cleared context-reads tracker")
+    # The context-reads clear MOVED OUT of this file 2026-08-22 ().
+    # It lived here as an inline `unlink()` of AGENT_DIR/session/context-reads.txt
+    # — a hand-rolled second implementation of `context-reads.py clear` that was
+    # pointed at the AGENT-WIDE path only. On a worker Body the tracker is
+    # sessions/<SID>/body-context-reads.txt, so the unlink found nothing and the
+    # manifest survived the compaction asserting in-context for evicted files.
+    # It is now ONE implementation called from TWO places, both session-aware:
+    #   precompact-checkpoint.sh    (pre-hoc, best-effort — this hook's wrapper,
+    #                                which already resolves and exports $SID)
+    #   sessionstart-orchestrator.sh source=compact (post-hoc, the guaranteed one)
+    # Do not re-add a clear here: the wrapper's call covers this hook, and a
+    # THIRD copy is how the first one drifted out of correctness unnoticed.
 
 
 if __name__ == "__main__":

@@ -32,6 +32,18 @@ import time
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+#  watch-set roots that live under the REPO (the WORLD_DIR
+# conventions root joins them at call time inside _source_mtime). Hoisted to a
+# module constant so tests can monkeypatch them away: sweeping the real repo
+# from inside the function made every consumer test time-dependent -- red for
+# exactly 1h after ANY commit touching these roots (measured 2026-08-21,
+# cc-13: a convention refreshed at 08:31 by a fleet merge vs a fixture index
+# aged to 08:12 flipped the REFUSE-case test to would_spawn=True).
+_FRAMEWORK_MD_ROOTS = (
+    SCRIPT_DIR.parent.parent / ".claude" / "rules",
+    SCRIPT_DIR.parent.parent / "core" / "config" / "conventions",
+)
 sys.path.insert(0, str(SCRIPT_DIR))
 
 DEBOUNCE_SECONDS = 6 * 3600  # one spawn attempt per box per 6h window
@@ -101,6 +113,29 @@ def _source_mtime():
             newest = m if newest is None else max(newest, m)
     except OSError:
         pass
+    # : framework docs joined the corpus, so they join the watch-set
+    # in the SAME change — this is the  decision rule applied
+    # prospectively rather than after the fact. _FRAMEWORK_MD_ROOTS + the
+    # WORLD_DIR conventions root here mirror
+    # retrieve._framework_file_sources, which is the SSOT; keep them in step.
+    #
+    # Hardcoded rather than imported ON PURPOSE, and the asymmetry with
+    # embedding-index-build.py (which calls R._build_framework_index directly)
+    # is deliberate: the builder ALREADY imports retrieve, so sharing there is
+    # free, while this module is a per-iteration-close hook that imports only
+    # _paths lazily. Pulling all of retrieve.py in for three directory names
+    # would put a large import on a tick that exists to be cheap. A missed
+    # framework edit costs one stale-index window; the import costs every tick.
+    for root in _FRAMEWORK_MD_ROOTS + (Path(WORLD_DIR) / "conventions",):
+        try:
+            for p in root.rglob("*.md"):
+                try:
+                    m = p.stat().st_mtime
+                except OSError:
+                    continue
+                newest = m if newest is None else max(newest, m)
+        except OSError:
+            continue
     return newest
 
 

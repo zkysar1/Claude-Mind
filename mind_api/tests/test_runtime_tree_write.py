@@ -610,8 +610,60 @@ def _run_cli(world: Path, meta: Path, args: list, stdin_text: str | None):
     return proc
 
 
+_STAMP_SENTINEL = "<AMEND-STAMP>"
+
+
 def _tree_bytes(world: Path) -> bytes:
-    return (world / "knowledge" / "tree" / "_tree.yaml").read_bytes()
+    """Raw _tree.yaml bytes, with per-field amendment stamp VALUES neutralized.
+
+    THIS IS NOT A WEAKENING OF BYTE-COMPAT, and the distinction is the whole
+    reason it is scoped this narrowly. The contract these tests enforce is that
+    the CLI and daemon hand-mirrors emit the SAME BYTES for the same operation. A
+    wall-clock stamp is the one thing they legitimately cannot agree on: the CLI
+    runs as a subprocess and the daemon writes in-process a fraction of a second
+    later, so g-115-5411's `amended_fields` stamp differs whenever the two writes
+    straddle a second boundary. That stamp is SECOND-granular by necessity — a
+    date-granular one would reproduce the very same-day merge tie it exists to
+    break — unlike the deliberately date-granular progression/calibration stamps.
+
+    MEASURED before this normalization existed (cc-07, 2026-08-21):
+    ``test_byte_compat_set_field`` failed 1 run in 15 (~7%), the observed diff
+    being a single seconds digit. That test sets ``summary``, a BASE field, so
+    every future BASE-field byte-compat case inherits the same flake. One green
+    run does not detect this; it took a repeat loop.
+
+    THE KEY SET IS STILL COMPARED, which is the half that catches real drift.
+    Only the VALUE of each stamp is replaced, and the replacement is keyed on the
+    exact ``<field>: <value>`` pair read back from the parsed document — so a
+    writer that stops stamping, or stamps a DIFFERENT set of fields, still
+    produces a different key set and still fails. That is precisely the
+    g-115-2422 shape (the CLI dropped a stamp, the daemon kept it, 19 days).
+    Formatting, ordering, and every other field remain compared byte-for-byte.
+    """
+    raw = (world / "knowledge" / "tree" / "_tree.yaml").read_bytes()
+    if yaml is None:
+        return raw
+    try:
+        doc = yaml.safe_load(raw) or {}
+    except Exception:  # pragma: no cover - a malformed dump must still diff
+        return raw
+    for node in (doc.get("nodes") or {}).values():
+        if not isinstance(node, dict):
+            continue
+        stamps = node.get("amended_fields")
+        if not isinstance(stamps, dict):
+            continue
+        for fld, val in stamps.items():
+            if not isinstance(val, str):
+                continue
+            # Both quoting styles the dumper may choose, plus bare. Scoped to the
+            # field NAME as well as the value so an unrelated field that happens
+            # to carry the same timestamp string is not touched.
+            for form in (f"{fld}: '{val}'", f'{fld}: "{val}"', f"{fld}: {val}"):
+                raw = raw.replace(
+                    form.encode("utf-8"),
+                    f"{fld}: {_STAMP_SENTINEL}".encode("utf-8"))
+    return raw
 
 
 @pytest.mark.skipif(not _HAS_LIBYAML,
@@ -1188,3 +1240,113 @@ def test_byte_compat_record_maintenance_with_run_record(tmp_path):
     for k in ("last_maintain_at", "last_backlog_mode_at",
               "last_stop_mode_at", "last_backlog_clear_at"):
         assert k in maint, f"{k} missing from {maint}"
+
+
+# ---------------------------------------------------------------------------
+#  — value-integrity (silent partial write detection)
+#
+# WHAT THESE PIN, and why the obvious test would be worthless. On 2026-08-19 a
+# `tree-update.sh --set` of a 17,708-byte value returned rc=0, echoed a
+# complete-looking node record, and stored 8,186 bytes cut mid-word, destroying
+# four catalogue entries of a live node. Nothing in the tree write path compared
+# stored bytes against sent bytes, so the loss was invisible by construction.
+#
+# The goal that filed this work states the trap explicitly: "the regression test
+# MUST assert stored LENGTH equals intended length; a test asserting only rc=0
+# passes against the exact failure being prevented." Every assertion below is
+# therefore on the LENGTH ON DISK or on the write NOT HAVING HAPPENED — never on
+# the status code alone, and never on the echoed record (which is rendered from
+# the in-memory dict and would look correct even for a short write).
+#
+# The check compares ACROSS THE WIRE (client-declared vs daemon-received). The
+# in-daemon comparison one reaches for first — len(req["value"]) against
+# len(node[field]) after _apply_set — is vacuous: _apply_set does
+# node[field] = the parsed request value, so it compares a string to itself and
+# passes 100% of the time while looking exactly like protection.
+# ---------------------------------------------------------------------------
+
+def test_set_reports_stored_value_bytes(running_daemon):
+    """The success response carries the stored byte length (guard-1661), and it
+    equals the length actually on disk — not the length we hoped for."""
+    project_root, port = running_daemon
+    world = project_root / "world"
+    value = "x" * 17708          # the exact size the incident truncated FROM
+    status, body = _post(port, "/v1/tree/write", {
+        "op": "set", "key": "alpha-test-node", "field": "summary",
+        "value": value, "value_bytes": len(value.encode("utf-8")),
+    })
+    assert status == 200, body
+    data = json.loads(body)
+    assert data["value_bytes"] == 17708
+    # The assertion that matters: LENGTH ON DISK, not the echoed record.
+    tree = _read_tree(world)
+    stored = tree["nodes"]["alpha-test-node"]["summary"]
+    assert len(stored.encode("utf-8")) == 17708
+    assert stored == value
+
+
+def test_set_refuses_value_that_lost_bytes_in_transit(running_daemon):
+    """A value shorter than the client declared is REFUSED, and nothing is
+    written. This reproduces the incident's shape: the daemon receives 8,186
+    bytes for a value the caller built at 17,708."""
+    project_root, port = running_daemon
+    world = project_root / "world"
+
+    before = _read_tree(world)["nodes"]["alpha-test-node"].get("summary")
+
+    truncated = "y" * 8186       # what arrived
+    status = None
+    try:
+        status, body = _post(port, "/v1/tree/write", {
+            "op": "set", "key": "alpha-test-node", "field": "summary",
+            "value": truncated,
+            "value_bytes": 17708,          # what the caller says it sent
+        })
+    except urllib.error.HTTPError as e:
+        status = e.code
+        body = e.read().decode("utf-8")
+    assert status == 500, f"expected refusal, got {status}: {body}"
+    assert "value_truncated_in_transit" in body
+    assert "9522" in body or "17708" in body, body
+
+    # THE LOAD-BEARING ASSERTION: the write did not happen. guard-3150 — a check
+    # that fires after the bytes are on disk cannot prevent anything, and on an
+    # S3-authoritative store they are already the shared truth for every box.
+    after = _read_tree(world)["nodes"]["alpha-test-node"].get("summary")
+    assert after == before, "refused write must leave the tree untouched"
+    assert after != truncated
+
+
+def test_set_without_declared_bytes_still_writes(running_daemon):
+    """Fail-open for callers that do not declare value_bytes. Every client
+    predates this field; refusing them would take the tree write path down
+    fleet-wide. This is a deliberate coverage gap, pinned so that a later change
+    to fail-closed is a conscious edit and not an accident."""
+    project_root, port = running_daemon
+    world = project_root / "world"
+    value = "z" * 4096
+    status, body = _post(port, "/v1/tree/write", {
+        "op": "set", "key": "alpha-test-node", "field": "summary",
+        "value": value,                      # no value_bytes
+    })
+    assert status == 200, body
+    tree = _read_tree(world)
+    assert len(tree["nodes"]["alpha-test-node"]["summary"].encode("utf-8")) == 4096
+
+
+def test_set_value_bytes_counts_utf8_bytes_not_characters(running_daemon):
+    """Both sides must count UTF-8 BYTES. A multibyte value where
+    len(str) != len(bytes) would false-alarm on every write if either side
+    counted characters."""
+    project_root, port = running_daemon
+    world = project_root / "world"
+    value = "éèê" * 200        # 600 chars, 1200 UTF-8 bytes
+    assert len(value) != len(value.encode("utf-8"))
+    status, body = _post(port, "/v1/tree/write", {
+        "op": "set", "key": "alpha-test-node", "field": "summary",
+        "value": value, "value_bytes": len(value.encode("utf-8")),
+    })
+    assert status == 200, body
+    assert json.loads(body)["value_bytes"] == 1200
+    tree = _read_tree(world)
+    assert tree["nodes"]["alpha-test-node"]["summary"] == value

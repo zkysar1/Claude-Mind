@@ -461,6 +461,69 @@ def _stamp_calibration(node):
     node["calibration_updated_at"] = date.today().isoformat()
 
 
+# --- BASE-class per-field amendment stamp () -----------------------
+# Written as the COMPLEMENT of the named classes on purpose. coordination_merge.
+# _classify_tree_field is a TOTAL function defaulting to BASE, so BASE is
+# "everything not otherwise named" and cannot be enumerated; listing the named
+# classes is the only form that stays correct when a BASE field is added later
+# (it gets a stamp automatically -- the safe direction).
+# _NON_BASE_STAMP_FIELDS MUST match the union of coordination_merge's
+# _TREE_MAX_FIELDS + _TREE_NEWER_FIELDS + _TREE_PROGRESSION_FIELDS +
+# _TREE_CALIBRATION_FIELDS + _TREE_STRUCTURAL_FIELDS (the merge-side SSOT).
+# Drift here is low-consequence in BOTH directions, which is why a complement is
+# safe: an over-inclusive entry only withholds a stamp the merge would not have
+# read, and an under-inclusive one only writes a stamp the merge ignores (it
+# consults amended_fields ONLY for fields whose class is BASE).
+_NON_BASE_STAMP_FIELDS = (
+    "retrieval_count", "times_helpful", "times_noise",
+    "times_inferred_helpful", "sample_size",
+    "last_retrieved", "last_updated", "last_relevant_at",
+    "progression_updated_at", "calibration_updated_at",
+    "confidence", "capability_level", "domain_confidence",
+    "accuracy",
+    "children", "parent", "depth", "child_count", "node_type",
+)
+
+
+def _stamp_amendment(node, field):
+    """Record WHEN this BASE-class field was written, PER FIELD ().
+
+    Without it every BASE field rides the newer-last_updated LWW base, and
+    last_updated is DATE-granular by design (g-001-67; g-115-1683 does not bump
+    it on a field poke) -- so two same-day edits tie and _order_by_ts falls to a
+    LEXICOGRAPHIC content tiebreak whose winner is a stable FIXED POINT. The edit
+    then loses every merge cycle forever, and retrying can never win.
+
+    SECOND-GRANULAR, deliberately UNLIKE _stamp_progression / _stamp_calibration
+    above. Those are date-granular so CLI and daemon writes stay byte-identical
+    for the parity tests; copying that granularity HERE would reproduce the exact
+    tie this stamp exists to break. Second granularity is also already the
+    amended_fields convention on the rb / guardrail / pattern-signature handlers
+    that share this machinery ("2026-07-28T10:00:00"). The parity cost is real
+    and is paid in the test rather than in the data: see
+    mind_api/tests/test_runtime_tree_write.py, which compares the two writers'
+    output with the stamp VALUES normalized and their KEY SETS still compared --
+    so a writer that stops stamping still fails parity (the g-115-2422 shape,
+    where the CLI dropped a stamp and the daemon kept it for 19 days).
+
+    PER FIELD, never a node-level scalar: guard-1153 addition (1). A node-level
+    stamp is the same-mutation timestamp for exactly ONE field and a FOREIGN one
+    for every other BASE field on the node, so it degrades to
+    newer-write-wins-everything and discards concurrent amendments (g-115-3690).
+
+    Keys are sorted on the way out to match _merge_stamp_map's sorted output, so
+    a merged node and a freshly-written one order this nested map identically
+    (g-115-5287: insertion order reaches the emitted bytes).
+    """
+    if field in _NON_BASE_STAMP_FIELDS:
+        return
+    stamps = node.get("amended_fields")
+    if not isinstance(stamps, dict):
+        stamps = {}
+    stamps[field] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    node["amended_fields"] = {k: stamps[k] for k in sorted(stamps)}
+
+
 # ---------------------------------------------------------------------------
 # Helpers: node operations
 # ---------------------------------------------------------------------------
@@ -655,8 +718,10 @@ def warn_if_body_absent(node_key, file_field, context):
                     context, node_key, file_field),
                 file=sys.stderr,
             )
+            return True
     except Exception:
         pass
+    return False
 
 
 def get_all_leaves(tree):
@@ -2361,6 +2426,12 @@ def cmd_set(args):
         # : same for the CALIBRATION stamp (separate key, see above).
         if field in _CALIBRATION_STAMP_FIELDS:
             _stamp_calibration(node)
+        # : BASE-class fields get a PER-FIELD amendment stamp, which is
+        # what makes a BASE edit survive an own-cloud reconcile at all. Without
+        # it the edit rides the date-granular last_updated LWW, ties on any
+        # same-day peer copy, and loses the lexicographic content tiebreak
+        # deterministically forever. No-ops for non-BASE fields.
+        _stamp_amendment(node, field)
         #  (Option B): do NOT auto-bump per-node last_updated on a
         # metadata --set. node .md front matter is the single source of truth
         # (); the _tree.yaml index last_updated is synced to it ONLY by
@@ -2448,6 +2519,26 @@ def cmd_add_child(args):
 
     if "key" not in child_data:
         print("Child JSON must include 'key' field", file=sys.stderr)
+        sys.exit(1)
+
+    # rb-8572 (2026-08-20): a payload carrying body-bearing keys means the
+    # caller believes add-child writes the .md body. It never has — the keys
+    # were silently dropped, producing index-only orphan nodes whose file:
+    # path 404s (two live instances found by the fleet sweep the same day).
+    # Refusing ONLY on these keys cannot break the 8+ legitimate
+    # register-before-author callers (none pass them — grepped 2026-08-21):
+    # the register-then-author flow sends index fields only.
+    _body_keys = [k for k in ("content", "body", "markdown") if k in child_data]
+    if _body_keys:
+        print(
+            "Refusing --add-child: payload carries body-bearing key(s) "
+            + ", ".join(repr(k) for k in _body_keys)
+            + " but add-child registers the INDEX ONLY — the content would be "
+            "silently dropped (rb-8572 orphan-node class). Write the .md body "
+            "first (front matter + content) at the file: path, then register; "
+            "or use the /tree add flow, which does both.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     child_key = child_data["key"]
@@ -2559,8 +2650,11 @@ def cmd_add_child(args):
 
     # : post-lock body-presence advisory. Silent on the canonical
     # body-first /tree add flow; fires when a registration lands with no body.
-    warn_if_body_absent(child_key, (captured["child_node"] or {}).get("file"),
-                        "add-child")
+    # rb-8572: the fired flag also lands in the stdout JSON below — the stderr
+    # line alone was swallowed by every `| tail` / stdout-capture invocation
+    # shape, which is exactly how both live orphans got past it.
+    _body_absent = warn_if_body_absent(
+        child_key, (captured["child_node"] or {}).get("file"), "add-child")
 
     # S9: log the L1 pick for this add-child (fail-open).
     _log_l1_pick_for_key(
@@ -2572,6 +2666,12 @@ def cmd_add_child(args):
 
     out = apply_defaults(captured["child_node"])
     out["key"] = child_key
+    if _body_absent:
+        out["body_absent"] = True
+        out["body_absent_hint"] = (
+            "index registered but no .md exists at file: yet — author it now "
+            "(rb-8572 / g-115-4140)"
+        )
     print(json.dumps(out, indent=2, ensure_ascii=False))
 
 
@@ -2872,6 +2972,7 @@ def cmd_batch(args):
                     _stamp_progression(node)  #  (see cmd_set)
                 if field in _CALIBRATION_STAMP_FIELDS:
                     _stamp_calibration(node)  #  (see cmd_set)
+                _stamp_amendment(node, field)  #  (see cmd_set)
                 #  (Option B): no per-node last_updated auto-bump on
                 # batch --set, same as cmd_set above. node .md fm is the single
                 # source of truth (); the index last_updated is synced

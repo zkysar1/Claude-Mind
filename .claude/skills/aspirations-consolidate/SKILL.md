@@ -95,8 +95,8 @@ The mode is still `autonomous` at invocation time (D4). If Phase -1.4 step order
 -0.9. WORKER-GOAL RETROSPECTIVE (Phase B, g-306-198):
    # A WORKER Body executes goals but never runs the reducer-only close phases,
    # so a goal it completed reaches the shared store with `outcome_note` written
-   # and the reducer lanes — team-state, journal, findings gate, imp@k — simply
-   # ABSENT, with nothing downstream to fill them. This step fills them.
+   # and every reducer lane (the script's `run_lanes`) simply ABSENT, with
+   # nothing downstream to fill them. This step fills them.
    #
    # RUN IT NOW OR NOT AT ALL. `merged_goal_ids` names the completed goals that
    # arrived from a Body, and it is derivable ONLY here: the WM rows carry no
@@ -123,9 +123,10 @@ The mode is still `autonomous` at invocation time (D4). If Phase -1.4 step order
        # On a non-zero exit: log and CONTINUE to triage (fail-open — a
        # retrospective failure must never block consolidation).
    #
-   # THE THREE LANES IT DOES NOT RUN ARE YOURS. The script calls the four lane
-   # writers that accept a goal id (team-state, journal, findings gate, imp@k
-   # via state-update-audit velocity). It reports `pending_judgment_lanes`
+   # THE THREE LANES IT DOES NOT RUN ARE YOURS. The script calls every lane
+   # writer taking a goal id; read `run_lanes` for the list, never a count here
+   # (this one said "four" through two additions). It reports
+   # `pending_judgment_lanes`
    # — verification, execution_feedback, user_notable — and does NOT fill them:
    # their writers exist but consume LLM RATINGS, and a script supplying its own
    # scores would fabricate the measurement the lane records (the same reason
@@ -985,7 +986,7 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
    # every claim the agent holds.
    Bash: MIND_AGENT={agent} aspirations-query.sh --goal-field claimed_by {agent_name} --goal-status pending,in-progress,blocked
    FOR EACH distinct source among the returned rows:
-       Bash: aspirations-read.sh --source <source> --active --json
+       Bash: aspirations-read.sh --source <source> --active
        → sid_map[goal.id] = goal.claimed_by_sid   # for goals with claimed_by == {agent_name}
    FOR EACH returned goal:                      # NOT `WHERE source == "world"`
        held_sid = sid_map.get(goal.goal_id)

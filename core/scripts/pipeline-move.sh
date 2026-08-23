@@ -18,14 +18,32 @@ PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
 # --- Parse args -----------------------------------------------------------
+# Sourced BEFORE _runtime.sh so the refusal cannot be masked by a daemon
+# failure (see _argv_strict.sh header). One file read on the hot path.
+source "$CORE_ROOT/scripts/_argv_strict.sh"
+
 REC_ID=""
 STAGE=""
+# This wrapper takes NO flags — only two positionals. Held in one variable so
+# the help text and the refusal message cannot drift apart (_argv_strict.sh
+# header: never two literals).
+_ACCEPTED_FLAGS="(none — this wrapper takes two positionals and no flags)"
 declare -a PASSTHROUGH=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        -h|--help)
+            argv_strict_help "pipeline-move.sh" "<rec-id> <stage>" "$_ACCEPTED_FLAGS";;
         -*)
-            PASSTHROUGH+=("$1"); shift;;
+            # REFUSE (). This arm used to be
+            # `PASSTHROUGH+=("$1"); shift` — and PASSTHROUGH has NO READER in
+            # this file, a vestige of the Python CLI fallback deleted
+            # 2026-05-14 (.claude/rules/no-python-cli-fallback.md). So an
+            # unrecognised flag was appended to an array nobody reads and
+            # vanished; the flag's VALUE then fell through to the positional
+            # arm below and became rec_id or stage. A pipeline record moved to
+            # the wrong stage, exit 0.
+            argv_strict_refuse_unknown "pipeline-move.sh" "$1" "$_ACCEPTED_FLAGS";;
         *)
             # First positional = rec_id, second = stage
             if [ -z "$REC_ID" ]; then

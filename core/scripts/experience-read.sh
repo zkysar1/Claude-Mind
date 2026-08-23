@@ -30,6 +30,10 @@ LEAST=""
 RECENT=""
 VALIDATE=0
 
+# Shared by the unknown-flag refusal and the five value-position guards below,
+# so the flag list has ONE definition rather than six copies that drift apart.
+_ACCEPTED_FLAGS="--id <id> | --category <cat> | --goal <g> | --hypothesis <h> | --type <t> | --most-retrieved [N] | --least-retrieved [N] | --recent [N] | --summary | --archive | --meta | --validate"
+
 # When --most-retrieved / --least-retrieved / --recent take an OPTIONAL int
 # (CLI nargs='?', const=10), only consume the next arg if it's numeric.
 _take_optional_int() {
@@ -49,15 +53,30 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: experience-read.sh (--id | --category | --goal | --hypothesis | --type | --most-retrieved [N] | --least-retrieved [N] | --recent [N] | --summary | --archive | --meta | --validate)"
             exit 0;;
         --id)
-            REC_ID="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
+            REC_ID="${2-}"
+            argv_strict_refuse_flaglike_value "$(basename "$0")" --id \
+                "$REC_ID" "$_ACCEPTED_FLAGS"
+            shift $(( $# >= 2 ? 2 : 1 ));;
         --category)
-            CATEGORY="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
+            CATEGORY="${2-}"
+            argv_strict_refuse_flaglike_value "$(basename "$0")" --category \
+                "$CATEGORY" "$_ACCEPTED_FLAGS"
+            shift $(( $# >= 2 ? 2 : 1 ));;
         --goal)
-            GOAL="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
+            GOAL="${2-}"
+            argv_strict_refuse_flaglike_value "$(basename "$0")" --goal \
+                "$GOAL" "$_ACCEPTED_FLAGS"
+            shift $(( $# >= 2 ? 2 : 1 ));;
         --hypothesis)
-            HYPOTHESIS="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
+            HYPOTHESIS="${2-}"
+            argv_strict_refuse_flaglike_value "$(basename "$0")" --hypothesis \
+                "$HYPOTHESIS" "$_ACCEPTED_FLAGS"
+            shift $(( $# >= 2 ? 2 : 1 ));;
         --type)
-            TYP="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
+            TYP="${2-}"
+            argv_strict_refuse_flaglike_value "$(basename "$0")" --type \
+                "$TYP" "$_ACCEPTED_FLAGS"
+            shift $(( $# >= 2 ? 2 : 1 ));;
         --most-retrieved)
             if [ $# -gt 1 ] && [[ "$2" =~ ^[0-9]+$ ]]; then
                 MOST="$2"; shift $(( $# >= 2 ? 2 : 1 ))
@@ -88,7 +107,7 @@ while [[ $# -gt 0 ]]; do
             # WRONG population with rc=0 (the rb-245 authoritative-false-count
             # shape). Refuse loudly. Exit 2 per the _argv_strict.sh convention
             # (the daemon path exits 1, so tests need a distinct rc).
-            argv_strict_refuse_unknown "experience-read.sh" "$1" "--id <id> | --category <cat> | --goal <g> | --hypothesis <h> | --type <t> | --most-retrieved [N] | --least-retrieved [N] | --recent [N] | --summary | --archive | --meta | --validate";;
+            argv_strict_refuse_unknown "experience-read.sh" "$1" "$_ACCEPTED_FLAGS";;
     esac
 done
 

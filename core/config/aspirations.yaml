@@ -270,6 +270,31 @@ tree_encoding_drift_threshold: 3
 temp_pressure:
   warn_threshold: 10          # >= this many undrained docs -> visible warn (no goal)
   drain_goal_threshold: 20    # >= this many -> file a HIGH /drain-temp goal
+  drain_goal_max_age_hours: 48  # open drain goal older than this with pressure still
+                                # >= drain threshold -> temp_drain_stalled: the precheck
+                                # SKILL invokes /drain-temp directly instead of trusting
+                                # the scorer to ever pick the goal (/:
+                                # existence-based suppression met a goal ranked #120/151
+                                # for weeks while pressure grew 18x). Escalation-only key:
+                                # missing -> code defaults to 48 (never bricks the check).
+
+# --- HOUSEKEEPING TICK (P1, 2026-08-21) ---
+# Per-box cadence for the MECHANICAL temp-store purge + harness-scratchpad GC
+# (housekeeping-tick.py, invoked from iteration-close productivity-check AND
+# sessionstart-orchestrator; self-gating, detached worker, fail-open). Root
+# cause it fixes: the purge's trigger rode the goal scorer, which ranks
+# janitorial work last by design (: drain goal at rank #120/151 for
+# weeks). Only the trigger moved — temp-drain-purge.sh and its guards are
+# unchanged, and the LLM drain (/drain-temp) stays goal-driven.
+# shadow: true => Lane A runs --dry-run and Lane B reports only. FLIP TO false
+# ONLY after reviewing the per-agent would-delete records in
+# core/logs/housekeeping-<agent>.jsonl — arming is a deliberate operator/user
+# decision, never a default (2026-08-21 plan, user-approved).
+housekeeping_tick:
+  interval_hours: 6
+  shadow: true
+  scratch_session_age_days: 14        # this project's session dirs idle past this -> GC
+  scratch_empty_project_age_days: 30  # recursively-empty project dirs idle past this -> GC
 
 # --- STALE-SENTINEL CANARY () ---
 # Defense-in-depth for Cat C sentinels (bash writer + SKILL-only consumer).
@@ -929,6 +954,51 @@ scar_tissue_check:
   min_age_days: 30              # Protect new entries still accumulating signal
   slate_cap: 25                 # Bounded proposal — a slate nobody can read is
                                 # not a proposal. Truncation is always flagged.
+
+# --- GUARDRAIL/PROTOCOL CONFLICT CADENCE () ---
+# Consumed by aspirations-precheck Phase 0.5g.8 via
+# guardrail-protocol-conflict-check.sh --cadence --post-board. SELF-ACTING (it
+# posts to the board inside the script), so per _cadence_registry.py it is NOT a
+# Phase 0.5e cadence-battery entry — that battery is scoped to cadences whose
+# fire-action is ONE skill invocation. Same shape and same exclusion as
+# scar_tissue_check above and l1_skew_check.
+#
+# WHY IT EXISTS: the detector () shipped with ZERO callers and was
+# hand-run exactly once. Measured 2026-08-21 (echo, cc-03) at wiring time:
+# active_guardrails=4318, actionable=58, novel=58 — against the 1969/12 recorded
+# at that single hand-run. The corpus more than DOUBLED and actionable findings
+# rose 4.8x, entirely unobserved, which is the reclaim-routed-work anti-pattern
+# in its purest form: a built-and-verified instrument with no call site is
+# indistinguishable from one that always returns clean.
+guardrail_conflict_check:
+  goal_cadence: 100             # Matches scar_tissue_check, NOT l1_skew's 50.
+                                # The expensive half is DISPOSAL, not detection:
+                                # one fire surfaced 58 actionable rows, which
+                                # already exceeds what any single pass can
+                                # resolve. A tighter cadence would grow the
+                                # backlog faster than it drains.
+  wm_slot: last_guardrail_conflict_check
+                                # Also carries seen_guardrails — the persisted
+                                # dedup set folded into the detector's existing
+                                # --known seam. WITHOUT it the detector is
+                                # stateless and re-reports its whole backlog on
+                                # every fire (guard-1826: a hit is evidence the
+                                # condition HOLDS, never that it is UNREPORTED),
+                                # which trains readers to skip the instrument.
+                                # Verified: 11 seen ids suppress all 58 rows.
+                                # NOTE this slot is PER-AGENT, so the cadence is
+                                # per-agent (correct — same as its siblings) but
+                                # finding-dedup is NOT shared across agents. If
+                                # board duplication appears once several agents
+                                # run it, move the seen set to a board
+                                # breadcrumb (the shared+durable pattern
+                                #  /  already use).
+  slate_cap: 10                 # Bounded slate; the FULL population is always
+                                # printed beside it (guard-3830 — a batch bound
+                                # is never a scan result). Lower than
+                                # scar_tissue's 25 because each row here needs a
+                                # scope-split judgment (guard-3814), not a
+                                # keep/retire call.
 
 # --- CURRICULUM RE-EVALUATION CADENCE () ---
 # Time-based cadence that re-runs curriculum-evaluate for the CURRENT agent so
@@ -2238,6 +2308,17 @@ git_drift:
   # default ext4; on cc-02 2026-08-14 that is 92% vs 88%.) 80 leaves room to act
   # before writes start failing. Env: GIT_DRIFT_DISK_PCT.
   disk_used_pct_threshold: 80
+  # ...AND fewer than this many GiB actually free. BOTH must hold before disk
+  # counts as a breach. A bare percentage is scale-blind: on 2026-08-22 a
+  # 905 GiB volume sitting at 81% used -- 169 GiB free, completely healthy --
+  # filed five HIGH Investigate goals in one hour across four containers. Every
+  # one was correctly ignored, which is the damage: the probe was training its
+  # readers to ignore it, and it was doing so during an hour when the same box
+  # really was failing (of memory, which nothing was watching). Requiring an
+  # absolute floor too keeps the genuine small-volume case (a 40 GiB root at
+  # 97% is 1.2 GiB free and fires) while dropping the large-volume noise.
+  # Env: GIT_DRIFT_DISK_FREE_GIB.
+  disk_free_floor_gib: 15
   # `git fetch` is the only network I/O in the watchdog tick, and the tick runs
   # every iteration. Fetch at most this often; between fetches the counts come
   # from the last-known remote ref and the payload carries stale_basis=true so a

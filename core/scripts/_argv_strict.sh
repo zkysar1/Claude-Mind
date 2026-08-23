@@ -228,6 +228,38 @@ argv_strict_refuse_flaglike_value() {
     exit 2
 }
 
+# ── THE VALUE-POSITION RESIDUAL: DECIDED ONCE FOR THE SWEEP () ──
+#
+# argv_strict_refuse_flaglike_value above refuses a dash-prefixed VALUE. Whether
+# every adopting wrapper should call it at every value-taking flag was left open
+# per-site, which meant re-deriving it once per wrapper — 22 times as originally
+# scoped. Decided here instead, so an adopter reads one rule.
+#
+# DECISION: refuse a dash-prefixed value at EVERY value-arg site. No numeric
+# carve-out. Measured on the sweep's own value domains, 2026-08-22 (echo, cc-03):
+#
+#   enum   (--source: world|agent)      no legitimate dash value exists.
+#   id     (--id: asp-NNN)              no legitimate dash value exists.
+#   text   (--text/--find: substring)   already settled by the  header
+#                                       above — substring match means dropping the
+#                                       leading dashes never loses a match.
+#   int    (--limit, --top)             THE ONLY ARGUABLE CLASS, and it resolves
+#                                       the same way. `--limit -1` looks like an
+#                                       "unlimited" idiom; it is not one here.
+#                                       aspirations.py:199,206 does
+#                                       `limit = int(q.get("limit","5"))` then
+#                                       `archived[:limit]`, so a negative value
+#                                       is a PYTHON SLICE — `archived[:-1]`
+#                                       silently drops the last record and exits
+#                                       0. Refusing converts a silent wrong
+#                                       answer into a loud one, which is this
+#                                       whole family's purpose.
+#
+# So the numeric class — the one that looked like it needed an exception — is the
+# strongest case FOR the refusal, not against it. Do not add a numeric escape
+# hatch without re-measuring the consumer: the question is never "is a negative
+# number syntactically plausible" but "what does THIS endpoint do with it".
+#
 # argv_strict_help <script-name> <positional-form> <accepted-flags> [<extra-note>]
 #
 # <extra-note> is OPTIONAL and prints last, after the refusal explanation. It

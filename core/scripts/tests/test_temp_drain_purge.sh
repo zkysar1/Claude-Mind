@@ -60,7 +60,7 @@ else
 fi
 # : main() must emit the new lane fields (else a downstream JSON
 # consumer of drained_gc_*/stray_* silently sees nulls).
-for k in '"drained_gc_would_purge"' '"stray_would_purge"' '"drained_age_days"' '"citation_lookup"' '"drained_gc_files"'; do
+for k in '"drained_gc_would_purge"' '"stray_would_purge"' '"drained_age_days"' '"citation_lookup"' '"drained_gc_files"' '"stray_preserved_git"' '"stray_preserved_git_dirs"' '"watermark_source"'; do
   if printf '%s' "$out" | grep -q "$k"; then
     echo "  [PASS] dry-run JSON carries $k"
   else
@@ -119,13 +119,44 @@ else
 fi
 # All 5 lane fields the fresh-eyes finding flagged as omitted from THIS branch MUST
 # be present so both exit paths share ONE schema ().
-for k in '"drained_gc_purged"' '"drained_gc_would_purge"' '"stray_purged"' '"stray_would_purge"' '"drained_age_days"' '"citation_lookup"'; do
+for k in '"drained_gc_purged"' '"drained_gc_would_purge"' '"stray_purged"' '"stray_would_purge"' '"drained_age_days"' '"citation_lookup"' '"stray_preserved_git"' '"stray_preserved_git_dirs"' '"watermark_source"'; do
   if printf '%s' "$nt_out" | grep -q "$k"; then
     echo "  [PASS] no-temp-dir JSON carries $k"
   else
     echo "  [FAIL] no-temp-dir JSON missing $k — out=$nt_out"; fails=$((fails+1))
   fi
 done
+
+echo "main() third-class watermark wiring (file default + flag override — guard-1482):"
+# The predicate-level watermark pins below prove the SSOT function; they cannot
+# prove main() actually RESOLVES the file/flag precedence (guard-1482: an
+# always-passed test argument leaves the code's DEFAULT untested — the default
+# here is reading temp/.drain-watermark, which is what every production caller
+# uses). Same MIND_AGENT_DIR fixture idiom as the lane-2 wiretest above.
+WT="$(cd "$SCRIPT_DIR/../.." && pwd)/agents/${MIND_AGENT:-alpha}/temp/.wmtest-$$"
+mkdir -p "$WT/temp"
+printf 'x\n' > "$WT/temp/wmtest-orphan.jsonl"
+touch -d '200 minutes ago' "$WT/temp/wmtest-orphan.jsonl"
+# (a) no watermark file, no flag → absent; third class exempt (fail-closed)
+wm1="$(MIND_AGENT_DIR="$WT" bash "$HELPER" --dry-run 2>/dev/null)"
+lcheck "wm absent: watermark_source=absent"      yes "$(printf '%s' "$wm1" | grep -q '"watermark_source":"absent"' && echo yes || echo no)"
+lcheck "wm absent: third-class file exempt"      no  "$(printf '%s' "$wm1" | grep -qF 'wmtest-orphan.jsonl' && echo yes || echo no)"
+# (b) THE DEFAULT PATH: watermark FILE present → source=file, third class purgeable
+date +%Y-%m-%dT%H:%M:%S > "$WT/temp/.drain-watermark"
+wm2="$(MIND_AGENT_DIR="$WT" bash "$HELPER" --dry-run 2>/dev/null)"
+lcheck "wm file: watermark_source=file"          yes "$(printf '%s' "$wm2" | grep -q '"watermark_source":"file"' && echo yes || echo no)"
+lcheck "wm file: third-class file purgeable"     yes "$(printf '%s' "$wm2" | grep -qF 'wmtest-orphan.jsonl' && echo yes || echo no)"
+lcheck "wm file: marker NOT reported unmanaged"  no  "$(printf '%s' "$wm2" | grep -qF '".drain-watermark"' && echo yes || echo no)"
+# (c) flag 'none' overrides the file → disabled, exempt again
+wm3="$(MIND_AGENT_DIR="$WT" bash "$HELPER" --dry-run --third-class-watermark none 2>/dev/null)"
+lcheck "wm none: watermark_source=disabled"      yes "$(printf '%s' "$wm3" | grep -q '"watermark_source":"disabled"' && echo yes || echo no)"
+lcheck "wm none: third-class file exempt again"  no  "$(printf '%s' "$wm3" | grep -qF 'wmtest-orphan.jsonl' && echo yes || echo no)"
+# (d) garbage in the marker file → invalid, fail-closed exempt
+echo garbage-not-a-timestamp > "$WT/temp/.drain-watermark"
+wm4="$(MIND_AGENT_DIR="$WT" bash "$HELPER" --dry-run 2>/dev/null)"
+lcheck "wm invalid: watermark_source=invalid"    yes "$(printf '%s' "$wm4" | grep -q '"watermark_source":"invalid"' && echo yes || echo no)"
+lcheck "wm invalid: third-class file exempt"     no  "$(printf '%s' "$wm4" | grep -qF 'wmtest-orphan.jsonl' && echo yes || echo no)"
+rm -rf "$WT"
 
 echo "lane functions (g-115-2948) — drained/ GC + stray-dir cleanup:"
 lcheck() {  # lcheck <desc> <expected> <actual>
@@ -450,6 +481,36 @@ touch -d '200 minutes ago' "$SYNTH2"/*
 # NEGATIVE: under drained/ — maxdepth must still exclude it
 printf 'archived\n' > "$SYNTH2/drained/old.jsonl"; touch -d '200 minutes ago' "$SYNTH2/drained/old.jsonl"
 
+# ENCODE-BEFORE-DELETE watermark (2026-08-21): the third class is additionally
+# gated on a completed-drain watermark. Three states pinned before the original
+# inversion assertions run:
+#   absent → EXEMPT (fail-closed default — what every pre-watermark caller and
+#            every box that has never completed a drain inherits)
+#   stale  → files NEWER than the last drain keep their encode chance
+#   fresh  → files the drain provably saw purge exactly as  specified
+unset PURGE_THIRD_CLASS_WATERMARK 2>/dev/null || true
+PURGE_FIND_PRED=()
+_purge_find_predicate 120 cited-evidence.jsonl
+got2a="$(find "$SYNTH2" "${PURGE_FIND_PRED[@]}" 2>/dev/null | sed 's#.*/##' | sort | tr '\n' ' ')"
+if [ -z "$got2a" ]; then
+  echo "  [PASS] no watermark → third class EXEMPT (encode-before-delete fail-closed default)"
+else
+  echo "  [FAIL] no watermark must exempt the third class, matched: $got2a"; fails=$((fails+1))
+fi
+# stale: last drain completed 300 min ago; fixtures are 200 min old → they
+# postdate that drain (never classified) and must keep their encode chance.
+PURGE_THIRD_CLASS_WATERMARK="$(date -d '300 minutes ago' +%Y-%m-%dT%H:%M:%S)"
+PURGE_FIND_PRED=()
+_purge_find_predicate 120 cited-evidence.jsonl
+got2b="$(find "$SYNTH2" "${PURGE_FIND_PRED[@]}" 2>/dev/null | sed 's#.*/##' | sort | tr '\n' ' ')"
+if [ -z "$got2b" ]; then
+  echo "  [PASS] stale watermark → post-drain files stay exempt"
+else
+  echo "  [FAIL] stale watermark must exempt post-drain files, matched: $got2b"; fails=$((fails+1))
+fi
+# fresh: every fixture predates the watermark — the drain provably saw them —
+# so the original  inversion assertions below apply unchanged.
+PURGE_THIRD_CLASS_WATERMARK="$(date +%Y-%m-%dT%H:%M:%S)"
 PURGE_FIND_PRED=()
 _purge_find_predicate 120 cited-evidence.jsonl
 got2="$(find "$SYNTH2" "${PURGE_FIND_PRED[@]}" 2>/dev/null | sed 's#.*/##' | sort | tr '\n' ' ')"
@@ -485,6 +546,9 @@ echo "cited-pattern breadth guard (g-306-111):"
 # cited paths carry one). But a pattern matching ANY name would exempt every
 # file and silently revert the inversion — the failure that looks like success.
 SYNTH3="$(mktemp -d)"
+# Watermark set fresh: these blocks pin CITATION-SHAPE behavior on an ACTIVE
+# third class (unrelated.jsonl is third-class and appears in expected sets).
+PURGE_THIRD_CLASS_WATERMARK="$(date +%Y-%m-%dT%H:%M:%S)"
 printf 'x\n' > "$SYNTH3/g-335-531-residue.py"
 printf 'x\n' > "$SYNTH3/unrelated.jsonl"
 touch -d '200 minutes ago' "$SYNTH3"/*
@@ -519,6 +583,8 @@ echo "class-wide cited exemption (g-001-84):"
 # a stemless pattern names a whole file CLASS. Both directions are asserted here:
 # rejecting every glob would delete the 7 legitimately-cited families.
 SYNTH4="$(mktemp -d)"
+# Watermark fresh here too (unrelated.jsonl is third-class in every expected set).
+PURGE_THIRD_CLASS_WATERMARK="$(date +%Y-%m-%dT%H:%M:%S)"
 printf 'x\n' > "$SYNTH4/dump.raw"
 printf 'x\n' > "$SYNTH4/mergeback-a.raw"
 printf 'x\n' > "$SYNTH4/unrelated.jsonl"
@@ -555,6 +621,52 @@ else
   echo "  [FAIL] '*.*' honored, lane shielded: got '$g8'"; fails=$((fails+1))
 fi
 rm -rf "$SYNTH4"
+# Don't leak the citation-shape watermark into blocks added below this line.
+unset PURGE_THIRD_CLASS_WATERMARK 2>/dev/null || true
+
+echo "stray git-repo preservation (g-115-3648) — sole-copy git content survives Lane 3:"
+# A stray git repo with a clean worktree looks maximally safe by every signal
+# Lane 3 read before — no dirty files, no RECEIPT — yet can carry commits that
+# exist NOWHERE else. Five shapes, each MEASURED with raw probes before this
+# block was authored (2026-08-21; empty-repo log rc=0/empty, status clean):
+#   unpushed commit (no remote)    → PRESERVED (log --branches --not --remotes)
+#   fully pushed + clean           → PURGED    (no marginal git content)
+#   pushed + dirty TRACKED file    → PRESERVED (--porcelain -uno non-empty)
+#   empty init'd repo (no commits) → PURGED    (scaffold only, nothing to lose)
+#   plain non-repo dir             → PURGED    (pre-existing behavior, control)
+TG3="$(mktemp -d)"
+GITC="-c user.email=t@t -c user.name=t -c commit.gpgsign=false"
+mkdir -p "$TG3/temp" "$TG3/bare"
+git -C "$TG3/bare" init -q --bare 2>/dev/null
+mk_repo() { # <dir> — init + one committed file
+  mkdir -p "$1"; git -C "$1" init -q 2>/dev/null
+  echo x > "$1/f.txt"; git -C "$1" add f.txt 2>/dev/null
+  # shellcheck disable=SC2086
+  git -C "$1" $GITC commit -qm c1 2>/dev/null
+}
+mk_repo "$TG3/temp/repo-unpushed"
+mk_repo "$TG3/temp/repo-pushed"
+git -C "$TG3/temp/repo-pushed" remote add origin "$TG3/bare" 2>/dev/null
+git -C "$TG3/temp/repo-pushed" push -q origin HEAD 2>/dev/null
+mk_repo "$TG3/temp/repo-dirty"
+git -C "$TG3/temp/repo-dirty" remote add origin "$TG3/bare" 2>/dev/null
+git -C "$TG3/temp/repo-dirty" push -q origin HEAD:dirty 2>/dev/null
+echo CHANGED >> "$TG3/temp/repo-dirty/f.txt"
+mkdir -p "$TG3/temp/repo-empty"; git -C "$TG3/temp/repo-empty" init -q 2>/dev/null
+mkdir -p "$TG3/temp/plain"; echo x > "$TG3/temp/plain/junk.txt"
+find "$TG3/temp" -mindepth 1 -exec touch -d '3 hours ago' {} + 2>/dev/null || true
+touch -d '3 hours ago' "$TG3/temp"/* 2>/dev/null
+lcheck "git-guard dry-run counts 3 (pushed+empty+plain)" 3 "$(cleanup_stray_dirs "$TG3/temp" 120 1 2>/dev/null)"
+cleanup_stray_dirs "$TG3/temp" 120 1 >/dev/null 2>&1
+lcheck "git-guard preserved list names repo-unpushed"    yes "$(printf '%s' "$STRAY_PRESERVED_GIT" | grep -qFx 'repo-unpushed' && echo yes || echo no)"
+lcheck "git-guard preserved list names repo-dirty"       yes "$(printf '%s' "$STRAY_PRESERVED_GIT" | grep -qFx 'repo-dirty' && echo yes || echo no)"
+lcheck "git-guard real run purges 3"                     3   "$(cleanup_stray_dirs "$TG3/temp" 120 0 2>/dev/null)"
+lcheck "repo-unpushed SURVIVED (sole-copy commit)"       yes "$([ -d "$TG3/temp/repo-unpushed" ] && echo yes || echo no)"
+lcheck "repo-dirty SURVIVED (dirty tracked file)"        yes "$([ -d "$TG3/temp/repo-dirty" ] && echo yes || echo no)"
+lcheck "repo-pushed purged (fully pushed + clean)"       no  "$([ -d "$TG3/temp/repo-pushed" ] && echo yes || echo no)"
+lcheck "repo-empty purged (no commits, nothing to lose)" no  "$([ -d "$TG3/temp/repo-empty" ] && echo yes || echo no)"
+lcheck "plain dir purged (control)"                      no  "$([ -d "$TG3/temp/plain" ] && echo yes || echo no)"
+rm -rf "$TG3"
 
 echo "cited-set lookup contract (g-306-111):"
 # UNKNOWN must be distinguishable from EMPTY, or a box with an unreadable world

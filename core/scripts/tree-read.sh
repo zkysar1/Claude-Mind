@@ -27,6 +27,17 @@ _RUNTIME_SELF="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
+source "$CORE_ROOT/scripts/_argv_strict.sh"
+
+# ONE literal, shared by the help text and the refusal message — never two
+# copies (see argv_strict_refuse_unknown's header in _argv_strict.sh).
+_ACCEPTED_FLAGS="--node <key> | --path <key> | --ancestors <key> | --children <key> | --leaves | --leaves-under <key> | --child-path <parent> <slug> | --stats | --summary | --maintenance | --by-l1 | --find <text> | --validate | --decompose-candidates | --redistribute-candidates | --distill-candidates | --active-content <key>"
+
+# PASSTHROUGH IS LIVE HERE — do NOT delete it. Unlike the sibling read wrappers
+# in this rollout (pipeline-read.sh:57, aspirations-read.sh), whose PASSTHROUGH
+# arrays had no reader and were removed, this one IS the argv handed to tree.py
+# on the FORCE_FALLBACK branch below. Deleting it would silently strip every
+# argument from --validate / --by-l1 / --*-candidates / --active-content / --find.
 declare -a PASSTHROUGH=()
 declare -a FLAG_KEYS=()
 NODE=""; PATH_KEY=""; ANCESTORS=""; CHILDREN=""; LEAVES_UNDER=""; FIND=""
@@ -65,7 +76,50 @@ while [[ $# -gt 0 ]]; do
         --active-content)
             FORCE_FALLBACK=1
             PASSTHROUGH+=("$1" "${2-}"); shift $(( $# >= 2 ? 2 : 1 ));;
+        -h|--help)
+            # BEFORE the -*) arm: --help is a `-*` token, and refusing it with
+            # exit 2 would be a regression the refusal introduced rather than a
+            # defect it fixed (). Help exits 0.
+            # This REPLACES a genuinely unhelpful answer, measured before the
+            # change: `tree-read.sh --help` was rc=1 "Error: at least one query
+            # parameter is required." — the flag fell to the catch-all, set no
+            # QUERY, and the caller was told nothing about what the flags are.
+            # The `extra` slot carries the two facts the flag list cannot show
+            # and that a caller most needs (both already documented at the top
+            # of this file, where a caller reaching for --help never looks).
+            argv_strict_help "$(basename "$0")" "<at least one query flag>" \
+                "$_ACCEPTED_FLAGS" \
+"  Two routing facts the flag list cannot show:
+  * Most flags are served by the daemon, but --validate, --by-l1, --find,
+    --active-content and the three *-candidates flags force a direct-python
+    path that forwards its arguments to tree.py. Both paths are supported;
+    the second is slower and runs cross-file logic.
+  * --validate checks the LOCAL MIRROR only (os.path.exists), so on a
+    remote-synced backend it is BLIND to index-entry-present/body-absent
+    nodes. The authoritative-store-aware complement is
+    core/scripts/tree-body-presence-audit.py (see rb-4089).";;
+        -*)
+            # REFUSE (). MEASURED on this box before the fix, and the
+            # result is asymmetric across this wrapper's two paths — which is why
+            # the refusal belongs HERE, at the wrapper, rather than being left to
+            # the downstream parser:
+            #   DAEMON path      `--node root --bogus-flag XVAL` was rc=0 and
+            #     BYTE-IDENTICAL to `--node root`. The flag and its value were
+            #     appended to PASSTHROUGH, which that path never reads, so the
+            #     caller got a confident answer to a different question.
+            #   FALLBACK path    `--validate --bogus-flag XVAL` was ALREADY
+            #     rc=2, refused loudly by tree.py's argparse ("unrecognized
+            #     arguments"), precisely because PASSTHROUGH *is* read there.
+            # So half of this wrapper was already correct and the other half was
+            # silent, with nothing at the call site to say which one you were on.
+            # This arm makes both halves refuse, at the SAME rc=2 the fallback
+            # path already returned — so no accepted invocation changes status.
+            argv_strict_refuse_unknown "$(basename "$0")" "$1" "$_ACCEPTED_FLAGS";;
         *)
+            # NON-FLAG tokens still flow to PASSTHROUGH deliberately: on the
+            # FORCE_FALLBACK branch this array is tree.py's argv, and that parser
+            # owns positional arity. Refusing them here would duplicate — and
+            # could contradict — a check that already exists downstream.
             PASSTHROUGH+=("$1"); shift;;
     esac
 done

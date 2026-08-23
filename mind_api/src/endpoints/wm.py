@@ -32,12 +32,19 @@ except ImportError as e:  # pragma: no cover
 from ..yaml_cache import cache
 
 
-# Mirrors wm.py's TOP_LEVEL_KEYS at the time of writing. When wm.py's set
-# grows/shrinks, mirror here. Cross-checked by mind_api/tests/test_runtime_wm.py.
+# Mirrors wm.py's TOP_LEVEL_KEYS -- the THIRD copy of this set (wm.py and
+# wm_write.py hold the other two). When wm.py's set grows/shrinks, mirror here.
+# Pinned by core/scripts/tests/test_wm_reset_cadence.py
+# ::test_top_level_keys_parity_with_read_endpoint. This comment previously named
+# mind_api/tests/test_runtime_wm.py, which does not reference TOP_LEVEL_KEYS at
+# all (measured 2026-08-22, ) -- so the mirror was unpinned while
+# reading as covered. Drift here is SILENT: resolve_slot below falls through to
+# slots:, misses, and returns null, which is the same answer a nonexistent key
+# gets.
 _TOP_LEVEL_KEYS = {
     "encoding_queue", "session_id", "session_start",
     "goals_completed_this_session", "aspiration_touched_last",
-    "last_goal_category",
+    "last_goal_category", "capture_evictions",
 }
 
 

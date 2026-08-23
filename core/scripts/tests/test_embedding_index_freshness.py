@@ -153,6 +153,13 @@ def world(tmp_path, monkeypatch):
     for p in _sources(w):
         p.write_text("x\n", encoding="utf-8")
     monkeypatch.setattr(_paths, "WORLD_DIR", str(w))
+    # The repo-root halves of the watch-set (.claude/rules, core/config/
+    # conventions) sweep the REAL repo, whose file mtimes this test cannot own
+    # -- any commit touching those roots within the index-age window flips the
+    # REFUSE-case test red (measured 2026-08-21). Neutralize them here; the
+    # framework-root behavior is pinned hermetically by
+    # test_framework_doc_newer_than_index_fires_the_tick.
+    monkeypatch.setattr(fresh, "_FRAMEWORK_MD_ROOTS", ())
     return w
 
 
@@ -197,6 +204,7 @@ def test_source_mtime_survives_absent_tree(tmp_path, monkeypatch):
     (w / "guardrails.jsonl").write_text("x\n", encoding="utf-8")
     _age(w / "guardrails.jsonl", 3600)
     monkeypatch.setattr(_paths, "WORLD_DIR", str(w))
+    monkeypatch.setattr(fresh, "_FRAMEWORK_MD_ROOTS", ())
     assert fresh._source_mtime() == rb.stat().st_mtime
 
 
@@ -224,3 +232,22 @@ def test_all_sources_older_than_index_stays_silent(tick_env, world, monkeypatch)
         _age(p, 7200)
     rc, out = run()
     assert rc == 0 and out == []
+
+
+def test_framework_doc_newer_than_index_fires_the_tick(
+        tick_env, world, tmp_path, monkeypatch):
+    """ ALLOW case, hermetic: a rule/convention .md fresher than the
+    index marks it stale -- via a tmp framework root, never the real repo."""
+    idx, run = tick_env
+    _make_index(idx, age_seconds=3600)
+    monkeypatch.setattr(fresh, "_blend_enabled", lambda: True)
+    for p in _sources(world):
+        _age(p, 7200)
+    fw = tmp_path / "rules"
+    fw.mkdir()
+    doc = fw / "some-rule.md"
+    doc.write_text("x\n", encoding="utf-8")
+    monkeypatch.setattr(fresh, "_FRAMEWORK_MD_ROOTS", (fw,))
+    rc, out = run()
+    assert rc == 0
+    assert out and out[0]["would_spawn"] is True

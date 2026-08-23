@@ -359,3 +359,53 @@ def test_summary_counts_author_scoped_resolutions(env, monkeypatch, capsys):
     assert summary["addressing_refused"] == 1
     assert summary["collision_set"] == ["zeta"]
     assert summary["filed"] == 2
+
+
+# ---------------------------------------------------------------------------
+# 8 — vocabulary normalization at payload build (selection-stack review
+#     2026-08-21). resolve_addressing settles WHICH DEPLOYMENT a target
+#     belongs to; it never checks roster MEMBERSHIP — a bare off-roster
+#     sentinel ("any"/"reducer") is non-collision by construction (the
+#     collision set is a subset of the roster), so it resolves local and used
+#     to be copied verbatim into intended_agent. The daemon add path now
+#     REFUSES off-vocab values (gates.intended_agent_vocab), so the payload
+#     builder normalizes off-roster => "either", keeping the original in the
+#     to:<target> tag.
+# ---------------------------------------------------------------------------
+
+
+def test_off_roster_target_normalizes_to_either(env):
+    """'any' is bare and non-collision — addressing resolves it local — but it
+    names nobody in the roster, so the payload must carry 'either' (the
+    read-side equivalent, g-115-3482) with provenance in the tag."""
+    _write(env, "findings", _msg("msg-vocab-1", target="any"))
+    resolved, refused, _ = its.resolve_addressing(its.load_triggers())
+
+    assert refused == []
+    assert resolved[0]["target"] == "any"
+
+    payload = its._build_goal_payload(resolved[0])
+    assert payload["intended_agent"] == "either"
+    assert "to:any" in payload["tags"]
+
+
+def test_on_roster_target_untouched_by_normalization(env):
+    """Byte-for-byte preservation for genuine roster members (clause 2 of the
+    addressing rule) survives the vocabulary normalization."""
+    _write(env, "findings", _msg("msg-vocab-2", target="bravo"))
+    resolved, _, _ = its.resolve_addressing(its.load_triggers())
+
+    payload = its._build_goal_payload(resolved[0])
+    assert payload["intended_agent"] == "bravo"
+
+
+def test_empty_roster_fails_open_to_verbatim(env, monkeypatch):
+    """Unreadable/empty roster: keep the target verbatim (rb-1028) — matching
+    gates.intended_agent_vocab, which skips its check in the same condition,
+    so the verbatim value cannot bounce at the add path either."""
+    monkeypatch.setattr(its, "_local_roster", lambda: set())
+    _write(env, "findings", _msg("msg-vocab-3", target="any"))
+    resolved, _, _ = its.resolve_addressing(its.load_triggers())
+
+    payload = its._build_goal_payload(resolved[0])
+    assert payload["intended_agent"] == "any"

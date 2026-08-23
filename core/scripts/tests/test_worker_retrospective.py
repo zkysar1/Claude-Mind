@@ -183,16 +183,25 @@ def _stub(monkeypatch, rec: _Recorder, store):
     monkeypatch.setattr(wr, "_lane_journal", rec.lane("journal"))
     monkeypatch.setattr(wr, "_lane_findings", rec.lane("findings"))
     monkeypatch.setattr(wr, "_lane_experience", rec.lane("experience"))
+    monkeypatch.setattr(wr, "_lane_encoding", rec.lane("encoding"))
     monkeypatch.setattr(wr, "_lane_impk", rec.lane("impk"))
     monkeypatch.setattr(wr, "_write_marker", rec.marker(store))
 
 
+# The lanes whose INPUT can be absent, so they SKIP rather than run. Derived
+# here once: every assertion below subtracts from RUN_LANES rather than listing
+# lane names, so adding a capture-fed lane updates the expectations by editing
+# this set. ( added `encoding` and broke two assertions that had
+# hardcoded `experience` as the only absent-able lane.)
+CAPTURE_FED = {"experience", "encoding"}
+
+
 def test_retrospect_runs_four_lanes_and_marks(monkeypatch):
-    """No captures reached this reducer, so the experience lane is inapplicable.
+    """No captures reached this reducer, so the capture-fed lanes are inapplicable.
 
     Every OTHER lane derives what it writes from the goal record, so all of them
-    always run; the experience lane alone has an input that can be absent. It is
-    SKIPPED here rather than failed, and a skip must not count as a write.
+    always run; only the CAPTURE_FED lanes have an input that can be absent. They
+    are SKIPPED here rather than failed, and a skip must not count as a write.
     """
     store = {"g-306-1": _rec("g-306-1")}
     rec = _Recorder()
@@ -200,16 +209,22 @@ def test_retrospect_runs_four_lanes_and_marks(monkeypatch):
     item = wr.decide(["g-306-1"], store)["plan"][0]
     out = wr.retrospect(item, "zeta", "2026-08-07T00:00:00", Path("/nonexistent"))
     assert sorted(n for n, _ in rec.calls) == sorted(
-        set(wr.RUN_LANES) - {"experience"})
+        set(wr.RUN_LANES) - CAPTURE_FED)
     assert out["lanes"]["experience"]["skipped"] == wr.SKIP_NO_CAPTURE
     assert out["lanes"]["experience"]["ok"] is False
+    assert out["lanes"]["encoding"]["skipped"] == wr.SKIP_NO_ENCODING
+    assert out["lanes"]["encoding"]["ok"] is False
     assert out["lanes_written"] == 3          # impk is not an artifact of itself
     assert out["marked"] is True
     assert out["pending_judgment_lanes"] == list(wr.REPORT_LANES)
 
 
 def test_retrospect_runs_the_experience_lane_when_a_capture_arrived(monkeypatch):
-    """With a capture in hand, all five lanes run and the extra write counts."""
+    """An EXP capture runs the experience lane; the encoding lane still skips.
+
+    The two capture-fed lanes are joined to DIFFERENT slots, so a capture for one
+    must not activate the other — that independence is what this asserts.
+    """
     store = {"g-306-1": _rec("g-306-1")}
     rec = _Recorder()
     _stub(monkeypatch, rec, store)
@@ -217,7 +232,9 @@ def test_retrospect_runs_the_experience_lane_when_a_capture_arrived(monkeypatch)
     captures = {"g-306-1": [{"goal_id": "g-306-1", "execution_summary": "did a thing"}]}
     out = wr.retrospect(item, "zeta", "2026-08-07T00:00:00", Path("/nonexistent"),
                         captures)
-    assert sorted(n for n, _ in rec.calls) == sorted(wr.RUN_LANES)
+    assert sorted(n for n, _ in rec.calls) == sorted(
+        set(wr.RUN_LANES) - {"encoding"})
+    assert out["lanes"]["encoding"]["skipped"] == wr.SKIP_NO_ENCODING
     assert out["lanes"]["experience"]["ok"] is True
     assert out["lanes"]["experience"]["entries"] == 1
     assert out["lanes_written"] == 4

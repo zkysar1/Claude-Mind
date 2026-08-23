@@ -73,6 +73,41 @@ agents/*/aspirations.jsonl merge=ayoai-ledger
 # per-clone by install-git-hooks.sh (git driver config is NOT version-controlled).
 agents/*/journal/**/*.md merge=ayoai-journal-md
 
+# Cross-box merge routing for the core/config READINGS ledgers. These three .md
+# files were extracted OUT of hot-path skills (Aug 2026, hot-path-size-budget
+# work) precisely so multiple agents could append dated blocks — i.e. they were
+# CREATED as multi-writer append ledgers — and none was given merge routing, so
+# `git check-attr merge` returned `unspecified` for all three. Measured
+# 2026-08-21 (foxtrot, LAPTOP-3IOFCNEO WSL2): two consecutive integrate attempts
+# hit a TRUE content conflict (MERGE_HEAD created — not the dirty-tree defer
+# shape) on strategic-scan-readings.md at behind=25, concealing 25 peer commits
+# on the ONE box that runs the Roblox worlds. Retry can never clear a content
+# conflict (g-115-7048, board msg-20260821-005730-foxtrot-6445).
+#
+# THE THREE SPLIT ON THE EVIDENCE GATE — deliberately NOT one blanket remedy.
+# Probe re-run at decision time per the gate above (git log -p | grep -cE '^-[^-]'):
+#   strategic-scan-readings.md   6 commits, 0 deleted content lines -> union OK
+#   felt-sense-readings.md       3 commits, 0 deleted content lines -> union OK
+#   run-full-suite-baselines.md  7 commits, 2 deleted content lines -> union UNSAFE
+# CAVEAT, carried forward deliberately (guard-912): these files are YOUNG (created
+# ~2026-08-17..08-19), so a zero over 3-6 commits is a far weaker signal than the
+# 6185-commit probe that qualified the journal family above. A young zero is not a
+# mature zero — one editorial pass invalidates it. Re-run the probe before widening
+# this block, and demote a file to ayoai-journal-md the moment its deleted-line
+# count leaves zero. The count is also a FLOOR: the documented regex excludes
+# deleted markdown list items.
+core/config/strategic-scan-readings.md merge=union
+core/config/felt-sense-readings.md merge=union
+
+# run-full-suite-baselines.md FAILS that union gate (2 deleted content lines), so
+# it routes like the daily journal above: section-union by '## heading', which
+# still surfaces a REAL conflict when the same heading diverges on both sides, so
+# nothing is silently coalesced. Driver registered per-clone by
+# install-git-hooks.sh (git driver config is NOT version-controlled) — an entry
+# naming an unregistered driver silently falls back to the default text merge
+# (guard-1290), so verify with check-merge-driver-registered.sh on every box.
+core/config/run-full-suite-baselines.md merge=ayoai-journal-md
+
 # Cross-machine merge for the SHARED world/meta stores under .mind-data/ — the
 # local-backend (STORAGE_BACKEND=local) analogue of every rule above.
 #

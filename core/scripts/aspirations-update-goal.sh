@@ -40,7 +40,7 @@ source "$CORE_ROOT/scripts/_argv_strict.sh"
 # fresh-eyes F-002). These were two copies until the review: the helper's own
 # comment asserted they came from one, which was simply false, and two strings
 # that must agree are the drift surface the refusal exists to remove.
-_ACCEPTED_FLAGS="--source --force-defer --override-agent-match --override-uncommitted --cross-lane --override-missing-artifact --override-residual --blocker-ref --force-unstructured-defer --override-blocker-gate --allow-new-field"
+_ACCEPTED_FLAGS="--source --force-defer --override-agent-match --override-uncommitted --cross-lane --override-missing-artifact --override-residual --override-shrink --blocker-ref --force-unstructured-defer --override-blocker-gate --allow-new-field"
 
 # --- Parse args -----------------------------------------------------------
 SOURCE_VAL="world"
@@ -48,6 +48,7 @@ FORCE_DEFER=""
 OVERRIDE_UNCOMMITTED=""
 OVERRIDE_MISSING_ARTIFACT=""
 OVERRIDE_RESIDUAL=""
+OVERRIDE_SHRINK=""
 BLOCKER_REF=""
 FORCE_UNSTRUCTURED_DEFER=""
 OVERRIDE_BLOCKER_GATE=""
@@ -100,6 +101,13 @@ while [[ $# -gt 0 ]]; do
             # : bypass the Layer-B residual-work completion gate
             # (outcome_note names undone work, no live carrier cited).
             OVERRIDE_RESIDUAL="${2-}"
+            PASSTHROUGH+=("$1" "${2-}")
+            shift $(( $# >= 2 ? 2 : 1 ));;
+        --override-shrink)
+            # : bypass the field-shrink guard (a description /
+            # outcome_note write dropping to under 25% of its current length,
+            # when that length exceeds 2000 chars). Deliberate condense only.
+            OVERRIDE_SHRINK="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
         --blocker-ref)
@@ -228,6 +236,7 @@ declare -a HEADER_ARGS=()
 [ -n "${BODY_ROLE:-}" ] && HEADER_ARGS+=(--header "X-Mind-Body-Role: $BODY_ROLE")
 [ -n "$OVERRIDE_MISSING_ARTIFACT" ] && HEADER_ARGS+=(--header "X-Mind-Override-Missing-Artifact: $OVERRIDE_MISSING_ARTIFACT")
 [ -n "$OVERRIDE_RESIDUAL" ] && HEADER_ARGS+=(--header "X-Mind-Override-Residual: $OVERRIDE_RESIDUAL")
+[ -n "$OVERRIDE_SHRINK" ] && HEADER_ARGS+=(--header "X-Mind-Override-Shrink: $OVERRIDE_SHRINK")
 [ -n "$BLOCKER_REF" ] && HEADER_ARGS+=(--header "X-Mind-Blocker-Ref: $BLOCKER_REF")
 [ -n "$FORCE_UNSTRUCTURED_DEFER" ] && HEADER_ARGS+=(--header "X-Mind-Force-Unstructured-Defer: $FORCE_UNSTRUCTURED_DEFER")
 [ -n "$OVERRIDE_BLOCKER_GATE" ] && HEADER_ARGS+=(--header "X-Mind-Override-Blocker-Gate: $OVERRIDE_BLOCKER_GATE")

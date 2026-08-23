@@ -95,7 +95,26 @@ MIN_SUMMARY_CHARS = 20
 ARCHIVE_UNUSED_AFTER_DAYS = 30
 ARCHIVE_LOW_UTILITY_AFTER_DAYS = 90
 PROTECT_MIN_RETRIEVAL_COUNT = 5
+# Retired as a live criterion () — kept for parity with the CLI twin
+# and memory-pipeline.yaml, no longer read by the sweep below. See
+# core/scripts/experience.py for the measurement that retired it.
 PROTECT_MIN_UTILITY_RATIO = 0.5
+
+
+def _retrieved_within(stats: dict, today: date, days: int) -> bool:
+    """True iff retrieval_stats.last_retrieved is within `days` of `today`.
+
+    Verbatim mirror of core/scripts/experience.py::_retrieved_within — the
+    rationale lives there. Unset / unparseable -> False.
+    """
+    last = stats.get("last_retrieved")
+    if not last:
+        return False
+    try:
+        last_date = date.fromisoformat(str(last)[:10])
+    except (ValueError, TypeError):
+        return False
+    return (today - last_date).days <= days
 
 
 # --- Paths ----------------------------------------------------------------
@@ -177,7 +196,15 @@ def _atomic_write_jsonl(path: Path, items: List[Dict[str, Any]]) -> None:
 # ids as exp-{goal_id}-{skill_slug}, so a caller-formed cmd_add record can leave
 # the goal_id FIELD null while the id still names the goal. Underscore-prefixed
 # per the daemon's private-helper convention (cf. _normalize_record).
-GOAL_ID_IN_EXP_ID_RE = re.compile(r"^exp-(g-\d{3}-\d{2,4})-")
+# RE-SYNCED to experience.py 2026-08-21 (). This copy had SILENTLY
+# DIVERGED from the "verbatim" it claims above: it was missing the `xw-` cross-world
+# alternative that experience.py has carried since , and it required a
+# trailing `-` (so a bare `exp-<goal-id>` never derived). Both mattered here and
+# NOT symmetrically — experience-add.sh is DAEMON-ONLY, so THIS narrower copy is
+# the one that actually runs at write time; the core-side copy only fires on
+# core-side touches. Keep the two literally identical; see the experience.py
+# comment for the 220-record measurement and the guard-2353 discriminating row.
+GOAL_ID_IN_EXP_ID_RE = re.compile(r"^exp-(g-(?:\d{3}-\d{2,4}|xw-\d{8}T\d{6}-\d{2}))(?:-|$)")
 
 
 def _derive_goal_id_from_id(rec_id):
@@ -908,16 +935,23 @@ def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
         age_days = (today - created_date).days
         stats = rec.get("retrieval_stats", {})
         retrieval_count = stats.get("retrieval_count", 0)
-        utility_ratio = stats.get("utility_ratio", 0.0)
+        # : both utility_ratio conjuncts replaced by a last_retrieved
+        # recency test. THIS is the copy that executes (daemon-only wrappers),
+        # so the CLI twin in core/scripts/experience.py must never move without
+        # it — an edit to the CLI alone is inert at runtime while reading as a
+        # correct fix in the diff (guard-742/547 class). Rationale, measurements
+        # and the guard-4000 reason for recency-over-count are on the CLI twin;
+        # not duplicated here so the two cannot disagree.
         if (retrieval_count >= PROTECT_MIN_RETRIEVAL_COUNT
-                and utility_ratio >= PROTECT_MIN_UTILITY_RATIO):
+                and _retrieved_within(stats, today, ARCHIVE_UNUSED_AFTER_DAYS)):
             continue
         if age_days >= ARCHIVE_UNUSED_AFTER_DAYS and retrieval_count == 0:
             rec["archived"] = True
             rec["archived_date"] = today.isoformat()
             to_archive.append(rec)
             continue
-        if age_days >= ARCHIVE_LOW_UTILITY_AFTER_DAYS and utility_ratio < 0.2:
+        if (age_days >= ARCHIVE_LOW_UTILITY_AFTER_DAYS
+                and not _retrieved_within(stats, today, ARCHIVE_LOW_UTILITY_AFTER_DAYS)):
             rec["archived"] = True
             rec["archived_date"] = today.isoformat()
             to_archive.append(rec)

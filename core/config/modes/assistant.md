@@ -2,6 +2,35 @@
 
 You are in ASSISTANT mode -- a user-directed learning assistant.
 
+## Session-Start Sync (container freshness)
+
+Immediately after entering assistant mode (the first read of this file in a
+session), run the session-start continuity pull:
+
+    Bash: bash core/scripts/iteration-push.sh --no-push
+
+`--no-push` fetches origin and merges origin-ahead commits in WITHOUT
+publishing anything as a side effect of starting — the flag exists for
+exactly this (g-115-3871). It is the assistant-mode counterpart of the
+autonomous loop's per-iteration sync; without it, an assistant session works
+on a tree as stale as the last session that pushed (measured 2026-08-21: the
+first wired run integrated 205 origin commits this box lacked).
+
+- Host-agnostic and fail-soft: pure `git` against the `origin` remote — no
+  provider-specific tooling — so it works unchanged on any git host or none;
+  offline / missing-remote / auth failures log loudly and the session
+  proceeds on the local tree.
+- NEVER substitute a raw `git pull --rebase`: this repo's history is
+  merge-based (guard-1863). The script merges, never rebases.
+- A dirty-tree merge aborts cleanly and logs; if you need the integration
+  immediately, sweep loop-body store writes as a `chore(store-flush)` commit
+  and re-run. Otherwise proceed — the session-close sync (encode-session
+  Phase Final.5 / graceful-stop D6.65) integrates again after committing.
+- OBSERVER sessions SKIP this step: if `session-state-get.sh` reports
+  RUNNING (an autonomous loop owns this agent), the loop's own
+  iteration-push already keeps the tree current — do not race it
+  (guard-135 / guard-340 observer discipline).
+
 ## Available Skills
 
 All reader capabilities, plus:
@@ -35,6 +64,25 @@ Hybrid and reporting skills (agent-completion-report, backlog-report) write thei
 output files (see each skill's Chaining/Modifies section) in all modes, beyond this table.
 
 All JSONL stores accessed exclusively via scripts -- never read or edit JSONL directly.
+
+## Retrieval-First (per-turn, MANDATORY)
+
+Assistant mode's biggest measured failure is answering from amnesia: 0.48% of
+daemon calls were retrievals (271/56,605, measured 2026-08-21) while the
+stores held the answers. Three mechanisms now enforce the habit — work WITH
+them, not around them:
+
+1. **The [auto-retrieval pre-pass] block** injected above each substantive
+   user message is an INDEX of ranked store matches, not an answer. Expand
+   what is relevant (Read the node file, `retrieve.sh --id`,
+   `guardrails-read.sh --id`) before answering. Its "no store matches" form
+   is a signal too: escalate Tier 2 → 2.5 → 3 if the question needs knowledge.
+2. **Every consequential answer gets a same-turn retrieval** per
+   `.claude/rules/retrieve-before-deciding.md` — the pre-pass covers Tier 1
+   breadth; depth and Tier 2/2.5/3 remain yours.
+3. **The /respond Step 4 escalation applies to every user message** even when
+   the skill-dedup gate refuses re-invocation — the refusal message says
+   exactly this; follow the in-context protocol.
 
 ## Directive Handling
 

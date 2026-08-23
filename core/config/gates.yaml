@@ -463,6 +463,39 @@ gates:
       not by the streak length.
     retirement_eligible: false
 
+  - id: intended-agent-vocab
+    script: core/scripts/gates/intended_agent_vocab.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: "mind_api/src/endpoints/aspirations_write.py", phase: "goal add validation" }
+      - { file: "mind_api/src/endpoints/aspirations_write.py", phase: "aspiration add validation" }
+      - { file: "core/scripts/aspirations.py", phase: "goal write validation" }
+    dominant_risk: FN
+    asymmetry_magnitude: low
+    keyword_bias: strict
+    override_flag: null
+    fp_cost: low
+    fn_cost: low
+    fp_description: "Author replaces the value with 'either' or an active agent name (~30s); fresh installs are exempt via the empty-roster fail-open."
+    fn_description: "An off-vocabulary intended_agent ('any'/'reducer'/a typo) names nobody: the read side treats it as 'either' on a healthy box (g-115-3482) but the conservative unresolvable-roster branch makes the same goal invisible on a box whose roster read fails, and the stored value misleads every census and reader. A typo of a real agent name silently converts a deliberate single-agent routing into a broadcast."
+    rb_evidence: ["g-115-3482"]
+    tuning_notes: >-
+      NEW 2026-08-21 (selection-stack review). Fourth instance of the
+      CLI-only-check orphaning: aspirations.py::validate_goal has checked
+      intended_agent against the live vocabulary since g-282-02 while the
+      daemon _validate_goal subset omitted it. Measured: 5 live goals carried
+      "agent"/"reducer"/"any", all filed by insight-trigger-sweep.py copying
+      the board tag requires_action_by:<x> verbatim (data normalized to
+      'either' the same day; the sweep now normalizes off-roster targets
+      itself before filing, so this gate is the backstop for hand filings).
+      Fail-open on an unresolvable or empty roster (rb-1028) — a fresh
+      install must not refuse its first agent's own name. ADD sites only,
+      never _validate_goal: legacy off-vocab carriers can arrive via merge
+      from another box, and wedging their status changes is worse than the
+      drift.
+    retirement_eligible: false
+
   - id: prose-verification-drift
     script: core/scripts/aspirations.py
     embedded: true
@@ -829,6 +862,25 @@ gates:
 # into the main `gates:` block on 2026-04-25 (, rb-466). Search for
 # `id: origin-signal-gate` and `id: goal-duplication-gate` above for their
 # instrumented asymmetry rows.
+
+  - id: field-shrink-guard
+    script: core/scripts/gates/field_shrink.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: "mind_api/src/endpoints/aspirations_write.py", phase: "update_goal pre-mutation (in-lock, before goal[field] = value)" }
+      - { file: "core/scripts/aspirations.py", phase: "cmd_update_goal pre-mutation (before goal[field] = value)" }
+    dominant_risk: FP
+    asymmetry_magnitude: high
+    keyword_bias: strict
+    override_flag: "--override-shrink"
+    fp_cost: low
+    fn_cost: high
+    fp_description: "A wrong `block` refuses a deliberate condense of a long description/outcome_note. Fully self-service and immediate: the refusal names --override-shrink and the write succeeds on retry. No work is lost and nothing is frozen."
+    fn_description: "A wrong `pass` lets long-lived goal prose be silently destroyed. Measured 2026-08-21 (g-115-105): a 36,904-char description was replaced with 3,467 chars belonging to an UNRELATED goal; the wrapper exited rc=0 and echoed the full record, the daemon wrote cleanly, the changelog logged an ordinary edit, and nothing warned. Recovered only from the .history copy-on-write pre-image (snapshot 2026-08-21T04-22-40 -> blob 3f597ef0). The generating mechanism is documented and recurrent: aspirations-update-goal.sh has no --append and drops unrecognized flags silently while the value REPLACES the field (guard-2525/2444/1691), and RMW against a truncated read does the same (guard-1251)."
+    rb_evidence: []
+    tuning_notes: "Threshold chosen by measuring who NEWLY gets refused, not by fitting the incident (guard-1562). description: 63 update pairs, 45 with old >= 2000 -> exactly ONE refused at 0.50/0.40/0.25 (the incident itself, ratio 0.09); every other description update GREW. outcome_note: 40 pairs, 8 with old >= 2000 -> ZERO refused below 0.50, closest legitimate shrink 0.55 (g-115-2571, 7784->4250). Chose ratio < 0.25 with a 2000-char floor: 2.2x below the closest legitimate shrink, 2.8x above the incident. Expect a noop-dominated log — that is the gate working, not idling. RETIREMENT CRITERION (recorded at birth, guard-769): retire when EITHER the wholesale-replace mechanism is gone (aspirations-update-goal.sh grows a real append mode AND unknown flags become a hard error) OR override/(block+override) > 0.5 over 20+ firings."
+
 pending_audit:
   - audit-schema-gate.py
   - encode-stable-facts-gate.py

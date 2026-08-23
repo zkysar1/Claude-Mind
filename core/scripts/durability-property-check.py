@@ -407,7 +407,7 @@ def _lane_keys():
 def check_held_key_still_listed(args):
     """ENTRY 6 — a key claimed as HELD is still listed at the moment of the claim.
 
-    guard-2077 declines to archive an unconsumed key from a shared lane, on the
+    guard-3380 declines to archive an unconsumed key from a shared lane, on the
     premise that declining keeps it listed. The peer FALSIFIED that premise
     (msg-20260731-080319-omni-6335): a manifest deliberately held for exactly
     this reason was 404 in the lane and present under processed/ by its poll,
@@ -422,7 +422,7 @@ def check_held_key_still_listed(args):
     if keys is None:
         print("FAIL: the inbound lane could not be listed (%s) — no hold claim can be "
               "verified while this is true, so the property is UNMEASURED, not clean. "
-              "A hold reported without a same-moment re-list is unverified (guard-2077)."
+              "A hold reported without a same-moment re-list is unverified (guard-3380)."
               % err)
         return 1
 
@@ -435,14 +435,14 @@ def check_held_key_still_listed(args):
                   "consumer's drain archived them, so the hold did not keep them "
                   "available and any relay depending on the hold is already broken: %s. "
                   "The relay is the only leg that carries content; re-send it "
-                  "(guard-2077 third half)." % (len(missing), len(claimed), missing[:6]))
+                  "(guard-3380 third half)." % (len(missing), len(claimed), missing[:6]))
             return 1
         print("PASS: held-key-still-listed — all %d claimed held key(s) re-listed and "
               "present in a lane of %d live key(s)" % (len(claimed), len(keys)))
         return 0
 
     # SCOPE, stated because the check's name is broader than what it can see.
-    # No hold is durably recorded anywhere: guard-2077's own second half measures
+    # No hold is durably recorded anywhere: guard-3380's own second half measures
     # that a hold is "counted only in a per-run conservation identity that is
     # forgotten at close". So this run audited NO PAST HOLD — it establishes only
     # that the lane IS listable, i.e. that a claim made right now is verifiable.
@@ -451,7 +451,7 @@ def check_held_key_still_listed(args):
     print("PASS: held-key-still-listed [verifiability only — 0 hold claims supplied] "
           "— the inbound lane is listable RIGHT NOW (%d live key(s)), so a hold "
           "claimed at this moment can be re-listed. NO PAST HOLD WAS AUDITED: holds "
-          "are not durably recorded (guard-2077 second half), so pass --held-key K "
+          "are not durably recorded (guard-3380 second half), so pass --held-key K "
           "at claim time to assert the property for a specific key." % len(keys))
     return 0
 

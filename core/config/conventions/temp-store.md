@@ -92,6 +92,22 @@ consumed within the current step, write to `session/scratch/`.
    every recovery-gate auto-recovery. There is no deadline you can plan around,
    which is sharper than a TTL, not softer.
 
+### The harness scratchpad is neither (2026-08-21)
+
+There is a THIRD temp-shaped surface, and it is banned: the Claude Code
+per-session scratchpad at `<system-temp>/claude/<project-slug>/<sid>/`, which
+the platform's system prompt actively tells the model to use. It sits outside
+every governed root, so nothing in this table applies to it — no drain, no
+receipts, no citation protection, no S3 durability, no other agent can even
+see it. Measured on this box the day it was closed: 1,854 dead project dirs
+and 440 aged session dirs of unreachable work product. `.claude/rules/
+no-scratchpad.md` is the behavioral override (the auto-memory precedent);
+settings.json deny rules + the `path-resolution-hook.py` scratchpad branch
+are the Write/Edit chokepoints (the hook fires before agent resolution, so it
+holds even in unbound sessions); `housekeeping-tick.py` Lane B GCs legacy
+strays. Everything that instinct would put there goes to the two columns
+above instead.
+
 ### Do not cite a `session/scratch/` path from a durable record
 
 A goal description, tree node, reasoning-bank entry, or convention that names a
@@ -208,7 +224,7 @@ list that goes stale on the next goal (see § The third class, below):
 | Drainable working docs | `.md`, `.json` (with content) | Yes — analyses, briefings, designs | **Exempt from purge.** Encode to tree/RB/experience, then move to `drained/` |
 | Pure ephemera | `.log`, `.txt`, `.py`, `.sh`, `.err`, `.raw`, `.out`, `.bak` — **common examples, NOT a closed list** (these 8 WERE the whole lane pre-g-306-111; they are now merely the frequent members of the row below) | No — test-suite output, tool dumps, one-off scratch scripts, raw command-output dumps, backup copies | **Purge (delete)** in Phase 1.5, once older than a 120-min age guard |
 | Empty scratch | ANY name **except dotfiles**, 0 bytes (`-empty`) | No — nothing was ever written | **Purge (delete)** in Phase 1.5, once older than the 120-min age guard |
-| **Third class** (the complement) | everything else — `.jsonl`, `.yaml`, `.xml`, `.tsv`, `.gz`, `.eml`, `.sha256`, and any suffix a goal invents | Sometimes | **Purge (delete)** past the same 120-min guard, UNLESS cited by a durable record (§ The third class (a)(1)). Cited-but-unwrapped files survive so they can be promoted into a receipted dir. |
+| **Third class** (the complement) | everything else — `.jsonl`, `.yaml`, `.xml`, `.tsv`, `.gz`, `.eml`, `.sha256`, and any suffix a goal invents | Sometimes | **Purge (delete)** past the same 120-min guard, UNLESS cited by a durable record (§ The third class (a)(1)) — **AND only when a completed drain postdates the file** (the `.drain-watermark` gate, 2026-08-21: no watermark → whole class exempt, fail-closed). Cited-but-unwrapped files survive so they can be promoted into a receipted dir. |
 
 > ⚠ **Anything that is not a content-bearing `.md`/`.json` is purged.**
 > Since g-306-111 the predicate in `core/scripts/temp-drain-purge.sh`
@@ -230,6 +246,27 @@ list that goes stale on the next goal (see § The third class, below):
 > and iteration-commit would commit the deletion, breaking the fresh-clone dir
 > guarantee above (g-115-2947 fresh-eyes catch). This table and the `find_expr`
 > glob in `temp-drain-purge.sh` MUST be updated together.
+
+**The third-class watermark (ENCODE-BEFORE-DELETE, 2026-08-21).** The inversion
+above now runs in two tiers. The 8 enumerated ephemera extensions + 0-byte
+empties purge at bare age, as always — those classes are knowledge-free by the
+drain skill's own definition. The **third class** (every OTHER suffix) is
+additionally gated on `temp/.drain-watermark`: a third-class file purges only
+when a **completed** `/drain-temp` pass postdates it (mtime ≤ watermark), i.e.
+the LLM provably enumerated it, had its chance to classify/encode, and
+declined. No watermark on a box → the whole third class is exempt there
+(fail-closed; the purge surface degrades to exactly the pre-inversion lane).
+The watermark is written by `/drain-temp` Phase 4 at completion — never under
+`--dry-run` or `--file`, since a targeted single-doc drain classifies nothing
+but its target. Callers may override via `--third-class-watermark <ISO|none>`;
+the JSON reports `watermark` + `watermark_source` (`flag|file|absent|invalid|
+disabled|n/a`) so a cadence caller can log which gate state a run executed
+under. This preserves g-306-111's bound (the class can no longer accrue
+unboundedly — every completed drain advances the watermark past everything it
+saw, and `/drain-temp` invokes the purge in the same run) while restoring the
+user-directed invariant that no file with possible knowledge value is ever
+deleted by a machine that cannot read it: deletion is downstream of encoding,
+never a substitute for it.
 
 **Raw command-output dumps** (redirecting `goal-selector.sh`, `retrieve.sh`, a
 `/tree` summary, or any script's stdout to a file for inspection) are IO buffers

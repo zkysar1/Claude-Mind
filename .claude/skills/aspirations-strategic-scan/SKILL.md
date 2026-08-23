@@ -43,17 +43,13 @@ Read recent execution history for each recurring goal. Recurring goals are the a
 that data and looks for signals that demand new work.
 
 ```
-# ⛔ ALREADY OWNED — DO NOT RE-FILE. But the header used to read "KNOWN-INERT",
-# and that is FALSIFIED as of 2026-08-16: **the `achievedCount` gate is LIVE.**
-# Measured (echo, hostname cc-03, uname -r 6.8.0-137-generic), both files side by
-# side in one call: FULL `aspirations-compact.json` 2626 goals, key present on
-# **92**, of which **74** clear `>= 2`; SUMMARY (the path `load-aspirations-compact.sh`
-# actually returns) 220 goals, key present on **36**, of which **34** clear `>= 2`.
-# So S1 selects ~34 sensors per scan today. The prior measurement (zeta, cc-02,
-# 2026-08-12: **0 of 2437**) is kept as a dated waypoint, not deleted — it was a
-# real reading, and 2437 is FULL-file magnitude, so the field was most likely
-# ADDED to the projection between those dates. WHEN and WHY is unmeasured; do not
-# assert a cause.
+# ⛔ ALREADY OWNED — DO NOT RE-FILE. The header used to read "KNOWN-INERT"; that
+# is FALSIFIED as of 2026-08-16 — the `achievedCount` gate is LIVE (echo, cc-03,
+# both files in one call: summary 36 of 220 carry the key and 34 clear `>= 2`, so
+# S1 selects ~34 sensors/scan; the full compact carries 92/74). The prior
+# 0-of-2437 reading (zeta, cc-02, 2026-08-12) was real and is SUPERSEDED; when and
+# why the field appeared is unmeasured — do not assert a cause. A recurrence now
+# announces itself via the zero-guard below rather than printing as health.
 #
 # ⚠ THE GATE GOING LIVE MADE THIS PHASE MORE DANGEROUS, NOT LESS — a silent
 # no-op became a confidently-stale detector, and the second owner below is now
@@ -80,20 +76,18 @@ that data and looks for signals that demand new work.
 # `mine/fleet` census per sensor and name `mine == 0` rows as DROPPED. Owned by
 # g-115-3215 — file nothing.
 #
-# OPEN OWNERS (re-verify status before acting — g-115-3246's premise expired with
-# the header above): **g-115-3246** (in-progress, titled "S1 inert on absent
-# achievedCount"), **g-115-3215** (the cross-agent blindness — now the live one),
-# g-115-5318 (8 of 10 recurring goals have <2 experience records).
+# OPEN OWNERS (re-verify before acting): **g-115-3215** — the cross-agent
+# blindness, now the LIVE one; g-115-5318 (8 of 10 recurring goals have <2
+# experience records). g-115-3246 CLOSED 2026-08-21: its S1 premise expired with
+# the FALSIFIED line above, and it shipped the zero-guard below.
 #
-# This marker exists because S4a twenty lines below carries one and S1 did not:
-# the ritual honestly recomputes this every scan, and with nothing here saying it
-# is known, each pass re-derives it as new. That is the guard-1984 shape — a
-# guardrail cannot outvote the instrument it guards — so the note belongs in the
-# INSTRUMENT, not in another goal (rb-7613). And note the failure mode a
-# suppression marker carries: with no path that re-examines it, the first
-# suppression is the last one forever (tree node `detector-dedup-lease-without-
-# release`). This correction is that release — RE-MEASURE the claim above rather
-# than inheriting it; the two commands are in the paragraph above.
+# This marker exists because the ritual honestly recomputes S1 every scan, so with
+# nothing here saying the finding is known, each pass re-derives it as new — the
+# guard-1984 shape (a guardrail cannot outvote the instrument it guards), so the
+# note belongs in the INSTRUMENT, not in another goal (rb-7613). A suppression
+# marker with no re-examination path makes the first suppression the last one
+# forever (tree node `detector-dedup-lease-without-release`); the FALSIFIED line
+# above is that release — RE-MEASURE, do not inherit.
 #
 # The old `lastAchievedAt is not None` substitute is NO LONGER NEEDED (it was a
 # workaround for the absent field). Run the gate as written. Do NOT file a goal
@@ -101,6 +95,13 @@ that data and looks for signals that demand new work.
 Bash: load-aspirations-compact.sh -> IF path returned: Read it
 recurring_goals = [g for asp in compact for g in asp.goals
                    if g.get("recurring", False) and g.get("achievedCount", 0) >= 2]
+# REGRESSION GUARD (g-115-3246), symmetric with S2's below: the fleet HAS recurring
+# sensors, so a 0 here means the projection lacks `achievedCount`, NOT that the
+# fleet is quiet. A detector whose broken state renders identically to its healthy
+# state is invisible -- that asymmetry is why S2a was caught and S1 was not.
+recurring_total = sum(1 for asp in compact for g in asp.goals if g.get("recurring", False))
+IF len(recurring_goals) == 0:
+    Output: ">> WARN strategic-scan S1: 0 sensors from {recurring_total} recurring goals -- projection likely lacks `achievedCount` (g-115-3246). Check WHICH file load-aspirations-compact.sh returned before trusting 'no recurring-sensor signals': the full compact carries the field, the summary does not."
 
 signals = []
 FOR EACH rg in recurring_goals (cap at 10 most-recently-achieved):
@@ -226,19 +227,19 @@ stale_nodes = [node for node in node_list
 # before believing a zero; guard-1419: a zero with two explanations must be
 # disambiguated). If opened < len(stale_nodes), the path resolution is wrong again —
 # report that, and do NOT report the structural count as a measurement.
-# `backfill` added 2026-08-06 (zeta, hostname cc-02, uname -r 6.8.0-136-generic).
-# The set named only tree-RESHAPING operations, but the class it exists to catch is
-# "a MECHANICAL stamp bumped last_updated without re-verifying content" — and the
-# single largest such event in this tree's history was not a reshape. Measured over
-# all 1355 tree .md files: `backfill` is the CURRENT trigger on **334** of them
-# (24.7%), 334 of those from one event (`source: tree-fm-backfill`,
-# `session: backfill-2026-05-10`) — nearly 7x `decompose` (50) + `distill` (17)
-# combined. Those nodes have not been touched since that backfill, so their
-# `last_updated` is the date the stamp was written, not the date the prose was last
-# verified. Blast radius of the ADDITION is small and correct (guard-1562: enumerate
-# what will NEWLY fire): S2a screens only stale EXPLORE nodes, of which exactly 1 of
-# 7 carried this trigger at the time of the change (`adoption-strategy-patterns`).
-STRUCTURAL_TRIGGERS = {"decompose", "merge", "distill", "re-parent", "reparent", "backfill"}
+# ADDITIONS ARE MEASURED BEFORE THEY LAND (guard-1562/guard-2499: enumerate what
+# NEWLY fires). The class caught is "a MECHANICAL stamp bumped last_updated without
+# re-verifying content" — wider than reshaping, which is why `backfill` joined
+# 2026-08-06: one 2026-05-10 front-matter event (`source: tree-fm-backfill`) is
+# still CURRENT on 326 nodes, ~4x `decompose` (72) + `distill` (15) combined.
+# `node_split` + `node_fold` joined 2026-08-22 (zeta, cc-02, 6.8.0-137-generic,
+# census of 1567 tree .md): a split relocates prose into two nodes, a fold dissolves
+# a pointer to inline detail elsewhere — reshape, no re-verify. Blast radius then:
+# node_split 2 fleet-wide, BOTH inside the stale screen (2/30 -> 4/30); node_fold 18
+# fleet-wide, 0 inside it. `merge` + `re-parent`/`reparent` are CURRENT on 0 — inert,
+# kept so a future one is caught. Readings: core/config/strategic-scan-readings.md
+STRUCTURAL_TRIGGERS = {"decompose", "merge", "distill", "re-parent", "reparent",
+                       "backfill", "node_split", "node_fold"}
 opened = 0
 FOR EACH node in stale_nodes:
     Read the node's own .md front matter at resolve(node.file); opened += 1 on success

@@ -879,6 +879,42 @@ do_verify() {
             >>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
     fi
 
+    # g-115-6932: WORKER-ONLY ALL-SWEEP. The call above is goal-scoped
+    # (`--goal $GOAL_ID` -> `list --goal-id`, EXACT equality) and accumulated
+    # entries carry an EMPTY goal_id, so it matches none of them, ever. The
+    # un-scoped ALL-sweep that does reach them lives in do_productivity_check,
+    # which a worker SKIPS (`worker_execute.py should-run-phase
+    # productivity-check` -> skip). Both call sites were therefore unreachable
+    # from a worker box, so a worker accumulated deploy obligations forever and
+    # the HIGH Unblock this gate exists to file for a genuinely FAILED deploy
+    # was never filed. The gate read healthy because nothing measured it.
+    #
+    # MEASURED on cc-08 2026-08-20, a worker box mid-session: a hand-run sweep
+    # found SIX accumulated entries, every one displaying `goal=?` (the empty
+    # goal_id), including a deploy registered by this same Body ~40 minutes
+    # earlier. Five cleared on that first sweep; one deferred on budget.
+    #
+    # THE COMPLEMENT, stated rather than left implicit (guard-2783): the REDUCER
+    # does NOT need this branch and must not run it — it reaches the identical
+    # all-sweep every iteration via do_productivity_check, and a second call
+    # here would just re-probe the same entries twice per iteration for nothing.
+    # Role-conditional inside this function is the established pattern here (see
+    # the --no-supersede branch below and the terminal NEXT line), not a new one.
+    #
+    # OUTSIDE the completed-gate above ON PURPOSE: obligations accumulate
+    # regardless of how THIS goal closed, so a worker whose units close blocked
+    # or skipped would otherwise still never sweep. Cadence then matches the
+    # reducer's — once per close.
+    #
+    # Safe to call every close: the gate self-bounds (100s loop budget, defers
+    # the remainder to the next close and drops nothing), fast-exits when
+    # nothing is pending, and always exits 0. Same fail-open contract as both
+    # sibling call sites.
+    if [[ "${BODY_ROLE:-}" == "worker" ]]; then
+        bash "$SCRIPT_DIR/pending-deploys-gate.sh" --agent "$AGENT" \
+            >>"$CORE_ROOT/logs/iteration-close-stderr.log" 2>&1 || true
+    fi
+
     # g-284-06 Step 0: Ordered-write intent marker. BEFORE any state mutation
     # of aspirations.jsonl or team-state.yaml, record intent in the
     # iteration-checkpoint.json so a crash mid-verify leaves a recoverable
@@ -999,6 +1035,35 @@ do_verify() {
     # removing it would make this line depend on an entry check ~150 lines away.
     if [[ -n "$OUTCOME" && "$GOAL_STATUS" == "completed" ]]; then
         bash "$SCRIPT_DIR/aspirations-update-goal.sh" --source "$SOURCE" "$GOAL_ID" outcome_class "$OUTCOME"
+    fi
+
+    # g-306-204: stamp WHICH ROLE closed the goal. Sits beside outcome_class
+    # because it shares that stamp's shape exactly (post-status, completed-only,
+    # non-fatal, both recurring and non-recurring paths).
+    #
+    # WHY IT EXISTS: nothing durable and fleet-visible recorded whether a goal
+    # was closed by a worker Body or by the reducer, so no audit could compute a
+    # worker-vs-reducer rate of anything. The one marker the design named --
+    # worker-loop Phase 3.9's `--prefix "[worker-loop] close:"` -- is only ever
+    # used in closure-evidence-write.sh's own echo lines and is NEVER written
+    # into the record; measured 2026-08-22 across the whole world store (18.4 MB,
+    # 2,860 goals, 655 completed, 534 carrying an outcome_note): the marker
+    # appears on ZERO goals, and could not have appeared on any. Body manifests
+    # are box-local (1 visible here) and worker refs are consumed on merge, so
+    # neither is a durable fleet-visible discriminator either.
+    #
+    # ABSENT IS NOT "reducer" -- bash-agent-inject.py exports BODY_ROLE ONLY on
+    # the worker fork path, so the reducer never sets it and an unset value means
+    # reducer-OR-unknown. We therefore write NOTHING rather than inventing
+    # "reducer", mirroring the completed_by_sid stamp's own rule that an absent
+    # value beats a wrong one. Any consumer must treat this as a POSITIVE
+    # identification of worker closes and never as a partition of all closes.
+    #
+    # Non-fatal like the stamps above: status is already committed, so failing
+    # here would strand the close in a state the caller cannot read from the rc.
+    if [[ -n "${BODY_ROLE:-}" && "$GOAL_STATUS" == "completed" ]]; then
+        bash "$SCRIPT_DIR/aspirations-update-goal.sh" --source "$SOURCE" "$GOAL_ID" completed_by_role "$BODY_ROLE" \
+            || echo "[iteration-close] ⚠ completed_by_role stamp failed for $GOAL_ID (non-fatal; field stays absent = unknown)" >&2
     fi
 
     # g-115-5157: land the verify narrative on the GOAL RECORD. Until now
@@ -1617,10 +1682,17 @@ print(json.dumps({
     # above is kept for the placement reasoning, which is still right. Corrected
     # in body-merge.sh (~L41) in the same change.
     #
-    # STILL OPEN — encoding_capture, the LAST orphaned lane of the four, has no
-    # consumer anywhere (0 mentions in aspirations-state-update/SKILL.md, the
-    # file both wm.py and wm_write.py name as its consumer; 132 live entries
-    # unread in the reducer WM). Owner: g-306-201 (HIGH, pending), half-shipped.
+    # CLOSED 2026-08-22 (g-306-327) — encoding_capture HAS a consumer now, and it
+    # landed at the SAME site the exp_capture lane did, not here.
+    # worker_retrospective.py RUN_LANES includes "encoding" (L133); ENC_SLOT =
+    # "encoding_capture" (L164); `_lane_encoding` (L666) dispatched at L788;
+    # `load_enc_captures` (L496) called at L933/L947. All four capture lanes now
+    # have drains, so "do not re-add a drain HERE" is settled for encoding_capture
+    # on the same reasoning it was settled for exp_capture above. Twins corrected
+    # in the same change: wm.py (~L513), wm_write.py (~L113), body-merge.sh (~L57).
+    # ORIGINAL (retained; its census discipline is still right):
+    #   "STILL OPEN — encoding_capture, the LAST orphaned lane of the four, has no
+    #    consumer anywhere ... Owner: g-306-201 (HIGH, pending), half-shipped."
     #
     # ORIGINAL (retained verbatim; its first paragraph is the false one):
     # A drain stood at this site (g-306-199) and was a DUPLICATE: a concurrent
@@ -2541,6 +2613,67 @@ for e in list(d.get('stranded') or []) + list(d.get('stranded_no_pr') or []):
             distinct_count=$(echo "$metric_gate_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('distinct_count', '?'))" 2>/dev/null || echo "?")
             metric_reason=$(echo "$metric_gate_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('reason', ''))" 2>/dev/null || echo "")
             echo "[iteration-close] METRIC-ENCODING: $distinct_count distinct numeric findings detected in $_metric_src ($metric_reason). force_metric_encoding_pending set — precheck Phase 0-pre4 will dispatch next iteration." >&2
+        fi
+    fi
+
+    # Step 8.79a Shipped-claim STORE-CONTENT check (g-115-7299; g-326-585
+    # incident). Third member of the artifact family, and the only one that
+    # reads CONTENT. Its two siblings both pass cleanly on the incident:
+    #   - goal-completion-artifact-gate (at cmd_update_goal status=completed)
+    #     scans title + description, tests Path.exists() on the LOCAL disk, and
+    #     its ARTIFACT_PATH_RE roots exclude world/scripts;
+    #   - the metric gate above scans the same note but only for NUMBERS.
+    # g-326-585 closed `completed` claiming a `--direct` mode and a
+    # probe_direct() had been added to zakpod1-pp-aging-probe.py. The STORE's
+    # world/scripts/zakpod1-pp-aging-probe.py (24,976 B, byte-identical to the
+    # local mirror) contains neither, and its own docstring argues the opposite
+    # design ("Direct-port is unreachable off-pod, full stop"). A downstream
+    # acceptance goal (g-326-586) was filed against a mode that does not exist.
+    #
+    # WHY HERE AND NOT AT CLOSE TIME. The note is frequently absent when the
+    # status flips — measured 2026-08-22: 5 of 21 completed goals sampled
+    # carried a 0-byte outcome_note, and g-326-469's own note records
+    # "Completed by alpha 2026-08-19T23:14:05 with an EMPTY outcome_note",
+    # filled in by a second agent the next day. A close-time note gate is
+    # inert on that population. do_state_update is the later phase that
+    # already re-reads the record's CURRENT note (g-115-5157), so the note is
+    # most likely populated here.
+    #
+    # NOT gated on outcome_class or category (unlike the metric gate): a
+    # shipped claim is just as wrong in a routine close, and the categories
+    # the metric gate excludes are exactly where framework artifacts land.
+    #
+    # REPORT-ONLY. The goal is already closed, so blocking is unavailable;
+    # and paraphrase in closing prose makes a hard refusal the wrong
+    # instrument. The finding goes to stderr (read by the closing agent in
+    # this turn's tool output — the live consumer) and to
+    # world/shipped-claim-mismatches.jsonl (the durable trail).
+    # Fail-open: gate errors never block state-update.
+    local _sc_note
+    _sc_note="${SUMMARY:-}"
+    if [[ -z "$_sc_note" ]]; then
+        _sc_note="$(_probe_goal_outcome_note)"
+    fi
+    if [[ -n "$_sc_note" ]]; then
+        local sc_json sc_fired
+        sc_json=$(printf '%s' "$_sc_note" | \
+            bash "$SCRIPT_DIR/shipped-claim-store-check.sh" --goal "$GOAL_ID" \
+                2>>"$CORE_ROOT/logs/iteration-close-stderr.log" \
+                || true)
+        [[ -z "$sc_json" ]] && sc_json='{"fired":false,"reason":"gate-error"}'
+        sc_fired=$(echo "$sc_json" | python3 -c "import json,sys; print('true' if json.load(sys.stdin).get('fired') else 'false')" 2>/dev/null || echo false)
+        if [[ "$sc_fired" == "true" ]]; then
+            local sc_detail
+            sc_detail=$(echo "$sc_json" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+r=d.get('resolved') or {}
+print('; '.join(
+    '%s (%s, %d B): %s' % (m.get('artifact'), r.get(m.get('artifact')) or 'unresolved',
+                           m.get('content_bytes', 0), ', '.join(m.get('missing') or []))
+    for m in (d.get('mismatches') or [])))
+" 2>/dev/null || echo "")
+            echo "[iteration-close] SHIPPED-CLAIM MISMATCH: $GOAL_ID's outcome_note claims symbol(s) that occur ZERO times in the STORE copy — $sc_detail. The artifact exists; its CONTENT does not carry the claim. Re-read the store copy before trusting this closure or any goal filed downstream of it (g-326-585 class). Logged to world/shipped-claim-mismatches.jsonl." >&2
         fi
     fi
 
@@ -3507,6 +3640,21 @@ do_productivity_check() {
     # run files an Investigate — g-115-4317's verification required exactly that,
     # and retiring the goal moves the obligation rather than dropping it.
     python3 "$(_winpath "$SCRIPT_DIR/cold-snapshot-tick.py")" --tick \
+        2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
+
+    # Housekeeping tick (P1, 2026-08-21) — per-box temp-purge + scratchpad-GC
+    # cadence. Root cause it fixes: the mechanical purge was scheduled through
+    # the goal scorer, which ranks janitorial work last BY DESIGN (g-115-3319:
+    # the open drain goal sat at rank #120/151 for weeks while pressure grew
+    # 18x). Only the TRIGGER moved (cold-snapshot precedent above):
+    # temp-drain-purge.sh + its guards are untouched, and the LLM drain stays
+    # goal-driven. PER-BOX like watchdog/monitor (a temp store lives where its
+    # agent runs), NOT fleet-stamped like cold-snapshot. Ships SHADOW (dry-run
+    # + report-only) until aspirations.yaml housekeeping_tick.shadow is
+    # flipped after fleet review of core/logs/housekeeping-<agent>.jsonl.
+    # Self-gating 6h; spawns its worker DETACHED; fail-open. Second caller is
+    # sessionstart-orchestrator.sh (assistant boxes never reach this phase).
+    python3 "$(_winpath "$SCRIPT_DIR/housekeeping-tick.py")" --tick --source iteration-close \
         2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
 
     # Stale-sentinel canary (g-115-717) — defense-in-depth for Cat C sentinels

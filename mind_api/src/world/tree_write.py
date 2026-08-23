@@ -890,6 +890,39 @@ def _stamp_calibration(node: Dict[str, Any]) -> None:
     node["calibration_updated_at"] = date.today().isoformat()
 
 
+# --- BASE-class per-field amendment stamp (; mirror of tree.py) -----
+# MUST match tree.py._NON_BASE_STAMP_FIELDS / _stamp_amendment byte-for-byte.
+# See tree.py for the full rationale: BASE is the DEFAULT class, so it is written
+# as the COMPLEMENT of the named classes (a field added later gets a stamp
+# automatically), and the stamp is SECOND-granular unlike the two date-granular
+# stamps above -- date granularity here would reproduce the very same-day tie the
+# stamp exists to break.
+_NON_BASE_STAMP_FIELDS = (
+    "retrieval_count", "times_helpful", "times_noise",
+    "times_inferred_helpful", "sample_size",
+    "last_retrieved", "last_updated", "last_relevant_at",
+    "progression_updated_at", "calibration_updated_at",
+    "confidence", "capability_level", "domain_confidence",
+    "accuracy",
+    "children", "parent", "depth", "child_count", "node_type",
+)
+
+
+def _stamp_amendment(node: Dict[str, Any], field: str) -> None:
+    """Record WHEN this BASE-class field was written, PER FIELD ().
+    Mirrors tree.py._stamp_amendment exactly. This is the DAEMON copy and the
+    LIVE path -- wrappers are daemon-only, so a stamp added to tree.py alone
+    changes nothing at runtime while reading as correct in the diff (g-115-2422:
+    the CLI dropped its stamp and the daemon kept it for 19 days)."""
+    if field in _NON_BASE_STAMP_FIELDS:
+        return
+    stamps = node.get("amended_fields")
+    if not isinstance(stamps, dict):
+        stamps = {}
+    stamps[field] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    node["amended_fields"] = {k: stamps[k] for k in sorted(stamps)}
+
+
 def _apply_set(tree: Dict[str, Any], key: str, field: str, value: Any,
                world_path: Path) -> Dict[str, Any]:
     """Non-confidence field set. Confidence is rejected upstream (handler)."""
@@ -907,6 +940,10 @@ def _apply_set(tree: Dict[str, Any], key: str, field: str, value: Any,
     # : same for the CALIBRATION stamp (separate key, see above).
     if field in _CALIBRATION_STAMP_FIELDS:
         _stamp_calibration(node)
+    # : BASE-class fields get a PER-FIELD amendment stamp, which is
+    # what makes a BASE edit survive an own-cloud reconcile at all (mirror
+    # tree.py cmd_set). No-ops for non-BASE fields.
+    _stamp_amendment(node, field)
     #  (Option B): do NOT auto-bump per-node last_updated on a
     # metadata set. node .md front matter is the single source of truth
     # (); the _tree.yaml index last_updated is synced to it ONLY by
@@ -1317,6 +1354,25 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
                 if not isinstance(child, dict) or not child.get("key"):
                     return Response.error(400, "missing_param",
                                           "'child' object with a 'key' required")
+                # rb-8572: body-bearing keys inside `child` are silently
+                # dropped by _apply_add_child's allowlist — the caller who
+                # sends them believes add-child writes the .md body, and the
+                # result is an index-only orphan node (two live instances,
+                # 2026-08-20 fleet sweep). Refuse with the correct interface:
+                # the request-level `body` field (verbatim .md text), or the
+                # body-first register-second flow.
+                _body_keys = [k for k in ("content", "markdown")
+                              if k in child] + (["body"] if "body" in child
+                                                else [])
+                if _body_keys and not req.get("body"):
+                    return Response.error(
+                        400, "body_in_child",
+                        "child JSON carries body-bearing key(s) "
+                        + ", ".join(repr(k) for k in _body_keys)
+                        + " — add-child registers the index only and would "
+                        "silently drop them (rb-8572). Pass the .md text as "
+                        "the request-level 'body' field, or write the body "
+                        "first and register after.")
                 child_key = child["key"]
                 if parent_key not in nodes:
                     return Response.error(404, "parent_not_found",
@@ -1404,6 +1460,56 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
                 if key not in nodes:
                     return Response.error(404, "node_not_found",
                                           f"node not found: {key}")
+                # : WIRE-INTEGRITY CHECK, and it runs BEFORE the write
+                # on purpose. guard-3150 forbids write-then-verify on a
+                # structured file — once short bytes are on disk they are, on an
+                # S3-authoritative store, already the shared truth for every
+                # other box, so a post-write check cannot prevent anything.
+                #
+                # WHY IT COMPARES ACROSS THE WIRE rather than in memory: the
+                # obvious daemon-side check (len(req["value"]) vs
+                # len(node[field]) after _apply_set) is VACUOUS — _apply_set
+                # does node[field] = v where v IS the parsed request value, so
+                # it compares a string to itself and passes 100% of the time
+                # while looking exactly like protection (the
+                # checker-input-assumption-defects class). The client's
+                # declared length is derived independently, on the other side
+                # of the wire, so this comparison is real.
+                #
+                # It targets the measured 2026-08-19 loss: a 17,708-byte value
+                # stored as 8,186 bytes cut mid-word, rc=0, with a
+                # complete-looking echo. That echo is rendered from the
+                # in-memory dict (see `out = _apply_defaults(node)` below) and
+                # never from a re-read, so nothing in this path could see it.
+                # The goal's own analysis places that loss at or before
+                # CLIENT-side serialization (a truncated HTTP body could not
+                # have returned 200 — it would be invalid JSON), which is
+                # exactly the span this check covers and an in-daemon check
+                # cannot.
+                #
+                # FAIL-OPEN WHEN ABSENT, FAIL-CLOSED ON MISMATCH. A client that
+                # does not declare value_bytes is not refused: every existing
+                # caller predates this field, and refusing them would take the
+                # tree write path down fleet-wide. That asymmetry is deliberate
+                # but it IS a coverage gap — an undeclared write is unchecked,
+                # so the protection is only as wide as the callers that opt in.
+                declared = req.get("value_bytes")
+                _sent = req["value"]
+                if declared is not None and isinstance(_sent, str):
+                    try:
+                        declared_int = int(declared)
+                    except (TypeError, ValueError):
+                        declared_int = None
+                    received = len(_sent.encode("utf-8"))
+                    if declared_int is not None and declared_int != received:
+                        return Response.error(
+                            500, "value_truncated_in_transit",
+                            f"REFUSING write to {key}.{field}: client declared "
+                            f"{declared_int} bytes but the daemon received "
+                            f"{received}. The value lost "
+                            f"{declared_int - received} bytes between the "
+                            f"caller and this endpoint; nothing was written. "
+                            f"See g-115-6823 / guard-4449.")
                 node = _apply_set(tree, key, field, req["value"], world_path)
                 # field=confidence triggers parent-chain propagation +
                 # self-graduation (mirrors cmd_set:1599-1604). The node is
@@ -1424,6 +1530,13 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
                     out["ancestors_updated"] = ancestors_updated
                     out["capability_changes"] = capability_changes
                 resp = {"ok": True, "op": op, "key": key, "node": out}
+                #  / guard-1661: the success response must carry
+                # evidence the caller can check WITHOUT a second read. The
+                # caller compares this against the length it sent; that is the
+                # half of the end-to-end check the daemon cannot perform alone.
+                _stored = node.get(field)
+                if isinstance(_stored, str):
+                    resp["value_bytes"] = len(_stored.encode("utf-8"))
                 # : enriching a bodiless node is the desync signature.
                 _bw = _body_presence_warning(key, node.get("file"),
                                              world_path, "set")

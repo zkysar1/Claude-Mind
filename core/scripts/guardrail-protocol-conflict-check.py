@@ -250,6 +250,151 @@ def scan(root: Path, index: dict) -> list[dict]:
     return hits
 
 
+# ─────────────────── cadence gate (mirrors scar-tissue-check) ───────────────────
+#
+# WHY THIS SHAPE: this detector is SELF-ACTING (it measures and posts to the board
+# itself), so per _cadence_registry.py it does NOT belong in the Phase 0.5e cadence
+# battery — that battery is scoped to cadences whose fire-action is a single SKILL
+# invocation. It gets its own precheck phase, exactly like scar-tissue-check and
+# l1-skew-check. ()
+#
+# WHY A SEEN-SET: measured 2026-08-21 on the live corpus — active_guardrails=4318,
+# actionable=58, novel=58, known_guardrails=[]. The detector carries no memory, so
+# a cadence without dedup would re-report all 58 rows on every fire, which is the
+# guard-1826 stateless-detector class (a hit is evidence the condition HOLDS, never
+# that it is UNREPORTED) and trains readers to skip the instrument. The existing
+# --known flag is the seam; the cadence path persists the seen set through it.
+
+def _cadence_defaults() -> dict:
+    return {"goal_cadence": 100, "wm_slot": "last_guardrail_conflict_check",
+            "slate_cap": 10}
+
+
+def _load_cadence_config() -> dict:
+    """Load the ``guardrail_conflict_check`` block from aspirations.yaml."""
+    cfg = _cadence_defaults()
+    try:
+        import yaml
+        cfg_path = _project_root() / "core" / "config" / "aspirations.yaml"
+        if not cfg_path.exists():
+            return cfg
+        with open(str(cfg_path), "r", encoding="utf-8") as f:
+            loaded = yaml.safe_load(f) or {}
+        block = loaded.get("guardrail_conflict_check") or {}
+        cfg["goal_cadence"] = int(block.get("goal_cadence", cfg["goal_cadence"]))
+        cfg["wm_slot"] = str(block.get("wm_slot", cfg["wm_slot"]))
+        cfg["slate_cap"] = int(block.get("slate_cap", cfg["slate_cap"]))
+    except Exception as e:
+        print("[guardrail-protocol-conflict] cadence config read failed: " + str(e),
+              file=sys.stderr)
+    return cfg
+
+
+def _count_completed_goals() -> int:
+    """Total completed goals, via fresh-eyes-cadence-check so every cadence ritual
+    shares ONE definition of 'completed'. Returns 0 on EVERY failure path — the
+    zero-guard in _cadence_gate exists because that sentinel is indistinguishable
+    from a real zero."""
+    import subprocess
+    try:
+        script = str(_project_root() / "core" / "scripts"
+                     / "fresh-eyes-cadence-check.py")
+        result = subprocess.run(
+            [sys.executable, script, "--print-current"],
+            cwd=str(_project_root()), capture_output=True, text=True, timeout=10)
+        if result.returncode != 0:
+            return 0
+        return int(result.stdout.strip() or 0)
+    except Exception:
+        return 0
+
+
+def _wm_read(slot):
+    try:
+        import _rt
+        raw = (_rt.wm_read(slot=slot, as_json=True) or "").strip()
+        if not raw or raw == "null":
+            return None
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def _wm_set(slot, value):
+    import subprocess
+    try:
+        wm_script = str(_project_root() / "core" / "scripts" / "wm.py")
+        subprocess.run([sys.executable, wm_script, "set", slot],
+                       input=json.dumps(value), capture_output=True,
+                       text=True, check=True, timeout=10)
+    except Exception as e:
+        print("[guardrail-protocol-conflict] wm-set failed: " + str(e),
+              file=sys.stderr)
+
+
+def _post_board(message: str) -> bool:
+    """Post to the findings board. Message goes on STDIN — board-post.sh reads it
+    there, not as an argv. Returns True on success; never raises (a board outage
+    must not fail the detector, and the caller re-stamps only after this returns
+    so a failed post simply re-fires next cadence)."""
+    import subprocess
+    try:
+        # bash_cmd, never a bare "bash" argv: it resolves BASH (guard-580 — never
+        # the System32 WSL stub) and passes the path as_posix (guard-581 —
+        # str(WindowsPath) yields backslashes that bash strips as escapes).
+        from _runtime_bash import bash_cmd
+        script = _project_root() / "core" / "scripts" / "board-post.sh"
+        result = subprocess.run(
+            bash_cmd(script, "--channel", "findings", "--type", "finding",
+                     "--tags", "guardrail-conflict,cadence,contradiction"),
+            input=message, cwd=str(_project_root()),
+            capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            print("[guardrail-protocol-conflict] board post failed: "
+                  + (result.stderr or "")[:300], file=sys.stderr)
+            return False
+        return True
+    except Exception as e:
+        print("[guardrail-protocol-conflict] board post error: " + str(e),
+              file=sys.stderr)
+        return False
+
+
+def _cadence_gate():
+    """Return (fire, current, cfg, last). fire=True when the cadence crossed.
+
+    Carries the two load-bearing guards the sibling cadence scripts learned the
+    hard way:
+
+      first-fire normalization (g-001-190) — an unset slot must not fire on the
+      full historical goal count; cap the diff at one cadence.
+
+      zero-guard (guard-1091) — _count_completed_goals returns 0 as a SILENT
+      FAILURE SENTINEL. Re-baselining on it would persist a transient failure as
+      the new basis. Noop WITHOUT re-stamping so the next check retries.
+    """
+    cfg = _load_cadence_config()
+    current = _count_completed_goals()
+    last = _wm_read(cfg["wm_slot"])
+
+    if not isinstance(last, dict):
+        diff = min(current, cfg["goal_cadence"])
+        return diff >= cfg["goal_cadence"], current, cfg, None
+
+    last_count = int(last.get("goals_count_at_last_fire", 0) or 0)
+    diff = current - last_count
+    if last_count == 0:
+        diff = min(diff, cfg["goal_cadence"])
+
+    if diff < 0 and current == 0:
+        print(f"[guardrail-protocol-conflict] negative diff ({diff}) with "
+              f"current=0 vs last={last_count} — FAILED MEASUREMENT, not a real "
+              f"basis; noop WITHOUT re-stamp — retries next check", file=sys.stderr)
+        return False, current, cfg, last
+
+    return diff >= cfg["goal_cadence"], current, cfg, last
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--output", choices=["human", "json"], default="human")
@@ -277,7 +422,30 @@ def main(argv=None) -> int:
         action="store_true",
         help="in human output, also print the likely-compliance rows",
     )
+    ap.add_argument(
+        "--cadence",
+        action="store_true",
+        help=(
+            "cadence-gated periodic mode: exit 0 SILENTLY unless the completed-goal "
+            "cadence has crossed. Also unions the persisted seen-set into --known so "
+            "a repeat fire reports only NEW conflicts (without this the detector is "
+            "stateless and re-reports its whole backlog every fire — guard-1826)."
+        ),
+    )
+    ap.add_argument(
+        "--post-board",
+        action="store_true",
+        help="post a findings-board message when novel conflicts exist",
+    )
     args = ap.parse_args(argv)
+
+    # Cadence gate FIRST — before any scanning work, so a noop costs one WM read
+    # rather than a full 4k-guardrail x 93-file scan.
+    cad_cfg, cad_current, cad_last = None, 0, None
+    if args.cadence:
+        fire, cad_current, cad_cfg, cad_last = _cadence_gate()
+        if not fire:
+            return 0
 
     world = Path(args.world) if args.world else _world_path()
     root = Path(args.root) if args.root else _project_root()
@@ -290,6 +458,14 @@ def main(argv=None) -> int:
         h for h in hits if not h["likely_compliance"] and not h["reconciled"]
     ]
     known = {k.strip() for k in args.known.split(",") if k.strip()}
+    # In cadence mode, fold the persisted seen-set into `known` so a repeat fire
+    # reports only NEW conflicts. Measured 2026-08-21: without this, every fire
+    # re-reports the full backlog (actionable=58, novel=58, known=[]) — the
+    # guard-1826 stateless-detector class, which trains readers to skip the
+    # instrument. Explicit --known still wins on top of it (a union, not an
+    # override): an operator naming ids by hand must never be silently narrowed.
+    if args.cadence and isinstance(cad_last, dict):
+        known |= {str(g) for g in (cad_last.get("seen_guardrails") or [])}
     novel = [h for h in actionable if not set(h["guardrails"]) <= known]
 
     if args.output == "json":
@@ -327,6 +503,44 @@ def main(argv=None) -> int:
             )
         if not hits:
             print("  no conflicts detected")
+
+    # ── cadence fire: post a BOUNDED slate, then re-stamp the seen-set ──
+    if args.cadence and cad_cfg is not None:
+        cap = int(cad_cfg.get("slate_cap", 10))
+        if args.post_board and novel:
+            # Quiet on a clean bill of health (no novel rows -> no post). An
+            # instrument that posts on every fire trains its readers to skip it;
+            # same posture scar-tissue-check takes.
+            slate = novel[:cap]
+            lines = [
+                f"Guardrail/protocol conflict cadence: {len(novel)} NEW of "
+                f"{len(actionable)} actionable ({len(hits)} raw hits over "
+                f"{sum(1 for g in guardrails if (g.get('status') or 'active') == 'active')} "
+                f"active guardrails).",
+                f"Showing {len(slate)} of {len(novel)} (slate_cap={cap}) — "
+                f"the cap bounds the SLATE, never the scan (guard-3830).",
+                "",
+                "Resolution class per guard-3814: find the PRECONDITION that makes "
+                "each side right (scope-split). NEVER resolve by utilization counts "
+                "or averaging. Output is a PROPOSAL — apply deliberately.",
+                "",
+            ]
+            for h in slate:
+                lines.append(
+                    f"- {h['file']}:{h['line']} — {' '.join(h['guardrails'])} "
+                    f"constrains {h['script']} {' '.join(h['args'])}"
+                )
+            _post_board("\n".join(lines))
+        # Re-stamp AFTER the post so a failed post re-fires next cadence rather
+        # than being silently marked seen.
+        seen = set(known)
+        for h in novel:
+            seen |= {str(g) for g in h["guardrails"]}
+        _wm_set(cad_cfg["wm_slot"], {
+            "goals_count_at_last_fire": cad_current,
+            "seen_guardrails": sorted(seen),
+            "novel_at_last_fire": len(novel),
+        })
 
     return 1 if (args.exit_on_hits and novel) else 0
 

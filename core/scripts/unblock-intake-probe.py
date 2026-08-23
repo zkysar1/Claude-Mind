@@ -287,7 +287,8 @@ def _probe_file_line(ref: dict, failure_text: str) -> "tuple[str, str]":
     described in failure_text still appear?
 
     Returns (verdict, signal-text). Verdicts:
-      - "file-missing"      : path does not exist (likely removed)
+      - "file-deleted"       : gone at HEAD but present in git history (fix-landed evidence)
+      - "file-never-existed" : gone at HEAD with NO git history (scores 0 — see below)
       - "line-out-of-range" : file shorter than named line
       - "shape-present"     : a keyword from failure_text appears near the line
       - "shape-absent"      : no failure_text keyword near the named line
@@ -299,7 +300,25 @@ def _probe_file_line(ref: dict, failure_text: str) -> "tuple[str, str]":
     if not abs_path.is_file():
         # Try the path verbatim (might be absolute or relative to cwd)
         if not Path(path).is_file():
-            return "file-missing", f"{path} does not exist at HEAD"
+            # ABSENCE IS EVIDENCE ONLY IF THE FILE ONCE EXISTED. A path that
+            # never existed anywhere — pulled out of prose, a typo, a rename,
+            # a path from another repo — says nothing about whether a fix
+            # landed. Scoring it as fix-landed is what produced a
+            # verify-and-close verdict on a live defect (): with
+            # EPSILON=0.25 a single bogus file_ref outweighs an empty other
+            # side and flips the whole verdict.
+            # This mirrors the commit axis, where _probe_commit resolves via
+            # cat-file and an unresolvable hash returns "missing" -> weight 0.
+            # The two axes disagreed about what absence means; only the commit
+            # axis was safe. Keep them agreeing.
+            rc, out = _git(["log", "--oneline", "-1", "--", path])
+            if rc == 0 and out.strip():
+                return "file-deleted", (
+                    f"{path} does not exist at HEAD but IS in git history "
+                    f"(deleted) — real fix-landed evidence")
+            return "file-never-existed", (
+                f"{path} does not exist at HEAD and has no git history — "
+                f"no evidence either way")
         abs_path = Path(path)
     try:
         lines = abs_path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -398,7 +417,10 @@ def _aggregate(commits, files, fns):
 
     for _ref, (v, sig) in files:
         all_signals.append(sig)
-        if v in ("file-missing", "line-out-of-range", "shape-absent"):
+        # "file-never-existed" is deliberately absent from BOTH branches — it
+        # scores 0, exactly like an unresolvable commit hash. See
+        # _probe_file_line for why ().
+        if v in ("file-deleted", "line-out-of-range", "shape-absent"):
             fix_landed_w += 1.0
         elif v == "shape-present":
             bug_present_w += 1.0

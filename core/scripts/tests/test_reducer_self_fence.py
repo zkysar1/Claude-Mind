@@ -460,9 +460,27 @@ def _sandbox(tmp_path, *, paths="good", signal_rc=0, verdict="stand-down"):
     (scripts / "session-signal-exists.sh").write_text(
         "#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
 
+    def _msys(p):
+        """Return the path AS BASH ITSELF SEES IT, by asking bash.
+
+        The SUT derives PROJECT_ROOT with `cd "$SCRIPT_DIR/../.." && pwd`, so the
+        containment check compares two bash-side strings. Hand-converting
+        "C:/x" -> "/c/x" looks right and is WRONG here: MSYS mounts
+        the Windows per-user temp directory (AppData/Local/Temp) as /tmp,
+        `pwd` returns /tmp/<...>, never /c/Users/.../Temp/<...>. Measured
+        2026-08-22: SESSION_DIR /c/Users/.../Temp/tmpqq02h5fh/root/... vs _PR
+        /tmp/tmpqq02h5fh/root -> the fence refused every write as "outside
+        PROJECT_ROOT" and the three write-path tests failed exactly as they did
+        before the fix. Running the SAME `cd && pwd` bash uses cannot disagree
+        with it, whatever the mount table says.
+        """
+        r = subprocess.run(bash_cmd("-c", 'cd "$1" 2>/dev/null && pwd', "_", str(p)),
+                           capture_output=True, text=True)
+        return r.stdout.strip() or p.as_posix()
+
     if paths == "good":
         (scripts / "_paths.sh").write_text(
-            'agent_dir() { echo "%s/agents/$1"; }\n' % root.as_posix(), encoding="utf-8")
+            'agent_dir() { echo "%s/agents/$1"; }\n' % _msys(root), encoding="utf-8")
     elif paths == "undefined":
         pass  # no _paths.sh at all -> source fails -> agent_dir undefined (F-001)
     elif paths == "escapes":

@@ -239,10 +239,31 @@ for flag, key in (("TU_ENC_SOURCE", "encoding_source"),
         body[key] = v
 if op == "set":
     body["key"], body["field"], body["value"] = a[0], a[1], a[2]
+    # : declare the byte length WE were handed, so the daemon can
+    # refuse a write whose value lost bytes between here and there. This is
+    # the only length in the chain derived independently of the daemon copy —
+    # an in-daemon comparison is vacuous (it compares the request value to
+    # itself). The 2026-08-19 incident lost 9,522 bytes somewhere at or before
+    # this serialization and returned rc=0 with a complete-looking echo.
+    body["value_bytes"] = len(a[2].encode("utf-8"))
 elif op == "add-child":
     body["parent"] = a[0]
     s = os.environ.get("TU_STDIN", "")
     body["child"] = json.loads(s) if s.strip() else {}
+    # rb-8572: body-bearing keys in the child JSON mean the caller expects
+    # add-child to write the .md body. It registers the INDEX ONLY — the
+    # daemon would silently drop these keys and an orphan node results
+    # (file: path 404s). Refuse at the door with the correct flow.
+    _bk = [k for k in ("content", "body", "markdown") if k in body["child"]]
+    if _bk:
+        sys.stderr.write(
+            "Refusing --add-child: child JSON carries body-bearing key(s) "
+            + ", ".join(repr(k) for k in _bk)
+            + " — add-child registers the INDEX ONLY and would silently drop "
+            "the content (rb-8572 orphan-node class). Write the .md body "
+            "first (front matter + content) at the node file: path, then "
+            "register; or use the /tree add flow, which does both.\n")
+        sys.exit(1)
     if os.environ.get("TU_NODEDUP") == "true":
         body["no_dedup"] = True
     if os.environ.get("TU_HAVE_ACCEPT") == "true":
@@ -291,7 +312,14 @@ if op in ("set", "add-child", "increment"):
     # CLI prints apply_defaults(node) + key; the daemon returns exactly that
     # in resp["node"] (md_written / ancestors / capability_changes already
     # folded in for the relevant ops).
-    print(json.dumps(resp["node"], indent=2, ensure_ascii=False))
+    # rb-8572/guard-4578: fold response-level advisories INTO the printed
+    # node — printing resp["node"] alone stripped body_presence_warning at
+    # this exact hop, which is how two index-only orphan nodes shipped past
+    # a daemon that was warning correctly the whole time.
+    node_out = resp["node"]
+    if resp.get("body_presence_warning"):
+        node_out["body_presence_warning"] = resp["body_presence_warning"]
+    print(json.dumps(node_out, indent=2, ensure_ascii=False))
 elif op == "remove-child":
     # CLI: single-line, NO indent=2 (the lone exception).
     print(json.dumps({"removed": resp["removed"], "parent": resp["parent"]},
@@ -325,13 +353,56 @@ elif op == "record-maintenance":
 '
 }
 
+# : end-to-end value-length assertion, the CLIENT half of the
+# integrity check. BODY carries the length we computed from argv; RESPONSE
+# carries the length the daemon actually stored. Those two numbers were derived
+# independently on opposite sides of the wire, which is the whole point — the
+# in-daemon comparison everyone reaches for first is a string compared to
+# itself (_apply_set does node[field] = the request value) and passes 100% of
+# the time while looking like protection.
+#
+# Runs AFTER _translate deliberately: the write has already landed by then, so
+# stdout must still carry the node JSON every existing caller parses. What this
+# adds is a non-zero EXIT plus a loud stderr line, so a silent partial write
+# stops being silent. Detection, not prevention — prevention is the daemon's
+# pre-write refusal (guard-3150).
+#
+# FAIL-OPEN on anything unexpected (unparseable JSON, older daemon that does not
+# report value_bytes, non-string value). A false alarm here would fire on every
+# tree write in the fleet; a miss costs one undetected write. Given the check is
+# new and the write path is the busiest in the framework, that asymmetry is the
+# right one — but it does mean an older daemon silently provides NO coverage.
+_assert_value_bytes() {
+    # shellcheck disable=SC2086
+    printf '%s' "$1" | TU_BODY="$BODY" $(rt_python_launcher) -c '
+import json, os, sys
+try:
+    sent = json.loads(os.environ["TU_BODY"]).get("value_bytes")
+    got = json.load(sys.stdin).get("value_bytes")
+except Exception:
+    sys.exit(0)
+if sent is None or got is None or sent == got:
+    sys.exit(0)
+sys.stderr.write(
+    "tree-update.sh: VALUE INTEGRITY FAILURE — sent %d bytes, daemon stored %d "
+    "(lost %d). The write LANDED SHORT; the node now holds a truncated value. "
+    "Recover the prior value from world/.history (read the pointer at "
+    ".history/snapshots/<path>/<ts>.yaml, gunzip "
+    ".history/blobs/<hash[:2]>/<hash[2:]>.gz, pull the single field) and "
+    "re-write via --batch. Do NOT use history.py restore: it reverts the whole "
+    "_tree.yaml and clobbers concurrent partner writes. See g-115-6823.\n"
+    % (sent, got, sent - got))
+sys.exit(1)
+'
+}
+
 BODY="$(_build_body)"
 
 rc=0
 RESPONSE="$(rt_call POST /v1/tree/write --body-string "$BODY")" || rc=$?
 
 case $rc in
-    0) _translate "$RESPONSE"; exit 0;;
+    0) _translate "$RESPONSE"; _assert_value_bytes "$RESPONSE"; exit $?;;
     2)
         # 4xx/5xx terminal refusal — print the daemon body to stderr, exit 1.
         printf '%s\n' "$RESPONSE" >&2
@@ -342,7 +413,7 @@ case $rc in
         if rt_try_autospawn; then
             rc=0
             RESPONSE="$(rt_call POST /v1/tree/write --body-string "$BODY")" || rc=$?
-            if [ "$rc" = "0" ]; then _translate "$RESPONSE"; exit 0; fi
+            if [ "$rc" = "0" ]; then _translate "$RESPONSE"; _assert_value_bytes "$RESPONSE"; exit $?; fi
             if [ "$rc" = "2" ]; then printf '%s\n' "$RESPONSE" >&2; exit 1; fi
         fi
         rt_no_daemon_error "tree-update.sh";;

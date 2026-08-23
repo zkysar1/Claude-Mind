@@ -134,3 +134,48 @@ def test_node_without_a_file_field_is_skipped(virtual_world):
     nodes["fileless"] = {"summary": "no file key at all"}
     index = tm.build_concept_index(nodes)
     assert "tailnet-ip" in index
+
+
+# ---------------------------------------------------------------------------
+# : a daemon that started BEFORE its world was configured has
+# _paths.WORLD_DIR = None for the life of the process, while every request
+# carries the correct root in ctx.paths.world. build_concept_index must be able
+# to take that root explicitly; otherwise the daemon's stale import-time state
+# wins and every find-node / retrieve request fails with an error that blames
+# the config file -- which is correct on disk. Measured 2026-08-22 on zc-03.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def pre_init_daemon(virtual_world, monkeypatch):
+    """The literal production state: the world EXISTS on disk and is what the
+    request would resolve, but the module global bound at import is None."""
+    monkeypatch.setattr(_paths, "WORLD_DIR", None)
+    return virtual_world
+
+
+def test_pre_init_daemon_positive_control_module_global_path_fails(pre_init_daemon):
+    """Without an explicit root the old path MUST fail here -- this is the
+    failure the next test proves is fixed. If this ever passes, the fixture no
+    longer reproduces the daemon state and the test below is decoration."""
+    with pytest.raises(RuntimeError, match="WORLD_DIR unresolved"):
+        tm.build_concept_index(NODES)
+
+
+def test_pre_init_daemon_explicit_world_root_builds_the_index(pre_init_daemon):
+    index = tm.build_concept_index(NODES, world_root=pre_init_daemon)
+    assert index.get("tailnet-ip") == ["fixture-node"]
+    assert index.get("fleet-topology-roster-fixture") == ["fixture-node"]
+
+
+def test_explicit_world_root_wins_over_a_stale_module_global(virtual_world, tmp_path, monkeypatch):
+    """A STALE (wrong, not None) import-time root must not be consulted when
+    the caller supplies one -- the daemon serving agent B with a WORLD_DIR that
+    was bound to agent A's world at startup. The stale world is EMPTY, so the
+    old code would silently build an empty index (the guard-132 failure shape)
+    rather than raise."""
+    stale = tmp_path / "some-other-world"
+    stale.mkdir()
+    monkeypatch.setattr(_paths, "WORLD_DIR", stale)
+    index = tm.build_concept_index(NODES, world_root=virtual_world)
+    assert index.get("tailnet-ip") == ["fixture-node"]

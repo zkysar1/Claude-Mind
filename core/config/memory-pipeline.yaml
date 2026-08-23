@@ -198,6 +198,51 @@ working_memory_pruning:
                                     # overflow drops the OLDEST evidence, and stale
                                     # evidence for an already-resolved hypothesis is
                                     # the entry you most want dropped first.
+    #
+    # encoding_capture IS DELIBERATELY ABSENT FROM
+    # THIS MAP — ratified, not overlooked ().
+    # It is the fourth capture lane and the only one
+    # with no cap; that started as an omission and is
+    # now a decision, so nobody "completes the set".
+    #
+    # WHY. The three caps above are survivable because
+    # a load_bearing entry has a SECOND durable copy:
+    # wm_write.py mirrors flagged captures into the
+    # Body's session/-rooted carrier, which is uncapped
+    # and lives in the store, and capture_fast_lane
+    # delivers from THERE. An UNFLAGGED entry has no
+    # such copy — the WM slot is its only existence, so
+    # its eviction is unrecoverable.
+    # Measured on one 12-day worker Body (alpha, cc-08,
+    # 2026-08-22): encoding_capture held 469 entries,
+    # 281 of them UNFLAGGED. Capping at the sibling
+    # scale would destroy ~419 in a single config edit,
+    # 281 irreversibly — before any consumer exists to
+    # read them. That is the most destructive available
+    # action on this lane, not a tidy-up.
+    # The same Body's capture_evictions read
+    # spark 582 / exp 345 / hyp 24 — and its unflagged
+    # counts sat EXACTLY at the reserved floor (10 of
+    # 50, 4 of 20), i.e. the floor is the only thing
+    # keeping undelivered mail alive and it is
+    # saturated. The capped lanes are the leak; the
+    # uncapped one is the only lane losing nothing.
+    # Decide a cap WITH its consumer, so the bound
+    # bounds a slot something actually reads. Until
+    # then, unbounded growth is the CHEAPER failure.
+    #
+    # A key here is NOT a free way to document this:
+    # body-merge.py iterates array_limits.items(), so
+    # `encoding_capture: null` would enter that loop.
+    # It happens to no-op (enforce_slot_limit returns 0
+    # on a falsy limit — probed, not assumed), but the
+    # comment form depends on no such behaviour.
+    #
+    # REVISIT WHEN: the  drain has run for a real window and someone
+    # measures this lane's STEADY-STATE size with the consumer operating. If it
+    # plateaus, no cap is needed. If it still grows monotonically, cap it WITH
+    # its consumer per the paragraph above — and size it from the post-drain
+    # number, never from the 132 measured while this lane was write-only.
   item_stale_minutes:               # Item-level age thresholds
     micro_hypotheses: 180           # 3 hours — unresolved micros
     sensory_buffer: 60              # 1 hour
@@ -351,6 +396,18 @@ experience_staleness:
   archive_low_utility_after_days: 90
   protect_threshold:
     min_retrieval_count: 5
+    # RETIRED AS A LIVE CRITERION 2026-08-20 (). Still declared here
+    # and in both code twins so the three stay in sync, but the archive sweep
+    # NO LONGER READS IT. utility_ratio = times_useful / retrieval_count and
+    # times_useful is never written in practice — measured 0 on all 200 of the
+    # most-retrieved records, 97 of which have retrieval_count >= 5. So the
+    # "never archive high-value" protection could not fire on ANY record, and
+    # `utility_ratio < 0.2` was true of every record, making the 90-day rule a
+    # pure age cap. Both consumers now key on retrieval_stats.last_retrieved,
+    # which IS written (non-null on 191 of those 200) and which DECAYS — a
+    # protection keyed on lifetime retrieval_count could never release its
+    # oldest members (guard-4000). Measured effect: protection 0 -> 85,
+    # 90-day rule archives 52 -> 8 of the same population.
     min_utility_ratio: 0.5
 
 # Reasoning bank prioritization — universal (cross-domain) vs. domain partition.

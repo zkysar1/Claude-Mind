@@ -179,3 +179,115 @@ def test_non_framework_paths_ignored(tmp_path):
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# ---------------------------------------------------------------------------
+# gap-061 DOUBLE class (). Set algebra is structurally blind here:
+# when a resolution keeps BOTH sides, every line is still in exactly the set it
+# was already in and only the COUNT moves. Cases F/G are a two-way vacuity
+# proof — same topology, resolutions differing in exactly one thing (how many
+# copies survive), and they MUST produce different verdicts (guard-1220).
+# ---------------------------------------------------------------------------
+
+COUNTER = "totalGroqFailures.incrementAndGet()"
+HANDLER = "core/scripts/llm-failure-handler.py"
+H_BASE = "def count_failure():\n    log()\n"
+H_SIDE = f"def count_failure():\n    log()\n    {COUNTER}\n"
+
+
+def _build_double_repo(tmp: Path, *, resolution: str) -> Path:
+    """Both branches independently add the SAME counter line; the merge either
+    keeps both copies (resolution='both') or exactly one (resolution='one').
+
+    This is encounter 2's shape (g-115-5758): one conflict hunk in
+    LlmAPIService.java kept BOTH sides, tests stayed green, and the
+    double-count was found only by hand-enumerating call sites.
+    """
+    repo = tmp / f"dbl-{resolution}"
+    _init(repo)
+    _write(repo, HANDLER, H_BASE)
+    _commit_all(repo, "base handler")
+    _git(repo, "checkout", "-q", "-b", "side")
+    _write(repo, HANDLER, H_SIDE)
+    _commit_all(repo, "side: count failures")
+    _git(repo, "checkout", "-q", "main")
+    _write(repo, HANDLER, H_SIDE)
+    _commit_all(repo, "main: count failures")
+    # Both sides added the identical line -> real conflict; resolve by hand.
+    subprocess.run(["git", "merge", "--no-ff", "--no-commit", "side"],
+                   cwd=str(repo), capture_output=True, text=True)
+    if resolution == "both":
+        _write(repo, HANDLER,
+               f"def count_failure():\n    log()\n    {COUNTER}\n    {COUNTER}\n")
+    else:
+        _write(repo, HANDLER, H_SIDE)
+    _git(repo, "add", HANDLER)
+    _git(repo, "commit", "-q", "-m", "merge side")
+    return repo
+
+
+def _dups(report):
+    out = []
+    for r in report["flagged"]:
+        for f in r["flags"]:
+            out.extend(f.get("duplicated", []))
+    return out
+
+
+def test_double_resolution_kept_both_sides_is_flagged(tmp_path):
+    """FAIL fixture: the merge holds 2 copies where no input held more than 1."""
+    repo = _build_double_repo(tmp_path, resolution="both")
+    report = emd.scan(repo, ["HEAD"])
+    assert report["merges_scanned"] == 1
+    dups = _dups(report)
+    hits = [d for d in dups if d["line"] == COUNTER]
+    assert hits, f"duplicated counter not flagged: {dups}"
+    d = hits[0]
+    assert d["class"] == "resolution-duplicated"
+    assert d["count_merge"] == 2, d
+    assert max(d["count_p1"], d["count_p2"], d["count_base"]) == 1, d
+
+
+def test_single_copy_resolution_is_not_flagged(tmp_path):
+    """PASS fixture (two-way proof partner): identical topology, correct
+    resolution. A detector returning the same verdict here as in the FAIL case
+    would be vacuous — no discriminating power."""
+    repo = _build_double_repo(tmp_path, resolution="one")
+    report = emd.scan(repo, ["HEAD"])
+    assert [d for d in _dups(report) if d["line"] == COUNTER] == []
+
+
+def test_paths_widening_reaches_non_framework_file(tmp_path):
+    """gap-061 encounters 1 and 4 landed in product TypeScript and a GitHub
+    Actions YAML — both outside FRAMEWORK_PREFIXES, so the default scope
+    cannot see them however correct the algebra is."""
+    repo = tmp_path / "dbl-product"
+    _init(repo)
+    rel = "product/src/ledger.ts"
+    base = "export function applyLedgerEntry() {\n  emit();\n}\n"
+    side = ("export function applyLedgerEntry() {\n  emit();\n"
+            "  const wholesaleRateCard = resolve();\n}\n")
+    _write(repo, rel, base)
+    _commit_all(repo, "base ledger")
+    _git(repo, "checkout", "-q", "-b", "side")
+    _write(repo, rel, side)
+    _commit_all(repo, "side: wholesale card")
+    _git(repo, "checkout", "-q", "main")
+    _write(repo, rel, side)
+    _commit_all(repo, "main: wholesale card")
+    subprocess.run(["git", "merge", "--no-ff", "--no-commit", "side"],
+                   cwd=str(repo), capture_output=True, text=True)
+    _write(repo, rel,
+           "export function applyLedgerEntry() {\n  emit();\n"
+           "  const wholesaleRateCard = resolve();\n"
+           "  const wholesaleRateCard = resolve();\n}\n")
+    _git(repo, "add", rel)
+    _git(repo, "commit", "-q", "-m", "merge side")
+
+    # DEFAULT scope is blind to it — this is the positive control for the flag,
+    # not an incidental assertion: without it a passing widened run proves only
+    # that the algebra works, never that --paths changed anything.
+    assert _dups(emd.scan(repo, ["HEAD"])) == []
+    widened = emd.scan(repo, ["HEAD"], ("product/",))
+    assert [d for d in _dups(widened)
+            if "wholesaleRateCard" in d["line"]], widened

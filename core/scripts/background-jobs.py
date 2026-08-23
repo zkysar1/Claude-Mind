@@ -164,6 +164,21 @@ def check_output_artifacts(artifacts):
     """
     failures = []
     for art in artifacts or []:
+        if not isinstance(art, dict):
+            # LEGACY SHAPE, tolerated on purpose (, rb-8845, guard-514).
+            # cmd_register validated only that --output-artifacts was a LIST, so
+            # a bare list of path STRINGS was accepted; three days later this
+            # function raised AttributeError ('str' has no attribute 'get') and
+            # `check --id` died on a record already in the store. Hardening the
+            # writer (below) stops new ones but cannot reach the stored record —
+            # guard-2475/guard-2400: a validator added later wedges the legacy
+            # rows it cannot rewrite. So the READER absorbs the old shape and the
+            # record stays inspectable.
+            if isinstance(art, str):
+                art = {"path": art}
+            else:
+                failures.append({"path": "", "reason": "artifact_not_a_spec"})
+                continue
         path_str = art.get("path")
         if not path_str:
             failures.append({"path": "", "reason": "artifact_missing_path"})
@@ -302,6 +317,21 @@ def cmd_register(args):
         parsed = json.loads(args.output_artifacts)
         if not isinstance(parsed, list):
             raise ValueError("--output-artifacts must be a JSON array of artifact specs")
+        # ELEMENT shape, not just the container (, guard-4813). Checking
+        # only "is a list" let a bare list of path strings through, and the crash
+        # landed days later in `check --id` — a different subcommand, on a path
+        # nobody runs on the happy path, so the register-time rc=0 was honest and
+        # useless. Refuse at the write instead, naming the offending index.
+        # Safe to add retroactively: this validates the entry being BUILT and
+        # never re-validates stored rows, so it cannot wedge a legacy record
+        # (guard-2475); the reader above absorbs those.
+        for i, art in enumerate(parsed):
+            if not isinstance(art, dict):
+                raise ValueError(
+                    f"--output-artifacts[{i}] must be an object with a 'path' key, "
+                    f"got {type(art).__name__}. Each spec is "
+                    f"{{path, min_bytes, format}} — a bare path string is the "
+                    f"shape that crashed `check --id` (g-306-357).")
         entry["output_artifacts"] = parsed
     data["jobs"].append(entry)
     write_data(data)

@@ -465,6 +465,7 @@ def _unallocatable_pid():
         return 2 ** 31 - 1
 
 
+@unittest.skipIf(sys.platform == "win32", "/proc unavailable on Windows")
 class UnixProcessAgeCorruptionTest(unittest.TestCase):
     """. `ps -o etimes` is not trustworthy for young processes.
 

@@ -15,6 +15,7 @@ import hmac
 import json
 import os
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -133,7 +134,7 @@ class RequestContext:
 
     @property
     def paths(self) -> AgentPaths:
-        """Resolved agent paths — resolved LAZILY on first access (g-367-03).
+        """Resolved agent paths — resolved LAZILY on first access ().
 
         On a pre-init deployment (no world configured yet, no local-paths.conf,
         no .mind-data/) AgentPathResolver.resolve() raises RuntimeError. Eager
@@ -147,6 +148,41 @@ class RequestContext:
         if self._paths is None and self._paths_factory is not None:
             self._paths = self._paths_factory()
         return self._paths
+
+
+# --- access-log self-rotation ----------------------------------------------
+#
+# The access log had NO size bound: one JSONL line per request, appended
+# forever (measured 2026-08-21: 100 MB on one dev box vs 4.8 MB on prod —
+# same writer, different traffic; user-reported). Self-rotation in the writer
+# rather than logrotate/cron so the fix travels with the promotion cycle and
+# needs no per-box setup. ONE previous generation (`access.log.1`) is kept,
+# not zero: the log is a documented forensic source — rb-3277 diagnoses
+# cross-box write-vs-pull-lag by grepping recent team-state PUT statuses —
+# so rotation must preserve a recent-history window (~2x cap ≈ days at
+# observed traffic), and a rename keeps the old generation grep-able JSONL.
+
+ACCESS_LOG_MAX_BYTES = 10 * 1024 * 1024
+
+_ACCESS_LOG_LOCK = threading.Lock()
+
+
+def _rotate_access_log_if_oversize(path: Path, max_bytes: int = ACCESS_LOG_MAX_BYTES) -> bool:
+    """Rotate `path` to `<name>.1` (clobbering any prior generation) when it
+    has reached max_bytes. Returns True when a rotation happened.
+
+    Caller must hold _ACCESS_LOG_LOCK. Fail-quiet toward NOT rotating: on any
+    OSError (file missing on first request; a concurrently-open handle on
+    Windows making os.replace refuse) the append simply continues against the
+    current file — an oversized log for one more request beats a lost line.
+    """
+    try:
+        if path.stat().st_size < max_bytes:
+            return False
+        os.replace(path, path.with_name(path.name + ".1"))
+        return True
+    except OSError:
+        return False
 
 
 # --- HTTP handler -----------------------------------------------------------
@@ -198,7 +234,7 @@ class _Handler(BaseHTTPRequestHandler):
             body = _normalize_request_body(body)
 
             agent_header = self.headers.get("X-Mind-Agent", "")
-            # g-367-03: do NOT resolve here. Resolution happens lazily at the
+            # : do NOT resolve here. Resolution happens lazily at the
             # first ctx.paths access (see RequestContext.paths) so a pre-init
             # deployment can still serve /v1/admin/health and the other
             # path-free admin routes.
@@ -428,8 +464,16 @@ class _Handler(BaseHTTPRequestHandler):
             if err_detail is not None:
                 record["detail"] = err_detail
             line = json.dumps(record, ensure_ascii=False)
-            with self.access_log_path.open("a", encoding="utf-8") as f:
-                f.write(line + "\n")
+            # Lock serializes the rotate-check with concurrent appends (the
+            # threaded server runs one handler per request); a per-request
+            # stat is microseconds against a multi-ms request.
+            with _ACCESS_LOG_LOCK:
+                # Module global read at CALL time (not the def-time default) so
+                # tests can monkeypatch the cap through the writer path.
+                _rotate_access_log_if_oversize(
+                    self.access_log_path, ACCESS_LOG_MAX_BYTES)
+                with self.access_log_path.open("a", encoding="utf-8") as f:
+                    f.write(line + "\n")
         except Exception:
             pass
 

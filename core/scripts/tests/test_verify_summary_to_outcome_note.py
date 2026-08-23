@@ -368,7 +368,7 @@ def test_inline_summary_is_mangled_by_the_shell_inline_control(tmp_path):
     script = _stage(tmp_path)
     env = _env(tmp_path)
 
-    cmd = (f'{BASH} {Path(script).as_posix()} --phase verify --goal {GID} '
+    cmd = (f'"{BASH}" {Path(script).as_posix()} --phase verify --goal {GID} '
            f'--status completed --source world --outcome routine '
            f'--summary "{HAZARD_PROSE}"')
     proc = subprocess.run(cmd, shell=True, capture_output=True, text=True,

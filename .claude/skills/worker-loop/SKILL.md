@@ -257,36 +257,40 @@ Bash: bash core/scripts/heartbeat-tick.sh
 # COMMITTING agents/<self>/* churn pathspec-limited (g-115-2249) and retrying the
 # merge once. Its fetch is independently throttled (FETCH_INTERVAL_MIN, stateless
 # via FETCH_HEAD mtime), so calling it every cycle costs nothing on most cycles.
+# THIS MERGES, so it VOIDS any full-suite run still executing (tree-moved
+# outranks every verdict). A SUITE MUST FINISH INSIDE THE UNIT THAT LAUNCHED IT;
+# Phase 3.8 merges too. --no-push suppresses the PUSH, never the merge.
+# Rationale (WHY a suite must finish inside its unit): core/config/rationale/suite-run-voided-by-loop-merge.md
 Bash: bash core/scripts/iteration-push.sh --no-push
 # Fail-soft BY CONTRACT: it exits 0 without --strict, so a network blip, a dirty
 # core/ file, or a true cross-machine conflict degrades to "resume on local code"
 # and is logged LOUDLY rather than stopping the cycle. Never branch on this rc.
-# BRANCH ON ITS STDOUT for ONE directive (g-306-315): a REPEATING content
-# conflict. Fail-soft retry is right for every transient shape and provably
-# wrong for this one — a conflict is the ONE shape retrying can never clear, so
-# "resume on local code" becomes PERMANENT staleness (measured cc-08: a Body ran
-# 85 commits behind retrying an identical conflict every cycle, and the blocked
-# merge concealed the peer fix g-306-308 for the very defect it was executing).
-# iteration-push.sh detects the repeat (its defer-streak file, shape-aware since
-# g-306-315) and prints the block below ONCE per streak at the 2nd consecutive
-# conflict — detection is bash-owned (guard-399); this branch owns the response.
-IF stdout contains "REPEATING MERGE CONFLICT — ESCALATION REQUIRED":
+# BRANCH ON ITS STDOUT for the ESCALATION directives. TWO shapes reach here and
+# retrying can NEVER clear either, so "resume on local code" becomes PERMANENT
+# staleness: a repeating content CONFLICT (g-306-315; cc-08 ran 85 commits
+# behind retrying one conflict every cycle while the blocked merge concealed
+# the peer fix g-306-308) and a repeating integrate DEFER on a dirty shared
+# file (g-115-6934; cc-08 39 behind while origin already carried the fix).
+# Fail-soft retry is right for transient shapes and wrong for these. Detection
+# is bash-owned (guard-399) in iteration-push.sh's shape-aware defer-streak
+# file, printing ONCE per streak; this branch owns the RESPONSE, same for both.
+IF stdout contains "— ESCALATION REQUIRED (g-":
     # Do BOTH, then CONTINUE the cycle — the escalation IS the fix path; local
-    # code stays runnable, and hand-resolving a shared-store conflict mid-goal
-    # is exactly the improvised git the no-transcription contract forbids.
-    1. Post the directive's one-line summary (conflicted path(s) from the merge
-       output above it, behind=N, this box's hostname) to the coordination
-       board: board-post.sh --channel coordination --type escalation
-       --tags "merge-conflict,g-306-315". The board survives the partition the
-       blocked merge IS (guard-997), so peers see the wedge even though this
-       box's store writes cannot reach them.
+    # code stays runnable, and hand-resolving a shared-store wedge mid-goal is
+    # exactly the improvised git the no-transcription contract forbids.
+    1. Post the directive's one-line summary (the blocking path(s) it names,
+       behind=N, this box's hostname) to the coordination board:
+       board-post.sh --channel coordination --type escalation --tags
+       "merge-wedge,<the g-NNN in the headline>". The board survives the
+       partition the blocked merge IS (guard-997), so peers see the wedge even
+       though this box's store writes cannot reach them.
     2. Append an sq-013 observation to the spark_capture WM slot (the sanctioned
-       worker relay, Phase 3.5 shape) naming the conflicted path(s), behind
-       count, box, and streak since-stamp — the reducer's spark replay files the
-       Unblock so the wedge gets an OWNER, not just visibility.
-    Do NOT stop the loop, do NOT git-merge by hand, and do NOT re-escalate on
-    later cycles — the directive prints once per streak by design; its absence
-    means either no repeat or already escalated.
+       worker relay, Phase 3.5 shape) naming those path(s), behind count, box,
+       and streak since-stamp — the reducer's spark replay files the Unblock so
+       the wedge gets an OWNER, not just visibility.
+    Do NOT stop the loop, do NOT git-merge or clear files by hand, and do NOT
+    re-escalate on later cycles — the directive prints once per streak by
+    design; its absence means either no repeat or already escalated.
 
 # Phase -0.2 — WATCHDOG TICK (g-306-240). A scoped CALL to the SAME probe engine
 # the reducer uses, in its role-filtered mode — never a worker-local detector
@@ -586,12 +590,12 @@ IF claim conflict: abort this goal, loop to SELECT.
 
 # Phase 2.9 — READ THE RECORD YOU WERE JUST HANDED (g-115-6695). The claim
 # response IS the full goal record. The loop's only OTHER prompt to touch
-# outcome_note is the one that WRITES it (3.9), so skipping this puts the read
-# after the work it would have prevented. aspirations-select's instrument never
-# reaches this path, and workers are the MAJORITY of claims.
-IF the claim response's `outcome_note` is non-empty: read it before re-deriving
-  anything. Treat it as a prior measurement to VERIFY, not repeat; if the work
-  already landed, close or release per Phase 4a instead of rebuilding it.
+# these fields is the one that WRITES them (3.9), so skipping it puts the read
+# after work it would prevent. Workers are MOST claims.
+READ EVERY narrative field: `outcome_note`, `outcome_notes` (plural, guard-3512),
+  `progress_note`, `description`. An empty outcome_note is NOT an untouched goal
+  — prior work hides in progress_note (g-364-54). Treat it as a measurement to
+  VERIFY, not repeat; if it landed, close or release per Phase 4a.
 # Rationale: core/config/rationale/worker-claim-outcome-note-read.md
 # Phase 2.95 — UNIT CLAIM (g-306-322). The machine-checkable half of 2.9: a goal whose
 # own text says one unit per pass is NON-TERMINAL, so each Body claims it, does
@@ -848,6 +852,9 @@ Bash: py -3 core/scripts/worker_execute.py check-outputs <class> [<class>...]
 # that is the one residual failure mode of this carrier (it is why
 # local-git-commit keeps its own row in OUTPUT_CLASS_CARRIERS rather than being
 # folded into framework-file-edit).
+# THIS MERGES TOO (fetch + integrate BEFORE the push), so it voids a live
+# full-suite run exactly as Phase -0.3 does — the flags differ on PUSH, never on
+# MERGE. Same constraint, same rationale file as Phase -0.3.
 Bash: bash core/scripts/iteration-push.sh --push-worker-ref
 # Pushes HEAD to refs/workers/<agent>/<sid>, then STOPS — it never touches the
 # shared branch. This does NOT contradict Phase -0.3's --no-push: that flag's

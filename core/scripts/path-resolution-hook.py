@@ -167,6 +167,55 @@ def main():
     if not is_absolute_path(file_path):
         approve_no_mutation()
 
+    # --- Harness-scratchpad deny (P4, 2026-08-21) ---
+    # The platform injects a per-session scratchpad (<system-temp>/claude/
+    # <project-slug>/<sid>/) and instructs the model to use it for ALL temp
+    # files. This framework overrides that: the scratchpad is invisible to
+    # every other agent and to the citation/drain/receipt/encoding machinery
+    # (measured 2026-08-21: 1,854 dead project dirs + 440 aged session dirs
+    # on one box — knowledge nobody could find). Sanctioned homes instead:
+    # agents/<name>/sessions/<SID>/scratch/ and agents/<name>/temp/.
+    # See .claude/rules/no-scratchpad.md (behavioral layer) and
+    # core/config/conventions/temp-store.md.
+    #
+    # Deliberately BEFORE agent resolution: a scratchpad target is
+    # categorically out of bounds, so this deny must fire even in an unbound
+    # session — everything below fails open when no agent resolves, which is
+    # exactly the state assistant-mode continuations run in. Needs only the
+    # path itself (no PROJECT_ROOT, no conf). Bash redirects are not gated by
+    # this hook; housekeeping-tick Lane B is the janitor for those.
+    _sp = norm_path(file_path).lower()
+    # The literal prefixes cover the fleet's observed shapes; the
+    # tempfile-derived prefix makes the deny platform-truthful on a box with
+    # a nonstandard TMPDIR (where BOTH literal shapes and the settings deny
+    # rules would miss). Same derivation housekeeping-tick Lane B uses.
+    try:
+        import tempfile
+        _td = norm_path(str(Path(tempfile.gettempdir()) / "claude")).lower()
+    except Exception:
+        _td = ""
+    if (
+        "/appdata/local/temp/claude/" in _sp
+        or _sp.startswith("/tmp/claude/")
+        or _sp.startswith("/tmp/claude-")
+        or _sp.startswith("/var/tmp/claude/")
+        or _sp.startswith("/var/tmp/claude-")
+        or (_td and _sp.startswith(_td + "/"))
+    ):
+        emit_deny(
+            f"Path-resolution hook (L1) blocked {tool_name} to:\n"
+            f"  {file_path}\n"
+            f"This is the Claude Code harness scratchpad — a per-session dir "
+            f"invisible to every other agent and to the framework's citation, "
+            f"drain, receipt, and encoding machinery. This project does not "
+            f"use it (see .claude/rules/no-scratchpad.md), the same way it "
+            f"does not use platform auto-memory.\n"
+            f"Route instead:\n"
+            f"  - session-scoped scratch -> agents/<agent>/sessions/<SID>/scratch/\n"
+            f"  - working files / evidence with a lifecycle -> agents/<agent>/temp/\n"
+            f"  - knowledge worth keeping -> the tree / reasoning bank, not a temp file"
+        )
+
     project_root = os.environ.get("PROJECT_ROOT", "")
     if not project_root:
         approve_no_mutation()

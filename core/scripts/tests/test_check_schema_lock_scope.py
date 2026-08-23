@@ -165,11 +165,22 @@ def test_stale_cur_can_only_refuse_never_falsely_pass():
 def test_eval_calls_precede_the_update_goal_lock():
     """INSPECTION-GRADE, and labelled as such.
 
-    The goal asks for a timing probe rather than inspection, and the tests
-    above are behavioural. This one is a cheap tripwire for the specific
-    regression of moving the evaluation back inside the lock — it cannot
-    prove absence of shell-out under lock, only that the call sites sit
-    ahead of the `update_goal` critical section.
+    A cheap tripwire for the specific regression of moving the evaluation back
+    inside the lock. It cannot prove absence of shell-out under lock, only that
+    the call sites sit ahead of the `update_goal` critical section.
+
+    THE RUNTIME COUNTERPART NOW EXISTS and is the one that answers the goal's
+    "demonstrated by a probe, not by inspection":
+    `mind_api/tests/test_check_schema_lock_runtime.py` DRIVES the production
+    `update_goal` with a real allowlisted shelling check and records the lock
+    depth at each `subprocess.run` entry. Verified to discriminate — against the
+    pre-fix source (e85ba0c31) it fails with depth 1 while its positive control
+    still passes.
+
+    Keep BOTH. They fail on different things: this one catches the call site
+    moving back under the lock even if no check in the fixture happens to shell
+    out, and the runtime one catches anything that shells out under the lock by
+    a path nobody thought to grep for. Neither subsumes the other.
     """
     src = DAEMON_WRITE.read_text(encoding="utf-8").splitlines()
     lo, hi = _function_bounds(src, "update_goal")

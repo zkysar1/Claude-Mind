@@ -74,9 +74,9 @@ figure understates tokens ~1.6x. It is not a rounding error: a pre-read
 estimate using this rule's ratio put that file at 99.6% of cap when it was at
 **161%**, and the Read came back at 53% of the file. ID-dense markdown (goal
 ids, guard ids, shas, timestamps, tables) tokenizes far denser than prose.
-What is NOT measured is a self.md's own ratio — identity files are
-prose-dominant, so ~4 B/tok is plausible there and the 28%-of-cap
-reassurance below is consistent with every fleet size ever measured. Treat
+A self.md's own ratio IS measured: **2.610 B/tok** (foxtrot, 2026-08-22,
+62,336 B) — id-dense, NOT prose-dominant, so the ~28%-of-cap line above
+understates ~1.5x (28k B is 43% of cap, not 28%). Treat
 4 B/tok as an unverified upper-bound estimate for prose and **2.5 B/tok as
 the measured floor for anything id-dense**; when it matters, get the real
 number from a truncation notice (it prints the token count) rather than
@@ -85,14 +85,14 @@ CONFIRMED; the density finding was not predicted by the claim.)
 
 **Do NOT trim a self.md on byte count alone.** The unitless "~25k" above misled
 two agents on the SAME DAY (2026-07-31) into reading it as BYTES and concluding
-their identity files were at or past the cap: zeta at 28,125 bytes recorded the
-false claim in its own front matter before re-measuring, and bravo independently
-reached the same wrong conclusion hours later and was about to file fleet-wide
-trim work. Both were falsified the same way — a single Read returns the LAST
-line of the file. Fleet sizes measured that day (20.2k–28.1k bytes) are all
-comfortably whole. Before acting on a suspected truncation, READ the file and
-check whether the final line came back; a byte count is not evidence of
-truncation, and trimming an identity file is destructive and hard to undo.
+their 28k-byte identity files were at or past the cap; both were falsified the
+same way — a single Read returns the LAST line of the file. Before acting on a
+suspected truncation, READ the file and check whether the final line came back;
+a byte count is not evidence of truncation, and trimming an identity file is
+destructive and hard to undo. **And never inherit a fleet baseline — sizes
+move.** The 2026-07-31 spread was 20.2k–28.1k bytes; on 2026-08-22 it was
+43.7k–62.3k, others at 72–76% of cap, and foxtrot's HAD truncated at 65.5k /
+25,082 tokens (g-115-7060). No cadence measures this.
 (g-115-1687; rb-2077 read-cap over-growth recurrence, self.md surface-class —
 the agent-identity-file twin of the tree-node guard g-115-1570.)
 

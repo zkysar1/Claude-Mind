@@ -789,7 +789,11 @@ Bash: source core/scripts/_paths.sh && bash core/scripts/iteration-commit.sh \
 #    push). Same shared component the loop and D6.65 use; fail-soft by
 #    contract, so a network blip degrades to "committed locally, push next
 #    session" and is logged loudly. Never let a push failure block the
-#    terminal call.
+#    terminal call. This is ALSO the session-END pull: fetch is throttled
+#    (~10-min interval) but integrate runs every call, even when the push
+#    defers. Session-START freshness is owned by assistant.md
+#    "Session-Start Sync" (iteration-push.sh --no-push, g-115-3871) — do
+#    not add a second pull path here.
 Bash: bash core/scripts/iteration-push.sh
 ```
 

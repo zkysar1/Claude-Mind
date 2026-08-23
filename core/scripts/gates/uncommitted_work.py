@@ -232,7 +232,8 @@ def _repo_default_ref(repo: Path) -> Optional[str]:
     return None
 
 
-def get_stranded_repos(roots: List[Path], fresh_hours: int = 48) -> List[dict]:
+def get_stranded_repos(roots: List[Path], fresh_hours: int = 48,
+                       goal_id: str = "") -> List[dict]:
     """The 'built but never connected' probe ( /  class).
 
     For each delivery repo, two ways work can be DONE-looking without having
@@ -245,13 +246,43 @@ def get_stranded_repos(roots: List[Path], fresh_hours: int = 48) -> List[dict]:
         presence is noise, and a NEW product file that matters is always
         accompanied by a tracked-file edit wiring it in.
 
-      stranded_commits — commits younger than `fresh_hours` reachable from any
-        local or origin ref but NOT from origin's default branch: committed,
-        possibly even pushed to a side branch with a PR nobody merged — and
-        invisible to every other box's default checkout. Age-bounded so one
-        crusty historical branch does not veto every close forever; older
-        strandings are reported in `stale_stranded_commits` (visibility
-        without a veto).
+      stranded_commits — the BLOCKING set. Commits younger than `fresh_hours`
+        that are off origin's default branch AND are this close's own problem,
+        which is two disjoint cases:
+
+          (a) LOCAL-ONLY — reachable from a local branch but contained by NO
+              remote ref (`--branches --not --remotes`). Only THIS box can
+              deliver them, so they block regardless of which goal made them.
+              Congruent with completed-not-committed-sweep's per-sha test
+              (`git branch -r --contains <sha>` empty ⇒ local-only), so the
+              two agree on one question instead of asking two.
+
+          (b) PUSHED-BUT-UNMERGED AND ATTRIBUTED — on a side branch with a PR
+              nobody merged, AND naming `goal_id` in the commit message. This
+              is the g-115-6784 / g-115-6785 incident shape, preserved intact:
+              a goal that closes with ITS OWN work stranded still refuses.
+
+        Pushed-but-unmerged commits belonging to OTHER goals are reported in
+        `unattributed_unmerged` (visibility without a veto). That split is the
+        g-115-6851 fix and it exists because the un-attributed predicate had
+        NO discriminating power left: measured 2026-08-20 (alpha worker, cc-08),
+        10 of 10 delivery repos blocked, on 26 commits every one of which was a
+        teammate's open PR from 4-34h earlier (g-363-09, g-326-422, g-350-194,
+        g-335-1305 ...) on a fleet whose normal workflow IS branch+PR. A gate
+        that refuses every close fleet-wide is not a gate — it trains an
+        override reflex, which is a deleted gate with extra friction
+        (guard-2273: when the filtered count equals the population, the
+        predicate excluded nothing).
+
+        Age-bounded so one crusty historical branch does not veto every close
+        forever; older strandings are reported in `stale_stranded_commits`
+        (visibility without a veto).
+
+        NOT the `ahead`-count this goal originally prescribed. Measured the
+        same run: `rev-list --count <default_ref>..HEAD` reads 1 on four of the
+        ten repos whose HEAD sits on a pushed feature branch, so it would have
+        kept false-blocking exactly the repos it was meant to release, while
+        also dropping case (b) entirely.
 
     STALENESS HANDLING is the inverse of get_undelivered_framework_files: a
     stale origin/<default> UNDER-delivers (a PR merged remotely five minutes
@@ -266,7 +297,7 @@ def get_stranded_repos(roots: List[Path], fresh_hours: int = 48) -> List[dict]:
     findings: List[dict] = []
     for repo in roots:
         try:
-            finding = _check_one_repo(repo, fresh_hours)
+            finding = _check_one_repo(repo, fresh_hours, goal_id)
             if finding is not None and (finding["dirty_tracked"]
                                         or finding["stranded_commits"]):
                 # One retry after a targeted default-branch refresh, so a
@@ -276,10 +307,11 @@ def get_stranded_repos(roots: List[Path], fresh_hours: int = 48) -> List[dict]:
                      "--quiet", "--no-tags"],
                     capture_output=True, text=True, timeout=30,
                 )
-                finding = _check_one_repo(repo, fresh_hours)
+                finding = _check_one_repo(repo, fresh_hours, goal_id)
             if finding is not None and (finding["dirty_tracked"]
                                         or finding["stranded_commits"]
-                                        or finding["stale_stranded_commits"]):
+                                        or finding["stale_stranded_commits"]
+                                        or finding["unattributed_unmerged"]):
                 findings.append(finding)
         except (subprocess.TimeoutExpired, OSError) as exc:
             print(f"[uncommitted-gate] delivery-repo probe failed for "
@@ -287,7 +319,8 @@ def get_stranded_repos(roots: List[Path], fresh_hours: int = 48) -> List[dict]:
     return findings
 
 
-def _check_one_repo(repo: Path, fresh_hours: int) -> Optional[dict]:
+def _check_one_repo(repo: Path, fresh_hours: int,
+                    goal_id: str = "") -> Optional[dict]:
     default_ref = _repo_default_ref(repo)
     if default_ref is None:
         print(f"[uncommitted-gate] {repo}: no origin default ref — skipping",
@@ -304,25 +337,50 @@ def _check_one_repo(repo: Path, fresh_hours: int) -> Optional[dict]:
     dirty = sorted({p for p in (_parse_porcelain_line(l)
                                 for l in st.stdout.splitlines()) if p})
 
-    def _rev_list(extra: List[str]) -> List[str]:
+    def _rev_list(args: List[str]) -> List[str]:
         r = subprocess.run(
-            ["git", "-C", str(repo), "rev-list", "--branches",
-             "--remotes=origin", "--not", default_ref, *extra],
+            ["git", "-C", str(repo), "rev-list", *args],
             capture_output=True, text=True, timeout=15,
         )
         if r.returncode != 0:
             return []
         return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
 
-    fresh = _rev_list([f"--since={fresh_hours}.hours.ago"])
-    allc = _rev_list([])
-    stale = [c for c in allc if c not in set(fresh)]
+    # OFF-DEFAULT: reachable from any local or origin ref, not from the default
+    # branch. The population both cases below are drawn from.
+    off_default = ["--branches", "--remotes=origin", "--not", default_ref]
+    # LOCAL-ONLY: contained by no remote ref at all. `--remotes` (no `=origin`)
+    # walks refs/remotes/* entirely, matching the sibling sweep's `branch -r`.
+    local_only_args = ["--branches", "--not", "--remotes"]
+    since = [f"--since={fresh_hours}.hours.ago"]
+
+    fresh_off_default = _rev_list(off_default + since)
+    fresh_local_only = set(_rev_list(local_only_args + since))
+    # Attribution: the fleet's commit convention names the goal as the
+    # conventional-commit SCOPE (`fix(): ...`). The needle is the
+    # PARENTHESIZED form, byte-identical to completed-not-committed-sweep's
+    # `resolve_shas_by_goal_id` (needle = f"({goal_id})"), so the gate and the
+    # sweep attribute a commit the same way instead of two ways. A bare
+    # substring would also match a prose mention ("supersedes ") and
+    # re-introduce a false block — the exact failure being removed here.
+    # -F keeps the parens literal rather than a regex group. No goal_id (a
+    # bare probe) attributes nothing: the reporting-only direction, never a
+    # wider block.
+    fresh_attributed = set(
+        _rev_list(off_default + since + ["-F", f"--grep=({goal_id})"])
+    ) if goal_id else set()
+
+    blocking = [c for c in fresh_off_default
+                if c in fresh_local_only or c in fresh_attributed]
+    unattributed = [c for c in fresh_off_default if c not in set(blocking)]
+    stale = [c for c in _rev_list(off_default) if c not in set(fresh_off_default)]
     return {
         "repo": str(repo),
         "default_ref": default_ref,
         "dirty_tracked": dirty,
-        "stranded_commits": fresh[:20],
+        "stranded_commits": blocking[:20],
         "stale_stranded_commits": stale[:20],
+        "unattributed_unmerged": unattributed[:20],
     }
 
 
@@ -418,7 +476,8 @@ def evaluate(*, goal_id: str, override: Optional[str], repo_path: Path,
     # legitimately closes with a PR still open passes
     # --override-uncommitted "PR #N open", which puts the pointer on the audit
     # ledger instead of leaving the stranding silent.
-    stranded = get_stranded_repos(_delivery_repo_roots(world_dir))
+    stranded = get_stranded_repos(_delivery_repo_roots(world_dir),
+                                  goal_id=goal_id or "")
     stranded_blocks = any(f["dirty_tracked"] or f["stranded_commits"]
                           for f in stranded)
     for f in stranded:
@@ -428,6 +487,14 @@ def evaluate(*, goal_id: str, override: Optional[str], repo_path: Path,
                   f"{len(f['stale_stranded_commits'])} stranded commit(s) "
                   f"older than the freshness window (reporting, not blocking)",
                   file=sys.stderr)
+        # Released by the  attribution split. Reported every run so
+        # the release is VISIBLE: a stranding that stops blocking silently is
+        # indistinguishable from a gate someone deleted.
+        if f["unattributed_unmerged"]:
+            print(f"[uncommitted-gate] NOTE: {f['repo']} carries "
+                  f"{len(f['unattributed_unmerged'])} fresh commit(s) pushed to "
+                  f"an unmerged branch by OTHER goals (not {goal_id or 'this goal'}"
+                  f") — reporting, not blocking", file=sys.stderr)
 
     would_block = (bool(dirty) or delivery_blocks or stranded_blocks) \
         and effective_override is None

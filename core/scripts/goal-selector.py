@@ -1374,6 +1374,32 @@ def _compose_rows(core_doc):
         return core_doc
 
 
+_SKILL_QUALITY_CACHE = {}
+
+
+def _load_skill_quality_cached():
+    """Read meta/skill-quality.yaml once and cache for the selector run.
+
+    skill_affinity (criterion 12) previously called read_yaml_file per
+    CANDIDATE — the same ~18KB YAML parsed once per scored goal. Measured
+    2026-08-21 (alpha, cc-09, 1,335 candidates): 27.9ms of the 29.9ms
+    per-goal scoring cost — ~37s of a ~40s selector invocation spent
+    re-parsing one unchanged file for the second-lowest-weighted criterion.
+    One snapshot per process is also the CORRECT read, not merely the cheap
+    one: a mid-invocation edit to skill-quality.yaml must not let two
+    candidates score against different quality tables in the same ranking.
+    Keyed by str(SKILL_QUALITY_PATH) rather than a bare singleton so tests
+    and perf probes that repoint the module attribute get a fresh parse
+    instead of a stale hit. Mirrors _load_team_state_cached above. Callers
+    treat the returned dict as READ-ONLY (guard-1663: never mutate a
+    shared-cache record).
+    """
+    key = str(SKILL_QUALITY_PATH)
+    if key not in _SKILL_QUALITY_CACHE:
+        _SKILL_QUALITY_CACHE[key] = read_yaml_file(SKILL_QUALITY_PATH)
+    return _SKILL_QUALITY_CACHE[key]
+
+
 PRIORITY_MAP = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
 # Inverse of PRIORITY_MAP: numeric raw["priority"] -> name, for apply_starvation_boost
 # (), which gates the anti-starvation lift on the named-priority multipliers.
@@ -2158,7 +2184,7 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
                 else:
                     continue  # No expiry configured — legacy behavior
 
-            # Claim check (world goals only): skip goals claimed by someone else.
+            # Claim check (ALL sources): skip goals claimed by someone else.
             # Expiry makes stale claims (older than claim_timeout_hours) fall through
             # so other agents can pick up abandoned work. The actual re-claim is still
             # atomic via aspirations-claim.sh — this only controls VISIBILITY.
@@ -2181,29 +2207,69 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
             # Fail-open by construction: when either SID is absent (legacy record
             # with no claimed_by_sid, or MIND_SID unset) `sibling_body` is False
             # and this filter behaves exactly as it did before .
-            if source == "world":
-                claimed = goal.get("claimed_by")
-                claim_sid = goal.get("claimed_by_sid")
-                other_mind = bool(claimed) and claimed != AGENT_NAME
-                sibling_body = (
-                    bool(claimed)
-                    and claimed == AGENT_NAME
-                    and isinstance(claim_sid, str) and bool(claim_sid)
-                    and bool(BODY_SID)
-                    and claim_sid != BODY_SID
-                )
-                if other_mind or sibling_body:
-                    if claim_timeout_hours is not None:
-                        effective_timeout = claim_timeout_hours
-                        if goal.get("recurring"):
-                            interval = get_interval_hours(goal)
-                            effective_timeout = min(claim_timeout_hours, 2 * interval)
-                        claim_age = hours_since(goal.get("claimed_at"))
-                        if claim_age is not None and claim_age <= effective_timeout:
-                            continue  # Valid claim — skip
-                        # else: claim expired or no claimed_at — fall through to include
-                    else:
-                        continue  # No expiry configured — legacy behavior
+            #
+            # UNCONDITIONAL ACROSS SOURCES since the 2026-08-21 selection-stack
+            # review ( part 2). This block was `if source == "world"`
+            # from birth, but agent-queue goals DO carry claims: cross-agent
+            # pull writes the claim back to the OWNING sibling's queue
+            # (), and under Mind/Body a sibling Body's claim lands on
+            # this agent's own queue — both were invisible to this filter, so a
+            # claimed agent-queue goal kept re-qualifying for its owner and for
+            # every puller (the world-queue livelock, reproduced one store
+            # over). Where the claim fields are absent — the overwhelming
+            # agent-queue majority — `other_mind` and `sibling_body` are both
+            # False and the block is a structural no-op, so behavior changes
+            # ONLY for records carrying a live foreign/sibling claim.
+            #   (c) an ORPHANED SID claim () — `claimed_by` is null but
+            #       `claimed_by_sid` still names a live session. BOTH branches
+            #       above are gated on `bool(claimed)`, so this record is
+            #       structurally invisible to them and gets offered as UNCLAIMED
+            #       while a live Body holds it. guard-4434 is the reading rule:
+            #       a null claimed_by beside a non-null claimed_by_sid IS a
+            #       claim, and a foreign sid fails closed regardless of the
+            #       missing name. This is the enforcement half.
+            #       The shape is not hypothetical and not a legacy artifact: it
+            #       is produced by own-cloud fenced-PUT reconcile damage
+            #       (rb-3636 sub-mechanism B / class ), which nulls
+            #       claimed_by while siblings survive. Measured 2026-08-22
+            #       (zeta, cc-02): 7 damaged records live, and the ONE carrying
+            #       a non-null sid — , holding alpha's then-active body
+            #       SID — was being offered in the candidate list at that
+            #       moment. Detector: core/scripts/claim-integrity-check.py.
+            #       Fails CLOSED when BODY_SID is unset (every sid then reads
+            #       foreign), which is the safe direction for a claim check and
+            #       costs nothing: the population is records with a null name
+            #       AND a live sid — 1 of 2239 non-terminal goals when measured.
+            #       Routed through the SAME expiry ladder below, so a dead
+            #       Body's orphaned claim still ages out and is reclaimable
+            #       rather than freezing the goal forever.
+            claimed = goal.get("claimed_by")
+            claim_sid = goal.get("claimed_by_sid")
+            other_mind = bool(claimed) and claimed != AGENT_NAME
+            sibling_body = (
+                bool(claimed)
+                and claimed == AGENT_NAME
+                and isinstance(claim_sid, str) and bool(claim_sid)
+                and bool(BODY_SID)
+                and claim_sid != BODY_SID
+            )
+            orphan_sid_claim = (
+                not claimed
+                and isinstance(claim_sid, str) and bool(claim_sid)
+                and claim_sid != BODY_SID
+            )
+            if other_mind or sibling_body or orphan_sid_claim:
+                if claim_timeout_hours is not None:
+                    effective_timeout = claim_timeout_hours
+                    if goal.get("recurring"):
+                        interval = get_interval_hours(goal)
+                        effective_timeout = min(claim_timeout_hours, 2 * interval)
+                    claim_age = hours_since(goal.get("claimed_at"))
+                    if claim_age is not None and claim_age <= effective_timeout:
+                        continue  # Valid claim — skip
+                    # else: claim expired or no claimed_at — fall through to include
+                else:
+                    continue  # No expiry configured — legacy behavior
 
             # blocked_by check (dependency timeout — fail-CLOSED hardening, ).
             # Keep the goal blocked UNLESS the block is genuinely stale: blocked_since
@@ -2870,6 +2936,34 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
     return blocked
 
 
+BLOCKED_PRESET_REASONS = [
+    "infrastructure", "dependency", "deferred", "hypothesis_gate", "explicit_status",
+]
+
+
+def _blocked_reason_counts(blocked):
+    """Canonical reason -> count map over collect_blocked output.
+
+    SINGLE SOURCE for the by_reason reason SET, shared by cmd_select's
+    all-blocked summary and cmd_blocked's tally so the two surfaces cannot
+    drift again. They drifted once: cmd_blocked hard-coded the 5
+    BLOCKED_PRESET_REASONS while collect_blocked had grown to 7
+    (precondition_unmet, not_my_lane). Measured 2026-08-21 (alpha, cc-09):
+    9 of 250 live blocked rows were present in blocked_goals[] and counted
+    in summary.total_blocked but absent from by_reason — sum(by_reason) !=
+    total_blocked, and a reader tallying by_reason concluded those classes
+    were empty. Preset keys are always present (zero-count) because
+    consumers iterate them (verify-learning q3386 asserts key presence;
+    aspirations-all-blocked reads them); observed extras are added
+    dynamically so a future predicate class is visible the day it ships.
+    """
+    counts = {r: 0 for r in BLOCKED_PRESET_REASONS}
+    for e in blocked:
+        r = e.get("block_reason") or "unknown"
+        counts[r] = counts.get(r, 0) + 1
+    return counts
+
+
 def trace_root_bottleneck(goal_id, goal_map, done_ids, blocker_by_skill, blocker_by_category=None, visited=None):
     """Walk dependency chains to find the ultimate root blocker.
 
@@ -2979,12 +3073,52 @@ def evidence_score(asp, resolved):
 # Category resolution
 # ---------------------------------------------------------------------------
 
+def _suggest_category(text):
+    """Category suggestion for free text. Returns a category key or None.
+
+    Calls gates.category_suggest.evaluate IN-PROCESS rather than spawning
+    category-suggest.py. The CLI is a thin shim over this same function, so the
+    result is identical; what is removed is one interpreter startup per lookup.
+
+    MEASURED (g-115-6972, echo, cc-03, 2026-08-21) — and the first two fixes
+    tried were both wrong, so the reasoning is recorded here:
+      * a MEMO on (title, description) buys NOTHING: instrumented over a real
+        select, category lookups were hits=0 / misses=5 — five uncategorized
+        goals, five distinct texts, each resolved exactly once. There is
+        nothing to memoize.
+      * BATCHING the subprocess was the other candidate, and it addresses the
+        smaller half: of the 3.8s per spawn, only ~1.7s is process startup.
+      * The dominant 2.1s was INSIDE evaluate, which re-parsed a 1.53 MB
+        _tree.yaml and rebuilt the concept index on every call. That is fixed
+        in gates/category_suggest.py::_load_tree_cached.
+    In-process is what makes that cache reachable at all — a fresh subprocess
+    per lookup can never hit an in-process cache, so the two changes only work
+    together.
+
+    Import is lazy and inside the try: it costs 0.03s, is needed only on the
+    uncategorized path, and a failure here must degrade to the tags fallback
+    exactly as the subprocess failure did — never raise into scoring.
+    """
+    try:
+        from gates.category_suggest import evaluate as _cat_eval
+        matches = _cat_eval(text, top_n=1, world_dir=WORLD_DIR)
+        if matches and matches[0].get("score", 0) > 0:
+            return matches[0]["key"]
+    except Exception:
+        pass
+    return None
+
+
 def _resolve_category(goal, asp):
     """Resolve goal category: direct field > suggest from text > aspiration tag.
 
     Falls back through three strategies:
     1. goal.category if set and not "uncategorized"
-    2. category-suggest.py on title+description
+    2. gates.category_suggest.evaluate on title+description — called IN-PROCESS,
+       NOT memoized here. A per-(title,description) memo was tried and measured
+       useless (hits=0/misses=5: every lookup is a distinct goal text); the win
+       came from the parsed-tree cache INSIDE category_suggest. See
+       _suggest_category.
     3. First aspiration tag, then "uncategorized"
     """
     cat = goal.get("category")
@@ -2996,19 +3130,9 @@ def _resolve_category(goal, asp):
         title=goal.get("title", ""),
         desc=goal.get("description", ""),
     )
-    try:
-        result = subprocess.run(
-            [sys.executable, str(CORE_ROOT / "scripts" / "category-suggest.py"),
-             "--text", text, "--top", "1"],
-            capture_output=True, timeout=5,
-            encoding="utf-8", errors="replace",
-        )
-        if result.returncode == 0:
-            matches = json.loads(result.stdout)
-            if matches and matches[0].get("score", 0) > 0:
-                return matches[0]["key"]
-    except Exception:
-        pass
+    suggested = _suggest_category(text)
+    if suggested:
+        return suggested
 
     tags = _ensure_list(asp.get("tags"))
     return tags[0] if tags else "uncategorized"
@@ -3872,7 +3996,7 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
     # Goals with no skill or unevaluated skills get neutral 0.
     skill = goal.get("skill", "")
     skill_name = skill.strip("/").split()[0] if skill else ""
-    skill_quality_data = read_yaml_file(SKILL_QUALITY_PATH)
+    skill_quality_data = _load_skill_quality_cached()
     sq_skills = skill_quality_data.get("skills", {})
     sq_entry = sq_skills.get(skill_name, {})
     sq_aggregate = sq_entry.get("aggregate", {})
@@ -5057,15 +5181,11 @@ def cmd_select(args):
                                       dependency_timeout_hours=dependency_timeout_hours,
                                       global_live_ids=global_live_ids_retry)
             if blocked:
-                summary = {}
-                for b in blocked:
-                    reason = b["block_reason"]
-                    summary[reason] = summary.get(reason, 0) + 1
                 print(json.dumps({
                     "candidates": [],
                     "all_blocked": True,
                     "blocked_count": len(blocked),
-                    "by_reason": summary,
+                    "by_reason": _blocked_reason_counts(blocked),
                     "blocked_goals": [
                         {"goal_id": b["goal_id"], "title": b["title"],
                          "reason": b["block_reason"],
@@ -5217,8 +5337,7 @@ def cmd_select(args):
 
 def cmd_blocked(args):
     """List all blocked goals with reasons. Output: JSON with blocked_goals and by_reason."""
-    empty_reasons = {r: {"count": 0, "goal_ids": []} for r in
-                      ["infrastructure", "dependency", "deferred", "hypothesis_gate", "explicit_status"]}
+    empty_reasons = {r: {"count": 0, "goal_ids": []} for r in BLOCKED_PRESET_REASONS}
     empty_reasons["dependency"]["head_count"] = 0
     empty_reasons["dependency"]["downstream_count"] = 0
 
@@ -5282,10 +5401,12 @@ def cmd_blocked(args):
             if g.get("status") not in ("completed", "skipped", "expired", "decomposed"):
                 total_active += 1
 
-    # Group by reason
-    reasons = ["infrastructure", "dependency", "deferred", "hypothesis_gate", "explicit_status"]
+    # Group by reason — reason set from the shared canonical counter (preset 5
+    # always present, observed extras added dynamically) so this tally can never
+    # again omit a class collect_blocked emits. See _blocked_reason_counts for
+    # the 2026-08-21 drift this closes.
     by_reason = {}
-    for reason in reasons:
+    for reason in _blocked_reason_counts(blocked):
         matches = [e for e in blocked if e["block_reason"] == reason]
         entry = {"count": len(matches), "goal_ids": [e["goal_id"] for e in matches]}
         if reason == "dependency":

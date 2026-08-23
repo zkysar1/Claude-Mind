@@ -522,9 +522,11 @@ upd_d = subprocess.run(
      "--source", src, "update-goal", gid, "consecutive_deep", str(new_deep)],
     capture_output=True, text=True, encoding="utf-8",
 )
+deep_write_landed = upd_d.returncode == 0
 if upd_d.returncode != 0:
     print(f"[recurring-close] update consecutive_deep failed: {upd_d.stderr}", file=sys.stderr)
     # Non-fatal — auto-contract is a value-add, not load-bearing.
+    # But the narration below MUST NOT claim the transition happened ().
 
 # Persist last_outcome_origin on the goal for audit / observability ().
 # Overwritten each close. Lets future debugging trace WHY consecutive_deep
@@ -573,10 +575,24 @@ if new_sub_hits != current_sub_hits:
 
 # Surface the decision so the loop's stderr stream captures it. Mirrors the
 # Block A/C flip notification line above (line ~192).
+# : report the PERSISTED state, never the INTENDED one. The write
+# above is deliberately non-fatal, so when it failed this line still narrated
+# the transition ("consecutive_deep=2→3") while the record still read 2 — the
+# log and the store disagreed and nothing surfaced it. Same defect class as
+# guard-3826 (iteration-close renders the full success affordance even when it
+# closed nothing): a close's output is a CLAIM about the store, and a reader
+# trusting it is reading the claim, not the record.
 if outcome == "deep":
+    if deep_write_landed:
+        deep_render = f"consecutive_deep={current_deep}→{new_deep}"
+    else:
+        deep_render = (
+            f"consecutive_deep={current_deep} "
+            f"(UNCHANGED — write FAILED, intended {new_deep})"
+        )
     print(
         f"[recurring-close] {gid}: outcome_origin={outcome_origin} "
-        f"consecutive_deep={current_deep}→{new_deep} "
+        f"{deep_render} "
         f"(genuine-deeps advance counter; forced-flips pin it; routine resets)",
         file=sys.stderr,
     )

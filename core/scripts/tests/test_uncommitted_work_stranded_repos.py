@@ -85,11 +85,18 @@ def framework_repo(tmp_path):
 
 def test_fresh_commit_on_an_unmerged_branch_blocks_the_close(tmp_path, framework_repo):
     """THE INCIDENT SHAPE: committed, pushed to a side branch, PR never merged.
-    Reachable from origin/side, absent from origin/master -> the close refuses."""
+    Reachable from origin/side, absent from origin/master -> the close refuses.
+
+    The commit message names the closing goal because that is the fleet's
+    production commit shape (`fix(g-350-194): ...` — all 26 live stranded
+    commits measured 2026-08-20 carry it), and since g-115-6851 attribution is
+    what separates THIS goal's stranding (blocks, here) from a teammate's open
+    PR (reports, next test). The fixture previously wrote an anonymous
+    "stranded work" subject, which no production commit resembles."""
     clone = _mk_origin_and_clone(tmp_path, "product")
     _git(clone, "checkout", "-q", "-b", "feature")
     (clone / "app.py").write_text("v2 stranded\n")
-    _git(clone, "add", "-A"); _git(clone, "commit", "-m", "stranded work")
+    _git(clone, "add", "-A"); _git(clone, "commit", "-m", "fix(g-test-1): stranded work")
     _git(clone, "push", "-q", "-u", "origin", "feature")
     _git(clone, "checkout", "-q", "master")  # tree clean, nothing dirty
 
@@ -99,6 +106,72 @@ def test_fresh_commit_on_an_unmerged_branch_blocks_the_close(tmp_path, framework
     assert res["stranded_would_block"] is True
     assert res["would_block"] is True
     assert res["stranded_repos"][0]["stranded_commits"], res["stranded_repos"]
+
+
+def test_another_goals_open_pr_does_not_block_this_close(tmp_path, framework_repo):
+    """: the SAME stranding, attributed to a DIFFERENT goal, must
+    report without vetoing.
+
+    Measured 2026-08-20 (alpha worker, cc-08): the un-attributed predicate
+    blocked 10 of 10 delivery repos on 26 commits, every one a teammate's open
+    PR from 4-34h earlier. A gate that refuses every close fleet-wide has no
+    discriminating power left (guard-2273) and trains an override reflex.
+
+    This is the released direction and it is the half a revert would silently
+    restore, so it is pinned here rather than left to the live tree."""
+    clone = _mk_origin_and_clone(tmp_path, "product")
+    _git(clone, "checkout", "-q", "-b", "feature")
+    (clone / "app.py").write_text("v2 someone else's work\n")
+    _git(clone, "add", "-A"); _git(clone, "commit", "-m", "fix(g-other-42): their work")
+    _git(clone, "push", "-q", "-u", "origin", "feature")
+    _git(clone, "checkout", "-q", "master")
+
+    world = _world_with_manifest(tmp_path, [str(clone)])
+    res = evaluate(goal_id="g-test-1b", override=None,
+                   repo_path=framework_repo, world_dir=world)
+    assert res["stranded_would_block"] is False, res["stranded_repos"]
+    # Released, NOT invisible — a stranding that stops blocking silently is
+    # indistinguishable from a deleted gate.
+    assert res["stranded_repos"][0]["unattributed_unmerged"], res["stranded_repos"]
+
+    # A PROSE MENTION of the closing goal is not authorship. Attribution reads
+    # the conventional-commit SCOPE `(g-...)`, matching the sweep's needle; a
+    # bare substring would re-block here on someone else's commit merely
+    # referring to this goal.
+    _git(clone, "checkout", "-q", "feature")
+    (clone / "app.py").write_text("v3 still theirs\n")
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-m", "fix(g-other-42): their work, supersedes g-test-1b")
+    _git(clone, "push", "-q", "origin", "feature")
+    _git(clone, "checkout", "-q", "master")
+    res2 = evaluate(goal_id="g-test-1b", override=None,
+                    repo_path=framework_repo, world_dir=world)
+    assert res2["stranded_would_block"] is False, res2["stranded_repos"]
+
+
+def test_local_only_commit_blocks_regardless_of_attribution(tmp_path, framework_repo):
+    """The attribution carve-out must NOT reach commits no remote ref contains.
+
+    Only this box can deliver those, so they block whoever made them — the
+    load-bearing half of g-115-6851's verification ("a fix that merely stops
+    blocking is indistinguishable from deleting the gate"). Same commit,
+    both sides of the push: blocks before, reports after."""
+    clone = _mk_origin_and_clone(tmp_path, "product")
+    (clone / "app.py").write_text("v2 local only\n")
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-m", "an anonymous subject naming no goal at all")
+
+    world = _world_with_manifest(tmp_path, [str(clone)])
+    res = evaluate(goal_id="g-test-1c", override=None,
+                   repo_path=framework_repo, world_dir=world)
+    assert res["stranded_would_block"] is True, res["stranded_repos"]
+
+    # Push it: now a remote ref carries it, so it becomes another goal's
+    # open-PR shape and releases.
+    _git(clone, "push", "-q", "-u", "origin", "HEAD:refs/heads/side")
+    res2 = evaluate(goal_id="g-test-1c", override=None,
+                    repo_path=framework_repo, world_dir=world)
+    assert res2["stranded_would_block"] is False, res2["stranded_repos"]
 
 
 def test_unpushed_local_commit_blocks_the_close(tmp_path, framework_repo):

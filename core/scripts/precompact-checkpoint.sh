@@ -47,4 +47,20 @@ export MIND_AGENT="$AGENT"
 # export, body_state_path() always takes the agent-wide fallback and a worker
 # body's PreCompact clobbers the reducer's checkpoint — the defect this fixes.
 export MIND_SID="$SID"
+
+# Clear the context-reads tracker for THIS session (). Pre-hoc and
+# best-effort by nature — PreCompact's matcher in settings.json is 'auto', so a
+# manual /compact fires nothing here, and this hook can time out mid-sequence.
+# The guaranteed clear is the post-hoc one in sessionstart-orchestrator.sh under
+# source=compact. This call is the belt to that braces, and the fail-safe
+# direction is deliberate: clearing a tracker that did not need clearing costs
+# one re-read, while failing to clear leaves the manifest asserting in-context
+# for content the compaction just evicted — which blocks a needed re-read or a
+# needed skill invocation. Clear more, not less.
+#
+# --session-id is load-bearing: without it this targets the AGENT-WIDE tracker,
+# which on a worker Body is a path that does not exist (measured cc-08).
+# Fail-open with `|| true`: PreCompact must never block compaction.
+bash "$CORE_ROOT/scripts/context-reads-clear.sh" --session-id "$SID" >/dev/null 2>&1 || true
+
 exec python3 "$CORE_ROOT/scripts/precompact-checkpoint.py" "$@"

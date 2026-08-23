@@ -1,4 +1,4 @@
-"""Pre-init import safety for daemon-imported core/scripts modules (g-367-03).
+"""Pre-init import safety for daemon-imported core/scripts modules ().
 
 The daemon's endpoints/load_all() imports tree.py, retrieve.py and (via
 aspirations_write's from-import of ACTIVE_AGENTS) gates/capability_route.py at

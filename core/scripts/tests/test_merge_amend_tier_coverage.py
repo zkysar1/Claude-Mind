@@ -103,6 +103,24 @@ HANDLER_DISPOSITION = {
         "The handler is also whole-record-wins (`win, lose = (a, b) if _canon(a) "
         ">= _canon(b) ...`), so a per-field key would be meaningless here.",
     ),
+    "_merge_tree_node": (
+        "_tree.yaml", "field-wise", "COVERED",
+        "g-115-5411. BASE is the DEFAULT class of _classify_tree_field (a TOTAL "
+        "function), so summary / entities / saturated_topics / maintain_exempt / "
+        "origin_goal_id / valid_from / domain_class and every field added later "
+        "rode the newer-last_updated LWW base -- and last_updated is DATE-granular "
+        "by design (g-001-67; g-115-1683 does not bump it on a field poke), so "
+        "same-day edits ALWAYS tied and fell to the lexicographic content "
+        "tiebreak. Measured live, not assumed: a saturated_topics narrowing was "
+        "re-derived away by every merge cycle, a 1953-char replacement losing to a "
+        "1942-char incumbent at list index 1 ('c' > 'a'), in BOTH arg orders. "
+        "Unlike the four stores above this one has no StoreSpec -- _tree.yaml is a "
+        "YAML tree written by tree_write.py, not an id-keyed JSONL record store -- "
+        "so its Layer-2 writer is hand-written in BOTH tree.py cmd_set and "
+        "mind_api/src/world/tree_write.py _apply_set (byte-compat mirrors), and "
+        "the stamp is SECOND-granular there because a date-granular one would "
+        "reproduce the very tie it exists to break.",
+    ),
 }
 
 # The Layer-1 reader constant. Read from source rather than imported so a rename

@@ -198,6 +198,54 @@ def already_filed(asp: dict, dedup_title: str) -> str | None:
     return None
 
 
+def prior_decision_block(asp: dict, dedup_title: str,
+                         excerpt_chars: int = 600) -> str:
+    """Return a PRIOR DECISION preamble citing the last COMPLETED same-title
+    goal that recorded an outcome, or "" when there is none.
+
+    Sibling of already_filed(), NOT a change to it. already_filed deliberately
+    skips terminal goals so a rebuilt deep streak is never gated by a stale
+    closed Idea — that skip is correct and its title match doubles as the dedup
+    key, so neither may move. But the same skip is why a re-filed Idea reaches
+    its executor with no memory that the identical question already has a
+    measured answer: the description is generated fresh from the template and
+    names no predecessor. This scan supplies the memory without touching the
+    gate.
+
+    Measured (g-335-1036, g-115-6411): the same question has been re-filed and
+    re-answered with the same verdict at least four times across three agents —
+    each executor starting from a blank page while the answer sat in a sibling
+    goal's outcome_note.
+    """
+    best_when, best = "", None
+    for g in asp.get("goals", []):
+        if g.get("title") != dedup_title or g.get("status") != "completed":
+            continue
+        if not (g.get("outcome_note") or "").strip():
+            continue
+        when = g.get("completed_at") or g.get("completed_date") or ""
+        if best is None or when >= best_when:
+            best_when, best = when, g
+    if best is None:
+        return ""
+
+    note = " ".join((best.get("outcome_note") or "").split())
+    if len(note) > excerpt_chars:
+        note = note[:excerpt_chars].rstrip() + " [...]"
+    return (
+        f"PRIOR DECISION — this exact question already has a recorded answer. "
+        f"Goal {best.get('id')} carries the identical title and closed "
+        f"{best_when or 'at an unrecorded time'} with:\n\n"
+        f"  \"{note}\"\n\n"
+        f"Read that verdict FIRST and start from it. Re-derive it only if the "
+        f"evidence below has changed since; if you reach the same conclusion, "
+        f"record that briefly and close — do not re-litigate from scratch "
+        f"(guard-3965). This Idea was re-filed because the deep streak "
+        f"rebuilt, which is a genuinely new escalation, NOT because the prior "
+        f"decision was found wanting.\n\n"
+    )
+
+
 def build_idea(goal_id: str, title: str, interval_hours: int, consecutive: int,
                now: datetime, source: str = "world") -> dict:
     description = (
@@ -1156,11 +1204,31 @@ def cmd_contract_per_goal(args, cfg: dict, contract_cfg: dict) -> int:
                 f"= {floor_ratio:g}x)"
             )
             return 0
+        # COUNTER FIRST, THEN THE INTERVAL — guard-382, and do not reorder.
+        # The reverse order (interval first, reset gated on its return value)
+        # corrupted  on 2026-08-21: the interval write LANDED (6h ->
+        # 4.0h, the stored float matches str(round(6.0/1.5, 2)) exactly) and
+        # still reported failure, so the gated reset never ran and
+        # consecutive_deep stuck at 4 >= threshold 3. A stale counter at/above
+        # threshold re-fires this contract on every subsequent deep close, which
+        # would have walked a 6h cadence down to 2.67h and then through the
+        # 1.98h floor on evidence that was already spent. guard-3117: a field
+        # written by phase N proves phase N ran, never that the job finished.
+        #
+        # Counter-first fails conservatively in BOTH partial-failure cases:
+        # reset fails    -> abort before touching the interval; nothing moves.
+        # interval fails -> counter 0 + interval unchanged, still consistent;
+        #                   the streak rebuilds and retries the contraction.
+        if not reset_consecutive_deep(args.goal_id, args.source):
+            sys.stderr.write(
+                "cargo-cult-detector: consecutive_deep reset failed; skipping "
+                "contraction to keep counter and interval consistent\n"
+            )
+            return 1
         if update_interval_hours(
             args.goal_id, args.source, proposed, original,
             had_original=(orig_stored is not None),
         ):
-            reset_consecutive_deep(args.goal_id, args.source)
             print(
                 f"[cargo-cult-contract] auto-contracted {args.goal_id}: "
                 f"interval_hours {interval_hours}h -> {proposed}h "
@@ -1168,9 +1236,18 @@ def cmd_contract_per_goal(args, cfg: dict, contract_cfg: dict) -> int:
                 f"consecutive_deep was {consecutive_deep})"
             )
             return 0
+        # A failed interval write is NOT a floor event. Falling through to the
+        # Idea path below would file a "the floor stopped it" narrative naming a
+        # proposed value that is ABOVE the floor — the false report that sent
+        #  chasing a floor that was never reached. Retry via the
+        # rebuilt streak instead.
         sys.stderr.write(
-            "cargo-cult-detector: auto-contract failed; falling back to Idea path\n"
+            f"cargo-cult-detector: auto-contract interval write failed for "
+            f"{args.goal_id} (proposed {proposed}h is ABOVE the {floor:.2f}h "
+            f"floor — this is a write failure, not a floor hit); counter reset, "
+            f"streak will rebuild and retry\n"
         )
+        return 1
     else:
         print(
             f"[cargo-cult-contract] floor HIT for {args.goal_id}: "
@@ -1216,6 +1293,7 @@ def cmd_contract_per_goal(args, cfg: dict, contract_cfg: dict) -> int:
     idea = {
         "title": dedup_title,
         "description": (
+            f"{prior_decision_block(asp, dedup_title)}"
             f"Recurring goal {args.goal_id} ({title}) closed deep "
             f"{consecutive_deep} times consecutively, which reached the "
             f"contract threshold. Auto-contract then DECLINED to act: its "

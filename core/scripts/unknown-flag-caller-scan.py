@@ -140,7 +140,26 @@ def _tokens_after(text: str, idx: int) -> list[str]:
 # "`aspirations-read.sh --active`" in verification-checklist.md. Documented flags
 # are real signal for a DIFFERENT question (stale docs); they are not callers,
 # and counting them would have sent this goal's sweep to fix documentation.
-_INVOKED_BY = re.compile(r'(?:^|[\s;&|(`$]|\$\()\s*(?:bash|sh|py|python3?|source|\.)\s+'
+#
+# `Bash:` IS AN INVOCATION PREFIX (, measured 2026-08-21). The prose
+# filter above is right, but it drew the line one form too wide: SKILL.md
+# pseudocode `Bash: <wrapper> --flag` is EXECUTED — by an LLM reading the skill —
+# so it is a caller in every sense that matters, and excluding it made the
+# scanner blind to the majority of them. Measured over the live tree with
+# .history excluded: 113 `Bash:`-form sites vs 57 seen, i.e. the scanner saw
+# one third of its own population (aspirations-read.sh 27 blind / 9 seen,
+# pipeline-read.sh 39/7, experience-read.sh 21/5, aspirations-meta-update.sh
+# 12/0, aspirations-complete.sh 6/0 — two wrappers were 100% invisible).
+# This is not theoretical: the aspirations-read.sh adoption shipped with
+# `blocking=0` from this scanner while `.claude/skills/aspirations-consolidate/
+# SKILL.md` documented `--json`, a flag the wrapper never had. Silently dropped
+# before the refusal; rc=2 after it. A live regression, invisible to the tool
+# whose whole job is to prevent exactly that.
+#
+# Deliberately NARROW. Bare-backtick prose stays excluded (that is the 53-FP
+# case), and `_CLEAN_FLAG` below still strips markdown punctuation. This adds
+# one prefix, not a category.
+_INVOKED_BY = re.compile(r'(?:^|[\s;&|(`$]|\$\()\s*(?:[Bb]ash:|bash|sh|py|python3?|source|\.)\s+'
                          r'(?:-3\s+)?["\']?[^\s"\';|&]*$')
 # A real flag token, after markdown/prose punctuation is stripped. Prose forms
 # ("--active`," "--meta})." "--active-compact`)") never survive this.

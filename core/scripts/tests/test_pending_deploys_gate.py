@@ -434,3 +434,85 @@ def test_gate_empty_dir_entry_parses_goal_id():
         s = _summary(r)
         assert s["cleared"] == 1 and s["not_clean"] is False, s
         assert _load_store(repo) == [], "empty-dir entry not cleared from ledger"
+
+
+# ── : the EMPTY goal_id is reachable only by the un-scoped sweep ───
+#
+# `--goal G` maps to `pending-deploys.py list --goal-id G`, whose filter is
+# EXACT equality (`e.get("goal_id") == args.goal_id`). An accumulated entry
+# carries goal_id "" and so is matched by NO non-empty --goal, ever. Only the
+# un-scoped call reaches it. Measured on cc-08 2026-08-20: six accumulated
+# entries, every one displaying `goal=?`. The tests below drive the REAL gate
+# and read its summary counts -- EFFECT, not a grep for a flag (sig-227). The
+# first two are each other's positive control: same seeded store, one call
+# shape each, opposite reachability.
+
+def test_empty_goal_id_entry_is_invisible_to_the_goal_scoped_call():
+    """The goal-scoped call sees ONLY its own entry; the accumulated one hides."""
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        repo = _setup_repo(Path(td))
+        _seed(repo, [_entry(sha="e" * 40, goal="g-115-2688-b"),
+                     _entry(sha="f" * 40, goal="")])          # accumulated
+        r = _run_gate(repo, "--goal", "g-115-2688-b", FAKE_GH_CONCLUSION="success")
+        assert r.returncode == 0, r.stderr
+        s = _summary(r)
+        assert s["checked"] == 1, (
+            "goal-scoped call must see exactly its own entry; the empty-goal_id "
+            f"entry must be invisible to it. summary={s}")
+        # ...and the proof it is INVISIBLE rather than merely skipped: it is
+        # still in the ledger afterwards, unprobed.
+        left = _load_store(repo)
+        assert [e["goal_id"] for e in left] == [""], (
+            f"the accumulated entry should survive the scoped call untouched: {left}")
+
+
+def test_unscoped_sweep_reaches_the_entry_the_scoped_call_cannot():
+    """Same store, no --goal: BOTH entries are checked. This is the fix's path."""
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        repo = _setup_repo(Path(td))
+        _seed(repo, [_entry(sha="e" * 40, goal="g-115-2688-b"),
+                     _entry(sha="f" * 40, goal="")])
+        r = _run_gate(repo, FAKE_GH_CONCLUSION="success")      # no --goal
+        assert r.returncode == 0, r.stderr
+        s = _summary(r)
+        assert s["checked"] == 2, f"un-scoped sweep must reach both entries: {s}"
+        assert _load_store(repo) == [], "both entries should clear"
+
+
+def test_failed_deploy_from_an_accumulated_entry_files_a_high_unblock():
+    """The outcome the gate exists for, reached through the un-scoped sweep.
+
+    A worker box registers deploys with an empty goal_id. Before g-115-6932 a
+    worker ran NEITHER the goal-scoped call (no match) nor the all-sweep
+    (do_productivity_check is reducer-only), so a genuinely FAILED deploy filed
+    nothing. This asserts the Unblock is actually filed on that exact path.
+    """
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        repo = _setup_repo(Path(td))
+        filed = Path(td) / "filed-goals.jsonl"
+        _seed(repo, [_entry(sha="c" * 40, goal="")])          # accumulated
+        r = _run_gate(repo, FAKE_GH_CONCLUSION="failure", FILED_GOALS=str(filed))
+        assert r.returncode == 0, r.stderr
+        s = _summary(r)
+        assert s["failed"] == 1 and s["not_clean"] is True, s
+        assert s["unblocks_filed"] == 1, f"Unblock not filed: {s} stderr={r.stderr!r}"
+        body = json.loads([l for l in filed.read_text().splitlines() if l.strip()][0])
+        assert body["priority"] == "HIGH", body
+        assert body["title"].startswith("Unblock:"), body
+
+        # POSITIVE CONTROL for the claim above: the same store, probed the way a
+        # worker's ONLY reachable call site probes it, files nothing at all. A
+        # bare "the sweep files an Unblock" assertion would pass just as well
+        # against a gate that files one unconditionally.
+        _seed(repo, [_entry(sha="c" * 40, goal="")])
+        filed2 = Path(td) / "filed-goals-scoped.jsonl"
+        r2 = _run_gate(repo, "--goal", "g-115-2688-b",
+                       FAKE_GH_CONCLUSION="failure", FILED_GOALS=str(filed2))
+        assert r2.returncode == 0, r2.stderr
+        s2 = _summary(r2)
+        assert s2["checked"] == 0 and s2["unblocks_filed"] == 0, (
+            f"goal-scoped call must reach nothing here -- that IS the defect: {s2}")
+        assert not filed2.exists() or filed2.read_text().strip() == ""

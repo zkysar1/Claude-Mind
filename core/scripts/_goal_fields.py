@@ -66,6 +66,17 @@ GOAL_KNOWN_FIELDS = frozenset({
     'commit_sha',                        # 1
     'completed_at',                      # 821
     'completed_by',                      # 808
+    # g-306-204: writer is iteration-close.sh do_verify, stamped beside
+    # outcome_class when BODY_ROLE is set (only ever "worker" — see below).
+    # 0 at introduction BY CONSTRUCTION: it is a going-forward provenance
+    # stamp, so the census that derived every other count here cannot produce
+    # one for it. PRESENT+"worker" positively identifies a worker-completed
+    # goal; ABSENT means reducer-or-unknown and must never be read as
+    # "reducer" (bash-agent-inject.py exports BODY_ROLE ONLY on the worker
+    # fork path, so the reducer leaves it unset). That asymmetry is the same
+    # "an absent value beats a wrong one" rule the completed_by_sid stamp
+    # already follows.
+    'completed_by_role',                 # 0 (new)
     'completed_by_sid',                  # 792
     'completed_date',                    # 762
     'consecutive_deep',                  # 79
@@ -178,17 +189,29 @@ GOAL_STRAY_FIELDS = {
     '__probe__': 'no writer, no reader, no schema entry — one-off invention',
     '_probe': 'field-name probe artifact',
     'box_local_demonstrated': 'no writer, no reader, no schema entry — one-off invention',
+    'checks': 'verification.checks written at goal top level, one goal '
+              '(g-335-1330, completed); no consumer reads a top-level checks '
+              '(selection-stack review census 2026-08-21)',
     'complete-by': 'hyphenated; matches the SCRIPT aspirations-complete-by.sh, not a field',
     'created': 'twin of created_at (1935 goals)',
     'defer_reason_correction': 'no writer, no reader, no schema entry — one-off invention',
     'defer_until': 'no writer, no reader, no schema entry — one-off invention',
+    'depends on': 'space-typo twin of depends_on, one goal (g-115-7095); its '
+                  'referent g-115-7093 is completed so the pointer is inert; '
+                  'fold on migration (selection-stack review 2026-08-21)',
     'description_append': 'invented to append to description (1958 goals)',
     'desiredEndState': 'camelCase drift',
     'evaluator_waste_note': 'no writer, no reader, no schema entry — one-off invention',
     'evidence_refs': 'no writer, no reader, no schema entry — one-off invention',
+    'evidence_source': 'one goal (g-326-476, completed); evidence citation '
+                       'that belongs in outcome_note/key_finding '
+                       '(selection-stack review census 2026-08-21)',
     'execution_note': 'no writer, no reader, no schema entry — one-off invention',
     'lastAchieved': 'no writer, no reader, no schema entry — one-off invention',
     'measurement_baseline': 'no writer, no reader, no schema entry — one-off invention',
+    'not_before': 'one goal (g-248-44, skipped); hand-invented precursor of '
+                  'resolves_no_earlier_than / deferred_until '
+                  '(selection-stack review census 2026-08-21)',
     'outcome_note_addendum': 'no writer, no reader, no schema entry — one-off invention',
     'precondition_unmet': 'a defer_reason PREFIX typed into the field slot',
     'prior_instances': 'no writer, no reader, no schema entry — one-off invention',

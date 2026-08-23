@@ -106,6 +106,15 @@ if [ "$gate_rc" -eq 2 ]; then
         # iteration would bloat the tracker with one duplicate line per cycle.
         exit 0
     fi
+    if [ "$skill_name" = "respond" ]; then
+        # The per-turn mandate ("every user turn MUST route through /respond")
+        # collides with this dedup — re-injection is refused to save the
+        # per-turn SKILL.md token cost, but the refusal must not train the
+        # model out of the PROTOCOL. Make the block message carry the mandate
+        # (2026-08-21, owner-directed assistant-retrieval drive).
+        echo "Skill /respond instructions already in context — do NOT re-invoke; APPLY them to THIS message now. Step 4 retrieval escalation is MANDATORY before answering domain questions (tree → codebase → peer worlds → web). The [auto-retrieval pre-pass] block, when present above, is a starting index — expand relevant hits, then answer." >&2
+        exit 2
+    fi
     echo "Skill /$skill_name instructions already in context — follow them from earlier in this conversation. Do NOT re-invoke." >&2
     exit 2
 fi

@@ -166,7 +166,30 @@ if [[ -n "${SAB_NEW:-}" ]]; then
   fi
 fi
 
-BACKUP="${TARGET}.mutation-backup.$$"
+# : THE BACKUP LIVES OUTSIDE THE TARGET'S WORKING TREE.
+# It used to be written as a SIBLING of the target ("${TARGET}.mutation-backup.$$"),
+# which put it inside whatever repo the target belongs to. Combined with the
+#  retention decision below — the backup deliberately SURVIVES every
+# non-PASS exit — that made stray copies of production source accumulate in
+# product working trees: measured 2026-08-21, five files after a 6-mutation
+# partition run, seventeen after an 8-mutation Java run. The next canonical step
+# for product work is product-pr-flow.sh, whose staging step is `git add -A`, so
+# those copies would be committed into a PR and merged.
+#
+# ADJACENCY WAS NEVER THE POINT — recoverability was, and the two are separable.
+# Retention semantics are UNCHANGED (see restore() and the PASS path); only the
+# location moves, which removes the staging hazard at its root rather than asking
+# every product repo to gitignore a framework-owned filename. The absolute path is
+# interpolated into every CRITICAL/retention message, so a human recovering from a
+# red run is told exactly where to look.
+#
+# The one property given up is tmp reaping (typically ~10 days). The backup exists
+# so a reader can recover immediately after a red verdict; a recovery that has not
+# happened in ten days is not happening, and until this change the file's real
+# lifetime was "forever, inside your repo", which is the defect.
+BACKUP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mutation-proof-backup-XXXXXX")" \
+  || { echo "ERROR: could not create a backup directory under ${TMPDIR:-/tmp}" >&2; exit 2; }
+BACKUP="$BACKUP_DIR/$(basename "$TARGET").mutation-backup.$$"
 cp -p "$TARGET" "$BACKUP" || { echo "ERROR: could not back up target" >&2; exit 2; }
 
 RESTORE_STATUS="pending"
@@ -224,6 +247,7 @@ emit() {
   RT="${RED_TESTS:-null}" RC="${RED_COUNT:-null}" RPE="${RED_PARSE_ERRORS:-null}" \
   SS="${SAB_SITES:-null}" SSB="${SAB_SITES_BASIS:-unmeasured}" \
   RCK="${RESIDUE_CHECK:-unavailable}" \
+  BKP="${BACKUP:-}" BKPR="$( [[ -n "${BACKUP:-}" && -e "${BACKUP:-}" ]] && echo true || echo false )" \
   $PY -c '
 import os, json
 try:
@@ -258,6 +282,20 @@ print(json.dumps({
   #                 an absence of measurement, never a pass; a consumer that
   #                 treats it as clean has reintroduced the original defect.
   "residue_check": os.environ["RCK"],
+  # . residue_check above is about SABOTAGE TEXT IN THE TARGET. It says
+  # nothing about the backup FILE, and never did — a goal filed against this tool
+  # read the two as one thing and reported "residue_check: clean while N backup
+  # files remained" as a false assertion. It was not: both readings were correct
+  # about different objects. The gap was that the JSON described the on-disk
+  # backup NOWHERE, so a caller running an N-mutation matrix had no machine-
+  # readable signal that N files had been left behind — only free text inside
+  # `reason`. These two fields close that, and backup_retained is MEASURED with a
+  # real stat at emit time, never inferred from the verdict:
+  #   true   the backup is on disk at backup_path (every non-PASS exit, by design)
+  #   false  it was removed (the clean-PASS path, the one state with no evidence
+  #          value) — or, on a pre-backup refusal, never taken at all
+  "backup_path": os.environ["BKP"] or None,
+  "backup_retained": os.environ["BKPR"],
   # null => not measured (no --junit-xml, or the parse failed).
   # []   => measured, and the RED run reported no failing testcase at all —
   #         a real signal, not an absence: the run went red WITHOUT any test
@@ -483,7 +521,10 @@ fi
 #  outcome 3: the ONLY place the backup is removed. Reaching here means
 # restore matched, residue_check did not fire, and the post-restore test is green
 # — the one state in which the backup has no evidentiary value. Every other exit
-# path, including the trap, now leaves it on disk.
-rm -f "$BACKUP"
+# path, including the trap, now leaves it on disk. `rm -rf` on the DIR rather
+# than `rm -f` on the file since  moved the backup into a per-run
+# mktemp dir — removing only the file would leave an empty dir behind on every
+# passing run, which is the same accumulation defect in a quieter form.
+rm -rf "$BACKUP_DIR"
 emit "PASS" "$PASS_REASON"
 exit 0

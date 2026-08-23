@@ -109,6 +109,29 @@ def rt_call(method, path, query=None, body=None, headers=None):
         raise RtError(
             "daemon unreachable for %s %s: %s. Daemon-only: no CLI fallback."
             % (method, path, e.reason))
+    except (TimeoutError, OSError) as e:
+        # READ-PHASE transport failure. urlopen's URLError wrapper covers the
+        # CONNECT phase; once the request has been sent and accepted, a socket
+        # timeout surfaces as a BARE TimeoutError out of
+        # http.client.getresponse -> socket.recv_into and reaches no clause
+        # above. So every caller that does `except _rt.RtError` to fail soft
+        # could not catch the one failure mode it most needed to.
+        #
+        # Measured 2026-08-21 (foxtrot, LAPTOP-3IOFCNEO, ):
+        # cargo-cult-detector.py:309 wraps its only daemon call in exactly that
+        # handler, printed "falling back to Idea path", and then died on an
+        # unhandled TimeoutError anyway — the Idea was never filed and the
+        # counter never reset, while recurring-close's auto-contract path
+        # relayed the traceback and still exited 0.
+        #
+        # ORDERING IS LOAD-BEARING: urllib's HTTPError and URLError are both
+        # OSError subclasses, so this arm MUST stay below them or it would
+        # swallow their richer diagnostics (status, body, reason). TimeoutError
+        # is itself an OSError subclass; it is named explicitly because it is
+        # the measured case and the name is the documentation.
+        raise RtError(
+            "daemon transport failure for %s %s: %r. Daemon-only: no CLI fallback."
+            % (method, path, e))
 
 
 # --- Helpers for the daemon-migrated operations framework .py callers need.

@@ -181,9 +181,26 @@ def collect_dynamic(path: Path | None) -> dict:
         detector that cried wolf on every compaction would be tuned out — but it
         does mean this metric is a poor early warning by construction.
 
-    A windowed variant (last N closes) would fix both and is deliberately NOT
-    built here: it needs a cross-session baseline to be meaningful, and this goal
-    ships the first row of that history rather than assuming its shape.
+    A windowed variant (last N closes) fixes both. It was deliberately NOT built
+    when this shipped, on the stated ground that "it needs a cross-session
+    baseline to be meaningful, and this goal ships the first row of that history
+    rather than assuming its shape."
+
+    THAT GROUND IS NARROWER THAN IT READS, and the distinction is why `--window`
+    now exists (g-115-6468 check 3). A cross-session baseline is required to
+    RATCHET a windowed value — to say this session is worse than the last. It is
+    NOT required to ANSWER a fixed absolute bar, and check 3 is exactly that:
+    "Skill injections per iteration < 40 KB avg over 10 iterations", a threshold
+    on ONE transcript needing no history at all. So the windowed figure is
+    computed and REPORTED, and is deliberately NOT fed to the ratchet — the
+    original reasoning is preserved where it applies and lifted where it does not.
+
+    The window is computed from per-close buckets accumulated in this same pass,
+    never by differencing ledger rows: measured 2026-08-18, `iteration_closes`
+    across 9 ledger rows read [35,35,43,43,43,43,0,0,237] — NOT monotonic,
+    because rows span sessions whose counters reset. Differencing a cumulative
+    series that resets yields a confident wrong number (guard-3700: append order
+    is not time order).
     """
     if path is None:
         # NOT a zero. An unreadable transcript and a session with no activity are
@@ -199,6 +216,13 @@ def collect_dynamic(path: Path | None) -> dict:
     idmap: dict[str, str] = {}
     first = last = None
     lines = 0
+    # Per-close buckets for the windowed view. `cur_*` accumulates the injections
+    # seen SINCE the previous close; a close flushes one bucket. Whatever remains
+    # at EOF is an iteration still in flight and is reported separately rather
+    # than folded in — counting a partial iteration as a whole one deflates the
+    # per-iteration average by exactly the amount the iteration has left to run.
+    buckets: list[dict] = []
+    cur_bytes = cur_inj = 0
 
     with open(path, errors="replace") as fh:
         for line in fh:
@@ -234,6 +258,8 @@ def collect_dynamic(path: Path | None) -> dict:
                         # dominant cost and it is invisible unless counted here.
                         skill_inj += 1
                         skill_bytes += len(txt)
+                        cur_inj += 1
+                        cur_bytes += len(txt)
                 elif t == "tool_use":
                     nm = b.get("name")
                     idmap[b.get("id")] = nm
@@ -248,6 +274,9 @@ def collect_dynamic(path: Path | None) -> dict:
                         # by post-compaction re-entry (brief: 292 re-entries vs 169
                         # closes), so counting re-entries overstates throughput.
                         closes += 1
+                        buckets.append({"skill_bytes": cur_bytes,
+                                        "skill_injections": cur_inj})
+                        cur_bytes = cur_inj = 0
                 elif t == "tool_result":
                     cc = b.get("content")
                     tool_res += len(cc if isinstance(cc, str) else json.dumps(cc))
@@ -274,6 +303,56 @@ def collect_dynamic(path: Path | None) -> dict:
             "assistant_text": pct(asst_text),
         },
         "skill_calls": dict(sorted(skills.items(), key=lambda x: -x[1])),
+        "per_close_buckets": buckets,
+        "in_flight_after_last_close": {"skill_bytes": cur_bytes,
+                                       "skill_injections": cur_inj},
+    }
+
+
+def windowed_skill(dy: dict, n: int) -> dict:
+    """Average skill-injection KB over the LAST `n` closed iterations.
+
+    This is the metric g-115-6468 check 3 puts the bar on — "Skill injections per
+    iteration < 40 KB avg over 10 iterations". NAME THE METRIC THAT CARRIES THE
+    BAR before reading any number beside it (guard-3555): the cumulative
+    `skill_kb_per_close` printed above is a DIFFERENT quantity over a different
+    span, and on a long session the two legitimately disagree. Check 3 is
+    answered by `avg_kb_per_close` here and by nothing else.
+
+    NOT RATCHETED, deliberately — see collect_dynamic's docstring. This answers an
+    absolute bar; ratcheting it would need the cross-session baseline the original
+    author correctly declined to assume.
+
+    Returns `available: False` with a REASON rather than a zero whenever the
+    window cannot be filled (rb-245): an unread transcript, a session that has
+    closed nothing, and a session that has closed fewer than `n` are three
+    different facts and none of them is "0 KB per iteration".
+    """
+    if not dy.get("available"):
+        return {"available": False, "reason": dy.get("reason", "no transcript")}
+    b = dy.get("per_close_buckets") or []
+    if not b:
+        return {"available": False, "n_requested": n, "n_available": 0,
+                "reason": "no iteration closed in this transcript yet — an empty "
+                          "window is an absence of measurement, NOT 0 KB/iteration"}
+    win = b[-n:]
+    total = sum(x["skill_bytes"] for x in win)
+    return {
+        "available": True,
+        "n_requested": n,
+        "n_available": len(win),
+        "short_window": len(win) < n,
+        "avg_kb_per_close": round(total / 1024 / len(win), 1),
+        "total_kb": round(total / 1024, 1),
+        "injections": sum(x["skill_injections"] for x in win),
+        # guard-1436: print the COMPLETE bucket census, empties included. An
+        # iteration that injected nothing is a real and informative data point,
+        # and dropping it would silently raise the average it belongs in.
+        "per_close_kb": [round(x["skill_bytes"] / 1024, 1) for x in win],
+        "empty_closes": sum(1 for x in win if x["skill_bytes"] == 0),
+        "in_flight_excluded_kb": round(
+            (dy.get("in_flight_after_last_close") or {}).get("skill_bytes", 0)
+            / 1024, 1),
     }
 
 
@@ -461,6 +540,10 @@ def main() -> int:
     ap.add_argument("--transcript", default=None)
     ap.add_argument("--hard-gate", action="store_true",
                     help="exit 1 when any ratchet verdict is regressed")
+    ap.add_argument("--window", type=int, default=10, metavar="N",
+                    help="average skill-injection KB over the last N CLOSED "
+                         "iterations (default 10, the span g-115-6468 check 3 "
+                         "specifies). Reported, never ratcheted.")
     args = ap.parse_args()
 
     if args.check:
@@ -472,6 +555,7 @@ def main() -> int:
 
     st = collect_static(PROJECT_ROOT)
     dy = collect_dynamic(_transcript_path(agent, args.transcript))
+    dy["windowed"] = windowed_skill(dy, args.window)
     rd = readiness(st)
 
     box = {"hostname": socket.gethostname(), "kernel": platform.release(),
@@ -520,6 +604,13 @@ def main() -> int:
                 "iteration_closes": dy.get("iteration_closes"),
                 "closes_per_compaction": dy.get("closes_per_compaction"),
                 "skill_kb_per_close": dy.get("skill_kb_per_close"),
+                # The windowed figure rides in the ledger row so the history it
+                # would need to BE ratcheted actually accumulates — recording it
+                # is what makes a future cross-session baseline possible without
+                # assuming its shape today.
+                "skill_kb_per_close_windowed":
+                    (dy.get("windowed") or {}).get("avg_kb_per_close"),
+                "windowed_n": (dy.get("windowed") or {}).get("n_available"),
                 "channel_pct": dy.get("channel_pct"),
             })
             report["ledger"] = str(LEDGER_PATH)
@@ -578,7 +669,20 @@ def _print_human(r):
               f"   <- higher is better")
         print(f"  skill injections         {dy['skill_injections']}"
               f"  ({_kb(dy['skill_injection_bytes'])} total,"
-              f" {dy['skill_kb_per_close']} KB per close)")
+              f" {dy['skill_kb_per_close']} KB per close, CUMULATIVE)")
+        w = dy.get("windowed") or {}
+        if w.get("available"):
+            short = ("  [SHORT WINDOW: only %d closed]" % w["n_available"]
+                     if w.get("short_window") else "")
+            print(f"  WINDOWED skill/close     {w['avg_kb_per_close']} KB"
+                  f"   <- last {w['n_available']} closed iterations{short}")
+            print(f"    per-close KB           {w['per_close_kb']}"
+                  f"   ({w['empty_closes']} of {w['n_available']} injected nothing)")
+            if w["in_flight_excluded_kb"]:
+                print(f"    excluded               {w['in_flight_excluded_kb']} KB in the"
+                      f" iteration still in flight (not yet closed)")
+        else:
+            print(f"  WINDOWED skill/close     UNAVAILABLE: {w.get('reason')}")
         ch = dy["channel_pct"]
         print(f"  channel mix              skill-injection {ch['skill_injection']}% |"
               f" tool-result {ch['tool_result']}% |"

@@ -35,8 +35,10 @@
 #   0 — I AM the runner, OR ambiguous (FAIL-OPEN), OR the running-session-id
 #       pointer is STALE but fresh write-attribution proves this session is the
 #       de-facto runner () → caller CONTINUES the loop
-#   1 — I am NOT the runner (definite mismatch, no fresh self write-attribution)
-#       → caller EJECTS (no re-entry)
+#   1 — I am NOT the runner → caller EJECTS (no re-entry). TWO causes:
+#       (a) definite SID mismatch, no fresh self write-attribution;
+#       (b) SID MATCHES but a different LIVE process already holds the runner
+#           role for this agent ( same-SID duplicate instance).
 #
 # FAIL-OPEN is deliberate and load-bearing. Exit 1 fires ONLY on a definite
 # mismatch: MIND_SID non-empty AND running-session-id non-empty AND they
@@ -82,6 +84,72 @@ RUNNER_SID=$(cat "$(agent_dir "$AGENT")/session/running-session-id" 2>/dev/null 
 # Fail-open when running-session-id is empty/unreadable. See header rationale.
 [ -n "$RUNNER_SID" ] || exit 0
 
+# -- Owning-process identity helpers () ------------------------------
+# WHY A PROCESS IDENTITY AND NOT runner-token: runner-token is a FILE in the
+# agent's session dir. Two processes both read it and both get the same value,
+# so it cannot distinguish them -- CLAUDE.md's signal table describes it as the
+# SID-reuse detector, but as a shared file it can only detect reuse ACROSS
+# /start runs, never two live readers of one token. The only identity that
+# differs between two concurrent sessions is the OWNING PROCESS.
+#
+# Identity = "<pid>:<starttime>" of the nearest ancestor whose comm is `claude`.
+# starttime (/proc/<pid>/stat field 22, boot-relative jiffies) is immutable for
+# the life of the process, so the pair survives PID reuse: a recycled pid
+# carries a different starttime and reads as DEAD, which is what lets a crashed
+# runner be taken over instead of wedging the agent forever.
+#
+# Deliberately NOT /proc/<pid>/environ (guard-1582, guard-1976): that is frozen
+# at exec and does not reflect later state, so an env-derived identity would go
+# stale exactly when it matters.
+_proc_stat_field() {  # <pid> <index into post-comm fields>: state=1 ppid=2 starttime=20
+    local pid="$1" idx="$2" line rest
+    line=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
+    [ -n "$line" ] || return 1
+    # Strip through the LAST ')' -- comm is parenthesized and may contain both
+    # spaces and parens ("tmux: server"), so positional parsing of the raw line
+    # is wrong. Longest-match ## is what makes this comm-safe.
+    rest="${line##*)}"
+    printf '%s' "$rest" | awk -v i="$idx" '{print $i}'
+}
+
+# Emits "<pid>:<starttime>", or returns 1 when it cannot be determined.
+# RUNNER_PROC_ID overrides for tests (no claude ancestor exists in a sandbox).
+_resolve_owner_proc() {
+    if [ -n "${RUNNER_PROC_ID:-}" ]; then printf '%s' "$RUNNER_PROC_ID"; return 0; fi
+    [ -d /proc ] || return 1
+    local pid=$$ depth=0 comm st ppid
+    while [ "$depth" -lt 12 ] && [ -n "$pid" ] && [ "$pid" != "0" ] && [ "$pid" != "1" ]; do
+        comm=$(cat "/proc/$pid/comm" 2>/dev/null) || return 1
+        if [ "$comm" = "claude" ]; then
+            st=$(_proc_stat_field "$pid" 20) || return 1
+            [ -n "$st" ] || return 1
+            printf '%s:%s' "$pid" "$st"
+            return 0
+        fi
+        ppid=$(_proc_stat_field "$pid" 2) || return 1
+        pid="$ppid"
+        depth=$((depth + 1))
+    done
+    return 1
+}
+
+# True only when <pid>:<starttime> names a process that is STILL the same one.
+_owner_alive() {
+    # SPLIT DECLARATIONS ARE LOAD-BEARING, NOT STYLE. `local a="$1" b="${a%%:*}"`
+    # expands ALL arguments before `local` runs, so `a` is still unset when
+    # `${a%%:*}` is evaluated -- under this script's `set -u` that aborts the
+    # whole gate with exit 1, i.e. EVERY runner ejects. Caught by case 17's
+    # stderr assertion (the exit code alone read as a correct eject).
+    local id="$1"
+    local pid="${id%%:*}"
+    local st="${id##*:}"
+    local cur
+    [ -n "$pid" ] && [ -n "$st" ] && [ "$pid" != "$st" ] || return 1
+    printf '%s' "$pid" | grep -Eq '^[0-9]+$' || return 1
+    cur=$(_proc_stat_field "$pid" 20) || return 1
+    [ -n "$cur" ] && [ "$cur" = "$st" ]
+}
+
 # -- Write-attribution runner override (, US-09) ----------------------
 # running-session-id is the file we already trust, but it is written ONLY by
 # /start (guard-340 sole-first-writer). A transient desync -- e.g. zeta's "stop
@@ -109,6 +177,47 @@ ATTRIB_FILE="$(agent_dir "$AGENT")/session/runner-write-attribution"
 WINDOW_SEC="${RUNNER_WRITE_ATTRIB_WINDOW_SEC:-300}"
 
 if [ "$MY_SID" = "$RUNNER_SID" ]; then
+    # -- Same-SID duplicate-instance eject () -----------------------
+    # THE GAP THIS CLOSES: everything above ejects on a definite SID MISMATCH,
+    # so two processes carrying the SAME $MIND_SID both reach here and both
+    # continue, every iteration, forever. Measured on cc-02 2026-08-22: two live
+    # `claude` processes under one SID duplicated a full /replay pass and, later
+    # that day, one OVERWROTE the other's 6,930-char outcome_note on a
+    # product-lane goal with a note belonging to a different goal -- silent data
+    # loss on the durable evidence trail, which the close path's never-clobber
+    # rule then PROTECTED. Every ownership predicate in the framework reads the
+    # (claimed_by, claimed_by_sid) pair, so none of them can see this case
+    # (guard-4806, guard-1460).
+    #
+    # BLAST RADIUS IS BOUNDED BY PLACEMENT: this runs only inside the SID-MATCH
+    # branch -- i.e. only among sessions that ALREADY pass -- so it can add
+    # ejections only where two sessions both claim to be THE one runner. A
+    # session with a different SID already ejected below; a worker Body never
+    # reaches here.
+    #
+    # FIRST STAMPER WINS, and a DEAD owner is taken over. Which of two live
+    # instances survives is arbitrary but deterministic and self-healing; the
+    # ejected one prints how to reclaim. Fail-open is preserved at every
+    # unknown: unresolvable identity skips the check entirely, so non-Linux
+    # boxes and any sandbox without a `claude` ancestor behave exactly as before.
+    MY_PROC=$(_resolve_owner_proc 2>/dev/null || true)
+    if [ -n "$MY_PROC" ]; then
+        PROC_FILE="$(agent_dir "$AGENT")/session/runner-proc"
+        STAMPED_PROC=$(cat "$PROC_FILE" 2>/dev/null | tr -d '\r\n' | head -n1)
+        if [ -n "$STAMPED_PROC" ] && [ "$STAMPED_PROC" != "$MY_PROC" ]; then
+            if _owner_alive "$STAMPED_PROC"; then
+                echo "[runner-identity-check] SAME-SID DUPLICATE INSTANCE for agent '$AGENT': running-session-id ($RUNNER_SID) matches this session, but the runner role is held by a DIFFERENT LIVE PROCESS ($STAMPED_PROC; this one is $MY_PROC). Two processes sharing one SID are invisible to every SID-based ownership check (g-115-7195), and concurrent execution has caused silent outcome_note loss. This session will exit the loop. To make THIS terminal the runner: /stop $AGENT in the other terminal, or /start $AGENT --recover here." >&2
+                exit 1
+            fi
+            # Stamped owner is gone (exited, or its pid was recycled and now
+            # carries a different starttime). Take over rather than wedge.
+        fi
+        if [ "$STAMPED_PROC" != "$MY_PROC" ]; then
+            TMP_PROC="$PROC_FILE.tmp.$$"
+            { printf '%s\n' "$MY_PROC" > "$TMP_PROC" && mv -f "$TMP_PROC" "$PROC_FILE"; } || true
+        fi
+    fi
+
     # Confirmed runner via the trusted pointer. Stamp SID + epoch as the
     # write-attribution evidence for any later stale-pointer iteration. Stamping
     # ONLY on a confirmed match (never on an override) is load-bearing: it lets a

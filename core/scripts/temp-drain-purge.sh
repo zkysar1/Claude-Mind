@@ -54,16 +54,28 @@
 #                        deleted via `find "$stray" -delete` (re-asserted strictly
 #                        under TEMP_DIR/). Removes abandoned scratch subdirs the
 #                        file lanes never touch (e.g. a leftover session subdir,
-#                        ).
+#                        ). PRESERVES git repos carrying unpushed
+#                        commits or dirty tracked files () — sole-copy
+#                        content a clean-worktree glance cannot see; fail-closed
+#                        when git itself cannot answer.
 #
 # Usage: temp-drain-purge.sh [--dry-run] [--age-min N] [--drained-age-days N]
+#                             [--third-class-watermark <ISO|none>]
 #   --dry-run           list what WOULD purge/clean, delete nothing
+#   --third-class-watermark  override the ENCODE-BEFORE-DELETE watermark gating
+#                       Lane 1's third class (rationale in _purge_find_predicate
+#                       header). Default: first line of temp/.drain-watermark,
+#                       written by /drain-temp Phase 4 at completion. "none"
+#                       forces the third class exempt this run.
 #   --age-min           file + stray-dir age guard in minutes (default 120; skips
 #                       actively-written logs and still-active scratch dirs)
 #   --drained-age-days  drained/ GC age guard in days (default 30)
 # Output (stdout, JSON): {"purged":N,"would_purge":N,"files":[...],
 #   "drained_gc_purged":N,"drained_gc_would_purge":N,"drained_gc_files":[...],
-#   "stray_purged":N,"stray_would_purge":N,"citation_lookup":"ok"|"failed"|"n/a",
+#   "stray_purged":N,"stray_would_purge":N,
+#   "stray_preserved_git":N,"stray_preserved_git_dirs":[...],          ()
+#   "watermark":"ISO"|null,"watermark_source":"flag|file|absent|invalid|disabled|n/a",
+#   "citation_lookup":"ok"|"failed"|"n/a",
 #   "dry_run":bool,"age_min":N,"drained_age_days":N,
 #   "temp_dir":"..."} — the no-temp-dir no-op path emits the SAME field set
 #   (all-zero lane fields, citation_lookup "n/a") so both exit paths share one
@@ -190,11 +202,50 @@ assert_safe_temp_dir() {
 # honoring it disables that extension in Lane 1 entirely. Dropped LOUDLY, same
 # as the sentinel case; the two branches are kept separate so "*"/"*.*" keep
 # their own message and the sentinel's test hook stays reachable.
+# ENCODE-BEFORE-DELETE — THE THIRD-CLASS WATERMARK (2026-08-21, user directive:
+# "even if a temp file is not referenced, try to encode it instead of deleting
+# blindly"). The  inversion made the third class — every suffix that is
+# neither drainable .md/.json nor an enumerated ephemera extension — purgeable
+# at bare age: a mechanical delete of files no drain pass ever classified. The
+# gate added here: a third-class file is purgeable ONLY when a COMPLETED
+# /drain-temp pass postdates it (mtime <= watermark), i.e. the LLM provably had
+# its chance to classify/encode it and declined. The watermark is the first
+# line of temp/.drain-watermark, written by /drain-temp Phase 4 at completion
+# (never under --dry-run or --file); callers override via
+# --third-class-watermark. NO WATERMARK => THIRD CLASS EXEMPT (fail-closed:
+# with the gate inactive this lane covers enumerated ephemera + empties only —
+# exactly the pre-inversion purge surface). The 8 enumerated extensions and
+# 0-byte empties stay purgeable at bare age: those classes are knowledge-free
+# BY the drain skill's own definition (Phase 1.5 deletes them without
+# encoding). This does NOT resurrect the unbounded-accrual defect the inversion
+# fixed: every completed drain advances the watermark past everything it saw,
+# and /drain-temp invokes this purge in the same run — the bound tightens from
+# "never" to "one drain cycle".
 _PURGE_OVERBROAD_SENTINEL='zzz-overbroad-sentinel-9f3a2c'
+
+# _EPHEMERA_GLOB — the eight enumerated pure-ephemera extensions, as a find
+# disjunct. SINGLE DEFINITION shared by _purge_find_predicate (the always-
+# purgeable class-A lane) and _purge_find_predicate_legacy (the citation-
+# failure degrade), so the two can never drift — they carried independent
+# copies until 2026-08-21.
+_EPHEMERA_GLOB=( -name '*.log' -o -name '*.txt' -o -name '*.py' -o -name '*.sh' -o -name '*.err' -o -name '*.raw' -o -name '*.out' -o -name '*.bak' )
+
 _purge_find_predicate() {
   local age_min="$1"; shift
   local _b
-  PURGE_FIND_PRED=( -maxdepth 1 -type f ! -name '.*' \( ! \( -name '*.md' -o -name '*.json' \) -o -empty \) )
+  # Third-class watermark (ENCODE-BEFORE-DELETE header above). Dynamic-scoped:
+  # main() declares it local after resolving flag/file precedence; the direct
+  # test harness sets it as a plain global. Empty => third class exempt.
+  local _wm="${PURGE_THIRD_CLASS_WATERMARK:-}"
+  _wm="${_wm/T/ }"   # GNU find and bfs both parse the space form of ISO 8601
+  if [ -n "$_wm" ]; then
+    # Class A (ephemera globs OR empty): purgeable at bare age, as always.
+    # Class B (third class = NOT drainable, NOT ephemera): additionally gated
+    # on `! -newermt <watermark>` — only files the last completed drain SAW.
+    PURGE_FIND_PRED=( -maxdepth 1 -type f ! -name '.*' \( \( \( "${_EPHEMERA_GLOB[@]}" \) -o -empty \) -o \( ! \( -name '*.md' -o -name '*.json' \) ! \( "${_EPHEMERA_GLOB[@]}" \) ! -newermt "$_wm" \) \) )
+  else
+    PURGE_FIND_PRED=( -maxdepth 1 -type f ! -name '.*' \( \( "${_EPHEMERA_GLOB[@]}" \) -o -empty \) )
+  fi
   for _b in "$@"; do
     [ -n "$_b" ] || continue
     # Default-expanded: this function is documented as sourceable in isolation,
@@ -239,7 +290,7 @@ _purge_find_predicate() {
 # rot unnoticed.
 _purge_find_predicate_legacy() {
   local age_min="$1"
-  PURGE_FIND_PRED=( -maxdepth 1 -type f ! -name '.*' \( \( -name '*.log' -o -name '*.txt' -o -name '*.py' -o -name '*.sh' -o -name '*.err' -o -name '*.raw' -o -name '*.out' -o -name '*.bak' \) -o -empty \) -mmin "+$age_min" )
+  PURGE_FIND_PRED=( -maxdepth 1 -type f ! -name '.*' \( \( "${_EPHEMERA_GLOB[@]}" \) -o -empty \) -mmin "+$age_min" )
 }
 
 # _cited_basenames <script_dir> — echo one basename per line for every temp/
@@ -448,9 +499,12 @@ _has_archive_receipt() {
 # "reported OR purged"; reporting is the branch that adds visibility without
 # adding a new way to destroy live state.
 #
-# The allowlist is the two LIFECYCLE markers this framework writes on purpose.
+# The allowlist is the LIFECYCLE markers this framework writes on purpose.
 # DOTFILE_ALLOWLIST overrides it (space-separated basenames) for tests.
-_DOTFILE_ALLOWLIST_DEFAULT='.gitkeep .archive-marker'
+# .drain-watermark joined 2026-08-21: written by /drain-temp Phase 4, read by
+# the third-class watermark gate (_purge_find_predicate) — a MANAGED marker,
+# not unmanaged residue (the guard-1581 distinction this lane reports on).
+_DOTFILE_ALLOWLIST_DEFAULT='.gitkeep .archive-marker .drain-watermark'
 UNMANAGED_DOTFILES=""              # newline-separated basenames, for the caller
 report_unmanaged_dotfiles() {
   local temp_dir="${1:-}" count=0 f b
@@ -492,6 +546,11 @@ cleanup_stray_dirs() {
   # expecting a file key; the dir's files are deliberately NOT enumerated
   # here (see the collection site below for the measured 153k-file reason).
   STRAY_PURGED_PATHS=""
+  # Basenames of git dirs PRESERVED by the  guard below (newline-
+  # separated; same no-subshell global idiom as UNMANAGED_DOTFILES). main()
+  # surfaces them as stray_preserved_git / stray_preserved_git_dirs so the
+  # preservation is checkable from outside, not just asserted.
+  STRAY_PRESERVED_GIT=""
   [ -d "$temp_dir" ] || { echo 0; return 0; }
   list="$(find "$temp_dir" -mindepth 1 -maxdepth 1 -type d ! -name drained -mmin "+$age_min" 2>/dev/null || true)"
   [ -z "$list" ] && { echo 0; return 0; }
@@ -510,6 +569,28 @@ cleanup_stray_dirs() {
     if _has_archive_receipt "$d"; then
       echo "temp-drain-purge: PRESERVING archive dir (RECEIPT.*/.archive-marker present): $d" >&2
       continue
+    fi
+    # UNPUSHED-WORK guard (): a stray GIT REPO whose worktree is
+    # clean looks maximally safe by every signal this lane read before — no
+    # dirty files, no RECEIPT — yet `git log --branches --not --remotes` can
+    # reveal commits that exist NOWHERE else. A clean-worktree check is the
+    # intuitive and precisely wrong probe. Preserve when the repo has (a) any
+    # unpushed commit, (b) any dirty TRACKED file (`--porcelain -uno`:
+    # untracked-only dirt is the same class as a plain stray dir's content,
+    # which this lane deletes by design — and -uno keeps the probe cheap on
+    # huge scratch trees, the 153k-file npmci lesson), or (c) git itself
+    # cannot answer (corrupt repo — fail-closed: retaining junk is
+    # recoverable, deleting sole-copy commits is not). `-e` catches both .git
+    # dirs and .git files (worktrees/submodules).
+    if [ -e "$d/.git" ]; then
+      local _gu="" _gd="" _gbad=0
+      _gu="$(git -C "$d" log --branches --not --remotes -1 --format=%H 2>/dev/null)" || _gbad=1
+      _gd="$(git -C "$d" status --porcelain -uno 2>/dev/null)" || _gbad=1
+      if [ "$_gbad" -eq 1 ] || [ -n "$_gu" ] || [ -n "$_gd" ]; then
+        echo "temp-drain-purge: PRESERVING git dir (unpushed commits, dirty tracked files, or unreadable repo — g-115-3648): $d" >&2
+        STRAY_PRESERVED_GIT="${STRAY_PRESERVED_GIT}$(basename "$d")"$'\n'
+        continue
+      fi
     fi
     count=$((count + 1))
     # Record the DIR (trailing slash = dir marker for --purge-propagate),
@@ -531,12 +612,13 @@ EOF
 }
 
 main() {
-  local DRY_RUN=0 AGE_MIN=120 DRAINED_AGE_DAYS=30
+  local DRY_RUN=0 AGE_MIN=120 DRAINED_AGE_DAYS=30 WM_ARG=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --dry-run) DRY_RUN=1; shift ;;
       --age-min) AGE_MIN="${2:?temp-drain-purge.sh: --age-min needs a value}"; shift 2 ;;
       --drained-age-days) DRAINED_AGE_DAYS="${2:?temp-drain-purge.sh: --drained-age-days needs a value}"; shift 2 ;;
+      --third-class-watermark) WM_ARG="${2:?temp-drain-purge.sh: --third-class-watermark needs a value (YYYY-MM-DDTHH:MM:SS or none)}"; shift 2 ;;
       -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; return 0 ;;
       *) echo "temp-drain-purge.sh: unknown arg '$1'" >&2; return 2 ;;
     esac
@@ -571,10 +653,35 @@ main() {
     # citation_lookup is "n/a" here (Lane 1 never ran) rather than omitted: the
     # field must exist on BOTH exit paths or a strict-field consumer KeyErrors
     # on a fresh agent — the same schema-parity finding the lane fields carry.
-    printf '{"purged":0,"would_purge":0,"files":[],"drained_gc_purged":0,"drained_gc_would_purge":0,"drained_gc_files":[],"stray_purged":0,"stray_would_purge":0,"citation_lookup":"n/a","backend_propagation":{"skipped":"no-temp-dir"},"dry_run":%s,"age_min":%d,"drained_age_days":%d,"temp_dir":"%s","note":"temp dir does not exist"}\n' \
+    printf '{"purged":0,"would_purge":0,"files":[],"drained_gc_purged":0,"drained_gc_would_purge":0,"drained_gc_files":[],"stray_purged":0,"stray_would_purge":0,"stray_preserved_git":0,"stray_preserved_git_dirs":[],"watermark":null,"watermark_source":"n/a","citation_lookup":"n/a","backend_propagation":{"skipped":"no-temp-dir"},"dry_run":%s,"age_min":%d,"drained_age_days":%d,"temp_dir":"%s","note":"temp dir does not exist"}\n' \
       "$([ "$DRY_RUN" -eq 1 ] && echo true || echo false)" "$AGE_MIN" "$DRAINED_AGE_DAYS" "$temp_dir"
     return 0
   fi
+
+  # ── Third-class watermark resolution (ENCODE-BEFORE-DELETE — full rationale
+  # in the _purge_find_predicate header). Precedence: --third-class-watermark
+  # flag ("none" disables) > first line of temp/.drain-watermark > absent.
+  # Anything malformed is INVALID → third class exempt this run (fail-closed:
+  # a garbage timestamp must never widen a delete predicate). The resolved
+  # value + source are surfaced in the JSON so a caller (housekeeping tick,
+  # /drain-temp report) can log which gate state the run executed under.
+  local WM_VAL="" WM_SRC="absent"
+  if [ -n "$WM_ARG" ]; then
+    if [ "$WM_ARG" = "none" ]; then WM_SRC="disabled"; else WM_VAL="$WM_ARG"; WM_SRC="flag"; fi
+  elif [ -f "$temp_dir/.drain-watermark" ]; then
+    WM_VAL="$(head -n 1 "$temp_dir/.drain-watermark" 2>/dev/null | tr -d ' \t\r')"
+    WM_SRC="file"
+  fi
+  if [ -n "$WM_VAL" ]; then
+    case "$WM_VAL" in
+      [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]) : ;;
+      *) echo "temp-drain-purge: WARN — third-class watermark '$WM_VAL' is not YYYY-MM-DDTHH:MM:SS; third class EXEMPT this run (fail-closed)." >&2
+         WM_VAL=""; WM_SRC="invalid" ;;
+    esac
+  elif [ "$WM_SRC" = "file" ]; then
+    WM_SRC="invalid"   # marker file present but empty/unreadable
+  fi
+  local PURGE_THIRD_CLASS_WATERMARK="$WM_VAL"
 
   # ── Lane 1 (purge-by-default, exemptions per _purge_find_predicate). List
   # purgeable files (for the caller's report), then delete (unless --dry-run).
@@ -738,14 +845,33 @@ EOF
     esac
   fi
 
+  # : surface the git dirs Lane 3 preserved — same builder idiom as
+  # the dotfile names above; the preservation must be checkable from outside.
+  local git_kept_json='[' _gk_first=1 _gk git_kept_count=0
+  if [ -n "${STRAY_PRESERVED_GIT:-}" ]; then
+    while IFS= read -r _gk; do
+      [ -z "$_gk" ] && continue
+      [ "$_gk_first" -eq 0 ] && git_kept_json="$git_kept_json,"
+      git_kept_json="$git_kept_json\"$_gk\""
+      _gk_first=0
+      git_kept_count=$((git_kept_count + 1))
+    done <<EOF
+$STRAY_PRESERVED_GIT
+EOF
+  fi
+  git_kept_json="$git_kept_json]"
+  local wm_json=null
+  [ -n "$WM_VAL" ] && wm_json="\"$WM_VAL\""
+
   local purged gc_purged stray_purged
   if [ "$DRY_RUN" -eq 1 ]; then
     purged=0; gc_purged=0; stray_purged=0
   else
     purged="$count"; gc_purged="$gc_count"; stray_purged="$stray_count"
   fi
-  printf '{"purged":%d,"would_purge":%d,"files":%s,"drained_gc_purged":%d,"drained_gc_would_purge":%d,"drained_gc_files":%s,"stray_purged":%d,"stray_would_purge":%d,"unmanaged_dotfiles":%d,"unmanaged_dotfile_names":%s,"citation_lookup":"%s","backend_propagation":%s,"dry_run":%s,"age_min":%d,"drained_age_days":%d,"temp_dir":"%s"}\n' \
+  printf '{"purged":%d,"would_purge":%d,"files":%s,"drained_gc_purged":%d,"drained_gc_would_purge":%d,"drained_gc_files":%s,"stray_purged":%d,"stray_would_purge":%d,"stray_preserved_git":%d,"stray_preserved_git_dirs":%s,"watermark":%s,"watermark_source":"%s","unmanaged_dotfiles":%d,"unmanaged_dotfile_names":%s,"citation_lookup":"%s","backend_propagation":%s,"dry_run":%s,"age_min":%d,"drained_age_days":%d,"temp_dir":"%s"}\n' \
     "$purged" "$count" "$files_json" "$gc_purged" "$gc_count" "$gc_files_json" "$stray_purged" "$stray_count" \
+    "$git_kept_count" "$git_kept_json" "$wm_json" "$WM_SRC" \
     "$dot_count" "$dot_files_json" "$citation_lookup" "$backend_prop" \
     "$([ "$DRY_RUN" -eq 1 ] && echo true || echo false)" "$AGE_MIN" "$DRAINED_AGE_DAYS" "$temp_dir"
   return 0
