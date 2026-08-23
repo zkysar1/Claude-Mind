@@ -1,0 +1,39 @@
+# Environment registry entry -- serene-mind (added 2026-08-23).
+#
+# A CLIENT deployment, and the only member of the roster no agent can reach.
+# It runs on a box inside a private VPC with no fleet route; the operator
+# tailscales in by hand and installs zak-code and Claude-Mind manually. Its
+# update path is therefore a fourth kind, distinct from every sibling:
+#
+#   ayoai-mind   frontier / source of truth
+#   claude-mind  push   -- promote-to-upstream.sh -> PR
+#   zds-mind     push   -- PR into its own repo
+#   coach-mind   pull   -- plain `git pull` (direct clone of staging)
+#   serene-mind  MANUAL -- hand-installed by the operator over Tailscale
+#
+# It is registered here precisely BECAUSE it is unreachable. The registry is the
+# SSOT for core/config/conventions/cross-deployment-channel.md ("this world is
+# not alone"); a live deployment absent from it makes every fleet-wide count
+# wrong by one, and an agent cannot reason about a peer it has never been told
+# exists. Registration is not a claim that anything here can talk to it.
+#
+# OPERATIONAL NOTES (do not act on these -- they explain why NOT to):
+#   * The host auto-stops. A tailnet listing showing it offline for days is the
+#     cost control working as designed, NOT an outage to investigate. Do not
+#     file liveness findings about it.
+#   * Access is gated by strict Tailscale ACLs (tag:serene) with IAP as
+#     break-glass. An agent probe will time out; that is the boundary holding.
+#   * The engagement carries HIPAA/BAA scope. Fleet automation must stay out.
+#
+# framework_version: UNKNOWN and not fleet-derivable. Only the operator knows
+# what was last hand-installed. Do not infer it from any sibling deployment.
+#
+# backend: local -- placeholder consistent with every other entry, NOT a
+# measurement. Nothing here has read that deployment's configuration.
+environment_id: serene-mind
+backend: local
+# known_agents: deliberately OMITTED rather than guessed. Absence contributes no
+# names to the cross-deployment collision set, so bare requires_action_by:<name>
+# tokens keep routing locally -- the correct fail-safe for a peer whose roster
+# cannot be read. Populate only from an operator-supplied roster, never by
+# analogy with a sibling.
