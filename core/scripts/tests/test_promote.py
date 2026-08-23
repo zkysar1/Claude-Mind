@@ -327,7 +327,11 @@ def _mk_target_with_remote(tmp_path: Path, version: str):
     _git(tgt, "init", "-q")
     _gitcfg(tgt)
     _git(tgt, "add", "-A")
-    _git(tgt, "commit", "-q", "-m", "init")
+    # Pin committer date before the source commit so classify_direction never
+    # sees a later tgt_ts on slow-git platforms (Windows).
+    subprocess.run([_GIT, "-C", str(tgt), "commit", "-q", "-m", "init"],
+                   capture_output=True, text=True, check=True,
+                   env={**os.environ, "GIT_COMMITTER_DATE": "2020-01-01T00:00:00+0000"})
     _git(tgt, "branch", "-M", "main")
     bare = tmp_path / "bare.git"
     r = subprocess.run([_GIT, "init", "--bare", "-q", str(bare)], capture_output=True, text=True)

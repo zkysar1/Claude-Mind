@@ -355,7 +355,9 @@ _wt_teardown() {
     || say "WARNING: worktree teardown reported a problem for $WT_DIR — remove it by hand (git -C \"$TARGET\" worktree remove --force \"$WT_DIR\")"
 }
 if [[ $DO_PR -eq 1 ]]; then
-  WT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/promote-wt-XXXXXX")" \
+  _wt_base="${TMPDIR:-/tmp}"
+  command -v cygpath >/dev/null 2>&1 && _wt_base="$(cygpath -m "$_wt_base")"
+  WT_DIR="$(mktemp -d "$_wt_base/promote-wt-XXXXXX")" \
     || fail "could not create a temp dir for the promotion worktree"
   rmdir "$WT_DIR" 2>/dev/null || true   # git worktree add wants to create it
   trap _wt_teardown EXIT

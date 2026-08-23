@@ -847,6 +847,25 @@ def _build_goal_payload(trigger):
     """Build the JSON payload passed via stdin to aspirations.py add-goal."""
     priority = SEVERITY_PRIORITY.get(trigger["severity"], "MEDIUM")
     title = f"Apply: {trigger['action']} (from {trigger['author']} insight_trigger {trigger['msg_id']})"
+    # intended_agent vocabulary normalization (selection-stack review
+    # 2026-08-21). resolve_addressing() settles WHICH DEPLOYMENT a target
+    # belongs to but never checks roster MEMBERSHIP, so loose board tags
+    # (requires_action_by:any / :reducer / :agent) used to be copied verbatim
+    # — 5 such goals measured live. The daemon add path now REFUSES off-vocab
+    # values (gates.intended_agent_vocab), so filing verbatim would error the
+    # sweep on the first loose tag. Off-roster => "either", byte-identical to
+    # how the read side already treats these values (); the
+    # to:<target> tag below keeps the author's original addressing for
+    # provenance. Empty/unreadable roster fails open to verbatim (rb-1028) —
+    # matching the gate, which skips its check in the same condition.
+    intended = trigger["target"]
+    _roster = _local_roster()
+    if _roster and intended not in _roster | {"either"}:
+        print(f"[insight-trigger-sweep] NOTE: target {intended!r} "
+              f"({trigger['msg_id']}) is not in the active roster; filing "
+              f"intended_agent='either' (read-side equivalent, g-115-3482); "
+              f"original kept in the to:{intended} tag.", file=sys.stderr)
+        intended = "either"
     desc_parts = [
         f"Insight trigger from {trigger['author']} @ {trigger['timestamp']}.",
         "",
@@ -864,7 +883,7 @@ def _build_goal_payload(trigger):
         "description": "\n".join(desc_parts),
         "priority": priority,
         "participants": ["agent"],
-        "intended_agent": trigger["target"],
+        "intended_agent": intended,
         "origin_signal": f"insight_trigger:{trigger['msg_id']}",
         "tags": ["insight-trigger-conversion", f"from:{trigger['author']}", f"to:{trigger['target']}"],
     }

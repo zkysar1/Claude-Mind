@@ -574,7 +574,7 @@ def test_unlistable_lane_is_not_a_pass(dpc, monkeypatch, capsys):
 def test_no_claims_passes_but_says_it_audited_nothing(dpc, monkeypatch, capsys):
     """The zero-claim PASS must not read as 'past holds were checked and clean'.
 
-    Holds are not durably recorded (guard-2077 second half), so this run can only
+    Holds are not durably recorded (guard-3380 second half), so this run can only
     establish that a claim made NOW is verifiable. If that scope statement ever
     disappears the PASS becomes the reassuring-forever answer this file exists to
     prevent.

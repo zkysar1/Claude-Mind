@@ -23,7 +23,25 @@ belong to which layer so a future repo split is straightforward.
 
 ## Mixed / TBD
 
-- `core/scripts/*.py` — CLI modules (currently mixed; will be split during/after cutover)
+- `core/scripts/*.py` — mixed by design since the 2026-05-14 daemon cutover
+  (the "will be split during/after cutover" note that used to sit here went
+  stale for three months; measured state, selection-stack review 2026-08-21):
+  - **Library modules** imported by both layers (`aspirations.py` validators/
+    constants, `_agents.py`, `_goal_fields.py`, `predicate.py`, …).
+  - **Python→Python CLI lane** — `aspirations.py` retains exactly FOUR argparse
+    subcommands, each deliberately alive (the 27 dead ones were deleted in the
+    cutover's over-deletion sweep, HARDENING.md S1–S4): `update-goal` and
+    `update-asp-field` (called by sweep scripts: recurring-precondition-sweep,
+    monitor-stale-check, credential-defer-recheck, chronic-friction-aggregator),
+    `recompute-all-progress` (bootstrap — init-agent.sh runs it before any
+    daemon exists; also a daemon endpoint), and `evolution-append` (its only
+    caller is test_runtime_batch4_write's byte-compat parity harness, which
+    runs the CLI as the reference implementation against the daemon mirror —
+    delete the CLI and the daemon loses its fidelity pin).
+  - Known coherence debt: `update-goal` therefore has TWO live paths whose
+    validation sets differ (the CLI runs structured-prefix/cascade extras the
+    daemon omits; the daemon runs the add-site parity gates). Tracked as a
+    world Idea goal filed by the 2026-08-21 selection-stack review.
 - `core/config/*.yaml` — config files (some consumed client-side, some server-side)
 
 ## How to extend

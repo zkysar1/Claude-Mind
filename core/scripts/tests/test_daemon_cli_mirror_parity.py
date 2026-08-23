@@ -21,6 +21,8 @@ Mirror pairs covered:
   B. tree_write._apply_defaults        <-> tree.py apply_defaults
   C. tree_write._CHILD_COPY_FIELDS     <-> tree.py cmd_add_child inline copy tuple
   D. tree_write._UTILITY_RATIO_FIELDS  <-> tree.py _UTILITY_RATIO_FIELDS
+  E. experience_write.GOAL_ID_IN_EXP_ID_RE <-> experience.py GOAL_ID_IN_EXP_ID_RE
+     (g-115-7028 — diverged for months; the daemon copy is the live write path)
 
 Ordered equality is asserted (strictly stronger than set equality): the daemon
 writes _tree.yaml / team-state.yaml with sort_keys=False, so insertion ORDER is
@@ -51,6 +53,11 @@ CLI_TREE = REPO_ROOT / "core" / "scripts" / "tree.py"
 CLI_TEAM_STATE = REPO_ROOT / "core" / "scripts" / "team-state.py"
 DAEMON_TREE_WRITE = REPO_ROOT / "mind_api" / "src" / "world" / "tree_write.py"
 DAEMON_TEAM_STATE = REPO_ROOT / "mind_api" / "src" / "world" / "team_state.py"
+# Pair E lives under endpoints/, not world/ — the daemon's route-registering
+# surface spans both (guard-742: greping only endpoints/ misses a majority of it).
+CLI_EXPERIENCE = REPO_ROOT / "core" / "scripts" / "experience.py"
+DAEMON_EXPERIENCE_WRITE = (REPO_ROOT / "mind_api" / "src" / "endpoints"
+                           / "experience_write.py")
 
 _RESYNC = ("Re-sync the daemon mirror to the CLI (byte-compat drift class; "
            "g-115-1459, guard-742 / guard-547).")
@@ -231,3 +238,69 @@ def test_distill_candidates_daemon_delegates_to_cli():
             "A daemon serving a project root other than the CLI module's would "
             "read the wrong path with no local symptom. " + _RESYNC
         )
+
+
+# --- E. experience goal-id derivation regex ---------------------------------
+
+def _compiled_regex_pattern(mod: ast.Module, name: str) -> str:
+    """Return the pattern string of a module-level ``name = re.compile(<str>)``.
+
+    Deliberately not ``_module_assign_literal``: the value is a Call, not a
+    literal, so ``ast.literal_eval`` raises on it.
+    """
+    for node in mod.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for tgt in node.targets:
+            if not (isinstance(tgt, ast.Name) and tgt.id == name):
+                continue
+            call = node.value
+            if (isinstance(call, ast.Call) and call.args
+                    and isinstance(call.args[0], ast.Constant)
+                    and isinstance(call.args[0].value, str)):
+                return call.args[0].value
+            raise AssertionError(
+                f"{name!r} is not a `re.compile(<string literal>)` assignment; "
+                "this extractor must be widened before it can compare the pair"
+            )
+    raise AssertionError(f"module-level assignment {name!r} not found")
+
+
+def test_experience_goal_id_regex_parity():
+    """The DAEMON copy is the one that RUNS — so CLI-side green proves nothing.
+
+    ``experience-add.sh`` is daemon-only (no Python CLI fallback since
+    2026-05-14), so every real write derives ``goal_id`` through the daemon's
+    copy; the CLI copy fires only on core-side touches. That asymmetry is
+    exactly what let these two diverge silently for months -- the g-115-2761
+    ``xw-`` cross-world widening landed on the CLI side alone, under a comment
+    claiming the daemon copy was "lifted VERBATIM from experience.py".
+
+    Cost when it was finally measured (g-115-7028): the daemon's narrower copy
+    also required a trailing ``-``, so a bare ``exp-<goal-id>`` id never
+    derived -- 220 records across all 7 agents permanently invisible to
+    ``experience-read --goal`` AND un-repairable, because the backfill tool
+    derives through the same helper and therefore reported a clean ``total: 0``
+    against the very population it exists for.
+
+    Both copies now carry a TWIN comment (guard-130). A comment is advisory;
+    this test is the enforcement it cannot supply.
+    """
+    cli = _compiled_regex_pattern(_module(CLI_EXPERIENCE), "GOAL_ID_IN_EXP_ID_RE")
+    daemon = _compiled_regex_pattern(
+        _module(DAEMON_EXPERIENCE_WRITE), "GOAL_ID_IN_EXP_ID_RE")
+    # Guard the guard: an extractor that silently returned "" from both sides
+    # would make this assertion vacuously true -- the failure mode this whole
+    # module exists to prevent, reintroduced one level up (guard-2298).
+    assert cli and daemon, (
+        "regex extraction returned empty -- the pair was never compared. "
+        f"cli={cli!r} daemon={daemon!r}"
+    )
+    assert cli == daemon, (
+        "experience goal-id derivation regex drift:\n"
+        f"  CLI    (core/scripts/experience.py):                 {cli!r}\n"
+        f"  daemon (mind_api/src/endpoints/experience_write.py): {daemon!r}\n"
+        "The DAEMON copy is the live write path -- a CLI-only widening is a "
+        "silent no-op at write time and every core-side test stays green. "
+        + _RESYNC
+    )

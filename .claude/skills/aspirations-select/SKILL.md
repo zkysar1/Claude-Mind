@@ -105,12 +105,12 @@ ranked_goals = parsed_output  # JSON array of scored candidates
 # fix's own comment records the gate "silently opened"; this is the second of
 # the three readers, and the digest Phase 4 hard gate is the third.
 #
-# Staleness is the REAPER's job, not this filter's: body_row_reaper (wired via
-# stranded-claim-sweep, which stop-hook/worker-loop/consolidate all call) deletes
-# rows whose carrier has been stale for DEFAULT_REAP_STALE_MINUTES (180). Do NOT
-# add a second freshness heuristic here — it would drift from the reaper's and
-# put two policies on one store. The bound to know: a dead Body can withhold a
-# goal for at most ~3h, which is the safe direction versus a duplicate claim.
+# Staleness is the REAPER's job, not this filter's: body_row_reaper (via
+# stranded-claim-sweep) deletes rows whose carrier is stale for
+# DEFAULT_REAP_STALE_MINUTES (180). Do NOT add a second freshness heuristic
+# here — it would drift and put two policies on one store. The ~3h bound
+# holds ONLY because every row is born with a carrier (g-306-349); a
+# carrier-less row is unreapable at ANY age.
 Bash: team-state-read.sh --field agent_status.<partner>.in_flight.goal_id --json
 Bash: team-state-read.sh --field agent_status.<partner>.in_flight_bodies --json
     # `--field` returns the whole nested map, so no new endpoint/helper is needed.

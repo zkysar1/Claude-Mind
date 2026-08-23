@@ -199,8 +199,13 @@ def _tolerant_decode(slot, raw):
     fail-open boundary is the caller's shell wrapper (rb-347), never
     inside this aggregator.
     """
-    if (raw or "").lstrip() == "null":
-        return None  # canonical wm-slot empty-state literal
+    if (raw or "").strip() == "null":
+        # Canonical wm-slot empty-state literal. .strip(), NOT .lstrip(): the
+        # daemon returns 'null\n' (measured), so a leading-only strip left the
+        # trailing newline attached, the guard never matched, and the empty slot
+        # fell through to tolerant_decode_aggregate -> sys.exit(1) with zero
+        # stdout. Sibling create-blocker.py:109 reads the same slot correctly.
+        return None
     return _rt.tolerant_decode_aggregate(f"blocker-recheck: {slot}", raw)
 
 

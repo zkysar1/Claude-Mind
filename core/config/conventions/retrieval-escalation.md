@@ -44,26 +44,7 @@ If no workspace is configured, skip Tier 2.
 
 **Sufficiency check**: Can I answer/execute with tree + codebase findings?
 - **YES** → stop, use combined knowledge
-- **NO** → proceed to Tier 3 (if mode permits)
-
-### Tier 3: Web Search (External Knowledge)
-
-When tree + codebase aren't enough, search the web for external knowledge.
-
-**Techniques**:
-- **WebSearch**: targeted queries for specific gaps
-- **WebFetch**: retrieve authoritative sources identified by search
-
-**When to use Tier 3**:
-- Topic involves external APIs, services, or technologies not in tree/codebase
-- Information may be outdated and needs current data
-- Tree + codebase provide no relevant results
-- Goal explicitly requires research (skill: `/research-topic`)
-
-**When to SKIP Tier 3**:
-- Mode is `reader` (no web access)
-- Tree + codebase fully answered the question
-- Topic is purely internal (private codebase knowledge)
+- **NO** → proceed to Tier 2.5 (peer worlds — one cheap read-only call), then Tier 3 (if mode permits)
 
 ### Tier 2.5: Peer Worlds (Cross-Deployment, READ-ONLY)
 
@@ -80,10 +61,22 @@ rigor can close it, which is what makes it different from every other
 bash core/scripts/peer-retrieve.sh <query terms...>        # add --json for the raw object
 ```
 
-**When to use Tier 2.5**: before reporting that something does not exist,
-before answering a question whose subject another deployment owns, and any
+**When to use Tier 2.5**: as the ROUTINE escalation step whenever Tiers 1+2
+come back thin or insufficient (since 2026-08-21 — one cheap read-only call
+BEFORE reaching for the web); before reporting that something does not exist;
+before answering a question whose subject another deployment owns; and any
 time the user's question spans the fleet rather than this world. It is cheap
 (filesystem reads) and read-only in every mode.
+
+**Coverage + ranking (2026-08-21 upgrade)**: per world the direct lane
+searches board channels, the knowledge tree, conventions, AND the
+reasoning-bank + guardrails JSONL stores (active records only). Candidates
+are scored (capped term frequency + whole-phrase adjacency bonus) and
+truncated AFTER global ranking. The pre-upgrade shape — first-N matches in
+file-glob order, with the two JSONL stores invisible — meant five early
+board rows could shut out an exact reasoning-bank hit entirely. AND-matching
+is unchanged: ranking reorders hits, it never widens or narrows what counts
+as `empty`.
 
 **Read the exit code — it is the whole point.**
 
@@ -117,6 +110,25 @@ world's stores, and every record keeps its `origin_env`. Rationale against
 reader never imports `_fileops`, so a peer read cannot inherit this world's
 storage backend (guard-955 / rb-2983 class) — `assert_no_fileops()` proves it
 at runtime rather than asserting it in prose.
+
+### Tier 3: Web Search (External Knowledge)
+
+When tree + codebase aren't enough, search the web for external knowledge.
+
+**Techniques**:
+- **WebSearch**: targeted queries for specific gaps
+- **WebFetch**: retrieve authoritative sources identified by search
+
+**When to use Tier 3**:
+- Topic involves external APIs, services, or technologies not in tree/codebase
+- Information may be outdated and needs current data
+- Tree + codebase provide no relevant results
+- Goal explicitly requires research (skill: `/research-topic`)
+
+**When to SKIP Tier 3**:
+- Mode is `reader` (no web access)
+- Tree + codebase fully answered the question
+- Topic is purely internal (private codebase knowledge)
 
 ## Mode Gates
 

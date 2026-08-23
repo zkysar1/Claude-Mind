@@ -230,6 +230,119 @@ mk_runner zeta sid-runner-999
 mk_attrib zeta sid-observer-222 "$((NOW_EPOCH - 5))"
 run_case_wa "14-window-env-override-ejects" 1 "is NOT the runner" zeta sid-observer-222 1
 
+# === Same-SID duplicate-instance eject () =========================
+# The gap: every case above turns on a SID MISMATCH. Two processes carrying the
+# SAME $MIND_SID both pass, forever. These cases pin the process-identity
+# discriminator that closes it — and, critically, pin that a LEGITIMATE single
+# runner stays GREEN, because a gate that ejects the real runner is far worse
+# than the bug it fixes.
+#
+# RUNNER_PROC_ID injects the owning-process identity (a sandbox has no `claude`
+# ancestor to resolve). Case 19 leaves it UNSET to exercise the real /proc walk.
+
+# live_proc_id <pid> -> "<pid>:<starttime>" for a process that is genuinely alive.
+# Uses the same comm-safe parse as the gate (strip through the LAST paren).
+live_proc_id() {
+    local p="$1" line rest
+    line=$(cat "/proc/$p/stat" 2>/dev/null) || return 1
+    rest="${line##*)}"
+    printf '%s:%s' "$p" "$(printf '%s' "$rest" | awk '{print $20}')"
+}
+
+mk_proc_stamp() {  # <agent> <proc-id>
+    mkdir -p "$SANDBOX/agents/$1/session"
+    printf '%s\n' "$2" > "$SANDBOX/agents/$1/session/runner-proc"
+}
+
+run_case_proc() {  # <label> <exit> <stderr-substr> <agent> <sid> <proc-id-or-__UNSET__>
+    local label="$1" expected_exit="$2" expected_stderr="$3"
+    local agent_env="$4" sid_env="$5" proc_env="$6"
+    local stderr_file rc=0
+    stderr_file=$(mktemp -t runner-identity-stderr-XXXXXX)
+    if [ "$proc_env" = "__UNSET__" ]; then
+        MIND_AGENT="$agent_env" MIND_SID="$sid_env" bash "$GATE" 2>"$stderr_file" || rc=$?
+    else
+        MIND_AGENT="$agent_env" MIND_SID="$sid_env" \
+          RUNNER_PROC_ID="$proc_env" bash "$GATE" 2>"$stderr_file" || rc=$?
+    fi
+    local stderr_content; stderr_content=$(cat "$stderr_file"); rm -f "$stderr_file"
+    local ok=1
+    [ "$rc" = "$expected_exit" ] || ok=0
+    if [ -n "$expected_stderr" ] && ! printf '%s' "$stderr_content" | grep -qF "$expected_stderr"; then ok=0; fi
+    if [ "$ok" = "1" ]; then echo "PASS $label (exit=$rc)"; PASS_COUNT=$((PASS_COUNT + 1));
+    else echo "FAIL $label"; echo "  expected_exit=$expected_exit got=$rc";
+         echo "  expected_stderr=\"$expected_stderr\""; echo "  actual_stderr=\"$stderr_content\"";
+         FAIL_COUNT=$((FAIL_COUNT + 1)); fi
+}
+
+PROC_FILE_PATH="$SANDBOX/agents/zeta/session/runner-proc"
+
+# Case 15: sole runner, no prior stamp -> passes AND claims the stamp.
+reset_state
+mk_runner zeta sid-abc-111
+run_case_proc "15-sole-runner-claims-proc-stamp" 0 "" zeta sid-abc-111 "4242:99999"
+if [ -f "$PROC_FILE_PATH" ] && [ "$(cat "$PROC_FILE_PATH")" = "4242:99999" ]; then
+    echo "PASS 15b-proc-stamp-written"; PASS_COUNT=$((PASS_COUNT + 1))
+else
+    echo "FAIL 15b-proc-stamp-written"
+    echo "  runner-proc: $([ -f "$PROC_FILE_PATH" ] && cat "$PROC_FILE_PATH" || echo MISSING)"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+fi
+
+# Case 16: stamp is MINE -> passes (the steady-state single-runner iteration).
+reset_state
+mk_runner zeta sid-abc-111
+mk_proc_stamp zeta "4242:99999"
+run_case_proc "16-own-proc-stamp-passes" 0 "" zeta sid-abc-111 "4242:99999"
+
+# Case 17: THE BUG. Same SID, stamp held by a DIFFERENT LIVE process -> EJECT.
+# Before this change the gate returned 0 here, which is the whole defect.
+reset_state
+mk_runner zeta sid-abc-111
+mk_proc_stamp zeta "$(live_proc_id $$)"
+run_case_proc "17-same-sid-live-duplicate-ejects" 1 "SAME-SID DUPLICATE INSTANCE" \
+    zeta sid-abc-111 "4242:99999"
+
+# Case 18: stamp holds a DEAD owner -> take over, do not wedge. Uses a LIVE pid
+# with a WRONG starttime, which is precisely the PID-reuse shape: pid alone
+# would read as alive, the (pid,starttime) pair correctly reads as dead.
+reset_state
+mk_runner zeta sid-abc-111
+mk_proc_stamp zeta "$$:1"
+run_case_proc "18-dead-owner-taken-over" 0 "" zeta sid-abc-111 "4242:99999"
+if [ "$(cat "$PROC_FILE_PATH" 2>/dev/null)" = "4242:99999" ]; then
+    echo "PASS 18b-takeover-rewrites-stamp"; PASS_COUNT=$((PASS_COUNT + 1))
+else
+    echo "FAIL 18b-takeover-rewrites-stamp"
+    echo "  runner-proc: $(cat "$PROC_FILE_PATH" 2>/dev/null || echo MISSING)"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+fi
+
+# Case 19: RUNNER_PROC_ID UNSET -> the real /proc ancestor walk runs. Asserts
+# only the SHAPE (<digits>:<digits>) and that the runner still passes, so the
+# case holds on any box: where an ancestor resolves it stamps a real identity,
+# and where none does the check is skipped and no stamp appears. Either way a
+# legitimate sole runner must exit 0 — that is the invariant under test.
+reset_state
+mk_runner zeta sid-abc-111
+run_case_proc "19-real-proc-walk-runner-still-passes" 0 "" zeta sid-abc-111 __UNSET__
+if [ ! -f "$PROC_FILE_PATH" ] || grep -Eq '^[0-9]+:[0-9]+$' "$PROC_FILE_PATH"; then
+    echo "PASS 19b-real-walk-stamp-well-formed-or-absent"; PASS_COUNT=$((PASS_COUNT + 1))
+else
+    echo "FAIL 19b-real-walk-stamp-well-formed-or-absent"
+    echo "  runner-proc: $(cat "$PROC_FILE_PATH")"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+fi
+
+# Case 20: a NON-runner with a duplicate-looking stamp still ejects via the
+# ORIGINAL mismatch path, not the new one. Pins that the new block did not
+# swallow or reword the pre-existing eject.
+reset_state
+mk_runner zeta sid-runner-999
+mk_proc_stamp zeta "$(live_proc_id $$)"
+run_case_proc "20-sid-mismatch-still-uses-original-eject" 1 "is NOT the runner" \
+    zeta sid-observer-222 "4242:99999"
+
 echo ""
 echo "──────────────────────────────────────────"
 echo "Total: $((PASS_COUNT + FAIL_COUNT))  Pass: $PASS_COUNT  Fail: $FAIL_COUNT"

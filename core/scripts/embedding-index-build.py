@@ -217,6 +217,31 @@ def load_corpus(limit=None):
         t = tree_doc_text(key, node)
         if did and t:
             docs.append({"id": did, "type": "tree", "text": t, "hash": content_hash(t)})
+    # : framework docs (.claude/rules + core/config/conventions +
+    # world/conventions) as 'framework:<relpath>' — namespace-disjoint from
+    # rb-*/guard-*/tree: like the tree docs before them.
+    #
+    # The corpus, the doc id and the embedded text ALL come from retrieve.py
+    # rather than being re-derived here. That is the whole point: this lane's
+    # read side is retrieve.load_framework_rules, and a join whose two halves
+    # are written twice is the  defect (basename-vs-path join matched
+    # ZERO records, feature shipped silently inert) and the  defect
+    # (freshness watch-set mirrored load_corpus by hand and drifted). The tree
+    # rows above still carry that shape — build.tree_doc_id and
+    # retrieve._tree_doc_id_for are hand-maintained copies that say "MUST
+    # mirror" each other. Do not extend that pattern here.
+    try:
+        for entry in R._build_framework_index():
+            did = R.framework_doc_id(entry)
+            t = R.framework_doc_text(entry)
+            if did and t:
+                docs.append({"id": did, "type": "framework", "text": t,
+                             "hash": content_hash(t)})
+    except Exception:
+        # Opportunistic, exactly like the tree read above: a framework corpus
+        # that cannot be walked must not fail the whole index build and strand
+        # the guardrail/rb/tree rows that were already collected.
+        pass
     # De-dup by id (defensive — a store should not carry two active same-id rows;
     # keep first). Preserves order.
     seen = set()
@@ -346,7 +371,15 @@ def cmd_stats(out):
     meta_path = out / "meta.json"
     emb_path = out / "embeddings.npy"
     if not meta_path.exists():
-        print(json.dumps({"op": "stats", "exists": False, "out": str(out)}))
+        # Absent index is the DEGRADED state, not a non-answer: with the fleet
+        # flags ON this box serves token-only retrieval, so the capability
+        # verdict must be present on every box, provisioned or not (2026-08-21
+        # cc-13: 5/7 known-target paraphrase misses with nothing reporting it).
+        print(json.dumps({"op": "stats", "exists": False, "out": str(out),
+                          "channel": "DEAD",
+                          "channel_reason": "index absent on this box -- "
+                          "initial build is a deliberate action: "
+                          "embedding-index-build.py --build"}))
         return
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     # Staleness: compare stored per-doc hashes against the live corpus.

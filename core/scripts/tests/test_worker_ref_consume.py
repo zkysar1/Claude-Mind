@@ -154,14 +154,39 @@ def test_retire_refuses_ref_not_reachable_from_origin_main(repo):
     assert not receipts.exists(), "a refused retire must not write a receipt"
 
 
-def _stub_reader(tmp_path, payload, rc=0):
+# Default: agent `alpha` present (every fixture ref is refs/workers/alpha/...)
+# and carrying the in_flight_bodies key, so the schema reads INTACT and an
+# absent child row is a GENUINE absence. Tests that want drift override it.
+INTACT_STATUS = '{"alpha": {"in_flight_bodies": {}}}'
+
+
+def _stub_reader(tmp_path, payload, rc=0, status_payload=INTACT_STATUS, name=None):
     """Hermetic stand-in for team-state-read.sh (WORKER_REF_TEAM_STATE_READER
     seam, g-306-286). Emits `payload` on stdout and exits `rc` — so the retire
     liveness gate's parse/decide path runs UNCHANGED; only the JSON's emitter
     differs. test_liveness_seam_default_is_the_real_sibling pins that
-    production resolves to the real sibling, not this stub."""
-    stub = tmp_path / "stub-team-state-read.sh"
-    stub.write_text(f"#!/usr/bin/env bash\nprintf '%s' '{payload}'\nexit {rc}\n")
+    production resolves to the real sibling, not this stub.
+
+    FIELD-AWARE since g-306-339. The gate now asks TWO different questions of
+    the reader: the child row (agent_status.<agent>.in_flight_bodies.<sid>) and
+    the schema probe (agent_status). A stub that answered both with one payload
+    could not model the real reader, which returns rc=0 "null" for a path that
+    does not exist — the exact ambiguity g-306-339 fixes. `status_payload`
+    answers the schema probe; `payload` answers everything else."""
+    stub = tmp_path / (name or "stub-team-state-read.sh")
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        'field=""\n'
+        'while [ $# -gt 0 ]; do\n'
+        '  case "$1" in --field) field="${2:-}"; shift 2;; *) shift;; esac\n'
+        "done\n"
+        'if [ "$field" = "agent_status" ]; then\n'
+        "  printf '%s' '" + status_payload + "'\n"
+        "  exit 0\n"
+        "fi\n"
+        "printf '%s' '" + payload + "'\n"
+        "exit " + str(rc) + "\n"
+    )
     return str(stub)
 
 
@@ -251,6 +276,89 @@ def test_force_retire_live_overrides_and_logs_to_receipt(repo, tmp_path):
     rec = json.loads(receipts.read_text().strip().splitlines()[-1])
     assert rec["liveness_override"] == "body killed manually during incident drill"
     assert rec["body_row"].startswith("LIVE-OVERRIDDEN goal=g-999-9")
+
+
+# --- : "null" means BOTH "no live row" and "that path does not exist" ---
+# team-state-read.sh returns rc=0 / stdout "null" / EMPTY stderr for a path that
+# does not exist (measured on four controls, incl. a positive control proving the
+# reader itself works). So the gate's fail-closed branch — written for an
+# "unreadable liveness source" — could not fire on the failure mode that actually
+# occurs, and path drift fell through to RETIRE. These four pin the schema probe
+# that disambiguates. guard-3660 is the constraint they must not violate: an
+# ABSENT row is a LEGITIMATE retire, so only UNTRUSTWORTHY absence may refuse.
+
+def test_retire_fails_closed_when_agent_status_itself_drifts(repo, tmp_path):
+    """Top-level key moved/renamed -> schema probe reads "null" -> REFUSE."""
+    work = _merge_and_push_a(repo)
+    r = _consume(work, "--retire", "refs/workers/alpha/sid-aaaa",
+                 env={"WORKER_REF_TEAM_STATE_READER": _stub_reader(
+                     tmp_path, "null", status_payload="null")})
+    assert r.returncode == 1, "drifted schema must REFUSE, not retire"
+    assert "sid-aaaa" in _git(work, "ls-remote", "origin", "refs/workers/*"), (
+        "the ref must survive a refusal — deleting it is the unrecoverable direction"
+    )
+
+
+def test_retire_fails_closed_when_ref_agent_absent_from_team_state(repo, tmp_path):
+    """The ref's agent segment is derived by string-munging the ref path. If it
+    parses wrong (or names an agent team-state never heard of), the child query
+    returns "null" for a nonexistent path and the old gate retired anyway."""
+    work = _merge_and_push_a(repo)
+    r = _consume(work, "--retire", "refs/workers/alpha/sid-aaaa",
+                 env={"WORKER_REF_TEAM_STATE_READER": _stub_reader(
+                     tmp_path, "null",
+                     status_payload='{"bravo": {"in_flight_bodies": {}}}')})
+    assert r.returncode == 1, "unknown ref agent must REFUSE"
+    assert "sid-aaaa" in _git(work, "ls-remote", "origin", "refs/workers/*")
+
+
+def test_retire_fails_closed_when_in_flight_bodies_key_gone_fleet_wide(repo, tmp_path):
+    """The in_flight_bodies key renamed: every agent row exists, none carries the
+    key. Indistinguishable from a fleet with zero live bodies, so this refuses in
+    BOTH cases — the safe direction, with --force-retire-live as the escape."""
+    work = _merge_and_push_a(repo)
+    r = _consume(work, "--retire", "refs/workers/alpha/sid-aaaa",
+                 env={"WORKER_REF_TEAM_STATE_READER": _stub_reader(
+                     tmp_path, "null", status_payload='{"alpha": {}, "bravo": {}}')})
+    assert r.returncode == 1, "fleet-wide missing key must REFUSE"
+    assert "sid-aaaa" in _git(work, "ls-remote", "origin", "refs/workers/*")
+
+
+def test_retire_proceeds_for_an_agent_that_simply_has_no_live_bodies(repo, tmp_path):
+    """THE FALSE-REFUSE PIN, and the reason this fix does NOT probe the parent
+    path the filing goal proposed. in_flight_bodies is created LAZILY on first
+    claim: measured 2026-08-21, alpha/bravo carried it while echo/foxtrot/zeta
+    existed in agent_status WITHOUT it. Probing agent_status.<agent>.in_flight_bodies
+    would therefore read "null" for three real agents and refuse every ordinary
+    retire for them — turning a guard into something operators route around with
+    --force-retire-live. The probe sits one level up for exactly this reason, and
+    guard-3660 requires it: an absent row is a legitimate retire."""
+    work = _merge_and_push_a(repo)
+    r = _consume(work, "--retire", "refs/workers/alpha/sid-aaaa",
+                 env={"WORKER_REF_TEAM_STATE_READER": _stub_reader(
+                     tmp_path, "null",
+                     status_payload='{"alpha": {}, "bravo": {"in_flight_bodies": {}}}')})
+    assert r.returncode == 0, (r.stderr + r.stdout)
+    assert "sid-aaaa" not in _git(work, "ls-remote", "origin", "refs/workers/*")
+    rec = json.loads((work / "core" / "logs" / "worker-ref-retirements.jsonl")
+                     .read_text().strip().splitlines()[-1])
+    assert rec["body_row"] == "absent"
+
+
+def test_schema_drift_refusal_is_overridable(repo, tmp_path):
+    """A refusal an operator cannot get past becomes a reason to stop using the
+    tool. Same escape hatch the live-row branch already offers, recorded in the
+    receipt so the override is auditable."""
+    work = _merge_and_push_a(repo)
+    r = _consume(work, "--retire", "refs/workers/alpha/sid-aaaa",
+                 "--force-retire-live", "team-state schema migration in flight",
+                 env={"WORKER_REF_TEAM_STATE_READER": _stub_reader(
+                     tmp_path, "null", status_payload="null")})
+    assert r.returncode == 0, (r.stderr + r.stdout)
+    rec = json.loads((work / "core" / "logs" / "worker-ref-retirements.jsonl")
+                     .read_text().strip().splitlines()[-1])
+    assert rec["liveness_override"] == "team-state schema migration in flight"
+    assert "DRIFT" in rec["body_row"].upper(), rec["body_row"]
 
 
 def test_liveness_seam_default_is_the_real_sibling():

@@ -116,15 +116,13 @@ sufficient knowledge. Context manifests and quality ratings are NOT needed for c
 
 ## Step 4.5: Tier-Escalation Encoding Debt (E1)
 
-If Step 4 had to escalate past Tier 1 (knowledge tree) to answer, that IS
-evidence the tree had a gap. Queue a `knowledge_debt` entry naming the topic
-so the next encoding pass (Phase 4.5 in autonomous, `/encode-session` Lane 1.6
-in assistant) can resolve it. Without this, every Tier-2/Tier-3 answer leaks —
-the agent re-discovers the same gap on the next question.
+Escalating past Tier 1 IS evidence of a tree gap: queue a `knowledge_debt`
+entry naming the topic so the next encoding pass (autonomous Phase 4.5,
+assistant `/encode-session` Lane 1.6) resolves it. Why:
+`core/config/conventions/encoding-triggers.md` E1.
 
-Skip entirely in reader mode (no writes). Skip if all Tier-1 retrieval
-suffficed (the common case). Skip if the question was UNINITIALIZED-state
-small-talk (no world to write to).
+Skip in reader mode (no writes), if Tier 1 sufficed (the common case), or for
+UNINITIALIZED-state small-talk (no world to write to).
 
 ```
 1. Bash: session-mode-get.sh
@@ -484,18 +482,25 @@ acting on a previously-registered escalation, re-read its status from the store
 chokepoint is the positive mechanism that satisfies guard-33; the bare
 pending-questions write it replaces was the anti-pattern guard-33 forbids.
 
+## Step 5.0b: Chat-Goal Lane
+
+SUBSTANTIVE WORK REQUEST — multi-step AND produces durable artifacts? File a
+goal record NOW, before executing, so chat work reaches the learning loop
+without a manual `/encode-session`: read
+`core/config/chat-goal-protocol-digest.md`. NOT Q&A, NOT one mechanical edit,
+NOT a row Step 5 routes. When uncertain do NOT fire — over-firing turns chat
+into ceremony and the existing lanes still catch it.
+
 ## Step 5: Directive Detection & Routing
 
 Applies in ALL states, persona on or off. When a user message contains a directive (not just a question/comment), detect the type and act:
 
-**Origin-signal rule (applies to every goal-creation row below):** any goal
-written to `aspirations-add-goal.sh` from this step MUST include
-`"origin_signal": "user_directive"` in the JSON payload. The user's message
-is the triggering signal. The origin-signal-gate
-(`core/scripts/origin-signal-gate.py`) rejects goals without this field.
-For `/create-aspiration from-user`, the skill itself sets the aspiration's
-`origin_signal: user_directive` — child goals inherit via
-`parent_aspiration:<asp-id>`.
+**Origin-signal rule (every goal-creation row below):** any goal written via
+`aspirations-add-goal.sh` from this step MUST carry
+`"origin_signal": "user_directive"` — the user's message IS the triggering
+signal, and `core/scripts/origin-signal-gate.py` rejects goals without it. For
+`/create-aspiration from-user` the skill sets it on the aspiration; child goals
+inherit via `parent_aspiration:<asp-id>`.
 
 | Directive Type | Example | Action |
 |---------------|---------|--------|
@@ -515,12 +520,10 @@ For `/create-aspiration from-user`, the skill itself sets the aspiration's
 ### Processing Rules
 
 1. Detect directive intent naturally from conversation (no special syntax needed)
-2. Confirm what you're about to change before doing it: "I'll create a new aspiration to learn about cooking — sound right?"
+2. Confirm what you're about to change before doing it, then confirm completion with the concrete result ("Done — added asp-003: Explore Cooking")
 3. Execute the state change using existing conventions (asp-NNN IDs, goal structure, etc.)
-4. Confirm completion: "Done — added aspiration asp-003: Explore Cooking. I'll start working on this in my next loop cycle."
-5. In RUNNING state: directive takes effect on next aspirations loop iteration
-6. In IDLE state: state is updated, takes effect when user runs `/start`
-7. In UNINITIALIZED state: do NOT write files (world/ and agent dir don't exist yet). Acknowledge conversationally: "Got it — once you run `/start`, I'll set that up." Process the directive immediately after `/start` creates world/ and agent dir.
+4. Takes effect: RUNNING → next aspirations loop iteration; IDLE → when the user runs `/start`
+5. UNINITIALIZED: do NOT write files (world/ and agent dir do not exist yet). Acknowledge conversationally, then process the directive immediately after `/start` creates them.
 
 ## Step 5.5: Mid-Directive Drift Check (G15)
 

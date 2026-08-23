@@ -103,6 +103,55 @@ writer read, 1 could not be certified append-only, and 2 were genuinely
 registerable — so the lookup-only predicate had overstated the work ~6x and
 pointed at one change that would have been an active regression.
 
+## The other prior question: may THIS BOX write this store? (ownership, g-365-12)
+
+Classes (a), (b) and (c) all answer questions about the STORE. None of them
+answers whether the BOX running the writer is permitted to push it — and under
+own-cloud that is a separate gate with its own failure mode.
+
+Agent-dir ownership is the LIVE DDB runner claim (`owncloud_sync._owned_agents`,
+fail-safe empty set). A box owns only the agents whose runner claim it holds, so
+an assistant-mode chat session — which holds no claim — owns NOTHING, and
+`sync_file` skips every push under `agents/<peer>/**` with reason `peer_agent`
+(`owncloud_sync.py:1858`). The write lands locally and never reaches S3. The
+owned-prune is scoped to the agents root (`owncloud_sync.py:1541`), so `world/**`
+is NOT ownership-gated — that asymmetry is what makes a cure possible at all.
+
+Measured 2026-08-22 (zeta, `hostname` cc-02, own-cloud): `_owned_agents()` →
+`['zeta']` with six other agent dirs present locally, every one a peer cache.
+Local-vs-S3 id diff across all six: **`LOCAL_ONLY=0`** — so the stranding class
+below is NOT a property of merely holding peer caches. It requires a session that
+WRITES a peer-owned store, i.e. assistant-mode on a non-owning box.
+
+**This is why a class-(b) store can be fully FIXED and still fail from one box.**
+`agents/<agent>/experience.jsonl` has BOTH cures in place — `locked_rmw` at
+`experience_write.py:506`, and a `force_fresh` in-cycle read via `_read_jsonl`
+(`experience_write.py:164-168`) — and an add for a peer-owned agent from a
+claimless box still cannot converge, because no fence can push an object the sync
+layer declines to push. Read as a fence problem, it sends you to re-fix a writer
+that is already correct; the symptom (`write_conflict`, identical on every retry)
+looks exactly like a stale fence.
+
+### `experience.jsonl` is PERMANENTLY disqualified from class (a)
+
+Do not register a handler for it. `experience.py:933-936` (`cmd_archive_sweep`
+phase 2) rewrites live as a strict subset —
+`[r for r in live_items if r.get("id") not in archived_ids]` — which is
+guard-1816's disqualifying signature exactly. A union handler would silently
+resurrect every archived record at conflict time, on the box that lost the race,
+and duplicate it against `experience-archive.jsonl`, which already holds it.
+
+### The spool cure has a location trap
+
+"Spool it like the utilization sidecar" does not port. That spool
+(`_utilization_store.spool_path`) is **machine-local and never pushed**; it works
+only because every box runs its own flusher against a SHARED world store. A
+claimless box's flusher cannot write `agents/<peer>/**` either, so a
+machine-local spool reproduces the stranding one level down — the rows sit in a
+file no owner can ever read. Any spool cure here must land where the writing box
+may actually push (`world/**`, per the asymmetry above) and be drained by the
+OWNING box.
+
 ## The trap this convention exists to prevent
 
 **Sibling files are not the same class.** Of the six strategy files written by
@@ -456,6 +505,143 @@ as subprocesses with `STORAGE_BACKEND=local` pinned explicitly (guard-955). NOT
 verified: no two-box live convergence run — the handler is exercised against
 fixtures, so the argument that both machines emit identical bytes rests on the
 commutativity tests, not on observation.
+
+### Decision: tree-node `.md` — the BASE IS ABSENT, and that decides the shape (g-115-6954, 2026-08-21, echo, hostname cc-03, `uname -r` 6.8.0-137-generic)
+
+> **LANDED — tree-node `.md` is now class (a), not class (b) (g-115-7071,
+> 2026-08-22, echo, cc-03).** Candidate (d) below is implemented as
+> `coordination_merge.merge_tree_node_md`, dispatched by a sixth path-pattern
+> branch in `merge_handler_for`, with the shared core extracted to
+> `core/scripts/_section_merge.py` so the hyphen-named journal merge driver and
+> this handler hold ONE copy. The analysis below is the decision record and
+> stands as written; read this box for what actually ships.
+>
+> Two things the implementation added that the decision did not anticipate:
+>
+> 1. **A canonical argument order is REQUIRED for commutativity, and the naive
+>    handler does not have it.** `merge_sections` emits ours-then-theirs, so with
+>    the base absent every section is an addition and output order follows the
+>    CALLER's arguments — `merge(a,b)` and `merge(b,a)` keep identical content but
+>    differ byte-for-byte. Two boxes see opposite `(ours, theirs)` by construction,
+>    so each writes a different byte string for the same logical merge: different
+>    hashes, perpetual mirror divergence, on a file the merge just reported success
+>    for. The handler now sorts the two SIDES into a canonical order first. Note
+>    this is the exact failure the "mirror requires identical bytes" argument above
+>    predicts, and it was still missed at first — the pin that claimed to enforce
+>    commutativity compared `sorted(out.split())`, a token multiset blind to
+>    ordering, so it passed against a non-commutative handler.
+> 2. **The resurrection residual is DEMONSTRATED, not assumed** — pinned by
+>    `test_KNOWN_RESIDUAL_a_deliberate_section_eviction_resurrects`, with detection
+>    tracked by **g-115-7176** (sibling of g-115-4357, which covers the same
+>    resurrection class for `ayoai-ledger`'s id-union over experience/journal).
+>
+> Pins: `core/scripts/tests/test_tree_node_md_merge.py`, 12 tests, each
+> mutation-validated (drop the conflicts refusal → 1 F; drop the decode guard →
+> 1 F; drop the canonical order → 2 F; widen dispatch to a catch-all → 3 F).
+> **Still NOT verified:** no two-box live convergence run — same caveat the
+> paragraph above this section records for the other handlers.
+
+**1,555 live nodes** under `world/knowledge/tree/` are unregistered, so every one
+is class (b): a both-diverged 412 freezes it permanently with no operator step.
+Measured cost of that freeze on one node — `vinheim-revenue-economics.md`, on the
+owner's stated top revenue priority — 516 sweeps frozen, this box reading 35,959
+stale bytes against an authoritative 42,201, missing an entire measurement-correction
+section. Detection worked; nothing cured it.
+
+**The deciding measurement is that no base exists, and none can.** The contract is
+`merge_handler_for(path) -> Optional[Callable[[bytes, bytes], bytes]]`
+(`coordination_merge.py:5021`), called as `handler(body, remote_bytes)`
+(`owncloud_backend.py:1632`) — **two** arguments. `.history` holds 111,264 files but
+**ZERO** snapshots for tree-node `.md` (positive control: 1,555 live nodes; the 5,229
+files under `.history/knowledge/tree/` are all `_tree.yaml`). And a recovered base
+would not help even if it existed: history is **per-box**, and the mirror requires both
+machines to independently compute *identical bytes*. Git converges on one commit; the
+mirror does not. A per-box base is disqualifying by construction, not merely awkward.
+
+**What that costs the surviving candidate.** Base-free section-union cannot distinguish
+"ours ADDED section B" from "remote DELETED section B" — it resurrects, which is
+guard-3645's evicted-section hazard, and not hypothetical here: read-cap work trims
+nodes deliberately.
+
+**But resurrection does not favour the status quo, and this is easy to get backwards.**
+Under the freeze this box keeps reading its stale local copy — *which still contains B*.
+So resurrection leaves this box's view of B unchanged while it GAINS every other section
+that landed remotely. Against the freeze specifically, section-union is a strict
+improvement on the axis actually measured. Resurrection is a real defect of the
+candidate that needs its own detection, not a reason to keep freezing.
+
+**Losing candidates, and why each loses for a DIFFERENT reason:**
+
+| candidate | verdict | why |
+|---|---|---|
+| (a) whole-file LWW on front-matter `last_updated` | REJECTED | **The same-date two-section case.** Two agents appending *different* sections on the same date produce equal `last_updated`; LWW picks one whole file and the loser's section is lost entirely. The tie-break is also lexicographic, not by length (see the `_canon` correction above), so which file survives is arbitrary. |
+| (b) front-matter LWW + body **line**-union | REJECTED | Not for (a)'s reason. rb-3683: line-level auto-merge on markdown can DROP an interleaved section body while KEEPING its heading — silent corruption *inside* a section. |
+| (c) status quo (freeze + hand-union) | REJECTED as the DEFAULT, retained as the RESIDUAL | Narrows from "every concurrent edit freezes" to "same-heading divergence freezes", which is the only case where freezing is the right answer. |
+| (d) section-union by `## heading` | **SURVIVES** — and LANDED in g-115-7071 (see the box above; not landed in g-115-6954 itself) | Section-granular: a section is wholly present or wholly absent, never half-merged. That granularity is the entire distinction from (b). Wins the same-date case outright, because the two sections have different headings. |
+
+**Why (d) is cheap:** the pure core already exists and needs no new merge logic —
+`core/scripts/git-merge-journal-md.py::merge_sections`, the same relationship
+`ayoai-ledger` has to this file's handlers. Shape as specified here, and as
+shipped in g-115-7071 — except that the real handler also sorts the two sides
+into a canonical order before this call, without which it is not commutative
+(see the LANDED box above), and it decodes STRICTLY so an undecodable side
+refuses rather than being read as empty:
+
+```python
+merged, conflicts = merge_sections(b"", ours, theirs)   # b"" == the absent base
+if conflicts:            # REFUSE -> backend keeps its safe-freeze for this path
+    return None
+return merged
+```
+
+It must **NEVER** write git conflict markers into a knowledge node — that is the
+`.jsonl` marker-corruption class applied to prose.
+
+**Precondition landed with this decision (g-115-6954):** two defects in that core, both
+live for weeks. `split_sections` reattaches a trailing blank line to the *preceding*
+block, so raw block-list comparison found byte-identical content unequal whenever the two
+sides' *neighbouring* sections differed — a spurious conflict in the normal cross-box
+case; fixed at all three raw-comparison sites by comparing `_join(...)`, the form the
+conflict emitter and final assembly already use. Separately the both-sides branch never
+consulted `base_map` at all, so **any** one-sided section edit conflicted even when the
+other side was provably unchanged since base; fixed with standard 3-way semantics. The
+second was found by a control whose expected value the author got *wrong* — the failure
+is what surfaced it.
+
+**BLOCKING CONSTRAINT ON (d), found by the fresh-eyes pass on this very change and
+NOT predicted — the recommended shape does not converge as-is.** `merge_sections` is
+content-commutative but **NOT byte-commutative for UNTIMED headings**. `_sort_index`
+returns `(1, 0)` for every heading without a leading `HH:MM`, and the stable sort then
+preserves INSERTION order, which is ours-first-then-theirs-only. Swapping the arguments
+swaps that order. Measured:
+
+```
+base="", ours="## Alpha\n1\n\n## Beta\n2\n", theirs="## Gamma\n3\n"
+  fwd: ## Alpha / ## Beta / ## Gamma   md5 47e36a69
+  rev: ## Gamma / ## Alpha / ## Beta   md5 0b5f8504     <- SAME content, DIFFERENT bytes
+```
+
+Timed sections are byte-identical (md5 `ce8e825f` both ways) — which is why the daily
+journal, whose headings are `## HH:MM`, has never hit this. **Tree-node headings are
+prose and therefore almost always untimed**, so this fires on exactly the population
+(d) was recommended for. Two boxes would each emit a different byte sequence for the
+same merge and the mirror would re-diverge on the next compare — the failure this whole
+decision exists to prevent. The implementation (g-115-7071) MUST impose a TOTAL order on
+untimed headings (lexicographic by heading text is the obvious candidate) before (d) can
+be registered; content-commutativity alone is NOT sufficient for a mirror handler, and a
+merge that "works" in every content test can still fail to converge.
+
+**Verified vs not.** VERIFIED: content-commutativity on clean merges (5 cases, both
+argument orders — equal line multisets, which is what that test actually asserts);
+BYTE-determinism for TIMED headings only, REFUTED for untimed (above); the absent-base
+measurement above with its positive control;
+the handler signature read from source, not inferred; `merge_sections` matrix 7/7 with
+four conservative controls (genuine divergence still conflicts, deliberate deletion still
+honoured, repeated heading not collapsed, disjoint append both kept); the driver's own
+suite 23/23. **NOT VERIFIED:** no two-box live convergence run for tree nodes — the
+commutativity argument rests on fixtures, not observation; and the resurrection *rate* is
+unmeasured, since nothing counts how often a node section is deliberately evicted
+fleet-wide.
 
 ## The required pattern for a class-(b) writer
 

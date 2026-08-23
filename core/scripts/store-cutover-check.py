@@ -14,8 +14,22 @@ hand-run chore on every box:
     derived proof for agent X =
         git merge-base --is-ancestor <seam-commit> <X's latest iteration
         commit on origin/main (newest commit touching agents/X/)>
-      AND the consumer files at that commit are byte-identical to origin/main
       AND that commit is recent (ATTESTATION_MAX_AGE_DAYS)
+      AND the consumer files at that commit either
+            (tier 1) are byte-identical to origin/main, or
+            (tier 2) — only for a store declaring `seam_symbols`, and only for
+            the files that DIVERGE — still route to a declared seam symbol when
+            read at X's own proof commit.
+
+Tier 2 exists because byte-identity is a TRANSPORT for a narrower property:
+every unrelated edit to any consumer breaks the proof without touching whether
+the consumer routes to the seam. On a dev tier moving at ~2.9 consumer
+commits/day (measured 2026-08-21) that made SAFE close to unsatisfiable. It is
+opt-in per store and reports its own reason (`seam_routed_despite_divergence`)
+so a reader can always tell which tier carried a verdict; a store that declares
+no `seam_symbols` keeps byte-identity as its sole predicate. Decision, the
+accepted residual risk, and the explicitly-rejected alternatives:
+core/config/rationale/store-cutover-attestation-predicate.md
 
 A box that commits its iteration state after pulling the seam has proven it
 carries the seam — a verifiable fact should never be a scheduling problem.
@@ -36,8 +50,10 @@ proofs, which is the UNSAFE direction — but the failure is surfaced.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -83,15 +99,22 @@ STORES = {
     # origin/main). Later /93f11b924 fixes are writer-side and do not
     # move the reader seam.
     #
-    # seam_symbol is what makes this migration lossless: this cutover's local
+    # seam_symbols is what makes this migration lossless: this cutover's local
     # predicate was never "match origin/main", it was "the consumers CALL the
     # seam" — a strictly stronger content check that byte-identity cannot
     # express. See _symbol_report / _calls_symbol.
+    #
+    # ONE-ELEMENT SET (). This store is the reason the field was
+    # singular: all 3 consumers call the same symbol, so one string expressed it
+    # exactly. Migrated to a set for `utilization`, whose 17 consumers use
+    # different parts of one reader API — measured, no single symbol exceeds
+    # 12/17. Behaviour here is unchanged: "calls >= 1" over a one-element set is
+    # the singular predicate.
     "gate_firings": {
         "seam_commit": "18e465af132584b723cf3d588aa46c5f0506fb08",
         "field": "gate_firings_seam",
         "flag": "GATE_FIRINGS_SEGMENTED",
-        "seam_symbol": "firings_paths",
+        "seam_symbols": ["firings_paths"],
         "consumers": [
             "core/scripts/gate-stats.py",
             "core/scripts/gate-retirement-eval.py",
@@ -101,10 +124,33 @@ STORES = {
     # : utilization counters out of reasoning-bank.jsonl +
     # guardrails.jsonl into spooled sidecars + date-segmented content.
     # Seam = last reader commit (unit 4-8 + item-1 set all ancestors of it).
+    #
+    # The 7 reader-API symbols, measured across all 17 consumers at origin/main
+    # (2026-08-21, cc-02): load_counters 12/17, utilization_of 12/17,
+    # store_paths 4/17, load_all_counters 3/17, counters_path 1/17,
+    # segment_name 1/17. NO SINGLE SYMBOL EXCEEDS 12 — which is precisely why a
+    # set is required rather than preferred: the one-symbol model cannot express
+    # a store whose consumers legitimately use different parts of one API.
+    # "calls >= 1" covers 16/17; the 17th (_curation_predicate.py) was a checker
+    # false-negative fixed in , not a consumer off the seam.
+    #
+    # UTILIZATION_COUNTERS_SPOOLED is kind="name": it is the cutover FLAG
+    # itself — the most seam-defining token in the set — and a constant is never
+    # called, so a call-only predicate would make it permanently invisible
+    # ( defect b).
     "utilization": {
         "seam_commit": "0c0bb0073a37d8eef1a69849d3965ebab7f0d004",
         "field": "utilization_seam",
         "flag": "UTILIZATION_COUNTERS_SPOOLED",
+        "seam_symbols": [
+            "load_counters",
+            "utilization_of",
+            "store_paths",
+            "load_all_counters",
+            "counters_path",
+            "segment_name",
+            {"name": "UTILIZATION_COUNTERS_SPOOLED", "kind": "name"},
+        ],
         "consumers": [
             "core/scripts/_curation_predicate.py",
             "core/scripts/_rb_helpers.py",
@@ -219,12 +265,30 @@ def _live_body_sids(bodies: dict | None, now: datetime) -> list[str]:
 
 
 def _prove_commit(commit: str, ciso: str, seam_commit: str,
-                  consumers: list[str], now: datetime) -> dict:
-    """Ancestry + consumer byte-identity + recency for ONE candidate commit.
+                  consumers: list[str], now: datetime,
+                  seam_symbols=None) -> dict:
+    """Ancestry + consumer routing + recency for ONE candidate commit.
 
     Extracted from derive_proof so both proof lanes apply the IDENTICAL test —
     a second lane with its own copy of these three checks would drift, and the
     drift would show up as one lane proving a box the other refuses.
+
+    TWO TIERS (g-358-23, implemented g-358-28), tried in order:
+
+      1. BYTE-IDENTITY to origin/main across every consumer. Tried first, still
+         wins when it holds: strictly stronger than tier 2 and costs one
+         `git diff`.
+      2. PER-FILE SEAM ROUTING, reached ONLY on divergence and scoped to the
+         DIVERGING FILES ONLY — files that did not diverge were already settled
+         by tier 1. Each diverging path is read at THIS box's own proof commit
+         (`git show <commit>:<path>`) and must still route to a declared seam
+         symbol. Requires the store to declare `seam_symbols`; without them
+         tier 1 is the sole predicate and divergence still refuses.
+
+    The two proven shapes are DISTINGUISHABLE ON PURPOSE: tier 2 carries
+    `reason="seam_routed_despite_divergence"` where tier 1 carries no reason at
+    all, so a reader can always tell which predicate carried a verdict. Never
+    make them equal.
     """
     when = _parse_ts(ciso.split("+")[0].split("Z")[0])
     if when is None:
@@ -238,13 +302,52 @@ def _prove_commit(commit: str, ciso: str, seam_commit: str,
     if anc.returncode != 0:
         return {"proven": False, "reason": "seam_not_ancestor",
                 "commit": commit[:9]}
+    # Rationale (WHY two tiers, and what tier 2 gives up):
+    # core/config/rationale/store-cutover-attestation-predicate.md
+    # Byte-identity is a TRANSPORT for a narrower property ("the consumers route
+    # to the seam"), so every unrelated edit to any consumer breaks the proof
+    # without touching the property — measured 2026-08-21 at 2.9 consumer
+    # commits/day on origin/main (a DATED observation of a moving repo, not a
+    # constant: re-measure before quoting it), which made SAFE close to
+    # unsatisfiable for STORES['utilization'].
     diff = _git("diff", "--name-only", commit, "origin/main", "--", *consumers)
     if diff.returncode != 0:
         return {"proven": False, "reason": "diff_failed", "commit": commit[:9]}
     changed = [l for l in diff.stdout.splitlines() if l.strip()]
     if changed:
-        return {"proven": False, "reason": "consumers_diverge_from_main",
-                "commit": commit[:9], "diff_files": changed[:10]}
+        specs = _symbol_specs(seam_symbols)
+        if not specs:
+            # FAIL-CLOSED DEFAULT. A store whose seam nobody has characterised
+            # cannot reach the narrower tier — opt-in per store, by design.
+            return {"proven": False, "reason": "consumers_diverge_from_main",
+                    "commit": commit[:9], "diff_files": changed[:10]}
+        # TIER 2, scoped to the DIVERGING files only. Read each at the box's own
+        # proof commit — NOT at origin/main, which would prove nothing about
+        # this box, and NOT from the working tree, which is a different box's.
+        missing, unreadable, routed = [], [], []
+        for path in changed:
+            out = _git("show", f"{commit}:{path}")
+            if out.returncode != 0:
+                # guard-487: unreadable input REFUSES. A consumer missing at the
+                # box's commit is exactly the pre-seam state this gate exists to
+                # catch, and `git show` failing is indistinguishable from it.
+                unreadable.append({"consumer": path,
+                                   "error": out.stderr.strip()[:160]})
+                continue
+            matched = _calls_any_symbol(out.stdout, specs)
+            if matched:
+                routed.append({"consumer": path, "symbol": matched})
+            else:
+                missing.append(path)
+        if missing or unreadable:
+            return {"proven": False,
+                    "reason": "diverging_consumers_do_not_route_to_seam",
+                    "commit": commit[:9], "diff_files": changed[:10],
+                    "missing": missing, "unreadable": unreadable}
+        return {"proven": True, "reason": "seam_routed_despite_divergence",
+                "commit": commit[:9], "committed_at": ciso,
+                "age_days": round(age_days, 1),
+                "diff_files": changed[:10], "routed": routed}
     return {"proven": True, "commit": commit[:9],
             "committed_at": ciso, "age_days": round(age_days, 1)}
 
@@ -265,7 +368,7 @@ def _agents_on_main() -> list[str]:
 
 
 def derive_proof(agent: str, seam_commit: str, consumers: list[str],
-                 bodies: dict | None = None) -> dict:
+                 bodies: dict | None = None, seam_symbols=None) -> dict:
     """Evidence-derived attestation for one agent, from git alone.
 
     TWO proof lanes, tried in order; the FIRST that proves wins and the winner
@@ -305,7 +408,8 @@ def derive_proof(agent: str, seam_commit: str, consumers: list[str],
             primary = {"proven": False, "reason": "no_iteration_commit"}
         else:
             commit, ciso = line.split("|", 1)
-            primary = _prove_commit(commit, ciso, seam_commit, consumers, now)
+            primary = _prove_commit(commit, ciso, seam_commit, consumers, now,
+                                    seam_symbols)
         if primary.get("proven"):
             primary["lane"] = "agent_namespace"
             return primary
@@ -319,7 +423,8 @@ def derive_proof(agent: str, seam_commit: str, consumers: list[str],
                 attempts.append({"ref": ref, "reason": "carrier_ref_unreadable"})
                 continue
             commit, ciso = tline.split("|", 1)
-            proof = _prove_commit(commit, ciso, seam_commit, consumers, now)
+            proof = _prove_commit(commit, ciso, seam_commit, consumers, now,
+                                  seam_symbols)
             if proof.get("proven"):
                 proof["lane"] = "worker_carrier_ref"
                 proof["ref"] = ref
@@ -503,10 +608,115 @@ def _strip_comments(text: str) -> str:
     return "\n".join(out)
 
 
-def _calls_symbol(text: str, symbol: str) -> bool:
-    """Does this source CALL `symbol`, as opposed to importing or naming it?
+SYMBOL_KINDS = ("call", "name")
 
-    Two ways a cheaper check reports a false all-clear, both observed in the
+
+def _symbol_spec(declared: str | dict) -> tuple[str, str]:
+    """Normalize a declared `seam_symbol` into (name, kind).
+
+    A STORES entry may declare a bare STRING (the historical form, always a
+    CALL) or a DICT {"name": ..., "kind": "call"|"name"}. The dict form exists
+    because a module CONSTANT is often the most seam-defining token a cutover
+    has — the feature flag itself — and a constant is never called, so a
+    call-only predicate makes a flag-named seam PERMANENTLY UNSATISFIABLE
+    (g-358-27 defect b). One key rather than two so the name and its mode
+    cannot drift apart.
+    """
+    if isinstance(declared, dict):
+        name, kind = declared.get("name"), declared.get("kind", "call")
+    else:
+        name, kind = declared, "call"
+    if not name or kind not in SYMBOL_KINDS:
+        raise ValueError(f"bad seam_symbol spec: {declared!r}")
+    return name, kind
+
+
+def _symbol_specs(declared) -> list[tuple[str, str]]:
+    """Normalize a declared `seam_symbols` into a list of (name, kind).
+
+    Accepts None/empty (-> []), a bare string or dict (the historical SINGULAR
+    form, normalized to a one-element list), or any sequence of those. One
+    normalizer rather than two call shapes so no caller can disagree with
+    another about what a declaration means.
+
+    An EMPTY result is meaningful and is the fail-closed default: a store that
+    declares no seam symbols keeps byte-identity as its sole predicate, so the
+    narrower per-file tier is opt-in per store and unreachable for a store whose
+    seam nobody has characterised (g-358-23 decision part 4).
+    """
+    if not declared:
+        return []
+    if isinstance(declared, (str, dict)):
+        declared = [declared]
+    return [_symbol_spec(d) for d in declared]
+
+
+def _calls_any_symbol(text: str, specs: list[tuple[str, str]]) -> str | None:
+    """The FIRST declared symbol this source routes to, or None.
+
+    "calls >= 1", not "calls ALL" — measured on the 17 `utilization` consumers,
+    requiring all 7 would be unsatisfiable by design, because the consumers use
+    different parts of one reader API on purpose. Returns the matching NAME
+    rather than a bool so a report can state WHICH symbol carried a consumer;
+    a verdict nobody can attribute is the shape this whole change exists to fix.
+    """
+    for name, kind in specs:
+        if _calls_symbol(text, name, kind):
+            return name
+    return None
+
+
+def _local_bindings(text: str, symbol: str) -> set[str]:
+    """Local names bound to `symbol` by an import in this source.
+
+    `from M import N as A` makes `A()` a genuine call to N, but no literal N
+    survives at the call site. The historical predicate stripped the file's one
+    `import N` and then found nothing, reporting MISSING — measured on
+    core/scripts/_curation_predicate.py, the sole zero-token consumer of 17
+    (g-358-27 defect a). ast is the honest fix the old docstring named.
+
+    Unparseable source degrades to {symbol} rather than raising: a syntax error
+    is the consumer's problem, not this predicate's, and the caller already
+    fails closed on a missing symbol.
+    """
+    names = {symbol}
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return names
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.name == symbol and alias.asname:
+                    names.add(alias.asname)
+    return names
+
+
+def _strip_import_lines(text: str) -> str:
+    """Drop whole import statements (NAME mode only).
+
+    In CALL mode an import can never match — the pattern requires a `(` after
+    the name and an import has none — but in NAME mode a bare `import SYMBOL`
+    would otherwise count as USING it, which is exactly the false all-clear the
+    original docstring warns about, one layer over.
+    """
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return text
+    drop: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            end = getattr(node, "end_lineno", None) or node.lineno
+            drop.update(range(node.lineno, end + 1))
+    return "\n".join(line for i, line in enumerate(text.splitlines(), 1)
+                     if i not in drop)
+
+
+def _calls_symbol(text: str, symbol: str, kind: str = "call") -> bool:
+    """Does this source CALL (or, in NAME mode, USE) `symbol`?
+
+    Two ways a cheaper check reports a false ALL-CLEAR, both observed in the
     real consumers this predicate was written for:
       - `import symbol` that nothing calls leaves the consumer on the legacy
         path — the exact pre-seam state — while a bare symbol grep succeeds;
@@ -515,8 +725,33 @@ def _calls_symbol(text: str, symbol: str) -> bool:
         call, so reverting the call and leaving the prose passes an uncommented
         check. Same referent trap as guard-1685 — the token survives its own
         removal.
+
+    And a third, reached by a different mechanism than comment-stripping, so
+    the two warnings above do not cover it: the old `f"{symbol}(" in text` had
+    NO LEFT WORD BOUNDARY, so `_get_backend(` and `maybe_get_backend(` both
+    passed as calls to `get_backend`. A revert renaming a public call to a
+    private `_`-prefixed sibling still reported symbol_present, defeating
+    _symbol_report's stated purpose (g-358-27 addendum). The left-anchored
+    pattern below closes it, and closes the PEP8-legal `get_backend (1)`
+    false-NEGATIVE in the same edit via `\\s*`.
+
+    Anchor only the LEFT side of the call form. A right anchor is what `\\s*\\(`
+    already is, and widening the comment-stripping to reach any of this would
+    be the false-all-clear direction.
     """
-    return f"{symbol}(" in _strip_comments(text).replace(f"import {symbol}", "")
+    if kind not in SYMBOL_KINDS:
+        raise ValueError(f"unknown symbol kind: {kind!r}")
+    body = _strip_comments(text)
+    if kind == "name":
+        body = _strip_import_lines(body)
+    for name in _local_bindings(text, symbol):
+        esc = re.escape(name)
+        pattern = (rf"(?<![A-Za-z0-9_]){esc}\s*\("
+                   if kind == "call"
+                   else rf"(?<![A-Za-z0-9_]){esc}(?![A-Za-z0-9_])")
+        if re.search(pattern, body):
+            return True
+    return False
 
 
 def _symbol_report(symbol: str, consumers: list[str], ref: str) -> dict:
@@ -533,6 +768,7 @@ def _symbol_report(symbol: str, consumers: list[str], ref: str) -> dict:
     So this is checked ONCE against `ref` (origin/main) as a fleet-level veto,
     not per agent — byte-identity then carries it to every box that matches.
     """
+    specs = _symbol_specs(symbol)
     missing, unreadable, ok = [], [], []
     for path in consumers:
         out = _git("show", f"{ref}:{path}")
@@ -540,19 +776,32 @@ def _symbol_report(symbol: str, consumers: list[str], ref: str) -> dict:
             unreadable.append({"consumer": path,
                                "error": out.stderr.strip()[:160]})
             continue
-        (ok if _calls_symbol(out.stdout, symbol) else missing).append(path)
-    return {"symbol_present": not missing and not unreadable, "symbol": symbol,
+        matched = _calls_any_symbol(out.stdout, specs)
+        if matched:
+            ok.append({"consumer": path, "symbol": matched})
+        else:
+            missing.append(path)
+    return {"symbol_present": not missing and not unreadable,
+            "symbols": [{"name": n, "kind": k} for n, k in specs],
             "ref": ref, "ok": ok, "missing": missing, "unreadable": unreadable}
 
 
 def _local_report(seam_commit: str, consumers: list[str],
-                  seam_symbol: str | None = None) -> dict:
+                  seam_symbols=None) -> dict:
     """Is THIS box's tree reader-capable? Ancestry + working-tree identity.
 
     Working-tree diff (not HEAD diff) so an uncommitted local revert of a
     consumer refuses the attest — deployed bytes are what execute. When the
-    store declares a `seam_symbol`, the working-tree FILES must also call it:
-    the strictest available read, since these are the bytes this box executes.
+    store declares `seam_symbols`, the working-tree FILES must also route to one
+    of them: the strictest available read, since these are the bytes this box
+    executes.
+
+    DELIBERATELY NOT GIVEN THE SECOND TIER that `_prove_commit` gains
+    (g-358-23 decision part 2 scopes the tier to per-remote-box proofs only).
+    Divergence here is UNCOMMITTED local drift on the box you are standing on —
+    the one case where "pull, then re-run" is both available and correct — so
+    admitting it would trade a refusal the operator can clear in one command for
+    a residual risk nobody needs to accept.
     """
     try:
         anc = _git("merge-base", "--is-ancestor", seam_commit, "HEAD")
@@ -566,7 +815,8 @@ def _local_report(seam_commit: str, consumers: list[str],
             return {"seam_present": False,
                     "reason": "consumers_differ_from_origin_main",
                     "diff_files": changed[:10]}
-        if seam_symbol:
+        specs = _symbol_specs(seam_symbols)
+        if specs:
             missing, unreadable = [], []
             for path in consumers:
                 try:
@@ -575,11 +825,12 @@ def _local_report(seam_commit: str, consumers: list[str],
                 except OSError as exc:
                     unreadable.append({"consumer": path, "error": str(exc)})
                     continue
-                if not _calls_symbol(text, seam_symbol):
+                if not _calls_any_symbol(text, specs):
                     missing.append(path)
             if missing or unreadable:
                 return {"seam_present": False,
-                        "reason": f"consumers_do_not_call_{seam_symbol}",
+                        "reason": "consumers_do_not_route_to_any_seam_symbol",
+                        "symbols": [n for n, _ in specs],
                         "missing": missing, "unreadable": unreadable}
         return {"seam_present": True}
     except Exception as exc:
@@ -601,7 +852,7 @@ def cmd_attest(cfg: dict) -> int:
                           "detail": "MIND_AGENT unset — cannot attest"}, indent=2))
         return 3
     report = _local_report(cfg["seam_commit"], cfg["consumers"],
-                           cfg.get("seam_symbol"))
+                           cfg.get("seam_symbols"))
     if not report["seam_present"]:
         report.update({"verdict": "refused", "agent": agent,
                        "detail": "this box is not reader-capable — attesting "
@@ -647,11 +898,12 @@ def cmd_check(cfg: dict) -> int:
     # UNDER-prove, which is the UNSAFE direction, but it must be visible.
     workers_fetch_ok = _fetch_worker_refs()
     proofs = {name: derive_proof(name, cfg["seam_commit"], cfg["consumers"],
-                                 bodies=row.get("in_flight_bodies"))
+                                 bodies=row.get("in_flight_bodies"),
+                                 seam_symbols=cfg.get("seam_symbols"))
               for name, row in roster.items()
               if isinstance(row, dict) and not row.get("retired_at")}
     local = _local_report(cfg["seam_commit"], cfg["consumers"],
-                          cfg.get("seam_symbol"))
+                          cfg.get("seam_symbols"))
     local["hostname"] = socket.gethostname()
     local["head"] = _head_commit()
     result = evaluate_roster(roster, proofs, cfg["field"], datetime.now(),
@@ -662,13 +914,13 @@ def cmd_check(cfg: dict) -> int:
     # the whole verdict, and fail-closed like every other branch. It overrides
     # a SAFE and never rescues an UNSAFE — a broken main is strictly worse than
     # whatever else is wrong, so it names itself as the reason.
-    if cfg.get("seam_symbol"):
-        symbols = _symbol_report(cfg["seam_symbol"], cfg["consumers"],
+    if cfg.get("seam_symbols"):
+        symbols = _symbol_report(cfg["seam_symbols"], cfg["consumers"],
                                  "origin/main")
-        result["seam_symbol"] = symbols
+        result["seam_symbols"] = symbols
         if not symbols["symbol_present"]:
             result["verdict"] = "UNSAFE"
-            result["reason"] = "origin_main_does_not_call_the_seam_symbol"
+            result["reason"] = "origin_main_does_not_call_the_seam_symbols"
 
     result.update({
         "flag": cfg.get("flag"),

@@ -116,19 +116,21 @@ _concept_cache_lock = threading.Lock()
 _CONCEPT_CACHE_MAX = 8  # bounded; ~1 entry per agent
 
 
-def _cached_build_concept_index(nodes):
-    """id(nodes)-keyed wrapper. Misses naturally when yaml_cache reloads
-    _tree.yaml (mtime change → new dict identity → cache miss → real rebuild).
-    The anchor in the cache entry prevents id reuse from causing stale hits."""
-    nodes_id = id(nodes)
+def _cached_build_concept_index(nodes, world_root=None):
+    """(id(nodes), world_root)-keyed wrapper. Misses naturally when yaml_cache
+    reloads _tree.yaml (mtime change → new dict identity → cache miss → real
+    rebuild). The anchor in the cache entry prevents id reuse from causing
+    stale hits. ``world_root`` arrives as the swapped-in ``retrieve.WORLD_DIR``
+    of the request being served (g-367-08) and is part of the key."""
+    cache_key = (id(nodes), str(world_root))
     with _concept_cache_lock:
-        entry = _concept_cache.get(nodes_id)
+        entry = _concept_cache.get(cache_key)
     if entry is not None:
         return entry[0]
     # Build outside the lock — file I/O can be slow on cold caches.
-    idx = _real_build_concept_index(nodes)
+    idx = _real_build_concept_index(nodes, world_root=world_root)
     with _concept_cache_lock:
-        _concept_cache[nodes_id] = (idx, nodes)  # anchor pins the dict
+        _concept_cache[cache_key] = (idx, nodes)  # anchor pins the dict
         if len(_concept_cache) > _CONCEPT_CACHE_MAX:
             _concept_cache.pop(next(iter(_concept_cache)))
     return idx
@@ -644,6 +646,7 @@ def handle(ctx) -> "Response":  # type: ignore[name-defined]
         "full_content": full_content,
         "timestamp": timestamp,
         "retrieval_channels": sorted(retrieval_channels),
+        "embedding_channel": _r.embedding_channel_status(),
         "items_returned": items_returned,
     }
     if coverage_gap:

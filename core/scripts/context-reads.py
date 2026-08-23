@@ -437,14 +437,35 @@ def cmd_check(args):
 # ---------------------------------------------------------------------------
 
 def cmd_clear(args):
-    """Delete the tracker file."""
-    # clear carries no --session-id (PreCompact / reducer-side utility) -> the
-    # agent-wide tracker. A forked Body's tracker self-heals across sessions via
-    # the session-header mismatch in read_tracker; an explicit per-Body clear is
-    # a Phase-2 concern (worker Bodies don't run PreCompact).
-    tp = tracker_path(None)
+    """Delete the tracker file THIS session uses. Session-aware since .
+
+    `--session-id` routes through tracker_path(), so the clear lands on the
+    body tracker for a forked worker Body and on the agent-wide tracker for a
+    reducer — never both, and never another session's. That scoping is the
+    point, not an optimisation: on a box where a reducer and a worker coexist,
+    clearing the agent-wide file from a worker's hook is exactly the
+    cross-session shared-state mutation guard-404 forbids.
+
+    Bare `clear` (no --session-id) keeps the agent-wide behaviour, which is
+    what an operator running the wrapper by hand means.
+
+    WHY THIS BECAME SESSION-AWARE. The docstring here used to argue an explicit
+    per-Body clear was "a Phase-2 concern (worker Bodies don't run PreCompact)".
+    Both halves were wrong by 2026-08-22 and measurably so on cc-08: worker
+    Bodies DO compact (their PreCompact wrote a body-keyed compact-checkpoint.yaml
+    at 12:55), and the agent-wide path this cleared did not exist for ANY agent
+    on the box — every live tracker was a sessions/<SID>/body-context-reads.txt.
+    So the clear ran, found nothing, and left a 135-entry manifest asserting
+    in-context for files the compaction had just evicted. The self-heal the
+    docstring relied on is a CROSS-SESSION header mismatch; it cannot fire
+    within one session, and a compaction never changes the SID.
+    """
+    tp = tracker_path(getattr(args, "session_id", None))
     if tp is not None and tp.exists():
         tp.unlink()
+        print(f"[context-reads] cleared tracker: {tp}")
+    else:
+        print(f"[context-reads] no tracker to clear: {tp}")
 
 
 # ---------------------------------------------------------------------------
@@ -534,7 +555,11 @@ def build_parser():
                       help="Prefix ranged-read-only paths with 'PARTIAL\\t' (edit advisory only)")
     cf_p.add_argument("file_paths", nargs="+", help="Absolute file paths to check")
 
-    sub.add_parser("clear", help="Delete the tracker file")
+    clear_p = sub.add_parser("clear", help="Delete the tracker file")
+    clear_p.add_argument("--session-id", default=None,
+                         help="Session ID (from hook JSON) — clears THAT session's tracker "
+                              "(body tracker for a forked Body, agent-wide for a reducer). "
+                              "Omit for the agent-wide tracker.")
     sub.add_parser("status", help="Print tracker contents")
 
     return parser

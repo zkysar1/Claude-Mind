@@ -185,6 +185,61 @@ except Exception: print("unparseable")' 2>/dev/null || echo unknown)"
       exit 1
     fi
     body_row_state="LIVE-OVERRIDDEN goal=$row_goal claimed_at=$row_claimed"
+  else
+    # : row_json == "null" is AMBIGUOUS BY CONSTRUCTION.
+    # team-state-read.sh returns rc=0 / stdout "null" / EMPTY stderr for a path
+    # that DOES NOT EXIST — byte-identical to a genuine "this sid has no live
+    # row" (measured on four controls, one of them a positive control proving
+    # the reader itself works). So the fail-closed branch above, written for an
+    # "unreadable liveness source", could never fire on the failure mode that
+    # actually occurs: any drift in the path string landed HERE and fell
+    # straight through to the delete. Probe the SCHEMA before trusting a null.
+    #
+    # THE PROBE IS agent_status — deliberately NOT agent_status.<agent>.in_flight_bodies,
+    # which is the obvious choice and is wrong. in_flight_bodies is created
+    # LAZILY on first claim, so it is legitimately absent for any agent with no
+    # live body (measured 2026-08-21: alpha and bravo carried it; echo, foxtrot
+    # and zeta existed in agent_status WITHOUT it). Probing that path would
+    # refuse every ordinary retire for those three, and guard-3660 states that
+    # an ABSENT body row is a LEGITIMATE retire. A guard that misfires on the
+    # normal case only teaches operators to pass --force-retire-live.
+    status_json="$(bash "$TEAM_STATE_READER" --field agent_status --json 2>/dev/null)"
+    status_rc=$?
+    drift="$(REF_AGENT="$ref_agent" STATUS_JSON="$status_json" STATUS_RC="$status_rc" py -3 -c '
+import json, os, sys
+rc  = os.environ.get("STATUS_RC", "1")
+raw = os.environ.get("STATUS_JSON", "")
+who = os.environ.get("REF_AGENT", "")
+if rc != "0" or not raw.strip():
+    print("agent_status is unreadable (reader rc=%s)" % rc); sys.exit(0)
+try:
+    st = json.loads(raw)
+except Exception:
+    print("agent_status did not parse as JSON"); sys.exit(0)
+if not isinstance(st, dict) or not st:
+    print("agent_status did not resolve to a non-empty container"); sys.exit(0)
+if who not in st:
+    print("team-state has no agent_status row for %r" % who); sys.exit(0)
+if not isinstance(st.get(who), dict):
+    print("agent_status[%r] is not a container" % who); sys.exit(0)
+if "in_flight_bodies" not in st[who]:
+    # Absent for THIS agent is normal (lazily created). Absent for EVERY agent
+    # means either the key was renamed or the whole fleet is idle -- those two
+    # are indistinguishable from here, so refuse in both.
+    if not any(isinstance(v, dict) and "in_flight_bodies" in v for v in st.values()):
+        print("no agent carries an in_flight_bodies key (renamed, or fleet fully idle)")
+        sys.exit(0)
+print("")' 2>/dev/null)"
+    if [ -n "$drift" ]; then
+      if [ -z "$FORCE_RETIRE_LIVE_JUST" ]; then
+        log "REFUSED: liveness for ${ref_agent}/${ref_sid} read \"null\", but the team-state schema looks DRIFTED — $drift." >&2
+        log "\"null\" is what the reader returns for a NONEXISTENT path as well as for a genuinely-absent body row," >&2
+        log "so retiring on it here could delete a LIVE body's carrier — an unrecoverable handle loss." >&2
+        log "Fix the team-state path/schema, or — only if you KNOW the body is dead — retry with --force-retire-live \"<justification>\"." >&2
+        exit 1
+      fi
+      body_row_state="SCHEMA-DRIFT-OVERRIDDEN $drift"
+    fi
   fi
 
   tip_sha="$(git -C "$REPO" rev-parse "$RETIRE_REF")"

@@ -113,12 +113,32 @@ Two things the delivery path must get right, both load-bearing:
      exempt (it is a status report about a real block, and it routes through
      CREATE_BLOCKER's capability gate at creation instead). `blocker` also
      selects the SendErrorAlert shape, so email-send.sh needs `--error`.
-  2. `deliberate` GOALS ARE REPORTED, NOT ESCALATED. A goal whose origin_signal
-     marks deliberate user routing (e.g. asp-314's park, "DO-NOT-TOUCH") is
-     counted and labelled but never emailed — emailing it would nag the user
+  2. TRUE PARKS ARE REPORTED, NOT ESCALATED — and a park is a ROUTING SHAPE,
+     not a provenance. A goal that is `participants:['user']` ONLY *and* carries
+     a deliberate-routing origin_signal (asp-314's park, "DO-NOT-TOUCH") is
+     counted and labelled but never emailed; emailing it would nag the user
      about a choice they made on purpose. Tagged rather than dropped, because a
      silent skip is indistinguishable from a clean sweep, which is the failure
      this whole lane exists to correct.
+
+     THIS TESTED `deliberate` ALONE UNTIL 2026-08-21 (g-115-6991), which is the
+     WRONG FIELD: origin_signal is provenance (who asked for the WORK),
+     participants is routing (who the work is waiting ON). A goal carries
+     origin_signal=user_directive precisely BECAUSE the principal asked for it,
+     so the filter was positively correlated with importance — the strongest
+     claim on the user's attention had become the suppression criterion, and the
+     digest reported itself clean throughout. Measured on this deployment at fix
+     time: 39 candidates, 11 suppressed, of which 10 were `['agent','user']`
+     goals wrongly hidden (5 HIGH, including an unanswered direct question from
+     the principal about a RETURNED federal form). Only 1 was a real park.
+
+     NOTE THE SAME TAG IS STILL CORRECT NEXT DOOR, and the asymmetry is the
+     lesson rather than an inconsistency: audit-user-to-agent.py's drop lane
+     refuses to remove `user` from ANY deliberate goal (verdict "deliberate",
+     never touch). That guards a MUTATION — dropping the human is a one-way door
+     — where refusing on provenance is right. This guards a NOTIFICATION, where
+     refusing on provenance silences the user's own request. One tag, two
+     consumers, opposite correct predicates.
 
 Called by aspirations-precheck. Dry-run by default; --apply to actually send.
 
@@ -802,12 +822,29 @@ def main() -> int:
         gid = goal.get("id") or ""
         age, age_field = _goal_age_hours(goal, now)
 
-        if cand.get("deliberate"):
-            # Reported, never emailed — nagging a deliberate choice is the wrong
+        if cand.get("shape") == "user-only" and cand.get("deliberate"):
+            # A TRUE PARK, and both halves are required (). Reported,
+            # never emailed — nagging a deliberate choice is the wrong
             # correction. Counted so the skip is visible, not silent. This is the
             # ONLY membership filter left: under a fixed cadence, age decides
             # nothing (D2), so there is no threshold and no per-goal cooldown for
             # a goal to fall through.
+            #
+            # `deliberate` ALONE was the bug: it is PROVENANCE (who asked for the
+            # work), and a park is ROUTING (who the work waits on). See the
+            # module docstring for the measured population.
+            #
+            # WHY THE `and`, WHEN A SHAPE-ONLY TEST MEASURES IDENTICALLY TODAY:
+            # both forms suppress exactly the same 1 goal on the live queue (0
+            # difference), because no `user-only`-but-not-deliberate goal exists
+            # right now. They diverge the moment one does — shape-only would
+            # silence it, which is a NEW suppression of the same family. The
+            # ANDed form is also what makes this predicate byte-identical to the
+            # "left alone" bucket in audit-user-to-agent.py
+            # (`shape == "user-only" and c["deliberate"]`), whose complement
+            # `user-only and NOT deliberate` that file already treats as
+            # ACTIONABLE. Reconciling the two consumers is the point; picking the
+            # form that only happens to agree on today's data is not.
             skipped_deliberate += 1
             results.append({"goal_id": gid, "action": "skip",
                             "reason": "deliberate_user_routing",

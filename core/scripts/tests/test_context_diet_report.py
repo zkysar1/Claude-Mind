@@ -295,3 +295,148 @@ def test_detect_role_uses_paths_helpers_not_literal_agents_join():
     body = src.split("def detect_role(", 1)[1].split("\ndef ", 1)[0]
     assert '"agents"' not in body and "'agents'" not in body
     assert "agent_state_dir(" in body and "agent_session_dir(" in body
+
+
+# --------------------------------------------------------------------------
+# WINDOWED skill-injection average ( check 3).
+#
+# Check 3 reads "Skill injections per iteration < 40 KB avg over 10 iterations".
+# The CUMULATIVE `skill_kb_per_close` cannot answer it — it averages over the
+# whole session and folds in an iteration still in flight. These pin the
+# windowed metric that DOES carry the bar (guard-3555: name the metric first),
+# and pin that it is reported rather than ratcheted, so the original author's
+# "needs a cross-session baseline" reasoning stays intact where it applies.
+# --------------------------------------------------------------------------
+
+def _dy(buckets, in_flight=0):
+    """Minimal collect_dynamic-shaped payload; only the windowing inputs matter."""
+    return {"available": True,
+            "per_close_buckets": [{"skill_bytes": b, "skill_injections": 1 if b else 0}
+                                  for b in buckets],
+            "in_flight_after_last_close": {"skill_bytes": in_flight,
+                                           "skill_injections": 1 if in_flight else 0}}
+
+
+def test_windowed_averages_only_the_last_n_closes(cdr):
+    # 12 closes, window 10 -> the first TWO must be excluded. If the window were
+    # ignored the average would be 6.5, not 7.0.
+    kb = [1024 * i for i in range(1, 13)]
+    w = cdr.windowed_skill(_dy(kb), 10)
+    assert w["n_available"] == 10
+    assert w["per_close_kb"] == [float(i) for i in range(3, 13)]
+    # mean(3..12) = 7.5. Over ALL twelve it would be 6.5 — so this value is the
+    # discriminator: a windowing bug that ignored `n` lands on 6.5, not here.
+    assert w["avg_kb_per_close"] == 7.5
+
+
+def test_windowed_excludes_the_iteration_still_in_flight(cdr):
+    """The bytes injected since the last close belong to an UNFINISHED iteration.
+
+    Counting them would deflate the per-iteration average by however much that
+    iteration has left to run — and on a long-running session the in-flight
+    remainder can dwarf a single closed iteration, as it does here.
+    """
+    w = cdr.windowed_skill(_dy([1024, 1024], in_flight=1024 * 99), 10)
+    assert w["avg_kb_per_close"] == 1.0, "in-flight bytes leaked into the average"
+    assert w["in_flight_excluded_kb"] == 99.0, "exclusion must be REPORTED, not silent"
+
+
+def test_windowed_keeps_empty_closes_in_the_census(cdr):
+    """guard-1436: print the COMPLETE bucket census, empties included.
+
+    An iteration that injected nothing is real data. Dropping it would raise the
+    average it belongs in — here 2.0 (correct) would become 3.0 (wrong).
+    """
+    w = cdr.windowed_skill(_dy([1024 * 3, 0, 1024 * 3]), 10)
+    assert w["per_close_kb"] == [3.0, 0.0, 3.0]
+    assert w["empty_closes"] == 1
+    assert w["avg_kb_per_close"] == 2.0
+
+
+def test_windowed_reports_a_short_window_rather_than_padding_it(cdr):
+    # Fewer closes than requested is a legitimate answer, but the caller must be
+    # able to tell — an average over 3 iterations is not an average over 10.
+    w = cdr.windowed_skill(_dy([1024, 1024, 1024]), 10)
+    assert w["short_window"] is True
+    assert w["n_available"] == 3 and w["n_requested"] == 10
+
+
+def test_windowed_full_window_is_not_flagged_short(cdr):
+    # The other axis of the same flag (guard-2319): a healthy input must NOT alarm.
+    w = cdr.windowed_skill(_dy([1024] * 10), 10)
+    assert w["short_window"] is False
+
+
+def test_windowed_refuses_to_call_no_closes_a_zero(cdr):
+    """rb-245 / the module's own positive-control doctrine.
+
+    A session that has closed nothing has not measured 0 KB per iteration — it
+    has not measured anything. Returning 0.0 here would read as a perfect score
+    and would PASS check 3's `< 40 KB` bar on no evidence whatsoever.
+    """
+    w = cdr.windowed_skill(_dy([]), 10)
+    assert w["available"] is False
+    assert w.get("avg_kb_per_close") is None
+    assert "NOT 0 KB" in w["reason"]
+
+
+def test_windowed_propagates_an_unreadable_transcript_as_unavailable(cdr):
+    w = cdr.windowed_skill({"available": False, "reason": "transcript not found"}, 10)
+    assert w["available"] is False and "transcript not found" in w["reason"]
+
+
+def test_windowed_is_reported_but_never_ratcheted(cdr):
+    """The narrow half of lifting the original 'deliberately NOT built' decision.
+
+    That decision was correct about RATCHETING (which needs a cross-session
+    baseline) and over-broad about REPORTING (an absolute bar needs no history).
+    If a future change ever feeds this metric to the ratchet, the cross-session
+    baseline question has to be answered first — so pin the absence.
+    """
+    import ast as _ast
+    src = SCRIPT.read_text(encoding="utf-8")
+    assert "dy[\"windowed\"] = windowed_skill" in src, "windowed must be computed"
+    # Check the ARGUMENTS of every ratchet() call, not a text window around them.
+    # A prose slice also matches the word in a nearby comment (it did, on the
+    # first draft of this test) — which would make the pin fire on documentation
+    # and tempt a future reader to loosen the assertion instead of reading it.
+    tree = _ast.parse(src)
+    calls = [n for n in _ast.walk(tree)
+             if isinstance(n, _ast.Call)
+             and isinstance(n.func, _ast.Name) and n.func.id == "ratchet"]
+    assert calls, "no ratchet() call found — this pin would be vacuous"
+    for c in calls:
+        seg = _ast.get_source_segment(src, c) or ""
+        assert "windowed" not in seg, (
+            "the windowed figure reached ratchet() — it needs a cross-session "
+            "baseline first (see collect_dynamic's docstring)")
+
+
+def test_per_close_buckets_flush_on_close_not_on_injection(cdr):
+    """End-to-end through the real parser: bucket boundaries are CLOSES.
+
+    Pins the segmentation itself rather than the arithmetic over it — a parser
+    that flushed per injection would produce one bucket per skill call and an
+    average that no longer means 'per iteration'.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        t = Path(td) / "t.jsonl"
+        rows = []
+        def inj(n):
+            rows.append({"message": {"role": "user", "content": [
+                {"type": "text",
+                 "text": "Base directory for this skill: /x" + "z" * (n - 33)}]}})
+        def close():
+            rows.append({"message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "i", "name": "Bash",
+                 "input": {"command": "core/scripts/iteration-close.sh --phase verify"}}]}})
+        # THREE injections inside ONE iteration, then a close.
+        inj(1024); inj(1024); inj(1024); close()
+        inj(1024); close()
+        t.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+        dy = cdr.collect_dynamic(t)
+    assert dy["iteration_closes"] == 2
+    assert [b["skill_bytes"] for b in dy["per_close_buckets"]] == [3072, 1024]
+    assert [b["skill_injections"] for b in dy["per_close_buckets"]] == [3, 1]
+    w = cdr.windowed_skill(dy, 10)
+    assert w["avg_kb_per_close"] == 2.0

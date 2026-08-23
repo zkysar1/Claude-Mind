@@ -42,9 +42,28 @@ from ..agent_paths import assert_not_cruft
 TOP_LEVEL_KEYS = {
     "encoding_queue", "session_id", "session_start",
     "goals_completed_this_session", "aspiration_touched_last",
-    "last_goal_category",
+    "last_goal_category", "capture_evictions",
 }
 SESSION_IDENTITY_FIELDS = {"session_start"}
+
+# : TOP-LEVEL keys that must survive wm-reset but are NOT identity.
+#
+# Deliberately a SEPARATE constant from SESSION_IDENTITY_FIELDS, and that is the
+# load-bearing part: `clear-identity` (below) NULLS every member of that set, so
+# adding a key there to make it survive reset would make clear-identity destroy
+# it instead — the opposite of the intent.
+#
+# RESET_SURVIVING_SLOTS cannot express this either: it is consulted ONLY inside
+# `for slot_name, slot_val in existing_slots.items()`, and a top-level key never
+# enters that loop. (Verified before this fix — it is the obvious move and it is
+# a no-op.)
+#
+# capture_evictions is a top-level counter whose producer (wm-append eviction)
+# and consumer (array_limits cap sizing) sit on opposite sides of the
+# aspirations-consolidate Step-5 wm-reset, which fires MID-SESSION at every
+# autocompact — so without this it reports a since-last-autocompact tally while
+# being read as a lifetime one.
+RESET_SURVIVING_TOP_LEVEL = {"capture_evictions"}
 DEFAULT_SLOT_TYPES = [
     "active_constraints", "active_context", "active_hypothesis", "active_strategy",
     "archived_context", "cross_domain_transfer", "domain_data",
@@ -110,6 +129,14 @@ CADENCE_TRACKER_PATTERNS = (
 # agreed on the same wrong set, and the survive-assertion exercised one
 # representative member. ()
 #
+# ┌─ HISTORICAL as of 2026-08-22 () — THE CONSUMER NOW EXISTS. ──────┐
+# │ Read the paragraph below as the record of a FIXED defect, not as current  │
+# │ state. worker_retrospective.py RUN_LANES includes "encoding" (L133) and    │
+# │ `_lane_encoding` (L666) is dispatched at L788, so 's reducer half │
+# │ landed. Header placed ABOVE the narrative per guard-4079 (a reader's entry │
+# │ point is the top of the block). Twins corrected in the same change:        │
+# │ core/scripts/wm.py, iteration-close.sh, body-merge.sh.                     │
+# └───────────────────────────────────────────────────────────────────────────┘
 # THAT CONSUMER DOES NOT EXIST — measured 2026-08-15 (alpha worker, cc-07); this
 # line read "consumed by tree encoding at ... Step 8" here and in the wm.py twin
 # until then. 0 mentions in aspirations-state-update/SKILL.md, no bridge to
@@ -208,6 +235,28 @@ def _unflagged_floor(limit: int) -> int:
     if not limit or limit < 2:
         return 0
     return min(limit - 1, max(1, int(limit * UNFLAGGED_FLOOR_RATIO)))
+
+
+def _record_capture_evictions(data, slot_name, n) -> None:
+    """Add `n` to the persisted `capture_evictions[slot_name]` tally.
+
+    TOP-LEVEL, not slot_meta, and that is load-bearing: body-merge merges
+    slot_meta REDUCER-WINS, so a counter there is discarded at generalize-down
+    (g-306-289). Shared by the append and prune paths — prune used to record
+    its evictions ONLY into the transient response `report`, so every capture
+    entry it destroyed was invisible to the one counter built to measure
+    capture loss, and to the reset-survival fix that counter received
+    (g-306-355). A blind lane in the counter silently undercounts any future
+    cap sizing that reads it.
+    """
+    if not n:
+        return
+    ev = data.get("capture_evictions")
+    if not isinstance(ev, dict):
+        ev = {}
+        data["capture_evictions"] = ev
+    prev = ev.get(slot_name)
+    ev[slot_name] = (prev if isinstance(prev, int) else 0) + n
 
 
 def _is_cadence_tracker(slot_name: str) -> bool:
@@ -778,6 +827,14 @@ def append_slot(ctx) -> "Response":  # type: ignore[name-defined]
                 # Above the floor the priority key is untouched. Below it the
                 # oldest FLAGGED entry is evicted instead — the stated cost,
                 # since a lane at 100% flagged has no variance left in the key.
+                # : this stays INLINE on purpose. Extracting it behind a
+                # helper was tried and reverted — test_capture_fast_lane.py
+                # ::test_daemon_eviction_key_is_defined_and_actually_called
+                # asserts `key=_eviction_sort_key` appears inside append_slot
+                # precisely so a mirrored-but-uncalled helper cannot pass a
+                # definition check while changing nothing at runtime (the
+                #  class). One level of indirection defeats that
+                # textual guard, and the guard is worth more than the tidiness.
                 arr.sort(key=_eviction_sort_key)
                 _floor = _unflagged_floor(limit)
                 # Sorted (flag, ts) => unflagged are the PREFIX, so this count is
@@ -806,12 +863,7 @@ def append_slot(ctx) -> "Response":  # type: ignore[name-defined]
                 # is discarded at generalize-down — the same silent loss one layer
                 # up. Top-level keys route through _merge_value, where a nested int
                 # gets the 3-way-delta SUM, so counts aggregate across Bodies.
-                _ev = data.get("capture_evictions")
-                if not isinstance(_ev, dict):
-                    _ev = {}
-                    data["capture_evictions"] = _ev
-                _prev = _ev.get(root_slot)
-                _ev[root_slot] = (_prev if isinstance(_prev, int) else 0) + _evicted
+                _record_capture_evictions(data, root_slot, _evicted)
             if not is_top:
                 _update_modified(data, slot)
             _write_wm(_wm_path(ctx), data)
@@ -992,15 +1044,37 @@ def prune(ctx) -> "Response":  # type: ignore[name-defined]
                 if isinstance(slot_val, list) and slot_name in limits:
                     limit = limits[slot_name]
                     if len(slot_val) > limit:
+                        # : DELIBERATELY pure FIFO — do NOT "unify" this
+                        # with _enforce_slot_limit. That was tried and MEASURED
+                        # here, and it is strictly worse for the payloads this
+                        # lane exists to protect. The shared policy evicts
+                        # UNFLAGGED first, but for a Body that has not CLOSED
+                        # `load_bearing` is the ONLY delivery channel (the fast
+                        # lane mirrors flagged entries out; unflagged ones are
+                        # reachable only at generalize-down), so unflagged ==
+                        # UNDELIVERED and flagged == a redundant second copy.
+                        # At limit=10, floor=2, counting undelivered entries
+                        # lost (FIFO vs shared policy): 8F+4U 0 vs 2; 4F+8U
+                        # 0 vs 2; 2F+10U 0 vs 2; 10F+2U 0 vs 0; unflagged-older
+                        # 2 vs 2. Never better, worse in 4 of 5. FIFO is
+                        # flag-NEUTRAL and evicts by age alone, which protects
+                        # the newest (still-undelivered) captures for free.
+                        _n = 0
                         slot_val.sort(key=lambda x: x.get("_item_ts", "0000") if isinstance(x, dict) else "0000")
                         while len(slot_val) > limit:
                             removed = slot_val.pop(0)
+                            _n += 1
                             report["pruned_items"].append({
                                 "slot": slot_name,
                                 "item_summary": str(removed.get("claim", removed.get("reason", "?")))[:80] if isinstance(removed, dict) else "?",
                                 "reason": "array_limit",
                             })
+                        # Persist the tally. This path recorded evictions ONLY
+                        # into the transient `report` above, so everything it
+                        # destroyed was invisible to capture_evictions — the
+                        # counter built to make exactly this loss measurable.
                         if not dry_run:
+                            _record_capture_evictions(data, slot_name, _n)
                             _update_modified(data, slot_name)
 
             eq = data.get("encoding_queue", [])
@@ -1065,6 +1139,15 @@ def reset(ctx) -> "Response":  # type: ignore[name-defined]
                 if v is not None:
                     data[k] = v
                     preserved.append(k)
+            # : top-level non-identity survivors. Reported separately
+            # from `preserved` so the response never implies these are identity
+            # fields — clear-identity must keep ignoring them.
+            preserved_top_level = []
+            for k in RESET_SURVIVING_TOP_LEVEL:
+                v = existing.get(k)
+                if v is not None:
+                    data[k] = v
+                    preserved_top_level.append(k)
             existing_slots = existing.get("slots", {})
             existing_meta = existing.get("slot_meta", {})
             cadence_preserved = []
@@ -1080,6 +1163,7 @@ def reset(ctx) -> "Response":  # type: ignore[name-defined]
     except OSError as e:
         return Response.error(500, "write_failed", str(e))
     return Response.json({"ok": True, "preserved_identity": sorted(preserved),
+                          "preserved_top_level": sorted(preserved_top_level),
                           "preserved_cadence": len(cadence_preserved),
                           "preserved_surviving": sorted(surviving_preserved)})
 

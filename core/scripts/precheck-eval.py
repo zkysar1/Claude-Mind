@@ -1165,6 +1165,13 @@ def cmd_temp_pressure(args, config, compact):
         raise KeyError(
             "aspirations.yaml missing temp_pressure."
             "{warn_threshold,drain_goal_threshold}")
+    # drain_goal_max_age_hours DEFAULTS rather than raising, a deliberate
+    # divergence from the two keys above: those gate goal FILING (no safe
+    # default exists), while this one only gates ESCALATION of an
+    # already-filed goal — a lagging config on a promoted box must degrade to
+    # the pre-escalation behavior, not brick the whole temp-pressure check
+    # (guard-4653 promotion-coupling class).
+    drain_goal_max_age_h = tp.get("drain_goal_max_age_hours") or 48
 
     # temp/ holds THREE file classes (core/config/conventions/temp-store.md).
     # The first two are counted below; the third is the COMPLEMENT of both
@@ -1278,6 +1285,7 @@ def cmd_temp_pressure(args, config, compact):
     # drain goals always carry filed_by_agent; preserves the legacy contract).
     agent_name = AGENT_DIR.name if AGENT_DIR is not None else None
     existing = None
+    existing_goal = None
     for asp in _active_aspirations(compact):
         for g in asp.get("goals", []):
             if g.get("status") in ("pending", "in-progress"):
@@ -1294,12 +1302,14 @@ def cmd_temp_pressure(args, config, compact):
                 if owner is not None and owner != agent_name:
                     continue  # another agent's drain goal () — not ours
                 existing = g.get("id")
+                existing_goal = g
                 break
         if existing:
             break
 
     flags = []
     suggested_goal = None
+    escalation = None
     if pressure_count >= drain_threshold and existing is None:
         flags.append("temp_drain_needed")
         _purge_clause = (f" + purge {ephemera_count} stale ephemera file(s)"
@@ -1338,7 +1348,67 @@ def cmd_temp_pressure(args, config, compact):
         if agent_name:
             suggested_goal["intended_agent"] = agent_name
     elif pressure_count >= drain_threshold and existing is not None:
-        flags.append("temp_drain_pending")
+        # STALL ESCALATION ( + , closed together 2026-08-21).
+        # Existence-based suppression checked that a drain goal EXISTS and
+        # inferred it is REACHABLE — but the scorer ranks janitorial work last
+        # by design (measured: the deduped-against goal at rank #120/151 for
+        # weeks while pressure grew 18x, flag firing every iteration, consumed
+        # by no one). Those defects are one: the silence is only harmful
+        # BECAUSE the goal cannot run. AGE is the honest reachability proxy —
+        # a drain goal older than drain_goal_max_age_hours with pressure still
+        # over threshold is, by observation, never getting picked. The flag
+        # flips to temp_drain_stalled and carries an escalation payload; the
+        # precheck SKILL acts on it by invoking /drain-temp THIS iteration
+        # (owner-scoped dedup above guarantees the goal is the bound agent's
+        # own store, so direct execution is always legal), mirroring the
+        # temp_drain_needed flow — never by filing a second goal.
+        stall_age_h = None
+        # `existing_goal` comes from the COMPACT — a bounded projection that
+        # carries created_at on ZERO goals (measured 2026-08-22, alpha/cc-04:
+        # 0 of 2919; the summary file omits the goal entirely). So this read
+        # was ALWAYS "", fromisoformat("") ALWAYS raised, and the escalation
+        # below was UNREACHABLE on every agent and every box from the day it
+        # shipped (b2fbfd899) — a stalled-drain detector that could not detect
+        # a stalled drain. Live proof at discovery:  open 665.3h
+        # against max_age 48h at pressure 4212, escalation null.
+        # Same class the sibling claim-integrity lane documents for
+        # `claimed_by` (see cmd_claim_integrity), and guard-3871 generally: an
+        # intermediate rebuild drops a field with no error and no test failure.
+        # Do NOT fix by adding created_at to the compact — that projection
+        # already omits 1929 of 2127 goals to stay under its byte budget, so
+        # widening it trades this bug for a worse one (rb-533 trade-off (a)).
+        # Resolve the ONE record authoritatively instead (guard-1755). This
+        # branch is rare (pressure over threshold AND an open drain goal), so
+        # a single lookup is affordable; any failure falls through to the
+        # original conservative no-escalation.
+        _created = (existing_goal or {}).get("created_at") or ""
+        if not _created and existing:
+            try:
+                _out, _err, _rc = _run_script(
+                    ["aspirations-query.sh", "--goal-field", "id",
+                     str(existing), "--full"], timeout=30)
+                _rows = json.loads(_out) if _rc == 0 and _out.strip() else []
+                # guard-2754: assert SHAPE before projecting a field out of it.
+                if isinstance(_rows, list) and _rows and isinstance(_rows[0], dict):
+                    _created = _rows[0].get("created_at") or ""
+            except (subprocess.SubprocessError, ValueError, OSError):
+                _created = ""   # lookup failed: conservative, no escalation
+        _created_dt = _parse_iso(str(_created))
+        if _created_dt is not None:
+            stall_age_h = round(
+                (_now() - _created_dt).total_seconds() / 3600.0, 1)
+        if stall_age_h is not None and stall_age_h > drain_goal_max_age_h:
+            flags.append("temp_drain_stalled")
+            escalation = {
+                "goal_id": existing,
+                "age_hours": stall_age_h,
+                "max_age_hours": drain_goal_max_age_h,
+                "pressure": pressure_count,
+                "goal_priority": (existing_goal or {}).get("priority"),
+                "action": "invoke /drain-temp this iteration (see SKILL)",
+            }
+        else:
+            flags.append("temp_drain_pending")
     elif pressure_count >= warn_threshold:
         flags.append("temp_pressure_warn")
 
@@ -1360,7 +1430,10 @@ def cmd_temp_pressure(args, config, compact):
         summary = (
             f"temp-pressure: {_breakdown} "
             f"(warn>={warn_threshold}, drain>={drain_threshold}"
-            + (f"; open drain goal {existing}" if existing else "") + ")"
+            + (f"; open drain goal {existing}" if existing else "")
+            + (f"; STALLED {escalation['age_hours']}h > "
+               f"{drain_goal_max_age_h}h — escalate"
+               if "temp_drain_stalled" in flags else "") + ")"
         )
     else:
         summary = "temp-pressure: clean"
@@ -1375,8 +1448,10 @@ def cmd_temp_pressure(args, config, compact):
         "ephemera_tracked_excluded": ephemera_tracked_excluded,
         "temp_root_total": count + ephemera_count + unclassified_count,
         "existing_drain_goal": existing,
+        "escalation": escalation if "temp_drain_stalled" in flags else None,
         "thresholds": {"warn_threshold": warn_threshold,
-                       "drain_goal_threshold": drain_threshold},
+                       "drain_goal_threshold": drain_threshold,
+                       "drain_goal_max_age_hours": drain_goal_max_age_h},
         "suggested_goal": suggested_goal,
     }
 
@@ -1555,6 +1630,64 @@ def cmd_peer_thread_relay(args, config, compact):
     }
 
 
+def cmd_claim_integrity(args, config, compact):
+    """Claim-pair damage census (). Delegates to
+    claim-integrity-check.py — one implementation, two call sites.
+
+    IGNORES `compact` DELIBERATELY, and that is the whole correctness argument.
+    Every sibling check here reads the compact, but the compact is a 16-key
+    projection that carries `claimed_by` on ZERO of its goals (measured cc-02
+    2026-08-22: 194 goals, none with a claim field, against 2,239 non-terminal
+    in the live stores). A compact-backed version of this check would report
+    `clean` permanently, on every box — the guard-2467 false-zero, wearing the
+    shape of health. So this reads the raw JSONL, where key-PRESENCE survives;
+    a projection can only ever destroy the present-vs-absent distinction the
+    check is built on.
+
+    Cheap enough for the per-iteration lane: 0.11-0.18s over an 18.4MB store.
+    """
+    import importlib.util as _ilu
+    spec = _ilu.spec_from_file_location(
+        "claim_integrity_check",
+        Path(__file__).resolve().parent / "claim-integrity-check.py")
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    res = mod.main_result() if hasattr(mod, "main_result") else None
+    if res is None:  # fail-open: never block the precheck on this lane
+        return {"subcommand": "claim-integrity", "flags": [],
+                "summary": "claim-integrity: unavailable"}
+
+    verdict = res["verdict"]
+    kp = res["key_presence"]
+    # BLIND is flagged as loudly as damage: a source that lost the field is a
+    # worse finding than a damaged record, because it silences every future run.
+    flags = []
+    if verdict == "BLIND":
+        flags = ["claim_integrity_blind"]
+    elif verdict == "damaged":
+        flags = ["claim_pair_damaged"]
+
+    summary = (
+        f"claim-integrity: {verdict} — {res['findings_total']} damaged "
+        f"({res['reconcile_damage_count']} with partial field survival) of "
+        f"{res['scanned_non_terminal']} non-terminal "
+        f"[key_presence absent={kp['absent']} null={kp['present_null']} "
+        f"value={kp['present_value']}]"
+    )
+    return {
+        "subcommand": "claim-integrity",
+        "summary": summary,
+        "flags": flags,
+        "verdict": verdict,
+        "key_presence": kp,
+        "findings_total": res["findings_total"],
+        "reconcile_damage_count": res["reconcile_damage_count"],
+        "per_agent": res["per_agent"],
+        "findings": res["findings"][:5],
+    }
+
+
 # Registered here, after the definition above, because SUBCMDS is declared
 # earlier in the file. This line is what gives the sweep its CALL SITE:
 # cmd_run_all iterates SUBCMDS, NOT DISPATCH, so a DISPATCH-only entry would
@@ -1563,10 +1696,12 @@ def cmd_peer_thread_relay(args, config, compact):
 # clean" defect  exists to fix, reintroduced one layer up. Caught by
 # reading cmd_run_all instead of assuming the two registries were the same one.
 SUBCMDS.append(("peer-thread-relay", cmd_peer_thread_relay))
+SUBCMDS.append(("claim-integrity", cmd_claim_integrity))
 
 DISPATCH = {
     "run-all": cmd_run_all,
     "peer-thread-relay": cmd_peer_thread_relay,
+    "claim-integrity": cmd_claim_integrity,
     "zombies": cmd_zombies,
     "pipeline-depth": cmd_pipeline_depth,
     "hypothesis-health": cmd_hypothesis_health,

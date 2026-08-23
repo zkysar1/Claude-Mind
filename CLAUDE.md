@@ -317,7 +317,7 @@ guardrails, reasoning bank, knowledge tree, forged skills (`world/forged-skills.
 
 ### Status Values
 
-Goals: `pending`, `in-progress`, `completed`, `blocked`, `skipped`, `expired` | Pipeline: `discovered`, `active`, `resolved`, `archived` | Aspirations: `active`, `completed`, `paused`, `retired`. Full per-entity status lists: see convention files.
+Goals: `pending`, `in-progress`, `completed`, `blocked`, `skipped`, `expired`, `decomposed`, `superseded` | Pipeline: `discovered`, `active`, `resolved`, `archived` | Aspirations: `active`, `completed`, `paused`, `retired`. Full per-entity status lists: see convention files.
 
 ### Pipeline Rules
 - **Never delete** pipeline records — move via `pipeline-move.sh`

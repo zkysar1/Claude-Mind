@@ -304,7 +304,29 @@ def main():
         if not mutations:
             return 0
         shown = mutations[:MAX_DISPLAY]
-        items = ", ".join("%s(%s)" % (m["goal_id"], m["sweep"]) for m in shown)
+
+        # An agent-queue goal id is unique only WITHIN one agent's private queue
+        # (guard-3441 / guard-3411 — never resolve or join by bare id across
+        # queues), and this is the ONE line read to answer "is this one MINE?".
+        # A bare id is therefore ambiguous at exactly the point of decision, and
+        # the remedy this line prescribes ("re-open with aspirations-update-goal.sh
+        # <id> status pending") would then mutate whichever record that id names in
+        # the READER's queue — a cross-agent write (guard-1007).
+        # Measured 2026-08-22 (zeta, cc-02): echo's `source: agent` g-001-94 (parent
+        # g-001-08, closed because its recurring cadence had resumed) surfaced here
+        # bare, while zeta's own g-001-94 is a DIFFERENT record (parent g-001-02,
+        # still pending). Three probes to tell them apart; the collected `agent`
+        # field answered it in one, and was being discarded at the render.
+        # Qualify any row applied by someone else; own rows stay byte-identical.
+        # Unknown self-identity qualifies everything (the safe direction).
+        def _label(m):
+            who = m.get("agent")
+            gid = m["goal_id"]
+            if who and who != args.agent:
+                gid = "%s@%s" % (gid, who)
+            return "%s(%s)" % (gid, m["sweep"])
+
+        items = ", ".join(_label(m) for m in shown)
         more = "" if len(mutations) <= MAX_DISPLAY else " (+%d more)" % (len(mutations) - MAX_DISPLAY)
         print("▸ ⚠ SWEEP AUTO-CLOSE: %d goal(s) moved to TERMINAL status by "
               "Phase-0.5b sweeps since last surface — %s%s. Swept goals leave "

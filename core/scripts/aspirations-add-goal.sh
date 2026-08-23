@@ -59,6 +59,12 @@ Options:
   --override-offload <reason>      Bypass operator-offload gate (recurring
                                    goals must otherwise carry offload_decision).
   --override-all <reason>          Bulk-override all gates (audited).
+  --allow-new-field <reason>       Register-later escape for the unknown-field
+                                   allowlist (g-115-6573 item 3): lets the goal
+                                   body carry a field not yet in
+                                   _goal_fields.GOAL_KNOWN_FIELDS. Audited.
+                                   NOT covered by --override-all (mirrors
+                                   aspirations-update-goal.sh).
 
 Goal fields go in the JSON body — NOT as CLI flags. The following are
 rejected as flags with an explicit error:
@@ -92,6 +98,7 @@ OVERRIDE_DUPLICATION=""
 OVERRIDE_NO_INVESTIGATE=""
 OVERRIDE_OFFLOAD=""
 OVERRIDE_ALL=""
+ALLOW_NEW_FIELD=""
 SCHEMA=0
 declare -a PASSTHROUGH=()
 declare -a PASSTHROUGH_SOURCE=()
@@ -142,6 +149,10 @@ while [[ $# -gt 0 ]]; do
             OVERRIDE_ALL="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
+        --allow-new-field)
+            ALLOW_NEW_FIELD="${2-}"
+            PASSTHROUGH+=("$1" "${2-}")
+            shift $(( $# >= 2 ? 2 : 1 ));;
         -*)
             # REFUSE (). The prior comment here was ACCURATE about the
             # mechanism — the 2026-05-14 cutover removed the Python CLI fallback, so
@@ -151,7 +162,7 @@ while [[ $# -gt 0 ]]; do
             # reader in this script, so the flag never reached the daemon either. Correct
             # diagnosis, wrong conclusion: describing a silent drop is a reason to refuse,
             # not a reason to keep passing it through.
-            argv_strict_refuse_unknown "$(basename "$0")" "$1" "--help --aspiration --source --override-signal --override-duplication --override-no-investigate --override-offload --override-all";;
+            argv_strict_refuse_unknown "$(basename "$0")" "$1" "--help --aspiration --source --override-signal --override-duplication --override-no-investigate --override-offload --override-all --allow-new-field";;
         *)
             # Positional asp_id (first non-flag wins)
             [ -z "$ASP_ID" ] && ASP_ID="$1"
@@ -215,6 +226,7 @@ declare -a HEADER_ARGS=()
 [ -n "$OVERRIDE_NO_INVESTIGATE" ] && HEADER_ARGS+=(--header "X-Mind-Override-No-Investigate: $OVERRIDE_NO_INVESTIGATE")
 [ -n "$OVERRIDE_OFFLOAD" ] && HEADER_ARGS+=(--header "X-Mind-Override-Offload: $OVERRIDE_OFFLOAD")
 [ -n "$OVERRIDE_ALL" ] && HEADER_ARGS+=(--header "X-Mind-Override-All: $OVERRIDE_ALL")
+[ -n "$ALLOW_NEW_FIELD" ] && HEADER_ARGS+=(--header "X-Mind-Allow-New-Field: $ALLOW_NEW_FIELD")
 
 rc=0
 RESPONSE="$(rt_call POST /v1/aspirations/add-goal \

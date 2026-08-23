@@ -70,7 +70,7 @@ def _active_agents() -> tuple:
 # binds the roster as of ITS import moment, same as before; and (b) importing
 # this module can never crash on pre-init deployment state — the prior eager
 # `ACTIVE_AGENTS = _active_agents()` ran get_active_agents() at import and
-# killed the daemon on a bare clone with no agents root (g-367-03, measured
+# killed the daemon on a bare clone with no agents root (, measured
 # 2026-08-21; _agents.py is now tolerant too, this is the second layer).
 def __getattr__(name: str):
     if name == "ACTIVE_AGENTS":

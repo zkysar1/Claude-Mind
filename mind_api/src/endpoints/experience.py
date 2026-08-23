@@ -24,6 +24,13 @@ from ..jsonl_cache import cache
 from ._jsonl_common import (
     find_by_id, flag, json_response_pretty, missing_flag_error, plain_lines,
 )
+# Reuse the WRITER's derivation helper rather than adding a third copy of the
+# regex (). experience_write.py's own comment demands its copy stay
+# literally identical to core/scripts/experience.py's; a third copy here would
+# make that promise harder to keep, and this module needs the exact same
+# id->goal-id mapping the writer uses. Import direction is safe: experience_write
+# does not import this module, so there is no cycle.
+from .experience_write import _derive_goal_id_from_id
 
 
 def _live(ctx):
@@ -131,8 +138,39 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
 
     goal = q.get("goal")
     if goal:
+        # Match the goal_id FIELD or the goal-id embedded in the record ID
+        # (). The field alone is not sufficient, and the reason is
+        # durability rather than writer bugs:  already fixed the
+        # writer and REPAIRED 862 records in this file at 04:13 on 2026-08-21 —
+        # by 06:00 the very next writes had reverted 26 of them to null. This
+        # store is append-heavy and fleet-synced, so a peer holding a copy that
+        # predates a repair silently un-does it on merge (guard-3209: a locked
+        # write plus a clean re-read proves the write LANDED, not that it
+        # SURVIVES). A field-only predicate therefore re-breaks on its own,
+        # and re-running the backfill is a treadmill.
+        #
+        # The record ID cannot be eroded that way — it is the record's identity,
+        # every writer forms it as exp-{goal_id}[-{slug}], and no merge rewrites
+        # it. So deriving from the id makes this read correct for the 28
+        # currently-invisible records AND immune to the next erosion, with no
+        # migration.
+        #
+        # This is what makes guard-2939's anti-overwrite pre-check able to fire
+        # at all: that check asks "does this goal already have an experience?"
+        # and a false [] tells a caller the bare exp-<goal-id> id and .md path
+        # are free when they are taken, so the Write silently overwrites.
+        #
+        # NOT widened to source_id, deliberately: source_id is the goal id only
+        # for goal_execution records, and carries hypothesis/other ids on the
+        # rest, so matching it would return foreign records under a goal query.
+        # The id derivation is exact — the regex anchors a full canonical goal
+        # id — so it cannot false-positive.
         items = jc.get(_live(ctx))
-        return json_response_pretty([r for r in items if r.get("goal_id") == goal])
+        return json_response_pretty([
+            r for r in items
+            if r.get("goal_id") == goal
+            or _derive_goal_id_from_id(r.get("id")) == goal
+        ])
 
     hypothesis = q.get("hypothesis")
     if hypothesis:

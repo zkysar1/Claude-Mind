@@ -27,10 +27,28 @@ The three fixes this file pins:
      evidentiary value (PASS). It used to be deleted inside `restore()`, i.e.
      precisely on the paths where a human would need it.
 
+AND A FOURTH, from g-115-7145 (2026-08-21):
+  4. That surviving backup is written OUTSIDE the target's working tree. Fix 3
+     is correct and unchanged, but it was landed on a backup named as a SIBLING
+     of the target — so retention meant stray copies of production source
+     accumulating in product repos (measured: five files after a 6-mutation
+     partition run, seventeen after an 8-mutation Java run), and the next
+     canonical step for product work stages with `git add -A`. Adjacency was
+     never the point; recoverability was, and the two are separable.
+
+     The goal that surfaced it also claimed `residue_check` was falsely
+     asserting those files had been cleaned. IT WAS NOT: residue_check answers
+     "did sabotage TEXT survive in the TARGET", it was correct on every run
+     cited, and the two readings are about different objects. The real
+     reporting gap was that NO field described the backup's on-disk state, so
+     an N-mutation caller could not see N files piling up. `backup_retained` /
+     `backup_path` close that, measured with a stat at emit time.
+
 EVERY TEST BELOW WAS PROVEN RED BY MUTATION before being committed.
 """
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -53,14 +71,20 @@ SED = ["--sabotage-sed", "0,/^alpha = 1$/s//alpha = 99/"]
 def bed(tmp_path):
     (tmp_path / "target.txt").write_text(BODY, encoding="utf-8")
     (tmp_path / "check.sh").write_text(CHECK, encoding="utf-8")
+    # A PRIVATE TMPDIR (). The backup no longer lives beside the target,
+    # so every assertion about where it went needs a store this test owns —
+    # globbing the shared /tmp would race any concurrent run on this box and would
+    # make "no backup was taken" unprovable rather than merely awkward.
+    (tmp_path / "tmp").mkdir()
     return tmp_path
 
 
 def run(bed, sabotage, test_cmd="bash check.sh"):
+    env = dict(os.environ, TMPDIR=str(bed / "tmp"))
     proc = subprocess.run(
         [BASH, str(SCRIPT), "--target", "target.txt", "--workdir", str(bed),
          "--test-cmd", test_cmd, *sabotage],
-        capture_output=True, text=True, timeout=180,
+        capture_output=True, text=True, timeout=180, env=env,
     )
     return proc
 
@@ -71,8 +95,24 @@ def verdict(proc):
     return json.loads(line)
 
 
-def backups(bed):
+def adjacent_backups(bed):
+    """Backups sitting IN the target's working tree — must ALWAYS be empty.
+
+    This is the g-115-7145 defect surface: `product-pr-flow.sh` stages with
+    `git add -A`, so anything matching this glob in a product repo gets
+    committed into a PR and merged.
+    """
     return sorted(bed.glob("target.txt.mutation-backup.*"))
+
+
+def stored_backups(bed):
+    """Backups in the out-of-tree store. NON-empty is the retention guarantee.
+
+    Read this as the POSITIVE control for every emptiness assertion above it
+    (guard-4166): a mutation-proof-test.sh that had stopped backing up at all
+    would satisfy `adjacent_backups(bed) == []` perfectly.
+    """
+    return sorted((bed / "tmp").glob("mutation-proof-backup-*/*.mutation-backup.*"))
 
 
 # --- 1. the entry refusal ------------------------------------------------
@@ -90,7 +130,11 @@ def test_preexisting_sabotage_string_is_refused_before_the_backup(bed):
     assert proc.stdout.strip() == "", "a refusal must emit no verdict at all"
     assert "already contains" in proc.stderr
     assert "alpha = 99" in proc.stderr, "the offending string must be named"
-    assert backups(bed) == [], "refused before the backup was taken"
+    # "before the backup was taken" is now checked in the store, not beside the
+    # target. Since  the adjacency glob can NEVER match, so asserting
+    # on it here would pass against a run that happily backed up (guard-2903).
+    assert stored_backups(bed) == [], "refused before the backup was taken"
+    assert adjacent_backups(bed) == []
 
 
 def test_the_refusal_survives_the_string_appearing_only_in_a_comment(bed):
@@ -145,8 +189,16 @@ def test_residue_check_is_present_on_a_failing_verdict_too(bed):
 def test_backup_is_removed_on_pass(bed):
     """PASS is the one state where the backup has no evidentiary value."""
     proc = run(bed, SUB)
-    assert verdict(proc)["verdict"] == "PASS"
-    assert backups(bed) == []
+    v = verdict(proc)
+    assert v["verdict"] == "PASS"
+    assert stored_backups(bed) == []
+    assert adjacent_backups(bed) == []
+    # The whole store directory goes, not just the file inside it — otherwise
+    # every passing run leaves an empty dir and the accumulation defect survives
+    # in a quieter form ().
+    assert list((bed / "tmp").iterdir()) == []
+    assert v["backup_retained"] == "false"
+    assert not Path(v["backup_path"]).exists()
 
 
 # GREEN on call 1, RED on every call after: green -> red under sabotage ->
@@ -165,8 +217,13 @@ def test_backup_is_retained_when_the_post_restore_test_is_red(bed):
     v = verdict(proc)
     assert v["verdict"] == "FAIL"
     assert "post-restore RED" in v["reason"]
-    assert len(backups(bed)) == 1, (
+    assert len(stored_backups(bed)) == 1, (
         "the backup must survive the one path where a human needs it")
+    # : survive, but NOT inside the repo the target belongs to.
+    assert adjacent_backups(bed) == []
+    assert v["backup_retained"] == "true"
+    assert Path(v["backup_path"]).exists()
+    assert Path(v["backup_path"]).read_bytes() == (bed / "target.txt").read_bytes()
 
 
 def test_the_post_restore_red_reason_does_not_blame_the_test(bed):
@@ -199,6 +256,60 @@ def test_the_pass_reason_still_claims_no_sabotage_left_behind(bed):
     v = verdict(run(bed, SUB))
     assert v["verdict"] == "PASS"
     assert "restore left no sabotage behind" in v["reason"]
+
+
+# --- 4. the retained backup is never inside the target's working tree ----
+
+@pytest.mark.parametrize("test_cmd", ["bash check.sh", "bash once.sh"])
+def test_no_run_ever_writes_a_backup_into_the_targets_working_tree(bed, test_cmd):
+    """BOTH buckets, because the retention split is exactly where this failed.
+
+    The clean-PASS path removes the backup, so it would look clean under any
+    implementation and proves nothing on its own; the post-restore-RED path is
+    the one that RETAINS, and is where the five/seventeen stray files were
+    measured. Pinning only the passing case is how an absence-shaped fix gets
+    certified by a test that cannot fail (guard-4374, guard-4166).
+    """
+    (bed / "once.sh").write_text(GREEN_ONCE, encoding="utf-8")
+    v = verdict(run(bed, SUB, test_cmd=test_cmd))
+    assert adjacent_backups(bed) == [], (
+        "a backup beside the target is what `git add -A` commits into a PR")
+    path = Path(v["backup_path"])
+    # The invariant is "in the TMPDIR store, never beside the target". It is NOT
+    # "outside `bed`": this fixture deliberately points TMPDIR *inside* tmp_path
+    # so the test can own the store, which is exactly the case an outside-of-bed
+    # assertion would fail on while the production shape (TMPDIR=/tmp, target in
+    # a repo) is fine. Pin the two properties that actually travel.
+    assert path.parent != (bed / "target.txt").parent, "backup is a sibling of the target"
+    assert path.parent.name.startswith("mutation-proof-backup-")
+    assert (bed / "tmp") in path.parents, "backup escaped the TMPDIR it was given"
+    # POSITIVE CONTROL. Everything above is satisfied by a script that never
+    # backs up at all — including, silently, by one whose backup step regressed
+    # to a no-op. The retaining arm must show a real file with the target's bytes.
+    if v["verdict"] != "PASS":
+        assert path.exists() and path.read_bytes() == (bed / "target.txt").read_bytes()
+
+
+def test_backup_retained_is_measured_not_inferred_from_the_verdict(bed):
+    """The field must read the filesystem at emit time.
+
+    A goal filed against this tool read `residue_check: clean` as a claim that
+    the backup FILES had been cleaned up. It never was — residue_check is about
+    sabotage TEXT surviving in the TARGET, and it was correct on both runs cited.
+    The real gap was that nothing in the JSON described the backup's on-disk
+    state at all, so an N-mutation caller had no way to see N files piling up.
+    """
+    (bed / "once.sh").write_text(GREEN_ONCE, encoding="utf-8")
+    red = verdict(run(bed, SUB, test_cmd="bash once.sh"))
+    green = verdict(run(bed, SUB))
+    # residue_check reports the same value across both — it is answering a
+    # different question, and reading it as a backup-cleanup signal is the
+    # misreading this test exists to make impossible to repeat.
+    assert red["residue_check"] == green["residue_check"] == "clean"
+    assert red["backup_retained"] == "true"
+    assert green["backup_retained"] == "false"
+    assert Path(red["backup_path"]).exists()
+    assert not Path(green["backup_path"]).exists()
 
 
 # --- the guarantee the fix must not have weakened ------------------------

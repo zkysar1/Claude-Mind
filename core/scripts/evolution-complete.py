@@ -384,6 +384,43 @@ def _email_user(entry, event):
     env = os.environ.copy()
     if agent:
         env["MIND_AGENT"] = agent
+    if event == "material-self":
+        # The prior-outreach gate collides EVERY identity notification with every
+        # other one, and the collision is structural rather than incidental: the
+        # body above cites "guard-380" by name, notification_outreach.entity_ids()
+        # regex-extracts that as a topic entity, and match_reason()'s third
+        # predicate ("shared ids") fires before body/subject similarity is even
+        # consulted. Two material self.md edits therefore read as ONE topic no
+        # matter how unrelated they are.
+        #
+        # Measured 2026-08-21 over world/notifications-sent.jsonl: 13 identity
+        # notifications, 13/13 carrying guard-380 in entity_ids, 12 of them rc=4.
+        # Only the very first (foxtrot 08-17T12:02:46) was delivered — it had
+        # nothing prior to collide with. bravo's 08-20T21:30:07 row matched a
+        # zeta row at subject jaccard 0.00 and body jaccard 0.05, purely on the
+        # shared guard-380 id. Fixing the SUBJECT template (08-19, back-ported
+        # from ZDS) could not have helped and did not: distinct subjects still
+        # returned rc=4.
+        #
+        # The routing gate above already classifies this event ALWAYS_SEND, for
+        # the reason spelled out at `routing_category` — the notification IS the
+        # consideration the user accepted on 2026-04-22 in exchange for the
+        # agent's autonomy over its own identity. The outreach gate is a second,
+        # independent suppressor that never learned that. This is the sanctioned
+        # override (world/conventions/notification-routing.md: pass
+        # EMAIL_SEND_ALLOW_DUPLICATE='<what is new>'; the reason is recorded to
+        # the ledger as duplicate_override_reason), and the "what is new" is
+        # always genuinely new here — a different agent, section, or revision.
+        # Scoped to this event ONLY: the rollback branch keeps normal dedup.
+        env["EMAIL_SEND_ALLOW_DUPLICATE"] = (
+            f"material self.md edit by {agent or '?'}"
+            f"{' — section: ' + _section if _section else ''}"
+            f" (revision {revision_id}). Distinct from any prior identity"
+            f" notification: different agent/section/revision. guard-380"
+            f" requires post-change notification for EVERY material self edit;"
+            f" the shared 'guard-380' citation in the body is boilerplate, not"
+            f" a shared topic."
+        )
     try:
         result = subprocess.run(
             bash_cmd(email_script),

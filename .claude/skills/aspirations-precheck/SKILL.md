@@ -1014,21 +1014,21 @@ Bash: bash core/scripts/execution-diary.sh phase-end phase-0.5.0-scripted
 #   user-goals:reclassifiable_user_goals → for each entry in
 #                                        results.user-goals.candidates[]: invoke
 #                                        aspirations-update-goal.sh participants '["agent"]'
-#   temp-pressure:temp_drain_needed    → file results.temp-pressure.suggested_goal
-#                                        via aspirations-add-goal.sh (title/priority
-#                                        HIGH/participants ["agent"]/description AND
-#                                        intended_agent — ALL fields from the payload)
-#                                        into asp-001, then the loop executes /drain-temp.
-#                                        intended_agent MUST be filed verbatim: it names
-#                                        the temp OWNER, and /drain-temp is bound-agent-
-#                                        scoped, so dropping it lets the content classifier
-#                                        re-route to bravo and the drain no-ops on the
-#                                        wrong temp store (g-115-2979, rb-3876). Dedup is
-#                                        already done
-#                                        by the check (it suppresses this flag when an
-#                                        open drain goal exists — emits temp_drain_pending
-#                                        instead). temp_pressure_warn / temp_drain_pending
-#                                        are visibility-only — surface in output, no goal.
+#   temp-pressure:temp_drain_needed    → file results.temp-pressure.suggested_goal via
+#                                        aspirations-add-goal.sh into asp-001, ALL payload
+#                                        fields (title, priority HIGH, participants
+#                                        ["agent"], description, AND intended_agent
+#                                        verbatim: it names the temp OWNER; /drain-temp is
+#                                        bound-agent-scoped — dropping it re-routes the
+#                                        goal and the drain no-ops on the wrong temp
+#                                        store; g-115-2979, rb-3876). Dedup: this flag is
+#                                        suppressed while an open drain goal exists (emits
+#                                        temp_drain_pending); that + temp_pressure_warn
+#                                        are visibility-only.
+#   temp-pressure:temp_drain_stalled   → the open drain goal (escalation.goal_id) outlived
+#                                        drain_goal_max_age_hours at pressure >= threshold
+#                                        (g-115-3774). ACTION: /drain-temp THIS
+#                                        iteration — no second goal, no scorer wait.
 ```
 
 ## Phase 0.5a: Pre-Selection Guardrail Check
@@ -1877,18 +1877,17 @@ unfinished half. guard-1249: "match the probe to the DEFER'S PREMISE, not to the
 resource it names ... never batch-clear several defers naming the same external
 resource on a single probe." A keyword join proves a message MENTIONS a goal; it
 cannot prove the message GRANTS that goal's specific blocking condition. The live
-population shows the hazard is not theoretical: of 8 `human_blocked` defers, THREE
-name one Studio host — exactly the cluster a single probe would wrongly clear.
+population shows the hazard is real: of 8 such defers, THREE named one Studio host.
 
 Read `confidence`, never mere presence. The four signals demand DIFFERENT actions,
 and the two deterministic ones demand OPPOSITE ones:
 
 | signal | confidence | what it means | action |
 |---|---|---|---|
-| `pq_answered` | deterministic | the cited pending-question now reads answered/resolved | strongest case to re-derive and clear |
-| `pq_retired` | deterministic | the cited question was WITHDRAWN | the OPPOSITE — the clearing path is dead, so the defer can never be satisfied as written. Re-premise it or re-file the question; do NOT read it as granted |
+| `pq_answered` | deterministic | the cited pending-question now reads answered/resolved | re-derive — but the tier is per-CITATION, not per-LEG: a defer naming several legs is NOT discharged by one answered pq (g-326-191). Count the legs first |
+| `pq_retired` | deterministic | the cited question was WITHDRAWN | the OPPOSITE — the clearing path is dead, so the defer cannot be satisfied as written. Re-premise or re-file; never read as granted |
 | `board_directive` | heuristic | a board post newer than the defer names this goal | evidence a human SPOKE about it. Open the post; never act on this alone |
-| `pq_missing` | none | the cited `pq-` id exists in no agent's file | nothing arrived — the defer's own citation is broken. Confirm the block is really filed (guard-1197) before trusting it |
+| `pq_missing` | none | the cited `pq-` id exists in no agent's file | nothing arrived — the citation itself is broken. Confirm the block is really filed (guard-1197) |
 
 ```
 # Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.

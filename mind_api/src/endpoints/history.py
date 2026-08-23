@@ -536,6 +536,7 @@ def prune_legacy(ctx) -> "Response":  # type: ignore[name-defined]
     deleted_dirs = 0
     skipped_recent = 0
     skipped_no_coverage = 0
+    skipped_shortfall = 0
     bytes_freed = 0
 
     for history_root in base_dirs:
@@ -588,6 +589,20 @@ def prune_legacy(ctx) -> "Response":  # type: ignore[name-defined]
             if not new_manifests:
                 skipped_no_coverage += 1
                 continue
+            # Count comparison, not presence — mirror of cmd_prune_legacy in
+            # core/scripts/history.py (). Keep the two in lockstep:
+            # this endpoint REIMPLEMENTS that function rather than calling it,
+            # and it is the copy that actually runs under daemon-only
+            # architecture, so a fix applied to only one half fixes nothing
+            # where it matters. test_runtime_history.py pins the parity.
+            if len(new_manifests) < len(snaps):
+                skipped_shortfall += 1
+                emit(f"  [shortfall] Preserved: {leg_dir}  "
+                     f"({len(snaps)} legacy snapshot"
+                     f"{'s' if len(snaps) != 1 else ''}, only "
+                     f"{len(new_manifests)} manifest"
+                     f"{'s' if len(new_manifests) != 1 else ''} in new store)")
+                continue
 
             dir_bytes = 0
             for s in snaps:
@@ -614,7 +629,8 @@ def prune_legacy(ctx) -> "Response":  # type: ignore[name-defined]
     verb = "Deleted" if apply else "Would delete"
     emit(f"{verb} {deleted_dirs} legacy subtree{'s' if deleted_dirs != 1 else ''} "
          f"({bytes_freed:,} bytes). "
-         f"Skipped {skipped_recent} recent, {skipped_no_coverage} no-coverage.")
+         f"Skipped {skipped_recent} recent, {skipped_no_coverage} no-coverage, "
+         f"{skipped_shortfall} shortfall.")
     return Response.text("".join(out), content_type="text/plain")
 
 

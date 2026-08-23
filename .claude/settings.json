@@ -36,7 +36,11 @@
       "Write(*/session/stop-block-count)",
       "Edit(*/session/stop-block-count)",
       "Write(*.active-agent-*)",
-      "Edit(*.active-agent-*)"
+      "Edit(*.active-agent-*)",
+      "Write(~/AppData/Local/Temp/claude/**)",
+      "Edit(~/AppData/Local/Temp/claude/**)",
+      "Write(//tmp/claude/**)",
+      "Edit(//tmp/claude/**)"
     ]
   },
   "env": {
@@ -62,6 +66,11 @@
             "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/context-reads-gate.sh",
             "timeout": 20
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/task-output-read-advisory.sh",
+            "timeout": 10
           }
         ]
       },
@@ -492,6 +501,18 @@
             "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/sessionstart-orchestrator.sh",
             "timeout": 95
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/user-prompt-retrieval-inject.sh",
+            "timeout": 25,
+            "statusMessage": "auto-retrieving context for this message..."
           }
         ]
       }

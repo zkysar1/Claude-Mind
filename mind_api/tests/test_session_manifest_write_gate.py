@@ -1,18 +1,25 @@
-"""Unit + CLI tests for session-manifest-write-gate.py — g-115-840.
+"""Unit + CLI tests for session-manifest-write-gate.py — g-115-840 + g-115-6405.
 
-Asserts the gate honors `type: dir` manifest entries end-to-end. Closes the
-half-implementation bravo-probed in g-115-784 (verified 2026-05-16T11:22):
-writes under registered dir-type subtrees were blocked despite the parent
-dir being registered with `writer: agent` and `recovery_action: clear`.
+Asserts the gate honors `type: dir` manifest entries end-to-end (g-115-840) AND
+`glob: true` fnmatch-pattern entries (g-115-6405). Closes two half-
+implementations: writes under registered dir-type subtrees were blocked
+(g-115-784, verified 2026-05-16), and files registered via a glob pattern were
+blocked because the gate exact-matched the literal pattern string while
+snapshot/clear/orphan-scan honored it as an fnmatch pattern (g-115-6405).
 
-Cases (verification outcomes from g-115-840):
+Cases:
   1. scratch-child-file:        <agent>/session/scratch/foo.txt → allowed (registered_dir)
   2. scratch-grandchild-file:   <agent>/session/scratch/sub/foo.txt → allowed (registered_dir)
   3. scratch-sibling-file:      <agent>/session/scratch-other/foo.txt → blocked (control)
   4. unregistered-deep-path:    <agent>/session/foo/bar/baz.txt → blocked (control)
+  5. glob-registered:           <agent>/session/body-heartbeat-<sid>.json → allowed (registered_glob)
+  6. glob-control:              <agent>/session/body-heartbeat.json → blocked (no -<sid> segment)
+  7. unregistered-message:      block message names sync_tiers + wedge consequence
+  8. mode-dispatch:             assistant→warn/block, reader→info/allow, unknown→info/allow
+  9. out-of-scope:              path outside session/ → allowed (out_of_scope)
 
-Plus unit tests for the three new helpers:
-  - _load_manifest_entries returns (file_names, dir_names) correctly split
+Plus unit tests for the helpers:
+  - _load_manifest_entries returns (file_names, dir_names, glob_patterns, sync_tiers)
   - _path_under_registered_dir matches at any depth, exact-segment match
   - _find_owning_agent returns the 3-tuple (agent, basename, ancestor_dirs)
 
@@ -73,12 +80,19 @@ def _build_tmp_repo(tmp_path: Path, agent_mode: str = "autonomous"):
         "files:\n"
         "  - file: working-memory.yaml\n"
         "    writer: agent\n"
+        "    sync_tier: continuity\n"
         "  - file: scratch\n"
         "    type: dir\n"
         "    writer: agent\n"
         "    recovery_action: clear\n"
+        "    sync_tier: machine_local\n"
         "  - file: no-type-entry.txt\n"
-        "    writer: agent\n",
+        "    writer: agent\n"
+        "    sync_tier: ephemeral\n"
+        "  - file: body-heartbeat-*.json\n"
+        "    glob: true\n"
+        "    writer: agent\n"
+        "    sync_tier: continuity\n",
         encoding="utf-8",
     )
 
@@ -113,16 +127,22 @@ def gate_fixture(tmp_path: Path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_load_manifest_entries_splits_by_type(gate_fixture):
-    """g-115-840: dir-type and file-type entries must split into separate sets.
-    The legacy `_load_manifest_basenames` collapsed them, leaving dir entries
-    invisible to the write-gate dispatch.
+    """g-115-840 + g-115-6405: file / dir / glob entries split into separate
+    collections, and the distinct sync_tiers are returned sorted. The legacy
+    `_load_manifest_basenames` collapsed file/dir; before g-115-6405 the glob
+    pattern leaked into file_names as a literal string that never matched.
     """
     mod, _ = gate_fixture
-    files, dirs = mod._load_manifest_entries()
+    files, dirs, globs, tiers = mod._load_manifest_entries()
     assert files == {"working-memory.yaml", "no-type-entry.txt"}, (
-        "no-type entries must default to file-type"
+        "no-type entries must default to file-type; the glob pattern must NOT "
+        "leak into file_names"
     )
     assert dirs == {"scratch"}, "scratch is the sole dir-type entry"
+    assert globs == ["body-heartbeat-*.json"], "glob:true entries go to glob_patterns"
+    assert tiers == ["continuity", "ephemeral", "machine_local"], (
+        "sync_tiers are the sorted distinct declared tiers (drives the block message)"
+    )
 
 
 def test_load_manifest_entries_fail_open_on_missing(gate_fixture, monkeypatch):
@@ -130,7 +150,7 @@ def test_load_manifest_entries_fail_open_on_missing(gate_fixture, monkeypatch):
     mod, _ = gate_fixture
     monkeypatch.setattr(mod, "MANIFEST_PATH", Path("/nonexistent/manifest.yaml"))
     result = mod._load_manifest_entries()
-    assert result == (None, None)
+    assert result == (None, None, None, None)
 
 
 def test_path_under_registered_dir_matches_any_depth():
@@ -273,6 +293,97 @@ def test_registered_file_still_allowed(gate_fixture, capsys):
     )
 
 
+# ---------------------------------------------------------------------------
+# g-115-6405 — glob: true fnmatch entries + enriched message + mode dispatch
+# ---------------------------------------------------------------------------
+
+def test_glob_registered_file_passes(gate_fixture, capsys):
+    """Case 5: a basename matching a glob:true fnmatch pattern is registered and
+    must pass with reason registered_glob:<pattern>. Before the fix the gate
+    exact-matched the literal pattern string and falsely blocked real files
+    (dogfooded: body-heartbeat-<sid>.json blocked in autonomous mode)."""
+    mod, repo = gate_fixture
+    target = repo / "agents" / "delta" / "session" / "body-heartbeat-sess42.json"
+    rc, data = _invoke_main(mod, target, capsys)
+    assert rc == 0, f"expected exit 0 (allowed), got {rc}; data={data}"
+    assert data["allowed"] is True
+    assert data["reason"] == "registered_glob:body-heartbeat-*.json", (
+        f"expected registered_glob reason, got {data['reason']}"
+    )
+    assert data["basename"] == "body-heartbeat-sess42.json"
+
+
+def test_glob_control_nonmatching_blocks(gate_fixture, capsys):
+    """Case 6 (control): a basename that does NOT match any glob pattern still
+    blocks. `body-heartbeat.json` lacks the `-<sid>` segment that
+    `body-heartbeat-*.json` requires, so fnmatch rejects it — proving glob
+    matching is precise, not a blanket prefix allow."""
+    mod, repo = gate_fixture
+    target = repo / "agents" / "delta" / "session" / "body-heartbeat.json"
+    rc, data = _invoke_main(mod, target, capsys)
+    assert rc == 1, f"expected exit 1 (blocked), got {rc}; data={data}"
+    assert data["allowed"] is False
+    assert data["severity"] == "block"
+    assert "unregistered file 'body-heartbeat.json'" in data["reason"]
+
+
+def test_unregistered_message_names_tiers_and_wedge(gate_fixture, capsys):
+    """Case 7: the block message must name the valid sync_tiers (derived from
+    the manifest, not hardcoded — guard-426) AND the wedge consequence, so it
+    tells the writer HOW to register rather than only that the write failed."""
+    mod, repo = gate_fixture
+    target = repo / "agents" / "delta" / "session" / "unregistered-probe.json"
+    rc, data = _invoke_main(mod, target, capsys)
+    assert rc == 1
+    assert data["allowed"] is False
+    reason = data["reason"]
+    for tier in ("continuity", "ephemeral", "machine_local"):
+        assert tier in reason, f"block message must name sync_tier '{tier}'; got: {reason}"
+    assert "wedge" in reason or "invisible" in reason, (
+        f"block message must state the wedge consequence; got: {reason}"
+    )
+    # The legacy prefix the hook + existing consumers rely on is preserved.
+    assert "unregistered file 'unregistered-probe.json'" in reason
+
+
+def test_out_of_scope_path_passes(gate_fixture, capsys):
+    """Case 9: a path outside any agent's session/ is out-of-scope → allowed,
+    reason out_of_scope, agent/basename null."""
+    mod, repo = gate_fixture
+    target = repo / "core" / "scripts" / "foo.py"
+    rc, data = _invoke_main(mod, target, capsys)
+    assert rc == 0
+    assert data["allowed"] is True
+    assert data["reason"] == "out_of_scope"
+    assert data["agent"] is None
+
+
+@pytest.mark.parametrize(
+    "mode,expect_rc,expect_allowed,expect_sev",
+    [
+        ("assistant", 1, False, "warn"),   # assistant → warn, still blocks the write
+        ("reader", 0, True, "info"),       # reader → info, fail-open allow
+        ("bogus-mode", 0, True, "info"),   # unknown → info, fail-open allow
+    ],
+)
+def test_unregistered_mode_dispatch(
+    tmp_path, monkeypatch, capsys, mode, expect_rc, expect_allowed, expect_sev
+):
+    """Case 8: unregistered dispatch by agent-mode. Only autonomous (block) is
+    covered by the block-case tests above; this pins the other three branches —
+    assistant warns (rc 1, still refused), reader/unknown fail open (rc 0)."""
+    repo, manifest_path = _build_tmp_repo(tmp_path, agent_mode=mode)
+    monkeypatch.setenv("PROJECT_ROOT", str(repo))
+    mod = _import_gate()
+    monkeypatch.setattr(mod, "PROJECT_ROOT", str(repo))
+    monkeypatch.setattr(mod, "MANIFEST_PATH", manifest_path)
+    target = repo / "agents" / "delta" / "session" / "unregistered-probe.json"
+    rc, data = _invoke_main(mod, target, capsys)
+    assert rc == expect_rc, f"mode={mode}: expected rc {expect_rc}, got {rc}; data={data}"
+    assert data["allowed"] is expect_allowed
+    assert data["severity"] == expect_sev
+
+
 if __name__ == "__main__":
     # Allow running standalone (no pytest fixtures). Runs only the unit helpers
     # — the integration tests depend on pytest's capsys + monkeypatch fixtures.
@@ -285,9 +396,11 @@ if __name__ == "__main__":
         mod.PROJECT_ROOT = str(repo)
         mod.MANIFEST_PATH = manifest_path
 
-        files, dirs = mod._load_manifest_entries()
+        files, dirs, globs, tiers = mod._load_manifest_entries()
         assert files == {"working-memory.yaml", "no-type-entry.txt"}, files
         assert dirs == {"scratch"}, dirs
+        assert globs == ["body-heartbeat-*.json"], globs
+        assert tiers == ["continuity", "ephemeral", "machine_local"], tiers
         print("PASS test_load_manifest_entries_splits_by_type (standalone)")
 
         assert mod._path_under_registered_dir(("scratch",), {"scratch"}) is True

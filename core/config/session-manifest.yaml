@@ -1105,8 +1105,8 @@ files:
     required_when_idle: false
     required_when_running: false
 
-  - file: mdl-existing-corpus.jsonl
-    purpose: cached corpus snapshot for the MDL gate's description-length comparison at state-update time. A rebuildable cache derived from the live stores, not a record of anything — regenerating it is cheap, so ephemeral.
+  - file: mdl-existing-corpus.raw
+    purpose: cached corpus snapshot for the MDL gate's description-length comparison at state-update time. A rebuildable cache derived from the live stores, not a record of anything — regenerating it is cheap, so ephemeral. Extension is `.raw` (JSONL content) NOT `.jsonl` — it lives in agents/<agent>/temp/, and temp-drain-purge.sh Lane 1 reaps by EXTENSION against `_EPHEMERA_GLOB` (.log .txt .py .sh .err .raw .out .bak). `.jsonl` and `.json` are both absent from that set, so under the old name this transient scratch was invisible to Lane 1 and accumulated permanently (g-115-7247).
     writer: mdl_gate.py (via aspirations-state-update)
     recovery_action: clear
     sync_tier: ephemeral

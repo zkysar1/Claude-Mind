@@ -256,6 +256,11 @@ def test_derive_proof_error_shape_on_bogus_agent():
 
 GF = "gate_firings"
 SYM = "firings_paths"
+# The PRODUCTION arg shape (guard-920): every real call site passes
+# cfg.get("seam_symbols"), which is a LIST. A bare string still normalizes —
+# pinned separately below — but the pins that stand in for production must use
+# the shape production actually uses.
+SYMS = [SYM]
 
 
 class _Proc:
@@ -292,9 +297,9 @@ def test_symbol_check_requires_a_CALL_not_merely_an_import(tmp_path, monkeypatch
         tmp_path, monkeypatch,
         lambda rel: f"from _gate_log import {SYM}\n"
                     "rows = read(META / 'gate-firings.jsonl')\n")
-    r = scc._local_report(cfg["seam_commit"], cfg["consumers"], SYM)
+    r = scc._local_report(cfg["seam_commit"], cfg["consumers"], SYMS)
     assert r["seam_present"] is False
-    assert r["reason"] == f"consumers_do_not_call_{SYM}"
+    assert r["reason"] == "consumers_do_not_route_to_any_seam_symbol"
     assert set(r["missing"]) == set(cfg["consumers"])
 
 
@@ -311,7 +316,7 @@ def test_a_comment_mentioning_the_symbol_does_not_count_as_a_call(tmp_path, monk
         tmp_path, monkeypatch,
         lambda rel: f"# resolved via {SYM}() rather than a hardcoded filename\n"
                     "rows = read(META / 'gate-firings.jsonl')\n")
-    r = scc._local_report(cfg["seam_commit"], cfg["consumers"], SYM)
+    r = scc._local_report(cfg["seam_commit"], cfg["consumers"], SYMS)
     assert r["seam_present"] is False
     assert set(r["missing"]) == set(cfg["consumers"])
 
@@ -321,7 +326,7 @@ def test_symbol_check_passes_when_consumers_call_it(tmp_path, monkeypatch):
         tmp_path, monkeypatch,
         lambda rel: f"from _gate_log import {SYM}\n"
                     f"rows = [r for p in {SYM}(META) for r in parse(p)]\n")
-    r = scc._local_report(cfg["seam_commit"], cfg["consumers"], SYM)
+    r = scc._local_report(cfg["seam_commit"], cfg["consumers"], SYMS)
     assert r["seam_present"] is True
 
 
@@ -329,20 +334,25 @@ def test_missing_consumer_file_is_unreadable_not_silently_ok(tmp_path, monkeypat
     cfg = scc.STORES[GF]
     monkeypatch.setattr(scc, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(scc, "_git", lambda *a, **k: _Proc(0, ""))
-    r = scc._local_report(cfg["seam_commit"], cfg["consumers"], SYM)
+    r = scc._local_report(cfg["seam_commit"], cfg["consumers"], SYMS)
     assert r["seam_present"] is False
     assert {u["consumer"] for u in r["unreadable"]} == set(cfg["consumers"])
 
 
-def test_a_store_without_seam_symbol_is_unaffected(tmp_path, monkeypatch):
-    """The predicate is OPT-IN. utilization/gzip declare no seam_symbol, so the
-    absorbed check must not start gating them — a silent tightening of two
-    unrelated cutovers would be exactly the drift this migration must avoid."""
+def test_a_store_without_seam_symbols_is_unaffected(tmp_path, monkeypatch):
+    """The predicate is OPT-IN. `gzip` declares no seam_symbols, so the absorbed
+    check must not start gating it — a silent tightening of an unrelated cutover
+    would be exactly the drift this migration must avoid.
+
+    Re-pointed from `utilization` at g-358-28: that store now DECLARES symbols,
+    which is the whole point of the change. `gzip` is the remaining exemplar and
+    the reason this pin still has a subject."""
     monkeypatch.setattr(scc, "PROJECT_ROOT", tmp_path)   # no consumer files
     monkeypatch.setattr(scc, "_git", lambda *a, **k: _Proc(0, ""))
-    cfg = scc.STORES["utilization"]
-    assert "seam_symbol" not in cfg
-    r = scc._local_report(cfg["seam_commit"], cfg["consumers"], cfg.get("seam_symbol"))
+    cfg = scc.STORES["gzip"]
+    assert "seam_symbols" not in cfg
+    r = scc._local_report(cfg["seam_commit"], cfg["consumers"],
+                          cfg.get("seam_symbols"))
     assert r["seam_present"] is True
 
 
@@ -350,7 +360,7 @@ def test_registry_carries_the_gate_firings_cutover():
     cfg = scc.STORES[GF]
     assert cfg["field"] == "gate_firings_seam"
     assert cfg["flag"] == "GATE_FIRINGS_SEGMENTED"
-    assert cfg["seam_symbol"] == SYM
+    assert cfg["seam_symbols"] == SYMS
     assert len(cfg["seam_commit"]) == 40
     assert [Path(c).name for c in cfg["consumers"]] == [
         "gate-stats.py", "gate-retirement-eval.py", "override-ledger-consume.py"]
@@ -364,7 +374,7 @@ def test_the_real_consumers_still_call_the_seam_on_this_tree():
     pin here that reads real files rather than fixtures, deliberately.
     """
     cfg = scc.STORES[GF]
-    r = scc._local_report(cfg["seam_commit"], cfg["consumers"], SYM)
+    r = scc._local_report(cfg["seam_commit"], cfg["consumers"], SYMS)
     assert r["seam_present"] is True, r
 
 
@@ -397,8 +407,8 @@ def test_origin_main_losing_the_symbol_vetoes_an_otherwise_SAFE_fleet(monkeypatc
     out = json.loads(capsys.readouterr().out)
     assert rc == 2
     assert out["verdict"] == "UNSAFE"
-    assert out["reason"] == "origin_main_does_not_call_the_seam_symbol"
-    assert out["seam_symbol"]["missing"]
+    assert out["reason"] == "origin_main_does_not_call_the_seam_symbols"
+    assert out["seam_symbols"]["missing"]
 
 
 def test_unattested_entry_surfaces_which_consumer_diverged():
@@ -752,8 +762,9 @@ def test_cmd_check_fetches_worker_refs_and_passes_the_body_rows(monkeypatch, cap
     monkeypatch.setattr(scc, "_read_team_state",
                         lambda: ({"agent_status": {"alpha": row}}, None))
 
-    def spy(agent, seam, consumers, bodies=None):
+    def spy(agent, seam, consumers, bodies=None, seam_symbols=None):
         seen["bodies"] = bodies
+        seen["seam_symbols"] = seam_symbols
         return {"proven": True, "commit": "abc", "lane": "agent_namespace"}
 
     monkeypatch.setattr(scc, "derive_proof", spy)
@@ -767,3 +778,285 @@ def test_cmd_check_fetches_worker_refs_and_passes_the_body_rows(monkeypatch, cap
     assert seen.get("fetched") is True
     assert REF_SID in (seen.get("bodies") or {})
     assert out["worker_refs_fetch_ok"] is True
+    # Same wiring class, second parameter (): _prove_commit's tier 2 is
+    # unreachable unless cmd_check threads the store's declared symbols all the
+    # way down. An unthreaded seam_symbols makes the tier structurally dead
+    # while every unit test of the tier itself still passes.
+    assert seen.get("seam_symbols") == SYMS
+
+
+# ---------------------------------------------------------------- 
+# _calls_symbol's three measured defects. Each test below FAILS against the
+# pre-fix `f"{symbol}(" in _strip_comments(text).replace(f"import {symbol}","")`
+# and passes after — that discrimination is the point (guard-385: prove a regex
+# guard by injecting the defect, not by asserting the happy path).
+#
+# The two ORIGINAL protections are re-pinned first. They are what a careless
+# widening would destroy, and both failure directions are live here: the
+# false-NEGATIVE tests below want the predicate LOOSER, the false-ALL-CLEAR
+# tests want it TIGHTER, so a fix that only moves one way reddens the other.
+
+
+def test_calls_symbol_keeps_the_import_only_false_all_clear_closed():
+    """An `import symbol` nothing calls is the pre-seam state, not the seam."""
+    assert scc._calls_symbol("import firings_paths\n", "firings_paths") is False
+
+
+def test_calls_symbol_keeps_the_comment_false_all_clear_closed():
+    """guard-1685 referent trap: the token survives its own removal."""
+    src = "# firings_paths(x) is called below\npass\n"
+    assert scc._calls_symbol(src, "firings_paths") is False
+
+
+def test_calls_symbol_resolves_an_aliased_deferred_import():
+    """Defect (a), measured on core/scripts/_curation_predicate.py.
+
+    `from M import N as A` then `A()` is a genuine call to N with no literal N
+    at the call site. The old predicate stripped the file's one `import N` and
+    reported MISSING — the sole zero-token consumer of 17 was an artifact of
+    the checker, not a consumer off the seam.
+    """
+    src = ("from _utilization_store import utilization_of as _uo\n"
+           "def f(rec, counters):\n"
+           "    return _uo(rec, counters)\n")
+    assert scc._calls_symbol(src, "utilization_of") is True
+
+
+def test_calls_symbol_rejects_a_suffix_collision():
+    """Defect (c), the false-ALL-CLEAR direction: no left word boundary.
+
+    A revert renaming a public call to a private `_`-prefixed sibling used to
+    still report symbol_present, defeating _symbol_report's stated purpose.
+    """
+    for src in ("x = _get_backend(cfg)\n",
+                "x = maybe_get_backend(1)\n",
+                "x = mod._get_backend()\n"):
+        assert scc._calls_symbol(src, "get_backend") is False, src
+
+
+def test_calls_symbol_accepts_a_pep8_legal_space_before_the_paren():
+    """Defect (d): `\\s*` — same one-line fix as (c), opposite direction."""
+    assert scc._calls_symbol("x = get_backend (1)\n", "get_backend") is True
+
+
+def test_calls_symbol_accepts_attribute_access_on_the_real_name():
+    """`mod.get_backend()` IS a call to get_backend; only a NAME-prefix collision
+    is rejected. Pins that the left anchor did not over-tighten into (c)'s
+    mirror — the failure a suffix-collision fix invites."""
+    assert scc._calls_symbol("import mod\nmod.get_backend()\n",
+                             "get_backend") is True
+
+
+def test_name_mode_makes_a_bare_constant_testable():
+    """Defect (b): a module CONSTANT is never called, so a call-only predicate
+    makes a flag-named seam permanently unsatisfiable."""
+    src = ("from x import UTILIZATION_COUNTERS_SPOOLED\n"
+           "if UTILIZATION_COUNTERS_SPOOLED:\n    pass\n")
+    assert scc._calls_symbol(src, "UTILIZATION_COUNTERS_SPOOLED",
+                             "name") is True
+    assert scc._calls_symbol(src, "UTILIZATION_COUNTERS_SPOOLED") is False
+
+
+def test_name_mode_does_not_count_a_bare_import_as_use():
+    """The import-only false all-clear, one layer over into NAME mode."""
+    assert scc._calls_symbol("from x import FLAG\n", "FLAG", "name") is False
+
+
+def test_calls_symbol_refuses_an_unknown_kind():
+    import pytest
+    with pytest.raises(ValueError):
+        scc._calls_symbol("pass\n", "x", "bogus")
+
+
+def test_symbol_spec_normalizes_both_declaration_forms():
+    assert scc._symbol_spec("firings_paths") == ("firings_paths", "call")
+    assert scc._symbol_spec(
+        {"name": "FLAG", "kind": "name"}) == ("FLAG", "name")
+    assert scc._symbol_spec({"name": "FLAG"}) == ("FLAG", "call")
+
+
+def test_symbol_spec_refuses_a_malformed_entry():
+    import pytest
+    for bad in ({"name": "x", "kind": "bogus"}, {"kind": "call"}, "", None):
+        with pytest.raises(ValueError):
+            scc._symbol_spec(bad)
+
+
+def test_calls_symbol_degrades_on_unparseable_source():
+    """A consumer's syntax error is not this predicate's problem — it must not
+    raise out of the gate. Falls back to the literal name."""
+    assert scc._calls_symbol("def (\n", "firings_paths") is False
+    assert scc._calls_symbol("firings_paths(1)\ndef (\n",
+                             "firings_paths") is True
+
+
+def test_curation_predicate_now_reads_as_calling_utilization_of():
+    """The live 17-consumer table row that motivated this goal (step 4)."""
+    text = (SCRIPTS / "_curation_predicate.py").read_text(encoding="utf-8")
+    assert scc._calls_symbol(text, "utilization_of") is True
+
+
+# ---------------------------------------------------------------- 
+# The two-tier _prove_commit predicate (decision: , rationale doc
+# core/config/rationale/store-cutover-attestation-predicate.md).
+#
+# Tier 1 = byte-identity to origin/main. Tier 2 = per-file seam routing, reached
+# ONLY on divergence, scoped to the DIVERGING files only, opt-in per store.
+# Every branch below asserts the REASON rather than a coarse truthiness signal
+# (guard-1082): "refused" and "refused for the right cause" are different
+# claims, and only the second one pins a fail-closed gate.
+
+T2_SEAM = "0c0bb0073a37d8eef1a69849d3965ebab7f0d004"
+T2_COMMIT = "f" * 40
+T2_CISO = "2026-08-17T09:00:00"
+T2_CONSUMERS = ["core/scripts/a.py", "core/scripts/b.py"]
+
+
+def _t2_git(changed, blobs, ancestor_ok=True):
+    """Drive _prove_commit's three git calls without a real repo.
+
+    `blobs` maps a consumer path to its source AT THE PROOF COMMIT; a path
+    absent from the map is unreadable there (`git show` rc!=0), which is the
+    guard-487 branch.
+    """
+    def fake(*args, **kw):
+        if args[0] == "merge-base":
+            return _Proc(0 if ancestor_ok else 1, "")
+        if args[0] == "diff":
+            return _Proc(0, "\n".join(changed))
+        if args[0] == "show":
+            path = args[1].split(":", 1)[1]
+            if path in blobs:
+                return _Proc(0, blobs[path])
+            return _Proc(128, "", f"fatal: path '{path}' does not exist")
+        return _Proc(0, "")
+    return fake
+
+
+def _prove(monkeypatch, changed, blobs, seam_symbols, ancestor_ok=True):
+    monkeypatch.setattr(scc, "_git", _t2_git(changed, blobs, ancestor_ok))
+    return scc._prove_commit(T2_COMMIT, T2_CISO, T2_SEAM, T2_CONSUMERS, NOW,
+                             seam_symbols)
+
+
+def test_tier1_byte_identity_still_wins_and_carries_no_tier2_reason(monkeypatch):
+    """Tier 1 is tried FIRST and is strictly stronger. Its proven shape must
+    stay reason-less so the two tiers remain distinguishable at a glance."""
+    r = _prove(monkeypatch, [], {}, ["load_counters"])
+    assert r["proven"] is True
+    assert "reason" not in r
+    assert "routed" not in r
+
+
+def test_a_store_without_seam_symbols_still_refuses_on_divergence(monkeypatch):
+    """THE FAIL-CLOSED PIN (decision part 4, and the test the goal names).
+
+    The narrower tier is opt-in per store: a store whose seam nobody has
+    characterised cannot reach it, so divergence refuses exactly as before.
+    Asserting the REASON matters here — a store that reached tier 2 and passed
+    would also be 'not refused', and only the reason separates the two."""
+    r = _prove(monkeypatch, ["core/scripts/a.py"],
+               {"core/scripts/a.py": "load_counters(x)\n"}, None)
+    assert r["proven"] is False
+    assert r["reason"] == "consumers_diverge_from_main"
+    assert r["diff_files"] == ["core/scripts/a.py"]
+    # It never even looked at the routing, despite the file plainly routing.
+    assert "missing" not in r and "routed" not in r
+
+
+def test_tier2_proves_a_diverging_consumer_that_still_routes(monkeypatch):
+    """The whole point: 62 unrelated insertions must not break a proof when the
+    consumer still calls the seam. Reported under its OWN reason."""
+    r = _prove(monkeypatch, ["core/scripts/a.py"],
+               {"core/scripts/a.py": "import x\nrows = load_counters(META)\n"},
+               ["load_counters", "utilization_of"])
+    assert r["proven"] is True
+    assert r["reason"] == "seam_routed_despite_divergence"
+    assert r["routed"] == [{"consumer": "core/scripts/a.py",
+                            "symbol": "load_counters"}]
+
+
+def test_tier2_refuses_a_diverging_consumer_that_lost_the_call(monkeypatch):
+    """The residual-risk boundary. A diverging file off the seam is the pre-seam
+    state this gate exists to catch, and tier 2 must still catch it."""
+    r = _prove(monkeypatch, ["core/scripts/a.py"],
+               {"core/scripts/a.py": "rows = read(LEGACY_PATH)\n"},
+               ["load_counters"])
+    assert r["proven"] is False
+    assert r["reason"] == "diverging_consumers_do_not_route_to_seam"
+    assert r["missing"] == ["core/scripts/a.py"]
+
+
+def test_tier2_fails_closed_on_a_consumer_unreadable_at_the_proof_commit(monkeypatch):
+    """guard-487. A consumer missing at the box's own commit is indistinguishable
+    from the pre-seam state, so unreadable REFUSES — it is never skipped."""
+    r = _prove(monkeypatch, ["core/scripts/a.py"], {}, ["load_counters"])
+    assert r["proven"] is False
+    assert r["reason"] == "diverging_consumers_do_not_route_to_seam"
+    assert [u["consumer"] for u in r["unreadable"]] == ["core/scripts/a.py"]
+
+
+def test_tier2_is_scoped_to_the_DIVERGING_files_only(monkeypatch):
+    """Scoping claim, stated as a discrimination rather than asserted in prose.
+
+    b.py does NOT route to the seam, but it did not diverge either — tier 1
+    already settled it against origin/main. If tier 2 ever widened to all
+    consumers this proof would flip to refused."""
+    r = _prove(monkeypatch, ["core/scripts/a.py"],
+               {"core/scripts/a.py": "load_counters(META)\n",
+                "core/scripts/b.py": "rows = read(LEGACY_PATH)\n"},
+               ["load_counters"])
+    assert r["proven"] is True
+    assert r["reason"] == "seam_routed_despite_divergence"
+    assert [e["consumer"] for e in r["routed"]] == ["core/scripts/a.py"]
+
+
+def test_tier2_is_never_reached_when_ancestry_fails(monkeypatch):
+    """Ordering pin: seam-ancestry runs FIRST, so a box that does not contain
+    the seam commit cannot be rescued by routing evidence."""
+    r = _prove(monkeypatch, ["core/scripts/a.py"],
+               {"core/scripts/a.py": "load_counters(META)\n"},
+               ["load_counters"], ancestor_ok=False)
+    assert r["proven"] is False
+    assert r["reason"] == "seam_not_ancestor"
+
+
+def test_tier2_matches_a_bare_CONSTANT_via_kind_name(monkeypatch):
+    """The cutover FLAG is the most seam-defining token a store has, and a
+    constant is never called — so a call-only predicate would make a
+    flag-declaring store permanently unsatisfiable (g-358-27 defect b)."""
+    src = "if UTILIZATION_COUNTERS_SPOOLED:\n    rows = spooled()\n"
+    r = _prove(monkeypatch, ["core/scripts/a.py"], {"core/scripts/a.py": src},
+               [{"name": "UTILIZATION_COUNTERS_SPOOLED", "kind": "name"}])
+    assert r["proven"] is True
+    assert r["routed"][0]["symbol"] == "UTILIZATION_COUNTERS_SPOOLED"
+
+
+# --- the set normalizer and "calls >= 1" ----------------------------------
+
+def test_symbol_specs_normalizes_every_declared_shape():
+    assert scc._symbol_specs(None) == []
+    assert scc._symbol_specs([]) == []
+    assert scc._symbol_specs("f") == [("f", "call")]           # historical form
+    assert scc._symbol_specs(["f", "g"]) == [("f", "call"), ("g", "call")]
+    assert scc._symbol_specs([{"name": "C", "kind": "name"}]) == [("C", "name")]
+
+
+def test_calls_any_symbol_is_calls_AT_LEAST_ONE_not_calls_all():
+    """Measured: no single utilization symbol exceeds 12 of 17 consumers, so
+    'calls ALL' would be unsatisfiable BY DESIGN. Returns WHICH symbol matched
+    so a verdict is always attributable."""
+    specs = scc._symbol_specs(["load_counters", "utilization_of"])
+    assert scc._calls_any_symbol("x = utilization_of(r)\n", specs) == "utilization_of"
+    assert scc._calls_any_symbol("x = load_counters(p)\n", specs) == "load_counters"
+    assert scc._calls_any_symbol("x = read(LEGACY)\n", specs) is None
+
+
+def test_utilization_declares_the_seven_measured_reader_symbols():
+    """Registry pin (step 2). The flag is kind=name; the other six are calls."""
+    specs = scc._symbol_specs(scc.STORES["utilization"]["seam_symbols"])
+    assert len(specs) == 7
+    assert dict(specs)["UTILIZATION_COUNTERS_SPOOLED"] == "name"
+    assert {n for n, k in specs if k == "call"} == {
+        "load_counters", "utilization_of", "store_paths",
+        "load_all_counters", "counters_path", "segment_name"}

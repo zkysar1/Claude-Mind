@@ -38,7 +38,7 @@ except ImportError:
     print("PyYAML required: pip install pyyaml", file=sys.stderr)
     sys.exit(1)
 
-from _paths import resolve_file_path
+from _paths import _longpath_safe, resolve_file_path
 
 # Match channel scores for ranking (higher = more relevant)
 CHANNEL_SCORES = {
@@ -253,7 +253,30 @@ def _norm_separators(s):
 _PREFETCH_MIN_NODES = 50
 
 
-def _prefetch_tree_root(node_count):
+def _node_path(virtual_path, world_root=None):
+    """Resolve a VIRTUAL-prefixed tree path ("world/knowledge/tree/...").
+
+    ``world_root`` is the per-request world: a daemon endpoint's
+    ``ctx.paths.world``, or the swapped-in ``retrieve.WORLD_DIR``. When given,
+    the path derives from IT -- the same ``root / virtual[6:]`` join that
+    ``resolve_file_path`` performs, so the spelling `_prefetch_tree_root`
+    depends on is unchanged. When omitted, fall back to the module-level
+    resolver, which is correct in a fresh CLI process where ``_paths.WORLD_DIR``
+    was bound from this agent's conf.
+
+    Why the parameter exists (g-367-08): a long-lived daemon binds
+    ``_paths.WORLD_DIR`` ONCE at import. A daemon that started before its
+    world was configured holds None forever; one that started bound to agent A
+    serves agent B's requests against A's files. Neither is visible from the
+    config, which is correct on disk. The request context is the only root
+    that is right per call.
+    """
+    if world_root is not None and virtual_path.startswith("world/"):
+        return _longpath_safe(Path(world_root) / virtual_path[6:])
+    return resolve_file_path(virtual_path)
+
+
+def _prefetch_tree_root(node_count, world_root=None):
     """One bulk listing that warms the freshness cache for every node body the
     loop below is about to read. Optimization ONLY — never changes what a read
     returns, and never raises.
@@ -292,7 +315,7 @@ def _prefetch_tree_root(node_count):
     # below: an optimization must never break retrieval.
     try:
         from storage_backend import get_backend
-        get_backend().prefetch(resolve_file_path("world/knowledge/tree"))
+        get_backend().prefetch(_node_path("world/knowledge/tree", world_root))
     except Exception as e:
         try:  # report, never raise (g-306-218)
             from storage_backend import note_swallowed_backend_error
@@ -302,14 +325,17 @@ def _prefetch_tree_root(node_count):
             pass
 
 
-def build_concept_index(nodes):
+def build_concept_index(nodes, world_root=None):
     """Build entity-term -> [node_keys] index from .md front matter entities.
 
     Reads the `entities` list from each node's .md front matter.
     Returns dict mapping lowercase entity terms to lists of node keys.
+
+    ``world_root``: the per-request world root (see ``_node_path``). Daemon
+    callers MUST pass it; the CLI may omit it.
     """
     index = {}
-    _prefetch_tree_root(len(nodes))
+    _prefetch_tree_root(len(nodes), world_root)
     for key, node in nodes.items():
         file_path = node.get("file")
         if not file_path:
@@ -324,7 +350,7 @@ def build_concept_index(nodes):
         # resolver tree.py has used all along. Do NOT reintroduce PROJECT_ROOT
         # here — the failure is silent, because an empty index and a genuinely
         # entity-less corpus produce identical output.
-        md_path = resolve_file_path(file_path)
+        md_path = _node_path(file_path, world_root)
         fm = parse_front_matter(md_path)
 
         # confidence/capability_level are NOT read from .md — they live

@@ -225,6 +225,13 @@ SHARED_WM_CONSTANTS = (
     # of this list exists to pin. Only the literal EXTRA is pinned; the union
     # itself is derived from members already covered here.
     "APPEND_CREATABLE_EXTRA",
+    # : the READ path's key set. Unpinned until now, and its drift is
+    # SILENT IN THE WORST DIRECTION -- resolve_slot falls through to slots:,
+    # misses, and returns null, which is byte-identical to the answer for a key
+    # that does not exist. So a dropped member does not raise; it reports the
+    # value ABSENT (guard-2616). Joins this list rather than getting a bespoke
+    # check, per the CAPTURE_SLOTS note above.
+    "TOP_LEVEL_KEYS",
 )
 
 
@@ -265,8 +272,11 @@ def _extract_daemon_constants(daemon_src: str) -> dict:
 def test_shared_wm_constants_parity_with_daemon():
     """The daemon endpoint module (mind_api/src/endpoints/wm_write.py) is the
     LIVE runtime path for wm-reset.sh (POST /v1/wm/reset) and inlines its own
-    copies of six wm.py constants (package-relative imports prevent importing
-    wm.py there). Asserts ALL six stay in sync AND that the daemon's reset()
+    copies of the wm.py constants named in SHARED_WM_CONSTANTS (package-relative
+    imports prevent importing wm.py there). The count is deliberately NOT written
+    out here — it said "six" against a tuple of eight until g-306-354, because a
+    hand-carried number goes stale every time the tuple legitimately grows.
+    Asserts EVERY member stays in sync AND that the daemon's reset()
     actually consults RESET_SURVIVING_SLOTS — a wm.py-only edit silently does
     nothing at runtime, which is how the g-115-1992 bug class re-enters.
     AST-parses the daemon source instead of importing it (relative imports
@@ -296,6 +306,49 @@ def test_shared_wm_constants_parity_with_daemon():
     reset_body = daemon_src.split("def reset(", 1)[1].split("\ndef ", 1)[0]
     assert "RESET_SURVIVING_SLOTS" in reset_body, \
         "daemon reset() no longer consults RESET_SURVIVING_SLOTS (g-115-1992)"
+
+
+def test_top_level_keys_parity_with_read_endpoint():
+    """THIRD mirror of TOP_LEVEL_KEYS ().
+
+    The set is hand-copied in three places, and the parity test above covers
+    only TWO of them (wm.py <-> wm_write.py, the WRITE path). The READ path
+    mind_api/src/endpoints/wm.py carries a third copy under a different name,
+    `_TOP_LEVEL_KEYS`, and the name difference is why it fell outside
+    SHARED_WM_CONSTANTS' membership filter and was pinned by NOTHING.
+
+    Its own comment asserted "Cross-checked by mind_api/tests/test_runtime_wm.py".
+    Measured 2026-08-22: that file does not contain the string TOP_LEVEL_KEYS at
+    all. A false coverage claim is worse than none -- it retires the question for
+    every later reader. The comment is corrected; this test makes it true.
+
+    Verified by guard-3253 (exhaustive diff, never a newest-member spot-check):
+    compares the whole set both ways, so a DROPPED member fails as loudly as an
+    added one. That direction is the dangerous one -- a missing member makes
+    wm-read return null, indistinguishable from a key that does not exist.
+    """
+    import ast
+
+    read_path = CORE_ROOT.parent / "mind_api" / "src" / "endpoints" / "wm.py"
+    src = read_path.read_text(encoding="utf-8")
+
+    found = None
+    for node in ast.walk(ast.parse(src)):
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == "_TOP_LEVEL_KEYS"):
+            found = ast.literal_eval(node.value)
+
+    assert found is not None, (
+        "read endpoint lost its _TOP_LEVEL_KEYS mirror (or the name/shape "
+        "changed) — resolve_slot there decides top-level vs slots: with it"
+    )
+    assert set(found) == set(wm.TOP_LEVEL_KEYS), (
+        f"TOP_LEVEL_KEYS drift between wm.py and the READ endpoint: "
+        f"only-in-wm.py={sorted(set(wm.TOP_LEVEL_KEYS) - set(found))} "
+        f"only-in-endpoint={sorted(set(found) - set(wm.TOP_LEVEL_KEYS))} — "
+        f"all THREE copies must be edited together"
+    )
 
 
 def test_daemon_reset_endpoint_preserves_surviving_slot():

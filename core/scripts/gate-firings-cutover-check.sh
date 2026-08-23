@@ -24,8 +24,10 @@
 # WHAT IT DOES NOT LOSE: this gate's local predicate was never "match
 # origin/main", it was "the three consumers CALL firings_paths()" — strictly
 # stronger, and not expressible as byte-identity. It travels as
-# STORES["gate_firings"]["seam_symbol"] and is enforced in two places
-# (working-tree files locally, origin/main fleet-wide).
+# STORES["gate_firings"]["seam_symbols"] (a one-element set since  —
+# widened for `utilization`, whose consumers use different parts of one reader
+# API; "calls >= 1" over one element is the singular predicate, unchanged) and
+# is enforced in two places (working-tree files locally, origin/main fleet-wide).
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null

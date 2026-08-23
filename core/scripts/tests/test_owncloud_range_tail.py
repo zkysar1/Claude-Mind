@@ -307,3 +307,60 @@ def test_allowlist_covers_the_two_stores_the_goal_names(cloud):
     import owncloud_backend as B
     assert "world/board/" in B._RANGE_TAIL_STORES
     assert "world/changelog.jsonl" in B._RANGE_TAIL_STORES
+
+
+# --- 9. the  widening: new members, and what it must NOT swallow ----
+def test_allowlist_covers_every_class_a_store_the_goal_names(cloud):
+    """ item (1) is "implement the range read for class A", and that
+    goal names FIVE class-A (append-only, byte-range sound) stores. Only TWO
+    were reachable -- the board pair, via the "world/board/" prefix -- so the
+    feature shipped covering 2/5 of its own stated scope while every test here
+    passed. This pins all five plus the two changelogs g-358-17 shipped with.
+
+    The board pair is asserted by PREFIX rather than by channel name because
+    that is what the matcher actually uses; naming the channels would pin a
+    stronger claim than the code makes.
+    """
+    import owncloud_backend as B
+    assert "world/board/" in B._RANGE_TAIL_STORES
+    for rel in ("world/productivity-snapshots.jsonl",
+                "world/goal-duplication-overrides.jsonl",
+                "meta/trigger-firings.jsonl"):
+        assert rel in B._RANGE_TAIL_STORES, f"class-A store {rel} unreachable"
+    assert "world/changelog.jsonl" in B._RANGE_TAIL_STORES
+    assert "meta/changelog.jsonl" in B._RANGE_TAIL_STORES
+
+
+def test_widening_does_not_swallow_gate_firings_or_its_segments(cloud):
+    """guard-2201 pins what a widening must not LOSE (the REMOVED set); this
+    pins what it must not GAIN. Three near-misses sit beside the entries added
+    by g-115-5268 and all three must stay OUT:
+
+      meta/gate-firings.jsonl             g-358-03 MEASURED it shrinking, so the
+          md5 proof fails on every pull and the range GET is pure cost.
+          `_gate_log.py` calls it "(legacy, append-only)" -- that describes its
+          WRITE IDIOM (locked_append_jsonl), not its size trajectory, and
+          mistaking one for the other is precisely the trap this test keeps shut.
+      meta/gate-firings-YYYY-MM-DD.jsonl  date segments
+      meta/gate-firings.spool.jsonl       machine-local, never synced
+
+    A future widening reaching for "meta/gate-firings" as a PREFIX would pull in
+    all three silently. Asserted THROUGH the production predicate
+    (`rel == s or rel.startswith(s)`) rather than by eyeballing the tuple, so a
+    change to the matching rule is caught too.
+    """
+    import owncloud_backend as B
+
+    def matches(rel):
+        return any(rel == s or rel.startswith(s) for s in B._RANGE_TAIL_STORES)
+
+    for rel in ("meta/gate-firings.jsonl",
+                "meta/gate-firings-2026-08-21.jsonl",
+                "meta/gate-firings.spool.jsonl"):
+        assert not matches(rel), f"{rel} must stay outside the allowlist"
+
+    # POSITIVE CONTROL (guard-2421): without this, a `matches` that returned
+    # False for everything would make all three assertions above pass while
+    # asserting nothing at all.
+    assert matches("meta/trigger-firings.jsonl")
+    assert matches("world/board/general.jsonl")

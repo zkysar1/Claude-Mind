@@ -102,10 +102,43 @@ PathLike = Union[str, os.PathLike]
 # excluded by construction: the tail of a gzip stream is not a suffix of the
 # plaintext, so `_codec_head_plain_md5(head) is None` is a REQUIRED guard, not
 # a nicety.
+#
+# g-115-5268 widened this from 3 entries to 6, completing "implement the range
+# read for class A": that goal names FIVE class-A (append-only, byte-range
+# sound) stores and only TWO of them -- the two board channels, via the
+# "world/board/" prefix -- were reachable here. The three added below are the
+# remaining named members. Delta computed per guard-2201 against ONE corpus
+# snapshot (32,845 rel paths, both roots): OLD matched 20 paths, NEW matches 24,
+# REMOVED set EMPTY, and the four newly-matched paths are exactly the intended
+# files -- notably NOT `gate-firings-YYYY-MM-DD.jsonl` (date segments) nor
+# `gate-firings.spool.jsonl` (machine-local), neither of which starts with a
+# listed prefix.
+#
+# EVIDENCE for the three, measured rather than taken from the goal's class
+# table -- that table is explicitly untrustworthy (the goal's own item (2):
+# "3 of 5 prior class-A CANDIDATES were measured wrong"). For each, the newest
+# 40 S3 versions carry ZERO shrink events, and the local mirror is byte-exact
+# against head-object (1.00x). Remote sizes 5.32 MB / 4.19 MB / 1.27 MB.
+# The window is the honest limit: 40 versions need not span a retention sweep,
+# so this is consistent with append-only and does not PROVE it. It does not
+# have to -- correctness lives in the md5 proof below, and a wrong guess here
+# costs one small range GET before the full GET we would have done anyway.
+#
+# gate-firings.jsonl is DELIBERATELY NOT ADDED, and the reasoning is worth
+# keeping because it looked like the biggest win on the bill. `_gate_log.py`
+# calls it "(legacy, append-only)", which describes its WRITE IDIOM
+# (locked_append_jsonl), not its size trajectory; the line above records that
+# g-358-03 MEASURED it shrinking. A 40-version window showing no shrink cannot
+# overturn a measurement whose event is a periodic retention sweep. Its cost
+# case has also decayed: the goal cites 15.6% of GET egress from 2026-08-09
+# when the object was ~40 MB, and head-object now reads 3.82 MB.
 _RANGE_TAIL_STORES = (
     "world/board/",
     "world/changelog.jsonl",
     "meta/changelog.jsonl",
+    "world/productivity-snapshots.jsonl",
+    "world/goal-duplication-overrides.jsonl",
+    "meta/trigger-firings.jsonl",
 )
 
 # S3/DDB error codes that mean "object/item absent" across boto3 surfaces.

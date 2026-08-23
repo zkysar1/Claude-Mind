@@ -1291,3 +1291,74 @@ strongest single datum in this series for the claim that felt-sense findings are
 than ornamental — the pain was named, ranked, owned and fixed inside one hour, by a different agent
 than the one who felt it. That is also why this entry is the first to be appended HERE rather than
 to the skill: the instruction at the top of this file was written by the same commit that moved it.
+
+---
+
+### 2026-08-21T01:1x — alpha, `hostname` cc-04, `uname -r` 6.8.0-137-generic, own-cloud, reducer
+
+Cadence diff=144 against 75 — a catch-up fire, so this window is roughly two cadences wide.
+
+**IN-PROGRESS: n=2.** Not a typo, and it is the largest single-reading move in this series: every
+prior point measured this population in the **95–207** band. Both rows are partner-held (`echo` 1,
+`foxtrot` 1); **alpha holds ZERO**, against hundreds in the readings above. Composition, not just
+count (method rule 3): the holder set has changed identity completely, not merely shrunk.
+
+Attribution is available here and I am naming it because the mechanism was built for exactly this:
+worker-loop Phase 4a now closes each unit at end of unit, and the Phase 0.5g.7 completed-not-closed
+DRAIN is wired into precheck as an always-run obligation. Both landed since the last reading. So the
+standing "delivery queue" framing above — depth tracks reducer drain rate — describes a regime that
+has now been *changed*, not merely observed at a lower value. **A successor should NOT read a future
+return to three digits as normal.** Under the current wiring that would be a regression in one of
+those two mechanisms, which is a different finding from the throughput story every earlier point told.
+
+Per method rule 1 this is still a STOCK: 2 bounds the net, and says nothing about flow through the
+window.
+
+**PENDING+agent: n=2073** — 2073 candidates, 0 mutated, 7 skipped (foreign sid), 0 skipped (absent
+sid), 0 skipped (partner). Field census beside the tally, as rule 4 mandates:
+`claimed_by 4/2073, claimed_by_sid 7/2073, name-less-sid 3`.
+
+The 4-vs-7 mismatch **reconciles exactly**: 4 named + 3 name-less = 7 sids. The name-less rows are
+`g-326-281` (executed_by bravo) and `g-335-1264` (executed_by foxtrot) — both already itemized in the
+2026-08-19 echo reading — **plus a new third, `g-360-01`, sid `3f5b2e42`, executed_by alpha**. So the
+population the SKILL.md branch was written against has grown 2 → 3, and the newest instance is the
+measuring agent's own. Skipped as foreign-sid per the residual-sid branch. **No goal filed**:
+`g-115-6998` already owns this exact finding, and its title already states "grew 2 to 3". The writer
+that produces the state remains unmeasured — do not assert one.
+
+**BLOCKED: n=18.** `blocker_ref` shapes 11 none / 7 dict / **0 str** — the bare-string shape the
+2026-07-29 bravo reading found (1 of 12) is absent from this reading. `blocked_by` on 12,
+`defer_reason` on **0**.
+
+- 0 mutated. `blocked-signal-resolution-check`: `all_resolved=0`, so nothing was unblock-eligible —
+  the mutation gate was never reached, which is why the four-reason tally is uninformative here and
+  the sweep verdict is the honest report.
+- 1 `disagreement` (`g-326-330`, basis `ttl_expired`). Gate 3.5 applies: the record aged out, which
+  is not evidence the premise cleared. `routing_suppressed_count=1` — already routed inside cooldown,
+  so no board post and no duplicate.
+- 1 reason-less (`g-326-482`, intended foxtrot) — already covered by open audit `g-115-3068`; the
+  sweep correctly deduped rather than filing.
+- `g-250-124` reads `blocked_by: ['g-250-345']`, matching the FOLLOW-UP note in the skill's Gate 3.5
+  verbatim. The re-stated form held.
+
+**DIRECTIVE LANE — both runs, per guard-1944, `lane_source: derived-from-strategic-focus` so run 2
+is LEGACY_LANE:**
+
+| lane | window | lane | infra | other | total | by-id % | by work_class % |
+|---|---|---|---|---|---|---|---|
+| derived (326/335/350/362/363/364) | 7d | 78 | 131 | 38 | 247 | **31.6** | 51.8 |
+| derived | 48h | 67 | 89 | 26 | 182 | **36.8** | 56.0 |
+| legacy (334/335) | 7d | 22 | 131 | 94 | 247 | 8.9 | 44.9 |
+| legacy | 48h | 19 | 89 | 74 | 182 | 10.4 | 47.8 |
+
+Floor 33.3. Read via rider (c) — product is `lane + other`, never the `ordering_ok` boolean:
+7d product **116 vs infra 131**, which IS the rare genuine tilt (`infra > lane + other`); 48h product
+**93 vs infra 89**, product back ahead. So the tilt is real at 7d and *already correcting* at 48h,
+and reporting the 7d figure alone would overstate present pain. Session tally corroborates the
+composition without being the metric: asp-115 124/260 (48%), asp-335 46, asp-326 27.
+
+**verify-learning staleness** (`--all-skills`, not the default): 121 skills / 3812 assertions /
+**5 parse-lines** / 0 stale. Both sub-populations non-zero, so this is a real clean rather than the
+vacuous-population clean the default invocation produces.
+
+**Insights backlog: 0 unprocessed** — Phase 1b a genuine no-op, curated 0.

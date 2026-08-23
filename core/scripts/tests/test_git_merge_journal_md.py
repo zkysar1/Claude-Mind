@@ -257,3 +257,88 @@ def test_undecodable_side_refuses(tmp_path):
     bad = tmp_path / "bad.md"; bad.write_bytes(b"\xff\xfe\x00\x00bad bytes")
     rc = main(["drv", str(base), str(ours), str(bad), "p.md"])
     assert rc == 1
+
+
+# --- : two spurious-conflict defects, both live for weeks ----------
+# Both were found while evaluating this driver's pure core as the merge handler
+# for the knowledge-tree .md class. Each test below FAILS if its fix is
+# reverted -- that is the point, so neither can pass vacuously.
+
+def test_identical_section_with_differing_neighbours_merges_clean():
+    """DEFECT A. split_sections reattaches a trailing blank line to the block
+    that PRECEDES it, so byte-identical section content compares UNEQUAL raw
+    whenever the two sides' NEIGHBOURING sections differ -- the normal
+    cross-box case. The comparison must happen in _join form, which is already
+    what the conflict emitter and final assembly use.
+
+    base is DELIBERATELY empty. With a base that carries the section, the
+    base-aware fast-forward branch (defect B's fix, below) rescues this input
+    before the raw comparison is reached, and the pin passes even with THIS fix
+    reverted -- measured, the first version of this test was vacuous for exactly
+    that reason. An empty base is also the add/add daily-journal shape and the
+    own-cloud mirror's real call shape, so this is the case that matters."""
+    base = ""
+    ours = "## A\n1\n\n## B\n2\n\n## C\n3\n"
+    theirs = "## B\n2\n"
+
+    # The defect is only pinned if the RAW forms genuinely differ here; if they
+    # were equal this test would pass even with the fix reverted.
+    ours_b = _mod._group(split_sections(ours)[1])["B"]
+    theirs_b = _mod._group(split_sections(theirs)[1])["B"]
+    assert ours_b != theirs_b, "precondition: raw blocks must differ for this to bite"
+    assert _mod._join(ours_b) == _mod._join(theirs_b), "joined forms are identical"
+
+    merged, conflicts = merge_sections(base, ours, theirs)
+    assert conflicts == [], "identical content must not conflict on neighbour drift"
+    assert "<<<<<<<" not in merged
+    for marker in ("## A", "## B", "## C"):
+        assert marker in merged
+
+
+def test_one_sided_edit_fast_forwards_to_the_editing_side():
+    """DEFECT B. The both-sides branch never consulted base_map, so ANY
+    one-sided section edit conflicted even when the other side was provably
+    unchanged since base. That is the EDITED-section shape: a ledger whose
+    rows accumulate under a stable heading conflicted on every cross-box
+    append."""
+    merged, conflicts = merge_sections("## B\n2\n", "## B\n2 plus ours\n", "## B\n2\n")
+    assert conflicts == [], "theirs == base, so ours holds the only edit"
+    assert "2 plus ours" in merged
+    assert "<<<<<<<" not in merged
+
+
+def test_one_sided_edit_fast_forwards_mirror():
+    """The other direction must behave identically -- a fix that only handles
+    'ours edited' would be asymmetric, and this driver must be commutative."""
+    merged, conflicts = merge_sections("## B\n2\n", "## B\n2\n", "## B\n2 plus theirs\n")
+    assert conflicts == []
+    assert "2 plus theirs" in merged
+
+
+def test_fast_forward_branch_does_not_swallow_a_genuine_conflict():
+    """CONTROL for defect B's fix: when NEITHER side matches base, both edited
+    and the conflict must still surface. A fix that made everything merge
+    clean would be worse than the bug."""
+    merged, conflicts = merge_sections(
+        "## B\nbase\n", "## B\nours edit\n", "## B\ntheirs edit\n")
+    assert conflicts == ["B"]
+    assert "<<<<<<<" in merged
+
+
+def test_clean_merges_are_commutative():
+    """The own-cloud mirror needs both boxes to independently compute the same
+    bytes (unlike git, which converges on one commit). Commutativity is only
+    meaningful on a CLEAN merge -- a conflict block embeds ours/theirs labels,
+    so argument order legitimately changes that text."""
+    cases = [
+        ("## B\n2\n", "## A\n1\n\n## B\n2\n\n## C\n3\n", "## B\n2\n"),
+        ("## B\n2\n", "## B\n2 plus ours\n", "## B\n2\n"),
+        ("", "## 09:00 a\nours\n", "## 10:00 b\ntheirs\n"),
+    ]
+    for base, a, b in cases:
+        fwd, cf = merge_sections(base, a, b)
+        rev, cr = merge_sections(base, b, a)
+        assert cf == [] and cr == [], "precondition: these cases must merge clean"
+        assert sorted(x for x in fwd.split("\n") if x.strip()) == \
+               sorted(x for x in rev.split("\n") if x.strip()), \
+            "merge(a,b) and merge(b,a) must carry the same content"

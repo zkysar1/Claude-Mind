@@ -292,19 +292,78 @@ def test_untimestamped_goal_is_included_with_age_reported_unknown(tmp_path):
 
 
 def test_deliberate_user_routing_is_reported_not_escalated(tmp_path):
-    """A user_directive goal is counted and labelled, never emailed.
+    """A TRUE PARK — participants:['user'] only, plus a deliberate signal — is
+    counted and labelled, never emailed.
 
     Tagged rather than dropped: a silent skip is indistinguishable from a clean
     sweep, which is the failure this lane exists to correct.
+
+    THIS TEST PINNED THE BUG UNTIL 2026-08-21 (g-115-6991). Its fixture was named
+    `g-park` but used the `_goal` default `participants=("agent","user")`, so it
+    asserted that a JOINT goal carrying origin_signal=user_directive is skipped —
+    reproducing in the test the exact provenance-vs-routing confusion the
+    production predicate had. A park is a ROUTING SHAPE; the name was the only
+    thing park-like about it. The fixture now passes `participants=("user",)`,
+    which is what the docstring always claimed it was testing.
     """
     out = _run(tmp_path,
-               [_goal("g-park", 500, origin_signal="user_directive")],
+               [_goal("g-park", 500, participants=("user",),
+                      origin_signal="user_directive")],
                "--apply")
     assert out["skipped"]["deliberate"] == 1
     assert out["applied"] == 0
     rec = [r for r in out["results"] if r["goal_id"] == "g-park"]
     assert rec and rec[0]["reason"] == "deliberate_user_routing", \
         "the skip must state its reason, not vanish"
+
+
+def test_joint_goal_with_user_directive_origin_is_eligible(tmp_path):
+    """A ['agent','user'] goal is ELIGIBLE even when the user asked for it.
+
+    The regression this file exists to hold shut (g-115-6991). The predicate
+    tested `deliberate` — origin_signal provenance — alone, so every goal the
+    principal personally requested was suppressed from the digest. The filter was
+    positively correlated with importance: a goal carries
+    origin_signal=user_directive precisely BECAUSE the user asked, so the
+    strongest claim on their attention became the suppression criterion, and the
+    digest reported itself clean the whole time. Measured at fix time on the live
+    queue: 10 of 11 suppressed goals were joint, 5 of them HIGH.
+
+    Nothing FAILS when a digest under-reports — that is why this needs a test and
+    not just a fix. There is no error, no bounce, no red: the user simply never
+    hears about their own request, and the silence is indistinguishable from
+    having nothing to say.
+    """
+    out = _run(tmp_path,
+               [_goal("g-joint", 500, participants=("agent", "user"),
+                      origin_signal="user_directive")],
+               "--apply")
+    assert out["skipped"]["deliberate"] == 0, \
+        "a joint goal is not a park; provenance must not suppress it"
+    rec = [r for r in out["results"] if r["goal_id"] == "g-joint"]
+    assert rec and rec[0]["action"] != "skip", \
+        "the user's own directive must reach the digest, not be filtered by it"
+
+
+def test_user_only_without_deliberate_signal_is_still_eligible(tmp_path):
+    """`participants:['user']` alone is NOT a park — the deliberate half matters.
+
+    Guards the other direction, and the reason the fix is an AND rather than the
+    bare shape test. A user-only goal that nobody marked deliberate is ordinary
+    work waiting on the user, which is precisely what this digest exists to
+    surface; suppressing it would be a new instance of the same family the fix
+    removes. audit-user-to-agent.py already treats this shape as ACTIONABLE
+    (`shape == "user-only" and not deliberate` is its promote lane), so this
+    keeps the two consumers of that tag reconciled rather than merely
+    coincidentally agreeing on today's queue, where zero such goals exist.
+    """
+    out = _run(tmp_path,
+               [_goal("g-useronly", 500, participants=("user",))],
+               "--apply")
+    assert out["skipped"]["deliberate"] == 0, \
+        "shape alone must not suppress; a park needs the deliberate signal too"
+    rec = [r for r in out["results"] if r["goal_id"] == "g-useronly"]
+    assert rec and rec[0]["action"] != "skip"
 
 
 def test_goal_without_user_participant_is_not_in_population(tmp_path):

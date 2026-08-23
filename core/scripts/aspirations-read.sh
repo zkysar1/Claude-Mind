@@ -21,13 +21,20 @@ _RUNTIME_SELF="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
+# Shared unknown-flag refusal (, the sweep  mandated).
+# Sourced BEFORE _runtime.sh so the refusal is cheap and cannot be masked by a
+# daemon failure.
+# shellcheck disable=SC1091
+source "$CORE_ROOT/scripts/_argv_strict.sh"
+# ONE literal, referenced by BOTH the --help arm and the refusal, so the two
+# strings that must agree cannot drift apart ( fresh-eyes F-002).
+_ACCEPTED_FLAGS="--source <world|agent> | --id <asp-id> | --limit <N> | --active | --active-compact | --summary | --archive | --stepping-stones | --meta | --blocked"
+
 # --- Parse args -----------------------------------------------------------
 SOURCE_VAL="world"
 ASP_ID=""
 LIMIT=""
 declare -a FLAG_KEYS=()
-declare -a PASSTHROUGH=()
-declare -a PASSTHROUGH_SOURCE=()
 
 # Value-arg pattern: "${2-}" + safe shift handle the case where the user
 # passes a flag with no following value (e.g., `aspirations-read.sh --source`).
@@ -37,26 +44,46 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --source)
             SOURCE_VAL="${2-}"
-            PASSTHROUGH_SOURCE=(--source "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
-        --active)            FLAG_KEYS+=(active);          PASSTHROUGH+=("$1"); shift;;
-        --active-compact)    FLAG_KEYS+=(active_compact);  PASSTHROUGH+=("$1"); shift;;
-        --summary)           FLAG_KEYS+=(summary);         PASSTHROUGH+=("$1"); shift;;
-        --archive)           FLAG_KEYS+=(archive);         PASSTHROUGH+=("$1"); shift;;
-        --stepping-stones)   FLAG_KEYS+=(stepping_stones); PASSTHROUGH+=("$1"); shift;;
-        --meta)              FLAG_KEYS+=(meta);            PASSTHROUGH+=("$1"); shift;;
-        --blocked)           FLAG_KEYS+=(blocked);         PASSTHROUGH+=("$1"); shift;;
+        --active)            FLAG_KEYS+=(active);          shift;;
+        --active-compact)    FLAG_KEYS+=(active_compact);  shift;;
+        --summary)           FLAG_KEYS+=(summary);         shift;;
+        --archive)           FLAG_KEYS+=(archive);         shift;;
+        --stepping-stones)   FLAG_KEYS+=(stepping_stones); shift;;
+        --meta)              FLAG_KEYS+=(meta);            shift;;
+        --blocked)           FLAG_KEYS+=(blocked);         shift;;
         --id)
             ASP_ID="${2-}"
-            PASSTHROUGH+=(--id "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
         --limit)
             LIMIT="${2-}"
-            PASSTHROUGH+=(--limit "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
+        -h|--help)
+            # BEFORE the -*) arm: --help is a `-*` token, and refusing it with
+            # exit 2 would be a regression the refusal introduced rather than a
+            # defect it fixed (). Help exits 0.
+            argv_strict_help "$(basename "$0")" "[no positionals]" \
+                "$_ACCEPTED_FLAGS";;
+        -*)
+            # REFUSE (). This arm used to append the unknown flag to
+            # PASSTHROUGH and shift, on the strength of a comment reading
+            # "Unknown flag — ignored by daemon, kept for completeness". Both
+            # halves were false: PASSTHROUGH had NO READER anywhere in this file,
+            # so nothing was kept and nothing reached the daemon — the flag was
+            # simply dropped and the command answered a different question with
+            # rc=0. Measured on this box before the fix: `--summary --bogus-flag`
+            # returned rc=0, 3374 bytes of real output, EMPTY stderr.
+            # This is the loop's busiest read path, and an over-broad READ is the
+            # dangerous direction: a wrong write is caught by the mandated
+            # read-back, while a wrong read exits 0 and never looks like failure.
+            argv_strict_refuse_unknown "$(basename "$0")" "$1" "$_ACCEPTED_FLAGS";;
         *)
-            # Unknown flag — ignored by daemon, kept for completeness.
-            PASSTHROUGH+=("$1")
+            # POSITIONALS are still accepted-and-ignored, deliberately. This
+            # wrapper takes none, so any positional is already a caller error —
+            # but refusing them is a WIDER blast radius than this goal measured
+            # (guard-1562: never ship a refusal without enumerating what would
+            # newly fire), and it is the same boundary  and the
+            # pipeline-read.sh adoption drew. Documented here rather than hidden.
             shift;;
     esac
 done

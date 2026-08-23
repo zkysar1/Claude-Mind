@@ -206,9 +206,20 @@ try:
     # trigger worker-loop Phase 2.95 states in prose, evaluated here so BOTH
     # orchestrators get it (see the advisory note below).
     _blob = (g.get('title') or '') + ' ' + (g.get('description') or '')
+    # : the bare alternative 'multi-unit' was ANTI-CORRELATED with its
+    # target and is now anchored to a DECLARATIVE use. Measured over 2,127 open
+    # goals: 14 matched, 10 also matched an instructional phrase, and the 4 that
+    # hinged on the bare form were false positives every one -- prose ABOUT the
+    # mechanism (citing  by title, reporting the contract landed,
+    # describing a multi-unit session, naming this remedy). Zero true positives
+    # were lost. This is guard-2096's class: a text detector over a corpus that
+    # documents its own findings re-flags every correction it causes, loudest on
+    # the goals written about it -- so the FP rate GROWS as the mechanism earns
+    # more goals. Declaring a goal multi-unit still fires ('this is a multi-unit
+    # goal'); merely mentioning the word no longer does.
     _mu = re.search(
         r'one at a time|one per pass|one unit per|one PR (?:each|per)'
-        r'|multi-unit|one[- ]by[- ]one',
+        r'|this (?:goal )?is (?:a )?multi[- ]unit|one[- ]by[- ]one',
         _blob, re.I,
     )
     print(cb + chr(9) + t + chr(9) + (_mu.group(0) if _mu else ''))

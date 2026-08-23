@@ -505,6 +505,7 @@ def cmd_prune_legacy(args):
     deleted_dirs = 0
     skipped_recent = 0
     skipped_no_coverage = 0
+    skipped_shortfall = 0
     bytes_freed = 0
 
     # New-store storage roots that share .history/ with the legacy tree
@@ -574,6 +575,27 @@ def cmd_prune_legacy(args):
             if not new_manifests:
                 skipped_no_coverage += 1
                 continue
+            # Coverage is a COUNT comparison, not a presence check. A single
+            # manifest used to authorize deleting a subtree holding any number
+            # of legacy snapshots — measured on the live world store, 200
+            # snapshots sat under subtrees whose new-store dir held fewer
+            # manifests than the versions about to be destroyed. Presence of
+            # ONE successor says nothing about the other N-1.
+            #
+            # Refusing on a shortfall is the fail-safe direction: the worst
+            # case is retained bytes, and a retained subtree is re-evaluated
+            # on the next run. The old predicate's worst case was permanent
+            # loss of unrepresented versions (archive-before-delete.md step 2:
+            # a recovery layer is not verified until its contents are counted,
+            # not merely observed to exist).
+            if len(new_manifests) < len(snaps):
+                skipped_shortfall += 1
+                print(f"  [shortfall] Preserved: {leg_dir}  "
+                      f"({len(snaps)} legacy snapshot"
+                      f"{'s' if len(snaps) != 1 else ''}, only "
+                      f"{len(new_manifests)} manifest"
+                      f"{'s' if len(new_manifests) != 1 else ''} in new store)")
+                continue
 
             # Eligible. Compute bytes freed (informational), then delete.
             dir_bytes = 0
@@ -601,7 +623,8 @@ def cmd_prune_legacy(args):
     verb = "Deleted" if apply else "Would delete"
     print(f"{verb} {deleted_dirs} legacy subtree{'s' if deleted_dirs != 1 else ''} "
           f"({bytes_freed:,} bytes). "
-          f"Skipped {skipped_recent} recent, {skipped_no_coverage} no-coverage.")
+          f"Skipped {skipped_recent} recent, {skipped_no_coverage} no-coverage, "
+          f"{skipped_shortfall} shortfall.")
 
 
 # ---------------------------------------------------------------------------

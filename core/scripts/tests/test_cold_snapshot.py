@@ -186,7 +186,7 @@ def test_tarball_round_trips_manifest_content(tmp_path, monkeypatch):
     root = tmp_path / "world"
     (root / "knowledge" / "tree").mkdir(parents=True)
     payload = "# node\n\nirreplaceable content\n"
-    (root / "knowledge" / "tree" / "node.md").write_text(payload, encoding="utf-8")
+    (root / "knowledge" / "tree" / "node.md").write_bytes(payload.encode("utf-8"))
     monkeypatch.setattr(cs, "WORLD_DIR", root)
     monkeypatch.setattr(cs, "META_DIR", tmp_path / "nonexistent-meta")
     monkeypatch.setattr(cs, "AGENTS_DIR", None)

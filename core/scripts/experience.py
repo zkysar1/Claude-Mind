@@ -92,6 +92,21 @@ DEFAULT_FIELDS = {
 ARCHIVE_UNUSED_AFTER_DAYS = 30
 ARCHIVE_LOW_UTILITY_AFTER_DAYS = 90
 PROTECT_MIN_RETRIEVAL_COUNT = 5
+# RETIRED AS A LIVE CRITERION (, 2026-08-20) — kept defined because
+# core/config/memory-pipeline.yaml mirrors it and the daemon twin declares it,
+# but NO LONGER READ by cmd_archive_sweep. utility_ratio = times_useful /
+# retrieval_count, and times_useful is never written in practice: measured on
+# the 200 most-retrieved records on this box, times_useful was 0 on ALL 200
+# while 97 of them had retrieval_count >= 5. That list is rc-ranked and its
+# tail reaches rc=0, so it contains EVERY record that could satisfy the
+# rc>=5 half — making "0 records qualify" exhaustive, not a sample.
+# Consequence while it WAS read: the protection guard could never fire, and
+# rule (2) below (`utility_ratio < 0.2`) was true of every record, so a
+# criterion that reads like a utility test was a pure 90-day age cap.
+#  already fixed the RECOMPUTE that populates this field; that was
+# necessary and not sufficient, because the recompute now faithfully computes
+# 0/23 = 0.0. The writer (reflect-on-outcome, LLM-discretionary) is the
+# unreachable half, which is why both consumers moved to last_retrieved.
 PROTECT_MIN_UTILITY_RATIO = 0.5
 
 # ---------------------------------------------------------------------------
@@ -260,7 +275,26 @@ def validate_record(rec):
 # slug-<letter> records to a NONEXISTENT goal-id, which breaks the daemon --goal
 # read filter. Deriving the PARENT is the safe default (the parent always exists);
 # a decompose child attributing to its parent is a benign, pre-existing limitation.
-GOAL_ID_IN_EXP_ID_RE = re.compile(r"^exp-(g-(?:\d{3}-\d{2,4}|xw-\d{8}T\d{6}-\d{2}))-")
+# The trailing `(?:-|$)` — NOT a bare `-` — is load-bearing (). A bare
+# hyphen requires a SLUG after the goal-id, so a BARE `exp-<goal-id>` id (no
+# slug) never matched and its record stayed invisible to `experience-read --goal`
+# forever, un-repairable by experience-backfill-goal-id.py because that tool
+# derives through this same helper. Measured across all 7 agents / 6,696 records:
+# 220 such records (alpha 70, zeta 45, echo 37, bravo 31, foxtrot 22, delta 12,
+# charlie 3). `exp-` is the discriminating row — rejected by the old
+# predicate, accepted by this one (guard-2353: a boundary move needs a row on the
+# far side of the OLD boundary, or the suite has zero power over the change).
+#
+# TWIN — DO NOT EDIT THIS PATTERN ALONE (guard-130). It is mirrored at
+# mind_api/src/endpoints/experience_write.py::GOAL_ID_IN_EXP_ID_RE and the two
+# MUST stay literally identical. That copy is the one that RUNS: experience-add.sh
+# is daemon-only (no Python CLI fallback since 2026-05-14), so every real write
+# derives through the daemon's copy and this one fires only on core-side touches.
+# Widening only this file is therefore a silent no-op at write time — which is
+# exactly what happened to the  `xw-` widening, lost for months until
+#  found the two had diverged under a comment claiming they were
+# "lifted VERBATIM". A green core-side test proves nothing about the write path.
+GOAL_ID_IN_EXP_ID_RE = re.compile(r"^exp-(g-(?:\d{3}-\d{2,4}|xw-\d{8}T\d{6}-\d{2}))(?:-|$)")
 
 
 def derive_goal_id_from_id(rec_id):
@@ -763,6 +797,34 @@ def cmd_update_field(args):
     _update_meta()
     print(json.dumps(written["rec"], indent=2, ensure_ascii=False))
 
+def _retrieved_within(stats, today, days):
+    """True iff retrieval_stats.last_retrieved is within `days` of `today`.
+
+    The RECENCY signal that replaced utility_ratio in both archive-sweep
+    consumers (g-115-6898). Chosen over lifetime retrieval_count on purpose:
+    retrieval_count only ever GROWS, so keying the protection guard on it
+    would create a KEEP branch that returns before the age checks and can
+    never release its oldest members — the unbounded-keep shape of guard-4000.
+    last_retrieved DECAYS, so protection lapses when a record stops being used.
+    Also guard-893's own prescription for this store class, and guard-731's
+    reason not to key retirement on retrieval_count alone.
+
+    Measured before adopting it: last_retrieved is non-null on 191 of the 200
+    most-retrieved records, newest 2026-08-19 — i.e. it is actually written,
+    which is exactly what times_useful is not.
+
+    Unset / unparseable -> False (no usable signal, treat as not-recent).
+    """
+    last = stats.get("last_retrieved")
+    if not last:
+        return False
+    try:
+        last_date = date.fromisoformat(str(last)[:10])
+    except (ValueError, TypeError):
+        return False
+    return (today - last_date).days <= days
+
+
 def cmd_archive_sweep(args):
     """Sweep old/low-utility experience records to archive.
 
@@ -808,10 +870,17 @@ def cmd_archive_sweep(args):
         age_days = (today - created_date).days
         stats = rec.get("retrieval_stats", {})
         retrieval_count = stats.get("retrieval_count", 0)
-        utility_ratio = stats.get("utility_ratio", 0.0)
 
-        # Protection: never archive high-value experiences
-        if retrieval_count >= PROTECT_MIN_RETRIEVAL_COUNT and utility_ratio >= PROTECT_MIN_UTILITY_RATIO:
+        # Protection: never archive experiences that are BOTH heavily used and
+        # STILL being used. The second conjunct was utility_ratio >= 0.5 until
+        # ; see PROTECT_MIN_UTILITY_RATIO for why that made this
+        # branch unreachable on every record in the corpus (0 of 4,175 when
+        # first measured 2026-08-04, still 0 of the 97 rc>=5 records on
+        # 2026-08-20). "Recently retrieved" is the live half of the same idea
+        # and it DECAYS, so this KEEP branch cannot accumulate members it will
+        # never release (guard-4000).
+        if (retrieval_count >= PROTECT_MIN_RETRIEVAL_COUNT
+                and _retrieved_within(stats, today, ARCHIVE_UNUSED_AFTER_DAYS)):
             continue
 
         # Archive: never retrieved after 30 days
@@ -821,8 +890,18 @@ def cmd_archive_sweep(args):
             to_archive.append(rec)
             continue
 
-        # Archive: low utility after 90 days
-        if age_days >= ARCHIVE_LOW_UTILITY_AFTER_DAYS and utility_ratio < 0.2:
+        # Archive: old AND not retrieved for just as long. The second conjunct
+        # was utility_ratio < 0.2 until  — true of EVERY record
+        # (utility_ratio is 0.0 corpus-wide), which made this a pure age cap
+        # wearing a utility criterion's clothes. Keying it on last_retrieved
+        # makes it an actual use test, and it is strictly LESS destructive than
+        # what it replaces: the old form archived every record past 90 days,
+        # the new form archives the subset of those that nothing has read since.
+        # Distinct from rule (1) above, which fires on retrieval_count == 0 —
+        # NEVER retrieved. This one catches records that were used once and
+        # then went cold, which rule (1) can never see.
+        if (age_days >= ARCHIVE_LOW_UTILITY_AFTER_DAYS
+                and not _retrieved_within(stats, today, ARCHIVE_LOW_UTILITY_AFTER_DAYS)):
             rec["archived"] = True
             rec["archived_date"] = today.isoformat()
             to_archive.append(rec)

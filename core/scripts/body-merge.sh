@@ -54,12 +54,20 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # same change (its cross-reference above says ~L1419; the real site is ~L1520 —
 # line numbers in cross-references drift, names do not).
 #
-# STILL OPEN, and it is the LAST of the four: encoding_capture has no consumer at
-# all. Same census discipline as above — 0 mentions in the file both wm.py and
-# wm_write.py name as its consumer (aspirations-state-update/SKILL.md), no bridge
-# to encoding_queue, 132 live entries unread in the reducer WM. Owner is 
-# (HIGH, pending), half-shipped: producer landed, reducer half did not. Copy the
-# exp_capture shape above — feed an existing writer, never become a second encoder.
+# CLOSED 2026-08-22 () — encoding_capture NOW HAS A CONSUMER, and it
+# took exactly the shape this paragraph prescribed. `worker_retrospective.py`
+# RUN_LANES is ("team_state","journal","findings","experience","encoding","impk")
+# at L133; ENC_SLOT = "encoding_capture" (L164); `_lane_encoding` (L666) is
+# dispatched at L788 and `load_enc_captures` (L496) is called at L933/L947. So
+# 's reducer half landed: it feeds an existing writer rather than
+# becoming a second encoder, exactly as advised. All four capture lanes now have
+# drains. Corrected in the same change: wm.py (~L513), wm_write.py (~L113),
+# iteration-close.sh (~L1656). ORIGINAL, retained because its census discipline
+# and its "feed an existing writer" advice are still right:
+#   "STILL OPEN, and it is the LAST of the four: encoding_capture has no consumer
+#    at all ... Owner is  (HIGH, pending), half-shipped: producer landed,
+#    reducer half did not. Copy the exp_capture shape above — feed an existing
+#    writer, never become a second encoder."
 #
 # The surviving lanes are MERGE-scoped, not
 # slot-scoped: argparse REQUIRES --goal-ids or --from-merge-summary, and

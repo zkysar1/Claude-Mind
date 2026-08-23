@@ -210,16 +210,27 @@ def test_file_line_out_of_range_fires_fix_landed(tmp_path):
     assert any("past EOF" in s for s in result["signals"])
 
 
-def test_file_missing_fires_fix_landed(tmp_path):
-    """Unblock naming a non-existent file should produce probable-fix-landed."""
+def test_file_never_existed_scores_zero(tmp_path):
+    """A path with NO git history is no evidence at all — not fix-landed.
+
+    Absence must mean the same thing on the file axis as on the commit axis
+    (an unresolvable hash scores 0). Before g-115-7291 the file axis scored a
+    not-found path +1.0 fix-landed, so a single bogus file_ref — from prose, a
+    typo, a rename, another repo — flipped the verdict to verify-and-close on a
+    live defect, with a confident citation attached. The genuinely-deleted case
+    (present in git history, gone at HEAD) still scores fix-landed; the
+    fix-landed direction is covered by test_file_line_out_of_range_fires_fix_landed.
+    """
     world = tmp_path / "world"
     world.mkdir()
     text = "Bug at core/scripts/does-not-exist-xyz.py:42 — file should be gone"
     goals = [_make_goal("g-test-06", "Unblock: missing file ref", text)]
     _write_queue(world, goals)
     result = _run_probe(world, "g-test-06")
-    assert result["status"] == "probable-fix-landed"
-    assert any("does not exist" in s for s in result["signals"])
+    assert result["status"] == "inconclusive"
+    assert result["recommendation"] == "execute-normally"
+    # "has no git history" proves the never-existed branch fired, not file-deleted
+    assert any("has no git history" in s for s in result["signals"])
 
 
 # ── Empty/edge inputs ────────────────────────────────────────────────────

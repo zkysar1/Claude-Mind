@@ -87,10 +87,17 @@ STATUS_UNREACHABLE = "unreachable"
 COMPLETE = "complete"
 PARTIAL = "partial"
 
-# Stores searched per world. Both are world-contract elements: board channels are
-# "Signals/events", the knowledge tree and conventions are "State / data objects".
+# Stores searched per world -- all world-contract elements: board channels are
+# "Signals/events"; the knowledge tree, conventions, reasoning bank and
+# guardrails are "State / data objects". The two JSONL stores joined
+# 2026-08-21: they hold the hardest-won lessons (incidents, prescriptive
+# rules) and were previously invisible here, so a peer's incident knowledge
+# could only arrive if the peer happened to publish it to a board.
 SKIP_BOARD_SUFFIXES = ("-reads.jsonl",)
 BOARD_TEXT_FIELDS = ("text", "subject", "summary")
+WORLD_JSONL_STORES = (("reasoning-bank.jsonl", "reasoning-bank"),
+                      ("guardrails.jsonl", "guardrails"))
+RECORD_TEXT_FIELDS = ("title", "rule", "content", "when_to_use", "trigger_condition")
 
 
 def _die(code, msg):
@@ -114,8 +121,27 @@ def _terms(query):
 
 
 def _matches(haystack, terms):
-    low = haystack.lower()
+    return _matches_low(haystack.lower(), terms)
+
+
+def _matches_low(low, terms):
     return all(t in low for t in terms)
+
+
+def _score(low, terms):
+    """Rank a matched doc. AND-matching decides WHAT is a hit (unchanged --
+    the `empty`-licenses-a-negative contract must neither widen nor narrow);
+    this decides only ORDER. Pre-2026-08-21 the order was glob order with an
+    early break at the limit, so the alphabetically-first N matches
+    masqueraded as the best N. Term frequency is capped at 3 per term (a
+    spammy doc must not swamp the slate); the whole query appearing as an
+    adjacent phrase earns a flat bonus."""
+    s = 0.0
+    for t in terms:
+        s += min(low.count(t), 3)
+    if len(terms) > 1 and " ".join(terms) in low:
+        s += 2.0
+    return s
 
 
 def _snippet(text, terms, width=180):
@@ -169,9 +195,10 @@ def _iter_board_rows(world_dir, include_archives=False, errors=None):
             # tail line is normal in an append-only JSONL store and MUST NOT flag
             # (it always has >=1 good row before it), and any ratio threshold would
             # be arbitrary. An EMPTY file is parsed=0 failed=0 and correctly stays
-            # clean -- it genuinely has nothing. Note this runs only when the
-            # generator is EXHAUSTED; an early `break` on a filled limit abandons
-            # it, which is right, because that lane already has hits to report.
+            # clean -- it genuinely has nothing. This runs only when the
+            # generator is EXHAUSTED; since the 2026-08-21 rank-then-truncate
+            # change every caller exhausts it (no early break), so the check
+            # now fires on every scan.
             if failed and not parsed and errors is not None:
                 errors.append("%s (no parseable rows in %d line(s))" % (base, failed))
 
@@ -180,27 +207,81 @@ def _board_text(row):
     return " ".join(str(row.get(f) or "") for f in BOARD_TEXT_FIELDS)
 
 
-def _search_docs(world_dir, terms, limit, subdir, pattern, store, errors=None):
+def _search_docs(world_dir, terms, subdir, pattern, store, errors=None):
     hits = []
     root = os.path.join(str(world_dir), subdir)
     if not os.path.isdir(root):
         return hits
     for path in sorted(glob.glob(os.path.join(root, pattern), recursive=True)):
-        if len(hits) >= limit:
-            break
         try:
             body = open(path, encoding="utf-8", errors="replace").read()
         except OSError:
             if errors is not None:
                 errors.append(os.path.relpath(path, str(world_dir)))
             continue
-        if _matches(body, terms):
+        low = body.lower()
+        if _matches_low(low, terms):
             hits.append({
                 "store": store,
                 "ref": os.path.relpath(path, str(world_dir)),
                 "author": None,
                 "snippet": _snippet(body, terms),
+                "score": _score(low, terms),
             })
+    return hits
+
+
+def _search_jsonl_store(world_dir, terms, filename, store, errors=None):
+    """Record-wise search of a top-level JSONL store (reasoning bank,
+    guardrails). Matching runs on the RAW line -- a JSONL line IS the
+    record's full text, so category/tags fields can hit without a field
+    list; every line is parsed regardless for the torn-line accounting.
+    Non-active records are dropped after matching. Torn-line policy mirrors
+    _iter_board_rows: a single torn tail line is normal in an append-only
+    store; a file that OPENED but parsed nothing is UNREADABLE, not empty.
+    An ABSENT store file is legitimately empty (fresh worlds carry no
+    reasoning bank yet) -- absence is not flagged."""
+    path = os.path.join(str(world_dir), filename)
+    hits = []
+    if not os.path.exists(path):
+        return hits
+    try:
+        fh = open(path, encoding="utf-8", errors="replace")
+    except OSError:
+        if errors is not None:
+            errors.append(filename)
+        return hits
+    with fh:
+        parsed = 0
+        failed = 0
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except (ValueError, TypeError):
+                failed += 1
+                continue
+            if not isinstance(rec, dict):
+                failed += 1
+                continue
+            parsed += 1
+            low = line.lower()
+            if not _matches_low(low, terms):
+                continue
+            if str(rec.get("status", "active")) != "active":
+                continue
+            text = " ".join(str(rec.get(f) or "") for f in RECORD_TEXT_FIELDS)
+            hits.append({
+                "store": store,
+                "ref": rec.get("id"),
+                "author": None,
+                "snippet": _snippet(text or line, terms),
+                "score": _score(low, terms),
+            })
+        if failed and not parsed and errors is not None:
+            errors.append("%s (no parseable rows in %d line(s))" % (filename, failed))
     return hits
 
 
@@ -212,27 +293,32 @@ def search_world_dir(world_dir, terms, limit=5, include_archives=False):
     the lane INCOMPLETE: a world whose files were partly unreadable has not been
     searched, however many hits the readable part happened to yield.
     """
-    results = []
+    cands = []
     unreadable = []
     for base, row in _iter_board_rows(world_dir, include_archives, errors=unreadable):
-        if len(results) >= limit:
-            break
         blob = _board_text(row)
-        if blob and _matches(blob, terms):
-            results.append({
+        low = blob.lower()
+        if blob and _matches_low(low, terms):
+            cands.append({
                 "store": "board/" + base,
                 "ref": row.get("id"),
                 "author": row.get("author"),
                 "snippet": _snippet(blob, terms),
+                "score": _score(low, terms),
             })
-    if len(results) < limit:
-        results += _search_docs(world_dir, terms, limit - len(results),
-                                os.path.join("knowledge", "tree"), "**/*.md",
-                                "knowledge-tree", errors=unreadable)
-    if len(results) < limit:
-        results += _search_docs(world_dir, terms, limit - len(results),
-                                "conventions", "*.md", "conventions", errors=unreadable)
-    return results, unreadable
+    cands += _search_docs(world_dir, terms, os.path.join("knowledge", "tree"),
+                          "**/*.md", "knowledge-tree", errors=unreadable)
+    cands += _search_docs(world_dir, terms, "conventions", "*.md",
+                          "conventions", errors=unreadable)
+    for filename, store in WORLD_JSONL_STORES:
+        cands += _search_jsonl_store(world_dir, terms, filename, store,
+                                     errors=unreadable)
+    # Rank globally across stores, THEN truncate. Pre-2026-08-21 the limit was
+    # applied per-store in scan order (board first), so five early board rows
+    # could shut out an exact tree/convention/reasoning-bank match entirely.
+    # Deterministic tie-break so identical corpora rank identically everywhere.
+    cands.sort(key=lambda r: (-r["score"], r["store"], str(r["ref"] or "")))
+    return cands[:limit], unreadable
 
 
 def resolve_peer_world_dir(env_id, registry_entry):
@@ -314,22 +400,24 @@ def channel_lane(self_world_dir, env_id, terms, limit, include_archives):
     peer CHOSE to publish, so it can never stand in for the direct lane.
     """
     suffix = "@" + env_id
-    results = []
+    cands = []
     unreadable = []
     for base, row in _iter_board_rows(self_world_dir, include_archives, errors=unreadable):
-        if len(results) >= limit:
-            break
         author = str(row.get("author") or "")
         if not author.endswith(suffix):
             continue
         blob = _board_text(row)
-        if blob and _matches(blob, terms):
-            results.append({
+        low = blob.lower()
+        if blob and _matches_low(low, terms):
+            cands.append({
                 "store": "board/" + base,
                 "ref": row.get("id"),
                 "author": author,
                 "snippet": _snippet(blob, terms),
+                "score": _score(low, terms),
             })
+    cands.sort(key=lambda r: (-r["score"], r["store"], str(r["ref"] or "")))
+    results = cands[:limit]
     return {
         "lane": "channel",
         "status": STATUS_HIT if results else STATUS_EMPTY,

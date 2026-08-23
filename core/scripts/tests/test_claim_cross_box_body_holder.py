@@ -303,12 +303,120 @@ def test_cross_box_body_row_other_sid_allows():
             assert _goal(world).get("claimed_by_sid") == CLAIMER_SID
 
 
+def _seed_carrier(project_root: Path, agent: str, sid: str, *, ts: str,
+                  body_state: str | None = None) -> None:
+    """The SECOND independent-writer signal ().
+
+    Mirrors `heartbeat-tick.sh`'s carrier write, at the agent-wide `session/`
+    (singular) dir — NOT `sessions/<sid>/`, which is machine-local and
+    walk-pruned from sync, which is the whole reason this syncable twin exists.
+    """
+    sess = project_root / "agents" / agent / "session"
+    sess.mkdir(parents=True, exist_ok=True)
+    doc: dict = {"sid": sid, "agent": agent, "host": "test-box", "ts": ts}
+    if body_state is not None:
+        doc["body_state"] = body_state
+    (sess / f"body-heartbeat-{sid}.json").write_text(
+        json.dumps(doc), encoding="utf-8")
+
+
+# --- F. THE  FIX: NO row at all + FRESH carrier -> REFUSE ----------
+def test_absent_body_row_with_fresh_carrier_is_refused():
+    """The measured 2026-08-19T08:20:59 shape, which  did NOT cover.
+
+    The per-SID row is written FAIL-OPEN, so a live worker Body can hold the
+    claim with NO `in_flight_bodies` evidence anywhere — a failed write, or a
+    caller with no MIND_SID. Before this fix the consumer read that absence as
+    "the holder is DORMANT" and handed the goal to a second Body of the same
+    agent; two Bodies then built one goal and 34 minutes of work was discarded.
+    Absent evidence is UNANSWERED, so the independent-writer carrier decides.
+    """
+    os.environ["STORAGE_BACKEND"] = "local"
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _make_world(Path(tmpd))
+        # NO body_sid -> the shard carries no `in_flight_bodies` key at all.
+        _seed_shard(world, "alpha", last_active=_now())
+        with DaemonFixture(world, agent="alpha") as df:
+            _seed_reducer_session(df.project_root, "alpha",
+                                  running_sid=CLAIMER_SID)
+            _seed_carrier(df.project_root, "alpha", HOLDER_SID, ts=_now())
+            code, body = _claim(df.port, "alpha", CLAIMER_SID)
+            assert code == 409, (
+                "a live cross-box Body with a FRESH heartbeat carrier must be "
+                "refused even when its fail-open in_flight_bodies row was "
+                f"never written (g-306-328); got {code}: {body}")
+            assert HOLDER_SID in body, body
+            assert _goal(world).get("claimed_by_sid") == HOLDER_SID
+
+
+# --- G. FAIL-OPEN PRESERVED: NO row + STALE carrier -> allow ----------------
+def test_absent_body_row_with_stale_carrier_still_allows():
+    """The direction that must NOT change, and the guard-1562 trade.
+
+    With no row AND no fresh carrier there is still no positive evidence of
+    life, so the take-over proceeds exactly as it does today. This is what keeps
+    the fix from wedging every claim on a box whose telemetry writes are broken:
+    the change can only NARROW the take-over window, never widen it.
+    """
+    os.environ["STORAGE_BACKEND"] = "local"
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _make_world(Path(tmpd))
+        _seed_shard(world, "alpha", last_active=_now())
+        with DaemonFixture(world, agent="alpha") as df:
+            _seed_reducer_session(df.project_root, "alpha",
+                                  running_sid=CLAIMER_SID)
+            _seed_carrier(df.project_root, "alpha", HOLDER_SID,
+                          ts=_ago(STALE_MINUTES * 10))
+            code, body = _claim(df.port, "alpha", CLAIMER_SID)
+            assert code == 200, (
+                "a STALE carrier is ambiguous, not evidence of life, and must "
+                f"never ground a refusal; got {code}: {body}")
+            assert _goal(world).get("claimed_by_sid") == CLAIMER_SID
+
+
+# --- H. A CLOSED Body is not live, however fresh its last stamp -------------
+def test_absent_body_row_with_closed_body_state_allows():
+    """`body_state` may WITHDRAW liveness but never assert it.
+
+    A Body that closed deliberately stamps its carrier on the way out, so
+    freshness alone would hold its claim hostage. The CLOSED SET is tested
+    explicitly rather than "not active", because `parked` is RESUMABLE
+    (g-306-291) and a parked Body is alive.
+    """
+    os.environ["STORAGE_BACKEND"] = "local"
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _make_world(Path(tmpd))
+        _seed_shard(world, "alpha", last_active=_now())
+        with DaemonFixture(world, agent="alpha") as df:
+            _seed_reducer_session(df.project_root, "alpha",
+                                  running_sid=CLAIMER_SID)
+            _seed_carrier(df.project_root, "alpha", HOLDER_SID, ts=_now(),
+                          body_state="closed-pending-merge")
+            code, body = _claim(df.port, "alpha", CLAIMER_SID)
+            assert code == 200, (
+                "a CLOSED Body's claim must remain takeable however fresh its "
+                f"final carrier stamp; got {code}: {body}")
+            assert _goal(world).get("claimed_by_sid") == CLAIMER_SID
+
+
+    #  — registered here as well as collected by pytest: this file has
+    # a main() runner too, and an unregistered case is silently skipped by the
+    # invisible-half suite while looking entirely present in the diff.
+    test_absent_body_row_with_fresh_carrier_is_refused,
+    test_absent_body_row_with_stale_carrier_still_allows,
+    test_absent_body_row_with_closed_body_state_allows,
+
+
 TESTS = [
     test_cross_box_live_body_holder_is_refused,
     test_cross_box_stale_body_row_fails_open,
     test_cross_box_body_row_other_goal_allows,
     test_agent_keyed_in_flight_alone_still_allows_takeover,
     test_cross_box_body_row_other_sid_allows,
+    # , re-landed  — the absent-row escalation.
+    test_absent_body_row_with_fresh_carrier_is_refused,
+    test_absent_body_row_with_stale_carrier_still_allows,
+    test_absent_body_row_with_closed_body_state_allows,
 ]
 
 

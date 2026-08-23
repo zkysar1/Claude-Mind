@@ -104,7 +104,8 @@ def world_owns_agent_corpus():
     write — accidental protection that any performance work would have removed.
     """
     try:
-        return WORLD_DIR.resolve() in _canonical_world_dirs()
+        resolved = os.path.normcase(str(WORLD_DIR.resolve()))
+        return resolved in {os.path.normcase(str(d)) for d in _canonical_world_dirs()}
     except OSError:
         return False
 

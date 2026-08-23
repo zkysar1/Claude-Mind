@@ -655,8 +655,48 @@ def _save_to_history_store(path, base_dir, agent_name, summary):
 # Changelog
 # ---------------------------------------------------------------------------
 
+# Process-lifetime tally of audit rows this process failed to append. Exposed as
+# a module global so a test (or a future telemetry consumer) can assert the
+# count rather than scraping stderr. `first` keeps the earliest exception repr —
+# guard-1893: a swallow must retain the EVIDENCE, not just decline to crash.
+_CHANGELOG_DROPS = {"count": 0, "first": None}
+
+
+def _note_changelog_drop(rel_path, action, exc, stage):
+    """Record + announce one dropped changelog row. Never raises.
+
+    Called only from append_changelog's best-effort arms (see the long comment
+    at its lock site). Loud by design: a dropped audit row is rare, and a
+    SUSTAINED drop rate is the signal that lock contention has become a real
+    regression rather than a transient blip (guard-905's "MUST NOT be
+    generalized into 'harmless'"). Printing every drop is bounded by the drop
+    rate itself; a quiet counter would reproduce the invisible-failure shape
+    this whole change exists to remove.
+    """
+    _CHANGELOG_DROPS["count"] += 1
+    detail = f"{type(exc).__name__}: {exc}"
+    if _CHANGELOG_DROPS["first"] is None:
+        _CHANGELOG_DROPS["first"] = detail
+    try:
+        print(
+            f"[_fileops] changelog row DROPPED at {stage} "
+            f"({rel_path} {action}): {detail} — the underlying write already "
+            f"landed; only this audit row is lost "
+            f"(drops this process: {_CHANGELOG_DROPS['count']})",
+            file=sys.stderr,
+        )
+    except Exception:
+        pass  # a broken stderr must not turn a lost audit row into a crash
+
+
 def append_changelog(base_dir, agent_name, file_path, action, summary="", lines_changed=0):
     """Append an entry to base_dir/changelog.jsonl.
+
+    BEST-EFFORT (g-115-7136): lock-acquisition and append failures are counted,
+    announced on stderr, and swallowed — never propagated. Every caller invokes
+    this AFTER its durable write, so raising here reports a landed write as
+    failed. This matches the daemon twin `mind_api/src/changelog.py::append`,
+    whose docstring already claimed to mirror this function.
 
     Args:
         base_dir: Directory containing changelog.jsonl (typically WORLD_DIR).
@@ -747,8 +787,45 @@ def append_changelog(base_dir, agent_name, file_path, action, summary="", lines_
     # schema-drift-sweep.py). Pattern matches locked_append_jsonl below — same
     # acquire/append/release with shared `.lock` sibling. (, fresh-eyes
     # finding from  iter-14.)
+    # BEST-EFFORT FROM HERE DOWN (). Every caller invokes this AFTER
+    # its durable write has already landed — all 7 locked_write_* sites above,
+    # aspirations.py `_write_live_under_lock` (the append is its last line),
+    # tree.py, history.py, retrieve.py. So a failure here can only lose ONE
+    # AUDIT ROW; it can never mean the user-visible write failed. Propagating it
+    # therefore reports a SUCCESSFUL write as a failure, and that is not
+    # theoretical: measured 2026-08-21 on two boxes within an hour
+    # ( foxtrot /  echo, plus guard-905's 2026-08-06 alpha
+    # trace), a transient `TimeoutError: Could not acquire lock: <world>/
+    # changelog.lock` propagated out of here and recurring-close.sh printed
+    # "update consecutive_deep failed" for a field that WAS on disk. The
+    # `consecutive_routine` site one branch earlier does `sys.exit(1)` on the
+    # same error, so a lost audit row could abort a whole recurring close.
+    #
+    # The daemon twin `mind_api/src/changelog.py::append` has ALWAYS swallowed
+    # (`except OSError: pass`) and its docstring says verbatim "Mirrors
+    # _fileops.append_changelog's behaviour" — a parity claim that was simply
+    # untrue on this side (guard-742 class: logic on both sides, half-applied).
+    # This makes the claim true.
+    #
+    # BLAST RADIUS of the two arms, enumerated rather than assumed (guard-2680,
+    # applied in the swallow direction): `except OSError` catches the lock
+    # TimeoutError (TimeoutError IS an OSError subclass), plus disk-full /
+    # permission on the append itself — exactly the set the daemon twin names.
+    # It does NOT catch `_write_queue.WriteQueueBackpressure`, which subclasses
+    # RuntimeError precisely to stay "distinct from the raw lock TimeoutError by
+    # design" (_write_queue.py:68), nor a botocore ClientError from a genuinely
+    # misconfigured backend. Real misconfiguration still fails loud.
+    #
+    # NOT SILENT (guard-1893): the drop is counted and announced on stderr with
+    # the running total, so a sustained-contention regression is visible instead
+    # of degrading into an audit trail that quietly loses rows. Do not "tidy"
+    # this into a bare `except OSError: pass`.
     lock_path = changelog.with_suffix(".lock")
-    acquire_lock(lock_path)
+    try:
+        acquire_lock(lock_path)
+    except OSError as exc:
+        _note_changelog_drop(rel_path, action, exc, "lock")
+        return
     try:
         # s3 reroute DEFERRED (deliberate, not an oversight): this append is NOT
         # routed through get_backend(). changelog.jsonl is 150K+ lines and
@@ -760,8 +837,17 @@ def append_changelog(base_dir, agent_name, file_path, action, summary="", lines_
         # audit-trail consumers (history.py, schema-drift-sweep) read it locally.
         with open(changelog, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=True) + "\n")
+    except OSError as exc:
+        _note_changelog_drop(rel_path, action, exc, "append")
     finally:
-        release_lock(lock_path)
+        # A release failure must not resurrect the very propagation this
+        # function just stopped: the lock's own stale-break (stale_seconds)
+        # recovers an unreleased lock, so there is nothing a caller could do
+        # with the exception except mis-report a landed write again.
+        try:
+            release_lock(lock_path)
+        except OSError as exc:
+            _note_changelog_drop(rel_path, action, exc, "release")
 
 
 # ---------------------------------------------------------------------------

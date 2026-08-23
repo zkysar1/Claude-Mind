@@ -500,3 +500,90 @@ def test_cli_json_mode_carries_the_three_valued_status(monkeypatch, capsys):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# ---------------------------------------------------- 2026-08-21: rank + JSONL stores
+# Under the pre-change code every pin in this section is RED by construction:
+# the board scan filled the limit in glob order (rank test), and the two JSONL
+# stores were never opened at all (store/retired/corrupt tests).
+
+import json as _json
+
+
+def _write_jsonl(world, fname, records):
+    (world / fname).write_text(
+        "\n".join(_json.dumps(r) for r in records) + "\n", encoding="utf-8")
+
+
+def test_results_rank_by_score_not_file_order(tmp_path):
+    """A dense tree match must beat a thin board row for the last slot.
+    Pre-change, board rows filled the limit first regardless of quality."""
+    w = _make_world(tmp_path, "rank-world", board_rows=[
+        {"id": "m-thin", "author": "a", "text": "widget mentioned once"},
+    ], tree_docs={"dense.md": "widget widget widget calibration of the widget"})
+    results, unreadable = pr.search_world_dir(w, ["widget"], limit=1)
+    assert unreadable == []
+    assert len(results) == 1
+    assert results[0]["store"] == "knowledge-tree"
+    assert results[0]["score"] > 1
+
+
+def test_phrase_adjacency_outranks_scattered_terms(tmp_path):
+    w = _make_world(tmp_path, "phrase-world", tree_docs={
+        "scattered.md": "deadline is set here and the widget sits elsewhere",
+        "adjacent.md": "the widget deadline is computed downstream",
+    })
+    results, _ = pr.search_world_dir(w, ["widget", "deadline"], limit=2)
+    assert [r["ref"] for r in results][0].endswith("adjacent.md")
+
+
+def test_reasoning_bank_and_guardrails_are_searched(tmp_path):
+    w = _make_world(tmp_path, "store-world")
+    _write_jsonl(w, "reasoning-bank.jsonl", [
+        {"id": "rb-1", "status": "active", "title": "widget deadline lesson",
+         "content": "the widget deadline moves when the calibration slips"},
+    ])
+    _write_jsonl(w, "guardrails.jsonl", [
+        {"id": "guard-1", "status": "active",
+         "rule": "ALWAYS recheck the widget deadline before shipping"},
+    ])
+    results, unreadable = pr.search_world_dir(w, ["widget", "deadline"], limit=10)
+    assert unreadable == []
+    by_store = {r["store"]: r for r in results}
+    assert by_store["reasoning-bank"]["ref"] == "rb-1"
+    assert by_store["guardrails"]["ref"] == "guard-1"
+    # Snippets come from the record's discriminative fields, not raw JSON.
+    assert "widget deadline" in by_store["guardrails"]["snippet"].lower()
+
+
+def test_retired_records_do_not_hit(tmp_path):
+    w = _make_world(tmp_path, "retired-world")
+    _write_jsonl(w, "reasoning-bank.jsonl", [
+        {"id": "rb-old", "status": "retired", "title": "widget deadline lesson"},
+        {"id": "rb-live", "status": "active", "title": "widget deadline lesson v2"},
+    ])
+    results, _ = pr.search_world_dir(w, ["widget", "deadline"], limit=10)
+    refs = [r["ref"] for r in results]
+    assert "rb-live" in refs
+    assert "rb-old" not in refs
+
+
+def test_wholly_corrupt_jsonl_store_is_unreadable_not_empty(tmp_path):
+    """The board-file collapse (guard-4093 shape) one store over: a
+    reasoning-bank file that opened but parsed nothing must flag the lane
+    INCOMPLETE, never report a clean empty."""
+    w = _make_world(tmp_path, "corrupt-world")
+    (w / "reasoning-bank.jsonl").write_text("not json\nalso not json\n",
+                                            encoding="utf-8")
+    results, unreadable = pr.search_world_dir(w, ["widget"], limit=5)
+    assert results == []
+    assert any("reasoning-bank.jsonl" in u for u in unreadable)
+
+
+def test_absent_jsonl_stores_stay_clean(tmp_path):
+    """A fresh world with no reasoning bank yet is legitimately empty --
+    absence of the store file must not flag unreadability."""
+    w = _make_world(tmp_path, "fresh-world", tree_docs={"a.md": "widget"})
+    results, unreadable = pr.search_world_dir(w, ["widget"], limit=5)
+    assert unreadable == []
+    assert len(results) == 1

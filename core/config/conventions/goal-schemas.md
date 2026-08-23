@@ -887,12 +887,14 @@ corresponding dimension. Introduced to close three feedback-loop gaps
 ## Goal-level fields
 
 - `work_class`: one of `framework`, `strategic`, `hygiene`, `pm_analysis`,
-  `research`. Populated by goal creators; used by the selector's planned
-  `class_balance_bonus` dimension (Tranche C) to pull under-represented
-  classes up when the last-N-goals distribution drifts from
+  `research`, `product`. Populated by goal creators; used by the selector's
+  planned `class_balance_bonus` dimension (Tranche C) to pull
+  under-represented classes up when the last-N-goals distribution drifts from
   `aspirations.yaml → work_class_targets`. Existing goals default to
   `unclassified` and are excluded from the balance computation until
-  reclassified.
+  reclassified. (`product` — domain/product-repo work — was omitted from this
+  list while being the live majority value: 456 goals at the 2026-08-21
+  selection-stack review census, more than any documented class.)
 
 - `user_thread_id`: **RETIRED 2026-04-24 (g-252-03 / commit 95e4df6)** — string or `null` — was a stable
   identifier for a conversation thread this goal belongs to. Path A

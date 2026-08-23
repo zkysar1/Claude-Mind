@@ -112,6 +112,18 @@ DECISION depends on it; a large reference count is not evidence, because most
 references are plumbing that exists to keep the file healthy (merge handlers, snapshot
 caps, reference scans) rather than to use it.
 
+**An unconsumed DETECTOR is the worse defect.** That same grep also turns up
+writer-without-reader stores, and they do NOT share one verdict. Measured 2026-08-21:
+`meta/step-attribution.yaml` — written at `/reflect` Step 7.6c, rollback-protected by
+`meta.yaml` audit_only_fields, merged, documented, and read by nothing that DECIDES —
+scores past goals on clarity/scope_accuracy, so an absent consumer means REDUCE.
+`meta/missing-verification-criteria.jsonl` has the identical shape but records goals
+filed with no machine-checkable criteria, which is a defect signal — so its absent
+consumer means WIRE IT, never retire it. Under this directive an unconsumed detector is
+strictly worse than an unconsumed attributor: the write cost is paid AND the fleet still
+would not "know asap if there is something wrong." Sort writer-without-reader findings
+by what the data WOULD detect, not by what it currently costs.
+
 **The latency asymmetry to design against.** Detection splits by cadence key, and the
 two halves fail in opposite directions:
 

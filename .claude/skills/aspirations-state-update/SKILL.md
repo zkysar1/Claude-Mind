@@ -66,12 +66,15 @@ After EVERY goal execution (Steps 1-8, plus Steps 8.5, 8.55, and 8.75 for deep o
      Otherwise: new_streak = currentStreak + 1.
      ALWAYS update both: currentStreak = new_streak, longestStreak = max(new_streak, longestStreak).
 
-1.1. CLEAR iteration-checkpoint (goal is finished — anchor no longer applies).
-     The checkpoint was written by `/aspirations-select` Phase 2.95 and must be
-     cleared now so a post-autocompact restart doesn't resume a completed goal.
-     Fires for ALL outcome classes (routine and deep) — Step 1's goal-status
-     update is the point-of-no-return. See `core/scripts/postcompact-restore.py`
-     for the read side.
+1.1. CLEAR iteration-checkpoint — but NOT before `iteration-close.sh --phase
+     state-update`, which deletes it at `:3687` AFTER three probes read
+     `selected_at` from it (`:2457`/`:2483` tree-updated, `:2551`
+     metric-encoding). Pre-deleting blinds all three silently and queues a
+     spurious re-encode (measured g-115-5489). Normal path: SKIP this rm, the
+     script owns it. Ad-hoc/`/reflect` path that bypasses iteration-close: run
+     it, AFTER the phase work. Read side: `core/scripts/postcompact-restore.py`.
+     # Rationale (WHY order beats idempotence here, + the misattributing
+     # diagnostic): core/config/rationale/iteration-checkpoint-delete-ownership.md
      Bash: rm -f agents/<agent>/session/iteration-checkpoint.json
 
 2. Aspiration progress is updated automatically by update-goal when status changes
@@ -410,7 +413,7 @@ IF outcome_class == "routine":
             # running when the node has enough existing content to BE redundant with.
             IF the target node already has >= 3 existing insights (Verified Values /
                Key Insights bullets):
-                Write agents/<agent>/temp/mdl-existing-corpus.jsonl
+                Write agents/<agent>/temp/mdl-existing-corpus.raw
                   # transient scratch: one JSONL line {id, text} per existing node
                   # insight (id = short tag). Overwritten each close.
                   # MUST be agents/<agent>/temp/, NOT session/ (g-115-3347 second
@@ -433,7 +436,7 @@ IF outcome_class == "routine":
                   # (core/config/conventions/temp-store.md) and carries no such gate.
                 Bash: py -3 core/scripts/mdl_gate.py gate \
                       --candidate "<the compressed insight from step c>" \
-                      --existing agents/<agent>/temp/mdl-existing-corpus.jsonl \
+                      --existing agents/<agent>/temp/mdl-existing-corpus.raw \
                       --node <node.key> --goal {goal.id} --caller aspirations-state-update
                   # args, not python source -> guard-165 N/A. exit 0 keep / 1 near-dup.
                 Parse stdout JSON (keep, nearest_id, max_similarity, novelty, reason):

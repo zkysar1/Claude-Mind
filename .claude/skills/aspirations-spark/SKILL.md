@@ -465,11 +465,11 @@ doubt between framework and domain, pick domain.
                 # description, and CONTINUE to the forge criteria check below.
             # Tracker NAMED but unreadable is the opposite case — see fail-CLOSED below.
             Bash: aspirations-query.sh --goal-field id "{tracker}" --full
-            # `--goal-field id`, NOT `goal_id`. The output projection RENAMES the record
-            # key `id` to `goal_id`, but only `id` is queryable — so querying the name
-            # you see in the output returns a silent, plausible-looking 0 hits. Measured
-            # 2026-08-01: `--goal-field goal_id g-115-3767` -> 0, `--goal-field id
-            # g-115-3767` -> 1. A false-empty here would void a LIVE deferral and re-file.
+            # EITHER NAME WORKS — `id` and `goal_id` both resolve; `goal_id` is a
+            # REGISTERED alias (aspirations-query.sh:99-101 help; _goal_fields.py:113).
+            # SUPERSEDES the pre-2026-08-22 claim here that only `id` was queryable:
+            # re-measured on that claim's own goal (g-115-3767) -> rows=1 BOTH shapes
+            # (g-115-4430). Fail-CLOSED branch below unchanged — never name-dependent.
             IF the probe ERRORS or returns 0 rows: WARN + SKIP (fail CLOSED, guard-487 —
                 an unreadable tracker is not a dead one, and a spurious re-file does not
                 self-heal). Do NOT treat 0 rows as "tracker is gone".
@@ -788,6 +788,15 @@ When sq-009 (or sq-c09 experiential variant) fires, it creates a hypothesis goal
          over already-saturated categories like: code, infrastructure, pipeline
          Reformulate: what USER-FACING or EXPERIENTIAL consequence follows from this work?
 0.5. Calibration gate (BEFORE assigning confidence):
+     CANONICAL PATH — do NOT hand-roll the tally (gap-071, extension 2026-08-21):
+        `Bash: py -3 core/scripts/sq009_formation_gates.py --json`
+     ONE call returns `cap` (the ceiling) and `saturated` (step 0.1's steer-away
+     list). It encodes every rule below — union population, exact `outcome`
+     match, UNRESOLVABLE excluded, zero-parse positive control — and declares
+     `cap_basis: "aggregate"` so the g-115-4715 per-band defect stays visible.
+     `n_total + n_terminal_outside_union` reconciles to `--meta` total_resolved;
+     strays are records awaiting `pipeline-move`, not a defect. Read on only
+     when the tool is unavailable, or to learn WHY the population is what it is.
      a. Read recent accuracy — BOTH stages are REQUIRED:
         `Bash: pipeline-read.sh --stage resolved`
         `Bash: pipeline-read.sh --stage archived`
@@ -831,26 +840,14 @@ When sq-009 (or sq-c09 experiential variant) fires, it creates a hypothesis goal
           (g-115-4866; template at review-hypotheses Mode 3 Step 1, g-115-3594.)
         - Count CONFIRMED vs CORRECTED over the UNION of both stages, in this
           category (or overall if <3 in category)
-        - COUNT THE `outcome` FIELD. There is no `resolution` key on a resolved
-          record (schema: pipeline.md; verified keys include `outcome`,
-          `outcome_date`, `outcome_detail`, `resolution_method` — NOT
-          `resolution`). A `resolution`-keyed count does NOT return zero, which
-          is what makes it dangerous: a handful of records carry that key from
-          an older shape, so the count comes back small-but-nonzero and reads as
-          a real track record. Measured 2026-08-01 (g-115-4005): `resolution`
-          gave total=2 / accuracy=0.0 over a store of 44, which sets the cap to
-          0.55; `outcome` gave 23 CONFIRMED / 20 CORRECTED = 0.535, cap 0.65.
-          READ THAT "store of 44" AS A HISTORICAL ARTEFACT, NOT AS THE
-          DENOMINATOR: 44 was the then-current `--stage resolved` count, i.e.
-          the narrow population this step no longer uses. Re-derived over the
-          union the same day, it would have been several hundred. Left in place
-          because the field comparison it illustrates is still valid — but do
-          not carry 44 forward as the store size, or the narrow denominator gets
-          re-derived from this very example. (g-115-4866.)
-          The wrong field silently tightens the ceiling by a full band. Exclude
-          `UNRESOLVABLE` (a third value) from the denominator — it is neither a
-          hit nor a miss. This is the rb-245 class landing inside the gate whose
-          own job is calibration.
+        - COUNT THE `outcome` FIELD, exact-match. There is no `resolution` key
+          on a resolved record (schema: pipeline.md), and a `resolution`-keyed
+          count does NOT return zero — which is what makes it dangerous: a few
+          records carry that key from an older shape, so it reads as a real
+          track record. Measured 2026-08-01 (g-115-4005): the wrong field
+          silently tightened the ceiling by a full band. Exclude `UNRESOLVABLE`
+          (a third value) from the denominator — neither a hit nor a miss. The
+          rb-245 class landing inside the gate whose own job is calibration.
         - If total == 0: SKIP gate (no track record yet), proceed to Step 0.7
         - Compute recent_accuracy = confirmed / total
      b. Apply confidence ceiling:
@@ -1480,7 +1477,9 @@ When sq-018 fires after goal completion:
        return 'verify-learning' in ((g.get('title') or '')+' '+(g.get('description') or '')).lower()
    wide=[g for g in open_ if cites(g)]
    narrow=[g for g in open_ if (g.get('origin_signal') or '').startswith('maintain:sq-018')]
-   isdrain=lambda g:(g.get('origin_signal') or '').startswith('maintain:drain-verify-learning-check-lane')
+   # (e) TUPLE, never one prefix. Rationale: core/config/rationale/sq018-drain-probe-predicate.md
+   DP=('maintain:drain-verify-learning-check-lane','maintain:verify-learning-checkproposal-batch')
+   isdrain=lambda g:(g.get('origin_signal') or '').startswith(DP)
    drain=[g for g in open_ if isdrain(g)]
    # (b) A drain that COMPLETED recently means the lane is being serviced. An
    #     open-only probe cannot distinguish that from 'never drained'.

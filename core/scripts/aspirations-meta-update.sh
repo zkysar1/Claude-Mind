@@ -18,9 +18,15 @@ PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
 # --- Parse args -----------------------------------------------------------
+# Sourced BEFORE _runtime.sh so the refusal cannot be masked by a daemon
+# failure (see _argv_strict.sh header).
+source "$CORE_ROOT/scripts/_argv_strict.sh"
+
 SOURCE_VAL="world"
 FIELD=""
 VALUE=""
+# ONE literal, shared by the help text and the refusal message — never two.
+_ACCEPTED_FLAGS="--source <world|agent>"
 declare -a PASSTHROUGH=()
 declare -a PASSTHROUGH_SOURCE=()
 
@@ -30,9 +36,15 @@ while [[ $# -gt 0 ]]; do
             SOURCE_VAL="${2-}"
             PASSTHROUGH_SOURCE=(--source "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
+        -h|--help)
+            argv_strict_help "aspirations-meta-update.sh" "[--source world|agent] <field> <value>" "$_ACCEPTED_FLAGS";;
         -*)
-            # Unknown flag — passthrough for argparse on fallback
-            PASSTHROUGH+=("$1"); shift;;
+            # REFUSE (). "passthrough for argparse on fallback" named
+            # a fallback deleted 2026-05-14; PASSTHROUGH has had no reader since.
+            # The swallowed flag's VALUE slid into the `*)` arm below and became
+            # FIELD (or VALUE), so this wrote the WRONG META FIELD — on the
+            # counter store the loop reads every iteration — and exited 0.
+            argv_strict_refuse_unknown "aspirations-meta-update.sh" "$1" "$_ACCEPTED_FLAGS";;
         *)
             # Positional: first is field, second is value
             if [ -z "$FIELD" ]; then

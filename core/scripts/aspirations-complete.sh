@@ -17,33 +17,71 @@ _RUNTIME_SELF="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
+# Shared unknown-flag refusal (, the sweep  mandated).
+# Sourced BEFORE _runtime.sh so the refusal is cheap and cannot be masked by a
+# daemon failure.
+# shellcheck disable=SC1091
+source "$CORE_ROOT/scripts/_argv_strict.sh"
+# ONE literal, referenced by BOTH the --help arm and the refusal, so the two
+# strings that must agree cannot drift apart ( fresh-eyes F-002).
+# HAND-ENUMERATED, deliberately: unknown-flag-caller-scan.py's `accepted_flags`
+# for THIS wrapper is POLLUTED — its arm parser mis-reads the rt_call
+# continuation lines below as case arms and reports '--query "$QUERY' plus two
+# multi-line '--body-string' fragments alongside the real flags. That direction
+# is OVER-acceptance, which can MASK a genuine unknown flag, so the scan was NOT
+# trusted here; the three flags below come from reading the arg loop.
+_ACCEPTED_FLAGS="--source <world|agent> | --force | --intent-satisfied"
+
 # --- Parse args -----------------------------------------------------------
 SOURCE_VAL="world"
 ASP_ID=""
 FORCE=0
 INTENT_SATISFIED=0
-declare -a PASSTHROUGH=()
-declare -a PASSTHROUGH_SOURCE=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --source)
             SOURCE_VAL="${2-}"
-            PASSTHROUGH_SOURCE=(--source "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
         --force)
             FORCE=1
-            PASSTHROUGH+=("$1"); shift;;
+            shift;;
         --intent-satisfied)
             INTENT_SATISFIED=1
-            PASSTHROUGH+=("$1"); shift;;
+            shift;;
+        -h|--help)
+            # BEFORE the -*) arm: --help is a `-*` token, and refusing it with
+            # exit 2 would be a regression the refusal introduced rather than a
+            # defect it fixed (). Help exits 0.
+            argv_strict_help "$(basename "$0")" "<asp-id>" \
+                "$_ACCEPTED_FLAGS";;
         -*)
-            # Unknown flag — passthrough for argparse on fallback
-            PASSTHROUGH+=("$1"); shift;;
+            # REFUSE (). This arm used to append the unknown flag to
+            # PASSTHROUGH on the strength of a comment reading "Unknown flag —
+            # passthrough for argparse on fallback". BOTH halves were false:
+            # PASSTHROUGH had NO READER anywhere in this file (appended in four
+            # arms, consumed in none — the daemon path builds QUERY from
+            # SOURCE_VAL/FORCE/INTENT_SATISFIED alone at the QUERY= lines
+            # below), and the "fallback" it names was DELETED in the 2026-05-14
+            # daemon-only cutover named in this file's own header, twelve lines
+            # above the arm that promised it. PASSTHROUGH_SOURCE was write-only
+            # too. Measured on this box before the fix:
+            # `--bogus-flag asp-zzz-refusal-fixture` returned rc=1 having
+            # silently swallowed the flag and reached the daemon, which rejected
+            # only the id — the unknown flag was never mentioned.
+            argv_strict_refuse_unknown "$(basename "$0")" "$1" "$_ACCEPTED_FLAGS";;
         *)
-            # Positional asp_id (first non-flag wins)
+            # POSITIONALS stay accepted-and-ignored past the first, the same
+            # boundary the aspirations-read.sh / pipeline-read.sh /
+            # tree-find-node.sh adoptions drew (guard-1562: never ship a
+            # refusal without enumerating what would newly fire). The documented
+            # call form IS positional — `aspirations-complete.sh <asp-id>` and
+            # the agent-aspirations-complete.sh forwarder, which execs this
+            # script with `--source agent "$@"` — so this arm is load-bearing
+            # and must not become a refusal. The required-arg guard below
+            # already exits 1 when no id is passed at all.
             [ -z "$ASP_ID" ] && ASP_ID="$1"
-            PASSTHROUGH+=("$1"); shift;;
+            shift;;
     esac
 done
 

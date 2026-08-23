@@ -192,6 +192,58 @@ if [ -n "$GITDIR" ] && [ -f "$GITDIR/index.lock" ]; then
   soft_exit 0
 fi
 
+# Skip if a CO-RESIDENT BODY holds the working tree (). Sibling of the
+# index.lock skip above and deliberately placed beside it: same semantics ("some
+# other process is mid-operation on this tree; come back next cycle"), different
+# duration. index.lock covers the INSTANT of one git command; this covers the
+# WINDOW a Body needs — the ~32 minutes of a suite run, or a unit spent between
+# an edit and its commit. Both measured collisions on 2026-08-21 happened with
+# index.lock free, through entirely legal git operations.
+#
+# ONE CHOKEPOINT, NOT ONE PER MERGE. This script has THREE `git merge` sites
+# (the self-heal retry, the integrate, and the push-race recovery) plus a
+# pathspec-limited self-heal COMMIT. Gating the integrate alone would have left
+# the recovery merge — reached precisely when the push was rejected, i.e. when
+# contention is highest — as an unguarded bypass (guard-4088 / guard-3448: a
+# gate at one caller is not a gate). Skipping the whole invocation here covers
+# every one of them by construction and needs no re-indentation.
+#
+# FAIL-OPEN IN EVERY AMBIGUOUS CASE. `tree-lock.sh check` returns 1 ONLY for a
+# present, parseable, unexpired lock held by a DIFFERENT sid whose holder
+# process is not provably dead; absent, unreadable, expired, mine and
+# dead-holder all return 0. The missing-script guard below adds one more: a
+# clone without the helper behaves exactly as before. This matters more than
+# usual here — a wrongly-refusing gate does not cost one merge, it silently
+# freezes framework sync for the box, and "resume on local code" becomes
+# permanent staleness (the  /  wedge shape).
+# ONLY rc=1 SKIPS. `if ! cmd` would treat EVERY non-zero as "held", and the
+# wrapper can exit non-zero for reasons that are not a lock at all: it runs
+# `set -euo pipefail` over `source _paths.sh` and `exec python3`, so a broken
+# _paths.sh or a missing interpreter exits 1-or-127 with no lock in sight. Those
+# are plumbing faults, and treating a plumbing fault as a held tree would freeze
+# this box's framework sync indefinitely — the exact fail-CLOSED behaviour the
+# comment above promises this gate does not have (guard-1562: stopping a healthy
+# loop on a plumbing fault is worse than the disease). `check` is contracted to
+# return 1 for held and 0 for everything else, and never 2; anything else is a
+# fault, so it is reported LOUDLY and then proceeds.
+if [ -f "$SCRIPT_DIR/tree-lock.sh" ]; then
+  # --project-root "$REPO" scopes the lock to the tree this invocation actually
+  # merges, which is the only tree the gate is about. Without it the check reads
+  # the lock of whatever repo the SCRIPT lives in, so a hermetic --repo run
+  # (test_iteration_push.py builds tmp origin/clone repos) would consult THIS
+  # machine's real lock and skip whenever any co-resident Body happened to hold
+  # it — a suite that passes or fails on unrelated global state. tree_lock.py
+  # .resolve()s whatever root it is handed, so this logical path and the
+  # suite runner's __file__-derived one name the same lock file.
+  _TL_OUT="$(bash "$SCRIPT_DIR/tree-lock.sh" check --project-root "$REPO" 2>&1)"; _TL_RC=$?
+  if [ "$_TL_RC" -eq 1 ]; then
+    log "tree-lock: a co-resident Body holds this working tree — skip, retry next iteration. ${_TL_OUT}"
+    soft_exit 0
+  elif [ "$_TL_RC" -ne 0 ]; then
+    log "tree-lock: check failed rc=${_TL_RC} (plumbing, not a lock) — proceeding unguarded. ${_TL_OUT}"
+  fi
+fi
+
 # Current branch (skip detached HEAD).
 BRANCH="${BRANCH_OVERRIDE:-$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")}"
 if [ -z "$BRANCH" ] || [ "$BRANCH" = "HEAD" ]; then
@@ -259,7 +311,10 @@ _ip_streak_file() { printf '%s' "${GITDIR:+$GITDIR/iteration-push-defer-streak}"
 
 _ip_defer_streak_reset() {
   local f; f="$(_ip_streak_file)"
-  { [ -n "$f" ] && rm -f "$f" "${f}-escalated"; } 2>/dev/null || true
+  # Both lane markers, or the surviving one silently suppresses the NEXT streak
+  # of its shape ( — the defer lane keeps its own marker so a streak
+  # that changes shape still escalates).
+  { [ -n "$f" ] && rm -f "$f" "${f}-escalated" "${f}-escalated-defer"; } 2>/dev/null || true
 }
 
 # Capture WHICH paths conflicted, BEFORE `git merge --abort` destroys the
@@ -293,7 +348,7 @@ _ip_log_conflict_paths() {
   log "conflicted paths (${n}): ${line}"
 }
 
-_ip_defer_streak_tick() {  # $1 = shape (dirty-defer | conflict-abort)
+_ip_defer_streak_tick() {  # $1 = shape (dirty-defer | conflict-abort), $2 = blocking paths (defer lanes)
   local f n=0 since="" first="" _rest=""
   f="$(_ip_streak_file)"
   [ -z "$f" ] && return 0
@@ -327,6 +382,42 @@ _ip_defer_streak_tick() {  # $1 = shape (dirty-defer | conflict-abort)
       log "═══ REPEATING MERGE CONFLICT — ESCALATION REQUIRED (g-306-315) ═══"
       log "The last ${n} integrate attempts since ${since} ALL hit a TRUE content conflict (behind=${cbehind}). Retrying can NEVER clear this and every peer fix stays concealed behind the blocked merge. CALLER MUST ESCALATE NOW: (1) post a coordination-board escalation naming the conflicted path(s) from the merge output above + behind=${cbehind} + this box; (2) worker Body: append an sq-013 observation to spark_capture so the reducer files an Unblock — reducer: file the Unblock directly. Then continue the cycle on local code; do NOT hand-resolve mid-goal and do NOT stop the loop."
       printf '%s\n' "$since" >"$mk" 2>/dev/null || true
+    fi
+  fi
+  # --- Repeating-DEFER escalation directive () ---------------------
+  # THE ASYMMETRY THIS CLOSES. A repeating dirty-file DEFER strands the box
+  # exactly as a repeating conflict does — retry can never clear it, because the
+  # blocking condition is not transient — yet only the conflict lane emitted a
+  # caller-facing directive. Measured cc-08 2026-08-20: two consecutive defers
+  # on a dirty repo-root blocker-gate-overrides.jsonl, 39 commits behind and
+  # climbing, ZERO escalation, while origin/main ALREADY CARRIED the fix the box
+  # was refusing to integrate. Self-blocking, and silent.
+  #
+  # The ⚠ streak WARNING below is not a substitute and never was: it starts at
+  # 3 (the conflict lane escalates at 2), it re-prints EVERY cycle rather than
+  # once per streak, and no caller greps for it — worker-loop Phase -0.3
+  # branches on the "— ESCALATION REQUIRED (g-" headline alone. A log line with
+  # no consumer is indistinguishable from silence at the layer that matters.
+  #
+  # DELIBERATELY A SEPARATE HEADLINE FROM THE CONFLICT LANE (guard-2586: a
+  # fallback path and a failure path must never emit the same message). The two
+  # remedies are opposite — a conflict is hand-resolved, a dirty defer is
+  # CLEARED, and for the durable-crossagent sub-shape clearing is the one
+  # forbidden action. Callers that want both match the shared "— ESCALATION
+  # REQUIRED (g-" tail, which is anchored enough not to collide with prose.
+  # Its own marker file too, so a streak that changes shape still escalates the
+  # new shape instead of being suppressed by the old one's marker.
+  if [ "${1:-}" != "conflict-abort" ] && [ "$n" -ge "$IP_CONFLICT_ESCALATE" ]; then
+    local dmk="${f}-escalated-defer" dprev=""
+    [ -f "$dmk" ] && dprev="$(head -n 1 "$dmk" 2>/dev/null || echo "")"
+    if [ "$dprev" != "$since" ]; then
+      local dbehind dpaths
+      dbehind="$(git -C "$REPO" rev-list --count "$BRANCH..$UPSTREAM" 2>/dev/null || echo '?')"
+      dpaths="${2:-}"
+      [ -z "$dpaths" ] && dpaths="(not recorded — read the 'git blocked on:' line above)"
+      log "═══ REPEATING INTEGRATE DEFER — ESCALATION REQUIRED (g-115-6934) ═══"
+      log "The last ${n} integrate attempts since ${since} ALL deferred on the SAME non-transient blocker (shape=${1:-unknown}, behind=${dbehind}). Blocking path(s): ${dpaths}. Retrying can NEVER clear this and every peer fix stays concealed behind the blocked merge — origin may ALREADY carry the fix this box is refusing to integrate. CALLER MUST ESCALATE NOW: (1) post a coordination-board escalation naming those path(s) + behind=${dbehind} + this box; (2) worker Body: append an sq-013 observation to spark_capture so the reducer files an Unblock — reducer: file the Unblock directly. Then continue the cycle on local code. For shape=dirty-defer the remedy is to CLEAR the named path(s); for shape=durable-crossagent-defer clearing DESTROYS a partner's unpushed work (g-115-6145) — follow the sanctioned superset-proof procedure in the streak hint below instead."
+      printf '%s\n' "$since" >"$dmk" 2>/dev/null || true
     fi
   fi
   if [ "$n" -ge "$IP_DEFER_STREAK_ALARM" ]; then
@@ -1075,7 +1166,11 @@ _ip_push_worker_ref() {
   # broke — single-writer, or a reset — and it should be LOUD rather than
   # silently overwritten.
   if git -C "$REPO" push origin "HEAD:$WREF" >/dev/null 2>&1; then
-    log "--push-worker-ref: pushed HEAD ($(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)) -> $WREF"
+    log "--push-worker-ref: pushed HEAD ($(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)) -> REMOTE $WREF"
+    log "  verify with 'git ls-remote origin $WREF', NOT 'git rev-parse $WREF'. This push writes the REMOTE ref only."
+    log "  A local refs/workers/... ref exists only because some consumer fetched '+refs/workers/*:refs/workers/*'"
+    log "  earlier; it does NOT advance on this push, so rev-parse returns a PLAUSIBLE STALE sha from a previous"
+    log "  unit and the natural verification reports a false NO (g-306-313, guard-1250)."
     _IP_WREF_RC=0; return 0
   fi
   log "--push-worker-ref: push FAILED for $WREF — this Body's framework edits and local commits have NOT reached the reducer"
@@ -1105,6 +1200,20 @@ if [ "$BEHIND" -gt 0 ]; then
     log "dry-run: origin/$BRANCH is ${BEHIND} ahead of local — WOULD merge before pushing"
   else
     log "origin/$BRANCH has ${BEHIND} commit(s) local lacks — integrating (merge --no-edit, never rebase)"
+    # : assert the record-aware merge driver is actually REGISTERED on
+    # this clone, immediately before the one command that would use it. The
+    # driver is written into .git/config by install-git-hooks.sh and git config
+    # is NOT version-controlled, so a clone where that never ran has correct
+    # .gitattributes pointing at nothing and git silently degrades to its
+    # default text merge — which on concurrent tail appends CONFLICTS, i.e.
+    # lands straight in the repeating-conflict wedge the block above escalates.
+    # Placed HERE rather than at cycle top so it costs nothing on the common
+    # already-up-to-date pass (measured 0.16s for 10,116 tracked paths, against
+    # a real fetch+merge). ADVISORY — must never block the integrate.
+    # --repo "$REPO", never the bare default: REPO honours --repo /
+    # ITERATION_PUSH_REPO and can differ from PROJECT_ROOT, and a check that
+    # asserted the wrong tree would report OK about a repo it never looked at.
+    bash "$SCRIPT_DIR/check-merge-driver-registered.sh" --repo "$REPO" >&2 2>&1 || true
     MERGE_OUT="$(GIT_TERMINAL_PROMPT=0 git -C "$REPO" merge --no-edit "$UPSTREAM" 2>&1)"
     MERGE_RC=$?
     if [ "$MERGE_RC" -ne 0 ]; then
@@ -1156,10 +1265,14 @@ if [ "$BEHIND" -gt 0 ]; then
         # dirty-tree hint says "clear it", which for the durable shape destroys a
         # partner's unpushed work. Split them by the cause recorded in the
         # self-heal, not by re-deriving it here.
+        # $2 carries the blocking paths into the escalation directive
+        # (): re-deriving them on the wedged box is exactly the work
+        # the escalation exists to save, and by the time a reader sees it the
+        # merge output that named them may be many cycles back in the log.
         if [ -n "${_IP_DEFER_DURABLE:-}" ]; then
-          _ip_defer_streak_tick "durable-crossagent-defer"
+          _ip_defer_streak_tick "durable-crossagent-defer" "$_defer_paths"
         else
-          _ip_defer_streak_tick "dirty-defer"
+          _ip_defer_streak_tick "dirty-defer" "$_defer_paths"
         fi
         _ip_defer_exit
       fi

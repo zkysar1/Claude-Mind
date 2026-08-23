@@ -59,7 +59,7 @@ def _set_default_agent():
     project_root = Path(__file__).resolve().parents[3]
     agents_root = project_root / _AGENTS_PARENT_DIR if _AGENTS_PARENT_DIR else project_root
     if not agents_root.is_dir():
-        return  # pre-init clone: no agents/ yet, nothing to default to (g-367-03)
+        return  # pre-init clone: no agents/ yet, nothing to default to ()
     for entry in sorted(agents_root.iterdir()):
         if entry.is_dir() and (entry / "local-paths.conf").is_file():
             os.environ["MIND_AGENT"] = entry.name
@@ -197,6 +197,38 @@ _BOOTSTRAP_MIND_WORLD = os.environ.get("MIND_WORLD", _UNSET)
 _BOOTSTRAP_MIND_META = os.environ.get("MIND_META", _UNSET)
 _BOOTSTRAP_MIND_BACKEND = os.environ.get("STORAGE_BACKEND", _UNSET)
 _BOOTSTRAP_ALLOW_TMP_PUT = os.environ.get("MIND_ALLOW_TMP_OWNCLOUD_PUT", _UNSET)
+
+
+@pytest.fixture(autouse=True)
+def _pin_intended_agent_roster(monkeypatch):
+    """Pin gates.intended_agent_vocab's roster to a fixed fixture superset.
+
+    The gate resolves the LIVE deployment roster env-independently
+    (_agents._project_root() derives from __file__, so tmp-world fixtures
+    cannot redirect it). Daemon-POSTing tests across this tree carry fixture
+    agent names (alpha/bravo/echo/foxtrot/zeta/...), which happen to exist on
+    dev-fleet rosters and NOT on a single-agent prod deployment — unpinned,
+    the same test is green here and 400s after promotion (guard-1038's
+    newly-blocked-shape hazard, in its cross-deployment form). The pin makes
+    vocabulary verdicts deployment-independent. Tests exercising the gate
+    itself (test_intended_agent_vocab_daemon_parity.py) override with their
+    own monkeypatch / roster= injection — test-scoped patches stack over this
+    autouse pin. Fail-open: if the gates package is unimportable in a
+    stripped-down context, skip the pin rather than erroring every test.
+    Mirrored in mind_api/tests/conftest.py (g-115-5651: a reset/pin fixture
+    that exists in only one test-tree conftest leaves the other tree exposed
+    in mixed chunks).
+    """
+    try:
+        from gates import intended_agent_vocab as _iav
+    except ImportError:
+        yield
+        return
+    monkeypatch.setattr(
+        _iav, "_resolve_roster",
+        lambda: ("alpha", "bravo", "charlie", "delta", "echo",
+                 "foxtrot", "omni", "zeta"))
+    yield
 
 
 @pytest.fixture(autouse=True)
@@ -582,7 +614,7 @@ def _purge_phantom_team_state_shards():
         yield
         return
     if _WD is None:
-        yield  # pre-init clone: no world configured, nothing to purge (g-367-03)
+        yield  # pre-init clone: no world configured, nothing to purge ()
         return
     shards = _P(_WD) / "team-state" / "agents"
     yield

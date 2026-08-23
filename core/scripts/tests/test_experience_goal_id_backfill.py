@@ -44,6 +44,24 @@ import experience  # conftest puts core/scripts on sys.path
     ("exp-2026-05-16_ohs-perception", None),
     ("", None),
     (None, None),
+    # ---  DISCRIMINATING ROWS (guard-2353) ------------------------
+    # A BARE exp-<goal-id> with no slug. The pre-fix regex ended in a literal
+    # `-`, which REQUIRED a slug, so every one of these derived None and its
+    # record stayed permanently invisible to `experience-read --goal`. These
+    # four are the rows on the far side of the OLD boundary — without them the
+    # old and new predicates agree on every fixture and the suite has ZERO
+    # power over the change. Measured population when this landed: 220 records
+    # across all 7 agents (alpha 70, zeta 45, echo 37, bravo 31, foxtrot 22,
+    # delta 12, charlie 3) out of 6,696.
+    ("exp-g-306-184", "g-306-184"),
+    ("exp-g-308-01", "g-308-01"),
+    ("exp-g-115-1697", "g-115-1697"),
+    ("exp-g-xw-20260719T110333-01", "g-xw-20260719T110333-01"),  # bare cross-world id
+    # --- and the matching NEGATIVE controls, so the widening cannot rot into
+    # a catch-all: `(?:-|$)` must still reject a truncated or malformed id.
+    ("exp-g-306", None),        # no goal-sequence segment at all
+    ("exp-g-30-18", None),      # 2-digit aspiration — not the g-NNN-NN shape
+    ("exp-gg-306-184", None),   # malformed prefix
 ])
 def test_derive_goal_id_from_id(rec_id, expected):
     assert experience.derive_goal_id_from_id(rec_id) == expected

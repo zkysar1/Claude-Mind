@@ -54,6 +54,91 @@ if [ -f "$SCRIPT_DIR/_paths.sh" ]; then
     source "$SCRIPT_DIR/_paths.sh"
 fi
 
+# ── Working-tree lock () ──────────────────────────────────────────
+#
+# Two Bodies of one agent share ONE checkout. iteration-push.sh does a real
+# `git fetch` + `git merge` every cycle, so a peer Body can move the tree out
+# from under a run that takes ~32 minutes -- and a tree move outranks every
+# verdict this script can print. The lock is the ANNOUNCEMENT half of that
+# contract; the CHECK half lives in iteration-push.sh, which skips its merge
+# while a foreign sid holds the tree.
+#
+# --holder-pid $$ is load-bearing and is the whole reason the flag exists.
+# tree_lock.py must never stamp its OWN pid: it runs as a short-lived CLI, so
+# a self-stamped holder is dead microseconds later, every check reads
+# `dead-holder`, and the gate is silently inert while looking correct. The pid
+# that matters is THIS shell -- the long-lived process the lock protects.
+#
+# BEST-EFFORT BY DESIGN, in both directions:
+#   * A refusal (rc=1, a peer already holds the tree) WARNS and PROCEEDS. That
+#     peer is almost certainly another suite run, which is a hazard the reader
+#     is already warned about by the pgrep check -- and refusing to run tests
+#     because a sibling is testing would be a worse failure than the one this
+#     lock prevents. The peer's lock stays in place, so the merge gate keeps
+#     holding for whichever run owns it.
+#   * A plumbing failure (rc=2, or the script missing entirely on an older
+#     checkout) also proceeds. This lock protects a verdict; it must never be
+#     the reason a suite does not run.
+# The trap releases only OUR lock (release is a no-op on a peer's, and a second
+# release is a reported no-op, so the overlapping EXIT/INT/TERM handlers below
+# cannot hurt each other). INT and TERM are trapped SEPARATELY rather than
+# folded into the EXIT list: bash runs a trapped INT handler and then CARRIES
+# ON, so `trap ... EXIT INT TERM` would swallow Ctrl-C and keep the suite
+# running. Each re-raises after releasing. They are worth the four extra lines
+# because Ctrl-C is the ordinary way a 32-minute run ends early, and without
+# them the lock would sit for its full TTL -- freezing a peer's framework sync
+# for 90 minutes, which is the EXPENSIVE failure direction for this lock.
+#
+# ⚠ A TRAP IS DEFERRED WHILE BASH WAITS ON A FOREGROUND CHILD, and this script
+# spends its entire runtime waiting on run-full-suite.py. Measured 2026-08-22
+# (cc-08, kernel 6.8.0-137-generic): `kill -TERM <this-shell>` alone left the
+# wrapper alive and the lock held -- the handler ran, and released, only once
+# the python child was also killed. So the traps cover the case that actually
+# happens (Ctrl-C signals the whole foreground process group, so the child dies
+# first and the handler runs immediately) and do NOT cover a signal aimed at
+# this pid alone. Kill the process GROUP, not the wrapper. The TTL remains the
+# backstop for that case and for a kill -9, which no trap can reach.
+#
+# --triage is EXCLUDED: it runs no tests, it only re-reads chunk logs a prior
+# run already wrote. Taking a long tree lock for a log read would block a
+# peer's framework sync for nothing.
+_TL_SKIP=0
+for _arg in "$@"; do
+    if [ "$_arg" = "--triage" ]; then _TL_SKIP=1; fi
+done
+if [ "$_TL_SKIP" -eq 0 ] && [ -f "$SCRIPT_DIR/tree-lock.sh" ]; then
+    # Capture the ACQUIRE's own stderr and REPRINT it on failure. Do not run a
+    # second `status` call to explain the refusal: status is a fresh evaluation
+    # under the same broken conditions, so it answers a different question and
+    # can flatly contradict the line above it. Measured 2026-08-22 on a run whose
+    # PreToolUse bash-inject hook missed (MIND_AGENT/MIND_SID both unset): the
+    # acquire correctly refused `no-sid`, and the follow-up status -- also sid-less
+    # -- printed "free: no lock present" directly beneath "could not take the
+    # working tree". A reader gets a contradiction where the real reason was one
+    # variable away.
+    #
+    # THE HOOK-MISS CASE IS THE ONE TO KNOW ABOUT: with no MIND_SID there is no
+    # identity to lock under, so this run is UNPROTECTED and says so. That is the
+    # correct fail-open behaviour -- a suite must not be refused because a hook
+    # dropped an env var -- but it means the lock's coverage is exactly the set of
+    # runs whose env was injected. (The miss itself is  / .)
+    # 2>&1 with NO `>/dev/null`: tree_lock.py `print`s its verdict to STDOUT, so
+    # capturing stderr alone would yield an empty string and reprint nothing --
+    # re-creating the same silent refusal in a new shape.
+    _TL_ERR="$(bash "$SCRIPT_DIR/tree-lock.sh" acquire \
+                    --reason "full-suite run" --holder-pid $$ 2>&1)"
+    if [ $? -eq 0 ]; then
+        _tl_release() { bash "$SCRIPT_DIR/tree-lock.sh" release >/dev/null 2>&1 || true; }
+        trap '_tl_release' EXIT
+        trap '_tl_release; trap - INT;  kill -INT  $$' INT
+        trap '_tl_release; trap - TERM; kill -TERM $$' TERM
+    else
+        echo "=== tree-lock: could not take the working tree ===" >&2
+        echo "    ${_TL_ERR:-(acquire gave no reason)}" >&2
+        echo "    Proceeding anyway -- this run is UNPROTECTED; a peer's merge may VOID its verdict." >&2
+    fi
+fi
+
 python3 "$SCRIPT_DIR_NATIVE/run-full-suite.py" "$@"
 FRAMEWORK_RC=$?
 

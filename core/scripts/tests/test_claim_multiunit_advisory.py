@@ -86,10 +86,56 @@ class TestTheDetectionFiresOnAPerUnitProtocolAndNotOtherwise:
         assert _run(_goal(description=text))[2] == ""
 
     def test_the_title_is_searched_too_not_only_the_description(self):
-        assert _run(_goal(title="multi-unit soak across two boxes"))[2] == "multi-unit"
+        # The fixture was `title="multi-unit soak across two boxes"` until
+        #  anchored the bare alternative to a declarative use. That
+        # phrase is the REFERENTIAL shape (a soak that happens to be described
+        # with the word), which is exactly what no longer fires -- so the test
+        # now uses an instructional title. What it pins is unchanged: field 3
+        # is populated from the TITLE when the description is empty.
+        assert _run(_goal(title="soak two boxes, one at a time"))[2] == "one at a time"
 
     def test_detection_is_case_insensitive(self):
         assert _run(_goal(description="ONE AT A TIME"))[2]
+
+
+class TestMentioningMultiUnitIsNotDeclaringIt:
+    """: the bare `multi-unit` alternative was anti-correlated.
+
+    Measured over 2,127 open goals: 14 matched the detector, 10 also matched an
+    instructional phrase, and the 4 that hinged on the bare form were false
+    positives every one. Zero true positives existed to lose.
+
+    This is guard-2096's class -- a text detector over a corpus that DOCUMENTS
+    ITS OWN FINDINGS re-flags every correction it causes. The goals most likely
+    to contain the word `multi-unit` are goals ABOUT the unit-claim mechanism,
+    so the false-positive rate GROWS as the mechanism earns more goals. The
+    strings below are the live prose, verbatim, from the four that fired.
+    """
+
+    @pytest.mark.parametrize("gid,prose", [
+        ("g-115-6745", "a fix touching one should look at the other: g-306-322 "
+                       "(a multi-unit goal has no unit-level claim)"),
+        ("g-306-126", "worker multi-unit contract landed (Phase 5, aa4b8de8a) "
+                      "and BOTH close edges exercised live"),
+        ("g-306-203", "a worker Body sat AT CAP on all three for an entire "
+                      "multi-unit session"),
+        ("g-306-352", "make the trigger script-detected at claim time so a "
+                      "multi-unit goal cannot be claimed without a unit token"),
+    ])
+    def test_referential_prose_about_multi_unit_goals_stays_silent(self, gid, prose):
+        assert _run(_goal(description=prose))[2] == "", (
+            f"{gid} false-fired: mentioning the mechanism is not declaring the goal"
+        )
+
+    @pytest.mark.parametrize("phrase", [
+        "this is a multi-unit goal",
+        "this goal is multi-unit",
+        "This Is A Multi-Unit goal, work one per claim",
+    ])
+    def test_declaring_a_goal_multi_unit_still_fires(self, phrase):
+        """The positive control guard-3351 requires: narrowing is the SILENT
+        direction, so the retained recall needs pinning, not just the removal."""
+        assert _run(_goal(description=phrase))[2], f"lost a true positive: {phrase!r}"
 
 
 class TestTheFieldContractTheShellDependsOn:

@@ -137,7 +137,8 @@ SKIP this phase entirely when invoked with --file (targeted single-doc drain).
 #     three other secrets. This lane makes it VISIBLE without adding a way to
 #     destroy live state: purging is the wrong correction because the exemption
 #     protects the git-tracked .gitkeep, and the live population is working
-#     cadence state. Allowlist: .gitkeep, .archive-marker.
+#     cadence state. Allowlist: .gitkeep, .archive-marker, .drain-watermark
+#     (the Phase 2.5 marker — managed, not residue).
 #
 # WHY the helper and NOT an inline rm: hand-rolling an unguarded
 # `rm -f "$TEMP_DIR/$f"` here — when $TEMP_DIR resolves empty — becomes an `rm`
@@ -281,6 +282,61 @@ In `--dry-run`, skip this phase entirely.
 2. IF anything was encoded (not dry-run): append a journal entry recording the
    drain (journal-append.sh) so the audit trail names what moved from temp/ to
    knowledge this session.
+
+2.5. ADVANCE THE THIRD-CLASS WATERMARK — full pass only, never --dry-run,
+   never --file (encode-before-delete gate, 2026-08-21), AND ONLY WHEN THE
+   DRY-RUN PROVES IT LICENSES NOTHING YOU DID NOT CLASSIFY (guard-4864,
+   2026-08-22). THE DEFAULT IS NOT TO STAMP. Run this check FIRST:
+   Bash: bash core/scripts/temp-drain-purge.sh --dry-run   # read `would_purge`
+   `would_purge` > 0 here means Lane 1 is condemning THIRD-CLASS suffixes
+   (.jsonl/.note/.patch/.desc/.eml/.tsv/.remote/.local-preserve-*) — and
+   Phase 1's census is `ls temp/*.md temp/*.json`, so your pass did NOT
+   enumerate a single one of them. DO NOT STAMP: skip to Phase 4 and say in
+   the report that the watermark was withheld and why. Stamp ONLY when
+   `would_purge` is 0, or when you have just extended the census to cover
+   those suffixes and classified each file individually.
+   Measured 2026-08-22 (alpha, hostname cc-04, reducer): stamping flipped
+   `watermark_source` absent->file and took `would_purge` 0 -> 31, condemning
+   `experience.jsonl.local-preserve-20260818`,
+   `vanished-goals-recovery-2026-08-20.jsonl`, `experience.jsonl.remote` and an
+   unapplied `npc-hours-fix.patch` — recovery layers, i.e. an
+   archive-before-delete violation produced by following this step literally.
+   `rm -f "$AGENT_DIR/temp/.drain-watermark"` retracted it and returned
+   would_purge to 0; retraction is always safe because it removes a LICENSE,
+   never data. A same-day reducer pass had already refused this stamp for the
+   same stated reason and recorded it only in an outcome_note, where the next
+   executor of this step never read it — which is why the correction is HERE
+   (guard-1984: a guardrail cannot outvote the instrument it guards).
+   Bash: source core/scripts/_paths.sh && [ -n "$AGENT_DIR" ] && (date -d '-60 min' +%Y-%m-%dT%H:%M:%S 2>/dev/null || date +%Y-%m-%dT%H:%M:%S) > "$AGENT_DIR/temp/.drain-watermark" || echo "REFUSED: AGENT_DIR unresolved — watermark NOT advanced"
+   The source + non-empty guard are MANDATORY (guard-687/guard-968: a bare
+   $AGENT_DIR in an unsourced Bash step collapses "$AGENT_DIR/temp" to
+   "/temp" — the same empty-var class the Phase 1.5 helper note above
+   documents). The stamp is BACK-DATED 60 minutes (fresh-eyes fix,
+   2026-08-21): the drain ENUMERATED at Phase 1, minutes before this step
+   runs, so a completion-time stamp would falsely license purging files
+   created inside that window that no drain ever saw. Back-dating puts the
+   claim on the safe side for any drain shorter than 60 min; files
+   classified but younger than the margin merely stay exempt until the next
+   drain (fail-exempt in both directions). The `date -d` fallback keeps the
+   step alive on a non-GNU date (stamps un-back-dated — old behavior, never
+   broken). Both writer and consumer run under the settings-enforced TZ=UTC
+   env, so the naive stamp compares on one clock (guard-982; rb-3741's
+   TZ-split hazard applies to long-lived daemons, not these hook-env runs).
+   The watermark asserts "a completed drain pass enumerated everything
+   present at least 60 minutes before this drain finished" — it is what
+   licenses temp-drain-purge.sh Lane 1 to mechanically delete THIRD-CLASS
+   files (odd suffixes neither drainable nor enumerated ephemera) older
+   than it. READ THAT ASSERTION AGAINST PHASE 1 BEFORE YOU MAKE IT: the
+   census globs `*.md` and `*.json` ONLY, so "enumerated everything present"
+   is FALSE for exactly the third-class suffixes the stamp condemns. The two
+   halves of this step were written against different populations and the
+   gate at the top is what reconciles them. A --file invocation classifies ONLY its target, and a --dry-run
+   classifies nothing, so writing it there would falsely license purging
+   files no drain ever saw. The marker is a MANAGED
+   dotfile: allowlisted in Lane 0's unmanaged-dotfile report and exempt from
+   every purge lane (dotfile exclusion). Rationale + predicate:
+   _purge_find_predicate header in core/scripts/temp-drain-purge.sh;
+   temp-store.md § The third-class watermark.
 
 3. IF this was invoked by the loop on temp_drain_needed: the drain goal is
    satisfied once temp/ is below threshold — the next precheck recomputes the count.

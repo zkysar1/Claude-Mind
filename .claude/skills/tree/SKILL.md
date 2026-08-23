@@ -401,13 +401,15 @@ Read {node.file}
 #      table-dense node while reporting a small line count. Tables, `|`-rows, id
 #      lists and timestamps tokenize far denser than prose (the same density trap
 #      `.claude/rules/self.md` measures at 2.48-2.51 B/token for ID-dense
-#      markdown). One awk pass gives the honest profile and costs no context:
-#        grep -nE '^#{1,3} ' {node.file}      # headings + line numbers
-#        awk '/^## /{if(n!="")printf "%-70s L=%4d B=%7d\n",n,nl,nb; n=substr($0,1,70); nl=0; nb=0; next}
-#             {if(n==""){pl++;pb+=length($0)+1}else{nl++;nb+=length($0)+1}}
-#             END{printf "%-70s L=%4d B=%7d\n",n,nl,nb; printf "%-70s L=%4d B=%7d\n","[PREAMBLE]",pl,pb}' {node.file}
-#      Read the B column. A single section holding >30% of the node's bytes is
-#      the finding, whatever its line count says.
+#      markdown). ONE CALL profiles it — a scoped call to the shared tool
+#      (gap-111), never a hand-run awk, so its thresholds cannot drift from the
+#      config that owns them:
+#        Bash: bash core/scripts/tree-shape-fork.sh {node.file}   # --json to parse
+#      Emits per-section bytes/%/lines/B-per-line/est-tokens, flags the tells
+#      (DOMINANT, TABLE-shaped, OVER-CAP-ALONE) and suggests a partition count —
+#      one child is often not enough. The dominant section is the finding,
+#      whatever its line count says. It WITHHOLDS the (a)/(b)/(c)/(d) call by
+#      design; that judgment is yours below.
 #
 #        (a) APPEND-GROWN SERIES — dated sections, newer supersedes older,
 #            roughly UNIFORM section size.

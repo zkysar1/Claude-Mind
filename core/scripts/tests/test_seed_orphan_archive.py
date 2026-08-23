@@ -52,7 +52,7 @@ def _mk_dest(tmp_path: Path) -> Path:
     dest = tmp_path / "dest"
     (dest / "core").mkdir(parents=True)
     (dest / "core" / "keep.py").write_text("KEEP = 1\n", encoding="utf-8")
-    (dest / ORPHAN_REL).write_text(ORPHAN_BODY, encoding="utf-8")
+    (dest / ORPHAN_REL).write_bytes(ORPHAN_BODY.encode("utf-8"))
     return dest
 
 

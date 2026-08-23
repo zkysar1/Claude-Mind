@@ -1,4 +1,4 @@
-"""RequestContext lazy path resolution (g-367-03).
+"""RequestContext lazy path resolution ().
 
 On a pre-init deployment (no world configured, no local-paths.conf, no
 .mind-data/) AgentPathResolver.resolve() raises RuntimeError. _serve used to

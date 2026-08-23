@@ -269,6 +269,27 @@ retrieval:
   # where unprovisioned, not broken. Reversible — set false to revert.
   # Replay the A/B with world/scripts/tree-embed-ab-harness.py.
   embedding_tree_channel_enabled: true
+  # : framework-lane embedding channel. When true AND the index
+  # carries framework docs (embedding-index-build.py embeds title + section
+  # headers + a 400-char body sample as 'framework:<relpath>' ids, built from
+  # retrieve._build_framework_index so the write and read halves of the join
+  # cannot drift), load_framework_rules gains the same semantic eligibility
+  # channel the tree lane has: docs above embedding_framework_min_cosine
+  # (falling back to embedding_min_cosine) join the match set even when token
+  # overlap misses. SEPARATE flag, per the  precedent — each lane
+  # enables on its OWN A/B evidence, never on a sibling's.
+  #
+  # DEFAULT OFF, and that is not a placeholder: the motivating miss was
+  # measured on cc-13 (the paraphrase "is my teammate agent actually down or
+  # just quiet" missing partner-liveness.md while the tree and rb lanes went
+  # semantic), but the A/B for THIS lane has not been run. Flip it only with
+  # a before/after on the 6-query probe set, and record the numbers here the
+  # way the tree lane above records its own. An open question the A/B must
+  # answer: FRAMEWORK_RULES_CAP(15) cuts in TIER order, so a cosine-admitted
+  # world-convention can still be trimmed when 15 higher-tier docs matched.
+  # Per-box: an unprovisioned box has no index, cosine_scores returns {}, and
+  # the lane stays on its token baseline — safe to ship off everywhere.
+  embedding_framework_channel_enabled: false
   # : reserve this many returned slots for the top nodes by SEMANTIC
   # cosine (among those clearing the eligibility floor). The cosine bonus is
   # ADDITIVE — at most COSINE_BONUS_WEIGHT(2.0) on a ~4.5-5.4 base, roughly

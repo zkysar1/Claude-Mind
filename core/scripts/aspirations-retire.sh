@@ -18,9 +18,17 @@ PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
 # --- Parse args -----------------------------------------------------------
+# Sourced BEFORE _runtime.sh so the refusal cannot be masked by a daemon
+# failure (see _argv_strict.sh header).
+source "$CORE_ROOT/scripts/_argv_strict.sh"
+
 SOURCE_VAL="world"
 FORCE=0
 ASP_ID=""
+# ONE literal, shared by the help text and the refusal message — never two
+# (_argv_strict.sh header: two strings that must agree is the failure class
+# the refusal exists to remove).
+_ACCEPTED_FLAGS="--source <world|agent> | --force"
 declare -a PASSTHROUGH=()
 declare -a PASSTHROUGH_SOURCE=()
 
@@ -33,8 +41,16 @@ while [[ $# -gt 0 ]]; do
         --force)
             FORCE=1
             PASSTHROUGH+=("$1"); shift;;
+        -h|--help)
+            argv_strict_help "aspirations-retire.sh" "<asp-id> [--source world|agent] [--force]" "$_ACCEPTED_FLAGS";;
         -*)
-            PASSTHROUGH+=("$1"); shift;;
+            # REFUSE (). Was `PASSTHROUGH+=("$1"); shift`, and
+            # PASSTHROUGH has NO READER here — a vestige of the Python CLI
+            # fallback deleted 2026-05-14. The unrecognised flag vanished and
+            # its VALUE slid into the `*)` arm below to become ASP_ID, so the
+            # command retired a DIFFERENT aspiration than the caller named,
+            # with exit status 0.
+            argv_strict_refuse_unknown "aspirations-retire.sh" "$1" "$_ACCEPTED_FLAGS";;
         *)
             [ -z "$ASP_ID" ] && ASP_ID="$1"
             PASSTHROUGH+=("$1"); shift;;

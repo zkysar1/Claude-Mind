@@ -235,6 +235,7 @@ from gates.defer_classifier import STRUCTURED_DEFER_PREFIXES  # noqa: E402,F401
 # ). gates.blocker_ref is the single source of truth, same import
 # create-blocker.py uses.
 from gates.blocker_ref import BLOCKER_REF_TYPES  # noqa: E402
+from gates.field_shrink import evaluate as _field_shrink_eval  # noqa: E402
 
 
 def _warn_missing_user_leg_scope(goal_id, participants, user_leg_scope):
@@ -556,18 +557,14 @@ def validate_goal(goal):
         if val is not None and not isinstance(val, str):
             raise ValueError(f"Goal {goal['id']}: abstained_by must be a string or null")
     # Validate intended_agent routing hint (; pairs with capability-route-gate.py)
-    # Resolve VALID_INTENDED_AGENTS lazily — the import-time snapshot is
-    # stale in a long-lived daemon when /start adds a new agent. Fresh-eyes
-    # review HIGH H1 (2026-05-18). Cost is one yaml read per goal write,
-    # mtime-cached in _agents.get_active_agents().
-    if "intended_agent" in goal:
-        val = goal["intended_agent"]
-        valid = _valid_intended_agents()
-        if val is not None and val not in valid:
-            raise ValueError(
-                f"Goal {goal['id']}: intended_agent must be null or one of "
-                f"{sorted(valid)}, got {val!r}"
-            )
+    # Delegates to gates.intended_agent_vocab (selection-stack review
+    # 2026-08-21) — fourth guard-547 extraction alongside the three below: the
+    # daemon _validate_goal subset omitted this check, so under
+    # no-python-cli-fallback it was inert on every real filing (5 live goals
+    # carried "agent"/"reducer"/"any" from verbatim board-tag copies). The
+    # gate resolves the roster lazily per call (mtime-cached), preserving the
+    # H1 2026-05-18 staleness fix the inline copy carried.
+    _check_intended_agent_vocab(goal)
     # Validate goal_source attribution field ()
     if "goal_source" in goal:
         val = goal["goal_source"]
@@ -635,6 +632,9 @@ from gates.check_schema import evaluate as _check_schema_evaluate  # noqa: E402
 from gates.depends_on_consistency import (  # noqa: E402
     evaluate as _depends_on_consistency_evaluate,
 )
+from gates.intended_agent_vocab import (  # noqa: E402
+    evaluate as _intended_agent_vocab_evaluate,
+)
 
 
 def _check_depends_on_consistency(goal):
@@ -643,6 +643,15 @@ def _check_depends_on_consistency(goal):
     # calls the SAME evaluate() from _assert_depends_on_consistency, so the two
     # write paths can no longer drift apart (guard-547).
     result = _depends_on_consistency_evaluate(goal)
+    if result["would_block"]:
+        raise ValueError(result["message"])
+
+
+def _check_intended_agent_vocab(goal):
+    # Delegates to the shared gate, raising ValueError so validate_goal's
+    # existing contract (raise → caller surfaces) is preserved. The daemon
+    # calls the SAME evaluate() from _assert_intended_agent_vocab (guard-547).
+    result = _intended_agent_vocab_evaluate(goal)
     if result["would_block"]:
         raise ValueError(result["message"])
 
@@ -1516,6 +1525,31 @@ def _is_narrative_defer(field, value):
     from gates.defer_classifier import is_narrative_defer
     return is_narrative_defer(field, value)
 
+def _warn_unresolvable_defer_targets(goal_id, text):
+    """ADVISORY: warn when a defer_reason names a DEPENDENCY goal id that
+    resolves in no queue and no archive (g-115-7282).
+
+    CLI half of a twin (guard-2323 — port a core/scripts fix to its mind_api
+    twin in the SAME change). The framework is daemon-only for this wrapper, so
+    the LIVE half is `aspirations_write.py::update_goal`, which appends the same
+    message to its `warnings[]` array; a check added only here would be inert on
+    the exact path every production caller takes (guard-742). Verified by
+    end-to-end probe, not by review: the first version of this fix lived only in
+    this function and emitted nothing through the wrapper.
+
+    All logic — including which ids count as dependencies and the empty-universe
+    positive control — lives in `gates.defer_target_existence`. Prints to stderr
+    and returns; it NEVER refuses the write, and every failure path is silent.
+    """
+    try:
+        from gates.defer_target_existence import evaluate, sources_for
+        from _paths import agents_root
+        result = evaluate(goal_id, text, sources_for(WORLD_DIR, agents_root()))
+    except Exception:
+        return
+    if result.get("message"):
+        print(result["message"], file=sys.stderr)
+
 def cmd_update_asp_field(args):
     """Update a single field on an aspiration in place.
 
@@ -2250,6 +2284,27 @@ def cmd_update_goal(args):
                 )
                 sys.exit(1)
 
+        # Defer-target existence advisory (). Runs LAST among the
+        # defer gates — after every refusing gate has passed — so a defer that
+        # is about to be REFUSED never also emits a warning about its target.
+        # Advisory only: it prints and returns, never exits.
+        #
+        # DELIBERATELY NOT GATED ON _is_narrative_defer, and this is the whole
+        # correctness of the check. That predicate returns False for every
+        # STRUCTURED_DEFER_PREFIXES defer — including `blocked_on_dependency`
+        # and `precondition_unmet:`, which are precisely the defers that carry
+        # dependency goal ids. Measured on the live corpus 2026-08-22: of the 79
+        # non-terminal defers citing a goal id, **79 were structured and 0 were
+        # narrative**, so reusing the narrative predicate here would have fired
+        # on zero of the real population while looking correct in review — the
+        # guard-1802 class (a predicate narrower than the population it audits
+        # reports clean forever). The structured bypass exists so the capability
+        # gate's forged-skill KEYWORD scan cannot collide with machine-written
+        # markers; this check does no keyword matching, so that rationale does
+        # not transfer. Trigger on the field itself.
+        if field == "defer_reason" and value not in (None, ""):
+            _warn_unresolvable_defer_targets(goal_id, value)
+
         # Blocker-ref requirement for direct status=blocked writes ().
         # Parallel to the defer_reason gate above. Without this check, the
         # status=blocked path bypasses the blocker_ref requirement entirely —
@@ -2363,6 +2418,50 @@ def cmd_update_goal(args):
                     )
                     sys.exit(1)
                 value = _normalized
+
+        # === field-shrink guard () — CLI HALF ===
+        # Byte-parallel with the daemon half in
+        # mind_api/src/endpoints/aspirations_write.py (guard-547/2323: a
+        # normalize/validate change on one writer must land on the other in the
+        # SAME change, or the two disagree about what a legal write is). Both
+        # import the same gates.field_shrink predicate — the thresholds live in
+        # exactly one place.
+        #
+        # Placed HERE and not in an earlier gate chain because the predicate
+        # needs the pre-mutation value, which only exists once `goal` is loaded.
+        # Not wrapped in try/except: pure arithmetic, no dependency to fail, and
+        # a fail-open handler would also swallow refusal-message construction
+        # errors and convert a block into a silent pass (guard-3803).
+        _shrink = _field_shrink_eval(field, goal.get(field), value)
+        if _shrink["blocked"]:
+            _shrink_override = getattr(args, "override_shrink", None)
+            _gate_log(
+                "field-shrink-guard",
+                "override" if _shrink_override else "block",
+                caller="cli:cmd_update_goal",
+                trigger_matched=_shrink["decision_path"],
+                payload=goal_id,
+                override_reason=_shrink_override,
+                extra={"field": field, "old_len": _shrink["old_len"],
+                       "new_len": _shrink["new_len"],
+                       "ratio": _shrink["ratio"]},
+            )
+            if not _shrink_override:
+                print(
+                    f"BLOCKED: {_shrink['message']}\nGoal: {goal_id}.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        else:
+            _gate_log(
+                "field-shrink-guard", "noop",
+                caller="cli:cmd_update_goal",
+                trigger_matched=_shrink["decision_path"],
+                payload=goal_id,
+                extra={"field": field, "old_len": _shrink["old_len"],
+                       "new_len": _shrink["new_len"],
+                       "ratio": _shrink["ratio"]},
+            )
 
         # CRITICAL: capture BEFORE the mutation below — the  selection_count
         # bump compares old_status vs the new value to stay idempotent on redundant
@@ -2595,9 +2694,22 @@ def cmd_update_goal(args):
             # propagated here: before this line the file contained ZERO
             # occurrences of the field, so a terminal transition through THIS
             # door left an orphaned sid on an unclaimed goal. The daemon
-            # endpoint is the other door and already paired it at four of its
-            # five sites; a fix wired into only one door is inert on the other
-            # (the shape test_credential_enum_both_doors.py exists to police).
+            # endpoint is the other door; a fix wired into only one door is
+            # inert on the other (the shape test_credential_enum_both_doors.py
+            # exists to police).
+            #
+            # This sentence read "already paired it at four of its five sites"
+            # until 2026-08-22. Present-tense, that says one daemon site is
+            # UNPAIRED, and it sent a  investigation to hunt it.
+            # Re-measured that day (zeta, cc-02, uname -r 6.8.0-137-generic) by
+            # mapping every claimed_by pop in aspirations_write.py to its
+            # enclosing def and its sid partner: ALL FIVE ARE PAIRED —
+            # L3126 update_goal/L3176, L4239 complete_by/L4248,
+            # L4306 complete_by/L4312, L4599 release/L4606,
+            # L6892 clear_stale_claims/L6894. "Four of five" was a true
+            # description of a state that has since been fixed; left in the
+            # present tense it reads as a live defect report. Do not re-derive
+            # the hunt from this comment — verify against the file.
             #
             #  fix set B part 2: preserve WHICH BODY closed it before
             # the sid is popped, so the completing body stays forensically
@@ -3053,6 +3165,17 @@ def main():
                            "markers with no live carrier cited. Bypasses the "
                            "residual-work gate; logged to "
                            "world/residual-work-overrides.jsonl.")
+    # --override-shrink is the bypass for the field-shrink guard ():
+    # a write that would shrink `description` / `outcome_note` to under 25% of
+    # its current size, when it currently exceeds 2000 chars. Use only for a
+    # DELIBERATE condense — the common cause is a read-modify-write against a
+    # truncated read, or a wholesale REPLACE where an append was intended.
+    p_ug.add_argument("--override-shrink", dest="override_shrink",
+                      default=None,
+                      help="Justification for a write that shrinks a long "
+                           "description/outcome_note to under a quarter of its "
+                           "current length. Bypasses the field-shrink guard; "
+                           "logged to meta/gate-firings.jsonl as an override.")
     # --blocker-ref is the structured companion to a narrative defer_reason.
     # Required for any non-null, non-structured-prefix defer_reason write so
     # the quiescence gate can distinguish genuine external gating from

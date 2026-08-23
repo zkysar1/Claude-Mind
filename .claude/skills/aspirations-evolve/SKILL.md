@@ -819,9 +819,9 @@ Trigger evolution check — the system evaluates its own strategy and generates 
      **`deferred-to-goal` re-check (MANDATORY — a deferral must not suppress forever).** On seeing
      this status, probe its tracker before honoring it:
      `Bash: aspirations-query.sh --goal-field id "{gap.resolution_tracked_by}" --full`
-     — `--goal-field id`, NOT `goal_id`. The output projection RENAMES the record key `id` to
-     `goal_id`, but only `id` is queryable, so querying the name you see in the output returns a
-     silent, plausible-looking 0 hits (measured 2026-08-01: `goal_id` → 0 rows, `id` → 1 row).
+     — EITHER NAME WORKS: `goal_id` is a REGISTERED alias of `id` (`_goal_fields.py:113`).
+     SUPERSEDES the pre-2026-08-22 "only `id` is queryable" claim — re-measured on that
+     claim's own goal g-115-3767: 1 row BOTH ways (g-115-4430). Fail-CLOSED below unchanged.
      Then: `resolution_tracked_by` ABSENT or empty → the deferral names nothing to re-check and so
      could never self-clear; treat it as MALFORMED, set the gap back to `registered`, note why, and
      evaluate forge criteria normally. This is the ONE case that fails OPEN, deliberately — a
@@ -1014,10 +1014,10 @@ FOR EACH skill in flagged.skills:
     # duplicate FILING while a prior follow-up is still active. Resolved
     # goals do not block re-filing — if a prior investigation closed
     # without addressing the silence, we want a fresh signal.
-    Bash: load-aspirations-compact.sh
-    IF any goal exists with skill.skill in its title AND status in
-       (pending, in-progress, blocked) AND title contains any of
-       ("silent", "discovery", "cold", "declining"):
+    # PROBE THE SKILL NAME ALONE — not a keyword list, not an exact
+    # origin_signal (its status suffix drifts). Both miss owners. rb-8741.
+    Bash: aspirations-query.sh --title-contains "{skill.skill}"
+    IF any returned goal has status in (pending, in-progress, blocked):
         Log: "DISCOVERY AUDIT: {skill.skill} already has active follow-up — skipping"
         continue
 
@@ -1213,19 +1213,17 @@ For each `recommendation` in {retire, tighten, widen, investigate, inert_candida
      gate whose taxonomy defect is already tracked.
 
    **THE DISCRIMINATOR, and it is one read.** Before filing on `fail_open`,
-   open the actual firing records in `meta/gate-firings.jsonl` and look for
-   evidence the gate THREW. Do not take the recommendation's own `reason`
-   text as that evidence — measured 2026-08-11 (echo, hostname cc-03, uname -r
-   6.8.0-136-generic), the emitted reason instructs you to "inspect the
-   `gate_error` field on those firings" and **that field does not exist in the
-   firing schema at all**: all 119 `store-dupe-warn` fail_open records carry
-   keys `agent, caller, decision, extra, gate_id, payload_hash,
-   schema_version, session_id, ts` and nothing else. So the advice cannot be
-   followed, and its unfollowability is itself the tell — a genuine crash
-   would have left a trace somewhere. Read `extra.reason` instead: a value
-   like `JSONDecodeError` on empty stdin is a DECLINE, not a crash.
-   (guard-1675: an absent field is not a zero. rb-245: probe the schema before
-   concluding from a count.)
+   open the firing records in `meta/gate-firings.jsonl` and look for evidence
+   the gate THREW — not the recommendation's own `reason` text. Read
+   `extra.reason`: `JSONDecodeError` on empty stdin is a DECLINE, not a crash.
+   Measured 2026-08-21 (zeta, cc-02, 6.8.0-137-generic): **120 of 120**
+   `store-dupe-warn` fail_open records carry `extra.reason: JSONDecodeError`.
+   `gate_error` — the field the emitted reason tells you to inspect, ABSENT
+   from all 119 records on 2026-08-11 (echo, cc-03) — now exists on exactly
+   ONE, and it CORROBORATES the decline (`Expecting value: line 1 column 1`,
+   i.e. empty stdin). Its arrival does not make this marker stale; it supplies
+   the evidence the marker had to infer. (guard-1675: an absent field is not
+   a zero. rb-245: probe the schema before concluding from a count.)
 6. For `inert_candidate`: file an Investigate goal to verify the gate is
    truly inert and route it to retirement or telemetry re-enable. The
    evaluator emits this when a prior retire/tighten/widen recommendation

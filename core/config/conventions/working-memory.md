@@ -55,7 +55,7 @@ All scripts in `core/scripts/`. File path is hardcoded to `agents/<agent>/sessio
 
 | Script | Purpose | Side Effects |
 |--------|---------|-------------|
-| `wm-read.sh [slot] [--json]` | Read slot or full WM | Updates `slot_meta.{slot}.accessed_at` |
+| `wm-read.sh [slot] [--json]` | Read slot or full WM | **NONE — this said "Updates `slot_meta.{slot}.accessed_at`" until 2026-08-22 and it has been false since the 2026-05-14 daemon-only cutover. See "Auto-Timestamps" below (SSOT).** |
 | `echo '<json>' \| wm-set.sh <slot>` | Set slot value from stdin | Updates `slot_meta.{slot}.updated_at`, increments `update_count` |
 | `echo '<json>' \| wm-append.sh <slot>` | Append to array slot | Adds `_item_ts` to item, enforces array limits, updates meta |
 | `wm-clear.sh <slot>` | Null scalars, empty arrays | Updates `slot_meta.{slot}.updated_at` |
@@ -131,8 +131,53 @@ no schema declaration required, skill owns the write path.
 ## Auto-Timestamps
 
 Every `wm-set.sh` and `wm-append.sh` call automatically updates `slot_meta.{slot}.updated_at`.
-Every `wm-read.sh <slot>` call updates `slot_meta.{slot}.accessed_at`.
 Items appended via `wm-append.sh` get `_item_ts` field with the current local ISO timestamp.
+
+### `accessed_at` HAS NO LIVE WRITER — do not read it as consumption evidence (g-306-327, 2026-08-22)
+
+**This section said "Every `wm-read.sh <slot>` call updates
+`slot_meta.{slot}.accessed_at`" until 2026-08-22.** That is FALSE and has been
+since the **2026-05-14 daemon-only cutover**. Three independent signals, plus a
+live positive control:
+
+1. `core/scripts/wm.py` defines `update_accessed()` (L704) and **nothing calls
+   it** — anywhere in `core/scripts/` or `mind_api/src/`. wm.py has no
+   `cmd_read` at all; the read command left the CLI module.
+2. `mind_api/src/endpoints/wm.py` (L19-21) states the daemon deliberately skips
+   the write — *"that's a daemon-safe writer (PR 2 territory). Until then the
+   fallback path still records."*
+3. **That fallback path no longer exists.** `wm-read.sh` is DAEMON-ONLY as of
+   2026-05-14, no Python CLI fallback (`.claude/rules/no-python-cli-fallback.md`).
+   So the daemon's stated reliance on it is stale by ~100 days.
+4. Live positive control (zeta, `hostname` cc-02, `uname -r` 6.8.0-137-generic):
+   `wm-read.sh known_blockers` returned rc=0 and produced **zero** `slot_meta`
+   change — no `known_blockers` entry was even created.
+
+**The only remaining writer is `compact-restore-slots.py` (L270, L431), which
+stamps `now_iso()` on RESTORE.** So a non-null `accessed_at` records *a
+compaction restore*, not an access; `null` records *no restore*, not *never
+consumed*. `wm-ages.sh --json`'s `minutes_since_access` inherits this and means
+nothing. Pruning is unaffected — `cmd_prune` keys on `updated_at`, never on
+`accessed_at`.
+
+**Why this matters enough to be written down:** an agent DID reason from this
+field and reached a false conclusion. A worker Body read `accessed_at` 15 min
+after body start and inferred "no drain ran in 8.8 days", which became the
+central unverified premise of g-306-327 (relayed from g-363-19 and posted to
+the findings board). Dead telemetry that *looks* live is worse than an absent
+field.
+
+Nothing DECIDES on `accessed_at` — its sole consumer is a report field
+(`cmd_ages` → `minutes_since_access`). Whether to restore the writer or retire
+the field is an open decision, not settled here.
+
+**Other describers of this same claim** (enumerate by SUBJECT, per guard-2333):
+`core/config/conventions/session-state.md` L712,
+`core/config/blocked-sleep-recovery-digest.md` L21,
+`core/config/verification-checklist.md` L2262,
+`.claude/skills/aspirations/SKILL.md` L288 + L592,
+`core/scripts/orchestrator-entry-battery.py` L19. **This section is the SSOT** —
+correct describers by pointing here, do not restate the predicate in each.
 
 Items without `_item_ts` are treated as old (pre-migration or manually added).
 

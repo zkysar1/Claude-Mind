@@ -36,6 +36,16 @@ This file pins the READ (visibility) side only; the WRITE (CAS) side is filed
 separately. Outcome 1's "measured select->409 count = 0 in a two-body run" is
 gated on the g-306-126 soak and is NOT asserted here.
 
+PART 2 (selection-stack review 2026-08-21): the whole claim block was
+`if source == "world"` from birth, on the premise that agent-queue goals never
+carry claims. The premise is false — cross-agent pull writes the claim back to
+the OWNING sibling's queue (g-115-1766), and a sibling Body's claim lands on
+this agent's own queue — so both livelock shapes reproduced one store over,
+invisible to the filter. The block is now UNCONDITIONAL across sources; where
+the claim fields are absent (the agent-queue majority) it is a structural
+no-op. The agent-source tests below pin the new behavior, its expiry ladder,
+and the no-op guarantee.
+
 Pattern mirrors test_goal_selector_human_blocked.py: build synthetic
 aspirations, call collect_candidates directly.
 """
@@ -198,12 +208,42 @@ def test_unclaimed_goal_still_visible():
     assert "g-free" in _visible([_goal("g-free")])
 
 
-def test_agent_queue_is_untouched_by_the_body_filter():
-    # The whole claim block is `if source == "world"`. Agent-queue goals never
-    # claim, so a stray claimed_by there must not start hiding work.
-    g = _goal("g-agentq", claimed_by=MIND, claimed_by_sid=SIBLING_SID,
+# ── PART 2: the claim filter is unconditional across sources ──────────────────
+
+def test_agent_queue_foreign_claim_now_hidden():
+    # Cross-agent pull writes a puller's claim back to the OWNING sibling's
+    # queue (). Pre-part-2 the owner kept re-selecting its own goal
+    # while the puller executed it — the world-queue livelock one store over.
+    g = _goal("g-agentq-foreign", claimed_by="bravo", claim_age_h=0.5)
+    assert "g-agentq-foreign" not in _visible([g], source="agent")
+
+
+def test_agent_queue_sibling_body_claim_now_hidden():
+    # 's two-Body shape, reproduced in the agent queue.
+    g = _goal("g-agentq-sib", claimed_by=MIND, claimed_by_sid=SIBLING_SID,
               claim_age_h=0.5)
-    assert "g-agentq" in _visible([g], source="agent")
+    assert "g-agentq-sib" not in _visible([g], source="agent")
+
+
+def test_agent_queue_expired_claim_falls_through():
+    # The same expiry ladder governs the agent source — an abandoned claim
+    # must not wedge the owner's own queue.
+    g = _goal("g-agentq-old", claimed_by="bravo",
+              claim_age_h=CLAIM_TIMEOUT + 2)
+    assert "g-agentq-old" in _visible([g], source="agent")
+
+
+def test_agent_queue_own_body_claim_still_visible():
+    # My own claim in my own queue stays re-selectable (same as world).
+    g = _goal("g-agentq-mine", claimed_by=MIND, claimed_by_sid=MY_SID,
+              claim_age_h=0.5)
+    assert "g-agentq-mine" in _visible([g], source="agent")
+
+
+def test_agent_queue_unclaimed_is_a_structural_noop():
+    # The no-op guarantee that made this extension safe: absent claim fields
+    # (the overwhelming agent-queue majority) leave behavior byte-identical.
+    assert "g-agentq-free" in _visible([_goal("g-agentq-free")], source="agent")
 
 
 def test_body_sid_constant_is_env_derived():
