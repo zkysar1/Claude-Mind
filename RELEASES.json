@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.2",
+    "previous_version": "2.12.1",
+    "date": "2026-08-23",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "guard-119 reconcile before the Claude-Mind to ZDS-Mind hop: back-port the two genuinely-AUTHORED ZDS improvements (agent-watchdog host-disk breach naming pinned by its test; strategic-scan staleness lessons generalized out of ZDS's deployment-specific log).",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.1",
     "previous_version": "2.12.0",
     "date": "2026-08-23",
