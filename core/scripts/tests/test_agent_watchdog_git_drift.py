@@ -281,7 +281,19 @@ def test_disk_breach_fires(monkeypatch, tmp_path):
     assert len(events) == 1
     assert events[0].payload["disk_used_pct"] == 92.0
     assert events[0].payload["disk_free_gib"] == 3.0
-    assert any("disk=92.0%" in b for b in events[0].payload["breaches"])
+    # PIN THE `host-` PREFIX, not a bare `disk=` substring. The prior assertion
+    # was `any("disk=92.0%" in b ...)`, which "host-disk=92.0%" ALSO satisfies —
+    # so it survived the rename without noticing it, and would equally survive
+    # the prefix being REMOVED again. That prefix is the whole point of the
+    # change: shutil.disk_usage measures the filesystem CONTAINING the path,
+    # which on a shared-fs container is the HOST volume, and a breach string
+    # that does not say so becomes a goal title nobody can act on (guard-846;
+    # guard-602 — assert the specific attribute you just wrote).
+    # Back-ported from downstream prod 2026-08-23, where the assertion was
+    # authored alongside the rename it pins.
+    breach = next(b for b in events[0].payload["breaches"] if "disk=92.0%" in b)
+    assert breach.startswith("host-disk=92.0%"), breach
+    assert "HOST volume" in breach and "not reclaimable from inside" in breach
 
 
 def test_disk_unreadable_is_not_a_breach(monkeypatch, tmp_path):

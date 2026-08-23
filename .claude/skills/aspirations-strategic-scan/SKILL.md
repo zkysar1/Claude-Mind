@@ -490,6 +490,56 @@ IF opened < len(stale_nodes):
 # print the raw `last_update_trigger` block for 2-3 stale nodes and eyeball the
 # shape before trusting any count. Do not report 0/N from a parser you wrote
 # this turn without one of those two checks. (guard-2421, guard-1419, guard-1984.)
+#
+# ⚠ AND THE PRIOR IS WORLD-SCOPED, NOT UNIVERSAL — CHECK WHICH TREE YOU ARE IN
+# BEFORE USING IT AS A CONTROL. Every count above was taken against ONE
+# deployment's knowledge tree, and `world/` is a per-deployment EXTERNAL path, so
+# the node keys and totals describe THAT world. BOX DOES NOT IMPLY WORLD: agents
+# on the same hostname and kernel can screen entirely separate trees. Measured
+# downstream 2026-08-12 — both node keys named in a written prior returned NOT IN
+# INDEX there, having never existed in that world. An agent following guard-2421
+# literally ("a fresh 0 CONTRADICTS a written prior — believe the prior and
+# re-read") would have hunted a parser bug that was not there. These rows record
+# hostname and kernel but NOT world. Record the world; treat a cross-world prior
+# as no prior at all.
+#
+# FIVE THINGS THE DOWNSTREAM SERIES ESTABLISHED (back-ported + generalized
+# 2026-08-23; the dated per-deployment readings stay in that world, per
+# promotion-runbook "semantic carry, not byte carry"):
+#  (1) SPOT-CHECK THE INDEX AGAINST THE FILES FIRST. A count taken through a
+#      diverged `_tree.yaml` is a count of the INDEX (guard-668). One sweep found
+#      35 of 211 nodes (17%) disagreeing with their own front matter, 30 with the
+#      index NEWER — which HIDES staleness. True stale count was 20, not the 8-11
+#      reported: 13 nodes were invisible to the very detector meant to find them.
+#  (2) THE SCREEN'S PREDICATE IS NARROWER THAN THIS DOC. It reads
+#      `node.last_updated` only, while `content_verified` is the TRUE content
+#      date. A node with recent `content_verified` and an older structural
+#      `last_updated` is a PERMANENT false positive. Do NOT bump its
+#      `last_updated` to silence the screen — that falsifies the structural
+#      history. Judge the EFFECTIVE count; a raw count drifts toward being a
+#      measure of the predicate rather than of the tree.
+#  (3) TYPE PREDICTS DRIFT BETTER THAN AGE (guard-680). Over one full cohort every
+#      clean node was CITATION-OR-STRUCTURE and every node with real drift was
+#      OPERATIONAL-STATE, while age separated nothing — triage operational-first.
+#      But the PENDING/HELD/NOT-YET/DEPLOY phrase grep that normally earns its
+#      keep there returned 5 hits and all 5 were FALSE on an external-article
+#      cohort: it matched SUBJECT MATTER, not readiness ("deploy AI systems"; a
+#      `source:` provenance line recording an HTTP 403, which will match on any
+#      user-paste node forever). Read the matched LINE before believing a hit.
+#  (4) BOTH ZERO-CASE CONTROLS ARE BLIND TO AN UNDERCOUNT. The opened/total check
+#      and guard-2421's "a fresh 0 contradicts the prior" both aim at ZERO; a
+#      WRONG NON-ZERO passes them cleanly. One pass reported 1 structural where
+#      the answer was 2, having eyeballed triggers while sweeping for content
+#      drift — the rarer trigger read as ordinary. THE CHECK: print the trigger
+#      for EVERY stale node and diff that set MECHANICALLY against
+#      STRUCTURAL_TRIGGERS. Never classify by eye while doing other work. A wrong
+#      prior is worse than no prior.
+#  (5) SAY WHICH KIND OF MOVE IT IS. A FALL can be a SHRINKING POPULATION (nodes
+#      re-verified out) rather than improving freshness; a RISE can be an AGING
+#      COHORT crossing the line together rather than new drift; a HOLD is neither.
+#      Print the age histogram and trigger buckets, not just the count. And a LOW
+#      count is not automatically a triage list — at stale=2 both survivors were
+#      `content_verified` false positives and the honest effective count was ZERO.
 
 # STRUCTURAL STAMPS CLUSTER BY EVENT — one decompose splitting a parent into N
 # children understates all N at once (2 events accounted for 5 nodes that day). So
