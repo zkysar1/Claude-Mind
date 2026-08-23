@@ -1,0 +1,38 @@
+# Environment registry entry -- coach-mind (added 2026-08-23).
+#
+# The zak-code TEST BED. A fifth-and-sixth-deployment pair joined the roster on
+# this date (coach-mind here, serene-mind alongside); before that the registry
+# listed four while six existed, so peer-surface and every cross-deployment
+# count silently under-reported by two.
+#
+# TOPOLOGY -- deliberately unlike its siblings, and the difference matters.
+# coach-mind's git `origin` IS Claude-Mind.git: it is a direct clone of staging
+# rather than a repo of its own. Consequences, measured 2026-08-23 on zc-03:
+#   * Framework updates arrive by plain `git pull` -- its history literally
+#     contains staging's merge PRs (#21/#22/#23), so it tracked to v2.11.0 with
+#     no promotion run and no recurring sync goal. It is the only deployment
+#     whose framework currency is free.
+#   * The cost is that it has nowhere to push its OWN state. `.mind-data/` is
+#     gitignored (0 tracked files) -- a DEFENSIVE choice, since committing world
+#     state into a staging clone would contaminate staging -- and the price is
+#     that coach's world+meta carry no history and no backup. ZDS-Mind
+#     git-carries its `.mind-data/` and additionally runs an off-repo backup
+#     cadence; coach-mind has neither.
+# Re-topologying it onto the ZDS pattern (own repo, tracked stores, promotion
+# PRs in) is deferred to asp-360 on purpose: that aspiration replaces
+# push-promotion with a pull protocol, and building coach's topology before the
+# protocol settles would build it twice.
+#
+# backend: local -- self-contained, touches no cloud resources, so committing
+# this entry cannot mix state into a wrong bucket. The coach-mind operator sets
+# own-cloud wiring HERE when cutting over (bucket / sessions_table / lock_table
+# / region), exactly as the zds-mind and claude-mind entries describe.
+environment_id: coach-mind
+backend: local
+# known_agents (OPTIONAL, ): feeds the cross-deployment addressing
+# collision set -- a BARE requires_action_by:<name> present in both the local
+# roster and a peer's known_agents is ambiguous and FAILS LOUD in
+# insight-trigger-sweep.py resolve_addressing(). Measured 2026-08-23 from
+# zc-03 /opt/coach-mind/agents/: the roster is exactly one agent.
+known_agents:
+  - coach

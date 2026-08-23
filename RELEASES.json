@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.3",
+    "previous_version": "2.12.2",
+    "date": "2026-08-23",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Fix the missing import os in learning-routing-audit.py: world_owns_agent_corpus() raised NameError on every call since d2353de47, taking the learning-routing audit and repair lanes down with it. Also registers coach-mind and serene-mind in the environments registry.",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.2",
     "previous_version": "2.12.1",
     "date": "2026-08-23",
