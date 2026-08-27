@@ -56,6 +56,7 @@ if [ -z "$SINCE" ] && [ -n "$SINCE_GOAL" ]; then
           PROJECT_ROOT_EARLY="$PROJECT_ROOT_EARLY" \
           WORLD_PATH="${WORLD_PATH:-}" \
           AGENT_NAME="${MIND_AGENT:-}" \
+          AGENTS_PARENT_DIR="$AGENTS_PARENT_DIR" \
           python3 - <<'PYEOF' 2>/dev/null || true
 import json, os, sys
 goal_id = os.environ["SINCE_GOAL"]
@@ -66,8 +67,11 @@ paths = []
 if world_path:
     paths.append(os.path.join(world_path, "aspirations.jsonl"))
 if agent_name:
-    # Phase 2.5.D: agent dirs under agents/ parent.
-    paths.append(os.path.join(project_root, "agents", agent_name, "aspirations.jsonl"))
+    # Phase 2.5.D: agent dirs under agents/ parent. : the segment is
+    # constant-routed via the env (guard-604 + guard-165). No literal fallback --
+    # the caller sources _paths.sh, so an unset var is a real bug, not a default.
+    paths.append(os.path.join(
+        project_root, os.environ["AGENTS_PARENT_DIR"], agent_name, "aspirations.jsonl"))
 for p in paths:
     if not os.path.isfile(p):
         continue

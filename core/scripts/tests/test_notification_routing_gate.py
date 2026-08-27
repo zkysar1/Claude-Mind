@@ -42,11 +42,39 @@ def test_status_categories_suppress_and_always_name_a_destination(cat):
 # the human channel -- these ARE the replacement, not an exemption
 # --------------------------------------------------------------------------- #
 
-@pytest.mark.parametrize("cat", ["decision-needed", "user-digest"])
+@pytest.mark.parametrize("cat", ["decision-needed", "user-digest", "reply"])
 def test_human_channel_categories_always_send(cat):
     verdict, _reason, dest = decide(cat, "anything", "anything")
     assert verdict == SEND
     assert dest is None
+
+
+def test_the_worked_example_an_answer_he_asked_for_reaches_him():
+    """ / . He emailed on 2026-08-15 asking 'send me an
+    email with exact instructions'; the verified answer went out as `info`,
+    suppressed to the findings board, and sat nine days on a board he does not
+    read. The SAME text under `reply` must send.
+
+    Both halves are asserted deliberately. The `info` half is the positive
+    control: without it a future change that made everything send would pass
+    the reply half while silently repealing the 2026-08-10 directive.
+    """
+    subject = "The IAM grant you asked about"
+    body = ("The grant was already applied on 2026-08-16 under policy "
+            "ayoai-fleet-least-priv v7. No action needed on your side.")
+    assert decide("info", subject, body)[0] == SUPPRESS
+    assert decide("reply", subject, body)[0] == SEND
+
+
+def test_reply_is_not_a_bypass_of_the_status_categories():
+    """Scope control. Adding a third ALWAYS_SEND member must not widen the set
+    by accident — the directive's whole value is that status reports stay
+    suppressed (guard-4722: the gate refusing a reply-shaped message was RIGHT
+    when the message was really an ask)."""
+    from notification_routing_gate import ALWAYS_SEND_CATEGORIES, FLEET_HANDLEABLE_CATEGORIES
+    assert ALWAYS_SEND_CATEGORIES == {"decision-needed", "user-digest", "reply"}
+    assert FLEET_HANDLEABLE_CATEGORIES == {"info", "update", "completion", "blocker"}
+    assert not (ALWAYS_SEND_CATEGORIES & FLEET_HANDLEABLE_CATEGORIES)
 
 
 # --------------------------------------------------------------------------- #

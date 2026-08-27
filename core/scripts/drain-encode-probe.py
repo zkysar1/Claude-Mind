@@ -158,6 +158,36 @@ def classify(path):
         return "goal", d
     if "id" in ks and ({"verbatim_anchors", "content_path"} & ks):
         return "experience", d
+
+    # ---- Extended shapes () -------------------------------------
+    # APPENDED AFTER every branch above ON PURPOSE: these predicates were
+    # measured ONLY against payloads that already fell through to
+    # `unknown_shape`, so placing them last makes the change provably
+    # non-regressive -- no payload that classifies today can be re-typed by
+    # them. Populations measured on a live temp root (alpha, cc-04,
+    # 2026-08-24, n=463 unknown_shape dict payloads), pairwise-disjoint
+    # (0 payloads matched two predicates):
+    #     hypothesis 109   aspiration 44   verification 15
+    #     meta_log    15   diary_entry 14  skill_gap    8
+    # The last four are typed but have NO probe entry, so probe_file() returns
+    # verdict="unknown" with "no probe for shape" -- naming the shape without
+    # asserting anything about whether its effect landed. That is deliberate
+    # per guard-3616: the fall-through must never hand a definite verdict to
+    # the no-information case, and a named-but-unprobed shape is still strictly
+    # more useful to a reader than `unknown_shape`.
+    if {"claim", "confidence", "horizon"} <= ks:
+        return "hypothesis", d
+    if {"goals", "id"} <= ks and ({"initial_goal_count", "motivation"} & ks):
+        return "aspiration", d
+    if {"checks", "outcomes"} <= ks:
+        return "verification", d
+    if {"event", "insight"} <= ks and ({"procedure_match", "outcome"} & ks):
+        return "meta_log", d
+    if {"entry_type", "goal_id"} <= ks:
+        return "diary_entry", d
+    if "procedure_name" in ks and ({"encounter_log", "times_encountered"} & ks):
+        return "skill_gap", d
+
     return "unknown_shape", None
 
 
@@ -373,6 +403,42 @@ def probe_tree_batch(rows):
         applied, checked)
 
 
+def probe_hypothesis(payload):
+    """Pipeline record. `pipeline-read.sh --id` exits 0 for BOTH hit and miss,
+    so the exit code discriminates nothing -- the `error` key does. Only a
+    well-formed `not_found` is evidence of absence; every OTHER error shape is
+    a store we could not read, which must stay `unknown` per this module's
+    fail-open contract (docstring, and guard-3616)."""
+    hid = (payload.get("id") or "").strip()
+    if not hid:
+        return "unknown", "payload has no id to match"
+    rec = _run(_sh("pipeline-read.sh", "--id", hid))
+    if rec is None:
+        return "unknown", "pipeline-read unreadable for %s" % hid
+    if isinstance(rec, dict) and rec.get("error"):
+        if rec.get("error") == "not_found":
+            return "absent", "no pipeline record %s" % hid
+        return "unknown", "pipeline-read error %r for %s" % (rec.get("error"), hid)
+    return "encoded", "pipeline record %s exists" % hid
+
+
+def probe_aspiration(payload):
+    """Aspiration record. Same error-key discrimination as probe_hypothesis."""
+    aid = (payload.get("id") or "").strip()
+    if not aid:
+        return "unknown", "payload has no id to match"
+    rec = _run(_sh("aspirations-read.sh", "--source", "world", "--id", aid))
+    if rec is None:
+        return "unknown", "aspirations-read unreadable for %s" % aid
+    if isinstance(rec, dict) and rec.get("error"):
+        if rec.get("error") in ("not_found", "no_match"):
+            return "absent", "no aspiration record %s" % aid
+        return "unknown", "aspirations-read error %r for %s" % (rec.get("error"), aid)
+    if isinstance(rec, list) and not rec:
+        return "absent", "aspirations-read returned empty list for %s" % aid
+    return "encoded", "aspiration record %s exists" % aid
+
+
 _PROBES = {
     "reasoning_bank": probe_reasoning_bank,
     "guardrail": probe_guardrail,
@@ -380,6 +446,8 @@ _PROBES = {
     "experience": probe_experience,
     "tree_batch": probe_tree_batch,
     "trace_md": probe_trace_md,
+    "hypothesis": probe_hypothesis,
+    "aspiration": probe_aspiration,
 }
 
 

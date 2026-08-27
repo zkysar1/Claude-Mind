@@ -228,6 +228,10 @@ Run every item; each is a one-liner and each has caught a real defect:
 
 ## Cross-references
 
+- `core/config/conventions/pull-promotion.md` — the PULL side: how a
+  downstream Mind ADOPTS a tagged release in its own idle window. This file
+  is dev→staging (push); that one is staging→downstream (pull).
+
 - `.claude/rules/promotion-cycle.md` — the chain, sign-off rules, drift gate
 - `seed-plant-living-prod-safety` (tree) — blast-radius classes per plant step
 - `seed-publication-methodology` (tree) — source-stays-dirty transform model

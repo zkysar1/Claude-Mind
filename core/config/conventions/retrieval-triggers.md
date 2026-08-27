@@ -236,6 +236,45 @@ The tree-maturity census is the sharpest case: its subject query
 returned **4** guardrails total against the mechanism query's 20, with
 zero overlap.
 
+
+### Mechanism phrasing is necessary but NOT sufficient — the operative variable is VOCABULARY
+
+The subject-vs-mechanism axis above is about what the query is *about*. A
+second, independent axis decides whether a well-aimed query lands at all:
+whether its WORDS are the ones the entry literally contains. `retrieve.sh`
+ranks by token overlap, so it is nearly blind to a paraphrase that describes
+the same idea in different words — including a paraphrase that is correctly
+mechanism-phrased.
+
+Measured 2026-08-26 (bravo, cc-05) against `guard-1826` (`times_active`
+2101), whose rule ends *"A sweep hit is evidence that a condition HOLDS,
+never evidence that it is UNREPORTED"*. Same flags, same depth, only
+phrasing varied:
+
+| query | tokens | phrasing | result |
+|---|---|---|---|
+| "stateless sweep re-surfaces same item every cycle repeated board mentions are lane cadence not evidence of neglect" | 16 | mechanism, my words | **absent** from top-8 |
+| "stateless sweep resurfaces hits" | 4 | mechanism, my words | **absent** — though `STATELESS` appears verbatim in the rule's first clause |
+| "sweep hit evidence condition holds not unreported" | 7 | mechanism, **the rule's words** | **rank 1** |
+
+The 4-token miss is the load-bearing row: it falsifies token-dilution-by-
+length as the whole explanation, because a short query missed too. What the
+winning query has is the entry's own closing sentence, near-verbatim.
+
+**Consequence for the two-query discipline:** the second query should differ
+in VOCABULARY, not only in subject-vs-mechanism framing. Compose it from the
+words a *rule* would use — imperative verbs, store nouns, the exact failure
+terms (`empty`, `stale`, `zero`, `holds`, `unreported`) — rather than from
+the words of your problem.
+
+**Honest limit:** composing the winning query often requires already knowing
+the answer, so this is a structural property of token-overlap retrieval over
+a paraphrase-rich corpus, not a skill deficit. The instruction is therefore
+"query twice in different vocabularies", never "phrase it better" — the
+latter is unfollowable. `guard-5231` carries the behavioural rule and the
+distinction from `guard-3665` (whose empty comes from a TIMEOUT and whose
+remedy, re-run it, cannot fix a vocabulary miss).
+
 ### Invocation-table footnotes
 
 - Free-text queries: supplementary stores fall back to matching `title` /

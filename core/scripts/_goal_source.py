@@ -19,6 +19,16 @@ VALID_GOAL_SOURCES = frozenset({
     "user", "agent-self", "recurring-cycle",
     "cycle-detector", "forge-skill",
 })
+# NOT a member, deliberately: "chat-originated". The chat-goal lane
+# (core/config/chat-goal-protocol-digest.md) originally prescribed it as a
+# goal_source, which is a category error this set is the SSOT for --
+# goal_source answers WHO INITIATED (a chat request is initiated by the user),
+# while "chat-originated" answers WHICH LANE FILED IT. Overloading the WHO
+# vocabulary with a HOW value would have made every user-sourced consumer
+# (drift denominators, US-06 attribution) blind to chat work. The lane
+# discriminator lives in origin_signal as the sanctioned "chat-goal:" prefix
+# below, which infers back to "user" -- so the goal is countable AS a lane and
+# still classified correctly AS user-initiated. (, 2026-08-26.)
 
 
 def infer(origin_signal):
@@ -32,7 +42,12 @@ def infer(origin_signal):
     if (sig == "user_directive"
             or sig.startswith("pending_question:")
             or sig.startswith("user-directed:")
-            or sig.startswith("user_directed:")):
+            or sig.startswith("user_directed:")
+            # chat-goal lane (): a substantive assistant-mode request
+            # filed as a goal record. User-initiated, so it infers "user" like
+            # its siblings; the prefix is what makes the LANE countable without
+            # a second vocabulary. Keep locked with ALLOWED_PREFIXES.
+            or sig.startswith("chat-goal:")):
         return "user"
     if sig.startswith("recurring_cadence:") or sig.startswith("recurring:"):
         return "recurring-cycle"

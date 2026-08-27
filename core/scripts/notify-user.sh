@@ -7,6 +7,11 @@
 #
 #   notify-user.sh --category C --subject S (--message M | --message-file F)
 #                  [--goal-id G] [--allow-duplicate '<what is new>'] [--dry-run]
+#                  [--in-reply-to '<what he asked, and when>']
+#     --in-reply-to is REQUIRED for --category reply (rc 2 without it) and is
+#     appended to the body. `reply` is an ALWAYS_SEND category, so the citation
+#     is what keeps it from becoming a way to re-send a message the routing gate
+#     refused (, guard-4722).
 #   <builder payload> | notify-user.sh --payload-stdin   (already-built payload)
 #
 # Order: routing gate -> prior-outreach gate -> payload builder -> transport

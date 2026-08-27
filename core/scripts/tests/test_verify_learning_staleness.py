@@ -286,3 +286,36 @@ if __name__ == "__main__":
             print(f"FAIL {fn.__name__}: {e}")
     print(f"\n{len(fns) - failed}/{len(fns)} passed")
     sys.exit(1 if failed else 0)
+
+
+# ── L4 trailing-comment strip (felt-sense 2026-08-27, zeta) ────────────────────
+# The sole stale finding across 129 skills / 3841 assertions was a flag named
+# ONLY inside a trailing `# ...` warning (`--json`, NOT `--output json`) on a
+# line whose command was correct. A comment is prose, never an executed arg.
+# BOTH axes pinned per guard-2319: the warned-against flag is not reported, AND
+# a genuinely-stale flag in the real command is still reported.
+
+def test_e2e_flag_only_in_trailing_comment_not_flagged():
+    body = ('bash core/scripts/aspirations-query.sh --goal-status pending '
+            '# `--goal-status`, NOT `--status`')
+    flagged = _flags_flagged(body)
+    assert "--status" not in flagged, \
+        f"flag named only in a trailing comment was reported stale: {flagged}"
+
+
+def test_e2e_stale_flag_before_comment_still_flagged():
+    """Positive control — stripping the comment must not blind the lane."""
+    body = 'bash core/scripts/aspirations-query.sh --status pending  # harmless note'
+    assert "--status" in _flags_flagged(body), "detector went blind after comment strip"
+
+
+def test_e2e_hash_inside_quotes_does_not_truncate():
+    """A `#` inside a quoted value is data, not a comment start."""
+    body = ('bash core/scripts/aspirations-query.sh --title-contains "fix #12" '
+            '--status pending')
+    assert "--status" in _flags_flagged(body), "quoted '#' wrongly truncated the arg tail"
+
+
+def test_strip_trailing_comment_leaves_bare_hash_in_token():
+    """Only a `#` at a word boundary starts a comment (`--tag=a#b` is one token)."""
+    assert _mod._strip_trailing_comment("--tag=a#b --x") == "--tag=a#b --x"

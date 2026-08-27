@@ -288,3 +288,65 @@ def test_selection_stays_role_blind():
     assert "skill_eligibility" not in src
     assert "worker_execute" not in src
     assert we.LIFECYCLE_DISPOSITIONS["select"].kind == we.SHARED_COMPONENT
+
+
+# ------------- the skill-less branch must not read as a PASS () -------------
+
+def test_skill_less_branch_declares_non_evaluation_not_a_pass():
+    """A SKILL-keyed bridge cannot answer "is this GOAL reducer-only?" for a goal
+    that names no skill -- it has no key at all. The branch used to return
+    "no skill named on the goal -- ordinary worker-eligible work", rendering a
+    structurally-unanswerable question as a CLEARED CHECK. That string was the
+    whole danger: 919 of 938 live candidates take this branch, and two
+    reducer-only goals reached worker Bodies behind it -- g-306-284 (which pushes
+    main, and which the drain lane affirmatively instructed a worker to claim)
+    and g-115-6886 (which clears the agent-wide working memory).
+
+    guard-1760 class: a checker must not report what it DECLINED to look at as a
+    pass. The fix is a MESSAGE change and deliberately NOT a flip of the default
+    -- fail-closed would refuse a worker essentially everything and strand the
+    role outright.
+    """
+    v = we.skill_eligibility(None)
+
+    # The load-bearing half (guard-2860): fail-open is preserved. A wrong refusal
+    # strands real worker work silently, which is the worse direction.
+    assert v.eligible is True
+    assert v.skill is None
+
+    # The honesty half: it must declare non-evaluation ...
+    assert "NOT EVALUATED" in v.reason
+    # ... must never again read as a cleared check ...
+    assert "ordinary worker-eligible work" not in v.reason
+    # ... and must hand the reader the check it could not perform.
+    assert "verification outcomes" in v.reason
+
+
+@pytest.mark.parametrize("skill", [None, "", "   "])
+def test_every_skill_less_shape_takes_the_declared_branch(skill):
+    """All three shapes normalize to None, so all three must get the honest
+    message -- not only the literal None a test author reaches for first."""
+    assert "NOT EVALUATED" in we.skill_eligibility(skill).reason
+
+
+def test_non_evaluation_message_is_scoped_to_the_skill_less_branch():
+    """POSITIVE CONTROL (guard-4166). A pin whose effect is that a STRING STOPS
+    APPEARING proves nothing unless something still produces the contrasting
+    values: had this fix leaked "NOT EVALUATED" into every branch, the test above
+    would pass while the bridge stopped distinguishing anything at all.
+
+    So a NAMED skill must never take the non-evaluation branch, a genuine
+    reducer-only skill must still REFUSE, and a pinned-eligible skill must still
+    pass -- each with its own distinct reason.
+    """
+    unknown = we.skill_eligibility("/never-heard-of-it")
+    assert "NOT EVALUATED" not in unknown.reason
+    assert unknown.eligible is True
+
+    refused = we.skill_eligibility("/replay")
+    assert "NOT EVALUATED" not in refused.reason
+    assert refused.eligible is False        # the dangerous direction still fails
+
+    pinned = we.skill_eligibility("/tree")
+    assert "NOT EVALUATED" not in pinned.reason
+    assert pinned.eligible is True

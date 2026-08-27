@@ -25,23 +25,31 @@ guardrails are checked, blockers are resolved, and recurring goals are tracked.
 **Step 0: Load Conventions** — `Bash: load-conventions.sh` with each name from the `conventions:` front matter.
 
 **Step 0-open: RUN THE ENTRY BATTERY FIRST (g-115-6468)** — one call that IS the
-executor for Step 0a's meter start, the entry checks, and every **always-run**
-lane (all 9), then prints a per-stage rc table, FINDINGS ONLY, selection
-candidates, and a `NEXT ACTION REQUIRED:` imperative.
+executor for Step 0a's meter start, the entry checks, and every **always-run** and
+**medium** lane, then prints a per-stage rc table, FINDINGS ONLY, selection
+candidates, and a `NEXT ACTION REQUIRED:` imperative. Lane counts are DERIVED;
+`--dry-run` prints the live number — do not re-type one here.
 
 ```
 Bash: bash core/scripts/iteration-open.sh --apply
 ```
 
-It SUBSUMES Step 0a and the always-run phase bodies below — do NOT also run them,
-or the `--apply` lanes escalate twice. Dispose what it prints, then resume at the
-first `medium`/`deferrable` sweep. If it reports `wrapper_failed`, or a stage as
-BLIND, run that stage's standalone fallback from the tier table's Invocation
-column — the fallbacks exist for exactly this. `--dry-run` lists every lane and
-its wiring status; a lane in the table that the battery does not dispatch prints
-as `not-yet-wired` rather than vanishing. Medium/deferrable lanes are NOT yet
-wired into it (strangler step 1). Rationale, composition contract and the
-worker-vs-reducer meter split: the `core/scripts/iteration-open.py` docstring.
+It SUBSUMES Step 0a and both the always-run AND medium phase bodies below — do
+NOT also run them, or the `--apply` lanes escalate twice. Dispose what it prints,
+then resume at the first `deferrable` sweep. If it reports `wrapper_failed`, or a
+stage as BLIND, run that stage's standalone fallback from the tier table's
+Invocation column — the fallbacks exist for exactly this. `--dry-run` lists every
+lane and its wiring status; a lane in the table that the battery does not dispatch
+prints as `not-yet-wired` rather than vanishing. The **deferrable** tier is NOT yet
+wired (strangler step 3).
+
+⚠ That sentence does not MAKE anything run — its twin said "medium" while that
+tier sat dark 94-208h on two boxes (g-115-7847). Tiers run by being STAGES in
+iteration-open.sh.
+
+Rationale, composition contract and the worker-vs-reducer meter split: the
+`core/scripts/iteration-open.py` docstring; the dark-window trace and the
+execution-record design: `core/scripts/precheck-medium-battery.py`.
 
 **Step 0a: Budget Meter Start (Magic Wand 2 — g-115-509)** — *fallback only when
 Step 0-open did not run; it calls this itself.* Initialize the
@@ -76,6 +84,9 @@ ACTIONABLE FINDINGS (measured: precheck-eval run-all exits 1 whenever any
 sub-eval flags), so a non-zero rc is a read-the-output signal, not an error.
 Every invocation below was run 2026-08-14 with rc recorded (report forms).
 
+**always-run** and **medium** rows are DISPATCHED by `iteration-open.sh`; their
+Invocation is the FALLBACK for a blind stage. Only **deferrable** rows are yours.
+
 | Phase | Sweep name (for `meter check`) | Tier | Invocation (exact) |
 |---|---|---|---|
 | 0-pre | tree-debt-gate | always-run | dispatched by `bash core/scripts/precheck-sentinel-battery.sh` (Phase 0-pre.0d) → this file's Phase 0-pre section; no standalone script |
@@ -106,6 +117,9 @@ Every invocation below was run 2026-08-14 with rc recorded (report forms).
 | 0.5b.16 | dependency-cycle-check | deferrable | `bash core/scripts/dependency-cycle-check.sh --output json` |
 | 0.5b.17 | hypothesis-terminal-goal-check | deferrable | `bash core/scripts/hypothesis-terminal-goal-check.sh --output json` |
 | 0.5b.18 | locus-sweep | deferrable | `bash core/scripts/locus-sweep.sh --output json` (read-only census — the only lane that asks WHERE, not when) |
+| 0.5b.19 | self-blocked-defer-sweep | deferrable | `py -3 core/scripts/self-blocked-defer-sweep.py --json` (.py only; `--json`, NOT `--output json`) |
+| 0.5b.20 | phantom-goal-audit | deferrable | `py -3 core/scripts/phantom-goal-audit.py audit` (positional REQUIRED; no `--json` flag exists) |
+| 0.5b.21 | hardcoded-scope-audit | deferrable | `source core/scripts/_paths.sh && py -3 core/scripts/hardcoded-scope-audit.py --json` (the `source` is load-bearing) |
 | 0.5c | recurring-precondition-sweep | deferrable | `py -3 core/scripts/recurring-precondition-sweep.py` (.py ONLY — no .sh wrapper exists) |
 | 0.5c.1 | recurring-starvation-check | medium | `bash core/scripts/recurring-starvation-check.sh --apply --max-file 1` |
 | 0.5e | fresh-eyes-cadence | deferrable | checked inside `bash core/scripts/precheck-cadence-battery.sh` (Phase 0.5e Cadence Battery) — do NOT meter-check or invoke separately |
@@ -117,6 +131,7 @@ Every invocation below was run 2026-08-14 with rc recorded (report forms).
 | 0.5g.5 | scar-tissue-cadence | deferrable | `bash core/scripts/scar-tissue-check.sh --cadence --post-board` |
 | 0.5g.6 | completed-not-closed-cadence | deferrable | `bash core/scripts/completed-not-closed-triage.sh --cadence --post-board` |
 | 0.5g.7 | completed-not-closed-drain | always-run | dispatched by the ALWAYS-RUN battery (Phase 0-pre.0e; named in full because the nearest preceding rows are the CADENCE battery's) → Phase 0.5g.7, which RE-RUNS `bash core/scripts/completed-not-closed-slate.sh` for the ROWS — the battery reports `slate=N`, a count. Sweep name ≠ script name |
+| 0.5g.8 | world-script-crlf-check | always-run | dispatched by the ALWAYS-RUN battery (Phase 0-pre.0e); standalone fallback `bash core/scripts/world-script-crlf-check.sh`. Report-only, no --apply. WHY in the script docstring (g-115-7288) |
 | 0.5h | health-regression-cadence | deferrable | `bash core/scripts/health-regression-check.sh --json` (then Phase 0.5h verify/revert steps on a trip) |
 | 0.5i | curriculum-cadence | deferrable | same cadence battery |
 | 0.5j | evolution-cadence | deferrable | same cadence battery |
@@ -1015,16 +1030,15 @@ Bash: bash core/scripts/execution-diary.sh phase-end phase-0.5.0-scripted
 #                                        results.user-goals.candidates[]: invoke
 #                                        aspirations-update-goal.sh participants '["agent"]'
 #   temp-pressure:temp_drain_needed    → file results.temp-pressure.suggested_goal via
-#                                        aspirations-add-goal.sh into asp-001, ALL payload
-#                                        fields (title, priority HIGH, participants
-#                                        ["agent"], description, AND intended_agent
-#                                        verbatim: it names the temp OWNER; /drain-temp is
-#                                        bound-agent-scoped — dropping it re-routes the
-#                                        goal and the drain no-ops on the wrong temp
-#                                        store; g-115-2979, rb-3876). Dedup: this flag is
+#                                        aspirations-add-goal.sh into asp-001 --source
+#                                        agent (BOTH queues have an asp-001, ~L2663;
+#                                        world's is often RETIRED, g-115-7347). Pass ALL
+#                                        fields incl. intended_agent verbatim: it names
+#                                        the temp OWNER, and /drain-temp is bound-agent-
+#                                        scoped, so dropping either re-routes the goal or
+#                                        no-ops the drain (g-115-2979, rb-3876). Dedup:
 #                                        suppressed while an open drain goal exists (emits
-#                                        temp_drain_pending); that + temp_pressure_warn
-#                                        are visibility-only.
+#                                        temp_drain_pending); +temp_pressure_warn: info.
 #   temp-pressure:temp_drain_stalled   → the open drain goal (escalation.goal_id) outlived
 #                                        drain_goal_max_age_hours at pressure >= threshold
 #                                        (g-115-3774). ACTION: /drain-temp THIS
@@ -2045,19 +2059,78 @@ which.
 ```
 # Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
 Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check locus-sweep)
-IF decision == "drop": SKIP this phase; continue to Phase 0.5c
+IF decision == "drop": SKIP this phase; continue to Phase 0.5b.19
 Bash: bash core/scripts/locus-sweep.sh --output json
 Parse population + bracket + this_box.counts + this_box.candidates.
 IF the command exits 2:
     Output: "▸ ⚠ LOCUS SWEEP CONTROL REGRESSED — the classifier is broken; the census is NOT a clean read (guard-2421)"
 ELIF this_box.counts.candidate == 0:
-    continue silently to Phase 0.5c   # the common case on most boxes
+    continue silently to Phase 0.5b.19   # the common case on most boxes
 ELSE:
     Output: "▸ LOCUS: {population} deferred, locus-bound between {bracket.floor} and {bracket.ceiling}; {counts.candidate} name a locus THIS box satisfies"
     FOR EACH c in this_box.candidates[:5]:
         Output: "    {c.goal_id} ({c.band}) — {c.why}: {c.title}"
     # Route exactly as 0.5b.12: read the row before acting, and a candidate
     # claimed by another agent gets a coordination post, never a re-route.
+```
+
+## Phases 0.5b.19-0.5b.21: Three Detective Lanes (g-115-7871)
+
+Same deferrable shape as 0.5b.10-0.5b.18 — meter-check, run, surface, route by
+lane (guard-1007), never mutate another agent's goal. All three are DETECTIVE
+ONLY. A finding is a stimulus, not a verdict (guard-4794). An empty or non-zero
+result is a FAILED run, not a clean queue (guard-2298).
+# Rationale (WHY each exists, the measured invocation mismatches, first-run counts):
+#   core/config/rationale/precheck-orphaned-detectors.md
+
+**The invocations below are measured, not inferred.** All three reject the
+`--output json` their neighbours use; one has no `--json` flag at all (rb-538 —
+verify at the parser whitelist, never by analogy with a sibling).
+
+```
+# 0.5b.19 self-blocked-defer-sweep — the PREMISE-axis lane the defer family lacks:
+# 0.5b.3-0.5b.15 all re-probe an EXTERNAL condition, none asks whether the defer
+# waits on anything external at all (reclaim-routed-work.md's RULE axis).
+Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check self-blocked-defer-sweep)
+IF decision == "drop": SKIP; continue to Phase 0.5b.20
+Bash: py -3 core/scripts/self-blocked-defer-sweep.py --json      # `--json`, NOT `--output json`
+Parse band_counts + self_blocked_candidates[] (that IS the key — NOT `candidates`,
+which the sibling lanes use; rows carry goal_id/src/asp_id/status/defer_set_at/
+title/defer_reason and have NO intended_agent or why field. Verified against the
+emitter 2026-08-26 — the rb-538 parser-whitelist check has an OUTPUT-SHAPE twin,
+and naming sibling-lane keys here surfaces zero rows beside a non-zero count).
+Only `self_blocked_candidate` is actionable; a large `exogenous:*` band is the
+classifier working, not a backlog.
+IF it is 0: continue silently to Phase 0.5b.20
+ELSE: surface up to 5 as "{goal_id} ({src}, {asp_id}, deferred {defer_set_at}): {title}"
+      plus the head of {defer_reason}; read the goal to learn its lane (no
+      intended_agent here), and re-run probe-before-defer.md rule 1 before touching
+      one (the classifier matched TEXT; that is not a probe).
+
+# 0.5b.20 phantom-goal-audit — all-null-provenance records, invisible to every
+# age-keyed sweep here (they cannot be aged) yet still in the candidate pool.
+Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check phantom-goal-audit)
+IF decision == "drop": SKIP; continue to Phase 0.5b.21
+Bash: py -3 core/scripts/phantom-goal-audit.py audit    # positional REQUIRED; emits JSON, has NO --json
+Parse scanned + schema_verified + live_phantoms + already_filed_open_investigate.
+IF schema_verified is not true OR scanned == 0: surface UNRELIABLE — the zero is
+   not a measurement (rb-245). ELIF live_phantoms == 0: continue silently to 0.5b.21.
+ELSE: surface them; file ONE consolidated Investigate unless already_filed_open_investigate.
+Report-only here — `--apply` is deliberately withheld (see rationale).
+
+# 0.5b.21 hardcoded-scope-audit — scope literals that should resolve through a
+# helper (CLAUDE.md Agent-dir Resolution family).
+Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check hardcoded-scope-audit)
+IF decision == "drop": SKIP; continue to Phase 0.5c
+Bash: source core/scripts/_paths.sh && py -3 core/scripts/hardcoded-scope-audit.py --json \
+        | py -3 -c "import sys,json; d=json.load(sys.stdin); print(json.dumps({k:d.get(k) for k in ('verdict','files_scanned','roots','roots_skipped','tier_counts')}))"
+# BOTH halves are load-bearing: without `source` $WORLD_PATH is unset, world/conventions
+# is dropped, and it returns SCANNED_PARTIAL — a real number over a corpus missing its
+# domain half. Without the projection the body is ~144KB.
+IF verdict == "SCANNED_PARTIAL" AND roots_skipped: surface it — counts are a FLOOR.
+IF files_scanned == 0: surface READ FAILURE. ELIF tier_counts["active-scope"] == 0:
+   continue silently to Phase 0.5c.
+ELSE: surface the count; pull rows with `--tier active-scope --json`, route by lane.
 ```
 
 ## Phase 0.5c: Recurring-Goal Precondition-Filter lastAchievedAt Sweep

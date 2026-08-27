@@ -32,6 +32,36 @@ source "$_SELF/_paths.sh" 2>/dev/null || true
 _DRY=0
 for _a in "$@"; do [ "$_a" = "--dry-run" ] && _DRY=1; done
 
+# ⛔ ROOT CAUSE ESTABLISHED 2026-08-23 — READ THIS BEFORE THE NARRATIVE BELOW.
+# The narrative that follows says "Root cause is NOT established". That was true
+# when written and is NOT true now; it is kept because the CAPTURE it justifies is
+# still correct and still earns its keep. The rc=0/zero-byte signature on
+# LAPTOP-3IOFCNEO is CALLER-SIDE, not a defect in this wrapper or in
+# iteration-open.py: at the Bash-tool default 120s bound the HARNESS BACKGROUNDS
+# the command and the caller captures rc=0 with 0 bytes on BOTH streams. Measured
+# in  (completed 2026-08-23, bravo, carrying this box's 2026-08-21
+# measurement), same command at three bounds: 120s -> backgrounded, rc=0/0 bytes;
+# 170s -> rc=124, 0 bytes; 480s -> rc=0, 2,669,416 bytes. The box is SLOW, not
+# broken — goal-selector select ran 176s here against 42.3s on cc-03 (4.2x), which
+# is exactly why cc-07/cc-03 never reproduce it: 42s fits inside every default
+# bound and 176s fits inside none.
+#
+# THREE CONSEQUENCES, all counter-intuitive enough to be worth stating:
+#   1. It is TRANSIENT because it is a DURATION race against a fixed bound, not
+#      because anything is flaky. Re-running "bare" appears to fix it; what
+#      actually changed is the runtime.
+#   2. It reproduces in OTHER wrappers calling OTHER .py files
+#      (precheck-always-run-battery.sh, pending-deploys-gate.sh ,
+#      scar-tissue-check ) precisely BECAUSE it is not about this .py.
+#      Do not file it per-wrapper; that population is already 4+ goals deep.
+#   3. THE SILENT-RUN WARNING BELOW CANNOT FIRE IN THIS CASE. When the harness
+#      backgrounds the process, the wrapper never reaches its own byte check —
+#      so the absence of that warning is NOT evidence the run was fine. Measured
+#      on this box 2026-08-25: rc=0, zero bytes, no warning emitted.
+# REMEDY when you see it: raise the caller's timeout (480s clears it here), or
+# run the standalone fallbacks. Do NOT re-diagnose the wrapper.
+#
+# --- historical narrative, retained for the capture rationale ---
 # stdout is CAPTURED rather than streamed so the wrapper can COUNT it. A
 # zero-byte run is the one failure this wrapper cannot otherwise see: _emit()
 # prints the STAGE table unconditionally, so zero stdout PROVES the report was
@@ -41,8 +71,10 @@ for _a in "$@"; do [ "$_a" = "--dry-run" ] && _DRY=1; done
 # (LAPTOP-3IOFCNEO, WSL2 6.18.33.2) 2026-08-21: --apply gave rc=0 / 0 bytes /
 # ~370s while the standalone fallback returned two real findings minutes later.
 # NOT reproducible on cc-07 (Linux 6.8.0-137-generic, worker Body): rc=0, 1988
-# bytes, 65s. Root cause is NOT established, so this makes the failure LOUD
-# instead of pretending to cure it (guard-4093 / guard-1715 — a quiet run is not
+# bytes, 65s. [SUPERSEDED — root cause established 2026-08-23, ; see the
+# header above. The cc-07 non-reproduction is EXPLAINED by that box being ~4x
+# faster, not by a box-specific defect.] The capture still makes a genuine
+# mid-run death LOUD instead of pretending to cure it (guard-4093 / guard-1715 — a quiet run is not
 # a clean one). Capture costs no interactivity: this is a ~2 KB batch report and
 # python block-buffers to a pipe regardless.
 _OUT="$(mktemp 2>/dev/null)" || _OUT=""

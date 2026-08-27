@@ -11,8 +11,8 @@ That split is the whole design, and it is not stylistic:
     question and three sweeps answering it separately is three predicates that
     drift the first time one of them learns something (guard-2783). The subtle
     parts live here: an unverifiable read is not permission, completion
-    provenance outranks a re-openable-looking status, and both refusals are
-    fail-CLOSED.
+    provenance outranks a re-openable-looking status, a live CLAIM outranks
+    both, and every refusal is fail-CLOSED.
   * COLLABORATORS ARE PASSED IN, NEVER IMPORTED HERE. `reread_goal_authoritative`
     takes `read_aspirations` and `is_owncloud` as required keyword arguments so
     each caller supplies its OWN module's copies. That is not ceremony: every
@@ -55,6 +55,7 @@ from _team_state import (  # noqa: E402
 )
 
 __all__ = [
+    "ACTIVE_CLAIM_FIELDS",
     "COMPLETION_PROVENANCE_FIELDS",
     "DEFAULT_OPEN_STATUSES",
     "reread_goal_authoritative",
@@ -152,6 +153,26 @@ def reread_goal_authoritative(source, goal_id, *, read_aspirations, is_owncloud,
 #: completed_by AND outcome_class` — a record a sweep already overwrote.
 COMPLETION_PROVENANCE_FIELDS = ("completed_by", "completed_by_sid", "outcome_class")
 
+#: Fields that prove a claim is held RIGHT NOW. Only `claimed_by_sid` qualifies,
+#: and the distinction is load-bearing rather than stylistic: `aspirations.py`
+#: pops claimed_by / claimed_at / claimed_by_sid TOGETHER on release and on
+#: close, so a non-null sid means a claim is live at this instant — whereas
+#: `started` / `executed_by` / `executed_by_sid` SURVIVE a release and are
+#: therefore execution HISTORY, not ownership.
+#:
+#: Measured 2026-08-24 on the world store, 2,193 open goals ():
+#: claimed_by_sid present on 4, started on 231 (10.5%), executed_by_sid on 205
+#: (9.3%); on TERMINAL goals started/executed_by_sid persist at ~78%. Keying
+#: this refusal on the execution fields — which is what the originating report
+#: proposed — would have disarmed all three sweeps across ~10% of the open queue
+#: permanently, so the narrow field is the correct one AND the safe one.
+#:
+#: guard-4434 is why the SID is named rather than `claimed_by`: an ownership
+#: test that mentions claimed_by and not the sid has a hole by construction,
+#: because a record whose NAME was cleared while its sid survived reads as
+#: unowned to every such predicate.
+ACTIVE_CLAIM_FIELDS = ("claimed_by_sid",)
+
 #: The statuses a scan-then-write sweep may legitimately act on. A sweep whose
 #: candidate predicate is narrower passes its own tuple; none may pass a WIDER
 #: one that admits a terminal status, which is the case this guard exists for.
@@ -189,4 +210,14 @@ def stale_candidate_reason(goal, provenance, *, open_statuses=DEFAULT_OPEN_STATU
     if present:
         return (f"completion provenance present ({', '.join(present)}) despite "
                 f"status={status!r} — a close is in flight or already landed")
+
+    claimed = [f for f in ACTIVE_CLAIM_FIELDS if goal.get(f)]
+    if claimed:
+        holder = goal.get("claimed_by") or "an unnamed holder"
+        return (f"claim in flight ({', '.join(claimed)} set, claimed_by="
+                f"{holder!r}) — an agent is executing this goal right now, and "
+                f"status alone cannot show that: the claim path writes "
+                f"claimed_by_sid/started/executed_by_sid but leaves status at "
+                f"'pending', so the one field a status-keyed sweep consults is "
+                f"exactly the one a live claim does not move")
     return None

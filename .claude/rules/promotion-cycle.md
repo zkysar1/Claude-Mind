@@ -30,19 +30,19 @@ Ayoai-Mind (dev)  →  Claude-Mind (staging)  →  ZDS-Mind (prod)
 
 ## Operator Runbook
 
-The end-to-end run procedure (worktree-at-tag method, plan-verdict triage
-decision table, force-past-plan ledger discipline, post-plant verification
-checklist, handoff) is standardized in
-`core/config/conventions/promotion-runbook.md`. When a promote's --plan
-verdict blocks, `bash core/scripts/promotion-plan-triage.sh` mechanically
-classifies every flagged file and emits the evidence ledger — only AUTHORED
-residue needs hand-forensics.
+Dev→staging is a PUSH: the run procedure (worktree-at-tag, plan-verdict
+triage, force-past-plan ledger, post-plant verification, handoff) is
+`core/config/conventions/promotion-runbook.md`. When a --plan verdict blocks,
+`bash core/scripts/promotion-plan-triage.sh` classifies every flagged file and
+emits the evidence ledger — only AUTHORED residue needs hand-forensics.
+Staging→downstream is a PULL, adopted by the downstream Mind in its own
+idle window: `core/config/conventions/pull-promotion.md`.
 
 ## Pre-Overwrite Drift Gate (MANDATORY)
 
 Promotion is a **RECONCILE, not a MIRROR.** Before overwriting ANY downstream
-repo (Ayoai → Claude, Claude → ZDS, or any framework file-copy between Mind
-deployments), the target may LEAD the source — ZDS self-evolves the framework
+repo (any framework file-copy between Mind deployments), the target may LEAD
+the source — ZDS self-evolves the framework
 during operation while Claude-Mind lags — so a blind mirror would silently
 DELETE or CLOBBER target-ahead improvements. (Confirmed 2026-06-24: ZDS led
 Claude-Mind on 18 framework files — 8 scripts, 2 architecture conventions, the
@@ -85,7 +85,6 @@ could pick them up. The goals were re-filed in Ayoai-Mind asp-328.
 ## Cross-References
 
 - guardrails: guard-97, guard-98 (ZDS-Mind world), guard-813 (Ayoai-Mind world)
-- CLAUDE.md "CRITICAL: Promotion Cycle" section
 - world/conventions/own-cloud-storage-refactor.md (example of a feature requiring full cycle)
 - Ayoai-Mind world asp-328 (S3 backend development goals — in correct location)
 - Ayoai-Mind world g-115-1539 (recovery-gate promotion — urgent)

@@ -85,70 +85,20 @@ RUNNER_SID=$(cat "$(agent_dir "$AGENT")/session/running-session-id" 2>/dev/null 
 [ -n "$RUNNER_SID" ] || exit 0
 
 # -- Owning-process identity helpers () ------------------------------
+# MOVED to core/scripts/_runner_proc.sh () and sourced, NOT copied.
+# stop-hook.sh Gate 0 needs the SAME predicate: two processes sharing one SID
+# make HOOK_SID == RUNNER_SID for both, so the SID-based hook BLOCKs the very
+# process this pid-based gate ejects, and the disagreement is a hard wedge. A
+# second copy of the predicate would let the two consumers drift apart again.
+#
 # WHY A PROCESS IDENTITY AND NOT runner-token: runner-token is a FILE in the
 # agent's session dir. Two processes both read it and both get the same value,
 # so it cannot distinguish them -- CLAUDE.md's signal table describes it as the
 # SID-reuse detector, but as a shared file it can only detect reuse ACROSS
 # /start runs, never two live readers of one token. The only identity that
 # differs between two concurrent sessions is the OWNING PROCESS.
-#
-# Identity = "<pid>:<starttime>" of the nearest ancestor whose comm is `claude`.
-# starttime (/proc/<pid>/stat field 22, boot-relative jiffies) is immutable for
-# the life of the process, so the pair survives PID reuse: a recycled pid
-# carries a different starttime and reads as DEAD, which is what lets a crashed
-# runner be taken over instead of wedging the agent forever.
-#
-# Deliberately NOT /proc/<pid>/environ (guard-1582, guard-1976): that is frozen
-# at exec and does not reflect later state, so an env-derived identity would go
-# stale exactly when it matters.
-_proc_stat_field() {  # <pid> <index into post-comm fields>: state=1 ppid=2 starttime=20
-    local pid="$1" idx="$2" line rest
-    line=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
-    [ -n "$line" ] || return 1
-    # Strip through the LAST ')' -- comm is parenthesized and may contain both
-    # spaces and parens ("tmux: server"), so positional parsing of the raw line
-    # is wrong. Longest-match ## is what makes this comm-safe.
-    rest="${line##*)}"
-    printf '%s' "$rest" | awk -v i="$idx" '{print $i}'
-}
-
-# Emits "<pid>:<starttime>", or returns 1 when it cannot be determined.
-# RUNNER_PROC_ID overrides for tests (no claude ancestor exists in a sandbox).
-_resolve_owner_proc() {
-    if [ -n "${RUNNER_PROC_ID:-}" ]; then printf '%s' "$RUNNER_PROC_ID"; return 0; fi
-    [ -d /proc ] || return 1
-    local pid=$$ depth=0 comm st ppid
-    while [ "$depth" -lt 12 ] && [ -n "$pid" ] && [ "$pid" != "0" ] && [ "$pid" != "1" ]; do
-        comm=$(cat "/proc/$pid/comm" 2>/dev/null) || return 1
-        if [ "$comm" = "claude" ]; then
-            st=$(_proc_stat_field "$pid" 20) || return 1
-            [ -n "$st" ] || return 1
-            printf '%s:%s' "$pid" "$st"
-            return 0
-        fi
-        ppid=$(_proc_stat_field "$pid" 2) || return 1
-        pid="$ppid"
-        depth=$((depth + 1))
-    done
-    return 1
-}
-
-# True only when <pid>:<starttime> names a process that is STILL the same one.
-_owner_alive() {
-    # SPLIT DECLARATIONS ARE LOAD-BEARING, NOT STYLE. `local a="$1" b="${a%%:*}"`
-    # expands ALL arguments before `local` runs, so `a` is still unset when
-    # `${a%%:*}` is evaluated -- under this script's `set -u` that aborts the
-    # whole gate with exit 1, i.e. EVERY runner ejects. Caught by case 17's
-    # stderr assertion (the exit code alone read as a correct eject).
-    local id="$1"
-    local pid="${id%%:*}"
-    local st="${id##*:}"
-    local cur
-    [ -n "$pid" ] && [ -n "$st" ] && [ "$pid" != "$st" ] || return 1
-    printf '%s' "$pid" | grep -Eq '^[0-9]+$' || return 1
-    cur=$(_proc_stat_field "$pid" 20) || return 1
-    [ -n "$cur" ] && [ "$cur" = "$st" ]
-}
+# shellcheck source=_runner_proc.sh
+source "$SCRIPT_DIR/_runner_proc.sh"
 
 # -- Write-attribution runner override (, US-09) ----------------------
 # running-session-id is the file we already trust, but it is written ONLY by

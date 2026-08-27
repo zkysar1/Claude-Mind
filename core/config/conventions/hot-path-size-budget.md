@@ -130,6 +130,60 @@ the ratchet below exist. **WATCH after the first week: if overrides run at more
 than a handful per day, the caps are being treated as a toll rather than a
 signal — tighten the refusal text or add per-file ceilings then, not before.**
 
+### WATCH RESULT — week one, measured 2026-08-25 (g-115-6639, bravo, cc-05)
+
+**Verdict: keep the mechanism as built. Do NOT add per-file ceilings.**
+
+26 override rows over the 7 days 08-18..08-24 (6, 8, 2, 3, 3, 2, 2) = 3.7/day
+average but **2.4/day over the last five**, i.e. declining after the two ship
+days. Authored growth through the trailer: **+35,488 B**. By agent: alpha 15,
+zeta 6, echo 3, foxtrot 2.
+
+The "repeated overrides on the same file" trigger IS met — strategic-scan 7,
+felt-sense-checkin 4, worker-loop 4 — and per-file ceilings are still the wrong
+remedy, for the reason the module docstring already gives: a cap stored in YAML
+must be rewritten by the very hook that cannot reliably stage a file into a
+pathspec commit, so it drifts; size-at-HEAD does not. Set against the 25 of 55
+ratcheted members (45%) already sitting above their set's `new_file_cap` and
+carrying 86% of hot-path bytes, any ceiling would be either a no-op (set above
+current) or a wedge (set below).
+
+**The mechanism is already working, and that is the load-bearing measurement.**
+Against the 2026-08-19 reading recorded in g-115-6639's own description:
+`aspirations-strategic-scan/SKILL.md` **134,121 → 117,456 B (−16,665)**;
+hot_path_total **1,554,344 → 1,539,528 B (−14,816)** while on_demand_skill_bytes
+went **1,951,156 → 2,033,414 B (+82,258)**. Prose is moving OUT of ratcheted
+files INTO ceiling-governed ones — the designed direction. Both ratchets still
+read `regressed` against their seed baselines, so the FAIL line is expected
+state, not new drift; re-seed the baselines rather than reading FAIL as a fresh
+regression.
+
+**ROUTING VERDICT for the overrides themselves.** 11 of 26 rows (42%) carrying
+**+22,862 B = 64% of all override bytes** are dated-measurement-series appends
+on exactly TWO files (strategic-scan, felt-sense-checkin). The other 15 rows
+(+12,626 B) are imperatives — a new lane, a call site, the fix itself. So the
+override population is bimodal, and only one mode is prose. Note
+`felt-sense-checkin/SKILL.md` is **not ratchet-governed at all** (it matches only
+`on-demand-skills`, which is CEILING-governed) — its 4 rows are ceiling breaches
+and belong to a different question.
+
+**STEP 4's refusals:overrides RATIO IS NOT COMPUTABLE, and finding out why is
+the most important result here.** `meta/gate-firings.jsonl` holds **0** rows for
+`hot-path-size-gate` across 174,421 firings and 46 distinct gate names. That is
+not "no refusal ever happened": `gate-log.sh` states its own precondition —
+*"gate-id must match an id in core/config/gates.yaml"* — and neither
+`hot-path-size-gate` nor its commit-msg sibling `goal-claim-commit-gate` is among
+the **34** registered ids. `gate-log.sh` runs under `2>/dev/null` and `exit 0`
+("telemetry must not break gates"), so the rejection is silent and permanent.
+Positive control that makes this decisive: the sibling hook `core/githooks/pre-commit`
+has **55** firing rows; `core/githooks/commit-msg` has **0**, for **both** of its
+gates. Both Layer-B commit-msg gates have therefore been blind since they
+shipped. Owner: **g-115-3488**, which PREDICTED this exact defect
+("implemented-but-unregistered is the QUIET one") and now carries it as its first
+measured instance — nothing new was filed. Until it lands, the ledger count is the ONLY
+visible half of this gate's behaviour, and it counts bypasses — never refusals.
+
+
 ## Reporting
 
 ```bash

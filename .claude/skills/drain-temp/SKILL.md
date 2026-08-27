@@ -286,15 +286,32 @@ In `--dry-run`, skip this phase entirely.
 2.5. ADVANCE THE THIRD-CLASS WATERMARK — full pass only, never --dry-run,
    never --file (encode-before-delete gate, 2026-08-21), AND ONLY WHEN THE
    DRY-RUN PROVES IT LICENSES NOTHING YOU DID NOT CLASSIFY (guard-4864,
-   2026-08-22). THE DEFAULT IS NOT TO STAMP. Run this check FIRST:
-   Bash: bash core/scripts/temp-drain-purge.sh --dry-run   # read `would_purge`
-   `would_purge` > 0 here means Lane 1 is condemning THIRD-CLASS suffixes
+   2026-08-22). THE DEFAULT IS NOT TO STAMP.
+   `would_purge` > 0 means Lane 1 is condemning THIRD-CLASS suffixes
    (.jsonl/.note/.patch/.desc/.eml/.tsv/.remote/.local-preserve-*) — and
    Phase 1's census is `ls temp/*.md temp/*.json`, so your pass did NOT
-   enumerate a single one of them. DO NOT STAMP: skip to Phase 4 and say in
-   the report that the watermark was withheld and why. Stamp ONLY when
-   `would_purge` is 0, or when you have just extended the census to cover
-   those suffixes and classified each file individually.
+   enumerate a single one of them. Stamp ONLY when it is 0 AFTER the stamp,
+   or when you have just extended the census to cover those suffixes and
+   classified each file individually.
+
+   ⛔ READ `would_purge` AFTER STAMPING, NOT BEFORE. A pre-stamp read is taken
+   under the OLD watermark, and stamping is what CHANGES the value — so it
+   predicts nothing. This step said "Run this check FIRST" until 2026-08-23,
+   one line above its own measurement that stamping moves it `0 -> 31`.
+   Measured 2026-08-23 (zeta, cc-02): pre-stamp **0** (gate PASSES, stamp
+   licensed), post-stamp **3** — three board captures no census ever saw.
+   # Rationale (WHY the gate is a transaction, not a pre-check): core/config/rationale/third-class-watermark-gate.md
+
+   RUN IT AS A THREE-STEP TRANSACTION, saving the prior value FIRST:
+   Bash: source core/scripts/_paths.sh && cp "$AGENT_DIR/temp/.drain-watermark" "$AGENT_DIR/temp/wm-prior.raw" 2>/dev/null
+   Bash: <the stamp command below>
+   Bash: bash core/scripts/temp-drain-purge.sh --dry-run   # read `would_purge` NOW
+   IF > 0: RETRACT by RESTORING the prior (`cp "$AGENT_DIR/temp/wm-prior.raw"
+   "$AGENT_DIR/temp/.drain-watermark"`; `rm -f` only when there was no prior —
+   it drops `watermark_source` to absent and discards a still-valid older,
+   narrower license). Re-run the dry-run to CONFIRM it returned to 0, and say
+   in the Phase 4 report which files it would have condemned. Retraction is
+   always safe: it removes a LICENSE, never data.
    Measured 2026-08-22 (alpha, hostname cc-04, reducer): stamping flipped
    `watermark_source` absent->file and took `would_purge` 0 -> 31, condemning
    `experience.jsonl.local-preserve-20260818`,

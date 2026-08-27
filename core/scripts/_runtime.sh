@@ -807,8 +807,47 @@ rt_ensure_running() {
 #
 # --header may be repeated; each appends one curl -H. Used by writer wrappers
 # that need to forward override justifications as X-Mind-Override-* headers.
+# --- Measured-elapsed capture for honest failure diagnostics () ---
+# rt_no_daemon_error used to assert a request "did not complete within
+# RT_CURL_TIMEOUT" while holding NO measurement of how long it actually took —
+# RT_CURL_TIMEOUT is an env read (line 57), so the sentence was config echoed
+# back as if it were observation. Measured 2026-08-26 (foxtrot): a 97ms failure
+# reported as a 90s timeout, and the rt_base_url branch below returns 3 without
+# issuing a request at all.
+#
+# The elapsed cannot be handed over in a variable. rt_call does
+# `out=$(rt_curl "$@")` — a SUBSHELL — so anything rt_curl assigns is discarded
+# at that boundary. It must cross via a file, written ONLY on the rc=3 paths so
+# the success path pays nothing.
+#
+# The record carries the writer's PID because one RT_DIR is shared by every
+# concurrent wrapper. Inside a command substitution `$$` is the PARENT shell's
+# PID (BASHPID is not), so rt_curl's write and rt_no_daemon_error's read agree
+# for the same wrapper and DISAGREE across wrappers — a foreign record is then
+# reported as UNMEASURED rather than as this call's time. Failing to "unknown"
+# is deliberate: a wrong measured number is worse than an obviously-configured
+# one, because it is credible.
+RT_ELAPSED_FILE="${RT_ELAPSED_FILE:-$RT_DIR/last-curl-elapsed}"
+
+# Microseconds since epoch via the bash-5 builtin — ZERO FORK. retrieve.sh's
+# _retrieve_now_ms uses `date +%s%3N`, which forks; that is fine there (twice
+# per run) but not here, where t0 is taken on EVERY daemon call and this file
+# is explicitly tuned to avoid subprocesses (see the rt_curl marker comment,
+# ~200-400ms/call on Windows). EPOCHREALTIME renders with the LOCALE's decimal
+# separator (a comma in e.g. de_DE), so strip either form rather than splitting
+# on '.'. Unset on bash < 5 -> empty -> every consumer reports "not measured".
+_rt_record_elapsed() {
+    local t0="$1"
+    [ -n "$t0" ] && [ -n "${EPOCHREALTIME:-}" ] || return 0
+    local t1="${EPOCHREALTIME/[.,]/}"
+    mkdir -p "$RT_DIR" 2>/dev/null || return 0
+    printf '%s %s\n' "$$" "$(( (t1 - t0) / 1000 ))" > "$RT_ELAPSED_FILE" 2>/dev/null || true
+    return 0
+}
+
 rt_curl() {
     local method="$1" path="$2"; shift 2
+    local _rt_t0="${EPOCHREALTIME/[.,]/}"
     local query="" body_string="" agent="${MIND_AGENT:-}"
     declare -a extra_headers=()
     while [ $# -gt 0 ]; do
@@ -824,6 +863,8 @@ rt_curl() {
     local base
     base="$(rt_base_url)"
     if [ -z "$base" ]; then
+        # No request was issued at all — record 0ms so the diagnostic can say so.
+        _rt_record_elapsed "$_rt_t0"
         return 3
     fi
 
@@ -899,6 +940,7 @@ rt_curl() {
             echo "  often a flag value or justification mis-bound to a positional argument." >&2
             return 2
         fi
+        _rt_record_elapsed "$_rt_t0"
         return 3
     fi
 
@@ -1027,12 +1069,59 @@ rt_call() {
 rt_no_daemon_error() {
     local cmd="${1:-<wrapper>}"
 
+    # Recover the MEASURED elapsed for THIS wrapper's last failed rt_curl
+    # (). Absent file, foreign PID, or a non-numeric record ALL mean
+    # UNMEASURED — never substitute a guess. Read-and-remove makes it one-shot,
+    # so a later failure that reaches here without an intervening rt_curl
+    # reports "not measured" instead of an earlier call's time.
+    local elapsed_ms="" _rec_pid="" _rec_ms=""
+    if [ -n "${RT_ELAPSED_FILE:-}" ] && [ -r "$RT_ELAPSED_FILE" ]; then
+        read -r _rec_pid _rec_ms < "$RT_ELAPSED_FILE" 2>/dev/null || true
+        case "${_rec_ms:-}" in
+            ''|*[!0-9]*) ;;
+            *) [ "${_rec_pid:-}" = "$$" ] && elapsed_ms="$_rec_ms";;
+        esac
+        rm -f "$RT_ELAPSED_FILE" 2>/dev/null || true
+    fi
+
     # Fast health probe (1s max) before declaring unreachable. rt_is_up uses
     # the same --max-time 1 budget as elsewhere in this file.
     if rt_is_up; then
         local port
         port="$(rt_port)"
-        echo "ERROR: daemon is REACHABLE but the request did not complete within RT_CURL_TIMEOUT=${RT_CURL_TIMEOUT}s." >&2
+
+        local bound_ms=0
+        case "${RT_CURL_TIMEOUT:-}" in
+            ''|*[!0-9]*) bound_ms=0;;
+            *) bound_ms=$(( RT_CURL_TIMEOUT * 1000 ));;
+        esac
+
+        # A failure that never approached the bound is NOT a timeout, and every
+        # cause listed further down is a SLOWNESS cause that the elapsed time
+        # excludes. Follow Exemplar A (platform-check.sh:94-97): state the
+        # measured fact and refuse to answer the rest rather than name a cause
+        # the evidence rules out.
+        if [ -n "$elapsed_ms" ] && [ "$bound_ms" -gt 0 ] \
+           && [ "$elapsed_ms" -lt $(( bound_ms * 9 / 10 )) ]; then
+            echo "ERROR: request FAILED after ${elapsed_ms}ms against a REACHABLE daemon." >&2
+            echo "  Wrapper: $cmd" >&2
+            echo "  Daemon health: OK (port ${port:-?})" >&2
+            echo "  Measured: ${elapsed_ms}ms elapsed; RT_CURL_TIMEOUT=${RT_CURL_TIMEOUT}s (${bound_ms}ms) was NOT reached." >&2
+            echo "  refusing to name a cause — this is NOT a timeout. Warmup, a cold request and" >&2
+            echo "  lock contention are all excluded by the elapsed time." >&2
+            echo "  Fact-gathering (none of these assume a cause):" >&2
+            echo "    1. Inspect mind_api/state/spawn.log around this timestamp." >&2
+            echo "    2. Confirm the base URL is well-formed: ${MIND_RUNTIME_URL:-<unset>} (port ${port:-?})." >&2
+            echo "    3. Check http_proxy/https_proxy/all_proxy — a proxy intercepting 127.0.0.1 fails fast." >&2
+            echo "  Do NOT raise RT_CURL_TIMEOUT: the bound was not reached, so it is not the constraint." >&2
+            exit 1
+        fi
+
+        if [ -n "$elapsed_ms" ]; then
+            echo "ERROR: daemon is REACHABLE but the request did not complete within RT_CURL_TIMEOUT=${RT_CURL_TIMEOUT}s (measured ${elapsed_ms}ms)." >&2
+        else
+            echo "ERROR: daemon is REACHABLE but the request FAILED; elapsed was NOT measured (RT_CURL_TIMEOUT=${RT_CURL_TIMEOUT}s is the configured bound, not an observation)." >&2
+        fi
         echo "  Wrapper: $cmd" >&2
         echo "  Daemon health: OK (port ${port:-?})" >&2
         echo "  Possible causes (do not assume the first): a one-time daemon warmup on the FIRST" >&2

@@ -7,19 +7,40 @@ its initial value (0.0) and metric-threshold gates can never pass —
 curriculum-gate-asymmetry, 2026-05-21 (pipeline:
 `2026-05-20_curriculum-gate-asymmetry`, outcome CORRECTED).
 
-Formula: equal-weighted mean of four components, each capped at 1.0.
+Formula: the gate metric is completion_breadth ALONE, capped at 1.0
+(changed 2026-08-26, g-115-5153 — it was an equal-weighted mean of the four
+components below until then; a stored value from before that date is NOT
+comparable to one after it, guard-1881).
+
+  completion_breadth  = completed_goals_where(completed_by == agent) / N4
+
+  competence = completion_breadth    in [0.0, 1.0]
+
+Three further components are still COMPUTED and REPORTED under `components`
+for diagnostics, and are EXCLUDED from the metric:
 
   knowledge_density   = nodes_with_files / N1     # tree growth
   pipeline_activity   = (resolved + 0.5*active) / N2   # judgment applied
   encoded_lessons     = (rb_active + 0.5*guardrails_active) / N3   # lessons captured
-  completion_breadth  = completed_goals / N4      # work delivered
 
-  competence = (k + p + e + c) / 4    in [0.0, 1.0]
+Why they are excluded: each is WORLD-scoped by construction — the tree,
+pipeline, reasoning bank and guardrails have no per-agent partition — so
+they are identical for every agent sharing a world and cannot discriminate
+between them. Measured 2026-08-26: five agents, four different assessment
+timestamps, all reading average_competence exactly 1.0 with every component
+saturated 22x-564x past its target. A per-agent graduation gate keyed to a
+world-level measurement certified nothing. `completed_by` is the only
+per-agent attribution the stores carry (reasoning-bank and guardrails have
+no attribution field at all), so completion is the only component that can
+carry the gate. The emitted `component_scope` map names each component
+world or agent so a consumer never has to re-derive this.
 
-Normalization constants (N1..N4) are calibrated so that a foundationally-
-competent agent (baseline knowledge captured, a few hypotheses resolved,
-~20 completed goals) lands near 0.5 — clearing Stage 1 gate (0.30) but
-NOT auto-passing Stage 2 gate (0.50) without further evidence.
+N4 (N_COMPLETION_AGENT) counts BOTH the live aspirations store and
+aspirations-archive.jsonl — the archive holds the large majority of
+completed goals, and reading only the live store made the score sawtooth
+downward on every archival run. It is calibrated against the live
+cumulative per-agent spread so the fleet straddles both live gate
+thresholds (0.25 and 0.55) with no agent pinned at the cap.
 
 Domain-agnostic: reads framework state (tree, pipeline, reasoning-bank,
 guardrails, completed goals) only — no domain strings.

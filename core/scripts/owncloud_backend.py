@@ -1669,6 +1669,35 @@ class OwnCloudBackend:
                 # it, rather than silently clobbering with un-merged local.
                 raise ConflictError(
                     f"coordination merge failed for {key}: {e}")
+            if merged is None:
+                # A handler REFUSES by returning None -- it is not an error, it
+                # is the store's deliberate safe-freeze for a divergence only a
+                # reader can resolve (merge_tree_node_md on same-heading
+                # divergence or an undecodable side, g-115-7071). Honor it
+                # as a freeze and leave BOTH sides untouched.
+                #
+                # Exactly ONE of coordination_merge's 31 handlers carries an
+                # explicit None-refusal today -- merge_tree_node_md, measured by
+                # AST 2026-08-23, NOT by grepping `return None` (that reports 13
+                # and is wrong: the other 12 are merge_handler_for's own returns
+                # and helpers). The check is written against the CONTRACT, not
+                # that population, so a handler that adopts a refusal later is
+                # covered without touching this file.
+                #
+                # Without this check the refusal fell through to
+                # put_object(Body=None), which boto3 rejects client-side as
+                # ParamValidationError -- so a merge conflict presented as a
+                # transport fault ("union-merge push failed ... Invalid type for
+                # parameter Body") and was nearly filed as an S3 outage on two
+                # separate boxes. Detection-corrupting, not just noisy: the
+                # sweep retried it every pass and the node never synced.
+                # (g-115-7211; the handler-EXCEPTION channel above was already
+                # wrapped -- this is the handler-RETURNS-NONE channel.)
+                raise ConflictError(
+                    f"coordination merge REFUSED for {key}: the store's merge "
+                    f"handler declined to reconcile diverged content (same-heading "
+                    f"divergence or an undecodable side). Frozen for reader "
+                    f"reconciliation -- no write attempted.")
             kw = dict(Bucket=self.bucket, Key=key)
             kw.update(self._body_kwargs(path, merged))  # g-358-11 transport encode
             if remote_etag is not None:

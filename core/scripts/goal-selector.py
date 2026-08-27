@@ -168,6 +168,41 @@ def _get_runner_capabilities():
 _HUMAN_BLOCKED_PREFIX = "human_blocked:"
 
 
+def _is_handoff_gated_defer(goal):
+    """A STRUCTURED defer on a goal that is ROUTED ELSEWHERE ().
+
+    The 120h fail-open below is a re-probe window for defers whose premise is a
+    WORLD CONDITION — "is the service up yet?" — and Phase 0.5b re-probes those
+    independently, so expiring the window is harmless. It is WRONG for a defer
+    whose premise is about WHO MAY ACT: a re-probe of a routing gate returns
+    "still true" forever, so the goal can only ever leave the deferred state by
+    the TIMER, and the timer hands it to whichever Body ranks it next — which is
+    precisely the Body the routing said must not act.
+
+    Measured (g-326-184, cc-07 2026-08-25T17:37): defer_reason
+    "precondition_unmet:studio_session_required", handoff_to=foxtrot,
+    intended_agent=alpha; it fail-opened at TTL to rank #1 of 1399 for
+    alpha-on-cc-07. Both halves — fail-open AND misroute — are visible in that
+    one record, and `handoff_to` is what distinguishes it.
+
+    Deliberately NARROW. It keys on handoff_to, so it covers routing-gated
+    defers ONLY. A sibling class exists whose premise is the BOX or the tool
+    policy rather than the lane (g-115-6259: "git cherry-pick is refused by
+    tool-permission policy on this box") and carries no handoff_to; that is NOT
+    covered here, on purpose — one measured instance supports one predicate, and
+    widening to "execution-context defers never fail open" would price the claim
+    off a conjunct nothing has measured (rb-2572).
+
+    Reinforces guard-2983: a re-route that lives only in prose is invisible to
+    the selector and the goal boomerangs back. This makes the routing structural.
+    """
+    defer = (goal.get("defer_reason") or "")
+    if not defer.lower().startswith(_STRUCTURED_DEFER_PREFIXES_LOWER):
+        return False
+    return bool(str(goal.get("handoff_to") or "").strip())
+
+
+
 def _has_future_deferred_until(goal):
     """True only when deferred_until is present AND still in the future.
 
@@ -2369,6 +2404,11 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
                     # synthesized blocker_ref so quiescence can fire.
                     if (goal.get("defer_reason") or "").lower().startswith(_HUMAN_BLOCKED_PREFIX):
                         continue
+                    # Handoff-gated defer (): same never-self-clears
+                    # property as human_blocked:, different cause — routing, not a
+                    # human gate. SYMMETRY: collect_blocked has the twin. Change both.
+                    if _is_handoff_gated_defer(goal):
+                        continue
                     # No structural gate — apply expiry logic
                     if defer_reason_timeout_hours is not None:
                         defer_age = hours_since(goal.get("defer_reason_set_at"))
@@ -2820,6 +2860,18 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
                         entry["block_reason"] = "deferred"
                         entry["block_detail"] = "Human-blocked: {reason}".format(
                             reason=goal.get("defer_reason", ""))
+                        blocked.append(entry)
+                        continue
+                    # Handoff-gated twin of the guard above (). Keep it in
+                    # blocked[] so all_blocked stays assertable and quiescence fires,
+                    # instead of falling through to the candidate pool of a Body the
+                    # goal is not routed to.
+                    if _is_handoff_gated_defer(goal):
+                        entry["block_reason"] = "deferred"
+                        entry["block_detail"] = (
+                            "Handoff-gated: routed to {to}; {reason}".format(
+                                to=goal.get("handoff_to"),
+                                reason=goal.get("defer_reason", "")))
                         blocked.append(entry)
                         continue
                     # No structural gate — apply expiry logic

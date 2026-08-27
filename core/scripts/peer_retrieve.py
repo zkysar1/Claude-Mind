@@ -51,9 +51,11 @@ discarded when the process exits. That choice follows from the guardrails:
                             matters most -- once a peer claim is a local tree
                             node, nothing downstream can tell it from ours.
 
-The GRANT entity does not exist in any hosted-store schema yet; G1-G5 are design
-artifacts, not built enforcement. Read-only is the posture that stays correct
-whether or not enforcement ever lands -- it needs no grant to be legitimate.
+The GRANT entity DOES now exist with enforcement (g-368-10, `_grants.py`) -- this
+paragraph said it did not until 2026-08-27. That changes nothing here: read-only
+is the posture that stays correct whether or not enforcement lands, because it
+needs no grant to be legitimate. `_grants` governs the WRITE direction only, and
+importing it here would be wrong for the reason the next section gives.
 
 STORAGE BACKEND IS NEVER INHERITED (guard-955 / rb-2983 class)
 -------------------------------------------------------------
@@ -285,7 +287,61 @@ def _search_jsonl_store(world_dir, terms, filename, store, errors=None):
     return hits
 
 
-def search_world_dir(world_dir, terms, limit=5, include_archives=False):
+# ── Tier classification () ──────────────────────────────────────────
+# Every result this module produces carries a `store` label, and that label is
+# already the tier discriminator -- no new metadata is needed, only a decision
+# about what each label MEANS.
+#
+# The split follows this module's own argument (see the G1 row of the guardrail
+# table above): reading what a peer ALREADY PUBLISHED to a shared channel needs
+# no grant. The board IS that shared channel, so board rows are PUBLIC. A
+# world's knowledge tree, conventions and JSONL stores are its own internal
+# state, published nowhere -- those are RAW, and they are what a subtree GRANT
+# would authorize a peer to read.
+#
+# DEFAULT IS "all" -- deliberately the pre-existing behaviour, byte for byte.
+# Defaulting to "public" would silently delete every tree/convention/
+# reasoning-bank hit from the LIVE Tier 2.5 retrieval lane, which is the
+# arming hazard  refused: build the distinction first, let a caller
+# opt in, decide the default separately with evidence.
+TIER_PUBLIC = "public"
+TIER_RAW = "raw"
+TIER_ALL = "all"
+
+
+def store_tier(store) -> str:
+    """Classify a result's `store` label as the public or the raw tier."""
+    label = str(store or "")
+    return TIER_PUBLIC if label.startswith("board/") else TIER_RAW
+
+
+def filter_by_tier(rows, tier=TIER_ALL, scopes=None):
+    """Select rows by tier. `scopes` (from _grants.readable_scopes) additionally
+    admits RAW rows whose ref falls inside a granted subtree.
+
+    Import-free by design: the scope predicate is passed IN as plain data, so
+    this module still imports no _fileops and no grant store. assert_no_fileops()
+    stays true.
+    """
+    if tier == TIER_ALL and not scopes:
+        return list(rows or [])
+    out = []
+    for r in rows or []:
+        t = store_tier(r.get("store"))
+        if tier == TIER_ALL or t == tier:
+            out.append(r)
+        elif t == TIER_RAW and scopes:
+            ref = str(r.get("ref") or "").strip().strip("/")
+            for sc in scopes:
+                sc = str(sc or "").strip().strip("/")
+                if not sc or sc == "/" or ref == sc or ref.startswith(sc + "/"):
+                    out.append(r)
+                    break
+    return out
+
+
+def search_world_dir(world_dir, terms, limit=5, include_archives=False,
+                    tier=TIER_ALL, scopes=None):
     """Search one world directory. Pure filesystem read -- no backend client.
 
     Returns (results, unreadable) where `unreadable` names every source that
@@ -317,6 +373,12 @@ def search_world_dir(world_dir, terms, limit=5, include_archives=False):
     # applied per-store in scan order (board first), so five early board rows
     # could shut out an exact tree/convention/reasoning-bank match entirely.
     # Deterministic tie-break so identical corpora rank identically everywhere.
+    # FILTER BEFORE RANK-AND-TRUNCATE (). Applying the tier filter after
+    # the `[:limit]` slice would let public rows crowd granted raw rows out of
+    # the window and then drop the publics too -- a caller holding a grant would
+    # see FEWER of its granted nodes the more public traffic the peer had, which
+    # reads as "the grant does not work" and is really a slice-order bug.
+    cands = filter_by_tier(cands, tier, scopes)
     cands.sort(key=lambda r: (-r["score"], r["store"], str(r["ref"] or "")))
     return cands[:limit], unreadable
 

@@ -33,6 +33,11 @@ only where the action is mechanically safe:
               them with judgment THIS run. Promotion reuses the existing gate
               (no field synthesis), so a record that cannot pass is never
               force-promoted.
+A FOURTH lane, ELIGIBLE (g-115-4721), covers the interval BEFORE overdue
+begins -- past the eligibility floor, deadline still in the future -- which
+until 2026-08-26 was watched by nothing at all and whose `0 overdue` reading was
+repeatedly recorded as "pipeline clean". See classify_eligible.
+
   - NEEDS_JUDGMENT (no mechanical action): recently-overdue but under-formed
               records (bare position / missing resolution fields). Surfaced for
               LLM claim synthesis -- NEVER auto-resolved. This is the explicit
@@ -212,6 +217,70 @@ def classify_overdue(records, now, expire_days_short=DEFAULT_EXPIRE_DAYS_SHORT,
     }
 
 
+def classify_eligible(records, now):
+    """Pure classifier for the ELIGIBLE lane (): discovered records
+    past their eligibility floor but NOT yet overdue.
+
+    Deliberately DISJOINT from classify_overdue over the same population:
+    that one takes `deadline.date() < now.date()`, this one takes
+    `deadline.date() >= now.date()`, so no record is classified by both and
+    nothing is ever moved twice. Same date-granular boundary (guard-2073), so
+    the two lanes cannot disagree about the boundary day.
+
+    WHY THIS LANE EXISTS. Before it, a discovered record that was eligible to
+    resolve but not yet late was reachable by NOTHING: review-hypotheses Mode 1
+    loads active + measurement-pending only, and classify_overdue gates on the
+    deadline having PASSED. That interval is precisely when a hypothesis is most
+    resolvable -- in-window, measurement channel live, evidence still cheap --
+    so the system reliably looked at these records only once they could no
+    longer be settled, at which point classify_overdue's one-way expire[] lane
+    archives them UNRESOLVABLE. Measured 2026-08-26 on the live store: 26 of 44
+    discovered records sat in this interval, 16 already passing the
+    active-formation gate, the oldest eligible for 99 days.
+
+    THE ZERO IT PRODUCED READ AS HEALTH, which is why the gap survived two prior
+    goals aimed at this same store. The sweep reported only `overdue`, so
+    sessions ran it, saw `0 overdue`, and recorded "pipeline clean / stores
+    healthy" (bravo 2026-07-09 and 2026-07-22, foxtrot 2026-08-17) while this
+    population sat unsurfaced. A gated detector's clean verdict says nothing
+    about what its gate excluded.
+
+    PARKING IS RESPECTED, and that is why the remedy is a sweep rather than
+    promote-at-creation. A FUTURE resolves_no_earlier_than is a deliberate
+    eligibility floor -- measured as systematic 7d and 30d offsets across 12
+    live records -- and it OUTRANKS the deadline here exactly as it does in
+    precheck-eval.py's hypothesis-health gate. Parked records are skipped, not
+    promoted.
+
+    Returns {scanned, eligible, promote[], needs_judgment[]}. Under-formed
+    records are SURFACED only: never force-promoted (same passes_active_formation
+    gate the overdue lane uses, so a record the daemon would reject is never
+    moved) and never expired, because an eligible record's observation window is
+    by definition still open.
+    """
+    promote, needs = [], []
+    eligible = 0
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("stage") != "discovered":
+            continue
+        deadline, _basis = effective_deadline(rec)
+        if deadline is None or deadline.date() < now.date():
+            continue  # no derivable deadline, or overdue -> classify_overdue's lane
+        rne = _parse_iso(rec.get("resolves_no_earlier_than"))
+        if rne is not None and rne.date() > now.date():
+            continue  # still parked behind a deliberate eligibility floor
+        eligible += 1
+        (promote if passes_active_formation(rec) else needs).append(rec)
+    return {
+        "scanned": len(records),
+        "eligible": eligible,
+        "promote": promote,
+        "needs_judgment": needs,
+    }
+
+
 def _read_discovered():
     """Read stage=='discovered' records directly from the live pipeline file.
     Direct read mirrors recurring-precondition-sweep.py (the file is the source
@@ -264,6 +333,10 @@ def main() -> int:
                     help="short/session-horizon overdue days past which a record is EXPIRED UNRESOLVABLE")
     ap.add_argument("--expire-days-long", type=int, default=DEFAULT_EXPIRE_DAYS_LONG,
                     help="long-horizon overdue days past which a record is EXPIRED UNRESOLVABLE")
+    ap.add_argument("--no-eligible", action="store_true",
+                    help="skip the ELIGIBLE lane (past eligibility floor, not yet overdue). "
+                         "The lane is ON by default on purpose: an opt-in flag nobody passes "
+                         "is a sweep that never runs, which is the gap this lane closes.")
     args = ap.parse_args()
 
     now = datetime.now()
@@ -303,12 +376,35 @@ def main() -> int:
         ok, _ = _move(rid, "active", None, args.apply)
         (promoted_ids if ok else failed).append(rid)
 
+    # ELIGIBLE lane (). Runs over the SAME `records` list and is
+    # disjoint from the overdue lane by predicate, so a record reached here was
+    # not touched above.
+    e = {"eligible": 0, "promote": [], "needs_judgment": []}
+    eligible_promoted = []
+    if not args.no_eligible:
+        e = classify_eligible(records, now)
+        for rec in e["promote"]:
+            rid = rec.get("id")
+            ok, _ = _move(rid, "active", None, args.apply)
+            (eligible_promoted if ok else failed).append(rid)
+
     result = {
         "scanned": c["scanned"],
         "overdue": c["overdue"],
         "expired": expired_ids,
-        "promoted": promoted_ids,
+        # UNION of both lanes, deliberately. review-hypotheses Step 1.0 documents
+        # that `promoted` records "are now stage=active and WILL appear in the
+        # active load below" -- true of eligible-lane promotions too, and having
+        # them resolved THIS run is the entire point of surfacing them early.
+        "promoted": promoted_ids + eligible_promoted,
         "needs_judgment": [r.get("id") for r in c["needs_judgment"]],
+        # SEPARATE key, deliberately NOT merged into needs_judgment: the caller's
+        # documented handling for that key ends in "resolve/expire with
+        # judgment", and EXPIRING an eligible record would close an observation
+        # window that is still open -- the exact harm this lane exists to prevent.
+        "eligible": e["eligible"],
+        "eligible_promoted": eligible_promoted,
+        "eligible_needs_judgment": [r.get("id") for r in e["needs_judgment"]],
         "failed": failed,
         "applied": args.apply,
     }
@@ -318,12 +414,18 @@ def main() -> int:
     else:
         print(
             f"[discovered-overdue-sweep] scanned={result['scanned']} "
-            f"overdue={result['overdue']} {'APPLIED' if args.apply else 'DRY-RUN'}: "
-            f"expired={len(expired_ids)} promoted={len(promoted_ids)} "
-            f"needs_judgment={len(result['needs_judgment'])} failed={len(failed)}"
+            f"overdue={result['overdue']} eligible={result['eligible']} "
+            f"{'APPLIED' if args.apply else 'DRY-RUN'}: expired={len(expired_ids)} "
+            f"promoted={len(result['promoted'])} (overdue {len(promoted_ids)} + "
+            f"eligible {len(eligible_promoted)}) "
+            f"needs_judgment={len(result['needs_judgment'])} "
+            f"eligible_needs_judgment={len(result['eligible_needs_judgment'])} "
+            f"failed={len(failed)}"
         )
         for rid in result["needs_judgment"][:10]:
             print(f"  needs-judgment (synthesize claim from position, then resolve/expire): {rid}")
+        for rid in result["eligible_needs_judgment"][:10]:
+            print(f"  eligible-needs-judgment (in-window, under-formed -- synthesize a claim; do NOT expire): {rid}")
     return 0
 
 

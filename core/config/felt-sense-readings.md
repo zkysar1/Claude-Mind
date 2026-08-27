@@ -1362,3 +1362,217 @@ composition without being the metric: asp-115 124/260 (48%), asp-335 46, asp-326
 vacuous-population clean the default invocation produces.
 
 **Insights backlog: 0 unprocessed** — Phase 1b a genuine no-op, curated 0.
+
+### 2026-08-26T16:39 — zeta, `hostname` cc-02, `uname -r` 6.8.0-137-generic, own-cloud, reducer
+
+Cadence fire at goals_completed_at_last_fire=**11713** (gate read current=11711, last=11602,
+diff=109, cadence=75). Session at goals_completed=100 / productive=97 / streak=5.
+
+**Phase 2 — the two queries, per rule 4's mandated four-reason tally:**
+
+| query | candidates | mutated | foreign sid | absent sid | partner |
+|---|---|---|---|---|---|
+| `in-progress` | **0** | 0 | 0 | 0 | 0 |
+| `pending` + participants `agent` | **2222** | 2221 eligible | 0 | 0 | 1 |
+
+Field presence on the pending population: `claimed_by` **2/2222**, `claimed_by_sid` **2/2222**,
+name-with-no-sid **0**. The two columns RECONCILE, which is what licenses reading the near-zero
+claim rate as a real property of the population rather than as the six-key projection defect —
+`--full` was passed, and a projection failure would have shown `claimed_by` present with
+`claimed_by_sid` at zero, not both at 2.
+
+Read the `in-progress` zero per this file's own rule: **"no worker Bodies active"**, NEVER "no
+out-of-cycle work found" (guard-1715). zeta runs a single Body, so the delivery-queue population
+this query exists to surface is structurally absent here — the zero is about the configuration,
+not the fleet. No mutations made; the genuine out-of-cycle subset (`executed_by` set AND
+`outcome_note` present) is the completed-not-closed slate already drained earlier this iteration.
+
+**Phase 3 — 20 blocked, all 20 carry a block signal, 18 eligible / 2 partner-held. Zero
+unblockable**, corroborated by three canonical sweeps rather than by my own scan:
+0.5b.12 → 0 all_resolved / 0 disagreement / 0 dangling / 1 undecidable (g-326-330,
+`external_unresolvable`, 9.9d, partner-held); 0.5b.16 → 5544 scanned, 42 with edges, 56 edges,
+0 cycles, 0 dangling, `archive_degraded: false`; 0.5b.11 → 0 reason-less.
+
+**Phase 5b — verify-learning staleness** (`--all-skills`, not the default): **129 skills / 3840
+assertions / 5 parse-lines / 1 stale**. The one hit is a FALSE POSITIVE and worth recording as
+such: `[L4_argparse_flag] aspirations-precheck/SKILL.md:2096 --output on self-blocked-defer-sweep.py`
+— the line reads ``--json      # `--json`, NOT `--output json` ``, so the scanner extracted the flag
+from the comment *warning against* it. **guard-1685 referent trap: a token survives its own
+correction.** Any flag-extraction scanner over prose that documents forbidden flags will do this;
+the fix is on the scanner side (skip the comment tail), not on the SKILL.md.
+
+**Phase 7 — directive-lane-share, and the parser lesson that nearly ate it.** My first pass printed
+`share_by_aspiration_id=None, share_by_work_class=None` at every window and I nearly recorded "the
+canonical instrument returns null shares" as a finding. Positive control against the producer
+falsified it: `share_by_aspiration_id` **does not exist as a key at all**, and `share_by_work_class`
+is a **function name** (line 306), not a field. The record was complete and fresh; I projected it
+away at the print. This is the eighth state — a CORRECT probe over a COMPLETE record where the loss
+is at the PRINT — and it is the second time this session, so guard-3850 / rb-7911 / guard-2298 were
+credited rather than a fourth duplicate filed. **Dump `TOP-LEVEL KEYS` before believing any None.**
+
+Real keys: `['agent','batch_filter','demanded_ratio','floor_pct','history_recoverability','lane',
+'lane_source','measured_at','pool','pool_is_pending_not_candidates','series','windows',
+'work_class_lane']`; per-window `['by_work_class','infra','lane','oneoff_only_pct','ordering_ok',
+'other','ratio','share_pct','total','unfiltered_total']`.
+
+| lane | window | lane | infra | other | total | by-id % | by work_class % |
+|---|---|---|---|---|---|---|---|
+| derived (326/335/350/362/363/364/**368/369**) | 7d | 53 | 78 | 22 | 153 | **34.6** | 47.1 |
+| derived | 48h | 42 | 68 | 14 | 124 | — | — |
+| derived | 24h | 29 | 43 | 11 | 83 | — | — |
+| derived | 12h | 17 | 23 | 8 | 48 | — | — |
+| legacy (335/334) | 7d | 16 | 78 | 59 | 153 | — | — |
+
+`lane_source: derived-from-strategic-focus`; pool lane 223 / infra 1895 / other 146, lane_pct 9.85,
+asymmetry 8.5; `ratio` **3.51** vs `demanded_ratio` **3.38** → demand **MET**.
+
+Read via rider (c) — product is `lane + other`, never the `ordering_ok` boolean (which is False
+here and means only `lane < infra`): 7d product **75 vs infra 78**; 48h **56 vs 68**; 24h **40 vs
+43**; 12h **25 vs 23 — product LEADS**. So the infra tilt is marginal (3 goals at 7d) and has
+already inverted at 12h. Reporting `ordering_ok: False` alone would have read as a standing infra
+problem that the window decomposition falsifies.
+
+**Delta vs my own prior point (2026-08-25, same 8-aspiration lane): by-id 33.6 → 34.6 (+1.0pp),
+work_class 47.1 → 47.1 (unchanged, exactly).** Both above the 33.3 floor; second consecutive
+above-floor reading. Do NOT compare against the 2026-08-21 entry above — different agent, different
+box, and a SIX-aspiration lane (368/369 had not joined), so its 31.6/51.8 is not the same
+measurement.
+
+**Insights backlog: 0 unprocessed** — Phase 1b a genuine no-op, curated 0.
+
+**Suite note (owed from the prior window):** `run-full-suite` chunked half returned
+`TOTAL: 17805 passed, 15 failed` under `VERDICT: INVALID (tree-moved)`. The verdict is the reading;
+the totals are not. I had earlier inferred from the 1/5/4/5 per-chunk spread that the failures were
+genuine — that inference is VOID, because the tree moved under the run (my own commit `5886ddc6`
+plus the origin integration to `19b00ed6a` landed mid-run). Tree is stable now (HEAD ==
+origin/main, only loop residue dirty); the main()-style half is still in flight, so the re-run for
+a valid verdict waits for it rather than racing a second runner.
+
+### 2026-08-27T00:44:25 — bravo, hostname `cc-05`, uname -r `6.8.0-137-generic`, own-cloud
+
+Phase 2, BOTH compartments (rule 5 — never the aggregate):
+
+| compartment | candidates | mutated | foreign-sid | absent-sid | partner |
+|---|---|---|---|---|---|
+| in-progress   | 1    | 0 | 0 | 0 | 1 |
+| pending+agent | 2240 | 0 | 0 | 0 | 3 |
+
+Field census beside the tally (the second mandated line):
+- in-progress: claimed_by 1/1, claimed_by_sid 1/1, **name-less-sid 0**
+- pending+agent: claimed_by 3/2240, claimed_by_sid 3/2240, **name-less-sid 0**
+
+Claimants — in-progress `{alpha: 1}`; pending+agent `{(none): 2237, echo: 1,
+alpha: 1, zeta: 1}`.
+
+**The in-progress compartment is at 1.** Prior recorded windows put this at 93-95
+with the worker-delivery-queue reading ("held in-progress for the reducer"). One
+row, held by alpha, correctly skipped as partner. Per rule 1 this is a STOCK and
+the delta is NOT a drain rate — arrivals and drains are both invisible here, so
+95 -> 1 bounds the net only. What it does establish is that the standing delivery
+queue described in the SKILL.md prose is not a permanent fixture; a successor
+meeting a near-empty in-progress query should not read it as "no worker Bodies
+active" without checking, because that is the guard-1715 vacuous-population trap
+the same section warns about in the other direction.
+
+**name-less-sid is 0 on both.** The g-115-5766 anomaly (a surviving `claimed_by_sid`
+beside a cleared `claimed_by`, which falls through the ownership branches into the
+mutate-authorized disjunct) is NOT present in this population. Recording the
+negative deliberately: the census line exists so its absence is legible, and a
+reading that only ever gets published when it fires cannot establish a baseline.
+
+**2237 of 2240 pending+agent goals are unclaimed** — rule 6 read from the other
+side. The tiny mutable count is not a small population; it is 3 ownership gates
+firing correctly over a very large one.
+
+Vantage (rule 2): read from bravo's own session, so `partner` carries the
+protection here and both foreign-sid counters are 0. No successor should inherit
+that column split.
+## Reading — 2026-08-27T01:05, zeta, `hostname` cc-02, `uname -r` 6.8.0-137-generic, own-cloud, reducer
+
+Cadence: current=11791 last=11713 diff=78 (cadence 75).
+
+**Phase 2 — `in-progress` 0 rows / `pending`+agent-participants 2234 rows.**
+
+```
+2234 candidates — 2233 mutable, 0 skipped (foreign sid), 0 skipped (absent sid), 1 skipped (partner)
+  fields: claimed_by 1/2234, claimed_by_sid 1/2234, name-less-sid 0
+  claimants: {'alpha': 1}
+```
+
+**This is method rule 6 INVERTED, and the inversion is the finding.** Rule 6 reads
+"a SMALL mutable count is the gates working, never a small population." Here the
+mutable count is essentially the WHOLE population (2233/2234) — because
+`claimed_by` is set on exactly ONE record in 2234. The ownership gate is not
+refusing anything; it is **inert**, because an unclaimed pending backlog gives it
+nothing to bite on. Do not read 2233 "mutable" as 2233 items to close: `mutable`
+means only "the ownership predicate does not forbid a write", and Phase 2's actual
+question (was this silently finished?) is unanswered by it. The discriminator has
+to come from elsewhere.
+
+Corollary for method rule 2 (the vantage decides which column carries the
+protection): on THIS vantage **neither** column carries it. partner=1 and
+foreign-sid=0 both round to nothing, so a successor inheriting either column's
+advice from this row inherits nothing. The four-reason tally still survives — it
+just reports, correctly, that the gate was idle.
+
+What DID answer Phase 2 was the purpose-built lane: `completed-not-closed-slate`
+ran in the same iteration's precheck (0.5g.7) and returned `population=4(mine)
+slate=0`. Prefer it; this query cannot substitute for it.
+
+**Phase 3 — 18 blocked.**
+
+```
+Phase3 Gate1: 18 candidates — 17 mutable, 0 foreign sid, 0 absent sid, 1 partner
+  fields: claimed_by 1/18, claimed_by_sid 1/18, name-less-sid 0
+signal combos: blocked_by 13 | blocked_by+defer_reason 2 | blocker_ref 1 | defer_reason 1 | NONE 1
+blocker_ref kind: none 17, dict 1  (no bare-string refs this reading)
+participants: agent 18 (no partner-routed goals)
+```
+
+**Gate 2 dependency-staleness scan: ZERO stale edges.** All 15 `blocked_by` edges
+resolved (16 distinct referents): **14 pending, 2 blocked, 0 terminal**. No goal
+in this population is held behind a finished dependency, so no unblock is
+warranted on the dependency axis. Recording the zero WITH its population because
+a stale-edge scan that finds nothing is indistinguishable from one that scanned
+nothing.
+
+`g-250-124 <- g-250-345` — the goal the skill's Gate 3.5 FOLLOW-UP block narrates —
+now reads `g-250-345: pending` (it was `in-progress`/alpha on 2026-08-11). The
+re-statement remedy is holding: the block is still live, still true, and still
+falsifiable in ONE query, which is the practical argument that block re-statement
+beats TTL re-gating.
+
+**Gate 3 / reason-less:** the one `NONE`-signal goal is `g-326-183` (asp-326,
+HIGH, `intended_agent: foxtrot`, rich foxtrot-authored progress_note +
+self-correcting outcome_note). My independent scan and the canonical
+`reason-less-blocked-check.sh` agreed exactly (1 of 3130 scanned) — a free
+positive control on my own predicate. `open_audit_exists: True`,
+`open_audit_goal_id: g-115-3068`. Already owned; not mutated, no new goal filed.
+A null `claimed_by` on a goal whose notes are written in another agent's first
+person is not ownership (guard-2931).
+
+**Phase 5b — 129 skills / 3841 assertions / 5 parse-lines, 1 stale → 0 after fix.**
+`[L4_argparse_flag] aspirations-precheck/SKILL.md:2096` was a FALSE POSITIVE: the
+flag appeared only inside a trailing shell comment warning against it. Fixed in
+`verify-learning-staleness.py` by stripping the unquoted trailing comment before
+the flag scan (NOT by widening `is_negative_assertion`, which would have disabled
+the lane on every line carrying `, NOT `). Population after the fix is
+byte-identical — 129 / 3841 / 5 — which is the proof the lane was not blinded.
+rb-9379, guard-5254, 4 tests, 23/23 green.
+
+**Phase 7 — directive-lane, both splits (rider (a): `lane_source` decided run 2).**
+
+| lane def | 7d lane / infra / other | share (asp-id) | share (work_class) |
+|---|---|---|---|
+| `derived-from-strategic-focus` (8 asps) | 59 / 87 / 24 = 170 | **34.7%** | **46.5%** |
+| legacy `asp-334,asp-335` (`explicit-flag`) | 22 / 87 / 61 = 170 | **12.9%** | **32.9%** |
+
+21.8pp of spread from the lane DEFINITION alone, at one instant, on one box —
+so an inherited series point compared against a differently-derived one is not a
+trend (guard-1944). Product (`lane + other`) is **83 in both**, as it must be;
+only the lane/other partition moves. `ordering_ok: false` in both, but per rider
+(c) that boolean tests only `lane > infra` and is silent about `other`: the
+genuine tilt condition `infra > lane + other` holds **87 > 83**, i.e. marginal,
+not the "infra dominates" reading the boolean invites. `pool` (lane 216 / infra
+1903, lane_pct 9.5) is NOT drift evidence — guard-2379, it counts non-terminal
+goals, not executable candidates.

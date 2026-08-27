@@ -714,7 +714,7 @@ IF abc_chain.consequence.surprise_level >= 3 OR NOT abc_chain.consequence.confir
         FOR EACH alt in alternatives:
             IF alt.plausibility >= 0.4 AND alt.testable:
                 echo '{"claim":"{alt.alternative_explanation}","confidence":{alt.plausibility},"source_hypothesis":"{hypothesis.id}","source_step":"divergent_alternatives","horizon":"session","test_description":"{alt.test_description}","resolves_when":"result of {alt.test_description}: does the alternative hold over the primary ABC explanation?","consumer":"reflection/encoding for {hypothesis.id}: supersede the primary ABC explanation if this alternative settles true"}' | Bash: wm-append.sh micro_hypotheses
-                Log: "DIVERGENT -> HYPOTHESIS: '{alt.alternative_explanation}' (plausibility {alt.plausibility})"
+                IF exit 0: Log: "DIVERGENT: '{alt.alternative_explanation}' (plausibility {alt.plausibility})"
 
         # Store alternatives for use in Step 3 (enriches the textual reflection)
         divergent_context = alternatives

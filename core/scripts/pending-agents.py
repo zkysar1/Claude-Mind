@@ -50,7 +50,15 @@ def read_data():
         return {"agents": [], "last_updated": None}
     try:
         data = yaml.safe_load(PENDING_PATH.read_text(encoding="utf-8")) or {}
-    except Exception:
+    except Exception as e:
+        # NEVER swallow silently: a corrupt/unreadable store must not be
+        # indistinguishable from an empty one at the call site. stop-hook Gate
+        # 2.5 reads this store to decide whether background agents are still
+        # pending, so a silent empty here reads as "none pending" and lets a
+        # turn end while agents are in flight. (verify-before-assuming Rule 4 —
+        # a swallowed failure is ZERO signals, not one.) .
+        log(f"READ FAILED for {PENDING_PATH}: {type(e).__name__}: {e} — "
+            f"returning EMPTY, which is NOT proof the store is empty")
         return {"agents": [], "last_updated": None}
     if "agents" not in data or not isinstance(data["agents"], list):
         data["agents"] = []

@@ -36,6 +36,15 @@ sys.path.insert(0, str(Path(__file__).parent))
 # not shared state -- ).
 from _wake_timers import _parse_iso, _iter_goals, _goal_wake_time  # noqa: E402
 
+# {(agent_etag, world_etag): (earliest_iso_or_None,)} -- the 1-tuple is what
+# distinguishes "no memo" from "memo says None".
+# The ETag short-circuit in authoritative_earliest_wake_at (). Held
+# at module level so it survives across the two cycle-cache calls inside one
+# iteration; cleared to a single entry on every write so a long-lived daemon
+# cannot accumulate slots. Deliberately keyed on CONTENT identity only -- no
+# session-scoped value goes anywhere near it (guard-2480).
+_AUTH_WAKE_MEMO = {}
+
 
 def wake_timer_elapsed(earliest_wake_at, now, within_s=0):
     """True iff `earliest_wake_at` has arrived (elapsed) or is within `within_s`
@@ -100,6 +109,95 @@ def authoritative_earliest_wake_at(now, *, backend=None,
         if agent_dir is None:
             agent_dir = AGENT_DIR
 
+    # --- ETag short-circuit () --------------------------------
+    # Each source below is a FULL unconditional S3 get_object straight to
+    # memory. Measured 2026-08-26 on cc-05: world/aspirations.jsonl is
+    # 19,882,815 B and agents/<a>/aspirations.jsonl 113,422 B, and BOTH
+    # cycle-caches (dry-idle-cycle-cache.py:381, quiescence-cycle-cache.py:311)
+    # call this every loop iteration on every agent on every box -- ~40 MB of
+    # pure egress per iteration to compute one min() timestamp. That is the
+    # dominant term in the 919 GB/wk re-pull  attributed to this
+    # bucket (rb-9328: "the real lever is box-side caching -- conditional GETs
+    # + longer read-through TTLs").
+    #
+    # The fix cannot be "read the mirror" -- guard-1139 / rb-2636: under
+    # own-cloud the local aspirations.jsonl is non-authoritative, and that is
+    # this whole function's reason to exist. But an ETag match is PROOF the
+    # object is unchanged, not a freshness heuristic, so serving a memoized
+    # answer behind one is authoritative in the same sense the GET is.
+    # backend.stat() is already in the StorageBackend protocol
+    # (storage_backend.py:199) and its `version` IS the S3 ETag
+    # (owncloud_backend.py:1211) -- so this needs no new backend method, no
+    # protocol change, and no update to the FakeBackends in the suite.
+    versions = []
+    stat_fn = getattr(backend, "stat", None)   # genuinely absent on some fakes
+    for base in (agent_dir, world_dir):
+        if base is None:
+            continue
+        if stat_fn is None:
+            versions = None
+            break
+        src = Path(base) / "aspirations.jsonl"
+        # stat() and read_authoritative_bytes DIVERGE on two path classes, and
+        # in both the ETag would describe a different object than the bytes:
+        #   * MACHINE-LOCAL -- read_authoritative_bytes short-circuits to a
+        #     local read, while OwnCloudBackend.stat has no _machine_local
+        #     branch and HEADs S3 (owncloud_backend.py:1211). The memo would
+        #     then key on a remote ETag that local edits never move.
+        #   * OUT-OF-ROOT -- read_authoritative_bytes catches the ValueError
+        #     _s3_key raises and reads locally; stat does not catch it, so the
+        #     probe would raise where today's code succeeds.
+        # Neither is reachable for these two governed queues today, but this
+        # helper is imported by both cycle-caches and the guard costs one
+        # branch each. Declining the OPTIMISATION is always safe -- it falls
+        # through to the unchanged read below and returns the same answer.
+        # Note this is NOT a guard-160 synthesized default: nothing is
+        # invented, and a genuine store failure still propagates untouched.
+        # ONE try around BOTH probes: _machine_local is pure path
+        # classification (owncloud_sync's _EXCLUDE_DIRS prune + basename
+        # rules) and _s3_key resolves a path relative to the configured
+        # root, so an out-of-root path can raise ValueError from either.
+        # This call is NEW to this function, so an exception it raises would
+        # be an error today's code never had -- it must not escape.
+        try:
+            is_machine_local = getattr(backend, "_machine_local", None)
+            if callable(is_machine_local) and is_machine_local(src):
+                versions = None
+                break
+            st = stat_fn(src)
+        except ValueError:      # path outside the configured root
+            versions = None
+            break
+        versions.append(getattr(st, "version", None) if st is not None else None)
+    memo_key = tuple(versions) if versions is not None else None
+
+    if memo_key is not None:
+        memo = _AUTH_WAKE_MEMO.get(memo_key)
+        if memo is not None:
+            (earliest_iso,) = memo          # 1-tuple: distinguishes a memoized None
+            # PROVABLY IDENTICAL to a fresh compute, and the proof is short
+            # because _wake_timers._goal_wake_time ends in ONE global backstop:
+            #     future = [c for c in candidates if c > now]
+            #     return min(future) if future else None
+            # so the answer is exactly R(t) = min{c in C : c > t}, and an ETag
+            # match fixes C. As t advances candidates only DROP OUT, never
+            # appear, therefore:
+            #   * R(T) is None  -> {c > T} was empty, so {c > T'} is empty too.
+            #   * R(T) > now    -> the minimiser is still in the set and nothing
+            #                      smaller can have appeared, so R(T') == R(T).
+            #   * R(T) <= now   -> the minimiser has elapsed and a fresh compute
+            #                      would drop it. Fall through and recompute.
+            # No staleness window and no tunable: the memo is either exactly
+            # right or not used. (An earlier draft carried a third arm for a
+            # candidate already past at compute time; that state is UNREACHABLE
+            # through the global backstop above, and the test written to pin it
+            # is what surfaced the misreading.)
+            if earliest_iso is None:
+                return None
+            e = _parse_iso(earliest_iso)
+            if e is None or e > now:
+                return earliest_iso
+
     asps = []
     # Agent then world -- order is irrelevant (we take the min wake across both),
     # but mirrors _wake_timers.scan_queue's agent-then-world load order.
@@ -128,4 +226,13 @@ def authoritative_earliest_wake_at(now, *, backend=None,
         w = _goal_wake_time(g, now)
         if w is not None and (earliest is None or w < earliest):
             earliest = w
-    return earliest.isoformat(timespec="seconds") if earliest else None
+    result = earliest.isoformat(timespec="seconds") if earliest else None
+    if memo_key is not None:
+        # SINGLE-SLOT by construction: keys are ETag tuples, so a dict would
+        # grow without bound over a long-lived daemon's life. Only consecutive
+        # calls can hit, which is exactly the win being harvested (the two
+        # cycle-caches read the same two objects moments apart in one
+        # iteration), so one slot loses nothing.
+        _AUTH_WAKE_MEMO.clear()
+        _AUTH_WAKE_MEMO[memo_key] = (result,)
+    return result

@@ -316,3 +316,76 @@ class TestLiveCorpus:
         assert n < 63515, (
             f"verify-learning SKILL.md is {n:,} B, over the 63,515 B skill-injection "
             f"ceiling — checks past the cut are silently invisible (g-115-6689)")
+
+
+class TestAddEmitsTheParsersOwnKind:
+    """: cmd_add hardcoded kind="check" and prepended "Check: "
+    unconditionally, so a bash check added through the tool landed as k=check
+    with i=None behind a doubled "Check: Bash (...)" prefix — REGISTERED BUT
+    NEVER EXECUTED. That is false coverage, which is worse than no check:
+    corpus_checks rises while nothing runs, so the instrument reports more
+    protection than exists.
+
+    BOTH directions are pinned (guard-1220 / rb-4133 — a fixture that cannot
+    come out the other way proves nothing): the bash case would also pass
+    against a cmd_add that emitted bash_named unconditionally, so the plain
+    case is what makes it meaningful. Assertions are PER-CASE, never an
+    aggregate count (guard-1793) — a `corpus_checks` total is satisfied
+    identically by two checks or two bash_named rows, so it cannot tell the
+    defect from the fix.
+    """
+
+    class Args:
+        section = "ZZ"
+        check = None
+        why = None
+        dry_run = False
+
+    def _add(self, mod, registry, capsys, check):
+        a = self.Args()
+        a.check = check
+        assert mod.cmd_add(a) == 0
+        capsys.readouterr()
+        return mod.load_registry(registry)
+
+    def test_a_bash_check_lands_as_bash_named_with_its_id(self, mod, registry, capsys):
+        blocks = self._add(mod, registry, capsys, "Bash (drift-probe): echo ok")
+        rows = [b for b in blocks if "drift-probe" in b["raw"]]
+        assert len(rows) == 1, "expected exactly one added row"
+        row = rows[0]
+        assert row["kind"] == "bash_named", (
+            f"bash check registered as k={row['kind']!r} — inert, never executed")
+        assert row["id"] == "drift-probe", (
+            f"bash_named id must be the captured name, got {row['id']!r}")
+        assert not row["raw"].lstrip().startswith("Check: Bash"), (
+            "the doubled 'Check: Bash (...)' prefix is back")
+        assert mod.cmd_verify(TestFixedPoint.Args()) == 0
+
+    def test_a_plain_check_still_lands_as_check(self, mod, registry, capsys):
+        blocks = self._add(mod, registry, capsys, "a plain textual check")
+        rows = [b for b in blocks if "a plain textual check" in b["raw"]]
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["kind"] == "check", f"plain check became k={row['kind']!r}"
+        assert row["id"] is None
+        assert row["raw"].lstrip().startswith("Check: ")
+        assert mod.cmd_verify(TestFixedPoint.Args()) == 0
+
+    def test_a_bare_bash_check_lands_as_bash_bare(self, mod, registry, capsys):
+        """cmd_add routes through the same cascade the parser uses, so the
+        third record kind must not silently become a check either."""
+        blocks = self._add(mod, registry, capsys, "Bash: echo bare")
+        rows = [b for b in blocks if "echo bare" in b["raw"]]
+        assert len(rows) == 1
+        assert rows[0]["kind"] == "bash_bare"
+        assert rows[0]["id"] is None
+
+    def test_the_added_kind_matches_what_parse_reads_back(self, mod, registry, capsys):
+        """The invariant behind all three: an added row must be classified the
+        same way the parser would classify its own raw line. This is what
+        cmd_add could not satisfy while `kind` was a literal."""
+        for text in ("Bash (round-trip): echo ok", "a plain check", "Bash: echo bare"):
+            blocks = self._add(mod, registry, capsys, text)
+            row = [b for b in blocks if text.split(":")[-1].strip() in b["raw"]][-1]
+            assert row["kind"] == mod._classify_record(row["raw"])[0]
+            assert row["id"] == mod._classify_record(row["raw"])[1]

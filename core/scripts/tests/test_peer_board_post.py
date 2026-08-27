@@ -231,3 +231,49 @@ def test_resolved_but_missing_dir_is_unreachable(tmp_path):
             env_extra={"PEER_WORLD_ZDS_MIND": str(ghost)})
     assert r.returncode == EXIT_UNREACHABLE
     assert not ghost.exists(), "must not create the peer world it failed to find"
+
+
+# ── G5 cross-world provenance () ───────────────────────────────────
+# guard-3221: a coupling test must call the REAL producer and assert the marker
+# appears, WITH a negative control asserting it does NOT appear when the
+# upstream value is absent. Without the control the positive assertion passes
+# against any non-empty record, which is exactly how an inert feature ships
+# green. The peer is not reachable from every box, so binding to build_record
+# (the function that produces the artifact the peer receives) is the closest
+# real producer that runs everywhere.
+
+def _load_pbp():
+    import importlib.util
+    sys.path.insert(0, str(SCRIPTS))
+    spec = importlib.util.spec_from_file_location("pbp_under_test", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _pbp_rec(**kw):
+    base = dict(author="zeta@world-a", channel="general", msg_type="note",
+                text="payload-body", tags=[], reply_to="", seq=1,
+                now="2026-08-27T00:00:00")
+    base.update(kw)
+    return _load_pbp().build_record(**base)
+
+
+def test_g5_provenance_reaches_the_record_the_peer_receives():
+    rec = _pbp_rec(origin_env="world-a")
+    assert rec["origin_env"] == "world-a"
+    assert rec["influence_chain"] == ["world-a"]
+    assert rec["source_trace_ids"] == []
+    assert rec["contributor_ids"] == []
+    # The stamp must not clobber the payload it decorates.
+    assert rec["text"] == "payload-body"
+    assert rec["channel"] == "general"
+
+
+def test_g5_negative_control_no_stamp_without_an_origin_env():
+    rec = _pbp_rec(origin_env="")
+    for k in ("origin_env", "influence_chain", "source_trace_ids",
+              "contributor_ids"):
+        assert k not in rec, (
+            "%s present with no origin_env — the marker is unconditional, so "
+            "the positive test above proves nothing" % k)

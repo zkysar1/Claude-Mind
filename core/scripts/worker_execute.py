@@ -458,6 +458,38 @@ SKILL_LIFECYCLE_STAGE = {
     "/drain-temp": "reducer-iteration",
 }
 
+# ── DO NOT POPULATE A GOAL'S `skill` FIELD JUST TO WIN THIS FENCE () ──
+#
+# The remedy this table advertises -- "add the skill to SKILL_LIFECYCLE_STAGE" --
+# is safe ONLY for a goal that ALREADY carries the right skill. The tempting next
+# step, for the 919-of-938 goals that carry NONE, is to fill the field in so the
+# bridge can finally answer. That is NOT a metadata edit and it is not free:
+#
+#   `skill` IS THE EXECUTOR'S DISPATCH KEY, not an inert tag.
+#   .claude/skills/aspirations-execute/SKILL.md: `result = invoke goal.skill
+#   with goal.args`. The "Misroute guard" 27 lines above it SETS goal.skill
+#   precisely to redirect dispatch, which is independent corroboration.
+#
+# So stamping a skill onto a skill-less goal changes WHAT THAT GOAL RUNS. On the
+#  recurring cognitive goals this was proposed for, the cadences are 2.67h
+# / 40.5h / 48h, and the nearest skills are all WIDER than the goal: 
+# ("Generate hypotheses from recent work") names the sq-009 formation protocol,
+# but /aspirations-spark documents no sq-009-only entry point, so the stamp would
+# run the ENTIRE spark phase every 2.67h to buy a refusal. That is guard-4618 in
+# its purest form -- a change that makes the detector go green by altering the
+# thing being detected -- and it is strictly worse than the miss it fixes.
+#
+# Measured 2026-08-24 (alpha worker Body, cc-07) while executing ,
+# which PROPOSED exactly this. Also measured there: of 's five skill-less
+# recurring goals only THREE are reducer-only at all ( archival sweep and
+#  shared-storage domain refresh are legitimate worker work), and
+# `intended_agent`
+# cannot substitute -- its values are agent NAMES and goal-schemas.md calls it
+# advisory, "without restricting access".
+#
+# The real fix is a goal-level marker with NO dispatch semantics, owned by
+# . Route skill-less reducer-only goals there; do not stamp `skill`.
+
 # THE PINNED NEGATIVES, and they are the load-bearing half of this table
 # (guard-2860: "the test proving the carve-out works cannot fail in the
 # dangerous direction; the load-bearing ones are the exclusions").
@@ -530,7 +562,19 @@ def skill_eligibility(skill: "str | None") -> _SkillEligibilityFields:
     if norm is None:
         return _SkillEligibilityFields(
             True, None, None, None,
-            "no skill named on the goal -- ordinary worker-eligible work")
+            "NOT EVALUATED -- the goal names no skill, and this bridge is "
+            "SKILL-keyed, so it CANNOT ANSWER whether the GOAL is reducer-only. "
+            "This is NOT a cleared check. Eligibility stays True because "
+            "fail-open is deliberate (919 of 938 live candidates carry no "
+            "skill; fail-closed would strand the worker role) -- so the "
+            "decision is YOURS, not this bridge's. Before claiming, read the "
+            "goal's verification outcomes and description: if the work ENCODES "
+            "to the tree / reasoning bank / guardrails, RESOLVES a hypothesis, "
+            "drains a capture lane, consumes worker refs, pushes main, or "
+            "writes the agent-wide working-memory.yaml, it is REDUCER-ONLY -- "
+            "release it and take the next candidate. "
+            "(g-115-6523; guard-1760 class: a checker must not report what it "
+            "declined to look at as a pass.)")
     if norm in SKILL_ELIGIBLE_DESPITE_ENCODING:
         return _SkillEligibilityFields(
             True, norm, None, None,
@@ -598,8 +642,10 @@ NO_CARRIER = "no-carrier"                # DECLARED as unreachable -- see below
 
 GIT_REF = "git-ref"                      # per-Body namespaced ref, pushed + consumed
 UPSTREAM_REMOTE = "upstream-remote"      # a repo's OWN origin, pushed per post-execution Step 2
+IN_PLACE_AT_DESTINATION = "in-place-at-destination"  # applied ON the target system; nothing to transport
 CARRIER_KINDS = frozenset({
-    STAGED_ARTIFACT, WM_SLOT, SHARED_STORE, GIT_REF, UPSTREAM_REMOTE, NO_CARRIER,
+    STAGED_ARTIFACT, WM_SLOT, SHARED_STORE, GIT_REF, UPSTREAM_REMOTE,
+    IN_PLACE_AT_DESTINATION, NO_CARRIER,
 })
 
 _CarrierFields = collections.namedtuple(
@@ -683,6 +729,7 @@ CANONICAL_OUTPUT_CLASSES = (
     "framework-file-edit",
     "local-git-commit",
     "product-repo-commit",
+    "remote-host-config-edit",
 )
 
 # POINTER DISCIPLINE for pending_goal: it names the goal that BUILDS the
@@ -769,6 +816,31 @@ OUTPUT_CLASS_CARRIERS = {
             "where two Bodies had independently written this same row and git took one "
             "side cleanly. The ROW survived — only this clause did not, which is why a "
             "raw at-HEAD token check reads the loss as benign supersession.)"),
+    "remote-host-config-edit": CarrierDisposition(
+        kind=IN_PLACE_AT_DESTINATION,
+        target="the TARGET HOST's own filesystem, plus whatever archive convention that "
+               "host keeps (e.g. zakpod1:/home/zak/config-archive/) — the goal's "
+               "outcome_note is the only fleet-visible record",
+        why="A worker edit to a file on a remote host — an inference pod's nginx config, a "
+            "systemd unit, an engine env file — is applied AT its destination, so unlike "
+            "every git-carried class there is nothing to transport and no 'finished work "
+            "stranded on the worker box' failure. That is precisely why it is NOT "
+            "no-carrier, and why reusing upstream-remote would be wrong: that kind means a "
+            "REPO's own origin, and a host filesystem is not a repo.\n"
+            "            What this class does not have is any fleet-visible COPY. No git "
+            "ref carries it, no own-cloud store holds it, and world/changelog.jsonl never "
+            "sees it. So the failure mode inverts: the edit survives and its EXPLANATION "
+            "does not. A re-image, a config-management run, or a restore-from-backup "
+            "silently reverts work that every Body still reads as complete — the g-4638 "
+            "shape (completion and landing are separate events) with the landing on a box "
+            "outside the repo entirely.\n"
+            "            TWO OBLIGATIONS FOLLOW, and they are this row's whole point: "
+            "archive to the target host's own convention BEFORE editing (so the box itself "
+            "carries a recovery layer), and put the before/after diff in the outcome_note "
+            "(so the fleet carries the reason). Measured 2026-08-24, g-326-629: an alpha "
+            "worker on cc-08 edited zakpod1:/etc/nginx/conf.d/llama-lb.conf and "
+            "check-outputs had no class for it at all — the same shape as g-306-263, where "
+            "an unlisted class was not thereby carried."),
 }
 
 

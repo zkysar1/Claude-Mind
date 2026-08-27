@@ -97,6 +97,29 @@ def _indent(line: str) -> int | None:
     return len(line) - len(line.lstrip())
 
 
+def _classify_record(line: str):
+    """-> (kind, id) for a RECORD line, or (None, None) if it is not one.
+
+    The check/bash cascade, extracted so `parse` and `cmd_add` cannot disagree
+    about what a line IS (g-115-7804). cmd_add used to hardcode kind="check",
+    so a bash check added through the tool landed as k=check with i=None and
+    was registered but never executed — false coverage, which is worse than no
+    coverage because the registry count rises while nothing runs.
+
+    Order is load-bearing and matches the parser's original cascade: CHECK_RE
+    is tried BEFORE BASH_NAMED_RE, so a line that literally starts `Check:` is
+    a check even when the rest of it mentions Bash.
+    """
+    if CHECK_RE.match(line):
+        return "check", None
+    m = BASH_NAMED_RE.match(line)
+    if m:
+        return "bash_named", m.group(2)
+    if BASH_BARE_RE.match(line):
+        return "bash_bare", None
+    return None, None
+
+
 def parse(text: str):
     """-> (blocks, meta). Blocks are verbatim; nothing is re-serialised."""
     lines = text.splitlines(keepends=True)
@@ -143,13 +166,10 @@ def parse(text: str):
             parent = last_record
         elif COMMENT_RE.match(line):
             kind = "why"
-        elif CHECK_RE.match(line):
-            kind = "check"
-        elif BASH_NAMED_RE.match(line):
-            kind = "bash_named"
-            cid = BASH_NAMED_RE.match(line).group(2)
-        elif BASH_BARE_RE.match(line):
-            kind = "bash_bare"
+        else:
+            k, c = _classify_record(line)
+            if k:
+                kind, cid = k, c
 
         if kind in ("check", "bash_named", "bash_bare"):
             last_record = seq
@@ -432,13 +452,31 @@ def cmd_add(args) -> int:
     new = []
     if args.why:
         new.append({"kind": "why", "raw": "   # " + args.why + "\n"})
-    new.append({"kind": "check", "raw": "   Check: " + args.check + "\n"})
+
+    # A row must land as the PARSER would have read it (). Two
+    # failures compounded here: `Check: ` was prepended unconditionally, so
+    # `Bash (name): cmd` became `Check: Bash (name): cmd` — a doubled prefix
+    # CHECK_RE then matched — and `kind` was hardcoded "check", so even an
+    # unprefixed bash line registered as k=check with i=None. Registered but
+    # never executed is FALSE COVERAGE: corpus_checks rises while nothing runs,
+    # which is worse than no check, because the instrument reports more
+    # protection than exists.
+    body = args.check.strip()
+    if BASH_NAMED_RE.match(body) or BASH_BARE_RE.match(body):
+        raw = "   " + body + "\n"   # already a record line — do not re-prefix
+    else:
+        raw = "   Check: " + body + "\n"
+    kind, cid = _classify_record(raw)
+    new.append({"kind": kind, "raw": raw, "id": cid})
 
     shift = len(new)
     base = blocks[at - 1]["seq"]
     for i, n in enumerate(new):
+        # `id` is the bash_named capture from _classify_record — preserve it.
+        # This used to hardcode None, which erased the id even when the kind
+        # was right, so `verify`'s round trip could not reconstruct the line.
         n.update({"seq": base + 1 + i, "step": base and blocks[at - 1]["step"],
-                  "section": args.section, "id": None, "parent_seq": None})
+                  "section": args.section, "id": n.get("id"), "parent_seq": None})
 
     tail = blocks[at:]
     for b in tail:

@@ -33,6 +33,7 @@ missing required create params -> 400. The PyYAML import guard is unreachable.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
@@ -138,6 +139,38 @@ def _next_id(experiments) -> str:
 
 
 # ---------------------------------------------------------------------------
+def _resolve_dotpath(data, dotpath):
+    """Read-only dotpath resolution — an EXISTENCE check, never a mutation.
+
+    Returns (found, deepest_container, resolved_prefix). On a miss the container
+    is the last level successfully navigated, so the caller can name the keys
+    that ARE available there.
+
+    Deliberately not the meta-yaml navigator, which "creates intermediate dicts
+    as needed for set operations" and therefore can never report a missing
+    segment — it materialises one. A setter's navigator is the wrong instrument
+    for a validity check (g-115-5154). Parity twin:
+    core/scripts/meta-experiment.py::resolve_dotpath.
+    """
+    parts = re.sub(r"\[(\d+)\]", r".\1", str(dotpath)).lstrip(".").split(".")
+    current = data
+    prefix: List[str] = []
+    for part in parts:
+        if isinstance(current, list):
+            try:
+                current = current[int(part)]
+            except (ValueError, IndexError):
+                return False, current, ".".join(prefix)
+        elif isinstance(current, dict):
+            if part not in current:
+                return False, current, ".".join(prefix)
+            current = current[part]
+        else:
+            return False, current, ".".join(prefix)
+        prefix.append(part)
+    return True, None, str(dotpath)
+
+
 # POST /v1/meta/experiment/create
 # ---------------------------------------------------------------------------
 
@@ -182,6 +215,41 @@ def create(ctx) -> "Response":  # type: ignore[name-defined]
             # No write — locked_rmw makes exactly one pass and returns this.
             return Response.error(409, "max_concurrent",
                                   "Max {} concurrent experiments".format(max_concurrent))
+        # : refuse a field that does not resolve in the target strategy
+        # file. An experiment on a nonexistent field can never accumulate a
+        # sample, so aspirations-evolve Step 0.7's "resolve only past
+        # min_duration_goals" gate can never fire — the record sits `active`
+        # forever, and that same step gates NEW experiments on `IF no active
+        # experiment`, so ONE typo silently blocks all A/B experimentation from
+        # then on. Nothing errors and nothing reports. Measured: exp-meta-001
+        # (field `weights.x`, absent from goal-selection-strategy.yaml's 26
+        # weight keys) held the single slot 6 days and would have held it
+        # permanently.
+        #
+        # Fail-closed, and the guard-1562 enumeration is small: the only
+        # programmatic caller is aspirations-evolve/SKILL.md:251, the active slot
+        # is empty, and the only historical field value across every stored
+        # experiment is `weights.x` — the defect itself.
+        #
+        # ORDER IS DELIBERATE: after the max_concurrent early-return, matching
+        # core/scripts/meta-experiment.py::cmd_create exactly. The parity twins
+        # must refuse in the same order or a caller sees a different error code
+        # for the same input depending on which path served it. Cost is a
+        # strategy-file re-read per locked_rmw retry, which is rare and cheap.
+        # ctx.paths.meta, never a module constant (path-resolution.md).
+        strategy_path = ctx.paths.meta / str(strategy)
+        if not strategy_path.exists():
+            return Response.error(400, "strategy_not_found",
+                                  "strategy file not found: {}".format(strategy))
+        _found, _container, _prefix = _resolve_dotpath(
+            _read_yaml(strategy_path), field)
+        if not _found:
+            _avail = sorted(_container.keys()) if isinstance(_container, dict) else []
+            return Response.error(
+                400, "field_unresolved",
+                "field '{}' does not resolve in {} (resolved as far as '{}'; keys there: {})".format(
+                    field, strategy, _prefix or "(root)",
+                    ", ".join(_avail) if _avail else "(none)"))
         exp_id = _next_id(experiments)
         experiment = {
             "id": exp_id,
@@ -332,9 +400,55 @@ def list_experiments(ctx) -> "Response":  # type: ignore[name-defined]
     path = _completed_path(ctx) if use_completed else _active_path(ctx)
     data = _read_yaml(path)
     experiments = data.get("experiments", [])
+
+    # : an ACTIVE experiment holding zero samples cannot reach
+    # min_duration_goals, so aspirations-evolve Step 0.7's resolution gate never
+    # fires and the single slot stays occupied in silence. Surface it HERE —
+    # this is the endpoint evolve reads (`meta-experiment.sh list --active`)
+    # immediately before deciding `IF no active experiment`, so a stuck record
+    # becomes visible at the exact moment it would otherwise block a new one.
+    #
+    # Report-only by design: never resolves, never mutates. An experiment can be
+    # legitimately young, and auto-resolving on a wall clock would discard real
+    # baselines — a human or the evolve step decides.
+    #
+    # THIS IS THE PATH THAT RUNS. The create-side validation was first written
+    # into core/scripts/meta-experiment.py alone and was inert: the wrapper is
+    # daemon-only (no CLI fallback since 2026-05-29), so the bogus field was
+    # still accepted end-to-end. Parity twin: that file's cmd_list.
+    stuck: List[Dict[str, Any]] = []
+    if not use_completed:
+        after_hours = _config(ctx).get("experiments", {}).get("stuck_after_hours", 48)
+        now = datetime.now()
+        for exp in experiments:
+            if exp.get("total_goals", 0):
+                continue
+            created = exp.get("created")
+            if not created:
+                continue
+            try:
+                age_h = (now - datetime.strptime(created, "%Y-%m-%dT%H:%M:%S")).total_seconds() / 3600.0
+            except (TypeError, ValueError):
+                continue
+            if age_h >= after_hours:
+                stuck.append({
+                    "id": exp.get("id"),
+                    "field": exp.get("field"),
+                    "strategy_file": exp.get("strategy_file"),
+                    "age_hours": round(age_h, 1),
+                    "total_goals": 0,
+                    "why": ("zero samples past {}h — cannot reach min_duration_goals, so "
+                            "Step 0.7 will never resolve it; it is occupying the single "
+                            "slot. Verify the field resolves, then "
+                            "`meta-experiment.sh resolve --id <id>`.".format(after_hours)),
+                })
+
+    out: Dict[str, Any] = {"count": len(experiments), "experiments": experiments}
+    if stuck:
+        out["stuck"] = stuck
+        out["stuck_count"] = len(stuck)
     return Response.text(
-        json.dumps({"count": len(experiments), "experiments": experiments},
-                   ensure_ascii=False, default=str) + "\n",
+        json.dumps(out, ensure_ascii=False, default=str) + "\n",
         content_type="application/json")
 
 

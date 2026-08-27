@@ -539,9 +539,35 @@ def _compose_digest_body(batch: list, cadence_hours: float) -> str:
         "items or is empty. Anything still waiting on you will be on the next one",
         "too, so nothing here quietly falls off the list by being ignored.",
         "",
-        "If any of these no longer needs you, say so and the `user` participant",
-        "gets dropped — that is a one-way door inside the loop, so it is not done",
-        "automatically (reclaim-routed-work.md lane P).",
+        # REPLY-TO-CLOSE CONTRACT (, user decision 2026-08-23: "long term
+        # strategic decisions, very very low cognitive load, designed intuitively
+        # even if harder now"). This REPLACES the old "say so and we will drop it"
+        # wording, which routed the user's answer back through an agent relay. The
+        # email is the interface now: the reply itself is the decision.
+        #
+        # ⚠ INVARIANT FOR ANYONE EDITING THE LINES BELOW: no line of this footer may
+        # BEGIN with a bare verb ("done" / "not needed"). reply_to_close.find_verbs
+        # matches a verb at the START of a line in the reply's own text, and a mail
+        # client that fails to mark quoted lines would drop this footer into that
+        # slice verbatim — turning the instructions into a command against whichever
+        # id the same mail quotes. Keep every verb mid-line (the "Reply" prefix below
+        # is what does that). Pinned by test_shipped_digest_footer_cannot_self_trigger.
+        "TO CLOSE AN ITEM FROM THIS EMAIL, just reply to it. One item per reply:",
+        "",
+        "   Reply  done         — it is finished. The item closes and stops",
+        "                         appearing on this list.",
+        "   Reply  not needed   — you are not needed on it. Your leg is dropped and",
+        "                         the agent carries on; if the item was yours alone,",
+        "                         it closes instead.",
+        "",
+        "Say which item by typing its goal id (the [g-...] shown above), or by",
+        "quoting just that one line of this email. If you quote the whole email we",
+        "cannot tell which item you mean, so nothing happens and you get a one-line",
+        "reply saying so. Anything we do not recognise is answered, never guessed at.",
+        "",
+        "Replies are acted on only from your own address, and replying twice to the",
+        "same message changes nothing the second time. A `done` is taken at your",
+        "word — we do not re-check the work behind it.",
         "",
         "--",
         "WHY YOU ARE HEARING ABOUT IT NOW (background, moved below the asks",

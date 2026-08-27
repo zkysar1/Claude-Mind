@@ -697,8 +697,12 @@ def test_stranded_undeterminable_default_branch_never_flags():
 
 
 def test_stranded_no_pr_is_the_weaker_class():
-    """Off-default with no pull request at all — could be a live working branch,
-    so it gets its own report-only class rather than a flag."""
+    """Off-default with no pull request at all gets its own report-only class
+    rather than a flag. NOT because it "could be a live working branch" — this
+    sweep's population is already filtered to goals closed status=completed, so
+    that reading does not survive. The measured reason (the bucket is dominated
+    by worker-carrier refs that already have an owner) lives with the
+    disposition in completed-not-committed-sweep.py; g-115-7704."""
     mod = _import()
     entry = mod.classify_stranded(
         _multi_repo_goal(), NOW, {_ON_DEFAULT: True},

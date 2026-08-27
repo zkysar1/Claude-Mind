@@ -18,6 +18,12 @@ This file adds the two the filing goal (g-306-173) named as highest-stakes:
 Gate 1 and Gate 2.6, each with a positive path, a negative control, and a
 mutation proof.
 
+g-115-7303 adds a THIRD, Gate 0b (same SID, different owning process), in the
+same shape. It belongs in this file and not the sibling for one structural
+reason: Gate 0b fires only when HOOK_SID == RUNNER_SID, and this fixture is the
+only one in the repo where that holds -- the sibling drives the MISMATCH branch,
+where Gate 0 exits two lines earlier and Gate 0b is unreachable by construction.
+
 WHY THESE TWO ARE NOT ALREADY COVERED BY THE SIBLING UNIT TESTS
 ---------------------------------------------------------------
 ``test_turn_end_gate_body_filter.py`` already pins the g-306-135 body filter
@@ -122,6 +128,13 @@ SIBLING_SID = "sibling-body-sid-4444-3333"
 # mutation proof and its positive test cannot drift apart.
 GATE1_ROLL = "pending-deploys.py"
 GATE26_FLAG = '--body-sid "$HOOK_SID"'
+# Gate 0b (), kept whole so a mutation proof can never drift from the
+# line it claims to mutate. Pinned against the REAL hook below: a rename that
+# leaves these stale would otherwise turn every mutation test into a silent no-op
+# that still passes (rb-5146 -- source text proves wiring exists, not that it runs).
+GATE0B_SID_GUARD = '[ -n "$RUNNER_SID" ] && [ "$HOOK_SID" = "$RUNNER_SID" ] && '
+GATE0B_AGENT_ARG = 'runner_proc_foreign_live "$HOOK_AGENT"'
+GATE0B_LINE = "if " + GATE0B_SID_GUARD + GATE0B_AGENT_ARG + "; then"
 
 
 def _build_runner_root(tmp: Path, world: Path, meta: Path, state: str) -> Path:
@@ -152,7 +165,7 @@ def _build_runner_root(tmp: Path, world: Path, meta: Path, state: str) -> Path:
     return root
 
 
-def _run_hook_as_runner(root: Path) -> subprocess.CompletedProcess:
+def _run_hook_as_runner(root: Path, extra_env: dict | None = None) -> subprocess.CompletedProcess:
     """Fire the hook in the environment a Stop event actually provides.
 
     See the module docstring: MIND_SID / MIND_AGENT are scrubbed because
@@ -164,6 +177,13 @@ def _run_hook_as_runner(root: Path) -> subprocess.CompletedProcess:
     env.pop("MIND_SID", None)
     env.pop("MIND_AGENT", None)
     env["STORAGE_BACKEND"] = "local"
+    # RUNNER_PROC_ID is the SAME seam the shell suite uses at three sites
+    # (test-runner-identity-check.sh:248/274/329), not a new one invented here
+    # (guard-1885). It is REQUIRED, not a convenience: _resolve_owner_proc walks
+    # for a `claude` ancestor, a pytest->bash tree has none, so without the
+    # override the predicate fails closed and every Gate 0b test would BLOCK for
+    # the wrong reason -- passing while proving nothing.
+    env.update(extra_env or {})
     return subprocess.run(
         # BASH, never a literal "/bin/bash" and never a bare "bash" -- the
         # latter reaches the System32 WSL launcher on a Windows PATH
@@ -178,8 +198,14 @@ def _agent_dir(root: Path) -> Path:
     return root / "agents" / AGENT
 
 
-def _drive(tmp_path, state="RUNNING", jobs=None, deploys=None, mutate=None):
-    """Run the whole hook once. `mutate` edits stop-hook.sh before the run."""
+def _drive(tmp_path, state="RUNNING", jobs=None, deploys=None, mutate=None,
+           runner_proc=None, my_proc=None, runner_sid=None):
+    """Run the whole hook once. `mutate` edits stop-hook.sh before the run.
+
+    ``runner_proc`` stamps ``session/runner-proc`` (who OWNS the runner role),
+    ``my_proc`` says who THIS process is via RUNNER_PROC_ID, and ``runner_sid``
+    overwrites ``running-session-id`` -- the three inputs Gate 0b reads.
+    """
     world = tmp_path / "world"
     world.mkdir()
     meta = tmp_path / "meta_gate"
@@ -194,12 +220,18 @@ def _drive(tmp_path, state="RUNNING", jobs=None, deploys=None, mutate=None):
         (sess / "pending-deploys.yaml").write_text(
             yaml.safe_dump(deploys), encoding="utf-8")
 
+    if runner_proc is not None:
+        (sess / "runner-proc").write_text(runner_proc + "\n", encoding="utf-8")
+    if runner_sid is not None:
+        (sess / "running-session-id").write_text(runner_sid, encoding="utf-8")
+
     if mutate is not None:
         hook = root / "core" / "scripts" / "stop-hook.sh"
         hook.write_text(mutate(hook.read_text(encoding="utf-8")),
                         encoding="utf-8")
 
-    proc = _run_hook_as_runner(root)
+    proc = _run_hook_as_runner(
+        root, extra_env={"RUNNER_PROC_ID": my_proc} if my_proc else None)
     return proc, root
 
 
@@ -454,3 +486,147 @@ def test_mutation_reading_ayoai_sid_instead_of_hook_sid_kills_the_gate(tmp_path)
         f"or the gate is no longer reading the flag at all; log:\n{log}")
     assert _blocked(proc), (
         f"expected BLOCK once the body sid resolves empty; stdout:\n{proc.stdout}")
+
+
+# ── Gate 0b: same SID, different owning process () ─────────────────
+#
+# THE WEDGE. runner-identity-check.sh ejects a duplicate instance that SHARES the
+# runner's SID, keyed on the owning-process identity. stop-hook Gate 0 allowed a
+# turn-end only on a SID MISMATCH -- so for that ejected process HOOK_SID ==
+# RUNNER_SID and the hook BLOCKED every turn-end while the gate ejected every
+# re-entry. Neither iterate nor stop. Measured zeta/cc-02 2026-08-22, 3 turns.
+#
+# Every test below drives state=RUNNING, so the DEFAULT verdict on this path is
+# BLOCK. That is what makes the negative controls mean something: three of the
+# four inputs Gate 0b can see must leave that BLOCK untouched, and only the
+# fourth may turn it into an ALLOW.
+
+
+def _starttime(pid: int) -> str:
+    """/proc/<pid>/stat field 22, read the comm-safe way the shell helper reads it.
+
+    Split on the LAST ')' because comm is parenthesized and may itself contain
+    spaces and parens; positional parsing of the raw line is wrong. Index 19
+    of the remainder was verified byte-equal against `_proc_stat_field <pid> 20`
+    rather than derived from the field table.
+    """
+    rest = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(")", 1)[1]
+    return rest.split()[19]
+
+
+def _proc_id(pid: int) -> str:
+    return f"{pid}:{_starttime(pid)}"
+
+
+def _live_other():
+    """A real, live, DIFFERENT process -- never a synthesized id.
+
+    _owner_alive re-reads starttime from /proc, so a made-up pair would read as
+    DEAD and every "foreign live owner" test would pass for the wrong reason.
+    """
+    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+
+
+MINE = "424242:777777"  # this process's identity, injected via RUNNER_PROC_ID
+
+
+def test_gate_0b_wiring_is_pinned_to_the_real_hook():
+    """If this fails, the mutation proofs below are silently no-ops."""
+    hook = (REAL_ROOT / "core" / "scripts" / "stop-hook.sh").read_text(encoding="utf-8")
+    assert hook.count(GATE0B_LINE) == 1, "Gate 0b line moved or was reworded"
+    assert hook.count('source "$CORE_ROOT/scripts/_runner_proc.sh"') == 1
+
+
+def test_gate_0b_ejected_duplicate_is_allowed_to_end_its_turn(tmp_path):
+    """THE FIX: a live foreign owner means this process is the ejected one."""
+    other = _live_other()
+    try:
+        proc, root = _drive(tmp_path, runner_proc=_proc_id(other.pid), my_proc=MINE)
+    finally:
+        other.kill(); other.wait()
+    assert not _blocked(proc), proc.stdout
+    assert "gate=same-sid-not-owner" in _hook_log(root)
+    assert not _compact_pending(root).exists(), "an ALLOW must write no BLOCK side effect"
+
+
+def test_gate_0b_negative_control_no_stamp_still_blocks(tmp_path):
+    """The positive control (guard-3366): this fixture BLOCKs when nothing is stamped.
+
+    Without it, every assertion above is unfalsifiable -- an ALLOW could just be
+    what this path always does.
+    """
+    proc, root = _drive(tmp_path, my_proc=MINE)
+    assert _blocked(proc), proc.stdout
+    assert "gate=same-sid-not-owner" not in _hook_log(root)
+
+
+def test_gate_0b_the_real_runner_is_not_allowed_to_die(tmp_path):
+    """Stamp names THIS process -> it IS the runner. The dangerous direction."""
+    proc, root = _drive(tmp_path, runner_proc=MINE, my_proc=MINE)
+    assert _blocked(proc), "the stamped owner must never be allowed to stop"
+    assert "gate=same-sid-not-owner" not in _hook_log(root)
+
+
+def test_gate_0b_dead_stamped_owner_still_blocks(tmp_path):
+    """A dead owner is a TAKEOVER, not an ejection.
+
+    runner-identity-check rewrites the stamp and keeps running in this case, so
+    an ALLOW here would be an allowance with no matching eject.
+    """
+    other = _live_other()
+    dead_id = _proc_id(other.pid)
+    other.kill(); other.wait()
+    proc, root = _drive(tmp_path, runner_proc=dead_id, my_proc=MINE)
+    assert _blocked(proc), proc.stdout
+    assert "gate=same-sid-not-owner" not in _hook_log(root)
+
+
+def test_gate_0b_empty_running_session_id_blocks(tmp_path):
+    """An EMPTY pointer must NOT allow -- runner-identity-check fail-opens there.
+
+    `[ -n "$RUNNER_SID" ] || exit 0` ejects NOBODY when the pointer is empty. The
+    hook falls THROUGH the sid-mismatch branch in that case (it also tests -n),
+    so Gate 0b re-states the SID match rather than inheriting it.
+    """
+    other = _live_other()
+    try:
+        proc, root = _drive(tmp_path, runner_proc=_proc_id(other.pid),
+                            my_proc=MINE, runner_sid="")
+    finally:
+        other.kill(); other.wait()
+    assert _blocked(proc), "an empty pointer has no matching eject -- must not allow"
+
+
+def test_mutation_dropping_the_sid_precondition_allows_an_empty_pointer(tmp_path):
+    """Proves the guard-4315 scar is load-bearing, not decorative.
+
+    Same inputs as the test above; deleting the precondition flips BLOCK to
+    ALLOW -- i.e. hands the real runner a licence to end its turn quietly.
+    """
+    other = _live_other()
+    try:
+        proc, root = _drive(
+            tmp_path, runner_proc=_proc_id(other.pid), my_proc=MINE, runner_sid="",
+            mutate=lambda t: t.replace(GATE0B_SID_GUARD, "", 1))
+    finally:
+        other.kill(); other.wait()
+    assert not _blocked(proc), "mutation did not take -- check GATE0B_SID_GUARD"
+    assert "gate=same-sid-not-owner" in _hook_log(root)
+
+
+def test_mutation_dropping_the_agent_argument_kills_the_gate(tmp_path):
+    """guard-2601: <agent> is a REQUIRED positional, and the caller must pass it.
+
+    runner_proc_foreign_live returns 1 on an empty agent rather than probing some
+    default, so a caller that forgets it gets the pre-existing BLOCK -- a visible
+    regression, never a silent probe of the wrong agent's session dir.
+    """
+    other = _live_other()
+    try:
+        proc, root = _drive(
+            tmp_path, runner_proc=_proc_id(other.pid), my_proc=MINE,
+            mutate=lambda t: t.replace(GATE0B_AGENT_ARG,
+                                       'runner_proc_foreign_live ""', 1))
+    finally:
+        other.kill(); other.wait()
+    assert _blocked(proc), "an agent-less call must fail closed"

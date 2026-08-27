@@ -72,6 +72,20 @@ Bash: py -3 core/scripts/hypothesis-discovered-overdue-sweep.py --apply --output
 # resolved: for each, if evaluable, synthesize a claim from the position
 # (guard-798: leaving discovered needs claim>=20 + a resolution method), then
 # resolve/expire with judgment; else leave for the next cycle.
+#
+# ELIGIBLE LANE (g-115-4721). The sweep ALSO returns {eligible,
+# eligible_promoted, eligible_needs_judgment}: discovered records past their
+# eligibility floor but NOT yet overdue -- the interval that was watched by
+# nothing, and the one where a hypothesis is MOST resolvable (in-window, channel
+# live, evidence still cheap). eligible_promoted is already folded into
+# `promoted`, so it needs no separate handling. Handle `eligible_needs_judgment`
+# exactly like needs_judgment WITH ONE EXCEPTION: never EXPIRE one -- its
+# observation window is still open, and expiring it is the harm the lane exists
+# to prevent. A future resolves_no_earlier_than is respected as a deliberate
+# park, so nothing still parked appears in either bucket.
+# READ `eligible`, NOT ONLY `overdue`: before this lane the sweep reported only
+# overdue, so `overdue=0` was repeatedly recorded as "pipeline clean / stores
+# healthy" while 27 eligible records sat unsurfaced (measured 2026-08-26).
 
 # Primary source: all active hypotheses
 Bash: pipeline-read.sh --stage active

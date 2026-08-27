@@ -204,9 +204,21 @@ def test_wiring_precheck_calls_the_slate_and_meter_registers_it_always_run():
     assert re.search(r"\|\s*0\.5g\.7\s*\|\s*completed-not-closed-drain\s*\|\s*always-run\s*\|", src), (
         "tier table row for completed-not-closed-drain must be always-run")
     meter = METER.read_text(encoding="utf-8")
-    assert re.search(r"^[^#]*completed-not-closed-drain\)", meter, re.M) or \
-        re.search(r"^[^#\n]*\|completed-not-closed-drain\)", meter, re.M), (
-        "completed-not-closed-drain must be registered in sweep_tier() (always-run)")
+    # MEMBERSHIP, NOT POSITION. This asserted `completed-not-closed-drain\)` --
+    # i.e. that the sweep was the LAST alternative before the case arm's closing
+    # paren. That is a positional predicate wearing a membership predicate's
+    # error message, and it fired a FALSE failure the first time a correct change
+    # appended a new always-run sweep after it ( / world-script-crlf-check).
+    # Same brittle-enumeration class as the hardcoded lane count in
+    # test_precheck_always_run_battery.py. Parse the arm and test membership, so
+    # the assertion tracks its own stated intent and survives the next append.
+    arm = next((ln for ln in meter.splitlines()
+                if not ln.lstrip().startswith("#") and "tree-debt-gate|" in ln), None)
+    assert arm is not None, "could not find sweep_tier()'s always-run case arm"
+    members = {a.strip() for a in arm.strip().rstrip(")").split("|")}
+    assert "completed-not-closed-drain" in members, (
+        "completed-not-closed-drain must be registered in sweep_tier() (always-run); "
+        f"arm members: {sorted(members)}")
 
 
 def test_slate_has_no_apply_flag():
@@ -402,3 +414,88 @@ def test_own_lane_hold_behaviour_is_unchanged(tmp_path, monkeypatch, capsys):
     capsys.readouterr()
     assert seen == ["alpha"]
     assert [h["goal_id"] for h in m.load_holds(tmp_path / "ledger-alpha.jsonl")] == ["g-9-01"]
+
+
+# ── Content-keyed hold: the lane's EXIT () ──────────────────────────
+# The TTL hold above is a LEASE, so a row correctly judged not-cnc re-qualifies
+# every time the lease lapses — forever, because `is_drain_candidate` cannot tell
+# a PROGRESS note from a completion note. Measured 2026-08-27 (zeta, cc-02): the
+# (unattributed) lane served 3 rows, all re-serves, 13 prior dispositions between
+# them, all reaching the same verdict, while 14 unlooked-at rows queued behind.
+# Both axes pinned (guard-2319): an UNCHANGED note suppresses, a CHANGED one does
+# not — the second is what keeps the lane able to catch a real completion note.
+
+_JUDGED = "PROGRESS: 2 of 5 outcomes met; still open."
+
+
+def _expired(gid, sha=None, *, hours=72):
+    h = {"goal_id": gid,
+         "held_at": (NOW - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S"),
+         "reason": "verified NOT cnc — progress note on open work"}
+    if sha is not None:
+        h["note_sha"] = sha
+    return h
+
+
+def test_note_sha_normalises_whitespace_and_empties():
+    m = _load()
+    assert m._note_sha("a  b\n c") == m._note_sha("a b c"), "reflow must not read as new evidence"
+    assert m._note_sha("") == "" and m._note_sha("   ") == "", "empty note is never a hold key"
+    assert m._note_sha("a b") != m._note_sha("a c")
+
+
+def test_unchanged_note_is_suppressed_past_ttl_and_stays_counted():
+    """The EXIT: a long-expired hold still suppresses while the note is identical."""
+    m = _load()
+    rows = [_row("g-1-01", age_h=200, note=_JUDGED), _row("g-1-02", age_h=150)]
+    hold = _expired("g-1-01", m._note_sha(_JUDGED))
+    out = m.build_slate(rows, "alpha", limit=5, min_age_hours=6, now=NOW,
+                        holds=[hold], hold_ttl_hours=24)
+    assert [r["goal_id"] for r in out["slate"]] == ["g-1-02"], "re-serve of an already-judged row"
+    pop = out["population"]
+    assert pop["mine_held_back_note_unchanged"] == 1
+    assert pop["mine_held_back_recent_hold"] == 0, "TTL lapsed — suppression is content-keyed"
+    # never a SILENT keep (guard-3628): counted AND named
+    assert pop["note_unchanged_goal_ids"] == ["g-1-01"]
+
+
+def test_changed_note_resurfaces_immediately_with_no_ttl_wait():
+    """The other axis: the completion note this lane exists to catch must get through."""
+    m = _load()
+    rows = [_row("g-1-01", age_h=200, note="DONE — all 5 outcomes met, ready to close.")]
+    hold = _expired("g-1-01", m._note_sha(_JUDGED))   # judged against the OLD note
+    out = m.build_slate(rows, "alpha", limit=5, min_age_hours=6, now=NOW,
+                        holds=[hold], hold_ttl_hours=24)
+    assert [r["goal_id"] for r in out["slate"]] == ["g-1-01"], \
+        "a rewritten outcome_note must resurface the row on the very next run"
+    assert out["population"]["mine_held_back_note_unchanged"] == 0
+    assert out["slate"][0]["hold_count"] == 1, "prior judgement stays visible to the reader"
+
+
+def test_legacy_hold_without_note_sha_is_ttl_only():
+    """Backward compatibility: pre-existing ledger entries behave exactly as before."""
+    m = _load()
+    rows = [_row("g-1-01", age_h=200, note=_JUDGED)]
+    fresh = dict(_expired("g-1-01", None, hours=2))
+    out = m.build_slate(rows, "alpha", limit=5, min_age_hours=6, now=NOW,
+                        holds=[fresh], hold_ttl_hours=24)
+    assert out["population"]["mine_held_back_recent_hold"] == 1
+    assert out["population"]["mine_held_back_note_unchanged"] == 0
+    out2 = m.build_slate(rows, "alpha", limit=5, min_age_hours=6, now=NOW,
+                         holds=[_expired("g-1-01", None)], hold_ttl_hours=24)
+    assert [r["goal_id"] for r in out2["slate"]] == ["g-1-01"], "no digest -> old TTL behaviour"
+    assert out2["population"]["mine_held_back_note_unchanged"] == 0
+
+
+def test_record_hold_omits_note_sha_when_note_unreadable(tmp_path):
+    """Fail-open: a hold must never be blocked by an unreadable goal, and an
+    absent digest must not suppress the row against a digest of nothing."""
+    m = _load()
+    led = tmp_path / "cnc-drain-holds.jsonl"
+    rec = m.record_hold(led, goal_id="g-1-09", reason="why", agent="alpha", sid="s",
+                        now=NOW, note_sha="")
+    assert "note_sha" not in rec, "empty digest must be OMITTED, not written empty"
+    rec2 = m.record_hold(led, goal_id="g-1-10", reason="why", agent="alpha", sid="s",
+                         now=NOW, note_sha=m._note_sha(_JUDGED))
+    assert rec2["note_sha"] == m._note_sha(_JUDGED)
+    assert len(m.load_holds(led)) == 2

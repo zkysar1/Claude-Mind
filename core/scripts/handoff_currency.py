@@ -63,6 +63,13 @@ import re
 import sys
 from datetime import datetime, timezone
 
+# : AGENTS_PARENT_DIR constant-routed rather than the literal
+# "agents" (guard-604). The path stays RELATIVE exactly as before -- only the
+# segment is constant-routed -- so the HANDOFF_PATH override and every caller
+# behave identically. Script-dir is on sys.path for both CLI invocation and
+# the test import, so a bare import is sufficient here.
+from _paths import AGENTS_PARENT_DIR  # noqa: E402
+
 CURRENT, STALE = 0, 2
 DEFAULT_MAX_AGE_DAYS = 3.0
 
@@ -205,7 +212,7 @@ def main(argv) -> int:
     result = {"verdict": "current", "reason": "gate did not run", "agent": agent}
     try:
         handoff_path = os.environ.get("HANDOFF_PATH") or (
-            os.path.join("agents", agent, "session", "handoff.yaml"))
+            os.path.join(AGENTS_PARENT_DIR, agent, "session", "handoff.yaml"))
         text = ""
         if os.path.exists(handoff_path):
             with open(handoff_path, "r", encoding="utf-8", errors="replace") as fh:

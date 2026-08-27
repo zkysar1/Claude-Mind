@@ -69,7 +69,12 @@ def _clean_payloads():
         },
         "handoff-aging-check.sh": {"candidate_count": 0, "failed": []},
         "completed-not-closed-slate.sh": {"slate": []},
+        "world-script-crlf-check.sh": {"offenders": [], "failed": []},
     }
+    # DECLARE EVERY LANE HERE. make_runner does `payloads.get(script, {})`, so an
+    # undeclared lane is handed {} -- which parses, yields no findings, and joins
+    # the clean count for free. A new lane that forgets this row reads GREEN in
+    # every test below without a single assertion covering it ().
 
 
 def _report(capsys, **kw):
@@ -151,7 +156,10 @@ def test_fully_clean_run_says_clean(capsys):
     assert r["status"] == "clean"
     assert r["findings"] == []
     bat.run(as_json=False, lane_runner=make_runner(_clean_payloads()))
-    assert "all 5 lanes clean" in capsys.readouterr().out
+    # Count is DERIVED, never literal: a literal here is the same
+    # hand-maintained-enumeration trap this suite exists to catch (guard-1969),
+    # and it broke the moment a sixth lane was registered ().
+    assert f"all {len(bat.LANES)} lanes clean" in capsys.readouterr().out
 
 
 # --------------------------------------------------------------------------
@@ -258,7 +266,7 @@ def test_mode_is_always_reported(capsys):
 
 
 def test_uncovered_lanes_are_named_in_the_report(capsys):
-    """"5 lanes" must never be read as "the whole always-run tier". The four
+    """The battery's lane count must never be read as "the whole always-run tier". The four
     sentinel-dispatched rows have no standalone script and are deliberately not
     run here; naming them is what keeps the split visible instead of inferred
     (guard-1760: a runner that reports only what it ran reads as total coverage)."""

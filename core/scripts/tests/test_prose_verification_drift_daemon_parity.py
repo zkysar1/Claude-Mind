@@ -271,6 +271,104 @@ def test_cli_validate_goal_raises_on_prose_drift():
     aspirations.validate_goal(ok_goal)
 
 
+# --- (7) acceptance/success SYNONYM headers () ----------------------
+# NOTE: this file contains the marker strings as literals, which is safe — the
+# gate scans goal DESCRIPTIONS, never source files, so there is no self-match
+# surface here (cf. guard-1668, which applies to scanners that read their own
+# source).
+_SYNONYM_DESC = "Widen the thing.\n\nAcceptance: the widened gate blocks the drifted case."
+
+
+def test_synonym_marker_blocks_empty_verification():
+    """A synonym header with NOTHING structured is the drift this goal targets."""
+    v = prose_evaluate({"id": "g-2-1", "description": _SYNONYM_DESC,
+                        "verification": {}})
+    assert v["would_block"] and v["decision"] == "block", v
+    assert "Acceptance:" in v["markers_seen"], v["markers_seen"]
+
+
+def test_synonym_marker_passes_with_outcomes_only():
+    """SAME prose, populated outcomes and NO checks -> pass.
+
+    Measured on the live corpus (2026-08-25): 3 of the 7 goals the synonym set
+    newly admits (g-368-01, g-368-02, g-306-126) carry outcomes and no checks.
+    Demanding checks for synonym headers would block those legitimate backlog
+    goals, so outcomes OR checks satisfies the synonym class.
+    """
+    v = prose_evaluate({"id": "g-2-2", "description": _SYNONYM_DESC,
+                        "verification": {"outcomes": ["the gate blocks it"]}})
+    assert (not v["would_block"]) and v["decision"] == "pass", v
+
+
+def test_original_markers_still_require_checks():
+    """Backward compat: outcomes alone must NOT satisfy an ORIGINAL marker.
+
+    Widening the synonym class must not silently relax the pre-existing
+    contract goal-schemas.md promises (guard-3351 — narrowing a gate is the
+    quiet direction, so it gets an explicit test rather than an assumption).
+    """
+    v = prose_evaluate({"id": "g-2-3", "description": _PROSE_DESC,
+                        "verification": {"outcomes": ["x"]}})
+    assert v["would_block"] and v["decision"] == "block", v
+
+
+def test_marker_quoted_in_code_region_does_not_fire():
+    """A description that merely QUOTES a marker must stay a no-op."""
+    fenced = {"id": "g-2-4",
+              "description": "example:\n```\nAcceptance: quoted\n```\n",
+              "verification": {}}
+    assert prose_evaluate(fenced)["decision"] == "noop", prose_evaluate(fenced)
+
+    inline = {"id": "g-2-5",
+              "description": "the `Acceptance:` header is what we match",
+              "verification": {}}
+    assert prose_evaluate(inline)["decision"] == "noop", prose_evaluate(inline)
+
+    # Positive control for the strip: the SAME marker outside a code region
+    # must still fire, or the test above would pass on a gate that never fires.
+    live = {"id": "g-2-6", "description": "Acceptance: real header",
+            "verification": {}}
+    assert prose_evaluate(live)["decision"] == "block", prose_evaluate(live)
+
+
+def test_bare_success_is_deliberately_not_a_marker():
+    """`Success:` was measured as a false positive and must stay excluded.
+
+    g-115-7522 quotes a load-test log line (`Total: 120, Success: 120 (200)`).
+    Bare high-frequency English words do not survive pasted tool output.
+    """
+    v = prose_evaluate({"id": "g-2-7",
+                        "description": "Total: 120, Success: 120 (200), Failed: 0",
+                        "verification": {}})
+    assert v["decision"] == "noop", v
+
+
+def test_marker_set_is_wider_than_the_original_two():
+    """The union the gate matches on must be strictly wider than the original 2."""
+    from gates.prose_verification import (  # noqa: E402
+        ALL_PROSE_MARKERS, PROSE_ACCEPTANCE_SYNONYM_MARKERS,
+        PROSE_VERIFICATION_MARKERS,
+    )
+    # HARDCODED, not derived (guard-1628): the marker set IS the thing under
+    # protection here, so a test that only asserts len(ALL_PROSE_MARKERS) > 2
+    # would still pass if someone replaced all seven synonyms with junk -- it
+    # moves with the mutation and can never fail. Ask the guard's question: if
+    # this constant were the thing that broke, would this check still pass?
+    # With the expected strings written out, no. Editing the set must now be a
+    # deliberate act that updates this list too.
+    assert PROSE_VERIFICATION_MARKERS == (
+        "Verification outcomes:", "Verification checks:",
+    ), "the original pair must not move -- goal-schemas.md promises compatibility"
+    assert set(PROSE_ACCEPTANCE_SYNONYM_MARKERS) == {
+        "Acceptance criteria:", "Acceptance:", "Success criteria:", "Done when:",
+        "Definition of done:", "Completion criteria:", "Exit criteria:",
+    }, "synonym set changed -- update this expectation deliberately, and re-measure"
+    assert set(PROSE_VERIFICATION_MARKERS) < set(ALL_PROSE_MARKERS)
+    assert "Success:" not in ALL_PROSE_MARKERS, "bare Success: is a measured FP"
+    assert set(PROSE_ACCEPTANCE_SYNONYM_MARKERS).isdisjoint(
+        PROSE_VERIFICATION_MARKERS), "the two classes must not overlap"
+
+
 if __name__ == "__main__":
     test_add_goal_rejects_prose_only()
     test_add_goal_accepts_markers_with_checks()
@@ -278,4 +376,10 @@ if __name__ == "__main__":
     test_update_goal_description_rejects_prose_injection()
     test_shared_gate_evaluate_verdicts()
     test_cli_validate_goal_raises_on_prose_drift()
+    test_synonym_marker_blocks_empty_verification()
+    test_synonym_marker_passes_with_outcomes_only()
+    test_original_markers_still_require_checks()
+    test_marker_quoted_in_code_region_does_not_fire()
+    test_bare_success_is_deliberately_not_a_marker()
+    test_marker_set_is_wider_than_the_original_two()
     print("ok")

@@ -1,6 +1,6 @@
 # Chat-Goal Protocol Digest
 
-Referenced from `.claude/skills/respond/SKILL.md` Step 5.6. Loaded on demand —
+Referenced from `.claude/skills/respond/SKILL.md` Step 5.0b. Loaded on demand —
 never in the hot path.
 
 The autonomous loop runs every unit of work through
@@ -47,20 +47,35 @@ Bash: cat <<'JSON' | bash core/scripts/aspirations-add-goal.sh <asp-id> --source
   "title": "<the work, as the user framed it>",
   "priority": "MEDIUM",
   "participants": ["agent"],
-  "goal_source": "chat-originated",
-  "origin_signal": "user_directive",
+  "goal_source": "user",
+  "origin_signal": "chat-goal:<short-slug-of-the-request>",
   "status": "in-progress",
-  "description": "<the user's request, verbatim>. Filed by the chat-goal lane (respond Step 5.6).",
+  "description": "<the user's request, verbatim>. Filed by the chat-goal lane (respond Step 5.0b).",
   "verification": {"outcomes": ["<stated UP FRONT, before any work>"]}
 }
 JSON
 ```
 
-`origin_signal: user_directive` is mandatory and is what the origin-signal gate
-checks — `chat-originated` is the `goal_source`, a different field answering a
-different question (WHO asked vs WHERE it came from). Scope-route the goal the
-same way any other goal is routed: framework/product work to `world`,
-agent-private work to `agent`.
+**The two fields answer different questions, and getting them backwards is the
+defect this lane shipped with (g-306-342, corrected 2026-08-26).** `goal_source`
+is a CLOSED vocabulary answering WHO INITIATED — and a chat request is initiated
+by the user, so it is `user`, exactly like every other user-pushed goal. It is
+NOT `chat-originated`: that value is not in `_goal_source.VALID_GOAL_SOURCES`
+and never was, so a record carrying it would have been unrecognised by every
+consumer that filters on user-sourced work (drift denominators, US-06
+attribution). The daemon write path does not validate `goal_source`, so it would
+have landed silently rather than failing — the flattering direction.
+
+WHICH LANE filed it is `origin_signal`'s job, and `chat-goal:` is a **sanctioned
+prefix** in `gates/origin_signal.py ALLOWED_PREFIXES`, kept locked with the
+`user` branch of `_goal_source.infer()` (which maps it back to `user`).
+Registration is load-bearing, not tidiness: per guard-2329 an unsanctioned
+prefix does NOT reliably fail — the write returns rc=0 and a goal id while the
+signal is silently rewritten to a title-derived one, which would leave the
+adoption census below querying a key that was never stored, vacuous forever.
+
+Scope-route the goal the same way any other goal is routed: framework/product
+work to `world`, agent-private work to `agent`.
 
 **Verification criteria are stated BEFORE execution, not after.** This is the
 whole difference between a goal record and a receipt. Criteria written after the
@@ -96,15 +111,56 @@ which covers retrieval per turn. This digest adds execute / verify / encode.
 
 ## Measuring adoption
 
-`goal_source` is the census key. A count of `chat-originated` goals flowing
-through encoding and completion reporting is the adoption measure — and its
-shape matters more than its level: a count that climbs steadily on a chat-heavy
-day is the lane working, while a count that fires on nearly every turn is the
-classifier over-firing and should be tightened, not celebrated.
+**`origin_signal` prefix `chat-goal:` is the census key** — NOT `goal_source`,
+which reads `user` for this lane and cannot discriminate it (122 of 173
+user-sourced goals already carry a bare `user_directive`, so that field answers
+a different question and answers it the same way for every one of them).
+
+**`aspirations-query.sh --goal-field` CANNOT run this census — it matches
+EXACTLY, not by prefix, and its refusal is silent.** Measured 2026-08-26:
+`--goal-field origin_signal "unblock:"` returns 0 records while the store holds
+175 distinct `unblock:<slug>` signals. A prefix census written that way is
+vacuous forever and fails in the flattering direction — the same defect this
+section is being rewritten to remove, one layer down. Scan directly:
+
+```
+source core/scripts/_paths.sh && py -3 - "$WORLD_PATH/aspirations.jsonl" <<'EOF'
+import json, sys
+tot = hit = ctl = 0
+for line in open(sys.argv[1], encoding="utf-8"):
+    line = line.strip()
+    if not line: continue
+    for g in json.loads(line).get("goals", []):
+        tot += 1
+        s = g.get("origin_signal") or ""
+        if s.startswith("chat-goal:"): hit += 1
+        if s.startswith("unblock:"):   ctl += 1     # positive control
+print("goals=%d  chat-goal:=%d  (control unblock:=%d)" % (tot, hit, ctl))
+EOF
+```
+
+The control must share the query's SHAPE. A bare tag like `user_directive`
+carries no suffix, so it succeeds under exact matching and proves nothing about
+prefix behaviour — that is exactly the control that let the broken query above
+look correct.
+
+Its SHAPE matters more than its level: a count that climbs steadily on a
+chat-heavy day is the lane working, while a count that fires on nearly every
+turn is the classifier over-firing and should be tightened, not celebrated.
+
+**Positive-control the zero before reading it as under-firing** (guard-2298): run
+the same query shape against a prefix known to be populated. Measured 2026-08-26
+at correction time the count was 0 across 3,060 goals against 2,266 for
+`agent-self` — a real zero, and the reason this section was rewritten: the census
+had been keyed on a `goal_source` value that is not in the enum, so it could
+never have counted anything even after the lane fired. Re-measured with the
+prefix scan above: `chat-goal:=0` against a same-shape control of
+`unblock:=175`. The lane has still never fired; that is now a MEASUREMENT
+rather than an artifact of a census that could not count.
 
 ## Cross-references
 
-- `.claude/skills/respond/SKILL.md` Step 5.6 — the pointer that reaches this file
+- `.claude/skills/respond/SKILL.md` Step 5.0b — the pointer that reaches this file
 - `.claude/skills/encode-session/SKILL.md` — the manual lane this reduces reliance on
 - `core/config/conventions/hot-path-size-budget.md` — why this content lives here
   and not in `respond/SKILL.md`

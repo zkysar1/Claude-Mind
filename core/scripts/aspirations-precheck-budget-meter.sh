@@ -11,9 +11,33 @@
 # <agent>/session/precheck-drops.jsonl.
 #
 # Operations:
-#   start              — snapshot start time + zone, init state file
-#   check <sweep-name> — print "run" or "drop" on stdout, log decision
-#   end                — finalize, log summary record
+#   start                 — snapshot start time + zone, init state file
+#   check <sweep-name>    — print "run" or "drop" on stdout, log decision
+#   executed <sweep-name> — record that the lane ACTUALLY RAN ()
+#   end                   — finalize, log summary record
+#
+# `check` and `executed` measure DIFFERENT THINGS and the difference is the whole
+# point of the second op. `check` records a PERMISSION DECISION — the caller asked
+# and was told run/drop. It cannot observe whether the caller then did the work.
+# So `sweeps_ran` conflates two states that a reader needs to tell apart:
+#   (i)  the lane executed but never asked the meter (hand-run, or run by a
+#        caller that skipped the check) -> contributes NOTHING to any counter
+#   (ii) the lane was never invoked at all             -> contributes NOTHING
+# Both render as an identical summary row, which is how 34 of 43 tier-table lanes
+# went dark for 90-208h across two boxes while `sweeps_dropped: 0` read as healthy
+# (: measured cc-04 dark 208h, cc-02 dark 94.3h, both fleet-confirmed).
+# `executed` is emitted BY THE SCRIPT THAT RUNS THE LANE, never by an LLM reading
+# a protocol file — guard-399's witness corollary: the observability of an
+# LLM-elected step is itself LLM-elected, so it cannot witness the step.
+#
+# IT COUNTS INVOCATIONS, NOT LANES, and the two differ in practice: one registered
+# lane may legitimately run more than once per iteration (aspirations-recover-recurring
+# runs --source world AND --source agent under a single `check`). So a healthy row
+# can read tail_executed=8 against 7 registered medium lanes. Do NOT "correct" that
+# to a lane count — the question the field answers is "how much tail work actually
+# happened", and collapsing two real invocations into one would understate it.
+# Proven non-vacuous by the guard-5163 fixture pair in
+# core/scripts/tests/test_precheck_medium_battery.py.
 #
 # Sweep tier table (single source of truth — keep in sync with
 # core/config/aspirations.yaml `precheck:` doc-block):
@@ -39,6 +63,14 @@
 #                completed-not-closed-drain (0.5g.7): the per-iteration DRAIN
 #                obligation () — bounded to a few rows, but an
 #                obligation, so it must not be the first thing dropped.
+#                world-script-crlf-check (0.5g.8): a *.sh carrying CR cannot
+#                execute on Linux, and bash is its own parser so the GAE-2
+#                CRLF-TOLERANT-PARSER answer cannot reach it. own-cloud delivers
+#                CRLF into world/scripts today (positive-controlled 2026-08-24),
+#                and .gitattributes does not reach a gitignored tree. The 2026-08-22
+#                incident killed the fleet's outbound email transport silently for
+#                17+ minutes; a dropped sweep here means the next one is silent too
+#                (). Sub-second over ~800 files, zero false-positive class.
 #   medium:      aspirations-recover-recurring, monitor-stale-check,
 #                precheck-eval, blocker-recheck, defer-recheck,
 #                precondition-defer-recheck, recurring-starvation-check
@@ -51,6 +83,11 @@
 #                defer-drift-check, reason-less-blocked-check,
 #                blocked-signal-resolution-check, dependency-cycle-check,
 #                hypothesis-terminal-goal-check, locus-sweep,
+#                self-blocked-defer-sweep, phantom-goal-audit,
+#                hardcoded-scope-audit (0.5b.19/20/21 — added to the SKILL.md
+#                table by  without a case arm, so they WARN-defaulted
+#                to medium for the whole interval; caught by
+#                test_budget_meter_sweep_tier_parity, 2026-08-27),
 #                fresh-eyes-cadence, fresh-eyes-program-cadence,
 #                strategic-scan-cadence,
 #                felt-sense-cadence, l1-skew-cadence, scar-tissue-cadence,
@@ -107,11 +144,11 @@ now_ms() {
 # Section PB check that asserts the SKILL.md tier table matches.
 sweep_tier() {
     case "$1" in
-        tree-debt-gate|experience-archival-gate|evolution-finalize-gate|fresh-eyes-code-gate|dependency-timeout-check|inbox-alert-age-check|handoff-aging-check|user-blocker-escalation-check|completed-not-closed-drain)
+        tree-debt-gate|experience-archival-gate|evolution-finalize-gate|fresh-eyes-code-gate|dependency-timeout-check|inbox-alert-age-check|handoff-aging-check|user-blocker-escalation-check|completed-not-closed-drain|world-script-crlf-check)
             echo "always-run" ;;
         aspirations-recover-recurring|monitor-stale-check|precheck-eval|blocker-recheck|defer-recheck|precondition-defer-recheck|recurring-starvation-check)
             echo "medium" ;;
-        pending-questions-sweep|recurring-precondition-sweep|parent-supersession-sweep|unblock-parent-status-sweep|routing-audit-target-status-sweep|credential-defer-recheck|defer-drift-check|reason-less-blocked-check|blocked-signal-resolution-check|dependency-cycle-check|hypothesis-terminal-goal-check|locus-sweep|reclaim-defer-audit|reclaim-user-participant-audit|human-blocked-defer-join|fresh-eyes-cadence|fresh-eyes-program-cadence|fresh-eyes-tree-cadence|strategic-scan-cadence|felt-sense-cadence|l1-skew-cadence|scar-tissue-cadence|completed-not-closed-cadence|health-regression-cadence|curriculum-cadence|evolution-cadence)
+        pending-questions-sweep|recurring-precondition-sweep|parent-supersession-sweep|unblock-parent-status-sweep|routing-audit-target-status-sweep|credential-defer-recheck|defer-drift-check|reason-less-blocked-check|blocked-signal-resolution-check|dependency-cycle-check|hypothesis-terminal-goal-check|locus-sweep|reclaim-defer-audit|reclaim-user-participant-audit|human-blocked-defer-join|self-blocked-defer-sweep|phantom-goal-audit|hardcoded-scope-audit|fresh-eyes-cadence|fresh-eyes-program-cadence|fresh-eyes-tree-cadence|strategic-scan-cadence|felt-sense-cadence|l1-skew-cadence|scar-tissue-cadence|completed-not-closed-cadence|health-regression-cadence|curriculum-cadence|evolution-cadence)
             echo "deferrable" ;;
         *)
             # Unknown sweep name — surface to stderr so a missing registration
@@ -386,6 +423,41 @@ print(decision)
 PYEOF
         ;;
 
+    executed)
+        # Record that a lane ACTUALLY RAN. No decision logic, no drop-log write:
+        # this op never gates anything, it only witnesses. Fail-open like every
+        # other arm — a meter bug must never break the caller that just did real
+        # work (and unlike `check`, there is nothing to fall back TO: the work is
+        # already done, so the only correct failure is a silent one).
+        if [[ -z "$SWEEP_NAME" ]] || [[ ! -f "$STATE_FILE" ]]; then
+            exit 0
+        fi
+        tier=$(sweep_tier "$SWEEP_NAME")
+        STATE_FILE_E="$STATE_FILE" SWEEP_E="$SWEEP_NAME" TIER_E="$tier" \
+        py -3 - <<'PYEOF' 2>/dev/null || true
+import os, json
+state_file = os.environ['STATE_FILE_E']
+try:
+    with open(state_file) as f:
+        state = json.load(f)
+except Exception:
+    raise SystemExit(0)
+if state.get('disabled'):
+    raise SystemExit(0)
+state.setdefault('sweeps', []).append({
+    'sweep': os.environ['SWEEP_E'],
+    'tier': os.environ['TIER_E'],
+    'decision': 'executed',
+    'reason': 'lane-completed',
+})
+try:
+    with open(state_file, 'w') as f:
+        json.dump(state, f)
+except Exception:
+    pass
+PYEOF
+        ;;
+
     end)
         if [[ ! -f "$STATE_FILE" ]]; then
             exit 0
@@ -407,7 +479,35 @@ else:
         sweeps = state.get('sweeps', [])
         ran = sum(1 for s in sweeps if s.get('decision') == 'run')
         dropped = sum(1 for s in sweeps if s.get('decision') == 'drop')
+        # : EXECUTION, not permission. `ran` counts run DECISIONS and
+        # is left exactly as it was — a reader comparing old rows to new ones must
+        # see the same quantity. These two are additive and answer the question
+        # `ran` cannot: did the medium/deferrable tail actually happen?
+        executed = [s for s in sweeps if s.get('decision') == 'executed']
+        tail_executed = sum(1 for s in executed if s.get('tier') != 'always-run')
         elapsed = cur_ms - state.get('start_ms', cur_ms)
+        # : sweeps_dropped==0 is AMBIGUOUS on its own -- it reads
+        # identically whether the medium/deferrable tail ran and fit the budget,
+        # or was never invoked at all. tail_considered counts the non-always-run
+        # sweeps that ASKED this meter for permission; zero means nothing ever
+        # asked, which is a routing gap, not a healthy budget.
+        #
+        # SCOPED TO DECISION RECORDS ('run'/'drop') WHEN THE TWO SIDES OF
+        #  WERE MERGED (), and the scoping is load-bearing,
+        # not cosmetic. The sibling implementation added an `executed` op that
+        # appends MORE rows to this same `sweeps` list, so the original
+        # `len(sweeps) - always` would count one medium lane TWICE -- once when it
+        # asked, once when it reported completion -- inflating a metric whose only
+        # job is to separate zero from non-zero. Keeping the two orthogonal is why
+        # both exist: tail_considered answers "did the tail ASK", tail_executed
+        # answers "did the tail RUN", and a lane can do either without the other
+        # (that asymmetry is exactly what the `executed` op was added to expose).
+        always_checked = sum(1 for s in sweeps
+                             if s.get('tier') == 'always-run'
+                             and s.get('decision') in ('run', 'drop'))
+        tail_considered = sum(1 for s in sweeps
+                              if s.get('tier') != 'always-run'
+                              and s.get('decision') in ('run', 'drop'))
         summary = {
             'ts': cur_ms,
             'event': 'precheck-end',
@@ -416,8 +516,29 @@ else:
             'zone': state.get('zone'),
             'sweeps_ran': ran,
             'sweeps_dropped': dropped,
+            # UNION of both  implementations (merged ).
+            # They are complementary, not duplicates: the *_considered/reached
+            # pair measures PERMISSION (did the tail ask), the *_executed pair
+            # measures EXECUTION (did the tail run). always_run_count keeps the
+            # sibling's unscoped expression verbatim so old rows stay comparable.
             'always_run_count': sum(1 for s in sweeps if s.get('tier') == 'always-run'),
+            'tail_considered': tail_considered,
+            'tail_reached': tail_considered > 0,
+            'sweeps_executed': len(executed),
+            'tail_executed': tail_executed,
         }
+        if tail_considered == 0:
+            # stdout, not stderr: the heredoc runs under 2>/dev/null, so a
+            # stderr warning here would be discarded -- which is exactly how
+            # this gap stayed invisible.
+            print('[precheck-meter] TAIL NEVER INVOKED: %d always-run sweeps '
+                  'reached the meter and ZERO medium/deferrable ones did. '
+                  'sweeps_dropped=%d does NOT mean the budget was fine -- it '
+                  'means nothing asked. The medium tier is wired into loop entry '
+                  'via precheck-medium-battery; if this fires, that battery did '
+                  'not run either. Check it, then resume aspirations-precheck at '
+                  'its first deferrable sweep (g-115-7847).'
+                  % (always_checked, dropped))
         try:
             os.makedirs(os.path.dirname(drop_log), exist_ok=True)
         except Exception:
@@ -436,7 +557,7 @@ PYEOF
         ;;
 
     *)
-        echo "usage: $0 {start|check <sweep-name>|end}" >&2
+        echo "usage: $0 {start|check <sweep-name>|executed <sweep-name>|end}" >&2
         exit 2
         ;;
 esac

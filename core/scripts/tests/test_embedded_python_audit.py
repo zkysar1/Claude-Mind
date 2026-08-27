@@ -384,3 +384,99 @@ PY
     # One block, from the fixture alone -- the live corpus is three orders of
     # magnitude larger, so any leak shows up immediately here.
     assert data["total_blocks"] == 1, data["total_blocks"]
+
+
+# --- unquoted-heredoc bash expansion () ---------------------------
+# THREE ARMS, and all three are required. A fix that only turns the flagged
+# block green is indistinguishable from deleting the check (guard-1636 /
+# guard-2421: a mutation proof can lie green; confirm BOTH directions).
+
+
+def test_unquoted_heredoc_bash_escapes_expanded_before_compile(tmp_path):
+    r"""An unquoted `<<PY` body is REWRITTEN by bash before python sees it.
+
+    Compiling the raw file bytes audits a string that never reaches the
+    interpreter, so `\\"` (which bash hands to python as `\"`) was reported as a
+    SyntaxError on a block bash executes correctly. This is the shape that held
+    `test_live_corpus_baseline_is_clean` RED against a correct script.
+    """
+    f = write(tmp_path, "unquoted-escaped.sh", r"""#!/usr/bin/env bash
+emit() {
+    python3 - <<PY
+import sys
+sys.stderr.write("Do NOT read this as \\"no rows to purge\\".\\n")
+t = "back\\\\slash"
+u = "dollar \$HOME"
+PY
+}
+""")
+    assert bash_n(f) in (0, None), "fixture must itself be valid bash"
+    rc, out = run_audit(tmp_path)
+    assert rc == 0, out
+
+
+def test_unquoted_heredoc_with_genuine_syntax_error_still_fails(tmp_path):
+    """NEGATIVE CONTROL: the expansion must not blind the compile check.
+
+    Same unquoted-heredoc kind as the test above, genuinely uncompilable body.
+    If this ever passes, the expansion has stopped discriminating and the audit
+    is silently dead for every `<<PY` block in the corpus.
+    """
+    write(tmp_path, "unquoted-broken.sh", """#!/usr/bin/env bash
+python3 - <<PY
+def broken(:
+    return 1
+PY
+""")
+    rc, out = run_audit(tmp_path)
+    assert rc == 1, out
+    assert "heredoc_unquoted" in out, out
+
+
+def test_quoted_heredoc_body_is_not_expanded(tmp_path):
+    r"""OVER-APPLICATION CONTROL: `<<'PY'` is literal, so it must NOT expand.
+
+    Quoting the delimiter is exactly the instruction "do not touch this text",
+    so the same `\\"` that is correct in an unquoted body is a real defect here
+    -- python receives it raw. Expanding quoted bodies too would re-introduce
+    the identical false verdict in the opposite (false-GREEN) direction.
+    """
+    f = write(tmp_path, "quoted-literal.sh", r"""#!/usr/bin/env bash
+python3 - <<'PY'
+s = "a \\"q\\" b"
+PY
+""")
+    assert bash_n(f) in (0, None), "fixture must itself be valid bash"
+    rc, out = run_audit(tmp_path)
+    assert rc == 1, out
+    assert "heredoc_quoted" in out, out
+
+
+def test_unquoted_expansion_matches_measured_bash_semantics():
+    r"""Pin the expansion table to MEASURED bash behaviour, not to the spec memo.
+
+    Measured on real bash (g-115-7302): a backslash in an unquoted heredoc is
+    special ONLY before `\`, `$` and a backtick. The filing goal proposed a
+    two-substitution shape that also mapped `\"` -> `"`; bash has no such rule,
+    and adding it would corrupt every escaped quote -- a false GREEN, which is
+    strictly worse than the false RED being fixed. The `\d`/`\n` row is the one
+    that falsifies it.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_epa_under_test", AUDIT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    expand = mod._expand_unquoted_heredoc
+
+    assert expand(r'"a \\"q\\" b"') == r'"a \"q\" b"'
+    assert expand(r'"back\\\\slash"') == r'"back\\slash"'
+    assert expand(r'"dollar \$HOME"') == r'"dollar $HOME"'
+    assert expand(r'"tick \`x\`"') == r'"tick `x`"'
+    # The falsifying row: every OTHER escape passes through untouched.
+    assert expand(r'"other \d \n"') == r'"other \d \n"'
+    # SINGLE left-to-right pass: `\\$` is a literal backslash THEN an expansion.
+    # Sequential str.replace would collapse it to a bare `$`, losing the slash.
+    assert expand(r'\\$') == r'\$'
+    # A lone trailing backslash is literal, not an IndexError.
+    assert expand("tail\\") == "tail\\"

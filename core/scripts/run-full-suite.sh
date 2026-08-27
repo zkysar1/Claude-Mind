@@ -139,7 +139,17 @@ if [ "$_TL_SKIP" -eq 0 ] && [ -f "$SCRIPT_DIR/tree-lock.sh" ]; then
     fi
 fi
 
-python3 "$SCRIPT_DIR_NATIVE/run-full-suite.py" "$@"
+# -u is LOAD-BEARING, not a style choice (). To a redirected FILE
+# CPython block-buffers stdout at 8KB, and this run takes ~12 minutes -- so a
+# run KILLED before it exits (a caller's timeout, a peer's merge, Ctrl-C) loses
+# the entire buffer, VERDICT included, while the chunk logs and halves.jsonl
+# survive because those are explicit file writes. The result reads as a clean
+# short log rather than as a truncation: measured 2026-08-26, a redirected log
+# came back 342 B carrying only the banner bash itself had written, with all 4
+# chunk logs present -- indistinguishable from a run that simply had little to
+# say. Differential test, same script, killed at 1s of a 3s run:
+# buffered -> 0 bytes, `-u` -> the pre-kill output survives.
+python3 -u "$SCRIPT_DIR_NATIVE/run-full-suite.py" "$@"
 FRAMEWORK_RC=$?
 
 # --triage RUNS NOTHING -- it re-reads chunk logs a prior run already wrote, and

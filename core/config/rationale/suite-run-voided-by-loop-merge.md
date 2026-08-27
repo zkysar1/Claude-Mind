@@ -82,6 +82,57 @@ If the constraint is later measured to be violated repeatedly despite being
 written down, that is the evidence that would justify the sentinel — and the
 staleness escape is the part to design first.
 
+## The documented PRIMARY path walks a worker straight into this (g-115-7638, 2026-08-25)
+
+Everything above explains why a merge voids a run. This section records that the
+framework's own suite rule **told a worker to take the path that triggers it**, and
+that the rule's stated reason for believing that path safe was wrong.
+
+`.claude/rules/run-full-suite-after-deep-code.md` item 4 read: *"The PRIMARY path is
+to background the suite (`run_in_background`) and END the turn — the harness
+auto-notifies on completion, so no polling and no sleep is needed (guard-1230)."*
+The same item then blamed the rc=1 / Gate-2.6-BLOCK / busy-spin chain on a **bare**
+`interruptible-sleep`, which reads as: the backgrounding path is the safe one.
+
+**It is not, and the blind spot is shared.** The harness's `run_in_background`
+registers NOTHING with `background-jobs.sh` either. Measured twice, on two boxes:
+
+| box | evidence |
+|---|---|
+| cc-07, 2026-08-24 (g-367-14) | `has-pending` rc=1 while THREE real suite PIDs were live |
+| cc-08, 2026-08-25 (g-115-7638) | live PID **1030906** (`sleep 90`, wrapper carrying `BODY_ROLE=worker`), `has-pending` **rc=1**, tracker holding only STOPPED rows 110–362h old |
+
+**Why the same blind spot costs a reducer a BLOCK and a worker the RESULT.** On a
+reducer the turn-end is refused and the loop retries. On a worker the refusal
+chains: Gate 2.6 BLOCKs → the worker-net stop hook demands `Skill(worker-loop)` as
+the next turn's FIRST action → Phase -0.3 runs `iteration-push.sh --no-push`, which
+merges (see above) → `tree-moved` → the suite the Body was waiting for is void.
+End turn → BLOCKED → re-enter → merge → destroy the measurement. That is the
+~20-turn busy-spin `EXTERNAL_WAIT=1` was created to prevent, arriving through a door
+that flag does not cover: the flag paces a SLEEP, it does not carry a SUITE across a
+merge.
+
+### Why the fix was the rule and not the harness registration
+
+Two remedies were on the table and they are not exclusive. Registering the harness
+task as a Tier-A job so Gate 2.6 can see it is the class-level fix and remains worth
+doing **for the reducer path** — it would also make that path honest. It was NOT
+chosen here, for a reason that only shows up once the deadman is included in the
+trace: it fixes the BLOCK and leaves the VOID.
+
+Even with the turn-end allowed, a worker's `ScheduleWakeup` net is armed at
+`delaySeconds=600`. The suite's measured runtime is ~32 min. So the net fires
+mid-suite, re-enters `worker-loop`, and Phase -0.3 merges — voiding the run exactly
+as before, with no gate involved at all. Registration cannot close that; only
+finishing in-turn can. Hence the invariant this file is named for, and hence the
+rule now routes a worker to the in-turn route it already documented at item 3
+(*"Foreground-in-one-turn is also fine — the Bash tool auto-backgrounds >2min
+commands but keeps them bound to the turn"*), which was present the whole time and
+simply never connected to the worker case.
+
+The reducer wording in item 4 is deliberately unchanged; only the role split and the
+pointer here were added, at zero net bytes in that rule.
+
 ## Cross-references
 
 - `rb-8554` — commit-before-launch; names the RUNNER's door into `tree-moved`.

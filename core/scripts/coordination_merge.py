@@ -4552,6 +4552,17 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     "productivity-snapshots.jsonl": merge_append_only_jsonl,
     "gate-firings.jsonl": merge_append_only_jsonl,
     "trigger-firings.jsonl": merge_append_only_jsonl,
+    # notification send-ledger (): append-only send log written by
+    # notification_outreach.py / notify_dispatch.py (both "append one row"). It is
+    # governed-store write-class (b) -- no reconciler below the write -- so unregistered
+    # the stale If-Match fence is a PERMANENT wedge, not a retry (measured wedged 528
+    # consecutive sweeps on cc-08; merge_handler_for returned None). Append-only VERIFIED
+    # per guard-1816: a grep of both writers for prune|trim|rotate|truncate|rewrite|
+    # filter|evict|unlink|del returns nothing and the schema carries no mutation flag.
+    # The 20 byte-identical duplicate lines present today are the SAME send double-logged
+    # (unique ntf-<ts>-<agent>-<hash> id per distinct event), which line-union correctly
+    # collapses; a distinct event is never lost.
+    "notifications-sent.jsonl": merge_append_only_jsonl,
     # citation-credit dedup ledger (): multi-writer — every box's
     # reducer sweeps its local HEAD and claims commits here, so unregistered
     # it would safe-freeze on the first both-diverged conflict (rb-3150 class)
@@ -5083,6 +5094,119 @@ def _is_gate_firings_segment(basename: str) -> bool:
     return bool(_GATE_FIRINGS_SEGMENT_RE.match(basename))
 
 
+# --- : front-matter-aware preamble reconcile ----------------------
+# _section_merge.merge_sections' preamble branch has exactly three outcomes:
+# identical / one-side-empty / CONFLICT. A knowledge-tree node ALWAYS carries
+# non-empty YAML front matter on BOTH sides, so the middle branch is unreachable
+# for this store and ANY front-matter difference was an unconditional CONFLICT ->
+# merge_tree_node_md returns None -> the node freezes. Every writer bumps
+# last_updated / last_update_trigger, so this made the handler unable to converge
+# a diverged tree node AT ALL. Measured <preamble>-conflict share of diverged
+# nodes: 16/16 on cc-05 (), 3/3 on cc-07 () = 19/19.
+#
+# THIS IS NOT REJECTED ALTERNATIVE (a). governed-store-write-classes.md rejects
+# "whole-file LWW on front-matter last_updated" because it picks one WHOLE FILE
+# and the loser's SECTION is lost on the same-date two-section case. This
+# reconciles the PREAMBLE ONLY and leaves the body to the landed section-union
+# (d), so no section can ever be lost -- the same-date case is still decided by
+# heading, exactly as (d) decides it.
+#
+# FAIL-SAFE BY CONSTRUCTION: every uncertain path returns None, which is
+# byte-for-byte the behaviour that exists today. This can only ADD convergence.
+_FM_RECONCILABLE_KEYS = frozenset({"last_updated", "last_update_trigger"})
+
+
+def _split_front_matter(text: str):
+    """Return (front_matter_text, rest_including_closing_delimiter).
+
+    (None, None) when the document does not open with a '---' block -- the
+    caller then refuses, because guessing at a node without front matter is
+    exactly the silent-overwrite class this handler exists to avoid.
+    """
+    if not text.startswith("---"):
+        return None, None
+    try:
+        end = text.index("\n---", 3)
+    except ValueError:
+        return None, None
+    return text[3:end], text[end:]
+
+
+def _demote_prior_source(trigger: dict, loser_source) -> dict:
+    """Add the loser's provenance as prior_source_<max+1> (guard-4401).
+
+    NEVER writes a duplicate key: YAML forbids duplicates at one level,
+    safe_load raises nothing and silently keeps only the LAST, so a naive
+    second `source:` destroys one of them (guard-2388, measured). The newest
+    entry stays `source:`; every demoted one is prior_source_N with N ascending.
+    """
+    out = dict(trigger)
+    n = 0
+    for k in out:
+        ks = str(k)
+        if ks.startswith("prior_source_"):
+            tail = ks[len("prior_source_"):]
+            if tail.isdigit():
+                n = max(n, int(tail))
+    out[f"prior_source_{n + 1}"] = loser_source
+    return out
+
+
+def _reconcile_front_matter(ours_text: str, theirs_text: str):
+    """Return (ours_text, theirs_text) sharing ONE reconciled preamble, or None.
+
+    Call AFTER the caller's canonical side-sort, so `ours` is the deterministic,
+    content-derived side and the equal-date tiebreak is identical on every box
+    (commutativity is this handler's load-bearing property).
+    """
+    o_fm, o_rest = _split_front_matter(ours_text)
+    t_fm, t_rest = _split_front_matter(theirs_text)
+    if o_fm is None or t_fm is None:
+        return None
+    if o_fm == t_fm:
+        return ours_text, theirs_text
+    try:
+        o = yaml.safe_load(o_fm)
+        t = yaml.safe_load(t_fm)
+    except Exception:  # noqa: BLE001 -- unparseable front matter -> freeze
+        return None
+    if not isinstance(o, dict) or not isinstance(t, dict):
+        return None
+    # Any difference OUTSIDE the two provenance keys REFUSES. Narrow on purpose:
+    # a body-derived field (confidence, capability_level, ...) has its own
+    # progression semantics (guard-1170) and must never be silently decided by
+    # an LWW on a key its writers deliberately do not bump.
+    for k in set(o) | set(t):
+        if k not in _FM_RECONCILABLE_KEYS and o.get(k) != t.get(k):
+            return None
+    ou = str(o.get("last_updated") or "")
+    tu = str(t.get("last_updated") or "")
+    win, lose = (t, o) if tu > ou else (o, t)          # tie -> ours (canonical)
+    win_fm = t_fm if win is t else o_fm
+    merged = dict(win)                                  # preserves key order
+    w_trig, l_trig = win.get("last_update_trigger"), lose.get("last_update_trigger")
+    if isinstance(w_trig, dict) and isinstance(l_trig, dict):
+        l_src = l_trig.get("source")
+        if l_src is not None and l_src != w_trig.get("source"):
+            merged["last_update_trigger"] = _demote_prior_source(w_trig, l_src)
+    elif w_trig != l_trig:
+        return None          # unstructured and disagreeing -> do not guess
+    if merged == win:
+        fm_out = win_fm                                 # verbatim: zero churn
+    else:
+        fm_out = "\n" + yaml.safe_dump(
+            merged, sort_keys=False, allow_unicode=True,
+            width=10 ** 6, default_flow_style=False)
+        # guard-2388: presence of a key is NOT evidence YOUR value survived.
+        # Assert the emitted block round-trips to exactly what we intended.
+        try:
+            if yaml.safe_load(fm_out) != merged:
+                return None
+        except Exception:  # noqa: BLE001
+            return None
+    return "---" + fm_out + o_rest, "---" + fm_out + t_rest
+
+
 def merge_tree_node_md(ours: bytes, theirs: bytes):
     """Section-union merge for ``world/knowledge/tree/**/*.md`` ().
 
@@ -5136,6 +5260,15 @@ def merge_tree_node_md(ours: bytes, theirs: bytes):
     # of a knowledge node on its first merge.
     if theirs_text < ours_text:
         ours_text, theirs_text = theirs_text, ours_text
+    # : reconcile the YAML front matter BEFORE the section merge, so
+    # merge_sections' preamble branch takes its identical-preamble path instead
+    # of the unconditional CONFLICT that froze every diverged tree node. Placed
+    # AFTER the canonical sort so the equal-last_updated tiebreak resolves to the
+    # same side on every box. A None refusal falls through with the ORIGINAL
+    # texts, which reproduces the pre-existing freeze exactly.
+    _rec = _reconcile_front_matter(ours_text, theirs_text)
+    if _rec is not None:
+        ours_text, theirs_text = _rec
     merged, conflicts = merge_sections("", ours_text, theirs_text)
     if conflicts:
         return None

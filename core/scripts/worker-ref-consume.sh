@@ -139,17 +139,42 @@ if [ -n "$RETIRE_REF" ]; then
   # retire is not a report.
   git -C "$REPO" fetch origin main >/dev/null 2>&1 \
     || log "WARN: fetch of origin main failed — testing against last-known origin/main" >&2
+  # : the join keys are extracted BEFORE the reachability gate so its
+  # refusal can name the LIVENESS disposition too. Pure string ops, no cost.
+  # The ref path carries both keys: refs/workers/<agent>/<sid>.
+  ref_sid="${RETIRE_REF##*/}"
+  ref_agent_seg="${RETIRE_REF%/*}"; ref_agent="${ref_agent_seg##*/}"
+
   if ! git -C "$REPO" merge-base --is-ancestor "$RETIRE_REF" refs/remotes/origin/main 2>/dev/null; then
     log "REFUSED: $RETIRE_REF is NOT fully reachable from origin/main." >&2
-    log "Merge it and push main first — retiring now would delete the only remote copy of its commits." >&2
+    # : the refusal is CORRECT but its one-line remedy is wrong for the
+    # commonest cause. A LIVE carrier keeps pushing after you merge it, so its
+    # tip is legitimately ahead of origin/main — "merge it and push main first"
+    # then reads as an unsatisfiable instruction and sends the operator hunting
+    # a bookkeeping bug. MEASURED 2026-08-26 (alpha, cc-04): both alpha carrier
+    # refs refused here while their in_flight_bodies rows were minutes old and
+    # mid-goal; the correct disposition was CARRY, and a filed remedy proposing
+    # auto-delete-on-merge would have deleted two live bodies' push targets.
+    # Best-effort and fail-soft — the refusal stands either way, and the
+    # authoritative liveness gate below is untouched.
+    live_hint_json="$(bash "$TEAM_STATE_READER" --field "agent_status.${ref_agent}.in_flight_bodies.${ref_sid}" --json 2>/dev/null || true)"
+    if [ -n "$live_hint_json" ] && [ "$live_hint_json" != "null" ]; then
+      log "NOTE: a LIVE in_flight_bodies row names this ref's body — $live_hint_json" >&2
+      log "So this is an ACTIVE carrier, not stuck bookkeeping: the body has pushed since your merge." >&2
+      log "Correct disposition is CARRY (leave it outstanding). Do NOT re-merge-and-push to satisfy this" >&2
+      log "gate, and do NOT retire it — guard-3660: reachability is about the CONTENT, the body row is" >&2
+      log "about the HANDLE, and only the handle matters while a body is running." >&2
+    else
+      log "Merge it and push main first — retiring now would delete the only remote copy of its commits." >&2
+      log "If you ALREADY merged and pushed and this still refuses, check whether an intervening rebase" >&2
+      log "rewrote the merge commit and orphaned the tip (guard-1863: never 'git pull --rebase' this repo" >&2
+      log "— use 'git pull --no-rebase'; merge, push, THEN pull)." >&2
+    fi
     exit 1
   fi
 
   # : LIVENESS precondition. Reachability proved the CONTENT durable;
-  # this proves no RUNNING body still needs the HANDLE. The ref path carries
-  # both join keys: refs/workers/<agent>/<sid>.
-  ref_sid="${RETIRE_REF##*/}"
-  ref_agent_seg="${RETIRE_REF%/*}"; ref_agent="${ref_agent_seg##*/}"
+  # this proves no RUNNING body still needs the HANDLE.
   body_row_state="absent"
   row_json="$(bash "$TEAM_STATE_READER" --field "agent_status.${ref_agent}.in_flight_bodies.${ref_sid}" --json 2>/dev/null)"
   reader_rc=$?
@@ -314,6 +339,11 @@ superseding_of() {
 }
 
 n_refs=0; n_outstanding=0; n_unreadable=0
+# Dependency-pull accumulators (): the reducer-lane producer needs to
+# know whether ANY outstanding tip carries framework content, which this loop
+# already computes exactly. Re-deriving it after the loop would be a second
+# copy of an instrument that exists (guard-2676).
+pull_fw_total=0; pull_tip_count=0; pull_first_ref=""
 NOW_CT="$(date +%s)"
 CHECK_BREACHES=()
 [ "$AS_JSON" = 1 ] && printf '{"refs":['
@@ -399,6 +429,11 @@ for ref in ${REF_LIST[@]+"${REF_LIST[@]}"}; do
   if [ "$ahead" -gt 0 ] && [ "$is_self" = 0 ] && [ -z "$superseded_by" ]; then
     is_tip=1
     n_outstanding=$((n_outstanding+1))
+    if [ "$fw_count" -gt 0 ]; then
+      pull_fw_total=$((pull_fw_total+fw_count))
+      pull_tip_count=$((pull_tip_count+1))
+      [ -z "$pull_first_ref" ] && pull_first_ref="$ref"
+    fi
   fi
   # Threshold evaluation — TIPS only (an ancestor's depth is contained in its
   # tip's), and evaluate BOTH axes rather than stopping at the first breach
@@ -465,5 +500,26 @@ if [ "$DO_CHECK" = 1 ] && [ ${#CHECK_BREACHES[@]} -gt 0 ]; then
     log "  ⚠ $b"
   done
   log "Disposition per ref: --merge (then push main, then --retire), carry specific hunks, or discard with a receipt."
+fi
+
+# --- DEPENDENCY-PULL PRODUCER, reducer lane () --------------------
+# Belt-and-braces companion to the worker lane in iteration-push.sh. The worker
+# stamps when it PUSHES; this stamps when the reducer SEES an outstanding tip
+# carrying framework content — which covers the case the worker lane cannot: a
+# body that pushed while running old code, or one that died before its own
+# producer ran. Both lanes call the same self-gating script, so a double-fire
+# costs one SKIP-live and nothing else.
+#
+# --check ONLY. A bare read (`--json`, or the plain report) must stay
+# side-effect-free, or every diagnostic probe of this instrument would perturb
+# the ranking it is being used to diagnose.
+#
+# STRICTLY ADVISORY: rc swallowed. This is the reducer's close path, which must
+# never fail on a visibility instrument.
+if [ "$DO_CHECK" = 1 ] && [ "$pull_tip_count" -gt 0 ]; then
+  extra=""
+  [ "$pull_tip_count" -gt 1 ] && extra=" (+$((pull_tip_count-1)) more tip(s))"
+  log "pull: $(bash "$SCRIPT_DIR/pull-signal-set.sh" \
+      --reason "outstanding carrier $pull_first_ref, $pull_fw_total framework file(s)$extra" 2>&1 | head -1)"
 fi
 exit 0

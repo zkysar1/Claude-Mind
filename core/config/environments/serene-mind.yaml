@@ -24,6 +24,32 @@
 #   * Access is gated by strict Tailscale ACLs (tag:serene) with IAP as
 #     break-glass. An agent probe will time out; that is the boundary holding.
 #   * The engagement carries HIPAA/BAA scope. Fleet automation must stay out.
+#     WHY, in clause terms: world/conventions/serene-engagement-constraints.md
+#     records the fleet-reaching clauses of the governing agreement, and maps
+#     them onto fleet behaviour: §2.3 forbids replicating client source/backups/
+#     technical docs to personal storage -- which is what this fleet's world+meta
+#     sync and GitHub state ARE; §3.3 requires a WRITTEN pre-existing-IP
+#     disclosure BEFORE integrating pre-existing code and grants a perpetual
+#     royalty-free licence to whatever is integrated; §6.1 demands certified
+#     ABSOLUTE deletion on termination, which .history/ + changelog + object
+#     versioning are designed to prevent.
+#     READ ITS STATUS SECTION FIRST — the copy in hand is UNSIGNED, so the frame
+#     is real but its binding force is not established, and conflating the two is
+#     the worst error available in either direction. That file exists because this
+#     line alone states a rule with no basis, and a constraint with no stated
+#     basis reads as a style preference — which is exactly how a future agent
+#     talks itself past one.
+#     THAT FILE IS WORLD-LOCAL BY DESIGN AND WILL BE ABSENT IN EVERY DOWNSTREAM
+#     DEPLOYMENT. This entry is framework and promotes to claude-mind/zds-mind;
+#     client contract terms deliberately do not travel with it. A dangling
+#     pointer there is the privacy boundary holding, NOT promotion drift -- do
+#     not "fix" it by inlining the terms (guard-4457: a cross-reference is a
+#     claim about a file you are not editing, so it must state its own
+#     fragility).
+#     (: the record was written 2026-08-24 and this pointer was
+#     claimed alongside it, but never landed — verified absent by grep over the
+#     whole 2,232-byte file before adding it here. The record was orphaned:
+#     nothing in the registry led a reader to it.)
 #
 # framework_version: UNKNOWN and not fleet-derivable. Only the operator knows
 # what was last hand-installed. Do not infer it from any sibling deployment.

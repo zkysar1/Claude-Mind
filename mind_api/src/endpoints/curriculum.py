@@ -408,8 +408,11 @@ def evaluate(ctx) -> "Response":  # type: ignore[name-defined]
     # Refresh the competence metric BEFORE evaluating (producer wiring,
     # ) — mirrors core/scripts/curriculum.py cmd_evaluate. Fail-open:
     # on refresh failure the stored value is used (pre-wiring behavior).
+    # ctx.paths.agent_name is the authoritative identity (the sibling
+    # _evaluate_gate call below already threads it); pass it so assess() does
+    # not re-derive a second, different one from agent_dir's basename.
     competence_refresh = refresh_competence_for_gates(
-        gates, Path(ctx.paths.world), agent_dir)
+        gates, Path(ctx.paths.world), agent_dir, ctx.paths.agent_name)
 
     now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     gate_results = []

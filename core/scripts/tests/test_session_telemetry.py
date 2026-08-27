@@ -510,7 +510,13 @@ def test_reap_missing_records_dir_total(tmp_path):
                                    now=_NOW, machine_id="machine-A")
     assert summary == {"scanned": 0, "reaped": 0, "skipped_fresh": 0,
                        "skipped_live": 0, "skipped_other_machine": 0,
-                       "reaped_ids": []}
+                       "reaped_ids": [],
+                       #  backlog fields. Asserted in the EXACT-dict
+                       # form deliberately: this is the one test that pins the
+                       # summary's full shape, so a future field cannot be added
+                       # without a reader noticing it here.
+                       "stale_other_machine": 0, "stale_here_held_live": 0,
+                       "backlog_total": 0, "backlog_by_machine": {}}
 
 
 def test_reap_idempotent(tmp_path):
@@ -524,3 +530,144 @@ def test_reap_idempotent(tmp_path):
     assert second["scanned"] == 1
     assert second["reaped"] == 0
     assert _read(tmp_path, "zeta", "sid-once")["status"] == "unknown"
+
+
+# --- : the backlog fields ------------------------------------------
+# `reaped: 0` is the CORRECT output on a healthy box and reads as "fleet clean".
+# These pin the fields that make the difference visible. The reaping predicate is
+# deliberately untouched, so every test here asserts reaped == 0 AND that the
+# record is still `active`: a backlog counter that quietly started reaping would
+# be a far worse defect than the one it reports.
+
+def test_backlog_counts_a_stale_record_owned_by_another_machine(tmp_path):
+    _seed_record(tmp_path, "zeta", "sid-elsewhere", machine_id="machine-B")
+    summary = st.reap_stale_active(world_dir=tmp_path, project_root=tmp_path,
+                                   now=_NOW, machine_id="machine-A")
+    assert summary["reaped"] == 0
+    assert summary["skipped_other_machine"] == 1
+    assert summary["stale_other_machine"] == 1
+    assert summary["backlog_total"] == 1
+    assert summary["backlog_by_machine"] == {"machine-B": 1}
+    # untouched, not reaped
+    assert _read(tmp_path, "zeta", "sid-elsewhere")["status"] == "active"
+
+
+def test_backlog_EXCLUDES_a_fresh_record_owned_by_another_machine(tmp_path):
+    """THE POSITIVE CONTROL for the whole feature, and the reason
+    `skipped_other_machine` was never a backlog figure: a remote record that is
+    still FRESH is a healthy live session on another box, not an orphan. If this
+    test ever passes trivially (both counters equal), the backlog number has
+    degraded back into the raw skip count it was introduced to replace."""
+    _seed_record(tmp_path, "zeta", "sid-remote-live",
+                 machine_id="machine-B", started_at="2026-06-07T12:00:00")
+    summary = st.reap_stale_active(world_dir=tmp_path, project_root=tmp_path,
+                                   now=_NOW, machine_id="machine-A")
+    assert summary["skipped_other_machine"] == 1   # still skipped...
+    assert summary["stale_other_machine"] == 0     # ...but NOT backlog
+    assert summary["backlog_total"] == 0
+    assert summary["backlog_by_machine"] == {}
+
+
+def test_backlog_counts_a_stale_local_record_held_by_the_liveness_verdict(tmp_path):
+    """The SECOND residue (foxtrot, 2026-08-06): a box can print `reaped: 0`
+    with a stale record OF ITS OWN, because the liveness verdict is
+    AGENT-granular while the population is SID-granular — one live heartbeat
+    holds every record that agent owns on the box."""
+    _set_heartbeat(tmp_path, "zeta", _NOW)          # agent is live HERE
+    _seed_record(tmp_path, "zeta", "sid-stale-local")   # stale, machine-A
+    summary = st.reap_stale_active(world_dir=tmp_path, project_root=tmp_path,
+                                   now=_NOW, machine_id="machine-A")
+    assert summary["reaped"] == 0
+    assert summary["skipped_live"] == 1
+    assert summary["stale_here_held_live"] == 1
+    assert summary["backlog_total"] == 1
+    assert summary["backlog_by_machine"] == {"machine-A": 1}
+    assert _read(tmp_path, "zeta", "sid-stale-local")["status"] == "active"
+
+
+def test_backlog_is_zero_when_the_reaper_actually_reaps(tmp_path):
+    """The other half of the control: a record this box CAN reap is not backlog.
+    Backlog counts what nobody will act on, so a successful reap must leave it
+    at zero — otherwise the field would report a problem the run just fixed."""
+    _seed_record(tmp_path, "zeta", "sid-reapable")
+    summary = st.reap_stale_active(world_dir=tmp_path, project_root=tmp_path,
+                                   now=_NOW, machine_id="machine-A")
+    assert summary["reaped"] == 1
+    assert summary["backlog_total"] == 0
+    assert summary["backlog_by_machine"] == {}
+
+
+def test_backlog_by_machine_attributes_each_record_to_its_OWNING_box(tmp_path):
+    """The field exists to NAME the box to chase, so attribution is the whole
+    point: measured on cc-07 one box held 38 of 57."""
+    for i in range(3):
+        _seed_record(tmp_path, "zeta", f"sid-b{i}", machine_id="machine-B")
+    _seed_record(tmp_path, "zeta", "sid-c0", machine_id="machine-C")
+    summary = st.reap_stale_active(world_dir=tmp_path, project_root=tmp_path,
+                                   now=_NOW, machine_id="machine-A")
+    assert summary["backlog_total"] == 4
+    assert summary["backlog_by_machine"] == {"machine-B": 3, "machine-C": 1}
+
+
+def test_backlog_total_always_equals_its_two_components(tmp_path):
+    """Pins the invariant that lets a reader trust the headline number without
+    re-adding it, across a population containing BOTH residues at once."""
+    _set_heartbeat(tmp_path, "zeta", _NOW)
+    _seed_record(tmp_path, "zeta", "sid-local-stale")                    # residue 2
+    _seed_record(tmp_path, "zeta", "sid-remote", machine_id="machine-B")  # residue 1
+    _seed_record(tmp_path, "zeta", "sid-remote2", machine_id="machine-B")
+    summary = st.reap_stale_active(world_dir=tmp_path, project_root=tmp_path,
+                                   now=_NOW, machine_id="machine-A")
+    assert (summary["backlog_total"]
+            == summary["stale_other_machine"] + summary["stale_here_held_live"])
+    assert summary["backlog_total"] == 3
+    assert sum(summary["backlog_by_machine"].values()) == summary["backlog_total"]
+
+
+def _run_reap_wrapper(world):
+    """Invoke the real session-telemetry-reap.sh against `world`.
+
+    STORAGE_BACKEND=local is MANDATORY (guard-955): without it a tmp-world write
+    on an own-cloud box derives the S3 key from customer_prefix+env_id+filename,
+    NOT from the MIND_WORLD override, and collides on the PRODUCTION store."""
+    import subprocess
+    from _runtime_bash import bash_cmd   # core/scripts is already on sys.path
+
+    env = dict(os.environ, STORAGE_BACKEND="local", MIND_WORLD=str(world))
+    # parents: [0]=tests [1]=scripts [2]=core [3]=PROJECT_ROOT
+    root = Path(__file__).resolve().parents[3]
+    script = root / "core" / "scripts" / "session-telemetry-reap.sh"
+    # bash_cmd(), never ["bash", str(path)]: a bare "bash" argv[0] resolves to
+    # the WSL launcher on win32 (CreateProcess searches System32 before PATH)
+    # and hangs forever on a dead LxssManager, and str(WindowsPath) loses its
+    # backslashes to bash (guard-580 / guard-581).
+    return subprocess.run(bash_cmd(script.as_posix()),
+                          capture_output=True, text=True, env=env,
+                          cwd=root.as_posix())
+
+
+def test_reap_wrapper_exits_3_and_says_so_when_a_backlog_exists(tmp_path):
+    """guard-963's closing clause: the verdict must move the EXIT CODE, because
+    'a human-readable warning beside an unchanged rc=0 is a false clean wearing
+    a caveat'. The summary already carried skipped_other_machine and nobody read
+    it as a backlog."""
+    _seed_record(tmp_path, "zeta", "sid-remote", machine_id="machine-ZZZ")
+    proc = _run_reap_wrapper(tmp_path)
+    assert proc.returncode == 3, proc.stderr
+    assert "BACKLOG:" in proc.stderr
+    assert "machine-ZZZ" in proc.stderr          # names the box to chase
+    payload = json.loads(proc.stdout)            # stdout stays PURE json
+    assert payload["backlog_total"] == 1
+    assert payload["reaped"] == 0
+
+
+def test_reap_wrapper_exits_0_when_there_is_no_backlog(tmp_path):
+    """THE POSITIVE CONTROL for the exit code. Without this, rc=3 above is
+    indistinguishable from a wrapper that always exits 3 (guard-4166: a fix
+    whose effect is that something appears needs a control showing it NOT
+    appearing)."""
+    (tmp_path / "telemetry" / "session-records").mkdir(parents=True)
+    proc = _run_reap_wrapper(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert "BACKLOG:" not in proc.stderr
+    assert json.loads(proc.stdout)["backlog_total"] == 0

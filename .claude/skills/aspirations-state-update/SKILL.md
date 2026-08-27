@@ -67,12 +67,12 @@ After EVERY goal execution (Steps 1-8, plus Steps 8.5, 8.55, and 8.75 for deep o
      ALWAYS update both: currentStreak = new_streak, longestStreak = max(new_streak, longestStreak).
 
 1.1. CLEAR iteration-checkpoint — but NOT before `iteration-close.sh --phase
-     state-update`, which deletes it at `:3687` AFTER three probes read
-     `selected_at` from it (`:2457`/`:2483` tree-updated, `:2551`
-     metric-encoding). Pre-deleting blinds all three silently and queues a
-     spurious re-encode (measured g-115-5489). Normal path: SKIP this rm, the
-     script owns it. Ad-hoc/`/reflect` path that bypasses iteration-close: run
-     it, AFTER the phase work. Read side: `core/scripts/postcompact-restore.py`.
+     state-update`: `do_productivity_check()` deletes it AFTER three
+     `do_state_update()` probes read `selected_at` (`*SELECTED_AT=` x2,
+     `force_metric_encoding_pending`). Pre-deleting blinds
+     all three silently and queues a spurious re-encode (measured g-115-5489).
+     Normal path: SKIP this rm, the script owns it. Ad-hoc/`/reflect` path that
+     bypasses iteration-close: run it, AFTER the phase work.
      # Rationale (WHY order beats idempotence here, + the misattributing
      # diagnostic): core/config/rationale/iteration-checkpoint-delete-ownership.md
      Bash: rm -f agents/<agent>/session/iteration-checkpoint.json
@@ -566,7 +566,7 @@ IF outcome_class == "routine":
          timestamp: now
      }
      echo '<encoding_payload_json>' | wm-append.sh encoding_queue
-     Output: "▸ Step 8: COORDINATION DEFERRED — encoding queued for {node.key}"
+     IF exit 0: Output: "▸ Step 8: COORDINATION DEFERRED — queued {node.key}"
      step_8_wrote_insight = true
      step_8_tree_encoded = false
 

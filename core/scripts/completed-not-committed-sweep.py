@@ -603,10 +603,99 @@ def all_merged_on_default(records, merge_default_status):
     return True
 
 
+def _pr_repo(pr):
+    """Repo NAME from a PR record's url ('.../OWNER/REPO/pull/N' -> 'REPO').
+
+    The key for deploy_hold_status. Returns None when the url is missing or
+    unparseable, which lands on the no-information branch rather than on a
+    wrong lookup — an unparseable url must never read as CLEAR.
+    """
+    url = (pr or {}).get("url") or ""
+    parts = [x for x in url.split("/") if x]
+    if "pull" in parts:
+        i = parts.index("pull")
+        if i >= 1:
+            return parts[i - 1]
+    return None
+
+
+def build_deploy_hold_status(pr_status, repo_roots, world_path=None):
+    """{repo_name: {"held": True|False, "holders": [goal_id, ...]}} for every
+    repo carrying an OPEN pull request. Impure: shells out to
+    world/scripts/deploy-hold-check.sh, the canonical probe (guard-3139).
+
+    A repo is OMITTED — not recorded False — when the checkout cannot be found,
+    bash is unavailable, the probe errors (rc=1), or the payload will not parse.
+    Omission lands the entry on the classifier's no-information branch, which
+    keeps the pre-existing verdict. Recording False there would be a definite
+    "no hold" verdict manufactured from a plumbing failure (guard-3616), and
+    this lane files goals — so a wrong CLEAR is the expensive direction.
+
+    rc contract, from the probe's own usage: 0 CLEAR, 3 HELD, 1 usage/plumbing.
+    The 3-not-1 split exists precisely so a broken run can never read as a hold
+    nor a hold as a broken run; preserve it — do not collapse to truthiness.
+    """
+    import glob as _glob
+    import shutil as _shutil
+    import subprocess as _sp
+
+    out = {}
+    if not repo_roots:
+        return out
+    # guard-580: never argv[0]="bash" — resolve the real binary or decline.
+    bash = _shutil.which("bash")
+    world = world_path or os.environ.get("WORLD_PATH")
+    if not bash or not world:
+        return out
+    probe = os.path.join(world, "scripts", "deploy-hold-check.sh")
+    if not os.path.exists(probe):
+        return out
+
+    repos = set()
+    for rec in (pr_status or {}).values():
+        if (rec or {}).get("state") == "OPEN":
+            name = _pr_repo(rec)
+            if name:
+                repos.add(name)
+
+    for name in sorted(repos):
+        path = None
+        for root in repo_roots:
+            for cand in (os.path.join(root, name),
+                         *sorted(_glob.glob(os.path.join(root, "*", name)))):
+                if os.path.isdir(os.path.join(cand, ".git")):
+                    path = cand
+                    break
+            if path:
+                break
+        if not path:
+            continue
+        try:
+            r = _sp.run([bash, probe, "--repo", path, "--json"],
+                        capture_output=True, text=True, timeout=120)
+        except Exception:
+            continue
+        if r.returncode not in (0, 3):
+            continue  # usage/plumbing — omit, never record a manufactured CLEAR
+        holders = []
+        try:
+            payload = json.loads(r.stdout or "{}")
+            # Holder ids come from the PROBE, never from PR text — they rotate
+            # (measured 2026-08-26: PR title  vs live probe ).
+            holders = [h.get("goal_id") for h in (payload.get("holds") or [])
+                       if h.get("goal_id")]
+        except Exception:
+            if r.returncode == 3:
+                continue  # HELD but unreadable holders — no information
+        out[name] = {"held": r.returncode == 3, "holders": holders}
+    return out
+
+
 def classify_stranded(goal, now, sha_status, default_status, pr_status,
                       min_age_minutes=30.0, lookback_hours=168.0,
                       min_pr_age_hours=24.0, goalid_status=None,
-                      merge_default_status=None, sha_goalid_owners=None):
+                      merge_default_status=None, sha_goalid_owners=None,
+                      deploy_hold_status=None):
     """Pure second-tier test: the goal's commit reached origin, but only on a
     NON-DEFAULT branch. Returns a stranded entry or None. g-115-3471.
 
@@ -686,6 +775,7 @@ def classify_stranded(goal, now, sha_status, default_status, pr_status,
     if any(r.get("state") == "UNAVAILABLE" for r in records):
         return None  # forge unreachable — never convert a clean sweep to a flag
     open_prs = [r for r in records if r.get("state") == "OPEN"]
+    deploy_holders = []
     pr = None
     if open_prs:
         pr = open_prs[0]
@@ -699,7 +789,34 @@ def classify_stranded(goal, now, sha_status, default_status, pr_status,
         # enough", and the whole lane is conservative in the no-flag direction.
         if pr_age_hours is None or pr_age_hours < min_pr_age_hours:
             return None  # in flight, or age unknown — not provably stranded
-        reason = "stranded_open_pr"
+        # An open PR on an auto-deploying repo under an ACTIVE DEPLOY HOLD is
+        # not stranded — it is correctly parked, and merging it would fire the
+        # very deploy the hold exists to prevent. Filing an Investigate here
+        # asks the fleet to re-derive what world/scripts/deploy-hold-check.sh
+        # returns in seconds; it was answered identically three times
+        # (, , ) before this branch existed.
+        #
+        # Three-way, deliberately not two-way (guard-4028 / guard-3616):
+        #   held is True  -> DECISIVE hold. Reclassify benign; never swallow a
+        #                    decisive signal into the flagged verdict.
+        #   held is False -> DECISIVE clear. Keep stranded_open_pr and file.
+        #   None/absent   -> NO information (caller did not probe, or the probe
+        #                    errored). Keep the PRE-EXISTING verdict rather than
+        #                    invent a new definite one — the same contract
+        #                    merge_default_status documents above: a carve-out
+        #                    must never fire on a caller that did not supply the
+        #                    evidence for it.
+        #
+        # Holder ids ROTATE. Measured 2026-08-26: the PR title quoted 
+        # while the live probe returned  for the same repo. The holders
+        # below therefore come from the PROBE PAYLOAD and must never be read off
+        # the PR text or hardcoded.
+        _hold = (deploy_hold_status or {}).get(_pr_repo(pr))
+        if isinstance(_hold, dict) and _hold.get("held") is True:
+            reason = "stranded_deploy_held"
+            deploy_holders = [h for h in (_hold.get("holders") or []) if h]
+        else:
+            reason = "stranded_open_pr"
     else:
         pr = next((r for r in records if r.get("number")), None)
         pr_age_hours = None
@@ -742,6 +859,12 @@ def classify_stranded(goal, now, sha_status, default_status, pr_status,
                                 for s in off_default) else "goal-id"),
         "title": (goal.get("title") or "")[:80],
     }
+    if reason == "stranded_deploy_held":
+        # Top-level on purpose: the pull_request dict below is rebuilt FIELD BY
+        # FIELD, and omitting a field there has silently made a whole fork inert
+        # in production twice ( `draft`,  `body`). Keeping the
+        # holders out of that rebuild keeps this tier out of that failure class.
+        entry["deploy_holders"] = deploy_holders
     if pr and pr.get("number"):
         entry["pull_request"] = {
             "number": pr.get("number"),
@@ -807,6 +930,33 @@ def pr_declares_merge_gate(body):
         return None
     low = body.lower()
     return any(m in low for m in _MERGE_GATE_MARKERS)
+
+
+# A goal-id cited in PROSE anywhere in the body. Distinct from
+# _COMMIT_GOALID_RE, which requires parentheses because it parses
+# conventional-commit SUBJECTS (`feat(): ...`); a PR body cites the
+# id bare ("Paired with "), so that pattern matches zero of them.
+_BODY_GOALID_RE = re.compile(r"\b(g-[a-z0-9]+-\d+)\b")
+
+
+def pr_cited_goal_ids(body):
+    """Goal ids cited anywhere in a PR body, in first-appearance order.
+
+    Used ONLY to make a token-miss remedy actionable: a body that names a goal
+    is a body with a stated reason to exist, so the reader is pointed at that
+    id instead of being told to read an unspecified wall of text. It is
+    deliberately NOT used to classify the PR — resolving whether the cited goal
+    is live is the reader's job, and a detector that resolved it here would be
+    re-deriving the same positive conclusion guard-4432 forbids, one field over.
+    """
+    if not isinstance(body, str) or not body.strip():
+        return []
+    seen, out = set(), []
+    for m in _BODY_GOALID_RE.findall(body.lower()):
+        if m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
 
 
 def apply_superseded(entry, superseded_status):
@@ -1678,21 +1828,44 @@ def _file_investigate(entry):
             # advice, so the classification never happened.
             _gate = pr_declares_merge_gate(pr.get("body"))
             if _gate is False:
+                # 0-of-N IS NO EVIDENCE EITHER WAY (guard-4432). This branch
+                # used to assert "HANDOFF ARTIFACT", assert the deliverable was
+                # "verified and green", and instruct a merge — a positive
+                # conclusion AND an action instruction derived from an ABSENCE,
+                # on two repos that auto-deploy on merge to default. Measured
+                # 2-of-2 counterexamples scored 0-of-6 while carrying gates
+                # unmistakable to a reader, and 11 of 32 open drafts sat in the
+                # trap fleet-wide. The green claim was never derived from the
+                # token scan at all — nothing here reads CI — so it is simply
+                # gone rather than softened ().
+                _cited = pr_cited_goal_ids(pr.get("body"))
+                if _cited:
+                    _cite = (
+                        " The body cites " + ", ".join(_cited[:3]) + " — "
+                        "resolve that goal FIRST; a live or unresolvable "
+                        "citation is positive evidence the draft has a stated "
+                        "reason to exist.")
+                else:
+                    _cite = (
+                        " The body cites no goal id, which is likewise not "
+                        "evidence either way.")
                 _remedy = (
-                    "That pull request is a DRAFT, but its body declares NO "
-                    "merge gate — none of 'merge gate' / 'do not merge' / "
-                    "'draft on purpose' / 'blocked' / 'precondition' / "
-                    "'until' appears in it. So the draft flag here is a "
-                    "HANDOFF ARTIFACT, not an author hold: the likely history "
-                    "is a worker Body opening a draft for a reducer to "
-                    "discharge, the reducer closing this goal `completed`, and "
-                    "nobody owning the last step. The deliverable is verified "
-                    "and green and users cannot see it. REMEDY: confirm checks "
-                    "are green and the branch is current, then mark the pull "
-                    "request ready and merge it (use a merge commit, never a "
-                    "squash — guard-3465). If you find a real gate this scan "
-                    "missed, say so in the PR body IN THOSE WORDS so the next "
-                    "sweep classifies it correctly, and leave it draft.")
+                    "That pull request is a DRAFT and NO GATE TEXT MATCHED (" +
+                    str(len(_MERGE_GATE_MARKERS)) + " tokens searched: "
+                    "'merge gate' / 'do not merge' / 'draft on purpose' / "
+                    "'blocked' / 'precondition' / 'until'). THAT IS NO "
+                    "EVIDENCE EITHER WAY — it is not evidence the draft flag "
+                    "is incidental, and not evidence it is a deliberate hold. "
+                    "This scan therefore reaches NO conclusion about why the "
+                    "pull request is a draft, makes NO claim about whether its "
+                    "checks are green (nothing here reads CI), and issues NO "
+                    "merge instruction." + _cite +
+                    " REMEDY: a human or an LLM must READ the pull request "
+                    "body and decide. If it states a gate this token list "
+                    "missed, write that gate back into the body in the "
+                    "vocabulary above so the next scan classifies it "
+                    "correctly, and leave it draft. Do NOT mark it ready and "
+                    "do NOT merge it on the strength of this goal.")
             elif _gate is True:
                 _remedy = (
                     "That pull request is a DRAFT and its body DOES declare a "
@@ -1724,9 +1897,10 @@ def _file_investigate(entry):
                     "unblocked, or file one if none exists — and re-check "
                     "whether the flagged goal should have closed `completed` "
                     "at all, since its deliverable cannot ship. If the body "
-                    "turns out to declare NO gate at all, this is a handoff "
-                    "artifact instead: mark it ready and merge it (merge "
-                    "commit, never squash — guard-3465).")
+                    "turns out to declare NO gate at all, that is NO EVIDENCE "
+                    "EITHER WAY (guard-4432) and NOT a licence to merge — "
+                    "read it and decide; do NOT mark it ready on the strength "
+                    "of this goal.")
         else:
             # Observation + a verification step, NOT a bare instruction. This
             # sweep reasons only about branch containment and cannot know a
@@ -1849,6 +2023,15 @@ def main():
                          "--min-age-minutes 0: a just-closed goal is younger "
                          "than the 30-min push-throttle guard and would "
                          "otherwise be filtered out before any check runs.")
+    ap.add_argument("--repo-root", action="append", default=None,
+                    help="Directory holding local product-repo checkouts, as "
+                         "<root>/<repo> or <root>/<org>/<repo>. Repeatable. "
+                         "Enables the stranded_deploy_held carve-out: an open "
+                         "PR on a repo under an ACTIVE deploy hold is parked, "
+                         "not stranded. Domain-free by construction — when "
+                         "unpassed (and PRODUCT_REPO_ROOT is unset) the hold "
+                         "map is empty, every entry takes the no-information "
+                         "branch, and behavior is byte-identical to before.")
     ap.add_argument("--no-fetch", action="store_true",
                     help="Skip the pre-probe `git fetch` across candidate repos. "
                          "For the CLOSE-TIME caller only, where the agent just "
@@ -2006,6 +2189,11 @@ def main():
     real_flagged = [e for e in real_flagged
                     if e.get("reason") == "committed_not_pushed"]
 
+    repo_roots = args.repo_root or (
+        [os.environ["PRODUCT_REPO_ROOT"]]
+        if os.environ.get("PRODUCT_REPO_ROOT") else [])
+    deploy_hold_status = build_deploy_hold_status(pr_status, repo_roots)
+
     stranded_all = []
     for g in all_goals:
         entry = classify_stranded(
@@ -2013,7 +2201,8 @@ def main():
             args.min_age_minutes, args.lookback_hours,
             args.min_pr_age_hours, goalid_status=goalid_status,
             merge_default_status=merge_default_status,
-            sha_goalid_owners=sha_goalid_owners)
+            sha_goalid_owners=sha_goalid_owners,
+            deploy_hold_status=deploy_hold_status)
         if entry is not None:
             stranded_all.append(entry)
     stranded_all.sort(key=lambda e: e["age_hours"], reverse=True)
@@ -2032,6 +2221,8 @@ def main():
     stranded_no_pr = [e for e in stranded_all if e["reason"] == "stranded_no_pr"]
     squash_merged = [e for e in stranded_all
                      if e["reason"] == "benign_squash_merged"]
+    deploy_held = [e for e in stranded_all
+                   if e["reason"] == "stranded_deploy_held"]
     pr_probe_unavailable = sorted(
         s for s, r in pr_status.items() if r.get("state") == "UNAVAILABLE")
     if pr_probe_unavailable:
@@ -2052,8 +2243,28 @@ def main():
             gid = _file_investigate(entry)
             if gid:
                 investigate_created.append(gid)
-        # stranded_no_pr is deliberately NOT filed — a commit on a branch with no
-        # open PR may simply be a live working branch. It stays in the report.
+        # stranded_no_pr is deliberately NOT filed, and the reason is OWNERSHIP,
+        # not WIP. This note used to read "a commit on a branch with no open PR
+        # may simply be a live working branch"; that reason does not survive this
+        # sweep's own population filter, which is already restricted to goals
+        # closed status=completed — a completed goal's commit is by definition
+        # not work-in-progress. The disposition is unchanged because the real
+        # reason is stronger, and it is MEASURED: 2026-08-25 (alpha worker Body,
+        # cc-08, ), one full scanned=3012 run held 11 stranded_no_pr
+        # goals, and 9 of them sit on a refs/workers/<agent>/<sid> carrier ref —
+        # the sanctioned mid-flight state of the worker->reducer handoff, which
+        # already has TWO owners: worker-ref-consume prints the ref, its file
+        # list, its age and an exact merge command at every iteration close, and
+        #  is the recurring goal that disposes those refs. Filing from
+        # here would duplicate that owner and open an Investigate against normal
+        # operation — the over-filing  exists to bound.
+        #
+        # THE RESIDUAL IS THE PART WORTH READING. The other 2 in that run
+        # ( and , which were also the two OLDEST at ~54h) carry
+        # shas that resolve in NO local repo, so they belong to sibling product
+        # repos and neither owner above covers them. Anyone wiring this bucket to
+        # file should scope it to that class — sha resolves in no candidate repo
+        # AND no worker ref contains it — rather than to the bucket as a whole.
         for entry in stranded:
             if _existing_investigate(entry["goal_id"], all_goals,
                                      STRANDED_SIGNAL_PREFIX,
@@ -2078,6 +2289,8 @@ def main():
         "stranded_no_pr": stranded_no_pr,
         "benign_squash_merged_count": len(squash_merged),
         "benign_squash_merged": squash_merged,
+        "stranded_deploy_held_count": len(deploy_held),
+        "stranded_deploy_held": deploy_held,
         "misrouted_reachability_count": len(misrouted),
         "misrouted_reachability": misrouted,
         "benign_merged_pr_count": len(merged_pr),
@@ -2093,6 +2306,7 @@ def main():
               f"stranded={len(stranded)} stranded_no_pr={len(stranded_no_pr)} "
               f"benign_superseded={len(benign_superseded)} "
               f"benign_squash_merged={len(squash_merged)} "
+              f"stranded_deploy_held={len(deploy_held)} "
               f"misrouted_reachability={len(misrouted)} "
               f"benign_merged_pr={len(merged_pr)} "
               f"repos={len(candidate_repos)} applied={bool(args.apply)}")
@@ -2130,6 +2344,14 @@ def main():
                   f"— the sha is unreachable because the head branch is gone, "
                   f"not because the work is | "
                   f"local-only={e['shas_absent_local_only']} | {e['title']}")
+        for e in deploy_held:
+            pr = e.get("pull_request") or {}
+            holders = ", ".join(e.get("deploy_holders") or []) or "unnamed"
+            print(f"  [stranded_deploy_held log-only] {e['goal_id']} "
+                  f"({e['source']}): PR #{pr.get('number')} is parked behind an "
+                  f"ACTIVE deploy hold ({holders}); merging would fire the "
+                  f"deploy the hold exists to prevent. Not stranded — no "
+                  f"Investigate filed | {e['title']}")
         for e in squash_merged:
             pr = e.get("pull_request") or {}
             print(f"  [benign_squash_merged log-only] {e['goal_id']} "

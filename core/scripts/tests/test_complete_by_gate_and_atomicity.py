@@ -275,10 +275,20 @@ def test_write_loss_detector_does_not_yet_cover_the_counters(monkeypatch):
 
     The never-success-without-persistence check (g-115-2429) re-reads the store
     after the write and refuses to report success if the transition is missing.
-    It verifies ``status`` and ``lastAchievedAt`` only. ``achievedCount``,
-    ``currentStreak`` and ``windowStreak`` are NOT in its expectation set, so a
-    write that landed the status while losing the counters would still report
-    success.
+    On this RECURRING path it verifies ``status``, ``lastAchievedAt`` and — since
+    g-115-7202 — ``claimed_by`` / ``claimed_at``. ``achievedCount``,
+    ``currentStreak`` and ``windowStreak`` are STILL NOT in its expectation set,
+    so a write that landed the status while losing the counters would still
+    report success. That blind spot is what this test characterizes, and it is
+    unchanged; only the claim pair was added.
+
+    WIDENED ONCE ALREADY (g-115-7202, 2026-08-23): the claim pair joined the set
+    because neither previously-verified field could witness the in-lock claim pop
+    on a recurring close — ``status`` cycles back to ``pending`` (unchanged by the
+    write) and ``lastAchievedAt`` is MONOTONIC in coordination_merge._merge_goal
+    ("strictly-newer wins"), so it survives a per-field reconcile independently of
+    the claim fields. This test going red is what forced that widening to be
+    acknowledged rather than absorbed silently — the tripwire working as designed.
 
     This is recorded in code rather than only in a goal note because it bears
     directly on why the g-326-85 mechanism stayed unknown: the detector also
@@ -303,7 +313,16 @@ def test_write_loss_detector_does_not_yet_cover_the_counters(monkeypatch):
             _rt.aspirations_complete_by(GOAL_ID, source="world", agent_name="alpha")
 
     assert seen, "the persistence detector did not run at all"
-    assert set(seen["expected"]) == {"status", "lastAchievedAt"}, (
+    assert set(seen["expected"]) == {"status", "lastAchievedAt",
+                                     "claimed_by", "claimed_at"}, (
         f"the detector's expectation set changed to {sorted(seen['expected'])}. "
         "If counters were ADDED, that is an improvement — update this test's "
         "docstring and assertion rather than reverting the widening.")
+    # The characterized blind spot itself, asserted explicitly rather than left
+    # implicit in the exact-set match above: the counters are the SUBJECT of this
+    # test, so a future widening that adds them should fail on a message that
+    # says so.
+    assert not ({"achievedCount", "currentStreak", "windowStreak"}
+                & set(seen["expected"])), (
+        "a counter entered the expectation set — that is the improvement this "
+        "test's docstring invites. Update the docstring and both assertions.")

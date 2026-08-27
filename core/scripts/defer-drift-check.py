@@ -91,7 +91,9 @@ Reference: g-115-1406.
 import argparse
 import datetime as dt
 import json
+import os
 import re
+import socket
 import sys
 from pathlib import Path
 
@@ -103,6 +105,11 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, )
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
+
+# Canonical path + fileop primitives (same SSOT as the writing siblings
+# precondition-defer-recheck.py / defer-recheck.py — rb-468 family).
+from _paths import WORLD_DIR  # noqa: E402
+from _fileops import locked_append_jsonl  # noqa: E402
 
 # The three STRUCTURED_DEFER_PREFIXES (single source of truth:
 # core/scripts/gates/defer_classifier.py). Imported when available so a future
@@ -317,6 +324,46 @@ def _classify_drift(goal, now, min_hours_past=0.0, on_schedule_window_days=1):
     return entry
 
 
+# --- Metrics logging (mirrors precondition-defer-recheck.py — rb-468 family) -
+#
+# WHY THIS EXISTS (, 2026-08-25). This script was the ONLY member of
+# the defer-recheck detective family with no metrics ledger: its three writing
+# siblings all append to world/*-metrics.jsonl, while this one emitted to stdout
+# and discarded every observation. Hypothesis
+# 2026-08-18_drifted-defers-enriched-for-permanent-premises needs n>=8 DISTINCT
+# drifted goals accumulated over time to resolve; drift is rare (measured
+# scanned=2926 drift_count=0 on 2026-08-25), so the population can only ever be
+# built by accumulation. With no writer, n could never leave 0 and the
+# hypothesis was unresolvable BY CONSTRUCTION, not by rarity — the failure mode
+# it was filed to study.
+#
+# The record carries drifted[] only (usually empty) plus scalar counts, so a
+# ledger written on every precheck stays small: the siblings that log full
+# populations are already 1.3 MB.
+
+
+def _resolve_metrics_log(cli_path):
+    """Resolve metrics log path. cli_path=='' -> disabled; None -> default."""
+    if cli_path == "":
+        return None
+    if cli_path is not None:
+        return Path(cli_path)
+    return Path(WORLD_DIR) / "defer-drift-metrics.jsonl"
+
+
+def _append_metric(path, record):
+    """Append one record to metrics JSONL. Fail-open: a write failure stays
+    visible on stderr but never aborts the sweep (this is a detective; losing
+    a datapoint must not cost the caller its drift verdict)."""
+    if path is None:
+        return
+    try:
+        locked_append_jsonl(str(path), record)
+    except Exception as e:
+        print(f"[defer-drift-check] WARN: metrics append failed: {e}",
+              file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=("Flag goals whose deferred_until is PAST while a "
@@ -336,7 +383,12 @@ def main():
                           "expiry (g-115-1541 FP) rather than drift (default "
                           "1). Calibrated from the incident: on-schedule delta "
                           "~0d vs genuine drift ~46d."))
+    ap.add_argument("--metrics-log", default=None,
+                    help=("Path to the drift metrics JSONL. Omit for the "
+                          "default (world/defer-drift-metrics.jsonl); pass an "
+                          "empty string to disable logging."))
     args = ap.parse_args()
+    metrics_path = _resolve_metrics_log(args.metrics_log)
 
     now = dt.datetime.now()
     all_goals = _read_goals("world") + _read_goals("agent")
@@ -373,6 +425,30 @@ def main():
         "on_schedule_expiry": on_schedule,
         "now": now.isoformat(timespec="seconds"),
     }
+
+    # Accumulate the observation BEFORE emitting, so a broken stdout consumer
+    # cannot cost the ledger a datapoint. Naive-UTC stamp per the fleet clock
+    # convention (TZ=UTC enforced in .claude/settings.json) — guard-2613.
+    _append_metric(metrics_path, {
+        "ts": now.isoformat(timespec="seconds"),
+        "agent": os.environ.get("MIND_AGENT") or None,
+        "host": socket.gethostname(),
+        "scanned": scanned,
+        "drift_count": len(drifted),
+        "on_schedule_expiry_count": len(on_schedule),
+        "min_hours_past": args.min_hours_past,
+        "on_schedule_window_days": args.on_schedule_window_days,
+        "drifted": [
+            {
+                "goal_id": d["goal_id"],
+                "source": d["source"],
+                "defer_prefix": d["defer_prefix"],
+                "hours_past": d["hours_past"],
+                "precondition_status": d["precondition_status"],
+            }
+            for d in drifted
+        ],
+    })
 
     if args.output == "human":
         print(f"scanned={scanned} drift_count={len(drifted)} "

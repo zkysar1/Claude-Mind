@@ -322,7 +322,7 @@ IF goals_completed_this_session % 5 == 0:
                 Output: "▸ ENCODING DRIFT RECOVERY: forced encoding to {node.key} (score {top.encoding_score:.2f})"
         ELSE:
             echo '{"node_key": "general", "reason": "encoding_drift_checkpoint", "source_goal": "periodic-5-goal", "priority": "HIGH", "created": "'"$(date +%Y-%m-%d)"'"}' | Bash: wm-append.sh knowledge_debt
-            Output: "▸ ENCODING DRIFT WARNING: no encodable items found — logged HIGH-priority knowledge debt"
+            IF exit 0: Output: "▸ ENCODING DRIFT: no encodable items — logged HIGH-priority knowledge debt"
 
     # Q6: Tree growth check (are decompose candidates accumulating?)
     Bash: tree-read.sh --decompose-candidates

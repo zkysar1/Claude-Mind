@@ -312,5 +312,67 @@ def test_dedup_return_marks_fired_no_respam(wd, tmp_path):
     assert len(attempts) == 1                            # filed once, no spam
 
 
+def test_persistent_wedge_reopens_latch_and_refiles(wd, tmp_path):
+    """: the `fired` latch MUST re-arm while the wedge persists.
+
+    `fired` is written False only on the `healthy` branch, so during a
+    persistent wedge the probe never writes the negative -- a latch by
+    guard-4870's definition ("a store written ONLY inside its own fire
+    condition"). Measured on cc-04: consecutive_wedged=981, fired=true, and
+    ZERO open wedge goals. The box was wedged, un-goaled and un-refileable,
+    because `not self.fired` short-circuits BEFORE _file_wedge_goal()'s own
+    open_goal_exists() dedup is ever reached.
+
+    Models the exact latched state: the wedge never clears AND the filer would
+    succeed (i.e. no open goal covers this box any more).
+
+    The interval is READ OFF THE CLASS, never hardcoded -- guard-3560 step 3
+    is a value enshrined in a test that then blocks its own correction.
+    """
+    filed = []
+    N = wd.MirrorWedgeProbe.WEDGED_TICKS_TO_REVALIDATE
+    assert N > wd.MirrorWedgeProbe.WEDGED_TICKS_TO_FILE, "revalidation must outlast the fire threshold"
+    probe, fake = _mk_probe(wd, tmp_path, [W] * (N + 5), filed)
+
+    _run_ticks(probe, fake, N - 1)
+    assert len(filed) == 1, "episode dedup must hold BETWEEN re-validations (no respam)"
+    assert probe.fired is True
+
+    _run_ticks(probe, fake, 1)                 # tick N -- the re-validation tick
+    assert len(filed) == 2, (
+        "latch must re-open so the filer can re-decide; without this a box stays "
+        "wedged + un-goaled forever (cc-04: 981 ticks)")
+
+
+def test_revalidation_does_not_respam_while_goal_still_open(wd, tmp_path):
+    """The bound on the  re-arm: when a goal IS still open the filer
+    returns dedup, so re-validation costs one open_goal_exists() read per N
+    wedged ticks and creates NO second goal. This is what keeps the re-arm from
+    reintroducing the spam that test_dedup_return_marks_fired_no_respam pins.
+    """
+    ctx = wd.WatchdogContext(agent_name="testagent", agent_dir=tmp_path,
+                             project_root_path=tmp_path)
+    probe = wd.MirrorWedgeProbe(ctx)
+    attempts = []
+
+    def _fake_file(v):
+        attempts.append(1)
+        return {"filed": False, "dedup": True, "goal_id": None,
+                "error": "open goal exists (dedup)"}
+    probe._file_wedge_goal = _fake_file
+
+    class FakeMH:
+        @staticmethod
+        def probe():
+            return W
+
+    N = wd.MirrorWedgeProbe.WEDGED_TICKS_TO_REVALIDATE
+    _run_ticks(probe, FakeMH, 2 * N + 1)
+    # Exactly: initial fire at tick 2, re-validation at tick N and at tick 2N.
+    # Three store consultations across 2N+1 ticks -- not one per tick.
+    assert len(attempts) == 3, f"expected 3 bounded consultations, got {len(attempts)}"
+    assert probe.fired is True
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

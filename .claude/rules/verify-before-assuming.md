@@ -107,25 +107,24 @@ inferred mechanism is falsified.
 conclusion too — the build-side twin of "X doesn't exist"; when wrong it
 builds a duplicate. **Rule**: before concluding something must be built, apply
 rule 1 plus the exhaustive knowledge search of
-`core/config/conventions/exhaustive-search-before-negation.md` — codebase,
-skill/script registry, `world/forged-skills.yaml`, knowledge tree,
-`world/conventions/` — and only when 2+ independent surfaces come back empty is
+`core/config/conventions/exhaustive-search-before-negation.md` (it carries
+the surface list) — and only when 2+ independent surfaces come back empty is
 "needs to be built" verified rather than assumed.
 
 ## Anti-patterns
 
 - One failed curl = "it's down"; `curl -sf` returns empty = "service not
   running" (silent 404 ≠ connection refused); SSH refused = "server is down"
-  (could be a stale host key)
+  (could be a stale host key); ping exit 0 / "0% loss" = "host is up" — a
+  third host's "unreachable" reply COUNTS as received (0% loss for a dead
+  box); require `Reply from <TARGET>: bytes=` (guard-4902)
 - "I tried and it didn't work" without trying an alternative approach
-- One tree search = "it's not built" (search multiple queries, categories, and
-  data stores)
 - "98% of records have X=0" without probing whether X is the correct field
   name (rb-245)
 - "X is the way it is because Y caused it" without checking whether Y
   actually caused X (rb-734)
-- "We need to build a script/gate for X" without grepping `core/scripts/`,
-  `world/forged-skills.yaml`, and the tree first
+- One tree search = "it's not built" / "we need to build X" — run the
+  Capability-Absence search above
 - Trusting a task notification's exit 0 without reading the log (guard-1431,
   guard-1341, guard-1150, guard-1096)
 

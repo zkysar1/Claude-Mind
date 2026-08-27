@@ -61,7 +61,8 @@ fi
 # Capture Python output so --and-file can parse WROTE_AGENT markers afterwards.
 # We print the captured output verbatim after the heredoc so the user-visible
 # stream is identical to pre-flag behavior.
-ANALYZE_OUT=$(python3 - "$LOG_PATH" "$STALL_THRESHOLD" "$STALL_WINDOW_SEC" "$PROJECT_ROOT" "$WORLD_DIR" <<'PY'
+ANALYZE_OUT=$(AGENTS_PARENT_DIR="$AGENTS_PARENT_DIR" \
+  python3 - "$LOG_PATH" "$STALL_THRESHOLD" "$STALL_WINDOW_SEC" "$PROJECT_ROOT" "$WORLD_DIR" <<'PY'
 import sys, re, json, os
 from datetime import datetime, timedelta
 
@@ -186,7 +187,9 @@ for agent, latest in warnings.items():
     # Phase 2.5.D: agent dirs live under agents/ parent — was previously
     # os.path.join(proj_root, agent, "session") which resolved to a
     # non-existent path → every warning skipped with "no session dir".
-    agent_dir = os.path.join(proj_root, "agents", agent, "session")
+    # : segment constant-routed via the env (guard-604 + guard-165).
+    agent_dir = os.path.join(
+        proj_root, os.environ["AGENTS_PARENT_DIR"], agent, "session")
     if not os.path.isdir(agent_dir):
         print(f"stop-hook-analyze: no session dir for {agent}, skipping", file=sys.stderr)
         continue

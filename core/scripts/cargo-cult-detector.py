@@ -752,7 +752,29 @@ def _propose_new_interval(goal: dict, cfg: dict) -> float | None:
     # can no longer ratchet upward on each batch apply.
     original = float(goal.get("original_interval_hours") or interval_h)
     proposed = min(float(interval_h) * multiplier, original * cap_ratio)
-    return proposed if proposed > interval_h else None
+    if proposed <= interval_h:
+        return None
+    # : once a goal approaches its cap (original x cap_ratio), the
+    # min() above TRUNCATES the multiplier step to a residue rather than
+    # suppressing it, so the goal keeps emitting a proposal that cannot change
+    # behaviour. Measured 2026-08-26 across all 134 recurring goals that would
+    # emit today:  1093 -> 1093.5h (+0.046%) and 
+    # 1230 -> 1230.186h (+0.015%). Both consume a batch-review slot and ask an
+    # agent for a judgement whose two outcomes are indistinguishable.
+    #
+    # THE THRESHOLD VALUE IS NOT LOAD-BEARING AND MUST NOT BE TUNED AS IF IT
+    # WERE. The delta distribution is bimodal with an EMPTY BAND: those two
+    # rows sit at 0.015% and 0.046%, and the next-smallest legitimate step is
+    # 28.57% (partial cap-binds cluster at 28.57/33.33%, clean steps at 50%).
+    # Every threshold from 0.5% through 10% suppresses exactly the same 2 of
+    # 134. 1% is chosen as the CONSERVATIVE end of that band -- suppression is
+    # the destructive direction (a dropped row is never reviewed), so a future
+    # partial cap-bind landing at 3-5% should survive rather than vanish.
+    # Re-measure the band before changing this; do not reason from the number.
+    min_ratio = float(cfg.get("min_materiality_ratio", 0.01))
+    if (proposed - float(interval_h)) / float(interval_h) < min_ratio:
+        return None
+    return proposed
 
 
 def _recent_audit_all_batch(hours: float) -> bool:

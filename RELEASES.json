@@ -1,5 +1,27 @@
 [
   {
+    "version": "2.12.5",
+    "previous_version": "2.12.4",
+    "date": "2026-08-27",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "re-cut of v2.12.4 for the Claude-Mind hop: adds the reconstructed roblox-place-geometry-check SKILL.md so seed-preflight forged-skill-tagging passes; payload otherwise = v2.12.4 (coach false-HELD claim-store fix rb-9401, runner_acquire store_error, 80+ fleet fixes)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.12.4",
+    "previous_version": "2.12.3",
+    "date": "2026-08-27",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "coach false-HELD fix: the git-ref claim store distinguishes an unwritable remote from a lost lease (rb-9401); runner_acquire returns store_error; default_remote honours a claims remote; plus 80+ fleet fixes since v2.12.3",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.3",
     "previous_version": "2.12.2",
     "date": "2026-08-23",

@@ -94,17 +94,16 @@ re-reading.
 # self-contained form. It can also read rc=0 when piped (guard-1150) — judge by
 # the OUTPUT, never the exit status.
   # (a) YOUR OWN SERIES ROW — two levels down, and the ONLY place the readings live.
-  #     ⚠ THE SHARDS HAVE DIVERGED — THERE IS NO FLEET-WIDE "TOP" OR "TAIL". This
-  #     line read "Read its TOP entry" until 2026-08-12, and guard-3312's action_hint
-  #     still asserted the shards are "newest-FIRST". Measured that day (bravo, cc-05,
-  #     all five shards): alpha IS newest-first (N=66 at line 129, archived rows at
-  #     1031) — so the old instruction was right for the agent who wrote it — while
-  #     bravo (N=18..N=41) and foxtrot (N=38..N=42) are OLDEST-first with the newest
-  #     point at the TAIL, and echo/zeta are index/rollup splits in a third shape
-  #     entirely. So `sed '1,140p'` returns alpha's NEWEST row and bravo's OLDEST
-  #     rows, silently, and both look like a series. Note the bravo-specific
-  #     "read the TAIL" correction recorded at N=40 is the same mistake mirrored —
-  #     do not adopt it fleet-wide either.
+  #     ⚠ NO FLEET-WIDE "TOP" OR "TAIL" — THE SHARDS DIVERGED AND GET RESTRUCTURED
+  #     WITHOUT ANNOUNCEMENT. Measured twice, 12 days apart, all five shards:
+  #     `sed '1,140p'` returns one agent's NEWEST row and another's OLDEST, and
+  #     both look like a series. One shard is now NEITHER — an off-by-SEVEN that
+  #     overwrote six successors' slots — and an ordering classifier passes
+  #     VACUOUSLY on the shards with zero `## N=` headings (guard-1922). Yours may
+  #     describe only yours (guard-3487). "Read the TOP" and "read the TAIL" have
+  #     EACH been wrong for some agent at some date. Dated readings, verbatim:
+  #     `core/config/fresh-eyes-shard-readings.md` — APPEND THERE, never here
+  #     (this file is over its injection ceiling; g-115-6690).
   #     DERIVE N AS THE MAX OVER SECTION HEADINGS — order-independent, so it is
   #     correct under every layout above. Exclude forward-reference headings
   #     ("Handoff to N=k"): those name an entry that does not exist yet (guard-2653).

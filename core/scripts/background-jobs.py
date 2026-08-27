@@ -56,7 +56,15 @@ def read_data():
         return {"jobs": [], "last_updated": None}
     try:
         data = yaml.safe_load(JOBS_PATH.read_text(encoding="utf-8")) or {}
-    except Exception:
+    except Exception as e:
+        # NEVER swallow silently: a corrupt/unreadable store must not be
+        # indistinguishable from an empty one at the call site. stop-hook Gates
+        # 2.5/2.6 read this store to decide whether pending work exists, so a
+        # silent empty here reads as "nothing pending" and lets a turn end.
+        # (verify-before-assuming Rule 4 — a swallowed failure is ZERO signals,
+        # not one.) .
+        log(f"READ FAILED for {JOBS_PATH}: {type(e).__name__}: {e} — "
+            f"returning EMPTY, which is NOT proof the store is empty")
         return {"jobs": [], "last_updated": None}
     if "jobs" not in data or not isinstance(data["jobs"], list):
         data["jobs"] = []

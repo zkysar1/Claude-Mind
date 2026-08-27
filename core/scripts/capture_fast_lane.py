@@ -166,6 +166,25 @@ def _flagged(entries) -> list:
             if isinstance(e, dict) and e.get("load_bearing")]
 
 
+def _lane_total(entries) -> int:
+    """Denominator for the flagged:total ratio — every entry, flagged or not.
+
+    `flagged_seen` alone is UNINTERPRETABLE (guard-4054): 40 flagged cannot
+    distinguish 40-of-50 (the flag has stopped discriminating) from 40-of-400
+    (healthy). The flag buys eviction-exemption and fast-lane priority, so both
+    of those powers decay as the ratio rises — at 80% the exemption forces
+    flagged-vs-flagged eviction, which is the plain FIFO it exists to prevent,
+    and the priority merge promotes 80% of the lane. Nothing measured this
+    ratio, which is why the degradation was invisible (g-306-365).
+
+    Callers pass None instead of this when the denominator is UNMEASURABLE —
+    see the carrier note in `_merge_flagged`. None is not 0: reporting an
+    unknown denominator as zero would let the instrument express a value it
+    cannot measure (the same reasoning `_age_minutes` gives for returning None).
+    """
+    return len(entries) if isinstance(entries, list) else 0
+
+
 def _age_minutes(entry, now: datetime):
     """Minutes from the entry's _item_ts to now, or None if unparseable.
 
@@ -205,6 +224,26 @@ def fast_lane(agent: str, project_root: Path | None = None,
         "flagged_seen": 0,       # flagged entries found across all Bodies
         "merged": 0,             # flagged entries NEW to the reducer WM this run
         "already_present": 0,    # flagged but already merged (the steady state)
+        #  — the DENOMINATOR. `flagged_seen` on its own cannot say
+        # whether the flag still discriminates, and that is the whole failure
+        # mode: the flag buys eviction-exemption AND fast-lane priority, so as
+        # the flagged share rises both powers decay toward the plain FIFO they
+        # exist to prevent. Nothing measured the share, so the degradation was
+        # structurally invisible — no gate could catch it (the flag is
+        # honour-system by design) and no cadence reported it.
+        #
+        # SCOPED TO THE sessions/ PASS ON PURPOSE. The carrier ships ONLY
+        # flagged entries (body_capture_carrier.py:24), so folding it in would
+        # report flagged/flagged = 100% for every remote Body — a denominator
+        # that is not merely wrong but wrong in the alarming direction. Its
+        # flagged entries still count in `flagged_seen`; they are excluded from
+        # `flagged_measurable` so the pair below is always like-for-like.
+        # `flagged_seen - flagged_measurable` is therefore the flagged
+        # population whose share is genuinely UNKNOWN from here, and that is a
+        # real limit of this instrument rather than a gap to paper over.
+        "entries_seen": 0,        # all entries (flagged or not), sessions/ pass
+        "flagged_measurable": 0,  # the numerator that PAIRS with entries_seen
+        "by_slot_ratio": {},      # {slot: {"flagged": N, "total": M}}
         "by_slot": {},
         "by_body": {},
         "latency_minutes_median": None,
@@ -248,10 +287,34 @@ def fast_lane(agent: str, project_root: Path | None = None,
         A second copy for the carrier would be the same drift this module's
         docstring refuses for _content_hash: the two paths' notions of "already
         merged" would diverge and produce duplicates precisely when both run.
+
+        Takes (slot_name, flagged, total) triples. `total` is the lane's full
+        entry count for the flagged:total ratio, or None where the source
+        cannot supply one (the carrier — see `_lane_total`).
         """
         nonlocal changed
         contributed = 0
-        for slot_name, flagged in slot_pairs:
+        for slot_name, flagged, total in slot_pairs:
+            # DENOMINATOR BEFORE THE SKIP BELOW, deliberately. A Body holding
+            # 50 entries and 0 flagged is a HEALTHY lane and is exactly the
+            # observation the ratio needs; counting it only when it already has
+            # a flagged entry would restrict the population to Bodies that pass
+            # the very test being measured and bias the share upward. That is
+            # the same selection effect the ratio exists to expose, so it must
+            # not be baked into the instrument.
+            # `total or flagged` — an entirely ABSENT lane contributes no row at
+            # all. A {flagged: 0, total: 0} row expresses a share that does not
+            # exist and would hand any downstream reader of the telemetry JSONL
+            # a division by zero; omitting it is the same reasoning `_age_minutes`
+            # applies to an unparseable stamp. Caught by the negative control in
+            # test_ratio_absent_when_no_capture_entries_exist.
+            if total is not None and (total or flagged):
+                row = summary["by_slot_ratio"].setdefault(
+                    slot_name, {"flagged": 0, "total": 0})
+                row["flagged"] += len(flagged)
+                row["total"] += total
+                summary["flagged_measurable"] += len(flagged)
+                summary["entries_seen"] += total
             if not flagged:
                 continue
             summary["flagged_seen"] += len(flagged)
@@ -323,8 +386,12 @@ def fast_lane(agent: str, project_root: Path | None = None,
         if not isinstance(body_slots, dict):
             continue
 
+        # The sessions/ WM is the FULLER record — it holds every entry, flagged
+        # or not (see the carrier note below) — so it is the one source that can
+        # supply a denominator.
         contributed = _merge_flagged(
-            (s, _flagged(body_slots.get(s))) for s in CAPTURE_SLOTS)
+            (s, _flagged(body_slots.get(s)), _lane_total(body_slots.get(s)))
+            for s in CAPTURE_SLOTS)
 
         if contributed:
             summary["bodies_contributing"] += 1
@@ -345,8 +412,14 @@ def fast_lane(agent: str, project_root: Path | None = None,
         if unit_key not in seen_bodies:
             summary["bodies_scanned"] += 1
             seen_bodies.add(unit_key)
+        # None, not a count: the carrier ships ONLY flagged entries
+        # (body_capture_carrier.py:24), so its "total" would equal its flagged
+        # count and report 100% for every remote Body. These entries still
+        # count in `flagged_seen`; they are excluded from the ratio pair, and
+        # the difference is reported as denominator-unmeasurable rather than
+        # folded in silently.
         contributed = _merge_flagged(
-            (s, _flagged(by_slot.get(s))) for s in CAPTURE_SLOTS)
+            (s, _flagged(by_slot.get(s)), None) for s in CAPTURE_SLOTS)
         if not contributed:
             continue
         summary["carrier_merged"] += contributed
@@ -390,6 +463,54 @@ def _append_telemetry(state_dir: Path, summary: dict) -> None:
         pass
 
 
+def _ratio_fragment(summary: dict) -> str:
+    """The flagged:total share per lane, for the reducer's close output.
+
+    Appears on EVERY non-refused branch including the 0-merged one, and that
+    is the load-bearing part rather than a formatting nicety (guard-3221). A
+    lane sitting at 80% flagged with nothing NEW to merge is precisely the
+    state this report exists to surface — everything already merged is the
+    steady state, not an absence of signal — so a ratio that printed only when
+    `merged` was non-zero would be silent exactly when it matters most.
+
+    Prints flagged AND total, never a bare percentage (guard-4054: a rate is
+    uninterpretable without the arrival count beside it).
+    """
+    # THE REMAINDER IS COMPUTED ABOVE BOTH EARLY RETURNS, deliberately
+    # (fresh-eyes F1 on ). Carrier-sourced flagged entries carry no
+    # denominator, and when they are the ONLY flagged entries -- the ordinary
+    # CROSS-BOX case, which is what this lane exists for -- `by_slot_ratio` is
+    # empty and `parts` is empty, so both guards below fire. Computing the
+    # remainder after them left the caveat UNREACHABLE in exactly that case:
+    # the reducer printed no share information at all, byte-indistinguishable
+    # from a lane nobody measured. That is the defect this report was filed to
+    # fix, reproduced inside the fix for it.
+    unmeasurable = ((summary.get("flagged_seen") or 0)
+                    - (summary.get("flagged_measurable") or 0))
+
+    per = summary.get("by_slot_ratio")
+    parts = []
+    if isinstance(per, dict):
+        for slot in sorted(per):
+            row = per[slot] or {}
+            fl, tot = row.get("flagged", 0), row.get("total", 0)
+            if not tot:
+                continue
+            parts.append(f"{slot} {fl}/{tot}={100.0 * fl / tot:.0f}%")
+    if not parts:
+        # No measurable lane. Report the unmeasurable population when there is
+        # one; stay silent ONLY when there is genuinely nothing to say -- the
+        # empty-lane case pinned by test_ratio_absent_when_no_capture_entries_exist.
+        if unmeasurable > 0:
+            return (" | load-bearing share: none measurable "
+                    f"({unmeasurable} flagged carrier-sourced, no denominator)")
+        return ""
+    frag = " | load-bearing share: " + ", ".join(parts)
+    if unmeasurable > 0:
+        frag += f" (+{unmeasurable} carrier-sourced, share unmeasurable)"
+    return frag
+
+
 def format_line(summary: dict) -> str:
     """The one-line form for the reducer's existing iteration-close output."""
     if summary.get("role_refused"):
@@ -397,7 +518,8 @@ def format_line(summary: dict) -> str:
     if not summary.get("merged"):
         return ("[capture-fast-lane] 0 load-bearing captures to merge "
                 f"({summary.get('bodies_scanned', 0)} Bodies scanned, "
-                f"{summary.get('already_present', 0)} already merged)")
+                f"{summary.get('already_present', 0)} already merged)"
+                + _ratio_fragment(summary))
     med = summary.get("latency_minutes_median")
     med_s = f"{med}m" if med is not None else "n/a"
     unmeas = summary.get("latency_unmeasurable") or 0
@@ -416,7 +538,8 @@ def format_line(summary: dict) -> str:
             f"{summary['bodies_contributing']}/{summary['bodies_scanned']} Bodies "
             f"— median flag-to-merge {med_s}, max "
             f"{summary.get('latency_minutes_max')}m{tail} "
-            f"[{', '.join(f'{k}={v}' for k, v in sorted(summary['by_slot'].items()))}]")
+            f"[{', '.join(f'{k}={v}' for k, v in sorted(summary['by_slot'].items()))}]"
+            + _ratio_fragment(summary))
 
 
 def main(argv=None) -> int:

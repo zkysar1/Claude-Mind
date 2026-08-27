@@ -456,6 +456,40 @@ def _get_pruning_config(config):
     return config.get("working_memory_pruning", defaults)
 
 
+# TWIN of core/scripts/wm.py::_normalize_spark_capture_entry (,
+# guard-742 twin discipline — this is the LIVE daemon path; the CLI copy is
+# the fallback, so a fix applied to only one of them is inert in production).
+# Rationale, measurement and the guard-1565/guard-3970 reasoning for why this
+# normalizes at the WRITER instead of adding a reader-side fallback chain live
+# in the wm.py copy — read it there before changing either.
+_SPARK_CAPTURE_META_KEYS = frozenset({
+    "goal_id", "category", "load_bearing", "sq_trigger", "_item_ts",
+})
+_SPARK_CAPTURE_MIN_CONTENT = 40
+
+
+def _normalize_spark_capture_entry(item):
+    """Promote an improvised content key into `observation`; return that key
+    or None. Normalizes rather than raising — a worker mid-close cannot
+    recover from a rejected append, and losing the observation is the exact
+    failure this prevents."""
+    if not isinstance(item, dict):
+        return None
+    if str(item.get("observation") or "").strip():
+        return None
+    best_key, best_val = None, ""
+    for k, v in item.items():
+        if k == "observation" or k in _SPARK_CAPTURE_META_KEYS:
+            continue
+        if isinstance(v, str) and len(v.strip()) > len(best_val):
+            best_key, best_val = k, v.strip()
+    if best_key is None or len(best_val) < _SPARK_CAPTURE_MIN_CONTENT:
+        return None
+    item["observation"] = best_val
+    item["observation_normalized_from"] = best_key
+    return best_key
+
+
 def _validate_knowledge_debt_entry(ctx, item) -> None:
     """wm.py _validate_knowledge_debt_entry — raises ValueError (caller -> 400)."""
     priority = item.get("priority")
@@ -683,6 +717,11 @@ def append_slot(ctx) -> "Response":  # type: ignore[name-defined]
             _validate_knowledge_debt_entry(ctx, item)
         except ValueError as e:
             return Response.error(400, "validation_failed", str(e))
+
+    # : promote improvised content keys into `observation` BEFORE the
+    # entry is persisted, so every downstream reader sees the canonical shape.
+    if root_slot_for_validation == "spark_capture" and isinstance(item, dict):
+        _normalize_spark_capture_entry(item)
 
     # : initialized OUTSIDE the try so every return path can report it.
     # A name defined only inside the array branch would NameError on a scalar
@@ -948,6 +987,120 @@ def clear_slot(ctx) -> "Response":  # type: ignore[name-defined]
         return Response.error(500, "write_failed", str(e))
 
     return Response.json({"ok": True, "slot": slot})
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/wm/drain-goals
+# ---------------------------------------------------------------------------
+
+def drain_goals(ctx) -> "Response":  # type: ignore[name-defined]
+    """POST /v1/wm/drain-goals?slot=  body: JSON array of goal ids.
+
+    Subtractive drain of a capture lane: removes every entry whose `goal_id` is
+    in the posted set and keeps everything else. g-115-7366 — `exp_capture` and
+    `encoding_capture` had readers and NO drain site anywhere in the tree. The
+    cap then decides only the SYMPTOM: a capped lane parks at cap and evicts its
+    oldest entry silently on every append, an uncapped one grows without bound
+    (measured 2026-08-24: spark 50/50, exp 20/20, hyp 10/10, encoding 931).
+
+    WHY A HANDLER AND NOT A READ-FILTER-`set` IN THE CALLER (guard-3881). A
+    caller that reads the slot, decides outside the lock, then POSTs the whole
+    surviving list to /v1/wm/set performs a full-slot OVERWRITE of a stale
+    snapshot: anything appended between its read and its write is destroyed.
+    guard-3881 requires the candidate predicate to be re-asserted INSIDE the
+    write lock, and guard-364's "hold the lock across the read-modify-write" is
+    explicitly not enough. This file already carries the proof, in `set_slot`'s
+    loop_state branch, whose CAS exists because "a >10s stall lets a peer
+    stale-break this lock and write" — the WM lock is stale-breakable, so even a
+    correctly-held lock does not make an overwrite safe.
+
+    Applying the filter HERE makes the operation a genuine SUBTRACTION rather
+    than an overwrite, which is what removes the hazard rather than narrowing
+    its window: an entry this handler never saw is either not in the drained set
+    (and survives, because the surviving list is derived from data read under
+    THIS lock) or is in it (and removing it is correct anyway). No CAS is needed
+    because the operation is idempotent and order-independent — which the
+    loop_state counter merge is not.
+
+    Scoped to CAPTURE_SLOTS on purpose: this is the only destructive goal-keyed
+    primitive in the WM surface, and a lane outside the capture set should widen
+    it deliberately rather than inherit it.
+
+    Deliberately has NO wm.py CLI twin, unlike the other eight handlers. The
+    wrappers are daemon-only (`.claude/rules/no-python-cli-fallback.md`), so a
+    twin would have zero callers, and `core/config/verification-checklist.md`
+    pins wm.py at nine subcommands. The asymmetry is a choice, not drift.
+    """
+    from ..server import Response
+
+    err = _require_agent_header(ctx)
+    if err:
+        return err
+    slot = (ctx.query.get("slot") or "").strip()
+    if not slot:
+        return Response.error(400, "missing_param", "query parameter 'slot' required")
+    if slot not in CAPTURE_SLOTS:
+        return Response.error(
+            400, "slot_not_drainable",
+            f"drain-goals is scoped to capture lanes {list(CAPTURE_SLOTS)}; "
+            f"refused '{slot}'")
+
+    raw = (ctx.body or b"").decode("utf-8").strip()
+    if not raw:
+        return Response.error(400, "empty_body", "JSON array of goal ids required")
+    try:
+        posted = json.loads(raw)
+    except json.JSONDecodeError as e:
+        return Response.error(400, "invalid_json", str(e))
+    if not isinstance(posted, list) or not posted:
+        return Response.error(
+            400, "empty_goal_ids",
+            "a non-empty JSON array of goal ids is required — a drain with no "
+            "ids is a caller defect, not a silent no-op")
+    ids = {g for g in posted if isinstance(g, str) and g}
+    if not ids:
+        return Response.error(
+            400, "empty_goal_ids",
+            "no usable goal ids in the posted array (expected non-empty strings)")
+
+    try:
+        with _wm_lock(ctx):
+            data = _read_yaml(_wm_path(ctx))
+            if not data:
+                return Response.error(400, "not_initialized",
+                                      "working memory not initialized")
+            parent, key, _is_top = _resolve_slot(data, slot)
+            if parent is None:
+                return Response.error(400, "unresolvable_slot",
+                                      f"cannot resolve path '{slot}'")
+            current = parent.get(key) if isinstance(parent, dict) else None
+            if current is None:
+                return Response.json({"ok": True, "slot": slot,
+                                      "removed": 0, "kept": 0})
+            if not isinstance(current, list):
+                return Response.error(
+                    400, "slot_not_a_list",
+                    f"slot '{slot}' holds {type(current).__name__}, not a list")
+            # Non-dict entries, and entries carrying no goal_id, are KEPT: an
+            # entry the classifier cannot classify must not be destroyed by it.
+            keep = [e for e in current
+                    if not (isinstance(e, dict) and e.get("goal_id") in ids)]
+            removed = len(current) - len(keep)
+            if not removed:
+                return Response.json({"ok": True, "slot": slot,
+                                      "removed": 0, "kept": len(keep)})
+            parent[key] = keep
+            # Capture lanes are never TOP_LEVEL_KEYS, so meta always advances
+            # (guard-540). wm-prune reads slot_meta.updated_at for staleness; a
+            # drain that left it untouched would age the lane from its last
+            # APPEND and could evict survivors it just spared.
+            _update_modified(data, slot)
+            _write_wm(_wm_path(ctx), data)
+    except OSError as e:
+        return Response.error(500, "write_failed", str(e))
+
+    return Response.json({"ok": True, "slot": slot,
+                          "removed": removed, "kept": len(keep)})
 
 
 # ---------------------------------------------------------------------------
@@ -1250,6 +1403,7 @@ def register(routes) -> None:
     routes[("POST", "/v1/wm/set")] = set_slot
     routes[("POST", "/v1/wm/append")] = append_slot
     routes[("POST", "/v1/wm/clear")] = clear_slot
+    routes[("POST", "/v1/wm/drain-goals")] = drain_goals
     routes[("POST", "/v1/wm/prune")] = prune
     routes[("POST", "/v1/wm/init")] = init
     routes[("POST", "/v1/wm/reset")] = reset

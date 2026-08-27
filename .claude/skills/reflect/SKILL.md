@@ -323,9 +323,11 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
    # POSITIVE CONTROL — the ONLY number that should ever alarm:
    #   [r for r in payload if r.get("outcome") in ("CONFIRMED","CORRECTED","REFUTED")
    #                       and not r.get("reflected")]
-   # RUN IT. Do not read a number off this comment — it was 0 on 2026-08-19 and
+   # RUN IT. Do not read a number off this comment — it was 0 on 2026-08-19,
    # 1 on 2026-08-22 (2026-08-09_prose-mandate-rate-generalizes, CONFIRMED,
-   # stage=resolved, resolved_by zeta 6 min before that pass reached this step).
+   # stage=resolved, resolved_by zeta 6 min before that pass reached this step),
+   # and 0 again on 2026-08-23 (echo, cc-03; payload 418, all stage=archived,
+   # UNRESOLVABLE 188 / EXPIRED 183 / none 47, conservation 418).
    # A nonzero value means genuine ABC input is going unreflected and IS the
    # work; a large `--unreflected` count means nothing on its own. The two
    # numbers move independently — the mass above grew 405 -> 418 across the same
@@ -335,6 +337,58 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
    # 4 days across three agents. A record another LIVE agent resolved minutes ago
    # is theirs — `liveness-check.sh --agent <resolved_by> --json`, and abstain on
    # `alive`. Reflecting it anyway races a conflicting ABC chain onto one record.
+   #
+   # THAT ABSTENTION IS NOW MEASURED, NOT JUST PRESCRIBED (2026-08-23, echo).
+   # The 08-22 pass abstained on the CONFIRMED record above because zeta was
+   # alive and held g-001-08. Read back one day later: that record is
+   # `reflected: True`, `resolved_by: zeta`, `resolved_at: 2026-08-22T12:40` —
+   # the owner did the work, and the control returned to 0 by that record
+   # LEAVING the payload (the count held at 418 because a new archived
+   # UNRESOLVABLE arrived, 187 -> 188). So "abstain on `alive`" costs nothing
+   # and loses nothing; it is not merely the safe choice. Most abstentions are
+   # never checked — check yours, the read is one `pipeline-read.sh --id`.
+   #
+   # ⚠ THE CONTROL ABOVE IS NECESSARY AND NOT SUFFICIENT — guard-2236's MIRROR
+   # DIRECTION. A zero here is ambiguous in the direction that reads as
+   # all-clear, because `archive_sweep` flips resolved -> archived on
+   # outcome_date age alone (>= 3d) WITHOUT consulting `reflected`, so a record
+   # left unreflected for three days can leave the queryable window while the
+   # count keeps reading 0. ALSO RUN, and REPORT even when zero (guard-1760 — a
+   # completeness tool must not report what it declined to look at as coverage):
+   #   pipeline-read.sh --stage archived   -> outcome in {CONFIRMED,CORRECTED} AND not reflected
+   #   pipeline-read.sh --stage resolved   -> same predicate
+   # Measured 2026-08-23 (echo, cc-03), with the rb-245 schema probe FIRST so the
+   # zeros are genuine absences and not misspelled-field artifacts:
+   #   archived: 1279 records, `reflected` present 1279/1279, 823 scoreable
+   #             (CONFIRMED 463 + CORRECTED 360) -> 0 unreflected
+   #   resolved:   67 records, `reflected` present   67/67,  57 scoreable
+   #             (CONFIRMED 41 + CORRECTED 16)   -> 0 unreflected
+   # Clean on both stages. Note WHY the primary control cannot substitute: all
+   # 418 rows it returned are the NON-scoreable mass, so on a healthy box it
+   # never sees the 823 records that carry ABC input at all.
+   #
+   # AND DO NOT INFER THE PREDICATE FROM guard-2236's LINE NUMBERS — MEASURE IT.
+   # That guardrail describes `--unreflected` as filtering `stage=="resolved"`
+   # on the live file only (mind_api/src/world/pipeline.py:119-123). Its
+   # CONCLUSION (run the archived scan explicitly) stands and is why this block
+   # exists. Its MECHANISM was accurate when written (2026-08-01) and was
+   # SUPERSEDED a week later: g-115-5358 (2026-08-08) widened the branch to
+   # union live+archive with a live-wins dedup and to admit `stage: archived`
+   # alongside `resolved` — age-driven archiving (ARCHIVE_AGE_DAYS=3) had made
+   # every record left unreflected for 3+ days permanently invisible to the very
+   # backlog meant to catch it, a 7.9x under-report. READ THE BRANCH AT :272.
+   #
+   # FIRE #111 (2026-08-23) recorded "returned 418 rows ALL stage=archived" and
+   # read it as the guardrail misdescribing the code. The OBSERVATION was right;
+   # the DIAGNOSIS was wrong — the code had changed under it. A stale mechanism
+   # and a wrong mechanism call for opposite responses (re-date vs re-derive),
+   # so name which one you found. That reading also described the PAYLOAD, not
+   # the PREDICATE: fire #112 (2026-08-24, echo, cc-03) got 419 rows from the
+   # same predicate — 418 archived + 1 resolved, the resolved row closed that
+   # morning and not yet 3 days old. A stage histogram tells you what is IN the
+   # store; only the source tells you what the predicate COVERS. Print the
+   # histogram (it is what caught this), then read the branch before claiming
+   # coverage.
    #
    # THE LANE IS HEALTHY, which inverts the severity every open owner implies:
    # precheck-eval the same hour counted 51 resolved hypotheses in the pipeline
@@ -620,6 +674,25 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
      Append via meta-yaml.py append to reflection-strategy.yaml roi_history:
        {date: today, modes_invoked: N, artifacts_produced: N, roi: N, session: N}
 
+     # CALL SHAPE — THE RECORD GOES ON STDIN. `append` takes exactly two
+     # positional args (file, dotpath); passing the JSON as a third is refused
+     # with a bare argparse `unrecognized arguments` line. Canonical form
+     # (core/config/conventions/stdin-json-inputs.md, same as reasoning-bank-add.sh):
+     #   printf '%s' '<json>' | py -3 core/scripts/meta-yaml.py append reflection-strategy.yaml roi_history
+     #
+     # ⚠ VERIFY WITH `meta-read.sh`, AND DO NOT RETRY ON A FAILED VERIFICATION —
+     # A FAILED VERIFICATION IS NOT A FAILED WRITE. `meta-yaml.py read` takes NO
+     # dotpath, so `read <file> roi_history` errors for its own reasons and reads
+     # as "the append did not land". Fire #110 (2026-08-22) hit exactly this and
+     # retried: roi_history carries TWO byte-identical entries for that date,
+     # same session id, same note — a duplicate telemetry row created by a
+     # verification error, not a write error. Its own note documents the
+     # misdiagnosis, which is how the mechanism is known rather than guessed.
+     # Verify by COUNTING (`meta-read.sh reflection-strategy.yaml` -> len(roi_history)
+     # should be exactly +1) and confirming the tail entry is yours. Same family
+     # as rb-8976: a probe that fails for its own reasons is not evidence about
+     # the thing it was probing.
+
 5.8. **Reflection Quality Consolidation (MR-Search Priority 2)**:
      Update reflection_effectiveness_by_type from reflection_quality_log:
      For each entry in reflection_quality_log:
@@ -673,7 +746,7 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
      Log: "▸ Tree lint: {len(stale)} stale high-retrieval nodes (of {len(hi)} with rc>10) — flagging top 5"
      FOR EACH node in sorted(stale, by retrieval_count desc)[:5]:
          echo '{"node_key": "<key>", "reason": "stale-high-retrieval", "retrieval_count": <N>, "days_since_update": <M>, "total_stale_at_scan": <len(stale)>, "priority": "MEDIUM"}' | wm-append.sh knowledge_debt
-         Log: "▸ Tree lint: {node.key} flagged stale (retrieved {retrieval_count}x, last updated {days_ago}d ago)"
+         IF exit 0: Log: "▸ Tree lint: {node.key} flagged stale (retrieved {retrieval_count}x, last updated {days_ago}d ago)"
      
      # Cross-reference discovery: nodes that share entities but aren't linked
      Bash: world-cat.sh knowledge/tree/_tree.yaml  # entity_index

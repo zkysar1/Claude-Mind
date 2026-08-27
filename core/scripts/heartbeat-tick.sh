@@ -196,10 +196,104 @@ if [ -n "${MIND_SID:-}" ]; then
             _HB_STATE="$(sed -n 's/^body_state:[[:space:]]*//p' \
                 "$_HB_BODY_DIR/body-manifest.yaml" | head -1 | tr -d '"'\'' \t\r')"
         fi
-        printf '{"sid":"%s","agent":"%s","host":"%s","ts":"%s","body_state":"%s"}\n' \
+        # : publish MACHINE_ID alongside host. `.env.local` is gitignored,
+        # so a cloned container carrying a stale MACHINE_ID is drift that NO
+        # promote, pull or preflight can ever reconcile (measured 2026-08-23:
+        # cc-13 and cc-14 both answered to cc-10). The carrier is the only
+        # fleet-readable, self-populating BOX enumeration -- body-manifest.yaml
+        # lives under `sessions/`, which owncloud_sync walk-prunes, and
+        # fleet-manifest.yaml is hand-maintained and listed NEITHER cc-13 nor
+        # cc-14 -- so this is the one place a peer can compare the two boxes at
+        # all (guard-2418: a cross-box condition must not read a machine_local
+        # file; .env.local is exactly that).
+        #
+        # EMPTY IS THE SAFE DIRECTION, same as $_HB_STATE above. `_runtime.sh
+        # rt_spawn` unsets MACHINE_ID in the spawn subshell, so some paths
+        # legitimately publish "". The consumer alerts only when two DISTINCT
+        # hosts publish the SAME NON-EMPTY value, so an empty field is skipped
+        # rather than mistaken for a collision. Deliberately NOT resolved via
+        # _session_telemetry._machine_id(): this file is IRREDUCIBLY LOCAL (see
+        # the header) and a python spawn per tick would tax the hot path to
+        # recover a value that, when absent, cannot indicate the fault anyway --
+        # a cloned .env.local is set BY DEFINITION on every path that loads it.
+        printf '{"sid":"%s","agent":"%s","host":"%s","ts":"%s","body_state":"%s","machine_id":"%s"}\n' \
             "$MIND_SID" "${MIND_AGENT:-}" "$(hostname || echo unknown)" \
-            "$(date +%Y-%m-%dT%H:%M:%S)" "$_HB_STATE" > "$_HB_CARRIER.tmp" \
+            "$(date +%Y-%m-%dT%H:%M:%S)" "$_HB_STATE" "${MACHINE_ID:-}" > "$_HB_CARRIER.tmp" \
             && mv -f "$_HB_CARRIER.tmp" "$_HB_CARRIER" || true
+    fi
+fi
+
+# ── core.hooksPath self-report () ─────────────────────────────────
+# ABOVE THE STATE GATE, DELIBERATELY — the same hoist, for the same reason, as
+# the per-Body heartbeat above (, guard-1479). The gate's `exit 2`
+# fires on every IDLE box and a cross-box worker Body is IDLE BY DESIGN, so a
+# provisioning signal placed below it would never run on the boxes LEAST likely
+# to be provisioned. Note the agent-wide team-state write at the bottom of this
+# file is below the gate and therefore does NOT run on a worker box — copying
+# its placement is the trap here, not the model.
+#
+# Hoisting is safe because this is NOT the signal the gate protects: the gate
+# stops the agent-WIDE runner-heartbeat going fresh while agent-state=IDLE (the
+# alpha-2026-05-13 desync, guard-543). core.hooksPath is a static provisioning
+# FACT, not a liveness claim, so publishing it from an IDLE box asserts nothing
+# about whether the agent is running and creates no desync.
+#
+# WHY IT EXISTS: install-git-hooks.sh is fail-open at four points (:15 not-a-repo,
+# :25 config-write WARN, :113 unconditional exit 0, and the `|| true` at its
+# sessionstart-orchestrator call site). Each is individually correct — provisioning
+# must never block a session — and together they mean a box whose entire
+# fail-closed pre-commit chain is inert reports NOTHING. No script in core/scripts/
+# probed core.hooksPath fleet-wide, so "which boxes are unprovisioned" was
+# unanswerable from any single box (guard-2193: a fleet-scoped condition read with
+# an agent-scoped instrument has no single truth value). This publishes the local
+# answer onto the row every box already writes, so ONE team-state read answers it
+# for the fleet. It does NOT make the installer fatal — that remains out of scope
+# by the goal's own note, and a provisioning REPORT that blocks a tick would be
+# worse than the gap it reports.
+#
+# CHANGE-GATED, NOT UNCONDITIONAL — measured on cc-07, not assumed: the git probe
+# is 0.002s and one team-state publish is 0.649s. This file's header declares a
+# per-Bash-call latency budget and it ticks every iteration, so an unconditional
+# second publish would spend ~0.65s per tick forever restating a value that never
+# changes. Gating on change spends it only when the answer is NEW, which is also
+# the only moment worth reporting. The 24h floor re-publishes a value the ROW may
+# have lost independently of this box (row rebuild, shard reset) — without it a
+# dropped field would stay silently absent, which is the exact failure class this
+# goal exists to close.
+#
+# THE STAMP IS WRITTEN ONLY IF THE PUBLISH SUCCEEDED. Recording the intent instead
+# of the outcome would mark a FAILED publish as done and never retry it — the
+# silently-marked-seen defect ( found the identical shape in
+# guardrail-protocol-conflict-check.py, where a discarded return value let a failed
+# board post be stamped as delivered). A failed publish here simply retries next tick.
+# THE VALUE CARRIES ITS HOSTNAME, and that is not decoration. `agent_status.<agent>`
+# is AGENT-keyed with no sid and no box (the same fact that makes an unconditional
+# in_flight clear unsafe, -d), so ONE agent spanning two boxes — a reducer
+# and a worker Body — publishes both answers into ONE key and the row keeps whichever
+# wrote last. Measured here: alpha's `last_active` advanced on this box while every
+# local tick exited 2, because the cc-04 REDUCER wrote it. A bare path would
+# therefore answer "some box of this agent", silently, while reading like a fleet
+# census. Prefixing the host makes the row say WHICH box answered, so a reader can
+# tell an unprovisioned box from an unreported one instead of averaging them. It
+# does not make the key hold N boxes — it makes the one value it holds honest.
+_HOOKS_NOW="$(git -C "$PROJECT_ROOT" config --get core.hooksPath 2>/dev/null || true)"
+[ -n "$_HOOKS_NOW" ] || _HOOKS_NOW="(unset)"   # (unset) is the VISIBLE failure value
+_HOOKS_VALUE="$(hostname 2>/dev/null || echo unknown):$_HOOKS_NOW"
+_HOOKS_STAMP="$AGENT_DIR/session/hookspath-published"
+_HOOKS_PREV=""
+[ -f "$_HOOKS_STAMP" ] && _HOOKS_PREV="$(cat "$_HOOKS_STAMP" 2>/dev/null || true)"
+_HOOKS_STALE=1
+if [ -f "$_HOOKS_STAMP" ] && [ -z "$(find "$_HOOKS_STAMP" -mmin +1440 2>/dev/null || true)" ]; then
+    _HOOKS_STALE=0
+fi
+# Stamp and compare the COMPOSITE, so a box whose hostname changed under a cloned
+# container (the stale-MACHINE_ID drift this file already guards for above)
+# re-publishes instead of coasting on the previous box's answer.
+if [ "$_HOOKS_VALUE" != "$_HOOKS_PREV" ] || [ "$_HOOKS_STALE" = "1" ]; then
+    if bash "$(dirname "$0")/team-state-update.sh" \
+        --field "agent_status.$MIND_AGENT.core_hooks_path" \
+        --value "\"$_HOOKS_VALUE\"" >/dev/null 2>&1; then
+        printf '%s' "$_HOOKS_VALUE" > "$_HOOKS_STAMP" 2>/dev/null || true
     fi
 fi
 

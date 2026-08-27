@@ -359,3 +359,101 @@ def test_agrees_with_pinned_sibling_predicate_across_the_boundary():
         rec = _well_formed(resolves_by=rb)
         mine = SW.classify_overdue([rec], NOW)["overdue"] == 1
         assert mine == sibling_says_past(rb), f"disagreement on resolves_by={rb!r}"
+
+
+# ---------------------------------------------------------------------------
+# ELIGIBLE lane (): past the eligibility floor, NOT yet overdue.
+#
+# Every test below is a DISCRIMINATING row for the new lane in the two-way form
+# (guard-1220 / guard-2353): each asserts BOTH that classify_overdue ignores the
+# record -- which is what "unwatched" meant, and is red for the pre-change tree
+# where the record was reached by nothing -- AND that classify_eligible acts on
+# it. Asserting only the second half would pass against a lane that had simply
+# widened the overdue predicate, which is the change this deliberately is NOT.
+# The 30 pre-existing tests above are the RECALL CONTROLS: classify_overdue is
+# byte-unchanged, so they must stay green.
+# ---------------------------------------------------------------------------
+
+
+def _eligible(**over):
+    """Well-formed discovered record whose deadline is still in the FUTURE.
+    Overrides are applied AFTER the defaults (matching _well_formed/_bare), so a
+    caller may override id/resolves_by without a duplicate-kwarg TypeError."""
+    rec = _well_formed(id="2026-06-19_eligible", resolves_by=_iso(+5))
+    rec.update(over)
+    return rec
+
+
+def test_eligible_well_formed_promotes_and_overdue_lane_ignores_it():
+    rec = _eligible()
+    o = SW.classify_overdue([rec], NOW)
+    assert o["overdue"] == 0 and o["promote"] == [] and o["expire"] == []
+    e = SW.classify_eligible([rec], NOW)
+    assert e["eligible"] == 1
+    assert [r["id"] for r in e["promote"]] == ["2026-06-19_eligible"]
+    assert e["needs_judgment"] == []
+
+
+def test_eligible_under_formed_is_surfaced_never_expired():
+    rec = _bare(id="2026-06-19_eligible_bare", resolves_by=_iso(+5))
+    o = SW.classify_overdue([rec], NOW)
+    assert o["overdue"] == 0 and o["expire"] == []
+    e = SW.classify_eligible([rec], NOW)
+    assert [r["id"] for r in e["needs_judgment"]] == ["2026-06-19_eligible_bare"]
+    assert e["promote"] == []
+
+
+def test_eligible_respects_future_rne_parking():
+    """A FUTURE resolves_no_earlier_than is a deliberate floor -> NOT promoted.
+    Without the RNE branch this record promotes, so this row is what pins the
+    'parking is real, so respect it' finding into code."""
+    rec = _eligible(id="2026-06-19_parked", resolves_no_earlier_than=_iso(+2))
+    e = SW.classify_eligible([rec], NOW)
+    assert e["eligible"] == 0 and e["promote"] == [] and e["needs_judgment"] == []
+
+
+def test_eligible_past_rne_is_not_parked():
+    """Recall control for the RNE branch: a PAST floor must not suppress."""
+    rec = _eligible(id="2026-06-19_floor_passed", resolves_no_earlier_than=_iso(-2))
+    e = SW.classify_eligible([rec], NOW)
+    assert [r["id"] for r in e["promote"]] == ["2026-06-19_floor_passed"]
+
+
+def test_eligible_zero_width_window_gets_exactly_its_one_day():
+    """Measured live shape: 10 of 22 RNE-bearing records carry RNE == resolves_by,
+    so the eligible interval is a single day. It must be caught on that day --
+    date-granular on both sides (guard-2073), floor not yet in the future."""
+    rec = _eligible(id="2026-06-19_zero_width",
+                    resolves_by=_iso(0), resolves_no_earlier_than=_iso(0))
+    assert SW.classify_overdue([rec], NOW)["overdue"] == 0
+    e = SW.classify_eligible([rec], NOW)
+    assert [r["id"] for r in e["promote"]] == ["2026-06-19_zero_width"]
+
+
+def test_eligible_ignores_non_discovered_and_undated():
+    active = _eligible(id="2026-06-19_active", stage="active")
+    sentinel = _well_formed(id="2026-06-19_sentinel", resolves_by="session_end",
+                            horizon="session")
+    e = SW.classify_eligible([active, sentinel], NOW)
+    assert e["eligible"] == 0 and e["promote"] == [] and e["needs_judgment"] == []
+
+
+def test_lanes_are_disjoint_over_a_mixed_corpus():
+    """No record may be classified by both lanes -- a record in both would be
+    moved twice by main(). The predicates are exact complements on the boundary
+    day, so this also pins that neither lane can claim the other's edge."""
+    corpus = [
+        _well_formed(id="a_overdue", resolves_by=_iso(-5)),
+        _bare(id="b_overdue_bare", resolves_by=_iso(-5)),
+        _eligible(id="c_eligible"),
+        _bare(id="d_eligible_bare", resolves_by=_iso(+5)),
+        _eligible(id="e_parked", resolves_no_earlier_than=_iso(+3)),
+        _well_formed(id="f_boundary_today", resolves_by=_iso(0)),
+    ]
+    o = SW.classify_overdue(corpus, NOW)
+    e = SW.classify_eligible(corpus, NOW)
+    o_ids = {r["id"] for r in o["expire"] + o["promote"] + o["needs_judgment"]}
+    e_ids = {r["id"] for r in e["promote"] + e["needs_judgment"]}
+    assert o_ids & e_ids == set(), o_ids & e_ids
+    assert o_ids == {"a_overdue", "b_overdue_bare"}
+    assert e_ids == {"c_eligible", "d_eligible_bare", "f_boundary_today"}

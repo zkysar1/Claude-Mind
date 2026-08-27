@@ -137,8 +137,17 @@ def _force_peer_backend(env_id: str, registry: dict) -> str:
     return os.environ["STORAGE_BACKEND"]
 
 
+# G1-G5 cross-world grant enforcement (). Safe to import at module
+# scope: _grants is PURE (json + pathlib only) and never imports _fileops,
+# so it cannot bind a storage backend -- the guard-955/rb-2983 hazard this
+# whole module is built around. Its own directory is sys.path[0] when this
+# script runs directly.
+import _grants  # noqa: E402
+
+
 def build_record(*, author: str, channel: str, msg_type: str, text: str,
-                 tags: list, reply_to: str, seq: int, now: str) -> dict:
+                 tags: list, reply_to: str, seq: int, now: str,
+                 origin_env: str = "") -> dict:
     """Board record matching core/config/conventions/board.md schema."""
     rec = {
         # Zero-padded to 3 digits to match board.py's generate_message_id
@@ -153,6 +162,15 @@ def build_record(*, author: str, channel: str, msg_type: str, text: str,
     }
     if reply_to:
         rec["reply_to"] = reply_to
+    if origin_env:
+        # G5 (world-contract.md): a cross-world write carries its provenance
+        # ON THE RECORD THE PEER RECEIVES -- not in a local log. Stamped here
+        # rather than in main() because this is the artifact the consumer
+        # actually gets (guard-3221): anything sitting between producer and
+        # consumer can drop a field, and from the producer side that drop is
+        # invisible, so a gate reading the producer's own state reads correct
+        # and is permanently false in production.
+        rec = _grants.stamp_provenance(rec, origin_env, chain=[origin_env])
     return rec
 
 
@@ -246,7 +264,8 @@ def main(argv=None) -> int:
         """
         return build_record(author=author, channel=args.channel,
                             msg_type=args.msg_type, text=text, tags=tags,
-                            reply_to=args.reply_to, seq=len(items) + 1, now=now)
+                            reply_to=args.reply_to, seq=len(items) + 1, now=now,
+                            origin_env=self_env)
 
     if args.dry_run:
         # Preview only -- no write, so an unlocked count is sound here. It is

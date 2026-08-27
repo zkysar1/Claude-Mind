@@ -62,6 +62,27 @@ def test_unavailable_body_is_None_not_False(body):
     assert cnc.pr_declares_merge_gate(body) is None
 
 
+# ── the citation pointer () ───────────────────────────────────────
+
+@pytest.mark.parametrize("body,expected", [
+    ("Paired with g-326-116; both halves are needed.", ["g-326-116"]),
+    ("closes g-115-7709 and g-335-1009", ["g-115-7709", "g-335-1009"]),
+    ("g-115-7709 again, g-115-7709 twice", ["g-115-7709"]),   # de-duplicated
+    ("Caps retention on a write-only archive.", []),
+    ("", []), (None, []), (123, []),
+])
+def test_pr_cited_goal_ids(body, expected):
+    assert cnc.pr_cited_goal_ids(body) == expected
+
+
+def test_cited_goal_ids_does_not_require_parentheses():
+    """_COMMIT_GOALID_RE parses conventional-commit SUBJECTS and so requires
+    parentheses; a PR body cites the id bare. Reusing that pattern here would
+    have matched zero real bodies while looking correct."""
+    assert cnc._COMMIT_GOALID_RE.findall("Paired with g-326-116") == []
+    assert cnc.pr_cited_goal_ids("Paired with g-326-116") == ["g-326-116"]
+
+
 # ── the field actually reaches the classifier ───────────────────────────────
 
 def test_norm_carries_body_off_the_forge_payload():
@@ -107,11 +128,72 @@ def _describe(monkeypatch, body, draft=True):
     return rt.bodies[0]["description"]
 
 
-def test_artifact_draft_is_told_to_discharge_it(monkeypatch):
+def test_token_miss_reaches_no_conclusion_and_gives_no_merge_advice(monkeypatch):
+    """ / guard-4432. This test previously pinned the OPPOSITE: it
+    asserted the 0-of-N branch says "HANDOFF ARTIFACT" and "mark the pull
+    request ready and merge it". Both repos in guard-4432's measurement
+    auto-deploy on merge to default, so that instruction manufactured authority
+    for an unwanted production deploy out of an ABSENCE of matched tokens —
+    measured 2-of-2 counterexamples scoring 0-of-6 while carrying gates
+    unmistakable to a reader, and 11 of 32 open drafts fleet-wide in the trap.
+
+    The guard-3465 "never a squash" assertion went with it, and deliberately:
+    it required squash advice to ride along with MERGE advice, and there is no
+    longer any merge advice in this branch for it to ride on.
+    """
     d = _describe(monkeypatch, "Caps retention on a write-only archive. Green.")
-    assert "HANDOFF ARTIFACT" in d
-    assert "mark the pull request ready and merge it" in d
-    assert "never a squash" in d, "guard-3465 must ride along with any merge advice"
+
+    # POSITIVE CONTROL — the branch actually RAN. Without these, the absence
+    # assertions below would pass just as happily if the fork stopped being
+    # reached at all, or emitted an empty remedy (guard-4166).
+    assert "NO GATE TEXT MATCHED" in d
+    assert "NO EVIDENCE EITHER WAY" in d
+    assert "READ the pull request" in d
+    assert str(len(cnc._MERGE_GATE_MARKERS)) + " tokens searched" in d, \
+        "the remedy must report how many tokens were searched, not just that none hit"
+
+    # The conclusion and the action instruction are both gone.
+    assert "HANDOFF ARTIFACT" not in d
+    assert "mark the pull request ready and merge it" not in d
+    # Anchor on the AFFIRMATIVE instruction, never the bare substring: this
+    # branch's own text says "Do NOT mark it ready", which contains it. Same
+    # word-collision trap the non-draft test below already documents.
+    assert "Do NOT mark it ready" in d
+    # The CI claim was never derived from the token scan — nothing here reads
+    # CI — so the branch must not assert it either.
+    assert "verified and green" not in d
+
+
+def test_token_miss_names_a_cited_goal_id_when_the_body_has_one(monkeypatch):
+    """A token miss routes to a READ; naming the cited goal makes that read
+    actionable instead of "go read a wall of text". The citation is used ONLY
+    to point the reader — resolving it here would re-derive the same positive
+    conclusion guard-4432 forbids, one field over."""
+    d = _describe(monkeypatch, "Paired with g-326-116; both halves are needed.")
+    assert "g-326-116" in d
+    assert "resolve that goal FIRST" in d
+    assert "HANDOFF ARTIFACT" not in d
+
+
+def test_token_miss_without_a_citation_still_reaches_no_conclusion(monkeypatch):
+    """The control for the test above: absence of a citation must not tip the
+    branch back toward a conclusion."""
+    d = _describe(monkeypatch, "Caps retention on a write-only archive.")
+    assert "cites no goal id" in d
+    assert "not evidence either way" in d
+    assert "Do NOT mark it ready" in d
+
+
+def test_unreadable_body_branch_offers_no_merge_licence(monkeypatch):
+    """The None branch carried the SAME defect in its closing clause — "if the
+    body turns out to declare NO gate at all, this is a handoff artifact
+    instead: mark it ready and merge it". Fixing only the False branch would
+    have left the identical unsupported inference reachable one branch over."""
+    d = _describe(monkeypatch, None)
+    assert "UNKNOWN" in d                      # positive control: branch ran
+    assert "handoff artifact instead" not in d
+    assert "mark it ready and merge it" not in d
+    assert "NOT a licence to merge" in d
 
 
 def test_gated_draft_keeps_the_do_not_merge_narrative(monkeypatch):

@@ -930,8 +930,22 @@ def _mark_skipped(source, goal_id, parent_id, parent_status,
         })
         return False
 
+    # The PREFIX is a dedup key, not prose: `_is_already_swept`,
+    # `_successor_marker_guard` and 6 tests all `startswith` it, so the caveat is
+    # APPENDED rather than folded into the phrase. : "without action
+    # needed" asserts something this sweep cannot know. It reads CURRENT state
+    # and cannot see the write that produced it, so an agent fix applied minutes
+    # earlier is byte-indistinguishable from self-resolution — measured on
+    # , where the sweep's own tolerance test passed only because it was
+    # computing against an interval_hours the agent had corrected 8 minutes
+    # before. That mis-records real agent work as unattended, and it errs toward
+    # UNDER-counting, which is the direction nobody notices.
     note = (f"parent resolved without action needed "
-            f"(parent_id={parent_id}, parent.status={parent_status})")
+            f"(parent_id={parent_id}, parent.status={parent_status})"
+            f" [verdict is about the parent's CURRENT state only: this sweep "
+            f"cannot see whether an agent fix produced it, so do not read this "
+            f"as evidence nobody acted — check world/changelog.jsonl around "
+            f"this timestamp before recording it as self-resolved]")
     rc1, _, err1 = _py([str(SCRIPT_DIR / "aspirations.py"),
                         "--source", source, "update-goal",
                         goal_id, "outcome_note", note])

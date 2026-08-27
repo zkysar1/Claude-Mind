@@ -171,9 +171,34 @@ DELAY=600
 # leaving the previous unit's 600s net in the slot. So the branch is now an
 # explicit CLOSED-SET test, not a not-active test: a state this prompt has never
 # heard of resolves toward RESUMING (recoverable) rather than stopping dead.
+# THE NET FIRES ON HEALTHY BODIES, AND THE PROMPT HAD NO BRANCH FOR IT
+# (). The 600s net is re-armed at every terminal pair, so it fires
+# whenever a SINGLE work unit runs longer than the delay — witnessed first-hand
+# 2026-08-26 (alpha worker, cc-08, during : suite alone 40 min, unit
+# ~55 min). "Never fires on a healthy loop" holds only for units SHORTER than
+# the delay, and a deep-code unit routinely is not. So the firing is correct and
+# the DEFECT IS THE INSTRUCTION: body_state was active, the prompt said
+# Skill(worker-loop), and Phase 1 SELECT hands out the top eligible UNCLAIMED
+# goal — skipping the in-progress goal this Body had CLAIMED and abandoning it
+# with uncommitted edits and the claim still held. That goal then sits
+# in-progress exactly like the 360-of-361 stranded claims  exists to
+# fix. It was avoided ONLY because the worker noticed its own live claim and
+# chose to finish; nothing in the prompt told it to look.
+#
+# The branch keys on claimed_by_sid, not claimed_by, per guard-1460: another
+# SESSION of the same agent can legitimately hold a claim, and the SID is what
+# separates "my abandoned unit" from "a peer instance's live work". The query
+# shape is probe-verified, not assumed (aspirations-query.sh --goal-field
+# claimed_by_sid <sid> --full returned exactly the one live claim). --goal-field
+# is EXACT-match, which is correct for a SID and would be wrong for a prefix.
+#
+# SCOPE IS WORKER-ONLY IN THIS SCRIPT, verified at source: --role reducer was
+# retired () with zero callers, and the three reducer emitters own
+# their own text. Whether they carry the same gap is a separate question —
+# probe before widening, do not assume symmetry.
 cat <<EOF
 [deadman] WORKER NET ARMED — your terminal response MUST be EXACTLY these TWO batched tool calls, in this order:
-  (1) ScheduleWakeup(prompt='Your worker Body loop may have stopped without reaching its terminal Skill(worker-loop) call. FIRST read agents/<agent>/sessions/<your-SID>/body-manifest.yaml — the DURABLE closure record (the body-closing sentinel is CONSUMED by the stop-hook on a genuine close, so its absence proves nothing). IF body_state is one of closed-pending-merge / merged / closed-stale, OR the body-closing sentinel EXISTS (a close is in flight): this Body closed deliberately — do NOT resume and do NOT re-arm; end the turn with a Bash echo saying so (the stop-hook stands down on the closed manifest). IF body_state is parked: this Body is PARKED awaiting a reducer, which is RESUMABLE and is NOT a close — re-arm this same wakeup FIRST at delaySeconds=3600, then resume by calling Skill(worker-loop) (its Phase 0.5 poll decides resume-or-re-park; do not decide that here). IF body_state is active, or is any value not named above: re-arm this same wakeup FIRST (natural-language prompt, delaySeconds=${DELAY}) so the net is restored before any work that could fail, then resume by calling Skill(worker-loop). NEVER call Skill(aspirations) — that is the reducer-only re-entry (guard-517/guard-463).', delaySeconds=${DELAY})
+  (1) ScheduleWakeup(prompt='Your worker Body loop may have stopped without reaching its terminal Skill(worker-loop) call. FIRST read agents/<agent>/sessions/<your-SID>/body-manifest.yaml — the DURABLE closure record (the body-closing sentinel is CONSUMED by the stop-hook on a genuine close, so its absence proves nothing). IF body_state is one of closed-pending-merge / merged / closed-stale, OR the body-closing sentinel EXISTS (a close is in flight): this Body closed deliberately — do NOT resume and do NOT re-arm; end the turn with a Bash echo saying so (the stop-hook stands down on the closed manifest). IF body_state is parked: this Body is PARKED awaiting a reducer, which is RESUMABLE and is NOT a close — re-arm this same wakeup FIRST at delaySeconds=3600, then resume by calling Skill(worker-loop) (its Phase 0.5 poll decides resume-or-re-park; do not decide that here). IF body_state is active, or is any value not named above: re-arm this same wakeup FIRST (natural-language prompt, delaySeconds=${DELAY}) so the net is restored before any work that could fail. THEN, BEFORE re-entering, check whether YOU STILL HOLD A CLAIM: run bash core/scripts/aspirations-query.sh --goal-field claimed_by_sid <your-SID> --full and read the rows. IF a row comes back with a non-terminal status (pending / in-progress / blocked), the net fired MID-UNIT on a perfectly healthy Body and that unit is YOURS and unfinished — RESUME THAT UNIT DIRECTLY and do NOT call Skill(worker-loop), whose Phase 1 SELECT offers only UNCLAIMED goals and would hand you a DIFFERENT one while your half-finished unit keeps its claim and its uncommitted edits on disk. Key on claimed_by_sid, NEVER on claimed_by: another SESSION of this same agent can hold a claim (guard-1460), and the SID is the only field that separates them. --goal-field matches EXACTLY, which is what you want here because a SID is a whole value, not a prefix. IF that query returns no rows you hold nothing — resume by calling Skill(worker-loop). NEVER call Skill(aspirations) — that is the reducer-only re-entry (guard-517/guard-463).', delaySeconds=${DELAY})
   (2) Skill(worker-loop) — the PRIMARY re-entry and the LAST call.
 Both calls, every work unit. Skill ALONE keeps THIS unit alive but leaves the NEXT one unprotected against a silent text-death.
 EOF

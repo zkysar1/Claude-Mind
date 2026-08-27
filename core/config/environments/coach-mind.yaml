@@ -27,6 +27,18 @@
 # this entry cannot mix state into a wrong bucket. The coach-mind operator sets
 # own-cloud wiring HERE when cutting over (bucket / sessions_table / lock_table
 # / region), exactly as the zds-mind and claude-mind entries describe.
+#
+# RUNNER CLAIM STORE (2026-08-27 incident). The local backend's git-ref claim
+# store arbitrates on a git remote, and `origin` here is Claude-Mind.git over
+# anonymous HTTPS -- readable, never writable. Every acquire's push failed
+# ("could not read Username") and was misreported as a HELD claim; coach's
+# operator agent spent 103 minutes and destroyed the repo's object store chasing
+# a holder that did not exist. The arbiter on zc-03 is now a LOCAL bare repo,
+# /opt/coach-mind-claims.git, wired two ways: `git remote add claims <path>`
+# (what git_ref_claim.GitRefClaimStore.default_remote prefers once this
+# framework revision is pulled) AND `remote.origin.pushurl` pointed at it (the
+# interim that makes the pre-fix code work today -- drop the pushurl once the
+# `claims` convention is live on the box). Single box, so one arbiter is exact.
 environment_id: coach-mind
 backend: local
 # known_agents (OPTIONAL, ): feeds the cross-deployment addressing

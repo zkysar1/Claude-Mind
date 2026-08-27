@@ -1723,6 +1723,44 @@ class MirrorWedgeProbe(Probe):
 
     name = "mirror-wedge"
     WEDGED_TICKS_TO_FILE = 2
+    # Re-validation interval for the `fired` episode latch ().
+    #
+    # `fired` caches "an open goal already covers this box's wedge". It is
+    # written False ONLY on the `healthy` branch below, so while a wedge
+    # PERSISTS it never writes the negative and the cache can never invalidate
+    # -- a latch by guard-4870's definition ("a store written ONLY inside its
+    # own fire condition"). That is how cc-04 reached consecutive_wedged=981
+    # with fired=true and ZERO open wedge goals: the covering goal was gone, the
+    # box stayed wedged, and `not self.fired` short-circuited BEFORE
+    # _file_wedge_goal()'s own open_goal_exists() dedup could ever run. The box
+    # was left wedged, un-goaled, and un-refileable.
+    #
+    # Every N wedged ticks the latch re-opens and the filer re-decides. The
+    # store read stays INSIDE _file_wedge_goal() where it already lives; this
+    # deliberately does NOT move a store read into the fire decision. It is
+    # self-limiting: if a goal IS open the filer returns dedup and `fired` goes
+    # straight back to True for another N ticks. It cannot double-dispatch live
+    # work (guard-1125's hazard) because the filer's dedup, not this counter,
+    # decides whether anything is actually filed.
+    #
+    # A close-path re-arm was considered and REJECTED: _close_wedge_goal() runs
+    # only on the `healthy` branch, which by definition never executes while the
+    # wedge persists, so it cannot break a latch the wedge is holding open
+    # (rb-6714 -- a completion signal that gates its own next cycle cannot
+    # recover "next cycle").
+    #
+    # Why 50, stated in full because a constant must not smuggle its real reason
+    # (guard-3560): (a) it bounds un-goaled wedge time to at most 50 ticks after
+    # a covering goal disappears, against a condition measured persisting 981
+    # ticks unnoticed; (b) it keeps the extra open_goal_exists() read to one per
+    # 50 wedged ticks rather than one per tick; (c) it is 10x the longest tick
+    # window any existing test in test_mirror_health.py drives (max 5), so those
+    # tests keep asserting the SHORT-window semantics they were written for --
+    # fires once, retries until landed, dedup does not respam -- unmodified.
+    # (c) is a real reason and is disclosed rather than hidden. No test asserts
+    # this value literally; the latch test reads it off the class, so correcting
+    # the number never requires editing a test (guard-3560 step 3).
+    WEDGED_TICKS_TO_REVALIDATE = 50
 
     def __init__(self, ctx: WatchdogContext) -> None:
         super().__init__(ctx)
@@ -1740,7 +1778,10 @@ class MirrorWedgeProbe(Probe):
         v = verdict.get("verdict")
         if v == "wedged":
             self.consecutive_wedged += 1
-            if self.consecutive_wedged >= self.WEDGED_TICKS_TO_FILE and not self.fired:
+            if self.consecutive_wedged >= self.WEDGED_TICKS_TO_FILE and (
+                    not self.fired
+                    or self.consecutive_wedged % self.WEDGED_TICKS_TO_REVALIDATE == 0
+            ):
                 goal = self._file_wedge_goal(verdict)
                 # Mark the episode fired ONLY when the goal actually landed
                 # (). Setting fired=True unconditionally (before this
@@ -1823,6 +1864,19 @@ class MirrorWedgeProbe(Probe):
     def _file_wedge_goal(self, verdict: dict) -> dict:
         """File one deduped Investigate goal. Fail-open ({filed: False, error})."""
         origin_signal = self._origin_signal()
+        # Name the BOX, not just the agent (). The dedup key
+        # (_origin_signal) is already BOX-scoped, but the title was only
+        # AGENT-scoped, so ONE agent running on TWO boxes produced two
+        # byte-identical titles for two genuinely different wedges — a reader
+        # could not tell which box to repair, and cc-04's wedge was
+        # indistinguishable from any other alpha wedge in a title scan.
+        # guard-860 ("keep run-specific identifiers OUT of titles") points the
+        # OTHER way and does not apply: its hazard is a SHARED id causing a
+        # false MATCH between unrelated goals; here the box id makes
+        # otherwise-identical titles DISTINCT.
+        # Computed HERE, outside the fail-open try, so _box_id()'s documented
+        # "both callers invoke it outside their try" invariant stays true.
+        box = _box_id()
         try:
             from _paths import WORLD_DIR
             import importlib
@@ -1838,16 +1892,17 @@ class MirrorWedgeProbe(Probe):
             listing = "; ".join(f"{p} ({n} sweeps)" for p, n in files[:8])
             body = {
                 "title": (f"Investigate: own-cloud mirror wedge on {self.ctx.agent_name}'s box "
-                          f"— both-diverged conflict-skips frozen"),
+                          f"[{box}] — both-diverged conflict-skips frozen"),
                 "priority": "HIGH",
                 "participants": ["agent"],
                 "description": (
-                    f"The watchdog mirror-wedge probe on {self.ctx.agent_name}'s box found "
+                    f"The watchdog mirror-wedge probe on {self.ctx.agent_name}'s box "
+                    f"[{box}] found "
                     f"{verdict.get('wedged_count')} "
                     f"file(s) both-diverged for >= {mh_threshold()} consecutive sweeps "
                     f"across {self.consecutive_wedged}+ watchdog ticks — their mirror "
                     f"refresh is frozen and every consumer on THAT box reads stale data "
-                    f"(repair must run on {self.ctx.agent_name}'s box) "
+                    f"(repair must run ON BOX {box}, {self.ctx.agent_name}'s box) "
                     f"(the g-115-2548 class; 21h undetected last time). Files: {listing}. "
                     f"Run: bash core/scripts/mirror-health.sh for the live list, then "
                     f"repair via the /reconcile-owncloud-conflicts protocol "
@@ -2620,6 +2675,7 @@ _GIT_DRIFT_ENV = {
     "disk_free_floor_gib": "GIT_DRIFT_DISK_FREE_GIB",
     "fetch_throttle_minutes": "GIT_DRIFT_FETCH_THROTTLE_MIN",
     "ticks_to_file": "GIT_DRIFT_TICKS_TO_FILE",
+    "ticks_to_revalidate": "GIT_DRIFT_TICKS_TO_REVALIDATE",
 }
 
 
@@ -2646,6 +2702,13 @@ def _git_drift_config() -> dict:
         "disk_free_floor_gib": 15,
         "fetch_throttle_minutes": 30,
         "ticks_to_file": 2,
+        # Re-validation interval for the `fired` latch below. GitDriftProbe
+        # takes its thresholds from THIS config dict (env-overridable,
+        # per-box tunable), so the interval is a config key here rather
+        # than the class constant MirrorWedgeProbe uses — same defect,
+        # each fix matching its own probe's idiom. Value matches the twin's
+        # WEDGED_TICKS_TO_REVALIDATE so the two probes re-file on one cadence.
+        "ticks_to_revalidate": 50,
     }
     for key in out:
         val = cfg.get(key)
@@ -2938,7 +3001,20 @@ class GitDriftProbe(Probe):
         if breaches:
             self.consecutive_breach += 1
             payload["consecutive_breach"] = self.consecutive_breach
-            if self.consecutive_breach >= cfg["ticks_to_file"] and not self.fired:
+            # `fired` is written ONLY in the cleared branch below, so while a
+            # breach PERSISTS it never takes the negative — a latch by
+            # guard-4870's definition. Once fired, if the covering goal is
+            # closed (or never landed) while the breach continues, the box is
+            # breached + un-goaled + UN-REFILEABLE, because `not self.fired`
+            # short-circuits BEFORE _file_drift_goal's own dedup can run. A
+            # latched detector has silently stopped detecting, which is worse
+            # than an absent one: the fleet reads the quiet as health.
+            # Re-validate on a cadence so a persistent breach can re-file.
+            _revalidate = cfg.get("ticks_to_revalidate") or 0
+            if self.consecutive_breach >= cfg["ticks_to_file"] and (
+                    not self.fired
+                    or (_revalidate and self.consecutive_breach % _revalidate == 0)
+            ):
                 goal = self._file_drift_goal(payload)
                 # Mark fired only when the goal LANDED or an open one already
                 # covers this box; a genuine filing failure retries next tick

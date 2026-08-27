@@ -427,3 +427,85 @@ def test_daemon_capture_slots_mirror_matches():
             assert tuple(ast.literal_eval(node.value)) == tuple(wm_mod.CAPTURE_SLOTS)
             return
     pytest.fail("daemon wm_write.py has no CAPTURE_SLOTS mirror (g-306-293)")
+
+
+# --------------------------------------------------------------------------
+#  — the flagged:total ratio (the DENOMINATOR)
+#
+# `flagged_seen` alone cannot distinguish a healthy lane from one where the
+# flag has stopped discriminating, and both of the flag's powers (eviction
+# exemption, fast-lane priority) decay as the share rises. Every test below
+# drives the REAL fast_lane rather than asserting on a hand-built summary —
+# a ratio computed in the test is not evidence the production path emits one.
+# --------------------------------------------------------------------------
+
+def test_ratio_reports_flagged_and_total_not_a_bare_count(tmp_path):
+    """1 flagged of 4 must report BOTH numbers (guard-4054: a rate is
+    uninterpretable without the arrival count beside it)."""
+    root = _mk_root(tmp_path)
+    _write_reducer_wm(root, "testagent")
+    _write_body(root, "testagent", "unit-a", {"spark_capture": [
+        _entry("g-1", load_bearing=True),
+        _entry("g-2"), _entry("g-3"), _entry("g-4"),
+    ]})
+
+    s = cfl.fast_lane("testagent", project_root=root)
+
+    assert s["by_slot_ratio"]["spark_capture"] == {"flagged": 1, "total": 4}, s
+    assert s["entries_seen"] == 4 and s["flagged_measurable"] == 1, s
+    line = cfl.format_line(s)
+    assert "spark_capture 1/4=25%" in line, line
+
+
+def test_ratio_absent_when_no_capture_entries_exist(tmp_path):
+    """NEGATIVE CONTROL (guard-3221). Without this the assertion above passes
+    against any non-empty string — it must be shown that the fragment is
+    absent when the upstream value is absent, not merely present when it is."""
+    root = _mk_root(tmp_path)
+    _write_reducer_wm(root, "testagent")
+    _write_body(root, "testagent", "unit-empty", {})
+
+    s = cfl.fast_lane("testagent", project_root=root)
+
+    assert s["entries_seen"] == 0, s
+    assert s["by_slot_ratio"] == {}, s
+    assert "load-bearing share" not in cfl.format_line(s)
+
+
+def test_denominator_counts_a_body_with_zero_flagged(tmp_path):
+    """A Body holding entries but flagging NONE is a healthy lane and belongs
+    in the denominator. Counting only Bodies that already have a flagged entry
+    would restrict the population to those passing the very test being
+    measured — the selection effect this ratio exists to expose."""
+    root = _mk_root(tmp_path)
+    _write_reducer_wm(root, "testagent")
+    _write_body(root, "testagent", "unit-flagged",
+                {"spark_capture": [_entry("g-1", load_bearing=True)]})
+    _write_body(root, "testagent", "unit-clean",
+                {"spark_capture": [_entry("g-2"), _entry("g-3"), _entry("g-4")]})
+
+    s = cfl.fast_lane("testagent", project_root=root)
+
+    # 1 of 4 across both Bodies. Dropping the all-clean Body would read 1/1=100%
+    # — a maximally-degraded lane — from data that is 25%.
+    assert s["by_slot_ratio"]["spark_capture"] == {"flagged": 1, "total": 4}, s
+    assert "spark_capture 1/4=25%" in cfl.format_line(s)
+
+
+def test_ratio_prints_on_the_zero_merged_branch(tmp_path):
+    """The state most worth reporting — a degraded share with nothing NEW to
+    merge — takes format_line's early return. A ratio gated on `merged` would
+    be silent exactly when it matters (guard-3221)."""
+    root = _mk_root(tmp_path)
+    flagged = _entry("g-1", load_bearing=True)
+    # Already in the reducer WM, so this run merges nothing.
+    _write_reducer_wm(root, "testagent", {"spark_capture": [flagged]})
+    _write_body(root, "testagent", "unit-a",
+                {"spark_capture": [flagged, _entry("g-2")]})
+
+    s = cfl.fast_lane("testagent", project_root=root)
+
+    assert s["merged"] == 0, s
+    line = cfl.format_line(s)
+    assert "0 load-bearing captures to merge" in line, line
+    assert "spark_capture 1/2=50%" in line, line

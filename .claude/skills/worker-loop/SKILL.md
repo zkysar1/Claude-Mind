@@ -257,9 +257,10 @@ Bash: bash core/scripts/heartbeat-tick.sh
 # COMMITTING agents/<self>/* churn pathspec-limited (g-115-2249) and retrying the
 # merge once. Its fetch is independently throttled (FETCH_INTERVAL_MIN, stateless
 # via FETCH_HEAD mtime), so calling it every cycle costs nothing on most cycles.
-# THIS MERGES, so it VOIDS any full-suite run still executing (tree-moved
-# outranks every verdict). A SUITE MUST FINISH INSIDE THE UNIT THAT LAUNCHED IT;
-# Phase 3.8 merges too. --no-push suppresses the PUSH, never the merge.
+# THIS MOVES HEAD, so it VOIDS any full-suite run still executing (tree-moved
+# outranks every verdict; the detector is HEAD-MOVEMENT, not merge — Phase 3.8's
+# own COMMIT FIRST voids it too, g-115-7943). A SUITE MUST FINISH INSIDE THE UNIT
+# THAT LAUNCHED IT. --no-push suppresses the PUSH, never the merge.
 # Rationale (WHY a suite must finish inside its unit): core/config/rationale/suite-run-voided-by-loop-merge.md
 Bash: bash core/scripts/iteration-push.sh --no-push
 # Fail-soft BY CONTRACT: it exits 0 without --strict, so a network blip, a dirty
@@ -291,6 +292,35 @@ IF stdout contains "— ESCALATION REQUIRED (g-":
     Do NOT stop the loop, do NOT git-merge or clear files by hand, and do NOT
     re-escalate on later cycles — the directive prints once per streak by
     design; its absence means either no repeat or already escalated.
+
+# Phase -0.25 — PULL LATEST PRODUCT REPOS (g-306-370). A scoped CALL to the
+# SAME estate pull the reducer path already mandates in the domain's
+# pre-execution convention — never a hand-rolled fetch loop (no-transcription
+# contract, guard-2676). That convention step is NOT removed; this is a SECOND
+# entry point, because a gate is only as broad as its entry points (guard-3448).
+#
+# WHY IT EXISTS: the capability shipped 2026-08-20 and was wired ONLY into that
+# convention — reachable from this loop solely by a five-link prose chain
+# (Phase 3 -> load-execute-protocol.sh -> digest Phase 3.9 -> load-conventions
+# -> the pull step), executed by a READER rather than a runner. This loop's own
+# -0.5/-0.4/-0.3/-0.2 phases are literal Bash calls and run every unit; that
+# chain did not. MEASURED 2026-08-26: a live worker session reached this point
+# with 23 of 61 product checkouts behind origin, one by 13 commits — a repo the
+# same session had ALREADY read source from. Earlier the same defect left a
+# checkout 3 commits/3 days stale, returned pre-fix source to a grep, and nearly
+# shipped a redundant change into an auto-deploying repo. Same shape as
+# g-306-233 (a worker never pulled the FRAMEWORK), one surface over.
+Bash: py -3 core/scripts/product-repo-freshness.py --pull
+# Fail-open, and never branch on this rc. The network fetch is throttled per
+# repo (stateless via FETCH_HEAD mtime), so the steady state is a rev-list per
+# repo and nothing else. rc=2 `unrecognized arguments: --pull` means this box
+# predates the flag: say so in one line and continue — do NOT hand-roll a
+# substitute pull.
+# READ THE OFF-DEFAULT LINES. A checkout parked on a feature branch is the one
+# class this pull deliberately does NOT fix (fast-forwarding it advances the
+# feature branch while the tree still lacks the default branch's content), so
+# confirm any negative about such a repo's contents against its default branch
+# before asserting it.
 
 # Phase -0.2 — WATCHDOG TICK (g-306-240). A scoped CALL to the SAME probe engine
 # the reducer uses, in its role-filtered mode — never a worker-local detector
@@ -521,20 +551,23 @@ Bash: py -3 core/scripts/worker_execute.py skill-eligible <the goal's skill fiel
 # with it. `reducer-only-skills` prints the current set if you want to see it.
 #
 # WHY THIS IS NOT IN goal-selector, where the starvation half would also be
-# fixed: LIFECYCLE_DISPOSITIONS["select"] forbids it in as many words — "A worker
-# selects exactly like the reducer — same scorer, same candidate set. There is no
-# worker-specific selection logic and there must not be one." Filtering inside
-# the scorer would also put role-conditional behavior inside a component BOTH
-# roles run (guard-2783). The scorer stays byte-identical for both roles.
+# fixed: LIFECYCLE_DISPOSITIONS["select"] forbids worker-specific selection logic
+# outright, and guard-2783 forbids role-conditional behavior in a component BOTH
+# roles run. The scorer stays byte-identical for both roles.
 #
-# A GREEN ANSWER IS NOT A PROOF. The bridge is a positive list, so a reducer-only
-# skill nobody has added yet reads as eligible (fail-open, deliberate: 919 of 938
-# live candidates carry no skill at all, and fail-closed would strand the role).
-# If a goal's skill looks like loop-phase encoding over YOUR OWN unmerged
-# experience, skip it anyway and add it to SKILL_LIFECYCLE_STAGE. The line that
-# matters is loop-phase encoding (forbidden) vs goal-directed artifact creation
-# from content supplied in the goal (fine — `/tree` is pinned eligible for
-# exactly this reason).
+# A GREEN ANSWER IS NOT A PROOF, AND ON A SKILL-LESS GOAL THERE IS NO ANSWER.
+# The bridge is SKILL-keyed, so a goal with no skill (919 of 938 candidates) now
+# returns "NOT EVALUATED ... NOT a cleared check" at rc 0: eligible stays True
+# because fail-closed would strand the role, but the bridge DECLINED to judge and
+# the call is YOURS (g-115-6523). On that answer — and whenever a named skill
+# looks like loop-phase encoding over YOUR OWN unmerged experience — read the
+# goal's verification outcomes and description BEFORE claiming. Work that ENCODES
+# to tree/reasoning-bank/guardrails, RESOLVES a hypothesis, drains a capture lane,
+# consumes worker refs, pushes main, or writes the agent-wide working-memory.yaml
+# is REDUCER-ONLY: release it, take the next candidate. SKILL_LIFECYCLE_STAGE is
+# the remedy for a NAMED skill only — a skill-less goal has no key to add. The
+# line that matters is loop-phase encoding (forbidden) vs goal-directed artifact
+# creation from content supplied in the goal (`/tree` is pinned for that reason).
 IF no goal: this is a GENUINE close — the worker has exhausted its work. Write the
   body-closing sentinel so the stop-hook (Phase-2B producer) marks this Body
   closed-pending-merge for the reducer to merge at generalize-down, then STOP:
@@ -801,16 +834,15 @@ FOR EACH tree-worthy domain fact this unit established (usually 0):
 #      spark_capture was handed. Second instance of the g-306-289 measurement
 #      (215 on cc-07), so this is the rule, not an outlier.
 #
-# DO NOT FLAG EVERYTHING. The cap still holds when every entry is flagged (a cap a
-# writer can defeat is not a cap), so blanket-flagging does not preserve more — it
-# just restores plain FIFO among the flagged and destroys the signal the reducer
-# uses to triage. Measured shape from the incident that motivated this: 1
-# load-bearing entry of 6.
+# DO NOT FLAG EVERYTHING. The cap holds when every entry is flagged (a cap a
+# writer can defeat is not a cap), so blanket-flagging preserves nothing: it
+# restores FIFO among the flagged and destroys the triage signal. ~1 of 6 is
+# healthy. The flag is honor-system; a mis-flag costs priority, nothing else.
 #
-# The flag is honor-system and unvalidated by design: nothing refuses a wrong
-# flag, and the fast lane never RESOLVES or ENCODES anything — it only moves the
-# entry earlier. The reducer still runs every real handler over it, so a
-# mis-flagged entry costs a little priority and nothing else.
+# KNOWN COST, ACCEPTED (g-306-361): at saturation an honest UNFLAGGED append
+# destroys an unrecoverable peer, a flagged one a carried duplicate. Flag
+# honestly anyway. Measured: re-ordering the victim moves ~10% of losses; the
+# lever is that a Body lane never DRAINS (the carrier copies, never clears).
 
 # Phase 3.7 — CARRIER CHECK (g-306-263). Numbered 3.7, NOT 3.9: Phase 3 above
 # delegates to the EXECUTE PROTOCOL's "Phase 3.9 .. 4.5", so a worker-loop phase

@@ -4420,6 +4420,22 @@ def complete_by(ctx):
     _cb_expected: Dict[str, Any] = {"status": goal.get("status")}
     if goal.get("lastAchievedAt") is not None:
         _cb_expected["lastAchievedAt"] = goal.get("lastAchievedAt")
+    if goal.get("recurring"):
+        # : the recurring branch cycles status back to `pending`, so
+        # `status` is UNCHANGED by this write and cannot witness the claim pop
+        # above; `lastAchievedAt` is monotonic ("strictly-newer wins") in
+        # coordination_merge._merge_goal, so it survives a reconcile
+        # INDEPENDENTLY of the claim fields and cannot witness it either. A
+        # lost PUT therefore leaves the goal pending AND still claimed, with
+        # nothing read back — the residual-claim shape guard-4775 measures.
+        # The NON-recurring branch needs no equivalent: its status IS terminal,
+        # and _merge_goal clears the whole claim triple whenever the merged
+        # status is terminal, so verifying `status` witnesses it transitively.
+        # claimed_by_sid is omitted for the same reason it is omitted from
+        # release()'s check below: the triple moves as a UNIT at every merge
+        # branch and every write site, so the pair witnesses the sid.
+        _cb_expected["claimed_by"] = None
+        _cb_expected["claimed_at"] = None
     if not _verify_transition_persisted(live_path, asp["id"], goal_id,
                                         _cb_expected):
         import sys

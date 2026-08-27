@@ -181,6 +181,29 @@ def _clear(path, repo, sha):
     return len(entries) - len(kept), len(kept)
 
 
+def _repo_is_qualified(repo):
+    """True when `repo` is an owner/name path that `gh api repos/<repo>` can resolve.
+
+    Every gh call in this module interpolates `repos/%s % repo`, so a BARE name
+    (no owner) can never resolve — `gh api repos/Ayoai-Operator` returns 404 Not
+    Found. _landed_on_default's positive control then fails and it returns the
+    fail-SAFE (False, ""), which is the SAME value it returns when gh is
+    genuinely unusable. The two causes are INDISTINGUISHABLE at that field, so a
+    malformed entry is kept forever while every close re-probes it and the
+    stderr line reads like a transient gh problem.
+
+    Measured (g-335-1313): two Ayoai-Operator entries recorded 2026-08-05 with a
+    bare repo sat unresolvable for 19 days. Two independent diagnoses on two
+    boxes blamed cc-04's gh auth — both had hand-probed the OWNER-QUALIFIED
+    string that production never stored. Side by side on one box, one second
+    apart, with gh healthy: _landed_on_default("Ayoai-Operator", "1aa65b9") ->
+    (False, "") and _landed_on_default("zkysar1/Ayoai-Operator", "1aa65b9") ->
+    (True, "ancestor:main"). Same guard-3970 shape from the write side: a
+    fail-safe default that cannot be told apart from a measured absence.
+    """
+    return bool(repo) and "/" in repo.strip("/")
+
+
 def _landed_on_default(repo, sha, timeout=30):
     """Probe whether the sha's work reached the default branch by a path OTHER
     than an ok CI run for the exact sha. Returns (landed: bool, via: str).
@@ -337,6 +360,24 @@ def cmd_add(args):
     repo, sha = (args.repo or ""), (args.sha or "")
     if not repo or not sha:
         return 0  # nothing trackable
+    # : REFUSE an owner-less repo instead of recording a permanent
+    # phantom. This deliberately BREAKS the module's usual fail-open-toward-
+    # registering posture, and the asymmetry is the whole point: an unqualified
+    # repo is unresolvable BY CONSTRUCTION (see _repo_is_qualified), so storing
+    # it does not preserve a deploy obligation — it manufactures one that can
+    # NEVER clear, marks every future close not-clean, and buries genuine
+    # deploy failures in that permanent noise. Nothing real is dropped here.
+    # The sole automatic caller (deploy-detect-hook.sh) derives repo from the
+    # origin URL and always yields owner/name, so this can only fire on a HAND
+    # invocation — which is exactly how the two 19-day-stuck entries were made.
+    if not _repo_is_qualified(repo):
+        sys.stderr.write(
+            "pending-deploys add: REFUSED repo=%r — expected owner/name (e.g. "
+            "zkysar1/Ayoai-Operator). A bare name can never resolve via `gh api "
+            "repos/<repo>`, so the entry would be kept forever and read as a "
+            "transient gh failure (g-335-1313).\n" % repo
+        )
+        return 2
     goal_id, d = (args.goal_id or ""), (args.dir or "")
     #  / rb-4737: skip commits on a non-deploying (non-default) branch —
     # they never trigger the deploy workflow, so deploy-verify returns `unverified`
@@ -392,6 +433,25 @@ def cmd_resolve(args):
     error (kept).
     """
     repo, sha, d = (args.repo or ""), (args.sha or ""), (args.dir or "")
+    # : an owner-less repo is a USAGE error, not an unverified deploy.
+    # Report it as rc 3 — the code this docstring already documents as "usage
+    # error (kept)" — so the gate's stderr line reads `rc=3` instead of `rc=2`.
+    # That one bit is what tells a reader to inspect the ENTRY rather than
+    # re-check gh auth. Without it both causes print the identical "UNVERIFIED
+    # ... entry kept for re-probe" line (pending-deploys-gate.sh's else-branch
+    # covers every rc but 0 and 1), which is how two entries re-probed silently
+    # for 19 days and drew two independent wrong diagnoses at gh.
+    # The entry is KEPT, exactly as on every other non-zero path: a malformed
+    # row still needs a human decision, and silently dropping it here would
+    # trade an unclearable obligation for an untracked one.
+    if repo and not _repo_is_qualified(repo):
+        print(json.dumps({
+            "status": "malformed-repo", "cleared": False, "rc": 3,
+            "detail": "repo=%r is not owner/name, so `gh api repos/<repo>` "
+                      "cannot resolve it and this entry can never clear. Clear "
+                      "it and re-add with the owner prefix." % repo,
+        }))
+        return 3
     dv = SCRIPT_DIR / "deploy-verify.sh"
     from _runtime_bash import bash_cmd  # guard-580 (bin-first, clean-PATH-safe) + guard-581
     cmd = bash_cmd(dv)

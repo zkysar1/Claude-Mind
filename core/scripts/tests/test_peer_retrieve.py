@@ -587,3 +587,81 @@ def test_absent_jsonl_stores_stay_clean(tmp_path):
     results, unreadable = pr.search_world_dir(w, ["widget"], limit=5)
     assert unreadable == []
     assert len(results) == 1
+
+
+# ── Tier classification () ─────────────────────────────────────────
+
+def _pr():
+    import importlib.util, sys as _s
+    from pathlib import Path as _P
+    sd = _P(__file__).resolve().parents[1]
+    _s.path.insert(0, str(sd))
+    spec = importlib.util.spec_from_file_location("pr_tier", sd / "peer_retrieve.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def test_board_is_public_everything_else_is_raw():
+    m = _pr()
+    assert m.store_tier("board/general") == m.TIER_PUBLIC
+    assert m.store_tier("board/findings") == m.TIER_PUBLIC
+    for s in ("knowledge-tree", "conventions", "reasoning-bank", "guardrails", ""):
+        assert m.store_tier(s) == m.TIER_RAW, s
+
+
+def test_default_tier_is_all_and_returns_rows_unchanged():
+    """The non-breaking guarantee: defaulting to public would silently delete
+    every tree/convention hit from the LIVE Tier 2.5 lane."""
+    m = _pr()
+    rows = [{"store": "board/general", "ref": "msg-1"},
+            {"store": "knowledge-tree", "ref": "intelligence/agent"}]
+    assert m.filter_by_tier(rows) == rows
+    assert m.filter_by_tier(rows, m.TIER_ALL) == rows
+
+
+def test_public_tier_keeps_only_board_rows():
+    m = _pr()
+    rows = [{"store": "board/general", "ref": "msg-1"},
+            {"store": "knowledge-tree", "ref": "intelligence/agent"}]
+    out = m.filter_by_tier(rows, m.TIER_PUBLIC)
+    assert [r["store"] for r in out] == ["board/general"]
+
+
+def test_a_granted_scope_admits_raw_rows_inside_that_subtree():
+    m = _pr()
+    rows = [{"store": "board/general", "ref": "msg-1"},
+            {"store": "knowledge-tree", "ref": "intelligence/agent/memory"},
+            {"store": "knowledge-tree", "ref": "performance/latency"}]
+    out = m.filter_by_tier(rows, m.TIER_PUBLIC, scopes=["intelligence/agent"])
+    refs = [r["ref"] for r in out]
+    assert "msg-1" in refs                      # public still flows
+    assert "intelligence/agent/memory" in refs  # granted raw admitted
+    assert "performance/latency" not in refs    # ungranted raw withheld
+
+
+def test_granted_scope_does_not_admit_a_sibling_sharing_a_prefix():
+    """Same over-granting boundary as _grants.covers — asserted again HERE
+    because this is a second, independent implementation of the predicate."""
+    m = _pr()
+    rows = [{"store": "knowledge-tree", "ref": "intelligence/agent-secrets"}]
+    assert m.filter_by_tier(rows, m.TIER_PUBLIC, scopes=["intelligence/agent"]) == []
+
+
+def test_tier_helpers_did_not_introduce_a_fileops_import():
+    """peer_retrieve's core invariant — the guard-955/rb-2983 backend class."""
+    m = _pr()
+    m.assert_no_fileops()
+
+
+def test_search_world_dir_filters_before_truncating(tmp_path):
+    """A grant holder must not see FEWER granted nodes as the peer's public
+    traffic grows. Filtering after the [:limit] slice would do exactly that."""
+    m = _pr()
+    rows = [{"store": "board/general", "ref": "m%d" % i, "score": 100 - i}
+            for i in range(5)]
+    rows.append({"store": "knowledge-tree", "ref": "intelligence/agent/x", "score": 1})
+    # Low-scoring granted raw row would fall outside a limit-3 window if the
+    # publics were kept; with tier=public+scope it must survive.
+    out = m.filter_by_tier(rows, m.TIER_RAW, scopes=["intelligence/agent"])
+    assert [r["ref"] for r in out] == ["intelligence/agent/x"]

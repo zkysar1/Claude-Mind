@@ -165,6 +165,32 @@ ENC_SLOT = "encoding_capture"
 ENC_QUEUE_SLOT = "encoding_queue"
 ENC_REPLAY_PRIORITY = "standard_deferred"
 
+# The prose-key fallback chain (guard-4044, applied to THIS lane by ).
+# `encoding_capture` has NO enforced schema -- many Bodies append whatever key
+# they like -- so a literal single-key read silently drops every entry that used
+# a different name, and the drop is invisible because the survivors replay
+# normally. Measured on the live 936-entry slot (alpha worker, cc-07,
+# 2026-08-24): 804 carry `fact`; 125 (13.4%) do NOT and were dropped by the
+# single-key read. The chain below recovers 97 of those 125.
+#
+# ORDER IS PROSE-BEFORE-LABEL, deliberately. Where an entry carries several of
+# these, the first match wins, so a short label ahead of real prose would
+# TRUNCATE the observation rather than merely rename it -- `title` is therefore
+# last. `content` leads the fallbacks on measurement, not taste: it appears on
+# 36 dropped entries at a mean length of 717 chars and is absent from
+# guard-4044's original chain, which was derived from `spark_capture`.
+#
+# The remaining 28 are NOT "empty" (guard-4093: a zero with a blind lane is
+# unreachable, not empty) -- they carry prose under narrower keys, and 5 of them
+# are exp_capture-shaped rows (execution_summary / key_decisions /
+# surprise_level) that were MISROUTED into this slot. Widening the chain to
+# swallow those would encode an execution narrative as a world-fact, so they are
+# deliberately left to the REPORT half instead: the lane now names how many
+# carried no prose key, which is the number that makes a misroute visible.
+ENC_PROSE_KEYS = ("fact", "content", "body", "observation", "note", "insight",
+                  "lesson", "text", "finding", "summary", "rule", "detail",
+                  "title")
+
 # The .md at content_path carries every anchor; the JSONL record carries a
 # bounded head of them, because that record is re-read on every experience
 # retrieval and a worker unit can capture 20+ anchors. When the bound bites, a
@@ -331,7 +357,7 @@ def exp_summary(entries, item) -> str:
     return f"Worker-executed goal {item['goal_id']}: {item['title']}"[:300]
 
 
-def exp_anchor_objects(entries) -> list:
+def exp_anchor_objects(entries, losses=None) -> list:
     """Capture anchors -> the `{key, content}` objects the record schema requires.
 
     `exp_capture` writes `verbatim_anchors` as bare STRINGS (worker-loop Phase
@@ -339,26 +365,68 @@ def exp_anchor_objects(entries) -> list:
     both `key` and `content`. That mismatch is the rb-245 class — two stores
     agreeing on a field NAME and disagreeing on its SHAPE — so the transform is
     explicit here rather than left to the writer.
+
+    `losses`, when a dict is passed, is filled with the per-path drop counts
+    (g-306-299 outcome 2). The transform NORMALISES rather than rejects, so a
+    dropped anchor is invisible today: experience-add refuses a malformed anchor
+    list at rc=0, meaning a silent drop produces no error anywhere. A count is
+    what makes the conformance claim falsifiable instead of assumed.
+
+    MEASURED 2026-08-24 (alpha worker, cc-08) over a real populated slot — 20
+    entries / 173 anchors, ALL bare strings, 173 in -> 173 out, every path zero.
+    Those zeros are vacuous for two of the paths and must not be read as
+    coverage: there were 0 dict anchors, so `dict_missing_field` could not fire,
+    and the largest group held 21 against a cap of 25, so `truncated` could not
+    either. Each path was therefore positive-controlled separately with
+    synthetic input (rb-245 / guard-1715: never accept a zero over a population
+    that cannot exercise the path).
+
+    Of the three paths, only TWO are genuinely silent. `truncated` already
+    self-reports in-band — it appends an `anchors-truncated` marker naming the
+    dropped count and the total — so the caller escalates on the other two only.
     """
+    if losses is not None:
+        losses.setdefault("dict_missing_field", 0)
+        losses.setdefault("empty_content", 0)
+        losses.setdefault("duplicate_content", 0)
+        losses.setdefault("truncated", 0)
+        losses.setdefault("input_anchors", 0)
+
+    def _bump(name):
+        if losses is not None:
+            losses[name] += 1
+
     seen, objs = set(), []
     for entry in entries or []:
         for anchor in entry.get("verbatim_anchors") or []:
+            _bump("input_anchors")
             if isinstance(anchor, dict):
                 # Already the record shape (a future capture writer, or a
                 # hand-authored entry) — take it as-is when it is well-formed.
                 key, content = anchor.get("key"), anchor.get("content")
                 if key is None or content is None:
+                    _bump("dict_missing_field")
                     continue
                 key, content = str(key), str(content).strip()
             else:
                 key, content = "", str(anchor).strip()
-            if not content or content in seen:
+            # Split from the original single `not content or content in seen`
+            # so the two paths are counted apart: an EMPTY anchor is a malformed
+            # input worth escalating, a DUPLICATE is the dedup working. Same
+            # control flow, same output.
+            if not content:
+                _bump("empty_content")
+                continue
+            if content in seen:
+                _bump("duplicate_content")
                 continue
             seen.add(content)
             objs.append({"key": key or f"anchor-{len(objs) + 1:02d}",
                          "content": content})
     if len(objs) > ANCHOR_RECORD_MAX:
         dropped = len(objs) - ANCHOR_RECORD_MAX
+        if losses is not None:
+            losses["truncated"] = dropped
         objs = objs[:ANCHOR_RECORD_MAX] + [{
             "key": "anchors-truncated",
             "content": (f"{dropped} further anchor(s) omitted from this record; "
@@ -618,6 +686,81 @@ def _unreadable_slots(captures, enc_captures) -> list:
     return blind
 
 
+def drain_consumed_captures(root: Path, drained_goal_ids, slots=None) -> dict:
+    """Remove capture entries for goals whose retrospective MARKER was stamped.
+
+    g-115-7366. `exp_capture` and `encoding_capture` had readers and no drain:
+    grepping every clear site in core/scripts and .claude/skills finds two for
+    `spark_capture` (the positive control, so the grep works) and ZERO for the
+    other three lanes. WITHOUT A CLEAR SITE THE CAP DECIDES THE SYMPTOM, NOT
+    WHETHER THERE IS ONE: a CAPPED lane parks at cap and evicts its oldest entry
+    on every append (silent, unrecoverable — the slot is that entry's only copy),
+    while an UNCAPPED one grows without bound. Measured on this Body 2026-08-24,
+    all four at once: spark_capture 50/50, exp_capture 20/20, hyp_capture 10/10
+    — three lanes sitting exactly ON their caps — and `encoding_capture`, which
+    has no cap, at 931 entries across 481 distinct goals. Do not read the 931 as
+    an eviction figure; it is the growth arm of the same root cause.
+
+    THE PREDICATE IS THE EXISTING MARKER, NOT A NEW JUDGEMENT. `retrospect`
+    stamps `marked` only when at least one lane landed AND no capture lane was
+    BLIND or LOSSY — the invariant that already licenses suppressing the retry
+    FOREVER. Anything safe to never retry is safe to drop the captures of, so
+    reusing it adds no new way to be wrong. Every goal whose marker was withheld
+    keeps its entries and stays a retry candidate.
+
+    WHOLE-SLOT CLEAR WOULD BE WRONG HERE, and that is the one thing to carry
+    forward if this is ever rewritten. `spark_capture`'s consumer replays EVERY
+    entry, so its blanket `wm-clear.sh` is safe. This consumer processes only
+    `plan` — `merged_goal_ids` capped at `--max` (25) — while the slot
+    accumulates across every Body and every merge (481 goals against a 25-goal
+    batch, measured). A blanket clear would destroy the other 456, and
+    `capture_fast_lane`'s consumed-hash watermark (g-306-311) would make that
+    loss PERMANENT by suppressing re-delivery. The watermark makes a clear safe
+    from DUPLICATES; it does nothing for entries that were never processed.
+
+    THE FILTER RUNS IN THE HANDLER, NOT HERE (guard-3881). An earlier draft of
+    this function read the slot, filtered in this process, and POSTed the
+    survivors to `wm-set.sh` — a full-slot overwrite of a stale snapshot, which
+    destroys any entry appended in between. Holding the WM lock would not have
+    fixed it: `wm_write.set_slot`'s loop_state CAS exists precisely because "a
+    >10s stall lets a peer stale-break this lock and write". So the subtraction
+    moved server-side to `wm-drain-goals.sh` -> POST /v1/wm/drain-goals, which
+    re-reads and re-applies the predicate INSIDE the lock. What this function
+    sends is the goal-id SET, never a surviving list.
+
+    FAIL-CLOSED TOWARD KEEPING, on every branch: an empty marked-set, a
+    non-zero rc, or an unparseable verdict all drain NOTHING. The handler keeps
+    non-dict entries and entries carrying no `goal_id` for the same reason — an
+    entry that cannot be classified must not be destroyed by the classifier.
+    """
+    if slots is None:
+        slots = (EXP_SLOT, ENC_SLOT)
+    ids = sorted({g for g in (drained_goal_ids or ()) if isinstance(g, str) and g})
+    out = {}
+    for slot in slots:
+        rec = {"removed": 0, "kept": 0, "wrote": False, "error": ""}
+        out[slot] = rec
+        if not ids:
+            rec["error"] = "no-marked-goals"
+            continue
+        rc, stdout, err = _run(
+            bash_cmd(str(root / "core" / "scripts" / "wm-drain-goals.sh"), slot),
+            stdin=json.dumps(ids))
+        if rc != 0:
+            rec["error"] = (err or stdout or "").strip()[-200:] or "drain-failed"
+            continue
+        verdict = _decode_first(stdout, "{")
+        if not isinstance(verdict, dict):
+            # Never infer "drained nothing" from a shape we did not expect, and
+            # never infer success from rc=0 alone (guard-2298).
+            rec["error"] = "unparseable-verdict"
+            continue
+        rec["removed"] = int(verdict.get("removed") or 0)
+        rec["kept"] = int(verdict.get("kept") or 0)
+        rec["wrote"] = rec["removed"] > 0
+    return out
+
+
 # ─────────────────────────────── the lanes ───────────────────────────────
 
 def _lane_team_state(item, agent, now_iso, root):
@@ -696,9 +839,10 @@ def _lane_experience(item, agent, now_iso, root, entries):
             handle.write(render_trace(item, entries, agent, now_iso))
         # verbatim_anchors and type have no CLI flag on the wrapper; they ride
         # the optional stdin JSON, which the endpoint merges as `extra`.
+        losses = {}
         payload = json.dumps({"type": EXP_TYPE,
-                              "verbatim_anchors": exp_anchor_objects(entries)})
-        return _run(
+                              "verbatim_anchors": exp_anchor_objects(entries, losses)})
+        rc, out, err = _run(
             bash_cmd(str(root / "core" / "scripts" / "experience-archive-goal.sh"),
                      "--goal", item["goal_id"],
                      "--skill-slug", EXP_SKILL_SLUG,
@@ -706,6 +850,20 @@ def _lane_experience(item, agent, now_iso, root, entries):
                      "--summary", exp_summary(entries, item),
                      "--trace-file", trace_path),
             stdin=payload)
+        #  outcome 2. Escalate ONLY the two paths that are otherwise
+        # invisible: dedup is the feature working, and truncation already
+        # self-reports via its in-band `anchors-truncated` marker. Reporting
+        # those two would be noise and would bury the ones that matter.
+        malformed = losses["dict_missing_field"] + losses["empty_content"]
+        if malformed:
+            err = (err or "") + (
+                f"\n[exp-anchors] {malformed} of {losses['input_anchors']} anchor(s) "
+                f"DROPPED SILENTLY before the record for {item['goal_id']}: "
+                f"dict-missing-key-or-content={losses['dict_missing_field']}, "
+                f"empty-content={losses['empty_content']}. "
+                f"(deduped={losses['duplicate_content']}, "
+                f"truncated={losses['truncated']} — both by design.)")
+        return rc, out, err
     except OSError as e:
         return -1, "", f"experience lane could not stage a trace file: {e}"
     finally:
@@ -718,23 +876,44 @@ def _lane_experience(item, agent, now_iso, root, entries):
                 pass
 
 
+def enc_prose(entry) -> "tuple[str, str | None]":
+    """Return `(prose, key_it_came_from)` for one `encoding_capture` entry.
+
+    The key is returned, not just the text, because the caller has to REPORT
+    which fallback each entry used -- that reporting is the half of guard-4044
+    that turns schema drift into a number instead of silence. `("", None)`
+    means no key in `ENC_PROSE_KEYS` carried anything.
+    """
+    if not isinstance(entry, dict):
+        return "", None
+    for key in ENC_PROSE_KEYS:
+        value = str(entry.get(key) or "").strip()
+        if value:
+            return value, key
+    return "", None
+
+
 def enc_observation(entry) -> str:
     """Render one `encoding_capture` entry as an encoding_queue observation.
 
     Read DEFENSIVELY: capture slots carry no enforced schema (guard-4044), and
     the sibling spark bridge broke on exactly this by assuming a field was
-    present. Every field below is optional except the fact itself; an entry with
-    no usable fact yields "" and is dropped by the caller rather than queued as
-    an empty node request.
+    present. The prose is taken from the first `ENC_PROSE_KEYS` hit rather than
+    from `fact` alone -- `fact` is the CONVENTIONAL key, never the only one
+    written -- and an entry carrying prose under none of them yields "" and is
+    dropped by the caller rather than queued as an empty node request.
+
+    Do NOT "fix" a future drop by tightening the WRITER instead (guard-4044's
+    own action_hint): the slot is append-only from many Bodies, so a
+    producer-side schema would drop entries at WRITE time, and a dropped write
+    is unrecoverable where a skipped read is not.
 
     `evidence` is carried verbatim and is the field that earns this lane its
     keep: the reducer writes the node later and cannot re-measure what it never
     observed, so a queued fact with no traceable measurement is precisely the
     drift these captures exist to prevent.
     """
-    if not isinstance(entry, dict):
-        return ""
-    fact = str(entry.get("fact") or "").strip()
+    fact, _key = enc_prose(entry)
     if not fact:
         return ""
     parts = [fact]
@@ -790,10 +969,18 @@ def _lane_encoding(item, agent, now_iso, root, entries):
     # hint are still ONE node and must not both queue.
     queued = 0
     seen_observations = set()
+    fell_through = {}   # fallback key -> count, for keys after the primary
+    no_prose_key = 0    # entries carrying prose under NO key in the chain
     for entry in entries:
         observation = enc_observation(entry)
         if not observation:
+            # guard-4044's REPORT half: a shape mismatch becomes a NUMBER in the
+            # lane result, never a silent `continue`.
+            no_prose_key += 1
             continue
+        _prose, prose_key = enc_prose(entry)
+        if prose_key != ENC_PROSE_KEYS[0]:
+            fell_through[prose_key] = fell_through.get(prose_key, 0) + 1
         if observation in seen_observations:
             continue
         seen_observations.add(observation)
@@ -827,12 +1014,21 @@ def _lane_encoding(item, agent, now_iso, root, entries):
                 f"those {queued}")
         queued += 1
     if queued == 0:
-        # Entries existed but none carried a usable fact. That is a lane that
-        # ran and found nothing to queue, NOT a success — reporting rc=0 here
-        # would let an all-malformed batch count toward `wrote` and stamp the
-        # marker, suppressing the retry forever on work that was never encoded.
-        return -1, "", "no encoding_capture entry carried a usable `fact`"
-    return 0, f"queued {queued}", ""
+        # Entries existed but none carried usable prose. That is a lane that ran
+        # and found nothing to queue, NOT a success — reporting rc=0 here would
+        # let an all-malformed batch count toward `wrote` and stamp the marker,
+        # suppressing the retry forever on work that was never encoded.
+        return -1, "", (
+            f"no encoding_capture entry carried usable prose under any of the "
+            f"{len(ENC_PROSE_KEYS)} known keys "
+            f"({no_prose_key} of {len(entries)} carried none)")
+    summary = f"queued {queued}"
+    if fell_through:
+        detail = " ".join(f"{k}={fell_through[k]}" for k in sorted(fell_through))
+        summary += f"; recovered via fallback key: {detail}"
+    if no_prose_key:
+        summary += f"; {no_prose_key} carried no prose key"
+    return 0, summary, ""
 
 
 def _write_marker(item, agent, now_iso, root):
@@ -1075,6 +1271,17 @@ def main(argv=None) -> int:
             summary["applied"].append(
                 retrospect(item, args.agent, now_iso, root, captures,
                            enc_captures))
+        # DRAIN (). Runs AFTER every lane, on the marker predicate —
+        # see `drain_consumed_captures` for why the marker and why not a
+        # blanket clear. Ordered last on the same crash-safety reasoning the
+        # spark_capture precedent gives: a crash between the lanes and the
+        # drain leaves the entries in place to be re-processed (the marker
+        # makes that a no-op), whereas draining first could lose a batch whose
+        # lanes then failed.
+        summary["drained_goals"] = [r["goal_id"] for r in summary["applied"]
+                                    if r.get("marked")]
+        summary["capture_drain"] = drain_consumed_captures(
+            root, summary["drained_goals"])
     else:
         summary["would_apply"] = [p["goal_id"] for p in plan]
         # Dry-run must be able to answer "will the experience lane fire?" — the

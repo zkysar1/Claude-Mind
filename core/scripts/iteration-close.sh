@@ -472,7 +472,51 @@ _print_recovery_instructions() {
     echo "[iteration-close] RECOVERY (rc=$rc, phase=$_CURRENT_PHASE, goal=${GOAL_ID:-?}):" >&2
     case "$_CURRENT_PHASE" in
         verify)
-            echo "  Goal ${GOAL_ID:-?} may be in indeterminate state (verify rejection)." >&2
+            # g-115-7663: PROBE, do not assert. This branch printed ONE
+            # unconditional "may be in indeterminate state" plus a "Revert
+            # (mark pending)" line on EVERY rc — including rc=2 from the entry
+            # check, where nothing ran and the goal was never touched, and
+            # including an interruption AFTER the status write landed, where
+            # reverting UNDOES a completed goal. The sibling state-update
+            # branch below has probed live state since g-115-4096; this one
+            # never did. Same helper, same fail-open contract (empty => assert
+            # neither direction), and it costs one read on the rc!=0 path only.
+            #
+            # WHAT CAN STILL REACH HERE, re-derived after this goal made every
+            # post-status-write side effect non-fatal (guard-2186 step 5 — an
+            # upstream fix can invalidate a message premise while leaving its
+            # observation true):
+            #   - entry-check refusal (rc=2) or a gate refusal: nothing landed
+            #   - the status write itself failing: nothing landed
+            #   - INTERRUPTION after the status write (SIGTERM / harness
+            #     timeout / exit 143, guard-3511): the write DID land. This is
+            #     now the only path that reaches here with a closed record, and
+            #     it is the one the old unconditional Revert line corrupted.
+            # A failing stamp no longer reaches here at all — it warns and the
+            # close continues.
+            local _vlive; _vlive="$(_probe_goal_status)"
+            if [[ -z "$_vlive" ]]; then
+                # The hedge phrase is PINNED by test_iteration_close_recovery_probe.py
+                # ::test_verify_case_unchanged_hedge_survives (g-115-4096), which
+                # exercises exactly this unreadable branch. g-115-4096 deliberately
+                # left the verify case alone because a HEDGE does not assert unread
+                # state; g-115-7663 changes only the REMEDIES, so the hedge stays
+                # here — the one branch where hedging is the honest answer.
+                echo "  Goal ${GOAL_ID:-?} may be in indeterminate state — could not read its live record; asserting neither direction." >&2
+                echo "  Probe first: bash core/scripts/aspirations-read.sh --source ${SOURCE:-<world|agent>} --id asp-<NNN>" >&2
+            elif [[ "$_vlive" == "$GOAL_STATUS" ]]; then
+                echo "  Goal ${GOAL_ID:-?} already reads status=$_vlive — the status this call was writing is ALREADY on the record, so the write landed (here or on a prior run); this rc came after it." >&2
+                echo "  Do NOT revert to pending: on a terminal status that re-opens a closed goal." >&2
+                echo "  What may be missing is the non-fatal bookkeeping ordered after it (outcome_class," >&2
+                echo "  completed_by_role, outcome_note, the diary breadcrumb, the COORDINATION BOARD POST," >&2
+                echo "  the team-state in_flight clear). An absent outcome_class is the fingerprint." >&2
+                echo "  Re-running verify re-attempts those; the status write is accepted again (no" >&2
+                echo "  same-value short-circuit), so the record stays $_vlive — but the board post can" >&2
+                echo "  DOUBLE-POST. Check the board before retrying." >&2
+            else
+                echo "  Goal ${GOAL_ID:-?} still reads status=$_vlive — the status write did NOT land; nothing downstream ran." >&2
+                echo "  (No revert needed — the goal is not closed.)" >&2
+            fi
             # --outcome is UNCONDITIONAL here, and the empty-case placeholder is
             # explicit rather than the `${OUTCOME:-deep}` default used by the
             # state-update / learning-gate hints below. Two reasons, both specific
@@ -492,7 +536,13 @@ _print_recovery_instructions() {
             [[ -n "$OVERRIDE_UNCOMMITTED" ]] && cmd+=" --override-uncommitted \"$OVERRIDE_UNCOMMITTED\""
             [[ -n "$OVERRIDE_MISSING_ARTIFACT" ]] && cmd+=" --override-missing-artifact \"$OVERRIDE_MISSING_ARTIFACT\""
             echo "  Retry: $cmd" >&2
-            echo "  Revert (mark pending): bash core/scripts/aspirations-update-goal.sh --source ${SOURCE:-world} ${GOAL_ID:-<id>} status pending" >&2
+            # The revert line is now CONDITIONAL. Offering it when the record is
+            # already closed is a destructive remedy for a state that does not
+            # need one (guard-2760: a destructive remedy needs evidence a
+            # reversible one is insufficient).
+            if [[ -n "$_vlive" && "$_vlive" != "$GOAL_STATUS" ]]; then
+                echo "  Revert (mark pending): bash core/scripts/aspirations-update-goal.sh --source ${SOURCE:-world} ${GOAL_ID:-<id>} status pending" >&2
+            fi
             ;;
         state-update)
             # g-115-4096: branch on the READ status — rc!=0 here is commonly the
@@ -1016,7 +1066,11 @@ do_verify() {
         fi
         "${update_cmd[@]}"
         if [[ "$GOAL_STATUS" == "completed" ]]; then
-            bash "$SCRIPT_DIR/aspirations-update-goal.sh" --source "$SOURCE" "$GOAL_ID" completed_date "$TODAY"
+            # NON-FATAL (g-115-7663). Bare, this aborts the whole close under
+            # `set -euo pipefail` AFTER the status write has already landed —
+            # see the block above outcome_class for the forensics.
+            bash "$SCRIPT_DIR/aspirations-update-goal.sh" --source "$SOURCE" "$GOAL_ID" completed_date "$TODAY" \
+                || echo "[iteration-close] ⚠ completed_date stamp failed for $GOAL_ID (non-fatal; status is already committed)" >&2
         fi
     fi
 
@@ -1033,8 +1087,35 @@ do_verify() {
     # REQUIRED at do_verify's entry check, so such a caller is refused at the
     # top and never reaches here. Left in place because the cost is one test and
     # removing it would make this line depend on an entry check ~150 lines away.
+    # NON-FATAL (g-115-7663), and this is the line that MEASURABLY took a close
+    # down. Every write from here to the end of do_verify is BOOKKEEPING or
+    # NOTIFICATION: the status write above is the only one whose failure means
+    # "the close did not happen". Bare, this call runs under `set -euo pipefail`
+    # (L65), so a lock blip on a stamp aborts do_verify and the EXIT trap (L3938)
+    # prints _print_recovery_instructions — offering a retry that would
+    # double-apply the status write and a revert-to-pending that would UNDO a
+    # completed goal. Neither remedy matches the actual state.
+    #
+    # WHAT IT KILLS, in order, all of them already fail-open and none reached:
+    # completed_by_role, outcome_note (closure-evidence-write), the execution-diary
+    # breadcrumb, the "Completed:" COORDINATION BOARD POST, the team-state
+    # in_flight clear, intent_state=committed, and close-defer-invalidation. The
+    # board post is the one that matters off-box: it is how the reducer and
+    # partner agents learn a goal closed, so its loss is invisible from HERE and
+    # surfaces as duplicate work or a stalled handoff on ANOTHER machine.
+    #
+    # MEASURED on g-326-627 (cc-08, 2026-08-24T14:43:41): status=completed and
+    # completed_date=2026-08-24 both landed, outcome_class and completed_by_role
+    # are ABSENT, and the board carried no post — i.e. do_verify died exactly
+    # here, one write past completed_date. An absent outcome_class on an
+    # otherwise-complete close is the durable fingerprint of this failure.
+    #
+    # Do NOT "fix" this by guarding the status write too: a failed status write
+    # means the close genuinely did not happen, and rc=1 is the correct report
+    # (that is guard-3256 sequence B, and it must stay loud).
     if [[ -n "$OUTCOME" && "$GOAL_STATUS" == "completed" ]]; then
-        bash "$SCRIPT_DIR/aspirations-update-goal.sh" --source "$SOURCE" "$GOAL_ID" outcome_class "$OUTCOME"
+        bash "$SCRIPT_DIR/aspirations-update-goal.sh" --source "$SOURCE" "$GOAL_ID" outcome_class "$OUTCOME" \
+            || echo "[iteration-close] ⚠ outcome_class stamp failed for $GOAL_ID (non-fatal; status is already committed)" >&2
     fi
 
     # g-306-204: stamp WHICH ROLE closed the goal. Sits beside outcome_class
@@ -2490,6 +2571,51 @@ for e in list(d.get('stranded') or []) + list(d.get('stranded_no_pr') or []):
         fi
     fi
 
+    # --findings-count auto-derive (g-115-3844). guard-399: a "the LLM must
+    # pass X at step N" instruction needs a bash baseline or it does not fire.
+    # guard-1235's own recovery advice is to ABSORB the loss, which is correct
+    # given the old wiring and wrong as a permanent state — the miss is silent
+    # and recurs by construction. --tree-updated has had a baseline since
+    # g-273-20 (the auto-detect ~40 lines above); the other three quality flags
+    # are pure pass-through (parsed L638-640, forwarded L266-268) and are
+    # exactly the three that go silently missing.
+    #
+    # Findings are the derivable one. execution-diary.py already records
+    # entry_type=finding with a goal_id and an auto-stamped timestamp (it
+    # stamps one when the caller omits it, execution-diary.py:332-334 — 52 of
+    # 53 bravo findings carry one; the single exception is a legacy line-1
+    # record), and its `read` subcommand already filters by --goal and
+    # --since. So this counts the WRAPPER's own JSON rather than hand-parsing
+    # the JSONL (guard-2298). --limit defaults to None (no truncation);
+    # verified against the raw store, 15 entries / 14 findings both ways.
+    #
+    # THREE DELIBERATE RESTRICTIONS, each load-bearing:
+    #  1. Only when the caller passed nothing. An explicit --findings-count is
+    #     an observation and always beats a derivation.
+    #  2. Only a count > 0 is adopted. Passing `--findings-count 0` would flip
+    #     this close out of the deliberate velocity_unmeasured_skip (g-115-2441
+    #     — skip rather than record a false 0.0) into a MEASURED close whose
+    #     quality inputs are all zero. That is strictly worse than absent.
+    #  3. Fail-open. Missing checkpoint, unparseable anchor, diary read error,
+    #     or a non-numeric result all leave FINDINGS_COUNT untouched, so the
+    #     worst case is exactly today's behaviour.
+    #
+    # --artifacts-count and --encoding-score are NOT derived here.
+    # --artifacts-count needs the commit enumeration that lives in another
+    # phase; --encoding-score is a judgment rating with no bash baseline
+    # available at all — it is guard-399's "optional enrichment on top of the
+    # bash baseline", i.e. the one flag for which a banner IS the right remedy.
+    if [[ -z "$FINDINGS_COUNT" ]] && [[ -f "$AGENT_DIR/session/iteration-checkpoint.json" ]]; then
+        FC_ANCHOR=$(python3 -c "import json,sys; d=json.load(open(r'$AGENT_DIR/session/iteration-checkpoint.json',encoding='utf-8')); print(d.get('selected_at',''))" 2>/dev/null || true)
+        if [[ -n "$FC_ANCHOR" ]]; then
+            FC_DERIVED=$(python3 "$SCRIPT_DIR/execution-diary.py" read --goal "$GOAL_ID" --since "$FC_ANCHOR" --json 2>/dev/null \
+                | python3 -c "import json,sys; print(sum(1 for e in (json.load(sys.stdin) or []) if e.get('entry_type')=='finding'))" 2>/dev/null || true)
+            if [[ "$FC_DERIVED" =~ ^[0-9]+$ ]] && [[ "$FC_DERIVED" -gt 0 ]]; then
+                FINDINGS_COUNT="$FC_DERIVED"
+                echo "[iteration-close] auto-derived --findings-count $FC_DERIVED (execution-diary entry_type=finding for $GOAL_ID since iteration anchor $FC_ANCHOR)"
+            fi
+        fi
+    fi
     local audit_args=(
         run-all
         --goal "$GOAL_ID"

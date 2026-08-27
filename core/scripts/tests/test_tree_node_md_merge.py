@@ -151,3 +151,141 @@ def test_KNOWN_RESIDUAL_a_deliberate_section_eviction_resurrects():
     out = H(evicted, full)
     assert out is not None
     assert b"DELETE ME" in out, "residual changed -- re-read this test's docstring"
+
+
+# ------------------------------------------- front-matter reconcile () --
+# Before this landed, merge_sections' preamble branch had three outcomes:
+# identical / one-side-empty / CONFLICT. A tree node ALWAYS carries non-empty
+# front matter on both sides, so the middle branch was unreachable for this
+# store and any front-matter difference froze the node unconditionally.
+# Measured <preamble>-conflict share of DIVERGED nodes: 16/16 cc-05, 3/3 cc-07.
+
+def _node(last_updated, source, body="## Alpha\nshared body\n", topic="T"):
+    return (
+        "---\n"
+        f'topic: "{topic}"\n'
+        f"last_updated: '{last_updated}'\n"
+        "last_update_trigger:\n"
+        "  type: goal_execution\n"
+        f'  source: "{source}"\n'
+        "---\n\n"
+        f"{body}"
+    ).encode("utf-8")
+
+
+def test_front_matter_only_divergence_now_CONVERGES():
+    # THE DEFECT. Same body, different provenance stamp -- the shape every
+    # cross-box tree write produces, because every writer bumps these two keys.
+    a = _node("2026-08-26", "box A wrote this")
+    b = _node("2026-08-24", "box B wrote this")
+    out = H(a, b)
+    assert out is not None, "front-matter-only divergence must no longer freeze"
+    assert b"shared body" in out
+
+
+def test_front_matter_reconcile_is_commutative_BYTE_FOR_BYTE():
+    # Commutativity is this handler's load-bearing property: two boxes see
+    # opposite (ours, theirs), and a non-commutative merge means perpetual
+    # mirror divergence on a file the merge just reported success on.
+    a = _node("2026-08-26", "box A wrote this")
+    b = _node("2026-08-24", "box B wrote this")
+    ab, ba = H(a, b), H(b, a)
+    # MUST assert non-None FIRST. Mutation-tested 2026-08-26: with the reconcile
+    # disabled both sides are None and a bare `ab == ba` passes trivially --
+    # the same "weaker assertion than the criterion it claims to enforce" defect
+    # this file's other commutativity pin was corrected for in .
+    assert ab is not None and ba is not None
+    assert ab == ba
+
+
+def test_LWW_keeps_the_later_last_updated():
+    a = _node("2026-08-26", "newer")
+    b = _node("2026-08-24", "older")
+    out = H(a, b).decode()
+    assert "2026-08-26" in out
+    assert '"newer"' in out or "newer" in out
+
+
+def test_equal_last_updated_tiebreak_is_deterministic_and_commutative():
+    # NOT an edge case: measured 3 of 16 cc-05 nodes (19%) had equal dates on
+    # both sides. A timestamp-only rule cannot decide these, so the tiebreak
+    # must be content-derived -- the caller's canonical side-sort.
+    a = _node("2026-08-26", "box A")
+    b = _node("2026-08-26", "box B")
+    out = H(a, b)
+    assert out is not None
+    assert out == H(b, a)
+
+
+def test_losers_trigger_is_DEMOTED_not_dropped():
+    # guard-4401: the front matter IS the provenance chain on these nodes and
+    # several entries carry RETRACTIONS of earlier figures, so dropping the
+    # loser silently deletes a correction.
+    import yaml
+    a = _node("2026-08-26", "winner source")
+    b = _node("2026-08-24", "loser source")
+    out = H(a, b).decode()
+    fm = yaml.safe_load(out[3:out.index("\n---", 3)])
+    trig = fm["last_update_trigger"]
+    assert trig["source"] == "winner source"
+    assert "loser source" in trig.values(), "loser's provenance was dropped"
+
+
+def test_demotion_never_produces_a_duplicate_key():
+    # guard-2388: YAML forbids duplicate keys, safe_load raises nothing and
+    # silently keeps only the LAST -- so "the key is present" is NOT evidence
+    # your value survived. Assert on the PARSED mapping, and that the raw block
+    # carries exactly one `source:` line.
+    a = _node("2026-08-26", "winner")
+    b = _node("2026-08-24", "loser")
+    out = H(a, b).decode()
+    block = out[3:out.index("\n---", 3)]
+    assert block.count("\n  source:") == 1, block
+    prior = [k for k in __import__("yaml").safe_load(block)["last_update_trigger"]
+             if str(k).startswith("prior_source_")]
+    assert prior == ["prior_source_1"], prior
+
+
+def test_demotion_increments_past_existing_prior_sources():
+    import yaml
+    a = ("---\ntopic: \"T\"\nlast_updated: '2026-08-26'\n"
+         "last_update_trigger:\n  type: goal_execution\n  source: \"newest\"\n"
+         "  prior_source_1: \"old one\"\n---\n\n## Alpha\nshared body\n").encode()
+    b = _node("2026-08-24", "loser")
+    out = H(a, b)
+    assert out is not None
+    trig = yaml.safe_load(out.decode()[3:out.decode().index("\n---", 3)])["last_update_trigger"]
+    assert trig["prior_source_1"] == "old one", "an existing prior_source was clobbered"
+    assert trig["prior_source_2"] == "loser"
+
+
+def test_a_difference_OUTSIDE_the_provenance_keys_still_REFUSES():
+    # THE FAIL-SAFE. A body-derived field has its own progression semantics
+    # (guard-1170: last_updated is deliberately NOT a field-poke freshness
+    # signal), so it must never be silently decided by an LWW on a key its
+    # writers do not bump. Refusing reproduces the pre-existing freeze exactly.
+    a = _node("2026-08-26", "s", topic="Topic A")
+    b = _node("2026-08-24", "s", topic="Topic B")
+    assert H(a, b) is None
+
+
+def test_body_section_conflict_still_REFUSES_even_when_front_matter_reconciles():
+    # The residual freeze (d) deliberately retains: same-heading divergence is
+    # the one case where freezing is the right answer. Reconciling the preamble
+    # must not weaken it.
+    a = _node("2026-08-26", "A", body="## Alpha\nA says x\n")
+    b = _node("2026-08-24", "B", body="## Alpha\nB says y\n")
+    assert H(a, b) is None
+
+
+def test_MEASURED_LIMIT_leading_prose_divergence_still_REFUSES():
+    # merge_sections defines <preamble> as everything before the first `## `
+    # heading -- front matter AND any leading prose. Measured 2026-08-26 on
+    # cc-07: of 3 diverged nodes, 2 were front-matter-only and 1 was PROSE-only
+    # (product-world-model.md, whose `**Last refresh**` pointer lives above the
+    # first heading). This fix addresses the front-matter half ONLY; a
+    # prose-divergent node still freezes, by design, because auto-picking prose
+    # is the silent corruption rb-3683 records.
+    a = _node("2026-08-26", "s", body="pointer: A\n\n## Alpha\nshared body\n")
+    b = _node("2026-08-26", "s", body="pointer: B\n\n## Alpha\nshared body\n")
+    assert H(a, b) is None

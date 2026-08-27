@@ -303,6 +303,62 @@ def _resolve_node_md(virtual_file: str, world_path: Path) -> Path:
     return world_path / vf
 
 
+def _durability_witness(path: Path, key: str, expectations: Dict[str, Any],
+                        write_stamp: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """POST-write durability probe for a merge-registered tree write ().
+
+    Distinct from the g-115-7816 STRUCTURAL post-condition, which guard-3150
+    pins BEFORE the write. That check asks "does the in-memory tree reflect what
+    the op claimed?" -- answerable pre-write, so writing first would be pure
+    downside. THIS check asks "did the write PERSIST?", which has no pre-write
+    form at all, so guard-3150's remedy is unavailable by construction rather
+    than declined. The two must stay separate: merging them would drag the
+    structural assertion after the write and re-open what guard-3150 closed.
+
+    WITNESS FIELDS MUST BE MERGE *INPUTS*, NEVER *OUTPUTS* (guard-5212). For
+    merge_tree, `_rebuild_tree_structure` unconditionally recomputes children /
+    child_count / node_type / depth from each node's `parent` on EVERY merge, so
+    those four pass any read-back regardless of what happened to the write and
+    have zero witnessing power. Callers must pass only INPUT fields: `parent`,
+    or a per-node non-structural field.
+
+    Peer-tolerant by construction: a MEMBERSHIP/FIELD assertion (not byte
+    identity) survives a peer editing a different node, or a different field of
+    the same node -- both merge cleanly and leave the asserted field untouched.
+    A byte/etag comparison would alarm forever on any multi-writer store.
+
+    Returns None when the write is witnessed, else a verdict dict. FAIL-OPEN:
+    any probe error returns None -- the write already succeeded, and a probe
+    fault must never be reported as data loss (guard-1562 class).
+    """
+    try:
+        from storage_backend import get_backend  # noqa: E402
+        be = get_backend()
+        raw = be.read_authoritative_bytes(Path(path).resolve())
+        if not raw:
+            return None                      # unreadable -> fail open, not "lost"
+        stored = yaml.safe_load(raw.decode("utf-8", "replace")) or {}
+    except Exception:
+        return None                          # fail-open (see docstring)
+    node = ((stored.get("nodes") or {}).get(key)) or {}
+    if not node:
+        return {"verdict": "write_not_durable", "key": key, "reason": "node absent",
+                "checked_fields": sorted(expectations)}
+    mismatched = {f: {"expected": v, "authoritative": node.get(f)}
+                  for f, v in expectations.items() if node.get(f) != v}
+    if not mismatched:
+        return None
+    # A peer legitimately winning the same node+field with a strictly-newer
+    # stamp is NOT a lost write. Keep the two verdicts distinct -- collapsing
+    # them reintroduces the indistinguishability  refused to inherit.
+    peer_stamp = node.get("last_updated")
+    if write_stamp and peer_stamp and str(peer_stamp) > str(write_stamp):
+        return {"verdict": "superseded_by_peer", "key": key,
+                "mismatched": mismatched, "peer_last_updated": peer_stamp,
+                "write_stamp": write_stamp}
+    return {"verdict": "write_not_durable", "key": key, "mismatched": mismatched}
+
+
 def _body_presence_warning(node_key: str, file_field, world_path: Path,
                            context: str):
     """ daemon mirror of tree.py warn_if_body_absent: return an
@@ -1537,6 +1593,18 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
                 _stored = node.get(field)
                 if isinstance(_stored, str):
                     resp["value_bytes"] = len(_stored.encode("utf-8"))
+                # : DURABILITY post-condition. `field` is the op's own
+                # INPUT to merge_tree's per-node field merge, so it witnesses
+                # this write (guard-5212 -- never children/child_count/
+                # node_type/depth, which the merge recomputes unconditionally).
+                # Report-only: the write already landed, so refusing here would
+                # be theatre. Fail-open inside the helper.
+                _dur = _durability_witness(path, key, {field: _stored},
+                                           write_stamp=node.get("last_updated"))
+                if _dur:
+                    print("WARN tree_write durability: " + json.dumps(_dur),
+                          file=sys.stderr)
+                    resp["durability_warning"] = _dur
                 # : enriching a bodiless node is the desync signature.
                 _bw = _body_presence_warning(key, node.get("file"),
                                              world_path, "set")
@@ -1590,10 +1658,60 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
                     [{"op": "remove-child", "key": parent_key,
                       "child_key": child_key}],
                     date.today().isoformat())
+                #  / guard-4592 / guard-1661 / guard-3150.
+                # STRUCTURAL POST-CONDITION, asserted BEFORE the write.
+                #
+                # The response below used to be exactly
+                # {"removed": child_key, "parent": parent_key} -- both values
+                # echoed VERBATIM FROM THE REQUEST. It was therefore true by
+                # construction and structurally incapable of reporting a failed
+                # removal: on 2026-08-20 (alpha worker Body, cc-08, own-cloud)
+                # that precise payload came back rc=0 while the node AND the
+                # parent's children entry were still present in the local mirror
+                # AND the authoritative store, both reading 1,514,666 B.
+                #
+                # The two sides here have DISTINCT ORIGINS, which is what
+                # guard-4592 requires: child_key comes from the REQUEST, while
+                # the membership tests read the MUTATED TREE STRUCTURE. This is
+                # not the one-side-of-an-assignment comparison that passes 100%
+                # of the time.
+                #
+                # THE NON-TAUTOLOGICAL CATCH: list.remove() removes only the
+                # FIRST occurrence. A duplicated child entry -- the shape an
+                # own-cloud union merge produces when a peer write resurrects a
+                # node (rb-2859 class) -- leaves the child STILL PRESENT while
+                # _apply_remove_child returns success. That is candidate (b) of
+                # this goal's two un-separated mechanisms, and this assertion
+                # catches it without asserting which mechanism is at fault.
+                #
+                # BEFORE the write, never write-then-verify (guard-3150): on an
+                # S3-authoritative store a post-write verify has already made the
+                # bad state the shared truth for every other box.
+                _nodes_after = tree.get("nodes", {})
+                _kids_after = list(
+                    (_nodes_after.get(parent_key) or {}).get("children") or [])
+                if child_key in _kids_after or child_key in _nodes_after:
+                    return Response.error(
+                        500, "remove_child_post_condition_failed",
+                        f"REFUSING to persist tree-remove-child: after applying "
+                        f"the removal in memory, '{child_key}' is STILL present "
+                        f"(in parent children: {child_key in _kids_after}; as a "
+                        f"node: {child_key in _nodes_after}). Nothing was "
+                        f"written. A duplicated child entry is the most likely "
+                        f"cause -- list.remove() drops only the first "
+                        f"occurrence. Inspect "
+                        f"nodes['{parent_key}']['children'] for duplicates. "
+                        f"See g-115-7816 / guard-4592.")
                 _write_tree_locked(path, tree, base_dir, agent,
                                    summary=f"tree-remove-child {child_key} from {parent_key}")
+                # guard-1661: return evidence the caller can check WITHOUT a
+                # second read. Send the STORED LIST, not a daemon-computed
+                # verdict -- the caller derives membership itself from its own
+                # argv, so neither side inherits the other's conclusion.
                 return Response.json({"ok": True, "op": op,
-                                      "removed": child_key, "parent": parent_key})
+                                      "removed": child_key, "parent": parent_key,
+                                      "parent_children": _kids_after,
+                                      "parent_child_count": len(_kids_after)})
 
             # ---- propagate --------------------------------------------------
             # Mirrors cmd_propagate (tree.py:2302-2337). No key-existence 404:

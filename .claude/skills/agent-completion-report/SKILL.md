@@ -134,6 +134,30 @@ All data comes from framework scripts — no direct JSONL reads.
    #   08-21 9.5h 75.0% (n=28, split 56/1262)  <- THIRD 08-21 reading, ~2h later
    #   08-22 25h(date-floored) 100% (n=22, split 60/1262)
    #   08-22 15.2h(date-floored 16.2h) 100% (n=14, split 62/1278)
+   #   08-24 32.5h(date-floored 48.8h) 86.2% (n=29, split 73/1279)  <- 3 CALENDAR DAYS
+   #   08-24 34.8h(date-floored 48.8h) 87.5% (n=32, split 76/1279)  <- SAME DAY, ~13min later, DIFFERENT BOX
+   #   08-24 63.3h(date-floored 83.9h) 83.3% (n=66, split 78/1279)  <- WIDEST WINDOW IN THE SERIES
+   #   08-25 13.3h(date-floored 25.3h) 63.0% (n=27, split 40/1335)  <- BACKLOG DRAINED 78->40, COVERAGE FELL WITH IT
+   # THE THIRD 08-24 ROW REFINES THE BACKLOG MODEL THE OTHER TWO PROPOSED, and it is the
+   # only row that can: it carries the HIGHEST backlog yet recorded (78 resolved) and still
+   # scored the LOWEST of the three, because its window is ~1.7x wider and reaches back past
+   # the archival horizon into days already swept. So backlog is not the sole driver either.
+   # Reconcile them this way: WITHIN a fixed window, coverage tracks the backlog (the 13-min
+   # pair proves that); ACROSS window widths, a window wide enough to cross the horizon pulls
+   # in archived rows and drives coverage DOWN regardless of backlog. Both effects are real at
+   # different scales, and neither licenses quoting a row — which is what the series already says.
+   # THE TWO 08-24 ROWS CONFIRM THE DRIVER DIRECTLY, and they are the cleanest pair in
+   # the series for it: 13 minutes apart, DIFFERENT BOXES (cc-0x, then foxtrot on
+   # LAPTOP-3IOFCNEO / WSL2 6.18.33.2), near-identical window width, and coverage ROSE
+   # 86.2% -> 87.5% while the resolved stage grew 73 -> 76 against an unchanged 1279
+   # archived. Coverage tracked the BACKLOG, not the window and not the box. If window
+   # width or box identity set coverage, these two would not move together like that.
+   # THE FIRST 08-24 ROW IS THE HIGHEST NON-100% READING BEFORE IT AND IT IS NOT A
+   # DATE-FLOOR ARTIFACT: it spans three calendar days, so guard-2303 does not
+   # explain it. It is high because the RESOLVED STAGE WAS BACKED UP -- 73 resolved
+   # against 44-62 in every prior row -- i.e. coverage rose because ARCHIVAL fell
+   # behind, not because the instrument improved. Same driver, opposite direction
+   # from the 08-15 low. Nothing here predicts your run; measure your own.
    # THE TWO 08-22 ROWS ARE BOTH 100% AND NEITHER MEANS THE INSTRUMENT IMPROVED: both
    # windows are SAME-DAY, and outcome_date is date-only, so the floor swallows the
    # whole window and the field cannot resolve inside it (guard-2303). The second row
@@ -275,8 +299,65 @@ All data comes from framework scripts — no direct JSONL reads.
         # file (which the outcome-observation hook mutates every goal).
         IF agents/<agent>/session/last-outcome-snapshot.yaml exists:
             Read it → outcome_prior = parsed YAML
+            # BASELINE-CORRESPONDENCE ASSERTION (g-001-04, 2026-08-24). The delta
+            # window is defined by `last-report-timestamp`; the baseline it diffs
+            # against is this file. NOTHING guarantees they correspond, and when
+            # they do not the report states a delta over the WRONG interval while
+            # looking completely normal. Two independent ways they decorrelate:
+            #   (1) a prior run wrote the timestamp and skipped this snapshot —
+            #       Phase 4 step 3's `|| true` makes a skip, a failed cp and a
+            #       success byte-identical after the fact;
+            #   (2) sync-tier split: `last-report-timestamp` is sync_tier
+            #       `continuity` (crosses machines) while this file is
+            #       `machine_local` (does not) — session-manifest.yaml:397/896.
+            #       A multi-box agent reporting from box B diffs against box B's
+            #       last LOCAL snapshot, not against its own last report.
+            # MEASURED 2026-08-24 (foxtrot, LAPTOP-3IOFCNEO): baseline
+            # updated_at 2026-08-21T03:16:14 / mtime Aug 21 03:53 against a
+            # last-report-timestamp of 2026-08-22T16:53:06 — a 3-DAY baseline
+            # presented as a 35-hour delta. Cause was (1), proven by three
+            # same-directory Phase-5/5.5 siblings (fleet-digest.md/.html,
+            # digest-notes.md) all written 2026-08-22 16:55:08-09 on this box
+            # while this file was not touched.
+            baseline_age_note = None
+            # GATE ON THE SNAPSHOT'S MTIME, NOT ITS updated_at — corrected
+            # 2026-08-24 (echo, cc-03) on this assertion's FIRST live run, which
+            # is what exposed it. `updated_at` records when the COLLECTOR last
+            # wrote world/outcome-metrics.yaml; the snapshot is COPIED from that
+            # file at report time, so updated_at is necessarily EARLIER than the
+            # report timestamp on every healthy run and `updated_at < since`
+            # fires ALWAYS. Measured here: updated_at 2026-08-21T20:00:07 against
+            # since 2026-08-21T20:23:35 — a 23m28s collector interval rendered as
+            # a window violation worth 0.6% of a 63.3h window. An assertion that
+            # fires on every healthy run trains its reader to skip it, which is
+            # precisely how the real 3-day case below would get missed.
+            # MTIME is the right signal because it records when the snapshot was
+            # TAKEN. It matched `since` to the second here (20:23:35.714 vs
+            # 20:23:35), and it still catches the foxtrot failure case
+            # decisively (mtime Aug 21 03:53 vs since 2026-08-22T16:53 = 37h).
+            # Writers enumerated before trusting an mtime (guard-1504, rb-190):
+            # session-manifest.yaml:898 names exactly ONE writer
+            # (agent-completion-report Phase 4) at sync_tier machine_local, so no
+            # sync layer and no background writer can move it. If that ever gains
+            # a second writer, this gate is void — re-enumerate before trusting it.
+            snapshot_mtime = mtime of agents/<agent>/session/last-outcome-snapshot.yaml
+            IF since is not null AND snapshot_mtime is more than 60s BEFORE since:
+                # The snapshot was not taken at the last report: a prior run wrote
+                # the timestamp and skipped the copy. The delta spans MORE than the
+                # report window, so every "moved" is over-stated.
+                baseline_age_note = ("baseline snapshot was TAKEN {t} but the report "
+                    "window starts {s} — a prior run wrote the timestamp and skipped "
+                    "the snapshot, so this delta spans {d} extra hours and "
+                    "OVER-STATES movement").format(...)
+            # `updated_at` remains useful as SECONDARY colour (how stale the metrics
+            # themselves were at snapshot time). Report it; never gate on it.
+                # Do NOT suppress the section and do NOT silently widen the window:
+                # print baseline_age_note verbatim in the Outcome Delta section
+                # (guard-2841 — a silently-dropped row is indistinguishable from a
+                # source that was never read).
         ELSE:
             outcome_prior = {}  # first report — deltas appear as "initial"
+            baseline_age_note = None
         # Compute per-source deltas. Each source contributes exactly these
         # three keys (consumer contract — do not omit any):
         #   available: bool     — was the source present in outcome_now?
@@ -540,10 +621,26 @@ If `since` is null, replace the "Since:" line with "Lifetime totals (no prior re
    # the live file is missing, skip silently. session/ is machine-local and the
    # baseline is regenerable — losing it on a machine move just makes the next
    # report show "initial" deltas (benign).
+   # VERIFY THE WRITE (g-001-04, 2026-08-24). The previous form ended in
+   # `|| true`, which made three different outcomes byte-identical to every
+   # later reader: cp succeeded, cp failed, step never ran. That is the
+   # verify-before-assuming.md rule-4 silent-failure shape applied to a
+   # baseline, and its cost is paid by the NEXT report, which diffs against a
+   # stale file with no way to know. Measured: the 2026-08-22T16:53 run wrote
+   # the report, the timestamp and the digest and left this snapshot at its
+   # 2026-08-21 value; the staleness surfaced 35h later only because a reader
+   # went looking. Read the copy BACK and compare `updated_at` — the echo of a
+   # write is not evidence the intended content is on disk.
    Bash: source core/scripts/_paths.sh && \
-         [ -f "$WORLD_DIR/outcome-metrics.yaml" ] && \
-         cp "$WORLD_DIR/outcome-metrics.yaml" \
-            "agents/<agent>/session/last-outcome-snapshot.yaml" || true
+         if [ -f "$WORLD_DIR/outcome-metrics.yaml" ]; then \
+           cp "$WORLD_DIR/outcome-metrics.yaml" \
+              "agents/<agent>/session/last-outcome-snapshot.yaml" && \
+           echo "live:  $(grep -m1 '^updated_at:' "$WORLD_DIR/outcome-metrics.yaml")" && \
+           echo "saved: $(grep -m1 '^updated_at:' agents/<agent>/session/last-outcome-snapshot.yaml)"; \
+         else echo "SKIP: no live outcome-metrics.yaml (fail-open, expected on a fresh world)"; fi
+   # The two `updated_at` lines MUST match. If they differ, or either is empty,
+   # the baseline did not land — say so in the report rather than proceeding
+   # silently; the next report's Outcome Delta depends on it.
 ```
 
 Note: `agents/<agent>/COMPLETION-REPORT.md` is the single latest-pointer report, overwritten each cycle. Its git history (committed every iteration) is the permanent archive — there is no separate timestamped archive directory. Do NOT recreate a `reports/` directory; the file-model normalization abolished it and the L1 allowlist gate denies writes there (see `core/config/conventions/temp-store.md`). `last-outcome-snapshot.yaml` lives under `session/` and is overwritten each report (delta baseline only, machine-local, regenerable).

@@ -59,7 +59,7 @@ from pathlib import Path
 
 
 VALID_CATEGORIES = ("info", "completion", "update", "blocker", "decision-needed",
-                    "user-digest")
+                    "user-digest", "reply")
 
 CATEGORY_TO_INFOTYPE = {
     "info": "Notification",
@@ -87,6 +87,26 @@ CATEGORY_TO_INFOTYPE = {
     # notify-user Step 1.5's exempt tuple (so it never wedges). Adding one
     # WITHOUT the other re-breaks it — keep the two in sync.
     "user-digest": "Fleet Digest",
+    # . An ANSWER to something the user himself asked. Every other
+    # category above names a message the FLEET decided to send; this one names
+    # the reply half of an exchange he started, which is why it is the third
+    # member of the routing gate's ALWAYS_SEND set (the reasoning lives there).
+    #
+    # SendInfoAlert-shaped, deliberately and for the reason the digest comment
+    # above learned the hard way: `blocker` is the one shape with no
+    # render_structured, so anything routed through it arrives as raw text under
+    # an "AyoAi Error Alert" heading. An answer to a direct question is the last
+    # message that should look like an error.
+    #
+    # IT DIVERGES FROM THE DIGEST ON STEP 1.5, ON PURPOSE — do not "sync" it.
+    # The digest MUST be gate-exempt because it quotes arbitrary goal
+    # descriptions it did not author, so one quoted "user must" would wedge the
+    # whole lane. A reply is authored deliberately, one message at a time, and
+    # guard-4722 records the case that decides this: a reply whose closing
+    # sentence had become a permission request for already-granted work SHOULD
+    # have been refused. Exempting `reply` would delete exactly that catch and
+    # turn this category into the re-send door that guardrail forbids.
+    "reply": "Reply",
 }
 
 # Minimum message length AFTER stripping. The silent-empty-email failure

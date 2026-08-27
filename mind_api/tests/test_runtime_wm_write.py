@@ -213,6 +213,158 @@ def test_clear_roundtrip(running_daemon):
     assert _read_wm(agent_dir)["slots"]["active_strategy"] is None
 
 
+# ---------------------------------------------------------------------------
+# POST /v1/wm/drain-goals ()
+# ---------------------------------------------------------------------------
+
+def _seed(port, slot, entries):
+    status, body = _post(port, "/v1/wm/set", {"slot": slot}, json.dumps(entries))
+    assert status == 200, body
+
+
+def test_drain_goals_removes_only_matching(running_daemon):
+    project_root, port = running_daemon
+    agent_dir = project_root / "agents" / "alpha"
+    _seed(port, "exp_capture", [
+        {"goal_id": "g-1-01", "note": "a"},
+        {"goal_id": "g-1-01", "note": "b"},
+        {"goal_id": "g-2-02", "note": "c"},
+    ])
+    status, body = _post(port, "/v1/wm/drain-goals", {"slot": "exp_capture"},
+                         json.dumps(["g-1-01"]))
+    assert status == 200, body
+    verdict = json.loads(body)
+    assert (verdict["removed"], verdict["kept"]) == (2, 1), verdict
+    survivors = _read_wm(agent_dir)["slots"]["exp_capture"]
+    assert [e["goal_id"] for e in survivors] == ["g-2-02"], survivors
+
+
+def test_drain_goals_keeps_entries_it_cannot_classify(running_daemon):
+    """An entry the classifier cannot classify must not be destroyed by it."""
+    project_root, port = running_daemon
+    agent_dir = project_root / "agents" / "alpha"
+    _seed(port, "encoding_capture", [
+        {"goal_id": "g-3-03", "note": "doomed"},
+        {"note": "no goal_id at all"},
+        "a bare string, not a dict",
+    ])
+    status, body = _post(port, "/v1/wm/drain-goals", {"slot": "encoding_capture"},
+                         json.dumps(["g-3-03"]))
+    assert status == 200, body
+    assert json.loads(body)["removed"] == 1
+    survivors = _read_wm(agent_dir)["slots"]["encoding_capture"]
+    assert len(survivors) == 2, survivors
+    assert "a bare string, not a dict" in survivors
+
+
+def test_drain_goals_takes_ids_never_a_survivor_list(running_daemon):
+    """guard-3881: the API shape is what makes the lost update impossible.
+
+    The retired design read the slot, filtered in the CALLER, and POSTed the
+    surviving list to /v1/wm/set — a full-slot overwrite of a stale snapshot,
+    so any entry appended in between was destroyed. This endpoint accepts the
+    goal-id SET only; a survivor list (dicts) carries no usable id and is
+    refused outright, so the old shape cannot be resurrected by accident.
+    """
+    _, port = running_daemon
+    _seed(port, "exp_capture", [{"goal_id": "g-4-04"}])
+    try:
+        status, body = _post(port, "/v1/wm/drain-goals", {"slot": "exp_capture"},
+                             json.dumps([{"goal_id": "g-9-09", "note": "survivor"}]))
+    except urllib.error.HTTPError as e:
+        status, body = e.code, e.read().decode("utf-8")
+    assert status == 400, body
+    assert "empty_goal_ids" in body, body
+
+
+def test_drain_goals_survives_an_append_the_caller_never_saw(running_daemon):
+    """The filter runs on data read INSIDE the handler, so a late append lives.
+
+    This is the behaviour the endpoint exists for: the caller's view of the slot
+    is irrelevant because it never sends one. An entry appended after the caller
+    decided — for a goal that is NOT being drained — must still be present after
+    the drain.
+    """
+    project_root, port = running_daemon
+    agent_dir = project_root / "agents" / "alpha"
+    _seed(port, "exp_capture", [{"goal_id": "g-5-05", "note": "old"}])
+    # The caller decides on ["g-5-05"] here. THEN a peer appends:
+    status, body = _post(port, "/v1/wm/append", {"slot": "exp_capture"},
+                         json.dumps({"goal_id": "g-6-06", "note": "late"}))
+    assert status == 200, body
+    status, body = _post(port, "/v1/wm/drain-goals", {"slot": "exp_capture"},
+                         json.dumps(["g-5-05"]))
+    assert status == 200, body
+    survivors = _read_wm(agent_dir)["slots"]["exp_capture"]
+    assert [e["goal_id"] for e in survivors] == ["g-6-06"], survivors
+
+
+def test_drain_goals_refuses_a_non_capture_slot(running_daemon):
+    """Blast radius: the only destructive goal-keyed primitive stays scoped."""
+    _, port = running_daemon
+    try:
+        status, body = _post(port, "/v1/wm/drain-goals", {"slot": "conclusions"},
+                             json.dumps(["g-7-07"]))
+    except urllib.error.HTTPError as e:
+        status, body = e.code, e.read().decode("utf-8")
+    assert status == 400, body
+    assert "slot_not_drainable" in body, body
+
+
+def test_drain_goals_refuses_an_empty_id_array(running_daemon):
+    """A drain with no ids is a caller defect, and must be loud, not a no-op."""
+    _, port = running_daemon
+    try:
+        status, body = _post(port, "/v1/wm/drain-goals", {"slot": "exp_capture"},
+                             json.dumps([]))
+    except urllib.error.HTTPError as e:
+        status, body = e.code, e.read().decode("utf-8")
+    assert status == 400, body
+    assert "empty_goal_ids" in body, body
+
+
+def test_drain_goals_advances_slot_meta(running_daemon):
+    """guard-540: wm-prune ages a lane from slot_meta.updated_at.
+
+    A drain that left the meta untouched would leave the lane aged from its last
+    APPEND, so the prune cadence could evict the very survivors it just spared.
+    """
+    project_root, port = running_daemon
+    agent_dir = project_root / "agents" / "alpha"
+    _seed(port, "exp_capture", [{"goal_id": "g-8-08"}, {"goal_id": "g-9-09"}])
+    before = _read_wm(agent_dir)["slot_meta"]["exp_capture"]["update_count"]
+    status, body = _post(port, "/v1/wm/drain-goals", {"slot": "exp_capture"},
+                         json.dumps(["g-8-08"]))
+    assert status == 200, body
+    meta = _read_wm(agent_dir)["slot_meta"]["exp_capture"]
+    assert meta["update_count"] == before + 1, meta
+    assert meta["updated_at"], meta
+
+
+def test_drain_goals_no_match_leaves_the_slot_alone(running_daemon):
+    project_root, port = running_daemon
+    agent_dir = project_root / "agents" / "alpha"
+    _seed(port, "exp_capture", [{"goal_id": "g-10-10"}])
+    before = _read_wm(agent_dir)["slot_meta"]["exp_capture"]["update_count"]
+    status, body = _post(port, "/v1/wm/drain-goals", {"slot": "exp_capture"},
+                         json.dumps(["g-nope-99"]))
+    assert status == 200, body
+    assert json.loads(body) == {"ok": True, "slot": "exp_capture",
+                                "removed": 0, "kept": 1}
+    # No write at all, so no meta bump either.
+    assert _read_wm(agent_dir)["slot_meta"]["exp_capture"]["update_count"] == before
+
+
+def test_drain_goals_requires_agent_header(running_daemon):
+    _, port = running_daemon
+    try:
+        status, body = _post(port, "/v1/wm/drain-goals", {"slot": "exp_capture"},
+                             json.dumps(["g-1-01"]), agent=None)
+    except urllib.error.HTTPError as e:
+        status, body = e.code, e.read().decode("utf-8")
+    assert status == 400, body
+
+
 def test_init_roundtrip(running_daemon):
     project_root, port = running_daemon
     agent_dir = project_root / "agents" / "bravo"

@@ -201,7 +201,8 @@ retrieval_session_path() {
     # which left the whole utilization lane inert on every worker Body.
     #
     # TAKES THE AGENT DIRECTORY, NOT THE AGENT NAME. $AGENT_DIR honours the
-    # MIND_AGENT_DIR override seam (see L347 below) while agent_dir() rebuilds
+    # MIND_AGENT_DIR override seam (the _AGENT_DIR_OVERRIDE block below --
+    # anchored by NAME, the line number here had drifted) while agent_dir() rebuilds
     # from PROJECT_ROOT and does not — so a name-based version would silently
     # discard a caller-resolved agent dir, which is the same single-source-of-
     # truth violation this helper exists to remove. Pass whatever dir the
@@ -227,9 +228,21 @@ retrieval_session_path() {
 # resolve to empty strings when no conf is found, and `$WORLD_DIR/foo`
 # expansions produce `/foo` — clearly broken paths that fail loudly on the
 # next filesystem operation rather than silently writing into PROJECT_ROOT.
-# MIND_AGENT_DIR (test-only override; UNSET in production) points agent-dir
-# resolution at a caller-supplied dir instead of live PROJECT_ROOT/agents/<name>.
-# Mirrors _paths.py L279-289. Closes the asymmetry () where _paths.py
+# MIND_AGENT_DIR (test-only override; UNSET in production) points the
+# $AGENT_DIR CONSTANT at a caller-supplied dir instead of live
+# PROJECT_ROOT/agents/<name>.
+#
+# SCOPE: THAT CONSTANT ONLY -- the agent_dir()/agent_state_dir() FUNCTION
+# family rebuilds from PROJECT_ROOT and consults this override NOWHERE, so a
+# test that sets it and then drives a script calling $(agent_dir NAME) still
+# touches LIVE agent state and still passes. Correct by design (a named lookup
+# must not collapse every name onto one dir), byte-equivalent to _paths.py, and
+# NOT a resolver-mirroring gap. Tell: resolving via $AGENT_DIR is isolated;
+# calling agent_dir NAME is not. guard-2985; measured .
+#
+# Mirrors the Tier 4 `_agent_dir_override` block in _paths.py (anchored by NAME
+# -- the line numbers this comment used to carry had drifted 140 lines).
+# Closes the asymmetry () where _paths.py
 # honored the override but _paths.sh did not — which FORCED framework tests that
 # invoke a bash script to create a real agents/<name> dir under live PROJECT_ROOT
 # (the running fleet then ADOPTS it mid-test via agents_root().glob(*/local-paths.conf)

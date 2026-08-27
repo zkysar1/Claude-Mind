@@ -437,6 +437,19 @@ def _agent_recently_active(agent, cutoff_dt, project_root):
             or _body_recently_active(agent, cutoff_dt, project_root))
 
 
+def _bump_backlog(summary, machine):
+    """Record ONE unreapable stale record against `machine` (g-115-5114).
+
+    ``backlog_total`` is incremented HERE rather than summed at the end so that
+    every return path carries a total consistent with its two component counts —
+    including the exception handler's partial summary, which is a normal output
+    for a function that is total by contract, not an error path."""
+    summary["backlog_total"] += 1
+    key = machine or "unknown"
+    summary["backlog_by_machine"][key] = (
+        summary["backlog_by_machine"].get(key, 0) + 1)
+
+
 def reap_stale_active(world_dir=None, project_root=None, freshness_hours=24,
                       liveness_hours=6, now=None, machine_id=None):
     """Phase 1.5 stale-active reaper. Flips ORPHANED ``status=active`` records to
@@ -469,9 +482,49 @@ def reap_stale_active(world_dir=None, project_root=None, freshness_hours=24,
 
     Total (never raises → returns the partial summary). Returns a dict:
     ``{scanned, reaped, skipped_fresh, skipped_live, skipped_other_machine,
-    reaped_ids}``."""
+    reaped_ids}`` plus the BACKLOG fields below.
+
+    THE BACKLOG FIELDS (g-115-5114, candidate (c)). ``reaped: 0`` is the correct
+    and expected output on a healthy box, and it reads as "the fleet is clean".
+    It is not: a record can only ever be reaped by the machine that created it,
+    so records belonging to a box that has stopped running this sweep are
+    unreapable by anyone who does run it. Measured on cc-07 2026-08-26 —
+    ``{"scanned": 117, "reaped": 0, "skipped_other_machine": 54}`` while 57
+    active records were past the freshness window, 39 of them on one box, the
+    oldest 50 DAYS old. The population grew 77 → 83 → 106 → 117 across four
+    measurements while every run in between printed ``reaped: 0``, and the
+    recurring goal's own run log records an agent writing "CLEAN" beside it.
+    ``skipped_other_machine`` was already in the summary and did not prevent
+    that, because it reads as "not my job" rather than "N records nobody is
+    reaping" — it also counts FRESH remote records (healthy live sessions
+    elsewhere), so it is not a backlog figure at all.
+
+    So the summary now carries an explicit backlog SET, per guard-963's
+    partial-coverage corollary ("compute an explicit unmeasured SET, gate the
+    clean status on that set being EMPTY, and emit the set alongside the
+    verdict"). BOTH residues are named, not just the cross-machine one — a box
+    can print ``reaped: 0`` with a stale record OF ITS OWN sitting in
+    ``skipped_live``, because the liveness verdict is AGENT-granular while the
+    population is SID-granular (one fresh heartbeat holds every record that
+    agent owns on the box):
+      * ``stale_other_machine``   — active, past freshness, owned by another box
+      * ``stale_here_held_live``  — active, past freshness, THIS box, held by the
+                                    agent-granular liveness verdict. Equal to
+                                    ``skipped_live`` by construction (the fresh
+                                    check runs first), and named separately so
+                                    the residue is legible without knowing that.
+      * ``backlog_total``         — the two summed: records nobody is reaping
+      * ``backlog_by_machine``    — where they are, so the box to chase is named
+
+    REPORTING ONLY — the reaping predicate is deliberately UNCHANGED. Which
+    predicate should replace machine-locality is the open question this goal
+    exists to decide; widening the reaper here would answer it as a side effect
+    of a reporting fix. This makes the backlog visible so that decision gets
+    made, and is safe under every candidate outcome."""
     summary = {"scanned": 0, "reaped": 0, "skipped_fresh": 0,
-               "skipped_live": 0, "skipped_other_machine": 0, "reaped_ids": []}
+               "skipped_live": 0, "skipped_other_machine": 0, "reaped_ids": [],
+               "stale_other_machine": 0, "stale_here_held_live": 0,
+               "backlog_total": 0, "backlog_by_machine": {}}
     try:
         wd = _resolve_world_dir(world_dir)
         if wd is None:
@@ -501,6 +554,14 @@ def reap_stale_active(world_dir=None, project_root=None, freshness_hours=24,
                 rec_machine = record.get("machine_id")
                 if rec_machine and rec_machine != this_machine:
                     summary["skipped_other_machine"] += 1
+                    # Backlog accounting only — the `continue` below is unchanged,
+                    # so this box still never touches another box's record. A
+                    # remote record that is still FRESH is a healthy live session
+                    # elsewhere and is NOT backlog; only a stale one is.
+                    remote_started = _parse_local_iso(record.get("started_at"))
+                    if remote_started is not None and remote_started <= fresh_cutoff:
+                        summary["stale_other_machine"] += 1
+                        _bump_backlog(summary, rec_machine)
                     continue
                 started_dt = _parse_local_iso(record.get("started_at"))
                 if started_dt is not None and started_dt > fresh_cutoff:
@@ -511,6 +572,14 @@ def reap_stale_active(world_dir=None, project_root=None, freshness_hours=24,
                         agent, live_cutoff, pr)
                 if live_cache[agent]:
                     summary["skipped_live"] += 1
+                    # The SECOND residue. Reaching here means the record already
+                    # passed the freshness check, so it is stale BY CONSTRUCTION;
+                    # it is held only by an AGENT-granular liveness verdict over a
+                    # SID-granular population, so one live Body holds every record
+                    # its agent owns on this box. Counted, never reaped — deciding
+                    # SID-level liveness is the open question, not this fix.
+                    summary["stale_here_held_live"] += 1
+                    _bump_backlog(summary, rec_machine or this_machine)
                     continue
                 record["status"] = "unknown"
                 record["ended_reason"] = "unknown"

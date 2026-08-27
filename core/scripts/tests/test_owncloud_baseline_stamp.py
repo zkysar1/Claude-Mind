@@ -250,5 +250,54 @@ def test_concurrent_different_path_stamps_both_survive(cloud, tmp_path, monkeypa
         "regression)")
 
 
+def test_merge_reconcile_partial_write_over_unmoved_remote_still_unions(
+        cloud, tmp_path):
+    """ TRIPWIRE — do NOT re-introduce a backend-level fast-forward
+    short-circuit in _merge_reconcile_put.
+
+    The tempting fix for the tree-node merge wedge is: "if the remote object
+    still equals the manifest baseline this box last reconciled against, then
+    S3 has not moved, so the outgoing bytes are strictly ahead and the handler
+    can be skipped." That premise is FALSE, and this test is the counterexample.
+
+    `remote == our baseline` does NOT imply `body` is a descendant of remote,
+    because for every union-merged store the outgoing body is DELIBERATELY a
+    PARTIAL write: an appender writes the one record it has and the handler is
+    what makes the result whole. Skipping the handler there converts a partial
+    append into a full-file clobber that silently discards every record the
+    appender did not happen to hold.
+
+    Measured 2026-08-26 (bravo, cc-05) by implementing exactly that
+    short-circuit: test_owncloud_codec_backend.py's
+    test_fresh_process_write_over_gzip_object_merges_and_reencodes and
+    test_interop_plain_writer_over_gzip_then_gzip_reader_reads_plain both
+    failed, each losing three records from meta/gate-firings.jsonl. The change
+    was reverted.
+
+    The real defect (merge_tree_node_md refusing a fast-forward) is a CONTENT
+    question and can only be answered where the content is understood — in the
+    handler, which would need a base it is not currently given. The backend
+    layer cannot decide it: at this layer a partial append and a fast-forward
+    are indistinguishable.
+    """
+    b = _backend(cloud)
+    p = cloud["root"] / "world" / "reasoning-bank.jsonl"  # registered store
+    rec1 = b'{"id": "rb-001", "created": "2026-01-01", "title": "a"}\n'
+    rec2 = b'{"id": "rb-002", "created": "2026-01-02", "title": "b"}\n'
+    b.write_bytes(p, rec1 + rec2)  # baseline := md5(rec1+rec2); S3 holds both
+
+    # S3 has NOT moved since that push, so a baseline probe would read
+    # "fast-forward". Now write a PARTIAL body holding only a NEW record.
+    rec3 = b'{"id": "rb-003", "created": "2026-01-03", "title": "c"}\n'
+    b._diverged_keys.add(b._s3_key(p))
+    b.write_bytes(p, rec3)
+
+    titles = {json.loads(l)["title"]
+              for l in p.read_bytes().decode().splitlines() if l.strip()}
+    assert titles == {"a", "b", "c"}, (
+        "a partial write over an UNMOVED remote must still union — losing "
+        f"records here means a fast-forward short-circuit is back; got {titles}")
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

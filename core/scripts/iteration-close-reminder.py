@@ -43,6 +43,13 @@ import re
 from _stdio import reconfigure_stdio  # noqa: E402
 reconfigure_stdio()
 
+# : route the AGENTS_PARENT_DIR path segment through the constant
+# instead of the literal "agents" (guard-604). project_root still comes from
+# the hook env below -- only the segment is constant-routed, so behaviour is
+# unchanged. _paths imports os/sys/pathlib only; measured at baseline cost
+# (0.01-0.02s, same as `import os,sys`), so the hot-path budget is unaffected.
+from _paths import AGENTS_PARENT_DIR  # noqa: E402
+
 
 REMINDER_TEXT_GENERIC = (
     "<system-reminder>\n"
@@ -358,7 +365,7 @@ def main():
     # un-fired for every Phase 2.6 session. Matches stop-hook.sh fix
     # (ff6e71c6) + recovery-gate.sh / stop-failure-hook.sh fix (938ca231).
     agent = ""
-    agents_parent = os.path.join(project_root, "agents")
+    agents_parent = os.path.join(project_root, AGENTS_PARENT_DIR)
     if os.path.isdir(agents_parent):
         try:
             for candidate_agent in os.listdir(agents_parent):
@@ -385,7 +392,7 @@ def main():
     # os.path.join(project_root, agent, "session") which resolved to a
     # non-existent path on disk → every read below failed → reminder
     # silently suppressed.
-    session_dir = os.path.join(project_root, "agents", agent, "session")
+    session_dir = os.path.join(project_root, AGENTS_PARENT_DIR, agent, "session")
     try:
         with open(os.path.join(session_dir, "agent-state"), "r", encoding="utf-8") as fh:
             state = fh.read().strip()

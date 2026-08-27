@@ -30,6 +30,7 @@ import io
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tarfile
@@ -416,7 +417,53 @@ def cmd_land(args):
             _fail("MACHINE_ID is empty in .env.local — set a DISTINCT per-machine "
                   "id (G5 fail-closed) before /start.")
         print(f".env.local      : present  OK")
-        print(f"MACHINE_ID : {mid}  (confirm this DIFFERS from the source machine)")
+        # g-353-49: "confirm this DIFFERS" was a REQUEST, and the cc-13/cc-14
+        # incident is what a request buys. Both boxes landed with a non-empty
+        # MACHINE_ID=cc-10 inherited from the cloned .env.local, so the
+        # empty-check above passed, this line printed, and nobody confirmed
+        # anything. The one fact this process CAN check for itself is its own
+        # hostname, and a clone's tell is exactly that MACHINE_ID names some
+        # OTHER box. So check it, and fail closed.
+        #
+        # The override is an EXPLICIT caller-supplied flag rather than a
+        # smarter default (guard-2418): a box whose fleet-manifest node carries
+        # `machine_id_check: skip` legitimately runs an id that is not its
+        # hostname, and this process cannot tell that case from a clone. Making
+        # the human name the exception keeps the common case safe without
+        # guessing at the uncommon one.
+        #
+        # AUTO-SETTING MACHINE_ID=<hostname> HERE WAS CONSIDERED AND REJECTED
+        # (g-353-49). It would satisfy "a cloned container comes up with
+        # MACHINE_ID equal to its own hostname" literally, but a container at
+        # land time frequently reports a provisioner-generated hostname that is
+        # NOT its final fleet name. The auto-write would then mint a
+        # distinct-but-WRONG id: it PASSES the uniqueness check (so the very
+        # detector added for this goal reports clean) while breaking the
+        # manifest-host invariant the sibling check enforces
+        # (fleet_config_parity: "MACHINE_ID=%s but manifest host is %s").
+        # Trading a loud refusal that NAMES the correct value for a silent
+        # possibly-wrong write is the wrong trade for a gate whose whole
+        # purpose is preventing a silent wrong identity.
+        try:
+            _host = socket.gethostname().strip()
+        except Exception:  # noqa: BLE001 — never let a hostname lookup block a land
+            _host = ""
+        if _host and mid != _host:
+            if not getattr(args, "allow_machine_id_mismatch", False):
+                _fail(
+                    f"MACHINE_ID={mid} but this box's hostname is {_host}. That is the "
+                    "clone signature: .env.local is gitignored, so a container copied "
+                    "from a running sibling inherits its identity and NO promote, pull "
+                    "or preflight can ever reconcile it (measured 2026-08-23: cc-13 and "
+                    "cc-14 both answered to cc-10). Reducer election compares "
+                    "MACHINE_ID, so duplicate boxes are indistinguishable to the runner "
+                    f"lease. Set MACHINE_ID={_host} in {envf}, or pass "
+                    "--allow-machine-id-mismatch if this box legitimately runs a "
+                    "non-hostname id (fleet-manifest machine_id_check: skip).")
+            print(f"MACHINE_ID : {mid}  (differs from hostname {_host} — allowed by "
+                  "--allow-machine-id-mismatch)")
+        else:
+            print(f"MACHINE_ID : {mid}  OK (matches this box's hostname)")
         print("next            : /start <agent>   (Phase A-0 resumes the cloned agent)")
         return
 
@@ -697,6 +744,10 @@ def main():
     ap.add_argument("--include-history", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--allow-machine-id-mismatch", action="store_true",
+                    help="land: accept a MACHINE_ID that differs from this box's "
+                         "hostname (legitimate for a box whose fleet-manifest node "
+                         "carries machine_id_check: skip)")
     ap.add_argument("--dest", default="")            # land/verify destination repo
     ap.add_argument("target", nargs="?", default="")  # land: pack path
     args = ap.parse_args()

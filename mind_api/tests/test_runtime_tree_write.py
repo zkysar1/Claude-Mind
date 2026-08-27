@@ -1350,3 +1350,169 @@ def test_set_value_bytes_counts_utf8_bytes_not_characters(running_daemon):
     assert json.loads(body)["value_bytes"] == 1200
     tree = _read_tree(world)
     assert tree["nodes"]["alpha-test-node"]["summary"] == value
+
+
+# --- : structural post-condition for non-set tree ops -------------
+# The shipped value_bytes check () compares a VALUE LENGTH, so it
+# covers `set` only -- --remove-child carries no value. These two tests pin the
+# structural equivalent. They assert the STRUCTURE ON DISK, never rc/status
+# alone: a status-only assertion passes against the exact failure being
+# prevented (rc=0 was what the 2026-08-20 reproduction returned).
+
+def test_remove_child_response_carries_stored_children_not_request_echo(
+        running_daemon):
+    """guard-1661: the success payload must carry caller-verifiable evidence.
+
+    Pre-fix the response was {"removed": child_key, "parent": parent_key} --
+    both echoed verbatim from the REQUEST, so it was true by construction and
+    could not report a failed removal. The new parent_children field is read
+    from the mutated tree, so it can DISAGREE with the request; this test pins
+    that it matches what actually landed on disk.
+    """
+    project_root, port = running_daemon
+    world = project_root / "world"
+    _post(port, "/v1/tree/write", {
+        "op": "add-child", "parent": "alpha-test-node",
+        "child": {"key": "evidence-leaf", "summary": "temp"},
+    })
+    status, body = _post(port, "/v1/tree/write", {
+        "op": "remove-child", "parent": "alpha-test-node",
+        "child_key": "evidence-leaf",
+    })
+    assert status == 200, body
+    resp = json.loads(body) if isinstance(body, str) else body
+
+    # The evidence field exists and is a real list (not the request echo).
+    assert "parent_children" in resp, (
+        "response must carry parent_children so the caller can verify the "
+        "removal without a second read (guard-1661)")
+    assert isinstance(resp["parent_children"], list)
+    assert resp["parent_child_count"] == len(resp["parent_children"])
+
+    # And it AGREES with disk -- this is the half that makes it evidence.
+    tree = _read_tree(world)
+    on_disk = tree["nodes"]["alpha-test-node"]["children"]
+    assert resp["parent_children"] == on_disk
+    assert "evidence-leaf" not in on_disk
+    assert "evidence-leaf" not in tree["nodes"]
+
+
+def test_remove_child_refuses_when_duplicate_entry_survives_removal(
+        running_daemon):
+    """The non-tautological catch: list.remove() drops only the FIRST match.
+
+    A duplicated child entry -- the shape an own-cloud union merge produces
+    when a peer write resurrects a node (rb-2859 class) -- leaves the child
+    STILL PRESENT after _apply_remove_child returns success. Pre-fix that
+    persisted, and the response echoed the request, so rc=0 with the node still
+    on disk was exactly what the caller saw (measured 2026-08-20, cc-08).
+
+    Asserts BOTH halves: the write is refused (guard-3150 -- before the write,
+    so nothing is persisted) AND the on-disk structure is byte-unchanged.
+    """
+    project_root, port = running_daemon
+    world = project_root / "world"
+    _post(port, "/v1/tree/write", {
+        "op": "add-child", "parent": "alpha-test-node",
+        "child": {"key": "dup-leaf", "summary": "temp"},
+    })
+
+    # Inject the duplicate directly -- no supported op creates one, which is
+    # precisely why it goes undetected in the wild.
+    tree_path = world / "knowledge" / "tree" / "_tree.yaml"
+    raw = yaml.safe_load(tree_path.read_text(encoding="utf-8"))
+    kids = raw["nodes"]["alpha-test-node"]["children"]
+    assert kids.count("dup-leaf") == 1
+    kids.insert(kids.index("dup-leaf"), "dup-leaf")
+    raw["nodes"]["alpha-test-node"]["children"] = kids
+    raw["nodes"]["alpha-test-node"]["child_count"] = len(kids)
+    tree_path.write_text(yaml.safe_dump(raw, sort_keys=False,
+                                        default_flow_style=None, width=200),
+                         encoding="utf-8")
+    before = tree_path.read_text(encoding="utf-8")
+
+    try:
+        _post(port, "/v1/tree/write", {
+            "op": "remove-child", "parent": "alpha-test-node",
+            "child_key": "dup-leaf",
+        })
+    except urllib.error.HTTPError as e:
+        assert e.code == 500
+        err = json.loads(e.read().decode("utf-8"))
+        assert err["error"] == "remove_child_post_condition_failed", err
+    else:
+        raise AssertionError(
+            "expected a refusal: one 'dup-leaf' entry survives list.remove(), "
+            "so the removal did not take effect and must not be persisted")
+
+    # STRUCTURE ON DISK, not status alone -- nothing may have been written.
+    assert tree_path.read_text(encoding="utf-8") == before, (
+        "the refusal must happen BEFORE the write (guard-3150); on an "
+        "S3-authoritative store a post-write verify has already published the "
+        "bad state to every other box")
+    after = yaml.safe_load(tree_path.read_text(encoding="utf-8"))
+    assert after["nodes"]["alpha-test-node"]["children"].count("dup-leaf") == 2
+    assert "dup-leaf" in after["nodes"]
+
+
+# ---- : durability post-condition -----------------------------------
+# These pin the TWO properties that make _durability_witness worth having, both
+# of which a naive implementation gets wrong in the dangerous direction.
+
+def test_durability_witness_fails_open_on_unreadable_store(tmp_path):
+    """A probe fault must NEVER be reported as a lost write (guard-1562 class).
+
+    The write has already succeeded by the time this runs, so a false
+    'write_not_durable' is strictly worse than silence: it manufactures a data-
+    loss alarm out of a plumbing error.
+    """
+    from mind_api.src.world import tree_write
+    out = tree_write._durability_witness(
+        tmp_path / "does-not-exist" / "_tree.yaml", "some-key",
+        {"confidence": 0.9})
+    assert out is None
+
+
+def test_durability_witness_rejects_derived_fields_as_witnesses(tmp_path, monkeypatch):
+    """guard-5212: a witness must be a merge INPUT, never an OUTPUT.
+
+    merge_tree's _rebuild_tree_structure recomputes children/child_count/
+    node_type/depth from each node's `parent` on EVERY merge. So a read-back
+    assertion on one of those passes regardless of what happened to the write —
+    it witnesses that the rebuild ran, not that the write survived.
+
+    This test pins the DISTINCTION the helper is built on: an INPUT field that
+    diverges is reported, and it is reported by VALUE comparison rather than by
+    byte identity (which would alarm forever on any multi-writer store).
+    """
+    from mind_api.src.world import tree_write
+
+    authoritative = (
+        "nodes:\n"
+        "  n1:\n"
+        "    parent: root\n"
+        "    confidence: 0.4\n"
+        "    children: [c1, c2]\n"
+    ).encode("utf-8")
+
+    class _FakeBackend:
+        def read_authoritative_bytes(self, _p):
+            return authoritative
+
+    monkeypatch.setitem(
+        sys.modules, "storage_backend",
+        type("m", (), {"get_backend": staticmethod(lambda: _FakeBackend())}))
+
+    p = tmp_path / "_tree.yaml"
+    p.write_text("nodes: {}\n", encoding="utf-8")
+
+    # INPUT field that diverged -> reported.
+    bad = tree_write._durability_witness(p, "n1", {"confidence": 0.9})
+    assert bad is not None and bad["verdict"] == "write_not_durable"
+    assert bad["mismatched"]["confidence"]["authoritative"] == 0.4
+
+    # INPUT field that matches -> silent, even though `children` differs from
+    # anything a caller might have expected. Peer-tolerance: only the asserted
+    # field is compared, never the whole node.
+    assert tree_write._durability_witness(p, "n1", {"confidence": 0.4}) is None
+    assert tree_write._durability_witness(p, "n1", {"parent": "root"}) is None

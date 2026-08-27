@@ -245,3 +245,134 @@ def test_authoritative_min_across_both_queues():
     # And it is the WORLD wake (30s), not the agent wake (300s): 300s is beyond 60s.
     parsed_secs = (datetime.fromisoformat(got) - now).total_seconds()
     assert 25 <= parsed_secs <= 35
+
+
+# =============================================================================
+# ETag short-circuit () -- the memo behind authoritative_earliest_wake_at.
+#
+# The helper's whole reason to exist is that it must NOT read the local mirror
+# (guard-1139 / rb-2636), so the saving cannot come from caching bytes locally.
+# It comes from backend.stat(): an ETag match is PROOF the object is unchanged,
+# so a memoized answer behind one is authoritative in the same sense the GET is.
+# These tests pin the four reuse arms AND the degrade path, because the
+# pre-existing _FakeBackend has no stat() and therefore exercises none of them.
+# =============================================================================
+
+class _StatFakeBackend(_FakeBackend):
+    """_FakeBackend + a stat() whose FileStat-alike `version` IS the ETag, and a
+    counter proving whether the full get_object actually ran."""
+
+    def __init__(self, by_path, etags):
+        super().__init__(by_path)
+        self._etags = {str(k): v for k, v in etags.items()}
+        self.reads = 0
+
+    def stat(self, path):
+        et = self._etags.get(str(path))
+        if et is None:
+            return None            # absent -- mirrors OwnCloudBackend.stat
+        return type("FileStat", (), {"version": et, "size": 0, "mtime_ns": 0})()
+
+    def read_authoritative_bytes(self, path):
+        # Count only reads that actually TRANSFER an object. The absent agent
+        # queue raises FileNotFoundError (the skip arm), and counting that as a
+        # read would make every assertion below off-by-one against the thing
+        # being measured, which is bytes pulled from the store.
+        out = super().read_authoritative_bytes(path)
+        self.reads += 1
+        return out
+
+
+def _fresh_memo():
+    import _idle_cache_common
+    _idle_cache_common._AUTH_WAKE_MEMO.clear()
+
+
+def test_etag_match_skips_the_get():
+    """Second call with an unchanged ETag returns the identical answer without
+    re-downloading. This is the 919 GB/wk saving, in one assertion."""
+    _fresh_memo()
+    now = datetime.now().replace(microsecond=0)
+    be = _StatFakeBackend(
+        {_WORLD: _asps_bytes(_recurring_due_at(now + timedelta(seconds=300)))},
+        {_WORLD: '"etag-v1"'})
+    first = authoritative_earliest_wake_at(now, backend=be,
+                                           world_dir=_WORLD.parent, agent_dir=_AGENT.parent)
+    assert be.reads == 1 and first is not None
+    second = authoritative_earliest_wake_at(now + timedelta(seconds=5), backend=be,
+                                            world_dir=_WORLD.parent, agent_dir=_AGENT.parent)
+    assert second == first, "memo must return the byte-identical answer"
+    assert be.reads == 1, "an unchanged ETag must not re-download the object"
+
+
+def test_etag_change_forces_reread():
+    """A changed ETag means changed content -- the memo must not be trusted."""
+    _fresh_memo()
+    now = datetime.now().replace(microsecond=0)
+    be = _StatFakeBackend(
+        {_WORLD: _asps_bytes(_recurring_due_at(now + timedelta(seconds=300)))},
+        {_WORLD: '"etag-v1"'})
+    authoritative_earliest_wake_at(now, backend=be,
+                                   world_dir=_WORLD.parent, agent_dir=_AGENT.parent)
+    assert be.reads == 1
+    be._etags[str(_WORLD)] = '"etag-v2"'          # a peer wrote the queue
+    authoritative_earliest_wake_at(now, backend=be,
+                                   world_dir=_WORLD.parent, agent_dir=_AGENT.parent)
+    assert be.reads == 2, "a new ETag must fall through to the full read"
+
+
+def test_elapsed_recurring_wake_recomputes():
+    """The one arm that must NOT reuse: a recurring candidate that was future at
+    compute time and has since elapsed would be filtered out by a fresh compute
+    (_goal_wake_time's `w > now`), so the memo must fall through."""
+    _fresh_memo()
+    now = datetime.now().replace(microsecond=0)
+    be = _StatFakeBackend(
+        {_WORLD: _asps_bytes(_recurring_due_at(now + timedelta(seconds=30)))},
+        {_WORLD: '"etag-v1"'})
+    first = authoritative_earliest_wake_at(now, backend=be,
+                                           world_dir=_WORLD.parent, agent_dir=_AGENT.parent)
+    assert be.reads == 1 and first is not None
+    # Same ETag, but now is past the memoized wake -> recompute, not reuse.
+    authoritative_earliest_wake_at(now + timedelta(seconds=120), backend=be,
+                                   world_dir=_WORLD.parent, agent_dir=_AGENT.parent)
+    assert be.reads == 2, "an elapsed recurring wake must force a recompute"
+
+
+def test_past_only_candidates_memoize_as_none():
+    """_goal_wake_time ends in a GLOBAL future-only backstop
+    (`future = [c for c in candidates if c > now]`), so a queue whose only timer
+    is in the past yields None -- and None is reusable under a fixed ETag,
+    because a set that was empty at T is still empty at T' > T. This pins the
+    invariant that makes the whole memo a two-arm proof rather than a three-arm
+    one; a draft that assumed the filter was recurring-only carried an
+    unreachable third arm until this case was written."""
+    _fresh_memo()
+    now = datetime.now().replace(microsecond=0)
+    be = _StatFakeBackend(
+        {_WORLD: _asps_bytes({"id": "g-blk", "status": "blocked",
+                              "blocker_ref": {"expires_at": _iso(now - timedelta(hours=5))}})},
+        {_WORLD: '"etag-v1"'})
+    first = authoritative_earliest_wake_at(now, backend=be,
+                                           world_dir=_WORLD.parent, agent_dir=_AGENT.parent)
+    assert first is None, "a past-only candidate must be filtered by the backstop"
+    assert be.reads == 1
+    second = authoritative_earliest_wake_at(now + timedelta(seconds=90), backend=be,
+                                            world_dir=_WORLD.parent, agent_dir=_AGENT.parent)
+    assert second is None
+    assert be.reads == 1, "a memoized None must not re-download the object"
+
+
+def test_backend_without_stat_degrades_to_todays_behaviour():
+    """The capability probe is a real absence check, not dead protection: the
+    suite's own fakes (and any third backend) lack stat(), and those must keep
+    the exact pre-change read-every-time semantics."""
+    _fresh_memo()
+    now = datetime.now().replace(microsecond=0)
+    be = _FakeBackend({_WORLD: _asps_bytes(_recurring_due_at(now + timedelta(seconds=300)))})
+    assert getattr(be, "stat", None) is None
+    a = authoritative_earliest_wake_at(now, backend=be,
+                                       world_dir=_WORLD.parent, agent_dir=_AGENT.parent)
+    b = authoritative_earliest_wake_at(now, backend=be,
+                                       world_dir=_WORLD.parent, agent_dir=_AGENT.parent)
+    assert a == b and a is not None
