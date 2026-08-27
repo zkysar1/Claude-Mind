@@ -153,7 +153,14 @@ def _run_fleet_block(roster_stub: str, pull_stub: str = "return 0"):
             'RESPONSE=\'{"ok":true,"agent":"x","pulled":1}\'\n'
             f'TOUCHED="{touched.as_posix()}"\n'
             f'_pull_one_agent() {{ {pull_stub}; }}\n'
-            'rt_no_daemon_error() { echo "no-daemon" >&2; exit 3; }\n'
+            # Faithful to the real contract: rt_no_daemon_error exits 1 on ALL THREE
+            # of its paths (_runtime.sh) — it can never produce rc=3, and the
+            # sibling stubs in test_clear_in_flight_call_site_scoping.py,
+            # test_claim_checkpoint_anchor.py and test_wm_append_arg_parser.py
+            # all use 1. Nothing here asserts on the value (every check is
+            # != 0 / == 0), so this only removes a shape production cannot
+            # emit. ()
+            'rt_no_daemon_error() { echo "no-daemon" >&2; exit 1; }\n'
             f'_fleet_roster() {{ {roster_stub}; }}\n'
         ) + block + "\n"
         h = Path(tmpd) / "h.sh"

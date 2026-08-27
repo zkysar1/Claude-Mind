@@ -47,10 +47,25 @@ def seeded_with_goals(running_daemon):
         "goals": [
             {"id": "g-001-01", "title": "Build encoding pipeline",
              "status": "pending", "category": "framework-architecture",
-             "tags": ["routine"]},
+             "tags": ["routine"], "recurring": True,
+             "verified": "true"},
+            # STRAY PROJECTION-ONLY KEYS ON A RAW RECORD (). These two
+            # are attached at projection time and are NOT goal fields — but real
+            # records in the live store carry stray literal copies anyway (both
+            # appear in the endpoint's own 135-name valid-field list). That is the
+            # production condition, and without it here the projection-only
+            # refusal test passed while the defect was live: with no record
+            # carrying the key, `field_key_seen` stayed False and the refusal
+            # fired for the wrong reason. Seeded on the COMPLETED goal because
+            # that is what leaked in production — `--goal-field asp_id asp-368`
+            # returned exactly one row and it was a completed goal, which reads
+            # as "this aspiration has one goal" rather than as an error.
+            # guard-2353: a fixture row must lie on the FAR SIDE of the boundary
+            # being moved, or the suite gives the change no evidence.
             {"id": "g-001-02", "title": "Audit token usage",
              "status": "completed", "category": "observability",
-             "tags": []},
+             "tags": [], "recurring": False,
+             "asp_id": "asp-001", "source": "world"},
         ],
         "progress": {"completed_goals": 1, "total_goals": 2},
     }
@@ -63,7 +78,7 @@ def seeded_with_goals(running_daemon):
         "goals": [
             {"id": "g-100-01", "title": "Encode session insights",
              "status": "pending", "category": "framework-architecture",
-             "tags": ["urgent", "encoding"]},
+             "tags": ["urgent", "encoding"], "recurring": True},
             {"id": "g-100-02", "title": "Refactor encoder",
              "status": "pending", "category": "framework-architecture",
              "tags": []},
@@ -305,22 +320,67 @@ def test_query_valid_field_with_no_match_still_returns_empty(seeded_with_goals):
     assert json.loads(body) == []
 
 
-def test_query_projection_only_key_gets_a_specific_hint(seeded_with_goals):
-    """`asp_id` is visible in output but attached at projection time.
+@pytest.mark.parametrize("key,value", [("asp_id", "asp-001"), ("source", "world")])
+def test_query_projection_only_key_refused_even_when_a_record_carries_it(
+        seeded_with_goals, key, value):
+    """DISCRIMINATING (): refused EVEN THOUGH  carries the key.
 
-    Refused like any absent key, with an extra sentence — the generic message
-    would send a caller hunting for a key they can plainly see in the response.
+    This is the whole defect. The refusal used to be nested inside
+    `if field_key is not None and not field_key_seen:` — reachable only when NO
+    goal record carried the name. Stray literal `asp_id`/`source` fields exist on
+    real records, so in production `field_key_seen` went True, the refusal was
+    skipped, and the endpoint returned the stray rows with HTTP 200: a PLAUSIBLE
+    NON-ZERO that trips none of the count-hazard reflexes a zero would. Measured
+    `--goal-field asp_id asp-115` → 4 rows against a truth of 1477.
+
+    The fixture now seeds those stray keys, so against the pre-fix code this test
+    FAILS with 200 + one row instead of erroring — which is what makes it evidence
+    rather than decoration. The value asserted is not "some rows" but "no rows at
+    any count": a projection-only key can never be filtered on, so the only
+    correct row count is *no answer at all*.
     """
     _, port = seeded_with_goals
     try:
-        _get(port, "/v1/aspirations/query",
-             {"goal_field_name": "asp_id", "goal_field_value": "asp-001"})
+        status, body = _get(port, "/v1/aspirations/query",
+                            {"goal_field_name": key, "goal_field_value": value})
     except urllib.error.HTTPError as e:
         assert e.code == 400
         detail = json.loads(e.read().decode("utf-8"))["detail"]
         assert "projection" in detail
+        # Name the supported path, or the caller has an error and no next step.
+        assert "aspirations-read.sh" in detail
     else:
-        raise AssertionError("expected 400 for a projection-only key")
+        raise AssertionError(
+            f"expected 400 for projection-only key {key!r}; got {status} with "
+            f"body {body!r} — the stray-field path is live again"
+        )
+
+
+def test_stray_projection_key_is_really_on_the_raw_record(seeded_with_goals):
+    """POSITIVE CONTROL for the test above — proves the fixture is discriminating.
+
+    If g-001-02 does not actually carry the stray key, the refusal test above
+    passes for the OLD wrong reason (key unseen) rather than the new right one
+    (key seen and refused anyway), and the suite silently stops covering the
+    defect the moment someone tidies the fixture.
+
+    READS THE STORE FILE, NOT THE ENDPOINT — and that is the whole point. Asking
+    the endpoint with `full=true` would assert nothing: `full` mode ATTACHES
+    `asp_id` and `source` during projection, so those keys come back present
+    whether or not the raw record holds them. That is precisely the trap that
+    produced this defect's original misdiagnosis, which cited a `--full` read as
+    proof the fields were "in the RAW record" and concluded the wrong defect
+    class. The store file is the only surface where the distinction is visible.
+    """
+    project_root, _ = seeded_with_goals
+    raw = (project_root / "world" / "aspirations.jsonl").read_text(encoding="utf-8")
+    record = json.loads(raw.strip().splitlines()[0])
+    goal = next(g for g in record["goals"] if g["id"] == "g-001-02")
+    assert goal.get("asp_id") == "asp-001", (
+        "fixture no longer carries a stray asp_id — the refusal test above is "
+        "now vacuous (it would pass via the key-unseen path)"
+    )
+    assert goal.get("source") == "world"
 
 
 def test_query_unknown_field_against_goalless_store_is_empty_not_400(running_daemon):
@@ -343,3 +403,76 @@ def test_query_unknown_field_against_goalless_store_is_empty_not_400(running_dae
                          "goal_field_value": "x"})
     assert status == 200
     assert json.loads(body) == []
+
+
+# ---------------------------------------------------------------------------
+# Filter: BOOLEAN goal fields ()
+#
+# guard-2353: a boundary move gets no evidence from a pre-existing suite unless
+# some fixture row lies on the FAR SIDE of the old boundary. None did — the word
+# "recurring" appeared zero times in this file — so the fixture above was
+# extended and these rows ARE the discriminating set: every assertion marked
+# DISCRIMINATING below returned [] under `str(actual) != value`.
+# ---------------------------------------------------------------------------
+
+def test_query_bool_field_json_spelling_matches(seeded_with_goals):
+    """DISCRIMINATING: `true` is the JSON/YAML spelling the store holds on disk,
+    and it was the one input that could never match (g-115-3965)."""
+    _, port = seeded_with_goals
+    _, body = _get(port, "/v1/aspirations/query",
+                   {"goal_field_name": "recurring", "goal_field_value": "true"})
+    assert sorted(r["goal_id"] for r in json.loads(body)) == ["g-001-01", "g-100-01"]
+
+
+def test_query_bool_field_spellings_agree(seeded_with_goals):
+    """true / True / 1 must return the SAME non-zero set. Only `True` worked before."""
+    _, port = seeded_with_goals
+    seen = []
+    for spelling in ("true", "True", "1"):
+        _, body = _get(port, "/v1/aspirations/query",
+                       {"goal_field_name": "recurring", "goal_field_value": spelling})
+        seen.append(sorted(r["goal_id"] for r in json.loads(body)))
+    assert seen[0] == ["g-001-01", "g-100-01"], seen
+    assert seen[0] == seen[1] == seen[2], seen
+
+
+def test_query_bool_field_false_matches_false_only(seeded_with_goals):
+    """`false` must select the False-valued goal and EXCLUDE the True ones —
+    the truthiness trap: not everything, not nothing."""
+    _, port = seeded_with_goals
+    for spelling in ("false", "False", "0"):
+        _, body = _get(port, "/v1/aspirations/query",
+                       {"goal_field_name": "recurring", "goal_field_value": spelling})
+        ids = sorted(r["goal_id"] for r in json.loads(body))
+        assert ids == ["g-001-02"], (spelling, ids)
+
+
+def test_query_bool_field_absent_is_not_false(seeded_with_goals):
+    """A goal LACKING the field is not thereby False — absence stays unmatched."""
+    _, port = seeded_with_goals
+    _, body = _get(port, "/v1/aspirations/query",
+                   {"goal_field_name": "recurring", "goal_field_value": "false"})
+    ids = {r["goal_id"] for r in json.loads(body)}
+    assert "g-100-02" not in ids and "g-100-03" not in ids, ids
+
+
+def test_query_bool_field_nonsense_value_matches_nothing(seeded_with_goals):
+    """An unrecognised spelling must match NOTHING, never everything."""
+    _, port = seeded_with_goals
+    _, body = _get(port, "/v1/aspirations/query",
+                   {"goal_field_name": "recurring", "goal_field_value": "banana"})
+    assert json.loads(body) == []
+
+
+def test_query_string_field_holding_true_is_not_coerced(seeded_with_goals):
+    """RECALL CONTROL (guard-958).  carries verified="true" as a STRING.
+    It must match "true" exactly and NOT the other boolean spellings — the bool
+    normalization is scoped by the ACTUAL field's type, not applied to input."""
+    _, port = seeded_with_goals
+    _, body = _get(port, "/v1/aspirations/query",
+                   {"goal_field_name": "verified", "goal_field_value": "true"})
+    assert sorted(r["goal_id"] for r in json.loads(body)) == ["g-001-01"]
+    for spelling in ("True", "1", "yes"):
+        _, body = _get(port, "/v1/aspirations/query",
+                       {"goal_field_name": "verified", "goal_field_value": spelling})
+        assert json.loads(body) == [], spelling

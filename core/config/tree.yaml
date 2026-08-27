@@ -311,6 +311,29 @@ retrieval:
   # (byte-identical to pre-). Only active on the real-embedding path;
   # the TF-IDF fallback is untouched.
   cosine_reserved_slots: 3
+  # Supplementary-store relevance floor (). The supplementary-lane
+  # analogue of cosine_reserved_slots above: reserve the top-N cap slots for the
+  # entries with the strongest QUERY-TOKEN overlap, leaving the other (cap - N)
+  # ranked by utilization exactly as before. Uses the overlap count the admission
+  # predicate already computes, so it needs NO embedding index — which is why it
+  # is DEFAULT ON while embedding_blend_enabled below is off.
+  # WHY IT EXISTS: `_entry_matches` admits on a BOOLEAN and the cap then sorts by
+  # utilization alone, so relevance is discarded at the door. 3,087 of 4,702 live
+  # guardrails carry utilization_score > 0, so a record at 0.0 cannot win a slot
+  # at any cap and cannot earn utilization without being returned — a deadlock.
+  # Measured 2026-08-24: guard-4838 ranked 377 of 431 on the query its own
+  # consumers are told to run, guard-4902 ranked 27 of 932 on verbatim text from
+  # its own rule field; the floor takes both to 1.
+  # DISPLACEMENT IS BOUNDED, measured over 120 recent goal titles: fired on 113,
+  # promoted at overlap median 5 / max 13, displaced entries at utility median
+  # 0.2857 against a corpus max of 0.8795 — the bottom 3 of the top 20, never the
+  # canon. 0 disables (byte-identical to pre-).
+  relevance_reserved_slots: 3
+  # Minimum distinct length->=5 query-token overlap to claim a reserved slot.
+  # Clamped in-code to strictly above the text-fallback admission threshold (2):
+  # at the threshold the floor would fire on bare-minimum accidental matches,
+  # which are 370 of 431 candidates on the live corpus.
+  relevance_floor_min_overlap: 3
   # : TREE-LANE eligibility floor. Deliberately SEPARATE from the
   # shared embedding_min_cosine (0.35) above, which governs the supplementary
   # rb/guardrail lane and was tuned on THAT lane's A/B evidence — lowering the

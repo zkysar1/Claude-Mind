@@ -54,7 +54,7 @@ _PYTHON_HEAD_RE = re.compile(r"^(?:[\w./\\-]*[/\\])?(?:python3?(?:\.exe)?|py)$")
 _GRADLE_HEAD_RE = re.compile(r"^(?:[\w./\\-]*[/\\])?gradlew(?:\.bat)?$")
 
 FRAMEWORK_IMPERATIVE = """\
-run-full-suite / pytest is about to run. Five things decide whether its output
+run-full-suite / pytest is about to run. Six things decide whether its output
 means anything (.claude/rules/run-full-suite-after-deep-code.md):
 
 1. READ THE `VERDICT:` LINE FIRST, before any number above it. A run reporting
@@ -79,6 +79,29 @@ means anything (.claude/rules/run-full-suite-after-deep-code.md):
    for the invisible (main()-style + shell) suites and the domain half --
    each half reports separately and none may ride under the chunked verdict.
    (mind_api/tests folded into the chunked pool 2026-08-20, g-115-6942.)
+6. ON A BUSY BOX, PIN THE TREE BEFORE YOU LAUNCH. `VERDICT: INVALID
+   (tree-moved)` outranks every other verdict and voids the entire run, and
+   HEAD moves for reasons that are not a peer merge: your OWN `git commit`
+   counts, and so does your own loop's turn-end iteration-push merge. The tree
+   lock does NOT cover you -- it returns 0 for your own sid, and a BACKGROUNDED
+   run inherits no MIND_SID at all so it takes no lock while still printing
+   authoritative-looking chunk counts. Remedy: `git worktree add --detach
+   /tmp/<name> <sha>`. FIRST `cp agents/<you>/local-paths.conf`
+   INTO the worktree, then run the suite THERE exporting MIND_AGENT,
+   MIND_SID, STORAGE_BACKEND=local. The conf copy is load-bearing: it is
+   GITIGNORED, so a worktree cannot inherit it and WORLD_DIR/META_DIR resolve
+   EMPTY -- 0 passed / 106 errors, an INVALID run that reads as a
+   catastrophic regression (alpha cc-04; zeta cc-02 2026-08-27). DO NOT reach
+   for MIND_WORLD/MIND_META: this line prescribed exporting them until
+   2026-08-27 and THEY CANNOT WORK -- core/scripts/tests/conftest.py pops
+   BOTH at module import, deliberately; its own comment says the unset case
+   resolves through the conf chain, measured in the MAIN repo where the conf
+   EXISTS. A worktree breaks that premise, so the copied conf is the only
+   channel surviving collection. That export remedy was itself a guard-2030
+   defect -- a correctly-measured diagnosis with an unmeasured remedy beside
+   it, believed by adjacency, costing a 30-min run.
+   Measured 6 voided runs across 3 agents before this line
+   existed (guard-4774, guard-4940, guard-5124).
 
 On an own-cloud box `STORAGE_BACKEND=local` is MANDATORY for any test runner,
 including bash aggregators and direct `python3 test_*.py` (guard-955): a

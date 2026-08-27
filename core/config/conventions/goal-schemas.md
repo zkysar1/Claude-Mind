@@ -148,7 +148,24 @@ two signals.
 
 ## Allowed values
 
-Single source of truth: `VALID_GOAL_SOURCES` in `core/scripts/aspirations.py`.
+Single source of truth: `VALID_GOAL_SOURCES` in `core/scripts/_goal_source.py`
+(`aspirations.py` imports it; it is not defined there — this pointer named the
+importer until 2026-08-26).
+
+**Enforcement is CLI-only, and the CLI is not the live path.** The enum is
+validated at `aspirations.py:571`, but the daemon writer
+(`mind_api/src/endpoints/aspirations_write.py`) imports only `apply_default`
+and its `_validate_goal` subset omits the check — the same omission its own
+comments memorialise for `intended_agent` and two sibling fields. Under
+daemon-only architecture that makes the validator inert on real filings, so an
+out-of-vocabulary `goal_source` LANDS silently rather than being refused. Treat
+this table as the contract a writer must honour by construction, not as one the
+store will enforce for you. (Measured g-306-342, 2026-08-26.)
+
+**Not a value: `chat-originated`.** The chat-goal lane originally prescribed it
+here, which is a category error — `goal_source` answers WHO INITIATED, and a
+chat request is user-initiated (`user`). WHICH LANE filed it is `origin_signal`'s
+job, via the sanctioned `chat-goal:` prefix in the table below.
 
 | Value | Meaning | Typical caller |
 |-------|---------|----------------|
@@ -168,7 +185,7 @@ by both the CLI path and the daemon writer endpoint):
 
 | `origin_signal` prefix | Inferred `goal_source` |
 |------------------------|------------------------|
-| `user_directive`, `user-directed:*`, `user_directed:*`, `pending_question:*` | `user` |
+| `user_directive`, `user-directed:*`, `user_directed:*`, `pending_question:*`, `chat-goal:*` | `user` |
 | `recurring_cadence:*`, `recurring:*` | `recurring-cycle` |
 | `failing_test:*`, `resolved_hypothesis:*`, `low_confidence_node:*`, `drift_detected:*`, `monitor:*`, `alert-email:*`, `routing-mismatch:*`, `routing-either-resolve:*`, `insight_trigger:*`, `skill-discovery-audit:*`, `blocker_pattern:*`, `unit-economics-move:*` | `cycle-detector` |
 | `decomposition:*`, `parent_aspiration:*`, `unblock:*`, `investigate:*`, `investigation:*`, `idea:*`, `maintain:*`, `apply:*`, `brief:*`, `board_post:*`, `program-change-proposal:*`, `idle_fallback` | `agent-self` |
@@ -1037,19 +1054,54 @@ cases where it is not.
 
 | Field | Written by | Read by |
 |-------|-----------|---------|
-| `pull_signal` | a PRODUCER at the moment the dependency lands — e.g. worker-loop Phase 3.8 after a carrier ref push carrying non-merge framework content; the reducer's hourly `worker-ref-consume --check` report lane | `goal-selector.py` `apply_pull_boost` (post-scoring pass); cleared by the consumer goal's close path |
+| `pull_signal` | `core/scripts/pull-signal-set.sh` — the ONE producer, called from two lanes (below) | `goal-selector.py` `apply_pull_boost` (post-scoring pass); CLEARED by `recurring-close.sh` at the consumer goal's close |
+
+Both lanes call the same self-gating script, so a double-fire costs one
+`SKIP-live` and nothing else. The decision is the pure function
+`pull_signal_producer.decide()` (branch-tested without a daemon, world or git
+tree — same shape and same reason as `reducer_self_fence.py::decide`):
+
+| Lane | Call site | Fires when |
+|---|---|---|
+| WORKER | `iteration-push.sh`, inside the `--push-worker-ref` SUCCESS branch | the carrier push just landed AND `origin/main..HEAD` carries non-merge framework files. Wired at the push rather than in worker-loop's Phase 3.8 prose so it fires on the real event instead of on an LLM remembering a step (guard-403), and costs no hot-path bytes |
+| REDUCER | `worker-ref-consume.sh --check` | an outstanding TIP carries framework content. Belt-and-braces: covers a body that pushed while running old code, or died before its own producer ran. `--check` ONLY — a bare `--json` read stays side-effect-free, or diagnosing this instrument would perturb the ranking being diagnosed |
+
+The consumer goal id lives in `aspirations.yaml` `pull_boost.carrier_consumer_goal`
+(currently `g-306-284`), not hardcoded in either lane.
 
 ## Set via
 
 ```
+# Prefer the producer — it owns idempotence, the age test and the null-clear rule:
+bash core/scripts/pull-signal-set.sh --goal <goal-id> --reason "<what landed>"
+bash core/scripts/pull-signal-set.sh --goal <goal-id> --clear
+
+# The raw writes it performs (valid only because `pull_signal` is now registered
+# in _goal_fields.py — before that both of these were refused):
 aspirations-update-goal.sh <goal-id> pull_signal '{"set_at":"2026-08-17T23:00:00","by":"alpha/cc-07","reason":"carrier ref, 4 framework files"}'
 aspirations-update-goal.sh <goal-id> pull_signal null        # the CLEAR — null, never key removal
 ```
 
 ## Validation
 
-None at the write layer: `aspirations-update-goal.sh` accepts arbitrary field
-names today (see g-115-6573). The consumer is defensive instead — a non-dict
+**CORRECTED 2026-08-23 (g-115-6590).** This section previously read "None at the
+write layer: `aspirations-update-goal.sh` accepts arbitrary field names today".
+That stopped being true the day AFTER this field was documented: g-115-6573
+landed `_goal_fields.py::GOAL_KNOWN_FIELDS` on 2026-08-18, and every write of an
+unregistered name is now refused by the `goal-field-allowlist` gate.
+
+The consequence was that the documented "Set via" command below **could not
+work**, and nothing said so — the consumer had shipped, the convention described
+the write, and the field was unwritable. `pull_signal` was missing from the
+allowlist for a structural reason worth remembering: that allowlist was derived
+from a census of keys OBSERVED on live goals, and a field whose CONSUMER has
+shipped but whose PRODUCER has not is carried by no goal, so a census cannot see
+it. **Any read-before-write field is invisible to census-derived validation.**
+Registering `pull_signal` is part of the change that ships its producer.
+
+Type validation at the write layer is still absent — `parse_value` json-parses a
+leading `{` into a dict and otherwise falls through to a string, with no
+per-field enforcement. The consumer is defensive instead: a non-dict
 `pull_signal`, a missing/unparseable `set_at`, an aged-out signal, or a stamp
 more than 1h in the reader's future all yield NO boost and never raise.
 
@@ -1071,3 +1123,91 @@ safely.
   deficit
 - `guard-3221` — a conditional feature must read the artifact the CONSUMER
   receives, not the store the PRODUCER wrote to
+
+# Supersession Pointer Field (g-115-7893, 2026-08-27)
+
+```json
+{
+  "goal_id": "g-364-79",
+  "status": "skipped",
+  "superseded_by": "g-364-81"
+}
+```
+
+`superseded_by` names the goal that CARRIES THE WORK this goal was closed in
+favour of. Optional; absent on the overwhelming majority of goals.
+
+## Why it exists
+
+Measured 2026-08-26 (~4h of fleet blindness). A duplicate cutover chain
+(`g-364-77..80`) was closed `skipped` with the supersession recorded only as
+prose in each `outcome_note`. A re-probe sweep read `status == "skipped"` as
+NOT-done and re-deferred two goals that had just been unblocked, citing a
+premise ("cutover not live") that was already false. Zero vinheim goals were
+selectable across 1,400 ranked until a human asked why.
+
+A status-equality check cannot see that the work IS done under a different id.
+The behavioural layer (`guard-5185`: rewrite dependents in the same pass) asks
+the closer to remember; this field lets the probe find out for itself.
+
+## The probe rule
+
+**Never resolve a dependency by comparing `status` to a terminal set.** Use the
+shared resolver:
+
+```python
+from _dependency_graph import resolve_dependency, supersession_target
+
+verdict, resolved_id, chain = resolve_dependency(target_id, goal_index)
+# verdict: "satisfied" | "open" | "unknown" | "cycle"
+```
+
+`goal_index` is `{goal_id: goal_dict}`. Four verdicts, and the distinctions are
+load-bearing:
+
+| verdict | meaning | correct handling |
+|---|---|---|
+| `satisfied` | the target, or the goal that superseded it, is `completed` | the gate is met |
+| `open` | live, or closed in a way that does not satisfy | still blocked |
+| `unknown` | absent from the index entirely | **not** "open" — guard-1890: an archived completion is absent too, so absence is ignorance, never evidence |
+| `cycle` | the `superseded_by` chain loops | a data defect; repoint it. Undecidable, not unsatisfied |
+
+**`completed` is the ONLY status that satisfies.** Supersession MOVES the
+obligation; it does not discharge it. A chain ending in another `skipped` stays
+`open` — over-satisfying here would silently green-light a dependency whose
+work nobody did, which is strictly worse than the freeze this field fixes.
+
+Chains are followed, so a duplicate-of-a-duplicate resolves to whoever finally
+did the work.
+
+## The migration fallback
+
+Rows closed before this field existed (the `g-364-77..80` shape) carry their
+supersession only in `outcome_note`. `supersession_target()` reads those, but
+**deliberately narrowly**: it requires BOTH a supersession word (`supersed(ed|es|ing)`)
+AND a goal id, takes the FIRST id in the note, and only applies to goals whose
+status is `skipped` or `superseded`. A note that merely MENTIONS another goal is
+not a supersession, and a supersession word with no id resolves to `None` rather
+than to a guess.
+
+The explicit field always wins over the note.
+
+## Writing it
+
+`superseded` is a full member of `VALID_GOAL_STATUSES` but is **not settable via
+`update-goal`** — `aspirations.py` routes it through
+`complete --intent-satisfied`, behind an evidence gate, listing the goal in
+`superseded_goal_ids`. Until a direct write path exists, a duplicate closed as
+`skipped` should carry `superseded_by` explicitly so the probe rule above
+resolves it without relying on the note fallback.
+
+## Consumers
+
+- `core/scripts/_dependency_graph.py` — `resolve_dependency` / `supersession_target` (SSOT)
+- `core/scripts/blocked-signal-resolution-check.py` — precheck 0.5b.12 re-probe path
+- Tests: `core/scripts/tests/test_dependency_supersession_resolution.py`
+
+Note `_dependency_graph.TERMINAL_STATUSES` must also list every terminal status,
+or `build_graph` keeps a closed goal in the adjacency map and it blocks its
+dependents forever — `superseded` and `decomposed` were both missing until
+2026-08-27.

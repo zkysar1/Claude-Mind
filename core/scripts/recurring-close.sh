@@ -469,6 +469,7 @@ current = 0
 current_deep = 0
 current_sub_hits = 0
 current_sub_runs = 0
+has_pull_signal = False   # : only CLEAR what is actually set
 with open(sf, "r", encoding="utf-8") as f:
     for line in f:
         line = line.strip()
@@ -481,6 +482,7 @@ with open(sf, "r", encoding="utf-8") as f:
                 current_deep = int(g.get("consecutive_deep", 0))
                 current_sub_hits = int(g.get("substantive_hits", 0))
                 current_sub_runs = int(g.get("substantive_runs", 0))
+                has_pull_signal = g.get("pull_signal") is not None
                 break
 
 new_val = current + 1 if outcome == "routine" else 0
@@ -572,6 +574,36 @@ if new_sub_hits != current_sub_hits:
     )
     if upd_lsa.returncode != 0:
         print(f"[recurring-close] update last_substantive_at failed: {upd_lsa.stderr}", file=sys.stderr)
+
+# : CLEAR the dependency-pull signal on close. This goal has now RUN,
+# so whatever the producer pulled it for has been consumed; leaving the signal
+# set would re-boost it on the very next selection.
+#
+# NULL, NEVER KEY REMOVAL. Measured against coordination_merge._merge_goal: a
+# clear by removing the key is RESURRECTED by the cross-box merge even when the
+# clearer is strictly newer, while a null clear survives whenever the clearer is
+# the newer write. See goal-schemas.md "THE CLEAR IS FRAGILE".
+#
+# GATED ON has_pull_signal, and that gate is load-bearing rather than an
+# optimisation: recurring-close runs on EVERY recurring goal, so an
+# unconditional write would stamp `pull_signal: null` onto every recurring
+# record in the store — turning a field ~no goal carries into a field ~every
+# goal carries, and destroying the "absence is the no-op path" property the
+# consumer's no-regression argument rests on.
+#
+# NON-FATAL, and the consumer does not depend on this landing: max_age_hours
+# ages the signal out on its own, so a lost clear degrades to "expires late"
+# rather than "pinned at rank 1 forever".
+if has_pull_signal:
+    upd_ps = subprocess.run(
+        [sys.executable, str(sd / "aspirations.py"),
+         "--source", src, "update-goal", gid, "pull_signal", "null"],
+        capture_output=True, text=True, encoding="utf-8",
+    )
+    if upd_ps.returncode != 0:
+        print(f"[recurring-close] clear pull_signal failed: {upd_ps.stderr}", file=sys.stderr)
+    else:
+        print(f"[recurring-close] {gid}: pull_signal CLEARED (null, not key removal)", file=sys.stderr)
 
 # Surface the decision so the loop's stderr stream captures it. Mirrors the
 # Block A/C flip notification line above (line ~192).

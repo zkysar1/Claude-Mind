@@ -197,6 +197,59 @@ def _atomic_write(path: Path, data: dict) -> None:
         raise
 
 
+def _read_optional_stdin(timeout_s=None):
+    """Read OPTIONAL stdin without blocking forever on a non-EOF pipe (guard-664).
+
+    `isatty()` distinguishes a terminal from a non-terminal but does NOT
+    guarantee EOF: a non-tty stdin can be an inherited pipe that never closes,
+    so a bare `sys.stdin.read()` blocks indefinitely. Measured on THIS script
+    (g-115-3661): a bare `loop-state-save.sh init` sat 11 minutes at 0% CPU,
+    wchan `unix_stream_data_wait`, and wrote no checkpoint -- while the WARN
+    emitted on every skipped Phase 2.95 prescribed that very command, so the
+    remediation advice was itself the trap.
+
+    Reading in a daemon thread with a join() deadline degrades a non-EOF stdin
+    to "" instead of hanging; when stdin IS piped, EOF arrives in << timeout_s
+    and the read completes normally. select()/signal.alarm do NOT work on
+    Windows pipes; a daemon thread does. Canonical reference:
+    experience.py::_read_optional_stdin. Tunable via
+    LOOP_STATE_SAVE_STDIN_TIMEOUT_S (default 10s) -- far above any real piped
+    delivery (EOF in ms), far below the observed hang.
+
+    Both call sites take OPTIONAL stdin (init has --json, update has --set),
+    which is exactly the class guard-664 covers; MANDATORY stdin is exempt.
+    """
+    if sys.stdin is None or sys.stdin.isatty():
+        return ""
+    if timeout_s is None:
+        timeout_s = float(os.environ.get("LOOP_STATE_SAVE_STDIN_TIMEOUT_S", "10"))
+    import threading
+    box = {"data": "", "done": False}
+
+    def _reader():
+        try:
+            box["data"] = sys.stdin.read()
+        except Exception:
+            pass
+        finally:
+            box["done"] = True
+
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+    t.join(timeout_s)
+    if not box["done"]:
+        sys.stderr.write(
+            f"WARN: stdin did not reach EOF within {timeout_s:.0f}s -- proceeding "
+            f"without stdin JSON. The caller likely invoked the wrapper bare (no "
+            f"`echo '...' |` pipe and no `</dev/null`). Use a non-blocking form "
+            f"instead -- `loop-state-save.sh init --json '{{...}}'` or "
+            f"`loop-state-save.sh update --set key=value` -- since this warning "
+            f"is emitted for BOTH subcommands (guard-664, g-115-3661).\n"
+        )
+        return ""
+    return box["data"]
+
+
 def cmd_init(args) -> int:
     """Write the initial checkpoint. Reads JSON payload from stdin OR from
     the --json flag. Required keys per SCHEMA must be present. Existing
@@ -204,7 +257,7 @@ def cmd_init(args) -> int:
     if args.json:
         payload = json.loads(args.json)
     elif not sys.stdin.isatty():
-        raw = sys.stdin.read().strip()
+        raw = _read_optional_stdin().strip()
         if not raw:
             print("ERROR: init requires JSON on stdin or via --json", file=sys.stderr)
             return 2
@@ -251,11 +304,15 @@ def _warn_checkpoint_missing(path, args) -> None:
             "Cause is almost always a skipped Phase 2.95 (aspirations-select creates "
             "the checkpoint; only iteration-close deletes it), which leaves it absent "
             "for the REST of the session and silently degrades every downstream "
-            "reader. Re-anchor by piping a JSON object carrying ALL required keys "
-            "(%s) into `loop-state-save.sh init` -- a bare `init` with no stdin "
-            "exits 1, and a partial object warns once per missing key and writes "
-            "nothing, so the naive reading of this line fails twice before it "
-            "works (g-115-3454)."
+            "reader. Re-anchor with the NON-BLOCKING form, which passes the "
+            "payload as an ARGUMENT instead of on stdin: "
+            "`loop-state-save.sh init --json '{...}'` carrying ALL required "
+            "keys (%s). Do NOT use a bare `loop-state-save.sh init`: with no "
+            "stdin it exits 2, and with an inherited never-EOF stdin it BLOCKED "
+            "FOREVER until g-115-3661 (it now degrades after "
+            "LOOP_STATE_SAVE_STDIN_TIMEOUT_S, default 10s, and still exits 2). "
+            "A partial object warns once per missing key and writes nothing, so "
+            "the naive reading of this line fails before it works (g-115-3454)."
             % (path, ", ".join(keys) or "<none>", ", ".join(REQUIRED_INIT_KEYS)),
             file=sys.stderr,
         )
@@ -317,7 +374,7 @@ def cmd_update(args) -> int:
             except json.JSONDecodeError:
                 updates[k] = v
     elif not sys.stdin.isatty():
-        raw = sys.stdin.read().strip()
+        raw = _read_optional_stdin().strip()
         if not raw:
             return 0
         updates = json.loads(raw)

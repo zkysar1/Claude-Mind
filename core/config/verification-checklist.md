@@ -3197,3 +3197,50 @@ MUTATION-PROVEN 2026-08-19 (echo, hostname cc-03, uname -r 6.8.0-137-generic, ow
 **The script refuses rather than reports when its join breaks (rc=2).** Every figure it emits is an INTERSECTION of two id sets, and an intersection's failure mode is a clean zero that reads as a measurement. This is not hypothetical: the script's own first run reported 0 of 636 because it read `goal_id` — the key `aspirations-query.sh`'s default projection emits — against the raw store, which keys goals on `id` (guard-4024). It now accepts both names AND refuses with rc=2 when goals were scanned and artifacts indexed but nothing matched at all. MEASURED at introduction (2026-08-22, agent-name worker Body, hostname cc-07, uname -r 6.8.0-137-generic, own-cloud): artifact index 3,195 ids over 660 completed goals; worker-stamped non-routine population 0 (INSUFFICIENT DATA, as expected); unstamped non-routine 636 with 270 carrying an artifact = **42.5%**. Note that baseline sits well BELOW the 60% bar the soak gate sets, so the target is an improvement goal and not a description of current behaviour. Tests: `core/scripts/tests/test_worker_artifact_rate.py` (5, covering both id shapes, the min-sample state, both sides of the threshold, and the broken-join refusal); the id-fallback and the refusal are each mutation-proven at `sabotage_sites=1`. Verified by g-306-204.
 
 56. **Runtime**: all THREE of these must return 1 against `.claude/skills/drain-temp/SKILL.md` — `grep -c 'guard-4864'`, `grep -c 'THE DEFAULT IS NOT TO STAMP'`, `grep -c 'is FALSE for exactly the third-class suffixes'`. (⚠ Each anchor is deliberately SHORT and verified to sit within ONE line. The first draft of this check grepped the full sentence `ONLY WHEN THE DRY-RUN PROVES IT LICENSES NOTHING YOU DID NOT CLASSIFY`, which spans a line wrap between `THE` and `DRY-RUN` — so it returned 0 against a file where the contract was fully present and committed, i.e. a check that reports REVERTED forever regardless of the truth. Caught within a minute only by running the check against its own target immediately after writing it; the failure mode is a permanent false alarm, which is the direction that trains readers to ignore the checklist. When authoring any grep-based check here, `grep -c` the pattern before committing it, and prefer a short single-token anchor over a quotable sentence — prose in this repo is hard-wrapped.) Phase 2.5 of `/drain-temp` advances `.drain-watermark`, and that stamp is what licenses `temp-drain-purge.sh` Lane 1 to mechanically DELETE third-class files older than it. The step's own justification asserts that a completed drain "enumerated everything present" — but Phase 1 globs `*.md` and `*.json` ONLY, which is precisely the complement of the third-class suffixes the stamp condemns. So the instruction's stated population and its actual population differ, and following the step literally over-licenses deletion. MEASURED 2026-08-22 (alpha, hostname cc-04, uname -r 6.8.0-137-generic, own-cloud, g-001-360): stamping flipped `watermark_source` absent->file and `would_purge` **0 -> 31**, condemning `experience.jsonl.local-preserve-20260818`, `vanished-goals-recovery-2026-08-20.jsonl`, `experience.jsonl.remote` and an unapplied `npc-hours-fix.patch` — every one a recovery layer, i.e. an archive-before-delete violation produced by obeying the step. Retraction (`rm -f .drain-watermark`) returned it to 0, which is the general property worth keeping: **retracting a watermark is always safe because it removes a LICENSE, never data.** The guardrail alone could not hold this, because the INSTRUMENT prescribed the hazard (guard-1984) — hence the SKILL.md patch (commit `97840c3ad`) and this check, which is what detects the patch being reverted. Note the failure is silent in the dangerous direction: an over-advanced watermark produces no error at stamp time and only shows up as files that are already gone. Guardrail: guard-4864. Verified by g-001-360.
+
+57. **Static**: `grep -cE '^[[:space:]]*bash "\$SCRIPT_DIR/shipped-claim-store-check\.sh"' core/scripts/iteration-close.sh` must return 1 — the shipped-claim detector must keep a LIVE, UNCOMMENTED call site inside `do_state_update()`. The detector compares a completed goal's CLAIMED store-backed artifact symbols against what the STORE actually holds, and it is report-only, so a wiring regression produces no error anywhere: the gate simply stops running and every future close reads clean. That is the rb-7741 producer-shipped-consumer-absent class, and the goal that shipped this detector (g-115-7299) named it explicitly in its own verification — "a sweep with no caller is indistinguishable from a sweep that always returns clean".
+
+**Why the `^[[:space:]]*bash` anchor rather than a bare name grep.** A bare `grep -c 'shipped-claim-store-check'` cannot tell an invocation from a mention, so commenting the call out would leave the check green — the exact distinction the goal's own not_machine_checkable check required a human reviewer for. ANCHOR VERIFIED BEFORE COMMITTING, per the lesson in check 56: live file returns **1**; a temp file containing the same line prefixed with `# ` returns **0**; and the file carries exactly ONE mention of the script, which is that invocation, so deletion and comment-out both fail the check identically. Both failure directions are regressions, so collapsing them is correct here. Verified by the g-115-7299 felt-sense window (Phase 5a), zeta, hostname cc-02, uname -r 6.8.0-137-generic.
+
+## BR16. Time-Bomb Tests — an Absolute Timestamp Compared Against now() (g-115-6731)
+
+Three measured instances, three one-off fixes, zero mechanical coverage until now:
+g-326-408 (`test_digest_cost_slot` hardcoded a wall-clock date, RED every day after
+2026-08-17); g-115-5539 (mind_api conftest experience fixtures crossed the 90-day
+staleness boundary); 2026-08-19 (`test_goal_claim_commit_gate.py` pinned
+`2026-08-19T00:57:34` against a 120-minute grace window and had already inverted to
+red **40 minutes after it was authored**, with guard-4364 encoded the same hour).
+
+The class is nasty because of its DELAY: the test passes when written and fails hours
+or days later in someone else's run, where it reads as a code regression rather than a
+fixture defect. Authoring cost lands on one person, triage cost on another.
+
+**DIRECTION IS THE WHOLE DISCRIMINATOR, and a naive proximity scan does not have it.**
+Measured 2026-08-26 across 1,171 test files: co-presence of an ISO literal and a `now()`
+call in the same FILE flags 57 files — unusable. Tightening to ±2 lines flags 3. All
+three are BENIGN, and each shows a different reason a literal near `now()` is safe:
+
+| site | why it is safe |
+|---|---|
+| `core/scripts/tests/test_dt.py:68` | literals are parser INPUTS, not compared to `now` |
+| `test_skill_relations_amended_at_writer.py:112` | `assert stamp > "2026-07-20T00:00:00"` — a LOWER bound against a past date grows MORE true as time passes; it can never flip |
+| `mind_api/tests/test_runtime_aspirations_complete_by.py:98` | already the FIXED form (`datetime.now() - timedelta(hours=1)`); it matches only because its COMMENT quotes the literal it replaced |
+
+So the corpus is currently CLEAN — all three known bombs were fixed — and the honest
+reading of a 3-hit result is three false positives, not three defects.
+
+    Check: no test pins an absolute timestamp as an UPPER bound or equality against a
+    now()-derived value (lower bounds are safe by direction; comments are stripped, because
+    the FIXED form of a past bomb usually quotes the literal it replaced).
+    Bash: `py -3 core/scripts/time-bomb-test-check.py`
+
+MEASURED at ship time (2026-08-26, cc-05): `WARN: 1 possible time-bomb test(s) of 1171
+scanned: core/scripts/tests/test_dt.py:68` — and that one is BENIGN (parser inputs). The
+two rules above are what took the naive ±2 proximity result from 3 hits to 1: stripping
+comments drops `test_runtime_aspirations_complete_by.py`, and the lower-bound rule drops
+`test_skill_relations_amended_at_writer.py`. So the expected steady state is ONE known
+benign hit; a SECOND hit is the signal.
+
+If this WARNs, do not assume a defect — apply the table above first. A literal that is a
+parser input, a lower bound, or quoted inside a comment is not a bomb. A literal compared
+`<`, `<=` or `==` against anything derived from `now()` is.

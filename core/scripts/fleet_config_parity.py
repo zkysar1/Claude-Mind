@@ -1051,6 +1051,12 @@ def _live_boxes(agents_root_dir=None):
     meta["read_via"] = enum_meta.get("read_via") or "none"
     meta["reason"] = enum_meta.get("reason")
     boxes = {}
+    # g-353-49: the newest carrier per host also supplies that box's MACHINE_ID,
+    # exposed via meta so the return SHAPE is unchanged for existing callers
+    # (_box_parity destructures the pair). Tracked from the SAME newest-carrier
+    # row as the timestamp, never merged across rows: a box that was re-identified
+    # must report its current id, not a union of everything it has ever claimed.
+    machine_ids = {}
     for r in rows:
         doc = r.get("doc") or {}
         host = (doc.get("host") or "").strip()
@@ -1059,6 +1065,8 @@ def _live_boxes(agents_root_dir=None):
         ts = doc.get("ts") or ""
         if ts > boxes.get(host, ""):
             boxes[host] = ts
+            machine_ids[host] = (doc.get("machine_id") or "").strip()
+    meta["machine_ids"] = machine_ids
     return boxes, meta
 
 
@@ -1138,6 +1146,99 @@ def _box_parity(manifest, *, fleet_complete, agents_root_dir=None, now=None):
             "INFO manifest node %s has no body-heartbeat carrier — it IS measured by "
             "the per-node sweep, so this is not a coverage gap; it means no Mind has "
             "run there recently" % host)
+    return out
+
+
+def _machine_id_uniqueness(*, fleet_complete, agents_root_dir=None, now=None):
+    """Cross-box MACHINE_ID uniqueness (g-353-49).
+
+    THE DEFECT. `.env.local` is gitignored, so a container cloned from a running
+    sibling inherits its MACHINE_ID and NO promote, pull or preflight can ever
+    reconcile it — this class of drift survives every reconciliation the fleet
+    has. The value is load-bearing: `reducer_self_fence.decide` calls the
+    `different-holder` trigger by comparing MACHINE_ID against the runner lease
+    holder, so several boxes answering to one id can corrupt reducer election.
+    Measured 2026-08-23: cc-13 and cc-14 both carried MACHINE_ID=cc-10.
+
+    WHY THE PER-NODE CHECK ALREADY IN (a) DOES NOT COVER THIS, though it looks
+    like it should. That check asserts `MACHINE_ID == node.host` and would flag
+    a duplicate INDIRECTLY — but only for hosts the manifest LISTS, and only
+    where `machine_id_check != "skip"`. Neither cc-13 nor cc-14 was in the
+    manifest, so both were structurally invisible to it; the duplicate was found
+    by a human. Deriving this check from the manifest would reproduce that blind
+    spot exactly (guard-2325: a derived enumeration does not save a structural
+    check whose key is non-unique).
+
+    WHY THE CARRIER. It is the only box-keyed, self-populating, FLEET-READABLE
+    enumeration. `.env.local` is machine_local — a peer's copy is simply absent
+    here, so a condition reading it does not error, it silently evaluates False
+    (guard-2418), which is the failure mode this check exists to end rather than
+    to reproduce. `_live_boxes` is the established scoped call (guard-2676); this
+    reuses it rather than opening a second carrier reader.
+
+    FAIL-OPEN ON EMPTY, deliberately. `_runtime.sh rt_spawn` unsets MACHINE_ID in
+    the spawn subshell, so some carriers legitimately publish "". Only a NON-EMPTY
+    id shared by two DISTINCT hosts is a collision. That is not a coverage hole
+    for the defect at hand: a cloned `.env.local` sets the value BY DEFINITION on
+    every path that loads it, so the duplicate case is precisely the case where
+    the field is populated.
+
+    Live/stale split follows `_box_parity`: a collision among boxes heartbeating
+    inside `_BOX_LIVE_WINDOW_HOURS` is DRIFT (exit 1); one involving only older
+    carriers is INFO, so a retired box does not raise the alarm forever.
+    """
+    out = {"checked": False, "reason": None, "drift": [], "info": [],
+           "machine_ids": {}, "read_via": "none"}
+    if not fleet_complete:
+        out["reason"] = "node-filtered run — uniqueness needs the whole fleet"
+        return out
+    boxes, meta = _live_boxes(agents_root_dir)
+    out["read_via"] = meta.get("read_via") or "none"
+    if not meta.get("complete"):
+        # Same contract as _box_parity: an enumeration that could not bound the
+        # fleet is NOT an enumeration that found no duplicates (guard-1760).
+        out["reason"] = (meta.get("reason")
+                         or "carrier enumeration could not bound the fleet")
+        return out
+    mids = meta.get("machine_ids") or {}
+    out["checked"] = True
+    out["machine_ids"] = dict(sorted(mids.items()))
+    now = now or datetime.now()
+    by_id = {}
+    for host, mid in mids.items():
+        if not mid:
+            continue
+        by_id.setdefault(mid, []).append(host)
+    for mid, hosts in sorted(by_id.items()):
+        if len(hosts) < 2:
+            continue
+        hosts = sorted(hosts)
+        # Age each host ONCE, and test `is not None` explicitly. `_age_hours`
+        # returns a float, and a carrier written this second returns 0.0 — which
+        # is FALSY, so the tempting `(_age_hours(...) or BIG) <= WINDOW` idiom
+        # classifies the freshest possible carrier as stale and downgrades the
+        # most urgent collision (two boxes ticking right now) from DRIFT to INFO.
+        # Caught by review of this function's own diff; None means unparseable
+        # and is the only value that may be treated as not-live.
+        ages = {h: _age_hours(boxes.get(h, ""), now) for h in hosts}
+        live = [h for h in hosts
+                if ages[h] is not None and ages[h] <= _BOX_LIVE_WINDOW_HOURS]
+        detail = ", ".join(
+            "%s (%s)" % (h, "%.1fh" % ages[h] if ages[h] is not None
+                         else "unparseable ts")
+            for h in hosts)
+        if len(live) >= 2:
+            out["drift"].append(
+                "DUPLICATE-MACHINE-ID: %d live boxes all answer to MACHINE_ID=%s "
+                "-- %s. .env.local is gitignored so no promote/pull can reconcile "
+                "this; reducer election compares MACHINE_ID, so these boxes are "
+                "indistinguishable to the runner lease. Set each box's MACHINE_ID "
+                "to its own hostname and restart its daemon." % (len(live), mid, detail))
+        else:
+            out["info"].append(
+                "INFO MACHINE_ID=%s is claimed by %d boxes but at most one is live "
+                "-- %s. Likely a retired box's stale carrier, not an active "
+                "collision." % (mid, len(hosts), detail))
     return out
 
 
@@ -1250,6 +1351,13 @@ def run(nodes_filter=None, want_json=False, file_investigate=False, strict=False
     # neither subsumes the other.
     box_parity = _box_parity(manifest, fleet_complete=not nodes_filter)
     box_drift = box_parity["drift"]
+    # g-353-49: box parity asks "is every live box MEASURED?"; this asks "does
+    # every live box have its OWN identity?". Both read the same carrier set and
+    # neither subsumes the other — a duplicate MACHINE_ID is invisible to box
+    # parity (both hosts appear, both may be in the manifest) and an unmeasured
+    # box is invisible here (its id may well be unique).
+    mid_uniq = _machine_id_uniqueness(fleet_complete=not nodes_filter)
+    mid_drift = mid_uniq["drift"]
 
     payload = {
         "checked_at": datetime.now().isoformat(timespec="seconds"),
@@ -1262,6 +1370,7 @@ def run(nodes_filter=None, want_json=False, file_investigate=False, strict=False
         "blackout": blackout,
         "roster_parity": roster_parity,
         "box_parity": box_parity,
+        "machine_id_uniqueness": mid_uniq,
         "results": results,
     }
 
@@ -1305,6 +1414,21 @@ def run(nodes_filter=None, want_json=False, file_investigate=False, strict=False
             if not bp["drift"]:
                 print("  [  BOX] every live box has a manifest node (%d boxes, read %s)"
                       % (len(bp["boxes"]), bp["read_via"]))
+        # g-353-49: identity uniqueness sits beside box parity for the same
+        # reason — it is a whole-fleet property, not a per-manifest-node one.
+        mu = mid_uniq
+        if not mu["checked"]:
+            print("  [MACHID] not checked — %s" % mu["reason"])
+        else:
+            for d in mu["drift"]:
+                print("  [DRIFT] %s" % d)
+            for i in mu["info"]:
+                print("  [ INFO] %s" % i)
+            if not mu["drift"]:
+                named = sum(1 for v in mu["machine_ids"].values() if v)
+                print("  [MACHID] %d live box(es) report a MACHINE_ID, all distinct "
+                      "(%d carrier(s) published none — not checked, read %s)"
+                      % (named, len(mu["machine_ids"]) - named, mu["read_via"]))
         # "%d PASS" counts MANIFEST nodes. Saying so is the whole point of this
         # goal: the unqualified form is what let a reader conclude THE FLEET was
         # clean when an unlisted node had never been measured.
@@ -1317,14 +1441,18 @@ def run(nodes_filter=None, want_json=False, file_investigate=False, strict=False
                  # fleet was clean — the defect surviving in the summary line after
                  # being fixed everywhere above it.
                  "" if (rp["checked"] and not rp["drift"]
-                        and bp["checked"] and not bp["drift"])
-                 else "; see [ROSTER]/[BOX]/[DRIFT] above — this is NOT a whole-fleet verdict"))
+                        and bp["checked"] and not bp["drift"]
+                        and mu["checked"] and not mu["drift"])
+                 else "; see [ROSTER]/[BOX]/[MACHID]/[DRIFT] above — this is NOT a whole-fleet verdict"))
         if roster_drift:
             print("  -> ROSTER DRIFT: %d live agent(s) have no manifest node and were "
                   "never measured (exit 1)" % len(roster_drift))
         if box_drift:
             print("  -> BOX DRIFT: %d live box(es) have no manifest node and were "
                   "never measured (exit 1)" % len(box_drift))
+        if mid_drift:
+            print("  -> MACHINE-ID DRIFT: %d duplicate identity/identities across live "
+                  "boxes — reducer election cannot tell them apart (exit 1)" % len(mid_drift))
         if blackout:
             print("  -> BLACKOUT: every non-self node is UNREACHABLE — the sweep "
                   "measured nothing this run (exit 1)")
@@ -1352,6 +1480,12 @@ def run(nodes_filter=None, want_json=False, file_investigate=False, strict=False
         # Same contract on the box axis (g-115-5172). Printing BOX DRIFT while
         # exiting 0 would leave every exit-code-only caller — which is what the
         # sweep wiring reads — seeing a clean fleet with three boxes unmeasured.
+        return 1
+    if mid_drift:
+        # Same contract again (g-353-49). This one is the reason the goal asked
+        # for an ASSERTION rather than a report: duplicate identities corrupt
+        # reducer election silently, and every automated caller here reads the
+        # exit code only.
         return 1
     if blackout:
         return 1

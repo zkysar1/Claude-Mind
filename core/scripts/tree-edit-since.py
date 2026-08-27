@@ -41,16 +41,38 @@ encoding-drift counter (the g-115-3115 defect); a false negative merely
 increments it, which routes to the lightweight log-and-clear path in
 aspirations-precheck Phase 0-pre. Prefer the cheap, self-limiting error.
 
+LIST MODE (g-115-4714). `--list` answers the question /encode-session Lane 5
+actually has — WHICH nodes did I encode — instead of the boolean the
+state-update caller needs. It reuses attributable_to_session() rather than
+reimplementing attribution, so the two modes cannot drift apart, and its exit
+code is defined so that `non-empty list iff detector exits 0` holds by
+construction rather than by convention.
+
+The default (no-flag) invocation is BYTE-IDENTICAL to the pre-g-115-4714
+behavior — same short-circuit on the first hit, same stdout line, same exit
+codes (guard-1479: a script that gains an entry mode must leave the existing
+one traced and unchanged; rb-538: the flag is parsed off an explicit
+whitelist, so an unknown flag is REFUSED rather than silently dropped into
+the timestamp slot).
+
+SCOPE IS TREE-ONLY AND SAYS SO. Conventions are deliberately not covered:
+only 6 of 66 carry any front matter, so there is no attribution to filter on
+(measured g-115-3392). A caller must present the result as tree-only; the
+`--list` header line states it so the scope cannot be lost in the handoff.
+
 Usage:
     py -3 tree-edit-since.py <ISO-8601-timestamp>
+    py -3 tree-edit-since.py <ISO-8601-timestamp> --list
 
 Exit codes:
     0 — at least one .md under WORLD_DIR/knowledge/tree was modified after
         the given timestamp AND is attributable to this session
-        (auto-detect should set TREE_UPDATED=true).
+        (auto-detect should set TREE_UPDATED=true). In --list mode the
+        attributable nodes are printed to stdout, one relative path per line.
     1 — no such file (or could not parse timestamp / could not access tree
         dir). Caller treats this as "no tree edit detected" and falls through
-        to the LLM-passed flag (default false).
+        to the LLM-passed flag (default false). In --list mode stdout is
+        empty.
 
 Fail-open: any error returns exit 1 with stderr message — never blocks
 state-update.
@@ -124,11 +146,28 @@ def attributable_to_session(path, sid):
 
 
 def main():
-    if len(sys.argv) != 2:
-        print("usage: tree-edit-since.py <ISO-8601-timestamp>", file=sys.stderr)
+    # Explicit flag whitelist (rb-538): an unknown flag must be REFUSED, not
+    # silently dropped — a multi-layer parser that ignores what it does not
+    # recognise would accept `--lst` and answer the boolean question while the
+    # caller believed it asked for a list.
+    args = sys.argv[1:]
+    list_mode = False
+    positional = []
+    for a in args:
+        if a == "--list":
+            list_mode = True
+        elif a.startswith("-"):
+            print(f"tree-edit-since: unknown flag {a!r}", file=sys.stderr)
+            sys.exit(1)
+        else:
+            positional.append(a)
+
+    if len(positional) != 1:
+        print("usage: tree-edit-since.py <ISO-8601-timestamp> [--list]",
+              file=sys.stderr)
         sys.exit(1)
 
-    iso = sys.argv[1].strip()
+    iso = positional[0].strip()
     try:
         # Accepts both "2026-05-04T15:35:00" and "2026-05-04T15:35:00.123"
         cutoff = datetime.fromisoformat(iso).timestamp()
@@ -149,9 +188,12 @@ def main():
     # "no encoding" for every iteration in an environment without the binding.
     sid = os.environ.get("MIND_SID", "").strip()
 
-    # Scan .md files. Short-circuit on the first ATTRIBUTED match — no need to
-    # enumerate all 1200+ files when one hit is sufficient signal.
+    # Scan .md files. In the default (boolean) mode, short-circuit on the first
+    # ATTRIBUTED match — no need to enumerate all 1200+ files when one hit is
+    # sufficient signal. In --list mode, enumerate them all: the caller needs
+    # the set, not the existence.
     skipped = 0
+    found = []
     for md in tree_dir.rglob("*.md"):
         try:
             if md.stat().st_mtime <= cutoff:
@@ -167,15 +209,35 @@ def main():
             skipped += 1
             continue
         rel = md.relative_to(tree_dir)
+        if list_mode:
+            found.append(rel)
+            continue
         print(f"tree-edit-since: detected {rel} modified after {iso}")
         sys.exit(0)
 
+    # ONE copy of the skipped note, shared by both modes. It was briefly
+    # duplicated per-branch; two copies of a message string is the drift
+    # hazard, not a convenience.
     if skipped:
         print(
             f"tree-edit-since: {skipped} node(s) modified after {iso} but "
             "attributed to another session — not this agent's encoding",
             file=sys.stderr,
         )
+
+    if list_mode:
+        # Scope is stated on the header, not left to the caller to remember
+        # (: conventions carry no attribution and are NOT covered).
+        if found:
+            print(f"tree-edit-since: {len(found)} tree node(s) encoded by this "
+                  f"session after {iso} (TREE-ONLY — conventions carry no "
+                  f"attribution and are not covered)", file=sys.stderr)
+            for rel in sorted(found, key=str):
+                print(rel)
+        # Exit code is the SAME predicate as the boolean mode, so
+        # "non-empty list iff detector exits 0" holds by construction.
+        sys.exit(0 if found else 1)
+
     sys.exit(1)
 
 

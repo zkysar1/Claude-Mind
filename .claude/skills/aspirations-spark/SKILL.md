@@ -162,9 +162,9 @@ ELSE:
             and the SOURCE goal's aspiration as the default target — NOT the
             goal the reducer is closing. Dedup FIRST and not only on the
             worker's phrasing (guard-1204, guard-2228: `--title-contains` on
-            one stem is structurally incapable of finding a differently-worded
-            owner — try two distinct token sets, and check the source goal's
-            own outcome_note for an id it already filed, guard-3738). If a live
+            one stem cannot find a differently-worded owner — try two distinct
+            token sets, and check the source goal's outcome_note for an id it
+            filed OR a fix it SHIPPED (g-306-360), guard-3738). If a live
             goal already owns it, cite that id and file nothing. Otherwise file
             with the sq-013 origin_signal mapping and put
             "relayed by <agent> worker Body (spark_capture from <entry.goal_id>),
@@ -209,8 +209,13 @@ doubt between framework and domain, pick domain.
     IF goal outcome revealed a reusable reasoning pattern (heuristic, procedure,
        diagnostic, or causal insight) that would help with FUTURE similar goals:
 
-        # Duplicate/contradiction check before creating reasoning bank entry
+        # Dedup. THE CATEGORY READ IS NOT THE CHECK (guard-2255): it is exact-match
+        # on a key with 499 distinct values, so a zero usually means the CATEGORY is
+        # empty, not that the lesson is novel. A zero-BYTE reply is a malfunction,
+        # not a result (guard-3707); the add-time near-dup advisory does NOT block
+        # (guard-4090) -- read its text, never its rc. Applies to all 5 sites below.
         existing_rb = Bash: reasoning-bank-read.sh --category {goal.category}
+                THEN Bash: retrieve.sh --category "<the lesson, one line>" --depth shallow   # THIS is the check (guard-2255)
         IF proposed entry semantically overlaps with an existing entry:
             Strengthen existing: Bash: reasoning-bank-increment.sh {entry.id} utilization.times_helpful
             Log: "Phase 6.5: Strengthened existing {entry.id} instead of creating duplicate"
@@ -253,6 +258,7 @@ doubt between framework and domain, pick domain.
 
         # Duplicate/contradiction check before creating guardrail
         existing_guards = Bash: guardrails-read.sh --category {goal.category}
+                THEN Bash: retrieve.sh --category "<the lesson, one line>" --depth shallow   # THIS is the check (guard-2255)
         IF proposed guardrail semantically overlaps with an existing guardrail:
             Strengthen existing: Bash: guardrails-increment.sh {guard.id} utilization.times_active
             Log: "Phase 6.5: Strengthened existing {guard.id} instead of creating duplicate"
@@ -287,6 +293,7 @@ doubt between framework and domain, pick domain.
         # Determine store: prescriptive ("always/never/must") → guardrail; diagnostic → reasoning bank
         IF lesson matches prescriptive pattern (always|never|must|do not):
             existing_guards = Bash: guardrails-read.sh --category {goal.category}
+                    THEN Bash: retrieve.sh --category "<the gotcha, one line>" --depth shallow   # THIS is the check (guard-2255)
             IF semantic overlap with existing:
                 Bash: guardrails-increment.sh {guard.id} utilization.times_active
                 Log: "OPS GOTCHA: Strengthened existing {guard.id}"
@@ -301,6 +308,7 @@ doubt between framework and domain, pick domain.
                 Log: "OPS GOTCHA (guardrail): {rule} from {goal.id}"
         ELSE:
             existing_rb = Bash: reasoning-bank-read.sh --category {goal.category}
+                    THEN Bash: retrieve.sh --category "<the gotcha, one line>" --depth shallow   # THIS is the check (guard-2255)
             IF no semantic overlap with existing:
                 Create reasoning bank entry via reasoning-bank-add.sh:
                   # `id` and `created` auto-set — omit both; capture from stdout.
@@ -373,32 +381,32 @@ doubt between framework and domain, pick domain.
         # the usual cause is a stray line of stdout captured into it.
         Bash: meta-set.sh skill-gaps.yaml "gaps[<i>].<field>" <value>   # existing gap
         Bash: meta-set.sh skill-gaps.yaml "gaps[<len>]" '<full gap JSON object>'  # new gap
-        # WRITE-INTEGRITY READ-BACK (g-115-3177) — check rc AND re-read. This step
-        # used to be one unchecked line, so a failed write was SILENT: the agent
-        # journalled "gap registered" and moved on while nothing landed. That is
-        # not hypothetical — on 2026-07-26 this exact write returned write_conflict
-        # 5/5 for zeta (g-335-275) because the daemon's meta-YAML path fenced
-        # against a stale local mirror with no refresh and no retry. Scope is
-        # per-object AND per-box (rb-2639/rb-3280), NOT fleet-wide — a peer's
-        # cross-box write stales only the OBSERVER's mirror — but where it lands
-        # it is PERMANENT: the 412 repeats forever against a remote that never
-        # changes, so no gap can be registered or incremented on that box,
-        # times_encountered never reaches forge_threshold, and no skill is forged
-        # from a detected capability gap. The daemon path is fixed (locked_rmw + force_fresh), but
-        # the protocol must not depend on that: assert the write, never assume it.
-        # Same rule as the forge-goal read-back below (own-cloud can echo success
-        # on a write that did not land).
+        # WRITE-INTEGRITY READ-BACK (g-115-3177) — assert the write, never assume
+        # it. Was unchecked, so a failed write was SILENT: "gap registered"
+        # journalled while nothing landed. Real: 2026-07-26 it hit write_conflict
+        # 5/5 for zeta (g-335-275) — per-object and per-box (rb-2639/rb-3280),
+        # PERMANENT where it lands, so that box forges nothing. Daemon since
+        # fixed (locked_rmw + force_fresh); do not rely on it.
         IF meta-set.sh exit code != 0:
             Log the FULL stderr — do NOT narrate "gap registered".
             Re-read skill-gaps.yaml; if the gap is genuinely absent, file
             "Investigate: skill-gaps.yaml write failed — <error code>" (HIGH,
             participants [agent]) so this box's forge lane cannot go dark
-            unnoticed again, then continue (never block the close on it).
-        ELSE:
-            Bash: meta-read.sh skill-gaps.yaml → confirm the gap id is present
-            with a non-null `type`. If it is NOT, treat exactly as the rc!=0
-            branch: an rc=0 that did not land is the worse failure, not the
-            better one.
+            unnoticed, then continue (never block the close on it).
+        ELSE (rc == 0):
+            # GATE THE VERDICT ON rc, NOT THE READ-BACK (g-115-3522) — different
+            # questions; conflating them files false HIGH goals and duplicates
+            # append-only rows.
+            Bash: meta-read.sh skill-gaps.yaml → gap id present, `type` non-null?
+            PRESENT → done. ABSENT → UNKNOWN, never "failed", never the rc!=0
+            branch: an rc=0 write is often durable while a read-back misses it
+            (~0s/~1min/~8min windows measured, so no fixed wait is safe). Do
+            NOT re-run the write — on an append-only store the retry succeeds
+            and duplicates silently (guard-1578). Two reads that both miss it
+            are ONE signal (shared elapsed time). Settle by comparing the
+            store's byte growth to the write response's reported `bytes` (exact
+            match = landed, no wait); else re-check once past OWNCLOUD_CACHE_TTL,
+            then record UNCONFIRMED and continue. Cf. guard-4631.
 
         # Check forge criteria immediately
         # GUARD: skip gaps whose status SUPPRESSES forging (Phase 9.2 checks the same set).
@@ -902,13 +910,16 @@ When sq-009 (or sq-c09 experiential variant) fires, it creates a hypothesis goal
      and clause (e) still applies to any claim that an intervention changed
      something.
 1. Create pipeline record: `echo '<record-json>' | bash core/scripts/pipeline-add.sh` (stage defaults to discovered)
+   PUT THE ACTIVE-STAGE CONTRACT IN THIS PAYLOAD if you will move to active (2.4):
+   `claim` (>=20 chars), `resolution_criteria`|`resolution_method`|`rationale` (>=10),
+   and for horizon=short `measurement_channel` (>=5, naming what settles it).
+   pipeline-add accepts a record with NONE of them; the formation-quality validator
+   runs only at the move and raises ONE per attempt -- three round-trips otherwise.
+   (guard-2784, guard-1395, guard-1984.)
 2. Add goal to aspiration: `echo '<goal-json>' | bash core/scripts/aspirations-add-goal.sh --source {source} <asp-id>`
    — the canonical GATED single-goal writer. Do NOT use the read-modify-write
-   `aspirations-update.sh` whole-aspiration form here: it bypasses the
-   origin-signal and goal-duplication gates, exactly as the forge block above
-   documents for its own migration off it (g-115-2284). Two write paths in one
-   skill, one gated and one not, means the gates fire or not depending on which
-   branch the author happened to copy. (g-115-3177 spark, 2026-07-26.)
+   `aspirations-update.sh` whole-aspiration form: it bypasses the origin-signal
+   and goal-duplication gates (g-115-2284, g-115-3177).
    Goal fields:
    - `participants: [agent]`
    - `skill: "/review-hypotheses --hypothesis {hypothesis_id}"`
@@ -916,9 +927,8 @@ When sq-009 (or sq-c09 experiential variant) fires, it creates a hypothesis goal
    - `horizon` — select using decision tree below
    - `resolves_no_earlier_than`, `resolves_by` from default windows for chosen horizon
    - `priority: MEDIUM` (default, agent can adjust)
-   - `origin_signal: "idea:sq-009-<slug>"` — the origin-signal gate's allowlist
-     has NO `hypothesis:` prefix, so the natural choice is REFUSED at write
-     time. Spark-generated goals use `idea:`. (Observed g-115-3297.)
+   - `origin_signal: "idea:sq-009-<slug>"` — the gate's allowlist has no
+     `hypothesis:` prefix; spark goals use `idea:`. (g-115-3297.)
 
    **Horizon selection** (pick the FIRST that matches):
    - **long** — prediction about a trend, scaling limit, or outcome that needs weeks+ to observe
@@ -930,13 +940,11 @@ When sq-009 (or sq-c09 experiential variant) fires, it creates a hypothesis goal
    - **session** — prediction verifiable NOW by reading current state
      *Example: "The service uses two-phase scheduling"*
 
-   **Bias toward short/long**: If the prediction is about current state, it's probably already
-   captured by a goal outcome — don't duplicate it as a session hypothesis. Prefer forming
-   predictions about what WILL change or what WOULD happen IF something changes.
+   **Bias toward short/long**: current-state predictions are already captured by the goal
+   outcome — prefer what WILL change, or what WOULD happen IF something changes.
 
 2.4. Move to active: `bash core/scripts/pipeline-move.sh <hypothesis_id> active`
-     (Without this, the record stays in `discovered` forever — /review-hypotheses reads active-only.
-     Mirrors /decompose Step 3.)
+     (Without this it stays `discovered` forever — /review-hypotheses reads active-only.)
 
 2.5. Archive hypothesis formation context:
         experience_id = "exp-{hypothesis_id}"
@@ -1622,6 +1630,7 @@ When sq-016 fires after goal completion:
 4. IF any assumption is INHERITED or UNTESTED:
    a. Check existing reasoning bank for entries about this assumption:
       Bash: reasoning-bank-read.sh --category {goal.category}
+      THEN Bash: retrieve.sh --category "<the assumption, one line>" --depth shallow   # THIS is the check (guard-2255)
    b. IF no existing entry covers this assumption:
       Create reasoning bank entry via reasoning-bank-add.sh:
         # `id` and `created` auto-set — omit both; capture from stdout.

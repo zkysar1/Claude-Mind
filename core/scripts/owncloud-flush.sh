@@ -156,6 +156,27 @@ if pruned:
     print(f"[owncloud-flush] WARN: {pruned} agent dir(s) pruned — NOT pushed, "
           f"and writes under them are local-only from this box: {which}. "
           f"{why} (guard-1579).", file=sys.stderr)
+if errs:
+    # WHICH files failed and why, mirroring the pruned block above ().
+    # The endpoint reported `errors=N` and named nothing, four lines below a
+    # `pruned_agent_names` list that exists for exactly this reason. The
+    # identities were recorded by _record_error the whole time and dropped by
+    # the payload whitelist. Degrade to the count rather than printing an empty
+    # list against a daemon predating the field -- an empty list would read as
+    # "no files named", the same false-clean this fixes.
+    eps = r.get("error_paths") or []
+    if eps:
+        for e in eps:
+            print(f"[owncloud-flush] error [{e.get('phase')}] {e.get('path')}: "
+                  f"{e.get('exc')}: {e.get('msg')}", file=sys.stderr)
+        more = r.get("error_paths_truncated", 0)
+        if more:
+            print(f"[owncloud-flush] ... and {more} more error(s) not named",
+                  file=sys.stderr)
+    else:
+        print(f"[owncloud-flush] WARN: {errs} error(s) with no identities returned "
+              f"-- daemon predates the error_paths field (restart it to see WHICH "
+              f"files are unpushable).", file=sys.stderr)
 # Exit semantics deliberately UNCHANGED: pruning is normal and expected on any
 # box that does not own a dir, so it must not fail /stop's D6.7 flush.
 sys.exit(2 if errs else 0)

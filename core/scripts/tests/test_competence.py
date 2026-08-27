@@ -34,7 +34,8 @@ def _write_jsonl(path, records):
             f.write(json.dumps(r) + "\n")
 
 
-def _seed_world(world: Path, tree_nodes=2, resolved=1, active=2, rb=4, guards=2, completed=3):
+def _seed_world(world: Path, tree_nodes=2, resolved=1, active=2, rb=4, guards=2, completed=3,
+                completed_by=None, archived=0, archived_by=None):
     tree = {"nodes": {f"n{i}": {"file": f"n{i}.md"} for i in range(tree_nodes)}}
     tree_path = world / "knowledge" / "tree" / "_tree.yaml"
     tree_path.parent.mkdir(parents=True, exist_ok=True)
@@ -43,32 +44,119 @@ def _seed_world(world: Path, tree_nodes=2, resolved=1, active=2, rb=4, guards=2,
                  [{"stage": "resolved"}] * resolved + [{"stage": "active"}] * active)
     _write_jsonl(world / "reasoning-bank.jsonl", [{"status": "active"}] * rb)
     _write_jsonl(world / "guardrails.jsonl", [{"status": "active"}] * guards)
+    def _goal(by):
+        g = {"status": "completed"}
+        if by is not None:
+            g["completed_by"] = by
+        return g
     _write_jsonl(world / "aspirations.jsonl",
-                 [{"goals": [{"status": "completed"}] * completed}])
+                 [{"goals": [_goal(completed_by) for _ in range(completed)]}])
+    if archived:
+        _write_jsonl(world / "aspirations-archive.jsonl",
+                     [{"goals": [_goal(archived_by) for _ in range(archived)]}])
 
 
 # --- assess() formula -------------------------------------------------------
+
+def test_assess_identity_is_the_caller_s_name_not_the_dir_basename(tmp_path):
+    """assess() must key completed_by on the agent name the CALLER resolved.
+
+    Both production callers hold an authoritative identity (AGENT_NAME from
+    MIND_AGENT on the CLI; ctx.paths.agent_name on the daemon) and pass it
+    explicitly. Deriving it from agent_dir.name instead is a silent-zero bug:
+    a caller whose agent_dir basename is not the agent name scores 0 attributed
+    completions, which is indistinguishable from an agent that has completed
+    nothing. Caught live by mind_api's byte-compat harness, whose two agent dirs
+    are named cli-agent/dae-agent while both sides resolve "alpha".
+
+    Both legs are asserted deliberately (guard-1220 two-way proof): the
+    explicit-name leg alone would stay green against a function that ignored the
+    parameter entirely, so the basename-fallback leg is what gives this test its
+    discriminating power.
+    """
+    world = tmp_path / "world"
+    agent = tmp_path / "not-the-agent-name"   # basename deliberately != identity
+    agent.mkdir()
+    _seed_world(world, completed=7, completed_by="alpha")
+
+    # Leg 1 — explicit name wins over the basename.
+    got = _competence.assess(world, agent, "alpha")
+    assert got["evidence"]["completed_goals_agent_attributed"] == 7
+    assert got["average_competence"] == round(7 / _competence.N_COMPLETION_AGENT, 4)
+
+    # Leg 2 — omitting it falls back to the basename, which matches nothing here.
+    fell_back = _competence.assess(world, agent)
+    assert fell_back["evidence"]["completed_goals_agent_attributed"] == 0
+    assert fell_back["average_competence"] == 0.0
+
 
 def test_assess_formula_components(tmp_path):
     world = tmp_path / "world"
     agent = tmp_path / "agent"
     agent.mkdir()
-    _seed_world(world, tree_nodes=2, resolved=1, active=2, rb=4, guards=2, completed=3)
+    _seed_world(world, tree_nodes=2, resolved=1, active=2, rb=4, guards=2, completed=3,
+                completed_by="agent")
     result = _competence.assess(world, agent)
     c = result["components"]
+    # The three world-scoped components are still COMPUTED and REPORTED ...
     assert c["knowledge_density"] == round(2 / 50, 4)
     assert c["pipeline_activity"] == round((1 + 0.5 * 2) / 5, 4)
     assert c["encoded_lessons"] == round((4 + 0.5 * 2) / 20, 4)
-    assert c["completion_breadth"] == round(3 / 25, 4)
-    expected = round((2 / 50 + 2 / 5 + 5 / 20 + 3 / 25) / 4, 4)
-    assert result["average_competence"] == expected
+    # ... but only completion_breadth is agent-attributable, so it ALONE is the
+    # gate metric (). Its basis is N_COMPLETION_AGENT, not N_COMPLETION.
+    assert c["completion_breadth"] == round(3 / _competence.N_COMPLETION_AGENT, 4)
+    assert result["average_competence"] == c["completion_breadth"]
+    assert result["gate_component"] == "completion_breadth"
+    assert result["component_scope"]["completion_breadth"] == "agent"
+    assert result["component_scope"]["knowledge_density"] == "world"
+
+
+def test_assess_completion_is_agent_attributed(tmp_path):
+    """A peer's completions must NOT raise this agent's score.
+
+    This is the defect g-115-5153 was filed against: every component was
+    world-scoped, so all five agents read an identical value and the metric
+    could not discriminate. Asserting the happy path alone would stay green
+    against the original bug -- the peer-attributed leg is what gives this
+    suite discriminating power (guard-1220 two-way proof).
+    """
+    world = tmp_path / "world"
+    agent = tmp_path / "agent"
+    agent.mkdir()
+    _seed_world(world, completed=40, completed_by="somebody-else")
+    assert _competence.assess(world, agent)["average_competence"] == 0.0
+
+    world2 = tmp_path / "world2"
+    agent2 = tmp_path / "agent"          # same basename -> same agent identity
+    _seed_world(world2, completed=40, completed_by="agent")
+    mine = _competence.assess(world2, agent2)["average_competence"]
+    assert mine == round(40 / _competence.N_COMPLETION_AGENT, 4)
+    assert mine > 0.0
+
+
+def test_assess_counts_the_archive(tmp_path):
+    """Archived completions count (guard-2347 / guard-1881).
+
+    aspirations-archive.jsonl holds the large majority of completed goals
+    (measured 2,372 archived against 555 live). Reading only the live store
+    would make the score SAWTOOTH DOWNWARD every time archival ran -- the
+    agent would lose competence by doing housekeeping.
+    """
+    world = tmp_path / "world"
+    agent = tmp_path / "agent"
+    agent.mkdir()
+    _seed_world(world, completed=10, completed_by="agent", archived=30, archived_by="agent")
+    result = _competence.assess(world, agent)
+    assert result["evidence"]["completed_goals_agent_attributed"] == 40
+    assert result["components"]["completion_breadth"] == round(40 / _competence.N_COMPLETION_AGENT, 4)
 
 
 def test_assess_caps_each_component_at_one(tmp_path):
     world = tmp_path / "world"
     agent = tmp_path / "agent"
     agent.mkdir()
-    _seed_world(world, tree_nodes=500, resolved=50, active=50, rb=100, guards=50, completed=100)
+    _seed_world(world, tree_nodes=500, resolved=50, active=50, rb=100, guards=50,
+                completed=_competence.N_COMPLETION_AGENT, completed_by="agent")
     result = _competence.assess(world, agent)
     assert result["average_competence"] == 1.0
     assert all(v == 1.0 for v in result["components"].values())

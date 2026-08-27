@@ -98,7 +98,50 @@ BLOCKER_REF_CORE_KEYS = (
 BLOCKER_REF_OPTIONAL_KEYS = (
     "unblock_goal",   # read by blocked-signal-resolution-check._resolve_blocker_ref
     "why",            # free-text rationale; surfaced in blocker_ref_why output
+    "owner",          # deploy-hold reservations: the agent accountable for
+                      # renewing or clearing this hold. Read by
+                      # world/scripts/deploy-hold-check.sh, which surfaces it on
+                      # the HELD verdict so a blocked pusher knows who to ask.
+                      # REQUIRED on deploy-hold:* refs (see DEPLOY_HOLD_* below),
+                      # optional everywhere else so no existing writer is
+                      # disturbed. Note the module rule above — a promoted key
+                      # earns its place by having a live reader, not by being
+                      # useful in principle.
 )
+
+
+# ---------------------------------------------------------------------------
+# Deploy-hold RESERVATIONS ().
+#
+# A deploy hold used to be an open-ended CLAIM: declared once, owned by nobody
+# on a cadence, honored only by whoever happened to probe. This turns it into a
+# LEASE — bounded, owned, and renewable — by refusing an unbounded declaration
+# at the write path instead of hoping a later audit catches it.
+#
+# THE 48h WINDOW IS A FORCING FUNCTION, NOT AN ESTIMATE. A hold that genuinely
+# needs longer is not forbidden; it is required to come back and say so, which
+# is the whole difference between a lease and a claim. The audited override
+# (allow_long_hold, below) is the sanctioned door for that case.
+#
+# GRANDFATHERING IS LOAD-BEARING — DO NOT REMOVE IT (guard-2400). validate() is
+# pure: it sees a payload, never the stored record, so it cannot tell a FRESH
+# declaration from a re-write of one that already exists. Without a cutoff,
+# shipping this gate would make every pre-existing deploy-hold ref permanently
+# unwritable BY EVERY WRITER — including the writes that would clear the hold —
+# and the breakage would surface only when someone tried to write, as a
+# rejection naming a field they did not send.
+# MEASURED before shipping, 2026-08-26 (the count guard-2400 requires): the live
+# world queue carried exactly TWO deploy-hold refs, and BOTH would have been
+# refused —  (span 120h, no owner) and  (span 296h, no owner,
+# and status=blocked, so the wedge would have blocked its own unblocking).
+# Both predate the cutoff and are therefore exempt; every ref declared from the
+# cutoff onward is governed.
+# The cutoff is honest rather than airtight: a writer that back-dates created_at
+# dodges the check. That is accepted deliberately — this is an internal fleet
+# contract, and a forgeable field is a far smaller cost than a wedged store.
+DEPLOY_HOLD_PREFIX = "deploy-hold:"
+DEPLOY_HOLD_MAX_HOURS = 48
+DEPLOY_HOLD_CONTRACT_EFFECTIVE_FROM = "2026-08-26T00:00:00"
 
 # Keys ACCEPTED on input but deliberately NOT carried into the output.
 #
@@ -149,7 +192,105 @@ BLOCKER_REF_REJECTED_KEYS = {
 }
 
 
-def validate(raw: Any, *, now: Optional[datetime] = None
+def _parse_iso(value: Any) -> Optional[datetime]:
+    """Best-effort ISO-8601 parse. Returns None when unparseable, never raises.
+
+    Tolerates a trailing 'Z' and sub-second precision because both appear in
+    stored refs. A None return is treated as a REFUSAL by the deploy-hold
+    checks below, never as a pass — an unparseable expiry is exactly the
+    open-ended claim this contract exists to refuse.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return datetime.fromisoformat(value.strip().replace("Z", "")[:19])
+    except ValueError:
+        return None
+
+
+def _check_deploy_hold_reservation(ref: dict, ext_id: str, created_at: Any,
+                                   expires_at: Any, *,
+                                   allow_long_hold: bool = False
+                                   ) -> Tuple[bool, Optional[str]]:
+    """Enforce the deploy-hold reservation contract. Pure; no I/O.
+
+    Returns (True, None) when the ref is a valid reservation OR is exempt,
+    else (False, refusal_message).
+
+    Every refusal message here is built by CONCATENATION, never .format() or
+    %-formatting (guard-3803): these messages quote payload content and file
+    paths, and a formatter cannot tell the message from the data it quotes. A
+    ValueError raised while COMPOSING a refusal would be swallowed by a
+    caller's fail-open handler and silently convert this refusal into an
+    approval — the decision correct, complete, and never shipped.
+    """
+    created_dt = _parse_iso(created_at)
+    effective_dt = _parse_iso(DEPLOY_HOLD_CONTRACT_EFFECTIVE_FROM)
+
+    # Grandfather clause — see DEPLOY_HOLD_* above and guard-2400.
+    if (created_dt is not None and effective_dt is not None
+            and created_dt < effective_dt):
+        return True, None
+
+    owner = ref.get("owner")
+    if not isinstance(owner, str) or not owner.strip():
+        return False, (
+            "blocker_ref '" + ext_id + "' is a deploy-hold reservation and "
+            "must name an `owner` — the agent accountable for renewing or "
+            "clearing it. A hold with no owner is an open-ended claim nobody "
+            "is on the hook for, which is the dead-letter class this contract "
+            "exists to remove. See world/conventions/deploy-holds.md."
+        )
+
+    # An explicit expiry is required: the per-type TTL default would silently
+    # manufacture one, which is precisely the open-ended declaration being
+    # refused. Read the RAW input, not the resolved value, so an auto-filled
+    # expiry cannot satisfy the check that exists to demand a deliberate one.
+    if not ref.get("expires_at"):
+        return False, (
+            "blocker_ref '" + ext_id + "' is a deploy-hold reservation and "
+            "must carry an explicit `expires_at`. The per-type TTL default is "
+            "not a reservation — a lease says when it ends, deliberately, and "
+            "letting the default fill it in reintroduces the open-ended hold. "
+            "See world/conventions/deploy-holds.md."
+        )
+
+    expires_dt = _parse_iso(expires_at)
+    if expires_dt is None or created_dt is None:
+        bad = "expires_at" if expires_dt is None else "created_at"
+        return False, (
+            "blocker_ref '" + ext_id + "' is a deploy-hold reservation whose "
+            "`" + bad + "` is not a parseable ISO-8601 timestamp. An expiry "
+            "that cannot be read is an expiry that cannot be enforced, so it "
+            "is refused rather than assumed valid."
+        )
+
+    span_hours = (expires_dt - created_dt).total_seconds() / 3600.0
+    if span_hours <= 0:
+        return False, (
+            "blocker_ref '" + ext_id + "' is a deploy-hold reservation whose "
+            "`expires_at` is not after its `created_at` (span "
+            + str(round(span_hours, 1)) + "h). A hold that expires before it "
+            "begins gates nothing and reads as active."
+        )
+
+    if span_hours > DEPLOY_HOLD_MAX_HOURS and not allow_long_hold:
+        return False, (
+            "blocker_ref '" + ext_id + "' is a deploy-hold reservation "
+            "spanning " + str(round(span_hours, 1)) + "h, over the "
+            + str(DEPLOY_HOLD_MAX_HOURS) + "h reservation window. A hold that "
+            "genuinely needs longer is not forbidden — it is required to come "
+            "back and renew, which is the difference between a lease and a "
+            "claim. Either shorten the window and renew before it lapses, or "
+            "re-declare with the audited long-hold override. See "
+            "world/conventions/deploy-holds.md."
+        )
+
+    return True, None
+
+
+def validate(raw: Any, *, now: Optional[datetime] = None,
+             allow_long_hold: bool = False
              ) -> Tuple[bool, Any]:
     """Parse and normalize a blocker_ref payload.
 
@@ -159,6 +300,13 @@ def validate(raw: Any, *, now: Optional[datetime] = None
             Empty/None inputs return (False, error-string).
         now: datetime override for expires_at derivation. Defaults to
             datetime.now() at call time. Injectable for deterministic tests.
+        allow_long_hold: audited override for the genuine long deploy-hold
+            case. Only affects deploy-hold:* refs, and only the window check —
+            an owner and an explicit expiry are still required, because those
+            are what make a long hold accountable rather than merely long.
+            Callers that pass True MUST record it via
+            log_unstructured_override(..., which_checks_bypassed=
+            ["deploy_hold_window"]) per the gate-overrides convention.
 
     Returns:
         (True, normalized_dict) on success — keys: type, external_id,
@@ -256,6 +404,20 @@ def validate(raw: Any, *, now: Optional[datetime] = None
     if not expires_at:
         ttl = BLOCKER_REF_TTL_HOURS[btype]
         expires_at = (now_dt + timedelta(hours=ttl)).isoformat(timespec="seconds")
+
+    # Deploy-hold reservations carry a stricter contract than the generic ref
+    # (). Keyed on the external_id PREFIX, not on `type`, because a
+    # hold is declared under whichever type fits its cause (infrastructure,
+    # resource, ...) — the prefix is what every existing reader already keys on
+    # (world/scripts/deploy-hold-check.sh hold_ref()), so keying the gate the
+    # same way keeps one vocabulary instead of introducing a second.
+    if ext_id.strip().startswith(DEPLOY_HOLD_PREFIX):
+        hold_ok, hold_err = _check_deploy_hold_reservation(
+            ref, ext_id.strip(), created_at, expires_at,
+            allow_long_hold=allow_long_hold,
+        )
+        if not hold_ok:
+            return False, hold_err
 
     out = {
         "type": btype,

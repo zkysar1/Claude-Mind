@@ -237,6 +237,53 @@ def find_blocks(path, text):
     return out
 
 
+def _expand_unquoted_heredoc(src):
+    r"""Apply bash's backslash processing to an UNQUOTED heredoc body.
+
+    An unquoted `<<PY` body is not literal text: bash rewrites it before python
+    ever sees it, so compiling the RAW bytes audits a string that never reaches
+    the interpreter. MEASURED on this box (g-115-7302), a backslash is special
+    ONLY before `\`, `$` and a backtick. Every other `\x` -- `\d`, `\n`, `\"` --
+    passes through untouched:
+
+        RAW  s = "a \\"q\\" b"    ->  PYTHON GETS  s = "a \"q\" b"
+        RAW  t = "back\\\\slash"  ->  PYTHON GETS  t = "back\\slash"
+        RAW  u = "dollar \$H"     ->  PYTHON GETS  u = "dollar $H"
+        RAW  w = "other \d \n"    ->  PYTHON GETS  w = "other \d \n"  (unchanged)
+
+    THE FILING GOAL'S SUGGESTED REMEDY WAS HALF WRONG AND MEASUREMENT FALSIFIED
+    IT (guard-1719 -- a diagnosis and its prescribed remedy carry different
+    evidentiary weight). g-115-7302 proposed a two-substitution shape including
+    `\"` -> `"`. Bash has no such rule: the flagged block's `\\"` becomes `\"`
+    purely by the `\\` -> `\` rule, with the quote untouched. Adding a `\"` ->
+    `"` rule would silently corrupt every escaped quote in an unquoted heredoc
+    -- turning a false RED into a false GREEN, which is strictly worse.
+
+    ONE LEFT-TO-RIGHT PASS, never sequential str.replace: replacing `\\`->`\`
+    and then `\$`->`$` would rewrite `\\$` (a literal backslash followed by an
+    expansion) all the way down to `$`, losing the backslash. A single scan
+    cannot double-apply.
+
+    `\<newline>` (bash line continuation) is deliberately NOT collapsed. Doing
+    so shifts every later line number, and this function's only consumer
+    reports `SyntaxError at block-relative line N`. It is also unnecessary:
+    python reads `\<newline>` as its own line continuation, so both arms parse
+    equivalently.
+    """
+    out = []
+    i = 0
+    n = len(src)
+    while i < n:
+        c = src[i]
+        if c == "\\" and i + 1 < n and src[i + 1] in ("\\", "$", "`"):
+            out.append(src[i + 1])
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def check_block(b):
     """Check one block. Returns None when clean, else a reason string.
 
@@ -264,8 +311,18 @@ def check_block(b):
                     "block-relative line(s) %s -- terminates the bash string, so "
                     "the python reaching the interpreter is truncated (guard-504)"
                     % ", ".join(str(x) for x in offenders))
+    # Compile what the INTERPRETER receives, not the raw file bytes. bash
+    # rewrites an unquoted heredoc body before python ever sees it, so auditing
+    # the raw form reports a SyntaxError in a string that never existed
+    # (). A QUOTED heredoc (`<<'PY'`) is literal by definition and is
+    # deliberately NOT expanded -- that is precisely what quoting the delimiter
+    # means, and expanding it would re-introduce the same class of false verdict
+    # in the opposite direction.
+    parse_src = src
+    if b["kind"] == "heredoc_unquoted":
+        parse_src = _expand_unquoted_heredoc(src)
     try:
-        ast.parse(src)
+        ast.parse(parse_src)
     except SyntaxError as e:
         return "SyntaxError at block-relative line %s: %s" % (e.lineno, e.msg)
     except ValueError as e:

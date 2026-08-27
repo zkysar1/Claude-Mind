@@ -115,6 +115,15 @@ def owncloud_flush(ctx) -> "Response":  # type: ignore[name-defined]
         # (guard-1579). Sorted so the wrapper's summary line is stable across
         # runs and diffable; the sweep appends in os.walk order.
         "pruned_agent_names": sorted(stats_d.get("pruned_agent_names", []) or []),
+        # Same principle as pruned_agent_names four lines up, applied to the
+        # counter that actually signals loss (). guard-1579 got the
+        # identity list for PRUNES into this payload; `errors` sat beside it
+        # naming nothing, so a sweep reporting errors=8 told an operator
+        # nothing about WHICH eight files are unpushable from this box.
+        **({"error_paths": stats_d["error_paths"]}
+           if stats_d.get("error_paths") else {}),
+        **({"error_paths_truncated": stats_d["error_paths_truncated"]}
+           if stats_d.get("error_paths_truncated") else {}),
     })
 
 
@@ -250,6 +259,21 @@ def owncloud_sync_file(ctx) -> "Response":  # type: ignore[name-defined]
         "conflicts": stats.get("conflicts", 0),
         "diverged_skipped": stats.get("diverged_skipped", 0),
         "errors": stats.get("errors", 0),
+        # WHICH object failed and why, not just how many ().
+        # _record_error has stored {path, phase, exc, msg} since 2026-08-11;
+        # this payload hand-enumerates counters, so it dropped the one field
+        # carrying the identity — and owncloud-push-on-write.sh prints this body
+        # VERBATIM in its failure warning, so `errors: 1` reached an operator
+        # with no cause attached. Measured
+        # 2026-08-22 on a world tree-node body push: three push paths each
+        # returned errors:1 with no reason, and the reason existed the whole
+        # time. The sibling owncloud_pull endpoint splats **stats and has
+        # always carried it; these whitelists were the outliers. Key name is
+        # the producer's verbatim (guard-3408).
+        **({"error_paths": stats["error_paths"]}
+           if stats.get("error_paths") else {}),
+        **({"error_paths_truncated": stats["error_paths_truncated"]}
+           if stats.get("error_paths_truncated") else {}),
         **({"reason": stats["reason"]} if "reason" in stats else {}),
     })
 
@@ -278,11 +302,15 @@ def _local_claim_store(ctx):
         return None
     root = str(ctx.paths.project_root)
     try:
-        if not GitRefClaimStore.available(root):
+        # RUNNER_CLAIM_REMOTE → a `claims` remote → origin (see default_remote:
+        # a read-only origin is the wrong arbiter for a self-contained box).
+        remote = GitRefClaimStore.default_remote(root)
+        if not GitRefClaimStore.available(root, remote):
             return None
         return GitRefClaimStore(
             repo_root=root,
             env_id=os.environ.get("ENVIRONMENT_ID", "ayoai-mind"),
+            remote=remote,
         )
     except Exception:  # noqa: BLE001 — same degrade-to-no-op contract
         return None
@@ -361,7 +389,24 @@ def runner_acquire(ctx) -> "Response":  # type: ignore[name-defined]
             {"backend": backend, "ok": False, "error": f"import failed: {e}"},
             status=500)
     try:
+        from git_ref_claim import GitRefClaimError as _StoreUnwritable
+    except Exception:  # noqa: BLE001 — own-cloud arm: no git store in play
+        class _StoreUnwritable(Exception):  # type: ignore[no-redef]
+            """Placeholder so the except clause below is always well-formed."""
+    try:
         get_backend().acquire_runner(agent, token)
+    except _StoreUnwritable as e:
+        # The claim store could not be WRITTEN — no credential for the remote,
+        # an unreachable host, a server-side refusal — which is a plumbing
+        # failure, NOT a held claim. Before this clause (2026-08-27, coach-mind
+        # on zc-03) the store reported a failed push as a lost CAS race, this
+        # endpoint answered {"held": true}, and runner-claim.sh told the operator
+        # "another machine owns a live claim for this agent" while the claim
+        # namespace was empty. Answer with the remote's own words instead; the
+        # wrapper prints FAILED (rc=2), and /start halts on a TRUE diagnosis.
+        return Response.json(
+            {"backend": backend, "ok": False, "store_error": True,
+             "error": f"claim store unwritable: {e}"}, status=500)
     except RunnerHeld:
         # §5 stale-lock-break: a crashed runner never reaches /stop, so its claim
         # sits RUNNING with a frozen heartbeat_at. Without recovery that stale
@@ -577,6 +622,11 @@ def runner_claims(ctx) -> "Response":  # type: ignore[name-defined]
         # `getattr` default None = "this daemon cannot tell you" — callers must
         # treat that as UNREADABLE (refuse), never as fresh (guard-487).
         "runner_stale_seconds": getattr(be, "runner_stale_seconds", None),
+        # Git-ref arm only: the stderr of the most recent FAILED fetch of the
+        # claim namespace, else None. When set, `claims` is the LAST-KNOWN LOCAL
+        # state, not the remote's — an empty list here must never be read as
+        # "no holder" (2026-08-27 coach-mind: `[]` beside failing acquires).
+        "store_error": getattr(be, "last_fetch_error", None),
         "claims": [
             {"agent": c.agent, "machine_id": c.machine_id,
              "agent_state": c.agent_state, "heartbeat_at": c.heartbeat_at,

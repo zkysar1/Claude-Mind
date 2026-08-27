@@ -12,8 +12,9 @@ g-115-2984 cadence-battery pattern applied to the always-run tier: post-compacti
 and the output re-derives the full lane set from LANES so a phase can never
 silently fall out of the protocol.
 
-FINDINGS ONLY IS THE POINT, AND IT IS ALSO THE HAZARD. The five lanes emit
-22,747 B of JSON between them on a quiet iteration (measured). Printing that
+FINDINGS ONLY IS THE POINT, AND IT IS ALSO THE HAZARD. The six lanes emit
+tens of kB of JSON between them on a quiet iteration (22,747 B measured when
+the set was five -- the denominator is kept rather than silently rescaled). Printing that
 every entry is exactly the context cost this goal exists to remove. But a
 findings-only battery that stays quiet when a lane FAILED is guard-4093's defect:
 "a zero with ANY blind lane is UNREACHABLE, not EMPTY". So this battery keeps two
@@ -28,12 +29,12 @@ any blind lane it prints NO-FINDINGS-REACHED and names the blind lanes, because
 aggregator ("if all lanes blind -> blind") is the wrong one: one reachable lane
 returning nothing would outvote every blind lane.
 
-THE LANE SET IS FIVE, NOT NINE, AND THE DIFFERENCE IS NOT AN OMISSION. The tier
-table carries 9 always-run rows. Four of them (0-pre tree-debt-gate, 0-pre2
+THE LANE SET IS SIX, NOT TEN, AND THE DIFFERENCE IS NOT AN OMISSION. The tier
+table carries 10 always-run rows. Four of them (0-pre tree-debt-gate, 0-pre2
 experience-archival-gate, 0-pre2.5 evolution-finalize-gate, 0-pre3
 fresh-eyes-code-gate) have NO standalone script -- they are already dispatched by
 `precheck-sentinel-battery.sh` and their bodies live in SKILL.md phase sections.
-Wrapping them here would run them twice. This battery owns the five lanes that
+Wrapping them here would run them twice. This battery owns the six lanes that
 have their own scripts; `_uncovered_lanes()` names the other four in the report so
 the split is visible rather than inferred.
 
@@ -45,7 +46,7 @@ and make an always-run lane DROPPABLE in a tight zone -- which is exactly the
 g-115-3124 drift the meter's own comment records for dependency-timeout-check.
 `meter_name` is therefore a separate field from `script`, never derived from it.
 
-DRY-RUN IS THE DEFAULT AND THE MODE IS ALWAYS PRINTED. Four of the five lanes
+DRY-RUN IS THE DEFAULT AND THE MODE IS ALWAYS PRINTED. Four of the six lanes
 send notifications and post to the board under `--apply`; the tier table calls
 them with it. Defaulting to apply would make any manual or test invocation fire
 real escalations, and defaulting to dry-run SILENTLY would turn the loop's
@@ -56,7 +57,7 @@ a reader can never mistake one for the other.
 Output (guard-424 fail-loud-with-stderr; guard-614 structured on EVERY exit path):
   default -- one human line per lane WITH findings, then a summary:
       > FINDING: <lane> (phase <phase>) <detail>
-      [always-run-battery] 2 finding / 5 lanes (mode=dry_run, completeness=complete)
+      [always-run-battery] 2 finding / 6 lanes (mode=dry_run, completeness=complete)
   --json  -- {checked_at, mode, status, completeness, lanes_registered,
              findings:[...], blind:[...], uncovered:[...], error?}
 
@@ -98,6 +99,14 @@ _METER = "aspirations-precheck-budget-meter.sh"
 #   false   -- bool key, FALSE is a finding (an all_clear-style flag)
 # Every lane additionally treats a non-empty `failed` list as BOTH a finding and
 # an error, so a lane that half-worked is never reported as clean.
+#
+# COUNTS IN THE PROSE ABOVE ARE PROSE. `len(LANES)` is the only authority for
+# how many lanes this battery owns, and the report prints it at runtime. Seven
+# hardcoded "five lanes" claims went stale the moment a sixth was registered
+# ( fresh-eyes) -- the three ENFORCED registration sites (this tuple,
+# the meter's always-run arm, the SKILL.md tier table) are pinned by
+# test_budget_meter_sweep_tier_parity, but no test can pin a sentence. If you
+# add a lane, re-grep this file for a spelled-out count before you commit.
 LANES = (
     {
         "name": "inbox-alert-age-check",
@@ -151,11 +160,27 @@ LANES = (
         "extra_args": ("--json",),
         "finds": {"counts": (), "lists": ("slate",), "false": ()},
     },
+    {
+        "name": "world-script-crlf-check",
+        "phase": "0.5g.8",
+        # Registered in sweep_tier()'s always-run arm under this exact name. See
+        # the meter-name trap above: the script stem happens to match here, but
+        # the field stays explicit so a future rename cannot silently demote an
+        # always-run lane to droppable.
+        "meter_name": "world-script-crlf-check",
+        "script": "world-script-crlf-check.sh",
+        # Report-only by contract: it has no --apply and must never be handed one.
+        # Repairing a *.sh under world/ writes into a live own-cloud-synced store
+        # and can race the sync; the 2026-08-22 repair needed a content-
+        # preservation assertion to be safe ().
+        "apply_flag": False,
+        "finds": {"counts": (), "lists": ("offenders",), "false": ()},
+    },
 )
 
 # The always-run rows this battery deliberately does NOT run, because they have no
 # standalone script and are already dispatched by precheck-sentinel-battery.sh.
-# Named in the report so "5 lanes" is never read as "the whole always-run tier".
+# Named in the report so "6 lanes" is never read as "the whole always-run tier".
 _SENTINEL_DISPATCHED = (
     ("0-pre", "tree-debt-gate"),
     ("0-pre2", "experience-archival-gate"),
@@ -298,7 +323,7 @@ def run(as_json=False, apply=False, lane_runner=None) -> int:
             if not isinstance(payload, dict):
                 raise ValueError(f"expected a JSON object, got {type(payload).__name__}")
         except Exception as exc:
-            # Unparseable output is BLIND, never clean. All five lanes emit JSON
+            # Unparseable output is BLIND, never clean. All six lanes emit JSON
             # on stdout by default (measured); a non-JSON body means the lane
             # broke or changed shape, and either way we did not see its findings.
             reason = f"unparseable output (rc={rc}): {exc}"

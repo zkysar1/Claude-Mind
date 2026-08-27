@@ -108,7 +108,7 @@ Trigger evolution check — the system evaluates its own strategy and generates 
          description is loaded into the system prompt at startup, so the corpus is a
          pure additive ratchet — forging adds and nothing subtracts — and a ceiling
          that can only tighten is the counter-pressure (learning-philosophy.md rule 5).
-         Measured 2026-08-11: 116 skill dirs against a cap of 100.
+         Measured 2026-08-23: 127 dirs vs cap 100 (116 on 08-11).
 
      If change warranted:
        Validate new_value is within [min, max] bounds from config modifiable section

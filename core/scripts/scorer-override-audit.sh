@@ -59,9 +59,31 @@ if [ -n "$goal_json" ]; then
     # Resolved inline (not at script top) — this branch only runs on hits, so
     # the clean-window common path pays nothing for the subprocess.
     _et="$(bash "$SCRIPT_DIR/escalation-target.sh")" || _et="asp-115 world"
-    printf '%s' "$goal_json" | bash "$SCRIPT_DIR/aspirations-add-goal.sh" \
-        --source "${_et##* }" "${_et%% *}"
-    echo "[scorer-override-audit] HITS in ${SINCE}h — filed Investigate goal into ${_et%% *}"
+    # A goal_duplication_blocked refusal is NOT a failure of this audit: it means
+    # the finding ALREADY HAS AN OWNER — a pending Investigate whose slugified
+    # title matches. Under `set -e` the unguarded call made that refusal the fatal
+    # exit of the whole wrapper, so the recurring goal that invokes this script
+    # () could never close cleanly while its own prior Investigate stayed
+    # open. That manufactured a permanent "stopped firing" reading: the goal ranked
+    # 8/1117 in the live scorer the whole time, yet an Unblock re-filed every ~48h
+    # ( 48.2h/3.01x,  48.4h/3.03x) and unblock-parent-status-sweep
+    # auto-closed each one "without action needed", so nothing ever reached the cause.
+    # Measured 2026-08-24 (, echo, cc-03): dup-owner .
+    # Matched with `case`, never `| grep -q` — grep -q exits early and pipefail would
+    # turn the resulting SIGPIPE into a second, spurious failure (guard-3132).
+    if add_out="$(printf '%s' "$goal_json" | bash "$SCRIPT_DIR/aspirations-add-goal.sh" \
+                      --source "${_et##* }" "${_et%% *}" 2>&1)"; then
+        echo "[scorer-override-audit] HITS in ${SINCE}h — filed Investigate goal into ${_et%% *}"
+    else
+        case "$add_out" in
+            *goal_duplication_blocked*)
+                echo "[scorer-override-audit] HITS in ${SINCE}h — finding ALREADY OWNED by an open Investigate; no new goal filed (duplication gate)" ;;
+            *)
+                printf '%s\n' "$add_out" >&2
+                echo "[scorer-override-audit] ERROR: add-goal failed and it was NOT a duplication block" >&2
+                exit 1 ;;
+        esac
+    fi
 else
     # Also print the human report for the log/operator when clean.
     py -3 "$SCRIPT_DIR/scorer-override-audit.py" --since-hours "$SINCE"

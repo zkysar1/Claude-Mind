@@ -642,3 +642,98 @@ def test_reducer_and_unknown_both_proceed_and_report_the_role(monkeypatch, capsy
         doc = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
         assert doc["body_role"] == role
         assert "error" not in doc
+
+
+# ---------------------------------------------------------------------------
+# drain_consumed_captures ()
+#
+# The lanes above CONSUME exp_capture / encoding_capture; until this function
+# existed nothing removed what they consumed, so both lanes parked at cap and
+# evicted silently on every append (930 entries / 481 goals, measured cc-08
+# 2026-08-24). These tests pin the two properties that make the drain safe:
+# it sends the goal-id SET (never a surviving list — guard-3881), and every
+# unhappy branch keeps the entries.
+# ---------------------------------------------------------------------------
+
+def _drain_calls(monkeypatch, results):
+    """Record each _run call; return canned (rc, stdout, stderr) per call."""
+    seen = []
+    queue = list(results)
+
+    def _fake_run(argv, timeout=90, **kw):
+        seen.append({"argv": list(argv), "stdin": kw.get("stdin")})
+        return queue.pop(0) if queue else (0, '{"removed":0,"kept":0}', "")
+
+    monkeypatch.setattr(wr, "_run", _fake_run)
+    return seen
+
+
+def test_drain_sends_the_goal_id_set_never_a_survivor_list(monkeypatch):
+    """guard-3881. The retired design filtered in this process and POSTed the
+    survivors to wm-set — a full-slot overwrite that loses concurrent appends.
+    What crosses the seam now is ids only; the handler does the subtracting."""
+    seen = _drain_calls(monkeypatch, [
+        (0, '{"ok":true,"removed":2,"kept":7}', ""),
+        (0, '{"ok":true,"removed":3,"kept":9}', ""),
+    ])
+    out = wr.drain_consumed_captures(Path("/repo"), ["g-2-02", "g-1-01", "g-1-01"])
+
+    assert len(seen) == 2, seen
+    for call in seen:
+        assert call["argv"][-2].endswith("wm-drain-goals.sh"), call["argv"]
+        # Sorted + deduped ids, and nothing else.
+        assert json.loads(call["stdin"]) == ["g-1-01", "g-2-02"], call["stdin"]
+    assert [c["argv"][-1] for c in seen] == [wr.EXP_SLOT, wr.ENC_SLOT]
+    assert out[wr.EXP_SLOT] == {"removed": 2, "kept": 7, "wrote": True, "error": ""}
+    assert out[wr.ENC_SLOT] == {"removed": 3, "kept": 9, "wrote": True, "error": ""}
+
+
+def test_drain_does_nothing_at_all_when_no_goal_was_marked(monkeypatch):
+    """No marker, no drain — and no call, so a marker-less run cannot even
+    reach the destructive endpoint."""
+    seen = _drain_calls(monkeypatch, [])
+    out = wr.drain_consumed_captures(Path("/repo"), [])
+
+    assert seen == []
+    assert all(r["error"] == "no-marked-goals" and r["removed"] == 0
+               for r in out.values()), out
+
+
+def test_drain_reports_zero_removed_when_the_wrapper_fails(monkeypatch):
+    """A failed write removed NOTHING. An optimistic tally here would read as
+    a drain that never happened."""
+    _drain_calls(monkeypatch, [
+        (1, "", "daemon unreachable"),
+        (0, '{"removed":1,"kept":0}', ""),
+    ])
+    out = wr.drain_consumed_captures(Path("/repo"), ["g-1-01"])
+
+    assert out[wr.EXP_SLOT]["removed"] == 0
+    assert out[wr.EXP_SLOT]["wrote"] is False
+    assert "daemon unreachable" in out[wr.EXP_SLOT]["error"]
+    # The second lane is independent — one lane failing must not skip the other.
+    assert out[wr.ENC_SLOT]["removed"] == 1
+
+
+def test_drain_refuses_to_infer_success_from_rc_zero(monkeypatch):
+    """guard-2298: rc=0 plus a shape we did not expect is zero signal, not a
+    clean drain."""
+    _drain_calls(monkeypatch, [
+        (0, "OK, done!", ""),
+        (0, '{"removed":0,"kept":4}', ""),
+    ])
+    out = wr.drain_consumed_captures(Path("/repo"), ["g-1-01"])
+
+    assert out[wr.EXP_SLOT]["error"] == "unparseable-verdict"
+    assert out[wr.EXP_SLOT]["removed"] == 0
+    assert out[wr.EXP_SLOT]["wrote"] is False
+
+
+def test_drain_does_not_claim_a_write_when_nothing_matched(monkeypatch):
+    _drain_calls(monkeypatch, [
+        (0, '{"ok":true,"removed":0,"kept":5}', ""),
+        (0, '{"ok":true,"removed":0,"kept":5}', ""),
+    ])
+    out = wr.drain_consumed_captures(Path("/repo"), ["g-nope-99"])
+
+    assert all(r["wrote"] is False and r["kept"] == 5 for r in out.values()), out

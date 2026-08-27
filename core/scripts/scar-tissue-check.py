@@ -693,6 +693,27 @@ def main(argv: Optional[List[str]] = None) -> int:
             if args.json:
                 print(json.dumps({"fired": False, "current": current,
                                   "goal_cadence": cfg["goal_cadence"]}))
+            else:
+                # Print on the NON-json path too. Without this branch,
+                # `--cadence --post-board` -- the exact invocation the
+                # aspirations-precheck tier table uses -- returned rc=0 with
+                # ZERO bytes on a noop, byte-indistinguishable from a crash, a
+                # kill, or a wrapper failure. That is precisely the
+                # confidence-manufacturing this file's own MEASUREMENT FAILED
+                # handler guards against ~10 lines below; the defense was
+                # applied to that exit path and not to this adjacent one.
+                # Both sibling self-acting cadences print their noop
+                # unconditionally (completed-not-closed-triage ~67 B,
+                # l1-skew-check ~1.6 KB), so this was the odd one out of the
+                # three. Observed twice from the orchestrator before being
+                # root-caused by source read (guard-3707: a zero-byte reply is
+                # a malfunction, not a result; guard-4002: a THIRD mechanism
+                # for the 0-byte rc=0 signature -- not transient, not
+                # long-run truncation, but a deliberately silent branch, which
+                # that guardrail's "RETRY ONCE" remedy would misdiagnose).
+                print("[scar-tissue-check] noop (cadence not crossed: "
+                      f"{current} completed, fires every "
+                      f"{cfg['goal_cadence']})")
             return 0
     if cfg is None:
         cfg = _load_cadence_config()

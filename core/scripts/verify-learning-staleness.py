@@ -678,6 +678,34 @@ def _script_emits_field(script_path: Path, field: str) -> bool:
                                 max_hops=6)
 
 
+def _strip_trailing_comment(s: str) -> str:
+    """Drop an unquoted trailing shell comment from a command tail.
+
+    L4 asserts that every `--flag` on a `Bash:` line exists in the named
+    script. A flag inside a trailing `# ...` comment is PROSE, never an
+    executed argument — and the comment is frequently a warning naming the
+    WRONG flag (`--json`, NOT `--output json`), so scanning it reports the
+    warned-against flag as drift. Measured 2026-08-27 (zeta, felt-sense):
+    the sole stale finding across 129 skills / 3841 assertions was exactly
+    this shape, on a SKILL.md line whose command was correct.
+
+    Fixed HERE rather than by widening `is_negative_assertion`: a bare
+    `, NOT ` phrase would suppress the whole lane on any line containing it
+    (guard-3274 — never loosen a detector when a narrower cut exists).
+    Quote-aware so `--reason "fix #12"` is not truncated.
+    """
+    q = None
+    for i, ch in enumerate(s):
+        if q:
+            if ch == q:
+                q = None
+        elif ch in "'\"":
+            q = ch
+        elif ch == "#" and (i == 0 or s[i - 1].isspace()):
+            return s[:i]
+    return s
+
+
 def check_argparse_flags(lineno: int, body: str) -> list[dict]:
     """Lane 4: every `--flag` mentioned in a `Bash: <script>.sh` line
     must appear in the script's source (or in any python script the
@@ -696,7 +724,7 @@ def check_argparse_flags(lineno: int, body: str) -> list[dict]:
     # and extract basename from the full path. Handle both POSIX `/`
     # and Windows `\` separators since SKILL pseudocode is path-agnostic.
     script_basename = script_full.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-    rest = (m.group(2) or "").strip()
+    rest = _strip_trailing_comment(m.group(2) or "").strip()
     if not rest:
         return []
     script_path = _resolve_script(script_basename)

@@ -147,6 +147,18 @@ ALLOWED_PREFIXES = (
     # _goal_source.infer(); test_goal_source_infer_parity.py pins the full set.
     "user-directed:",           # infer -> user
     "user_directed:",           # infer -> user (underscore variant)
+    # chat-goal lane (, 2026-08-26). A substantive assistant-mode
+    # request filed as a goal record by respond Step 5.0b. Registered here for
+    # the reason guard-2329 gives directly: an UNsanctioned prefix does not
+    # fail loudly on the Layer-D path -- the write succeeds, rc=0, and the
+    # signal is SILENTLY REWRITTEN to a title-derived one, which would leave
+    # this lane's adoption census querying a key that was never stored, vacuous
+    # forever and failing in the flattering direction. It infers -> user
+    # (a chat request IS user-initiated); the prefix exists so the LANE is
+    # countable without inventing a second goal_source vocabulary -- the
+    # category error the digest originally made. Keep locked with the user
+    # branch in _goal_source.infer().
+    "chat-goal:",               # infer -> user
     "recurring:",               # infer -> recurring-cycle (sibling of recurring_cadence:)
     "monitor:",                 # infer -> cycle-detector (monitor proc-NNN goals)
     "investigation:",           # infer -> agent-self (sibling of investigate:)

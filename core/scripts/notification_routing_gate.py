@@ -51,7 +51,34 @@ SUPPRESS = 1
 #   user-digest     : the BATCHED "goals waiting on you" list. Individual sends
 #                     collapse into this, which is what makes suppression a
 #                     re-route rather than a deletion.
-ALWAYS_SEND_CATEGORIES = frozenset({"decision-needed", "user-digest"})
+#   reply           : an ANSWER to something the user himself asked ().
+#
+# WHY `reply` IS HERE, stated against the directive's own words rather than
+# around them. Every other category names a message the FLEET decided to send;
+# the directive suppresses those because "if you can handle them ... i do not
+# need to know". A reply is the one shape the fleet did not initiate, and the
+# thing to be handled IS reaching him — so the directive's condition is not
+# merely unmet, it is unmeetable. Measured (): he emailed on
+# 2026-08-15 asking "send me an email with exact instructions"; the verified
+# answer dispatched as `info`, suppressed to the findings board, and nine days
+# later sat on a board he does not read. Suppressing that is not handling it
+# ourselves — it is declining an instruction.
+#
+# THIS IS NOT A RE-SEND DOOR, AND THE DISTINCTION IS LOAD-BEARING (guard-4722).
+# That guardrail records the gate CORRECTLY suppressing a reply whose closing
+# sentence had turned it into a permission request for work a standing grant
+# already authorized, and its remedy is explicit: file the work as agent work,
+# "not to re-send with a different category". Two interlocks keep `reply` from
+# becoming exactly that door, and NEITHER lives in this function:
+#   1. the dispatcher REQUIRES --in-reply-to, so the claim "he asked for this"
+#      is cited in the body, the email and the outreach ledger — auditable, and
+#      visible to him, which is what makes a wrong claim self-correcting;
+#   2. `reply` is deliberately NOT exempt from notify-user Step 1.5, so a reply
+#      that reads as an ask still meets the approval-request gate and is refused
+#      with guard-4722's remedy. `blocker`/`completion`/`user-digest` are exempt;
+#      `reply` must never join them.
+# Removing either interlock re-opens the bypass this comment exists to close.
+ALWAYS_SEND_CATEGORIES = frozenset({"decision-needed", "user-digest", "reply"})
 
 # Status-report categories. Fleet-handleable BY DEFAULT -- they retrospectively
 # state what happened, and the fleet already records that on the board and in

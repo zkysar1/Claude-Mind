@@ -91,6 +91,29 @@ _CURRICULUM_YAML = (
 )
 
 
+# Agent-attributed completions seeded into the WORLD store so the g-metric gate
+# clears its 0.5 threshold under the  basis (500/800 = 0.625). Keep
+# this above 0.5 * _competence.N_COMPLETION_AGENT; it is deliberately a plain
+# literal rather than an import so mind_api/tests takes no dependency on
+# core/scripts, but that means a change to N_COMPLETION_AGENT must be mirrored
+# here. The failure is loud (test_evaluate_roundtrip goes red), not silent.
+WORLD_COMPLETED = 500
+
+# The agent name the RUNTIME resolves — NOT the agent dir's basename. Both
+# harnesses supply this name explicitly (the CLI via MIND_AGENT in _run_cli,
+# the daemon via _FakeCtx's agent_name default), and assess() now keys
+# completed_by on the caller's resolved name, so this is the literal shape the
+# production call site passes (guard-920).
+#
+# It must NOT be agent_dir.name. TestByteCompat seeds two agent dirs whose
+# basenames differ (cli-agent / dae-agent) but which share ONE world dir --
+# _seed_agent derives world as agent_dir.parent/'world' for both -- so the
+# second seed overwrites the first. Keying on the basename made the two sides
+# disagree (dae 500 attributed, cli 0) and broke byte-compat; keying on the
+# resolved name makes both writes identical, so the shared dir is harmless.
+SEEDED_AGENT_NAME = "alpha"
+
+
 def _seed_agent(agent_dir: Path, *, completed: int = 1):
     """Seed curriculum.yaml + the three gate-input files. completed=0 makes the
     count_check gate FAIL (for the not-all-passed promote path).
@@ -100,8 +123,24 @@ def _seed_agent(agent_dir: Path, *, completed: int = 1):
     evidence via refresh_competence_for_gates, overwriting the stored 0.7 —
     an empty world derives 0.0 and the g-metric gate fails. The stored value
     below remains only the pre-refresh baseline (and what promote — which
-    does not refresh — reads). Seeded inputs: pipeline 5/5 resolved +
-    rb 20/20 active + 25/25 completed world goals → recomputed 0.75 ≥ 0.5."""
+    does not refresh — reads).
+
+    ARITHMETIC CHANGED 2026-08-26 (g-115-5153). average_competence is no
+    longer the four-component mean (pipeline + rb + completion + tree, which
+    this fixture used to clear at 0.75); it is agent-attributed
+    completion_breadth ALONE = completions where `completed_by == <agent>`,
+    over N_COMPLETION_AGENT (800). So the pipeline and reasoning-bank rows
+    below no longer move the gate metric at all — they are retained because
+    the endpoint still REPORTS those components as diagnostics.
+    What the gate now needs is WORLD_COMPLETED goals carrying completed_by:
+    500/800 = 0.625 ≥ the 0.5 threshold in _CURRICULUM_YAML. Two things make
+    this fixture break if edited carelessly: the goals must be NESTED under
+    `goals` (a flat top-level {"status": "completed"} record counts ZERO —
+    that is why the agent-side aspirations.jsonl below contributes nothing to
+    this metric, and always did), and each must carry completed_by matching
+    the agent name the runtime RESOLVES (SEEDED_AGENT_NAME — NOT the dir
+    basename; see that constant for why the distinction is load-bearing here)
+    or it is filtered out as another agent's work."""
     agent_dir.mkdir(parents=True, exist_ok=True)
     (agent_dir / "curriculum.yaml").write_text(_CURRICULUM_YAML, encoding="utf-8")
     asp_lines = "".join(
@@ -127,7 +166,8 @@ def _seed_agent(agent_dir: Path, *, completed: int = 1):
         for i in range(20)), encoding="utf-8")
     (world / "aspirations.jsonl").write_text(json.dumps(
         {"id": "asp-w", "goals": [
-            {"id": f"g-w-{i}", "status": "completed"} for i in range(25)]}
+            {"id": f"g-w-{i}", "status": "completed",
+             "completed_by": SEEDED_AGENT_NAME} for i in range(WORLD_COMPLETED)]}
     ) + "\n", encoding="utf-8")
 
 

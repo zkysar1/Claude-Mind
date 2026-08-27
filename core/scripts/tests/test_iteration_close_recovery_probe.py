@@ -199,9 +199,20 @@ def test_learning_gate_unreadable_goal_does_not_assert_closed():
 
 
 def test_verify_case_unchanged_hedge_survives():
-    # The verify case was already honest ("may be in indeterminate state") —
-    # the goal's sibling audit keeps it untouched; pin the hedge so a future
-    # edit does not import the unconditional-assertion shape there.
+    # NAME IS HISTORICAL: the verify case is no longer "unchanged". 
+    # gave it the same live-status probe the sibling cases have, because its
+    # REMEDIES were wrong even though its wording was honest — it offered a
+    # destructive "Revert (mark pending)" unconditionally, including on the rc=2
+    # entry-check refusal where nothing ran at all.
+    #
+    # THE PIN STILL HOLDS AND STILL MATTERS.  left the hedge alone
+    # because a HEDGE does not assert unread state, and that reasoning is intact:
+    # this test exercises the UNREADABLE branch, which is exactly where hedging is
+    # the honest answer, so the phrase survives there. What  changed is
+    # the two branches where the record IS readable — and those now say which half
+    # landed instead of hedging. Keep this assertion: it is what stops a future
+    # edit from importing the unconditional-assertion shape into the one branch
+    # that must never assert.
     proc = _run("verify", "g-999999-99")
     assert proc.returncode == 2, proc.stderr
     assert "may be in indeterminate state" in proc.stderr

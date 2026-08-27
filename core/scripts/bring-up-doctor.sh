@@ -97,6 +97,29 @@ if [ -f .env.local ] && grep -qE '^\s*STORAGE_(BACKEND|S3_BUCKET|DDB_)' .env.loc
   warn "legacy STORAGE_* vars present in .env.local — they OVERRIDE the registry (deprecation path); remove unless intentional"
 fi
 
+# commons egress dial -- the world-contract T3 gate (g-368-09, first live consumer).
+# Resolved through the canonical SSOT in _paths.py, NEVER a bare shell env read:
+# _paths also sources .env.local, so a shell-side ${COMMONS_POLICY:-private} would
+# miss a configured value and print a confident wrong answer (guard-3726).
+if [ -n "$PY" ]; then
+  CP="$(PYTHONPATH="$SCRIPT_DIR" $PY -c 'import _paths;print(_paths.COMMONS_POLICY)' 2>/dev/null)"
+  CP_RAW=""
+  [ -f .env.local ] && CP_RAW="$(grep -E '^\s*COMMONS_POLICY=' .env.local 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '\r\n" ' | tr '[:upper:]' '[:lower:]')"
+  if [ -z "$CP" ]; then
+    warn "COMMONS_POLICY unresolvable (could not import _paths) -- egress posture UNKNOWN"
+  elif [ -z "$CP_RAW" ]; then
+    ok "COMMONS_POLICY=$CP (undeclared -> fail-closed default; nothing crosses to the commons)"
+  elif [ "$CP_RAW" != "$CP" ]; then
+    bad "COMMONS_POLICY declared '$CP_RAW' but RESOLVES to '$CP' -- unrecognized value fails closed (world-contract.md Rule 4). The dial is NOT doing what .env.local says."
+  else
+    case "$CP" in
+      private)   ok   "COMMONS_POLICY=private (declared) -- no knowledge egress" ;;
+      selective) warn "COMMONS_POLICY=selective -- generalized patterns are declared to leave this world (verify intended)" ;;
+      public)    warn "COMMONS_POLICY=public -- full knowledge tree declared exposed via read API (verify intended)" ;;
+    esac
+  fi
+fi
+
 # --- 4. .env.local key presence (names only, never values) -------------------
 hr ".env.local key presence"
 if [ -f .env.local ]; then

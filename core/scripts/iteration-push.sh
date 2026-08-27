@@ -82,6 +82,49 @@ PUSH_WORKER_REF=0
 WORKER_REF_AGENT="${MIND_AGENT:-}"
 WORKER_REF_SID="${MIND_SID:-}"
 
+# --- Network bound for every push () -------------------------------
+# Each `git push` below is a NETWORK call that carried NO bound of its own. git
+# has no push-side equivalent of http.lowSpeedLimit on the ssh transport, and an
+# effective ssh config with `serveraliveinterval 0` (the default, and what
+# `ssh -G github.com` reports on these boxes) means keepalives are OFF — so a
+# half-open connection hangs until the kernel gives up, which is tens of
+# minutes. Measured on ZDS-Mind 2026-08-26: one stalled push blocked the
+# autonomous loop for 681s and would NOT have self-recovered.
+#
+# TWO bounds, because neither reaches every stall on its own:
+#   ssh keepalive — detects a DEAD PEER (answers nothing) in KEEPALIVE_S *
+#                   KEEPALIVE_MAX seconds. Set HERE rather than in a
+#                   machine-local ~/.ssh/config so it TRAVELS with the repo to
+#                   every box; covers the fetches below for free as a result.
+#   timeout(1)    — bounds wall-clock against EVERY stall cause, including an
+#                   application-level wedge where the peer still answers
+#                   keepalives — which the keepalive by construction cannot see.
+# The keepalive alone would leave that second case unbounded; the timeout alone
+# would not protect fetch. Hence both.
+#
+# A bounded failure is deliberately NOT special-cased: rc=124 falls through the
+# same "Auth / network / non-race shapes" branch as any other failed push and
+# soft_exit 1s — i.e. it degrades to retry-next-iteration, which is exactly the
+# existing fail-soft contract.
+IP_PUSH_TIMEOUT_S="${ITERATION_PUSH_TIMEOUT_S:-120}"   # vs a measured ~0.7s normal round-trip
+IP_SSH_KEEPALIVE_S="${ITERATION_PUSH_SSH_KEEPALIVE_S:-15}"
+IP_SSH_KEEPALIVE_MAX="${ITERATION_PUSH_SSH_KEEPALIVE_MAX:-4}"
+# Deliberately word-split at each call site: expands to `timeout <n>`, or to
+# NOTHING where timeout(1) is absent (BSD/macOS/git-bash), which preserves
+# today's unbounded-but-working behaviour instead of failing the push outright.
+if command -v timeout >/dev/null 2>&1; then
+  IP_TMO="timeout ${IP_PUSH_TIMEOUT_S}"
+else
+  IP_TMO=""
+  # Announced, never silent: an unbounded box is the exact condition this guard
+  # exists to remove, and a silent fallback is indistinguishable from success.
+  echo "[iteration-push] NOTE: timeout(1) unavailable — pushes bounded by ssh keepalive only" >&2
+fi
+# Never clobber a caller-supplied GIT_SSH_COMMAND (custom key, proxy, jump host).
+if [ -z "${GIT_SSH_COMMAND:-}" ]; then
+  export GIT_SSH_COMMAND="ssh -o ServerAliveInterval=${IP_SSH_KEEPALIVE_S} -o ServerAliveCountMax=${IP_SSH_KEEPALIVE_MAX}"
+fi
+
 usage() {
   cat <<'EOF'
 Usage: iteration-push.sh [--repo <path>] [--branch <name>] [--min-commits <n>]
@@ -1165,12 +1208,27 @@ _ip_push_worker_ref() {
   # through commits and merges), so a non-fast-forward here means an assumption
   # broke — single-writer, or a reset — and it should be LOUD rather than
   # silently overwritten.
-  if git -C "$REPO" push origin "HEAD:$WREF" >/dev/null 2>&1; then
+  if $IP_TMO git -C "$REPO" push origin "HEAD:$WREF" >/dev/null 2>&1; then
     log "--push-worker-ref: pushed HEAD ($(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)) -> REMOTE $WREF"
     log "  verify with 'git ls-remote origin $WREF', NOT 'git rev-parse $WREF'. This push writes the REMOTE ref only."
     log "  A local refs/workers/... ref exists only because some consumer fetched '+refs/workers/*:refs/workers/*'"
     log "  earlier; it does NOT advance on this push, so rev-parse returns a PLAUSIBLE STALE sha from a previous"
     log "  unit and the natural verification reports a false NO (g-306-313, guard-1250)."
+    # DEPENDENCY-PULL PRODUCER, worker lane (). The carrier has just
+    # LANDED, which is precisely the event the drain goal exists to consume — so
+    # the pull is stamped HERE, as an invariant of the push transition
+    # (guard-403), rather than as a second line in worker-loop's Phase 3.8.
+    # Three reasons this beats the SKILL.md call the goal originally specified:
+    # it fires on the real event instead of on an LLM remembering a step, it
+    # costs zero bytes of the hot-path prose budget, and the detection lives in
+    # exactly one place. pull-signal-set.sh is self-gating — it no-ops unless
+    # this push carried non-merge framework content, and no-ops again if a live
+    # signal is already stamped — so calling it unconditionally here is correct.
+    # STRICTLY ADVISORY: rc swallowed. A carrier push must never fail because a
+    # rank hint could not be written.
+    if [ -x "$SCRIPT_DIR/pull-signal-set.sh" ]; then
+      log "  pull: $(bash "$SCRIPT_DIR/pull-signal-set.sh" --if-carrier-content 2>&1 | head -1)"
+    fi
     _IP_WREF_RC=0; return 0
   fi
   log "--push-worker-ref: push FAILED for $WREF — this Body's framework edits and local commits have NOT reached the reducer"
@@ -1393,9 +1451,14 @@ fi
 
 log "pushing ${BRANCH} -> origin (${AHEAD} ahead, oldest ${AGE_MIN}m old)"
 # GIT_TERMINAL_PROMPT=0: never block on an interactive credential prompt (headless).
-# No --force, ever. Capture combined output for the log summary (GCM never prints
-# the token; the remote is a plain https URL, so no secret leaks).
-PUSH_OUT="$(GIT_TERMINAL_PROMPT=0 git -C "$REPO" push origin "$BRANCH" 2>&1)"
+# $IP_TMO: bound the network call () — rc=124 lands in the non-race
+# branch below and soft_exits, i.e. retry next iteration.
+# No --force, ever. Capture combined output for the log summary. Safe to log: an
+# https remote is credential-helper-backed (GCM never prints the token) and an
+# ssh remote carries no credential in the URL at all. (Corrected 2026-08-26 —
+# this comment asserted "the remote is a plain https URL", which is false on
+# every ssh-remote box, i.e. most of the fleet.)
+PUSH_OUT="$(GIT_TERMINAL_PROMPT=0 $IP_TMO git -C "$REPO" push origin "$BRANCH" 2>&1)"
 PUSH_RC=$?
 if [ "$PUSH_RC" -eq 0 ]; then
   log "push OK: origin/${BRANCH} now at $(git -C "$REPO" rev-parse --short "$UPSTREAM" 2>/dev/null || echo '?')"
@@ -1442,7 +1505,7 @@ if [ "$NO_FETCH" -eq 0 ] && printf '%s' "$PUSH_OUT" | grep -qiE 'non-fast-forwar
       soft_exit 1
     fi
   fi
-  RPUSH_OUT="$(GIT_TERMINAL_PROMPT=0 git -C "$REPO" push origin "$BRANCH" 2>&1)"
+  RPUSH_OUT="$(GIT_TERMINAL_PROMPT=0 $IP_TMO git -C "$REPO" push origin "$BRANCH" 2>&1)"
   RPUSH_RC=$?
   if [ "$RPUSH_RC" -eq 0 ]; then
     log "push-race recovery OK: origin/${BRANCH} now at $(git -C "$REPO" rev-parse --short "$UPSTREAM" 2>/dev/null || echo '?') (${RBEHIND} origin commit(s) integrated in-recovery)"

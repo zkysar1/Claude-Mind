@@ -34,6 +34,7 @@ import http.server
 import json
 import os
 import re
+import socket
 import subprocess
 import threading
 import time
@@ -83,6 +84,20 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self._send(b"")
             elif mode == "slow":
                 time.sleep(self.server.retrieve_sleep)
+            elif mode == "fastfail":
+                # Close without writing any response: curl exits 52 ("empty
+                # reply from server"), which rt_curl maps to rc=3 in a few
+                # MILLISECONDS. The threading server keeps answering
+                # /v1/admin/health, so rt_no_daemon_error still takes its
+                # REACHABLE branch — the exact shape that used to be reported
+                # as an RT_CURL_TIMEOUT expiry ().
+                self.close_connection = True
+                try:
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                self.connection.close()
+                return
             else:
                 self._send(NORMAL_BODY.encode())
         else:
@@ -178,3 +193,44 @@ def test_caller_timeout_override_is_honored(fake_daemon):
     r = _run(rt_dir, timeout_env=33)
     assert r.returncode == 7
     assert "RT_CURL_TIMEOUT=33s" in r.stderr, r.stderr[-300:]
+
+
+def test_fast_failure_is_not_reported_as_a_timeout(fake_daemon):
+    """: a fast rc=3 against a REACHABLE daemon must report MEASURED
+    elapsed and refuse to name a cause — not assert an RT_CURL_TIMEOUT expiry
+    it never observed.
+
+    The defect: rt_no_daemon_error held no measurement at all. RT_CURL_TIMEOUT
+    is an env read, so "did not complete within RT_CURL_TIMEOUT=90s" was config
+    echoed back as observation. Measured before the fix (foxtrot, 2026-08-26):
+    a 97ms failure reported as a 90s timeout.
+
+    Bound is 60s here while the failure lands in single-digit ms, so the two
+    are three orders of magnitude apart and no timing flake can blur them.
+    """
+    srv, rt_dir = fake_daemon
+    srv.mode = "fastfail"
+    r = _run(rt_dir, timeout_env=60)
+    assert r.returncode == 1, (r.returncode, r.stderr[-800:])
+
+    # The fabricated claim must be GONE. This substring is unique to
+    # rt_no_daemon_error — retrieve.sh's own line reads "did not complete:
+    # transport failure after Nms", which is measured and stays.
+    assert "did not complete within RT_CURL_TIMEOUT" not in r.stderr, \
+        "SIG-FABRICATED-TIMEOUT-CLAIM: " + r.stderr[-600:]
+
+    m = re.search(r"request FAILED after (\d+)ms against a REACHABLE daemon", r.stderr)
+    assert m, "SIG-NO-MEASURED-ELAPSED: " + r.stderr[-600:]
+
+    # Requirement 3: verify the MEASUREMENT is right, not merely that the
+    # sentence changed. A wrong measured number is worse than an obviously
+    # configured one, because it is credible.
+    elapsed = int(m.group(1))
+    assert 0 <= elapsed < 6000, f"elapsed {elapsed}ms must be far below the 60000ms bound"
+
+    assert "refusing to name a cause" in r.stderr
+    assert "was NOT reached" in r.stderr
+    assert "Do NOT raise RT_CURL_TIMEOUT" in r.stderr
+    # The slowness causes must NOT be offered for a failure that excluded them.
+    assert "one-time daemon warmup" not in r.stderr, \
+        "SIG-SLOWNESS-CAUSES-OFFERED: " + r.stderr[-600:]

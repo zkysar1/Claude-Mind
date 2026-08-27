@@ -1,7 +1,7 @@
 ---
 name: forge-skill
 description: "Forges a new SKILL.md from a recurring capability gap recorded in meta/skill-gaps.yaml, registers it in world/forged-skills.yaml, creates companion scripts for restricted operations, announces on the message board, and adds a validation goal. Use whenever a gap reaches the forge threshold (times_encountered >= 2, estimated_value >= medium, no duplicate skill exists) and the curriculum permits forging, or the user runs /forge-skill list / skill {gap-id} / check / dismiss {gap-id}. Wraps Anthropic's generic skill-authoring pattern (see anthropics/skills/skill-creator) with this agent's gap-detection, registry, and validation loop."
-user-invocable: false
+user-invocable: true
 triggers:
   - "/forge-skill"
 parameters:
@@ -18,7 +18,7 @@ execution_history:
   known_pitfalls: []
   reconsolidation_trigger: "After 10 invocations with declining success rate, trigger skill review"
 conventions: [aspirations, tree-retrieval, board]
-minimum_mode: autonomous
+minimum_mode: assistant
 revision_id: "skill-bootstrap-forge-skill-2a3db3"
 previous_revision_id: null
 ---
@@ -361,9 +361,21 @@ then come back here for the integration requirements.
    forged skill (`core/scripts/mutation-proof-test.sh`) IS this harness — invoke it
    on one of the script's guarded targets; for a pure computation script a
    3-fixture inline assertion suffices. SCOPE: verification / computation /
-   state-mutating gaps ONLY — thin API-wrapper forges (shell one documented command,
-   no correctness-critical branch) are EXEMPT; note the exemption in the forge log
-   and proceed to Step 4. (guard-1220, rb-4004, rb-4124 — done manually for gap-019,
+   state-mutating gaps ONLY — a thin API wrapper (shells one documented command,
+   no correctness-critical branch) is EXEMPT; note the exemption in the forge log
+   and proceed to Step 4.
+
+   JUDGE THE EXEMPTION PER SUBCOMMAND, NEVER PER SCRIPT (g-115-3475, rb-5355).
+   A companion script is a BUNDLE of subcommands with heterogeneous risk, so one
+   whole-artifact verdict launders the riskiest member through the average — and
+   the riskiest member is exactly the one carrying the harness's safety claim.
+   Measured while forging launch-env-server-session: 4 of 8 subcommands were
+   exempted as thin wrappers, and TWO were ineligible by the classes named right
+   above — `verify-terminated` returns exit 1 plus a STILL-BILLING action on a
+   non-terminated instance (a pass/fail verdict, i.e. a VERIFIER), and `teardown`
+   is state-mutating. Both shipped unvalidated through an exemption neither
+   qualified for. Walk the subcommand list and write one verdict per entry;
+   a bundle-level "it's a thin wrapper" is not a verdict. (guard-1220, rb-4004, rb-4124 — done manually for gap-019,
    now required by the process.)
 
 4. **Register in Forged Skills** (`world/forged-skills.yaml` + git-commit the body):

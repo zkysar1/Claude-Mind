@@ -237,7 +237,9 @@ is simply where the handful of tmp-world-plus-lock tests sort to.
 **CAUSE FOUND AND FIXED (g-115-5651, 2026-08-19).** `ValueError: <tmp>/world/pipeline.lock
 is not under any configured root` meant `get_backend()`'s process-wide `_ACTIVE_BACKEND`
 had frozen an EARLIER test's tmp-world root map into the cached instance — conftest
-restored the env VAR, not the derived object. The fixture now resets it.
+restored the env VAR, not the derived object. The fixture now resets it —
+mutation-proved, and all three victims ran together cleanly: the trio is
+verified, not inferred.
 Reproducing needs FOUR conditions, not two: cache empty, `own-cloud` in-process,
 `MIND_WORLD`/`MIND_META` SET (else `from_env()` raises and nothing caches), and a
 later test on a DIFFERENT tmp world — why ordered chunk replays and solo re-runs
@@ -379,16 +381,15 @@ runs whenever no live daemon is present. Enforced by `guard-672`.
 > solo. The tempting chunk-local-collision reading of it was **FALSIFIED**
 > 2026-08-17: chunk 09's exact 59-file list re-ran in the same order, same
 > process, same pin, with 0 failures. Chunk 09 is where those files sort to, not
-> the cause. **The cause IS known** — `get_backend()` memoizes `_ACTIVE_BACKEND`
-> process-wide while conftest restores only the env var, so one own-cloud test
-> poisons the rest of that process (`owncloud_backend._rel` raises on the tmp-world
-> `pipeline.lock`). Owned by **g-115-5651**. Re-run solo, then file THERE.
+> the cause. **The cause is known and FIXED** — the memoized-`_ACTIVE_BACKEND`
+> poisoning above, closed by **g-115-5651** 2026-08-19. A fresh occurrence is a
+> REGRESSION: re-run solo and file a NEW goal.
 >
 > **3. `INVALID` HAS TWO CAUSES AND CLIMBING THE LADDER ONLY FIXES ONE.** The
 > other is log corruption. **RESOLVED 2026-08-17 (g-115-6409): the default log
 > dir moved off the fleet-synced tree** to `<tmpdir>/ayoai-suite-run-<agent>`, so
-> there is nothing to pass; the bash wrapper follows automatically because it
-> ASKS via `--print-out-dir`. On a build predating that, use
+> there is nothing to pass. `--print-out-dir` is a **`.py`** flag; on the `.sh`
+> it rides into a REAL run that looks hung. Older builds:
 > `--out /tmp/<non-synced-dir>`. Mechanism, measured not inferred: the sync layer
 > REPLACES the log at a new inode while the writer still holds an fd on the old
 > one, so the writer trickles into an orphaned inode. **Duration is the
@@ -516,10 +517,10 @@ before you kill a run or file a false "suite hangs" blocker:
    auto-backgrounds >2min commands but keeps them bound to the turn).
 
 4. **Sanctioned pacing for an in-turn wait: `EXTERNAL_WAIT=1` (g-115-2678).**
-   The PRIMARY path is to background the suite (`run_in_background`) and END the
-   turn — the harness auto-notifies on completion, so no polling and no sleep is
-   needed (guard-1230). But if you deliberately pace with a bounded in-turn
-   sleep, use the sanctioned flag: `EXTERNAL_WAIT=1 bash
+   ON A REDUCER: background the suite (`run_in_background`), END the turn;
+   harness notifies (guard-1230). **A WORKER MUST NOT — it VOIDS the run;
+   use item 3's in-turn route** (`rationale/suite-run-voided-by-loop-merge.md`).
+   To pace an in-turn sleep, use the flag: `EXTERNAL_WAIT=1 bash
    core/scripts/interruptible-sleep.sh <seconds>`. A BARE interruptible-sleep
    registers no background job, so `background-jobs.sh has-pending` returns rc=1,
    stop-hook Gate 2.6 BLOCKs the turn-end, and the loop busy-spins (~20 turns

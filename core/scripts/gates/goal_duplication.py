@@ -467,9 +467,42 @@ def _extract_signals(goal: dict):
     # exclusion-context path drop below; _GOAL_ID_RE is defined with the
     # pending-queue lineage block. fullmatch keeps it precise (only an exact
     # goal-id token qualifies).
+    #  candidate (b): a goal-id the goal DECLARES as its own
+    # provenance — `discovered_by`, or one cited inside `origin_signal` — says
+    # WHERE THE WORK CAME FROM, not what it is ABOUT. Citing the discovering
+    # goal is standard practice, and that goal's own closure record names the
+    # same id, so the citation MANUFACTURES the overlap it is then blocked on.
+    # (That goal's REFUSAL 2: a block vs a goal closed three hours earlier where
+    # file_path_hits was EMPTY and the keyword hits were stopwords — after,
+    # author, closed, identifier — plus the discovering goal-id itself.)
+    #
+    # KEYED ON THE GOAL'S OWN FIELDS, NEVER ON PROSE MARKERS, and that is the
+    # load-bearing choice rather than an implementation convenience. A prose
+    # marker set cannot separate provenance from shared-work here: the
+    # neutral-context cases pinned in test_goal_duplication_contrast_goal_id.py
+    # read "the sentinel written by " and "the item tracked under
+    # " — provenance-SOUNDING phrasing pinned as GENUINE co-signal to
+    # preserve structural cases G3/G9. Marker matching would drop exactly those
+    # and repeat the candidate-(c) regression this goal already recorded
+    # (its outcome_note: a port broke pinned true positive G11). A declared
+    # field is unambiguous and is invisible to every prose-only case.
+    #
+    # NO LINEAGE SIGNAL IS LOST: genuine goal-id RELATIONSHIPS are handled by
+    # the dedicated _lineage_relation + Strategy-1 (origin_signal exact-match)
+    # paths, as this module's own  note states. This drop narrows only
+    # the FUZZY KEYWORD-OVERLAP path, where a provenance id was never evidence
+    # of shared subject matter.
+    _provenance_ids = set()
+    _disc = str(goal.get("discovered_by") or "").strip().lower()
+    if _GOAL_ID_RE.fullmatch(_disc):
+        _provenance_ids.add(_disc)
+    for _m in _GOAL_ID_RE.finditer((goal.get("origin_signal") or "").lower()):
+        _provenance_ids.add(_m.group(0))
+
     keywords = {
         w for w in words
         if w not in _STOPWORDS
+        and w not in _provenance_ids
         and not (_GOAL_ID_RE.fullmatch(w)
                  and _path_in_exclusion_context(text_lower, w,
                                                 marker_re=_CONTRAST_MARKER_RE))

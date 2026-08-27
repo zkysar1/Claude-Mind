@@ -172,3 +172,122 @@ def test_wrapper_and_skill_wiring():
     assert "core/scripts/notify-user.sh" in skill
     hooks = (root / "core" / "config" / "conventions" / "domain-hooks.md").read_text(encoding="utf-8")
     assert "notify-transport" in hooks
+
+
+# --------------------------------------------------------------------------- #
+# `reply` — answering something HE asked ()
+# --------------------------------------------------------------------------- #
+# `reply` is the third ALWAYS_SEND category, so it is the one shape that walks
+# past the 2026-08-10 suppression directive. The citation is the whole safety
+# margin, and guard-4722 is why: it records the routing gate CORRECTLY refusing
+# a reply-shaped message whose closing sentence had become a permission request
+# for already-granted work, with the explicit remedy "not to re-send with a
+# different category". These tests pin the citation, not the wording.
+
+ANSWER = ("The grant was already applied on 2026-08-16 under policy "
+          "ayoai-fleet-least-priv v7, Sid LambdaDeployRotateRevoke. "
+          "No action needed on your side.")
+ASKED = "your 2026-08-15 email 'send me an email with exact instructions'"
+
+
+def test_reply_without_a_citation_is_refused_and_sends_nothing(world):
+    p = _run(world, "--category", "reply", "--subject", "The IAM grant you asked about",
+             "--message", ANSWER)
+    assert p.returncode == nd.RC_USAGE, p.stderr
+    assert "--in-reply-to" in p.stderr
+    assert "guard-4722" in p.stderr, "the refusal must name why, or it reads as a missing-arg nit"
+    assert _sent(world) == [], "a refused reply must not reach the transport"
+
+
+def test_reply_with_a_citation_sends_and_the_citation_reaches_the_email(world):
+    """The load-bearing one. A citation that stayed in the gate's working copy
+    and never reached the payload would be an audit trail he cannot see — and
+    his seeing it is what makes a wrong claim self-correcting."""
+    p = _run(world, "--category", "reply", "--subject", "The IAM grant you asked about",
+             "--message", ANSWER, "--in-reply-to", ASKED)
+    assert p.returncode == nd.RC_SENT, p.stderr
+    payload = json.loads(_sent(world)[0].read_text())
+    blob = json.dumps(payload)
+    assert ASKED in blob, "the citation never reached the payload"
+    assert nd.REPLY_CITATION_PREFIX in blob
+
+
+def test_the_citation_is_appended_after_the_answer_never_before_it(world):
+    """TWO independent reasons, either of which alone justifies the order, so
+    this is asserted by POSITION rather than by exact formatting (guard-355):
+
+    1. notification_outreach.body_fingerprint() is the normalized HEAD of the
+       body (BODY_FP_CHARS=400). A fixed prefix on every reply seeds a shared
+       fingerprint, and the second unrelated reply inside the window gets
+       refused as a duplicate of the first.
+    2. He asked a question. The answer belongs at the top of the mail.
+    """
+    p = _run(world, "--category", "reply", "--subject", "The IAM grant you asked about",
+             "--message", ANSWER, "--in-reply-to", ASKED)
+    assert p.returncode == nd.RC_SENT, p.stderr
+    body = json.loads(_sent(world)[0].read_text()).get("Body") or ""
+    assert body.index("The grant was already applied") < body.index(nd.REPLY_CITATION_PREFIX)
+
+
+def test_the_citation_is_recorded_in_the_outreach_ledger(world):
+    """The audit half: 'he asked for this' must be reviewable later, not just
+    visible in one inbox."""
+    p = _run(world, "--category", "reply", "--subject", "The IAM grant you asked about",
+             "--message", ANSWER, "--in-reply-to", ASKED)
+    assert p.returncode == nd.RC_SENT, p.stderr
+    rows = [r for r in _ledger(world) if r.get("category") == "reply"]
+    assert rows, "the reply was not recorded in the ledger"
+    assert nd.REPLY_CITATION_PREFIX in json.dumps(rows[-1])
+
+
+def test_a_prebuilt_payload_already_carrying_the_citation_passes(world):
+    """ONE rule covers BOTH entry paths: supply --in-reply-to, or already carry
+    the citation. The payload path derives its category after main() has parsed
+    argv, so a main()-only check would leave exactly the bypass-capable shape
+    unguarded — this test is what fails if the check migrates up there."""
+    payload = {"InfoType": "Reply", "Title": "The IAM grant you asked about",
+               "Body": ANSWER + "\n\n" + nd.REPLY_CITATION_PREFIX + ASKED,
+               "XPayloadProvenance": "test/v1"}
+    p = _run(world, "--payload-stdin", stdin=json.dumps(payload))
+    assert p.returncode == nd.RC_SENT, p.stderr
+
+
+def test_a_prebuilt_reply_payload_without_a_citation_is_refused(world):
+    """The control for the test above — otherwise 'both paths are covered'
+    would pass just as happily if the payload path checked nothing at all."""
+    payload = {"InfoType": "Reply", "Title": "The IAM grant you asked about",
+               "Body": ANSWER, "XPayloadProvenance": "test/v1"}
+    p = _run(world, "--payload-stdin", stdin=json.dumps(payload))
+    assert p.returncode == nd.RC_USAGE, p.stderr
+    assert _sent(world) == []
+
+
+def test_reply_is_info_shaped_and_deliberately_NOT_step_1_5_exempt():
+    """The cross-cutting contract, in one place because its two halves live in
+    two files and only their INTERSECTION is correct (the g-115-4962 lesson,
+    one category over).
+
+    info-shaped: `blocker` is the only shape with no pretty renderer, and an
+    answer to a direct question is the last message that should arrive as an
+    "AyoAi Error Alert" in raw text (rb-3754: a category/shape mismatch makes a
+    payload vanish server-side while the async invoke still reports success).
+
+    NOT Step-1.5-exempt: the routing gate now always sends `reply`, so the
+    approval-request gate is the only thing left standing between it and the
+    user — and guard-4722 names the exact message it has to catch. Exempting
+    `reply` would delete that catch. The digest's exemption does NOT transfer:
+    it quotes goal descriptions it did not author, a reply is composed
+    deliberately one message at a time.
+    """
+    import re
+    builder = (SCRIPTS / "notify-build-payload.py").read_text(encoding="utf-8")
+    valid = re.search(r"VALID_CATEGORIES = \(([^)]*)\)", builder, re.S)
+    assert valid and "reply" in set(re.findall(r'"([a-z-]+)"', valid.group(1)))
+    assert '"reply": "Reply"' in builder, "reply must map to an InfoType, or the builder KeyErrors"
+
+    skill = (SCRIPTS.parent.parent / ".claude" / "skills" / "notify-user" / "SKILL.md").read_text(encoding="utf-8")
+    gate = re.search(r"IF category not in \(([^)]*)\):", skill)
+    assert gate, "could not find Step 1.5's exempt tuple in notify-user/SKILL.md"
+    assert "reply" not in set(re.findall(r'"([a-z-]+)"', gate.group(1))), (
+        "`reply` was added to Step 1.5's exempt tuple — that converts an "
+        "ALWAYS_SEND category into the re-send door guard-4722 forbids")

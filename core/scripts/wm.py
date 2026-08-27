@@ -771,6 +771,60 @@ def get_pruning_config(config):
 # Schema gates
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------- 
+# spark_capture entries are written by LLM worker Bodies following
+# worker-loop SKILL.md Phase 3.5, whose documented shape is
+# {goal_id, category, observation}. Measured 2026-08-16 over a live slot of
+# 162 entries: 16 (9.9%) carried NO `observation` key while holding 511-2,686
+# chars of real content under improvised names — `lesson` (4), `insight` (4),
+# `summary` (3), and singly `findings`, `text`, `observed`, `body`, `finding`,
+# `worker_note`, `action_hint`. Every reader keys on `observation`, so those
+# entries read as blank and their learning was dropped with no error anywhere.
+#
+# WHY NORMALIZE AT THE WRITER AND NOT ADD A FALLBACK CHAIN TO EACH READER:
+# guard-1565 (census first, fix the MINORITY spelling) — the schema
+# (working-memory.md), the writer instruction (worker-loop SKILL.md) and the
+# reader (aspirations-spark) ALL say `observation`, so this is not a
+# reader/writer disagreement; it is write-time improvisation, and the minority
+# is the improvised entry. guard-3970 — a fallback chain `a or b or c` is an
+# ENUMERATION CLAIM that those are all the keys, which cannot hold against an
+# LLM free to invent an 11th name tomorrow.
+#
+# So the rule below enumerates the CLOSED METADATA set the schema owns and
+# treats every other substantial string as content. That is immune to a new
+# content-key name by construction, which a fallback list is not.
+_SPARK_CAPTURE_META_KEYS = frozenset({
+    "goal_id", "category", "load_bearing", "sq_trigger", "_item_ts",
+})
+_SPARK_CAPTURE_MIN_CONTENT = 40
+
+
+def _normalize_spark_capture_entry(item):
+    """Promote an improvised content key into `observation`. Returns the key
+    promoted from, or None if nothing was changed.
+
+    Normalizes rather than refusing: a worker mid-close cannot recover from a
+    rejected append, and losing the observation is the exact failure this
+    exists to prevent. The provenance is recorded on the entry so a reader can
+    see the promotion happened.
+    """
+    if not isinstance(item, dict):
+        return None
+    if str(item.get("observation") or "").strip():
+        return None  # canonical shape — nothing to do
+    best_key, best_val = None, ""
+    for k, v in item.items():
+        if k == "observation" or k in _SPARK_CAPTURE_META_KEYS:
+            continue
+        if isinstance(v, str) and len(v.strip()) > len(best_val):
+            best_key, best_val = k, v.strip()
+    if best_key is None or len(best_val) < _SPARK_CAPTURE_MIN_CONTENT:
+        return None
+    item["observation"] = best_val
+    item["observation_normalized_from"] = best_key
+    return best_key
+
+
 def _validate_knowledge_debt_entry(item):
     """Reject knowledge_debt entries with unresolvable node_keys.
 
@@ -972,6 +1026,14 @@ def cmd_append(args):
     root_slot_for_validation = args.slot.split(".")[0]
     if root_slot_for_validation == "knowledge_debt" and isinstance(item, dict):
         _validate_knowledge_debt_entry(item)
+
+    # : promote improvised content keys into `observation` BEFORE the
+    # entry is persisted, so every downstream reader sees the canonical shape.
+    if root_slot_for_validation == "spark_capture" and isinstance(item, dict):
+        _promoted = _normalize_spark_capture_entry(item)
+        if _promoted:
+            print(f"[wm-append] spark_capture: promoted '{_promoted}' -> "
+                  f"'observation' (g-115-7795)", file=sys.stderr)
 
     # : initialized OUTSIDE the lock so the post-lock push below can
     # read it on every path — the same NameError trap the _evicted counter

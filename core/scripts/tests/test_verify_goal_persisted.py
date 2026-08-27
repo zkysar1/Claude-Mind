@@ -694,5 +694,105 @@ def test_complete_by_success_when_completion_persisted(tmp_path, monkeypatch):
     assert json.loads(resp.body)["ok"] is True
 
 
+# ── : the RECURRING complete-by claim-clear read-back ───────────
+#
+# A recurring completion cycles status back to `pending`, so `status` is
+# unchanged by the write and cannot witness the in-lock claim pop; and
+# `lastAchievedAt` is monotonic in coordination_merge._merge_goal
+# ("strictly-newer wins"), so it survives a per-field reconcile INDEPENDENTLY
+# of the claim fields and cannot witness it either. Before the fix, a lost
+# claim-clear on a recurring goal returned a clean 200 with the goal left
+# pending AND still claimed — the residual-claim shape guard-4775 measures.
+
+
+class _ReplayS3:
+    """Return exactly what the endpoint just wrote locally, with `mutate`
+    applied to each goal — the per-field reconcile shape (rb-3636 mechanism
+    B), where most of the PUT lands and the claim pair alone survives.
+
+    Replaying the endpoint's OWN write is what makes this test pin the right
+    field: status and lastAchievedAt match by construction, so the only
+    expectation that can fail is the claim pair (guard-920 — a regression
+    test must fail for the reason it names, not an incidental mismatch)."""
+
+    def __init__(self, world, mutate):
+        self._world = world
+        self._mutate = mutate
+
+    def get_object(self, Bucket, Key):  # noqa: N803 ( kwarg names)
+        raw = (self._world / "aspirations.jsonl").read_bytes()
+        recs = [json.loads(ln) for ln in raw.decode("utf-8").splitlines()
+                if ln.strip()]
+        for r in recs:
+            for g in (r.get("goals") or []):
+                self._mutate(g)
+        return {"Body": _FakeBody(_jsonl(*recs))}
+
+
+def _recurring_ctx(tmp_path, gid):
+    return _fake_ctx_claimed(
+        tmp_path, gid, CLAIM_AGENT,
+        goal_extra={"recurring": True, "interval_hours": 24},
+        query={"goal_id": gid, "source": "world",
+               "agent_name": CLAIM_AGENT})
+
+
+def _replay_backend(monkeypatch, tmp_path, mutate):
+    backend = _FakeOwnCloudBackend()
+    backend.s3 = _ReplayS3(tmp_path / "world", mutate)
+    _patch_backend(monkeypatch, backend)
+
+
+def test_complete_by_recurring_refuses_when_claim_clear_swallowed(
+        tmp_path, monkeypatch, capsys):
+    """The whole point of : everything else about the completion
+    persisted, ONLY the claim pair survived in the store → must be 500, not a
+    false 200. status is `pending` on both sides and lastAchievedAt matches,
+    so the claim pair is the sole discriminator."""
+    gid = "g-115-7820"
+    ctx = _recurring_ctx(tmp_path, gid)
+    _quiet_side_writers(monkeypatch)
+    _replay_backend(monkeypatch, tmp_path, lambda g: g.update(
+        {"claimed_by": CLAIM_AGENT, "claimed_at": "2026-07-16T11:45:56"}))
+    resp = aw.complete_by(ctx)
+    assert resp.status == 500, resp.body
+    assert b"complete_not_persisted" in resp.body
+    assert "WRITE-LOSS DETECTED" in capsys.readouterr().err
+
+
+def test_complete_by_recurring_success_when_claim_clear_persisted(
+        tmp_path, monkeypatch):
+    """Success twin — identical setup, claim pair absent in the store (the
+    clear landed) → 200. Without this the test above would also pass if the
+    endpoint had simply started refusing every recurring completion."""
+    gid = "g-115-7821"
+    ctx = _recurring_ctx(tmp_path, gid)
+    _quiet_side_writers(monkeypatch)
+    _replay_backend(monkeypatch, tmp_path, lambda g: None)
+    resp = aw.complete_by(ctx)
+    assert resp.status == 200, resp.body
+    assert json.loads(resp.body)["ok"] is True
+
+
+def test_complete_by_nonrecurring_unaffected_by_the_recurring_branch(
+        tmp_path, monkeypatch):
+    """Scope pin: the new expectation is gated on `recurring`. A NON-recurring
+    completion whose store copy still carries claimed_by still returns 200 —
+    its status IS terminal, and _merge_goal clears the whole claim triple on a
+    merged terminal status, so `status` witnesses the clear transitively.
+    Guards the documented 'shown not to need it' half of the enumeration."""
+    gid = "g-115-7822"
+    ctx = _fake_ctx_claimed(
+        tmp_path, gid, CLAIM_AGENT,
+        query={"goal_id": gid, "source": "world",
+               "agent_name": CLAIM_AGENT})
+    _quiet_side_writers(monkeypatch)
+    _replay_backend(monkeypatch, tmp_path, lambda g: g.update(
+        {"claimed_by": CLAIM_AGENT}))
+    resp = aw.complete_by(ctx)
+    assert resp.status == 200, resp.body
+    assert json.loads(resp.body)["ok"] is True
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

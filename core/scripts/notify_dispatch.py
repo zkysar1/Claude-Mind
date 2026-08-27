@@ -52,6 +52,20 @@ TRANSPORT_SLOT = "scripts/notify-transport.sh"
 
 RC_SENT, RC_USAGE, RC_ROUTED, RC_DUP, RC_NO_TRANSPORT, RC_TRANSPORT_FAIL = 0, 2, 3, 4, 5, 6
 
+# . `reply` is an ALWAYS_SEND category, so it is the one shape that
+# can walk past the 2026-08-10 suppression directive. The citation is what keeps
+# it from becoming a bypass: every reply must state, in the message itself, what
+# the user asked and when. That reaches him (so a wrong claim is visible and he
+# can say so), the routing gate's text, and the outreach ledger's stored body.
+#
+# APPENDED, NEVER PREPENDED, for two independent reasons. He asked a question:
+# the answer belongs at the top of the mail, not behind a bookkeeping line. And
+# notification_outreach.body_fingerprint() is the normalized HEAD of the body
+# (BODY_FP_CHARS=400), so a fixed prefix on every reply would seed a shared
+# fingerprint across unrelated replies and make the dedup gate refuse the second
+# one as a duplicate of the first.
+REPLY_CITATION_PREFIX = "Replying to what you asked: "
+
 
 def _bash_argv(script: str, *args: str) -> list:
     # guard-580/581: never a bare "bash" argv[0]; _runtime_bash resolves it.
@@ -80,7 +94,8 @@ def _category_from_payload(d: dict) -> str:
     it = re.sub(r"^\s*(\[[^\]]*\]\s*)+", "", d.get("InfoType") or "").strip().lower()
     m = {"notification": "info", "completion report": "completion", "aspiration update": "update",
          "infrastructure alert": "blocker", "decision needed": "decision-needed", "user digest": "user-digest",
-         "fleet digest": "user-digest", "goals waiting on you": "user-digest"}
+         "fleet digest": "user-digest", "goals waiting on you": "user-digest",
+         "reply": "reply"}
     if it in m:
         return m[it]
     return "blocker" if ("ErrorMessage" in d or "ErrorFrom" in d) else ""
@@ -171,7 +186,7 @@ def run_transport(payload: dict, *, world: Path | None, env_extra: dict) -> tupl
 def dispatch(*, agent: str, category: str, subject: str = "", message: str | None = None,
              message_file: str | None = None, payload: dict | None = None, goal_id: str = "",
              allow_duplicate: str = "", builder_args: list | None = None, world: Path | None = None,
-             mirror_peers: bool = True, dry_run: bool = False) -> int:
+             mirror_peers: bool = True, dry_run: bool = False, in_reply_to: str = "") -> int:
     builder_args = builder_args or []
     to_shape_src = os.environ.get("USER_EMAIL", "")
 
@@ -184,6 +199,31 @@ def dispatch(*, agent: str, category: str, subject: str = "", message: str | Non
             body = Path(message_file).read_text(encoding="utf-8", errors="replace") if Path(message_file).exists() else ""
         else:
             body = message or ""
+
+    # 0. reply citation (). One rule covers BOTH entry paths: a reply
+    # either supplies --in-reply-to (composed here) or already carries the
+    # citation in its body (a pre-built payload). Neither = refuse. Enforcing it
+    # here rather than in main() is deliberate — the payload path derives its
+    # category after main() has run, so a main()-only check would leave exactly
+    # the shape that can bypass the directive unguarded.
+    if (category or "").strip().lower() == "reply":
+        if in_reply_to.strip():
+            citation = f"\n\n{REPLY_CITATION_PREFIX}{in_reply_to.strip()}"
+            body += citation
+            if payload is None:
+                # Route the augmented text to the builder as an inline message so
+                # the citation reaches the EMAIL too, not just the gate and the
+                # ledger. message_file is dropped on purpose: its content is
+                # already folded into body above, and leaving it set would make
+                # the builder re-read the un-augmented file and win.
+                message, message_file = body, None
+        elif REPLY_CITATION_PREFIX not in body:
+            _log("--category reply requires --in-reply-to '<what he asked, and when>'. "
+                 "reply is an ALWAYS_SEND category, so the citation is the only thing "
+                 "separating an answer he asked for from a re-send of a message the "
+                 "routing gate refused (guard-4722). If this is not an answer to "
+                 "something he asked, use a different category.")
+            return RC_USAGE
 
     # 1. routing gate
     suppress, reason, destination = route_check(category, subject, body)
@@ -262,6 +302,11 @@ def main(argv=None) -> int:
                     help="stdin carries an already-built payload JSON (from notify-build-payload.py); "
                          "subject/body/category are derived from it")
     ap.add_argument("--goal-id", default="")
+    ap.add_argument("--in-reply-to", default="",
+                    help="REQUIRED with --category reply: what the user asked, and when "
+                         "(e.g. \"your 2026-08-15 email 'send me an email with exact "
+                         "instructions'\"). Appended to the message body, so it reaches him, "
+                         "the routing gate and the outreach ledger.")
     ap.add_argument("--allow-duplicate", default=os.environ.get("EMAIL_SEND_ALLOW_DUPLICATE", ""),
                     help="send even if prior outreach exists; state WHAT IS NEW (recorded)")
     ap.add_argument("--builder-arg", action="append", default=[],
@@ -290,7 +335,8 @@ def main(argv=None) -> int:
                     message_file=args.message_file, payload=payload, goal_id=args.goal_id,
                     allow_duplicate=args.allow_duplicate, builder_args=args.builder_arg,
                     world=Path(args.world) if args.world else None,
-                    mirror_peers=not args.no_mirror_peers, dry_run=args.dry_run)
+                    mirror_peers=not args.no_mirror_peers, dry_run=args.dry_run,
+                    in_reply_to=args.in_reply_to)
 
 
 if __name__ == "__main__":

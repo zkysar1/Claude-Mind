@@ -116,13 +116,39 @@ The build roadmap's value spine (Steps 2.1-2.3) defines three transitions:
 
 ### Current status (honest)
 
-`COMMONS_POLICY` is defined in `.env.example` with value `private`.
-As of 2026-06-02, no code file reads or branches on this variable. The
-generalization engine exists (11 modules, 77 tests in Lodestar-Web-App)
-but has zero production callers. The T1/T2/T3 transitions above are design
-targets, not built features. Every world today is effectively private -- not
-because the private tier is enforced in code, but because the selective and
-public tiers do not yet exist.
+`COMMONS_POLICY` is declared in `.env.example` (value `private`) as of
+2026-08-25 -- it was NOT there before that date, though this section claimed it
+was since 2026-06-02. Measured on cc-04: the key was absent from BOTH
+`.env.example` and `.env.local`, so the dial could only ever be the fail-closed
+default. Do not re-derive a status claim from this section without re-grepping.
+
+First live consumer wired 2026-08-25 (g-368-09): `bring-up-doctor.sh` section 3
+resolves the dial through the `_paths.py` SSOT and branches on it -- it FAILS
+when a value is declared in `.env.local` but resolves to something else, which
+is the silent case (`COMMONS_POLICY=selectve` fails closed to `private` and
+nothing else in the fleet would tell you).
+
+**T1 IS UNIMPLEMENTED. There is no file to point at, and that is deliberate**
+(g-368-24, 2026-08-25). `core/scripts/experience-pipe.sh` used to sit here
+looking like the T1 hook; it was REMOVED after both halves of that appearance
+were re-measured false: it was registered in NO settings file and had zero
+invokers anywhere in the repo (it had never executed), and it gated on
+`MIND_COMMONS_POLICY` / `shared|open` -- the PRODUCT-side value-spine switch
+(rb-1541, `lib/commons/policy.ts`), a different variable with an incompatible
+vocabulary that appears in no Mind-repo code at all. So `COMMONS_POLICY=selective`
+could never fire it, at any value. Do NOT read its absence as a regression and do
+NOT re-create it: the forward path is not a file, it is an authorization.
+Registering it would have armed `npm run pipe` in a sibling repo -- live knowledge
+egress -- behind three gates none of which is agent-provisionable (the product
+dial is unset; enabling is recorded as gated on Gate B GO + a commons-table IAM
+grant; and the engine it feeds has zero production callers). Full evidence,
+restore command, and a byte-verified copy of the removed file: **rb-9216**.
+
+The generalization engine exists (11 modules, 77 tests in Lodestar-Web-App) but
+has zero production callers. The T1/T2/T3 transitions above are design targets,
+not built features. Every world today is effectively private -- not because the
+private tier is enforced in code, but because the selective and public tiers do
+not yet exist.
 
 ### Rules
 
@@ -157,12 +183,61 @@ Step 3.3. Summary:
 
 ### Current status (honest)
 
-The GRANT entity does not exist in any hosted-store schema. The guardrails are
-design artifacts documented in the pearl and roadmap, not built enforcement
-mechanisms. The first concrete cross-world influence instance (this world
-feeding aspirations to a sibling Mind world via board cross-post) uses lightweight
-guardrails only (G2 sandbox metadata + G3 human approval + G4 rate limit),
-with full RT2 hardening (G1-G5) planned for build roadmap Step 3.3.
+The GRANT entity now EXISTS as a schema with enforcement (g-368-10, 2026-08-27).
+This paragraph said "does not exist in any hosted-store schema" until then; that
+claim is retired rather than softened, on the same discipline g-368-09 applied to
+the `COMMONS_POLICY` claim two sections up -- a false statement inside a section
+titled "Current status (honest)" is the worst place in the file for one.
+
+**What is BUILT** -- `core/scripts/_grants.py` (pure SSOT, no `_fileops` import,
+so it can never bind a caller's storage backend) with 28 tests in
+`core/scripts/tests/test_grants.py`:
+
+| Field | Meaning |
+|---|---|
+| `grant_id` | stable id for the edge |
+| `from_env` / `to_env` | the directed influence edge, both `environment_id`s from `core/config/environments/` |
+| `status` | `active` gates the grant; anything else denies |
+| `approved_by` / `approved_at` | G3 human approval; an `agent:`/`bot:`/`system:` prefix is refused |
+| `origin_env` | G5 provenance; must equal `from_env` |
+
+- `evaluate(from_env, to_env, store_path)` -- the caller entry point.
+- `check_influence()` -- pure policy over loaded grants; matches only a DIRECT
+  edge, so **G4 no-transitive is unrepresentable rather than merely forbidden**.
+- `validate_new_grant()` -- G3 approval + G4 cycle detection + G5 origin match,
+  all at CREATION time.
+- `stamp_provenance()` -- G5; returns a new dict, never mutates its input.
+
+**The verdict split that matters** (guard-142 vs G1 -- trivially confusable, and
+collapsing them breaks the gate in whichever direction the author picked):
+`DENY` means the store READ FINE and policy says no (G1 default-private working);
+`UNAVAILABLE` means the gate's OWN dependency failed and the caller fails OPEN.
+An empty-but-readable store, and an ABSENT store file, are both `DENY` -- a world
+that was never granted anything correctly has no store, and returning
+`UNAVAILABLE` there would turn default-private into default-public.
+
+**What is WIRED**: G5 provenance is live on the real outbound influence path --
+`peer_board_post.build_record()` stamps `origin_env`, `influence_chain`,
+`source_trace_ids`, `contributor_ids` onto the record THE PEER RECEIVES (not a
+local log -- guard-3221). Pinned by a producer-coupling test plus a negative
+control, mutation-verified 2026-08-27 (unconditional-stamp mutant fails the
+control; revert passes).
+
+**What is deliberately NOT ARMED**: no caller REFUSES on a `DENY` yet. Arming is
+a successor decision, not an oversight -- G1 starts every world at zero grants,
+so switching refusal on today would instantly sever the cross-deployment board
+channel that has been live since 2026-06-02. The order is: seed the grants that
+describe existing relationships, THEN arm. Successors: g-368-11 (subtree-granular
+grants), g-368-12 (generalization engine).
+
+**Retirement criterion** (guard-769, recorded at birth): retire this entity if
+the fleet consolidates to a single world, or if cross-world influence moves to a
+transport that carries its own authorization. The telemetry that would show it is
+safe to remove: zero `evaluate()` calls and an empty grant store across all
+registered environments for a full promotion cycle.
+
+G2 remains out of scope for the grant edge by design -- it is enforced by the
+target world's execution sandbox, not by the authorization record.
 
 ## Environment Variables in `.env.example`
 

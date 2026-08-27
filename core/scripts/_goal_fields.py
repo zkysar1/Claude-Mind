@@ -148,6 +148,16 @@ GOAL_KNOWN_FIELDS = frozenset({
     'preconditions',                     # 3
     'priority',                          # 2791
     'progress_note',                     # 262
+    'pull_signal',                       # 0 — NEW 2026-08-23 (g-115-6590).
+    #   Zero observations is CORRECT, and is exactly why it was missing: this
+    #   allowlist was derived 2026-08-18 from a census of keys OBSERVED on live
+    #   goals, while `pull_signal`'s CONSUMER (goal-selector apply_pull_boost)
+    #   had shipped 2026-08-17 with no producer — so no goal carried the key and
+    #   the census could not see it. A census-derived allowlist is structurally
+    #   blind to any read-only field whose writer has not shipped yet. Registering
+    #   it here is the refusal message's own prescribed remedy ('register it in
+    #   _goal_fields.py in the same change that ships its writer'), and this
+    #   change ships that writer: core/scripts/pull-signal-set.sh.
     'recurring',                         # 160
     'recurring_interval_hours',          # 2
     'references',                        # 1

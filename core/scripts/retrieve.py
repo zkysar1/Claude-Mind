@@ -38,7 +38,10 @@ rules are short AND are the actionable content.
      per call) regardless of category — the audit found ~75% had
      utilization_score=0. Counter-bump gating was already category-filtered
      since 2026-04-23; the result-filter (P0 #1) brings the returned set
-     into alignment.
+     into alignment. Since g-115-7318 the LAST `relevance_reserved_slots`
+     of that cap are reserved for the strongest query-token matches, because
+     a pure utility cut is unreachable for any freshly-encoded entry (see
+     `_relevance_floor`).
 
 Experiences are governed by EXP_LIMITS (10/15/25). Beliefs and
 experiential_index remain unfiltered/uncapped — beliefs are tiny and
@@ -1018,7 +1021,24 @@ def _entry_matches_text(entry, categories):
     """
     if not categories:
         return False
-    # Build a token corpus from the entry's text fields.
+    return _query_overlap(entry, categories) >= _TEXT_FALLBACK_MIN_OVERLAP
+
+# Admission threshold for the text fallback: >=2 distinct length->=5 query tokens.
+# Named because _relevance_floor must sit STRICTLY ABOVE it — a floor that fired
+# at the admission threshold would reserve slots for bare-minimum accidental
+# matches, which on the live corpus are 370 of 431 candidates (measured
+# g-115-7318).
+_TEXT_FALLBACK_MIN_OVERLAP = 2
+
+
+def _entry_token_corpus(entry):
+    """Lowercased token SET of an rb/guardrail/pattern-signature entry's
+    searchable text fields.
+
+    Extracted from `_entry_matches_text` (g-115-7318) because the relevance
+    floor needs the same corpus. Two live call sites — the boolean predicate
+    and `_query_overlap` — so this is not a single-use abstraction.
+    """
     parts = []
     for field in ("title", "content", "rule", "summary"):
         v = entry.get(field)
@@ -1035,23 +1055,41 @@ def _entry_matches_text(entry, categories):
         elif isinstance(cond, str):
             parts.append(cond)
     if not parts:
-        return False
+        return set()
     corpus = " ".join(parts).lower()
     if not corpus:
-        return False
-    corpus_tokens = set(_TEXT_FALLBACK_TOKEN_RE.findall(corpus))
-    if not corpus_tokens:
-        return False
+        return set()
+    return set(_TEXT_FALLBACK_TOKEN_RE.findall(corpus))
+
+
+def _query_overlap(entry, categories, corpus_tokens=None):
+    """How many DISTINCT length->=5 query tokens the entry's text actually carries.
+
+    This is the number `_entry_matches_text` used to compute and then THROW AWAY
+    at the `>= 2` boolean. Discarding it is the whole mechanism behind g-115-7318:
+    a 2-token accidental match and an 8-token exact match arrive at the cap
+    indistinguishable, so the cap is decided purely by utilization and a new
+    entry at utilization 0.0 can never win a slot.
+
+    MAX over the query strings, not sum — `_entry_matches_text` treats them as
+    ALTERNATIVES (any one clearing the threshold admits), so the strongest single
+    query is the entry's relevance. max >= 2 iff any >= 2, which is what keeps
+    the extracted predicate byte-equivalent to the pre-extraction one.
+    """
+    ct = _entry_token_corpus(entry) if corpus_tokens is None else corpus_tokens
+    if not ct or not categories:
+        return 0
+    best = 0
     for q in categories:
         if not isinstance(q, str) or not q:
             continue
         q_tokens = set(_TEXT_FALLBACK_TOKEN_RE.findall(q.lower()))
         if not q_tokens:
             continue
-        matched = sum(1 for t in q_tokens if len(t) >= 5 and t in corpus_tokens)
-        if matched >= 2:
-            return True
-    return False
+        n = sum(1 for t in q_tokens if len(t) >= 5 and t in ct)
+        if n > best:
+            best = n
+    return best
 
 def _entry_matches(entry, categories):
     """Combined supplementary-store predicate: strict category match first,
@@ -1506,6 +1544,114 @@ def _sort_by_utility(entries, counters=None):
     entries.sort(key=_key, reverse=True)
     return entries
 
+
+def _relevance_floor(ranked, categories, cap):
+    """Reserve the first `relevance_reserved_slots` cap slots for the entries
+    with the strongest QUERY-TOKEN OVERLAP that the utility cut would drop.
+
+    THE DEFECT (g-115-7318, measured 2026-08-23/24). Supplementary stores are
+    admitted by a BOOLEAN (`_entry_matches`) and then ordered by UTILITY alone,
+    so relevance is discarded at the door. On the live guardrail corpus 3,087 of
+    4,702 records carry utilization_score > 0, so a freshly-encoded entry at 0.0
+    cannot win a slot at any cap -- and it cannot earn utilization without being
+    returned. Deadlock. Measured: guard-4838 ranked 377 of 431 on the query its
+    OWN consumers are instructed to run; guard-4902 ranked 27 of 932 on verbatim
+    text from its own rule field (cap shallow=20). 366 of the 431 and 757 of the
+    932 had nonzero utility.
+
+    WHY THE AXIS IS RELEVANCE, NOT RECENCY. The goal proposed reserving slots for
+    recently-created entries. Measured and FALSIFIED: guard-4838 was the 13th
+    NEWEST of the entries matching its own consumer query, so a 1-2 slot recency
+    floor promotes three unrelated newer guardrails and still never delivers it.
+    Relevance is the axis the ranking actually discards -- for that query 370 of
+    431 candidates cleared the bare `>= 2` admission threshold while guard-4838
+    matched all 5 query tokens, and a relevance floor takes it from 377 to 1.
+
+    THE SHAPE IS THE SIBLING'S. This is `cosine_reserved_slots` (g-306-93) for
+    the supplementary lane: reserve the top-N by relevance, leave the other
+    (cap - N) slots ranked exactly as before. It needs NO embedding index -- the
+    overlap count is already computed by the admission predicate -- which is why
+    it ships DEFAULT ON while `embedding_blend_enabled` stays off. Bounded
+    displacement is what keeps the "no known-good knowledge hidden" property
+    honest: the (cap - N) highest-utility matches are untouched by construction.
+    Measured over 120 recent goal titles (the real `--goal-title` traffic): the
+    floor fired on 113, promoted entries at overlap median 5 / max 13, and the
+    entries it displaced sat at utility median 0.2857 against a corpus max of
+    0.8795 -- the bottom three of the top twenty, never the canon.
+
+    NOT gated on `as_of`, deliberately -- and that is where it diverges from its
+    two neighbours in every call site. `_embedding_blend` skips historical reads
+    because it ranks yesterday's records against TODAY's semantic index. This
+    floor reads only the query string and the entry's own stored text, so it is
+    exactly as valid at T as it is now; skipping it would hand point-in-time
+    reads the worse ranking.
+
+    A strict no-op when nothing is being cut (`len(ranked) <= cap`): the floor
+    exists to fix EXCLUSION, not to re-order a result that is returned whole.
+    That keeps `load_pattern_signatures` (~5 active records) byte-identical.
+
+    A RESERVED SLOT IS EARNED BY A STRICT RELEVANCE GAIN, never by eligibility
+    alone: a candidate is promoted only when its overlap is strictly greater
+    than that of the entry it displaces. Ties go to the incumbent, which is both
+    equally relevant and better proven.
+
+    THREE SLOT MECHANISMS NOW EXIST AND THEY ARE NOT INTERCHANGEABLE — say which
+    lane you mean before touching any of them. `cosine_reserved_slots` reserves
+    TREE slots by cosine; `_universal_relevance_split` / `universal_relevance_slots`
+    splits the UNIVERSAL-RB cap by cosine; this one reserves DOMAIN supplementary
+    slots by token overlap. The first two need the embedding index and are gated
+    behind `embedding_blend_enabled` (off), so on a box with no index they are
+    inert — which is precisely the hole this one fills, and why it must never be
+    folded into either.
+    """
+    if cap <= 0 or len(ranked) <= cap:
+        return ranked
+    cfg = _load_retrieval_config()
+    # try/except-to-default on both reads, mirroring _universal_relevance_split:
+    # a hand-edited tree.yaml with a non-numeric value must degrade to the
+    # documented default, never raise inside a retrieval call.
+    try:
+        slots = int(cfg.get("relevance_reserved_slots", 3))
+    except (TypeError, ValueError):
+        slots = 3
+    slots = max(0, min(slots, cap))
+    if slots == 0:
+        return ranked
+    # STRICTLY above the admission threshold: at the threshold the floor would
+    # reserve slots for bare-minimum accidental matches (370 of 431, measured).
+    try:
+        min_ov = int(cfg.get("relevance_floor_min_overlap", 3))
+    except (TypeError, ValueError):
+        min_ov = 3
+    if min_ov <= _TEXT_FALLBACK_MIN_OVERLAP:
+        min_ov = _TEXT_FALLBACK_MIN_OVERLAP + 1
+    overlaps = [_query_overlap(r, categories) for r in ranked]
+    pool = sorted((i for i in range(cap, len(ranked)) if overlaps[i] >= min_ov),
+                  key=lambda i: (-overlaps[i], i))
+    # STRICTLY GREATER than the entry it displaces, or no promotion. Clearing
+    # min_ov makes a candidate ELIGIBLE; it does not make the swap an
+    # IMPROVEMENT. Where a candidate ties the entry it would push out, the two
+    # are equally relevant and the incumbent additionally has more utilization —
+    # so the swap is pure churn, and it costs a strictly better record its slot.
+    # Caught by test_embedding_blend's cap-after-widen pin, which builds 21
+    # equal-overlap guardrails around one cosine-widened entry: without this
+    # test the floor evicted the widened entry for the two LOWEST-utility of the
+    # 21 identical matches.
+    promo = []
+    for cand in pool[:slots]:
+        displaced = cap - 1 - len(promo)
+        if displaced < 0 or overlaps[cand] <= overlaps[displaced]:
+            break
+        promo.append(cand)
+    if not promo:
+        return ranked
+    promo_set = set(promo)
+    keep = cap - len(promo)
+    head = [ranked[i] for i in promo] + ranked[:keep]
+    tail = [r for i, r in enumerate(ranked) if i >= keep and i not in promo_set]
+    return head + tail
+
+
 def load_reasoning_bank(categories, depth="medium", read_only=False, entry_type=None,
                         as_of=None):
     """Load active reasoning bank entries, partitioned into domain + universal.
@@ -1586,6 +1732,12 @@ def load_reasoning_bank(categories, depth="medium", read_only=False, entry_type=
     if as_of_dt is None:
         domain = _embedding_blend(domain, active, categories,
                                   exclude=is_universal_rb)
+    # g-115-7318: reserve a bounded number of cap slots for the strongest
+    # token-overlap matches. OUTSIDE the as_of guard above on purpose — it reads
+    # only the query and the entry's own text, so it is valid at any T (see
+    # _relevance_floor). AFTER the blend so the blend's re-rank cannot undo it,
+    # BEFORE the cap so the bump-set == return-set invariant below still holds.
+    domain = _relevance_floor(domain, categories, cap)
     domain = domain[:cap]
     sort_universal_rbs(universal, _rb_counters)
     # g-306-86: flag-gated relevance split of the universal cap. as_of reads
@@ -1668,6 +1820,9 @@ def load_guardrails(categories, depth="medium", read_only=False, as_of=None):
     # g-306-77 b2: flag-gated embedding hybrid — see load_reasoning_bank.
     if as_of_dt is None:
         filtered = _embedding_blend(filtered, active, categories)
+    # g-115-7318 — see the sibling comment in load_reasoning_bank. Unconditional
+    # by design; the bump below still keys off the post-cap list.
+    filtered = _relevance_floor(filtered, categories, cap)
     filtered = filtered[:cap]
 
     if not read_only and as_of_dt is None:
@@ -1712,6 +1867,10 @@ def load_pattern_signatures(categories, depth="medium", read_only=False, as_of=N
     # _check_kind would raise. This lane keeps reading the embedded field, which
     # is correct rather than a gap: nothing splits these counters out.
     _sort_by_utility(filtered)
+    # g-115-7318 — same floor as the two sibling lanes. A strict no-op here
+    # today: this corpus is far below the cap, and the floor returns unchanged
+    # whenever nothing is being cut.
+    filtered = _relevance_floor(filtered, categories, cap)
     filtered = filtered[:cap]
 
     if not read_only and as_of_dt is None:
@@ -2082,6 +2241,19 @@ _DEFAULT_RETRIEVAL_CFG = {
     # (limit - N) slots are ranked. 0 disables (byte-identical to pre-g-306-93).
     # Only active on the real-embedding path; the TF-IDF fallback is untouched.
     "cosine_reserved_slots": 3,
+    # Supplementary-store relevance floor (g-115-7318). The supplementary lane's
+    # analogue of cosine_reserved_slots above, using the token-overlap count the
+    # admission predicate already computes instead of a cosine — so it needs no
+    # embedding index and ships DEFAULT ON. Reserve the top-N cap slots for the
+    # strongest QUERY-TOKEN matches that the utility cut would drop; the other
+    # (cap - N) slots keep the pure utility order. 0 disables (byte-identical to
+    # pre-g-115-7318). See _relevance_floor for the measurements.
+    "relevance_reserved_slots": 3,
+    # Minimum distinct length->=5 query-token overlap for a floor slot. Clamped
+    # in-code to strictly above _TEXT_FALLBACK_MIN_OVERLAP (2) — at the
+    # admission threshold the floor would fire on bare-minimum accidental
+    # matches, which are 370 of 431 candidates on the live corpus.
+    "relevance_floor_min_overlap": 3,
     # Poignancy blend (g-306-08, BRD Gap 1a). DEFAULT OFF — mirrors
     # core/config/tree.yaml retrieval:. When false, _poignancy_weight() returns
     # 1.0 for every record and ranking is identical to pre-g-306-08.

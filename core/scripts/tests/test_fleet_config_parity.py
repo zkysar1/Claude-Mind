@@ -1358,5 +1358,138 @@ def test_manifest_body_boxes_do_not_perturb_roster_parity():
     assert {n["host"] for n in nodes} >= {"cc-07", "cc-08"}
 
 
+# ---------------------------------------------------------------------------
+# MACHINE_ID uniqueness across live boxes ()
+#
+# The incident: cc-13 and cc-14 both carried MACHINE_ID=cc-10 from a cloned
+# .env.local. NEITHER was in fleet-manifest.yaml, so the per-node
+# `MACHINE_ID == host` check in (a) could not see them — a human found the
+# duplicate. These fixtures therefore use hosts OUTSIDE the manifest on purpose:
+# a fixture built from manifest nodes would pass against a manifest-derived
+# implementation and prove nothing about the shape that actually occurred.
+# ---------------------------------------------------------------------------
+
+def _muniq(monkeypatch, boxes, machine_ids, *, fleet_complete=True, meta=None):
+    m = meta or {"complete": True, "read_via": "authoritative", "reason": None}
+    m = dict(m, machine_ids=dict(machine_ids))
+    monkeypatch.setattr(
+        fcp, "_live_boxes",
+        lambda agents_root_dir=None: (dict(boxes), m))
+    return fcp._machine_id_uniqueness(fleet_complete=fleet_complete)
+
+
+def test_duplicate_machine_id_across_two_live_boxes_is_DRIFT(monkeypatch):
+    """THE INCIDENT, replayed on its own axis, with unlisted hosts."""
+    boxes = {"cc-10": _FRESH, "cc-13": _FRESH, "cc-14": _FRESH}
+    mu = _muniq(monkeypatch, boxes,
+                {"cc-10": "cc-10", "cc-13": "cc-10", "cc-14": "cc-10"})
+    assert mu["checked"] is True
+    assert any("DUPLICATE-MACHINE-ID" in d and "cc-10" in d for d in mu["drift"]), (
+        "three boxes on one MACHINE_ID must be DRIFT: %r" % (mu["drift"],))
+    assert not mu["info"], (
+        "a live collision must not be downgraded to INFO: %r" % (mu["info"],))
+
+
+def test_distinct_machine_ids_produce_no_drift(monkeypatch):
+    """ANTI-VACUITY. Without this, every assertion above is satisfied by a
+    function that returns drift unconditionally."""
+    boxes = {"cc-10": _FRESH, "cc-13": _FRESH, "cc-14": _FRESH}
+    mu = _muniq(monkeypatch, boxes,
+                {"cc-10": "cc-10", "cc-13": "cc-13", "cc-14": "cc-14"})
+    assert mu["checked"] is True
+    assert mu["drift"] == [], "a healthy fleet must produce no drift: %r" % (mu["drift"],)
+
+
+def test_empty_machine_id_is_skipped_not_collided(monkeypatch):
+    """rt_spawn unsets MACHINE_ID, so several carriers legitimately publish "".
+
+    Those must NOT be read as all sharing the empty identity — that would fire on
+    every fleet with two spawn-path carriers and train readers to ignore the line.
+    """
+    boxes = {"cc-10": _FRESH, "cc-13": _FRESH, "cc-14": _FRESH}
+    mu = _muniq(monkeypatch, boxes, {"cc-10": "cc-10", "cc-13": "", "cc-14": ""})
+    assert mu["drift"] == [], "empty ids must be skipped, not collided: %r" % (mu["drift"],)
+
+
+def test_collision_with_only_one_live_box_is_INFO_not_drift(monkeypatch):
+    """A retired box's stale carrier must not raise the alarm forever."""
+    stale = (datetime.now() - timedelta(hours=fcp._BOX_LIVE_WINDOW_HOURS + 5)).isoformat(
+        timespec="seconds")
+    boxes = {"cc-10": _FRESH, "cc-13": stale}
+    mu = _muniq(monkeypatch, boxes, {"cc-10": "cc-10", "cc-13": "cc-10"})
+    assert mu["drift"] == [], "only one live box is not an active collision: %r" % (mu["drift"],)
+    assert any("cc-10" in i for i in mu["info"]), (
+        "a stale collision must still be reported as INFO: %r" % (mu["info"],))
+
+
+def test_carrier_stamped_right_now_still_counts_as_live(monkeypatch):
+    """REGRESSION (found reviewing this function's own diff).
+
+    `_age_hours` returns 0.0 for a carrier written this second, and 0.0 is FALSY.
+    The `(_age_hours(...) or BIG) <= WINDOW` idiom therefore classified the
+    freshest possible carrier as stale — downgrading the single most urgent
+    collision, two boxes ticking right now, from DRIFT to INFO. The other
+    live/stale tests all use timestamps minutes or hours old and pass either way,
+    so only an exactly-now fixture can catch it.
+    """
+    nowish = datetime.now().isoformat(timespec="seconds")
+    boxes = {"cc-13": nowish, "cc-14": nowish}
+    mu = _muniq(monkeypatch, boxes, {"cc-13": "cc-10", "cc-14": "cc-10"},
+                meta={"complete": True, "read_via": "authoritative", "reason": None})
+    assert any("DUPLICATE-MACHINE-ID" in d for d in mu["drift"]), (
+        "a collision between two just-ticked boxes must be DRIFT, not INFO: "
+        "drift=%r info=%r" % (mu["drift"], mu["info"]))
+
+
+def test_incomplete_enumeration_is_not_a_pass(monkeypatch):
+    """guard-1760: 'could not bound the fleet' must never render as 'no duplicates'."""
+    mu = _muniq(monkeypatch, {}, {},
+                meta={"complete": False, "read_via": "none", "reason": "backend down"})
+    assert mu["checked"] is False
+    assert mu["reason"] == "backend down"
+    assert mu["drift"] == []
+
+
+def test_node_filtered_run_does_not_claim_uniqueness(monkeypatch):
+    """A subset run cannot speak for the fleet."""
+    mu = _muniq(monkeypatch, {"cc-13": _FRESH}, {"cc-13": "cc-10"}, fleet_complete=False)
+    assert mu["checked"] is False
+    assert "node-filtered" in (mu["reason"] or "")
+
+
+def test_machine_id_uniqueness_requires_fleet_complete_keyword():
+    with pytest.raises(TypeError):
+        fcp._machine_id_uniqueness()
+
+
+def test_live_boxes_exposes_machine_ids_without_changing_its_return_shape(monkeypatch):
+    """_box_parity destructures the (dict, meta) pair — the new data rides in meta.
+
+    Also pins that the id comes from the NEWEST carrier for that host, not from
+    whichever row happened to be enumerated last.
+    """
+    rows = [
+        {"doc": {"host": "cc-13", "ts": "2026-08-24T01:00:00", "machine_id": "cc-10"}},
+        {"doc": {"host": "cc-13", "ts": "2026-08-24T09:00:00", "machine_id": "cc-13"}},
+        {"doc": {"host": "cc-14", "ts": "2026-08-24T09:00:00", "machine_id": "cc-10"}},
+    ]
+    monkeypatch.setattr(
+        fcp, "enumerate_carriers" if hasattr(fcp, "enumerate_carriers") else "_noop",
+        lambda *a, **k: (rows, {"complete": True, "read_via": "authoritative"}),
+        raising=False)
+    import worker_stall
+    monkeypatch.setattr(worker_stall, "enumerate_carriers",
+                        lambda *a, **k: (rows, {"complete": True,
+                                                "read_via": "authoritative",
+                                                "reason": None}))
+    boxes, meta = fcp._live_boxes(Path("."))
+    assert isinstance(boxes, dict) and isinstance(meta, dict)
+    assert boxes["cc-13"] == "2026-08-24T09:00:00"
+    assert meta["machine_ids"]["cc-13"] == "cc-13", (
+        "must take the id from the NEWEST carrier: %r" % (meta["machine_ids"],))
+    assert meta["machine_ids"]["cc-14"] == "cc-10"
+
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

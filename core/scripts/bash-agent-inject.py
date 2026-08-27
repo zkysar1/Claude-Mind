@@ -506,6 +506,23 @@ def main():
                 # export mislabels the reducer as a worker and the store rails
                 # would suppress reducer-only writes. Any change to who gets a
                 # body-WM-file MUST revisit this line and the rails keyed on it.
+                # THE RAILS, ENUMERATED — an unnamed rail does not get revisited,
+                # which is the whole point of writing them down (, from
+                # fresh-eyes-code F-1 on the  diff):
+                #   (a) this export (BODY_ROLE=worker) and the store rails it feeds;
+                #   (b) core/scripts/stop-hook.sh `_BODY_WM` (~L292) — the worker-net
+                #       that queues a Body for merge at turn-end. Added by 29af94108
+                #       and keyed on the SAME predicate in a different file.
+                # (b)'s blast radius is NARROWER than (a)'s and the difference is
+                # structural, not incidental: it sits INSIDE the sid-mismatch guard,
+                # so a REDUCER can never reach it whatever its WM state — the
+                # mislabel-the-reducer failure this comment fears for (a) is
+                # impossible for (b). The residual is OBSERVER sessions, which ARE
+                # sid-mismatched: were an observer ever to gain a body-WM-file, the
+                # net would BLOCK its turn-end in a loop. That cannot happen today
+                # because the file is created by /start FORK-BODY only, for a
+                # non-reducer Body, and an observer session forks no Body — so if
+                # you change EITHER of those two facts, (b) is what breaks.
                 _body_state_dir = _body_wm.parent
                 body_clause = (f'export BODY_WM_PATH="{_body_wm.as_posix()}"; '
                                'export BODY_ROLE=worker; ')

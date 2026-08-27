@@ -585,3 +585,127 @@ def test_the_gauntlet_reasserts_the_clone_at_verify_time():
     assert "PARTIAL" in gauntlet, (
         "a citation from a behind>0 clone must be capped at PARTIAL, not "
         "allowed to pass as VERIFIED")
+
+
+# ------------------------------------------------- --check-read ()
+#
+# The class `--pull` deliberately declines: a checkout parked on a FEATURE
+# BRANCH. It cannot be fast-forwarded into safety, because advancing the branch
+# leaves the tree still missing origin/<default>'s content — so `--pull` reports
+# it and moves on, and nothing then stops the next unit grepping it and banking
+# the miss. Measured 2026-08-26 on cc-08: 16 of 63 repos off-default, including
+# the exact repo whose stale read filed .
+
+def test_check_read_flags_an_off_default_checkout_as_a_read_hazard(tmp_path):
+    origin, clone = tmp_path / "o", tmp_path / "Prod"
+    _init_repo(origin)
+    _clone(origin, clone)
+    subprocess.run(["git", "-C", str(clone), "checkout", "-qb", "feature/x"],
+                   check=True)
+
+    rec = PRF.check_read(clone / "f.txt", enumerated=[clone])
+
+    assert rec["in_product_repo"] is True
+    assert rec["safe"] is False, "a feature-branch checkout is not a safe read"
+    assert rec["action"] == "skipped-off-default"
+    # The remedy must name the AUTHORITATIVE ref, not the local branch — that
+    # substitution is the entire content of guard-5217.
+    assert "origin/main:f.txt" in rec["remedy"]
+    assert "show" in rec["remedy"]
+
+
+def test_check_read_calls_an_on_default_matching_checkout_safe(tmp_path):
+    origin, clone = tmp_path / "o", tmp_path / "Prod"
+    _init_repo(origin)
+    _clone(origin, clone)
+
+    rec = PRF.check_read(clone / "f.txt", enumerated=[clone])
+
+    assert rec["safe"] is True
+    assert rec["verdict"] == "safe-matches-origin"
+    assert rec["remedy"] is None
+
+
+def test_check_read_declines_to_judge_a_path_outside_the_product_estate(tmp_path):
+    """Not-a-product-repo is a DECLINE, not a pass.
+
+    The Mind framework repo is itself a git repo, so a naive walk-up would
+    report on it. `_repo_for_path` requires ENUMERATED membership, and the
+    rendering says out loud that no claim was made — guard-1760: a checker must
+    not report what it declined to look at as a pass.
+    """
+    outside = tmp_path / "elsewhere" / "x.py"
+    outside.parent.mkdir(parents=True)
+    outside.write_text("x\n")
+
+    rec = PRF.check_read(outside, enumerated=[])
+
+    assert rec["in_product_repo"] is False
+    assert rec["verdict"] == "not-a-product-repo"
+    assert "NOT an all-clear" in PRF.render_check_read(rec)
+
+
+def test_check_read_fetches_BEFORE_judging_so_the_behind_count_is_real(tmp_path):
+    """The design's load-bearing assertion, and the reason this cannot just
+    delegate to `pull_status`.
+
+    `pull_status` returns on the off-default rung BEFORE it fetches, so its
+    behind-count is measured against whatever `origin/<default>` happened to be
+    on disk. A zero from an unfetched remote-tracking ref is byte-identical to
+    a genuine zero (guard-4280).
+
+    Here origin advances AFTER the clone, so the clone's stored
+    `origin/main` knows nothing about it. The no-fetch path must therefore
+    report 0 behind and the fetching path must report 1 — proving the fetch is
+    what makes the number mean anything. Asserting only the fetching leg would
+    stay green against a version that never fetched at all (guard-1220).
+    """
+    origin, clone = tmp_path / "o", tmp_path / "Prod"
+    _init_repo(origin)
+    _clone(origin, clone)
+    subprocess.run(["git", "-C", str(clone), "checkout", "-qb", "feature/x"],
+                   check=True)
+    _commit(origin, "c2")          # origin moves; the clone has not fetched
+
+    stale = PRF.check_read(clone / "f.txt", do_fetch=False, enumerated=[clone])
+    assert stale["behind"] == 0, "unfetched ref cannot see origin's new commit"
+
+    fresh = PRF.check_read(clone / "f.txt", interval_min=0, enumerated=[clone])
+    assert fresh["behind"] == 1, "fetch-first is what makes behind trustworthy"
+    # Both are hazards; the DIFFERENCE is whether the number can be believed.
+    assert stale["safe"] is False and fresh["safe"] is False
+
+
+def test_check_read_advances_a_behind_on_default_checkout_then_calls_it_safe(tmp_path):
+    """Remedy (b) — fetch the specific repo it is about to read — actuated.
+
+    An on-default clone that is merely behind IS fixable, so the probe fixes it
+    rather than merely warning: it fast-forwards and returns safe. This is the
+    half that keeps the gate from being pure friction.
+    """
+    origin, clone = tmp_path / "o", tmp_path / "Prod"
+    _init_repo(origin)
+    _clone(origin, clone)
+    _commit(origin, "c2")
+
+    rec = PRF.check_read(clone / "f.txt", interval_min=0, enumerated=[clone])
+
+    assert rec["action"] == "pulled"
+    assert rec["safe"] is True
+    assert "c2" in (clone / "f.txt").read_text(), "tree actually advanced"
+
+
+def test_check_read_exit_code_carries_the_verdict(tmp_path):
+    """The CLI contract callers gate on: 0 = safe, 1 = read hazard."""
+    origin, clone = tmp_path / "o", tmp_path / "Prod"
+    _init_repo(origin)
+    _clone(origin, clone)
+    subprocess.run(["git", "-C", str(clone), "checkout", "-qb", "feature/x"],
+                   check=True)
+
+    import unittest.mock as _m
+    with _m.patch.object(PRF, "enumerate_repos", lambda: [clone]):
+        assert PRF.main(["--check-read", str(clone / "f.txt")]) == 1
+        subprocess.run(["git", "-C", str(clone), "checkout", "-q", "main"],
+                       check=True)
+        assert PRF.main(["--check-read", str(clone / "f.txt")]) == 0

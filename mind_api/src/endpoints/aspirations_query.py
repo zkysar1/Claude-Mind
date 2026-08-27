@@ -104,8 +104,33 @@ _GOAL_FIELD_ALIASES = {"goal_id": "id"}
 _PROJECTION_ONLY_KEYS = ("asp_id", "source")
 
 
+# A caller's boolean spelling, normalized against a field that is GENUINELY bool.
+# `true` is the JSON and YAML spelling and is what the store holds on disk, so
+# before  the natural call was the one input that could never match:
+# `str(True) != "true"` returned [] with rc=0, indistinguishable from a real
+# absence. Reproduced five times across four boxes over 28 days, every catch
+# coming from rb-245 schema-probe habit rather than from the tool.
+_BOOL_TRUE_TOKENS = frozenset(("true", "1", "yes"))
+_BOOL_FALSE_TOKENS = frozenset(("false", "0", "no"))
+
+
+def _bool_input_matches(actual: bool, value: str):
+    """True/False for a recognised boolean spelling; None when `value` is not a
+    boolean spelling at all, so the caller falls back to the repr comparison and
+    a nonsense value matches NOTHING rather than everything."""
+    tok = value.strip().lower()
+    if tok in _BOOL_TRUE_TOKENS:
+        return actual is True
+    if tok in _BOOL_FALSE_TOKENS:
+        return actual is False
+    return None
+
+
 def _goal_matches(goal: Dict[str, Any], status_filter, field_filter, title_substr) -> bool:
-    """AND semantics across filters. Mirror of aspirations.py:_goal_matches."""
+    """AND semantics across filters. Sole implementation — the
+    `aspirations.py:_goal_matches` this once mirrored was deleted in the
+    2026-05-14 daemon-only cutover and no second site exists (g-115-3965).
+    Do NOT re-create a CLI mirror to satisfy the old pointer."""
     if status_filter is not None:
         if goal.get("status") not in status_filter:
             return False
@@ -114,6 +139,17 @@ def _goal_matches(goal: Dict[str, Any], status_filter, field_filter, title_subst
         actual = goal.get(field)
         if isinstance(actual, list):
             if value not in actual:
+                return False
+        elif isinstance(actual, bool):
+            # bool is checked BEFORE any other scalar handling because bool is a
+            # subclass of int. Scoped to genuinely-bool fields ONLY: a STRING
+            # field whose stored value is the text "true" still matches only
+            # "true", so this widens nothing on the string path (guard-958).
+            verdict = _bool_input_matches(actual, value)
+            if verdict is None:
+                if str(actual) != value:
+                    return False
+            elif not verdict:
                 return False
         else:
             if str(actual) != value:
@@ -163,6 +199,35 @@ def query(ctx) -> "Response":  # type: ignore[name-defined]
     field_filter: Tuple[str, str] | None = None
     field_key = None
     if raw_field_name is not None:
+        # PROJECTION-ONLY KEYS ARE REFUSED UNCONDITIONALLY (). Whether
+        # `asp_id`/`source` is a goal field is a STATIC fact about this endpoint's
+        # schema, so deciding it needs no store read — and gating the refusal on
+        # "no record carries this key" is exactly what made it unreachable in
+        # production. Stray literal `asp_id`/`source` fields DO exist on real goal
+        # records (both appear in this endpoint's own 135-name valid-field list),
+        # so `field_key_seen` went True, the refusal below was skipped, and the
+        # query answered HTTP 200 with the handful of stray rows.
+        #
+        # Measured 2026-08-27 (zeta, cc-02): `--goal-field asp_id asp-368` returned
+        # 1 row — a COMPLETED goal — while 4 pending candidates carried that value;
+        # 2026-08-15 the same call for asp-115 returned 4 against a truth of 1477
+        # (0.27%), with `--goal-field status pending` correct at 1772 as the
+        # positive control. Third independent sighting: alpha, 2026-07-29.
+        #
+        # A PLAUSIBLE NON-ZERO is the danger. A zero trips every count-hazard
+        # reflex the framework has; "1 goal" reads as a small aspiration and trips
+        # none, so a caller checking whether work is already owned concludes it is
+        # not — the premise that produces duplicate implementation.
+        if raw_field_name in _PROJECTION_ONLY_KEYS:
+            return Response.error(
+                400, "unknown_goal_field",
+                f"{raw_field_name!r} appears in this endpoint's OUTPUT but is "
+                f"attached during projection — it is not a field of the goal "
+                f"record and cannot be filtered on. Some goal records carry a "
+                f"stray literal {raw_field_name!r}, so filtering on it would "
+                f"return an arbitrary subset rather than an error. To enumerate "
+                f"one aspiration's goals use `aspirations-read.sh --id <asp-id>`.",
+            )
         # Alias BEFORE matching: matching reads the raw record, where the
         # identifier is `id`; `goal_id` only exists after projection.
         field_key = _GOAL_FIELD_ALIASES.get(raw_field_name, raw_field_name)
@@ -298,12 +363,11 @@ def query(ctx) -> "Response":  # type: ignore[name-defined]
         detail += (
             f" All {len(known)} valid field names: {', '.join(sorted(known))}"
         )
-        if raw_field_name in _PROJECTION_ONLY_KEYS:
-            detail += (
-                f". Note {raw_field_name!r} appears in this endpoint's OUTPUT but is "
-                f"attached during projection — it is not a field of the goal record "
-                f"and cannot be filtered on."
-            )
+        # NOTE: a `_PROJECTION_ONLY_KEYS` footnote used to be appended here. It is
+        # gone rather than kept "for safety" (guard-1696): projection-only keys now
+        # return 400 at the top of query() before any store read, so this branch
+        # became unreachable, and an unreachable branch reads as coverage while
+        # signalling nothing. Its wording moved into that early refusal.
         return Response.error(400, "unknown_goal_field", detail)
 
     # cmd_query uses ensure_ascii=True — match byte-for-byte.

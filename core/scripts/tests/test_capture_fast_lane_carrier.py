@@ -511,3 +511,110 @@ def test_push_sends_the_whole_file_so_a_failed_push_self_heals(tmp_path, monkeyp
     shipped = be.files["sid-3-fastlane.jsonl"].decode("utf-8")
     assert "g-A" in shipped and "g-B" in shipped, (
         "the recovered push must carry the entry whose own push failed")
+
+
+# --------------------------------------------------------------------------
+#  — the carrier must not inflate the flagged:total denominator
+# --------------------------------------------------------------------------
+
+def test_carrier_entries_are_excluded_from_the_ratio_denominator(tmp_path, monkeypatch):
+    """The carrier ships ONLY flagged entries, so counting it in the
+    denominator reports flagged/flagged = 100% for every remote Body — a
+    maximally-degraded reading manufactured from a source that simply has no
+    denominator to give.
+
+    Its flagged entries still count in `flagged_seen`; the gap between that and
+    `flagged_measurable` is reported as unmeasurable rather than folded in.
+    """
+    root = _mk_root(tmp_path)
+    # Local Body: 1 flagged of 4 — the only measurable share.
+    d = root / "agents" / AGENT / "sessions" / "local-body"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "working-memory.yaml").write_text(yaml.safe_dump({"slots": {"spark_capture": [
+        _entry("g-1"),
+        _entry("g-2", load_bearing=False),
+        _entry("g-3", load_bearing=False),
+        _entry("g-4", load_bearing=False),
+    ]}}), encoding="utf-8")
+    (d / "body-manifest.yaml").write_text(
+        yaml.safe_dump({"body_state": "active", "unit_key": "local-body"}),
+        encoding="utf-8")
+    # Remote Body reachable only by carrier: 2 flagged, no denominator.
+    be = DivergingBackend({
+        "remote-fastlane.jsonl": _carrier_bytes(
+            "remote", [("spark_capture", _entry("g-9")),
+                       ("spark_capture", _entry("g-10"))]),
+    })
+    monkeypatch.setattr(bmg, "_get_backend", lambda: be)
+
+    s = cfl.fast_lane(AGENT, project_root=root)
+
+    # The share is the LOCAL one, undisturbed by the two carrier entries.
+    assert s["by_slot_ratio"]["spark_capture"] == {"flagged": 1, "total": 4}, s
+    assert s["entries_seen"] == 4, s
+    assert s["flagged_measurable"] == 1, s
+    # ...while the carrier's flagged entries are still SEEN.
+    assert s["flagged_seen"] == 3, s
+    line = cfl.format_line(s)
+    assert "spark_capture 1/4=25%" in line, line
+    assert "+2 carrier-sourced, share unmeasurable" in line, line
+    # Negative control: with no carrier the caveat must be ABSENT, or the
+    # assertion above would pass against any run that merged anything.
+    monkeypatch.setattr(bmg, "_get_backend", lambda: DivergingBackend({}))
+    root2 = _mk_root(tmp_path / "second")
+    d2 = root2 / "agents" / AGENT / "sessions" / "local-body"
+    d2.mkdir(parents=True, exist_ok=True)
+    (d2 / "working-memory.yaml").write_text(yaml.safe_dump({"slots": {"spark_capture": [
+        _entry("g-1"), _entry("g-2", load_bearing=False),
+    ]}}), encoding="utf-8")
+    (d2 / "body-manifest.yaml").write_text(
+        yaml.safe_dump({"body_state": "active", "unit_key": "local-body"}),
+        encoding="utf-8")
+    s2 = cfl.fast_lane(AGENT, project_root=root2)
+    assert s2["flagged_seen"] == s2["flagged_measurable"] == 1, s2
+    assert "unmeasurable" not in cfl.format_line(s2), cfl.format_line(s2)
+
+
+def test_carrier_only_lane_still_reports_that_the_share_is_unmeasurable(
+        tmp_path, monkeypatch):
+    """The CROSS-BOX case: every flagged entry arrived by carrier, so there is
+    no measurable lane at all.
+
+    This sits between the two tests that bracket it — the mixed case above
+    (local measurable + carrier) and the empty-lane negative control in
+    test_capture_fast_lane.py — and neither reaches it. Found by fresh-eyes
+    review of g-306-365's own commit (4798cb2c): `_ratio_fragment` computed the
+    unmeasurable remainder AFTER two early returns, both of which fire when
+    `by_slot_ratio` is empty, so the reducer printed NO share information
+    whatsoever in exactly the remote case this lane exists for — byte-identical
+    to a lane nobody measured. That is the defect g-306-365 was filed to fix,
+    reproduced inside the fix for it.
+    """
+    root = _mk_root(tmp_path)
+    # A live local Body holding NO capture entries — the lane is genuinely
+    # empty locally, which is what makes `by_slot_ratio` empty.
+    d = root / "agents" / AGENT / "sessions" / "local-body"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "working-memory.yaml").write_text(
+        yaml.safe_dump({"slots": {}}), encoding="utf-8")
+    (d / "body-manifest.yaml").write_text(
+        yaml.safe_dump({"body_state": "active", "unit_key": "local-body"}),
+        encoding="utf-8")
+    be = DivergingBackend({
+        "remote-fastlane.jsonl": _carrier_bytes(
+            "remote", [("spark_capture", _entry("g-20")),
+                       ("spark_capture", _entry("g-21"))]),
+    })
+    monkeypatch.setattr(bmg, "_get_backend", lambda: be)
+
+    s = cfl.fast_lane(AGENT, project_root=root)
+
+    assert s["by_slot_ratio"] == {}, s          # nothing measurable
+    assert s["flagged_measurable"] == 0, s
+    assert s["flagged_seen"] == 2, s            # ...but the entries were seen
+    line = cfl.format_line(s)
+    assert "none measurable" in line, line
+    assert "2 flagged carrier-sourced, no denominator" in line, line
+    # The pre-fix behaviour was total silence about the share. Pin that it
+    # cannot return: a line with no share clause at all is the regression.
+    assert "load-bearing share" in line, line

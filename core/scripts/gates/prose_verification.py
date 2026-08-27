@@ -15,6 +15,11 @@ both, not duplicated — duplication is exactly the drift that produced this gap
 
 Public API:
     evaluate(goal, *, meta_dir=None, agent_name=None) -> dict
+    PROSE_VERIFICATION_MARKERS          -- the original two headers (checks required)
+    PROSE_ACCEPTANCE_SYNONYM_MARKERS    -- acceptance/success synonyms (g-306-358;
+                                           satisfied by outcomes OR checks)
+    ALL_PROSE_MARKERS                   -- the union, for callers that only need
+                                           "does this description advertise criteria"
 
 Return shape:
     {
@@ -36,11 +41,61 @@ _gate_log_layer_d for the same pattern).
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional
 
 # gate_id MUST match core/config/gates.yaml id.
 GATE_ID = "prose-verification-drift"
+
+# The ORIGINAL two markers. Their satisfaction rule is UNCHANGED (a non-empty
+# verification.checks is required) because goal-schemas.md promises backward
+# compatibility and these are the headers the /verify-learning convention emits.
 PROSE_VERIFICATION_MARKERS = ("Verification outcomes:", "Verification checks:")
+
+# Acceptance/success SYNONYM headers (). A goal that advertises its
+# criteria under one of these and leaves structured verification empty slipped
+# the gate as a no-op — the predicate-narrower-than-population class
+# (guard-1802 / rb-5650).
+#
+# THE SET IS MEASURED, NOT GUESSED. Counted over the live 2,990-goal corpus
+# (2026-08-25, alpha worker cc-08): "Acceptance:" 3 hits, "Done when:" 2,
+# "Exit criteria:" 1 — every one a genuine criteria header. The remaining
+# entries hit ZERO today and are included as the canonical long forms of the
+# same headers, which costs nothing precisely because nothing matches them yet.
+PROSE_ACCEPTANCE_SYNONYM_MARKERS = (
+    "Acceptance criteria:",
+    "Acceptance:",
+    "Success criteria:",
+    "Done when:",
+    "Definition of done:",
+    "Completion criteria:",
+    "Exit criteria:",
+)
+
+# DELIBERATELY NOT A MARKER: bare "Success:". It was a candidate and it was
+# MEASURED as a false positive — 's description quotes a load-test log
+# line, `Total: 120, Success: 120 (200), Rate limited: 0`, which is not a header
+# at all. Bare high-frequency English words do not survive contact with pasted
+# tool output. Do not "complete" this list by adding it back; the long form
+# "Success criteria:" above already covers the real header.
+
+ALL_PROSE_MARKERS = PROSE_VERIFICATION_MARKERS + PROSE_ACCEPTANCE_SYNONYM_MARKERS
+
+# Code regions are stripped before matching so a description that QUOTES a
+# marker (documenting this gate, showing a template, pasting tool output) does
+# not self-trip — guard-1668, rb-349/guard-319 prose-filter-pattern.
+# An UNCLOSED fence matches nothing and therefore strips nothing, which leaves
+# the marker visible and the gate LOUD. That is the correct failure direction:
+# a missed strip costs a false block someone sees immediately, while an
+# over-eager strip costs a silent miss (guard-3351 — narrowing is the quiet
+# direction).
+_FENCED_CODE = re.compile(r"```.*?```", re.S)
+_INLINE_CODE = re.compile(r"`[^`\n]*`")
+
+
+def _strip_code_regions(text: str) -> str:
+    """Blank out fenced blocks and inline code spans, preserving offsets loosely."""
+    return _INLINE_CODE.sub(" ", _FENCED_CODE.sub(" ", text))
 
 
 def evaluate(goal: Dict[str, Any], *, meta_dir=None,
@@ -74,26 +129,59 @@ def evaluate(goal: Dict[str, Any], *, meta_dir=None,
         _log("noop", extra={"reason": "description not a string"})
         return _verdict("noop", [], None)
 
-    if not any(marker in desc for marker in PROSE_VERIFICATION_MARKERS):
+    prose = _strip_code_regions(desc)
+
+    original_seen = [m for m in PROSE_VERIFICATION_MARKERS if m in prose]
+    synonym_seen = [m for m in PROSE_ACCEPTANCE_SYNONYM_MARKERS if m in prose]
+    if not original_seen and not synonym_seen:
         _log("noop")
         return _verdict("noop", [], None)
 
-    markers_seen = [m for m in PROSE_VERIFICATION_MARKERS if m in desc]
+    markers_seen = original_seen + synonym_seen
     verification = goal.get("verification") or {}
-    checks = verification.get("checks") if isinstance(verification, dict) else None
-    if isinstance(checks, list) and len(checks) > 0:
+    if isinstance(verification, dict):
+        checks = verification.get("checks")
+        outcomes = verification.get("outcomes")
+    else:
+        checks = outcomes = None
+    has_checks = isinstance(checks, list) and len(checks) > 0
+    has_outcomes = isinstance(outcomes, list) and len(outcomes) > 0
+
+    # SATISFACTION SEMANTICS DIFFER BY MARKER CLASS, and the split is measured.
+    # An ORIGINAL marker still demands checks — that is the pre-existing contract
+    # and narrowing it would be a silent behaviour change.
+    # A SYNONYM-ONLY goal is satisfied by outcomes OR checks: of the 7 goals the
+    # synonym set newly admits, THREE (, , ) carry
+    # populated outcomes and no checks. Demanding checks there would block real
+    # backlog goals that legitimately have human-verified outcomes and no machine
+    # check yet — over-blocking a correct goal to catch a drifted one.
+    # Mixed case resolves to the STRICTER rule: any original marker means checks.
+    if original_seen:
+        satisfied = has_checks
+        requirement = "verification.checks"
+    else:
+        satisfied = has_checks or has_outcomes
+        requirement = "verification.checks or verification.outcomes"
+
+    if satisfied:
         _log("pass", trigger_matched=",".join(markers_seen),
-             extra={"checks_count": len(checks)})
+             extra={"checks_count": len(checks) if has_checks else 0,
+                    "outcomes_count": len(outcomes) if has_outcomes else 0,
+                    "synonym_only": not original_seen})
         return _verdict("pass", markers_seen, None)
 
     _log("block", trigger_matched=",".join(markers_seen),
-         payload=desc[:500], extra={"would_block": True})
+         payload=desc[:500], extra={"would_block": True,
+                                    "synonym_only": not original_seen})
     message = (
         f"Goal {gid}: prose-only verification drift detected. "
-        f"Description contains {markers_seen} but verification.checks is absent or empty. "
+        f"Description contains {markers_seen} but {requirement} is absent or empty. "
         f"Fix: either (a) move the prose bullets into a structured verification "
-        f"{{outcomes:[...], checks:[...]}} object, or (b) remove the 'Verification "
-        f"outcomes:/checks:' prose headers from the description. Prose-only "
+        f"{{outcomes:[...], checks:[...]}} object, (b) remove the acceptance-criteria "
+        f"prose header from the description, or (c) if you are QUOTING the header "
+        f"rather than declaring criteria -- documenting this gate, showing a "
+        f"template -- wrap it in backticks or a fenced block, which this gate "
+        f"strips before matching. Prose-only "
         f"verification silently bypasses /verify-learning S49.7 gates."
     )
     return _verdict("block", markers_seen, message)

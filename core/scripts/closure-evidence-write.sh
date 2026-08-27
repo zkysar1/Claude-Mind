@@ -202,15 +202,114 @@ if [[ -z "$SUMMARY" ]]; then
     exit 0
 fi
 
+# PROVENANCE MARKER (). The recurring supersede branch below needs to
+# tell a PRIOR-occurrence note (safe to replace) from one an agent hand-wrote for
+# THIS occurrence (must never be replaced), and the goal record carries NO signal
+# for it — measured 2026-08-25 over all 98 recurring goals / 80 with a note:
+# there is no outcome_note_set_at, `outcome_notes` is a plain string not a
+# timestamped list, and the only time-ish fields (lastAchievedAt, last_modified,
+# last_substantive_at) are all restamped by cmd_complete_by BEFORE this script
+# runs, so none of them separates the two cases. The signal therefore has to be
+# one we WRITE. Every write below appends this token, so its ABSENCE means "not
+# written by this script" = hand-written (or pre-dating this change).
+#
+# TRAILING, NOT LEADING, AND THAT IS MEASURED. aspirations.py:2810 previews the
+# note as `outcome_note[:300]`; a leading marker is charged against that window.
+# The supersede header already costs ~200 of those 300 chars, so prepending a
+# second banner would leave previews almost entirely boilerplate.
+#
+# FAILS CONSERVATIVE BY CONSTRUCTION. Every note written before this change is
+# unmarked and is therefore protected, so superseding re-arms one occurrence
+# later per goal.
+#
+# ⚠ THAT RE-ARM CLAIM WAS TRUE ONLY ON THE NOTE-ABSENT PATH, AND THIS FILE
+# ASSERTED IT UNCONDITIONALLY FOR A DAY (). "The first close after
+# this change writes a marked note and the NEXT one may supersede it" holds
+# where NO note exists — the write-if-absent path reaches the stamp at the
+# bottom of this file and marks it. Where a note is PRESENT, the decline branch
+# below used to `exit 0` BEFORE that stamp, so the note could never acquire the
+# marker, every later occurrence re-entered the same branch, and the goal was
+# WEDGED PERMANENTLY: occurrence N's evidence dropped silently at rc=0 behind a
+# message that reads like correct behaviour.
+#
+# Measured twice, independently, against world/aspirations.jsonl:
+#   cc-08 2026-08-26 — recurring=90, note-absent=17, note-present=73, marked=0,
+#                      wedged (unmarked, achievedCount>=2) = 63
+#   cc-07 2026-08-26 — same file at 19,263,903 B / 2,978 goals parsed as a
+#                      positive control: 90 / 17 / 73 / 0, wedged = 64
+# The counts agree; the extra wedged goal is one that closed in between. Skewed
+# to the HIGHEST-frequency goals —  (achievedCount 349), 
+# (342),  (277),  (187, the inbound email-directive lane).
+#
+# THE FIX IS A SECOND, DISTINCT MARKER — NOT A BACKFILL OF THE FIRST. Stamping
+# CE_AUTO_MARK on the decline path would be the smaller diff and it is the wrong
+# one: that token's own text asserts "written ... by closure-evidence-write.sh",
+# so putting it on a note this script did NOT write is a false provenance claim,
+# and it would authorize destroying a genuine hand-written artifact one
+# occurrence later. Measured on the same corpus: 41 of the 73 note-present goals
+# carry this file's older "[closure-evidence]" prefix (so they ARE script
+# output), and 32 do not. A single token cannot describe both populations
+# honestly.
+#
+# CE_DEFER_MARK says only what is true — "provenance unknown, supersede DEFERRED
+# at occurrence N, preserved" — and it carries the achievedCount it was stamped
+# at. That count is what separates a NEXT OCCURRENCE (recorded N < current) from
+# a SAME-OCCURRENCE RETRY (recorded N == current), which a bare presence test
+# cannot do: recurring-close.sh documents retrying a failed verify by name, and
+# a retry that superseded would destroy the artifact inside the very occurrence
+# that just preserved it. Cost is exactly one deferred note per goal — the trade
+# this file already declares cheaper ("one conservative miss costs a deferred
+# note, one over-eager supersede costs a hand-written artifact").
+CE_AUTO_MARK="[closure-evidence:auto]"
+CE_DEFER_MARK="[closure-evidence:deferred]"
+
+# ANCHORED, LITERAL MARKER MATCH ( outcome 3). The old discriminator
+# was `"$_existing" != *"$CE_AUTO_MARK"*` — a bare substring test over the whole
+# note, so a note that merely MENTIONS the token anywhere, in any prose, was
+# misclassified as script-written and became eligible for destruction. That is
+# not hypothetical: the worker that filed this goal quoted the token in its own
+# close note to EXPLAIN the decline, which armed the test against both that
+# evidence and a preserved 2026-06-30 artifact, and caught it only at read-back.
+# Any diagnostic note about this mechanism arms the old test — including a
+# regression test that stores a sample note inline.
+#
+# This matcher requires the token to START a line AND that line to carry the
+# full written shape. `index()` is a LITERAL search, deliberately: the tokens
+# contain `[` and `]`, and a regex-escaping matcher would have to escape them
+# correctly in every caller — one missed escape silently turns the anchor into a
+# character class that matches almost anything. Nothing here is escaped because
+# nothing here is a pattern. Interval expressions ({4}) are avoided too; not
+# every awk in the fleet supports them.
+#
+# Prints the achievedCount recorded on the marker's own line, or nothing when
+# the marker is absent. Empty means absent — callers must not read it as zero.
+_ce_marker_ach() {
+    printf '%s\n' "$1" | awk -v tok="$2" '
+        index($0, tok) == 1 &&
+        index($0, " by closure-evidence-write.sh (achievedCount=") > 0 {
+            if (match($0, /achievedCount=[0-9]+/)) {
+                print substr($0, RSTART + 14, RLENGTH - 14)
+                exit
+            }
+        }'
+}
+
 _record="$(_probe_record)"
 _meta="$(printf '%s\n' "$_record" | head -n 1)"
 _existing="$(printf '%s\n' "$_record" | tail -n +2)"
 
+# HOISTED out of the `if [[ -n "$_existing" ]]` block below (). The
+# provenance stamp at the write site needs `_rec` on the path where NO note
+# exists yet — that is the FIRST close of a recurring goal, and it is precisely
+# the write whose marker lets the NEXT occurrence recognise a prior-occurrence
+# note. Left inside the block, `_rec` was unset on exactly that path, no marker
+# was written, and the supersede branch could never re-arm.
+_rec=0
+[[ "$_meta" == *"recurring=1"* ]] && _rec=1
+_ach="${_meta##*achieved=}"
+[[ "$_ach" =~ ^[0-9]+$ ]] || _ach=0
+
 if [[ -n "$_existing" ]]; then
-    _rec=0
-    [[ "$_meta" == *"recurring=1"* ]] && _rec=1
-    _ach="${_meta##*achieved=}"
-    [[ "$_ach" =~ ^[0-9]+$ ]] || _ach=0
 
     # RECURRING SUPERSEDE (). Never-clobber is CORRECT for a one-shot
     # goal, where a pre-existing note can only mean the agent wrote the richer
@@ -275,7 +374,73 @@ if [[ -n "$_existing" ]]; then
         exit 0
     fi
 
-    if [[ "$_rec" -eq 1 && "$_ach" -ge 2 ]]; then
+    # WHICH OCCURRENCE STAMPED THE DEFERRAL (). Empty when absent —
+    # never read empty as zero, which is why this is compared explicitly below
+    # rather than defaulted.
+    _defer_ach="$(_ce_marker_ach "$_existing" "$CE_DEFER_MARK")"
+    [[ "$_defer_ach" =~ ^[0-9]+$ ]] || _defer_ach=""
+
+    # May this note be superseded? TWO independent grants, and the second is the
+    # one this goal added:
+    #   1. it carries CE_AUTO_MARK on its own line  -> this script wrote it
+    #   2. it carries CE_DEFER_MARK stamped at a STRICTLY EARLIER achievedCount
+    #      -> a previous occurrence preserved it and warned that the next one
+    #         may replace it, and that next occurrence is now here
+    # A deferral stamped at the CURRENT count grants nothing: that is a retry of
+    # the same occurrence, and recurring-close.sh documents retrying a failed
+    # verify by name. Presence alone would let a retry destroy the artifact
+    # inside the very occurrence that just preserved it.
+    _may_supersede=0
+    if [[ -n "$(_ce_marker_ach "$_existing" "$CE_AUTO_MARK")" ]]; then
+        _may_supersede=1
+    elif [[ -n "$_defer_ach" && "$_defer_ach" -lt "$_ach" ]]; then
+        _may_supersede=1
+    fi
+
+    if [[ "$_rec" -eq 1 && "$_ach" -ge 2 && "$_may_supersede" -eq 0 ]]; then
+        # RECURRING BUT HAND-WRITTEN (). Recurring and past the first
+        # occurrence, so the branch below would have superseded — but the note
+        # carries no CE_AUTO_MARK, so this script did not write it. It is either
+        # an agent's hand-written note for THIS occurrence or a note pre-dating
+        # the marker; both are richer artifacts than a one-line summary and both
+        # must survive. This is the SILENT half of the defect: field-shrink-guard
+        # only refuses below 25%, so a hand-written note merely longer than the
+        # summary but under 4x used to be replaced with no warning anywhere.
+        #
+        # DISTINCT message text, deliberately not shared with the one-shot
+        # never-clobber below: guard-2536 requires a negative assertion ("the
+        # note was NOT superseded") to be paired with positive proof the path was
+        # REACHED, and a test cannot tell "declined here" from "never ran" unless
+        # this branch says so in its own words. STDOUT per guard-772.
+        #
+        # THE DECLINE NOW STAMPS, AND THAT IS THE WHOLE FIX (). This
+        # branch used to `exit 0` here, which preserved the note correctly and
+        # dropped THIS occurrence's evidence on the floor — permanently, because
+        # nothing downstream could ever mark the note and every later occurrence
+        # re-entered this same branch. Preserving the old artifact and recording
+        # that a decision was made are not in tension: the note is rewritten as
+        # ITSELF plus one stamped line.
+        if [[ -n "$_defer_ach" && "$_defer_ach" -eq "$_ach" ]]; then
+            # Already stamped at THIS occurrence: a retry. Write nothing at all
+            # — re-stamping would append a second identical line every retry and
+            # grow the note without bound.
+            echo "$PREFIX outcome_note on $GOAL_ID (${#_existing} chars) already carries $CE_DEFER_MARK for occurrence ${_ach} — recurring supersede DECLINED (idempotent re-run), note preserved."
+            exit 0
+        fi
+        echo "$PREFIX outcome_note on $GOAL_ID (${#_existing} chars) carries no $CE_AUTO_MARK — provenance unknown, recurring supersede DECLINED (achievedCount=${_ach}), note preserved and stamped $CE_DEFER_MARK so the NEXT occurrence may supersede."
+        # ASCII-ONLY IN THE STAMPED LINE, for the reason the provenance stamp
+        # below states in full: ${#_existing} counts BYTES under a non-UTF-8
+        # locale, so a non-ASCII character here inflates the length the next
+        # occurrence reports. This line is STORED; the prose above is printed.
+        SUMMARY="$_existing
+
+$CE_DEFER_MARK written $(date +%Y-%m-%dT%H:%M:%S) by closure-evidence-write.sh (achievedCount=${_ach}) - the note above predates the provenance marker or was hand-written, so THIS occurrence preserved it rather than superseding it. The NEXT occurrence (achievedCount > ${_ach}) MAY supersede it. Prior text is recoverable from world/.history/snapshots/aspirations.jsonl/; see g-115-7853."
+        # Suppress the auto-mark at the bottom of this file. That token asserts
+        # this script AUTHORED the note, and the note being written here is the
+        # caller's preserved artifact with one line appended — stamping it would
+        # re-tell the exact lie this branch exists to avoid.
+        _CE_DEFER_STAMPED=1
+    elif [[ "$_rec" -eq 1 && "$_ach" -ge 2 ]]; then
         # IDEMPOTENCY IS PRESERVED, AND IT HAD TO BE RESTORED EXPLICITLY. The
         # refusal branch below gets it free ("a re-run finds the note it wrote
         # and declines") and this branch does not. recurring-close.sh documents
@@ -286,7 +451,20 @@ if [[ -n "$_existing" ]]; then
             echo "$PREFIX outcome_note on $GOAL_ID already carries THIS summary (${#_existing} chars) — not re-written (idempotent re-run)."
             exit 0
         fi
-        SUMMARY="[closure-evidence] SUPERSEDES a prior-occurrence note of ${#_existing} chars — recurring occurrence achievedCount=${_ach}, superseded $(date +%Y-%m-%dT%H:%M:%S). Prior text recoverable from git history of the queue file (guard-3983).
+        # THE RECOVERY ROUTE IS NAMED BECAUSE IT IS THE MITIGATION, and until
+        #  it named a route that does not exist here. The comment on
+        # --no-supersede above already records that "the 'recoverable from git
+        # history' route does not exist on own-cloud" — world/ is external and
+        # gitignored, so on a STORAGE_BACKEND=own-cloud box git carries no
+        # version of this file at all. It was still what this line, the one text
+        # actually STORED in the superseded note, told every future reader.
+        # The route that does exist was measured on cc-07 2026-08-26:
+        # world/.history/snapshots/aspirations.jsonl/ held 5,309 versioned
+        # snapshots, newest 2026-08-26T02-14-29, i.e. current to the minute on an
+        # own-cloud box. Both are named rather than one swapped for the other —
+        # git IS the route on a local-backend deployment, and this file ships to
+        # all of them.
+        SUMMARY="[closure-evidence] SUPERSEDES a prior-occurrence note of ${#_existing} chars — recurring occurrence achievedCount=${_ach}, superseded $(date +%Y-%m-%dT%H:%M:%S). Prior text recoverable from world/.history/snapshots/aspirations.jsonl/ (all deployments), or from git history of the queue file where world/ is git-tracked (guard-3983).
 
 $SUMMARY"
         # STDOUT, not stderr: this is a successful write, and guard-772 records
@@ -305,10 +483,69 @@ $SUMMARY"
     fi
 fi
 
-if bash "$SCRIPT_DIR/aspirations-update-goal.sh" ${SOURCE:+--source "$SOURCE"} \
-        "$GOAL_ID" outcome_note "$SUMMARY"; then
+# Stamp provenance LAST, so the marker rides every note this script writes and
+# the branch above can recognise its own work next occurrence. Appended after the
+# idempotency compare deliberately: that test looks for the bare summary inside
+# the existing note, which still matches once the marker is on the end.
+# ASCII-ONLY IN THE MARKER TEXT, and that is not cosmetic. The supersede header
+# reports the superseded length as ${#_existing}, which counts BYTES whenever the
+# locale is not UTF-8 (it is unset in the loop's own environment). Every non-ASCII
+# character this script writes INTO a note therefore inflates the "N chars" the
+# next occurrence reports by its extra byte count -- measured here: one em-dash
+# made a 255-character note report as 257. The rest of this file's prose may use
+# em-dashes freely because it is printed, never stored; this one line is stored.
+#
+# RECURRING ONLY, and the narrowing is deliberate. The discriminator exists to
+# serve the supersede branch, which only runs on recurring goals; a one-shot goal
+# takes never-clobber and needs no marker. So a one-shot note still reaches the
+# record BYTE-EXACT, which is a contract this suite already pins
+# (test_writes_the_note_when_absent asserts the narrative is unaltered in
+# transit). Marking every write would have bought nothing and broken that.
+# NOT on the deferral path (). `_CE_DEFER_STAMPED` means SUMMARY is
+# the CALLER'S preserved artifact with a deferral line appended, not this
+# script's own narrative. CE_AUTO_MARK asserts authorship; adding it there would
+# claim this script wrote a note it deliberately declined to touch, and would
+# grant the next occurrence a supersede on the wrong evidence.
+if [[ "$_rec" -eq 1 && "${_CE_DEFER_STAMPED:-0}" -eq 0 ]]; then
+    SUMMARY="$SUMMARY
+
+$CE_AUTO_MARK written $(date +%Y-%m-%dT%H:%M:%S) by closure-evidence-write.sh (achievedCount=${_ach:-0}) - absence of this line on a recurring goal means a human wrote the note, so it is never superseded; see g-115-7733."
+fi
+
+# CAPTURE the writer's output instead of letting it stream past. The refusal is
+# an error-JSON the caller must READ to answer "did this actually fail?"
+# (guard-1007), and the old code discarded it and then asserted an outcome it had
+# no evidence for. Merged 2>&1 because the CLI path prints its refusal on stderr
+# and the daemon path on stdout; dropping either would re-bury the one line that
+# explains the exit code (guard-3662).
+_upd_out="$(bash "$SCRIPT_DIR/aspirations-update-goal.sh" ${SOURCE:+--source "$SOURCE"} \
+        "$GOAL_ID" outcome_note "$SUMMARY" 2>&1)"
+_upd_rc=$?
+
+if [[ "$_upd_rc" -eq 0 ]]; then
+    # Re-emit verbatim: capturing must not silence the writer for callers that
+    # were reading its record echo before this change.
+    printf '%s\n' "$_upd_out"
     echo "$PREFIX outcome_note written to $GOAL_ID (${#SUMMARY} chars)"
 else
-    echo "$PREFIX ⚠ outcome_note write FAILED for $GOAL_ID — the narrative is NOT on the record. Re-run: bash core/scripts/aspirations-update-goal.sh --source ${SOURCE:-world} $GOAL_ID outcome_note \"...\"" >&2
+    printf '%s\n' "$_upd_out" >&2
+    _old_len="$(printf '%s' "$_upd_out" | sed -n 's/.*"old_len"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+    [[ -z "$_old_len" ]] && _old_len="$(printf '%s' "$_upd_out" | sed -n 's/.*would shrink it from \([0-9][0-9]*\) chars.*/\1/p' | head -n 1)"
+
+    if [[ "$_upd_out" == *field_shrink_blocked* || "$_upd_out" == *field-shrink-guard* ]]; then
+        # NOT A FAILURE TO REPORT AS ONE ( defect 2, guard-5049). The
+        # gate refused precisely BECAUSE a longer note is already on the record,
+        # so "the narrative is NOT on the record" was false BY CONSTRUCTION here
+        # — and the re-run the old message printed either failed identically or,
+        # with --override-shrink, destroyed the very note the gate had just
+        # saved. Both offered outcomes were wrong for the observed state. Say
+        # what happened and prescribe nothing.
+        echo "$PREFIX outcome_note NOT overwritten on $GOAL_ID — field-shrink-guard declined this ${#SUMMARY}-char summary because a LONGER note (${_old_len:-unknown} chars) is already on the record. THE NARRATIVE IS ON THE RECORD; NO ACTION IS NEEDED. Do NOT re-run with --override-shrink: that would replace the longer note with this summary (guard-5049). To see it: bash core/scripts/completed-not-closed-slate.sh --show $GOAL_ID --note-chars 400" >&2
+    else
+        # A genuine, unclassified failure. Still no bare re-run — verify FIRST,
+        # because the same instruction that is right for an absent note is
+        # destructive for a present one.
+        echo "$PREFIX ⚠ outcome_note write FAILED for $GOAL_ID (rc=$_upd_rc) — reason above. VERIFY BEFORE WRITING: bash core/scripts/completed-not-closed-slate.sh --show $GOAL_ID --note-chars 400. Only if the read-back shows the narrative absent or truncated, write the FULL narrative (not a summary) with aspirations-update-goal.sh." >&2
+    fi
 fi
 exit 0

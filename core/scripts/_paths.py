@@ -38,7 +38,16 @@ def agents_root() -> Path:
 
 
 def agent_dir(name: str) -> Path:
-    """Filesystem path for an individual agent's dir."""
+    """Filesystem path for an individual agent's dir.
+
+    NAME-based, and therefore does NOT honour the `MIND_AGENT_DIR` test
+    override -- that seam applies to the `AGENT_DIR` CONSTANT only (see the
+    Tier 4 block below). Correct as-is: honouring it here would collapse every
+    agent name onto one dir and break cross-agent enumeration. But it means a
+    test that sets the override and then drives code calling this function is
+    NOT isolated from live agent state. When you already hold a resolved dir,
+    pass the DIR, not the name. guard-2985.
+    """
     return agents_root() / name
 
 
@@ -179,7 +188,9 @@ def retrieval_session_path(agent_dir_path, sid: "str | None" = None) -> Path:
 
     TAKES THE AGENT DIRECTORY, NOT THE AGENT NAME, and that is load-bearing
     rather than a style choice. `AGENT_DIR` honours the `MIND_AGENT_DIR`
-    override seam (`_paths.py` L401-405, `_paths.sh` L347) while
+    override seam (the `_agent_dir_override` block in `_paths.py`'s Tier 4
+    section; `_AGENT_DIR_OVERRIDE` in `_paths.sh` -- anchored by NAME because
+    the line numbers this comment used to carry had drifted 18 lines) while
     `agent_dir(name)` rebuilds from PROJECT_ROOT and does not. A name-based
     version of this function therefore SILENTLY DISCARDS a caller-resolved
     agent dir — which is a second way to derive one path, i.e. the
@@ -419,6 +430,25 @@ WORLD_DIR = _resolve_external("MIND_WORLD", "WORLD_PATH")
 # Resolution: MIND_AGENT_DIR env (test override) > MIND_AGENT under PROJECT_ROOT.
 # MIND_AGENT_DIR exists for unit tests that need a tmp agent dir; production
 # code never sets it.
+#
+# SCOPE: THIS CONSTANT ONLY. The override is applied HERE and nowhere else --
+# `agent_dir(name)` and its delegates (`agent_state_dir`, `agent_sessions_root`,
+# `agent_session_dir`) rebuild from PROJECT_ROOT and consult it NOWHERE, so a
+# test that sets MIND_AGENT_DIR and then exercises code routed through the
+# NAME-based family still reads and writes LIVE agent state -- and passes.
+# That is not a bug in the function: a named-agent lookup MUST NOT collapse
+# every name onto one dir, or cross-agent enumeration breaks. Measured
+# 2026-08-25 (, zeta/cc-02) over core/scripts + mind_api: 103
+# name-route call sites in 69 files, splitting 47 production sites that pass
+# the BOUND agent (the ones a test override silently misses) / 9 in tests /
+# 47 that pass a PEER or explicit name (the ones that REQUIRE the override be
+# ignored). The two 47s are a coincidence, not the same set.
+#
+# HOW TO TELL WHICH ROUTE YOU ARE ON: resolving via this CONSTANT
+# (`AGENT_DIR` / `$AGENT_DIR`) is isolated; CALLING `agent_dir(name)` with an
+# explicit name is not. Prefer passing an already-resolved DIR (see
+# `retrieval_session_path` earlier in this file) over re-deriving one from a
+# name. guard-2985.
 AGENT_NAME = _resolve_agent_name()
 _agent_dir_override = os.environ.get("MIND_AGENT_DIR", "").strip()
 if _agent_dir_override:

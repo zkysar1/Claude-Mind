@@ -248,8 +248,8 @@ IF agents/<agent>/session/handoff.yaml EXISTS (auto-continuation / inline restar
         IF handoff.knowledge_debts_pending exists and non-empty:
             Seed knowledge_debt slot:
             echo '<carried_debts_json>' | wm-set.sh knowledge_debt
-            Promote any debts with sessions_deferred >= 2 to priority: HIGH
-            Report: "KNOWLEDGE DEBTS CARRIED: {N} pending ({H} HIGH)"
+            Promote debts with sessions_deferred >= 2 to priority: HIGH
+            IF exit 0: Report: "DEBTS CARRIED: {N} pending ({H} HIGH)"
     4c. Critical Path Resume:
         IF handoff.critical_path exists and critical_path.primary_blocker is not null:
             Output: "CRITICAL PATH: {primary_blocker.title} [{primary_blocker.goal_id}] — blocks {downstream_count} goals ({blocked_fraction} of active work)"

@@ -413,6 +413,8 @@ For each substantive inline completion in this chat:
   # positional JSON args are silently discarded. --source picks the JSONL:
   # world (asp-NNN in world/aspirations.jsonl) vs agent (agent-local
   # aspirations) — deployment-routing.md records which applies here.
+  # Priority stays MEDIUM (cognitive-primitives map — Maintain is never HIGH);
+  # Lane 4.1's title bar applies to every goal-filing call site in this skill.
   echo '{"title":"Maintain: <one-line summary of inline work>",
      "description":"Completed inline during chat session on <date>: <details>",
      "status":"completed",
@@ -478,7 +480,15 @@ Apply the sq-013 / sq-002 / sq-c07 / sq-008 lenses to the chat session.
 Did the conversation reveal actionable work not yet tracked?
 For each:
   classification = requirement | dependency | follow-up | fix | capability_gap | opportunity
+  # PRIORITY IS DERIVED FROM CLASSIFICATION — never chosen on felt urgency.
+  # Field incident 2026-08-26 (sera/serene): a day-old deployment filed a
+  # capability_gap as HIGH with a hedge-word title; MEDIUM was the mapped
+  # value. (Cognitive-primitive prefix goals map per CLAUDE.md "Cognitive
+  # Primitives": Unblock=HIGH, Investigate/Idea/Maintain=MEDIUM.)
   priority = HIGH (fix/dependency/requirement) | MEDIUM (follow-up/capability_gap) | LOW (opportunity)
+  # TITLE BAR: the title states the concrete deliverable. Hedge/filler
+  # adjectives ("robust", "potentially", "comprehensive", "improved") are
+  # barred unless the description carries concrete verification criteria.
   target_asp = current focus / matching category / new aspiration
   # origin_signal is gate-required. Pick by classification (use the prefix
   # form with a short tag, e.g. "idea:tree-decompose-helper"):
@@ -551,7 +561,30 @@ IF yes:
   # _fileops.locked_modify_yaml when a concurrent writer is possible).
   Bash: meta-set.sh skill-gaps.yaml "gaps[<i>].times_encountered" <n+1> --reason "<goal-id> encounter"
   Bash: meta-set.sh skill-gaps.yaml "gaps[<i>].encounter_log" '<full JSON array incl. the new entry>'
-  Print: FORGE GAP <gap-id> — <procedure_name>
+  # WRITE-INTEGRITY READ-BACK (g-115-3177 — mirrored from aspirations-spark's
+  # sq-008 handler, which gained it while this lane drifted without it.
+  # Measured 2026-08-26 (sera/serene): a run reported "1 forge gaps" while
+  # skill-gaps.yaml carried no new entry — the claim was printed from the
+  # write attempt, not the store; same class as Lane 1.5's g-115-2847.
+  # meta-read.sh is a synchronous YAML read, so read-back is valid here — the
+  # guard-4631 spool caveat applies to utilization-sidecar increments only.)
+  IF meta-set.sh exit code != 0:
+    Log the FULL stderr — do NOT print the FORGE GAP line.
+    Re-read via meta-read.sh; if the gap is genuinely absent, file
+    "Investigate: skill-gaps.yaml write failed — <error>" (HIGH, participants
+    [agent]), then continue (never block the pass on it).
+  ELSE (rc == 0):
+    # GATE THE VERDICT ON rc, NOT THE READ-BACK (g-115-3522). They answer
+    # different questions; conflating them files a false HIGH goal on a write
+    # that actually succeeded.
+    Bash: meta-read.sh skill-gaps.yaml → gap id present with a non-null `type`?
+    PRESENT → print the FORGE GAP line. ABSENT → UNKNOWN, never "failed", and
+    never the rc!=0 branch: rc=0 IS the write verdict, so print the line marked
+    UNCONFIRMED and continue. Do NOT re-run the write — encounter_log is
+    append-only, so the retry succeeds and duplicates silently (guard-1578).
+    A same-box read here is synchronous (see above), so ABSENT is rare; when it
+    happens suspect a cross-box mirror read-through (guard-980), not a failure.
+  Print: FORGE GAP <gap-id> — <procedure_name>   [+ " (UNCONFIRMED)" on ABSENT]
 Do NOT auto-forge — that requires curriculum permission and the /forge-skill flow.
 ```
 
@@ -600,15 +633,41 @@ Did the chat-session changes touch framework files where regressions need a chec
    # sweep is only sound where an authorship filter exists: 1269/1335 (95%)
    # of tree nodes carry `last_update_trigger.session`, but only 6 of 66
    # conventions carry ANY front matter, so no such filter exists for the
-   # conventions half. That asymmetry is why the sound probe is tree-only
-   # and is NOT built here — a probe covering half the surface would read
-   # as coverage of all of it, which is this lane's original defect.
-   IF no framework files changed:
-     Print: "encode-session: no framework files changed — no verify-learning candidates."
+   # conventions half.
+   #
+   # THE TREE HALF IS NOW PROBED FOR REAL (g-115-4714). That asymmetry used
+   # to be the reason NO probe was built here; it is now the reason the probe
+   # is tree-ONLY. `--list` returns the nodes this session encoded, filtered
+   # by `last_update_trigger.session` — the authorship filter that makes an
+   # mtime sweep sound under own-cloud. It reuses the boolean detector's own
+   # attribution function rather than reimplementing it, so the two cannot
+   # drift apart.
+   Bash: sess=$(bash core/scripts/wm-read.sh session_start 2>/dev/null)
+   Bash: py -3 core/scripts/tree-edit-since.py "$sess" --list
+   # rc 0 = attributable nodes on stdout, one relative path per line.
+   # rc 1 = none. Nodes another session stamped are counted out and reported
+   # on stderr, so a peer's synced edit cannot be read as your own.
+   #
+   # ITS SCOPE IS TREE-ONLY AND MUST BE REPORTED THAT WAY. Conventions stay
+   # in-context-only — there is no authorship filter to run on 6-of-66 front
+   # matter, and none can be built from data that does not exist. Calling
+   # this output "world/ coverage" would rebuild this lane's original defect
+   # in a new place: a probe covering half the surface reading as coverage of
+   # all of it. Say "tree nodes"; never "world files".
+   #
+   # AN UNSET session_start MEANS BLIND, NOT CLEAN (guard-1947 — the class
+   # Phase 1 already names). Empty $sess = the probe could not run, so the
+   # tree half falls back to in-context memory exactly like conventions do.
+   # Report it as BLIND; it is not evidence that nothing was encoded.
+   IF no framework files changed AND the tree list is empty:
+     Print: "encode-session: no framework files changed, no tree nodes encoded this session — no verify-learning candidates."
      SKIP rest of Lane 5.
+   # EITHER source non-empty → continue to 5.2. A session that encoded tree
+   # nodes but touched no tracked file is precisely the case the old
+   # git-status-only SKIP dropped in silence.
 
 5.2. PROPOSE CHECKS
-   For each changed framework file or new behavior:
+   For each changed framework file, encoded tree node, or new behavior:
      Identify a check that catches the same regression next time:
        - New script invariant   → grep-based check
        - New file expected      → existence check (test -f / test -d)
@@ -662,7 +721,23 @@ Same handler as `/aspirations-spark` sq-012, but on chat-session input.
 7.3. Bash: curriculum-contract-check.sh --action allow_self_edits
      IF exit code 1: print "Self edit blocked by curriculum stage <stage>"
                      SKIP to 7.5.
-7.4. IF 7.2 = YES, apply guard-380 classification:
+7.4. IF 7.2 = YES:
+     # AUDIT-MACHINERY GATE (field incident 2026-08-26, sera/serene): a thin
+     # day-old deployment declared a MATERIAL change while the evolution audit
+     # stream did not exist there — a Material claim with no audit artifact
+     # behind it. The honest branch was WEAK/deferred. Probe BEFORE classifying:
+     Bash: test -x core/scripts/evolution-complete.sh        # machinery present?
+     AND after the self.md Edit: confirm the evolution-prepare hook captured a
+     stub — an awaiting_completion record for this revision in
+     world/self-evolution.jsonl.
+     IF either probe fails (script absent, or no stub captured):
+       Do NOT classify COSMETIC or MATERIAL — no audit artifact, no claim.
+       Print: SELF SIGNAL (weak) — deferred: audit machinery unavailable
+              (<which probe failed>). Signal was: <what 7.2 found>
+       File "Idea: revisit deferred self-evolution signal — <the signal>"
+       (MEDIUM) so the content survives until the machinery lands, then SKIP
+       to 7.5. Do NOT edit self.md on this branch.
+     Apply guard-380 classification:
      # Both `last_updated` and `last_update_trigger` MUST be set in the SAME
      # Edit so the audit trail stays accurate. Mirror sites that MUST stay
      # in sync: aspirations-spark/SKILL.md (sq-012 handler), respond/SKILL.md
@@ -682,7 +757,7 @@ Same handler as `/aspirations-spark` sq-012, but on chat-session input.
              --reasoning "<>=80-char rationale citing encode-session cosmetic signal>" \
              --signal-source encode-session \
              --signal-evidence '[{"type":"encode_session_lane","id":"lane-7","outcome":"cosmetic"}]'
-         Print: SELF EVOLUTION (cosmetic, audited via self-evolution stream) — <one-line summary>
+         Print: SELF EVOLUTION (cosmetic, audit artifact: <revision-id>) — <one-line summary>
      - MATERIAL change (new/removed drive, principle, role,
        agent-provisionable action, or multi-paragraph rewrite):
          Edit agents/<agent>/self.md — update body AND front matter:
@@ -699,7 +774,11 @@ Same handler as `/aspirations-spark` sq-012, but on chat-session input.
              --reasoning "<>=80-char rationale citing the encode-session signal source — sq-012, ABC drift, fresh-eyes pattern, etc — that prompted this material Self change>" \
              --signal-source encode-session \
              --signal-evidence '[{"type":"encode_session_lane","id":"lane-7","outcome":"material-applied"}]'
-         Print: SELF EVOLUTION (material, audited via self-evolution stream) — <summary>
+         Print: SELF EVOLUTION (material, audit artifact: <revision-id> +
+                decisions-board post + user email per evolution-complete.sh
+                Phase 5) — <summary>
+         # No named artifact = no Material claim. If evolution-complete.sh
+         # errored, fall back to the WEAK-branch wording of the gate above.
      - WEAK / uncertain signal:
          Print: SELF SIGNAL (weak) — deferred to /reflect-on-self
          Do NOT edit self.md.
@@ -712,6 +791,20 @@ Same handler as `/aspirations-spark` sq-012, but on chat-session input.
 ```
 
 ## Phase Final: Summary
+
+**Root-cruft check (runs first — feeds the Proposals block).** The L1 hook
+governs only Write/Edit; Bash mkdir/heredoc/redirects create repo-root files
+invisibly. Field incident 2026-08-26 (sera/serene): a session left
+temp_*/list_* ground-truth scripts at PROJECT_ROOT and the encode pass ended
+without noticing them. From Phase 1's `git status --short`: any top-level
+untracked file (`?? <name>` with no slash) matching session-temp shapes
+(temp*, tmp*, scratch*, list_*, *ground_truth*) — or any root file this
+session itself created — gets ONE Proposals entry naming the files, the
+sanctioned homes (`agents/<agent>/temp/` for lifecycle files,
+`agents/<agent>/sessions/<SID>/scratch/` for scratch —
+`.claude/rules/no-scratchpad.md`), and the proposed move/delete. PROPOSE
+ONLY — never auto-delete (`archive-before-delete.md`; the user may want one
+kept).
 
 ```
 ═══ ENCODE-SESSION COMPLETE ═══════════════════════
@@ -727,11 +820,21 @@ Lane 5 (Verify-Learn.):  <N> check candidates filed (sq-018)
 Lane 6 (Meta):           <N> meta proposals
 Lane 7 (Self):           <evolution-classification or "no change">
 
-Proposals (require user OK to write):
-  <for each: MECHANISM=PROBED|INFERRED — the stated reason, then the exact
-   tool call needed to accept>
+Proposals (genuinely-open items only — see reconciliation rule below):
+  <for each: DEFER-REASON + MECHANISM=PROBED|INFERRED — the stated reason,
+   then the exact tool call needed to accept>
 ═══════════════════════════════════════════════════
 ```
+
+**The Proposals block lists only genuinely-open items.** Before printing it,
+reconcile each candidate against this run's OWN action lines: anything already
+materialized this pass (an ENCODED / RECONCILED / CORRECTED / FILED /
+FORGE GAP line above) is an action, not a proposal — a proposals entry
+contradicting the run's own output is itself the defect (field incident
+2026-08-26, sera/serene: a tree node listed as a pending proposal minutes
+after its ENCODED line printed). Every surviving proposal carries its
+deferral reason (needs user OK / over-encode risk / machinery unavailable)
+alongside the MECHANISM mark below.
 
 **Mark every proposal's stated MECHANISM as PROBED or INFERRED.** A proposal
 carries two separable claims: the ACTION and the MECHANISM justifying it.

@@ -1488,6 +1488,49 @@ def test_merge_failure_on_registered_store_raises_conflict_not_clobbers(cloud, t
     assert b._get_remote_raw(key)[0] == garbage               # remote NOT clobbered
 
 
+def test_handler_refusal_none_freezes_instead_of_put_body_none(cloud, tmp_path):
+    """: a handler REFUSES by returning None (merge_tree_node_md on
+    same-heading divergence, g-115-7071). _merge_reconcile_put must honor that
+    as the store's safe-freeze and raise ConflictError -- NOT fall through to
+    put_object(Body=None), which boto3 rejects as ParamValidationError.
+
+    Why this is worth its own test rather than a variant of the exception case
+    above: the two refusal channels are DIFFERENT. A handler that RAISES was
+    already wrapped; a handler that RETURNS None had no check at all, so the
+    store's deliberate freeze became a transport-shaped crash -- 'union-merge
+    push failed ... Invalid type for parameter Body, value: None' -- which reads
+    as an S3 outage and was nearly filed as one on two separate boxes. The check
+    guards the handler CONTRACT, not one handler: merge_tree_node_md is the only
+    one carrying an explicit None-refusal today (1 of 31, measured by AST -- a
+    `return None` grep says 13 and is wrong), so any handler that adopts a
+    refusal later is covered without a second fix."""
+    from owncloud_backend import ConflictError
+    b = _backend(cloud)
+    p = cloud["root"] / "world" / "knowledge" / "tree" / "system" / "demo-node.md"
+    key = b._s3_key(p)
+    fm = "---\ntitle: demo\nlast_updated: 2026-08-23\n---\n\n"
+    base = (fm + "## Alpha\n\nbase body\n").encode()
+    b.write_text(p, base.decode())                            # S3 == local == base
+    _write_sync_manifest(tmp_path, {b._rel(p): {
+        "mtime": 0, "md5": hashlib.md5(base).hexdigest()}})
+    local_a = (fm + "## Alpha\n\nmachineA body\n").encode()
+    b._local(p).write_bytes(local_a)                          # unpushed local edit
+    remote_b = (fm + "## Alpha\n\nmachineB body\n").encode()
+    cloud["s3"].put_object(Bucket=BUCKET, Key=key, Body=remote_b)  # peer, SAME heading
+    b.refresh(p)
+    assert key in b._diverged_keys
+    with pytest.raises(ConflictError) as exc:
+        b.write_text(p, local_a.decode())                     # refusal surfaces LOUD
+    assert b._get_remote_raw(key)[0] == remote_b              # remote NOT clobbered
+    assert b._local(p).read_bytes() == local_a                # local NOT clobbered
+    # The MESSAGE is the deliverable, not a nicety: this goal exists because the old
+    # failure read as a transport fault. Pin the discriminating token, not the prose --
+    # rewording stays free, regressing to a -shaped message does not.
+    msg = str(exc.value)
+    assert "REFUSED" in msg, f"message must name the refusal, got: {msg}"
+    assert "parameter Body" not in msg, f"message must not read as a transport fault: {msg}"
+
+
 def test_hot_coordination_store_412_merges_with_empty_diverged_flag(cloud, tmp_path):
     """: a HOT coordination store (team-state.yaml, written every
     iteration) whose in-process fence went stale but whose key was NEVER added

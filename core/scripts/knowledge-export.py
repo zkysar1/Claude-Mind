@@ -127,6 +127,68 @@ def _read_node_body(tree_dir: Path, file_rel: str) -> str:
     return _strip_front_matter(text)[:_NODE_BODY_CAP]
 
 
+#: Where ``_tree.yaml`` is looked for, in preference order. The FIRST entry is the
+#: framework convention every other reader shares (``<world>/knowledge/tree`` — CLAUDE.md,
+#: ``tree.py``, ``retrieve.sh``) and stays first so a conformant world is never ambiguous.
+#: The second is the mind-sidecar layout: ``bootstrap.sh`` has set
+#: ``WORLD_PATH=<workspace>/knowledge`` and created ``<workspace>/knowledge/tree`` since
+#: 5996fa7 (2026-07-17) and has never written the conformant path — so ``<world>/tree`` is
+#: not drift to be migrated away, it is a second live layout with 402 nodes in it.
+_TREE_LAYOUTS: tuple[tuple[str, ...], ...] = (("knowledge", "tree"), ("tree",))
+
+
+def _resolve_tree_dir(world_path: Path) -> Path | None:
+    """The directory whose ``_tree.yaml`` this world actually has, or ``None``.
+
+    Selection is by PRESENCE OF THE INDEX, never by presence of the directory — an empty
+    ``knowledge/tree/`` next to a populated ``tree/`` must not shadow it. That is the exact
+    regression a "just mkdir the conformant path in the provisioner" fix would have
+    introduced, so the ordering above is load-bearing only as a tie-break between two
+    layouts that BOTH carry an index.
+
+    Taking the non-conformant branch is announced on stderr: a compatibility fallback that
+    is silent is indistinguishable from the empty world it produces, which is the whole
+    defect this function exists to end (g-368-34; ``communication-clarity.md`` rule 5 —
+    the objection to fallbacks is that they MASK the source of a failure).
+    """
+    for i, parts in enumerate(_TREE_LAYOUTS):
+        candidate = world_path.joinpath(*parts)
+        if (candidate / "_tree.yaml").is_file():
+            if i:
+                print(
+                    f"[knowledge-export] WARNING: tree index found at non-conformant "
+                    f"{candidate} (framework layout is {world_path / 'knowledge' / 'tree'}). "
+                    f"Exporting it, but every OTHER framework tree reader will read it as EMPTY.",
+                    file=sys.stderr,
+                )
+            return candidate
+    return None
+
+
+def world_store_evidence(world_path: Path) -> dict[str, int]:
+    """Byte counts for the stores this world holds, whatever the bundle ended up saying.
+
+    The positive control for an all-zero bundle (``guard-2298``: print the unfiltered
+    population beside the zero). A world with readable bytes here and zeros in the bundle
+    is a BROKEN EXPORT; a world with zeros here is simply new, and must still export.
+    """
+    out: dict[str, int] = {}
+    tree_dir = _resolve_tree_dir(world_path)
+    if tree_dir is not None:
+        try:
+            out["tree_index_bytes"] = (tree_dir / "_tree.yaml").stat().st_size
+        except OSError:
+            pass
+    for name in ("reasoning-bank.jsonl", "guardrails.jsonl", "pipeline.jsonl"):
+        try:
+            size = (world_path / name).stat().st_size
+        except OSError:
+            continue
+        if size:
+            out[name] = size
+    return {k: v for k, v in out.items() if v}
+
+
 def read_tree_nodes(world_path: Path) -> list[dict[str, object]]:
     """Read ``_tree.yaml`` into node dicts shaped for :func:`project`.
 
@@ -138,10 +200,10 @@ def read_tree_nodes(world_path: Path) -> list[dict[str, object]]:
     projection suppresses that subtree anyway, so skipping the read keeps framework bodies
     out of memory entirely (defense in depth) and halves the per-export file reads.
     """
-    tree_dir = world_path / "knowledge" / "tree"
-    tree_yaml = tree_dir / "_tree.yaml"
-    if not tree_yaml.is_file():
+    tree_dir = _resolve_tree_dir(world_path)
+    if tree_dir is None:
         return []
+    tree_yaml = tree_dir / "_tree.yaml"
     data = yaml.safe_load(tree_yaml.read_text(encoding="utf-8")) or {}
     nodes = data.get("nodes") or {}
     out: list[dict[str, object]] = []
@@ -386,6 +448,24 @@ def main(argv: list[str] | None = None) -> int:
     bundle = build_bundle(
         world, project_root, extra_paths=(meta,) if meta else ()
     )
+
+    # An all-zero bundle over a world that demonstrably HOLDS knowledge is a broken
+    # export, and it is byte-indistinguishable from an honest export of a brand-new world
+    # — which is why 17 sidecar envs published empty wikis for weeks with nothing raising a
+    # hand. Refuse, loudly, and name the evidence; the caller (knowledge-export.sh) then
+    # leaves the previous bundle in place rather than replacing it with nothing. A world
+    # with no stores yet still exports its empty bundle, unchanged (g-368-34).
+    if not any(bundle.counts().values()):
+        evidence = world_store_evidence(world)
+        if evidence:
+            print(
+                f"[knowledge-export] REFUSING to write an all-zero bundle: {world} holds "
+                f"readable stores {evidence} but the projection produced "
+                f"{bundle.counts()}. This is a broken export, not an empty world. "
+                f"Nothing was written.",
+                file=sys.stderr,
+            )
+            return 2
 
     if fmt == "okf":
         if not out_dir:

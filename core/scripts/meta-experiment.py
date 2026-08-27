@@ -10,6 +10,7 @@ Subcommands:
 
 import argparse
 import json
+import re
 import sys
 from datetime import datetime
 
@@ -55,6 +56,37 @@ def next_id(experiments):
     return f"exp-meta-{max_num + 1:03d}"
 
 
+def resolve_dotpath(data, dotpath):
+    """Read-only dotpath resolution — an EXISTENCE check, never a mutation.
+
+    Returns (found, value, deepest_container, resolved_prefix). On a miss,
+    deepest_container is the last thing successfully navigated into, so the
+    caller can name the keys that ARE available at that level.
+
+    Deliberately NOT meta-yaml.navigate(): that helper "creates intermediate
+    dicts as needed for set operations", so it can never report a missing
+    segment — it materialises one. A setter's navigator is the wrong instrument
+    for a validity check (g-115-5154).
+    """
+    parts = re.sub(r"\[(\d+)\]", r".\1", dotpath).lstrip(".").split(".")
+    current = data
+    prefix = []
+    for part in parts:
+        if isinstance(current, list):
+            try:
+                current = current[int(part)]
+            except (ValueError, IndexError):
+                return False, None, current, ".".join(prefix)
+        elif isinstance(current, dict):
+            if part not in current:
+                return False, None, current, ".".join(prefix)
+            current = current[part]
+        else:
+            return False, None, current, ".".join(prefix)
+        prefix.append(part)
+    return True, current, None, dotpath
+
+
 def cmd_create(args):
     """Create a new A/B experiment."""
     active = read_yaml(META_DIR / "experiments" / "active-experiments.yaml")
@@ -65,6 +97,42 @@ def cmd_create(args):
     max_concurrent = config.get("experiments", {}).get("max_concurrent", 1)
     if len(experiments) >= max_concurrent:
         print(json.dumps({"error": f"Max {max_concurrent} concurrent experiments"}), file=sys.stderr)
+        sys.exit(1)
+
+    # : refuse a field that does not resolve in the target strategy
+    # file. An experiment on a nonexistent field can never accumulate a sample,
+    # so aspirations-evolve Step 0.7's "resolve only past min_duration_goals"
+    # gate can never fire — the record sits `active` forever, and that same step
+    # gates NEW experiments on `IF no active experiment`, so ONE typo silently
+    # blocks all A/B experimentation from that point on. Nothing errors and
+    # nothing reports. Measured: exp-meta-001 (field `weights.x`, which does not
+    # exist in goal-selection-strategy.yaml's 26 weight keys) held the single
+    # slot for 6 days and would have held it permanently.
+    #
+    # Fail-closed is safe here and the enumeration is small (guard-1562): the
+    # ONLY programmatic caller is aspirations-evolve/SKILL.md:251, the active
+    # slot is empty, and the sole historical field value across every stored
+    # experiment is `weights.x` — the defect itself. Zero legitimate existing
+    # patterns are refused by this check.
+    #
+    # This is the only moment the author can still correct the typo, which is
+    # why it refuses rather than warns.
+    strategy_path = META_DIR / args.strategy
+    if not strategy_path.exists():
+        print(json.dumps({
+            "error": f"strategy file not found: {args.strategy}",
+            "resolved_to": str(strategy_path),
+        }), file=sys.stderr)
+        sys.exit(1)
+    found, _value, container, resolved_prefix = resolve_dotpath(
+        read_yaml(strategy_path), args.field)
+    if not found:
+        print(json.dumps({
+            "error": f"field '{args.field}' does not resolve in {args.strategy}",
+            "resolved_prefix": resolved_prefix or "(root)",
+            "available_keys_at_prefix": (sorted(container.keys())
+                                         if isinstance(container, dict) else []),
+        }), file=sys.stderr)
         sys.exit(1)
 
     exp_id = next_id(experiments)
@@ -168,7 +236,48 @@ def cmd_list(args):
         data = read_yaml(META_DIR / "experiments" / "active-experiments.yaml")
         experiments = data.get("experiments", [])
 
-    print(json.dumps({"count": len(experiments), "experiments": experiments}, ensure_ascii=False, default=str))
+    # : an ACTIVE experiment holding zero samples cannot reach
+    # min_duration_goals, so Step 0.7's resolution gate never fires and the
+    # single slot stays occupied in silence. Surface it HERE — this is the call
+    # site aspirations-evolve reads (`meta-experiment.sh list --active`)
+    # immediately before deciding `IF no active experiment`, so a stuck record
+    # becomes visible at the exact moment it would otherwise block a new one.
+    # Report-only by design: it never resolves or mutates. An experiment can be
+    # legitimately young, and auto-resolving on a wall clock would discard real
+    # baselines; a human or the evolve step decides.
+    stuck = []
+    if not args.completed:
+        config = read_yaml(CONFIG_DIR / "meta.yaml")
+        after_hours = config.get("experiments", {}).get("stuck_after_hours", 48)
+        now = datetime.now()
+        for exp in experiments:
+            if exp.get("total_goals", 0):
+                continue
+            created = exp.get("created")
+            if not created:
+                continue
+            try:
+                age_h = (now - datetime.strptime(created, "%Y-%m-%dT%H:%M:%S")).total_seconds() / 3600.0
+            except (TypeError, ValueError):
+                continue
+            if age_h >= after_hours:
+                stuck.append({
+                    "id": exp.get("id"),
+                    "field": exp.get("field"),
+                    "strategy_file": exp.get("strategy_file"),
+                    "age_hours": round(age_h, 1),
+                    "total_goals": 0,
+                    "why": ("zero samples past " + str(after_hours) + "h — cannot reach "
+                            "min_duration_goals, so Step 0.7 will never resolve it; "
+                            "it is occupying the single slot. Verify the field resolves, "
+                            "then `meta-experiment.sh resolve --id <id>`."),
+                })
+
+    out = {"count": len(experiments), "experiments": experiments}
+    if stuck:
+        out["stuck"] = stuck
+        out["stuck_count"] = len(stuck)
+    print(json.dumps(out, ensure_ascii=False, default=str))
 
 
 def build_parser():

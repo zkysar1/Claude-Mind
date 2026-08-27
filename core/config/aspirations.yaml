@@ -378,13 +378,23 @@ stale_cadence:
 # budget_pct or move the sweep up the priority order.
 precheck:
   enabled: true                # global on/off
-  budget_pct: 15               # informational target — drop deferrable when zone==tight OR elapsed > budget
-  iteration_budget_ms: 600000  # nominal iteration wall-clock cap (10 min); budget = 15% = 90s. Raised 2026-05-10 (g-115-559) — observed precheck cost 100-300s under OneDrive sync; 9s cap (60s nominal) was dropping all deferrable sweeps every cycle. 90s allows fast cycles to complete deferrables, still drops slow/stalled cycles.
+  budget_pct: 15               # informational target — the ONLY drop path is zone_drop_rules below. The
+                               # `OR elapsed > budget` half this comment carried until 2026-08-26 was removed
+                               # from the meter by  (elapsed measured inter-tool-call LLM latency,
+                               # not script cost, so it dropped every deferrable sweep every iteration).
+  iteration_budget_ms: 600000  # nominal iteration wall-clock cap (10 min); budget = 15% = 90s. Raised 2026-05-10 (g-115-559) — observed precheck cost 100-300s under OneDrive sync; 9s cap (60s nominal) was dropping all deferrable sweeps every cycle. 90s allows fast cycles to complete deferrables. NOTE: since g-115-1489 this value drops NOTHING — cap_ms is telemetry only.
   zone_drop_rules:
     fresh: []                  # run all
     normal: []                 # run all (under autocompact 50%)
     tight: [deferrable]        # drop deferrable sweeps in tight zone
   drop_log: precheck-drops.jsonl  # appended under <agent>/session/
+  # `precheck-end` summary schema. sweeps_ran/sweeps_dropped count PERMISSION
+  # DECISIONS (a lane that asked the meter); sweeps_executed/tail_executed count
+  # COMPLETIONS reported by whatever ran the lane (). They are not
+  # interchangeable: a lane that runs without asking moves neither of the first
+  # two, which is how 34 of 43 tier-table lanes stayed dark for 90-208h across two
+  # boxes while sweeps_dropped:0 read as healthy. Read tail_executed to answer
+  # "did the medium/deferrable tail actually happen?".
 
 # --- ANTICIPATORY REFLECTION (Phase 3.96 / ; design: world/conventions/anticipated-failures.md) ---
 # Devil's-Advocate failure prediction BEFORE deep goals (Gate 1 = estimated_depth==deep),
@@ -1664,6 +1674,13 @@ pull_boost:
   enabled: true             # no-regression comes from the pull_signal REQUIREMENT (~no goal carries one), not from this flag
   boost: 4.0                # MEASURED, not picked: exploration_noise is ~U(0, 1.210) over 99.6% of candidates (cc-07, 1163 candidates, 2026-08-17), and the acceptance bar is beating a top substantive 2 points up — so the boost must clear 2 + 1.210 = 3.21 (guard-1895 (2): sizing against the deterministic deficit instead of the NOISE WIDTH is what makes a scorer fix look real and do nothing). Kept BELOW directive_boost's 4.5 raw max so a fresh USER directive still outranks a machine-set pull.
   max_age_hours: 24.0       # SAFETY VALVE, load-bearing: measured against coordination_merge._merge_goal, a one-sided SET survives cross-box merge (good) but CLEAR-BY-KEY-REMOVAL is RESURRECTED and CLEAR-BY-NULL loses on a same-or-older last_modified (seconds resolution — a same-second tie is reachable). Without an age bound a lost clear pins the goal at rank 1 forever, which is worse than the starvation being fixed.
+  carrier_consumer_goal: g-306-284   # the FIRST consumer, and the one both shipped producers stamp
+                            # (worker-loop Phase 3.8 via `pull-signal-set.sh --if-carrier-content`, and
+                            # `worker-ref-consume.sh --check`). It lives HERE rather than hardcoded in
+                            # either producer so the id has exactly one home (communication-clarity
+                            # rule 5). A producer invoked with no --goal falls back to it; an unset or
+                            # renamed key degrades to a loud SKIP-no-goal rather than silently stamping
+                            # the wrong record.
 
 # --- PRODUCTIVITY SELF-STOP GATE (Item 2) ---
 # Composite productivity score computed at end of each iteration (via
@@ -1887,6 +1904,15 @@ dry_idle_backoff:
 cargo_cult:
   multiplier: 1.5                 # per-goal auto-extend: new_interval = current * this
   cap_ratio: 3.0                  # per-goal auto-extend: max ratio new/original before Idea fallback
+  min_materiality_ratio: 0.01     # g-335-1415: suppress a batch proposal whose clamped delta is
+                                  # below this fraction of the current interval. Once a goal nears
+                                  # cap_ratio the min() truncates the step to a residue (+0.015%,
+                                  # +0.046% measured) that cannot change behaviour but still costs
+                                  # a review slot. NOT a tuning knob: the delta distribution is
+                                  # bimodal with an empty band from 0.05% to 28.57%, so 0.005-0.10
+                                  # all suppress the identical 2 of 134 rows. Re-measure the band
+                                  # before changing. 0 disables (zero-delta rows stay suppressed
+                                  # by the explicit proposed<=interval check above it).
   batch_audit_dedupe_hours: 24    # caller-side (recurring-close.sh) suppress: filters pending/in-progress only
   # Self-side temporal dedup (): cargo-cult-detector.py audit_all() suppresses
   # emission when ANY batch goal (regardless of status — completed/skipped/expired included)
@@ -2329,6 +2355,20 @@ git_drift:
   # because a fetch that races a partner's push can read one transient spike.
   # Env: GIT_DRIFT_TICKS_TO_FILE.
   ticks_to_file: 2
+  # Re-validation cadence for the probe's `fired` latch. `fired` is written only
+  # in the CLEARED branch, so while a breach PERSISTS it never takes the negative
+  # (guard-4870: a store written ONLY inside its own fire condition is a latch).
+  # Once fired, if the covering goal is closed -- or never landed -- while the
+  # breach continues, the box is breached + un-goaled + UN-REFILEABLE, because
+  # `not self.fired` short-circuits before the filer's own dedup can run. A
+  # latched detector has silently STOPPED DETECTING, and the fleet reads the
+  # quiet as health -- strictly worse than no detector, under the standing
+  # detection-outranks-attribution directive.
+  # 50 matches MirrorWedgeProbe.WEDGED_TICKS_TO_REVALIDATE so the twin probes
+  # re-file on ONE cadence rather than two that drift apart. Set 0 to disable
+  # re-validation and restore the pre-fix fire-once behaviour.
+  # Env: GIT_DRIFT_TICKS_TO_REVALIDATE.
+  ticks_to_revalidate: 50
 
 # ------------------------------------------------------------------
 # Infra-health failing-streak alerting ( — asp-249)

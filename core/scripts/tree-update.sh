@@ -396,13 +396,58 @@ sys.exit(1)
 '
 }
 
+# : the structural sibling of _assert_value_bytes above. `set` carries
+# a value whose LENGTH can be declared; --remove-child carries no value at all,
+# so the shipped byte check covers none of it. What a structural op CAN declare
+# from its own argv is the child key it asked to remove -- and the daemon now
+# returns the parent's children list AS STORED, so the two sides have distinct
+# origins (our argv vs the daemon's post-write structure) and this is not the
+# vacuous self-comparison guard-4592 names.
+#
+# The failure this makes non-silent: on 2026-08-20 --remove-child returned rc=0
+# with {"removed": ..., "parent": ...} -- both echoed straight back from the
+# request -- while the node stayed present in BOTH stores. A response built only
+# from request fields cannot report failure, so no caller could have detected it.
+#
+# FAIL-OPEN on anything unexpected (unparseable JSON, or an older daemon that
+# does not return parent_children). Same asymmetry _assert_value_bytes documents:
+# a false alarm would fire fleet-wide on the busiest write path, a miss costs one
+# undetected write -- but an older daemon therefore provides NO coverage here.
+_assert_child_removed() {
+    # shellcheck disable=SC2086
+    printf '%s' "$1" | TU_BODY="$BODY" $(rt_python_launcher) -c '
+import json, os, sys
+try:
+    sent = json.loads(os.environ["TU_BODY"])
+    child = sent.get("child_key")
+    resp = json.load(sys.stdin)
+    kids = resp.get("parent_children")
+except Exception:
+    sys.exit(0)
+if child is None or not isinstance(kids, list):
+    sys.exit(0)
+if child not in kids:
+    sys.exit(0)
+sys.stderr.write(
+    "tree-update.sh: STRUCTURAL INTEGRITY FAILURE -- asked to remove child %r "
+    "from parent %r, and the daemon reports it is STILL in the stored children "
+    "list (%d entries). The removal did NOT take effect; rc=0 and the "
+    "{removed,parent} echo above are built from the REQUEST and cannot report "
+    "this. Most likely a DUPLICATED child entry -- list.remove() drops only the "
+    "first occurrence -- so inspect the parent children list for repeats before "
+    "re-running. See g-115-7816 / guard-4592 / guard-1661.\n"
+    % (child, sent.get("parent"), len(kids)))
+sys.exit(1)
+'
+}
+
 BODY="$(_build_body)"
 
 rc=0
 RESPONSE="$(rt_call POST /v1/tree/write --body-string "$BODY")" || rc=$?
 
 case $rc in
-    0) _translate "$RESPONSE"; _assert_value_bytes "$RESPONSE"; exit $?;;
+    0) _translate "$RESPONSE"; _assert_value_bytes "$RESPONSE" && _assert_child_removed "$RESPONSE"; exit $?;;
     2)
         # 4xx/5xx terminal refusal — print the daemon body to stderr, exit 1.
         printf '%s\n' "$RESPONSE" >&2
@@ -413,7 +458,7 @@ case $rc in
         if rt_try_autospawn; then
             rc=0
             RESPONSE="$(rt_call POST /v1/tree/write --body-string "$BODY")" || rc=$?
-            if [ "$rc" = "0" ]; then _translate "$RESPONSE"; _assert_value_bytes "$RESPONSE"; exit $?; fi
+            if [ "$rc" = "0" ]; then _translate "$RESPONSE"; _assert_value_bytes "$RESPONSE" && _assert_child_removed "$RESPONSE"; exit $?; fi
             if [ "$rc" = "2" ]; then printf '%s\n' "$RESPONSE" >&2; exit 1; fi
         fi
         rt_no_daemon_error "tree-update.sh";;

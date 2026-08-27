@@ -731,38 +731,16 @@ Thresholds from `core/config/tree.yaml` `pruning` section.
 1. Scan candidates: `Bash: tree-read.sh --distill-candidates`
 2. For each candidate (largest line_count first, up to `max_distill_per_invocation`):
    a0. ACTION ROUTING (g-115-4058) — read the candidate's `recommended_action`
-      FIRST, before the coherence gate. This list is NOT all distills: a node
-      with `trigger == oversized_not_append_grown` carries
-      `recommended_action: regroup`, because it is too big to Read but has too
-      few dated sections for the rb-2085 archive + keep-newest-N rollup to have
-      anything to roll up. For those, do NOT invoke `/tree distill` — route them
-      to the SPLIT-OVERCAP PATH FORK (§ split-overcap step 0) and SKIP to the
-      next candidate. Only `recommended_action: distill` proceeds to 2.a below.
+      FIRST, before the coherence gate. This list is NOT all distills:
+        - `recommended_action: regroup` (`trigger == oversized_not_append_grown`)
+          -> do NOT invoke `/tree distill`, and do NOT route to REGROUP (§1.5) —
+          that arm is DORMANT BY DESIGN and cannot fire on them. Route to the
+          SPLIT-OVERCAP PATH FORK (§ split-overcap step 0) and SKIP to the next
+          candidate.
+        - `recommended_action: distill` -> proceed to 2.a below.
 
-      DO NOT route these to REGROUP (§1.5) — that arm is DORMANT BY DESIGN and
-      cannot fire on them (g-115-4147, measured 2026-07-30 alpha cc-04). REGROUP
-      triggers on `child_count > K_max`, and `core/config/tree.yaml:9` raised
-      K_max 4 -> 40 by user directive 2026-07-14, stating verbatim: "count-based
-      DECOMPOSE/REGROUP pressure is effectively retired; regroup on SEMANTIC
-      incoherence only." Measured consequence: `tree-read.sh
-      --redistribute-candidates` returns [] against the whole 1299-node tree,
-      and all four live arm members report `child_count: None` — two are LEAVES,
-      which have no children to regroup at all, so the old routing was
-      categorically wrong for them rather than merely unmet. The cost was not
-      theoretical: the arm holds the two MOST-RETRIEVED nodes in the tree
-      (framework-guardrails-and-gates, 438 retrievals / 30,633 est. tokens;
-      product-world-model, 247 / 29,535), both past the ~25k Read cap — so the
-      read-cap arm was silently exempting exactly the nodes the fleet reads most.
-
-      FIRST CHECK est_tokens >= 26413 — this arm's trigger is PROACTIVE and
-      splitting an under-cap node is a net harm (guard-2006 / rb-5894). The arm
-      fires at `token_trigger` = 0.8 * 25000 = 20000, i.e. deliberately BEFORE the
-      cap, which is free for the distill arm (an early rollup is non-destructive)
-      and NOT free here: structural surgery on an already-readable node fragments
-      coherent content and buys nothing. est_tokens = chars/2.3 is the LOW end of
-      the measured 2.31-2.43 band, so it runs high by up to ~5.7% and a node
-      reported at 100-106% of cap may be UNDER it. 26413 is that band's floor
-      (25000 * 2.43 / 2.3) — at or above it the node is over cap at ANY ratio.
+      Before taking the fork, CHECK est_tokens. This arm's trigger is PROACTIVE
+      and splitting an under-cap node is a net harm (guard-2006 / rb-5894):
         - est_tokens >= 26413        -> over cap for certain: take the FORK below.
         - est_tokens <  25000        -> readable in one Read: the arm's "too big to
           Read" premise is FALSE for it. Do NOT do structural surgery — fall
@@ -770,9 +748,6 @@ Thresholds from `core/config/tree.yaml` `pruning` section.
           `maintain_exempt`.
         - 25000 <= est_tokens < 26413 -> UNKNOWN, not over. Re-measure with a real
           tokenizer, or treat as under (conservative for a destructive-shaped op).
-      Measured 2026-07-30: of the 4 live arm members, checker-input-assumption-
-      defects (21680 est / 50156 chars) is UNDER cap and must NOT be split; the
-      other three (27820 / 29535 / 30633) clear 26413 and take the fork.
 
       THE FORK IS THE ROUTE — do not shorten this to "call split-overcap". Its
       step 0 is load-bearing: BOUNDARIES ARE INPUT, NEVER INFERRED. Enumerate the
@@ -782,15 +757,9 @@ Thresholds from `core/config/tree.yaml` `pruning` section.
           -> `/tree split-overcap <key> --boundaries "..."`
         - NO natural partition key, OR cross-cutting content sits NESTED inside
           one partition -> that is a DISTILL, not a split: `/tree distill`, STOP.
-      A leaf with 0 children normally takes this second branch. Skipping the fork
-      and splitting on an inferred boundary buries cross-cutting content in one
-      shard, which the fork exists to prevent.
-      Why this step is load-bearing: the read-cap size test fires INDEPENDENTLY
-      of append-grown-ness (that decoupling is the whole of g-115-4058), so
-      without this routing the nodes in the regroup arm would each
-      receive the destructive-shaped procedure that is wrong for them — the
-      false-positive class the conjunction originally existed to prevent. A
-      branched action that no caller reads changes no behavior.
+      A leaf with 0 children normally takes this second branch.
+      # Rationale (WHY the regroup arm is dormant, WHY the floor is 26413, WHY
+      # the fork may not be shortened): core/config/rationale/tree-distill-routing.md
    a. COHERENCE GATE (rb-94 / guard-896): body-read the candidate FIRST. If it
       coheres as one tight document flagged purely by low retrieval (niche, not
       bloated), set `maintain_exempt` to include "distill" and SKIP — do NOT

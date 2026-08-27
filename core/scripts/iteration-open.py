@@ -135,8 +135,43 @@ STAGES = (
             "dependency-timeout-check",
             "handoff-aging-check",
             "completed-not-closed-drain",
+            # Registered by the battery since  but absent from this
+            # tuple until . The STAGES header promises "the coverage
+            # arithmetic catching any disagreement between the two" — nothing
+            # actually compared them, so the lane RAN every iteration while
+            # `--dry-run` printed it unwired and not_yet_wired_count was inflated
+            # by one. Now pinned by test_iteration_open_stage_registry_parity.
+            "world-script-crlf-check",
         ),
-        "note": "the 5 always-run lanes that have one",
+        # Count re-derived from the tuple, never re-typed: the sibling battery's
+        # own docstring records seven stale "five lanes" claims from doing that.
+        "note": "the always-run lanes that have a standalone script",
+    },
+    {
+        # Strangler step 2 (). The medium tier ran nowhere between
+        # 2026-08-17 (the day this script landed and took over loop entry) and
+        # this stage: 208h dark on cc-04, 94.3h on cc-02, with sweeps_ran ==
+        # always_run_count on every row of the final 24h. The cause was NOT that
+        # anyone disagreed the tail should run -- SKILL.md Step 0-open says to
+        # resume at it in prose. The cause is that prose and a `Bash:` line are
+        # the same enforcement class (guard-399 amendment 2): both need a model to
+        # elect them, and the imperative below elects SELECTION instead. Moving
+        # the call into a script the flow already runs is the only remedy that
+        # changes WHO executes it. ~16.1 s for all 7 lanes, measured.
+        "key": "medium-battery",
+        "script": "precheck-medium-battery.sh",
+        "args": ("--json",),
+        "apply_flag": True,
+        "covers": (
+            "aspirations-recover-recurring",
+            "monitor-stale-check",
+            "precheck-eval",
+            "blocker-recheck",
+            "defer-recheck",
+            "precondition-defer-recheck",
+            "recurring-starvation-check",
+        ),
+        "note": "the 7 medium-tier lanes",
     },
 )
 
@@ -263,9 +298,28 @@ def _findings_from(stage_key, payload):
 
 
 def _blind_from(stage_key, payload):
+    """Lift a battery's blind lanes -- AND its dropped ones.
+
+    A budget-dropped lane did not run, so this script did not see what it would
+    have found. The drop was deliberate; the resulting ignorance is not, and
+    folding it into a `complete` report is precisely the guard-4093 collapse
+    ("found nothing" rendering identically to "could not look"). Only the medium
+    battery emits `dropped` today, so this is a no-op for every other stage.
+    """
     out = []
     if not isinstance(payload, dict):
         return out
+    for d in payload.get("dropped", []) or []:
+        if isinstance(d, dict):
+            out.append({
+                "stage": stage_key,
+                "name": d.get("name", stage_key),
+                "reason": "dropped: " + str(d.get("reason", "budget meter")),
+            })
+        else:
+            out.append({
+                "stage": stage_key, "name": stage_key, "reason": f"dropped: {d}",
+            })
     for b in payload.get("blind", []) or []:
         if isinstance(b, dict):
             out.append({
@@ -294,7 +348,7 @@ def _coverage(rows):
         "wired_count": len(wired),
         "not_yet_wired_count": len(unwired),
         "by_tier": {k: len(v) for k, v in sorted(by_tier.items())},
-        "stage": "always-run only (strangler step 1 — medium/deferrable follow)",
+        "stage": "always-run + medium (strangler step 2 — deferrable follows)",
     }
 
 
@@ -339,8 +393,113 @@ def _emit(report, as_json):
     # (3) Selection candidates.
     cands = report.get("candidates")
     if cands is not None:
-        print("\nSELECTION: %s candidate(s); top: %s"
-              % (cands.get("count", "?"), cands.get("top") or "(none)"))
+        if cands.get("all_blocked"):
+            # Every goal is blocked. Surface the routing information the
+            # all-blocked handler needs (blocked_count / by_reason) instead of
+            # printing "0 candidate(s); top: (none)", which reads as a quiet
+            # nothing-to-do and hides the fact that the queue is wedged.
+            by_reason = cands.get("by_reason") or {}
+
+            def _n(v):
+                return v.get("count", 0) if isinstance(v, dict) else (v or 0)
+
+            # Sort by count so the 5 shown are the LARGEST reasons, not the
+            # first 5 in dict order -- and say so when the rest are elided. A
+            # silently-truncated list reads as the complete picture, which is
+            # exactly wrong when the operator is deciding how a wedged queue
+            # got that way.
+            ordered = sorted(by_reason.items(), key=lambda kv: -_n(kv[1]))
+            shown, rest = ordered[:5], ordered[5:]
+            top_reasons = ", ".join("%s=%s" % (k, _n(v)) for k, v in shown) \
+                or "(none reported)"
+            if rest:
+                top_reasons += " (+%d more reason(s) not shown)" % len(rest)
+            print("\nSELECTION: ALL BLOCKED — %s blocked goal(s); by_reason: %s"
+                  % (cands.get("blocked_count", "?"), top_reasons))
+            print("[iteration-open] every goal is blocked — route to the "
+                  "all-blocked handler (Skill(aspirations-all-blocked)), not to "
+                  "a claim.")
+        else:
+            top = cands.get("top") or "(none)"
+            print("\nSELECTION: %s candidate(s); top: %s"
+                  % (cands.get("count", "?"), top))
+            # PREMISE-SUPERSESSION CHECK on the top candidate (gap-142, satisfied
+            # by extension rather than by SKILL.md #130 against a 100-skill cap).
+            # Placed HERE for the reason the medium-battery comment above gives:
+            # prose and a `Bash:` line are the same enforcement class, so the only
+            # remedy that changes WHO executes it is a call inside a script the
+            # flow already runs. A goal's cited measurement is a premise with an
+            # expiry; this surfaces the citations and their age at the one moment
+            # the reader is deciding whether to claim.
+            # FAIL-OPEN by contract: loop entry must never break on this.
+            m = re.match(r'\s*(g-\d+-\d+)', str(top))
+            if m:
+                try:
+                    r = subprocess.run(
+                        [sys.executable,
+                         str(SCRIPT_DIR / "premise_supersession_check.py"),
+                         m.group(1), "--json", "--root", str(PROJECT_ROOT)],
+                        capture_output=True, text=True, timeout=45)
+                    # A NON-ZERO CHILD IS A FAILURE THE PARENT MUST VOICE
+                    # ( fresh-eyes F-001). The child is LOUD BY
+                    # CONTRACT — on any load failure it writes its diagnostic to
+                    # STDERR and exits 2 with stdout EMPTY. Gating only on
+                    # `stdout.strip()` therefore printed NOTHING on every such
+                    # failure, and the `except` below never fires because
+                    # subprocess.run itself succeeded. That is byte-identical to
+                    # a dead call site — the precise failure this whole advisory
+                    # exists to prevent, reproduced in its own caller. It is not
+                    # hypothetical: the child's bare-`.sh` argv[0] (F-002, fixed
+                    # alongside) makes rc=2 the PERMANENT state on any box where
+                    # Windows CreateProcess cannot exec a shell script.
+                    if r.returncode not in (0, 1) or not r.stdout.strip():
+                        why = (r.stderr or "").strip().splitlines()
+                        print("[premise-supersession] check FAILED (rc=%s) — the top "
+                              "candidate's premise is UNVERIFIED, not clean.%s"
+                              % (r.returncode,
+                                 ("  " + why[0]) if why else ""))
+                    else:
+                        d = json.loads(r.stdout)
+                        if d.get("verdict") == "RE-MEASURE-BEFORE-EXECUTING":
+                            print("[premise-supersession] %s: filed %s (%sd ago) with "
+                                  "%d cited measurement(s) — RE-MEASURE BEFORE EXECUTING."
+                                  % (d["goal_id"], d.get("filed") or "?",
+                                     d.get("age_days"), d["cited_measurement_count"]))
+                            for c in d["cited_measurements"][:6]:
+                                print("    cites: %s" % c)
+                            if d.get("commits_touching_named_paths_since_filing"):
+                                print("    %d commit(s) touched its named paths since "
+                                      "filing — may already be remediated."
+                                      % len(d["commits_touching_named_paths_since_filing"]))
+                        elif d.get("own_record_fields_present"):
+                            print("[premise-supersession] %s carries %s — read it before "
+                                  "any scope reasoning (guard-2803)."
+                                  % (d["goal_id"],
+                                     ", ".join(d["own_record_fields_present"])))
+                        else:
+                            # THE QUIET BRANCH IS PRINTED ON PURPOSE ().
+                            # Without this line the clean case emits nothing, which is
+                            # byte-identical to the block never executing — and the
+                            # handler below is fail-open, so a dead call site produces
+                            # no error either. Measured: on the first live --apply entry
+                            # after wiring, the top candidate was 0d old with no
+                            # outcome_note, both branches above were correctly silent,
+                            # and there was no way to tell working from dead. An
+                            # advisory built to fight "green is its only observable
+                            # state" must not itself have only one observable state.
+                            print("[premise-supersession] %s: %dd old, %d cited "
+                                  "measurement(s), no prior execution note — nothing to "
+                                  "re-measure." % (d["goal_id"], d.get("age_days") or 0,
+                                                   d.get("cited_measurement_count", 0)))
+                except Exception as e:
+                    # FAIL-OPEN, NOT SILENT. A bare `pass` here already hid one
+                    # real defect during authoring (a missing import raised
+                    # NameError and the check simply never fired, with green as
+                    # its only observable state — guard-1977). Behaviour stays
+                    # fail-open: loop entry is never blocked. But say so.
+                    print("[premise-supersession] check did not run (%s: %s) — "
+                          "the top candidate's premise is UNVERIFIED, not clean."
+                          % (type(e).__name__, str(e)[:120]))
 
     # (4) The imperative, mirroring iteration-close's ═══ ITERATION COMPLETE ═══.
     n_find = len(findings)
@@ -355,10 +514,32 @@ def _emit(report, as_json):
         verdict = "%d finding(s) need disposition" % n_find
 
     print("\n[iteration-open] ═══ ITERATION OPEN ═══ (%s)" % verdict)
+    # Name the residue, ABOVE the imperative. The imperative must remain the
+    # LAST line (test_terminal_line_is_the_next_action_imperative pins it as
+    # the line that survives summarization), so this states what did not run
+    # without displacing what to do next.
+    #
+    # It does not ASK for anything. This line does not ASK for anything -- asking is what
+    # failed for 208h (guard-399 amendment 2: re-wording an instruction does not
+    # change who executes it), and the always-run + medium tiers above now run
+    # without being asked. What it prevents is the reader concluding, from an
+    # imperative that mentions only SELECTION, that loop entry is COMPLETE. It is
+    # not: the deferrable tier is still unwired, and a reader who wants those
+    # lanes must invoke them deliberately (guard-1760 -- report what did NOT run).
+    unwired = (cov or {}).get("not_yet_wired_count")
+    if unwired:
+        print("[iteration-open] NOT COVERED BY THIS ENTRY: %d tier-table lane(s) "
+              "remain unwired (the deferrable tier). They did not run and nothing "
+              "above reflects them — `--dry-run` lists them by name." % unwired)
     print("[iteration-open] NEXT ACTION REQUIRED: dispose the findings above "
-          "(each becomes a goal, a defer, or an explicit no-op), then claim from "
-          "SELECTION and enter execution — Skill(aspirations-execute) as the "
-          "reducer, or worker-loop Phase 2 CLAIM as a worker Body.")
+          "(each becomes a goal, a defer, or an explicit no-op). THEN, AS THE "
+          "REDUCER, RESUME aspirations-precheck AT ITS FIRST DEFERRABLE SWEEP — "
+          "this entry ran the always-run AND medium tiers, but the deferrable "
+          "tier is still unwired, so going straight to SELECTION silently skips "
+          "it and the meter still reads sweeps_dropped=0 (g-115-7847). Only "
+          "after that tail, claim from SELECTION and enter execution — "
+          "Skill(aspirations-execute). A worker Body runs NO precheck tail: "
+          "dispose, then worker-loop Phase 2 CLAIM.")
 
 
 def _selection(runner):
@@ -372,7 +553,32 @@ def _selection(runner):
         d = json.loads(out)
     except Exception as exc:
         return {"count": None, "top": None, "error": f"unparseable selector output: {exc}"}
+    # goal-selector cmd_select emits TWO legitimate top-level shapes. Normal case:
+    # a bare LIST of ranked candidates. ALL-BLOCKED case: a DICT carrying
+    # all_blocked/blocked_count/by_reason (goal-selector.py cmd_select, the
+    # collect_blocked branch). Rejecting the dict made this stage report an ERROR
+    # in exactly the state whose signal the iteration most needs -- every goal
+    # blocked -- and the all-blocked routing information was discarded with it
+    # (; settled as a legitimate branch, NOT producer drift, by
+    # ). Shape check precedes any type-specific .get() call (guard-3075).
+    #
+    # count 0 here is a MEASURED zero (the selector ran and found no eligible
+    # candidates), and it must stay distinguishable from the count None returned
+    # on every error path above and below -- a failed measurement is not a
+    # measurement of zero (guard-1091). That is why this branch sets count and
+    # never sets "error".
+    if isinstance(d, dict) and d.get("all_blocked"):
+        cands = d.get("candidates") or []
+        return {
+            "count": len(cands),
+            "top": None,
+            "all_blocked": True,
+            "blocked_count": d.get("blocked_count"),
+            "by_reason": d.get("by_reason"),
+        }
     if not isinstance(d, list):
+        # Still an error for genuinely unexpected shapes -- a dict WITHOUT
+        # all_blocked is not a shape either producer branch emits.
         return {"count": None, "top": None, "error": f"expected a list, got {type(d).__name__}"}
     top = d[0] if d else None
     return {
@@ -492,7 +698,8 @@ def dry_run(as_json=False, md_path=None) -> int:
         print("%-16s %-12s %-6s %s" % (
             l["phase"][:16], l["tier"], "yes" if l["wired"] else "-", l["sweep"]))
     print("\n[iteration-open] %d lanes in the tier table; %d dispatched by this "
-          "battery (always-run only — medium/deferrable are the next strangler step)"
+          "battery (always-run + medium; the deferrable tier is the next "
+          "strangler step)"
           % (len(lanes), sum(1 for l in lanes if l["wired"])))
     return 0
 

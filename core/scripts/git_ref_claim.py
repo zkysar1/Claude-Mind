@@ -203,6 +203,35 @@ class GitRefClaimStore:
             else _stale_seconds()
         )
         self.ref_prefix = ref_prefix
+        #: stderr tail of the most recent FAILED claim-namespace fetch, or None
+        #: when the last fetch succeeded. Surfaced by the daemon's claims
+        #: listing so an empty ``claims`` after a failed fetch is never read as
+        #: "no holder" (2026-08-27 coach-mind: the listing said ``[]`` while
+        #: every acquire failed, and the operator's agent chased phantom refs).
+        self.last_fetch_error: Optional[str] = None
+
+    @classmethod
+    def default_remote(cls, repo_root) -> str:
+        """The remote the claim store should arbitrate on.
+
+        Precedence: ``RUNNER_CLAIM_REMOTE`` (explicit operator choice) → a remote
+        literally named ``claims`` when the repo has one → ``origin``.
+
+        The ``claims`` convention exists because ``origin`` is the WRONG arbiter
+        for a self-contained single-box deployment whose origin is a repo it can
+        only read: coach-mind's origin is the staging repo over anonymous HTTPS,
+        so every push — and therefore every acquire — fails (measured
+        2026-08-27, zc-03). A bare repo on the box, added as ``git remote add
+        claims /path/to/claims.git``, gives the store a writable CAS arbiter
+        that touches no cloud resource. Every box that runs the agent must
+        share the same ``claims`` remote; on a single box that is trivially true.
+        """
+        explicit = (os.environ.get("RUNNER_CLAIM_REMOTE") or "").strip()
+        if explicit:
+            return explicit
+        if cls.available(repo_root, "claims"):
+            return "claims"
+        return "origin"
 
     @classmethod
     def available(cls, repo_root, remote: str = "origin") -> bool:
@@ -260,7 +289,14 @@ class GitRefClaimStore:
         whether the fetch succeeded.
         """
         refspec = f"+{self.ref_prefix}/*:{self.ref_prefix}/*"
-        self._git("fetch", self.remote, refspec, check=False)
+        p = self._git("fetch", self.remote, refspec, check=False)
+        if p.returncode != 0:
+            tail = (p.stderr or p.stdout or "").strip().splitlines()
+            self.last_fetch_error = (
+                f"fetch of {self.ref_prefix}/* from {self.remote} failed (rc={p.returncode}): "
+                + (tail[-1] if tail else "no output"))
+        else:
+            self.last_fetch_error = None
 
     def _read_ref(self, ref: str):
         """Return ``(oid, payload_dict)`` for a claim ref, or ``(None, None)``.
@@ -321,7 +357,21 @@ class GitRefClaimStore:
             # does not need another network round trip.
             self._git("update-ref", ref, new_oid, check=False)
             return True
-        return False
+        if _is_lease_rejection(push.stderr or ""):
+            return False
+        # Anything else — no credentials for the remote, an unreachable host, a
+        # remote that is not a repository, a server-side hook refusal — is NOT a
+        # lost race, and reporting it as one turns an auth failure into
+        # "another machine owns a live claim" (measured 2026-08-27, coach-mind
+        # on zc-03: anonymous-read origin, no push credential, every acquire
+        # answered HELD while the claim store was empty; the operator's agent
+        # spent 103 minutes and destroyed the repo's object store chasing a
+        # phantom holder). Fail LOUD with the remote's own words instead.
+        tail = [ln for ln in (push.stderr or "").strip().splitlines() if ln.strip()]
+        raise GitRefClaimError(
+            f"push to remote '{self.remote}' failed (rc={push.returncode}) — not a "
+            f"lease rejection, so no peer holds the claim; the store is unwritable "
+            f"here: {tail[-1] if tail else 'no stderr'}")
 
     # ------------------------------------------------------------- public API
 
@@ -487,6 +537,20 @@ class GitRefClaimStore:
         stored = payload.get("runner_token_fp")
         mine = _fingerprint(token)
         return bool(stored) and bool(mine) and stored == mine
+
+
+_LEASE_REJECTION_MARKERS = ("stale info", "fetch first", "[rejected]")
+
+
+def _is_lease_rejection(stderr: str) -> bool:
+    """True iff a failed push was git refusing the ``--force-with-lease`` CAS
+    (the ordinary lost-race outcome). A ``[remote rejected]`` is a server-side
+    refusal (hook, protection, permissions) and is deliberately NOT a race.
+    """
+    text = stderr or ""
+    if "[remote rejected]" in text:
+        return False
+    return any(marker in text for marker in _LEASE_REJECTION_MARKERS)
 
 
 def _default_machine_id() -> str:

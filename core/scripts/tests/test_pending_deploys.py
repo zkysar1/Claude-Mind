@@ -582,6 +582,64 @@ def test_add_fail_open_non_git_dir():
             "non-git --dir must fail-open (register), never silently skip"
 
 
+# ── : an owner-less repo is unresolvable BY CONSTRUCTION ──────────
+#
+# guard-4166: this fix's effect is an ABSENCE — a malformed row stops being
+# recorded — and an absence assertion is satisfied by the DO-NOTHING world. A
+# cmd_add that recorded nothing at all would also pass "the bad row is not in
+# the store". So the refusal assertions below are deliberately PAIRED with a
+# positive-existence control in the SAME test: the qualified row must STILL be
+# recorded. Under a mutant that reverts the guard, the refusal assertions go
+# RED while the control stays GREEN — that asymmetry is the evidence, not the
+# redness. Do NOT "simplify" the control away; without it both halves would be
+# green against a completely dead cmd_add.
+
+def test_tracker_add_still_records_qualified_repo():
+    """POSITIVE CONTROL for the two refusal pins below (guard-4166).
+
+    It lives in its OWN test on purpose. Folded into the refusal test it would
+    be unobservable: the refusal assertion fires first, so the test would go
+    red under the mutant before this half ever executed, and 'is the control
+    still green?' — the actual evidence — could not be answered. Separate, the
+    mutation run reads directly: this GREEN, the two refusal pins RED.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        store = Path(td) / "pd.yaml"
+        ok = _tracker(store, "add", "--repo", "zkysar1/Ayoai-Operator", "--sha", "b" * 40,
+                      "--goal-id", "g-1", "--dir", "/d")
+        assert ok.returncode == 0, f"qualified repo must still record: {ok.stderr}"
+        rows = json.loads(_tracker(store, "list", "--json").stdout)
+        assert [r["repo"] for r in rows] == ["zkysar1/Ayoai-Operator"], rows
+
+
+def test_tracker_add_refuses_owner_less_repo():
+    """`gh api repos/Ayoai-Operator` is a 404 on every box and in every session,
+    so recording that row manufactures an obligation that can never clear —
+    measured: two such rows sat unresolvable for 19 days (g-335-1313)."""
+    with tempfile.TemporaryDirectory() as td:
+        store = Path(td) / "pd.yaml"
+        bad = _tracker(store, "add", "--repo", "Ayoai-Operator", "--sha", "1aa65b9",
+                       "--goal-id", "g-335-809", "--dir", "")
+        assert bad.returncode == 2, f"expected refusal rc=2, got {bad.returncode}"
+        assert "REFUSED" in bad.stderr, bad.stderr
+        rows = json.loads(_tracker(store, "list", "--json").stdout)
+        assert rows == [], f"malformed row must not be stored: {rows}"
+
+
+def test_tracker_resolve_reports_malformed_repo_as_usage_error():
+    """rc 3 ('usage error (kept)') separates an unresolvable entry from a
+    transient gh failure. Both previously printed rc=2 through the gate's
+    catch-all else-branch, so the log line could not tell a reader whether to
+    inspect the ENTRY or re-check gh auth — and two agents chose gh, twice."""
+    with tempfile.TemporaryDirectory() as td:
+        store = Path(td) / "pd.yaml"
+        r = _tracker(store, "resolve", "--repo", "Ayoai-Operator", "--sha", "1aa65b9")
+        assert r.returncode == 3, f"expected rc=3, got {r.returncode}: {r.stdout}{r.stderr}"
+        out = json.loads(r.stdout)
+        assert out["status"] == "malformed-repo", out
+        assert out["cleared"] is False, out
+
+
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-q"]))

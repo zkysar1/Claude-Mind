@@ -621,6 +621,29 @@ def _save_to_history_store(path, base_dir, agent_name, summary):
     Disabled when FILEOPS_HISTORY_USE_NEW_STORE=0. DO NOT set in
     production: without this writer AND without
     FILEOPS_HISTORY_KEEP_LEGACY_WRITES=1, no snapshot lands at all.
+
+    RETENTION IS NOT ABSENT HERE -- IT IS AGE-BASED AND LIVES ELSEWHERE.
+    This writer makes no `_prune_to_cap` call, and that is correct, not a
+    gap: `_prune_to_cap` is the per-file snapshot COUNT cap for the legacy
+    gzip tree, and its only call site is the legacy writer directly above.
+    The CAS store is bounded by an AGE-based vacuum instead --
+    `history_vacuum_archive.py`, invoked on a 24h gate by
+    `history-vacuum-tick.sh` from the iteration-close maintenance tick,
+    governed by `core/config/aspirations.yaml` section `history_vacuum`.
+    That config block is the SSOT for the window; deliberately not restated
+    here, because a value copied into a comment goes stale silently
+    (guard-4457).
+
+    The window bounds LOCAL DISK, not recoverability: payloads are archived
+    to the remote S3 graveyard and verified there BEFORE local deletion, and
+    the graveyard prefix carries a transition-only lifecycle (no expiry), so
+    a dropped payload stays restorable indefinitely. Design, decisions and
+    measurements: tree node `system/history-store-gc-cadence`.
+
+    Reading this function's lack of a prune call as "the CAS store is
+    unpruned" is a wrong-mechanism inference -- absence of mechanism A is
+    not absence of retention. Measured against that premise 2026-08-24
+    (g-115-7358) and falsified at the store level.
     """
     if os.environ.get("FILEOPS_HISTORY_USE_NEW_STORE", "1") == "0":
         return

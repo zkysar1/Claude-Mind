@@ -152,7 +152,11 @@ PROJECT_ROOT = CORE_ROOT.parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse)
-from _dependency_graph import norm_blocked_by  # noqa: E402  SSOT (guard-547)
+from _dependency_graph import (  # noqa: E402  SSOT (guard-547)
+    norm_blocked_by,
+    resolve_dependency,
+    supersession_target,
+)
 from _runtime_bash import bash_cmd  # noqa: E402   Windows-safe bash resolution
 import _rt  # noqa: E402  canonical Python -> daemon client
 
@@ -441,6 +445,42 @@ def _classify_ref(ref_id, goal_index, pq_index, pq_complete=True):
         # branch at all only because main() folds the archive into goal_index.
         _where = ("an ARCHIVED aspiration" if _g.get("_archived")
                   else "the live queue")
+        # SUPERSESSION-AWARE (). A goal closed `skipped`/`superseded`
+        # may have had its work MOVED to another goal rather than abandoned, and
+        # a status-equality check cannot see that. Measured 2026-08-26: a
+        # duplicate chain closed `skipped` with supersession notes was read as
+        # NOT-done by a re-probe, which re-deferred two just-unblocked goals on a
+        # premise that was already false — zero vinheim goals selectable across
+        # 1,400 ranked for ~4h.
+        #
+        # Only followed when a pointer actually exists, so the flat-view rebuild
+        # below costs nothing on the overwhelmingly common path. `satisfied`
+        # requires the SUPERSEDING goal to be completed: supersession moves the
+        # obligation, it does not discharge it, so a chain ending in another
+        # skip stays unresolved rather than silently satisfying the dependency.
+        if supersession_target(_g):
+            _flat = {k: v[1] for k, v in goal_index.items()}
+            _verdict, _resolved_id, _chain = resolve_dependency(rid, _flat)
+            if _verdict == "satisfied":
+                return (True,
+                        f"goal {rid} is {status} but was superseded by "
+                        f"{_resolved_id}, which is completed "
+                        f"(chain {' -> '.join(_chain)})", "goal")
+            if _verdict == "cycle":
+                # A looping superseded_by chain is a data defect, not a
+                # resolution. None (not False) — it cannot be decided here.
+                return (None,
+                        f"goal {rid} has a CYCLIC supersession chain "
+                        f"({' -> '.join(_chain)}) — repoint it; the dependency "
+                        f"cannot be resolved while it loops", "goal")
+            if _verdict == "open":
+                return (False,
+                        f"goal {rid} is {status}, superseded by {_resolved_id} "
+                        f"which is NOT completed — the obligation moved, it was "
+                        f"not discharged", "goal")
+            # "unknown" — the superseding goal is absent from live AND archive.
+            # guard-1890: absence is ignorance, never evidence. Fall through to
+            # the plain status read rather than guessing.
         return (status in TERMINAL_STATUSES,
                 f"goal {rid} is {status} (found in {_where})", "goal")
     if rid in pq_index:

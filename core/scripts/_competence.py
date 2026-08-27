@@ -33,7 +33,18 @@ import yaml
 N_KNOWLEDGE = 50      # target tree-node count for "broad baseline"
 N_PIPELINE = 5        # target (resolved + 0.5*active) for "judgment applied"
 N_ENCODED = 20        # target (rb + 0.5*guard) for "lessons captured"
-N_COMPLETION = 25     # target completed-goals for "work delivered"
+N_COMPLETION = 25     # target completed-goals for "work delivered" (world-scoped, legacy)
+
+# Agent-attributable completion target (). The three other components
+# above are WORLD-scoped by construction -- the tree, pipeline, reasoning-bank and
+# guardrails have no per-agent partition -- so they cannot discriminate between
+# agents and are excluded from the gate metric. Only completion carries a usable
+# agent attribution (`completed_by`), so it alone feeds average_competence.
+# Calibrated 2026-08-26 against the live cumulative spread (archive + live,
+# `completed_by`): alpha 694, bravo 506, zeta 170, echo 150, foxtrot 50 -- chosen
+# so the distribution straddles BOTH live gate thresholds (0.25 and 0.55) with no
+# agent pinned at the cap.
+N_COMPLETION_AGENT = 800
 
 # The one metric dotpath this producer owns (curriculum.yaml gate `metric`).
 COMPETENCE_METRIC = "developmental-stage.current_assessment.average_competence"
@@ -143,6 +154,52 @@ def count_jsonl(path: Path, predicate) -> int:
     return n
 
 
+def count_completed_goals_by(path: Path, agent_name: str | None) -> int:
+    """Completed goals in `path`, optionally restricted to `completed_by == agent`.
+
+    `agent_name=None` counts every completed goal (the legacy world-scoped
+    behaviour). A named agent counts only goals it completed, which is the one
+    genuinely agent-attributable signal in the evidence set (g-115-5153).
+    """
+    if not path.exists():
+        return 0
+    n = 0
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            asp = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        for g in asp.get("goals", []):
+            if g.get("status") != "completed":
+                continue
+            if agent_name is None or g.get("completed_by") == agent_name:
+                n += 1
+    return n
+
+
+def count_agent_completions(world_dir: Path, agent_dir: Path, agent_name: str) -> int:
+    """Cumulative completions attributable to `agent_name`.
+
+    COUNTS THE ARCHIVE, and that is load-bearing rather than thorough
+    (guard-2347). Completed goals LEAVE `aspirations.jsonl` for
+    `aspirations-archive.jsonl` as part of ordinary lifecycle, so a live-store-only
+    count measures a population whose members exit on their own: it would SAWTOOTH
+    DOWNWARD every time archival runs, reporting a competence REGRESSION no
+    behaviour caused. Measured on cc-08 2026-08-26: 2,372 completed goals in the
+    archive against 555 live -- a live-only count sees 19% of the history.
+    """
+    return (
+        count_completed_goals_by(world_dir / "aspirations.jsonl", agent_name)
+        + count_completed_goals_by(world_dir / "aspirations-archive.jsonl", agent_name)
+        # the agent's own queue is agent-scoped by construction; its records
+        # predate the completed_by convention, so count them unfiltered.
+        + count_completed_goals_by(agent_dir / "aspirations.jsonl", None)
+    )
+
+
 def count_completed_goals(path: Path) -> int:
     if not path.exists():
         return 0
@@ -161,7 +218,7 @@ def count_completed_goals(path: Path) -> int:
     return n
 
 
-def assess(world_dir: Path, agent_dir: Path) -> dict:
+def assess(world_dir: Path, agent_dir: Path, agent_name: str | None = None) -> dict:
     tree_nodes = count_tree_nodes_with_files(world_dir)
     pipeline_path = world_dir / "pipeline.jsonl"
     resolved = count_jsonl(pipeline_path, lambda r: r.get("stage") == "resolved")
@@ -177,16 +234,41 @@ def assess(world_dir: Path, agent_dir: Path) -> dict:
     world_completed = count_completed_goals(world_dir / "aspirations.jsonl")
     agent_completed = count_completed_goals(agent_dir / "aspirations.jsonl")
     total_completed = world_completed + agent_completed
+    # Identity is the CALLER's resolved agent name, not a path basename. Both
+    # production callers already hold an authoritative one (`AGENT_NAME` from
+    # MIND_AGENT on the CLI; `ctx.paths.agent_name` from the request on the
+    # daemon, which the sibling _evaluate_gate call already threads), so
+    # re-deriving it here from agent_dir.name was a second source of truth for
+    # one value. It agrees in production only because agent_dir IS
+    # agents/<name>; any caller passing a path whose basename is not the agent
+    # name silently scores 0 attributed completions, which is indistinguishable
+    # from an agent that has genuinely completed nothing. The basename stays as
+    # the fallback so this module keeps its pure-function contract (explicit
+    # Path args, no _paths import) and every existing caller is unchanged.
+    agent_name = agent_name or agent_dir.name
+    agent_attributed = count_agent_completions(world_dir, agent_dir, agent_name)
 
     knowledge_density = min(1.0, tree_nodes / N_KNOWLEDGE)
     pipeline_activity = min(1.0, (resolved + 0.5 * active) / N_PIPELINE)
     encoded_lessons = min(1.0, (rb_active + 0.5 * guard_active) / N_ENCODED)
-    completion_breadth = min(1.0, total_completed / N_COMPLETION)
+    completion_breadth = min(1.0, agent_attributed / N_COMPLETION_AGENT)
 
-    average = round(
-        (knowledge_density + pipeline_activity + encoded_lessons + completion_breadth) / 4,
-        4,
-    )
+    # average_competence is AGENT-ATTRIBUTABLE and equals completion_breadth alone
+    # (). It is not a four-way mean any more, and the name is retained
+    # deliberately: it is the `metric` dotpath of 8 live metric_threshold gates
+    # across 4 agents' curriculum.yaml, and this Body can only edit its own.
+    # Renaming the key would break the 3 it cannot repair.
+    #
+    # The other three components stay COMPUTED and REPORTED for diagnostics but
+    # are excluded from the gate metric, because each is world-scoped by
+    # construction and so identical for every agent sharing the world. Measured
+    # 2026-08-26: five agents, four different assessment timestamps, all reading
+    # average_competence exactly 1.0 -- a per-agent graduation gate keyed to a
+    # world-level measurement certified nothing.
+    #
+    # NOT COMPARABLE TO PRIOR VALUES (guard-1881): the basis changed, so a stored
+    # 1.0 from before this date is not a higher reading of the same quantity.
+    average = round(completion_breadth, 4)
 
     return {
         "average_competence": average,
@@ -205,12 +287,21 @@ def assess(world_dir: Path, agent_dir: Path) -> dict:
             "completed_goals_world": world_completed,
             "completed_goals_agent": agent_completed,
             "completed_goals_total": total_completed,
+            "completed_goals_agent_attributed": agent_attributed,
+        },
+        "gate_component": "completion_breadth",
+        "component_scope": {
+            "knowledge_density": "world",
+            "pipeline_activity": "world",
+            "encoded_lessons": "world",
+            "completion_breadth": "agent",
         },
         "normalization": {
             "N_knowledge": N_KNOWLEDGE,
             "N_pipeline": N_PIPELINE,
             "N_encoded": N_ENCODED,
             "N_completion": N_COMPLETION,
+            "N_completion_agent": N_COMPLETION_AGENT,
         },
         "stage_assessment": assess_stage(world_dir),
     }
@@ -263,7 +354,7 @@ def write_developmental_stage(agent_dir: Path, result: dict) -> Path:
     return stage_path
 
 
-def refresh_competence_for_gates(gates, world_dir, agent_dir) -> str:
+def refresh_competence_for_gates(gates, world_dir, agent_dir, agent_name=None) -> str:
     """Refresh the competence metric iff a gate consumes it. FAIL-OPEN.
 
     Called by both curriculum evaluate implementations immediately before
@@ -283,7 +374,7 @@ def refresh_competence_for_gates(gates, world_dir, agent_dir) -> str:
         )
         if not consumes:
             return "skipped"
-        result = assess(Path(world_dir), Path(agent_dir))
+        result = assess(Path(world_dir), Path(agent_dir), agent_name)
         write_developmental_stage(Path(agent_dir), result)
         return "ok"
     except Exception as exc:  # fail-open by contract

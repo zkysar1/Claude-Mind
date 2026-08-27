@@ -43,6 +43,54 @@ WORKER_LOOP = (SCRIPTS.parent.parent / ".claude" / "skills" / "worker-loop" / "S
 
 GID = "g-777-01"
 
+#  — the provenance marker closure-evidence-write.sh appends to every
+# note it writes on a RECURRING goal. Its ABSENCE is the discriminator: an
+# unmarked note on a recurring goal was written by a human for THIS occurrence
+# and must never be superseded.
+#
+# WHAT THE MARKER DOES AND DOES NOT SAY, because the fixtures below depend on the
+# difference. It says "this script wrote this note". It does NOT say "at a PRIOR
+# occurrence" — a worker's Phase 3.9 narrative is also written through this
+# script and is therefore also marked. That case stays the job of --no-supersede,
+# where the CALLER declares it is mid-occurrence. The two layer: the marker
+# catches hand-written notes, the flag catches same-occurrence script writes.
+# Fixtures representing script-written notes must therefore carry the marker, or
+# they select the wrong branch and prove the wrong thing.
+CE_AUTO_MARK = "[closure-evidence:auto]"
+CE_DEFER_MARK = "[closure-evidence:deferred]"
+
+
+def _marked(body, ach=1, when="2026-08-20T04:00:00"):
+    """Render `body` as this script would have written it on a recurring goal."""
+    return (f"{body}\n\n{CE_AUTO_MARK} written {when} by "
+            f"closure-evidence-write.sh (achievedCount={ach}) - absence of this "
+            f"line on a recurring goal means a human wrote the note, so it is "
+            f"never superseded; see g-115-7733.")
+
+
+def _deferred(body, ach=1, when="2026-08-25T04:00:00"):
+    """Render `body` as the DECLINE path would have preserved it ().
+
+    The deferral marker records the achievedCount it was stamped at, and that
+    number is load-bearing rather than decorative: it is what separates a NEXT
+    occurrence (stamped count < current) from a SAME-occurrence retry (stamped
+    count == current). A presence-only fixture would pass both tests below and
+    prove neither.
+
+    THIS HELPER ARMS THE DISCRIMINATOR ON PURPOSE, and that is the distinction
+    the goal's own check 1 is about. A fixture standing in for a real stamped
+    note must match; what must NOT match is PROSE that merely mentions the
+    token, which is why the matcher is anchored to line start plus the full
+    written shape and why TestAnchoredMarkerMatch below exists.
+    """
+    return (f"{body}\n\n{CE_DEFER_MARK} written {when} by "
+            f"closure-evidence-write.sh (achievedCount={ach}) - the note above "
+            f"predates the provenance marker or was hand-written, so THIS "
+            f"occurrence preserved it rather than superseding it. The NEXT "
+            f"occurrence (achievedCount > {ach}) MAY supersede it. Prior text "
+            f"is recoverable from world/.history/snapshots/aspirations.jsonl/; "
+            f"see g-115-7853.")
+
 STUB_UPDATE = """#!/usr/bin/env bash
 { for a in "$@"; do printf '%s\\n' "---ARG---"; printf '%s\\n' "$a"; done; } >> "$UPDATE_SINK"
 exit 0
@@ -408,7 +456,7 @@ class TestBothOrchestratorsCallIt:
 
 class TestRecurringSupersede:
 
-    NOTE = "prior occurrence narrative, 6 hours old"
+    NOTE = _marked("prior occurrence narrative, 6 hours old")
 
     def test_recurring_at_achieved_two_supersedes_the_prior_note(self, tmp_path):
         """Verification outcome 1: a recurring goal closed twice in a row with a
@@ -516,10 +564,10 @@ class TestRecurringSupersede:
         s2 = _stage(tmp_path / "at")
         _, below = _run(tmp_path / "below", s1,
                         ["--goal", GID, "--source", "world", "--summary", "x"],
-                        existing_note="p", recurring=True, achieved=1)
+                        existing_note=_marked("p"), recurring=True, achieved=1)
         _, at = _run(tmp_path / "at", s2,
                      ["--goal", GID, "--source", "world", "--summary", "x"],
-                     existing_note="p", recurring=True, achieved=2)
+                     existing_note=_marked("p"), recurring=True, achieved=2)
         assert below == [], f"achievedCount=1 superseded anyway: {below!r}"
         assert len(at) == 1, f"achievedCount=2 did not supersede: {at!r}"
 
@@ -557,9 +605,10 @@ class TestRecurringSupersede:
         so without this a retry re-supersedes its own note and the header's
         'superseded N chars' counts its own previous header."""
         script = _stage(tmp_path)
-        already = ("[closure-evidence] SUPERSEDES a prior-occurrence note of 41 chars "
-                   "— recurring occurrence achievedCount=4.\n\nthe summary this run "
-                   "already wrote")
+        already = _marked(
+            "[closure-evidence] SUPERSEDES a prior-occurrence note of 41 chars "
+            "— recurring occurrence achievedCount=4.\n\nthe summary this run "
+            "already wrote", ach=4)
         proc, writes = _run(tmp_path, script,
                             ["--goal", GID, "--source", "world",
                              "--summary", "the summary this run already wrote"],
@@ -578,7 +627,8 @@ class TestRecurringSupersede:
         proc, writes = _run(tmp_path, script,
                             ["--goal", GID, "--source", "world",
                              "--summary", "a genuinely new occurrence summary"],
-                            existing_note="[closure-evidence] SUPERSEDES ...\n\nlast run's text",
+                            existing_note=_marked(
+                                "[closure-evidence] SUPERSEDES ...\n\nlast run's text", ach=4),
                             recurring=True, achieved=4)
         assert len(writes) == 1, (
             f"the idempotency check swallowed a NEW summary: {writes!r} "
@@ -606,7 +656,12 @@ class TestNoSupersedeFlag:
     than by a record shape that never qualified.
     """
 
-    RICH = "worker Phase 3.9 narrative, written seconds ago in THIS occurrence\n\nparagraph two"
+    # MARKED: Phase 3.9 writes this narrative BY CALLING this script, so a real
+    # worker note carries the marker. Leaving it unmarked would make the
+    # flag-declines test pass because of the MARKER rather than the FLAG — a
+    # false pass that would hide a regression in --no-supersede itself.
+    RICH = _marked("worker Phase 3.9 narrative, written seconds ago in THIS "
+                   "occurrence\n\nparagraph two", ach=3)
 
     def test_flag_declines_the_supersede_and_preserves_the_note(self, tmp_path):
         script = _stage(tmp_path)
@@ -691,3 +746,439 @@ class TestNoSupersedeFlag:
             "protects the Phase 3.9 narrative")
         assert "its note write is write-if-absent" not in txt, (
             "the falsified contract sentence is still present")
+
+
+# ─── : the silent clobber and the lying failure message ───────────
+
+
+# A stub that REFUSES the write exactly as field-shrink-guard does. The daemon
+# shape is the live one (mind_api/src/endpoints/aspirations_write.py); the CLI
+# path (core/scripts/aspirations.py) emits the same `field_shrink_blocked` token
+# in prose, and the fix keys on the token so both shapes classify.
+STUB_UPDATE_SHRINK = """#!/usr/bin/env bash
+{ for a in "$@"; do printf '%s\\n' "---ARG---"; printf '%s\\n' "$a"; done; } >> "$UPDATE_SINK"
+printf '%s\\n' '{"error":"field_shrink_blocked","gate":"field-shrink-guard","field":"outcome_note","old_len":2567,"new_len":407,"ratio":0.159,"detail":"field_shrink_blocked: writing `outcome_note` would shrink it from 2567 chars to 407 (16% of the original, floor is 25%). (goal g-777-01)"}'
+exit 1
+"""
+
+
+def _stage_shrink(tmp_path):
+    core = tmp_path / "core" / "scripts"
+    core.mkdir(parents=True)
+    (core / "closure-evidence-write.sh").write_text(
+        HELPER.read_text(encoding="utf-8"), encoding="utf-8")
+    (core / "aspirations-update-goal.sh").write_text(STUB_UPDATE_SHRINK, encoding="utf-8")
+    (core / "aspirations-query.sh").write_text(STUB_QUERY, encoding="utf-8")
+    for f in core.iterdir():
+        f.chmod(0o755)
+    return core / "closure-evidence-write.sh"
+
+
+class TestSilentClobberOfAHandWrittenNote:
+    """DEFECT 1 — the recurring branch had no never-clobber test and the one-shot
+    branch did, so a note an agent hand-wrote for THIS occurrence was replaced.
+
+    WHY THE SILENT CASE IS THE ONE THAT MATTERS. field-shrink-guard only refuses
+    below 25%, so the LOUD case (a note >4x the summary) was already survivable
+    by accident of length — measured 2026-08-25 on g-326-516, a 2,567-char note
+    against a 407-char summary, ratio 0.159. A note merely LONGER but under 4x
+    clears the floor, the write proceeds, and nothing is emitted on stdout,
+    stderr, or the rc. That population was never measured because it leaves no
+    trace at all.
+    """
+
+    # 300 chars against a 200-char summary: ratio 0.67, comfortably ABOVE the
+    # 0.25 floor, so field-shrink-guard would NOT have refused this write.
+    HAND_WRITTEN = "H" * 300
+    SUMMARY = "S" * 200
+
+    def test_hand_written_note_on_a_recurring_goal_survives(self, tmp_path):
+        """Verification check 1. The stub update script ALWAYS exits 0, so a
+        surviving note proves closure-evidence-write.sh itself declined — it
+        cannot be a shrink gate saving it, because there is no gate in this
+        fixture at all. That separation is the whole point: pre-fix, this exact
+        record was replaced with no warning anywhere.
+
+        ASSERTS SURVIVAL DIRECTLY, NOT VIA `writes == []` (g-115-7853). This
+        test used to require that NO write occurred at all. That was a valid
+        proxy while the decline path was a bare `exit 0`, and it is exactly what
+        made the path permanently wedged: a note that is never written can never
+        acquire a provenance marker, so every later occurrence re-entered this
+        branch and dropped its evidence at rc=0. The decline now preserves the
+        note AND stamps a deferral line, so the proxy is superseded — but the
+        property it was defending is unchanged and is now checked head-on: the
+        hand-written text must survive BYTE-EXACT, and the summary must not
+        appear anywhere in the record. That is a strictly stronger claim than
+        'nothing happened', because it would also catch a write that preserved
+        the length while corrupting the content.
+        """
+        script = _stage(tmp_path)
+        proc, writes = _run(tmp_path, script,
+                            ["--goal", GID, "--source", "world",
+                             "--summary", self.SUMMARY],
+                            existing_note=self.HAND_WRITTEN,
+                            recurring=True, achieved=6)
+        assert proc.returncode == 0, proc.stderr
+        assert len(writes) == 1, (
+            f"expected exactly one preserving write: {writes!r} {proc.stderr!r}")
+        argv = writes[0]
+        written = argv[argv.index("outcome_note") + 1]
+        assert written.startswith(self.HAND_WRITTEN), (
+            "the hand-written note must survive BYTE-EXACT at the front of the "
+            f"record — this is the silent clobber case: {written[:340]!r}")
+        assert self.SUMMARY not in written, (
+            "the summary reached the record: the note WAS clobbered, which is "
+            f"the whole defect this class pins: {written!r}")
+        assert CE_DEFER_MARK in written, (
+            "the decline must stamp the deferral marker, or the goal stays "
+            f"wedged forever (g-115-7853): {written!r}")
+        assert "carries no [closure-evidence:auto]" in proc.stdout, (
+            "guard-2536: the decline must announce ITSELF, or this test cannot "
+            f"tell 'declined here' from 'never ran': {proc.stdout!r}")
+
+    def test_a_marked_prior_note_with_the_same_shape_still_supersedes(self, tmp_path):
+        """TWO-WAY CONTROL (guard-1220 / rb-4133). Byte-identical record except
+        the marker, so the test above cannot be passing because the fixture
+        never selected the supersede branch. Without this, 'never supersede when
+        any note exists' would pass the sibling test and silently re-open
+        g-115-6527."""
+        script = _stage(tmp_path)
+        proc, writes = _run(tmp_path, script,
+                            ["--goal", GID, "--source", "world",
+                             "--summary", self.SUMMARY],
+                            existing_note=_marked(self.HAND_WRITTEN, ach=5),
+                            recurring=True, achieved=6)
+        assert proc.returncode == 0, proc.stderr
+        assert len(writes) == 1, (
+            f"a genuine prior-occurrence note stopped being superseded: {writes!r} "
+            f"stdout={proc.stdout!r}")
+
+    def test_one_shot_notes_are_still_written_byte_exact(self, tmp_path):
+        """The marker is RECURRING-ONLY. A one-shot goal must still receive the
+        narrative unaltered — the contract test_writes_the_note_when_absent
+        pins. This asserts the narrowing from the other side."""
+        script = _stage(tmp_path)
+        proc, writes = _run(tmp_path, script,
+                            ["--goal", GID, "--source", "world",
+                             "--summary", "one-shot narrative"],
+                            existing_note="", recurring=False, achieved=0)
+        assert proc.returncode == 0, proc.stderr
+        assert len(writes) == 1, f"expected a write: {writes!r}"
+        argv = writes[0]
+        assert argv[argv.index("outcome_note") + 1] == "one-shot narrative", (
+            "a one-shot note must reach the record byte-exact; the provenance "
+            f"marker leaked onto the one-shot path: {argv!r}")
+
+    def test_a_recurring_first_write_is_marked_so_the_next_occurrence_can_tell(self, tmp_path):
+        """The re-arm. `_rec` had to be hoisted out of the `if [[ -n $_existing ]]`
+        block for this path to see it: this is the FIRST close of a recurring
+        goal (no note yet), and if its write went out unmarked the next
+        occurrence would read it as hand-written and never supersede again."""
+        script = _stage(tmp_path)
+        proc, writes = _run(tmp_path, script,
+                            ["--goal", GID, "--source", "world",
+                             "--summary", "first occurrence narrative"],
+                            existing_note="", recurring=True, achieved=1)
+        assert proc.returncode == 0, proc.stderr
+        assert len(writes) == 1, f"expected a first write: {writes!r}"
+        written = writes[0][writes[0].index("outcome_note") + 1]
+        assert written.startswith("first occurrence narrative"), (
+            f"the narrative must lead; the marker is TRAILING: {written!r}")
+        assert CE_AUTO_MARK in written, (
+            "a recurring first write went out UNMARKED, so the supersede branch "
+            f"can never re-arm on this goal: {written!r}")
+
+    def test_the_marker_is_trailing_so_it_does_not_eat_the_300_char_preview(self, tmp_path):
+        """MEASURED PLACEMENT. aspirations.py:2810 previews the note as
+        `outcome_note[:300]`. A leading marker is charged against that window,
+        and the supersede header already spends ~200 of those 300 chars."""
+        script = _stage(tmp_path)
+        body = "N" * 280
+        proc, writes = _run(tmp_path, script,
+                            ["--goal", GID, "--source", "world", "--summary", body],
+                            existing_note="", recurring=True, achieved=1)
+        written = writes[0][writes[0].index("outcome_note") + 1]
+        assert CE_AUTO_MARK not in written[:300], (
+            "the provenance marker landed inside the 300-char preview window: "
+            f"{written[:300]!r}")
+
+
+class TestFieldShrinkRefusalMessage:
+    """DEFECT 2 — the failure message asserted something the script could not
+    know, and the remedy it printed destroyed the note the gate had just saved.
+
+    When field-shrink-guard is the refuser, "the narrative is NOT on the record"
+    is false BY CONSTRUCTION: the gate refused precisely BECAUSE a longer note is
+    there. The prescribed re-run then either failed identically or, with
+    --override-shrink, replaced the full note with the summary (guard-5049).
+    """
+
+    def test_the_refusal_does_not_claim_the_narrative_is_absent(self, tmp_path):
+        """Verification check 2, half one."""
+        script = _stage_shrink(tmp_path)
+        proc, _ = _run(tmp_path, script,
+                       ["--goal", GID, "--source", "world", "--summary", "short"],
+                       existing_note="", recurring=False, achieved=0)
+        assert proc.returncode == 0, "NON-FATAL BY CONTRACT — callers must not branch on rc"
+        assert "is NOT on the record" not in proc.stderr, (
+            "the message still asserts the narrative is absent while the gate "
+            f"refused BECAUSE a longer one is present: {proc.stderr!r}")
+        assert "NO ACTION IS NEEDED" in proc.stderr, (
+            f"the refusal must say the note is safe: {proc.stderr!r}")
+        assert "2567" in proc.stderr, (
+            f"the surviving old_len must be reported: {proc.stderr!r}")
+
+    def test_no_override_shrink_remedy_is_prescribed(self, tmp_path):
+        """Verification check 2, half two, and outcome 3. --override-shrink may
+        appear ONLY as a prohibition, never as an instruction."""
+        script = _stage_shrink(tmp_path)
+        proc, _ = _run(tmp_path, script,
+                       ["--goal", GID, "--source", "world", "--summary", "short"],
+                       existing_note="", recurring=False, achieved=0)
+        for line in proc.stderr.splitlines():
+            if "--override-shrink" in line:
+                assert "Do NOT" in line or "do NOT" in line, (
+                    f"--override-shrink is prescribed rather than forbidden: {line!r}")
+
+    def test_the_gate_payload_is_surfaced_verbatim(self, tmp_path):
+        """guard-3662 / guard-1007: the refusal JSON is the caller's only
+        evidence for 'did this actually fail?'. The pre-fix code discarded it
+        and then asserted an outcome it had no evidence for."""
+        script = _stage_shrink(tmp_path)
+        proc, _ = _run(tmp_path, script,
+                       ["--goal", GID, "--source", "world", "--summary", "short"],
+                       existing_note="", recurring=False, achieved=0)
+        assert "field_shrink_blocked" in proc.stderr, (
+            f"the gate's own payload was swallowed: {proc.stderr!r}")
+
+    def test_an_unclassified_failure_still_warns_but_verifies_first(self, tmp_path):
+        """TWO-WAY CONTROL: a non-shrink failure must still be loud. Otherwise
+        the fix could degrade into 'never warn', which loses the real failures
+        the original message existed to surface."""
+        core = tmp_path / "core" / "scripts"
+        core.mkdir(parents=True)
+        (core / "closure-evidence-write.sh").write_text(
+            HELPER.read_text(encoding="utf-8"), encoding="utf-8")
+        (core / "aspirations-update-goal.sh").write_text(
+            '#!/usr/bin/env bash\n'
+            '{ for a in "$@"; do printf \'%s\\n\' "---ARG---"; printf \'%s\\n\' "$a"; done; } >> "$UPDATE_SINK"\n'
+            'echo "daemon unreachable" >&2\nexit 7\n', encoding="utf-8")
+        (core / "aspirations-query.sh").write_text(STUB_QUERY, encoding="utf-8")
+        for f in core.iterdir():
+            f.chmod(0o755)
+        proc, _ = _run(tmp_path, core / "closure-evidence-write.sh",
+                       ["--goal", GID, "--source", "world", "--summary", "x"],
+                       existing_note="", recurring=False, achieved=0)
+        assert proc.returncode == 0
+        assert "write FAILED" in proc.stderr, (
+            f"a genuine failure stopped being reported: {proc.stderr!r}")
+        assert "VERIFY BEFORE WRITING" in proc.stderr, (
+            f"even a genuine failure must not prescribe a blind re-run: {proc.stderr!r}")
+
+
+def test_the_recurring_branch_reads_a_this_vs_prior_signal():
+    """Verification check 3 — a source-level assertion, deliberately.
+
+    The behavioural tests above prove the branch DECLINES; this proves it
+    declines for the stated REASON. Without it the suite would still pass
+    against a branch that refused for an unrelated coincidence.
+    """
+    src = HELPER.read_text(encoding="utf-8")
+    assert 'CE_AUTO_MARK="[closure-evidence:auto]"' in src, \
+        "the provenance marker constant is gone"
+    assert 'CE_DEFER_MARK="[closure-evidence:deferred]"' in src, \
+        "the deferral marker constant is gone — the decline path cannot stamp"
+    assert "_ce_marker_ach" in src, \
+        "the recurring branch no longer reads a THIS-vs-PRIOR occurrence signal"
+    # NEGATIVE PIN ( outcome 3). The bare substring test is the
+    # fragility, not an implementation detail: it matched the token ANYWHERE in
+    # the note, so any prose mentioning it — a close note explaining the decline,
+    # this very file's docstrings — reclassified a hand-written artifact as
+    # script output and made it eligible for destruction. Asserting the anchored
+    # matcher EXISTS does not prevent the substring test coming back beside it,
+    # so its absence is pinned separately.
+    #
+    # SCOPED TO EXECUTABLE LINES, and the reason is worth the four extra lines:
+    # written as a whole-file substring test, this assertion FAILED on its first
+    # run — against the COMMENT in closure-evidence-write.sh that quotes the old
+    # expression to explain what was removed. That is the defect under repair,
+    # reproduced one level up: a bare substring test over a corpus that contains
+    # prose about itself. De-arming the prose would have been the smaller edit
+    # and the wrong lesson; the comment is load-bearing documentation and the
+    # PIN is what was mis-shaped.
+    live = [ln for ln in src.splitlines() if not ln.lstrip().startswith("#")]
+    offenders = [ln for ln in live if '"$_existing" != *"$CE_AUTO_MARK"*' in ln]
+    assert offenders == [], (
+        "the bare-substring discriminator is back in executable code; prose "
+        f"mentioning the token re-arms destruction of a hand-written note: {offenders}")
+    emitters = [ln for ln in src.splitlines()
+                if ln.strip().startswith(("echo", "printf"))
+                and "the narrative is NOT on the record" in ln]
+    assert emitters == [], f"the false assertion is still emitted: {emitters}"
+
+
+class TestDeclinePathStampsSoTheGoalCanUnwedge:
+    """ — the decline branch preserved the note and dropped THIS
+    occurrence's evidence, permanently.
+
+    MEASURED TWICE against world/aspirations.jsonl before the fix: cc-08
+    2026-08-26 read 90 recurring / 17 note-absent / 73 note-present / 0 marked /
+    63 wedged; cc-07 the same day read 90 / 17 / 73 / 0 / 64 over a 19,263,903-byte
+    file with 2,978 goals parsed as a positive control. The counts agree and the
+    extra wedged goal is one that closed in between. Nothing could ever clear it:
+    the marker is written at the BOTTOM of the script and this branch exited
+    before reaching it, so the note stayed unmarked and every later occurrence
+    re-entered the same branch. Skewed to the highest-frequency goals —
+    achievedCount 349, 342, 277, 187.
+    """
+
+    HAND_WRITTEN = "H" * 300
+    SUMMARY = "S" * 200
+
+    def test_the_next_occurrence_may_supersede_a_deferred_note(self, tmp_path):
+        """Outcome 2 + outcome 4. The unwedge itself: a note preserved and
+        stamped at occurrence 6 is superseded at occurrence 7."""
+        script = _stage(tmp_path)
+        proc, writes = _run(tmp_path, script,
+                            ["--goal", GID, "--source", "world",
+                             "--summary", self.SUMMARY],
+                            existing_note=_deferred(self.HAND_WRITTEN, ach=6),
+                            recurring=True, achieved=7)
+        assert proc.returncode == 0, proc.stderr
+        assert len(writes) == 1, (
+            f"the goal is still wedged at the next occurrence: {writes!r} "
+            f"{proc.stdout!r} {proc.stderr!r}")
+        argv = writes[0]
+        written = argv[argv.index("outcome_note") + 1]
+        assert "SUPERSEDES" in written, f"not a supersede: {written[:200]!r}"
+        assert self.SUMMARY in written, (
+            f"this occurrence's evidence still did not reach the record: {written!r}")
+
+    def test_a_same_occurrence_retry_does_not_supersede(self, tmp_path):
+        """THE HAZARD THE RECORDED COUNT EXISTS FOR. recurring-close.sh
+        documents retrying a failed verify by name, so 'has a deferral marker'
+        cannot by itself authorize a supersede — a retry would destroy the
+        artifact inside the very occurrence that just preserved it. Stamped at 6,
+        re-run at 6: decline, and write NOTHING (re-stamping would append a
+        duplicate line on every retry and grow the note without bound)."""
+        script = _stage(tmp_path)
+        note = _deferred(self.HAND_WRITTEN, ach=6)
+        proc, writes = _run(tmp_path, script,
+                            ["--goal", GID, "--source", "world",
+                             "--summary", self.SUMMARY],
+                            existing_note=note, recurring=True, achieved=6)
+        assert proc.returncode == 0, proc.stderr
+        assert writes == [], (
+            f"a same-occurrence retry wrote to the record: {writes!r}")
+        assert "idempotent re-run" in proc.stdout, (
+            f"guard-2536: the retry decline must announce itself: {proc.stdout!r}")
+
+    def test_the_deferral_write_does_not_claim_authorship(self, tmp_path):
+        """CE_AUTO_MARK asserts 'written by closure-evidence-write.sh'. The note
+        on the decline path was written by someone else and merely appended to,
+        so stamping it would be a false provenance claim — and would grant the
+        next occurrence a supersede on evidence of the wrong thing."""
+        script = _stage(tmp_path)
+        proc, writes = _run(tmp_path, script,
+                            ["--goal", GID, "--source", "world",
+                             "--summary", self.SUMMARY],
+                            existing_note=self.HAND_WRITTEN,
+                            recurring=True, achieved=6)
+        argv = writes[0]
+        written = argv[argv.index("outcome_note") + 1]
+        assert CE_AUTO_MARK not in written, (
+            f"the decline path claimed authorship of a note it preserved: {written!r}")
+
+    def test_the_deferral_is_trailing_so_the_preview_still_shows_the_note(self, tmp_path):
+        """aspirations.py previews outcome_note[:300]. The preserved artifact is
+        what a reader needs to see, so the stamp goes at the END — same reason
+        the provenance marker is trailing."""
+        script = _stage(tmp_path)
+        proc, writes = _run(tmp_path, script,
+                            ["--goal", GID, "--source", "world",
+                             "--summary", self.SUMMARY],
+                            existing_note=self.HAND_WRITTEN,
+                            recurring=True, achieved=6)
+        argv = writes[0]
+        written = argv[argv.index("outcome_note") + 1]
+        assert CE_DEFER_MARK not in written[:300], (
+            f"the stamp ate the 300-char preview window: {written[:300]!r}")
+
+    def test_first_occurrence_is_untouched_by_any_of_this(self, tmp_path):
+        """TWO-WAY CONTROL. achievedCount==1 means no prior occurrence exists, so
+        an existing note can only be hand-written for THIS one — it must not be
+        stamped, deferred, or superseded. Without this the fix could pass every
+        test above by simply stamping everything."""
+        script = _stage(tmp_path)
+        proc, writes = _run(tmp_path, script,
+                            ["--goal", GID, "--source", "world",
+                             "--summary", self.SUMMARY],
+                            existing_note=self.HAND_WRITTEN,
+                            recurring=True, achieved=1)
+        assert proc.returncode == 0, proc.stderr
+        assert writes == [], f"the first occurrence was written to: {writes!r}"
+
+
+class TestAnchoredMarkerMatch:
+    """ outcome 3 — the discriminator was a bare substring test.
+
+    NOT HYPOTHETICAL. The worker that filed this goal quoted the marker token in
+    its own close note to EXPLAIN why the supersede had declined. That armed the
+    old test against both that evidence and a preserved 2026-06-30 artifact, and
+    it was caught only at read-back. Any diagnostic note about this mechanism
+    arms the substring form — which is why the fixtures here are prose, and why
+    the check is that prose does NOT match.
+    """
+
+    SUMMARY = "S" * 200
+
+    def test_prose_mentioning_the_token_does_not_arm_the_discriminator(self, tmp_path):
+        """The exact shape that armed it live: a hand-written note whose text
+        discusses the marker mid-sentence. It must still DECLINE."""
+        note = ("Occurrence note: the supersede declined here because the "
+                f"record carries no {CE_AUTO_MARK} anywhere in it, which is "
+                "the provenance signal the branch reads.")
+        script = _stage(tmp_path)
+        proc, writes = _run(tmp_path, script,
+                            ["--goal", GID, "--source", "world",
+                             "--summary", self.SUMMARY],
+                            existing_note=note, recurring=True, achieved=4)
+        assert proc.returncode == 0, proc.stderr
+        assert len(writes) == 1, f"expected a preserving write: {writes!r}"
+        argv = writes[0]
+        written = argv[argv.index("outcome_note") + 1]
+        assert written.startswith(note), (
+            "prose mentioning the token was read as script authorship and the "
+            f"note was superseded: {written[:220]!r}")
+        assert "SUPERSEDES" not in written, (
+            f"the note was destroyed by a prose mention: {written!r}")
+
+    def test_a_line_starting_with_the_token_still_needs_the_written_shape(self, tmp_path):
+        """Anchoring alone is not enough. A note whose LINE begins with the
+        token but which lacks the ' by closure-evidence-write.sh
+        (achievedCount=N)' tail is still not this script's output."""
+        note = f"{CE_AUTO_MARK} - I am pasting the marker at the start of a line."
+        script = _stage(tmp_path)
+        proc, writes = _run(tmp_path, script,
+                            ["--goal", GID, "--source", "world",
+                             "--summary", self.SUMMARY],
+                            existing_note=note, recurring=True, achieved=4)
+        argv = writes[0]
+        written = argv[argv.index("outcome_note") + 1]
+        assert "SUPERSEDES" not in written, (
+            f"a bare token at line start was accepted as authorship: {written!r}")
+
+    def test_a_genuinely_marked_note_still_matches(self, tmp_path):
+        """TWO-WAY CONTROL (guard-1220). The tests above would all pass against
+        a matcher that never matches anything, which would re-open g-115-6527 by
+        making every recurring note permanently un-supersedable."""
+        script = _stage(tmp_path)
+        proc, writes = _run(tmp_path, script,
+                            ["--goal", GID, "--source", "world",
+                             "--summary", self.SUMMARY],
+                            existing_note=_marked("prior occurrence body", ach=3),
+                            recurring=True, achieved=4)
+        argv = writes[0]
+        written = argv[argv.index("outcome_note") + 1]
+        assert "SUPERSEDES" in written, (
+            f"a genuinely marked note stopped being supersedable: {written!r}")

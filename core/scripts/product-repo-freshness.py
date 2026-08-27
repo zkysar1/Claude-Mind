@@ -1130,6 +1130,163 @@ def vacuity(enumerated_count, selected_count, lookup_ok=True):
     return False, None
 
 
+def _repo_for_path(path, enumerated):
+    """The enumerated product repo containing `path`, or None.
+
+    Walks UP from the path — which need NOT exist, since a prior-art probe
+    often names a file precisely because it may be absent — and returns the
+    first ancestor that is both a git repo and a MEMBER of `enumerated`.
+    Membership is required rather than incidental: the Mind framework repo is
+    itself a git repo and is already kept current by iteration-push, so a
+    check against a `core/scripts/...` path must decline to judge instead of
+    re-reporting a repo this mode does not own.
+    """
+    try:
+        p = Path(path).resolve()
+    except Exception:
+        return None
+    members = {str(Path(r).resolve()) for r in enumerated}
+    for cand in [p] + list(p.parents):
+        if str(cand) in members and _is_repo(cand):
+            return cand
+    return None
+
+
+def check_read(path, interval_min=PULL_INTERVAL_MIN, do_fetch=True,
+               enumerated=None):
+    """May `path` be read as EVIDENCE about what a product repo contains?
+
+    The mechanical half of a rule the fleet has now written down TEN times
+    (guard-5217, and guard-1759 / 2000 / 2005 / 2204 / 2311 / 2528 / 3822 /
+    4280 before it). `--pull` above actuated the on-default case; this covers
+    the one class it deliberately declines — a checkout parked on a FEATURE
+    BRANCH, which cannot be fast-forwarded into safety because advancing the
+    branch would leave the tree still missing origin/<default>'s content.
+
+    MEASURED 2026-08-26 on cc-08: 16 of 63 enumerated repos were off-default,
+    among them the very repo whose stale read produced the incident that filed
+    g-306-370 (StartAyoServerEnvironment, on a feature branch, 5 behind main).
+    A `--pull` pass reports those repos and moves on, by design. Nothing then
+    stops the next unit grepping one of them and banking the miss.
+
+    FETCH ORDERING IS THE WHOLE POINT, and it is why this cannot simply call
+    `pull_status` and read its verdict. That function returns on the
+    off-default rung BEFORE it fetches, so its `behind_default` is computed
+    against whatever `origin/<default>` happened to be on disk — and a zero
+    from an unfetched remote-tracking ref is byte-identical to a genuine zero
+    (guard-4280). So the network refresh happens HERE, first, under the same
+    FETCH_HEAD throttle; `pull_status` is then called with do_fetch=False so
+    the fetch is not paid twice, and it evaluates against a ref that is
+    actually current.
+
+    Returns a record; `safe` is the verdict and the caller maps it to an exit
+    code. Safe means the working tree at `path` is known to match
+    origin/<default> — either it already did (`current`) or this call
+    fast-forwarded it (`pulled`). Every other outcome is a READ HAZARD, and
+    that includes the probe FAILING: an unreachable remote or a broken status
+    probe yields "cannot tell", which must never render as permission to
+    trust the tree (guard-1760 — a checker must not report what it declined
+    to look at as a pass).
+    """
+    enumerated = enumerate_repos() if enumerated is None else enumerated
+    repo = _repo_for_path(path, enumerated)
+    rec = {"path": str(path), "in_product_repo": repo is not None,
+           "repo": str(repo) if repo else None, "safe": True,
+           "verdict": "not-a-product-repo", "fetched": None,
+           "branch": None, "default_branch": None, "behind": None,
+           "remedy": None}
+    if repo is None:
+        return rec
+
+    if do_fetch:
+        gitdir = Path(repo) / ".git"
+        fetch_head = gitdir / "FETCH_HEAD" if gitdir.is_dir() else None
+        fresh = False
+        if interval_min > 0 and fetch_head is not None and fetch_head.exists():
+            fresh = ((time.time() - fetch_head.stat().st_mtime) / 60.0) < interval_min
+        if not fresh:
+            frc, _, _ = _git(repo, "fetch", "--quiet", "origin",
+                             timeout=FETCH_TIMEOUT_S)
+            rec["fetched"] = (frc == 0)
+        else:
+            rec["fetched"] = "throttled"
+
+    # OFF-DEFAULT IS DECIDED HERE, NOT INHERITED FROM `pull_status`, because the
+    # two modes ask different questions and their skip ladders are ordered for
+    # the OTHER one. `pull_status` asks "may I fast-forward this?", so it
+    # returns `skipped-no-upstream` BEFORE it ever compares branches — correct
+    # for an actuator, useless here: whether a feature branch happens to track
+    # a remote has no bearing on whether reading its tree can produce a false
+    # negative about origin/<default>'s content. Measured while writing the
+    # tests: a LOCAL-ONLY feature branch (the shape "WIP DO NOT MERGE" work
+    # takes) reported `skipped-no-upstream`, which names no remedy, where the
+    # actionable fact is that the tree is not the default branch at all.
+    cur_rc, cur_b, _ = _git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    default_b = _default_branch(repo)
+    if cur_rc == 0 and cur_b and default_b and cur_b != default_b:
+        rc_b, bm, _ = _git(repo, "rev-list", "--count",
+                           "HEAD..origin/%s" % default_b)
+        rec["branch"] = cur_b
+        rec["default_branch"] = default_b
+        rec["behind"] = int(bm) if rc_b == 0 and bm.isdigit() else None
+        rec["action"] = "skipped-off-default"
+        rec["safe"] = False
+        rec["verdict"] = "read-hazard"
+        rec["detail"] = (
+            "on %s, not %s (%s behind origin/%s) — fast-forwarding would "
+            "advance %s and leave the hazard intact, so this is reported, "
+            "never pulled."
+            % (cur_b, default_b,
+               "?" if rec["behind"] is None else rec["behind"],
+               default_b, cur_b))
+        try:
+            rel = Path(path).resolve().relative_to(Path(repo).resolve()).as_posix()
+        except Exception:
+            rel = "<path-in-repo>"
+        rec["remedy"] = "git -C %s show origin/%s:%s" % (repo, default_b, rel)
+        return rec
+
+    inner = pull_status(repo, interval_min=interval_min, do_fetch=False)
+    action = inner.get("action")
+    rec["action"] = action
+    rec["branch"] = inner.get("branch")
+    rec["default_branch"] = inner.get("default_branch")
+    rec["behind"] = inner.get("behind_default", inner.get("behind"))
+    rec["detail"] = inner.get("detail")
+    rec["safe"] = action in ("current", "pulled")
+    rec["verdict"] = "safe-matches-origin" if rec["safe"] else "read-hazard"
+
+    if not rec["safe"]:
+        default = rec["default_branch"] or "main"
+        try:
+            rel = Path(path).resolve().relative_to(Path(repo).resolve()).as_posix()
+        except Exception:
+            rel = "<path-in-repo>"
+        rec["remedy"] = ("git -C %s show origin/%s:%s" % (repo, default, rel))
+    return rec
+
+
+def render_check_read(rec):
+    """ALWAYS speaks — a gate that is silent on the safe path teaches a reader
+    that no output means it ran, which is the vacuity this file exists to
+    prevent (see the empty-enumeration banner in main)."""
+    if not rec["in_product_repo"]:
+        return ("[check-read] %s is not inside an enumerated product repo — no "
+                "freshness claim is made about it. This is NOT an all-clear "
+                "about product code." % rec["path"])
+    if rec["safe"]:
+        return ("[check-read] SAFE: %s is on %s and matches origin/%s — a read "
+                "of this tree is a read of origin."
+                % (rec["repo"], rec["branch"], rec["default_branch"]))
+    return ("[check-read] READ HAZARD (%s): %s\n"
+            "  A grep or `git show` here can return a FALSE 'this code does not "
+            "exist'.\n"
+            "  %s\n"
+            "  Read the authoritative ref instead:\n    %s"
+            % (rec.get("action"), rec["repo"], rec.get("detail") or "",
+               rec["remedy"]))
+
+
 def main(argv=None):
     _force_lf_stdout()
     ap = argparse.ArgumentParser(description=__doc__,
@@ -1138,6 +1295,12 @@ def main(argv=None):
     ap.add_argument("--source", choices=["world", "agent"])
     ap.add_argument("--repo", action="append", default=[])
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--check-read", metavar="PATH",
+                    help="May PATH be read as EVIDENCE about product-repo "
+                         "contents? Fetches that repo FIRST (throttled), then "
+                         "answers. exit 0 = tree matches origin/<default>; "
+                         "exit 1 = READ HAZARD, and the remedy command is "
+                         "printed. The mechanical half of guard-5217.")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--no-fetch", action="store_true")
     ap.add_argument("--sweep", action="store_true",
@@ -1174,6 +1337,13 @@ def main(argv=None):
               "nothing was examined. Confirm MIND_AGENT is set and its "
               "local-paths.conf names AGENT_WRITE_PATH."
               % (os.environ.get("MIND_AGENT") or "",), file=sys.stderr)
+
+    if args.check_read:
+        rec = check_read(args.check_read, args.pull_interval_min,
+                         not args.no_fetch, enumerated)
+        print(json.dumps(rec, indent=2) if args.json
+              else render_check_read(rec))
+        return 0 if rec["safe"] else 1
 
     if args.list:
         payload = {"enumerated": [str(r) for r in enumerated], "count": len(enumerated)}

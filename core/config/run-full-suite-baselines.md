@@ -852,3 +852,38 @@ row over appending an eleventh.
 > tail-rising distribution was NOT contention this time: solos stayed red
 > and every red was pre-owned — the discriminator did its job in the other
 > direction.
+
+> **2026-08-24 (g-367-14 confirmatory suite, alpha WORKER Body, `hostname` cc-07,
+> `uname -r` 6.8.0-137-generic, own-cloud box with `STORAGE_BACKEND=local` pinned,
+> HEAD 277ad3fdf, 4 chunks × ~291 files, 1166 files across mind_api/tests +
+> core/tests/gates + core/scripts/tests, logs via `--out /tmp/suite-g367-14`):
+> `TOTAL: 17,372 passed, 34 failed, 0 errors` / `VERDICT: GENUINE`, distribution
+> **0/9/22/3** — spread across three chunks with chunk 02 dominating, i.e. NOT
+> chunk-confined, so the confinement tell would have under-fired (the cc-08
+> pattern, not the cc-03 one). `--triage`: **1 environmental | 9 genuine-owned |
+> 0 genuine-UNOWNED**, owners g-115-7127 and g-115-5210. The other two halves,
+> which never ride under the chunked verdict: invisible **108/111**, 3 reds all
+> owned — `test_capability_gate_narrative.py` (g-115-7346),
+> `test_stale_sentinel_canary.py` (g-115-5280),
+> `test-wm-prune-cadence-protection.sh` (g-115-7389); domain **64/65 units + 1
+> skipped**, its one red unit being the pytest batch's 2 pre-owned tests
+> (`test_email_send_outreach_gate` g-115-7297, `test_emitter_header_census`
+> g-350-316). **Zero unowned reds anywhere, and zero failures touching
+> `category_suggest`** — the commit under test (1197482fd, the fourth
+> daemon-reachable `build_concept_index` call site) appears in no failing set,
+> and its gate file is 16/16 green solo.
+>
+> Two method notes measured here. (1) The **task-notification exit code lied
+> again**: it reported "completed (exit code 0)" against `RUNNER_EXIT=1`, because
+> a trailing `echo` in the backgrounded command replaced the runner's status.
+> The PreToolUse trailing-echo advisory PREDICTED this at launch time and was
+> correct — that advisory is the only warning you get, since the notification
+> itself carries no signal (guard-1150, verify-before-assuming 4a). (2) On a
+> WORKER Body the rule's "PRIMARY path — background the suite and END the turn"
+> **does not work**: the harness's `run_in_background` registers nothing with
+> `background-jobs.sh` (`has-pending` measured rc=1 while three suite PIDs were
+> live), so stop-hook Gate 2.6 BLOCKs the turn-end and the worker-net demands a
+> `Skill(worker-loop)` re-entry — whose Phase -0.3 merge would VOID the running
+> suite. The working pattern is an IN-TURN bounded wait loop
+> (`EXTERNAL_WAIT=1 interruptible-sleep.sh`, which does pace accurately —
+> asked 30s, got 30s), repeated across turns without ever ending the turn.

@@ -169,7 +169,7 @@ Those constants are mirrored at **12 constant-named sites, 5 inlined copies and
 scans NOTHING after a relocation — a depth-1 redrift is invisible to every
 audit grep and has zeroed skill-discovery sources, self.md backfill and a
 learning-routing corpus (which fed an automatic writer). The site tables, the
-cross-agent glob consumer table with each row's incident history, and the three
+cross-agent glob consumer table with each row's incident history, and the four
 audit greps with their triage live in
 `core/config/conventions/agent-dir-resolution.md` — **read it BEFORE changing
 any of the three constants or adding any glob that sweeps agent dirs**
@@ -242,7 +242,7 @@ When you need schema, script API, or protocol details for a subsystem, read the 
 | `goal-schemas.md` | Goal verification, recurring/deferred fields, goal scoring |
 | `goal-selection.md` | Mandatory goal-selector.sh, post-compaction fabrication guard |
 | `session-state.md` | Agent state machine, session scripts, generic YAML store, background jobs tracker |
-| `agent-dir-resolution.md` | `AGENTS_PARENT_DIR` / `SESSIONS_DIRNAME` / `SESSION_DIRNAME` sync-site tables (12 constant-named + 5 inlined + 2 literal hardcoders), the cross-agent glob consumer table with per-row incident history, the three audit greps + triage — read before changing a constant or adding a cross-agent glob (moved out of CLAUDE.md 2026-08-17) |
+| `agent-dir-resolution.md` | `AGENTS_PARENT_DIR` / `SESSIONS_DIRNAME` / `SESSION_DIRNAME` sync-site tables (12 constant-named + 5 inlined + 2 literal hardcoders), the cross-agent glob consumer table with per-row incident history, the four audit greps + triage — read before changing a constant or adding a cross-agent glob (moved out of CLAUDE.md 2026-08-17) |
 | `infrastructure.md` | Error response protocol, infra health, verify-before-assuming details, knowledge reconciliation details |
 | `secrets.md` | Credentials convention, env-read.sh, security rules |
 | `working-memory.md` | Working memory schema, wm-*.sh script API, slot_meta, pruning rules |
@@ -274,7 +274,7 @@ When you need schema, script API, or protocol details for a subsystem, read the 
 | `domain-recipe-seed-purity.md` | D1 decision (A): domain-specific upgrade recipes are `domain-leak-exempt` and travel in the seed; the 5 invariants (location/marker/FROM-state-guard/H3b/gate-scope), seed-down per-env-id semantics |
 | `fleet-secret-provisioning.md` | Bootstrap-key → remote-vault self-service provisioner formalized as a framework capability: mechanism (5 steps), 7 invariants, vault-file contract, secrets hygiene, clone-home companion (guard-131), transplant integration, dev-origination promotion; the domain-specific `core/scripts/provision-from-vault.sh` (marker-exempt) instantiates it |
 | `transfer-bundle-export-shape.md` | OKF-aligned export shape for `meta/transfer/` bundles: bundle=unit-of-distribution, concept=one md+YAML, one required `type` discriminator, consumers-preserve-unknown-keys, git-shippable interchange (contract-on-shape, not a field schema) |
-| `governed-store-write-classes.md` | Merge-protected vs fence-only store classification: `merge_handler_for` is the one-lookup classifier (basename-keyed), class (b) has no reconciler below the write so a stale fence is a PERMANENT wedge and the writer MUST use `locked_rmw` + in-cycle `force_fresh` read; sibling files differ (1 of 6 strategy files is merge-protected); why local-backend green proves nothing and the read-time assertion point |
+| `governed-store-write-classes.md` | Merge-protected vs fence-only store classification: `merge_handler_for` is the one-lookup classifier (never by grep), class (b) has no reconciler below the write so a stale fence is a PERMANENT wedge and the writer MUST use `locked_rmw` + in-cycle `force_fresh` read; sibling files differ (1 of 6 strategy files is merge-protected); why local-backend green proves nothing and the read-time assertion point |
 | `world-contract.md` | `ENVIRONMENT_ID` / `COMMONS_POLICY` world-identity primitives, the six world-contract elements, and the G1–G5 cross-world influence guardrails (design artifacts, not built enforcement) |
 | `cross-deployment-channel.md` | **This world is not alone.** Peer Mind deployments, the `core/config/environments/*.yaml` registry, the 139-inbound board channel that has been live since 2026-06-02 (outbound **VOLUME** is not measurable from this world's board; outbound **REACH** is — the peer reads this board, so deliver here and let its reply be the measurement: guard-2082 route + latency floor, guard-3596 ack≠completeness), the `<agent>@<env-id>` author format (and why the hyphen form is unparseable), when crossing is expected, `peer-board-post.sh`, and the never-inherit-the-caller's-storage-backend hazard (guard-955/rb-2983 class) |
 | `hot-path-size-budget.md` | The always-loaded prose surface (this file, every `.claude/rules/*.md`, the aspirations*/worker-loop/boot/prime/respond skills, the loop digest) may not GROW: `core/githooks/commit-msg` refuses a commit that leaves a budgeted file larger than at HEAD (set in `core/config/hot-path-budget.yaml`); bypass = `size-budget-override: <why>` trailer, audited to `world/override-bypass-ledger.jsonl`; `hot-path-size-gate.sh --check` ratchets the corpus total |
@@ -338,7 +338,7 @@ The shared purpose lives in `world/program.md` (The Program). Each agent's ident
 ### Skill Invocation Rules
 - **Control skills** (/start, /stop, /open-questions): user-invocable only — Claude MUST NOT invoke these
 - **Mode control**: `/start <agent-name> --mode <mode>` to enter a mode, `/stop <agent-name>` to return to assistant (or `/stop <agent-name> --reader` for read-only). Agent name is REQUIRED on `/stop`.
-- **Hybrid skills** (/agent-completion-report, /backlog-report, /priority-review, /sprint-planning, /verify-learning, /generate-domain-goals): user-invocable AND agent-callable
+- **Hybrid skills** (/agent-completion-report, /backlog-report, /forge-skill, /priority-review, /sprint-planning, /verify-learning, /generate-domain-goals): user-invocable AND agent-callable
 - **Internal skills**: `user-invocable: false` — invoked by agent during RUNNING state
 - **No blocking on user input in RUNNING state** — skills must never wait for, request, or depend on user input during autonomous execution
 
@@ -522,7 +522,6 @@ User control commands: see User Control Commands table above.
 | Replay | Compressed review, reconsolidation, domain transfer |
 | Research Topic | Build knowledge base via web research |
 | Decompose | Break compound goals into primitives |
-| Forge Skill | Create new skills from capability gaps |
 | Tree | Knowledge tree operations: read, find, add, edit, set, decompose, maintain, stats, validate |
 
 *(Forged skills created via /forge-skill appear here after creation — see world/forged-skills.yaml)*

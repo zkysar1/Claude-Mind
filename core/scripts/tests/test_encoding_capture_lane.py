@@ -224,7 +224,69 @@ def test_an_all_malformed_batch_fails_the_lane_rather_than_reporting_success(
 
     assert seen == [], "nothing usable, so nothing should have been appended"
     assert rc != 0
-    assert "fact" in err
+    # Pins the REPORT half (guard-4044): the lane must NAME how many entries
+    # carried no prose key, so schema drift is a number rather than silence.
+    # This replaced an `assert "fact" in err` on 2026-08-24 () --
+    # that assertion pinned the single-key vocabulary this lane no longer uses,
+    # so keeping it would have required the message to keep naming one key.
+    # The test's stated purpose (rc != 0, nothing appended) is untouched above.
+    assert "2 of 2 carried none" in err
+
+
+# ── : the prose-key fallback chain ─────────────────────────────────
+
+@pytest.mark.parametrize("key", [
+    k for k in wr.ENC_PROSE_KEYS if k != "fact"])
+def test_enc_observation_recovers_prose_from_every_fallback_key(key):
+    """Each chain key must actually be reachable.
+
+    A key listed but never consulted is worse than an absent one: the chain
+    LOOKS wider than it is, which is the silence guard-4044 exists to end.
+    """
+    assert wr.enc_observation({key: "recovered prose"}) == "recovered prose"
+
+
+def test_enc_prose_reports_which_key_it_used():
+    assert wr.enc_prose({"fact": "F"}) == ("F", "fact")
+    assert wr.enc_prose({"content": "C"}) == ("C", "content")
+    assert wr.enc_prose({"nothing": "here"}) == ("", None)
+    assert wr.enc_prose("not a dict") == ("", None)
+
+
+def test_the_primary_key_wins_over_every_fallback():
+    """First match wins, so `fact` must sit first or a richer field loses."""
+    entry = {"title": "short label", "content": "longer prose", "fact": "the fact"}
+    assert wr.enc_observation(entry) == "the fact"
+    assert wr.enc_prose(entry)[1] == "fact"
+
+
+def test_label_keys_sort_after_prose_keys():
+    """ORDER IS PROSE-BEFORE-LABEL. First match wins, so a short label ahead of
+    real prose would TRUNCATE the observation, not merely rename its source."""
+    assert wr.enc_prose({"title": "T", "content": "C"})[1] == "content"
+    assert wr.enc_prose({"title": "T", "body": "B"})[1] == "body"
+    assert wr.ENC_PROSE_KEYS[-1] == "title"
+    assert wr.ENC_PROSE_KEYS[0] == "fact"
+
+
+def test_lane_reports_per_key_fallthrough_counts(monkeypatch):
+    """guard-4044's REPORT half, at the lane boundary.
+
+    Recovery alone is not the fix: without the count, a future schema drift is
+    silently absorbed by the chain exactly the way it was silently dropped
+    before. The number is what makes drift visible.
+    """
+    _capture_run(monkeypatch)
+    rc, out, _err = wr._lane_encoding(
+        ITEM, "zeta", "2026-08-21T17:00:00", ROOT,
+        [{"fact": "primary"}, {"content": "via content"},
+         {"body": "via body"}, {"junk": "no prose key"}])
+
+    assert rc == 0
+    assert "queued 3" in out
+    assert "recovered via fallback key:" in out
+    assert "body=1" in out and "content=1" in out
+    assert "1 carried no prose key" in out
 
 
 def test_a_failing_append_propagates_its_rc_and_stops_the_batch(monkeypatch):

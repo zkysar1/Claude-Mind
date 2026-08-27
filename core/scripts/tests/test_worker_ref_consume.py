@@ -571,3 +571,71 @@ def test_content_not_commits_source_pin():
     assert "rev-list --count --no-merges" in src
     assert "show --remerge-diff --format=" in src
     assert '"sync_merges":%s' in src
+
+
+# ---------------------------------------------------------------------------
+# : pin the TWO reachability-refusal diagnostics added by .
+#
+# WHY THIS EXISTS.  split the "not reachable from origin/main" refusal
+# into two different remedies, and the whole suite passed 24/24 both BEFORE and
+# AFTER that change — grep showed CARRY=0, rebase=0, orphan=0 in this file. So
+# the split could have been reverted wholesale with the suite still green: the
+# "fix can be deleted and nothing goes red" class.
+#
+# The refusal ITSELF was already pinned (test_retire_refuses_ref_not_reachable_
+# from_origin_main above). What was NOT pinned is WHICH REMEDY it prints, and
+# that is the entire content of  — the branch exists because the two
+# causes need OPPOSITE actions: a live carrier must be CARRIED (re-merging is
+# unsatisfiable, retiring destroys a running body's push target), while a dead
+# one must be merge-and-pushed. Printing the wrong one sends the operator
+# hunting a bookkeeping bug that is not there.
+#
+# Both pins assert rc=1 AND ref survival AND receipt-absence, not message text
+# alone, so a loosened predicate cannot pass them (goal verification outcome 2).
+# Both drive the declared WORKER_REF_TEAM_STATE_READER seam, which is what makes
+# the live-vs-dead distinction hermetic: sid-bbbb is deliberately NOT merged, so
+# the reachability check refuses first and the branch under test is reached.
+# ---------------------------------------------------------------------------
+
+def test_unreachable_refusal_names_CARRY_when_a_live_body_row_exists(repo, tmp_path):
+    """ branch 1: unreachable ref + LIVE in_flight_bodies row -> the
+    remedy is CARRY, explicitly NOT merge-and-push. guard-3660: reachability is
+    about the CONTENT, the body row is about the HANDLE, and only the handle
+    matters while a body is running."""
+    r = _consume(repo["work"], "--retire", "refs/workers/alpha/sid-bbbb",
+                 env={"WORKER_REF_TEAM_STATE_READER": _stub_reader(tmp_path, LIVE_ROW)})
+    assert r.returncode == 1, "an unreachable ref must still refuse"
+    assert "REFUSED" in r.stderr
+    assert "CARRY" in r.stderr, "a live carrier's remedy is CARRY, not merge-and-push"
+    assert "guard-3660" in r.stderr, "the CARRY branch must cite guard-3660"
+    assert "g-999-9" in r.stderr, "the live row's claiming goal must be named"
+    # The wrong remedy must NOT also be printed — the branch is exclusive, and a
+    # refusal that prints both remedies is no better than the one-line original.
+    assert "Merge it and push main first" not in r.stderr, (
+        "the live branch must not also emit the dead-carrier remedy"
+    )
+    ls = _git(repo["work"], "ls-remote", "origin", "refs/workers/*")
+    assert "sid-bbbb" in ls, "the ref must survive the refusal"
+    receipts = repo["work"] / "core" / "logs" / "worker-ref-retirements.jsonl"
+    assert not receipts.exists(), "a refused retire must not write a receipt"
+
+
+def test_unreachable_refusal_names_rebase_orphan_when_no_live_body_row(repo, tmp_path):
+    """ branch 2: unreachable ref + NO live row -> merge-and-push, plus
+    the rebase-orphan cause for the 'I already merged and it still refuses'
+    case. guard-1863: never `git pull --rebase` this repo."""
+    r = _consume(repo["work"], "--retire", "refs/workers/alpha/sid-bbbb",
+                 env={"WORKER_REF_TEAM_STATE_READER": _stub_reader(tmp_path, "null")})
+    assert r.returncode == 1, "an unreachable ref must still refuse"
+    assert "REFUSED" in r.stderr
+    assert "Merge it and push main first" in r.stderr
+    assert "rebase" in r.stderr, "the dead branch must name the rebase-orphan cause"
+    assert "guard-1863" in r.stderr, "the rebase-orphan hint must cite guard-1863"
+    # Exclusivity, mirroring the pin above.
+    assert "CARRY" not in r.stderr, (
+        "with no live row the CARRY remedy must not be emitted"
+    )
+    ls = _git(repo["work"], "ls-remote", "origin", "refs/workers/*")
+    assert "sid-bbbb" in ls, "the ref must survive the refusal"
+    receipts = repo["work"] / "core" / "logs" / "worker-ref-retirements.jsonl"
+    assert not receipts.exists(), "a refused retire must not write a receipt"

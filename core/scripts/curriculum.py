@@ -405,7 +405,10 @@ def cmd_evaluate(args):
     # ): script-enforced at the evaluate chokepoint so the
     # stale-metric class () cannot recur. Fail-open — on refresh
     # failure the stored value is used, exactly the pre-wiring behavior.
-    competence_refresh = refresh_competence_for_gates(gates, WORLD_DIR, AGENT_DIR)
+    # AGENT_NAME (from MIND_AGENT) is the authoritative identity; passing it
+    # explicitly stops assess() re-deriving it from AGENT_DIR's basename.
+    competence_refresh = refresh_competence_for_gates(
+        gates, WORLD_DIR, AGENT_DIR, AGENT_NAME)
 
     now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     gate_results = []

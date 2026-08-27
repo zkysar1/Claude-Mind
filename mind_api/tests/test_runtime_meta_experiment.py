@@ -18,6 +18,7 @@ Agent set to alpha on both sides so changelog attribution matches.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 import os
 import re
 import subprocess
@@ -43,12 +44,29 @@ def _seed_active(meta, experiments):
         encoding="utf-8")
 
 
+def _seed_strategy(meta):
+    """: create now REFUSES a field that does not resolve in the target
+    strategy file, so a fixture that ships no strategy file makes every create
+    400. Seed a minimal one carrying the weights these tests reference.
+
+    Note what this fixture caught: the tests previously used `weights.novelty`,
+    which does not exist — the live key is `weights.novelty_bonus`. The suite was
+    itself encoding the exact defect the gate now refuses.
+    """
+    (meta / "goal-selection-strategy.yaml").write_text(
+        yaml.dump({"weights": {"novelty_bonus": 1.0, "priority": 1.0}},
+                  Dumper=yaml.CSafeDumper, default_flow_style=False,
+                  allow_unicode=True, sort_keys=False),
+        encoding="utf-8")
+
+
 def _setup(tmp_path, name="x"):
     base = tmp_path / name
     meta = base / "meta"
     agent = base / "agents" / "alpha"
     for d in (meta, agent):
         d.mkdir(parents=True, exist_ok=True)
+    _seed_strategy(meta)
     return meta, agent
 
 
@@ -104,7 +122,7 @@ def _http(port, method, path, query=None, body=None):
 
 _RESOLVABLE = {
     "id": "exp-meta-001", "created": "2026-05-01T00:00:00",
-    "strategy_file": "goal-selection-strategy.yaml", "field": "weights.novelty",
+    "strategy_file": "goal-selection-strategy.yaml", "field": "weights.novelty_bonus",
     "baseline_value": 1.0, "variant_value": 1.5, "status": "active",
     "phase": "variant", "total_goals": 20,
     "metrics": {"baseline": [0.5, 0.5], "variant": [0.9, 0.9]},  # delta=+0.4 -> adopted
@@ -116,8 +134,9 @@ _RESOLVABLE = {
 # ---------------------------------------------------------------------------
 
 def test_create_then_status(running_daemon):
-    _, port = running_daemon
-    body = {"strategy": "goal-selection-strategy.yaml", "field": "weights.x",
+    pr, port = running_daemon
+    _seed_strategy(pr / "meta")
+    body = {"strategy": "goal-selection-strategy.yaml", "field": "weights.novelty_bonus",
             "baseline": 1.0, "variant": 1.5}
     status, out = _http(port, "POST", "/v1/meta/experiment/create", body=json.dumps(body))
     assert status == 200
@@ -130,8 +149,15 @@ def test_create_then_status(running_daemon):
 
 def test_create_max_concurrent_409(running_daemon):
     # First create fills the single slot; second must 409.
-    _, port = running_daemon
-    body = {"strategy": "s", "field": "f", "baseline": 1.0, "variant": 2.0}
+    pr, port = running_daemon
+    _seed_strategy(pr / "meta")
+    # : the strategy + field must RESOLVE, or the first create is
+    # refused 400 and never fills the slot — the second then 400s too and this
+    # test can no longer reach the 409 it exists to pin. The old synthetic
+    # {"strategy": "s", "field": "f"} pair worked only because create validated
+    # neither.
+    body = {"strategy": "goal-selection-strategy.yaml", "field": "weights.novelty_bonus",
+            "baseline": 1.0, "variant": 2.0}
     try:
         _http(port, "POST", "/v1/meta/experiment/create", body=json.dumps(body))
     except urllib.error.HTTPError:
@@ -184,9 +210,9 @@ class TestByteCompat:
         cli_meta, cli_agent = _setup(tmp_path, "cli")
         dmn_meta, dmn_agent = _setup(tmp_path, "dmn")
         args = ["create", "--strategy", "goal-selection-strategy.yaml",
-                "--field", "weights.novelty", "--baseline", "1.0", "--variant", "1.5"]
+                "--field", "weights.novelty_bonus", "--baseline", "1.0", "--variant", "1.5"]
         cli_out = _run_cli(cli_meta, cli_agent, args).stdout
-        body = {"strategy": "goal-selection-strategy.yaml", "field": "weights.novelty",
+        body = {"strategy": "goal-selection-strategy.yaml", "field": "weights.novelty_bonus",
                 "baseline": 1.0, "variant": 1.5}
         resp = meta_experiment.create(
             _FakeCtx(dmn_meta, dmn_agent, body=json.dumps(body).encode("utf-8")))
@@ -274,3 +300,114 @@ class TestByteCompat:
         resp = meta_experiment.resolve(_FakeCtx(meta, agent, body=json.dumps(
             {"id": "exp-meta-999"}).encode("utf-8")))
         assert resp.status == 404
+
+
+def test_create_refuses_field_that_does_not_resolve(running_daemon):
+    """: a field absent from the target strategy file must be REFUSED.
+
+    The defect this pins: an experiment on a nonexistent field can never
+    accumulate a sample, so aspirations-evolve Step 0.7's `past
+    min_duration_goals` resolution gate never fires, the record sits `active`
+    forever, and that same step's `IF no active experiment` guard then blocks
+    ALL A/B experimentation. Measured: exp-meta-001 (`weights.x`) held the
+    single slot 6 days and would have held it permanently.
+
+    NOTE the shape of the regression this file itself carried: before this fix,
+    two tests here ASSERTED that creating on `weights.x` returns 200, and a
+    third used `weights.novelty` — a key that does not exist either (the live
+    key is `weights.novelty_bonus`). The suite encoded the defect as the
+    contract.
+    """
+    pr, port = running_daemon
+    _seed_strategy(pr / "meta")
+    body = {"strategy": "goal-selection-strategy.yaml", "field": "weights.x",
+            "baseline": 1.0, "variant": 1.5}
+    try:
+        _http(port, "POST", "/v1/meta/experiment/create", body=json.dumps(body))
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 400
+        detail = exc.read().decode("utf-8")
+        # The message must NAME the valid keys — a bare refusal leaves the author
+        # guessing, and guessing is what produced weights.x.
+        assert "weights.x" in detail
+        assert "novelty_bonus" in detail, detail
+    else:
+        raise AssertionError("create accepted a field that does not resolve")
+
+
+def test_create_refuses_missing_strategy_file(running_daemon):
+    """ companion: a strategy FILE that does not exist cannot host a
+    field, so it is refused for the same reason and with the same fail-closed
+    posture. Without this, a typo in the filename would slip past the field
+    check by making every dotpath vacuously unresolvable."""
+    pr, port = running_daemon
+    _seed_strategy(pr / "meta")
+    body = {"strategy": "no-such-strategy.yaml", "field": "weights.novelty_bonus",
+            "baseline": 1.0, "variant": 1.5}
+    try:
+        _http(port, "POST", "/v1/meta/experiment/create", body=json.dumps(body))
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 400
+        assert "no-such-strategy.yaml" in exc.read().decode("utf-8")
+    else:
+        raise AssertionError("create accepted a nonexistent strategy file")
+
+
+def test_list_surfaces_stuck_zero_sample_experiment(running_daemon):
+    """ outcome 2: an active experiment that CANNOT progress must be
+    surfaced, not left occupying the single slot until someone notices by hand.
+
+    Zero samples means it can never reach min_duration_goals, so Step 0.7's
+    resolution gate never fires; and that same step gates new experiments on
+    `IF no active experiment`. Surfacing happens at the list endpoint because
+    that is what evolve reads immediately before making that decision.
+
+    Report-only: `stuck` is advisory. The record stays in `experiments` and
+    nothing is resolved or mutated — a fresh experiment is legitimately young,
+    and auto-resolving on a wall clock would discard real baselines.
+    """
+    pr, port = running_daemon
+    _seed_strategy(pr / "meta")
+    _seed_active(pr / "meta", [{
+        "id": "exp-meta-001", "created": "2026-01-01T00:00:00",
+        "strategy_file": "goal-selection-strategy.yaml", "field": "weights.x",
+        "baseline_value": 1.0, "variant_value": 1.5, "status": "active",
+        "phase": "baseline", "total_goals": 0,
+        "metrics": {"baseline": [], "variant": []},
+    }])
+    status, out = _http(port, "GET", "/v1/meta/experiment/list")
+    assert status == 200
+    payload = json.loads(out)
+    assert payload["count"] == 1, payload
+    assert payload.get("stuck_count") == 1, payload
+    entry = payload["stuck"][0]
+    assert entry["id"] == "exp-meta-001"
+    assert entry["total_goals"] == 0
+    assert entry["age_hours"] > 48
+    # The record itself is untouched — advisory, not a mutation.
+    assert payload["experiments"][0]["status"] == "active"
+
+
+def test_list_does_not_flag_a_fresh_zero_sample_experiment(running_daemon):
+    """Negative control for the test above. A brand-new experiment also has zero
+    samples, so a stuck-check keyed on sample count ALONE would flag every
+    experiment the moment it is created. The age clause is what makes the signal
+    mean anything, and without this control a always-fires bug would pass.
+    """
+    pr, port = running_daemon
+    _seed_strategy(pr / "meta")
+    _seed_active(pr / "meta", [{
+        "id": "exp-meta-001",
+        "created": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "strategy_file": "goal-selection-strategy.yaml",
+        "field": "weights.novelty_bonus",
+        "baseline_value": 1.0, "variant_value": 1.5, "status": "active",
+        "phase": "baseline", "total_goals": 0,
+        "metrics": {"baseline": [], "variant": []},
+    }])
+    status, out = _http(port, "GET", "/v1/meta/experiment/list")
+    assert status == 200
+    payload = json.loads(out)
+    assert payload["count"] == 1
+    assert "stuck" not in payload, payload
+    assert "stuck_count" not in payload, payload

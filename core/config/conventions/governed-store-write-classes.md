@@ -24,9 +24,15 @@ DEADLOCK, not transient contention). Class (a) degrades; class (b) wedges.
 ## How to classify a store (one lookup, no judgment)
 
 `merge_handler_for` in `core/scripts/coordination_merge.py` dispatches on
-**basename**, against the `_HANDLERS` dict (85 entries measured 2026-08-02 by
-`grep -c '^\s*"[^"]*":\s*merge_' core/scripts/coordination_merge.py` — re-derive
-rather than trusting this number), plus **FIVE path-pattern branches that run
+**basename**, against the `_HANDLERS` dict (91 entries measured 2026-08-26 by
+`py -3 -c "import sys;sys.path.insert(0,'core/scripts');import coordination_merge as m;print(len(m._HANDLERS))"`
+— re-derive rather than trusting this number, and do NOT use
+`grep -c '^\s*"[^"]*":\s*merge_'`, which this file prescribed until 2026-08-26:
+it is not scoped to `_HANDLERS` and also matches the split-store kind->handler
+map in the same file, overcounting by exactly the 2 extension-less keys
+`guardrails` and `reasoning-bank` — 93 vs 91, measured. A counting command that
+matches a second dict in the same file is the same defect class this section
+already warns about one paragraph down), plus **SIX path-pattern branches that run
 BEFORE the dict lookup**:
 
 | # | Pattern | Effect |
@@ -36,6 +42,7 @@ BEFORE the dict lookup**:
 | 3 | `<kind>-<YYYY-MM-DD>.jsonl` for reasoning-bank / guardrails | registers — routed to that store's OWN id-keyed handler, not append-only (g-358-05) |
 | 4 | `gate-firings-<YYYY-MM-DD>.jsonl` | registers — routed to the legacy file's `merge_append_only_jsonl` (g-358-08 / g-328-51 cutover, 2026-08-17). Measured BEFORE registration: `merge_handler_for("meta/gate-firings-2026-08-17.jsonl")` was `None` — the hottest dynamic-basename store in the fleet (every box flushes into the same live segment at every iteration close) was class (b) while the legacy file it replaces had always been class (a). Cure chosen per guard-1816: handler-registration, NOT a writer conversion, because the writer (`gate-firings-flush.py` → `locked_modify_jsonl`) already satisfies the class-(b) pattern AND the segment has no removal path (store-hygiene G5's age-cap keys on the legacy basename), so a line-union can never resurrect a deletion |
 | 5 | `core/config/**` | **un**-registers — a registered basename that also names an immutable framework config is deliberately NOT merged (g-115-3997) |
+| 6 | `world/knowledge/tree/**/*.md` | registers — section-union (g-115-7071). 1,555 unique basenames make per-node registration structurally impossible, so this is the same unenumerable-basename cure as 1-4 applied to tree nodes rather than to a JSONL segment |
 
 ```bash
 # authoritative, and cheaper than reasoning about it

@@ -250,3 +250,100 @@ def test_all_three_sweeps_share_one_policy_object():
     for mod in (unblock, routing, supers):
         assert mod._shared_stale_candidate_reason is swg.stale_candidate_reason
         assert mod._shared_reread_goal_authoritative is swg.reread_goal_authoritative
+
+
+# ---------------------------------------------------------------------------
+# : a LIVE CLAIM must refuse, and execution HISTORY must not.
+#
+# The incident: unblock-parent-status-sweep marked  skipped with
+# "parent resolved without action needed" 11 seconds before the holding agent's
+# own outcome_note landed. The sweep branched on `status`, which read "pending"
+# — and the claim path writes claimed_by_sid / started / executed_by_sid while
+# leaving status alone, so the single field the sweep consulted is exactly the
+# one a live claim does not move.
+#
+# WHY THE PREDICATE IS `claimed_by_sid` AND NOT `started`/`executed_by_sid`,
+# which is what the originating report proposed. Measured on the world store
+# 2026-08-24, 2,193 open goals: claimed_by_sid on 4, started on 231 (10.5%),
+# executed_by_sid on 205 (9.3%); on terminal goals the latter two persist at
+# ~78% because nothing pops them on release. They are execution HISTORY, not
+# ownership. Keying the refusal on them would have disarmed all three sweeps
+# across ~10% of the open queue, permanently and silently — a far worse defect
+# than the one being fixed. That is what the second test below pins.
+#
+# EXPECTED MUTATION OUTCOMES, stated before running (guard-4166). With
+# ACTIVE_CLAIM_FIELDS reverted to ():
+#   test_a_live_claim_refuses ................................ RED
+#   test_the_unblock_sweep_refuses_a_claimed_goal_and_writes_nothing  RED
+#   test_execution_history_alone_does_not_refuse ............. GREEN  (control)
+#   test_a_genuinely_open_goal_passes (pre-existing) ......... GREEN  (control)
+# An all-red mutation run on a NARROWING fix is a warning sign, not a success.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("extra", [
+    {"claimed_by": "bravo"},   # ordinary live claim
+    {},                        # guard-4434: name cleared, sid survives — still a claim
+])
+def test_a_live_claim_refuses(extra):
+    goal = dict(OPEN_GOAL, claimed_by_sid="8d277ad6-597f-4c1a-9e00-000000000001",
+                **extra)
+    reason = swg.stale_candidate_reason(goal, swg.PROV_AUTHORITATIVE)
+    assert reason is not None, (
+        "a goal held by a live claim was cleared for a terminal write — this is "
+        "the g-115-7410 defect")
+    assert "claim in flight" in reason
+
+
+def test_execution_history_alone_does_not_refuse():
+    """THE CONTROL FOR THE NARROWING — must stay GREEN under the mutant.
+
+    started / executed_by / executed_by_sid survive a release, so a goal that
+    was worked and handed back carries all three while being genuinely
+    unclaimed. If a later author "helpfully" widens ACTIVE_CLAIM_FIELDS to
+    include them, this goes red — which is the point: that widening silently
+    freezes ~10% of the open queue against every sweep that shares this policy.
+    """
+    goal = dict(OPEN_GOAL,
+                started="2026-08-24T00:32:40",
+                executed_by="alpha",
+                executed_by_sid="1dc6fc35-c568-4912-8ef3-1cf10b102721")
+    assert swg.stale_candidate_reason(goal, swg.PROV_AUTHORITATIVE) is None, (
+        "execution history was mistaken for a live claim — this would disarm "
+        "all three sweeps across the ~10% of open goals that carry it")
+
+
+def test_the_unblock_sweep_refuses_a_claimed_goal_and_writes_nothing(tmp_path):
+    """The mutation-killer: assert the ABSENCE of the write, not a return value.
+
+    Runs through the sweep the incident happened on, so the wiring is exercised
+    and not merely the pure policy (this file's own header: a guard that is
+    wired but unexercised is indistinguishable from one that is absent).
+    """
+    unblock = _load("unblock-parent-status-sweep", "unblock_swg")
+    unblock._reread_goal_authoritative = lambda s, g: (
+        dict(OPEN_GOAL, claimed_by="alpha",
+             claimed_by_sid="1dc6fc35-c568-4912-8ef3-1cf10b102721",
+             started="2026-08-24T00:32:40"),
+        swg.PROV_AUTHORITATIVE)
+    _forbid_writes(unblock, "unblock-parent-status-sweep _mark_skipped")
+    metrics = tmp_path / "m.jsonl"
+    assert unblock._mark_skipped("world", "g-1-1", "g-306-284", "pending",
+                                 metrics_path=metrics) is False
+
+
+def test_the_sweep_note_does_not_assert_that_nobody_acted():
+    """ defect 2: the note claimed knowledge the sweep cannot have.
+
+    The PREFIX is a dedup key (`_is_already_swept`, `_successor_marker_guard`
+    and six tests all `startswith` it), so the correction had to be APPENDED.
+    This pins both halves: the key survives, and the caveat is present.
+    """
+    import inspect
+    unblock = _load("unblock-parent-status-sweep", "unblock_swg2")
+    src = inspect.getsource(unblock._mark_skipped)
+    assert 'f"parent resolved without action needed "' in src, (
+        "the dedup prefix moved — _is_already_swept and _successor_marker_guard "
+        "both startswith it")
+    assert "cannot see whether an agent fix produced it" in src, (
+        "the note still asserts nobody acted; the sweep reads current state "
+        "only and cannot know that")

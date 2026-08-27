@@ -67,7 +67,7 @@ constant-definition audit grep below does NOT see them. They work for
 
 When changing `AGENTS_PARENT_DIR`, `SESSIONS_DIRNAME`, or `SESSION_DIRNAME`,
 update ALL 12 constant-named sites AND the 2 literal-string hardcoders above.
-Audit with ALL THREE greps (the first finds constant-named sites; the second
+Audit with ALL FOUR greps (the first finds constant-named sites; the second
 finds literal-`agents/` glob hardcoders — it also surfaces comments/tests/bench
 refs, so eyeball-filter to executable glob/prefix lines; the third finds
 `.parent`-based PROJECT_ROOT re-derivations from an agent-dir variable, which
@@ -75,6 +75,26 @@ the constant-name and `agents/*` greps both miss):
 `grep -rn '^[[:space:]]*\(_APD=\|_SDN=\|_\?AGENTS_PARENT_DIR\|_\?SESSIONS_DIRNAME\|_\?SESSION_DIRNAME\)' core/scripts/ mind_api/`
 `grep -rn 'agents/\*' core/scripts/ mind_api/`
 `grep -rnE '(agent_dir|AGENT_DIR)\.parent' core/scripts/ mind_api/`
+`grep -rnE 'os\.path\.join\([^)]*"agents"' core/scripts/ mind_api/ | grep -v __pycache__ | grep -v /tests/ | grep -v team-state`
+FOURTH GREP (added 2026-08-25, g-115-4290) — the `os.path.join(<root>, "agents", ...)`
+CALL SHAPE. It defines no constant (grep 1 misses), writes no `agents/*` glob (grep 2
+misses) and uses no `.parent` (grep 3 misses), so it passed the whole audit while being
+exactly as breakable — the guard-1802 class (an audit predicate narrower than the
+population it claims to cover, reporting clean forever). Measured 2026-08-25: all three
+greps returned 0 against the three files carrying it while firing 57/121/25 tree-wide, so
+the zeros were genuine misses and not broken greps. FIVE sites existed (the filing goal
+named four; `handoff_currency.py` was found by the new grep itself) and ALL FIVE are now
+constant-routed, so this grep returns empty — re-run it against `git show HEAD~1` copies
+if you need to see it fire. Two of the five were `.sh` files, which is why the grep is not
+restricted to `*.py`. The `team-state` filter drops `world/team-state/agents/<agent>.yaml`
+shard paths, a DIFFERENT `agents` directory that is not this constant.
+Automated twin: the `/verify-learning` `hardcoded-APD-join-literal` check (registry
+section 4T) runs this same predicate on cadence. Its sibling `hardcoded-APD-literal`
+cannot see this shape — that check's predicate is `PROJECT_ROOT / "agents"` (pathlib,
+UPPERCASE variable) over `core/scripts/*.py mind_api/src/*.py` only, so it also misses
+lowercase/other-variable pathlib forms, every `.sh` file, and the non-recursive glob's
+`gates/` `checks/` `audit_helpers/` subdirs.
+
 Third-grep triage: a single `.parent` of `PROJECT_ROOT/agents/<agent>` yields
 the *agents-parent* dir (correct for sibling enumeration — goal-selector.py
 `collect_cross_agent_candidates`), but treating that `.parent` result AS

@@ -384,6 +384,89 @@ def test_value_change_parametric_target_ahead_still_blocks_exit_2(tmp_path):
     assert data["content_divergence"]["core/config/thresholds.yaml"]["kind"] == "value"
 
 
+def _chmod_takes_effect(p: Path) -> bool:
+    """True when this filesystem actually carries the execute bit.
+
+    Windows and permission-flattening mounts ignore chmod, so these four tests
+    would assert against a property the platform cannot represent. Probing the
+    real file is the only honest check — os.name is a proxy for it, and a proxy
+    is what makes a test pass for the wrong reason.
+    """
+    p.chmod(0o755)
+    return bool(p.stat().st_mode & 0o111)
+
+
+def test_mode_only_drift_is_reported_when_content_is_identical(tmp_path):
+    """: the whole point — same bytes, stripped execute bit.
+
+    digest() hashes CONTENT, so this file is absent from `differing` and the
+    gate reported it clean while the planted hook silently never ran.
+    """
+    src, tgt = tmp_path / "src", tmp_path / "tgt"
+    _mk(src, "core/scripts/hook.sh", "#!/usr/bin/env bash\necho hi\n")
+    _mk(tgt, "core/scripts/hook.sh", "#!/usr/bin/env bash\necho hi\n")
+    if not _chmod_takes_effect(src / "core/scripts/hook.sh"):
+        return
+    (tgt / "core/scripts/hook.sh").chmod(0o644)
+    data = json.loads(_run(src, tgt, "--json").stdout)
+    assert data["mode_bits_visible"] is True, data
+    assert data["mode_differing"] == ["core/scripts/hook.sh"], data
+    # The subset a content diff can never surface.
+    assert data["mode_only_differing"] == ["core/scripts/hook.sh"], data
+
+
+def test_identical_mode_reports_no_mode_drift(tmp_path):
+    """NEGATIVE CONTROL, in its own test on purpose (guard-4166).
+
+    It must stay GREEN while the assertions above go RED under a mutant that
+    disables detection — that asymmetry is what proves the RED came from the
+    sabotaged predicate and not from an import error or a broken harness. Folded
+    into the test above it would be unobservable.
+    """
+    src, tgt = tmp_path / "src", tmp_path / "tgt"
+    _mk(src, "core/scripts/hook.sh", "#!/usr/bin/env bash\necho hi\n")
+    _mk(tgt, "core/scripts/hook.sh", "#!/usr/bin/env bash\necho hi\n")
+    if not _chmod_takes_effect(src / "core/scripts/hook.sh"):
+        return
+    (tgt / "core/scripts/hook.sh").chmod(0o755)
+    data = json.loads(_run(src, tgt, "--json").stdout)
+    assert data["mode_differing"] == [], data
+    assert data["mode_only_differing"] == [], data
+
+
+def test_mode_drift_is_report_only_and_never_changes_the_verdict(tmp_path):
+    """Pins REPORT-ONLY. Mode drift must not start blocking a promotion by
+    accident — guard-1958's order is print, read one real run, only then assert.
+    Checked under --strict too, which is the flag most likely to be widened."""
+    src, tgt = tmp_path / "src", tmp_path / "tgt"
+    _mk(src, "core/scripts/hook.sh", "#!/usr/bin/env bash\necho hi\n")
+    _mk(tgt, "core/scripts/hook.sh", "#!/usr/bin/env bash\necho hi\n")
+    if not _chmod_takes_effect(src / "core/scripts/hook.sh"):
+        return
+    (tgt / "core/scripts/hook.sh").chmod(0o644)
+    res = _run(src, tgt, "--json")
+    data = json.loads(res.stdout)
+    assert data["mode_differing"], "precondition: drift must be present to test it"
+    assert data["verdict"] == "CLEAN", data
+    assert res.returncode == 0, res.stdout
+    assert _rc(src, tgt, "--strict") == 0, "mode drift must not block even under --strict"
+
+
+def test_absent_execute_bits_report_unavailable_not_clean(tmp_path):
+    """The built-in positive control: no execute bit anywhere means the
+    filesystem cannot represent one, so an empty mode_differing is 'cannot see',
+    NOT 'no drift'. Without this flag the feature would emit a
+    measurement-shaped silence on every Windows box in the fleet."""
+    src, tgt = tmp_path / "src", tmp_path / "tgt"
+    _mk(src, "core/config/plain.yaml", "a: 1\n")
+    _mk(tgt, "core/config/plain.yaml", "a: 1\n")
+    (src / "core/config/plain.yaml").chmod(0o644)
+    (tgt / "core/config/plain.yaml").chmod(0o644)
+    data = json.loads(_run(src, tgt, "--json").stdout)
+    assert data["mode_bits_visible"] is False, data
+    assert data["mode_differing"] == [], data
+
+
 def _main() -> int:
     import tempfile
     failures = 0

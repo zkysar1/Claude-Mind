@@ -24,6 +24,14 @@
 # appends. DO NOT REINTRODUCE `set -e` here — see 2026-05-12 hardening pass.
 set -uo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
+# Owning-PROCESS identity predicate, shared with runner-identity-check.sh rather
+# than copied (). MUST be sourced AFTER _paths.sh: runner_proc_foreign_live
+# calls agent_dir(), which _paths.sh defines (guard-1885). Function definitions
+# only — sets no shell options, exports nothing, mutates no paths and calls no
+# python, so it is safe to pull into a latency-critical hook. Consumed once, at
+# Gate 0b.
+# shellcheck source=_runner_proc.sh
+source "$CORE_ROOT/scripts/_runner_proc.sh"
 cd "$PROJECT_ROOT"
 
 # --- Per-step timing instrumentation () ---
@@ -475,6 +483,52 @@ fi
 if [ -n "$RUNNER_SID" ] && [ "$HOOK_SID" != "$RUNNER_SID" ]; then
     echo "$(date +%Y-%m-%dT%H:%M:%S) ALLOW gate=sid-mismatch sid=$HOOK_SID runner=$RUNNER_SID agent=$HOOK_AGENT runner_token=$RUNNER_TOKEN_LOG" >> "$LOG" 2>/dev/null || true
     exit 0  # Different session — not the autonomous loop runner, allow stop
+fi
+
+# --- Gate 0b: same SID, DIFFERENT owning process () ---
+# THE WEDGE THIS CLOSES. Gate 0 above ALLOWs a turn-end only on a SID MISMATCH.
+#  taught runner-identity-check.sh to eject a duplicate instance that
+# SHARES the runner's SID, using the owning-PROCESS identity ("<pid>:<starttime>"
+# of the nearest `claude` ancestor) — the only signal that differs between two
+# concurrent sessions. Nothing taught THIS hook the same thing, so for the
+# ejected process HOOK_SID == RUNNER_SID and the block above never fires: the
+# pid-based gate ejects it from the loop on every re-entry while the SID-based
+# hook BLOCKs its every turn-end. It can neither iterate nor stop. Measured on
+# zeta / cc-02 2026-08-22 over 3 consecutive turns; it does not self-resolve.
+#
+# THE ALLOW IS EXACTLY AS BROAD AS THE EJECT, AND NO BROADER. runner-identity-check
+# ejects when (SID matches) AND (a stamped runner-proc names a DIFFERENT process)
+# AND (that process is still live). The last two are runner_proc_foreign_live —
+# the same function, sourced, not a second copy, because the wedge IS a
+# disagreement between two predicates and a copy re-arms it one level down.
+#
+# THE SID-MATCH TEST IS RE-STATED HERE, NOT INHERITED FROM FALLING THROUGH THE
+# BLOCK ABOVE. That fall-through also carries the RUNNER_SID-EMPTY case, where
+# runner-identity-check FAIL-OPENS (`[ -n "$RUNNER_SID" ] || exit 0`) and ejects
+# NOBODY. An allowance there would have no matching eject — a licence for the
+# REAL runner to end its turn quietly, which is the one direction this hook must
+# never widen in (guard-4315).
+#
+# IT COMPOSES WITH THE CROSS-BOX WORKER BRANCH ABOVE RATHER THAN SHADOWING IT —
+# checked as a truth table over (runner-file, RUNNER_SID, HOOK_SID), not by
+# reading. That branch is TAKEN on file-absent and on SID-differs; this one is
+# evaluated ONLY on file-present + SID-matches, which is the single row that
+# branch documents as deliberately NOT taken ("the REDUCER"). Zero overlap. What
+# changes is that the row's "SID matches => this IS the reducer" assumption is
+# the very one  falsified; Gate 0b handles the falsified subset and
+# leaves the worker-net's re-entry contract untouched.
+#
+# FAIL-CLOSED TOWARD THE STATUS QUO: an unresolvable identity, an absent stamp, a
+# dead stamped owner, or a stamp naming THIS process all return 1, leaving every
+# pre-existing turn-end decision untouched. The allowance is added ONLY on
+# positive evidence that some OTHER live process holds the role.
+#
+# COST, measured here (Linux 6.8, 10 reps): ~2ms/call on a box that has never
+# stamped (one failed open, no /proc walk), ~12ms when the walk runs — against a
+# hook whose latency budget is measured in seconds.
+if [ -n "$RUNNER_SID" ] && [ "$HOOK_SID" = "$RUNNER_SID" ] && runner_proc_foreign_live "$HOOK_AGENT"; then
+    echo "$(date +%Y-%m-%dT%H:%M:%S) ALLOW gate=same-sid-not-owner sid=$HOOK_SID runner=$RUNNER_SID agent=$HOOK_AGENT runner_token=$RUNNER_TOKEN_LOG" >> "$LOG" 2>/dev/null || true
+    exit 0  # Duplicate instance ejected by runner-identity-check — let it stop
 fi
 
 # DO NOT use "$_A bash ..." — variable expansion is not recognized as an env

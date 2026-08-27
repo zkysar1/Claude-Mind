@@ -533,3 +533,144 @@ def test_disk_free_gib_returns_none_on_error(monkeypatch):
     monkeypatch.setattr(WD.shutil, "disk_usage",
                         lambda p: (_ for _ in ()).throw(OSError("gone")))
     assert WD._disk_free_gib(Path(".")) is None
+
+
+# ── 10. the fired-latch re-validation () ───────────────────────────
+
+def test_persistent_breach_reopens_latch_and_refiles(monkeypatch, tmp_path):
+    """: the `fired` latch MUST re-arm while the breach persists.
+
+    `fired` is written False only in the CLEARED branch, so during a persistent
+    breach the probe never writes the negative -- a latch by guard-4870's
+    definition ("a store written ONLY inside its own fire condition"). Once
+    fired, if the covering goal is closed (or never landed) while the breach
+    continues, the box is breached + un-goaled + UN-REFILEABLE, because
+    `not self.fired` short-circuits BEFORE _file_drift_goal()'s own dedup is
+    ever reached. A latched detector has silently stopped detecting, which is
+    worse than an absent one: the fleet reads the quiet as health.
+
+    Models the exact latched state -- the breach never clears AND the filer
+    would now succeed (no open goal covers this box any more).
+
+    The interval is READ OFF THE CONFIG, never hardcoded. GitDriftProbe takes
+    its thresholds from a config dict rather than class constants (the reason
+    this fix is a config key and the twin's is a class constant), so the test
+    reads it the same way the probe does -- guard-3560 step 3, a value
+    enshrined in a test that then blocks its own correction.
+    """
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("GIT_DRIFT_AHEAD", "2")
+    monkeypatch.setenv("GIT_DRIFT_TICKS_TO_FILE", "2")
+    monkeypatch.setenv("GIT_DRIFT_TICKS_TO_REVALIDATE", "5")
+    monkeypatch.setenv("GIT_DRIFT_DISK_PCT", "100")
+
+    N = WD._git_drift_config()["ticks_to_revalidate"]
+    assert N > WD._git_drift_config()["ticks_to_file"], \
+        "re-validation must outlast the fire threshold, or every tick re-files"
+
+    repo = _seed_repo(tmp_path, ahead=5)
+    p = _probe(monkeypatch, repo)
+
+    filed: list[int] = []
+    monkeypatch.setattr(p, "_file_drift_goal",
+                        lambda payload: (filed.append(1) or
+                                         {"filed": True, "dedup": False,
+                                          "goal_id": f"g-test-{len(filed):02d}"}))
+
+    for _ in range(N - 1):
+        p.check()
+    assert len(filed) == 1, \
+        "episode dedup must hold BETWEEN re-validations -- no respam"
+    assert p.fired is True
+
+    p.check()                                   # tick N -- the re-validation tick
+    assert len(filed) == 2, (
+        "latch must re-open so the filer can re-decide; without this a box stays "
+        "breached + un-goaled forever (the twin was measured at 981 ticks)")
+
+
+def test_revalidation_does_not_respam_while_goal_still_open(monkeypatch, tmp_path):
+    """The BOUND on the re-arm: when a goal IS still open the filer returns
+    dedup, so re-validation costs one open-goal read per N breaching ticks and
+    creates NO second goal. This is what keeps the re-arm from reintroducing the
+    spam that test_ticks_to_file_dedups_the_episode pins.
+    """
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("GIT_DRIFT_AHEAD", "2")
+    monkeypatch.setenv("GIT_DRIFT_TICKS_TO_FILE", "2")
+    monkeypatch.setenv("GIT_DRIFT_TICKS_TO_REVALIDATE", "5")
+    monkeypatch.setenv("GIT_DRIFT_DISK_PCT", "100")
+
+    N = WD._git_drift_config()["ticks_to_revalidate"]
+    repo = _seed_repo(tmp_path, ahead=5)
+    p = _probe(monkeypatch, repo)
+
+    attempts: list[int] = []
+    monkeypatch.setattr(p, "_file_drift_goal",
+                        lambda payload: (attempts.append(1) or
+                                         {"filed": False, "dedup": True,
+                                          "goal_id": None,
+                                          "error": "open goal exists (dedup)"}))
+
+    for _ in range(2 * N + 1):
+        p.check()
+    # Exactly: the initial fire at ticks_to_file, then re-validation at tick N
+    # and tick 2N. Three store consultations across 2N+1 ticks -- not one per tick.
+    assert len(attempts) == 3, \
+        f"expected 3 bounded consultations, got {len(attempts)}"
+    assert p.fired is True
+
+
+def test_revalidate_zero_restores_fire_once_behaviour(monkeypatch, tmp_path):
+    """The documented off-switch. `ticks_to_revalidate: 0` must not crash on a
+    modulo-by-zero and must reproduce the pre-fix semantics exactly -- fire
+    once, then stay quiet for the whole episode.
+
+    This is the POSITIVE CONTROL for the two tests above: it pins that they are
+    measuring the re-validation and not some unrelated re-entry.
+    """
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("GIT_DRIFT_AHEAD", "2")
+    monkeypatch.setenv("GIT_DRIFT_TICKS_TO_FILE", "2")
+    monkeypatch.setenv("GIT_DRIFT_TICKS_TO_REVALIDATE", "0")
+    monkeypatch.setenv("GIT_DRIFT_DISK_PCT", "100")
+
+    repo = _seed_repo(tmp_path, ahead=5)
+    p = _probe(monkeypatch, repo)
+
+    filed: list[int] = []
+    monkeypatch.setattr(p, "_file_drift_goal",
+                        lambda payload: (filed.append(1) or
+                                         {"filed": True, "dedup": False,
+                                          "goal_id": "g-test-01"}))
+
+    for _ in range(25):
+        p.check()
+    assert len(filed) == 1, \
+        "with re-validation disabled the episode must fire exactly once"
+    assert p.fired is True
+
+
+def test_revalidate_interval_matches_the_twin_probe(monkeypatch):
+    """ fresh-eyes finding: the ALIGNMENT was a comment, not a test.
+
+    GitDriftProbe reads `ticks_to_revalidate` from config and MirrorWedgeProbe
+    reads WEDGED_TICKS_TO_REVALIDATE off the class -- each correctly sourced
+    (guard-3560), and nothing whatsoever tied the two VALUES together. So the
+    stated property ("the twin probes re-file on ONE cadence rather than two
+    that drift apart") could be broken by editing either side alone, silently,
+    with every existing test still green.
+
+    That is the guard-5163 shape: a claimed property no assertion can falsify.
+    This pins it. If the two are intentionally decoupled later, delete this test
+    DELIBERATELY and drop the alignment claim from the config comment and from
+    aspirations.yaml in the same change -- do not just retune one number.
+    """
+    _clear_env(monkeypatch)   # env overrides must not mask a real config drift
+    cfg_interval = WD._git_drift_config()["ticks_to_revalidate"]
+    twin_interval = WD.MirrorWedgeProbe.WEDGED_TICKS_TO_REVALIDATE
+    assert cfg_interval == twin_interval, (
+        f"git_drift.ticks_to_revalidate={cfg_interval} has drifted from "
+        f"MirrorWedgeProbe.WEDGED_TICKS_TO_REVALIDATE={twin_interval}; the twin "
+        "probes no longer re-file on one cadence"
+    )

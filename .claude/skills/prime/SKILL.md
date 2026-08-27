@@ -206,7 +206,7 @@ token budget below, as a bounded index plus on-demand expansion, never in full.
    - Category-relevant entries load in Phase 3 via
      `retrieve.sh --category {cat} --depth {tier_depth}` (DEPTH_LIMITS:
      shallow 15 / medium 30 / deep 50) — the existing budgeted path.
-   - Expand on demand: `--id`, `--tag`, `--query`, `--category`.
+   - Expand on demand: `--id`, `--tag`, `--category`.
    - This does NOT preserve the old universal-set guarantee (every framework/any
      lesson present at prime time); that guarantee was unbuyable at ~2.7M tokens.
      Cross-domain lessons now arrive via the recency window plus Phase 3

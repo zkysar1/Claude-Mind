@@ -484,6 +484,96 @@ Same run, both controls replicated and are worth keeping as the instrument's sel
 balanced p95 **7.19pp** (vs 7.57 / 7.80 on two other boxes) and the date-free `id[11:]`
 checksum at **−2.04pp** (vs −1.00pp).
 
+⚠ **DE-CIRCULARIZATION IS NOT ONLY A SMALL-n CORRECTIVE — IT CAN REMOVE MOST OF THE EFFECT
+SIZE AT A GROUP SIZE WHERE QUANTIZATION IS NOT IN PLAY.** The paragraph above reaches for it
+because dropping batch members took n from 5 to 3 and exposed the quantization; that framing
+invites a reader with a comfortably-sized group to treat the step as optional. Measured
+2026-08-24 (zeta, `hostname` cc-02, `uname -r` 6.8.0-137-generic, g-001-05, 890 scoreable
+resolved+archived, store base **42.9%**): a marker discovered in a 10-record batch —
+*the CORRECTED verdict landed on the FRAMING rather than the substance* (premise dissolved /
+weakest conjunct / substantive finding intact) — measured **+12.90pp at n=18**. Only **3** of
+those 18 were batch members. Dropping them gave **+3.88pp at n=15**: de-circularization alone
+removed **70% of the effect** while leaving the group comfortably large. Three of eighteen is
+not a small-n problem; it is 17% of the group carrying most of the signal, and nothing about
+n=18 warns you.
+
+Two calibration anchors from the same run, both worth carrying:
+
+- **The size-matched MEDIAN, not just p95, is worth printing.** At n=15 the floor was
+  median **9.69pp** / p95 **24.22pp**, so the de-circularized +3.88pp sat *below the median* —
+  exceedance probability **79.1%**, i.e. four in five random splits reach it. A p95-only
+  comparison tells you the marker failed; the median tells you it was not close, which is what
+  stops a reader relitigating it next cycle.
+- **Compare the marker against the date-only control directly.** The `id[:10]` date checksum
+  returned **+3.18pp** on the same corpus — indistinguishable from the hypothesized marker's
+  +3.88pp. The most persuasive thing in the batch performed about as well as ten characters of
+  date. That one-line comparison is faster to read than any permutation table.
+
+⛔ **AND THE MARKER ABOVE WAS ITSELF SEMANTICALLY CIRCULAR — READ THIS BEFORE COPYING ITS
+METHOD.** It was matched against the RESOLUTION NARRATIVE (`outcome_detail` and its nine
+fallback keys), which is written AFTER and ABOUT the outcome, so the predicate is a linguistic
+proxy for the very variable being measured. `guard-4758` forbids exactly this and says
+plainly that **de-circularization does not catch it**: excluding the batch removes SELECTION
+circularity and is silent on SEMANTIC circularity. Compute a marker over PRE-RESOLUTION fields
+only — `title`, `claim`, `rationale`, `measurement_channel`, `position` — and report THAT
+number as the verdict.
+
+⚠ **THAT FIVE-FIELD LIST IS ITSELF CONTAMINATED, AND ITS TWO RICHEST FIELDS ARE THE WORST.
+Prefer `title`.** Verdict-token census 2026-08-24 (alpha, `hostname` cc-04, `uname -r`
+6.8.0-137-generic, g-001-05) over the resolved+archived union, 1372 records, regex
+`\b(CORRECTED|CONFIRMED|FALSIFIED|UNRESOLVABLE|REFUTED)\b`, as a fraction of records where
+the field is present and non-empty:
+
+| field | verdict-token | share |
+|---|---|---|
+| `title` | 7/1372 | **0.5%** |
+| `position` | 65/1322 | 4.9% |
+| `claim` | 69/1133 | 6.1% |
+| `measurement_channel` | 175/948 | **18.5%** |
+| `rationale` | 239/1019 | **23.5%** |
+
+So a marker over `rationale` or `measurement_channel` can key on the VERDICT WORD ITSELF on
+about one record in five — the exact semantic circularity the rule above forbids. Following
+that sentence literally routes a reader OUT of the narrative and INTO two fields that carry
+the narrative's verdict anyway. Among the 666 scoreable records carrying a rationale, 191
+(28.7%) are contaminated.
+
+**The contamination is a CONSEQUENCE OF A WORKING GATE, which is why it will keep accruing
+and why the fix is stripping rather than scolding.** Step 2's own fallback chain resolved 4
+of 10 batch records to `narrative_key='rationale'` on the run that measured this, and the
+write-time resolution-evidence gate (guard-870 / guard-1126) is satisfied by `rationale`
+alone — so agents write the post-hoc verdict there legitimately. Prefer `title`, then
+`position` / `claim`; if a marker MUST use the contaminated two, strip verdict tokens first
+or drop contaminated records from BOTH arms and report the reduced n.
+
+Do NOT re-derive the accompanying outcome delta: CORRECTED inside contaminated rationale
+37.2% (n=191) vs 44.2% clean (n=475) = **−7.04pp**, below the size-matched p95 of **8.38pp**
+at exceedance **9.0%** (2000 permutations at n=191), against a pure-date `id[:10]` control of
++3.40pp. **Nothing.** Recorded so the next reader does not spend the hour. The CENSUS is the
+finding and needs no floor — it counts fields, not outcomes. (guard-4758, amended.)
+
+The finding above survives the objection, in one direction only: semantic circularity INFLATES
+a marker's apparent effect, and this one came back at exceedance **79.1%** even so. A marker
+that is nothing under an upward-biased method is still nothing. Do NOT read that as licence —
+had it come back positive, the number would have been uninterpretable and the de-circularization
+step would have signed off on it.
+
+**Why this is in the instrument and not only in the guardrail.** `guard-4758` was written
+2026-08-22 by zeta on cc-02 from a run of THIS SAME recurring goal, and on 2026-08-24 the same
+agent on the same box ran a narrative-derived marker again — because nothing in this block said
+not to, and the block is what a reader follows at the moment of use (`guard-1984`: a guardrail
+cannot outvote the instrument it guards). Its `times_helpful` was **0** against `times_active`
+**3** at that moment: firing, and not reaching anyone. That is also `guard-4070` — *retrieve
+BEFORE you measure, not after* — landing on the one decision point
+`retrieve-before-deciding.md` does not list, since "I am about to spend an hour measuring" is
+not a write and no dedup check can refund the hour.
+
+Controls replicated a fourth time: date-free `id[11:]` **−0.71pp** (vs −1.00 / −2.04), balanced
+p95 **6.35pp** (vs 7.57 / 7.80 / 7.19), store base **42.9%** (vs 42.6%). Also note the
+pool-vs-store base gap has WIDENED to **16.4pp** (26.5% pool vs 42.9% store) against the
+12.1pp recorded 2026-08-22 — the chronic drain the block above describes is still running, so
+re-measure the gap rather than inheriting it, and keep naming the population on every rate.
+
 ```
 1. SHARED CONDITIONS in corrected hypotheses:
    Group all corrected hypotheses

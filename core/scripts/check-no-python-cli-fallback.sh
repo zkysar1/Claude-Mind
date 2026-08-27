@@ -113,14 +113,26 @@ if [ "$MODE" = "precommit" ]; then
         fi
     done <<< "$STAGED"
 else
+    scanned=0
     while IFS= read -r f; do
         [ -f "$f" ] || continue
+        scanned=$((scanned + 1))
         if scan "$f" "$(cat "$f")"; then
             echo "AUDIT HIT: $f matches a Python-CLI-fallback pattern." >&2
             rc=1
         fi
     done < <(git ls-files 'core/scripts/*.sh')
-    [ "$rc" = "0" ] && echo "audit clean: no Python-CLI-fallback regressions in core/scripts/*.sh"
+    # State the DENOMINATOR beside the verdict. Without it a zero-file scan
+    # (wrong cwd, pathspec drift, an untracked tree) prints the identical
+    # "audit clean" line as a real 551-file pass — the ambiguous-zero class
+    # (guard-1641: counted-zero and never-ran must not render alike). Stays
+    # fail-open per the discipline above: an inconclusive scan warns, it
+    # never blocks.
+    if [ "$scanned" = "0" ]; then
+        echo "audit INCONCLUSIVE: 0 files scanned — git ls-files 'core/scripts/*.sh' matched nothing; this is NOT a clean result" >&2
+    elif [ "$rc" = "0" ]; then
+        echo "audit clean: no Python-CLI-fallback regressions in $scanned core/scripts/*.sh files scanned"
+    fi
 fi
 
 exit "$rc"

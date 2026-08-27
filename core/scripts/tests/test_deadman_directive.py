@@ -134,7 +134,41 @@ def test_worker_prompt_checks_closure_before_rearming():
     # keep passing even if the live branch lost its ordering entirely.
     live = p.index("IF body_state is active")
     assert live < p.index("re-arm this same wakeup", live)
-    assert p.index("re-arm this same wakeup", live) < p.index("then resume by calling", live)
+    # The proxy is "resume by calling Skill(worker-loop)", not the older
+    # "then resume by calling":  put an in-flight-claim check between
+    # the re-arm and the re-entry, so the two clauses are no longer adjacent.
+    # The INVARIANT is unchanged and is what this pins — re-arm still precedes
+    # every path that resumes work.
+    assert (p.index("re-arm this same wakeup", live)
+            < p.index("resume by calling Skill(worker-loop)", live))
+
+
+def test_worker_prompt_resumes_its_own_claim_instead_of_reselecting():
+    """: the net fires MID-UNIT on a HEALTHY Body, and the prompt
+    must not send it back through SELECT.
+
+    The 600s net is re-armed at every terminal pair, so any single unit longer
+    than the delay trips it — witnessed 2026-08-26 on a ~55 min deep-code unit
+    whose suite alone ran 40 min. The firing is correct; the instruction was
+    not. Skill(worker-loop) reaches Phase 1 SELECT, which offers only UNCLAIMED
+    goals, so it hands out a DIFFERENT goal while the half-finished unit keeps
+    its claim and its uncommitted edits — a stranded claim of exactly the
+    g-115-6337 shape.
+    """
+    p = worker_prompt()
+    live = p.index("IF body_state is active")
+    branch = p[live:]
+    # The check exists, and keys on the SID rather than the agent (guard-1460:
+    # another SESSION of the same agent can hold a claim, and claimed_by_sid is
+    # the only field that separates them).
+    assert "claimed_by_sid" in branch
+    assert "NEVER on claimed_by" in branch, (
+        "keying on claimed_by would read a peer session's live claim as my own")
+    # It must fire BEFORE the re-entry, or the goal is already gone.
+    assert (branch.index("claimed_by_sid")
+            < branch.index("resume by calling Skill(worker-loop)"))
+    # And it must say what to do instead of re-entering.
+    assert "do NOT call Skill(worker-loop)" in branch
 
 
 def test_worker_prompt_treats_parked_as_resumable_not_closed():

@@ -25,6 +25,24 @@ unclaimed with `executed_by` set. So the widened predicate is:
   AND no defer_reason;  "mine" = claimed_by == me
                         OR (unclaimed AND executed_by == me)
 
+THAT PREDICATE HAS NO EXIT ON ITS OWN, and the hold TTL does not give it one
+(g-115-7000). `outcome_note` on an OPEN goal is very often a PROGRESS note, not
+a completion note, and nothing in the record distinguishes them — so a row
+correctly judged not-cnc re-qualifies the moment its 24h lease lapses, forever.
+Measured 2026-08-27 (zeta, cc-02): the `(unattributed)` lane served 3 rows, all
+re-serves, 13 prior dispositions between them, every one reaching the same
+verdict, while 14 never-looked-at rows queued behind them.
+
+The exit is a CONTENT-KEYED hold: `--hold` stamps `note_sha`, the digest of the
+note it was judged against, and `build_slate` suppresses that row only while the
+note is UNCHANGED. Because `outcome_note` is REPLACED wholesale rather than
+appended (guard-1691), any rewrite — including the completion note this lane
+exists to catch — changes the digest and resurfaces the row on the NEXT run,
+with no clock to wait out. Suppressed rows are counted
+(`mine_held_back_note_unchanged`) and named in the report line, so this is a
+visible keep, never the silent one guard-3628 warns about. Pre-existing holds
+carry no `note_sha` and behave exactly as before.
+
 `executed_by` is stamped at claim time (E1) and survives release, so an
 unclaimed noted row still names the reducer that has the context to judge it;
 a row with neither field is counted (`(unattributed)`) and offered to nobody.
@@ -90,6 +108,7 @@ TWO SUB-COMMANDS ADDED BY THE 2026-08-16 FRESH-EYES REVIEW
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -170,6 +189,17 @@ def cross_record_ids(note: str, own_id: str) -> List[str]:
         if gid != own_id and gid not in seen:
             seen.append(gid)
     return seen
+
+
+def _note_sha(note: str) -> str:
+    """Stable digest of an outcome_note, for content-keyed holds ().
+
+    Whitespace-normalised so a reflow is not mistaken for new evidence. Empty
+    note -> "" (never a hold key: `is_drain_candidate` already excludes it)."""
+    n = " ".join((note or "").split())
+    if not n:
+        return ""
+    return hashlib.sha256(n.encode("utf-8")).hexdigest()[:16]
 
 
 DRAIN_STATUSES = ("in-progress", "pending")
@@ -263,6 +293,8 @@ def build_slate(rows: List[Dict[str, Any]], agent: str, *, limit: int,
     held_back_fresh = 0
     held_back_own_sid = 0
     held_back_recent_hold = 0
+    held_back_note_unchanged = 0
+    note_unchanged_rows: List[Any] = []
     for g in mine_noted:
         sid = g.get("claimed_by_sid") or ""
         if own_sid and sid == own_sid:
@@ -282,6 +314,35 @@ def build_slate(rows: List[Dict[str, Any]], agent: str, *, limit: int,
                 break
         if recent is not None:
             held_back_recent_hold += 1
+            continue
+        # CONTENT-KEYED HOLD (). The TTL above is a LEASE, not an EXIT:
+        # `is_drain_candidate` cannot tell a completion note from a PROGRESS note,
+        # so a row correctly judged not-cnc re-qualifies the moment its lease
+        # lapses -- forever, and no amount of correct disposition removes it.
+        # Measured 2026-08-27 (zeta, hostname cc-02, uname -r 6.8.0-137-generic):
+        # the (unattributed) lane served 3 rows, ALL re-serves, 13 prior
+        # dispositions between them, every one reaching the same verdict, while
+        # 14 never-looked-at rows queued behind them (oldest-first + bounded).
+        #
+        # A hold stamped with the note's digest suppresses that row only while the
+        # note is UNCHANGED. guard-1691 is what makes this sound: outcome_note is
+        # REPLACED wholesale, never appended, so ANY rewrite -- including the
+        # completion note this lane exists to catch -- changes the digest and
+        # resurfaces the row on the very next run, with no TTL to wait out. That
+        # is why this is not "widen the TTL", which the goal explicitly rejects as
+        # trading a recurring read for a SILENT one.
+        #
+        # Suppressed rows stay COUNTED (`mine_held_back_note_unchanged`) and are
+        # named individually in the report line + `note_unchanged` payload, so this
+        # is never the silent keep guard-3628 warns
+        # about. Holds written before this change carry no `note_sha` and fall
+        # through to the TTL path unchanged -- no migration, no behaviour change
+        # for existing ledgers.
+        cur_sha = _note_sha(g.get("outcome_note") or "")
+        if cur_sha and any(h.get("note_sha") == cur_sha
+                           for h in hold_by_goal.get(gid, [])):
+            held_back_note_unchanged += 1
+            note_unchanged_rows.append((gid, g))
             continue
         eligible.append((age_h if age_h is not None else float("inf"), g))
 
@@ -327,6 +388,8 @@ def build_slate(rows: List[Dict[str, Any]], agent: str, *, limit: int,
             "mine_held_back_fresh": held_back_fresh,
             "mine_held_back_own_sid": held_back_own_sid,
             "mine_held_back_recent_hold": held_back_recent_hold,
+            "mine_held_back_note_unchanged": held_back_note_unchanged,
+            "note_unchanged_goal_ids": [gid for gid, _ in note_unchanged_rows],
             "by_holder": by_holder,
         },
         "hold_ttl_hours": hold_ttl_hours,
@@ -369,7 +432,7 @@ def load_holds(path) -> List[Dict[str, Any]]:
 
 
 def record_hold(path, *, goal_id: str, reason: str, agent: str, sid: str,
-                now: datetime,
+                now: datetime, note_sha: str = "",
                 retention_days: int = _HOLD_LEDGER_RETENTION_DAYS) -> Dict[str, Any]:
     """Append one hold and drop entries older than `retention_days` (the ledger
     is bounded by construction — a hold older than any TTL is dead weight).
@@ -377,6 +440,11 @@ def record_hold(path, *, goal_id: str, reason: str, agent: str, sid: str,
     reducer) by the same argument that makes the drain reducer-only."""
     rec = {"goal_id": goal_id, "held_at": now.strftime("%Y-%m-%dT%H:%M:%S"),
            "reason": (reason or "").strip()[:400], "agent": agent, "sid": (sid or "")[:8]}
+    # : the digest of the note this hold was JUDGED AGAINST. Omitted
+    # (not written empty) when the note could not be read, so the row falls back
+    # to the TTL path rather than being suppressed against a digest of nothing.
+    if note_sha:
+        rec["note_sha"] = note_sha
     keep = []
     for h in load_holds(path):
         hts = _parse_ts(h.get("held_at"))
@@ -501,8 +569,14 @@ def _render(result: Dict[str, Any]) -> None:
           f"held_back_fresh={pop['mine_held_back_fresh']} "
           f"own_sid={pop['mine_held_back_own_sid']} "
           f"recent_hold(<{result.get('hold_ttl_hours', _DEFAULT_HOLD_TTL_HOURS):g}h)="
-          f"{pop.get('mine_held_back_recent_hold', 0)} | slate={len(result['slate'])} "
-          f"dropped={result['dropped']}")
+          f"{pop.get('mine_held_back_recent_hold', 0)} "
+          f"note_unchanged={pop.get('mine_held_back_note_unchanged', 0)} "
+          f"| slate={len(result['slate'])} dropped={result['dropped']}")
+    _nu = pop.get("note_unchanged_goal_ids") or []
+    if _nu:
+        print("[cnc-slate] suppressed on an UNCHANGED note (already judged not-cnc; "
+              "resurfaces automatically when the note is rewritten — guard-1691): "
+              + ", ".join(_nu))
     others = {h: v for h, v in (pop.get("by_holder") or {}).items() if h != result["agent"]}
     if others:
         parts = [f"{h}:{v['noted']}"
@@ -593,14 +667,27 @@ def main() -> int:
         # `agent` is provenance for WHO DECIDED, so it is the acting agent too —
         # not the queried holder. Stamping args.agent here would record a hold as
         # made by "(unattributed)", which is not an agent and decided nothing.
+        # Read the note this hold is being judged against so the hold can be
+        # CONTENT-KEYED (). Fail-open: an unreadable goal writes a
+        # plain TTL hold exactly as before -- a hold must never be blocked by a
+        # daemon hiccup, and a missing digest degrades to the old behaviour.
+        _hg = _load_one(args.hold, args.timeout)
+        _sha = _note_sha((_hg or {}).get("outcome_note") or "")
         rec = record_hold(hpath, goal_id=args.hold, reason=args.reason, agent=acting,
-                          sid=os.environ.get("MIND_SID", ""), now=datetime.now())
+                          sid=os.environ.get("MIND_SID", ""), now=datetime.now(),
+                          note_sha=_sha)
         n = sum(1 for h in load_holds(hpath) if h.get("goal_id") == args.hold)
-        print(f"[cnc-slate] HOLD recorded for {args.hold} (hold #{n}; held back "
-              f"{cfg['hold_ttl_hours']:g}h; ledger {hpath}) reason: {rec['reason']}")
+        _kind = (f"content-keyed on note {_sha} — resurfaces the moment the note "
+                 f"CHANGES, not on a clock" if _sha else
+                 f"TTL-only ({cfg['hold_ttl_hours']:g}h) — note unreadable, no digest stamped")
+        print(f"[cnc-slate] HOLD recorded for {args.hold} (hold #{n}; {_kind}; "
+              f"ledger {hpath}) reason: {rec['reason']}")
         if n >= 3:
-            print(f"[cnc-slate] {args.hold} has now been held {n}x — file an Investigate "
-                  "instead of holding a fourth time.")
+            print(f"[cnc-slate] {args.hold} has now been held {n}x — and since holds "
+                  "became content-keyed (g-115-7000) a REPEAT hold means the note was "
+                  "REWRITTEN between judgements, not that the row recycled on a clock. "
+                  "That is a different signal: read the note diff before holding again, "
+                  "and file an Investigate if the rewrites are not converging.")
         return 0
     if args.show:
         g = _load_one(args.show, args.timeout)

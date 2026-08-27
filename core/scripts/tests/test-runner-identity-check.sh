@@ -35,6 +35,14 @@ trap 'rm -rf "$SANDBOX"' EXIT
 mkdir -p "$SANDBOX/core/scripts"
 cp "$REAL_SCRIPT" "$SANDBOX/core/scripts/runner-identity-check.sh"
 
+# The REAL _runner_proc.sh, not a stub (). The owning-process predicate
+# moved out of runner-identity-check.sh so stop-hook.sh Gate 0 could consume the
+# SAME implementation instead of a second copy; this sandbox must therefore carry
+# it or the script sources a missing file and every proc-stamp case fails with a
+# "No such file or directory" that reads as a logic regression. Copied rather than
+# stubbed because the predicate IS what cases 15b-18b exercise.
+cp "$(dirname "$REAL_SCRIPT")/_runner_proc.sh" "$SANDBOX/core/scripts/_runner_proc.sh"
+
 # Minimal _paths.sh stub — BASH_SOURCE-anchored PROJECT_ROOT + agent_dir,
 # matching the real _paths.sh AGENTS_PARENT_DIR="agents" layout. Drops the
 # external-paths config / python shim / windows detection the real script does;

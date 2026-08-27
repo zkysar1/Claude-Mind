@@ -17,7 +17,10 @@ Read-only. Compares only framework paths; auto-excludes build artifacts.
 Exit codes:
   0  CLEAN  -- target framework is a subset of source (safe to promote)
   2  DRIFT  -- target has framework files the source lacks (orphan risk), or
-              (with --strict) framework files differ; reconcile/back-port first
+              a differing file whose TARGET half carries functional lines the
+              source lacks (LINE-level clobber risk, g-115-4155 -- always
+              checked, not gated by --strict), or (with --strict) framework
+              files differ; reconcile/back-port first
   1  ERROR  -- bad invocation
 
 Usage:
@@ -28,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import difflib
 import fnmatch
 import hashlib
 import json
@@ -58,6 +62,7 @@ FRAMEWORK_PATHS = [
     "CLAUDE.md",
     "core/config",
     "core/scripts",
+    "core/githooks",
     ".claude/skills",
     ".claude/rules",
     ".claude/settings.json",
@@ -81,8 +86,16 @@ MANIFEST_NOT_DRIFT_CHECKED = {
     # (githooks, tests/gates). Widening to bare "core" would newly report
     # core/logs churn as drift on every run, so it needs its own exclusion
     # design -- deliberately out of 's scope, not overlooked.
-    "core/": "copied whole; only core/config + core/scripts are checked "
-             "(core/logs is machine-local; widening needs its own exclusions)",
+    # core/githooks was CLOSED 2026-08-25 () — narrowly, by naming the
+    # one subdir rather than widening to bare "core", which is what the
+    # core/logs objection below was really about. It had to close: v2.9.4
+    # promoted core/githooks/* as 100644 into ZDS, silencing the whole gate
+    # chain (guard-844), and this tool could not have caught it in ANY
+    # dimension because the files were outside the walk entirely. A mode check
+    # alone would have been inert here — the surface gap came first.
+    "core/": "copied whole; core/config + core/scripts + core/githooks are "
+             "checked (core/logs is machine-local; core/tests and "
+             "core/BOUNDARY.md still need their own exclusion design)",
     # Repo-furniture that legitimately differs per deployment. A promote
     # overwriting these is expected, not drift.
     ".env.example": "deployment-local credential template",
@@ -163,6 +176,73 @@ def digest(p: Path) -> str:
         return hashlib.sha256(p.read_bytes()).hexdigest()
     except Exception:
         return "READ_ERROR:" + p.name
+
+
+def exec_bits(p: Path) -> int | None:
+    """The EXECUTE bits of a file (0o111 mask), or None if unreadable.
+
+    Only the execute bits are compared. Read/write bits track each box's umask
+    and would make mode drift a pure noise generator; the execute bit is the one
+    that changes BEHAVIOUR, and it fails in the silent direction — a git hook or
+    wrapper that loses u+x does not error, it simply never runs, so the safety
+    layer is absent with nothing red anywhere (g-360-09).
+    """
+    try:
+        return p.stat().st_mode & 0o111
+    except OSError:
+        return None
+
+
+def index_exec_map(repo_root: Path) -> dict[str, bool]:
+    """rel-path -> is-executable, read from git's INDEX (`git ls-tree -r HEAD`).
+
+    THE INDEX MODE IS THE ONE THAT PROPAGATES (g-360-07, guard-844). A promotion
+    commits what the index says; `chmod +x` alone does not travel, which is why
+    the downstream fix needed `git update-index --chmod=+x`. The filesystem mode
+    is also the dimension that DISAPPEARS on a checkout whose mount flattens
+    permissions — precisely the boxes where exec_bits() reports "cannot see" and
+    the whole check goes blind. Reading the index restores the signal there.
+
+    Returns {} on any failure (not a git repo, git absent, detached/empty HEAD).
+    An empty map is a DECLINE, not a clean result: callers fall back to
+    exec_bits() per file and must never read {} as "no drift".
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo_root), "ls-tree", "-r", "HEAD"],
+            capture_output=True, text=True, timeout=120,
+        )
+    except Exception:
+        return {}
+    if out.returncode != 0:
+        return {}
+    m: dict[str, bool] = {}
+    for line in out.stdout.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) != 2:
+            continue
+        fields = parts[0].split()
+        if not fields:
+            continue
+        # 100755 = executable blob, 100644 = regular. Anything else (120000
+        # symlink, 160000 gitlink) is not a mode this check reasons about.
+        if fields[0] in ("100755", "100644"):
+            m[parts[1].replace("\\", "/")] = fields[0] == "100755"
+    return m
+
+
+def resolve_exec(rel: str, abs_path: Path, idx: dict[str, bool]) -> tuple[bool | None, str]:
+    """(is_executable, source) preferring the INDEX, falling back to the filesystem.
+
+    source is "index" or "fs" so a reader can tell which dimension produced a
+    verdict — a file staged-but-not-in-HEAD legitimately has no index entry and
+    must not be silently treated as non-executable (that would invent a
+    regression out of an absence).
+    """
+    if rel in idx:
+        return idx[rel], "index"
+    bits = exec_bits(abs_path)
+    return (None if bits is None else bool(bits)), "fs"
 
 
 def is_skill(rel: str) -> bool:
@@ -672,6 +752,74 @@ def classify_direction(
     return "ambiguous"
 
 
+def target_only_functional_lines(src_abs: Path, tgt_abs: Path,
+                                 rel: str, cap: int = 5) -> list[str] | None:
+    """Lines the TARGET ADDS that have no counterpart in the source.
+
+    g-115-4155. classify_direction answers "which side is NEWER"; this answers
+    "would overwriting DELETE anything nobody replaced". They are different
+    questions, and the first short-circuits on Signal 1 (git recency) before
+    content is read -- so a source committed more recently is labelled
+    source_ahead and never blocks, even when the target carries downstream
+    additions. That is the file-level/line-level split g-115-4136 measured:
+    preflight said CLEAN (153 source-ahead) where the seed plan refused.
+
+    ADDED vs MODIFIED is the load-bearing distinction, and a set difference
+    cannot make it. `__version__ = "0.0.1"` at the target against
+    `__version__ = "1.0.0"` at the source is target-only AS A SET, but it is a
+    line the source REPLACES, not one it deletes -- and every promotion bumps a
+    version. Blocking that would make the gate fire on every promotion, and a
+    gate that always fires is one people learn to force past (PROMOTE_ALLOW_DRIFT=1),
+    which is worse than the hole it closed. So the comparison is difflib opcodes:
+
+      insert  -> target lines with NO aligned source counterpart. PROD-AHEAD.
+      replace -> both sides changed the same region. The source is overwriting
+                 something it can see; that is the ordinary promotion payload,
+                 and the pre-existing ambiguous/--strict lane already covers it.
+      delete/equal -> nothing the target adds.
+
+    This is deliberately NARROWER than the seed plan's `_substantive_lines(dst) -
+    _substantive_lines(transformed)` set difference. The plan can afford the
+    looser rule because its refusal (exit 21) has a justification-bearing
+    override with a ledger; preflight's DRIFT aborts promote-to-upstream outright.
+    Same defect class, different blast radius -- so it flags only what is
+    UNAMBIGUOUS. Under-flagging a `replace` leaves behavior exactly as it was;
+    over-flagging every version bump would have broken every promotion.
+
+    Comment/provenance drift is filtered via _functional_code for the suffixes it
+    models (.sh/.bash/.py) so a downstream goal-id scrub does not resurface as a
+    block (that would regress g-115-2885). Other suffixes compare raw non-blank
+    lines, and the caller's comment-only excusal still applies -- this set joins
+    `blocking` BEFORE that excusal runs.
+
+    Returns None when either side is unreadable: unreadable is not PROVABLE
+    prod-ahead, and the file already sits in the differing set where the existing
+    ambiguous/--strict handling covers it. [] means proved-none.
+    """
+    try:
+        src_text = src_abs.read_text(errors="replace")
+        tgt_text = tgt_abs.read_text(errors="replace")
+    except OSError:
+        return None
+    suffix = Path(rel).suffix
+    s_fn = _functional_code(src_text, suffix)
+    t_fn = _functional_code(tgt_text, suffix)
+    if s_fn is None or t_fn is None:
+        s_fn, t_fn = src_text, tgt_text
+    src_lines = [ln.strip() for ln in s_fn.splitlines() if ln.strip()]
+    tgt_lines = [ln.strip() for ln in t_fn.splitlines() if ln.strip()]
+    extra: list[str] = []
+    for tag, _i1, _i2, j1, j2 in difflib.SequenceMatcher(
+            a=src_lines, b=tgt_lines, autojunk=False).get_opcodes():
+        if tag != "insert":
+            continue
+        for ln in tgt_lines[j1:j2]:
+            extra.append(ln)
+            if len(extra) >= cap:
+                return extra
+    return extra
+
+
 def parse_known_criteria(repo_root: Path) -> set[str] | None:
     """AST-parse KNOWN_CRITERIA from <root>/core/scripts/goal-selector.py.
 
@@ -805,6 +953,94 @@ def main() -> int:
     source_only = sorted(s_keys - t_keys)
     differing = sorted(k for k in (s_keys & t_keys) if digest(S[k]) != digest(T[k]))
 
+    # Mode drift (). digest() hashes CONTENT only, so a file that is
+    # byte-identical but whose executable bit a plant stripped is invisible to
+    # `differing` above — and that is the dangerous direction: a non-executable
+    # hook or wrapper does not error, it silently never runs, so the safety
+    # layer is absent with nothing red anywhere. Measured 2026-08-23: 620 files
+    # lost the bit per plant across 3 consecutive plants, and this gate reported
+    # them all as clean because their bytes matched.
+    #
+    # DETECTION WAS REPORT-ONLY UNTIL ; ONE DIRECTION NOW BLOCKS. The
+    # order guard-1958 prescribes is print, read one real run, only then assert —
+    # and that run has now been read. Measured 2026-08-25, this repo vs its
+    # staging peer across the widened surface, reading the INDEX: 479 files
+    # differ in mode, and the STRIP direction (source non-exec over an executable
+    # target) is **0 of them**. So asserting on strip-direction costs nothing
+    # today and would have caught the incident; asserting on `mode_differing`
+    # wholesale would have blocked every promotion on 479 benign files, which is
+    # why the predicate is directional rather than the literal "any
+    # 100755/100644 mismatch" the goal's title suggests.
+    #
+    # The same pair REVERSED is the positive control that keeps that zero honest:
+    # 479 strip-risk / 0 target-stripped, an exact mirror — and the four files
+    # `core/githooks/{post-commit,post-merge,pre-commit,pre-push}` are in it,
+    # which is this incident reproduced by the gate that now catches it.
+    #
+    # THE INDEX IS THE DIMENSION THAT PROMOTES (guard-844). A promotion commits
+    # what `git ls-tree` says; a bare `chmod +x` never travels, which is exactly
+    # why the downstream repair needed `git update-index --chmod=+x`. Reading the
+    # index also restores the signal on mounts that flatten filesystem
+    # permissions, where exec_bits() reports "cannot see" for every file and the
+    # whole check would otherwise go blind. resolve_exec() prefers the index and
+    # falls back to the filesystem per file, reporting which it used.
+    #
+    # mode_bits_visible is a POSITIVE CONTROL, not an assumption: when NOTHING on
+    # either side reads as executable, the report says UNAVAILABLE rather than
+    # CLEAN, because a uniform zero is measurement-shaped silence meaning "I
+    # cannot see" and it is indistinguishable from a genuinely clean tree.
+    _common = s_keys & t_keys
+    _src_idx = index_exec_map(src)
+    _tgt_idx = index_exec_map(tgt)
+    _src_exec: dict[str, bool | None] = {}
+    _tgt_exec: dict[str, bool | None] = {}
+    _mode_sources: set[str] = set()
+    for k in _common:
+        _sv, _ss = resolve_exec(k, S[k], _src_idx)
+        _tv, _ts = resolve_exec(k, T[k], _tgt_idx)
+        _src_exec[k], _tgt_exec[k] = _sv, _tv
+        _mode_sources.add(_ss)
+        _mode_sources.add(_ts)
+    mode_source = "+".join(sorted(_mode_sources)) if _mode_sources else "none"
+    mode_bits_visible = (
+        any(v is True for v in _src_exec.values())
+        or any(v is True for v in _tgt_exec.values())
+    )
+    mode_differing = sorted(
+        k for k in _common
+        if _src_exec[k] is not None and _tgt_exec[k] is not None
+        and _src_exec[k] != _tgt_exec[k]
+    ) if mode_bits_visible else []
+    # The subset a content diff can NEVER surface: same bytes, different bit.
+    _differing_set = set(differing)
+    mode_only_differing = [k for k in mode_differing if k not in _differing_set]
+
+    # THE BLOCKING HALF, and the whole reason the direction matters. Promotion
+    # copies SOURCE over TARGET, so the target ends up wearing the source's mode:
+    #
+    #   source non-exec + target exec  -> the bit is STRIPPED by promoting. The
+    #     hook/wrapper stops running downstream and NOTHING goes red, because a
+    #     non-executable hook is not an error, it is an absence. This is the
+    #      incident verbatim (v2.9.4 shipped core/githooks/* as 100644
+    #     and disabled every gate downstream). It BLOCKS.
+    #   source exec + target non-exec  -> promoting RESTORES the bit. The target
+    #     is already broken and the promotion is the repair, so blocking it would
+    #     hold the fix hostage to the defect. Report-only.
+    #
+    # Kept OUT of `blocking` deliberately, alongside `wc_drift`: `blocking` is a
+    # list of CONTENT-divergent keys that downstream passes partition by zone and
+    # excuse by comment-only diffing. A mode-strip key is byte-identical, so it
+    # would be silently excused by exactly those passes — the drift signal is
+    # wired to the verdict instead, where nothing can launder it.
+    mode_strip_risk = sorted(
+        k for k in mode_differing
+        if _src_exec[k] is False and _tgt_exec[k] is True
+    )
+    mode_target_stripped = sorted(
+        k for k in mode_differing
+        if _src_exec[k] is True and _tgt_exec[k] is False
+    )
+
     # Phase 0 zone classification () — REPORT-ONLY, computed over the
     # full drift surface (differing + orphans both directions). Emitted below in
     # both output paths; NEVER feeds `blocking`/`drift`/exit codes.
@@ -900,6 +1136,18 @@ def main() -> int:
     blocking = list(to_core) + list(ta_core)
     if args.strict:
         blocking += am_core  # ambiguous blocks only in strict mode
+    # : LINE-level prod-ahead. to_core/ta_core are FILE-level verdicts;
+    # a file the direction heuristic cleared as source_ahead (or left ambiguous)
+    # can still carry target-only functional lines that a mirror would DELETE.
+    # NOT gated by --strict: promotion-cycle.md prescribes the bare invocation as
+    # the safety check, and a fix reachable only under a flag production does not
+    # pass is a fix that never runs (guard-1479).
+    line_level_prod_ahead: dict[str, list[str]] = {}
+    for _k in list(sa_core) + list(am_core):
+        _extra = target_only_functional_lines(S[_k], T[_k], _k)
+        if _extra:
+            line_level_prod_ahead[_k] = _extra
+    blocking += [k for k in line_level_prod_ahead if k not in blocking]
     # Phase 2 ENFORCEMENT (): excuse PHENOTYPE-parametric files that
     # block ONLY on comment/provenance drift (no value change — the 
     # Phase-1 finding). This promotes content_divergence from report-only to a
@@ -907,7 +1155,10 @@ def main() -> int:
     # downstream goal-id scrub now goes CLEAN. VALUE/UNPARSEABLE parametric diffs
     # and all orphan/structural blocks are conservatively retained.
     blocking, comment_only_excused = excuse_comment_only_blocks(blocking, content_divergence)
-    drift = len(blocking) > 0 or wc_drift
+    # : a mode STRIP is drift on its own. It carries no content
+    # divergence by definition, so it cannot ride in `blocking` (see the mode
+    # block above) and is joined at the verdict instead — same shape as wc_drift.
+    drift = len(blocking) > 0 or wc_drift or bool(mode_strip_risk)
 
     # Phase 3b (): partition the target-ahead blocking set by promotion
     # zone so the STRUCTURAL-WITH-REVIEW gate is EXPLICIT. This is pure LABELING —
@@ -940,6 +1191,11 @@ def main() -> int:
             "target_ahead_core": ta_core, "target_ahead_skills": ta_skills,
             "source_ahead_core": sa_core, "source_ahead_skills": sa_skills,
             "ambiguous_core": am_core, "ambiguous_skills": am_skills,
+            # : LINE-level clobber risk. Populated per file with the
+            # first few target-only functional lines, i.e. exactly what a mirror
+            # would delete. VERDICT-AFFECTING (joins `blocking`), unlike the
+            # report-only zone/divergence keys below.
+            "line_level_prod_ahead": {k: v for k, v in sorted(line_level_prod_ahead.items())},
             "deployment_local_differing": sorted(set(to_deploy + ta_deploy + sa_deploy + am_deploy)),
             "source_only_core": so_core, "source_only_skills": so_skills,
             "weights_contract": wc,
@@ -967,6 +1223,25 @@ def main() -> int:
             "structural_requires_review": structural_requires_review,
             "param_reconcile_up": param_reconcile_up,
             "source_freshness": src_fresh,
+            # Mode drift ( detection,  enforcement).
+            # mode_bits_visible is the built-in positive control: when false
+            # NOTHING on either side reads as executable, so an empty
+            # mode_differing means "cannot see", NOT "clean". Read it before
+            # concluding anything from the lists below.
+            # mode_source names the dimension the verdict came from — "index"
+            # is the one that PROMOTES (guard-844); "fs" is a fallback for files
+            # with no HEAD entry and is invisible to a commit.
+            # mode_only_differing is the subset a CONTENT diff can never
+            # surface: identical bytes, different executable bit.
+            # mode_strip_risk is the ONLY mode field that gates: promoting would
+            # take the bit AWAY from the target. mode_target_stripped is its
+            # benign mirror (promotion RESTORES the bit) and stays report-only.
+            "mode_bits_visible": mode_bits_visible,
+            "mode_source": mode_source,
+            "mode_differing": mode_differing,
+            "mode_only_differing": mode_only_differing,
+            "mode_strip_risk": mode_strip_risk,
+            "mode_target_stripped": mode_target_stripped,
             "verdict": "DRIFT" if drift else "CLEAN", "exit": 2 if drift else 0,
         }, indent=2))
         return 2 if drift else 0
@@ -1077,6 +1352,40 @@ def main() -> int:
     print(f"normal promotion payload (source-only): {len(so_core)} core + {len(so_skills)} skills")
     print()
 
+    # Mode drift column ( detection,  enforcement).
+    if not mode_bits_visible:
+        print("MODE DRIFT: UNAVAILABLE -- nothing on either side reads as executable,")
+        print("   in the index OR on the filesystem. This is 'cannot see', NOT 'no drift'.")
+        print()
+    else:
+        if mode_strip_risk:
+            print(f"MODE STRIP RISK -- BLOCKING (g-360-07): {len(mode_strip_risk)}")
+            print("   Promoting would take the execute bit AWAY from these target files.")
+            print("   A stripped bit fails SILENTLY: the hook or wrapper does not error,")
+            print("   it simply never runs, so the safety layer is absent with nothing red.")
+            print("   Reconcile UP first -- `git update-index --chmod=+x <path>` in the")
+            print("   SOURCE repo and commit. A bare `chmod +x` does NOT travel (guard-844).")
+            for k in mode_strip_risk[:25]:
+                print(f"     {k}")
+            if len(mode_strip_risk) > 25:
+                print(f"     ... and {len(mode_strip_risk) - 25} more")
+            print()
+        if mode_differing:
+            print(f"MODE DRIFT (mode read from: {mode_source}): {len(mode_differing)}"
+                  f"  [{len(mode_strip_risk)} strip-risk / "
+                  f"{len(mode_target_stripped)} target-already-stripped]")
+            if mode_target_stripped:
+                print("   target-already-stripped is REPORT-ONLY: the target has already lost")
+                print("   the bit and promoting RESTORES it, so blocking would hold the repair")
+                print("   hostage to the defect.")
+            if mode_only_differing:
+                print(f"   {len(mode_only_differing)} of these are BYTE-IDENTICAL -- invisible to the content diff:")
+                for k in mode_only_differing[:25]:
+                    print(f"     {k}")
+                if len(mode_only_differing) > 25:
+                    print(f"     ... and {len(mode_only_differing) - 25} more")
+            print()
+
     # Phase 0 zone column () — REPORT-ONLY, zero gating effect.
     if zone_map:
         print("ZONE CLASSIFICATION (report-only, g-115-2864 Phase 0 -- does NOT affect verdict):")
@@ -1104,9 +1413,32 @@ def main() -> int:
         print(f"VERDICT: DRIFT DETECTED -- {len(to_core)} orphan-risk"
               + (f" + {len(ta_core_blocking)} target-ahead" if ta_core_blocking else "")
               + (f" + {len(am_core_blocking)} ambiguous(strict)" if args.strict and am_core_blocking else "")
+              + (f" + {len(line_level_prod_ahead)} line-level prod-ahead" if line_level_prod_ahead else "")
               + (f" + weights-contract orphans (seed:{len(wc_blocking)}, target-metas:{len(wc_target_orphans)})" if wc_drift else "")
+              + (f" + {len(mode_strip_risk)} MODE-STRIP" if mode_strip_risk else "")
               + (f" ({len(comment_only_excused)} comment-only excused)" if comment_only_excused else "")
               + " framework file(s).")
+        # Name the mode cause separately: it is NOT lost content, it is a lost
+        # execute bit on byte-identical files, and the generic sentence below
+        # would send a reader hunting a content diff that does not exist.
+        if mode_strip_risk:
+            print(f"         {len(mode_strip_risk)} file(s) would LOSE their execute bit -- see MODE STRIP RISK above.")
+        # : name this cause separately. The generic sentence sends a
+        # reader to the FILE-level buckets, and these files are NOT in them --
+        # the direction heuristic cleared them, so a reader who trusts the
+        # bucket lists concludes the verdict is spurious and forces past it.
+        if line_level_prod_ahead:
+            print(f"         {len(line_level_prod_ahead)} file(s) the file-level direction check cleared "
+                  "carry TARGET-ONLY functional lines (LINE-level clobber risk):")
+            for _k in sorted(line_level_prod_ahead)[:10]:
+                print(f"           - {_k}")
+                for _ln in line_level_prod_ahead[_k][:3]:
+                    print(f"               target-only: {_ln[:110]}")
+            if len(line_level_prod_ahead) > 10:
+                print(f"           ... and {len(line_level_prod_ahead) - 10} more")
+            print("         REMEDY: back-port those lines UP into the source, or discard them")
+            print("         explicitly with sign-off, then re-run this gate. Do not --force past")
+            print("         them: these are the lines a mirror overwrite would DELETE.")
         print("         Promotion would lose target-ahead content. Reconcile before overwriting. (exit 2)")
         if not args.strict and am_core_blocking:
             print(f"         (also {len(am_core_blocking)} ambiguous framework files -- run --strict to block on them too.)")

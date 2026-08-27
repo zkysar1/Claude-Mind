@@ -183,6 +183,27 @@ _EXCLUDE_NAMES = {
     "guardrails-utilization.spool.jsonl",
     "guardrails-utilization.spool.flushing.jsonl",
     "guardrails-utilization.spool.last-flush",
+    # citation-credit sweep throttle (g-115-7384). FOURTH per-box .last-*
+    # stamp to need a literal entry, and the third added after the fact --
+    # `.last-sweep` matches no glob above, exactly as the gate-firings comment
+    # warns ("the last-flush stamp needs an exact entry").
+    #
+    # WHY MACHINE-LOCAL IS THE RIGHT CLASS HERE, per guard-3018 (read the
+    # CONSUMER, do not infer from the name): the only reader is
+    # citation-credit-sweep.py::_marker_fresh, which compares LOCAL st_mtime
+    # against MIN_INTERVAL_S -- a per-box "don't re-scan git more than hourly"
+    # throttle with no cross-box meaning. Cross-box dedup is NOT this file's
+    # job: it is the SHARED citation-credit-ledger.jsonl, which the sweep reads
+    # via ledgered_shas() and appends claim-first before firing increments. So
+    # the utilization-spool hazard one block up (N boxes each applying the same
+    # increments) does NOT apply -- the ledger dedups by sha regardless of how
+    # many boxes sweep. The LEDGER stays synced; only this stamp does not.
+    #
+    # Left out, both sides rewrite it hourly and it both-diverges forever: the
+    # sync conflict-skips it every sweep and never self-resolves, so this box's
+    # mirror sits wedged. Measured on cc-02: streak 38 at filing, 797 ~25h
+    # later, with its excluded sibling gate-firings.spool.last-flush clean.
+    "citation-credit-ledger.last-sweep",
 }
 # Basename glob patterns never synced.
 _EXCLUDE_GLOBS = ("*.lock", "*.pyc", "*.tmp", "*.swp", "*~", "*.sock",
@@ -798,6 +819,7 @@ def _try_merge_put(be, full: Path, local_bytes: bytes, stats: dict, *,
         _sync_print(f"[sync] WARN: union-merge push failed for {full}: {e}",
               file=sys.stderr)
         _record_error(stats, full, e, phase="union-merge-push")
+        _record_merge_lane_freeze(stats, full, e)  # g-115-7454
         return None
     if res is None:  # backend-side not-registered/machine-local double-check
         stats["merge_na_backend_declined"] = \
@@ -1275,6 +1297,84 @@ def _record_error(stats: dict, path, exc, *, phase: str) -> None:
     else:
         stats["error_paths_truncated"] = \
             stats.get("error_paths_truncated", 0) + 1
+
+
+def _record_merge_lane_freeze(stats: dict, path, exc) -> None:
+    """Record a class-(a) MERGE-PROTECTED freeze on the SAME surface class (b) uses.
+
+    THE TWO FREEZE LANES HAD ONE DETECTOR BETWEEN THEM (g-115-7454). A
+    fence-only store (`merge_handler_for` -> None) that both-diverges appends to
+    `conflict_paths` at the class-(b) site, which `_update_conflict_streaks`
+    turns into the streaks artifact that `mirror_health.classify` reads and
+    `agent-watchdog`'s MirrorWedgeProbe auto-files from. A MERGE-PROTECTED store
+    whose handler DECLINES surfaced only as an `error [union-merge-push]` line on
+    the sweep's stderr — never in the streaks file. So mirror-health could not
+    see it, the probe could not see it, and nothing auto-filed it: the file
+    stopped propagating to every other box INDEFINITELY while the health surface
+    the fleet trusts reported `healthy`. That is guard-1760 in its most expensive
+    form — the instrument reports what it RAN, and its silence about the lane it
+    cannot read renders identically to a pass.
+
+    ONE DETECTOR, NOT TWO. Routing this lane into the EXISTING artifact is
+    deliberate: a second detector is a second thing to drift, and the streaks
+    file already has a reader, a threshold, a probe and an auto-filer.
+
+    DISCRIMINATE ON THE EXCEPTION TYPE, NOT THE MESSAGE. The caller's `except`
+    catches a merge-handler decline AND a genuine transport fault with equal
+    enthusiasm, and only the first is a divergence. Recording a network blip here
+    would put a path into an artifact whose verdict text reads "file(s)
+    both-diverged" — a true statement about the wrong thing — and an S3 outage
+    touches EVERY file, so it would flood the artifact at exactly the moment it
+    is least readable. `ConflictError` is the merge lane's own type, so no
+    literal-token matching is involved (guard-4432) and a reworded message cannot
+    silently disable this.
+
+    A TRANSIENT CANNOT FALSE-POSITIVE, because the threshold is TEMPORAL, not
+    per-event. `_update_conflict_streaks` REBUILDS the map from this sweep's
+    paths (`{c: old+1 for c in cur}`), so a path absent next sweep is dropped and
+    its streak forgotten. A contention-class ConflictError (If-Match lost,
+    merge-reconcile retries exhausted) clears on the next pass and stays a
+    sub-threshold transient that `classify` reports as healthy; only a genuine
+    freeze recurs every sweep and reaches `wedged`. That is why this records the
+    whole ConflictError family rather than trying to sort freeze from contention
+    at the raise site — the artifact already sorts them, and by the one signal
+    that actually distinguishes them: persistence.
+
+    Fail-open, like every other bookkeeping path in this sweep.
+    """
+    try:
+        from owncloud_backend import ConflictError
+    except Exception:  # noqa: BLE001 — backend unimportable; nothing to classify
+        ConflictError = ()  # type: ignore[assignment]
+    if not isinstance(exc, ConflictError):
+        return
+    stats["merge_lane_frozen"] = stats.get("merge_lane_frozen", 0) + 1
+    stats.setdefault("conflict_paths", []).append(str(path))
+
+
+def _print_error_paths(stats: dict, *, limit: int = 40) -> None:
+    """Render the per-error IDENTITY beside the summary's error COUNT.
+
+    The counter and the list are written together by _record_error, but every
+    CLI summary printed only the counter while printing the identities of the
+    SUCCESSES (push_paths / pulled_files). Quiet when there is nothing to say,
+    so a clean run is unchanged.
+
+    Reports the raising code's own exception text and nothing more: an error
+    message states what that code path OBSERVED, never a cause, so this must
+    not attach a diagnosis (guard-2947, guard-4203).
+    """
+    paths = stats.get("error_paths") or []
+    if not paths:
+        return
+    for e in paths[:limit]:
+        _sync_print(f"           error [{e.get('phase')}] {e.get('path')}: "
+                    f"{e.get('exc')}: {e.get('msg')}", file=sys.stderr)
+    extra = max(0, len(paths) - limit)
+    trunc = stats.get("error_paths_truncated", 0)
+    if extra or trunc:
+        _sync_print(f"           ... and {extra + trunc} more error(s) not shown",
+                    file=sys.stderr)
 
 
 def _log_sweep_stats(stats: dict, *, source: str,
@@ -2654,6 +2754,7 @@ def main() -> int:
                 print(f"           would pull: {p}")
             if len(stats["pulled_files"]) > 40:
                 print(f"           ... and {len(stats['pulled_files']) - 40} more")
+        _print_error_paths(stats)
         return 1 if stats["errors"] else 0
 
     if args.no_manifest and _multi_machine():
@@ -2681,6 +2782,7 @@ def main() -> int:
           f"unchanged-skip {stats.get('skipped_unchanged', 0)}, "
           f"stale-skip {stats.get('stale_skipped', 0)}, "
           f"conflict-skip {stats.get('diverged_skipped', 0)}, "
+          f"merge-lane-frozen {stats.get('merge_lane_frozen', 0)}, "  # g-115-7454 class (a)
           f"nobaseline-skip {stats.get('nobaseline_skipped', 0)}, "
           f"{'nobaseline-would-reconcile' if args.dry_run else 'nobaseline-reconcile'} "
           f"{stats.get('nobaseline_would_reconcile', 0) if args.dry_run else stats.get('nobaseline_reconciled', 0)}, "
@@ -2692,6 +2794,11 @@ def main() -> int:
             print(f"           would push: {p}")
         if len(stats["push_paths"]) > 40:
             print(f"           ... and {len(stats['push_paths']) - 40} more")
+    # NOT dry-run-gated, unlike the success list above (g-115-7255). An error
+    # in an APPLIED run is exactly when the name is needed; printing the
+    # identities of what WORKED while printing failures as a bare count is the
+    # asymmetry that let `errors 8` run for days naming nothing.
+    _print_error_paths(stats)
     return 1 if stats["errors"] else 0
 
 

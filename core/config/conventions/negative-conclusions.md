@@ -58,6 +58,42 @@ these means "I don't know," not "it's down":
 When a silent-failure command returns empty: re-run WITHOUT the silent flag to see
 what actually happened. Then that verbose output counts as signal 1.
 
+### The inverse class: commands that return a confident FALSE POSITIVE
+
+The table above catalogs commands whose SILENCE is zero-information. The more
+dangerous inverse is a command that reports **success** for a thing that is not
+true, because nothing about the output looks like a failure.
+
+**`ping` is the canonical case.** An ICMP "Destination host unreachable" emitted
+by a THIRD host on the network is still a received packet, so `ping` prints
+`Packets: Sent = 3, Received = 3, Lost = 0 (0% loss)` and exits **0** for a
+machine that is fully powered off. Neither the exit code nor the loss percentage
+distinguishes "the target answered" from "something else answered about the
+target."
+
+Measured 2026-08-23 (alpha, quiesce window): `ping -n 2 -w 3000 10.0.0.241`
+returned exit 0 immediately after that host was deliberately powered down. The
+real stdout was three lines of `Reply from 10.0.0.235: Destination host
+unreachable`. The probe reported "PING OK" and the host was nearly declared
+up-and-mid-boot to the user.
+
+- **Require responder identity**: `Reply from <TARGET-IP>: bytes=` — the
+  `bytes=` is load-bearing, absent from every unreachable / TTL-expired reply.
+- **Prefer a probe only the target can answer**: an SSH banner or a service
+  health endpoint. That is the only signal meaning *usable*, as opposed to
+  *something answered*.
+- **The tell is contradiction between signals**: reachable-by-ping while ARP
+  holds no entry and every port is closed is proof the ping is lying, never a
+  host mid-boot.
+- **To prove absence rather than quietness**, sweep the subnet and match the
+  MAC in ARP. A booted host that moved to a new IP still shows its MAC, so
+  MAC-absent separates "not on the network" from "came back on a new address."
+
+Sibling false-positive traps, same shape — a zero-looking success meaning the
+opposite: `guard-1150` (a trailing `echo` replaces a command's exit code with
+the echo's) and `guard-2298` (a self-written parser turns a shape mismatch into
+a confident zero). Guardrail: `guard-4902`.
+
 ## Enforcement Points
 
 1. **Phase 4.0** (fast-path SKIP): Before CREATE_BLOCKER, verify the failure with
