@@ -409,9 +409,19 @@ def cmd_list(args):
                 pass
             alive = pid_alive(j.get("pid"))
             status_str = "RUNNING" if alive else "STOPPED"
+            #  part 2: `goal=` shows goal_id, which cmd_has_pending does
+            # NOT read — it reads monitor_goal_id/completion_check. So a job could
+            # display a live PID, an attached goal and RUNNING while has-pending
+            # said NO, with nothing on the line to tell them apart. Derive the flag
+            # from the SAME expression cmd_has_pending uses (line ~477) so display
+            # and predicate cannot drift; a second hand-written copy is exactly how
+            # they diverged in the first place.
+            gating = bool((j.get("monitor_goal_id") or "")
+                          or (j.get("completion_check") or ""))
+            gate_str = "GATING" if gating else "non-gating"
             print(f"  {j.get('job_id', '?')} | type={j.get('type', '?')} | "
                   f"goal={j.get('goal_id', '?')} | pid={j.get('pid', '?')} "
-                  f"[{status_str}]{elapsed}")
+                  f"[{status_str}/{gate_str}]{elapsed}")
 
 
 def cmd_has_pending(args):

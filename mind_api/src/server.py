@@ -359,7 +359,22 @@ class _Handler(BaseHTTPRequestHandler):
                 _is_backpressure = isinstance(e, WriteQueueBackpressure)
             except Exception:
                 _is_backpressure = False
-            if _is_backpressure:
+            # : the STRUCTURAL non-ownership case, classified by TYPE
+            # (same lazy-import shape as _is_conflict below — zero behaviour
+            # change off own-cloud, where no_claim_error is the empty tuple).
+            # Tested BEFORE _is_conflict: NoClaimError is the more specific
+            # verdict, and a box that cannot ever land this write must not be
+            # told to "discriminate before retrying".
+            _is_no_claim = False
+            try:
+                from storage_backend import get_backend
+                _nce = getattr(get_backend(), "no_claim_error", ())
+                _is_no_claim = bool(_nce) and isinstance(e, _nce)
+            except Exception:
+                _is_no_claim = False
+            if _is_no_claim:
+                resp = Response.error(409, "no_claim", str(e)[:600])
+            elif _is_backpressure:
                 resp = Response.error(
                     429, "write_queue_backpressure",
                     type(e).__name__ + ": " + str(e)[:300])
@@ -393,7 +408,11 @@ class _Handler(BaseHTTPRequestHandler):
                     "MIRROR raise this same error and need opposite responses "
                     "(retry vs. refresh first). Discriminate before retrying: "
                     "HEAD the remote twice; an UNCHANGED version means local is "
-                    "behind and every retry will conflict identically (g-115-3782)")
+                    "behind and every retry will conflict identically (g-115-3782). "
+                    "THIRD CASE, STRUCTURAL (g-115-8028): if the target is an agent "
+                    "dir this box does not own, NEITHER retry NOR refresh can ever "
+                    "succeed from here — the box is permanently behind the "
+                    "claim-holder's advancing version. See the no_claim error")
             else:
                 # : no repr(e) — repr of a UnicodeError embeds the
                 # whole failed payload and re-triggers the surrogate cascade

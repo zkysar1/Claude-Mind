@@ -1,5 +1,27 @@
 [
   {
+    "version": "2.12.7",
+    "previous_version": "2.12.6",
+    "date": "2026-08-28",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Liveness at tool-call cadence (g-115-8200: heartbeat-tick from the PreToolUse[Bash] hook once per 600s, --body-only for non-reducer Bodies; runner lease renewed on every backend) plus the merged alpha worker ref (replay-check-across-states forge gap-089, selector priority inheritance g-115-6590, pipeline verification fallback drop g-115-4230) — v2.12.6 could not pass seed-preflight because the forged skill was registered but its files sat on the unmerged worker ref",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.12.6",
+    "previous_version": "2.12.5",
+    "date": "2026-08-28",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Liveness at tool-call cadence: heartbeat-tick spawned from the PreToolUse[Bash] hook once per 600s (--body-only for non-reducer Bodies) and the runner lease renewed on every backend, not only own-cloud (g-115-8200) — a local-backend reducer's worker no longer parks 65 min after /start; plus peers' fixes since v2.12.5",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.5",
     "previous_version": "2.12.4",
     "date": "2026-08-27",

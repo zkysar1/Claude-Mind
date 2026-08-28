@@ -57,6 +57,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hook_helpers import (  # noqa: E402
     approve_no_mutation,
+    emit_advisory,
     emit_deny,
     stdin_json_or_approve,
 )
@@ -411,6 +412,49 @@ def main():
                               "local-paths.conf")
     conf_present = os.path.isfile(conf_path)
     paths = read_paths_conf(conf_path) if conf_present else {}
+
+    # --- Stray repo-root world/|meta/ advisory (2026-08-28 incident) ---
+    # A literal PROJECT_ROOT/world (or /meta) that is NOT the configured root
+    # is a cruft location NO write-time layer can prevent when the file is
+    # created by a script body (a `py -3 patch.py` builds its paths
+    # internally, invisible to command-text scanning and to the Write/Edit
+    # hook alike). Detection is the closure: this hook fires before every
+    # write-shaped Bash call, so one isdir here surfaces the stray within a
+    # tool call or two of its creation regardless of the lane that made it.
+    # Measured cost of the gap: the asp-370 SDLC charter sat at repo-root
+    # world/ for ~7h, foundationally blocking the aspiration fleet-wide,
+    # while every local read of it succeeded (own-cloud reads never consult
+    # S3 for a path outside the cache). Advisory, not deny — the current
+    # command is usually unrelated; the message names the migration. It
+    # deliberately repeats on every matching call until the stray is gone.
+    # Skips: a box whose conf legitimately points WORLD/META at the repo-root
+    # dir (compared against the configured root), and conf-absent sessions
+    # (cannot know the configured root — stay silent, fail-open).
+    if conf_present:
+        try:
+            for _label, _sub in (("WORLD_PATH", "world"), ("META_PATH", "meta")):
+                _stray = os.path.join(project_root, _sub)
+                _configured = norm_path(paths.get(_label) or "")
+                if os.path.isdir(_stray) and norm_path(_stray) != _configured:
+                    emit_advisory(
+                        f"[stray-root-advisory] A literal '{_sub}/' directory "
+                        f"exists at the repo root:\n  {_stray}\n"
+                        f"It is NOT the {_label} — the configured root is:\n"
+                        f"  {paths.get(_label) or '(unset)'}\n"
+                        f"Anything in it is invisible to the authoritative "
+                        f"store, the fleet, and git (2026-08-28: the asp-370 "
+                        f"SDLC charter sat there ~7h, blocking the aspiration "
+                        f"fleet-wide while local reads kept succeeding).\n"
+                        f"Fix NOW: migrate contents to the configured root "
+                        f"(own-cloud: fenced storage_backend.mirror_put, or "
+                        f"the relevant store script), verify with "
+                        f"read_authoritative_bytes, then remove the stray "
+                        f"directory. This advisory repeats until it is gone."
+                    )
+        except SystemExit:
+            raise
+        except Exception:
+            pass
 
     # Allowed roots — the SAME list path-resolution-hook.py builds, from the
     # SAME helper, so the two tool surfaces cannot answer "is this path in

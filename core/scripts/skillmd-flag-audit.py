@@ -601,9 +601,19 @@ def _ratchet(result: dict, output: str) -> int:
         locked_modify_yaml(META_DIR / "audit-baselines.yaml", _modify, initial={})
     except Exception as e:  # never block the loop on a baseline-write failure
         print(f"WARN: could not persist baseline: {e}", file=sys.stderr)
-        captured.setdefault("verdict", "error")
-        captured.setdefault("new_baseline", None)
-        captured.setdefault("message", f"baseline operation failed: {e}")
+        # OVERWRITE, never setdefault. _modify runs INSIDE locked_modify_yaml
+        # and populates `captured` before the write; if the write then fails
+        # (disk full, conflict-retry exhausted, validation), setdefault is a
+        # no-op and this would report the COMPUTED verdict as though it had
+        # persisted. stderr is the only contradicting signal and no JSON
+        # consumer reads it. A tool must not claim a write it did not make.
+        computed = captured.get("verdict")
+        captured["verdict"] = "error"
+        captured["new_baseline"] = None
+        captured["message"] = (
+            f"baseline operation FAILED and nothing was persisted: {e}"
+            + (f" (the computed verdict was '{computed}' — it did NOT "
+               f"take effect)" if computed else ""))
 
     if output == "json":
         print(json.dumps({**result, "verdict": captured["verdict"],

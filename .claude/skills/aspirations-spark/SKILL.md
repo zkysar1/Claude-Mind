@@ -143,29 +143,30 @@ ELSE:
         these artifacts too — a worker's observation about domain
         infrastructure still belongs in a domain-scoped entry, and this block
         sits ABOVE that paragraph only because it must run before the SKIP.
-        # WORK-DISCOVERY RELAYS FILE GOALS HERE (2026-08-16, goal-completion
-        # audit D1). worker-loop's filing ruling (g-306-250, Case B) tells a
-        # worker that finds NEW SCOPE any Body could observe to "relay via
-        # spark_capture — the relay loses nothing but time". Until now that was
-        # false: the five handlers above make rb / guardrail / gotcha artifacts
-        # and NONE of them files a goal, so a Case-B relay arrived as a lesson
-        # and never as WORK. Workers now execute most units (7 SIDs vs 1
-        # reducer on alpha, 2026-08-16), so this was the largest hole in
-        # "completion seeds the next goal" (guard-3880: the reducer is the
-        # LAST moment a relayed finding can acquire an owner). The reducer is
-        # unconstrained by the worker ruling and files freely.
+        # WORK-DISCOVERY RELAYS FILE GOALS HERE (2026-08-16, audit D1).
+        # Rationale (WHY relays file goals + WHY the dedup spans terminal
+        # statuses): core/config/rationale/sq013-work-discovery-relay.md
         IF entry.sq_trigger == "sq-013"
            OR entry.observation names actionable work needing an owner
               (a defect to fix, a follow-up, a capability gap, a dependency):
             Run the sq-013 work_discovery handler (below, "Work Discovery Spark
             Handler") over entry.observation with `discovered_by = entry.goal_id`
             and the SOURCE goal's aspiration as the default target — NOT the
-            goal the reducer is closing. Dedup FIRST and not only on the
-            worker's phrasing (guard-1204, guard-2228: `--title-contains` on
-            one stem cannot find a differently-worded owner — try two distinct
-            token sets, and check the source goal's outcome_note for an id it
-            filed OR a fix it SHIPPED (g-306-360), guard-3738). If a live
-            goal already owns it, cite that id and file nothing. Otherwise file
+            goal the reducer is closing. Dedup FIRST on BOTH axes. PHRASING
+            (guard-1204, guard-2228): `--title-contains` on one stem cannot
+            find a differently-worded owner — try two distinct token sets, and
+            check the source goal's outcome_note for an id it filed OR a fix it
+            SHIPPED (g-306-360), guard-3738. STATUS (guard-5176, guard-4938):
+            an OPEN-ONLY scan is blind to the owner that COMPLETED minutes ago,
+            which is the most expensive duplicate there is. Run:
+              bash core/scripts/aspirations-query.sh --goal-status \
+                   pending,in-progress,completed,skipped --full \
+                | py -3 core/scripts/sq013-dedup-probe.py \
+                      --subject "<entry.observation>" --session-start <ISO>
+            rc 3 = DECLINE (owner exists), 0 = FILE, 2 = probe broke and is
+            NEVER permission to file. On DECLINE cite the id AND the
+            status it names, so a reader can tell "already done" from "never
+            filed". Otherwise file
             with the sq-013 origin_signal mapping and put
             "relayed by <agent> worker Body (spark_capture from <entry.goal_id>),
             filed at reducer spark replay" in the description so the provenance

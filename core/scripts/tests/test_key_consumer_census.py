@@ -193,7 +193,7 @@ def test_tabulate_counts_sites_not_just_roles():
     ]
     rows.append({"file": "b.py", "line": 5, "key": "k", "role": "WRITE",
                  "narration": False, "text": ""})
-    table = kcc._tabulate(rows, ["k"])
+    table = kcc._tabulate(rows)
     assert table["a.py"]["k"]["WRITE"] == 4
     assert table["b.py"]["k"]["WRITE"] == 1
     # The pre-fix shape could not tell these two files apart at all.
@@ -208,7 +208,7 @@ def test_membership_tests_still_read_role_names():
     """
     rows = [{"file": "a.py", "line": 1, "key": "k", "role": "WRITE",
              "narration": False, "text": ""}]
-    cell = kcc._tabulate(rows, ["k"])["a.py"]["k"]
+    cell = kcc._tabulate(rows)["a.py"]["k"]
     assert "WRITE" in cell
     assert "READ" not in cell
 
@@ -225,7 +225,7 @@ def test_mention_only_detection_survives_the_type_change():
              "narration": False, "text": ""},
             {"file": "w.py", "line": 1, "key": "k", "role": "WRITE",
              "narration": False, "text": ""}]
-    table = kcc._tabulate(rows, ["k"])
+    table = kcc._tabulate(rows)
     mention_only = [f for f in table if set(table[f].get("k", ())) == {"MENTION"}]
     assert mention_only == ["m.py"], mention_only
 
@@ -241,3 +241,194 @@ def test_fmt_roles_shows_multiplicity_only_when_it_exists():
     assert kcc._fmt_roles(Counter()) == "-"
     # Tolerates the old set shape rather than raising on it.
     assert kcc._fmt_roles({"READ", "WRITE"}) == "READ/WRITE"
+
+
+# ---------------------------------------------------------------------------
+# main() output — . F1 (a docstring-promised warning that was never
+# implemented) is exactly the class ONE main()-output assertion catches, and
+# this file had zero coverage of main(), which is why it shipped.
+# ---------------------------------------------------------------------------
+
+def _run_main(kcc, capsys, argv):
+    old = sys.argv
+    sys.argv = ["key-consumer-census.py", *argv]
+    try:
+        rc = kcc.main()
+    finally:
+        sys.argv = old
+    cap = capsys.readouterr()
+    return rc, cap.out, cap.err
+
+
+def test_main_warns_when_unscoped_result_is_too_large(tmp_path, capsys):
+    """The no-scope hit-count warning census()'s docstring promises."""
+    root = tmp_path / "proj"
+    (root / "core").mkdir(parents=True)
+    for i in range(60):
+        (root / "core" / f"f{i}.py").write_text('x = {"reason": 1}\n', encoding="utf-8")
+    rc, out, err = _run_main(kcc, capsys, ["reason", "--project-root", str(root)])
+    assert rc == 0
+    assert "WARNING" in err and "--scope" in err, err
+    assert "60" in err, err
+
+
+def test_main_does_not_warn_when_scoped(tmp_path, capsys):
+    """Positive control: the warning is conditional, not unconditional.
+
+    Without this, the assertion above passes against a tool that warns always —
+    a different defect wearing the same output.
+    """
+    root = tmp_path / "proj"
+    (root / "core").mkdir(parents=True)
+    for i in range(60):
+        (root / "core" / f"f{i}.py").write_text(
+            'known_blockers = {"reason": 1}\n', encoding="utf-8")
+    rc, out, err = _run_main(
+        kcc, capsys,
+        ["reason", "--scope", "known_blockers", "--project-root", str(root)])
+    assert rc == 0
+    assert "--scope" not in err, err
+
+
+def test_main_does_not_warn_on_a_small_unscoped_result(tmp_path, capsys):
+    """Second positive control: below both thresholds, no warning."""
+    root = tmp_path / "proj"
+    (root / "core").mkdir(parents=True)
+    (root / "core" / "a.py").write_text('x = {"reason": 1}\n', encoding="utf-8")
+    rc, out, err = _run_main(kcc, capsys, ["reason", "--project-root", str(root)])
+    assert rc == 0
+    assert "WARNING" not in err, err
+
+
+def test_census_reports_unreadable_files(tmp_path, capsys):
+    """F2: an unreadable file is COUNTED and reported, never silently dropped."""
+    root = tmp_path / "proj"
+    (root / "core").mkdir(parents=True)
+    (root / "core" / "ok.py").write_text('x = {"reason": 1}\n', encoding="utf-8")
+    (root / "core" / "bad.py").write_text('x = {"reason": 1}\n', encoding="utf-8")
+    real = kcc.Path.read_text
+
+    def _boom(self, *a, **k):
+        if self.name == "bad.py":
+            raise OSError("simulated unreadable file")
+        return real(self, *a, **k)
+
+    kcc.Path.read_text = _boom
+    try:
+        rows = kcc.census(["reason"], project_root=str(root))
+    finally:
+        kcc.Path.read_text = real
+    err = capsys.readouterr().err
+    assert "1 file(s) were unreadable" in err, err
+    assert "lower bound" in err, err
+    assert any(r["file"].endswith("ok.py") for r in rows), rows
+# ------------------------------------------------------------------- main()
+# main() is the tool's ONLY output surface — header, separator, per-file rows,
+# totals, alias-map block, decision-rule footer. Until  nothing
+# invoked it, so census() being green said nothing about whether the census
+# PRINTS anything usable. These two tests give it its first coverage.
+
+def _wide_cell_root(tmp_path):
+    """A tmp project whose single file renders a cell WIDER than the legacy
+    14-char pad (`READ x3/WRITE x4`, 16 chars).
+
+    The width matters, not the exact roles: at <=14 chars the fixed pad and the
+    derived pad agree, so an alignment assertion built on a narrow cell passes
+    identically against the bug and against the fix. The non-vacuity guard in
+    the test below pins that property rather than trusting this docstring.
+    """
+    root = tmp_path / "proj"
+    (root / "core").mkdir(parents=True)
+    (root / "core" / "wide.py").write_text(
+        'rec = {"blocker_ref": 1}\n'
+        'rec2 = {"blocker_ref": 2}\n'
+        'rec3 = {"blocker_ref": 3}\n'
+        'rec4 = {"blocker_ref": 4}\n'
+        'a = g.get("blocker_ref")\n'
+        'b = g.get("blocker_ref")\n'
+        'c = g["blocker_ref"]\n',
+        encoding="utf-8",
+    )
+    return root
+
+
+def test_main_keeps_columns_aligned_when_a_cell_exceeds_the_legacy_pad(
+        tmp_path, monkeypatch, capsys):
+    """Every data row renders to the same width as the header row.
+
+    Pins the g-115-3611 fix at key-consumer-census.py:351-355 (derive the key
+    column width from the widest rendered cell, clamped to 34). Reverting that
+    to a literal `kw = 14` re-widens nothing while the cells stay 16 chars, so
+    the data rows overflow past the header and this assertion fails.
+
+    The invariant is deliberately shape-based rather than content-based: it
+    predicts no cell text, so it keeps holding as role spellings evolve.
+    """
+    root = _wide_cell_root(tmp_path)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["key-consumer-census.py", "blocker_ref", "--project-root", str(root)])
+    assert kcc.main() == 0
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+
+    sep = [i for i, ln in enumerate(lines) if set(ln.strip()) == {"-"}]
+    assert sep, f"no separator row — main() printed no table:\n{out}"
+    header = lines[sep[0] - 1]
+    # Data rows run from the separator to the first blank line. Do NOT filter on
+    # the root path: the participant column is clamped to 62 chars, so a tmp_path
+    # root is truncated out of its own row.
+    data = []
+    for ln in lines[sep[0] + 1:]:
+        if not ln.strip():
+            break
+        data.append(ln)
+    assert data, f"no data rows under the separator:\n{out}"
+
+    # NON-VACUITY: the fixture must actually exercise the derivation. If the
+    # widest cell ever falls back to <=14 this test would pass against the bug
+    # too, so fail loudly here rather than silently going green for free.
+    rows = kcc.census(["blocker_ref"], project_root=root)
+    table = kcc._tabulate(rows)
+    widest = max(len(kcc._fmt_roles(v.get("blocker_ref"))) for v in table.values())
+    assert widest > 14, (
+        f"fixture no longer exercises the width derivation: widest cell is "
+        f"{widest} chars, which the legacy fixed pad of 14 already covers")
+
+    # Compare RAW widths, never rstrip()ed ones. Both rows pad every column to
+    # the same width, so they are equal as emitted — but the header's final cell
+    # is a short key name padded out with spaces while the data cell fills its
+    # column exactly, so rstrip() shortens the header and not the row and the
+    # comparison fails on correct output. Measured while writing this test.
+    for ln in data:
+        assert len(ln) == len(header), (
+            f"column overflow: data row is {len(ln)} chars vs header "
+            f"{len(header)} — the key column stopped sizing to its widest "
+            f"cell.\nheader: {header!r}\nrow:    {ln!r}")
+
+
+def test_main_prints_the_operator_surface(tmp_path, monkeypatch, capsys):
+    """main() emits the lines an operator actually reads.
+
+    Coverage-first companion to the alignment test: asserts the surface exists
+    (title, hit summary, separator, a row naming the file) without pinning
+    wording, so it fails if main() stops printing rather than on a reword.
+    """
+    root = _wide_cell_root(tmp_path)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["key-consumer-census.py", "blocker_ref", "--project-root", str(root)])
+    assert kcc.main() == 0
+    out = capsys.readouterr().out
+
+    assert "key-consumer census" in out, f"no title line:\n{out}"
+    assert "blocker_ref" in out, f"censused key never named:\n{out}"
+    assert "live hits across" in out, f"no hit summary:\n{out}"
+    assert any(set(ln.strip()) == {"-"} for ln in out.splitlines()), (
+        f"no separator row:\n{out}")
+    # NOT the basename: the participant column is clamped to 62 chars, so a
+    # tmp_path root truncates its own filename away. Assert a row rendered.
+    lines = out.splitlines()
+    sep = [i for i, ln in enumerate(lines) if set(ln.strip()) == {"-"}]
+    assert sep and sep[0] + 1 < len(lines) and lines[sep[0] + 1].strip(), (
+        f"separator printed but no participant row beneath it:\n{out}")

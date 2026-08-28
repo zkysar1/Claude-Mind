@@ -96,12 +96,10 @@ def _advance_heartbeat():
         pass
 
 
-# How long either liveness signal may go unrefreshed before this writer fires a
-# tick. Must stay FAR below BOTH windows it protects, so a tick can fail several
-# times over and still be retried inside the shorter one:
-#   reducer — OWNERSHIP_STALE_SECONDS      3900s (peer may break the claim)
-#   worker  — foreign-SID grace           7200s (sweep pops the claim)
-SHARED_HEARTBEAT_INTERVAL_S = 600
+# The interval and the pytest chokepoint live in _shared_tick, shared with the
+# hook caller (bash-agent-inject.py, ) so the two rate limits cannot
+# drift apart. Imported by name so this module's public constant stays.
+from _shared_tick import SHARED_HEARTBEAT_INTERVAL_S, pytest_suppressed  # noqa: E402
 
 # One-shot latch for the under-pytest suppression notice below. Module level so
 # the notice is emitted once per PROCESS; a suite makes thousands of diary writes.
@@ -190,8 +188,7 @@ def _tick_shared_heartbeat_if_due():
     # PROJECT_ROOT whose heartbeat-tick.sh is a stub recorder, as
     # test_lease_renewal_cadence.py does. Setting it against the real core/scripts
     # re-opens exactly this hole.
-    if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get(
-            "MIND_DIARY_SHARED_TICK_TEST"):
+    if pytest_suppressed():
         global _SHARED_TICK_PYTEST_NOTICE
         if not _SHARED_TICK_PYTEST_NOTICE:
             _SHARED_TICK_PYTEST_NOTICE = True

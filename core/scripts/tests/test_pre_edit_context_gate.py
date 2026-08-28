@@ -76,9 +76,10 @@ THROWAWAY_AGENT = "_gate_test_throwaway_agent_"
 SID = "gate-test-sid-001"
 
 
-def _norm(p):
-    """Match context-reads.py normalize_path: resolve + forward slashes."""
-    return str(Path(p).resolve()).replace("\\", "/")
+# : was a hand-rolled resolve-then-replace copy of
+# context-reads.normalize_path — the ordering  proved wrong.
+# Use the real function; never re-implement it here.
+from _context_reads_helper import norm_path as _norm  # noqa: E402
 
 
 def _make_hook_json(file_path, session_id=SID):

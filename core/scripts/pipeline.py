@@ -627,19 +627,28 @@ def compute_meta(live_items, archive_items):
     meta["accuracy"]["evidence_pct"] = (
         round(with_evidence / len(resolved_records) * 100, 1) if resolved_records else 0.0)
 
-    # by_strategy
+    # by_strategy (). A record with no usable `strategy` bins under
+    # one explicit "unlabeled" key. The prior expression fell back to
+    # `verification` — a field of different meaning holding free-text
+    # resolution criteria — so bins were keyed on prose: measured 2026-08-28,
+    # 35 bins covering 42 of 944 resolved records, 34 of them n=1, keys up to
+    # 814 chars. That reads as a populated breakdown while `strategy` is in
+    # fact unwritten on ~95% of the corpus. Binning the remainder explicitly
+    # makes the deadness visible, and makes the bin totals sum to
+    # total_resolved so the unlabeled count always carries its denominator.
+    # Mirror of pipeline_write._compute_meta; parity pinned by
+    # tests/test_pipeline_resolution_evidence.py::test_compute_meta_parity.
     by_strategy = {}
     for r in resolved_records:
-        strategy = r.get("strategy", r.get("verification", "unknown"))
-        # Skip non-string strategy values (legacy dicts)
-        if not isinstance(strategy, str):
-            continue
-        if strategy and strategy != "unknown":
-            if strategy not in by_strategy:
-                by_strategy[strategy] = {"confirmed": 0, "total": 0, "pct": 0.0}
-            by_strategy[strategy]["total"] += 1
-            if r["outcome"] == "CONFIRMED":
-                by_strategy[strategy]["confirmed"] += 1
+        strategy = r.get("strategy")
+        if (not isinstance(strategy, str) or not strategy.strip()
+                or strategy == "unknown"):
+            strategy = "unlabeled"
+        if strategy not in by_strategy:
+            by_strategy[strategy] = {"confirmed": 0, "total": 0, "pct": 0.0}
+        by_strategy[strategy]["total"] += 1
+        if r["outcome"] == "CONFIRMED":
+            by_strategy[strategy]["confirmed"] += 1
     for s in by_strategy.values():
         s["pct"] = round(s["confirmed"] / s["total"] * 100, 1) if s["total"] > 0 else 0.0
     meta["accuracy"]["by_strategy"] = by_strategy

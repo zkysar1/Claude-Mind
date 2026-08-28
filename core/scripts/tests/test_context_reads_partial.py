@@ -63,8 +63,10 @@ THROWAWAY_AGENT = "_partial_reads_test_throwaway_agent_"
 SID = "partial-reads-sid-001"
 
 
-def _norm(p):
-    return str(Path(p).resolve()).replace("\\", "/")
+# : was a hand-rolled resolve-then-replace copy of
+# context-reads.normalize_path — the ordering  proved wrong.
+# Use the real function; never re-implement it here.
+from _context_reads_helper import norm_path as _norm  # noqa: E402
 
 
 @contextmanager

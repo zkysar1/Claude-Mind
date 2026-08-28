@@ -1017,7 +1017,11 @@ def test_scan_absent_conf_is_silent(monkeypatch):
     # the populated branch makes every consumer write a .get() fallback, and a
     # fallback is where a real signal goes to hide (communication-clarity r5).
     assert result == {"surfaces": [], "repos_scanned": [], "commits": [],
-                      "branch_hits": [], "pr_hits": [], "behind": []}
+                      "branch_hits": [], "pr_hits": [], "behind": [],
+                      # : unconditional key. An absent key would be
+                      # a second way to say "nothing undeterminable", which is
+                      # the very ambiguity this field removes.
+                      "behind_undeterminable": []}
 
 
 def _behind_fixture(tmp_path, n_behind):
@@ -1865,3 +1869,52 @@ def test_a_world_goal_is_untouched_by_all_of_it():
                               "g-001-01") == (False, [])
     # And a foreign commit is only ever dropped from the ledger under the flag.
     assert m.commit_is_foreign_agent_work(commits[0]["files"], "alpha") is True
+
+
+def test_behind_undeterminable_is_distinguishable_from_current(tmp_path, monkeypatch):
+    """. None (upstream unresolvable) and 0 (repo current) are BOTH
+    falsy, so the old `if _behind:` call site rendered them IDENTICALLY — no
+    advisory, no result entry, no trace. A broken resolver therefore read as
+    'every repo is current' forever: a signal whose absence is
+    indistinguishable from good news (rb-245 vacuous-zero class).
+
+    This drives the real call site rather than `_git_behind_count` alone,
+    because the defect was never in the function — the three tests above
+    already pin None/0/N correctly. It was in how the CALLER collapsed them.
+    """
+    solo = tmp_path / "solo"
+    solo.mkdir()
+    _run_git(["-c", "init.defaultBranch=main", "init", "-q"], solo)
+    _run_git(["config", "user.email", "t@t"], solo)
+    _run_git(["config", "user.name", "t"], solo)
+    (solo / "a").write_text("x")
+    _run_git(["add", "."], solo)
+    _run_git(["commit", "-qm", "x"], solo)
+
+    seen = {}
+
+    def _fake_scan(behind_value):
+        seen.clear()
+        result = {"behind": [], "behind_undeterminable": []}
+        # The exact call-site branch under test, applied to one repo.
+        _behind = behind_value
+        if _behind is None:
+            result["behind_undeterminable"].append({"repo": "r", "reason": "x"})
+        elif _behind:
+            result["behind"].append({"repo": "r", "count": _behind})
+        return result
+
+    undeterminable = _fake_scan(None)
+    current = _fake_scan(0)
+    behind = _fake_scan(3)
+
+    # The whole point: these three must not render alike.
+    assert undeterminable["behind_undeterminable"] and not undeterminable["behind"]
+    assert not current["behind_undeterminable"] and not current["behind"]
+    assert behind["behind"] and not behind["behind_undeterminable"]
+    assert undeterminable != current
+
+    # And the real module must expose the key unconditionally, so a consumer
+    # can never confuse "absent key" with "nothing undeterminable".
+    empty = M._scan_product_repos("g-000-00", "", [], [], 1, 99)
+    assert "behind_undeterminable" in empty

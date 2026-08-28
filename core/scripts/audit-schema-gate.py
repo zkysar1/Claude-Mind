@@ -195,4 +195,29 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Fail-open crash handler (). main() promises fail-open in its
+    # docstring, but an OSError escaping path resolution (Path.is_file() and
+    # Path.exists() both re-raise non-ignored OSError) exited NON-zero -- i.e.
+    # exit 1, the SAME code as an intentional block. A caller told to halt
+    # aggregation could not tell a real missing-field verdict from a crash.
+    # This mirrors the sibling jsonl-field-probe.py, whose handler states the
+    # shared contract verbatim: "diagnostic tools must never block their
+    # caller." Both now record the exception in the emitted JSON and exit 0.
+    #
+    # SystemExit derives from BaseException, NOT Exception, so the deliberate
+    # sys.exit(1) block verdict passes through untouched -- only an unhandled
+    # crash is converted. guard-3803 (a fail-open handler also covers its own
+    # deny-message construction, silently turning a refusal into an allow) was
+    # considered: the only code this shadows past the verdict is the refusal
+    # f-string, which interpolates already-computed locals and does no I/O.
+    # The real crash surface is path resolution, which runs before any verdict.
+    try:
+        main()
+    except Exception as exc:
+        print(json.dumps({
+            "would_block": False,
+            "reason": "gate crashed; failing open so a crash is never mistaken "
+                      "for a missing-field block",
+            "gate_error": f"{type(exc).__name__}: {exc}",
+        }))
+        sys.exit(0)

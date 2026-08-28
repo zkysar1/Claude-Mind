@@ -39,9 +39,10 @@ SID_A = "aaaa1111-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 SID_B = "bbbb2222-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 
 
-def _norm(p) -> str:
-    """Match context-reads.py normalize_path: resolve + forward slashes."""
-    return str(Path(p).resolve()).replace("\\", "/")
+# : was a hand-rolled resolve-then-replace copy of
+# context-reads.normalize_path — the ordering  proved wrong.
+# Use the real function; never re-implement it here.
+from _context_reads_helper import norm_path as _norm  # noqa: E402
 
 
 @contextmanager

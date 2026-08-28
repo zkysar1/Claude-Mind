@@ -212,7 +212,10 @@ def census(keys, project_root=None, include_narration=False, scope=None):
     `last_fresh_eyes_run`) needs no scope, and forcing one would add ceremony to
     the easy case. The no-scope path prints a hit-count warning instead.
     """
-    base = Path(project_root) if project_root else PROJECT_ROOT
+    # `is not None`, not truthiness — must agree with the extra_roots test 10
+    # lines down or an empty-string project_root takes the live-store branch
+    # here and the hermetic branch there (g-115-3705 informs item).
+    base = Path(project_root) if project_root is not None else PROJECT_ROOT
     # HERMETICITY: only reach the live external stores when scanning the REAL
     # project root. An explicit project_root means a caller (a test) has built a
     # controlled tree and expects the scan bounded to it; adding WORLD_DIR /
@@ -228,6 +231,7 @@ def census(keys, project_root=None, include_narration=False, scope=None):
             for k in keys}
 
     rows = []
+    unreadable = 0
     for p, rel in _iter_census_targets(base, extra_roots):
         narration = _refscan.is_historical(p, rel)
         if narration and not include_narration:
@@ -235,6 +239,12 @@ def census(keys, project_root=None, include_narration=False, scope=None):
         try:
             text = p.read_text(encoding="utf-8", errors="replace")
         except OSError:
+            # F2 (g-115-3705): fail-open, but never SILENT. This tool's whole
+            # contract is enumeration COMPLETENESS, so a dropped file is
+            # exactly the thing a reader must know about. _is_scannable
+            # already filters directories, so the one live population here is
+            # genuinely unreadable files.
+            unreadable += 1
             continue
         if scope and scope not in text:
             continue
@@ -251,10 +261,14 @@ def census(keys, project_root=None, include_narration=False, scope=None):
                         "narration": narration,
                         "text": line.strip()[:160],
                     })
+    if unreadable:
+        print(f"key-consumer-census: WARNING — {unreadable} file(s) were "
+              "unreadable and are ABSENT from this census. The result is a "
+              "lower bound, not a complete enumeration.", file=sys.stderr)
     return rows
 
 
-def _tabulate(rows, keys):
+def _tabulate(rows):
     """participant -> {key: Counter(role -> site count)} — the census table.
 
     Counter, not set (g-115-3611). A set answers "does this file write the key
@@ -330,7 +344,7 @@ def main() -> int:
               "(verify-before-assuming.md).")
         return 0
 
-    table = _tabulate(rows, args.keys)
+    table = _tabulate(rows)
     writers = sorted(f for f, ks in table.items()
                      if any("WRITE" in r for r in ks.values()))
     readers = sorted(f for f, ks in table.items()
@@ -339,6 +353,18 @@ def main() -> int:
     print(f"=== key-consumer census: {', '.join(args.keys)} ===")
     print(f"{len(rows)} live hits across {len(table)} files "
           f"({len(writers)} with writes, {len(readers)} with reads)\n")
+
+    # F1 (g-115-3705): the docstring on census() offers this warning as the
+    # STATED MITIGATION for leaving --scope optional; it shipped without it.
+    # Thresholds match the measured failure: the first ground-truth run
+    # returned 3,781 hits across 732 files and buried its own table.
+    if args.scope is None and (len(rows) > 200 or len(table) > 50):
+        print(f"key-consumer-census: WARNING — {len(rows)} hits across "
+              f"{len(table)} files with no --scope. A census is about a "
+              "STRUCTURE, not a bare word: at this size the signal (a deviant "
+              "writer among a handful of participants) is present but "
+              "undetectable in the table below. Re-run with --scope <the "
+              "structure these keys belong to>.\n", file=sys.stderr)
 
     width = max((len(f) for f in table), default=10)
     width = min(width, 62)

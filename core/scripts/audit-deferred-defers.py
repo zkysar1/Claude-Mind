@@ -227,8 +227,28 @@ def _defer_age_days(defer_set_at) -> float | None:
 # between key and date that contains a digit yields NO match -- under-matching,
 # which is the safe direction here: a missed suppression costs one re-derivation,
 # a wrong suppression hides a genuinely stale defer.
+# WIDENED 2026-08-28 (g-115-5639) with FOUR measured keys. Each was chosen by
+# scanning the LIVE corpus, never by guessing a phrasing: of 158 live defers, 108
+# carry a date with no existing key — and nearly all of those dates are
+# MEASUREMENT TIMESTAMPS ("Probed 2026-08-16", "Measured on cc-07 2026-08-26"),
+# which is constraint 2 demonstrated at scale. A bare-date scan would suppress
+# ~108 defers, most of them wrongly. Live hit counts at the time of widening:
+#   resolves_no_earlier_than  2  (a real structured key nobody had registered)
+#   gated until               1
+#   ACTIVE until              2  (deploy-hold windows)
+#   window open until         2  (hypothesis windows)
+# NOT added, because they have ZERO live hits and every unused alternative is
+# surface a future false positive can enter through: "no earlier than",
+# "not before".
+# `until` is NOT admitted bare. It is anchored to the two attested contexts
+# ("ACTIVE until", "window open until"): a bare \buntil would match a future
+# deadline phrasing and invert the meaning exactly as constraint 2 forbids.
+# Before/after delta on the live corpus (2236 goals): 8 -> 15 matches, ADDED 7,
+# REMOVED 0 — no row that was a finding before stops being one (guard-2201).
 _DATE_GATE_RE = re.compile(
-    r"(resolves_by|deferred_until|window closes)\D{0,32}(\d{4}-\d{2}-\d{2})",
+    r"(resolves_by|deferred_until|window closes|resolves_no_earlier_than"
+    r"|gated until|ACTIVE until|window open until)"
+    r"\D{0,32}(\d{4}-\d{2}-\d{2})",
     re.IGNORECASE,
 )
 

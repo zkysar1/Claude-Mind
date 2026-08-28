@@ -105,6 +105,43 @@ strategy_schemas:
       "step-attribution.yaml":
         - step_attribution
 
+    # ENFORCED ON BOTH PATHS since 3d2639f77 (, echo, 2026-08-28).
+    # This block read "DECLARED BUT NOT YET ENFORCED ... read by NOTHING today"
+    # from 1f812e1d0 (the declare commit) until the enforce commit landed hours
+    # later and did not revisit the comment — so the warning outlived the defect
+    # it described and actively told readers to re-implement shipped code
+    # (guard-2333: a describer goes stale the moment the code moves; corrected
+    # under guard-4526 in the same change as the artifact that inherited it).
+    # Live wiring, verified by reading it: core/scripts/meta-backpressure.py:278
+    # loads owner_mandated_fields and :337-362 refuses the revert, sets status
+    # owner_mandated_skipped, and APPENDS a skip record to owner_mandated_skips;
+    # mind_api/src/meta/meta_backpressure.py:545/:603-624 mirrors it exactly
+    # (guard-130 — the two may not import each other, core/BOUNDARY.md). Pinned
+    # by 82c308976. What is still OUTSTANDING is the LIVE-FIRE observation, not
+    # the code: no owner_mandated_skips entry exists yet, because backpressure
+    # has not challenged the field since the 2026-08-28T08:04:56 restore.
+    #
+    # WHY A SECOND ALLOWLIST INSTEAD OF EXTENDING audit_only_fields — the
+    # distinction IS the mechanism:
+    #   audit_only_fields     = "reverting this loses EVIDENCE without changing
+    #                            BEHAVIOR" (telemetry; append-only logs).
+    #   owner_mandated_fields = "reverting this DOES change behavior — that is
+    #                            precisely why a human set it, and why an
+    #                            automatic mechanism may not silently undo it."
+    # Admission here is by PROVENANCE (an explicit owner instruction), never by
+    # inertness. Folding these into the block above would falsify its own stated
+    # admission criterion and degrade it into a junk drawer.
+    #
+    # MOTIVATING LOSS: weights.directive_boost was set 1.5 -> 3.0 twice on
+    # explicit owner instruction (mc-946, asp-368 revenue directive; mc-964, THE
+    # VINHEIM RALLY) and auto-reverted BOTH times by imp@k backpressure (mc-951,
+    # mc-965) with no notification — two agents, two owner statements, both
+    # silently undone. A refused revert MUST be SURFACED (its own skip record),
+    # not merely skipped, or this repeats the 99-day silent-zero of .
+    owner_mandated_fields:
+      "goal-selection-strategy.yaml":
+        - weights.directive_boost
+
   self_program_backpressure:
     # Per world/conventions/self-program-evolution.md
     # Multi-metric backpressure for Self/Program/Skill/Rule autonomous edits.

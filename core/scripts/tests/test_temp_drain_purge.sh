@@ -689,6 +689,49 @@ else
   echo "  [SKIP] cited-set unreadable on this box — fail-closed path covered above"
 fi
 
+echo "age-guard visibility (g-115-4994) — a skipped dir must be NAMED, not omitted:"
+# The reported failure: an operator MOVED an archive into a RECEIPT-bearing dir
+# so Lane 3 would preserve it, then re-ran the dry-run to confirm. The dir
+# appeared in NO lane, which reads as safety — but the protective move had
+# refreshed its mtime, so the age guard never evaluated it. The reader most
+# likely to hit this is the one confirming a protective action, and it is
+# silent in the SAFE-LOOKING direction.
+# INVOCATION SHAPE IS LOAD-BEARING HERE. cleanup_stray_dirs reports its count on
+# stdout but its age-skip detail through GLOBALS, and production calls it bare
+# (temp-drain-purge.sh:841 `cleanup_stray_dirs ... >/dev/null`) so those globals
+# reach the emitter. Capturing with `$(...)` forks a subshell and every global is
+# discarded at the closing paren -- silently, with the count still correct. That
+# is a green-looking harness measuring a branch production never takes
+# (probe-with-canonical-code-path.md). Redirect to a file; never $(...).
+TG4="$(mktemp -d)"
+mkdir -p "$TG4/temp/aged-dir" "$TG4/temp/just-touched"
+echo x > "$TG4/temp/aged-dir/f.txt"
+echo x > "$TG4/temp/just-touched/f.txt"
+touch -d '3 hours ago' "$TG4/temp/aged-dir/f.txt" "$TG4/temp/aged-dir"
+# just-touched keeps its now-mtime: inside the 120-min window, so never evaluated.
+
+cleanup_stray_dirs "$TG4/temp" 120 1 >"$TG4/n" 2>/dev/null; _n="$(cat "$TG4/n")"
+lcheck "aged dir is evaluated (counted)"                 1   "$_n"
+lcheck "fresh dir is reported as age-skipped"            1   "${STRAY_AGE_SKIPPED:-0}"
+lcheck "age-skipped list NAMES the fresh dir"            yes "$(printf '%s' "${STRAY_AGE_SKIPPED_DIRS:-}" | grep -q 'just-touched' && echo yes || echo no)"
+lcheck "age-skipped dir is NOT folded into the count"    no  "$(printf '%s' "$_n" | grep -q '^2$' && echo yes || echo no)"
+
+# Neutralized guard: the same dir must now report a REAL lane verdict, and the
+# skip tally must fall to zero — the operator's escape hatch actually works.
+cleanup_stray_dirs "$TG4/temp" 0 1 >"$TG4/n0" 2>/dev/null; _n0="$(cat "$TG4/n0")"
+lcheck "--age-min 0 evaluates both dirs"                 2   "$_n0"
+lcheck "--age-min 0 leaves nothing age-skipped"          0   "${STRAY_AGE_SKIPPED:-0}"
+
+# The empty-candidate case is the one that matters most: with NO evaluable dir,
+# the lane used to return early and the skipped dir vanished entirely.
+TG5="$(mktemp -d)"
+mkdir -p "$TG5/temp/only-fresh"
+echo x > "$TG5/temp/only-fresh/f.txt"
+cleanup_stray_dirs "$TG5/temp" 120 1 >"$TG5/n1" 2>/dev/null; _n1="$(cat "$TG5/n1")"
+lcheck "no evaluable dirs -> count 0"                    0   "$_n1"
+lcheck "...but the skipped dir is STILL reported"        1   "${STRAY_AGE_SKIPPED:-0}"
+rm -rf "$TG4" "$TG5"
+
 if [ "$fails" -gt 0 ]; then echo ""; echo "$fails failure(s)"; exit 1; fi
 echo ""
 echo "All temp-drain-purge guard + lane cases verified."

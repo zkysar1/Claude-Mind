@@ -285,7 +285,21 @@ def dispatch(*, agent: str, category: str, subject: str = "", message: str | Non
                                     override_reason=allow_duplicate)
         outreach._append(outreach.ledger_path(world), rec)
         if mirror_peers:
-            outreach.mirror_to_peers(rec)
+            # Capture the per-peer result. mirror_to_peers COMPUTES a
+            # [{"peer","rc"}] list and returns it; discarding that return made a
+            # silently-skipped unroutable peer (rc=3) indistinguishable from a
+            # delivering one, which is why "outreach never reaches a peer" went
+            # unnoticed across 12,077 board posts (). Measured
+            # 2026-08-27 on this box: all 4 registered peers returned rc=3.
+            # Log-only and best-effort by design -- the mirror must never affect
+            # the send's exit code (notification_outreach.mirror_to_peers docstring).
+            mirror = outreach.mirror_to_peers(rec)
+            if mirror:
+                _log("mirror: " + " ".join(
+                    f"{m.get('peer')}=rc{m.get('rc')}" for m in mirror))
+            else:
+                _log("mirror: no peer attempted (no registry entries, "
+                     "missing peer-board-post.sh, or bash helper unavailable)")
     except Exception as exc:
         _log(f"WARN: ledger record failed ({exc}) -- the notification WAS sent")
     return RC_SENT

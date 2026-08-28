@@ -89,6 +89,19 @@ Bash: meta-read.sh reflection-strategy.yaml
 # - category_depth_overrides: per-category depth preferences
 # - reflection_effectiveness_by_type: MR-Search quality tracking (Priority 2)
 # - adaptive_depth: MR-Search adaptive reflection scaling (Priority 6)
+# - roi_history: READ THE LAST 2-3 ENTRIES' `note` FIELD. This is the only
+#   place a prior cycle records what it FOUND, and this step already pays to
+#   load it (it is the bulk of the file), so reading it is free. guard-2095:
+#   without it, consecutive cycles re-derive the same finding — measured
+#   2026-07-31, a cycle independently re-derived a defect the previous day had
+#   already encoded as rb-5577, and the duplicate filing was avoided only
+#   because an unrelated dedup retrieval happened to run.
+#   PAIR THIS WITH guard-1868, WHICH POINTS THE OPPOSITE WAY: the prior note is
+#   a CLAIM, not a verdict, and because it reads as settled it is the note
+#   LEAST likely to be re-checked. Consult the prior finding, then re-measure
+#   its load-bearing assertion; never inherit it whole. Both halves are
+#   load-bearing and the same day proved each — consulting rb-5577 prevented a
+#   duplicate goal, AND re-measuring it showed its stated cause was wrong.
 # These are advisory — structural rules (horizon gating) still apply.
 
 # MR-Search reflection quality-driven depth allocation (Priority 2):
@@ -692,6 +705,25 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
      # should be exactly +1) and confirming the tail entry is yours. Same family
      # as rb-8976: a probe that fails for its own reasons is not evidence about
      # the thing it was probing.
+
+     # BOUND THE LOG — KEEP THE LAST 20 IN PLACE (g-115-4231, 2026-08-27).
+     # roi_history is an append-only log living inside a config file that
+     # Step 0.3 reads WHOLE on every cycle, and NOTHING has ever trimmed it:
+     # neither this step nor `meta-yaml.py append` carries a cap (verified by
+     # reading both, 2026-08-27). After appending, if len(roi_history) > 20,
+     # drop the OLDEST entries until 20 remain. Index 0 is the oldest — derived
+     # empirically from the stored dates, not assumed (guard-2496: an
+     # append-only file can have more than one append region, in different
+     # orders).
+     # IN PLACE, NOT A SIBLING ARCHIVE, and the reason is that the full
+     # narrative ALREADY has a durable home: the journal. The 2026-08-18 entry
+     # says so in its own note — "FULL NOTE IS IN THE JOURNAL, NOT HERE".
+     # roi_history is the INDEX, not the archive, so sharding the tail would
+     # create exactly the second unbounded file this bound exists to avoid.
+     # ARCHIVE BEFORE DELETE APPLIES TO THE EVICTION. An entry about to be
+     # dropped must already be represented in that date's journal entry; if it
+     # is not, write the journal entry FIRST, then evict. A trim is a
+     # destructive store operation, not bookkeeping.
 
 5.8. **Reflection Quality Consolidation (MR-Search Priority 2)**:
      Update reflection_effectiveness_by_type from reflection_quality_log:

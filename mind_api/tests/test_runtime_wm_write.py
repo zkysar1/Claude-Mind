@@ -130,6 +130,125 @@ def test_append_roundtrip(running_daemon):
     assert "_item_ts" in arr[-1]
 
 
+@pytest.mark.parametrize("slot", ["known_blockers", "goals_completed_this_session"])
+def test_append_reports_where_the_entry_physically_landed(running_daemon, slot):
+    """: the append response must say WHICH of the two physical
+    locations the entry went to — the YAML top level, or under `slots:`.
+
+    The expectation is read from the FILE THE WRITE PRODUCED, not from a
+    restated copy of TOP_LEVEL_KEYS. That matters more than the usual
+    derive-don't-restate discipline (guard-1220) does here: TOP_LEVEL_KEYS is
+    hand-mirrored in two files, so an expectation derived from EITHER copy would
+    still agree with a `placement` computed from the same drifted set. Anchoring
+    on where the bytes actually are is the one check both copies cannot fool.
+
+    Why the field exists: reading the wrong level returns a clean, plausible 0
+    that is byte-identical to "this slot is empty", so a caller who guesses wrong
+    gets no error to notice — measured in both directions in one session.
+    """
+    project_root, port = running_daemon
+    agent_dir = project_root / "agents" / "alpha"
+    marker = f"placement-probe-{slot}"
+    status, body = _post(port, "/v1/wm/append", {"slot": slot},
+                         json.dumps({"id": marker}))
+    assert status == 200, body
+    placement = json.loads(body).get("placement")
+    assert placement in ("top-level", "slots"), (
+        f"append response carried no usable placement: {body!r}")
+
+    wm = _read_wm(agent_dir)
+
+    def _has(container):
+        return (isinstance(container, list)
+                and any(isinstance(e, dict) and e.get("id") == marker
+                        for e in container))
+
+    at_top = _has(wm.get(slot))
+    under_slots = _has((wm.get("slots") or {}).get(slot))
+    assert at_top != under_slots, (
+        f"{slot} entry found at top-level={at_top} and under slots={under_slots} "
+        f"— the physical location must be exactly one of the two for this "
+        f"assertion to mean anything")
+    expected = "top-level" if at_top else "slots"
+    assert placement == expected, (
+        f"{slot}: response said placement={placement!r} but the entry physically "
+        f"landed at {expected!r} — a caller following the response would read the "
+        f"wrong level and get a clean, wrong 0")
+
+
+def test_append_placement_present_on_every_success(running_daemon):
+    """Always present, for the same reason `evicted` is: a caller must be able to
+    branch on it without a key-existence check. An absent key is indistinguishable
+    from a pre-fix daemon, which is precisely the ambiguity this field removes."""
+    _, port = running_daemon
+    status, body = _post(port, "/v1/wm/append", {"slot": "known_blockers"},
+                         json.dumps({"id": "blk-presence"}))
+    assert status == 200, body
+    assert "placement" in json.loads(body), (
+        f"placement key missing from a successful append response: {body!r}")
+
+
+def test_wrapper_extractor_parses_a_REAL_daemon_response(running_daemon):
+    """The wrapper's own sed, run verbatim against the daemon's own bytes.
+
+    core/scripts/tests/test_wm_append_placement_notice.py proves the wrapper
+    prints the right line for a HAND-WRITTEN response. That leaves one
+    restatement between the tests and the truth: nothing there checks that the
+    daemon actually EMITS the shape the wrapper is able to read.
+
+    What the extractor survives was MEASURED, not assumed — an earlier draft of
+    this docstring claimed a switch to compact `separators=(",", ":")` would
+    break it, and that is FALSE: `[[:space:]]*` matches zero spaces, so
+    `{"ok":true,"placement":"slots"}` parses fine, as does an indented one.
+    The regex is robust to whitespace. What it is NOT robust to is the VALUE
+    TYPE: it requires a quoted string, so `"placement": ["slots"]` and
+    `"placement": true` both extract nothing. `null` also extracts nothing, and
+    there that is correct and deliberate — null means the resolver never ran, so
+    the wrapper prints no placement line.
+
+    So the drift this test catches is a producer-side change to the field's
+    TYPE or NAME that leaves the consumer silently unable to read it — the
+    g-115-6541 defect (`evicted` emitted by the daemon and displayed by nobody
+    for its whole existence). It restates NOTHING: it lifts the extractor out of
+    the production wrapper and runs it on the production response (guard-920 —
+    replicate the literal production shape, not the contract-ideal one).
+    """
+    sys.path.insert(0, str(REPO_ROOT / "core" / "scripts" / "tests"))
+    from _bash_helpers import BASH  # noqa: E402  (guard-580: never a bare "bash")
+
+    _, port = running_daemon
+    status, body = _post(port, "/v1/wm/append", {"slot": "known_blockers"},
+                         json.dumps({"id": "blk-extractor"}))
+    assert status == 200, body
+    assert "placement" in json.loads(body), f"producer emitted no placement: {body!r}"
+
+    # The extractor, lifted verbatim from the wrapper rather than retyped.
+    wrapper = (REPO_ROOT / "core" / "scripts" / "wm-append.sh").read_text(encoding="utf-8")
+    sed_line = next(l for l in wrapper.splitlines()
+                    if '"placement"' in l and l.strip().startswith("| sed"))
+    sed_expr = sed_line.strip()[len("| sed -n "):].split(" | head")[0].strip("'")
+
+    # Pass BOTH the payload and the sed script as ARGUMENTS. Interpolating the
+    # sed script into the -c string takes three levels of quoting, and the first
+    # attempt at it silently extracted "" — a harness failure BYTE-IDENTICAL to
+    # the producer/consumer drift this test exists to detect. A harness whose
+    # failure mode is indistinguishable from a real finding is worse than none
+    # (guard-2298), hence the separate emptiness assert below.
+    proc = subprocess.run(
+        [BASH, "-c", 'printf %s "$1" | sed -n "$2" | head -1', "_", body, sed_expr],
+        capture_output=True, text=True, timeout=30)
+    got = proc.stdout.strip()
+    assert got, (
+        f"the extractor returned NOTHING — check the HARNESS before reading this "
+        f"as drift: sed script {sed_expr!r}, stderr {proc.stderr!r}, "
+        f"response {body!r}")
+    assert got == json.loads(body)["placement"], (
+        f"the wrapper's own sed extracted {got!r} from the daemon's real "
+        f"response {body!r} — expected {json.loads(body)['placement']!r}. The "
+        f"serialization shape and the extractor have drifted apart; the wrapper "
+        f"will print nothing and no single-sided test will notice.")
+
+
 def test_append_knowledge_debt_invalid_400(running_daemon):
     _, port = running_daemon
     try:

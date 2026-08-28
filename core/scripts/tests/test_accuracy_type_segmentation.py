@@ -179,6 +179,34 @@ def test_cmd_accuracy_surfaces_by_confidence_band():
     print("PASS: cmd_accuracy surfaces by_confidence_band (empty for legacy meta)")
 
 
+def test_unlabeled_excluded_from_worst_strategies():
+    """: the "unlabeled" sentinel is not an approach anyone chose.
+
+    Deleting the `verification` fallback made every strategy-less record bin
+    under one explicit "unlabeled" key -- ~99% of the corpus -- so it clears the
+    n>=3 floor by default. Left in, it would crowd a genuinely failing strategy
+    out of worst[:3] and report the ABSENCE of a label as the worst strategy.
+    Asserted BOTH ways: the sentinel is dropped AND a real failing strategy is
+    still reported, so this cannot pass by returning an empty list.
+    """
+    data = {
+        "total_resolved": 916, "accuracy_pct": 11.0, "confirmed": 101,
+        "by_strategy": {
+            "unlabeled": {"confirmed": 90, "total": 900, "pct": 10.0},
+            "self_check": {"confirmed": 1, "total": 5, "pct": 20.0},
+            "structural-analogy": {"confirmed": 9, "total": 10, "pct": 90.0},
+        },
+        "by_type": {
+            "calibration": {"confirmed": 1, "total": 6, "pct": 16.7},
+        },
+    }
+    r = _run_accuracy(data)
+    assert "accuracy_low" in r["flags"], f"fixture must flag for worst to compute: {r}"
+    assert "unlabeled" not in r["worst_strategies"], r
+    assert r["worst_strategies"] == ["self_check"], r
+    print("PASS: unlabeled sentinel excluded from worst_strategies, real one kept")
+
+
 if __name__ == "__main__":
     test_exploration_heavy_does_not_flag()
     test_genuine_overconfidence_still_flags()
@@ -187,5 +215,6 @@ if __name__ == "__main__":
     test_compute_meta_emits_by_type()
     test_compute_meta_emits_by_confidence_band()
     test_cmd_accuracy_surfaces_by_confidence_band()
+    test_unlabeled_excluded_from_worst_strategies()
     print()
-    print("ALL 7 ACCURACY TYPE-SEGMENTATION TESTS PASS")
+    print("ALL 8 ACCURACY TYPE-SEGMENTATION TESTS PASS")

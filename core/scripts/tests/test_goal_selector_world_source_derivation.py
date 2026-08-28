@@ -192,9 +192,16 @@ def case_offroster_routed_world_goal_kept() -> tuple[bool, str]:
     unrecognized sentinel like the cycle-detector's "any") names nobody who can
     ever honor the routing. Filtering it made the goal invisible in BOTH
     directions -- absent from the candidate list, and never classified by
-    collect_blocked, which does not reference intended_agent at all. Two goals
+    collect_blocked, which did not reference intended_agent at all. Two goals
     sat unreachable for 71 days that way. Falling through restores them to
     exactly the visibility "either" would give.
+
+    UPDATED g-115-3679: collect_blocked now DOES carry an intended_agent
+    inverse (block_reason "routed_to_agent"), so the both-directions vanish no
+    longer applies to an ON-ROSTER target. This case is unaffected -- an
+    off-roster name still falls THROUGH to visible rather than being blocked,
+    and test_goal_selector_intended_agent_inverse.py pins that boundary from
+    the other side.
 
     Skipped when the roster is unresolvable: the vocabulary check is disabled
     in that state by design (an unreadable team-state must not make every

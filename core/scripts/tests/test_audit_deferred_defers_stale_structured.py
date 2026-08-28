@@ -486,3 +486,95 @@ def test_all_evidence_strings_are_ascii():
     for text, when in cases:
         for e in MOD.classify(text, ["agent"], defer_set_at=when)["evidence"]:
             e.encode("ascii")   # raises UnicodeEncodeError on any non-ASCII
+
+
+# ---------------------------------------------------------------------------
+# Widened defer-until key set (). Four keys added, each chosen by
+# scanning the LIVE corpus rather than guessing a phrasing. The negative
+# controls below are the load-bearing half: of 158 live defers, 108 carried a
+# date with NO key, and nearly all of those dates were MEASUREMENT timestamps
+# ("Probed 2026-08-16"), so a bare-date scan would have suppressed ~108 defers
+# and inverted the meaning of constraint 2.
+# ---------------------------------------------------------------------------
+
+_WIDEN_NOW = dt.datetime(2026, 8, 28)
+
+
+def test_widened_keys_suppress_on_a_future_window():
+    """Each of the four added keys suppresses on a future window.
+
+    Kept as one function with an explicit table rather than a parametrize:
+    this suite imports no pytest (plain asserts throughout) and matching the
+    file's existing idiom is the rule, not introducing a second one.
+    """
+    cases = [
+        ("gated until",
+         "precondition_unmet: calendar-gated until ~2026-10-24. rollback path",
+         dt.datetime(2026, 10, 24)),
+        ("resolves_no_earlier_than",
+         "precondition_unmet: resolves_no_earlier_than: 2026-09-05 pending peer",
+         dt.datetime(2026, 9, 5)),
+        ("active until",
+         "precondition_unmet: deploy-hold:Repo:2026-08-16 ACTIVE until 2026-08-29T02:30",
+         dt.datetime(2026, 8, 29)),
+        ("window open until",
+         "precondition_unmet: hypothesis window open until 2026-09-11 (resolves)",
+         dt.datetime(2026, 9, 11)),
+    ]
+    for key, text, expect_date in cases:
+        got = MOD._keyed_future_date(text, now=_WIDEN_NOW)
+        assert got is not None, f"{key!r} did not suppress: {text!r}"
+        assert got[0] == key, f"matched key {got[0]!r}, expected {key!r}"
+        assert got[1] == expect_date, f"{key!r} parsed {got[1]}, expected {expect_date}"
+
+
+def test_deadline_phrasing_does_not_suppress():
+    """NEGATIVE CONTROL (constraint 2). A 'by DATE' due-date is an URGENCY
+    deadline, not a defer-until date. Reading one as a licence to stay stopped
+    inverts the meaning — the whole reason suppression is keyed, not date-based.
+    """
+    for text in (
+        "precondition_unmet: must ship by 2026-09-30 deadline",
+        "precondition_unmet: due 2026-12-01, needs the migration first",
+        "precondition_unmet: target date 2026-11-15 for the cutover",
+    ):
+        assert MOD._keyed_future_date(text, now=_WIDEN_NOW) is None, text
+
+
+def test_measurement_timestamp_does_not_suppress():
+    """NEGATIVE CONTROL, and the one the live corpus proved matters most.
+
+    108 of 158 live defers carried a date with no key, dominated by probe and
+    measurement stamps. A bare-date scan suppresses essentially all of them.
+    """
+    for text in (
+        "precondition_unmet: RE-PROBED 2026-08-14T13:00, still blocked",
+        "precondition_unmet: Measured on cc-07 2026-08-26: /opt not resident",
+        "precondition_unmet: Released from a session claim 2026-08-26 (pinned)",
+    ):
+        assert MOD._keyed_future_date(text, now=_WIDEN_NOW) is None, text
+
+
+def test_bare_until_is_not_admitted():
+    """`until` is anchored to its two attested contexts, never bare.
+
+    A bare \\buntil would match deadline-flavoured phrasings and re-open exactly
+    the inversion constraint 2 forbids.
+    """
+    assert MOD._keyed_future_date(
+        "precondition_unmet: blocked until 2026-09-30 unless waived",
+        now=_WIDEN_NOW) is None
+
+
+def test_widened_keys_still_honour_the_past_window_rule():
+    """A CLOSED window must not be laundered into genuineness (constraint 3)."""
+    for text in (
+        "precondition_unmet: calendar-gated until 2026-01-01",
+        "precondition_unmet: hypothesis window open until 2026-02-02",
+    ):
+        assert MOD._keyed_future_date(text, now=_WIDEN_NOW) is None, text
+
+
+def test_widened_keys_still_fail_open_on_an_unparseable_date():
+    assert MOD._keyed_future_date(
+        "precondition_unmet: gated until 2026-13-45", now=_WIDEN_NOW) is None

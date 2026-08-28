@@ -499,3 +499,81 @@ def test_record_hold_omits_note_sha_when_note_unreadable(tmp_path):
                          now=NOW, note_sha=m._note_sha(_JUDGED))
     assert rec2["note_sha"] == m._note_sha(_JUDGED)
     assert len(m.load_holds(led)) == 2
+
+
+# ── The >=3-hold escalation must not claim a rewrite that never happened ──────
+# ()  left the escalation text asserting that a REPEAT hold
+# means the note was REWRITTEN between judgements. That is true only once a PRIOR
+# hold on the row carried a digest, and it is FALSE throughout the migration
+# window — where it is also loudest, because the no-migration choice (holds
+# predating the change carry no note_sha) helps the LONGEST-SERVING rows LAST.
+# Measured 2026-08-28 (zeta, cc-02, 6.8.0-137-generic): live ledger 81 holds / 6
+# with note_sha; the three lane rows read holds=6/4/6 with sha=0/0/0. Telling
+# that reader to "read the note diff" sends them after a diff that cannot exist.
+# BOTH branches are pinned — a one-sided test would pass against a hardcoded
+# message (guard-2319).
+
+def _seed_holds(m, ledger, gid, n, *, sha=None):
+    """Append n holds for gid directly, bypassing record_hold's digest logic."""
+    import json as _j
+    with open(ledger, "a", encoding="utf-8") as fh:
+        for i in range(n):
+            rec = {"goal_id": gid, "held_at": "2026-08-20T0%d:00:00" % i,
+                   "reason": "prior", "agent": "alpha", "sid": "abc"}
+            if sha:
+                rec["note_sha"] = sha
+            fh.write(_j.dumps(rec) + "\n")
+
+
+def _run_hold(m, tmp_path, monkeypatch, capsys, gid, note):
+    monkeypatch.setattr(m, "holds_path", lambda agent: tmp_path / "ledger.jsonl")
+    monkeypatch.setattr(m, "_load_one", lambda g, t: {"goal_id": g, "outcome_note": note})
+    monkeypatch.setenv("MIND_AGENT", "alpha")
+    monkeypatch.setenv("MIND_SID", "cd5fd3b9")
+    monkeypatch.setattr("sys.argv", ["cnc", "--hold", gid, "--reason", "r"])
+    assert m.main() == 0
+    return capsys.readouterr().out
+
+
+def test_escalation_says_clock_recycle_when_no_prior_hold_carried_a_digest(
+        tmp_path, monkeypatch, capsys):
+    m = _load()
+    ledger = tmp_path / "ledger.jsonl"
+    _seed_holds(m, ledger, "g-9-05", 5)                    # 5 pre- holds
+    out = _run_hold(m, tmp_path, monkeypatch, capsys, "g-9-05", _JUDGED)
+    assert "held 6x" in out
+    assert "NO prior hold" in out and "CLOCK recycle" in out, (
+        "with every prior hold sha-less the count records a clock recycle; "
+        "claiming the note was rewritten sends the reader after a diff that "
+        "cannot exist (g-115-6641)")
+    assert "REWRITTEN between judgements" not in out
+
+
+def test_escalation_says_rewrite_when_a_prior_hold_did_carry_a_digest(
+        tmp_path, monkeypatch, capsys):
+    m = _load()
+    ledger = tmp_path / "ledger.jsonl"
+    _seed_holds(m, ledger, "g-9-06", 2, sha=m._note_sha("an OLDER note"))
+    out = _run_hold(m, tmp_path, monkeypatch, capsys, "g-9-06", _JUDGED)
+    assert "held 3x" in out
+    assert "REWRITTEN between judgements" in out, (
+        "once a prior hold carried a digest, a repeat hold really does mean the "
+        "note changed — that branch must survive")
+    assert "NO prior hold" not in out
+
+
+def test_prior_keyed_is_sampled_before_the_write_not_after(tmp_path, monkeypatch, capsys):
+    """The regression this test exists for: load_holds re-reads from disk and
+    returns fresh dicts, so an identity test against the record just written can
+    never exclude it — every hold would then see its OWN digest as `prior` and
+    the clock-recycle branch would be unreachable. Sampling before record_hold is
+    the whole fix; this pins it with the exact input that defeats the naive form."""
+    m = _load()
+    ledger = tmp_path / "ledger.jsonl"
+    _seed_holds(m, ledger, "g-9-07", 3)                    # sha-less priors only
+    out = _run_hold(m, tmp_path, monkeypatch, capsys, "g-9-07", _JUDGED)
+    written = [h for h in m.load_holds(ledger) if h["goal_id"] == "g-9-07"]
+    assert len(written) == 4 and written[-1].get("note_sha"), (
+        "this hold must itself be content-keyed — otherwise the test proves nothing")
+    assert "NO prior hold" in out, (
+        "the freshly-written digest must NOT count as a prior one")

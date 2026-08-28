@@ -101,6 +101,19 @@ session — never reconstructed from prior-session memory (per
    #   not exist"). Run `git stash list` BEFORE concluding work was never
    #   written; recover with `git stash apply` (3-way, keeps the stash),
    #   never `git apply`. Full protocol: guard-3796.
+1b. Bash: bash core/scripts/mirror-integrity-check.sh --no-drift
+   # OWN-CLOUD ONLY (exits 0 "n/a" on every other backend). The git probes
+   # above cannot see world/ at all, and the loop's MirrorWedgeProbe fires
+   # only from the watchdog tick — an assistant session on an own-cloud box
+   # has NEITHER instrument. Measured 2026-08-27 (rb-9443): 11 tree nodes, a
+   # design SSOT among them, sat both-diverged FROZEN for ~2 days while every
+   # encode pass printed ENCODED tree:<key> for edits that never left the box
+   # (silent merge-handler refusal, guard-4778 — owncloud-flush reports
+   # conflicts=0, so nothing else surfaces it). rc=1 WEDGED → repair BEFORE
+   # Lane 1 writes more edits into a frozen file (class-B files:
+   # /reconcile-owncloud-conflicts; tree nodes: guard-4778's fenced mirror_put
+   # union — worked example in rb-9443). rc=2 = blind, not clean (guard-1947).
+   # The script's exit code is the gate (guard-399), not this comment.
 2. Read agents/<agent>/session/working-memory.yaml
 3. Bash: aspirations-read.sh --summary
 4. Identify scope from in-context conversation memory:
@@ -898,6 +911,21 @@ Bash: source core/scripts/_paths.sh && bash core/scripts/iteration-commit.sh \
 #    "Session-Start Sync" (iteration-push.sh --no-push, g-115-3871) — do
 #    not add a second pull path here.
 Bash: bash core/scripts/iteration-push.sh
+
+# 3. OWN-CLOUD ONLY — read back what this session encoded (exits 0 "n/a"
+#    elsewhere). Step 2 pushed the git-tracked half; nothing above proves the
+#    world/ half LANDED. This HEADs every tree node this session attributed
+#    to itself (tree-edit-since.py) against the authoritative object and
+#    re-reads the streak verdict AFTER the flush has had its chance. rc=1
+#    (DRIFT or WEDGED) means an "ENCODED tree:<key>" line printed above was
+#    FALSE — repair now (rb-9443 recipe), re-run until OK, and say so in the
+#    summary. rc=2 (blind) is not clean. Never lets a failure block the
+#    terminal call. Sibling of Phase 1 step 1b (entry) — entry catches a
+#    wedge before Lane 1 builds on it, exit catches one this session caused.
+#    Cost: one remote HEAD per attributed node, ~3-4s each (measured
+#    2026-08-27: 53 nodes in 3m18s) — run it in the foreground, it is the
+#    only step that proves the tree half of the flush landed.
+Bash: bash core/scripts/mirror-integrity-check.sh
 ```
 
 **MIRROR ASYMMETRY — do NOT copy this step to `/aspirations-spark`.** The
@@ -906,7 +934,11 @@ lanes. This step is deliberately encode-session-ONLY: the autonomous loop
 already commits at iteration-close (`iteration-commit.sh` from
 state-update/iteration-close wiring) and pushes at `do_productivity_check`,
 so mirroring this step into the loop path would double-commit every
-iteration. The asymmetry is the fix, not an oversight.
+iteration. The asymmetry is the fix, not an oversight. Step 3 (and Phase 1
+step 1b) are likewise encode-session-ONLY: the loop already runs
+MirrorWedgeProbe from the watchdog tick every iteration. The remaining gap is
+the hook-level gate for chat mode (SessionStart banner / PreToolUse[Edit]
+advisory on a frozen node) — tracked by g-115-8029, not by this skill.
 
 ## Chaining
 

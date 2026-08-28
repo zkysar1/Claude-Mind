@@ -252,3 +252,117 @@ def test_normalize_value_preservation_covers_all_renames(normalize):
     out = normalize({"outcome_notes": "ran probe X", "outcome_detail": None})
     assert out["outcome_detail"] == "ran probe X"
     assert "outcome_notes" not in out
+
+
+# ---------------------------------------------------------------------------
+# by_strategy: no `verification` fallback ()
+#
+# compute_meta used to read r.get("strategy", r.get("verification", "unknown")).
+# `verification` holds free-text resolution criteria, so whenever `strategy` was
+# absent — measured at ~95% of the corpus — the BIN KEY became prose: 35 bins
+# over 42 of 944 resolved records, 34 of them n=1, keys up to 814 chars. The
+# breakdown read as populated while the field it stands for was dead. A record
+# with no usable strategy now bins under one explicit "unlabeled" key.
+# ---------------------------------------------------------------------------
+
+PROSE = ("Run: efs-session-classify.sh --limit 30 --since 2026-08-12T06:00 "
+         "--output json. Read excluded_by_floor BEFORE concluding anything.")
+
+
+@pytest.mark.parametrize("funcs", BOTH)
+def test_compute_meta_no_verification_fallback(funcs):
+    compute_meta = funcs[2]
+    rec = {"stage": "resolved", "outcome": "CONFIRMED", "verification": PROSE}
+    bs = compute_meta([rec], [])["accuracy"]["by_strategy"]
+    assert PROSE not in bs, "verification prose leaked back into a bin key"
+    assert bs == {"unlabeled": {"confirmed": 1, "total": 1, "pct": 100.0}}
+
+
+@pytest.mark.parametrize("funcs", BOTH)
+def test_compute_meta_named_strategy_survives(funcs):
+    # The fix must not stop binning records that DO carry a real strategy --
+    # otherwise "no prose bins" would be satisfied by an empty breakdown.
+    compute_meta = funcs[2]
+    rec = {"stage": "resolved", "outcome": "CONFIRMED",
+           "strategy": "self_check", "verification": PROSE}
+    bs = compute_meta([rec], [])["accuracy"]["by_strategy"]
+    assert bs == {"self_check": {"confirmed": 1, "total": 1, "pct": 100.0}}
+
+
+@pytest.mark.parametrize("funcs", BOTH)
+@pytest.mark.parametrize("value", [None, "", "   ", "unknown", {"legacy": "d"}, 7])
+def test_compute_meta_unusable_strategy_bins_unlabeled(funcs, value):
+    # Every unusable shape lands in the SAME bin, including the legacy dict and
+    # the literal "unknown" -- both of which the old code dropped on the floor,
+    # so those records appeared in no bin at all.
+    compute_meta = funcs[2]
+    rec = {"stage": "resolved", "outcome": "CORRECTED", "strategy": value}
+    bs = compute_meta([rec], [])["accuracy"]["by_strategy"]
+    assert list(bs) == ["unlabeled"]
+    assert bs["unlabeled"]["total"] == 1
+
+
+@pytest.mark.parametrize("funcs", BOTH)
+def test_compute_meta_bins_carry_their_denominator(funcs):
+    #  outcome 4: an unlabeled count is only readable against a
+    # denominator, so every resolved record must land in exactly one bin and
+    # the bin totals must sum to total_resolved.
+    compute_meta = funcs[2]
+    live = [
+        {"stage": "resolved", "outcome": "CONFIRMED", "strategy": "self_check"},
+        {"stage": "resolved", "outcome": "CORRECTED", "verification": PROSE},
+        {"stage": "resolved", "outcome": "CONFIRMED"},
+        {"stage": "resolved", "outcome": "EXPIRED"},   # not a resolved record
+        {"stage": "active", "outcome": None},          # not a resolved record
+    ]
+    acc = compute_meta(live, [])["accuracy"]
+    assert acc["total_resolved"] == 3
+    assert sum(b["total"] for b in acc["by_strategy"].values()) == 3
+    assert acc["by_strategy"]["unlabeled"]["total"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Call-site parity: the two compute_meta implementations must agree ENTIRELY
+#
+# The constraining insight_trigger (bravo, msg-20260729-114459) measured a
+# helper call DELETED from the CLI copy with the suite still green: nothing
+# asserted parity BETWEEN the tiers, only that each was internally consistent.
+# Comparing the WHOLE meta dict rather than one block is what makes any future
+# divergence -- in any block, not just the one being edited today -- fail here
+# instead of silently in production. guard-547 / guard-2323 / guard-1189.
+# ---------------------------------------------------------------------------
+
+PARITY_LIVE = [
+    {"id": "h1", "stage": "resolved", "outcome": "CONFIRMED",
+     "type": "high-conviction", "horizon": "short", "confidence": 0.9,
+     "strategy": "self_check", "outcome_detail": "confirmed by g-115-1604"},
+    {"id": "h2", "stage": "resolved", "outcome": "CORRECTED",
+     "type": "exploration", "horizon": "session", "confidence": 0.3,
+     "verification": PROSE},                       # prose, no strategy
+    {"id": "h3", "stage": "resolved", "outcome": "CONFIRMED",
+     "type": "calibration", "horizon": "long", "confidence": 0.55,
+     "strategy": {"legacy": "dict"}},              # unusable strategy shape
+    {"id": "h4", "stage": "active", "outcome": None, "type": "contrarian"},
+    {"id": "h5", "stage": "resolved", "outcome": "EXPIRED", "type": "calibration"},
+    {"stage": "resolved", "outcome": "CONFIRMED", "type": "calibration"},  # no id
+]
+PARITY_ARCHIVE = [
+    {"id": "h6", "stage": "archived", "outcome": "CORRECTED",
+     "type": "contrarian", "horizon": "micro", "confidence": 0.7,
+     "strategy": "unknown"},                       # literal "unknown"
+    # Same id as a live record: dedup must count it once, archive copy winning.
+    {"id": "h1", "stage": "archived", "outcome": "CONFIRMED",
+     "type": "high-conviction", "horizon": "short", "confidence": 0.9,
+     "strategy": "self_check", "outcome_detail": "confirmed by g-115-1604"},
+]
+
+
+def test_compute_meta_parity():
+    assert (cli_pipeline.compute_meta(PARITY_LIVE, PARITY_ARCHIVE)
+            == pipeline_write._compute_meta(PARITY_LIVE, PARITY_ARCHIVE)), (
+        "CLI and daemon compute_meta disagree -- the tiers have diverged")
+
+
+def test_empty_meta_parity():
+    assert cli_pipeline.empty_meta() == pipeline_write._empty_meta(), (
+        "CLI and daemon empty_meta disagree -- a block exists in one tier only")

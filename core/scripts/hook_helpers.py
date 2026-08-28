@@ -47,6 +47,29 @@ def emit_deny(reason):
     sys.exit(0)
 
 
+def emit_advisory(message):
+    """Emit a NON-BLOCKING advisory per Claude Code PreToolUse contract.
+
+    permissionDecision stays "allow" — the command runs; the message rides
+    EVERY non-blocking channel because delivery was measured field-by-field
+    (g-115-3511, trailing-echo-exit-gate): allow+reason alone does NOT reach
+    the model; the full shape below is the one that delivers. stderr is also
+    written for the human terminal. Exits 0 like every helper here.
+    """
+    payload = {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "permissionDecisionReason": message,
+            "additionalContext": message,
+        },
+        "systemMessage": message,
+    }
+    print(json.dumps(payload))
+    print(message, file=sys.stderr)
+    sys.exit(0)
+
+
 def stdin_json_or_approve():
     """Read stdin JSON. On any parse error, approve_no_mutation (exits 0).
     Returns the parsed dict on success."""

@@ -509,9 +509,29 @@ class TestReadCapArmRouting(unittest.TestCase):
         block = src[start:src.find("\n   a. ", start)]
         self.assertIn("SPLIT-OVERCAP PATH FORK", block,
                       "2.a0 must route the read-cap arm at split-overcap's fork")
-        self.assertIn("DO NOT route these to REGROUP", block,
-                      "2.a0 must say why the REGROUP arm is dormant, or the next "
-                      "reader re-points it back at §1.5")
+        # : anchored on the two facts that must stay TRUE, not on one
+        # phrasing of them. This assertion used to require the literal
+        # "DO NOT route these to REGROUP"; the SKILL.md was reworded to
+        # "do NOT route to REGROUP (§1.5) — that arm is DORMANT BY DESIGN and
+        # cannot fire on them", which satisfies the assertion's own stated
+        # intent while failing its literal. That is a red carrying no defect —
+        # the exact churn the goal was filed against.
+        #
+        # guard-2723's general form is "grep for what stops being TRUE, not for
+        # what stops being PRINTED". Its letter (anchor on a branch CONDITION)
+        # does not transfer: this block is prose routing an LLM, so there is no
+        # condition to anchor on and the prose IS the defence. Its spirit does,
+        # and these two tokens are what any correct phrasing must carry:
+        #   REGROUP  — the arm being spoken about at all
+        #   DORMANT  — the REASON it must not be routed to
+        # Deleting the dormancy explanation, or re-pointing the arm at §1.5 as a
+        # live route, removes "DORMANT" and goes red — which is the regression
+        # this test exists to catch. Rewording the sentence does not.
+        self.assertIn("REGROUP", block,
+                      "2.a0 must name the REGROUP arm it is steering away from")
+        self.assertIn("DORMANT", block,
+                      "2.a0 must say the REGROUP arm is DORMANT — without the "
+                      "reason, the next reader re-points it back at §1.5")
         self.assertNotIn("handle the node under REGROUP", block,
                          "the old dormant routing is still present")
 

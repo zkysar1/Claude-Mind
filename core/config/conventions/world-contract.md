@@ -53,6 +53,15 @@ ENVIRONMENT_ID=zds-mind
 > and `COMMONS_POLICY` keys AND their values now match ayoai-mind across both
 > environments, so shared code (e.g. Zak-Code) reads one name and one
 > vocabulary everywhere. Semantics are unchanged.
+>
+> **SCOPE CORRECTION (2026-08-27, g-368-12): that convergence covers the MIND
+> deployments only -- the PRODUCT side never converged.** Measured on the
+> shipped `lodestar-commons` package: it still reads `MIND_COMMONS_POLICY` with
+> the pre-convergence `nothing|shared|open` vocabulary, and `policyToTier()`
+> branches on those literals. So "one name and one vocabulary everywhere" is
+> true across ayoai-mind/zds-mind and FALSE at the Mind->product boundary, which
+> is precisely the boundary the commons dial exists to govern. Nothing performs
+> the documented `shared=selective` mapping; it exists only in this paragraph.
 
 ### Purpose
 
@@ -114,6 +123,22 @@ The build roadmap's value spine (Steps 2.1-2.3) defines three transitions:
    `public`, T1/T2 are bypassed entirely -- the raw tree is exposed directly
    via the read API.
 
+> **THE THREE LINES ABOVE ARE THE DESIGN TARGET. THE BUILT CODE GATES ON A
+> DIFFERENT VARIABLE, SO `COMMONS_POLICY=selective` FIRES NOTHING** (measured
+> 2026-08-27, alpha, cc-07 -- g-368-12). T1+T3+T2 ARE built and wired, in one
+> function: `lib/commons/value-spine.ts::ingestWorlds` (Lodestar-Web-App) runs
+> `generalize()` and contributes the output under `channel: 'generalized'`. But
+> its T3 gate is `policyToTier()`, which branches on the literals `'shared'` /
+> `'open'`, read from **`MIND_COMMONS_POLICY`** by the pinned `lodestar-commons`
+> package (`dist/commons/policy.js`: `VALID = ['nothing','shared','open']`, and
+> any unrecognised value falls closed to `'nothing'`). `COMMONS_POLICY` appears
+> in no product code, and `'selective'` is not a value that package accepts --
+> so the documented dial cannot reach the engine at either the key or the value.
+> This is the SAME defect g-368-24 measured in the removed `experience-pipe.sh`
+> (wrong dial, incompatible vocabulary); it was a property of the whole
+> integration, not of that one file, which is why removing the file did not
+> remove it.
+
 ### Current status (honest)
 
 `COMMONS_POLICY` is declared in `.env.example` (value `private`) as of
@@ -144,11 +169,25 @@ dial is unset; enabling is recorded as gated on Gate B GO + a commons-table IAM
 grant; and the engine it feeds has zero production callers). Full evidence,
 restore command, and a byte-verified copy of the removed file: **rb-9216**.
 
-The generalization engine exists (11 modules, 77 tests in Lodestar-Web-App) but
-has zero production callers. The T1/T2/T3 transitions above are design targets,
-not built features. Every world today is effectively private -- not because the
-private tier is enforced in code, but because the selective and public tiers do
-not yet exist.
+The generalization engine exists (11 modules, 77 tests in Lodestar-Web-App).
+"Zero production callers" is the shape of the gap but not its location, and the
+difference decides what work remains (measured 2026-08-27, g-368-12): the engine
+HAS non-test callers -- `value-spine.ts` imports `generalize`, `CoarseInducer`
+and `StubDpBudget`, and `app/api/commons/contribute/route.ts` is a live route
+that accepts the engine's `EmittedRecord[]`. What has no production caller is the
+DRIVER one level up: `value-spine-service.ts::runCommonsIngest`, whose only
+importers are tests. So the generalized tier is not unbuilt and not unwired --
+it is unCALLED and un-dialled. Every world today is effectively private because
+the product master switch defaults to `nothing` (fail-closed), NOT because the
+selective tier does not exist.
+
+**Do not read this as a to-do.** Supplying that caller IS the T1/T2 egress
+g-368-24 ruled is not agent-provisionable: it moves real world experience to an
+external product surface (lodestar.wiki) behind three gates -- the product dial,
+Gate B (formally INCONCLUSIVE at the meta-corpus floor: 5 patterns/fold vs
+MIN_PATTERNS=50, per `docs/gate-b-verdict.md`), and a commons-table IAM grant.
+The dial correction above is the part that was safe to do; arming is a decision,
+not a wiring task.
 
 ### Rules
 

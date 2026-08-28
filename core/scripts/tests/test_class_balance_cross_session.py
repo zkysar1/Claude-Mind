@@ -278,6 +278,57 @@ def test_chronological_order(world_dir, agent_dir):
 # Test runner
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Test 6: empty AGENT_NAME must NOT self-scope onto unattributed goals
+# (F-1, )
+# ---------------------------------------------------------------------------
+
+@with_sandbox
+def test_empty_agent_name_falls_back_fleet_wide(world_dir, agent_dir):
+    """AGENT_NAME == "" must yield the FLEET-WIDE window, not the unattributed subset.
+
+    AGENT_NAME is `AGENT_DIR.name if AGENT_DIR else ""`, and the window coerces a
+    missing completed_by to "" via `g.get("completed_by") or ""`. So a bare
+    `d[2] == AGENT_NAME` matches every UNATTRIBUTED goal instead of none. The
+    deliberate `scoped = mine or dated` fleet-wide fallback then CANNOT fire,
+    because `mine` is non-empty, and the window silently becomes an arbitrary
+    subset while the label still claims it is self-scoped. Measured live at the
+    time of the fix: completed_by == "" had 384 rows.
+
+    THE MIX IS THE WHOLE TEST. If every row were unattributed, `mine == dated`
+    and both behaviours agree — the bug would be invisible. Only a MIX of
+    attributed and unattributed rows separates them, which is why this fixture
+    carries two of each.
+    """
+    helper = _import_helper()
+    # Simulate AGENT_DIR failing to resolve. Patching the function's __globals__
+    # reaches the same module global the function body reads, so no change to
+    # _import_helper is needed.
+    helper.__globals__["AGENT_NAME"] = ""
+
+    ts = _recent(1)  # inside the staleness bound; never a literal date
+    goals = [
+        {"id": "g-mix-01", "work_class": "framework", "recurring": False,
+         "completed_at": ts, "completed_by": "alpha"},
+        {"id": "g-mix-02", "work_class": "product", "recurring": False,
+         "completed_at": ts, "completed_by": "bravo"},
+        {"id": "g-mix-03", "work_class": "framework", "recurring": False,
+         "completed_at": ts},                       # completed_by absent
+        {"id": "g-mix-04", "work_class": "product", "recurring": False,
+         "completed_at": ts, "completed_by": ""},   # completed_by explicitly empty
+    ]
+    _write_aspirations(world_dir, "asp-mix", goals)
+
+    result = helper(window_size=20)
+    ids = {r["goal_id"] for r in result}
+    assert ids == {"g-mix-01", "g-mix-02", "g-mix-03", "g-mix-04"}, (
+        "empty AGENT_NAME must fall back to the FLEET-WIDE window; got "
+        f"{sorted(ids)} — a proper subset means the self-scope filter matched "
+        "unattributed goals (F-1 regression)"
+    )
+    print("  test_empty_agent_name_falls_back_fleet_wide PASSED")
+
+
 def main():
     tests = [
         ("test_last_n_tail", test_last_n_tail),
@@ -285,6 +336,8 @@ def main():
         ("test_missing_work_class_skip", test_missing_work_class_skip),
         ("test_orphaned_id_skip", test_orphaned_id_skip),
         ("test_chronological_order", test_chronological_order),
+        ("test_empty_agent_name_falls_back_fleet_wide",
+         test_empty_agent_name_falls_back_fleet_wide),
     ]
     failures = []
     for name, fn in tests:

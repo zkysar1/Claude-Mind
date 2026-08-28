@@ -4640,6 +4640,20 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     "parent-supersession-sweep-metrics.jsonl": merge_append_only_jsonl,
     "unblock-parent-status-sweep-metrics.jsonl": merge_append_only_jsonl,
     "routing-audit-target-status-sweep-metrics.jsonl": merge_append_only_jsonl,
+    # world/npc-composition-sweep-metrics.jsonl (): the cross-run
+    # population ledger the composition sweep writes once per run via
+    # _fileops.locked_append_jsonl. Strictly append-only by construction — each
+    # row is an immutable {timestamp, agent, scanned populations, rcs} snapshot,
+    # and nothing filters, prunes or rewrites it, so guard-1816's disqualifier (a
+    # removal path makes a base-less union resurrect deleted records) cannot
+    # reach it. Registered WITH the store's first write, per the 
+    # precedent below, rather than after a wedge. It does NOT fall under the
+    # "single-writer flows, registration deferred" triage note above:  is
+    # a WORLD recurring goal, so whichever Body picks it up runs the sweep — echo
+    # on cc-03 and alpha on cc-08 both produced rows in the measurements that
+    # motivated this ledger. Two boxes appending in one window is the ordinary
+    # case here, not the hazard case.
+    "npc-composition-sweep-metrics.jsonl": merge_append_only_jsonl,
     # Phase 4 bulk-override audit ledger (): multi-agent append-only
     # via _override_helpers.locked_append_jsonl (no rewrite writer). A shared
     # world store where concurrent overrides from two boxes can both-diverge and

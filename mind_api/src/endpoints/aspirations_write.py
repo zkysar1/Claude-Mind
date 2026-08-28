@@ -1139,6 +1139,33 @@ def _resolve_paths(ctx, source: str) -> Tuple[Path, Path]:
     return (base / "aspirations.jsonl", base)
 
 
+def _sibling_aspiration_stores(ctx, source: str) -> List[Path]:
+    """Every OTHER aspiration store (live + archive) that shares this deployment's
+    ``asp-NNN`` id space with the store ``source`` names.
+
+    The world file and each agent's file are one id space — goal ids, claims and the
+    selector key on the number alone — so an auto-minted id must clear all of them.
+    ``source == "agent"`` → the world pair; ``source == "world"`` → every agent dir's pair
+    (via ``agents_root``, never a project-root glob — g-115-1405). Missing files are
+    simply absent from the list; the caller reads each with ``_read_jsonl``.
+    """
+    stores: List[Path] = []
+    if source == "agent":
+        bases = [ctx.paths.world]
+    else:
+        try:
+            root = ctx.paths.agents_root
+            bases = sorted(p for p in root.iterdir() if p.is_dir()) if root.is_dir() else []
+        except OSError:
+            bases = []
+    for base in bases:
+        for name in ("aspirations.jsonl", "aspirations-archive.jsonl"):
+            candidate = base / name
+            if candidate.is_file():
+                stores.append(candidate)
+    return stores
+
+
 def _agent_name(ctx) -> str:
     """Read X-Mind-Agent. Required for write paths — history and changelog
     record which agent made the change."""
@@ -1859,6 +1886,18 @@ def add_goal(ctx) -> "Response":  # type: ignore[name-defined]
         return Response.error(400, "invalid_body", f"body must be JSON goal object: {e}")
     if not isinstance(goal, dict):
         return Response.error(400, "invalid_body", "body must be a JSON object")
+    # Shape check BEFORE the pipeline: every later reader of ``verification`` assumes a
+    # dict (``(g.get("verification") or {}).get(...)`` passes a non-empty STRING straight
+    # through to ``.get``), so a string here used to surface as ``internal_error:
+    # AttributeError: 'str' object has no attribute 'get'`` — which a served small model
+    # read as "the daemon is broken" and answered by hand-writing the JSONL store
+    # (coach, zc-03, 2026-08-28). A shape error must name the shape.
+    if "verification" in goal and not isinstance(goal.get("verification"), dict):
+        return Response.error(
+            400, "validation_failed",
+            "verification must be an object, e.g. {\"outcomes\": [\"<criterion>\"], "
+            "\"checks\": [], \"preconditions\": []} — a bare string is not accepted "
+            f"(got {type(goal.get('verification')).__name__})")
 
     # UNKNOWN-FIELD GATE, ADD half ( item 3 — selection-stack review
     # 2026-08-21). The update endpoint has refused unknown field names since
@@ -4706,6 +4745,50 @@ def release(ctx) -> "Response":  # type: ignore[name-defined]
             # field. The stamp must not survive the claim it describes.
             goal.pop("claimed_by_sid", None)
 
+            # : CAPTURE THE RELEASE REASON. Optional and additive —
+            # with no `reason` query param this block is a no-op and release()
+            # behaves byte-identically to before.
+            #
+            # WHY THIS EXISTS. Release was the ONE exit that recorded nothing
+            # about why. The schema carries defer_reason, skip_reason,
+            # last_shelve_reason and cross_world_reason — a reason for every
+            # other way a goal leaves an agent's hands — and had no released_*
+            # counterpart to the claimed_by/claimed_at/claimed_by_sid triple.
+            # So when an agent claims a goal, discovers it cannot run HERE, and
+            # releases, that measured negative was destroyed at exactly the
+            # moment it was produced. Observed on : two agents claimed
+            # and released it, the signal was generated twice and lost twice,
+            # and every later box re-derived it from scratch.
+            #
+            # ACCUMULATE, NEVER OVERWRITE. The useful object is the SET of boxes
+            # that have tried and failed, so a second box's release must not
+            # erase the first's — a scalar here would have recorded exactly one
+            # row for the two-agent  case and lost the fact that two
+            # DISTINCT boxes failed, which is the whole signal.
+            #
+            # Consumers must FAIL OPEN: absence of a negative means unmeasured,
+            # never "runnable nowhere". Nothing scores off this field yet, by
+            # design — the capture accumulates first.
+            release_reason = (ctx.query.get("reason") or "").strip()
+            if release_reason:
+                import socket
+                try:
+                    box = socket.gethostname() or "unknown"
+                except Exception:
+                    box = "unknown"
+                negatives = goal.get("release_negatives")
+                if not isinstance(negatives, list):
+                    negatives = []
+                negatives.append({
+                    "box": box,
+                    "agent": agent,
+                    "reason": release_reason[:500],
+                    "at": datetime.now().isoformat(timespec="seconds"),
+                })
+                # Bounded so a goal repeatedly released cannot grow without
+                # limit; the newest entries are the ones a consumer wants.
+                goal["release_negatives"] = negatives[-20:]
+
             # : return in-progress work to the pool. goal-selector.py
             # treats `in-progress` as a SKIP status, so dropping the claim
             # WITHOUT this left the goal unclaimed AND unselectable — released
@@ -7281,6 +7364,16 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
             # naturally via :03d). Embedded goal ids are minted g-NNN-01..
             # in array order (their absence was enforced pre-lock).
             if auto_id:
+                # max+1 across live ∪ archive of THIS store AND every sibling store
+                # ( lineage): the world file and each agent file allocate
+                # from one id space, because goal ids (g-NNN-NN), claims, scores
+                # and the selector all key on the number alone. Two allocators
+                # scanning only their own file minted the same asp-002 twice on
+                # coach (world "Operating Rhythm" vs agent-level "Build Fantasy
+                # Football Data Infrastructure", 2026-08-28) and the selector
+                # aggregated both. Sibling stores are read outside their own lock:
+                # a concurrent add there can at worst hand out the same number
+                # once, which the archive/live checks below still refuse.
                 max_n = 0
                 for rec in items:
                     m = re.match(r"^asp-(\d{3,})$", str(rec.get("id") or ""))
@@ -7290,6 +7383,11 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
                     m = re.match(r"^asp-(\d{3,})$", str(rec.get("id") or ""))
                     if m:
                         max_n = max(max_n, int(m.group(1)))
+                for sibling in _sibling_aspiration_stores(ctx, source):
+                    for rec in _read_jsonl(sibling):
+                        m = re.match(r"^asp-(\d{3,})$", str(rec.get("id") or ""))
+                        if m:
+                            max_n = max(max_n, int(m.group(1)))
                 asp["id"] = f"asp-{max_n + 1:03d}"
                 asp_num = asp["id"][len("asp-"):]
                 for seq, g in enumerate(asp.get("goals", []), start=1):

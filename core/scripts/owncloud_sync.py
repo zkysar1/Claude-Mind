@@ -553,7 +553,7 @@ def _save_manifest(m: dict) -> None:
 _OWNERSHIP_STALE_SECONDS_DEFAULT = 3900
 
 
-def _owned_agents(be=None):
+def _owned_agents_with_provenance(be=None):
     """Resolve the agent dirs THIS machine owns for the sweep, from the LIVE DDB
     runner claims — the SAME single-runner claims the cross-machine lock uses
     (lodestar dynamic-ownership design §3). STORAGE_BACKEND is the ONLY signal;
@@ -578,7 +578,7 @@ def _owned_agents(be=None):
     claim table, not a local runner-token scan."""
     kind = os.environ.get("STORAGE_BACKEND", "local").strip().lower()
     if kind != "own-cloud":
-        return None
+        return None, "local-backend"
     # g-328-20: the diagnosable permission-gap type. Safe to import here — own-cloud
     # mode is confirmed above, so owncloud_backend is importable (get_backend below
     # depends on it, so this import cannot fail where get_backend would succeed).
@@ -590,7 +590,7 @@ def _owned_agents(be=None):
         # (SSOT), so the resolver's 'me' matches the claim's machine_id exactly.
         me = getattr(be_dyn, "machine_id", None)
         if not me or me == "unknown":
-            return set()  # cannot identify this machine → own none (safe)
+            return set(), "unknown-machine"  # cannot identify this machine → own none (safe)
         claims = be_dyn.list_runner_claims()
     except OwnCloudPermissionError:
         # g-328-20: a PERSISTENT IAM/permission gap (e.g. the daemon's creds lack
@@ -608,7 +608,7 @@ def _owned_agents(be=None):
               f"({type(exc).__name__}: {exc}); owning NO agent dirs this sweep "
               "(conservative — never own-all, never clobber a peer).",
               file=sys.stderr)
-        return set()
+        return set(), "transient-error"
     # Staleness threshold: env override (call-time, guard-594 calibration) ->
     # the live backend's runner_stale_seconds (SSOT — the SAME value
     # reclaim_if_stale enforces for the lock-break, parsed from the same env
@@ -628,7 +628,25 @@ def _owned_agents(be=None):
         if c.machine_id == me
         and c.agent_state == "RUNNING"
         and (now - c.heartbeat_at) < stale
-    }
+    }, "live-claims"
+
+
+def _owned_agents(be=None):
+    """Ownership set ONLY — the long-standing contract every sweep call site
+    uses (None = local backend/own-all, set = owned agents this sweep).
+
+    Thin delegate over _owned_agents_with_provenance so there is exactly ONE
+    implementation of the ownership rule (communication-clarity rule 5). Callers
+    that must DISTINGUISH a legitimately-empty set from the conservative
+    empty-set fail-safe call the provenance form directly — see g-115-8028: a
+    `no_claim` verdict ("retry can NEVER succeed from this box") is only honest
+    on provenance == "live-claims"; on "transient-error" the box may well own
+    the dir and simply failed to read the claim table, so that case must keep
+    the ordinary write_conflict rather than assert a structural impossibility.
+    Note OwnCloudPermissionError still propagates through both forms (g-328-20)
+    — a persistent IAM gap must fail LOUD, never degrade to "owns nothing"."""
+    result, _provenance = _owned_agents_with_provenance(be=be)
+    return result
 
 
 def _multi_machine() -> bool:
@@ -904,6 +922,15 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
         stats["in_sync"] += 1
         return local_md5
 
+    # g-115-7944: bind BEFORE the classification chain. `s3_at_baseline` is
+    # assigned only inside the `elif st is not None` branch below, so the
+    # single-machine MULTIPART fall-through reaches the push block with the
+    # name never bound — and the push-block gate that reads it would raise
+    # UnboundLocalError on exactly that path. False is also the correct
+    # default there: an uncomparable multipart ETag proves nothing about the
+    # baseline, so it must take the union lane exactly as it did before.
+    s3_at_baseline = False
+
     # Diverged. A multipart S3 ETag is uncomparable to a content md5 — neither the
     # in-sync check above nor the baseline check below is valid for it. Treat it as
     # UNCOMPARABLE: on a multi-machine setup a peer may own the object, so DEFER
@@ -1153,7 +1180,48 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
     # 03:09:14). The union is a superset of the push: local-only records still
     # land, S3-only records survive. S3-absent stays the plain PUT (nothing to
     # merge); unregistered stores keep the fenced mirror_put below.
-    if st is not None:
+    #
+    # CONFLICT RESOLVED g-306-284 (alpha reducer, 2026-08-27), then REVERSED by
+    # the suite an hour later. Two Bodies of this agent edited this line in
+    # OPPOSITE directions, both citing g-115-7944. The first resolution kept the
+    # UNGATED union; the full suite then failed three tests in
+    # test_owncloud_sync_merge_lanes.py that pin the GATE. Those three pass at the
+    # pre-merge base, so they were not pre-existing red: the losing ref had changed
+    # BOTH the code and its tests, and taking its tests while keeping the other
+    # code produced an incoherent half-merge. That is exactly the semantic
+    # incoherence sig-29 names when it says a clean auto-merge is not coherence and
+    # patch-id cannot see semantic supersession. The gate is now adopted.
+    #
+    # A CLAIM THAT DECIDED NOTHING BECAUSE IT IS FALSE, kept because it is the kind
+    # a reader re-trusts without checking: the keep-ungated side argued the gate was
+    # "mechanically not writable" — that s3_at_baseline is bound only in the
+    # `elif st is not None` arm, so the multipart path would reach here UNBOUND and
+    # raise NameError. It does not. Line ~932 binds `s3_at_baseline = False`
+    # unconditionally before the classification chain, under a comment naming this
+    # same goal; an earlier commit in this lineage had already closed that hazard,
+    # so the argument was stale when written.
+    #
+    # WHY THE GATE WINS, on evidence rather than on preference. Both sides describe
+    # the SAME state — local holds fewer records, S3 unchanged since baseline — and
+    # read it oppositely: a stale-copy REGRESSION (union restores; a plain put
+    # destroys) versus an intentional REMOVAL (union re-adds what was deliberately
+    # pruned, local never converges, and the divergence re-evaluates every sweep —
+    # the cc-08 lane-B wedge). The regression reading was the basis for keeping the
+    # union, on the asymmetry that destroyed bytes need version history while a
+    # wedge is merely loud. What defeats it is the gate side's own scope note: the
+    # narrowing CANNOT reach the g-115-7941 head-replacement, because that came
+    # through the sync_file (PostToolUse) lane, which calls _sync_one with NO
+    # baseline_md5 -> s3_at_baseline False -> merges regardless. A peer append moves
+    # S3 off baseline -> False -> merges. Only sweep()'s two call sites, which pass
+    # a manifest baseline, reach True. So the data-loss case the union was being
+    # preserved for is not reachable through the gated path, and the wedge it
+    # prevents is. _content_matches fails safe (missing/mismatched digest -> False),
+    # so every uncertainty keeps the union behaviour.
+    #
+    # STILL OPEN: distinguishing an intentional prune from a stale-copy regression
+    # AT THIS CALL SITE. A prune that announced itself (a caller flag, a tombstone)
+    # would let both readings be served instead of one being chosen.
+    if st is not None and not s3_at_baseline:
         merged_md5 = _try_merge_put(be, full, local_bytes, stats,
                                     counter="pushed_merged")
         if merged_md5 is not _MERGE_NA:
@@ -1200,9 +1268,138 @@ def _roots(be, only_root: str | None):
 _CONFLICT_STREAK_THRESHOLD = 3
 _CONFLICT_PERSISTENT_PRINT_CAP = 10
 
+# g-115-8027: the streak print above is stderr-only, and stderr is not captured
+# (daemon.log holds lifecycle events only), so a persistent wedge reaches a HUMAN
+# only via /prime Step 5.55 — session-start keyed AND display-only. A quiet box
+# with a long-lived chat session is therefore blind for the length of that
+# session: measured 2026-08-27, 11 tree files sat both-diverged for 400-1283
+# sweeps (~13-45h) with no code path able to surface them. This sweep already
+# runs at wall-clock cadence, so it is the one producer that does not need the
+# loop to be alive. Cross a HIGHER threshold than the print (a wedge is normal
+# for a few sweeps; 10 sweeps ~= 20 min is not) and post ONE board finding per
+# episode, which the existing insight-trigger-gate converts into an Investigate
+# goal on the next agent pass.
+_CONFLICT_ALERT_THRESHOLD = 10
+
+# Reserved key for the per-episode alert markers, stored INSIDE the streaks
+# artifact rather than in a sidecar. Two reasons, and the first is the binding
+# one: marker and streak are then written by the SAME tmp.replace, so they can
+# never disagree (a sidecar admits a torn state where the streak resets but the
+# marker survives, suppressing a real alert forever). Second, the artifact
+# already lives in RUNTIME_DIR — structurally outside the tree this sweep
+# observes — which is exactly the placement guard-2316 prescribes for a
+# detector's own state; a sidecar would inherit that property without adding
+# anything. Safe for the two live consumers: mirror_health.classify guards BOTH
+# of its comprehensions with `isinstance(v, int)` (mirror_health.py:63,71), so a
+# dict value under this key is ignored rather than mis-counted, and
+# agent-watchdog reads through mirror_health.probe(). A '#' prefix cannot
+# collide with a repo-relative path.
+_CONFLICT_ALERTED_KEY = "#alerted"
+
 
 def _conflict_streaks_path() -> Path:
     return _runtime_dir() / "owncloud-conflict-streaks.json"
+
+
+def _conflict_alert_transitions(old, new, threshold=_CONFLICT_ALERT_THRESHOLD):
+    """PURE. Which paths cross the alert threshold from below on this sweep?
+
+    `old` is the previous artifact (may carry the reserved marker map); `new` is
+    this sweep's {path: streak} map, which never contains the reserved key
+    because it is rebuilt from `stats["conflict_paths"]`.
+
+    Returns (crossings, carried):
+      crossings — sorted paths at/over `threshold` with no live marker
+      carried   — the prior marker map with entries for paths that stopped
+                  conflicting DROPPED
+
+    Dropping them is what gives episode semantics for free, and it inherits the
+    existing rebuild rule rather than adding a second one: `_update_conflict_streaks`
+    already rebuilds `new` from this sweep's conflicts alone, so a path that
+    resolves leaves the map on the next sweep. Its marker leaves with it, and a
+    later re-cross alerts again.
+    """
+    prev = old.get(_CONFLICT_ALERTED_KEY) if isinstance(old, dict) else None
+    if not isinstance(prev, dict):
+        prev = {}
+    carried = {k: v for k, v in prev.items() if k in new}
+    crossings = sorted(k for k, v in new.items()
+                       if isinstance(v, int) and v >= threshold
+                       and k not in carried)
+    return crossings, carried
+
+
+def _post_conflict_alert(rel_path: str, streak: int) -> bool:
+    """Post ONE board finding for a path that just crossed the alert threshold.
+
+    Routed through board-post.sh (guard-996: never raw-append a governed store;
+    the board is merge-registered, so the daemon wrapper is the sanctioned
+    path). FAIL-OPEN and time-bounded — this runs inside the fleet's sync sweep
+    and must never block or kill it. Returns True only on a confirmed post, so a
+    failure leaves the episode marker UNSET and the next sweep retries: the
+    alert is at-least-once, never lost, and still exactly-once per episode.
+
+    `subprocess` is imported lazily rather than at module scope so the daemon's
+    import surface is unchanged on the overwhelmingly common path where no
+    threshold is crossed.
+    """
+    try:
+        import subprocess
+        # Guard the insert: this runs once per crossing, and a bare
+        # sys.path.insert would grow the path unboundedly in a long-lived daemon.
+        _sd = str(Path(__file__).resolve().parent)
+        if _sd not in sys.path:
+            sys.path.insert(0, _sd)
+        from _runtime_bash import bash_cmd  # guard-580/581: never bare argv[0]
+
+        tags = ["insight_trigger", "severity:constrains",
+                "affects:%s" % rel_path, "mirror-wedge"]
+        # Route to an agent this box hosts when one is bound. If it is not, post
+        # the finding UNROUTED rather than guessing: a wrong requires_action_by
+        # is worse than an unrouted finding, which a human still reads.
+        agent = (os.environ.get("MIND_AGENT") or "").strip()
+        if agent:
+            tags.append("requires_action_by:%s" % agent)
+        msg = (
+            "MIRROR WEDGE (own-cloud): %s has been both-diverged for %d "
+            "consecutive sweeps (~%d min). Local and S3 both moved past the "
+            "manifest baseline, so the sweep skips this file every pass — local "
+            "edits never push and peer edits never pull, and reads are silently "
+            "stale. This will NOT self-heal. Repair with "
+            "/reconcile-owncloud-conflicts (check merge_handler_for first — a "
+            "merge-registered path needs the guard-4778 fenced route, not the "
+            "two-sweep fallback). Posted once per episode by the sync sweep "
+            "(g-115-8027); the streak resets when the file reconciles."
+            % (rel_path, streak, streak * 2)
+        )
+        # --author is LOAD-BEARING, and getting it wrong makes this whole
+        # mechanism a no-op. insight-trigger-gate._collect_triggers:260 skips
+        # any finding whose author == the reading agent ("self-triggers don't
+        # apply"). board-post.sh defaults the author to $MIND_AGENT, so a post
+        # written here would be authored by the SAME agent this alert must be
+        # routed to — the gate would skip it, no Investigate goal would ever be
+        # filed, and the alert would reach nobody while still looking delivered.
+        # Attributing the post to the sync daemon is both accurate (the daemon
+        # is a different actor from the agent) and what makes the routing work.
+        proc = subprocess.run(
+            bash_cmd(Path(__file__).resolve().parent / "board-post.sh",
+                     "--channel", "findings",
+                     "--type", "finding",
+                     "--author", "owncloud-sync",
+                     "--tags", ",".join(tags)),
+            input=msg, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=30,
+        )
+        if proc.returncode == 0:
+            return True
+        _sync_print("[sync] WARN: conflict-alert board post exit=%d %s"
+                    % (proc.returncode, (proc.stderr or "").strip()[:200]),
+                    file=sys.stderr)
+        return False
+    except Exception as e:  # noqa: BLE001 — fail-open by contract
+        _sync_print("[sync] WARN: conflict-alert board post failed (%s: %s)"
+                    % (e.__class__.__name__, str(e)[:160]), file=sys.stderr)
+        return False
 
 
 def _update_conflict_streaks(stats: dict) -> None:
@@ -1229,6 +1426,27 @@ def _update_conflict_streaks(stats: dict) -> None:
         _sync_print(f"[sync] CONFLICT-PERSISTENT: ... and "
               f"{len(persistent) - _CONFLICT_PERSISTENT_PRINT_CAP} more",
               file=sys.stderr)
+    # g-115-8027: escalate a wedge that OUTLIVES the print threshold from a
+    # stderr line nobody captures to a board finding an agent will act on. The
+    # log line fires on every crossing whether or not the post lands — that is
+    # the belt for the self-referential case where the board itself is the
+    # wedged store.
+    crossings, alerted = _conflict_alert_transitions(old, new)
+    for k in crossings:
+        posted = _post_conflict_alert(k, new[k])
+        if posted:
+            # Marker set ONLY on a confirmed post, so a failed post retries next
+            # sweep instead of being silently swallowed.
+            alerted[k] = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+        _sync_print(f"[sync] CONFLICT-ALERT ({new[k]} consecutive sweeps): {k} "
+              f"— crossed alert threshold {_CONFLICT_ALERT_THRESHOLD}; board post "
+              f"{'OK' if posted else 'FAILED (retry next sweep)'} (g-115-8027)",
+              file=sys.stderr)
+    stats["conflict_alerted"] = sorted(alerted)
+    # Added AFTER `persistent` is computed, so the reserved key never reaches
+    # that unguarded `v >= threshold` comprehension.
+    if alerted:
+        new[_CONFLICT_ALERTED_KEY] = alerted
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_suffix(".tmp")

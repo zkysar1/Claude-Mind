@@ -863,6 +863,47 @@ gates:
 # `id: origin-signal-gate` and `id: goal-duplication-gate` above for their
 # instrumented asymmetry rows.
 
+  - id: stale-summary-source-gate
+    script: core/scripts/gates/stale_summary_source.py
+    embedded: false
+    instrumented: true
+    sites:
+      - file: core/scripts/iteration-close.sh
+        phase: "--summary-file resolution (arg parse, before any phase runs)"
+      - file: core/scripts/closure-evidence-write.sh
+        phase: "--summary-file read (worker-loop close path)"
+    dominant_risk: FP
+    asymmetry_magnitude: moderate
+    keyword_bias: strict
+    override_flag: "--override-stale-source"
+    fp_cost: low
+    fn_cost: high
+    fp_description: >-
+      A wrong `block` refuses a narrative whose source file legitimately
+      predates the claim — the realistic case is a goal released and re-claimed
+      after the note was written, which resets claimed_at under an unchanged
+      file. Fully self-service and immediate: the refusal names
+      --override-stale-source and the write succeeds on retry. No data is lost,
+      because the refusal happens BEFORE the write.
+    fn_description: >-
+      A wrong `pass` lets one goal's closure evidence be silently replaced by
+      another's. Measured 2026-08-24 (alpha worker Body, cc-08): 36,260 chars
+      from a stale --summary-file landed over 6,580. The result is valid,
+      well-formed, LONGER prose, so no length- or content-based check can see
+      it and a later reader cannot tell what was actually shipped. Recovery
+      needs a .history dig by someone who already suspects the swap.
+    rb_evidence: "g-115-7425 (this gate); g-115-7361 (the falsification that surfaced it); guard-1701 (a gate-blocked heredoc never runs while a later $(cat) returns the previous occupant)"
+    tuning_notes: >-
+      Reference is the goal's claimed_at, falling back to session_start. The
+      fallback is MEASURED WEAK and that is recorded rather than smoothed over:
+      an autonomous session runs for days (5d 4h at build time), so almost every
+      candidate file postdates session_start and an unclaimed goal gets far less
+      protection. GRACE_SECONDS=120 is clock-skew allowance only, not a
+      tolerance dial. Deliberately does NOT gate on "the note cites another goal
+      id" — legitimate notes cite siblings constantly and the cross-record
+      protocol requires it (guard-2860: never relax an ownership test into a
+      pattern). No daemon half exists or should be added: this gate judges a
+      FILE PATH, which only the shell layer ever sees.
   - id: field-shrink-guard
     script: core/scripts/gates/field_shrink.py
     embedded: false
@@ -880,6 +921,24 @@ gates:
     fn_description: "A wrong `pass` lets long-lived goal prose be silently destroyed. Measured 2026-08-21 (g-115-105): a 36,904-char description was replaced with 3,467 chars belonging to an UNRELATED goal; the wrapper exited rc=0 and echoed the full record, the daemon wrote cleanly, the changelog logged an ordinary edit, and nothing warned. Recovered only from the .history copy-on-write pre-image (snapshot 2026-08-21T04-22-40 -> blob 3f597ef0). The generating mechanism is documented and recurrent: aspirations-update-goal.sh has no --append and drops unrecognized flags silently while the value REPLACES the field (guard-2525/2444/1691), and RMW against a truncated read does the same (guard-1251)."
     rb_evidence: []
     tuning_notes: "Threshold chosen by measuring who NEWLY gets refused, not by fitting the incident (guard-1562). description: 63 update pairs, 45 with old >= 2000 -> exactly ONE refused at 0.50/0.40/0.25 (the incident itself, ratio 0.09); every other description update GREW. outcome_note: 40 pairs, 8 with old >= 2000 -> ZERO refused below 0.50, closest legitimate shrink 0.55 (g-115-2571, 7784->4250). Chose ratio < 0.25 with a 2000-char floor: 2.2x below the closest legitimate shrink, 2.8x above the incident. Expect a noop-dominated log — that is the gate working, not idling. RETIREMENT CRITERION (recorded at birth, guard-769): retire when EITHER the wholesale-replace mechanism is gone (aspirations-update-goal.sh grows a real append mode AND unknown flags become a hard error) OR override/(block+override) > 0.5 over 20+ firings."
+
+  - id: bare-bash-authoring-gate
+    script: core/scripts/bare-bash-authoring-gate.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: ".claude/settings.json", phase: "PreToolUse[Bash] hook" }
+    dominant_risk: FN
+    asymmetry_magnitude: extreme
+    keyword_bias: strict
+    override_flag: "# allow-bare-bash: <reason>"
+    fp_cost: low
+    fn_cost: high
+    fp_description: "Legit POSIX-only inline Python refused; author adds the allow-bare-bash marker or resolves the binary explicitly (~30s)."
+    fn_description: "A bare-bash argv reaches win32 CreateProcess, which searches System32 before PATH, hits the WSL launcher and BLOCKS FOREVER on a dead LxssManager (guard-580)."
+    rb_evidence: ["rb-5255", "rb-5143"]
+    tuning_notes: "Instrumented 2026-08-27 (g-115-3325). Records the deny (block) and the two silent-breakage paths (fail_open: engine_unavailable, scan_source_raised). The hot path -- a Bash command carrying no inline Python -- is deliberately NOT logged: it fires on essentially every Bash call, so a record there would be pure volume with no diagnostic value, and the goal's own criterion 2 requires an approved command to produce no line. Hook liveness is covered instead by a settings.json registration assertion (guard-1943 pattern), not by per-command telemetry."
+    retirement_eligible: true
 
 pending_audit:
   - audit-schema-gate.py

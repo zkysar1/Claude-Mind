@@ -176,6 +176,13 @@ _SUPERSEDED_NOTE_RE = re.compile(r"supersed(?:ed|es|ing)\b", re.IGNORECASE)
 # reachable, and those rows are the entire migration population.
 SUPERSEDABLE_STATUSES = ("skipped", "superseded")
 
+# The migration fallback's SCOPE. A narrowed search has two invisible premises
+# — PATTERN and SCOPE (guard-1722) — so both are named: the PATTERN is
+# `_GOAL_ID_RE`, and the SCOPE is the SENTENCE carrying the supersession word.
+# `\n` ends a sentence too, because these notes are markdown and a heading or
+# bullet ends the thought without a period.
+_SENTENCE_END_RE = re.compile(r"\.\s|\.$|\n")
+
 
 def supersession_target(goal):
     """Return the goal-id this goal was superseded BY, or None.
@@ -186,11 +193,37 @@ def supersession_target(goal):
          MIGRATION FALLBACK for rows closed before the field existed
 
     The fallback is deliberately narrow. It requires BOTH a supersession word
-    AND a goal id, and it takes the FIRST id in the note. A note that merely
-    MENTIONS another goal is not a supersession, and a bare `*supersed*`
-    substring with no id resolves to nothing rather than to a guess — an
-    over-eager fallback here would silently satisfy a dependency that is not
-    actually met, which is strictly worse than the freeze this fixes.
+    AND a goal id that FOLLOWS it inside the SAME SENTENCE, and it never
+    returns the goal's OWN id. A note that merely MENTIONS another goal is not
+    a supersession, and a bare `*supersed*` substring with no id in scope
+    resolves to nothing rather than to a guess — an over-eager fallback here
+    would silently satisfy a dependency that is not actually met, which is
+    strictly worse than the freeze this fixes. That asymmetry is what makes
+    this resolver safe to consult at SELECTION time and not only in
+    diagnostics.
+
+    WHY SENTENCE SCOPE AND NOT "FIRST ID IN THE NOTE" (g-115-7893, measured
+    2026-08-27 over the 32 live pointer-carrying rows). First-id is wrong in
+    three distinct ways, all of them live in the store:
+
+      * SELF-MATCH. The closure-note convention opens with a markdown header
+        naming the goal itself (`# g-001-374 — SKIPPED: duplicate of
+        g-001-372`), so the first id IS the goal and `resolve_dependency`
+        answered `cycle` — a false data-defect verdict on 4 rows whose real
+        target was one clause away and completed.
+      * WRONG TARGET. `g-364-80` says the chain "was superseded by g-364-11"
+        while naming g-364-77 earlier; `g-326-343` names its corrected
+        successor after the marker and an unrelated id before it.
+      * SUPERSEDING A NON-GOAL. "SUPERSEDES the prior-occurrence note",
+        "superseding the convention's four-item enumeration", "a premise the
+        user superseded" — real marker, non-goal object, unrelated first id.
+        Six further rows read "superseded by weeks of later runs on the same
+        workflow": superseded by TIME, with no goal id in the sentence at all.
+
+    Sentence scope drops all of those and keeps every adjudicated true
+    positive, including the g-364-77..80 -> g-364-11 chain that motivated this
+    module: 16 targets unchanged, 4 corrected, 12 dropped (each one read and
+    confirmed a non-supersession, or a supersession that names no successor).
     """
     if not isinstance(goal, dict):
         return None
@@ -200,10 +233,18 @@ def supersession_target(goal):
     if (goal.get("status") or "") not in SUPERSEDABLE_STATUSES:
         return None
     note = goal.get("outcome_note") or ""
-    if not isinstance(note, str) or not _SUPERSEDED_NOTE_RE.search(note):
+    if not isinstance(note, str):
         return None
-    m = _GOAL_ID_RE.search(note)
-    return m.group(0) if m else None
+    own = goal.get("id")
+    for marker in _SUPERSEDED_NOTE_RE.finditer(note):
+        end = _SENTENCE_END_RE.search(note, marker.end())
+        sentence = note[marker.end(): end.start() if end else len(note)]
+        for hit in _GOAL_ID_RE.finditer(sentence):
+            # A goal never supersedes itself. Skipping the self-mention is what
+            # lets the real target, one clause later, be found at all.
+            if hit.group(0) != own:
+                return hit.group(0)
+    return None
 
 
 def resolve_dependency(target_id, goal_index, terminal_statuses=TERMINAL_STATUSES):
@@ -247,3 +288,45 @@ def resolve_dependency(target_id, goal_index, terminal_statuses=TERMINAL_STATUSE
         if not nxt:
             return "open", current, seen
         current = nxt
+
+
+def supersession_satisfied_ids(goal_index, already_done=()):
+    """Ids that are NOT plainly done but whose supersession chain IS completed.
+
+    The bridge between this module and any caller that keeps a flat `done_ids`
+    SET — goal-selector.py's `global_done_ids` is the one this was written for.
+    Such a caller asks "is this dependency id done?" by set membership, which
+    cannot follow a pointer; this returns the ids to ADD so that it can.
+
+    STRICTLY ADDITIVE, and that is the safety property, not a convenience: it
+    returns a set to union IN, never one to subtract, so a caller's existing
+    verdicts are unreachable from here. The worst a bug in this function can do
+    is fail to un-freeze something — never freeze something new, and never
+    satisfy a dependency by REMOVING an id the caller had already resolved.
+
+    `already_done` is skipped rather than re-resolved: an id the caller already
+    counts as done needs no pointer walk, and skipping it keeps the cost
+    proportional to the pointer population rather than the store. Measured on
+    the live store (3,182 goals, 2026-08-27): 1.7 ms for the whole scan, of
+    which the resolve half is 0.4 ms across 20 pointer-carrying rows — the
+    `supersession_target` pre-filter is what keeps it there, so keep it first.
+
+    `satisfied` is the only verdict that adds an id. `open` means the
+    obligation MOVED but was not discharged, `unknown` means the successor is
+    absent from the index (guard-1890: absence is ignorance, not evidence), and
+    `cycle` is a data defect — none of the three is a reason to call the work
+    done.
+    """
+    if not isinstance(goal_index, dict):
+        return set()
+    done = set(already_done or ())
+    out = set()
+    for gid, goal in goal_index.items():
+        if gid in done:
+            continue
+        if not supersession_target(goal):
+            continue
+        verdict, _resolved, _chain = resolve_dependency(gid, goal_index)
+        if verdict == "satisfied":
+            out.add(gid)
+    return out

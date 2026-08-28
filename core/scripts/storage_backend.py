@@ -181,6 +181,10 @@ class StorageBackend(Protocol):
     #: read-modify-write. Backends that cannot conflict (LocalBackend) set it
     #: to an empty tuple so ``except backend.conflict_error`` matches nothing.
     conflict_error: "type[BaseException] | tuple[type[BaseException], ...]"
+    #:  twin of conflict_error for the STRUCTURAL non-ownership case.
+    #: Empty tuple on backends that cannot raise it, so
+    #: ``except backend.no_claim_error`` / isinstance matches nothing there.
+    no_claim_error: "type[BaseException] | tuple[type[BaseException], ...]" = ()
 
     # --- reads -------------------------------------------------------------
     def read_bytes(self, path: PathLike, *, force_fresh: bool = False) -> bytes: ...
@@ -258,6 +262,8 @@ class LocalBackend:
     #: transparent single pass (zero added I/O on the default local path).
     #: See StorageBackend.conflict_error and OwnCloudBackend.conflict_error.
     conflict_error: tuple = ()
+    #: : LocalBackend has no ownership concept — never raises.
+    no_claim_error: tuple = ()
 
     # --- locking: operates on the LITERAL lock-file path the caller passes,
     #     byte-for-byte identical to the legacy _fileops.acquire_lock /

@@ -207,6 +207,17 @@ def test_persist_failure_is_reported_as_error_not_as_the_computed_verdict():
     the tool reports "seeded"/"ratcheted" for a baseline it never persisted —
     stderr being the only contradicting signal, which no JSON consumer reads.
     (Adversarial fresh-eyes finding, g-115-3946.)
+
+    ⚠ THIS TEST DOES NOT EXERCISE THAT DEFECT, and passes identically on
+    the broken code. An unwritable baseline path fails at READ time, INSIDE
+    locked_modify_yaml but BEFORE `_modify` is called -- so `captured` is
+    still empty and `setdefault` behaves correctly. Measured 2026-08-27
+    (g-115-4275): pre-patch experience-orphan-ratchet returned
+    verdict='error' under exactly this condition. What this test DOES pin
+    is the read-time-failure path, which is worth keeping.
+    The defect itself is pinned by
+    test_ratchet_persist_failure_family.py, which fails the write AFTER the
+    modifier has run (7 of 8 family members fail there at pre-patch HEAD).
     """
     with tempfile.TemporaryDirectory(prefix="tcr_persistfail_") as d:
         tmp = Path(d)

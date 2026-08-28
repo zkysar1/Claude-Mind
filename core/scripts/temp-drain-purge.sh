@@ -76,6 +76,17 @@
 #   "stray_preserved_git":N,"stray_preserved_git_dirs":[...],          ()
 #   "watermark":"ISO"|null,"watermark_source":"flag|file|absent|invalid|disabled|n/a",
 #   "citation_lookup":"ok"|"failed"|"n/a",
+#   "age_skipped":N,"age_skipped_names":[...],                        ()
+#   "stray_age_skipped":N,"stray_age_skipped_dirs":[...],             ()
+#     — what the --age-min guard EXCLUDED FROM EVALUATION, per lane. Reported
+#     as their OWN fields and never folded into would_purge/stray_would_purge
+#     (guard-4178). Without them, a path absent from every lane is ambiguous
+#     between "evaluated and preserved" and "never looked at", and the
+#     ambiguity lands hardest on the operator who just MOVED a file to
+#     protect it — the move refreshes the mtime, so the confirming re-run is
+#     the one most likely to skip it, silently, in the safe-looking
+#     direction. A nonzero age_skipped means: re-run with --age-min 0 to see
+#     those paths' real lane verdicts before concluding anything.
 #   "dry_run":bool,"age_min":N,"drained_age_days":N,
 #   "temp_dir":"..."} — the no-temp-dir no-op path emits the SAME field set
 #   (all-zero lane fields, citation_lookup "n/a") so both exit paths share one
@@ -278,6 +289,12 @@ _purge_find_predicate() {
     fi
     PURGE_FIND_PRED+=( ! -name "$_b" )
   done
+  # : snapshot the predicate WITHOUT the age guard, so main() can
+  # report what the guard EXCLUDED. Absence from every lane otherwise reads as
+  # "safe" when it may mean "never evaluated" — and the reader most likely to
+  # hit it is the operator who just refreshed an mtime by moving a file to
+  # protect it (guard-2672 is the behavioral half; this is the tool half).
+  PURGE_FIND_PRED_NOAGE=( "${PURGE_FIND_PRED[@]}" )
   PURGE_FIND_PRED+=( -mmin "+$age_min" )
 }
 
@@ -290,7 +307,8 @@ _purge_find_predicate() {
 # rot unnoticed.
 _purge_find_predicate_legacy() {
   local age_min="$1"
-  PURGE_FIND_PRED=( -maxdepth 1 -type f ! -name '.*' \( \( "${_EPHEMERA_GLOB[@]}" \) -o -empty \) -mmin "+$age_min" )
+  PURGE_FIND_PRED_NOAGE=( -maxdepth 1 -type f ! -name '.*' \( \( "${_EPHEMERA_GLOB[@]}" \) -o -empty \) )
+  PURGE_FIND_PRED=( "${PURGE_FIND_PRED_NOAGE[@]}" -mmin "+$age_min" )
 }
 
 # _cited_basenames <script_dir> — echo one basename per line for every temp/
@@ -551,8 +569,20 @@ cleanup_stray_dirs() {
   # surfaces them as stray_preserved_git / stray_preserved_git_dirs so the
   # preservation is checkable from outside, not just asserted.
   STRAY_PRESERVED_GIT=""
+  STRAY_AGE_SKIPPED_DIRS=""
+  STRAY_AGE_SKIPPED=0
   [ -d "$temp_dir" ] || { echo 0; return 0; }
   list="$(find "$temp_dir" -mindepth 1 -maxdepth 1 -type d ! -name drained -mmin "+$age_min" 2>/dev/null || true)"
+  # : compute the age-EXCLUDED dirs BEFORE the empty-list early
+  # return below. That ordering is the whole point: the reported failure was a
+  # dir that appeared in NO lane because the protective move that was meant to
+  # save it refreshed its mtime, and an early return here would drop the very
+  # dir the operator came to check. Reported as its own field, never merged
+  # into the purge counts (guard-4178).
+  STRAY_AGE_SKIPPED_DIRS="$(find "$temp_dir" -mindepth 1 -maxdepth 1 -type d ! -name drained ! -mmin "+$age_min" 2>/dev/null || true)"
+  if [ -n "$STRAY_AGE_SKIPPED_DIRS" ]; then
+    STRAY_AGE_SKIPPED="$(printf '%s\n' "$STRAY_AGE_SKIPPED_DIRS" | grep -c . || true)"
+  fi
   [ -z "$list" ] && { echo 0; return 0; }
   # Iterate candidates: preserve archive-before-delete archives ();
   # `count` reflects ONLY dirs actually purged (or that WOULD purge under
@@ -653,7 +683,7 @@ main() {
     # citation_lookup is "n/a" here (Lane 1 never ran) rather than omitted: the
     # field must exist on BOTH exit paths or a strict-field consumer KeyErrors
     # on a fresh agent — the same schema-parity finding the lane fields carry.
-    printf '{"purged":0,"would_purge":0,"files":[],"drained_gc_purged":0,"drained_gc_would_purge":0,"drained_gc_files":[],"stray_purged":0,"stray_would_purge":0,"stray_preserved_git":0,"stray_preserved_git_dirs":[],"watermark":null,"watermark_source":"n/a","citation_lookup":"n/a","backend_propagation":{"skipped":"no-temp-dir"},"dry_run":%s,"age_min":%d,"drained_age_days":%d,"temp_dir":"%s","note":"temp dir does not exist"}\n' \
+    printf '{"purged":0,"would_purge":0,"files":[],"drained_gc_purged":0,"drained_gc_would_purge":0,"drained_gc_files":[],"stray_purged":0,"stray_would_purge":0,"stray_preserved_git":0,"stray_preserved_git_dirs":[],"watermark":null,"watermark_source":"n/a","citation_lookup":"n/a","backend_propagation":{"skipped":"no-temp-dir"},"age_skipped":0,"age_skipped_names":[],"stray_age_skipped":0,"stray_age_skipped_dirs":[],"dry_run":%s,"age_min":%d,"drained_age_days":%d,"temp_dir":"%s","note":"temp dir does not exist"}\n' \
       "$([ "$DRY_RUN" -eq 1 ] && echo true || echo false)" "$AGE_MIN" "$DRAINED_AGE_DAYS" "$temp_dir"
     return 0
   fi
@@ -712,6 +742,20 @@ EOF
   local ephemera_list count
   ephemera_list="$(find "$temp_dir" "${PURGE_FIND_PRED[@]}" 2>/dev/null || true)"
   if [ -z "$ephemera_list" ]; then count=0; else count="$(printf '%s\n' "$ephemera_list" | grep -c . || true)"; fi
+
+  # : what the AGE GUARD excluded from Lane 1 — reported as its OWN
+  # fields, never folded into `would_purge`/`files` (guard-4178: a
+  # not-applicable outcome summed into the evaluated one is invisible on BOTH
+  # axes). Same predicate minus the -mmin element, minus what actually
+  # matched: exact set difference, so a file sitting exactly ON the boundary
+  # lands in one set or the other rather than falling through a `-mmin -N`
+  # complement that excludes it from both.
+  local age_skipped_list age_skipped_count
+  age_skipped_list="$(find "$temp_dir" "${PURGE_FIND_PRED_NOAGE[@]}" 2>/dev/null || true)"
+  if [ -n "$age_skipped_list" ] && [ -n "$ephemera_list" ]; then
+    age_skipped_list="$(printf '%s\n' "$age_skipped_list" | grep -vxF -f <(printf '%s\n' "$ephemera_list") || true)"
+  fi
+  if [ -z "$age_skipped_list" ]; then age_skipped_count=0; else age_skipped_count="$(printf '%s\n' "$age_skipped_list" | grep -c . || true)"; fi
 
   # Delete FROM THE CAPTURED LIST (per-file bounded find, the Lane-2 idiom),
   # not by re-running the predicate: the backend delete-propagation pass below
@@ -860,6 +904,38 @@ $STRAY_PRESERVED_GIT
 EOF
   fi
   git_kept_json="$git_kept_json]"
+
+  # : age-EXCLUDED sets as JSON arrays, same pure-bash idiom as
+  # files_json above. These answer "what did the guard never look at?" — the
+  # question a reader cannot otherwise ask, because a skipped path is absent
+  # from every lane and absence reads as safety.
+  local age_skipped_json='[' _as_first=1 _as _asb
+  if [ "$age_skipped_count" -gt 0 ]; then
+    while IFS= read -r _as; do
+      [ -z "$_as" ] && continue
+      _asb="$(basename "$_as")"
+      [ "$_as_first" -eq 0 ] && age_skipped_json="$age_skipped_json,"
+      age_skipped_json="$age_skipped_json\"$_asb\""
+      _as_first=0
+    done <<EOF
+$age_skipped_list
+EOF
+  fi
+  age_skipped_json="$age_skipped_json]"
+
+  local stray_age_json='[' _sa_first=1 _sa _sab
+  if [ "${STRAY_AGE_SKIPPED:-0}" -gt 0 ]; then
+    while IFS= read -r _sa; do
+      [ -z "$_sa" ] && continue
+      _sab="$(basename "$_sa")"
+      [ "$_sa_first" -eq 0 ] && stray_age_json="$stray_age_json,"
+      stray_age_json="$stray_age_json\"$_sab\""
+      _sa_first=0
+    done <<EOF
+${STRAY_AGE_SKIPPED_DIRS:-}
+EOF
+  fi
+  stray_age_json="$stray_age_json]"
   local wm_json=null
   [ -n "$WM_VAL" ] && wm_json="\"$WM_VAL\""
 
@@ -869,10 +945,11 @@ EOF
   else
     purged="$count"; gc_purged="$gc_count"; stray_purged="$stray_count"
   fi
-  printf '{"purged":%d,"would_purge":%d,"files":%s,"drained_gc_purged":%d,"drained_gc_would_purge":%d,"drained_gc_files":%s,"stray_purged":%d,"stray_would_purge":%d,"stray_preserved_git":%d,"stray_preserved_git_dirs":%s,"watermark":%s,"watermark_source":"%s","unmanaged_dotfiles":%d,"unmanaged_dotfile_names":%s,"citation_lookup":"%s","backend_propagation":%s,"dry_run":%s,"age_min":%d,"drained_age_days":%d,"temp_dir":"%s"}\n' \
+  printf '{"purged":%d,"would_purge":%d,"files":%s,"drained_gc_purged":%d,"drained_gc_would_purge":%d,"drained_gc_files":%s,"stray_purged":%d,"stray_would_purge":%d,"stray_preserved_git":%d,"stray_preserved_git_dirs":%s,"watermark":%s,"watermark_source":"%s","unmanaged_dotfiles":%d,"unmanaged_dotfile_names":%s,"citation_lookup":"%s","backend_propagation":%s,"age_skipped":%d,"age_skipped_names":%s,"stray_age_skipped":%d,"stray_age_skipped_dirs":%s,"dry_run":%s,"age_min":%d,"drained_age_days":%d,"temp_dir":"%s"}\n' \
     "$purged" "$count" "$files_json" "$gc_purged" "$gc_count" "$gc_files_json" "$stray_purged" "$stray_count" \
     "$git_kept_count" "$git_kept_json" "$wm_json" "$WM_SRC" \
     "$dot_count" "$dot_files_json" "$citation_lookup" "$backend_prop" \
+    "$age_skipped_count" "$age_skipped_json" "${STRAY_AGE_SKIPPED:-0}" "$stray_age_json" \
     "$([ "$DRY_RUN" -eq 1 ] && echo true || echo false)" "$AGE_MIN" "$DRAINED_AGE_DAYS" "$temp_dir"
   return 0
 }

@@ -45,6 +45,9 @@ TESTS_DIR = Path(__file__).resolve().parent
 SCRIPT_DIR = TESTS_DIR.parent            # core/scripts
 PROJECT_ROOT = SCRIPT_DIR.parent.parent  # repo root
 
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+
 CONTEXT_READS = SCRIPT_DIR / "context-reads.py"
 LOADER = SCRIPT_DIR / "load-aspirations-compact.sh"
 
@@ -55,8 +58,10 @@ SUMMARY_NAME = "aspirations-compact-summary.json"
 FULL_NAME = "aspirations-compact.json"
 
 
-def _norm(p):
-    return str(Path(p).resolve()).replace("\\", "/")
+# : was a hand-rolled resolve-then-replace copy of
+# context-reads.normalize_path — the ordering  proved wrong.
+# Use the real function; never re-implement it here.
+from _context_reads_helper import norm_path as _norm  # noqa: E402
 
 
 @contextmanager

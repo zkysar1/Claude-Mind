@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import datetime
 import re
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -290,6 +291,32 @@ def parse_pins(text: str):
                 idx = header.index(col) if col in header else -1
                 pin[col] = _norm(cells[idx]) if 0 <= idx < len(cells) else ""
             pins.append(pin)
+        #  defect TWO: FOUR registry states produce ONE observable.
+        # Measured against the live file — reformatting the table to a bullet
+        # list, removing a column, renaming the heading, and the registry being
+        # genuinely ABSENT all yield zero pins with no error and no log, against
+        # a baseline that parses one. The fail-open is CORRECT and stays: a
+        # broken registry must never block a claim.
+        #
+        # But the gate CAN tell a human reformat from a deliberate retirement,
+        # and was simply not saying so. When the heading still MATCHES and the
+        # section still HAS CONTENT and yet zero rows parsed, that is not a
+        # retired registry — every pin was deleted by editing, or the table
+        # shape changed underneath the parser. Say it loudly and keep allowing.
+        #
+        # Deliberately NOT warned: heading absent (that is the retired/absent
+        # case and is indistinguishable from "this world has no pins" — warning
+        # there would fire on every world that never adopted the feature).
+        if not pins and section.strip():
+            print(
+                "[lane-pin] WARNING: '%s' matched the Standing Lane Pins "
+                "heading and the section is non-empty, but ZERO pin rows "
+                "parsed. Every pin is unenforced right now. This is a table-"
+                "shape or row-content problem, not a retirement — a retired "
+                "registry has no heading. Allowing the claim (fail-open by "
+                "design)." % (REGISTRY_RELPATH,),
+                file=sys.stderr,
+            )
     except Exception:
         return []
     return pins
@@ -453,6 +480,39 @@ def evaluate(agent, goal, *, registry_text=None, world_dir=None,
 
         text = registry_text if registry_text is not None else _read_registry(world_dir)
         if not text:
+            #  / foxtrot N=45 (2026-08-13): the FIFTH state, reachable
+            # from the CALLER side rather than the registry side. A caller that
+            # supplies NEITHER registry_text NOR world_dir gets
+            # would_block=False / reason="no-pin" -- byte-identical to "this
+            # agent has no pin". Measured: that call returned no-pin for all 8
+            # probed goals INCLUDING one aspirations-claim.sh had refused with
+            # lane_pin_refused ~19h earlier; supplying world_dir reproduced the
+            # block exactly. A clean, confident, structurally-inert PASS with
+            # nothing to notice.
+            #
+            # Same observable and same direction as the heading-matched/
+            # zero-rows case parse_pins warns about, so it gets the same
+            # treatment and the same posture: warn loudly, still fail open.
+            # The asymmetry this closes is that the `except` branch below
+            # already WARNs (citing guard-1977 -- a gate that silently declines
+            # to run reports success by default) while this degrade path stayed
+            # silent; the lesson had been applied to the raise-path only.
+            #
+            # DELIBERATELY NARROW: a world_dir that WAS supplied but holds no
+            # registry is a legitimate absence (a fresh world), the analogue of
+            # parse_pins' silent heading-absent branch. Only the
+            # nothing-to-look-at case is a caller wiring defect.
+            if registry_text is None and world_dir is None:
+                print(
+                    "[lane-pin] WARNING: evaluate() was given NEITHER "
+                    "registry_text NOR world_dir, so the gate could not look at "
+                    "the registry at all. Returning 'no-pin', which is "
+                    "indistinguishable from 'this agent has no pin' -- every "
+                    "pin is unenforced for this call. This is a CALLER wiring "
+                    "problem, not a retirement. Allowing the claim (fail-open "
+                    "by design).",
+                    file=sys.stderr,
+                )
             return allow  # no registry reachable -> fail open
 
         pins = [p for p in parse_pins(text) if p["agent"] == agent_name]

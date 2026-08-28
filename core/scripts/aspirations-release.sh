@@ -28,7 +28,7 @@ GOAL_NORMALIZE_TARGET=positional source "$CORE_ROOT/scripts/_goal-arg-normalize.
 source "$CORE_ROOT/scripts/_argv_strict.sh"
 
 # ONE literal, referenced by BOTH the --help arm and the refusal ().
-_ACCEPTED_FLAGS="--source"
+_ACCEPTED_FLAGS="--source --reason"
 
 # --- Parse args -----------------------------------------------------------
 GOAL_ID=""
@@ -52,6 +52,21 @@ GOAL_ID=""
 #
 # DEFAULT IS "world", so every existing caller is byte-identical.
 SOURCE_VAL="world"
+
+# WHY --reason EXISTS (). Release was the ONE exit that recorded
+# nothing about WHY a goal left an agent's hands — the schema carries
+# defer_reason, skip_reason, last_shelve_reason and cross_world_reason, and had
+# no released_* counterpart at all. So the measured negative produced at exactly
+# the moment an agent discovers it cannot run a goal HERE was destroyed on the
+# spot, and every later box re-derived it (observed: , claimed and
+# released by two agents, signal generated twice and lost twice).
+#
+# EMPTY BY DEFAULT and omitted from the query when empty, so every existing
+# caller is byte-identical — this must stay a pure addition to a write path the
+# whole fleet uses. Note the flag is EXTENDED into _ACCEPTED_FLAGS rather than
+# loosening the `-*)` refusal: that strict refusal is the  fix and is a
+# feature, not an obstacle.
+REASON_VAL=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -79,11 +94,25 @@ while [[ $# -gt 0 ]]; do
             SOURCE_VAL="$2"; shift 2;;
         --source=*)
             SOURCE_VAL="${1#--source=}"; shift;;
+        --reason)
+            # Same ARITY GUARD as --source above, and for the same reason
+            # (): with --reason as the FINAL argument there is no $2,
+            # so `shift 2` returns 1 and `set -e` kills the script silently at
+            # rc=1 — indistinguishable from a transport failure. Exit 2 keeps
+            # "you invoked me wrong" separate from "the daemon is unreachable".
+            if [ $# -lt 2 ]; then
+                echo "Error: --reason requires a value." >&2
+                echo "  Accepted flags: $_ACCEPTED_FLAGS" >&2
+                exit 2
+            fi
+            REASON_VAL="$2"; shift 2;;
+        --reason=*)
+            REASON_VAL="${1#--reason=}"; shift;;
         -h|--help)
             # BEFORE the -*) arm: --help is a `-*` token, and refusing it with
             # exit 2 would be a regression the refusal introduced rather than a
             # defect it fixed (). Help exits 0.
-            argv_strict_help "$(basename "$0")" "<goal-id> [--source world|agent]" \
+            argv_strict_help "$(basename "$0")" "<goal-id> [--source world|agent] [--reason <why>]" \
                 "$_ACCEPTED_FLAGS";;
         -*)
             argv_strict_refuse_unknown "$(basename "$0")" "$1" "$_ACCEPTED_FLAGS";;
@@ -135,6 +164,13 @@ QUERY="id=${GOAL_ID}&source=${SOURCE_VAL}"
 # every Bash call by bash-agent-inject.py.
 if [ -n "${MIND_SID:-}" ]; then
     QUERY="${QUERY}&sid=$(rt_url_encode "$MIND_SID")"
+fi
+# : omitted entirely when empty, so a release with no --reason sends
+# a byte-identical query to what it sent before this flag existed. URL-encoded
+# via the same helper as the sid above — a reason is free text and will contain
+# spaces and `&`.
+if [ -n "$REASON_VAL" ]; then
+    QUERY="${QUERY}&reason=$(rt_url_encode "$REASON_VAL")"
 fi
 
 # --- in_flight clear () -----------------------------------------

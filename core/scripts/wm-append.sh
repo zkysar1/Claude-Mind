@@ -99,11 +99,64 @@ source "$CORE_ROOT/scripts/_runtime.sh"
 # parse it); diagnostics go to STDERR, which is the channel a non-blocking
 # notice belongs on.
 rc=0
+# RELAY THE DAEMON'S STDERR ON FAILURE (). This call used to end in
+# `2>/dev/null`, which discarded the one thing a caller needs when the append is
+# REFUSED. wm.py's _validate_knowledge_debt_entry rejects an unresolvable
+# node_key with a 250-byte diagnostic naming the three valid forms; through this
+# wrapper the caller saw rc=1 and ZERO bytes, so a correct, deliberate refusal
+# was indistinguishable from an unexplained failure -- and the comment at the
+# top of this file already recorded that the stderr was being discarded.
+# guard-3662 exactly: `2>/dev/null` on a deliberately-hardened script re-buries
+# the refusal that was built to save you. guard-114: wrappers invoking external
+# commands must not suppress stderr.
+# Relayed ONLY on non-zero rc, so the success path stays as quiet as before and
+# the stdout contract (silent on success; callers parse it) is untouched.
+_WM_ERR="$(mktemp 2>/dev/null || echo /tmp/wm-append-err.$$)"
 RESP="$(rt_call POST /v1/wm/append \
     --query "slot=$(rt_url_encode "$SLOT")" \
-    --body-string "$BODY" 2>/dev/null)" || rc=$?
+    --body-string "$BODY" 2>"$_WM_ERR")" || rc=$?
+if [ "$rc" != "0" ] && [ -s "$_WM_ERR" ]; then cat "$_WM_ERR" >&2; fi
+rm -f "$_WM_ERR"
 
 _emit_notice() {
+    # : WHERE the write landed. wm-append routes some slots to the YAML
+    # TOP LEVEL (TOP_LEVEL_KEYS in wm_write.py) and the rest under the `slots:`
+    # mapping, and until now nothing at the call site said which. That is not a
+    # cosmetic detail: a hand-rolled read of the wrong level returns a clean,
+    # plausible 0 that is byte-identical to "this slot is empty", so the caller
+    # gets no error to notice. Measured in ONE session, in BOTH directions
+    # () — top-level `goals_completed_this_session` read as 0 under
+    # `slots:`, and `spark_capture` read as 0 at the top level, each immediately
+    # after a successful append. Placement is also consulted by the PRUNE path,
+    # so it is not merely a cosmetic routing detail: wm.py's eviction loop
+    # iterates the `slots:` mapping (`slots[slot_name] = None`), and
+    # `_is_cadence_tracker` special-cases TOP_LEVEL_KEYS explicitly. The
+    # eviction ASYMMETRY between a top-level key and a field nested inside a
+    # slot is guard-1544's subject — read it there rather than inferring a
+    # mechanism from this line; the two senses of "top-level" in play (YAML top
+    # level vs slot-rather-than-nested-field) are easy to conflate, and an
+    # earlier draft of this comment did exactly that.
+    #
+    # Printed on EVERY append, not just the surprising case: which case is
+    # surprising depends on the reader's prior, and a notice that fires only when
+    # someone already guessed right is the defect restated. Extract with
+    # [^"]* rather than a greedy .* — the value is a short enum, and a greedy
+    # match would swallow the rest of the JSON object.
+    _p="$(printf '%s\n' "$RESP" \
+        | sed -n 's/.*"placement"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+    # `if`/`case`, never an `&&` chain: this file runs under `set -e`, so a
+    # trailing `&&` list whose final test fails returns non-zero from the
+    # function and aborts the wrapper before its `exit 0` (the lesson already
+    # learned one branch below). A null/absent placement prints nothing — the
+    # resolver never ran, which is a third fact, not a placement.
+    case "$_p" in
+        top-level)
+            echo "[wm-append] '$SLOT' lives at the YAML TOP LEVEL of working-memory.yaml, NOT under slots: — a hand-rolled read under slots: returns a clean, wrong 0. Use wm-read.sh, which resolves both." >&2
+            ;;
+        slots)
+            echo "[wm-append] '$SLOT' lives under slots: in working-memory.yaml, NOT at the top level — a hand-rolled read of the top level returns a clean, wrong 0. Use wm-read.sh, which resolves both." >&2
+            ;;
+    esac
     # The captured group is a JSON string BODY, so its inner quotes are still
     # backslash-escaped; un-escape them or the operator reads `\"load_bearing\"`
     # in advice they are meant to copy.
@@ -143,9 +196,13 @@ case $rc in
         # DAEMON-ONLY (2026-05-29 cutover): no Python CLI fallback.
         if rt_try_autospawn; then
             rc=0
+            # Same stderr relay as the primary call site above ().
+            _WM_ERR2="$(mktemp 2>/dev/null || echo /tmp/wm-append-err2.$$)"
             RESP="$(rt_call POST /v1/wm/append \
                 --query "slot=$(rt_url_encode "$SLOT")" \
-                --body-string "$BODY" 2>/dev/null)" || rc=$?
+                --body-string "$BODY" 2>"$_WM_ERR2")" || rc=$?
+            if [ "$rc" != "0" ] && [ -s "$_WM_ERR2" ]; then cat "$_WM_ERR2" >&2; fi
+            rm -f "$_WM_ERR2"
             if [ "$rc" = "0" ]; then _emit_notice; exit 0; fi
         fi
         rt_no_daemon_error "wm-append.sh";;

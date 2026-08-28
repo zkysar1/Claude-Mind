@@ -1111,17 +1111,25 @@ def _compute_meta(live_items: List[Dict], archive_items: List[Dict]) -> Dict:
         round(with_evidence / len(resolved_records) * 100, 1)
         if resolved_records else 0.0)
 
+    # by_strategy (). A record with no usable `strategy` bins under
+    # one explicit "unlabeled" key, rather than falling back to `verification`
+    # — a field of different meaning holding free-text resolution criteria,
+    # which keyed bins on prose (measured 2026-08-28: 35 bins over 42 of 944
+    # resolved records, 34 of them n=1). Bin totals now sum to total_resolved,
+    # so the unlabeled count carries its own denominator. Mirror of
+    # core/scripts/pipeline.py compute_meta; parity pinned by
+    # core/scripts/tests/test_pipeline_resolution_evidence.py.
     by_strategy: Dict[str, Any] = {}
     for r in resolved_records:
-        strategy = r.get("strategy", r.get("verification", "unknown"))
-        if not isinstance(strategy, str):
-            continue
-        if strategy and strategy != "unknown":
-            if strategy not in by_strategy:
-                by_strategy[strategy] = {"confirmed": 0, "total": 0, "pct": 0.0}
-            by_strategy[strategy]["total"] += 1
-            if r["outcome"] == "CONFIRMED":
-                by_strategy[strategy]["confirmed"] += 1
+        strategy = r.get("strategy")
+        if (not isinstance(strategy, str) or not strategy.strip()
+                or strategy == "unknown"):
+            strategy = "unlabeled"
+        if strategy not in by_strategy:
+            by_strategy[strategy] = {"confirmed": 0, "total": 0, "pct": 0.0}
+        by_strategy[strategy]["total"] += 1
+        if r["outcome"] == "CONFIRMED":
+            by_strategy[strategy]["confirmed"] += 1
     for s in by_strategy.values():
         s["pct"] = round(s["confirmed"] / s["total"] * 100, 1) if s["total"] > 0 else 0.0
     meta["accuracy"]["by_strategy"] = by_strategy

@@ -306,6 +306,32 @@ def main():
     # counters and slot values. SKIP the restore + delete the stale
     # checkpoint (: was LLM-owned Phase -0.5c Step 3; moved here so
     # the stale-skip path can no longer leak).
+    # MEASURED box identity, surfaced BEFORE any restore branch ().
+    # Placed above the stale-skip below on purpose: a stale-skip resume still
+    # produces a summary, so it needs the measured value just as much as a
+    # clean restore does -- gating this on a successful restore would leave the
+    # exact path that recovers least with no ground truth at all.
+    # The point is ORDERING: this line lands in the resume context ahead of the
+    # summary prose, so an inherited hostname has something to contradict it.
+    # Fail-open -- a missing stamp (any checkpoint written before this shipped)
+    # prints nothing and changes no behaviour.
+    # NOTE: `checkpoint` is NOT bound in main() -- it is a PARAMETER of
+    # _describe_discarded_checkpoint(). Referencing it here raised NameError,
+    # which this very except swallowed, so the surface was silently dead from
+    # the moment it shipped (guard-3803: a fail-open handler also covers bugs
+    # in the code it wraps; rb-9581: line order is not scope). Parse locally.
+    try:
+        _ck_doc = yaml.safe_load(CHECKPOINT_PATH.read_text(encoding="utf-8")) or {}
+        _box = _ck_doc.get("box_identity") or {}
+        if _box.get("machine_id"):
+            print(
+                "box identity (MEASURED at checkpoint write, not from summary "
+                f"prose): machine_id={_box.get('machine_id')} "
+                f"uname={_box.get('platform_uname', 'unknown')}"
+            )
+    except Exception:
+        pass
+
     if _wm_fresher_than_checkpoint:
         ck_mtime = CHECKPOINT_PATH.stat().st_mtime
         wm_mtime = _resolve_wm_path().stat().st_mtime

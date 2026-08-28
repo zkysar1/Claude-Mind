@@ -134,6 +134,37 @@ def _remote_registered(backend, tree_root, world_dir, project_root):
             for n in (remote.get("nodes") or {}).values() if (n or {}).get("file")}
 
 
+def _is_archive_key(rel):
+    """True when a tree-relative POSIX key lies under an `.archive/` directory.
+
+    THE ONE archive policy for both orphan lanes (g-115-4975, outcome 2). It
+    previously existed twice, hand-written and in different forms: the local
+    lane tested `".archive" not in p.parts` (exact path COMPONENT) and the S3
+    lane tested `"/.archive/" not in k` (SUBSTRING). Component-exact is the
+    correct one and is what survives here -- a substring test also has to get
+    the boundary slashes right at both ends, and gets them wrong for a
+    top-level or trailing component.
+
+    Unification was MEASURED before it was applied, per guard-4807 (a shared
+    helper can be strictly worse on the second path when two paths assign the
+    same structure different meanings). Scenario table over plain / nested /
+    `.archive` / mid-path dot-dir / a directory literally named `x.archive`:
+    the two filters agreed 5 of 5, so the divergence was in FORM only and is
+    not load-bearing. Consumer grep at the same time: 15 references to
+    local_unregistered / s3_unregistered / orphan_findings, all of them in
+    core/scripts/tests/test_tree_body_presence_audit.py -- no production
+    consumer parses these fields.
+
+    The KEY SHAPE is unified alongside it: the local lane now emits
+    `.relative_to(tree_root).as_posix()` rather than `str(...)`, so both lanes
+    produce forward slashes on every platform. That is not cosmetic -- the
+    union fold in main() is only meaningful if both lanes emit the same shape,
+    and `str(WindowsPath)` yields backslashes, which silently degraded that
+    union to the old double-counting sum on Windows.
+    """
+    return ".archive" in rel.split("/")
+
+
 def _scan_orphans_safe(world_dir, project_root, registered_abs, backend):
     """Orphans are ADDITIVE — their failure must never discard the primary result.
 
@@ -202,9 +233,9 @@ def _scan_orphans(world_dir, project_root, registered_abs, backend):
 
     local_md = {p.resolve() for p in tree_root.rglob("*.md")}
     local_orphans = sorted(local_md - registered_abs)
-    out["local_unregistered"] = [str(p.relative_to(tree_root)) for p in local_orphans
-                                 if ".archive" not in p.parts]
-    out["local_unregistered_archived"] = sum(1 for p in local_orphans if ".archive" in p.parts)
+    _local_keys = [p.relative_to(tree_root).as_posix() for p in local_orphans]
+    out["local_unregistered"] = [k for k in _local_keys if not _is_archive_key(k)]
+    out["local_unregistered_archived"] = sum(1 for k in _local_keys if _is_archive_key(k))
 
     if not hasattr(backend, "s3"):
         out["s3_unregistered"] = None  # not probeable without a remote store
@@ -230,8 +261,9 @@ def _scan_orphans(world_dir, project_root, registered_abs, backend):
         except ValueError:
             pass  # registered outside a configured root — not S3-addressable
     s3_orphans = sorted(k for k in keys if k.endswith(".md") and k not in reg_keys)
-    out["s3_unregistered"] = [k[len(prefix):] for k in s3_orphans if "/.archive/" not in k]
-    out["s3_unregistered_archived"] = sum(1 for k in s3_orphans if "/.archive/" in k)
+    _s3_keys = [k[len(prefix):] for k in s3_orphans]
+    out["s3_unregistered"] = [k for k in _s3_keys if not _is_archive_key(k)]
+    out["s3_unregistered_archived"] = sum(1 for k in _s3_keys if _is_archive_key(k))
     return out
 
 
@@ -334,7 +366,29 @@ def main(argv=None):
     # from a failed probe is indistinguishable from a real one (guard-980), so
     # suppression fails CLOSED (guard-487) and the error itself is a finding.
     orphan_error = bool(orph.get("error"))
-    orphan_findings = len(orph.get("local_unregistered") or []) + len(orph.get("s3_unregistered") or [])
+    # UNION, never SUM (guard-2625, ). The two lanes enumerate the
+    # SAME orphan population from two sides -- measured on cc-07 during the
+    #  fire, local_unregistered == s3_unregistered == 1331 -- so
+    # adding their lengths reported 2662 findings for 1331 orphans and fired
+    # every consumer gate below at double strength. |A u B| is not a function
+    # of |A| and |B|: sum() is right only if the sets are disjoint, max() only
+    # if one contains the other, and neither relation is knowable from the
+    # counts. Both LISTS are in hand here, so the fold is computed where the
+    # sets still exist rather than from two lengths, and the per-shape terms
+    # stay published alongside it so disjointness remains checkable.
+    #
+    # SHAPE PRECONDITION, and it is why the sibling half of this goal matters:
+    # a set union is only meaningful if both lanes emit the same key shape.
+    # They do on POSIX (scenario table, 5 of 5 over plain / nested / .archive /
+    # mid-path dot-dir / a dir named `x.archive`). They do NOT on Windows,
+    # where the local lane's `str(p.relative_to(tree_root))` yields BACKSLASHES
+    # while the S3 lane emits a POSIX key suffix -- there the union degrades to
+    # the old sum. Unifying the two hand-written normalisers in _scan_orphans
+    # is the remaining fix; until then this is correct on POSIX and no worse
+    # than before anywhere else.
+    _local = orph.get("local_unregistered") or []
+    _s3 = orph.get("s3_unregistered") or []
+    orphan_findings = len(set(_local) | set(_s3))
     if result.get("local_noop"):
         # Only the local-lane orphan direction ran; it is still actionable.
         return 3 if (args.exit_on_findings and (orphan_findings > 0 or orphan_error)) else 0

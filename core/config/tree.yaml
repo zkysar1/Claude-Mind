@@ -279,17 +279,31 @@ retrieval:
   # overlap misses. SEPARATE flag, per the  precedent — each lane
   # enables on its OWN A/B evidence, never on a sibling's.
   #
-  # DEFAULT OFF, and that is not a placeholder: the motivating miss was
-  # measured on cc-13 (the paraphrase "is my teammate agent actually down or
-  # just quiet" missing partner-liveness.md while the tree and rb lanes went
-  # semantic), but the A/B for THIS lane has not been run. Flip it only with
-  # a before/after on the 6-query probe set, and record the numbers here the
-  # way the tree lane above records its own. An open question the A/B must
-  # answer: FRAMEWORK_RULES_CAP(15) cuts in TIER order, so a cosine-admitted
+  # ENABLED 2026-08-27 (bravo, cc-05) on its own A/B, per the rule above.
+  # 6-query paraphrase probe set, index carrying 196 framework docs:
+  #   target-hit A(token-only) 2/6  ->  B(token+cosine) 3/6
+  #   miss->hit fixes 1 · REGRESSIONS 0 · newly-admitted 2 docs across 6 queries
+  # The one fix is the motivating case itself: "is my teammate agent actually
+  # down or just quiet" admitted .claude/rules/check-team-state-before-silent.md
+  # (the partner-liveness rule) at cosine, which token overlap missed. Zero
+  # regressions and a 2-doc admission budget are why this ships ON: the lane
+  # gains a hit without flooding the cap.
+  #
+  # THE CAP QUESTION IS STILL OPEN — do not read this A/B as closing it.
+  # FRAMEWORK_RULES_CAP(15) cuts in TIER order, so a cosine-admitted
   # world-convention can still be trimmed when 15 higher-tier docs matched.
+  # This probe set never reached the cap (max n=13), so the case was NOT
+  # exercised, only unobserved. A probe that drives >=15 token matches is what
+  # would answer it.
+  # Known residual misses in BOTH arms (not regressions, pre-existing lane
+  # gaps): "background job really finished or just returned zero" returns 0
+  # docs, and "I changed the file but I never looked at it first" misses
+  # read-before-edit.md — cosine below the floor, not a token defect.
+  # Harness: agents/bravo/temp/fw-ab/probe2.py (in-process flag override, no
+  # config mutation); raw numbers in that dir's result2.json.
   # Per-box: an unprovisioned box has no index, cosine_scores returns {}, and
-  # the lane stays on its token baseline — safe to ship off everywhere.
-  embedding_framework_channel_enabled: false
+  # the lane stays on its token baseline — safe to ship on everywhere.
+  embedding_framework_channel_enabled: true
   # : reserve this many returned slots for the top nodes by SEMANTIC
   # cosine (among those clearing the eligibility floor). The cosine bonus is
   # ADDITIVE — at most COSINE_BONUS_WEIGHT(2.0) on a ~4.5-5.4 base, roughly

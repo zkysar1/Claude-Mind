@@ -712,6 +712,42 @@ def append_slot(ctx) -> "Response":  # type: ignore[name-defined]
         item["_item_ts"] = _now_iso()
 
     root_slot_for_validation = slot.split(".")[0]
+
+    # : a capture lane takes ONE OBJECT PER APPEND. Any other
+    # top-level JSON shape is refused here, at the write, because every
+    # downstream consumer drops it SILENTLY: worker_retrospective.index_captures
+    # does `if not isinstance(entry, dict): continue` BEFORE bucketing by
+    # goal_id, so a non-dict never enters a goal's bucket and therefore never
+    # reaches the per-goal accounting that would have surfaced it (no_prose_key,
+    # the rc=-1 all-malformed path, _slot_goal_ids). All three of those are real
+    # guard-4044 instrumentation; they simply sit downstream of the drop.
+    # Measured 2026-08-27 (alpha, cc-04): encoding_capture held 1091 entries, 7
+    # of them non-dict -- 5 single-element ARRAYS wrapping a perfectly good dict
+    # ( x3, , ) and 2 bare STRINGS, one of which was a
+    # 4233-char narrative for . Every one carried a joinable goal_id or
+    # real prose; none was ever counted.
+    #
+    # The refusal names EVERY shape it now catches, not just the array that
+    # motivated it (guard-2680) -- the string case is in the measured data and a
+    # list-only check would have left it open. Container type is not element
+    # shape (guard-4813). Refused at rc=400 rather than coerced: `[{...}]` is
+    # unambiguous to unwrap but `[a, b]` is two entries, and silently picking one
+    # is the same class of silent-success this refusal exists to end.
+    if root_slot_for_validation in CAPTURE_SLOTS and not isinstance(item, dict):
+        return Response.error(
+            400, "validation_failed",
+            f"capture slot {root_slot_for_validation!r} takes one JSON OBJECT "
+            f"per append; got a top-level {type(item).__name__}. Every non-dict "
+            f"entry is dropped silently by worker_retrospective.index_captures "
+            f"before it is bucketed by goal_id, so it is never counted and no "
+            f"consumer reads it. Pass one object per append"
+            + (" (send each element of the array as its own append)"
+               if isinstance(item, list) else
+               " (wrap the text in an object, e.g. "
+               '{\"goal_id\": \"...\", \"observation\": \"...\"})'
+               if isinstance(item, str) else "")
+            + ".")
+
     if root_slot_for_validation == "knowledge_debt" and isinstance(item, dict):
         try:
             _validate_knowledge_debt_entry(ctx, item)
@@ -734,6 +770,14 @@ def append_slot(ctx) -> "Response":  # type: ignore[name-defined]
     # : same NameError trap as the two above — the response builder reads
     # both on EVERY append, including the scalar and upsert paths that never reach
     # the eviction branch.
+    # : same trap, third instance. `placement` reports WHICH of the two
+    # physical locations this slot occupies — the YAML top level, or under the
+    # `slots:` mapping. It is DERIVED from _resolve_slot's own routing decision a
+    # few lines below, never from a restated copy of TOP_LEVEL_KEYS: a second copy
+    # of that set would drift, and the drift would be invisible because both
+    # answers still look like valid placements. None means the resolver never ran
+    # (an early error return) — a different fact from either placement.
+    _placement = None
 
     try:
         with _wm_lock(ctx):
@@ -742,6 +786,9 @@ def append_slot(ctx) -> "Response":  # type: ignore[name-defined]
                 return Response.error(400, "not_initialized",
                                       "working memory not initialized (run wm init)")
             parent, key, is_top = _resolve_slot(data, slot)
+            # : capture the routing decision at the one place it is
+            # made. `is_top` IS the answer the caller cannot otherwise see.
+            _placement = "top-level" if is_top else "slots"
             if parent is None:
                 return Response.error(400, "unresolvable_slot",
                                       f"cannot resolve path '{slot}'")
@@ -936,7 +983,14 @@ def append_slot(ctx) -> "Response":  # type: ignore[name-defined]
     # : `evicted` is always present (0 on the common path) so a caller
     # can branch on it without a key-existence check, and so a non-zero value is
     # visible in the same breath as the write that caused it.
-    out = {"ok": True, "slot": slot, "evicted": _evicted}
+    # : `placement` is always present, for the same reason `evicted`
+    # is — a caller must be able to branch on it without a key-existence
+    # check, and the write that CAUSED a placement is the only moment the
+    # answer is free. Measured both directions in one session: reading the
+    # wrong level returns a clean, plausible 0 that is byte-identical to
+    # "this slot is empty", so a caller who guesses wrong gets no error.
+    out = {"ok": True, "slot": slot, "evicted": _evicted,
+           "placement": _placement}
     if _healed_int is not None:
         # Surface the heal in the SAME response as the write, never silently:
         # a caller that reads `healed_from` non-null knows this Body's slot had

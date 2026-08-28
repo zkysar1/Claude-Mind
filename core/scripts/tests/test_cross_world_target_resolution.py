@@ -55,6 +55,42 @@ SCRIPTS = [INJECT, POST]
 
 EXIT_UNREACHABLE = 3
 
+# The peer env-id under test, and the env-var name the transport derives from it.
+#
+# DERIVED, NOT WRITTEN OUT, and the reason is a downstream-only failure. Seed rule
+# G2 rewrites the literal `MIND_` -> `MIND_` across `**/*` with
+# apply_even_if_exempt, because it renames FUNCTIONAL env-var identifiers
+# (MIND_AGENT/SID/WORLD/META) -- which is correct, and every MIND_AGENT below is
+# meant to travel through it. But the transport's var name merely CONTAINS that
+# pattern: it is `PEER_WORLD_` + the env-id upper-cased, so spelling that name out
+# as a source literal gets its middle segment rewritten at every plant -- the
+# brand token becomes MIND_ and the tail is already MIND, so the planted file
+# asserts against a doubled name that nothing produces, while the script keeps
+# deriving the real one at runtime from registry DATA the transform never touches.
+# (This comment states the shape rather than the string on purpose: writing the
+# literal here would be the very violation the block below asserts against, and G2
+# would rewrite this paragraph into a sentence claiming a name is corrupted into
+# itself -- guard-1855.) Measured at the ZDS v2.8.10 plant: all 8 tests here red
+# downstream, 8 green in dev -- dev being the one place the transform never runs
+# (; same class as  one file over).
+#
+# Composing it from the lowercase env-id is transform-safe by construction:
+# `ayoai-mind` does not match `MIND_`, and `"PEER_WORLD_"` carries no brand. The
+# upper-cased token therefore exists only at runtime, where no rewrite can reach
+# it. A seed-manifest exemption would "fix" this too and is the WRONG remedy -- it
+# would plant the branded literal downstream instead of removing it, and self-
+# exclusion puts a permanent blind spot over the file most likely to hold the
+# pattern (guard-1855).
+#
+# Deriving is also safe for the ASSERTION at test_unreachable_peer_exits_3_*, not
+# only for the setup sites: guard-1628 forbids deriving an expected value FROM the
+# source under test, and this derivation is independent of it -- the script reaches
+# the same name through its own WORLD_ALIAS map and `tr` pipeline. Break either of
+# those and this expectation does not move with the mutation, so the assertion
+# still fails. Convention: cross-deployment-channel.md, resolution order step 1.
+PEER_ENV_ID = "ayoai-mind"
+PEER_WORLD_VAR = "PEER_WORLD_" + PEER_ENV_ID.upper().replace("-", "_")
+
 
 def _run(rel_script, *args, env_extra=None):
     env = os.environ.copy()
@@ -64,7 +100,7 @@ def _run(rel_script, *args, env_extra=None):
     env["STORAGE_BACKEND"] = "local"
     env.setdefault("ENVIRONMENT_ID", "ayoai-mind")
     env.setdefault("MIND_AGENT", "bravo")
-    env.pop("PEER_WORLD_MIND_MIND", None)
+    env.pop(PEER_WORLD_VAR, None)
     if env_extra:
         env.update(env_extra)
     return subprocess.run(
@@ -118,9 +154,80 @@ def test_unreachable_peer_exits_3_with_actionable_diagnostic(script):
     # and what to do when this box genuinely does not host it. The pre-fix message
     # ("Target world directory does not exist") named neither, and read as a hard
     # dead end; a real user decision was once filed as blocked on box topology.
-    assert "PEER_WORLD_MIND_MIND" in err, "diagnostic omits the env-var remedy"
+    assert PEER_WORLD_VAR in err, "diagnostic omits the env-var remedy"
     assert "peer_world_path" in err, "diagnostic omits the registry remedy"
-    assert "peer-board-post.sh" in err, "diagnostic omits the reachable-channel fallback"
+    # The third remedy must be the LOCAL board, and it must be a route that
+    # actually works from a box in this state. See the two tests below for why
+    # this assertion is no longer `"peer-board-post.sh" in err`.
+    assert "board-post.sh --channel coordination" in err, (
+        "diagnostic omits the local-board route, the only channel that works "
+        "when target resolution has already failed (guard-2082)"
+    )
+
+
+@pytest.mark.parametrize("script", SCRIPTS)
+def test_diagnostic_does_not_offer_peer_board_post_as_the_fallback(script):
+    """peer-board-post.sh CANNOT be the fallback for a resolution failure.
+
+    It resolves the target world through the SAME two sources this script just
+    failed on -- `peer_board_post.py::peer_world_path()` reads
+    $PEER_WORLD_<ENV_ID> then the registry `peer_world_path:` key -- so when
+    this diagnostic prints, peer-board-post.sh is guaranteed to exit 3 for the
+    identical reason. Measured 2026-08-28 (cc-07): rc=3 for all four registered
+    peers, each naming the same registry key in its own remedy text.
+
+    THIS ASSERTION REPLACES ONE THAT PINNED THE DEFECT. The prior version was
+    `assert "peer-board-post.sh" in err` with the message "diagnostic omits the
+    reachable-channel fallback" -- it REQUIRED the broken recommendation, and
+    being a bare substring test it passed identically whether the script
+    RECOMMENDED the command or WARNED AGAINST it. A substring cannot tell those
+    apart, which is why this test keys on the recommending SHAPE (the command
+    line the reader would copy) rather than on the name appearing at all.
+    Naming it in a "NOT this, because ..." warning is correct and must stay
+    allowed (guard-2435: a control has to be able to fail for the right reason).
+    """
+    r = _run(script, *ARGS_FOR[script]())
+    assert r.returncode == EXIT_UNREACHABLE
+    err = r.stderr
+    offered = re.findall(r"^\s*(?:board message\s*:)?\s*bash \S*peer-board-post\.sh",
+                         err, re.MULTILINE)
+    assert offered == [], (
+        f"{script}: the exit-3 diagnostic offers peer-board-post.sh as a runnable "
+        f"fallback, but it shares this script's resolution precondition and will "
+        f"exit 3 too. Offered lines: {offered}"
+    )
+
+
+@pytest.mark.parametrize("script", SCRIPTS)
+def test_diagnostic_only_recommends_flags_board_post_actually_accepts(script):
+    """THE RECURRENCE-3 CATCHER, and the reason this file needed a new test.
+
+    Recurrences 1 and 2 were both "the sanctioned transport is dead fleet-wide,
+    silently". Every existing test here pins the SCRIPT's behaviour against tmp
+    fixtures, so both recurrences happened with the suite fully green -- the
+    dead layer was never the script. The remaining silent-death shape is a
+    diagnostic that confidently names a route the reader cannot run, which is
+    exactly what the prior guidance did.
+
+    So: every long flag the exit-3 diagnostic recommends for board-post.sh must
+    be a flag board-post.sh actually parses. Caught by hand while writing this
+    guidance -- `--requires-action-by` does not exist; guard-2082 means
+    `requires_action_by:` as a TAG VALUE, not a flag.
+    """
+    r = _run(script, *ARGS_FOR[script]())
+    err = r.stderr
+    m = re.search(r"bash \S*board-post\.sh(?P<rest>(?:[^\n]*\\\n?|[^\n]*))+", err)
+    assert m, "no board-post.sh invocation found in the diagnostic"
+    recommended = set(re.findall(r"--[a-z][a-z-]+", m.group(0)))
+    accepted = set(re.findall(r"--[a-z][a-z-]+",
+                              (PROJECT_ROOT / "core/scripts/board-post.sh").read_text(encoding="utf-8")))
+    accepted |= set(re.findall(r"--[a-z][a-z-]+",
+                               (PROJECT_ROOT / "core/scripts/board.py").read_text(encoding="utf-8")))
+    unknown = recommended - accepted
+    assert unknown == set(), (
+        f"{script}: exit-3 diagnostic recommends board-post.sh flag(s) that "
+        f"board-post.sh does not accept: {sorted(unknown)}"
+    )
 
 
 @pytest.mark.parametrize("script", SCRIPTS)
@@ -130,7 +237,7 @@ def test_env_var_resolves_target(script, tmp_path):
     (peer / "board").mkdir(parents=True)
     (peer / "aspirations.jsonl").touch()
     r = _run(script, *ARGS_FOR[script](),
-             env_extra={"PEER_WORLD_MIND_MIND": str(peer)})
+             env_extra={PEER_WORLD_VAR: str(peer)})
     assert r.returncode == 0, (
         f"{script}: env-var resolution should succeed.\n"
         f"rc={r.returncode}\nstdout:\n{r.stdout[:600]}\nstderr:\n{r.stderr[:600]}"
@@ -180,7 +287,7 @@ def test_inject_goal_origin_is_derived_not_a_peer_identity(tmp_path):
     (peer / "board").mkdir(parents=True)
     (peer / "aspirations.jsonl").touch()
     r = _run(INJECT, *_inject_args(),
-             env_extra={"PEER_WORLD_MIND_MIND": str(peer),
+             env_extra={PEER_WORLD_VAR: str(peer),
                         "MIND_AGENT": "bravo", "ENVIRONMENT_ID": "ayoai-mind"})
     assert r.returncode == 0, f"rc={r.returncode}\nstderr:\n{r.stderr[:600]}"
     assert "omni@zds-mind" not in r.stdout, (
@@ -196,6 +303,50 @@ def test_inject_goal_origin_is_derived_not_a_peer_identity(tmp_path):
         bad = [ln for ln in text.splitlines()
                if re.match(r'^\s*ORIGIN\s*=\s*"[^"$]*@', ln)]
         assert bad == [], f"{script} reintroduced a literal ORIGIN: {bad}"
+
+
+def test_this_file_holds_no_transform_corruptible_peer_var_literal():
+    """COUNT OF ZERO for the branded env-var spelling -- in THIS file, not the scripts.
+
+    Every other source-scan test here inspects the two transport scripts. This one
+    inspects the test module itself, because the corruption it guards against is
+    one a test file can only inflict on itself: the scripts derive the name at
+    runtime and were never affected, while these assertions were written out and
+    got rewritten under them at every plant. The whole failure is invisible in dev
+    -- dev is the one deployment where the transform does not run -- so a test is
+    the only thing that can carry the constraint forward.
+
+    ASSEMBLED FROM FRAGMENTS, NOT WRITTEN OUT (guard-1855). Neither half carries
+    the `MIND_` pattern on its own, so the needle exists only at runtime. Spelling
+    it out would make this function the single remaining violation of the invariant
+    it asserts, and G2 would silently rewrite the needle to match the corrupted
+    text -- leaving a test that passes at every plant while checking nothing.
+    """
+    needle = "PEER_WORLD_" + "AYOAI" + "_MIND"
+    text = Path(__file__).read_text(encoding="utf-8", errors="replace")
+    hits = [f"L{i}: {ln.strip()[:100]}"
+            for i, ln in enumerate(text.splitlines(), 1) if needle in ln]
+    assert hits == [], (
+        "this module spells out the branded peer env-var instead of deriving it "
+        "from PEER_ENV_ID; the seed de-brand rewrites it at every downstream plant "
+        f"and the assertions go red there while staying green here:\n" + "\n".join(hits)
+    )
+
+
+def test_peer_world_var_derivation_is_not_vacuous():
+    """The derivation must actually PRODUCE the name the transport looks up.
+
+    Without this, PEER_WORLD_VAR could be misderived (wrong separator, wrong case,
+    missing prefix) and every setup site would agree with every other setup site
+    while none of them matched the script -- the tests would pass as a closed loop.
+    The expected value is assembled from fragments for the same reason as above.
+    """
+    assert PEER_WORLD_VAR == "PEER_WORLD_" + "AYOAI" + "_MIND"
+    assert PEER_ENV_ID == "ayoai" + "-mind"
+    # And the registry entry for that env-id must exist, or the id is a typo that
+    # no amount of correct string-building would catch.
+    assert (PROJECT_ROOT / "core" / "config" / "environments"
+            / f"{PEER_ENV_ID}.yaml").is_file()
 
 
 FLEET_AGENT_NAMES = ("omni", "alpha", "bravo", "charlie", "delta",
@@ -266,7 +417,7 @@ def _peer_with_target_aspiration(tmp_path, asp_id="asp-115"):
 
 
 def _live_env(peer):
-    return {"PEER_WORLD_MIND_MIND": str(peer),
+    return {PEER_WORLD_VAR: str(peer),
             "MIND_AGENT": "bravo", "ENVIRONMENT_ID": "ayoai-mind"}
 
 

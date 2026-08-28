@@ -28,6 +28,68 @@ if str(SCRIPTS_DIR) not in sys.path:
 from gates.capability_route import evaluate, ACTIVE_AGENTS  # noqa: E402
 
 
+# --- deployment-neutrality () -----------------------------------
+# The routing ANSWERS in this module come from the world overlay
+# world/config/capability-routing.yaml, not from framework code — the gate
+# itself is already deployment-neutral (ACTIVE_AGENTS is resolved at access
+# time via PEP 562). Only these EXPECTATIONS were Ayoai-specific, which made
+# ~26 of them perma-red the moment core/tests/gates became collected
+# downstream (measured cc-06 post-v2.8.10). A known-red floor trains readers
+# to distrust the runner verdict, so an expectation that assumes an agent
+# this deployment does not have must SKIP WITH REASON, not fail.
+def _overlay_agents() -> set:
+    """Agents this deployment's routing overlay actually routes to.
+
+    Returns an empty set when the overlay is absent or unreadable — callers
+    treat empty as 'cannot judge' and skip rather than assert, so a missing
+    overlay never manufactures a red.
+    """
+    try:
+        from gates.capability_route import _load_routing_tables
+        tables = _load_routing_tables()
+    except Exception:
+        return set()
+    found = set()
+    for table in tables:
+        if isinstance(table, dict):
+            rows = table.values()
+        elif isinstance(table, (list, tuple)):
+            rows = table
+        else:
+            continue
+        for row in rows:
+            agent = None
+            if isinstance(row, dict):
+                agent = row.get("agent")
+            elif isinstance(row, (list, tuple)):
+                # Shapes PROBED, not assumed (guard-2298). Position is derived
+                # from LENGTH, never from a roster hint: an extractor that only
+                # recognises agents already on the roster makes the drift check
+                # below structurally unable to fail.
+                #   len 3 -> (agent, confidence, rationale)      [dict values]
+                #   len 4 -> (phrase, agent, delta, rationale)   [heuristics]
+                if len(row) == 3:
+                    agent = row[0]
+                elif len(row) >= 4:
+                    agent = row[1]
+            if isinstance(agent, str) and agent and agent != "either":
+                found.add(agent)
+    return found
+
+
+def _require_agent(agent: str) -> None:
+    """Skip when `agent` is not on this deployment's active roster."""
+    if agent == "either":
+        return
+    roster = ACTIVE_AGENTS
+    if agent not in roster:
+        pytest.skip(
+            f"expectation assumes agent {agent!r}, which this deployment's "
+            f"roster does not contain (active: {sorted(roster)}) — "
+            "domain-coupled expectation, not a gate defect (g-115-4392)"
+        )
+
+
 def _run_cli(*, title: str, category: str = "", description: str = "",
              route_to: str | None = None) -> tuple[int, dict]:
     args = [sys.executable, str(CLI), "--title", title]
@@ -63,6 +125,7 @@ def _run_cli(*, title: str, category: str = "", description: str = "",
     ("Maintain: weekly cleanup", "either", 0.40),
 ])
 def test_title_prefix_routing(title, expected_agent, min_conf):
+    _require_agent(expected_agent)
     out = evaluate(title)
     assert out["intended_agent"] == expected_agent, out["rationale"]
     assert out["confidence"] >= min_conf
@@ -232,4 +295,42 @@ def test_active_agents_tripwire():
     artifact into this tuple would have silenced the detector with the very
     defect it detected.
     """
-    assert ACTIVE_AGENTS == ("alpha", "bravo", "echo", "foxtrot", "zeta")
+    # : the literal baseline was replaced, NOT retired. It fired
+    # truly once (the phantom below) so narrowing it would delete a working
+    # detector -- but a hand-maintained tuple of ONE deployment's agents is
+    # also guaranteed-red in every other deployment, which is the known-red
+    # floor this goal exists to remove. Both properties are preserved by
+    # asserting the INVARIANT the baseline was standing in for, rather than
+    # the roster it happened to have here.
+    roster = ACTIVE_AGENTS
+
+    # (a) structural: a roster is a non-empty tuple of non-empty names.
+    assert isinstance(roster, tuple) and roster, f"empty/invalid roster: {roster!r}"
+    assert all(isinstance(a, str) and a.strip() for a in roster), roster
+
+    # (b) the detector proper: no test fixture may leak a row into the LIVE
+    # world roster. This is the signature of the incident above ('test-race-5')
+    # and it is deployment-independent -- no real agent is named for a test.
+    polluted = [a for a in roster
+                if any(m in a.lower()
+                       for m in ("test", "fixture", "phantom", "race", "tmp", "dummy"))]
+    assert not polluted, (
+        f"test-fixture pollution in the LIVE agent roster: {polluted}. "
+        "A fixture row outlived its cleanup and is now routable. PURGE the "
+        "live world/team-state row before doing anything else -- do not "
+        "relax this predicate to accommodate it (that is the very defect it "
+        "detects)."
+    )
+
+    # (c) cross-check against this deployment's own routing overlay, which
+    # declares the vocabulary the gate routes to. Checked only in the
+    # overlay->roster direction: an agent may legitimately have no routing
+    # rules yet, but the overlay naming an agent that does not exist means
+    # the two sources of truth have drifted.
+    overlay = _overlay_agents()
+    if overlay:
+        unroutable = sorted(overlay - set(roster))
+        assert not unroutable, (
+            f"capability-routing.yaml routes to agent(s) {unroutable} that are "
+            f"not on the active roster {sorted(roster)} -- overlay/roster drift."
+        )

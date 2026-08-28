@@ -434,12 +434,22 @@ def evaluate(payload: dict, *, override_signal: Optional[str] = None,
         }
 
     # BLOCK — missing or invalid, no override.
+    # Refusal text is written for a reader with ZERO prior context (a small
+    # model mid-call): name the field, show WHERE it goes with a valid
+    # example, and state the fix BEFORE the bypass. Measured 2026-08-28
+    # (coach, 27B): the previous values-only refusal produced two identical
+    # retries — the model never learned what to change in the JSON.
     reason = (
-        "Invalid origin_signal "
-        + (f"'{signal}'" if signal else "(missing)")
-        + ". Every agent-sourced goal must cite a concrete signal. Allowed: "
+        "BLOCKED: the goal JSON's \"origin_signal\" field is "
+        + (f"'{signal}' (not a recognized prefix)" if signal else "MISSING")
+        + ". FIX: add the field to the goal JSON and retry, e.g. "
+        + '{"title": "Investigate: ...", "origin_signal": "investigate:g-NNN-NN", ...}. '
+        + "Match the prefix to the goal's title prefix (Unblock->unblock:, "
+        + "Investigate->investigate:, Idea->idea:, Maintain->maintain:); a goal "
+        + "from a user instruction uses \"user_directive\". All allowed values: "
         + ", ".join(ALLOWED_PREFIXES)
-        + ". To bypass with justification: --override-signal \"<reason>\"."
+        + ". Only if this block is a false positive, bypass with "
+        + "--override-signal \"<reason>\"."
     )
     _gate_log(
         "origin-signal-gate", "block",

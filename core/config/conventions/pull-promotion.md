@@ -79,6 +79,14 @@ Adoption compares the **installed tag** against the newest staging tag:
 git -C <staging-clone> tag --list 'v*' --sort=v:refname | tail -1
 ```
 
+**Who puts that tag on staging: the PROMOTING operator, at the end of the
+push hop** (`promotion-runbook.md` Phase 3 — tag the dest merge commit, push
+the tag). `release.sh` tags only the source and the plant carries no tags, so
+until 2026-08-27 staging's newest tag was v2.9.4 under v2.12.3 content and this
+listing would have returned nothing adoptable for three releases. If the
+newest staging tag is older than the staging `__version__`, the push hop was
+left unfinished — say so on the coordination board rather than adopting HEAD.
+
 **Where the installed tag is recorded — this did not exist and is defined
 here.** Measured 2026-08-24: nothing in `core/scripts` or `core/config` records
 an installed/adopted tag, and `check-releases-current.sh` records that
@@ -314,13 +322,90 @@ which is why the gate fails closed AND the wording names the subcommand.
    picks it up by diffing `core/config/world-aspirations-initial.jsonl` across
    the adopted range and filing it locally. Seeding and §b are complements, not
    alternatives.
-2. **No executor exists yet.** Measured 2026-08-25 across four surfaces:
-   `.claude/skills/` (no pull/adopt/promotion skill), a repo-wide grep for
-   `pull-promotion` (documentation and agent narrative only — no caller),
-   `world/forged-skills.yaml` (no match), and retrieval. The recurring goal
-   SCHEDULES this protocol; it does not implement it. Whoever builds the
-   executor should wire into the seeded cadence rather than invent a second
-   trigger.
+2. **The executor EXISTS: `bash core/scripts/framework-pull.sh`** (g-360-02,
+   2026-08-24 — `core/scripts/framework_pull.py`, 871 lines, 41 tests in
+   `core/scripts/tests/test_framework_pull.py`; exit 0 OK / 1 ERROR / 2 BLOCKED /
+   3 ROLLED_BACK; implements C1–C7 plus addenda a–d, reading `FRAMEWORK_PATHS`
+   out of `promotion-preflight.py` rather than re-declaring them). This item
+   read "no executor exists yet (measured 2026-08-25 across four surfaces)"
+   until 2026-08-27, one day after the executor had landed — the measurement
+   was correct on 08-25 and stale by the time it was written down; the
+   2026-08-27 coach-mind adoption ran the protocol by hand because the operator
+   trusted this paragraph over `ls core/scripts`. An adopting Mind (and the
+   g-002-02 cadence) should invoke the executor, not re-derive the steps.
+
+## f — The UPSTREAM lane: target-ahead files flow UP to the dev origin (normative)
+
+Everything above is DOWNSTREAM. This section is the return path, and it exists
+because the push side already detects the need and then names no transport.
+
+**The detection is built and works.** `promotion-preflight.sh` exits 2 on DRIFT
+and lists every *target-ahead* file — a downstream Mind self-evolves during
+operation, so a blind mirror would CLOBBER improvements the target made
+(confirmed 2026-06-24: ZDS led Claude-Mind on 18 framework files).
+`.claude/rules/promotion-cycle.md` then instructs: "back-port it UP to the
+source (or explicitly discard with sign-off) **before** the overwrite."
+
+**The gap was never detection — it was carriage.** That instruction names no
+mechanism, so the back-port is hand-carried by whoever is running the promotion,
+in the middle of a push they are trying to finish. Work that depends on a human
+noticing an exit-2 mid-task is work that gets discarded under time pressure.
+
+### The transport EXISTS — do not build a second one
+
+`core/scripts/cross-world-inject-goal.sh` injects a goal into a sibling world's
+queue. Measured 2026-08-28 (zeta, cc-02): fully built, with a non-hand caller
+already in the tree (`unblock-parent-status-sweep.py`). Siblings present and
+working: `peer-board-post.sh`, `peer-retrieve.sh`, `cross-world-post.sh`,
+`peer-surface.sh`. The environment registry carries six worlds including
+`zds-mind.yaml`. Nothing needs writing; the lane needs *wiring*.
+
+Its five cross-world guardrails are enforced in the script itself, with no
+caller opt-in: G1 default-Vault (`--shared`), G2 sandboxing (stamps
+`injected_by` + `sandbox:true`), G3 human approval (forces
+`participants:[agent,user]`), G4 rate-limit (`M2_RATE_LIMIT=3` per source per
+24h per target), G5 provenance stamps.
+
+### G3 STANDS — ferrying is not reviewing
+
+The obvious objection is that G3 forces `participants:[agent,user]`, while the
+upstream lane wants the artifact to land "without a human ferrying it." These
+do not conflict. FERRYING is transport; REVIEWING is judgment. Under G3 the
+artifact travels, lands, and is durable with **zero** human transport — a person
+then reviews it in place, in the dev origin's own queue, on their own schedule.
+Relaxing G3 would trade a real safety property (no world can silently enqueue
+executable work in another world) for a distinction the requirement never asked
+for. Use the transport as-is.
+
+### ⚠ The G1–G5 guardrail citations are DANGLING (measured, 2026-08-28)
+
+`cross-world-inject-goal.sh`'s header cites `guard-64` (G1), `guard-65` (G2),
+`guard-66` (G3), `guard-67` (G4), `guard-68` (G5). **All five return
+`{"error": "not_found"}`** from `guardrails-read.sh --id`. The enforcement is
+real and lives in the script's own code (`M2_RATE_LIMIT` at :121, the forced
+`participants:[agent,user]` at :43/:153) — but the guardrail IDs point at
+nothing.
+
+Two consequences worth stating plainly, because each one bit during this goal:
+
+1. **Do not plan a change to G1–G5 as "amend guard-NN."** There is no record to
+   amend. A change to any of the five is a change to the script, with its tests.
+   This goal's own first-pass framing was "relaxing G3 means amending guard-66,
+   which is a guardrail change" — that framing was FALSE and was retired only by
+   probing all five ids.
+2. **`world-contract.md` describes G1–G5 as "design artifacts, not built
+   enforcement."** For this transport that is now stale: the script builds them.
+   Read the code as authoritative over both the header citations and the
+   convention prose until one of the three is reconciled.
+
+### Wiring (the remaining work, stated so it is not re-derived)
+
+The detector and the transport both exist and are not connected. The join is:
+on a `promotion-preflight.sh` exit 2, for each **target-ahead** file, inject a
+back-port goal into the DEV ORIGIN's queue naming the file, the target world,
+and the preflight run — instead of relying on the operator to hand-carry it.
+G4's 3-per-24h ceiling is the natural batch bound: inject ONE goal enumerating
+the drifted files, never one goal per file.
 
 ## Cross-references
 

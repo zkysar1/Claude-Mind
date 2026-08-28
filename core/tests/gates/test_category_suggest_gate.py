@@ -281,3 +281,159 @@ def test_explicit_tree_path_resolves_bodies_under_its_own_world(
     matches = evaluate("acmeledger outage", world_dir=other,
                        tree_path=world / "knowledge" / "tree" / "_tree.yaml")
     assert [m["key"] for m in matches] == ["payments-ledger"]
+
+
+# ---------------------------------------------------------------------------
+# : pin the _TREE_CACHE invalidation semantics added by .
+# The cache is keyed on (path, st_mtime_ns, st_size, world_root). The risk the
+# goal names is silent and directional: if the mtime keying is wrong, evaluate()
+# serves STALE nodes after every /tree write and the only symptom is subtly
+# wrong goal categories -- no error, no red test.
+#
+# Note the fixtures above only .clear() the cache for isolation; clearing a
+# cache is not pinning it. These three tests assert the behaviour itself.
+# ---------------------------------------------------------------------------
+
+def _cache_tree_world(tmp_path: Path, node_key: str, summary: str) -> Path:
+    """A tmp world whose tree carries exactly one eligible node."""
+    world = tmp_path / "cache-world"
+    tree_dir = world / "knowledge" / "tree"
+    tree_dir.mkdir(parents=True, exist_ok=True)
+    _rewrite_cache_tree(world, node_key, summary)
+    return world
+
+
+def _rewrite_cache_tree(world: Path, node_key: str, summary: str) -> Path:
+    """(Re)write the world's _tree.yaml with one eligible node, then push its
+    mtime forward. The explicit utime bump is load-bearing: callers below use
+    SAME-LENGTH node keys so st_size is identical across revisions, which is
+    what forces the assertion onto st_mtime_ns -- the field whose failure the
+    goal describes. Without the bump a coarse filesystem clock could leave
+    mtime_ns unchanged and the test would pass for the wrong reason.
+
+    THE BUMP MUST BE MONOTONIC ACROSS REVISIONS, not relative to the mtime this
+    call just wrote. Measured 2026-08-28: the original form read the FRESH stat
+    and added 1s, so revision 1 (written at T0) landed at T0+1s and revision 2
+    (written at T1, milliseconds later) landed at T1+1s -- and whenever T0 and
+    T1 fell in the SAME filesystem mtime tick those are the SAME nanosecond.
+    st_size is identical by construction here, so an equal mtime makes the whole
+    cache key `(path, st_mtime_ns, st_size, world_root)` identical, the cache
+    hits, stale nodes are served, and the test fails asserting exactly the
+    invalidation bug it was written to disprove. 3 of 6 runs failed; all three
+    cache tests were affected. Anchoring on max(previous, fresh) makes each
+    revision strictly newer than the last regardless of clock granularity.
+
+    Note this flakiness was invisible to the mutation proofs these tests already
+    passed: killing a mutant shows the assertion has teeth, not that the fixture
+    is deterministic. They are separate properties and need separate checks."""
+    import os
+    import yaml
+    tree_path = world / "knowledge" / "tree" / "_tree.yaml"
+    prev_ns = tree_path.stat().st_mtime_ns if tree_path.exists() else 0
+    tree = {
+        "nodes": {
+            "root": {"summary": "tree root", "depth": 0, "children": []},
+            node_key: {"summary": summary, "depth": 2, "children": []},
+        },
+        "entity_index": {},
+    }
+    tree_path.write_text(yaml.safe_dump(tree, sort_keys=False), encoding="utf-8")
+    st = tree_path.stat()
+    next_ns = max(st.st_mtime_ns, prev_ns) + 10**9
+    os.utime(tree_path, ns=(next_ns, next_ns))
+    return tree_path
+
+
+@pytest.fixture
+def cache_isolated():
+    """Isolate the module-level tree cache on both sides of a test."""
+    from gates import category_suggest as cs
+    cs._TREE_CACHE.clear()
+    yield cs
+    cs._TREE_CACHE.clear()
+
+
+def test_tree_cache_serves_fresh_nodes_after_the_tree_file_changes(
+        tmp_path: Path, cache_isolated):
+    """(1) A tree write must be reflected on the next evaluate().
+
+    The two node keys are deliberately the SAME LENGTH, so the rewritten file
+    has an identical st_size and only st_mtime_ns distinguishes the revisions.
+    A cache keyed on size alone would serve the stale node here."""
+    probe = "monthly statement reconciliation"
+    world = _cache_tree_world(tmp_path, "payments-ledger", probe)
+    assert [m["key"] for m in evaluate(probe, world_dir=world)] == ["payments-ledger"]
+
+    before = (world / "knowledge" / "tree" / "_tree.yaml").stat().st_size
+    _rewrite_cache_tree(world, "billing-runbook", probe)
+    after = (world / "knowledge" / "tree" / "_tree.yaml").stat().st_size
+    assert before == after, (
+        "fixture no longer exercises mtime keying: the two revisions differ in "
+        "size, so this test would pass on a size-only cache key")
+
+    assert [m["key"] for m in evaluate(probe, world_dir=world)] == ["billing-runbook"], (
+        "stale nodes served after a tree write — _TREE_CACHE invalidation is broken")
+
+
+def test_tree_cache_reuses_the_parsed_tree_when_the_file_is_unchanged(
+        tmp_path: Path, monkeypatch, cache_isolated):
+    """(2) Two calls over an UNCHANGED file must not rebuild the concept index.
+
+    Counting build_concept_index is what makes this non-vacuous: asserting only
+    that both calls return the same ANSWER would pass even with the cache
+    disabled entirely."""
+    cs = cache_isolated
+    calls = {"n": 0}
+    real = cs.build_concept_index
+
+    def counting(nodes, world_root=None):
+        calls["n"] += 1
+        return real(nodes, world_root=world_root)
+
+    monkeypatch.setattr(cs, "build_concept_index", counting)
+
+    probe = "monthly statement reconciliation"
+    world = _cache_tree_world(tmp_path, "payments-ledger", probe)
+
+    first = evaluate(probe, world_dir=world)
+    assert calls["n"] == 1, "positive control: a cold call must build the index once"
+
+    second = evaluate(probe, world_dir=world)
+    assert calls["n"] == 1, (
+        "concept index rebuilt on an unchanged file — the cache is not being hit")
+    assert [m["key"] for m in first] == [m["key"] for m in second]
+
+    # Positive control on the other side: a real change MUST rebuild, so the
+    # counter above is measuring cache hits and not a dead monkeypatch.
+    _rewrite_cache_tree(world, "billing-runbook", probe)
+    evaluate(probe, world_dir=world)
+    assert calls["n"] == 2, "a changed file must rebuild the concept index"
+
+
+def test_tree_cache_bound_keeps_the_current_revision(
+        tmp_path: Path, cache_isolated):
+    """(3) The len>=3 bound must never leave the CURRENT revision uncached.
+
+    _load_tree_cached clears the whole dict at the bound and then inserts, so
+    the revision that triggered the eviction is the one retained. Pin that: the
+    failure mode of a naive eviction is dropping the entry you are about to
+    serve, which would make every subsequent call a miss."""
+    cs = cache_isolated
+    probe = "monthly statement reconciliation"
+    world = _cache_tree_world(tmp_path, "revision-aaaaaa", probe)
+
+    for key in ("revision-bbbbbb", "revision-cccccc", "revision-dddddd"):
+        _rewrite_cache_tree(world, key, probe)
+        evaluate(probe, world_dir=world)
+
+    assert len(cs._TREE_CACHE) >= 1, "cache empty after the bound fired"
+    assert len(cs._TREE_CACHE) <= 3, "cache grew past its stated 3-entry bound"
+
+    tree_path = world / "knowledge" / "tree" / "_tree.yaml"
+    st = tree_path.stat()
+    current_key = (str(tree_path), st.st_mtime_ns, st.st_size, str(world))
+    assert current_key in cs._TREE_CACHE, (
+        "the current revision was evicted by the cache bound — every later "
+        "call would miss and re-parse")
+
+    assert [m["key"] for m in evaluate(probe, world_dir=world)] == ["revision-dddddd"]

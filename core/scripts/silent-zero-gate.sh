@@ -26,5 +26,12 @@ export PROJECT_ROOT
 SCRIPT_PATH="$PROJECT_ROOT/core/scripts/silent-zero-gate.py"
 [ -f "$SCRIPT_PATH" ] || exit 0
 
-python3 "$SCRIPT_PATH" 2>/dev/null
+# D3 (): capture the gate's OWN stderr to a breakage log instead of
+# discarding it. A module-load failure (e.g. a renamed import) escapes
+# silent-zero-gate.py's in-main try/except and would otherwise vanish into
+# /dev/null while `exit 0` fails open -- a dead gate that silently approves and
+# reports nothing. stdout (the hook decision channel) is untouched, so the
+# PreToolUse contract and the fail-open exit are unchanged; a non-empty
+# core/logs/hook-fires/silent-zero-gate.err now marks a broken gate.
+python3 "$SCRIPT_PATH" 2>>"$PROJECT_ROOT/core/logs/hook-fires/silent-zero-gate.err"
 exit 0

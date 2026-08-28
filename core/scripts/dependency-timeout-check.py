@@ -368,6 +368,151 @@ def _human_gated(goal) -> bool:
     return dr.strip().lower().startswith(HUMAN_GATED_DEFER_PREFIXES)
 
 
+# ---------------------------------------------------------------------------
+# Re-probe before escalating ()
+#
+# THE DEFECT THIS CLOSES. The notify_user branch below renders the ROOT's
+# STORED defer_reason/title/description into an email and sends it to a human.
+# It never re-ran the probe that produced that verdict. Measured on
+# : alpha filed a credentials-required blocker on 2026-07-22
+# concluding the fleet key mint needed a human; zeta's escalation 89.5h later
+# relayed that conclusion faithfully AND inherited its confidence, asserting
+# to the user that this was "a genuine human-only class ... not work an agent
+# routed around". A ~5-minute read-only re-probe falsified it three days
+# later. A blocker good enough to FILE is not automatically good enough to
+# INTERRUPT A PERSON WITH, and escalation is exactly the moment the verdict is
+# (a) days old, (b) about to consume human attention, and (c) cheap to re-test
+# relative to the cost of being wrong. (guard-3161, guard-2286.)
+#
+# SCOPE IS DELIBERATELY NARROW. Only `credentials-required` is probeable here,
+# because it is the one class with a real read-only predicate the fleet already
+# owns. `user_action` / `security-trust` / `physical-hardware` have NO probe
+# and escalate UNCHANGED — no subprocess is spawned for them, so they take no
+# added latency. `human_blocked:` is deliberately NOT probed: it is the one
+# STRUCTURED_DEFER_PREFIXES member that never auto-clears
+# (probe-before-defer.md), and credential-defer-recheck.py owns that lane under
+# its own rules.
+PROBEABLE_DEFER_PREFIXES = ("credentials-required",)
+
+
+def _cred_probe_module():
+    """The sibling that OWNS the credential probe, imported lazily.
+
+    NOT a copy of its regexes (communication-clarity rule 5: one source of
+    truth). credential-defer-recheck.py is hyphenated so it cannot be a plain
+    import, and it does real work at module scope, so this is lazy — it runs
+    only for a root that is actually credentials-gated — and fail-open: an
+    import error yields None, which lands on the unprobeable branch and
+    escalates exactly as before.
+    """
+    import importlib.util
+    try:
+        path = SCRIPT_DIR / "credential-defer-recheck.py"
+        spec = importlib.util.spec_from_file_location("_dtc_cred_probe", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+def _reprobe_root(root):
+    """Re-test a root's stored blocker verdict. NEVER raises.
+
+    Returns {"outcome", "detail", "at", "key"} where outcome is one of:
+      unprobeable  — no defer_reason, or a class with no probe. Escalate
+                     unchanged; nothing was spawned.
+      cleared      — the probe now SUCCEEDS. The stored verdict is stale:
+                     suppress the notification.
+      still_blocked— the probe still fails. Escalate, and carry this verdict's
+                     OWN timestamp so the human can see the claim is fresh
+                     rather than inherited.
+      error        — the probe could not be run or raised. FAIL-OPEN: treated
+                     exactly like still_blocked so the escalation still fires
+                     rather than being silently swallowed. A broken probe must
+                     never become a way for a real blocker to go unreported.
+
+    rb-7672 applies to the READER of this verdict, not to this function: a
+    probe answers "is the condition true NOW", which is the PREMISE axis only.
+    A standing grant that retires the excuse while the condition stays true is
+    the RULE axis, and no probe can see it (reclaim-routed-work.md). So
+    `still_blocked` means "re-measured, still failing" — never "correctly
+    routed to a human", and the escalation body says so.
+    """
+    at = dt.datetime.now().replace(microsecond=0).isoformat()
+    dr = (root or {}).get("defer_reason")
+    if not isinstance(dr, str) or not dr.strip().lower().startswith(
+            PROBEABLE_DEFER_PREFIXES):
+        return {"outcome": "unprobeable", "detail": "no probeable blocker class",
+                "at": at, "key": None}
+    mod = _cred_probe_module()
+    if mod is None:
+        return {"outcome": "error", "at": at, "key": None,
+                "detail": "credential probe module unavailable"}
+    try:
+        key = mod._extract_env_key(dr)
+    except Exception as e:
+        return {"outcome": "error", "at": at, "key": None,
+                "detail": "key extraction raised: %s" % e}
+    if not key:
+        # A credentials-required defer whose text names no key gives the probe
+        # nothing to test. That is UNPROBEABLE, not clear — inventing a verdict
+        # from an absent measurement is the failure this whole change removes.
+        return {"outcome": "unprobeable", "at": at, "key": None,
+                "detail": "credentials-required defer names no env key"}
+    try:
+        present = mod._probe_env_key(key)
+    except Exception as e:
+        return {"outcome": "error", "at": at, "key": key,
+                "detail": "probe raised: %s" % e}
+    if present:
+        return {"outcome": "cleared", "at": at, "key": key,
+                "detail": "env-read.sh has %s -> present" % key}
+    return {"outcome": "still_blocked", "at": at, "key": key,
+            "detail": "env-read.sh has %s -> absent" % key}
+
+
+def _reprobe_line(reprobe):
+    """The freshness paragraph for the escalation body. '' when unprobeable.
+
+    Returning EMPTY for the unprobeable classes is what makes outcome 4 true
+    literally rather than approximately: a user_action / security-trust /
+    physical-hardware escalation body stays byte-identical to what it was
+    before this change, so nothing about those escalations moved.
+
+    For the two probed outcomes the point is that the human can SEE the claim
+    is fresh. The stale-verdict incident this fixes was not caused by a wrong
+    blocker — it was caused by a three-day-old blocker being restated in the
+    present tense with no indication of its age.
+    """
+    if not reprobe or reprobe.get("outcome") == "unprobeable":
+        return ""
+    if reprobe.get("outcome") == "error":
+        return ("Re-probe of the root's blocker could not be run at %s (%s), so "
+                "this escalation is sent WITHOUT fresh evidence — the stored "
+                "verdict below has not been re-tested.\n\n"
+                % (reprobe.get("at"), reprobe.get("detail")))
+    return ("Re-probed at %s: %s. This is a fresh measurement, not the stored "
+            "verdict. Note it re-tests only whether the CONDITION still holds; "
+            "if a standing grant has since retired this class of blocker, no "
+            "probe can see that.\n\n"
+            % (reprobe.get("at"), reprobe.get("detail")))
+
+
+def _clear_defer(root_id, source):
+    """Clear a falsified defer_reason. Mirrors _boost_priority's shape."""
+    try:
+        proc = subprocess.run(
+            bash_cmd(SCRIPT_DIR / "aspirations-update-goal.sh",
+                     root_id, "defer_reason", "", "--source", source),
+            capture_output=True, text=True, timeout=120)
+        if proc.returncode == 0:
+            return True, "cleared defer on %s" % root_id
+        return False, "clear rc=%s %s" % (proc.returncode, (proc.stderr or "")[:160])
+    except Exception as e:
+        return False, "clear raised: %s" % e
+
+
 def _participants(goal):
     p = (goal or {}).get("participants") or ["agent"]
     if isinstance(p, str):
@@ -421,6 +566,7 @@ def run(args) -> dict:
     already = _read_recent_escalations(threshold, args.board_escalation_log)
 
     candidates, escalated, boosted, needs_notify = [], [], [], []
+    reprobe_suppressed = []
     skipped_cooldown, skipped_young, skipped_no_ts, failed = [], [], [], []
 
     for entry in dep_entries:
@@ -470,6 +616,30 @@ def run(args) -> dict:
         if not args.apply:
             continue
 
+        # : RE-PROBE BEFORE THE BOARD POST, not after the route
+        # branch below. _post_board is what records the durable cooldown, so a
+        # suppressed escalation that had already posted would burn its own
+        # cooldown slot and stay silent on the NEXT sweep too — turning a
+        # correct suppression into an accidental permanent one.
+        reprobe = _reprobe_root(root) if route == "notify_user" else None
+        if reprobe is not None and reprobe["outcome"] == "cleared":
+            # The stored verdict is FALSIFIED. Do not notify. Clear the defer
+            # and post a correction naming the stale verdict, so the next
+            # reader of that goal does not re-derive the same wrong conclusion
+            # (guard-1710: sweep every artifact still asserting the old one).
+            cok, cnote = _clear_defer(root_id, (root or {}).get("_source", "world"))
+            _post_board(gid, root_id, age,
+                        "RE-PROBE FALSIFIED the stored blocker on root %s: %s "
+                        "(probed %s). No user notification sent. defer_reason: "
+                        "%s. The stored verdict was %s old and was relayed to "
+                        "nobody." % (root_id, reprobe["detail"], reprobe["at"],
+                                     cnote, _window_str(age)),
+                        args.no_board)
+            reprobe_suppressed.append({
+                "goal_id": gid, "root_id": root_id, "age_hours": round(age, 1),
+                "probe": reprobe, "defer_cleared": cok, "detail": cnote})
+            continue
+
         detail = ("Root %s (%s). Route=%s. Threshold %.0fh of %.0fh timeout; "
                   "at timeout the dependency clears fail-open and the goal runs."
                   % (root_id, (root.get("title")[:60] if root else "unknown"),
@@ -498,12 +668,15 @@ def run(args) -> dict:
                     "That goal requires user action (participants includes 'user').\n\n"
                     "If not resolved within %.0fh the dependency clears automatically "
                     "(fail-open) and the blocked goal will attempt execution.\n\n"
+                    "%s"
                     "The one thing that would help:\n%s"
                     % (gid, c["title"], age, root_id,
                        (root.get("title") if root else "unknown"),
                        max(0.0, threshold / ESCALATE_AT_FRACTION - age),
+                       _reprobe_line(reprobe),
                        (root.get("description") or root.get("title") or "")[:400]
                        if root else "")),
+                "reprobe": reprobe,
             })
 
     return {
@@ -516,6 +689,7 @@ def run(args) -> dict:
         "escalated": escalated,
         "boosted": boosted,
         "needs_user_notification": needs_notify,
+        "reprobe_suppressed": reprobe_suppressed,
         "skipped_cooldown": skipped_cooldown,
         "skipped_below_threshold": skipped_young,
         "skipped_no_blocked_since": skipped_no_ts,

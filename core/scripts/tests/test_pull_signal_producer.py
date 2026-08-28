@@ -65,7 +65,16 @@ else:
     os.environ["MIND_AGENT"] = _SAVED_AGENT
 
 
-NOW = datetime(2026, 8, 23, 12, 0, 0)
+# RELATIVE TO THE REAL CLOCK, DELIBERATELY (guard-566, guard-4364). This read
+# `datetime(2026, 8, 23, 12, 0, 0)` until 2026-08-28, and that hardcoded stamp
+# silently disarmed the two END_TO_END tests this file exists for. They feed the
+# producer's output to the REAL `apply_pull_boost`, which reads `datetime.now()`
+# and accepts no injected clock -- so once wall-time passed MAX_AGE the fixture
+# signal was dead on arrival and the join assertions went red 24h after they were
+# written, and stayed red. Measured that day: the fixture signal was 124.2h old
+# against max_age_hours=24.0. The file's own thesis is that a wire can be correct
+# on both ends and inert in the middle; its clock was the third such end.
+NOW = datetime.now().replace(microsecond=0)
 MAX_AGE = 24.0
 CONSUMER_CFG = {"enabled": True, "boost": 4.0, "max_age_hours": MAX_AGE}
 
@@ -265,7 +274,9 @@ def test_producer_and_consumer_agree_on_liveness():
         sig = _sig(hours_ago)
         producer_says_live = prod.is_live(sig, NOW, MAX_AGE)
         scored = [_entry(sig, score=5.0)]
-        # apply_pull_boost uses datetime.now(); NOW is fixed, so compare against
+        # apply_pull_boost uses datetime.now(). NOW now tracks the real clock (see
+        # its definition above), so this re-stamp is belt-and-braces rather than a
+        # correction -- it keeps the comparison exact if NOW is ever re-pinned.
         # a signal expressed relative to the real clock instead.
         sig_real = {**sig, "set_at": (datetime.now() - timedelta(hours=hours_ago))
                     .strftime("%Y-%m-%dT%H:%M:%S")}

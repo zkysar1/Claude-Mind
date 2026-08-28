@@ -126,6 +126,13 @@ VALID_USER_LEG_SCOPES = {
     "commit", "push", "deployment-approval",
     "architecture-decision", "credential-grant",
     "data-provision", "new-resource",
+    # An act the principal must perform AS A LEGAL OR CREDENTIALED PERSON
+    # (signature, certification, attestation, filing under their identity).
+    # Added 2026-08-28 (zeta,  / ): two genuinely-human
+    # goals were unclassifiable and `data-provision` was false for both.
+    # SSOT — gates/user_leg_scope.py mirrors this set; parity is pinned by
+    # tests/test_allowlist_parity_batch3.py::test_2b_user_leg_scopes_equal.
+    "principal-identity",
 }
 
 # `intended_agent` is the optional routing hint produced by

@@ -261,6 +261,7 @@ def cmd_check(args):
     rollback_actions = []
     graduated = []
     audit_only_skipped = []
+    owner_mandated_skipped = []
     monitors = data.get("active_monitors", [])
 
     #  / rb-504: per-strategy-file allowlist of append-only audit
@@ -269,6 +270,12 @@ def cmd_check(args):
     # See core/config/meta.yaml backpressure.audit_only_fields. Missing or
     # empty config → empty dict → legacy unconditional-rollback behavior.
     audit_only_fields = config.get("audit_only_fields", {}) or {}
+    # : a SECOND allowlist with an orthogonal criterion — admitted by
+    # PROVENANCE (an explicit owner instruction), not by behavioural inertness.
+    # Reuses the same matcher/basename helpers deliberately: they take the
+    # allowlist as a parameter, so no helper changes and guard-130's
+    # byte-equivalence mirror with mind_api/src/meta/ is untouched.
+    owner_mandated_fields = config.get("owner_mandated_fields", {}) or {}
 
     for monitor in monitors:
         if monitor["status"] != "monitoring":
@@ -325,6 +332,34 @@ def cmd_check(args):
                 }
                 audit_only_skipped.append(skip)
                 data.setdefault("audit_only_skips", []).append(skip)
+            elif _is_audit_only_field(
+                monitor["field"],
+                _audit_allowlist_for(monitor["strategy_file"], owner_mandated_fields),
+            ):
+                # OWNER-MANDATED value: an explicit human instruction set this, so an
+                # automatic mechanism may not silently undo it. Distinct status and
+                # distinct skip key from audit_only_* on purpose — the two refusals
+                # have different REASONS and collapsing them would hide which fired.
+                monitor["status"] = "owner_mandated_skipped"
+                skip = {
+                    "meta_change_id": monitor["meta_change_id"],
+                    "strategy_file": monitor["strategy_file"],
+                    "field": monitor["field"],
+                    "would_have_rolled_back_to": monitor["old_value"],
+                    "failed_value": monitor["new_value"],
+                    "skipped_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+                    "reason": (
+                        f"owner_mandated_field — backpressure refused to roll back a "
+                        f"value set by explicit owner instruction "
+                        f"({monitor['strategy_file']}::{monitor['field']}); "
+                        f"see meta.yaml backpressure.owner_mandated_fields and "
+                        f"g-115-8149"
+                    ),
+                    "imp_k_at_check": learning_value,
+                    "goals_measured": monitor["goals_since_change"],
+                }
+                owner_mandated_skipped.append(skip)
+                data.setdefault("owner_mandated_skips", []).append(skip)
             else:
                 monitor["status"] = "rolled_back"
                 # Count total goals for cooldown tracking
@@ -383,6 +418,7 @@ def cmd_check(args):
         "graduated": graduated,
         "dead_end_candidates": dead_end_candidates,
         "audit_only_skipped": audit_only_skipped,
+        "owner_mandated_skipped": owner_mandated_skipped,
         "active_monitors_count": len(data["active_monitors"]),
     }
     print(json.dumps(result, ensure_ascii=False, default=str))

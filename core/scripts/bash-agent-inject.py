@@ -313,6 +313,70 @@ def _detect_agent_dir_cruft(command: str, project_root: Path):
     return None
 
 
+def _maybe_tick_heartbeat(agent: str, sid: str, project_root: Path) -> None:
+    """Keep THIS Body's liveness fresh at TOOL-CALL cadence ().
+
+    Every other heartbeat-tick.sh caller is keyed to loop structure — one tick
+    per iteration, one per diary write, one per 60s of a sanctioned sleep. A
+    runner that issues tool calls for hours without completing an iteration or
+    writing a breadcrumb therefore reads as DEAD to every consumer of the
+    signal: the worker's reducer-liveness poll parks the Body, an observer
+    /stop or /start --recover treats the runner as crashed, and a peer box may
+    stale-break its lease. Measured 2026-08-28 (coach on zc-03, a served 27B):
+    precheck alone ran 1h53m, the claim heartbeat aged to 6544s, the worker
+    parked on "Reducer STALE". This hook fires before EVERY Bash call, so a
+    tick from here is the one cadence that tracks the model's actual pace.
+
+    ROLE SPLIT is the caller's job. The tick's own state gate separates a
+    cross-box worker (IDLE by design) from the reducer, but a same-box worker
+    shares agent-state=RUNNING and would renew the reducer's lease with the
+    shared runner-token. So: SID == running-session-id -> the full tick, on the
+    diary path's own `claim-renewal-last` window (one tick per interval across
+    both callers); any other Body -> `--body-only`, which refreshes only its
+    carrier, on a per-SID stamp under core/logs. A session with NO carrier is
+    not a Body (an observer, an assistant) and never ticks — and this function
+    never creates the carrier; /start and the tick own that.
+
+    DETACHED (see _shared_tick.spawn_detached): this hook is on the critical
+    path of every tool call, and a tick blocked on a slow daemon would time the
+    hook out and drop the MIND_AGENT injection for that call. Fail-open on
+    every path, like every other clause in this hook.
+    """
+    try:
+        if not sid or any(c in sid for c in ("/", "\\", "\n", "\r", " ")) or ".." in sid:
+            return
+        state_dir = _agent_dir(project_root, agent) / "session"
+        carrier = state_dir / f"body-heartbeat-{sid}.json"
+        if not carrier.is_file():
+            return
+        import _shared_tick
+        if _shared_tick.pytest_suppressed():
+            return
+        running = ""
+        try:
+            running = (state_dir / "running-session-id").read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+        if running == sid:
+            body_only = False
+            stamp = state_dir / "claim-renewal-last"
+        else:
+            body_only = True
+            stamp = project_root / "core" / "logs" / "heartbeat-hook" / sid
+        if not _shared_tick.due(stamp):
+            return
+        # Stamp BEFORE the spawn so a slow or failing tick cannot re-fire on
+        # every subsequent call (the same order execution-diary.py uses).
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.touch()
+        _shared_tick.spawn_detached(
+            SCRIPT_DIR, agent, sid, body_only=body_only,
+            log_path=project_root / "core" / "logs" / f"heartbeat-hook-{agent}.log",
+            cwd=project_root)
+    except Exception:
+        pass
+
+
 def main():
     data = stdin_json_or_approve()
 
@@ -581,6 +645,12 @@ def main():
                     goal_clause = f"export MIND_GOAL_ID={_gid}; "
         except (OSError, ValueError, TypeError, AttributeError):
             goal_clause = ""
+
+    # Liveness at tool-call cadence (). After the role/goal clauses so
+    # it reuses the same resolved agent name; before the emit so it costs the
+    # hook one stat per call and a detached spawn once per interval.
+    if _agent_m:
+        _maybe_tick_heartbeat(_agent_m.group(1), sid, project_root)
 
     expected_prefix = (f'export PATH="{shim_path}:$PATH"; '
                        f'{agent_clause}{body_clause}{goal_clause}export MIND_SID={sid};')

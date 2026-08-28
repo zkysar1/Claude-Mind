@@ -991,9 +991,13 @@ IF categories:
         # Same population S3 built `categories` from, so `total` is a valid
         # denominator for this axis too — do not re-derive a second total here,
         # or the two axes stop being comparable.
+        # ⛔ NOT `g.aspiration_id` — absent from the compact (goals are NESTED),
+        # so a literal read buckets all under None and prints a spurious 100%.
+        # Rationale: core/config/rationale/strategic-scan-axis2-grouping-key.md
         asp_counts = {}
-        FOR EACH g in pending/in-progress goals across active_asps:
-            asp_counts[g.aspiration_id] = asp_counts.get(g.aspiration_id, 0) + 1
+        FOR EACH (asp, g) in [(a, g) for a in active_asps for g in a.goals
+                              if g.status in ("pending", "in-progress")]:
+            asp_counts[asp.id] = asp_counts.get(asp.id, 0) + 1   # PARENT's id
         IF asp_counts:
             max_asp = max(asp_counts, key=asp_counts.get)
             max_asp_pct = asp_counts[max_asp] / total
@@ -1656,8 +1660,13 @@ observation becomes work.
 ```
 # Single-writer cadence stamp: reaching S5 means the scan ran end-to-end
 # (signals were collected in S1-S4) regardless of whether any fired.
-# The orchestrator's Phase 1.5 time_cadence trigger reads this slot.
-# Without this write, strategic_scan.hours_cadence silently never fires.
+# Read by orchestrator Phase 1.5 AND strategic-scan-cadence-check.py (precheck
+# 0.5e). ⚠ NOT WRITING IT RE-ARMS THE CADENCE EVERY ITERATION — it does NOT
+# disable it (`:139` exit 0 = FIRE when unset; a stale stamp fires too, `:6`).
+# This line asserted the opposite until 2026-08-27, measured after the scan
+# fired 3x running on deferrals that never reached S5 (guard-3503: reason was
+# false, conclusion survives). **SKIPPING THE PHASE BODIES? WRITE THE STAMP
+# ANYWAY** — the one irreducible action here. Trace: strategic-scan-readings.md.
 # Routed through verified-wm-set.sh (write -> read-back -> assert -> retry-once)
 # so a silent drop FAILS LOUD instead of re-firing the scan every iteration
 # undetected (g-115-1416; the bare write form dropped a stamp 2026-06-13). This

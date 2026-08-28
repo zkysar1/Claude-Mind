@@ -539,6 +539,10 @@ def check(ctx) -> "Response":  # type: ignore[name-defined]
     graduation_window = config.get("graduation_window", 15)
     baseline_tolerance = config.get("baseline_tolerance", -0.10)
     audit_only_fields = config.get("audit_only_fields", {}) or {}
+    # : sibling allowlist admitted by PROVENANCE (explicit owner
+    # instruction), not by behavioural inertness. Mirrors core/scripts/
+    # meta-backpressure.py; helpers unchanged so guard-130 stays satisfied.
+    owner_mandated_fields = config.get("owner_mandated_fields", {}) or {}
 
     # locked_rmw may run _cycle MORE THAN ONCE (a peer landed a write between
     # our read and our conditional PUT). Every accumulator must therefore be
@@ -553,6 +557,7 @@ def check(ctx) -> "Response":  # type: ignore[name-defined]
         rollback_actions: List[Any] = []
         graduated: List[Any] = []
         audit_only_skipped: List[Any] = []
+        owner_mandated_skipped: List[Any] = []
         monitors = data.get("active_monitors", [])
 
         for mon in monitors:
@@ -593,6 +598,30 @@ def check(ctx) -> "Response":  # type: ignore[name-defined]
                     }
                     audit_only_skipped.append(skip)
                     data.setdefault("audit_only_skips", []).append(skip)
+                elif _is_audit_only_field(
+                    mon["field"],
+                    _audit_allowlist_for(mon["strategy_file"], owner_mandated_fields),
+                ):
+                    # OWNER-MANDATED: an explicit human instruction set this value, so
+                    # an automatic mechanism may not silently undo it. Distinct status
+                    # and skip key from audit_only_* — the refusals differ in REASON.
+                    mon["status"] = "owner_mandated_skipped"
+                    skip = {
+                        "meta_change_id": mon["meta_change_id"],
+                        "strategy_file": mon["strategy_file"], "field": mon["field"],
+                        "would_have_rolled_back_to": mon["old_value"],
+                        "failed_value": mon["new_value"], "skipped_at": _now(),
+                        "reason": ("owner_mandated_field — backpressure refused to roll "
+                                   "back a value set by explicit owner instruction "
+                                   "({}::{}); see meta.yaml "
+                                   "backpressure.owner_mandated_fields and "
+                                   "g-115-8149".format(
+                                       mon["strategy_file"], mon["field"])),
+                        "imp_k_at_check": learning_value,
+                        "goals_measured": mon["goals_since_change"],
+                    }
+                    owner_mandated_skipped.append(skip)
+                    data.setdefault("owner_mandated_skips", []).append(skip)
                 else:
                     mon["status"] = "rolled_back"
                     vel = _read_yaml(ctx.paths.meta / "improvement-velocity.yaml")
