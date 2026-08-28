@@ -139,7 +139,36 @@ re-reading.
   #     because echo's own N=73 row names N=74 in its body. guard-2653's `handoff to
   #     N=` filter does not catch that phrasing and cannot be widened to (the forms
   #     are unbounded prose) — position is the reliable discriminator, not wording.
-  Bash: source core/scripts/_paths.sh && S="$WORLD_PATH/knowledge/tree/system/directive-lane-compliance/directive-lane-series-$MIND_AGENT.md"; { grep -E '^#{1,4} ' "$S" | grep -viE 'handoff to N=' | grep -oE 'N=[0-9]+'; grep -oE '^\| \*\*N=[0-9]+' "$S"; grep -viE 'handoff to N=' "$S" | awk '/^\|/ { if (match($0, /N=[0-9]+/)) print substr($0, RSTART, RLENGTH) }'; } | grep -oE '[0-9]+' | sort -n | tail -1
+  #     ⚠ READ THE AUTHORITATIVE STORE COPY, NOT $WORLD_PATH — AND RE-RUN THIS
+  #     PROBE IMMEDIATELY BEFORE THE PHASE-8 WRITE (g-115-8055). This line read
+  #     the local mirror until 2026-08-27. Two independent defects, and fixing
+  #     only the first leaves the collision intact:
+  #       (1) SOURCE. Under own-cloud $WORLD_PATH is a read-through cache, so the
+  #           allocation could be computed from stale bytes (guard-157: default NO
+  #           mirror, read the single authoritative source). backend-cat.sh cat is
+  #           a pure to-memory authoritative read.
+  #       (2) SHELF LIFE — the load-bearing half. N is a value DERIVED from a read,
+  #           and the write happens many minutes later at Phase 8. owncloud_backend
+  #           fences every PUT with PutObject(IfMatch), which proves no LOST UPDATE
+  #           and says NOTHING about whether the allocated VALUE is unique: box A
+  #           reads 88 -> mints 89 -> writes (fence passes); box B read 88 before
+  #           A's write, mints 89, and B's write ALSO passes because locked_rmw
+  #           re-reads and B's ETag is current at B's OWN write. Two N=89 sections
+  #           in a file that stayed internally consistent throughout — so every
+  #           drift and integrity probe reports [match] and nothing sees it. That
+  #           is exactly how the 89a/89b collision was minted. (guard-5322,
+  #           guard-1876: a measured verdict about mutable data has a shelf life.)
+  #     SO: allocate at WRITE time, not at read time. Re-run this probe as the last
+  #     step before writing the section heading and use THAT max+1. If the value
+  #     moved between the two runs, a peer allocated in the gap — take the new max,
+  #     do not keep your earlier number.
+  #     ⚠ FAIL LOUD, NEVER FALL BACK TO THE MIRROR. An authoritative read that
+  #     fails means N is unallocatable this pass; silently re-reading $WORLD_PATH
+  #     restores defect (1) at precisely the moment it is most likely to bite.
+  #     The three branches below are UNCHANGED and must stay byte-identical — the
+  #     shape is correct and hard-won (verified all five shards; zeta corrected by
+  #     45). Only the SOURCE of $S and the TIMING of the run are the fix.
+  Bash: source core/scripts/_paths.sh && P="world/knowledge/tree/system/directive-lane-compliance/directive-lane-series-$MIND_AGENT.md"; S="$(mktemp)"; bash core/scripts/backend-cat.sh cat "$P" > "$S" 2>/dev/null || { echo "FATAL: authoritative read of $P failed — N is UNALLOCATABLE this pass. Do NOT fall back to \$WORLD_PATH (g-115-8055)."; rm -f "$S"; exit 1; }; test -s "$S" || { echo "FATAL: authoritative read returned 0 bytes — refusing to allocate N from an empty file."; rm -f "$S"; exit 1; }; { grep -E '^#{1,4} ' "$S" | grep -viE 'handoff to N=' | grep -oE 'N=[0-9]+'; grep -oE '^\| \*\*N=[0-9]+' "$S"; grep -viE 'handoff to N=' "$S" | awk '/^\|/ { if (match($0, /N=[0-9]+/)) print substr($0, RSTART, RLENGTH) }'; } | grep -oE '[0-9]+' | sort -n | tail -1; rm -f "$S"
   #     VERIFIED against ground truth 2026-08-18 (zeta, cc-02, 6.8.0-137-generic), all
   #     five shards, old two-branch vs new three-branch, same run:
   #       alpha 83→83 · bravo 61→61 · echo 73→73 · foxtrot 57→57 · **zeta 34→79**

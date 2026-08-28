@@ -86,7 +86,12 @@ _PARSES = re.compile(r"(?:json\.loads?\b|yaml\.safe_load\b)")
 # The defect itself: an explicit fallback converting empty stdout into an empty
 # structure. Covers `read() or '[]'`, `... or '{}'`, `... or ''`, either quote.
 _COERCE = re.compile(
-    r"""(?:sys\.stdin\.read\(\)|stdin\.read\(\)|read\(\))\s*or\s*"""
+    # stdin-consumption spellings the earlier form missed (): a
+    # .strip()/.rstrip()/.lstrip() chain between the read and `or`, plus the
+    # readline()/readlines()/input() alternatives to read().
+    r"""(?:sys\.stdin\.read\(\)|stdin\.read\(\)|read\(\)"""
+    r"""|sys\.stdin\.readlines?\(\)|stdin\.readlines?\(\)|readlines?\(\)|input\(\))"""
+    r"""(?:\.[lr]?strip\([^)]*\))*\s*or\s*"""
     r"""(['"])\s*(?:\[\s*\]|\{\s*\}|)\s*\1"""
 )
 
@@ -94,7 +99,11 @@ _COERCE = re.compile(
 # bash idiom for a piped command and MUST be here: omitting it was measured to
 # misclassify thousands of deliberately-guarded calls as unguarded.
 _RC = re.compile(
-    r"(?:PIPESTATUS|\$\?|pipefail|\brc=|\bRC=|\bEXIT=|set\s+-e\b)"
+    # `set -e` REMOVED (): without `pipefail` it does not abort on
+    # a PRODUCER failure in `producer | parser` -- only the parser's (last)
+    # status is seen -- so it does not read the status that matters here.
+    # `pipefail` (with or without `set -e`) IS the real signal and stays.
+    r"(?:PIPESTATUS|\$\?|pipefail|\brc=|\bRC=|\bEXIT=)"
 )
 
 # --- SECOND FORM: the shape-selective parser () -------------------

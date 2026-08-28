@@ -233,6 +233,16 @@ def _coordination_merge_handler(path):
 _MANIFEST_STAMP_LOCK = threading.Lock()
 
 
+class NoClaimError(Exception):
+    """A write targeted an agent dir this machine does NOT hold the live runner
+    claim for (g-115-8028). Structurally different from ConflictError: no retry
+    and no refresh can ever succeed from here, because this box is permanently
+    behind the claim-holder's advancing version. Raised only when ownership
+    provenance is ``live-claims`` — never on the conservative empty-set
+    fail-safe, where the box may in fact own the dir and merely failed to read
+    the claim table."""
+
+
 class ConflictError(Exception):
     """An ``If-Match`` conditional PUT was rejected (the object changed since the
     in-lock read). The caller MUST re-run the whole read-modify-write; the
@@ -396,6 +406,9 @@ class OwnCloudBackend:
     #: — to drive the G1 re-read->re-apply->re-PUT retry, with zero import
     #: coupling to this concrete module. See storage_backend.StorageBackend.
     conflict_error = ConflictError
+    #: g-115-8028 twin of conflict_error — lets the daemon classify the
+    #: structural no-claim case by TYPE without importing this module.
+    no_claim_error = NoClaimError
 
     def __init__(self, *, env_id: str, bucket: str, lock_table: str,
                  sessions_table: str, cache_root: PathLike = None,
@@ -1501,6 +1514,54 @@ class OwnCloudBackend:
         # conftest never loads) and the bash aggregator that ran the 2026-07-09
         # truncating test. See _assert_not_tempdir_put for the full rationale.
         self._assert_not_tempdir_put(path)
+        # g-115-8028: ownership consult BEFORE the first remote round-trip, so
+        # "no wasted round-trip" holds by construction rather than by review.
+        # ORDER IS LOAD-BEARING and is asserted by test_no_claim_error.py: this
+        # sits AFTER the guard-955 tempdir tripwire (a tmp-world PUT is the
+        # worse error and must not be masked by an ownership verdict) and after
+        # the _machine_local early return above (those writes never reach S3, so
+        # ownership is not a question -- refusing there would be a false
+        # refusal and would break the rb-2396 per-agent-telemetry path).
+        # Fires ONLY on provenance "live-claims". "local-backend",
+        # "transient-error" and "unknown-machine" all fall through to the
+        # ordinary fenced PUT, because on those this box may in fact own the dir
+        # and merely failed to prove it -- asserting a structural impossibility
+        # there would be the same confident-and-wrong error this fix removes.
+        # Function-local import: the house pattern for this module pair (five
+        # existing owncloud_sync imports in this file, L684/784/1000/1078).
+        try:
+            from _paths import agents_root
+            from owncloud_sync import _owned_agents_with_provenance
+            _root = Path(agents_root()).resolve()
+            try:
+                _agent = Path(path).resolve().relative_to(_root).parts[0]
+            except (ValueError, IndexError):
+                _agent = None          # not under an agent dir -- not our case
+            if _agent is not None:
+                _owned, _prov = _owned_agents_with_provenance()
+                if _prov == "live-claims" and _agent not in (_owned or set()):
+                    raise NoClaimError(
+                        "no_claim: this box does not hold the live runner claim "
+                        "for agent dir '%s'. The write did NOT land, and NO "
+                        "retry or refresh can EVER succeed from here -- this box "
+                        "is permanently behind the claim-holder's advancing "
+                        "version. STRUCTURAL, not a race: do not retry, do not "
+                        "refresh. Relay instead -- post the full payload plus "
+                        "registration instructions to the coordination board for "
+                        "the claim-holding instance to execute (worked example: "
+                        "msg-20260827-110602-bravo-6570, g-364-104)." % _agent)
+        except NoClaimError:
+            raise
+        except Exception as _consult_exc:
+            # NEVER a bare `pass`. A fail-open wrapper around a NEW code path
+            # turns every authoring error in it into silence: an earlier draft
+            # of this block called a helper that did not exist, and the
+            # resulting NameError was swallowed here -- the guard never fired,
+            # compiled clean, and passed every existing test. Naming the
+            # exception type keeps "the consult is broken" distinguishable from
+            # "the consult ran and found nothing" (guard-1715 class).
+            _LOG.warning("[no-claim-consult] skipped: %s: %s",
+                         type(_consult_exc).__name__, _consult_exc)
         key = self._s3_key(path)
         local = self._local(path)
         local.parent.mkdir(parents=True, exist_ok=True)

@@ -224,7 +224,7 @@ def _compute_drift(session_completions, targets, window_size, critical_ratio):
     return drifted
 
 
-def _detect_aspiration_source(aspiration_id: str) -> Optional[str]:
+def _detect_aspiration_source(aspiration_id: str, agent: str) -> Optional[str]:
     """Probe world then agent queue for the aspiration_id.
 
     Returns "world", "agent", or None. Used by _file_unblock_goal to route
@@ -232,6 +232,11 @@ def _detect_aspiration_source(aspiration_id: str) -> Optional[str]:
     actually lives — the gate's target may be a shared aspiration (world)
     or an agent-local one (agent). Fail-open: read errors skip the queue,
     never crash the gate.
+
+    `agent` is supplied by the caller (main() -> _file_unblock_goal), NOT
+    re-read from the environment here. main() resolves it via _agent_name()
+    and refuses an unset MIND_AGENT outright, so threading it through keeps
+    one source of truth for agent identity across the whole run.
     """
     def _queue_contains(jsonl_path: Path) -> bool:
         if not jsonl_path.is_file():
@@ -252,9 +257,15 @@ def _detect_aspiration_source(aspiration_id: str) -> Optional[str]:
 
     # Read external world path from agent's local-paths.conf.
     # agent_dir(<agent>)/local-paths.conf is the canonical location
-    # (Phase 2.5.D: agents/<agent>/ via _paths.agent_dir helper);
-    # fall back to alpha if MIND_AGENT not resolvable.
-    agent = os.environ.get("MIND_AGENT", "")
+    # (Phase 2.5.D: agents/<agent>/ via _paths.agent_dir helper).
+    #
+    # Do NOT re-read MIND_AGENT here with a literal default. main() already
+    # resolved this agent via _agent_name() and returns rc=1 on an unset
+    # MIND_AGENT; a second resolution with a hardcoded peer name would read
+    # ONE SPECIFIC OTHER AGENT'S private local-paths.conf and aspirations.jsonl
+    # and return a plausible wrong answer instead of failing. That is the
+    # read-path cousin of the write-path defect  fixed in
+    # cross-world-inject-goal.sh. (, 2026-08-28.)
     paths_file = _resolve_agent_dir(agent) / "local-paths.conf"
     world_dir = None
     if paths_file.is_file():
@@ -336,7 +347,7 @@ def _file_unblock_goal(agent_name, aspiration_id, drift_info, dry_run):
     # Auto-detect source: aspiration_id may live in the world queue (shared,
     # e.g.  portfolio-steering) OR the agent queue (e.g. ).
     # Hardcoding agent fails when the domain uses a world-queue aspiration.
-    source = _detect_aspiration_source(aspiration_id)
+    source = _detect_aspiration_source(aspiration_id, agent_name)
     if source is None:
         return {"filed": False,
                 "error": f"Aspiration {aspiration_id} not found in world or agent queues",

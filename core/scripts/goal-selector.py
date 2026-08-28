@@ -93,6 +93,7 @@ from wm import read_wm  # noqa: E402
 from peer_surface import (parse_routing_tag,  # noqa: E402
                           routing_tag_targets_agent)
 from cadence_signals import evaluate_cadence_signal  # noqa: E402  ( signal-gated cadence)
+from pull_signal_producer import is_live as pull_signal_is_live  # noqa: E402  ( eligibility bypass)
 # Single source of truth for terminal goal statuses — see aspirations.py.
 # Derived sets below (SKIP_STATUSES, ABANDONED_STATUSES) stay consistent if a new
 # status is added to TERMINAL_GOAL_STATUSES.
@@ -104,8 +105,47 @@ from _runner_capabilities import (  # noqa: E402  ( per-runner capability filter
     derive_runner_capabilities, box_config_from_conf, merge_capability_config,
     goal_is_locally_executable, goal_required_capabilities)
 from _drain_title import is_drain_action_title  # noqa: E402  ( owner-scope drain SSOT)
+from _dependency_graph import supersession_satisfied_ids  # noqa: E402  ( SSOT, guard-547)
 SKIP_STATUSES = TERMINAL_GOAL_STATUSES | {"in-progress"}              # not selectable
 ABANDONED_STATUSES = TERMINAL_GOAL_STATUSES - {"completed"}            # terminal but not "done"
+
+
+def expand_done_ids_via_supersession(aspirations, done_ids):
+    """Return `done_ids` plus every id whose supersession chain ends completed.
+
+    `done_ids` is a flat SET and every dependency check in this module is set
+    membership (`bid not in done_ids`), which cannot follow a pointer. So a
+    duplicate closed `skipped` with its work MOVED to another goal reads as
+    NOT-done forever, and every dependent stays frozen. Measured 2026-08-26:
+    that exact read re-deferred two just-unblocked goals and left zero goals
+    selectable across 1,400 ranked for ~4h.
+
+    STRICTLY ADDITIVE — a union, never a difference. Nothing that was
+    selectable before can become blocked by this call, so the failure
+    direction is "still frozen", which is the pre-existing behaviour, never
+    "wrongly unfrozen by removing a check". The resolver behind it satisfies
+    ONLY on a chain that reaches `completed`; `open` / `unknown` / `cycle` all
+    decline (see `_dependency_graph.supersession_satisfied_ids`).
+
+    Called at each `global_done_ids` build site rather than at the two
+    `blocked_by` read sites, deliberately: collect_candidates and
+    collect_blocked MUST agree on done-ness or a goal appears unblocked in
+    selection and blocked in diagnostics, and both already read whatever this
+    one set contains. One expansion point keeps that symmetry structural
+    instead of remembered.
+
+    Live effect when wired (2026-08-27, 3,182 goals): 10 ids added, 0 live
+    goals changed their unmet-dep set — a latent fix, not a queue reshuffle.
+    """
+    index = {}
+    for asp in aspirations:
+        if asp.get("status") != "active":
+            continue
+        for g in asp.get("goals", []) or []:
+            gid = g.get("id")
+            if gid:
+                index[gid] = g
+    return done_ids | supersession_satisfied_ids(index, already_done=done_ids)
 
 # Populated by main() before scoring loop fires; consumed by score_goal's
 # cross_aspiration_support criterion (LifingPolls item 2). Empty fallback
@@ -1737,6 +1777,15 @@ def load_recent_class_completions(window_size=20):
                     ts = (g.get("completed_at") or g.get("completed_date")
                           or g.get("lastAchievedAt"))
                     if ts and info["work_class"]:
+                        # DEDUP BY CONSTRUCTION ( F-2): a goal id can
+                        # contribute at most ONE row here, because the store keeps a
+                        # single completion marker per goal — measured 2026-08-27
+                        # (zeta, cc-02): 948 dated rows, 948 distinct ids, 0 repeats,
+                        # unfiltered population 3130. The journal this replaced
+                        # () carried one entry PER FIRING, so
+                        # per_goal_saturation.consecutive_threshold > 1 is now
+                        # unreachable from this path. See core/config/aspirations.yaml
+                        # per_goal_saturation.
                         dated.append((str(ts), info, g.get("completed_by") or ""))
     except Exception:
         return _in_session_fallback()
@@ -1794,7 +1843,7 @@ def load_recent_class_completions(window_size=20):
     # window still beats no cross-session window at all, which is the defect
     # being fixed.
     if dated:
-        mine = [d for d in dated if d[2] == AGENT_NAME]
+        mine = [d for d in dated if AGENT_NAME and d[2] == AGENT_NAME]
         scoped = mine or dated
         label = ("the aspirations store" if mine
                  else "the aspirations store (unattributed — fleet-wide)")
@@ -1849,15 +1898,41 @@ def load_recent_class_completions(window_size=20):
     # filled entirely from months ago was indistinguishable from a fresh one and
     # was returned as "recent".
     #
-    # That is not hypothetical: `goals_completed` has NO writer anywhere in
-    # core/scripts or mind_api (every match targets a different store — session
-    # telemetry, handoff.yaml, or the loop_state int counter), so the field
-    # stopped being populated and the window silently fossilised. Measured
-    # 2026-07-31: alpha walked back 194 of 384 journal entries to fill 20, whose
-    # newest contributor was 15.7 days old and oldest 50.7; zeta measured 82 days
-    # on a second box. Three scorer criteria consume this window —
-    # per_goal_saturation (a RAPID-REPEAT suppressor charging -5.0 for a
-    # months-old completion), class_balance_bonus, and context_coherence.
+    # CORRECTED IN PLACE 2026-08-28 (, alpha/cc-08). This comment used
+    # to read "`goals_completed` has NO writer anywhere in core/scripts or
+    # mind_api". That is FALSE and has been since 2026-04-25 (commit c9b2248d4):
+    # `core/scripts/journal-append.sh:257` unions the closing goal id into a
+    # journal record via journal-merge.sh, and both live callers reach it
+    # (iteration-close.sh:2133, worker_retrospective.py:790). The original grep
+    # covered .py only, where every match really does target a different store
+    # (session telemetry, handoff.yaml, the loop_state int counter) — which is
+    # exactly why the wrong conclusion looked well-evidenced.
+    #
+    # The field is written CONSTANTLY, to ONE WRONG RECORD. journal-append.sh
+    # derives its session number from `active_context.session_id`, which fails
+    # two INDEPENDENT ways that both land on the literal fallback "1":
+    #   (A) format — `wm-read.sh active_context` emits YAML and the inline
+    #       parser calls json.load, so it raises JSONDecodeError and takes
+    #       `except: print("1")`. wm-read.sh HAS a `--json` flag; no caller
+    #       passes it.
+    #   (B) schema — `active_context` has no `session_id` key. wm.py:427 defines
+    #       the slot as {summary, experience_refs, retrieval_manifest} and
+    #       nothing in production writes one; only test fixtures construct it.
+    #       So even with --json, sid == "" and the same "1" is returned.
+    # Fixing (A) alone is a NO-OP. Measured 2026-08-28 across all five agents:
+    # 90.1%-99.5% of every goal id ever recorded sits in 3-19 records claiming
+    # session 1, dated 2026-03-27..2026-05-16; alpha's largest holds 2062 ids and
+    # its newest entries are same-day closes.
+    #
+    # So this window does not fossilise because nothing writes — it fossilises
+    # because the writes land in an ancient record that this newest-first walk
+    # reaches LAST. The staleness guard below is unchanged and still needed; only
+    # its stated cause was wrong. Measured 2026-07-31: alpha walked back 194 of
+    # 384 journal entries to fill 20, whose newest contributor was 15.7 days old
+    # and oldest 50.7; zeta measured 82 days on a second box. Three scorer
+    # criteria consume this window — per_goal_saturation (a RAPID-REPEAT
+    # suppressor charging -5.0 for a months-old completion), class_balance_bonus,
+    # and context_coherence.
     #
     # guard-138 governs the SHAPE: a clock-only staleness heuristic must not take
     # a destructive action. This one is deliberately non-destructive — it falls
@@ -2360,7 +2435,43 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
                     interval = get_interval_hours(goal)
                     la = hours_since(goal.get("lastAchievedAt"))
                     if la is not None and la < interval:
-                        continue
+                        # EVENT-keyed bypass (), mirroring the
+                        # cadence_signal bypass directly above. apply_pull_boost
+                        # runs on `scored`, and this `continue` drops the goal
+                        # BEFORE scoring — so the boost could only ever lift a
+                        # consumer the time gate had ALREADY admitted, which made
+                        # the flag inert for exactly the case it exists for
+                        # ("fire WHEN the carrier arrives", not on the interval).
+                        # MEASURED 2026-08-28:  carried a live
+                        # pull_signal for 1h50m (producer healthy — set by
+                        # alpha/cc-08 with the carrier ref) and was ABSENT from
+                        # BOTH bravo's and alpha's candidate sets, because
+                        # la 2.1h < interval 4.45h. Absence, not a low rank:
+                        # nothing score-side could have reached it.
+                        #
+                        # Liveness comes from pull_signal_producer.is_live, whose
+                        # docstring is literally "True when apply_pull_boost would
+                        # currently honour this signal" — ONE predicate, TWO
+                        # consumers, so eligibility and lift cannot drift apart.
+                        # That is the same argument overdue_exemption_level makes
+                        # for its own two consumers (); a second inline
+                        # copy of the skew/age arithmetic is what would rot.
+                        #
+                        # NO-REGRESSION BY CONSTRUCTION: is_live returns False for
+                        # a goal with no pull_signal dict, so every unpulled goal
+                        # takes the `continue` exactly as before. Gated on
+                        # PULL_CONFIG["enabled"] so disabling the mechanism
+                        # disables the bypass too, matching apply_pull_boost's
+                        # own early return.
+                        if not (
+                            PULL_CONFIG.get("enabled")
+                            and pull_signal_is_live(
+                                goal.get("pull_signal"),
+                                datetime.now(),
+                                float(PULL_CONFIG.get("max_age_hours", 24.0)),
+                            )
+                        ):
+                            continue
 
             # Hypothesis time gate (datetime-form safe — , _parse_rne_dt)
             rne_dt = _parse_rne_dt(goal.get("resolves_no_earlier_than"))
@@ -2643,6 +2754,7 @@ def collect_cross_agent_candidates(project_root, agent_dir, agent_name,
 def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
                     defer_reason_timeout_hours=None,
                     dependency_timeout_hours=None,
+                    reallocation_hours=None,
                     global_live_ids=None):
     """Return blocked goals with reasons (inverse of collect_candidates).
 
@@ -2662,6 +2774,11 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
     # module-wide (same accessor as collect_candidates) so the not_my_lane
     # classification below is the exact inverse of the candidate skip.
     runner_caps = _get_runner_capabilities()
+    # Same accessor collect_candidates uses (memoized per process, so this second
+    # call costs no extra authoritative-store probes) -- required by the
+    # routed_to_agent branch below to stay the exact complement of the candidate
+    # side's idle-reallocation escape. Empty set when reallocation is disabled.
+    idle_agents = _get_idle_agents(reallocation_hours)
 
     # Map skill -> blocker info for infrastructure blocks
     blocker_by_skill = {}
@@ -2933,6 +3050,55 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
                             "precondition", ",".join(sorted(failed_ids)))
                     blocked.append(entry)
                     continue
+
+            # 6.5 Routed-to-another-agent: intended_agent names a peer, so
+            #    collect_candidates DROPPED this goal at its intended_agent
+            #    filter. Without this inverse the goal vanishes from the ranked
+            #    list AND the blocked list -- invisible in both directions and
+            #    therefore immortal (guard-1698, which names this exact filter;
+            #    census  identified intended_agent as the ONLY
+            #    PERMANENT select-time drop lacking an inverse).
+            #    SYMMETRY: must be the logical complement of the intended_agent
+            #    check in collect_candidates. If you change one, change the
+            #    other. That side ESCAPES (surfaces the goal as selectable) only
+            #    when ALL THREE hold -- owner idle, goal unclaimed, goal not
+            #    owner-scoped -- so this side blocks unless all three hold, which
+            #    keeps candidate XOR blocked exact.
+            #    guard-3644: the detail names EVERY unmet escape conjunct, not
+            #    just the first. A message reporting one conjunct of an AND
+            #    describes the cheapest check, never the decisive one -- and an
+            #    "owner is idle, this self-clears" forecast read off a partial
+            #    reason is how a decided block gets re-read as a transient wait.
+            #    Placed BEFORE not_my_lane to mirror capability being the LAST
+            #    filter on the candidate side.
+            intended_agent = goal.get("intended_agent")
+            if routes_away_from(intended_agent, AGENT_NAME):
+                unmet_escape = []
+                if intended_agent not in idle_agents:
+                    unmet_escape.append("owner not idle")
+                if goal.get("claimed_by"):
+                    unmet_escape.append(
+                        "claimed by {c}".format(c=goal.get("claimed_by")))
+                if _is_owner_scoped_goal(goal):
+                    unmet_escape.append("owner-scoped work")
+                if unmet_escape:
+                    entry["block_reason"] = "routed_to_agent"
+                    entry["block_detail"] = (
+                        "Routed to {a}; idle-reallocation escape unavailable "
+                        "({w})".format(a=intended_agent,
+                                       w="; ".join(unmet_escape)))
+                    # guard-1362: routing/ownership fields must reach the
+                    # consuming LLM, not only the scoring/diagnostic ones.
+                    entry["intended_agent"] = intended_agent
+                    entry["unmet_escape_conditions"] = unmet_escape
+                    if not isinstance(entry.get("blocker_ref"), dict):
+                        entry["blocker_ref"] = _synth_block_ref(
+                            "routed-to-agent", str(intended_agent))
+                    blocked.append(entry)
+                    continue
+                # All three escape conditions hold -> collect_candidates
+                # surfaces this goal as selectable, so it is NOT blocked here.
+                # Fall through (never classify a live candidate as blocked).
 
             # 7. Not-my-lane: this runner lacks a capability the goal EXPLICITLY
             #    requires ( Slice 2). A per-RUNNER gap, distinct from a
@@ -5035,6 +5201,76 @@ def write_scorer_verdict(scored, agent_dir):
               f"({type(e).__name__}: {e})", file=sys.stderr)
 
 
+def write_scorer_verdict_banners(banners, agent_dir):
+    """Additively record the banner emitters' RETURNS onto the verdict sidecar
+    so the banners survive loss of stderr (g-115-4296).
+
+    WHY A SECOND WRITE instead of folding this into write_scorer_verdict: that
+    writer runs BEFORE both emitters deliberately ("so it can never disturb the
+    pinned emit_directive_honor_banner call site", g-115-2807), and the banners
+    do not exist yet at that point. Reordering would move the pinned call site;
+    an additive second write does not. The sidecar is already fail-open and its
+    only consumer reads just top_goal_id + ts, so an extra key is tolerated and
+    a failure here cannot affect selection or the claim gate.
+
+    THE TWO EMITTERS RETURN DIFFERENT SHAPES, AND THAT IS PRESERVED RATHER THAN
+    NORMALISED. emit_directive_honor_banner returns structured records
+    ({directive_id, goal_id, rank}) and PRINTS its prose without ever returning
+    it; emit_strategic_focus_banner returns its full banner TEXT. Reshaping the
+    former is not available: test_goal_selector_directive_honor_banner.py
+    asserts on warns[0]["directive_id"]/["goal_id"]/["rank"] and on `== []`, so
+    changing that return breaks the very pin this placement exists to protect.
+    Nothing actionable is lost — the prose is a rendering of those three fields
+    plus static boilerplate.
+
+    THE KEY IS WRITTEN EVEN WHEN BOTH LISTS ARE EMPTY, and that is load-bearing.
+    An ABSENT `banners` key means the sidecar predates this feature or the second
+    write failed; a PRESENT key holding empty lists means the emitters ran and
+    had nothing to say. Collapsing those two states would leave the sidecar
+    unable to answer the one question it was added to answer.
+
+    `errors` is recorded for the same reason: an emitter that RAISED reports only
+    to stderr, which is exactly the channel this function exists to backstop, so
+    an exception would otherwise be indistinguishable from "returned nothing".
+
+    ONLY EVER CALLED FROM cmd_select. `goal-selector.sh blocked` must keep
+    touching neither the drain-lane state nor this sidecar — guard-2545 measured
+    that byte- and mtime-identical, and a prescribed cross-check ritual depends
+    on it — so do not call this from any other subcommand.
+    """
+    if agent_dir is None or not banners:
+        return
+    if not _agent_is_resident():
+        _suppress_cross_agent_write("scorer-verdict-banners")
+        return
+    try:
+        session_dir = agent_dir / "session"
+        target = session_dir / "scorer-verdict.json"
+        if not target.exists():
+            return  # primary write no-op'd (no candidates) — nothing to append to
+        with open(target, encoding="utf-8") as fh:
+            verdict = json.load(fh)
+        if not isinstance(verdict, dict):
+            return  # never overwrite a sidecar whose shape we do not recognise
+        verdict["banners"] = banners
+        fd, tmp = tempfile.mkstemp(
+            dir=str(session_dir), prefix=".scorer-verdict-", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(verdict, fh, ensure_ascii=False, indent=2)
+            os.replace(tmp, target)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except Exception as e:  # pragma: no cover - defensive; write must never block
+        print(f"[goal-selector] scorer-verdict banner write error "
+              f"({type(e).__name__}: {e})", file=sys.stderr)
+
+
 def cmd_select(args):
     """Score and rank all unblocked goals from both world and agent queues.
 
@@ -5084,6 +5320,9 @@ def cmd_select(args):
                 global_done_ids.add(g["id"])
             if st not in TERMINAL_GOAL_STATUSES:
                 global_live_ids.add(g["id"])
+    # Supersession-aware done-ness (). Additive union; see the
+    # function docstring for why this is the ONE expansion point.
+    global_done_ids = expand_done_ids_via_supersession(all_aspirations, global_done_ids)
 
     # Load multi-agent coordination config from aspirations.yaml
     claim_timeout_hours = None
@@ -5180,6 +5419,11 @@ def cmd_select(args):
                     global_done_ids_retry.add(g["id"])
                 if st not in TERMINAL_GOAL_STATUSES:
                     global_live_ids_retry.add(g["id"])
+        # Supersession-aware done-ness () — mirrors the primary
+        # build above; the retry path must not resolve dependencies
+        # differently from the pass it is retrying.
+        global_done_ids_retry = expand_done_ids_via_supersession(
+            all_aspirations_retry, global_done_ids_retry)
         retry_candidates = collect_candidates(
             world_retry, known_blockers=known_blockers, source="world",
             global_done_ids=global_done_ids_retry, claim_timeout_hours=claim_timeout_hours,
@@ -5231,6 +5475,7 @@ def cmd_select(args):
                                       global_done_ids=global_done_ids_retry,
                                       defer_reason_timeout_hours=defer_reason_timeout_hours,
                                       dependency_timeout_hours=dependency_timeout_hours,
+                                      reallocation_hours=reallocation_hours,
                                       global_live_ids=global_live_ids_retry)
             if blocked:
                 print(json.dumps({
@@ -5368,9 +5613,18 @@ def cmd_select(args):
     # iteration -> compaction cannot summarize it away (the Phase 2.07 LLM path
     # can). Fail-open inside the helper; wrap defensively so a banner bug can
     # never suppress the ranked-candidate output.
+    # Return values captured () for write_scorer_verdict_banners below.
+    # Both emitters report ONLY to stderr, which an ad-hoc invocation carrying a
+    # hand-typed redirect discards silently — that is the failure mode the sidecar
+    # backstops. `errors` is carried for the same reason: an emitter that RAISED
+    # also reports only to stderr, so without it an exception would be
+    # indistinguishable from "ran and had nothing to say".
+    banners = {"directive_honor": [], "strategic_focus": [], "errors": []}
+
     try:
-        emit_directive_honor_banner(scored, AGENT_NAME)
+        banners["directive_honor"] = emit_directive_honor_banner(scored, AGENT_NAME) or []
     except Exception as e:  # pragma: no cover - defensive; banner must never block
+        banners["errors"].append(f"directive_honor: {type(e).__name__}: {e}")
         print(f"[goal-selector] directive-honor banner error "
               f"({type(e).__name__}: {e})", file=sys.stderr)
 
@@ -5379,10 +5633,17 @@ def cmd_select(args):
     # cannot express. Separately wrapped so it can never disturb the pinned
     # emit_directive_honor_banner call site above ().
     try:
-        emit_strategic_focus_banner(scored, AGENT_NAME)
+        banners["strategic_focus"] = emit_strategic_focus_banner(scored, AGENT_NAME) or []
     except Exception as e:  # pragma: no cover - defensive; banner must never block
+        banners["errors"].append(f"strategic_focus: {type(e).__name__}: {e}")
         print(f"[goal-selector] strategic-focus banner error "
               f"({type(e).__name__}: {e})", file=sys.stderr)
+
+    # Second, ADDITIVE sidecar write (). It must stay AFTER both
+    # emitters — that ordering is the entire reason it is a separate writer from
+    # write_scorer_verdict above, whose placement BEFORE them is itself pinned
+    # (). Fail-open; never reached by cmd_blocked (guard-2545).
+    write_scorer_verdict_banners(banners, AGENT_DIR)
 
     print(json.dumps(scored, indent=2, ensure_ascii=False))
 
@@ -5396,6 +5657,14 @@ def cmd_blocked(args):
     # Load expiry config (same source as cmd_select)
     defer_reason_timeout_hours = None
     dependency_timeout_hours = None
+    # reallocation_hours feeds collect_blocked's routed_to_agent branch, whose
+    # idle-owner escape must match the one cmd_select applies in
+    # collect_candidates. Loading it here (rather than leaving the kwarg at its
+    # None default) is what keeps the `blocked` CLI view consistent with the
+    # `select` view: with None the idle set is empty, so a goal whose owner IS
+    # idle would be a candidate under select AND blocked under this command --
+    # the exact candidate-XOR-blocked violation the branch exists to prevent.
+    reallocation_hours = None
     try:
         asp_config = read_yaml_file(CONFIG_DIR / "aspirations.yaml")
         ma = asp_config.get("multi_agent", {})
@@ -5406,6 +5675,9 @@ def cmd_blocked(args):
             dth = ma.get("dependency_timeout_hours")
             if dth is not None:
                 dependency_timeout_hours = float(dth)
+            rh = ma.get("reallocation_hours")
+            if rh is not None:
+                reallocation_hours = float(rh)
     except Exception:
         pass
 
@@ -5437,11 +5709,15 @@ def cmd_blocked(args):
                 global_done_ids.add(g["id"])
             if st not in TERMINAL_GOAL_STATUSES:
                 global_live_ids.add(g["id"])
+    # Supersession-aware done-ness () — same expansion the selection
+    # path uses, so `blocked` diagnostics never disagree with selection.
+    global_done_ids = expand_done_ids_via_supersession(aspirations, global_done_ids)
 
     blocked = collect_blocked(aspirations, known_blockers=known_blockers,
                               global_done_ids=global_done_ids,
                               defer_reason_timeout_hours=defer_reason_timeout_hours,
                               dependency_timeout_hours=dependency_timeout_hours,
+                              reallocation_hours=reallocation_hours,
                               global_live_ids=global_live_ids)
 
     # Count total non-terminal goals across active aspirations

@@ -36,6 +36,15 @@ VALID_USER_LEG_SCOPES = frozenset({
     "commit", "push", "deployment-approval",
     "architecture-decision", "credential-grant",
     "data-provision", "new-resource",
+    # An act the principal must perform AS A LEGAL OR CREDENTIALED PERSON:
+    # signature, certification, attestation, or a filing made under their
+    # identity. Added 2026-08-28 (zeta,  / ) because two
+    # genuinely-human goals were unclassifiable: an unsigned counterparty
+    # agreement and an OASIS+ SDVOSB submission asserting the principal's
+    # certification. `data-provision` was the nearest fit and is FALSE for
+    # both — the user is not supplying data to the agent, they are being the
+    # legal person. grant-010 retains exactly this class.
+    "principal-identity",
 })
 
 # Scopes where the user's JUDGMENT is the deliverable (approval, architectural
@@ -50,6 +59,12 @@ DECISION_LIKE_SCOPES = frozenset({
     "architecture-decision",
     "deployment-approval",
     "credential-grant",
+    # SYNC OBLIGATION discharged for "principal-identity": decision-like YES.
+    # The principal's own person/judgment IS the deliverable, so it must
+    # surface individually in /open-questions. Note it does NOT match
+    # _DECISION_SCOPE_SUBSTRINGS ("decision"/"approval"/"grant"), so this
+    # explicit membership is load-bearing, not belt-and-braces.
+    "principal-identity",
 })
 
 # Title prefixes that imply a decision even when user_leg_scope is unset —

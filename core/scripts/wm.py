@@ -1024,6 +1024,31 @@ def cmd_append(args):
     # placeholders like "multiple" or "tree_maintenance" produce false positives
     # in debt-closure matchers that use simple string containment.
     root_slot_for_validation = args.slot.split(".")[0]
+
+    # : TWIN of the capture-shape refusal in the daemon
+    # (mind_api/src/endpoints/wm_write.py::append_slot). The daemon is the LIVE
+    # path -- the wrappers are daemon-only -- so this copy exists for parity,
+    # exactly like the eviction counter and the carrier mirror below. Full
+    # rationale and the 2026-08-27 measurement live in the daemon copy; the
+    # short version: a non-dict capture entry is dropped SILENTLY by
+    # worker_retrospective.index_captures before bucketing, so it is never
+    # counted. Names every shape it catches, not just the array that motivated
+    # it (guard-2680); container type is not element shape (guard-4813).
+    if root_slot_for_validation in CAPTURE_SLOTS and not isinstance(item, dict):
+        hint = ""
+        if isinstance(item, list):
+            hint = " (send each element of the array as its own append)"
+        elif isinstance(item, str):
+            hint = (" (wrap the text in an object, e.g. "
+                    '{"goal_id": "...", "observation": "..."})')
+        print(f"Error: capture slot {root_slot_for_validation!r} takes one JSON "
+              f"OBJECT per append; got a top-level {type(item).__name__}. Every "
+              f"non-dict entry is dropped silently by "
+              f"worker_retrospective.index_captures before it is bucketed by "
+              f"goal_id, so it is never counted and no consumer reads it. Pass "
+              f"one object per append{hint}.", file=sys.stderr)
+        sys.exit(1)
+
     if root_slot_for_validation == "knowledge_debt" and isinstance(item, dict):
         _validate_knowledge_debt_entry(item)
 

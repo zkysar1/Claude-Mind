@@ -108,4 +108,8 @@ def test_canonical_scope_set_unchanged():
         "commit", "push", "deployment-approval",
         "architecture-decision", "credential-grant",
         "data-provision", "new-resource",
+        # Added 2026-08-28 (zeta,  / ). Its sibling
+        # aspirations.py VALID_USER_LEG_SCOPES was updated in the same change —
+        # which is exactly what this pin exists to remind the author to do.
+        "principal-identity",
     })

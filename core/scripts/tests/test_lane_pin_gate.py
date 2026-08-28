@@ -344,3 +344,118 @@ def test_registry_is_read_from_world_dir_when_no_text_is_supplied(tmp_path):
                          world_dir=tmp_path, meta_dir=tmp_path)
     assert result["would_block"] is True
     assert result["pin_id"] == "pin-t01"
+
+
+# ---------------------------------------------------------------------------
+#  defect TWO: a heading-matched, non-empty, zero-rows registry must
+# be DISTINGUISHABLE from a retired one. Four states used to yield one
+# observable (zero pins, no error, no log); two of them are now loud.
+# ---------------------------------------------------------------------------
+
+_PIN_ROW = (
+    "## Standing Lane Pins\n\n"
+    "| id | agent | in-lane | out-of-lane | granted | source | expires | review_by |\n"
+    "|---|---|---|---|---|---|---|---|\n"
+    "| lp-1 | foxtrot | files code defects | fixes them | 2026-08-06 "
+    "| user directive | user directive only | 2026-11-04 |\n"
+)
+
+
+def _parse_capturing_stderr(text, capsys):
+    pins = lp.parse_pins(text)
+    return pins, capsys.readouterr().err
+
+
+def test_intact_registry_parses_and_stays_quiet(capsys):
+    """Positive control. Without this the warning assertions below could pass
+    against a parser that is simply broken for every input."""
+    pins, err = _parse_capturing_stderr(_PIN_ROW, capsys)
+    assert len(pins) == 1
+    assert "WARNING" not in err
+
+
+def test_reformatted_table_warns_loudly(capsys):
+    """The registry was edited into a shape the parser cannot read. Every pin
+    is silently unenforced — the operator must be told."""
+    pins, err = _parse_capturing_stderr(_PIN_ROW.replace("|", "-"), capsys)
+    assert pins == []
+    assert "WARNING" in err and "ZERO pin rows" in err
+
+
+def test_heading_kept_but_rows_removed_warns(capsys):
+    pins, err = _parse_capturing_stderr(
+        "## Standing Lane Pins\n\nnone currently.\n", capsys)
+    assert pins == []
+    assert "WARNING" in err
+
+
+def test_retired_registry_is_silent(capsys):
+    """A renamed heading IS the retirement path. Warning here would fire on
+    every world that never adopted lane pins."""
+    pins, err = _parse_capturing_stderr(
+        _PIN_ROW.replace("## Standing Lane Pins", "## Retired Lane Pins"), capsys)
+    assert pins == []
+    assert "WARNING" not in err
+
+
+def test_absent_registry_is_silent(capsys):
+    pins, err = _parse_capturing_stderr("", capsys)
+    assert pins == []
+    assert "WARNING" not in err
+
+
+def test_warning_never_blocks_the_claim(capsys):
+    """Fail-open is the load-bearing half: the warning is additive, and every
+    degraded state must still return a list the caller can no-op on."""
+    for text in (_PIN_ROW.replace("|", "-"),
+                 "## Standing Lane Pins\n\nnone currently.\n",
+                 "", "## Retired Lane Pins\n\n| a |\n"):
+        assert lp.parse_pins(text) == [] or isinstance(
+            lp.parse_pins(text), list)
+
+
+# ── The FIFTH state: no resolution root at all (, foxtrot N=45) ──
+# parse_pins' four states are reachable from the REGISTRY side. This one is
+# reachable from the CALLER side and produces the same observable: evaluate()
+# with neither registry_text nor world_dir returns reason="no-pin", which is
+# byte-identical to "this agent has no pin" -- a clean, confident,
+# structurally-inert PASS with nothing to notice.
+
+_FIFTH_GOAL = {"id": "g-1", "title": "framework gate work", "aspiration_id": "asp-115"}
+
+
+def _evaluate_capturing_stderr(capsys, **kwargs):
+    capsys.readouterr()
+    result = lp.evaluate("bravo", _FIFTH_GOAL, **kwargs)
+    return result, capsys.readouterr().err
+
+
+def test_evaluate_with_no_resolution_root_warns(capsys):
+    result, err = _evaluate_capturing_stderr(capsys)
+    assert result["would_block"] is False
+    assert "WARNING" in err
+    assert "NEITHER" in err
+
+
+def test_evaluate_with_world_dir_but_no_registry_is_silent(capsys, tmp_path):
+    """A world that has no registry yet is a LEGITIMATE absence -- the
+    caller-side analogue of parse_pins' silent heading-absent branch. Warning
+    here would fire on every fresh world that never adopted lane pins."""
+    result, err = _evaluate_capturing_stderr(capsys, world_dir=str(tmp_path))
+    assert result["would_block"] is False
+    assert "WARNING" not in err
+
+
+def test_evaluate_with_registry_text_is_silent(capsys):
+    """Positive control: a caller that supplies a real registry must stay
+    quiet, or the warning is unfalsifiable."""
+    result, err = _evaluate_capturing_stderr(capsys, registry_text=_PIN_ROW)
+    assert "WARNING" not in err
+    assert result["would_block"] in (True, False)
+
+
+def test_fifth_state_warning_never_blocks_the_claim(capsys):
+    """Same fail-open posture as the parse_pins warning: additive only."""
+    result, _ = _evaluate_capturing_stderr(capsys)
+    assert result["would_block"] is False
+    assert result["reason"] == "no-pin"

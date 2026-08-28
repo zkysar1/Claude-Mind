@@ -60,6 +60,40 @@ from hook_helpers import (  # noqa: E402
 # Windows launcher (see core/config/conventions/python-invocation.md).
 INTERPRETERS = frozenset({"python", "python3", "py", "python.exe", "python3.exe", "py.exe"})
 
+GATE_ID = "bare-bash-authoring-gate"
+
+
+def _log(decision, *, path, form=None, error=None):
+    """Best-effort firing record. NEVER raises, NEVER changes the verdict.
+
+    Instrumented for g-115-3325: without this the hook wrote nothing on deny,
+    so its firing rate was unmeasurable, rb-5255's "throwaway code is where the
+    pattern returns" claim was untestable, and — because the hook is fail-open
+    by design — a regression that swallowed a real deny left no trace at all.
+
+    WHY _gate_log AND NOT A BESPOKE LOG. The goal specified a new local
+    core/logs/bare-bash-denials.jsonl plus a hand-rolled writer, on the premise
+    that the shared ledger costs a 4.7-10s whole-object remote RMW on the
+    interactive path. That premise is STALE (measured 2026-08-27): _gate_log
+    routes the hot path to a machine-local lockless O_APPEND spool
+    (_gate_log.py:301-304, `_spool_active()` True on this box) and only
+    gate-firings-flush.py batches it into the shared store at iteration-close.
+    So the standard mechanism already IS the "one local append, fail-open"
+    shape the goal asked to build by hand, and guard-502 requires gates use it.
+
+    THE IMPORT IS LAZY ON PURPOSE. main() returns before reaching any _log()
+    call on the hot path (a Bash command containing no inline Python), so the
+    overwhelmingly common case pays neither the import nor the write.
+    """
+    try:
+        import sys as _s
+        _s.path.insert(0, str(Path(__file__).resolve().parent))
+        import _gate_log
+        _gate_log.log(GATE_ID, decision, caller=path,
+                      trigger_matched=form, gate_error=error)
+    except Exception:
+        return  # telemetry must never influence the gate
+
 DENY_TEMPLATE = (
     "BLOCKED by bare-bash-authoring-gate (guard-580): this inline Python builds a "
     "subprocess argv whose argv[0] is a bare \"bash\".\n\n"
@@ -202,6 +236,12 @@ def main() -> None:
 
     engine = _load_engine()
     if engine is None:
+        # SILENT-BREAKAGE PATH. Inline Python was present and extracted, but the
+        # detection engine could not be loaded, so the command is approved
+        # WITHOUT having been checked. Indistinguishable from a clean approval
+        # unless it is recorded (guard-502's rationale: a branch with no record
+        # reads identically to "gate never ran").
+        _log("fail_open", path="engine_unavailable")
         approve_no_mutation()
 
     findings: list[str] = []
@@ -210,12 +250,18 @@ def main() -> None:
             hits = engine.scan_source(src, "<inline>")
         except SyntaxError:
             continue  # fragment / not standalone-parseable — approve
-        except Exception:
+        except Exception as exc:
+            # SILENT-BREAKAGE PATH, same class as engine_unavailable: the
+            # detector threw, so this payload was never actually scanned.
+            _log("fail_open", path="scan_source_raised", error=repr(exc)[:200])
             approve_no_mutation()
         for lineno, form, detail in hits:
             findings.append(f"  line {lineno} [{form}] {detail}")
 
     if findings:
+        # Log BEFORE emit_deny: emit_deny terminates the process.
+        _log("block", path="bare_bash_argv_found",
+             form="; ".join(f.strip() for f in findings)[:200])
         emit_deny(DENY_TEMPLATE.format(findings="\n".join(findings)))
     approve_no_mutation()
 

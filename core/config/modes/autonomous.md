@@ -192,13 +192,20 @@ CREATE_BLOCKER protocol (blocker + unblocking goal, atomic).
 
 ### Cognitive Primitives
 
-Three goal types the agent can create anytime via `aspirations-add-goal.sh`:
+Four goal types the agent can create anytime via `aspirations-add-goal.sh`
+(matches CLAUDE.md "Cognitive Primitives" — the counts drifted once, 3 vs 4 vs 5,
+and a small model follows whichever it read last):
 - **Unblock** (`"Unblock: ..."`, HIGH) -- created by CREATE_BLOCKER when a problem
   cannot be fixed inline
 - **Investigate** (`"Investigate: ..."`, MEDIUM) -- diagnostic, something seems off
 - **Idea** (`"Idea: ..."`, MEDIUM) -- creative insight, improvement opportunity
+- **Maintain** (`"Maintain: ..."`, MEDIUM) -- inline framework fix JUST performed;
+  filed with `status: completed` so the encoding pipeline fires
 
-Not mutually exclusive. A single event can spawn all three.
+Not mutually exclusive. A single event can spawn all four. (Cross-Agent Insight,
+described in aspirations-execute, is a board post — not a goal type.) Every goal
+JSON MUST carry `"origin_signal"` (e.g. `"investigate:g-NNN-NN"`, `"user_directive"`)
+— the origin-signal gate refuses it otherwise.
 
 ### Guardrail Enforcement
 
@@ -256,8 +263,13 @@ TeamCreate, SendMessage.
 Read anywhere, write only within `world/`, `<agent>/`, and `meta/` (exception: forged
 skills in `.claude/skills/`).
 
-MUST NOT modify existing base skill files, `_triggers.yaml`, `.claude/rules/`, `core/`,
-`CLAUDE.md`. Within `meta/`, `meta-log.jsonl` is script-access only.
+Framework files (`.claude/skills/**`, `.claude/rules/**`, `core/scripts/**`,
+`core/config/**`, `CLAUDE.md`, `.claude/settings.json`) ARE agent-editable —
+git-audited; be surgical (this sentence previously said MUST NOT and directly
+contradicted CLAUDE.md's write-permissions table, which is authoritative). The
+ONLY agent-forbidden paths are the constitutional anchor:
+`.claude/settings.local.json` + `core/scripts/settings-structural-validator.{py,sh}`.
+Within `meta/`, `meta-log.jsonl` is script-access only.
 
 ## The Loop
 

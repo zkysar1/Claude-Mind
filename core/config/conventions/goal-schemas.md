@@ -1194,18 +1194,58 @@ The explicit field always wins over the note.
 
 ## Writing it
 
-`superseded` is a full member of `VALID_GOAL_STATUSES` but is **not settable via
-`update-goal`** — `aspirations.py` routes it through
-`complete --intent-satisfied`, behind an evidence gate, listing the goal in
-`superseded_goal_ids`. Until a direct write path exists, a duplicate closed as
-`skipped` should carry `superseded_by` explicitly so the probe rule above
-resolves it without relying on the note fallback.
+The FIELD and the STATUS have deliberately different write paths, and
+conflating them is the mistake to avoid.
+
+**The field is writable** (g-115-7893, 2026-08-27):
+
+```bash
+bash core/scripts/aspirations-update-goal.sh <goal-id> superseded_by <goal-id>
+```
+
+`superseded_by` is a member of `_goal_fields.GOAL_KNOWN_FIELDS`, so
+`update-goal` accepts it on any goal in any status. Write it in the same pass
+that closes the duplicate — before or after the `status=skipped` write, order
+does not matter to the resolver.
+
+**The status is NOT.** `superseded` is a full member of `VALID_GOAL_STATUSES`
+but `aspirations.py` refuses a direct `status=superseded` write, routing it
+through `complete --intent-satisfied` behind an evidence gate that lists the
+goal in `superseded_goal_ids`. That refusal is deliberate and is NOT what the
+field fixes: its own message names the sanctioned single-goal route — write the
+supersession evidence to `outcome_note`, then set `status=skipped`. The field
+makes that route MACHINE-READABLE instead of leaving the pointer in prose.
+
+Prefer the field. The `outcome_note` fallback exists for rows closed before the
+field did, and it is a heuristic over prose: it reads only the sentence
+carrying the supersession word and skips the goal's own id, which is enough to
+resolve 20 of the 32 live pointer-carrying rows and deliberately declines the
+rest (measured 2026-08-27 — six of them say "superseded by weeks of later runs",
+superseded by TIME, naming no successor at all). A pointer nobody has to guess
+at is strictly better than one the resolver has to infer.
 
 ## Consumers
 
-- `core/scripts/_dependency_graph.py` — `resolve_dependency` / `supersession_target` (SSOT)
+- `core/scripts/_dependency_graph.py` — `resolve_dependency` / `supersession_target`
+  / `supersession_satisfied_ids` (SSOT, guard-547)
 - `core/scripts/blocked-signal-resolution-check.py` — precheck 0.5b.12 re-probe path
+- `core/scripts/goal-selector.py` — `expand_done_ids_via_supersession`, called at
+  all three `global_done_ids` build sites so SELECTION and the `blocked`
+  diagnostics resolve done-ness identically
+- `core/scripts/_goal_fields.py` — the write-side allowlist
 - Tests: `core/scripts/tests/test_dependency_supersession_resolution.py`
+
+**Where it is NOT wired, and why.** `capability-gate.py` is named in this
+goal's own outcome text as a dependency probe; it is not one. It and
+`gates/capability.py` carry zero references to `blocked_by`, `done_ids` or goal
+status — they keyword-match a `failure_reason` against forged skills, SKILL.md
+triggers and the capability-routing convention. Wiring supersession there would
+be a no-op by construction (measured 2026-08-27). `dependent-unblock.py` IS an
+adjacent gap of the same family — when the SUPERSEDING goal completes, the
+dependents that name the SUPERSEDED one are never stripped, because that
+requires walking the chain BACKWARD — but it is a write path, and the selector
+expansion above already prevents the freeze that gap would cause; the residual
+defect is a stale `blocked_by` entry, not a blocked goal.
 
 Note `_dependency_graph.TERMINAL_STATUSES` must also list every terminal status,
 or `build_graph` keeps a closed goal in the adjacency map and it blocks its

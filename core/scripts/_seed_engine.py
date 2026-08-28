@@ -20,7 +20,9 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import shutil
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +32,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import _seed_transforms as xform  # noqa: E402
+from _exec_bits import carry_exec_bit, index_exec_map  # noqa: E402  ()
 
 try:
     import yaml
@@ -418,7 +421,14 @@ def do_copy_staged(source_root: Path, dest_root: Path, manifest: dict, *,
     transformations = manifest.get("transformations", [])
 
     stats = {"staged": 0, "transformed": 0, "binary": 0, "pending_skip": [],
-             "failures": [], "preserved_deployment_local": []}
+             "failures": [], "preserved_deployment_local": [],
+             "exec_bits_carried": 0, "exec_source_executable": 0}
+
+    # : the SOURCE's executable bits, index-preferred. Read ONCE --
+    # one `git ls-tree` for the whole plant, not one per file. An empty map is
+    # a DECLINE (see index_exec_map), and carry_exec_bit then falls back to the
+    # filesystem per file rather than treating absence as "not executable".
+    idx_exec = index_exec_map(source_root)
 
     # Skill dirs present in the SOURCE include set are base skills being
     # promoted — the preserve predicate must not freeze them at dest
@@ -463,6 +473,18 @@ def do_copy_staged(source_root: Path, dest_root: Path, manifest: dict, *,
                 rel, content, transformations, source_root,
             )
             dst.write_text(new_content, encoding="utf-8", newline="")  # preserve content as-is
+            # : write_text CREATES the file at the umask default (0644),
+            # so this branch -- and ONLY this branch -- strips the exec bit; the
+            # three shutil.copy2 paths around it already carry mode. Every .sh and
+            # every git hook is text, which is why the strip measured 628/628.
+            if carry_exec_bit(rel, src, dst, idx_exec):
+                stats["exec_bits_carried"] += 1
+                stats["exec_source_executable"] += 1
+            elif idx_exec.get(rel) or (src.stat().st_mode & 0o111):
+                # Source IS executable but the carry did not fire (already set, or
+                # chmod refused). Counted so seed-verify can compare source-exec
+                # against carried and see a gap instead of a bare zero.
+                stats["exec_source_executable"] += 1
             stats["staged"] += 1
             if applied_ids:
                 stats["transformed"] += 1
@@ -1518,6 +1540,54 @@ def _substantive_lines(text: str) -> set:
     return out
 
 
+# Dest HEAD subject that proves the last write was a promote-PR plant.
+# Same pattern promotion-plan-triage.py keys on — kept in sync deliberately;
+# both answer "was the last thing to touch this repo a plant?".
+_PROMOTE_MERGE_RE = re.compile(
+    r"Merge pull request #\d+ .*promote/(?P<tag>v\d+\.\d+\.\d+)")
+
+
+def _dest_frozen_at_last_plant(dest_root: Path) -> dict:
+    """Repo-level proof that NOTHING at dest can be locally authored.
+
+    True only when dest HEAD *is* the newest promote-PR merge AND the tree is
+    clean — i.e. zero commits since the last plant. Under that condition every
+    "dest-only line" is necessarily seed-forward-motion (the frontier moved at
+    the source), not prod authorship, so flagging it as prod-ahead is a false
+    positive. This is discriminator (1) of g-115-4389; it cleared 18/18 flags
+    at the staging hop of v2.8.10 where staging is unstaffed.
+
+    FAILS CLOSED (guard-487): a suppression gate whose input cannot be read
+    must not suppress. Any missing git, non-zero rc, timeout, or decode fault
+    returns frozen=False, which leaves every flag standing and preserves the
+    DO-NOT-PROMOTE verdict. The dangerous direction here is a silent excusal,
+    never a spurious block.
+    """
+    ev = {"frozen": False, "head_subject": "", "dirty_files": 0, "error": None}
+    try:
+        def _git(*args: str) -> str:
+            r = subprocess.run(
+                ["git", "-C", str(dest_root), *args],
+                capture_output=True, text=False, check=False, timeout=30,
+            )
+            if r.returncode != 0:
+                raise RuntimeError(
+                    f"git {' '.join(args)} rc={r.returncode}: "
+                    f"{r.stderr.decode('utf-8', errors='replace')[:120]}")
+            return r.stdout.decode("utf-8", errors="replace").strip()
+
+        head_subject = _git("log", "-1", "--format=%s")
+        dirty = _git("status", "--porcelain")
+    except Exception as exc:                      # noqa: BLE001 — fail closed
+        ev["error"] = f"{type(exc).__name__}: {exc}"
+        return ev
+
+    ev["head_subject"] = head_subject
+    ev["dirty_files"] = len(dirty.splitlines()) if dirty else 0
+    ev["frozen"] = bool(_PROMOTE_MERGE_RE.search(head_subject)) and not dirty
+    return ev
+
+
 def _compare_dest_vs_seed(rel: str, source_root: Path, dst: Path,
                           transformations: list):
     """(diverged, dest_only_line_count) — dest vs POST-TRANSFORM seed content.
@@ -1678,6 +1748,26 @@ def do_plan(source_root: Path, dest_root: Path, manifest: dict,
             prod_ahead.append({"rel": rel, "dest_only_lines": dest_only})
     prod_ahead.sort(key=lambda e: e["dest_only_lines"], reverse=True)
 
+    # ── AUTO-EXCUSAL: repo-level dest-frozen proof () ──
+    # A flag means "dest carries lines the seed lacks", which has more than one
+    # cause. When dest is provably frozen at the last plant, prod authorship is
+    # impossible, so every flag is seed-forward-motion. Excused entries are
+    # RE-LABELLED and still reported (§3), never dropped: a detector that goes
+    # quiet is indistinguishable from one that was fixed (guard-2499).
+    dest_frozen = _dest_frozen_at_last_plant(dest_root)
+    seed_motion_excused = []
+    if prod_ahead and dest_frozen["frozen"]:
+        for e in prod_ahead:
+            e = dict(e)
+            e["excused_by"] = "dest-frozen"
+            e["evidence"] = (
+                f"dest HEAD is the promote-PR merge "
+                f"('{dest_frozen['head_subject'][:70]}') with a clean tree — "
+                f"0 commits since the plant, so no dest-only line can be "
+                f"prod-authored")
+            seed_motion_excused.append(e)
+        prod_ahead = []
+
     # ── §4 STORE BLAST RADIUS (guard-121) ──
     store_status = {
         "in_repo_store_roots": sorted(store_tops),
@@ -1753,6 +1843,8 @@ def do_plan(source_root: Path, dest_root: Path, manifest: dict,
                 "all": cruft_deletions, "dangerous": cruft_dangerous,
             },
             "prod_ahead_framework_files": prod_ahead,
+            "seed_motion_excused": seed_motion_excused,
+            "dest_frozen_at_last_plant": dest_frozen,
             "store_blast_radius": store_status,
             "orphan_deletions": {
                 "real_orphans": real_orphans,
@@ -1816,12 +1908,29 @@ def _render_plan_report(plan: dict) -> str:
 
     # §3
     pa = s["prod_ahead_framework_files"]
+    # .get() — a summary produced before  carries neither key.
+    excused = s.get("seed_motion_excused") or []
+    frozen = s.get("dest_frozen_at_last_plant") or {}
     L.append("§3 PROD-AHEAD FRAMEWORK FILES — dest carries lines the seed lacks → BACK-PORT UP (guard-119)")
     if not pa:
         L.append("   none — no framework file is ahead at dest")
     else:
         for e in pa:
             L.append(f"   ⛔ {e['rel']}  ({e['dest_only_lines']} dest-only line(s)) — DO NOT PROMOTE OVER")
+    if excused:
+        L.append(f"   ── {len(excused)} flag(s) AUTO-EXCUSED as SEED-MOTION (g-115-4389) ──")
+        L.append(f"   REPO-LEVEL PROOF: dest HEAD is the promote-PR merge "
+                 f"('{frozen.get('head_subject', '')[:70]}'), tree clean, 0 commits "
+                 f"since — no dest-only line can be prod-authored.")
+        for e in excused:
+            L.append(f"   ✓ {e['rel']}  ({e['dest_only_lines']} dest-only line(s)) — "
+                     f"SEED-MOTION, not prod-ahead")
+    elif pa and frozen.get("error"):
+        # Fail-closed path made visible: the excusal COULD not run, so these
+        # flags may include seed-motion. Say so rather than letting the
+        # operator read a full block as if the check had cleared them.
+        L.append(f"   (auto-excusal unavailable — {frozen['error']}; "
+                 f"flags above are unclassified, run promotion-plan-triage.sh)")
     L.append("")
 
     # §4

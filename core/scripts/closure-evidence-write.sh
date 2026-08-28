@@ -64,6 +64,7 @@ GOAL_ID=""
 SOURCE=""
 SUMMARY=""
 SUMMARY_FILE=""
+OVERRIDE_STALE_SOURCE=""
 # The caller supplies its OWN bracketed prefix so each orchestrator's existing
 # message shape survives verbatim — do_verify's lines were "[iteration-close]
 # verify: ..." before this extraction and must stay byte-identical, since
@@ -85,6 +86,7 @@ while [[ $# -gt 0 ]]; do
         --source)         SOURCE="${2:-}"; shift $(( $# >= 2 ? 2 : 1 ));;
         --summary)        SUMMARY="${2:-}"; shift $(( $# >= 2 ? 2 : 1 ));;
         --summary-file)   SUMMARY_FILE="${2:-}"; shift $(( $# >= 2 ? 2 : 1 ));;
+        --override-stale-source) OVERRIDE_STALE_SOURCE="${2:-}"; shift $(( $# >= 2 ? 2 : 1 ));;
         --prefix)         PREFIX="${2:-}"; shift $(( $# >= 2 ? 2 : 1 ));;
         --probe-only)     PROBE_ONLY=1; shift;;
         # : caller asserts a note may ALREADY have been written for
@@ -189,6 +191,28 @@ fi
 # --- write -----------------------------------------------------------------
 if [[ -n "$SUMMARY_FILE" ]]; then
     if [[ -r "$SUMMARY_FILE" ]]; then
+        # === stale-narrative-source gate () ===
+        # Same predicate as iteration-close.sh's, at this script's own
+        # --summary-file read: worker-loop calls HERE directly, so a gate wired
+        # only into iteration-close would be inert on the worker path (the path
+        # the incident was measured on). Refusal posture matches THIS script's
+        # existing one for a bad --summary-file: say so loudly and write no
+        # note, rc=0 — a provenance fault must not break the close itself.
+        # Exit 3 is the ONLY refusal; any other non-zero means the gate could
+        # not run (this script is STAGED into a tmp core/scripts by its own
+        # tests, where the gate file is absent), and a gate that cannot run
+        # must not silently stop every close. Fail OPEN, loudly.
+        _sss_rc=0
+        py -3 "$SCRIPT_DIR/stale-summary-source-gate.py" \
+            --path "$SUMMARY_FILE" --goal "${GOAL_ID:-}" --source "${SOURCE:-}" \
+            --caller "closure-evidence-write.sh:summary-file-read" \
+            ${OVERRIDE_STALE_SOURCE:+--override-stale-source "$OVERRIDE_STALE_SOURCE"} \
+            >/dev/null || _sss_rc=$?
+        if [[ "$_sss_rc" -eq 3 ]]; then
+            echo "$PREFIX ⚠ closure-evidence-write: refusing stale narrative source; no note written." >&2
+            echo "$PREFIX   Re-write the narrative for THIS goal, or pass --override-stale-source \"<why>\"." >&2
+            exit 0
+        fi
         SUMMARY="$(cat "$SUMMARY_FILE")"
     else
         echo "$PREFIX ⚠ closure-evidence-write: --summary-file '$SUMMARY_FILE' is not readable; no note written" >&2
@@ -432,6 +456,12 @@ if [[ -n "$_existing" ]]; then
         # below states in full: ${#_existing} counts BYTES under a non-UTF-8
         # locale, so a non-ASCII character here inflates the length the next
         # occurrence reports. This line is STORED; the prose above is printed.
+        # : remember what the CALLER passed before we overwrite it.
+        # The line below reassigns SUMMARY to the preserved note + stamp, so
+        # from here on ${#SUMMARY} measures text the caller never supplied.
+        # Without this the terminal success line reports a length that is true
+        # of the wrong text (see the report branch at the bottom of this file).
+        _CE_DROPPED_SUMMARY_LEN=${#SUMMARY}
         SUMMARY="$_existing
 
 $CE_DEFER_MARK written $(date +%Y-%m-%dT%H:%M:%S) by closure-evidence-write.sh (achievedCount=${_ach}) - the note above predates the provenance marker or was hand-written, so THIS occurrence preserved it rather than superseding it. The NEXT occurrence (achievedCount > ${_ach}) MAY supersede it. Prior text is recoverable from world/.history/snapshots/aspirations.jsonl/; see g-115-7853."
@@ -526,7 +556,24 @@ if [[ "$_upd_rc" -eq 0 ]]; then
     # Re-emit verbatim: capturing must not silence the writer for callers that
     # were reading its record echo before this change.
     printf '%s\n' "$_upd_out"
-    echo "$PREFIX outcome_note written to $GOAL_ID (${#SUMMARY} chars)"
+    # : the DEFERRED path must not report as a plain write. There,
+    # SUMMARY is the PRESERVED note plus the stamp -- so "outcome_note written
+    # to X (N chars)" is true of text the caller never passed, and the caller's
+    # own narrative was dropped. Measured 2026-08-27T16:50:06 (cc-07,
+    # ): a 6,744-byte --summary-file was dropped and the run printed
+    # "written to  (8265 chars)" -- 8265 being preserved+stamp.
+    # iteration-close then compounded it with its own literally-true line, so
+    # two success-shaped messages covered a dropped artifact. The decline itself
+    # is CORRECT and stays (preserving a hand-written note is the whole point of
+    # the branch, ); what changes is that the drop is now stated
+    # rather than implied, and the dropped length is named so a caller can tell
+    # its summary went nowhere. Emitter-located defect, fixed at the emitter
+    # (guard-3299).
+    if [[ "${_CE_DEFER_STAMPED:-0}" -eq 1 ]]; then
+        echo "$PREFIX outcome_note on $GOAL_ID PRESERVED + stamped (${#SUMMARY} chars = prior note + $CE_DEFER_MARK). YOUR SUMMARY (${_CE_DROPPED_SUMMARY_LEN:-0} chars) WAS NOT WRITTEN -- this occurrence declined to supersede a note of unknown provenance. Re-run at the NEXT occurrence (achievedCount > ${_ach}), which may supersede; or write it yourself with aspirations-update-goal.sh if it must land now."
+    else
+        echo "$PREFIX outcome_note written to $GOAL_ID (${#SUMMARY} chars)"
+    fi
 else
     printf '%s\n' "$_upd_out" >&2
     _old_len="$(printf '%s' "$_upd_out" | sed -n 's/.*"old_len"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)"

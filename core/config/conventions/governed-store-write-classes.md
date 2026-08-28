@@ -505,6 +505,35 @@ beat a 101-char one. That error is not cosmetic; it made the first two versions
 of this cure's own coupling test set up the *opposite* of the adverse case they
 claimed, and pass vacuously.
 
+**WHAT AN AMENDER MUST DO ABOUT IT — the tiebreak is not a corner case, it is the
+merge rule whenever the LWW key is COARSER THAN THE EDIT CADENCE** (`rb-6977`;
+third instance g-115-5171, bravo, cc-05). The correction above explains the
+mechanism; this is the operating procedure.
+
+- **Where it binds.** Two prior instances had a FROZEN timestamp by house style
+  (forged-skills `triggers`, g-115-3638; `strategic_focus` text, rb-6977) — an
+  amender who bumped the stamp escaped it. The `_tree.yaml` per-node case is
+  STRUCTURAL and offers no such escape: `_classify_tree_field` is TOTAL and
+  defaults to BASE, BASE rides the newer-`last_updated` LWW base, and a node's
+  `last_updated` is DATE-granular by contract (g-001-67; g-115-1683 deliberately
+  does not bump it on a field poke). Two same-day edits therefore can NEVER be
+  ordered by recency, so `_order_by_ts` falls to the content tiebreak **every
+  time**. Ask of any store: is my LWW key coarser than how often this field is
+  edited? If yes, you are always in the tiebreak.
+- **Simulate the tie before you append.** The comparison is
+  `_canon(va) >= _canon(vb)` — lexicographic, and it decides at the FIRST
+  DIVERGENT CHARACTER. Run both candidate strings through `_canon` and compare
+  them yourself; do not reason about it from length or from which edit came
+  later. (`guard-1703` — never rely on this tiebreak to preserve an amendment.)
+- **The remedy is the leading character.** Because the append's first divergent
+  character decides, a **space-led** append sorts BELOW the pre-amendment text
+  and is silently reverted by the next peer merge, while a **newline-led** append
+  sorts above and survives. Lead the appended block with a newline.
+- **Why this is written as a hazard rather than a preference.** The loss is
+  SILENT and it is invisible to the amender: two prior amenders of the same field
+  were exposed unknowingly, and the revert happens on a peer's merge, not on the
+  amending box. There is no local signal to notice.
+
 **Verified vs not.** Mutation matrix: baseline 11/11; restoring `out = dict(win)`
 kills `test_loser_only_key_survives`; removing the stamp bump kills
 `test_writing_primary_bumps_set_at` AND the coupling test. Writer-side tests run

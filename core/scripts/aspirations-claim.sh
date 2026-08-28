@@ -31,6 +31,7 @@ AGENT=""
 CROSS_LANE=""
 DEVIATION=""
 OVERRIDE_LANE_PIN=""
+VERDICT_FILE=""
 # (PASSTHROUGH array removed : it was written in three places and read
 # in none — a vestigial leftover of the pre-daemon cutover. Its only live effect
 # was the `-*` branch's shift-the-flag-only behavior, which is the defect fixed
@@ -77,6 +78,32 @@ while [[ $# -gt 0 ]]; do
             # gate below is the only consumer.
             DEVIATION="${2-}"
             shift $(( $# >= 2 ? 2 : 1 ));;
+        --verdict-file)
+            # Scorer Sovereignty test seam (). The gate already owns
+            # this flag, annotated `(tests)`; this branch is the missing link
+            # between it and the only callers that need it. WITHOUT it a test
+            # driving this wrapper in a tmp project_root still gets the gate's
+            # default resolution -- `agent_state_dir(<agent>) / scorer-verdict.json`
+            # through `_paths`, i.e. rooted at the REAL project root -- so the
+            # gate reads the LIVE agent's verdict and refuses the claim against a
+            # top pick that exists only in the live queue.
+            #
+            # The env-override route is closed BY DESIGN and was measured, not
+            # assumed: `_paths.agent_dir()` explicitly does NOT honour
+            # MIND_AGENT_DIR (guard-2985, documented in _paths.py), and
+            # _paths.sh recomputes AGENT_DIR from MIND_AGENT on every source
+            # (guard-2446). Name-based resolution leaves the path argument as
+            # the only lever.
+            #
+            # Substituting a throwaway AGENT name so the gate finds no verdict
+            # and fails open was considered and REJECTED under guard-2530: that
+            # is a proxy whose equivalence ("a nonexistent agent has no verdict")
+            # nobody restates, it goes stale silently the day the gate branches
+            # on identity, and no live caller drives a synthetic agent through
+            # this wrapper (guard-920). An explicit, readable path argument is
+            # the visible dependency; take the visible one.
+            VERDICT_FILE="${2-}"
+            shift $(( $# >= 2 ? 2 : 1 ));;
         -*)
             # REFUSE unknown flags (). This branch used to do
             # `PASSTHROUGH+=("$1"); shift` — shifting the FLAG ONLY. The
@@ -98,7 +125,7 @@ while [[ $# -gt 0 ]]; do
             # core/config, and world/scripts — no caller passes any flag but
             # --source and --deviation.
             echo "Error: unrecognized flag '$1'." >&2
-            echo "  Accepted: --deviation <code> | --cross-lane <reason> | --source <world|agent> | --goal[-id] <id> | --override-lane-pin <reason>" >&2
+            echo "  Accepted: --deviation <code> | --cross-lane <reason> | --source <world|agent> | --goal[-id] <id> | --override-lane-pin <reason> | --verdict-file <path>" >&2
             echo "  Usage: aspirations-claim.sh <goal-id> [<agent-name>] [--deviation <code>]" >&2
             exit 1;;
         *)
@@ -163,9 +190,15 @@ source "$CORE_ROOT/scripts/_runtime.sh"
 # never wedges claiming. exit 2 = refused (distinct from, but same
 # "claim-refused, pick again" meaning as, the daemon conflict exit 2 below).
 GATE_RC=0
+GATE_ARGS=(--agent "$AGENT" --goal-id "$GOAL_ID" --deviation "$DEVIATION")
+if [ -n "$VERDICT_FILE" ]; then
+    # Absent in every production call, so the gate's behaviour for production
+    # callers is byte-identical to before this flag existed.
+    GATE_ARGS+=(--verdict-file "$VERDICT_FILE")
+fi
 # shellcheck disable=SC2086  # rt_python_launcher is intentionally word-split (`py -3` on Windows)
 $(rt_python_launcher) "$CORE_ROOT/scripts/scorer-verdict-gate.py" \
-    --agent "$AGENT" --goal-id "$GOAL_ID" --deviation "$DEVIATION" || GATE_RC=$?
+    "${GATE_ARGS[@]}" || GATE_RC=$?
 if [ "$GATE_RC" = "2" ]; then
     exit 2
 fi

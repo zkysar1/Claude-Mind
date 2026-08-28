@@ -160,10 +160,26 @@ def main(argv=None) -> int:
                     print("      match: " + json.dumps(m)[:200])
         if result.get("override_applied"):
             print(f"override: {result['override_applied']}")
+        # : on a SCOPED block the reason carries the only information
+        # that matters — WHICH match the justification never named. The text
+        # path printed no reason at all, so that landed nowhere.
+        _sc = result.get("override_scope") or {}
+        if _sc.get("blocks"):
+            print(f"override_scope: SCOPED — names {', '.join(_sc['named_matches'])}, "
+                  f"does NOT name "
+                  f"{', '.join(u['goal_id'] for u in _sc['unnamed_matches'])}")
+            print(f"reason: {result['reason']}")
 
-    if result.get("override_applied"):
+    _sc = result.get("override_scope") or {}
+    if result.get("override_applied") and not _sc.get("blocks"):
         print(f"[goal-duplication-gate] override applied: "
               f"{result['override_applied']}", file=sys.stderr)
+    elif result.get("override_applied"):
+        # NOT "applied" — the override was scoped to the matches it named and
+        # the filing still blocks. Saying "applied" beside exit 1 would tell a
+        # reader (and any stderr-parsing caller) the bypass succeeded.
+        print(f"[goal-duplication-gate] override SCOPED, still blocking: "
+              f"{result['reason']}", file=sys.stderr)
 
     return 1 if result["would_block"] else 0
 

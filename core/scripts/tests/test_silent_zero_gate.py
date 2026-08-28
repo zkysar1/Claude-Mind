@@ -25,6 +25,7 @@ GATE = PROJECT_ROOT / "core" / "scripts" / "silent-zero-gate.py"
 SETTINGS = PROJECT_ROOT / ".claude" / "settings.json"
 
 sys.path.insert(0, str(PROJECT_ROOT / "core" / "scripts"))
+from _bash_helpers import BASH  # noqa: E402
 from _silent_zero_predicate import (  # noqa: E402
     OVERRIDE_TOKEN,
     coerced_fallbacks,
@@ -105,6 +106,82 @@ def test_deny_message_names_the_rewrite_and_the_override():
     assert "PIPESTATUS" in reason, "must name a concrete working rewrite"
     assert OVERRIDE_TOKEN in reason, "must name its own escape hatch"
     assert "stderr" in reason, "must pre-empt the wrong fix (move the message)"
+
+
+# -------------------------------------------  fresh-eyes defect fixes
+
+def test_denies_strip_chained_read_coercion():
+    """D1: a `.strip()` between read() and `or` is the same masking idiom. The
+    earlier regex required read() immediately before `or` and missed it."""
+    reason = assert_denied(
+        "bash core/scripts/aspirations-query.sh --goal-status pending 2>/dev/null "
+        "| py -3 -c \"import sys,json; "
+        "d=json.loads(sys.stdin.read().strip() or '[]'); print(len(d))\""
+    )
+    assert "silent-zero" in reason
+
+
+def test_denies_input_and_readline_coercion():
+    """D1: input() and sys.stdin.readline() are stdin-consumption spellings the
+    earlier read()-only alternation missed."""
+    assert_denied(
+        "bash core/scripts/guardrails-read.sh --active 2>/dev/null "
+        "| py -3 -c \"import sys,json; g=json.loads(input() or '[]'); print(len(g))\""
+    )
+    assert_denied(
+        "bash core/scripts/guardrails-read.sh --active 2>/dev/null "
+        "| py -3 -c \"import sys,json; "
+        "g=json.loads(sys.stdin.readline() or '[]'); print(len(g))\""
+    )
+
+
+def test_set_e_alone_does_not_excuse_the_coercion():
+    """D2: `set -e` without `pipefail` does NOT abort on a PRODUCER failure in
+    `producer | parser`, so it must not excuse the coercion idiom. It was
+    wrongly in the rc predicate and excused exactly this shape."""
+    reason = assert_denied(
+        "set -e; bash core/scripts/aspirations-query.sh --goal-status pending "
+        "2>/dev/null | py -3 -c \"import sys,json; "
+        "d=json.loads(sys.stdin.read() or '[]'); print(len(d))\""
+    )
+    assert "exit status" in reason
+
+
+def test_predicate_new_spellings_and_set_e():
+    """Unit-level pins for D1/D2 (supplement to the behavioral cases above)."""
+    assert coerced_fallbacks("json.loads(sys.stdin.read().strip() or '[]')")
+    assert coerced_fallbacks("input() or '[]'")
+    assert coerced_fallbacks("json.loads(sys.stdin.readline() or '[]')")
+    assert coerced_fallbacks("json.loads(sys.stdin.readlines() or '[]')")
+    # no over-match: a strip with no `or` fallback is not the idiom
+    assert not coerced_fallbacks("sys.stdin.read().strip()")
+    # D2: set -e alone no longer reads exit status; pipefail still does
+    assert not reads_exit_status("set -e; bash x.sh | grep -c y")
+    assert reads_exit_status("set -o pipefail; a | b")
+
+
+def test_sh_wrapper_routes_own_stderr_to_breakage_log():
+    """D3: the .sh must route the gate's OWN stderr to a breakage log rather
+    than /dev/null, so a module-load crash (which escapes silent-zero-gate.py's
+    in-main try/except and is invisible while `exit 0` fails open) is
+    recordable. The crash path cannot be triggered without breaking the real
+    import, so the stderr routing is asserted structurally; the end-to-end deny
+    through the real wrapper is behavioral and confirms fail-open is preserved."""
+    SH = PROJECT_ROOT / "core" / "scripts" / "silent-zero-gate.sh"
+    src = SH.read_text(encoding="utf-8")
+    py_line = next(l for l in src.splitlines() if l.strip().startswith("python3 "))
+    assert "2>/dev/null" not in py_line, "python3 invocation must not discard its own stderr (D3)"
+    assert "silent-zero-gate.err" in py_line, "breakage log must be wired on the python3 line (D3)"
+    # behavioral: the real wrapper still denies + exits 0 (fail-open intact)
+    proc = subprocess.run(
+        [BASH, SH.as_posix()], input=json.dumps(
+            {"tool_name": "Bash", "tool_input": {"command": FOUNDING}}),
+        capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode == 0, f"wrapper must exit 0; got {proc.returncode}"
+    if proc.stdout.strip():
+        assert json.loads(proc.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
 
 
 # ------------------------------------------------------------- APPROVE cases

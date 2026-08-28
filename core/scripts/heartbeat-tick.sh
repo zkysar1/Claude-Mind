@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
 # IRREDUCIBLY LOCAL -- per-Bash-call latency budget / hook / session-state critical path. Keep local: never add MCP or remote-service indirection here (a localhost daemon hop, where already present, is the maximum).
-# Per-iteration heartbeat tick: local file mtime + cross-agent team-state write.
+# Heartbeat tick: local file mtime + cross-agent team-state write + lease renewal.
 #
 # Both heartbeats advance together — single source of truth for "this agent is
-# alive at NOW." Called once per aspirations-loop iteration from Phase -0.5,
-# once from /start autonomous seed, and every 60s from interruptible-sleep.sh
-# during long B7 waits so mtime can't cross the staleness threshold.
+# alive at NOW." Callers: once per aspirations-loop iteration from Phase -0.5;
+# once from /start autonomous seed; every 60s from interruptible-sleep.sh during
+# long B7 waits; on every diary write via execution-diary.py (rate-limited,
+# ); and — since  — before every Bash tool call from the
+# PreToolUse hook bash-agent-inject.py (detached, rate-limited to one per
+# _shared_tick.SHARED_HEARTBEAT_INTERVAL_S). The hook caller is what makes a
+# runner's freshness independent of its ITERATION LENGTH: a served 27B whose
+# precheck alone outlasted OWNERSHIP_STALE_SECONDS read as a crashed reducer and
+# its worker Body parked (coach, zc-03, 2026-08-28). A non-reducer Body passes
+# `--body-only` (below) so it refreshes its own carrier and nothing agent-wide.
 #
 # Liveness model: pure mtime. heartbeat-stale.sh compares file age against
 # runner_heartbeat.stale_minutes and returns fresh/stale. No writer-identity
-# check — the heartbeat-tick cadence during waits + the single-caller invariant
-# (aspirations loop + /start + interruptible-sleep) is the liveness contract.
+# check — the tick cadence above is the liveness contract.
 #
 # Why a script and not inline in aspirations/SKILL.md:
 # SKILL.md pseudocode is loaded into LLM context at prime/boot — changes don't
@@ -223,6 +229,22 @@ if [ -n "${MIND_SID:-}" ]; then
     fi
 fi
 
+# ── --body-only () ────────────────────────────────────────────────
+# Everything ABOVE this line is per-SID; everything BELOW is per-BOX or
+# AGENT-WIDE — the hooksPath self-report, then the runner signal (runner-
+# heartbeat, team-state last_active, claim renewal, self-fence) that only the
+# REDUCER may advance. The state gate further down separates the roles only for
+# the CROSS-BOX worker (IDLE by design); a SAME-BOX worker shares the reducer's
+# agent-state=RUNNING and would sail through it, renewing the reducer's lease
+# with the shared runner-token — a zombie lease if the reducer died. So the
+# CALLER separates them: bash-agent-inject.py passes this flag for any Body
+# whose SID is not running-session-id. Exit 0 — the per-Body carrier was
+# refreshed, which is the whole job; the box-level publish below is the
+# reducer's tick's to make.
+if [ "${1:-}" = "--body-only" ]; then
+    exit 0
+fi
+
 # ── core.hooksPath self-report () ─────────────────────────────────
 # ABOVE THE STATE GATE, DELIBERATELY — the same hoist, for the same reason, as
 # the per-Body heartbeat above (, guard-1479). The gate's `exit 2`
@@ -364,23 +386,22 @@ bash "$(dirname "$0")/team-state-update.sh" \
 # surfaces the problem and the next tick retries naturally.
 bash "$(dirname "$0")/live-phase-emit.sh" || true
 
-# ── DDB runner-claim heartbeat (single-runner lock §4). Advances the cross-machine
-# DDB heartbeat_at alongside the local mtime above so a peer machine's
-# stale-lock-break (OWNERSHIP_STALE_SECONDS) never reclaims a LIVE runner. Gated on
-# STORAGE_BACKEND=own-cloud — the ONLY signal (no OWNERSHIP_MODE flag; removed
-# 2026-07-02 ) — so the local backend keeps THIS script IRREDUCIBLY
-# LOCAL: NO subprocess, NO daemon hop. STORAGE_BACKEND is not exported into the
-# agent shell, so resolve it the same cheap way check-prerequisites.sh does: live
-# env first, else one grepped .env.local line (no secret sourcing). When own-cloud,
-# runner-claim.sh routes through the LOCALHOST daemon (the annotation's stated
-# maximum), fail-open (|| true) so a DDB hiccup can NEVER block an iteration.
-_HB_BACKEND="${STORAGE_BACKEND:-}"
-if [ -z "$_HB_BACKEND" ] && [ -f "$PROJECT_ROOT/.env.local" ]; then
-    _HB_BACKEND="$(grep -E '^[[:space:]]*STORAGE_BACKEND[[:space:]]*=' "$PROJECT_ROOT/.env.local" 2>/dev/null \
-        | tail -1 | sed -E 's/^[^=]*=[[:space:]]*//; s/[[:space:]]*#.*$//; s/[[:space:]]*$//')"
-fi
-_HB_BACKEND="$(printf '%s' "$_HB_BACKEND" | tr '[:upper:]' '[:lower:]')"
-if [ "$_HB_BACKEND" = "own-cloud" ]; then
+# ── Runner-claim heartbeat (single-runner lock §4). Advances the cross-machine
+# lease's heartbeat_at alongside the local mtime above so a peer machine's
+# stale-lock-break (OWNERSHIP_STALE_SECONDS) never reclaims a LIVE runner.
+# BACKEND-POLYMORPHIC, NO GATE (): runner-claim.sh always calls the
+# localhost daemon and the DAEMON decides — DDB under own-cloud, the git-ref
+# lease under the local backend (), a clean no-op where no claim store
+# exists. This leg used to be gated on STORAGE_BACKEND=own-cloud, which was right
+# only while own-cloud was the sole claim store:  added the local lease
+# and re-keyed the READ side (`status`) on capability, while this WRITE side kept
+# keying on the backend NAME — so a local-backend reducer acquired its lease at
+# /start and never renewed it. Measured 2026-08-28 (coach, zc-03, local backend):
+# claim heartbeat 6544s old under a healthy reducer, `status` STALE, the worker
+# Body parked on it. rb-9476 shape — a scoped fix present, correct-looking and
+# inert. The daemon hop is the header's stated maximum; fail-open (|| true) so a
+# claim-store hiccup can NEVER block an iteration.
+{
     # STILL fail-open (a DDB hiccup must never block an iteration) but NO LONGER
     # SILENT. `|| true` alone discarded the rc, so this leg could die while the
     # team-state leg above kept succeeding — two legs of ONE tick failing
@@ -463,4 +484,4 @@ if [ "$_HB_BACKEND" = "own-cloud" ]; then
     # though — the script writes a durable marker and loud stderr before it
     # stops anything, and every internal failure path exits 0 without writing.
     bash "$(dirname "$0")/reducer-self-fence.sh" || true
-fi
+}

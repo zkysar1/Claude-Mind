@@ -44,7 +44,48 @@ if [ -z "$CHANNEL" ]; then
 fi
 
 # Read stdin (the message text) BEFORE sourcing _runtime.sh.
-BODY="$(cat)"
+# Guarded (, porting the  bounded read from pipeline-move.sh;
+# guard-3393 door (b)): a bare `cat` wedges FOREVER when stdin is open but never
+# delivers EOF — any backgrounded invocation inherits a live descriptor. Observed
+# 2026-07-26: a backgrounded post sat 25 minutes in state S, wrote nothing, and had
+# to be killed by PID; nothing timed out and nothing logged. `[ -t 0 ]` CANNOT
+# detect this (measured FALSE for both /dev/null and a never-EOF socket stdin), so
+# the tty test only skips the interactive case — the bounded probe is what closes
+# the door. Real piped callers (`echo "msg" | ...`) have data in the pipe buffer at
+# exec, so the timeout never fires for them. `|| [ -n "$first_chunk" ]` keeps
+# single-line input lacking a trailing newline (read exits nonzero on EOF but fills
+# the var). UNLIKE pipeline-move.sh, the body here IS the message, so an idle stdin
+# is a FATAL usage error, not a degrade: a post with an empty body must error, never
+# block and never post empty.
+BODY=""
+if ! [ -t 0 ]; then
+    first_chunk=""
+    rc_read=0
+    IFS= read -r -t 2 first_chunk || rc_read=$?
+    if [ "$rc_read" -eq 0 ] || [ -n "$first_chunk" ]; then
+        rest="$(cat)"
+        if [ -n "$rest" ]; then
+            BODY="$first_chunk"$'\n'"$rest"
+        else
+            BODY="$first_chunk"
+        fi
+    elif [ "$rc_read" -gt 128 ]; then
+        echo "board-post.sh: stdin open but idle after 2s — refusing to post an empty message (backgrounded-task guard, g-115-3284/g-115-2291)." >&2
+        echo "  The MESSAGE TEXT is read from STDIN. There is no --message/--body/--text flag." >&2
+        echo "  Correct: echo \"msg\" | bash core/scripts/board-post.sh --channel <ch> [--type <t>] [--tags <a,b>]" >&2
+        echo "  If calling from a backgrounded task, redirect stdin explicitly: ... | bash core/scripts/board-post.sh --channel <ch>" >&2
+        exit 1
+    fi
+    # rc_read == 1 with empty var (immediate EOF, e.g. </dev/null): falls through to
+    # the empty-body check below, which reports the usage error.
+fi
+
+if [ -z "$BODY" ]; then
+    echo "Error: empty message body — nothing to post." >&2
+    echo "  The MESSAGE TEXT is read from STDIN. There is no --message/--body/--text flag." >&2
+    echo "  Correct: echo \"msg\" | bash core/scripts/board-post.sh --channel <ch> [--type <t>] [--tags <a,b>]" >&2
+    exit 1
+fi
 
 # --- Daemon path ----------------------------------------------------------
 # shellcheck disable=SC1091

@@ -59,6 +59,20 @@ if [ -n "${AGENT_DIR:-}" ]; then
     _vp_check "AGENT_DIR" "$AGENT_DIR"
 fi
 
+# Stray repo-root world/|meta/ (2026-08-28 charter incident): a literal
+# PROJECT_ROOT/world or /meta that is NOT the configured root holds files no
+# other box, store, or git history can see. Script-lane writes bypass every
+# write-time hook by design, so session-start detection is a load-bearing
+# layer, not decoration.
+for _vp_pair in "world:${WORLD_DIR:-}" "meta:${META_DIR:-}"; do
+    _vp_sub="${_vp_pair%%:*}"; _vp_conf="${_vp_pair#*:}"
+    _vp_stray="$PROJECT_ROOT/$_vp_sub"
+    if [ -d "$_vp_stray" ] && [ "$_vp_stray" != "$_vp_conf" ]; then
+        _vp_warn "STRAY $_vp_sub/ AT REPO ROOT: $_vp_stray is NOT the configured root ($_vp_conf) — its contents are invisible to the authoritative store and the fleet. Migrate + remove it."
+        _vp_fail=$((_vp_fail+1))
+    fi
+done
+
 if [ "$_vp_fail" -gt 0 ]; then
     printf '>> L3 PATH VALIDATOR: %d warning(s) — writes may land at wrong path\n' "$_vp_fail" >&2
 else

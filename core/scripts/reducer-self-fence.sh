@@ -11,8 +11,9 @@
 # AUTHORIZATION: `.claude/rules/stop-hook-compliance.md` rule 2 names this script
 # as the second authorized caller of `session-signal-set.sh stop-requested`
 # outside /stop (productivity-stop-gate.sh is the first). INVOKED ONLY by
-# heartbeat-tick.sh, inside its existing STORAGE_BACKEND=own-cloud branch. The
-# LLM MUST NOT invoke this directly.
+# heartbeat-tick.sh, on every tick regardless of backend (: where no
+# claim store exists the daemon answers `status` with REFUSE, rc=4, which
+# decide() HOLDS on). The LLM MUST NOT invoke this directly.
 #
 # The DECISION is script-gated in reducer_self_fence.py::decide (pure, fully
 # branch-tested) — not LLM-discretionary — so the threshold math cannot be

@@ -37,7 +37,7 @@ a signal to stop.
 
    <!-- exception added 2026-08-05 for reducer-self-fence (g-306-225) -->
    **Exception**: `core/scripts/reducer-self-fence.sh` (invoked only by
-   `heartbeat-tick.sh`, inside its existing `STORAGE_BACKEND=own-cloud` branch)
+   `heartbeat-tick.sh`, on every tick, whatever the backend — g-115-8200)
    is authorized to set `stop-requested` when the cross-machine runner lease says
    this box is no longer the reducer. The runner claim is a LEASE, and a lease
    needs `T_stepdown < T_takeover`: the holder must stop acting as leader before a

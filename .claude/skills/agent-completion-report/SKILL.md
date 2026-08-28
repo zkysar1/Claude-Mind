@@ -558,8 +558,25 @@ Since: {since_timestamp} ({hours}h {min}m ago)
      platitude with concrete proof the sweep HAS caught real things over its life.
      Order by runs DESC:}
       - {goal_id}: lifetime {hits} catch(es) / {runs} runs{", last catch " + last[:10]
-        when last is not null} -- a non-zero lifetime catch count is evidence the
-        cadence is load-bearing, not busywork.
+        when last is not null} -- {IF hits > 0: "a non-zero lifetime catch count is
+        evidence the cadence is load-bearing, not busywork." ELSE: "a clean lifetime
+        across {runs} runs -- the sweep has held its cadence and found nothing to
+        report, which is the guard working, not the guard idling."}
+     {THE hits == 0 CASE IS OWNED HERE, DELIBERATELY (g-115-4086). The predicate
+      above is `runs > 0`, so a 17-run/0-hit goal IS selected -- but the original
+      trailing clause asserted a non-zero catch count for every selected row, which
+      is FALSE for that goal, and GRACEFUL OMIT below fires only when NO goal has
+      runs > 0. So runs>0 && hits==0 fell between the two branches: the predicate
+      said PRINT and the prose said the line meant nothing. Measured consequence
+      (g-001-04, 2026-07-30): the report omitted the tally for a 17-run goal and
+      published a WRONG reason -- "a partial write, not a measured zero" -- and one
+      hour later that goal's deep close wrote hits=1, proving the absence had been a
+      true zero all along. Do NOT "fix" this by tightening the predicate to
+      `hits > 0`: that re-suppresses exactly the row this branch exists to print,
+      and lines 553-554 above are the reason -- a sweep that returns 0 today is why
+      a regression did not ship. This is NOT the "0/0" the GRACEFUL OMIT forbids;
+      that prohibition is about a tally with no RUNS behind it, where nothing has
+      been measured at all.}
     {GRACEFUL OMIT (the early-data default): IF NO recurring goal completed this
      window has runs > 0 -- the writer has not accumulated yet, or this window held
      only non-recurring goals -- show NONE of the per-goal lines above; keep only the

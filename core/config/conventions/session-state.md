@@ -514,7 +514,7 @@ to know which Claude Code session it belongs to.
 
 | Consumer | Behavior |
 |----------|----------|
-| `heartbeat-tick.sh` | Advances `runner-heartbeat` mtime every iteration + every 60s during B7 waits. Content is irrelevant (pure mtime). |
+| `heartbeat-tick.sh` | Advances `runner-heartbeat` mtime every iteration, every 60s during B7 waits, on every diary write and before every Bash tool call (the last two rate-limited to one per `_shared_tick.SHARED_HEARTBEAT_INTERVAL_S` — g-306-233 / g-115-8200). Content is irrelevant (pure mtime). |
 | `/stop` observer branch | Reads `$MIND_SID` and compares against `running-session-id`. Match → promote to runner; mismatch → observer branch. |
 | `recovery-gate.sh` | Reads `heartbeat-stale.sh` (fresh/stale only) for Condition 2. Also reads SessionStart `source` field and skips the gate entirely when source is `compact` or `resume` (continuations, not fresh startups). See `compact-recovery.md` "Recovery-gate source matching". |
 | `session-save-id.sh` | Writes `$MIND_SID` into `running-session-id` at RUNNING entry. |
@@ -613,6 +613,14 @@ invariants.
     ⟹ fresh heartbeat exists" invariant (rb-323).
   - `core/scripts/interruptible-sleep.sh` — every 60s during B7 waits so
     mtime can't cross the staleness threshold during a 1800s cap sleep.
+  - `core/scripts/execution-diary.py` — on every diary write, rate-limited by
+    the `claim-renewal-last` stamp (g-306-233); the runner-heartbeat itself is
+    touched directly on every write.
+  - `core/scripts/bash-agent-inject.py` — before every Bash tool call, detached
+    and on the same stamp/interval (g-115-8200). This is the caller that keeps a
+    runner fresh whose ITERATIONS outlast the threshold (served small models).
+    A non-reducer Body gets `heartbeat-tick.sh --body-only`, which refreshes
+    only its `body-heartbeat-<SID>.json` carrier and exits before this file.
 - **Content**: irrelevant (the probe reads mtime only).
 - **mtime**: seconds-granularity liveness timestamp.
 - **Recovery action**: `clear` — `/start --recover` and `recovery-gate.sh`

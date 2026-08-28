@@ -383,10 +383,16 @@ def _cadence_gate():
     # healthy "cadence not crossed": no crash, no warning, just silence. A gate
     # that cannot distinguish "not due" from "never again" is not a gate.
     #
-    # fresh-eyes-cadence-check.py got this heal ( per-agent,
-    #  team-layer); its two siblings (this file, felt-sense-cadence-
-    # check.py) never did. Measured 2026-07-14: felt-sense sat at diff=-335 and
-    # needed 410 more completed goals before it could fire again.
+    # fresh-eyes-cadence-check.py got this heal first ( per-agent,
+    #  team-layer). Its two siblings (this file, felt-sense-cadence-
+    # check.py) HAVE SINCE BEEN HEALED TOO — verified 2026-08-28 (alpha, cc-04):
+    # the `diff < 0` branch is present in all three (fresh-eyes:376,
+    # felt-sense:236, and below). This paragraph read "its two siblings never
+    # did" until then, which sent a reader looking for two starving rituals that
+    # no longer exist — a dated waypoint left in the present tense, the same
+    # already-fixed-work trap as rb-9574. The 2026-07-14 measurement below is
+    # kept as the ORIGINATING evidence, not as current state: felt-sense sat at
+    # diff=-335 and needed 410 more completed goals before it could fire.
     #
     # Re-stamp to the current count and DO NOT fire. Firing here would trade a
     # starved ritual for one that fires on every basis correction (banner

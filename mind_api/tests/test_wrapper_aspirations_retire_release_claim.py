@@ -4,6 +4,8 @@ Test strategy:
   - running_daemon fixture spawns a daemon in a tmp project_root
   - We override RT_DIR so the wrapper finds the tmp daemon's port file
   - We seed aspirations.jsonl with test data before each call
+  - Claim tests additionally pin the scorer-verdict sidecar (see
+    `_seed_scorer_verdict`) -- RT_DIR does NOT reach it
 """
 from __future__ import annotations
 
@@ -11,6 +13,7 @@ import json
 import os
 import shutil
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -29,6 +32,43 @@ def _bash() -> str:
 def _seed_aspiration(world: Path, asp):
     path = world / "aspirations.jsonl"
     path.write_text(json.dumps(asp, ensure_ascii=True) + "\n", encoding="utf-8")
+
+
+def _seed_scorer_verdict(project_root: Path, top_goal_id: str,
+                         agent: str = "alpha") -> Path:
+    """Fixture-scoped scorer-verdict sidecar; returns the path to pass through.
+
+    THE CLAIM WRAPPER IS THE ONLY ONE OF THE THREE THAT NEEDS THIS, and neither
+    of the other two knobs reaches it. `project_root` and `RT_DIR` pin the
+    daemon; the Scorer Sovereignty gate resolves its sidecar independently, as
+    `agent_state_dir(<agent>) / scorer-verdict.json` through `_paths` -- rooted
+    at the REAL repo, not at the tmp tree. Un-pinned, these tests read whatever
+    verdict the LIVE selector wrote minutes ago and the claim is refused for
+    diverging from a top pick that exists only in the live queue (g-115-5492).
+
+    WHY IT LOOKED INTERMITTENT: the gate is fail-open and denies only on a FRESH
+    verdict, so in a quiet window the live verdict is stale or absent and these
+    tests pass. A green run was evidence of TIMING, not of isolation.
+
+    `ts` is computed relative to now for the same reason (guard-566): a
+    hardcoded timestamp would go stale, the gate would fail open, and the test
+    would pass without the gate ever reading this file -- an isolation that
+    only looks like one. `test_wrapper_claim_sovereignty_refuses_...` below is
+    the positive control that this file is genuinely being read.
+
+    The path mirrors the production layout inside the tmp root rather than
+    inventing a flat one, so the fixture stays recognizable as the thing it
+    stands in for (guard-920).
+    """
+    path = (project_root / "agents" / agent / "session" / "scorer-verdict.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "top_goal_id": top_goal_id,
+        "top_score": 1.0,
+        "ts": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "top_5": [{"goal_id": top_goal_id, "score": 1.0}],
+    }), encoding="utf-8")
+    return path
 
 
 def _run(wrapper, args, *, project_root: Path, agent: str = "alpha"):
@@ -150,8 +190,10 @@ def test_wrapper_claim_happy_path(running_daemon):
         "progress": {"completed_goals": 0, "total_goals": 1, "recurring_goals": 0},
     }
     _seed_aspiration(world, asp)
+    verdict = _seed_scorer_verdict(project_root, "g-001-01")
 
-    rc, out, err = _run(WRAPPER_CLAIM, ["g-001-01", "alpha"],
+    rc, out, err = _run(WRAPPER_CLAIM,
+                        ["g-001-01", "alpha", "--verdict-file", str(verdict)],
                         project_root=project_root)
     assert rc == 0, f"wrapper exit {rc}: stderr={err}"
     parsed = json.loads(out)
@@ -173,8 +215,86 @@ def test_wrapper_claim_cross_lane_refused(running_daemon):
         "progress": {"completed_goals": 0, "total_goals": 1, "recurring_goals": 0},
     }
     _seed_aspiration(world, asp)
+    # Sovereignty must ALLOW here so the cross-lane refusal is what we measure:
+    # both gates exit 2, and only the stderr text tells them apart.
+    verdict = _seed_scorer_verdict(project_root, "g-001-01")
 
-    rc, out, err = _run(WRAPPER_CLAIM, ["g-001-01", "alpha"],
+    rc, out, err = _run(WRAPPER_CLAIM,
+                        ["g-001-01", "alpha", "--verdict-file", str(verdict)],
                         project_root=project_root)
     assert rc == 2, f"expected exit 2, got {rc}"
     assert "cross_lane_refused" in err
+    assert "scorer-sovereignty" not in err, (
+        "sovereignty gate refused first -- the fixture verdict was not honored, "
+        f"so this test is measuring the wrong gate: {err}")
+
+
+def test_wrapper_claim_sovereignty_refuses_with_fixture_verdict(running_daemon):
+    """Positive control for the `--verdict-file` seam ().
+
+    The two tests above pass when the gate ALLOWS, and the gate allows in three
+    materially different situations: the fixture verdict was read and named this
+    goal as top pick (what we intend), the flag was silently dropped and the LIVE
+    verdict happened to be stale (fail-open), or the fixture verdict was written
+    unparseably (fail-open again). All three look identical from a green run, so
+    a passing suite above is NOT by itself evidence that the seam works.
+
+    This test makes them distinguishable: the fixture verdict names a DIFFERENT
+    top pick, so the gate must refuse -- and must name the fixture's goal-id in
+    the refusal. A refusal quoting anything else means the gate read some other
+    verdict; no refusal at all means it read no verdict.
+
+    It also pins the half the fix must NOT break: threading a path argument
+    exposes the gate to tests, it does not disarm it.
+    """
+    project_root, _ = running_daemon
+    world = project_root / "world"
+    asp = {
+        "id": "asp-001", "title": "Test", "status": "active",
+        "priority": "LOW", "archived": False,
+        "goals": [
+            {"id": "g-001-01", "title": "Claimable", "status": "pending",
+             "recurring": False},
+        ],
+        "progress": {"completed_goals": 0, "total_goals": 1, "recurring_goals": 0},
+    }
+    _seed_aspiration(world, asp)
+    verdict = _seed_scorer_verdict(project_root, "g-001-99")
+
+    rc, out, err = _run(WRAPPER_CLAIM,
+                        ["g-001-01", "alpha", "--verdict-file", str(verdict)],
+                        project_root=project_root)
+    assert rc == 2, f"expected sovereignty refusal (exit 2), got {rc}: {err}"
+    assert "scorer-sovereignty" in err, err
+    assert "g-001-99" in err, (
+        "refusal did not name the FIXTURE's top pick -- the gate read a "
+        f"different verdict than the one threaded in: {err}")
+
+
+def test_wrapper_claim_sanctioned_deviation_clears_sovereignty(running_daemon):
+    """The refusal above is not a dead end: a deviation code clears it.
+
+    Without this, the control test alone would be satisfied by a gate that
+    refuses unconditionally. Same fixture verdict, same divergent claim, one
+    added `--deviation` from the closed enum -- and the claim must land.
+    """
+    project_root, _ = running_daemon
+    world = project_root / "world"
+    asp = {
+        "id": "asp-001", "title": "Test", "status": "active",
+        "priority": "LOW", "archived": False,
+        "goals": [
+            {"id": "g-001-01", "title": "Claimable", "status": "pending",
+             "recurring": False},
+        ],
+        "progress": {"completed_goals": 0, "total_goals": 1, "recurring_goals": 0},
+    }
+    _seed_aspiration(world, asp)
+    verdict = _seed_scorer_verdict(project_root, "g-001-99")
+
+    rc, out, err = _run(WRAPPER_CLAIM,
+                        ["g-001-01", "alpha", "--verdict-file", str(verdict),
+                         "--deviation", "force-override"],
+                        project_root=project_root)
+    assert rc == 0, f"wrapper exit {rc}: stderr={err}"
+    assert json.loads(out)["claimed_by"] == "alpha"

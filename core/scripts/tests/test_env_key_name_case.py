@@ -25,6 +25,7 @@ place to introduce a false positive, and the measured census showed none.
 Secrets hygiene: every fixture here is synthetic. Nothing reads the real
 `.env.local`, and no value is ever printed (guard-1270 / guard-1461).
 """
+import os
 import sys
 from pathlib import Path
 
@@ -172,6 +173,167 @@ def test_all_three_env_parsers_share_the_case_insensitive_class():
             f"erroring — the g-115-3372 defect. All three copies must stay in "
             f"sync; see the comment at each site."
         )
+
+
+# --- integration: the OTHER TWO parsers, exercised END TO END () ---
+#
+# test_all_three_env_parsers_share_the_case_insensitive_class above asserts the
+# `_paths.py` and `storage_backend.py` copies by SOURCE TEXT. That catches a
+# narrowing edit to the pattern and nothing else: a parser can carry the right
+# regex and still fail to surface the key — a later guard, a different match
+# group index, an ordering change, or a caller that re-filters. These two tests
+# close that gap by CALLING each parser with a lowercase key and asserting the
+# key comes out the far end.
+#
+# Secrets hygiene is the design constraint here, not an afterthought (guard-1461):
+# both parsers produce a container holding every key on the box (`_env_local_vars`
+# and, for the second test, the real `os.environ`), and pytest rewrites a failing
+# assertion by serializing its operands. So `assert key in mod._env_local_vars`
+# would dump the whole dict into the failure output.
+#
+# SUBSCRIPTING THE ONE KEY IS NECESSARY BUT NOT SUFFICIENT, which is the part
+# that is easy to get wrong and was measured here rather than assumed. pytest
+# also appends a "where" clause reprs the RECEIVER of any call left inside the
+# asserted expression, so `assert os.environ.get(k) == v` still fails with
+# `where None = <bound method Mapping.get of environ({...})>` — every variable on
+# the box. Both tests below therefore bind the scalar to a local FIRST and assert
+# on the local, leaving the container out of the expression entirely. Verified
+# both ways through mutation-proof-test.sh --junit-xml: the pre-fix red message
+# carried the `bound method ... environ(` repr, the post-fix one ends at
+# `assert None == \'synthetic-value\'`.
+#
+# The fixtures are synthetic and no real `.env.local` is read.
+
+
+def _load_paths_copy_with_env_local(tmp_path, env_local_text):
+    """Import a FRESH copy of `_paths.py` whose PROJECT_ROOT resolves to tmp_path.
+
+    `_paths` derives PROJECT_ROOT from its own ``__file__`` (SCRIPT_DIR.parent.
+    parent) and runs ``_env_local_vars = _read_env_local()`` at IMPORT time, so
+    neither monkeypatching the constant nor ``importlib.reload`` reaches the
+    import-time path: reload re-derives PROJECT_ROOT from the real location.
+    Copying the module into a tmp tree and loading it from there is what makes
+    the import-time assignment observable, which is the half of path (1) a
+    direct ``_read_env_local()`` call cannot cover.
+
+    Deliberately NOT registered in ``sys.modules``: guard-1165 (module-level
+    sys.modules stubs poison every test module collected afterward in the shared
+    pytest process) and its refinement that ``importlib.reload`` in a finally is
+    not a real restore. Nothing here to restore, because nothing is installed.
+    This also is not the guard-603 shape — the module loaded is the REAL source,
+    not a fake that must stub every symbol the production code imports.
+    """
+    import importlib.util
+    import shutil
+
+    scripts = tmp_path / "core" / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(SCRIPT_DIR / "_paths.py", scripts / "_paths.py")
+    (tmp_path / ".env.local").write_text(env_local_text, encoding="utf-8")
+
+    spec = importlib.util.spec_from_file_location(
+        "_paths_g115_3380_probe", scripts / "_paths.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.mark.parametrize("key", [
+    "view_cage_online",     # all lowercase
+    "SMTPserver",           # mixed case — the real shape that was skipped
+    "_leading_underscore",  # legal in shell/dotenv
+])
+def test_paths_env_local_surfaces_non_uppercase_key_at_import(
+        tmp_path, monkeypatch, key):
+    """Path (1): lowercase key in .env.local -> _read_env_local -> _env_local_vars.
+
+    Asserts the module-level dict that ENVIRONMENT_ID / COMMONS_POLICY are read
+    from, so this covers the import-time assignment and not merely the function.
+    """
+    # The fresh copy resolves AGENT_DIR against tmp_path, which has no agents/;
+    # unset the ambient binding so the import does not fall through to scanning
+    # real agent dirs. conftest's _restore_env_per_test puts it back regardless.
+    monkeypatch.delenv("MIND_AGENT", raising=False)
+
+    mod = _load_paths_copy_with_env_local(
+        tmp_path,
+        "# a comment line\n"
+        f"{key}=synthetic-value\n"
+        "MIND_UPPER_KEY=synthetic-upper\n",
+    )
+
+    assert mod.PROJECT_ROOT == tmp_path, (
+        "the copied module did not re-root; this test would otherwise be "
+        "reading the REAL .env.local (guard-1461)"
+    )
+    # guard-1461, and the intermediate local is LOAD-BEARING, not style. Calling
+    # .get() INSIDE the asserted expression is not enough: pytest's assertion
+    # rewriting appends a "where" clause that reprs the RECEIVER, so
+    # `assert mod._env_local_vars.get(k) == v` fails with
+    # `where None = <bound method Mapping.get of {...whole dict...}>`. Binding the
+    # scalar first leaves the container out of the expression entirely, so only
+    # `None` and the expected value can reach the failure output. Measured on this
+    # very test via mutation-proof-test.sh --junit-xml ().
+    got = mod._env_local_vars.get(key)
+    assert got == "synthetic-value", (
+        f"{key!r} was silently SKIPPED by _paths._read_env_local() — an "
+        f"uppercase-only key-name class omits the line rather than erroring, so "
+        f"ENVIRONMENT_ID/COMMONS_POLICY and every other world-contract var read "
+        f"through this dict go missing without a diagnostic. See g-115-3372."
+    )
+    # No-regression direction (rb-401): widening must not disturb uppercase.
+    got_upper = mod._env_local_vars.get("MIND_UPPER_KEY")
+    assert got_upper == "synthetic-upper"
+
+
+def test_storage_backend_bootstrap_exports_non_uppercase_key(tmp_path, monkeypatch):
+    """Path (2): lowercase key in .env.local -> storage_backend -> os.environ.
+
+    `_bootstrap_env_defaults` is a no-op under pytest unless
+    ENV_BOOTSTRAP_ALLOW_PYTEST is set, and takes `root` as a test seam — both
+    are load-bearing here: without the seam this would read the real
+    `.env.local` and side-load production config into the suite process.
+    """
+    import storage_backend
+
+    key = "view_cage_online"
+
+    # setenv-then-delenv so a teardown restore is ALWAYS registered. A bare
+    # monkeypatch.delenv on an ABSENT var registers nothing, and the function
+    # under test sets the key via os.environ.setdefault — which would then LEAK
+    # into every test collected afterward in the shared pytest process
+    # (guard-1165's in-process pollution; the same reasoning as
+    # test_telemetry_append_log_integrity.py::_delenv_with_restore). Popping
+    # rather than snapshotting is also guard-2334's remedy: a value merely
+    # captured by a restore fixture is inherited from the launching shell.
+    monkeypatch.setenv(key, "_g115_3380_placeholder_")
+    monkeypatch.delenv(key)
+    monkeypatch.setenv("ENV_BOOTSTRAP_ALLOW_PYTEST", "1")
+    # guard-955: pin the backend so nothing here can resolve a real one.
+    monkeypatch.setenv("STORAGE_BACKEND", "local")
+
+    (tmp_path / ".env.local").write_text(
+        "# a comment line\n"
+        f"{key}=synthetic-value\n",
+        encoding="utf-8",
+    )
+
+    storage_backend._bootstrap_env_defaults(root=tmp_path)
+
+    # guard-1461 names "os.environ as a whole" alongside _env_local_vars, and
+    # THIS is the assertion where it bites hardest: the receiver here is the real
+    # process environment. Bind the scalar BEFORE the assert — with the call
+    # inside the expression, pytest's rewriting emits
+    # `where None = <bound method Mapping.get of environ({...})>` and dumps every
+    # variable on the box into the failure output (and thence the CI log and the
+    # session transcript). Observed verbatim in this test's own mutation-proof
+    # run before the local was introduced.
+    got = os.environ.get(key)
+    assert got == "synthetic-value", (
+        f"{key!r} never reached os.environ — storage_backend's .env.local "
+        f"parser silently SKIPPED the line, so every consumer sees an unset "
+        f"var that is plainly present in the file. See g-115-3372."
+    )
 
 
 if __name__ == "__main__":

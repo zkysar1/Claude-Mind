@@ -12,6 +12,29 @@ PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
 # Value-arg pattern: "${2-}" + safe shift; see _runtime.sh / tree-read.sh.
+#
+# STRICT ARGV (). The final arm below used to be `*) shift;;`, which
+# silently DISCARDED any unrecognized flag. This script is SET-ONLY -- the
+# canonical clear is team-state-clear-in-flight.sh -- so
+# `--agent X --goal-id Y --clear` did not clear anything: it dropped --clear and
+# SET in_flight, and because --title/--phase were absent it wrote an EMPTY title
+# and EMPTY phase over a row that had carried both, with a NEWER claimed_at, and
+# returned rc=0. in_flight is the CROSS-AGENT claim surface, so an operation
+# intended to RELEASE a claim instead REFRESHED it -- the exact opposite of
+# intent, on the one store where a wrong answer causes duplicate or withheld
+# work. Measured live 2026-08-19T18:27 (echo, cc-03) during the 
+# close; only a read-back caught it. Same shape as the  class that
+# _argv_strict.sh exists for.
+#
+# Sourced BEFORE _runtime.sh, as _argv_strict.sh's header prescribes, so the
+# refusal stays cheap and cannot be masked by a daemon failure. The whole loop
+# runs before any write, so a refusal here mutates NOTHING -- which is the
+# property the regression test pins, not merely that the call failed.
+# shellcheck disable=SC1091
+source "$CORE_ROOT/scripts/_argv_strict.sh"
+_IF_SELF="team-state-in-flight.sh"
+_IF_ACCEPTED="--agent, --goal-id, --title, --phase, --author"
+
 AGENT=""; GOAL_ID=""; TITLE=""; PHASE=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -20,7 +43,31 @@ while [[ $# -gt 0 ]]; do
         --title)   TITLE="${2-}";   shift $(( $# >= 2 ? 2 : 1 ));;
         --phase)   PHASE="${2-}";   shift $(( $# >= 2 ? 2 : 1 ));;
         --author)  shift $(( $# >= 2 ? 2 : 1 ));;  # handled by X-Mind-Agent header
-        *) shift;;
+        --clear|--clear-in-flight)
+            # DISCOVERABILITY HALF (). A bare unknown-flag refusal is
+            # correct but unhelpful here: the caller wanted to RELEASE a claim,
+            # and a script that does exactly that already exists. Name it, so
+            # the refusal ends the TASK rather than merely ending the command
+            # (guard-1532 -- a refusal naming a remediation must have that
+            # remediation reachable from the state the refusal observed; the
+            # named command is verified against a seeded row by the regression
+            # test, not merely quoted here).
+            # Both spellings are caught because both were tried in sequence
+            # during the measured incident: --clear-in-flight is the flag of the
+            # SIBLING script (team-state-update.sh), and confusing the two is
+            # what produced the wrong write.
+            {
+                printf "%s: '%s' is not a flag of this script -- refusing.\n" "$_IF_SELF" "$1"
+                printf '  This script is SET-ONLY. This flag used to be silently discarded, so\n'
+                printf '  the row was SET with an empty title/phase and a newer claimed_at --\n'
+                printf '  the opposite of the intended release, with exit status 0 (g-115-6829).\n'
+                printf '  To CLEAR the row, use:\n'
+                printf '    bash core/scripts/team-state-clear-in-flight.sh --agent <name> [--if-goal <goal-id>]\n'
+                printf '  Accepted flags here: %s\n' "$_IF_ACCEPTED"
+            } >&2
+            exit 2;;
+        -*) argv_strict_refuse_unknown "$_IF_SELF" "$1" "$_IF_ACCEPTED";;
+        *)  argv_strict_refuse_extra_positional "$_IF_SELF" "$1" 0 "$_IF_ACCEPTED";;
     esac
 done
 

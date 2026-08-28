@@ -1352,6 +1352,17 @@ strategic_pulse:
 per_goal_saturation:
   window_size: 8                  # look back at last N session completions
   consecutive_threshold: 1        # ≥N prior fires of this goal_id in window → suppress
+                                  # ⚠ VALUES >1 ARE STRUCTURALLY UNREACHABLE from the
+                                  # aspirations-store window ( F-2). 
+                                  # repointed load_recent_class_completions at the store,
+                                  # which carries at most ONE completion marker per goal
+                                  # id — measured 2026-08-27 (zeta, cc-02): 948 dated
+                                  # entries, 948 distinct ids, 0 duplicates, against an
+                                  # unfiltered population of 3130. The journal it replaced
+                                  # carried one entry PER FIRING, so this knob's usable
+                                  # range narrowed silently with that fix. At 1 the penalty
+                                  # still fires correctly; raise it only if a window source
+                                  # that can repeat a goal_id is restored.
   suppress_penalty: -5.0          # raw score penalty when threshold hit
                                   # Weight: meta/goal-selection-strategy.yaml → per_goal_saturation
                                   # (default 0.8; -5.0 * 0.8 = -4.0 weighted penalty)
@@ -2097,8 +2108,14 @@ runner_heartbeat:
   # (). Deep-close LLM work (precision extraction, multi-tree-node
   # edits, encoding) regularly runs 30-45 min between iteration-close.sh phase
   # invocations with no diary writes -- both heartbeat AND diary-stale signals
-  # triggered. 60 min absorbs that without forcing per-tool-call heartbeat
-  # instrumentation. Trade-off: genuine zombie recovery takes ~2x longer.
+  # triggered. 60 min absorbed that without per-tool-call heartbeat
+  # instrumentation — UNTIL  (2026-08-28): the tick now ALSO fires
+  # before every Bash tool call from the PreToolUse hook (bash-agent-inject.py,
+  # rate-limited to one per _shared_tick.SHARED_HEARTBEAT_INTERVAL_S), so a
+  # runner's freshness no longer depends on its iteration length. A served 27B
+  # whose precheck alone ran 1h53m read as crashed under the old cadence. 60
+  # stays as the genuine-dead-runner bound (a dead process stops ticking within
+  # one interval). Trade-off: genuine zombie recovery takes ~2x longer.
   # Tunable; raise further if 60 still false-positives.
   # CROSS-MACHINE TWIN (2026-07-07, bravo dual-runner incident): the DDB
   # runner-lease staleness (owncloud_backend.DEFAULT_RUNNER_STALE_SECONDS,
@@ -2113,19 +2130,24 @@ runner_heartbeat:
   # a WEDGE: the loop keeps the heartbeat FRESH while diary writes stall behind a
   # wedged _fileops lock (2026-07-04 own-cloud fleet-wedge,  #4/#5).
   # INVARIANT (): wedge_stale_minutes MUST be > runner_heartbeat.stale_minutes
-  # (60). WHY: a HEALTHY non-phase-4 phase's local runner-heartbeat ages WITH its
-  # phase_start -- both are stamped near the iteration's Phase -0.5 -> Phase 0
-  # boundary and neither re-ticks mid-phase during active (non-sleeping) work
-  # (heartbeat-stale.sh reads the LOCAL runner-heartbeat mtime, touched only by
-  # heartbeat-tick.sh at Phase -0.5 and interruptible-sleep.sh during sleeps). So
-  # when a healthy phase_start exceeds wedge_stale (>60), its heartbeat is ALSO
-  # >60 -> STALE -> Path D's heartbeat-FRESH gate (recovery-gate.sh L607-608)
-  # fails FIRST and suppresses. ONLY a genuine wedge (heartbeat re-ticked FRESH
-  # while the diary stays frozen) presents phase_start>wedge_stale WITH a fresh
-  # heartbeat. At 45 (< 60) there was a 45-60min window where a long precheck /
-  # state-update false-recovered a HEALTHY agent -- the  defect, found by
-  # fresh-eyes-code self-review of . 65 = 60 + 5min margin eliminates that
-  # window; cost is ~20min slower real-wedge recovery (rare + previously manual).
+  # (60). WHY, AS ORIGINALLY CALIBRATED: a HEALTHY non-phase-4 phase's local
+  # runner-heartbeat aged WITH its phase_start (both stamped near Phase -0.5 and
+  # nothing re-ticked mid-phase), so a healthy phase_start past wedge_stale had a
+  # STALE heartbeat and Path D's heartbeat-FRESH gate suppressed FIRST; only a
+  # genuine wedge (heartbeat re-ticked while the diary froze) reached the check.
+  # At 45 (< 60) a long precheck / state-update false-recovered a HEALTHY agent
+  # -- the  defect, found by fresh-eyes-code self-review of .
+  # 65 = 60 + 5min margin closed that window.
+  # SINCE  (2026-08-28) THAT COUPLING NO LONGER HOLDS: the heartbeat
+  # re-ticks at tool-call cadence from the PreToolUse[Bash] hook, so a healthy
+  # phase that runs past wedge_stale WITHOUT a diary write now presents the
+  # wedge signature. What still separates it from a wedge: phase-4-execute's 4h
+  # execute-in-flight suppressor, the runner-age gate (), the diary
+  # liveness veto (any diary write inside the window) and the assistant-turn
+  # veto () -- which reads a CLAUDE CODE transcript and therefore
+  # cannot fire under another runner platform. A deployment whose non-phase-4
+  # phases legitimately exceed 65min (served small models) MUST raise this via
+  # meta/config-overrides; the > stale_minutes invariant still applies.
   # Raising the threshold is monotonically safe: it can only REDUCE Path D firings.
   # phase-4-execute is separately protected by the execute-in-flight suppressor
   # (4h) shared with Paths A/C. Env override: WEDGE_STALE_MINUTES. Guarded by

@@ -120,6 +120,34 @@ def entity_ids(*texts: str) -> set:
     return out
 
 
+def identity_ids(subject: str, body: str = "") -> set:
+    """Ids that IDENTIFY the message: SUBJECT-sourced only, never body citations.
+
+    g-115-8026. `entity_ids` unions subject and body, so an id named in the body
+    purely as provenance becomes the message's dedup identity. Measured
+    2026-08-27 (g-115-8005, zeta, cc-02): agent-watchdog's memory-pressure alert
+    cites (g-115-4699) in its BODY as an explanatory cross-reference, so all 675
+    ledger records carried the identical entity_ids tuple and collapsed into ONE
+    topic fleet-wide -- rc {0:1, 4:674}: one delivery in a week, for one box,
+    while the SUBJECT was correctly box-scoped (21 distinct subject_norm) and
+    was never consulted by the shared-ids leg.
+
+    The perverse gradient is the point: the more carefully an alert cites its
+    provenance, the more aggressively it is suppressed. This module already knew
+    the shape -- DIGEST_CATEGORIES exists because "a digest names dozens of
+    goal/guard ids, so it must never be the shared-ids prior". Same defect, a
+    different trigger: one cited id rather than dozens.
+
+    NO BODY FALLBACK, deliberately. A fallback ("subject ids, else body ids")
+    was written first and measured as a NO-OP on the exact case above: neither
+    subject contains an id, so both sides fall back to the body and collide
+    identically. `body` is accepted and ignored to keep the call shape obvious
+    at the call sites and to make that decision visible here rather than in a
+    diff.
+    """
+    return entity_ids(subject)
+
+
 def body_fingerprint(body: str) -> str:
     """Normalized head of the body -- enough to recognise the same message
     re-sent under a reworded subject, small enough to keep the ledger light."""
@@ -220,6 +248,7 @@ def _board_outreach_rows(world: Path, since: datetime) -> list:
                 "agent": agent, "category": cat, "subject": subj,
                 "subject_norm": normalize_subject(subj),
                 "entity_ids": sorted(entity_ids(subj, text)),
+                "identity_ids": sorted(identity_ids(subj, text)),
                 "body_fp": body_fingerprint(text), "source": f"board:{name}",
             })
     return out
@@ -233,18 +262,71 @@ def window_for(category: str) -> timedelta:
     return timedelta(hours=WINDOW_HOURS.get((category or "").lower(), WINDOW_HOURS["_default"]))
 
 
-def match_reason(cand: dict, subject_norm: str, subj_tokens: set, ids: set, body_fp: str) -> str | None:
+def match_reason(cand: dict, subject_norm: str, subj_tokens: set, ids: set, body_fp: str,
+                 ids_all: set | None = None) -> str | None:
+    # `ids` = identity (subject-sourced). `ids_all` = subject+body union, used
+    # only for the weak leg below; defaults to `ids` so older callers behave as
+    # if no body citations existed (conservative: fewer weak matches).
+    ids_all = ids if ids_all is None else ids_all
     cn = cand.get("subject_norm") or normalize_subject(cand.get("subject") or "")
     if subject_norm and cn == subject_norm:
         return "same subject"
     j = jaccard(subj_tokens, tokens(cn))
     if j >= SUBJECT_JACCARD:
         return f"subject overlap {j:.2f}"
-    cids = set(cand.get("entity_ids") or [])
-    shared = ids & cids
-    if shared:
-        return "shared ids " + ",".join(sorted(shared)[:4])
-    if ids and cids and not shared:
+    #  + guard-3152: `identity_ids` ships in the same change that
+    # starts consuming it, so it is present on new rows and ABSENT on every row
+    # written before -- the field cannot by itself mark its own boundary. The
+    # remedy is NOT backfill (that manufactures readings nobody took): derive
+    # the absent side from what its absence can only mean -- a pre-split row,
+    # whose identity was the old subject+body union -- and LABEL the derivation
+    # in the reason string so a reader is never handed an inference wearing the
+    # costume of a reading.
+    # STRONG identity: ids named in BOTH subjects. These bind regardless of
+    # phrasing -- "Blocker on " and "Update re " are one
+    # topic. guard-3152: identity_ids ships in the same change that consumes it,
+    # so it is absent on every pre-existing row and cannot mark its own
+    # boundary. Do NOT backfill (that manufactures readings nobody took);
+    # derive the absent side from what its absence can only mean -- a pre-split
+    # row whose identity was the subject+body union -- and LABEL the derivation
+    # so a reader is never handed an inference dressed as a reading.
+    cids_all = set(cand.get("entity_ids") or [])
+    if "identity_ids" in cand:
+        cand_identity = set(cand.get("identity_ids") or [])
+        derived = ""
+    else:
+        cand_identity = set(cand.get("entity_ids") or [])
+        derived = " (DERIVED — prior row predates identity_ids; used its subject+body union)"
+    # Strong when the id is IDENTITY on EITHER side: this side's subject ids
+    # against the candidate's full ids, or the candidate's subject ids against
+    # this side's full ids. One party naming the id in its SUBJECT makes it the
+    # topic, and the other party citing that same id in its body is then talking
+    # about the same thing -- which is exactly the cross-agent case this module
+    # exists for ("I'm getting the same question three different times"), where
+    # one agent writes "Should we retire the legacy PK? ()" and another
+    # writes "Your call: retiring the legacy identity PK" with the id in the body.
+    # Only when the id is body-only on BOTH sides is it a mere citation.
+    strong = (ids & cids_all) | (cand_identity & ids_all)
+    if strong:
+        return "shared ids " + ",".join(sorted(strong)[:4]) + derived
+
+    # WEAK identity: ids that appear only in the BODIES.  -- a body
+    # citation must not override a subject that has already said these are
+    # different topics. `j` above is the subject Jaccard, so reaching here means
+    # the subjects are neither equal nor similar. When BOTH sides carry a real
+    # subject, that disagreement is the more specific signal and it wins: fall
+    # through to the body-fingerprint leg, which still catches a genuine re-send
+    # under a reworded subject. Without this the 674 suppressed memory-pressure
+    # alerts stay suppressed -- neither subject names an id, and both bodies
+    # cite the same tracking goal.
+    cids = cids_all
+    subjects_disagree = bool(subject_norm) and bool(cn) and j < SUBJECT_JACCARD
+    shared = ids_all & cids
+    if shared and not subjects_disagree:
+        return "shared ids " + ",".join(sorted(shared)[:4]) + derived
+    if shared and subjects_disagree:
+        return None   # cited-only overlap under disagreeing subjects: not one topic
+    if ids_all and cids and not shared:
         # Both sides name entities and none coincide: two DIFFERENT topics that
         # merely share phrasing (two outages, two goals). Body-shape overlap
         # must not override an explicit id disagreement.
@@ -263,7 +345,8 @@ def find_prior(subject: str, body: str, category: str, *, world: Path | None = N
     since = now - window_for(category)
     subject_norm = normalize_subject(subject)
     subj_tokens = tokens(subject_norm)
-    ids = entity_ids(subject, body)
+    ids = identity_ids(subject)          # : subject-sourced identity
+    ids_all = entity_ids(subject, body)  # full union, for the weak leg only
     fp = body_fingerprint(body)
     rows = []
     for r in _read_jsonl(ledger_path(world)):
@@ -283,7 +366,7 @@ def find_prior(subject: str, body: str, category: str, *, world: Path | None = N
         if is_digest:
             why = "digest already sent this window"
         else:
-            why = match_reason(r, subject_norm, subj_tokens, ids, fp)
+            why = match_reason(r, subject_norm, subj_tokens, ids, fp, ids_all)
         if why:
             hits.append({**{k: r.get(k) for k in ("id", "ts", "env", "agent", "category", "subject", "source", "goal_id")}, "why": why})
     hits.sort(key=lambda h: h.get("ts") or "", reverse=True)
@@ -310,6 +393,7 @@ def build_record(*, agent: str, category: str, subject: str, body: str, goal_id:
         "subject": strip_agent_prefix(subject or "")[:300],
         "subject_norm": normalize_subject(subject or ""),
         "entity_ids": sorted(entity_ids(subject, body)),
+        "identity_ids": sorted(identity_ids(subject, body)),
         "goal_id": goal_id or "",
         "body_fp": body_fingerprint(body),
         "body_sha1": digest,

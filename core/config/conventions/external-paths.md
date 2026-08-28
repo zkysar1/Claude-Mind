@@ -400,3 +400,25 @@ extended (Option A — surgical) to also fire when the matched root is
 (`PROJECT_ROOT/<MIND_AGENT>/`). Cross-agent writes (one agent's session
 writing into another agent's dir) are not covered by this check by design;
 those route through `world/board/` per `core/config/conventions/coordination.md`.
+
+On 2026-08-27/28, bravo authored the owner-approved asp-370 SDLC charter into a
+literal `PROJECT_ROOT/world/conventions/` path — created by a `py -3` patch
+script whose paths were built INSIDE the script body, a lane no write-time hook
+can see (the Write/Edit L1 hook denies the same absolute path when it arrives
+as a tool `file_path`; verified live the same day). The stray was gitignored,
+outside every governed root (so no post-write verifier keyed on it), and
+self-confirming on an own-cloud box: every local read succeeded while S3 never
+had the file. The nine goals citing it (written via daemon store scripts, which
+write S3 directly) arrived on every box, masking the gap. Cost: asp-370
+foundationally blocked fleet-wide ~7h until a peer agent probed S3. Diagnosis
+of the hook was itself delayed by shell-quoting: six probes fed the hook JSON
+whose backslashes a shell layer had collapsed (`\Z` -> invalid escape), and the
+hook fail-open-approves a parse error — build hook probe payloads with
+json.dumps, never hand-quoted shell strings. Closures: (1)
+`bash-path-resolution-hook.py` now emits a persistent 4-channel ADVISORY on
+every write-shaped Bash call while a stray `PROJECT_ROOT/world|meta` exists
+(detection within a call or two of creation, regardless of lane); (2)
+`validate-paths.sh` (L3) warns on the stray at session start; (3) guard-5362 —
+verify a world/meta file against the AUTHORITATIVE store before citing its
+path in any artifact other agents will read. Tests:
+`core/scripts/tests/test_bash_hook_stray_root_advisory.py`.

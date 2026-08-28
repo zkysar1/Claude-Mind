@@ -10,8 +10,19 @@ adjudication). These tests target the CURRENT lanes:
      BOTH sides, merged md5 becomes the baseline, no conflict skip)
   B  no-baseline + own-cloud auth   -> nobaseline_merged lane engages (union,
      NOT the wholesale S3 pull that drops a local-authored tail)
-  C  local-authoritative change     -> pushed_merged lane engages (union, never
-     a blind whole-object PUT when S3 holds an object)
+  C1 local change, NO baseline      -> pushed_merged lane engages (union, never
+     a blind whole-object PUT when S3 holds an object). This is the sync_file /
+     PostToolUse shape and the lane the 2026-07-16 03:09:14 gate-firings
+     head-replacement came from.
+  C2 local change, S3 AT baseline   -> fenced plain PUT, NOT the union (g-115-7944).
+     Classification has already proven no peer wrote, so there are no peer bytes
+     for the union to preserve — and on a local REMOVAL the union re-adds the
+     record and the file never converges (the lane-B wedge).
+     C was ONE test until 2026-08-27. Its prose described C1 (the incident) while
+     its fixture supplied a baseline, i.e. C2 — so it pinned a lane its own
+     rationale did not describe, and its S3 side held no peer-only record, so it
+     could not have caught the loss it guarded. Split, and the C1 half is now
+     strictly stronger: it asserts the peer record SURVIVES.
   D  multipart ETag + registered    -> pins the CURRENT defer. The pre-merge
      lineage merged here ("multipart classification is unnecessary for a
      commutative merge"); the current lineage defers unconditionally — the
@@ -149,28 +160,6 @@ def test_sync_one_nobaseline_owncloud_authority_merges(tmp_path):
         {"file": str(f), "lane": "nobaseline_merged"}]
 
 
-def test_sync_one_local_change_pushes_via_merge(tmp_path):
-    """Local-authoritative change (S3 still at baseline) + registered store ->
-    the push routes through the union, never a blind whole-object PUT: even a
-    'confirmed local change' can carry a stale TAIL while peers appended to S3
-    (the PostToolUse sync_file lane that replaced the newer gate-firings S3
-    head, 2026-07-16 03:09:14)."""
-    be = MergeBackend([(tmp_path, "world")])
-    f = tmp_path / "evolution-log.jsonl"
-    s3_content = _jl(BASE)
-    f.write_bytes(_jl(BASE, MINE))          # local changed
-    be.s3[str(f)] = s3_content              # S3 at baseline
-    stats = _new_stats()
-    out = _mod._sync_one(be, f, dry_run=False, stats=stats,
-                         baseline_md5=_md5(s3_content), multi_machine=True)
-    assert stats.get("pushed_merged") == 1
-    assert stats["pushed"] == 0             # no blind mirror_put
-    assert be.puts == []
-    assert _lines(be.s3[str(f)]) == _lines(_jl(BASE, MINE))
-    assert out == _md5(f.read_bytes())
-    assert stats["merge_events"] == [{"file": str(f), "lane": "pushed_merged"}]
-
-
 class _MultipartMergeBackend(MergeBackend):
     def stat(self, path):
         st = super().stat(path)
@@ -297,6 +286,153 @@ def test_sync_print_carries_iso_timestamp(capsys):
     err = capsys.readouterr().err
     assert re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2} \[sync\] err canary",
                     err.strip())
+
+
+
+# ── : the merge lane must not swallow a NON-diverged push ──────────
+#
+# THE LANE SPLIT THIS SECTION PINS. `_try_merge_put` at the final push block ran
+# on `if st is not None:` alone, so EVERY push with an object on S3 took the
+# union — including the case where classification had just PROVEN S3 sits at the
+# baseline and nothing diverged. The  rationale it was written for (a
+# stale local TAIL while peers appended to S3) is real, but strictly NARROWER
+# than the guard: a peer append moves S3 off the baseline, so the case it
+# protects is `s3_at_baseline == False` and is untouched here.
+#
+# WHICH CALLER REACHES WHICH LANE (measured, owncloud_sync.py):
+#   sync_file (PostToolUse, L2118)  -> _sync_one WITHOUT baseline_md5 -> None
+#                                      -> s3_at_baseline False -> MERGE (kept)
+#   periodic sweep (L1752 / L1803)  -> baseline_md5 from the manifest
+#                                      -> s3_at_baseline may be True -> fenced put
+# The 2026-07-16 03:09:14 gate-firings incident the merge was written for came
+# from the sync_file lane, which passes no baseline — so it keeps the union.
+# test_sync_file_lane_without_baseline_still_merges below is its regression pin.
+
+
+def test_sync_one_s3_at_baseline_takes_fenced_put_not_merge(tmp_path):
+    """S3 proven AT BASELINE + local changed -> fenced plain PUT, not the union.
+
+    s3_at_baseline is True exactly when S3's content equals the baseline this
+    box last reconciled, i.e. no peer has written since. The merge handler is a
+    BYTE-SURVIVAL guarantee (guard-2471) and here there are no peer bytes to
+    survive, so the union has nothing to reconcile and the CAS put is correct.
+    """
+    be = MergeBackend([(tmp_path, "world")])
+    f = tmp_path / "evolution-log.jsonl"          # registered: line-union
+    s3_content = _jl(BASE)
+    f.write_bytes(_jl(BASE, MINE))                # local changed
+    be.s3[str(f)] = s3_content                    # S3 still at baseline
+    stats = _new_stats()
+    out = _mod._sync_one(be, f, dry_run=False, stats=stats,
+                         baseline_md5=_md5(s3_content), multi_machine=True)
+    assert stats["pushed"] == 1
+    assert stats.get("pushed_merged") in (None, 0)
+    assert be.merge_puts == []                    # union lane did NOT engage
+    assert be.puts == [str(f)]
+    # Same bytes either way in this fixture — only the LANE differs.
+    assert _lines(be.s3[str(f)]) == _lines(_jl(BASE, MINE))
+    assert out == _md5(f.read_bytes())
+
+
+def test_s3_at_baseline_local_deletion_is_not_resurrected(tmp_path):
+    """THE WEDGE ITSELF: a local REMOVAL must survive the push.
+
+    When local's change is a removal (prune / vacuum / cap-roll) rather than an
+    append, the union re-adds the removed record from S3, so local never
+    converges — the merged md5 becomes the baseline while local still differs,
+    and the SAME divergence re-evaluates every sweep forever. This is the
+    own-cloud lane-B wedge measured on cc-08 2026-08-26.
+    """
+    be = MergeBackend([(tmp_path, "world")])
+    f = tmp_path / "evolution-log.jsonl"
+    s3_content = _jl(BASE, PEER)                  # baseline == S3
+    f.write_bytes(_jl(BASE))                      # local PRUNED the PEER record
+    be.s3[str(f)] = s3_content
+    stats = _new_stats()
+    out = _mod._sync_one(be, f, dry_run=False, stats=stats,
+                         baseline_md5=_md5(s3_content), multi_machine=True)
+    # The removal STICKS on both sides...
+    assert _lines(be.s3[str(f)]) == _lines(_jl(BASE))
+    assert _lines(f.read_bytes()) == _lines(_jl(BASE))
+    # ...and the returned baseline equals local, so the next sweep reads
+    # in-sync instead of re-evaluating the same divergence forever.
+    assert out == _md5(f.read_bytes())
+    assert stats["pushed"] == 1
+
+
+def test_sync_file_lane_without_baseline_still_merges(tmp_path):
+    """REGRESSION PIN for 2026-07-16 03:09:14 ().
+
+    The PostToolUse sync_file lane calls _sync_one with NO baseline_md5 and
+    multi_machine=False — the exact shape that replaced a newer gate-firings S3
+    head. s3_at_baseline is False there, so the union MUST still engage and the
+    peer's records must survive. If this ever goes red, the g-115-7944 gate has
+    been widened past the lane it was scoped to.
+    """
+    be = MergeBackend([(tmp_path, "world")])
+    f = tmp_path / "evolution-log.jsonl"
+    f.write_bytes(_jl(BASE, MINE))                # local (stale tail)
+    be.s3[str(f)] = _jl(BASE, PEER)               # peer appended
+    stats = _new_stats()
+    out = _mod._sync_one(be, f, dry_run=False, stats=stats,
+                         baseline_md5=None, multi_machine=False)
+    assert stats.get("pushed_merged") == 1
+    assert stats["pushed"] == 0
+    assert be.merge_puts == [str(f)]
+    assert _lines(be.s3[str(f)]) == _lines(_jl(BASE, MINE, PEER))  # PEER survives
+    assert out == _md5(f.read_bytes())
+
+
+def test_multipart_single_machine_reaches_push_without_unbound_name(tmp_path):
+    """PATH-A TRAP: s3_at_baseline is assigned ONLY inside the `elif st is not
+    None` branch, so the single-machine multipart fall-through reaches the push
+    block with that name never bound. A gate written as `not s3_at_baseline`
+    without a pre-initialisation raises UnboundLocalError on exactly this path.
+    Behaviour must be UNCHANGED from before the gate: the union still engages.
+    """
+    be = _MultipartMergeBackend([(tmp_path, "world")])
+    f = tmp_path / "evolution-log.jsonl"
+    f.write_bytes(_jl(MINE))
+    be.s3[str(f)] = _jl(PEER)
+    stats = _new_stats()
+    out = _mod._sync_one(be, f, dry_run=False, stats=stats,
+                         baseline_md5=_md5(b"v1"), multi_machine=False)
+    assert stats.get("pushed_merged") == 1
+    assert be.merge_puts == [str(f)]
+    assert _lines(f.read_bytes()) == _lines(_jl(MINE, PEER))
+    assert out == _md5(f.read_bytes())
+
+
+def test_merge_and_fenced_put_lanes_are_not_collapsed(tmp_path):
+    """Anti-vacuity: the two PUSH-BLOCK arms must not collapse into one.
+
+    Both arms below reach the final push block with identical local bytes and an
+    object on S3; the ONLY thing varied is what the gate reads — whether the
+    baseline proves S3 has not moved. A gate flattened in either direction
+    (always merge, or never merge) passes each single-lane test above on its own
+    while being useless; this is the assertion that fails if they are collapsed.
+
+    Note the comparison is deliberately WITHIN the push block. Varying "has S3
+    moved?" with a baseline present does NOT work as the contrast: that case is
+    caught earlier by the both-diverged branch (`diverged_merged`) and never
+    reaches this gate at all — measured, and the reason the first draft of this
+    test was wrong.
+    """
+    lanes = []
+    for baseline_present in (True, False):
+        be = MergeBackend([(tmp_path, "world")])
+        f = tmp_path / "evolution-log.jsonl"
+        f.write_bytes(_jl(BASE, MINE))
+        be.s3[str(f)] = _jl(BASE)
+        stats = _new_stats()
+        _mod._sync_one(be, f, dry_run=False, stats=stats,
+                       baseline_md5=_md5(_jl(BASE)) if baseline_present else None,
+                       multi_machine=False)
+        lanes.append(("merged" if be.merge_puts else "fenced_put",
+                      stats["pushed"], stats.get("pushed_merged") or 0))
+    assert lanes[0] != lanes[1], f"lanes collapsed: {lanes}"
+    assert lanes[0] == ("fenced_put", 1, 0)   # S3 proven at baseline -> CAS put
+    assert lanes[1] == ("merged", 0, 1)       # no baseline -> union (preserved)
 
 
 if __name__ == "__main__":

@@ -412,7 +412,16 @@ def _try_precon_studio_source(reason: str, by_id: dict) -> dict | None:
     # version + `git log -1 --format=%h` against ROBLOX_REPO. Same probe shape,
     # same match policy (g-001-273: layered label / exact / ancestry).
     # If `roblox-studio.sh deploy-state` evolves the policy, mirror the change
-    # here. (Reference: rb-373 deploy-vs-HEAD pattern; g-275-08 plugin-version
+    # here. MIRRORED 2026-08-28 (g-326-652): deploy-state renamed its verdict
+    # keys to plugin-scoped names (plugin_deploy_is_current / plugin_file_verified
+    # / plugin_content_hash_verified) because the old bare names read as claims
+    # about the deployed GameScripts and two readers misread them. NO CODE CHANGE
+    # IS NEEDED HERE — this function never parses deploy-state's JSON, it probes
+    # /api/plugin-version directly — but the SCOPE the rename makes explicit
+    # applies to this probe verbatim: it proves the AyoBridge PLUGIN is fresh and
+    # says NOTHING about the ~145 ServerScriptService.AyoaiServerScripts
+    # instances. That matters here specifically because this is the path that
+    # AUTO-CLEARS a roblox_studio_source defer (guard-5050). (Reference: rb-373 deploy-vs-HEAD pattern; g-275-08 plugin-version
     # POST infrastructure; g-001-273 ancestry-policy refinement.)
     import urllib.request
     import urllib.error

@@ -258,6 +258,29 @@ if [ "$AND_FILE" = true ]; then
     # the same agent got multiple warnings in one pass (currently impossible,
     # but cheap insurance).
     agents=$(printf '%s\n' "$ANALYZE_OUT" | awk '/^WROTE_AGENT: / {print $2}' | sort -u)
+    # REACH FIX (). WROTE_AGENT names only agents that got a NEW
+    # warning on THIS run, but the population this sweep exists to drain is
+    # every agent holding an UNPROCESSED row. stall-goal-filer.py skips a
+    # rate-limited entry WITHOUT setting goal_filed, so that row stays
+    # unprocessed — and if the agent never stalls again, --and-file never
+    # names it again and the row sits forever. The recurring 4h cadence buys
+    # nothing for that population because it only ever reaches the filer
+    # through the WROTE_AGENT path.
+    # reclaim-routed-work.md rule 7: a reclaim predicate must not be narrower
+    # than the gate that creates the population, or the gate's CORRECT
+    # operation fills the blind spot and the sweep reports clean forever.
+    # This widens REACH ONLY. The filer's per-agent 24h rate limit is
+    # untouched: a still-rate-limited agent is re-invoked and skips again,
+    # which is cheap and idempotent.
+    # The glob routes through AGENTS_PARENT_DIR, never a hardcoded "agents/*"
+    # — a depth-1 redrift here would silently scan NOTHING and is invisible to
+    # every audit grep (CLAUDE.md "Agent-dir Resolution").
+    backlog=$(python3 "$CORE_ROOT/scripts/stall_backlog_agents.py" \
+        "$(agents_root)")
+    if [ -n "$backlog" ]; then
+        echo "stop-hook-analyze: --and-file backlog reach adds: $(printf '%s' "$backlog" | tr '\n' ' ')"
+    fi
+    agents=$(printf '%s\n%s\n' "$agents" "$backlog" | awk 'NF' | sort -u)
     if [ -n "$agents" ]; then
         while IFS= read -r a; do
             [ -z "$a" ] && continue

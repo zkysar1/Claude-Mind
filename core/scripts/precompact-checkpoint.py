@@ -23,6 +23,39 @@ import yaml
 from _paths import AGENT_DIR, assert_agent_dir, body_state_path
 from wm import read_wm, WM_PATH  # noqa: E402
 
+
+def _box_identity():
+    """MEASURED box identity for the checkpoint ().
+
+    Reuses the EXISTING resolver in _session_telemetry (`MACHINE_ID` env, else
+    socket.gethostname(), memoized, fail-safe to "unknown") rather than adding a
+    second one -- there must be exactly one answer to "which box is this"
+    (communication-clarity rule 5).
+
+    WHY THE CHECKPOINT NEEDS IT: without a measured stamp, the only box identity
+    present at restore is whatever the resume SUMMARY says in prose, and prose is
+    exactly what goes stale. Originating incident: a resume summary carried a
+    PARTNER's hostname and it reached 5 durable records before anyone ran
+    `hostname`. A value measured at checkpoint-write time cannot be inherited
+    from another box's narrative.
+
+    FAIL-OPEN, always. Box identity is a rider on the checkpoint; slot recovery
+    is its purpose. Any failure here returns "unknown" and the checkpoint still
+    writes -- never let an identity stamp cost a slot restore.
+    """
+    ident = {"machine_id": "unknown", "platform_uname": "unknown"}
+    try:
+        from _session_telemetry import _machine_id
+        ident["machine_id"] = _machine_id()
+    except Exception:
+        pass
+    try:
+        import platform
+        ident["platform_uname"] = "%s %s" % (platform.system(), platform.release())
+    except Exception:
+        pass
+    return ident
+
 # : fail loud at import time if MIND_AGENT unset; replaces the
 # opaque `None / "session"` TypeError class the next line would otherwise raise.
 assert_agent_dir("precompact-checkpoint")
@@ -86,6 +119,9 @@ def main():
 
     checkpoint = {
         "created_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        # MEASURED at write time on THIS box -- never inherited from summary
+        # prose, which is the thing that goes stale ().
+        "box_identity": _box_identity(),
         "compact_count": compact_count,
         "session_id": wm.get("session_id"),
         "trigger": hook_input.get("trigger", "auto"),

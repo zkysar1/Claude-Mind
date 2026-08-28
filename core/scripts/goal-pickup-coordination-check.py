@@ -1473,7 +1473,8 @@ def _scan_product_repos(goal_id, surface_text, affected_paths, keywords,
     fewer signals, never an exception (advisory probe must never block the
     claim)."""
     empty = {"surfaces": [], "repos_scanned": [], "commits": [],
-             "branch_hits": [], "pr_hits": [], "behind": []}
+             "branch_hits": [], "pr_hits": [], "behind": [],
+             "behind_undeterminable": []}
     try:
         me = os.environ.get("MIND_AGENT", "")
         wp_entries = []
@@ -1498,7 +1499,7 @@ def _scan_product_repos(goal_id, surface_text, affected_paths, keywords,
             return empty
         result = {"surfaces": sorted(labels), "repos_scanned": [],
                   "commits": [], "branch_hits": [], "pr_hits": [],
-                  "behind": []}
+                  "behind": [], "behind_undeterminable": []}
         # Network budget follows MATCH order (full-name first, then served
         # domain, then token family), not disk order — the live 2026-07-17
         # replay showed a token-family leak spending all 3 slots on
@@ -1533,7 +1534,30 @@ def _scan_product_repos(goal_id, surface_text, affected_paths, keywords,
             # working-tree mutation. Quiet on the common case (current repo →
             # 0 → nothing emitted); None means undeterminable, also quiet.
             _behind = _git_behind_count(p)
-            if _behind:
+            if _behind is None:
+                # : None (upstream ref unresolvable) and 0 (repo is
+                # current) are BOTH falsy, so `if _behind:` rendered them
+                # identically — no advisory, no result entry, no trace. A
+                # broken resolver therefore read as "every repo is current"
+                # forever, which is the exact failure this advisory exists to
+                # prevent: a signal whose absence is indistinguishable from
+                # good news (rb-245 vacuous-zero class).
+                #
+                # The record is UNCONDITIONAL on this branch, which is what
+                # makes the absence readable (guard-5271: to tell "ran and
+                # failed" from "never ran", record the thing that does not
+                # depend on the outcome). Console stays quiet on BOTH 0 and
+                # None — the fix is a durable trace for an auditor, not more
+                # operator noise. Same discipline as the orphan-ratchet
+                # sweep's `skipped` verdict, which exists so a vacuous zero
+                # cannot read as "no drift" forever.
+                result["behind_undeterminable"].append({
+                    "repo": n,
+                    "reason": "upstream ref unresolvable (origin/HEAD unset "
+                              "and neither origin/main nor origin/master "
+                              "present), or git errored/timed out",
+                })
+            elif _behind:
                 result["behind"].append({"repo": n, "count": _behind})
                 print(
                     f"[goal-pickup-coord] ADVISORY: product repo '{n}' is "

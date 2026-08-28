@@ -453,3 +453,99 @@ def test_a_real_violation_still_blocks_when_another_file_is_unreadable(tmp_path,
         f"expected BLOCKED (1), got rc={rc} — a real violation must outrank an "
         "unreadable surface, or the .sh maps it to 'do not block'"
     )
+
+
+# --- 8. the .sh's `*)` rc arm: neither block nor clean () ---------
+#
+# F5 above STATES the .sh's rc mapping as its rationale — 0 -> clean, 1 ->
+# block, `*` (which includes 3) -> WARNING + `return 0`, never block — and
+# nothing here executed that `*)` arm: grepping this file for rc=3 /
+# PY_VERDICT / "did not complete" returned ZERO before this section existed.
+# So the arm F5 leans on was reasoned about and never run, and rewriting `*)`
+# to `return 1` would have made F5's stated rationale silently stale with no
+# test noticing. guard-2543: "is there a test for X" is the wrong question —
+# ask which CALL SITES are executed.
+#
+# BOTH call sites are covered deliberately. run_py_detector is invoked from
+# the precommit branch (MODE's default, and what the pre-commit hook runs)
+# and from the --audit branch, and ONLY the audit branch gates the clean
+# banner on PY_VERDICT. A guard proven at one entry point proves nothing
+# about the entry point production uses (guard-4376), so the precommit case
+# is not a duplicate of the audit one.
+
+def _repo_with_stub_delegate(tmp_path, body: str, delegate_rc: int) -> Path:
+    """A repo carrying a COPY of the .sh plus a STUB delegate that exits `delegate_rc`.
+
+    Mirrors _repo_without_delegate, and for the same reason: the .sh resolves
+    its delegate from SCRIPT_DIR, not $REPO_ROOT, so a stub only BECOMES the
+    delegate when it sits beside the copied .sh. Driving the real GATE_SH via
+    _shell() would reach the real delegate instead and this arm would never be
+    entered — the rc has to be forced from outside the detector, because no
+    input to the REAL detector reliably produces 3 (it means "git could not
+    enumerate", which is an environment failure, not a code shape).
+    """
+    (tmp_path / "core" / "scripts").mkdir(parents=True)
+    (tmp_path / "core" / "scripts" / GATE_SH.name).write_bytes(GATE_SH.read_bytes())
+    (tmp_path / "core" / "scripts" / GATE_PY.name).write_text(
+        f"import sys\n\nsys.exit({delegate_rc})\n", encoding="utf-8")
+    (tmp_path / "core" / "scripts" / "probe.py").write_text(body, encoding="utf-8")
+    for cmd in (["git", "init", "-q"],
+                ["git", "config", "user.email", "t@example.invalid"],
+                ["git", "config", "user.name", "t"],
+                ["git", "add", "-A"], ["git", "commit", "-qm", "base"]):
+        subprocess.run(cmd, cwd=tmp_path, check=True, timeout=60,
+                       capture_output=True)
+    return tmp_path
+
+
+def _run_local_sh(repo: Path, *args):
+    """Run the repo-LOCAL copy of the .sh, so SCRIPT_DIR resolves to the stub."""
+    return subprocess.run(
+        [BASH, str(repo / "core" / "scripts" / GATE_SH.name), *args],
+        cwd=str(repo), capture_output=True, text=True, timeout=180)
+
+
+@pytest.mark.parametrize("delegate_rc", [3, 7])
+def test_audit_delegate_error_neither_blocks_nor_claims_clean(tmp_path, delegate_rc):
+    """The two-sided assertion F1 makes for a MISSING delegate, for a FAILING one.
+
+    The repo carries a real violation the stub never reports, which is the
+    point: an unreadable population must not block (rb-246/guard-147 — a gate
+    that cannot run must not become a false-positive blocker) and must not be
+    laundered into "clean" either. Exactly one of those two is a mistake a
+    reader would notice, so both are asserted.
+
+    rc=7 is not decoration: `*)` is documented as "rc=3 ... or any unexpected
+    code", and parametrizing pins it as a catch-all rather than an rc==3
+    equality that a later edit could narrow.
+    """
+    repo = _repo_with_stub_delegate(tmp_path, READ_GET, delegate_rc)
+    r = _run_local_sh(repo, "--audit")
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, (
+        f"delegate rc={delegate_rc} blocked (rc={r.returncode}) — an UNKNOWN "
+        f"population must never block, which is the premise F5 depends on: {out}")
+    assert f"did not complete (rc={delegate_rc})" in out, \
+        f"the `*)` arm never ran, so this test proves nothing about it: {out}"
+    assert "audit clean" not in out, \
+        "claimed clean while the .py surface returned an error — the F1 defect"
+    assert "delegate: error" in out, \
+        f"PY_VERDICT did not reach the banner as 'error': {out}"
+
+
+def test_precommit_delegate_error_does_not_block(tmp_path):
+    """The same arm at the OTHER call site — MODE's default, i.e. the hook's.
+
+    run_py_detector is called unconditionally by the precommit branch (outside
+    its staged-file loop), so this fires with nothing staged. There is no clean
+    banner on this path to assert against; what must hold is that the failing
+    delegate is ANNOUNCED and does not turn into a commit block.
+    """
+    repo = _repo_with_stub_delegate(tmp_path, READ_GET, 3)
+    r = _run_local_sh(repo)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, (
+        f"a failing delegate blocked the pre-commit path (rc={r.returncode}) — "
+        f"every commit on a box with a broken delegate would be refused: {out}")
+    assert "did not complete (rc=3)" in out, \
+        f"the precommit call site never reached the `*)` arm: {out}"

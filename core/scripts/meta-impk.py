@@ -11,6 +11,7 @@ Subcommands:
 
 import argparse
 import json
+import math
 import sys
 from datetime import datetime
 
@@ -18,6 +19,46 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+# Standard errors the recent-vs-older shift must exceed before `direction`
+# leaves "stable". MIRRORED in mind_api/src/meta/meta_impk.py — the daemon copy
+# is the LIVE path (meta-impk.sh is a daemon-only wrapper), so editing this file
+# alone changes NOTHING at runtime (guard-742/547).
+SIGNIFICANCE_SE_MULTIPLE = 2.0
+
+def _population_variance(entries):
+    """Population variance of learning_value over `entries` (0.0 for n<2).
+
+    Population rather than sample: these windows ARE the population of the
+    interval being described, not a draw from a larger one, and the n-1
+    correction would only inflate the SE at small windows — i.e. make the
+    gate more conservative exactly where the goal that motivated this
+    (g-115-5902) found it firing on noise. Conservative in the safe
+    direction is fine; being conservative for a reason that does not apply
+    is a number nobody can re-derive.
+    """
+    vals = [float(e.get("learning_value", 0) or 0) for e in entries]
+    n = len(vals)
+    if n < 2:
+        return 0.0
+    mean = sum(vals) / n
+    return sum((v - mean) ** 2 for v in vals) / n
+
+
+def _direction_from_significance(delta, significance, threshold):
+    """Total mapping from (delta, significance) to a direction label.
+
+    TOTAL by construction (guard-805): a sub-threshold significance, an
+    unmeasurable one (None), and delta == 0 all land in "stable", so no input
+    falls through to a wrong fallback.
+    """
+    if significance is None or significance < threshold:
+        return "stable"
+    if delta > 0:
+        return "improving"
+    if delta < 0:
+        return "declining"
+    return "stable"
 
 try:
     import yaml
@@ -105,21 +146,97 @@ def cmd_compute(args):
         recent = entries[-window:]
         older = entries[-(window * 2):-window] if len(entries) >= window * 2 else entries[:len(entries) - window]
 
+        sig_k = args.significance
+
+    # DIRECTION IS A SIGNIFICANCE TEST ON THE RAW DELTA, NOT A COMPARISON OF
+    # `imp` AGAINST A FIXED CONSTANT (, 2026-08-28).
+    #
+    # The old line was:
+    #     direction = "improving" if imp > 0.001 else ("declining" if imp < -0.001 else "stable")
+    # and `imp` is `delta / window`. So the quantity being thresholded is
+    # divided by the window while the threshold is not — the constant is in
+    # DIFFERENT UNITS at every window, and no value of it is correct at all of
+    # them (guard-3810: "not slightly tight, it is in the WRONG UNITS").
+    #
+    # MEASURED on the live series 2026-08-28 (n=9912, mean 0.410, stdev 0.358),
+    # the same data returning three different verdicts:
+    #     w=5   delta -0.0440  imp -0.008800  0.41 SE -> "declining"
+    #     w=10  delta -0.0900  imp -0.009000  1.14 SE -> "declining"
+    #     w=20  delta +0.1240  imp +0.006200  2.13 SE -> "improving"
+    #     w=40  delta -0.00025 imp -0.000006  0.01 SE -> "stable"
+    # Note the ORDERING INVERSION, which is worse than the flip and was not in
+    # the goal's filing: w=5 is a 0.41-SE noise blip yet reports a LARGER |imp|
+    # than w=20, which is the one window where the shift is arguably real. The
+    # old statistic ranked noise above signal.
+    #
+    # WHY NOT A RELATIVE THRESHOLD (candidate (a) in the goal: |imp| > 0.02 *
+    # recent_avg). Measured against the same rows: at recent_avg ~0.35 that bar
+    # is ~0.007, which keeps w=5's 0.41-SE blip as "declining" AND demotes
+    # w=20's 2.13-SE shift to "stable". It moves both readings the WRONG way,
+    # so it is not a cheaper version of this fix — it is worse than the bug.
+    # (guard-2260: a remedy is a separate claim from the diagnosis and needs
+    # its own measurement. It got one, and it failed.)
+    #
+    # WHAT THIS DOES INSTEAD. Test `delta` — the actual recent-vs-older shift —
+    # against the standard error of that difference. `significance` is how many
+    # standard errors the shift is; the label fires only past
+    # SIGNIFICANCE_SE_MULTIPLE. SE scales with the window exactly as the noise
+    # does, so one threshold is meaningful at every window, which is the
+    # property the constant could never have.
+    #
+    # `imp_at_k` IS UNCHANGED and still reported: it is the documented metric
+    # and other readers consume it. Only the LABEL derivation moved.
+    #
+    # The emitted `delta` / `standard_error` / `significance` /
+    # `significance_threshold` fields are guard-3810's "diagnostic before
+    # numeric" half: a bare label cannot be re-judged by a reader, and a score
+    # without its scorer is uninterpretable. A caller that disagrees with the
+    # multiple can now see the number the verdict came from.
+    #
+    # The mapping is TOTAL (guard-805): every (significance, delta) pair lands
+    # in exactly one label, with delta == 0 and every sub-threshold value
+    # falling to "stable". No uncovered gap.
         if older:
             recent_avg = sum(e.get("learning_value", 0) for e in recent) / len(recent)
             older_avg = sum(e.get("learning_value", 0) for e in older) / len(older)
-            imp = (recent_avg - older_avg) / window
+            delta = recent_avg - older_avg
+            imp = delta / window
+            se = math.sqrt(_population_variance(recent) / window
+                           + _population_variance(older) / window)
+            if se > 0:
+                significance = abs(delta) / se
+            else:
+                # Zero variance in BOTH windows: any nonzero delta is a clean
+                # step change, not noise. delta == 0 is genuinely stable.
+                significance = float("inf") if delta else 0.0
         else:
+            # No older window exists, so there is nothing to compare against.
+            # The old code took recent_avg / window here, which is positive for
+            # any normal series and therefore reported "improving" for a
+            # first-ever window on no evidence at all. Report "stable" with a
+            # null significance instead: absent a baseline the honest verdict
+            # is "no trend measured", and "stable" is also the label that does
+            # NOT trigger the aspirations-evolve Step 0.7 META ALERT branch.
             recent_avg = sum(e.get("learning_value", 0) for e in recent) / len(recent)
+            delta = None
             imp = recent_avg / window
+            se = None
+            significance = None
 
-        direction = "improving" if imp > 0.001 else ("declining" if imp < -0.001 else "stable")
+        direction = _direction_from_significance(delta or 0.0, significance, sig_k)
         result = {
             "series": "learning_value",
             "window": window,
             "imp_at_k": round(imp, 6),
             "direction": direction,
             "recent_avg": round(recent_avg, 4),
+            "delta": (round(delta, 6) if delta is not None else None),
+            "standard_error": (round(se, 6) if se is not None else None),
+            "significance": (
+                None if significance is None
+                else ("inf" if significance == float("inf") else round(significance, 3))
+            ),
+            "significance_threshold": sig_k,
         }
 
     # Non-default label: echo it but say plainly the computation ignored it
@@ -198,6 +315,12 @@ def build_parser():
 
     p_compute = sub.add_parser("compute", help="Compute imp@k over the learning_value series")
     p_compute.add_argument("--window", type=int, required=True, help="Rolling window size (k)")
+    # A PARAMETER, NOT A NEW BURIED CONSTANT (rb-4082). The default is the
+    # conventional ~2-sigma bar; a caller that wants a different sensitivity
+    # says so and the emitted significance_threshold records which bar ran.
+    p_compute.add_argument("--significance", type=float, default=SIGNIFICANCE_SE_MULTIPLE,
+                           help="How many standard errors the recent-vs-older shift must "
+                                "exceed before direction leaves 'stable' (default %(default)s)")
     # : there is exactly ONE series in the store (per-goal
     # learning_value snapshots). The old required --metric was decorative —
     # any name produced identical output, which misled the evolve Step 0.7

@@ -73,6 +73,24 @@ bash core/scripts/promote-to-upstream.sh --target <dest-clone> \
 
 Merge the PR yourself once mergeable (guard-680 grant); sync the dest clone.
 
+**Then TAG the dest merge commit and push the tag** — this is the step nothing
+else performs, and without it the pull side is blind:
+
+```bash
+git -C <dest-clone> tag -a vX.Y.Z -m "vX.Y.Z — plant of <source-repo> vX.Y.Z (source sha <sha>)" <merge-sha>
+git -C <dest-clone> push origin vX.Y.Z
+```
+
+`pull-promotion.md` C3 has every downstream Mind discover a release by listing
+the STAGING clone's tags, and neither the plant nor the promote PR creates one
+(`release.sh` tags only the source). Measured 2026-08-27: staging carried v2.12.3
+content while its newest tag was still **v2.9.4**, and a downstream clone's
+`git describe` read `v2.9.4-16-gdd5e281` — three plants that no poll could see.
+The dest's `pre-push` M2 gate (`check-tag-in-releases.py`) requires the version
+in `RELEASES.json`, which the plant delivers, so the push passes without an
+override; if it refuses, the plant did not land `RELEASES.json` and THAT is the
+defect to fix, not the gate.
+
 **The dest clone's own checked-out branch is never touched** (g-115-4803). Under
 `--pr` the promote plants into an isolated worktree of the dest — created before
 the plan, torn down after the push — so the destination's live checkout stays on

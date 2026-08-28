@@ -611,7 +611,17 @@ def resolve_addressing(triggers):
 
 
 def probe_goal_status(goal_id):
-    """Return current status of goal_id by scanning world + per-agent
+    """Return the current STATUS string of goal_id, or None when not found.
+
+    Thin wrapper over probe_goal_record so the status-only callers keep their
+    exact contract while the filing path can read the whole record.
+    """
+    g = probe_goal_record(goal_id)
+    return g.get("status") if g else None
+
+
+def probe_goal_record(goal_id):
+    """Return the full goal RECORD for goal_id by scanning world + per-agent
     aspirations.jsonl. Returns the status string when found, None when the
     goal does not exist anywhere.
 
@@ -642,8 +652,35 @@ def probe_goal_status(goal_id):
                 continue
             for g in asp.get("goals", []) or []:
                 if g.get("id") == goal_id:
-                    return g.get("status")
+                    return g
     return None
+
+
+# Rank used ONLY to take a max; not a general priority ordering.
+_PRIORITY_RANK = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+
+
+def inherit_priority(own, target):
+    """Return the higher of the chore's own priority and the priority of the
+    goal it unblocks.
+
+    PURE, so the decision is testable without a store. g-115-6590 item (2):
+    an Apply-chore is filed at a priority derived from the BOARD POST'S
+    severity, which describes how important the FINDING is -- not how much
+    work is waiting on it. The measured incident is g-115-6243: a one-command
+    chore filed LOW while three HIGH goals sat blocked behind it, at rank 10
+    for 36 hours. Severity and blocking-cost are different quantities and the
+    filed priority has to carry the larger one.
+
+    Unknown/absent values on EITHER side fall back to the other, and an
+    unrecognised string never wins -- a typo must not silently promote a
+    chore to HIGH.
+    """
+    if own not in _PRIORITY_RANK:
+        return target if target in _PRIORITY_RANK else own
+    if target not in _PRIORITY_RANK:
+        return own
+    return own if _PRIORITY_RANK[own] >= _PRIORITY_RANK[target] else target
 
 
 def _emit_audit_stale_note(trigger, target_status):
@@ -844,8 +881,28 @@ def load_converted_ids():
 
 
 def _build_goal_payload(trigger):
-    """Build the JSON payload passed via stdin to aspirations.py add-goal."""
+    """Build the JSON payload passed via stdin to aspirations.py add-goal.
+
+    The optional `_target_record` key on `trigger` is the live goal record named
+    by the trigger's `affects:<goal-id>` tag, stashed by the filing loop when it
+    probes (one scan, two consumers). It is carried on the trigger rather than
+    added as a parameter because file_goal is STUBBED by this sweep's own test
+    suites — a new kwarg breaks every stub for no behavioural gain, and this file
+    already treats the trigger dict as a mutable carrier (see the addressing
+    code's local_t["target"] rewrite).
+    """
     priority = SEVERITY_PRIORITY.get(trigger["severity"], "MEDIUM")
+    #  item (2). Severity measures the FINDING; it says nothing about
+    # how much work is queued behind the chore. Inherit upward so a chore that
+    # unblocks a HIGH goal is not filed LOW (the  incident: LOW, rank
+    # 10, 36h, three HIGH goals waiting).
+    inherited_from = None
+    target_record = trigger.get("_target_record")
+    if target_record:
+        promoted = inherit_priority(priority, target_record.get("priority"))
+        if promoted != priority:
+            inherited_from = target_record.get("id")
+            priority = promoted
     title = f"Apply: {trigger['action']} (from {trigger['author']} insight_trigger {trigger['msg_id']})"
     # intended_agent vocabulary normalization (selection-stack review
     # 2026-08-21). resolve_addressing() settles WHICH DEPLOYMENT a target
@@ -878,7 +935,15 @@ def _build_goal_payload(trigger):
         "the routing gap where board action items did not reach the goal queue",
         "(canonical incident: msg-20260514-143816-bravo-1073).",
     ]
-    return {
+    if inherited_from:
+        desc_parts[-1:] = desc_parts[-1:] + [
+            "",
+            f"Priority inherited: raised to {priority} from {inherited_from}, "
+            f"which this chore unblocks (g-115-6590 item 2). The board post's "
+            f"severity ({trigger['severity']}) would have filed this "
+            f"{SEVERITY_PRIORITY.get(trigger['severity'], 'MEDIUM')}.",
+        ]
+    payload = {
         "title": title,
         "description": "\n".join(desc_parts),
         "priority": priority,
@@ -887,6 +952,14 @@ def _build_goal_payload(trigger):
         "origin_signal": f"insight_trigger:{trigger['msg_id']}",
         "tags": ["insight-trigger-conversion", f"from:{trigger['author']}", f"to:{trigger['target']}"],
     }
+    # Carry the target's category so the chore lands in the same lane as the
+    # work it unblocks. Only when the target HAS one — never invent a category,
+    # and never override a value the payload already carries.
+    if target_record and target_record.get("category"):
+        payload["category"] = target_record["category"]
+    if inherited_from:
+        payload["tags"].append(f"priority-inherited-from:{inherited_from}")
+    return payload
 
 
 def file_goal(trigger, *, dry_run=False):
@@ -1033,8 +1106,13 @@ def main():
             # before filing the Apply. Authors of insight_triggers tag with
             # `affects:<goal-id>` when the action points at a specific goal;
             # absent that tag we file unchanged (no probe target available).
+            target_record = None
             if t.get("affects_goal"):
-                target_status = probe_goal_status(t["affects_goal"])
+                # ONE scan, two consumers: the terminal check below and the
+                # priority/category inheritance in _build_goal_payload. Calling
+                # probe_goal_status here as well would scan every queue twice.
+                target_record = probe_goal_record(t["affects_goal"])
+                target_status = target_record.get("status") if target_record else None
                 if target_status in TERMINAL_GOAL_STATES:
                     note_result = {"posted": False, "msg_id": None}
                     if not dry_run:
@@ -1058,6 +1136,8 @@ def main():
                         "affects_goal": t["affects_goal"],
                         "warning": "affects target not found in any queue at filing time",
                     })
+            if target_record:
+                t["_target_record"] = target_record
             result = file_goal(t, dry_run=dry_run)
             filed.append({"trigger": t, "result": result})
     finally:

@@ -161,6 +161,8 @@ GOAL_KNOWN_FIELDS = frozenset({
     'recurring',                         # 160
     'recurring_interval_hours',          # 2
     'references',                        # 1
+    'release_negatives',                 # 0  (g-115-8163 — see release() in
+                                         #     mind_api/src/endpoints/aspirations_write.py)
     'requires_capability',               # 8
     'resolves_by',                       # 196
     'resolves_no_earlier_than',          # 194
@@ -177,6 +179,14 @@ GOAL_KNOWN_FIELDS = frozenset({
     'subclass',                          # 72
     'substantive_hits',                  # 65
     'substantive_runs',                  # 79
+    'superseded_by',                     # 0 at add time — g-115-7893; core
+                                         # schema element, documented in
+                                         # goal-schemas.md 'Supersession
+                                         # Pointer Field'. Qualifies under
+                                         # rule (b) above; this change ships
+                                         # its writer by allowlisting it, and
+                                         # goal-schemas.md 'Writing it' asks
+                                         # for exactly this write.
     'tags',                              # 360
     'title',                             # 2791
     'type',                              # 52

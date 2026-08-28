@@ -554,10 +554,21 @@ def cmd_hypothesis_health(args, config, compact):
 
     flowing = len(fresh_discovered) + len(resolvable_active)
     flags = ["stalled_pipeline"] if flowing < lwm else []
+    # `time_gated_active` is the COMPLEMENT of `resolvable_active` — the loop
+    # above puts every active hypothesis in exactly one of the two — so it is the
+    # denominator that makes `flowing` interpretable (guard-2298: print the
+    # unfiltered population beside the filtered count). Without it a
+    # `stalled_pipeline` flag cannot distinguish two states needing OPPOSITE
+    # remedies: a genuinely EMPTY pipeline (generate more) from a FULL one whose
+    # records all sit behind future `resolves_no_earlier_than` floors (generating
+    # more is exactly wrong — it is already full and waiting). It was computed
+    # every iteration and read by nothing but its own tests until .
     summary = (
-        f"hypothesis-health: stalled ({flowing} flowing < {lwm})"
+        f"hypothesis-health: stalled ({flowing} flowing < {lwm}; "
+        f"{len(time_gated_active)} active but time-gated)"
         if flags else f"hypothesis-health: healthy ({flowing} flowing; "
-                     f"{len(fresh_discovered)} fresh, {len(resolvable_active)} resolvable)"
+                     f"{len(fresh_discovered)} fresh, {len(resolvable_active)} resolvable, "
+                     f"{len(time_gated_active)} time-gated)"
     )
     return {
         "subcommand": "hypothesis-health",
@@ -622,8 +633,15 @@ def cmd_accuracy(args, config, compact):
     worst = []
     if flag_total >= min_sample and flag_pct < (crit * 100):
         flags.append("accuracy_low")
+        # "unlabeled" is the sentinel bin for records carrying no `strategy`
+        # (), not an approach anyone chose — it is ~99% of the corpus,
+        # so it clears the n>=3 floor by default and would crowd a genuinely
+        # failing strategy out of the top-3 below. Excluded by name: naming the
+        # absence of a label as the "worst strategy" is a category error.
         worst = [name for name, stats in by_strategy.items()
-                 if (stats or {}).get("pct", 100) < 40 and (stats or {}).get("total", 0) >= 3]
+                 if name != "unlabeled"
+                 and (stats or {}).get("pct", 100) < 40
+                 and (stats or {}).get("total", 0) >= 3]
 
     summary = (
         f"accuracy: critical ({flag_pct}% < {crit*100}%, n={flag_total}, basis={flag_basis})"
@@ -1178,7 +1196,7 @@ def cmd_temp_pressure(args, config, compact):
     # allowlists and is handled by `unclassified_count` (see  note):
     #   - drainable working docs (.md/.json) -> /drain-temp encodes to the tree
     #     then archives to drained/. Counted as `count`.
-    #   - pure ephemera (.log/.txt/.py/.sh/.err: test-suite output, tool dumps
+    #   - pure ephemera (.log/.txt/.py/.sh/.err/.raw/.out/.bak: test-suite output, tool dumps
     #     like leak-check.txt, and one-shot scratch scripts like build-*.py /
     #     orphan-*.py / restart-poller.sh / gs.err) -> carry NO knowledge;
     #     /drain-temp Phase 1.5 PURGES them (deletes — gitignored + unencodable,
@@ -1191,7 +1209,20 @@ def cmd_temp_pressure(args, config, compact):
     # glob AND this metric both saw only .md/.json). Threshold flags fire on the
     # COMBINED pressure; the two counts stay distinct so the drain goal can name
     # what it drains vs purges.
-    EPHEMERA_SUFFIXES = (".log", ".txt", ".py", ".sh", ".err")
+    # DO NOT EDIT ONE COPY. Must match `_EPHEMERA_GLOB` in
+    # core/scripts/temp-drain-purge.sh (~line 242) — that lane is the SSOT for
+    # what counts as pure ephemera, and THIS metric is the pressure signal that
+    # decides when the lane runs, so a short list here suppresses the trigger for
+    # exactly the files it omits. Hardcoded rather than parsed, per guard-1628 (a
+    # gate reading a constant out of the source it checks defaults to hardcoding);
+    # a second extraction predicate would be the guard-2224 hazard, and
+    # checks/temp_durability_invariant.py already owns the parsing side.
+    # Twin comment per guard-130.
+    #  (bravo, cc-05, 2026-08-28): this tuple carried FIVE entries while
+    # the lane carried EIGHT, so .raw/.out/.bak fell through to the  third
+    # class ("not-drainable, excluded from thresholds") — absent from the very
+    # signal that triggers their own purge. Measured here at fix time: 9 aged .raw.
+    EPHEMERA_SUFFIXES = (".log", ".txt", ".py", ".sh", ".err", ".raw", ".out", ".bak")
     count = 0
     ephemera_count = 0
     # : THIRD class. The two classes above are extension ALLOWLISTS, so
@@ -1420,7 +1451,13 @@ def cmd_temp_pressure(args, config, compact):
     if pressure_count or unclassified_count:
         _breakdown = f"{count} undrained doc(s)"
         if ephemera_count:
-            _breakdown += f" + {ephemera_count} ephemera(.log/.txt/.py/.sh/.err)"
+            # DERIVED from EPHEMERA_SUFFIXES, never re-typed: this literal was a
+            # THIRD copy of the list and it went stale silently — after the
+            # 5->8 reconciliation it reported '16 ephemera(.log/.txt/.py/.sh/.err)'
+            # while 10 of those 16 were the .raw/.out/.bak it did not name
+            # (). A count whose own legend omits the classes it counts
+            # is worse than no legend (guard-2283).
+            _breakdown += f" + {ephemera_count} ephemera({'/'.join(EPHEMERA_SUFFIXES)})"
         if unclassified_count:
             _breakdown += (f" + {unclassified_count} not-drainable"
                            "(other suffixes, excluded from thresholds)")

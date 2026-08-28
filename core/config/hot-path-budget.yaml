@@ -51,6 +51,36 @@ sets:
     paths: ["core/config/aspirations-loop-digest.md"]
     new_file_cap: 40960
 
+  # ── IDENTITY FILES () ───────────────────────────────────────────
+  # agents/<agent>/self.md is re-read WHOLE at every post-compaction identity
+  # restoration (Session Start Protocol Phase -0.5d, aspirations Phase -0.5d),
+  # so the binding constraint is the ~25,000-TOKEN Read cap, not per-turn cost.
+  # A ceiling, never a ratchet: identity legitimately evolves, and the second
+  # tier's rule is what this needs — below the line it grows freely, above it
+  # only GROWTH is refused, so the trim that fixes an over-ceiling file is
+  # never blocked.
+  #
+  # WHY 58000: measured, not chosen. foxtrot's self.md ACTUALLY TRUNCATED at
+  # 65,535 B returning 25,082 tokens (, 2026-08-22) — which pins the
+  # density at 2.613 B/tok for id-dense identity prose, so the cap is
+  # 25,000 x 2.613 = ~65,320 B. guard-4854 REQUIRES citing that byte threshold
+  # rather than the unitless "~25k", which has twice been misread as BYTES and
+  # nearly triggered trims of healthy files. 58,000 B is ~22,197 tok = 88.8% of
+  # cap — deliberately just under the ~90% line guard-4854 names as the point
+  # where cap urgency begins, leaving ~7 KB so the gate fires BEFORE truncation
+  # rather than reporting it afterwards.
+  #
+  # Blast radius when introduced (2026-08-27, live, all five agents): alpha
+  # 44,582 · bravo 46,943 · echo 45,123 · zeta 46,459 all sit 68-72% of cap and
+  # are unconstrained by this line. foxtrot 62,766 (96.2% of cap, ~3 KB from
+  # truncating a SECOND time) is over it, so its self.md may shrink or stay
+  # flat but not grow — which is the intended signal, not a side effect.
+  # Trimming an identity file is destructive: read .claude/rules/self.md
+  # "Do NOT trim a self.md on byte count alone" before acting on a firing.
+  - name: identity-files
+    paths: ["agents/*/self.md"]
+    ceiling: 58000
+
   # ── SECOND TIER: on-demand skills () ────────────────────────────
   # MUST STAY LAST. `set_for` is first-match, so the hot-path sets above claim
   # the aspirations*/worker-loop/boot/prime/respond skills and keep their

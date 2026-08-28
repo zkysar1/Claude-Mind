@@ -833,7 +833,12 @@ def _check_recent_completions(goal, file_paths, keywords, self_agent,
             "reason": "overlap with " + str(len(matches)) +
                       " recent non-self completion(s) [weighted>=" +
                       str(WEIGHT_THRESHOLD) + ", N>=" + str(MIN_UNIQUE_HITS) +
-                      ", structural_co_signal_required, source=" + source_name + "]",
+                      ", structural_co_signal_required, source=" + source_name + "]."
+                      " ACTION: this work may already be DONE — read the matching"
+                      " completion's key_finding (goal ids in matches[]) before"
+                      " filing; if genuinely new work, retry with"
+                      " --override-duplication \"<why distinct>\". Never retry the"
+                      " same JSON unchanged.",
             "matches": matches,
             "advisories": advisories[:5],
         }
@@ -2338,6 +2343,43 @@ def _check_pending_queue(goal, file_paths, keywords, source_name,
             "advisories": [],
         }
 
+    # Strategy 0: exact-normalized-title equality against the PENDING /
+    # IN-PROGRESS corpus blocks unconditionally — no co-signal, no IDF, no
+    # demotion, no lineage exemption. An identical title is the one duplicate
+    # signal that needs no corroboration, and it is precisely how a small
+    # model re-files the same goal minutes after filing it: measured
+    # 2026-08-28 (coach, zc-03, 27B local model) —  was filed with a
+    # byte-identical title+description to pending  and PASSED, because
+    # Strategy 2's prose branch demotes keyword-only overlap and research
+    # prose carries no directory-qualified paths. Completed goals are
+    # deliberately excluded: re-using a completed goal's title is follow-up
+    # work, not a race (the completed-Maintain carve-out above keeps its own
+    # exact matching). False positives route through --override-duplication.
+    norm_proposed_title = " ".join((goal.get("title") or "").split()).lower()
+    if norm_proposed_title:
+        title_exact = [{
+            "source": c["source"],
+            "asp_id": c["asp_id"],
+            "goal_id": c["goal_id"],
+            "title": c["title"][:120],
+            "origin_signal": c["origin_signal"],
+            "match_strategy": "title_exact",
+        } for c in candidates
+            if " ".join(c["title"].split()).lower() == norm_proposed_title]
+        if title_exact:
+            return {
+                "name": "pending_queue",
+                "passed": False,
+                "reason": ("exact-title duplicate of " + str(len(title_exact)) +
+                           " pending/in-progress goal(s) — an identical title "
+                           "needs no co-signal. If this is genuinely distinct "
+                           "work, retitle it or pass --override-duplication "
+                           "[strategy=title_exact, scanned=" +
+                           str(len(candidates)) + "]"),
+                "matches": title_exact,
+                "advisories": [],
+            }
+
     # Strategy 2: structural overlap mirroring _check_recent_completions.
     # IDF computed over the candidate text corpus so common queue vocab
     # doesn't inflate matches (matches the rare-identifier discipline in
@@ -2491,7 +2533,11 @@ def _check_pending_queue(goal, file_paths, keywords, source_name,
                        " [strategies=" + strategy_summary +
                        ", source=" + source_name +
                        ", scanned=" + str(len(candidates)) + " pending/in-progress + "
-                       + str(len(completed_candidates)) + " completed]"),
+                       + str(len(completed_candidates)) + " completed]."
+                       " ACTION: if a matching goal (ids in matches[]) already covers"
+                       " this work, do NOT file — work that goal instead; if genuinely"
+                       " distinct, retitle or retry with --override-duplication"
+                       " \"<why distinct>\". Never retry the same JSON unchanged."),
             "matches": matches,
             "advisories": advisories[:5],
         }
@@ -2530,6 +2576,18 @@ def _log_override(world_dir: Optional[Path], agent_name: str, goal: dict,
             "justification": justification,
             "which_checks_bypassed": [c["name"] for c in failing_checks],
             "match_summary": {c["name"]: len(c.get("matches") or []) for c in failing_checks},
+            # : the COUNTS above cannot answer the one question an
+            # override audit exists to ask — did this justification address the
+            # match it actually hit? Measured on the live ledger 2026-08-27:
+            # 6,466 records, 73% mention some goal-id, and 0% could be verified
+            # as naming a FAILING match, because the ids were never recorded.
+            # That 0% is a schema limit, not a finding (rb-245). Recording the
+            # ids makes the question answerable from here on.
+            "match_goal_ids": sorted({
+                m["goal_id"] for c in failing_checks
+                for m in (c.get("matches") or [])
+                if isinstance(m, dict) and m.get("goal_id")
+            }),
         }
         locked_append_jsonl(str(log_path), record)
         return str(log_path)
@@ -2687,6 +2745,90 @@ def _check_saturated_frontier(goal, world_dir):
 
 # --- Main entry point --------------------------------------------------------
 
+# --- Scoped override () --------------------------------------------
+# `--override-duplication` used to zero the WHOLE gate: `would_block` went False
+# whenever a justification was non-empty, regardless of WHICH matches failed.
+# Measured 2026-08-26, twice ( duplicated  34s apart;
+#  duplicated  106s apart): the agent hits a genuine FALSE
+# positive, writes a justification naming THAT match, re-files with the override
+# — and a TRUE duplicate filed by a CONCURRENT Body in the intervening seconds is
+# suppressed along with it. The window is exactly the time between reading the
+# refusal and re-filing, and on a multi-Body agent it is heavily populated.
+#
+# SCOPING, NOT STRICTNESS. A stricter gate would refuse more legitimate filings
+# and drive MORE overrides. This narrows what an override CLEARS; it never widens
+# what the gate CATCHES.
+#
+# BACKWARD COMPATIBLE BY CONSTRUCTION, which is load-bearing rather than polite.
+# Scoping engages ONLY when the justification names >=1 goal-id that is genuinely
+# among the failing matches — i.e. only when the author demonstrably read the
+# refusal and addressed a specific match. Every other justification (names
+# nothing; names only provenance ids that are not matches) takes the legacy
+# whole-gate path, byte-unchanged. That fallback is what makes the change safe
+# despite an effect that could NOT be measured against history: the ledger's
+# `match_summary` recorded COUNTS only, never ids, so no retrospective pass can
+# say how often a justification named its real match. If the true rate is 0%,
+# nothing changes and there is no regression; if it is high, the fix engages
+# exactly where intended.
+#
+# The SIX automated callers that pass a canned --override-duplication
+# (agent-watchdog x2, cargo-cult-detector, cadence-stale-canary,
+# stale-sentinel-canary, fleet_config_parity, self-drift-gate) name no match id,
+# so all six stay on the legacy path and are unaffected.
+#
+# A MATCH THAT CARRIES NO goal_id CANNOT BE NAMED, so it never contributes to the
+# unnamed set: git-commit, insight-trigger and saturated-frontier matches key on
+# commit/finding_id/node instead. Blocking on something the author had no way to
+# name would punish them for the gate's own output shape.
+#
+# WHY NOT THE PER-MATCH WAIVER FLAG THE GOAL SUGGESTED
+# (`--override-duplication <goal-id>: <why>`): guard-1731 holds that the gate's
+# cited match is "a pointer to a NEIGHBORHOOD, not a verdict on a pair", and that
+# "a refusal that cites the wrong match can still be a CORRECT refusal". A flag
+# whose ARGUMENT is a goal-id makes naming a match the FORMAL act of clearance —
+# precisely the named-pair-equals-cleared model that guardrail exists to refuse.
+# Reading the author's own free text and holding them to it takes their words at
+# face value without promoting naming into a clearance mechanism.
+
+_OVERRIDE_GOAL_ID_RE = re.compile(r"\bg-\d+-\d+\b")
+
+
+def _override_scope(failing_checks: list, justification: str) -> dict:
+    """Classify an override as 'scoped' or 'legacy'.
+
+    Returns {mode, named_matches, unnamed_matches, blocks}. `blocks` is True
+    only in scoped mode when a failing match carries a goal_id the justification
+    does not name — the concurrent-duplicate case this exists to catch.
+    """
+    named = set(_OVERRIDE_GOAL_ID_RE.findall(justification or ""))
+    failing_ids = set()
+    unnamed = []
+    for c in failing_checks:
+        for m in (c.get("matches") or []):
+            if not isinstance(m, dict):
+                continue
+            gid = m.get("goal_id")
+            if not gid:
+                continue
+            failing_ids.add(gid)
+            if gid not in named:
+                unnamed.append({"check": c.get("name"), "goal_id": gid,
+                                "title": (m.get("title") or "")[:120]})
+    if not (named & failing_ids):
+        return {"mode": "legacy", "named_matches": [],
+                "unnamed_matches": [], "blocks": False}
+    # dedupe unnamed by goal_id, preserving first-seen order
+    seen = set()
+    uniq = []
+    for u in unnamed:
+        if u["goal_id"] in seen:
+            continue
+        seen.add(u["goal_id"])
+        uniq.append(u)
+    return {"mode": "scoped", "named_matches": sorted(named & failing_ids),
+            "unnamed_matches": uniq, "blocks": bool(uniq)}
+
+
 def evaluate(goal: dict, *, override_duplication: Optional[str] = None,
              agent_name: str = "", world_dir: Optional[Path] = None,
              project_root: Optional[Path] = None) -> dict:
@@ -2730,6 +2872,18 @@ def evaluate(goal: dict, *, override_duplication: Optional[str] = None,
     failing = [c for c in checks if not c.get("passed")]
     would_block = bool(failing) and not override_duplication
 
+    # . Fail-open to legacy on ANY error: a gate on the critical path
+    # of every goal filing must never refuse work because its own new
+    # bookkeeping raised.
+    override_scope = None
+    if override_duplication and failing:
+        try:
+            override_scope = _override_scope(failing, override_duplication)
+        except Exception:
+            override_scope = None
+    if override_scope is not None and override_scope.get("blocks"):
+        would_block = True
+
     result = {
         "would_block": would_block,
         "checks": checks,
@@ -2739,7 +2893,19 @@ def evaluate(goal: dict, *, override_duplication: Optional[str] = None,
         "expected_coverage_paths": sorted(expected_paths),
         "override_applied": override_duplication,
     }
+    if override_scope is not None:
+        result["override_scope"] = override_scope
     result["reason"] = failing[0]["reason"] if failing else "all checks passed"
+    if override_scope is not None and override_scope.get("blocks"):
+        result["reason"] = (
+            "override names " + ", ".join(override_scope["named_matches"])
+            + " but does NOT name "
+            + ", ".join(u["goal_id"] for u in override_scope["unnamed_matches"])
+            + " — a match the justification never addressed (g-115-7992: an "
+            "override clears the matches it names, not the whole gate). Read "
+            "the unnamed match: if it is a genuine duplicate, do not file. If "
+            "it is another false positive, name it too."
+        )
 
     # description_quality_warning — informational only, never flips
     # would_block. Recurring goals exempt (title-as-spec by design).
@@ -2762,8 +2928,14 @@ def evaluate(goal: dict, *, override_duplication: Optional[str] = None,
     if not failing:
         decision = "noop"
         trigger = None
-    elif override_duplication:
+    elif override_duplication and not (
+            override_scope is not None and override_scope.get("blocks")):
         decision = "override"
+        trigger = failing[0].get("name")
+    elif override_duplication:
+        # scoped override that still blocks — a BLOCK, not an override; logging
+        # it as "override" would make the telemetry say the bypass succeeded.
+        decision = "block"
         trigger = failing[0].get("name")
     else:
         decision = "block"
@@ -2778,6 +2950,8 @@ def evaluate(goal: dict, *, override_duplication: Optional[str] = None,
             "would_block": would_block,
             "failing_count": len(failing),
             "failing_checks": [c.get("name") for c in failing],
+            "override_scope_mode": (override_scope or {}).get("mode"),
+            "override_scope_blocked": bool((override_scope or {}).get("blocks")),
             "all_check_names": [c.get("name") for c in checks],
             "self_agent": self_agent or None,
             "file_paths_count": len(file_paths),

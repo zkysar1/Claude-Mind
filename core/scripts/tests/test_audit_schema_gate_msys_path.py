@@ -219,3 +219,79 @@ def test_gate_routes_argv_through_normalizer(tmp_path, monkeypatch):
 
     assert exc.value.code == 0
     assert calls == [str(f)], "gate did not pass its --jsonl-path through normalize_msys_path"
+
+
+# ---------------------------------------------------------------------------
+#  — an OSError crash must not masquerade as an intentional block.
+#
+# main() promises fail-open in its docstring, but it had NO try/except: an
+# OSError escaping path resolution (Path.is_file() and Path.exists() both
+# re-raise non-ignored OSError) propagated and exited NON-zero — i.e. exit 1,
+# the SAME code the gate uses for a real missing-field verdict. A caller told
+# to halt aggregation could not tell the two apart. Note the direction: the
+# defects above are the gate silently NOT blocking; this is the mirror hazard,
+# a FALSE block.
+#
+# TESTED BY INJECTION, for the reason the module docstring already gives: the
+# raising path is reached through a platform/filesystem condition this box does
+# not reproduce on demand, so a test that waited for a real OSError would never
+# run here. The seam is the same one the Windows branch uses.
+#
+# The handler lives in the `if __name__ == "__main__"` block, so calling
+# mod.main() directly would BYPASS the very code under test — this drives the
+# file as __main__ through runpy in a subprocess, which is the only shape that
+# exercises it.
+def test_oserror_crash_fails_open_and_is_labelled(tmp_path):
+    f = tmp_path / "store.jsonl"
+    f.write_text('{"a": 1}\n', encoding="utf-8")
+
+    driver = (
+        "import pathlib, runpy, sys\n"
+        "def boom(self, *a, **k):\n"
+        "    raise OSError(22, 'Invalid argument')\n"
+        "pathlib.Path.is_file = boom\n"
+        "pathlib.Path.exists = boom\n"
+        f"sys.argv = ['audit-schema-gate.py', '--jsonl-path', {str(f)!r},"
+        " '--field-names', 'a']\n"
+        f"runpy.run_path({str(GATE_PY)!r}, run_name='__main__')\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", driver],
+        capture_output=True, text=True,
+    )
+
+    # Exit 0 — fail-open. This is the assertion the defect violated: the crash
+    # previously exited 1, which is the gate's own BLOCK code.
+    assert proc.returncode == 0, (
+        f"crash did not fail open: rc={proc.returncode} stderr={proc.stderr[-400:]}"
+    )
+
+    # Assert on the PAYLOAD, not merely the exit code (guard-1627): a rc=0 read
+    # alone would also be satisfied by a gate that passed for the wrong reason.
+    payload = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert payload["would_block"] is False
+    assert payload["gate_error"].startswith("OSError:"), payload["gate_error"]
+    assert "crash" in payload["reason"]
+
+
+def test_deliberate_block_still_exits_1_after_crash_handler(tmp_path):
+    """The fail-open handler must not swallow a REAL verdict.
+
+    SystemExit derives from BaseException, not Exception, so the deliberate
+    sys.exit(1) passes through the `except Exception` untouched. Without this
+    positive control the crash handler above could be satisfied by a gate that
+    can no longer block at all — the exact "indistinguishable from one that
+    CANNOT block" failure this file's docstring names.
+    """
+    f = tmp_path / "store.jsonl"
+    f.write_text('{"a": 1}\n', encoding="utf-8")
+
+    proc = subprocess.run(
+        [sys.executable, str(GATE_PY),
+         "--jsonl-path", str(f), "--field-names", "definitely_absent_field"],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 1, f"gate no longer blocks: stdout={proc.stdout[-300:]}"
+    payload = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert payload["would_block"] is True
+    assert "gate_error" not in payload

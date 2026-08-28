@@ -887,3 +887,48 @@ row over appending an eleventh.
 > suite. The working pattern is an IN-TURN bounded wait loop
 > (`EXTERNAL_WAIT=1 interruptible-sleep.sh`, which does pace accurately —
 > asked 30s, got 30s), repeated across turns without ever ending the turn.
+
+### 2026-08-28T03:0x — zeta, `hostname` cc-02, `uname -r` 6.8.0-137-generic, own-cloud, live fleet, 16 chunks
+
+`VERDICT: GENUINE failures -- trustworthy, act on them` · `TOTAL: 17999 passed, 30 failed, 0 errors` ·
+invisible + domain halves `grep -c '^FAIL'` = **0**.
+
+Run in a **detached worktree pinned at a7e0aa7ad** with `agents/zeta/local-paths.conf` copied in,
+`STORAGE_BACKEND=local`, `--out /tmp/zeta-suite-log` (off the synced tree). Env verified from
+`/proc/<pid>/environ` rather than assumed — the launch's collapsed argv (`cd "$WT" VAR=... \` + continuation)
+*looked* like the vars had bound to the `cd`, and on an own-cloud box a missing `STORAGE_BACKEND=local` is the
+S3-key-collision class that truncated the production store on 2026-07-09. cwd and all three vars confirmed
+correct. Worth doing: reading the argv would have produced a false alarm, reading `/proc` settled it in one call.
+
+**Applied the guard-1448 discriminators rather than trusting `GENUINE`** (item 2: the verdict is fail-safe for
+INVALID and NOT for GENUINE, and a small count is more suspicious). Per-chunk buckets:
+
+    00:14  01:0  02:4  03:0  04:0  05:1  06:2  07:1
+    08:1   09:3  10:0  11:1  12:0  13:2  14:0  15:1
+
+Spread across **11 of 16 chunks, PEAKING AT CHUNK-00**, with 10/12/14 clean *after* the peak. That is
+**front-loaded** — the opposite of the tail-loaded progressive-exhaustion signature and not chunk-confined — so
+GENUINE is credible here. Note this is the second consecutive night this box has produced the same shape (31
+failed on 2026-08-27, buckets 14/4/1/2/1/1/3/1/2/1/1, same chunk-00 peak); a stable front-loaded distribution
+across nights is a standing red population, not contention.
+
+Top failing files: `test_aspirations_query_flaglike_value` 6, `test_blocker_recheck_producer_managed_exempt` 5,
+`test_completed_not_committed_scoped_probe` 4, `test_pull_signal_producer` 2, `test_agent_watchdog_worker_role` 2,
+then eleven singletons incl. one in `mind_api/tests`. **None is in a file this run's change touched** — the
+closure claim for g-115-6641 was scoped to that, explicitly not to "all tests pass".
+
+**METHOD NOTE — absence from a FAILED list is not evidence a test RAN** (guard-1715). `-q` names only failures,
+so `grep -c completed_not_closed` returning 0 across all 16 chunk logs is silence, not a pass. The chain that
+actually closes it: the pinned worktree was confirmed to contain all 3 new tests and both `_prior_keyed` sites
+(`grep -c` in the worktree, not the main repo); the file is in the collected set at index 202/1194; and its
+chunk reported failures only in a *differently named* file — `test_completed_not_COMMITTED_scoped_probe`, one
+letter-cluster from `completed_not_CLOSED`, which is exactly the confusion to guard against when eyeballing a
+failure list.
+
+**Timing, for anyone sizing a wait:** launched 02:27, chunk logs complete ~02:56, `VERDICT` at ~03:03 — ~36 min
+total, with the last ~7 minutes spent in `mind_api/tests` (the tree folded into the chunked pool by g-115-6942),
+whose pytest child buffers and writes nothing to the run log. **A flat run-log byte count for several minutes at
+that stage is normal**, and reading it as a stall is the mistake to avoid; corroborate with
+`pgrep -P <runner-pid>` and the child's `etimes`, which showed a live pytest at 282s then 331s. Also
+re-confirmed live: `pgrep -c "[r]un-full-suite"` returns **0** against an actively running suite because the
+process name is `python3` — only `pgrep -af` sees it (item 9's false-negative direction).

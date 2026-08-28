@@ -77,8 +77,13 @@ Example:
     "priority": "MEDIUM",
     "participants": ["agent"],
     "description": "...",
+    "origin_signal": "idea:g-NNN-NN",
     "category": "framework-architecture"
   }' | bash core/scripts/aspirations-add-goal.sh asp-115
+
+origin_signal is REQUIRED on agent-sourced goals (the origin-signal gate
+refuses without it). Match the title prefix (investigate:/idea:/unblock:/
+maintain:<goal-id>) or use "user_directive" for user-instructed goals.
 
 For full goal schema see core/config/conventions/aspirations.md.
 USAGE

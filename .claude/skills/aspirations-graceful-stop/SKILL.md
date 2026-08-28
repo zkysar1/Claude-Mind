@@ -407,6 +407,10 @@ Bash: SID=$(cat agents/<agent>/session/latest-session-id 2>/dev/null | tr -d '\r
 # transient network failure abort the stop sequence. The script logs every
 # decision to stderr, which is the real visibility channel. The `|| true` mirrors
 # iteration-close.sh's production shape as belt-and-suspenders only.
+# D6.62 (g-115-4145): commit BEFORE D6.65's push+merge — nothing in D1-D7 ever
+# committed, so D4's git-tracked writes sat uncommitted and the push had
+# nothing ahead to flush. Fail-soft; rationale in the commit message.
+Bash: MIND_AGENT=<agent> bash core/scripts/iteration-commit.sh || true
 Bash: MIND_AGENT=<agent> bash core/scripts/iteration-push.sh --min-commits 0 --max-age-min 0 --fetch-interval-min 0 || true
 # D6.7 (session-continuity redesign, 2026-06-02): Flush this machine's governed
 # writes to S3 NOW so a machine-move right after this clean stop cannot strand

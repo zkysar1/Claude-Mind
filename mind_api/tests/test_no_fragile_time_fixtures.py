@@ -19,8 +19,31 @@ re-introduces the same silent-flip bug.
 
 Scope: this test is INTENTIONALLY narrow. It guards the CANONICAL
 incident shape — the `_make_asp_with_recurring_goal` fixture helper.
-A broader scan of all test fixtures was performed 2026-05-18 (G6
-sweep) and found no other instances. The other fixtures that hardcode
+
+⚠ THE "no other instances" CLAIM BELOW IS FALSIFIED BY EVENTS — read it as
+history, not as current coverage (g-115-5539, 2026-08-28). A SECOND instance
+of this exact class fired on 2026-08-16, three months after that sweep, in a
+different file: `test_archive_sweep_roundtrip` in
+test_runtime_experience_write.py leaned on conftest experience records dated
+2026-05-10/11 being recent, and wall-clock crossed the 90-day
+memory-pipeline staleness threshold on 2026-08-08, flipping an expected
+no-op sweep into `archived == 2`. It has since been fixed the right way
+(records re-stamped relative to now, not re-pinned).
+
+The lesson is about the GUARD, not that fixture: a point-in-time sweep
+cannot certify a class going forward, because the population grows after the
+sweep. This meta-test pins ONE file and ONE helper (TARGET_FILE /
+HELPER_NAME below), so every fixture added since 2026-05-18 is outside it —
+a gate is only as broad as its entry points (guard-3448). Measured
+2026-08-28 for whoever widens it: 478 hardcoded ISO dates sit on
+time-sensitive field names across mind_api/tests, core/scripts/tests and
+core/tests; 321 of those, in 82 files, are in files that ALSO mention an
+age/staleness threshold. That 321 is a file-level co-occurrence heuristic
+and NOT a bomb list — most are LWW-merge comparands dated relative to EACH
+OTHER, which is correct and must not be "fixed". Do not act on the number
+without discriminating; it is an upper bound on where to look, nothing more.
+
+The other fixtures that hardcode
 dates either:
   - assign to fields not consumed by relative-time logic (labels), or
   - intentionally set monotonically-past values (sibling test

@@ -673,6 +673,12 @@ def main() -> int:
         # daemon hiccup, and a missing digest degrades to the old behaviour.
         _hg = _load_one(args.hold, args.timeout)
         _sha = _note_sha((_hg or {}).get("outcome_note") or "")
+        # Sampled BEFORE the write on purpose: record_hold appends to the ledger
+        # and load_holds re-reads it from disk, returning fresh dicts — so after
+        # the append there is no way to exclude the hold just written, and the
+        # check would report "prior" for its own row every time.
+        _prior_keyed = any(h.get("note_sha") for h in load_holds(hpath)
+                           if h.get("goal_id") == args.hold)
         rec = record_hold(hpath, goal_id=args.hold, reason=args.reason, agent=acting,
                           sid=os.environ.get("MIND_SID", ""), now=datetime.now(),
                           note_sha=_sha)
@@ -683,11 +689,29 @@ def main() -> int:
         print(f"[cnc-slate] HOLD recorded for {args.hold} (hold #{n}; {_kind}; "
               f"ledger {hpath}) reason: {rec['reason']}")
         if n >= 3:
-            print(f"[cnc-slate] {args.hold} has now been held {n}x — and since holds "
-                  "became content-keyed (g-115-7000) a REPEAT hold means the note was "
-                  "REWRITTEN between judgements, not that the row recycled on a clock. "
-                  "That is a different signal: read the note diff before holding again, "
-                  "and file an Investigate if the rewrites are not converging.")
+            # The "a repeat hold means the note was REWRITTEN" reading is only
+            # true once a PRIOR hold on this goal carried a digest. During the
+            #  migration window it is usually FALSE, and false exactly
+            # where it is loudest: the no-migration choice (holds predating the
+            # change carry no note_sha) helps the LONGEST-SERVING rows LAST, so
+            # the rows with the most prior holds are the ones whose holds have no
+            # digest at all. Measured 2026-08-28 (zeta, hostname cc-02, uname -r
+            # 6.8.0-137-generic) while executing : live ledger 81 holds,
+            # 6 with note_sha; the three lane rows read holds=6/4/6 with sha=0/0/0
+            # and went to #7/#5/#7. Telling that reader to "read the note diff"
+            # sends them after a rewrite that never happened. ()
+            if _prior_keyed:
+                print(f"[cnc-slate] {args.hold} has now been held {n}x — and since holds "
+                      "became content-keyed (g-115-7000) a REPEAT hold means the note was "
+                      "REWRITTEN between judgements, not that the row recycled on a clock. "
+                      "That is a different signal: read the note diff before holding again, "
+                      "and file an Investigate if the rewrites are not converging.")
+            else:
+                print(f"[cnc-slate] {args.hold} has now been held {n}x, but NO prior hold "
+                      "carried a digest — these are pre-g-115-7000 TTL holds, so the count "
+                      "records a CLOCK recycle, not note rewrites. Nothing to diff. This "
+                      "hold is the row's first content-keyed one, so it is the LAST: the "
+                      "row exits the lane until its note actually changes.")
         return 0
     if args.show:
         g = _load_one(args.show, args.timeout)

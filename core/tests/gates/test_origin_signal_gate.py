@@ -70,11 +70,11 @@ def _call_module(payload: dict, *, override_signal: str | None = None,
     ({"title": "foo", "origin_signal": "user_directive", "source": "agent"},
      False, "valid origin_signal"),
     ({"title": "foo", "origin_signal": None, "source": "agent"},
-     True, "Invalid origin_signal (missing)"),
+     True, "\"origin_signal\" field is MISSING"),
     ({"title": "foo", "origin_signal": "", "source": "agent"},
-     True, "Invalid origin_signal"),
+     True, "BLOCKED: the goal JSON"),
     ({"title": "foo", "origin_signal": "garbage", "source": "agent"},
-     True, "Invalid origin_signal 'garbage'"),
+     True, "'garbage' (not a recognized prefix)"),
     ({"title": "Investigate: flaky test", "origin_signal": None,
       "source": "agent"},
      False, "auto-derived"),
@@ -168,7 +168,9 @@ def test_block_without_override():
     payload = {"title": "x", "origin_signal": None, "source": "agent"}
     rc, cli, _ = _run_cli(payload, agent="alpha")
     assert cli["would_block"] is True
-    assert "Invalid origin_signal" in cli["reason"]
+    assert "origin_signal" in cli["reason"]
+    # The fix is stated BEFORE the bypass, with a placement example (2026-08-28).
+    assert "FIX: add the field" in cli["reason"]
     # All ALLOWED_PREFIXES surface in the error message so the agent can recover.
     assert "board_post:" in cli["reason"]
     assert "idle_fallback" in cli["reason"]

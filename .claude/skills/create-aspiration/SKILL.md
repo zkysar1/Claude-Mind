@@ -110,9 +110,11 @@ IF mode == "from-followup":
     Create + capture the minted id:
       Bash: echo '<aspiration-json>' | bash core/scripts/aspirations-add.sh
       # Response carries "aspiration_id": "asp-NNN" + "id_allocated": true.
-      # Failures surface as-is. Do NOT auto-retry with --override-signal or
-      # --override-duplication — the error text is the signal the caller needs
-      # to see and act on.
+      # On a gate refusal: READ the error, fix the specific field it names
+      # (usually a missing origin_signal or a duplicate title), and retry with
+      # the CORRECTED JSON. Do NOT retry the same JSON unchanged, and do NOT
+      # reach for --override-signal / --override-duplication unless the block
+      # is a false positive — the overrides are audited bypasses, not retries.
 
     File the seed goal under the minted id (goal id minted server-side — omit "id"):
       Bash: echo '<seed-goal-json>' | bash core/scripts/aspirations-add-goal.sh <asp-id> --source world

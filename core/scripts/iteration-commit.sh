@@ -1288,6 +1288,22 @@ if [[ ${#staged_files[@]} -gt 0 ]]; then
   }
 fi
 
+# Exec bit for new core/scripts *.sh on Windows clones (). A fresh
+# `git add` records a NEW shell script at 100644 here regardless of
+# core.filemode (measured 2026-08-27 on a Windows clone under BOTH settings via
+# a scratch GIT_INDEX_FILE), and a prior `git update-index --chmod=+x` does not
+# survive the re-add above — so Gate 13 (check-sh-exec-bits --staged) refused
+# the commit and the author had to bypass this script. Set the index mode
+# directly for every staged shebang'd script; a no-op on Linux where the
+# working-tree bit already carried it.
+for _shf in "${staged_files[@]}"; do
+  case "$_shf" in core/scripts/*.sh) ;; *) continue ;; esac
+  [[ -f "$REPO/$_shf" ]] || continue
+  [[ "$(head -c 2 "$REPO/$_shf" 2>/dev/null)" == "#!" ]] || continue
+  git -C "$REPO" update-index --chmod=+x -- "$_shf" 2>/dev/null || true
+done
+unset _shf
+
 # Local-backend temp durability (). `git add -A` above respects
 # .gitignore, so these paths are invisible to it — an ignored file never appears
 # in `git status --porcelain` and so never reaches staged_files. -f is the only

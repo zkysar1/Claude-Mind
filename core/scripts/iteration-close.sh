@@ -108,6 +108,7 @@ SOURCE=""
 OUTCOME=""
 SUMMARY=""
 SUMMARY_FILE=""
+OVERRIDE_STALE_SOURCE=""
 NO_RETRIEVAL_APPLICABLE=""
 # g-115-228: Quality inputs forwarded to state-update-audit.sh velocity (rb-428
 # bash-consolidation-drift twin). Without these flags, state-update-audit.py's
@@ -624,6 +625,7 @@ while [[ $# -gt 0 ]]; do
         # silently deleting the exact command a goal description existed to
         # record. Precedent for the flag: notify-build-payload.py --message-file.
         --summary-file) SUMMARY_FILE="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --override-stale-source) OVERRIDE_STALE_SOURCE="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         # g-242-10: documented opt-out for the Phase 4.26 gate. Forwarded to
         # phase-4-26-gate.sh; logs to world/phase-4-26-overrides.jsonl.
         --no-retrieval-applicable) NO_RETRIEVAL_APPLICABLE="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
@@ -717,6 +719,29 @@ if [[ -n "$SUMMARY_FILE" ]]; then
     if [[ -z "$SUMMARY" ]]; then
         echo "iteration-close: --summary-file '$SUMMARY_FILE' is empty" >&2
         exit 2
+    fi
+    # === stale-narrative-source gate (g-115-7425) ===
+    # A file older than this goal's claim cannot describe this unit of work.
+    # The two existing narrative gates are both blind to it: the empty-VALUE
+    # refusal sees valid prose, and gates.field_shrink sees GROWTH (the measured
+    # incident was 36,260 chars landing over 6,580). Placed HERE, immediately
+    # after the verbatim read, because this is where the path is still known —
+    # every later consumer sees only $SUMMARY. py -3, never bash (guard-156).
+    # Exit 3 is the ONLY refusal. Any other non-zero means the gate could not
+    # run, and a gate that cannot run must not refuse a write — fail OPEN, but
+    # LOUDLY (guard-2298: a malfunction that renders as a clean result is worse
+    # than the fault). `|| true` keeps `set -e` out of the decision.
+    _sss_rc=0
+    py -3 "$SCRIPT_DIR/stale-summary-source-gate.py" \
+        --path "$SUMMARY_FILE" --goal "${GOAL_ID:-}" --source "${SOURCE:-}" \
+        --caller "iteration-close.sh:summary-file-resolve" \
+        ${OVERRIDE_STALE_SOURCE:+--override-stale-source "$OVERRIDE_STALE_SOURCE"} \
+        >/dev/null || _sss_rc=$?
+    if [[ "$_sss_rc" -eq 3 ]]; then
+        echo "  Pass --override-stale-source \"<why this file is genuinely current>\" to proceed." >&2
+        exit 2
+    elif [[ "$_sss_rc" -ne 0 ]]; then
+        echo "iteration-close: WARN stale-summary-source gate did not run (rc=$_sss_rc) — proceeding UNGATED." >&2
     fi
 fi
 
@@ -1551,6 +1576,18 @@ do_state_update() {
     [[ -z "$GOAL_ID" || -z "$SOURCE" || -z "$OUTCOME" ]] && {
         echo "state-update: --goal, --source, --outcome required" >&2
         echo "  usage: iteration-close.sh --phase state-update --goal <id> --source <world|agent> --outcome <deep|routine>" >&2
+        # THE FOUR OPTIONAL QUALITY FLAGS ARE NAMED HERE BECAUSE THEY ARE ONE-SHOT
+        # (g-115-4283). They were listed only in the top-level usage at the head of
+        # this file, so an agent that consulted THIS per-phase line -- the careful
+        # path -- saw a complete-looking invocation, omitted them, and silently
+        # skipped the imp@k snapshot. Their absence is reported only AFTER a
+        # successful close, in the "deep close UNMEASURED" LLM-ACTION line, by
+        # which point guard-1235 forbids a post-hoc amend and re-running the phase
+        # re-bumps the loop-state counters and re-commits. So the measurement is
+        # permanently unrecoverable for that goal: a one-shot flag MUST appear in
+        # the usage string a caller actually reads.
+        echo "         optional (deep closes): [--tree-updated] [--artifacts-count <n>] [--encoding-score <0.0-1.0>] [--findings-count <n>]" >&2
+        echo "         omitting them on a deep close SKIPS the imp@k snapshot IRRECOVERABLY -- it cannot be added afterward" >&2
         exit 2;
     }
     echo "[iteration-close] state-update: goal=$GOAL_ID outcome=$OUTCOME"

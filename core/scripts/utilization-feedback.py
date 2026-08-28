@@ -959,6 +959,64 @@ def main():
         supp_helpful = [s for s in supp_items if s["id"] in helpful_ids]
         supp_noise = [s for s in supp_items if s["id"] not in helpful_ids]
 
+        # : an id named here that matches NOTHING in the manifest used
+        # to be dropped in SILENCE, while every manifest item the caller did not
+        # name was defaulted to noise (--helpful is a whole-session verdict, not
+        # a per-item increment -- guard-2079). Those two behaviours compose into
+        # an exact INVERSION: a caller whose informing retrieval was untracked
+        # (retrieve.sh without --goal, e.g. the code-review-protocol step-4
+        # consult) names the entries that genuinely carried the work and thereby
+        # records 0 helpful / N noise on entries it never read. times_noise feeds
+        # retirement signals, so this does not merely under-record -- it
+        # ANTI-records, and silently, so nothing surfaces it.
+        unmatched_ids = sorted(helpful_ids - all_tree_set - all_supp_set)
+        if unmatched_ids:
+            matched_count = len(tree_helpful) + len(supp_helpful)
+            detail = {
+                "unmatched_helpful_ids": unmatched_ids,
+                "matched_count": matched_count,
+                "manifest_tree_nodes": sorted(all_tree_set),
+                "manifest_supplementary_ids": sorted(all_supp_set),
+                "goal_id": args.goal,
+            }
+            if matched_count == 0:
+                # ZERO of the named ids are in the manifest. That is the
+                # signature of an untracked-retrieval caller, for whom
+                # --all-unknown is the documented correct posture. Applying the
+                # noise default here would mark every manifest item noise on the
+                # strength of a verdict about entries this session never
+                # retrieved. Refuse instead of silently succeeding.
+                #
+                # Exit 5 is a NEW code, deliberately: 0 (success/no-op), 1
+                # (PyYAML import failure) and 4 (inference_disabled) are already
+                # load-bearing here, and reusing one would retroactively break
+                # every existing diagnosis of that code (guard-4563).
+                detail.update({
+                    "status": "refused_no_manifest_overlap",
+                    "reason": (
+                        "none of the --helpful ids appear in this session's "
+                        "retrieval manifest, so applying the noise default would "
+                        "mark every retrieved item noise on the strength of a "
+                        "verdict about entries that were never retrieved"
+                    ),
+                    "remedy": (
+                        "if the retrieval that informed you was untracked, re-run "
+                        "it with --goal, or record this session with "
+                        "--all-unknown (a no-op on counters) instead"
+                    ),
+                })
+                print(json.dumps(detail, indent=2))
+                sys.exit(5)
+            # Some named ids matched and some did not. The matched ones are
+            # honest signal, so apply them -- but never in silence. stderr keeps
+            # stdout parseable for callers that json.loads() it.
+            detail["status"] = "warning_partial_manifest_overlap"
+            print(
+                "[utilization-feedback] WARNING: "
+                + json.dumps(detail, sort_keys=True),
+                file=sys.stderr,
+            )
+
     if superseding_infer:
         # The superseded pass ALREADY applied its noise verdict to these same
         # items (infer per-item, all_noise to every item; all_unknown applied
