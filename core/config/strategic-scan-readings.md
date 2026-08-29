@@ -6277,3 +6277,66 @@ gap in this reading, not as health.
 **S5 verdict: zero signals routed.** Every fire this scan produced is either a
 standing confirmation (axis 2), a predicted net-widening (S2a), or an owned confound
 (S2b, S4a, S4b, S4.6). The scan's product is this row.
+
+---
+
+## 2026-08-29T00:2x — zeta, `hostname` cc-02, `uname -r` 6.8.0-137-generic, own-cloud
+
+Trigger `time_cadence`, fired ~11h past a 4h cadence after THREE consecutive
+deferrals under ritual contention (rb-9537). Recorded because the deferral streak
+is itself the context for this row.
+
+**S3 concentration — FULL corpus** (control: 27 active, 2918 goals in record,
+`goals_omitted` key-presence **0/27**, so this is `aspirations-compact.json` and not
+the 220-goal summary; n=2206 pending+in-progress, 216 categories, 30 `framework-*`
+labels):
+
+    axis1  max category    framework-architecture   822/2206 = 37.3%   PASSES
+    axis1b max prefix      framework-*             1385/2206 = 62.8%   PASSES
+    axis2  max aspiration  asp-115                 1868/2206 = 84.7%   FIRES
+
+Verdicts unchanged — axis 2 still the only fire, so the standing-property claim
+holds again. Routed nothing (a fresh fire is CONFIRMATION, per the S3 marker).
+asp-115 absolute **1868**, the highest in this ledger; quoting it beside the ratio
+per the standing rule that neither term alone is readable.
+
+**S4.6 — the finding of this row, and it is about the INSTRUMENT, not the fleet.**
+0 candidates at `--min-failures 2` AND at `--min-failures 1`, distinct failing-goal
+members 0, `failing_count: 1` at the ledger level. That is the undecidable
+0-at-both shape — except the discriminator says otherwise this time:
+
+    ceiling_ratio = 0.0862   (classifiable_ceiling 2356 of 27336 invocations)
+
+**Every prior zero in this ledger was measured at 0.0026–0.0088. This one is ~10x
+that, at the TOP of the band.** So it is the first 0-at-both taken under
+substantially non-blind coverage, and it is correspondingly the strongest evidence
+in this series that the zero is about the fleet rather than about the reading box.
+It is still 8.6%, so it is not a clean bill of health and nothing was routed — but
+do not file it beside the band-floor zeros as if they were the same measurement.
+
+Mechanism is visible in one line of `per_agent`, and it confirms the standing
+"span WIDTH against an all-time denominator" reading rather than adding to it:
+
+    alpha    2026-08-01T23:29 .. 2026-08-27T08:53   windows=24  in_span 2231/5327  (41.9%)
+    bravo    2026-08-02T00:05 .. 2026-08-02T07:42   windows=14  in_span   49/5797
+    echo     2026-08-01T23:34 .. 2026-08-02T07:41   windows=16  in_span   39/5096
+    foxtrot  2026-08-01T23:37 .. 2026-08-02T07:37   windows=19  in_span   29/5127
+    zeta     2026-08-28T22:05 .. 2026-08-29T00:19   windows= 8  in_span    8/5989
+
+ONE peer holding a **26-day** span carries the entire ratio: alpha alone supplies
+2231 of the 2356 classifiable invocations (94.7%). The other four are the familiar
+~8h slices, and three of them are the SAME 08-01/08-02 batched seed this ledger has
+recorded before — unchanged, now 27 days stale. So the band's top is not the fleet
+getting healthier; it is one diary having been pulled wide. Corollary worth carrying:
+`ceiling_ratio` can be dominated by a single peer, so read `per_agent` before treating
+a high ratio as fleet coverage — a 0.086 built from one 26-day span and four 8h slices
+is not the same instrument as a 0.086 built from five even spans.
+
+**S4.5 silent-gap audit**: 0 NEW, 2 dedup-suppressed, 0 rb-245-suppressed, 0 filed.
+
+**S1 / S2a / S2b / S4a / S4b**: not routed, per their ⛔ markers (owned, or confound).
+S1's cross-agent census (g-115-3215) was not run this pass, so no trend is claimed —
+recorded as a gap in this reading, not as health.
+
+**S5 verdict: zero signals routed.** The scan's product is this row plus the
+ceiling_ratio observation above.

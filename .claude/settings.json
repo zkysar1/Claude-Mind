@@ -136,6 +136,11 @@
             "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/git-restore-uncommitted-gate.sh",
             "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/bash-store-write-guard.sh",
+            "timeout": 15
           }
         ]
       },
