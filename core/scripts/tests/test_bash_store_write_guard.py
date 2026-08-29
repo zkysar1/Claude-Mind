@@ -106,6 +106,47 @@ def test_reads_scripts_and_temp_paths_pass(command):
     assert decision == "allow", command
 
 
+# The framework prefixes EVERY worker command with its own env exports, one of
+# which names the Body's working-memory.yaml. Measured 2026-08-29 02:56 (a
+# downstream worker Body): the Python wrote a test file, the store name lived
+# only in the prefix, and the guard denied it anyway.
+WORKER_PREFIX = (
+    'export PATH="/opt/mind/core/scripts/.python-shim:$PATH"; export MIND_AGENT=alpha; '
+    'export BODY_WM_PATH="/opt/mind/agents/alpha/sessions/cb47721d/working-memory.yaml"; '
+    "export BODY_ROLE=worker; export MIND_GOAL_ID=g-005-09; export MIND_SID=cb47721d; "
+)
+
+
+def test_a_store_named_only_in_the_shell_prefix_is_not_a_python_write():
+    cmd = WORKER_PREFIX + (
+        'cd .mind-data/world/scripts && python3 -c "\nimport sys, json\n'
+        "sys.path.insert(0, '.')\nfrom lineup_optimizer import optimize\n"
+        "open('test_lineup_optimizer_results.json', 'w').write(json.dumps(optimize()))\n"
+        '"'
+    )
+    assert direct_store_writes(cmd) == []
+    assert run(cmd)[0] == "allow"
+
+
+def test_the_same_prefix_with_a_store_write_inside_the_program_is_refused():
+    cmd = WORKER_PREFIX + (
+        "cd /opt/mind && python3 -c \"\nimport json\n"
+        "open('agents/alpha/aspirations.jsonl', 'a').write(json.dumps({'id': 'x'}) + '\\n')\n\""
+    )
+    assert direct_store_writes(cmd) == [("inline Python writing", "agents/alpha/aspirations.jsonl")]
+    assert run(cmd)[0] == "deny"
+
+
+def test_a_write_idiom_outside_the_program_does_not_count():
+    # `json.dump(` in a --summary string, a store name in a path argument, and a
+    # Python program that only READS: three mentions, zero writes.
+    cmd = (
+        "bash core/scripts/iteration-close.sh --summary 'used json.dump( on the report' "
+        "&& python3 - <<'EOF'\nimport json\nprint(len(open('world/aspirations.jsonl').readlines()))\nEOF"
+    )
+    assert direct_store_writes(cmd) == []
+
+
 def test_override_token_passes_and_is_logged(tmp_path):
     cmd = "STORE_WRITE_GUARD_OVERRIDE=restore-from-history cp snap.jsonl world/guardrails.jsonl"
     payload = {"tool_name": "Bash", "tool_input": {"command": cmd}}

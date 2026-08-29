@@ -279,7 +279,7 @@ token budget below, as a bounded index plus on-demand expansion, never in full.
    → Surface findings-channel insight_triggers (posts tagged
      `requires_action_by:<agent>` + `action_type:<verb>`) that have aged
      past the 1h grace window but not yet converted to goals. The
-     recurring sweep g-115-754 at 1h cadence handles conversion; this is
+     recurring sweep g-115-754 at 6h cadence handles conversion; this is
      the visibility surface for "what will fire next sweep tick".
      Read-only invocation — `--dry-run` never writes.
      Stash for Phase 4:

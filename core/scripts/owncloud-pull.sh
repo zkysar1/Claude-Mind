@@ -44,6 +44,34 @@
 # for a targeted refresh when you want ONE file rather than the ~17-object
 # continuity set.
 #
+# A NAME THAT IS NOT IN THE CONTINUITY SET MATCHES NOTHING, and this wrapper now
+# says so and exits 2 (). It used to exit 0 after printing
+# `pulled=0 in_sync=0 scanned=0 s3_absent=0 local_ahead=0 errors=0`. `scanned`
+# DOES distinguish the two cases -- but the three signals a caller reads to
+# decide "did anything change" are pulled, errors and rc, and those are
+# IDENTICAL to a matched scope that was already in sync. Measured 2026-08-28
+# (alpha, cc-08, own-cloud), same box, one turn:
+#     --only handoff.yaml      -> pulled=0 in_sync=1 scanned=1 errors=0 rc=0
+#     --only no-such-file.yaml -> pulled=0 in_sync=0 scanned=0 errors=0 rc=0
+# So a caller that force-freshes a file and diffs it concludes UNCHANGED off a
+# scan that never opened it -- the  incident (foxtrot, 2026-08-11).
+# The discriminator was never missing: pull_continuity has always set
+# `requested_missing` ("surfaced, not fatal") and the endpoint spreads it via
+# **stats, so it was on the wire the whole time and THIS RENDERER DROPPED IT.
+# guard-2018 (an absent field can BE the zero); guard-3489 (emit the coverage
+# count beside the result count, and refuse to exit 0 when it is zero).
+#
+# AND NO, --only WILL NOT BE WIDENED TO ARBITRARY PATHS. That was considered
+# under  and DECLINED, because the capability already exists with a
+# better contract: `backend-cat.sh head <path>` reports the authoritative
+# version/size and the local-mirror drift for ANY governed path (absolute, or
+# a world//meta/ virtual prefix), and `--exit-on-drift` turns that verdict into
+# an exit code -- verified on world/conventions/pre-execution.md, cc-08
+# 2026-08-28. Widening --only would also break the invariant pull_continuity's
+# docstring states as a safety property: "names are matched against the
+# continuity set, so `only` can never widen the pull beyond it or reach a
+# non-continuity file". Reach for backend-cat.sh, not for a wider --only.
+#
 # --with-temp () opts INTO the temp/ working-doc sweep, which is OFF by
 # default. It is off because temp/ is NOT continuity-tier — session-manifest.yaml
 # does not list it — yet sweeping it made this command's cost scale with scratch
@@ -325,11 +353,40 @@ errs = r.get("errors", 0)
 print(f"  agent={r.get('agent','?')} pulled={r.get('pulled',0)} "
       f"in_sync={r.get('in_sync',0)} scanned={r.get('scanned',0)} "
       f"s3_absent={r.get('s3_absent',0)} errors={errs}")
+# --only COVERAGE (), fleet twin of the single-agent block below.
+# The continuity set is manifest-derived and agent-INDEPENDENT, so an unmatched
+# name is unmatched for every agent -- N loud lines for one bad invocation is
+# the intended output, not noise.
+#
+# DELIBERATE ASYMMETRY, so it does not read as an oversight and get "fixed":
+# this gates the coverage line on `missing` while the single-agent block gates
+# it on `only`, i.e. a FULLY-MATCHED scope prints nothing here and one
+# confirming line there. Fleet output is one line PER AGENT, and the sole
+# production --only caller (/open-questions, --all-agents --only
+# pending-questions.yaml) always matches -- so a line-per-agent confirmation
+# would double an interactive dashboard's output on the happy path to say
+# nothing. The single-agent path prints one summary, where the positive
+# confirmation is cheap and worth having.
+only = r.get("only") or []
+missing = r.get("requested_missing") or []
+if missing:
+    print(f"    --only: {len(only) - len(missing)}/{len(only)} matched; "
+          f"NOT CONTINUITY FILES: {', '.join(missing)}")
+if only and not r.get("scanned", 0):
+    print("    NOTHING WAS SCANNED for this agent: the --only scope matched no "
+          "continuity file (pulled=0 means 'never looked', not 'in sync').")
+    sys.exit(4)
 sys.exit(2 if errs else 0)
 PYEOF
             )" || _prc=$?
             echo "${_s:-  agent=$_fa (raw) $RESPONSE}"
-            if [ "${_prc:-0}" = "2" ]; then agents_failed=$((agents_failed + 1)); fleet_rc=1; fi
+            # 4 = vacuous --only scope for this agent (nothing scanned). Counted
+            # as a failure for the SAME reason as 2: the agent's continuity files
+            # were not checked, so reporting it as pulled would be a false
+            # all-clear ().
+            case "${_prc:-0}" in
+                2|4) agents_failed=$((agents_failed + 1)); fleet_rc=1;;
+            esac
             _prc=0
         else
             echo "  agent=$_fa (raw) $RESPONSE"
@@ -393,6 +450,20 @@ print(f"[owncloud-pull] agent={r.get('agent','?')} backend={backend} "
 pf = r.get("pulled_files") or []
 if pf:
     print(f"[owncloud-pull] pulled: {', '.join(pf)}")
+# --only COVERAGE (). Report what the scope LOCATED beside what it
+# pulled, so a zero is readable. Measurement + rationale in this file's header.
+only = r.get("only") or []
+missing = r.get("requested_missing") or []
+if only:
+    _line = (f"[owncloud-pull] --only scope: {len(only) - len(missing)}/{len(only)} "
+             f"name(s) matched the continuity set")
+    if missing:
+        _line += f"; NOT CONTINUITY FILES: {', '.join(missing)}"
+    print(_line)
+if only and not r.get("scanned", 0):
+    print("[owncloud-pull] NOTHING WAS SCANNED: the --only scope matched no "
+          "continuity file, so pulled=0 means 'never looked', NOT 'in sync'.")
+    sys.exit(4)
 sys.exit(2 if errs else 0)
 PYEOF
 )" || pyrc=$?
@@ -402,5 +473,15 @@ case $pyrc in
     2) echo "$SUMMARY"
        echo "[owncloud-pull] WARN: pull reported errors — some continuity files may be stale on this machine" >&2
        exit 1;;
+    # 4 = the --only scope matched ZERO continuity files, so the pull was
+    # VACUOUS: nothing was examined. rc 2 (usage/config) rather than 1 (a pull
+    # error) because nothing FAILED — the invocation named files the continuity
+    # set does not contain. Exiting 0 here was the whole defect ():
+    # a caller that checks only the rc reads a scan that never happened as
+    # "everything already in sync".
+    4) echo "$SUMMARY"
+       echo "[owncloud-pull] ERROR: --only matched no continuity file — nothing was pulled and nothing was CHECKED." >&2
+       echo "[owncloud-pull]   Name a file from the continuity set (session-manifest.yaml, sync_tier: continuity), or drop --only for the full pull." >&2
+       exit 2;;
     *) echo "[owncloud-pull] (raw) $RESPONSE"; exit 0;;
 esac

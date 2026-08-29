@@ -404,34 +404,69 @@ def cmd_backpressure(args):
 # ─────────────────────────── Step 8.9 temporal credit ───────────────────────────
 
 def cmd_temporal_credit(args):
-    exp_out, _e, exp_rc = _run(["experience-read.sh", "--goal", args.goal])
-    if exp_rc != 0 or not exp_out.strip():
-        return {
-            "subcommand": "temporal-credit",
-            "summary": "temporal-credit: no experience record",
-            "flags": [],
-            "propagated": [],
-        }
-    try:
-        exp = json.loads(exp_out)
-    except json.JSONDecodeError:
-        return {
-            "subcommand": "temporal-credit",
-            "summary": "temporal-credit: experience JSON parse failed",
-            "flags": ["bad_experience_json"],
-            "propagated": [],
-        }
+    # RESOLVE ONE RECORD. `--id` returns a dict; `--goal` is a FILTER and
+    # returns a LIST *even on a single match*. The previous guard here was
+    # `if not isinstance(exp, dict): return` over a `--goal` read, so it fired
+    # on EVERY invocation and this function returned upstream of the
+    # dereference below — a total short-circuit, not the edge-case net it was
+    # written as ( added it after a SYNTHETIC --goal with no record
+    # returned a list; that reasoning is right for the EMPTY case and wrong for
+    # the populated one). Measured 2026-08-28: `--goal ` -> list of 25,
+    # `--id exp--...` -> dict. Diagnosed in  by bravo.
+    #
+    # Prefer the exact record for THIS execution when the caller has it —
+    # cmd_relative_advantage already receives `--experience-id` from run-all,
+    # so this only threads an argument that was already being computed.
+    # Fall back to the newest record for the goal, which is the run that just
+    # finished. Every shape is handled explicitly rather than by one isinstance
+    # test: a partially-working shape filter is the dangerous case (guard-2290).
+    exp = None
+    exp_id = getattr(args, "experience_id", None)
+    if exp_id:
+        id_out, _e, id_rc = _run(["experience-read.sh", "--id", exp_id])
+        if id_rc == 0 and id_out.strip():
+            try:
+                cand = json.loads(id_out)
+            except json.JSONDecodeError:
+                cand = None
+            # `--id` on a miss returns a dict {"error": "not_found"}, which is
+            # a dict and would pass a bare isinstance test.
+            if isinstance(cand, dict) and not cand.get("error"):
+                exp = cand
 
-    # experience-read.sh returns a LIST when there's no exact-id match
-    # (multi-result fallback) or an empty array when nothing found.
-    # cmd_temporal_credit needs a single dict. Guard defensively: if the
-    # shape isn't a dict, treat as "no experience" and short-circuit the
-    # credit-propagation.  surfaced this while smoke-testing the
-    #  fix with a synthetic --goal that had no experience record.
+    if exp is None:
+        exp_out, _e, exp_rc = _run(["experience-read.sh", "--goal", args.goal])
+        if exp_rc != 0 or not exp_out.strip():
+            return {
+                "subcommand": "temporal-credit",
+                "summary": "temporal-credit: no experience record",
+                "flags": [],
+                "propagated": [],
+            }
+        try:
+            parsed = json.loads(exp_out)
+        except json.JSONDecodeError:
+            return {
+                "subcommand": "temporal-credit",
+                "summary": "temporal-credit: experience JSON parse failed",
+                "flags": ["bad_experience_json"],
+                "propagated": [],
+            }
+        if isinstance(parsed, dict):
+            exp = None if parsed.get("error") else parsed
+        elif isinstance(parsed, list) and parsed:
+            # Newest by `created`; records missing the key sort oldest rather
+            # than raising, so a malformed row cannot hide a good one.
+            exp = max(
+                (r for r in parsed if isinstance(r, dict)),
+                key=lambda r: str(r.get("created") or ""),
+                default=None,
+            )
+
     if not isinstance(exp, dict):
         return {
             "subcommand": "temporal-credit",
-            "summary": f"temporal-credit: no single experience record (got {type(exp).__name__})",
+            "summary": "temporal-credit: no experience record",
             "flags": [],
             "propagated": [],
         }
@@ -613,7 +648,10 @@ def cmd_run_all(args):
     lv = r1.get("learning_value", 0.0)
     bp_args = argparse.Namespace(learning_value=lv)
     r2 = cmd_backpressure(bp_args)
-    tc_args = argparse.Namespace(goal=args.goal, learning_value=lv)
+    tc_args = argparse.Namespace(
+        goal=args.goal, learning_value=lv,
+        experience_id=args.experience_id,
+    )
     r3 = cmd_temporal_credit(tc_args)
     ra_args = argparse.Namespace(
         category=args.category, learning_value=lv, experience_id=args.experience_id,

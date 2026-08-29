@@ -145,6 +145,7 @@ def test_no_recognized_prefix_defaults_either():
 def test_category_resolves_either_to_specific_agent():
     """Title prefix 'Unblock:' returns either; category 'infrastructure-
     monitoring' (bravo's lane) should resolve the choice."""
+    _require_agent("bravo")
     out = evaluate("Unblock: monitor failures", category="infrastructure-monitoring")
     assert out["intended_agent"] == "bravo"
     # confidence: max(0.40 Tier-1, 0.80 Tier-2 cat-override) = 0.80
@@ -154,6 +155,7 @@ def test_category_resolves_either_to_specific_agent():
 def test_category_reinforces_tier_1():
     """Title says zeta (Investigate), category investigation-methodology
     also says zeta → confidence bump."""
+    _require_agent("zeta")
     out = evaluate("Investigate: methodology gaps",
                    category="investigation-methodology")
     assert out["intended_agent"] == "zeta"
@@ -163,6 +165,8 @@ def test_category_reinforces_tier_1():
 
 def test_tier_1_wins_over_tier_2_conflict():
     """Build: (alpha) + investigation-methodology (zeta) → Tier 1 wins."""
+    _require_agent("alpha")
+    _require_agent("zeta")
     out = evaluate("Build: investigation script",
                    category="investigation-methodology")
     assert out["intended_agent"] == "alpha"
@@ -174,6 +178,7 @@ def test_tier_1_wins_over_tier_2_conflict():
 
 def test_description_bias_breaks_either_tie():
     """Idea: + 'cross-cutting refactor' → zeta bias should win."""
+    _require_agent("zeta")
     out = evaluate("Idea: refactor session state",
                    description="this is a cross-cutting refactor across all agents")
     assert out["intended_agent"] == "zeta"
@@ -182,6 +187,8 @@ def test_description_bias_breaks_either_tie():
 def test_description_bias_cannot_flip_strong_tier_1():
     """Build: (alpha 0.85) + 'code archaeology' (zeta bias 0.12) →
     alpha still wins, but rationale notes the disagreement."""
+    _require_agent("alpha")
+    _require_agent("zeta")
     out = evaluate("Build: a tool",
                    description="this is code archaeology — analyzing history")
     assert out["intended_agent"] == "alpha"
@@ -191,6 +198,7 @@ def test_description_bias_cannot_flip_strong_tier_1():
 def test_owner_naming_routes_explicitly():
     """'owner alpha' in description has weight 0.30 — strong enough to
     pull 'either' from Tier 1 into alpha."""
+    _require_agent("alpha")
     out = evaluate("Idea: something to do",
                    description="owner alpha — they're best for this")
     assert out["intended_agent"] == "alpha"
@@ -204,6 +212,7 @@ def test_owner_naming_routes_explicitly():
 @pytest.mark.parametrize("override", ["alpha", "bravo", "zeta", "either"])
 def test_route_to_override_bypasses_classifier(override):
     """--route-to alpha must return alpha regardless of title/category."""
+    _require_agent(override)
     out = evaluate("Investigate: foo",  # would normally → zeta
                    category="infrastructure-monitoring",  # would normally → bravo
                    description="cross-cutting refactor",  # would normally → zeta
@@ -215,6 +224,7 @@ def test_route_to_override_bypasses_classifier(override):
 
 def test_invalid_route_to_falls_through_to_classifier():
     """route_to='garbage' must NOT be returned — classifier runs normally."""
+    _require_agent("zeta")
     out = evaluate("Investigate: foo", route_to="garbage")
     # Classifier sees Investigate: → zeta
     assert out["intended_agent"] == "zeta"
@@ -239,6 +249,7 @@ def test_cli_module_equivalent(title, category, description):
 
 
 def test_cli_route_to_equivalent():
+    _require_agent("alpha")
     rc, cli_out = _run_cli(title="Investigate: foo", route_to="alpha")
     mod_out = evaluate("Investigate: foo", route_to="alpha")
     assert rc == 0
