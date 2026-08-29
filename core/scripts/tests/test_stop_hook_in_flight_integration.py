@@ -809,3 +809,43 @@ def test_the_parked_and_closed_valves_are_disjoint(tmp_path):
     assert "gate=worker-net-body-closed" in log_c
     assert "gate=worker-net-body-parked" not in log_c, (
         f"the parked valve claimed a closed Body; log:\n{log_c}")
+
+
+def test_the_parked_valve_arms_the_re_poll_and_the_closed_valve_cancels_it(tmp_path):
+    """ / Zak-Code ADR-0102: the hook ARMS the park re-poll itself.
+
+    The park turn is supposed to end on the Body's own ScheduleWakeup(…, 3600);
+    measured across 26 zc-03 sessions (2026-08-29) the model armed a wake-up
+    ONCE, so a parked Body sat at its prompt like a closed one. A Zak-Code
+    harness honours a `wakeup` key in the Stop hook's JSON (arm, replace-slot,
+    clamped to 3600 s) and a `cancel`; Claude Code ignores the key. So the parked
+    ALLOW must print exactly one JSON document carrying the 3600 s arm with a
+    natural-language prompt (never a slash command — schedule-wakeup-correctness),
+    and the closed ALLOW must print the cancel, and neither may also print a
+    BLOCK. A second document on stdout would turn the whole payload into a
+    fail-open parse and lose the arm silently.
+    """
+    import json as _json
+    (tmp_path / "p").mkdir()
+    (tmp_path / "c").mkdir()
+    proc_p, _s, _root_p = _drive(tmp_path / "p", closing=False,
+                                 runner_file=False, scrub_env=True,
+                                 body_state="parked")
+    proc_c, _s2, _root_c = _drive(tmp_path / "c", closing=False,
+                                  runner_file=False, scrub_env=True,
+                                  body_state="closed-pending-merge")
+    assert proc_p.returncode == 0 and proc_c.returncode == 0
+    docs_p = [ln for ln in (proc_p.stdout or "").splitlines() if ln.strip().startswith("{")]
+    docs_c = [ln for ln in (proc_c.stdout or "").splitlines() if ln.strip().startswith("{")]
+    assert len(docs_p) == 1, f"parked ALLOW must print exactly one JSON document:\n{proc_p.stdout}"
+    assert len(docs_c) == 1, f"closed ALLOW must print exactly one JSON document:\n{proc_c.stdout}"
+    parked = _json.loads(docs_p[0])
+    closed = _json.loads(docs_c[0])
+    assert parked.get("decision") != "block" and closed.get("decision") != "block"
+    arm = parked["wakeup"]
+    assert arm["delay_seconds"] == 3600
+    assert isinstance(arm["prompt"], str) and arm["prompt"].strip()
+    assert not arm["prompt"].lstrip().startswith("/"), (
+        "a slash-prefixed wake-up prompt is rejected as user input at fire time")
+    assert "worker-loop" in arm["prompt"] and "parked" in arm["prompt"]
+    assert closed["wakeup"] == {"cancel": True}

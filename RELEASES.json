@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.30",
+    "previous_version": "2.12.29",
+    "date": "2026-08-29",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "stop-hook: arm the park re-poll wake-up from the parked ALLOW and cancel the net on the closed ALLOW via the Zak-Code ADR-0102 wakeup key (g-353-74)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.29",
     "previous_version": "2.12.28",
     "date": "2026-08-29",

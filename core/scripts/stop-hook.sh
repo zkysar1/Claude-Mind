@@ -443,6 +443,23 @@ if [ ! -f "$RUNNER_FILE" ] || { [ -n "$RUNNER_SID" ] && [ "$HOOK_SID" != "$RUNNE
             # the closed valve: a missing or unreadable manifest matches
             # neither and falls through to the BLOCK.
             echo "$(date +%Y-%m-%dT%H:%M:%S) ALLOW gate=worker-net-body-parked sid=$HOOK_SID agent=$HOOK_AGENT" >> "$LOG" 2>/dev/null || true
+            # ARM THE PARK RE-POLL FROM HERE (, Zak-Code ADR-0102). The
+            # park turn is supposed to end on the Body's own
+            # ScheduleWakeup(<park-resume prompt>, 3600) — and measured across 26
+            # zc-03 sessions on 2026-08-29 the model armed a wake-up ONCE, so a
+            # parked Body sat at its prompt exactly like a closed one. This hook
+            # is the one process that positively knows the Body is parked, at
+            # the last moment before the prompt, so it arms the re-poll itself:
+            # a Zak-Code harness honours the `wakeup` key (replace-slot, clamped
+            # to 3600s, persisted on the session); Claude Code ignores unknown
+            # keys, so the line is harmless there and the Body's own arm stands.
+            # Emitted INSTEAD of falling through to the gates below, which would
+            # ALLOW anyway for a worker SID and could never be reached with a
+            # second JSON document on stdout without turning this into a
+            # fail-open parse. The prompt is a natural-language line, never a
+            # slash command (schedule-wakeup-correctness.md).
+            printf '%s\n' '{"wakeup": {"prompt": "Parked worker Body: re-enter /worker-loop at Phase -0 (the manifest reads parked = RESUMABLE), re-run the Phase 0.5 reducer poll and SELECT; a claim resumes this Body, no eligible goal re-parks it.", "delay_seconds": 3600}}'
+            exit 0
         elif grep -Eq "^body_state: '?(closed-pending-merge|merged|closed-stale)'?[[:space:]]*$" \
                 "$HOOK_AGENT_DIR/sessions/$HOOK_SID/body-manifest.yaml" 2>/dev/null; then
             # 4th safety valve (2026-08-09, cc-08 04:39->04:49): a GENUINELY-
@@ -460,6 +477,12 @@ if [ ! -f "$RUNNER_FILE" ] || { [ -n "$RUNNER_SID" ] && [ "$HOOK_SID" != "$RUNNE
             # toward protection and only a positively-read closed state stands
             # it down.
             echo "$(date +%Y-%m-%dT%H:%M:%S) ALLOW gate=worker-net-body-closed sid=$HOOK_SID agent=$HOOK_AGENT" >> "$LOG" 2>/dev/null || true
+            # A CLOSED Body needs no net: drop whatever wake-up the last work unit
+            # armed so it does not fire a resurrection prompt into a finished
+            # session (Zak-Code ADR-0102 `cancel`; Claude Code ignores the key,
+            # where the resurrection prompt's own closed-set read is the guard).
+            printf '%s\n' '{"wakeup": {"cancel": true}}'
+            exit 0
         else
             echo "$(date +%Y-%m-%dT%H:%M:%S) BLOCK gate=worker-net sid=$HOOK_SID agent=$HOOK_AGENT" >> "$LOG" 2>/dev/null || true
             unset _BODY_WM _CLOSE_SENTINEL
