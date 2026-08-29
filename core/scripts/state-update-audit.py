@@ -45,8 +45,18 @@ except ImportError:
     sys.exit(2)
 
 
-def _run(argv, input_text=None, timeout=30):
+def _run(argv, input_text=None, timeout=None):
     """Run a shell command. Returns (stdout, stderr, returncode)."""
+    # guard-918: several callers below write to own-cloud meta/ and world/
+    # (meta-impk, evolution-log-append, meta-dead-ends, meta-generations,
+    # board-post). A fixed short cap kills a write still inside its own curl
+    # window and then reports FAILURE for a write that already COMMITTED --
+    # measured  (2026-08-29): meta-impk hit the old 30s cap, the
+    # snapshot HAD landed (retry returned duplicate_suppressed), and velocity
+    # still emitted impk_snapshot_failed / impk_rc=-1. Derive from the knob the
+    # inner curl honors, plus headroom. Explicit per-call timeouts still win.
+    if timeout is None:
+        timeout = int(os.environ.get("RT_CURL_TIMEOUT", "150")) + 30
     from _runtime_bash import BASH as bash  # rb-1472: bin-first, honors MIND_SHELL, clean-PATH-safe
     # POSIX-slash the script path. Git Bash / MSYS on Windows mangles
     # backslashes in argv (e.g. `C:\Zak\...` → `C:Zak...`), resulting in

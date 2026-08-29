@@ -489,25 +489,27 @@ Bash: py -3 core/scripts/worker_execute.py skill-eligible <the goal's skill fiel
 # roles run. The scorer stays byte-identical for both roles.
 #
 # A GREEN ANSWER IS NOT A PROOF, AND ON A SKILL-LESS GOAL THERE IS NO ANSWER.
-# The bridge is SKILL-keyed, so a goal with no skill (919 of 938 candidates) now
-# returns "NOT EVALUATED ... NOT a cleared check" at rc 0: eligible stays True
-# because fail-closed would strand the role, but the bridge DECLINED to judge and
-# the call is YOURS (g-115-6523). On that answer — and whenever a named skill
-# looks like loop-phase encoding over YOUR OWN unmerged experience — read the
-# goal's verification outcomes and description BEFORE claiming. Work that ENCODES
-# to tree/reasoning-bank/guardrails, RESOLVES a hypothesis, drains a capture lane,
-# consumes worker refs, pushes main, or writes the agent-wide working-memory.yaml
-# is REDUCER-ONLY: release it, take the next candidate. SKILL_LIFECYCLE_STAGE is
-# the remedy for a NAMED skill only — a skill-less goal has no key to add. The
-# line that matters is loop-phase encoding (forbidden) vs goal-directed artifact
-# creation from content supplied in the goal (`/tree` is pinned for that reason).
+# The bridge is SKILL-keyed, so a goal with no skill (most candidates) returns
+# "NOT EVALUATED ... NOT a cleared check" at rc 0: eligible stays True because
+# fail-closed would strand the role, but the bridge DECLINED to judge and the
+# call is YOURS (g-115-6523). On that answer — and whenever a named skill looks
+# like loop-phase encoding over YOUR OWN unmerged experience — read the goal's
+# verification outcomes and description BEFORE claiming, with THIS command
+# (never a hand parser over the store file — the guard refuses it):
+Bash: bash core/scripts/aspirations-query.sh --goal-field id <goal-id> --full
+# Work that ENCODES to tree/reasoning-bank/guardrails, RESOLVES a hypothesis,
+# drains a capture lane, consumes worker refs, pushes main, or writes the
+# agent-wide working-memory.yaml is REDUCER-ONLY: release it, take the next
+# candidate. SKILL_LIFECYCLE_STAGE is the remedy for a NAMED skill only — a
+# skill-less goal has no key to add. The line: loop-phase encoding (forbidden)
+# vs goal-directed artifact creation from content supplied in the goal
+# (`/tree` is pinned for that reason).
 IF no goal: PARK AWAITING SUPPLY — the same resumable park as Phase 0.5 rc=1,
-  NOT a close (g-353-73). Exhaustion is usually TRANSIENT on a multi-Body fleet:
-  measured 2026-08-29 (8 Bodies, zc-03), four workers read 0 candidates within
-  minutes of each other while sibling Bodies held an aspiration's tail, and 25
-  min later SELECT ranked 18 (claims released, a new aspiration filed) — all four
-  had closed durably and sat dead at the prompt until a human relaunched them. A
-  worker with no work is WAITING, not finished.
+  NOT a close (g-353-73). Exhaustion is TRANSIENT on a multi-Body fleet: measured
+  2026-08-29 (8 Bodies), four workers read 0 candidates minutes apart while
+  siblings held an aspiration's tail; 25 min later SELECT ranked 18 — all four had
+  closed durably and sat dead until a human relaunched them. A worker with no
+  work is WAITING, not finished.
     Bash: py -3 core/scripts/body-manifest.py park-expired --sid "$MIND_SID" --agent "$MIND_AGENT"
   rc=0 (parked past the cap) -> GENUINE close. Record it, write the body-closing
   sentinel so the stop-hook (Phase-2B producer) marks this Body
@@ -531,22 +533,21 @@ IF no goal: PARK AWAITING SUPPLY — the same resumable park as Phase 0.5 rc=1,
   The invented-close conservatism is untouched, and parking must never acquire
   a soft edge for anything else.
   ** CONTEXT PRESSURE IS NEITHER A CLOSE NOR A PARK CONDITION. ** Not "context is
-  filling up", not "the session has run long", not "I have done N units", not
-  "the next goal will not fit". Autocompact makes a long session survivable and
-  this loop runs indefinitely, so nearly-out-of-context is a reason to enter the
-  next unit. Mirrors stop-hook-compliance.md rules 3-4; measured 2026-08-11, a
-  Body closed itself after 12 units with ~930 candidates in SELECT and a live
-  reducer, then wrote a persuasive board post explaining why — that post is the
-  SIGNATURE of the defect, not evidence against it.
-  IF A SPECIFIC GOAL GENUINELY WILL NOT FIT, RELEASE THE CLAIM UNSTARTED and
-  keep looping — `aspirations-release.sh <goal-id> --source <world|agent>`, then
-  VERIFY by re-reading that the record shows status=pending / claimed_by=None
-  (the release echo is not proof). Never close or park the Body for it.
+  filling up", "the session has run long", "I have done N units", "the next goal
+  will not fit". Autocompact makes a long session survivable and this loop runs
+  indefinitely: nearly-out-of-context is a reason to enter the next unit
+  (stop-hook-compliance.md rules 3-4). Measured 2026-08-11: a Body closed itself
+  after 12 units with ~930 candidates and a live reducer, then wrote a persuasive
+  board post explaining why — the post is the SIGNATURE of the defect.
+  IF A SPECIFIC GOAL WILL NOT FIT, RELEASE THE CLAIM UNSTARTED and keep looping —
+  `aspirations-release.sh <goal-id> --source <world|agent>`, then VERIFY by
+  re-reading that the record shows status=pending / claimed_by=None (the release
+  echo is not proof). Never close or park the Body for it.
   WHY A WRONG CLOSE IS NOT RECOVERABLE: the sentinel stages this Body's WM
-  snapshot, Phase -0's closure gate then REFUSES every further unit on this SID,
-  and `body_state: closed-pending-merge` is DURABLE — only a user-only `/start`
-  of a NEW session reopens work. A wrong close STRANDS the remaining queue on a
-  human who does not know they are needed; a wrong park costs one hourly poll.
+  snapshot, Phase -0's closure gate REFUSES every further unit on this SID, and
+  `body_state: closed-pending-merge` is DURABLE — only a user `/start` of a NEW
+  session reopens work. A wrong close STRANDS the queue on a human who does not
+  know they are needed; a wrong park costs one hourly poll.
   (The reducer generates work, not the worker. A worker does not INVENT an agenda —
    but "never files a goal" is too strong and was ruled on: see "May a worker file a
    goal?" below. Do NOT file here regardless; SELECT finding nothing is the park
