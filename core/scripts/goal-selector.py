@@ -2424,6 +2424,8 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
         #   - dicts with "type" → structured predicates, filtered below via
         #     predicate.evaluate_all (fail-fast; selector_skip=True is honored)
         for goal in asp.get("goals", []):
+            if goal_record_id(asp, goal) is None:
+                continue  # string ref / id-less stub: warned once, never a candidate
             if goal.get("status") != "pending":
                 continue
 
@@ -2974,8 +2976,10 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
                         and g.get("status") not in TERMINAL_GOAL_STATUSES}
 
         for goal in asp.get("goals", []):
+            goal_id = goal_record_id(asp, goal)
+            if goal_id is None:
+                continue  # string ref / id-less stub: warned once, not a diagnosable goal
             status = goal.get("status", "")
-            goal_id = goal.get("id", "")
 
             # Skip terminal and in-progress statuses
             if status in SKIP_STATUSES:

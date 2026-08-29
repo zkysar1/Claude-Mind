@@ -138,6 +138,11 @@ def effective_counts(asp, *, exclude_statuses=frozenset(), include_recurring=Tru
     goals = asp.get("goals") or []
 
     def _live(g):
+        if not isinstance(g, dict):
+            # A bare string ref or other non-record in the raw JSONL (a shape
+            # the daemon now refuses at write time) is not a live goal; counting
+            # it would raise here and fail every caller's census.
+            return False
         if not include_recurring and g.get("recurring"):
             return False
         if g.get("status") in exclude_statuses:
