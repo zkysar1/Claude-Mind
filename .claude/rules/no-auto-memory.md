@@ -1,3 +1,7 @@
+---
+description: "Never write platform auto-memory; persist via guardrails, knowledge tree, reasoning bank or working memory per learning-routing.md."
+---
+
 # No Auto-Memory
 
 This project has its own knowledge persistence. NEVER write to the platform

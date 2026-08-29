@@ -191,6 +191,29 @@ template embedded by Bun, which is what the CLI is compiled with. Chasing it
 leads to a Bun scaffolding blob, not to a rules loader. The real keys are
 `paths` (rules front matter) and `globs` (the parsed result on the loaded entry).
 
+## `description:` and `alwaysApply:` — what a NON-Claude-Code runtime sees (2026-08-29)
+
+Claude Code folds every unscoped rule's full body into the preamble. A Zak-Code Body
+does not: its full render is capped at 32 KB total / 8 KB per file (only the first
+seven rules by name fit; 27 are dropped with a note), so the coach fleet runs the
+**lean rules index** — one line per rule (`- name: summary [path]`, summary ≤ 140
+chars) plus a `read_rule` tool. Measured 2026-08-29 over one hour of eight sessions on
+a 35B model: 252 turns, **zero** `read_rule` calls, and the summary line was the rule's
+TITLE because no rule carried a `description:`. The index line is therefore the only
+part of a rule a small-model Body ever sees. Two front-matter keys fix that; Claude
+Code's loader ignores both (its only rules key is `paths`, verified above):
+
+| key | who reads it | contract |
+|---|---|---|
+| `description: "<imperative>"` | Zak-Code lean index (and any Cursor-style loader) | ≤ 140 chars, one sentence, the rule's imperative — not its title. Every rule carries one; `core/scripts/tests/test_rules_frontmatter_index.py` pins length and presence. |
+| `alwaysApply: true` | Zak-Code (ADR-0105) | the FULL body rides in the prompt ahead of the index (8 KB per-file cap — the test pins that a pinned body fits) and is folded first under the full render. Budget ≈ 25 KB across pins: `return-protocol`, `verify-before-assuming`, `read-before-edit`, `no-scratchpad` today. |
+
+A rule that had no front matter gained a block; a rule that already had `paths:` gained
+the keys inside its block. The HTML-comment `domain-leak-exempt` marker on rules without
+front matter still sits below the block (the scanner greps the whole file). Byte cost:
++125 lines / ~5 KB across 34 files, paid on every Claude Code turn — accepted with a
+`size-budget-override` because the alternative was 34 rules a Body never applies.
+
 ## Cross-references
 
 - `.claude/rules/gradle-tests-pattern.md` — the first scoped rule

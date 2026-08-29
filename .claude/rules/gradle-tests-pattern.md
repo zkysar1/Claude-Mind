@@ -1,4 +1,5 @@
 ---
+description: "A gradle --tests pattern with an uppercase first char AND uppercase last dot-segment selects zero tests silently; use the gate's shapes."
 paths:
   - "**/*.gradle"
   - "**/*.gradle.kts"

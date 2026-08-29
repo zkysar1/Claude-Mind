@@ -1,4 +1,5 @@
 ---
+description: "Examples in core/, rules, base skills and mind_api use generic terms (service, endpoint, remote storage); domain content goes to world/."
 paths:
   - "core/**"
   - ".claude/rules/**"

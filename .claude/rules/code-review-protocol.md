@@ -1,3 +1,7 @@
+---
+description: "Treat review findings as hypotheses: probe each with evidence and run the subject+mechanism retrieve.sh consults before applying a fix."
+---
+
 # Code Review Protocol
 
 ## Principle

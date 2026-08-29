@@ -1,3 +1,7 @@
+---
+description: "Probe with the skill's companion script in its production call shape (same env, args), never a synthetic probe: wrong shape proves nothing."
+---
+
 <!-- domain-leak-exempt: deliberate pedagogical examples — efs-ssh.sh, aws-exec.sh, operator.ayoai.com appear in the wrapper-vs-synthetic-probe comparison table where the framework's failure mode is demonstrated by NAMING the actual wrappers that hide the StrictHostKeyChecking flag / .env loading / auth header. Genericizing to `<wrapper>.sh` would lose the "look at WHY plain-ssh diverges" specificity that makes the rule learnable. -->
 # Probe With the Canonical Code Path
 

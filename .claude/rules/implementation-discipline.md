@@ -1,3 +1,7 @@
+---
+description: "Change only what the goal requires: no speculative features, no single-use abstractions, match existing style; adjacent ideas become goals."
+---
+
 # Implementation Discipline
 
 ## Principle

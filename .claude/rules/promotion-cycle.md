@@ -1,3 +1,7 @@
+---
+description: "Framework changes flow Ayoai-Mind to Claude-Mind to ZDS-Mind (dev, staging, prod), never skipping a stage; promotion-preflight.sh first."
+---
+
 <!-- domain-leak-exempt: This rule governs the ZDS deployment topology; repo names (Ayoai-Mind, Claude-Mind, ZDS-Mind) are necessary for the rule to be operationally actionable — a generic placeholder would make the rule unenforceable. -->
 
 # Promotion Cycle (ZDS-Mind is Production)

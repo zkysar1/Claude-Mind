@@ -1,4 +1,5 @@
 ---
+description: "Multi-paragraph WHY for extracted pseudocode goes in core/config/rationale/<mechanism>.md with a pointer in the source, never inline."
 paths:
   - "core/config/**"
   - "core/scripts/**"

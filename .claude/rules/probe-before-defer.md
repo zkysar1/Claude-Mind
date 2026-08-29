@@ -1,3 +1,7 @@
+---
+description: "Before setting defer_reason run the canonical companion script; defer only on a non-recoverable failure, naming the real external signal."
+---
+
 # Probe Before Defer
 
 ## Principle

@@ -1,4 +1,5 @@
 ---
+description: "Daemon-only wrappers: on rc=3 exit 1 via _no_daemon_error(); never add a Python CLI fallback or bypass the gate; fix the daemon or revert."
 paths:
   - "core/scripts/**"
   - "mind_api/**"

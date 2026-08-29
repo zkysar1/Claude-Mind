@@ -1,4 +1,5 @@
 ---
+description: "A deep code closure may claim tests pass only after the area's FULL suite (run-full-suite.sh, gradlew, npm test); read the VERDICT first."
 paths:
   - "core/scripts/**"
   - "core/tests/**"

@@ -1,3 +1,7 @@
+---
+description: "State observed facts as X is Y because Z, never hedge on evidence you can gather; propose the simpler alternative; one source of truth."
+---
+
 # Communication Clarity
 
 ## Principle

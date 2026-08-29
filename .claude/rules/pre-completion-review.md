@@ -1,3 +1,7 @@
+---
+description: "Before marking a goal complete re-read what landed on disk, check every verification criterion and side effect, remove what is not required."
+---
+
 # Pre-Completion Review
 
 ## Principle

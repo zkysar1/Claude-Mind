@@ -1,3 +1,7 @@
+---
+description: "After any infrastructure interaction check error alerts, never trust superficial success; fix inline first, else file a CREATE_BLOCKER."
+---
+
 # Error Response Imperative
 
 After ANY infrastructure interaction (success or failure): check error alerts.

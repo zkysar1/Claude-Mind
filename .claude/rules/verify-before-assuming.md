@@ -1,3 +1,8 @@
+---
+description: "Negative conclusions (broken, missing, cannot) need 2+ independent signals; silent-failure commands count zero; read the log, not the rc."
+alwaysApply: true
+---
+
 # Verify Before Assuming
 
 ## Principle
