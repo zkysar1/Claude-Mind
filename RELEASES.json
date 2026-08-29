@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.16",
+    "previous_version": "2.12.15",
+    "date": "2026-08-29",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Refuse stub or lossy aspiration goals-field rewrites (invalid_goals / goals_removed / goal_id_not_aspiration); goal-selector tolerates a goal record without an id — the coach fleet-wide KeyError: 'id' incident",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.15",
     "previous_version": "2.12.14",
     "date": "2026-08-29",

@@ -8,6 +8,8 @@ hypotheses) fail CLOSED — an untagged or framework entry is suppressed, never 
 from __future__ import annotations
 
 from knowledge_projection import (
+    _SELF_PURPOSE_CAP,
+    project_self,
     FRAMEWORK_TREE_ROOT,
     ProjectedBundle,
     Redactor,
@@ -273,7 +275,9 @@ def test_project_suppresses_framework_and_exposes_domain() -> None:
     )
     assert isinstance(bundle, ProjectedBundle)
     # Exactly the domain entries survive each store.
-    assert bundle.counts() == {"tree": 1, "hypotheses": 1, "guardrails": 1, "lessons": 1}
+    assert bundle.counts() == {
+        "tree": 1, "hypotheses": 1, "guardrails": 1, "lessons": 1, "self": 0,
+    }  # no self.md passed to project() -> `self` projects empty
     assert bundle.tree[0]["key"] == "reefs"
     assert bundle.hypotheses[0]["horizon"] == "short"
     assert bundle.guardrails[0]["rule"].startswith("Verify every claim")
@@ -412,3 +416,37 @@ def test_project_never_leaks_the_framework_subtree_category() -> None:
     assert not any("fail closed" in r for r in rules)
     assert not any("critical()" in r for r in rules)
     assert all(h["status"] != "active" for h in bundle.hypotheses)
+
+
+def test_self_purpose_redacts_before_capping_so_a_straddling_token_cannot_leak():
+    """A redactable token straddling the cap must not leave its prefix in the output.
+
+    THE ORDERING IS THE WHOLE TEST. Capping first bisects the SOURCE token, so the
+    redactor's pattern no longer matches the surviving fragment and the prefix is
+    published; redacting first can only ever bisect a "[redacted]" placeholder, which
+    is harmless. A token placed WHOLLY INSIDE the cap passes under BOTH orderings and
+    is therefore not coverage -- it is asserted below only as the control.
+
+    Not hypothetical: measured 2026-08-29, pre-## prose is 1824 B (alpha) and 2053 B
+    (bravo) against a 1200-char cap, so this boundary is crossed in production today.
+    Pre-fix, this test's first assertion failed with purpose ending 'SUPERSECRETVAL'.
+    """
+    secret = "SUPERSECRETVALUE"
+    redactor = Redactor(agent_names=("zeta",), workspace_paths=(), secret_values=(secret,))
+
+    # Token spans the cap boundary: starts 8 chars before _SELF_PURPOSE_CAP.
+    straddling = "x" * (_SELF_PURPOSE_CAP - 8) + secret + "y" * 400
+    out = project_self({"created": "2026-01-01"}, straddling, redactor)
+
+    assert secret not in out["purpose"]
+    # The specific failure mode: the pre-cap PREFIX of the token surviving.
+    for n in range(4, len(secret)):
+        assert not out["purpose"].endswith(secret[:n]), (
+            f"leaked a {n}-char prefix of a straddling secret: {out['purpose'][-24:]!r}"
+        )
+    assert len(out["purpose"]) <= _SELF_PURPOSE_CAP
+
+    # Control: wholly inside the cap. Passes under either ordering by construction,
+    # so it guards the ordinary path without standing in for the assertion above.
+    inside = "x" * 1100 + " " + secret + " " + "y" * 400
+    assert secret not in project_self({"created": "2026-01-01"}, inside, redactor)["purpose"]

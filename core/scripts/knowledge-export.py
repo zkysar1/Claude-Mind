@@ -22,13 +22,21 @@ import json
 import os
 import re
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import yaml  # noqa: E402 — PyYAML, available in the framework venv
 
-from knowledge_projection import ProjectedBundle, Redactor, is_domain_tree_node, project  # noqa: E402
+from _paths import AGENTS_PARENT_DIR
+from knowledge_projection import (  # noqa: E402
+    KNOWLEDGE_COUNT_KEYS,
+    ProjectedBundle,
+    Redactor,
+    is_domain_tree_node,
+    project,
+)
 
 #: Env var name suffixes whose VALUES are stripped from exposed text (never their names).
 _SECRET_SUFFIXES = ("_KEY", "_TOKEN", "_SECRET", "_PASSWORD")
@@ -189,7 +197,33 @@ def world_store_evidence(world_path: Path) -> dict[str, int]:
     return {k: v for k, v in out.items() if v}
 
 
-def read_tree_nodes(world_path: Path) -> list[dict[str, object]]:
+def _degrade(
+    status: dict[str, object] | None, path: Path, error: str
+) -> list[dict[str, object]]:
+    """Record a tree-index read failure on ``status`` and return an empty node list.
+
+    Called on the two unreadable-index paths in :func:`read_tree_nodes`. The message names
+    the MEASURED condition (the exception class and text, or the actual root type) rather
+    than a generic "could not read" — a degrade whose reason is generic is only marginally
+    better than the silent failure it replaces (guard-1946).
+    """
+    if status is not None:
+        status["degraded"] = True
+        status["store"] = "tree"
+        status["path"] = str(path)
+        status["error"] = error
+    print(
+        f"[knowledge-export] WARNING: tree index at {path} is unreadable ({error}). "
+        f"Exporting tree=0 and marking the bundle degraded so the failure is visible to a "
+        f"reader rather than hidden behind a stale bundle.",
+        file=sys.stderr,
+    )
+    return []
+
+
+def read_tree_nodes(
+    world_path: Path, *, status: dict[str, object] | None = None
+) -> list[dict[str, object]]:
     """Read ``_tree.yaml`` into node dicts shaped for :func:`project`.
 
     Uses the index-level ``summary`` (already in the tree yaml) and a humanized key for the
@@ -199,12 +233,55 @@ def read_tree_nodes(world_path: Path) -> list[dict[str, object]]:
     can render the article on click; framework (``system/``) node bodies are NOT read — the
     projection suppresses that subtree anyway, so skipping the read keeps framework bodies
     out of memory entirely (defense in depth) and halves the per-export file reads.
+
+    Two index shapes beyond the canonical one are handled, both measured live across 18
+    sidecar worlds (g-368-53, filed off g-369-49):
+
+    * A **flat string mapping** (``<key>: "<filename>.md"``) instead of a node mapping —
+      2 of 18 indexes. Coerced to ``{"file": <str>}``; everything downstream already
+      derives category and body from ``file``, and ``top_level_category`` strips the
+      extension, so a coerced node classifies exactly like a canonical one (verified: the
+      framework root ``system.md`` still reads non-domain, so the coercion cannot leak a
+      framework body).
+    * An **unparseable or non-mapping index** — 5 of 18. Reported through ``status``
+      rather than raised, so the caller writes a bundle that SAYS it is degraded instead
+      of dying and leaving the previous (hollow) bundle in place, where a malformed index
+      is byte-indistinguishable from a healthy no-op.
+
+    ``status``, when a dict is passed, is populated in place on the degraded path and left
+    untouched on the healthy one — so ``status.get("degraded")`` is the caller's test.
     """
     tree_dir = _resolve_tree_dir(world_path)
     if tree_dir is None:
         return []
     tree_yaml = tree_dir / "_tree.yaml"
-    data = yaml.safe_load(tree_yaml.read_text(encoding="utf-8")) or {}
+    # DEFECT C (g-368-53). The exception classes are deliberate and narrow (guard-373 —
+    # never a blanket ``except Exception``, which would mask a bug in this reader as a
+    # benign degrade):
+    #   * ``yaml.YAMLError``     — the ScannerError/ParserError parent (a stray backtick,
+    #                              an unquoted structural marker; guard-610 is the WRITE
+    #                              side of the same defect).
+    #   * ``UnicodeDecodeError`` — corrupt bytes. It is a ``ValueError``, NOT an
+    #                              ``OSError``, so an ``(OSError, YAMLError)`` tuple would
+    #                              let it escape silently (guard-2441).
+    #   * ``OSError``            — the index vanished or is unreadable between the
+    #                              ``is_file()`` probe in ``_resolve_tree_dir`` and here.
+    try:
+        data = yaml.safe_load(tree_yaml.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        return _degrade(status, tree_yaml, f"{type(exc).__name__}: {exc}")
+    # ``safe_load(x) or {}`` does NOT cover valid-YAML-that-is-not-a-mapping: ``or``
+    # substitutes only on a falsey value, so a non-empty list or a bare scalar reaches
+    # ``.get`` and raises ``AttributeError``. Guard it STRUCTURALLY rather than catching
+    # that AttributeError — catching it would make a bug in this function
+    # indistinguishable from the malformed input it guards against (guard-2441,
+    # guard-1946).
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        return _degrade(
+            status, tree_yaml, f"index root is {type(data).__name__}, expected a mapping"
+        )
     nodes = data.get("nodes") or {}
     out: list[dict[str, object]] = []
     if isinstance(nodes, dict):
@@ -212,6 +289,11 @@ def read_tree_nodes(world_path: Path) -> list[dict[str, object]]:
     else:  # tolerate a list-of-nodes shape
         items = ((str(n.get("key") or ""), n) for n in nodes if isinstance(n, dict))
     for key, node in items:
+        # DEFECT B (g-368-53): a flat ``<key>: "<filename>.md"`` index maps every node to a
+        # STRING, so the guard below dropped all of them and the export read tree=0 while
+        # the index was perfectly healthy. Coerce before the guard, not inside it.
+        if isinstance(node, str):
+            node = {"file": node}
         if not isinstance(node, dict):
             continue
         file_rel = str(node.get("file") or "")  # file path → top-level category + body source
@@ -241,10 +323,54 @@ def read_tree_nodes(world_path: Path) -> list[dict[str, object]]:
 
 def _agent_names(project_root: Path) -> list[str]:
     """Agent directory names under ``agents/`` — redacted to "the agent" in output."""
-    agents = project_root / "agents"
+    agents = project_root / AGENTS_PARENT_DIR
     if not agents.is_dir():
         return []
     return [p.name for p in agents.iterdir() if p.is_dir() and not p.name.startswith(".")]
+
+
+def _read_self(project_root: Path, env: Mapping[str, str]) -> tuple[dict[str, object], str]:
+    """Read the bound agent's ``self.md`` -> ``(front_matter, body)``; ``({}, "")`` on any miss.
+
+    Store I/O only -- the projection/redaction decision lives in
+    :func:`knowledge_projection.project_self`, per PEARL 10.3 filter-at-the-source.
+
+    Agent resolution is deliberately narrow and fail-closed. ``MIND_AGENT`` is the
+    framework's ONE agent-resolution mechanism (CLAUDE.md "Agent-Session Binding"), so it
+    wins. A sidecar environment holds exactly one agent, and that unambiguous case is the
+    fallback. Two or more agent dirs with no binding is AMBIGUOUS, and guessing there
+    would publish one agent's identity under another's environment -- so it returns
+    nothing. An absent, empty or unreadable file returns nothing too: no identity
+    published beats a wrong or a hollow one.
+    """
+    name = str(env.get("MIND_AGENT") or "").strip()
+    agents_dir = project_root / AGENTS_PARENT_DIR
+    if not name:
+        try:
+            candidates = [d.name for d in agents_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+        except OSError:
+            return {}, ""
+        if len(candidates) != 1:
+            return {}, ""   # zero or ambiguous -> publish nothing
+        name = candidates[0]
+
+    try:
+        text = (agents_dir / name / "self.md").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return {}, ""
+
+    body = _strip_front_matter(text)
+    if body == text:          # no front matter at all
+        return {}, body
+    lines = text.split("\n")
+    end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+    if end is None:
+        return {}, body
+    try:
+        fm = yaml.safe_load("\n".join(lines[1:end])) or {}
+    except yaml.YAMLError:
+        fm = {}
+    return (fm if isinstance(fm, dict) else {}), body
 
 
 def _secret_values(env: dict[str, str]) -> list[str]:
@@ -266,20 +392,31 @@ def build_bundle(
     *,
     extra_paths: tuple[str, ...] = (),
     env: dict[str, str] | None = None,
+    tree_status: dict[str, object] | None = None,
 ) -> ProjectedBundle:
-    """Read all four stores from ``world_path`` and project them into a safe bundle."""
+    """Read all four stores from ``world_path`` and project them into a safe bundle.
+
+    ``tree_status`` is an opt-in out-parameter: pass a dict to learn whether the tree
+    index was readable (see :func:`read_tree_nodes`). It is keyword-only and defaults to
+    ``None`` so every existing caller is byte-identical; the degraded marker is a
+    reporting concern of this I/O layer and deliberately does NOT enter the pure
+    :class:`ProjectedBundle`, which describes the projection and not how the read went.
+    """
     env = dict(os.environ if env is None else env)
     redactor = Redactor(
         agent_names=tuple(_agent_names(project_root)),
         workspace_paths=(str(world_path), str(project_root), *extra_paths),
         secret_values=tuple(_secret_values(env)),
     )
+    self_fm, self_body = _read_self(project_root, env)
     return project(
-        tree_nodes=read_tree_nodes(world_path),
+        tree_nodes=read_tree_nodes(world_path, status=tree_status),
         reasoning=_read_jsonl(world_path / "reasoning-bank.jsonl"),
         guardrails=_read_jsonl(world_path / "guardrails.jsonl"),
         hypotheses=_read_jsonl(world_path / "pipeline.jsonl"),
         redactor=redactor,
+        self_front_matter=self_fm,
+        self_body=self_body,
     )
 
 
@@ -392,6 +529,22 @@ def write_okf_bundle(bundle: ProjectedBundle, out_dir: Path) -> dict[str, int]:
             f"{_okf_frontmatter({'type': 'lesson', 'title': title})}\n{text}\n", encoding="utf-8"
         )
 
+    # self.md — the identity concept, one file like every other concept, carrying the
+    # required `type` discriminator (transfer-bundle-export-shape.md invariant: one
+    # concept = one md + a `type`). Written ONLY when the projection is non-empty: an
+    # absent file means "no identity published", which is the same signal the JSON
+    # payload's `{}` carries, in the shape this format has for absence.
+    if bundle.agent_self:
+        _self = bundle.agent_self
+        _self_fm = {"type": "self"}
+        for _k in ("created", "last_updated"):
+            if _self.get(_k):
+                _self_fm[_k] = str(_self[_k])
+        (out_dir / "self.md").write_text(
+            f"{_okf_frontmatter(_self_fm)}\n# About this agent\n\n{_self.get('purpose', '')}\n",
+            encoding="utf-8",
+        )
+
     # index.md — the optional progressive-disclosure index (invariant 7).
     # `generated_at` rides in the frontmatter AND as a visible line: the downloadable
     # wiki outlives the box it came from, so a reader holding an unzipped copy needs
@@ -413,6 +566,10 @@ def write_okf_bundle(bundle: ProjectedBundle, out_dir: Path) -> dict[str, int]:
         f"- Hypotheses: {counts['hypotheses']}",
         f"- Guardrails: {counts['guardrails']}",
         f"- Lessons: {counts['lessons']}",
+    ]
+    if counts.get("self"):
+        lines.append("- [About this agent](self.md)")
+    lines += [
         "",
         "## Articles",
         "",
@@ -445,8 +602,9 @@ def main(argv: list[str] | None = None) -> int:
     world = _resolve_world()
     project_root = Path(__file__).resolve().parents[2]
     meta = os.environ.get("META_PATH")
+    tree_status: dict[str, object] = {}
     bundle = build_bundle(
-        world, project_root, extra_paths=(meta,) if meta else ()
+        world, project_root, extra_paths=(meta,) if meta else (), tree_status=tree_status
     )
 
     # An all-zero bundle over a world that demonstrably HOLDS knowledge is a broken
@@ -455,14 +613,20 @@ def main(argv: list[str] | None = None) -> int:
     # hand. Refuse, loudly, and name the evidence; the caller (knowledge-export.sh) then
     # leaves the previous bundle in place rather than replacing it with nothing. A world
     # with no stores yet still exports its empty bundle, unchanged (g-368-34).
-    if not any(bundle.counts().values()):
+    _counts = bundle.counts()
+    if not any(_counts[k] for k in KNOWLEDGE_COUNT_KEYS):
         evidence = world_store_evidence(world)
         if evidence:
+            cause = (
+                f" CAUSE: {tree_status.get('error')} (at {tree_status.get('path')})."
+                if tree_status.get("degraded")
+                else ""
+            )
             print(
                 f"[knowledge-export] REFUSING to write an all-zero bundle: {world} holds "
                 f"readable stores {evidence} but the projection produced "
                 f"{bundle.counts()}. This is a broken export, not an empty world. "
-                f"Nothing was written.",
+                f"Nothing was written.{cause}",
                 file=sys.stderr,
             )
             return 2
@@ -474,16 +638,32 @@ def main(argv: list[str] | None = None) -> int:
         print(f"wrote OKF bundle to {out_dir}: {counts}")
         return 0
 
-    payload = {
+    payload: dict[str, object] = {
         # First key so a consumer reading the head of the file sees the age
         # immediately. Additive — every existing key keeps its name and shape.
         "generated_at": _generated_at(),
-        "counts": bundle.counts(),
-        "tree": bundle.tree,
-        "hypotheses": bundle.hypotheses,
-        "guardrails": bundle.guardrails,
-        "lessons": bundle.lessons,
     }
+    # ABSENT on a healthy export, so a consumer testing ``"degraded" in bundle`` gets a
+    # clean signal and no existing reader sees a new key. Second when present, for the
+    # same head-of-file reason ``generated_at`` is first: a hollow bundle must say why it
+    # is hollow, or it reads exactly like an honest export of an empty world (g-368-53).
+    if tree_status.get("degraded"):
+        payload["degraded"] = [tree_status]
+    payload.update(
+        {
+            "counts": bundle.counts(),
+            "tree": bundle.tree,
+            "hypotheses": bundle.hypotheses,
+            "guardrails": bundle.guardrails,
+            "lessons": bundle.lessons,
+            # The customer-facing identity view. `{}` when nothing is exposable, so a
+            # consumer can tell "no identity published" from "published and blank" -- the
+            # key is always present, its emptiness is the signal (guard-5144 class: read
+            # the content, never mere presence). Projection/redaction happened at the
+            # source in knowledge_projection.project_self; this writer only shapes.
+            "self": bundle.agent_self,
+        }
+    )
     text = json.dumps(payload, indent=2, ensure_ascii=False)
     if out_path:
         Path(out_path).write_text(text, encoding="utf-8")

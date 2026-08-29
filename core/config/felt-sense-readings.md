@@ -1576,3 +1576,37 @@ genuine tilt condition `infra > lane + other` holds **87 > 83**, i.e. marginal,
 not the "infra dominates" reading the boolean invites. `pool` (lane 216 / infra
 1903, lane_pct 9.5) is NOT drift evidence — guard-2379, it counts non-terminal
 goals, not executable candidates.
+
+## 2026-08-29T11:35 — zeta, hostname cc-02, uname -r 6.8.0-137-generic, own-cloud (reducer)
+
+Cadence diff=78 (fires every 75), goals_count 12235. SID bde2c353.
+
+**Lane 2 census** (the coverage line, not just the verdict):
+`2190 candidates — 0 mutated, 0 foreign sid, 0 absent sid, 2 partner`
+`fields: claimed_by 2/2190, claimed_by_sid 2/2190, name-less-sid 0`
+Method rule 6 does NOT apply here and it is worth saying why: the small
+*mutable* count that usually means "the gates are working" is absent — 2188
+were mutable. The limiter was the verify-outcomes step, not ownership,
+because the pending+agent query returns the whole backlog (unclaimed by
+construction). Reading this row as a gates-working datapoint would be wrong
+in both directions. Vantage (method rule 2): reducer reading its own queue,
+and the partner column is 2 — near-zero, matching the "own queue" vantage.
+
+**Lane 7, canonical instrument, both guard-1944 runs:**
+
+| run | lane set | 7d share | 7d work_class | 48h share | 48h work_class |
+|---|---|---|---|---|---|
+| derived-from-strategic-focus | asp-363/364/368/369 | 14.1% | 31.5% | 14.7% | 33.9% |
+| legacy (explicit-flag) | asp-334/335 | 7.6% | 27.7% | 3.7% | 28.4% |
+
+7d composition: lane 26 / infra 102 / other 56 / total 184. floor_pct 33.3.
+
+**Tilt test (rider c) is TRUE in both windows** — `infra > lane + other`:
+7d 102 > 82, 48h 65 > 44. This is the rare genuine condition, not the common
+`ordering_ok: False` false positive that fires whenever `lane <= infra` while
+product (lane+other) still leads.
+
+Note for a successor comparing points: the derived lane set now tracks the
+owner's 2026-08-29 `strategic_focus` rewrite exactly (four boosted lanes), so
+a derived point from before that rewrite is measuring a different lane set.
+The legacy row is the comparable one across the boundary.

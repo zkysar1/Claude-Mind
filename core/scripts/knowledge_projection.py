@@ -57,6 +57,30 @@ FRAMEWORK_TREE_ROOT = "system"
 #: other value ("framework", "specific", or missing) is suppressed — fail closed.
 _EXPOSED_APPLIES_TO = frozenset({"domain", "any"})
 
+#: Front-matter keys of an agent ``self.md`` that may reach a customer. An ALLOWLIST,
+#: fail-closed like every other cut in this module: a key absent from this set is
+#: suppressed whether or not anyone thought about it. Deliberately tiny — the two
+#: dates answer "how current is this identity?", which is the only front-matter
+#: question a customer has. Everything else in that block is framework-internal
+#: (``revision_id``/``previous_revision_id`` are the revision chain, ``source`` is
+#: provenance, and ``last_update_trigger`` is a narrative that cites goal ids, agent
+#: names and internal findings verbatim).
+SELF_EXPOSED_FM_FIELDS = frozenset({"created", "last_updated"})
+
+#: The count keys that represent actual KNOWLEDGE. The broken-export refusal in
+#: knowledge-export's ``main()`` fires when every one of these is zero over a world that
+#: demonstrably holds stores. ``self`` is excluded on purpose: it is projected from the
+#: agent directory, not from the world stores, so it is non-zero on a world whose four
+#: knowledge stores all failed to project. Folding it into that check would let a
+#: genuinely broken export pass the very gate that exists to catch it — the failure
+#: g-368-34 built the refusal for, and the one guard-5144 records 13 sidecars living in.
+KNOWLEDGE_COUNT_KEYS: tuple[str, ...] = ("tree", "hypotheses", "guardrails", "lessons")
+
+#: Cap on the projected purpose text. A self.md runs 44-55 KB; the identity statement
+#: is its opening prose and is far under this. The cap bounds a malformed file, it is
+#: not the filter — :func:`project_self` is.
+_SELF_PURPOSE_CAP = 1200
+
 #: Framework-id shapes stripped from any exposed string. These are internal handles
 #: (reasoning-bank / guardrail / goal ids, script filenames) — noise and mild leakage
 #: to a kid. Order matters: strip compound ids before bare tokens.
@@ -290,6 +314,61 @@ def is_exposed_by_category(entry: Mapping[str, object], allow: frozenset[str]) -
 
 # ── projections (shape-preserving) ───────────────────────────────────────────
 
+def project_self(
+    front_matter: Mapping[str, object] | None,
+    body: str,
+    redactor: "Redactor",
+) -> dict[str, object]:
+    """Project an agent ``self.md`` down to the customer-facing identity view.
+
+    PEARL §10.3 is filter-at-the-source, so the cut is made HERE and the consumer holds
+    no projection logic. ``self.md`` is not domain knowledge — it is the agent's
+    operating identity, and the bulk of it is exactly the "cognitive plumbing" §10.3
+    suppresses: absolute workspace paths, box hostnames, sub-repo tiering,
+    agent-provisionable action lists, revision chains. So this is an allowlist of two
+    dated fields plus ONE bounded slice of prose, and everything else is dropped.
+
+    The prose cut is STRUCTURAL, not a character budget: a ``self.md`` opens with an
+    identity statement and then turns into ``##`` sections, and every one of those
+    sections is plumbing. Taking the text before the first ``##`` therefore yields the
+    identity paragraphs and nothing else, and it stays correct as sections are added
+    or reordered — which a line count or a heading denylist would not.
+
+    The agent's NAME is deliberately absent. :class:`Redactor` already rewrites agent
+    names to "the agent" in every other projected string; emitting the name here would
+    contradict the redaction the rest of the bundle performs.
+
+    Returns ``{}`` when there is nothing exposable — an absent, empty or unreadable
+    ``self.md`` yields no key rather than a hollow one, so a consumer can distinguish
+    "no identity published" from "identity published and blank".
+    """
+    fm = dict(front_matter or {})
+    out: dict[str, object] = {}
+
+    purpose_src = body or ""
+    # Drop a leading "# Heading" line — it is the file's own title ("# Self"), not prose.
+    lines = purpose_src.lstrip("\n").split("\n")
+    if lines and lines[0].startswith("# "):
+        lines = lines[1:]
+    # Cut at the first "##" section: everything from there down is plumbing.
+    cut = next((i for i, ln in enumerate(lines) if ln.startswith("##")), len(lines))
+    purpose = "\n".join(lines[:cut]).strip()
+    if purpose:
+        out["purpose"] = redactor(purpose)[:_SELF_PURPOSE_CAP]
+
+    for key in sorted(SELF_EXPOSED_FM_FIELDS):
+        value = fm.get(key)
+        if value in (None, ""):
+            continue
+        # Dates, like the tree's `last_updated`, are NOT redacted: an ISO date carries
+        # no secret and no agent name, and passing it through the redactor could only
+        # mangle it.
+        out[key] = str(value)
+
+    # A dates-only projection is not an identity — refuse to publish a husk.
+    return out if "purpose" in out else {}
+
+
 @dataclass
 class ProjectedBundle:
     """The kid-facing knowledge view. Shape-preserving; every string already redacted."""
@@ -298,13 +377,23 @@ class ProjectedBundle:
     hypotheses: list[dict[str, object]] = field(default_factory=list)
     guardrails: list[dict[str, object]] = field(default_factory=list)
     lessons: list[dict[str, object]] = field(default_factory=list)
+    #: The customer-facing identity view, or ``{}`` when nothing is exposable. Named
+    #: ``agent_self`` because a dataclass field literally named ``self`` would shadow
+    #: the receiver in every method below; it is emitted under the JSON key ``self``.
+    agent_self: dict[str, object] = field(default_factory=dict)
 
     def counts(self) -> dict[str, int]:
+        # `self` is 0/1, not a length: it is one projected view, not a store. It is in
+        # counts() because guard-5144 makes counts the verification signal for an export
+        # ("read the COUNTS, never just file presence"), so a projection absent from
+        # counts is a projection no verifier can check. It is NOT in
+        # KNOWLEDGE_COUNT_KEYS: see that constant for why the distinction is load-bearing.
         return {
             "tree": len(self.tree),
             "hypotheses": len(self.hypotheses),
             "guardrails": len(self.guardrails),
             "lessons": len(self.lessons),
+            "self": 1 if self.agent_self else 0,
         }
 
 
@@ -315,6 +404,8 @@ def project(
     guardrails: Iterable[Mapping[str, object]],
     hypotheses: Iterable[Mapping[str, object]],
     redactor: Redactor,
+    self_front_matter: Mapping[str, object] | None = None,
+    self_body: str = "",
 ) -> ProjectedBundle:
     """Filter + redact all four stores into a :class:`ProjectedBundle`.
 
@@ -326,6 +417,9 @@ def project(
     allow = domain_categories(nodes)
 
     bundle = ProjectedBundle()
+    # Keyword-only with defaults, so every existing caller keeps its exact behaviour and
+    # gets an empty `agent_self` rather than a changed shape.
+    bundle.agent_self = project_self(self_front_matter, self_body, redactor)
     for n in nodes:
         bundle.tree.append(
             {
@@ -388,5 +482,8 @@ __all__ = [
     "is_exposed_by_category",
     "ProjectedBundle",
     "project",
+    "project_self",
+    "SELF_EXPOSED_FM_FIELDS",
+    "KNOWLEDGE_COUNT_KEYS",
     "FRAMEWORK_TREE_ROOT",
 ]
