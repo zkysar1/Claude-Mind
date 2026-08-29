@@ -227,5 +227,142 @@ def test_quality_loop_still_rejects_outcome_less_evidence(validate):
     assert "g-9" in err and "verification.outcomes" in err
 
 
+# ── : the two halves of the gate must AGREE ────────────────────────
+#
+# The threshold is capped by a qualifying POOL; the quality loop ~15 lines below
+# re-tests the SAME membership conditions in separate code so it can name WHICH
+# goal failed and WHY. That is the  defect reproduced in miniature: add
+# a 4th condition to the loop and the pool over-counts, so the gate silently
+# becomes unsatisfiable again for records failing only the new condition.
+#
+# The coupling is a TEST rather than shared control flow, deliberately. Collapsing
+# the loop into one boolean would trade real diagnostic quality for a cosmetic
+# dedup, and rb-6012's rule is that the halves must AGREE, not that they must
+# share code. The pool half is reached through the REAL predicate imported from
+# each module -- adding a fourth private copy of the conditions here would be the
+# very drift under test (the older helper `_qualifying_ids` above is a third copy,
+# scoped to the arithmetic fixtures and deliberately left alone).
+
+MODULES = [pytest.param(_cli, id="cli"), pytest.param(_daemon, id="daemon")]
+
+# scope floor of 1, so a ONE-goal probe aspiration clears the cardinality check and
+# actually reaches the quality loop. With a higher floor every probe would bounce
+# off "requires >=N" and the test would measure a branch it is not about.
+SOLO_CONFIG = {"min_evidence_by_scope": {"solo": 1}}
+
+# The four refusals the quality loop can emit, in wording common to BOTH copies
+# (the CLI appends "; cannot serve as intent evidence" to the last one).
+LOOP_REASONS = ("not in aspiration", "is recurring", "must be completed",
+                "no verification.outcomes")
+
+# One goal per membership-condition combination. Every non-recurring entry is
+# reached by both halves; the recurring ones are excluded by the pool's own
+# iteration and by the loop's explicit branch.
+CORPUS = [
+    ("completed+outcomes",           "completed", True,  False),
+    ("completed+no-outcomes",        "completed", False, False),
+    ("completed+empty-outcomes",     "completed", None,  False),
+    ("pending+outcomes",             "pending",   True,  False),
+    ("pending+no-outcomes",          "pending",   False, False),
+    ("blocked+outcomes",             "blocked",   True,  False),
+    ("skipped+outcomes",             "skipped",   True,  False),
+    ("recurring+completed+outcomes", "completed", True,  True),
+    ("recurring+pending+no-outcomes","pending",   False, True),
+]
+
+
+def _corpus_goal(gid, status, outcomes, recurring):
+    g = {"id": gid, "status": status, "recurring": recurring}
+    if outcomes is True:
+        g["verification"] = {"outcomes": ["did the thing"]}
+    elif outcomes is None:                      # present but EMPTY -- falsy, must not qualify
+        g["verification"] = {"outcomes": []}
+    return g
+
+
+def _loop_verdict(validate, goal):
+    """Does the QUALITY LOOP accept `goal` as evidence? -> (accepted, err).
+
+    Drives the real validator with `goal` as the sole evidence of a one-goal
+    aspiration. Any refusal is asserted to be a quality-loop refusal that NAMES
+    the goal, so this probe cannot silently measure the cardinality branch or a
+    later check instead -- and that assertion is also what pins the
+    no-diagnostic-regression outcome.
+    """
+    gid = goal["id"]
+    asp = {"id": "asp-agree", "scope": "solo", "motivation": MOTIVATION,
+           "goals": [goal]}
+    block = {"evidence_goal_ids": [gid], "rationale": RATIONALE,
+             "superseded_goal_ids": []}
+    ok, err = validate(asp, block, SOLO_CONFIG)
+    if ok:
+        return True, None
+    assert gid in err, f"loop refusal must name the goal; got: {err}"
+    assert any(r in err for r in LOOP_REASONS), (
+        f"refusal for {gid} did not come from the quality loop -- the probe "
+        f"measured a different branch: {err}")
+    return False, err
+
+
+@pytest.mark.parametrize("mod", MODULES)
+def test_qualifying_pool_agrees_with_quality_loop(mod):
+    """Per-goal agreement between the pool predicate and the quality loop.
+
+    If either half gains a membership condition the other lacks, some corpus goal
+    lands in exactly one of them and this fails -- which is the whole point, since
+    that divergence is silent in production until an aspiration cannot be closed.
+    """
+    qualifies = mod._qualifies_as_intent_evidence
+    validate = mod._validate_intent_satisfaction
+
+    accepted, reasons = [], []
+    for label, status, outcomes, recurring in CORPUS:
+        goal = _corpus_goal(f"g-{label}", status, outcomes, recurring)
+        pool_says = bool(qualifies(goal))
+        loop_says, err = _loop_verdict(validate, goal)
+        assert pool_says == loop_says, (
+            f"{label}: qualifying pool says {pool_says} but the quality loop says "
+            f"{loop_says} -- the two halves of the gate have drifted apart. "
+            f"Loop said: {err}")
+        accepted.append(loop_says)
+        if err:
+            reasons.append(next(r for r in LOOP_REASONS if r in err))
+
+    # Anti-vacuity: a corpus that is all-accept or all-reject would agree with a
+    # predicate stuck at a constant, so the assertions above would prove nothing.
+    assert any(accepted), "corpus must contain at least one ACCEPTED shape"
+    assert not all(accepted), "corpus must contain at least one REJECTED shape"
+
+    # No diagnostic regression: the loop still discriminates BETWEEN conditions
+    # rather than emitting one generic refusal. Checked in addition to -- never
+    # instead of -- the per-goal assertions above, which are what actually fail
+    # when the halves drift (an aggregate can stay green through a defect that
+    # moves a different axis).
+    assert len(set(reasons)) >= 3, (
+        f"quality loop must keep a distinct message per condition; saw only "
+        f"{sorted(set(reasons))}")
+
+
+@pytest.mark.parametrize("mod", MODULES)
+def test_evidence_goal_outside_the_aspiration_is_rejected_by_the_loop_alone(mod):
+    """The loop's in-aspiration check has NO pool counterpart, by construction.
+
+    The pool is built by iterating the aspiration's own goals, so a foreign id can
+    never be in it -- the halves agree trivially. Pinned separately because it is
+    the one loop branch the predicate cannot express (it is a property of the
+    aspiration, not of a goal), and a reader who found it missing from the corpus
+    above would otherwise have to re-derive why.
+    """
+    validate = mod._validate_intent_satisfaction
+    resident = _corpus_goal("g-resident", "completed", True, False)
+    asp = {"id": "asp-agree", "scope": "solo", "motivation": MOTIVATION,
+           "goals": [resident]}
+    block = {"evidence_goal_ids": ["g-ghost"], "rationale": RATIONALE,
+             "superseded_goal_ids": []}
+    ok, err = validate(asp, block, SOLO_CONFIG)
+    assert not ok
+    assert "g-ghost" in err and "not in aspiration" in err
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

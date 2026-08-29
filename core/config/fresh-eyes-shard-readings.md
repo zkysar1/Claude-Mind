@@ -79,3 +79,5 @@ FROZEN block — guard-2516's shape. The durable content here is the SHAPE (whic
 of the file the newest entry sits at, and whether the shard is multi-block); the MAX
 is a timestamp in disguise. Read the shape from this file; read the MAX from the
 probe, every fire.
+
+- **2026-08-28, bravo/cc-05 (Linux 6.8.0-137-generic), N=101.** Three-branch probe returned **100** on BOTH the read-time and the write-time run (g-115-8055), authoritative `backend-cat.sh` copy 61,310 B, byte-identical to the `$WORLD_PATH` mirror. Positive-controlled against the ROWS, not the shard-index table (guard-2421): `grep -n 'N=' | tail` showed `## N=100 — 2026-08-28T18:13` as the last section heading, agreeing with the probe. Shard layout: **oldest-first, newest-LAST** — the section tail is the newest point, so append at EOF. Post-append size **69,124 B**, which at the head banner's measured 2.579 B/token is ~26.8k tokens and therefore **already past the ~25k Read cap**; the inherited "distill advisory ~N=107" is stale and the fold is due at N=102 (recorded in that shard's HANDOFF (g)).

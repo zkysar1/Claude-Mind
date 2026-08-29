@@ -193,15 +193,96 @@ def test_past_expires_at_still_disqualifies(monkeypatch, tmp_path):
 
 def test_unparseable_expires_at_still_disqualifies(monkeypatch, tmp_path):
     """Unparseable was already disqualifying — and must not be recounted as
-    missing. The two buckets drive different follow-up actions."""
+    missing OR as past. THREE buckets, three follow-up actions.
+
+    UPDATED DELIBERATELY (g-115-3537), not deleted. This test previously
+    asserted past_expiry_count == 1 for an unparseable value, which CODIFIED
+    the conflation the goal exists to remove: n_past was computed as
+    len(expired_ref) - n_missing, so every parse_error landed in "expires_at
+    in the past" — a claim about a value that was never compared to anything.
+    The assertion is now inverted: past MUST be 0 and parse_error MUST be 1.
+    """
     ref = {"type": "user_action", "external_id": "pq-junk-01",
            "expires_at": "not-a-timestamp"}
     _, out = _run_check(monkeypatch, tmp_path, [_entry("g-000-05", ref)])
     r = _c3(out)
     assert r is not None
     assert r["missing_expires_at_count"] == 0
-    assert r["past_expiry_count"] == 1
+    assert r["past_expiry_count"] == 0, (
+        "an UNPARSEABLE expires_at was never compared, so nothing is known "
+        f"about whether it is past — it must not be counted there: {r!r}")
+    assert r["parse_error_count"] == 1, r
     assert r["sample"][0].get("parse_error") is True
+    assert "UNPARSEABLE" in r["detail"], (
+        f"the detail line must name the shape, not describe it as past: {r!r}")
+
+
+def test_tz_aware_expires_at_is_compared_not_swallowed(monkeypatch, tmp_path):
+    """guard-4372: a tz-aware stamp must PARSE, not degrade into parse_error.
+
+    This is the case the goal was filed for. `datetime.fromisoformat` accepts
+    "+00:00" fine and then raises TypeError on the comparison to a naive now(),
+    which the fail-open `except` swallowed — so a tz-aware FUTURE expiry (a
+    perfectly valid, unexpired ref) was disqualified and mislabelled "in the
+    past". parse_naive_iso strips the offset at the parse boundary, so the
+    comparison happens for real.
+
+    A tz-aware value arrives via the unvalidated direct-field write path
+    (aspirations.py) that produced 7 of 11 live blocked refs, so this is the
+    reachable shape, not a hypothetical.
+    """
+    future = ((datetime.now() + timedelta(hours=48))
+              .isoformat(timespec="seconds") + "+00:00")
+    ref = {"type": "user_action", "external_id": "pq-tz-01", "expires_at": future}
+    _, out = _run_check(monkeypatch, tmp_path, [_entry("g-000-06", ref)])
+    r = _c3(out)
+    assert r is None, (
+        "a tz-aware FUTURE expiry is unexpired and must not disqualify at all; "
+        f"C3 fired, so the comparison was still being swallowed: {r!r}")
+
+
+def test_tz_aware_PAST_expiry_is_counted_as_past_not_parse_error(monkeypatch, tmp_path):
+    """The other half: tz-aware must not become a free pass either.
+
+    Without this, a fix that routed every tz-aware value into parse_error would
+    pass the test above while silently disabling the expiry check — the same
+    swallowed-comparison defect wearing a different bucket.
+    """
+    past = ((datetime.now() - timedelta(hours=2))
+            .isoformat(timespec="seconds") + "+00:00")
+    ref = {"type": "user_action", "external_id": "pq-tz-02", "expires_at": past}
+    _, out = _run_check(monkeypatch, tmp_path, [_entry("g-000-07", ref)])
+    r = _c3(out)
+    assert r is not None, f"a tz-aware PAST expiry must still disqualify: {out!r}"
+    assert r["past_expiry_count"] == 1, r
+    assert r["parse_error_count"] == 0, (
+        f"it parsed and compared cleanly — this is not a parse error: {r!r}")
+
+
+def test_parse_error_count_DISCRIMINATES_from_past(monkeypatch, tmp_path):
+    """guard-5163: prove the new field differs between the two conflated cases.
+
+    A discriminator added in good faith that happens to take the same value on
+    both branches is decoration — the ambiguity survives behind a field that
+    now reads as a fix. So: build a fixture for EACH case, assert the SHARED
+    old counter cannot tell them apart, and assert the NEW field does.
+    """
+    past = (datetime.now() - timedelta(hours=1)).isoformat(timespec="seconds")
+    _, out_past = _run_check(
+        monkeypatch, tmp_path,
+        [_entry("g-000-08", {"type": "user_action", "external_id": "pq-p",
+                             "expires_at": past})])
+    _, out_junk = _run_check(
+        monkeypatch, tmp_path,
+        [_entry("g-000-09", {"type": "user_action", "external_id": "pq-j",
+                             "expires_at": "not-a-timestamp"})])
+    rp, rj = _c3(out_past), _c3(out_junk)
+    assert rp is not None and rj is not None
+    # Both disqualify identically on the OLD observable — that is the ambiguity.
+    assert len(rp["sample"]) == len(rj["sample"]) == 1
+    # The NEW field is what separates them.
+    assert (rp["past_expiry_count"], rp["parse_error_count"]) == (1, 0), rp
+    assert (rj["past_expiry_count"], rj["parse_error_count"]) == (0, 1), rj
 
 
 def test_missing_and_past_are_reported_separately(monkeypatch, tmp_path):

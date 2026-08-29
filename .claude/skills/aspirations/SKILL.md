@@ -495,7 +495,11 @@ IF signal is not null:
         # mis-match). A sentinel with no producer field (recurring-close.sh, or
         # any pre-g-115-3351 sentinel) keeps the bounded behavior, which is
         # correct for it — there the lookback models a bounded script runtime.
-        Bash: dedup=$(bash core/scripts/wm-read.sh spark_fired_session --json | py -3 core/scripts/spark-fire-dedup.py check {signal.goal_id} --sentinel-set-at "{signal.set_at}" --producer "{signal.producer}")
+        # --diary-file (g-115-4201): set_at/producer decide WHICH close a fire
+        # belongs to; neither helps when there is NO RECORD, and a fire that was
+        # never recorded returns "fire" forever. Rationale + incident: that
+        # script's `check --help`.
+        Bash: dedup=$(bash core/scripts/wm-read.sh spark_fired_session --json | py -3 core/scripts/spark-fire-dedup.py check {signal.goal_id} --sentinel-set-at "{signal.set_at}" --producer "{signal.producer}" --diary-file "agents/$MIND_AGENT/session/execution-diary.jsonl")
         IF dedup == "skip":
             Output: "▸ PENDING-PHASE-6-SPARK: dedup-skip for {signal.goal_id} — spark already fired in-turn (fast-stdout path) at/after this sentinel's set_at; clearing sentinel without re-firing (g-115-1203 / g-115-1404)"
             Bash: `echo 'null' | verified-wm-set.sh pending_phase_6_spark`

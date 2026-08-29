@@ -331,6 +331,69 @@ def test_unrouted_goals_count_as_eligible(focus):
     assert len(gs.emit_strategic_focus_banner(scored, "zeta")) == 1
 
 
+# ------------------------------------------- clause (ii) nominee filter ()
+#
+# The directive excludes recurring goals from what counts as lane work remaining
+# -- "both re-supply continuously from the lane's own cadence and neither is
+# unbuilt product work". The top-pick side of the banner has always applied that
+# field test; the NOMINEE side did not, so the advisory could answer "a routine
+# sweep outranks the lane" by nominating another routine sweep. Measured
+# 2026-08-08 (bravo, cc-05): it nominated recurring  over recurring
+#  and prescribed --deviation meta-tiebreaker for the swap, which files
+# a directive-compliance record for work the directive excludes and pollutes the
+# Layer-C deviation audit.
+
+
+def test_recurring_lane_goal_is_never_nominated_as_the_product_substitute(
+        focus, capsys):
+    """The defect case. A recurring lane candidate outranks a non-recurring one,
+    so the pre-fix `next(...)` picked the recurring goal purely because it came
+    first. Both are present deliberately: with only the recurring one the test
+    could pass against a filter that broke nomination outright."""
+    focus({"strategic_focus": {"primary": LIVE_PRIMARY}})
+    scored = [_c("g-115-831", 12.0, recurring=True, title="Recurring: tripwire"),
+              _c("g-335-658", 11.0, asp="asp-335", recurring=True, ia="zeta",
+                 title="Recurring: cross-repo audit"),
+              _c("g-335-285", 10.0, asp="asp-335", ia="zeta",
+                 title="Build the parity surface")]
+    warnings = gs.emit_strategic_focus_banner(scored, "zeta")
+    assert len(warnings) == 1, "a valid non-recurring nominee exists -- still fire"
+    err = capsys.readouterr().err
+    assert "g-335-285" in err, "the non-recurring lane goal is the only nominee"
+    assert "g-335-658" not in err, (
+        "clause (ii): a recurring lane goal is not unbuilt product work, so "
+        "nominating it swaps one routine sweep for another")
+    assert "2.0" in err, "the gap must be measured against the NOMINEE, not the "\
+                         "higher-scoring goal that was filtered out"
+
+
+def test_banner_is_silent_when_every_lane_candidate_is_recurring(focus, capsys):
+    """With no non-recurring lane candidate the directive's outrank rule has no
+    valid target, so the correct output is silence -- not a nomination. This is
+    the conclusion bravo reached by hand on 2026-08-08 and then had to argue for
+    in prose; here it is the code path."""
+    focus({"strategic_focus": {"primary": LIVE_PRIMARY}})
+    scored = [_c("g-115-831", 12.0, recurring=True, title="Recurring: tripwire"),
+              _c("g-335-658", 11.0, asp="asp-335", recurring=True, ia="zeta")]
+    assert gs.emit_strategic_focus_banner(scored, "zeta") == []
+    assert "STRATEGIC-FOCUS" not in capsys.readouterr().err
+
+
+def test_clause_ii_did_not_leak_into_the_scalar_boost(focus):
+    """Clause (ii) belongs to the ADVISORY, not to the ranking. strategic_focus_
+    boost takes (asp_id, completion_ratio) and has no access to `recurring` at
+    all, so it cannot discriminate -- pinned here because the obvious next 'fix'
+    is to extend the exclusion to the boost, which would silently down-rank every
+    recurring lane goal and change selection rather than advice."""
+    focus({"strategic_focus": {"primary": LIVE_PRIMARY}})
+    import inspect
+    params = list(inspect.signature(gs.strategic_focus_boost).parameters)
+    assert params == ["asp_id", "completion_ratio"], (
+        f"boost signature changed to {params} -- if `recurring` was threaded in, "
+        "clause (ii) has escaped the advisory and now moves the ranking")
+    assert gs.strategic_focus_boost("asp-335", 0.5) > 0
+
+
 @pytest.mark.parametrize("scored,agent", [
     ([], "zeta"),
     ([_c("g-1", 1.0)], ""),

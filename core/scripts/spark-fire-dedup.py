@@ -119,6 +119,29 @@ UNBOUNDED_LOOKBACK = None
 # bounded MAX_BG_CLOSE_DURATION_MIN path, so this is backward-compatible.
 NONRECURRING_PRODUCER = "nonrecurring-state-update"
 
+#  (echo's addendum, cc-03, 2026-08-05). SECOND, INDEPENDENT failure
+# mode of `check`, and the one the close_id fix this goal originally prescribed
+# does NOT reach: the fire HAPPENED and was NEVER RECORDED, so every window in
+# the world returns 'fire' — a correct verdict about the RECORD and a wrong one
+# about REALITY. Measured: sentinel for  consumed at 05:31 with
+# spark_fired_session holding no  key at all, while the execution diary
+# carried ` | phase-6-spark` phase_start AND phase_end at 04:53. The
+# write-side probe read the same absent key, so BOTH sides agreed and both were
+# wrong. Cost: one full redundant Phase-6 re-fire, which would have
+# double-counted times_asked across all 20 active spark questions into the
+# yield_rate denominators that drive the retire/promote review.
+#
+# WHY A RECORD GOES MISSING: it is written by aspirations-spark Step 0.5 — one
+# bash line at the top of a long LLM-executed skill. Compliance measured 3 of 4
+# on the observed session. A missed RECORD and a missed FIRE are indistinguishable
+# at this check and demand OPPOSITE actions, so no amount of care on the WM side
+# can decide it; only a signal with a DIFFERENT WRITER can.
+#
+# The execution diary is that signal: script-written (execution-diary.sh, not the
+# LLM), keyed by goal_id, already on disk. This is the phase value its rows carry
+# for a Phase-6 spark.
+DIARY_PHASE = "phase-6-spark"
+
 
 def _parse_dt(value):
     """Parse an ISO timestamp; return None on any failure (guard-420 pattern:
@@ -193,6 +216,51 @@ def fired_in_consumption_window(fired_map, goal_id, set_at,
     return lo <= ts <= hi
 
 
+def diary_fired_at(lines, goal_id, phase=DIARY_PHASE):
+    """Latest timestamp at which the execution diary records `phase` for
+    goal_id, or None when there is no such row (g-115-4201).
+
+    PURE by the same contract as every other helper here: it takes an ITERABLE
+    OF JSONL STRINGS, never a path, so the decision logic is unit-testable with
+    no filesystem. The single `open()` lives in the CLI layer below.
+
+    LATEST, not first: a recurring goal can carry markers from several closes,
+    and only the most recent one can be THIS close's. The caller then runs it
+    through the SAME consumption window as a real record, so a marker from a
+    genuine previous close falls outside the window and still fires — the diary
+    gets no privilege the WM record does not have.
+
+    Fail-open at every layer, matching this module's asymmetry: a non-string
+    line, an unparseable row, a row that is not a dict, a missing/renamed field
+    or an unparseable timestamp are all SKIPPED, and an input with nothing
+    usable returns None -> no corroboration -> 'fire'. A dedup bug must never
+    SUPPRESS a spark.
+    """
+    latest = None
+    for line in lines or ():
+        if not isinstance(line, str):
+            continue
+        stripped = line.strip()
+        # Cheap prefilter before the json parse: the diary is a few thousand
+        # rows and only a handful ever mention a spark phase.
+        if not stripped or goal_id not in stripped or phase not in stripped:
+            continue
+        try:
+            row = json.loads(stripped)
+        except Exception:
+            continue
+        if not isinstance(row, dict):
+            continue
+        if row.get("goal_id") != goal_id or row.get("phase") != phase:
+            continue
+        ts = _parse_dt(row.get("timestamp"))
+        if ts is None:
+            continue
+        if latest is None or ts > latest:
+            latest = ts
+    return latest
+
+
 def already_fired_this_close(fired_map, goal_id):
     """WRITE-SIDE dedup (): True iff goal_id has a parseable entry in
     the spark_fired_session map at all — no time comparison of any kind.
@@ -262,6 +330,35 @@ def _now():
     return datetime.now()
 
 
+def _read_diary_lines(path):
+    """Read an execution-diary JSONL into a list of lines. The ONLY file read in
+    this module.
+
+    NOT a breach of the pure-stdin contract in the module docstring, and the
+    distinction matters: that contract exists because a python process must not
+    spawn `bash wm-*.sh` (rb-225 / rb-247 — the wm slot getter/setter are DAEMON
+    wrappers reached THROUGH bash, and that subprocess hangs on this platform).
+    The execution diary is a plain local JSONL file, so reading it needs no
+    subprocess at all. The DECISION logic stays pure — `diary_fired_at` takes
+    lines, not a path — so nothing about the unit tests changes.
+
+    Reading the file whole is deliberate rather than a tail scan: the largest
+    live diary measured across the fleet is 644 KB / 2,766 rows (alpha, cc-07,
+    2026-08-28), which is single-digit milliseconds, and a tail bound would be a
+    PROXY for "recent" that a chatty iteration can push a relevant marker past.
+
+    Fail-open: a missing path, an unreadable file, or any OS error yields [] ->
+    no corroboration -> 'fire'.
+    """
+    if not path:
+        return []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.readlines()
+    except OSError:
+        return []
+
+
 def _read_stdin_map():
     """Read the current spark_fired_session map from stdin (JSON). Treats
     empty / 'null' / malformed input as {} — fail-open (the wm slot getter
@@ -288,6 +385,23 @@ def cmd_record(args):
 def cmd_check(args):
     fired = _read_stdin_map()
     set_at = _parse_dt(getattr(args, "sentinel_set_at", None))
+    # CORROBORATION FOR AN ABSENT RECORD (). Consulted ONLY when the
+    # WM map has no parseable entry for this goal — a present record is
+    # authoritative and the diary may never override it, in either direction.
+    # The diary timestamp is then substituted INTO the map and runs through the
+    # unchanged window logic below, so it inherits every producer semantic a
+    # real record has: bounded lookback on the recurring path, unbounded on the
+    # non-recurring one, upper bound at set_at + TTL. That is what stops a
+    # marker from a genuine PREVIOUS close of a recurring goal counting as this
+    # close's consumption — the diary gets no privilege the record lacks.
+    # Fail-open is UNCHANGED and is the whole safety argument: absent record AND
+    # absent diary marker still prints 'fire', exactly as before this existed.
+    if _parse_dt(fired.get(args.goal_id)) is None:
+        diary_ts = diary_fired_at(
+            _read_diary_lines(getattr(args, "diary_file", None)), args.goal_id)
+        if diary_ts is not None:
+            fired = dict(fired)
+            fired[args.goal_id] = diary_ts.isoformat(timespec="seconds")
     if set_at is not None:
         # PRIMARY path (): consumption-based — is the recorded fire
         # inside THIS sentinel's consumption window? The window brackets set_at
@@ -366,6 +480,17 @@ def main(argv=None):
                          "span, and a non-recurring goal closes exactly once so any recorded "
                          "fire is necessarily this close's. Absent/other (recurring-close.sh, "
                          "or a pre-g-115-3351 sentinel) keeps the bounded behavior.")
+    pc.add_argument("--diary-file", default=None,
+                    help="path to the executing agent's execution-diary.jsonl. Consulted ONLY "
+                         "when spark_fired_session has no entry for the goal (g-115-4201): the "
+                         "WM record is written by aspirations-spark Step 0.5, which is "
+                         "LLM-discretionary, so an ABSENT record cannot distinguish 'Phase 6 "
+                         "never ran' from 'Phase 6 ran and did not record it' -- and those demand "
+                         "OPPOSITE actions. The diary has a DIFFERENT (script) writer and is keyed "
+                         "by goal_id, so a `phase-6-spark` row for this goal decides it. The "
+                         "timestamp found is run through the SAME consumption window as a real "
+                         "record, so it earns no privilege a record lacks. Omitting the flag, or "
+                         "an unreadable file, changes nothing: no corroboration -> 'fire'.")
     pc.set_defaults(func=cmd_check)
     pf = sub.add_parser("fired", help="stdin=current map JSON; stdout=write|skip-write[\\tgap_seconds] "
                                       "(write-side sentinel gate, g-115-3351)")

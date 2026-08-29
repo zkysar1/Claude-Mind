@@ -310,9 +310,19 @@ the SELECTION showing through rather than a signal about the strategy. Measured
 2026-07-31 (foxtrot, g-001-05): a 10-record batch read as a strong calibration signal;
 re-measuring the same signatures across all 252 resolved records showed it was a
 selection artifact, and the lesson was retracted before it was encoded. Before emitting
-any rate or divergence as a finding, re-measure it over the unfiltered resolved corpus,
-or state explicitly that the number is batch-scoped and not comparable to a corpus
-average. A guardrail cannot outvote the instrument it guards — guard-2129 sits in the
+any rate or divergence as a finding, re-measure it over the CORPUS — the union of
+`pipeline-read.sh --stage resolved` AND `pipeline-read.sh --stage archived` — or state
+explicitly that the number is batch-scoped and not comparable to a corpus average.
+`--stage resolved` ALONE IS A SURVIVORSHIP FILTER, not the corpus; the wording
+that stood here until 2026-08-28 invited exactly that read.
+Measured that day (echo, cc-03): resolved=45 vs archived=1397, union=1442 at ZERO
+overlap — resolved-only is 3.1% of the corpus, and records migrate OUT of resolved as
+they age, so a resolved-only read is blind to the long-lived evidence BY CONSTRUCTION.
+It has already produced one false conclusion here (g-115-5211, "Step 3.6 has never
+fired": 0 of 71 on resolved, 114 of 1007 on the union). `--replay-candidates` is not the
+corpus either — guard-2148 measured it +22.9pp accuracy-inflated, dominated by the
+encoded_via_chronic filter, which excludes a population that is 100% CORRECTED.
+A guardrail cannot outvote the instrument it guards — guard-2129 sits in the
 guardrail store, and this paragraph is the instrument.
 
 **THE CORPUS RE-MEASUREMENT IS NOT SELF-INTERPRETING — RUN A MEANINGLESS-MARKER CONTROL
@@ -581,9 +591,25 @@ re-measure the gap rather than inheriting it, and keep naming the population on 
    Flag: "N of M corrected hypotheses shared condition X"
 
 2. STRATEGY PERFORMANCE by pattern signature:
-   For each pattern signature matched in this batch:
-     Calculate: matches attempted, matches confirmed, accuracy
-   Flag any signature where accuracy diverges > 10pp from its historical average
+   ⚠ "matched in this batch" HAS NO FIELD TO READ. Measured 2026-08-06 (zeta),
+   re-confirmed 2026-08-28 (echo): NO pipeline record carries a pattern-signature
+   reference — the only signal-ish keys are origin_signal / resolution_signal /
+   settling_signal. This step is not usually-empty, it is structurally unreachable
+   from the pipeline store, so a number here is not a small sample — it is no sample.
+   USE THE JOIN THAT EXISTS rather than inventing one:
+     - retrieved-and-applied signatures → aspirations-spark Phase 6.5's
+       pattern-outcome block, joined via retrieval-session.json supplementary_detail
+     - hypothesis-linked signatures → reflect-on-outcome's ABC chains
+   Both are wired and working; the gap is specific to the replay-batch path.
+   Then, for each signature the join returns: matches attempted, matches confirmed,
+   accuracy; flag divergence > 10pp from historical. Read guard-4715 FIRST —
+   outcome_stats counters are NOT monotonic (a reset truncates any rate over them),
+   so diff history.py snapshots rather than reading counters live.
+   PRICED so the next reader need not re-derive it: the alternative remedy — stamp a
+   signature ref onto each pipeline record at formation — needs a store-spec change,
+   a formation-time writer, and a backfill over 1442 records, and spec.validate runs
+   over the WHOLE record (guard-2475). That is the expensive branch; this is the
+   cheap one, and it is sufficient for what Step 3 actually asks.
 
 3. TEMPORAL PATTERNS:
    Check: does batch position correlate with accuracy?

@@ -1693,6 +1693,15 @@ pull_boost:
                             # renamed key degrades to a loud SKIP-no-goal rather than silently stamping
                             # the wrong record.
 
+fan_in_boost:
+  enabled: true             # no-regression comes from the blocked_by REQUIREMENT (a goal nothing waits on gets no map entry and is scored byte-identically), not from this flag
+  per_dependent: 1.2        # MEASURED, not picked: weighted exploration_noise is ~U(0, 1.220) over 100% of candidates (cc-07, 1368 candidates, 2026-08-28). The acceptance bar is a goal with 3 HIGH dependents outranking a SAME-PRIORITY lane goal, whose deterministic deficit is ~0, so the boost need only clear the NOISE WIDTH: 3 x 1.2 = 3.6 clears 1.220 about threefold (guard-1895 (2)).
+  cap: 4.0                  # holds the total BELOW directive_boost's 4.5 raw max so a fresh USER directive still outranks a machine-derived fan-in — the same ordering argument pull_boost and starvation_boost make for their own 4.0. NOTE the guard-1895 (3) tradeoff accepted here: at >=4 HIGH dependents the lift saturates, so intra-cohort order above the cap is decided by the terms below it rather than by degree of fan-in. That is deliberate — an uncapped graph term would outrank a user directive, which is worse.
+  priority_weights:         # what one LIVE dependent is worth, by ITS priority. Only non-terminal dependents count, so the lift decays structurally as they close — no signal to clear, hence no lost-clear failure mode and no max_age valve needed (contrast pull_boost).
+    HIGH: 1.0
+    MEDIUM: 0.5
+    LOW: 0.25
+
 # --- PRODUCTIVITY SELF-STOP GATE (Item 2) ---
 # Composite productivity score computed at end of each iteration (via
 # iteration-close.sh → productivity-stop-gate.sh). If the agent is padding the

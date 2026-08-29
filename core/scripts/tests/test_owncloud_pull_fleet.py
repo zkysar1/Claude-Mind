@@ -334,3 +334,73 @@ if __name__ == "__main__":
     test_do_call_appends_with_temp_using_the_exact_param_name()
     test_do_call_with_temp_absent_by_default()
     print("ok")
+
+
+# ---  ITEM A: the GENERIC failure branch --------------------------
+# MEASURED 2026-08-28 (alpha worker Body, cc-07), and it corrects this goal's
+# own premise: item A asked for failure-isolation coverage as though none
+# existed, but test_a_timed_out_agent_is_isolated_and_the_roster_continues (rc=4)
+# and test_an_absent_daemon_still_aborts_the_whole_sweep (rc=3) already assert
+# BOTH halves — survivors by id AND the named stderr diagnostic. What was
+# genuinely uncovered is the `*)` catch-all: rc=2, a daemon ERROR, which is the
+# most common real per-agent failure and the only isolated branch with no test.
+#
+# The distinction is not cosmetic. rc=3 ABORTS the sweep and rc=2 ISOLATES it,
+# and they are three lines apart in one `case` statement — a mutant that moves
+# rc=2 into the abort arm silently converts one bad agent into a fleet-wide
+# blindness, which is exactly the failure  exists to prevent.
+
+def test_a_generic_agent_failure_is_isolated_and_named():
+    """rc=2 (daemon error): count it, name it, keep going — do NOT abort."""
+    r = _run_fleet_block(
+        'printf "alpha\\nbravo\\nzeta\\n"',
+        pull_stub='echo "$1" >> "$TOUCHED"; [ "$1" = "bravo" ] && return 2; return 0',
+    )
+    assert r.returncode != 0, (
+        "a failed agent must make the sweep exit nonzero or a partial refresh "
+        f"reads as a clean one: {r.stdout!r} {r.stderr!r}")
+    assert r.attempted == ["alpha", "bravo", "zeta"], (
+        "every roster entry must be ATTEMPTED after a generic failure — this is "
+        "the direct evidence the sweep isolated rather than aborted, and the "
+        f"assertion a summary-line check cannot make: {r.attempted!r}")
+    assert "agent=bravo FAILED (rc=2" in r.stderr, (
+        "the failure must be NAMED with its agent and rc — a silently swallowed "
+        f"failure is the blindness this branch exists to prevent: {r.stderr!r}")
+    assert "no-daemon" not in r.stderr, (
+        "rc=2 is a per-agent daemon ERROR, not an ABSENT daemon; reaching "
+        f"rt_no_daemon_error here would abort the whole sweep: {r.stderr!r}")
+    assert "2 agent(s) pulled, 1 failed" in r.stdout, (
+        f"expected 2 pulled / 1 failed: {r.stdout!r}")
+
+
+def test_the_LAST_agent_failing_still_reports_the_failure():
+    """Position matters: a failure on the final roster entry must still count.
+
+    An off-by-one in the summary (reporting counts gathered before the last
+    iteration) would leave this green in every other test — the failure is
+    always seeded mid-roster there — while under-reporting exactly the case
+    where the operator has no later line to notice something went wrong.
+    """
+    r = _run_fleet_block(
+        'printf "alpha\\nbravo\\nzeta\\n"',
+        pull_stub='echo "$1" >> "$TOUCHED"; [ "$1" = "zeta" ] && return 2; return 0',
+    )
+    assert r.returncode != 0, f"{r.stdout!r} {r.stderr!r}"
+    assert r.attempted == ["alpha", "bravo", "zeta"]
+    assert "agent=zeta FAILED (rc=2" in r.stderr, r.stderr
+    assert "2 agent(s) pulled, 1 failed" in r.stdout, (
+        f"a failure on the LAST entry must still be counted: {r.stdout!r}")
+
+
+def test_every_agent_failing_does_not_report_a_clean_sweep():
+    """guard-963: an aggregator must never report clean when zero items succeeded."""
+    r = _run_fleet_block(
+        'printf "alpha\\nbravo\\nzeta\\n"',
+        pull_stub='echo "$1" >> "$TOUCHED"; return 2',
+    )
+    assert r.returncode != 0
+    assert r.attempted == ["alpha", "bravo", "zeta"], (
+        f"isolation must hold even when EVERY agent fails: {r.attempted!r}")
+    assert "0 agent(s) pulled, 3 failed" in r.stdout, (
+        "a total failure must be reported as such, not as a clean or partial "
+        f"sweep: {r.stdout!r}")

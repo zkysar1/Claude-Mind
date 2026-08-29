@@ -99,6 +99,32 @@ for i, m in enumerate(muts):
     if have_old == have_sed:
         sys.stderr.write(f"ERROR: mutation {name}: provide exactly one of sabotage_old / sabotage_sed\n")
         sys.exit(2)
+    # REFUSE a multi-line sabotage rather than silently flattening it (rb-6196).
+    # The row below is a \x1f-separated TSV so the driving loop can stay pure
+    # bash, and `read` is line-based -- so newlines structurally CANNOT survive
+    # that bridge. Every field is newline-stripped, sabotage_old included.
+    # Measured (zeta, cc-02): a 7-mutation plan returned 4 survivors, all reading
+    # "sabotage-old string not found in target". The split was a perfect
+    # partition on LINE COUNT -- every single-line sabotage killed, every
+    # multi-line one "not found". That message is honest about the OUTCOME and
+    # MISLEADING about the CAUSE: it reads as "your anchor is stale", so the next
+    # move is re-deriving an anchor that was never wrong. The worse branch is
+    # reading N survivors as N real gaps and "fixing" correct tests.
+    # sabotage_sed is the working multi-line escape hatch -- the EXPRESSION stays
+    # single-line while sed does the multi-line work (`/anchor/{N;d}` for a
+    # two-line delete). All four measured failures re-expressed successfully.
+    for _f in ("sabotage_old", "sabotage_new", "sabotage_sed"):
+        if "\n" in (m.get(_f) or ""):
+            sys.stderr.write(
+                f"ERROR: mutation {name}: {_f} contains a newline. This plan is "
+                "flattened into a newline-separated TSV, so a multi-line value "
+                "cannot survive and would fail later as a misleading "
+                "sabotage-old-string-not-found-in-target error. Use sabotage_sed, "
+                "whose expression stays single-line while sed does the "
+                "multi-line work: /<anchor>/{{N;d}} deletes two lines, or chain "
+                "single-line s/// commands. Escape bracket literals; BRE reads "
+                "a bare [1] as a bracket expression.\n")
+            sys.exit(2)
     target = m.get("target") or p.get("target")
     test_cmd = m.get("test_cmd") or p.get("test_cmd")
     if not target or not test_cmd:
