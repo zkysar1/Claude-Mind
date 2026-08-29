@@ -26,7 +26,7 @@ RECENT=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help)
-            echo "Usage: reasoning-bank-read.sh (--id <id> | --category <cat> | --tag <tag> | --recent [N] | --active | --universal | --summary)"
+            echo "Usage: reasoning-bank-read.sh (--id <id> | --category <cat> | --tag <tag> | --recent [N] | --active | --universal | --summary | --count)"
             exit 0;;
         --id)
             REC_ID="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
@@ -44,6 +44,8 @@ while [[ $# -gt 0 ]]; do
         --active)      FLAG_KEYS+=(active);    shift;;
         --universal)   FLAG_KEYS+=(universal); shift;;
         --summary)     FLAG_KEYS+=(summary);   shift;;
+        # --count: record count only (). See guardrails-read.sh.
+        --count)       FLAG_KEYS+=(count);     shift;;
         *)
             # : this arm was `PASSTHROUGH+=("$1"); shift` — a dead
             # accumulator that fed the Python CLI fallback deleted in the
@@ -54,7 +56,7 @@ while [[ $# -gt 0 ]]; do
             # loop's audits read through daily. Refuse loudly instead. Exit 2
             # SPECIFICALLY (the _argv_strict.sh convention): the daemon path
             # also exits 1, so a test pinning this refusal needs a distinct rc.
-            argv_strict_refuse_unknown "reasoning-bank-read.sh" "$1" "--id <id> | --category <cat> | --tag <tag> | --recent [N] | --active | --universal | --summary";;
+            argv_strict_refuse_unknown "reasoning-bank-read.sh" "$1" "--id <id> | --category <cat> | --tag <tag> | --recent [N] | --active | --universal | --summary | --count";;
     esac
 done
 

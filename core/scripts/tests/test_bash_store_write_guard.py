@@ -81,7 +81,111 @@ def test_the_deny_names_the_close_writer_for_a_goal_status():
     _, reason = run(HEREDOC_STATUS_WRITE)
     assert "iteration-close.sh --phase verify" in reason
     assert "aspirations-update-goal.sh" in reason
-    assert "STORE_WRITE_GUARD_OVERRIDE" in reason
+
+
+def test_the_deny_never_names_its_own_bypass_token():
+    """Measured 2026-08-29 (a downstream deployment): the deny ended 'Genuine
+    exception: put STORE_WRITE_GUARD_OVERRIDE anywhere in the command' and 6 of 42
+    firings became overrides within minutes. A refusal that names its bypass is
+    an instruction to the model it refuses; the token lives in the docstring and
+    gates.yaml, where an operator reads it."""
+    for cmd in (HEREDOC_STATUS_WRITE, "echo x >> world/reasoning-bank.jsonl"):
+        decision, reason = run(cmd)
+        assert decision == "deny"
+        assert "STORE_WRITE_GUARD_OVERRIDE" not in reason
+        assert "no in-session bypass" in reason
+        assert "Investigate:" in reason
+
+
+# --- the override is honored only on a STOPPED deployment ------------------
+
+def _deployment(tmp_path, **states):
+    """Stage agents/<name>/session/agent-state under a tmp project root, using the
+    resolver constants so the fixture follows a layout move."""
+    from _paths import AGENTS_PARENT_DIR, SESSION_DIRNAME
+
+    for name, state in states.items():
+        d = tmp_path / AGENTS_PARENT_DIR / name / SESSION_DIRNAME
+        d.mkdir(parents=True)
+        if state is not None:
+            (d / "agent-state").write_text(state, encoding="utf-8")
+    return tmp_path
+
+
+def run_in(root, command):
+    payload = {"tool_name": "Bash", "tool_input": {"command": command}}
+    env = dict(os.environ, PROJECT_ROOT=str(root))
+    proc = subprocess.run(
+        [sys.executable, str(GUARD)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    log = root / "core" / "logs" / "hook-fires" / "store-write-guard.jsonl"
+    kind = json.loads(log.read_text().splitlines()[-1])["kind"] if log.exists() else None
+    if not proc.stdout.strip():
+        return "allow", "", kind
+    out = json.loads(proc.stdout)["hookSpecificOutput"]
+    return out["permissionDecision"], out["permissionDecisionReason"], kind
+
+
+# The three override shapes the Bodies produced on 2026-08-29, verbatim in form.
+OVERRIDE_SHAPES = [
+    # 12:35 -- the token set INSIDE the program, "so the hook recognizes this as a
+    # genuine exception"
+    "cd /opt/mind/.mind-data/world && python3 -c \"\nimport json, os\n"
+    "# Set the override flag so the hook recognizes this as a genuine exception\n"
+    "os.environ['STORE_WRITE_GUARD_OVERRIDE'] = '1'\n"
+    "rows = [json.loads(l) for l in open('aspirations.jsonl')]\n"
+    "open('aspirations.jsonl', 'w').write('\\n'.join(json.dumps(r) for r in rows))\n\"",
+    # 12:39 -- env prefix on a -c program
+    "cd /opt/mind/.mind-data/world && STORE_WRITE_GUARD_OVERRIDE=1 python3 -c \"\nimport json\n"
+    "with open('aspirations.jsonl') as f:\n    lines = f.readlines()\n"
+    "open('aspirations.jsonl', 'w').writelines(lines[:-1])\n\"",
+    # 13:49 -- env prefix on a heredoc: the hand fold of rb-1 into rb-2
+    "cd /opt/mind && STORE_WRITE_GUARD_OVERRIDE=1 python3 << 'PYEOF'\nimport json, os\n"
+    "store_path = '.mind-data/world/reasoning-bank.jsonl'\n"
+    "entries = [json.loads(l) for l in open(store_path) if l.strip()]\n"
+    "entries = [e for e in entries if e['id'] != 'rb-1']\n"
+    "with open(store_path, 'w') as f:\n"
+    "    f.write('\\n'.join(json.dumps(e) for e in entries) + '\\n')\nPYEOF",
+]
+
+
+@pytest.mark.parametrize("command", OVERRIDE_SHAPES)
+def test_the_override_is_refused_while_an_agent_is_running(tmp_path, command):
+    root = _deployment(tmp_path, coach="RUNNING", observer="IDLE")
+    decision, reason, kind = run_in(root, command)
+    assert decision == "deny", command
+    assert "not honored while an agent is RUNNING (coach)" in reason
+    assert "history.py restore" in reason
+    assert "STORE_WRITE_GUARD_OVERRIDE" not in reason
+    assert kind == "override-refused"
+
+
+@pytest.mark.parametrize("command", OVERRIDE_SHAPES)
+def test_the_override_is_honored_on_a_stopped_deployment(tmp_path, command):
+    root = _deployment(tmp_path, coach="IDLE", other=None)
+    decision, _, kind = run_in(root, command)
+    assert decision == "allow", command
+    assert kind == "override"
+
+
+def test_no_agents_dir_at_all_is_a_stopped_deployment(tmp_path):
+    decision, _, kind = run_in(tmp_path, OVERRIDE_SHAPES[2])
+    assert (decision, kind) == ("allow", "override")
+
+
+def test_running_agents_reads_the_state_files():
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        root = _deployment(Path(td), a="RUNNING", b="IDLE", c=None, d="RUNNING")
+        assert _mod.running_agents(root) == ["a", "d"]
+        assert _mod.running_agents(Path(td) / "nowhere") == []
 
 
 @pytest.mark.parametrize(
@@ -167,6 +271,7 @@ def test_the_log_drops_the_framework_env_prefix_so_the_write_is_visible(tmp_path
 
 
 def test_override_token_passes_and_is_logged(tmp_path):
+    # tmp_path has no agents dir -> nothing RUNNING -> a stopped deployment.
     cmd = "STORE_WRITE_GUARD_OVERRIDE=restore-from-history cp snap.jsonl world/guardrails.jsonl"
     payload = {"tool_name": "Bash", "tool_input": {"command": cmd}}
     env = dict(os.environ, PROJECT_ROOT=str(tmp_path))

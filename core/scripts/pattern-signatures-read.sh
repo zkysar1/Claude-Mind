@@ -23,13 +23,15 @@ REC_ID=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help)
-            echo "Usage: pattern-signatures-read.sh (--id <id> | --all | --active | --summary)"
+            echo "Usage: pattern-signatures-read.sh (--id <id> | --all | --active | --summary | --count)"
             exit 0;;
         --id)
             REC_ID="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
         --all)      FLAG_KEYS+=(all); shift;;
         --active)   FLAG_KEYS+=(active); shift;;
         --summary)  FLAG_KEYS+=(summary); shift;;
+        # --count: record count only (). See guardrails-read.sh.
+        --count)    FLAG_KEYS+=(count);   shift;;
         *)
             # : this arm silently appended to a dead PASSTHROUGH
             # accumulator (fed the pre-2026-05-14 CLI fallback, read by nothing
@@ -37,7 +39,7 @@ while [[ $# -gt 0 ]]; do
             # WRONG population with rc=0 (the rb-245 authoritative-false-count
             # shape). Refuse loudly. Exit 2 per the _argv_strict.sh convention
             # (the daemon path exits 1, so tests need a distinct rc).
-            argv_strict_refuse_unknown "pattern-signatures-read.sh" "$1" "--id <id> | --all | --active | --summary";;
+            argv_strict_refuse_unknown "pattern-signatures-read.sh" "$1" "--id <id> | --all | --active | --summary | --count";;
     esac
 done
 
@@ -51,7 +53,7 @@ for key in "${FLAG_KEYS[@]+"${FLAG_KEYS[@]}"}"; do
 done
 
 if [ -z "$QUERY" ]; then
-    echo "Error: at least one filter is required (--id, --all, --active, --summary)." >&2
+    echo "Error: at least one filter is required (--id, --all, --active, --summary, --count)." >&2
     exit 1
 fi
 rc=0

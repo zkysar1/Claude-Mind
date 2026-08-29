@@ -130,16 +130,44 @@ def daemon_import_surface() -> set[str]:
     return closure
 
 
-def pathspec_entries() -> set[str]:
-    """Parse the pathspec OUT of the shell script — never restate it here.
+def _pathspec_tokens() -> list[str]:
+    """The DAEMON_PATHSPEC entries, read OUT of the shell script — never restated.
 
     A second copy of the list in this file would just be a new thing to drift.
     The script is the single source of truth; this test reads it.
+
+    Reads the `DAEMON_PATHSPEC=( ... )` ARRAY, not the `git diff` line the array is
+    expanded into. g-115-3587 hoisted the list into that array and left the diff
+    invocation holding only `"${DAEMON_PATHSPEC[@]}"`, so the previous regex over the
+    diff block matched a 45-byte span containing no paths at all and every derived set
+    came back EMPTY — every daemon module then read as uncovered and this file reported
+    all 77 as missing (g-115-8287). Parse the declaration, not a use site.
     """
     text = PREDICATE.read_text(encoding="utf-8")
-    block = re.search(r'diff --name-only "\$BASE" HEAD --(.*?)2>&1\)', text, re.S)
-    assert block, "could not locate the git-diff pathspec block in the predicate"
-    return set(re.findall(r"core/scripts/([A-Za-z0-9_*]+)\.py", block.group(1)))
+    block = re.search(r"^DAEMON_PATHSPEC=\((.*?)^\)", text, re.S | re.M)
+    assert block, (
+        f"could not locate the DAEMON_PATHSPEC array in {PREDICATE.name}. The pathspec "
+        f"declaration moved again — fix THIS parser; do not restate the list here."
+    )
+    tokens: list[str] = []
+    for line in block.group(1).splitlines():
+        line = line.split("#", 1)[0].strip().strip("\\").strip()
+        if line:
+            # The single quotes on `_*.py` are load-bearing IN THE SHELL (they stop
+            # glob expansion at array-construction time); git receives the bare
+            # pattern, so strip them to get the pathspec as git actually sees it.
+            tokens.append(line.strip("'\""))
+    return tokens
+
+
+def pathspec_entries() -> set[str]:
+    """FILE entries of the form `core/scripts/<name>.py`, as bare names."""
+    out: set[str] = set()
+    for tok in _pathspec_tokens():
+        m = re.fullmatch(r"core/scripts/([A-Za-z0-9_*]+)\.py", tok)
+        if m:
+            out.add(m.group(1))
+    return out
 
 
 def pathspec_dir_entries() -> set[str]:
@@ -147,14 +175,10 @@ def pathspec_dir_entries() -> set[str]:
 
     Members of such a directory are covered by the directory entry, not by an
     individual `.py` entry — so a gate module is pinned IFF `gates` appears here.
-    Parsed from the SAME predicate block as pathspec_entries(); never restated.
+    Derived from the SAME tokens as pathspec_entries(); never restated.
     """
-    text = PREDICATE.read_text(encoding="utf-8")
-    block = re.search(r'diff --name-only "\$BASE" HEAD --(.*?)2>&1\)', text, re.S)
-    assert block, "could not locate the git-diff pathspec block in the predicate"
     dirs: set[str] = set()
-    for raw in block.group(1).split():
-        tok = raw.strip().strip("\\").strip("'\"")
+    for tok in _pathspec_tokens():
         if not tok.startswith("core/scripts/"):
             continue
         rest = tok[len("core/scripts/"):]
@@ -193,6 +217,38 @@ def test_probe_is_not_vacuous():
     assert len(surface) < all_py / 2, (
         f"surface={len(surface)} of {all_py} core/scripts modules — the probe is "
         f"over-matching, not computing a real closure"
+    )
+
+
+def test_pathspec_parse_is_not_vacuous():
+    """POSITIVE CONTROL on the OTHER derived set (guard-1638).
+
+    `test_probe_is_not_vacuous` above floors the AST surface. Nothing floored the
+    PATHSPEC side, and that asymmetry is exactly what made g-115-8287 silent in the
+    wrong DIRECTION: the parse returned an EMPTY set, so every daemon module read as
+    uncovered and `test_every_loaded_module_is_in_the_pathspec` failed telling the
+    reader to edit the SHELL SCRIPT — when the broken code was the parser in THIS
+    file. A floor that runs independently of the list assertion names the real cause.
+
+    Both derived sets now have a floor. Keep it that way.
+    """
+    tokens = _pathspec_tokens()
+    assert len(tokens) >= 10, (
+        f"DAEMON_PATHSPEC parsed to {len(tokens)} token(s). The parser in THIS file "
+        f"has stopped matching {PREDICATE.name} — do NOT 'fix' the pathspec, and do "
+        f"NOT restate the list here. Fix the parser."
+    )
+    # Sentinels spanning all three token SHAPES the parse must preserve: a plain
+    # path, the quoted glob (its shell quotes must be stripped, since git receives
+    # the bare pattern), and a bare directory.
+    assert "mind_api/src" in tokens, "the daemon's own source root is absent"
+    assert "_*" in pathspec_entries(), "the `core/scripts/_*.py` glob did not survive"
+    assert "gates" in pathspec_dir_entries(), "the `core/scripts/gates` dir did not survive"
+    # NEGATIVE control: the block regex must stop at the array's closing paren
+    # rather than swallowing the rest of the script.
+    assert len(tokens) < 60, (
+        f"parsed {len(tokens)} tokens — the block regex is over-matching past the "
+        f"array's closing paren and is picking up ordinary script lines"
     )
 
 

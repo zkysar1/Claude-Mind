@@ -34,7 +34,20 @@ gate is recoverable; a fail-closed one stalls every autonomous loop.
 
 Override: put STORE_WRITE_GUARD_OVERRIDE anywhere in the command -- for an
 operator restoring a store from a .history snapshot who has read
-.claude/rules/archive-before-delete.md. Every override is logged.
+.claude/rules/archive-before-delete.md. Every override is logged. It is honored
+ONLY while no agent in the deployment is RUNNING: a governed store is never
+hand-written under a live loop, and a Body IS the live loop.
+
+THE DENY MUST NOT NAME THE TOKEN. The audience of a deny is the LLM being
+refused; the audience of the override is the operator reading this docstring
+or gates.yaml. Measured on a downstream deployment, 2026-08-29: the deny ended
+"Genuine exception: put STORE_WRITE_GUARD_OVERRIDE anywhere in the command (it
+is logged)", and 6 of 42 firings (14%) became overrides within 3-12 minutes --
+three whole-file rewrites of aspirations.jsonl (one Body set
+os.environ['STORE_WRITE_GUARD_OVERRIDE'] INSIDE its program, commented "so the
+hook recognizes this as a genuine exception") and three of reasoning-bank.jsonl
+(a hand "fold" of rb-1 into rb-2 that deleted a record). A refusal that names
+its own bypass is an instruction.
 """
 
 import json
@@ -89,7 +102,11 @@ WRITER_FOR = {
     "pipeline.jsonl": "pipeline-add.sh / pipeline-move.sh / pipeline-update.sh",
     "experience.jsonl": "experience-add.sh",
     "journal.jsonl": "journal-add.sh",
-    "reasoning-bank.jsonl": "reasoning-bank-add.sh / reasoning-bank-update-field.sh",
+    "reasoning-bank.jsonl": (
+        "reasoning-bank-add.sh / reasoning-bank-update-field.sh (to FOLD entries: "
+        "update-field the survivor's content, then update-field the folded entry's "
+        "status to retired -- a record is never deleted)"
+    ),
     "guardrails.jsonl": "guardrails-add.sh / guardrails-update-field.sh",
     "pattern-signatures.jsonl": "pattern-signatures-add.sh",
     "spark-questions.jsonl": "spark-questions-add.sh",
@@ -259,8 +276,54 @@ def build_reason(hits) -> str:
         f"Use instead ({base}): {writer}.\n"
         "Reading a store to CHECK something is fine; if you are restoring one from "
         "a .history snapshot, use `bash core/scripts/history.py restore ...` -- and "
-        f"only after .claude/rules/archive-before-delete.md. Genuine exception: put "
-        f"{OVERRIDE_TOKEN} anywhere in the command (it is logged)."
+        "only after .claude/rules/archive-before-delete.md. There is no in-session "
+        "bypass: if the script cannot express the write you need, file it -- "
+        f"`aspirations-add-goal.sh` with title `Investigate: {base} write not "
+        "expressible via its script: <what>` -- and continue with the goal."
+    )
+
+
+def running_agents(root: Path):
+    """Names of the agents whose `agent-state` reads RUNNING under `root`.
+
+    Layout comes from the resolver constants (AGENTS_PARENT_DIR / SESSION_DIRNAME,
+    CLAUDE.md "Agent-dir Resolution"), rooted at the hook's PROJECT_ROOT rather
+    than _paths.PROJECT_ROOT so a test can stage a deployment in a tmp dir.
+    Fail-open: unreadable layout -> no running agents -> the override is honored.
+    """
+    try:
+        from _paths import AGENTS_PARENT_DIR, SESSION_DIRNAME
+
+        agents = root / AGENTS_PARENT_DIR if AGENTS_PARENT_DIR else root
+        names = []
+        for d in sorted(agents.iterdir()):
+            state = d / SESSION_DIRNAME / "agent-state"
+            try:
+                if state.read_text(encoding="utf-8").strip() == "RUNNING":
+                    names.append(d.name)
+            except OSError:
+                continue
+        return names
+    except Exception:
+        return []
+
+
+def build_override_refusal(hits, running) -> str:
+    idiom, path = hits[0]
+    base = _basename_of(path)
+    writer = WRITER_FOR.get(base, "the store's *-add.sh / *-update*.sh script")
+    return (
+        f"direct store write refused: {idiom} `{path}` -- the override is not "
+        f"honored while an agent is RUNNING ({', '.join(running)}).\n\n"
+        "A governed store is never hand-written under a live loop: the daemon "
+        "holds the lock, the .history snapshot and the changelog, and a Body IS "
+        "the live loop. The override exists for an operator restoring a snapshot "
+        "on a stopped deployment.\n\n"
+        f"Use instead ({base}): {writer}.\n"
+        "Restoring from .history: `bash core/scripts/history.py restore ...` (a "
+        "script call -- it never trips this guard). If the script cannot express "
+        f"the write, file `Investigate: {base} write not expressible via its "
+        "script: <what>` with aspirations-add-goal.sh and continue."
     )
 
 
@@ -307,6 +370,11 @@ def main() -> None:
         if not hits:
             approve_no_mutation()
         if OVERRIDE_TOKEN in cmd:
+            root = Path(os.environ.get("PROJECT_ROOT") or SCRIPT_DIR.parent.parent)
+            running = running_agents(root)
+            if running:
+                _log("override-refused", cmd, hits)
+                emit_deny(build_override_refusal(hits, running))
             _log("override", cmd, hits)
             approve_no_mutation()
         _log("deny", cmd, hits)

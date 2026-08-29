@@ -5,6 +5,7 @@ Query params (mutually exclusive — exactly one):
     active=1
     id=<sig-id>
     summary=1
+    count=1
 
 Equivalence target: stdout of `python3 core/scripts/pattern-signatures.py read --<flag>`.
 """
@@ -56,7 +57,14 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
             lines.append(f"{sig_id}: {name} [{vs}] accuracy={accuracy} ({confirmed}/{total})")
         return plain_lines(lines)
 
-    return missing_flag_error(["all", "active", "id", "summary"])
+    # COUNT — record count only (). Counting `summary=1` LINES is
+    # not a record count; the two error directions are documented ONCE, in
+    # mind_api/src/world/reasoning_bank.py. Do not restate them here — two
+    # copies of a measured claim is the drift surface (guard-5032).
+    if flag(q, "count"):
+        return json_response_pretty({"count": len(jc.get(path))})
+
+    return missing_flag_error(["all", "active", "id", "summary", "count"])
 
 
 def register(routes) -> None:

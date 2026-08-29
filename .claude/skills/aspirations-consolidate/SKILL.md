@@ -476,20 +476,19 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
 2.25. Knowledge Debt Sweep:
    Bash: wm-read.sh knowledge_debt --json
    IF items exist:
+       # NORMALIZE FIRST (g-115-4021) — digest Section E step 0 (SSOT). A BARE
+       # STRING element misses every lookup below, so it never resolves, ages,
+       # or hits the ceiling while this sweep reports success (guard-1970):
+       #   IF isinstance(entry, str): entry = {node_key: null, reason: entry,
+       #       priority: "medium", created: null, sessions_deferred: 0}
+       # created:null must NOT auto-resolve — no date is not a node date.
        Sort by priority (HIGH first), then by age (oldest first)
        For each debt:
            Read target node .md file
            IF node was updated AFTER debt was created → mark resolved, skip
 
-           # NULL-KEY LANE (g-115-5150) — mirrors encode-session Lane 1.6.
-           # The node-update check above CANNOT fire without a node_key, and
-           # null is the MAJORITY shape rather than an anomaly: /respond Step 6
-           # files debt precisely when a correction has BROADER implications
-           # than any single node the _tree.yaml scan found, so "no one node" is
-           # the DESIGNED common case here. Such entries fall through to the
-           # carry-forward increment on every sweep until the ceiling below
-           # DISCARDS them. Measured 2026-08-06 (alpha): all five live entries
-           # had node_key null, all HIGH, all at sessions_deferred 6 of 10.
+           # NULL-KEY LANE (g-115-5150). Rationale + measurements: digest
+           # Section E step 2 (SSOT) — null is the DESIGNED majority shape.
            IF debt.node_key is null or empty:
                Extract the first goal id matching g-\d+-\d+ from debt.reason
                  (also debt.routed_goal / debt.source_goal if present).
@@ -525,11 +524,8 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
 
            # MAX-DEFER CEILING: drop stale debts that never resolve
            IF sessions_deferred >= 10:
-               # DURABLE DROP FIRST (g-115-5150) — mirrors encode-session.
-               # This is a DISCARD, not a resolution: the gap is still open and
-               # nobody was told. The Log line dies with the session, and for
-               # the null-key majority it rendered as "DROPPED: null", naming
-               # nothing recoverable. Preserve the reason BEFORE removing.
+               # DURABLE DROP FIRST (g-115-5150) — a DISCARD, not a
+               # resolution. Rationale: digest Section E step 4 (SSOT).
                Bash: echo '{"entry_type":"observation","content":"KNOWLEDGE DEBT DROPPED (ceiling {sessions_deferred}): node_key={node_key or \"null\"} priority={priority} source_goal={source_goal} — {reason}"}' | bash core/scripts/execution-diary.sh append
                IF priority == "HIGH":
                    # 10 sweeps failed to resolve a HIGH debt — a finding about
@@ -538,6 +534,10 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
                Log: "KNOWLEDGE DEBT DROPPED: {node_key} — {reason} (deferred {sessions_deferred} sessions, ceiling reached; reason preserved to execution-diary)"
                Remove from debt list (do not carry forward)
 
+       # DEDUP BY node_key ON WRITE-BACK (g-115-4021) — digest Section E step 6.
+       # Rows embed counters that only RISE, so exact-record dedup never matches
+       # and a re-scanned node appends forever. Collapse non-null node_key
+       # duplicates keeping the OLDEST; never collapse node_key null.
        Report: "Knowledge debts: {resolved} resolved, {carried} carried forward, {dropped} dropped"
 
 <!-- Steps 2.6-10 are mirrored in core/config/consolidation-housekeeping.md (fast-path digest) -->

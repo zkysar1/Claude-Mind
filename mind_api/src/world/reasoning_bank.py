@@ -10,6 +10,7 @@ RB query params (mutually exclusive — exactly one):
     universal=1
     tag=<tag>            (case-insensitive exact match)
     summary=1
+    count=1
     recent=<N>           (default 10 when present without value via recent=)
 
 Guard query params:
@@ -17,6 +18,7 @@ Guard query params:
     id=<guard-id>
     category=<cat>
     summary=1
+    count=1
 
 Equivalence target: stdout of the corresponding CLI invocation.
 """
@@ -262,8 +264,21 @@ def rb_read(ctx) -> "Response":  # type: ignore[name-defined]
         active = sorted(active, key=lambda r: r.get("created", ""), reverse=True)
         return json_response_pretty(active[:n])
 
+    # COUNT — the cheap answer to "how many records are in this store".
+    # Added for : agent-completion-report step 7 wanted three integers
+    # and paid 2,106,400 bytes of `summary=1` output for them, then MISCOUNTED.
+    # Counting summary LINES is not a record count, and it errs in BOTH
+    # directions at once: a field carrying an embedded newline emits a
+    # continuation line (+3 on guardrails, measured 2026-08-29), while the
+    # output has no trailing newline so `wc -l` undercounts by 1. The two
+    # partially cancel, which is why the bug read as "+3 on one store only"
+    # and stayed invisible on the other two.
+    if flag(q, "count"):
+        return json_response_pretty({"count": len(_load(jc, paths))})
+
     return missing_flag_error([
         "active", "id", "category", "universal", "tag", "summary", "recent",
+        "count",
     ])
 
 
@@ -333,7 +348,11 @@ def guard_read(ctx) -> "Response":  # type: ignore[name-defined]
             lines.append(f"{rec.get('id', '?')}: [{cat}] {rule}")
         return plain_lines(lines)
 
-    return missing_flag_error(["active", "id", "category", "summary", "severity"])
+    if flag(q, "count"):
+        return json_response_pretty({"count": len(_load(jc, paths))})
+
+    return missing_flag_error(
+        ["active", "id", "category", "summary", "severity", "count"])
 
 
 def register(routes) -> None:

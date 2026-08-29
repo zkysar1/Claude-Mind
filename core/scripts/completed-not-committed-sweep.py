@@ -725,7 +725,9 @@ def classify_stranded(goal, now, sha_status, default_status, pr_status,
     must never turn a clean sweep into a flagged one. Both degrade to clean and
     surface as warnings in the run report instead.
 
-    Two classes, matching the goal's guidance that they carry different weight:
+    Four classes, matching the goal's guidance that they carry different weight.
+    THE LAST TWO ARE BENIGN AND MUST NOT BE SUMMED INTO A CONSUMER'S STRANDED
+    COUNT — see the Step 8.79a advisory in iteration-close.sh (g-115-7881):
       stranded_open_pr -> commit off-default AND an open PR carries it, open at
                           least min_pr_age_hours. STRONG: the work is finished,
                           reviewed-or-not, and simply not merged. Investigate-filed.
@@ -737,6 +739,16 @@ def classify_stranded(goal, now, sha_status, default_status, pr_status,
                           NOT stranded at all: the work shipped under a rewritten
                           sha. Report-only, and carved out of stranded_no_pr
                           rather than added to it — see all_merged_on_default.
+      stranded_deploy_held -> commit off-default WITH an open PR, but the repo
+                          is under an ACTIVE deploy hold, so merging would fire
+                          the deploy the hold exists to prevent. PARKED, not
+                          stranded — report-only, never filed, and like
+                          benign_squash_merged it must never be added to a
+                          stranded warning: telling a closer to "land it" is
+                          telling them to do the thing the hold forbids.
+                          Decorated with a top-level deploy_holders field; holder
+                          ids ROTATE, so they come from the probe payload and are
+                          never read off the PR text.
 
     `merge_default_status` is the INJECTED map {merge_commit_sha: True|False|None}
     built by the same probe as `default_status`. Defaulting it to None (treated
@@ -2291,6 +2303,16 @@ def main():
         "benign_squash_merged": squash_merged,
         "stranded_deploy_held_count": len(deploy_held),
         "stranded_deploy_held": deploy_held,
+        # Every report key stranded_all is partitioned into, named for
+        # consumers so a new partition surfaces instead of silently dropping
+        # out of a hardcoded subset (guard-1802 / ). Keep in sync
+        # with the four partition statements above; the coupling test
+        # test_advisory_reads_every_partition_the_producer_emits fails loudly
+        # if a consumer stops referencing one.
+        "stranded_all_partitions": [
+            "stranded", "stranded_no_pr",
+            "benign_squash_merged", "stranded_deploy_held",
+        ],
         "misrouted_reachability_count": len(misrouted),
         "misrouted_reachability": misrouted,
         "benign_merged_pr_count": len(merged_pr),
