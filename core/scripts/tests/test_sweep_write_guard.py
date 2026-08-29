@@ -210,8 +210,11 @@ def test_supersession_refuses_and_writes_nothing(supersession, tmp_path):
         swg.PROV_AUTHORITATIVE)
     _forbid_writes(supersession, "parent-supersession _mark_superseded")
     metrics = tmp_path / "m.jsonl"
-    assert supersession._mark_superseded("world", "g-1-1", ["g-1-2"],
-                                         metrics_path=metrics) is False
+    ok, reason = supersession._mark_superseded("world", "g-1-1", ["g-1-2"],
+                                               metrics_path=metrics)
+    assert ok is False
+    # : the refusal must CARRY its diagnosis, not just report False.
+    assert reason, "stale-candidate refusal returned no reason"
     rows = [json.loads(l) for l in metrics.read_text().splitlines() if l.strip()]
     assert [r["type"] for r in rows] == ["parent_supersession_refused_stale_candidate"]
     assert rows[0]["sibling_ids"] == ["g-1-2"]
@@ -221,8 +224,10 @@ def test_supersession_refuses_on_an_unverifiable_read(supersession, tmp_path):
     supersession._reread_goal_authoritative = lambda s, g: (OPEN_GOAL,
                                                             swg.PROV_LOCAL_MIRROR)
     _forbid_writes(supersession, "parent-supersession _mark_superseded")
-    assert supersession._mark_superseded("world", "g-1-1", ["g-1-2"],
-                                         metrics_path=tmp_path / "m.jsonl") is False
+    ok, reason = supersession._mark_superseded(
+        "world", "g-1-1", ["g-1-2"], metrics_path=tmp_path / "m.jsonl")
+    assert ok is False
+    assert reason, "unverifiable-read refusal returned no reason"
 
 
 def test_supersession_writes_when_the_goal_is_genuinely_open(supersession, tmp_path):
@@ -230,9 +235,46 @@ def test_supersession_writes_when_the_goal_is_genuinely_open(supersession, tmp_p
                                                             swg.PROV_AUTHORITATIVE)
     calls = []
     supersession._py = lambda args, input_text=None: (calls.append(args), (0, "", ""))[1]
-    assert supersession._mark_superseded("world", "g-1-1", ["g-1-2"],
-                                         metrics_path=tmp_path / "m.jsonl") is True
+    ok, reason = supersession._mark_superseded(
+        "world", "g-1-1", ["g-1-2"], metrics_path=tmp_path / "m.jsonl")
+    assert ok is True
+    assert reason is None, "a successful write must carry no failure reason"
     assert len(calls) == 3  # outcome_note, status, completed_date
+
+
+def test_supersession_failed_write_carries_the_child_diagnosis(supersession,
+                                                               tmp_path):
+    """: a failed child write must surface WHY, not just mark_failed.
+
+    Positive control for the whole fix. Before it, all three write sites bound
+    `rc1, _, _ = _py(...)`, so this stderr was discarded at the call and the
+    emitted record carried action=mark_failed with no reason field at all.
+    """
+    supersession._reread_goal_authoritative = lambda s, g: (OPEN_GOAL,
+                                                            swg.PROV_AUTHORITATIVE)
+    supersession._py = lambda args, input_text=None: (
+        7, '{"partial": "body"}', "refused by downstream guard: goal is claimed")
+    ok, reason = supersession._mark_superseded(
+        "world", "g-1-1", ["g-1-2"], metrics_path=tmp_path / "m.jsonl")
+    assert ok is False
+    assert "outcome_note" in reason        # names WHICH write failed
+    assert "rc=7" in reason                # carries the child's exit code
+    assert "refused by downstream guard" in reason
+    # stderr wins over stdout: a gate that refuses often still emits a JSON
+    # body, and surfacing that body would bury the actual cause.
+    assert "partial" not in reason
+
+
+def test_supersession_failure_reason_is_bounded(supersession, tmp_path):
+    """The reason rides on a per-goal record — an unbounded child dump would
+    push the emitted JSON past what a reader or a log line keeps."""
+    supersession._reread_goal_authoritative = lambda s, g: (OPEN_GOAL,
+                                                            swg.PROV_AUTHORITATIVE)
+    supersession._py = lambda args, input_text=None: (1, "", "x" * 5000)
+    ok, reason = supersession._mark_superseded(
+        "world", "g-1-1", ["g-1-2"], metrics_path=tmp_path / "m.jsonl")
+    assert ok is False
+    assert len(reason) < 500
 
 
 def test_supersession_seam_resolves_its_own_module_stubs(supersession, monkeypatch):

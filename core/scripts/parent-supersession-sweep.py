@@ -364,9 +364,36 @@ def _stale_candidate_reason(source, goal_id):
     return _shared_stale_candidate_reason(goal, prov)
 
 
+def _write_failure_reason(field, rc, out, err):
+    """One-line diagnosis for a failed child write.
+
+    stderr FIRST: aspirations.py prints its refusals there, and a gate that
+    refuses often still writes a JSON body to stdout, so preferring stdout
+    would surface the payload and bury the cause. Bounded to 400 chars —
+    this rides on a per-goal record, and an unbounded child dump would push
+    the emitted JSON past what a reader (or a log line) keeps.
+    """
+    detail = (err or "").strip() or (out or "").strip() or "no output"
+    detail = " ".join(detail.split())
+    if len(detail) > 400:
+        detail = detail[:400] + "…"
+    return f"write of {field!r} failed (rc={rc}): {detail}"
+
+
 def _mark_superseded(source, goal_id, sibling_ids, metrics_path=None,
                      aspiration_id=None):
-    """Mark parent as completed with outcome_note. Returns True on success.
+    """Mark parent as completed with outcome_note.
+
+    Returns (ok, reason): reason is None on success, else a SHORT diagnosis
+    string naming which child write failed and what it said. The caller puts
+    it on the emitted record so `action: "mark_failed"` is not the only
+    surviving trace (g-115-7957). Before this, all three write sites bound
+    `rc1, _, _ = _py(...)` and returned a bare False, so the child's stderr
+    was destroyed AT THE CALL, not merely unrouted -- a failed write reported
+    action=mark_failed with no reason while every other action value carried
+    one. Cost measured on this very script: its own :496 comment records
+    g-249-06 stuck at mark_failed for 235h of repeated write attempts,
+    "refused only by a downstream guard the sweep never consults".
 
     INVARIANT: uses sys.executable directly. Same rationale as
     defer-recheck._clear_defer — bash on Windows can resolve to WSL
@@ -399,22 +426,22 @@ def _mark_superseded(source, goal_id, sibling_ids, metrics_path=None,
             "reason": stale,
             "agent": os.environ.get("MIND_AGENT", "") or None,
         })
-        return False
+        return False, stale
 
     sibling_str = ", ".join(sibling_ids)
     note = f"superseded by sibling decomposition: {sibling_str}"
     # First write outcome_note (informational only — does NOT close goal).
-    rc1, _, _ = _py([str(SCRIPT_DIR / "aspirations.py"),
-                     "--source", source, "update-goal",
-                     goal_id, "outcome_note", note])
+    rc1, out1, err1 = _py([str(SCRIPT_DIR / "aspirations.py"),
+                           "--source", source, "update-goal",
+                           goal_id, "outcome_note", note])
     if rc1 != 0:
-        return False
+        return False, _write_failure_reason("outcome_note", rc1, out1, err1)
     # Then close the goal.
-    rc2, _, _ = _py([str(SCRIPT_DIR / "aspirations.py"),
-                     "--source", source, "update-goal",
-                     goal_id, "status", "completed"])
+    rc2, out2, err2 = _py([str(SCRIPT_DIR / "aspirations.py"),
+                           "--source", source, "update-goal",
+                           goal_id, "status", "completed"])
     if rc2 != 0:
-        return False
+        return False, _write_failure_reason("status", rc2, out2, err2)
     # Stamp completed_date if absent.
     today = dt.date.today().isoformat()
     rc3, _, _ = _py([str(SCRIPT_DIR / "aspirations.py"),
@@ -422,7 +449,7 @@ def _mark_superseded(source, goal_id, sibling_ids, metrics_path=None,
                      goal_id, "completed_date", today])
     # completed_date rewrite is best-effort — non-fatal if it fails
     # (most stores stamp it server-side via update-goal hooks).
-    return True
+    return True, None
 
 
 def main():
@@ -570,10 +597,15 @@ def main():
                 "siblings": sibling_ids,
             })
             if args.apply:
-                ok = _mark_superseded(source, g.get("id"), sibling_ids,
-                                      metrics_path=metrics_path,
-                                      aspiration_id=asp.get("id"))
+                ok, fail_reason = _mark_superseded(
+                    source, g.get("id"), sibling_ids,
+                    metrics_path=metrics_path,
+                    aspiration_id=asp.get("id"))
                 entry["action"] = "marked" if ok else "mark_failed"
+                if not ok and fail_reason:
+                    # Every other action value this script emits carries a
+                    # reason; mark_failed did not ().
+                    entry["reason"] = fail_reason
                 if ok:
                     applied += 1
                     _append_metric(metrics_path, {

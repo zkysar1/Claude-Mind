@@ -25,6 +25,33 @@ if str(SCRIPTS_DIR) not in sys.path:
 from gates.scaffolded_exploration import evaluate, DEFAULT_PRODUCT_PREFIXES
 
 
+# --- deployment-neutrality () -----------------------------------
+# The product-category VOCABULARY ("npc-", "ayoai-", ...) comes from the world
+# overlay world/config/scaffolded-exploration.yaml, not from framework code, and
+# `_default_product_prefixes()` defaults to () when that overlay is absent. So a
+# test asserting the Ayoai vocabulary by name is red on any deployment that does
+# not share it. NOTE this file's coupling is the CATEGORY vocabulary, NOT the
+# agent roster that couples test_capability_route_gate.py — same class, different
+# axis, so the guard has to read prefixes rather than agents.
+def _sample_product_category() -> str:
+    """A category this deployment's overlay actually treats as product.
+
+    Skips (never fails) when the overlay declares no product prefixes: with an
+    empty list the gate is disabled by design, so there is no product category
+    to construct and the expectation is unjudgeable here.
+    """
+    prefixes = tuple(DEFAULT_PRODUCT_PREFIXES)
+    if not prefixes:
+        pytest.skip(
+            "this deployment's overlay declares no product_category_prefixes, "
+            "so the gate is disabled by design and there is no product category "
+            "to exercise — domain-coupled expectation, not a gate defect "
+            "(g-115-4392)"
+        )
+    return prefixes[0] + "build"
+
+
+
 # ---------------------------------------------------------------------------
 # Skip paths
 # ---------------------------------------------------------------------------
@@ -52,19 +79,28 @@ def test_apply_non_product_category_skips():
 def test_apply_product_with_discovered_by_passes():
     """Apply + product category + discovered_by → Investigate precursor
     cited → pass without block."""
+    category = _sample_product_category()
     out = evaluate({
         "title": "Apply: NPC behavior fix",
-        "category": "npc-build",
+        "category": category,
         "discovered_by": "g-115-001",
     })
     assert out["would_block"] is False
     assert "Investigate precursor present" in out["reason"]
-    assert out["matched_category_prefix"] == "npc-"
+    assert out["matched_category_prefix"] == tuple(DEFAULT_PRODUCT_PREFIXES)[0]
 
 
-@pytest.mark.parametrize("prefix", DEFAULT_PRODUCT_PREFIXES)
+# `or [None]` so an overlay with no prefixes yields ONE skipping case rather
+# than zero collected cases — a vacuous parametrize is indistinguishable
+# from a passing one in the runner summary ().
+@pytest.mark.parametrize("prefix", tuple(DEFAULT_PRODUCT_PREFIXES) or [None])
 def test_all_default_prefixes_match(prefix):
     """Every default product prefix must trigger the gate when used."""
+    if prefix is None:
+        pytest.skip(
+            "this deployment's overlay declares no product_category_prefixes "
+            "(g-115-4392)"
+        )
     out = evaluate({
         "title": "Apply: something",
         "category": prefix + "foo",

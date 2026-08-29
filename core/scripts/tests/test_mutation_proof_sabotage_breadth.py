@@ -44,6 +44,16 @@ ALL_SITES = ["--sabotage-old", "date.fromisoformat",
              "--sabotage-new", "datetime.fromisoformat"]
 ONE_SITE = ["--sabotage-sed", "0,/date\\.fromisoformat/s//datetime.fromisoformat/"]
 
+# The verdict can now carry MORE THAN ONE caveat (mutation-proof-test.sh gained an
+# attribution caveat, ), so a bare `"CAVEAT" in reason` no longer proves
+# THIS file's caveat fired -- it would pass on the attribution one alone. Every
+# assertion below names the breadth caveat by its own distinctive text instead.
+# This is the guard-1793 shape: a blunt assertion that stops discriminating the
+# moment a second producer appears, in the one file whose whole subject is
+# assertions that stop discriminating.
+BREADTH_CAVEAT = "the sabotage changed"
+
+
 
 @pytest.fixture
 def workdir(tmp_path):
@@ -94,7 +104,7 @@ def test_multi_site_pass_carries_the_anchoring_caveat(workdir):
     """
     v = run(workdir, "anchored.sh", ALL_SITES)
     assert v["verdict"] == "PASS"
-    assert "CAVEAT" in v["reason"]
+    assert BREADTH_CAVEAT in v["reason"]
     assert "anchored" in v["reason"]
 
 
@@ -109,7 +119,7 @@ def test_the_false_green_is_now_legible(workdir):
     vacuous = run(workdir, "naive.sh", ALL_SITES)
     assert vacuous["verdict"] == "PASS"          # the tool cannot discriminate...
     assert vacuous["sabotage_sites"] == 2        # ...but it reports WHY it cannot
-    assert "CAVEAT" in vacuous["reason"]
+    assert BREADTH_CAVEAT in vacuous["reason"]
 
 
 def test_single_site_sabotage_reports_changed_lines_and_no_caveat(workdir):
@@ -118,7 +128,9 @@ def test_single_site_sabotage_reports_changed_lines_and_no_caveat(workdir):
     assert v["verdict"] == "PASS"
     assert v["sabotage_sites"] == 1
     assert v["sabotage_sites_basis"] == "changed-lines"
-    assert "CAVEAT" not in v["reason"]
+    # No BREADTH caveat. An attribution caveat IS expected here and is unrelated:
+    # this run passes no --junit-xml, so attribution is legitimately unmeasured.
+    assert BREADTH_CAVEAT not in v["reason"]
 
 
 def test_single_site_sabotage_discriminates_the_vacuous_predicate(workdir):

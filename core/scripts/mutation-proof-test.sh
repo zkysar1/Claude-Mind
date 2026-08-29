@@ -38,6 +38,9 @@ Proves a regression test is not vacuous by mutating the code under test:
   message. A RED run alone does not say WHICH assertion fired — a precondition
   blowing up and the behavioural detector firing look identical from the exit
   status. Without --junit-xml, `red_tests` is null (NOT measured), never [].
+  The verdict's `attribution` field names WHICH of those it is —
+  measured | unmeasured (flag not given) | parse-failed — so a null is never
+  read as a clean attribution, and a PASS carries a CAVEAT saying so.
   `type` is the REPORTING TOOL'S classification, not a property of the test:
   Gradle separates failure from error, while pytest files an uncaught
   exception as a failure too (verified against real output from both). Read
@@ -245,6 +248,7 @@ emit() {
   TARGET="$TARGET" VERDICT="$1" REASON="$2" BG="$BASELINE_GREEN" \
   SA="$SAB_APPLIED" SR="$SAB_RED" RG="$RESTORE_GREEN" TR="$TEST_RAN" RS="$RESTORE_STATUS" \
   RT="${RED_TESTS:-null}" RC="${RED_COUNT:-null}" RPE="${RED_PARSE_ERRORS:-null}" \
+  ATTR="${ATTRIBUTION:-unmeasured}" \
   SS="${SAB_SITES:-null}" SSB="${SAB_SITES_BASIS:-unmeasured}" \
   RCK="${RESIDUE_CHECK:-unavailable}" \
   MSC="${MUTANT_SYNTAX_CHECKED:-unchecked}" \
@@ -303,6 +307,26 @@ print(json.dumps({
   #         failing (compile/build artifact), which is exactly what guard-1220
   #         and guard-1631 warn a bare RED cannot distinguish.
   "red_tests": red, "red_count": red_count, "red_parse_errors": parse_errors,
+  # WHICH of the two null-producing situations above actually occurred. A bare
+  # null cannot say, and the difference decides what to do next:
+  #   "measured"     --junit-xml was given and the extraction ran. red_count is a
+  #                  real number (0 included, per the [] note above).
+  #   "unmeasured"   --junit-xml was NOT given, so attribution was never asked
+  #                  for. NOT a clean result: the kill may have been made by an
+  #                  unrelated test, or by a precondition blowing up rather than
+  #                  the behavioural assertion, and this run cannot tell. Re-run
+  #                  with --junit-xml to find out. Measured 2026-08-28: the flag
+  #                  is passed at ~4% of in-repo call sites, so this is the
+  #                  DEFAULT state of the tool, not an edge case.
+  #   "parse-failed" --junit-xml WAS given and yielded nothing usable — a tool or
+  #                  XML fault worth chasing, not an un-run check.
+  # Deliberately a separate field rather than a default-on --junit-xml: that flag
+  # names where the script LOOKS for XML the test command already wrote, it does
+  # not tell the runner where to WRITE. Defaulting it to a path nothing writes
+  # would read tests=0 and hard-FAIL every currently-passing caller (the
+  #  false-FAIL class, which the Step-3b comment calls worse than a
+  # missing check).
+  "attribution": os.environ["ATTR"],
   # HOW BROAD the sabotage was. A mutation that lands at the site under test
   # AND at N-1 others makes the RED uninformative: a predicate anchored to the
   # site and one that merely greps the whole file both go red, so a PASS cannot
@@ -327,6 +351,12 @@ MUTANT_SYNTAX_CHECKED="unchecked"
 # null (the JSON literal), not [] — see the emit() comment. Absent-vs-empty is
 # load-bearing here: [] would claim a measurement that never happened.
 RED_TESTS="null"; RED_COUNT="null"; RED_PARSE_ERRORS="null"
+# Which of the THREE attribution states the red_tests/red_count pair is in.
+# They are both `null` in two DIFFERENT situations and a bare null cannot say
+# which, so this names it — the same posture residue_check, sabotage_sites_basis
+# and mutant_syntax_checked already take (guard-963: never let "verified nothing"
+# render as a clean result). Default is the ~96%-of-call-sites case.
+ATTRIBUTION="unmeasured"
 RED_TESTS_CAP=20
 
 # --- Step 1: baseline (real code must be GREEN) ---
@@ -544,9 +574,15 @@ sys.exit(0 if total > 0 else 8)
   # because a tests=0 run whose XML still names failing cases is exactly the
   # diagnostic an operator needs to see.
   if [[ -n "${JUNIT_JSON:-}" ]]; then
+    ATTRIBUTION="measured"
     RED_TESTS="$(RTJ="$JUNIT_JSON" $PY -c 'import os,json;print(json.dumps(json.loads(os.environ["RTJ"])["red"]))' 2>/dev/null || echo "null")"
     RED_COUNT="$(RTJ="$JUNIT_JSON" $PY -c 'import os,json;print(json.dumps(json.loads(os.environ["RTJ"])["red_count"]))' 2>/dev/null || echo "null")"
     RED_PARSE_ERRORS="$(RTJ="$JUNIT_JSON" $PY -c 'import os,json;print(json.dumps(json.loads(os.environ["RTJ"])["parse_errors"]))' 2>/dev/null || echo "null")"
+  else
+    # --junit-xml WAS given and the extraction produced nothing usable. Distinct
+    # from "unmeasured": the caller DID ask, so a null here is a tool/XML fault
+    # worth chasing, not an un-run check.
+    ATTRIBUTION="parse-failed"
   fi
   if [[ "$TEST_RAN" == "false" ]]; then
     restore; trap - EXIT INT TERM   # restore now so restore_status is accurate in the emitted JSON
@@ -586,6 +622,16 @@ PASS_REASON="mutation-proof: GREEN on real code -> RED under sabotage -> GREEN a
 # for a smaller proposition than "this test is anchored" (guard-1856).
 if [[ "${SAB_SITES:-}" =~ ^[0-9]+$ ]] && (( SAB_SITES > 1 )); then
   PASS_REASON="${PASS_REASON}. CAVEAT: the sabotage changed ${SAB_SITES} sites (basis=${SAB_SITES_BASIS}), not one — this RED does NOT prove the test is anchored to the site under test, because a predicate that merely matches the token ANYWHERE in the file goes red too. Narrow the mutation to one site (e.g. --sabotage-sed '0,/re/s//new/') to prove anchoring."
+fi
+# The PASS above is silent about attribution unless we say so here: red_tests
+# null renders identically whether nobody asked or nobody failed, and a reader
+# with a PASS in hand has no prompt to look. Caveat, never downgrade — the proof
+# IS real, it just does not establish WHICH test did the killing (guard-1856,
+# the same posture the multi-site caveat above takes).
+if [[ "$ATTRIBUTION" == "unmeasured" ]]; then
+  PASS_REASON="${PASS_REASON}. CAVEAT: kill attribution was NOT measured (no --junit-xml), so red_tests/red_count are null because nothing was asked, not because nothing failed — this PASS does not establish WHICH test went red under the sabotage. An unrelated test can kill a mutant while the intended one stays green, and a precondition blowing up looks identical to the behavioural assertion firing. Re-run with --junit-xml '<result-xml-path-or-glob>' to attribute the kill."
+elif [[ "$ATTRIBUTION" == "parse-failed" ]]; then
+  PASS_REASON="${PASS_REASON}. CAVEAT: --junit-xml was given but produced no usable attribution (see red_parse_errors), so this PASS does not establish WHICH test went red."
 fi
 #  outcome 3: the ONLY place the backup is removed. Reaching here means
 # restore matched, residue_check did not fire, and the post-restore test is green

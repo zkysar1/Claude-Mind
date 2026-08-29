@@ -940,6 +940,24 @@ gates:
     tuning_notes: "Instrumented 2026-08-27 (g-115-3325). Records the deny (block) and the two silent-breakage paths (fail_open: engine_unavailable, scan_source_raised). The hot path -- a Bash command carrying no inline Python -- is deliberately NOT logged: it fires on essentially every Bash call, so a record there would be pure volume with no diagnostic value, and the goal's own criterion 2 requires an approved command to produce no line. Hook liveness is covered instead by a settings.json registration assertion (guard-1943 pattern), not by per-command telemetry."
     retirement_eligible: true
 
+  - id: bash-store-write-guard
+    script: core/scripts/bash-store-write-guard.py
+    embedded: false
+    instrumented: false
+    sites:
+      - { file: ".claude/settings.json", phase: "PreToolUse[Bash] hook" }
+    dominant_risk: FN
+    asymmetry_magnitude: extreme
+    keyword_bias: strict
+    override_flag: "STORE_WRITE_GUARD_OVERRIDE anywhere in the command"
+    fp_cost: low
+    fn_cost: high
+    fp_description: "A legitimate hand restore of a store (operator, post archive-before-delete) is refused once; the token clears it and the bypass is logged to core/logs/hook-fires/store-write-guard.jsonl."
+    fn_description: "An ad-hoc redirect / sed -i / python heredoc writes a governed JSONL or YAML store directly: no lock, no .history snapshot, no changelog, no schema check. Measured 2026-08-29 (a downstream worker Body): a goal parked at status 'done' -- a value no reader knows -- so it never completed, never posted, and never released in_flight."
+    rb_evidence: ["guard-996", "guard-1052"]
+    tuning_notes: "Writes only, by design: reads of a store are also against the rules but skills grep stores to confirm their own writes landed. Temp paths (/tmp, $TMPDIR, agents/<a>/temp/, sessions/<sid>/scratch/) are exempt -- hand-built fixtures are not governed stores. Denies and overrides are logged locally (not to gate-firings) so the hot path stays free of daemon hops. RETIREMENT CRITERION: override/(deny+override) > 0.5 over 20+ firings, or a daemon-side write fence makes the file unwritable by anything but the scripts."
+    retirement_eligible: true
+
 pending_audit:
   - audit-schema-gate.py
   - encode-stable-facts-gate.py
