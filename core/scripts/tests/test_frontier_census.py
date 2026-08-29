@@ -209,6 +209,8 @@ def _manifest(agents: Path, agent: str, sid: str, state: str, age_s: float) -> N
 
 
 def test_body_census_active_closed_recent_closed_old(tmp_path):
+    """A dead session never closes its manifest (measured: 37 of 49 read `active`,
+    14 fresh), so `active` requires a fresh manifest OR a fresh body-heartbeat."""
     agents = tmp_path / "agents"
     _manifest(agents, "coach", "s1", "active", 10)
     _manifest(agents, "coach", "s2", "parked", 10)
@@ -216,9 +218,16 @@ def test_body_census_active_closed_recent_closed_old(tmp_path):
     _manifest(agents, "coach", "s4", "'merged'", 60)           # quoted form
     _manifest(agents, "coach", "s5", "closed-stale", 3 * 24 * 3600)   # too old
     _manifest(agents, "other", "s6", "closed-pending-merge", 60)
+    _manifest(agents, "coach", "s7", "active", 2 * 24 * 3600)   # died days ago, never closed
+    # Stale manifest but a FRESH heartbeat beside it: the Body is alive (a manifest is
+    # written at join and close, the heartbeat every tick).
+    _manifest(agents, "coach", "s8", "active", 2 * 24 * 3600)
+    hb = agents / "coach" / "sessions" / "s8" / "body-heartbeat"
+    hb.write_text("beat\n", encoding="utf-8")
     b = _frontier.count_bodies(agents, lookback_hours=6)
-    assert b == {"active": 2, "closed_recent": 3, "scanned": 6}
-    assert _frontier.count_bodies(tmp_path / "nope") == {"active": 0, "closed_recent": 0, "scanned": 0}
+    assert b == {"active": 3, "active_stale": 1, "closed_recent": 3, "scanned": 8}
+    assert _frontier.count_bodies(tmp_path / "nope") == {
+        "active": 0, "active_stale": 0, "closed_recent": 0, "scanned": 0}
 
 
 def test_open_funnel_goals_by_signal_prefix(tmp_path):

@@ -138,6 +138,7 @@ All data comes from framework scripts — no direct JSONL reads.
    #   08-24 34.8h(date-floored 48.8h) 87.5% (n=32, split 76/1279)  <- SAME DAY, ~13min later, DIFFERENT BOX
    #   08-24 63.3h(date-floored 83.9h) 83.3% (n=66, split 78/1279)  <- WIDEST WINDOW IN THE SERIES
    #   08-25 13.3h(date-floored 25.3h) 63.0% (n=27, split 40/1335)  <- BACKLOG DRAINED 78->40, COVERAGE FELL WITH IT
+   #   08-29 49.4h(date-floored 3 calendar days) 90.3% (n=31, split 50/1397)  <- HIGHEST NON-100% IN THE SERIES, ON A WIDE WINDOW
    # THE THIRD 08-24 ROW REFINES THE BACKLOG MODEL THE OTHER TWO PROPOSED, and it is the
    # only row that can: it carries the HIGHEST backlog yet recorded (78 resolved) and still
    # scored the LOWEST of the three, because its window is ~1.7x wider and reaches back past

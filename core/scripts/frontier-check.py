@@ -59,7 +59,8 @@ def main(argv=None) -> int:
     print(f"claimable frontier: {census['claimable_count']}   gated: {census['gated_count']}   "
           f"in-progress: {census['in_progress']}   deferred: {census['deferred']}   "
           f"blocked: {census['blocked']}   user-only: {census['user_only']}")
-    print(f"bodies: active={b['active']} closed-recent={b['closed_recent']} "
+    print(f"bodies: active={b['active']} active-stale={b.get('active_stale', 0)} "
+          f"closed-recent={b['closed_recent']} "
           f"(of {b['scanned']} manifests, last {lookback:g}h)   "
           f"active aspirations: {census['active_aspirations']}   "
           f"parse_skipped: {census['parse_skipped']}")
