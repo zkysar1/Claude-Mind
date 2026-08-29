@@ -6,6 +6,15 @@ Query parameters (at least one required — same rule as the CLI):
     goal_field_name=<field>              paired with goal_field_value
     goal_field_value=<value>             AND semantics with name (both or neither)
     title_contains=<substring>           case-insensitive
+    description_contains=<substring>     case-insensitive, matches the goal's
+                                          `description` body (g-115-5200). The
+                                          duplication GATE that refuses a filing
+                                          already reads descriptions; without this
+                                          the pre-filing PROBE could only read
+                                          titles, so the check was narrower than
+                                          the refusal and every differently-worded
+                                          sibling looked novel — measured at 5
+                                          duplicate filings by 4 agents in 7 days.
     full=true|1|yes                      return the full canonical goal record
                                           (raw goal dict + {asp_id, source}) instead
                                           of the 6-field projection (g-115-1304;
@@ -126,7 +135,8 @@ def _bool_input_matches(actual: bool, value: str):
     return None
 
 
-def _goal_matches(goal: Dict[str, Any], status_filter, field_filter, title_substr) -> bool:
+def _goal_matches(goal: Dict[str, Any], status_filter, field_filter, title_substr,
+                  desc_substr=None) -> bool:
     """AND semantics across filters. Sole implementation — the
     `aspirations.py:_goal_matches` this once mirrored was deleted in the
     2026-05-14 daemon-only cutover and no second site exists (g-115-3965).
@@ -158,6 +168,15 @@ def _goal_matches(goal: Dict[str, Any], status_filter, field_filter, title_subst
         title = goal.get("title", "")
         if title_substr.lower() not in title.lower():
             return False
+    if desc_substr is not None:
+        # `or ""` rather than a get() default: MOST goals carry no description at
+        # all, and a large minority carry an explicit null, so `get("description",
+        # "")` returns None for them and .lower() raises AttributeError — a 500 on
+        # the single most common shape this filter meets. The two-argument default
+        # only fires when the KEY is absent, never when its VALUE is None.
+        description = goal.get("description") or ""
+        if desc_substr.lower() not in description.lower():
+            return False
     return True
 
 
@@ -169,6 +188,7 @@ def query(ctx) -> "Response":  # type: ignore[name-defined]
     raw_field_name = q.get("goal_field_name")
     raw_field_value = q.get("goal_field_value")
     raw_title = q.get("title_contains")
+    raw_desc = q.get("description_contains")
     raw_full = q.get("full")
     # full=true|1|yes → return raw goal records + {asp_id, source} metadata instead
     # of the 5-field projection. Goal-by-id full-record read in one call ().
@@ -183,11 +203,11 @@ def query(ctx) -> "Response":  # type: ignore[name-defined]
             "goal_field_name and goal_field_value must be provided together",
         )
 
-    if not (raw_status or raw_field_name or raw_title):
-        # Mirror cmd_query line 875 stderr message verbatim, status 400.
+    if not (raw_status or raw_field_name or raw_title or raw_desc):
         return Response.error(
             400, "missing_filter",
-            "Specify at least one filter (goal_status, goal_field, title_contains)",
+            "Specify at least one filter (goal_status, goal_field, title_contains, "
+            "description_contains)",
         )
 
     status_filter = None
@@ -278,7 +298,8 @@ def query(ctx) -> "Response":  # type: ignore[name-defined]
             for goal in asp.get("goals", []):
                 if field_key is not None and not field_key_seen and field_key in goal:
                     field_key_seen = True
-                if _goal_matches(goal, status_filter, field_filter, raw_title):
+                if _goal_matches(goal, status_filter, field_filter, raw_title,
+                                 raw_desc):
                     if full_mode:
                         # Full-record read (): raw goal dict + {asp_id,
                         # source} metadata. Returns the canonical record

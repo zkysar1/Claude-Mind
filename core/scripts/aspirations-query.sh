@@ -34,12 +34,13 @@ source "$CORE_ROOT/scripts/_argv_strict.sh"
 # ONE literal, referenced by BOTH the --help arm and the refusal (
 # fresh-eyes F-002) — two strings that must agree is the drift surface the
 # refusal exists to remove.
-_ACCEPTED_FLAGS="--goal-status <status> | --goal-field <name> <value> | --title-contains <substr> | --full"
+_ACCEPTED_FLAGS="--goal-status <status> | --goal-field <name> <value> | --title-contains <substr> | --description-contains <substr> | --full"
 
 GOAL_STATUS=""
 GOAL_FIELD_NAME=""
 GOAL_FIELD_VALUE=""
 TITLE_CONTAINS=""
+DESC_CONTAINS=""
 FULL=0
 
 # Value-arg pattern: "${2-}" + safe shift; see retrieve.sh for rationale.
@@ -56,6 +57,16 @@ while [[ $# -gt 0 ]]; do
             TITLE_CONTAINS="${2-}"
             argv_strict_refuse_flaglike_value "$(basename "$0")" --title-contains \
                 "$TITLE_CONTAINS" "$_ACCEPTED_FLAGS"
+            shift $(( $# >= 2 ? 2 : 1 ));;
+        --description-contains)
+            # Substring over the goal's `description` body (). Matches
+            # SERVER-side against the raw record, so it needs no --full — the
+            # six-key projection limit (guard-4824) governs what comes BACK, not
+            # what can be filtered ON. Same semantics as --title-contains so
+            # there is one shape to learn.
+            DESC_CONTAINS="${2-}"
+            argv_strict_refuse_flaglike_value "$(basename "$0")" --description-contains \
+                "$DESC_CONTAINS" "$_ACCEPTED_FLAGS"
             shift $(( $# >= 2 ? 2 : 1 ));;
         --goal-field)
             GOAL_FIELD_NAME="${2-}"
@@ -98,7 +109,10 @@ while [[ $# -gt 0 ]]; do
   Anything else (created_at, priority, defer_reason, claimed_by, ...) requires --full.
   --goal-field matches the RAW record, so it filters on fields the projection does
   not show; the identifier there is \`id\`, and \`goal_id\` is accepted as an alias.
-  A name no record carries is REFUSED, not answered with an empty array.";;
+  A name no record carries is REFUSED, not answered with an empty array.
+  --description-contains searches the description BODY. Use it for dedup probes:
+  the duplication gate that refuses a filing reads descriptions, so a title-only
+  check is narrower than the refusal and differently-worded siblings look novel.";;
         -*)
             # REFUSE (). Every unrecognized flag used to land in a
             # write-only PASSTHROUGH array, so the query silently answered a
@@ -146,9 +160,13 @@ if [ -n "$TITLE_CONTAINS" ]; then
     [ -n "$QUERY" ] && QUERY+="&"
     QUERY+="title_contains=$(rt_url_encode "$TITLE_CONTAINS")"
 fi
+if [ -n "$DESC_CONTAINS" ]; then
+    [ -n "$QUERY" ] && QUERY+="&"
+    QUERY+="description_contains=$(rt_url_encode "$DESC_CONTAINS")"
+fi
 
 if [ -z "$QUERY" ]; then
-    echo "Error: at least one filter is required (--goal-status, --goal-field, or --title-contains)." >&2
+    echo "Error: at least one filter is required (--goal-status, --goal-field, --title-contains, or --description-contains)." >&2
     exit 1
 else
     # --full appends full=true ONLY when a filter is present (QUERY non-empty),

@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.21",
+    "previous_version": "2.12.20",
+    "date": "2026-08-29",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "reasoning-bank.py / retrieve.py run as a script now refuse loudly (rc=2) naming their wrappers instead of exiting 0 in silence",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.20",
     "previous_version": "2.12.19",
     "date": "2026-08-29",

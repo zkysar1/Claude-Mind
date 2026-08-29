@@ -48,7 +48,12 @@ def seeded_with_goals(running_daemon):
             {"id": "g-001-01", "title": "Build encoding pipeline",
              "status": "pending", "category": "framework-architecture",
              "tags": ["routine"], "recurring": True,
-             "verified": "true"},
+             "verified": "true",
+             # widget_sentinel appears in NO title anywhere in this fixture —
+             # that is the point: it is only reachable by description_contains
+             # (). guard-2353 — the row must lie on the far side of
+             # the boundary being moved or the suite gives the change no evidence.
+             "description": "Covers the widget_sentinel path end to end."},
             # STRAY PROJECTION-ONLY KEYS ON A RAW RECORD (). These two
             # are attached at projection time and are NOT goal fields — but real
             # records in the live store carry stray literal copies anyway (both
@@ -76,15 +81,22 @@ def seeded_with_goals(running_daemon):
         "priority": "HIGH",
         "archived": False,
         "goals": [
+            # EXPLICIT NULL description. `goal.get("description", "")` returns
+            # None here (the two-arg default fires only on an ABSENT key), so a
+            # naive implementation raises AttributeError on .lower() — a 500 on
+            # a shape the live store carries in bulk.
             {"id": "g-100-01", "title": "Encode session insights",
              "status": "pending", "category": "framework-architecture",
-             "tags": ["urgent", "encoding"], "recurring": True},
+             "tags": ["urgent", "encoding"], "recurring": True,
+             "description": None},
+            # ABSENT description key — the other null shape, and the common one.
             {"id": "g-100-02", "title": "Refactor encoder",
              "status": "pending", "category": "framework-architecture",
              "tags": []},
             {"id": "g-100-03", "title": "Investigate flaky test",
              "status": "blocked", "category": "infra",
-             "tags": ["urgent"]},
+             "tags": ["urgent"],
+             "description": "Retry logic interacts with widget_sentinel under load."},
         ],
         "progress": {"completed_goals": 0, "total_goals": 3},
     }
@@ -476,3 +488,86 @@ def test_query_string_field_holding_true_is_not_coerced(seeded_with_goals):
         _, body = _get(port, "/v1/aspirations/query",
                        {"goal_field_name": "verified", "goal_field_value": spelling})
         assert json.loads(body) == [], spelling
+
+
+# ---------------------------------------------------------------------------
+# Filter: description_contains ()
+#
+# The duplication GATE that refuses a filing already reads descriptions; the
+# probe an agent runs BEFORE filing could only read titles. That asymmetry cost
+# 5 duplicate filings by 4 agents in 7 days — every sibling was worded
+# differently, so every title search came back clean and every filing looked
+# novel. These pin the probe to the gate's own width.
+# ---------------------------------------------------------------------------
+
+def test_query_description_contains_finds_what_title_search_cannot(seeded_with_goals):
+    """The core defect: a token present ONLY in descriptions.
+
+    The title search is the positive control — it must return [] for the same
+    token, or this test would pass even if the filter secretly read titles.
+    """
+    _, port = seeded_with_goals
+    _, body = _get(port, "/v1/aspirations/query",
+                   {"description_contains": "widget_sentinel"})
+    ids = sorted(r["goal_id"] for r in json.loads(body))
+    assert ids == ["g-001-01", "g-100-03"]
+
+    _, title_body = _get(port, "/v1/aspirations/query",
+                         {"title_contains": "widget_sentinel"})
+    assert json.loads(title_body) == [], (
+        "positive control failed: the token leaked into a title, so the "
+        "description filter is not what produced the rows above"
+    )
+
+
+def test_query_description_contains_is_case_insensitive(seeded_with_goals):
+    """Mirror --title-contains semantics exactly — one shape to learn."""
+    _, port = seeded_with_goals
+    _, body = _get(port, "/v1/aspirations/query",
+                   {"description_contains": "WIDGET_SENTINEL"})
+    ids = sorted(r["goal_id"] for r in json.loads(body))
+    assert ids == ["g-001-01", "g-100-03"]
+
+
+def test_query_description_contains_composes_with_goal_status(seeded_with_goals):
+    """Composition is explicitly required: naive flag composition in this script
+    is already broken elsewhere (g-115-5128), so the new flag must be pinned
+    against a second filter, not just alone."""
+    _, port = seeded_with_goals
+    _, body = _get(port, "/v1/aspirations/query",
+                   {"description_contains": "widget_sentinel",
+                    "goal_status": "pending"})
+    ids = [r["goal_id"] for r in json.loads(body)]
+    assert ids == ["g-001-01"], "AND semantics must drop the blocked g-100-03"
+
+
+def test_query_description_contains_survives_null_and_absent_descriptions(seeded_with_goals):
+    """Most goals carry no description; a large minority carry an explicit null.
+
+    Both shapes are in the fixture (g-100-01 null, g-100-02 absent). A miss must
+    return [] with HTTP 200 — never a 500 from .lower() on None.
+    """
+    _, port = seeded_with_goals
+    status, body = _get(port, "/v1/aspirations/query",
+                        {"description_contains": "no-goal-carries-this-string"})
+    assert status == 200
+    assert json.loads(body) == []
+
+
+def test_query_description_contains_alone_satisfies_the_filter_requirement(seeded_with_goals):
+    """It must count as a filter — otherwise it 400s as missing_filter and the
+    flag is unusable on its own, which is the primary dedup-probe shape."""
+    _, port = seeded_with_goals
+    status, body = _get(port, "/v1/aspirations/query",
+                        {"description_contains": "widget_sentinel"})
+    assert status == 200
+    assert len(json.loads(body)) == 2
+
+
+def test_query_title_contains_unchanged_by_the_new_filter(seeded_with_goals):
+    """Regression pin: --title-contains behaviour is unchanged (goal's own
+    verification criterion)."""
+    _, port = seeded_with_goals
+    _, body = _get(port, "/v1/aspirations/query", {"title_contains": "ENCOD"})
+    ids = sorted(r["goal_id"] for r in json.loads(body))
+    assert ids == ["g-001-01", "g-100-01", "g-100-02"]

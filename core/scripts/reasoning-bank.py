@@ -639,3 +639,19 @@ def normalize_record(rec, defaults):
 # validators, and utility functions (guardrail-check.py, learning-ratio.py,
 # utilization-feedback.py, board.py, _rb_helpers.py, tests).
 # ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    # NOT a CLI fallback (no-python-cli-fallback.md): a refusal that names the
+    # writers. Measured 2026-08-29 on a downstream deployment: a Body ran
+    # `python3 core/scripts/reasoning-bank.py add --entry ...`, got rc=0 and no
+    # output, and read the silence as "added". Nothing was written.
+    import sys
+
+    sys.stderr.write(
+        "reasoning-bank.py is a daemon-side library, not a command -- running it "
+        "writes nothing. Use the wrappers: `bash core/scripts/reasoning-bank-add.sh` "
+        "(JSON record on stdin), `reasoning-bank-read.sh`, "
+        "`reasoning-bank-update-field.sh <id> <field> <value>`, "
+        "`reasoning-bank-increment.sh <id> <field>`.\n"
+    )
+    sys.exit(2)
