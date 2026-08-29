@@ -352,6 +352,8 @@ its own.** Its own caveat above concedes it carries a title-LENGTH confound, whi
 reader cannot tell how much of its delta is noise and how much is that confound; a floor
 you cannot decompose is a weak floor.
 
+**Do not hand-roll the batch-vs-corpus comparison — invoke `/compare-batch-vs-corpus-rate`** (forged; its SKILL.md already declares `Called by: /replay --sharp-wave`). It does NOT supply the size-matched GROUP-SIZE PERMUTATION FLOOR this section asks for — treating its output as that floor drops the control (g-115-6627). Build the floor yourself, over `id[11:]` per the correction below.
+
 ⚠ **CORRECTED 2026-08-18 (zeta, `hostname` cc-02, `uname -r` 6.8.0-137-generic,
 g-001-05, 570 scoreable candidates, base corrected rate 29.3%). This block used to
 prescribe the parity of a checksum over the record id, `sum(ord(c) for c in id) % 2 == 0`,

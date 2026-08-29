@@ -13,6 +13,7 @@ Manages:
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -95,6 +96,54 @@ def cmd_state_get(args):
         print(val)
 
 
+def require_runner_sid():
+    """RUNNING implies a non-empty running-session-id (the rb-323/guard-403 invariant).
+
+    /start's runner triple-write (running-session-id + latest-session-id + runner-token)
+    MUST precede the RUNNING flip: stop-hook.sh routes the runner on running-session-id,
+    so a RUNNING agent without it is treated like an observer at turn end — never BLOCKed —
+    and its loop dies silently at the first text-only turn end. Measured 2026-08-29 (a
+    paged /start --recover on a small model skipped the triple-write, acquired the claim
+    and flipped RUNNING; the file was absent until an operator wrote it by hand). The
+    skill already HALTs on a non-zero exit here, so refusing puts the model back on the
+    missing step instead of booting a runner the stop hook cannot see.
+    """
+    sid = read_file(SESSION_DIR / "running-session-id")
+    if not sid:
+        print(
+            "REJECTED: state RUNNING requires a non-empty running-session-id "
+            f"({SESSION_DIR / 'running-session-id'}). Run /start's runner triple-write first "
+            "(running-session-id + latest-session-id + runner-token), then set RUNNING — "
+            "the stop hook routes the runner on that file (rb-323/guard-403).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    env_sid = os.environ.get("MIND_SID", "").strip()
+    if env_sid and sid != env_sid:
+        print(
+            f"REJECTED: running-session-id names {sid[:8]}… but this session is {env_sid[:8]}… — "
+            "a stale runner file. Run /start's manifest-clear and the runner triple-write in THIS "
+            "session before setting RUNNING.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    # The liveness carrier is the other half of the same invariant. The tool-call-cadence
+    # tick (bash-agent-inject.py, ) keys on session/body-heartbeat-<SID>.json and
+    # never creates it; /start's pre-flip heartbeat-tick does. A runner that flips RUNNING
+    # without it renews its lease only at iteration boundaries, so a long single-turn /boot
+    # ages the claim past the takeover threshold while the reducer is alive and working
+    # (measured 2026-08-29: 3214 s of a 3900 s threshold, 11 minutes from a false takeover).
+    if env_sid and not (SESSION_DIR / f"body-heartbeat-{env_sid}.json").is_file():
+        print(
+            f"REJECTED: state RUNNING requires this session's liveness carrier "
+            f"({SESSION_DIR / f'body-heartbeat-{env_sid}.json'}). Run /start's pre-flip "
+            "heartbeat-tick (it writes the carrier), then set RUNNING — without it the "
+            "tool-call-cadence tick never fires and the runner lease starves during /boot.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def cmd_state_set(args):
     """Write agent-state after validation."""
     require_agent()
@@ -102,6 +151,8 @@ def cmd_state_set(args):
     if value not in VALID_STATES:
         print(f"ERROR: Invalid state '{value}'. Must be one of: {', '.join(sorted(VALID_STATES))}", file=sys.stderr)
         sys.exit(1)
+    if value == "RUNNING":
+        require_runner_sid()
     write_file(SESSION_DIR / "agent-state", value)
 
 

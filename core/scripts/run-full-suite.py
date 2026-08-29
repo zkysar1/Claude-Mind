@@ -752,7 +752,7 @@ def _solo(path, root, env):
     rather than clean.
     """
     try:
-        r = subprocess.run([sys.executable, "-m", "pytest", path, "-q"],
+        r = subprocess.run([sys.executable, "-m", "pytest", path],
                            capture_output=True, text=True, cwd=str(root),
                            env=env, timeout=1800)
     except Exception as exc:
@@ -1201,7 +1201,14 @@ def main(argv=None):
     combined = []
     tot_p = tot_f = tot_e = 0
     for i, group in enumerate(groups):
-        cmd = [sys.executable, "-u", "-m", "pytest", *group, "-q"]
+        # NO -q HERE, DELIBERATELY (). pytest.ini:12 already sets
+        # `addopts = -q`; passing it again makes -qq, which SUPPRESSES the final
+        # summary line. _parse_counts then reads (0,0,0) from every chunk log and
+        # the whole verdict path silently computes from nothing, while the run
+        # still exits 0 and still prints dots to [100%] so it looks healthy.
+        # Measured both directions on cc-02 2026-08-29: with -q, zero lines match
+        # "[0-9]+ passed"; without it, "20 passed, 2 warnings in 0.50s".
+        cmd = [sys.executable, "-u", "-m", "pytest", *group]
         # ONE -m carrying every clause. A SECOND -m does not AND with the first;
         # pytest keeps only the last and SILENTLY DISCARDS the earlier one.
         # Measured 2026-08-19 on test_daemon_orphan_prevention.py: `-m "not
@@ -1235,6 +1242,28 @@ def main(argv=None):
 
     print("\n" + "=" * 66)
     print("TOTAL: %d passed, %d failed, %d errors" % (tot_p, tot_f, tot_e))
+
+    # NO-COUNTS RECOVERY POINTER (). All three zero means no chunk log
+    # yielded a pytest summary line, so every verdict below is computed from
+    # nothing -- and the caller cannot tell that silence from a normal red. The
+    # analysis is NOT lost: --triage re-reads the chunk logs already on disk and
+    # re-runs each failing file solo, recovering the full attribution in ~1min
+    # with no re-run. Measured 2026-08-29 on cc-04 (alpha): the runner exited 1
+    # after only its 4 header lines, twice, and --triage then returned
+    # "1 environmental | 16 genuine-owned | 0 genuine-UNOWNED" from those same
+    # logs. The recovery path existed the whole time and was undocumented AT THE
+    # CALL SITE, which is the part that cost the time -- the filer did not know
+    # the flag existed. Printing it here is deliberately cheaper than
+    # root-causing why the chunks emit no summary, which is still open and is a
+    # SEPARATE question from the parent's own lost output (the chunks already
+    # run with -u; only the parent does not).
+    if (tot_p, tot_f, tot_e) == (0, 0, 0) and list(Path(out).glob("chunk-*.log")):
+        print("  NO COUNTS PARSED -- no chunk log carried a pytest summary line.")
+        print("  This is NOT a clean run and NOT a normal red; the verdict below "
+              "is computed from nothing.")
+        print("  RECOVER WITHOUT RE-RUNNING: run-full-suite.sh --triage")
+        print("  (reads the chunk-*.log files already in %s and solo-classifies "
+              "each failure)" % out)
 
     # Tree-move check runs BEFORE every other verdict and outranks all of them
     # (). A mixed-tree run is uninterpretable in BOTH directions: a
@@ -1284,7 +1313,7 @@ def main(argv=None):
             worst = max(files_failing,
                         key=lambda f: blob.count("FAILED " + f))
             print("  confirming: re-running %s alone ..." % worst)
-            cmd = [sys.executable, "-m", "pytest", worst, "-q"]
+            cmd = [sys.executable, "-m", "pytest", worst]
             r = subprocess.run(cmd, capture_output=True, text=True,
                                cwd=str(PROJECT_ROOT), env=env)
             sp, sf, _ = _parse_counts(r.stdout or "")

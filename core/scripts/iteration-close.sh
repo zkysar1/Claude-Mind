@@ -1042,6 +1042,75 @@ do_verify() {
 
     if [[ "$IS_RECURRING" == "true" ]]; then
         bash "$SCRIPT_DIR/aspirations-complete-by.sh" --source "$SOURCE" "$GOAL_ID"
+
+        # -- g-115-6768: WORKER-ONLY recurring-tally advance -------------------
+        # The five counters a recurring close must advance -- substantive_runs,
+        # substantive_hits, last_substantive_at, consecutive_routine,
+        # consecutive_deep -- are written by recurring-close.sh's post-phase
+        # heredoc, STRICTLY AFTER all four iteration-close phases. A worker
+        # never runs that script (it would drag in three reducer-only phases),
+        # so on the worker path those five freeze while complete_by advances
+        # achievedCount / currentStreak / lastAchievedAt normally. Nothing
+        # errors; the close looks complete and the tally silently stalls.
+        #
+        # FAIL-UNSAFE DIRECTION, which is why this is a defect and not an
+        # omission: substantive_runs is the DENOMINATOR of the lifetime_hit_rate
+        # cargo-cult-detector.py keys on, so a denominator missing worker closes
+        # INFLATES the rate -- a low-value recurring goal executed mostly by
+        # workers looks MORE productive than it is, the exact inverse of what
+        # the detector exists to catch.
+        #
+        # MEASURED 2026-08-29 (alpha, cc-07): 36 of the 80 recurring goals that
+        # track substantive_runs (45%) had their most recent close performed by
+        # a worker Body. That is a FLOOR, not a partition -- the role stamp added
+        # by g-306-204 identifies worker closes positively and writes NOTHING for
+        # a reducer, so absent means reducer-OR-unknown.
+        #
+        # (The sentence above deliberately does not spell that field name out.
+        # Its ordering test locates the stamp with a bare body.find() on the
+        # bare identifier, so ANY comment containing it matches first and the
+        # assertion compares a comment offset against the status write instead
+        # of comparing the real stamp. Measured twice while writing this block:
+        # once by the explanatory sentence, then again by a parenthetical that
+        # named the test FILE -- whose own name carries the identifier.)
+        #
+        # THE COMPLEMENT, stated rather than left implicit (guard-2783): the
+        # REDUCER must NOT run this branch. It reaches the identical arithmetic
+        # through recurring-close.sh's own heredoc, and an unguarded call here
+        # would DOUBLE-COUNT every reducer close -- recurring-close.sh invokes
+        # this very function as its `verify` phase before writing the tally
+        # itself. BODY_ROLE is the correct discriminator because
+        # bash-agent-inject.py exports it ONLY on the worker fork path.
+        # Role-conditional inside do_verify is the established pattern in this
+        # file, not a new one (see the g-115-6932 pending-deploys ALL-sweep
+        # above and the --no-supersede branch below).
+        #
+        # A reducer that closes a recurring goal with `--phase verify` directly
+        # is the guard-1591 anti-pattern; it does not fire here and still does
+        # not advance the tally. That is unchanged, deliberate, and guard-1591
+        # remains the rule that governs it.
+        #
+        # Arithmetic lives in recurring_tally.py so the two paths cannot
+        # silently diverge; that module is READ-ONLY (it resolves the store and
+        # emits field/value pairs) and the writes stay here, through the same
+        # daemon-routed wrapper every other stamp in do_verify uses. Each write
+        # is NON-FATAL (g-115-7663): bare, under `set -euo pipefail`, a lock
+        # blip on a bookkeeping stamp would abort the close AFTER the status
+        # write already landed.
+        # RECURRING_TALLY_OWNER is set by recurring-close.sh around this very
+        # call, because it writes the same counters after its four phases.
+        # Without that half, a worker Body that closed through recurring-close.sh
+        # -- which guard-1591 tells it to do -- would advance every counter TWICE.
+        if [[ "${BODY_ROLE:-}" == "worker" && -z "${RECURRING_TALLY_OWNER:-}" ]]; then
+            local _tf _tv
+            while IFS=$'\t' read -r _tf _tv; do
+                [[ -n "$_tf" ]] || continue
+                bash "$SCRIPT_DIR/aspirations-update-goal.sh" --source "$SOURCE" "$GOAL_ID" "$_tf" "$_tv" \
+                    || echo "[iteration-close] WARN recurring-tally: $_tf stamp failed for $GOAL_ID (non-fatal; close already committed)" >&2
+            done < <(GID="$GOAL_ID" SRC_FLAG="$SOURCE" OUTCOME="$OUTCOME" \
+                         NOW="$(date +%Y-%m-%dT%H:%M:%S)" \
+                         python3 "$SCRIPT_DIR/recurring_tally.py" || true)
+        fi
     else
         # g-280-09 auto-override: for deep-outcome iterations, iteration-commit.sh
         # fires unconditionally in do_state_update (this same invocation, next
