@@ -3021,4 +3021,19 @@ def _log_retrieval_trace(category, depth, read_only, items_returned,
     except Exception:
         return
 
+
+if __name__ == "__main__":
+    # NOT a CLI fallback (no-python-cli-fallback.md): a refusal that names the
+    # wrapper. `python3 core/scripts/retrieve.py --category x` used to exit 0
+    # with no output -- the silent-success shape a small model reads as "no
+    # knowledge on that topic" (measured 2026-08-29, downstream deployment).
+    import sys
+
+    sys.stderr.write(
+        "retrieve.py is a daemon-side library, not a command -- running it "
+        "retrieves nothing. Use `bash core/scripts/retrieve.sh --category <q> "
+        "--depth shallow` (add --include-framework for rules and conventions).\n"
+    )
+    sys.exit(2)
+
 # ---------------------------------------------------------------------------
