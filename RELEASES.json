@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.25",
+    "previous_version": "2.12.24",
+    "date": "2026-08-29",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "frontier census: dependency_funnel.liveness_hours (1h) separates live Bodies from sessions that died without closing their manifest; frontier-check --liveness-hours",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.24",
     "previous_version": "2.12.23",
     "date": "2026-08-29",

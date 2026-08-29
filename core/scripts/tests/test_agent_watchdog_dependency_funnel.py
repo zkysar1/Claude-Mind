@@ -115,7 +115,8 @@ def test_config_defaults_come_from_aspirations_yaml():
     got = WD._dependency_funnel_config()
     for key, value in declared.items():
         assert got[key] == value, f"{key}: probe read {got[key]}, config declares {value}"
-    assert set(got) == {"min_gated", "ticks_to_file", "ticks_to_revalidate", "lookback_hours"}
+    assert set(got) == {"min_gated", "ticks_to_file", "ticks_to_revalidate", "lookback_hours",
+                        "liveness_hours"}
 
 
 # ── 2-3. positive control and discrimination ─────────────────────────────────

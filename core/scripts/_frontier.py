@@ -153,20 +153,23 @@ def roots_of(goal_id: str, goal_index: dict) -> set:
 
 
 def count_bodies(agents_root_path, now: float | None = None,
-                 lookback_hours: float = 6.0) -> dict:
+                 lookback_hours: float = 6.0, liveness_hours: float = 1.0) -> dict:
     """Body census from `agents/*/sessions/*/body-manifest.yaml`.
 
-    `active` = manifests in an active/parked state whose session is FRESH —
-    the manifest or its `body-heartbeat` changed within `lookback_hours`. A
+    `active` = manifests in an active/parked state whose session is LIVE —
+    the manifest or its `body-heartbeat` changed within `liveness_hours`. A
     Body that dies mid-session never closes its manifest, so `body_state:
     active` alone over-counts by a lot: measured 2026-08-29 on a live 8-Body
-    deployment, 37 of 49 manifests read `active` and 14 had a heartbeat inside
-    6h. The rest are reported as `active_stale`, never as Bodies.
+    deployment, 42 of 49 manifests read active/parked; 14 had a heartbeat
+    inside 6h and exactly 8 inside 1h — the live set's heartbeats were 2–26
+    min old and the dead set's 2h+, so one hour separates them with margin on
+    both sides (a single model turn can run 15 min). The rest are reported as
+    `active_stale`, never as Bodies.
     `closed_recent` = manifests in a closed state whose file changed within
-    the window — Bodies that stopped recently, which on a frontier of 0 means
-    "stopped for lack of work". Read with a line regex rather than a YAML
-    parser: the file is written by the framework in a fixed shape and a parser
-    dependency would make a census fail where a grep would not.
+    `lookback_hours` — Bodies that stopped recently, which on a frontier of 0
+    means "stopped for lack of work". Read with a line regex rather than a
+    YAML parser: the file is written by the framework in a fixed shape and a
+    parser dependency would make a census fail where a grep would not.
     """
     out = {"active": 0, "active_stale": 0, "closed_recent": 0, "scanned": 0}
     if not agents_root_path:
@@ -176,6 +179,7 @@ def count_bodies(agents_root_path, now: float | None = None,
         return out
     now = time.time() if now is None else now
     cutoff = now - lookback_hours * 3600.0
+    live_cutoff = now - liveness_hours * 3600.0
     for manifest in root.glob("*/sessions/*/body-manifest.yaml"):
         try:
             text = manifest.read_text(encoding="utf-8", errors="replace")
@@ -194,14 +198,15 @@ def count_bodies(agents_root_path, now: float | None = None,
                     mtime = max(mtime, heartbeat.stat().st_mtime)
             except OSError:
                 pass
-            out["active" if mtime >= cutoff else "active_stale"] += 1
+            out["active" if mtime >= live_cutoff else "active_stale"] += 1
         elif state in CLOSED_BODY_STATES and mtime >= cutoff:
             out["closed_recent"] += 1
     return out
 
 
 def frontier_census(world_dir, agents_root_path, *, now: float | None = None,
-                    lookback_hours: float = 6.0, max_ids: int = 40) -> dict:
+                    lookback_hours: float = 6.0, liveness_hours: float = 1.0,
+                    max_ids: int = 40) -> dict:
     """The whole census as one dict. Pure read; never raises on store shape.
 
     Keys a consumer acts on:
@@ -282,7 +287,8 @@ def frontier_census(world_dir, agents_root_path, *, now: float | None = None,
         "pending_total": len(claimable) + len(gated),
         **counts,
         "active_aspirations": len(active_asp_ids),
-        "bodies": count_bodies(agents_root_path, now=now, lookback_hours=lookback_hours),
+        "bodies": count_bodies(agents_root_path, now=now, lookback_hours=lookback_hours,
+                               liveness_hours=liveness_hours),
         "parse_skipped": stats["parse_skipped"],
         "stores_scanned": stats["stores"],
     }

@@ -224,8 +224,13 @@ def test_body_census_active_closed_recent_closed_old(tmp_path):
     _manifest(agents, "coach", "s8", "active", 2 * 24 * 3600)
     hb = agents / "coach" / "sessions" / "s8" / "body-heartbeat"
     hb.write_text("beat\n", encoding="utf-8")
-    b = _frontier.count_bodies(agents, lookback_hours=6)
-    assert b == {"active": 3, "active_stale": 1, "closed_recent": 3, "scanned": 8}
+    # Inside the closed-recently window but past the liveness window: a session that
+    # died two hours ago (measured: live heartbeats are minutes old, dead ones 2h+).
+    _manifest(agents, "coach", "s9", "active", 2 * 3600)
+    b = _frontier.count_bodies(agents, lookback_hours=6, liveness_hours=1)
+    assert b == {"active": 3, "active_stale": 2, "closed_recent": 3, "scanned": 9}
+    # The same census at the old 6h liveness counts the 2h corpse as a Body.
+    assert _frontier.count_bodies(agents, lookback_hours=6, liveness_hours=6)["active"] == 4
     assert _frontier.count_bodies(tmp_path / "nope") == {
         "active": 0, "active_stale": 0, "closed_recent": 0, "scanned": 0}
 

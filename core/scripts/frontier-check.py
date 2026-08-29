@@ -32,20 +32,25 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Claimable-frontier census (read-only)")
     parser.add_argument("--json", action="store_true", help="emit the full census as JSON")
     parser.add_argument("--lookback-hours", type=float, default=None,
-                        help="body-census window (default: aspirations.yaml dependency_funnel.lookback_hours)")
+                        help="closed-recently window (default: aspirations.yaml dependency_funnel.lookback_hours)")
+    parser.add_argument("--liveness-hours", type=float, default=None,
+                        help="a Body is active only if its manifest/heartbeat moved within this window "
+                             "(default: aspirations.yaml dependency_funnel.liveness_hours)")
     args = parser.parse_args(argv)
 
     try:
         from _paths import WORLD_DIR, agents_root
         import _frontier
-        lookback = args.lookback_hours
-        if lookback is None:
+        lookback, liveness = args.lookback_hours, args.liveness_hours
+        if lookback is None or liveness is None:
             import yaml
             cfg_path = Path(__file__).resolve().parent.parent / "config" / "aspirations.yaml"
             with cfg_path.open(encoding="utf-8") as f:
-                lookback = float(((yaml.safe_load(f) or {}).get("dependency_funnel") or {})
-                                 .get("lookback_hours", 6))
-        census = _frontier.frontier_census(WORLD_DIR, agents_root(), lookback_hours=lookback)
+                block = (yaml.safe_load(f) or {}).get("dependency_funnel") or {}
+            lookback = float(block.get("lookback_hours", 6)) if lookback is None else lookback
+            liveness = float(block.get("liveness_hours", 1)) if liveness is None else liveness
+        census = _frontier.frontier_census(WORLD_DIR, agents_root(), lookback_hours=lookback,
+                                           liveness_hours=liveness)
     except Exception as e:  # noqa: BLE001 — report, never traceback
         print(f"frontier-check: census failed — {type(e).__name__}: {e}", file=sys.stderr)
         return 1
@@ -61,7 +66,7 @@ def main(argv=None) -> int:
           f"blocked: {census['blocked']}   user-only: {census['user_only']}")
     print(f"bodies: active={b['active']} active-stale={b.get('active_stale', 0)} "
           f"closed-recent={b['closed_recent']} "
-          f"(of {b['scanned']} manifests, last {lookback:g}h)   "
+          f"(of {b['scanned']} manifests; live<{liveness:g}h, closed<{lookback:g}h)   "
           f"active aspirations: {census['active_aspirations']}   "
           f"parse_skipped: {census['parse_skipped']}")
     if census["claimable"]:

@@ -2429,6 +2429,12 @@ dependency_funnel:
   # How far back a Body's closed manifest counts as "closed recently" in the
   # payload's body census (context for the reader, not a trigger input).
   lookback_hours: 6
+  # A Body counts as ACTIVE only if its manifest or body-heartbeat moved within
+  # this window; otherwise it is `active_stale` (a session that died without
+  # closing its manifest — the common end). Measured 2026-08-29 on a live
+  # 8-Body deployment: the 8 live heartbeats were 2–26 min old, every dead one
+  # 2h+; a single model turn can take 15 min, so 1h leaves margin both ways.
+  liveness_hours: 1
 
 # ------------------------------------------------------------------
 # Infra-health failing-streak alerting ( — asp-249)

@@ -7010,3 +7010,46 @@ would otherwise trend from. Owned by g-115-3215; filed nothing.
 **Net routed to S5: ZERO.** Every detector that fired is one the instrument
 already marks ALREADY-OWNED or CONFOUND with an explicit route-nothing
 instruction. The stamp was written regardless — the one irreducible S5 action.
+
+## S3 axes — 2026-08-29T15:0x (foxtrot, `hostname` LAPTOP-3IOFCNEO, `uname -r` 6.18.33.2-microsoft-standard-WSL2)
+
+**36.9% / 62.1% (30 `framework-*` labels) / 84.3%** at n=2202, 28 active
+aspirations, 222 distinct categories. Verdicts unchanged — axis 2 the only fire.
+Full-store, disambiguated by GOAL COUNT (2944, not 220) and `goals_omitted`
+key-presence **0/28**, per the ambiguity warning (a SUM is structurally 0 on the
+full file and cannot fail there).
+
+**Same-box longitudinal against this box's own 2026-08-20 row (the only comparison
+the cross-box `n` trap permits) — and it is the direction the dilution paragraphs
+say is NOT arithmetic:**
+
+| | 08-20 | 08-29 | delta |
+|---|---|---|---|
+| asp-115 absolute | 1706 | **1856** | +150 (+8.8%) |
+| non-115 | 357 | **346** | **-11 (-3.1%)** |
+| denominator n | 2063 | 2202 | +139 |
+| axis-2 share | 82.7% | **84.3%** | +1.6pp |
+
+Both terms moved the *same* way for asp-115 (absolute up, share up) while the
+non-115 pool SHRANK. Every prior rise in this roster was a denominator effect with
+non-115 growing alongside; here the smaller pool drained while the big one grew, so
+the share rise is not dilution running backward — it is concentration increasing on
+both terms. The 08-18 row's "non-115 grows faster" interval is now clearly not a
+trend. Quote both terms, as always: one interval is not a trend either.
+
+Note `axis1` fell 39.2% -> 36.9% while `axis1b` fell 63.5% -> 62.1% and label count
+rose 23 -> 30 — category fragmentation increasing, which is exactly what makes the
+single-category axis blind here (rb-4502: the finding is that the axes DISAGREE).
+
+## S4.6 — highest-coverage zero recorded on this box
+
+0 candidates at BOTH `--min-failures 2` and `1` (distinct members 0), so nominally
+the "undecidable" case. But `ceiling_ratio` = **0.0671 (1847 classifiable of
+27517)** — roughly 8x this box's own prior readings (0.0084/0.0085/0.0088) and
+~26x the 0.0026 floor. `failing_count: 1` at ledger level against 0 surfaced.
+
+That does not make it a clean bill of health — 93.3% of invocations are still
+unclassifiable — but a zero at 6.7% coverage is materially stronger evidence than
+a zero at 0.3%, and the marker's standing advice ("a 0 at both thresholds
+distinguishes nothing") was written against the blind regime. **Report the ratio
+WITH the zero**; the two readings are not interchangeable. Routed nothing.
