@@ -109,6 +109,55 @@ SKIP_STATUSES = TERMINAL_GOAL_STATUSES | {"in-progress"}              # not sele
 ABANDONED_STATUSES = TERMINAL_GOAL_STATUSES - {"completed"}            # terminal but not "done"
 
 
+def goal_record_id(asp, g):
+    """The id of goal ``g`` of aspiration ``asp``, or None for a record that has none —
+    warned once on stderr, never raised. A goal may be a bare string ref (a legacy shape
+    aspirations-read --active-compact expands) or a malformed dict: measured 2026-08-29,
+    a Body rewrote asp-002's ``goals`` as ``{"goal_id", "status"}`` stubs and every
+    ``select`` on the fleet died on ``KeyError: 'id'`` until the records were restored.
+    One bad record must cost one warning, not the whole fleet's selection."""
+    if isinstance(g, dict):
+        gid = g.get("id")
+        if isinstance(gid, str) and gid:
+            return gid
+    key = (asp.get("id") if isinstance(asp, dict) else None, id(g))
+    if key not in _MALFORMED_GOALS_WARNED:
+        _MALFORMED_GOALS_WARNED.add(key)
+        shape = ("string ref" if isinstance(g, str)
+                 else f"dict without id (keys: {sorted(g.keys())[:6]})" if isinstance(g, dict)
+                 else type(g).__name__)
+        print(f"[goal-selector] WARN: {asp.get('id') if isinstance(asp, dict) else '?'} "
+              f"has a goal record with no id ({shape}) — skipped; the record needs "
+              f"repair (aspirations-update-goal.sh cannot address it)", file=sys.stderr)
+    return None
+
+
+_MALFORMED_GOALS_WARNED = set()
+
+
+def global_goal_id_sets(aspirations):
+    """``(done_ids, live_ids)`` across every ACTIVE aspiration in ``aspirations`` — the
+    cross-aspiration dependency sets (g-115-1344). The one builder for the selection
+    pass, its all-blocked retry, and the ``blocked`` diagnostic, so the three cannot
+    disagree; goal records without an id are skipped with a warning
+    (:func:`goal_record_id`)."""
+    done_ids = set()
+    live_ids = set()  # non-terminal goals — dependency-liveness check ()
+    for asp in aspirations:
+        if asp.get("status") != "active":
+            continue
+        for g in asp.get("goals", []) or []:
+            gid = goal_record_id(asp, g)
+            if gid is None:
+                continue
+            st = g.get("status")
+            if st in ("completed", "decomposed"):
+                done_ids.add(gid)
+            if st not in TERMINAL_GOAL_STATUSES:
+                live_ids.add(gid)
+    return done_ids, live_ids
+
+
 def expand_done_ids_via_supersession(aspirations, done_ids):
     """Return `done_ids` plus every id whose supersession chain ends completed.
 
@@ -2356,7 +2405,8 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
             done_ids = global_done_ids
         else:
             done_ids = {g["id"] for g in asp.get("goals", [])
-                        if g.get("status") in ("completed", "decomposed")}
+                        if isinstance(g, dict) and g.get("id")
+                        and g.get("status") in ("completed", "decomposed")}
 
         # live_ids: goal IDs that could still complete (non-terminal status).
         # Re-validates dependency liveness before honoring the dependency_timeout
@@ -2366,7 +2416,8 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
             live_ids = global_live_ids
         else:
             live_ids = {g["id"] for g in asp.get("goals", [])
-                        if g.get("status") not in TERMINAL_GOAL_STATUSES}
+                        if isinstance(g, dict) and g.get("id")
+                        and g.get("status") not in TERMINAL_GOAL_STATUSES}
 
         # verification.preconditions come in two forms:
         #   - strings → LLM-evaluated in aspirations-select Phase 2.2
@@ -2909,7 +2960,8 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
             done_ids = global_done_ids
         else:
             done_ids = {g["id"] for g in asp.get("goals", [])
-                        if g.get("status") in ("completed", "decomposed")}
+                        if isinstance(g, dict) and g.get("id")
+                        and g.get("status") in ("completed", "decomposed")}
 
         # live_ids: mirror of collect_candidates — goal IDs still able to complete
         # (non-terminal status). Re-validates dependency liveness so the timeout
@@ -2918,7 +2970,8 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
             live_ids = global_live_ids
         else:
             live_ids = {g["id"] for g in asp.get("goals", [])
-                        if g.get("status") not in TERMINAL_GOAL_STATUSES}
+                        if isinstance(g, dict) and g.get("id")
+                        and g.get("status") not in TERMINAL_GOAL_STATUSES}
 
         for goal in asp.get("goals", []):
             status = goal.get("status", "")
@@ -5546,17 +5599,7 @@ def cmd_select(args):
     # Without this, blocked_by references to goals in other aspirations are silently ignored.
     # (Mirrors the global goal_map approach already used by collect_blocked/trace_root_bottleneck.)
     all_aspirations = world_aspirations + agent_aspirations
-    global_done_ids = set()
-    global_live_ids = set()  # non-terminal goals — dependency-liveness check ()
-    for asp in all_aspirations:
-        if asp.get("status") != "active":
-            continue
-        for g in asp.get("goals", []):
-            st = g.get("status")
-            if st in ("completed", "decomposed"):
-                global_done_ids.add(g["id"])
-            if st not in TERMINAL_GOAL_STATUSES:
-                global_live_ids.add(g["id"])
+    global_done_ids, global_live_ids = global_goal_id_sets(all_aspirations)
     # Supersession-aware done-ness (). Additive union; see the
     # function docstring for why this is the ONE expansion point.
     global_done_ids = expand_done_ids_via_supersession(all_aspirations, global_done_ids)
@@ -5645,17 +5688,8 @@ def cmd_select(args):
         world_retry = read_jsonl(WORLD_ASP_PATH)
         agent_retry = read_jsonl(AGENT_ASP_PATH) if AGENT_ASP_PATH else []
         all_aspirations_retry = world_retry + agent_retry
-        global_done_ids_retry = set()
-        global_live_ids_retry = set()  # non-terminal goals ()
-        for asp in all_aspirations_retry:
-            if asp.get("status") != "active":
-                continue
-            for g in asp.get("goals", []):
-                st = g.get("status")
-                if st in ("completed", "decomposed"):
-                    global_done_ids_retry.add(g["id"])
-                if st not in TERMINAL_GOAL_STATUSES:
-                    global_live_ids_retry.add(g["id"])
+        global_done_ids_retry, global_live_ids_retry = global_goal_id_sets(
+            all_aspirations_retry)
         # Supersession-aware done-ness () — mirrors the primary
         # build above; the retry path must not resolve dependencies
         # differently from the pass it is retrying.
@@ -5936,17 +5970,7 @@ def cmd_blocked(args):
         known_blockers = []
 
     # Build global done_ids + live_ids for cross-aspiration dependency resolution
-    global_done_ids = set()
-    global_live_ids = set()  # non-terminal goals — dependency-liveness check ()
-    for asp in aspirations:
-        if asp.get("status") != "active":
-            continue
-        for g in asp.get("goals", []):
-            st = g.get("status")
-            if st in ("completed", "decomposed"):
-                global_done_ids.add(g["id"])
-            if st not in TERMINAL_GOAL_STATUSES:
-                global_live_ids.add(g["id"])
+    global_done_ids, global_live_ids = global_goal_id_sets(aspirations)
     # Supersession-aware done-ness () — same expansion the selection
     # path uses, so `blocked` diagnostics never disagree with selection.
     global_done_ids = expand_done_ids_via_supersession(aspirations, global_done_ids)

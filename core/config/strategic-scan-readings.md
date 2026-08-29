@@ -6912,3 +6912,101 @@ candidates — read that gap as coverage, never as suppression working.
 **S1 / S2a / S2b / S4a / S4b:** not re-derived. All carry ⛔ ALREADY-OWNED or
 CONFOUND markers in the instrument (g-115-3215, g-115-5462 + 4 siblings,
 g-115-4840, g-115-3853); nothing filed, nothing routed, per those markers.
+
+---
+
+## 2026-08-29T10:3x — alpha, `hostname` cc-04, `uname -r` 6.8.0-137-generic, own-cloud, strategic scan `time_cadence`
+
+**S3 portfolio (FULL corpus — verified by GOAL COUNT 2913, not 142; `goals_omitted`
+key-presence 0/27 on the full file, 27/27 on the summary):** n=2219
+pending/in-progress across **27 active aspirations**, 221 distinct categories,
+threshold 0.70 read from config at run time.
+
+| axis | value | verdict |
+|---|---|---|
+| 1 — max category (`framework-architecture`) | 817/2219 = **36.8%** | passes |
+| 1b — lane `framework-*` (**30** labels) | 1390/2219 = **62.6%** | passes |
+| 2 — max aspiration (`asp-115`) | 1871/2219 = **84.3%** | **FIRES** |
+
+Verdicts unchanged — axis 2 still the only fire. Not routed to S5 (standing
+property; see the S3 dedup warning in the instrument).
+
+**Same-box longitudinal — the only comparison the cross-box `n` trap permits.**
+Against cc-04's own 2026-08-18T22:2x row (39.6 / 62.6 / 82.1, n=1973, asp-115
+1620): asp-115 absolute **1620 → 1871 (+251)**, share **82.1 → 84.3 (+2.2pp)**,
+denominator 1973 → 2219 (+246). **non-115 on one box is a legitimate
+subtraction: 353 → 348 (−5).** So over ~11 days asp-115 grew 15.5% while the
+rest of the portfolio SHRANK 1.4% — both terms moving the wrong way at once,
+which no prior roster row shows and which is what actual concentration
+*worsening* looks like. Read it beside cc-04's own 08-18 note, where non-115
+grew ~10% against asp-115's 3.8% and the row correctly refused to call one
+interval a trend; the same restraint applies here in the other direction.
+axis1 also fell 39.6 → 36.8 (−2.8pp) while the `framework-*` label count rose
+24 → 30, i.e. the lane held (62.6%, identical to one decimal) while fragmenting
+further across labels — the exact effect axis 1b exists to see through.
+
+**S3c:** high_pct 0.44 (12/27), completed_unarchived 0 → no
+`portfolio_health_signal` write.
+
+**S2a stale-EXPLORE — THIRD INDEPENDENT CONFIRMATION, members unchanged.**
+opened **30/30** (control passed). **30 stale EXPLORE of 55**, threshold 30d
+read from config. **STRUCTURAL 4/30**, identical members to bravo (08-27) and
+zeta (08-28): `infrastructure-performance` (decompose), `solver-v0-audits`
+(distill), `v2-directed-steering-ship-log` + `v2-directed-steering-wiring`
+(both node_split). Split **30 raw / 6 re-verify / 24 suspect**.
+Age histogram `{34:1,39:1,41:1,42:1,43:2,45:1,48:8,49:8,56:1,60:1,62:1,89:1,100:1,101:1,111:1}`.
+
+Its one addition is the cleanest available proof of the instrument's own
+"calendar, not drift" claim: the 16-node cohort reads **46-47d (bravo 08-27) →
+47-48d (zeta 08-28) → 48-49d (here 08-29)** — three boxes, three consecutive
+days, each age advancing exactly one day per calendar day with the cohort size
+pinned at 8+8. A count reproducing is weak; a whole distribution translating by
+exactly the elapsed calendar is not. Denominator moved 52 → 54 → 55 EXPLORE
+while the numerator held at 30 and the structural members held at the same 4.
+**NOT attached to g-115-5462 as a third paragraph** — the marker says attach only
+when a measurement differs MATERIALLY from the owner's stated counts, and this
+one confirms rather than differs; that note is already 2973 chars carrying two
+paragraphs saying this, and a third would be the read-cap over-growth pattern
+(guard-1478 / rb-2077) inside the very note meant to keep the finding legible.
+
+**S2b:** 51/55 EXPLORE leaf-thin = **92.7%**, and `depth >= 2` is true for
+**55/55** — the inert clause the instrument records, reproduced. Owned by
+g-115-4840; nothing routed.
+
+**S4.6 reconsolidation — the UNDECIDABLE case, and the peer seed is now stable
+across SIX WEEKS.** 0 candidates at BOTH `--min-failures 2` and `1`, distinct
+failing-goal members 0, `failing_count: 2` at the ledger level.
+`ceiling_ratio` **0.0055 (151 of 27479)** — inside the ~0.0026-0.009 band, so
+this is a COVERAGE measurement and not a skill-quality one. Routed nothing.
+
+| agent | diary span | windows | in-span / total |
+|---|---|---|---|
+| alpha (resident) | `08-29T02:17..10:17` — live 8h | 27 | 15 / 5349 |
+| bravo | `07-15T17:10..08-06T01:07` | 27 | 28 / 5830 |
+| echo | `08-06T07:55..16:55` | 18 | 39 / 5115 |
+| foxtrot | `08-06T08:54..16:56` | 14 | 17 / 5170 |
+| zeta | `08-04T01:01..09:07` | 14 | 52 / 6015 |
+
+bravo's slice on this box is **`07-15` — 45 days stale, byte-identical to the
+first/last alpha/cc-04 recorded on 2026-08-17** when it was already called "a
+month stale". The instrument's claim had reached "stable across days"; this
+extends the same unchanged peer slice to ~6 weeks on one box, which is what
+makes the repeat-on-one-box discriminator trustworthy at all. Four of five
+slices are ~8-9h; every agent classifies 0.28-0.86% of its own invocations.
+
+**S1:** 89 sensors live (`achievedCount >= 2` of 104 recurring) — the gate is
+LIVE, confirming the 2026-08-16 falsification, not the 0-of-2437 reading.
+mine/fleet census, top-10 by achievedCount, 7 stores: **10/10 cross-agent, 9/10
+mine < fleet, 8/10 local-newest BEHIND fleet-newest**, and one `mine < 2` row
+DROPPED (`g-249-06`, mine 1/21). Sharpest: `g-326-85` mine **2/115** with
+foxtrot holding 104, and `g-115-22` mine 6/80 with a local newest of `07-19`
+against a fleet newest of `08-29` — a 41-day blind spot on a sensor this box
+would otherwise trend from. Owned by g-115-3215; filed nothing.
+
+**S4.5 silent-gap audit:** 0 NEW, 2 dedup-suppressed, 0 rb-245-suppressed.
+**S4a / S4b:** not re-derived — both carry CONFOUND markers in the instrument
+(g-115-3246/4600/5435, g-115-3853); nothing routed.
+
+**Net routed to S5: ZERO.** Every detector that fired is one the instrument
+already marks ALREADY-OWNED or CONFOUND with an explicit route-nothing
+instruction. The stamp was written regardless — the one irreducible S5 action.

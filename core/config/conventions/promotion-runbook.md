@@ -248,10 +248,19 @@ Run every item; each is a one-liner and each has caught a real defect:
    and anything the resident agent should adjust in its world overlays. If
    the dest world is git-tracked, commit + push the board file — a post that
    only lands in your local clone reached nobody.
-2. Box updates while the resident agent is stopped (runtime upgrades, CLI
-   updates, repo fast-forward) — this is the window.
-3. The USER restarts the resident agents. Not the promoting agent's call.
-4. First post-restart brief from the resident agent is part of the promotion:
+2. **Live-plant is the DEFAULT — do not stop the resident** (g-115-4807,
+   2026-08-29). Residents consume a merged promotion at their next
+   iteration boundary (`iteration-push.sh`), the post-merge hook restarts
+   the daemon on daemon-surface changes, skills reload per-invocation, and
+   plants write per-file via atomic `os.replace` — measured across the
+   promote/v2.9.x→v2.12.x train (39 unattended PRs, residents operating
+   throughout). The stop/start bracket is a FALLBACK, warranted only when
+   the promotion changes `settings.json` hook DEFINITIONS (Claude Code
+   loads hook defs at session start only; measured ~2 of 30 promotions)
+   or a box-level runtime/CLI upgrade rides the same window. When the
+   fallback is used: the USER restarts the resident agents — not the
+   promoting agent's call.
+3. First post-plant brief from the resident agent is part of the promotion:
    read it, verify anything it attributes to the plant (last-writer +
    introduction-commit checks distinguish "plant caused it" from "plant
    surfaced it"), and back-port any fix it made that lives in framework

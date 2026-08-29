@@ -237,3 +237,76 @@ class TestUpdateAspirationErrors:
                              {"asp_id": "asp-001", "source": "mars"}, body)
         assert status == 400
         assert "invalid_source" in text
+
+
+# ---------------------------------------------------------------------------
+# The 'goals' field is a list of FULL goal records, and a rewrite never loses one
+# (coach-w4, 2026-08-29: two real goals became fifteen {goal_id,status} stubs and
+# every goal-selector.sh select on the fleet died on KeyError: 'id').
+# ---------------------------------------------------------------------------
+
+
+_FULL = [
+    {"id": "g-001-01", "title": "First", "status": "pending"},
+    {"id": "g-001-02", "title": "Second", "status": "completed"},
+]
+
+
+class TestGoalsFieldGuard:
+    def _put_goals(self, port, goals):
+        return _post(port, "/v1/aspirations/update",
+                     {"asp_id": "asp-001", "source": "world"},
+                     json.dumps({"goals": goals}))
+
+    def test_full_records_are_accepted_and_may_be_edited_or_reordered(self, running_daemon):
+        root, port = running_daemon
+        status, text = self._put_goals(port, _FULL)
+        assert status == 200, text
+        edited = [dict(_FULL[1], title="Second, renamed"), _FULL[0],
+                  {"id": "g-001-03", "title": "Third (added)", "status": "pending"}]
+        status, text = self._put_goals(port, edited)
+        assert status == 200, text
+        items = _read_jsonl(root / "world" / "aspirations.jsonl")
+        asp = next(a for a in items if a["id"] == "asp-001")
+        assert [g["id"] for g in asp["goals"]] == ["g-001-02", "g-001-01", "g-001-03"]
+
+    def test_stub_records_are_refused_and_the_right_door_is_named(self, running_daemon):
+        root, port = running_daemon
+        assert self._put_goals(port, _FULL)[0] == 200
+        # The measured shape, verbatim: goal_id instead of id, no title.
+        stubs = [{"goal_id": "g-001-01", "status": "completed"},
+                 {"goal_id": "g-001-02", "status": "pending"}]
+        status, text = self._put_goals(port, stubs)
+        assert status == 400
+        assert "invalid_goals" in text
+        assert "goal_id" in text and "stub" in text
+        assert "aspirations-update-goal.sh" in text and "iteration-close.sh" in text
+        # Nothing was written.
+        items = _read_jsonl(root / "world" / "aspirations.jsonl")
+        asp = next(a for a in items if a["id"] == "asp-001")
+        assert [g["id"] for g in asp["goals"]] == ["g-001-01", "g-001-02"]
+        # Other malformations: not a list, a record without a title, a bad status.
+        assert self._put_goals(port, "g-001-01")[0] == 400
+        assert self._put_goals(port, [{"id": "g-001-01", "status": "pending"}])[0] == 400
+        s, t = self._put_goals(port, [dict(_FULL[0], status="done"), _FULL[1]])
+        assert s == 400 and "invalid status" in t
+
+    def test_a_rewrite_that_drops_a_goal_is_refused(self, running_daemon):
+        root, port = running_daemon
+        assert self._put_goals(port, _FULL)[0] == 200
+        status, text = self._put_goals(port, [_FULL[0]])
+        assert status == 400
+        assert "goals_removed" in text and "g-001-02" in text
+        items = _read_jsonl(root / "world" / "aspirations.jsonl")
+        asp = next(a for a in items if a["id"] == "asp-001")
+        assert len(asp["goals"]) == 2
+
+    def test_a_goal_id_where_an_aspiration_id_belongs_names_the_goal_scripts(self, running_daemon):
+        _, port = running_daemon
+        status, text = _post(port, "/v1/aspirations/update",
+                             {"asp_id": "g-002-02", "source": "world"},
+                             json.dumps({"status": "completed"}))
+        assert status == 400
+        assert "goal_id_not_aspiration" in text
+        assert "aspirations-update-goal.sh g-002-02" in text
+        assert "iteration-close.sh --phase verify --goal g-002-02" in text

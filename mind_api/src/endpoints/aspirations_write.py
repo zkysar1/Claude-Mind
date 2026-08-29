@@ -214,6 +214,44 @@ _TERMINAL_GOAL_STATUSES = {"completed", "skipped", "expired",
                            "decomposed", "superseded"}
 _ASP_ID_RE = re.compile(r"^asp-(\d{3}|xw-\d{8}T\d{6})$")  # asp-xw-<ts> cross-world ids (mirrors aspirations.py::ASP_ID_RE; companion to _GOAL_ID_RE xw branch below)
 _GOAL_ID_RE = re.compile(r"^g-(\d{3}-\d{2,4}(-[a-z])?|xw-\d{8}T\d{6}-\d{2})$")  # 4-digit: asp-115 hit  (2026-05-19); g-xw-<ts>-NN cross-world ids ( made them selector-visible but the update/close path still rejected them -> stuck at 0/1 forever)
+
+
+def _goals_field_problem(value) -> "str | None":
+    """Why ``value`` may not be written as an aspiration's ``goals`` field, or None.
+
+    Every element must be a FULL goal record — a dict with a valid ``id``, a non-empty
+    ``title`` and a known ``status``. Measured 2026-08-29 (coach-w4): a Body trying to
+    close one goal rewrote the parent's ``goals`` as ``[{"goal_id": …, "status": …}, …]``
+    — no id, no title, no verification — and the write was accepted; the two real goal
+    records became fifteen stubs (thirteen of them invented), every ``goal-selector.sh
+    select`` on the fleet then died on ``KeyError: 'id'``, and the records had to be put
+    back from the .history snapshot. A goals-field write is a structural edit; a single
+    goal's fields change through aspirations-update-goal.sh / iteration-close.sh.
+    """
+    redirect = (" To change one goal use aspirations-update-goal.sh <goal-id> <field> "
+                "<value>; to close one use iteration-close.sh --phase verify --goal "
+                "<goal-id> --status <completed|blocked|skipped> --source <world|agent>.")
+    if not isinstance(value, list):
+        return f"'goals' must be a list of full goal records, got {type(value).__name__}." + redirect
+    seen = set()
+    for i, g in enumerate(value):
+        if not isinstance(g, dict):
+            return f"goals[{i}] is {type(g).__name__}, not a goal record." + redirect
+        gid = g.get("id")
+        if not isinstance(gid, str) or not _GOAL_ID_RE.match(gid):
+            hint = (f" (it carries 'goal_id': {g.get('goal_id')!r} — a stub, not a record)"
+                    if "goal_id" in g else "")
+            return (f"goals[{i}] has no valid 'id'{hint}; every element must be the FULL "
+                    f"goal record (id, title, status, verification, …)." + redirect)
+        if gid in seen:
+            return f"goals[{i}] repeats id {gid}."
+        seen.add(gid)
+        if not isinstance(g.get("title"), str) or not g["title"].strip():
+            return f"goals[{i}] ({gid}) has no 'title'; a stub is not a goal record." + redirect
+        if g.get("status") not in _VALID_GOAL_STATUSES:
+            return (f"goals[{i}] ({gid}) has invalid status {g.get('status')!r}. "
+                    f"Valid: {sorted(_VALID_GOAL_STATUSES)}")
+    return None
 # Mirrors aspirations.py::_AGENT_NAME_RE. Catches flag-name leak into the
 # agent_name positional/query slot (, 2026-05-14).
 _AGENT_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
@@ -7630,6 +7668,19 @@ def update_aspiration(ctx) -> "Response":  # type: ignore[name-defined]
     if not asp_id:
         return Response.error(400, "missing_asp_id",
                               "Query parameter 'asp_id' is required")
+    if _GOAL_ID_RE.match(asp_id):
+        # A GOAL id where an aspiration id belongs is the first step of a measured
+        # data-loss chain (coach-w4, 2026-08-29): the refusal read as "wrong format",
+        # the caller re-issued the write against the parent aspiration's `goals`
+        # field with {goal_id,status} stubs, and 2 full goal records became 15 stubs.
+        # Name the right door instead of the wrong format.
+        return Response.error(400, "goal_id_not_aspiration",
+                              f"{asp_id} is a GOAL id; this endpoint updates an ASPIRATION "
+                              f"(asp-NNN). To change one field of a goal use "
+                              f"aspirations-update-goal.sh {asp_id} <field> <value>; to close "
+                              f"a goal use iteration-close.sh --phase verify --goal {asp_id} "
+                              f"--status <completed|blocked|skipped> --source <world|agent>. "
+                              f"Never rewrite an aspiration's 'goals' field to change one goal.")
     if not _ASP_ID_RE.match(asp_id):
         return Response.error(400, "invalid_asp_id",
                               f"Invalid asp_id format: {asp_id} (expected asp-NNN)")
@@ -7672,6 +7723,10 @@ def update_aspiration(ctx) -> "Response":  # type: ignore[name-defined]
         if field == "archived" and not isinstance(value, bool):
             return Response.error(400, "invalid_archived",
                                   f"'archived' must be a boolean, got {type(value).__name__}")
+        if field == "goals":
+            problem = _goals_field_problem(value)
+            if problem is not None:
+                return Response.error(400, "invalid_goals", problem)
 
     # FW-2: agent-scoped writes MUST carry an explicit X-Mind-Agent header —
     # never silently fall back to the alphabetically-first agent's queue.
@@ -7691,6 +7746,23 @@ def update_aspiration(ctx) -> "Response":  # type: ignore[name-defined]
                                       f"Aspiration {asp_id} not found")
 
             idx, asp = found
+
+            if "goals" in body:
+                # A wholesale 'goals' write may add, reorder or edit goals; it may
+                # never LOSE one. Removal has its own doors (skip / archive / the
+                # decompose + supersede paths), each of which records why.
+                have = [g.get("id") for g in (asp.get("goals") or [])
+                        if isinstance(g, dict) and g.get("id")]
+                keep = {g["id"] for g in body["goals"]}
+                lost = [gid for gid in have if gid not in keep]
+                if lost:
+                    return Response.error(
+                        400, "goals_removed",
+                        f"A 'goals' rewrite of {asp_id} would drop {len(lost)} existing "
+                        f"goal(s): {', '.join(lost)}. A rewrite may add, reorder or edit "
+                        f"goals but never remove one — to retire a goal close it "
+                        f"(iteration-close.sh --phase verify --goal <id> --status skipped) "
+                        f"or archive it; to change one goal use aspirations-update-goal.sh.")
 
             # Apply each field
             for field, value in body.items():

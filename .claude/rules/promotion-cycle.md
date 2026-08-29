@@ -28,6 +28,10 @@ Ayoai-Mind (dev)  →  Claude-Mind (staging)  →  ZDS-Mind (prod)
    - **Framework file promotions** (skills, scripts, rules, gates, conventions, CLAUDE.md, settings.json): **agent-doable** — run promotion-preflight.sh, reconcile drift, copy files. No user approval required. Git is the safety net.
    - **Infrastructure changes** (S3 backends, schema migrations, new daemon endpoints, .env credential changes, jar-keys vault edits, IAM policies, networking/VPC within already-authorized accounts): **agent-autonomous** — NO sign-off (Zachary 2026-07-01: "ungate me from signing off on things"; reversible technical infra is not protected by gating). The ONLY retained gate is **net-new recurring spend / new paid cloud accounts / billing-impact**, and even that is a *heads-up*, not a block.
 
+5. **Promotions are live-compatible.** No stop/start bracket; residents consume at their next iteration boundary. Fallback (user restarts residents) only for `settings.json` hook-DEFINITION changes or box runtime upgrades. Detail: `promotion-runbook.md` Phase 6, guard-5497, rb-9674.
+
+6. **No one-off "promote X" goals.** The versioned `promote/vX.Y.Z` train delivers; verify the payload at target HEAD and close. The recurring g-360-12 sweep reconciles delivered-but-open promotion goals.
+
 ## Operator Runbook
 
 Dev→staging is a PUSH: the run procedure (worktree-at-tag, plan-verdict
@@ -70,21 +74,12 @@ so they never count as drift. Read-only; safe anytime. Tests:
 
 ## What "Production" Means Here
 
-- Omni's loop is always potentially running.
-- World aspirations in ZDS-Mind are omni's work queue — anything filed there can be picked up.
-- If a development goal lands in ZDS-Mind world aspirations and omni executes it, the result
-  may be: broken production state, corrupted aspirations.jsonl, framework regressions that
-  affect all future loops.
-
-## Canonical Incident (2026-06-18)
-
-8 development goals for the S3 own-cloud storage backend were filed directly in ZDS-Mind world
-aspirations instead of Ayoai-Mind. All were skipped as an emergency remediation before omni
-could pick them up. The goals were re-filed in Ayoai-Mind asp-328.
+ZDS-Mind world aspirations are omni's live work queue: a dev goal filed there
+can execute in production and break state or regress the framework for every
+future loop. Canonical incident 2026-06-18: 8 dev goals filed straight into
+ZDS-Mind, emergency-skipped, re-filed as Ayoai-Mind asp-328.
 
 ## Cross-References
 
 - guardrails: guard-97, guard-98 (ZDS-Mind world), guard-813 (Ayoai-Mind world)
 - world/conventions/own-cloud-storage-refactor.md (example of a feature requiring full cycle)
-- Ayoai-Mind world asp-328 (S3 backend development goals — in correct location)
-- Ayoai-Mind world g-115-1539 (recovery-gate promotion — urgent)

@@ -201,6 +201,155 @@ def test_read_tree_nodes_body_empty_when_md_absent(tmp_path: Path) -> None:
     assert nodes["coral-reefs"]["body"] == ""
 
 
+# ── index-shape robustness () ────────────────────────────────────────
+# Three index SHAPES reach this reader in production, measured across 18 sidecar
+# worlds: the canonical dict-valued mapping (covered above), a flat string-valued
+# mapping, and an index that will not parse at all. The first two must yield nodes;
+# the third must yield a MARKED empty result rather than an exception.
+#
+# Every malformed member gets its own case rather than one test named for the class:
+# a single "malformed index" test reads as full coverage to anyone scanning the
+# suite while covering one member of four (guard-2441). They fail through three
+# DIFFERENT code paths — a YAML parse error, valid YAML whose root is not a mapping,
+# and a decode error that is a ValueError and not an OSError.
+
+
+def _string_valued_world(root: Path, mapping: dict[str, str]) -> Path:
+    """A world whose tree index maps each key straight to a filename STRING."""
+    world = root / "world"
+    tree_dir = world / "knowledge" / "tree"
+    tree_dir.mkdir(parents=True)
+    (tree_dir / '_tree.yaml').write_text(
+        yaml.safe_dump({"nodes": dict(mapping)}), encoding="utf-8"
+    )
+    return world
+
+
+def _raw_index_world(root: Path, raw: bytes) -> Path:
+    """A world whose tree index is written as RAW BYTES — valid or not."""
+    world = root / "world"
+    tree_dir = world / "knowledge" / "tree"
+    tree_dir.mkdir(parents=True)
+    (tree_dir / '_tree.yaml').write_bytes(raw)
+    return world
+
+
+def test_read_tree_nodes_coerces_string_valued_index(tmp_path: Path) -> None:
+    """DEFECT B: a flat ``<key>: "<file>.md"`` index yielded ZERO nodes.
+
+    Two of 18 live sidecar indexes carry this shape (33 and 12 nodes), and every node
+    was dropped by the ``isinstance(node, dict)`` guard — so the export read tree=0
+    against a perfectly healthy index and the bundle was byte-indistinguishable from
+    an empty world's.
+    """
+    world = _string_valued_world(
+        tmp_path, {"coral-reefs": "coral-reefs.md", "kelp": "kelp.md"}
+    )
+    nodes = {n["key"]: n for n in M.read_tree_nodes(world)}
+    assert set(nodes) == {"coral-reefs", "kelp"}, "string-valued nodes were dropped"
+    # The coerced node carries `file` as its category, which is what every downstream
+    # classifier reads; summary/parent/children fall back to their empty defaults.
+    assert nodes["kelp"]["category"] == "kelp.md"
+    assert nodes["kelp"]["summary"] == ""
+    assert nodes["kelp"]["children"] == []
+
+
+def test_read_tree_nodes_string_valued_index_still_suppresses_framework(
+    tmp_path: Path,
+) -> None:
+    """The coercion must not become a framework-body leak.
+
+    ``top_level_category`` strips the extension, so a bare ``system.md`` still reads
+    as the framework root and its body is never loaded — the same defense-in-depth
+    the dict-valued path relies on. This is the security-relevant half of DEFECT B:
+    a coercion that classified every flat node as domain would expose framework
+    bodies to the kid-facing wiki.
+    """
+    world = _string_valued_world(tmp_path, {"system": "system.md", "reefs": "reefs.md"})
+    tree_dir = world / "knowledge" / "tree"
+    (tree_dir / "system.md").write_text("Framework internals — never expose.\n", "utf-8")
+    (tree_dir / "reefs.md").write_text("Reefs are lovely.\n", "utf-8")
+    nodes = {n["key"]: n for n in M.read_tree_nodes(world)}
+    assert nodes["system"]["body"] == "", "framework body was read through the coercion"
+    assert "Reefs are lovely" in nodes["reefs"]["body"], "domain body was not read"
+
+
+def test_read_tree_nodes_healthy_index_leaves_status_untouched(tmp_path: Path) -> None:
+    """POSITIVE CONTROL for the degrade cases below.
+
+    Without it, every one of them would also pass against a reader that degraded
+    unconditionally — a zero from a broken function and a zero from a working one are
+    textually identical.
+    """
+    status: dict[str, object] = {}
+    nodes = M.read_tree_nodes(_build_world(tmp_path), status=status)
+    assert len(nodes) == 2
+    assert status == {}, "healthy index must not be marked degraded"
+
+
+@pytest.mark.parametrize(
+    ("member", "raw", "expect_in_error"),
+    [
+        # yaml.YAMLError — the shape measured live (a stray backtick at line 4 col 3).
+        ("scanner_error", b"nodes:\n  a:\n    summary: x\n  `bad: [\n", "Error"),
+        # Valid YAML whose root is a LIST. `safe_load(x) or {}` does not substitute for
+        # a truthy non-mapping, so this reached `.get` and raised AttributeError.
+        ("non_mapping_root", b"- one\n- two\n", "expected a mapping"),
+        # Valid YAML whose root is a bare SCALAR — the same hole, other member.
+        ("scalar_root", b"just-a-string\n", "expected a mapping"),
+        # Corrupt bytes. UnicodeDecodeError is a ValueError, NOT an OSError, so an
+        # `(OSError, YAMLError)` tuple would let this escape silently (guard-2441).
+        ("corrupt_bytes", b"nodes:\n  a: \xff\xfe\x00bad\n", "UnicodeDecodeError"),
+    ],
+)
+def test_read_tree_nodes_unreadable_index_degrades_not_raises(
+    tmp_path: Path, member: str, raw: bytes, expect_in_error: str
+) -> None:
+    """DEFECT C: an unreadable index killed the export instead of marking the bundle.
+
+    ``knowledge-export.sh`` then left the previous bundle in place, so a malformed
+    index was indistinguishable from a healthy no-op at the bundle — 5 of 18 live
+    indexes were in exactly that state.
+    """
+    world = _raw_index_world(tmp_path, raw)
+    status: dict[str, object] = {}
+    nodes = M.read_tree_nodes(world, status=status)   # must not raise
+    assert nodes == []
+    assert status.get("degraded") is True, f"{member} did not mark the status degraded"
+    assert status.get("store") == "tree"
+    assert str(status.get("path")).endswith('_tree.yaml')
+    # The reason names the MEASURED condition, not a generic "could not read"
+    # (guard-1946) — a reader has to be able to tell these four members apart.
+    assert expect_in_error in str(status.get("error")), status.get("error")
+
+
+def test_read_tree_nodes_degrades_without_a_status_dict(tmp_path: Path) -> None:
+    """``status`` is opt-in, so the no-arg call must still swallow the failure.
+
+    Every pre-existing caller passes no ``status``; if the guarded parse only held
+    when a dict was supplied, the fix would be inert on the production path.
+    """
+    world = _raw_index_world(tmp_path, b"- not\n- a mapping\n")
+    assert M.read_tree_nodes(world) == []
+
+
+def test_build_bundle_reports_tree_degradation(tmp_path: Path) -> None:
+    """The marker has to survive the trip to the caller, not just exist in the reader."""
+    world = _raw_index_world(tmp_path, b"nodes:\n  `bad: [\n")
+    status: dict[str, object] = {}
+    bundle = M.build_bundle(world, tmp_path, env={}, tree_status=status)
+    assert bundle.counts()["tree"] == 0
+    assert status.get("degraded") is True
+
+
+def test_build_bundle_healthy_world_reports_no_degradation(tmp_path: Path) -> None:
+    """Positive control for the assertion above, at the build_bundle layer."""
+    status: dict[str, object] = {}
+    bundle = M.build_bundle(_build_world(tmp_path), tmp_path, env={}, tree_status=status)
+    assert bundle.counts()["tree"] > 0
+    assert status == {}
+
+
 def test_agent_names_lists_agent_dirs(tmp_path: Path) -> None:
     _build_world(tmp_path)
     assert M._agent_names(tmp_path) == ["alpha"]
@@ -224,7 +373,9 @@ def test_build_bundle_filters_and_redacts(tmp_path: Path) -> None:
     bundle = M.build_bundle(world, tmp_path, env={})
 
     # Exactly the domain entries survive; framework rows are gone.
-    assert bundle.counts() == {"tree": 1, "hypotheses": 1, "guardrails": 1, "lessons": 1}
+    assert bundle.counts() == {
+        "tree": 1, "hypotheses": 1, "guardrails": 1, "lessons": 1, "self": 0,
+    }  # the fixture world has no agents/<a>/self.md -> `self` projects empty
 
     node = bundle.tree[0]
     assert node["key"] == "coral-reefs"
@@ -292,7 +443,9 @@ def test_build_bundle_redacts_env_secret_values(tmp_path: Path) -> None:
 def test_build_bundle_empty_world_is_empty_bundle(tmp_path: Path) -> None:
     (tmp_path / "world").mkdir()
     bundle = M.build_bundle(tmp_path / "world", tmp_path, env={})
-    assert bundle.counts() == {"tree": 0, "hypotheses": 0, "guardrails": 0, "lessons": 0}
+    assert bundle.counts() == {
+        "tree": 0, "hypotheses": 0, "guardrails": 0, "lessons": 0, "self": 0,
+    }
 
 
 # ── OKF markdown bundle (PEARL §10.5) ────────────────────────────────────────
@@ -366,7 +519,9 @@ def test_okf_empty_bundle_writes_index_and_empty_dirs(tmp_path: Path) -> None:
     bundle = M.build_bundle(tmp_path / "world", tmp_path, env={})
     out = tmp_path / "okf"
     counts = M.write_okf_bundle(bundle, out)
-    assert counts == {"tree": 0, "hypotheses": 0, "guardrails": 0, "lessons": 0}
+    assert counts == {
+        "tree": 0, "hypotheses": 0, "guardrails": 0, "lessons": 0, "self": 0,
+    }
     assert (out / "index.md").is_file()
     assert list((out / "nodes").glob("*.md")) == []
 
@@ -515,3 +670,161 @@ def test_okf_bundle_conforms_to_shape_contract(tmp_path: Path) -> None:
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# ── SELF projection () ───────────────────────────────────────────────
+# self.md is AGENT IDENTITY, not domain knowledge, and the bulk of a real one
+# (44-55 KB, measured across five agents 2026-08-29) is precisely the "cognitive
+# plumbing" PEARL 10.3 suppresses: absolute workspace paths, box hostnames,
+# sub-repo tiering, agent-provisionable action lists, revision chains. These tests
+# pin the cut, and pin it from the CUSTOMER side -- what must NOT come out.
+
+_SELF_MD = """---
+created: "2026-05-09"
+last_updated: "2026-08-27"
+last_update_trigger: "fresh-eyes N=107 retired the premise; see g-115-4913"
+source: "agent"
+revision_id: "self-20260827T022711-alpha-f57d"
+previous_revision_id: "self-20260822T105350-alpha-145c"
+---
+
+# Self
+
+I am the analyst-investigator, the lens that converts ambiguity into evidence.
+
+alpha builds from a verified foundation.
+
+## Primary Workspace
+
+Resolve from AGENT_WRITE_PATH in agents/alpha/local-paths.conf; /home/ec2/world
+on the Linux boxes. 40 sub-repos, 8 ACTIVE Tier-1.
+
+## Agent-Provisionable Actions
+
+- restart the daemon
+"""
+
+
+def _self_bundle(tmp_path: Path, text: str | None = _SELF_MD):
+    """A world plus an agents/alpha/self.md, projected. ``None`` writes no self.md."""
+    world = _build_world(tmp_path, write_bodies=True)
+    if text is not None:
+        (tmp_path / "agents" / "alpha" / "self.md").write_text(text, encoding="utf-8")
+    return M.build_bundle(world, tmp_path, env={"MIND_AGENT": "alpha"})
+
+
+def test_self_projection_allowlists_front_matter_and_cuts_at_first_section(tmp_path: Path) -> None:
+    """Two dated keys plus the pre-``##`` prose. Everything else is suppressed."""
+    got = _self_bundle(tmp_path).agent_self
+
+    assert set(got) == {"purpose", "created", "last_updated"}, (
+        "front matter is an ALLOWLIST (SELF_EXPOSED_FM_FIELDS) -- a new key must be "
+        "added there deliberately, never arrive by default"
+    )
+    assert got["created"] == "2026-05-09" and got["last_updated"] == "2026-08-27"
+
+    purpose = str(got["purpose"])
+    assert "converts ambiguity into evidence" in purpose, "the identity statement is the point"
+    assert not purpose.startswith("#"), "the file's own '# Self' title is not prose"
+    # The structural cut: nothing at or below the first '##' survives.
+    for plumbing in ("Primary Workspace", "AGENT_WRITE_PATH", "local-paths.conf",
+                     "Tier-1", "Agent-Provisionable", "restart the daemon"):
+        assert plumbing not in purpose, f"section content leaked past the '##' cut: {plumbing}"
+
+
+def test_self_projection_suppresses_identity_plumbing_and_redacts(tmp_path: Path) -> None:
+    """The customer-side leak check: none of this may appear anywhere in the view."""
+    blob = repr(_self_bundle(tmp_path).agent_self)
+    for forbidden in (
+        "revision_id", "self-20260827", "self-20260822",   # the revision chain
+        "last_update_trigger", "fresh-eyes", "g-115-4913",  # the internal narrative
+        "/home/ec2/world",                                  # absolute paths
+        "alpha",                                            # agent name -> "the agent"
+    ):
+        assert forbidden not in blob, f"`{forbidden}` reached the customer-facing self view"
+    assert "the agent" in blob, "Redactor must rewrite the agent name, not merely drop it"
+
+
+def test_self_projection_refuses_a_dates_only_husk(tmp_path: Path) -> None:
+    """Front matter with no prose behind it is not an identity -- publish nothing."""
+    bundle = _self_bundle(tmp_path, '---\ncreated: "2026-05-09"\n---\n\n## Primary Workspace\n\nx\n')
+    assert bundle.agent_self == {}, "dates alone must not publish as an identity"
+    assert bundle.counts()["self"] == 0
+
+
+def test_self_absent_publishes_no_key_rather_than_a_hollow_one(tmp_path: Path) -> None:
+    """No self.md -> `{}`, so a consumer can tell 'not published' from 'published blank'."""
+    bundle = _self_bundle(tmp_path, None)
+    assert bundle.agent_self == {} and bundle.counts()["self"] == 0
+
+
+def test_self_agent_resolution_is_fail_closed_when_ambiguous(tmp_path: Path) -> None:
+    """Two agent dirs and no MIND_AGENT binding: guessing would publish the wrong identity."""
+    world = _build_world(tmp_path, write_bodies=True)
+    (tmp_path / "agents" / "alpha" / "self.md").write_text(_SELF_MD, encoding="utf-8")
+    (tmp_path / "agents" / "bravo").mkdir(parents=True)
+    assert M.build_bundle(world, tmp_path, env={}).agent_self == {}
+    # ...and the single-agent sidecar case, which IS unambiguous, still resolves.
+    (tmp_path / "agents" / "bravo").rmdir()
+    assert M.build_bundle(world, tmp_path, env={}).agent_self != {}
+
+
+def test_self_reaches_json_payload_and_okf_bundle(tmp_path: Path) -> None:
+    """Both emitted forms carry it -- an enumerated writer drops what it is not told about."""
+    bundle = _self_bundle(tmp_path)
+    out = tmp_path / "okf"
+    counts = M.write_okf_bundle(bundle, out)
+
+    assert counts["self"] == 1
+    self_md = (out / "self.md").read_text(encoding="utf-8")
+    fm = _fm(self_md)
+    assert fm["type"] == "self", "one concept = one md + a required `type` discriminator"
+    assert fm["created"] == "2026-05-09" and fm["last_updated"] == "2026-08-27"
+    assert "converts ambiguity into evidence" in self_md
+    assert "- [About this agent](self.md)" in (out / "index.md").read_text(encoding="utf-8")
+
+
+def test_self_key_is_always_present_in_the_json_payload(tmp_path: Path, monkeypatch) -> None:
+    """The JSON writer is the OTHER enumerated writer, and it was the untested half.
+
+    ``test_self_reaches_json_payload_and_okf_bundle`` names the JSON payload but only
+    exercises ``write_okf_bundle``; nothing called ``main()`` and read the key back. The
+    g-368-53 merge moved the data keys out of the payload literal into a ``.update()``
+    so ``degraded`` could sit second, and dropping ``self`` on the way would have left
+    the whole suite green. Caught by a hand-run positive control, pinned here.
+
+    The assertion is PRESENCE, not content: ``project_root`` is bound to the real repo
+    root inside ``main()`` and is not injectable, so a tmp world exposes no agent
+    identity. That is the documented contract -- ``{}`` distinguishes "no identity
+    published" from "published and blank", so the key must survive even when empty.
+    """
+    world = _build_world(tmp_path)
+    monkeypatch.setenv("WORLD_PATH", str(world))
+    monkeypatch.delenv("META_PATH", raising=False)
+    out = tmp_path / "bundle.json"
+    assert M.main(["-o", str(out)]) == 0
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert "self" in payload, sorted(payload)
+    assert "self" in payload["counts"], sorted(payload["counts"])
+
+
+def test_self_count_cannot_satisfy_the_broken_export_refusal(tmp_path: Path) -> None:
+    """`self` is in counts() but NOT in KNOWLEDGE_COUNT_KEYS -- and that gap is load-bearing.
+
+    The refusal (g-368-34) fires when a world that demonstrably holds stores projects
+    to all-zero knowledge. `self` is read from the AGENT directory, not the world, so it
+    is non-zero exactly when the four knowledge stores have all failed. Folding it into
+    that check would let a genuinely broken export walk past the gate built to catch it
+    -- the state guard-5144 records 13 live sidecars sitting in.
+    """
+    import knowledge_projection as K
+
+    assert "self" in K.ProjectedBundle().counts()
+    assert "self" not in K.KNOWLEDGE_COUNT_KEYS
+
+    bundle = M.ProjectedBundle(agent_self={"purpose": "p"})
+    assert bundle.counts()["self"] == 1
+    assert any(bundle.counts().values()), "the naive check would pass this broken bundle"
+    assert not any(bundle.counts()[k] for k in K.KNOWLEDGE_COUNT_KEYS), (
+        "the refusal must still see this export as all-zero knowledge"
+    )
