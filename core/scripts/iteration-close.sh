@@ -671,7 +671,24 @@ while [[ $# -gt 0 ]]; do
         # outcome_class, the diary breadcrumb, the board post and clear-in-flight.
         # Logged to world/residual-work-overrides.jsonl by the gate.
         --override-residual) OVERRIDE_RESIDUAL="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
-        *) echo "unknown arg: $1" >&2; exit 2 ;;
+        *)
+            # (2026-08-29): a bare `unknown arg: --outcome-class` sent a downstream
+            # Body (small local model) into a second invented flag (`--executed-by`),
+            # then a third, each a full model turn. Name the accepted set -- read
+            # from THIS parser's own case labels so it cannot drift -- and the
+            # nearest accepted flag when one shares a prefix with the guess.
+            # Bounded to this `while ... done` block (guard-2172: accepted flags
+            # live in the parsing case block ONLY, never a whole-file flag grep).
+            echo "unknown arg: $1" >&2
+            _accepted=$(sed -n '/^while \[\[ \$# -gt 0 \]\]; do$/,/^done$/p' "${BASH_SOURCE[0]}" \
+                        | grep -oE '^\s+--[a-z-]+\)' | tr -d ' )' | sort -u | tr '\n' ' ')
+            echo "  accepted: ${_accepted}" >&2
+            _near=$(for _f in $_accepted; do
+                        case "$1" in "$_f"*) echo "$_f" ;; esac
+                        case "$_f" in "$1"*) echo "$_f" ;; esac
+                    done | sort -u | tr '\n' ' ')
+            [[ -n "$_near" ]] && echo "  did you mean: ${_near}" >&2
+            exit 2 ;;
     esac
 done
 
