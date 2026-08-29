@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.26",
+    "previous_version": "2.12.25",
+    "date": "2026-08-29",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "wm-set.sh refuses a value passed as a second positional / empty stdin with the exact corrected command (guard-4437 twin); suite ledger row for the 2026-08-29 cc-14 run",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.25",
     "previous_version": "2.12.24",
     "date": "2026-08-29",

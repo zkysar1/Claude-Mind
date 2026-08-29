@@ -5435,6 +5435,162 @@ def emit_drain_lane_banner(picked, eligible_count, since, k):
     )
 
 
+def _strategic_focus_claimable(s, agent_name):
+    """Rows this agent may actually claim. Same predicate as
+    emit_strategic_focus_banner._eligible — kept identical on purpose so the
+    banner and the floor can never disagree about what "available" means."""
+    ia = s.get("intended_agent")
+    return bool(s.get("routed_to_me")) or ia in (None, "", "either", agent_name)
+
+
+def apply_strategic_focus_floor(scored, agent_name, drain_lane_fired=False):
+    """Hard selection-time floor for the standing user directive ().
+
+    REORDERS so ONE directive-lane goal takes the top slot whenever that lane
+    has a POOL-ELIGIBLE candidate and the scorer did not already put one there.
+    Returns (picked_row_or_None, status_dict). Like apply_drain_lane it never
+    writes `score`, so every non-floor pick stays byte-identical to pre-floor
+    behavior and the change is a pure reordering of one slot.
+
+    WHY A FLOOR AND NOT A LARGER BOOST. strategic_focus_boost is raw 1.0 x
+    WEIGHTS["directive_boost"] 1.5 = +1.5 final. Measured on this queue
+    2026-08-29 (alpha, hostname cc-07, uname -r 6.8.0-137-generic, 1329
+    candidates): the deterministic score span is 11.60..5.59 and the deficit
+    from the lowest directive-eligible row to the top is 4.41, against an
+    exploration_noise width of 1.22 applied to 1327 of 1329 rows. A +1.5 scalar
+    cannot close 4.41. guard-1895 rule (2): an intervention sized below the
+    contested band changes almost nothing WHILE LOOKING LIKE A FIX, and its
+    corollary names the structurally correct remedy — remove the item from the
+    competition rather than try to win the lottery. That is this function. The
+    scalar is left exactly as it is; emit_strategic_focus_banner's docstring
+    already refuses to raise it, with reasons, and this does not re-litigate it.
+
+    WHY IT READS THE POOL AND NOT THE QUEUE — the load-bearing constraint, and
+    the one a literal reading of the spec gets wrong. The goal says "whenever a
+    boosted lane has executable, unclaimed work"; evaluated against the QUEUE
+    that promotes work this agent must not do. Measured the same day: of 68
+    executable, unclaimed, undeferred goals in the directive's lanes, 46 were
+    routed_to_agent (peer agents), 12 sat behind a future-dated hypothesis gate
+    (2026-08-31..09-15), 2 were deferred, and 8 reached the ranked pool. Hoisting
+    from the queue would have promoted another agent's host-bound GUI-tool work
+    (a domain guardrail forbids running it off-host) or a goal gated 17 more days.
+    `scored` is the post-filter set, so the floor can only ever promote work this
+    agent is genuinely permitted to take. It cannot resurrect a filtered goal —
+    and it must not pretend to; see emit_strategic_focus_inert_banner.
+
+    WHY IT DEFERS TO A LIVE DRAIN-LANE PICK. Both hoist to index 0, so whichever
+    runs last wins. The drain lane fires at most once per K invocations to rescue
+    a recurring goal that would otherwise starve permanently; displacing it
+    re-starves exactly what it just saved — guard-2331 direction B, where
+    stealing a correction defers it another full K-cycle. The floor carries no
+    cadence bound and can take the very next invocation, so it yields.
+
+    RECURRING LANE GOALS ARE NOT NOMINEES, for the same reason clause (ii) of
+    the banner excludes them (g-115-5327): swapping a routine sweep for a
+    routine sweep cannot honor a directive whose premise is that product work
+    outranks sweeps.
+
+    Fail-open throughout: never raises, never blocks selection.
+    """
+    status = {"lanes": [], "pool_lane_rows": 0, "claimable": 0,
+              "picked": None, "yielded_to_drain_lane": False}
+    if not agent_name or not scored:
+        return None, status
+    try:
+        lanes = load_strategic_focus()["aspirations"]
+    except Exception as e:  # pragma: no cover - fail-open guard
+        print(f"[goal-selector] strategic-focus floor skipped "
+              f"({type(e).__name__}: {e})", file=sys.stderr)
+        return None, status
+    status["lanes"] = sorted(lanes)
+    if not lanes:
+        return None, status  # no standing directive, or prose names no asp-NNN
+
+    lane_rows = [s for s in scored if s.get("aspiration_id") in lanes]
+    status["pool_lane_rows"] = len(lane_rows)
+    nominees = [s for s in lane_rows
+                if not s.get("recurring")
+                and _strategic_focus_claimable(s, agent_name)]
+    status["claimable"] = len(nominees)
+    if not nominees:
+        return None, status  # nothing this agent may take — the inert case
+
+    if drain_lane_fired:
+        status["yielded_to_drain_lane"] = True
+        return None, status
+
+    # Already honored: the scorer's own top eligible pick is lane work.
+    mine = [s for s in scored if _strategic_focus_claimable(s, agent_name)]
+    if mine and mine[0].get("aspiration_id") in lanes:
+        return None, status
+
+    picked = nominees[0]  # `scored` is already sorted, so this is the best one
+    if scored[0] is not picked:
+        scored.remove(picked)
+        scored.insert(0, picked)
+    picked["strategic_focus_pick"] = True
+    status["picked"] = picked.get("goal_id")
+    return picked, status
+
+
+def emit_strategic_focus_floor_banner(picked, status):
+    """stderr-only, mirroring emit_drain_lane_banner. Says WHY the top pick is
+    not the scorer's, so the LLM does not read the hoist as a scoring anomaly —
+    and, critically, states that this IS the sanctioned top pick, because the
+    claim chokepoint will accept it without a deviation code once
+    write_scorer_verdict has recorded it (guard-2331 direction B: a hoist the
+    sidecar does not record makes the goal UNCLAIMABLE)."""
+    if picked is None:
+        return
+    print(
+        "[goal-selector] STRATEGIC-FOCUS FLOOR: promoted {gid} to top — it is "
+        "non-recurring work in directive lane {asp}, {n} lane row(s) were "
+        "claimable here, and the scorer's top eligible pick was not lane work. "
+        "Scores are UNCHANGED; only ordering moved, for this one slot. This IS "
+        "the sanctioned top pick — claim it without a deviation code.".format(
+            gid=picked.get("goal_id"), asp=picked.get("aspiration_id"),
+            n=status.get("claimable", 0)),
+        file=sys.stderr,
+    )
+
+
+def emit_strategic_focus_inert_banner(status):
+    """The half that was missing, and the reason this goal carried a false
+    premise (g-353-55).
+
+    emit_strategic_focus_banner returns [] in SILENCE when the directive's lanes
+    contribute no eligible candidate. That silence is indistinguishable from
+    "the directive is being honored", and it is why six prior diagnoses read
+    DRAINED as OUTRANKED. Its own docstring records the cost: establishing which
+    one it was took a hand-run of `goal-selector.sh blocked` and a count of 28
+    excluded goals. That hand-diagnosis is what this banner automates.
+
+    Fires only when the directive names lanes AND zero of them reached the
+    ranked pool — a state in which BOTH the +1.5 boost and the floor above are
+    provably inert, however they are tuned. Measured 2026-08-29 (cc-07): the
+    live directive named asp-363/364/368/369; directive_boost was 0.00 on all
+    1329 candidates, not because it was outweighed but because not one lane goal
+    was in the pool to receive it.
+
+    Returns the emitted warnings for tests. Never raises."""
+    lanes = status.get("lanes") or []
+    if not lanes or status.get("pool_lane_rows"):
+        return []
+    warn = (
+        "[goal-selector] ⚠ STRATEGIC-FOCUS INERT: the standing directive names "
+        "{n} lane(s) ({lanes}) and ZERO of their goals reached the ranked pool, "
+        "so directive_boost applies to nothing and the strategic-focus floor "
+        "cannot fire — this iteration's ranking is unaffected by the directive "
+        "no matter how it is weighted. This is NOT evidence the lanes are "
+        "drained and NOT evidence they were outranked; the goals exist and were "
+        "filtered upstream. Run `bash core/scripts/goal-selector.sh blocked` "
+        "(a PURE read — guard-2331) and read block_reason to see which.".format(
+            n=len(lanes), lanes=", ".join(lanes))
+    )
+    print(warn, file=sys.stderr)
+    return [warn]
+
+
 # ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
@@ -5860,7 +6016,25 @@ def cmd_select(args):
             )
             emit_drain_lane_banner(_lane_pick, _lane_elig, 0, _lane_k)
     except Exception as e:  # pragma: no cover - defensive; lane must never block
+        _lane_pick = None
         print(f"[goal-selector] drain-lane error "
+              f"({type(e).__name__}: {e})", file=sys.stderr)
+
+    # STRATEGIC-FOCUS FLOOR (). Runs AFTER the drain lane so it can yield
+    # to a live lane pick rather than re-starve it (guard-2331 direction B), and
+    # BEFORE write_scorer_verdict below so the sidecar records the hoist as the
+    # sanctioned top — without that ordering the promoted goal is UNCLAIMABLE at
+    # aspirations-claim.sh, which is the exact failure guard-2331 measured. Same
+    # defensive wrapper as the lane: a floor bug must never suppress the ranked
+    # output every agent depends on each iteration.
+    _sf_floor_status = {}
+    try:
+        _sf_pick, _sf_floor_status = apply_strategic_focus_floor(
+            scored, AGENT_NAME, drain_lane_fired=(_lane_pick is not None))
+        emit_strategic_focus_floor_banner(_sf_pick, _sf_floor_status)
+        emit_strategic_focus_inert_banner(_sf_floor_status)
+    except Exception as e:  # pragma: no cover - defensive; floor must never block
+        print(f"[goal-selector] strategic-focus floor error "
               f"({type(e).__name__}: {e})", file=sys.stderr)
 
     # : log meta-strategy application. Proof-of-concept that the

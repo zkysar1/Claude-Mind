@@ -32,6 +32,13 @@ def _load_mod():
 
 M = _load_mod()
 
+# Importable only AFTER _load_mod(): knowledge-export.py puts core/scripts on sys.path
+# at its own import time. `M_storage` is the MODULE (not the symbol) so a test can
+# monkeypatch `get_backend` on it and prove the bundle write never consults it —
+# see test_bundle_write_never_routes_through_the_configured_backend ( F4).
+import storage_backend as M_storage  # noqa: E402
+from storage_backend import LocalBackend  # noqa: E402
+
 CONFORMANCE_PY = SCRIPT_DIR.parent / "okf-bundle-conformance.py"
 
 
@@ -336,6 +343,202 @@ def test_read_tree_nodes_degrades_without_a_status_dict(tmp_path: Path) -> None:
     """
     world = _raw_index_world(tmp_path, b"- not\n- a mapping\n")
     assert M.read_tree_nodes(world) == []
+
+
+# ---------------------------------------------------------------------------
+# : the guards above stop at the index ROOT. `nodes` — one level down —
+# was unguarded, so the SAME three failure modes DEFECT B and DEFECT C were
+# written to remove all survived there: a raise instead of a degrade (F1), a
+# dropped-but-healthy shape (F2), and a malformed index rendering as an honest
+# empty world (F3). Every case below was MEASURED against the pre-fix reader.
+# ---------------------------------------------------------------------------
+
+
+def _nodes_valued_world(root: Path, nodes_value: object, *, omit: bool = False) -> Path:
+    """A world whose tree index carries an arbitrary value under ``nodes``.
+
+    ``omit=True`` writes an index with NO ``nodes`` key at all — the honest
+    empty world, which must stay a clean undegraded zero and is the positive
+    control that stops the degrade cases below passing against a reader that
+    degrades unconditionally.
+    """
+    world = root / "world"
+    tree_dir = world / "knowledge" / "tree"
+    tree_dir.mkdir(parents=True)
+    doc: dict[str, object] = {} if omit else {"nodes": nodes_value}
+    (tree_dir / '_tree.yaml').write_text(yaml.safe_dump(doc), encoding="utf-8")
+    (tree_dir / "kelp.md").write_text("Kelp is lovely.\n", encoding="utf-8")
+    (tree_dir / "coral.md").write_text("Coral is lovely.\n", encoding="utf-8")
+    return world
+
+
+@pytest.mark.parametrize(
+    ("member", "nodes_value", "expect_type_name"),
+    [
+        # F1 — both of these RAISED TypeError('... object is not iterable') against
+        # the pre-fix reader: `nodes` reached `for n in nodes` with no shape check.
+        # That is DEFECT C's die-instead-of-degrade behaviour surviving one level down.
+        ("int", 42, "int"),
+        ("bool_true", True, "bool"),
+        # F3 — a str IS iterable, so this did not raise: it iterated the string's
+        # CHARACTERS, matched no dicts, and returned a clean undegraded zero. A
+        # malformed index that renders exactly like an empty world is the precise
+        # ambiguity DEFECT C exists to close.
+        ("str", "a-string", "str"),
+        # The falsey members matter separately: the pre-fix `data.get("nodes") or {}`
+        # substituted on ANY falsey value, so these passed as "empty" while being
+        # malformed. `or {}` cannot do this job — only an isinstance check can.
+        ("bool_false", False, "bool"),
+        ("float", 1.5, "float"),
+    ],
+)
+def test_read_tree_nodes_malformed_nodes_value_degrades_not_raises(
+    tmp_path: Path, member: str, nodes_value: object, expect_type_name: str
+) -> None:
+    """F1/F3: a non-container ``nodes`` must degrade with a NAMED cause."""
+    world = _nodes_valued_world(tmp_path, nodes_value)
+    status: dict[str, object] = {}
+    nodes = M.read_tree_nodes(world, status=status)   # must not raise
+    assert nodes == []
+    assert status.get("degraded") is True, f"{member} did not mark the status degraded"
+    assert status.get("store") == "tree"
+    assert str(status.get("path")).endswith('_tree.yaml')
+    # The reason names the MEASURED type, not a generic "malformed" (guard-1946) —
+    # a reader debugging a live sidecar index has to know WHICH shape it hit.
+    error = str(status.get("error"))
+    assert "`nodes`" in error, error
+    assert expect_type_name in error, error
+
+
+@pytest.mark.parametrize(
+    ("member", "nodes_value", "omit"),
+    [
+        # THE POSITIVE CONTROLS for the degrade cases above. An index with no nodes
+        # is an honest empty world and must NOT be marked degraded — without these
+        # three, a reader that degraded on every falsey `nodes` would pass the whole
+        # parametrized block above.
+        ("missing_key", None, True),
+        ("empty_dict", {}, False),
+        ("empty_list", [], False),
+    ],
+)
+def test_read_tree_nodes_honestly_empty_nodes_stays_clean(
+    tmp_path: Path, member: str, nodes_value: object, omit: bool
+) -> None:
+    """An empty container is not malformed — it is a world with nothing in it."""
+    world = _nodes_valued_world(tmp_path, nodes_value, omit=omit)
+    status: dict[str, object] = {}
+    assert M.read_tree_nodes(world, status=status) == []
+    assert status == {}, f"{member} was wrongly marked degraded"
+
+
+def test_read_tree_nodes_coerces_a_list_of_filename_strings(tmp_path: Path) -> None:
+    """F2: a LIST of filename strings is the list analogue of DEFECT B's flat mapping.
+
+    DEFECT B's coercion lives in the loop body, but the list branch filtered with
+    ``if isinstance(n, dict)`` in its GENERATOR — so every string was dropped one
+    step before the coercion could reach it, and the export read tree=0 against a
+    healthy index. Measured pre-fix: the dict shape yielded 1 node and the list
+    shape yielded 0 from the same filenames.
+    """
+    world = _nodes_valued_world(tmp_path, ["kelp.md", "coral.md"])
+    nodes = {n["key"]: n for n in M.read_tree_nodes(world)}
+    assert set(nodes) == {"kelp", "coral"}, "list-valued filename strings were dropped"
+    # The key is DERIVED from the filename, because a list element carries no mapping
+    # key to supply one. Without that every node lands on _okf_safe_key's "node"
+    # fallback and they collide into node/node-2 with empty titles — "not dropped"
+    # in the narrowest sense only.
+    assert nodes["kelp"]["category"] == "kelp.md"
+    assert "Kelp is lovely" in nodes["kelp"]["body"]
+
+
+def test_read_tree_nodes_list_of_strings_still_suppresses_framework(
+    tmp_path: Path,
+) -> None:
+    """The list coercion must not become a framework-body leak either.
+
+    The security-relevant half of F2, mirroring the dict-shape test above: a
+    coercion that classified every list element as domain would expose framework
+    bodies to the kid-facing wiki. ``top_level_category`` strips the extension, so
+    a bare ``system.md`` still reads non-domain and its body is never loaded.
+    """
+    world = _nodes_valued_world(tmp_path, ["system.md", "kelp.md"])
+    tree_dir = world / "knowledge" / "tree"
+    (tree_dir / "system.md").write_text("Framework internals — never expose.\n", "utf-8")
+    nodes = {n["key"]: n for n in M.read_tree_nodes(world)}
+    assert nodes["system"]["body"] == "", "framework body leaked through the list coercion"
+    assert "Kelp is lovely" in nodes["kelp"]["body"], "domain body was not read"
+
+
+def test_read_tree_nodes_mixed_list_takes_both_shapes(tmp_path: Path) -> None:
+    """A list may carry both shapes; neither may shadow the other.
+
+    This is what pins the fix's SHAPE rather than its outcome: the coercion and the
+    dict guard now live in ONE place (the loop body) instead of being split between
+    the generator and the loop, so a future edit cannot make the two branches
+    disagree again without failing here.
+    """
+    world = _nodes_valued_world(
+        tmp_path, ["kelp.md", {"key": "coral", "file": "coral.md"}]
+    )
+    nodes = {n["key"]: n for n in M.read_tree_nodes(world)}
+    assert set(nodes) == {"kelp", "coral"}
+    # The dict element's OWN key wins; only the string element derives one.
+    assert nodes["coral"]["category"] == "coral.md"
+
+
+def test_bundle_write_is_atomic_and_leaves_no_partial_file(tmp_path: Path) -> None:
+    """F4: a mid-write failure must leave the PREVIOUS bundle intact and parseable.
+
+    ``Path(out).write_text(text)`` was an open-truncate-write, so a process death or
+    ENOSPC replaced a good bundle with a truncated, unparseable one — strictly worse
+    than the stale bundle it clobbered, and invisible to the g-368-34 all-zero
+    refusal, which runs BEFORE the write.
+    """
+    out = tmp_path / "bundle.json"
+    M._write_bundle_atomically(out, json.dumps({"good": "bundle"}))
+    assert json.loads(out.read_text(encoding="utf-8")) == {"good": "bundle"}
+    assert not Path(str(out) + ".tmp").exists(), "tmp file survived a clean write"
+
+    # Simulate the crash: the writer callback dies after emitting partial content.
+    def _boom(handle: object) -> None:
+        handle.write('{"partial"')  # type: ignore[attr-defined]
+        raise RuntimeError("simulated mid-write death")
+
+    with pytest.raises(RuntimeError):
+        LocalBackend().atomic_write(out, _boom)
+
+    assert json.loads(out.read_text(encoding="utf-8")) == {"good": "bundle"}, (
+        "a failed write clobbered the previous bundle — the write is not atomic"
+    )
+    assert not Path(str(out) + ".tmp").exists(), "tmp file survived a failed write"
+
+
+def test_bundle_write_never_routes_through_the_configured_backend(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """F4, the half a green atomicity test cannot see: it must stay LOCAL.
+
+    ``get_backend()`` is deployment-dependent. Under an own-cloud deployment it
+    returns a backend whose ``atomic_write`` does an object-store PUT of the target
+    and hands the callback an in-memory buffer with no ``fileno`` — so routing this
+    write through it would ship the bundle to object storage instead of the local
+    path the reader opens, AND raise ``UnsupportedOperation`` on the fsync. Both
+    were measured on an own-cloud box while this fix was being written. Never
+    inherit the caller's storage backend for a non-store write (guard-955, rb-2983).
+
+    The assertion is that ``get_backend`` is not consulted at all: a test that only
+    checked the bytes landed would pass on a local box and ship the defect to every
+    own-cloud one.
+    """
+    called: list[str] = []
+    monkeypatch.setattr(
+        M_storage, "get_backend", lambda *a, **k: called.append("get_backend") or None
+    )
+    out = tmp_path / "bundle.json"
+    M._write_bundle_atomically(out, json.dumps({"local": True}))
+    assert called == [], "the bundle write consulted the configured storage backend"
+    assert json.loads(out.read_text(encoding="utf-8")) == {"local": True}
 
 
 def test_build_bundle_reports_tree_degradation(tmp_path: Path) -> None:

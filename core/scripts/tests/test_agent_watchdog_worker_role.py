@@ -42,6 +42,44 @@ def _load():
 wd = _load()
 
 
+@pytest.fixture(autouse=True)
+def _isolated_world(tmp_path, monkeypatch):
+    """Point WORLD_DIR at an empty tmp world for every test in this file.
+
+    WHY, stated as observed fact rather than inferred: FreshnessProbe._world_dir()
+    ignores the WatchdogContext entirely and does a deferred
+    `from _paths import WORLD_DIR`, so it scans the LIVE world no matter what tmp
+    tree a test builds. Measured on this fleet, that live world carries a REAL
+    finding -- world/conventions/cross-repo-lodestar.md points at a Windows
+    canonical (`C:/Users/...`) that cannot exist on a Linux box -- so the probe
+    correctly emits `freshness/canonical_missing` (severity info) and it lands in
+    the WORKER set, because `freshness` is legitimately WORKER_SAFE.
+
+    So neither reading the goal offered was right. The emitter is NOT buggy and
+    must NOT be scoped: suppressing it would hide a genuine world-level finding
+    on every worker box. And the assertion is NOT too strict -- it is measuring
+    something it never meant to. This file asks what the ROLE FILTER admits about
+    a worker-shaped TREE; the world is out of that scope, so it is ISOLATED here
+    rather than filtered at the assertion (which is what the severity filter did
+    the first time, and what this goal forbids repeating).
+
+    SHAPE IS LOAD-BEARING (guard-1415). `import _paths` INSIDE the fixture body is
+    shape (ii): it resolves sys.modules at RUN time, immune by construction to the
+    sibling-suite purge that would otherwise leave setattr patching a stale module
+    object while the deferred import above reads a fresh one still holding live
+    repo paths. The setitem pin holds that module identity for the same reason.
+    monkeypatch throughout, never a module-level stub, so teardown is an unwind
+    and not a re-init (guard-1165).
+    """
+    import _paths
+
+    world = tmp_path / "_isolated_world"
+    (world / "conventions").mkdir(parents=True)
+    monkeypatch.setitem(sys.modules, "_paths", _paths)
+    monkeypatch.setattr(_paths, "WORLD_DIR", world)
+    return world
+
+
 def _ctx(role, agent_dir):
     return wd.WatchdogContext(
         agent_name="testagent",
@@ -301,10 +339,44 @@ def test_healthy_worker_tick_reports_nothing_about_worker_shaped_state(tmp_path)
     heartbeat event is severity `info`, so the assertion was true for a reason
     that had nothing to do with the filter under test. Its paired control
     (below) is what exposed that, which is the entire reason the control exists.
+
+    NARROWED 2026-08-29 (g-368-60) FROM `events == []` TO PROVENANCE — and NOT
+    back to a severity filter, which is what hid the first draft. `== []` asserted
+    a property of AMBIENT STATE THIS FIXTURE DOES NOT OWN (guard-4425). Every
+    WORKER_SAFE probe is BOX-level by construction — the tick's own banner lists
+    them as "clock-skew, daemon-health, freshness, git-drift, memory-headroom,
+    mirror-wedge" — and they read the real world, not `tmp_path`. `_ctx` redirects
+    only `agent_dir`; `project_root_path` is the REAL PROJECT_ROOT. So any real
+    box condition reddens this test for reasons that have nothing to do with a
+    worker.
+
+    MEASURED, which is what settles it between "scope the emitter" and "narrow the
+    assertion": with an EMPTY agent dir the worker set emits the IDENTICAL
+    ('freshness', 'canonical_missing', 'info'), so the event does not depend on
+    worker-shaped state at all. Pointing project_root_path at tmp_path does NOT
+    suppress it either (the pointer scan resolves the world independently) and
+    adds a critical daemon_unreachable. The emitter is right; it reports a real
+    pointer-doc condition, and scoping it by ROLE would suppress a genuine
+    box-level finding.
+
+    So the property actually worth pinning is the one the docstring already names
+    — a worker must not report about state it does NOT KEEP — i.e. no
+    reducer-shaped probe leaked into the worker set. Ambient box events from
+    worker-SAFE probes are legitimate and are not this test's business.
+
+    This is a coverage-shaped assertion, which has zero power against OVER-matching
+    on its own (guard-1836): if WORKER_SAFE_PROBES contained every probe it would
+    pass vacuously. What rules that out is the paired control below, which asserts
+    the reducer set reports probes OUTSIDE WORKER_SAFE_PROBES on this same tree.
+    DO NOT DELETE THAT CONTROL — without it this assertion is hollow.
     """
     agent_dir = _worker_shaped_tree(tmp_path)
     events = _events_for_role(agent_dir, "worker")
-    assert events == [], f"healthy worker reported: {events}"
+    leaked = {name for name, _, _ in events} - set(wd.WORKER_SAFE_PROBES)
+    assert not leaked, (
+        "reducer-shaped probe(s) reached a worker Body: %r (all events: %r)"
+        % (sorted(leaked), events)
+    )
 
 
 def test_unfiltered_set_does_report_on_the_same_worker_tree(tmp_path):
@@ -372,8 +444,25 @@ def test_that_induced_fault_is_absent_when_the_box_is_healthy(tmp_path, monkeypa
 
     If memory-headroom fired regardless of the reading, the test above would be
     proving nothing about induction. Same tree, same worker set, healthy numbers.
+
+    NARROWED 2026-08-29 (g-368-60) FROM `== []` TO "memory-headroom is absent", for
+    the reason in the sibling above: `== []` swept in ambient events from other
+    worker-SAFE box probes (measured: ('freshness','canonical_missing','info'),
+    which fires even against an EMPTY agent dir) and reddened a control whose
+    subject is memory pressure alone. The narrowing is by SUBJECT, not severity —
+    the induced event is `critical` and the ambient one is `info`, so a severity
+    filter would have "worked" here for exactly the wrong reason and re-created the
+    defect this file already fixed once.
+
+    Discriminating power is unchanged: the paired positive above asserts
+    memory-headroom IS present at severity critical under induced pressure, and
+    this asserts it is ABSENT on healthy numbers. That pair is the induction claim.
     """
     agent_dir = _worker_shaped_tree(tmp_path)
     monkeypatch.setattr(wd, "_mem_total_kb", lambda: 8 * 1024 * 1024)
     monkeypatch.setattr(wd, "_claude_rss_kb", lambda: [(4242, "claude", 256 * 1024)])
-    assert _events_for_role(agent_dir, "worker") == []
+    names = {name for name, _, _ in _events_for_role(agent_dir, "worker")}
+    assert "memory-headroom" not in names, (
+        "memory-headroom fired on healthy numbers, so the induction test above "
+        "proves nothing; got probes %r" % (sorted(names),)
+    )
