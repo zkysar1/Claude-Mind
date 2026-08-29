@@ -138,6 +138,103 @@ class TestMindRecommendations(unittest.TestCase):
         self.assertFalse(any("core/scripts/tests" in r for r in recs),
                          f"daemon change advised to run the core suite: {recs}")
 
+    # : the daemon-staleness advisory. Verification outcome 4 asks for
+    # BOTH directions, and the does-not-fire case is the load-bearing one -- an
+    # advisory that fires on every close is noise an agent learns to skip.
+    def test_daemon_change_advises_restarting_the_daemon(self):
+        """An uncommitted mind_api/src edit is live on disk and STALE in the
+        long-lived daemon (guard-4804, guard-3373). pytest imports fresh and
+        goes green, so nothing else in this banner warns."""
+        recs = self.mod._mind_recommendations(
+            self.mod._classify_mind(["mind_api/src/endpoints/aspirations_write.py"])
+        )
+        self.assertTrue(any("mind-api-start.sh --restart" in r for r in recs),
+                        f"no daemon-restart advisory emitted: {recs}")
+
+    def test_non_daemon_change_does_not_advise_restarting_the_daemon(self):
+        """core/scripts is NOT the daemon import surface, so a core-only change
+        must stay silent. Without this pin the advisory could be appended
+        unconditionally and every test above would still pass."""
+        recs = self.mod._mind_recommendations(
+            self.mod._classify_mind(["core/scripts/goal-selector.py"])
+        )
+        self.assertFalse(any("mind-api-start.sh" in r for r in recs),
+                         f"core-only change advised a daemon restart: {recs}")
+
+    #  outcome 2: the surface is SOURCED from
+    # mind-api-code-changed.sh, never re-listed. Before this, the advisory keyed
+    # on MIND_DAEMON_PY_PREFIX ("mind_api/src/") and covered 1 of the boundary's
+    # 19 entries -- an uncommitted edit to any of the 18 core/scripts modules the
+    # daemon imports was silently un-warned.
+    def test_core_scripts_daemon_import_surface_advises_restart(self):
+        """core/scripts/aspirations.py IS daemon-imported. The prefix-keyed
+        advisory could not see it; the sourced one must."""
+        for p in ("core/scripts/aspirations.py",
+                  "core/scripts/retrieve.py",
+                  "core/scripts/storage_backend.py",
+                  "core/scripts/_paths.py",
+                  "core/scripts/gates/defer_classifier.py"):
+            with self.subTest(path=p):
+                recs = self.mod._mind_recommendations(self.mod._classify_mind([p]))
+                self.assertTrue(
+                    any("mind-api-start.sh --restart" in r for r in recs),
+                    f"{p} is on the daemon import surface but no restart advisory fired: {recs}")
+
+    def test_daemon_surface_is_sourced_from_the_script_not_relisted(self):
+        """guard-3038: a comment naming the producer is a claim about routing,
+        never evidence of it. Assert the entries this module uses ARE the ones
+        mind-api-code-changed.sh prints -- so the two cannot drift."""
+        import subprocess
+        from pathlib import Path as _P
+        from _bash_helpers import BASH
+        proc = subprocess.run(
+            [BASH, _P("core/scripts/mind-api-code-changed.sh").as_posix(),
+             "--print-pathspec"],
+            capture_output=True, text=True, timeout=20)
+        self.assertEqual(proc.returncode, 0, proc.stderr[:400])
+        from_script = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+        self.assertTrue(from_script, "the script printed no pathspec entries")
+        from_module, why = self.mod._daemon_surface_pathspec()
+        self.assertEqual(why, "")
+        self.assertEqual(from_module, from_script)
+        # And the module must not carry its own copy of the list.
+        body = open("core/scripts/full-suite-recommender.py", encoding="utf-8").read()
+        for entry in ("core/scripts/owncloud_backend.py", "core/scripts/tree_match.py",
+                      "core/scripts/peer_surface.py"):
+            self.assertNotIn(entry, body,
+                             f"{entry} is re-listed in the recommender -- it must be sourced")
+
+    def test_unreadable_surface_warns_rather_than_going_silent(self):
+        """Fail TOWARD the warning, matching mind-api-code-changed.sh's own
+        fail-toward-restart posture. A silent fallback to a narrower literal is
+        exactly the drift this goal closed."""
+        real = self.mod._daemon_surface_pathspec
+        try:
+            self.mod._daemon_surface_pathspec = lambda: ([], "daemon surface unreadable: injected")
+            recs = self.mod._mind_recommendations(self.mod._classify_mind(["core/scripts/goal-selector.py"]))
+            self.assertTrue(any("mind-api-start.sh --restart" in r for r in recs),
+                            f"unreadable surface went silent: {recs}")
+            self.assertTrue(any("unreadable" in r for r in recs),
+                            f"advisory did not say WHY it fired blind: {recs}")
+        finally:
+            self.mod._daemon_surface_pathspec = real
+
+    def test_empty_pathspec_is_treated_as_unreadable_not_as_clean(self):
+        """A zero-entry read would disable the advisory forever and look healthy
+        (guard-2298 shape). It must be classified unreadable instead."""
+        real = self.mod.subprocess.run
+        class _P:
+            returncode = 0
+            stdout = "\n   \n"
+            stderr = ""
+        try:
+            self.mod.subprocess.run = lambda *a, **k: _P()
+            entries, why = self.mod._daemon_surface_pathspec()
+            self.assertEqual(entries, [])
+            self.assertIn("0 entries", why)
+        finally:
+            self.mod.subprocess.run = real
+
     def test_both_trees_touched_emits_both_arms(self):
         recs = self.mod._mind_recommendations(
             self.mod._classify_mind(["core/scripts/foo.py", "mind_api/src/agent_paths.py"])
@@ -240,7 +337,14 @@ class TestMainEntrypoint(unittest.TestCase):
              mock.patch("sys.argv", ["x", "g-test", "--outcome-class", "deep"]):
             rc = self.mod.main()
         self.assertEqual(rc, 0)
-        self.assertIn("no code changes detected", buf.getvalue())
+        out = buf.getvalue()
+        # : the line must NOT read as an all-clear. world/ and meta/ are
+        # gitignored, so a domain-script goal produces zero git-visible changes and
+        # an agent trusting this line closes having run nothing (guard-3097).
+        self.assertIn("no GIT-VISIBLE code changes", out)
+        self.assertIn("NOT scanned", out)
+        self.assertIn("not an all-clear", out)
+        self.assertIn("g-test", out)
         self.assertNotIn("FULL-SUITE TEST RECOMMENDER", buf.getvalue())
 
     def test_mind_changes_emits_banner(self):

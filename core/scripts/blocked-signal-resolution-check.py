@@ -176,6 +176,17 @@ TERMINAL_STATUSES = ("completed", "archived", "skipped", "expired", "resolved")
 ROUTING_TAG = "blocked-signal-routed"
 _ROUTING_MARKERS = (ROUTING_TAG, "blocked-signal", "blocked-signal-sweep")
 
+# Tolerance for a breadcrumb stamped AHEAD of `now` (). A post whose
+# age is negative beyond this band came from a box whose clock is skewed, and it
+# must not suppress: a negative age is unconditionally `< cooldown_hours`, so the
+# caller would read it as maximally fresh and the suppression would last ~the
+# skew rather than ~the cooldown. Inside the band it is ordinary inter-box
+# jitter and IS honoured — dropping every negative age would weaken the cooldown
+# into re-routing duplicates on routine jitter.
+# NOT HYPOTHETICAL HERE (rb-3741): fleet peers are TZ-split by up to 4h, and
+# CLAUDE.md notes a long-lived process keeps the TZ it started with.
+ROUTING_CLOCK_SKEW_TOLERANCE_HOURS = 0.5
+
 # Default cooldown window. The measured duplication spanned ~29h with 7 posts
 # from 3 agents on UNCHANGED goals, so a window shorter than a day would not
 # have suppressed it. Deliberately a CLI arg with a documented default rather
@@ -873,6 +884,15 @@ def _read_recent_routings(now, cooldown_hours, board_log_path=None):
             continue
         age = _age_hours_from(p.get("timestamp") or p.get("ts"), now)
         if age is None:
+            continue
+        if age < -ROUTING_CLOCK_SKEW_TOLERANCE_HOURS:
+            # Future-stamped beyond clock skew: DROP, never clamp to 0 —
+            # clamping still yields `age < cooldown_hours` and still suppresses.
+            # Dropping fails OPEN, the direction this function's docstring
+            # already commits to ("A duplicate post is cheap; a
+            # suppressed-and-forgotten hit is not"). Silent by construction
+            # otherwise: read_ok stays True because the READ succeeded, so no
+            # field reported the suppression (guard-1760 shape).
             continue
         for t in tags:
             # The breadcrumb tags the goal_id (`g-*`); lane/agent tags never do.

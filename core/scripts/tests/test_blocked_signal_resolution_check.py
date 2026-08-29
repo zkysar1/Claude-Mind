@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import datetime as dt
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -368,19 +369,97 @@ def test_live_pq_reference_reads_as_still_blocked_not_dangling():
     assert e["verdict"] == "still_blocked"
 
 
+def _pq_ids_in(path):
+    """Count pending-question ids in ONE pending-questions.yaml.
+
+    Mirrors `_load_pq_index`'s entry-shape handling (list / keyed-dict /
+    dict-of-dicts) so the resident-file comparison in the corpus test counts
+    the same things the loader does.
+    """
+    import yaml
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    entries = []
+    if isinstance(data, list):
+        entries = data
+    elif isinstance(data, dict):
+        for key in ("questions", "pending_questions", "entries"):
+            v = data.get(key)
+            if isinstance(v, list):
+                entries = v
+                break
+        else:
+            entries = [v for v in data.values() if isinstance(v, dict)]
+    return len({str(e["id"]) for e in entries
+                if isinstance(e, dict) and e.get("id")})
+
+
 def test_load_pq_index_returns_pair_and_reads_store_of_record():
     """Contract test: the loader returns (index, missing_agents) — a bare dict
-    return would make `pq_complete` silently truthy and re-arm the bug — and on
-    THIS box it must resolve more than the resident agent alone (10 was the
-    local-glob number; the store of record holds ~87 across 5 agents)."""
+    return would make `pq_complete` silently truthy and re-arm the bug — and
+    where a fleet pq corpus is readable it must resolve MORE than the resident
+    agent alone (the local-glob regression this sweep was written to prevent).
+
+    The pair/type half is environment-independent and always runs. The
+    corpus half is gated on a MEASURED precondition, not on a hardcoded fleet
+    size: `> 10` encoded one box's roster and could not hold anywhere else.
+
+    WHY THE GATE EXISTS (measured 2026-08-29, alpha/cc-04, g-306-284). This
+    test was authored and passes in the agent's PRIMARY repo, and it is a
+    guaranteed RED in the pinned detached worktree that
+    `.claude/rules/run-full-suite-after-deep-code.md` MANDATES for suite runs
+    on a busy box. `.gitignore:146` ignores `**/session/`, so a worktree has
+    no `agents/*/session/pending-questions.yaml` at all; and the suite pins
+    `STORAGE_BACKEND=local` (guard-955), under which `_load_pq_index`'s
+    "store of record" IS that absent local file. Both factors are required
+    and both are non-negotiable properties of the sanctioned environment, so
+    the old assertion could never pass there — 0 ids, on every agent, forever.
+    That is guard-5253's class ("a detached worktree inherits only git-tracked
+    content; enumerate the gitignored runtime state the run reads") and
+    guard-4425's ("a test that asserts a property of an ambient fixture it does
+    not own is not a test of the behaviour it names").
+
+    Per guard-1946 the precondition is computed OUTSIDE any broad handler and
+    the skip message states the MEASURED count, so a bug in the gate cannot
+    masquerade as the condition it guards.
+    """
     mod = _import()
     result = mod._load_pq_index()
     assert isinstance(result, tuple) and len(result) == 2
     index, missing = result
     assert isinstance(index, dict) and isinstance(missing, list)
-    assert len(index) > 10, (
-        f"only {len(index)} pq ids — looks like a local-glob regression "
-        f"(resident-agent-only); expected the fleet corpus")
+
+    # Measured precondition: how many agent dirs actually carry a pq file on
+    # this checkout. Deliberately NOT wrapped in try/except — an agents_root()
+    # failure must surface as an error, never as a plausible skip (guard-1946).
+    sys.path.insert(0, str(SCRIPT.parent))
+    from _paths import agents_root
+    pq_files = [d / "session" / "pending-questions.yaml"
+                for d in sorted(agents_root().iterdir()) if d.is_dir()]
+    present = [f for f in pq_files if f.exists()]
+
+    if not present:
+        import pytest
+        pytest.skip(
+            f"no agent carries session/pending-questions.yaml on this checkout "
+            f"({len(pq_files)} agent dir(s) scanned, 0 with a pq file) — the "
+            f"corpus assertion has no fixture to measure. Expected in a "
+            f"detached worktree: '**/session/' is gitignored (.gitignore:146). "
+            f"The pair/type contract above still ran.")
+
+    assert index, (
+        f"{len(present)} agent(s) carry a pq file but the loader resolved 0 "
+        f"ids — the corpus read is broken, not merely empty")
+
+    me_pq = agents_root() / (os.environ.get("MIND_AGENT") or "") \
+        / "session" / "pending-questions.yaml"
+    if len(present) >= 2 and me_pq.exists():
+        # The local-glob regression signal, expressed against measured data
+        # instead of a magic number: a resident-agent-only read cannot resolve
+        # more ids than live in the resident agent's own file.
+        assert len(index) > _pq_ids_in(me_pq), (
+            f"{len(index)} pq ids vs {_pq_ids_in(me_pq)} in the resident "
+            f"agent's own file, across {len(present)} agent file(s) — looks "
+            f"like a local-glob regression (resident-agent-only)")
 
 
 # ── blocker_ref.external_id: the partner-response blocker class () ──
@@ -671,6 +750,66 @@ def test_a_breadcrumb_older_than_the_window_does_not_suppress(tmp_path):
     # caller's `age < cooldown_hours` comparison must not suppress.
     assert recent["g-111-11"] == 48.0
     assert not (recent["g-111-11"] < 24.0)
+
+
+def test_a_future_stamped_breadcrumb_does_not_suppress(tmp_path):
+    """. A post stamped in the FUTURE yields a NEGATIVE age, and a
+    negative age is unconditionally `< cooldown_hours` — so before the fix the
+    caller's compare suppressed on it, and `board-read --since` kept admitting
+    the post for as long as its stamp stayed ahead. The suppression therefore
+    lasted ~the clock skew, not ~the cooldown, and nothing reported it:
+    read_ok stays True because the READ succeeded (guard-1760 shape).
+
+    The fix DROPS such posts rather than clamping their age to 0 — clamping
+    still suppresses. Dropping fails OPEN, which is the direction
+    `_read_recent_routings`'s own docstring commits to in as many words:
+    "A duplicate post is cheap; a suppressed-and-forgotten hit is not."
+
+    NOT HYPOTHETICAL IN THIS FLEET (rb-3741): peers are TZ-split by up to 4h,
+    and CLAUDE.md notes a long-lived process keeps the TZ it started with, so a
+    daemon predating the UTC-by-fiat convergence stamps ahead of a UTC-reading
+    box. Harm scales with skew magnitude."""
+    mod = _import()
+    log = _routing_log(tmp_path, "future.json",
+                       [mod.ROUTING_TAG, "g-111-11"], -720.0)   # +30d
+    recent, read_ok = mod._read_recent_routings(NOW, 24.0, log)
+    assert read_ok is True, "the read SUCCEEDED — this is not a degraded read"
+    assert recent == {}, (
+        "a future-stamped breadcrumb must be dropped, not returned with a "
+        "negative age that the caller's `age < cooldown_hours` compare would "
+        "read as fresh: %r" % (recent,))
+
+
+def test_a_normally_aged_breadcrumb_still_suppresses(tmp_path):
+    """THE POSITIVE CONTROL for the test above, and it is load-bearing rather
+    than decorative (guard-4166): the fix's whole effect is that something
+    STOPS appearing, and a predicate that dropped EVERY post would satisfy the
+    future-stamp assertion perfectly while silently disabling the cooldown the
+    sweep exists to have. This control must NOT flip when that fix is mutated."""
+    mod = _import()
+    log = _routing_log(tmp_path, "normal.json",
+                       [mod.ROUTING_TAG, "g-111-11"], 2.0)
+    recent, read_ok = mod._read_recent_routings(NOW, 24.0, log)
+    assert read_ok is True
+    assert recent == {"g-111-11": 2.0}, recent
+    assert recent["g-111-11"] < 24.0, "inside the window -> must still suppress"
+
+
+def test_a_breadcrumb_inside_the_clock_skew_tolerance_is_kept(tmp_path):
+    """The tolerance is a BAND, not a sign test, and both edges matter. A post
+    a few minutes ahead is ordinary inter-box jitter, not a broken clock; if
+    any negative age were dropped, routine jitter would silently weaken the
+    cooldown into re-routing duplicates. Only a stamp beyond the tolerance is
+    treated as a skewed clock."""
+    mod = _import()
+    tol = mod.ROUTING_CLOCK_SKEW_TOLERANCE_HOURS
+    assert tol > 0, "a non-positive tolerance collapses the band to a sign test"
+    log = _routing_log(tmp_path, "jitter.json",
+                       [mod.ROUTING_TAG, "g-111-11"], -(tol / 2.0))
+    recent, read_ok = mod._read_recent_routings(NOW, 24.0, log)
+    assert read_ok is True
+    assert "g-111-11" in recent, (
+        "a stamp inside the skew tolerance must still be honoured: %r" % (recent,))
 
 
 def test_legacy_hand_written_routing_tags_are_honoured(tmp_path):

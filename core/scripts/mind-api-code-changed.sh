@@ -157,6 +157,52 @@
 
 set -uo pipefail
 
+# THE DAEMON-CODE PATHSPEC. Hoisted into an array 2026-08-29 () so a
+# NON-GIT consumer can read the boundary without re-listing it: see
+# --print-pathspec below. The list itself is unchanged and still lives here and
+# only here. The single quotes on `_*.py` are load-bearing exactly as before --
+# they stop the SHELL from glob-expanding it at array-construction time, so git
+# receives the literal pathspec and does its own match.
+DAEMON_PATHSPEC=(
+    mind_api/src
+    'core/scripts/_*.py'
+    core/scripts/gates
+    core/scripts/storage_backend.py
+    core/scripts/owncloud_backend.py
+    core/scripts/coordination_merge.py
+    core/scripts/owncloud_sync.py
+    core/scripts/retrieve.py
+    core/scripts/tree_idf.py
+    core/scripts/trigger_firings.py
+    core/scripts/store_dupe_warn.py
+    core/scripts/mdl_gate.py
+    core/scripts/experience.py
+    core/scripts/tree.py
+    core/scripts/tree_match.py
+    core/scripts/predicate.py
+    core/scripts/aspirations.py
+    core/scripts/peer_surface.py
+    core/scripts/git_ref_claim.py
+)
+
+# --print-pathspec: emit the boundary, one entry per line, exit 0. For consumers
+# that need the SURFACE rather than the BASE..HEAD verdict -- currently
+# core/scripts/full-suite-recommender.py, which must warn about an UNCOMMITTED
+# daemon-surface edit and so cannot use the commit-range predicate below.
+#
+# HANDLED BEFORE THE BASE PARSING ON PURPOSE. argv[1] is otherwise taken as a
+# BASE ref; an unrecognised flag would fail rev-parse and `exit 0` SILENTLY,
+# which is this script's fail-toward-restart path and is indistinguishable from
+# a real "surface changed" answer (rb-538 -- multi-layer arg parsers silently
+# drop unknown flags; verify the claim at the parser, not at the docs).
+#
+# Callers MUST capture stdout alone and must NOT fold in stderr: this is a
+# payload another program parses (guard-1963).
+if [ "${1:-}" = "--print-pathspec" ]; then
+    printf '%s\n' "${DAEMON_PATHSPEC[@]}"
+    exit 0
+fi
+
 BASE="${1:-}"
 if [ -z "$BASE" ]; then
     # No base to diff against → cannot prove "unchanged" → fail toward restart.
@@ -203,25 +249,7 @@ changed=""
 _diff_rc=1
 for _attempt in 1 2 3; do
     _out="$("${GIT[@]}" diff --name-only "$BASE" HEAD -- \
-        mind_api/src \
-        'core/scripts/_*.py' \
-        core/scripts/gates \
-        core/scripts/storage_backend.py \
-        core/scripts/owncloud_backend.py \
-        core/scripts/coordination_merge.py \
-        core/scripts/owncloud_sync.py \
-        core/scripts/retrieve.py \
-        core/scripts/tree_idf.py \
-        core/scripts/trigger_firings.py \
-        core/scripts/store_dupe_warn.py \
-        core/scripts/mdl_gate.py \
-        core/scripts/experience.py \
-        core/scripts/tree.py \
-        core/scripts/tree_match.py \
-        core/scripts/predicate.py \
-        core/scripts/aspirations.py \
-        core/scripts/peer_surface.py \
-        core/scripts/git_ref_claim.py \
+        "${DAEMON_PATHSPEC[@]}" \
         2>&1)"
     _diff_rc=$?
     if [ "$_diff_rc" -eq 0 ]; then

@@ -267,3 +267,98 @@ stores:
     by: lines
     max_lines: 5000
     owner_goal: g-333-11
+
+  # ── : the six recheck / auto-close sweep metrics logs ────────────
+  # guard-586 violation, all six: neither of its two named branches is present
+  # (no cleanup-stale-bindings.sh entry, no inline rotation at write time), and
+  # they were absent from THIS registry too -- the third mechanism the guardrail
+  # text does not name. Checked all three before building anything.
+  # MEASURED 2026-08-29 (alpha worker Body, hostname cc-08, uname -r
+  # 6.8.0-137-generic, own-cloud): 37,637 lines / 6,508,511 B across the six,
+  # oldest record 2026-04-23. At filing (bravo, cc-05, 2026-08-11) it was 28,177
+  # lines / 4,804,328 B -- +33% lines in 18 days, ~525 lines/day family-wide, so
+  # the growth is live and compounding. Per file 47-75 lines/day.
+  #
+  # rotate, NOT cap -- the filing goal's "nothing reads them" premise is STALE.
+  # core/scripts/sweep-mutation-surface.py (added AFTER this goal was filed; its
+  # SWEEP_LOGS map cites  and a 2026-08-16 measurement) opens with
+  # "This is the missing CONSUMER. It reads the EXISTING per-sweep metrics logs"
+  # and reads THREE of the six (parent-supersession, unblock-parent-status,
+  # routing-audit-target). History also carries the lifetime action-rate signal
+  # the goal itself names as the strongest dead-sweep detector -- one of these
+  # wrote 3,346 run records and cleared ZERO items across its whole life, which
+  # was discoverable only by hand. cap would destroy exactly that signal;
+  # rotate keeps it recoverable in the -archive sibling (guard-3523 covers
+  # computing lifetime rates across live + archive: dedup by id, live wins).
+  #
+  # by: lines, NOT age -- guard-362 requires enumerating record classes and
+  # proving age IS staleness before an owner goal may enable by:age. lines needs
+  # no such proof, and lines/bytes is the axis the violation is stated in.
+  #
+  # max_lines 2000 -> MEASURED live windows after the first rotation (do not
+  # re-derive these from the lifetime average, which understates the recent
+  # rate ~2.5x): credential-defer 27d, parent-supersession 27d,
+  # unblock-parent-status 26d, routing-audit 26d, precondition-defer 12d,
+  # defer-recheck 11d. The two defer-recheck lanes run ~170 lines/day now
+  # against a 47-75/day lifetime mean, so they hold the shortest window --
+  # and neither is read by the consumer below. The three that ARE read
+  # retain 26-27 days.
+  # CONSUMER SAFETY: sweep-mutation-surface._collect_new_mutations selects
+  # `timestamp > watermark` with a 24h first-run lookback -- its need is HOURS,
+  # the bound is WEEKS, so the live window cannot starve it. Its own comment
+  # already notes "these logs grow unboundedly"; it read_text()s the whole file
+  # on every precheck run, so bounding these also removes an unbounded hot-path
+  # read (guard-875 class).
+  #
+  # THE CAP-WIRED-LATER HAZARD IS CLEARED, verified not assumed ():
+  # merge_append_only_jsonl sorts by _log_ts, and "keep newest" is only correct
+  # if that lookup resolves. All six carry a _LOG_TS_FIELDS member -- `timestamp`
+  # (five) and `ts` (credential-defer-recheck) -- so the merged log stays
+  # chronological and rotation trims the right end.
+  # SYNCED + UNION-MERGED IS NOT NOVEL HERE: all six are merge_append_only_jsonl
+  # and none is machine-local, which is byte-for-byte the shape of the already
+  # enabled meta/gate-firings.jsonl and meta/evolution-log.jsonl entries above.
+  # NOT a retirement change: guard-2092 / the goal's own constraint -- the low
+  # action rates are NOT evidence any sweep is broken, and nothing here
+  # deprioritizes or lengthens any of them. Scope is rotation only.
+  - path: world/defer-recheck-metrics.jsonl
+    enabled: true
+    mode: rotate
+    by: lines
+    max_lines: 2000
+    owner_goal: g-115-5860
+
+  - path: world/precondition-defer-recheck-metrics.jsonl
+    enabled: true
+    mode: rotate
+    by: lines
+    max_lines: 2000
+    owner_goal: g-115-5860
+
+  - path: world/credential-defer-recheck-metrics.jsonl
+    enabled: true
+    mode: rotate
+    by: lines
+    max_lines: 2000
+    owner_goal: g-115-5860
+
+  - path: world/parent-supersession-sweep-metrics.jsonl
+    enabled: true
+    mode: rotate
+    by: lines
+    max_lines: 2000
+    owner_goal: g-115-5860
+
+  - path: world/unblock-parent-status-sweep-metrics.jsonl
+    enabled: true
+    mode: rotate
+    by: lines
+    max_lines: 2000
+    owner_goal: g-115-5860
+
+  - path: world/routing-audit-target-status-sweep-metrics.jsonl
+    enabled: true
+    mode: rotate
+    by: lines
+    max_lines: 2000
+    owner_goal: g-115-5860

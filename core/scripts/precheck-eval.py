@@ -1224,6 +1224,27 @@ def cmd_temp_pressure(args, config, compact):
     # signal that triggers their own purge. Measured here at fix time: 9 aged .raw.
     EPHEMERA_SUFFIXES = (".log", ".txt", ".py", ".sh", ".err", ".raw", ".out", ".bak")
     count = 0
+    # md/json SPLIT — VISIBILITY ONLY, never a threshold input ().
+    # THE 'SMALLEST DIFF' THIS GOAL WAS THREE TIMES ENDORSED TO MAKE IS REFUTED.
+    # Candidate fix (2) was 'count .json separately from .md, or exclude it',
+    # recorded as the chosen direction by foxtrot 2026-08-08 (90.4% .json), echo
+    # 2026-08-16 (~47%) and bravo 2026-08-29 (148 .json / 0 .md = 100.0%). Reading
+    # the CONSUMER kills it: /drain-temp Phase 1's census is literally
+    # `ls -1 "$TEMP_DIR"/*.md "$TEMP_DIR"/*.json` (drain-temp/SKILL.md:65) and
+    # temp-drain-purge.sh:256 protects .md/.json as 'DRAINABLE WORKING DOCS'. So
+    # this predicate is in EXACT agreement with the lane it triggers; dropping
+    # .json here would make the metric say 0 while the lane still enumerates 148 —
+    # manufacturing the twin-divergence guard-130 and the EPHEMERA_SUFFIXES comment
+    # above both forbid. The bravo reading is therefore NOT 'the remedy is empty'
+    # (a claim this goal's own progress_note made and this comment retracts): the
+    # remedy would enumerate all 148. The defect is UPSTREAM — candidate fix (1),
+    # writers staging payloads as bare .json in temp/ root instead of .raw/.out per
+    # temp-store.md. Per 's rule already applied to the third class,
+    # 'Visibility is the fix; changing threshold semantics is not': the split below
+    # is REPORTED so no future reader re-derives it by hand a fourth time, and
+    # `count` is left exactly as the drain lane sees it. (guard-4618, guard-2273.)
+    md_count = 0
+    json_count = 0
     ephemera_count = 0
     # : THIRD class. The two classes above are extension ALLOWLISTS, so
     # every other suffix in temp/ root was invisible to this metric — not counted,
@@ -1249,6 +1270,10 @@ def cmd_temp_pressure(args, config, compact):
                 continue
             if f.suffix in (".md", ".json"):
                 count += 1
+                if f.suffix == ".md":
+                    md_count += 1
+                else:
+                    json_count += 1
             elif f.suffix in EPHEMERA_SUFFIXES:
                 ephemera_count += 1
                 ephemera_files.append(f)
@@ -1449,7 +1474,7 @@ def cmd_temp_pressure(args, config, compact):
     # same invisibility this fix exists to remove. Named "not-drainable" rather
     # than a bare number so it cannot be misread as additional drain pressure.
     if pressure_count or unclassified_count:
-        _breakdown = f"{count} undrained doc(s)"
+        _breakdown = f"{count} undrained doc(s)[{md_count} .md/{json_count} .json]"
         if ephemera_count:
             # DERIVED from EPHEMERA_SUFFIXES, never re-typed: this literal was a
             # THIRD copy of the list and it went stale silently — after the
@@ -1479,6 +1504,8 @@ def cmd_temp_pressure(args, config, compact):
         "summary": summary,
         "flags": flags,
         "count": count,
+        "md_count": md_count,
+        "json_count": json_count,
         "ephemera_count": ephemera_count,
         "pressure_count": pressure_count,
         "unclassified_count": unclassified_count,

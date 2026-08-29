@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.15",
+    "previous_version": "2.12.14",
+    "date": "2026-08-29",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "aspirations-update-goal.sh refuses a --source value other than world|agent (exit 2, both values named) — the daemon read any other token as world, so a fleet reducer's --source <skill-name> writes came back goal_not_found naming the wrong cause; shell test added to the invisible-suite pool",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.14",
     "previous_version": "2.12.13",
     "date": "2026-08-29",
