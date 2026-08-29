@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.29",
+    "previous_version": "2.12.28",
+    "date": "2026-08-29",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "worker-loop: SELECT-exhausted parks (resumable, hourly re-poll, 60h cap) instead of closing; resume at claim so the cap holds; park rationale extracted to core/config/rationale/worker-park.md (g-353-73)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.28",
     "previous_version": "2.12.27",
     "date": "2026-08-29",

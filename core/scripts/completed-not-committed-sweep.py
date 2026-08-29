@@ -180,6 +180,12 @@ _COMMIT_KEYWORDS = (
 _EVIDENCE_FIELDS = (
     "outcome_note", "completion_summary", "verify_summary", "summary",
     "description", "notes", "result",
+    # progress_note/key_finding carry the evidence on a TERSE close — the goal
+    # is closed straight from a mid-execution note and outcome_note is never
+    # written at all. Measured 2026-08-29 (, bravo): outcome_note,
+    # completion_summary and verify_summary were ALL None while both of these
+    # were populated and named the commit. ( spark, sq-002.)
+    "progress_note", "key_finding",
 )
 
 
@@ -271,6 +277,27 @@ def extract_commit_shas(goal):
     if isinstance(ver, dict):
         for s in _walk_strings(ver):
             _collect(s)
+    # The documented fallback, which until 2026-08-29 the code never had: both
+    # the _EVIDENCE_FIELDS comment and this docstring promised a full-record
+    # walk "so a SHA stored in an unexpected field is still found", and only
+    # `verification` was ever walked. Widening cannot manufacture a false
+    # commit — every regex is verb-anchored (commit/pushed/merged/sha,
+    # origin/<sha>, or a range), main() validates each candidate against a real
+    # repo, and own_shas drops any whose own commit message names another goal.
+    #
+    # ⚠ THE FIELD SURFACE IS NOT THE BINDING CONSTRAINT — THE VERB ANCHOR IS,
+    # and widening the fields does NOT widen what matches. `_ANCHORED_SHA_RE`
+    # requires the sha to follow its cue across `[\s:=@,]*` only, so the very
+    # common close-note form `(42b56e5, 32 tests)` — a bare parenthetical with
+    # no adjacent verb — matches NOTHING, in any field, before or after this
+    # walk. Measured 2026-08-29 on 's real key_finding text, whose
+    # sha this walk still does not extract. That goal is nonetheless classified
+    # correctly, by two paths that never call this function: is_code_deliverable
+    # short-circuits on work_class in (framework, product), and has_git_evidence
+    # resolves commits by GOAL ID in the message. So a miss here is not by
+    # itself a miss by the sweep — check those two before reading a gap as one.
+    for s in _walk_strings(goal):
+        _collect(s)
     return seen
 
 

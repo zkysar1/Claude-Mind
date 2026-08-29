@@ -3,7 +3,8 @@ name: worker-loop
 description: >-
   The simplified per-Body execution loop a forked WORKER Body runs (Mind/Body
   convergence Phase 2, asp-306). select -> claim -> execute -> RE-ENTER for the
-  next work unit; closes only when work is exhausted or the reducer is gone.
+  next work unit; parks (resumable) when work or the reducer is gone, closes
+  only when a park expires.
   Records the status it judged for each unit through the shared close writer
   (Phase 4a), then SKIPS the reducer-only phases (the LLM verify phase / encode /
   reflect / state-update / learning-gate); the single reducer applies those to
@@ -25,9 +26,9 @@ conventions:
 
 A **worker Body** is a forked instance of a Mind (keyed by `unitKey` = its
 session SID) that is NOT the reducer. It runs a deliberately thin loop —
-**select -> claim -> execute -> re-enter** — one work unit per pass, repeating
-until work is exhausted or its reducer is gone, leaving its divergent
-working-memory for the single reducer to merge later. It does NOT verify,
+**select -> claim -> execute -> re-enter** — one work unit per pass, parking
+(resumable, hourly re-poll) when work or its reducer is gone, leaving its
+divergent working-memory for the single reducer to merge later. It does NOT verify,
 encode, reflect, update state, run the learning gate, evolve, or do completion
 review. Those are **reducer-only**: the one Body holding `running-session-id`
 (the reducer) applies them to the MERGED state of every Body at generalize-down
@@ -123,8 +124,8 @@ IF the value is in the CLOSED SET — 'closed-pending-merge' / 'merged' /
   gate=worker-net-body-closed — so this turn-end is ALLOWed, not trapped.)
 IF the value is 'parked': this Body is RESUMABLE and did NOT close (g-306-291).
   Do NOT end the turn here. Skip the closure exit, continue through the
-  preamble, and let the Phase 0.5 poll decide resume-or-re-park — that poll is
-  the ONLY place the decision is made, so this gate never re-derives it.
+  preamble: Phase 0.5 re-polls the reducer and SELECT decides — a claim RESUMES
+  (Phase 2), no goal re-parks (Phase 1). This gate never re-derives that.
   TEST THE CLOSED SET, NEVER 'not active'. The old predicate here was
   "anything other than active", correct while every non-active state was
   terminal — so introducing `parked` would have made this gate refuse every
@@ -388,125 +389,57 @@ Bash: py -3 core/scripts/agent-watchdog.py --tick
 # reducer is the only Body that runs generalize-down — so the work is silently
 # discarded and the goals are held from the rest of the fleet.
 Bash: py -3 core/scripts/worker_reducer_liveness.py
-# rc 0 = CONTINUE to SELECT (and if this Body is PARKED, RESUME it first — see
-#   below). rc 1 = PARK, which is a WIND-DOWN AND NOT A CLOSE (g-306-291).
-#
-# WHY PARK RATHER THAN CLOSE. The wind-down DECISION is right and unchanged: with
-# no reducer, claiming and executing accumulates work nobody will ever merge. Its
-# TERMINALITY was the defect. Measured 2026-08-14/15: a reducer stalled 15.7h, the
-# worker closed durably, and when the reducer RETURNED THE WORKER STAYED CLOSED —
-# `body_state: closed-pending-merge` makes Phase -0's gate refuse every further
-# unit and only a user-only /start reopens it. Recovery cost is one human /start
-# PER worker, and the incident's own email says it verbatim: "I cannot run it from
-# a closed worker Body here." This spec's own words for that cost class: a wrong
-# close "parks the remaining queue on a human who does not know they are needed"
-# — quoted from the pre-g-306-291 wording, where `park` still meant STRAND. It
-# means the opposite here. The close path now says "strands" for exactly that
-# reason; this quote is left verbatim because it is a quote.
-#
-#   Bash: py -3 core/scripts/body-manifest.py park --sid "$MIND_SID" --agent "$MIND_AGENT"
-#   Bash: python3 core/scripts/stop-reason-record.py --path worker-body-parked \
-#           --reason "<the poll's reason field>" --agent "$MIND_AGENT"
-# then arm an hourly re-poll and STOP:
-#   Tool (not Bash): ScheduleWakeup(prompt=<the park-resume prompt>, delaySeconds=3600) # clamp
+# rc 0 = CONTINUE to SELECT — even when this Body is PARKED. The poll does NOT
+#   resume it; a CLAIM does (Phase 2), so `parked_at` keeps measuring the whole
+#   wait (guard-4184: the cap is a patience cap, and `resume` clears the stamp).
+# rc 1 = PARK, which is a WIND-DOWN AND NOT A CLOSE (g-306-291).
 # The JSON on stdout carries {verdict, reason, rc, consecutive_errors} — quote
 # `reason` in the stop message so the wind-down cause is legible.
+# Rationale (WHY park rather than close, why no staging, why the recorder call,
+#   why resume-at-claim, the terminal shapes): core/config/rationale/worker-park.md
 #
-# THE RECORDER CALL IS NOT OPTIONAL BOOKKEEPING — it is what stops the fleet
-# sweeper emailing the user that this box is DEAD. Measured against the installed
-# `world/scripts/fleet-liveness-sweep.py`: `classify()` returns EXPECTED_IDLE on
-# `session/last-stop-reason` BEFORE it reaches the heartbeat-age branch, and its
-# `--stale-min` default is 45 while a park re-polls at 3600s. 60 > 45, so with no
-# reason file a correctly-parked Body is DEAD_LOOP for ~15 minutes of every hour.
-# That is the exact inversion the parking work exists to remove: the user must
-# read "parked awaiting reducer", never "dead".
-# It never emails — `worker-body-parked` is in the recorder's NO_NOTIFY_PATHS and
-# is enforced INSIDE record(), so forgetting a flag here cannot mail the user
-# hourly about a box that is fine and self-resuming.
-#
-# DO NOT STAGE THE WM WHEN PARKING, and this reverses what the goal that filed
-# this change asked for ("the SAME durable handoff as today: board post, staged
-# WM, pushed ref"). Staging queues the Body for merge, and a Body that is queued
-# for merge and then keeps working is the exact hazard close-body-on-genuine
-# exists to prevent, in its own words: the reducer "merges + marks `merged`, then
-# the worker keeps diverging into a now-merged manifest that the sessions-pass
-# never revisits." A parked Body intends to resume BY CONSTRUCTION. It is also
-# pointless — the trigger for parking is that no reducer exists, so there is
-# nothing to merge into for the whole park. Divergence is still safe: an abrupt
-# death mid-park stages via the stale-binding path, and an EXPIRED park runs the
-# ordinary genuine-close path, which stages and pushes through the one existing
-# writer. `park` never stages; only a real close does.
-#
-# ON RE-ENTRY (the wakeup fires): Phase -0 sees `parked`, which is RESUMABLE and
-# must not be read as closed. Re-run this poll. rc=0 ->
-#   Bash: py -3 core/scripts/body-manifest.py resume --sid "$MIND_SID" --agent "$MIND_AGENT"
-#   Bash: python3 core/scripts/stop-reason-record.py --clear --agent "$MIND_AGENT"
-# and proceed to SELECT. rc=1 -> re-park (idempotent; the ORIGINAL parked_at is
-# preserved, so the cap measures the whole park and not the last poll) and re-arm.
-#
-# CLEARING THE REASON FILE ON RESUME IS THE HALF THAT IS EASY TO DROP, and
-# dropping it disables a detector rather than merely leaving litter. Every OTHER
-# writer of that file stops the loop for good and hands recovery to `/start`,
-# which clears it via `session-manifest-clear.sh` — a park→resume never goes
-# through `/start`, so nothing else would ever remove it. A resumed Body would
-# then work normally for days while the sweeper kept reading EXPECTED_IDLE,
-# suppressing the alert for a LATER genuine death. `--clear` is idempotent and
-# never raises, so it is safe on a resume that never parked through the recorder.
-#
-# THE PARK IS CAPPED at body-manifest.PARK_MAX_HOURS (60h). When
-# `py -3 core/scripts/body-manifest.py park-expired --sid ... --agent ...` exits 0,
-# stop re-parking and take the GENUINE close path below (touch the body-closing
-# sentinel), recording it as a REAL stop — this one DOES email, because from a
-# closed Body `/start` is user-only and a human now genuinely has to act:
-#   Bash: python3 core/scripts/stop-reason-record.py --path worker-park-expired \
-#           --reason "parked <N>h with no reducer; cap reached" --agent "$MIND_AGENT"
-# A reducer absent that long is a human matter and the wind-down board post
-# already went out. Expiry FAILS TOWARD STAYING PARKED: an unreadable or
-# missing `parked_at` reports not-expired, because a wrong close is the
-# unrecoverable direction and a long park costs only an hourly poll.
-#
-# ROUTE IT BEFORE YOU STOP (g-115-5274). Quoting `reason` in the stop message
-# tells the terminal, and the terminal is about to end — so on rc=1 the fleet
-# loses its reducer and the ONLY externally-visible trace is workers quietly
-# ceasing to appear. Post FIRST, then park, then arm, then stop:
+# THE PARK SEQUENCE (rc=1 here; Phase 1 re-enters it on no eligible goal with its
+# own reason and tags). Post FIRST — the terminal is about to end and this line is
+# the one place a live process holds the fact — then park, record, arm, STOP:
+#   Bash: py -3 core/scripts/body-manifest.py park --sid "$MIND_SID" --agent "$MIND_AGENT"
+#     `parked` = first park; `already-parked` = idempotent re-park, ORIGINAL
+#     parked_at preserved. POST ON THE FIRST PARK ONLY (`already-parked` is the
+#     tell — an unconditional post buries the signal under ~24 copies a day):
 #   Bash: echo "<reason>, this Body PARKED awaiting reducer (hourly re-poll, auto-resume)" \
 #           | bash core/scripts/board-post.sh \
 #           --channel coordination --type finding --tags reducer-stall,body-parked
-# POST ON THE FIRST PARK ONLY, not on every hourly re-park — an unconditional post
-# emits ~24 identical messages per day per worker into the channel a human reads to
-# find out the reducer is gone, which buries the signal it exists to raise. The
-# manifest already carries the state; `park` returning `already-parked` is the tell.
-# Say PARKED, not "winding down": the two words route a reader to opposite actions,
-# and the whole point of g-306-291 is that nobody needs to be summoned to /start
-# this Body — it resumes itself the moment a reducer returns.
-# WHY THIS IS THE RIGHT PLACE and not a new detector: measured 2026-08-08, the
-# reducer is ALREADY observable cross-box by two independent means — its per-SID
-# body-heartbeat carrier (heartbeat-tick.sh:95-97 writes it for EVERY Body
-# INCLUDING the reducer, and it is peer-readable), and the runner-claim endpoint,
-# which publishes agent_state + heartbeat age cross-box and which THIS VERY POLL
-# already reads every cycle. Detection was never the gap. The gap is that no
-# layer converts an observation into something a human or a queue sees: Layer C
-# (trailing-text-detector.py) has exactly ONE runtime caller, stop-hook.sh:476,
-# and the Stop hook is what a text-death prevents from firing; and the peer-side
-# WorkerStallProbe runs ON the reducer, so when the REDUCER is what died the
-# reporter is the corpse. This line is the one place a live process holds the
-# fact that the reducer is gone.
-# The board post is a Bash call, so it does not disturb either terminal shape.
-# THE TWO SHAPES DIFFER AND THE DIFFERENCE IS THE WHOLE FEATURE: a genuine CLOSE
-# ends on a Bash echo and does NOT arm a wakeup (nothing should wake a closed
-# Body); a PARK ends on `ScheduleWakeup(<park-resume prompt>, 3600)` and nothing
-# after it, because that wakeup IS the auto-resume. A parked turn that forgets to
-# arm is indistinguishable from a closed one and needs the same human /start this
-# change exists to remove. Fail-open: a failed post must never block the park.
+#   Bash: python3 core/scripts/stop-reason-record.py --path worker-body-parked \
+#           --reason "<the poll's reason field>" --agent "$MIND_AGENT"
+#     NOT optional bookkeeping: it is what keeps the fleet sweeper reading
+#     EXPECTED_IDLE instead of emailing the user that this box is DEAD. The path
+#     is in the recorder's NO_NOTIFY_PATHS, enforced inside record().
+#   Tool (not Bash): ScheduleWakeup(prompt="Parked worker Body: re-enter
+#     /worker-loop at Phase -0 (manifest reads parked = RESUMABLE), re-run the
+#     Phase 0.5 poll and SELECT; a claim resumes, no goal re-parks.",
+#     delaySeconds=3600)
+# and NOTHING after it — that wakeup IS the auto-resume; a park turn that forgets
+# to arm is indistinguishable from a close. DO NOT STAGE THE WM: a Body queued for
+# merge that keeps working diverges into a merged manifest; `park` never stages,
+# only a real close does. Say PARKED, not "winding down". Fail-open: a failed
+# post must never block the park.
+#
+# ON RE-ENTRY (the wakeup fires): Phase -0 sees `parked` (resumable, not closed).
+# Re-run this poll. rc=0 -> SELECT: Phase 2 resumes on a claim, Phase 1 re-parks
+# on no goal. rc=1 -> re-park (idempotent) and re-arm.
+#
+# THE PARK IS CAPPED at body-manifest.PARK_MAX_HOURS (60h), whichever trigger
+# parked it. When `py -3 core/scripts/body-manifest.py park-expired --sid ...
+# --agent ...` exits 0, stop re-parking and take the GENUINE close in Phase 1 —
+# recorded as a REAL stop that DOES email, because from a closed Body `/start`
+# is user-only and a human now genuinely has to act. Expiry FAILS TOWARD STAYING
+# PARKED (an unreadable `parked_at` is not-expired): a wrong close is the
+# unrecoverable direction; a long park costs one hourly poll.
 #
 # NEVER-PROMOTE is the invariant the poll turns on: no rc yields "become the
-# reducer". Every ambiguous signal resolves toward wind-down, because winding
-# down loses nothing (the Body's divergent WM stays live and unstaged across the
-# park, and reaches the reducer at the eventual close — genuine, expired, or the
-# stale-binding path) while continuing without a reducer accumulates work that is
-# thrown away. Parking makes this cheaper still: the cost of a WRONG wind-down
-# used to be a human /start per worker and is now one hourly poll, so the bias
-# toward winding down is safer than it was when this line was written.
+# reducer". Every ambiguous signal resolves toward wind-down, which loses nothing
+# (the divergent WM stays live and unstaged across the park and reaches the
+# reducer at the eventual close) while continuing without a reducer accumulates
+# work that is thrown away.
 #
 # A single transient failure (daemon/DDB error) does NOT wind down — that would
 # let one daemon blip kill every worker in the fleet at once. Transients
@@ -568,53 +501,55 @@ Bash: py -3 core/scripts/worker_execute.py skill-eligible <the goal's skill fiel
 # the remedy for a NAMED skill only — a skill-less goal has no key to add. The
 # line that matters is loop-phase encoding (forbidden) vs goal-directed artifact
 # creation from content supplied in the goal (`/tree` is pinned for that reason).
-IF no goal: this is a GENUINE close — the worker has exhausted its work. Write the
-  body-closing sentinel so the stop-hook (Phase-2B producer) marks this Body
-  closed-pending-merge for the reducer to merge at generalize-down, then STOP:
+IF no goal: PARK AWAITING SUPPLY — the same resumable park as Phase 0.5 rc=1,
+  NOT a close (g-353-73). Exhaustion is usually TRANSIENT on a multi-Body fleet:
+  measured 2026-08-29 (8 Bodies, zc-03), four workers read 0 candidates within
+  minutes of each other while sibling Bodies held an aspiration's tail, and 25
+  min later SELECT ranked 18 (claims released, a new aspiration filed) — all four
+  had closed durably and sat dead at the prompt until a human relaunched them. A
+  worker with no work is WAITING, not finished.
+    Bash: py -3 core/scripts/body-manifest.py park-expired --sid "$MIND_SID" --agent "$MIND_AGENT"
+  rc=0 (parked past the cap) -> GENUINE close. Record it, write the body-closing
+  sentinel so the stop-hook (Phase-2B producer) marks this Body
+  closed-pending-merge for the reducer to merge at generalize-down, then STOP on
+  a Bash echo:
+    Bash: python3 core/scripts/stop-reason-record.py --path worker-park-expired \
+            --reason "parked <N>h (no reducer / no supply); cap reached" --agent "$MIND_AGENT"
     Bash: touch "agents/$MIND_AGENT/sessions/$MIND_SID/body-closing"
+  rc=1 (not parked, or parked under the cap) -> run THE PARK SEQUENCE of Phase
+  0.5 with reason "SELECT returned no eligible goal; parked awaiting supply",
+  board tags `supply-gap,body-parked` (first park only), and the same 3600s
+  wakeup as the LAST call. The Body re-enters hourly: reducer poll -> SELECT ->
+  a claim resumes it (Phase 2), no goal re-parks it (here).
 
-  THE CLOSE CONDITIONS ARE EXHAUSTIVE — THERE ARE EXACTLY TWO, and they are the
-  only two places in this file that write the sentinel: THIS one (SELECT returned
-  no eligible goal) and Phase 0.5's EXPIRED park. A user stop is the third path
-  and is not yours to initiate. Anything else is an INVENTED stop condition
-  (guard-3479).
-
-  NARROWED, NOT WIDENED, BY g-306-291 — read this before assuming the count grew.
-  The second condition used to be Phase 0.5's rc=1 wind-down ITSELF. rc=1 now
-  PARKS (resumable, hourly re-poll), so it no longer closes anything; only the
-  60h park CAP closes, and it closes through this same sentinel. So there are
-  still exactly two sentinel writers and the invented-close conservatism is
-  untouched — parking is available ONLY on rc=1, and it must never acquire a soft
-  edge for anything else. SELECT-exhausted (this branch) still closes DURABLY and
-  immediately: a worker with no work is finished, not waiting on anything.
-  ** CONTEXT PRESSURE IS NOT A CLOSE CONDITION. ** Not "context is filling up",
-  not "the session has run long", not "I have done N units", not "the next goal
-  will not fit". Autocompact exists to make a long session survivable and this
-  loop is built to run indefinitely, so nearly-out-of-context is a reason to
-  enter the next unit, not to stop. This mirrors stop-hook-compliance.md rules
-  3-4, which said it for the AUTONOMOUS loop only — nothing carried it to this
-  close path until 2026-08-11, when a Body closed itself after 12 units with
-  ~930 candidates still in SELECT and a live reducer, then wrote a persuasive
-  board post explaining why. That post is the SIGNATURE of the defect, not
-  evidence against it: a capacity close always feels responsible from inside.
-  IF A SPECIFIC GOAL GENUINELY WILL NOT FIT, the move is to RELEASE THE CLAIM
-  UNSTARTED and keep looping — `aspirations-release.sh <goal-id> --source
-  <world|agent>`, then VERIFY by re-reading that the record shows
-  status=pending / claimed_by=None (the release echo is not proof). Never close
-  the Body for it.
-  WHY THIS IS NOT A RECOVERABLE MISTAKE, which is what makes it worth a
-  paragraph: the sentinel stages this Body's WM snapshot, Phase -0's closure
-  gate then REFUSES every further unit on this SID, and `body_state:
-  closed-pending-merge` is DURABLE — so nothing you can do re-opens it. Resuming
-  requires a fresh `/start`, which is user-only. A wrong close does not cost an
-  iteration; it STRANDS the remaining queue on a human who does not know they
-  are needed. (The original wording was "parks the remaining queue" — reworded
-  by g-306-291 because `park` now names the RESUMABLE state two blocks up, and
-  the whole point of that state is that it strands nobody. Two opposite meanings
-  for one word, in the file that defines it, is a reading trap.)
+  THE CLOSE CONDITION IS EXHAUSTIVE — THERE IS EXACTLY ONE, and it is the only
+  place in this file that writes the sentinel: an EXPIRED park, reached from
+  either trigger (reducer gone, Phase 0.5; supply gone, here). A user stop is the
+  other path and is not yours to initiate. Anything else is an INVENTED stop
+  condition (guard-3479). NARROWED TWICE, never widened: g-306-291 made rc=1
+  park instead of close; g-353-73 made SELECT-exhausted park instead of close.
+  The invented-close conservatism is untouched, and parking must never acquire
+  a soft edge for anything else.
+  ** CONTEXT PRESSURE IS NEITHER A CLOSE NOR A PARK CONDITION. ** Not "context is
+  filling up", not "the session has run long", not "I have done N units", not
+  "the next goal will not fit". Autocompact makes a long session survivable and
+  this loop runs indefinitely, so nearly-out-of-context is a reason to enter the
+  next unit. Mirrors stop-hook-compliance.md rules 3-4; measured 2026-08-11, a
+  Body closed itself after 12 units with ~930 candidates in SELECT and a live
+  reducer, then wrote a persuasive board post explaining why — that post is the
+  SIGNATURE of the defect, not evidence against it.
+  IF A SPECIFIC GOAL GENUINELY WILL NOT FIT, RELEASE THE CLAIM UNSTARTED and
+  keep looping — `aspirations-release.sh <goal-id> --source <world|agent>`, then
+  VERIFY by re-reading that the record shows status=pending / claimed_by=None
+  (the release echo is not proof). Never close or park the Body for it.
+  WHY A WRONG CLOSE IS NOT RECOVERABLE: the sentinel stages this Body's WM
+  snapshot, Phase -0's closure gate then REFUSES every further unit on this SID,
+  and `body_state: closed-pending-merge` is DURABLE — only a user-only `/start`
+  of a NEW session reopens work. A wrong close STRANDS the remaining queue on a
+  human who does not know they are needed; a wrong park costs one hourly poll.
   (The reducer generates work, not the worker. A worker does not INVENT an agenda —
    but "never files a goal" is too strong and was ruled on: see "May a worker file a
-   goal?" below. Do NOT file here regardless; SELECT finding nothing is the close
+   goal?" below. Do NOT file here regardless; SELECT finding nothing is the park
    edge, not a moment to manufacture work.)
 
 # Phase 2 — CLAIM (claimed_by = the agent name; <source> = the queue SELECT printed)
@@ -625,6 +560,14 @@ SUCCESS = the full goal record with `executed_by_sid` == YOUR `$MIND_SID`
   Body holds the goal). A refusal is a JSON `error`. Never execute a goal this
   pass did not claim: measured 2026-08-29, one Body re-selected past its own
   successful claim and a sibling executed an unclaimed goal.
+IF this Body's manifest reads `parked` (either trigger): the claim IS the resume.
+  BEFORE any execution:
+    Bash: py -3 core/scripts/body-manifest.py resume --sid "$MIND_SID" --agent "$MIND_AGENT"
+    Bash: python3 core/scripts/stop-reason-record.py --clear --agent "$MIND_AGENT"
+  The `--clear` is the half that is easy to drop, and dropping it disables a
+  detector: nothing else ever removes that file (a park→resume never passes
+  through /start), so a resumed Body working for days under EXPECTED_IDLE
+  suppresses the alert for a LATER genuine death. Idempotent, never raises.
 
 # Phase 2.9 — READ THE RECORD YOU WERE JUST HANDED (g-115-6695). The claim
 # response IS the full goal record. The loop's only OTHER prompt to touch
@@ -1051,10 +994,11 @@ Bash: echo '{"goal_id":"<goal-id>","aspiration_id":"<aspiration-id>","recurring"
 # Skill(worker-loop), which re-enters at Phase -0 (re-verifying worker identity —
 # guard-517/guard-463 class: role-gated re-entry) and runs the Phase 0.5
 # reducer-liveness poll before any new claim. NEVER Skill(aspirations) — that is
-# the reducer's full-loop re-entry. Every CLOSE path (Phase 1 genuine close, an
-# EXPIRED park, user stop) still ends the turn with a Bash call after its sentinel
-# work, exactly as before — self-continuation never overrides a close edge. The
-# Phase 0.5 PARK is not a close and takes the third shape: it ends on
+# the reducer's full-loop re-entry. Every CLOSE path (an EXPIRED park — the one
+# sentinel writer — or a user stop) still ends the turn with a Bash call after
+# its sentinel work, exactly as before — self-continuation never overrides a
+# close edge. A PARK (Phase 0.5 rc=1, or Phase 1 no eligible goal) is not a
+# close and takes the third shape: it ends on
 # `ScheduleWakeup(<park-resume prompt>, 3600)` and nothing after it.
 ```
 
@@ -1183,6 +1127,6 @@ script's own header.
 | Just finished | Terminal tool call |
 |---|---|
 | A work unit (Phase 4 done, no close condition) | **The deadman PAIR** — run `bash core/scripts/deadman-directive.sh --role worker` and emit exactly the two batched calls it prints: `ScheduleWakeup(<natural-language resurrection prompt>, 600)` THEN `Skill(worker-loop)` as the LAST call. `Skill(worker-loop)` is still the primary re-entry (NEVER `Skill(aspirations)` — reducer-only, guard-517/guard-463; and never a bare Bash echo — the pre-2026-08-03 text said "hand control back to its driver", naming a driver that does not exist, and the Body silently one-shotted after its first goal, g-315-518 soak). The ScheduleWakeup is a NET behind it, not a substitute. |
-| A **PARK** — Phase 0.5 rc=1, reducer gone, park not expired (g-306-291) | **`ScheduleWakeup(<park-resume prompt>, 3600)` ALONE, as the last call, with NO `Skill(worker-loop)` after it.** This is the one terminal shape that is neither the pair nor a bare echo, and the asymmetry is deliberate in both directions. No Skill: re-entering now would re-run the poll that just said "no reducer" and spin. No 600s net either — **the platform keeps ONE pending wakeup (replace-slot), so the park poll IS the net**; arming both would leave whichever came second, and a 600s worker-net firing on a parked Body is the wedge the resurrection prompt now branches for explicitly. A park turn that forgets to arm is indistinguishable from a close and needs exactly the human `/start` this change exists to remove — and in THAT case only, the previous unit's 600s net is still in the slot (unreplaced, precisely because this turn never armed over it) and becomes a real backstop rather than a nuisance: `deadman-directive.sh` teaches it to read `parked` as RESUMABLE and re-arm at 3600 (pinned by `test_worker_prompt_treats_parked_as_resumable_not_closed`). On a park that DOES arm correctly there is no 600s net left to worry about — the 3600s poll replaced it. The stop-hook worker-net stands down on the parked manifest (`gate=worker-net-body-parked`), so this turn-end is ALLOWed rather than BLOCKed into a sentinel ceremony that would durably close the Body. |
-| A close path — Phase 1 genuine close (sentinel just touched), an EXPIRED park, or a user stop | Bash echo stating the close reason. **Do NOT arm the net here** — the turn genuinely ends; stop-hook Phase 2B consumes the sentinel and stages the WM. A net armed by the PREVIOUS work unit is still pending and will fire ~600s later; that firing is benign because THREE layers read the DURABLE closure record, `sessions/<SID>/body-manifest.yaml` `body_state`: the resurrection prompt checks it FIRST and declines to resume (and does not re-arm) when it is in the CLOSED SET — `closed-pending-merge` / `merged` / `closed-stale`, NOT merely "not `active`", since `parked` is non-active and resumable; Phase -0's closure gate refuses a work unit on the same read; and the stop-hook worker-net stands down on it (`gate=worker-net-body-closed`). The `body-closing` SENTINEL cannot serve this purpose — close-body-on-genuine CONSUMES it on every genuine-close branch, so after a completed close its absence is indistinguishable from "no close ever happened". (The pre-2026-08-09 prompt read exactly that as "resume", and the worker-net BLOCKed every post-close turn-end into a second sentinel ceremony — measured cc-08 04:39→04:49.) This is the worker's equivalent of the reducer's safe landing (whose resurrected turn self-aborts at Phase -1.5 on `agent-state != RUNNING`). |
+| A **PARK** — Phase 0.5 rc=1 (reducer gone, g-306-291) or Phase 1 no eligible goal (supply gone, g-353-73), park not expired | **`ScheduleWakeup(<park-resume prompt>, 3600)` ALONE, as the last call, with NO `Skill(worker-loop)` after it.** This is the one terminal shape that is neither the pair nor a bare echo, and the asymmetry is deliberate in both directions. No Skill: re-entering now would re-run the poll that just said "no reducer" and spin. No 600s net either — **the platform keeps ONE pending wakeup (replace-slot), so the park poll IS the net**; arming both would leave whichever came second, and a 600s worker-net firing on a parked Body is the wedge the resurrection prompt now branches for explicitly. A park turn that forgets to arm is indistinguishable from a close and needs exactly the human `/start` this change exists to remove — and in THAT case only, the previous unit's 600s net is still in the slot (unreplaced, precisely because this turn never armed over it) and becomes a real backstop rather than a nuisance: `deadman-directive.sh` teaches it to read `parked` as RESUMABLE and re-arm at 3600 (pinned by `test_worker_prompt_treats_parked_as_resumable_not_closed`). On a park that DOES arm correctly there is no 600s net left to worry about — the 3600s poll replaced it. The stop-hook worker-net stands down on the parked manifest (`gate=worker-net-body-parked`), so this turn-end is ALLOWed rather than BLOCKed into a sentinel ceremony that would durably close the Body. |
+| A close path — an EXPIRED park (the Phase 1 sentinel just touched) or a user stop | Bash echo stating the close reason. **Do NOT arm the net here** — the turn genuinely ends; stop-hook Phase 2B consumes the sentinel and stages the WM. A net armed by the PREVIOUS work unit is still pending and will fire ~600s later; that firing is benign because THREE layers read the DURABLE closure record, `sessions/<SID>/body-manifest.yaml` `body_state`: the resurrection prompt checks it FIRST and declines to resume (and does not re-arm) when it is in the CLOSED SET — `closed-pending-merge` / `merged` / `closed-stale`, NOT merely "not `active`", since `parked` is non-active and resumable; Phase -0's closure gate refuses a work unit on the same read; and the stop-hook worker-net stands down on it (`gate=worker-net-body-closed`). The `body-closing` SENTINEL cannot serve this purpose — close-body-on-genuine CONSUMES it on every genuine-close branch, so after a completed close its absence is indistinguishable from "no close ever happened". (The pre-2026-08-09 prompt read exactly that as "resume", and the worker-net BLOCKed every post-close turn-end into a second sentinel ceremony — measured cc-08 04:39→04:49.) This is the worker's equivalent of the reducer's safe landing (whose resurrected turn self-aborts at Phase -1.5 on `agent-state != RUNNING`). |
 | Consulted for the phase split only (no work unit ran) | The `worker_execute.py` Bash call whose output answered the question. |
