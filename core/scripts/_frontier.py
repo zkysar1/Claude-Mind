@@ -156,14 +156,19 @@ def count_bodies(agents_root_path, now: float | None = None,
                  lookback_hours: float = 6.0) -> dict:
     """Body census from `agents/*/sessions/*/body-manifest.yaml`.
 
-    `active` = manifests in an active/parked state; `closed_recent` = manifests
-    in a closed state whose file changed within `lookback_hours` — Bodies that
-    stopped recently, which on a frontier of 0 means "stopped for lack of
-    work". Read with a line regex rather than a YAML parser: the file is
-    written by the framework in a fixed shape and a parser dependency would
-    make a census fail where a grep would not.
+    `active` = manifests in an active/parked state whose session is FRESH —
+    the manifest or its `body-heartbeat` changed within `lookback_hours`. A
+    Body that dies mid-session never closes its manifest, so `body_state:
+    active` alone over-counts by a lot: measured 2026-08-29 on a live 8-Body
+    deployment, 37 of 49 manifests read `active` and 14 had a heartbeat inside
+    6h. The rest are reported as `active_stale`, never as Bodies.
+    `closed_recent` = manifests in a closed state whose file changed within
+    the window — Bodies that stopped recently, which on a frontier of 0 means
+    "stopped for lack of work". Read with a line regex rather than a YAML
+    parser: the file is written by the framework in a fixed shape and a parser
+    dependency would make a census fail where a grep would not.
     """
-    out = {"active": 0, "closed_recent": 0, "scanned": 0}
+    out = {"active": 0, "active_stale": 0, "closed_recent": 0, "scanned": 0}
     if not agents_root_path:
         return out
     root = Path(agents_root_path)
@@ -183,7 +188,13 @@ def count_bodies(agents_root_path, now: float | None = None,
         out["scanned"] += 1
         state = m.group(1)
         if state in ACTIVE_BODY_STATES:
-            out["active"] += 1
+            heartbeat = manifest.parent / "body-heartbeat"
+            try:
+                if heartbeat.exists():
+                    mtime = max(mtime, heartbeat.stat().st_mtime)
+            except OSError:
+                pass
+            out["active" if mtime >= cutoff else "active_stale"] += 1
         elif state in CLOSED_BODY_STATES and mtime >= cutoff:
             out["closed_recent"] += 1
     return out

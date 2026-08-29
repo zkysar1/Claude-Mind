@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.24",
+    "previous_version": "2.12.23",
+    "date": "2026-08-29",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "frontier census: Body liveness requires a fresh manifest or body-heartbeat (dead sessions never close their manifest); active_stale reported separately in frontier-check",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.23",
     "previous_version": "2.12.22",
     "date": "2026-08-29",
