@@ -15,7 +15,9 @@ counted list). So a goal this session closed which is NOT in the list is a goal
 whose state-update did not run -- the counter bump, the journal append, the
 iteration commit and the tree-drift reset all silently did not happen.
 
-THE STRUCTURAL POINT (measured 2026-08-29, zeta/cc-02, during g-326-447): an
+THE STRUCTURAL POINT (measured 2026-08-29, zeta/cc-02, during g-326-447 -- the
+goal being CLOSED at the time, i.e. the incident victim, not an analysis of
+this shape; see the role note at the runtime message below): an
 autocompact resume dropped the loop back in at the CLOSE sequence, so
 `--phase learning-gate` and `--phase productivity-check` ran while `--phase
 verify` and `--phase state-update` never did. Every visible signal read healthy
@@ -206,8 +208,14 @@ def render(report):
             f"close-phase-skip: {len(skipped)} of {pop} close(s) this session had "
             f"NO state-update — {', '.join(skipped)}. The counter bump, journal "
             "append, iteration commit and tree-drift reset did not happen for "
-            "these. Known cause: an autocompact resume that re-entered the loop at "
-            "the close sequence (g-326-447)."
+            "these. ESTABLISH THE CAUSE PER GOAL — do not inherit one. The shape "
+            "this check was built from is an autocompact resume that re-entered "
+            "the loop at the close sequence; g-326-447 is the goal that was BEING "
+            "CLOSED when that happened (the incident VICTIM, evidence not "
+            "analysis — its title is about a units guard and explains nothing). "
+            "A batch close through a direct path leaves the IDENTICAL fingerprint "
+            "(absent outcome_class + completed_by_role), so the fingerprint alone "
+            "cannot tell the two apart."
         )
     else:
         base = f"close-phase-skip: clean — {pop} close(s) this session, all counted"

@@ -5149,19 +5149,47 @@ def _split_front_matter(text: str):
 def _demote_prior_source(trigger: dict, loser_source) -> dict:
     """Add the loser's provenance as prior_source_<max+1> (guard-4401).
 
-    NEVER writes a duplicate key: YAML forbids duplicates at one level,
+    NEVER writes a duplicate KEY: YAML forbids duplicates at one level,
     safe_load raises nothing and silently keeps only the LAST, so a naive
     second `source:` destroys one of them (guard-2388, measured). The newest
     entry stays `source:`; every demoted one is prior_source_N with N ascending.
+
+    AND NEVER A DUPLICATE VALUE, which is a different guarantee and the one this
+    function used to lack (g-115-8294). The caller only checks the loser against
+    the winner's CURRENT `source`, so a provenance string already demoted by an
+    EARLIER merge failed that test and was demoted AGAIN under a fresh key. Every
+    re-sync of the same pair therefore appended another copy — an unbounded
+    ratchet driven by sync frequency rather than by how many distinct passes
+    actually happened. Measured on
+    world/knowledge/tree/system/program-alignment-health.md (2026-08-29): nine
+    trigger keys carrying TWO exact-duplicate pairs, ~6.6 KB of pure duplication
+    in a 14,511-char block, on a node already ~16% over the Read cap and whose
+    standing instruction makes folding a precondition of appending.
+
+    Returning `trigger` UNCHANGED when the value is already recorded is the whole
+    fix, and it is load-bearing beyond dedup: the caller compares `merged == win`
+    and reuses the winner's front matter VERBATIM on equality, so an already-known
+    provenance now produces ZERO CHURN instead of a rewrite. That is what stops
+    the growth, not merely tidies it.
+
+    Commutativity (this handler's load-bearing property) is preserved: membership
+    is order-independent, and the N numbering is still derived from the keys
+    present, exactly as before.
     """
     out = dict(trigger)
     n = 0
-    for k in out:
+    for k, v in out.items():
         ks = str(k)
         if ks.startswith("prior_source_"):
             tail = ks[len("prior_source_"):]
             if tail.isdigit():
                 n = max(n, int(tail))
+        # Scan `source` and EVERY prior_source form — including the bare
+        # `prior_source` (no digit), which exists in live nodes and would
+        # otherwise re-demote forever because it never matches the digit test.
+        if ks == "source" or ks.startswith("prior_source"):
+            if v == loser_source:
+                return out
     out[f"prior_source_{n + 1}"] = loser_source
     return out
 

@@ -30,6 +30,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import yaml  # noqa: E402 — PyYAML, available in the framework venv
 
 from _paths import AGENTS_PARENT_DIR
+
+# The SHARED atomic-write policy (tmp -> os.replace with backoff -> in-place fallback),
+# taken as the LOCAL backend EXPLICITLY rather than through ``get_backend()``. The
+# bundle is an export ARTIFACT at an arbitrary ``--out`` path, not a governed store:
+# under an own-cloud deployment ``get_backend()`` returns a backend whose
+# ``atomic_write`` does an S3 PUT of the target and hands the callback an in-memory
+# buffer — so the bundle would be shipped to object storage instead of the local path
+# the reader actually opens, and the fsync below would raise ``UnsupportedOperation``
+# on a handle with no ``fileno``. Both were MEASURED here before this line was written.
+# Never inherit the caller's storage backend for a non-store write (guard-955, rb-2983).
+from storage_backend import LocalBackend  # noqa: E402
 from knowledge_projection import (  # noqa: E402
     KNOWLEDGE_COUNT_KEYS,
     ProjectedBundle,
@@ -282,18 +293,57 @@ def read_tree_nodes(
         return _degrade(
             status, tree_yaml, f"index root is {type(data).__name__}, expected a mapping"
         )
-    nodes = data.get("nodes") or {}
+    # DEFECT F1/F3 (g-368-55). The root guard above stopped ONE LEVEL SHORT: ``nodes``
+    # itself was unguarded, so ``nodes: 42`` and ``nodes: true`` reached ``for n in
+    # nodes`` and raised TypeError — the die-instead-of-degrade behaviour DEFECT C was
+    # written to eliminate, surviving one level down — while ``nodes: "a-string"``
+    # iterated its CHARACTERS and rendered as a clean empty world. Guard it
+    # STRUCTURALLY, exactly as the root is guarded and for the same reason: catching
+    # the TypeError would make a bug in this reader indistinguishable from the
+    # malformed input it guards against (guard-2441, guard-1946).
+    #
+    # An ABSENT ``nodes`` key is NOT malformed — an index with no nodes is an honest
+    # empty world — so only ``None`` becomes ``{}``. ``{}`` and ``[]`` pass the
+    # isinstance check and yield zero naturally. Every other type (str, int, bool,
+    # float) degrades with a NAMED cause, because those render identically to an empty
+    # world and a reader has no way to tell them apart otherwise. Note ``or {}`` was
+    # the original and cannot do this job: it substitutes on any falsey value, so
+    # ``nodes: false`` and ``nodes: 0`` would pass as "empty" while being malformed.
+    nodes = data.get("nodes")
+    if nodes is None:
+        nodes = {}
+    if not isinstance(nodes, (dict, list)):
+        return _degrade(
+            status,
+            tree_yaml,
+            f"index `nodes` is {type(nodes).__name__}, expected a mapping or a list",
+        )
     out: list[dict[str, object]] = []
     if isinstance(nodes, dict):
         items = nodes.items()
     else:  # tolerate a list-of-nodes shape
-        items = ((str(n.get("key") or ""), n) for n in nodes if isinstance(n, dict))
+        # DEFECT F2 (g-368-55): this generator used to filter with ``if isinstance(n,
+        # dict)``, which dropped every element BEFORE the string coercion below could
+        # reach it — so a list of filename STRINGS (the list analogue of the flat
+        # mapping DEFECT B exists to handle) exported zero nodes from a perfectly
+        # healthy index. Yield every element and let the ONE coercion + guard in the
+        # loop body decide, so the dict and list shapes cannot diverge again.
+        items = (
+            (str(n.get("key") or "") if isinstance(n, dict) else "", n) for n in nodes
+        )
     for key, node in items:
         # DEFECT B (g-368-53): a flat ``<key>: "<filename>.md"`` index maps every node to a
         # STRING, so the guard below dropped all of them and the export read tree=0 while
         # the index was perfectly healthy. Coerce before the guard, not inside it.
         if isinstance(node, str):
             node = {"file": node}
+            # A LIST element carries no mapping key to supply one, so derive it from
+            # the filename — the list analogue of what the flat mapping gives for free
+            # (F2, g-368-55). Without this every list-of-strings node falls to
+            # ``_okf_safe_key``'s "node" fallback and they collide into
+            # node/node-2/node-3 with empty titles, which is "not dropped" only in the
+            # narrowest sense. ``key or`` so the dict branch's real key always wins.
+            key = key or Path(str(node["file"])).stem
         if not isinstance(node, dict):
             continue
         file_rel = str(node.get("file") or "")  # file path → top-level category + body source
@@ -587,6 +637,42 @@ def _resolve_world() -> Path:
     return Path(wp)
 
 
+def _write_bundle_atomically(out_path: Path, text: str) -> None:
+    """Write the JSON bundle tmp -> fsync -> rename, so a crash cannot truncate it.
+
+    DEFECT F4 (g-368-55). ``Path(out_path).write_text(text)`` is an open-truncate-write:
+    a process death or ENOSPC mid-write replaces a GOOD bundle with a truncated,
+    unparseable one — strictly worse than the stale bundle it clobbered. The g-368-34
+    all-zero refusal cannot catch this, because that refusal runs BEFORE the write
+    decides anything. The window is not negligible: a 1248-node bundle carries every
+    node body and the sidecar reads it over a network filesystem.
+
+    Routed through the SHARED local-backend writer rather than a hand-rolled
+    ``os.replace``, which is exactly what g-115-7257 is open about — OneDrive
+    Files-On-Demand reparse points refuse the rename with WinError 5 — and that writer
+    owns the retry-with-backoff plus in-place-fallback policy for the case, as a single
+    source of truth (guard-1179). ``LocalBackend`` is named EXPLICITLY, never
+    ``get_backend()``: see the import comment for the measured own-cloud failure.
+
+    The ``fsync`` is the half the writer does NOT do (it closes the handle, then
+    renames). NTFS journals a rename while the data blocks are still unflushed, so a
+    renamed file can come back as all-0x00 content — flush+fsync pins the bytes before
+    the rename can make them live (guard-1179, ``_fileops.durable_write_text``).
+
+    NOT a claim of reader safety: an atomic rename does not make a process that is
+    ALREADY reading the bundle immune to the swap, it only changes the failure
+    signature (guard-4299). What it buys is that whatever is on disk is always a
+    COMPLETE bundle — the old one or the new one, never a half-written one.
+    """
+
+    def _write(handle: object) -> None:
+        handle.write(text)  # type: ignore[attr-defined]
+        handle.flush()  # type: ignore[attr-defined]
+        os.fsync(handle.fileno())  # type: ignore[attr-defined]
+
+    LocalBackend().atomic_write(out_path, _write)
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     out_path = None
@@ -689,7 +775,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     text = json.dumps(payload, indent=2, ensure_ascii=False)
     if out_path:
-        Path(out_path).write_text(text, encoding="utf-8")
+        _write_bundle_atomically(Path(out_path), text)
         print(f"wrote {out_path}: {bundle.counts()}")
     else:
         print(text)

@@ -5,7 +5,10 @@
 # so its counter bump, journal append, iteration commit and tree-drift reset all
 # silently did not happen.
 #
-# The shape it catches (measured 2026-08-29, zeta/cc-02, ): an
+# The shape it catches (measured 2026-08-29, zeta/cc-02, during  --
+# that id is the goal that was BEING CLOSED when it happened, i.e. the
+# incident VICTIM, NOT an analysis of close phases; its title is about a
+# units guard and will explain nothing on its own): an
 # autocompact resume re-entered the loop AT the close sequence, so learning-gate
 # and productivity-check ran while verify and state-update never did. Every
 # visible signal read healthy, because the phases that would have left a sentinel

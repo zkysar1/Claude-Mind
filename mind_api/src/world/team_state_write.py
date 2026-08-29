@@ -230,11 +230,37 @@ def update(ctx) -> "Response":  # type: ignore[name-defined]
         # An explicit set_at supplied BY the mutation is respected (the only
         # way to restate a historical stamp — migrations, backfills).
         if field == "strategic_focus" or field.startswith("strategic_focus."):
+            # An explicit set_at supplied BY the mutation is respected (the only
+            # way to restate a historical stamp — migrations, backfills).
             mutation_sets_set_at = (
                 field == "strategic_focus.set_at"
                 or (field == "strategic_focus"
                     and isinstance(parsed, dict) and "set_at" in parsed))
-            if not mutation_sets_set_at:
+            # The stamp rides ONLY a mutation that writes the directive's own
+            # CONTENT (). It used to ride EVERY strategic_focus write,
+            # which made `set_at` serve two semantics at once — the LWW merge
+            # clock AND "when the owner set this directive". guard-5457 is the
+            # rule that the second semantic breaks silently, and it did:
+            # appending to `acknowledged_by` re-stamped set_at, so an agent that
+            # merely ACKNOWLEDGED a directive outranked the owner in
+            # _merge_strategic_focus and its (possibly stale) `primary` won the
+            # scalars. That is a directive-LOSS path, not a cosmetic one.
+            # Measured 2026-08-29 (alpha, cc-04): one ack erased 11.7h of age.
+            # guard-1153 already prescribed the correct shape and this IS it —
+            # LWW on a timestamp written BY THE SAME MUTATION that writes the
+            # value being ordered. An ack does not write `primary`, so it must
+            # not move the stamp that orders `primary`.
+            # ALLOWLIST, never a denylist: a future subfield then defaults to
+            # NOT bumping. Cost of not bumping is a fall back to the _canon
+            # content tiebreak (mild — and `acknowledged_by` is unioned, so it
+            # is unaffected either way); cost of bumping is directive loss.
+            # Content subfields per EMPTY_STATE in world/team_state.py.
+            _sub = (field[len("strategic_focus."):]
+                    if field.startswith("strategic_focus.") else "")
+            writes_directive_content = (
+                field == "strategic_focus"
+                or _sub.split(".", 1)[0] in ("primary", "rationale", "set_by"))
+            if writes_directive_content and not mutation_sets_set_at:
                 _set_nested(state, "strategic_focus.set_at",
                             datetime.now().strftime("%Y-%m-%dT%H:%M:%S"))
         if "recent_completions" in state:

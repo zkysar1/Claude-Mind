@@ -289,3 +289,75 @@ def test_MEASURED_LIMIT_leading_prose_divergence_still_REFUSES():
     a = _node("2026-08-26", "s", body="pointer: A\n\n## Alpha\nshared body\n")
     b = _node("2026-08-26", "s", body="pointer: B\n\n## Alpha\nshared body\n")
     assert H(a, b) is None
+
+
+# ------------------------------------------- value-idempotent demotion () --
+def test_a_source_already_recorded_as_prior_is_not_demoted_again():
+    """THE RATCHET. The caller tests the loser only against the winner's CURRENT
+    `source`, so a provenance string demoted by an EARLIER merge passed that test
+    and was appended AGAIN under a fresh key. Growth was then driven by SYNC
+    FREQUENCY, not by how many distinct passes happened. Measured on
+    program-alignment-health.md: two exact-duplicate pairs, ~6.6 KB, on a node
+    already over the Read cap.
+    """
+    import yaml
+    a = ("---\ntopic: \"T\"\nlast_updated: '2026-08-26'\n"
+         "last_update_trigger:\n  type: goal_execution\n  source: \"newest\"\n"
+         "  prior_source_1: \"loser\"\n---\n\n## Alpha\nshared body\n").encode()
+    b = _node("2026-08-24", "loser")
+    out = H(a, b)
+    assert out is not None
+    block = out.decode()[3:out.decode().index("\n---", 3)]
+    trig = yaml.safe_load(block)["last_update_trigger"]
+    priors = [k for k in trig if str(k).startswith("prior_source")]
+    assert priors == ["prior_source_1"], f"re-demoted an already-recorded source: {priors}"
+    values = [v for k, v in trig.items() if str(k) in ("source",) or str(k).startswith("prior_source")]
+    assert len(values) == len(set(values)), f"duplicate provenance values: {values}"
+
+
+def test_re_demoting_a_known_source_produces_ZERO_CHURN():
+    """Dedup is not merely tidier — it is what stops the write amplification.
+
+    The caller reuses the winner's front matter VERBATIM when `merged == win`, so
+    returning the trigger unchanged means the file is not rewritten at all. If this
+    ever regresses to appending-then-comparing, the bytes move on every sync and the
+    node grows even when nothing was learned.
+    """
+    a = ("---\ntopic: \"T\"\nlast_updated: '2026-08-26'\n"
+         "last_update_trigger:\n  type: goal_execution\n  source: \"newest\"\n"
+         "  prior_source_1: \"loser\"\n---\n\n## Alpha\nshared body\n").encode()
+    b = _node("2026-08-24", "loser")
+    out = H(a, b).decode()
+    assert out[3:out.index("\n---", 3)] == a.decode()[3:a.decode().index("\n---", 3)], \
+        "front matter was rewritten for a provenance we already had"
+
+
+def test_the_bare_prior_source_key_without_a_digit_is_also_matched():
+    """`prior_source` (no digit) exists in live nodes. The N-scan only reads keys
+    ending in digits, so a bare key would never suppress a re-demotion and would
+    ratchet forever — which is exactly one of the two duplicate pairs measured.
+    """
+    import yaml
+    a = ("---\ntopic: \"T\"\nlast_updated: '2026-08-26'\n"
+         "last_update_trigger:\n  type: goal_execution\n  source: \"newest\"\n"
+         "  prior_source: \"loser\"\n---\n\n## Alpha\nshared body\n").encode()
+    b = _node("2026-08-24", "loser")
+    out = H(a, b)
+    assert out is not None
+    trig = yaml.safe_load(out.decode()[3:out.decode().index("\n---", 3)])["last_update_trigger"]
+    assert "prior_source_1" not in trig, "bare prior_source did not suppress re-demotion"
+
+
+def test_a_genuinely_NEW_source_is_still_demoted():
+    """Anti-vacuity twin: dedup must not become 'never demote anything'. Without
+    this, deleting the append entirely would pass every test above.
+    """
+    import yaml
+    a = ("---\ntopic: \"T\"\nlast_updated: '2026-08-26'\n"
+         "last_update_trigger:\n  type: goal_execution\n  source: \"newest\"\n"
+         "  prior_source_1: \"something else\"\n---\n\n## Alpha\nshared body\n").encode()
+    b = _node("2026-08-24", "loser")
+    trig = __import__("yaml").safe_load(
+        H(a, b).decode()[3:H(a, b).decode().index("\n---", 3)])["last_update_trigger"]
+    assert trig["prior_source_2"] == "loser", "a genuinely new provenance was dropped"
+    assert trig["prior_source_1"] == "something else"

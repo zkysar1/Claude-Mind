@@ -269,3 +269,85 @@ def test_equal_stamps_still_tiebreak_deterministically():
     b = _ts(strategic_focus={"primary": "zzz", "set_at": "2026-08-03T09:00:00",
                              "acknowledged_by": []})
     assert _focus(a, b) == _focus(b, a)
+
+
+# --- : the stamp must NOT ride a non-content write ---------------
+#
+# The negative control above (`test_unrelated_field_does_not_bump_set_at`) uses
+# `inbox_alert_backlog`, a field OUTSIDE strategic_focus. Nothing covered a write
+# INSIDE strategic_focus that is not the directive's content — which is where the
+# whole fleet writes, because acknowledging is the normal response to a directive.
+
+def test_acking_a_directive_does_not_bump_set_at(world: Path):
+    """THE defining property for . RED before the fix.
+
+    `acknowledged_by` is appended to by every agent a directive binds, so under
+    the old unconditional bump the directive's age was falsified by agents doing
+    exactly the right thing."""
+    r = _run(world, "update", "--field", "strategic_focus.set_at",
+             "--value", "2026-07-04T13:45:00")
+    assert r.returncode == 0, r.stderr
+    r = _run(world, "update", "--field", "strategic_focus.acknowledged_by",
+             "--value", '"alpha"', "--operation", "append")
+    assert r.returncode == 0, r.stderr
+    f = _read_focus(world)
+    assert f["acknowledged_by"] == ["alpha"], "the ack itself must still land"
+    assert f["set_at"] == "2026-07-04T13:45:00", \
+        "an ack must not re-stamp the directive's own provenance"
+
+
+@pytest.mark.parametrize("sub,val", [("primary", "amended"),
+                                     ("rationale", "because"),
+                                     ("set_by", "zachary")])
+def test_directive_content_writes_STILL_bump_set_at(world: Path, sub: str, val: str):
+    """Anti-vacuity twin (guard-1220). A fix that simply stopped stamping
+    entirely would pass the test above and silently reintroduce g-115-5294's
+    frozen-stamp defect, so the allowlist must be shown to still ALLOW."""
+    r = _run(world, "update", "--field", "strategic_focus.set_at",
+             "--value", "2026-07-04T13:45:00")
+    assert r.returncode == 0, r.stderr
+    r = _run(world, "update", "--field", f"strategic_focus.{sub}", "--value", val)
+    assert r.returncode == 0, r.stderr
+    assert _read_focus(world)["set_at"] > "2026-07-04T13:45:00", \
+        f"writing {sub} is directive content and MUST still bump the stamp"
+
+
+def test_an_ack_cannot_outrank_the_owner_directive_in_the_merge(world: Path):
+    """The expensive consequence, pinned end-to-end: directive LOSS.
+
+    Built through the REAL writer, not hand-written stamps — a hand-written
+    fixture exercises only _order_by_ts, which already preferred recency, so it
+    would go green under the broken writer (the guard-1793 lesson this file
+    already learned once).
+
+    Setup: this box holds a STALE directive and merely ACKS it. A peer holds a
+    NEWER owner directive. Under the old unconditional bump the ack stamped
+    `now`, which outranks the peer's stamp, so the stale `primary` won the
+    scalars and the owner's directive was destroyed by an acknowledgement."""
+    r = _run(world, "update", "--field", "strategic_focus.primary",
+             "--value", "stale directive")
+    assert r.returncode == 0, r.stderr
+    r = _run(world, "update", "--field", "strategic_focus.set_at",
+             "--value", "2026-07-04T13:45:00")
+    assert r.returncode == 0, r.stderr
+    r = _run(world, "update", "--field", "strategic_focus.acknowledged_by",
+             "--value", '"alpha"', "--operation", "append")
+    assert r.returncode == 0, r.stderr
+
+    acker = (world / "team-state.yaml").read_bytes()
+    acker_focus = _read_focus(world)
+    # Guard the guard: if the ack DID bump, this fixture is no longer adverse.
+    assert acker_focus["set_at"] == "2026-07-04T13:45:00"
+
+    owner_focus = dict(acker_focus)
+    owner_focus["primary"] = "NEW owner directive"
+    owner_focus["set_at"] = "2026-08-01T00:00:00"   # newer than stale, older than now
+    owner_focus["acknowledged_by"] = ["bravo"]
+    owner = _ts(strategic_focus=owner_focus)
+
+    m = _focus(acker, owner)
+    assert m["primary"] == "NEW owner directive", \
+        "an acknowledgement must never outrank the owner's directive"
+    assert m["set_at"] == "2026-08-01T00:00:00"
+    assert sorted(m["acknowledged_by"]) == ["alpha", "bravo"], \
+        "and every acknowledgement must still survive the union"

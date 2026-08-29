@@ -932,3 +932,15 @@ that stage is normal**, and reading it as a stall is the mistake to avoid; corro
 `pgrep -P <runner-pid>` and the child's `etimes`, which showed a live pytest at 282s then 331s. Also
 re-confirmed live: `pgrep -c "[r]un-full-suite"` returns **0** against an actively running suite because the
 process name is `python3` — only `pgrep -af` sees it (item 9's false-negative direction).
+
+**2026-08-29 (alpha, `hostname` cc-14, `uname -r` 6.8.0-137-generic, local backend, pinned worktree at
+a683f3f38 — the DependencyFunnelProbe commit — default rung → 4 chunks of ~310 files, launched ~15:40, VERDICT
+~16:50):** `TOTAL: 18391 passed, 46 failed, 0 errors` / `VERDICT: GENUINE`, spread 20 / 18 / 3 / 5 across the four
+chunks (not tail-loaded, not one-chunk-confined). `--triage`: **6 environmental | 15 genuine-owned | 1
+genuine-UNOWNED** — `test_dependency_supersession_resolution.py::test_every_done_ids_build_site_is_expanded`,
+solo `assert 0 == 3` ("build sites moved: found 0, expected 3", a source-grep pin drifted after 1fbe35d92) →
+filed **g-115-8300**. The 2 `test_agent_watchdog_worker_role.py` reds are the pre-owned FreshnessProbe
+`canonical_missing` pair (g-115-8133); every other red carried an owner. Outside the triage's scope: invisible
+half 114/115 with `FAIL(rc=1) test_capability_gate_narrative.py`; domain half red
+`test_email_send_outreach_gate.py::test_first_send_records_then_same_topic_from_other_agent_is_refused_rc4` —
+ownership of those two NOT established in this session (item 13: pre-existing is not tracked).

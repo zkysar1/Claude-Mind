@@ -26,17 +26,32 @@ OVERRIDE_MERGE_GATE=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --override-merge-gate) OVERRIDE_MERGE_GATE="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
-        *) SLOT="$1"; shift;;
+        *)
+            if [ -n "$SLOT" ]; then
+                # A second positional is the VALUE handed as an argument — the shape a model
+                # reaches for (`wm-set.sh <slot> '<json>'`). It used to silently REPLACE the
+                # slot name and send an empty body, and the daemon's `empty_body` reply named
+                # neither mistake: measured 2026-08-29 (coach, zc-03), 9 identical retries in
+                # one session. Refuse with the exact corrected command instead.
+                echo "Error: wm-set.sh takes ONE positional (the slot); the value is read from stdin, not an argument." >&2
+                echo "  Run: printf '%s' '$1' | bash core/scripts/wm-set.sh $SLOT" >&2
+                exit 1
+            fi
+            SLOT="$1"; shift;;
     esac
 done
 
 if [ -z "$SLOT" ]; then
-    echo "Error: slot name required. Usage: wm-set.sh <slot> [--override-merge-gate <justification>]" >&2
+    echo "Error: slot name required. Usage: printf '%s' '<value>' | bash core/scripts/wm-set.sh <slot> [--override-merge-gate <justification>]" >&2
     exit 1
 fi
 
 # Read stdin (the value to set) BEFORE invoking the daemon.
 BODY="$(cat)"
+if [ -z "$BODY" ]; then
+    echo "Error: no value on stdin for slot '$SLOT'. Run: printf '%s' '<json-or-scalar>' | bash core/scripts/wm-set.sh $SLOT" >&2
+    exit 1
+fi
 
 # --- Daemon path ----------------------------------------------------------
 # shellcheck disable=SC1091
