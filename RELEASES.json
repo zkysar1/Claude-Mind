@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.31",
+    "previous_version": "2.12.30",
+    "date": "2026-08-29",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "domain-suite gate at close (g-353-75): iteration-close do_verify refuses status=completed when a domain script under $WORLD_PATH/scripts changed since the claim and the world test suite is red or uncollectable; --override-domain-suite logged to world/domain-suite-overrides.jsonl",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.30",
     "previous_version": "2.12.29",
     "date": "2026-08-29",

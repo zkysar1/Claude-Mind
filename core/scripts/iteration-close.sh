@@ -125,6 +125,7 @@ FINDINGS_COUNT=""
 OVERRIDE_UNCOMMITTED=""
 OVERRIDE_MISSING_ARTIFACT=""
 OVERRIDE_RESIDUAL=""
+OVERRIDE_DOMAIN_SUITE=""
 
 # g-284-04: Recovery instructions on non-zero exit. The trap below reads
 # _CURRENT_PHASE (set by each do_* function at entry) and prints
@@ -536,6 +537,7 @@ _print_recovery_instructions() {
             [[ -n "$SUMMARY" ]] && cmd+=" --summary \"$SUMMARY\""
             [[ -n "$OVERRIDE_UNCOMMITTED" ]] && cmd+=" --override-uncommitted \"$OVERRIDE_UNCOMMITTED\""
             [[ -n "$OVERRIDE_MISSING_ARTIFACT" ]] && cmd+=" --override-missing-artifact \"$OVERRIDE_MISSING_ARTIFACT\""
+            [[ -n "$OVERRIDE_DOMAIN_SUITE" ]] && cmd+=" --override-domain-suite \"$OVERRIDE_DOMAIN_SUITE\""
             echo "  Retry: $cmd" >&2
             # The revert line is now CONDITIONAL. Offering it when the record is
             # already closed is a destructive remedy for a state that does not
@@ -671,6 +673,9 @@ while [[ $# -gt 0 ]]; do
         # outcome_class, the diary breadcrumb, the board post and clear-in-flight.
         # Logged to world/residual-work-overrides.jsonl by the gate.
         --override-residual) OVERRIDE_RESIDUAL="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        # g-353-75: forwarded to domain-suite-gate.py inside do_verify. Turns a
+        # domain-suite BLOCK into a logged pass (world/domain-suite-overrides.jsonl).
+        --override-domain-suite) OVERRIDE_DOMAIN_SUITE="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         *)
             # (2026-08-29): a bare `unknown arg: --outcome-class` sent a downstream
             # Body (small local model) into a second invented flag (`--executed-by`),
@@ -1005,6 +1010,41 @@ do_verify() {
     if [[ "${BODY_ROLE:-}" == "worker" ]]; then
         bash "$SCRIPT_DIR/pending-deploys-gate.sh" --agent "$AGENT" \
             >>"$CORE_ROOT/logs/iteration-close-stderr.log" 2>&1 || true
+    fi
+
+    # ── Domain-suite gate (g-353-75) ─────────────────────────────────────────
+    # Refuse status=completed while the world's domain test suite
+    # ($WORLD_PATH/scripts) is red or uncollectable, IF a domain script changed
+    # since this goal's claim. The domain half is invisible to the git-based
+    # full-suite-recommender (guard-1947) and run-full-suite-after-deep-code.md
+    # only NAMES its command — measured 2026-08-29 on a live deployment, two
+    # test modules that could not import shipped through worker closes and every
+    # later goal in the lane "verified" against a suite that could not collect.
+    # guard-399: the instruction needed a gate. Cheap until it fires (a stat
+    # walk; the suite runs only when a domain code file is newer than the
+    # claim), FAIL-OPEN on its own errors (decision=error, rc 0), and BEFORE
+    # the status write so a refusal leaves the goal open — the EXIT trap's
+    # verify branch then prints the retry line, carrying --override-domain-suite.
+    # Both roles close through here (worker Phase 4a and the reducer's verify),
+    # so this is the one place the domain half is enforced. stdout (the JSON
+    # verdict) goes to the diagnostic log; the refusal text is stderr and stays
+    # loop-visible — do NOT pipe or silence it (guard-3257).
+    # Only the gate's OWN verdict refuses: rc 1 is a block; rc 0 is pass/noop/
+    # override/error; anything else (usage error, interpreter missing, the
+    # script absent in a harness that copies a subset of core/scripts) is a
+    # gate fault and fails OPEN with a warning — never a refusal.
+    if [[ "$GOAL_STATUS" == "completed" && -f "$SCRIPT_DIR/domain-suite-gate.py" ]]; then
+        _dsg_args=(--goal "$GOAL_ID" --source "$SOURCE")
+        [[ -n "$OVERRIDE_DOMAIN_SUITE" ]] && _dsg_args+=(--override "$OVERRIDE_DOMAIN_SUITE")
+        _dsg_rc=0
+        python3 "$SCRIPT_DIR/domain-suite-gate.py" "${_dsg_args[@]}" \
+            >>"$CORE_ROOT/logs/iteration-close-stderr.log" || _dsg_rc=$?
+        if [[ $_dsg_rc -eq 1 ]]; then
+            echo "[iteration-close] ✖ REFUSED — DOMAIN SUITE RED (g-353-75): goal $GOAL_ID stays open. Fix the world test suite (see above), then re-run this close." >&2
+            return 1
+        elif [[ $_dsg_rc -ne 0 ]]; then
+            echo "[iteration-close] WARN domain-suite-gate rc=$_dsg_rc (gate fault, fail-open) — the domain suite was NOT checked for $GOAL_ID" >&2
+        fi
     fi
 
     # g-284-06 Step 0: Ordered-write intent marker. BEFORE any state mutation
