@@ -1,3 +1,7 @@
+---
+description: "Before routing work to the user, check skills, scripts, forged skills, provisionability; framework edits are agent work, never user-gated."
+---
+
 # Capability Check Before User Routing (MANDATORY)
 
 > **Enforcement**: The CREATE_BLOCKER protocol now runs `capability-gate.py` as

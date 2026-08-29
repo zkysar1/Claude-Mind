@@ -1,3 +1,7 @@
+---
+description: "When pseudocode names an action in natural language, check world/forged-skills.yaml triggers and invoke the matching skill, never improvise."
+---
+
 # Forged Skill Resolution
 
 ## Principle

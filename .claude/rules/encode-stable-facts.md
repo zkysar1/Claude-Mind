@@ -1,3 +1,7 @@
+---
+description: "Retrieve resource locators (paths, endpoints, ids) from world/conventions before rediscovering; after three discovery probes, encode."
+---
+
 # Encode Stable Facts
 
 ## Principle

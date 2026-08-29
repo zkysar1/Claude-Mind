@@ -232,6 +232,12 @@ def test_tree_floor_key_absent_from_defaults():
     and the shared-floor fallback could never fire — silently breaking the
     documented "delete the config line to revert" path with no test failure
     anywhere else. Configure the value in core/config/tree.yaml only.
+
+    This test is the one guard-1510 asks for by name: "Pin the absence with an
+    explicit test asserting new_key not in DEFAULTS, so a later tidy-up that
+    'completes' the defaults dict fails loudly." The omission is DELIBERATE --
+    do not "fix" it by adding the key. Origin g-306-92; guard-1510 citation
+    added by g-115-3258 so the guardrail is greppable from its own safety net.
     """
     assert "embedding_tree_min_cosine" not in _retrieve._DEFAULT_RETRIEVAL_CFG
 

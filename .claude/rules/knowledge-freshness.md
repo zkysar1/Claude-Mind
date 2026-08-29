@@ -1,3 +1,7 @@
+---
+description: "After any world-changing action update the affected tree nodes (Edit; last_updated + trigger) or record the debt in working memory."
+---
+
 # Knowledge Freshness Principle
 
 After any action that changes the world (code edits, hypothesis resolution, user corrections),

@@ -1,3 +1,7 @@
+---
+description: "Never call a partner silent without liveness-check.sh: fresh last_active proves life; stale is ambiguous, corroborate independently."
+---
+
 # Check Team-State Before Concluding Partner Silent
 
 ## Principle

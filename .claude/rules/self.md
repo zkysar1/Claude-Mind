@@ -1,3 +1,7 @@
+---
+description: "Read agents/<agent>/self.md before aspirations, priorities or strategy; decide and log rather than block; keep last_update_trigger one line."
+---
+
 # Self (Agent Identity)
 
 The agent's core purpose is defined in `agents/<agent>/self.md`.

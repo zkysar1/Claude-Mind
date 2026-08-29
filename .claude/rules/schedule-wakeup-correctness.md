@@ -1,3 +1,7 @@
+---
+description: "ScheduleWakeup prompt: the <<autonomous-loop-dynamic>> sentinel, a user /loop, or plain text; never a slash skill; re-arm first on wakeup."
+---
+
 # ScheduleWakeup Correctness
 
 ## Principle

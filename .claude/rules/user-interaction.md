@@ -1,3 +1,7 @@
+---
+description: "Never invoke /start, /stop or /open-questions or write session-state files; answer the user first via /respond with retrieval, then resume."
+---
+
 # User Interaction Protocol
 
 ## Immutable Constraints (all states)

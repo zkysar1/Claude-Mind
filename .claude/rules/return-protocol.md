@@ -1,3 +1,8 @@
+---
+description: "End every turn with a tool call, never text: sub-skills with Bash; the orchestrator with ScheduleWakeup(sentinel) + Skill(aspirations loop)."
+alwaysApply: true
+---
+
 # Return Protocol
 
 Text-only output as the last action in a turn kills the autonomous session —

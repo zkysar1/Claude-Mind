@@ -1,3 +1,7 @@
+---
+description: "For high-conviction hypotheses, failure analysis and inherited designs: list assumptions, keep only what is verifiable, rebuild, log delta."
+---
+
 # First-Principles Thinking
 
 ## Principle

@@ -1,3 +1,7 @@
+---
+description: "world/ and meta/ resolve via local-paths.conf (Read/Edit prefixes only, never bare bash paths); agents under agents/; no new top-level dirs."
+---
+
 # External Path Resolution
 
 ## Problem

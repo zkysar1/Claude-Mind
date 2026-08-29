@@ -1,3 +1,7 @@
+---
+description: "Before a consequential decision (goal pick, verify, hypothesis, blocker, aspiration, framework fix, negation, census) run retrieve.sh first."
+---
+
 # Retrieve Before Deciding
 
 ## Principle

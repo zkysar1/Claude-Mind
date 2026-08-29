@@ -1,3 +1,7 @@
+---
+description: "No destructive store op before an integrity-verified archive exists outside the blast radius; authorization never means delete-first."
+---
+
 # Archive Before Delete (MANDATORY)
 
 ## Principle

@@ -1,3 +1,7 @@
+---
+description: "The learning loop IS the work: never skip encoding, sparks, reflection or gates; retiring dead rules counts; detection beats attribution."
+---
+
 # Learning Is The Mission
 
 ## Principle

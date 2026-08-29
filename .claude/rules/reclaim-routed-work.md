@@ -1,3 +1,7 @@
+---
+description: "Re-derive everything routed away (questions, user-participant goals, blocked/deferred goals) on both axes: premise true AND reason valid."
+---
+
 # Reclaim Routed Work (MANDATORY)
 
 ## Principle

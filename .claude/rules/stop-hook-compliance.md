@@ -1,3 +1,7 @@
+---
+description: "When the stop hook says re-enter the loop, do that; never touch agent-state, stop-loop or stop-requested; a long session is no stop reason."
+---
+
 # Stop Hook Compliance
 
 ## The Recovery Protocol

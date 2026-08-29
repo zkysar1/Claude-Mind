@@ -1,3 +1,8 @@
+---
+description: "Read the file (or retrieve the node) this session before any Edit, Write or sed -i; summaries are not context; the hook covers few paths."
+alwaysApply: true
+---
+
 # Read Before Edit
 
 ## Principle

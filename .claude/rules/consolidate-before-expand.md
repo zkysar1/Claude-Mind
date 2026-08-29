@@ -1,3 +1,7 @@
+---
+description: "Finish existing work before starting new: near-complete aspirations pull hardest; dig deeper on plateaus; close zombies before creating."
+---
+
 # Consolidate Before Expand
 
 ## Principle
