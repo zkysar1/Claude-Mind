@@ -142,6 +142,40 @@ _PY_WRITE_IDIOMS = (
 )
 _PY_WRITE_RE = re.compile("|".join(_PY_WRITE_IDIOMS))
 _MENTION_RE = re.compile(_PATH_TOKEN)
+# After the `<<` of a heredoc marker: `'PYEOF'`, `-EOF`, `"EOF"`.
+_HEREDOC_TAG_RE = re.compile(r"^-?\s*[\"']?(\w+)[\"']?")
+# After `-c `: the quoted program (double quotes may carry escaped quotes).
+_C_ARG_RE = re.compile(r"^\s*(?:\"((?:[^\"\\]|\\.)*)\"|'([^']*)'|(\S+))", re.S)
+
+
+def _python_bodies(cmd: str):
+    """The Python SOURCE of every inline invocation in `cmd` -- and nothing else.
+
+    The inline-Python rule must read the program, not the shell around it. A
+    worker Body's every command is prefixed by the framework's own env exports
+    (`export BODY_WM_PATH=".../working-memory.yaml"; ...`), so scanning the whole
+    command for a governed basename denied a worker that was writing a TEST
+    FILE (measured 2026-08-29 02:56, a downstream worker Body) -- the store name
+    came from the prefix, the write from the program, and the two were never
+    the same statement.
+    """
+    bodies = []
+    for m in _INLINE_PY_RE.finditer(cmd):
+        marker = m.group(0)
+        rest = cmd[m.end():]
+        if "<<" in marker:
+            tag = _HEREDOC_TAG_RE.match(rest)
+            nl = rest.find("\n")
+            if not tag or nl < 0:
+                continue
+            body = rest[nl + 1 :]
+            end = re.search(r"(?m)^\s*" + re.escape(tag.group(1)) + r"\s*$", body)
+            bodies.append(body[: end.start()] if end else body)
+        elif "-c" in marker:
+            arg = _C_ARG_RE.match(rest)
+            if arg:
+                bodies.append(next(g for g in arg.groups() if g is not None))
+    return bodies
 
 
 def _is_temp_path(token: str) -> bool:
@@ -198,8 +232,10 @@ def direct_store_writes(cmd: str):
             if _governed(tok):
                 hits.append((label, tok))
     hits.extend(_copy_move_targets(cmd))
-    if _INLINE_PY_RE.search(cmd) and _PY_WRITE_RE.search(cmd):
-        for m in _MENTION_RE.finditer(cmd):
+    for body in _python_bodies(cmd):
+        if not _PY_WRITE_RE.search(body):
+            continue
+        for m in _MENTION_RE.finditer(body):
             tok = m.group(0)
             if _governed(tok):
                 hits.append(("inline Python writing", tok))

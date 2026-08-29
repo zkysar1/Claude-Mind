@@ -60,7 +60,32 @@ def classify(lines):
     return fm, c
 
 
+class GitUnusable(Exception):
+    """git itself failed -- NOT the same as 'this path is absent from the ref'.
+
+    Collapsing the two is how a checker reports CLEAN when it could not look
+    (fresh-eyes F-1: --ref with a typo printed CLEAN and exited 0). A checker
+    that cannot read its baseline must fail loudly, never quietly pass.
+    """
+
+
+def assert_ref_usable(ref):
+    """Resolve the ref ONCE, up front, so a bad ref cannot masquerade as
+    'every file is new'."""
+    r = subprocess.run(["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise GitUnusable(
+            "cannot resolve ref %r (not a git repo, or the ref does not exist). "
+            "Refusing to report CLEAN against a baseline that cannot be read." % ref)
+
+
 def head_text(path, ref):
+    """Return the file's content at ref, or None IFF the path is absent there.
+
+    The ref is already known good (assert_ref_usable), so a non-zero exit here
+    means path-not-in-ref, which is a legitimate skip for a newly added file.
+    """
     r = subprocess.run(["git", "show", f"{ref}:{path}"],
                        capture_output=True, text=True)
     return r.stdout if r.returncode == 0 else None
@@ -106,10 +131,22 @@ def main():
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
+    try:
+        assert_ref_usable(args.ref)
+    except GitUnusable as e:
+        print("line-class-diff: ERROR -- %s" % e, file=sys.stderr)
+        return 2
+
     files = args.files
     if not files:
         r = subprocess.run(["git", "diff", "--name-only", args.ref],
                            capture_output=True, text=True)
+        if r.returncode != 0:
+            # F-2: an unchecked failure here yields empty stdout, which reads
+            # as "nothing changed" -- a clean bill of health from a broken git.
+            print("line-class-diff: ERROR -- git diff failed (rc=%d): %s"
+                  % (r.returncode, (r.stderr or "").strip()), file=sys.stderr)
+            return 2
         files = [f for f in r.stdout.split("\n") if f.strip().endswith(".md")]
     if not files:
         print("line-class-diff: no markdown files changed vs %s" % args.ref)
@@ -117,9 +154,14 @@ def main():
 
     results = [check(f, args.ref) for f in files]
     bad = [r for r in results if r["status"] == "DEFECT"]
+    # F-3: a skipped file was never compared, so it must not inflate the
+    # reviewed count -- that is how "CLEAN - N files" overstates coverage.
+    skipped = [r for r in results if r["status"] == "skipped"]
+    compared = len(results) - len(skipped)
 
     if args.json:
-        print(json.dumps({"results": results, "defect_count": len(bad)}, indent=2))
+        print(json.dumps({"results": results, "defect_count": len(bad),
+                          "compared": compared, "skipped": len(skipped)}, indent=2))
     else:
         for r in bad:
             print("DEFECT: %s" % r["path"])
@@ -133,8 +175,14 @@ def main():
                 for ln in v["added"][:2]:
                     print("      added:   %s" % ln[:100])
         if not bad:
-            print("line-class-diff: CLEAN — %d markdown file(s), no line-class removals vs %s"
-                  % (len(results), args.ref))
+            print("line-class-diff: CLEAN — %d markdown file(s) compared, no line-class "
+                  "removals vs %s" % (compared, args.ref))
+        if skipped:
+            # Stated on BOTH the clean and defect paths: a skipped file is
+            # unexamined, and silence about it reads as coverage.
+            print("  note: %d file(s) SKIPPED (not examined): %s"
+                  % (len(skipped), ", ".join("%s [%s]" % (r["path"], r["reason"])
+                                             for r in skipped[:5])))
     return 1 if bad else 0
 
 

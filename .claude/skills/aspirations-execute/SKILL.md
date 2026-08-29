@@ -1129,9 +1129,15 @@ IF outcome_class != "routine" AND goal_succeeded:
     FOR EACH active item from retrieval_manifest that met structural helpfulness:
         item_source_goal = item.source_goal or item.source
         IF item_source_goal:
+            # RESOLVE the real record; never concatenate "exp-{id}" (g-115-4924).
+            # Why, census, consumer pairing: core/config/rationale/enabled-by-id-resolution.md
+            Bash: experience-read.sh --goal {item_source_goal}   # a LIST, always
+            enabler = record whose `created` most closely PRECEDES this execution
+            IF none: SKIP this item — a DOCUMENTED skip. Never write a constructed
+                id: an absent edge is visibly a gap, a dangling one reads as coverage.
             goals_between = count goals completed between then and now
             Bash: experience-update-field.sh exp-{goal.id}-* enabled_by \
-                '<append {experience_id: "exp-{item_source_goal}", relationship: "provided_foundation", temporal_distance: goals_between}>'
+                '<append {experience_id: "{enabler.id}", relationship: "provided_foundation", temporal_distance: goals_between}>'
 ```
 
 ## Phase 4.28: Skill Co-Invocation Logging — lightweight: SKIP if trivial_mode

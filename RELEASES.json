@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.12",
+    "previous_version": "2.12.11",
+    "date": "2026-08-29",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "store-write-guard: inline-Python rule scoped to the program text (worker-prefix false positive)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.11",
     "previous_version": "2.12.10",
     "date": "2026-08-29",
