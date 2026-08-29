@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.10",
+    "previous_version": "2.12.9",
+    "date": "2026-08-29",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "worker-loop Phase 2: the success shape of a claim (record with your own executed_by_sid) and never execute an unclaimed goal",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.9",
     "previous_version": "2.12.8",
     "date": "2026-08-29",
