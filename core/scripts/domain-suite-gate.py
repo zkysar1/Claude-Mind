@@ -35,9 +35,15 @@ WHAT IT DOES, in order (each step is cheap until the last):
      `python3 -m pytest -q` with cwd=scripts so `from <pkg> import ...`
      resolves the way the rule's own command runs it. STORAGE_BACKEND=local is
      pinned (guard-955). Bounded at 900 s.
-  4. rc 0 → pass. rc 5 (pytest: nothing collected) → pass, noted. Anything
-     else → BLOCK: exit 1, the touched files and the last lines on stderr.
-     `--override "<why>"` turns a block into a pass and appends one row to
+  4. rc 0 → pass. rc 5 (pytest: nothing collected) → pass, noted. A timeout
+     or a pytest internal/usage error (3/4) is a gate fault → fail-open with a
+     warning. rc 2 (collection error) → BLOCK, always. rc 1 (red) → the
+     RATCHET: the failing set from the previous run on this box
+     (world/domain-suite-baseline.json) is the baseline; the first run seeds
+     it and passes; later runs block only on a red NOT in it, and a run whose
+     reds are a subset passes and shrinks the baseline. A block exits 1 with
+     the touched files and the last lines on stderr. `--override "<why>"`
+     turns a block into a pass and appends one row to
      world/domain-suite-overrides.jsonl — the ledger is the audit, and a
      collection error is never a legitimate override (the message says so).
 
@@ -61,6 +67,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timedelta
@@ -171,8 +178,8 @@ def runner_command(scripts_dir: Path) -> tuple[list[str], str]:
     return [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--color=no"], "python -m pytest (cwd=scripts)"
 
 
-def run_suite(scripts_dir: Path, timeout: int) -> tuple[int | None, list[str]]:
-    """(rc, last lines). rc None means the run exceeded `timeout`."""
+def run_suite(scripts_dir: Path, timeout: int) -> tuple[int | None, list[str], set[str]]:
+    """(rc, last lines, failing ids). rc None means the run exceeded `timeout`."""
     cmd, _ = runner_command(scripts_dir)
     env = dict(os.environ)
     env["STORAGE_BACKEND"] = "local"  # guard-955: any test runner, always
@@ -184,9 +191,70 @@ def run_suite(scripts_dir: Path, timeout: int) -> tuple[int | None, list[str]]:
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or b"")
         text = out.decode("utf-8", "replace") if isinstance(out, bytes) else str(out)
-        return None, text.splitlines()[-TAIL_LINES:]
+        return None, text.splitlines()[-TAIL_LINES:], set()
     text = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
-    return proc.returncode, [ln for ln in text.splitlines() if ln.strip()][-TAIL_LINES:]
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    return proc.returncode, lines[-TAIL_LINES:], failing_ids(lines)
+
+
+_PYTEST_FAILED = re.compile(r"^(?:FAILED|ERROR)\s+(\S+)")
+_RUNNER_FAIL = re.compile(r"^\s*\[\d+/\d+\]\s+FAIL\s+(\S+)|^\s*FAIL\s+(\S+)")
+
+
+def failing_ids(lines: list[str]) -> set[str]:
+    """The failing units named in a run's output, as a set of identifiers.
+
+    Two shapes are recognised, both stable: pytest's short summary
+    (`FAILED path::test - msg`, `ERROR path::test`) and the domain runner's
+    per-file lines (`[N/M] FAIL file.sh (rc=1)`, `FAIL name`). Everything else
+    is ignored, so an unrecognised runner yields an EMPTY set — and an empty
+    set on a red run is treated as "cannot prove pre-existing", which blocks.
+    """
+    ids: set[str] = set()
+    for ln in lines:
+        m = _PYTEST_FAILED.match(ln)
+        if m:
+            ids.add(m.group(1))
+            continue
+        m = _RUNNER_FAIL.match(ln)
+        if m:
+            ids.add(m.group(1) or m.group(2))
+    return ids
+
+
+# ─── the baseline (ratchet) ───────────────────────────────────────────────
+#
+# A world's suite may already be red before this gate exists (measured on the
+# dev world: 2 real reds nobody had seen, in a 651 s run). Demanding GREEN would
+# refuse every close on such a world until someone fixed reds that no close
+# caused, so the verdict is a RATCHET, the audit-baselines shape: the failing
+# set from the previous run is the baseline; a close blocks only on a red that
+# is NOT in it (or on a collection error, which is never baseline-able); a run
+# whose reds are a subset of the baseline passes AND shrinks the baseline to
+# what still fails. The first run seeds it. The file is per box (a plain write
+# to the world mirror; on a synced world it stays local), which is the honest
+# scope — the baseline describes what THIS box last saw.
+
+def _baseline_path(world_dir: Path) -> Path:
+    return Path(world_dir) / "domain-suite-baseline.json"
+
+
+def load_baseline(world_dir: Path) -> dict | None:
+    try:
+        doc = json.loads(_baseline_path(world_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) and isinstance(doc.get("failing"), list) else None
+
+
+def save_baseline(world_dir: Path, failing: set[str], rc: int, runner: str) -> None:
+    payload = {"recorded_at": datetime.now().isoformat(timespec="seconds"),
+               "agent": os.environ.get("MIND_AGENT", "unknown"),
+               "runner": runner, "rc": rc, "failing": sorted(failing)}
+    try:
+        _baseline_path(world_dir).write_text(json.dumps(payload, indent=1) + "\n", encoding="utf-8")
+    except OSError as e:
+        print(f"domain-suite-gate: baseline write failed: {e}", file=sys.stderr)
 
 
 # ─── ledger + telemetry ───────────────────────────────────────────────────
@@ -238,16 +306,46 @@ def evaluate(goal_id: str, source: str, since: datetime | None, override: str | 
         return 0
 
     _, runner_label = runner_command(scripts_dir)
-    rc, tail = run_suite(scripts_dir, timeout)
+    rc, tail, failing = run_suite(scripts_dir, timeout)
     if rc in (0, 5):
         note = "" if rc == 0 else " (pytest collected no tests)"
+        save_baseline(world_dir, set(), rc, runner_label)
         _emit("pass", goal_id, override, reason="domain suite green" + note, runner=runner_label,
               rc=rc, touched=touched)
         return 0
 
-    why = (f"domain suite exceeded {timeout}s" if rc is None
-           else "domain suite could not COLLECT (rc=2: an import or syntax error in a test module)"
-           if rc == 2 else f"domain suite RED (rc={rc})")
+    # Gate faults fail OPEN: a suite that cannot finish in `timeout`, a pytest
+    # internal error (3) or usage error (4) say nothing about THIS close.
+    if rc is None or rc in (3, 4):
+        why = f"domain suite exceeded {timeout}s" if rc is None else f"pytest rc={rc} (internal/usage error)"
+        _emit("error", goal_id, override, reason=why + " — not a verdict on this close; fail-open",
+              runner=runner_label, rc=rc, touched=touched, tail=tail)
+        print(f"[domain-suite-gate] WARN {why}; the domain suite was NOT verified for {goal_id}", file=sys.stderr)
+        return 0
+
+    baseline = load_baseline(world_dir)
+    if rc == 2 or not failing:
+        why = ("domain suite could not COLLECT (rc=2: an import or syntax error in a test module)"
+               if rc == 2 else f"domain suite RED (rc={rc}) and no failing unit could be identified from its output")
+    elif baseline is None:
+        # First run on this box: what is red now predates this gate. Record it
+        # and pass, saying so — the ratchet starts here, not at green.
+        save_baseline(world_dir, failing, rc, runner_label)
+        _emit("pass", goal_id, override, reason=f"seeded baseline: {len(failing)} pre-existing red(s) recorded, "
+              "later closes block only on NEW reds", runner=runner_label, rc=rc, touched=touched,
+              failing=sorted(failing))
+        return 0
+    else:
+        new_reds = sorted(failing - set(baseline["failing"]))
+        if not new_reds:
+            save_baseline(world_dir, failing, rc, runner_label)  # ratchet: only what still fails
+            _emit("pass", goal_id, override, reason=f"{len(failing)} pre-existing red(s), none new since "
+                  f"{baseline.get('recorded_at', '?')} (baseline ratcheted)", runner=runner_label, rc=rc,
+                  touched=touched, failing=sorted(failing))
+            return 0
+        why = (f"domain suite has {len(new_reds)} NEW red(s) not in the baseline of "
+               f"{baseline.get('recorded_at', '?')}: " + ", ".join(new_reds[:6])
+               + (" ..." if len(new_reds) > 6 else ""))
     if override:
         _log_override(world_dir, {
             "timestamp": datetime.now().isoformat(timespec="seconds"),

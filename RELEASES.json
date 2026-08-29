@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.32",
+    "previous_version": "2.12.31",
+    "date": "2026-08-29",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "domain-suite gate verdict is a per-box ratchet (g-353-75): world/domain-suite-baseline.json holds the previous run's failing set; block only on a NEW red or a collection error; timeouts and pytest rc 3/4 fail open",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.31",
     "previous_version": "2.12.30",
     "date": "2026-08-29",

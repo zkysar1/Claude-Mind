@@ -89,13 +89,101 @@ def test_a_green_touched_suite_passes(tmp_path):
     assert doc["runner"].startswith("python -m pytest")
 
 
-def test_a_red_test_refuses_the_close(tmp_path):
+def _baseline(world: Path) -> dict:
+    return json.loads((world / "domain-suite-baseline.json").read_text(encoding="utf-8"))
+
+
+def test_the_first_red_run_seeds_the_baseline_and_passes(tmp_path):
+    # A world can be red before the gate exists (the dev world was: 2 reds
+    # nobody had seen). The first run records what is red and passes, so the
+    # gate never refuses a close for a red that predates it.
     world = _world(tmp_path, {"test_red.py": RED_TEST})
     rc, doc, _ = _run(tmp_path, world, "--since", OLD)
+    assert rc == 0
+    assert doc["decision"] == "pass"
+    assert "seeded baseline: 1 pre-existing red(s)" in doc["reason"]
+    assert _baseline(world)["failing"] == ["tests/test_red.py::test_red"]
+
+
+def test_a_new_red_after_the_seed_refuses_the_close(tmp_path):
+    world = _world(tmp_path, {"test_red.py": RED_TEST})
+    _run(tmp_path, world, "--since", OLD)  # seeds
+    (world / "scripts" / "tests" / "test_red2.py").write_text("def test_red2():\n    assert 0\n", encoding="utf-8")
+    rc, doc, err = _run(tmp_path, world, "--since", OLD)
     assert rc == 1
     assert doc["decision"] == "block"
-    assert doc["rc"] == 1
-    assert "RED" in doc["reason"]
+    assert "1 NEW red(s)" in doc["reason"] and "tests/test_red2.py::test_red2" in doc["reason"]
+    assert "REFUSED status=completed" in err
+    # The baseline is untouched by a refusal: the old red stays the only entry.
+    assert _baseline(world)["failing"] == ["tests/test_red.py::test_red"]
+
+
+def test_pre_existing_reds_pass_and_the_baseline_ratchets_down(tmp_path):
+    world = _world(tmp_path, {"test_red.py": RED_TEST, "test_red2.py": "def test_red2():\n    assert 0\n"})
+    _run(tmp_path, world, "--since", OLD)  # seeds with two reds
+    assert len(_baseline(world)["failing"]) == 2
+    # Same reds again: pass. Fix one: pass, and the baseline shrinks to what still fails.
+    rc, doc, _ = _run(tmp_path, world, "--since", OLD)
+    assert rc == 0 and doc["decision"] == "pass" and "2 pre-existing red(s), none new" in doc["reason"]
+    (world / "scripts" / "tests" / "test_red2.py").write_text(GREEN_TEST, encoding="utf-8")
+    rc, doc, _ = _run(tmp_path, world, "--since", OLD)
+    assert rc == 0 and doc["decision"] == "pass"
+    assert _baseline(world)["failing"] == ["tests/test_red.py::test_red"]
+    # Fix the last one: green writes an EMPTY baseline, so the red cannot come back unnoticed.
+    (world / "scripts" / "tests" / "test_red.py").write_text(GREEN_TEST, encoding="utf-8")
+    rc, doc, _ = _run(tmp_path, world, "--since", OLD)
+    assert rc == 0 and doc["reason"] == "domain suite green"
+    assert _baseline(world)["failing"] == []
+    (world / "scripts" / "tests" / "test_red.py").write_text(RED_TEST, encoding="utf-8")
+    rc, doc, _ = _run(tmp_path, world, "--since", OLD)
+    assert rc == 1 and doc["decision"] == "block"
+
+
+def test_a_collection_error_blocks_even_with_a_baseline(tmp_path):
+    world = _world(tmp_path, {"test_red.py": RED_TEST})
+    _run(tmp_path, world, "--since", OLD)  # seeds
+    (world / "scripts" / "tests" / "test_broken.py").write_text(BROKEN_IMPORT_TEST, encoding="utf-8")
+    rc, doc, _ = _run(tmp_path, world, "--since", OLD)
+    assert rc == 1 and doc["decision"] == "block" and doc["rc"] == 2
+
+
+def test_a_red_run_that_names_no_unit_blocks(tmp_path):
+    # A runner that exits 1 without naming a failing unit cannot be ratcheted:
+    # "cannot prove pre-existing" is a block, not a pass.
+    world = _world(tmp_path, {"test_green.py": GREEN_TEST}, hook="#!/usr/bin/env bash\necho 'something went wrong'\nexit 1\n")
+    rc, doc, _ = _run(tmp_path, world, "--since", OLD)
+    assert rc == 1 and doc["decision"] == "block"
+    assert "no failing unit could be identified" in doc["reason"]
+
+
+def test_a_timeout_fails_open_with_a_warning(tmp_path):
+    world = _world(tmp_path, {"test_green.py": GREEN_TEST}, hook="#!/usr/bin/env bash\nsleep 5\nexit 0\n")
+    rc, doc, err = _run(tmp_path, world, "--since", OLD, "--timeout", "1")
+    assert rc == 0
+    assert doc["decision"] == "error"
+    assert "exceeded 1s" in doc["reason"]
+    assert "NOT verified" in err
+    assert not (world / "domain-suite-baseline.json").exists()
+
+
+def test_failing_ids_reads_both_output_shapes():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("domain_suite_gate_t", GATE)
+    mod = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(CORE_SCRIPTS))
+    spec.loader.exec_module(mod)
+    lines = [
+        "FAILED tests/test_a.py::test_x - AssertionError: boom",
+        "ERROR tests/test_b.py - ImportError",
+        "[57/77] FAIL test_ssm_run_send_deny_backoff.sh (rc=1)",
+        "  FAIL the tag alone decides whether it retries (A=3, B=3)",
+        "FAIL pytest-batch",
+        "74 passed in 1.0s",
+    ]
+    assert mod.failing_ids(lines) == {
+        "tests/test_a.py::test_x", "tests/test_b.py", "test_ssm_run_send_deny_backoff.sh",
+        "the", "pytest-batch",
+    }
 
 
 # ─── the trigger ──────────────────────────────────────────────────────────
@@ -175,14 +263,20 @@ def test_the_world_runner_hook_takes_precedence_over_pytest(tmp_path):
     assert doc["runner"] == "scripts/run-domain-tests.sh"
 
 
-def test_a_failing_world_runner_hook_refuses_the_close(tmp_path):
+def test_a_failing_world_runner_hook_seeds_then_refuses_a_new_red(tmp_path):
     world = _world(tmp_path, {"test_green.py": GREEN_TEST},
                    hook="#!/usr/bin/env bash\necho 'FAIL tests/test_x.sh'\nexit 1\n")
     rc, doc, _ = _run(tmp_path, world, "--since", OLD)
+    assert rc == 0 and doc["decision"] == "pass" and "seeded" in doc["reason"]
+    assert doc["runner"] == "scripts/run-domain-tests.sh"
+    assert _baseline(world)["failing"] == ["tests/test_x.sh"]
+    (world / "scripts" / "run-domain-tests.sh").write_text(
+        "#!/usr/bin/env bash\necho 'FAIL tests/test_x.sh'\necho '[2/2] FAIL tests/test_y.sh (rc=1)'\nexit 1\n", encoding="utf-8")
+    rc, doc, _ = _run(tmp_path, world, "--since", OLD)
     assert rc == 1
     assert doc["decision"] == "block"
-    assert doc["runner"] == "scripts/run-domain-tests.sh"
-    assert any("FAIL tests/test_x.sh" in ln for ln in doc["tail"])
+    assert "tests/test_y.sh" in doc["reason"] and "tests/test_x.sh" not in doc["reason"].split(":")[-1]
+    assert any("FAIL tests/test_y.sh" in ln for ln in doc["tail"])
 
 
 def test_the_runner_is_pinned_to_the_local_backend(tmp_path):
