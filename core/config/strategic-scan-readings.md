@@ -7082,3 +7082,115 @@ because the box holding the widest peer window is the one best placed to see it.
 
 Still routed nothing: 91.4% of invocations remain unclassifiable, and one well-covered
 peer is not a fleet.
+
+## 2026-08-29T21:0x — alpha, `hostname` cc-04, `uname -r` 6.8.0-137-generic, own-cloud, strategic scan `time_cadence`
+
+### S2a — FIRST confirmation of the `node_split` blast radius, on a second box
+
+opened **30/30** (control passed), threshold read from config (30d). **4 of 30 structural:**
+
+| node | age | trigger |
+|---|---|---|
+| `solver-v0-audits` | 62d | distill |
+| `infrastructure-performance` | 49d | decompose |
+| `v2-directed-steering-ship-log` | 48d | **node_split** |
+| `v2-directed-steering-wiring` | 48d | **node_split** |
+
+This is a **WIDENED NET, not drift**, and it lands exactly on the prediction. zeta's
+2026-08-22 census that added `node_split`/`node_fold` to `STRUCTURAL_TRIGGERS` predicted
+"node_split 2 fleet-wide, BOTH inside the stale screen (2/30 -> 4/30)". Measured here 7
+days later on a different box: numerator **4**, denominator **30**, both new members
+`node_split`. The denominator matched the prediction too.
+
+The two long-standing members reproduce BY NAME with ages advancing exactly with the
+calendar against the 08-20 row (`solver-v0-audits` 53d->62d, `infrastructure-performance`
+40d->49d, both +9 over 9 days) — the tell that these are the same nodes rather than a
+coincidence of counts. `adoption-strategy-patterns` stayed out, as its 08-20 stamp-bump
+exit recorded. `content_verified` null on all four.
+
+`age_histogram={34:1,39:1,41:1,42:1,43:2,45:1,48:8,49:8,56:1,60:1,62:1,89:1,100:1,101:1,111:1}`
+— **16 of 30 sit at 48-49d**, one cohort. SPLIT: **30 raw / 6 re-verify / 24 suspect**.
+Routed nothing (owned 5x; g-115-5462 newest owner).
+
+### S4.6 — a box's view of its OWN resident diary can be far NARROWER than a peer's
+
+0 candidates at BOTH `--min-failures 2` and `1`, distinct members 0 — the undecidable
+case. `ceiling_ratio` **0.0057 (158 of 27596)**, inside the ~0.0026–0.087 band, so this
+is a COVERAGE measurement and not a skill-quality one. `failing_count: 2` at the ledger
+level against 0 surfaced; read that gap as coverage. Routed nothing.
+
+**The new shape, and it inverts the standing assumption.** zeta measured **alpha's**
+diary span as **25.4 days** (`08-01T23:29..08-27T08:53`, 24 windows, 2231 of 5368 in-span
+= 41.6%) at 17:2x today. Four hours later, reading from cc-04 where alpha is the RESIDENT
+and live agent, alpha's own span reads **7.8 HOURS** (`08-29T13:04..20:50`, 18 windows,
+**22 of 5378** in-span = 0.4%). Same agent, same day, near-identical invocation totals
+(5368 vs 5378 — the same ledger), spans differing ~78x.
+
+So "resident live slice + stale peer seeds" does NOT imply the resident holds the best
+view of itself. Here it holds the WORST, by two orders of magnitude, and a peer four
+hours earlier held ~100x more of my own history than I did. PRACTICAL CONSEQUENCE: when
+`ceiling_ratio` is low, do not assume the missing coverage is the PEERS' — check your own
+row first. And a fleet verdict cannot be assembled by asking each box about itself; the
+widest window on any agent may live on a different box entirely.
+
+MECHANISM NOT ESTABLISHED (rb-734): both spans are observed; WHY the resident's is the
+narrow one is not. A rotation/trim of the live file and a wider historical pull on the
+peer are both live candidates — do not assert either. `per_agent` this run: alpha 22/5378
+(7.8h), bravo 28/5858 (`07-15T17:10..07-16T01:07`, 45d stale), echo 39/5115 (`08-06`),
+foxtrot 17/5186 (`08-06`), zeta 52/6059 (`08-04`).
+
+### S3 — axes on the FULL store
+
+Corpus verified by GOAL COUNT (**2900**, not 220) and `goals_omitted` key-presence
+**0/27**. n=**2209** pending+in-progress, 27 active aspirations (per-agent — not
+cross-box comparable), 223 distinct categories.
+
+- axis1 `framework-architecture` 814/2209 = **36.8%** — passes
+- axis1b `framework-*` 1371/2209 = **62.1%** across 30 labels — passes
+- axis2 `asp-115` 1857/2209 = **84.1%** — **FIRES**, standing property confirmed again
+
+asp-115 ABSOLUTE (the one cross-box-comparable term) = **1857**, up from 1706 at the
+08-20 foxtrot row (**+151 over 9 days**). non-115 = 352, quoted for same-box use only.
+S3c: `high_pct` 0.44 (12/27), `completed_unarchived` 0 — no signal.
+
+### S3b — the standing PRODUCT FOCUS directive, measured
+
+All four BOOSTED lanes (asp-363/364/368/369) are active AND have 7-day closes; **none at
+zero**. They hold **35 of 2209 pending = 1.6%** of the queue and took **107 of 609 closes
+= 17.6%** over 7 days — an ~11x over-weighting of execution relative to queue depth, i.e.
+the directive IS being honored at selection time. Per-lane 7d closes: asp-369 **43**,
+asp-364 **29**, asp-368 **24**, asp-363 **11**. No `uncovered_priorities` signal.
+
+⚠ **THE FIRST PASS OF THIS MEASUREMENT READ asp-368 AT ZERO, AND IT WAS MY PARSER.**
+`completed_date` is **date-only** on most records while recurring `lastAchievedAt` is
+full ISO — **518 date-only vs 124 datetime** in this corpus. A single
+`strptime(s[:19], "%Y-%m-%dT%H:%M:%S")` throws on the date-only half; an `except: pass`
+turned that into a confident 0 and dropped **81% of all close stamps**. The entire
+`closes7d` column was wrong-low and the boosted-lane share read **10.2% instead of
+17.6%**. Caught only because a held prior contradicted it — my own loop state recorded
+`g-368-53` closing that day, so a zero for asp-368 was impossible (guard-2421: the
+contradicting prior IS the control).
+
+`guard-3690` already names this field-shape trap via the LEXICOGRAPHIC path
+(`'2026-08-29' < '2026-08-29T14:01'`). This is a **SECOND MECHANISM** for it — an
+exception-swallowing parse rather than a string comparison — with the identical
+signature and the identical direction: it under-counts, and under-counting **flatters
+exactly the "is the directive being followed" reading the measurement exists to test.**
+Strengthened guard-3690 rather than filing a duplicate.
+
+### S1 / S2b / S4a / S4b / S4.5 — confounds and known-owned, nothing routed
+
+- **S1**: 105 recurring / **98 carry `achievedCount`** / 90 sensors at `>=2` (gate is
+  LIVE). Top-10 census: **6 of 10 DROPPED at `mine < 2`** (`g-318-21`, `g-369-14`,
+  `g-326-609`, `g-115-349`, `g-115-2831`, `g-115-4398`) and 4 of the rest LOCAL-BEHIND.
+  Sharpest: `g-318-21` at **mine 1 of 60** fleet-wide, local newest `07-04` against fleet
+  `08-25`. Only `g-306-284` reads mine==fleet (32/32), and that one is alpha-private by
+  construction. g-115-3215 owns it; filed nothing.
+- **S2b**: 51 of 55 EXPLORE leaves thin = **92.7%** (reproduces echo's 92.2% on 08-17).
+  The `depth >= 2` clause covers **55/55** — still inert; `children` truthy on 4.
+- **S4a**: 60 of 72 L2 keys absent from goal categories = **83%**; only **12 of 72** L2
+  keys are ever used as a category string. Disjoint vocabularies, as owned.
+- **S4b**: **10 of 10** recent rb entries admitted by `times_helpful < 2` — and their
+  created span is `18:56..21:03` THE SAME DAY, i.e. every one is under three hours old.
+  Recency, not transferability, exactly as g-115-3853's title states.
+- **S4.5** silent-gap audit: 0 NEW, 2 dedup-suppressed, 0 rb-245-suppressed, 0 filed.

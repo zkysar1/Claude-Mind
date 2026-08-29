@@ -958,6 +958,24 @@ gates:
     tuning_notes: "Writes only, by design: reads of a store are also against the rules but skills grep stores to confirm their own writes landed. Temp paths (/tmp, $TMPDIR, agents/<a>/temp/, sessions/<sid>/scratch/) are exempt -- hand-built fixtures are not governed stores. Denies and overrides are logged locally (not to gate-firings) so the hot path stays free of daemon hops. RETIREMENT CRITERION: override/(deny+override) > 0.5 over 20+ firings, or a daemon-side write fence makes the file unwritable by anything but the scripts."
     retirement_eligible: true
 
+  - id: domain-suite-gate
+    script: core/scripts/domain-suite-gate.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: "core/scripts/iteration-close.sh", phase: "do_verify (status=completed, BEFORE the status write; both roles)" }
+    dominant_risk: FN
+    asymmetry_magnitude: high
+    keyword_bias: strict
+    override_flag: "--override-domain-suite"
+    fp_cost: low
+    fn_cost: high
+    fp_description: "A close is refused for a red the closing Body did not cause: several Bodies edit one shared $WORLD_PATH/scripts tree and the trigger is mtime (Edit-tool writes to world/ never reach the changelog, so nothing can attribute them). The refusal names the touched files; the override logs the attribution the reader supplies. Or a slow domain suite is run on a close that only touched a comment."
+    fn_description: "A unit closes 'verified' while the world's domain test suite cannot even collect. Measured 2026-08-29 on a live deployment: tests importing symbols that later units removed; `Interrupted: 2 errors during collection`; every later goal in the lane verified against nothing. The domain half is invisible to full-suite-recommender (git-based, guard-1947) and run-full-suite-after-deep-code.md only NAMES its command."
+    rb_evidence: ["guard-399", "guard-1947", "guard-955"]
+    tuning_notes: "Instrumented from day one (g-353-75). Fires only when a code file (.py .sh .yaml .toml .cfg .ini) under $WORLD_PATH/scripts is newer than the goal's claimed_at (aspirations-read.sh; fallback 6h); a world with no run-domain-tests.sh hook AND no test_*.py is noop. Runner: the world hook when present, else python -m pytest -q with cwd=scripts, STORAGE_BACKEND=local pinned, 900s bound. Read the FP ratio against world/domain-suite-overrides.jsonl reasons: an override citing a tracked goal is the designed shared-tree FP; an override on a COLLECTION error (rc=2) is a Body laundering a broken import and is the signal to tighten, not retire."
+    retirement_eligible: false
+
 pending_audit:
   - audit-schema-gate.py
   - encode-stable-facts-gate.py
