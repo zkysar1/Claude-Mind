@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.34",
+    "previous_version": "2.12.33",
+    "date": "2026-08-29",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "worker-loop names the sanctioned single-goal read (aspirations-query.sh --goal-field id <goal-id> --full) before claiming; a Body had invented a goal_reader module and tried a raw store parse",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.33",
     "previous_version": "2.12.32",
     "date": "2026-08-29",

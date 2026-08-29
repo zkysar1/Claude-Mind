@@ -3244,3 +3244,21 @@ benign hit; a SECOND hit is the signal.
 If this WARNs, do not assume a defect — apply the table above first. A literal that is a
 parser input, a lower bound, or quoted inside a comment is not a bomb. A literal compared
 `<`, `<=` or `==` against anything derived from `now()` is.
+
+58. **Runtime**: `state-update-audit.py`'s `_run()` helper MUST derive its default
+    subprocess timeout from `RT_CURL_TIMEOUT` plus headroom, never hardcode a short
+    fixed cap. Several of its callers write to own-cloud `meta/` and `world/`
+    (`meta-impk.sh`, `evolution-log-append.sh`, `meta-dead-ends.sh`,
+    `meta-generations.sh`, `board-post.sh`), which is exactly guard-918's scope. A
+    short cap does NOT lose the write — it kills the reporter AFTER the child
+    commits, so the close reports `impk_snapshot_failed` / `impk_rc: -1` for a
+    snapshot that landed (guard-1091: a FAILED measurement is not a measurement of
+    zero). That false negative is only harmless while `--close-key` dedup is live;
+    the iteration-close advisory notes the suppression lapses once
+    `do_productivity_check()` deletes the checkpoint, after which a retry
+    double-weights the goal across the 5/10/20 rolling imp@k averages.
+    Bash: `grep -n 'timeout=None' core/scripts/state-update-audit.py` (the `_run`
+    definition) AND `grep -n 'RT_CURL_TIMEOUT' core/scripts/state-update-audit.py`
+    (the derivation, guarded by `if timeout is None:` so explicit per-call timeouts
+    still win). Both MUST return a hit; a bare integer default is the regression.
+    Verified by g-115-8308.
